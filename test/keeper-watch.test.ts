@@ -26,30 +26,38 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyHeldGate,
+  type BackstopBaseline,
   COOLDOWN_SECS,
   countDeadLetters,
   detectApprovalReview,
   detectAutopilotStall,
+  detectBackstopTelemetry,
   detectDaemonDown,
   detectDeadLetterGrowth,
   detectDispatchFailures,
   detectDupApprove,
   detectDupDispatch,
+  detectFoldLatency,
   detectReducerWedge,
   detectStuckJobs,
   type EventRow,
+  emptyBackstopBaseline,
   emptySeenState,
   type Finding,
+  FOLD_LATENCY_SANITY_CAP,
   fingerprint,
   foldSeenState,
   HELD_TICKS_THRESHOLD,
+  loadBackstopBaseline,
   loadSeenState,
   MAX_SPAWN_RETRIES,
+  resolveBackstopBaselinePath,
   resolveSeenStatePath,
   type ScanDeps,
   type SeenState,
   type SpawnAgentFn,
   type SpawnResult,
+  saveBackstopBaseline,
   saveSeenState,
   scan,
   selectToNotify,
@@ -112,6 +120,7 @@ function ev(over: Partial<EventRow> & { id: number; ts: number }): EventRow {
   return {
     session_id: "s",
     hook_event: "PostToolUse",
+    event_type: "lifecycle",
     planctl_op: null,
     planctl_target: null,
     data: null,
@@ -524,6 +533,385 @@ describe("detectApprovalReview", () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// fold-latency (fn-733) — op→first-matching-snapshot pairing over the bar.
+// ---------------------------------------------------------------------------
+
+describe("detectFoldLatency", () => {
+  /** Build a planctl_op event row. */
+  function opEv(id: number, ts: number, op: string, target: string): EventRow {
+    return ev({
+      id,
+      ts,
+      session_id: "agent-sess",
+      hook_event: "PostToolUse",
+      event_type: "planctl",
+      planctl_op: op,
+      planctl_target: target,
+    });
+  }
+
+  /** Build a plan_snapshot event row (the entity pk rides in session_id). */
+  function snapEv(
+    id: number,
+    ts: number,
+    entityId: string,
+    hookEvent: "EpicSnapshot" | "TaskSnapshot",
+  ): EventRow {
+    return ev({
+      id,
+      ts,
+      session_id: entityId,
+      hook_event: hookEvent,
+      event_type: "plan_snapshot",
+    });
+  }
+
+  test("fn-732 fixture: scaffold op→EpicSnapshot ~10s pairs and fires", () => {
+    const epic = "fn-732-move-approval-to-runtime-sidecar";
+    const opTs = 1780868476.689;
+    const snapTs = 1780868486.905; // ~10.2s later (the live evidence)
+    const events = [
+      opEv(1, opTs, "scaffold", epic),
+      snapEv(2, snapTs, epic, "EpicSnapshot"),
+    ];
+    const findings = detectFoldLatency(events);
+    expect(findings).toHaveLength(1);
+    const f = findings[0];
+    expect(f.category).toBe("fold-latency");
+    expect(f.key).toBe(`fold-latency:scaffold:${epic}`);
+    expect(f.evidence.latencySecs).toBe(10);
+    expect(f.evidence.entityId).toBe(epic);
+  });
+
+  test("task op pairs to the TaskSnapshot (task id), not the EpicSnapshot", () => {
+    const epic = "fn-9-foo";
+    const task = "fn-9-foo.2";
+    const events = [
+      opEv(1, 1000, "done", task),
+      // EpicSnapshot for the parent — must NOT be the pairing target.
+      snapEv(2, 1003, epic, "EpicSnapshot"),
+      // TaskSnapshot for the task, 30s after the op → fires.
+      snapEv(3, 1030, task, "TaskSnapshot"),
+    ];
+    const findings = detectFoldLatency(events);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].evidence.entityId).toBe(task);
+    expect(findings[0].evidence.latencySecs).toBe(30);
+  });
+
+  test("does not fire when the pair is under the realtime threshold", () => {
+    const epic = "fn-1-fast";
+    const events = [
+      opEv(1, 1000, "scaffold", epic),
+      snapEv(2, 1000.05, epic, "EpicSnapshot"), // ~50ms — the happy path
+    ];
+    expect(detectFoldLatency(events)).toHaveLength(0);
+  });
+
+  test("skips an in-flight op with no matching snapshot in the window", () => {
+    const epic = "fn-2-inflight";
+    // op present, NO snapshot — must NOT produce a false infinite latency.
+    const events = [opEv(1, 1000, "scaffold", epic)];
+    expect(detectFoldLatency(events)).toHaveLength(0);
+  });
+
+  test("re-fold guard: a snapshot ts BEFORE the op (negative latency) is skipped", () => {
+    const epic = "fn-3-refold";
+    const events = [
+      opEv(1, 2000, "scaffold", epic),
+      // re-fold minted a snapshot ts earlier than the op ts → artifact.
+      snapEv(2, 1000, epic, "EpicSnapshot"),
+    ];
+    expect(detectFoldLatency(events)).toHaveLength(0);
+  });
+
+  test("re-fold guard: an absurd latency past the sanity cap is skipped", () => {
+    const epic = "fn-4-absurd";
+    const events = [
+      opEv(1, 1000, "scaffold", epic),
+      // a re-fold mints a fresh ts far in the future → > sanity cap → artifact.
+      snapEv(2, 1000 + FOLD_LATENCY_SANITY_CAP + 10, epic, "EpicSnapshot"),
+    ];
+    expect(detectFoldLatency(events)).toHaveLength(0);
+  });
+
+  test("pairs to the FIRST matching snapshot (earliest sighting wins)", () => {
+    const epic = "fn-5-first";
+    const events = [
+      opEv(1, 1000, "scaffold", epic),
+      snapEv(2, 1010, epic, "EpicSnapshot"), // FIRST snapshot — 10s
+      snapEv(3, 1090, epic, "EpicSnapshot"), // a later re-snapshot — ignored
+    ];
+    const findings = detectFoldLatency(events);
+    expect(findings).toHaveLength(1);
+    expect(findings[0].evidence.latencySecs).toBe(10);
+  });
+
+  test("ignores non-op events and unparseable targets", () => {
+    const events = [
+      // a plain PostToolUse with no planctl_op
+      ev({ id: 1, ts: 1000, event_type: "lifecycle" }),
+      // an op with a malformed target → parsePlanRef returns null → skipped
+      opEv(2, 1000, "scaffold", "not-a-ref"),
+      ev({
+        id: 3,
+        ts: 1100,
+        session_id: "not-a-ref",
+        event_type: "plan_snapshot",
+      }),
+    ];
+    expect(detectFoldLatency(events)).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// backstop-degraded (fn-733) — ingest keeper's OWN backstop self-telemetry.
+// ---------------------------------------------------------------------------
+
+describe("detectBackstopTelemetry", () => {
+  function rescueLine(over: {
+    backstop: string;
+    cls: string;
+    staleness_ms: number | null;
+  }): string {
+    return JSON.stringify({
+      ts: 1780868400000,
+      kind: "backstop-rescue",
+      class: over.cls,
+      backstop: over.backstop,
+      worker: "main",
+      fast_path: over.cls === "timeout" ? null : "data_version_poll",
+      rescued: true,
+      staleness_ms: over.staleness_ms,
+      last_fast_path_at: over.cls === "timeout" ? null : 1780868200000,
+    });
+  }
+
+  function rollupLine(over: {
+    backstop: string;
+    cls: string;
+    fires_total: number;
+    rescues_total: number;
+  }): string {
+    return JSON.stringify({
+      ts: 1780868400500,
+      kind: "backstop-rollup",
+      backstop: over.backstop,
+      class: over.cls,
+      fires_total: over.fires_total,
+      rescues_total: over.rescues_total,
+    });
+  }
+
+  const ID = { dev: 1, ino: 100 };
+
+  test("today's incident: pending-dispatch-sweep rescue at staleness=143108 fires", () => {
+    const text = `${rescueLine({
+      backstop: "pending-dispatch-sweep",
+      cls: "timeout",
+      staleness_ms: 143108,
+    })}\n`;
+    const { findings } = detectBackstopTelemetry({
+      text,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
+    expect(stale).toBeDefined();
+    expect(stale?.category).toBe("backstop-degraded");
+    expect(stale?.severity).toBe("critical");
+    expect(stale?.evidence.stalenessMs).toBe(143108);
+  });
+
+  test("skips a null-staleness rescue (cold boot) — no finding", () => {
+    const text = `${rescueLine({
+      backstop: "plan-heartbeat",
+      cls: "missed-wake",
+      staleness_ms: null,
+    })}\n`;
+    const { findings } = detectBackstopTelemetry({
+      text,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-staleness:")),
+    ).toHaveLength(0);
+  });
+
+  test("absent/empty text reads as healthy (no finding)", () => {
+    expect(
+      detectBackstopTelemetry({
+        text: "",
+        prior: emptyBackstopBaseline(),
+        identity: null,
+      }).findings,
+    ).toHaveLength(0);
+  });
+
+  test("missed-wake DELTA: seeds silently, then fires when fires_total rises past the threshold", () => {
+    const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
+    // Tick 1: first observation seeds the baseline silently (no delta fire).
+    const t1 = `${rollupLine({ ...bucket, fires_total: 10, rescues_total: 4 })}\n`;
+    const seed = detectBackstopTelemetry({
+      text: t1,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    expect(
+      seed.findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
+    ).toHaveLength(0);
+    expect(seed.next.buckets["git-heartbeat missed-wake"].fires_total).toBe(10);
+    expect(seed.next.dev).toBe(ID.dev);
+    expect(seed.next.ino).toBe(ID.ino);
+
+    // Tick 2: fires_total jumped by 8 (> MISSED_WAKE_DELTA=5) → fires.
+    const t2 = `${rollupLine({ ...bucket, fires_total: 18, rescues_total: 6 })}\n`;
+    const second = detectBackstopTelemetry({
+      text: t2,
+      prior: seed.next,
+      identity: ID,
+    });
+    const delta = second.findings.find((f) =>
+      f.key.startsWith("backstop-missed-wake:"),
+    );
+    expect(delta).toBeDefined();
+    expect(delta?.evidence.delta).toBe(8);
+    expect(delta?.evidence.baselineFires).toBe(10);
+    expect(delta?.evidence.currentFires).toBe(18);
+  });
+
+  test("a tiny rise (≤ threshold) does NOT fire", () => {
+    const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
+    const prior: BackstopBaseline = {
+      version: 1,
+      dev: ID.dev,
+      ino: ID.ino,
+      buckets: {
+        "git-heartbeat missed-wake": { fires_total: 10, rescues_total: 4 },
+      },
+    };
+    const text = `${rollupLine({ ...bucket, fires_total: 13, rescues_total: 5 })}\n`;
+    const { findings } = detectBackstopTelemetry({ text, prior, identity: ID });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
+    ).toHaveLength(0);
+  });
+
+  test("counter RESET (current < baseline) reads as a reset, NOT a regression", () => {
+    const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
+    // Baseline at 100; daemon restarted → current counter is 7 (< baseline).
+    const prior: BackstopBaseline = {
+      version: 1,
+      dev: ID.dev,
+      ino: ID.ino,
+      buckets: {
+        "git-heartbeat missed-wake": { fires_total: 100, rescues_total: 40 },
+      },
+    };
+    // 7 < 100 → reset → delta = 7, but a reset NEVER fires even though
+    // 7 > MISSED_WAKE_DELTA(5).
+    const text = `${rollupLine({ ...bucket, fires_total: 7, rescues_total: 2 })}\n`;
+    const { findings, next } = detectBackstopTelemetry({
+      text,
+      prior,
+      identity: ID,
+    });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
+    ).toHaveLength(0);
+    // The baseline re-seeds to the post-reset value for the next tick.
+    expect(next.buckets["git-heartbeat missed-wake"].fires_total).toBe(7);
+  });
+
+  test("file-identity change (dev,ino) invalidates the whole baseline — no delta fire", () => {
+    const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
+    const prior: BackstopBaseline = {
+      version: 1,
+      dev: 1,
+      ino: 100,
+      buckets: {
+        "git-heartbeat missed-wake": { fires_total: 10, rescues_total: 4 },
+      },
+    };
+    // The log rotated → new inode. A big jump would normally fire, but the
+    // identity changed → invalidate → re-seed silently this tick.
+    const text = `${rollupLine({ ...bucket, fires_total: 99, rescues_total: 40 })}\n`;
+    const { findings, next } = detectBackstopTelemetry({
+      text,
+      prior,
+      identity: { dev: 1, ino: 999 },
+    });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
+    ).toHaveLength(0);
+    expect(next.dev).toBe(1);
+    expect(next.ino).toBe(999);
+    expect(next.buckets["git-heartbeat missed-wake"].fires_total).toBe(99);
+  });
+
+  test("fingerprint is stable across ticks for the same bucket+signal", () => {
+    const text = `${rescueLine({
+      backstop: "pending-dispatch-sweep",
+      cls: "timeout",
+      staleness_ms: 143108,
+    })}\n`;
+    const a = detectBackstopTelemetry({
+      text,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    }).findings.find((f) => f.key.startsWith("backstop-staleness:"));
+    const b = detectBackstopTelemetry({
+      text,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    }).findings.find((f) => f.key.startsWith("backstop-staleness:"));
+    expect(a?.fingerprint).toBe(b?.fingerprint);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// backstop-baseline sidecar (fn-733) — load/save round-trip + corrupt fallback.
+// ---------------------------------------------------------------------------
+
+describe("backstop-baseline sidecar", () => {
+  test("resolveBackstopBaselinePath honors KEEPER_WATCH_STATE_DIR (its OWN dir)", () => {
+    const p = resolveBackstopBaselinePath();
+    expect(p).toBe(join(seenStateDir, "backstop-baseline.json"));
+    // NOT under the keeper DB's dir — segregated from keeper.db.
+    expect(p.startsWith(join(tmpDir, "watch-state"))).toBe(true);
+  });
+
+  test("save then load round-trips the baseline", () => {
+    const p = resolveBackstopBaselinePath();
+    const baseline: BackstopBaseline = {
+      version: 1,
+      dev: 5,
+      ino: 55,
+      buckets: {
+        "git-heartbeat missed-wake": { fires_total: 7, rescues_total: 3 },
+      },
+    };
+    saveBackstopBaseline(p, baseline);
+    const loaded = loadBackstopBaseline(p);
+    expect(loaded).toEqual(baseline);
+  });
+
+  test("absent file loads as an empty baseline", () => {
+    expect(loadBackstopBaseline(resolveBackstopBaselinePath())).toEqual(
+      emptyBackstopBaseline(),
+    );
+  });
+
+  test("corrupt file degrades to an empty baseline (never throws)", () => {
+    const p = resolveBackstopBaselinePath();
+    require("node:fs").mkdirSync(seenStateDir, { recursive: true });
+    writeFileSync(p, "{ this is not json");
+    expect(loadBackstopBaseline(p)).toEqual(emptyBackstopBaseline());
+  });
+});
+
 describe("sortFindings", () => {
   test("critical before warning before info, then by key", () => {
     const all = [
@@ -628,6 +1016,75 @@ describe("scan (DB layer)", () => {
     const now = Math.floor(Date.now() / 1000);
     const findings = await scan(dbPath, 3600, quietDeps(now));
     expect(findings).toHaveLength(0);
+  });
+
+  test("fold-latency: a scaffold op + later EpicSnapshot pairs end-to-end", async () => {
+    const writer = openDb(dbPath);
+    const now = Math.floor(Date.now() / 1000);
+    const epic = "fn-732-move-approval-to-runtime-sidecar";
+    // op 20s ago; matching EpicSnapshot 10s ago → ~10s latency, over the bar.
+    insertEvent(writer.db, {
+      ts: now - 20,
+      session_id: "agent-sess",
+      hook_event: "PostToolUse",
+      event_type: "planctl",
+      planctl_op: "scaffold",
+      planctl_target: epic,
+    });
+    insertEvent(writer.db, {
+      ts: now - 10,
+      session_id: epic,
+      hook_event: "EpicSnapshot",
+      event_type: "plan_snapshot",
+    });
+    writer.db.close();
+
+    const findings = await scan(dbPath, 3600, quietDeps(now));
+    const fl = findings.find((f) => f.category === "fold-latency");
+    expect(fl).toBeDefined();
+    expect(fl?.evidence.entityId).toBe(epic);
+    expect(fl?.evidence.latencySecs).toBe(10);
+  });
+
+  test("backstop ingest: a high-staleness rescue surfaces through scan via injected deps", async () => {
+    openDb(dbPath).db.close();
+    const now = Math.floor(Date.now() / 1000);
+    const baselinePath = resolveBackstopBaselinePath();
+    const deps: ScanDeps = {
+      ...quietDeps(now),
+      readBackstop: () => ({
+        text: `${JSON.stringify({
+          ts: 1780868400000,
+          kind: "backstop-rescue",
+          class: "timeout",
+          backstop: "pending-dispatch-sweep",
+          worker: "main",
+          fast_path: null,
+          rescued: true,
+          staleness_ms: 143108,
+          last_fast_path_at: null,
+        })}\n`,
+        identity: { dev: 1, ino: 100 },
+      }),
+      backstopBaseline: {
+        load: () => loadBackstopBaseline(baselinePath),
+        save: (next) => saveBackstopBaseline(baselinePath, next),
+      },
+    };
+    const findings = await scan(dbPath, 3600, deps);
+    const bs = findings.find((f) => f.category === "backstop-degraded");
+    expect(bs).toBeDefined();
+    expect(bs?.evidence.stalenessMs).toBe(143108);
+  });
+
+  test("backstop ingest is OFF when readBackstop is absent (older caller)", async () => {
+    openDb(dbPath).db.close();
+    const now = Math.floor(Date.now() / 1000);
+    // quietDeps has no readBackstop → no backstop-degraded findings.
+    const findings = await scan(dbPath, 3600, quietDeps(now));
+    expect(
+      findings.filter((f) => f.category === "backstop-degraded"),
+    ).toHaveLength(0);
   });
 });
 
