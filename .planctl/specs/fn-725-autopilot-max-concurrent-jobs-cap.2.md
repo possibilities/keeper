@@ -77,5 +77,5 @@ value-carrying synthetic event.
 - [ ] A cursor=0 re-fold reproduces byte-identical `autopilot_state` rows; schema-version and autopilot tests pass.
 
 ## Done summary
-
+Surface the autopilot max_concurrent_jobs cap on the viewer banner, sourced entirely over the socket. Schema v60 adds a nullable autopilot_state.max_concurrent_jobs column fed by a new AutopilotCapSet synthetic event (boot-appended with the config-frozen value); the viewer renders '· max N' / '· max ∞' next to the play/pause pill without reading config.
 ## Evidence
