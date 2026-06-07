@@ -55,5 +55,5 @@ and the first (live) conn survives. Assert a reap-tick throw is swallowed.
 - [ ] No new wire-protocol frame; no reducer/schema change; `bun test test/server-worker.test.ts` green.
 
 ## Done summary
-
+Server-side connection reaping + max-conn cap: EPIPE-evict on write<0 via flush->sock.end()->Bun close; stuck-pending TTL (30s) reaps a dead-but-backpressured conn that diffTick skips; reject-new max-conn cap (64) with a max_connections error frame + close, logged loudly; EPIPE/ECONNRESET demoted to TRACE. All reap/cap logic in no-self-heal try/catch. No wire-protocol/reducer/schema change.
 ## Evidence
