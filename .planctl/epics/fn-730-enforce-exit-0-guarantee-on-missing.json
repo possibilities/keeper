@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "rejected",
   "branch_name": "fn-730-enforce-exit-0-guarantee-on-missing",
   "bundles": [],
   "closer_done_at": "2026-06-07T16:39:28.102230Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T16:39:28.102230Z"
+  "updated_at": "2026-06-07T16:40:27.472450Z"
 }
