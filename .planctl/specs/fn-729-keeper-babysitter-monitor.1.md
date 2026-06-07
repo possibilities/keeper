@@ -90,5 +90,5 @@ to the `test:fast` set in `package.json`.
 - [ ] `bun run lint`, `bun run typecheck`, `bun run test:fast` pass
 
 ## Done summary
-
+Built cli/keeper-watch.ts read-only detection core: 9 pure (input)=>Finding[] detectors wired over a bounded readonly scan ({readonly:true,prepareStmts:false}), stable key+fingerprint (no timestamps/pids/free-text), default table + --json output. Detects the live fn-728 dup-approve signature. 30 unit tests in test/keeper-watch.test.ts (in test:fast).
 ## Evidence
