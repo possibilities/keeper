@@ -21,5 +21,5 @@ the expected zero-finding / baseline result.
 - [ ] A test in `test/keeper-watch.test.ts` covers the missing-DB path and asserts no throw
 
 ## Done summary
-
+Added an existsSync first-boot guard at the top of tick so a --tick run before keeperd creates keeper.db returns the baseline shape and exits 0 instead of letting read-only openDb throw; added a tick test covering the missing-DB path (no throw, baseline result, no spawn).
 ## Evidence

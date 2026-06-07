@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "enforce exit-0 on missing DB",
-  "updated_at": "2026-06-07T16:23:54.404038Z"
+  "updated_at": "2026-06-07T16:33:24.185562Z",
+  "worker_done_at": "2026-06-07T16:33:24.185562Z"
 }
