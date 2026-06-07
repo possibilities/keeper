@@ -6,14 +6,13 @@
  *   (1) Render — pure transforms over fixtures:
  *       - `buildCurrentRows` projects the readiness snapshot's `jobs` map
  *         into the `--- current ---` rows the viewer paints.
- *       - `predictNextDispatches` projects the snapshot into the four
- *         `--- predicted ---` buckets (approvals + informational +
- *         workers + closers).
+ *       - `renderDependencyGraph` projects the open tasks into the
+ *         `--- dependencies ---` ASCII DAG.
  *       - `projectFailedRows` projects the wire `dispatch_failures` rows
  *         into the `--- failed ---` shape.
  *       - `renderBody` ties them together and emits the body lines in the
- *         documented order (current → predicted → failed, sections only
- *         when non-empty).
+ *         documented order (current → stopped → failed → dependencies,
+ *         sections only when non-empty).
  *
  *   (2) Control — pause / play / retry emit well-formed RPC frames:
  *       - `buildSetPausedFrame(id, paused)` shape (method, params).
@@ -32,8 +31,6 @@ import {
   buildRetryFrame,
   buildSetPausedFrame,
   type FailedRow,
-  predictFullSchedule,
-  predictNextDispatches,
   projectAutopilotPaused,
   projectFailedRows,
   projectMaxConcurrentJobs,
@@ -352,20 +349,14 @@ test("projectFailedRows — empty wire array yields empty output", () => {
 });
 
 // ---------------------------------------------------------------------------
-// renderBody — three sections, each only emitted when non-empty, in priority
-// order: current → predicted → failed.
+// renderBody — four sections, each only emitted when non-empty, in priority
+// order: current → stopped → failed → dependencies.
 // ---------------------------------------------------------------------------
 
 test("renderBody — empty input renders no lines", () => {
   expect(
     renderBody({
       current: [],
-      predicted: {
-        approvals: [],
-        informational: [],
-        workers: [],
-        closers: [],
-      },
       failed: [],
       paused: true,
     }),
@@ -390,12 +381,6 @@ test("renderBody — only current populated renders only the current header + ro
         created_at: 20,
       },
     ],
-    predicted: {
-      approvals: [],
-      informational: [],
-      workers: [],
-      closers: [],
-    },
     failed: [],
     paused: false,
   });
@@ -406,58 +391,19 @@ test("renderBody — only current populated renders only the current header + ro
   ]);
 });
 
-test("renderBody — only predicted populated renders only the predicted block, aligned by widest dir", () => {
+test("renderBody — only dependencies populated renders only the dependencies block", () => {
   const lines = renderBody({
     current: [],
-    predicted: {
-      approvals: [
-        {
-          verb: "approve",
-          id: "fn-2-bar.1",
-          dir: "arthack",
-          dirFull: "/arthack",
-          tier: null,
-        },
-      ],
-      informational: [
-        {
-          verb: "git-dirty",
-          id: "fn-2-bar.2",
-          dir: "arthack",
-          dirFull: "/arthack",
-          tier: null,
-        },
-      ],
-      workers: [
-        {
-          verb: "work",
-          id: "fn-1-foo.3",
-          dir: "keeper",
-          dirFull: "/keeper",
-          tier: null,
-        },
-      ],
-      closers: [
-        {
-          verb: "close",
-          id: "fn-1-foo",
-          dir: "keeper",
-          dirFull: "/keeper",
-          tier: null,
-        },
-      ],
-    },
+    dependencies: ["fn-1-foo", "  ○ .1", "  · .2  ← .1"],
     failed: [],
     paused: false,
   });
-  // Widest dir is `arthack` (7 chars) → col width is 7+3=10. Each line's
-  // `(<dir>) ` segment padEnd(10).
   expect(lines).toEqual([
-    "--- predicted ---",
-    "(arthack) approve::fn-2-bar.1",
-    "(arthack) git-dirty::fn-2-bar.2",
-    "(keeper)  work::fn-1-foo.3",
-    "(keeper)  close::fn-1-foo",
+    "--- dependencies ---",
+    "legend: ✓ done  ▸ running  ○ ready  · blocked   (← waits for)",
+    "fn-1-foo",
+    "  ○ .1",
+    "  · .2  ← .1",
   ]);
 });
 
@@ -480,12 +426,6 @@ test("renderBody — only failed populated renders failed header + reason-tagged
   ];
   const lines = renderBody({
     current: [],
-    predicted: {
-      approvals: [],
-      informational: [],
-      workers: [],
-      closers: [],
-    },
     failed,
     paused: false,
   });
@@ -496,7 +436,7 @@ test("renderBody — only failed populated renders failed header + reason-tagged
   ]);
 });
 
-test("renderBody — all four sections emit together in current → predicted → stopped → failed order", () => {
+test("renderBody — all four sections emit together in current → stopped → failed → dependencies order", () => {
   const lines = renderBody({
     current: [
       {
@@ -514,20 +454,7 @@ test("renderBody — all four sections emit together in current → predicted �
         created_at: 30,
       },
     ],
-    predicted: {
-      approvals: [
-        {
-          verb: "approve",
-          id: "fn-1-foo.2",
-          dir: "repo",
-          dirFull: "/repo",
-          tier: null,
-        },
-      ],
-      informational: [],
-      workers: [],
-      closers: [],
-    },
+    dependencies: ["fn-1-foo", "  ▸ .1"],
     failed: [
       {
         verb: "work",
@@ -542,12 +469,14 @@ test("renderBody — all four sections emit together in current → predicted �
   expect(lines).toEqual([
     "--- current ---",
     "(repo) work::fn-1-foo.1",
-    "--- predicted ---",
-    "(repo) approve::fn-1-foo.2",
     "--- stopped ---",
     "(repo) close::fn-1-foo",
     "--- failed ---",
     "(/repo) work::fn-1-foo.3 — confirm timeout",
+    "--- dependencies ---",
+    "legend: ✓ done  ▸ running  ○ ready  · blocked   (← waits for)",
+    "fn-1-foo",
+    "  ▸ .1",
   ]);
 });
 
@@ -569,12 +498,6 @@ test("renderBody — only stopped populated renders only the stopped header + ro
         created_at: 20,
       },
     ],
-    predicted: {
-      approvals: [],
-      informational: [],
-      workers: [],
-      closers: [],
-    },
     failed: [],
     paused: false,
   });
@@ -582,129 +505,6 @@ test("renderBody — only stopped populated renders only the stopped header + ro
     "--- stopped ---",
     "(repo) work::fn-1-foo.1",
     "(repo) close::fn-1-foo",
-  ]);
-});
-
-// ---------------------------------------------------------------------------
-// predictNextDispatches — preserved end-to-end from the legacy renderer.
-//
-// Same verb-aware simulated tree, same four-bucket output (approvals +
-// informational + workers + closers). Boundary cases mirror the legacy
-// suite's most load-bearing assertions.
-// ---------------------------------------------------------------------------
-
-test("predictNextDispatches — in-flight worker on a task predicts approve::<task>", () => {
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.4",
-        task_number: 4,
-        worker_phase: "open",
-        approval: "pending",
-        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
-      }),
-    ],
-    approval: "pending",
-  });
-  const { approvals, informational, workers, closers } = predictNextDispatches(
-    buildSnap([epic]),
-  );
-  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
-    "approve::fn-1-foo.4",
-  ]);
-  expect(informational).toEqual([]);
-  expect(workers).toEqual([]);
-  expect(closers).toEqual([]);
-});
-
-test("predictNextDispatches — close-row fan-up does NOT spuriously emit approve::<epic> when only a task worker is running", () => {
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.4",
-        task_number: 4,
-        worker_phase: "open",
-        approval: "pending",
-        jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
-      }),
-    ],
-    approval: "pending",
-  });
-  const { approvals } = predictNextDispatches(buildSnap([epic]));
-  const ids = approvals.map((r) => `${r.verb}::${r.id}`);
-  expect(ids).toContain("approve::fn-1-foo.4");
-  expect(ids).not.toContain("approve::fn-1-foo");
-});
-
-test("predictNextDispatches — in-flight closer on the epic predicts approve::<epic>", () => {
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        task_number: 1,
-        worker_phase: "done",
-        approval: "approved",
-      }),
-    ],
-    status: "open",
-    approval: "pending",
-    jobs: [makeEmbeddedJob({ plan_verb: "close", state: "working" })],
-  });
-  const { approvals } = predictNextDispatches(buildSnap([epic]));
-  expect(approvals.map((r) => `${r.verb}::${r.id}`)).toEqual([
-    "approve::fn-1-foo",
-  ]);
-});
-
-test("predictNextDispatches — stable empty preview when nothing is in flight or ready", () => {
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        task_number: 1,
-        worker_phase: "done",
-        approval: "approved",
-      }),
-    ],
-    status: "done",
-    approval: "approved",
-  });
-  expect(predictNextDispatches(buildSnap([epic]))).toEqual({
-    approvals: [],
-    informational: [],
-    workers: [],
-    closers: [],
-  });
-});
-
-test("predictNextDispatches — stopped worker + worker_phase=done + git_dirty_count>0 emits informational git-dirty::<task>", () => {
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        task_number: 1,
-        worker_phase: "done",
-        approval: "pending",
-        jobs: [
-          makeEmbeddedJob({
-            plan_verb: "work",
-            state: "stopped",
-            git_dirty_count: 3,
-          }),
-        ],
-      }),
-    ],
-    approval: "pending",
-  });
-  // The live git_status row is what predicate 6.5 reads — feed it directly.
-  const gitStatusByProjectDir = new Map([
-    ["/repo", { dirty_count: 3, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = buildSnap([epic], new Map(), { gitStatusByProjectDir });
-  expect(snap.readiness.perTask.get("fn-1-foo.1")?.tag).toBe("blocked");
-  const { informational } = predictNextDispatches(snap);
-  expect(informational.map((r) => `${r.verb}::${r.id}`)).toEqual([
-    "git-dirty::fn-1-foo.1",
   ]);
 });
 
@@ -911,12 +711,6 @@ test("renderBody — paused=true does NOT emit a banner line into the body (live
         created_at: 1,
       },
     ],
-    predicted: {
-      approvals: [],
-      informational: [],
-      workers: [],
-      closers: [],
-    },
     failed: [],
     paused: true,
   });
@@ -937,12 +731,6 @@ test("renderBody — paused=false does NOT emit a banner line into the body eith
         created_at: 1,
       },
     ],
-    predicted: {
-      approvals: [],
-      informational: [],
-      workers: [],
-      closers: [],
-    },
     failed: [],
     paused: false,
   });
@@ -950,76 +738,6 @@ test("renderBody — paused=false does NOT emit a banner line into the body eith
     expect(line).not.toContain("[paused]");
     expect(line).not.toContain("[playing]");
   }
-});
-
-// ---------------------------------------------------------------------------
-// predictFullSchedule — iterate the one-step sim to a fixed point.
-// ---------------------------------------------------------------------------
-
-test("predictFullSchedule — a dependency chain serializes work then closes the epic", () => {
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        task_number: 1,
-        worker_phase: "open",
-        approval: "approved",
-      }),
-      makeTask({
-        task_id: "fn-1-foo.2",
-        task_number: 2,
-        worker_phase: "open",
-        approval: "approved",
-        depends_on: ["fn-1-foo.1"],
-      }),
-    ],
-  });
-  const steps = predictFullSchedule(buildSnap([epic]));
-  expect(steps.map((s) => `${s.round}:${s.verb}::${s.id}`)).toEqual([
-    "1:work::fn-1-foo.1",
-    "2:work::fn-1-foo.2",
-    "3:close::fn-1-foo",
-  ]);
-});
-
-test("predictFullSchedule — a pending approval surfaces an approve step before the dependent unblocks", () => {
-  const epic = makeEpic({
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        task_number: 1,
-        worker_phase: "done",
-        approval: "pending",
-      }),
-      makeTask({
-        task_id: "fn-1-foo.2",
-        task_number: 2,
-        worker_phase: "open",
-        approval: "approved",
-        depends_on: ["fn-1-foo.1"],
-      }),
-    ],
-  });
-  const steps = predictFullSchedule(buildSnap([epic]));
-  expect(steps.map((s) => `${s.round}:${s.verb}::${s.id}`)).toEqual([
-    "1:approve::fn-1-foo.1",
-    "2:work::fn-1-foo.2",
-    "3:close::fn-1-foo",
-  ]);
-});
-
-test("predictFullSchedule — empty when nothing is dispatchable", () => {
-  const epic = makeEpic({
-    status: "done",
-    tasks: [
-      makeTask({
-        task_id: "fn-1-foo.1",
-        worker_phase: "done",
-        approval: "approved",
-      }),
-    ],
-  });
-  expect(predictFullSchedule(buildSnap([epic]))).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
