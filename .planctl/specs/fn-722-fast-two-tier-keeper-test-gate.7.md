@@ -30,5 +30,5 @@ Full `bun run test` (fast && slow && opentui) green. Record final wall times vs 
 - [ ] No stale test-command references left in docs
 
 ## Done summary
-
+Audited both charter-flagged redundancy clusters with git-log + per-file coverage evidence; KEEP all six files (zero merges) — each tests a distinct subject. Cluster (a): commit-work-foundation (in-proc primitives), commit-work (commit-work CLI subprocess), find-task-commit (find-task-commit CLI subprocess) — disjoint verbs, fixtures already deduped into test/helpers/{git-repo,sandbox-env}.ts. Cluster (b): readiness/readiness-client/readiness-diagnostics map 1:1 to three separate src modules with no shared assertions. Doc sweep clean (epic doc-gaps already landed, no stale test-cmd refs, no --isolate). Re-measure: fast 0 flakes / slow 0 flakes over 5x each; Python untouched (41 tests). Note: fast tier ~36s not <10s on this run — environmental (load avg 7.83/10 cores, agent+zellij+ghostty saturating box), not a code regression; bulk-minus-3-subprocess-files still 27s confirms broad CPU contention vs the epic's clean-machine 7.5s.
 ## Evidence
