@@ -310,6 +310,36 @@ export const DEFAULT_LIMIT = 100;
 /** Maximum page size — kept well below `MAX_IN_PARAMS` so a page is one query. */
 export const MAX_LIMIT = 500;
 
+/**
+ * Hard upper bound on concurrent subscriber connections (fn-723 task .2). The
+ * single-threaded worker diffs every projection change against ALL live conns
+ * serially, so a leak of headless orphan viewers (the 2026-06-06 incident: 64
+ * procs / 96 conns) saturates the fan-out. At the cap a NEW connection is
+ * REJECTED with a `max_connections` error frame then closed — reject-new, NOT
+ * LRU-evict: the oldest conn is the legit long-lived board, and evicting it to
+ * admit a newcomer would punish the wrong party. Hitting the cap is logged
+ * loudly (un-gated) because it means the reaper regressed — a healthy daemon
+ * never gets close. 64 is comfortably above the realistic live-viewer count
+ * (a handful per active session) yet bounds the worst-case fan-out cost.
+ */
+export const MAX_CONNECTIONS = 64;
+
+/**
+ * Ceiling (ms) a connection's outbound write may stay BACKPRESSURED before the
+ * conn is reaped (fn-723 task .2). `diffTick` SKIPS a conn whose `pending`
+ * write buffer is non-empty (slow/dead consumer), so a dead-but-backpressured
+ * socket never gets another write to EPIPE on — it would linger forever. When
+ * `pending` has been continuously set longer than this ceiling the conn is
+ * evicted (`sock.end()` → Bun `close` handler removes it from `conns`).
+ *
+ * This is explicitly NOT a write-side idle timer: a quiet receive-only
+ * subscriber (a board during a DB-quiet period) has `pending === null` and is
+ * never touched. The TTL fires ONLY on a genuinely STUCK write buffer, which a
+ * live consumer drains in milliseconds. 30s is orders of magnitude beyond any
+ * legitimate drain latency on a local UDS yet bounds a wedged socket's lifetime.
+ */
+export const STUCK_PENDING_TTL_MS = 30_000;
+
 // ---------------------------------------------------------------------------
 // DEBUG: timing instrumentation
 // ---------------------------------------------------------------------------
@@ -723,6 +753,14 @@ export interface ConnState {
   buffer: LineBuffer;
   subs: Map<string | null, SubState>;
   pending: { bytes: Uint8Array; offset: number } | null;
+  /**
+   * Epoch-ms when `pending` last transitioned from null → non-null, or null
+   * when not backpressured (fn-723 task .2). The stuck-pending reaper compares
+   * this against `STUCK_PENDING_TTL_MS` to evict a dead-but-backpressured conn
+   * (one `diffTick` skips for backpressure so it never EPIPEs). Set in `flush`
+   * when a write stashes a tail; cleared the instant `pending` drains to null.
+   */
+  pendingSince: number | null;
   /** DEBUG: per-connection sequence id for `[srv-ts]` log correlation. */
   id?: number;
 }
@@ -732,6 +770,7 @@ function newConnState(): ConnState {
     buffer: new LineBuffer(),
     subs: new Map(),
     pending: null,
+    pendingSince: null,
   };
 }
 
@@ -1677,6 +1716,15 @@ function readWorldRev(db: Database): number {
  */
 export interface Writable {
   write(data: Uint8Array, byteOffset?: number, byteLength?: number): number;
+  /**
+   * Close the connection (fn-723 task .2 reaper path). Declared optional
+   * because the minimal write surface a test `fakeSock` provides may omit it;
+   * the real Bun socket always has `.end()` at runtime even though its TS
+   * `Writable`-cast view only declares `write` — the same type-vs-runtime
+   * bridge `startServer`'s `as unknown as Writable` cast already relies on.
+   * Eviction calls `sock.end()`; the Bun `close` handler then `conns.delete`s.
+   */
+  end?(): void;
   data: ConnState;
 }
 
@@ -1782,17 +1830,30 @@ function flush(sock: Writable, buf: Uint8Array, startOffset: number): void {
     if (wrote <= 0) {
       // 0 → buffer full (backpressure); negative → socket closing.
       if (wrote < 0) {
-        // Socket is closing/closed — drop the rest; close handler cleans up.
+        // Socket is closing/closed (EPIPE/ECONNRESET on a diff write — normal,
+        // NOT an error). Drop the rest AND evict (fn-723 task .2): the dead
+        // socket must leave `conns` or it costs a serial diff every tick. We
+        // `end()` here and rely on the Bun `close` handler (:open/close in
+        // startServer) to `conns.delete`; the close handler is idempotent.
         sock.data.pending = null;
+        sock.data.pendingSince = null;
+        sock.end?.();
         return;
       }
-      // Stash the remainder; drain() resumes it.
+      // Stash the remainder; drain() resumes it. Stamp `pendingSince` only on
+      // the null → non-null transition so the stuck-pending TTL measures from
+      // when backpressure BEGAN, not from each subsequent partial write.
       sock.data.pending = { bytes: buf, offset };
+      if (sock.data.pendingSince === null) {
+        sock.data.pendingSince = Date.now();
+      }
       return;
     }
     offset += wrote;
   }
+  // Fully drained: clear both the buffer and the backpressure clock.
   sock.data.pending = null;
+  sock.data.pendingSince = null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1806,6 +1867,45 @@ function flush(sock: Writable, buf: Uint8Array, startOffset: number): void {
  */
 function readWorldRevOnce(db: Database): number {
   return readWorldRev(db);
+}
+
+/**
+ * Evict connections whose outbound write has been BACKPRESSURED past
+ * {@link STUCK_PENDING_TTL_MS} (fn-723 task .2). `diffTick` skips a conn with a
+ * non-empty `pending` buffer, so a dead-but-backpressured socket never receives
+ * another write to EPIPE on and would otherwise linger in `conns` forever,
+ * costing a serial diff every tick. The guard fires ONLY on a genuinely stuck
+ * buffer (`pendingSince !== null` AND aged past the ceiling) — a quiet
+ * receive-only subscriber has `pending === null` and is never touched, so this
+ * is NOT a write-side idle timer.
+ *
+ * Eviction is `sock.end()`; the Bun `close` handler then removes the conn from
+ * `conns` (idempotent). Wrapped per-conn in try/catch so a single `end()` throw
+ * can't abort the reap of the others (and, since the whole reaper runs inside
+ * `diffTick`'s no-self-heal call sites — `pollLoop`/`handleKick` — a throw never
+ * reaches the daemon). Cap-hit-style loud log because a stuck conn is abnormal.
+ */
+function reapStuckPending(list: Writable[]): void {
+  const now = Date.now();
+  for (const sock of list) {
+    const since = sock.data.pendingSince;
+    if (since === null || now - since < STUCK_PENDING_TTL_MS) {
+      continue;
+    }
+    console.error(
+      `[server-worker] reaping stuck-pending conn ${sock.data.id ?? -1} ` +
+        `(backpressured ${now - since}ms > ${STUCK_PENDING_TTL_MS}ms ceiling)`,
+    );
+    try {
+      sock.end?.();
+    } catch (err) {
+      // No-self-heal: a failed end() must not abort the reap of sibling conns.
+      console.error(
+        `[server-worker] stuck-pending end() failed for conn ${sock.data.id ?? -1}:`,
+        err,
+      );
+    }
+  }
 }
 
 /**
@@ -1881,6 +1981,15 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
   if (list.length === 0) {
     return;
   }
+
+  // fn-723 task .2 — stuck-pending reaper. A conn skipped below for backpressure
+  // never gets another write to EPIPE on, so a dead-but-backpressured socket
+  // would linger forever; evict any whose outbound buffer has been stuck past
+  // the ceiling. `sock.end()` triggers the Bun `close` handler → `conns.delete`.
+  // The cheap `pendingSince === null` guard means a live, quiet, receive-only
+  // subscriber (no backpressure) is never touched. NOT an idle timer. `Date.now`
+  // is fine here — the server-worker is the serve path, never a fold.
+  reapStuckPending(list);
 
   // Build the flat list of (sock, subId, sub) triples across all conns and
   // group by `sub.collection`. A conn with an empty `subs` map (no live
@@ -2300,10 +2409,37 @@ export function startServer(
     unix: sockPath,
     socket: {
       open(socket) {
-        socket.data = newConnState();
-        socket.data.id = ++__nextConnId;
-        conns.add(socket as unknown as Writable);
-        if (TRACE) srvTs(`conn ${socket.data.id} open`);
+        // fn-723 task .2 — max-connection cap. Wrapped in the no-self-heal
+        // try/catch (mirrors handleKick): a throw in the accept path must
+        // log+continue, never crash the worker and bounce the daemon.
+        try {
+          socket.data = newConnState();
+          socket.data.id = ++__nextConnId;
+          // Reject-new at the cap (NOT LRU-evict — the oldest conn is the legit
+          // long-lived board). Send a `max_connections` error frame then close.
+          // Logged loudly (un-gated): hitting the cap means the reaper regressed
+          // — a healthy daemon never approaches it.
+          if (conns.size >= MAX_CONNECTIONS) {
+            console.error(
+              `[server-worker] max_connections cap (${MAX_CONNECTIONS}) hit — ` +
+                `rejecting conn ${socket.data.id}; the reaper has regressed`,
+            );
+            const w = socket as unknown as Writable;
+            writeFrames(w, [
+              errorFrame(
+                db,
+                "max_connections",
+                `server at connection cap (${MAX_CONNECTIONS}); rejecting new connection`,
+              ),
+            ]);
+            socket.end();
+            return; // never added to `conns`
+          }
+          conns.add(socket as unknown as Writable);
+          if (TRACE) srvTs(`conn ${socket.data.id} open`);
+        } catch (err) {
+          console.error("[server-worker] open handler failed:", err);
+        }
       },
       data(socket, chunk) {
         const id = socket.data.id ?? -1;
@@ -2325,8 +2461,19 @@ export function startServer(
         conns.delete(socket as unknown as Writable);
         socket.data.subs.clear();
         socket.data.pending = null;
+        socket.data.pendingSince = null;
       },
-      error(_socket, err) {
+      error(socket, err) {
+        // EPIPE/ECONNRESET are the NORMAL shape of a peer (a viewer) going away
+        // — a dead conn the reaper/close path already handles. Logging them as
+        // errors floods the daemon log with non-signal during a viewer-churn
+        // burst (the fn-723 incident class). Demote to TRACE; log anything else
+        // (a genuinely unexpected socket fault) loudly.
+        const code = (err as { code?: unknown } | null)?.code;
+        if (code === "EPIPE" || code === "ECONNRESET") {
+          if (TRACE) srvTs(`conn ${socket.data?.id ?? -1} peer-gone (${code})`);
+          return;
+        }
         console.error("[server-worker] socket error:", err);
       },
     },

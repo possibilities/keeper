@@ -52,6 +52,7 @@ import {
   handleKick,
   isPidAlive,
   LockHeldError,
+  MAX_CONNECTIONS,
   META_MIN_INTERVAL_MS,
   newResultMemo,
   type PreSerialized,
@@ -64,6 +65,7 @@ import {
   resolveFilter,
   resumePending,
   runQuery,
+  STUCK_PENDING_TTL_MS,
   type SubState,
   startServer,
   unregisterRpc,
@@ -132,6 +134,7 @@ function dispatchInit(): ConnState {
     } as unknown as ConnState["buffer"],
     subs: new Map(),
     pending: null,
+    pendingSince: null,
   };
 }
 
@@ -1357,18 +1360,33 @@ test("spawned Worker shuts down cleanly and removes the socket file", async () =
 /**
  * A fake socket that records every frame written to it (decoded from the
  * NDJSON bytes `writeFrames` produces). Drives `diffTick` deterministically
- * without a real `Bun.Socket`. `accept` controls backpressure: when false,
- * `write()` returns 0 so the frame stays pending and the connection is skipped.
+ * without a real `Bun.Socket`.
+ *
+ * Backpressure / liveness knobs (fn-723 task .2):
+ * - `accept = false` → `write()` returns 0 (buffer full): the frame stays
+ *   `pending` and the connection is skipped by `diffTick`.
+ * - `closing = true` → `write()` returns -1 (EPIPE/socket closing): `flush`
+ *   drops the tail AND calls `end()` to evict the dead conn.
+ * - `end()` is the eviction spy — `ended` flips true and, when a backing
+ *   `conns` Set is wired (the reaper/cap proofs), the sock removes itself from
+ *   it, mirroring the Bun `close` handler's `conns.delete`.
  */
-function fakeSock(): Writable & {
+function fakeSock(conns?: Set<Writable>): Writable & {
   frames: ServerFrame[];
   accept: boolean;
+  closing: boolean;
+  ended: boolean;
 } {
   const sock = {
     data: dispatchInit(),
     accept: true,
+    closing: false,
+    ended: false,
     frames: [] as ServerFrame[],
     write(data: Uint8Array, off = 0, len = data.length - off): number {
+      if (this.closing) {
+        return -1; // socket closing: EPIPE — flush drops the tail and evicts
+      }
       if (!this.accept) {
         return 0; // backpressure: nothing accepted, remainder stashed
       }
@@ -1379,6 +1397,11 @@ function fakeSock(): Writable & {
         }
       }
       return len;
+    },
+    end(): void {
+      this.ended = true;
+      // Mirror the Bun `close` handler: an evicted conn leaves `conns`.
+      conns?.delete(this as unknown as Writable);
     },
   };
   return sock;
@@ -1567,6 +1590,206 @@ test("handleKick never throws out of the handler when diffTick fails", () => {
   // The worker message handler is in the no-self-heal path: a throw here would
   // crash the worker and bounce the daemon. handleKick must swallow it.
   expect(() => handleKick(db, [sock])).not.toThrow();
+});
+
+// ---------------------------------------------------------------------------
+// fn-723 task .2 — connection reaping + max-conn cap.
+//
+// The server must bound its connection set so leaked headless orphan viewers
+// (the 2026-06-06 incident) can never again saturate the serial diff fan-out:
+// (1) EPIPE-evict a dead conn (write<0 on a diff write), (2) evict a
+// dead-but-backpressured conn via a stuck-pending TTL (it's skipped by diffTick
+// so it never EPIPEs), (3) reject-new at a hard cap. All in the no-self-heal
+// path — a reap throw must never escape.
+// ---------------------------------------------------------------------------
+
+test("diffTick EPIPE-evicts a dead conn (write<0) from conns and calls end()", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // The socket is closing: the next diff write returns -1 (EPIPE). `flush` must
+  // drop the tail AND evict — end() the sock, which removes it from `conns`.
+  sock.closing = true;
+  advanceJob(db, "a", 6);
+  diffTick(db, conns);
+
+  expect(sock.ended).toBe(true);
+  expect(conns.has(sock)).toBe(false);
+  db.close();
+});
+
+test("diffTick does NOT evict a live attached conn (no false-evict)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns); // accept=true, closing=false, no pending
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  advanceJob(db, "a", 6);
+  diffTick(db, conns);
+
+  // A healthy conn gets its patch and stays in the set, untouched.
+  expect(sock.frames).toHaveLength(1);
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("diffTick stuck-pending TTL evicts a backpressured-too-long conn", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // Simulate a conn that backpressured long ago: a non-empty pending buffer and
+  // a `pendingSince` aged well past the ceiling (the "fake clock advance").
+  sock.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
+  sock.data.pendingSince = Date.now() - (STUCK_PENDING_TTL_MS + 1);
+
+  diffTick(db, conns);
+
+  expect(sock.ended).toBe(true);
+  expect(conns.has(sock)).toBe(false);
+  db.close();
+});
+
+test("diffTick stuck-pending TTL does NOT evict a freshly-backpressured conn", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // Backpressured, but only just now — well within the ceiling. Not reaped.
+  sock.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
+  sock.data.pendingSince = Date.now();
+
+  diffTick(db, conns);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("diffTick stuck-pending TTL leaves a quiet receive-only conn alone", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // No backpressure (pending === null, pendingSince === null) — a quiet board
+  // during a DB-quiet period. The TTL is NOT an idle timer: never evicted.
+  expect(sock.data.pending).toBeNull();
+  expect(sock.data.pendingSince).toBeNull();
+
+  diffTick(db, conns); // an idle tick (nothing changed)
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("flush stamps pendingSince on backpressure and clears it on drain", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 5 });
+
+  // Backpressure the conn: the diff write stashes a tail and stamps the clock.
+  sock.accept = false;
+  advanceJob(db, "a", 6);
+  diffTick(db, [sock]);
+  expect(sock.data.pending).not.toBeNull();
+  expect(sock.data.pendingSince).not.toBeNull();
+
+  // Drain: resumePending fully flushes, clearing both the buffer and the clock.
+  sock.accept = true;
+  resumePending(sock);
+  expect(sock.data.pending).toBeNull();
+  expect(sock.data.pendingSince).toBeNull();
+  db.close();
+});
+
+test("a reap-tick throw is swallowed (no-self-heal) by handleKick", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const sock = fakeSock();
+  watch(db, sock, { a: 5 });
+
+  // A stuck-pending conn whose end() throws: the reaper must catch it, and
+  // handleKick wraps the whole tick — neither path may escape.
+  sock.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
+  sock.data.pendingSince = Date.now() - (STUCK_PENDING_TTL_MS + 1);
+  sock.end = () => {
+    throw new Error("boom");
+  };
+
+  expect(() => handleKick(db, [sock])).not.toThrow();
+  db.close();
+});
+
+test("max-conn cap rejects a new connection with an error frame + close; the oldest survives", async () => {
+  const { db } = openDb(dbPath, { readonly: true });
+  const server = startServer(db, sockPath, lockPath);
+
+  // Open exactly MAX_CONNECTIONS clients — all should be admitted.
+  const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
+  for (let i = 0; i < MAX_CONNECTIONS; i++) {
+    clients.push(
+      await Bun.connect({
+        unix: sockPath,
+        socket: { data() {}, error() {} },
+      }),
+    );
+  }
+  await retryUntil(() => (server.conns.size === MAX_CONNECTIONS ? true : null));
+
+  // The (cap+1)th connection is rejected: it receives a `max_connections`
+  // error frame then the server closes it. Capture the frame on the client.
+  const rejectFrames: Array<{ type?: string; code?: string }> = [];
+  const overflow = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      data(_s, chunk: Buffer) {
+        for (const line of chunk.toString("utf8").split("\n")) {
+          if (line.length > 0) {
+            rejectFrames.push(
+              JSON.parse(line) as { type?: string; code?: string },
+            );
+          }
+        }
+      },
+      error() {},
+    },
+  });
+
+  const frame = await retryUntil(() =>
+    rejectFrames.find((f) => f.code === "max_connections"),
+  );
+  expect(frame).toBeDefined();
+  expect(frame?.type).toBe("error");
+  expect(frame?.code).toBe("max_connections");
+
+  // Reject-new, NOT LRU-evict: the conn count never exceeded the cap, and the
+  // first (oldest, live) client was never closed to make room.
+  expect(server.conns.size).toBe(MAX_CONNECTIONS);
+
+  overflow.end();
+  for (const c of clients) {
+    c.end();
+  }
+  server.stop();
+  db.close();
 });
 
 test("diffTick fans out only to connections watching the changed id", () => {
