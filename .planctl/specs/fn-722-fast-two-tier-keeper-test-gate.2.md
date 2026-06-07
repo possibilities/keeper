@@ -38,5 +38,5 @@ Then update docs: CLAUDE.md (~296-304) to cite `test/helpers/sandbox-env.ts` by 
 - [ ] All migrated test files pass
 
 ## Done summary
-
+Extracted test/helpers/{sandbox-env,git-repo,retry-until}.ts. sandboxEnv reconciles the two inline env families (id-clearing CLI-spawn + zellij hook-spawn) into one parameterized core with state paths applied last; migrated commit-work/find-task-commit/session-state/events-writer/integration. Cited the helper by path in CLAUDE.md + README.md (AGENTS.md symlink untouched).
 ## Evidence
