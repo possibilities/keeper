@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 59;
+export const SCHEMA_VERSION = 60;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1479,6 +1479,18 @@ const CREATE_EVENT_BLOBS_INDEXES = [
  * - `updated_at` (REAL, NOT NULL): unix-seconds of the latest UPSERT to
  *   `event.ts`. Mirrors every other projection table's `updated_at`
  *   discipline.
+ * - `max_concurrent_jobs` (INTEGER, NULLABLE, DEFAULT NULL — v60, fn-725):
+ *   the global autopilot concurrency cap surfaced on the viewer banner.
+ *   `NULL` = unlimited (the zero-event/zero-config default, rendered `∞`).
+ *   Lifted from the `AutopilotCapSet` event's null-tolerant
+ *   `max_concurrent_jobs` payload, which the daemon FREEZES from
+ *   `resolveConfig().maxConcurrentJobs` at boot-append mint time (config read
+ *   on main, never in the fold). Folded by `foldAutopilotCapSet` (UPSERT
+ *   id=1, sets ONLY this column, PRESERVES `paused` on conflict);
+ *   `foldAutopilotPaused` symmetrically preserves THIS column on conflict so
+ *   a play/pause toggle never clobbers the cap. Lags config until daemon
+ *   restart (same contract as every other keeper config key — the next
+ *   boot-append re-mints the frozen value).
  *
  * Defaults match the zero-event projection: a fresh DB with zero events has
  * zero rows here. Boot is responsible for unconditionally appending a
@@ -1500,7 +1512,8 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     paused INTEGER NOT NULL,
     last_event_id INTEGER NOT NULL,
     created_at REAL NOT NULL,
-    updated_at REAL NOT NULL
+    updated_at REAL NOT NULL,
+    max_concurrent_jobs INTEGER
 )
 `;
 
@@ -5860,6 +5873,44 @@ function migrate(db: Database): void {
       // autopilot are the only consumers), but the bump is required so
       // keeper-py's Python readers (e.g. `planctl render-approve-context`)
       // on this host don't fail-loud (test/schema-version.test.ts enforces).
+
+      // v59→v60: fn-725 (task 2) — surface the global autopilot concurrency
+      // cap on the `keeper autopilot` viewer banner. Adds a NULLABLE
+      // `autopilot_state.max_concurrent_jobs INTEGER` column (DEFAULT NULL =
+      // unlimited, matching the zero-event/zero-config projection default,
+      // rendered `∞` in the viewer). Whitelist-only ALTER, NO backfill —
+      // mirrors the v46→v47 / v49→v50 templates: the column populates
+      // exclusively from the reducer's new `AutopilotCapSet` fold arm, fed by
+      // the daemon's boot-append `AutopilotCapSet{max_concurrent_jobs:
+      // resolveConfig().maxConcurrentJobs}` re-arm (the config value FROZEN
+      // into the event payload on main at mint time — never read in the
+      // fold, preserving re-fold determinism). Stays NULL on a fresh DB / a
+      // steady-state v60 re-open until the first boot-append folds.
+      //
+      // Lockstep ALTER vs CREATE: this literal byte-matches the
+      // `max_concurrent_jobs INTEGER` column in CREATE_AUTOPILOT_STATE above
+      // so a fresh v60 DB and an upgraded v59-shaped DB produce
+      // byte-identical PRAGMA table_info rows. `addColumnIfMissing` is
+      // idempotent on column presence (no-op on the freshly CREATE'd table /
+      // a re-open of an already-migrated DB).
+      //
+      // The column IS part of the `autopilot_state` reducer projection — it
+      // already rides the rewind-and-redrain DELETE list via the existing
+      // `DELETE FROM autopilot_state` in the v41→v42 slot (no new rewind
+      // entry needed). A from-scratch cursor=0 re-fold reproduces it
+      // byte-identically from the `AutopilotCapSet` events in the log.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds
+      // 60 in the SAME change — whitelist-only (keeper-py reads neither
+      // `autopilot_state` nor `AutopilotCapSet`), but the bump is required so
+      // keeper-py's Python readers (e.g. `planctl render-approve-context`) on
+      // this host don't fail-loud (test/schema-version.test.ts enforces).
+      addColumnIfMissing(
+        db,
+        "autopilot_state",
+        "max_concurrent_jobs",
+        "INTEGER",
+      );
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

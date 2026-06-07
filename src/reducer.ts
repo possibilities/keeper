@@ -3935,8 +3935,105 @@ function foldAutopilotPaused(db: Database, event: Event): void {
        -- created_at preserved through UPSERT: the row's "since" view is
        -- the FIRST AutopilotPaused observation (typically the boot-append
        -- re-arm), never the latest flip.
+       -- max_concurrent_jobs NOT touched here: the singleton row is shared
+       -- with foldAutopilotCapSet (fn-725), so a pause/play toggle MUST
+       -- preserve the cap column on conflict — omitting it from the SET
+       -- clause leaves the persisted value intact (the INSERT path binds no
+       -- value, defaulting to NULL = unlimited, which is correct for the
+       -- never-folded-a-cap-yet boot race). Symmetric to
+       -- foldAutopilotCapSet's preservation of paused.
        updated_at = excluded.updated_at`,
     [payload.paused ? 1 : 0, event.id, event.ts, event.ts],
+  );
+}
+
+/**
+ * `AutopilotCapSet` synthetic-event payload (fn-725) — the global autopilot
+ * concurrency cap surfaced on the `keeper autopilot` viewer banner.
+ *
+ * `max_concurrent_jobs`: a positive integer ceiling on concurrent
+ * root-occupants, or `null` for unlimited (the default). The daemon's
+ * boot-append FREEZES `resolveConfig().maxConcurrentJobs` into this payload
+ * on main at mint time — the config is NEVER read in the fold (re-fold
+ * determinism). Like {@link AutopilotPausedPayload}, a typed value-carrying
+ * event rather than a generic `SettingChanged{key,value}` so per-knob
+ * invariants stay co-located (planetgeek event-versioning playbook).
+ */
+interface AutopilotCapSetPayload {
+  max_concurrent_jobs: number | null;
+}
+
+/**
+ * Parse an `AutopilotCapSet` event payload. NULL-TOLERANT — unlike
+ * {@link extractAutopilotPausedPayload} (which rejects anything but a literal
+ * boolean), the cap's `null` is a first-class legal value (= unlimited), so a
+ * missing/null field folds to `{ max_concurrent_jobs: null }` rather than a
+ * dropped event. Any non-positive / non-integer / non-number value also folds
+ * to `null` (= unlimited) — defensive against a corrupted producer, matching
+ * the config parser's "0/negative/non-integer/absent → unlimited" contract.
+ * NEVER throws (a throw inside the fold wedges the reducer); a malformed JSON
+ * blob folds to `null`.
+ */
+function extractAutopilotCapSetPayload(
+  event: Event,
+): AutopilotCapSetPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    // Empty payload → unlimited (not a dropped event: the row must still
+    // fold so a boot-append with a missing value lands NULL = unlimited).
+    return { max_concurrent_jobs: null };
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<AutopilotCapSetPayload>;
+    const raw = parsed.max_concurrent_jobs;
+    if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
+      return { max_concurrent_jobs: null };
+    }
+    return { max_concurrent_jobs: raw };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse AutopilotCapSet payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return { max_concurrent_jobs: null };
+  }
+}
+
+/**
+ * Fold one synthetic `AutopilotCapSet` event (fn-725). UPSERT on the singleton
+ * `id = 1`, setting ONLY `max_concurrent_jobs` and PRESERVING `paused` on
+ * conflict — symmetric to {@link foldAutopilotPaused}'s preservation of
+ * `max_concurrent_jobs`. The two arms share `id = 1`, so each MUST preserve
+ * the other's column or a toggle clobbers the sibling.
+ *
+ * The INSERT path (first-ever event on a fresh row) needs a `paused` value
+ * (NOT NULL column) — bind `1` (paused), matching the boot-append ORDERING:
+ * the daemon appends `AutopilotPaused{paused:true}` BEFORE `AutopilotCapSet`,
+ * so the cap arm always hits the CONFLICT branch in practice and the INSERT
+ * default is only a defensive fallback for a log that somehow carries a cap
+ * event before any pause event (re-fold over such a log still converges:
+ * paused boots true, matching autopilot's "boots paused" contract).
+ *
+ * Pure function of the event payload + persisted row — no `Date.now()`, no
+ * env read, no `resolveConfig()`. Runs INSIDE the open `BEGIN IMMEDIATE`
+ * transaction; performs zero cursor work. Malformed payload → unlimited
+ * (NULL), never a throw — the cursor still advances.
+ */
+function foldAutopilotCapSet(db: Database, event: Event): void {
+  const payload = extractAutopilotCapSetPayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO autopilot_state (
+       id, paused, last_event_id, created_at, updated_at, max_concurrent_jobs
+     ) VALUES (1, 1, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       max_concurrent_jobs = excluded.max_concurrent_jobs,
+       last_event_id = excluded.last_event_id,
+       -- paused NOT touched here: shared singleton row with
+       -- foldAutopilotPaused — a cap re-arm MUST preserve the live
+       -- pause/play flag. created_at preserved (first-observation "since").
+       updated_at = excluded.updated_at`,
+    [event.id, event.ts, event.ts, payload.max_concurrent_jobs],
   );
 }
 
@@ -7913,6 +8010,8 @@ export function applyEvent(
       foldDispatchExpired(db, event);
     } else if (event.hook_event === "AutopilotPaused") {
       foldAutopilotPaused(db, event);
+    } else if (event.hook_event === "AutopilotCapSet") {
+      foldAutopilotCapSet(db, event);
     } else if (event.hook_event === "BackendExecSnapshot") {
       // retired fn-684 — fold to no-op so historical events advance the
       // cursor without touching the jobs projection. MUST stay an explicit

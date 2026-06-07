@@ -27,6 +27,7 @@
 
 import { expect, test } from "bun:test";
 import {
+  autopilotBannerLabel,
   buildCurrentRows,
   buildRetryFrame,
   buildSetPausedFrame,
@@ -35,6 +36,7 @@ import {
   predictNextDispatches,
   projectAutopilotPaused,
   projectFailedRows,
+  projectMaxConcurrentJobs,
   renderBody,
   renderDependencyGraph,
 } from "../cli/autopilot";
@@ -795,6 +797,98 @@ test("projectAutopilotPaused — non-number `paused` falls back to true (safer s
     },
   ];
   expect(projectAutopilotPaused(rows2)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// projectMaxConcurrentJobs — coerce the singleton `autopilot_state.
+// max_concurrent_jobs` column to the banner-facing cap (socket-sourced, never
+// config.yaml). Positive integer → that cap; NULL / absent / empty-rows /
+// non-positive → null (= unlimited, rendered `∞`). fn-725.
+// ---------------------------------------------------------------------------
+
+test("projectMaxConcurrentJobs — positive integer row → that cap (fn-725)", () => {
+  const rows = [
+    {
+      id: 1,
+      paused: 0,
+      last_event_id: 42,
+      created_at: 1,
+      updated_at: 1,
+      max_concurrent_jobs: 3,
+    },
+  ];
+  expect(projectMaxConcurrentJobs(rows)).toBe(3);
+});
+
+test("projectMaxConcurrentJobs — NULL column → null (unlimited) (fn-725)", () => {
+  // SQL NULL wire-decodes to JS null = unlimited.
+  const rows = [
+    {
+      id: 1,
+      paused: 0,
+      last_event_id: 1,
+      created_at: 1,
+      updated_at: 1,
+      max_concurrent_jobs: null,
+    },
+  ];
+  expect(projectMaxConcurrentJobs(rows)).toBeNull();
+});
+
+test("projectMaxConcurrentJobs — missing column (pre-v60 wire shape) → null (fn-725)", () => {
+  const rows = [
+    { id: 1, paused: 0, last_event_id: 1, created_at: 1, updated_at: 1 },
+  ];
+  expect(projectMaxConcurrentJobs(rows)).toBeNull();
+});
+
+test("projectMaxConcurrentJobs — empty rows (singleton not folded yet) → null (fn-725)", () => {
+  // Boot-race empty-rows case — the full absent → unlimited path.
+  expect(projectMaxConcurrentJobs([])).toBeNull();
+});
+
+test("projectMaxConcurrentJobs — non-positive / non-integer values → null (fn-725)", () => {
+  const mk = (v: unknown) => [
+    {
+      id: 1,
+      paused: 0,
+      last_event_id: 1,
+      created_at: 1,
+      updated_at: 1,
+      max_concurrent_jobs: v,
+    },
+  ];
+  expect(projectMaxConcurrentJobs(mk(0))).toBeNull();
+  expect(projectMaxConcurrentJobs(mk(-2))).toBeNull();
+  expect(projectMaxConcurrentJobs(mk(2.5))).toBeNull();
+  expect(projectMaxConcurrentJobs(mk("3"))).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// autopilotBannerLabel — the persistent banner pill: play/pause pill +
+// concurrency-cap suffix. `[playing] · max 3` (finite) / `· max ∞`
+// (unlimited). Sourced from viewer state, never config. fn-725.
+// ---------------------------------------------------------------------------
+
+test("autopilotBannerLabel — finite cap renders `[playing] · max 3` (fn-725)", () => {
+  expect(autopilotBannerLabel({ paused: false, maxConcurrentJobs: 3 })).toBe(
+    "[playing] · max 3",
+  );
+});
+
+test("autopilotBannerLabel — unlimited cap renders `· max ∞` (fn-725)", () => {
+  expect(autopilotBannerLabel({ paused: true, maxConcurrentJobs: null })).toBe(
+    "[paused] · max ∞",
+  );
+});
+
+test("autopilotBannerLabel — paused flag drives the pill independent of cap (fn-725)", () => {
+  expect(autopilotBannerLabel({ paused: true, maxConcurrentJobs: 5 })).toBe(
+    "[paused] · max 5",
+  );
+  expect(autopilotBannerLabel({ paused: false, maxConcurrentJobs: null })).toBe(
+    "[playing] · max ∞",
+  );
 });
 
 // ---------------------------------------------------------------------------

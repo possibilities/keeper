@@ -14703,6 +14703,149 @@ test("zero-event projection: a fresh DB has zero autopilot_state rows (fn-667)",
 });
 
 // ---------------------------------------------------------------------------
+// Schema v60 (fn-725) — `AutopilotCapSet{max_concurrent_jobs}` folds the
+// global autopilot concurrency cap into the SAME singleton `autopilot_state`
+// row as `paused`. The two fold arms share `id = 1`, so each MUST preserve
+// the other's column on conflict (a cap re-arm never clobbers the live
+// pause flag; a pause toggle never resets the cap). Null-tolerant extractor:
+// missing / null / non-positive / malformed → NULL (= unlimited).
+// ---------------------------------------------------------------------------
+
+function autopilotCapSetEvent(
+  maxConcurrentJobs: number | null,
+  sessionId = "autopilot",
+): number {
+  return insertEvent({
+    hook_event: "AutopilotCapSet",
+    session_id: sessionId,
+    data: JSON.stringify({ max_concurrent_jobs: maxConcurrentJobs }),
+  });
+}
+
+function getAutopilotStateFull() {
+  return db.query("SELECT * FROM autopilot_state WHERE id = 1").get() as {
+    id: number;
+    paused: number;
+    last_event_id: number;
+    created_at: number;
+    updated_at: number;
+    max_concurrent_jobs: number | null;
+  } | null;
+}
+
+test("AutopilotCapSet UPSERTs the singleton row with the cap and advances the cursor (fn-725)", () => {
+  const eventId = autopilotCapSetEvent(3);
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateFull();
+  expect(row).not.toBeNull();
+  expect(row?.id).toBe(1);
+  expect(row?.max_concurrent_jobs).toBe(3);
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("AutopilotCapSet null payload folds the cap to SQL NULL (= unlimited) (fn-725)", () => {
+  autopilotCapSetEvent(null);
+  drainAll();
+  const row = getAutopilotStateFull();
+  expect(row).not.toBeNull();
+  expect(row?.max_concurrent_jobs).toBeNull();
+});
+
+test("AutopilotCapSet then AutopilotPaused: a pause toggle PRESERVES the cap (fn-725)", () => {
+  // Boot order in daemon.ts is paused-then-cap, but the cross-preservation
+  // invariant must hold regardless of order. Here: cap first, then a pause
+  // flip — the cap MUST survive the pause UPSERT.
+  autopilotCapSetEvent(3);
+  drainAll();
+  expect(getAutopilotStateFull()?.max_concurrent_jobs).toBe(3);
+  autopilotPausedEvent(false);
+  drainAll();
+  const row = getAutopilotStateFull();
+  expect(row?.paused).toBe(0); // pause flip landed
+  expect(row?.max_concurrent_jobs).toBe(3); // cap PRESERVED across the toggle
+});
+
+test("AutopilotPaused then AutopilotCapSet: a cap re-arm PRESERVES paused (fn-725)", () => {
+  // The daemon boot order: paused re-arm THEN cap re-arm. The cap UPSERT
+  // must PRESERVE the just-folded `paused` flag (it omits `paused` from its
+  // SET clause).
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateFull()?.paused).toBe(1);
+  autopilotCapSetEvent(5);
+  drainAll();
+  const row = getAutopilotStateFull();
+  expect(row?.max_concurrent_jobs).toBe(5); // cap landed
+  expect(row?.paused).toBe(1); // paused PRESERVED across the cap UPSERT
+});
+
+test("AutopilotCapSet INSERT path (cap before any pause) defaults paused=1 (fn-725)", () => {
+  // Defensive: a log whose FIRST autopilot_state event is a cap (no prior
+  // pause) hits the INSERT branch, which binds paused=1 (autopilot's
+  // boots-paused contract) so the NOT NULL column is satisfiable.
+  autopilotCapSetEvent(2);
+  drainAll();
+  const row = getAutopilotStateFull();
+  expect(row?.max_concurrent_jobs).toBe(2);
+  expect(row?.paused).toBe(1);
+});
+
+test("AutopilotCapSet malformed/non-positive payloads fold to NULL (= unlimited), cursor advances (fn-725)", () => {
+  // Null-tolerant extractor: unlike AutopilotPaused (which DROPS a malformed
+  // event), the cap arm always lands a row with max_concurrent_jobs=NULL for
+  // a bad/absent/non-positive value. Seed a pause first so the row exists,
+  // then fold each malformed cap and assert the cap reads NULL.
+  autopilotPausedEvent(true);
+  drainAll();
+  const malformed = [
+    { data: "{ not json" },
+    { data: JSON.stringify({}) }, // missing key
+    { data: JSON.stringify({ max_concurrent_jobs: null }) },
+    { data: JSON.stringify({ max_concurrent_jobs: 0 }) }, // non-positive
+    { data: JSON.stringify({ max_concurrent_jobs: -3 }) }, // negative
+    { data: JSON.stringify({ max_concurrent_jobs: 2.5 }) }, // non-integer
+    { data: JSON.stringify({ max_concurrent_jobs: "3" }) }, // non-number
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: "AutopilotCapSet",
+      session_id: "autopilot",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  const row = getAutopilotStateFull();
+  expect(row?.max_concurrent_jobs).toBeNull();
+  expect(row?.paused).toBe(1); // paused preserved through every cap fold
+  expect(getCursor()).toBe(lastId);
+});
+
+test("from-scratch re-fold reproduces autopilot_state byte-identically with mixed paused/cap events (fn-725)", () => {
+  // Seed a representative boot+steady-state sequence interleaving both event
+  // kinds. A cursor=0 rewind + DELETE + re-drain MUST reproduce the row
+  // byte-for-byte (re-fold determinism — the cap is frozen in the payload).
+  autopilotPausedEvent(true); // boot pause re-arm
+  autopilotCapSetEvent(3); // boot cap re-arm
+  autopilotPausedEvent(false); // RPC play flip
+  autopilotCapSetEvent(5); // (e.g. restart re-mint)
+  autopilotPausedEvent(true); // RPC pause flip
+  drainAll();
+  const before = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  // Final state sanity: latest paused=1, latest cap=5.
+  expect(getAutopilotStateFull()?.paused).toBe(1);
+  expect(getAutopilotStateFull()?.max_concurrent_jobs).toBe(5);
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  drainAll();
+  const after = db.query("SELECT * FROM autopilot_state ORDER BY id ASC").all();
+  expect(after).toEqual(before);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v46 / fn-666 — planctl-file attribution mint
 // ---------------------------------------------------------------------------
 

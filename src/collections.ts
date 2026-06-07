@@ -718,7 +718,17 @@ export const DISPATCH_FAILURES_DESCRIPTOR: CollectionDescriptor = {
 export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
   name: "autopilot_state",
   table: "autopilot_state",
-  columns: ["id", "paused", "last_event_id", "created_at", "updated_at"],
+  columns: [
+    "id",
+    "paused",
+    "last_event_id",
+    "created_at",
+    "updated_at",
+    // fn-725 (schema v60): the global autopilot concurrency cap. Rides the
+    // subscribe wire so the viewer renders it next to the play/pause pill
+    // from the socket ONLY (never reads config.yaml). NULL = unlimited → `∞`.
+    "max_concurrent_jobs",
+  ],
   pk: "id",
   version: "last_event_id",
   sortable: new Set(["id", "last_event_id", "created_at", "updated_at"]),

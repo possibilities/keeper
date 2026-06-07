@@ -865,6 +865,30 @@ export function projectAutopilotPaused(
   return raw !== 0;
 }
 
+/**
+ * Coerce a singleton `autopilot_state` wire row's `max_concurrent_jobs`
+ * column to the banner-facing cap. The column is a NULLABLE INTEGER (a
+ * positive cap, or SQL NULL = unlimited). Sourced ENTIRELY over the socket —
+ * the viewer NEVER reads config.yaml. Defensive across the full
+ * absent → unlimited path: an empty row set (singleton hasn't folded yet —
+ * sub-ms boot race), a NULL value (wire-decoded as JS `null`), a missing
+ * column (pre-v60 wire shape), or any non-positive / non-integer value all
+ * return `null` (= unlimited, rendered `∞`); only a positive integer returns
+ * a numeric cap. Pure — exported for tests. fn-725.
+ */
+export function projectMaxConcurrentJobs(
+  rows: Record<string, unknown>[],
+): number | null {
+  if (rows.length === 0) {
+    return null;
+  }
+  const raw = rows[0]?.max_concurrent_jobs;
+  if (typeof raw !== "number" || !Number.isInteger(raw) || raw <= 0) {
+    return null;
+  }
+  return raw;
+}
+
 // ---------------------------------------------------------------------------
 // Body renderer — pure (fixtures → lines).
 // ---------------------------------------------------------------------------
@@ -1158,6 +1182,28 @@ interface ViewerState {
   snap: ReadinessClientSnapshot | null;
   failed: FailedRow[];
   paused: boolean;
+  // fn-725: the global autopilot concurrency cap, sourced over the socket
+  // from the `autopilot_state` singleton (NEVER config.yaml). `null` =
+  // unlimited (rendered `∞`). Seeded `null` and overwritten by the
+  // `autopilot_state` subscribe edge alongside `paused`.
+  maxConcurrentJobs: number | null;
+}
+
+/**
+ * Render the persistent banner pill from viewer state: the play/pause pill
+ * plus the fn-725 concurrency-cap suffix. `[playing] · max 3` for a finite
+ * cap, `[playing] · max ∞` for unlimited (`null`). Pure — exported for
+ * tests. The cap is read from `state.maxConcurrentJobs` (socket-sourced via
+ * `projectMaxConcurrentJobs`), never from config.
+ */
+export function autopilotBannerLabel(state: {
+  paused: boolean;
+  maxConcurrentJobs: number | null;
+}): string {
+  const pill = state.paused ? "[paused]" : "[playing]";
+  const cap =
+    state.maxConcurrentJobs === null ? "∞" : String(state.maxConcurrentJobs);
+  return `${pill} · max ${cap}`;
 }
 
 async function runViewer(sockPath: string): Promise<void> {
@@ -1172,12 +1218,16 @@ async function runViewer(sockPath: string): Promise<void> {
     // (`row.paused === 1`), so this seed is only ever visible for the
     // sub-ms window between viewer launch and the first subscribe edge.
     paused: true,
+    // fn-725: seed `null` (= unlimited) — the safe default before the
+    // `autopilot_state` subscribe edge lands the real folded cap. Sourced
+    // ONLY over the socket; the viewer never reads config.yaml.
+    maxConcurrentJobs: null,
   };
 
   const view = createViewShell<ViewerState>({
     script: "autopilot",
     title: "autopilot",
-    persistentBannerPill: () => (state.paused ? "[paused]" : "[playing]"),
+    persistentBannerPill: () => autopilotBannerLabel(state),
     renderBody: (snap) => {
       // The view-shell's TSnap is our own `ViewerState`; we ignore the
       // arg (`snap === state` because we pass it through `view.emit`)
@@ -1212,10 +1262,10 @@ async function runViewer(sockPath: string): Promise<void> {
     },
   });
 
-  // Seed the banner immediately so the human sees `[paused]` before the
-  // first snapshot lands — same shape as board's persistent-pill restore
-  // pattern.
-  view.liveShell.setStatus(state.paused ? "[paused]" : "[playing]");
+  // Seed the banner immediately so the human sees `[paused] · max ∞`
+  // before the first snapshot lands — same shape as board's persistent-pill
+  // restore pattern.
+  view.liveShell.setStatus(autopilotBannerLabel(state));
 
   const readinessHandle = subscribeReadiness({
     sockPath,
@@ -1253,12 +1303,18 @@ async function runViewer(sockPath: string): Promise<void> {
     onRows: (rows) => {
       const paused = projectAutopilotPaused(rows);
       if (paused === null) {
-        // Singleton hasn't folded yet (sub-ms boot race). Leave the
-        // seed `state.paused` untouched and wait for the next edge.
+        // Singleton hasn't folded yet (sub-ms boot race) — empty row set.
+        // Leave the seed `state.paused` / `state.maxConcurrentJobs`
+        // untouched and wait for the next edge. (`projectMaxConcurrentJobs`
+        // would also return `null` here, so there is nothing real to fold.)
         return;
       }
       state.paused = paused;
-      view.liveShell.setStatus(state.paused ? "[paused]" : "[playing]");
+      // fn-725: the cap rides the SAME singleton wire row as `paused` — fold
+      // it on every edge so a config-change-then-restart's re-minted cap and
+      // a live pause/play toggle both land on the banner. `null` = unlimited.
+      state.maxConcurrentJobs = projectMaxConcurrentJobs(rows);
+      view.liveShell.setStatus(autopilotBannerLabel(state));
       view.emit(state);
     },
     onLifecycle: view.emitLifecycle,

@@ -996,6 +996,70 @@ function runDaemon(): void {
         null, // planctl_files
       ],
     );
+    // fn-725 task .2: unconditional boot-append of an `AutopilotCapSet`
+    // re-arm carrying the global concurrency cap, minted AFTER the
+    // `AutopilotPaused` re-arm above (so the cap fold always hits the
+    // shared-singleton CONFLICT branch and preserves the just-folded
+    // `paused` flag) and BEFORE the trailing `drainToCompletion` +
+    // `serverWorker` spawn (so a viewer subscribing the instant the socket
+    // opens reads the cap, never an empty/stale surface).
+    //
+    // The cap value is read from config HERE, on main, and FROZEN into the
+    // event payload — `resolveConfig()` is NEVER called inside the fold
+    // (re-fold determinism: a cursor=0 re-drain reproduces the row
+    // byte-identically from the event's own frozen value). `null` =
+    // unlimited round-trips as JSON `null` → SQL NULL → wire null → `∞` in
+    // the viewer. Like `zellijSession` / the `AutopilotPaused` re-arm, the
+    // column LAGS config until the next daemon restart re-mints — the
+    // restart-to-apply contract every keeper config key shares.
+    //
+    // Raw `db.run` INSERT mirrors the `AutopilotPaused` re-arm above; the
+    // column list MUST stay in sync with `prepareStmts`' prepared form.
+    db.run(
+      `INSERT INTO events (
+         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+         planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+         planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+         bash_mutation_kind, bash_mutation_targets, planctl_files
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      [
+        Date.now() / 1000, // unix seconds as REAL — matches the hook + every other synthetic
+        "autopilot", // stable synthetic session_id
+        null, // pid
+        "AutopilotCapSet",
+        "autopilot_state", // synthetic event_type tag
+        null, // tool_name
+        null, // matcher
+        null, // cwd
+        null, // permission_mode
+        null, // agent_id
+        null, // agent_type
+        null, // stop_hook_active
+        // Config read on MAIN, frozen into the payload. `?? null` keeps the
+        // JSON value a literal `null` (= unlimited) when config omits the key.
+        JSON.stringify({
+          max_concurrent_jobs: resolveConfig().maxConcurrentJobs ?? null,
+        }),
+        null, // subagent_agent_id
+        null, // spawn_name
+        null, // start_time
+        null, // slash_command
+        null, // skill_name
+        null, // planctl_op
+        null, // planctl_target
+        null, // planctl_epic_id
+        null, // planctl_task_id
+        null, // planctl_subject_present
+        null, // tool_use_id
+        null, // config_dir
+        null, // planctl_queue_jump
+        null, // bash_mutation_kind
+        null, // bash_mutation_targets
+        null, // planctl_files
+      ],
+    );
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
   });
 
