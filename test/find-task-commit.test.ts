@@ -29,6 +29,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
+import { initRepo } from "./helpers/git-repo";
 import { sandboxEnv as buildSandboxEnv } from "./helpers/sandbox-env";
 
 const ROOT = realpathSync(join(import.meta.dir, ".."));
@@ -77,10 +78,7 @@ function git(cwd: string, ...args: string[]): string {
 function makeRepo(name: string): string {
   const repo = join(tmpDir, name);
   mkdirSync(repo, { recursive: true });
-  git(repo, "init", "-q", "-b", "main");
-  git(repo, "config", "user.email", "t@t");
-  git(repo, "config", "user.name", "t");
-  git(repo, "config", "commit.gpgsign", "false");
+  initRepo(repo);
   return repo;
 }
 

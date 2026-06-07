@@ -31,6 +31,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
+import { initRepo as initGitRepo } from "./helpers/git-repo";
 import { sandboxEnv as buildSandboxEnv } from "./helpers/sandbox-env";
 
 const ROOT = realpathSync(join(import.meta.dir, ".."));
@@ -84,10 +85,7 @@ function git(...args: string[]): string {
 
 /** Initialize `repo` as a git repo with an identity and an initial commit. */
 function initRepo(): void {
-  git("init", "-q", "-b", "main");
-  git("config", "user.email", "t@t");
-  git("config", "user.name", "t");
-  git("config", "commit.gpgsign", "false");
+  initGitRepo(repo);
   writeFileSync(join(repo, "seed.txt"), "seed\n");
   git("add", "--", "seed.txt");
   git("commit", "-q", "-m", "init");

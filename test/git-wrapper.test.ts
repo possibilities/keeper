@@ -2,6 +2,7 @@ import { afterAll, describe, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { initRepo } from "./helpers/git-repo";
 
 const WRAPPER = join(import.meta.dir, "..", "plugin", "bin", "git");
 const REAL_GIT = "/usr/bin/git";
@@ -36,14 +37,10 @@ function spawn(
 /** Make a fresh tmp git repo with one staged file ready to commit. */
 function makeRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "keeper-git-wrapper-"));
-  expect(spawn([REAL_GIT, "init", "-q"], { cwd: dir }).code).toBe(0);
-  expect(
-    spawn([REAL_GIT, "config", "user.email", "test@example.com"], { cwd: dir })
-      .code,
-  ).toBe(0);
-  expect(
-    spawn([REAL_GIT, "config", "user.name", "test"], { cwd: dir }).code,
-  ).toBe(0);
+  // Init + identity + `commit.gpgsign false` via the shared helper. The
+  // commit-time injection under test is driven explicitly by the WRAPPER /
+  // REAL_GIT spawns below, so the setup binary doesn't matter here.
+  initRepo(dir);
   writeFileSync(join(dir, "a.txt"), "hello\n");
   expect(spawn([REAL_GIT, "add", "a.txt"], { cwd: dir }).code).toBe(0);
   return dir;

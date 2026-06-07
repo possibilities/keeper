@@ -29,6 +29,7 @@ import { CommitWorkLock, FLOCK_CONSTANTS } from "../src/commit-work/flock";
 import { gitExec } from "../src/commit-work/git-exec";
 import { resolveSessionId } from "../src/commit-work/session-id";
 import { openDb } from "../src/db";
+import { initRepo } from "./helpers/git-repo";
 
 let tmpDir: string;
 let dbPath: string;
@@ -272,9 +273,7 @@ describe("getSessionDirtyFiles live git integration", () => {
       mkdtempSync(join(tmpdir(), "keeper-cw-fixture-")),
     );
     try {
-      await gitExec(["init", "-q"], { cwd: repo });
-      await gitExec(["config", "user.email", "t@t"], { cwd: repo });
-      await gitExec(["config", "user.name", "t"], { cwd: repo });
+      initRepo(repo);
       // committed-then-clean file (NOT dirty), plus a tracked-modified file and
       // an untracked file (both dirty).
       writeFileSync(join(repo, "tracked.ts"), "v1\n");

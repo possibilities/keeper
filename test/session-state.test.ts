@@ -27,6 +27,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
+import { initRepo } from "./helpers/git-repo";
 import { sandboxEnv as buildSandboxEnv } from "./helpers/sandbox-env";
 
 const ROOT = realpathSync(join(import.meta.dir, ".."));
@@ -74,10 +75,7 @@ function git(...args: string[]): string {
 
 /** Initialize `repo` as a git repo with an identity (NO commit yet). */
 function initRepoBare(): void {
-  git("init", "-q", "-b", "main");
-  git("config", "user.email", "t@t");
-  git("config", "user.name", "t");
-  git("config", "commit.gpgsign", "false");
+  initRepo(repo);
 }
 
 /** Add an initial commit to `repo`. Returns its full SHA. */

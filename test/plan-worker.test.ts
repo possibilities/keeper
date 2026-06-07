@@ -53,6 +53,7 @@ import {
   taskIdFromStatePath,
   taskNumberFromId,
 } from "../src/plan-worker";
+import { initRepo } from "./helpers/git-repo";
 
 let tmpDir: string;
 
@@ -1704,14 +1705,7 @@ function git(cwd: string, ...args: string[]): void {
 
 /** Initialize a quiet test git repo so `isPathInHead` has a HEAD to read. */
 function gitInit(root: string): void {
-  for (const args of [
-    ["init", "-q", "-b", "main"],
-    ["config", "user.email", "test@example.com"],
-    ["config", "user.name", "Test"],
-    ["config", "commit.gpgsign", "false"],
-  ] as const) {
-    git(root, ...args);
-  }
+  initRepo(root);
   // An initial empty commit so HEAD resolves (no commits → cat-file -e HEAD:
   // fails uniformly; the gate correctly suppresses, but tests want HEAD to
   // exist so the predicate's "committed" arm is reachable).

@@ -47,6 +47,7 @@ import {
   shouldWatchRoot,
 } from "../src/git-worker";
 import { RescanScheduler, type SchedulerTimers } from "../src/rescan";
+import { initRepo as initGitRepo } from "./helpers/git-repo";
 
 // ---------------------------------------------------------------------------
 // parsePorcelainV2 — kept verbatim from pre-fn-633.5; the producer's
@@ -420,19 +421,9 @@ test("buildGitSnapshot uses lstat so a symlink reports the link's own mtime, not
 
 function gitInit(root: string): void {
   // Minimal config so `git add` / `git commit` work without a global git
-  // identity. Suppress stderr to keep the test output clean on hosts that
-  // print upgrade-suggestion banners.
-  for (const args of [
-    ["init", "-q", "-b", "main"],
-    ["config", "user.email", "test@example.com"],
-    ["config", "user.name", "Test"],
-  ] as const) {
-    const res = Bun.spawnSync(["git", "-C", root, ...args], {
-      stdout: "ignore",
-      stderr: "ignore",
-    });
-    if (!res.success) throw new Error(`git ${args.join(" ")} failed`);
-  }
+  // identity, plus `commit.gpgsign false` so signed-by-default hosts don't
+  // wedge — the shared helper centralizes the exact init+config sequence.
+  initGitRepo(root);
 }
 
 function gitHashObjectStored(root: string, relPath: string): string {
@@ -833,7 +824,7 @@ function git(cwd: string, ...args: string[]): string {
 
 function initRepo(): string {
   const dir = mkdtempSync(join(tmpdir(), "keeper-headfs-"));
-  git(dir, "init", "-q", "-b", "main");
+  initGitRepo(dir);
   writeFileSync(join(dir, "a.txt"), "hello\n");
   git(dir, "add", "-A");
   git(dir, "commit", "-qm", "init");
