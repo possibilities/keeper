@@ -21,7 +21,7 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -1009,6 +1009,33 @@ describe("tick", () => {
       .run();
     writer.db.close();
   }
+
+  test("first boot before keeperd creates keeper.db — no throw, baseline shape, no spawn", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    let spawnCalls = 0;
+    const spawn: SpawnAgentFn = async () => {
+      spawnCalls++;
+      return { exitCode: 0, ackedFingerprints: [] };
+    };
+    // Fresh tmpdir: keeper.db does not exist yet. The read-only openDb in scan
+    // would let SQLite throw; tick's existsSync guard must short-circuit.
+    expect(existsSync(dbPath)).toBe(false);
+    let res!: Awaited<ReturnType<typeof tick>>;
+    await expect(
+      (async () => {
+        res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+      })(),
+    ).resolves.toBeUndefined();
+    expect(res).toEqual({
+      baselined: false,
+      spawned: false,
+      selectedCount: 0,
+      deliveredCount: 0,
+    });
+    expect(spawnCalls).toBe(0);
+    // No seen-state was written (we never reached the fold).
+    expect(existsSync(seenPath())).toBe(false);
+  });
 
   test("cold start baselines silently — no spawn, seen.json seeded", async () => {
     seedDispatchFailure();
