@@ -87,13 +87,20 @@ Carve-outs are fine: `@parcel/watcher` on EXTERNAL trees (transcripts, `.planctl
 
 Any unrecoverable error (including a worker's `error` event) calls `fatalExit` →
 `process.exit(1)`; the LaunchAgent restarts the single recovery path. Never
-respawn a worker in-process.
+respawn a worker in-process. **Carve-out:** closing a stale/EPIPE UDS client
+connection (the fn-723 reaper: EPIPE-evict, stuck-pending TTL, max-conn cap) is
+connection hygiene, not self-heal — it touches only the server-worker's `conns`
+Set + the socket, never respawns a worker, never writes the DB, never emits a
+synthetic event.
 
 ## Worker contract
 
 - **`isMainThread` guard** — a plain import of the module is inert.
 - **Own `openDb` connection** (read-only for readers); never share main's.
-- **Typed messages** — `{ kind }` worker→main, `{ type }` main→worker.
+- **Typed messages** — `{ kind }` worker→main, `{ type }` main→worker. The UDS
+  client connection lifecycle (evict/cap, fn-723) is the server-worker's own
+  socket-handler concern — distinct from this `{type}`/`{kind}` worker↔main
+  message bus.
 - **Supervisor-owned lifecycle** — main spawns after migrate+boot-drain and is the
   only one that terminates (`shutdown` → await close → terminate). A worker owning
   an external resource MUST release it in its own shutdown handler.

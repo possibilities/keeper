@@ -627,7 +627,10 @@ collapses to plain stream output. Run any of them with
   no colorizer carve-out).
   The byte-compare emit gate keeps the stream quiet when row churn
   doesn't surface in the render. Reconnects across keeperd restarts;
-  Ctrl-C unsubscribes cleanly. Every emitted frame is mirrored to three
+  Ctrl-C unsubscribes cleanly — and so do SIGHUP, parent-death (a
+  ~2s `ppid === 1` poll), and controlling-TTY loss (stdin EOF), so an
+  orphaned viewer self-exits within ~2s instead of running headless
+  forever (fn-723). Every emitted frame is mirrored to three
   per-pid `/tmp` sidecar files (epics JSON state, frame text, unified
   diff vs. the previous emit); when stdout/stdin are both TTYs the
   client enters a real TUI (alt-screen + ring-buffered frame history
@@ -697,7 +700,8 @@ collapses to plain stream output. Run any of them with
   the sub-agent lines inside the collapse-controlled region; an empty
   / missing / malformed `monitors` blob produces no Monitors lines
   and never crashes the render. Same sidecar / TUI / non-TTY
-  contract as board.
+  contract as board — including the SIGHUP / parent-death / TTY-loss
+  self-exit (fn-723), so an orphaned jobs viewer exits within ~2s.
 
   ```sh
   keeper jobs             # live jobs list, default scope
@@ -737,7 +741,9 @@ collapses to plain stream output. Run any of them with
   Alt-screen TUI when stdout is a TTY; keymap `←/h/k` / `→/l/j` / `g` /
   `G/Esc` / `space` pause / `c` copy / `q` quit. SIGINT tears down the
   renderer (alt-screen exit, raw mode off) then disposes the subscribe
-  helper.
+  helper — as do SIGHUP, parent-death (a ~2s `ppid === 1` poll), and
+  controlling-TTY loss (stdin EOF), so an orphaned viewer self-exits
+  within ~2s (fn-723).
 
   ```sh
   keeper autopilot                       # viewer: current / predicted / failed + paused state
@@ -770,7 +776,9 @@ collapses to plain stream output. Run any of them with
   under non-TTY the TUI gate collapses to plain stream output).
   `--project-dir <path>` filters to one worktree root. SIGINT tears
   down the renderer (alt-screen exit, raw mode off) then disposes the
-  subscribe helper and exits 0.
+  subscribe helper and exits 0 — as do SIGHUP, parent-death (a ~2s
+  `ppid === 1` poll), and controlling-TTY loss (stdin EOF), so an
+  orphaned viewer self-exits within ~2s (fn-723).
 
   ```sh
   keeper git                          # all worktrees
@@ -802,7 +810,11 @@ collapses to plain stream output. Run any of them with
   (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`, indexed via a meta
   sidecar) carry the row set so the JSON sidecar captures the full input
   to the rendered frame. SIGINT disposes the subscription handle and
-  prints sidecar paths on exit.
+  prints sidecar paths on exit — and so do SIGHUP, parent-death (a ~2s
+  `ppid === 1` poll), and controlling-TTY loss (stdin EOF), so an
+  orphaned usage viewer self-exits within ~2s (fn-723); usage wires the
+  shared `armViewerExitTriggers` despite keeping its own raw SIGINT
+  teardown.
 
   ```sh
   keeper usage                # all profiles
@@ -985,7 +997,18 @@ offset) at the same `worldRev` run ONE `runQuery` SELECT + ONE
 around the shared `rows` blob — byte-identical to `encodeFrame`, no
 wire-protocol change; the memo's `entries` map is replaced wholesale the
 instant `worldRev` advances, and any memo-path throw degrades to the
-un-memoized `runQuery` + `encodeFrame` path.
+un-memoized `runQuery` + `encodeFrame` path. The server also reaps dead
+connections so its single-threaded diff loop never serializes against orphaned
+viewers (fn-723): a write that returns `< 0` (EPIPE/ECONNRESET on a diff
+write) evicts the connection from `conns`, and a connection whose pending
+write buffer stays stuck past a TTL is reaped too — the case `diffTick` can't
+EPIPE on because it skips backpressured conns. A `MAX_CONNECTIONS` cap (64)
+hard-bounds the set: at the cap a NEW connection is rejected with a
+`max_connections` error frame then closed (reject-new, not LRU-evict, so the
+oldest legit board survives), and hitting the cap logs loudly as a
+reaper-regression signal. There is NO ping/pong heartbeat — it was descoped
+(a faithfully-ponging orphan is indistinguishable from a quiet live viewer);
+the load-bearing fix for the orphan class is the client-side self-exit below.
 
 A **third** Worker thread is the transcript-title producer: it watches the
 external transcript tree (the `claude_projects_root` from
