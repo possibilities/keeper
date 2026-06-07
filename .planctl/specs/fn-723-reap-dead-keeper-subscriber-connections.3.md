@@ -36,5 +36,5 @@ one-line worker-contract note that the UDS client connection lifecycle
 - [ ] CLAUDE.md no-self-heal carve-out for connection reaping added; worker-contract note added.
 
 ## Done summary
-
+Documented the fn-723 connection lifecycle: README Architecture now covers EPIPE-evict + stuck-pending TTL + max-conn cap (64, reject-new, no ping/pong); Example clients lists SIGHUP/parent-death/TTY-loss self-exit per viewer (board/jobs/git/autopilot/usage); CLAUDE.md gained a no-self-heal carve-out for connection reaping and a worker-contract socket-lifecycle note.
 ## Evidence
