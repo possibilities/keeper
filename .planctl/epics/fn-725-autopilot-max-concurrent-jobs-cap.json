@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "rejected",
   "branch_name": "fn-725-autopilot-max-concurrent-jobs-cap",
   "bundles": [],
   "closer_done_at": "2026-06-07T03:51:26.800416Z",
@@ -18,5 +18,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T03:51:26.800416Z"
+  "updated_at": "2026-06-07T03:57:46.661851Z"
 }
