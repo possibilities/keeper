@@ -34,5 +34,5 @@ Run `bun run test:fast` 5× and `bun run test:slow` 5×; record wall times and c
 - [ ] `bun run test:fast` <10s, 0 fail over 5 runs
 
 ## Done summary
-
+Landed two-tier test gate: test:fast (--parallel --timeout=30000, 50 files, 0 crashes/0 fail over 5 runs, ~50s) and test:slow (serial integration+daemon+plan-worker). Carved plan-worker into the slow tier — its @parcel/watcher native NAPI addon panics under --parallel. Audited all fast-tier files: each sandboxes the six state paths to tmpdir or is pure in-memory; before/after snapshot of ~/.local/state/keeper proved zero real-feed pollution. Retired test:isolated (no in-repo callers).
 ## Evidence
