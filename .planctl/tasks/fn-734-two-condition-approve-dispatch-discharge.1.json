@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-07T22:14:25.303603Z",
+  "depends_on": [],
+  "epic": "fn-734-two-condition-approve-dispatch-discharge",
+  "id": "fn-734-two-condition-approve-dispatch-discharge.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Exempt live approve panes from pause-boot reap",
+  "updated_at": "2026-06-07T22:14:25.303603Z"
+}
