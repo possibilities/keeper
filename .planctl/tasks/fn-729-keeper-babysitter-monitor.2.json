@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-07T14:56:04.543389Z",
+  "depends_on": [
+    "fn-729-keeper-babysitter-monitor.1"
+  ],
+  "epic": "fn-729-keeper-babysitter-monitor",
+  "id": "fn-729-keeper-babysitter-monitor.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "tick escalation and seen-state",
+  "updated_at": "2026-06-07T14:56:04.543389Z"
+}
