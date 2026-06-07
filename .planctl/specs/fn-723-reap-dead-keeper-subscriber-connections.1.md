@@ -54,5 +54,5 @@ viewer does NOT exit.
 - [ ] `bun test test/view-shell.test.ts` green; lint + typecheck clean.
 
 ## Done summary
-
+Viewers now self-exit on parent/TTY death: added armViewerExitTriggers (SIGHUP, stdin-EOF on TTY, ~2s ppid===1 poll with launch-time guard), factored view-shell teardown into an idempotent exitCleanly, and routed usage.ts's own teardown through the shared triggers. 7 new view-shell tests; lint+typecheck clean.
 ## Evidence
