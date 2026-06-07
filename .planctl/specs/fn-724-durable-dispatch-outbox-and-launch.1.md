@@ -57,5 +57,5 @@ DEFAULT_CEILING_MS < PENDING_DISPATCH_TTL_MS. Assert SCHEMA_VERSION unchanged.
 - [ ] `bun test test/autopilot-worker.test.ts test/daemon.test.ts` green; lint+typecheck clean.
 
 ## Done summary
-
+Made the autopilot Dispatched mint durable-before-launch via an id-correlated dispatched-request/ack on the main<->autopilot-worker channel: confirmRunning now awaits main's durable insert before launch() (closing the fn-627 SessionStart-drains-before-Dispatched race), and widened ConfirmOutcome with 'indoubt' so a ceiling-hit with launch.ok keeps the pending_dispatches row and suppresses DispatchFailed. Reducer untouched, no schema bump (stays 59).
 ## Evidence
