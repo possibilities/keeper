@@ -305,6 +305,15 @@ export const META_MIN_INTERVAL_MS = 150;
  */
 const REPLAY_DEADLINE_MS = 5000;
 
+/**
+ * Bound on how long `shutdown()` waits for the realtime poll loop to observe
+ * `stopping` and exit before it closes the DB connection (fn-722 task .6). The
+ * loop checks `stopping` once per `pollMs` tick (floored at `MIN_POLL_MS`), so
+ * one cadence plus slack is ample; the cap guarantees a wedged loop can't block
+ * teardown forever (we exit the process right after the close regardless).
+ */
+const POLL_DRAIN_DEADLINE_MS = 500;
+
 /** Default page size when a `query` omits `limit`; the hard cap is the same. */
 export const DEFAULT_LIMIT = 100;
 /** Maximum page size — kept well below `MAX_IN_PARAMS` so a page is one query. */
@@ -2806,10 +2815,29 @@ function main(): void {
   }
 
   let stopping = false;
+  /**
+   * Resolves once the realtime `pollLoop` has fully exited. `shutdown()` awaits
+   * this BEFORE closing `db`, so an in-flight poll tick (its `query.get()` /
+   * `diffTick` both read `db`) can never race the close — the
+   * "Cannot use a closed database" leak fn-722 task .6 targets. The pollLoop's
+   * `.then` below settles it on loop exit; the `Bun.sleep` fallback bounds the
+   * wait so a wedged loop can't block teardown forever.
+   */
+  let resolvePollDone: (() => void) | null = null;
+  const pollDone = new Promise<void>((resolve) => {
+    resolvePollDone = resolve;
+  });
 
-  const shutdown = (): void => {
+  const shutdown = async (): Promise<void> => {
     stopping = true; // resolves the poll loop on its next iteration check
+    // Stop accepting + evict conns FIRST so any final diffTick has nothing to
+    // fan out to, then WAIT for the poll loop to observe `stopping` and exit
+    // before closing the connection it reads from. Without this await, the
+    // synchronous `db.close()` below raced a resumed `Bun.sleep` continuation
+    // inside `pollLoop` (its post-sleep `query.get()` reads `db`), throwing
+    // "Cannot use a closed database" out of the worker.
     server.stop();
+    await Promise.race([pollDone, Bun.sleep(POLL_DRAIN_DEADLINE_MS)]);
     try {
       db.close();
     } catch {
@@ -2839,7 +2867,9 @@ function main(): void {
       // distinct `type` so a stale reply for one bridge can't
       // wrong-resolve another bridge's awaiting promise.
       if ((msg as ShutdownMessage).type === "shutdown") {
-        shutdown();
+        // `shutdown` is async (it awaits the poll loop draining before closing
+        // the DB); fire-and-forget — it ends in `process.exit(0)`.
+        void shutdown();
         return;
       }
       if ((msg as KickMessage).type === "kick") {
@@ -2906,15 +2936,22 @@ function main(): void {
     () => server.conns,
     () => stopping,
     data.pollMs,
-  ).catch((err) => {
-    console.error("[server-worker] poll loop crashed:", err);
-    try {
-      server.stop();
-    } catch {
-      // best-effort
-    }
-    process.exit(1);
-  });
+  )
+    .then(() => {
+      // Clean loop exit (observed `stopping`). Signal `shutdown()` that the
+      // poll connection is idle so it can safely close `db` (fn-722 task .6
+      // closed-db-leak ordering).
+      resolvePollDone?.();
+    })
+    .catch((err) => {
+      console.error("[server-worker] poll loop crashed:", err);
+      try {
+        server.stop();
+      } catch {
+        // best-effort
+      }
+      process.exit(1);
+    });
 
   parentPort.postMessage({ kind: "ready" } satisfies ReadyMessage);
 }

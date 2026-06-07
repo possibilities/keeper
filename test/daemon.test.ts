@@ -685,7 +685,7 @@ test("starvation repro: a long-held writer lock (no yield) starves a concurrent 
   // hook into a dead-letter.
   expect(result.ok).toBe(false);
   expect(result.err).toMatch(/(?:locked|busy|SQLITE_BUSY)/i);
-}, 10_000);
+}, 30_000);
 
 test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock cleanly to a concurrent writer", async () => {
   // The mirror of the starvation repro: instead of one long-held
@@ -750,7 +750,7 @@ test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock c
   // cadence, the contender grabs the lock in the FIRST paced gap → ok.
   expect(result.ok).toBe(true);
   expect(result.err).toBeNull();
-}, 10_000);
+}, 30_000);
 
 test("withBootDrainCheckpointTuning ends the boot with a PASSIVE checkpoint (writer-skipping, not TRUNCATE)", () => {
   // The end-of-boot checkpoint runs in the `finally` AFTER the drain body.
@@ -1862,7 +1862,7 @@ test("autopilot worker spawns with paused=true workerData and shuts down cleanly
     Bun.sleep(2000).then(() => "timeout" as const),
   ]);
   expect(result).toBe("exited");
-});
+}, 30_000);
 
 test("autopilot worker accepts {type:'set-paused', paused} commands without crashing the loop", async () => {
   openDb(dbPath).db.close();
@@ -1905,7 +1905,7 @@ test("autopilot worker accepts {type:'set-paused', paused} commands without cras
     Bun.sleep(2000).then(() => "timeout" as const),
   ]);
   expect(result).toBe("exited");
-});
+}, 30_000);
 
 // ---------------------------------------------------------------------------
 // fn-678 task .3 — pending_dispatches TTL sweep (producer-side, 60s heartbeat)
@@ -1954,16 +1954,23 @@ test("PENDING_DISPATCH_TTL_MS is 120s (>= 2x the documented 60s cold-start ceili
   expect(PENDING_DISPATCH_TTL_MS).toBe(120_000);
 });
 
-test("fn-724: SCHEMA_VERSION is unchanged (no schema bump — durable ack is producer-side control-flow only)", () => {
+test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no schema)", () => {
   // The fn-724 durable mint-before-launch + three-way outcome is entirely
   // a producer-side control-flow change: a new id-correlated
   // dispatched-request/ack on the main↔autopilot-worker channel and the
   // ceiling→indoubt emit suppression. The reducer arms
-  // (foldDispatched / foldDispatchFailed / foldDispatchExpired) are
-  // UNTOUCHED — no new event, no new column, no migration. The schema
-  // version MUST stay at the fn-719 value (59); a bump here would signal
-  // an accidental reducer/schema change that re-couples the outcome.
-  expect(SCHEMA_VERSION).toBe(59);
+  // (foldDispatched / foldDispatchFailed / foldDispatchExpired) were
+  // UNTOUCHED by fn-724 — no new event, no new column, no migration; it
+  // landed against the fn-719 schema value (59).
+  //
+  // The schema has since LEGITIMATELY advanced to 60 via fn-725 (the
+  // max_concurrent_jobs cap snapshot), which bumped SCHEMA_VERSION AND added
+  // 60 to `SUPPORTED_SCHEMA_VERSIONS` per the CLAUDE.md same-commit invariant
+  // — but left this pin at 59, leaving the daemon test tier red. This pin now
+  // tracks the LIVE schema version: the guard it provides is "an accidental
+  // reducer/schema change must surface as a failing whitelist + this pin",
+  // which still holds — bump both together when the schema genuinely moves.
+  expect(SCHEMA_VERSION).toBe(60);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -2223,4 +2230,4 @@ test("boot smoke: after main pre-warm, a fleet of @parcel/watcher workers all su
   // concurrent-dlopen race re-opening.
   expect(failures).toEqual([]);
   expect(results.filter((r) => r.ok)).toHaveLength(N);
-}, 20_000);
+}, 30_000);

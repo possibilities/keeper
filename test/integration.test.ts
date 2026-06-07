@@ -34,6 +34,7 @@ import { epicNumberFromId, taskNumberFromId } from "../src/plan-worker";
 import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
 import { retryUntil } from "./helpers/retry-until";
 import { sandboxEnv } from "./helpers/sandbox-env";
+import { waitForDaemon } from "./helpers/wait-for-daemon";
 
 /** Repo root — this file lives at <root>/test, so one level up. */
 const ROOT = join(import.meta.dir, "..");
@@ -98,53 +99,69 @@ beforeEach(() => {
 });
 
 afterEach(async () => {
-  // Best-effort: if a test left the daemon running (e.g. it failed before the
-  // SIGTERM assertion), kill it so it can't leak into the next isolate.
-  if (daemon && daemon.exitCode === null) {
-    try {
-      daemon.kill("SIGKILL");
-      await daemon.exited;
-    } catch {
-      // already gone
-    }
-  }
-  // Reap every spawned victim-launcher. The happy path SIGKILLs and awaits
-  // exit, but a thrown / timed-out test bypasses that — and the launcher
-  // parks forever, so without this sweep it leaks. We spawn launchers
-  // `detached: true` (own process group), so a negative-pid kill takes out
-  // the launcher AND any in-flight grandchild hook in one shot.
-  while (victimLaunchers.length > 0) {
-    const v = victimLaunchers.pop();
-    if (!v || v.exitCode !== null) {
-      continue;
-    }
-    try {
-      // SIGKILL the whole process group. ESRCH is fine (already dead);
-      // EPERM shouldn't happen in tests but is also swallowed.
+  // Teardown is layered in try/finally so EVERY reclaim phase runs even if an
+  // earlier one throws unexpectedly: a leaked daemon-kill must not strand a
+  // parked victim-launcher (CPU-pegging leak observed in the wild), and neither
+  // must strand the socket/lock unlink or the tmpdir rm. The inner per-victim /
+  // per-path try/catches stay (they swallow the expected already-gone races);
+  // the outer try/finally is the belt-and-suspenders for the unexpected throw.
+  try {
+    // Best-effort: if a test left the daemon running (e.g. it failed before the
+    // SIGTERM assertion), kill it so it can't leak into the next isolate.
+    if (daemon && daemon.exitCode === null) {
       try {
-        process.kill(-v.pid, "SIGKILL");
+        daemon.kill("SIGKILL");
+        await daemon.exited;
       } catch {
-        // pgid kill may fail if the leader already exited — fall back to
-        // direct-pid kill so we still reap the launcher itself.
-        v.kill("SIGKILL");
+        // already gone
       }
-      await v.exited;
-    } catch {
-      // already gone
     }
-  }
-  // A SIGKILLed daemon never runs its socket-release teardown, so unlink the
-  // socket (+ lock) here too — a leftover would collide with the next isolate.
-  for (const p of [sockPath, `${sockPath}.lock`]) {
+  } finally {
     try {
-      if (existsSync(p)) {
-        unlinkSync(p);
+      // Reap every spawned victim-launcher. The happy path SIGKILLs and awaits
+      // exit, but a thrown / timed-out test bypasses that — and the launcher
+      // parks forever, so without this sweep it leaks. We spawn launchers
+      // `detached: true` (own process group), so a negative-pid kill takes out
+      // the launcher AND any in-flight grandchild hook in one shot.
+      while (victimLaunchers.length > 0) {
+        const v = victimLaunchers.pop();
+        if (!v || v.exitCode !== null) {
+          continue;
+        }
+        try {
+          // SIGKILL the whole process group. ESRCH is fine (already dead);
+          // EPERM shouldn't happen in tests but is also swallowed.
+          try {
+            process.kill(-v.pid, "SIGKILL");
+          } catch {
+            // pgid kill may fail if the leader already exited — fall back to
+            // direct-pid kill so we still reap the launcher itself.
+            v.kill("SIGKILL");
+          }
+          await v.exited;
+        } catch {
+          // already gone
+        }
       }
-    } catch {
-      // best-effort
+    } finally {
+      try {
+        // A SIGKILLed daemon never runs its socket-release teardown, so unlink
+        // the socket (+ lock) here too — a leftover would collide with the next
+        // isolate.
+        for (const p of [sockPath, `${sockPath}.lock`]) {
+          try {
+            if (existsSync(p)) {
+              unlinkSync(p);
+            }
+          } catch {
+            // best-effort
+          }
+        }
+      } finally {
+        rmSync(tmpDir, { recursive: true, force: true });
+      }
     }
   }
-  rmSync(tmpDir, { recursive: true, force: true });
 });
 
 /** Drain a piped stream to a string (for failure diagnostics). */
@@ -170,6 +187,32 @@ function sandboxedBaseEnv(): Record<string, string> {
     dbPath,
     clearAmbientIds: false,
     includeZellij: true,
+  });
+}
+
+/**
+ * Sandboxed env for every spawned daemon (`bun run src/daemon.ts`). Routes ALL
+ * SIX keeper state paths under the per-test tmpdir via `sandboxEnv`, PLUS the
+ * two daemon-only knobs `KEEPER_SOCK` and `KEEPER_CONFIG`.
+ *
+ * Why this matters (and why the old hand-rolled `{ ...process.env, KEEPER_DB,
+ * KEEPER_SOCK, KEEPER_CONFIG }` was a real bug, not just style): a daemon spawn
+ * that strands `KEEPER_DEAD_LETTER_DIR` at its production default boot-IMPORTS
+ * the human's REAL dead-letter backlog (`scanDeadLetterDir` at boot) — observed
+ * live as a 45MB tmp DB that never finished booting (socket never bound, every
+ * test timed out) AND a write into the real `~/.local/state/keeper/`
+ * restore/backstop/drop sidecars. Sandboxing all six closes the CLAUDE.md
+ * isolation invariant for the daemon spawn exactly as it's closed for the hook.
+ */
+function daemonSpawnEnv(
+  extra: Record<string, string | undefined> = {},
+): Record<string, string> {
+  return sandboxEnv({
+    tmpDir,
+    dbPath,
+    clearAmbientIds: false,
+    includeZellij: true,
+    extra: { KEEPER_SOCK: sockPath, KEEPER_CONFIG: configPath, ...extra },
   });
 }
 
@@ -250,23 +293,19 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
   // default socket (which would collide across isolates).
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
 
-  // Give the daemon time to open the writer connection, run boot drain (the DB
-  // is empty so it's instant), and spawn the wake worker.
-  await Bun.sleep(300);
+  // Wait for the daemon to bind its socket — a strict happens-after signal for
+  // migrate + boot drain + worker spawn. A fixed sleep raced the bootstrap and
+  // tripped the reader's open below with SQLITE_CANTOPEN on a loaded machine.
+  await waitForDaemon(sockPath);
 
   // A read-only connection mirrors the inspect CLI / external observer. Open it
   // AFTER the daemon has bootstrapped the schema (readers fail if the DB is
-  // missing).
+  // missing) — the readiness gate above guarantees the file is migrated.
   const { db: reader } = openDb(dbPath, { readonly: true });
 
   try {
@@ -303,17 +342,20 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
     }
 
     // --- events table: exactly the four rows we fired, in id order.
-    // Filter out the `AutopilotPaused` boot-append re-arm (schema v47 /
-    // fn-667 — main writes one of these from the boot drain alongside
-    // `seedKilledSweep` so the autopilot_state singleton boots paused
-    // honestly). It rides on session_id="autopilot", not our test
-    // session, so the lifecycle assertions on `sessionId` are unaffected;
-    // we just exclude it from this raw-events count + ordering check. ---
+    // Filter out EVERY synthetic boot-append event, keyed by the
+    // `event_type = 'autopilot_state'` tag rather than by hook_event name.
+    // Main writes these from the boot drain on session_id="autopilot":
+    // the `AutopilotPaused{paused:true}` re-arm (fn-661 / fn-667) AND the
+    // `AutopilotCapSet` cap snapshot (fn-725 task .2) — and any future
+    // boot synthetic carrying the same tag. They ride on the synthetic
+    // "autopilot" session, not our test session, so the lifecycle
+    // assertions on `sessionId` are unaffected; the tag-based exclude keeps
+    // this raw-events count + ordering check stable as boot synthetics grow.
     const events = await retryUntil(() => {
       const rows = reader
         .query(
           `SELECT id, hook_event, permission_mode FROM events
-             WHERE hook_event != 'AutopilotPaused'
+             WHERE event_type != 'autopilot_state'
              ORDER BY id ASC`,
         )
         .all() as Array<{
@@ -392,7 +434,7 @@ test("end-to-end: hook writes → wake worker → reducer folds → jobs project
   daemon.kill("SIGTERM");
   const exitCode = await daemon.exited;
   expect(exitCode).toBe(0);
-}, 15000);
+}, 30000);
 
 /**
  * Connect to the daemon's UDS as an in-test client (the ONLY thing that ever
@@ -435,12 +477,7 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
 
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -586,7 +623,7 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
   // The server worker's shutdown handler unlinks the socket (it's process-owned;
   // terminate() alone wouldn't release it).
   expect(existsSync(sockPath)).toBe(false);
-}, 15000);
+}, 30000);
 
 test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_approval rewrites the epic file", async () => {
   // Hermetic plan tree: write two real planctl files into the tmp planRoot
@@ -624,12 +661,7 @@ test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_a
 
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -740,7 +772,7 @@ test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_a
   daemon.kill("SIGTERM");
   expect(await daemon.exited).toBe(0);
   expect(existsSync(sockPath)).toBe(false);
-}, 15000);
+}, 30000);
 
 test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends real event, flips waiting→recovered, session reappears", async () => {
   // Hermetic dead-letters dir under the per-test tmp tree so the boot scan
@@ -813,14 +845,11 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
 
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-      KEEPER_DEAD_LETTER_DIR: deadLetterDir,
-      KEEPER_ZELLIJ_EVENTS_DIR: join(tmpDir, "zellij-events"),
-    },
+    // `daemonSpawnEnv` already routes KEEPER_DEAD_LETTER_DIR to
+    // `join(tmpDir, "dead-letters")` — the exact `deadLetterDir` this test
+    // scans — so the boot dead-letter import stays hermetic without an explicit
+    // override here.
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -951,7 +980,7 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
   daemon.kill("SIGTERM");
   expect(await daemon.exited).toBe(0);
   expect(existsSync(sockPath)).toBe(false);
-}, 15000);
+}, 30000);
 
 test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
   const sessionId = "sess-transcript-e2e";
@@ -961,19 +990,15 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
   // watches our tmp dir instead of the real ~/.claude/projects.
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
 
-  // Give the daemon time to boot all three workers (the transcript worker
-  // subscribes to the watch root after migrate + boot drain).
-  await Bun.sleep(400);
+  // Wait for the daemon to bind its socket (happens-after migrate + boot drain
+  // + worker spawn — the transcript worker subscribes to the watch root in the
+  // same boot phase). Replaces a fixed sleep that raced the bootstrap.
+  await waitForDaemon(sockPath);
 
   // Fold a SessionStart so the job row exists for the title to land on. The
   // transcript title only updates an existing job (the title rule no-ops when
@@ -1018,7 +1043,8 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
     );
 
     // The watcher fires → worker tails the line → posts to main → main inserts a
-    // synthetic TranscriptTitle event → reducer folds it at priority-3.
+    // synthetic TranscriptTitle event → reducer folds it at priority-3. The 8s
+    // budget gives FSEvents-grade latency headroom under serial slow-tier load.
     const titled = await retryUntil(() => {
       const row = reader
         .query("SELECT title, title_source FROM jobs WHERE job_id = ?")
@@ -1027,7 +1053,7 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
         title_source: string | null;
       } | null;
       return row && row.title_source === "transcript" ? row : null;
-    }, 5000);
+    }, 8000);
     if (!titled) {
       const out = await readStream(daemon.stdout);
       const err = await readStream(daemon.stderr);
@@ -1046,7 +1072,7 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
   daemon.kill("SIGTERM");
   const exitCode = await daemon.exited;
   expect(exitCode).toBe(0);
-}, 15000);
+}, 30000);
 
 test("end-to-end: rename-while-down → folded at boot via the startup transcript scan", async () => {
   const sessionId = "sess-rename-while-down";
@@ -1060,16 +1086,13 @@ test("end-to-end: rename-while-down → folded at boot via the startup transcrip
   writeFileSync(transcriptPath, "");
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
-  await Bun.sleep(400);
+  // Wait for run #1's daemon to bind its socket (happens-after migrate + boot
+  // drain + worker spawn). Replaces a fixed boot sleep that raced the bootstrap.
+  await waitForDaemon(sockPath);
 
   await fireHook({
     hook_event_name: "SessionStart",
@@ -1116,15 +1139,16 @@ test("end-to-end: rename-while-down → folded at boot via the startup transcrip
     // --- Daemon run #2: the boot scan folds the current title ---------------
     daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
       cwd: ROOT,
-      env: {
-        ...process.env,
-        KEEPER_DB: dbPath,
-        KEEPER_SOCK: sockPath,
-        KEEPER_CONFIG: configPath,
-      },
+      env: daemonSpawnEnv(),
       stdout: "pipe",
       stderr: "pipe",
     });
+    // Gate the title-fold poll on run #2's socket bind so the poll budget below
+    // measures only the boot-SCAN latency, not the (load-variable) migrate +
+    // boot-drain + worker-spawn that precedes it. Without this, under serial
+    // slow-tier contention the bare 5s `retryUntil` was consumed by boot alone
+    // and flaked before the scan ever ran.
+    await waitForDaemon(sockPath);
 
     const titled = await retryUntil(() => {
       const row = reader
@@ -1134,7 +1158,7 @@ test("end-to-end: rename-while-down → folded at boot via the startup transcrip
         title_source: string | null;
       } | null;
       return row && row.title_source === "transcript" ? row : null;
-    }, 5000);
+    }, 8000);
     if (!titled) {
       const out = await readStream(daemon.stdout);
       const err = await readStream(daemon.stderr);
@@ -1151,7 +1175,7 @@ test("end-to-end: rename-while-down → folded at boot via the startup transcrip
   daemon.kill("SIGTERM");
   const code2 = await daemon.exited;
   expect(code2).toBe(0);
-}, 20000);
+}, 30000);
 
 test("end-to-end: plan worker → .planctl write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
   const epicId = "fn-9-keeper-e2e-plans";
@@ -1211,12 +1235,7 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
 
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });
@@ -1643,12 +1662,7 @@ test("end-to-end: downtime file deletion is reconciled on restart via the boot s
   const spawnDaemon = (): Subprocess<"ignore", "pipe", "pipe"> =>
     Bun.spawn(["bun", "run", DAEMON_ENTRY], {
       cwd: ROOT,
-      env: {
-        ...process.env,
-        KEEPER_DB: dbPath,
-        KEEPER_SOCK: sockPath,
-        KEEPER_CONFIG: configPath,
-      },
+      env: daemonSpawnEnv(),
       stdout: "pipe",
       stderr: "pipe",
     });
@@ -1820,12 +1834,7 @@ await new Promise(() => {
 
   daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
     cwd: ROOT,
-    env: {
-      ...process.env,
-      KEEPER_DB: dbPath,
-      KEEPER_SOCK: sockPath,
-      KEEPER_CONFIG: configPath,
-    },
+    env: daemonSpawnEnv(),
     stdout: "pipe",
     stderr: "pipe",
   });

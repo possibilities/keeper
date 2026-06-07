@@ -2802,11 +2802,24 @@ function runDaemon(): void {
   // Unrecoverable async errors that escape every guard also take the single
   // recovery path. (A fold throw inside drain bubbles here if it ever escapes
   // the reducer's per-event handling.)
+  //
+  // BUT once shutdown() is underway these are moot teardown noise, not a
+  // steady-state crash: a relay `postMessage` racing a just-terminated target
+  // worker throws `InvalidStateError: Worker has been terminated`, and a
+  // worker's own `db.close()` racing its in-flight poll surfaces a rejection —
+  // both AFTER `shuttingDown` is set. Without the guard either one calls
+  // `fatalExit()` and clobbers the clean `exit(0)` with a 1, which (a) flakes
+  // the integration suite's `daemon.exited === 0` assertion and (b) in
+  // production tells launchd (`KeepAlive.SuccessfulExit=false`) to RESTART a
+  // daemon that stopped cleanly. The `!shuttingDown` guard mirrors every
+  // worker `onerror` / `close` handler above.
   process.on("unhandledRejection", (reason) => {
+    if (shuttingDown) return;
     console.error("[keeperd] unhandled rejection:", reason);
     fatalExit();
   });
   process.on("uncaughtException", (err) => {
+    if (shuttingDown) return;
     console.error("[keeperd] uncaught exception:", err);
     fatalExit();
   });
