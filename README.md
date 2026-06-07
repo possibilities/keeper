@@ -482,7 +482,10 @@ Keeper has no `install` verb. Wire it up manually:
    denominator), and staleness p50/p95/p99. Spawn-tests MUST override this
    path too (alongside `KEEPER_DB` / `KEEPER_DROP_LOG` /
    `KEEPER_DEAD_LETTER_DIR` / `KEEPER_RESTORE_FILE`) so the suite never
-   writes the user's real state dir. The restore worker (epic fn-677, two-tier
+   writes the user's real state dir — build the sandboxed env via the shared
+   `sandboxEnv(...)` in `test/helpers/sandbox-env.ts` rather than restating the
+   path list at each spawn site (it sets the state paths LAST so a caller can't
+   strand one, and optionally adds the sixth `KEEPER_ZELLIJ_EVENTS_DIR`). The restore worker (epic fn-677, two-tier
    rework fn-702) writes `~/.local/state/keeper/restore.json` (the
    Chrome-style "restore previous session" snapshot — agents + zellij
    metadata for `scripts/restore-agents.ts` to replay against) as a

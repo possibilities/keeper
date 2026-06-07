@@ -31,6 +31,7 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
+import { sandboxEnv as buildSandboxEnv } from "./helpers/sandbox-env";
 
 const ROOT = realpathSync(join(import.meta.dir, ".."));
 const KEEPER_CLI = join(ROOT, "cli", "keeper.ts");
@@ -56,32 +57,15 @@ afterEach(() => {
 });
 
 /**
- * Sandboxed base env: overrides ALL FIVE keeper state paths under the per-test
- * tmpDir AND clears every ambient session/job id source so the test fully
- * controls attribution + the Job-Id trailer. Applied AFTER the clear loop so a
- * caller can't reopen the leak (CLAUDE.md isolation rule).
+ * Sandboxed base env (Family A): overrides ALL FIVE keeper state paths under
+ * the per-test tmpDir AND clears every ambient session/job id source so the
+ * test fully controls attribution + the Job-Id trailer. See
+ * `test/helpers/sandbox-env.ts` for the shared core.
  */
 function sandboxEnv(
   extra: Record<string, string | undefined> = {},
 ): Record<string, string> {
-  const env: Record<string, string | undefined> = {
-    ...(process.env as Record<string, string>),
-  };
-  // Clear ambient id sources — a real Claude session sets CLAUDE_CODE_SESSION_ID.
-  env.CLAUDE_CODE_SESSION_ID = undefined;
-  env.JOBCTL_SESSION_ID = undefined;
-  env.JOBCTL_JOB_ID = undefined;
-  for (const [k, v] of Object.entries(extra)) env[k] = v;
-  // State paths last so `extra` can never strand them at production defaults.
-  env.KEEPER_DB = dbPath;
-  env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
-  env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
-  env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
-  env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
-  // Drop any key whose value was cleared to undefined.
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
-  return out;
+  return buildSandboxEnv({ tmpDir, dbPath, extra });
 }
 
 /** Run a git command in `repo` synchronously; throw on failure. */

@@ -27,6 +27,7 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
+import { sandboxEnv as buildSandboxEnv } from "./helpers/sandbox-env";
 
 const ROOT = realpathSync(join(import.meta.dir, ".."));
 const KEEPER_CLI = join(ROOT, "cli", "keeper.ts");
@@ -47,25 +48,14 @@ afterEach(() => {
   rmSync(repo, { recursive: true, force: true });
 });
 
-/** Sandboxed base env overriding ALL FIVE keeper state paths + clearing ids. */
+/**
+ * Sandboxed base env (Family A) overriding ALL FIVE keeper state paths +
+ * clearing ambient ids. See `test/helpers/sandbox-env.ts`.
+ */
 function sandboxEnv(
   extra: Record<string, string | undefined> = {},
 ): Record<string, string> {
-  const env: Record<string, string | undefined> = {
-    ...(process.env as Record<string, string>),
-  };
-  env.CLAUDE_CODE_SESSION_ID = undefined;
-  env.JOBCTL_SESSION_ID = undefined;
-  env.JOBCTL_JOB_ID = undefined;
-  for (const [k, v] of Object.entries(extra)) env[k] = v;
-  env.KEEPER_DB = dbPath;
-  env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
-  env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
-  env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
-  env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
-  const out: Record<string, string> = {};
-  for (const [k, v] of Object.entries(env)) if (v !== undefined) out[k] = v;
-  return out;
+  return buildSandboxEnv({ tmpDir, dbPath, extra });
 }
 
 /** Run a git command in `repo` synchronously; throw on failure. */

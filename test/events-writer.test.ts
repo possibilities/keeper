@@ -44,6 +44,7 @@ import {
   planVerbRefFromSpawnName,
   slashCommandFromPrompt,
 } from "../src/derivers";
+import { sandboxEnv } from "./helpers/sandbox-env";
 
 const ROOT = join(import.meta.dir, "..");
 const HOOK_ENTRY = join(ROOT, "plugin", "hooks", "events-writer.ts");
@@ -115,13 +116,20 @@ function sandboxedBaseEnv(): Record<string, string> & {
   KEEPER_ZELLIJ_EVENTS_DIR: string;
   KEEPER_BACKSTOP_LOG: string;
 } {
-  return {
-    ...(process.env as Record<string, string>),
-    KEEPER_DB: dbPath,
-    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
-    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
-    KEEPER_ZELLIJ_EVENTS_DIR: join(tmpDir, "zellij-events"),
-    KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
+  // Family B (hook-spawn): keep ambient ids, include the zellij feed. The
+  // shared core (test/helpers/sandbox-env.ts) guarantees the SIX state paths
+  // are set; the cast pins the keys this file's callers read by name.
+  return sandboxEnv({
+    tmpDir,
+    dbPath,
+    clearAmbientIds: false,
+    includeZellij: true,
+  }) as Record<string, string> & {
+    KEEPER_DB: string;
+    KEEPER_DEAD_LETTER_DIR: string;
+    KEEPER_DROP_LOG: string;
+    KEEPER_ZELLIJ_EVENTS_DIR: string;
+    KEEPER_BACKSTOP_LOG: string;
   };
 }
 

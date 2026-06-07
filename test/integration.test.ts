@@ -32,6 +32,8 @@ import type { Subprocess } from "bun";
 import { openDb } from "../src/db";
 import { epicNumberFromId, taskNumberFromId } from "../src/plan-worker";
 import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
+import { retryUntil } from "./helpers/retry-until";
+import { sandboxEnv } from "./helpers/sandbox-env";
 
 /** Repo root — this file lives at <root>/test, so one level up. */
 const ROOT = join(import.meta.dir, "..");
@@ -145,29 +147,6 @@ afterEach(async () => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-/**
- * Poll `predicate` until it returns a truthy value or the deadline elapses.
- * Returns the truthy value, or `null` on timeout. Used instead of fixed sleeps
- * so a fast machine doesn't waste time and a slow one doesn't flake.
- */
-async function retryUntil<T>(
-  predicate: () => T | null | undefined,
-  timeoutMs = 2000,
-  cadenceMs = 50,
-): Promise<T | null> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = predicate();
-    if (value) {
-      return value;
-    }
-    if (Date.now() >= deadline) {
-      return null;
-    }
-    await Bun.sleep(cadenceMs);
-  }
-}
-
 /** Drain a piped stream to a string (for failure diagnostics). */
 async function readStream(
   stream: ReadableStream<Uint8Array> | undefined,
@@ -179,22 +158,19 @@ async function readStream(
 }
 
 /**
- * Shared sandboxed base env for every test spawn that fires the real hook.
- * Routes the state-bearing env vars (`KEEPER_DB`,
- * `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`,
- * `KEEPER_ZELLIJ_EVENTS_DIR`, `KEEPER_BACKSTOP_LOG`) under the live
- * per-test `tmpDir` so no spawn falls through to the production
- * `~/.local/state/keeper/` paths. fn-657 / fn-684 / fn-720.
+ * Shared sandboxed base env for every test spawn that fires the real hook
+ * (Family B: ambient ids kept, zellij feed included). Routes the state-bearing
+ * env vars under the live per-test `tmpDir` so no spawn falls through to the
+ * production `~/.local/state/keeper/` paths. See `test/helpers/sandbox-env.ts`.
+ * fn-657 / fn-684 / fn-720.
  */
 function sandboxedBaseEnv(): Record<string, string> {
-  return {
-    ...(process.env as Record<string, string>),
-    KEEPER_DB: dbPath,
-    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
-    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
-    KEEPER_ZELLIJ_EVENTS_DIR: join(tmpDir, "zellij-events"),
-    KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
-  };
+  return sandboxEnv({
+    tmpDir,
+    dbPath,
+    clearAmbientIds: false,
+    includeZellij: true,
+  });
 }
 
 /**
