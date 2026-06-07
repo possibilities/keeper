@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-724-durable-dispatch-outbox-and-launch",
   "bundles": [],
+  "closer_done_at": "2026-06-07T00:38:38.208153Z",
   "created_at": "2026-06-06T23:41:11.933563Z",
   "depends_on_epics": [],
   "id": "fn-724-durable-dispatch-outbox-and-launch",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Durable dispatch outbox and launch-outcome contract",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-06T23:41:11.933563Z"
+  "updated_at": "2026-06-07T00:38:38.208153Z"
 }
