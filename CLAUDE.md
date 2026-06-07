@@ -76,8 +76,8 @@ shape because a consumer reads it.
   Workers feed the log only via main; they never write the DB themselves.
 - **The babysitter is a pure read-only external scanner.** `cli/keeper-watch.ts`
   opens `keeper.db` read-only and only observes — no event-log write, no
-  synthetic events, no RPC. Its own seen-state lives outside the DB under
-  `~/.local/state/keeper-watch/`.
+  synthetic events, no RPC. Its own seen-state and the escalation follow-up
+  prompt files live outside the DB under `~/.local/state/keeper-watch/`.
 
 ## No kernel watchers on keeper's OWN DB
 

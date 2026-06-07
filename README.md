@@ -445,8 +445,9 @@ Keeper has no `install` verb. Wire it up manually:
    only genuinely-new signatures via a headless babysitter agent (`notifyctl` +
    `botctl` — hence `~/.local/bin` on the plist's `PATH`). It never writes the
    DB, mints no synthetic events, and performs no RPC. Edit the plist's username
-   / checkout path / arch first if they differ. Seen-state and logs live under
-   `~/.local/state/keeper-watch/`. Inspect with
+   / checkout path / arch first if they differ. Seen-state, logs, and the
+   escalation follow-up prompts (`followups/latest.md` + per-finding history)
+   live under `~/.local/state/keeper-watch/`. Inspect with
    `launchctl print gui/$(id -u)/arthack.keeper-babysit`, or force a tick with
    `launchctl kickstart gui/$(id -u)/arthack.keeper-babysit`.
 
@@ -977,7 +978,7 @@ launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
 launchctl bootout gui/$(id -u)/arthack.keeper-babysit
 rm ~/Library/LaunchAgents/arthack.keeper-babysit.plist
-rm -rf ~/.local/state/keeper-watch   # babysitter seen-state + logs
+rm -rf ~/.local/state/keeper-watch   # babysitter seen-state, logs, + follow-up prompts
 # Stop loading the plugin: remove `--plugin-dir ~/code/keeper` from
 # whatever entrypoint launches `claude` (e.g. the arthack launcher).
 # Optional — drops all captured state, including the events log:
@@ -1958,7 +1959,11 @@ launchd, it opens `keeper.db` read-only, deterministically detects the recurring
 failure classes (autopilot stalls, duplicate dispatches / approvals, reducer
 wedge, dead-letter growth, stuck jobs), and escalates only genuinely-new
 signatures to a headless agent — it never writes the DB, mints no synthetic
-events, and performs no RPC.
+events, and performs no RPC. On escalation the agent writes a self-contained,
+injection-safe investigation prompt per paged finding under
+`~/.local/state/keeper-watch/followups/` (plus a stable `latest.md`) and the
+notification points at that file, so closing the loop is just handing the
+prompt to a fresh agent (`claude < followups/latest.md`).
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
