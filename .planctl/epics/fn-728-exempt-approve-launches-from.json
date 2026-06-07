@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-728-exempt-approve-launches-from",
   "bundles": [],
+  "closer_done_at": "2026-06-07T14:34:38.067192Z",
   "created_at": "2026-06-07T14:03:07.346206Z",
   "depends_on_epics": [],
   "id": "fn-728-exempt-approve-launches-from",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Exempt approve launches from concurrency cap",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T14:10:00.105217Z"
+  "updated_at": "2026-06-07T14:34:38.067192Z"
 }
