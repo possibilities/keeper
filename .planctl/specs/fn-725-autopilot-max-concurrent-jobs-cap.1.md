@@ -79,5 +79,5 @@ NO UI — the value is read on main and threaded to the worker via
 - [ ] New + existing tests pass (`bun test test/config.test.ts test/autopilot-worker.test.ts test/readiness.test.ts`).
 
 ## Done summary
-
+Added max_concurrent_jobs config (positive-int-only, default null=unlimited) and a reconcile-level dispatch budget: reconcile() counts isRootOccupant verdicts over perTask + perCloseRow once, then admits at most cap-occupied new launches across both push sites via one shared decrementing budget (strict budget > 0). Cap threaded daemon -> workerData -> ReconcileState; isRootOccupant exported with unchanged logic; null cap reproduces pre-change dispatch via a POSITIVE_INFINITY fast-path. No UI.
 ## Evidence

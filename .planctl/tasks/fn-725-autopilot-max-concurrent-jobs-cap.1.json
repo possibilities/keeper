@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "config value and reconcile concurrency budget",
-  "updated_at": "2026-06-07T00:07:06.519008Z"
+  "updated_at": "2026-06-07T03:20:23.843268Z",
+  "worker_done_at": "2026-06-07T03:20:23.843268Z"
 }
