@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-731-babysitter-follow-up-prompt-files",
   "bundles": [],
   "closer_done_at": "2026-06-07T21:28:48.640040Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T21:28:48.640040Z"
+  "updated_at": "2026-06-07T21:29:48.263247Z"
 }
