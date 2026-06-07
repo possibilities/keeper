@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-06T23:41:11.933563Z",
   "depends_on": [
@@ -12,6 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Document dispatch outbox + outcome contract",
-  "updated_at": "2026-06-07T00:31:24.675416Z",
+  "updated_at": "2026-06-07T00:32:56.583008Z",
   "worker_done_at": "2026-06-07T00:31:24.675416Z"
 }
