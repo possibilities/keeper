@@ -1696,15 +1696,29 @@ fire-and-forget; on `ok:false` or ack-timeout it ABORTS without launching (no
 double-dispatch — a phantom row clears via the TTL sweep), closing the
 SessionStart-drains-before-`dispatched` race (fn-627 class). The reducer folds
 the `Dispatched` event into a `pending_dispatches` row keyed `(verb, id)`;
-`loadReconcileSnapshot` reads the table each cycle and populates
-`liveTabKeys: Set<DispatchKey>`; a fifth suppression arm fires when
-`liveTabKeys.has(key)` is true, sitting alongside the `isOccupyingJob` arm.
-`reconcile()` stays pure — it reads the synchronous Set, never the backend, so
-re-fold determinism is preserved. The row discharges when `SessionStart` folds
-(reducer DELETE) or via a producer-side TTL sweep on the heartbeat
-(`PENDING_DISPATCH_TTL_MS`, 120s, `DispatchExpired`) — closing the launch →
-SessionStart blind window without any live zellij probe (the `verb::id` tab
-name is now a cosmetic label only). The reconciler boots PAUSED (the in-memory
+`loadReconcileSnapshot` reads the table each cycle. As of fn-721 those rows
+feed `computeReadiness` directly as the `dispatch-pending` mutex occupant —
+NOT a standalone `reconcile()` suppression arm outside the mutex: a launched
+but not-yet-SessionStart-bound worker has no `jobs` row, so readiness reads
+the pending rows (via the shared `projectPendingDispatches` helper, the same
+input the board's `subscribeReadiness` consumes — no board/autopilot
+divergence) and stamps `dispatch-pending` at a late per-row rank that holds
+BOTH the per-epic and per-root mutex (`isLiveWorkOccupant` → auto-covers
+`isRootOccupant`), demoting a same-epic OR same-root ready sibling. A pending
+row matching no snapshot row occupies its root via its own `dir` column
+(root-fallback). The pre-existing same-`(verb, id)` `liveTabKeys.has(key)`
+suppression arm (sitting alongside the `isOccupyingJob` arm) is PRESERVED for
+same-key re-dispatch — orthogonal to the cross-sibling demotion the occupant
+does. `reconcile()` stays pure — it reads the synchronous pending-rows
+snapshot, never the backend, so re-fold determinism is preserved
+(`dispatch-pending` is a read-time client verdict, NOT a folded one). The row
+discharges when `SessionStart` folds (reducer DELETE) or via a producer-side
+TTL sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s,
+`DispatchExpired`) — so both the launch → SessionStart blind window and the
+`dispatch-pending` occupancy self-clear without any live zellij probe (the
+`verb::id` tab name is now a cosmetic label only). SAFETY SEAM: the fn-721
+occupant closes the cross-cycle double-dispatch window; `confirmRunning`'s
+serial wait still covers the intra-cycle race and stays in place. The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's
 boot drain unconditionally appends an `AutopilotPaused{paused:true}`
 synthetic event so the durable `autopilot_state` singleton projection

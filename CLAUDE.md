@@ -399,16 +399,18 @@ firing correctly — check them before concluding it is broken:
   `output.emit()` seam (one transaction per mutating verb), so the gate
   trusts that an envelope `success: true` on stdout means the file is in
   HEAD.
-- **The mutex occupancy definition (one canonical set — fn-663 / fn-671 / fn-703 / fn-719).**
+- **The mutex occupancy definition (one canonical set — fn-663 / fn-671 / fn-703 / fn-719 / fn-721).**
   Both the per-epic mutex (`applySingleTaskPerEpicMutex`) and the per-root
   mutex (predicate 12) decide which verdicts CLAIM a slot via two shared
   predicates in `src/readiness.ts`: `isLiveWorkOccupant` (per-epic) and the
   narrower `isRootOccupant` (per-root, exempts `planner-running` — a planner
   holds no working tree, fn-663). The occupant set is: every `running` verdict
   (job-running, sub-agent-running, sub-agent-stale, monitor-running,
-  monitor-stale, planner-running) PLUS the three approval-pending blocked
-  verdicts `job-pending`, `git-uncommitted`, and `git-orphans`. Three facets
-  fall out of that set:
+  monitor-stale, planner-running) PLUS the four approval-pending /
+  launch-pending blocked verdicts `job-pending`, `git-uncommitted`,
+  `git-orphans`, and `dispatch-pending` (fn-721 — a worker autopilot LAUNCHED
+  but whose `SessionStart` has not yet folded, so it has no `jobs` row to
+  occupy via a `running` verdict). Four facets fall out of that set:
   - *Won't dispatch into a dirty repo.* Predicate 6.5 (block reason
     `git-uncommitted` / `git-orphans`) suppresses every approve dispatch whose
     target repo has `git_status.dirty_count > 0` (or unattributed-to-live
@@ -465,6 +467,39 @@ firing correctly — check them before concluding it is broken:
     `verbForVerdict` returns `null` for both `monitor-running` and
     `monitor-stale` (a test pins it, the fn-700/fn-703 precedent), so occupancy
     never leaks into a dispatch.
+  - *Won't double-dispatch into the launch → SessionStart blind window
+    (fn-721).* A worker autopilot has LAUNCHED but whose `SessionStart` has
+    not yet folded owns no `jobs` row, so `computeReadiness` cannot see it via
+    any `running` verdict — yet the fn-678 `pending_dispatches` projection
+    durably tracks exactly that window. `computeReadiness` now CONSUMES those
+    rows (threaded in as a new param after `now`, via the SOLE shared
+    `projectPendingDispatches` helper so both the autopilot reconciler and the
+    board/CLI path build the input identically): it matches each pending
+    `verb::id` to its task row (`work::`/`approve::`) or close row (`close::`)
+    and stamps a `dispatch-pending` verdict on THAT row at a LATE per-row rank
+    10.5 — after every real `running` verdict (predicates 1–7) and the
+    structural not-ready verdicts (`epic-not-materialized` /
+    `epic-not-validated` / `planner-running`), BEFORE the two mutex post-passes
+    so pass-1 sees it as an occupant (the fn-700 rank-9.5 / fn-719 rank-6.6
+    precedent). It is in the canonical set (`isLiveWorkOccupant` →
+    auto-covers `isRootOccupant`; `dispatch-pending` exempts no working tree so
+    it occupies both), so a same-epic OR same-root ready sibling is demoted
+    while a launch is in flight. Root-fallback (decision b): a pending row
+    matching NO snapshot row (launch→materialize lag or a deleted target) still
+    occupies its ROOT via the row's own `dir` column, seeded outside the
+    per-row walk — null-`dir`-safe and never wedging (the row's TTL / discharge
+    still clears it). The row's occupancy lifts the instant it discharges —
+    `SessionStart` bind / `DispatchFailed` / `DispatchExpired`. The held slot
+    stays UNDISPATCHABLE: `verbForVerdict` returns `null` for `dispatch-pending`
+    (a test pins it, the fn-700/fn-703/fn-719 precedent), and `keeper await`
+    treats it as `waiting` not stuck (NOT `workable()`, NOT in
+    `STUCK_REASON_KINDS` — it self-resolves). Read-time verdict only: NO
+    reducer / schema / keeper-py change. **SAFETY SEAM (load-bearing):** this
+    closes the CROSS-cycle race only — the WITHIN-one-reconcile-cycle race
+    (N siblings ready at once, the 2nd launch decided before the 1st's
+    `Dispatched` row folds) stays covered by the still-present serial
+    `confirmRunning`; a future step 3 that removes `confirmRunning` MUST close
+    that intra-cycle hole or it reopens the fn-627 double-dispatch class.
 - **Won't dispatch the closer against a taskless epic (fn-700).** A keeper
   epic and its tasks fold as two separate single-event transactions
   (`EpicSnapshot`, then `TaskSnapshot`); between them the epic exists with
@@ -504,31 +539,44 @@ firing correctly — check them before concluding it is broken:
   for the worker spawn ordering, but is no longer the viewer's source of
   truth. `confirmRunning` serializes launches, so dispatch is paced, not a
   burst.
-- **Closes the launch → SessionStart blind window via the durable
-  `pending_dispatches` projection (schema v50, fn-678; durable-ack +
-  three-way outcome + reap-on-pause, fn-724).** Before calling `launch()`,
-  `confirmRunning` AWAITS main's durable `Dispatched` insert: it posts the
-  `DispatchedPayload` via `emitDispatched` and BLOCKS on an id-correlated
-  `dispatched-ack{id, ok}` reply (a `DISPATCHED_ACK_TIMEOUT_MS` floor that
-  must exceed busy_timeout + a boot-drain so boot dispatches don't
-  false-abort). Outbox ordering — intent durably committed BEFORE the launch
-  side-effect — is now load-bearing, not fire-and-forget: on `ok:false` or
-  ack-timeout the worker ABORTS without launching (outcome `"aborted"`; no
-  double-dispatch — a phantom row from a crash between ack and launch is
-  cleared by the TTL sweep). This closes the SessionStart-drains-before-
-  `dispatched` race (fn-627 class) that fire-and-forget left open. The
-  reducer folds `Dispatched` into a `pending_dispatches` row keyed
-  `(verb, id)`; `loadReconcileSnapshot` reads the table each cycle and
-  populates `liveTabKeys: Set<DispatchKey>`. A fifth suppression arm in
-  `reconcile()` fires when `liveTabKeys.has(key)` is true — alongside the
-  `state.paused`, `state.inFlight`, `snapshot.failedKeys`, and
-  `isOccupyingJob` arms — so a launched but not-yet-SessionStart-bound worker
-  keeps its slot held without any live zellij probe. `reconcile()` stays
-  pure: it reads the synchronous Set, never the backend. The row discharges
-  when `SessionStart` folds (reducer DELETE), or via a producer-side TTL
-  sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s, `DispatchExpired`)
-  when the bind never arrives — so a phantom row self-clears without human
-  intervention. **Three-way `ConfirmOutcome` (fn-724).** Past the durable
+- **Durably tracks the launch → SessionStart blind window via the
+  `pending_dispatches` projection (schema v50, fn-678; readiness-occupant
+  consumer fn-721; durable-ack + three-way outcome + reap-on-pause, fn-724).**
+  Before calling `launch()`, `confirmRunning` AWAITS main's durable
+  `Dispatched` insert: it posts the `DispatchedPayload` via `emitDispatched`
+  and BLOCKS on an id-correlated `dispatched-ack{id, ok}` reply (a
+  `DISPATCHED_ACK_TIMEOUT_MS` floor that must exceed busy_timeout + a
+  boot-drain so boot dispatches don't false-abort). Outbox ordering — intent
+  durably committed BEFORE the launch side-effect — is now load-bearing, not
+  fire-and-forget: on `ok:false` or ack-timeout the worker ABORTS without
+  launching (outcome `"aborted"`; no double-dispatch — a phantom row from a
+  crash between ack and launch is cleared by the TTL sweep). This closes the
+  SessionStart-drains-before-`dispatched` race (fn-627 class) that
+  fire-and-forget left open. The reducer folds `Dispatched` into a
+  `pending_dispatches` row keyed `(verb, id)`. **Readiness-occupant consumer
+  (fn-721).** These rows are no longer a standalone `reconcile()` suppression
+  arm OUTSIDE the mutex — they feed `computeReadiness` directly as the
+  `dispatch-pending` occupant (see the occupancy-definition bullet's 4th
+  facet): both the autopilot reconciler (`loadReconcileSnapshot` →
+  `reconcile` → `computeReadiness`) and the board/CLI (`subscribeReadiness`)
+  consume the same rows via the SOLE shared `projectPendingDispatches`
+  helper, so a launched-but-not-yet-bound worker holds BOTH the per-epic and
+  per-root mutex and demotes a same-epic OR same-root ready sibling to
+  `dispatch-pending` — without any live zellij probe, and with the board and
+  the autopilot in agreement. The same-`(verb, id)` `liveTabKeys.has(key)`
+  suppression arms in `reconcile()` (alongside `state.paused`,
+  `state.inFlight`, `snapshot.failedKeys`, `isOccupyingJob`) are PRESERVED:
+  they suppress same-key RE-dispatch, orthogonal to the cross-sibling
+  demotion the new occupant does. `reconcile()` stays pure — it reads the
+  synchronous Set and the synchronous pending-rows snapshot, never the
+  backend. The row discharges when `SessionStart` folds (reducer DELETE), or
+  via a producer-side TTL sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`,
+  120s, `DispatchExpired`) when the bind never arrives — so both the phantom
+  row and the `dispatch-pending` occupancy self-clear without human
+  intervention. **SAFETY SEAM:** the fn-721 occupant closes the CROSS-cycle
+  double-dispatch window; `confirmRunning`'s serial wait still covers the
+  intra-cycle race and stays in place (a future step 3 removing it MUST close
+  the intra-cycle hole or it reopens fn-627). **Three-way `ConfirmOutcome` (fn-724).** Past the durable
   ack, `confirmRunning` polls `findJob` until `ceilingMs` (60s) and
   classifies: `launch.ok===false` → `"failed"` (emit `DispatchFailed`,
   unchanged); SessionStart bound before the ceiling → `"ok"`; ceiling
