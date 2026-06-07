@@ -61,5 +61,5 @@ delete only the genuinely-unused ones.
 - [ ] `bun test test/autopilot.test.ts` passes; viewer eyeball confirms sections removed, banner intact
 
 ## Done summary
-
+Removed the keeper autopilot viewer's client-side cap simulation (predictNextDispatches/predictFullSchedule and orphaned preview helpers) plus the predicted/schedule fields and renderBody blocks; kept current/stopped/failed/dependencies sections and the projectMaxConcurrentJobs '· max N' banner intact. Updated tests; bun test test/autopilot.test.ts passes (32/32).
 ## Evidence

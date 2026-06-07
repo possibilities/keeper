@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Remove viewer prediction and schedule simulation",
-  "updated_at": "2026-06-07T14:03:07.346206Z"
+  "updated_at": "2026-06-07T14:23:20.497049Z",
+  "worker_done_at": "2026-06-07T14:23:20.497049Z"
 }
