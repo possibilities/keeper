@@ -30,5 +30,5 @@ Each touched file green; record spawn-count / wall-time reduction. `bun test tes
 - [ ] Git never mocked; all touched files pass; spawn-count reduction recorded
 
 ## Done summary
-
+Routed all seven real-git test fixtures (initRepo/makeRepo/gitInit/initRepoBare) through the shared test/helpers/git-repo.ts initRepo, eliminating every duplicated init+config sequence and adding the load-bearing commit.gpgsign false to the git-worker and git-wrapper fixtures that lacked it. Repos kept fresh-per-test (distinct seed-commit/bare-origin/virgin-HEAD state); git never mocked. All seven files green (146 + 138 tests pass).
 ## Evidence
