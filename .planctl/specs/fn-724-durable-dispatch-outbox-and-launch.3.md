@@ -35,5 +35,5 @@ reducer/schema change.
 - [ ] README fn-678 + eighth-worker paras + dispatch_failures source enum updated; no-schema-change framing preserved.
 
 ## Done summary
-
+Updated CLAUDE.md fn-678 bullet and README fn-678/eighth-worker paras + dispatch_failures source enum to the fn-724 durable-ack + three-way ConfirmOutcome (indoubt) + reap-on-pause contract; dropped confirm_timeout source; preserved no-schema-change framing.
 ## Evidence
