@@ -1021,11 +1021,7 @@ describe("tick", () => {
     // would let SQLite throw; tick's existsSync guard must short-circuit.
     expect(existsSync(dbPath)).toBe(false);
     let res!: Awaited<ReturnType<typeof tick>>;
-    await expect(
-      (async () => {
-        res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
-      })(),
-    ).resolves.toBeUndefined();
+    res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
     expect(res).toEqual({
       baselined: false,
       spawned: false,
