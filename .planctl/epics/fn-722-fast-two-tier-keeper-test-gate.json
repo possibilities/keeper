@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-722-fast-two-tier-keeper-test-gate",
   "bundles": [],
   "closer_done_at": "2026-06-07T19:55:25.079214Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T19:55:25.079214Z"
+  "updated_at": "2026-06-07T19:56:12.696274Z"
 }
