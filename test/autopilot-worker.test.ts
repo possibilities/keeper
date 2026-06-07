@@ -846,6 +846,166 @@ test("fn-725 cap: the budget is shared across task + close-row push sites (a clo
   expect(decision.launches).toEqual([]);
 });
 
+// ---------------------------------------------------------------------------
+// fn-728 — approve is exempt from the budget cap at the launch boundary
+// ---------------------------------------------------------------------------
+//
+// The fn-725 cap counts a finished-but-pending root (`blocked:job-pending`)
+// as an `isRootOccupant`, so a backlog of pending-approval rows drives
+// `budget = max(0, cap - occupied)` to zero and the `budget <= 0` gate skips
+// EVERY launch — including the `approve` workers that would drain those rows
+// (the resource-cap deadlock). The fix exempts `approve` at BOTH push sites:
+// it skips the budget gate AND the budget decrement, sharing one
+// `verb !== "approve"` predicate. `occupied` is left unchanged, so an
+// in-flight approver still pushes back on NEW work on later cycles.
+//
+// Distinct-root discipline (same as the fn-725 helpers above): approve /
+// ready / occupant rows go in SEPARATE project_dirs so the per-root mutex
+// doesn't pre-empt the budget under test.
+
+// A `blocked:job-pending` task → its done + approval-pending row with an
+// embedded STOPPED job renders `blocked:job-pending` (predicate 7): predicate
+// 5 (`job-running`) needs a *working* embedded job, so `stopped` falls through
+// to 7. verb → `approve`. Lives in its own epic+root.
+function approveTaskEpic(epicId: string, projectDir: string): Epic {
+  const taskId = `${epicId}.1`;
+  return makeEpic({
+    epic_id: epicId,
+    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
+    project_dir: projectDir,
+    sort_path: epicId,
+    tasks: [
+      makeTask({
+        task_id: taskId,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+        approval: "pending",
+        jobs: [
+          // Embedded STOPPED job → predicates 5/6/6.6 all clear, so the row
+          // falls through to predicate 7 (own-approval-pending) → job-pending.
+          {
+            job_id: `j-${epicId}`,
+            state: "stopped",
+          } as unknown as EmbeddedJob,
+        ],
+      }),
+    ],
+  });
+}
+
+// A `blocked:job-pending` CLOSE row → an epic at `status:done` +
+// `approval:pending` whose single task is `completed` (so predicate 10's
+// dep-on-task doesn't block and predicate 9.5 epic-no-tasks doesn't fire).
+// Predicate 1 (terminal-completed) needs `approval:approved`, so `pending`
+// falls through to predicate 7 → job-pending → verb `approve` on the close row.
+function approveCloseEpic(epicId: string, projectDir: string): Epic {
+  const taskId = `${epicId}.1`;
+  return makeEpic({
+    epic_id: epicId,
+    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
+    project_dir: projectDir,
+    sort_path: epicId,
+    status: "done",
+    approval: "pending",
+    tasks: [
+      makeTask({
+        task_id: taskId,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+        approval: "approved",
+      }),
+    ],
+  });
+}
+
+test("fn-728 approve exempt: occupied >= cap + a job-pending approve in a distinct root → approve launches, no work", () => {
+  // cap=1, one job-running occupant → occupied=1 → budget=0. A job-pending
+  // approve in a DISTINCT root must still launch (exempt); a co-considered
+  // ready `work` in YET another root stays budget-skipped.
+  const occ = occupantEpic("fn-1-a", "/repo-a");
+  const approveT = approveTaskEpic("fn-2-b", "/repo-b");
+  const ready = readyEpic("fn-3-c", "/repo-c");
+  const snap = makeSnapshot({ epics: [occ, approveT, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
+  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-2-b.1"]);
+});
+
+test("fn-728 approve exempt: task-level approve at budget=0 fires and does NOT decrement budget", () => {
+  // budget starts at 0 (cap=1, one occupant). The approve fires WITHOUT
+  // consuming the slot; a ready `work` in another root proves no decrement
+  // happened (it stays skipped at budget=0, but the approve still got out —
+  // i.e. the approve didn't push budget negative or otherwise perturb work).
+  const occ = occupantEpic("fn-1-a", "/repo-a");
+  const approveT = approveTaskEpic("fn-2-b", "/repo-b");
+  const ready = readyEpic("fn-3-c", "/repo-c");
+  const snap = makeSnapshot({ epics: [occ, approveT, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
+  // Only the approve — the work stays budget-gated.
+  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-2-b.1"]);
+  expect(decision.launches.find((l) => l.verb === "work")).toBeUndefined();
+});
+
+test("fn-728 approve exempt: epic close-row approve at budget=0 fires AND budget unchanged (De Morgan pin)", () => {
+  // cap=1, one job-running occupant → budget=0. A close-row job-pending
+  // approve in a DISTINCT root must launch (close-row exemption). A ready
+  // `work` in a THIRD root stays skipped — proving the close-row approve did
+  // not decrement budget (if it had wrapped to -1 the gate would still skip
+  // work, but the close approve itself must have fired through the
+  // `closeVerb === "approve"` gate-skip; the work-skip pins budget at 0).
+  const occ = occupantEpic("fn-1-a", "/repo-a");
+  const approveClose = approveCloseEpic("fn-2-b", "/repo-b");
+  const ready = readyEpic("fn-3-c", "/repo-c");
+  const snap = makeSnapshot({ epics: [occ, approveClose, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
+  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-2-b"]);
+  expect(decision.launches.find((l) => l.verb === "work")).toBeUndefined();
+});
+
+test("fn-728 regression: a work and a close row still respect budget<=0 (only approve is exempt)", () => {
+  // cap=1, one job-running occupant → budget=0. A ready work row (distinct
+  // root) and a ready close row (distinct root) are BOTH budget-gated and
+  // neither launches — the exemption is approve-only.
+  const occ = occupantEpic("fn-1-a", "/repo-a");
+  const ready = readyEpic("fn-2-b", "/repo-b");
+  const completedTask = makeTask({
+    task_id: "fn-3-c.1",
+    epic_id: "fn-3-c",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const closeEpic = makeEpic({
+    epic_id: "fn-3-c",
+    epic_number: 3,
+    project_dir: "/repo-c",
+    sort_path: "fn-3-c",
+    tasks: [completedTask],
+  });
+  const snap = makeSnapshot({ epics: [occ, ready, closeEpic] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-728 mutex not budget: same-root approve + ready sibling → sibling suppressed by per-root mutex", () => {
+  // An approve and a ready `work` in the SAME root. The approve is exempt
+  // from the budget, but the ready sibling is suppressed by the PER-ROOT
+  // mutex (the approve row occupies the root via isRootOccupant), NOT by the
+  // budget. cap=null so the budget can't be the cause — proving the mutex is.
+  const approveT = approveTaskEpic("fn-1-a", "/repo-shared");
+  const ready = makeEpic({
+    epic_id: "fn-2-b",
+    epic_number: 2,
+    project_dir: "/repo-shared",
+    sort_path: "fn-2-b",
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const snap = makeSnapshot({ epics: [approveT, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: null }), 0);
+  // The approve fires; the same-root ready sibling is mutex-suppressed.
+  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-1-a.1"]);
+});
+
 test("fn-721 parity: autopilot reconcile path and the board/CLI computeReadiness path agree", () => {
   // BOTH paths must compute identical verdicts for the same pending set. The
   // autopilot path projects via `projectPendingDispatches` in

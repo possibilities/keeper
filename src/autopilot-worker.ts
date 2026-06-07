@@ -904,7 +904,17 @@ export function reconcile(
       // verdict is computed (so debug verdicts aren't masked). A budget
       // skip does NOT hold a slot; it just defers this launch to a later
       // cycle once an occupant frees up.
-      if (budget <= 0) {
+      //
+      // fn-728: `approve` is EXEMPT from the cap at the launch boundary —
+      // the budget governs new WORK entering the system (`work`/`close`),
+      // never the approvals that retire it. Counting a finished-but-pending
+      // root as an occupant (via `isRootOccupant`) lets the budget hit zero
+      // while the very approvers that would drain those roots are the only
+      // launches that could free a slot — the resource-cap deadlock. The
+      // gate-skip and the decrement-skip MUST share the same `verb !==
+      // "approve"` predicate; an in-flight approver still occupies a slot
+      // against NEW work on later cycles (correct — `occupied` is unchanged).
+      if (verb !== "approve" && budget <= 0) {
         continue;
       }
       launches.push({
@@ -915,7 +925,9 @@ export function reconcile(
         workerCommand: buildWorkerCommand(verb, taskId, cwd, task.tier),
         tier: verb === "work" ? task.tier : null,
       });
-      budget--;
+      if (verb !== "approve") {
+        budget--;
+      }
     }
     // Close row.
     const epicId = epic.epic_id;
@@ -934,7 +946,13 @@ export function reconcile(
         !snapshot.liveTabKeys.has(closeKey) &&
         // fn-725 cap — the close-row push shares the SAME decrementing
         // budget as the task push above, so a closer can't blow the cap.
-        budget > 0;
+        // fn-728: `approve` is exempt at this site too (the close-row
+        // `blocked:job-pending` verdict also maps to `approve` via
+        // `verbForVerdict`). The gate-skip below and the decrement-skip
+        // further down MUST use the EXACT same `closeVerb === "approve"`
+        // predicate — a De Morgan inversion here would let an approve
+        // close-row decrement budget on a path the gate didn't guard.
+        (closeVerb === "approve" || budget > 0);
       if (okToPlan && projectDir !== "") {
         launches.push({
           verb: closeVerb,
@@ -944,7 +962,9 @@ export function reconcile(
           workerCommand: buildWorkerCommand(closeVerb, epicId, projectDir),
           tier: null,
         });
-        budget--;
+        if (closeVerb !== "approve") {
+          budget--;
+        }
       }
     }
   }
