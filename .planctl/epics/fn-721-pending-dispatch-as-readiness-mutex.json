@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-721-pending-dispatch-as-readiness-mutex",
   "bundles": [],
   "closer_done_at": "2026-06-07T01:51:47.219387Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T01:51:47.219387Z"
+  "updated_at": "2026-06-07T02:09:40.808034Z"
 }
