@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "babysitter custom agent",
-  "updated_at": "2026-06-07T14:56:04.543389Z"
+  "updated_at": "2026-06-07T16:09:39.819577Z",
+  "worker_done_at": "2026-06-07T16:09:39.819577Z"
 }

@@ -56,5 +56,5 @@ reads the file, judges approvals, and the notify commands fire (or dry-run).
 - [ ] Invoking it on a seeded findings file produces a sensible human callout and ack
 
 ## Done summary
-
+Authored .claude/agents/keeper-babysitter.md: the headless escalation agent --tick spawns on new findings. Reads the frozen findings JSON (no re-scan), formats the deterministic failure classes into a human callout, judges the approval-review class for merit via planctl render-approve-context (flagging only unmerited approvals), pages the human via notifyctl + botctl, and writes delivered fingerprints to the ack file. Frontmatter pins tools to Bash/Read/Grep (read+notify fence) and model sonnet; DB-derived strings are treated as data (injection hygiene).
 ## Evidence
