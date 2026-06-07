@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-727-revive-autopilot-window-autoclose",
   "bundles": [],
   "closer_done_at": "2026-06-07T16:27:22.372294Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T16:27:22.372294Z"
+  "updated_at": "2026-06-07T16:31:10.776813Z"
 }
