@@ -179,13 +179,9 @@ def _parse_envelopes(output: str) -> list[dict]:
 def test_emit_auto_commit_happy_path(tmp_path, monkeypatch):
     """A mutating verb landing dirty .planctl/ files emits success AND lands a commit.
 
-    Canonical leak case: ``approve`` invoked outside any /plan:* skill.
-    The envelope's ``success: true`` is the authoritative signal that the
-    commit landed.
-
-    Uses ``rejected`` so the fn-592 approve-gates (task→done /
-    epic→done+all-tasks-done+all-tasks-approved) don't fire — this test
-    cares about the emit / auto-commit boundary, not the approve gate.
+    Canonical single-field mutating verb: ``epic set-title`` (rewrites the
+    epic def file). The envelope's ``success: true`` is the authoritative
+    signal that the commit landed.
     """
     project = _make_planctl_git_project(tmp_path, monkeypatch)
     epic_id, _ = _seed_epic(project)
@@ -193,14 +189,15 @@ def test_emit_auto_commit_happy_path(tmp_path, monkeypatch):
     pre_count = _git_commit_count(project)
 
     runner = CliRunner()
-    result = runner.invoke(cli, ["approve", epic_id, "rejected"], env=_ENV)
+    result = runner.invoke(
+        cli, ["epic", "set-title", epic_id, "--title", "Renamed epic"], env=_ENV
+    )
     assert result.exit_code == 0, result.output
 
     docs = _parse_envelopes(result.output)
     assert docs, f"no JSON envelopes in output: {result.output!r}"
     envelope = docs[0]
     assert envelope.get("success") is True, envelope
-    assert envelope.get("approval") == "rejected"
     # Mutating verbs emit a single compact NDJSON envelope carrying
     # planctl_invocation merged in.
     assert "planctl_invocation" in envelope
@@ -208,7 +205,7 @@ def test_emit_auto_commit_happy_path(tmp_path, monkeypatch):
     # HEAD advanced by exactly one commit.
     assert _git_commit_count(project) == pre_count + 1
     subject = _git_head_subject(project)
-    assert subject == f"chore(planctl): approve {epic_id}", subject
+    assert subject == f"chore(planctl): set-title {epic_id}", subject
 
     # Worktree clean for .planctl/ — no dirty files left behind.
     status = subprocess.run(
@@ -219,7 +216,7 @@ def test_emit_auto_commit_happy_path(tmp_path, monkeypatch):
         check=True,
     )
     assert status.stdout.strip() == "", (
-        f"approve left .planctl/ dirty: {status.stdout!r}"
+        f"set-title left .planctl/ dirty: {status.stdout!r}"
     )
 
 
@@ -250,9 +247,11 @@ def test_emit_commit_failure_emits_structured_envelope_and_exits_1(
     monkeypatch.setattr(commit_module, "auto_commit_from_invocation", _boom)
 
     runner = CliRunner()
-    # Use ``rejected`` so the fn-592 approve-gate doesn't fire — we want the
-    # commit failure path, not the gate refusal path.
-    result = runner.invoke(cli, ["approve", epic_id, "rejected"], env=_ENV)
+    # `epic set-title` is a genuine committing single-field verb — the right
+    # surface to exercise the commit-failure boundary.
+    result = runner.invoke(
+        cli, ["epic", "set-title", epic_id, "--title", "Renamed epic"], env=_ENV
+    )
     # exit 1 on commit failure (the success envelope contract).
     assert result.exit_code == 1, (
         f"expected exit 1 on commit failure, got {result.exit_code}: {result.output!r}"
@@ -470,24 +469,28 @@ def test_emit_read_only_path_never_attempts_commit(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Regression — the approve leak case (the canonical fix)
+# fn-732 — approve is runtime-state-only: any cwd, no commit, clean tracked tree
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("from_any_cwd", [True, False])
-def test_approve_from_any_cwd_leaves_planctl_clean(tmp_path, monkeypatch, from_any_cwd):
-    """The canonical leak case: ``approve`` invoked from a non-project cwd
-    (or from inside the project) must commit its ``.planctl/`` write inline.
-    Both invocation forms leave ``.planctl/`` clean after exit.
+def test_approve_from_any_cwd_lands_no_commit(tmp_path, monkeypatch, from_any_cwd):
+    """fn-732: ``approve`` from any cwd writes only gitignored state.
+
+    Approval moved off the tracked def files into the gitignored sidecars, so
+    approve is reclassified runtime-state-only: it lands NO commit and the
+    tracked ``.planctl/`` tree stays clean (the sidecar write is gitignored,
+    not visible to ``git status``). Mirrors ``claim``/``block``.
 
     Uses ``rejected`` so the fn-592 approve-gate doesn't fire — we want the
-    commit-leak coverage, not the gate behavior.
+    no-commit coverage, not the gate behavior.
     """
     project = _make_planctl_git_project(tmp_path, monkeypatch)
     epic_id, _ = _seed_epic(project)
 
-    # `approve` resolves the project via roots discovery, not via cwd — so a
-    # cwd outside the project is the leak case the fix targets.
+    pre_count = _git_commit_count(project)
+
+    # `approve` resolves the project via roots discovery, not via cwd.
     cwd = tmp_path if from_any_cwd else project
 
     result = subprocess.run(
@@ -499,6 +502,14 @@ def test_approve_from_any_cwd_leaves_planctl_clean(tmp_path, monkeypatch, from_a
     )
     assert result.returncode == 0, f"approve failed: {result.stdout}\n{result.stderr}"
 
+    # No commit landed — approve is runtime-state-only.
+    assert _git_commit_count(project) == pre_count, (
+        f"approve must not create a commit (runtime-state-only); "
+        f"head went from {pre_count} to {_git_commit_count(project)}"
+    )
+
+    # The tracked .planctl/ tree is clean: the sidecar write lives under the
+    # gitignored state/ subtree, invisible to `git status`.
     status = subprocess.run(
         ["git", "status", "--porcelain", "--", ".planctl/"],
         cwd=project,
@@ -507,5 +518,5 @@ def test_approve_from_any_cwd_leaves_planctl_clean(tmp_path, monkeypatch, from_a
         check=True,
     )
     assert status.stdout.strip() == "", (
-        f"approve left .planctl/ dirty after exit: {status.stdout!r}"
+        f"approve left tracked .planctl/ dirty after exit: {status.stdout!r}"
     )

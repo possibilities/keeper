@@ -17,6 +17,11 @@ Coverage matrix:
 
 Plus regression coverage for :func:`planctl.store.now_iso` after the
 microsecond-precision upgrade.
+
+The synthetic payloads here carry ``op="set-title"`` as a representative
+single-field mutating verb — ``auto_commit_from_invocation`` is verb-agnostic
+(it commits whatever ``files``/``subject`` it is handed), so any committing
+verb's op label exercises the helper identically.
 """
 
 from __future__ import annotations
@@ -171,11 +176,11 @@ def test_auto_commit_happy_path_returns_sha_and_commits(planctl_git_repo):
     rel = _make_dirty(planctl_git_repo, ".planctl/epics/test_marker.txt")
     pre = _git_commit_count(planctl_git_repo)
 
-    subject = "chore(planctl): approve fn-587-x"
+    subject = "chore(planctl): set-title fn-587-x"
     sha = auto_commit_from_invocation(
         {
             "files": [rel],
-            "op": "approve",
+            "op": "set-title",
             "target": "fn-587-x",
             "subject": subject,
             "state_repo": str(planctl_git_repo),
@@ -191,7 +196,7 @@ def test_auto_commit_happy_path_returns_sha_and_commits(planctl_git_repo):
     msg = _git_head_message(planctl_git_repo)
     assert msg.splitlines()[0] == subject
     # Forensic trailers are appended.
-    assert "Planctl-Op: approve" in msg
+    assert "Planctl-Op: set-title" in msg
     assert "Planctl-Target: fn-587-x" in msg
     assert "Planctl-Prev-Op: " in msg
     assert rel in _git_head_files(planctl_git_repo)
@@ -310,9 +315,9 @@ def test_auto_commit_skips_files_not_in_payload(planctl_git_repo):
     sha = auto_commit_from_invocation(
         {
             "files": [in_scope],
-            "op": "approve",
+            "op": "set-title",
             "target": "fn-587-y",
-            "subject": "chore(planctl): approve fn-587-y",
+            "subject": "chore(planctl): set-title fn-587-y",
             "state_repo": str(planctl_git_repo),
             "repo_root": str(planctl_git_repo),
         }
@@ -351,9 +356,9 @@ def test_auto_commit_falls_back_to_repo_root_when_state_repo_missing(
     sha = auto_commit_from_invocation(
         {
             "files": [rel],
-            "op": "approve",
+            "op": "set-title",
             "target": "fn-587-fb",
-            "subject": "chore(planctl): approve fn-587-fb",
+            "subject": "chore(planctl): set-title fn-587-fb",
             # state_repo absent
             "repo_root": str(planctl_git_repo),
         }
@@ -372,9 +377,9 @@ def test_auto_commit_raises_when_state_repo_and_repo_root_both_missing(
         auto_commit_from_invocation(
             {
                 "files": [rel],
-                "op": "approve",
+                "op": "set-title",
                 "target": "fn-587-nr",
-                "subject": "chore(planctl): approve fn-587-nr",
+                "subject": "chore(planctl): set-title fn-587-nr",
             }
         )
     assert ei.value.error == "missing_state_repo"
@@ -387,7 +392,7 @@ def test_auto_commit_raises_when_subject_missing(planctl_git_repo):
         auto_commit_from_invocation(
             {
                 "files": [rel],
-                "op": "approve",
+                "op": "set-title",
                 "target": "fn-587-ns",
                 "state_repo": str(planctl_git_repo),
                 "repo_root": str(planctl_git_repo),
@@ -415,9 +420,9 @@ def test_auto_commit_raises_commit_failed_on_git_commit_error(
         auto_commit_from_invocation(
             {
                 "files": [rel],
-                "op": "approve",
+                "op": "set-title",
                 "target": "fn-587-cf",
-                "subject": "chore(planctl): approve fn-587-cf",
+                "subject": "chore(planctl): set-title fn-587-cf",
                 "state_repo": str(planctl_git_repo),
                 "repo_root": str(planctl_git_repo),
             }
@@ -442,9 +447,9 @@ def test_auto_commit_two_sequential_commits_succeed(planctl_git_repo):
     sha1 = auto_commit_from_invocation(
         {
             "files": [rel],
-            "op": "approve",
+            "op": "set-title",
             "target": "fn-587-l1",
-            "subject": "chore(planctl): approve fn-587-l1",
+            "subject": "chore(planctl): set-title fn-587-l1",
             "state_repo": str(planctl_git_repo),
             "repo_root": str(planctl_git_repo),
         }
@@ -456,9 +461,9 @@ def test_auto_commit_two_sequential_commits_succeed(planctl_git_repo):
     sha2 = auto_commit_from_invocation(
         {
             "files": [rel2],
-            "op": "approve",
+            "op": "set-title",
             "target": "fn-587-l2",
-            "subject": "chore(planctl): approve fn-587-l2",
+            "subject": "chore(planctl): set-title fn-587-l2",
             "state_repo": str(planctl_git_repo),
             "repo_root": str(planctl_git_repo),
         }
@@ -500,9 +505,9 @@ def test_auto_commit_retries_past_preexisting_index_lock(planctl_git_repo):
         sha = auto_commit_from_invocation(
             {
                 "files": [rel],
-                "op": "approve",
+                "op": "set-title",
                 "target": "fn-640-retry",
-                "subject": "chore(planctl): approve fn-640-retry",
+                "subject": "chore(planctl): set-title fn-640-retry",
                 "state_repo": str(planctl_git_repo),
                 "repo_root": str(planctl_git_repo),
             }
@@ -536,9 +541,9 @@ def test_auto_commit_raises_commit_contended_on_exhaustion(
             auto_commit_from_invocation(
                 {
                     "files": [rel],
-                    "op": "approve",
+                    "op": "set-title",
                     "target": "fn-640-exhaust",
-                    "subject": "chore(planctl): approve fn-640-exhaust",
+                    "subject": "chore(planctl): set-title fn-640-exhaust",
                     "state_repo": str(planctl_git_repo),
                     "repo_root": str(planctl_git_repo),
                 }
@@ -570,9 +575,9 @@ def test_auto_commit_does_not_retry_genuine_commit_failure(
         auto_commit_from_invocation(
             {
                 "files": [rel],
-                "op": "approve",
+                "op": "set-title",
                 "target": "fn-640-genuine",
-                "subject": "chore(planctl): approve fn-640-genuine",
+                "subject": "chore(planctl): set-title fn-640-genuine",
                 "state_repo": str(planctl_git_repo),
                 "repo_root": str(planctl_git_repo),
             }

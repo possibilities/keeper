@@ -392,3 +392,96 @@ def test_multi_repo_project_epic_create_with_touched_repos(
     assert epic["primary_repo"] == str(primary)
     assert str(primary) in epic["touched_repos"]
     assert str(touched) in epic["touched_repos"]
+
+
+# ---------------------------------------------------------------------------
+# fn-732: approval moved off the def files into the runtime sidecars.
+#   - normalize_* must NOT default `approval` to "pending" (the default lives
+#     only in the merge step).
+#   - merge_task_state / merge_epic_state resolve the ladder
+#     (sidecar > def > pending).
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_epic_no_longer_defaults_approval():
+    """fn-732: normalize_epic must not inject the "pending" approval default."""
+    data = {"id": "fn-1-test", "title": "Epic", "status": "open"}
+    normalize_epic(data)
+    assert "approval" not in data
+
+
+def test_normalize_task_no_longer_defaults_approval():
+    """fn-732: normalize_task must not inject the "pending" approval default."""
+    data = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Task"}
+    normalize_task(data)
+    assert "approval" not in data
+
+
+def test_normalize_epic_passes_through_def_approval():
+    """A pre-cutover def `approval` rides through normalize untouched."""
+    data = {"id": "fn-1-t", "title": "X", "status": "open", "approval": "approved"}
+    normalize_epic(data)
+    assert data["approval"] == "approved"
+
+
+def test_normalize_task_passes_through_def_approval():
+    """A pre-cutover def `approval` rides through normalize untouched."""
+    data = {"id": "fn-1-t.1", "epic": "fn-1-t", "title": "X", "approval": "rejected"}
+    normalize_task(data)
+    assert data["approval"] == "rejected"
+
+
+def test_merge_task_state_resolves_approval_ladder():
+    """sidecar > def > pending for merged task approval (fn-732)."""
+    from planctl.models import merge_task_state
+
+    base = {"id": "fn-1-x.1", "epic": "fn-1-x", "title": "X"}
+    # sidecar wins
+    assert (
+        merge_task_state({**base, "approval": "rejected"}, {"approval": "approved"})[
+            "approval"
+        ]
+        == "approved"
+    )
+    # def fallback when sidecar lacks the key / is None
+    assert merge_task_state({**base, "approval": "rejected"}, None)["approval"] == (
+        "rejected"
+    )
+    assert (
+        merge_task_state({**base, "approval": "rejected"}, {"approval": None})[
+            "approval"
+        ]
+        == "rejected"
+    )
+    # pending when absent everywhere
+    assert merge_task_state(base, None)["approval"] == "pending"
+
+
+def test_merge_epic_state_resolves_approval_ladder():
+    """sidecar > def > pending for merged epic approval (fn-732)."""
+    from planctl.models import merge_epic_state
+
+    base = {"id": "fn-1-x", "title": "X", "status": "done"}
+    assert (
+        merge_epic_state({**base, "approval": "rejected"}, {"approval": "approved"})[
+            "approval"
+        ]
+        == "approved"
+    )
+    assert merge_epic_state({**base, "approval": "rejected"}, None)["approval"] == (
+        "rejected"
+    )
+    assert merge_epic_state(base, None)["approval"] == "pending"
+    assert merge_epic_state(base, {})["approval"] == "pending"
+
+
+def test_merge_epic_state_normalizes_def_fields():
+    """merge_epic_state returns a normalized epic (additive defaults applied)."""
+    from planctl.models import merge_epic_state
+
+    merged = merge_epic_state({"id": "fn-1-x", "title": "X", "status": "open"}, None)
+    # normalize_epic additive defaults present …
+    assert merged["snippets"] == []
+    assert merged["bundles"] == []
+    # … and approval resolved to pending via the ladder.
+    assert merged["approval"] == "pending"
