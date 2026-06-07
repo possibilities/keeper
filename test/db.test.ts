@@ -53,7 +53,7 @@ afterEach(() => {
 });
 
 test("openDb creates events, jobs, reducer_state, meta tables", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const tables = db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
@@ -75,7 +75,7 @@ test("openDb creates events, jobs, reducer_state, meta tables", () => {
 });
 
 test("all expected indexes are present", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const indexes = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
@@ -114,7 +114,7 @@ test("idx_events_tool_attr makes the explicit-attribution tool scan COVERING", (
   // covering index carries all of them so the planner never reads a data page —
   // the key-only predecessor was a SEEK but faulted one cold page per match,
   // regressing PASS 1 to ~4.5s/file under concurrent load.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const plan = db
     .prepare(
       `EXPLAIN QUERY PLAN
@@ -137,7 +137,7 @@ test("idx_events_bash_attr makes the explicit-attribution bash scan COVERING", (
   // fn-649 follow-up: the bash scan filters bash_mutation_kind IS NOT NULL,
   // expands json_each(bash_mutation_targets), SELECTs id,ts,session_id,kind.
   // Covering means no per-row table read even under concurrent I/O.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const plan = db
     .prepare(
       `EXPLAIN QUERY PLAN
@@ -353,7 +353,7 @@ test("migrate: false against a stale schema fails on a column-binding error (hoo
 });
 
 test("reducer_state row (1, 0, ts) is seeded on first open", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const row = db
     .prepare("SELECT id, last_event_id, updated_at FROM reducer_state")
     .get() as { id: number; last_event_id: number; updated_at: number } | null;
@@ -399,7 +399,7 @@ test("KEEPER_DB env var overrides default path", () => {
 });
 
 test("schema_version is stamped in meta", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const row = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
@@ -408,7 +408,7 @@ test("schema_version is stamped in meta", () => {
 });
 
 test("events has a nullable spawn_name column; jobs has a nullable title_source column", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
     notnull: number;
@@ -432,7 +432,7 @@ test("events has a nullable spawn_name column; jobs has a nullable title_source 
 });
 
 test("jobs has a nullable title column and no mode/title_history columns", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(jobs)").all() as {
     name: string;
     dflt_value: string | null;
@@ -1060,7 +1060,7 @@ test("v6 DB migrates to v7: tasks embedded into epics.tasks in (task_number, tas
 });
 
 test("fresh openDb at v9 has events.start_time and jobs.start_time as nullable TEXT", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
     type: string;
@@ -1205,7 +1205,7 @@ test("v8 DB migrates to v9: events.start_time + jobs.start_time added, rows pres
 });
 
 test("fresh openDb at v10 has events.slash_command + events.skill_name + jobs.plan_verb + jobs.plan_ref as nullable TEXT", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
     type: string;
@@ -1243,7 +1243,7 @@ test("fresh openDb at v10 has events.slash_command + events.skill_name + jobs.pl
 });
 
 test("v10 partial indexes are present on fresh openDb", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const indexes = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
@@ -1255,7 +1255,7 @@ test("v10 partial indexes are present on fresh openDb", () => {
 });
 
 test("v10 idx_jobs_plan_ref serves a WHERE plan_verb='close' query (EXPLAIN QUERY PLAN)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   // Seed enough rows + ANALYZE so the planner picks the partial index over a
   // table scan. The acceptance bar is "an EXPLAIN QUERY PLAN ... shows SEARCH
   // ... USING INDEX idx_jobs_plan_ref (or equivalent index hit)" — `plan_verb`
@@ -1289,7 +1289,7 @@ test("v10 idx_jobs_plan_ref serves a WHERE plan_verb='close' query (EXPLAIN QUER
 });
 
 test("Tier 2 (fn-628) idx_epics_sort_path + idx_jobs_created_state are present on fresh openDb", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const indexes = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
@@ -1303,7 +1303,7 @@ test("Tier 4.1 (fn-634) idx_epics_default_visible is present on fresh openDb", (
   // Sibling presence assertion to the Tier 2 test above: the schema v32
   // partial index lands on every fresh open (CREATE INDEX IF NOT EXISTS is
   // idempotent + always-run from CREATE_EPICS_INDEXES).
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const indexes = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
@@ -1329,7 +1329,7 @@ test("Tier 4.1 (fn-634) idx_epics_default_visible serves the default epics query
   // clause is load-bearing: a parameterized `default_visible = ?` with
   // params=[1] might not syntactically match the partial-index predicate
   // across SQLite versions.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at, sort_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   );
@@ -1359,7 +1359,7 @@ test("Tier 2 (fn-628) idx_epics_sort_path still serves the explicit-status epics
   // drops the descriptor's defaultClause. Pins that the Tier 4.1 work
   // doesn't regress the prior coverage — both indexes coexist and the
   // planner picks the right one for each query shape.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at, sort_path) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
   );
@@ -1393,7 +1393,7 @@ test("fn-712 default_visible = 1 is semantically equivalent to the materialized 
   // fn-712 added the `status IS NOT NULL` "epic is materialized" guard, so
   // the equivalent OR form now carries that guard too: a NULL-status shell
   // row (no EpicSnapshot folded yet) is HIDDEN regardless of approval.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
@@ -1451,7 +1451,7 @@ test("fn-712 default_visible generated column yields the expected 0/1 values acr
   // because a shell row with no folded EpicSnapshot is hidden from the
   // board until it materializes. The prior expression surfaced c6
   // (null+pending) via the !approved branch — c6 flips 1 → 0 here.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
@@ -1486,7 +1486,7 @@ test("Tier 4.1 (fn-634) write-protection: INSERT INTO default_visible throws (ge
   // 13-column INSERT (which deliberately omits default_visible) the only
   // correct shape. If a future contributor adds default_visible to the
   // INSERT column list, this test catches it.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   expect(() => {
     db.run(
       "INSERT INTO epics (epic_id, status, approval, updated_at, default_visible) VALUES ('bad', 'open', 'pending', 1, 1)",
@@ -1524,7 +1524,7 @@ test("fn-712 a status-NULL shell epic computes default_visible=0 and is excluded
   // board's default page regardless of approval. A status-set (materialized)
   // open epic still qualifies. Same `status IS NOT NULL` predicate the
   // autopilot's `epic-not-materialized` readiness verdict uses.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
@@ -1559,7 +1559,7 @@ test("fn-712 idx_epics_default_visible still serves the default epics query with
   // plan: the board query still SEARCHes idx_epics_default_visible (not a
   // SCAN) with no temp B-tree for the ORDER BY, even when shell rows are
   // present in the table.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const insert = db.prepare(
     "INSERT INTO epics (epic_id, epic_number, title, status, approval, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
   );
@@ -1685,7 +1685,7 @@ test("Tier 2 (fn-628) idx_jobs_created_state serves the default jobs query as CO
   // shape was rejected during planning because SQLite cannot translate a
   // `NOT IN` predicate into a usable index-entry range on the leading
   // column.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const states = ["running", "stopped", "ended", "killed", "spawned"];
   const insert = db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, state) VALUES (?, ?, ?, ?, ?)",
@@ -1799,7 +1799,7 @@ function seedPlanctlEventMix(db: Database): void {
 }
 
 test("Tier 2 (fn-628.2) idx_events_planctl_epic + idx_events_planctl_target are present on fresh openDb", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const indexes = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
@@ -1814,7 +1814,7 @@ test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH planctl partial inde
   // after the OR→UNION rewrite. EQP must show a COMPOUND QUERY whose two
   // branches each SEARCH a different new partial index — proving the
   // optimizer can reach both indexes (the prior OR form could only reach one).
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   seedPlanctlEventMix(db);
 
   const plan = db
@@ -1842,7 +1842,7 @@ test("Tier 2 (fn-628.2) per-epic queue_jump scan uses idx_events_planctl_epic (E
   // The per-epic queue_jump EXISTS scan at src/reducer.ts:~2543 keys off
   // `planctl_epic_id = ?` — must hit the new index (the schema-v14
   // session-leading index cannot serve a planctl_epic_id equality).
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   seedPlanctlEventMix(db);
 
   const plan = db
@@ -1868,7 +1868,7 @@ test("Tier 2 (fn-628.2) per-session ordered planctl load still uses idx_events_p
   // displaced by the new indexes — confirms the v14 session-leading index
   // remains the planner's pick for `WHERE session_id = ? AND planctl_op IS
   // NOT NULL ORDER BY id ASC`.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   seedPlanctlEventMix(db);
 
   const plan = db
@@ -1892,7 +1892,7 @@ test("Tier 2 (fn-628.2) UNION rewrite is semantically equivalent to the prior OR
   // The reducer's `syncPlanctlLinks` cross-session sweep must produce
   // byte-identical session_id sets after the rewrite. Both forms run against
   // the same fixture; sorted+deduped session_id sets must deep-equal.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   seedPlanctlEventMix(db);
 
   const orForm = db
@@ -2736,7 +2736,7 @@ test("v12 DB migrates to v13: epics.approval added, approvals table dropped, fil
 });
 
 test("fresh openDb at v14 has events.planctl_* + jobs.epic_links + epics.job_links with correct shapes", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
     type: string;
@@ -2795,7 +2795,7 @@ test("fresh openDb at v14 has events.planctl_* + jobs.epic_links + epics.job_lin
 });
 
 test("fresh openDb has git_status table for the git read surface", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(git_status)").all() as {
     name: string;
     type: string;
@@ -2813,7 +2813,7 @@ test("fresh openDb has git_status table for the git read surface", () => {
 });
 
 test("fresh openDb has the schema-v23 usage table for the agentuse read surface (fn-615)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   // Table exists, table_info shape matches the CREATE_USAGE literal.
   const cols = db.prepare("PRAGMA table_info(usage)").all() as {
     name: string;
@@ -3500,7 +3500,7 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
 // ---------------------------------------------------------------------------
 
 test("fresh openDb at v17 has events.tool_use_id + subagent_invocations table with correct shapes", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   // events.tool_use_id is a sparse top-level TEXT column with no default.
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
@@ -4828,7 +4828,7 @@ test("runPlanctlApprovalMigration first-time boot with no approvals table is a c
   );
 
   // Open a fresh-v13 DB (migrate ran, no approvals table created).
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   // Backfill ran cleanly — `approval: "approved"` landed.
   runPlanctlApprovalMigration(db, [planRoot]);
   const obj = JSON.parse(readFileSync(epicPath, "utf8")) as {
@@ -4856,7 +4856,7 @@ test("runPlanctlApprovalMigration walks <root>/<project>/.planctl/... one level 
     serializePlanctlJson({ id: "fn-1-foo", title: "Foo" }),
   );
 
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   runPlanctlApprovalMigration(db, [outerRoot]);
   const obj = JSON.parse(readFileSync(epicPath, "utf8")) as {
     approval: string;
@@ -5148,13 +5148,13 @@ test("resolveSockPath does no I/O (does not create the parent dir)", () => {
 });
 
 test("selectWorldRev returns the seeded 0 on a fresh DB", () => {
-  const { db, stmts } = openDb(dbPath);
+  const { db, stmts } = openDb(":memory:");
   expect(selectWorldRev(stmts)).toBe(0);
   db.close();
 });
 
 test("selectWorldRev reflects advanceCursor", () => {
-  const { db, stmts } = openDb(dbPath);
+  const { db, stmts } = openDb(":memory:");
   db.prepare(
     "UPDATE reducer_state SET last_event_id = ?, updated_at = ? WHERE id = 1",
   ).run(7, 1);
@@ -5163,14 +5163,14 @@ test("selectWorldRev reflects advanceCursor", () => {
 });
 
 test("selectByIds returns [] for an empty id-set without querying", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   // Sanity: even if we hadn't seeded anything, [] must short-circuit.
   expect(selectByIds(db, JOBS_DESCRIPTOR, [])).toEqual([]);
   db.close();
 });
 
 test("selectByIds returns matching rows for a multi-id set", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const ts = 1_700_000_000;
   const insert = db.prepare(
     "INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
@@ -5201,7 +5201,7 @@ test("selectByIds returns matching rows for a multi-id set", () => {
 });
 
 test("selectByIds serves title and no title_history key", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const ts = 1_700_000_000;
   db.prepare(
     "INSERT INTO jobs (job_id, created_at, last_event_id, updated_at, title) VALUES (?, ?, ?, ?, ?)",
@@ -5222,7 +5222,7 @@ test("selectByIds serves title and no title_history key", () => {
 });
 
 test("selectByIds throws when id-set exceeds MAX_IN_PARAMS", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const ids = Array.from({ length: MAX_IN_PARAMS + 1 }, (_, i) => `id-${i}`);
   expect(() => selectByIds(db, JOBS_DESCRIPTOR, ids)).toThrow(
     /MAX_VARIABLE_NUMBER/,
@@ -5428,7 +5428,7 @@ test("fresh v25 DB: CREATE_JOBS literal carries last_input_request_at + last_inp
   // CREATE TABLE literal — not via the v24→v25 ALTER step. Re-fold
   // determinism requires that a fresh v25 DB and a migrated v24→v25
   // DB converge to identical schema.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const jobCols = (
     db.prepare("PRAGMA table_info(jobs)").all() as {
       name: string;
@@ -5471,7 +5471,7 @@ test("fresh v25 DB: CREATE_JOBS literal carries last_input_request_at + last_inp
 // ---------------------------------------------------------------------------
 
 test("fresh v29 DB: epics has created_by_closer_of + sort_path with correct shapes", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(epics)").all() as {
     name: string;
     type: string;
@@ -5705,7 +5705,7 @@ test("addColumnIfMissing is idempotent for the v30 columns", () => {
 
 test("fresh v31 DB has events.bash_mutation_kind + events.bash_mutation_targets as nullable TEXT", () => {
   // Fresh-DB path: CREATE_EVENTS literal carries the new columns.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
     type: string;
@@ -5726,7 +5726,7 @@ test("fresh v31 DB has events.bash_mutation_kind + events.bash_mutation_targets 
 });
 
 test("fresh v31 DB has jobs.git_unattributed_to_live_count (renamed) + jobs.git_orphan_count (new) as INTEGER NOT NULL DEFAULT 0", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(jobs)").all() as {
     name: string;
     type: string;
@@ -5747,7 +5747,7 @@ test("fresh v31 DB has jobs.git_unattributed_to_live_count (renamed) + jobs.git_
 });
 
 test("fresh v31 DB has file_attributions table with the right PK + indexes", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const tables = db
     .prepare(
       "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'file_attributions'",
@@ -5807,7 +5807,7 @@ test("fresh v31 DB has file_attributions table with the right PK + indexes", () 
 });
 
 test("fresh DB has idx_events_bash_attr covering partial index (replaces idx_events_bash_mutation_kind)", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const indexes = db
     .prepare(
       "SELECT name, sql FROM sqlite_master WHERE type = 'index' AND name = 'idx_events_bash_attr'",
@@ -5833,7 +5833,7 @@ test("fresh DB has idx_events_bash_attr covering partial index (replaces idx_eve
 });
 
 test("fresh DB schema_version is stamped at current SCHEMA_VERSION", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const ver = db
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
@@ -6315,7 +6315,7 @@ test("fresh v33 DB has profiles table with config_dir NOT NULL PRIMARY KEY + pai
   // `INSERT OR IGNORE` would NOT dedupe; the `''` sentinel collapses the
   // default `~/.claude` profile (NULL `events.config_dir`) into a single
   // bucket.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(profiles)").all() as {
     name: string;
     type: string;
@@ -6493,7 +6493,7 @@ test("fresh v34 DB has epics.resolved_epic_deps (nullable TEXT) and epic_dep_edg
   // is a (consumer_id, dep_token) two-column key-only table backed by
   // `idx_epic_dep_edges_dep_token` for the reverse-fan-out lookup keyed
   // on the raw token.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
 
   // (a) epics.resolved_epic_deps — nullable TEXT, no DEFAULT (NULL is the
   // schema-default zero-event reading).
@@ -7121,7 +7121,7 @@ test("fresh v40 DB has jobs.name_history TEXT NOT NULL DEFAULT '[]' (fn-652)", (
   // lockstep convention). Mirrors `epic_links` exactly (TEXT NOT NULL
   // DEFAULT '[]') — same JSON-array convention used elsewhere in the
   // `jobs` projection.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(jobs)").all() as {
     name: string;
     type: string;
@@ -7247,7 +7247,7 @@ test("fresh v41 DB has usage.rate_limit_lifts_at TEXT and usage.last_usage_fold_
   // so a fresh-DB path and a migrated-DB path converge on identical schema
   // (the addColumnIfMissing/literal lockstep convention). Both nullable
   // (no NOT NULL); no DEFAULT — null on existing rows after migrate.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const cols = db.prepare("PRAGMA table_info(usage)").all() as {
     name: string;
     type: string;
@@ -7384,7 +7384,7 @@ test("fresh DB has events.backend_exec_{type,session_id,pane_id} + jobs.backend_
   // `jobs.backend_exec_tab_{id,name}` columns were dropped in fn-710 T2 (sole
   // writer was the now-removed BackendExecSnapshot fold) — assert they are GONE
   // from the fresh CREATE_JOBS literal.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
     type: string;

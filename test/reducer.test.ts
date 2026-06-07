@@ -13,27 +13,25 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
 import { openDb } from "../src/db";
 import { applyEvent, DEFAULT_BATCH_SIZE, drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import type { Event } from "../src/types";
 
-let tmpDir: string;
-let dbPath: string;
 let db: Database;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "keeper-reducer-test-"));
-  dbPath = join(tmpDir, "keeper.db");
-  db = openDb(dbPath).db;
+  // fn-722.3: each test opens a fresh in-memory writer connection. The
+  // refold-determinism tests (~:337, ~:2229) rewind the cursor + DELETE the
+  // projection tables + re-drain on this SAME connection, so the byte-identical
+  // re-fold still holds in memory. No body-level test opens a second
+  // connection that would need to see this DB's rows, so :memory: is safe and
+  // drops the per-test on-disk WAL setup cost.
+  db = openDb(":memory:").db;
 });
 
 afterEach(() => {
   db.close();
-  rmSync(tmpDir, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
