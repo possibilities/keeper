@@ -38,7 +38,7 @@ Task that proves the approach: `.1` (config + reconcile budget enforces the cap 
 - **`null` not `Infinity` at rest:** `Infinity` serializes to `null` via JSON and fails SQLite; keep `null`=unlimited in config + column + wire, convert to a fast-path bypass (not `Infinity` arithmetic) only at the budget gate.
 - **Strict `budget > 0` gate:** cap=1, occupied=1 → budget=0 → block the next (CWE-193 off-by-one).
 - **Predicate parity:** count and the per-root mutex must use the SAME `isRootOccupant` (planner-exempt) or the two counts drift.
-- **Approval-pending starvation is correct, not a bug:** cap=1 with a held done+approval-pending slot dispatches nothing until a human approves — document it.
+- ~~**Approval-pending starvation is correct, not a bug:** cap=1 with a held done+approval-pending slot dispatches nothing until a human approves — document it.~~ **SUPERSEDED by fn-728:** `approve`-verb launches are now exempt from the cap (a backlog of pending-approval rows must not deadlock its own approvers); the cap bounds only `work`/`close`.
 
 ## Docs gaps
 
