@@ -135,6 +135,7 @@ import {
 } from "./exec-backend";
 import {
   computeReadiness,
+  isRootOccupant,
   type PendingDispatch,
   type Verdict,
 } from "./readiness";
@@ -406,6 +407,13 @@ export interface ReconcileSnapshot {
 export interface ReconcileState {
   paused: boolean;
   inFlight: Set<DispatchKey>;
+  /**
+   * Global ceiling on how many root-occupants this reconciler dispatches
+   * at once across ALL epics/roots (fn-725). `null` = unlimited (today's
+   * behavior — no cap). Threaded daemon → workerData → here so the cap
+   * rides `state` and `reconcile()` stays pure (never a module global).
+   */
+  maxConcurrentJobs: number | null;
 }
 
 /**
@@ -825,6 +833,31 @@ export function reconcile(
     snapshot.pendingDispatches,
   );
 
+  // fn-725 global concurrency cap. Count root-occupants ONCE over the
+  // POST-mutex verdicts of BOTH perTask AND perCloseRow — `isRootOccupant`
+  // is planner-exempt, matching the per-root mutex predicate so the two
+  // counts never drift. This snapshot baseline includes a `dispatch-pending`
+  // row (it occupies), but that row is already suppressed from re-push by
+  // the `liveTabKeys`/`isOccupyingJob` arms below, so it never
+  // double-consumes. `budget` is the remaining admittance for NEWLY-planned
+  // launches this cycle; `null` cap is a fast-path bypass (POSITIVE_INFINITY)
+  // rather than `Infinity` at rest. Strict `budget > 0` (CWE-193): cap=1
+  // occupied=1 → budget=0 → admit nothing.
+  let occupied = 0;
+  for (const verdict of readiness.perTask.values()) {
+    if (isRootOccupant(verdict)) {
+      occupied++;
+    }
+  }
+  for (const verdict of readiness.perCloseRow.values()) {
+    if (isRootOccupant(verdict)) {
+      occupied++;
+    }
+  }
+  const cap = state.maxConcurrentJobs;
+  let budget =
+    cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - occupied);
+
   // Walk every row. For each (kind, id), compute the wanted verb and
   // record whichever launches survive suppression.
   for (const epic of snapshot.epics) {
@@ -867,6 +900,13 @@ export function reconcile(
         // project_dir is a data bug, not a runtime decision.
         continue;
       }
+      // fn-725 cap — LAST gate, after every per-task/per-epic/per-root
+      // verdict is computed (so debug verdicts aren't masked). A budget
+      // skip does NOT hold a slot; it just defers this launch to a later
+      // cycle once an occupant frees up.
+      if (budget <= 0) {
+        continue;
+      }
       launches.push({
         verb,
         id: taskId,
@@ -875,6 +915,7 @@ export function reconcile(
         workerCommand: buildWorkerCommand(verb, taskId, cwd, task.tier),
         tier: verb === "work" ? task.tier : null,
       });
+      budget--;
     }
     // Close row.
     const epicId = epic.epic_id;
@@ -890,7 +931,10 @@ export function reconcile(
         // fn-674 standing dedup arm: a live `close::<epic>` tab in the
         // session is proof a launched closer occupies the slot before
         // its SessionStart binds. Same shape as the task arm above.
-        !snapshot.liveTabKeys.has(closeKey);
+        !snapshot.liveTabKeys.has(closeKey) &&
+        // fn-725 cap — the close-row push shares the SAME decrementing
+        // budget as the task push above, so a closer can't blow the cap.
+        budget > 0;
       if (okToPlan && projectDir !== "") {
         launches.push({
           verb: closeVerb,
@@ -900,6 +944,7 @@ export function reconcile(
           workerCommand: buildWorkerCommand(closeVerb, epicId, projectDir),
           tier: null,
         });
+        budget--;
       }
     }
   }
@@ -1176,6 +1221,14 @@ export interface AutopilotWorkerData {
    * main, every worker receives the resolved value.
    */
   zellijSession?: string;
+  /**
+   * Global concurrent-job cap (fn-725) — the configured ceiling on
+   * root-occupants autopilot dispatches at once across ALL epics/roots.
+   * `null`/absent = unlimited. Threaded in from
+   * `resolveConfig().maxConcurrentJobs`; like `zellijSession`, config I/O
+   * happens once on main and the resolved value rides workerData.
+   */
+  maxConcurrentJobs?: number | null;
 }
 
 /** Main → worker: paused-flag flip. */
@@ -1390,6 +1443,7 @@ function main(): void {
   const state: ReconcileState = {
     paused: data.paused ?? true,
     inFlight: new Set(),
+    maxConcurrentJobs: data.maxConcurrentJobs ?? null,
   };
   // `liveDispatches` tracks the in-flight surfaces this reconciler still
   // owns confirm/reap work for (keyed `${verb}::${id}`). Boots EMPTY: a

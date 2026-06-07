@@ -57,7 +57,7 @@ import {
   type Verdict,
 } from "../src/readiness";
 import { projectPendingDispatches } from "../src/readiness-client";
-import type { Epic, Job, Task } from "../src/types";
+import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers (same shape as test/autopilot.test.ts)
@@ -153,6 +153,9 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
   return {
     paused: false,
     inFlight: new Set(),
+    // Default unlimited — every pre-fn-725 test that omits this must see
+    // identical dispatch behavior.
+    maxConcurrentJobs: null,
     ...overrides,
   };
 }
@@ -699,6 +702,148 @@ test("fn-721 reconcile: without the pending row the sibling is NOT demoted (cont
   const snap = makeSnapshot({ epics: [epic], pendingDispatches: [] });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches.map((l) => l.key)).toEqual(["work::fn-1-foo.1"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-725 — global max_concurrent_jobs budget gate
+// ---------------------------------------------------------------------------
+//
+// The cap counts `isRootOccupant` verdicts over perTask ∪ perCloseRow ONCE
+// per cycle (the baseline) and admits at most `cap - occupied` NEW launches,
+// shared across the task + close-row push sites by one decrementing budget.
+// Occupants and ready tasks are placed in DISTINCT roots so the per-root
+// mutex doesn't pre-empt the budget under test (an occupant + ready task on
+// the SAME root would be demoted by the mutex before the budget sees it).
+
+// A `working` job → its done+approved task renders `running:job-running`, a
+// real root-occupant that consumes one budget slot.
+function occupantEpic(epicId: string, projectDir: string): Epic {
+  const taskId = `${epicId}.1`;
+  return makeEpic({
+    epic_id: epicId,
+    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
+    project_dir: projectDir,
+    sort_path: epicId,
+    tasks: [
+      makeTask({
+        task_id: taskId,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+        approval: "approved",
+        jobs: [
+          // Embedded working job → predicate 1 holds the task at
+          // `running:job-running`, an `isRootOccupant`.
+          {
+            job_id: `j-${epicId}`,
+            state: "working",
+          } as unknown as EmbeddedJob,
+        ],
+      }),
+    ],
+  });
+}
+
+// A ready `work` task in its own epic+root (so no mutex collision with
+// other epics' occupants or ready tasks).
+function readyEpic(epicId: string, projectDir: string): Epic {
+  return makeEpic({
+    epic_id: epicId,
+    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
+    project_dir: projectDir,
+    sort_path: epicId,
+    tasks: [makeTask({ task_id: `${epicId}.1`, epic_id: epicId })],
+  });
+}
+
+test("fn-725 cap: cap=2 with 2 root-occupants → zero launches (budget exhausted)", () => {
+  // occupied = 2 (both job-running), budget = max(0, 2-2) = 0. A third ready
+  // task in its own root is admitted only if budget > 0 — it is not.
+  const occA = occupantEpic("fn-1-a", "/repo-a");
+  const occB = occupantEpic("fn-2-b", "/repo-b");
+  const ready = readyEpic("fn-3-c", "/repo-c");
+  const snap = makeSnapshot({ epics: [occA, occB, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 2 }), 0);
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-725 cap: cap=2 with 1 occupant + 2 ready → exactly 1 launch", () => {
+  // occupied = 1, budget = max(0, 2-1) = 1. Two ready tasks (distinct roots,
+  // each first-on-root so the mutex leaves them ready) compete for one slot.
+  const occ = occupantEpic("fn-1-a", "/repo-a");
+  const ready1 = readyEpic("fn-2-b", "/repo-b");
+  const ready2 = readyEpic("fn-3-c", "/repo-c");
+  const snap = makeSnapshot({ epics: [occ, ready1, ready2] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 2 }), 0);
+  expect(decision.launches.length).toBe(1);
+  // The first ready row in board order wins the single slot.
+  expect(decision.launches[0]?.key).toBe("work::fn-2-b.1");
+});
+
+test("fn-725 cap: a planner-running occupant does NOT consume budget (planner-exempt)", () => {
+  // The planner epic renders `running:planner-running` — NOT an
+  // `isRootOccupant`, so it must not charge the cap. With cap=1 and one
+  // planner + one ready task in another root, the ready task launches.
+  const plannerEpic = makeEpic({
+    epic_id: "fn-1-plan",
+    epic_number: 1,
+    project_dir: "/repo-plan",
+    sort_path: "fn-1-plan",
+    // A working job_link with no embedded work started → planner-running.
+    job_links: [
+      {
+        kind: "creator",
+        job_id: "planner-job",
+        state: "working",
+      } as unknown as Epic["job_links"][number],
+    ],
+    tasks: [makeTask({ task_id: "fn-1-plan.1", epic_id: "fn-1-plan" })],
+  });
+  const ready = readyEpic("fn-2-go", "/repo-go");
+  const snap = makeSnapshot({ epics: [plannerEpic, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
+  // The planner's OWN task is held by the per-epic mutex (planner-running),
+  // so only the other root's ready task can launch — and it does, proving
+  // the planner didn't eat the single budget slot.
+  expect(decision.launches.map((l) => l.key)).toEqual(["work::fn-2-go.1"]);
+});
+
+test("fn-725 cap: cap=null reproduces pre-change dispatch exactly", () => {
+  // No cap → every ready task in its own root launches (the pre-fn-725
+  // behavior). Two ready epics, two distinct roots, both launch.
+  const ready1 = readyEpic("fn-1-a", "/repo-a");
+  const ready2 = readyEpic("fn-2-b", "/repo-b");
+  const snap = makeSnapshot({ epics: [ready1, ready2] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: null }), 0);
+  expect(decision.launches.map((l) => l.key).sort()).toEqual([
+    "work::fn-1-a.1",
+    "work::fn-2-b.1",
+  ]);
+});
+
+test("fn-725 cap: the budget is shared across task + close-row push sites (a closer can't blow the cap)", () => {
+  // cap=1, one job-running occupant (budget=0). A second epic is fully
+  // complete → its close row is ready (a would-be `close` launch). The
+  // close-row push is gated by the SAME exhausted budget, so nothing
+  // dispatches — the closer can't sneak past the cap.
+  const occ = occupantEpic("fn-1-a", "/repo-a");
+  const completedTask = makeTask({
+    task_id: "fn-2-b.1",
+    epic_id: "fn-2-b",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const closeEpic = makeEpic({
+    epic_id: "fn-2-b",
+    epic_number: 2,
+    project_dir: "/repo-b",
+    sort_path: "fn-2-b",
+    tasks: [completedTask],
+  });
+  const snap = makeSnapshot({ epics: [occ, closeEpic] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
+  expect(decision.launches.find((p) => p.verb === "close")).toBeUndefined();
+  expect(decision.launches).toEqual([]);
 });
 
 test("fn-721 parity: autopilot reconcile path and the board/CLI computeReadiness path agree", () => {

@@ -155,6 +155,13 @@ export interface KeeperConfig {
   // windows open — useful while troubleshooting a worker whose surface
   // would otherwise vanish the moment it goes idle/done.
   autocloseWindows?: boolean;
+  // Global ceiling on how many root-occupants autopilot dispatches at
+  // once across ALL epics/roots — a configurable N replacing the hard
+  // single-per-root mutex. `null` (default) is unlimited. Only a POSITIVE
+  // INTEGER overrides; 0/negative/non-integer/absent all resolve to
+  // `null` (unlimited). Enforced as a reconcile-level budget, not a
+  // readiness verdict, so the board renders unchanged.
+  maxConcurrentJobs?: number | null;
 }
 
 /**
@@ -163,6 +170,15 @@ export interface KeeperConfig {
  * resolver and tests share one literal.
  */
 export const DEFAULT_AUTOCLOSE_WINDOWS = true;
+
+/**
+ * Default for `max_concurrent_jobs`: `null` = unlimited (no global cap).
+ * `null` (not `Infinity`) at rest — `Infinity` serializes to `null` via
+ * JSON and fails SQLite, so the unlimited sentinel stays `null` end-to-end
+ * and is converted to a fast-path bypass only at the budget gate. Exported
+ * so the resolver and tests share one literal.
+ */
+export const DEFAULT_MAX_CONCURRENT_JOBS: number | null = null;
 
 /**
  * Resolve the keeper config path. `KEEPER_CONFIG` env var wins (hermetic tests
@@ -200,6 +216,7 @@ export function resolveConfig(): KeeperConfig {
   let agentuseRoot: string = DEFAULT_AGENTUSE_ROOT;
   let zellijSession: string = DEFAULT_ZELLIJ_SESSION;
   let autocloseWindows: boolean = DEFAULT_AUTOCLOSE_WINDOWS;
+  let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   try {
     if (!existsSync(path)) {
       return {
@@ -208,6 +225,7 @@ export function resolveConfig(): KeeperConfig {
         agentuseRoot,
         zellijSession,
         autocloseWindows,
+        maxConcurrentJobs,
       };
     }
     const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
@@ -239,6 +257,14 @@ export function resolveConfig(): KeeperConfig {
       if (typeof acw === "boolean") {
         autocloseWindows = acw;
       }
+      // Only a POSITIVE INTEGER overrides the unlimited default; any other
+      // shape (0, negative, fractional, string, null, missing) leaves
+      // `max_concurrent_jobs` at `null` (unlimited).
+      const mcj = (raw as { max_concurrent_jobs?: unknown })
+        .max_concurrent_jobs;
+      if (typeof mcj === "number" && Number.isInteger(mcj) && mcj > 0) {
+        maxConcurrentJobs = mcj;
+      }
     }
   } catch (err) {
     console.error(
@@ -251,6 +277,7 @@ export function resolveConfig(): KeeperConfig {
       agentuseRoot: DEFAULT_AGENTUSE_ROOT,
       zellijSession: DEFAULT_ZELLIJ_SESSION,
       autocloseWindows: DEFAULT_AUTOCLOSE_WINDOWS,
+      maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
     };
   }
   return {
@@ -259,6 +286,7 @@ export function resolveConfig(): KeeperConfig {
     agentuseRoot,
     zellijSession,
     autocloseWindows,
+    maxConcurrentJobs,
   };
 }
 

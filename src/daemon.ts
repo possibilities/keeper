@@ -2246,6 +2246,7 @@ function runDaemon(): void {
         dbPath,
         paused: autopilotPaused,
         zellijSession: apConfig.zellijSession,
+        maxConcurrentJobs: apConfig.maxConcurrentJobs,
       } satisfies AutopilotWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );

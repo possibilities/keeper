@@ -24,6 +24,7 @@ import {
   type BlockReason,
   computeReadiness,
   formatPill,
+  isRootOccupant,
   type PendingDispatch,
   type RunningReason,
   type Verdict,
@@ -218,6 +219,48 @@ function runWithNow(
 ) {
   return computeReadiness(epics, jobs, subs, new Map(), now);
 }
+
+// ---------------------------------------------------------------------------
+// isRootOccupant — direct unit calls (fn-725 exported the predicate)
+// ---------------------------------------------------------------------------
+//
+// Previously these contracts were only asserted indirectly via the per-root
+// mutex integration tests' prose. Now that `isRootOccupant` is exported (so
+// the fn-725 reconcile budget can count root-occupants with the SAME
+// predicate the mutex uses), pin its per-verdict contract directly.
+
+test("isRootOccupant: planner-running is EXEMPT (a planner does not claim the root)", () => {
+  expect(isRootOccupant(running({ kind: "planner-running" }))).toBe(false);
+});
+
+test("isRootOccupant: real running workers occupy the root", () => {
+  expect(isRootOccupant(running({ kind: "job-running" }))).toBe(true);
+  expect(isRootOccupant(running({ kind: "sub-agent-running" }))).toBe(true);
+  expect(isRootOccupant(running({ kind: "sub-agent-stale" }))).toBe(true);
+  expect(isRootOccupant(running({ kind: "monitor-running" }))).toBe(true);
+  expect(isRootOccupant(running({ kind: "monitor-stale" }))).toBe(true);
+});
+
+test("isRootOccupant: the job-pending + approval-pending window occupies (fn-703)", () => {
+  expect(isRootOccupant(blocked({ kind: "job-pending" }))).toBe(true);
+  expect(isRootOccupant(blocked({ kind: "git-uncommitted" }))).toBe(true);
+  expect(isRootOccupant(blocked({ kind: "git-orphans" }))).toBe(true);
+});
+
+test("isRootOccupant: a launch-window dispatch-pending row occupies (fn-721)", () => {
+  expect(isRootOccupant(blocked({ kind: "dispatch-pending" }))).toBe(true);
+});
+
+test("isRootOccupant: non-occupying verdicts do NOT claim the root", () => {
+  // Ready / completed / dependency-style blocks represent no live worker.
+  expect(isRootOccupant({ tag: "ready" })).toBe(false);
+  expect(isRootOccupant({ tag: "completed" })).toBe(false);
+  expect(isRootOccupant(blocked({ kind: "dep-on-task", upstream: "x" }))).toBe(
+    false,
+  );
+  expect(isRootOccupant(blocked({ kind: "job-rejected" }))).toBe(false);
+  expect(isRootOccupant(blocked({ kind: "single-task-per-root" }))).toBe(false);
+});
 
 // ---------------------------------------------------------------------------
 // Predicate-ordering matrix

@@ -1437,7 +1437,7 @@ function isLiveWorkOccupant(verdict: Verdict): boolean {
  * still fires at the per-task verdict layer, so the planner's own tasks
  * never read `ready` until the planner finishes).
  */
-function isRootOccupant(verdict: Verdict): boolean {
+export function isRootOccupant(verdict: Verdict): boolean {
   if (verdict.tag === "running" && verdict.reason.kind === "planner-running") {
     return false;
   }
