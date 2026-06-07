@@ -91,7 +91,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
   };
 }
 
-
 function makeJob(overrides: Partial<Job>): Job {
   return {
     job_id: "j-1",

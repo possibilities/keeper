@@ -25,6 +25,8 @@ import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  applyHeldGate,
+  COOLDOWN_SECS,
   countDeadLetters,
   detectApprovalReview,
   detectAutopilotStall,
@@ -36,10 +38,24 @@ import {
   detectReducerWedge,
   detectStuckJobs,
   type EventRow,
+  emptySeenState,
+  type Finding,
   fingerprint,
+  foldSeenState,
+  HELD_TICKS_THRESHOLD,
+  loadSeenState,
+  MAX_SPAWN_RETRIES,
+  resolveSeenStatePath,
   type ScanDeps,
+  type SeenState,
+  type SpawnAgentFn,
+  type SpawnResult,
+  saveSeenState,
   scan,
+  selectToNotify,
   sortFindings,
+  type TickDeps,
+  tick,
 } from "../cli/keeper-watch";
 import { openDb } from "../src/db";
 
@@ -49,6 +65,7 @@ import { openDb } from "../src/db";
 
 let tmpDir: string;
 let dbPath: string;
+let seenStateDir: string;
 let savedEnv: Record<string, string | undefined>;
 
 const FIVE_PATHS = [
@@ -59,20 +76,27 @@ const FIVE_PATHS = [
   "KEEPER_BACKSTOP_LOG",
 ] as const;
 
+// The seen-state dir is the watcher's OWN dir (NOT a KEEPER_* path); its
+// override is sandboxed alongside the five so no test touches the real
+// ~/.local/state/keeper-watch.
+const SANDBOXED_ENV = [...FIVE_PATHS, "KEEPER_WATCH_STATE_DIR"] as const;
+
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-watch-"));
   dbPath = join(tmpDir, "keeper.db");
+  seenStateDir = join(tmpDir, "watch-state");
   savedEnv = {};
-  for (const k of FIVE_PATHS) savedEnv[k] = process.env[k];
+  for (const k of SANDBOXED_ENV) savedEnv[k] = process.env[k];
   process.env.KEEPER_DB = dbPath;
   process.env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
   process.env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   process.env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   process.env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
+  process.env.KEEPER_WATCH_STATE_DIR = seenStateDir;
 });
 
 afterEach(() => {
-  for (const k of FIVE_PATHS) {
+  for (const k of SANDBOXED_ENV) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
   }
@@ -618,5 +642,527 @@ describe("countDeadLetters", () => {
     writeFileSync(join(dir, "1.ndjson"), "x");
     writeFileSync(join(dir, "2.ndjson"), "y");
     expect(countDeadLetters(dir).count).toBe(2);
+  });
+});
+
+// ===========================================================================
+// Task .2: seen-state + the `--tick` escalation flow.
+// ===========================================================================
+
+/** A minimal Finding builder for the .2 tick/seen-state tests. */
+function mkFinding(over: Partial<Finding> & { key: string }): Finding {
+  return {
+    fingerprint: fingerprint("dispatch-failure", over.key),
+    severity: "warning",
+    category: "dispatch-failure",
+    title: "t",
+    detail: "d",
+    evidence: {},
+    ...over,
+  };
+}
+
+describe("resolveSeenStatePath", () => {
+  test("honors KEEPER_WATCH_STATE_DIR and is its OWN dir (not under KEEPER_DB)", () => {
+    const p = resolveSeenStatePath();
+    expect(p).toBe(join(seenStateDir, "seen.json"));
+    // NOT under the keeper DB's dir — the monitor's bookkeeping is segregated.
+    expect(p.startsWith(join(tmpDir, "keeper"))).toBe(false);
+  });
+});
+
+describe("loadSeenState / saveSeenState", () => {
+  test("missing file loads as an empty baseline", () => {
+    const path = join(seenStateDir, "seen.json");
+    expect(loadSeenState(path)).toEqual(emptySeenState());
+  });
+
+  test("corrupt JSON falls back to empty (never throws)", () => {
+    const path = join(seenStateDir, "seen.json");
+    require("node:fs").mkdirSync(seenStateDir, { recursive: true });
+    writeFileSync(path, "{not json at all");
+    expect(loadSeenState(path)).toEqual(emptySeenState());
+  });
+
+  test("wrong version falls back to empty", () => {
+    const path = join(seenStateDir, "seen.json");
+    require("node:fs").mkdirSync(seenStateDir, { recursive: true });
+    writeFileSync(path, JSON.stringify({ version: 999, fingerprints: {} }));
+    expect(loadSeenState(path)).toEqual(emptySeenState());
+  });
+
+  test("round-trips a valid state and creates the parent dir", () => {
+    const path = join(seenStateDir, "seen.json");
+    const state: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        fpA: {
+          first_seen: 100,
+          last_seen: 200,
+          notification_count: 1,
+          last_notified_at: 200,
+          held_ticks: 0,
+          spawn_failures: 0,
+          count: null,
+        },
+      },
+    };
+    saveSeenState(path, state);
+    expect(loadSeenState(path)).toEqual(state);
+  });
+
+  test("atomic write: a leftover .tmp does not corrupt the target", () => {
+    const path = join(seenStateDir, "seen.json");
+    const state = emptySeenState();
+    state.fingerprints.fpA = {
+      first_seen: 1,
+      last_seen: 1,
+      notification_count: 0,
+      last_notified_at: null,
+      held_ticks: 0,
+      spawn_failures: 0,
+      count: null,
+    };
+    saveSeenState(path, state);
+    // Simulate a crash MID a subsequent write: a stray .tmp sibling is left,
+    // but the committed target is intact (rename is the atomic commit point).
+    writeFileSync(`${path}.tmp.99999.deadbeef`, "garbage partial");
+    expect(loadSeenState(path)).toEqual(state);
+  });
+});
+
+describe("applyHeldGate", () => {
+  test("reducer-wedge / autopilot-stall require HELD_TICKS_THRESHOLD ticks", () => {
+    const wedge = mkFinding({
+      key: "reducer-wedge",
+      category: "reducer-wedge",
+      fingerprint: fingerprint("reducer-wedge", "reducer"),
+    });
+    // First sighting → suppressed (held=1 < threshold), accrues a tick.
+    const r1 = applyHeldGate([wedge], emptySeenState());
+    expect(r1.gated).toHaveLength(0);
+    expect(r1.heldTicks.get(wedge.fingerprint)).toBe(1);
+
+    // Prior state with held just below threshold → this tick clears it.
+    const prior: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        [wedge.fingerprint]: {
+          first_seen: 0,
+          last_seen: 0,
+          notification_count: 0,
+          last_notified_at: null,
+          held_ticks: HELD_TICKS_THRESHOLD - 1,
+          spawn_failures: 0,
+          count: null,
+        },
+      },
+    };
+    const r2 = applyHeldGate([wedge], prior);
+    expect(r2.gated).toHaveLength(1);
+    expect(r2.heldTicks.get(wedge.fingerprint)).toBe(HELD_TICKS_THRESHOLD);
+  });
+
+  test("dead-letter-growth fires only on a POSITIVE delta vs baseline", () => {
+    const dl = (count: number): Finding =>
+      mkFinding({
+        key: "dead-letter-growth",
+        category: "dead-letter-growth",
+        fingerprint: fingerprint("dead-letter-growth", "dead-letters"),
+        evidence: { count },
+      });
+    // Cold (no baseline) → seed, don't escalate.
+    expect(applyHeldGate([dl(3)], emptySeenState()).gated).toHaveLength(0);
+
+    const baseline2: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        [dl(0).fingerprint]: {
+          first_seen: 0,
+          last_seen: 0,
+          notification_count: 0,
+          last_notified_at: null,
+          held_ticks: 0,
+          spawn_failures: 0,
+          count: 2,
+        },
+      },
+    };
+    // Same count as baseline → no delta → suppressed.
+    expect(applyHeldGate([dl(2)], baseline2).gated).toHaveLength(0);
+    // Higher count → positive delta → escalates.
+    expect(applyHeldGate([dl(5)], baseline2).gated).toHaveLength(1);
+  });
+
+  test("non-held categories pass through unchanged", () => {
+    const f = mkFinding({ key: "dispatch-failure:x" });
+    expect(applyHeldGate([f], emptySeenState()).gated).toHaveLength(1);
+  });
+});
+
+describe("selectToNotify", () => {
+  const now = 1_000_000;
+  test("a genuinely new fingerprint is selected as 'new'", () => {
+    const f = mkFinding({ key: "x" });
+    const sel = selectToNotify([f], emptySeenState(), now);
+    expect(sel).toHaveLength(1);
+    expect(sel[0].reason).toBe("new");
+  });
+
+  test("cooldown suppresses a still-present finding within the window", () => {
+    const f = mkFinding({ key: "x" });
+    const prior: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        [f.fingerprint]: {
+          first_seen: now - 100,
+          last_seen: now - 100,
+          notification_count: 1,
+          last_notified_at: now - 60, // 60s ago, well within the 1h cooldown
+          held_ticks: 0,
+          spawn_failures: 0,
+          count: null,
+        },
+      },
+    };
+    expect(selectToNotify([f], prior, now)).toHaveLength(0);
+  });
+
+  test("re-notify once the cooldown has elapsed", () => {
+    const f = mkFinding({ key: "x" });
+    const prior: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        [f.fingerprint]: {
+          first_seen: now - COOLDOWN_SECS * 3,
+          last_seen: now,
+          notification_count: 1,
+          last_notified_at: now - COOLDOWN_SECS - 1, // just past cooldown
+          held_ticks: 0,
+          spawn_failures: 0,
+          count: null,
+        },
+      },
+    };
+    const sel = selectToNotify([f], prior, now);
+    expect(sel).toHaveLength(1);
+    expect(sel[0].reason).toBe("renotify");
+  });
+
+  test("retry cap halts selection after MAX_SPAWN_RETRIES failures", () => {
+    const f = mkFinding({ key: "x" });
+    const prior: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        [f.fingerprint]: {
+          first_seen: now - COOLDOWN_SECS * 3,
+          last_seen: now,
+          notification_count: 0,
+          last_notified_at: now - COOLDOWN_SECS - 1,
+          held_ticks: 0,
+          spawn_failures: MAX_SPAWN_RETRIES,
+          count: null,
+        },
+      },
+    };
+    expect(selectToNotify([f], prior, now)).toHaveLength(0);
+  });
+});
+
+describe("foldSeenState", () => {
+  const now = 2_000_000;
+  test("delivered fingerprints bump notification_count + reset spawn_failures", () => {
+    const f = mkFinding({ key: "x" });
+    const prior: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        [f.fingerprint]: {
+          first_seen: now - 500,
+          last_seen: now - 500,
+          notification_count: 2,
+          last_notified_at: now - 500,
+          held_ticks: 0,
+          spawn_failures: 3,
+          count: null,
+        },
+      },
+    };
+    const next = foldSeenState({
+      prior,
+      present: [f],
+      heldTicks: new Map(),
+      counts: new Map(),
+      delivered: new Set([f.fingerprint]),
+      spawnFailed: new Set(),
+      nowSecs: now,
+    });
+    const e = next.fingerprints[f.fingerprint];
+    expect(e.notification_count).toBe(3);
+    expect(e.last_notified_at).toBe(now);
+    expect(e.spawn_failures).toBe(0);
+    expect(e.last_seen).toBe(now);
+  });
+
+  test("spawnFailed fingerprints increment spawn_failures (retry-cap fuel)", () => {
+    const f = mkFinding({ key: "x" });
+    const next = foldSeenState({
+      prior: emptySeenState(),
+      present: [f],
+      heldTicks: new Map(),
+      counts: new Map(),
+      delivered: new Set(),
+      spawnFailed: new Set([f.fingerprint]),
+      nowSecs: now,
+    });
+    expect(next.fingerprints[f.fingerprint].spawn_failures).toBe(1);
+  });
+
+  test("TTL prune drops a not-present entry older than the TTL", () => {
+    const stale: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        old: {
+          first_seen: 0,
+          last_seen: now - 48 * 60 * 60, // 48h ago, > 24h TTL
+          notification_count: 0,
+          last_notified_at: null,
+          held_ticks: 0,
+          spawn_failures: 0,
+          count: null,
+        },
+      },
+    };
+    const next = foldSeenState({
+      prior: stale,
+      present: [], // not present this tick
+      heldTicks: new Map(),
+      counts: new Map(),
+      delivered: new Set(),
+      spawnFailed: new Set(),
+      nowSecs: now,
+    });
+    expect(next.fingerprints.old).toBeUndefined();
+  });
+
+  test("a not-present but fresh entry is carried forward", () => {
+    const fresh: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        recent: {
+          first_seen: now - 100,
+          last_seen: now - 100, // well within TTL
+          notification_count: 0,
+          last_notified_at: null,
+          held_ticks: 0,
+          spawn_failures: 0,
+          count: null,
+        },
+      },
+    };
+    const next = foldSeenState({
+      prior: fresh,
+      present: [],
+      heldTicks: new Map(),
+      counts: new Map(),
+      delivered: new Set(),
+      spawnFailed: new Set(),
+      nowSecs: now,
+    });
+    expect(next.fingerprints.recent).toBeDefined();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// tick — the full launchd flow, with a STUBBED spawn (no real claude runs).
+// ---------------------------------------------------------------------------
+
+describe("tick", () => {
+  const seenPath = (): string => join(seenStateDir, "seen.json");
+
+  /** A tick-deps bundle: quiet probes + a capturing spawn stub. */
+  function tickDeps(
+    nowSecs: number,
+    spawnAgent: SpawnAgentFn,
+    over: Partial<ScanDeps> = {},
+  ): TickDeps {
+    return { ...quietDeps(nowSecs), ...over, spawnAgent };
+  }
+
+  /** Seed a dispatch_failures row so the scan yields one warning finding. */
+  function seedDispatchFailure(): void {
+    const writer = openDb(dbPath);
+    writer.db
+      .query(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+         VALUES ('work', 'fn-3-bar.1', 'dirty repo', '/x', 1, 1, 1, 1)`,
+      )
+      .run();
+    writer.db.close();
+  }
+
+  test("cold start baselines silently — no spawn, seen.json seeded", async () => {
+    seedDispatchFailure();
+    const now = Math.floor(Date.now() / 1000);
+    let spawnCalls = 0;
+    const spawn: SpawnAgentFn = async () => {
+      spawnCalls++;
+      return { exitCode: 0, ackedFingerprints: [] };
+    };
+    const res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    expect(res.baselined).toBe(true);
+    expect(res.spawned).toBe(false);
+    expect(spawnCalls).toBe(0);
+    // The finding was seeded into seen-state (the baseline), not escalated.
+    const state = loadSeenState(seenPath());
+    expect(Object.keys(state.fingerprints).length).toBeGreaterThan(0);
+  });
+
+  test("second tick with the SAME findings is silent (exit 0, no spawn)", async () => {
+    seedDispatchFailure();
+    const now = Math.floor(Date.now() / 1000);
+    let spawnCalls = 0;
+    const spawn: SpawnAgentFn = async () => {
+      spawnCalls++;
+      return { exitCode: 0, ackedFingerprints: [] };
+    };
+    // Tick 1 baselines.
+    await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    // Tick 2: nothing new → silent.
+    const res = await tick(dbPath, 3600, tickDeps(now + 1, spawn), seenPath());
+    expect(res.baselined).toBe(false);
+    expect(res.spawned).toBe(false);
+    expect(spawnCalls).toBe(0);
+  });
+
+  test("a genuinely-new finding after a baseline spawns the agent", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    let captured: { findingsFile: string; ackFile: string } | null = null;
+    const spawn: SpawnAgentFn = async (input) => {
+      captured = { findingsFile: input.findingsFile, ackFile: input.ackFile };
+      return { exitCode: 0, ackedFingerprints: null }; // no ack → commit all handed
+    };
+    // Tick 1: empty DB → baseline with no findings.
+    openDb(dbPath).db.close();
+    await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    // Now a NEW finding appears.
+    seedDispatchFailure();
+    const res = await tick(dbPath, 3600, tickDeps(now + 1, spawn), seenPath());
+    expect(res.spawned).toBe(true);
+    expect(res.selectedCount).toBe(1);
+    expect(res.deliveredCount).toBe(1);
+    expect(captured).not.toBeNull();
+    // The seen-state recorded the delivery (notification_count bumped).
+    const state = loadSeenState(seenPath());
+    const delivered = Object.values(state.fingerprints).find(
+      (e) => e.notification_count > 0,
+    );
+    expect(delivered).toBeDefined();
+  });
+
+  test("agent exit 0 + ack commits ONLY the acked fingerprints", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    openDb(dbPath).db.close();
+    let handedFingerprint = "";
+    // Baseline empty, then a new finding; the spawn acks exactly that fp.
+    const spawn: SpawnAgentFn = async (input) => {
+      const snapshot = JSON.parse(
+        require("node:fs").readFileSync(input.findingsFile, "utf8"),
+      ) as { findings: Finding[] };
+      handedFingerprint = snapshot.findings[0].fingerprint;
+      return { exitCode: 0, ackedFingerprints: [handedFingerprint] };
+    };
+    await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    seedDispatchFailure();
+    const res = await tick(dbPath, 3600, tickDeps(now + 1, spawn), seenPath());
+    expect(res.deliveredCount).toBe(1);
+    const state = loadSeenState(seenPath());
+    expect(state.fingerprints[handedFingerprint].notification_count).toBe(1);
+  });
+
+  test("non-zero exit commits NOTHING delivered and counts a spawn failure", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    openDb(dbPath).db.close();
+    const spawn: SpawnAgentFn = async () => ({
+      exitCode: 1,
+      ackedFingerprints: null,
+    });
+    await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    seedDispatchFailure();
+    const res = await tick(dbPath, 3600, tickDeps(now + 1, spawn), seenPath());
+    expect(res.spawned).toBe(true);
+    expect(res.deliveredCount).toBe(0);
+    const state = loadSeenState(seenPath());
+    const failed = Object.values(state.fingerprints).find(
+      (e) => e.spawn_failures > 0,
+    );
+    expect(failed?.spawn_failures).toBe(1);
+    expect(failed?.notification_count).toBe(0);
+  });
+
+  test("timeout (exitCode null) commits nothing delivered", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    openDb(dbPath).db.close();
+    const spawn: SpawnAgentFn = async (): Promise<SpawnResult> => ({
+      exitCode: null, // hard-timeout kill path
+      ackedFingerprints: null,
+    });
+    await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    seedDispatchFailure();
+    const res = await tick(dbPath, 3600, tickDeps(now + 1, spawn), seenPath());
+    expect(res.deliveredCount).toBe(0);
+    const state = loadSeenState(seenPath());
+    expect(
+      Object.values(state.fingerprints).some((e) => e.spawn_failures > 0),
+    ).toBe(true);
+  });
+
+  test("retry cap: a permanently-failing fingerprint stops re-spawning", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    openDb(dbPath).db.close();
+    let spawnCalls = 0;
+    const spawn: SpawnAgentFn = async () => {
+      spawnCalls++;
+      return { exitCode: 1, ackedFingerprints: null };
+    };
+    // Baseline empty.
+    await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    seedDispatchFailure();
+    // Drive ticks until the per-fingerprint cap is hit. The first spawn is the
+    // 'new' selection; subsequent ones are cooldown-elapsed re-notifies, so
+    // advance the clock past the cooldown each iteration.
+    let t = now + 1;
+    for (let i = 0; i < MAX_SPAWN_RETRIES + 3; i++) {
+      await tick(dbPath, 3600, tickDeps(t, spawn), seenPath());
+      t += COOLDOWN_SECS + 1;
+    }
+    // Capped at MAX_SPAWN_RETRIES spawns (no infinite re-attempt).
+    expect(spawnCalls).toBe(MAX_SPAWN_RETRIES);
+  });
+
+  test("corrupt seen.json re-baselines silently (no spawn)", async () => {
+    seedDispatchFailure();
+    const now = Math.floor(Date.now() / 1000);
+    require("node:fs").mkdirSync(seenStateDir, { recursive: true });
+    writeFileSync(seenPath(), "{corrupt");
+    let spawnCalls = 0;
+    const spawn: SpawnAgentFn = async () => {
+      spawnCalls++;
+      return { exitCode: 0, ackedFingerprints: [] };
+    };
+    const res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    expect(res.baselined).toBe(true);
+    expect(spawnCalls).toBe(0);
+    // The re-baseline overwrote the corrupt file with a valid one.
+    expect(loadSeenState(seenPath()).version).toBe(1);
   });
 });

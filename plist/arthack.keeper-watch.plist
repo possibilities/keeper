@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent for the keeper babysitter scanner (keeper-watch --tick).
+
+  This is a TEMPLATE, not an installed agent: keeper ships no `install` verb.
+  See README.md "Install" for the manual symlink + `launchctl bootstrap` steps.
+
+  An always-on, escalate-only safety monitor: every 5 minutes it scans
+  keeper.db READ-ONLY, diffs the findings against its own persistent
+  seen-state (~/.local/state/keeper-watch/seen.json — its OWN dir, NOT the
+  keeper state dir), and ONLY on a genuinely-new finding spawns a headless
+  PLAIN-claude babysitter agent. It never writes keeper.db.
+
+  Why StartInterval (not StartCalendarInterval, never with KeepAlive):
+    - StartInterval resets from process EXIT, so ticks never overlap for free.
+    - NEVER mix StartInterval + KeepAlive — KeepAlive restarts immediately and
+      defeats the interval entirely (launchd.info).
+    - The flip side: a HUNG tick blocks all future ticks. The hard agent
+      timeout in keeper-watch (AGENT_TIMEOUT_MS = 240s < the 300s interval)
+      is therefore LOAD-BEARING — it kills a stuck `claude -p` so the next
+      tick always fires.
+
+  PATH is set explicitly (launchd does not source your shell rc) and INCLUDES
+  ~/.local/bin so the spawned agent's notifyctl / botctl resolve, and so the
+  PLAIN claude binary (/Users/mike/.local/bin/claude — NOT the
+  arthack-claude.py wrapper) is reachable. No `~` is allowed in a plist; all
+  paths are hard-coded absolute. Edit these for your own username / arch
+  before bootstrapping.
+
+  Install:
+    cp plist/arthack.keeper-watch.plist ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$UID ~/Library/LaunchAgents/arthack.keeper-watch.plist
+
+  Uninstall:
+    launchctl bootout gui/$UID/arthack.keeper-watch
+    rm ~/Library/LaunchAgents/arthack.keeper-watch.plist
+
+  Failures are observable via:
+    launchctl print gui/$UID/arthack.keeper-watch
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>arthack.keeper-watch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/bun</string>
+		<string>run</string>
+		<string>/Users/mike/code/keeper/cli/keeper-watch.ts</string>
+		<string>--tick</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/mike/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<false/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/mike/code/keeper</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mike/.local/state/keeper-watch/launchd.stdout</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/mike/.local/state/keeper-watch/launchd.stderr</string>
+</dict>
+</plist>
