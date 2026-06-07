@@ -85,5 +85,5 @@ If touching any TS, run `bun run lint && bun run typecheck && bun run test:fast`
 - [ ] README (install/uninstall/architecture) + CLAUDE.md mention the `followups/` artifact
 
 ## Done summary
-
+Babysitter agent now writes a self-contained, injection-safe investigation prompt per PAGED finding under followups/ (Bash-written, no new tools), maintains a stable atomic latest.md mirroring the lead finding, and both notify surfaces (notifyctl + botctl) name that path instead of 'want to dig in?'. README install/uninstall/architecture + CLAUDE.md mention the followups/ artifact.
 ## Evidence

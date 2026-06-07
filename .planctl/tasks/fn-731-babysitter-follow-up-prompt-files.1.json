@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "agent writes follow-up prompt files",
-  "updated_at": "2026-06-07T21:13:40.052879Z"
+  "updated_at": "2026-06-07T21:22:05.968123Z",
+  "worker_done_at": "2026-06-07T21:22:05.968123Z"
 }
