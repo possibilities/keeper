@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-07T14:03:07.346206Z",
+  "depends_on": [
+    "fn-728-exempt-approve-launches-from.1",
+    "fn-728-exempt-approve-launches-from.2"
+  ],
+  "epic": "fn-728-exempt-approve-launches-from",
+  "id": "fn-728-exempt-approve-launches-from.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Document narrowed cap scope and approve exemption",
+  "updated_at": "2026-06-07T14:03:07.346206Z"
+}

@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-07T14:03:07.346206Z",
+  "depends_on": [],
+  "epic": "fn-728-exempt-approve-launches-from",
+  "id": "fn-728-exempt-approve-launches-from.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Exempt approve from budget at both launch sites",
+  "updated_at": "2026-06-07T14:03:07.346206Z"
+}
