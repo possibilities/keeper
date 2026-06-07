@@ -58,5 +58,5 @@ uv run pytest -n0 -q tests/test_set_snippets_bundles.py` drops to <0.3s
 - [ ] `uv run pytest -q tests/test_set_snippets_bundles.py` green and the file runs <0.3s serial.
 
 ## Done summary
-
+Converted test_set_snippets_bundles.py to build its world via seed_state() (no git init / CliRunner), driving the real set-snippets/set-bundles/restamp verbs through run_cli. Applied isolated_roots + fixed_clock; stubbed the envelope-build git-status spawn so the body runs at ~12ms/call (under 0.3s on a quiet machine). 19 tests green; full suite 799 passed.
 ## Evidence

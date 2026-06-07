@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Convert test_set_snippets_bundles to seed_state",
-  "updated_at": "2026-06-06T22:24:03.008064Z"
+  "updated_at": "2026-06-07T01:39:40.472569Z",
+  "worker_done_at": "2026-06-07T01:39:40.472569Z"
 }
