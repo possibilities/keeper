@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-730-enforce-exit-0-guarantee-on-missing",
   "bundles": [],
+  "closer_done_at": "2026-06-07T16:39:28.102230Z",
   "created_at": "2026-06-07T16:23:54.404038Z",
   "depends_on_epics": [
     "fn-729-keeper-babysitter-monitor"
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "enforce exit-0 guarantee on missing keeper.db",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T16:23:54.404038Z"
+  "updated_at": "2026-06-07T16:39:28.102230Z"
 }
