@@ -4,11 +4,10 @@
   "bundles": [],
   "created_at": "2026-06-07T14:03:07.346206Z",
   "depends_on_epics": [
-    "fn-727-revive-autopilot-window-autoclose",
     "fn-722-fast-two-tier-keeper-test-gate"
   ],
   "id": "fn-728-exempt-approve-launches-from",
-  "last_validated_at": "2026-06-07T14:03:38.472990Z",
+  "last_validated_at": "2026-06-07T14:10:00.009451Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -17,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T14:03:38.443159Z"
+  "updated_at": "2026-06-07T14:09:59.696428Z"
 }
