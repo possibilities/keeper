@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the keeper babysitter scanner (keeper-watch).
+
+  This is a TEMPLATE, not an installed agent: keeper ships no `install` verb.
+  See README.md "Install" for the manual symlink + `launchctl bootstrap` steps.
+
+  What it does: every 5 minutes, runs the read-only `keeper-watch --tick`
+  scanner over `keeper.db`, diffs findings against its own seen-state, and
+  escalates genuinely-new failure signatures via the headless babysitter agent.
+  It is a PURE EXTERNAL OBSERVER: opens the DB read-only, never writes it,
+  mints no synthetic events, performs no RPC. `keeper-watch` is its OWN binary,
+  NOT a `keeper` subcommand.
+
+  Paths are hard-coded absolute because launchd does NOT source your shell rc,
+  so `bun` cannot be found by name. The values below assume:
+    - bun installed via Homebrew on Apple Silicon: /opt/homebrew/bin/bun
+      (Intel Macs: /usr/local/bin/bun — edit ProgramArguments + PATH below)
+    - the repo checked out at /Users/mike/code/keeper
+    - keeper.db under /Users/mike/.local/state/keeper
+    - babysitter seen-state + logs under /Users/mike/.local/state/keeper-watch
+  Edit these for your own username / arch before bootstrapping.
+
+  PATH below MUST include /Users/mike/.local/bin: the escalation path shells out
+  to `notifyctl` + `botctl`, which live there and would otherwise be unfound
+  (launchd inherits no login PATH).
+
+  Periodic via StartInterval (300s), NOT KeepAlive — mixing the two defeats the
+  interval (KeepAlive would restart the one-shot scanner immediately). The
+  interval resets from process EXIT, so a hung tick would block all future
+  ticks; the scanner's hard agent-timeout is the load-bearing guard against
+  that. RunAtLoad fires one immediate pass at bootstrap; the scanner exits 0
+  cleanly if keeper.db is missing, so an early load is harmless.
+
+  Install:
+    ln -s "$PWD/plist/arthack.keeper-babysit.plist" ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeper-babysit.plist
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/arthack.keeper-babysit
+    rm ~/Library/LaunchAgents/arthack.keeper-babysit.plist
+
+  Failures are observable via:
+    launchctl print gui/$(id -u)/arthack.keeper-babysit
+    /Users/mike/.local/state/keeper-watch/watch.stderr
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>arthack.keeper-babysit</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/bun</string>
+		<string>run</string>
+		<string>/Users/mike/code/keeper/cli/keeper-watch.ts</string>
+		<string>--tick</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/mike/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>StartInterval</key>
+	<integer>300</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/mike/code/keeper</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mike/.local/state/keeper-watch/watch.stdout</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/mike/.local/state/keeper-watch/watch.stderr</string>
+</dict>
+</plist>

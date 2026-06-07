@@ -429,7 +429,28 @@ Keeper has no `install` verb. Wire it up manually:
    reconnect across your subscribe clients each Sunday at 04:00. Inspect with
    `launchctl print gui/$(id -u)/arthack.keeperd.logrotate`.
 
-8. **Verify** the agent is loaded and the projection is live:
+8. **Install the babysitter scanner** (optional) so keeper's recurring failure
+   classes — autopilot stalls, duplicate dispatches / approvals, reducer wedge,
+   dead-letter growth — page you automatically instead of being noticed after
+   the fact:
+
+   ```sh
+   ln -s "$PWD/plist/arthack.keeper-babysit.plist" ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeper-babysit.plist
+   ```
+
+   This is a user-LaunchAgent that runs `keeper-watch --tick` every 5 minutes
+   (`StartInterval`, no `KeepAlive`): an out-of-process **read-only** scanner
+   over `keeper.db` that diffs findings against its own seen-state and escalates
+   only genuinely-new signatures via a headless babysitter agent (`notifyctl` +
+   `botctl` — hence `~/.local/bin` on the plist's `PATH`). It never writes the
+   DB, mints no synthetic events, and performs no RPC. Edit the plist's username
+   / checkout path / arch first if they differ. Seen-state and logs live under
+   `~/.local/state/keeper-watch/`. Inspect with
+   `launchctl print gui/$(id -u)/arthack.keeper-babysit`, or force a tick with
+   `launchctl kickstart gui/$(id -u)/arthack.keeper-babysit`.
+
+9. **Verify** the agent is loaded and the projection is live:
 
    ```sh
    launchctl print gui/$(id -u)/arthack.keeperd | head
@@ -948,6 +969,12 @@ Reverse of install:
 ```sh
 launchctl bootout gui/$(id -u)/arthack.keeperd
 rm ~/Library/LaunchAgents/arthack.keeperd.plist
+# If installed: the rotation sidecar and the babysitter scanner.
+launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
+rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
+launchctl bootout gui/$(id -u)/arthack.keeper-babysit
+rm ~/Library/LaunchAgents/arthack.keeper-babysit.plist
+rm -rf ~/.local/state/keeper-watch   # babysitter seen-state + logs
 # Stop loading the plugin: remove `--plugin-dir ~/code/keeper` from
 # whatever entrypoint launches `claude` (e.g. the arthack launcher).
 # Optional — drops all captured state, including the events log:
@@ -1921,6 +1948,14 @@ The unified `keeper` CLI is a single dispatcher entrypoint (`cli/keeper.ts`,
 the package.json `bin`) that fans into every subcommand — `board`,
 `autopilot`, `git`, `usage`, `await`, `approve` — so all example clients
 ship as one binary instead of N standalone scripts.
+
+The babysitter (`cli/keeper-watch.ts`, its OWN binary — NOT a `keeper`
+subcommand) is an out-of-process read-only scanner: run every 5 minutes under
+launchd, it opens `keeper.db` read-only, deterministically detects the recurring
+failure classes (autopilot stalls, duplicate dispatches / approvals, reducer
+wedge, dead-letter growth, stuck jobs), and escalates only genuinely-new
+signatures to a headless agent — it never writes the DB, mints no synthetic
+events, and performs no RPC.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
