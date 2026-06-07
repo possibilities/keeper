@@ -72,5 +72,5 @@ preserved vs baseline.
 - [ ] If the fallback fired (whole file integration), it is noted for task .4.
 
 ## Done summary
-
+Marked all 58 git-driven scaffold-behavior tests `integration`; left the 2 verb-registration unit tests in the fast gate. No test honestly converted to seed_state (every behavior test asserts what scaffold itself produces/rejects/commits, requiring the real-git integrity gate) — re-tier only, zero coverage cut. Fast slice: 2 passed in 0.51s; integration slice: 58 passed; total 60 green.
 ## Evidence
