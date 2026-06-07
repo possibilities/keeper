@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-728-exempt-approve-launches-from",
   "bundles": [],
   "closer_done_at": "2026-06-07T14:34:38.067192Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T14:34:38.067192Z"
+  "updated_at": "2026-06-07T14:35:27.247064Z"
 }
