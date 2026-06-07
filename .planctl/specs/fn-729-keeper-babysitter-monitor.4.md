@@ -57,5 +57,5 @@ it loaded, then `launchctl kickstart` to force a tick.
 - [ ] `launchctl bootstrap` loads it and a forced tick runs cleanly against the live DB
 
 ## Done summary
-
+Added arthack.keeper-babysit.plist launchd template (StartInterval 300, no KeepAlive, absolute bun path, PATH incl ~/.local/bin, Background, no ~ in dict values) and documented install/uninstall/architecture in README plus a read-only-scanner note in CLAUDE.md.
 ## Evidence
