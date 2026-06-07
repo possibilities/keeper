@@ -9,6 +9,19 @@ Coverage:
 - Forward ref (task 1 deps on [2]) resolves via two-pass id allocation.
 - Failure shapes: bad_yaml (non-mapping), spec_invalid (malformed task spec),
   dep_invalid (out-of-range ordinal), dep_cycle. Each writes nothing.
+
+Test tiering (fn-4 proof slice): every test that drives the real ``scaffold``
+verb is marked ``integration`` — scaffold's mint-time integrity gate runs with
+``check_filesystem_repos=True`` (run_scaffold.py:899-910), so it needs a real
+``.git/`` and cannot run on a git-free ``seed_state`` tree. The only tests left
+in the fast gate are the two verb-registration unit tests
+(``test_scaffold_registered_in_verb_templates`` /
+``test_scaffold_not_in_validation_restamp_verbs``), which assert constants and
+touch neither git nor the scaffold write path. No behavior test converts to
+``seed_state``: each asserts what scaffold itself produces / rejects / commits,
+not scaffold-independent on-disk schema shape — so this is a re-tier, not a
+coverage cut. Run ``-m "not integration"`` for the fast slice, ``-m
+integration`` for the real-git slice.
 """
 
 from __future__ import annotations
@@ -109,6 +122,7 @@ def _indent(text: str, n: int) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_happy_path_emits_one_invocation(planctl_git_repo):
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
 
@@ -145,6 +159,7 @@ def test_scaffold_happy_path_emits_one_invocation(planctl_git_repo):
     )
 
 
+@pytest.mark.integration
 def test_scaffold_writes_verbatim_specs_not_skeletons(planctl_git_repo):
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
     r = _invoke(["scaffold", "--file", yaml_path])
@@ -158,6 +173,7 @@ def test_scaffold_writes_verbatim_specs_not_skeletons(planctl_git_repo):
     assert "- [ ] It works." in spec_1
 
 
+@pytest.mark.integration
 def test_scaffold_dep_resolves_to_fn_n_m(planctl_git_repo):
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
     r = _invoke(["scaffold", "--file", yaml_path])
@@ -170,6 +186,7 @@ def test_scaffold_dep_resolves_to_fn_n_m(planctl_git_repo):
     assert task_2["depends_on"] == [f"{epic_id}.1"]
 
 
+@pytest.mark.integration
 def test_scaffold_forward_ref_resolves(planctl_git_repo):
     """Task 1 declares deps=[2] (forward ref) — two-pass resolution must work."""
     yaml = f"""\
@@ -201,6 +218,7 @@ tasks:
     assert task_1["depends_on"] == [f"{epic_id}.2"]
 
 
+@pytest.mark.integration
 def test_scaffold_epic_carries_snippets_bundles(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -255,6 +273,7 @@ tasks:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_no_substrate_emits_advisory_warning(planctl_git_repo):
     """Epic + tasks with no snippets/bundles anywhere surfaces the advisory.
 
@@ -282,6 +301,7 @@ def test_scaffold_no_substrate_emits_advisory_warning(planctl_git_repo):
     assert _count_planctl_invocation_lines(r.output) == 1
 
 
+@pytest.mark.integration
 def test_scaffold_with_epic_substrate_no_advisory(planctl_git_repo):
     """Epic-level snippets present -> no advisory (even if tasks are empty)."""
     yaml = f"""\
@@ -309,6 +329,7 @@ tasks:
     )
 
 
+@pytest.mark.integration
 def test_scaffold_with_task_substrate_no_advisory(planctl_git_repo):
     """Any task carrying snippets/bundles -> no advisory (even if epic is empty)."""
     yaml = f"""\
@@ -363,6 +384,7 @@ def _write_sketch(repo, name: str, snippet_ids: list[str]) -> None:
     )
 
 
+@pytest.mark.integration
 def test_scaffold_inlines_sketch_refs_into_snippets(planctl_git_repo):
     """Same-project sketch inlining: ids fold into snippets, sketch ref dropped."""
     _write_sketch(planctl_git_repo, "draft-epic", ["epic-snip-1", "epic-snip-2"])
@@ -406,6 +428,7 @@ tasks:
     assert all(not b.startswith("sketch/") for b in task_def["bundles"])
 
 
+@pytest.mark.integration
 def test_scaffold_missing_sketch_emits_ref_invalid(planctl_git_repo):
     """Unresolvable sketch -> ref_invalid envelope, no writes land."""
     yaml = f"""\
@@ -432,6 +455,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_empty_sketch_drops_ref_keeps_snippets(planctl_git_repo):
     """Empty sketch (snippet_ids: []) drops ref, adds zero ids."""
     _write_sketch(planctl_git_repo, "empty-draft", [])
@@ -495,6 +519,7 @@ tasks:
     return _parse_envelope(r.output)["epic_id"]
 
 
+@pytest.mark.integration
 def test_scaffold_epic_dep_happy_path_preserves_order(planctl_git_repo):
     first = _seed_epic(planctl_git_repo, title="seed epic first")
     second = _seed_epic(planctl_git_repo, title="seed epic second")
@@ -524,6 +549,7 @@ tasks:
     assert epic_def["depends_on_epics"] == [second, first]
 
 
+@pytest.mark.integration
 def test_scaffold_no_epic_deps_yields_empty_list(planctl_git_repo):
     """Absent field coerces to []."""
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
@@ -536,6 +562,7 @@ def test_scaffold_no_epic_deps_yields_empty_list(planctl_git_repo):
     assert epic_def["depends_on_epics"] == []
 
 
+@pytest.mark.integration
 def test_scaffold_epic_dep_non_list_is_typed(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -558,6 +585,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_epic_dep_list_of_non_strings_is_typed(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -580,6 +608,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_epic_dep_malformed_id_is_typed(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -602,6 +631,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_epic_dep_nonexistent_is_typed(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -627,6 +657,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_epic_dep_duplicate_is_typed(planctl_git_repo):
     first = _seed_epic(planctl_git_repo)
     yaml = f"""\
@@ -666,6 +697,7 @@ def _no_epics_or_tasks_landed(repo) -> bool:
     return True
 
 
+@pytest.mark.integration
 def test_scaffold_bad_yaml_non_mapping_doc(planctl_git_repo):
     yaml_path = _write_yaml(planctl_git_repo, "just a string\n")
     r = _invoke(["scaffold", "--file", yaml_path])
@@ -677,6 +709,7 @@ def test_scaffold_bad_yaml_non_mapping_doc(planctl_git_repo):
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_empty_tasks_list_is_bad_yaml(planctl_git_repo):
     """An empty `tasks: []` list trips the n_tasks == 0 invariant
     (run_scaffold.py: "tasks: must contain at least one entry")."""
@@ -701,6 +734,7 @@ tasks: []
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_spec_invalid_lists_offending_task(planctl_git_repo):
     bad_spec = (
         "## Description\n\n## Acceptance\n\n## Done summary\n"  # missing Evidence
@@ -733,6 +767,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_dep_out_of_range_is_typed(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -756,6 +791,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_dep_self_ref_is_typed(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -776,6 +812,7 @@ tasks:
     assert env["error"]["code"] == "dep_invalid"
 
 
+@pytest.mark.integration
 def test_scaffold_dep_cycle_is_typed(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -804,6 +841,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_ref_invalid_rejects_bad_snippet_id(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -827,6 +865,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_ref_invalid_rejects_bad_bundle_ref(planctl_git_repo):
     yaml = f"""\
 epic:
@@ -884,6 +923,7 @@ def test_scaffold_not_in_validation_restamp_verbs():
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_default_target_repo_unchanged(planctl_git_repo):
     """Default-omit on every task: each task's target_repo == primary_repo and
     touched_repos == [primary_repo] (single-element, unchanged from pre-fn-585).
@@ -916,6 +956,7 @@ def test_scaffold_default_target_repo_unchanged(planctl_git_repo):
         assert td["target_repo"] == primary
 
 
+@pytest.mark.integration
 def test_scaffold_per_task_target_repo(planctl_git_repo, multi_repo_project):
     """Two distinct absolute target_repos: persisted per-task, rolled up sorted-uniq."""
     primary_other, touched_other = multi_repo_project
@@ -970,6 +1011,7 @@ tasks:
     assert t2["target_repo"] == touched_resolved
 
 
+@pytest.mark.integration
 def test_scaffold_mixed_target_repo_dedup(planctl_git_repo, multi_repo_project):
     """Two tasks declare the same target_repo, third omits — sorted-uniq rollup."""
     foreign_a, foreign_b = multi_repo_project
@@ -1029,6 +1071,7 @@ tasks:
     assert t3["target_repo"] == primary
 
 
+@pytest.mark.integration
 def test_scaffold_target_repo_tilde_expansion(planctl_git_repo, monkeypatch):
     """~ expansion: persisted target_repo must be the canonicalised absolute path.
 
@@ -1070,6 +1113,7 @@ tasks:
     assert td["target_repo"].startswith("/")
 
 
+@pytest.mark.integration
 def test_scaffold_target_repo_relative_rejected(planctl_git_repo):
     """Relative paths (CWE-22-class footgun) rejected with repo_invalid; no writes."""
     yaml = f"""\
@@ -1098,6 +1142,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_target_repo_not_string_rejected(planctl_git_repo):
     """Non-string target_repo (int / list) is a shape failure → bad_yaml, no writes."""
     yaml = f"""\
@@ -1126,6 +1171,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_target_repo_empty_string_rejected(planctl_git_repo):
     """Empty-after-strip target_repo → repo_invalid, no writes."""
     yaml = f"""\
@@ -1162,6 +1208,7 @@ tasks:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_fresh_epic_carries_validated_marker(planctl_git_repo):
     """Acceptance (a): valid scaffold writes ``last_validated_at = now_iso()``
     on the epic JSON, with microsecond precision (``.%fZ`` suffix)."""
@@ -1183,6 +1230,7 @@ def test_scaffold_fresh_epic_carries_validated_marker(planctl_git_repo):
     )
 
 
+@pytest.mark.integration
 def test_scaffold_fresh_epic_emit_covers_one_commit(planctl_git_repo):
     """Acceptance (a) part 2: the scaffold's planctl_invocation payload covers
     epic JSON + epic spec + every task JSON + every task spec, so the per-verb
@@ -1207,6 +1255,7 @@ def test_scaffold_fresh_epic_emit_covers_one_commit(planctl_git_repo):
     )
 
 
+@pytest.mark.integration
 def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypatch):
     """Acceptance (b): a structural integrity failure on the in-memory tree
     aborts the scaffold cleanly — no JSON files written, no commit landed,
@@ -1284,6 +1333,7 @@ def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypat
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatch):
     """A missing CLAUDE_CODE_SESSION_ID fails closed BEFORE any write (fn-630 a).
 
@@ -1331,6 +1381,7 @@ def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatc
     )
 
 
+@pytest.mark.integration
 def test_scaffold_invocation_raise_persists_written_tree(planctl_git_repo, monkeypatch):
     """fn-640: a raise in build_planctl_invocation (after the tree is on disk,
     pre-commit) leaves every written file ON DISK — the seam unwind is gone.
@@ -1372,6 +1423,7 @@ def test_scaffold_invocation_raise_persists_written_tree(planctl_git_repo, monke
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_reads_yaml_from_stdin(planctl_git_repo):
     """`--file -` reads YAML from stdin; envelope is identical to file mode."""
     yaml = _two_task_yaml()
@@ -1388,6 +1440,7 @@ def test_scaffold_reads_yaml_from_stdin(planctl_git_repo):
     assert _count_planctl_invocation_lines(r.output) == 1
 
 
+@pytest.mark.integration
 def test_scaffold_stdin_byte_cap_enforced(planctl_git_repo):
     """The 1 MiB cap fires on stdin via sys.stdin.buffer.read() pre-decode."""
     # Build a YAML body that comfortably exceeds 1 MiB after the comment fluff.
@@ -1413,6 +1466,7 @@ def test_scaffold_stdin_byte_cap_enforced(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_per_task_tier_persists(planctl_git_repo):
     """Happy path: tier on each task → persisted verbatim on task_def."""
     yaml = f"""\
@@ -1448,6 +1502,7 @@ tasks:
     assert t2["tier"] == "xhigh"
 
 
+@pytest.mark.integration
 def test_scaffold_missing_tier_field_rejected(planctl_git_repo):
     """fn-594: omitted `tier:` on a task entry → tier_invalid, no writes land.
 
@@ -1482,6 +1537,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_tier_invalid_value_rejected(planctl_git_repo):
     """Unknown tier value (not in TASK_TIERS) → tier_invalid, no writes land."""
     yaml = f"""\
@@ -1508,6 +1564,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_tier_low_rejected_with_allowlist_in_message(planctl_git_repo):
     """`low` is a tempting-but-wrong tier name; reject with allowlist in detail."""
     yaml = f"""\
@@ -1536,6 +1593,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_tier_non_string_is_bad_yaml(planctl_git_repo):
     """Non-string tier (int / list) is a shape failure → bad_yaml, no writes."""
     yaml = f"""\
@@ -1564,6 +1622,7 @@ tasks:
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_tier_all_valid_values_accepted(planctl_git_repo):
     """Every TASK_TIERS member is accepted — proves the allowlist matches the constant."""
     from planctl.models import TASK_TIERS
@@ -1599,6 +1658,7 @@ tasks:
         assert td["tier"] == tier
 
 
+@pytest.mark.integration
 def test_scaffold_tier_invalid_collects_all_offenders(planctl_git_repo):
     """Collect-all: two invalid tiers in one YAML → both appear in details."""
     yaml = f"""\
@@ -1659,6 +1719,7 @@ tasks:
 """
 
 
+@pytest.mark.integration
 def test_scaffold_queue_jump_true_rides_envelope(planctl_git_repo):
     """epic.queue_jump: true lands queue_jump=true on the emitted envelope."""
     yaml_path = _write_yaml(planctl_git_repo, _queue_jump_yaml("true"))
@@ -1679,6 +1740,7 @@ def test_scaffold_queue_jump_true_rides_envelope(planctl_git_repo):
     assert epic_def["queue_jump"] is True
 
 
+@pytest.mark.integration
 def test_scaffold_queue_jump_false_explicit_rides_envelope(planctl_git_repo):
     """epic.queue_jump: false (explicit) lands queue_jump=false on the envelope."""
     yaml_path = _write_yaml(planctl_git_repo, _queue_jump_yaml("false"))
@@ -1697,6 +1759,7 @@ def test_scaffold_queue_jump_false_explicit_rides_envelope(planctl_git_repo):
     assert epic_def["queue_jump"] is False
 
 
+@pytest.mark.integration
 def test_scaffold_queue_jump_omitted_defaults_false(planctl_git_repo):
     """Omitting epic.queue_jump entirely → envelope still carries queue_jump=false."""
     yaml_path = _write_yaml(planctl_git_repo, _queue_jump_yaml(None))
@@ -1725,6 +1788,7 @@ def test_scaffold_queue_jump_omitted_defaults_false(planctl_git_repo):
     assert legacy["queue_jump"] is False
 
 
+@pytest.mark.integration
 def test_scaffold_queue_jump_non_bool_is_bad_yaml(planctl_git_repo):
     """epic.queue_jump: "yes" (non-bool) is rejected with bad_yaml and writes nothing."""
     yaml_path = _write_yaml(planctl_git_repo, _queue_jump_yaml('"yes"'))
@@ -1753,6 +1817,7 @@ def test_scaffold_queue_jump_non_bool_is_bad_yaml(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.integration
 def test_scaffold_integrity_failure_leaves_scan_max_unchanged(
     planctl_git_repo, monkeypatch
 ):
@@ -1817,6 +1882,7 @@ def test_scaffold_integrity_failure_leaves_scan_max_unchanged(
     )
 
 
+@pytest.mark.integration
 def test_scaffold_integrity_failure_writes_no_spec_files_at_all(
     planctl_git_repo, monkeypatch
 ):
@@ -1840,6 +1906,7 @@ def test_scaffold_integrity_failure_writes_no_spec_files_at_all(
     assert _no_epics_or_tasks_landed(planctl_git_repo)
 
 
+@pytest.mark.integration
 def test_scaffold_dup_slug_rejected_with_duplicate_epic(planctl_git_repo):
     """Acceptance: same-slug scaffold returns ``duplicate_epic`` (existing
     id + status in details) unless ``--allow-duplicate`` is set.
@@ -1884,6 +1951,7 @@ tasks:
     )
 
 
+@pytest.mark.integration
 def test_scaffold_dup_slug_allow_duplicate_mints_distinct_fn_n(planctl_git_repo):
     """Acceptance: ``--allow-duplicate`` mints a distinct fn-N (same slug,
     different number).
@@ -1916,6 +1984,7 @@ tasks:
     assert first_id.endswith("-allow-duplicate"), first_id
 
 
+@pytest.mark.integration
 def test_scaffold_dup_slug_unrelated_slug_unaffected(planctl_git_repo):
     """A different-slug second scaffold proceeds normally (dup guard is
     slug-keyed, not title-keyed)."""
@@ -1927,6 +1996,7 @@ def test_scaffold_dup_slug_unrelated_slug_unaffected(planctl_git_repo):
     assert second_id.endswith("-second-slug-different")
 
 
+@pytest.mark.integration
 def test_scaffold_dup_slug_suffix_false_positive_regression(planctl_git_repo):
     """fn-624 regression: the dup-guard glob ``fn-*-{slug}.json`` false-matched
     any epic whose slug *ends* with ``-{slug}`` (e.g. existing ``foo-bar``
@@ -1990,6 +2060,7 @@ tasks:
     assert bar_id not in detail_blob, env2["error"]["details"]
 
 
+@pytest.mark.integration
 def test_scaffold_normal_path_still_succeeds_post_atomicity_fix(planctl_git_repo):
     """End-to-end smoke: a valid scaffold still succeeds + commits the whole
     tree (epic JSON + epic spec + every task JSON + every task spec) after the
