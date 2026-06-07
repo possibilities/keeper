@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "update confirmRunning docstring for fn-724",
-  "updated_at": "2026-06-07T00:38:32.747735Z"
+  "updated_at": "2026-06-07T00:41:59.267702Z",
+  "worker_done_at": "2026-06-07T00:41:59.267702Z"
 }

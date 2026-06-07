@@ -14,5 +14,5 @@ The inline comments at the ceiling site and the `ConfirmOutcome` type doc were c
 - [ ] The three-way outcome matches the `ConfirmOutcome` type doc already in the file
 
 ## Done summary
-
+Refreshed the confirmRunning header docstring in src/autopilot-worker.ts: step 2 now describes the durable emitDispatched/dispatched-ack gate before launch (abort-without-launch on ok:false/timeout), and step 4 describes the three-way ok/failed/indoubt ceiling outcome with suppressed DispatchFailed emit on launch-success, matching the ConfirmOutcome type doc.
 ## Evidence
