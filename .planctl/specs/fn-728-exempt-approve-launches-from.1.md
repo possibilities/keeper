@@ -66,5 +66,5 @@ repo convention):
 - [ ] New reconcile tests cover task-approve, close-row-approve, the budget=0 De Morgan case, and the work/close regression; `bun test test/autopilot-worker.test.ts` passes
 
 ## Done summary
-
+Exempt approve launches from the fn-725 budget cap at both reconcile push sites (task-loop + close-row), skipping the budget gate AND decrement via a shared verb-predicate; occupied summation left unchanged. Added 5 fn-728 reconcile tests covering task-approve, close-row-approve at budget=0 (De Morgan pin), the work/close regression, and same-root mutex-not-budget suppression.
 ## Evidence
