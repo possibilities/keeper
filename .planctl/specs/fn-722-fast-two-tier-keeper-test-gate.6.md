@@ -32,5 +32,5 @@ Make integration + daemon 100% stable. (1) Bump per-test timeouts to 30s on the 
 - [ ] `bun run test:slow` 0 flakes over 5 consecutive runs
 
 ## Done summary
-
+De-flaked the slow tier to 5/5 consecutive clean runs (157 tests, 0 fail). Replaced daemon-boot sleeps with a waitForDaemon socket-readiness probe; routed all daemon spawns through sandboxEnv (the missing dead-letter-dir override was boot-importing the real backlog → 45MB tmp DB that never bound); excluded boot synthetics by event_type tag so the new AutopilotCapSet row stops inflating the events count; 30s per-test timeouts; afterEach reap in try/finally. Fixed two genuine shutdown races surfaced by the de-flake: daemon now !shuttingDown-guards the global error handlers (terminated-worker postMessage no longer clobbers exit(0)), and server-worker awaits the poll loop draining before db.close() (the closed-db leak). Also corrected a stale fn-724 SCHEMA_VERSION pin (59→60).
 ## Evidence
