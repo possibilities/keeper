@@ -32,5 +32,5 @@ db.test.ts (SELECTIVE, per-test): convert ONLY single-connection schema-shape te
 - [ ] Measured per-file wall time drop recorded for both files
 
 ## Done summary
-
+Rewrote single-connection schema tests to :memory:. reducer.test.ts shares one in-memory writer across all 456 tests (refold determinism preserved on same connection): ~23.8s->~13.9s. db.test.ts flipped 51 single-connection schema/index/EXPLAIN/select/fs-migration tests to :memory:, kept WAL-assert, readonly-reader, idempotent-reopen, env-path, and all migration tests on-disk: ~7.5s->~3.8s. Full fast tier 2397 pass / 0 fail.
 ## Evidence
