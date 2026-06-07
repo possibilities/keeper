@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-07T21:41:16.435863Z",
+  "depends_on": [],
+  "epic": "fn-732-move-approval-to-runtime-sidecar",
+  "id": "fn-732-move-approval-to-runtime-sidecar.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "planctl approval write+read moves to sidecar",
+  "updated_at": "2026-06-07T21:41:16.435863Z"
+}
