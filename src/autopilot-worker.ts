@@ -31,8 +31,19 @@
  *      excludes any stale terminal or resumed `jobs` row for the same
  *      `(plan_verb, plan_ref)` — a SessionStart that lands AFTER the
  *      watermark is the one that proves THIS dispatch made it).
- *   2. `res = await deps.launch(argv, name)`. `{ok:false}` → emit
- *      `DispatchFailed` immediately with the surfaced reason and return.
+ *   2a. Durable ack-before-launch gate (fn-678/fn-724): `ack = await
+ *      deps.emitDispatched({verb, id, ...})` posts a `Dispatched` intent
+ *      to main for durable insert and BLOCKS on the id-correlated
+ *      `dispatched-ack{id, ok}` reply. `{ok:false}` from the ack OR an
+ *      ack-wait timeout → ABORT without launching (resolve `"aborted"`,
+ *      no emit; a phantom `pending_dispatches` row, if one landed, is
+ *      cleared by the TTL sweep). Outbox ordering — intent committed
+ *      BEFORE the launch side-effect — is load-bearing (closes the
+ *      SessionStart-drains-before-`dispatched` race, fn-627 class).
+ *   2b. `res = await deps.launch(argv, name)`, ONLY after the durable
+ *      `dispatched-ack{ok:true}`. `{ok:false}` (or throw) → emit
+ *      `DispatchFailed` immediately with the surfaced reason and resolve
+ *      `"failed"`.
  *   3. Poll BOTH `deps.findJob(plan_verb, plan_ref, last_event_id >
  *      watermark)` AND `deps.tabExistsByName(name)` every
  *      `pollIntervalMs` (~1-2s) until EITHER returns truthy — the
@@ -40,13 +51,23 @@
  *      first — and resolve `"ok"` (fn-674 early-resolve). Releases
  *      the fn-644 one-at-a-time stagger in ~zellij latency rather
  *      than the full ceiling.
- *   4. Ceiling (`ceilingMs`, default 60s) elapses with NEITHER signal
- *      → emit `DispatchFailed reason="confirm timeout"` and resolve
- *      `"failed"`. A timeout while the tab DOES exist mints NOTHING
- *      and resolves `"ok"` instead (the launch succeeded; the slot
- *      stays held by the standing `liveTabKeys` dedup arm until the
- *      tab disappears OR a `jobs` row binds). The last tick uses
- *      `Math.min(interval, remaining)` so the ceiling is honored.
+ *   4. Three-way ceiling outcome (`ceilingMs`, default 60s) — matches the
+ *      `ConfirmOutcome` type doc:
+ *        - `launch.ok===false` → `"failed"` (emit `DispatchFailed`, per 2b).
+ *        - SessionStart bound (jobs row OR named tab visible) before the
+ *          ceiling → `"ok"`.
+ *        - Ceiling elapses with `launch.ok===true` and NO bind → `"indoubt"`
+ *          (fn-724): NO `DispatchFailed` is emitted (the launch SUCCEEDED;
+ *          zellij execs `claude` cold 24-33s later, occasionally past the
+ *          ceiling, so a timeout is UNKNOWN, not failed). The
+ *          `pending_dispatches` row is KEPT (it still holds the slot via the
+ *          fifth suppression arm) so the producer-side TTL sweep
+ *          (`PENDING_DISPATCH_TTL_MS`, 120s) mints `DispatchExpired` only if
+ *          the bind truly never lands; `inFlight` is released.
+ *      The last tick uses `Math.min(interval, remaining)` so the ceiling is
+ *      honored. The `ceilingMs (60s) < PENDING_DISPATCH_TTL_MS (120s)`
+ *      invariant is load-bearing (a sweep < ceiling would clear the row
+ *      mid-confirm and re-open the dispatch).
  *   5. The polled rows are NEVER mutated; reads only — the reducer is the
  *      sole writer of `jobs` (per the event-sourcing invariants).
  *
