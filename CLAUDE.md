@@ -123,6 +123,12 @@ epic, into a dirty repo, during the launch→SessionStart blind window, or again
 taskless epic. To inspect, read `src/readiness.ts` and `src/autopilot-worker.ts`;
 the `[paused]` banner in `keeper autopilot` is authoritative.
 
+**Global cap (`max_concurrent_jobs`)** counts root-occupants (planner-exempt,
+and now approve-exempt) before per-epic dispatch; the budget governs only
+`work`/`close` launches. `approve`-verb launches are exempt at both launch
+sites — they skip the budget gate and never decrement it — so a backlog of
+pending-approval rows can't deadlock the very approvers that would drain it.
+
 ## Out of scope
 
 prise/env-var integration, multi-session lineage, harness_meta.

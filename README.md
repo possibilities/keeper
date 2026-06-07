@@ -295,6 +295,12 @@ Keeper has no `install` verb. Wire it up manually:
      autopilot reconciler lazily ensures (and reuses) for every tab it spawns.
      Default: `autopilot`. Each dispatch opens as a new tab inside that shared
      background session.
+   - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
+     jobs. A positive integer enforces the cap; omit or set non-positive
+     (the default) to leave it unlimited. The cap bounds only `work`/`close`
+     launches; `approve`-verb launches are exempt from the budget (counted
+     outside the cap) so a pending-approval backlog can't deadlock its own
+     approvers — total live workers can reach `cap + live approvers`.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -304,6 +310,7 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/src
    claude_projects_root: ~/.claude/projects
    zellij_session: autopilot
+   max_concurrent_jobs: 3
    YAML
    ```
 
@@ -712,11 +719,10 @@ collapses to plain stream output. Run any of them with
   `## Architecture`). All dispatch decision, launch, confirmation, dedup,
   and (config-gated) reap live in the daemon; the CLI carries no dispatch
   logic of its own. It subscribes through `src/readiness-client.ts` and the
-  `dispatch_failures` collection, renders a three-section frame
+  `dispatch_failures` collection, renders a two-section frame
   (`--- current ---` from `jobs` correlated by `plan_verb`+`plan_ref`,
-  `--- predicted ---` from `computeReadiness`, `--- failed ---` from the
-  `dispatch_failures` projection) plus a paused/playing banner, and
-  exposes three control RPCs:
+  `--- failed ---` from the `dispatch_failures` projection) plus a
+  paused/playing banner, and exposes three control RPCs:
 
   - `keeper autopilot play` / `keeper autopilot pause` — flip the autopilot
     pause flag on the daemon via `set_autopilot_paused`. The RPC appends an
@@ -746,7 +752,7 @@ collapses to plain stream output. Run any of them with
   within ~2s (fn-723).
 
   ```sh
-  keeper autopilot                       # viewer: current / predicted / failed + paused state
+  keeper autopilot                       # viewer: current / failed + paused state
   keeper autopilot play                  # un-pause the reconciler
   keeper autopilot pause                 # pause the reconciler (default at boot)
   keeper autopilot retry work::fn-1-x.3  # clear a sticky DispatchFailed
@@ -1872,9 +1878,8 @@ in-daemon autopilot reconciler worker (which subscribes to the same
 collections on its own read-only connection and runs `computeReadiness`
 against them on every `data_version` wake). The `scripts/autopilot.ts`
 viewer subscribes only to the `dispatch_failures` collection plus the
-helper-driven verdict stream to render the `--- predicted ---` /
-`--- failed ---` sections; the dispatch decision itself does NOT run
-client-side anymore. Each per-collection state carries a stable
+helper-driven verdict stream to render the `--- failed ---` section;
+the dispatch decision itself does NOT run client-side anymore. Each per-collection state carries a stable
 constant `subId` (`${idPrefix}-<collection>`) that the helper sends on
 every `query` frame and uses to route inbound `patch`/`meta` frames
 back to the originating state via a `bySubId` map — collection lookup
