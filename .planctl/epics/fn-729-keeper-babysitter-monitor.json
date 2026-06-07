@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-729-keeper-babysitter-monitor",
   "bundles": [],
   "closer_done_at": "2026-06-07T16:24:00.167133Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T16:24:00.167133Z"
+  "updated_at": "2026-06-07T16:25:08.619608Z"
 }
