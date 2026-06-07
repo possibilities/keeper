@@ -28,5 +28,5 @@ The file already imports the writer's exported functions (line ~39) AND spawns t
 - [ ] File passes; spawn-count reduction and wall-time recorded
 
 ## Done summary
-
+Thinned redundant events-writer hook spawns: converted assertion-only DB-round-trip tests (slash_command/skill_name negatives, planctl_* shape cases, tool_use_id no-field, config_dir value normalizations) to in-process deriver calls; kept one wiring spawn per column-family plus all exit-0/dead-letter/fn-669 column-narrow process-level tests as real subprocesses. Spawn-firing tests dropped ~28→~21; wall-time 6.57s→5.03s.
 ## Evidence

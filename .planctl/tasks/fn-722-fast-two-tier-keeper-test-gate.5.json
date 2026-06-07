@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Reduce events-writer hook spawns",
-  "updated_at": "2026-06-06T22:31:12.114342Z"
+  "updated_at": "2026-06-07T18:08:30.204522Z",
+  "worker_done_at": "2026-06-07T18:08:30.204522Z"
 }
