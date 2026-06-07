@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-07T21:47:29.268895Z",
+  "depends_on": [
+    "fn-733-babysitter-telemetry-and-fold-latency.1"
+  ],
+  "epic": "fn-733-babysitter-telemetry-and-fold-latency",
+  "id": "fn-733-babysitter-telemetry-and-fold-latency.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "babysitter self-watchdog heartbeat",
+  "updated_at": "2026-06-07T21:47:29.268895Z"
+}
