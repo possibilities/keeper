@@ -28,7 +28,7 @@ import {
   WAL_AUTOCHECKPOINT_PAGES,
   withBootDrainCheckpointTuning,
 } from "../src/daemon";
-import { openDb } from "../src/db";
+import { openDb, SCHEMA_VERSION } from "../src/db";
 import { drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
@@ -1952,6 +1952,18 @@ test("PENDING_DISPATCH_TTL_MS is 120s (>= 2x the documented 60s cold-start ceili
   // is ~24-33s; 120s gives ~3-4x margin. A regression here would
   // re-create the hazard the projection exists to eliminate.
   expect(PENDING_DISPATCH_TTL_MS).toBe(120_000);
+});
+
+test("fn-724: SCHEMA_VERSION is unchanged (no schema bump — durable ack is producer-side control-flow only)", () => {
+  // The fn-724 durable mint-before-launch + three-way outcome is entirely
+  // a producer-side control-flow change: a new id-correlated
+  // dispatched-request/ack on the main↔autopilot-worker channel and the
+  // ceiling→indoubt emit suppression. The reducer arms
+  // (foldDispatched / foldDispatchFailed / foldDispatchExpired) are
+  // UNTOUCHED — no new event, no new column, no migration. The schema
+  // version MUST stay at the fn-719 value (59); a bump here would signal
+  // an accidental reducer/schema change that re-couples the outcome.
+  expect(SCHEMA_VERSION).toBe(59);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

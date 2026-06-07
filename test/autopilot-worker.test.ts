@@ -34,6 +34,8 @@ import {
   type ConfirmRunningDeps,
   checkWorkPluginManifest,
   confirmRunning,
+  DEFAULT_CEILING_MS,
+  type DispatchedAck,
   type DispatchedPayload,
   type DispatchFailedPayload,
   type FoundJob,
@@ -46,6 +48,7 @@ import {
   runReconcileCycle,
   verbForVerdict,
 } from "../src/autopilot-worker";
+import { PENDING_DISPATCH_TTL_MS } from "../src/daemon";
 import {
   computeReadiness,
   type PendingDispatch,
@@ -178,6 +181,15 @@ interface FakeDepsOptions {
   pollIntervalMs?: number;
   ceilingMs?: number;
   /**
+   * fn-724: control the durable `dispatched-ack` `emitDispatched` returns.
+   * - omitted → resolves `{ok:true}` (the happy durable-mint path).
+   * - `{ok:false}` (or any `DispatchedAck`) → resolves that ack (insert
+   *   failed on main → confirmRunning aborts without launching).
+   * - a function → called per emission; return a Promise to model a
+   *   never-resolving ack (the ack-timeout abort) or a deferred resolve.
+   */
+  dispatchedAck?: DispatchedAck | (() => Promise<DispatchedAck>);
+  /**
    * Optional work-plugin manifest check. When provided, records the tier
    * it was called with and returns the configured verdict; when omitted
    * the dep is left unset (guard is a no-op, matching production tests
@@ -223,8 +235,15 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
     emitDispatchFailed(payload) {
       log.emissions.push({ ...payload });
     },
-    emitDispatched(payload) {
+    async emitDispatched(payload) {
       log.dispatchedEmissions.push({ ...payload });
+      // fn-724: model main's durable ack. Default resolves {ok:true}; a
+      // function override can return a never-resolving Promise (ack-timeout)
+      // or a {ok:false} ack (insert-failed).
+      if (typeof opts.dispatchedAck === "function") {
+        return opts.dispatchedAck();
+      }
+      return opts.dispatchedAck ?? { ok: true };
     },
     maxEventId() {
       log.maxEventIdCalls += 1;
@@ -832,11 +851,15 @@ test("confirmRunning GOOD: job appears before ceiling → ok, no emission", asyn
   expect(log.emissions).toEqual([]); // no DispatchFailed
 });
 
-test("confirmRunning BAD (fn-674 dead launch): ceiling elapses, NO tab and NO jobs row → failed + DispatchFailed", async () => {
-  // The post-fn-674 BAD case is narrower: a timeout MINTS DispatchFailed
-  // only when the zellij tab never appeared AND the jobs row never
-  // appeared — the launch genuinely failed to materialize a worker.
-  // The fake's default `liveTabs` set is empty, mirroring "no tab".
+test("confirmRunning IN-DOUBT (fn-724): launch.ok + ceiling elapses, NO jobs row → indoubt, NO DispatchFailed, pending row kept", async () => {
+  // fn-724 reclassifies the ceiling-hit-with-successful-launch case. The
+  // launch SUCCEEDED (default fake launch returns {ok:true}) but the
+  // SessionStart jobs row never landed inside the ceiling. The outcome is
+  // UNKNOWN, not failed (zellij execs `claude` cold 24-33s later — maybe
+  // past the ceiling), so confirmRunning returns "indoubt" and SUPPRESSES
+  // the DispatchFailed emit. The `pending_dispatches` row (emitted + ack'd
+  // before launch) is KEPT — the TTL sweep clears it if the bind never
+  // arrives. The dispatched mint (emission) still happened exactly once.
   const { deps, log } = makeFakeDeps({
     maxEventId: 100,
     pollIntervalMs: 5,
@@ -851,25 +874,27 @@ test("confirmRunning BAD (fn-674 dead launch): ceiling elapses, NO tab and NO jo
     ctrl.signal,
     deps,
   );
-  expect(outcome).toBe("failed");
-  expect(log.emissions.length).toBe(1);
-  const emission = log.emissions[0];
-  expect(emission?.verb).toBe("work");
-  expect(emission?.id).toBe("fn-1-foo.1");
-  expect(emission?.reason).toContain("confirm timeout");
-  expect(emission?.dir).toBe("/repo");
+  expect(outcome).toBe("indoubt");
+  // No sticky DispatchFailed — the launch outcome is in-doubt, not failed.
+  expect(log.emissions).toEqual([]);
+  // The durable Dispatched mint happened once (the pending row that the TTL
+  // sweep later clears).
+  expect(log.dispatchedEmissions.length).toBe(1);
+  expect(log.dispatchedEmissions[0]?.verb).toBe("work");
+  expect(log.dispatchedEmissions[0]?.id).toBe("fn-1-foo.1");
 });
 
 // ---------------------------------------------------------------------------
 // fn-720: confirmRunning timeout-class backstop telemetry
 // ---------------------------------------------------------------------------
 
-test("confirmRunning ceiling-hit: posts a timeout rescue with elapsedMs staleness; DispatchFailed unchanged", async () => {
+test("confirmRunning ceiling-hit: posts a timeout rescue with elapsedMs staleness; outcome indoubt, NO DispatchFailed (fn-724)", async () => {
   // Ceiling elapses with NO jobs row → the `timeout`-class backstop RESCUED a
   // stuck dispatch. The telemetry record carries rescued:true and
   // stalenessMs = the elapsed-since-dispatch poll duration (= ceilingMs, since
-  // the loop runs full pollIntervalMs ticks up to the ceiling). The existing
-  // DispatchFailed emit must be unchanged.
+  // the loop runs full pollIntervalMs ticks up to the ceiling). fn-724: the
+  // telemetry rescue record is UNCHANGED, but the outcome is now "indoubt"
+  // (launch.ok + no jobs row) and NO DispatchFailed is emitted.
   const { deps, log } = makeFakeDeps({
     maxEventId: 100,
     pollIntervalMs: 5,
@@ -884,11 +909,10 @@ test("confirmRunning ceiling-hit: posts a timeout rescue with elapsedMs stalenes
     ctrl.signal,
     deps,
   );
-  expect(outcome).toBe("failed");
-  // DispatchFailed emit unchanged (the telemetry is strictly additive).
-  expect(log.emissions.length).toBe(1);
-  expect(log.emissions[0]?.reason).toContain("confirm timeout");
-  // Exactly one timeout-backstop record, the rescue.
+  expect(outcome).toBe("indoubt");
+  // fn-724: NO DispatchFailed on the in-doubt ceiling path.
+  expect(log.emissions).toEqual([]);
+  // The timeout-backstop telemetry rescue record is unchanged.
   expect(log.timeoutBackstops.length).toBe(1);
   const rec = log.timeoutBackstops[0];
   expect(rec?.rescued).toBe(true);
@@ -997,8 +1021,11 @@ test("confirmRunning: watermark captured BEFORE launch (excludes stale terminal 
     ctrl.signal,
     deps,
   );
-  expect(outcome).toBe("failed");
-  expect(log.emissions[0]?.reason).toContain("confirm timeout");
+  // fn-724: the stale row is filtered, the ceiling elapses with launch.ok →
+  // "indoubt" (not "failed"); no DispatchFailed. The watermark gate still
+  // prevents the stale terminal row from false-confirming as "ok".
+  expect(outcome).toBe("indoubt");
+  expect(log.emissions).toEqual([]);
 });
 
 test("confirmRunning ABORTED: shutdown signal during poll → aborted, no emission", async () => {
@@ -1021,6 +1048,116 @@ test("confirmRunning ABORTED: shutdown signal during poll → aborted, no emissi
   const outcome = await promise;
   expect(outcome).toBe("aborted");
   expect(log.emissions).toEqual([]); // a shutdown is NOT a sticky failure
+});
+
+// ---------------------------------------------------------------------------
+// fn-724: durable mint-before-launch (dispatched-ack)
+// ---------------------------------------------------------------------------
+
+test("confirmRunning (fn-724): launch() is NOT called until the dispatched-ack resolves", async () => {
+  // The keystone race fix. emitDispatched returns a deferred ack that we
+  // hold open; the launch MUST NOT fire until we resolve it. This proves
+  // the durable mint-before-launch ordering (the fire-and-forget version
+  // could launch before the pending_dispatches row was written → fn-627
+  // double-dispatch).
+  const ackGate = Promise.withResolvers<DispatchedAck>();
+  let ackRequested = false;
+  const { deps, log, setJobByKey } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 200,
+    dispatchedAck: () => {
+      ackRequested = true;
+      return ackGate.promise;
+    },
+  });
+  setJobByKey("work", "fn-1-foo.1", { job_id: "j-1", last_event_id: 150 });
+  const ctrl = new AbortController();
+  const promise = confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    deps,
+  );
+  // Give the microtask queue room to run up to (but not past) the ack await.
+  await Bun.sleep(20);
+  expect(ackRequested).toBe(true);
+  // CRITICAL: launch must NOT have fired while the ack is unresolved.
+  expect(log.launches.length).toBe(0);
+  // Resolve the durable ack → the launch may now proceed.
+  ackGate.resolve({ ok: true });
+  const outcome = await promise;
+  expect(outcome).toBe("ok");
+  expect(log.launches.length).toBe(1);
+});
+
+test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted, NO DispatchFailed", async () => {
+  // Main's durable insert failed → the dispatch aborts WITHOUT launching.
+  // No row landed, so no DispatchFailed (a real worker never spawned). The
+  // next reconcile cycle re-attempts.
+  const { deps, log } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 200,
+    dispatchedAck: { ok: false },
+  });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    deps,
+  );
+  expect(outcome).toBe("aborted");
+  expect(log.launches.length).toBe(0); // never launched
+  expect(log.emissions).toEqual([]); // no DispatchFailed
+  // The mint request was still issued (it's what got rejected by main).
+  expect(log.dispatchedEmissions.length).toBe(1);
+});
+
+test("confirmRunning (fn-724): ack-wait that never resolves → aborted on signal, no launch", async () => {
+  // Models the ack-timeout abort flavor via the shutdown signal: the ack
+  // never resolves and the worker aborts. confirmRunning must NOT launch.
+  // (The live deps' real DISPATCHED_ACK_TIMEOUT_MS timer is exercised in
+  // the worker; here the fake's never-resolving ack is rejected when the
+  // confirm is abandoned — we assert launch never fired.)
+  const neverGate = Promise.withResolvers<DispatchedAck>();
+  const { deps, log } = makeFakeDeps({
+    maxEventId: 100,
+    pollIntervalMs: 5,
+    ceilingMs: 200,
+    dispatchedAck: () => neverGate.promise,
+  });
+  const ctrl = new AbortController();
+  const promise = confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh", "-c", "true"],
+    ctrl.signal,
+    deps,
+  );
+  await Bun.sleep(20);
+  // Still parked on the ack — no launch yet.
+  expect(log.launches.length).toBe(0);
+  // Reject the ack-wait (the timeout/shutdown flavor) → confirm aborts.
+  neverGate.reject(new Error("dispatched-ack timeout"));
+  const outcome = await promise;
+  expect(outcome).toBe("aborted");
+  expect(log.launches.length).toBe(0); // never launched
+  expect(log.emissions).toEqual([]); // no DispatchFailed
+});
+
+test("ceiling invariant (fn-724): DEFAULT_CEILING_MS < PENDING_DISPATCH_TTL_MS", () => {
+  // Load-bearing for the in-doubt path: the producer-side TTL sweep MUST
+  // fire AFTER the confirm ceiling, never during it. Were the sweep ≤ the
+  // ceiling, it would clear the pending_dispatches row mid-confirm and the
+  // slot would re-dispatch (the fn-627 hazard the row exists to prevent).
+  expect(DEFAULT_CEILING_MS).toBeLessThan(PENDING_DISPATCH_TTL_MS);
 });
 
 // ---------------------------------------------------------------------------

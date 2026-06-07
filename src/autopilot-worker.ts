@@ -419,19 +419,32 @@ export interface ConfirmRunningDeps {
   emitDispatchFailed(payload: DispatchFailedPayload): void;
   /**
    * Emit a synthetic `Dispatched` event onto the writable connection (via
-   * the parent thread — workers never write the DB). Outbox-ordered intent
-   * (fn-678): the reconciler mints this BEFORE `launch()` so a crash
-   * between mint and the side-effect leaves a phantom `pending_dispatches`
-   * row the producer-side TTL sweep clears via `DispatchExpired`. Strictly
-   * preferable to double-dispatch in the launch→SessionStart blind window
-   * the fn-674 live-tab probe used to cover.
+   * the parent thread — workers never write the DB) AND AWAIT a durable
+   * ack (fn-724). Outbox-ordered intent (fn-678): the reconciler mints
+   * this BEFORE `launch()` so a crash between mint and the side-effect
+   * leaves a phantom `pending_dispatches` row the producer-side TTL sweep
+   * clears via `DispatchExpired`. Strictly preferable to double-dispatch
+   * in the launch→SessionStart blind window the fn-674 live-tab probe
+   * used to cover.
+   *
+   * fn-724 — DURABLE before launch. Returns a Promise that resolves only
+   * once main has DURABLY inserted the `Dispatched` event onto the
+   * writable connection and replied `dispatched-ack{ok}`. `confirmRunning`
+   * AWAITS it BEFORE `launch()`: the fire-and-forget `postMessage` it
+   * replaced let main drain a worker's `SessionStart` BEFORE the queued
+   * mint landed, so the `pending_dispatches` row was never written, the
+   * launch-window occupancy arm never fired, and the slot double-dispatched
+   * (the fn-627 class). A `{ok:false}` resolution (insert threw) — OR an
+   * ack-timeout / shutdown surfaced via the rejected Promise — ABORTS the
+   * dispatch without launching: no double-dispatch; if the row DID land
+   * (timeout after a slow insert) the TTL sweep clears the phantom.
    *
    * Carries the reconcile-time `ts` so the reducer's `Dispatched` fold
    * lands `pending_dispatches.dispatched_at` byte-identically across a
    * re-fold (all wallclock lives in the producer; the fold never reads
    * `Date.now()`).
    */
-  emitDispatched(payload: DispatchedPayload): void;
+  emitDispatched(payload: DispatchedPayload): Promise<DispatchedAck>;
   /**
    * `SELECT MAX(id) FROM events` against the reconciler's own read-only
    * connection. Captured BEFORE `launch` so the post-launch poll can
@@ -544,6 +557,20 @@ export interface DispatchedPayload {
 }
 
 /**
+ * Durable-ack reply shape for {@link ConfirmRunningDeps.emitDispatched}
+ * (fn-724). `ok:true` means main DURABLY inserted the `Dispatched` event
+ * onto the writable connection before replying; `ok:false` means the
+ * insert threw (a writer-lock contention or DB failure). The reconciler
+ * launches ONLY on `ok:true`; an `ok:false` (or a rejected ack-wait —
+ * timeout / shutdown) aborts WITHOUT launching, so the SessionStart-
+ * drains-before-`Dispatched` race that re-opened the fn-627 double-
+ * dispatch window is closed.
+ */
+export interface DispatchedAck {
+  ok: boolean;
+}
+
+/**
  * Payload shape for the producer-side TTL sweep's `DispatchExpired`
  * mint (fn-678, schema v50). Mirrors `src/reducer.ts`'s
  * `DispatchExpiredPayload` shape — the discharge arm is keyed-by-pk
@@ -557,12 +584,28 @@ export interface DispatchExpiredPayload {
 }
 
 /**
- * Confirm outcome — internal to `runConfirmCycle`. The worker calls
- * `deps.emitDispatchFailed` on `"failed"`; `"ok"` is the noop happy
- * path; `"aborted"` means shutdown — drop the in-flight entry and exit
- * without emitting (no DispatchFailed for a worker shutdown).
+ * Confirm outcome — internal to `runReconcileCycle`. Four-way (fn-724):
+ *  - `"ok"` — the SessionStart `jobs` row landed before the ceiling. Noop
+ *    happy path; the dispatch is promoted to `liveDispatches`.
+ *  - `"failed"` — `launch()` returned `{ok:false}` (or threw). The worker
+ *    never materialized, so `deps.emitDispatchFailed` mints a STICKY
+ *    `DispatchFailed` (cleared only by a human `retry_dispatch`).
+ *  - `"indoubt"` (fn-724) — the launch SUCCEEDED (`launch.ok===true`) but
+ *    the ceiling elapsed with NO `jobs` row. The launch outcome is
+ *    UNKNOWN, not failed (zellij accepts `new-tab` and execs `claude` cold
+ *    24-33s later, occasionally past the ceiling). NO `DispatchFailed` is
+ *    minted (that would be a sticky ghost-worker write-off); the
+ *    `pending_dispatches` row is KEPT so the producer-side TTL sweep
+ *    eventually mints `DispatchExpired` if the bind truly never arrives.
+ *    `inFlight` is released (same as `ok`/`failed`).
+ *  - `"aborted"` — shutdown OR a DURABLE-ack abort (fn-724: `emitDispatched`
+ *    resolved `{ok:false}` or its ack-wait rejected on timeout/shutdown).
+ *    Drop the in-flight entry and exit WITHOUT emitting (no DispatchFailed
+ *    for a worker shutdown; and no DispatchFailed for an ack abort — a
+ *    phantom row, if one landed, is cleared by the TTL sweep). The launch
+ *    NEVER happened on an ack abort, so there is no worker to write off.
  */
-export type ConfirmOutcome = "ok" | "failed" | "aborted";
+export type ConfirmOutcome = "ok" | "failed" | "indoubt" | "aborted";
 
 /**
  * Default poll cadence — every 1s. Spec says ~1-2s; we pick 1000ms so a
@@ -585,6 +628,20 @@ export const DEFAULT_POLL_INTERVAL_MS = 1000;
  * dedup signal.
  */
 export const DEFAULT_CEILING_MS = 60_000;
+
+/**
+ * Floor for the durable `dispatched-ack` wait (fn-724). `confirmRunning`
+ * awaits main's `Dispatched` insert before `launch()`; if the ack never
+ * arrives within this window the dispatch ABORTS (no launch). The floor
+ * MUST exceed `busy_timeout` (5s, `src/db.ts`) plus a boot-drain so a
+ * dispatch fired during the boot drain — when the writable connection may
+ * be blocked on the WAL writer lock for a full `busy_timeout` — does NOT
+ * false-abort. 10s gives 2x the `busy_timeout` of margin. An ack-timeout
+ * is the rare crash/wedge case (the insert is a single prepared-statement
+ * run in steady state, replying in sub-ms); a phantom row from a timeout
+ * AFTER a slow insert self-clears via the TTL sweep.
+ */
+export const DISPATCHED_ACK_TIMEOUT_MS = 10_000;
 
 /**
  * Worker shell wrapping. Mirrors the CLI autopilot's launch body so the
@@ -837,18 +894,46 @@ export async function confirmRunning(
   //    SessionStart that PROVES this dispatch lit up will carry
   //    `last_event_id > watermark`.
   const watermark = deps.maxEventId();
-  // 2. Mint intent BEFORE launch (outbox ordering, fn-678). A crash
-  //    between this mint and the actual `launch()` call leaves a phantom
-  //    `pending_dispatches` row; the producer-side TTL sweep clears it via
-  //    `DispatchExpired`. A phantom row delaying a real dispatch by up to
-  //    120s is strictly preferable to double-dispatch.
-  deps.emitDispatched({
-    verb,
-    id,
-    dir: cwd === "" ? null : cwd,
-    ts: deps.now(),
-  });
-  // 3. Launch.
+  // 2. Mint intent BEFORE launch (outbox ordering, fn-678) AND AWAIT a
+  //    DURABLE ack (fn-724). The pre-fn-724 mint was a fire-and-forget
+  //    `postMessage` NOT awaited before `launch()`, so main could drain a
+  //    worker's `SessionStart` BEFORE the queued `Dispatched` mint landed —
+  //    the `pending_dispatches` row was never written, the launch-window
+  //    occupancy arm never fired, and the slot double-dispatched (fn-627).
+  //    Now `await`-ing the ack guarantees the durable row exists BEFORE the
+  //    side-effect. Two abort flavors, BOTH don't-launch:
+  //      (a) ack `{ok:false}` (insert threw) — NO row landed; nothing to
+  //          clean up. Abort cleanly.
+  //      (b) ack-wait REJECTED (timeout ≥ busy_timeout+drain, or shutdown)
+  //          — the row MAY have landed (a slow insert that replied after the
+  //          wait gave up); the producer-side TTL sweep clears any such
+  //          phantom via `DispatchExpired`. Abort cleanly.
+  //    Either way we return `"aborted"` (no `DispatchFailed` — the launch
+  //    never happened, so there is no worker to write off). A phantom row
+  //    delaying a real re-dispatch by up to 120s is strictly preferable to
+  //    double-dispatch.
+  let ack: DispatchedAck;
+  try {
+    ack = await deps.emitDispatched({
+      verb,
+      id,
+      dir: cwd === "" ? null : cwd,
+      ts: deps.now(),
+    });
+  } catch {
+    // Ack-wait rejected (timeout or shutdown). Abort without launching.
+    return "aborted";
+  }
+  if (!ack.ok) {
+    // Durable insert failed on main. Abort without launching — no row
+    // landed, so no TTL cleanup needed; the next reconcile cycle re-attempts.
+    return "aborted";
+  }
+  if (signal.aborted) {
+    // Shutdown raced the ack. Abort before the side-effect.
+    return "aborted";
+  }
+  // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`.
   const launchResult: LaunchResult | { ok: false; error: string } = await deps
     .launch(argv, key, cwd)
     .catch((err) => ({
@@ -897,21 +982,31 @@ export async function confirmRunning(
       return "aborted";
     }
   }
-  // Ceiling elapsed with no jobs row — the launch is dead.
-  deps.emitDispatchFailed({
-    verb,
-    id,
-    reason: `confirm timeout after ${ceilingMs}ms (verb=${verb} id=${id})`,
-    dir: cwd === "" ? null : cwd,
-    ts: deps.now(),
-  });
-  // fn-720: the ceiling RESCUED a stuck dispatch (SessionStart never arrived).
-  // `stalenessMs` is the elapsed-since-dispatch poll duration in ms — distinct
-  // from the missed-wake class's now−last_fast_path_at semantics. Strictly
-  // additive: this rides ALONGSIDE the DispatchFailed emit above without
-  // changing it.
+  // Ceiling elapsed with no jobs row. fn-724: the launch SUCCEEDED
+  // (`launch.ok===true` — we only reach here past the `launch.ok===false`
+  // guard above), so the outcome is IN-DOUBT, not failed. zellij accepts
+  // `new-tab` and execs `claude` cold 24-33s later — occasionally past the
+  // ceiling — so a SessionStart may still be coming. Treating it as a
+  // sticky `DispatchFailed` produced ghost workers the system wrongly wrote
+  // off (the findings.md §7c incident). Instead:
+  //   - SUPPRESS the `DispatchFailed` emit (no sticky write-off).
+  //   - KEEP the `pending_dispatches` row (minted + ack'd above). It holds
+  //     the launch-window slot AND, if the bind truly never arrives, the
+  //     producer-side TTL sweep (120s, > this 60s ceiling) mints
+  //     `DispatchExpired` to clear it. The `ceilingMs < PENDING_DISPATCH_
+  //     TTL_MS` invariant is load-bearing here: were the sweep < ceiling it
+  //     would clear the row mid-confirm and re-open the dispatch.
+  // The reducer is UNCHANGED — `foldDispatchExpired` already DELETEs the
+  // row idempotently; the coupling break is entirely producer-side
+  // suppression of the emit.
+  //
+  // fn-720 telemetry rides ALONGSIDE unchanged: the ceiling still RESCUED a
+  // stuck dispatch (the fast path — SessionStart before ceiling — did not
+  // fire), so `rescued:true` with the elapsed-since-dispatch `stalenessMs`.
+  // (The fn-720 epic's noted follow-on re-label of a ceiling→indoubt
+  // outcome is out of scope for this task — left as-is here.)
   deps.recordTimeoutBackstop?.({ rescued: true, stalenessMs: elapsedMs });
-  return "failed";
+  return "indoubt";
 }
 
 /**
@@ -992,8 +1087,15 @@ export async function runReconcileCycle(
         });
       }
       // outcome === "failed" → DispatchFailed already emitted by
-      // confirmRunning; no live entry recorded.
-      // outcome === "aborted" → shutdown, no emission, no live entry.
+      //   confirmRunning; no live entry recorded.
+      // outcome === "indoubt" (fn-724) → launch succeeded but the ceiling
+      //   elapsed with no jobs row; NO DispatchFailed, the pending row is
+      //   kept (TTL sweep clears it if the bind never lands). No live entry
+      //   recorded (we never observed the confirm), but inFlight IS released
+      //   (the `finally` below) — same as ok/failed.
+      // outcome === "aborted" → shutdown OR a durable-ack abort (fn-724:
+      //   emitDispatched {ok:false} or its ack-wait rejected); no emission,
+      //   no live entry. On an ack abort the launch never happened.
     } finally {
       state.inFlight.delete(plan.key);
     }
@@ -1048,18 +1150,42 @@ export interface DispatchFailedMessage {
 }
 
 /**
- * Worker → main: Dispatched mint request (fn-678, schema v50). Main is
- * the sole writer of the synthetic event onto the events log; the worker
- * only describes what to mint. Outbox-ordered intent — the reconciler
- * posts this BEFORE invoking `launch()` so a crash between mint and the
- * tab-spawn side-effect leaves a phantom `pending_dispatches` row the
- * producer-side TTL sweep discharges via `DispatchExpired` (strictly
- * preferable to double-dispatch in the launch→SessionStart blind window
- * the fn-674 live-tab probe used to cover).
+ * Worker → main: Dispatched mint request (fn-678, schema v50; made
+ * id-correlated + durable-acked in fn-724). Main is the sole writer of
+ * the synthetic event onto the events log; the worker only describes what
+ * to mint. Outbox-ordered intent — the reconciler posts this BEFORE
+ * invoking `launch()` so a crash between mint and the tab-spawn
+ * side-effect leaves a phantom `pending_dispatches` row the producer-side
+ * TTL sweep discharges via `DispatchExpired` (strictly preferable to
+ * double-dispatch in the launch→SessionStart blind window the fn-674
+ * live-tab probe used to cover).
+ *
+ * fn-724: the worker now AWAITS a durable ack BEFORE `launch()`. The
+ * `id` is a per-request correlation token (a monotonic worker-local
+ * counter) main echoes back on the {@link DispatchedAckMessage} reply so
+ * the worker resolves the matching pending-promise. Mirrors the
+ * server-worker↔main `SetAutopilotPausedRequest`/`Result` id-correlated
+ * pattern (`src/server-worker.ts`).
  */
 export interface DispatchedMessage {
-  kind: "dispatched";
+  kind: "dispatched-request";
+  id: number;
   payload: DispatchedPayload;
+}
+
+/**
+ * Main → worker: durable-ack reply paired with {@link DispatchedMessage}
+ * (fn-724). Sent ONLY after main has inserted (or failed to insert) the
+ * `Dispatched` synthetic event on its writable connection. The `id`
+ * echoes the request's correlation token; `ok` is `true` on a successful
+ * insert, `false` when the insert threw. The worker's `emitDispatched`
+ * Promise resolves with `{ok}` — `confirmRunning` launches only on
+ * `ok:true`.
+ */
+export interface DispatchedAckMessage {
+  type: "dispatched-ack";
+  id: number;
+  ok: boolean;
 }
 
 /**
@@ -1075,11 +1201,15 @@ export interface DispatchExpiredMessage {
   payload: DispatchExpiredPayload;
 }
 
-type IncomingMessage = SetPausedMessage | ShutdownMessage;
+type IncomingMessage =
+  | SetPausedMessage
+  | ShutdownMessage
+  | DispatchedAckMessage;
 // `DispatchFailedMessage`, `DispatchedMessage`, and `DispatchExpiredMessage`
 // are the outgoing wire shapes main consumes when the reconcile + dispatch
 // loop is wired; the supervisor's message handler types against the same
-// records.
+// records. `DispatchedAckMessage` is the main→worker reply the worker keys
+// against its pending-ack map (fn-724).
 
 /**
  * Load a fresh {@link ReconcileSnapshot} from the worker's read-only
@@ -1221,6 +1351,21 @@ function main(): void {
   const shutdownController = new AbortController();
   const liveDispatches = new Map<DispatchKey, LiveDispatch>();
   let shutdown = false;
+  // fn-724 — durable `dispatched-ack` correlation. `emitDispatched` posts a
+  // `dispatched-request{id}` and parks a resolver in `pendingDispatchAcks`
+  // keyed by the monotonic `id`; main replies `dispatched-ack{id,ok}` which
+  // the message handler below resolves. The Promise also races a
+  // `DISPATCHED_ACK_TIMEOUT_MS` timer and the `shutdownController` signal —
+  // both REJECT the wait so `confirmRunning` aborts WITHOUT launching (a
+  // phantom row from a slow-but-eventual insert is cleared by the TTL
+  // sweep). On shutdown every parked resolver is rejected so no confirm
+  // hangs the teardown. Mirrors the server-worker↔main `SetAutopilotPaused`
+  // Request/Result id-correlated pattern.
+  let nextDispatchedAckId = 1;
+  const pendingDispatchAcks = new Map<
+    number,
+    { resolve: (ack: DispatchedAck) => void; reject: (err: Error) => void }
+  >();
   // Late-bound reconcile kick. The reconciler is level-triggered on
   // `data_version` (the `watchLoop` below), but two edges have no DB write
   // to ride: (1) `play` (set-paused → false) flips an in-memory flag only,
@@ -1236,6 +1381,25 @@ function main(): void {
     if (msg.type === "shutdown") {
       shutdown = true;
       shutdownController.abort();
+      // Reject every parked ack-wait so an in-flight `confirmRunning` that
+      // launched its `emitDispatched` request before shutdown resolves
+      // promptly (as `"aborted"`) instead of hanging until its timeout.
+      for (const [id, pending] of pendingDispatchAcks) {
+        pendingDispatchAcks.delete(id);
+        pending.reject(new Error("autopilot worker shutting down"));
+      }
+      return;
+    }
+    if (msg.type === "dispatched-ack") {
+      // fn-724: durable-ack reply from main. Resolve the parked
+      // `emitDispatched` Promise keyed by the correlation `id`. A
+      // late/duplicate ack whose id already discharged (timeout fired
+      // first) is a harmless no-op.
+      const pending = pendingDispatchAcks.get(msg.id);
+      if (pending) {
+        pendingDispatchAcks.delete(msg.id);
+        pending.resolve({ ok: msg.ok });
+      }
       return;
     }
     if (msg.type === "set-paused") {
@@ -1322,12 +1486,45 @@ function main(): void {
         payload,
       } satisfies DispatchFailedMessage);
     },
-    emitDispatched: (payload) => {
-      parentPort?.postMessage({
-        kind: "dispatched",
-        payload,
-      } satisfies DispatchedMessage);
-    },
+    emitDispatched: (payload) =>
+      new Promise<DispatchedAck>((resolve, reject) => {
+        // fn-724: post an id-correlated request and AWAIT main's durable
+        // insert ack. Reject (→ `confirmRunning` aborts without launching)
+        // if the ack never arrives within DISPATCHED_ACK_TIMEOUT_MS — a
+        // floor chosen ABOVE busy_timeout (5s) + a boot drain so a dispatch
+        // fired during the boot drain (when main's writable connection may
+        // block a full busy_timeout on the WAL writer lock) does NOT
+        // false-abort. Also reject on an already-aborted shutdown signal.
+        if (shutdownController.signal.aborted) {
+          reject(new Error("autopilot worker shutting down"));
+          return;
+        }
+        const id = nextDispatchedAckId++;
+        const timer = setTimeout(() => {
+          if (pendingDispatchAcks.delete(id)) {
+            reject(
+              new Error(
+                `dispatched-ack timeout after ${DISPATCHED_ACK_TIMEOUT_MS}ms (verb=${payload.verb} id=${payload.id})`,
+              ),
+            );
+          }
+        }, DISPATCHED_ACK_TIMEOUT_MS);
+        pendingDispatchAcks.set(id, {
+          resolve: (ack) => {
+            clearTimeout(timer);
+            resolve(ack);
+          },
+          reject: (err) => {
+            clearTimeout(timer);
+            reject(err);
+          },
+        });
+        parentPort?.postMessage({
+          kind: "dispatched-request",
+          id,
+          payload,
+        } satisfies DispatchedMessage);
+      }),
     maxEventId: () => {
       const row = db.query("SELECT MAX(id) AS m FROM events").get() as
         | { m: number | null }

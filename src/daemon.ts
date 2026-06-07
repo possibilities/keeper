@@ -73,6 +73,7 @@ import { join } from "node:path";
 import type {
   AutopilotWorkerData,
   DispatchExpiredMessage,
+  DispatchedAckMessage,
   DispatchedMessage,
   DispatchFailedMessage,
   Verb,
@@ -2293,8 +2294,12 @@ function runDaemon(): void {
     }
     if (msg.kind === "dispatch-failed") {
       handleDispatchFailedMint(msg.payload);
-    } else if (msg.kind === "dispatched") {
-      handleDispatchedMint(msg.payload);
+    } else if (msg.kind === "dispatched-request") {
+      // fn-724: durable mint-before-launch. Insert the `Dispatched` event,
+      // then reply `dispatched-ack{id, ok}` so the worker only `launch()`es
+      // AFTER the row is durable (closes the SessionStart-drains-before-
+      // Dispatched race that re-opened the fn-627 double-dispatch window).
+      handleDispatchedMint(msg);
     } else if (msg.kind === "dispatch-expired") {
       handleDispatchExpiredMint(msg.payload);
     }
@@ -2364,19 +2369,29 @@ function runDaemon(): void {
 
   /**
    * Mint a synthetic `Dispatched` event on the writable connection
-   * (fn-678, schema v50). The reducer's `Dispatched` fold UPSERTs a
+   * (fn-678, schema v50) AND reply a durable `dispatched-ack{id, ok}`
+   * (fn-724). The reducer's `Dispatched` fold UPSERTs a
    * `pending_dispatches` row keyed `(verb, id)` carrying the
    * producer-side `dispatched_at` lifted off the payload's `ts` —
    * outbox-ordered intent so a crash between mint and `launch()`
-   * leaves a phantom row the TTL sweep clears. NON-FATAL on insert
-   * failure: a missed mint means the launch-window dedup arm opens up
-   * for that `(verb, id)` until the next reconcile cycle, which is
-   * preferable to wedging the daemon (the worst case is one extra
-   * launch attempt, identical to fn-674's transient-failure
-   * degradation).
+   * leaves a phantom row the TTL sweep clears.
+   *
+   * fn-724 — DURABLE before launch. The worker AWAITS this ack BEFORE
+   * `launch()`, so the reply MUST fire on every path: `ok:true` once the
+   * insert lands, `ok:false` when it throws. The worker launches only on
+   * `ok:true`; an `ok:false` (or an ack-timeout on the worker side) aborts
+   * the dispatch WITHOUT launching — strictly preferable to the
+   * fire-and-forget race that re-opened the fn-627 double-dispatch window
+   * (main draining a worker's `SessionStart` BEFORE the queued mint
+   * landed). NON-FATAL on insert failure: the worker's abort means the
+   * launch-window dedup arm opens up for that `(verb, id)` until the next
+   * reconcile cycle, which is preferable to wedging the daemon. Mirrors
+   * the `set-autopilot-paused` insert-then-reply ack pattern.
    */
-  function handleDispatchedMint(payload: DispatchedMessage["payload"]): void {
+  function handleDispatchedMint(msg: DispatchedMessage): void {
+    const { id, payload } = msg;
     const data = JSON.stringify(payload);
+    let ok = false;
     try {
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
@@ -2411,8 +2426,12 @@ function runDaemon(): void {
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
       });
+      // Durably inserted — pump the reducer so the `pending_dispatches` row
+      // folds promptly, THEN ack. (The ack only promises durability of the
+      // event, not the fold; the fold is idempotent on the next drain.)
       wakePending = true;
       pumpWakes();
+      ok = true;
     } catch (err) {
       console.error(
         `[keeperd] Dispatched mint threw (non-fatal): ${
@@ -2420,6 +2439,13 @@ function runDaemon(): void {
         }`,
       );
     }
+    // Reply on EVERY path — the worker is blocked awaiting this ack before
+    // it launches. A `false` reply tells the worker to abort the dispatch.
+    autopilotWorkerInstance.postMessage({
+      type: "dispatched-ack",
+      id,
+      ok,
+    } satisfies DispatchedAckMessage);
   }
 
   /**
