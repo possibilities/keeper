@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-4-prove-seed-state-test-fixture",
   "bundles": [],
   "closer_done_at": "2026-06-07T11:21:13.275173Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-07T11:21:13.275173Z"
+  "updated_at": "2026-06-07T14:02:45.433766Z"
 }
