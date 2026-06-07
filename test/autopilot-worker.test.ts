@@ -39,6 +39,7 @@ import {
   type DispatchedPayload,
   type DispatchFailedPayload,
   type FoundJob,
+  isCompletionReapCandidate,
   isOccupyingJob,
   isReapCandidate,
   type LaunchResult,
@@ -1766,4 +1767,145 @@ test("isReapCandidate: approve:: and close:: surfaces match when open", () => {
       pane({ id: "2", terminal_command: "claude --name close::fn-2-bar" }),
     ),
   ).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// fn-727 — isCompletionReapCandidate (approved-completion reap gate)
+//
+// A SIBLING of isReapCandidate, NOT an overload: this one gates on the
+// completed-row-id SET (the `{tag:"completed"}` verdict), keying off the
+// `<id>` of a `(work|approve|close)::<id>` pane name — so one completed
+// id authorizes reaping BOTH its work/close pane AND its approve pane.
+// `is_exited` is DELIBERATELY not gated (the approver is live at approval).
+// ---------------------------------------------------------------------------
+
+test("isCompletionReapCandidate: a completed task id reaps work::<id> AND approve::<id>", () => {
+  const completed = new Set(["fn-1-foo.3"]);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "1", tab_name: "work::fn-1-foo.3" }),
+    ),
+  ).toBe(true);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({
+        id: "2",
+        tab_name: "Tab #2",
+        terminal_command:
+          "claude --name approve::fn-1-foo.3 '/plan:approve ...'",
+      }),
+    ),
+  ).toBe(true);
+});
+
+test("isCompletionReapCandidate: a completed epic id reaps close::<id> AND approve::<id>", () => {
+  const completed = new Set(["fn-2-bar"]);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "1", tab_name: "close::fn-2-bar" }),
+    ),
+  ).toBe(true);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({
+        id: "2",
+        tab_name: "Tab #2",
+        terminal_command: "claude --name approve::fn-2-bar",
+      }),
+    ),
+  ).toBe(true);
+});
+
+test("isCompletionReapCandidate: a NON-completed id is never a candidate (pending/rejected/worker-ended stay open)", () => {
+  // The id is not in the completed set — its surfaces are NOT reaped,
+  // regardless of pane state. This is the pending / rejected /
+  // worker-ended-but-unapproved hold-open guard.
+  const completed = new Set(["fn-1-foo.3"]);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "5", tab_name: "work::fn-9-other.1" }),
+    ),
+  ).toBe(false);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "6", tab_name: "approve::fn-9-other.1" }),
+    ),
+  ).toBe(false);
+});
+
+test("isCompletionReapCandidate: human ad-hoc tab (no dispatch key) is never a candidate", () => {
+  const completed = new Set(["fn-1-foo.3"]);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "9", tab_name: "Tab #9", terminal_command: "/bin/zsh -l -i" }),
+    ),
+  ).toBe(false);
+});
+
+test("isCompletionReapCandidate: empty completed set never reaps", () => {
+  const completed = new Set<string>();
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "3", tab_name: "work::fn-1-foo.3" }),
+    ),
+  ).toBe(false);
+});
+
+test("isCompletionReapCandidate: ignores pane.exited (the approver is live at approval)", () => {
+  // DELIBERATE divergence from the practice-scout `is_exited==true` rule:
+  // a LIVE approve pane (exited:false) on a completed id IS reaped. The
+  // verdict, not pane liveness, is the sole authorization.
+  const completed = new Set(["fn-1-foo.3"]);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "2", tab_name: "approve::fn-1-foo.3", exited: false }),
+    ),
+  ).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// fn-727 — reconcile surfaces completedRowIds (no second computeReadiness)
+// ---------------------------------------------------------------------------
+
+test("reconcile: completedRowIds carries approved-completed task ids and close-row epic ids", () => {
+  // A done+approved task → `{tag:"completed"}` perTask verdict → its id in
+  // the set. An epic with that task completed + status done+approved →
+  // close-row `{tag:"completed"}` → epic id in the set too.
+  const completedTask = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    runtime_status: "done",
+    approval: "approved",
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    status: "done",
+    approval: "approved",
+    tasks: [completedTask],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.completedRowIds.has("fn-1-foo.1")).toBe(true);
+  expect(decision.completedRowIds.has("fn-1-foo")).toBe(true);
+});
+
+test("reconcile: a non-completed task id is NOT in completedRowIds", () => {
+  // An open task (worker_phase open) is `ready`, never `completed`.
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    status: "open",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.completedRowIds.has("fn-1-foo.1")).toBe(false);
 });

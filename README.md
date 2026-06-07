@@ -301,6 +301,15 @@ Keeper has no `install` verb. Wire it up manually:
      launches; `approve`-verb launches are exempt from the budget (counted
      outside the cap) so a pending-approval backlog can't deadlock its own
      approvers — total live workers can reach `cap + live approvers`.
+   - `autoclose_windows` — whether the autopilot reaps a row's zellij
+     surfaces when it reaches **approved completion**. Default `true`. When a
+     task reaches `{tag:"completed"}` (worker done + approved + idle) the
+     reconciler closes its `work::<id>` AND `approve::<id>` panes together; an
+     approved-completed epic close-row closes `close::<id>` AND `approve::<id>`.
+     Pending, rejected, and just-worker-ended (unapproved) windows stay open
+     for inspection. Set `false` to keep every window open (the reap pass
+     becomes a no-op and skips the `list-panes` probe). Restart-to-apply — a
+     flip lags until the next daemon restart, like every keeper config key.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -311,6 +320,7 @@ Keeper has no `install` verb. Wire it up manually:
    claude_projects_root: ~/.claude/projects
    zellij_session: autopilot
    max_concurrent_jobs: 3
+   autoclose_windows: true
    YAML
    ```
 
@@ -320,7 +330,8 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `zellij_session: autopilot`). Unknown keys are silently ignored — a legacy
+   `zellij_session: autopilot`, `autoclose_windows: true`). Unknown keys are
+   silently ignored — a legacy
    `exec_backend: ghostty` carried over from a pre-fn-654 config has no effect.
 
    (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
@@ -1784,8 +1795,22 @@ emits `DispatchExpired` only if the bind truly never lands. On `set-paused`
 (boot-pause via the same relay), the worker reaps stale launch-window zellij
 surfaces — `ExecBackend.reapSurfaces` intersects `list-panes -a -j` with the
 OPEN `pending_dispatches` rows (a discharged row = live worker = never reaped)
-and never throws (no-self-heal). This whole hardening is producer-side only:
-no reducer arm, column, or `SCHEMA_VERSION` change (stays 59).
+and never throws (no-self-heal). A **distinct** completion reap (fn-727,
+config-gated on `autoclose_windows`, default `true`) shares the SAME
+`reapSurfaces` close path but gates on the OPPOSITE signal: each reconcile
+cycle, when a row reaches the durable `{tag:"completed"}` readiness verdict
+(worker done + approved + idle), the worker closes every live surface sharing
+that row's id — a completed task reaps `work::<id>` AND `approve::<id>`; a
+completed close-row reaps `close::<id>` AND `approve::<id>`. Unlike the pause
+reap it deliberately does NOT gate on `is_exited` (the approver pane is live at
+the instant of approval — the verdict, not pane liveness, is the sole
+authorization); pending / rejected / worker-ended-unapproved windows never
+reach `{tag:"completed"}` and stay open. The completed-row-id set rides out of
+`reconcile`'s single `computeReadiness` pass (no second pass), the reap
+re-probes `list-panes` every cycle (survives a daemon restart — no reliance on
+cold-boot `liveDispatches`), and the whole pass is try/caught (no-self-heal).
+This whole hardening is producer-side only: no reducer arm, column, or
+`SCHEMA_VERSION` change (stays 59).
 There is NO auto-retry — a failed dispatch is sticky and visible in `keeper
 autopilot`'s `--- failed ---` section until the human runs `keeper autopilot
 retry <verb::id>`, which routes through the server-worker's `retry_dispatch`

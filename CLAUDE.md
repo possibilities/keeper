@@ -129,6 +129,17 @@ and now approve-exempt) before per-epic dispatch; the budget governs only
 sites — they skip the budget gate and never decrement it — so a backlog of
 pending-approval rows can't deadlock the very approvers that would drain it.
 
+**Completion reap (`autoclose_windows`, default `true`, fn-727).** When a row
+reaches the `{tag:"completed"}` verdict (worker done + approved + idle), the
+reconcile cycle closes its zellij surfaces via `ExecBackend.reapSurfaces`
+(pane-close on the surviving live-probe path — NOT the retired `closeByTabId`
+tab-coord mechanism): a completed task reaps `work::<id>` + `approve::<id>`, a
+completed close-row reaps `close::<id>` + `approve::<id>`; pending / rejected /
+worker-ended-unapproved windows stay open. Deliberately does NOT gate on
+`is_exited` (the approver is live at approval). See `src/autopilot-worker.ts`
+(`isCompletionReapCandidate`, `reapCompletionSurfaces`) + `src/exec-backend.ts`
+(`reapSurfaces`).
+
 ## Out of scope
 
 prise/env-var integration, multi-session lineage, harness_meta.

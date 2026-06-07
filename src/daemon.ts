@@ -2298,10 +2298,10 @@ function runDaemon(): void {
   // The flag flips ONLY via the `set_autopilot_paused` RPC → bridge →
   // main → `{type:"set-paused"}` relay above.
   //
-  // Config (`zellijSession`) is read here on main and threaded into
-  // workerData so the worker doesn't open `~/.config/keeper/config.yaml`
-  // itself — every config I/O lives on main, every worker receives the
-  // resolved values.
+  // Config (`zellijSession`, `maxConcurrentJobs`, `autocloseWindows`) is
+  // read here on main and threaded into workerData so the worker doesn't
+  // open `~/.config/keeper/config.yaml` itself — every config I/O lives on
+  // main, every worker receives the resolved values.
   const apConfig = resolveConfig();
   const autopilotWorkerInstance = new Worker(
     new URL("./autopilot-worker.ts", import.meta.url).href,
@@ -2311,6 +2311,10 @@ function runDaemon(): void {
         paused: autopilotPaused,
         zellijSession: apConfig.zellijSession,
         maxConcurrentJobs: apConfig.maxConcurrentJobs,
+        // fn-727 — completion-reap toggle, read on main and frozen into
+        // workerData (every config I/O lives on main). Restart-to-apply:
+        // a config flip lags until the next daemon restart re-spawns.
+        autocloseWindows: apConfig.autocloseWindows,
       } satisfies AutopilotWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );

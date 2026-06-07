@@ -17,6 +17,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { isCompletionReapCandidate } from "../src/autopilot-worker";
 import {
   buildZellijAttachBgArgs,
   buildZellijClosePaneArgs,
@@ -1584,4 +1585,123 @@ test("reapSurfaces: list-panes ENOENT (spawn throws) → skippedNoSnapshot, no t
   const result = await backend.reapSurfaces(() => true);
   expect(result.skippedNoSnapshot).toBe(true);
   expect(result.reaped).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// fn-727 — completion-reap pass: reapSurfaces driven by the REAL
+// `isCompletionReapCandidate` predicate (the wiring the autopilot worker's
+// `reapCompletionSurfaces` performs). The worker-scope early-return on
+// flag-off / empty-set lives in the worker closure; here we exercise the
+// predicate-through-reapSurfaces seam — the same shape the fn-724 pause
+// reap tests use.
+// ---------------------------------------------------------------------------
+
+test("completion reap: approving a completed task reaps work::<id> AND approve::<id> together", async () => {
+  const calls: string[][] = [];
+  // Live session: the completed task's work pane + its approve pane, plus
+  // an unrelated worker on a non-completed id and a human tab.
+  const json = JSON.stringify([
+    { id: 1, tab_name: "work::fn-1-foo.3", terminal_command: "claude" },
+    {
+      id: 2,
+      tab_name: "Tab #2",
+      terminal_command: "claude --name approve::fn-1-foo.3",
+      exited: false,
+    },
+    { id: 3, tab_name: "work::fn-9-other.1", terminal_command: "claude" },
+    { id: 4, tab_name: "Tab #4", terminal_command: "/bin/zsh -l -i" },
+  ]);
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: makeReapSpawnStub(json, {}, calls),
+  });
+  const completed = new Set(["fn-1-foo.3"]);
+  const result = await backend.reapSurfaces((pane) =>
+    isCompletionReapCandidate(completed, pane),
+  );
+  // Exactly the work + approve pair for the completed id.
+  expect(result.reaped).toBe(2);
+  expect(result.failed).toBe(0);
+  const closes = calls.filter((c) => c[4] === "close-pane").map((c) => c[6]);
+  expect(closes.sort()).toEqual(["terminal_1", "terminal_2"]);
+  // The non-completed worker (terminal_3) and the human tab (terminal_4)
+  // were NEVER touched.
+  expect(closes.includes("terminal_3")).toBe(false);
+  expect(closes.includes("terminal_4")).toBe(false);
+});
+
+test("completion reap: approving a completed close-row reaps close::<id> AND approve::<id>", async () => {
+  const calls: string[][] = [];
+  const json = JSON.stringify([
+    { id: 1, tab_name: "close::fn-2-bar", terminal_command: "claude" },
+    {
+      id: 2,
+      tab_name: "Tab #2",
+      terminal_command: "claude --name approve::fn-2-bar",
+    },
+  ]);
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: makeReapSpawnStub(json, {}, calls),
+  });
+  const completed = new Set(["fn-2-bar"]);
+  const result = await backend.reapSurfaces((pane) =>
+    isCompletionReapCandidate(completed, pane),
+  );
+  expect(result.reaped).toBe(2);
+  const closes = calls.filter((c) => c[4] === "close-pane").map((c) => c[6]);
+  expect(closes.sort()).toEqual(["terminal_1", "terminal_2"]);
+});
+
+test("completion reap: pending / rejected / worker-ended-unapproved surfaces are NOT reaped", async () => {
+  // None of these ids reached `{tag:"completed"}`, so the empty completed
+  // set leaves every surface open — the human-inspection guarantee.
+  const calls: string[][] = [];
+  const json = JSON.stringify([
+    { id: 1, tab_name: "work::fn-pending.1", terminal_command: "claude" },
+    { id: 2, tab_name: "approve::fn-rejected.2", terminal_command: "claude" },
+    { id: 3, tab_name: "work::fn-ended.3", terminal_command: "claude" },
+  ]);
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: makeReapSpawnStub(json, {}, calls),
+  });
+  const completed = new Set<string>(); // nothing approved-completed
+  const result = await backend.reapSurfaces((pane) =>
+    isCompletionReapCandidate(completed, pane),
+  );
+  expect(result.examined).toBe(3);
+  expect(result.reaped).toBe(0);
+  expect(calls.some((c) => c[4] === "close-pane")).toBe(false);
+});
+
+test("completion reap: a predicate throw is contained by the worker's try/catch, not reapSurfaces", async () => {
+  // `isCompletionReapCandidate` is pure and never throws, but if a
+  // predicate DID throw, `reapSurfaces` propagates it (no per-pane catch in
+  // its loop). The swallow point is the worker's `reapCompletionSurfaces`
+  // try/catch — a throw there would otherwise bounce the daemon
+  // (no-self-heal). This pins the seam: the backend propagates; the CALLER
+  // contains. No close-pane fires before the throw.
+  const calls: string[][] = [];
+  const json = JSON.stringify([
+    { id: 1, tab_name: "work::fn-1-foo.3", terminal_command: "claude" },
+  ]);
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: makeReapSpawnStub(json, {}, calls),
+  });
+  let threw = false;
+  try {
+    await backend.reapSurfaces(() => {
+      throw new Error("predicate boom");
+    });
+  } catch {
+    threw = true;
+  }
+  expect(threw).toBe(true); // backend propagates — caller's catch contains
+  expect(calls.some((c) => c[4] === "close-pane")).toBe(false);
 });

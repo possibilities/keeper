@@ -186,23 +186,41 @@ memo, re-ensures (re-mints + re-captures any orphan tab), and retries the
 `list-sessions` per worker life). `ensureLaunched` mirrors this with
 per-call state instead of a memo.
 
-## The reap path (fn-724)
+## The reap path (fn-724, fn-727)
 
-`reapSurfaces` cancels launch-window ghost surfaces on pause/boot-pause.
-The shape:
+`reapSurfaces` closes a predicate-selected subset of live zellij surfaces.
+The shape is shared; the **`predicate` is the caller's safety gate**, and
+there are TWO distinct caller contracts:
 
 ```
 list-panes -a -j  →  collectPanesFromListJson  →  for each pane:
    predicate(pane) ? close-pane -p terminal_<id> : skip
 ```
 
-The **`predicate` is the caller's safety gate.** The autopilot worker
-passes "verb-prefixed dispatch key AND an OPEN `pending_dispatches`
-row" — NEVER name-alone. A dispatch key that has *discharged* from the
-open set means SessionStart already bound = a LIVE worker, which must
-never be reaped. `list-panes` lags zellij reality, so a name match alone
-must not authorize a close; the open-row intersect is the
-highest-blast-radius gate.
+1. **Pause / boot reap (fn-724, `isCompletionReapCandidate`'s sibling
+   `isReapCandidate`).** Cancels launch-window ghost surfaces on
+   pause/boot-pause. The predicate passes "verb-prefixed dispatch key AND
+   an OPEN `pending_dispatches` row" — NEVER name-alone. A dispatch key
+   that has *discharged* from the open set means SessionStart already
+   bound = a LIVE worker, which must never be reaped. `list-panes` lags
+   zellij reality, so a name match alone must not authorize a close; the
+   open-row intersect is the highest-blast-radius gate.
+
+2. **Completion reap (fn-727, `isCompletionReapCandidate`).** Closes a
+   row's surfaces when it reaches the durable `{tag:"completed"}` readiness
+   verdict. The predicate passes "the pane's `(work|approve|close)::<id>`
+   key's `<id>` is in this cycle's approved-completion set" — so one
+   completed id reaps its name-located PAIR (`work::<id>` + `approve::<id>`,
+   or `close::<id>` + `approve::<id>`). It deliberately does NOT gate on
+   `is_exited`: the approver pane is LIVE at the instant of approval, so an
+   `is_exited` gate would never reap it. The durable verdict is the SOLE
+   authorization; the name match only LOCATES the panes. (Safe because an
+   approved-completed row cannot have a concurrent live worker for the same
+   id — a re-dispatch would flip the row off `completed`.)
+
+Both contracts share the same `list-panes` lag caveat: the predicate, not
+pane liveness, authorizes the close. The completion predicate substitutes
+the durable verdict for the open-row intersect as its authorization.
 
 Failure modes all degrade rather than throw:
 

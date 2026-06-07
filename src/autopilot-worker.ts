@@ -339,6 +339,53 @@ export function isReapCandidate(
 }
 
 /**
+ * fn-727 — pure completion-reap predicate for `ExecBackend.reapSurfaces`.
+ * A SIBLING of `isReapCandidate`, NOT an overload: the two gate on
+ * OPPOSITE sets. `isReapCandidate` reaps the pause-window ghost — a pane
+ * whose key is still OPEN in `pending_dispatches` (not-yet-bound launch).
+ * This predicate reaps the APPROVED-COMPLETION pair — a pane whose key's
+ * `<id>` reached the durable `{tag:"completed"}` readiness verdict this
+ * cycle.
+ *
+ * A pane is a completion-reap candidate IFF its `(work|approve|close)::<id>`
+ * dispatch key (lifted by `dispatchKeyForPane`) has its `<id>` in
+ * `completedRowIds` — the set of task ids / epic ids whose readiness
+ * verdict is `{tag:"completed"}` this cycle. So a completed task reaps
+ * BOTH `work::<id>` and `approve::<id>`; a completed close row reaps BOTH
+ * `close::<id>` and `approve::<id>` (same id, two surfaces).
+ *
+ * SAFETY — DELIBERATE DIVERGENCE from practice-scout's universal "match
+ * name AND `is_exited==true`" rule: `is_exited` (the pane's `exited`
+ * field) is INTENTIONALLY NOT gated. The approver pane is LIVE at the
+ * instant of approval, so an `is_exited` gate would NEVER reap it. The
+ * durable `{tag:"completed"}` verdict is the SOLE authorization; the name
+ * match only LOCATES the panes. Per the human's design call: an
+ * `approve::<id>` surface existing implies a completed corresponding job —
+ * a completed+approved row cannot have a concurrent live worker for the
+ * same id (a re-dispatch would flip the row OFF `completed`). Do NOT "fix"
+ * this back to the `is_exited` default. A pane with no dispatch key (a
+ * human's ad-hoc tab) is never touched.
+ */
+export function isCompletionReapCandidate(
+  completedRowIds: Set<string>,
+  pane: ZellijPane,
+): boolean {
+  const key = dispatchKeyForPane(pane);
+  if (key == null) {
+    return false;
+  }
+  // Key is `${verb}::${id}`; `<id>` is everything after the first `::`.
+  // Ids never contain `::` (verb-prefixed keys are `verb::id` with the
+  // verb being one of work|approve|close), so a single split is exact.
+  const sep = key.indexOf("::");
+  if (sep < 0) {
+    return false;
+  }
+  const id = key.slice(sep + 2);
+  return completedRowIds.has(id);
+}
+
+/**
  * Snapshot the reconciler folds into a desired-vs-observed decision.
  * Mirrors the wire snapshot the readiness client emits (`epics` +
  * `jobs` + `subagentInvocations` + the projected `gitStatusByProjectDir`
@@ -451,13 +498,24 @@ export interface LiveDispatch {
 }
 
 /**
- * The output of `reconcile(snapshot, state)`: the launches to fire.
- * Pure data — `runReconcileCycle` walks the array and chains the
- * side-effect deps. (Window-reap was retired with the zellij feed in
- * fn-710; the decision carries launches only.)
+ * The output of `reconcile(snapshot, state)`: the launches to fire PLUS
+ * (fn-727) the set of row ids whose readiness verdict is
+ * `{tag:"completed"}` this cycle. Pure data — `runReconcileCycle` walks
+ * `launches`; the completion-reap pass in `driveCycle` reads
+ * `completedRowIds`.
+ *
+ * `completedRowIds` is harvested from the SAME `computeReadiness` pass
+ * `reconcile` already makes (single source of truth) — `driveCycle` must
+ * NOT recompute readiness to derive it. It holds task ids (from
+ * `readiness.perTask`) and epic ids (from `readiness.perCloseRow`) whose
+ * verdict tag is `completed`. The completion-reap predicate keys off
+ * `<id>` only, so a completed task authorizes reaping `work::<id>` AND
+ * `approve::<id>`, and a completed close row authorizes `close::<id>` AND
+ * `approve::<id>`.
  */
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
+  completedRowIds: Set<string>;
 }
 
 /**
@@ -833,6 +891,25 @@ export function reconcile(
     snapshot.pendingDispatches,
   );
 
+  // fn-727: harvest the approved-completion set from the ONE readiness pass
+  // above (never a second `computeReadiness`). A `{tag:"completed"}` task
+  // verdict authorizes reaping `work::<id>` + `approve::<id>`; a completed
+  // close-row verdict authorizes `close::<id>` + `approve::<id>` — the
+  // completion-reap predicate keys off `<id>` only, so one id covers its
+  // pair. Both maps feed the same id set (task ids and epic ids never
+  // collide — `fn-N-slug.M` vs `fn-N-slug`).
+  const completedRowIds = new Set<string>();
+  for (const [taskId, verdict] of readiness.perTask) {
+    if (verdict.tag === "completed") {
+      completedRowIds.add(taskId);
+    }
+  }
+  for (const [epicId, verdict] of readiness.perCloseRow) {
+    if (verdict.tag === "completed") {
+      completedRowIds.add(epicId);
+    }
+  }
+
   // fn-725 global concurrency cap. Count root-occupants ONCE over the
   // POST-mutex verdicts of BOTH perTask AND perCloseRow — `isRootOccupant`
   // is planner-exempt, matching the per-root mutex predicate so the two
@@ -969,7 +1046,7 @@ export function reconcile(
     }
   }
 
-  return { launches };
+  return { launches, completedRowIds };
 }
 
 /**
@@ -1249,6 +1326,18 @@ export interface AutopilotWorkerData {
    * happens once on main and the resolved value rides workerData.
    */
   maxConcurrentJobs?: number | null;
+  /**
+   * fn-727 — completion-reap toggle. When `true` (the default), the
+   * reconcile cycle reaps the zellij surfaces of an approved-completion
+   * row (`work`/`close` + its `approve` pane). `false` makes the reap
+   * pass a no-op AND skips the `list-panes` spawn. Threaded in from
+   * `resolveConfig().autocloseWindows`; like `zellijSession`, config I/O
+   * happens once on main and the resolved value rides workerData.
+   * Restart-to-apply — a config flip lags until the next daemon restart,
+   * the contract every keeper config key shares. Exposed in the payload
+   * (default `true`) so hermetic tests can override it.
+   */
+  autocloseWindows?: boolean;
 }
 
 /** Main → worker: paused-flag flip. */
@@ -1465,6 +1554,14 @@ function main(): void {
     inFlight: new Set(),
     maxConcurrentJobs: data.maxConcurrentJobs ?? null,
   };
+  // fn-727 — completion-reap toggle. Default `true` (reap) when the
+  // supervisor didn't thread the resolved flag (e.g. a hermetic test that
+  // omits it), matching `DEFAULT_AUTOCLOSE_WINDOWS`. Read once here; the
+  // reap pass in `driveCycle` early-returns when it's false (no
+  // `list-panes` spawn). Lives on the worker scope, NOT `ReconcileState`
+  // (that struct is the pure-`reconcile` input; the reap is a side-effect
+  // the cycle drives).
+  const autocloseWindows = data.autocloseWindows ?? true;
   // `liveDispatches` tracks the in-flight surfaces this reconciler still
   // owns confirm/reap work for (keyed `${verb}::${id}`). Boots EMPTY: a
   // cold restart re-derives "already running" from the durable `jobs`
@@ -1761,6 +1858,58 @@ function main(): void {
     })();
   };
 
+  // fn-727 — completion reap. Distinct from the pause/boot reap above:
+  // that one gates on the OPEN `pending_dispatches` intersect (a
+  // not-yet-bound launch-window ghost); THIS one gates on the durable
+  // approved-completion verdict surfaced by `reconcile` this cycle. When a
+  // row reaches `{tag:"completed"}` (worker_phase done + approval approved
+  // + idle), every live surface sharing that row's id is reaped: a task
+  // completion reaps `work::<id>` AND `approve::<id>`; an epic close-row
+  // completion reaps `close::<id>` AND `approve::<id>`. Pending, rejected,
+  // and just-worker-ended (unapproved) surfaces stay open for human
+  // inspection — they never reach `{tag:"completed"}`, so their ids are
+  // never in `completedRowIds`.
+  //
+  // Built on the SURVIVING live-probe path (`reapSurfaces` +
+  // `buildZellijClosePaneArgs`), NOT the torn-out fn-710 jobs-row
+  // tab-coord path. The reap re-probes live `list-panes` every cycle
+  // (level-triggered on `data_version`); it persists no pane ids and
+  // survives a daemon restart — the verdict, not a cold-boot
+  // `liveDispatches`, drives it. SAFETY divergence (no `is_exited` gate)
+  // documented on `isCompletionReapCandidate`.
+  //
+  // Structurally mirrors `reapLaunchWindowSurfaces`: early-return (skip the
+  // `list-panes` spawn) when `autocloseWindows` is false OR the completed
+  // set is empty; else `reapSurfaces` with the completion predicate; log
+  // examined/reaped/failed; the whole body is try/caught so a throw never
+  // propagates (a throw would crash the worker and bounce the daemon, per
+  // no-self-heal). `backend.reapSurfaces` is itself never-throw; this catch
+  // is the belt-and-suspenders backstop for the predicate.
+  const reapCompletionSurfaces = (completedRowIds: Set<string>): void => {
+    // Flag off → no-op AND no `list-panes` spawn (restart-to-apply: the
+    // flag is frozen at spawn). Empty completed set → no ghost to reap.
+    if (!autocloseWindows || completedRowIds.size === 0) {
+      return;
+    }
+    void (async (): Promise<void> => {
+      try {
+        const result = await backend.reapSurfaces((pane) =>
+          isCompletionReapCandidate(completedRowIds, pane),
+        );
+        if (result.reaped > 0 || result.failed > 0) {
+          console.error(
+            `[autopilot-worker] completion reap: examined=${result.examined} reaped=${result.reaped} failed=${result.failed}`,
+          );
+        }
+      } catch (err) {
+        console.error(
+          "[autopilot-worker] completion reap threw (non-fatal):",
+          err,
+        );
+      }
+    })();
+  };
+
   // Single-flight reconcile drive. `watchLoop` fires this callback on
   // every `data_version` pulse; if a cycle is already running we set
   // `wakePending` and the running cycle loops once more after it finishes
@@ -1784,6 +1933,12 @@ function main(): void {
         }
         const snapshot = await loadReconcileSnapshot(db);
         const decision = reconcile(snapshot, state, deps.now());
+        // fn-727 — fire the completion reap with THIS cycle's approved-
+        // completion set (recomputed every cycle from the one readiness
+        // pass `reconcile` made — no second `computeReadiness`). Fire-and-
+        // forget: it owns its own try/catch and never throws past itself,
+        // so it never blocks or wedges the dispatch stagger below.
+        reapCompletionSurfaces(decision.completedRowIds);
         await runReconcileCycle(
           decision,
           state,
