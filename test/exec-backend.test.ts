@@ -8,7 +8,8 @@
  *    `buildZellijAttachBgArgs`) produce the zellij CLI shape the live
  *    spec calls for.
  *  - `createZellijBackend.launch` returns `{ ok }` (no pane id),
- *    threads `--name` through, and reaps the fresh-mint orphan tab.
+ *    threads `--name` through, and keeps the fresh-mint default tab as
+ *    a keepalive anchor (never reaped).
  *  - `resolveExecBackend` returns a zellij backend; tolerates undefined
  *    session via `DEFAULT_ZELLIJ_SESSION`.
  *
@@ -659,11 +660,13 @@ test("createZellijBackend.launch: session-ensure is memoized — second launch s
   expect(listCount).toBe(1);
 });
 
-test("createZellijBackend.launch: fresh mint reaps the orphan default tab via close-tab-by-id after the agent tab lands", async () => {
-  // The orphan-default-tab reap uses `close-tab-by-id` — the same
-  // builder `closeByTabId` (the autopilot reap path, epic fn-678)
-  // wraps. The deliberate close of a known-empty default tab created
-  // at mint time has no risk of nuking a shared tab.
+test("createZellijBackend.launch: fresh mint KEEPS the default Tab #1 as a keepalive anchor (never close-tab-by-id)", async () => {
+  // The fresh-mint default `Tab #1` is deliberately retained, NOT reaped.
+  // It carries no `(work|approve|close)::<id>` dispatch key, so the
+  // fn-727 completion-reap never touches it; its persistence stops the
+  // session from collapsing to zero tabs (which exits it) once every
+  // agent tab is completion-reaped. The pre-fix behavior reaped it, which
+  // let the autopilot session die + re-mint in a loop.
   const calls: string[][] = [];
   const notes: string[] = [];
   let listCalls = 0;
@@ -679,9 +682,6 @@ test("createZellijBackend.launch: fresh mint reaps the orphan default tab via cl
       return reply(listCalls === 1 ? "" : "autopilot\n");
     }
     if (cmd[1] === "attach") return reply("");
-    if (cmd[1] === "--session" && cmd[4] === "list-tabs") {
-      return reply("TAB_ID  POSITION  NAME\n0  0  Tab #1\n");
-    }
     if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("9\n");
     return reply("");
   };
@@ -692,18 +692,9 @@ test("createZellijBackend.launch: fresh mint reaps the orphan default tab via cl
   });
   const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
   expect(res).toEqual({ ok: true });
-  // The orphaned default tab (id 0, captured from list-tabs at mint) is
-  // closed via close-tab-by-id AFTER the agent tab exists. The orphan
-  // reap intentionally uses the tab-level builder (the default tab is
-  // known-empty) — only the agent-pane close moved to close-pane.
-  const closeCall = calls.find(
-    (c) => c[4] === "close-tab-by-id" && c[5] === "0",
-  );
-  expect(closeCall).toBeDefined();
-  const newTabIdx = calls.findIndex((c) => c[4] === "new-tab");
-  const closeIdx = calls.findIndex((c) => c[4] === "close-tab-by-id");
-  expect(closeIdx).toBeGreaterThan(newTabIdx);
-  // One-shot: a second launch (session now memoized) does NOT re-close.
+  // No close-tab-by-id is ever issued — the anchor tab survives.
+  expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
+  // A second launch (session now memoized) also never closes a tab.
   calls.length = 0;
   await backend.launch(["sh"], "work::fn-2-y.1", "/abs");
   expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
@@ -1009,12 +1000,11 @@ test("ExecBackend.ensureLaunched: pre-existing live session → new-tab (no atta
   expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
 });
 
-test("ExecBackend.ensureLaunched: absent session → attach -b --forget, poll, new-tab, then reap orphan default Tab #1", async () => {
+test("ExecBackend.ensureLaunched: absent session → attach -b --forget, poll, new-tab, KEEPS the default Tab #1 anchor", async () => {
   // Full mint path: list-sessions empty → attach -b --forget mints →
-  // poll shows it live → list-tabs captures default tab id → new-tab
-  // lands → close-tab-by-id reaps the orphan default. All
-  // parameterized by the per-call session, no `pendingOrphanTabId`
-  // clobber on the closure's managed-session slot.
+  // poll shows it live → new-tab lands. The fresh-mint default Tab #1 is
+  // retained as the session's keepalive anchor (matching `launch`), NOT
+  // reaped — so no close-tab-by-id is issued.
   const calls: string[][] = [];
   const notes: string[] = [];
   let listCalls = 0;
@@ -1030,9 +1020,6 @@ test("ExecBackend.ensureLaunched: absent session → attach -b --forget, poll, n
       return reply(listCalls === 1 ? "" : "restored\n");
     }
     if (cmd[1] === "attach") return reply("");
-    if (cmd[1] === "--session" && cmd[4] === "list-tabs") {
-      return reply("TAB_ID  POSITION  NAME\n0  0  Tab #1\n");
-    }
     if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("");
     return reply("");
   };
@@ -1060,27 +1047,15 @@ test("ExecBackend.ensureLaunched: absent session → attach -b --forget, poll, n
     "--forget",
     "restored",
   ]);
-  // list-tabs captured the default tab id against the per-call session.
-  const listTabsCall = calls.find(
-    (c) => c[1] === "--session" && c[4] === "list-tabs",
-  );
-  expect(listTabsCall?.[2]).toBe("restored");
   // new-tab fires AFTER the mint + poll cycle (so its index is past
   // the first list-sessions probe).
   const newTabIdx = calls.findIndex(
     (c) => c[1] === "--session" && c[4] === "new-tab" && c[2] === "restored",
   );
   expect(newTabIdx).toBeGreaterThan(1);
-  // Orphan reap: close-tab-by-id with the captured id (0), targeting
-  // the per-call session, AFTER the new-tab lands.
-  const closeIdx = calls.findIndex(
-    (c) =>
-      c[1] === "--session" &&
-      c[2] === "restored" &&
-      c[4] === "close-tab-by-id" &&
-      c[5] === "0",
-  );
-  expect(closeIdx).toBeGreaterThan(newTabIdx);
+  // Anchor retained: no close-tab-by-id is ever issued against the
+  // freshly-minted session.
+  expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
 });
 
 test("ExecBackend.ensureLaunched: session-gone new-tab stderr → re-ensure + retry once succeeds", async () => {
@@ -1271,7 +1246,7 @@ test("ExecBackend.ensureLaunched: shares no state with managed-session memo (sep
   await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
   // Now ensureLaunched into a DIFFERENT session. It must NOT see the
   // memo as "session already ensured" — it must run its own probe,
-  // see "restored" missing, attach, poll, new-tab, reap.
+  // see "restored" missing, attach, poll, new-tab.
   await backend.ensureLaunched(
     "restored",
     ["/bin/zsh", "-c", "echo hi"],
@@ -1294,13 +1269,9 @@ test("ExecBackend.ensureLaunched: shares no state with managed-session memo (sep
     "--forget",
     "restored",
   ]);
-  // And the orphan reap on "restored" targeted the per-call session,
-  // not the managed one.
-  const restoredReap = calls.find(
-    (c) =>
-      c[1] === "--session" && c[2] === "restored" && c[4] === "close-tab-by-id",
-  );
-  expect(restoredReap?.[5]).toBe("0");
+  // The fresh-mint default tab on "restored" is kept as a keepalive
+  // anchor — no close-tab-by-id is issued against either session.
+  expect(calls.some((c) => c[4] === "close-tab-by-id")).toBe(false);
 });
 
 test("ExecBackend.ensureLaunched: empty `name` string still omits --name (defensive)", async () => {

@@ -833,13 +833,6 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
   const spawn = deps.spawn ?? defaultSpawn;
   const session = deps.session ?? DEFAULT_ZELLIJ_SESSION;
   let sessionReady: Promise<void> | null = null;
-  // When `ensureSession` MINTS the session (vs. attaching to a listed
-  // one), zellij leaves an empty default `Tab #1`. We stash its id here
-  // and the FIRST successful `launch` reaps it after creating the agent
-  // tab — net result is a single named agent tab, not an orphan beside
-  // it. Cleared after the one-shot close so later launches never touch
-  // it; stays null when the session pre-existed (nothing to reap).
-  let pendingOrphanTabId: string | null = null;
 
   async function runCapture(
     args: string[],
@@ -868,36 +861,29 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
    * Session-parameterized get-or-create. Shared between the managed
    * `ensureSession` memo (called with the construction `session`) and
    * the per-call `ensureLaunched` path (called with the caller's
-   * target session). Mirrors the original ensureSession control flow
-   * exactly — list-sessions probe, `attach -b --forget` mint when
-   * absent/EXITED, color-capable env on the mint spawn, ~50ms poll
-   * up to 5s, fresh-mint default-tab id capture — but returns the
-   * captured orphan-tab id (null when the session pre-existed or the
-   * list-tabs capture failed) instead of mutating the closure's
-   * memoized `pendingOrphanTabId`. The two callers own their own
-   * orphan-reap state: the managed `launch` path stashes into the
-   * closure's one-shot field (cleared after first reap); the
-   * `ensureLaunched` path keeps the id local to the call. NEVER
-   * throws — every failure mode (binary missing, mint timeout)
-   * degrades to a noteLine warn + null orphan id, and the caller
-   * proceeds with the new-tab spawn (which will then fail honestly
-   * if the session truly never came up).
+   * target session). list-sessions probe, `attach -b --forget` mint
+   * when absent/EXITED, color-capable env on the mint spawn, ~50ms poll
+   * up to 5s. A freshly-minted session KEEPS its empty default `Tab #1`
+   * as a permanent keepalive ANCHOR — it is NOT reaped — so the fn-727
+   * completion-reap (which only matches `(work|approve|close)::<id>`
+   * dispatch-key panes) can never empty the session to zero tabs and
+   * collapse it into a re-mint loop. NEVER throws — every failure mode
+   * (binary missing, mint timeout) degrades to a noteLine warn, and the
+   * caller proceeds with the new-tab spawn (which then fails honestly if
+   * the session truly never came up).
    */
-  async function ensureSessionFor(
-    targetSession: string,
-  ): Promise<{ orphanTabId: string | null }> {
+  async function ensureSessionFor(targetSession: string): Promise<void> {
     // Probe first — a session already listed is the steady state.
     const listed = await runCapture(buildZellijListSessionsArgs());
     if (listed == null) {
       deps.noteLine(
         `# warn: zellij list-sessions failed (binary missing?); subsequent launches will no-op`,
       );
-      return { orphanTabId: null };
+      return;
     }
     if (zellijSessionListed(listed.stdout, targetSession)) {
-      // Pre-existing live session — never `--forget` it, never reap a
-      // default tab (there isn't one we minted).
-      return { orphanTabId: null };
+      // Pre-existing live session — never `--forget` it; nothing minted.
+      return;
     }
     // Not listed (absent OR EXITED corpse) — fire
     // `attach -b --forget <session>` to FORGET any saved/serialized
@@ -923,35 +909,27 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
     while (Date.now() < deadline) {
       const probe = await runCapture(buildZellijListSessionsArgs());
       if (probe != null && zellijSessionListed(probe.stdout, targetSession)) {
-        // Freshly minted: capture the default `Tab #1` id so the first
-        // launch can reap it once the agent tab exists. Best-effort —
-        // a missing/unparsable list returns null and we simply keep
-        // the default tab.
-        const tabs = await runCapture(buildZellijListTabsArgs(targetSession));
-        if (tabs != null) {
-          return { orphanTabId: firstTabIdFromListTabs(tabs.stdout) };
-        }
-        return { orphanTabId: null };
+        // Freshly minted and live. zellij leaves an empty default
+        // `Tab #1`; we KEEP it as the session's keepalive ANCHOR rather
+        // than reaping it. It carries no dispatch key, so the fn-727
+        // completion-reap never touches it, and its presence stops the
+        // session collapsing to zero tabs when every agent tab is
+        // completion-reaped. (Reaping it was the re-mint-loop bug.)
+        return;
       }
       await delay(50);
     }
     deps.noteLine(
       `# warn: zellij session "${targetSession}" never appeared in list-sessions after 5s; new-tab may no-op`,
     );
-    return { orphanTabId: null };
+    return;
   }
 
   function ensureSession(): Promise<void> {
     if (sessionReady != null) {
       return sessionReady;
     }
-    sessionReady = (async () => {
-      const { orphanTabId } = await ensureSessionFor(session);
-      // Stash for the FIRST `launch` to reap one-shot after the agent
-      // tab lands. A pre-existing session returns null; a failed mint
-      // also returns null.
-      pendingOrphanTabId = orphanTabId;
-    })();
+    sessionReady = ensureSessionFor(session);
     return sessionReady;
   }
 
@@ -998,14 +976,10 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         deps.noteLine(`# warn: ${error}`);
         return { ok: false, error };
       }
-      // First launch after a fresh mint: reap the orphaned default
-      // `Tab #1` now that the agent tab exists, leaving a single named
-      // agent tab. Done AFTER the agent tab is confirmed so the session
-      // never drops to zero tabs (which would exit it). One-shot.
-      if (pendingOrphanTabId != null) {
-        await runCapture(buildZellijCloseTabArgs(session, pendingOrphanTabId));
-        pendingOrphanTabId = null;
-      }
+      // The fresh-mint default `Tab #1` is intentionally NOT reaped — it
+      // is the session's keepalive anchor (see `ensureSessionFor`).
+      // Reaping it let the fn-727 completion-reap empty the session to
+      // zero tabs and collapse it into a re-mint loop.
       return { ok: true };
     },
     async focusPane(
@@ -1037,17 +1011,11 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       name?: string,
     ): Promise<LaunchResult> {
       // Session-agnostic get-or-create + launch. Mirrors `launch`'s
-      // shape (ensure → new-tab → orphan reap → session-gone single
-      // retry) but parameterized by `targetSession` and with all
-      // session-state local — no `sessionReady` memo, no
-      // `pendingOrphanTabId` clobber. The orphan id captured here
-      // belongs to THIS mint; the per-call closure reaps it after
-      // the agent tab lands and discards the binding when the
-      // method returns. A pre-existing session returns
-      // `orphanTabId: null` from `ensureSessionFor`, so the reap is
-      // skipped — only freshly-minted sessions ever leave a default
-      // `Tab #1` to clean up.
-      let { orphanTabId } = await ensureSessionFor(targetSession);
+      // shape (ensure → new-tab → session-gone single retry) but
+      // parameterized by `targetSession` and with no `sessionReady`
+      // memo. The fresh-mint default `Tab #1` is kept as the session's
+      // keepalive anchor (see `ensureSessionFor`), never reaped.
+      await ensureSessionFor(targetSession);
       const args = buildZellijNewTabArgs(targetSession, cwd, argv, name);
       let res = await runCapture(args);
       // Session can die between ensure and new-tab (an OS reboot, a
@@ -1065,8 +1033,7 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         deps.noteLine(
           `# warn: zellij session "${targetSession}" vanished mid-ensureLaunched; re-minting and retrying new-tab`,
         );
-        const retry = await ensureSessionFor(targetSession);
-        orphanTabId = retry.orphanTabId;
+        await ensureSessionFor(targetSession);
         res = await runCapture(args);
       }
       if (res == null) {
@@ -1084,13 +1051,9 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         deps.noteLine(`# warn: ${error}`);
         return { ok: false, error };
       }
-      // Per-call orphan reap. Only fires when ensureSessionFor MINTED
-      // the session this call (pre-existing sessions return
-      // orphanTabId=null). Done after the agent tab is confirmed so
-      // the session never drops to zero tabs (which would exit it).
-      if (orphanTabId != null) {
-        await runCapture(buildZellijCloseTabArgs(targetSession, orphanTabId));
-      }
+      // The fresh-mint default `Tab #1` is intentionally NOT reaped — it
+      // is the session's keepalive anchor (see `ensureSessionFor`),
+      // matching the managed `launch` path.
       return { ok: true };
     },
     async reapSurfaces(
