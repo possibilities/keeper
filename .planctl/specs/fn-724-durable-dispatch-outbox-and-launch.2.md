@@ -51,5 +51,5 @@ list-panes; never throws on close failure.
 - [ ] `bun test test/exec-backend.test.ts test/autopilot-worker.test.ts` green.
 
 ## Done summary
-
+Added ExecBackend.reapSurfaces (enumerate panes via list-panes -a -j, close-pane those a predicate selects, never-throw) plus pure helpers collectPanesFromListJson/dispatchKeyForPane/closePaneIdForReap. Wired into the autopilot worker's set-paused (covers boot-pause) handler: aborts in-flight confirms via a pause-scoped controller, then reaps surfaces whose verb-prefixed name intersects the OPEN pending_dispatches set. Shared pure isReapCandidate gate ensures a discharged row (live worker) is never reaped.
 ## Evidence
