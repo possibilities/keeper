@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-726-fix-stale-confirmrunning-docstring",
   "bundles": [],
+  "closer_done_at": "2026-06-07T00:45:56.831388Z",
   "created_at": "2026-06-07T00:38:32.747735Z",
   "depends_on_epics": [
     "fn-724-durable-dispatch-outbox-and-launch"
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "fix stale confirmRunning docstring",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T00:38:32.747735Z"
+  "updated_at": "2026-06-07T00:45:56.831388Z"
 }
