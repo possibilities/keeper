@@ -42,5 +42,5 @@ still covers intra-cycle until step 3.
 - [ ] The SAFETY SEAM (cross-cycle only; confirmRunning still covers intra-cycle until step 3) is documented.
 
 ## Done summary
-
+Updated CLAUDE.md + README to frame pending_dispatches as the dispatch-pending readiness occupant (canonical occupant set + 4th facet bullet + replaced blind-window bullet) instead of a standalone reconcile suppression arm; documented the cross-cycle-only SAFETY SEAM with confirmRunning still covering intra-cycle.
 ## Evidence

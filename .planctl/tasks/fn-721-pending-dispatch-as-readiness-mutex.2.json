@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Document dispatch-pending occupant",
-  "updated_at": "2026-06-06T22:23:26.684328Z"
+  "updated_at": "2026-06-07T01:25:58.934695Z",
+  "worker_done_at": "2026-06-07T01:25:58.934695Z"
 }
