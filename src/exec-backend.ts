@@ -185,6 +185,23 @@ export interface ExecBackend {
     cwd: string,
     name?: string,
   ): Promise<LaunchResult>;
+  /**
+   * Session-bound. Enumerate every terminal pane in the managed session
+   * (`list-panes -a -j`) and `close-pane -p` each pane the `predicate`
+   * selects. Drives the fn-724 pause/boot-pause reap: cancel launch-window
+   * zellij surfaces so a pre-pause dispatch intent (zellij execs the new
+   * tab seconds-to-minutes late) cannot escape the pause boundary as a
+   * ghost worker.
+   *
+   * The `predicate` is the caller's safety gate — the autopilot worker
+   * passes "verb-prefixed name AND an OPEN `pending_dispatches` row",
+   * NEVER name-alone (a discharged row = a live worker, which must never
+   * be reaped; list-panes lags zellij reality). NEVER throws: a
+   * null/unparseable list-panes snapshot no-ops (`skippedNoSnapshot`),
+   * and a per-pane close failure logs via `noteLine` + continues to the
+   * next candidate. Returns a {@link ReapResult} count envelope.
+   */
+  reapSurfaces(predicate: (pane: ZellijPane) => boolean): Promise<ReapResult>;
 }
 
 /**
@@ -580,6 +597,144 @@ export function findPaneById(payload: unknown, paneId: string): FindPaneResult {
 }
 
 /**
+ * Walk a parsed `list-panes -a -j` payload and return EVERY terminal
+ * pane (plugin panes skipped — they carry ids in an unrelated namespace
+ * and never name a worker surface). Pure — exported for tests + the
+ * `reapSurfaces` predicate path (fn-724).
+ *
+ * Shares the exact array / object-of-arrays traversal `findPaneById`
+ * uses (zellij's JSON is `[pane, …]` in 0.44.3 but the legacy
+ * `{tab: [pane, …]}` shape is tolerated, lifting the tab name from the
+ * key as a fallback). The pane `id` is string-coerced but NOT
+ * `terminal_`-prefixed — that normalization is the close site's job
+ * (`closePaneIdForReap`), since `findPaneById`'s env-pane-id match wants
+ * the bare form while `close-pane -p` wants the prefixed form.
+ */
+export function collectPanesFromListJson(payload: unknown): ZellijPane[] {
+  const matches: ZellijPane[] = [];
+  const collect = (raw: unknown, tabNameHint?: string): void => {
+    if (raw == null || typeof raw !== "object") {
+      return;
+    }
+    const rec = raw as Record<string, unknown>;
+    if (rec.is_plugin === true) {
+      return;
+    }
+    const idRaw = rec.id;
+    const idStr =
+      typeof idRaw === "string"
+        ? idRaw
+        : typeof idRaw === "number"
+          ? String(idRaw)
+          : null;
+    if (idStr == null) {
+      return;
+    }
+    const tabNameField =
+      typeof rec.tab_name === "string" ? rec.tab_name : undefined;
+    matches.push({
+      id: idStr,
+      tab_name: tabNameField ?? tabNameHint ?? "",
+      tab_id: typeof rec.tab_id === "number" ? rec.tab_id : undefined,
+      tab_position:
+        typeof rec.tab_position === "number" ? rec.tab_position : undefined,
+      terminal_command:
+        typeof rec.terminal_command === "string"
+          ? rec.terminal_command
+          : rec.terminal_command === null
+            ? null
+            : undefined,
+      exited: typeof rec.exited === "boolean" ? rec.exited : undefined,
+    });
+  };
+  if (Array.isArray(payload)) {
+    for (const entry of payload) {
+      collect(entry);
+    }
+  } else if (payload != null && typeof payload === "object") {
+    for (const [key, value] of Object.entries(
+      payload as Record<string, unknown>,
+    )) {
+      if (Array.isArray(value)) {
+        for (const entry of value) {
+          collect(entry, key);
+        }
+      } else {
+        collect(value, key);
+      }
+    }
+  }
+  return matches;
+}
+
+/**
+ * Verb-prefixed dispatch-key matcher: `work::<id>` / `approve::<id>` /
+ * `close::<id>` — the `--name` the reconciler bakes into the worker argv
+ * (`claude … --name work::fn-1-x.1 …`) and the autopilot dedup key. The
+ * id run stops at the first whitespace / quote so the surrounding shell
+ * argv (`… --name work::id --plugin-dir …`) peels cleanly.
+ */
+const DISPATCH_KEY_RE = /(work|approve|close)::([^\s'"]+)/;
+
+/**
+ * Lift the `verb::id` dispatch key off a pane, or `null` when none is
+ * present. Pure — exported for tests. fn-724 reap candidate matcher.
+ *
+ * Post-fn-711 the zellij TAB is unnamed (`Tab #N`) — the `verb::id`
+ * lives ONLY in the pane's `terminal_command` (the `claude --name
+ * verb::id` arg). We scan `tab_name` FIRST (so a future named-tab launch
+ * path still matches) then fall back to `terminal_command`, returning
+ * the first `(work|approve|close)::<id>` token found. The match is the
+ * reap CANDIDATE filter only — the safety gate is the caller's open-
+ * `pending_dispatches` intersect, never the name alone (list-panes lags
+ * zellij reality, so a name match on a live worker MUST NOT authorize a
+ * close).
+ */
+export function dispatchKeyForPane(pane: ZellijPane): string | null {
+  const fromTab = pane.tab_name.match(DISPATCH_KEY_RE);
+  if (fromTab) {
+    return `${fromTab[1]}::${fromTab[2]}`;
+  }
+  const cmd = pane.terminal_command;
+  if (typeof cmd === "string") {
+    const fromCmd = cmd.match(DISPATCH_KEY_RE);
+    if (fromCmd) {
+      return `${fromCmd[1]}::${fromCmd[2]}`;
+    }
+  }
+  return null;
+}
+
+/**
+ * Normalize a `list-panes -a -j` pane `id` (a bare number in zellij
+ * 0.44.3, e.g. `"3"`) to the `close-pane -p` selector form
+ * (`terminal_<n>`). Idempotent — an already-prefixed id (`terminal_5`)
+ * passes through unchanged. Pure — exported for tests. `findPaneById`
+ * deliberately keeps the bare form (env-pane-id matching); the reap path
+ * is the one consumer that needs the prefixed close selector.
+ */
+export function closePaneIdForReap(id: string): string {
+  return /^terminal_/.test(id) ? id : `terminal_${id}`;
+}
+
+/**
+ * Outcome envelope from {@link ExecBackend.reapSurfaces}. `examined` is
+ * the count of terminal panes the list-panes snapshot returned;
+ * `reaped` / `failed` partition the panes the predicate selected by the
+ * close-pane exit. `skippedNoSnapshot` is `true` when list-panes
+ * returned null/unparseable (binary missing, empty output) — the whole
+ * reap no-ops rather than guessing. NEVER carries an error: every
+ * failure mode degrades into a count + a `noteLine`, so the caller can
+ * `await` it inside its no-self-heal try/catch without a throw escaping.
+ */
+export interface ReapResult {
+  readonly examined: number;
+  readonly reaped: number;
+  readonly failed: number;
+  readonly skippedNoSnapshot: boolean;
+}
+
+/**
  * Resolved tab coordinates for a known (session, paneId). Retained as a
  * pure type exported for the `list-panes -a -j` finder tests (the live
  * tab-resolver consumer was retired with the zellij feed in fn-710).
@@ -937,6 +1092,64 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         await runCapture(buildZellijCloseTabArgs(targetSession, orphanTabId));
       }
       return { ok: true };
+    },
+    async reapSurfaces(
+      predicate: (pane: ZellijPane) => boolean,
+    ): Promise<ReapResult> {
+      // No `ensureSession` — a reap against a session that doesn't exist
+      // has nothing to close (the ghost surfaces we'd reap can only exist
+      // in a live session). list-panes against a gone session returns a
+      // null/non-zero capture → skippedNoSnapshot, a clean no-op.
+      const listed = await runCapture(buildZellijListPanesAllJsonArgs(session));
+      if (listed == null || listed.exitCode !== 0) {
+        return { examined: 0, reaped: 0, failed: 0, skippedNoSnapshot: true };
+      }
+      const parsed = parseListPanesJson(listed.stdout);
+      if (parsed == null) {
+        // Empty / unparseable snapshot — leave every pane alone rather
+        // than guess (list-panes lags zellij reality; a bad parse could
+        // strand a live worker if we acted on it).
+        return { examined: 0, reaped: 0, failed: 0, skippedNoSnapshot: true };
+      }
+      const panes = collectPanesFromListJson(parsed);
+      let reaped = 0;
+      let failed = 0;
+      for (const pane of panes) {
+        if (!predicate(pane)) {
+          continue;
+        }
+        // One predicate-selected surface → one `close-pane -p
+        // terminal_<id>`. Closing the pane drops its tab too (the
+        // reconciler dedup invariant keeps one agent pane per tab, so a
+        // pane-scoped close lands the tab). Per-pane failures log +
+        // continue so one stuck close never strands the rest — the reap
+        // is best-effort cleanup, not a transaction.
+        const closeId = closePaneIdForReap(pane.id);
+        const res = await runCapture(
+          buildZellijClosePaneArgs(session, closeId),
+        );
+        if (res == null || res.exitCode !== 0) {
+          failed += 1;
+          const detail =
+            res == null
+              ? "ENOENT? binary missing"
+              : `exit ${res.exitCode}${res.stderr.trim().length > 0 ? `: ${res.stderr.trim()}` : ""}`;
+          deps.noteLine(
+            `# warn: reap close-pane ${closeId} (tab="${pane.tab_name}") failed (${detail})`,
+          );
+          continue;
+        }
+        reaped += 1;
+        deps.noteLine(
+          `# reap: closed pane ${closeId} (tab="${pane.tab_name}", exited=${pane.exited ?? "?"})`,
+        );
+      }
+      return {
+        examined: panes.length,
+        reaped,
+        failed,
+        skippedNoSnapshot: false,
+      };
     },
   };
 }

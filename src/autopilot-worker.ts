@@ -107,7 +107,11 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { openDb } from "./db";
-import { resolveExecBackend } from "./exec-backend";
+import {
+  dispatchKeyForPane,
+  resolveExecBackend,
+  type ZellijPane,
+} from "./exec-backend";
 import {
   computeReadiness,
   type PendingDispatch,
@@ -285,6 +289,31 @@ export function buildWorkerCommand(
 /** Compose the canonical `${verb}::${id}` key. */
 export function dispatchKey(verb: Verb, id: string): DispatchKey {
   return `${verb}::${id}`;
+}
+
+/**
+ * fn-724 — pure reap-candidate predicate for `ExecBackend.reapSurfaces`.
+ * Exported so the worker's pause handler and the test suite share the
+ * EXACT safety gate (the highest-blast-radius decision in this epic).
+ *
+ * A pane is a reap candidate IFF it carries a `(work|approve|close)::<id>`
+ * dispatch key (lifted from `tab_name` / `terminal_command` by
+ * `dispatchKeyForPane`) AND that key is in `openPendingKeys` — the set of
+ * `${verb}::${id}` for every row still present in `pending_dispatches`.
+ *
+ * SAFETY: `pending_dispatches` rows discharge on `SessionStart` (the
+ * reducer DELETEs the row when the worker binds), so a key MISSING from
+ * `openPendingKeys` means a LIVE worker — its pane is NEVER reaped. The
+ * name match alone never authorizes a close; `list-panes` lags zellij
+ * reality and a name-only reap would kill live workers. A pane with no
+ * dispatch key (a human's ad-hoc tab) is also never touched.
+ */
+export function isReapCandidate(
+  openPendingKeys: Set<DispatchKey>,
+  pane: ZellijPane,
+): boolean {
+  const key = dispatchKeyForPane(pane);
+  return key != null && openPendingKeys.has(key);
 }
 
 /**
@@ -1349,6 +1378,15 @@ function main(): void {
   // liveDispatches starts cold. The worker-scoped abort controller aborts
   // every in-flight confirm sleep on shutdown.
   const shutdownController = new AbortController();
+  // fn-724 — pause-scoped abort. `driveCycle` passes THIS signal (not
+  // `shutdownController.signal` directly) to `runReconcileCycle`, so a
+  // `set-paused {paused:true}` can abort every in-flight `confirmRunning`
+  // poll WITHOUT marking the worker shut down — a confirm that survived
+  // the pause would keep polling a pane the reap below just closed. The
+  // controller is REPLACED after each pause-abort (an aborted signal stays
+  // aborted forever) so the next play-edge cycle runs against a fresh,
+  // un-aborted signal. Shutdown aborts this one too (see the shutdown arm).
+  let cycleController = new AbortController();
   const liveDispatches = new Map<DispatchKey, LiveDispatch>();
   let shutdown = false;
   // fn-724 — durable `dispatched-ack` correlation. `emitDispatched` posts a
@@ -1375,12 +1413,22 @@ function main(): void {
   // assigned once `driveCycle` is constructed below; it stays a no-op until
   // then (no message can arrive before `main()` finishes synchronous setup).
   let requestCycle: () => void = () => {};
+  // fn-724 — late-bound pause reap. Assigned once `backend` exists below;
+  // stays a no-op until then (no message can arrive before `main()`
+  // finishes synchronous setup). On a `set-paused {paused:true}` the
+  // handler aborts in-flight confirms then fires this to close any
+  // launch-window ghost surface still parked in the managed session.
+  let reapLaunchWindowSurfaces: () => void = () => {};
 
   parentPort.on("message", (msg: IncomingMessage | undefined) => {
     if (!msg) return;
     if (msg.type === "shutdown") {
       shutdown = true;
       shutdownController.abort();
+      // Abort the pause-scoped signal too so any in-flight confirm using
+      // it stops polling on teardown (it would otherwise wait on the
+      // ceiling before noticing shutdown).
+      cycleController.abort();
       // Reject every parked ack-wait so an in-flight `confirmRunning` that
       // launched its `emitDispatched` request before shutdown resolves
       // promptly (as `"aborted"`) instead of hanging until its timeout.
@@ -1409,6 +1457,20 @@ function main(): void {
       // instead of waiting for the next incidental `data_version` pulse.
       if (wasPaused && !msg.paused) {
         requestCycle();
+      }
+      // Pause edge (fn-724) — covers boot-pause too: the daemon's
+      // boot-append re-arm relays `set-paused {paused:true}` through this
+      // same handler. Abort every in-flight confirm (so a confirm doesn't
+      // keep polling a surface we're about to close), swap in a fresh
+      // pause-scoped controller for the next play cycle, then reap any
+      // launch-window ghost surface still parked in the managed session.
+      // Guarded on `paused === true` regardless of prior state (a
+      // redundant pause re-issue is harmless: the abort/reap are
+      // idempotent no-ops when nothing is in flight / no ghost exists).
+      if (msg.paused) {
+        cycleController.abort();
+        cycleController = new AbortController();
+        reapLaunchWindowSurfaces();
       }
       return;
     }
@@ -1551,6 +1613,59 @@ function main(): void {
     recordTimeoutBackstop,
   };
 
+  // fn-724 — pause/boot-pause launch-window reap. Close zellij surfaces
+  // for a pre-pause dispatch intent (zellij execs the queued `new-tab`
+  // seconds-to-minutes late) so it can't escape the pause boundary as a
+  // ghost worker. SAFETY (highest blast radius): the candidate predicate
+  // intersects the verb-prefixed pane name with the OPEN
+  // `pending_dispatches` set — a row already discharged by SessionStart =
+  // a LIVE worker = NEVER reaped. The name match alone never authorizes a
+  // close (list-panes lags zellij reality). Bound here now that `backend`
+  // exists; the message handler above calls it on the pause edge AFTER
+  // aborting in-flight confirms.
+  //
+  // The whole body is try/caught — a reap throw must NOT propagate (it
+  // would crash the worker and bounce the daemon, per no-self-heal).
+  // `backend.reapSurfaces` is itself never-throw; this catch is the
+  // belt-and-suspenders backstop for the snapshot query / predicate.
+  reapLaunchWindowSurfaces = (): void => {
+    void (async (): Promise<void> => {
+      try {
+        // Open-pending set: every row currently in `pending_dispatches`
+        // (SessionStart DELETEs a row on bind, so a present row is an
+        // OPEN, not-yet-bound dispatch). Keyed `${verb}::${id}` to match
+        // `dispatchKeyForPane`.
+        const openKeys = new Set<DispatchKey>();
+        for (const row of db
+          .query("SELECT verb, id FROM pending_dispatches")
+          .all() as Array<{ verb: unknown; id: unknown }>) {
+          if (typeof row.verb === "string" && typeof row.id === "string") {
+            openKeys.add(dispatchKey(row.verb as Verb, row.id));
+          }
+        }
+        // Nothing pending → no launch-window ghost to reap; skip the
+        // list-panes spawn entirely.
+        if (openKeys.size === 0) {
+          return;
+        }
+        // CANDIDATE = verb-prefixed name AND an OPEN pending row. A
+        // discharged (missing) row means SessionStart bound a live worker
+        // — never reap it. The predicate is the shared pure
+        // `isReapCandidate` so the worker + tests pin the same gate.
+        const result = await backend.reapSurfaces((pane) =>
+          isReapCandidate(openKeys, pane),
+        );
+        if (result.reaped > 0 || result.failed > 0) {
+          console.error(
+            `[autopilot-worker] pause reap: examined=${result.examined} reaped=${result.reaped} failed=${result.failed}`,
+          );
+        }
+      } catch (err) {
+        console.error("[autopilot-worker] pause reap threw (non-fatal):", err);
+      }
+    })();
+  };
+
   // Single-flight reconcile drive. `watchLoop` fires this callback on
   // every `data_version` pulse; if a cycle is already running we set
   // `wakePending` and the running cycle loops once more after it finishes
@@ -1579,7 +1694,11 @@ function main(): void {
           state,
           liveDispatches,
           shell,
-          shutdownController.signal,
+          // fn-724: the pause-scoped signal — a `set-paused {paused:true}`
+          // aborts every in-flight confirm here (and shutdown aborts it
+          // too). Captured per-cycle so a mid-cycle pause-abort + fresh
+          // controller doesn't retroactively un-abort this run.
+          cycleController.signal,
           deps,
         );
       } while (wakePending && !shutdown);

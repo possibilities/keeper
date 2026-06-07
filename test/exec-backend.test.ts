@@ -26,15 +26,19 @@ import {
   buildZellijListSessionsArgs,
   buildZellijListTabsArgs,
   buildZellijNewTabArgs,
+  closePaneIdForReap,
+  collectPanesFromListJson,
   createZellijBackend,
   DEFAULT_EXEC_BACKEND,
   DEFAULT_ZELLIJ_SESSION,
+  dispatchKeyForPane,
   execBackendEnvMeta,
   findPaneById,
   firstTabIdFromListTabs,
   parseListPanesJson,
   resolveExecBackend,
   type SpawnFn,
+  type ZellijPane,
 } from "../src/exec-backend";
 
 /**
@@ -1320,4 +1324,264 @@ test("ExecBackend.ensureLaunched: empty `name` string still omits --name (defens
   const newTab = calls.find((c) => c[1] === "--session" && c[4] === "new-tab");
   expect(newTab).toBeDefined();
   expect(newTab).not.toContain("--name");
+});
+
+// ---------------------------------------------------------------------------
+// fn-724 reap primitives: collectPanesFromListJson / dispatchKeyForPane /
+// closePaneIdForReap / ExecBackend.reapSurfaces
+// ---------------------------------------------------------------------------
+
+test("collectPanesFromListJson: lifts every terminal pane, skips plugins, array shape", () => {
+  // zellij 0.44.3 ships a top-level array; plugin panes carry ids in an
+  // unrelated namespace and must be skipped.
+  const payload = parseListPanesJson(
+    JSON.stringify([
+      { id: 0, tab_name: "Tab #1", is_plugin: true },
+      { id: 3, tab_name: "Tab #4", exited: false, terminal_command: "claude" },
+      { id: 5, tab_name: "Tab #4", exited: true, terminal_command: null },
+    ]),
+  );
+  const panes = collectPanesFromListJson(payload);
+  expect(panes.map((p) => p.id)).toEqual(["3", "5"]);
+  expect(panes[0]?.tab_name).toBe("Tab #4");
+  expect(panes[0]?.exited).toBe(false);
+  expect(panes[1]?.exited).toBe(true);
+  expect(panes[1]?.terminal_command).toBeNull();
+});
+
+test("collectPanesFromListJson: object-of-arrays shape lifts tab name from key, empty → []", () => {
+  const payload = parseListPanesJson(
+    JSON.stringify({ "Tab #2": [{ id: 9, terminal_command: "sh" }] }),
+  );
+  const panes = collectPanesFromListJson(payload);
+  expect(panes).toHaveLength(1);
+  expect(panes[0]?.id).toBe("9");
+  expect(panes[0]?.tab_name).toBe("Tab #2");
+  // null / non-object payloads → []
+  expect(collectPanesFromListJson(null)).toEqual([]);
+  expect(collectPanesFromListJson(parseListPanesJson(""))).toEqual([]);
+  expect(collectPanesFromListJson(42)).toEqual([]);
+});
+
+test("dispatchKeyForPane: lifts verb::id from terminal_command (fn-711 unnamed tab)", () => {
+  // Post-fn-711 the TAB is unnamed (`Tab #N`); the verb::id lives only in
+  // the `claude --name verb::id` arg inside terminal_command.
+  const pane: ZellijPane = {
+    id: "3",
+    tab_name: "Tab #4",
+    exited: false,
+    terminal_command:
+      "/bin/zsh -l -i -c cd /repo && claude --model sonnet --name work::fn-724-x.2 --plugin-dir /p '/plan:work fn-724-x.2'",
+  };
+  expect(dispatchKeyForPane(pane)).toBe("work::fn-724-x.2");
+});
+
+test("dispatchKeyForPane: tab_name takes precedence; approve/close verbs match; none → null", () => {
+  // A named-tab launch path (future / restore) still matches via tab_name.
+  expect(
+    dispatchKeyForPane({
+      id: "1",
+      tab_name: "approve::fn-1-foo.3",
+      terminal_command: "claude --name close::other.1",
+    }),
+  ).toBe("approve::fn-1-foo.3");
+  // close:: verb
+  expect(
+    dispatchKeyForPane({
+      id: "2",
+      tab_name: "Tab #1",
+      terminal_command: "claude --name close::fn-2-bar.1 '/plan:close ...'",
+    }),
+  ).toBe("close::fn-2-bar.1");
+  // No verb-prefixed token anywhere → null (a human's ad-hoc pane).
+  expect(
+    dispatchKeyForPane({
+      id: "7",
+      tab_name: "Tab #9",
+      terminal_command: "/bin/zsh -l -i",
+    }),
+  ).toBeNull();
+  // Missing terminal_command, plain tab → null.
+  expect(dispatchKeyForPane({ id: "8", tab_name: "Tab #3" })).toBeNull();
+});
+
+test("closePaneIdForReap: prefixes a bare numeric id, idempotent on terminal_<n>", () => {
+  expect(closePaneIdForReap("3")).toBe("terminal_3");
+  expect(closePaneIdForReap("terminal_5")).toBe("terminal_5");
+});
+
+/**
+ * Build a spawn stub for the reap path: `list-panes -a -j` returns the
+ * canned JSON, `close-pane -p <id>` returns the canned exit (default 0).
+ * Records every spawn into `calls`.
+ */
+function makeReapSpawnStub(
+  listPanesJson: string,
+  closeExitById: Record<string, number>,
+  calls: string[][],
+  opts: { listExit?: number } = {},
+): SpawnFn {
+  return (cmd, _options) => {
+    calls.push([...cmd]);
+    const reply = (stdout: string, exitCode = 0, stderr = "") => ({
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(stdout).body,
+      stderr: new Response(stderr).body,
+    });
+    if (cmd[4] === "list-panes") {
+      return reply(listPanesJson, opts.listExit ?? 0);
+    }
+    if (cmd[4] === "close-pane") {
+      const closeId = cmd[6] ?? "";
+      const ex = closeExitById[closeId] ?? 0;
+      return reply("", ex, ex === 0 ? "" : "pane gone");
+    }
+    return reply("");
+  };
+}
+
+test("reapSurfaces: closes ONLY predicate-selected panes via close-pane -p terminal_<id>", async () => {
+  const calls: string[][] = [];
+  // Two worker surfaces (work::A, work::B) and one human pane.
+  const json = JSON.stringify([
+    {
+      id: 3,
+      tab_name: "Tab #4",
+      exited: true,
+      terminal_command: "claude --name work::A",
+    },
+    {
+      id: 5,
+      tab_name: "Tab #5",
+      exited: false,
+      terminal_command: "claude --name work::B",
+    },
+    { id: 9, tab_name: "Tab #6", terminal_command: "/bin/zsh -l -i" },
+  ]);
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: makeReapSpawnStub(json, {}, calls),
+  });
+  // Predicate selects only work::A (the OPEN-pending intersect the
+  // autopilot worker applies; here modeled as a name-set membership).
+  const open = new Set(["work::A"]);
+  const result = await backend.reapSurfaces((pane) => {
+    const key = dispatchKeyForPane(pane);
+    return key != null && open.has(key);
+  });
+  expect(result.examined).toBe(3);
+  expect(result.reaped).toBe(1);
+  expect(result.failed).toBe(0);
+  expect(result.skippedNoSnapshot).toBe(false);
+  // Exactly one close-pane, targeting terminal_3 (the bare id 3 → prefixed).
+  const closes = calls.filter((c) => c[4] === "close-pane");
+  expect(closes).toHaveLength(1);
+  expect(closes[0]).toEqual([
+    "zellij",
+    "--session",
+    "autopilot",
+    "action",
+    "close-pane",
+    "-p",
+    "terminal_3",
+  ]);
+});
+
+test("reapSurfaces: LIVE-worker guard — a pane whose row discharged is NEVER closed", async () => {
+  // Safety pin (highest blast radius): work::B's pending row already
+  // discharged on SessionStart (NOT in the open set), so even though its
+  // pane is live in list-panes, the predicate excludes it. Only work::A
+  // (still open) is reaped — never the live worker.
+  const calls: string[][] = [];
+  const json = JSON.stringify([
+    { id: 3, tab_name: "Tab #4", terminal_command: "claude --name work::A" },
+    { id: 5, tab_name: "Tab #5", terminal_command: "claude --name work::B" },
+  ]);
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: makeReapSpawnStub(json, {}, calls),
+  });
+  const open = new Set(["work::A"]); // work::B discharged → live worker
+  const result = await backend.reapSurfaces((pane) => {
+    const key = dispatchKeyForPane(pane);
+    return key != null && open.has(key);
+  });
+  expect(result.reaped).toBe(1);
+  const closes = calls.filter((c) => c[4] === "close-pane");
+  expect(closes).toHaveLength(1);
+  expect(closes[0]?.[6]).toBe("terminal_3");
+  // work::B (terminal_5) was NEVER closed.
+  expect(closes.some((c) => c[6] === "terminal_5")).toBe(false);
+});
+
+test("reapSurfaces: empty/unparseable list-panes → skippedNoSnapshot, no close, no throw", async () => {
+  for (const out of ["", "   \n ", "not json"]) {
+    const calls: string[][] = [];
+    const backend = createZellijBackend({
+      noteLine: () => {},
+      session: "autopilot",
+      spawn: makeReapSpawnStub(out, {}, calls),
+    });
+    const result = await backend.reapSurfaces(() => true);
+    expect(result.skippedNoSnapshot).toBe(true);
+    expect(result.reaped).toBe(0);
+    expect(calls.some((c) => c[4] === "close-pane")).toBe(false);
+  }
+});
+
+test("reapSurfaces: non-zero list-panes exit → skippedNoSnapshot (no guess)", async () => {
+  const calls: string[][] = [];
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn: makeReapSpawnStub("[]", {}, calls, { listExit: 1 }),
+  });
+  const result = await backend.reapSurfaces(() => true);
+  expect(result.skippedNoSnapshot).toBe(true);
+  expect(calls.some((c) => c[4] === "close-pane")).toBe(false);
+});
+
+test("reapSurfaces: per-pane close failure logs + continues, never throws", async () => {
+  const notes: string[] = [];
+  const calls: string[][] = [];
+  const json = JSON.stringify([
+    { id: 3, tab_name: "Tab #4", terminal_command: "claude --name work::A" },
+    { id: 5, tab_name: "Tab #5", terminal_command: "claude --name work::B" },
+  ]);
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    // terminal_3 close fails (exit 1); terminal_5 succeeds.
+    spawn: makeReapSpawnStub(json, { terminal_3: 1 }, calls),
+  });
+  const result = await backend.reapSurfaces(() => true);
+  // Did not throw; partitioned into one failed + one reaped.
+  expect(result.examined).toBe(2);
+  expect(result.failed).toBe(1);
+  expect(result.reaped).toBe(1);
+  // Both closes were attempted (the failure did not abort the loop).
+  const closes = calls.filter((c) => c[4] === "close-pane");
+  expect(closes.map((c) => c[6]).sort()).toEqual(["terminal_3", "terminal_5"]);
+  // A warn line was emitted for the failed close.
+  expect(
+    notes.some((n) => n.includes("terminal_3") && n.includes("failed")),
+  ).toBe(true);
+});
+
+test("reapSurfaces: list-panes ENOENT (spawn throws) → skippedNoSnapshot, no throw", async () => {
+  const calls: string[][] = [];
+  const spawn: SpawnFn = (cmd) => {
+    calls.push([...cmd]);
+    throw new Error("ENOENT: zellij missing");
+  };
+  const backend = createZellijBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  const result = await backend.reapSurfaces(() => true);
+  expect(result.skippedNoSnapshot).toBe(true);
+  expect(result.reaped).toBe(0);
 });

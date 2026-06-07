@@ -40,6 +40,7 @@ import {
   type DispatchFailedPayload,
   type FoundJob,
   isOccupyingJob,
+  isReapCandidate,
   type LaunchResult,
   type LiveDispatch,
   type ReconcileSnapshot,
@@ -49,6 +50,7 @@ import {
   verbForVerdict,
 } from "../src/autopilot-worker";
 import { PENDING_DISPATCH_TTL_MS } from "../src/daemon";
+import type { ZellijPane } from "../src/exec-backend";
 import {
   computeReadiness,
   type PendingDispatch,
@@ -1377,4 +1379,86 @@ test("buildLaunchArgv wraps the worker command in [shell, -l, -i, -c, body]", ()
   expect(argv[3]).toBe("-c");
   expect(argv[4]).toContain("claude --name work::x");
   expect(argv[4]).toContain("; exec /bin/zsh -l -i");
+});
+
+// ---------------------------------------------------------------------------
+// fn-724 — isReapCandidate (pause/boot-pause launch-window reap safety gate)
+// ---------------------------------------------------------------------------
+
+function pane(overrides: Partial<ZellijPane> & { id: string }): ZellijPane {
+  return { tab_name: "Tab #1", ...overrides };
+}
+
+test("isReapCandidate: verb-prefixed name AND an OPEN pending row → reap", () => {
+  // work::A still has an open pending_dispatches row (launch-window ghost
+  // the autopilot intended pre-pause); its surface IS a reap candidate.
+  const open = new Set(["work::fn-724-x.2"]);
+  expect(
+    isReapCandidate(
+      open,
+      pane({
+        id: "3",
+        tab_name: "Tab #4",
+        terminal_command: "claude --name work::fn-724-x.2 '/plan:work ...'",
+      }),
+    ),
+  ).toBe(true);
+});
+
+test("isReapCandidate: LIVE worker (discharged row) is NEVER a candidate — safety pin", () => {
+  // SessionStart already discharged work::B's pending row (it bound a live
+  // worker), so work::B is NOT in the open set. Even though its pane is
+  // live in list-panes and carries a verb-prefixed name, it must NEVER be
+  // reaped. This is the highest-blast-radius guard in the epic.
+  const open = new Set(["work::A"]); // work::B discharged → live
+  const liveWorkerPane = pane({
+    id: "5",
+    tab_name: "Tab #5",
+    exited: false,
+    terminal_command: "claude --name work::B '/plan:work B'",
+  });
+  expect(isReapCandidate(open, liveWorkerPane)).toBe(false);
+  // The still-open sibling IS a candidate, proving the set membership —
+  // not pane state — is what gates the close.
+  expect(
+    isReapCandidate(
+      open,
+      pane({ id: "3", terminal_command: "claude --name work::A" }),
+    ),
+  ).toBe(true);
+});
+
+test("isReapCandidate: empty open set never reaps (nothing pending → no ghost)", () => {
+  const open = new Set<string>();
+  expect(
+    isReapCandidate(
+      open,
+      pane({ id: "3", terminal_command: "claude --name work::A" }),
+    ),
+  ).toBe(false);
+});
+
+test("isReapCandidate: pane with no verb-prefixed key (human tab) is never a candidate", () => {
+  // A non-worker pane carries no work::/approve::/close:: token — even
+  // with a non-empty open set it must never match.
+  const open = new Set(["work::A"]);
+  expect(
+    isReapCandidate(
+      open,
+      pane({ id: "9", tab_name: "Tab #9", terminal_command: "/bin/zsh -l -i" }),
+    ),
+  ).toBe(false);
+});
+
+test("isReapCandidate: approve:: and close:: surfaces match when open", () => {
+  const open = new Set(["approve::fn-1-foo.3", "close::fn-2-bar"]);
+  expect(
+    isReapCandidate(open, pane({ id: "1", tab_name: "approve::fn-1-foo.3" })),
+  ).toBe(true);
+  expect(
+    isReapCandidate(
+      open,
+      pane({ id: "2", terminal_command: "claude --name close::fn-2-bar" }),
+    ),
+  ).toBe(true);
 });
