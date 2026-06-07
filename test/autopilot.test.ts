@@ -40,7 +40,6 @@ import {
 import { computeReadiness } from "../src/readiness";
 import type {
   DeadLetter,
-  EmbeddedJob,
   Epic,
   GitStatus,
   Job,
@@ -92,27 +91,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
   };
 }
 
-function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
-  return {
-    job_id: "session-1",
-    plan_verb: "work",
-    state: "working",
-    title: null,
-    created_at: 0,
-    updated_at: 0,
-    last_event_id: 0,
-    last_api_error_at: null,
-    last_api_error_kind: null,
-    last_input_request_at: null,
-    last_input_request_kind: null,
-    last_permission_prompt_at: null,
-    last_permission_prompt_kind: null,
-    git_dirty_count: 0,
-    git_unattributed_to_live_count: 0,
-    git_orphan_count: 0,
-    ...overrides,
-  };
-}
 
 function makeJob(overrides: Partial<Job>): Job {
   return {
