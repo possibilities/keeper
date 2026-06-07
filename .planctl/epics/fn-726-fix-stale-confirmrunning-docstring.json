@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-726-fix-stale-confirmrunning-docstring",
   "bundles": [],
   "closer_done_at": "2026-06-07T00:45:56.831388Z",
@@ -17,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T00:45:56.831388Z"
+  "updated_at": "2026-06-07T00:47:04.795793Z"
 }
