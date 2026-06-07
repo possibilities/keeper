@@ -40,7 +40,9 @@ import {
 import { openDb } from "../src/db";
 import { parseDeadLetterLine } from "../src/dead-letter";
 import {
+  extractPlanctlInvocation,
   extractSkillName,
+  extractToolUseId,
   planVerbRefFromSpawnName,
   slashCommandFromPrompt,
 } from "../src/derivers";
@@ -738,48 +740,20 @@ test("hook writes slash_command on UserPromptSubmit with /plan:work prompt", asy
   }
 });
 
-test("hook leaves slash_command NULL on UserPromptSubmit with free-text prompt", async () => {
-  const code = await fireViaLauncher("my-session", {
-    hook_event_name: "UserPromptSubmit",
-    session_id: "sess-plain",
-    cwd: "/tmp/work",
-    prompt: "just a free-text prompt without a leading slash",
-  });
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT slash_command FROM events WHERE session_id = 'sess-plain'",
-      )
-      .get() as { slash_command: string | null };
-    expect(row.slash_command).toBeNull();
-  } finally {
-    db.close();
-  }
+// The slash_command NULL cases below are deriver-input mappings, not wiring:
+// the hook lifts `data.prompt` straight into `slashCommandFromPrompt` on
+// UserPromptSubmit (the wiring itself is proven by the kept spawn above).
+// Re-proving the deriver's null-on-non-command behavior through a subprocess
+// "tests nothing" the in-process call doesn't — convert to a direct deriver
+// assertion on the exact field the hook reads (fn-722 task .5 thinning).
+test("slash_command stays NULL for a free-text UserPromptSubmit prompt", () => {
+  expect(
+    slashCommandFromPrompt("just a free-text prompt without a leading slash"),
+  ).toBeNull();
 });
 
-test("hook leaves slash_command NULL on UserPromptSubmit with /Users/... path prompt", async () => {
-  const code = await fireViaLauncher("my-session", {
-    hook_event_name: "UserPromptSubmit",
-    session_id: "sess-path",
-    cwd: "/tmp/work",
-    prompt: "/Users/mike/code/keeper",
-  });
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT slash_command FROM events WHERE session_id = 'sess-path'",
-      )
-      .get() as { slash_command: string | null };
-    expect(row.slash_command).toBeNull();
-  } finally {
-    db.close();
-  }
+test("slash_command stays NULL for a /Users/... path-shaped prompt", () => {
+  expect(slashCommandFromPrompt("/Users/mike/code/keeper")).toBeNull();
 });
 
 test("hook writes skill_name on PreToolUse + Skill", async () => {
@@ -806,25 +780,14 @@ test("hook writes skill_name on PreToolUse + Skill", async () => {
   }
 });
 
-test("hook leaves skill_name NULL on PreToolUse + non-Skill tool", async () => {
-  const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PreToolUse",
-    session_id: "sess-bash",
-    cwd: "/tmp/work",
-    tool_name: "Bash",
-    tool_input: { command: "ls" },
-  });
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare("SELECT skill_name FROM events WHERE session_id = 'sess-bash'")
-      .get() as { skill_name: string | null };
-    expect(row.skill_name).toBeNull();
-  } finally {
-    db.close();
-  }
+// The non-Skill negative is a deriver gate, not wiring (the PreToolUse:Skill
+// wiring is proven by the kept spawn above). `extractSkillName` already gates
+// on the tool name in-process — assert it directly on the same fields the hook
+// reads rather than paying a subprocess to re-prove the null path.
+test("skill_name stays NULL on a PreToolUse non-Skill tool", () => {
+  expect(
+    extractSkillName("PreToolUse", "Bash", { tool_input: { command: "ls" } }),
+  ).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -878,115 +841,45 @@ test("hook writes planctl_* columns on PostToolUse:Bash with a planctl envelope 
   }
 });
 
-test("hook writes planctl_* columns on PostToolUse:Bash with a planctl read-only verb on a task ref", async () => {
-  // Read-only verb on a task-form ref: subject_present=0, epic_id + task_id
-  // both stamped. Exercises the `parsePlanRef` task-form split and the
-  // envelope's null-subject → subject_present=0 path.
+// The deriver-shape cases below (task-ref split, no-envelope, PreToolUse gate)
+// exercise `extractPlanctlInvocation` directly — the kept epic-create spawn
+// above proves the PostToolUse:Bash → columns wiring end-to-end, so re-spawning
+// per shape only re-runs the deriver inside a subprocess. Convert to in-process
+// calls of the exported deriver over the exact payload shapes the hook lifts
+// (fn-722 task .5 thinning; deriver internals also covered by derivers.test.ts).
+test("extractPlanctlInvocation splits a read-only verb on a task-form ref", () => {
+  // subject_present=false, epic_id + task_id both stamped via parsePlanRef.
   const stdout = JSON.stringify({
-    planctl_invocation: {
-      op: "cat",
-      target: "fn-42-foo.3",
-      subject: null,
-    },
+    planctl_invocation: { op: "cat", target: "fn-42-foo.3", subject: null },
   });
-  const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PostToolUse",
-    session_id: "sess-planctl-cat",
-    cwd: "/tmp/work",
-    tool_name: "Bash",
-    tool_input: { command: "planctl cat fn-42-foo.3" },
+  const got = extractPlanctlInvocation("PostToolUse", "Bash", {
     tool_response: { stdout },
   });
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        `SELECT planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-                planctl_subject_present
-           FROM events WHERE session_id = 'sess-planctl-cat'`,
-      )
-      .get() as {
-      planctl_op: string | null;
-      planctl_target: string | null;
-      planctl_epic_id: string | null;
-      planctl_task_id: string | null;
-      planctl_subject_present: number | null;
-    };
-    expect(row.planctl_op).toBe("cat");
-    expect(row.planctl_target).toBe("fn-42-foo.3");
-    expect(row.planctl_epic_id).toBe("fn-42-foo");
-    expect(row.planctl_task_id).toBe("fn-42-foo.3");
-    expect(row.planctl_subject_present).toBe(0);
-  } finally {
-    db.close();
-  }
+  expect(got).not.toBeNull();
+  expect(got?.op).toBe("cat");
+  expect(got?.target).toBe("fn-42-foo.3");
+  expect(got?.epic_id).toBe("fn-42-foo");
+  expect(got?.task_id).toBe("fn-42-foo.3");
+  expect(got?.subject_present).toBe(false);
 });
 
-test("hook leaves planctl_* columns NULL on PostToolUse:Bash whose stdout carries no envelope", async () => {
-  // Bash command whose stdout is plain text (no planctl_invocation key) —
-  // all five planctl_* columns must stay NULL so the partial-index
-  // predicate keeps the index small.
-  const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PostToolUse",
-    session_id: "sess-bash-ls",
-    cwd: "/tmp/work",
-    tool_name: "Bash",
-    tool_input: { command: "ls -la /tmp" },
-    tool_response: { stdout: "drwxr-xr-x  ... /tmp\n" },
-  });
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        `SELECT planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-                planctl_subject_present
-           FROM events WHERE session_id = 'sess-bash-ls'`,
-      )
-      .get() as {
-      planctl_op: string | null;
-      planctl_target: string | null;
-      planctl_epic_id: string | null;
-      planctl_task_id: string | null;
-      planctl_subject_present: number | null;
-    };
-    expect(row.planctl_op).toBeNull();
-    expect(row.planctl_target).toBeNull();
-    expect(row.planctl_epic_id).toBeNull();
-    expect(row.planctl_task_id).toBeNull();
-    expect(row.planctl_subject_present).toBeNull();
-  } finally {
-    db.close();
-  }
+test("extractPlanctlInvocation returns null when stdout carries no envelope", () => {
+  // Plain-text Bash stdout → all planctl_* columns stay NULL (selective index).
+  expect(
+    extractPlanctlInvocation("PostToolUse", "Bash", {
+      tool_response: { stdout: "drwxr-xr-x  ... /tmp\n" },
+    }),
+  ).toBeNull();
 });
 
-test("hook leaves planctl_* columns NULL on PreToolUse:Bash even with a planctl command", async () => {
-  // PreToolUse:Bash with a planctl command must leave the columns NULL —
-  // the deriver is gated on `hookEvent === 'PostToolUse'`. This is the
-  // negative case for the new gate: only PostToolUse carries the envelope.
-  const code = await fireViaLauncher("my-session", {
-    hook_event_name: "PreToolUse",
-    session_id: "sess-planctl-pre",
-    cwd: "/tmp/work",
-    tool_name: "Bash",
-    tool_input: { command: "planctl epic-create fn-1-bar" },
-  });
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT planctl_op FROM events WHERE session_id = 'sess-planctl-pre'",
-      )
-      .get() as { planctl_op: string | null };
-    expect(row.planctl_op).toBeNull();
-  } finally {
-    db.close();
-  }
+test("extractPlanctlInvocation is gated to PostToolUse (PreToolUse → null)", () => {
+  // PreToolUse:Bash carries no tool_response envelope — the gate keeps the
+  // columns NULL even on a planctl command.
+  expect(
+    extractPlanctlInvocation("PreToolUse", "Bash", {
+      tool_input: { command: "planctl epic-create fn-1-bar" },
+    }),
+  ).toBeNull();
 });
 
 test("hook exits 0 on PostToolUse:Bash with a malformed tool_response.stdout (defensive)", async () => {
@@ -1108,29 +1001,13 @@ test("PostToolUse:Agent with tool_use_id populates events.tool_use_id", async ()
   }
 });
 
-test("An event without tool_use_id leaves events.tool_use_id NULL", async () => {
-  // SessionStart / UserPromptSubmit / Notification payloads don't carry
-  // tool_use_id; the column stays NULL so the partial-index
-  // `WHERE tool_use_id IS NOT NULL` predicate keeps the index selective.
-  const code = await fireViaLauncher("any-session", {
-    hook_event_name: "UserPromptSubmit",
-    session_id: "sess-ups-notuid",
-    cwd: "/tmp",
-    prompt: "hi",
-  });
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT tool_use_id FROM events WHERE session_id = 'sess-ups-notuid'",
-      )
-      .get() as { tool_use_id: string | null } | null;
-    expect(row?.tool_use_id).toBeNull();
-  } finally {
-    db.close();
-  }
+// The kept PreToolUse:Bash + PostToolUse:Agent spawns above prove the
+// tool_use_id wiring (and the subagent_agent_id bridge cross-stamp). The
+// no-field case is a pure `extractToolUseId` shape check — a payload without
+// the field yields null so the partial-index stays selective. Convert to an
+// in-process deriver call (fn-722 task .5 thinning).
+test("extractToolUseId returns null on a payload without tool_use_id", () => {
+  expect(extractToolUseId({ prompt: "hi" })).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -1301,81 +1178,42 @@ test("SessionStart stamps events.config_dir from CLAUDE_CONFIG_DIR env", async (
   }
 });
 
-test("SessionStart strips a trailing '/' from CLAUDE_CONFIG_DIR before stamping", async () => {
-  const code = await fireViaLauncherWithEnv(
-    "my-session",
-    {
-      hook_event_name: "SessionStart",
-      session_id: "sess-cfg-trailing",
-      cwd: "/tmp/work",
-    },
-    { CLAUDE_CONFIG_DIR: "/Users/x/.claude-profiles/profile-b/" },
+// The trailing-slash / unset / empty cases are pure `configDirFromEnv`
+// value-normalizations — the kept "stamps from env" spawn above proves the
+// SessionStart → config_dir wiring, and the "non-SessionStart leaves NULL"
+// spawn below proves the gate. Spawning a subprocess per value variant just
+// re-runs the deriver, so assert it directly via the shared sandbox-env helper
+// (state paths sandboxed even though configDirFromEnv reads only
+// CLAUDE_CONFIG_DIR) over the LIVE per-test env (fn-722 task .5 thinning).
+test("configDirFromEnv normalizes the SessionStart-captured CLAUDE_CONFIG_DIR", () => {
+  const trailing = sandboxEnv({
+    tmpDir,
+    dbPath,
+    clearAmbientIds: false,
+    includeZellij: true,
+    extra: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-profiles/profile-b/" },
+  });
+  expect(configDirFromEnv(trailing)).toBe(
+    "/Users/x/.claude-profiles/profile-b",
   );
-  expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-trailing'",
-      )
-      .get() as { config_dir: string | null } | null;
-    expect(row?.config_dir).toBe("/Users/x/.claude-profiles/profile-b");
-  } finally {
-    db.close();
-  }
-});
+  const unset = sandboxEnv({
+    tmpDir,
+    dbPath,
+    clearAmbientIds: false,
+    includeZellij: true,
+    extra: { CLAUDE_CONFIG_DIR: undefined },
+  });
+  expect(configDirFromEnv(unset)).toBeNull();
 
-test("SessionStart with CLAUDE_CONFIG_DIR unset stamps NULL", async () => {
-  // Force-clear the env variable so the test inherits a known-unset state
-  // regardless of the test runner's environment.
-  const code = await fireViaLauncherWithEnv(
-    "my-session",
-    {
-      hook_event_name: "SessionStart",
-      session_id: "sess-cfg-unset",
-      cwd: "/tmp/work",
-    },
-    { CLAUDE_CONFIG_DIR: undefined },
-  );
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-unset'",
-      )
-      .get() as { config_dir: string | null } | null;
-    expect(row?.config_dir).toBeNull();
-  } finally {
-    db.close();
-  }
-});
-
-test("SessionStart with CLAUDE_CONFIG_DIR='' stamps NULL", async () => {
-  const code = await fireViaLauncherWithEnv(
-    "my-session",
-    {
-      hook_event_name: "SessionStart",
-      session_id: "sess-cfg-empty",
-      cwd: "/tmp/work",
-    },
-    { CLAUDE_CONFIG_DIR: "" },
-  );
-  expect(code).toBe(0);
-
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-empty'",
-      )
-      .get() as { config_dir: string | null } | null;
-    expect(row?.config_dir).toBeNull();
-  } finally {
-    db.close();
-  }
+  const empty = sandboxEnv({
+    tmpDir,
+    dbPath,
+    clearAmbientIds: false,
+    includeZellij: true,
+    extra: { CLAUDE_CONFIG_DIR: "" },
+  });
+  expect(configDirFromEnv(empty)).toBeNull();
 });
 
 test("a non-SessionStart event leaves config_dir NULL even when CLAUDE_CONFIG_DIR is set", async () => {
