@@ -94,5 +94,5 @@ plus tests and docs, all one cohesive slice:
 - [ ] README + CLAUDE.md + docs/exec-backend.md updated per the epic Docs gaps
 
 ## Done summary
-
+Revived autopilot completion-reap on the surviving live-probe path: thread autoclose_windows config to the worker, widen ReconcileDecision with the completed-row-id set (one readiness pass), add isCompletionReapCandidate predicate (sibling of isReapCandidate), and fire a never-throwing reapCompletionSurfaces pass per cycle that closes work/close + approve panes for approved-completed rows. Predicate + reap-pass + completedRowIds tests added; README/CLAUDE.md/docs updated.
 ## Evidence
