@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "ingest backstop telemetry and fold latency",
-  "updated_at": "2026-06-07T21:47:29.268895Z"
+  "updated_at": "2026-06-07T22:03:44.224987Z",
+  "worker_done_at": "2026-06-07T22:03:44.224987Z"
 }

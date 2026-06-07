@@ -82,5 +82,5 @@ guard. Sandbox all five `KEEPER_*` paths + `KEEPER_WATCH_STATE_DIR`; add to
 - [ ] Five `KEEPER_*` + `KEEPER_WATCH_STATE_DIR` sandboxed; `bun run lint && typecheck && test:fast` pass
 
 ## Done summary
-
+Added two pure detectors to keeper-watch: backstop-telemetry ingest (fires on high-staleness rescues + missed-wake fires_total deltas with Prometheus reset + (dev,ino) baseline invalidation via a new backstop-baseline.json sidecar) and fold-latency (pairs each planctl_op to the first matching plan_snapshot, fires >= the realtime bar, skips in-flight + re-fold artifacts). Both wired into scan via injected ScanDeps; prepareStmts:false preserved; never writes keeper.db. Catches today's staleness=143108 incident and the fn-732 ~10-20s fold-latency fixture.
 ## Evidence
