@@ -505,19 +505,53 @@ firing correctly — check them before concluding it is broken:
   truth. `confirmRunning` serializes launches, so dispatch is paced, not a
   burst.
 - **Closes the launch → SessionStart blind window via the durable
-  `pending_dispatches` projection (schema v50, fn-678).** Before calling
-  `launch()`, `confirmRunning` mints a `Dispatched` synthetic event (outbox
-  ordering: intent before side-effect). The reducer folds `Dispatched` into
-  a `pending_dispatches` row keyed `(verb, id)`; `loadReconcileSnapshot`
-  reads the table each cycle and populates `liveTabKeys: Set<DispatchKey>`.
-  A fifth suppression arm in `reconcile()` fires when `liveTabKeys.has(key)`
-  is true — alongside the `state.paused`, `state.inFlight`,
-  `snapshot.failedKeys`, and `isOccupyingJob` arms — so a launched but
-  not-yet-SessionStart-bound worker keeps its slot held without any live
-  zellij probe. `reconcile()` stays pure: it reads the synchronous Set, never
-  the backend. The row discharges when `SessionStart` folds (reducer DELETE),
-  or via a producer-side TTL sweep on the 60s heartbeat (120s ceiling,
-  `DispatchExpired`) when the bind never arrives — so a phantom row from a
-  crash between mint and launch self-clears without human intervention. The
-  tab name is a purely cosmetic label — no control path reads it back.
-  `ExecBackend` exposes `launch` and `focusPane`.
+  `pending_dispatches` projection (schema v50, fn-678; durable-ack +
+  three-way outcome + reap-on-pause, fn-724).** Before calling `launch()`,
+  `confirmRunning` AWAITS main's durable `Dispatched` insert: it posts the
+  `DispatchedPayload` via `emitDispatched` and BLOCKS on an id-correlated
+  `dispatched-ack{id, ok}` reply (a `DISPATCHED_ACK_TIMEOUT_MS` floor that
+  must exceed busy_timeout + a boot-drain so boot dispatches don't
+  false-abort). Outbox ordering — intent durably committed BEFORE the launch
+  side-effect — is now load-bearing, not fire-and-forget: on `ok:false` or
+  ack-timeout the worker ABORTS without launching (outcome `"aborted"`; no
+  double-dispatch — a phantom row from a crash between ack and launch is
+  cleared by the TTL sweep). This closes the SessionStart-drains-before-
+  `dispatched` race (fn-627 class) that fire-and-forget left open. The
+  reducer folds `Dispatched` into a `pending_dispatches` row keyed
+  `(verb, id)`; `loadReconcileSnapshot` reads the table each cycle and
+  populates `liveTabKeys: Set<DispatchKey>`. A fifth suppression arm in
+  `reconcile()` fires when `liveTabKeys.has(key)` is true — alongside the
+  `state.paused`, `state.inFlight`, `snapshot.failedKeys`, and
+  `isOccupyingJob` arms — so a launched but not-yet-SessionStart-bound worker
+  keeps its slot held without any live zellij probe. `reconcile()` stays
+  pure: it reads the synchronous Set, never the backend. The row discharges
+  when `SessionStart` folds (reducer DELETE), or via a producer-side TTL
+  sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s, `DispatchExpired`)
+  when the bind never arrives — so a phantom row self-clears without human
+  intervention. **Three-way `ConfirmOutcome` (fn-724).** Past the durable
+  ack, `confirmRunning` polls `findJob` until `ceilingMs` (60s) and
+  classifies: `launch.ok===false` → `"failed"` (emit `DispatchFailed`,
+  unchanged); SessionStart bound before the ceiling → `"ok"`; ceiling
+  elapses with `launch.ok===true` → `"indoubt"` — the launch SUCCEEDED but
+  the bind is merely late (zellij execs `claude` cold 24–33s later,
+  occasionally past the ceiling), so it emits NO `DispatchFailed`, KEEPS the
+  `pending_dispatches` row (it still holds the slot), releases `inFlight`,
+  and lets the 120s TTL sweep emit `DispatchExpired` if the bind truly never
+  lands. The `ceilingMs (60s) < PENDING_DISPATCH_TTL_MS (120s)` invariant is
+  load-bearing (pinned by a test): were the sweep < ceiling it would clear
+  the row mid-confirm and re-open the dispatch. The reducer is UNCHANGED —
+  `foldDispatchFailed` / `foldDispatchExpired` already DELETE idempotently;
+  the ceiling-emit suppression is entirely producer-side. NO new event, NO
+  column, NO `SCHEMA_VERSION` bump (stays 59), `keeper/api.py` untouched.
+  **Reap-on-pause (fn-724).** On `set-paused` (covering boot-pause via the
+  same relay), the worker reaps stale launch-window zellij surfaces:
+  `ExecBackend.reapSurfaces` intersects `list-panes -a -j` (tab-name /
+  terminal-command carrying a `work::|approve::|close::<id>` dispatch key)
+  with the set of OPEN `pending_dispatches` rows — a key MISSING from the
+  open set means the row already discharged on SessionStart = a LIVE worker,
+  whose pane is NEVER reaped. The intersect is the highest-blast-radius gate;
+  name-match alone never authorizes a close (`list-panes` lags zellij
+  reality). `exited` ghost tabs are cleaned, and the reap is try/caught and
+  never throws (no-self-heal). The tab name is a purely cosmetic label — no
+  control path reads it back. `ExecBackend` exposes `launch`, `focusPane`,
+  and `reapSurfaces`.
