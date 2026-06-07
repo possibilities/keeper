@@ -58,5 +58,5 @@ Docs only — no test. Verify the README YAML snippet stays valid YAML and CLAUD
 - [ ] fn-725 spec carries a one-line supersession addendum
 
 ## Done summary
-
+Documented the narrowed max_concurrent_jobs cap scope and the approve-verb exemption across README (config key + YAML snippet), CLAUDE.md Autopilot section, and the live config.yaml comment; removed the viewer predicted/schedule sections from README; added a supersession addendum to the fn-725 spec.
 ## Evidence
