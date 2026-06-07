@@ -82,5 +82,5 @@ so no real `claude` runs in tests. Same five-path sandbox rule.
 - [ ] `bun run lint`, `bun run typecheck`, `bun run test:fast` pass
 
 ## Done summary
-
+Added the --tick launchd escalation flow on top of the .1 detection core: seen-state dedup (own dir, atomic write, corrupt/missing -> silent baseline), held-across-ticks / delta finalizers, cooldown + TTL prune + per-fingerprint retry cap, and an injectable hard-timeout-killed headless spawn of the PLAIN claude binary that commits only delivered findings on success. Added arthack.keeper-watch.plist (StartInterval 300, no KeepAlive) and 33 new unit tests.
 ## Evidence

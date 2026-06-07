@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "tick escalation and seen-state",
-  "updated_at": "2026-06-07T14:56:04.543389Z"
+  "updated_at": "2026-06-07T16:00:20.169858Z",
+  "worker_done_at": "2026-06-07T16:00:20.169858Z"
 }
