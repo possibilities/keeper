@@ -639,8 +639,8 @@ def test_approve_envelope_carries_planctl_invocation(tmp_path, monkeypatch):
 
 def test_set_approval_subcommand_removed():
     """The old `set-approval` subcommand is no longer registered on the CLI."""
-    assert "set-approval" not in cli.commands
-    assert "approve" in cli.commands
+    assert "set-approval" not in cli.commands  # type: ignore[attr-defined]
+    assert "approve" in cli.commands  # type: ignore[attr-defined]
 
 
 # ---------------------------------------------------------------------------
@@ -890,12 +890,15 @@ def test_approve_task_dual_write_preserves_status_in_sidecar(tmp_path, monkeypat
     epic_id, task_id = _make_epic_with_task()
     _force_task_done(tmp_path, task_id)
     # Sanity: status is present before approve.
-    assert _read_task_sidecar(tmp_path, task_id)["status"] == "done"
+    pre = _read_task_sidecar(tmp_path, task_id)
+    assert pre is not None
+    assert pre["status"] == "done"
 
     code, _, output = _invoke(["approve", epic_id, task_id, "approved"])
     assert code == 0, output
 
     sidecar = _read_task_sidecar(tmp_path, task_id)
+    assert sidecar is not None
     assert sidecar["status"] == "done", "RMW clobbered the runtime status"
     assert sidecar["approval"] == "approved"
     # Other runtime fields ride through untouched.
@@ -991,6 +994,7 @@ def test_store_write_task_approval_rmw_preserves_status(tmp_path, monkeypatch):
     store.write_task_approval("fn-1-x.1", "approved")
 
     runtime = store.load_runtime("fn-1-x.1")
+    assert runtime is not None
     assert runtime["status"] == "done"
     assert runtime["assignee"] == "alice"
     assert runtime["approval"] == "approved"
@@ -1014,6 +1018,7 @@ def test_store_write_epic_approval_rmw(tmp_path, monkeypatch):
     store.write_epic_approval("fn-1-x", "approved")
 
     runtime = store.load_epic_runtime("fn-1-x")
+    assert runtime is not None
     assert runtime["approval"] == "approved"
     assert runtime["future"] == "keep"
 
@@ -1053,6 +1058,7 @@ def test_store_concurrent_status_and_approval_under_lock(tmp_path, monkeypatch):
     t2.join()
 
     runtime = store.load_runtime("fn-1-x.1")
+    assert runtime is not None
     assert runtime["status"] == "done", "status write was lost"
     assert runtime["approval"] == "approved", "approval write was lost"
     assert runtime["assignee"] == "bob"
