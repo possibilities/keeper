@@ -32,6 +32,17 @@
  *   alone (we cannot prove recycle without the (pid, start_time) two-field
  *   identity, and a bare pid match is unsafe on macOS where the pid space is
  *   small).
+ * - pid NULL (fn-743): the row has NO process to probe and the exit-watcher's
+ *   `pid IS NOT NULL` filter never armed it — so a NULL-pid `stopped`/`working`
+ *   row would live forever (the 11-stuck-rows incident, 2026-06-08). Such a
+ *   row is terminal BY CONSTRUCTION (unwatchable, unprovable-alive), so emit a
+ *   PIDLESS Killed (`{pid:null}`) to reap it. The reducer's Killed fold honors
+ *   a pidless reap ONLY against a row whose persisted pid is ALSO NULL, so this
+ *   can never knock out a watchable row. NULL-pid origin: a SessionStart whose
+ *   pid binding landed NULL (events-log ingester schema-skew degrade, a
+ *   dead-letter replay that dropped the pid, or a legacy pre-pid-capture row) —
+ *   unavoidable from the projection side, hence the reaper is the fallback the
+ *   epic's "early proof point" anticipated.
  *
  * Determinism + safety invariants:
  * - **Producer-only liveness probing.** This module IS the producer (the boot
@@ -130,7 +141,7 @@ function readOsStartTime(pid: number): string | null {
 function insertKilledEvent(
   db: Database,
   sessionId: string,
-  pid: number,
+  pid: number | null,
   startTime: string | null,
 ): void {
   db.run(
@@ -186,22 +197,33 @@ function insertKilledEvent(
  * continues — the next boot will re-probe the row anyway.
  */
 export function seedKilledSweep(db: Database): void {
-  // Candidate set: non-terminal lifecycle states (Q7 scope) AND pid present.
-  // A row with no pid (synthetic snapshots, malformed events) has nothing to
-  // probe and is left alone.
+  // Candidate set: every non-terminal lifecycle row (Q7 scope), INCLUDING
+  // NULL-pid rows (fn-743). A NULL-pid row used to be excluded (`pid IS NOT
+  // NULL`) — that exclusion was the root cause of the stuck-`stopped` incident:
+  // an unwatchable, unprobeable row that lived forever. We now pull it in and
+  // reap it via a pidless Killed (the `row.pid == null` branch below).
   const rows = db
     .query(
       `SELECT job_id, pid, start_time FROM jobs
-         WHERE state IN ('working', 'stopped') AND pid IS NOT NULL`,
+         WHERE state IN ('working', 'stopped')`,
     )
     .all() as {
     job_id: string;
-    pid: number;
+    pid: number | null;
     start_time: string | null;
   }[];
 
   for (const row of rows) {
     try {
+      if (row.pid == null) {
+        // fn-743: NULL-pid non-terminal row. Nothing to probe — it can never
+        // be watched (exit-watcher armed only `pid IS NOT NULL`) and we can
+        // never prove it alive, so it's terminal by construction. Emit a
+        // pidless Killed; the reducer's pidless-reap arm folds it to 'killed'
+        // (guarded to NULL-pid rows only, so a watchable row is never touched).
+        insertKilledEvent(db, row.job_id, null, row.start_time);
+        continue;
+      }
       const alive = isPidAlive(row.pid);
       if (!alive) {
         // Q7 dead-pid rule: emit Killed regardless of stored start_time. The

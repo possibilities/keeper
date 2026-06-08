@@ -65,7 +65,11 @@ function insertEvent(
   const row = {
     ts,
     session_id: overrides.session_id ?? "sess-a",
-    pid: overrides.pid ?? 4242,
+    // Honor an EXPLICIT `pid: null` (fn-743: NULL-pid SessionStart seeds a
+    // NULL-pid jobs row — the stuck-`stopped` origin). `?? 4242` would coalesce
+    // null away, so key off presence: omitted → 4242, present (incl. null) →
+    // the given value.
+    pid: "pid" in overrides ? (overrides.pid ?? null) : 4242,
     hook_event: overrides.hook_event,
     event_type: overrides.event_type ?? overrides.hook_event,
     tool_name: overrides.tool_name ?? null,
@@ -5956,6 +5960,88 @@ test("Killed with missing pid in payload is a safe no-op", () => {
   expect(getCursor()).toBe(killedId);
 });
 
+// ---------------------------------------------------------------------------
+// fn-743: pidless reap of NULL-pid stopped rows (the stuck-`stopped` incident)
+// ---------------------------------------------------------------------------
+
+/** Insert a synthetic PIDLESS Killed event (`pid: null`) — fn-743 reap. */
+function pidlessKilledEvent(
+  start_time: string | null = null,
+  session_id = "sess-a",
+): number {
+  return insertEvent({
+    hook_event: "Killed",
+    session_id,
+    data: JSON.stringify({ pid: null, start_time }),
+  });
+}
+
+test("fn-743: pidless Killed reaps a NULL-pid stopped row to killed", () => {
+  // A SessionStart whose pid binding landed NULL (ingester schema-skew /
+  // dead-letter replay / legacy row) seeds a stopped row with pid=NULL — the
+  // unwatchable row the exit-watcher's old `pid IS NOT NULL` filter never
+  // armed, so it lived forever.
+  insertEvent({ hook_event: "SessionStart", pid: null });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getJob()?.pid).toBeNull();
+
+  const killedId = pidlessKilledEvent();
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("killed");
+  expect(job?.last_event_id).toBe(killedId);
+  expect(getCursor()).toBe(killedId);
+});
+
+test("fn-743: pidless Killed NEVER reaps a row that carries a real pid", () => {
+  // A watchable (pid-bearing) row is the live exit-watcher's / seed-sweep's
+  // job, matched on the strict (pid, start_time) identity. A pidless reap that
+  // happened to race a resume (row gained a pid) must be a safe no-op.
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 1234,
+    start_time: "macos:t1",
+  });
+  drainAll();
+  const beforeLastId = getJob()?.last_event_id;
+
+  const killedId = pidlessKilledEvent();
+  drainAll();
+  const job = getJob();
+  // Untouched: a pidless reap must not knock out a watchable row.
+  expect(job?.state).toBe("stopped");
+  expect(job?.last_event_id).toBe(beforeLastId ?? 0);
+  expect(getCursor()).toBe(killedId);
+});
+
+test("fn-743: pidless Killed on an already-terminal NULL-pid row is a no-op", () => {
+  // Seed a NULL-pid stopped row, reap it once (→ killed), then re-emit the
+  // pidless Killed. The terminal-state guard must keep it killed without a
+  // fresh row write (no resurrection, idempotent re-fold).
+  insertEvent({ hook_event: "SessionStart", pid: null });
+  drainAll();
+  const firstKill = pidlessKilledEvent();
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getJob()?.last_event_id).toBe(firstKill);
+
+  const secondKill = pidlessKilledEvent();
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("killed");
+  // No fresh write — last_event_id stays pinned to the FIRST kill.
+  expect(job?.last_event_id).toBe(firstKill);
+  expect(getCursor()).toBe(secondKill);
+});
+
+test("fn-743: pidless Killed for a non-existent jobs row is a safe no-op", () => {
+  const killedId = pidlessKilledEvent(null, "ghost");
+  drainAll();
+  expect(getJob("ghost")).toBeNull();
+  expect(getCursor()).toBe(killedId);
+});
+
 test("SessionStart re-opens a killed row: killed -> stopped, pid+start_time refreshed", () => {
   insertEvent({
     hook_event: "SessionStart",
@@ -6124,6 +6210,62 @@ test("cross-boot: kill -> UPS-resume-new-pid -> daemon restart (seed sweep) keep
   expect(after?.state).toBe("working");
   expect(after?.pid).toBe(livePid);
   expect(after?.start_time).toBe(null);
+});
+
+test("fn-743 seed sweep: a NULL-pid stopped row is reaped to killed at boot", () => {
+  // A SessionStart whose pid binding landed NULL seeds a stopped row with
+  // pid=NULL — the unwatchable, unprobeable row that lived forever (the
+  // 2026-06-08 stuck-`stopped` incident). The boot seed sweep now reaps it via
+  // a pidless Killed.
+  insertEvent({ hook_event: "SessionStart", pid: null });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+  expect(getJob()?.pid).toBeNull();
+
+  seedKilledSweep(db);
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+
+  // Idempotent: a second boot sweep emits another pidless Killed, but the
+  // terminal guard keeps the row killed without a fresh write.
+  const lastIdAfterFirst = getJob()?.last_event_id;
+  seedKilledSweep(db);
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getJob()?.last_event_id).toBe(lastIdAfterFirst ?? 0);
+});
+
+test("fn-743 seed sweep: a live-pid stopped row is left untouched (idle != terminal)", () => {
+  // The reaper must NOT touch a row whose process is still alive. process.pid
+  // is alive for the duration of the test, with a NULL stored start_time, so
+  // the legacy-loose branch leaves it alone.
+  const livePid = process.pid;
+  insertEvent({ hook_event: "SessionStart", pid: livePid }); // no start_time
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+
+  seedKilledSweep(db);
+  drainAll();
+  // Untouched — a live (idle-but-alive) session is not terminal.
+  expect(getJob()?.state).toBe("stopped");
+  expect(getJob()?.pid).toBe(livePid);
+});
+
+test("fn-743 seed sweep: a dead-pid stopped row is reaped to killed", () => {
+  // A pid that is no longer alive (we pick a high pid unlikely to exist; the
+  // sweep's `isPidAlive` returns false → emit Killed regardless of start_time).
+  const deadPid = 2_000_000_000; // above any live macOS/Linux pid
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: deadPid,
+    start_time: "macos:t1",
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("stopped");
+
+  seedKilledSweep(db);
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
 });
 
 test("Stop on a killed row is a no-op (terminal guard)", () => {

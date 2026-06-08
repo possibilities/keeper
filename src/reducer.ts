@@ -518,7 +518,19 @@ function extractTranscriptPath(event: Event): string | null {
  * `killed` (match) or stay put (mismatch / stale).
  */
 interface KilledPayload {
-  pid: number;
+  /**
+   * The proven-dead process pid, OR `null` for a PIDLESS REAP (fn-743). A
+   * pidless Killed reaps a `stopped` row whose persisted `pid IS NULL` — an
+   * unwatchable row (the exit-watcher's old `pid IS NOT NULL` filter never
+   * armed it, the seed sweep never probed it) that would otherwise live
+   * forever. The pidless arm carries NO liveness claim: a NULL-pid stopped
+   * row is terminal by construction (we can never prove it alive and never
+   * watch it), so the producer reaps it directly. The Killed fold only honors
+   * a pidless reap against a row whose persisted pid is ALSO NULL, so a
+   * pidless event can never knock out a row that carries a real (watchable)
+   * pid.
+   */
+  pid: number | null;
   start_time: string | null;
 }
 
@@ -529,10 +541,14 @@ interface KilledPayload {
  * throw — the cursor still advances upstream, and the Killed fold falls through
  * as a safe no-op when this returns null.
  *
- * `pid` is required (a Killed event with no pid is meaningless — there's
- * nothing to match against). `start_time` is optional / nullable — the producer
- * may emit a Killed for a row whose stored start_time is NULL (legacy / loose
- * pid-only match handled by the Killed fold).
+ * `pid` is either a finite number (the proven-dead pid — strict/loose match
+ * against the persisted `(pid, start_time)`) OR explicit `null` for a PIDLESS
+ * REAP of a NULL-pid `stopped` row (fn-743). Any OTHER shape (missing pid,
+ * non-finite, non-number-non-null) is malformed → null (the fold no-ops). The
+ * pidless arm is opt-in via a literal JSON `null`, so a malformed blob can
+ * never accidentally trigger a reap. `start_time` is optional / nullable — the
+ * producer may emit a Killed for a row whose stored start_time is NULL (legacy
+ * / loose pid-only match handled by the Killed fold).
  */
 function extractKilledPayload(event: Event): KilledPayload | null {
   if (event.data == null || event.data.length === 0) {
@@ -544,12 +560,15 @@ function extractKilledPayload(event: Event): KilledPayload | null {
       start_time?: unknown;
     };
     const pid = parsed.pid;
-    if (typeof pid !== "number" || !Number.isFinite(pid)) {
+    // Accept a finite number (normal proven-dead reap) OR an explicit literal
+    // `null` (fn-743 pidless reap). `undefined` / non-number-non-null are
+    // malformed → no-op.
+    if (pid !== null && (typeof pid !== "number" || !Number.isFinite(pid))) {
       return null;
     }
     const startTime =
       typeof parsed.start_time === "string" ? parsed.start_time : null;
-    return { pid, start_time: startTime };
+    return { pid: pid as number | null, start_time: startTime };
   } catch (err) {
     // Malformed JSON: skip-and-log. The cursor still advances upstream so the
     // reducer never wedges on one bad row.
@@ -7195,21 +7214,46 @@ function projectJobsRow(db: Database, event: Event): void {
           break; // malformed/missing payload — safe no-op.
         }
         const row = db
-          .query("SELECT pid, start_time FROM jobs WHERE job_id = ?")
+          .query("SELECT pid, start_time, state FROM jobs WHERE job_id = ?")
           .get(jobId) as {
           pid: number | null;
           start_time: string | null;
+          state: string;
         } | null;
         if (row == null) {
           break; // no jobs row for this session — safe no-op.
         }
-        // Strict match when the row has a stored start_time; loose pid-only
-        // match when start_time is NULL (legacy / pre-schema-v9 row).
-        const pidMatches = row.pid != null && row.pid === payload.pid;
-        const startMatches =
-          row.start_time == null || row.start_time === payload.start_time;
-        if (!pidMatches || !startMatches) {
-          break; // stale/recycled — safe no-op.
+        // fn-743 pidless reap: a Killed event carrying `pid: null` reaps a
+        // `stopped`/`working` row whose persisted pid is ALSO NULL — an
+        // unwatchable row the exit-watcher could never arm and the seed sweep
+        // could never probe. Guarded both ways: the payload pid must be NULL
+        // AND the row pid must be NULL. A pidless event therefore NEVER folds
+        // a row that carries a real (watchable) pid — that row is the live
+        // exit-watcher's / seed-sweep's job, matched on the strict
+        // (pid, start_time) identity below. No liveness claim is made here: a
+        // NULL-pid row is terminal by construction. The pidless arm carries
+        // its OWN terminal-state guard (the strict arm relies on the
+        // (pid, start_time) identity instead, and re-emitting a strict Killed
+        // on an already-killed row re-writes byte-identically on re-fold — a
+        // guard there would change re-fold output, so it's pidless-only).
+        if (payload.pid == null) {
+          if (row.pid != null) {
+            break; // pidless reap must not touch a row that has a real pid.
+          }
+          if (row.state === ENDED || row.state === KILLED) {
+            break; // already terminal — never resurrect a NULL-pid ended row.
+          }
+          // row.pid == null && payload.pid == null && non-terminal → reap the
+          // unwatchable row.
+        } else {
+          // Strict match when the row has a stored start_time; loose pid-only
+          // match when start_time is NULL (legacy / pre-schema-v9 row).
+          const pidMatches = row.pid != null && row.pid === payload.pid;
+          const startMatches =
+            row.start_time == null || row.start_time === payload.start_time;
+          if (!pidMatches || !startMatches) {
+            break; // stale/recycled — safe no-op.
+          }
         }
         db.run(
           `UPDATE jobs SET state = 'killed', monitors = '[]', last_event_id = ?, updated_at = ?

@@ -68,8 +68,11 @@ function seedJobsRow(
 test("diffLoop fires onTick once at boot and again on each commit by another connection", async () => {
   const reader = openDb(dbPath, { readonly: true }).db;
   const writer = openDb(dbPath).db;
-  const ticks: { job_id: string; pid: number; start_time: string | null }[][] =
-    [];
+  const ticks: {
+    job_id: string;
+    pid: number | null;
+    start_time: string | null;
+  }[][] = [];
   let shutdown = false;
 
   // Seed an initial candidate row so the boot tick is non-empty.
@@ -112,20 +115,26 @@ test("diffLoop fires onTick once at boot and again on each commit by another con
   reader.close();
 });
 
-test("diffLoop only emits rows with pid IS NOT NULL and non-terminal state", async () => {
+test("diffLoop emits all non-terminal rows INCLUDING NULL-pid ones (fn-743)", async () => {
+  // fn-743 dropped the old `pid IS NOT NULL` exclusion: a NULL-pid stopped row
+  // is the stuck-`stopped` incident (unwatchable, lived forever). The diff loop
+  // now surfaces it so `diffTick` can reap it via a pidless exit message.
+  // Terminal rows (ended/killed) stay out of the candidate set.
   const reader = openDb(dbPath, { readonly: true }).db;
   const writer = openDb(dbPath).db;
   let lastTick:
-    | { job_id: string; pid: number; start_time: string | null }[]
+    | { job_id: string; pid: number | null; start_time: string | null }[]
     | null = null;
   let shutdown = false;
 
-  // Mixed: alive working, alive stopped, ended (out), killed (out), no-pid (out).
+  // Mixed: alive working, alive stopped, ended (out), killed (out), NULL-pid
+  // stopped (NOW IN — reaped via the pidless path), NULL-pid ended (out).
   seedJobsRow(writer, "sess-working", 1001, "darwin:a", "working");
   seedJobsRow(writer, "sess-stopped", 1002, "darwin:b", "stopped");
   seedJobsRow(writer, "sess-ended", 1003, "darwin:c", "ended");
   seedJobsRow(writer, "sess-killed", 1004, "darwin:d", "killed");
   seedJobsRow(writer, "sess-no-pid", null, null, "stopped");
+  seedJobsRow(writer, "sess-no-pid-ended", null, null, "ended");
 
   const loop = diffLoop(
     reader,
@@ -143,7 +152,13 @@ test("diffLoop only emits rows with pid IS NOT NULL and non-terminal state", asy
   expect(lastTick).not.toBeNull();
   // biome-ignore lint/style/noNonNullAssertion: asserted non-null above
   const ids = lastTick!.map((r) => r.job_id).sort();
-  expect(ids).toEqual(["sess-stopped", "sess-working"]);
+  // NULL-pid STOPPED row is in; terminal rows (pid-bearing or NULL) are out.
+  expect(ids).toEqual(["sess-no-pid", "sess-stopped", "sess-working"]);
+  // The NULL-pid candidate carries pid === null (the diffTick pidless arm keys
+  // off this to reap-on-sight rather than arm the kernel watcher).
+  // biome-ignore lint/style/noNonNullAssertion: asserted non-null above
+  const noPidRow = lastTick!.find((r) => r.job_id === "sess-no-pid");
+  expect(noPidRow?.pid).toBeNull();
 
   writer.close();
   reader.close();
@@ -324,7 +339,9 @@ test("diffLoop+mock: every new candidate row triggers exactly one add()", async 
     reader,
     (rows) => {
       for (const r of rows) {
-        if (!tracked.has(r.job_id)) {
+        // Mirror the worker's pidless skip (fn-743): NULL-pid rows are reaped
+        // on sight, never armed in the kernel.
+        if (r.pid != null && !tracked.has(r.job_id)) {
           tracked.add(r.job_id);
           watcher.add(r.pid, BigInt(addCalls.length + 1));
         }

@@ -25,14 +25,17 @@
  *
  * - watchLoop (data_version-driven, ~50ms): on every commit by any OTHER
  *   connection, re-query `jobs` for the candidate set (state IN
- *   ('working','stopped') AND pid IS NOT NULL), diff against the locally-
- *   tracked set, and call `ExitWatcher.add(pid, jobIdToken)` for each new
- *   pid. An `alreadyDead` result (kqueue ESRCH or the post-register kill-0
- *   probe) posts an exit message immediately — the live-exit window between
- *   "row appears" and "kernel arms" closes there. Rows leaving the candidate
- *   set (state moved to ended/killed, or pid cleared) are dropped from the
- *   local set; the kqueue/epoll registration is `EV_ONESHOT`/`EPOLLONESHOT`
- *   so we never need to issue EV_DELETE.
+ *   ('working','stopped') — fn-743 dropped the old `AND pid IS NOT NULL`
+ *   exclusion), diff against the locally-tracked set, and call
+ *   `ExitWatcher.add(pid, jobIdToken)` for each new PID-BEARING row. An
+ *   `alreadyDead` result (kqueue ESRCH or the post-register kill-0 probe)
+ *   posts an exit message immediately — the live-exit window between "row
+ *   appears" and "kernel arms" closes there. A NULL-pid row (unwatchable —
+ *   the old exclusion made these live forever, the stuck-`stopped` incident)
+ *   is reaped on sight via a PIDLESS exit message (no kernel registration).
+ *   Rows leaving the candidate set (state moved to ended/killed, or pid
+ *   cleared) are dropped from the local set; the kqueue/epoll registration is
+ *   `EV_ONESHOT`/`EPOLLONESHOT` so we never need to issue EV_DELETE.
  *
  * - waitLoop (kernel-blocking, ~1s timeout slices): drives
  *   `ExitWatcher.wait()` until either a tracked pid exits (post an exit
@@ -78,7 +81,15 @@ export interface ExitWatcherWorkerData {
 export interface ExitMessage {
   kind: "exit";
   jobId: string;
-  pid: number;
+  /**
+   * The exited process pid, OR `null` for a PIDLESS REAP (fn-743) of a
+   * `stopped`/`working` row whose persisted pid is NULL — an unwatchable row
+   * the kernel watcher can never arm. The diff loop posts the pidless variant
+   * the instant it sees such a row (no kernel registration); main's verifier
+   * folds a pidless `Killed` against the NULL-pid row. A pidless message
+   * carries NO liveness claim — a NULL-pid row is terminal by construction.
+   */
+  pid: number | null;
   startTime: string | null;
 }
 
@@ -106,7 +117,8 @@ interface TrackedEntry {
 
 interface CandidateRow {
   job_id: string;
-  pid: number;
+  /** NULL for the fn-743 pidless-reap rows (unwatchable, reaped on sight). */
+  pid: number | null;
   start_time: string | null;
 }
 
@@ -151,9 +163,15 @@ export async function diffLoop(
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   const versionQuery = db.query("PRAGMA data_version");
+  // fn-743: candidate set now INCLUDES NULL-pid rows. The old
+  // `pid IS NOT NULL` exclusion was the root cause of the stuck-`stopped`
+  // incident — a NULL-pid row was never watched and never folded to terminal,
+  // so it lived forever. We surface it here and `diffTick` reaps it on sight
+  // via a pidless exit message (no kernel registration — there's no pid to
+  // arm). Watchable (pid-bearing) rows still arm the kernel watcher as before.
   const candidatesQuery = db.query(
     `SELECT job_id, pid, start_time FROM jobs
-       WHERE state IN ('working','stopped') AND pid IS NOT NULL`,
+       WHERE state IN ('working','stopped')`,
   );
 
   // Run one initial sweep so rows already present at boot enter the watch
@@ -219,6 +237,13 @@ function main(): void {
   // counter), so the index is unambiguous even across resumes.
   const byToken = new Map<bigint, string>();
   let nextUdata = 1n;
+  // fn-743: job_ids we've already posted a PIDLESS reap for. A NULL-pid row
+  // lingers in the candidate set for several ticks until main's synthetic
+  // Killed folds and flips it to `killed` (leaving the set), so we dedupe the
+  // pidless `Killed` emission here — emit once per appearance, drop the mark
+  // when the row leaves the candidate set so a (theoretical) resurrected
+  // NULL-pid row would be reaped afresh.
+  const pidlessReaped = new Set<string>();
 
   function postExit(entry: TrackedEntry, jobId: string): void {
     parentPort?.postMessage({
@@ -235,6 +260,23 @@ function main(): void {
     const seen = new Set<string>();
     for (const row of rows) {
       seen.add(row.job_id);
+      // fn-743: NULL-pid row — nothing to arm in the kernel. Reap on sight via
+      // a pidless exit message (deduped so we emit one Killed per appearance,
+      // not one per tick while the fold catches up). It never enters `tracked`
+      // (no pid/udata), so the candidate-set drop loop below ignores it; the
+      // `pidlessReaped` mark is cleared there instead.
+      if (row.pid == null) {
+        if (!pidlessReaped.has(row.job_id)) {
+          pidlessReaped.add(row.job_id);
+          parentPort?.postMessage({
+            kind: "exit",
+            jobId: row.job_id,
+            pid: null,
+            startTime: row.start_time,
+          } satisfies ExitMessage);
+        }
+        continue;
+      }
       const existing = tracked.get(row.job_id);
       if (existing) {
         // Same job, but a new pid means the row was resumed (SessionStart
@@ -287,6 +329,16 @@ function main(): void {
         if (!seen.has(jobId)) {
           byToken.delete(entry.udata);
           tracked.delete(jobId);
+        }
+      }
+    }
+    // fn-743: drop pidless-reap marks whose row left the candidate set (the
+    // synthetic Killed folded → row now `killed`, or it gained a pid on
+    // resume). A future re-appearance is then reaped afresh.
+    if (pidlessReaped.size > 0) {
+      for (const jobId of pidlessReaped) {
+        if (!seen.has(jobId)) {
+          pidlessReaped.delete(jobId);
         }
       }
     }

@@ -1205,15 +1205,16 @@ test("seed sweep is idempotent — a second sweep emits no duplicate Killed even
   db.close();
 });
 
-test("seed sweep ignores rows already in terminal states (ended, killed) and rows with no pid", () => {
+test("seed sweep ignores terminal rows (ended, killed) — incl. NULL-pid ones", () => {
   const { db } = openDb(dbPath);
 
   const deadPid = pickDeadPid();
-  // Terminal states are out of scope per the candidate query.
+  // Terminal states are out of scope per the candidate query — even with a
+  // NULL pid (a terminal NULL-pid row stays put; the fn-743 reap is for
+  // NON-terminal NULL-pid rows only).
   seedJobsRow(db, "sess-ended", deadPid, null, "ended");
   seedJobsRow(db, "sess-already-killed", deadPid, null, "killed");
-  // A row with no pid has nothing to probe.
-  seedJobsRow(db, "sess-no-pid", null, null);
+  seedJobsRow(db, "sess-no-pid-ended", null, null, "ended");
 
   seedKilledSweep(db);
   drainToCompletion(db);
@@ -1222,7 +1223,7 @@ test("seed sweep ignores rows already in terminal states (ended, killed) and row
   const killedCount = (
     db
       .query(
-        "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Killed' AND session_id IN ('sess-ended','sess-already-killed','sess-no-pid')",
+        "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Killed' AND session_id IN ('sess-ended','sess-already-killed','sess-no-pid-ended')",
       )
       .get() as { n: number }
   ).n;
@@ -1238,7 +1239,36 @@ test("seed sweep ignores rows already in terminal states (ended, killed) and row
   }
   expect(stateOf("sess-ended")).toBe("ended");
   expect(stateOf("sess-already-killed")).toBe("killed");
-  expect(stateOf("sess-no-pid")).toBe("stopped");
+  expect(stateOf("sess-no-pid-ended")).toBe("ended");
+
+  db.close();
+});
+
+test("fn-743 seed sweep: a NON-terminal NULL-pid (stopped) row IS reaped to killed", () => {
+  // The stuck-`stopped` incident (2026-06-08): a NULL-pid stopped row is
+  // unwatchable (exit-watcher's old `pid IS NOT NULL` filter never armed it)
+  // and unprobeable, so it lived forever. The sweep now reaps it via a pidless
+  // Killed. Default state for `seedJobsRow` is `stopped`.
+  const { db } = openDb(dbPath);
+  seedJobsRow(db, "sess-no-pid", null, null);
+
+  seedKilledSweep(db);
+  drainToCompletion(db);
+
+  const killedCount = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM events WHERE hook_event = 'Killed' AND session_id = 'sess-no-pid'",
+      )
+      .get() as { n: number }
+  ).n;
+  expect(killedCount).toBe(1);
+  const state = (
+    db.query("SELECT state FROM jobs WHERE job_id = 'sess-no-pid'").get() as {
+      state: string;
+    }
+  ).state;
+  expect(state).toBe("killed");
 
   db.close();
 });

@@ -2279,21 +2279,34 @@ function runDaemon(): void {
       // anyway, but skip the event log churn.
       return;
     }
-    // Strict-match when both sides carry a start_time; loose pid-only match
-    // when EITHER side is NULL (the row is legacy / the message snapshot
-    // didn't carry one — Q7 loose-accept rule). A strict mismatch is the
-    // race-recovered case.
-    const pidMatches = row.pid != null && row.pid === msg.pid;
-    if (!pidMatches) {
-      return;
-    }
-    const startMatches =
-      row.start_time == null ||
-      msg.startTime == null ||
-      row.start_time === msg.startTime;
-    if (!startMatches) {
-      // Strict mismatch — silently skip (the producer raced a re-open).
-      return;
+    // fn-743 pidless reap: a `pid: null` message reaps a NULL-pid (unwatchable)
+    // row. Guarded both ways — the row's persisted pid must ALSO be NULL, or a
+    // resume re-armed it with a real pid between the diff-loop snapshot and
+    // this re-read (in which case the pid-bearing path / kernel watcher owns
+    // it). No (pid, start_time) identity check applies (there's no pid to
+    // match); the start_time rides into the payload for parity / debug only.
+    if (msg.pid == null) {
+      if (row.pid != null) {
+        // Re-armed with a real pid since the snapshot — let the watcher own it.
+        return;
+      }
+    } else {
+      // Strict-match when both sides carry a start_time; loose pid-only match
+      // when EITHER side is NULL (the row is legacy / the message snapshot
+      // didn't carry one — Q7 loose-accept rule). A strict mismatch is the
+      // race-recovered case.
+      const pidMatches = row.pid != null && row.pid === msg.pid;
+      if (!pidMatches) {
+        return;
+      }
+      const startMatches =
+        row.start_time == null ||
+        msg.startTime == null ||
+        row.start_time === msg.startTime;
+      if (!startMatches) {
+        // Strict mismatch — silently skip (the producer raced a re-open).
+        return;
+      }
     }
     stmts.insertEvent.run({
       $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
