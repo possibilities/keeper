@@ -12,8 +12,9 @@
     "lint": "biome check --no-errors-on-unmatched babysitters cli src test",
     "typecheck": "tsc --noEmit",
     "test:fast": "bun test --parallel --timeout=30000 --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts' --path-ignore-patterns='test/integration.test.ts' --path-ignore-patterns='test/daemon.test.ts' --path-ignore-patterns='test/plan-worker.test.ts'",
-    "test:slow": "bun test test/integration.test.ts test/daemon.test.ts test/plan-worker.test.ts",
+    "test:slow": "bun test test/integration.test.ts test/daemon.test.ts --parallel --timeout=30000 && bun test test/plan-worker.test.ts --timeout=30000",
     "test:opentui": "bun test test/ansi-to-styled.test.ts test/live-shell.test.ts",
+    "test:soak": "bun scripts/soak-slow-tests.ts",
     "test": "bun run test:fast && bun run test:slow && bun run test:opentui"
   },
   "devDependencies": {
