@@ -22,9 +22,11 @@ import {
   BackstopCounters,
 } from "../src/backstop-telemetry";
 import {
+  ALL_WORKERS,
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   buildPendingDispatchSweepRecords,
+  type DaemonHandle,
   drainToCompletion,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
@@ -33,7 +35,9 @@ import {
   scanDeadLetterDir,
   selectExpiredPendingDispatches,
   serializeUsageSnapshot,
+  startDaemon,
   WAL_AUTOCHECKPOINT_PAGES,
+  type WorkerName,
   withBootDrainCheckpointTuning,
 } from "../src/daemon";
 import { openDb, SCHEMA_VERSION } from "../src/db";
@@ -2718,3 +2722,147 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
   // WITHOUT a `process.exit` (a `process.exit` would have killed the test
   // runner). Clean in-process boot → fold → query → stop, proven.
 }, 30_000);
+
+// ---------------------------------------------------------------------------
+// fn-749 task .1 — worker-set selector
+// ---------------------------------------------------------------------------
+
+/** Map a spawned worker-module URL back to its {@link WorkerName}. */
+const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
+  "wake-worker.ts": "wake",
+  "server-worker.ts": "server",
+  "transcript-worker.ts": "transcript",
+  "plan-worker.ts": "plan",
+  "exit-watcher.ts": "exit",
+  "git-worker.ts": "git",
+  "usage-worker.ts": "usage",
+  "dead-letter-worker.ts": "deadLetter",
+  "events-ingest-worker.ts": "eventsIngest",
+  "autopilot-worker.ts": "autopilot",
+  "restore-worker.ts": "restore",
+};
+
+/**
+ * fn-749 — boot `startDaemon(opts)` under a `globalThis.Worker` constructor SPY
+ * that records each spawned worker's module name WITHOUT creating a real thread
+ * (so no `@parcel/watcher` dlopen, no UDS bind, no kernel fd). The stub satisfies
+ * the property/method surface `startDaemon` touches during its synchronous boot
+ * (`onmessage`/`onerror` setters + `addEventListener`); the boot's DB work runs
+ * for real against the sandboxed tmp DB. Returns the captured set of spawned
+ * worker NAMES, in spawn order.
+ *
+ * The `close` listeners the boot wires (the fatalExit-on-crash guards) are NEVER
+ * fired by the stub, so the `!shuttingDown` crash path can't trip the test
+ * runner. We do NOT call `handle.stop()` (no real workers to tear down); the
+ * sandboxed DB connection is released when the test process ends and the tmpdir
+ * is removed in `afterEach`.
+ */
+function spawnedWorkerNames(opts?: {
+  workers?: readonly WorkerName[];
+}): WorkerName[] {
+  const captured: WorkerName[] = [];
+
+  // Minimal Worker stub — records the module name, no-ops the lifecycle surface.
+  class WorkerSpy {
+    onmessage: ((ev: unknown) => void) | null = null;
+    onerror: ((ev: unknown) => void) | null = null;
+    constructor(url: string | URL) {
+      const href = typeof url === "string" ? url : url.href;
+      const leaf = href.split("/").pop() ?? href;
+      const name = WORKER_MODULE_TO_NAME[leaf];
+      if (name) captured.push(name);
+    }
+    addEventListener(): void {}
+    postMessage(): void {}
+    terminate(): void {}
+  }
+
+  const realWorker = globalThis.Worker;
+  // Sandbox every state path on the LIVE process.env for the synchronous boot
+  // window, mirroring the in-process harness (the path resolvers read
+  // process.env directly). Restore exactly afterward — no `await` between set
+  // and restore, so it stays parallel-safe.
+  const sockPath = join(tmpDir, "keeperd.sock");
+  const sandbox: Record<string, string> = {
+    KEEPER_DB: dbPath,
+    KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
+    KEEPER_EVENTS_LOG: join(tmpDir, "events-log"),
+    KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
+    KEEPER_RESTORE_FILE: join(tmpDir, "restore.json"),
+    KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
+    KEEPER_SOCK: sockPath,
+  };
+  const prior: Record<string, string | undefined> = {};
+  for (const k of Object.keys(sandbox)) prior[k] = process.env[k];
+
+  let handle: DaemonHandle | null = null;
+  try {
+    (globalThis as { Worker: unknown }).Worker = WorkerSpy;
+    for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
+    // Boot is fully synchronous up to the returned handle (every `new Worker`
+    // fires here, under the spy).
+    handle = startDaemon(opts);
+  } finally {
+    (globalThis as { Worker: unknown }).Worker = realWorker;
+    for (const k of Object.keys(sandbox)) {
+      const v = prior[k];
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+  void handle;
+  return captured;
+}
+
+test("fn-749: the production boot (no selector) spawns the IDENTICAL eleven workers", () => {
+  // The headline regression guard: a wrong default would silently drop a worker
+  // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
+  // must spawn exactly ALL_WORKERS, in order.
+  const spawned = spawnedWorkerNames();
+  expect(spawned).toEqual([...ALL_WORKERS]);
+  expect(spawned).toHaveLength(11);
+  // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
+  // must consciously update this contract.
+  expect([...ALL_WORKERS]).toEqual([
+    "wake",
+    "server",
+    "transcript",
+    "plan",
+    "exit",
+    "git",
+    "usage",
+    "deadLetter",
+    "eventsIngest",
+    "autopilot",
+    "restore",
+  ]);
+});
+
+test("fn-749: passing the full ALL_WORKERS set is identical to passing no selector", () => {
+  // The production default is ALL_WORKERS, so an explicit full set is a no-op.
+  expect(spawnedWorkerNames({ workers: ALL_WORKERS })).toEqual([
+    ...ALL_WORKERS,
+  ]);
+});
+
+test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worker)", () => {
+  // The UDS/RPC/fold tier's set: wake (main's reducer pump) + server (UDS).
+  const minimal = spawnedWorkerNames({ workers: ["wake", "server"] });
+  expect(minimal).toEqual(["wake", "server"]);
+  // Crucially NONE of the six @parcel/watcher workers spawned.
+  for (const w of [
+    "transcript",
+    "plan",
+    "git",
+    "usage",
+    "deadLetter",
+    "eventsIngest",
+  ] as const) {
+    expect(minimal).not.toContain(w);
+  }
+
+  // The plan-fold tier's set additionally boots the plan worker — and ONLY it
+  // among the watchers.
+  const planSet = spawnedWorkerNames({ workers: ["wake", "server", "plan"] });
+  expect(planSet).toEqual(["wake", "server", "plan"]);
+});

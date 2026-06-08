@@ -1270,6 +1270,77 @@ export function prewarmWatcherAddon(
 }
 
 /**
+ * fn-749 — the eleven worker threads {@link startDaemon} spawns, each addressable
+ * by a stable name so a test can boot a SUBSET. The names map 1:1 to the
+ * `new Worker(...)` sites in {@link startDaemon}:
+ *
+ *  - `wake`          — `wake-worker.ts`; polls `data_version` and pumps main's
+ *                      reducer drain. In keeper's topology the REDUCER itself runs
+ *                      on MAIN (`drainToCompletion`), woken by this worker — there
+ *                      is no separate "reducer" worker. So any fold-driven test
+ *                      needs `wake` (the pump) but NOT a dedicated reducer worker.
+ *  - `server`        — `server-worker.ts`; owns the UDS read surface.
+ *  - `transcript`    — `transcript-worker.ts`; watcher producer.
+ *  - `plan`          — `plan-worker.ts`; `.planctl` watcher producer.
+ *  - `exit`          — `exit-watcher.ts`; kqueue/pidfd process-exit watcher.
+ *  - `git`           — `git-worker.ts`; git-status watcher producer.
+ *  - `usage`         — `usage-worker.ts`; agentuse watcher producer.
+ *  - `deadLetter`    — `dead-letter-worker.ts`; dead-letter dir watcher.
+ *  - `eventsIngest`  — `events-ingest-worker.ts`; events-log NDJSON watch-hint.
+ *  - `autopilot`     — `autopilot-worker.ts`; dispatch reconciler.
+ *  - `restore`       — `restore-worker.ts`; restore.json snapshot writer.
+ */
+export type WorkerName =
+  | "wake"
+  | "server"
+  | "transcript"
+  | "plan"
+  | "exit"
+  | "git"
+  | "usage"
+  | "deadLetter"
+  | "eventsIngest"
+  | "autopilot"
+  | "restore";
+
+/**
+ * fn-749 — the full eleven-worker set, in spawn order. This IS the production
+ * boot: {@link runDaemon} passes no `workers` selector, so {@link startDaemon}
+ * defaults to this list and spawns the identical eleven workers (zero behavior
+ * change). The set is the source of truth for the "production boot spawns all
+ * eleven" regression test.
+ */
+export const ALL_WORKERS: readonly WorkerName[] = [
+  "wake",
+  "server",
+  "transcript",
+  "plan",
+  "exit",
+  "git",
+  "usage",
+  "deadLetter",
+  "eventsIngest",
+  "autopilot",
+  "restore",
+] as const;
+
+/**
+ * fn-749 — the SIX watcher workers that dlopen `@parcel/watcher`. Used to decide
+ * whether the main-thread pre-warm ({@link prewarmWatcherAddon}) is needed: with
+ * `disableNativeWatcher` off, the pre-warm runs ONLY when at least one of these
+ * is in the selected set (a `wake`+`server`-only boot loads no addon, so there is
+ * no first-dlopen race to pre-warm).
+ */
+const WATCHER_WORKERS: readonly WorkerName[] = [
+  "transcript",
+  "plan",
+  "git",
+  "usage",
+  "deadLetter",
+  "eventsIngest",
+] as const;
+
+/**
  * fn-747 — options for {@link startDaemon}. The production
  * `import.meta.main → runDaemon()` boot passes none (every field falls to its
  * production default); the in-process test harness sets `disableNativeWatcher`.
@@ -1287,6 +1358,19 @@ export interface DaemonOptions {
    * the pre-warm are unchanged.
    */
   disableNativeWatcher?: boolean;
+  /**
+   * fn-749 worker-set selector. When supplied, {@link startDaemon} spawns ONLY
+   * the named workers; every unselected worker is never constructed (its
+   * `onmessage`/`onerror`/`close` handlers are never wired and its reference
+   * stays `null`). When OMITTED (the production default), the full
+   * {@link ALL_WORKERS} set spawns — so the `import.meta.main → runDaemon` boot
+   * is byte-for-byte unchanged. The in-process slow-test tier passes a minimal
+   * set (e.g. `["wake", "server"]` for a fold/UDS test) so no watcher worker
+   * dlopens the addon at all. Pick each set DELIBERATELY: a fold-driven test
+   * needs `wake` (main's reducer pump) + `server` (to serve), and a plan-fold
+   * test additionally needs `plan`.
+   */
+  workers?: readonly WorkerName[];
 }
 
 /**
@@ -1320,6 +1404,13 @@ export interface DaemonHandle {
  */
 export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.title = "keeperd";
+  // fn-749 — resolve the worker-set selector. Omitted → the full ALL_WORKERS
+  // set (production parity: runDaemon passes no selector, so this spawns the
+  // identical eleven workers). A test passes a minimal subset; `want(name)`
+  // gates each `new Worker(...)` site below. The fold REDUCER runs on MAIN (the
+  // `drainToCompletion` pump) regardless of the selector — it is never a worker.
+  const selectedWorkers = new Set<WorkerName>(opts.workers ?? ALL_WORKERS);
+  const want = (name: WorkerName): boolean => selectedWorkers.has(name);
   // fn-747 — resolve the UDS path the same way the server worker does, so the
   // returned handle exposes it for `waitForDaemon` (the server worker defaults to
   // `resolveSockPath()` when `workerData.sockPath` is omitted, which it is).
@@ -1600,6 +1691,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // that boot window is a tolerated no-op (the next full discovery sweep
   // recovers it), mirroring the `autopilotWorker` ordering tolerance.
   let gitWorkerRef: Worker | null = null;
+  // fn-749 — forward declaration of the server worker. `pumpWakes` (defined
+  // just below) captures this via closure to `kick` the server after a drain;
+  // the actual `new Worker(...)` lands further down, gated on the selector. The
+  // `?.` in `pumpWakes` tolerates the null window (and a server-less boot).
+  let serverWorker: Worker | null = null;
 
   /**
    * Process the wake signal. Re-entrancy guard (`draining`) ensures we never
@@ -1631,7 +1727,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // is version-gated). Skip on a no-op pump (re-entrant wake that folded
     // nothing) and during shutdown.
     if (folded && !shuttingDown) {
-      serverWorker.postMessage({ type: "kick" } satisfies KickMessage);
+      // fn-749: null-guarded — a boot without the server worker has no UDS
+      // surface to kick; the fold still ran on main.
+      serverWorker?.postMessage({ type: "kick" } satisfies KickMessage);
     }
   }
 
@@ -1651,7 +1749,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // NOT load the addon on main either, or the in-process daemon dlopens it after
   // all (defeating the SIGTRAP avoidance). Skip the pre-warm entirely in that
   // mode.
-  if (!opts.disableNativeWatcher) {
+  // fn-749 — also skip the pre-warm when NO watcher worker is in the selected
+  // set: a `wake`+`server`-only boot loads no addon on any thread, so there is
+  // no first-dlopen race to serialize. (Production selects all six, so the
+  // pre-warm runs exactly as before.)
+  const anyWatcherSelected = WATCHER_WORKERS.some((n) => want(n));
+  if (!opts.disableNativeWatcher && anyWatcherSelected) {
     try {
       prewarmWatcherAddon();
     } catch {
@@ -1665,144 +1768,239 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   // Step 3 — spawn the wake worker. Bun uses the web Worker API; `workerData`
   // is a worker_threads option not in the DOM lib type, hence the cast.
-  const worker = new Worker(new URL("./wake-worker.ts", import.meta.url).href, {
-    workerData: { dbPath, pollMs: 25 } satisfies WakeWorkerData,
-  } as WorkerOptions & { workerData: unknown });
+  // fn-749: gated on the selector. `null` when unselected — but a daemon
+  // without the wake worker never pumps main's reducer drain on a foreign-
+  // connection write, so a fold-driven test MUST include `wake`.
+  let worker: Worker | null = null;
+  if (want("wake")) {
+    worker = new Worker(new URL("./wake-worker.ts", import.meta.url).href, {
+      workerData: { dbPath, pollMs: 25 } satisfies WakeWorkerData,
+    } as WorkerOptions & { workerData: unknown });
 
-  // Step 4 — each wake message triggers a (coalescing) drain pass.
-  worker.onmessage = (ev: MessageEvent<WakeMessage | undefined>): void => {
-    if (ev.data && ev.data.kind === "wake") {
-      wakePending = true;
-      pumpWakes();
-    }
-  };
+    // Step 4 — each wake message triggers a (coalescing) drain pass.
+    worker.onmessage = (ev: MessageEvent<WakeMessage | undefined>): void => {
+      if (ev.data && ev.data.kind === "wake") {
+        wakePending = true;
+        pumpWakes();
+      }
+    };
 
-  // Worker `error` event is NOT a message — it signals the worker thread itself
-  // failed. Per the single-recovery-path policy: crash → exit 1 → launchd
-  // restarts. Do NOT attempt to respawn the worker in-process. The
-  // `!shuttingDown` guard mirrors the `close` handler below (and every other
-  // worker's onerror): once shutdown() is underway a worker erroring
-  // mid-teardown is moot — the worker-exit race in shutdown() already
-  // backstops a wedge — so it must NOT clobber the clean `exit(0)`. Without
-  // it, a SIGTERM landing while a worker was mid-operation intermittently
-  // failed the integration suite (daemon exited 1, not 0) under parallel load.
-  worker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] wake worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
+    // Worker `error` event is NOT a message — it signals the worker thread
+    // itself failed. Per the single-recovery-path policy: crash → exit 1 →
+    // launchd restarts. Do NOT attempt to respawn the worker in-process. The
+    // `!shuttingDown` guard mirrors the `close` handler below (and every other
+    // worker's onerror): once shutdown() is underway a worker erroring
+    // mid-teardown is moot — the worker-exit race in shutdown() already
+    // backstops a wedge — so it must NOT clobber the clean `exit(0)`. Without
+    // it, a SIGTERM landing while a worker was mid-operation intermittently
+    // failed the integration suite (daemon exited 1, not 0) under parallel load.
+    worker.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] wake worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
 
-  // A worker `process.exit(1)` (e.g. its own fatalExit) fires `close`, NOT
-  // `onerror` — so the steady-state crash path needs its own listener, or a
-  // crashing worker leaves a zombie daemon and launchd is never notified. The
-  // `!shuttingDown` guard makes this a no-op on the clean path (shutdown() sets
-  // the flag before posting `{ type: "shutdown" }`), avoiding a double exit.
-  worker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+    // A worker `process.exit(1)` (e.g. its own fatalExit) fires `close`, NOT
+    // `onerror` — so the steady-state crash path needs its own listener, or a
+    // crashing worker leaves a zombie daemon and launchd is never notified. The
+    // `!shuttingDown` guard makes this a no-op on the clean path (shutdown()
+    // sets the flag before posting `{ type: "shutdown" }`), avoiding a double
+    // exit.
+    worker.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
 
   // Spawn the server worker in the SAME post-migration window: its read-only
   // `openDb` would fail loud against a missing/un-migrated DB. It binds the UDS,
   // acquires the ownership lock, and runs its own `data_version` poll — fully
   // decoupled from the reducer. `dbPath` is the only required field; sock/lock
   // paths default to `resolveSockPath()` worker-side (KEEPER_SOCK honored there).
-  const serverWorker = new Worker(
-    new URL("./server-worker.ts", import.meta.url).href,
-    {
-      workerData: { dbPath, role: "server" } satisfies ServerWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector. `serverWorker` was forward-declared above
+  // (for `pumpWakes`'s kick); assign it here when selected. A boot without the
+  // server worker binds no UDS — a query/RPC test MUST include `server`.
+  if (want("server")) {
+    serverWorker = new Worker(
+      new URL("./server-worker.ts", import.meta.url).href,
+      {
+        workerData: { dbPath, role: "server" } satisfies ServerWorkerData,
+      } as WorkerOptions & { workerData: unknown },
+    );
+    // fn-749: a non-null local so the bridge closures below don't have to
+    // re-narrow the nullable `serverWorker` field on every reply.
+    const sw = serverWorker;
 
-  // Server-worker → main bridge. Originally the `replay_dead_letter`
-  // round-trip (fn-643 task .4); extended for fn-661 task .4 with the
-  // autopilot pause/retry pair. Every inbound message carries a `kind`
-  // discriminator so a stale reply for one verb can't wrong-resolve
-  // another. The `{kind:"ready"}` signal is one-way (worker→main only)
-  // and matches no branch — silently dropped.
-  serverWorker.onmessage = (
-    ev: MessageEvent<
-      | ReplayRequestMessage
-      | SetAutopilotPausedRequestMessage
-      | RetryDispatchRequestMessage
-      | { kind: "ready" }
-      | undefined
-    >,
-  ): void => {
-    const msg = ev.data;
-    if (!msg) return;
-    if (msg.kind === "replay-request") {
-      const id = msg.id;
-      let reply: ReplayResultMessage;
-      try {
-        const recoveredDlId = recoverOneDeadLetter(db);
-        reply = {
-          type: "replay-result",
-          id,
-          ok: true,
-          recovered_dl_id: recoveredDlId,
-        };
-        if (recoveredDlId !== null) {
-          // We appended a real `events` row. Pump a wake so the reducer
-          // folds it (jobs / epics / etc.) without waiting for the wake
-          // worker's `data_version` poll — symmetry with the other
-          // synthetic-event mint sites in this file.
-          wakePending = true;
-          pumpWakes();
-        }
-      } catch (err) {
-        // The recovery transaction crashed (programming bug or a DB-level
-        // failure). Surface as a typed `ok:false` reply; the worker's
-        // dispatcher frames `rpc_failed` on the wire.
-        reply = {
-          type: "replay-result",
-          id,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        };
-      }
-      serverWorker.postMessage(reply);
-      return;
-    }
-    if (msg.kind === "set-autopilot-paused-request") {
-      // Fn-661 task .4 / fn-667 task .1. APPEND an `AutopilotPaused`
-      // synthetic event FIRST onto the writable connection so the reducer
-      // folds it into the `autopilot_state` singleton on the next drain
-      // (the viewer's banner-truth substrate). THEN — only on a successful
-      // insert — flip the in-memory `autopilotPaused` flag and relay a
-      // `{type:"set-paused"}` command to the autopilot worker. Order
-      // matters: the gate (worker dispatch decision) and the projection
-      // (viewer-visible state) MUST NOT diverge on a partial failure. If
-      // the insert throws, neither side flips and the RPC returns
-      // `ok:false` — the human's pause/play attempt is rejected loud
-      // rather than silently dropped half-way.
-      //
-      // Mirrors the retry-dispatch handler's mint pattern (same column
-      // list — keep them in sync on any future events-column add). The
-      // session_id is a stable synthetic constant (`"autopilot"`) so
-      // every AutopilotPaused row groups onto the same key — useful for
-      // event-log scans and matches the producer-side convention every
-      // other singleton-bound synthetic uses.
-      //
-      // Surfaces `ok:false` ONLY if the autopilot worker isn't constructed
-      // yet (a narrow boot race between this bridge wire-up and the worker
-      // spawn below) OR the insert throws (a writer-lock contention or DB
-      // failure). The worker is always present in steady state; the
-      // insert is one prepared-statement run, no scan.
-      let reply: SetAutopilotPausedResultMessage;
-      if (autopilotWorker === null) {
-        reply = {
-          type: "set-autopilot-paused-result",
-          id: msg.id,
-          ok: false,
-          error: "autopilot worker not yet ready",
-        };
-      } else {
+    // Server-worker → main bridge. Originally the `replay_dead_letter`
+    // round-trip (fn-643 task .4); extended for fn-661 task .4 with the
+    // autopilot pause/retry pair. Every inbound message carries a `kind`
+    // discriminator so a stale reply for one verb can't wrong-resolve
+    // another. The `{kind:"ready"}` signal is one-way (worker→main only)
+    // and matches no branch — silently dropped.
+    sw.onmessage = (
+      ev: MessageEvent<
+        | ReplayRequestMessage
+        | SetAutopilotPausedRequestMessage
+        | RetryDispatchRequestMessage
+        | { kind: "ready" }
+        | undefined
+      >,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "replay-request") {
+        const id = msg.id;
+        let reply: ReplayResultMessage;
         try {
+          const recoveredDlId = recoverOneDeadLetter(db);
+          reply = {
+            type: "replay-result",
+            id,
+            ok: true,
+            recovered_dl_id: recoveredDlId,
+          };
+          if (recoveredDlId !== null) {
+            // We appended a real `events` row. Pump a wake so the reducer
+            // folds it (jobs / epics / etc.) without waiting for the wake
+            // worker's `data_version` poll — symmetry with the other
+            // synthetic-event mint sites in this file.
+            wakePending = true;
+            pumpWakes();
+          }
+        } catch (err) {
+          // The recovery transaction crashed (programming bug or a DB-level
+          // failure). Surface as a typed `ok:false` reply; the worker's
+          // dispatcher frames `rpc_failed` on the wire.
+          reply = {
+            type: "replay-result",
+            id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "set-autopilot-paused-request") {
+        // Fn-661 task .4 / fn-667 task .1. APPEND an `AutopilotPaused`
+        // synthetic event FIRST onto the writable connection so the reducer
+        // folds it into the `autopilot_state` singleton on the next drain
+        // (the viewer's banner-truth substrate). THEN — only on a successful
+        // insert — flip the in-memory `autopilotPaused` flag and relay a
+        // `{type:"set-paused"}` command to the autopilot worker. Order
+        // matters: the gate (worker dispatch decision) and the projection
+        // (viewer-visible state) MUST NOT diverge on a partial failure. If
+        // the insert throws, neither side flips and the RPC returns
+        // `ok:false` — the human's pause/play attempt is rejected loud
+        // rather than silently dropped half-way.
+        //
+        // Mirrors the retry-dispatch handler's mint pattern (same column
+        // list — keep them in sync on any future events-column add). The
+        // session_id is a stable synthetic constant (`"autopilot"`) so
+        // every AutopilotPaused row groups onto the same key — useful for
+        // event-log scans and matches the producer-side convention every
+        // other singleton-bound synthetic uses.
+        //
+        // Surfaces `ok:false` ONLY if the autopilot worker isn't constructed
+        // yet (a narrow boot race between this bridge wire-up and the worker
+        // spawn below) OR the insert throws (a writer-lock contention or DB
+        // failure). The worker is always present in steady state; the
+        // insert is one prepared-statement run, no scan.
+        let reply: SetAutopilotPausedResultMessage;
+        if (autopilotWorker === null) {
+          reply = {
+            type: "set-autopilot-paused-result",
+            id: msg.id,
+            ok: false,
+            error: "autopilot worker not yet ready",
+          };
+        } else {
+          try {
+            stmts.insertEvent.run({
+              $ts: Date.now() / 1000,
+              $session_id: "autopilot",
+              $pid: null,
+              $hook_event: "AutopilotPaused",
+              $event_type: "autopilot_state",
+              $tool_name: null,
+              $matcher: null,
+              $cwd: null,
+              $permission_mode: null,
+              $agent_id: null,
+              $agent_type: null,
+              $stop_hook_active: null,
+              $data: JSON.stringify({ paused: msg.paused }),
+              $subagent_agent_id: null,
+              $spawn_name: null,
+              $start_time: null,
+              $slash_command: null,
+              $skill_name: null,
+              $planctl_op: null,
+              $planctl_target: null,
+              $planctl_epic_id: null,
+              $planctl_task_id: null,
+              $planctl_subject_present: null,
+              $config_dir: null,
+              $planctl_queue_jump: null,
+              $bash_mutation_kind: null,
+              $bash_mutation_targets: null,
+              $planctl_files: null,
+              $backend_exec_type: null,
+              $backend_exec_session_id: null,
+              $backend_exec_pane_id: null,
+            });
+            wakePending = true;
+            pumpWakes();
+            // Only AFTER the event is durably appended do we flip the
+            // in-memory gate + relay to the worker. A throw above leaves
+            // both untouched.
+            autopilotPaused = msg.paused;
+            autopilotWorker.postMessage({
+              type: "set-paused",
+              paused: msg.paused,
+            });
+            reply = {
+              type: "set-autopilot-paused-result",
+              id: msg.id,
+              ok: true,
+            };
+          } catch (err) {
+            reply = {
+              type: "set-autopilot-paused-result",
+              id: msg.id,
+              ok: false,
+              error: err instanceof Error ? err.message : String(err),
+            };
+          }
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "retry-dispatch-request") {
+        // Fn-661 task .4. Append a `DispatchCleared` synthetic event onto
+        // the writable connection so the reducer's fold arm DELETEs the
+        // matching `dispatch_failures` row on the next drain. Mirrors the
+        // git-worker mint pattern (insertEvent.run + wakePending=true +
+        // pumpWakes). The wire `verb` is already validated to be one of
+        // `work` / `close` / `approve`; the wire `dispatch_id` is a
+        // non-empty token (validated handler-side); main treats both as
+        // opaque payload tokens.
+        const id = msg.id;
+        let reply: RetryDispatchResultMessage;
+        try {
+          const data = JSON.stringify({
+            verb: msg.verb,
+            id: msg.dispatch_id,
+          });
           stmts.insertEvent.run({
             $ts: Date.now() / 1000,
-            $session_id: "autopilot",
+            // The dispatch key rides as the entity-key overload so a
+            // re-fold can correlate the event to its dispatch_failures
+            // row without re-parsing the data blob. Same convention as
+            // every other synthetic minted on main (the producer-side
+            // composite `${verb}::${id}` is unambiguous).
+            $session_id: `${msg.verb}::${msg.dispatch_id}`,
             $pid: null,
-            $hook_event: "AutopilotPaused",
-            $event_type: "autopilot_state",
+            $hook_event: "DispatchCleared",
+            $event_type: "dispatch_failures",
             $tool_name: null,
             $matcher: null,
             $cwd: null,
@@ -1810,7 +2008,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             $agent_id: null,
             $agent_type: null,
             $stop_hook_active: null,
-            $data: JSON.stringify({ paused: msg.paused }),
+            $data: data,
             $subagent_agent_id: null,
             $spawn_name: null,
             $start_time: null,
@@ -1832,58 +2030,99 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           });
           wakePending = true;
           pumpWakes();
-          // Only AFTER the event is durably appended do we flip the
-          // in-memory gate + relay to the worker. A throw above leaves
-          // both untouched.
-          autopilotPaused = msg.paused;
-          autopilotWorker.postMessage({
-            type: "set-paused",
-            paused: msg.paused,
-          });
-          reply = {
-            type: "set-autopilot-paused-result",
-            id: msg.id,
-            ok: true,
-          };
+          reply = { type: "retry-dispatch-result", id, ok: true };
         } catch (err) {
           reply = {
-            type: "set-autopilot-paused-result",
-            id: msg.id,
+            type: "retry-dispatch-result",
+            id,
             ok: false,
             error: err instanceof Error ? err.message : String(err),
           };
         }
+        sw.postMessage(reply);
+        return;
       }
-      serverWorker.postMessage(reply);
-      return;
-    }
-    if (msg.kind === "retry-dispatch-request") {
-      // Fn-661 task .4. Append a `DispatchCleared` synthetic event onto
-      // the writable connection so the reducer's fold arm DELETEs the
-      // matching `dispatch_failures` row on the next drain. Mirrors the
-      // git-worker mint pattern (insertEvent.run + wakePending=true +
-      // pumpWakes). The wire `verb` is already validated to be one of
-      // `work` / `close` / `approve`; the wire `dispatch_id` is a
-      // non-empty token (validated handler-side); main treats both as
-      // opaque payload tokens.
-      const id = msg.id;
-      let reply: RetryDispatchResultMessage;
-      try {
-        const data = JSON.stringify({
-          verb: msg.verb,
-          id: msg.dispatch_id,
-        });
+    };
+
+    // Same crash policy as the wake worker: any thread failure → fatalExit → exit
+    // 1 → launchd restart. No in-process respawn.
+    sw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] server worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    // Same crash-via-`close` gap as the wake worker: a server-worker
+    // `process.exit(1)` fires `close`, not `onerror`. Without this the subscribe
+    // server could silently vanish while the reducer kept running. `!shuttingDown`
+    // makes it inert on the clean shutdown path.
+    sw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // fn-749: end `if (want("server"))`
+
+  // Spawn the transcript worker in the SAME post-migration window. It watches
+  // the external transcript tree and posts a `transcript-title` message whenever
+  // it tails a `custom-title` line — making the daemon an event PRODUCER for the
+  // first time. The watch root is resolved ON MAIN via `resolveClaudeProjectsRoot()`
+  // (config `claude_projects_root` → absolute path, default `~/.claude/projects`)
+  // and passed as the always-populated `workerData.watchRoot`, mirroring how the
+  // plan worker receives `roots: resolvePlanRoots()`.
+  if (process.env.KEEPER_WATCH_ROOT) {
+    console.error(
+      "[keeperd] KEEPER_WATCH_ROOT is deprecated and ignored; set `claude_projects_root` in ~/.config/keeper/config.yaml instead",
+    );
+  }
+  // fn-749: gated on the selector — `null` when unselected, and the handler
+  // wiring below is guarded so it is never touched.
+  const transcriptWorker = want("transcript")
+    ? new Worker(new URL("./transcript-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          watchRoot: resolveClaudeProjectsRoot(),
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies TranscriptWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  // fn-749: wire handlers only when the worker was selected (`tw` is the
+  // non-null narrowing of the nullable field).
+  if (transcriptWorker) {
+    const tw = transcriptWorker;
+    // Main stays the SOLE writer: a worker `transcript-title` message becomes a
+    // synthetic `TranscriptTitle` events row inserted on the existing WRITABLE
+    // connection, then a wake pump folds it (priority-3 'transcript' title). The
+    // insert is synchronous on the main thread and so cannot interleave with the
+    // synchronous drain inside pumpWakes. Bindings are named — see the comment on
+    // `stmts.insertEvent` in `src/db.ts` for why. The title rides in
+    // `data.session_title` (the same field the reducer's title rule reads);
+    // everything else is NULL (synthetic — never carries a process identity).
+    tw.onmessage = (
+      ev: MessageEvent<
+        | TranscriptTitleMessage
+        | ApiErrorMessage
+        | InputRequestMessage
+        | BackstopMessage
+        | undefined
+      >,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) {
+        return;
+      }
+      if (msg.kind === "backstop") {
+        // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
+        // writer — append the line and return. NOT an event fold (a pure
+        // consumer-side side-file, never read by the reducer).
+        handleBackstopMessage(msg);
+        return;
+      }
+      if (msg.kind === "transcript-title") {
         stmts.insertEvent.run({
-          $ts: Date.now() / 1000,
-          // The dispatch key rides as the entity-key overload so a
-          // re-fold can correlate the event to its dispatch_failures
-          // row without re-parsing the data blob. Same convention as
-          // every other synthetic minted on main (the producer-side
-          // composite `${verb}::${id}` is unambiguous).
-          $session_id: `${msg.verb}::${msg.dispatch_id}`,
+          $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+          $session_id: msg.sessionId, // == job_id
           $pid: null,
-          $hook_event: "DispatchCleared",
-          $event_type: "dispatch_failures",
+          $hook_event: "TranscriptTitle", // synthetic; reducer maps → 'transcript'
+          $event_type: "transcript_title",
           $tool_name: null,
           $matcher: null,
           $cwd: null,
@@ -1891,7 +2130,65 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $agent_id: null,
           $agent_type: null,
           $stop_hook_active: null,
-          $data: data,
+          $data: JSON.stringify({ session_title: msg.title }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $planctl_op: null,
+          $planctl_target: null,
+          $planctl_epic_id: null,
+          $planctl_task_id: null,
+          $planctl_subject_present: null,
+          $config_dir: null,
+          $planctl_queue_jump: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $planctl_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+        });
+        // Our own INSERT bumps data_version, so the wake worker would re-drain
+        // anyway — but pump directly so the title folds without a poll-cycle delay.
+        wakePending = true;
+        pumpWakes();
+        return;
+      }
+      if (msg.kind === "api-error") {
+        // Synthetic `ApiError` event minted from the transcript-worker
+        // signal — Claude Code wrote its `isApiErrorMessage: true` synthetic
+        // assistant turn to the JSONL, naming the failure mode via a
+        // bare-string `error` field (`rate_limit` / `authentication_failed` /
+        // `billing_error` / `server_error` / `invalid_request`; anything
+        // else routed through the matcher's `"unknown"` fallback). The
+        // reducer's dual-case `RateLimited` / `ApiError` arm (schema v24)
+        // folds this row by flipping `jobs.state` to `'stopped'` AND
+        // stamping `(last_api_error_at, last_api_error_kind)` to the event
+        // ts + the matched kind in a single compound UPDATE
+        // (re-fold-deterministic). Everything other than `session_id` /
+        // `hook_event` / `event_type` / `data` is NULL — synthetics never
+        // carry a process identity. The matched kind rides in `data.kind`
+        // (read by the reducer's `extractApiErrorKind`); the display text
+        // rides alongside in `data.text` for downstream consumers. The
+        // pre-v24 `RateLimited` event_type is still folded by the same arm
+        // via the dual-case alias so the historical event log re-folds
+        // byte-deterministically — we never re-mint it.
+        stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          $session_id: msg.sessionId,
+          $pid: null,
+          $hook_event: "ApiError",
+          $event_type: "api_error",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({ kind: msg.errorKind, text: msg.text }),
           $subagent_agent_id: null,
           $spawn_name: null,
           $start_time: null,
@@ -1913,93 +2210,194 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         });
         wakePending = true;
         pumpWakes();
-        reply = { type: "retry-dispatch-result", id, ok: true };
-      } catch (err) {
-        reply = {
-          type: "retry-dispatch-result",
-          id,
-          ok: false,
-          error: err instanceof Error ? err.message : String(err),
-        };
+        return;
       }
-      serverWorker.postMessage(reply);
-      return;
-    }
-  };
+      if (msg.kind === "input-request") {
+        // Synthetic `InputRequest` event minted from the transcript-worker
+        // signal — Claude Code used a built-in interactive tool that fires
+        // no Pre/PostToolUse hook of its own (initially `AskUserQuestion`).
+        // The reducer's `InputRequest` arm (schema v25) folds this row by
+        // flipping `jobs.state` to `'stopped'` AND stamping
+        // `(last_input_request_at, last_input_request_kind)` to the event
+        // ts + the matched kind in a single compound UPDATE
+        // (re-fold-deterministic). Everything other than `session_id` /
+        // `hook_event` / `event_type` / `data` is NULL — synthetics never
+        // carry a process identity. The matched kind rides in `data.kind`
+        // (read by the reducer's `extractInputRequestKind`). Mirrors the
+        // `api-error` branch above structurally; the transcript matcher
+        // arrives in task .2 of fn-617 — until then no `InputRequest`
+        // event ever lands and this branch is unreachable in practice,
+        // but landing the mint + the reducer arm together preserves the
+        // re-fold determinism invariant (an event log emitted by a
+        // future task .2 must fold the same way under a re-fold from
+        // scratch on this code).
+        stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          $session_id: msg.sessionId,
+          $pid: null,
+          $hook_event: "InputRequest",
+          $event_type: "input_request",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: null,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({ kind: msg.requestKind }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $planctl_op: null,
+          $planctl_target: null,
+          $planctl_epic_id: null,
+          $planctl_task_id: null,
+          $planctl_subject_present: null,
+          $config_dir: null,
+          $planctl_queue_jump: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $planctl_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+        });
+        wakePending = true;
+        pumpWakes();
+        return;
+      }
+    };
 
-  // Same crash policy as the wake worker: any thread failure → fatalExit → exit
-  // 1 → launchd restart. No in-process respawn.
-  serverWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] server worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
+    // Same crash policy as the other workers: any thread failure → fatalExit.
+    tw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] transcript worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
 
-  // Same crash-via-`close` gap as the wake worker: a server-worker
-  // `process.exit(1)` fires `close`, not `onerror`. Without this the subscribe
-  // server could silently vanish while the reducer kept running. `!shuttingDown`
-  // makes it inert on the clean shutdown path.
-  serverWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+    // Same crash-via-`close` gap: a transcript-worker `process.exit(1)` fires
+    // `close`, not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
+    tw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // fn-749: end `if (transcriptWorker)`
 
-  // Spawn the transcript worker in the SAME post-migration window. It watches
-  // the external transcript tree and posts a `transcript-title` message whenever
-  // it tails a `custom-title` line — making the daemon an event PRODUCER for the
-  // first time. The watch root is resolved ON MAIN via `resolveClaudeProjectsRoot()`
-  // (config `claude_projects_root` → absolute path, default `~/.claude/projects`)
-  // and passed as the always-populated `workerData.watchRoot`, mirroring how the
-  // plan worker receives `roots: resolvePlanRoots()`.
-  if (process.env.KEEPER_WATCH_ROOT) {
-    console.error(
-      "[keeperd] KEEPER_WATCH_ROOT is deprecated and ignored; set `claude_projects_root` in ~/.config/keeper/config.yaml instead",
-    );
-  }
-  const transcriptWorker = new Worker(
-    new URL("./transcript-worker.ts", import.meta.url).href,
-    {
-      workerData: {
-        dbPath,
-        watchRoot: resolveClaudeProjectsRoot(),
-        disableNativeWatcher: opts.disableNativeWatcher,
-      } satisfies TranscriptWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // Spawn the plan worker in the SAME post-migration window. It watches each
+  // configured project root's `.planctl/{epics,tasks}` trees and posts a
+  // `plan-epic`/`plan-task` snapshot message on each change — the second
+  // producer-worker instance. `roots` come from `resolvePlanRoots()` (config →
+  // absolute, existing dirs); an empty list means there is nothing to watch.
+  // fn-749: gated on the selector. Cross-referenced by the git-worker handler
+  // (the fn-681 planctl-commit-changed forward) via `planWorker?.postMessage` —
+  // null-safe when unselected.
+  const planWorker = want("plan")
+    ? new Worker(new URL("./plan-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          roots: planRoots,
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies PlanWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
 
-  // Main stays the SOLE writer: a worker `transcript-title` message becomes a
-  // synthetic `TranscriptTitle` events row inserted on the existing WRITABLE
-  // connection, then a wake pump folds it (priority-3 'transcript' title). The
-  // insert is synchronous on the main thread and so cannot interleave with the
-  // synchronous drain inside pumpWakes. Bindings are named — see the comment on
-  // `stmts.insertEvent` in `src/db.ts` for why. The title rides in
-  // `data.session_title` (the same field the reducer's title rule reads);
-  // everything else is NULL (synthetic — never carries a process identity).
-  transcriptWorker.onmessage = (
-    ev: MessageEvent<
-      | TranscriptTitleMessage
-      | ApiErrorMessage
-      | InputRequestMessage
-      | BackstopMessage
-      | undefined
-    >,
-  ): void => {
-    const msg = ev.data;
-    if (!msg) {
-      return;
-    }
-    if (msg.kind === "backstop") {
-      // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
-      // writer — append the line and return. NOT an event fold (a pure
-      // consumer-side side-file, never read by the reducer).
-      handleBackstopMessage(msg);
-      return;
-    }
-    if (msg.kind === "transcript-title") {
+  if (planWorker) {
+    const pw = planWorker;
+    // Main stays the SOLE writer: a `plan-epic`/`plan-task` snapshot message
+    // becomes a synthetic `EpicSnapshot`/`TaskSnapshot` events row inserted on the
+    // existing WRITABLE connection, then a wake pump folds it (snapshot upsert into
+    // the `epics`/`tasks` projection). The entity id rides in `session_id` (the
+    // generic entity-key overload the reducer reads); the full snapshot rides in
+    // `data` (the same field `extractPlanSnapshot` parses) with the producer's
+    // pre-computed fields mapped to the projection's column names. Mirrors the
+    // `transcript-title` branch exactly; bindings are named (see `stmts.insertEvent`
+    // in `src/db.ts`). Everything other than session_id/hook_event/event_type/data
+    // is NULL (synthetic — never carries a process identity).
+    pw.onmessage = (ev: MessageEvent<PlanWorkerOutbound | undefined>): void => {
+      const msg = ev.data;
+      if (!msg) {
+        return;
+      }
+      if (msg.kind === "backstop") {
+        // Epic fn-720: a worker posted a backstop rescue/rollup record up. Main
+        // is the SOLE sidecar writer — append the line and return. NOT an event
+        // fold; the sidecar is a pure consumer-side side-file. Workers do not
+        // yet EMIT this (counters + last_fast_path_at wiring lands in .2/.3),
+        // but main handles it today so the topology is proven end to end.
+        handleBackstopMessage(msg);
+        return;
+      }
+      if (msg.kind === "nudge-discovery") {
+        // fn-705 discovery nudge: the plan-worker first saw a `.planctl` tree in
+        // `msg.root`. Forward to the git-worker so it folds the root into its
+        // discovery candidates and watches that repo's `.git` immediately
+        // (attribution/GitSnapshot data then flows). NOT written to the event log
+        // — it drives a producer worker, not a projection. The forward-ref
+        // null-guards the boot window before the git worker is constructed.
+        gitWorkerRef?.postMessage({
+          type: "add-discovery-root",
+          root: msg.root,
+        } satisfies AddDiscoveryRootMessage);
+        return;
+      }
+      let hookEvent: string;
+      let data: string;
+      if (msg.kind === "plan-epic") {
+        hookEvent = "EpicSnapshot";
+        data = JSON.stringify({
+          epic_number: msg.number,
+          title: msg.title,
+          project_dir: msg.projectDir,
+          status: msg.status,
+          approval: msg.approval,
+          depends_on_epics: msg.dependsOnEpics,
+          last_validated_at: msg.lastValidatedAt,
+        });
+      } else if (msg.kind === "plan-task") {
+        hookEvent = "TaskSnapshot";
+        data = JSON.stringify({
+          epic_id: msg.epicId,
+          task_number: msg.number,
+          title: msg.title,
+          target_repo: msg.targetRepo,
+          // Planctl-native effort tier (fn-602): rides FREE in the embedded-
+          // tasks JSON — no schema column, no migration. A pre-fn-602
+          // TaskSnapshot blob lacks this key and the reducer reads
+          // `snapshot.tier ?? null` (graceful-degradation precedent shared with
+          // `worker_phase`/`runtime_status`).
+          tier: msg.tier,
+          // Renamed from the legacy `status` field. The producer surfaces the
+          // derived worker-phase binary (`worker_done_at` present → "done", else
+          // "open") under its new name to free up `runtime_status` (sibling
+          // below) for planctl's native enum.
+          worker_phase: msg.workerPhase,
+          // Planctl-native runtime status (`todo|in_progress|done|blocked`)
+          // ingested from `.planctl/state/tasks/<task_id>.state.json`. Threads
+          // through the synthetic-event pipeline so a re-fold reproduces it.
+          runtime_status: msg.runtimeStatus,
+          approval: msg.approval,
+          depends_on: msg.dependsOn,
+        });
+      } else if (msg.kind === "plan-epic-deleted") {
+        // Tombstone: the reducer deletes the `epics` row (embedded tasks vanish
+        // with it). No payload beyond the pk in session_id.
+        hookEvent = "EpicDeleted";
+        data = "";
+      } else if (msg.kind === "plan-task-deleted") {
+        // Tombstone: the reducer splices the element out of the parent epic's
+        // embedded array. The parent key rides in the `data` blob (the deleted
+        // file is gone, so the producer recovered it from the change-gate).
+        hookEvent = "TaskDeleted";
+        data = JSON.stringify({ epic_id: msg.epicId });
+      } else {
+        return;
+      }
       stmts.insertEvent.run({
         $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
-        $session_id: msg.sessionId, // == job_id
+        $session_id: msg.id, // the entity pk: epic_id / task_id
         $pid: null,
-        $hook_event: "TranscriptTitle", // synthetic; reducer maps → 'transcript'
-        $event_type: "transcript_title",
+        $hook_event: hookEvent, // synthetic; reducer folds into epics/tasks
+        $event_type: "plan_snapshot",
         $tool_name: null,
         $matcher: null,
         $cwd: null,
@@ -2007,7 +2405,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $agent_id: null,
         $agent_type: null,
         $stop_hook_active: null,
-        $data: JSON.stringify({ session_title: msg.title }),
+        $data: data, // the full snapshot blob
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,
@@ -2028,294 +2426,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_pane_id: null,
       });
       // Our own INSERT bumps data_version, so the wake worker would re-drain
-      // anyway — but pump directly so the title folds without a poll-cycle delay.
+      // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
       wakePending = true;
       pumpWakes();
-      return;
-    }
-    if (msg.kind === "api-error") {
-      // Synthetic `ApiError` event minted from the transcript-worker
-      // signal — Claude Code wrote its `isApiErrorMessage: true` synthetic
-      // assistant turn to the JSONL, naming the failure mode via a
-      // bare-string `error` field (`rate_limit` / `authentication_failed` /
-      // `billing_error` / `server_error` / `invalid_request`; anything
-      // else routed through the matcher's `"unknown"` fallback). The
-      // reducer's dual-case `RateLimited` / `ApiError` arm (schema v24)
-      // folds this row by flipping `jobs.state` to `'stopped'` AND
-      // stamping `(last_api_error_at, last_api_error_kind)` to the event
-      // ts + the matched kind in a single compound UPDATE
-      // (re-fold-deterministic). Everything other than `session_id` /
-      // `hook_event` / `event_type` / `data` is NULL — synthetics never
-      // carry a process identity. The matched kind rides in `data.kind`
-      // (read by the reducer's `extractApiErrorKind`); the display text
-      // rides alongside in `data.text` for downstream consumers. The
-      // pre-v24 `RateLimited` event_type is still folded by the same arm
-      // via the dual-case alias so the historical event log re-folds
-      // byte-deterministically — we never re-mint it.
-      stmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: msg.sessionId,
-        $pid: null,
-        $hook_event: "ApiError",
-        $event_type: "api_error",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: JSON.stringify({ kind: msg.errorKind, text: msg.text }),
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $planctl_op: null,
-        $planctl_target: null,
-        $planctl_epic_id: null,
-        $planctl_task_id: null,
-        $planctl_subject_present: null,
-        $config_dir: null,
-        $planctl_queue_jump: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $planctl_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-      });
-      wakePending = true;
-      pumpWakes();
-      return;
-    }
-    if (msg.kind === "input-request") {
-      // Synthetic `InputRequest` event minted from the transcript-worker
-      // signal — Claude Code used a built-in interactive tool that fires
-      // no Pre/PostToolUse hook of its own (initially `AskUserQuestion`).
-      // The reducer's `InputRequest` arm (schema v25) folds this row by
-      // flipping `jobs.state` to `'stopped'` AND stamping
-      // `(last_input_request_at, last_input_request_kind)` to the event
-      // ts + the matched kind in a single compound UPDATE
-      // (re-fold-deterministic). Everything other than `session_id` /
-      // `hook_event` / `event_type` / `data` is NULL — synthetics never
-      // carry a process identity. The matched kind rides in `data.kind`
-      // (read by the reducer's `extractInputRequestKind`). Mirrors the
-      // `api-error` branch above structurally; the transcript matcher
-      // arrives in task .2 of fn-617 — until then no `InputRequest`
-      // event ever lands and this branch is unreachable in practice,
-      // but landing the mint + the reducer arm together preserves the
-      // re-fold determinism invariant (an event log emitted by a
-      // future task .2 must fold the same way under a re-fold from
-      // scratch on this code).
-      stmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: msg.sessionId,
-        $pid: null,
-        $hook_event: "InputRequest",
-        $event_type: "input_request",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: JSON.stringify({ kind: msg.requestKind }),
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-        $slash_command: null,
-        $skill_name: null,
-        $planctl_op: null,
-        $planctl_target: null,
-        $planctl_epic_id: null,
-        $planctl_task_id: null,
-        $planctl_subject_present: null,
-        $config_dir: null,
-        $planctl_queue_jump: null,
-        $bash_mutation_kind: null,
-        $bash_mutation_targets: null,
-        $planctl_files: null,
-        $backend_exec_type: null,
-        $backend_exec_session_id: null,
-        $backend_exec_pane_id: null,
-      });
-      wakePending = true;
-      pumpWakes();
-      return;
-    }
-  };
+    };
 
-  // Same crash policy as the other workers: any thread failure → fatalExit.
-  transcriptWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] transcript worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
+    // Same crash policy as the other workers: any thread failure → fatalExit.
+    pw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] plan worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
 
-  // Same crash-via-`close` gap: a transcript-worker `process.exit(1)` fires
-  // `close`, not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
-  transcriptWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
-
-  // Spawn the plan worker in the SAME post-migration window. It watches each
-  // configured project root's `.planctl/{epics,tasks}` trees and posts a
-  // `plan-epic`/`plan-task` snapshot message on each change — the second
-  // producer-worker instance. `roots` come from `resolvePlanRoots()` (config →
-  // absolute, existing dirs); an empty list means there is nothing to watch.
-  const planWorker = new Worker(
-    new URL("./plan-worker.ts", import.meta.url).href,
-    {
-      workerData: {
-        dbPath,
-        roots: planRoots,
-        disableNativeWatcher: opts.disableNativeWatcher,
-      } satisfies PlanWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
-
-  // Main stays the SOLE writer: a `plan-epic`/`plan-task` snapshot message
-  // becomes a synthetic `EpicSnapshot`/`TaskSnapshot` events row inserted on the
-  // existing WRITABLE connection, then a wake pump folds it (snapshot upsert into
-  // the `epics`/`tasks` projection). The entity id rides in `session_id` (the
-  // generic entity-key overload the reducer reads); the full snapshot rides in
-  // `data` (the same field `extractPlanSnapshot` parses) with the producer's
-  // pre-computed fields mapped to the projection's column names. Mirrors the
-  // `transcript-title` branch exactly; bindings are named (see `stmts.insertEvent`
-  // in `src/db.ts`). Everything other than session_id/hook_event/event_type/data
-  // is NULL (synthetic — never carries a process identity).
-  planWorker.onmessage = (
-    ev: MessageEvent<PlanWorkerOutbound | undefined>,
-  ): void => {
-    const msg = ev.data;
-    if (!msg) {
-      return;
-    }
-    if (msg.kind === "backstop") {
-      // Epic fn-720: a worker posted a backstop rescue/rollup record up. Main
-      // is the SOLE sidecar writer — append the line and return. NOT an event
-      // fold; the sidecar is a pure consumer-side side-file. Workers do not
-      // yet EMIT this (counters + last_fast_path_at wiring lands in .2/.3),
-      // but main handles it today so the topology is proven end to end.
-      handleBackstopMessage(msg);
-      return;
-    }
-    if (msg.kind === "nudge-discovery") {
-      // fn-705 discovery nudge: the plan-worker first saw a `.planctl` tree in
-      // `msg.root`. Forward to the git-worker so it folds the root into its
-      // discovery candidates and watches that repo's `.git` immediately
-      // (attribution/GitSnapshot data then flows). NOT written to the event log
-      // — it drives a producer worker, not a projection. The forward-ref
-      // null-guards the boot window before the git worker is constructed.
-      gitWorkerRef?.postMessage({
-        type: "add-discovery-root",
-        root: msg.root,
-      } satisfies AddDiscoveryRootMessage);
-      return;
-    }
-    let hookEvent: string;
-    let data: string;
-    if (msg.kind === "plan-epic") {
-      hookEvent = "EpicSnapshot";
-      data = JSON.stringify({
-        epic_number: msg.number,
-        title: msg.title,
-        project_dir: msg.projectDir,
-        status: msg.status,
-        approval: msg.approval,
-        depends_on_epics: msg.dependsOnEpics,
-        last_validated_at: msg.lastValidatedAt,
-      });
-    } else if (msg.kind === "plan-task") {
-      hookEvent = "TaskSnapshot";
-      data = JSON.stringify({
-        epic_id: msg.epicId,
-        task_number: msg.number,
-        title: msg.title,
-        target_repo: msg.targetRepo,
-        // Planctl-native effort tier (fn-602): rides FREE in the embedded-
-        // tasks JSON — no schema column, no migration. A pre-fn-602
-        // TaskSnapshot blob lacks this key and the reducer reads
-        // `snapshot.tier ?? null` (graceful-degradation precedent shared with
-        // `worker_phase`/`runtime_status`).
-        tier: msg.tier,
-        // Renamed from the legacy `status` field. The producer surfaces the
-        // derived worker-phase binary (`worker_done_at` present → "done", else
-        // "open") under its new name to free up `runtime_status` (sibling
-        // below) for planctl's native enum.
-        worker_phase: msg.workerPhase,
-        // Planctl-native runtime status (`todo|in_progress|done|blocked`)
-        // ingested from `.planctl/state/tasks/<task_id>.state.json`. Threads
-        // through the synthetic-event pipeline so a re-fold reproduces it.
-        runtime_status: msg.runtimeStatus,
-        approval: msg.approval,
-        depends_on: msg.dependsOn,
-      });
-    } else if (msg.kind === "plan-epic-deleted") {
-      // Tombstone: the reducer deletes the `epics` row (embedded tasks vanish
-      // with it). No payload beyond the pk in session_id.
-      hookEvent = "EpicDeleted";
-      data = "";
-    } else if (msg.kind === "plan-task-deleted") {
-      // Tombstone: the reducer splices the element out of the parent epic's
-      // embedded array. The parent key rides in the `data` blob (the deleted
-      // file is gone, so the producer recovered it from the change-gate).
-      hookEvent = "TaskDeleted";
-      data = JSON.stringify({ epic_id: msg.epicId });
-    } else {
-      return;
-    }
-    stmts.insertEvent.run({
-      $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
-      $session_id: msg.id, // the entity pk: epic_id / task_id
-      $pid: null,
-      $hook_event: hookEvent, // synthetic; reducer folds into epics/tasks
-      $event_type: "plan_snapshot",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: data, // the full snapshot blob
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $planctl_op: null,
-      $planctl_target: null,
-      $planctl_epic_id: null,
-      $planctl_task_id: null,
-      $planctl_subject_present: null,
-      $config_dir: null,
-      $planctl_queue_jump: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $planctl_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
+    // Same crash-via-`close` gap: a plan-worker `process.exit(1)` fires `close`,
+    // not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
+    pw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
     });
-    // Our own INSERT bumps data_version, so the wake worker would re-drain
-    // anyway — but pump directly so the snapshot folds without a poll-cycle delay.
-    wakePending = true;
-    pumpWakes();
-  };
-
-  // Same crash policy as the other workers: any thread failure → fatalExit.
-  planWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] plan worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
-
-  // Same crash-via-`close` gap: a plan-worker `process.exit(1)` fires `close`,
-  // not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
-  planWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+  } // fn-749: end `if (planWorker)`
 
   // Spawn the exit-watcher worker in the SAME post-migration window. It owns
   // a kqueue (macOS) / pidfd+epoll (Linux) fd via `bun:ffi`, polls
@@ -2324,265 +2451,275 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // the post-register kill-0 probe finds it already dead. Spawns AFTER seed
   // sweep + re-drain (above) so its initial candidate-set diff reads a
   // settled projection, not a half-folded one.
-  const exitWorker = new Worker(
-    new URL("./exit-watcher.ts", import.meta.url).href,
-    {
-      workerData: { dbPath, pollMs: 50 } satisfies ExitWatcherWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector — `null` when unselected.
+  const exitWorker = want("exit")
+    ? new Worker(new URL("./exit-watcher.ts", import.meta.url).href, {
+        workerData: { dbPath, pollMs: 50 } satisfies ExitWatcherWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
 
-  // Main stays the SOLE writer: an `exit` message becomes a synthetic
-  // `Killed` events row inserted on the existing WRITABLE connection, then a
-  // wake pump folds it. The verifier here re-reads the persisted row and
-  // matches `(pid, start_time)` against the message's snapshot — STRICT when
-  // the row carries a stored start_time, LOOSE pid-only when the row has
-  // none (legacy / pre-schema-v9). A strict-mismatch is a race-recovered
-  // stale event (the row was re-opened with a fresh process between
-  // register and exit delivery, OR the producer races a SessionStart on the
-  // same row); we silently skip it. The reducer's Killed fold ALSO
-  // double-checks the match — this verifier is a producer-side optimization
-  // that keeps the event log tight (no Killed rows that the reducer would
-  // discard as stale).
-  exitWorker.onmessage = (ev: MessageEvent<ExitMessage | undefined>): void => {
-    const msg = ev.data;
-    if (!msg || msg.kind !== "exit") {
-      return;
-    }
-    // Re-read the row to confirm the message's pid + start_time still match
-    // what's persisted. A non-matching row means the session was re-opened
-    // (and the new process is presumably alive) — skip silently.
-    const row = db
-      .query("SELECT pid, start_time, state FROM jobs WHERE job_id = ?")
-      .get(msg.jobId) as {
-      pid: number | null;
-      start_time: string | null;
-      state: string;
-    } | null;
-    if (row == null) {
-      // Row vanished — nothing to fold against.
-      return;
-    }
-    if (row.state === "ended" || row.state === "killed") {
-      // Already terminal — the reducer's Killed terminal-guard would no-op
-      // anyway, but skip the event log churn.
-      return;
-    }
-    // fn-743 pidless reap: a `pid: null` message reaps a NULL-pid (unwatchable)
-    // row. Guarded both ways — the row's persisted pid must ALSO be NULL, or a
-    // resume re-armed it with a real pid between the diff-loop snapshot and
-    // this re-read (in which case the pid-bearing path / kernel watcher owns
-    // it). No (pid, start_time) identity check applies (there's no pid to
-    // match); the start_time rides into the payload for parity / debug only.
-    if (msg.pid == null) {
-      if (row.pid != null) {
-        // Re-armed with a real pid since the snapshot — let the watcher own it.
+  if (exitWorker) {
+    const ew = exitWorker;
+    // Main stays the SOLE writer: an `exit` message becomes a synthetic
+    // `Killed` events row inserted on the existing WRITABLE connection, then a
+    // wake pump folds it. The verifier here re-reads the persisted row and
+    // matches `(pid, start_time)` against the message's snapshot — STRICT when
+    // the row carries a stored start_time, LOOSE pid-only when the row has
+    // none (legacy / pre-schema-v9). A strict-mismatch is a race-recovered
+    // stale event (the row was re-opened with a fresh process between
+    // register and exit delivery, OR the producer races a SessionStart on the
+    // same row); we silently skip it. The reducer's Killed fold ALSO
+    // double-checks the match — this verifier is a producer-side optimization
+    // that keeps the event log tight (no Killed rows that the reducer would
+    // discard as stale).
+    ew.onmessage = (ev: MessageEvent<ExitMessage | undefined>): void => {
+      const msg = ev.data;
+      if (!msg || msg.kind !== "exit") {
         return;
       }
-    } else {
-      // Strict-match when both sides carry a start_time; loose pid-only match
-      // when EITHER side is NULL (the row is legacy / the message snapshot
-      // didn't carry one — Q7 loose-accept rule). A strict mismatch is the
-      // race-recovered case.
-      const pidMatches = row.pid != null && row.pid === msg.pid;
-      if (!pidMatches) {
+      // Re-read the row to confirm the message's pid + start_time still match
+      // what's persisted. A non-matching row means the session was re-opened
+      // (and the new process is presumably alive) — skip silently.
+      const row = db
+        .query("SELECT pid, start_time, state FROM jobs WHERE job_id = ?")
+        .get(msg.jobId) as {
+        pid: number | null;
+        start_time: string | null;
+        state: string;
+      } | null;
+      if (row == null) {
+        // Row vanished — nothing to fold against.
         return;
       }
-      const startMatches =
-        row.start_time == null ||
-        msg.startTime == null ||
-        row.start_time === msg.startTime;
-      if (!startMatches) {
-        // Strict mismatch — silently skip (the producer raced a re-open).
+      if (row.state === "ended" || row.state === "killed") {
+        // Already terminal — the reducer's Killed terminal-guard would no-op
+        // anyway, but skip the event log churn.
         return;
       }
-    }
-    stmts.insertEvent.run({
-      $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
-      $session_id: msg.jobId, // == job_id
-      $pid: null,
-      $hook_event: "Killed", // synthetic; reducer folds → 'killed'
-      $event_type: "killed",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: JSON.stringify({ pid: msg.pid, start_time: msg.startTime }),
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $planctl_op: null,
-      $planctl_target: null,
-      $planctl_epic_id: null,
-      $planctl_task_id: null,
-      $planctl_subject_present: null,
-      $config_dir: null,
-      $planctl_queue_jump: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $planctl_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
+      // fn-743 pidless reap: a `pid: null` message reaps a NULL-pid (unwatchable)
+      // row. Guarded both ways — the row's persisted pid must ALSO be NULL, or a
+      // resume re-armed it with a real pid between the diff-loop snapshot and
+      // this re-read (in which case the pid-bearing path / kernel watcher owns
+      // it). No (pid, start_time) identity check applies (there's no pid to
+      // match); the start_time rides into the payload for parity / debug only.
+      if (msg.pid == null) {
+        if (row.pid != null) {
+          // Re-armed with a real pid since the snapshot — let the watcher own it.
+          return;
+        }
+      } else {
+        // Strict-match when both sides carry a start_time; loose pid-only match
+        // when EITHER side is NULL (the row is legacy / the message snapshot
+        // didn't carry one — Q7 loose-accept rule). A strict mismatch is the
+        // race-recovered case.
+        const pidMatches = row.pid != null && row.pid === msg.pid;
+        if (!pidMatches) {
+          return;
+        }
+        const startMatches =
+          row.start_time == null ||
+          msg.startTime == null ||
+          row.start_time === msg.startTime;
+        if (!startMatches) {
+          // Strict mismatch — silently skip (the producer raced a re-open).
+          return;
+        }
+      }
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+        $session_id: msg.jobId, // == job_id
+        $pid: null,
+        $hook_event: "Killed", // synthetic; reducer folds → 'killed'
+        $event_type: "killed",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ pid: msg.pid, start_time: msg.startTime }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+        $planctl_queue_jump: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      // Our own INSERT bumps data_version, so the wake worker would re-drain
+      // anyway — but pump directly so the Killed fold lands without a poll-
+      // cycle delay.
+      wakePending = true;
+      pumpWakes();
+    };
+
+    // Same crash policy as the other workers: any thread failure → fatalExit.
+    ew.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] exit-watcher worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    // Same crash-via-`close` gap: an exit-watcher `process.exit(1)` fires
+    // `close`, not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
+    ew.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
     });
-    // Our own INSERT bumps data_version, so the wake worker would re-drain
-    // anyway — but pump directly so the Killed fold lands without a poll-
-    // cycle delay.
-    wakePending = true;
-    pumpWakes();
-  };
-
-  // Same crash policy as the other workers: any thread failure → fatalExit.
-  exitWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] exit-watcher worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
-
-  // Same crash-via-`close` gap: an exit-watcher `process.exit(1)` fires
-  // `close`, not `onerror`. `!shuttingDown` makes it inert on clean shutdown.
-  exitWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+  } // fn-749: end `if (exitWorker)`
 
   // Spawn the git worker after the plan/job projections are caught up. It is
   // event-driven (file watcher + DB data_version wake + 60s heartbeat — see
   // `git-worker.ts` header) and posts a snapshot only when the rendered view
   // changes; main persists each one as a synthetic `GitSnapshot` event so the
   // reducer's `git_status` row is replayable.
-  const gitWorker = new Worker(
-    new URL("./git-worker.ts", import.meta.url).href,
-    {
-      workerData: {
-        dbPath,
-        disableNativeWatcher: opts.disableNativeWatcher,
-      } satisfies GitWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector — `null` when unselected.
+  const gitWorker = want("git")
+    ? new Worker(new URL("./git-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies GitWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
   // fn-705: publish the git-worker ref so the plan-worker `onmessage` handler's
   // discovery-nudge forward (wired ABOVE) can post `add-discovery-root` to it.
-  // Any nudge posted before this line is a tolerated no-op (null-guarded).
+  // Any nudge posted before this line is a tolerated no-op (null-guarded). When
+  // the git worker is unselected (fn-749) the ref stays `null` and the nudge is
+  // a no-op via the existing `?.`.
   gitWorkerRef = gitWorker;
 
-  gitWorker.onmessage = (
-    ev: MessageEvent<GitWorkerMessage | undefined>,
-  ): void => {
-    const msg = ev.data;
-    if (!msg) return;
-    if (msg.kind === "backstop") {
-      // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
-      // writer — append the line and return. NOT an event fold (a pure
-      // consumer-side side-file, never read by the reducer).
-      handleBackstopMessage(msg);
-      return;
-    }
-    if (msg.kind === "planctl-commit-changed") {
-      // Epic fn-681: authoritative commit-driven planctl ingest. The
-      // git-worker observed a commit in `msg.project_dir` carrying
-      // changed `.planctl/**` paths; forward the path list verbatim to
-      // plan-worker so it re-ingests each from the COMMITTED worktree
-      // bytes via the existing idempotent `onChange` / `onDelete`. NOT
-      // written to the `events` log — the reducer must stay a pure
-      // function of the immutable log, and this channel exists to drive
-      // a producer worker, not a projection. Duplicate fires from a
-      // live FSEvent are no-ops via plan-worker's change-gate.
-      planWorker.postMessage({
-        type: "planctl-commit-changed",
-        repo: msg.project_dir,
-        changes: msg.changes,
-      } satisfies PlanctlCommitChangedMessage);
-      return;
-    }
-    let hookEvent: string;
-    let data: string;
-    if (msg.kind === "git-snapshot") {
-      hookEvent = "GitSnapshot";
-      const { kind: _kind, ...snapshot } = msg;
-      data = JSON.stringify(snapshot);
-    } else if (msg.kind === "git-root-dropped") {
-      // Tombstone: the reducer DELETEs the `git_status` row whose primary key
-      // is `project_dir`. No payload beyond the pk in `session_id` — matches
-      // the EpicDeleted / TaskDeleted shape so re-fold reproduces the deletion.
-      hookEvent = "GitRootDropped";
-      data = "";
-    } else if (msg.kind === "commit") {
-      // Per-commit attribution event. The reducer's `foldCommit` arm reads
-      // the payload's `files` + `committer_session_id` and updates
-      // `file_attributions.last_commit_at` — discharging the committing
-      // session's claim on each file, or globally clearing every session's
-      // claim when the trailer was absent / malformed.
-      hookEvent = "Commit";
-      const { kind: _kind, ...commit } = msg;
-      data = JSON.stringify(commit);
-    } else {
-      return;
-    }
-    stmts.insertEvent.run({
-      $ts: Date.now() / 1000,
-      $session_id: msg.project_dir,
-      $pid: null,
-      $hook_event: hookEvent,
-      $event_type: "git_snapshot",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: msg.project_dir,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: data,
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $planctl_op: null,
-      $planctl_target: null,
-      $planctl_epic_id: null,
-      $planctl_task_id: null,
-      $planctl_subject_present: null,
-      $config_dir: null,
-      $planctl_queue_jump: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $planctl_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
+  if (gitWorker) {
+    const gw = gitWorker;
+    gw.onmessage = (ev: MessageEvent<GitWorkerMessage | undefined>): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "backstop") {
+        // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
+        // writer — append the line and return. NOT an event fold (a pure
+        // consumer-side side-file, never read by the reducer).
+        handleBackstopMessage(msg);
+        return;
+      }
+      if (msg.kind === "planctl-commit-changed") {
+        // Epic fn-681: authoritative commit-driven planctl ingest. The
+        // git-worker observed a commit in `msg.project_dir` carrying
+        // changed `.planctl/**` paths; forward the path list verbatim to
+        // plan-worker so it re-ingests each from the COMMITTED worktree
+        // bytes via the existing idempotent `onChange` / `onDelete`. NOT
+        // written to the `events` log — the reducer must stay a pure
+        // function of the immutable log, and this channel exists to drive
+        // a producer worker, not a projection. Duplicate fires from a
+        // live FSEvent are no-ops via plan-worker's change-gate.
+        // fn-749: null-safe — a git-only boot (no plan worker) has nothing to
+        // forward the planctl-commit hint to; the plan-worker change-gate would
+        // re-ingest from a live FSEvent anyway in a full boot.
+        planWorker?.postMessage({
+          type: "planctl-commit-changed",
+          repo: msg.project_dir,
+          changes: msg.changes,
+        } satisfies PlanctlCommitChangedMessage);
+        return;
+      }
+      let hookEvent: string;
+      let data: string;
+      if (msg.kind === "git-snapshot") {
+        hookEvent = "GitSnapshot";
+        const { kind: _kind, ...snapshot } = msg;
+        data = JSON.stringify(snapshot);
+      } else if (msg.kind === "git-root-dropped") {
+        // Tombstone: the reducer DELETEs the `git_status` row whose primary key
+        // is `project_dir`. No payload beyond the pk in `session_id` — matches
+        // the EpicDeleted / TaskDeleted shape so re-fold reproduces the deletion.
+        hookEvent = "GitRootDropped";
+        data = "";
+      } else if (msg.kind === "commit") {
+        // Per-commit attribution event. The reducer's `foldCommit` arm reads
+        // the payload's `files` + `committer_session_id` and updates
+        // `file_attributions.last_commit_at` — discharging the committing
+        // session's claim on each file, or globally clearing every session's
+        // claim when the trailer was absent / malformed.
+        hookEvent = "Commit";
+        const { kind: _kind, ...commit } = msg;
+        data = JSON.stringify(commit);
+      } else {
+        return;
+      }
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: msg.project_dir,
+        $pid: null,
+        $hook_event: hookEvent,
+        $event_type: "git_snapshot",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: msg.project_dir,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+        $planctl_queue_jump: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      // fn-629 observation-gate drain: a `git-snapshot` or `commit` from
+      // the git-worker is the cross-worker "HEAD may have moved" signal a
+      // plan-worker cannot observe on its own (a `git commit` leaves the
+      // `.planctl/*.json` bytes identical, so FSEvents will not re-fire on
+      // the worktree path). Fire `recheck-pending` so the scanner re-runs
+      // its tracked-in-HEAD predicate over every path currently held in
+      // pending. Cheap (no-op when the set is empty); idempotent.
+      if (msg.kind === "git-snapshot" || msg.kind === "commit") {
+        // fn-749: null-safe — see the planctl-commit-changed forward above.
+        planWorker?.postMessage({
+          type: "recheck-pending",
+          // fn-712: scope the drain to the single repo whose HEAD may have moved
+          // (this snapshot's `project_dir`), so the plan-worker re-probes only
+          // that repo's pending paths in ONE batched git call instead of every
+          // repo's per-path — the fix for the cross-repo per-path git storm that
+          // starved the worker for ~74s.
+          repo: msg.project_dir,
+        } satisfies RecheckPendingMessage);
+      }
+      wakePending = true;
+      pumpWakes();
+    };
+
+    gw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] git worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    gw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
     });
-    // fn-629 observation-gate drain: a `git-snapshot` or `commit` from
-    // the git-worker is the cross-worker "HEAD may have moved" signal a
-    // plan-worker cannot observe on its own (a `git commit` leaves the
-    // `.planctl/*.json` bytes identical, so FSEvents will not re-fire on
-    // the worktree path). Fire `recheck-pending` so the scanner re-runs
-    // its tracked-in-HEAD predicate over every path currently held in
-    // pending. Cheap (no-op when the set is empty); idempotent.
-    if (msg.kind === "git-snapshot" || msg.kind === "commit") {
-      planWorker.postMessage({
-        type: "recheck-pending",
-        // fn-712: scope the drain to the single repo whose HEAD may have moved
-        // (this snapshot's `project_dir`), so the plan-worker re-probes only
-        // that repo's pending paths in ONE batched git call instead of every
-        // repo's per-path — the fix for the cross-repo per-path git storm that
-        // starved the worker for ~74s.
-        repo: msg.project_dir,
-      } satisfies RecheckPendingMessage);
-    }
-    wakePending = true;
-    pumpWakes();
-  };
-
-  gitWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] git worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
-
-  gitWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+  } // fn-749: end `if (gitWorker)`
 
   // Spawn the usage worker in the SAME post-migration window. It watches the
   // agentuse daemon's flat leaf state dir (`~/.local/state/agentuse/`) and
@@ -2591,93 +2728,94 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // synthetic `UsageSnapshot`/`UsageDeleted` events row on its writable
   // connection. The watch root is resolved on main via `resolveUsageRoot()`
   // and tolerates absence (agentuse may not have run yet).
-  const usageWorker = new Worker(
-    new URL("./usage-worker.ts", import.meta.url).href,
-    {
-      workerData: {
-        dbPath,
-        root: resolveUsageRoot(),
-        disableNativeWatcher: opts.disableNativeWatcher,
-      } satisfies UsageWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector — `null` when unselected.
+  const usageWorker = want("usage")
+    ? new Worker(new URL("./usage-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          root: resolveUsageRoot(),
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies UsageWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
 
-  // Main stays the SOLE writer: a `usage-snapshot`/`usage-deleted` message
-  // becomes a synthetic `UsageSnapshot`/`UsageDeleted` events row inserted on
-  // the existing WRITABLE connection, then a wake pump folds it. The agentuse
-  // profile id rides in `session_id` (the generic entity-key overload the
-  // reducer reads); the flattened snapshot rides in `data` for snapshots, an
-  // empty string for tombstones. Everything other than session_id / hook_event /
-  // event_type / data is NULL (synthetic — never carries a process identity).
-  usageWorker.onmessage = (
-    ev: MessageEvent<UsageMessage | undefined>,
-  ): void => {
-    const msg = ev.data;
-    if (!msg) return;
-    let hookEvent: string;
-    let data: string;
-    if (msg.kind === "usage-snapshot") {
-      hookEvent = "UsageSnapshot";
-      // Pre-flattened payload — the reducer never re-reads the on-disk file.
-      // Forwarded via the exported `serializeUsageSnapshot` so the wire
-      // shape is pinned by a direct test; fn-651 task .1 fixed the leak
-      // that dropped the fn-645 status / subscription_active / error_*
-      // fields (those columns folded to NULL forever before this).
-      data = serializeUsageSnapshot(msg);
-    } else if (msg.kind === "usage-deleted") {
-      // Tombstone: the reducer DELETEs the `usage` row whose primary key is
-      // `id`. No payload beyond the pk in `session_id` — matches the
-      // GitRootDropped / EpicDeleted shape so re-fold reproduces the deletion.
-      hookEvent = "UsageDeleted";
-      data = "";
-    } else {
-      return;
-    }
-    stmts.insertEvent.run({
-      $ts: Date.now() / 1000,
-      $session_id: msg.id, // the entity pk: agentuse profile id
-      $pid: null,
-      $hook_event: hookEvent,
-      $event_type: "usage_snapshot",
-      $tool_name: null,
-      $matcher: null,
-      $cwd: null,
-      $permission_mode: null,
-      $agent_id: null,
-      $agent_type: null,
-      $stop_hook_active: null,
-      $data: data,
-      $subagent_agent_id: null,
-      $spawn_name: null,
-      $start_time: null,
-      $slash_command: null,
-      $skill_name: null,
-      $planctl_op: null,
-      $planctl_target: null,
-      $planctl_epic_id: null,
-      $planctl_task_id: null,
-      $planctl_subject_present: null,
-      $config_dir: null,
-      $planctl_queue_jump: null,
-      $bash_mutation_kind: null,
-      $bash_mutation_targets: null,
-      $planctl_files: null,
-      $backend_exec_type: null,
-      $backend_exec_session_id: null,
-      $backend_exec_pane_id: null,
+  if (usageWorker) {
+    const uw = usageWorker;
+    // Main stays the SOLE writer: a `usage-snapshot`/`usage-deleted` message
+    // becomes a synthetic `UsageSnapshot`/`UsageDeleted` events row inserted on
+    // the existing WRITABLE connection, then a wake pump folds it. The agentuse
+    // profile id rides in `session_id` (the generic entity-key overload the
+    // reducer reads); the flattened snapshot rides in `data` for snapshots, an
+    // empty string for tombstones. Everything other than session_id / hook_event /
+    // event_type / data is NULL (synthetic — never carries a process identity).
+    uw.onmessage = (ev: MessageEvent<UsageMessage | undefined>): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      let hookEvent: string;
+      let data: string;
+      if (msg.kind === "usage-snapshot") {
+        hookEvent = "UsageSnapshot";
+        // Pre-flattened payload — the reducer never re-reads the on-disk file.
+        // Forwarded via the exported `serializeUsageSnapshot` so the wire
+        // shape is pinned by a direct test; fn-651 task .1 fixed the leak
+        // that dropped the fn-645 status / subscription_active / error_*
+        // fields (those columns folded to NULL forever before this).
+        data = serializeUsageSnapshot(msg);
+      } else if (msg.kind === "usage-deleted") {
+        // Tombstone: the reducer DELETEs the `usage` row whose primary key is
+        // `id`. No payload beyond the pk in `session_id` — matches the
+        // GitRootDropped / EpicDeleted shape so re-fold reproduces the deletion.
+        hookEvent = "UsageDeleted";
+        data = "";
+      } else {
+        return;
+      }
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: msg.id, // the entity pk: agentuse profile id
+        $pid: null,
+        $hook_event: hookEvent,
+        $event_type: "usage_snapshot",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: data,
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+        $planctl_queue_jump: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    };
+
+    uw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] usage worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    uw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
     });
-    wakePending = true;
-    pumpWakes();
-  };
-
-  usageWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] usage worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
-
-  usageWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+  } // fn-749: end `if (usageWorker)`
 
   // Spawn the dead-letter worker (fn-643 task .3) in the SAME post-migration
   // window — the eighth worker thread (and fifth file-watcher producer
@@ -2693,59 +2831,62 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // worker spawns AFTER the boot import so the table state is settled
   // before any live notification arrives — there is no race where a
   // live message could fire against a half-imported boot state.
-  const deadLetterWorker = new Worker(
-    new URL("./dead-letter-worker.ts", import.meta.url).href,
-    {
-      workerData: {
-        dir: deadLetterDir,
-        disableNativeWatcher: opts.disableNativeWatcher,
-      } satisfies DeadLetterWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector — `null` when unselected.
+  const deadLetterWorker = want("deadLetter")
+    ? new Worker(new URL("./dead-letter-worker.ts", import.meta.url).href, {
+        workerData: {
+          dir: deadLetterDir,
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies DeadLetterWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
 
-  // Main owns the actual `dead_letters` write: a worker `dead-letter-changed`
-  // message triggers a fresh `scanDeadLetterDir` against the on-disk dir
-  // (treating the watcher event as "go look", never as the data — the
-  // CLAUDE.md "safe value" pattern). The scan is idempotent (`INSERT OR
-  // IGNORE` on `dl_id`), so a burst of watcher events collapses harmlessly
-  // into the same converged row set. NO wake is pumped here — the write
-  // goes to the `dead_letters` table, NOT `events`, so there is no
-  // projection to fold; the server worker's data_version polling picks
-  // up the row change directly and the board re-renders.
-  deadLetterWorker.onmessage = (
-    ev: MessageEvent<DeadLetterChangedMessage | undefined>,
-  ): void => {
-    const msg = ev.data;
-    if (!msg || msg.kind !== "dead-letter-changed") {
-      return;
-    }
-    try {
-      scanDeadLetterDir(db, deadLetterDir);
-    } catch (err) {
-      // Defense-in-depth: scanDeadLetterDir's design contract is "never
-      // throw out of the scan", but an unexpected internal throw must
-      // NOT crash the daemon. Log and continue — the next watcher event
-      // will retry the import.
-      console.error(
-        `[keeperd] dead-letter live import threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
-      );
-    }
-  };
+  if (deadLetterWorker) {
+    const dlw = deadLetterWorker;
+    // Main owns the actual `dead_letters` write: a worker `dead-letter-changed`
+    // message triggers a fresh `scanDeadLetterDir` against the on-disk dir
+    // (treating the watcher event as "go look", never as the data — the
+    // CLAUDE.md "safe value" pattern). The scan is idempotent (`INSERT OR
+    // IGNORE` on `dl_id`), so a burst of watcher events collapses harmlessly
+    // into the same converged row set. NO wake is pumped here — the write
+    // goes to the `dead_letters` table, NOT `events`, so there is no
+    // projection to fold; the server worker's data_version polling picks
+    // up the row change directly and the board re-renders.
+    dlw.onmessage = (
+      ev: MessageEvent<DeadLetterChangedMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg || msg.kind !== "dead-letter-changed") {
+        return;
+      }
+      try {
+        scanDeadLetterDir(db, deadLetterDir);
+      } catch (err) {
+        // Defense-in-depth: scanDeadLetterDir's design contract is "never
+        // throw out of the scan", but an unexpected internal throw must
+        // NOT crash the daemon. Log and continue — the next watcher event
+        // will retry the import.
+        console.error(
+          `[keeperd] dead-letter live import threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    };
 
-  // Same crash policy as the other workers: any thread failure → fatalExit.
-  deadLetterWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] dead-letter worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
+    // Same crash policy as the other workers: any thread failure → fatalExit.
+    dlw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] dead-letter worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
 
-  // Same crash-via-`close` gap: a dead-letter-worker `process.exit(1)`
-  // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
-  // shutdown.
-  deadLetterWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+    // Same crash-via-`close` gap: a dead-letter-worker `process.exit(1)`
+    // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
+    // shutdown.
+    dlw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // fn-749: end `if (deadLetterWorker)`
 
   // Spawn the events-ingest worker (fn-736 task .1) in the SAME post-migration
   // window — the lock-free events path's watch-hint thread, the architectural
@@ -2764,63 +2905,72 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // the hook still INSERTs, so the dir is normally absent and the worker
   // skip-and-logs at spawn (tolerated) — the path lights up when task .2 flips
   // the hook to NDJSON.
-  const eventsIngestWorker = new Worker(
-    new URL("./events-ingest-worker.ts", import.meta.url).href,
-    {
-      workerData: {
-        dir: eventsLogDir,
-        disableNativeWatcher: opts.disableNativeWatcher,
-      } satisfies EventsIngestWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector — `null` when unselected. Note the in-process
+  // fold/UDS tests inject events via DIRECT DB INSERT (bumping `data_version`),
+  // not via the events-log NDJSON path, so they do NOT need this worker — the
+  // wake worker catches the cross-connection write and main drains it.
+  const eventsIngestWorker = want("eventsIngest")
+    ? new Worker(new URL("./events-ingest-worker.ts", import.meta.url).href, {
+        workerData: {
+          dir: eventsLogDir,
+          disableNativeWatcher: opts.disableNativeWatcher,
+        } satisfies EventsIngestWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
 
-  // Main owns the actual `events` write: an `events-log-changed` message
-  // triggers a fresh `scanEventsLogDir` against the on-disk dir (treating the
-  // watcher event as "go look", never as the data — the CLAUDE.md "safe value"
-  // pattern). The scan is exactly-once (durable per-pid byte-offset), so a
-  // burst of watcher events collapses harmlessly into the same converged row
-  // set. UNLIKE the dead-letter handler, a wake IS pumped here — the write goes
-  // to `events` (the canonical fold source), so the reducer must fold the new
-  // rows into the projections. The ingest INSERT already bumped `data_version`
-  // (the wake worker would catch it within a poll tick regardless), but pumping
-  // here collapses the latency the same way the git/usage synthetic-mint
-  // handlers do.
-  eventsIngestWorker.onmessage = (
-    ev: MessageEvent<EventsLogChangedMessage | undefined>,
-  ): void => {
-    const msg = ev.data;
-    if (!msg || msg.kind !== "events-log-changed") {
-      return;
-    }
-    try {
-      scanEventsLogDir(db, eventsLogDir);
-      wakePending = true;
-      pumpWakes();
-    } catch (err) {
-      // Defense-in-depth: scanEventsLogDir's design contract is "never throw
-      // out of the scan", but an unexpected internal throw must NOT crash the
-      // daemon. Log and continue — the next watcher event will retry the
-      // ingest.
+  if (eventsIngestWorker) {
+    const eiw = eventsIngestWorker;
+    // Main owns the actual `events` write: an `events-log-changed` message
+    // triggers a fresh `scanEventsLogDir` against the on-disk dir (treating the
+    // watcher event as "go look", never as the data — the CLAUDE.md "safe value"
+    // pattern). The scan is exactly-once (durable per-pid byte-offset), so a
+    // burst of watcher events collapses harmlessly into the same converged row
+    // set. UNLIKE the dead-letter handler, a wake IS pumped here — the write goes
+    // to `events` (the canonical fold source), so the reducer must fold the new
+    // rows into the projections. The ingest INSERT already bumped `data_version`
+    // (the wake worker would catch it within a poll tick regardless), but pumping
+    // here collapses the latency the same way the git/usage synthetic-mint
+    // handlers do.
+    eiw.onmessage = (
+      ev: MessageEvent<EventsLogChangedMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg || msg.kind !== "events-log-changed") {
+        return;
+      }
+      try {
+        scanEventsLogDir(db, eventsLogDir);
+        wakePending = true;
+        pumpWakes();
+      } catch (err) {
+        // Defense-in-depth: scanEventsLogDir's design contract is "never throw
+        // out of the scan", but an unexpected internal throw must NOT crash the
+        // daemon. Log and continue — the next watcher event will retry the
+        // ingest.
+        console.error(
+          `[keeperd] events-log live ingest threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    };
+
+    // Same crash policy as the other workers: any thread failure → fatalExit.
+    eiw.onerror = (err: ErrorEvent): void => {
       console.error(
-        `[keeperd] events-log live ingest threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
-        }`,
+        "[keeperd] events-ingest worker error:",
+        err.message ?? err,
       );
-    }
-  };
+      if (!shuttingDown) fatalExit();
+    };
 
-  // Same crash policy as the other workers: any thread failure → fatalExit.
-  eventsIngestWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] events-ingest worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
-
-  // Same crash-via-`close` gap: an events-ingest-worker `process.exit(1)`
-  // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
-  // shutdown.
-  eventsIngestWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+    // Same crash-via-`close` gap: an events-ingest-worker `process.exit(1)`
+    // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
+    // shutdown.
+    eiw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  } // fn-749: end `if (eventsIngestWorker)`
 
   // Spawn the autopilot reconciler worker (fn-661 task .4) — the eighth
   // worker thread. It runs the level-triggered dispatch reconcile loop
@@ -2843,86 +2993,101 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // open `~/.config/keeper/config.yaml` itself — every config I/O lives on
   // main, every worker receives the resolved values.
   const apConfig = resolveConfig();
-  const autopilotWorkerInstance = new Worker(
-    new URL("./autopilot-worker.ts", import.meta.url).href,
-    {
-      workerData: {
-        dbPath,
-        paused: autopilotPaused,
-        zellijSession: apConfig.zellijSession,
-        maxConcurrentJobs: apConfig.maxConcurrentJobs,
-        // fn-727 — completion-reap toggle, read on main and frozen into
-        // workerData (every config I/O lives on main). Restart-to-apply:
-        // a config flip lags until the next daemon restart re-spawns.
-        autocloseWindows: apConfig.autocloseWindows,
-      } satisfies AutopilotWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector — `null` when unselected. The server-worker
+  // bridge's `set_autopilot_paused` relay already null-guards via
+  // `autopilotWorker === null` (returns `ok:false, "autopilot worker not yet
+  // ready"`), so a server-only boot's pause RPC degrades gracefully.
+  const autopilotWorkerInstance = want("autopilot")
+    ? new Worker(new URL("./autopilot-worker.ts", import.meta.url).href, {
+        workerData: {
+          dbPath,
+          paused: autopilotPaused,
+          zellijSession: apConfig.zellijSession,
+          maxConcurrentJobs: apConfig.maxConcurrentJobs,
+          // fn-727 — completion-reap toggle, read on main and frozen into
+          // workerData (every config I/O lives on main). Restart-to-apply:
+          // a config flip lags until the next daemon restart re-spawns.
+          autocloseWindows: apConfig.autocloseWindows,
+        } satisfies AutopilotWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
   // Wire the forward reference declared above so the server-worker's
   // bridge handler (registered earlier) can target the autopilot worker
   // via `autopilotWorker.postMessage({...})`. Assign BEFORE the
   // onmessage / onerror / close handlers fire so the first bridge
-  // request never sees a `null` autopilot worker.
+  // request never sees a `null` autopilot worker. (Stays `null` when the
+  // worker is unselected — the bridge null-guard covers that.)
   autopilotWorker = autopilotWorkerInstance;
 
-  // Worker → main: `DispatchFailed` / `Dispatched` / `DispatchExpired`
-  // mint requests. Mirrors the git-worker synthetic-event mint pattern
-  // (see `:1309-1376`): the worker posts a `{kind, payload}` message,
-  // main runs `stmts.insertEvent.run` on its writable connection, then
-  // sets `wakePending = true; pumpWakes()` so the reducer folds the row
-  // into `dispatch_failures` / `pending_dispatches` without waiting for
-  // the wake worker's `data_version` poll. Workers never write the DB;
-  // the producer-side `ts` rides in the payload (where the fold reads
-  // it) so re-fold determinism holds.
-  //
-  // The three mint paths share an identical column-binding shape — the
-  // only differences are `$hook_event` (`DispatchFailed` / `Dispatched`
-  // / `DispatchExpired`), `$event_type` (the projection tag the
-  // reducer matches on), and `$cwd` (carried from the payload `dir`
-  // when present; `null` for `DispatchExpired`, which is keyed by-pk
-  // only). NON-FATAL catch — a failed INSERT logs to stderr and
-  // continues; the next reconcile cycle re-attempts the dispatch.
-  autopilotWorkerInstance.onmessage = (
-    ev: MessageEvent<
-      | DispatchFailedMessage
-      | DispatchedMessage
-      | DispatchExpiredMessage
-      | ClearRejectedApprovalMessage
-      | BackstopMessage
-      | undefined
-    >,
-  ): void => {
-    const msg = ev.data;
-    if (!msg) return;
-    if (msg.kind === "backstop") {
-      // Epic fn-720: a `timeout`-class backstop rescue/rollup from the
-      // autopilot `confirmRunning` ceiling. Main is the SOLE sidecar writer —
-      // append the line and return. NOT an event fold (a pure consumer-side
-      // side-file, never read by the reducer).
-      handleBackstopMessage(msg);
-      return;
-    }
-    if (msg.kind === "dispatch-failed") {
-      handleDispatchFailedMint(msg.payload);
-    } else if (msg.kind === "dispatched-request") {
-      // fn-724: durable mint-before-launch. Insert the `Dispatched` event,
-      // then reply `dispatched-ack{id, ok}` so the worker only `launch()`es
-      // AFTER the row is durable (closes the SessionStart-drains-before-
-      // Dispatched race that re-opened the fn-627 double-dispatch window).
-      handleDispatchedMint(msg);
-    } else if (msg.kind === "dispatch-expired") {
-      handleDispatchExpiredMint(msg.payload);
-    } else if (msg.kind === "clear-rejected-approval") {
-      // fn-742.2: one-shot rejected-epic recovery. Main is the sole writer of
-      // the approval surface — reset the epic approval to `pending` through the
-      // SANCTIONED `set_epic_approval` handler (sidecar write; the plan-worker
-      // re-folds it gate-free). The worker has already recorded the id in its
-      // in-memory `autoClearedRejections` ledger so it won't re-request — main
-      // never needs to dedup. Non-fatal on failure: the worker re-requests on a
-      // later cycle if the epic is still rejected and not yet recorded there.
-      handleClearRejectedApproval(msg);
-    }
-  };
+  // fn-749: the autopilot worker's main-side machinery (the `handleDispatch*`
+  // mint helpers + the 60s sweep / compaction / checkpoint timers below) is
+  // interleaved with this handler and partly shared with main's steady state,
+  // so rather than wrap the whole region we gate only the three direct
+  // worker-binding sites — the `onmessage`/`onerror`/`close` assignments here,
+  // each `if (autopilotWorkerInstance)`-guarded — and `?.` the one in-helper
+  // `postMessage` (the dispatched-ack reply). When the worker is unselected the
+  // helpers/timers still load but never fire against a live worker.
+  if (autopilotWorkerInstance) {
+    const aw = autopilotWorkerInstance;
+    // Worker → main: `DispatchFailed` / `Dispatched` / `DispatchExpired`
+    // mint requests. Mirrors the git-worker synthetic-event mint pattern
+    // (see `:1309-1376`): the worker posts a `{kind, payload}` message,
+    // main runs `stmts.insertEvent.run` on its writable connection, then
+    // sets `wakePending = true; pumpWakes()` so the reducer folds the row
+    // into `dispatch_failures` / `pending_dispatches` without waiting for
+    // the wake worker's `data_version` poll. Workers never write the DB;
+    // the producer-side `ts` rides in the payload (where the fold reads
+    // it) so re-fold determinism holds.
+    //
+    // The three mint paths share an identical column-binding shape — the
+    // only differences are `$hook_event` (`DispatchFailed` / `Dispatched`
+    // / `DispatchExpired`), `$event_type` (the projection tag the
+    // reducer matches on), and `$cwd` (carried from the payload `dir`
+    // when present; `null` for `DispatchExpired`, which is keyed by-pk
+    // only). NON-FATAL catch — a failed INSERT logs to stderr and
+    // continues; the next reconcile cycle re-attempts the dispatch.
+    aw.onmessage = (
+      ev: MessageEvent<
+        | DispatchFailedMessage
+        | DispatchedMessage
+        | DispatchExpiredMessage
+        | ClearRejectedApprovalMessage
+        | BackstopMessage
+        | undefined
+      >,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "backstop") {
+        // Epic fn-720: a `timeout`-class backstop rescue/rollup from the
+        // autopilot `confirmRunning` ceiling. Main is the SOLE sidecar writer —
+        // append the line and return. NOT an event fold (a pure consumer-side
+        // side-file, never read by the reducer).
+        handleBackstopMessage(msg);
+        return;
+      }
+      if (msg.kind === "dispatch-failed") {
+        handleDispatchFailedMint(msg.payload);
+      } else if (msg.kind === "dispatched-request") {
+        // fn-724: durable mint-before-launch. Insert the `Dispatched` event,
+        // then reply `dispatched-ack{id, ok}` so the worker only `launch()`es
+        // AFTER the row is durable (closes the SessionStart-drains-before-
+        // Dispatched race that re-opened the fn-627 double-dispatch window).
+        handleDispatchedMint(msg);
+      } else if (msg.kind === "dispatch-expired") {
+        handleDispatchExpiredMint(msg.payload);
+      } else if (msg.kind === "clear-rejected-approval") {
+        // fn-742.2: one-shot rejected-epic recovery. Main is the sole writer of
+        // the approval surface — reset the epic approval to `pending` through the
+        // SANCTIONED `set_epic_approval` handler (sidecar write; the plan-worker
+        // re-folds it gate-free). The worker has already recorded the id in its
+        // in-memory `autoClearedRejections` ledger so it won't re-request — main
+        // never needs to dedup. Non-fatal on failure: the worker re-requests on a
+        // later cycle if the epic is still rejected and not yet recorded there.
+        handleClearRejectedApproval(msg);
+      }
+    };
+  } // fn-749: end `if (autopilotWorkerInstance)` onmessage guard
 
   /**
    * Mint a synthetic `DispatchFailed` event on the writable connection.
@@ -3060,7 +3225,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     // Reply on EVERY path — the worker is blocked awaiting this ack before
     // it launches. A `false` reply tells the worker to abort the dispatch.
-    autopilotWorkerInstance.postMessage({
+    // fn-749: `?.` — this helper lives at function scope (outside the
+    // onmessage guard); it only ever runs in response to a worker message, so
+    // the worker is non-null in practice, but the optional-chain keeps it
+    // null-safe for the type system on an unselected-autopilot boot.
+    autopilotWorkerInstance?.postMessage({
       type: "dispatched-ack",
       id,
       ok,
@@ -3380,21 +3549,25 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }, WAL_CHECKPOINT_INTERVAL_MS);
 
-  // Same crash policy as the other workers: any thread failure →
-  // fatalExit → exit 1 → launchd restart.
-  autopilotWorkerInstance.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] autopilot worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
+  // fn-749: crash-handler guard — wired only when the worker was selected.
+  if (autopilotWorkerInstance) {
+    const aw = autopilotWorkerInstance;
+    // Same crash policy as the other workers: any thread failure →
+    // fatalExit → exit 1 → launchd restart.
+    aw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] autopilot worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
 
-  // Same crash-via-`close` gap as every other worker: a
-  // `process.exit(1)` inside the autopilot worker fires `close`, not
-  // `onerror`. Without this the reconciler could silently vanish while
-  // the rest of keeperd kept running. `!shuttingDown` makes it inert
-  // on the clean shutdown path.
-  autopilotWorkerInstance.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+    // Same crash-via-`close` gap as every other worker: a
+    // `process.exit(1)` inside the autopilot worker fires `close`, not
+    // `onerror`. Without this the reconciler could silently vanish while
+    // the rest of keeperd kept running. `!shuttingDown` makes it inert
+    // on the clean shutdown path.
+    aw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
 
   // Spawn the restore-snapshot worker (fn-677 task .3) — the tenth worker
   // thread. A pure CONSUMER: it opens its own read-only connection, polls
@@ -3412,21 +3585,24 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // pulse re-writes); only an unhandled throw out of the watch loop
   // escalates to `onerror`/`close` → fatalExit. Consistent with the other
   // workers' crash policy.
-  const restoreWorker = new Worker(
-    new URL("./restore-worker.ts", import.meta.url).href,
-    {
-      workerData: { dbPath } satisfies RestoreWorkerData,
-    } as WorkerOptions & { workerData: unknown },
-  );
+  // fn-749: gated on the selector — `null` when unselected.
+  const restoreWorker = want("restore")
+    ? new Worker(new URL("./restore-worker.ts", import.meta.url).href, {
+        workerData: { dbPath } satisfies RestoreWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
 
-  restoreWorker.onerror = (err: ErrorEvent): void => {
-    console.error("[keeperd] restore worker error:", err.message ?? err);
-    if (!shuttingDown) fatalExit();
-  };
+  if (restoreWorker) {
+    const rw = restoreWorker;
+    rw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] restore worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
 
-  restoreWorker.addEventListener("close", () => {
-    if (!shuttingDown) fatalExit();
-  });
+    rw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
 
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
@@ -3502,30 +3678,31 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // checkpoint can't fire into the writer connection mid-teardown.
     clearInterval(walCheckpointTimer);
 
-    worker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
-    serverWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
-    transcriptWorker.postMessage({
-      type: "shutdown",
-    } satisfies ShutdownMessage);
-    planWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
-    exitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
-    gitWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
-    usageWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
-    deadLetterWorker.postMessage({
-      type: "shutdown",
-    } satisfies ShutdownMessage);
-    eventsIngestWorker.postMessage({
-      type: "shutdown",
-    } satisfies ShutdownMessage);
-    autopilotWorkerInstance.postMessage({
-      type: "shutdown",
-    } satisfies ShutdownMessage);
-    restoreWorker.postMessage({
-      type: "shutdown",
-    } satisfies ShutdownMessage);
+    // fn-749: the set of workers actually spawned this boot (filter out the
+    // `null`s for any unselected worker). Teardown iterates THIS list, so a
+    // minimal-set boot posts shutdown to / awaits close on / terminates only
+    // the workers it spawned. In the production all-eleven boot this is the
+    // identical eleven, in spawn order.
+    const spawnedWorkers: Worker[] = [
+      worker,
+      serverWorker,
+      transcriptWorker,
+      planWorker,
+      exitWorker,
+      gitWorker,
+      usageWorker,
+      deadLetterWorker,
+      eventsIngestWorker,
+      autopilotWorkerInstance,
+      restoreWorker,
+    ].filter((w): w is Worker => w !== null);
 
-    // Bun surfaces worker exit via the "close" event. Await ALL TEN
-    // workers' close (the server worker releases its socket + lock, the
+    for (const w of spawnedWorkers) {
+      w.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+    }
+
+    // Bun surfaces worker exit via the "close" event. Await every spawned
+    // worker's close (the server worker releases its socket + lock, the
     // transcript + plan + usage + dead-letter workers
     // unsubscribe their watchers, the exit-watcher releases its
     // kqueue/pidfd fd, the autopilot worker aborts its in-flight
@@ -3538,78 +3715,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
       });
-    const exitWaits: Promise<void>[] = [
-      exited(worker),
-      exited(serverWorker),
-      exited(transcriptWorker),
-      exited(planWorker),
-      exited(exitWorker),
-      exited(gitWorker),
-      exited(usageWorker),
-      exited(deadLetterWorker),
-      exited(eventsIngestWorker),
-      exited(autopilotWorkerInstance),
-      exited(restoreWorker),
-    ];
+    const exitWaits: Promise<void>[] = spawnedWorkers.map((w) => exited(w));
     await Promise.race([
       Promise.all(exitWaits),
       Bun.sleep(WORKER_SHUTDOWN_DEADLINE_MS),
     ]);
 
-    try {
-      worker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      serverWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      transcriptWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      planWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      exitWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      gitWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      usageWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      deadLetterWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      eventsIngestWorker.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      autopilotWorkerInstance.terminate();
-    } catch {
-      // best-effort if it already exited
-    }
-    try {
-      restoreWorker.terminate();
-    } catch {
-      // best-effort if it already exited
+    for (const w of spawnedWorkers) {
+      try {
+        w.terminate();
+      } catch {
+        // best-effort if it already exited
+      }
     }
 
     try {

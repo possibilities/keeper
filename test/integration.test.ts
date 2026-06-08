@@ -521,111 +521,119 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
   // fn-747: in-process daemon. The clean-shutdown / socket-unlink contract is a
   // subprocess concern, covered by the retained subprocess smoke tests; here we
   // assert only the fold→serve→subscribe path, which is process-model-agnostic.
-  await withInProcessDaemon(async ({ dbPath, sockPath }) => {
-    const sessionId = "sess-subscribe-e2e";
+  // fn-749: minimal worker set — the fold runs on MAIN (pumped by `wake`), and
+  // `server` serves it over the UDS. NO watcher worker spawns, so the
+  // `@parcel/watcher` seam is irrelevant here; events arrive via direct DB
+  // INSERT (injectLifecycleEvent), which the wake worker's data_version poll
+  // catches.
+  await withInProcessDaemon(
+    async ({ dbPath, sockPath }) => {
+      const sessionId = "sess-subscribe-e2e";
 
-    // Fold one job so the query has a row to page + watch.
-    injectLifecycleEvent(dbPath, sessionId, "SessionStart", {
-      cwd: "/tmp/work",
-      permissionMode: "default",
-    });
-
-    // Wait for the reducer to project the job (read-only observer mirrors the
-    // server's own view) before we query, so the result page is non-empty.
-    const reader = openDb(dbPath, { readonly: true }).db;
-    const projected = await retryUntil(() => {
-      const row = reader
-        .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
-        .get(sessionId) as { last_event_id: number } | null;
-      return row ? row : null;
-    });
-    reader.close();
-    expect(projected).not.toBeNull();
-
-    const client = await connectClient(sockPath);
-    try {
-      // --- query → result: ordered page, frozen membership, world rev. The
-      // query now carries a required `collection`; result/patch echo it and the
-      // patch payload is `row` (not `job`). ---
-      client.send({ type: "query", collection: "jobs", id: "q1" });
-      const result = await retryUntil(
-        () => client.frames.find((f) => f.type === "result") ?? null,
-      );
-      expect(result).not.toBeNull();
-      if (!result || result.type !== "result") {
-        throw new Error("unreachable: result presence asserted above");
-      }
-      expect(result.id).toBe("q1");
-      expect(result.collection).toBe("jobs");
-      // The result carries the filtered-set total (≥ the one job we folded).
-      expect(typeof result.total).toBe("number");
-      expect(result.total).toBeGreaterThanOrEqual(1);
-      const baselineTotal = result.total;
-      expect(result.rows.some((r) => r.job_id === sessionId)).toBe(true);
-      const watchedRow = result.rows.find((r) => r.job_id === sessionId);
-      if (!watchedRow) {
-        throw new Error("unreachable: row presence asserted above");
-      }
-      const baselineEventId = watchedRow.last_event_id as number;
-
-      // --- fold a change to the watched row → expect a patch (live cell). ---
-      injectLifecycleEvent(dbPath, sessionId, "UserPromptSubmit", {
-        permissionMode: "plan",
-      });
-
-      const patch = await retryUntil(
-        () =>
-          client.frames.find(
-            (f) =>
-              f.type === "patch" &&
-              f.row.job_id === sessionId &&
-              (f.row.last_event_id as number) > baselineEventId,
-          ) ?? null,
-      );
-      expect(patch).not.toBeNull();
-      if (!patch || patch.type !== "patch") {
-        throw new Error("unreachable: patch presence asserted above");
-      }
-      expect(patch.collection).toBe("jobs");
-      expect(patch.row.job_id).toBe(sessionId);
-      expect(patch.row.state).toBe("working");
-      expect(patch.rev).toBeGreaterThanOrEqual(
-        patch.row.last_event_id as number,
-      );
-
-      // --- a NEW session enters the (unfiltered) set → a live `meta` with the
-      // incremented total. Frozen membership means the new row is NOT pushed; the
-      // meta is just the "set changed" count signal. ---
-      const otherSession = "sess-subscribe-e2e-2";
-      injectLifecycleEvent(dbPath, otherSession, "SessionStart", {
-        cwd: "/tmp/work2",
+      // Fold one job so the query has a row to page + watch.
+      injectLifecycleEvent(dbPath, sessionId, "SessionStart", {
+        cwd: "/tmp/work",
         permissionMode: "default",
       });
 
-      const meta = await retryUntil(
-        () =>
-          client.frames.find(
-            (f) =>
-              f.type === "meta" &&
-              f.collection === "jobs" &&
-              f.total > baselineTotal,
-          ) ?? null,
-      );
-      expect(meta).not.toBeNull();
-      if (!meta || meta.type !== "meta") {
-        throw new Error("unreachable: meta presence asserted above");
+      // Wait for the reducer to project the job (read-only observer mirrors the
+      // server's own view) before we query, so the result page is non-empty.
+      const reader = openDb(dbPath, { readonly: true }).db;
+      const projected = await retryUntil(() => {
+        const row = reader
+          .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+          .get(sessionId) as { last_event_id: number } | null;
+        return row ? row : null;
+      });
+      reader.close();
+      expect(projected).not.toBeNull();
+
+      const client = await connectClient(sockPath);
+      try {
+        // --- query → result: ordered page, frozen membership, world rev. The
+        // query now carries a required `collection`; result/patch echo it and the
+        // patch payload is `row` (not `job`). ---
+        client.send({ type: "query", collection: "jobs", id: "q1" });
+        const result = await retryUntil(
+          () => client.frames.find((f) => f.type === "result") ?? null,
+        );
+        expect(result).not.toBeNull();
+        if (!result || result.type !== "result") {
+          throw new Error("unreachable: result presence asserted above");
+        }
+        expect(result.id).toBe("q1");
+        expect(result.collection).toBe("jobs");
+        // The result carries the filtered-set total (≥ the one job we folded).
+        expect(typeof result.total).toBe("number");
+        expect(result.total).toBeGreaterThanOrEqual(1);
+        const baselineTotal = result.total;
+        expect(result.rows.some((r) => r.job_id === sessionId)).toBe(true);
+        const watchedRow = result.rows.find((r) => r.job_id === sessionId);
+        if (!watchedRow) {
+          throw new Error("unreachable: row presence asserted above");
+        }
+        const baselineEventId = watchedRow.last_event_id as number;
+
+        // --- fold a change to the watched row → expect a patch (live cell). ---
+        injectLifecycleEvent(dbPath, sessionId, "UserPromptSubmit", {
+          permissionMode: "plan",
+        });
+
+        const patch = await retryUntil(
+          () =>
+            client.frames.find(
+              (f) =>
+                f.type === "patch" &&
+                f.row.job_id === sessionId &&
+                (f.row.last_event_id as number) > baselineEventId,
+            ) ?? null,
+        );
+        expect(patch).not.toBeNull();
+        if (!patch || patch.type !== "patch") {
+          throw new Error("unreachable: patch presence asserted above");
+        }
+        expect(patch.collection).toBe("jobs");
+        expect(patch.row.job_id).toBe(sessionId);
+        expect(patch.row.state).toBe("working");
+        expect(patch.rev).toBeGreaterThanOrEqual(
+          patch.row.last_event_id as number,
+        );
+
+        // --- a NEW session enters the (unfiltered) set → a live `meta` with the
+        // incremented total. Frozen membership means the new row is NOT pushed; the
+        // meta is just the "set changed" count signal. ---
+        const otherSession = "sess-subscribe-e2e-2";
+        injectLifecycleEvent(dbPath, otherSession, "SessionStart", {
+          cwd: "/tmp/work2",
+          permissionMode: "default",
+        });
+
+        const meta = await retryUntil(
+          () =>
+            client.frames.find(
+              (f) =>
+                f.type === "meta" &&
+                f.collection === "jobs" &&
+                f.total > baselineTotal,
+            ) ?? null,
+        );
+        expect(meta).not.toBeNull();
+        if (!meta || meta.type !== "meta") {
+          throw new Error("unreachable: meta presence asserted above");
+        }
+        expect(meta.total).toBe(baselineTotal + 1);
+        // The new member's row never arrived as a patch (frozen membership).
+        expect(
+          client.frames.some(
+            (f) => f.type === "patch" && f.row.job_id === otherSession,
+          ),
+        ).toBe(false);
+      } finally {
+        client.socket.end();
       }
-      expect(meta.total).toBe(baselineTotal + 1);
-      // The new member's row never arrived as a patch (frozen membership).
-      expect(
-        client.frames.some(
-          (f) => f.type === "patch" && f.row.job_id === otherSession,
-        ),
-      ).toBe(false);
-    } finally {
-      client.socket.end();
-    }
-  });
+    },
+    { workers: ["wake", "server"] },
+  );
 }, 30000);
 
 test("end-to-end: set_task_approval / set_epic_approval RPC → atomic SIDECAR write, committed def untouched (fn-732)", async () => {
@@ -792,7 +800,12 @@ test("end-to-end: set_task_approval / set_epic_approval RPC → atomic SIDECAR w
         expect(String(e)).toMatch(/bad_params/);
       }
     },
-    { env: { KEEPER_CONFIG: configPath } },
+    // fn-749: minimal set — the set_{task,epic}_approval RPCs are handled
+    // server-worker-side (filesystem-direct sidecar write + scan), so only
+    // `server` is load-bearing; `wake` rides along for boot-drain readiness.
+    // No watcher worker spawns despite the hermetic plan tree — the RPC's root
+    // scan never touches the projection.
+    { env: { KEEPER_CONFIG: configPath }, workers: ["wake", "server"] },
   );
 }, 30000);
 
@@ -801,173 +814,179 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
   // watch), so it converts cleanly. We INSERT the seed `waiting` rows AFTER boot
   // (the harness creates + migrates the DB at boot) via a SECOND writer
   // connection, mirroring what the dead-letter boot scan would have produced.
-  await withInProcessDaemon(async ({ dbPath, sockPath }) => {
-    // Seed two `waiting` rows by hand. We INSERT directly into `dead_letters`
-    // (mirroring what the scan would have produced) so the test is hermetic
-    // against the dead-letter parser and the NDJSON file format. The post-replay
-    // assertions still drive the full worker→main→reducer round-trip.
-    {
-      const { db } = openDb(dbPath);
-      try {
-        const insertStmt = db.prepare(
-          `INSERT INTO dead_letters
+  // fn-749: minimal set — replay routes board→`server`→main bridge (appends a
+  // real event + pumps a wake on MAIN), then the fold reappears the session
+  // which `server` serves; `wake` is the backstop poll. No watcher worker.
+  await withInProcessDaemon(
+    async ({ dbPath, sockPath }) => {
+      // Seed two `waiting` rows by hand. We INSERT directly into `dead_letters`
+      // (mirroring what the scan would have produced) so the test is hermetic
+      // against the dead-letter parser and the NDJSON file format. The post-replay
+      // assertions still drive the full worker→main→reducer round-trip.
+      {
+        const { db } = openDb(dbPath);
+        try {
+          const insertStmt = db.prepare(
+            `INSERT INTO dead_letters
              (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
               status, recovered_at, replayed_event_id, source_file)
            VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, NULL)`,
-        );
-        // First (oldest) waiting row: a dropped SessionStart for sess-replay-1.
-        insertStmt.run(
-          "dl-first",
-          "sess-replay-1",
-          "SessionStart",
-          1_700_000_000,
-          100,
-          4321,
-          JSON.stringify({
-            ts: 1_700_000_000,
-            session_id: "sess-replay-1",
-            pid: 4321,
-            hook_event: "SessionStart",
-            event_type: "lifecycle",
-            data: "{}",
-            cwd: "/tmp/replay",
-          }),
-        );
-        // Second waiting row — newer dl_written_at; should NOT be picked first.
-        insertStmt.run(
-          "dl-second",
-          "sess-replay-2",
-          "SessionStart",
-          1_700_000_005,
-          200,
-          4322,
-          JSON.stringify({
-            ts: 1_700_000_005,
-            session_id: "sess-replay-2",
-            pid: 4322,
-            hook_event: "SessionStart",
-            event_type: "lifecycle",
-            data: "{}",
-            cwd: "/tmp/replay-2",
-          }),
-        );
-      } finally {
-        db.close();
-      }
-    }
-
-    async function rpc(
-      method: string,
-      params: Record<string, unknown> | undefined,
-    ): Promise<unknown> {
-      const buffer = new LineBuffer();
-      const id = crypto.randomUUID();
-      return new Promise((resolve, reject) => {
-        Bun.connect({
-          unix: sockPath,
-          socket: {
-            open(s) {
-              s.write(
-                encodeFrame(
-                  params === undefined
-                    ? { type: "rpc", id, method }
-                    : { type: "rpc", id, method, params },
-                ),
-              );
-            },
-            data(s, chunk) {
-              for (const line of buffer.push(chunk.toString("utf8"))) {
-                if (line.trim().length === 0) continue;
-                const frame = JSON.parse(line) as ServerFrame;
-                if ((frame as { id?: string }).id !== id) continue;
-                if (frame.type === "rpc_result") {
-                  resolve(frame.value);
-                } else if (frame.type === "error") {
-                  reject(
-                    new Error(
-                      `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
-                    ),
-                  );
-                }
-                s.end();
-                return;
-              }
-            },
-            close() {},
-            error(_s, err) {
-              reject(err);
-            },
-          },
-        }).catch(reject);
-      });
-    }
-
-    // First replay: oldest waiting row (dl-first, sess-replay-1) flips to
-    // recovered; the events log gains a real SessionStart row; the reducer
-    // folds it into a fresh `jobs` row.
-    const first = (await rpc("replay_dead_letter", {})) as {
-      ok: boolean;
-      recovered_dl_id: string | null;
-    };
-    expect(first).toEqual({ ok: true, recovered_dl_id: "dl-first" });
-
-    // Poll the jobs projection for the recovered session.
-    const verify = await retryUntil(() => {
-      const { db } = openDb(dbPath, { readonly: true });
-      try {
-        const job = db
-          .query(
-            "SELECT job_id, state, cwd FROM jobs WHERE job_id = 'sess-replay-1'",
-          )
-          .get() as { job_id: string; state: string; cwd: string } | null;
-        const dl = db
-          .query(
-            "SELECT status, replayed_event_id FROM dead_letters WHERE dl_id = 'dl-first'",
-          )
-          .get() as {
-          status: string;
-          replayed_event_id: number | null;
-        } | null;
-        if (
-          job &&
-          dl &&
-          dl.status === "recovered" &&
-          dl.replayed_event_id !== null
-        ) {
-          return { job, dl };
+          );
+          // First (oldest) waiting row: a dropped SessionStart for sess-replay-1.
+          insertStmt.run(
+            "dl-first",
+            "sess-replay-1",
+            "SessionStart",
+            1_700_000_000,
+            100,
+            4321,
+            JSON.stringify({
+              ts: 1_700_000_000,
+              session_id: "sess-replay-1",
+              pid: 4321,
+              hook_event: "SessionStart",
+              event_type: "lifecycle",
+              data: "{}",
+              cwd: "/tmp/replay",
+            }),
+          );
+          // Second waiting row — newer dl_written_at; should NOT be picked first.
+          insertStmt.run(
+            "dl-second",
+            "sess-replay-2",
+            "SessionStart",
+            1_700_000_005,
+            200,
+            4322,
+            JSON.stringify({
+              ts: 1_700_000_005,
+              session_id: "sess-replay-2",
+              pid: 4322,
+              hook_event: "SessionStart",
+              event_type: "lifecycle",
+              data: "{}",
+              cwd: "/tmp/replay-2",
+            }),
+          );
+        } finally {
+          db.close();
         }
-        return null;
-      } finally {
-        db.close();
       }
-    }, 3000);
-    expect(verify).not.toBeNull();
-    expect(verify?.job.job_id).toBe("sess-replay-1");
-    expect(verify?.job.cwd).toBe("/tmp/replay");
 
-    // Second replay: drains the next oldest (dl-second).
-    const second = (await rpc("replay_dead_letter", {})) as {
-      ok: boolean;
-      recovered_dl_id: string | null;
-    };
-    expect(second).toEqual({ ok: true, recovered_dl_id: "dl-second" });
+      async function rpc(
+        method: string,
+        params: Record<string, unknown> | undefined,
+      ): Promise<unknown> {
+        const buffer = new LineBuffer();
+        const id = crypto.randomUUID();
+        return new Promise((resolve, reject) => {
+          Bun.connect({
+            unix: sockPath,
+            socket: {
+              open(s) {
+                s.write(
+                  encodeFrame(
+                    params === undefined
+                      ? { type: "rpc", id, method }
+                      : { type: "rpc", id, method, params },
+                  ),
+                );
+              },
+              data(s, chunk) {
+                for (const line of buffer.push(chunk.toString("utf8"))) {
+                  if (line.trim().length === 0) continue;
+                  const frame = JSON.parse(line) as ServerFrame;
+                  if ((frame as { id?: string }).id !== id) continue;
+                  if (frame.type === "rpc_result") {
+                    resolve(frame.value);
+                  } else if (frame.type === "error") {
+                    reject(
+                      new Error(
+                        `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
+                      ),
+                    );
+                  }
+                  s.end();
+                  return;
+                }
+              },
+              close() {},
+              error(_s, err) {
+                reject(err);
+              },
+            },
+          }).catch(reject);
+        });
+      }
 
-    // Third replay: backlog empty → clean ack, NOT an error.
-    const third = (await rpc("replay_dead_letter", undefined)) as {
-      ok: boolean;
-      recovered_dl_id: string | null;
-    };
-    expect(third).toEqual({ ok: true, recovered_dl_id: null });
+      // First replay: oldest waiting row (dl-first, sess-replay-1) flips to
+      // recovered; the events log gains a real SessionStart row; the reducer
+      // folds it into a fresh `jobs` row.
+      const first = (await rpc("replay_dead_letter", {})) as {
+        ok: boolean;
+        recovered_dl_id: string | null;
+      };
+      expect(first).toEqual({ ok: true, recovered_dl_id: "dl-first" });
 
-    // A bad params payload is rejected as `bad_params` and the connection
-    // survives — the dispatcher contract for typed validation throws.
-    try {
-      await rpc("replay_dead_letter", { dl_id: "nope" });
-      throw new Error("expected bad_params rejection");
-    } catch (e) {
-      expect(String(e)).toMatch(/bad_params/);
-    }
-  });
+      // Poll the jobs projection for the recovered session.
+      const verify = await retryUntil(() => {
+        const { db } = openDb(dbPath, { readonly: true });
+        try {
+          const job = db
+            .query(
+              "SELECT job_id, state, cwd FROM jobs WHERE job_id = 'sess-replay-1'",
+            )
+            .get() as { job_id: string; state: string; cwd: string } | null;
+          const dl = db
+            .query(
+              "SELECT status, replayed_event_id FROM dead_letters WHERE dl_id = 'dl-first'",
+            )
+            .get() as {
+            status: string;
+            replayed_event_id: number | null;
+          } | null;
+          if (
+            job &&
+            dl &&
+            dl.status === "recovered" &&
+            dl.replayed_event_id !== null
+          ) {
+            return { job, dl };
+          }
+          return null;
+        } finally {
+          db.close();
+        }
+      }, 3000);
+      expect(verify).not.toBeNull();
+      expect(verify?.job.job_id).toBe("sess-replay-1");
+      expect(verify?.job.cwd).toBe("/tmp/replay");
+
+      // Second replay: drains the next oldest (dl-second).
+      const second = (await rpc("replay_dead_letter", {})) as {
+        ok: boolean;
+        recovered_dl_id: string | null;
+      };
+      expect(second).toEqual({ ok: true, recovered_dl_id: "dl-second" });
+
+      // Third replay: backlog empty → clean ack, NOT an error.
+      const third = (await rpc("replay_dead_letter", undefined)) as {
+        ok: boolean;
+        recovered_dl_id: string | null;
+      };
+      expect(third).toEqual({ ok: true, recovered_dl_id: null });
+
+      // A bad params payload is rejected as `bad_params` and the connection
+      // survives — the dispatcher contract for typed validation throws.
+      try {
+        await rpc("replay_dead_letter", { dl_id: "nope" });
+        throw new Error("expected bad_params rejection");
+      } catch (e) {
+        expect(String(e)).toMatch(/bad_params/);
+      }
+    },
+    { workers: ["wake", "server"] },
+  );
 }, 30000);
 
 test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
@@ -1531,7 +1550,12 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
         reader.close();
       }
     },
-    { env: { KEEPER_CONFIG: configPath } },
+    // fn-749: this is the ONE migrated test that boots the `plan` worker — it
+    // proves a partial set still satisfies a watcher-driven assertion. The plan
+    // worker's `disableNativeWatcher` degrade runs its boot scan per root, so
+    // the pre-committed plan files emit synthetic snapshots; `wake` pumps the
+    // fold on MAIN and `server` serves the resulting epics/tasks rows.
+    { env: { KEEPER_CONFIG: configPath }, workers: ["wake", "server", "plan"] },
   );
 }, 30000);
 

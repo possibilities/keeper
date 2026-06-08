@@ -37,7 +37,11 @@
 import { existsSync, mkdtempSync, rmSync, unlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type DaemonHandle, startDaemon } from "../../src/daemon";
+import {
+  type DaemonHandle,
+  startDaemon,
+  type WorkerName,
+} from "../../src/daemon";
 import { waitForDaemon } from "./wait-for-daemon";
 
 /** The context a {@link withInProcessDaemon} body receives. */
@@ -64,6 +68,17 @@ export interface WithInProcessDaemonOptions {
    * before any `await` — a sibling parallel test never observes it).
    */
   env?: Record<string, string>;
+  /**
+   * fn-749 worker-set selector forwarded verbatim to
+   * `startDaemon({ workers })`. When supplied, the in-process daemon spawns ONLY
+   * the named workers — so a UDS query/RPC/fold test passes
+   * `["wake", "server"]` (no watcher worker dlopens the addon at all) and a
+   * plan-fold test passes `["wake", "server", "plan"]`. Pick the set
+   * DELIBERATELY: the fold REDUCER runs on MAIN, pumped by the `wake` worker, so
+   * every fold-driven test needs `wake`; serving needs `server`. When OMITTED
+   * the daemon boots the full eleven-worker set (production parity).
+   */
+  workers?: readonly WorkerName[];
 }
 
 /** The six sandboxed `KEEPER_*` state-path keys, plus the per-test socket. */
@@ -128,7 +143,14 @@ export async function withInProcessDaemon(
     // sibling parallel test never observes this test's env.
     for (const [k, v] of Object.entries(sandbox)) process.env[k] = v;
     try {
-      handle = startDaemon({ disableNativeWatcher: true });
+      // fn-749: forward the optional worker-set selector. Omitted → the daemon
+      // defaults to the full eleven (still `disableNativeWatcher: true`, so even
+      // a full-set in-process boot dlopens no addon). A minimal set spawns only
+      // the named workers.
+      handle = startDaemon({
+        disableNativeWatcher: true,
+        ...(opts.workers ? { workers: opts.workers } : {}),
+      });
     } finally {
       // Restore EXACTLY — delete keys that were absent, restore the rest.
       for (const k of touchedKeys) {
