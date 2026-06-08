@@ -47,5 +47,5 @@ NOT widen the exit-watcher to close windows; do NOT probe liveness in a fold.
 - [ ] Re-fold determinism preserved; `keeper jobs` no longer accumulates them.
 
 ## Done summary
-
+Diagnosed + fixed the stuck-stopped NULL-pid root cause: dropped the exit-watcher + seed-sweep 'pid IS NOT NULL' exclusion and added a producer-side pidless reap (boot sweep + live exit-watcher) that folds NULL-pid non-terminal rows to killed via a synthetic Killed, guarded so watchable rows and already-terminal rows are untouched. Re-fold determinism preserved (no fold-time probing).
 ## Evidence

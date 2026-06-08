@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Diagnose NULL-pid origin and reap terminal stopped rows",
-  "updated_at": "2026-06-08T15:02:02.053920Z"
+  "updated_at": "2026-06-08T18:13:35.212997Z",
+  "worker_done_at": "2026-06-08T18:13:35.212997Z"
 }
