@@ -8,6 +8,7 @@
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readFileSync,
@@ -1771,6 +1772,187 @@ test("scanDeadLetterDir skips a torn final line — the partial record is never 
     ).n,
   ).toBe(0);
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-740 task .1 — archive-recovered-dead-letters.ts eligibility gate. F2 from
+// the fn-739 audit: the script's DATA-SAFETY CONTRACT (allConfirmed gate,
+// ids.length===0 early-exit, recovered-but-no-replayed_event_id exclusion, and
+// the --apply move) had zero direct coverage. These four tests drive the real
+// script as a subprocess against a sandboxed KEEPER_DB + KEEPER_DEAD_LETTER_DIR
+// and assert on whether the on-disk file is moved to archive/ or left in place.
+// ---------------------------------------------------------------------------
+
+const ARCHIVE_SCRIPT = join(
+  import.meta.dir,
+  "..",
+  "scripts",
+  "archive-recovered-dead-letters.ts",
+);
+
+/**
+ * Insert a `recovered` dead_letters row AND its landed `events` row so the
+ * script's `confirmed` set (status='recovered' AND replayed_event_id IS NOT
+ * NULL AND that events row EXISTS) includes this dl_id. Returns the dl_id.
+ */
+function seedConfirmedRecovered(
+  db: ReturnType<typeof openDb>["db"],
+  dlId: string,
+  sessionId: string,
+): void {
+  const info = db
+    .prepare(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'SessionStart', 'lifecycle', '{}')`,
+    )
+    .run(1, sessionId);
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, ?, 'SessionStart', 1, 1, 1, '{}', 'recovered', 1, ?, NULL)`,
+  ).run(dlId, sessionId, info.lastInsertRowid as number);
+}
+
+/** Seed a `waiting` (not-yet-recovered) dead_letters row — no events row. */
+function seedWaiting(
+  db: ReturnType<typeof openDb>["db"],
+  dlId: string,
+  sessionId: string,
+): void {
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES (?, ?, 'SessionStart', 1, 1, 1, '{}', 'waiting', NULL, NULL, NULL)`,
+  ).run(dlId, sessionId);
+}
+
+/** Serialize one NDJSON line carrying just the dl_id the script keys on. */
+function dlLine(dlId: string, sessionId: string): string {
+  return serializeDeadLetterRecord({
+    dl_id: dlId,
+    session_id: sessionId,
+    hook_event: "SessionStart",
+    ts: 1,
+    dl_written_at: 1,
+    pid: 1,
+    bindings: {
+      ts: 1,
+      session_id: sessionId,
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+}
+
+/** Run the archive script as a subprocess against the sandboxed DB + dl dir. */
+function runArchiveScript(dlDir: string, args: string[] = []): void {
+  const proc = Bun.spawnSync(["bun", ARCHIVE_SCRIPT, ...args], {
+    env: {
+      ...process.env,
+      KEEPER_DB: dbPath,
+      KEEPER_DEAD_LETTER_DIR: dlDir,
+    },
+  });
+  if (proc.exitCode !== 0) {
+    throw new Error(
+      `archive script exited ${proc.exitCode}: ${proc.stderr.toString()}`,
+    );
+  }
+}
+
+test("archive eligibility: a file with one still-waiting record is left in place (allConfirmed gate fires)", () => {
+  // The DB must exist + be migrated before the read-only script opens it.
+  openDb(dbPath).db.close();
+  const { db } = openDb(dbPath);
+  // One confirmed-recovered record and one still-waiting record share a file.
+  seedConfirmedRecovered(db, "dl-ok", "sess-ok");
+  seedWaiting(db, "dl-wait", "sess-wait");
+  db.close();
+
+  const dlDir = join(tmpDir, "dead-letters");
+  mkdirSync(dlDir, { recursive: true });
+  const file = join(dlDir, "mixed.ndjson");
+  writeFileSync(
+    file,
+    dlLine("dl-ok", "sess-ok") + dlLine("dl-wait", "sess-wait"),
+  );
+
+  runArchiveScript(dlDir, ["--apply"]);
+
+  // allConfirmed === false (the waiting record is not in `confirmed`) → the
+  // whole file stays, never archived on a guess.
+  expect(existsSync(file)).toBe(true);
+  expect(existsSync(join(dlDir, "archive", "mixed.ndjson"))).toBe(false);
+});
+
+test("archive eligibility: a recovered record with no replayed_event_id is excluded; the file stays", () => {
+  openDb(dbPath).db.close();
+  const { db } = openDb(dbPath);
+  // Status flipped to `recovered` but replayed_event_id never stamped (the
+  // should-never-happen case). The script's `EXISTS` SELECT excludes it from
+  // `confirmed`, so allConfirmed fires false.
+  db.prepare(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+        status, recovered_at, replayed_event_id, source_file)
+     VALUES ('dl-noid', 'sess-noid', 'SessionStart', 1, 1, 1, '{}',
+             'recovered', 1, NULL, NULL)`,
+  ).run();
+  db.close();
+
+  const dlDir = join(tmpDir, "dead-letters");
+  mkdirSync(dlDir, { recursive: true });
+  const file = join(dlDir, "noid.ndjson");
+  writeFileSync(file, dlLine("dl-noid", "sess-noid"));
+
+  runArchiveScript(dlDir, ["--apply"]);
+
+  expect(existsSync(file)).toBe(true);
+  expect(existsSync(join(dlDir, "archive", "noid.ndjson"))).toBe(false);
+});
+
+test("archive eligibility: an all-torn file (ids.length === 0) is left untouched", () => {
+  openDb(dbPath).db.close();
+
+  const dlDir = join(tmpDir, "dead-letters");
+  mkdirSync(dlDir, { recursive: true });
+  const file = join(dlDir, "torn.ndjson");
+  // Every line is unparseable garbage — no recoverable record. parseDeadLetterLine
+  // returns null for each → ids stays empty → the file is not archived (nothing
+  // to confirm landed).
+  writeFileSync(file, "not json\n{bad\n");
+
+  runArchiveScript(dlDir, ["--apply"]);
+
+  expect(existsSync(file)).toBe(true);
+  expect(existsSync(join(dlDir, "archive", "torn.ndjson"))).toBe(false);
+});
+
+test("archive eligibility: --apply moves a fully-confirmed file to the archive/ subdir", () => {
+  openDb(dbPath).db.close();
+  const { db } = openDb(dbPath);
+  seedConfirmedRecovered(db, "dl-a", "sess-a");
+  seedConfirmedRecovered(db, "dl-b", "sess-b");
+  db.close();
+
+  const dlDir = join(tmpDir, "dead-letters");
+  mkdirSync(dlDir, { recursive: true });
+  const file = join(dlDir, "done.ndjson");
+  writeFileSync(file, dlLine("dl-a", "sess-a") + dlLine("dl-b", "sess-b"));
+
+  // Dry run first: every record is confirmed, but without --apply the file
+  // stays put (only reported).
+  runArchiveScript(dlDir);
+  expect(existsSync(file)).toBe(true);
+  expect(existsSync(join(dlDir, "archive", "done.ndjson"))).toBe(false);
+
+  // --apply moves the eligible file into archive/.
+  runArchiveScript(dlDir, ["--apply"]);
+  expect(existsSync(file)).toBe(false);
+  expect(existsSync(join(dlDir, "archive", "done.ndjson"))).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
