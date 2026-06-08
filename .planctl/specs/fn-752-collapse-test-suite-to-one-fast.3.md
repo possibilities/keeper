@@ -55,5 +55,5 @@ flakes," not a hard millisecond gate.
 - [ ] `bun run test` green over ~5 repeated runs (0 flakes); wall-time measured + reported (<8s target)
 
 ## Done summary
-
+Collapsed the suite to one --parallel test tier (only the 2 OpenTUI ignores retained) plus a separate test:opentui phase; dropped test:slow/test:soak and deleted scripts/soak-slow-tests.ts; fixed the stale test:isolated comment in live-shell.test.ts and trimmed the CLAUDE.md Test-isolation CLI-spawn guidance. Green 0-flake over 5 runs; wall-time ~42s (over the 8s soft target, driven by pre-existing fast-tier cost, not the fold-in — the 6.16s baseline cited in the spec did not reproduce on this host).
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Collapse to one parallel tier; drop soak",
-  "updated_at": "2026-06-08T21:16:36.725067Z"
+  "updated_at": "2026-06-08T22:36:07.906814Z",
+  "worker_done_at": "2026-06-08T22:36:07.906814Z"
 }
