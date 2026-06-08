@@ -1,4 +1,5 @@
 {
+  "approval": "approved",
   "bundles": [],
   "created_at": "2026-06-07T21:41:16.435863Z",
   "depends_on": [],
@@ -9,6 +10,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "keeper plan-worker sidecar fold arms",
-  "updated_at": "2026-06-08T01:25:34.566880Z",
+  "updated_at": "2026-06-08T01:27:56.223644Z",
   "worker_done_at": "2026-06-08T01:25:34.566880Z"
 }
