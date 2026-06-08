@@ -120,12 +120,13 @@ def normalize_epic(data: dict) -> dict:
         data["snippets"] = []
     if "bundles" not in data:
         data["bundles"] = []
-    # fn-592: approval gate field — top-level on every epic JSON. Missing or
-    # null gets the implicit "pending" default; the value is the canonical
-    # source for keeper's filter (replaces the `approvals` sidecar).
-    # Additive, no SCHEMA_VERSION bump (mirrors `tier`, `snippets`, etc.).
-    if data.get("approval") is None:
-        data["approval"] = "pending"
+    # fn-732: the ``approval`` pending default moved OUT of normalize and into
+    # the merge step (``merge_epic_state``). normalize_epic carries through
+    # whatever ``approval`` the def file holds (including a literal None /
+    # absent) untouched; the resolution ladder sidecar → def → pending lives
+    # at merge so the def's pending-vs-absent distinction survives to the
+    # reader. A def written by scaffold/epic create still carries an explicit
+    # "pending"; legacy/absent defs resolve to pending only after the merge.
     # fn-595: queue_jump signals to keeper that this epic should sort above all
     # other root epics on the board (via a `!`-prefixed sort_path).
     # The signal is server-derived from a scaffold YAML opt-in (`queue_jump:
@@ -195,11 +196,10 @@ def normalize_task(data: dict) -> dict:
         data["snippets"] = []
     if "bundles" not in data:
         data["bundles"] = []
-    # fn-592: approval gate field — top-level on every task JSON. Missing or
-    # null gets the implicit "pending" default; mirrors normalize_epic above
-    # so every consumer treats absence as pending uniformly.
-    if data.get("approval") is None:
-        data["approval"] = "pending"
+    # fn-732: the ``approval`` pending default moved OUT of normalize and into
+    # the merge step (``merge_task_state``). normalize_task carries through the
+    # def's ``approval`` untouched; the resolution ladder sidecar → def →
+    # pending lives at merge (see normalize_epic for the rationale).
     return data
 
 
@@ -208,11 +208,40 @@ def merge_task_state(definition: dict, runtime: dict | None) -> dict:
 
     If runtime is None, default to {"status": "todo"}.
     Runtime fields overwrite definition fields.
+
+    fn-732: the runtime sidecar (``.planctl/state/tasks/<id>.state.json``) may
+    carry an ``approval`` value alongside ``status``. Because runtime fields
+    overwrite definition fields, a sidecar ``approval`` shadows the committed
+    def's ``approval`` — that's the sidecar → def half of the resolution
+    ladder. The final ``pending`` default (the def → pending tail) is applied
+    here, AFTER the merge, so a reader sees a fully-resolved value:
+    sidecar > committed def > "pending".
     """
     if runtime is None:
         runtime = {"status": "todo"}
     merged = {**definition, **runtime}
-    return normalize_task(merged)
+    normalize_task(merged)
+    if merged.get("approval") is None:
+        merged["approval"] = "pending"
+    return merged
+
+
+def merge_epic_state(definition: dict, epic_runtime: dict | None) -> dict:
+    """Merge an epic definition with its runtime sidecar (fn-732).
+
+    Epics have no ``status`` overlay — the sidecar carries only ``approval``
+    today. The merge runs the same resolution ladder as ``merge_task_state``:
+    a sidecar ``approval`` shadows the committed def's ``approval``, and an
+    absent value on both resolves to ``"pending"`` here (not in
+    ``normalize_epic``). ``epic_runtime`` is ``None`` when no sidecar exists,
+    which falls straight through to the def → pending tail.
+    """
+    runtime = epic_runtime or {}
+    merged = {**definition, **runtime}
+    normalize_epic(merged)
+    if merged.get("approval") is None:
+        merged["approval"] = "pending"
+    return merged
 
 
 def task_priority(task_data: dict) -> int:

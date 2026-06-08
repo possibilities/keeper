@@ -217,7 +217,13 @@ def _gate_epic_approve(epic_id: str, epic_def: dict, ctx, emit_error_fn) -> None
                 f"Cannot approve epic {epic_id}: task {tid} status is "
                 f"{tstatus!r}, must be 'done'"
             )
-        tapproval = task_def.get("approval", "pending") or "pending"
+        # fn-732: resolve each task's approval via the ladder. merge_task_state
+        # folds the sidecar (runtime) value over the def value and applies the
+        # pending tail, so `merged["approval"]` is already sidecar → def →
+        # pending. The prior `task_def.get("approval", ...)` read only saw the
+        # committed def and would miss a sidecar-only approval during the
+        # dual-write transition.
+        tapproval = merged.get("approval", "pending") or "pending"
         if tapproval != "approved":
             emit_error_fn(
                 f"Cannot approve epic {epic_id}: task {tid} approval is "
@@ -277,6 +283,19 @@ def run(args: SimpleNamespace) -> int:
         if status == "approved":
             _gate_task_approve(task_id, ctx, emit_error)
 
+        # fn-732 DUAL-WRITE. Approval now lives canonically in the gitignored
+        # runtime sidecar (the task state file, RMW under lock_task so a
+        # concurrent `status` write isn't clobbered) AND keeps being written to
+        # the committed def file. The reader-side ladder (keeper + planctl)
+        # resolves sidecar → def → pending, so a not-yet-restarted keeper still
+        # reads the def while a restarted keeper reads the sidecar — no keeper
+        # is starved. The def write is NOT dropped here; that is .2's gated
+        # contract. Removing it now is the exact bug that black-holed approvals.
+        from planctl.store import LocalFileStateStore
+
+        state_store = LocalFileStateStore(ctx.state_dir)
+        state_store.write_task_approval(task_id, status)
+
         # Load -> mutate known field -> rewrite. Unknown top-level fields
         # ride through untouched because we mutate the same dict.
         task_def = load_json(task_path)
@@ -318,6 +337,15 @@ def run(args: SimpleNamespace) -> int:
     # (deleted by this epic).  Rejected/pending writes are unguarded.
     if status == "approved":
         _gate_epic_approve(epic_id, epic_def, ctx, emit_error)
+
+    # fn-732 DUAL-WRITE — same contract as the task branch above. Write the
+    # epic runtime sidecar (.planctl/state/epics/<id>.state.json) AND keep
+    # writing+committing the def-file approval. Reader ladder resolves
+    # sidecar → def → pending. The def write stays until .2's gated contract.
+    from planctl.store import LocalFileStateStore
+
+    state_store = LocalFileStateStore(ctx.state_dir)
+    state_store.write_epic_approval(epic_id, status)
 
     epic_def["approval"] = status
     epic_def["updated_at"] = now_iso()

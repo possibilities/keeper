@@ -32,7 +32,13 @@ from pathlib import Path
 
 from click.testing import CliRunner
 from planctl.cli import cli
-from planctl.models import APPROVAL_STATUSES, normalize_epic, normalize_task
+from planctl.models import (
+    APPROVAL_STATUSES,
+    merge_epic_state,
+    merge_task_state,
+    normalize_epic,
+    normalize_task,
+)
 from planctl.store import LocalFileStateStore, atomic_write_json, now_iso
 from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
 
@@ -150,22 +156,24 @@ def _force_task_approval(project_path: Path, task_id: str, status: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# normalize_*: missing field defaults to "pending"
+# fn-732: the "pending" default moved OUT of normalize_* and INTO the merge
+# step. normalize carries the def's approval through untouched (incl. absent /
+# null); merge_task_state / merge_epic_state apply the def → pending tail.
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_epic_defaults_approval_to_pending():
-    """A legacy epic dict missing `approval` gets the implicit pending default."""
+def test_normalize_epic_does_not_default_approval():
+    """fn-732: normalize_epic no longer injects a pending default for approval."""
     data = {"id": "fn-1-test", "title": "Test", "status": "open"}
     normalize_epic(data)
-    assert data["approval"] == "pending"
+    assert "approval" not in data
 
 
-def test_normalize_task_defaults_approval_to_pending():
-    """A legacy task dict missing `approval` gets the implicit pending default."""
+def test_normalize_task_does_not_default_approval():
+    """fn-732: normalize_task no longer injects a pending default for approval."""
     data = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Test"}
     normalize_task(data)
-    assert data["approval"] == "pending"
+    assert "approval" not in data
 
 
 def test_normalize_epic_preserves_existing_approval():
@@ -182,18 +190,71 @@ def test_normalize_task_preserves_existing_approval():
     assert data["approval"] == "rejected"
 
 
-def test_normalize_epic_coerces_null_to_pending():
-    """A serialized `approval: null` round-trips back to "pending" on read."""
-    data = {"id": "fn-1-t", "title": "X", "status": "open", "approval": None}
-    normalize_epic(data)
-    assert data["approval"] == "pending"
+def test_merge_task_defaults_approval_to_pending():
+    """fn-732: a def missing `approval` resolves to "pending" at merge."""
+    definition = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Test"}
+    merged = merge_task_state(definition, None)
+    assert merged["approval"] == "pending"
 
 
-def test_normalize_task_coerces_null_to_pending():
-    """A serialized `approval: null` on a task round-trips back to "pending"."""
-    data = {"id": "fn-1-t.1", "epic": "fn-1-t", "title": "X", "approval": None}
-    normalize_task(data)
-    assert data["approval"] == "pending"
+def test_merge_epic_defaults_approval_to_pending():
+    """fn-732: a def missing `approval` resolves to "pending" at epic merge."""
+    definition = {"id": "fn-1-test", "title": "Test", "status": "open"}
+    merged = merge_epic_state(definition, None)
+    assert merged["approval"] == "pending"
+
+
+def test_merge_task_coerces_null_to_pending():
+    """A serialized `approval: null` resolves to "pending" at merge."""
+    definition = {"id": "fn-1-t.1", "epic": "fn-1-t", "title": "X", "approval": None}
+    merged = merge_task_state(definition, None)
+    assert merged["approval"] == "pending"
+
+
+def test_merge_epic_coerces_null_to_pending():
+    """A serialized epic `approval: null` resolves to "pending" at merge."""
+    definition = {"id": "fn-1-t", "title": "X", "status": "open", "approval": None}
+    merged = merge_epic_state(definition, None)
+    assert merged["approval"] == "pending"
+
+
+# ---------------------------------------------------------------------------
+# fn-732 resolution ladder: sidecar > def > pending
+# ---------------------------------------------------------------------------
+
+
+def test_merge_task_ladder_sidecar_over_def():
+    """A sidecar approval shadows the committed def approval (sidecar wins)."""
+    definition = {
+        "id": "fn-1-t.1",
+        "epic": "fn-1-t",
+        "title": "X",
+        "approval": "pending",
+    }
+    runtime = {"status": "done", "approval": "approved"}
+    merged = merge_task_state(definition, runtime)
+    assert merged["approval"] == "approved"
+
+
+def test_merge_task_ladder_def_when_no_sidecar_approval():
+    """When the sidecar carries no approval, the def value wins."""
+    definition = {
+        "id": "fn-1-t.1",
+        "epic": "fn-1-t",
+        "title": "X",
+        "approval": "rejected",
+    }
+    runtime = {"status": "done"}  # no approval key in sidecar
+    merged = merge_task_state(definition, runtime)
+    assert merged["approval"] == "rejected"
+
+
+def test_merge_epic_ladder_sidecar_over_def():
+    """An epic sidecar approval shadows the committed def approval."""
+    definition = {"id": "fn-1-t", "title": "X", "status": "done", "approval": "pending"}
+    epic_runtime = {"approval": "approved"}
+    merged = merge_epic_state(definition, epic_runtime)
+    assert merged["approval"] == "approved"
 
 
 # ---------------------------------------------------------------------------
@@ -783,3 +844,215 @@ def test_approve_ambiguous_task_id_across_projects(tmp_path, monkeypatch):
     assert obj.get("success") is False
     assert "exists in multiple projects" in str(obj.get("error", ""))
     assert "--project" in str(obj.get("error", ""))
+
+
+# ---------------------------------------------------------------------------
+# fn-732 DUAL-WRITE: approve writes BOTH the gitignored sidecar AND the
+# committed def file. The def write is retained (dropping it is .2's job).
+# ---------------------------------------------------------------------------
+
+
+def _read_task_sidecar(project_path: Path, task_id: str) -> dict | None:
+    store = LocalFileStateStore(project_path / ".planctl" / "state")
+    return store.load_runtime(task_id)
+
+
+def _read_epic_sidecar(project_path: Path, epic_id: str) -> dict | None:
+    store = LocalFileStateStore(project_path / ".planctl" / "state")
+    return store.load_epic_runtime(epic_id)
+
+
+def test_approve_task_dual_writes_sidecar_and_def(tmp_path, monkeypatch):
+    """`approve <task> approved` lands approval on BOTH the sidecar and the def."""
+    _create_project(tmp_path, monkeypatch)
+    epic_id, task_id = _make_epic_with_task()
+    _force_task_done(tmp_path, task_id)
+
+    code, _, output = _invoke(["approve", epic_id, task_id, "approved"])
+    assert code == 0, output
+
+    # Def file carries approval (still committed during the transition).
+    assert _read_task(tmp_path, task_id)["approval"] == "approved"
+    # Sidecar carries approval too (the new canonical source).
+    sidecar = _read_task_sidecar(tmp_path, task_id)
+    assert sidecar is not None
+    assert sidecar["approval"] == "approved"
+
+
+def test_approve_task_dual_write_preserves_status_in_sidecar(tmp_path, monkeypatch):
+    """The approval write must not clobber the task's runtime `status`.
+
+    The done state lands `status=done` in the sidecar first; an approve write
+    is a RMW under lock_task that touches only the approval key, so status
+    survives.
+    """
+    _create_project(tmp_path, monkeypatch)
+    epic_id, task_id = _make_epic_with_task()
+    _force_task_done(tmp_path, task_id)
+    # Sanity: status is present before approve.
+    assert _read_task_sidecar(tmp_path, task_id)["status"] == "done"
+
+    code, _, output = _invoke(["approve", epic_id, task_id, "approved"])
+    assert code == 0, output
+
+    sidecar = _read_task_sidecar(tmp_path, task_id)
+    assert sidecar["status"] == "done", "RMW clobbered the runtime status"
+    assert sidecar["approval"] == "approved"
+    # Other runtime fields ride through untouched.
+    assert sidecar["assignee"] == "test"
+
+
+def test_approve_epic_dual_writes_sidecar_and_def(tmp_path, monkeypatch):
+    """`approve <epic> approved` lands approval on BOTH the epic sidecar and def."""
+    _create_project(tmp_path, monkeypatch)
+    epic_id, task_id = _make_epic_with_task()
+    _force_task_done(tmp_path, task_id)
+    _force_task_approval(tmp_path, task_id, "approved")
+    _force_epic_done(tmp_path, epic_id)
+
+    code, _, output = _invoke(["approve", epic_id, "approved"])
+    assert code == 0, output
+
+    assert _read_epic(tmp_path, epic_id)["approval"] == "approved"
+    sidecar = _read_epic_sidecar(tmp_path, epic_id)
+    assert sidecar is not None
+    assert sidecar["approval"] == "approved"
+
+
+def test_approve_epic_gate_reads_task_sidecar_approval(tmp_path, monkeypatch):
+    """Epic gate resolves each task's approval via the ladder (sidecar wins).
+
+    A task approved through the CLI lands its approval canonically on the
+    sidecar; the epic gate must see it via merge_task_state even if the def
+    happened to lag. Here both are written (dual-write), so the gate passes.
+    """
+    _create_project(tmp_path, monkeypatch)
+    epic_id, task_id = _make_epic_with_task()
+    _force_task_done(tmp_path, task_id)
+    # Approve the task through the CLI (dual-writes sidecar + def).
+    code, _, output = _invoke(["approve", epic_id, task_id, "approved"])
+    assert code == 0, output
+
+    _force_epic_done(tmp_path, epic_id)
+    # Epic gate must pass — task approval resolves to "approved".
+    code, _, output = _invoke(["approve", epic_id, "approved"])
+    assert code == 0, output
+    assert _read_epic(tmp_path, epic_id)["approval"] == "approved"
+
+
+def test_approve_epic_gate_sees_sidecar_only_task_approval(tmp_path, monkeypatch):
+    """Gate ladder: a sidecar-only task approval (def stale 'pending') passes.
+
+    Simulates the dual-write transition window where the sidecar leads the
+    committed def. The gate reads merge_task_state, so the sidecar's
+    "approved" shadows the def's "pending".
+    """
+    _create_project(tmp_path, monkeypatch)
+    epic_id, task_id = _make_epic_with_task()
+    _force_task_done(tmp_path, task_id)
+    # Sidecar-only approval; the committed def is NOT "approved" (it resolves
+    # to pending via the merge tail), so only the sidecar carries the approval.
+    store = LocalFileStateStore(tmp_path / ".planctl" / "state")
+    store.write_task_approval(task_id, "approved")
+    assert _read_task(tmp_path, task_id).get("approval") != "approved"
+
+    _force_epic_done(tmp_path, epic_id)
+    code, _, output = _invoke(["approve", epic_id, "approved"])
+    assert code == 0, output
+    assert _read_epic(tmp_path, epic_id)["approval"] == "approved"
+
+
+# ---------------------------------------------------------------------------
+# fn-732 store API: read-never-creates + RMW-under-lock concurrent-writer
+# ---------------------------------------------------------------------------
+
+
+def test_store_read_task_approval_absent_returns_none(tmp_path):
+    """read_task_approval on a never-written task returns None (no file created)."""
+    store = LocalFileStateStore(tmp_path / "state")
+    assert store.read_task_approval("fn-1-x.1") is None
+    # Read must not create the sidecar file or the tasks dir.
+    assert not (tmp_path / "state" / "tasks" / "fn-1-x.1.state.json").exists()
+
+
+def test_store_read_epic_approval_absent_returns_none(tmp_path):
+    """read_epic_approval on a never-written epic returns None (no file created)."""
+    store = LocalFileStateStore(tmp_path / "state")
+    assert store.read_epic_approval("fn-1-x") is None
+    assert not (tmp_path / "state" / "epics" / "fn-1-x.state.json").exists()
+
+
+def test_store_write_task_approval_rmw_preserves_status(tmp_path, monkeypatch):
+    """write_task_approval RMW preserves a pre-existing runtime status."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-store-rmw")
+    store = LocalFileStateStore(tmp_path / "state")
+    store.save_runtime("fn-1-x.1", {"status": "done", "assignee": "alice"})
+
+    store.write_task_approval("fn-1-x.1", "approved")
+
+    runtime = store.load_runtime("fn-1-x.1")
+    assert runtime["status"] == "done"
+    assert runtime["assignee"] == "alice"
+    assert runtime["approval"] == "approved"
+
+
+def test_store_write_task_approval_seeds_absent_sidecar(tmp_path, monkeypatch):
+    """write_task_approval on an absent sidecar seeds an approval-only dict."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-store-seed")
+    store = LocalFileStateStore(tmp_path / "state")
+    store.write_task_approval("fn-1-x.1", "rejected")
+    runtime = store.load_runtime("fn-1-x.1")
+    assert runtime == {"approval": "rejected"}
+
+
+def test_store_write_epic_approval_rmw(tmp_path, monkeypatch):
+    """write_epic_approval RMW preserves any pre-existing epic-runtime keys."""
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-store-epic-rmw")
+    store = LocalFileStateStore(tmp_path / "state")
+    store.save_epic_runtime("fn-1-x", {"approval": "pending", "future": "keep"})
+
+    store.write_epic_approval("fn-1-x", "approved")
+
+    runtime = store.load_epic_runtime("fn-1-x")
+    assert runtime["approval"] == "approved"
+    assert runtime["future"] == "keep"
+
+
+def test_store_concurrent_status_and_approval_under_lock(tmp_path, monkeypatch):
+    """A concurrent status write + approval write serialize without data loss.
+
+    Two threads contend on lock_task: one writes status=done (RMW), the other
+    writes approval=approved (RMW). After both, the sidecar must carry BOTH
+    fields — neither write may clobber the other.
+    """
+    import threading
+
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-store-concurrent")
+    store = LocalFileStateStore(tmp_path / "state")
+    # Seed an in_progress state so both writers RMW a non-empty file.
+    store.save_runtime("fn-1-x.1", {"status": "in_progress", "assignee": "bob"})
+
+    barrier = threading.Barrier(2)
+
+    def write_status():
+        barrier.wait()
+        with store.lock_task("fn-1-x.1"):
+            rt = store.load_runtime("fn-1-x.1") or {}
+            rt["status"] = "done"
+            store.save_runtime("fn-1-x.1", rt)
+
+    def write_approval():
+        barrier.wait()
+        store.write_task_approval("fn-1-x.1", "approved")
+
+    t1 = threading.Thread(target=write_status)
+    t2 = threading.Thread(target=write_approval)
+    t1.start()
+    t2.start()
+    t1.join()
+    t2.join()
+
+    runtime = store.load_runtime("fn-1-x.1")
+    assert runtime["status"] == "done", "status write was lost"
+    assert runtime["approval"] == "approved", "approval write was lost"
+    assert runtime["assignee"] == "bob"

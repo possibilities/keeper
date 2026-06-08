@@ -61,7 +61,7 @@ Top-level commands:
 - `show`, `epics`, `tasks`, `list`, `cat`
 - `epic`, `task`, `dep`
 
-`approve <epic_id> [<task_id>] <status>` (fn-592) — gated approval verb (renamed from the prior ungated verb removed in fn-592 task .1). Status is one of `approved | rejected | pending`. Gates: task→`status == done`; epic→`status == done` AND every embedded task `status == done` with `approval == approved`. Driven by `/plan:approve <id>` from a claude session.
+`approve <epic_id> [<task_id>] <status>` (fn-592) — gated approval verb (renamed from the prior ungated verb removed in fn-592 task .1). Status is one of `approved | rejected | pending`. Gates: task→`status == done`; epic→`status == done` AND every embedded task `status == done` with `approval == approved` (resolved via the sidecar → def → pending ladder). Driven by `/plan:approve <id>` from a claude session. The verb writes approval to the gitignored runtime sidecar (task state file via a `lock_task` RMW that preserves a concurrent `status` write; `epics/{id}.state.json` for epics) AND keeps writing + auto-committing the `approval` field on the committed def file — a dual-write (fn-732) so a not-yet-restarted keeper reads the def while a restarted keeper reads the sidecar.
 
 `resolve-task <task_id>` (fn-593) — read-only routing lookup returning the subset of `claim`'s envelope an external consumer needs to pick a tier-plugin and police cwd. Retained as a public CLI surface; no longer wired to the `arthack-claude.py` launcher (keeper reads `task.tier` from its own projected Task data and launches with the matching `--plugin-dir` itself). Cwd-agnostic (scans configured `roots`); supports `--project <path>` to disambiguate. Returns `{task_id, epic_id, project_path, target_repo, primary_repo, tier, status}` — `tier` is one of `medium|high|xhigh|max` or `null`. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID | NOT_A_PROJECT`.
 
@@ -84,9 +84,16 @@ All data lives in `.planctl/` inside the project directory:
   specs/{task-id}.md
   tasks/{task-id}.json
   state/                    # gitignored -- ephemeral runtime data
-    tasks/{task-id}.state.json
+    tasks/{task-id}.state.json    # task runtime status + approval (fn-732)
+    epics/{epic-id}.state.json    # epic approval sidecar (fn-732)
     locks/{task-id}.lock
 ```
+
+Approval lives canonically in the gitignored runtime sidecars (`approval`
+key on the task state file; `epics/{epic-id}.state.json` for epics) so keeper
+folds it gate-free. Every approval reader resolves it via the ladder
+**sidecar → committed def → `pending`**, defaulted at the merge step
+(`merge_task_state` / `merge_epic_state`), never in `normalize_*`.
 
 Specs are written in place to `specs/{id}.md` by commands that mutate spec content (`done`, `task set-description`, `task set-acceptance`, `task set-spec`, `task reset`, `epic set-plan`, `task create`, `epic create`). Git history provides the audit trail.
 

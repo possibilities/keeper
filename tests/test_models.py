@@ -13,7 +13,12 @@ import os
 
 from click.testing import CliRunner
 from planctl.cli import cli
-from planctl.models import normalize_epic, normalize_task
+from planctl.models import (
+    merge_epic_state,
+    merge_task_state,
+    normalize_epic,
+    normalize_task,
+)
 
 from .conftest import run_cli
 
@@ -155,6 +160,50 @@ def test_normalize_task_preserves_existing_bundles():
     data = {"bundles": ["arc/snippeting/main", "sketch/foo"]}
     normalize_task(data)
     assert data["bundles"] == ["arc/snippeting/main", "sketch/foo"]
+
+
+# ---------------------------------------------------------------------------
+# fn-732: approval resolution ladder lives in the merge step, not normalize.
+# ---------------------------------------------------------------------------
+
+
+def test_normalize_epic_no_longer_defaults_approval():
+    """fn-732: normalize_epic leaves a missing approval absent (merge defaults it)."""
+    data = {"id": "fn-1-test", "title": "Test", "status": "open"}
+    normalize_epic(data)
+    assert "approval" not in data
+
+
+def test_normalize_task_no_longer_defaults_approval():
+    """fn-732: normalize_task leaves a missing approval absent (merge defaults it)."""
+    data = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Task"}
+    normalize_task(data)
+    assert "approval" not in data
+
+
+def test_merge_task_state_defaults_approval_pending():
+    """fn-732: merge_task_state applies the def → pending approval tail."""
+    merged = merge_task_state({"id": "fn-1-t.1", "epic": "fn-1-t", "title": "X"}, None)
+    assert merged["approval"] == "pending"
+
+
+def test_merge_task_state_sidecar_approval_wins():
+    """fn-732 ladder: a sidecar (runtime) approval shadows the def approval."""
+    definition = {
+        "id": "fn-1-t.1",
+        "epic": "fn-1-t",
+        "title": "X",
+        "approval": "pending",
+    }
+    merged = merge_task_state(definition, {"status": "done", "approval": "approved"})
+    assert merged["approval"] == "approved"
+
+
+def test_merge_epic_state_defaults_and_ladder():
+    """fn-732: merge_epic_state defaults to pending and lets the sidecar win."""
+    base = {"id": "fn-1-t", "title": "X", "status": "open"}
+    assert merge_epic_state(base, None)["approval"] == "pending"
+    assert merge_epic_state(base, {"approval": "approved"})["approval"] == "approved"
 
 
 # ---------------------------------------------------------------------------

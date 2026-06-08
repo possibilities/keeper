@@ -139,15 +139,37 @@ def read_file_or_stdin(file_arg: str | None) -> str:
 
 
 class LocalFileStateStore:
-    """File-based state store with fcntl locking."""
+    """File-based state store with fcntl locking.
+
+    Holds two families of gitignored runtime sidecars under
+    ``.planctl/state/``:
+
+    * ``tasks/<task_id>.state.json`` — per-task runtime state (status,
+      assignee, evidence, …) AND the task's ``approval`` gate value (fn-732).
+      Approval shares the task file rather than a third file so a single
+      ``lock_task`` RMW serializes a concurrent ``status`` write against an
+      approval write.
+    * ``epics/<epic_id>.state.json`` — per-epic runtime sidecar; today it
+      carries only the epic's ``approval`` value (fn-732). Epics have no
+      ``status``/assignee runtime overlay, so the sidecar is approval-only.
+
+    All reads are read-never-creates: an absent sidecar returns ``None`` /
+    "no approval recorded", never a freshly-written empty file. This keeps the
+    cold-start hot path side-effect free (mirrors ``acks.py``'s
+    ``_open_for_read`` discipline).
+    """
 
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
         self.tasks_dir = state_dir / "tasks"
+        self.epics_dir = state_dir / "epics"
         self.locks_dir = state_dir / "locks"
 
     def _state_path(self, task_id: str) -> Path:
         return self.tasks_dir / f"{task_id}.state.json"
+
+    def _epic_state_path(self, epic_id: str) -> Path:
+        return self.epics_dir / f"{epic_id}.state.json"
 
     def _lock_path(self, task_id: str) -> Path:
         return self.locks_dir / f"{task_id}.lock"
@@ -169,6 +191,75 @@ class LocalFileStateStore:
         state_path = self._state_path(task_id)
         content = json.dumps(data, indent=2, sort_keys=True) + "\n"
         atomic_write(state_path, content)
+
+    def read_task_approval(self, task_id: str) -> str | None:
+        """Return the task's sidecar ``approval`` value, or ``None`` if absent.
+
+        Read-never-creates: a missing sidecar, a sidecar with no ``approval``
+        key, or a corrupt file all return ``None`` so the caller's resolution
+        ladder falls through to the committed def. No lock is taken — a torn
+        read of the JSON surfaces as ``None`` (the ladder degrades to def),
+        never a raise.
+        """
+        runtime = self.load_runtime(task_id)
+        if runtime is None:
+            return None
+        return runtime.get("approval")
+
+    def write_task_approval(self, task_id: str, approval: str) -> None:
+        """Set the task's sidecar ``approval`` value under ``lock_task`` RMW.
+
+        Read-modify-write inside the per-task lock so a concurrent ``status``
+        write (``done`` / ``claim`` / ``block``) is never clobbered — the
+        approval write only touches the ``approval`` key and re-serializes the
+        whole runtime dict. An absent sidecar is seeded as an approval-only
+        ``{"approval": ...}`` dict; the next ``status`` write fills in the rest.
+        """
+        with self.lock_task(task_id):
+            runtime = self.load_runtime(task_id) or {}
+            runtime["approval"] = approval
+            self.save_runtime(task_id, runtime)
+
+    def load_epic_runtime(self, epic_id: str) -> dict | None:
+        """Load the epic runtime sidecar, or ``None`` if absent/corrupt."""
+        state_path = self._epic_state_path(epic_id)
+        if not state_path.exists():
+            return None
+        try:
+            with open(state_path, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return None
+
+    def save_epic_runtime(self, epic_id: str, data: dict) -> None:
+        """Save the epic runtime sidecar."""
+        self.epics_dir.mkdir(parents=True, exist_ok=True)
+        state_path = self._epic_state_path(epic_id)
+        content = json.dumps(data, indent=2, sort_keys=True) + "\n"
+        atomic_write(state_path, content)
+
+    def read_epic_approval(self, epic_id: str) -> str | None:
+        """Return the epic's sidecar ``approval`` value, or ``None`` if absent.
+
+        Read-never-creates, mirroring :meth:`read_task_approval`.
+        """
+        runtime = self.load_epic_runtime(epic_id)
+        if runtime is None:
+            return None
+        return runtime.get("approval")
+
+    def write_epic_approval(self, epic_id: str, approval: str) -> None:
+        """Set the epic's sidecar ``approval`` value under ``lock_task`` RMW.
+
+        Epics have no concurrent ``status`` writer the way tasks do, but the
+        RMW-under-lock shape is kept symmetric with the task path so a future
+        epic-runtime field cannot be clobbered. The lock namespace reuses
+        ``_lock_path(epic_id)`` (epic ids and task ids never collide).
+        """
+        with self.lock_task(epic_id):
+            runtime = self.load_epic_runtime(epic_id) or {}
+            runtime["approval"] = approval
+            self.save_epic_runtime(epic_id, runtime)
 
     @contextmanager
     def lock_task(self, task_id: str):
