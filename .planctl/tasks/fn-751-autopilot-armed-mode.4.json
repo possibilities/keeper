@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T20:32:29.239972Z",
+  "depends_on": [
+    "fn-751-autopilot-armed-mode.1"
+  ],
+  "epic": "fn-751-autopilot-armed-mode",
+  "id": "fn-751-autopilot-armed-mode.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Board armed pill",
+  "updated_at": "2026-06-08T20:32:29.239972Z"
+}
