@@ -74,5 +74,5 @@ dlopens = the SIGTRAP. So "gut em" needs TWO coupled moves:
 - [ ] `bun run test` umbrella green
 
 ## Done summary
-
+Carved a programmatic startDaemon(opts) returning a {stop, sockPath} handle whose stop() tears down all workers + db without process.exit (runDaemon now wraps it, preserving the SIGTERM->exit-0 launchd contract), added a disableNativeWatcher seam so all six watcher workers skip their @parcel/watcher dlopen (plan-worker degrades to its data_version-poll/heartbeat fold path), and shipped test/helpers/in-process-daemon.ts + a keystone test proving boot->fold->UDS query->clean stop with zero worker-thread addon dlopens (180/180 on a 2-file parallel run, no SIGTRAP).
 ## Evidence

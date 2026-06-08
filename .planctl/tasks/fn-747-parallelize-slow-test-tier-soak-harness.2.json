@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "In-process daemon harness + parcel-watcher seam",
-  "updated_at": "2026-06-08T18:03:06.710568Z"
+  "updated_at": "2026-06-08T18:42:18.288021Z",
+  "worker_done_at": "2026-06-08T18:42:18.288021Z"
 }
