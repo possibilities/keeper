@@ -171,50 +171,50 @@ function synthesizeEpics(
         sort_path, queue_jump)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
   );
-  db.exec("BEGIN");
-  for (let i = 0; i < count; i++) {
-    const id = `fn-${i}-synthetic-epic-${i}`;
-    // Each task/job element mirrors the embedded shape the reducer projects, so
-    // the JSON-decode + serialize cost on the read path tracks production.
-    const taskN = 2 + Math.floor(rng() * 6);
-    const tasks = Array.from({ length: taskN }, (_, t) => ({
-      task_id: `${id}.${t}`,
-      title: `Task ${t} — ${"x".repeat(40 + Math.floor(rng() * 80))}`,
-      status: rng() > 0.5 ? "done" : "open",
-      approval: "approved",
-      jobs: [{ verb: "work", job_id: `job-${i}-${t}`, state: "ended" }],
-      snippets: Array.from({ length: 3 }, (_, s) => `snippet/bundle-${s}`),
-    }));
-    const jobs = [
-      { verb: "plan", job_id: `plan-${i}`, state: "ended" },
-      { verb: "close", job_id: `close-${i}`, state: "ended" },
-    ];
-    const jobLinks = Array.from({ length: 2 }, (_, l) => ({
-      kind: "creator",
-      epic_id: `fn-${(i + l + 1) % count}-synthetic-epic`,
-    }));
-    insert.run(
-      id,
-      i,
-      `Synthetic epic ${i} — ${"y".repeat(30 + Math.floor(rng() * 40))}`,
-      "/Users/mike/code/keeper",
-      // All `done` so the cold-connect leg's `status:done` filter returns the
-      // FULL set (matching the ~2MB live board snapshot, which serves every
-      // epic). Approval varies so default-visible / meta-pass behavior is still
-      // representative.
-      "done",
-      rng() > 0.5 ? "approved" : "pending",
-      1000 + i,
-      1_700_000_000 + i,
-      JSON.stringify(tasks),
-      "[]",
-      JSON.stringify(jobs),
-      JSON.stringify(jobLinks),
-      `!${String(i).padStart(6, "0")}`,
-      0,
-    );
-  }
-  db.exec("COMMIT");
+  db.transaction(() => {
+    for (let i = 0; i < count; i++) {
+      const id = `fn-${i}-synthetic-epic-${i}`;
+      // Each task/job element mirrors the embedded shape the reducer projects, so
+      // the JSON-decode + serialize cost on the read path tracks production.
+      const taskN = 2 + Math.floor(rng() * 6);
+      const tasks = Array.from({ length: taskN }, (_, t) => ({
+        task_id: `${id}.${t}`,
+        title: `Task ${t} — ${"x".repeat(40 + Math.floor(rng() * 80))}`,
+        status: rng() > 0.5 ? "done" : "open",
+        approval: "approved",
+        jobs: [{ verb: "work", job_id: `job-${i}-${t}`, state: "ended" }],
+        snippets: Array.from({ length: 3 }, (_, s) => `snippet/bundle-${s}`),
+      }));
+      const jobs = [
+        { verb: "plan", job_id: `plan-${i}`, state: "ended" },
+        { verb: "close", job_id: `close-${i}`, state: "ended" },
+      ];
+      const jobLinks = Array.from({ length: 2 }, (_, l) => ({
+        kind: "creator",
+        epic_id: `fn-${(i + l + 1) % count}-synthetic-epic`,
+      }));
+      insert.run(
+        id,
+        i,
+        `Synthetic epic ${i} — ${"y".repeat(30 + Math.floor(rng() * 40))}`,
+        "/Users/mike/code/keeper",
+        // All `done` so the cold-connect leg's `status:done` filter returns the
+        // FULL set (matching the ~2MB live board snapshot, which serves every
+        // epic). Approval varies so default-visible / meta-pass behavior is still
+        // representative.
+        "done",
+        rng() > 0.5 ? "approved" : "pending",
+        1000 + i,
+        1_700_000_000 + i,
+        JSON.stringify(tasks),
+        "[]",
+        JSON.stringify(jobs),
+        JSON.stringify(jobLinks),
+        `!${String(i).padStart(6, "0")}`,
+        0,
+      );
+    }
+  })();
 }
 
 /**
@@ -231,41 +231,41 @@ function synthesizeEvents(
     `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
      VALUES (?, ?, ?, ?, ?, ?, ?)`,
   );
-  db.exec("BEGIN");
-  for (let i = 0; i < count; i++) {
-    const r = rng();
-    let hook = "PostToolUse";
-    let data = "{}";
-    if (r < 0.05) {
-      hook = "GitSnapshot";
-      // A git snapshot payload listing many roots — the heavy fold.
-      const roots = Array.from({ length: 8 }, (_, k) => ({
-        root: `/Users/mike/code/project-${k}`,
-        branch: "main",
-        ahead: Math.floor(rng() * 5),
-        dirty: rng() > 0.5,
-      }));
-      data = JSON.stringify({ roots });
-    } else if (r < 0.07) {
-      hook = "Commit";
-      data = JSON.stringify({
-        sha: `${i}`.padStart(40, "0"),
-        subject: "synthetic",
-      });
-    } else if (r < 0.5) {
-      hook = "PreToolUse";
+  db.transaction(() => {
+    for (let i = 0; i < count; i++) {
+      const r = rng();
+      let hook = "PostToolUse";
+      let data = "{}";
+      if (r < 0.05) {
+        hook = "GitSnapshot";
+        // A git snapshot payload listing many roots — the heavy fold.
+        const roots = Array.from({ length: 8 }, (_, k) => ({
+          root: `/Users/mike/code/project-${k}`,
+          branch: "main",
+          ahead: Math.floor(rng() * 5),
+          dirty: rng() > 0.5,
+        }));
+        data = JSON.stringify({ roots });
+      } else if (r < 0.07) {
+        hook = "Commit";
+        data = JSON.stringify({
+          sha: `${i}`.padStart(40, "0"),
+          subject: "synthetic",
+        });
+      } else if (r < 0.5) {
+        hook = "PreToolUse";
+      }
+      insert.run(
+        1_700_000_000 + i,
+        `sess-${i % 8}`,
+        4242,
+        hook,
+        hook,
+        "/Users/mike/code/keeper",
+        data,
+      );
     }
-    insert.run(
-      1_700_000_000 + i,
-      `sess-${i % 8}`,
-      4242,
-      hook,
-      hook,
-      "/Users/mike/code/keeper",
-      data,
-    );
-  }
-  db.exec("COMMIT");
+  })();
 }
 
 // ---------------------------------------------------------------------------

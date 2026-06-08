@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Diagnose serve + fold latency under load (harness)",
-  "updated_at": "2026-06-08T15:02:02.356932Z"
+  "updated_at": "2026-06-08T19:03:35.791527Z",
+  "worker_done_at": "2026-06-08T19:03:35.791527Z"
 }
