@@ -2192,3 +2192,59 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # How far the reducer has folded:
 sqlite3 ~/.local/state/keeper/keeper.db 'SELECT * FROM reducer_state'
 ```
+
+## Backup & restore
+
+The event log + projections in `keeper.db` are the system's source of truth, so
+a corrupt image (the 2026-06-07 `database disk image is malformed` incident on
+the now ~2 GB DB) is a catastrophe if it's unrecoverable. Three layers guard it
+(epic `fn-746`):
+
+1. **Detect** — a producer-side `PRAGMA quick_check` integrity probe runs every
+   15 min on a short-lived read-only connection and pages (Telegram, the
+   `Keeper` topic) the moment corruption is structurally detectable
+   (`src/integrity-probe.ts`). A healthy probe is silent.
+2. **Recover** — a daily verified snapshot via `VACUUM INTO`
+   (`src/backup.ts`): the daemon writes a freelist-compacted, standalone copy of
+   the live DB to `~/.local/state/keeper/backups/keeper-<YYYYMMDDTHHMMSS>.db`,
+   immediately re-opens it read-only and runs the FULL `PRAGMA integrity_check`,
+   and only keeps it if it passes — a snapshot that fails verification is
+   deleted (restoring a corrupt snapshot would propagate the corruption). The
+   newest 3 snapshots are retained; a backup failure pages (recovery degraded).
+   `VACUUM INTO` holds only a read transaction on the source, so it never takes
+   the writer lock or starves a concurrent hook INSERT — it is safe while the
+   daemon is up.
+
+Take a snapshot by hand at any time (safe while keeperd is running):
+
+```sh
+bun scripts/backup-db.ts   # prints the verified snapshot path + restore steps
+```
+
+### Restore a snapshot over a corrupt DB
+
+The `VACUUM INTO` snapshot is a fully-defragmented copy, so restoring it doubles
+as the offline size reclamation that online `VACUUM` deliberately defers (the
+live file stays large after cold-blob compaction). Steps (DB path shown for the
+default `~/.local/state/keeper/keeper.db`):
+
+```sh
+# 1. Stop the daemon so nothing holds the writer lock or a stale WAL.
+launchctl stop <keeperd label>          # or kill the keeperd process
+
+# 2. Move the corrupt live DB aside (keep it for forensics) and drop the stale
+#    WAL/SHM sidecars — they belong to the OLD file.
+mv ~/.local/state/keeper/keeper.db ~/.local/state/keeper/keeper.db.corrupt-$(date +%Y%m%dT%H%M%S)
+rm -f ~/.local/state/keeper/keeper.db-wal ~/.local/state/keeper/keeper.db-shm
+
+# 3. Move the newest verified snapshot into place as the new live DB.
+mv ~/.local/state/keeper/backups/keeper-<stamp>.db ~/.local/state/keeper/keeper.db
+
+# 4. Re-verify in place, then restart the daemon (it re-opens WAL on first write).
+sqlite3 -readonly ~/.local/state/keeper/keeper.db 'PRAGMA integrity_check;'
+launchctl start <keeperd label>
+```
+
+Because the entire system folds deterministically from the immutable `events`
+table, a restored DB re-derives byte-identical projections; no projection state
+is lost that the event log doesn't already carry.

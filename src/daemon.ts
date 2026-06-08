@@ -93,6 +93,7 @@ import {
   type BackstopRecord,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
+import { BACKUP_INTERVAL_MS, backupDb, liveBackupPage } from "./backup";
 import { compactColdBlobs, countAbsentBlobs } from "./compaction";
 import {
   openDb,
@@ -3574,6 +3575,60 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     runIntegrityProbe(integrityProbeDeps);
   }, INTEGRITY_PROBE_INTERVAL_MS);
 
+  // fn-746 .2 — periodic verified backup/snapshot (the RECOVERY half of the
+  // epic, complementing the .1 DETECTION probe). `backupDb` runs `VACUUM INTO`
+  // on a DEDICATED short-lived READ-ONLY source connection, so it never takes
+  // the writer lock or starves a concurrent hook INSERT — the copy holds only a
+  // read transaction on the live DB. The freelist-compacted snapshot is the
+  // SIZE-RECLAIMED image (fn-746.1 found the live ~1.9 GB file is freelist-poor
+  // because online VACUUM is deliberately deferred — restoring the snapshot is
+  // the offline VACUUM), and every snapshot is verified with `integrity_check`
+  // before it counts (a snapshot that fails verification is deleted, not kept).
+  // Producer-side: writes ONLY the snapshot file (a sibling of the DB under the
+  // state dir), never the live DB, mints no synthetic event, touches no
+  // projection/reducer — re-fold determinism + sole-writer rules untouched.
+  // Never-throws out, matching the compaction / checkpoint / probe timers; a
+  // backup FAILURE logs AND pages (recovery is degraded), a success is silent.
+  // Stored so shutdown can clear it (an outstanding timer pins a ref on the
+  // main loop, and a backup must not fire mid-teardown). 24h cadence — backup
+  // is a heavy op and a daily verified snapshot is the right recovery floor.
+  const backupPage = liveBackupPage();
+  const backupTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      const result = backupDb(dbPath);
+      if (result.verified && result.snapshotPath !== null) {
+        const mb = (result.bytes / (1024 * 1024)).toFixed(1);
+        console.error(
+          `[keeperd] backup: verified snapshot (${mb} MB) ${result.snapshotPath}${
+            result.pruned.length > 0
+              ? ` (pruned ${result.pruned.length} old)`
+              : ""
+          }`,
+        );
+      } else {
+        const detail = result.error ?? "unknown error";
+        console.error(`[keeperd] backup FAILED: ${detail}`);
+        try {
+          backupPage(
+            `🔴 keeperd backup FAILED — no fresh verified snapshot, recovery is degraded.\n${detail}`,
+          );
+        } catch {
+          // Page is best-effort; a notifier failure must not crash the heartbeat.
+        }
+      }
+    } catch (err) {
+      // A backup is pure recovery-floor maintenance, never a correctness issue
+      // (it only reads the source + writes a sidecar file). Log non-fatally and
+      // let the next heartbeat retry — same crash policy as the probe timer.
+      console.error(
+        `[keeperd] backup pass threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, BACKUP_INTERVAL_MS);
+
   // fn-749: crash-handler guard — wired only when the worker was selected.
   if (autopilotWorkerInstance) {
     const aw = autopilotWorkerInstance;
@@ -3707,6 +3762,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // timer hygiene — an outstanding timer would pin a ref on the main loop and
     // hang teardown at the shutdown deadline.
     clearInterval(integrityProbeTimer);
+    // fn-746 .2 — clear the backup heartbeat. The backup reads via its own
+    // short-lived read-only source connection (never the writer) and writes
+    // only a sidecar snapshot file, so this is timer hygiene — an outstanding
+    // timer would pin a ref on the main loop and hang teardown.
+    clearInterval(backupTimer);
 
     // fn-749: the set of workers actually spawned this boot (filter out the
     // `null`s for any unselected worker). Teardown iterates THIS list, so a
