@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-keeper-db-corruption-resilience",
   "bundles": [],
+  "closer_done_at": "2026-06-08T23:11:21.132290Z",
   "created_at": "2026-06-08T15:12:59.036213Z",
   "depends_on_epics": [],
   "id": "fn-746-keeper-db-corruption-resilience",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Keeper db corruption resilience",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T15:34:42.512047Z"
+  "updated_at": "2026-06-08T23:11:21.132290Z"
 }
