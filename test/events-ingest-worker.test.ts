@@ -439,3 +439,102 @@ test("scanEventsLogDir skips a poison line (INSERT-safe) without advancing past 
 
   db.close();
 });
+
+// ---------------------------------------------------------------------------
+// fn-742 — the LIVE path the original fn-736.1 tests never exercised: the real
+// Worker's `@parcel/watcher` subscription firing a hint, and a many-file
+// concurrent-writers drain. These are the proof-before-re-flip the ingester
+// fix is gated on.
+// ---------------------------------------------------------------------------
+
+test("fn-742 e2e: events-ingest worker posts a live hint when an NDJSON file is appended", async () => {
+  // The dir exists at spawn — the mkdir-at-boot guarantee (daemon.ts) WITHOUT
+  // which the worker skip-and-logs and the live ingest path is dead until the
+  // next restart (the 2026-06-08 incident). Spawn the REAL worker and assert
+  // its watcher subscription fires a contentless hint on a file append.
+  mkdirSync(eventsLogDir, { recursive: true });
+
+  const worker = new Worker(
+    new URL("../src/events-ingest-worker.ts", import.meta.url).href,
+    { workerData: { dir: eventsLogDir } } as WorkerOptions & {
+      workerData: unknown;
+    },
+  );
+
+  let hinted = false;
+  const gotHint = new Promise<void>((resolve) => {
+    worker.addEventListener("message", (ev: MessageEvent) => {
+      const msg = ev.data as { kind?: string } | undefined;
+      if (msg && msg.kind === "events-log-changed") {
+        hinted = true;
+        resolve();
+      }
+    });
+  });
+
+  // Let the worker import @parcel/watcher and subscribe before we mutate.
+  await Bun.sleep(400);
+
+  writeFileSync(
+    join(eventsLogDir, `${LIVE_PID}.ndjson`),
+    serializeEventLogRecord(makeRecord("e2e-live")),
+  );
+
+  // Bounded wait: a watcher miss fails loud (hinted stays false) rather than hang.
+  await Promise.race([gotHint, Bun.sleep(5000)]);
+
+  // Clean shutdown of the watcher subscription, then ensure the thread exits.
+  const closed = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  worker.postMessage({ type: "shutdown" });
+  await Promise.race([closed, Bun.sleep(2000)]);
+  worker.terminate();
+
+  expect(hinted).toBe(true);
+});
+
+test("fn-742 load: scanEventsLogDir drains many concurrent per-pid files exactly-once", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+
+  const N_FILES = 25;
+  const LINES_PER = 12;
+  for (let i = 0; i < N_FILES; i++) {
+    // Distinct, almost-certainly-dead pids — one writer per file, the shape the
+    // hook produces under concurrency (APFS O_APPEND non-interleave per file).
+    const pid = 900_000 + i;
+    const recs = [];
+    for (let j = 0; j < LINES_PER; j++) {
+      recs.push(makeRecord(`load-${i}-${j}`, "PreToolUse"));
+    }
+    writeFileSync(
+      join(eventsLogDir, `${pid}.ndjson`),
+      recs.map(serializeEventLogRecord).join(""),
+    );
+  }
+
+  scanEventsLogDir(db, eventsLogDir);
+
+  const total = (
+    db.query("SELECT count(*) AS c FROM events").get() as { c: number }
+  ).c;
+  const distinct = (
+    db.query("SELECT count(DISTINCT session_id) AS c FROM events").get() as {
+      c: number;
+    }
+  ).c;
+  // Every line landed, exactly once (no drop, no dup) in a single scan pass.
+  expect(total).toBe(N_FILES * LINES_PER);
+  expect(distinct).toBe(N_FILES * LINES_PER);
+
+  // A redundant scan (the periodic fallback timer firing again) lands NO new
+  // rows — idempotent under re-scan regardless of dead-pid file reaping.
+  scanEventsLogDir(db, eventsLogDir);
+  const total2 = (
+    db.query("SELECT count(*) AS c FROM events").get() as { c: number }
+  ).c;
+  expect(total2).toBe(N_FILES * LINES_PER);
+
+  db.close();
+});

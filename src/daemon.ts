@@ -70,6 +70,7 @@
 import type { Database } from "bun:sqlite";
 import {
   existsSync,
+  mkdirSync,
   readdirSync,
   readFileSync,
   statSync,
@@ -285,6 +286,17 @@ export const PENDING_DISPATCH_TTL_MS = 120_000;
  * "60s heartbeat" reference.
  */
 export const PENDING_DISPATCH_SWEEP_INTERVAL_MS = 60_000;
+
+/**
+ * fn-742 — events-log live-ingest poll-is-truth fallback cadence. The
+ * `@parcel/watcher` hint (events-ingest-worker) is the fast path; this periodic
+ * scan is the safety net that guarantees every NDJSON line lands within one
+ * interval even if a watcher event is dropped/coalesced or the worker never
+ * subscribed. Single-digit seconds keeps it under the realtime fold bar
+ * (`FOLD_LATENCY_REALTIME_THRESHOLD = 5s`) while staying near-free when the dir
+ * is unchanged (a readdir + per-file stat; no INSERT until new bytes exist).
+ */
+export const EVENTS_INGEST_FALLBACK_INTERVAL_MS = 3_000;
 
 /**
  * Heartbeat cadence (ms) for the producer-side cold-blob compaction pass
@@ -1299,6 +1311,17 @@ function runDaemon(): void {
   // DIRECT writer-connection write (on `db`, main's writer conn) so the INSERT
   // bumps `data_version` and the downstream pollers wake for free.
   const eventsLogDir = resolveEventsLogDir();
+  // fn-742: the events-ingest worker subscribes to this dir ONCE at spawn and
+  // goes inert with NO retry if it's absent (events-ingest-worker.ts: the
+  // `existsSync` skip-and-log). So a deploy that boots the daemon BEFORE the
+  // hook's first NDJSON append leaves the live ingest path permanently dead
+  // until the next restart — the 2026-06-08 incident: the daemon booted ~2s
+  // before the first append, the worker skipped subscribing, and ~35 min of
+  // hook events piled up undrained (recovered only by the next boot scan).
+  // `mkdir` the dir HERE, before the boot scan AND the worker spawn, so the
+  // worker always finds it and subscribes regardless of deploy ordering. The
+  // hook also mkdirs on append; this just guarantees existence at spawn time.
+  mkdirSync(eventsLogDir, { recursive: true });
   scanEventsLogDir(db, eventsLogDir);
 
   withBootDrainCheckpointTuning(db, () => {
@@ -3065,6 +3088,33 @@ function runDaemon(): void {
     sweepExpiredPendingDispatches();
   }, PENDING_DISPATCH_SWEEP_INTERVAL_MS);
 
+  // fn-742 — poll-is-truth fallback for the events-log live ingest. The
+  // events-ingest worker's `@parcel/watcher` hint is the fast path, but a
+  // dropped/coalesced watcher event (or a worker that never subscribed) would
+  // otherwise leave hook events undrained until the next daemon restart's boot
+  // scan (the 2026-06-08 freeze). This periodic scan guarantees every NDJSON
+  // line lands within one interval no matter what — keeper's standard
+  // watcher-is-hint / poll-is-truth discipline (the plan-worker carries the
+  // same db-poll fallback alongside its FSEvents watch). Runs ON THE MAIN
+  // THREAD against the writer conn (single-writer discipline), is idempotent
+  // (durable per-pid byte-offset, so a redundant scan re-reads only the unread
+  // tail), and never-throws out (mirrors the live `onmessage` handler). Stored
+  // so the shutdown path can `clearInterval` it.
+  const eventsIngestFallbackTimer = setInterval(() => {
+    if (shuttingDown) return;
+    try {
+      scanEventsLogDir(db, eventsLogDir);
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      console.error(
+        `[keeperd] events-log fallback scan threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, EVENTS_INGEST_FALLBACK_INTERVAL_MS);
+
   // Producer-side cold-blob compaction pass (fn-717.2). Relocates the cold
   // tail of inline `events.data` blobs into the `event_blobs` side table and
   // NULLs the hot column, paced (a bounded number of small transactions per
@@ -3250,6 +3300,9 @@ function runDaemon(): void {
     // can't fire a mint into the writer connection mid-teardown.
     // (`clearInterval` is a no-op if the timer already fired.)
     clearInterval(pendingDispatchSweepTimer);
+    // fn-742 — clear the events-log fallback scan timer so a poll can't fire
+    // a scan+INSERT into the writer connection mid-teardown.
+    clearInterval(eventsIngestFallbackTimer);
     // Likewise clear the compaction heartbeat — a relocation batch must not
     // fire into the writer connection mid-teardown.
     clearInterval(compactionTimer);
