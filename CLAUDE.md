@@ -135,8 +135,17 @@ shape because a consumer reads it.
 `fs.watch`/FSEvents/kqueue drop same-process and WAL writes on macOS. Detect
 DB changes via `PRAGMA data_version` polling on a read-only connection (optionally
 woken faster by a same-process `postMessage({type:"kick"})` after a drain).
-Carve-outs are fine: `@parcel/watcher` on EXTERNAL trees (transcripts, `.planctl`,
-`.git/logs/HEAD`) and kqueue/pidfd on EXTERNAL process descriptors (exit-watcher).
+`data_version` carries NO row/root attribution — it signals only "something
+committed" — so it drives O(1) MEMBERSHIP-RECONCILE wakes, never an O(roots)
+per-root fan-out. The git-worker learned this the hard way (fn-748): its
+`data_version` poll used to fan a `git status` snapshot out to EVERY subscribed
+root on every foreign write, pegging the daemon at ~144% CPU under multi-agent
+load. The snapshot arm is now FSEvents-triggered (per-root worktree +
+git-common-dir `@parcel/watcher` subs, plus the drop-triggered rescan) with the
+60s heartbeat as the single backstop; `data_version` only reconciles which roots
+to watch. Carve-outs are fine: `@parcel/watcher` on EXTERNAL trees (transcripts,
+`.planctl`, `.git/logs/HEAD`) and kqueue/pidfd on EXTERNAL process descriptors
+(exit-watcher).
 
 ## No in-process self-heal
 

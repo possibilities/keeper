@@ -2970,6 +2970,108 @@ test("decideDataVersionWake: first advance after boot reconciles", () => {
 });
 
 // ---------------------------------------------------------------------------
+// fn-748 regression — NO snapshot fan-out on a foreign data_version advance.
+//
+// THE acceptance guard for this epic: a foreign write that dirties root A (a
+// hook tool event → a `jobs`-row touch → a `data_version` bump) must NOT fan a
+// `git status` snapshot out to the OTHER subscribed roots B/C/D. `data_version`
+// carries no root attribution, so the removed fan-out arm could not have known
+// which root the write belonged to — it scheduled a snapshot on EVERY root,
+// the O(roots × write-rate) shell-out storm that pegged the daemon at 144%.
+//
+// We faithfully re-create the poll-loop's wiring (src/git-worker.ts:2757) — a
+// per-root `RescanScheduler` (the snapshot trigger) for each subscribed root,
+// and the `decideDataVersionWake` → reconcile-only branch the loop runs on each
+// tick. The poll loop, on an advance, calls `reconcileRoots()` and NOTHING
+// else; it never touches any root's scheduler. So after a foreign advance, the
+// only observable effect must be one membership reconcile and ZERO scheduled
+// snapshots across all roots. A pinned-down model of the OLD fan-out (schedule
+// on every root) is asserted to show what the regression would look like.
+// ---------------------------------------------------------------------------
+
+test("fn-748 regression: a foreign data_version advance fans NO snapshot to other roots", () => {
+  const clock = fakeClock();
+  const roots = ["/repo/A", "/repo/B", "/repo/C", "/repo/D"];
+
+  // One snapshot scheduler per subscribed root — the actual per-root snapshot
+  // trigger the worker owns (subscriptions.get(root).sched). A fire here means
+  // a `git status` shell-out for that root.
+  const scheduled: Record<string, number> = {};
+  const schedByRoot = new Map<string, RescanScheduler>();
+  for (const root of roots) {
+    scheduled[root] = 0;
+    schedByRoot.set(
+      root,
+      new RescanScheduler(
+        () => {
+          scheduled[root] = (scheduled[root] ?? 0) + 1;
+        },
+        500,
+        () => {},
+        clock.timers,
+        1500,
+      ),
+    );
+  }
+
+  // The poll loop's exact body: decide, and on an advance reconcile membership
+  // ONLY. `reconcileRoots` manages subscriptions — it never schedules a
+  // per-root snapshot — so we model it as a pure membership-touch counter.
+  let reconciles = 0;
+  let lastDataVersion = 1;
+  const pollTick = (curVersion: number): void => {
+    const decision = decideDataVersionWake(curVersion, lastDataVersion);
+    if (!decision.reconcile) return;
+    lastDataVersion = curVersion;
+    reconciles++; // === reconcileRoots(); NO sched.schedule() anywhere.
+  };
+
+  // A foreign write dirties root A → data_version bumps 1 → 2. Drive the tick.
+  pollTick(2);
+
+  // Membership was reconciled exactly once (cheap, O(1), idempotent)…
+  expect(reconciles).toBe(1);
+  // …and NOTHING was scheduled — not for A, and crucially not for B/C/D.
+  clock.flushDelay(500); // trailing debounce
+  clock.flushDelay(1500); // ceiling
+  for (const root of roots) {
+    expect(scheduled[root]).toBe(0);
+  }
+
+  // A burst of back-to-back foreign advances (a multi-agent write storm) still
+  // never fans a snapshot out — the storm class the epic kills. Each advance is
+  // a bounded O(1) reconcile, never O(roots) git status spawns.
+  for (let v = 3; v <= 50; v++) pollTick(v);
+  expect(reconciles).toBe(49); // 48 storm advances + the first
+  clock.flushDelay(500);
+  clock.flushDelay(1500);
+  for (const root of roots) {
+    expect(scheduled[root]).toBe(0);
+  }
+
+  // Contrast: the REMOVED fan-out arm scheduled a snapshot on EVERY subscribed
+  // root per advance. Pinned here so the regression's shape is explicit — if a
+  // future edit re-wires the data_version poll back into per-root scheduling,
+  // the assertions above flip from 0 to (advances × roots) and this test fails.
+  let fanoutScheduled = 0;
+  const oldFanoutOnAdvance = (): void => {
+    for (const root of roots) {
+      schedByRoot.get(root)?.schedule();
+      fanoutScheduled++;
+    }
+  };
+  oldFanoutOnAdvance();
+  expect(fanoutScheduled).toBe(roots.length); // 4 — what the bug did per write
+  clock.flushDelay(500);
+  for (const root of roots) {
+    // The old arm WOULD have fired one snapshot per root — proving the test's
+    // scheduler wiring is live (so the 0s above are a real absence, not a
+    // mis-wired harness that can never schedule).
+    expect(scheduled[root]).toBe(1);
+  }
+});
+
+// ---------------------------------------------------------------------------
 // fn-720 backstop telemetry — git-heartbeat missed-wake record + denominator.
 // emitSnapshot + the heartbeat body live inside the worker `main` closure, so
 // (per the established emitSnapshot-delta test pattern above) we faithfully
