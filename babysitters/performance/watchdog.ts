@@ -142,7 +142,7 @@ export function decideWatchdog(input: {
       heartbeatTs: null,
       ageSecs: null,
       message:
-        "babysitter performance: no heartbeat yet (babysitter not yet ticked) — silent first-run.",
+        "babysitter performance: no heartbeat yet (sitter not yet ticked) — silent first-run.",
     };
   }
   const ageSecs = input.nowSecs - input.heartbeatTs;
@@ -166,7 +166,7 @@ export function decideWatchdog(input: {
       action: "all-clear",
       heartbeatTs: input.heartbeatTs,
       ageSecs,
-      message: `babysitter performance: ✅ babysitter alive — last heartbeat ${mins} min ago. (Daily all-clear; the dead-man is watching.)`,
+      message: `babysitter performance: ✅ sitter alive — last heartbeat ${mins} min ago. (Daily all-clear; the dead-man is watching.)`,
     };
   }
   return {
