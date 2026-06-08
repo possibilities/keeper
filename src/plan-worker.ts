@@ -2962,6 +2962,99 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
 }
 
 /**
+ * Resolve the reflog file to watch for `repoRoot`, degrading gracefully
+ * (Risk: `core.logAllRefUpdates=false` repos have no `.git/logs/HEAD`).
+ * Prefer `.git/logs/HEAD` (appended on every commit when reflogs are on);
+ * fall back to `.git/HEAD` (rewritten on branch-switch — weaker but present
+ * even with reflogs off). `null` when neither exists (degrade to the
+ * heartbeat floor + T1's poll for any repo that produces a DB write).
+ *
+ * Pure `existsSync` ladder — no mutation, no DB read. fn-752: hoisted out of
+ * the worker `main()` closure to module scope + exported so the reflog
+ * watch-set wiring stays unit-tested after the live reflog tests are deleted.
+ */
+export function resolveReflogTarget(repoRoot: string): string | null {
+  const logsHead = join(repoRoot, ".git", "logs", "HEAD");
+  if (existsSync(logsHead)) return logsHead;
+  const head = join(repoRoot, ".git", "HEAD");
+  if (existsSync(head)) return head;
+  return null;
+}
+
+/**
+ * fn-737: the discovered planctl-repo set — every `<root>/<project>` that
+ * holds a `.planctl` tree under the configured roots, via the same
+ * {@link discoverPlanctlDirs} walk the heartbeat reconcile uses (a shallow
+ * readdir+stat per root, no DB read, no emission). Each `.planctl` dir's
+ * parent IS its repo root (`repoRootFromPlanctlPath`-shaped), so a commit in
+ * any of these repos can be caught by a reflog watch even when it holds no
+ * currently-pending path. Pure I/O; failures inside {@link discoverPlanctlDirs}
+ * skip-and-log (so a transient read miss just yields a smaller set this cycle,
+ * re-derived on the next reconcile).
+ *
+ * fn-752: hoisted out of the worker `main()` closure, parameterized on `roots`
+ * (was a closure over `data.roots`) + exported. Thin FS wrapper over the
+ * already-exported {@link discoverPlanctlDirs} + `dirname` — no readdir/dirname
+ * logic duplicated here.
+ */
+export function discoverPlanctlRepos(roots: readonly string[]): Set<string> {
+  const repos = new Set<string>();
+  for (const planctlDir of discoverPlanctlDirs(roots)) {
+    repos.add(dirname(planctlDir));
+  }
+  return repos;
+}
+
+/**
+ * The repos that SHOULD hold a `.git/logs/HEAD` reflog watch: every repo that
+ * currently owns a pending path UNION every repo that holds a `.planctl` tree
+ * under the configured roots (fn-737 widening — the latter closes the
+ * no-pending-repo commit tail).
+ *
+ * PURE set arithmetic over the two input sets — READ-only (returns a fresh
+ * union; never mutates `pending` or `discovered`). fn-752: extracted from
+ * `reconcileReflogWatches` so the desired-set derivation is unit-testable
+ * without a Worker, a watcher, or a real `~/code` walk.
+ */
+export function desiredReflogRepos(
+  pending: ReadonlySet<string>,
+  discovered: ReadonlySet<string>,
+): Set<string> {
+  const desired = new Set<string>(pending);
+  for (const repo of discovered) {
+    desired.add(repo);
+  }
+  return desired;
+}
+
+/**
+ * Diff the desired reflog-watch set against the live (subscribed) set:
+ * `toAdd = desired - live` (repos that should be watched but aren't),
+ * `toDrop = live - desired` (repos no longer desired — neither pending nor
+ * holding a `.planctl` tree any longer, e.g. a removed `.planctl` repo).
+ *
+ * PURE set arithmetic — READ-only (returns fresh sets; never mutates the live
+ * `reflogSubs`/`reflogSubscribing` sets the worker owns). fn-752: extracted
+ * from `reconcileReflogWatches` so the add/drop derivation is unit-testable
+ * in isolation; the `subscribe()`/`unsubscribe()` I/O + the mutation of the
+ * worker's live sets stay in the closure that CALLS this helper.
+ */
+export function reflogWatchDiff(
+  desired: ReadonlySet<string>,
+  live: ReadonlySet<string>,
+): { toAdd: Set<string>; toDrop: Set<string> } {
+  const toAdd = new Set<string>();
+  for (const repo of desired) {
+    if (!live.has(repo)) toAdd.add(repo);
+  }
+  const toDrop = new Set<string>();
+  for (const repo of live) {
+    if (!desired.has(repo)) toDrop.add(repo);
+  }
+  return { toAdd, toDrop };
+}
+
+/**
  * Worker entrypoint. Opens its own read-only connection, seeds the change-gate,
  * subscribes ONE recursive watch per root, routes each change event into the
  * scanner, and posts a snapshot message per changed plan file. Each subscription
@@ -3036,36 +3129,10 @@ function main(): void {
   // double-subscribe the same root.
   const reflogSubscribing = new Set<string>();
 
-  // Resolve the reflog file to watch for `repoRoot`, degrading gracefully
-  // (Risk: `core.logAllRefUpdates=false` repos have no `.git/logs/HEAD`).
-  // Prefer `.git/logs/HEAD` (appended on every commit when reflogs are on);
-  // fall back to `.git/HEAD` (rewritten on branch-switch — weaker but present
-  // even with reflogs off). `null` when neither exists (degrade to the
-  // heartbeat floor + T1's poll for any repo that produces a DB write).
-  const resolveReflogTarget = (repoRoot: string): string | null => {
-    const logsHead = join(repoRoot, ".git", "logs", "HEAD");
-    if (existsSync(logsHead)) return logsHead;
-    const head = join(repoRoot, ".git", "HEAD");
-    if (existsSync(head)) return head;
-    return null;
-  };
-
-  // fn-737: the discovered planctl-repo set — every `<root>/<project>` that
-  // holds a `.planctl` tree under the configured roots, via the same
-  // `discoverPlanctlDirs` walk the heartbeat reconcile uses (a shallow
-  // readdir+stat per root, no DB read, no emission). Each `.planctl` dir's
-  // parent IS its repo root (`repoRootFromPlanctlPath`-shaped), so a commit in
-  // any of these repos can be caught by a reflog watch even when it holds no
-  // currently-pending path. Pure I/O; failures inside `discoverPlanctlDirs`
-  // skip-and-log (so a transient read miss just yields a smaller set this cycle,
-  // re-derived on the next reconcile).
-  const discoverPlanctlRepos = (): Set<string> => {
-    const repos = new Set<string>();
-    for (const planctlDir of discoverPlanctlDirs(data.roots)) {
-      repos.add(dirname(planctlDir));
-    }
-    return repos;
-  };
+  // The module-scope `resolveReflogTarget` (the `.git/logs/HEAD` -> `.git/HEAD`
+  // -> null `existsSync` ladder) and `discoverPlanctlRepos(roots)` (the
+  // `discoverPlanctlDirs` + `dirname` FS wrapper) are pure helpers this closure
+  // composes (fn-752 — hoisted to module scope + exported for unit reach).
 
   // Bring the live reflog-watch set into agreement with the repos that should
   // hold a `.git/logs/HEAD` reflog watch: every repo that currently owns a
@@ -3079,19 +3146,27 @@ function main(): void {
   const reconcileReflogWatches = (): void => {
     if (shuttingDown || reflogWatcherModule === null) return;
     const watcher = reflogWatcherModule;
-    const desired = scanner.pendingRepos();
-    for (const repo of discoverPlanctlRepos()) {
-      desired.add(repo);
-    }
+    // PURE desired-set derivation (fn-752): the union of currently-pending
+    // repos and every discovered `.planctl` repo under the configured roots.
+    const desired = desiredReflogRepos(
+      scanner.pendingRepos(),
+      discoverPlanctlRepos(data.roots),
+    );
+    // PURE add/drop diff against the live subscription set. The live set is the
+    // KEYS of `reflogSubs` only — a mid-subscribe root (`reflogSubscribing`)
+    // isn't live yet, so it must not count toward `toDrop` (the `subscribing`
+    // skip below + the in-flight `stillDesired` teardown handle that case).
+    const { toDrop } = reflogWatchDiff(desired, new Set(reflogSubs.keys()));
     // Drop watches for repos that are no longer in the desired union (neither
-    // pending nor holding a `.planctl` tree any longer).
-    for (const [root, sub] of [...reflogSubs]) {
-      if (!desired.has(root)) {
-        reflogSubs.delete(root);
-        void sub.unsubscribe().catch(() => {
-          // best-effort; the repo is no longer desired either way.
-        });
-      }
+    // pending nor holding a `.planctl` tree any longer) — the I/O the pure diff
+    // can't do: actually `unsubscribe()` and mutate the worker's live set.
+    for (const root of toDrop) {
+      const sub = reflogSubs.get(root);
+      if (sub === undefined) continue;
+      reflogSubs.delete(root);
+      void sub.unsubscribe().catch(() => {
+        // best-effort; the repo is no longer desired either way.
+      });
     }
     // Add watches for newly-desired repos (skip ones already subscribed or
     // mid-subscribe).
@@ -3163,7 +3238,7 @@ function main(): void {
           // would be torn down the instant it resolved.
           const stillDesired =
             scanner.pendingRepos().has(root) ||
-            discoverPlanctlRepos().has(root);
+            discoverPlanctlRepos(data.roots).has(root);
           if (shuttingDown || !stillDesired) {
             void sub.unsubscribe().catch(() => {});
             return;

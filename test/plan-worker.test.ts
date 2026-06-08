@@ -37,7 +37,9 @@ import {
   buildTaskMessage,
   classifyPlanPath,
   coerceRuntimeStatus,
+  desiredReflogRepos,
   discoverPlanctlDirs,
+  discoverPlanctlRepos,
   epicDefPathFromStatePath,
   epicIdFromStatePath,
   epicNumberFromId,
@@ -50,7 +52,9 @@ import {
   PlanScanner,
   RECONCILE_HEARTBEAT_MS,
   reconcilePlanctlDirs,
+  reflogWatchDiff,
   repoRootFromPlanctlPath,
+  resolveReflogTarget,
   scanRoot,
   seedFromDb,
   taskDefPathFromStatePath,
@@ -1828,6 +1832,93 @@ test("discoverPlanctlDirs: does NOT recurse — a project nested 2 levels deep i
 
   const dirs = discoverPlanctlDirs([tmpDir]);
   expect(dirs).toEqual([join(tmpDir, "flat", ".planctl")]);
+});
+
+// fn-737 reflog watch-set wiring, extracted to PURE module-scope helpers
+// (fn-752) so the "which repos get watched" logic stays covered after the live
+// spawned-Worker reflog tests are deleted in `.2`. No Worker, no
+// `@parcel/watcher`, no real `~/code` access — just tmp files + plain sets.
+
+test("resolveReflogTarget: prefers .git/logs/HEAD when present", () => {
+  // A repo with reflogs ON has `.git/logs/HEAD` — the strong signal (appended
+  // on every commit). Write both files; the ladder must pick logs/HEAD first.
+  mkdirSync(join(tmpDir, ".git", "logs"), { recursive: true });
+  writeFileSync(join(tmpDir, ".git", "logs", "HEAD"), "");
+  writeFileSync(join(tmpDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+
+  expect(resolveReflogTarget(tmpDir)).toBe(
+    join(tmpDir, ".git", "logs", "HEAD"),
+  );
+});
+
+test("resolveReflogTarget: falls back to .git/HEAD when logs/HEAD is absent", () => {
+  // Reflogs OFF (`core.logAllRefUpdates=false`, no `.git/logs/HEAD`): the
+  // weaker `.git/HEAD` fallback (rewritten on branch-switch) is the target.
+  mkdirSync(join(tmpDir, ".git"), { recursive: true });
+  writeFileSync(join(tmpDir, ".git", "HEAD"), "ref: refs/heads/main\n");
+
+  expect(resolveReflogTarget(tmpDir)).toBe(join(tmpDir, ".git", "HEAD"));
+});
+
+test("resolveReflogTarget: returns null when neither file exists", () => {
+  // Neither `.git/logs/HEAD` nor `.git/HEAD` (not a git repo, or a torn-down
+  // `.git`): no reflog watch — the worker degrades to the heartbeat floor.
+  expect(resolveReflogTarget(tmpDir)).toBeNull();
+});
+
+test("discoverPlanctlRepos: returns the repo roots (parents of discovered .planctl dirs)", () => {
+  // Each `<root>/<project>/.planctl` parent IS its repo root. Build a couple of
+  // real `.planctl` trees under a tmp root (no real `~/code` touched) and
+  // confirm the FS wrapper yields the project dirs, not the `.planctl` dirs.
+  const projA = join(tmpDir, "proja");
+  const projB = join(tmpDir, "projb");
+  mkdirSync(join(projA, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(projB, ".planctl", "tasks"), { recursive: true });
+  // A project WITHOUT `.planctl` contributes no repo.
+  mkdirSync(join(tmpDir, "projc"), { recursive: true });
+
+  const repos = discoverPlanctlRepos([tmpDir]);
+  expect([...repos].sort()).toEqual([projA, projB].sort());
+});
+
+test("desiredReflogRepos: the union of pending repos and discovered planctl repos", () => {
+  // The fn-737 widening: watch every pending repo UNION every discovered
+  // `.planctl` repo. A repo present in BOTH inputs appears once (set union).
+  const pending = new Set(["/r/a", "/r/b"]);
+  const discovered = new Set(["/r/b", "/r/c"]);
+
+  const desired = desiredReflogRepos(pending, discovered);
+  expect([...desired].sort()).toEqual(["/r/a", "/r/b", "/r/c"]);
+  // READ-only: the inputs are not mutated.
+  expect([...pending].sort()).toEqual(["/r/a", "/r/b"]);
+  expect([...discovered].sort()).toEqual(["/r/b", "/r/c"]);
+});
+
+test("reflogWatchDiff: toAdd = desired - live, toDrop = live - desired", () => {
+  // The watch-set reconcile diff. `/r/new` is desired but not yet live (add);
+  // `/r/gone` is live but no longer desired — e.g. a removed `.planctl` repo —
+  // so it lands in toDrop; `/r/keep` is in both (no churn).
+  const desired = new Set(["/r/keep", "/r/new"]);
+  const live = new Set(["/r/keep", "/r/gone"]);
+
+  const { toAdd, toDrop } = reflogWatchDiff(desired, live);
+  expect([...toAdd]).toEqual(["/r/new"]);
+  expect([...toDrop]).toEqual(["/r/gone"]);
+  // READ-only: neither input set is mutated.
+  expect([...desired].sort()).toEqual(["/r/keep", "/r/new"]);
+  expect([...live].sort()).toEqual(["/r/gone", "/r/keep"]);
+});
+
+test("reflogWatchDiff: a removed .planctl repo lands in toDrop (drops its watch)", () => {
+  // The drop-side of the fn-737 lifecycle: a repo that held a `.planctl` tree
+  // (so it was watched) no longer appears in the desired union, so its live
+  // subscription must be reclaimed.
+  const desired = new Set<string>(); // nothing pending, no `.planctl` repos
+  const live = new Set(["/r/removed"]);
+
+  const { toAdd, toDrop } = reflogWatchDiff(desired, live);
+  expect([...toAdd]).toEqual([]);
+  expect([...toDrop]).toEqual(["/r/removed"]);
 });
 
 test("reconcilePlanctlDirs: a new-repo first scaffold converges on one call (no FSEvents, no DB row)", () => {
