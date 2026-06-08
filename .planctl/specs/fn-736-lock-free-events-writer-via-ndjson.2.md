@@ -56,5 +56,5 @@ Re-point events-writer.test.ts to assert the appended NDJSON line + sandboxed KE
 - [ ] Perf harness re-run: ~6–10ms/call (down from ~22.5ms), contention flat; recorded in ~/docs/hook-perf-baseline.md
 
 ## Done summary
-
+Flipped the events-writer hook from a direct SQLite INSERT to a lock-free per-pid NDJSON appendFileSync, dropping the src/db.ts/bun:sqlite import entirely; repurposed dead-letter as the append-failure fallback, re-pointed tests to assert the appended NDJSON line, and updated CLAUDE.md/README/hooks.json plus the perf baseline.
 ## Evidence
