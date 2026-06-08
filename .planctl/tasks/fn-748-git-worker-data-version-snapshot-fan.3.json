@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Prove CPU under soak, guard, and document",
-  "updated_at": "2026-06-08T17:33:34.056128Z"
+  "updated_at": "2026-06-08T23:55:07.034181Z",
+  "worker_done_at": "2026-06-08T23:55:07.034181Z"
 }
