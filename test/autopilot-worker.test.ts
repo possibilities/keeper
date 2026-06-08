@@ -1985,6 +1985,47 @@ test("isReapCandidate: approve:: and close:: surfaces match when open", () => {
   ).toBe(true);
 });
 
+test("isReapCandidate: fn-741 live-veto — exited:false pane with an OPEN key is NOT reaped", () => {
+  // The 2026-06-08 regression: during the fn-736 hook freeze SessionStart
+  // never folded, so work::A's pending row never discharged — its key stays
+  // in the open set even though the worker is LIVE (exited:false). The
+  // fold-latency-immune veto spares it regardless of set membership.
+  const open = new Set(["work::fn-741-x.1"]);
+  expect(
+    isReapCandidate(
+      open,
+      pane({
+        id: "7",
+        exited: false,
+        terminal_command: "claude --name work::fn-741-x.1 '/plan:work ...'",
+      }),
+    ),
+  ).toBe(false);
+});
+
+test("isReapCandidate: fn-741 — exited true/undefined with an OPEN key still reap (no ghost regression)", () => {
+  // Only an explicit `false` vetoes. A true ghost AND an unknown-state pane
+  // (zellij omits the field) both still reap when their key is open — the
+  // launch-window ghost behavior is preserved.
+  const open = new Set(["work::fn-741-x.1"]);
+  expect(
+    isReapCandidate(
+      open,
+      pane({
+        id: "8",
+        exited: true,
+        terminal_command: "claude --name work::fn-741-x.1",
+      }),
+    ),
+  ).toBe(true);
+  expect(
+    isReapCandidate(
+      open,
+      pane({ id: "9", terminal_command: "claude --name work::fn-741-x.1" }), // exited undefined
+    ),
+  ).toBe(true);
+});
+
 // ---------------------------------------------------------------------------
 // fn-727 — isCompletionReapCandidate (approved-completion reap gate)
 //
@@ -1992,7 +2033,9 @@ test("isReapCandidate: approve:: and close:: surfaces match when open", () => {
 // completed-row-id SET (the `{tag:"completed"}` verdict), keying off the
 // `<id>` of a `(work|approve|close)::<id>` pane name — so one completed
 // id authorizes reaping BOTH its work/close pane AND its approve pane.
-// `is_exited` is DELIBERATELY not gated (the approver is live at approval).
+// Pane liveness is NOT the authorization (the `{tag:"completed"}` verdict
+// is), but fn-741 layers an `exited === false` VETO: a demonstrably-live
+// pane is spared even on a completed id. `exited` true/undefined still reap.
 // ---------------------------------------------------------------------------
 
 test("isCompletionReapCandidate: a completed task id reaps work::<id> AND approve::<id>", () => {
@@ -2075,15 +2118,36 @@ test("isCompletionReapCandidate: empty completed set never reaps", () => {
   ).toBe(false);
 });
 
-test("isCompletionReapCandidate: ignores pane.exited (the approver is live at approval)", () => {
-  // DELIBERATE divergence from the practice-scout `is_exited==true` rule:
-  // a LIVE approve pane (exited:false) on a completed id IS reaped. The
-  // verdict, not pane liveness, is the sole authorization.
+test("isCompletionReapCandidate: fn-741 live-veto — exited:false pane on a completed id is NOT reaped", () => {
+  // fn-741 defense-in-depth: a demonstrably-live pane (zellij reports
+  // exited:false) is spared even when its id is in the completed set. This
+  // does NOT reinstate the rejected `is_exited==true` rule (inverse
+  // polarity) — it blocks ONLY explicit liveness, sparing the pane one
+  // extra cycle until it exits.
   const completed = new Set(["fn-1-foo.3"]);
   expect(
     isCompletionReapCandidate(
       completed,
       pane({ id: "2", tab_name: "approve::fn-1-foo.3", exited: false }),
+    ),
+  ).toBe(false);
+});
+
+test("isCompletionReapCandidate: exited true/undefined on a completed id still reap (no regression)", () => {
+  // Only an explicit `false` vetoes. An exited ghost and an unknown-state
+  // pane (zellij omits the field) both still reap on the completed verdict —
+  // the approver, live at approval, exits and reaps on a later list-panes.
+  const completed = new Set(["fn-1-foo.3"]);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "2", tab_name: "approve::fn-1-foo.3", exited: true }),
+    ),
+  ).toBe(true);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "3", tab_name: "work::fn-1-foo.3" }), // exited undefined
     ),
   ).toBe(true);
 });

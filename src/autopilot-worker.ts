@@ -391,11 +391,24 @@ export function sweepRedispatchCooldown(
  * name match alone never authorizes a close; `list-panes` lags zellij
  * reality and a name-only reap would kill live workers. A pane with no
  * dispatch key (a human's ad-hoc tab) is also never touched.
+ *
+ * fn-741 LIVE-VETO: a pane with `exited === false` is demonstrably live and
+ * is NEVER a reap candidate, regardless of its `pending_dispatches`
+ * membership. The `openPendingKeys` intersect is fold-latency-dependent —
+ * during the 2026-06-08 fn-736 hook freeze, `SessionStart` never folded, so
+ * keys never discharged and the pause reap killed LIVE workers mid-task.
+ * This veto removes the fold-latency dependency from the highest-blast-radius
+ * close decision, making the reap strictly MORE conservative. Treat ONLY an
+ * explicit `false` as live — `undefined` is unknown (zellij omits the field)
+ * and MUST fall through so true ghosts still reap.
  */
 export function isReapCandidate(
   openPendingKeys: Set<DispatchKey>,
   pane: ZellijPane,
 ): boolean {
+  if (pane.exited === false) {
+    return false;
+  }
   const key = dispatchKeyForPane(pane);
   return key != null && openPendingKeys.has(key);
 }
@@ -427,11 +440,26 @@ export function isReapCandidate(
  * same id (a re-dispatch would flip the row OFF `completed`). Do NOT "fix"
  * this back to the `is_exited` default. A pane with no dispatch key (a
  * human's ad-hoc tab) is never touched.
+ *
+ * fn-741 LIVE-VETO: the same `exited === false` safety net the pause reap
+ * carries is layered here too. This does NOT reinstate the rejected
+ * "match name AND is_exited==true" rule — that gated on `exited === true`,
+ * which would NEVER reap the live-at-approval approver. The veto is the
+ * INVERSE polarity: it blocks ONLY a demonstrably-live (`exited === false`)
+ * pane, while `true` AND `undefined` still fall through to the
+ * `{tag:"completed"}` authorization. So the approver pane (live at approval,
+ * `exited` undefined or true on the next list-panes) still reaps normally;
+ * only a pane zellij explicitly reports as still-running is spared one cycle.
+ * Defense-in-depth against any fold-latency edge where a still-live worker's
+ * id transiently appears in `completedRowIds`.
  */
 export function isCompletionReapCandidate(
   completedRowIds: Set<string>,
   pane: ZellijPane,
 ): boolean {
+  if (pane.exited === false) {
+    return false;
+  }
   const key = dispatchKeyForPane(pane);
   if (key == null) {
     return false;

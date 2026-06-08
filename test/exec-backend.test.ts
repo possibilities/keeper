@@ -1571,13 +1571,16 @@ test("completion reap: approving a completed task reaps work::<id> AND approve::
   const calls: string[][] = [];
   // Live session: the completed task's work pane + its approve pane, plus
   // an unrelated worker on a non-completed id and a human tab.
+  // The completed pair's panes have exited by reap time (exited true/
+  // undefined). fn-741's live-veto only spares an explicit `exited:false`
+  // pane (covered separately), so the pair-reap is unaffected here.
   const json = JSON.stringify([
     { id: 1, tab_name: "work::fn-1-foo.3", terminal_command: "claude" },
     {
       id: 2,
       tab_name: "Tab #2",
       terminal_command: "claude --name approve::fn-1-foo.3",
-      exited: false,
+      exited: true,
     },
     { id: 3, tab_name: "work::fn-9-other.1", terminal_command: "claude" },
     { id: 4, tab_name: "Tab #4", terminal_command: "/bin/zsh -l -i" },
