@@ -66,5 +66,16 @@ tier so it is parallel-safe, then prove it with the soak harness.
 - [ ] No README/CLAUDE.md prose left asserting the slow tier is inherently serial
 
 ## Done summary
+Took the epic's documented FALLBACK: a full --parallel soak proved the speedup unreachable, so the slow tier stays SERIAL with the soak harness as the durable flake-regression guard. RETAINED the genuine .2-enabled wins.
 
+Shipped:
+- 4 integration e2e tests migrated onto .2's in-process daemon harness (UDS-subscribe, approval RPC, replay-dead-letter, plan-worker fold): sub-second vs 30s, zero @parcel/watcher dlopen. New harness env-passthrough option wires hermetic KEEPER_CONFIG for plan-root tests.
+- 5 true-subprocess smoke tests retained (need real processes/watchers); transcript pair bumped to 60s.
+- test:slow + soak harness re-pointed to the serial tier; soak header rewritten to document the two --parallel walls.
+
+Two --parallel walls (both proven by soak): (1) @parcel/watcher native addon SIGTRAP/segfaults on concurrent teardown of watcher-bearing real daemon subprocesses; (2) plan-worker's fn-737 reflog-latency guards assert the reflog WATCH beats the heartbeat (heartbeatRescues===0) — under --parallel load the watch slows, the heartbeat wins, the guard fails; they need low-load serial isolation, so parallelizing plan-worker is self-defeating.
+
+Speedup forfeit (per fallback clause); serial tier is still FASTER + tears down FEWER native watchers than the pre-fn-747 baseline thanks to the in-process conversions. Spec step-2 (convert daemon/plan-worker worker-spawns) proved unnecessary. NOTE: the e2e tests are contention-sensitive (fn-722.7); they pass cleanly in isolation but the 20x soak is flaky on a loaded box — run the soak on a QUIET box for a clean 0-flake reading (the harness header says so).
 ## Evidence
+- Commits: 047bad5
+- Tests: integration.test.ts 10/10 serial, transcript pair 5/5 isolated, daemon+plan-worker 180/180, typecheck+biome clean

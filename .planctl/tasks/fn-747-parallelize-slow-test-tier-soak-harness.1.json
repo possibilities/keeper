@@ -11,6 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Soak harness + parallelize slow tier",
-  "updated_at": "2026-06-08T18:03:11.714241Z",
-  "worker_done_at": null
+  "updated_at": "2026-06-08T20:40:04.025488Z",
+  "worker_done_at": "2026-06-08T20:40:04.025488Z"
 }
