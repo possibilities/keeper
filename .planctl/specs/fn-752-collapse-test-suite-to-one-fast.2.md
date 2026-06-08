@@ -68,5 +68,5 @@ plan-fold survivor).
 - [ ] Each touched test file passes when run individually
 
 ## Done summary
-
+Deleted the OS-coupled tests (spawned-Worker, @parcel/watcher load smokes, fn-737 real-git latency/lever harness, 5 subprocess-daemon e2e, pre-warm FLEET dlopen smoke) from the 4 slow-tier test files; cited each deletion's surviving OUR-logic coverage in the commit body. Cleaned integration.test.ts dead scaffolding and dropped serial-tier framing from all 4 file headers. All 4 files pass individually + together; full fast+slow suite green.
 ## Evidence
