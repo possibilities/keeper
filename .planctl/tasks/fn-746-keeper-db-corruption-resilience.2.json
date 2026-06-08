@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T15:12:59.036213Z",
+  "depends_on": [
+    "fn-746-keeper-db-corruption-resilience.1"
+  ],
+  "epic": "fn-746-keeper-db-corruption-resilience",
+  "id": "fn-746-keeper-db-corruption-resilience.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Checkpoint cadence, backup/restore, and size management",
+  "updated_at": "2026-06-08T15:12:59.036213Z"
+}

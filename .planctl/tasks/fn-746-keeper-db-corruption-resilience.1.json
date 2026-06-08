@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T15:12:59.036213Z",
+  "depends_on": [],
+  "epic": "fn-746-keeper-db-corruption-resilience",
+  "id": "fn-746-keeper-db-corruption-resilience.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Diagnose corruption + add proactive integrity detection",
+  "updated_at": "2026-06-08T15:12:59.036213Z"
+}
