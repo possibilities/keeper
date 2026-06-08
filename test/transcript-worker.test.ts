@@ -1,18 +1,16 @@
 /**
- * Transcript-worker tests, in three layers (mirrors wake-worker.test.ts +
- * server-worker.test.ts):
+ * Transcript-worker tests — DETERMINISM unit tests against the PURE
+ * `TranscriptLineStream` core + the `scanFile`/`scanJobsForTitles` title seam +
+ * the `matchApiError` line parser — no Worker, no watcher, just files +
+ * `onChange`. Cover partial-line buffering across two reads, truncation reset,
+ * malformed-skip, change-only emit, a multi-byte (emoji) title split across the
+ * 64 KiB read boundary (must NOT decode to U+FFFD), and the fn-720 backstop
+ * missed-wake records.
  *
- * (a) DETERMINISM unit tests against the PURE `TranscriptLineStream` core — no
- *     Worker, no watcher, just files + `onChange`. Cover partial-line buffering
- *     across two reads, truncation reset, malformed-skip, change-only emit, and
- *     a multi-byte (emoji) title split across the 64 KiB read boundary (must NOT
- *     decode to U+FFFD).
- * (b) A SMOKE test that `@parcel/watcher`'s native addon loads + fires under
- *     `bun test` (the keystone CI risk — N-API load failure is a hard dyld
- *     crash, not catchable).
- * (c) A real spawned Worker that shuts down cleanly on `{ type: "shutdown" }`
- *     (the subsystem teardown — the watcher unsubscribe must let the thread
- *     exit), mirroring wake-worker.test.ts.
+ * The OS-coupled layers — the `@parcel/watcher` native-addon load smoke and the
+ * real spawned-Worker shutdown test — were deleted in fn-752: they assert
+ * OS/runtime behavior (native dlopen, FSEvents delivery, thread teardown)
+ * rather than keeper's own transcript logic. Dogfooding is the backstop.
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -1124,72 +1122,6 @@ test("disjointness corpus: the three pre-filter needles never co-fire on the sam
       hits: c.expect,
     });
   }
-});
-
-// ---------------------------------------------------------------------------
-// (b) Native addon smoke test
-// ---------------------------------------------------------------------------
-
-test("smoke: @parcel/watcher loads + fires a create event under bun test", async () => {
-  const watcher = await import("@parcel/watcher");
-  expect(typeof watcher.subscribe).toBe("function");
-
-  // tmpDir already exists (created in beforeEach) — watch it directly.
-  const fired: string[] = [];
-  const sub = await watcher.subscribe(tmpDir, (err, events) => {
-    if (err) {
-      return;
-    }
-    for (const ev of events) {
-      fired.push(ev.path);
-    }
-  });
-
-  try {
-    // Create a file and wait for the FSEvents notification.
-    const target = join(tmpDir, "fires.jsonl");
-    writeFileSync(target, `${titleLine("smoke", "Title")}\n`);
-
-    const deadline = Date.now() + 3000;
-    while (fired.length === 0 && Date.now() < deadline) {
-      await Bun.sleep(50);
-    }
-    expect(fired.length).toBeGreaterThanOrEqual(1);
-  } finally {
-    await sub.unsubscribe();
-  }
-});
-
-// ---------------------------------------------------------------------------
-// (c) Real spawned Worker — clean shutdown
-// ---------------------------------------------------------------------------
-
-test("spawned Worker shuts down cleanly on shutdown message", async () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  // Bootstrap the schema with a writer so the worker's read-only open succeeds.
-  openDb(dbPath).db.close();
-  // tmpDir already exists, so the worker's subscribe() can bind to it.
-  const worker = new Worker(
-    new URL("../src/transcript-worker.ts", import.meta.url).href,
-    {
-      workerData: { dbPath, watchRoot: tmpDir },
-    } as WorkerOptions & { workerData: unknown },
-  );
-
-  const exited = new Promise<void>((resolve) => {
-    worker.addEventListener("close", () => resolve());
-  });
-
-  // Let it boot, open its connection, and subscribe.
-  await Bun.sleep(200);
-  worker.postMessage({ type: "shutdown" });
-
-  const result = await Promise.race([
-    exited.then(() => "exited" as const),
-    Bun.sleep(3000).then(() => "timeout" as const),
-  ]);
-
-  expect(result).toBe("exited");
 });
 
 // ---------------------------------------------------------------------------

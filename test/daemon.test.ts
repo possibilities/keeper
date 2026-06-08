@@ -2581,49 +2581,6 @@ test("prewarmWatcherAddon: the loud assertion does NOT downgrade a genuine failu
   ).toThrow("ABI mismatch");
 });
 
-// fn-701 task .3 — boot smoke test for the concurrent-dlopen fix. Mirrors the
-// daemon's boot sequence (pre-warm @parcel/watcher on MAIN, THEN spawn the
-// watcher-loading workers back-to-back) and asserts every worker reaches
-// "subscribed" without exiting. Without the pre-warm, N≥16 concurrent FIRST
-// dlopens of the native addon reproduce `symbol 'napi_register_module_v1' not
-// found` on bun 1.3.14 (residual Bun #15942); with it, the addon is already
-// registered on main so the worker imports never race. Spawns more workers than
-// the daemon's six to stress the race the fix closes.
-test("boot smoke: after main pre-warm, a fleet of @parcel/watcher workers all subscribe without exit", async () => {
-  // Pre-warm on the main test thread — the SAME synchronous require the daemon
-  // runs before its spawn block. This is the load-bearing step under test.
-  prewarmWatcherAddon();
-
-  const N = 16;
-  const results = await Promise.all(
-    Array.from({ length: N }, () => {
-      const worker = new Worker(
-        new URL("./fixtures/parcel-watcher-worker.ts", import.meta.url).href,
-      );
-      return new Promise<{ ok: boolean; err?: string }>((resolve) => {
-        worker.onmessage = (
-          ev: MessageEvent<{ ok: boolean; err?: string }>,
-        ) => {
-          worker.terminate();
-          resolve(ev.data);
-        };
-        // A worker that crashes on the addon load fires `error`, NOT a message —
-        // surface it as a failure so the assertion below catches the race.
-        worker.addEventListener("error", (ev: ErrorEvent) => {
-          worker.terminate();
-          resolve({ ok: false, err: ev.message ?? "worker error" });
-        });
-      });
-    }),
-  );
-
-  const failures = results.filter((r) => !r.ok);
-  // Every worker must have loaded + subscribed cleanly. Any failure here is the
-  // concurrent-dlopen race re-opening.
-  expect(failures).toEqual([]);
-  expect(results.filter((r) => r.ok)).toHaveLength(N);
-}, 30_000);
-
 // ---------------------------------------------------------------------------
 // fn-747 task .2 — in-process daemon keystone
 // ---------------------------------------------------------------------------
@@ -2633,8 +2590,9 @@ test("boot smoke: after main pre-warm, a fleet of @parcel/watcher workers all su
  * `startDaemon({ disableNativeWatcher: true })` runs the full fold pipeline
  * (event INSERT → wake-worker drain → `jobs` projection → UDS query) and tears
  * down cleanly via `stop()` — with NO worker-thread `@parcel/watcher` dlopen
- * (the SIGTRAP source the serial slow tier exists to dodge). This is what lets
- * the slow tier go `--parallel`: the heavyweight, addon-dlopening boot is gone.
+ * (the SIGTRAP source the OS-coupled subprocess-daemon tests, deleted in
+ * fn-752, used to risk). This addon-free boot is what lets the whole suite run
+ * as ONE `--parallel` tier.
  *
  * The trigger is a direct synthetic-event INSERT through a SECOND writer
  * connection to the sandboxed DB — the daemon's wake worker polls
