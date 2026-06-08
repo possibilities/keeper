@@ -246,6 +246,38 @@ test("set_epic_approval writes the SIDECAR, leaves the committed def UNTOUCHED (
   }
 });
 
+test("fn-732 cleanup: approval handlers fire NO plan-worker kick — the dead approval-kick machinery is gone", async () => {
+  // The fn-701 approval-kick (approvalKickSignal / setApprovalKickSignal /
+  // fireApprovalKick) papered over the committed-def fold lag. fn-732's sidecar
+  // fold is gate-free, so the kick is removed. Guard against a regression that
+  // re-introduces the side-channel: the module must export NO kick installer,
+  // and an approve must complete with ONLY the sidecar write (no extra hook to
+  // pump a stale recheck).
+  const rpcHandlers = (await import("../src/rpc-handlers")) as Record<
+    string,
+    unknown
+  >;
+  expect(rpcHandlers.setApprovalKickSignal).toBeUndefined();
+
+  const { db } = openDb(dbPath, { readonly: false });
+  try {
+    seedTask("fn-1.6");
+    const result = setTaskApprovalHandler(db, {
+      epic_id: "fn-1",
+      task_id: "fn-1.6",
+      status: "approved",
+    });
+    // The handler returns purely on the durable sidecar write — no kick to fire.
+    expect(result.approval).toBe("approved");
+    const obj = JSON.parse(
+      readFileSync(taskSidecarPath("fn-1.6"), "utf8"),
+    ) as Record<string, unknown>;
+    expect(obj.approval).toBe("approved");
+  } finally {
+    db.close();
+  }
+});
+
 test("sidecarPathFromDef maps a committed def path to its runtime sidecar (fn-732)", () => {
   const defT = join(planRoot, ".planctl", "tasks", "fn-1.2.json");
   expect(sidecarPathFromDef(defT, "tasks")).toBe(

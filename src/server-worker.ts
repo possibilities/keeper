@@ -85,7 +85,7 @@ import {
   type RpcResultFrame,
   type ServerFrame,
 } from "./protocol";
-import { installRpcHandlers, setApprovalKickSignal } from "./rpc-handlers";
+import { installRpcHandlers } from "./rpc-handlers";
 
 /**
  * Data the parent passes via `new Worker(url, { workerData })`. Only path
@@ -248,21 +248,6 @@ export interface RetryDispatchResultMessage {
   id: string;
   ok: boolean;
   error?: string;
-}
-
-/**
- * Worker→main one-way signal fired when a `set_task_approval` /
- * `set_epic_approval` write succeeds (fn-701 task .2). UNLIKE the three
- * bridges above, this carries NO correlation id and expects NO reply — main
- * reacts by posting a `{type:"kick"}` to the plan-worker (null-guarded for
- * the boot race), which runs a GATED `recheckPending()`. The approval write
- * makes the plan file dirty/uncommitted; the kick drives the in-HEAD probe
- * to re-run promptly instead of waiting on the 60s heartbeat. Fire-and-
- * forget: a dropped signal degrades to the heartbeat backstop, never a
- * failed approval.
- */
-export interface KickPlanWorkerRequestMessage {
-  kind: "kick-plan-worker-request";
 }
 
 /**
@@ -2653,21 +2638,6 @@ function main(): void {
   // spawn. Concrete handlers live in `src/rpc-handlers.ts`; this is the
   // single install point.
   installRpcHandlers();
-
-  // fn-701 task .2: wire the approval-kick signal. The sync approval handlers
-  // (`set_task_approval` / `set_epic_approval`) call this on a successful
-  // write; we post a one-way `kick-plan-worker-request` to main, which posts
-  // `{type:"kick"}` to the plan-worker (null-guarded for the boot race) so it
-  // runs a GATED `recheckPending()`. Fire-and-forget — no correlation id, no
-  // reply; the handler's own `fireApprovalKick` swallows a throw, so this is
-  // additionally guarded but never the source of a failed approval. Posted on
-  // the parent port (the worker→main channel) exactly like the bridge
-  // requests below.
-  setApprovalKickSignal(() => {
-    parentPort?.postMessage({
-      kind: "kick-plan-worker-request",
-    } satisfies KickPlanWorkerRequestMessage);
-  });
 
   // Worker→main async-RPC bridge state (fn-643 task .4; extended for
   // fn-661 task .4 with the autopilot pause/retry pair). Outgoing

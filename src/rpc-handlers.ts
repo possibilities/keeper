@@ -143,55 +143,6 @@ function rejectPathTraversal(field: string, value: string): void {
   }
 }
 
-/**
- * Fire-and-forget signal a successful approval write fires so main re-kicks
- * the plan-worker into a GATED `recheckPending()` (fn-701 task .2). The
- * approval RPC runs in the server-worker; mutating `<root>/.planctl/{epics,
- * tasks}/<id>.json`'s `approval` field makes that file dirty/uncommitted, so
- * absent a follow-on git pulse the only thing that drains the plan-worker's
- * pending set is the 60s heartbeat — the board-removal lag this kick closes.
- *
- * The kick is SUPPLEMENTARY: task .1's commit-driven bypass is the
- * load-bearing disappear-fix; this handles the approval-that-never-commits
- * gap. It is GATED, NOT a bypass — the plan-worker re-runs its fn-629
- * in-HEAD probe, so an uncommitted approval stays in pending and does NOT
- * emit (re-opening the fn-627 duplicate-dispatch incident is the regression
- * this gate prevents).
- *
- * Defaults to a no-op so a direct-handler test (or any caller that imports
- * a handler without wiring the bridge) keeps the pre-fn-701 behavior. The
- * server-worker's `main()` installs the real signal via
- * {@link setApprovalKickSignal}. Never throws — the cost of a failed kick is
- * a (rare) fallback to the heartbeat, never a failed approval write.
- */
-let approvalKickSignal: () => void = () => {};
-
-/**
- * Install the fire-and-forget kick signal the approval handlers fire on a
- * successful write (fn-701 task .2). Called once by the server-worker's
- * `main()` after `installRpcHandlers()`, wiring the signal to a
- * `parentPort.postMessage` toward main → plan-worker. Idempotent-by-last-
- * write; tests may install a spy or leave the default no-op.
- */
-export function setApprovalKickSignal(signal: () => void): void {
-  approvalKickSignal = signal;
-}
-
-/**
- * Invoke the approval kick signal, swallowing any throw — a transport hiccup
- * on a cosmetic fast-path must never fail the (already-durable) approval
- * write. The level-triggered 60s heartbeat is the lost-wakeup backstop.
- */
-function fireApprovalKick(): void {
-  try {
-    approvalKickSignal();
-  } catch (err) {
-    console.error(
-      `[rpc-handlers] approval kick signal failed: ${err instanceof Error ? err.message : String(err)}`,
-    );
-  }
-}
-
 function validateApprovalStatus(value: unknown): ApprovalStatus {
   if (
     typeof value !== "string" ||
@@ -394,10 +345,10 @@ export function setTaskApprovalHandler(
   // RMW preserves the sidecar's runtime fields (status / claim / evidence)
   // written by planctl; we only set `approval`.
   rewriteSidecarApproval(sidecarPath, status);
-  // fn-701 task .2: kick the plan-worker into a GATED recheck so an approval
-  // converges promptly instead of waiting on the 60s heartbeat. KEPT for now —
-  // fn-732 task .4 removes it once the sidecar fold is the sole path.
-  fireApprovalKick();
+  // fn-732: the sidecar fold is gate-free — keeper folds approval directly
+  // from the runtime sidecar with no commit on the critical path, so the
+  // fn-701 approval-kick (which papered over the committed-def fold lag) is
+  // gone. No kick fires here.
   return { ok: true, epic_id, task_id, approval: status };
 }
 
@@ -421,10 +372,8 @@ export function setEpicApprovalHandler(
   }
   const sidecarPath = sidecarPathFromDef(defPath, "epics");
   rewriteSidecarApproval(sidecarPath, status);
-  // fn-701 task .2: kick the plan-worker into a GATED recheck (see the
-  // matching call in `setTaskApprovalHandler`). KEPT for now — removed in
-  // fn-732 task .4.
-  fireApprovalKick();
+  // fn-732: gate-free sidecar fold — no approval-kick (see the matching note
+  // in `setTaskApprovalHandler`).
   return { ok: true, epic_id, approval: status };
 }
 
