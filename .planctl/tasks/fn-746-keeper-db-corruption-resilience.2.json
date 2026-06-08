@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Checkpoint cadence, backup/restore, and size management",
-  "updated_at": "2026-06-08T15:12:59.036213Z"
+  "updated_at": "2026-06-08T23:02:07.702229Z",
+  "worker_done_at": "2026-06-08T23:02:07.702229Z"
 }
