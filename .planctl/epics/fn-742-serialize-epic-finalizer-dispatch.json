@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-serialize-epic-finalizer-dispatch",
   "bundles": [],
+  "closer_done_at": "2026-06-08T17:53:09.793049Z",
   "created_at": "2026-06-08T15:02:01.647223Z",
   "depends_on_epics": [],
   "id": "fn-742-serialize-epic-finalizer-dispatch",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Serialize epic finalizer dispatch",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T15:13:53.510472Z"
+  "updated_at": "2026-06-08T17:53:09.793049Z"
 }
