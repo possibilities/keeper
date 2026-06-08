@@ -79,6 +79,7 @@ import {
 import { join } from "node:path";
 import type {
   AutopilotWorkerData,
+  ClearRejectedApprovalMessage,
   DispatchExpiredMessage,
   DispatchedAckMessage,
   DispatchedMessage,
@@ -128,6 +129,7 @@ import type {
 } from "./plan-worker";
 import { DEFAULT_BATCH_SIZE, type DrainOptions, drain } from "./reducer";
 import type { RestoreWorkerData } from "./restore-worker";
+import { setEpicApprovalHandler } from "./rpc-handlers";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
   KickMessage,
@@ -2774,6 +2776,7 @@ function runDaemon(): void {
       | DispatchFailedMessage
       | DispatchedMessage
       | DispatchExpiredMessage
+      | ClearRejectedApprovalMessage
       | BackstopMessage
       | undefined
     >,
@@ -2798,6 +2801,15 @@ function runDaemon(): void {
       handleDispatchedMint(msg);
     } else if (msg.kind === "dispatch-expired") {
       handleDispatchExpiredMint(msg.payload);
+    } else if (msg.kind === "clear-rejected-approval") {
+      // fn-742.2: one-shot rejected-epic recovery. Main is the sole writer of
+      // the approval surface — reset the epic approval to `pending` through the
+      // SANCTIONED `set_epic_approval` handler (sidecar write; the plan-worker
+      // re-folds it gate-free). The worker has already recorded the id in its
+      // in-memory `autoClearedRejections` ledger so it won't re-request — main
+      // never needs to dedup. Non-fatal on failure: the worker re-requests on a
+      // later cycle if the epic is still rejected and not yet recorded there.
+      handleClearRejectedApproval(msg);
     }
   };
 
@@ -2997,6 +3009,43 @@ function runDaemon(): void {
     } catch (err) {
       console.error(
         `[keeperd] DispatchExpired mint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }
+
+  /**
+   * fn-742.2 — one-shot rejected-epic recovery. The autopilot worker found an
+   * epic stuck `[::blocked:job-rejected]` (its `approval === "rejected"` maps to
+   * `verbForVerdict → null`, so there's no dispatchable verb) and requested a
+   * single auto-clear back to `pending`. Route it through the SANCTIONED
+   * `set_epic_approval` handler — the only approval-write surface — so the
+   * gitignored runtime sidecar is rewritten and the plan-worker re-folds the new
+   * approval gate-free (`@parcel/watcher` on `.planctl` → `PRAGMA data_version`
+   * poll), exactly as a human re-approve would. NO synthetic event / wake here:
+   * approval is NOT a main-minted projection; it folds from the sidecar via the
+   * plan-worker, so a `set_epic_approval` write is complete once the file lands.
+   *
+   * The worker's in-memory `autoClearedRejections` ledger is the thrash gate
+   * (one clear per epic per process) — main does not dedup. NON-FATAL on
+   * failure: a throw (missing def, fs error) logs and returns; the worker
+   * re-requests on a later cycle only if the epic is still rejected and not yet
+   * recorded in its ledger (it already recorded this id on send, so a transient
+   * failure forfeits the recovery until a daemon bounce reseeds the ledger — an
+   * acceptable degrade vs. a write loop).
+   */
+  function handleClearRejectedApproval(
+    msg: ClearRejectedApprovalMessage,
+  ): void {
+    try {
+      setEpicApprovalHandler(db, {
+        epic_id: msg.epic_id,
+        status: "pending",
+      });
+    } catch (err) {
+      console.error(
+        `[keeperd] rejected-approval auto-clear threw (non-fatal) for epic ${msg.epic_id}: ${
           err instanceof Error ? err.message : String(err)
         }`,
       );

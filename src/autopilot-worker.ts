@@ -673,6 +673,39 @@ export interface ReconcileState {
    */
   finalizerGuard: Map<string, number>;
   /**
+   * fn-742.2 — the in-process per-epic ONE-SHOT auto-clear ledger for rejected
+   * epics. An epic whose close-row verdict is `{kind:"job-rejected"}`
+   * (`epic.approval === "rejected"`) is otherwise PERMANENTLY stuck: its verdict
+   * maps to `verbForVerdict → null`, so the autopilot has no dispatchable verb
+   * and the epic sits `[::blocked:job-rejected]` forever. The fn-740 incident
+   * minted exactly such a BOGUS rejection (the close↔approve race `.1` now
+   * prevents) and left the epic wedged with no recourse.
+   *
+   * RECOVERY POLICY (`.2`): the FIRST time `reconcile` sees a still-`rejected`
+   * epic this process, it requests a one-shot auto-clear of the epic approval
+   * back to `"pending"` — routed through the SANCTIONED `set_epic_approval`
+   * sidecar write (via main; the worker never writes). That re-runs the normal
+   * approve flow (next cycle the close-row verdict flips
+   * `job-pending → approve`). The epic id is then recorded HERE so a SECOND
+   * rejection — a genuinely-rejected epic, or one the re-approve rejected
+   * again — is NOT auto-cleared a second time. No thrash loop: at most one
+   * auto-clear per epic per daemon process; a legitimately-rejected epic stays
+   * rejected and an operator's manual re-approve / `retry_dispatch` is the
+   * recourse.
+   *
+   * Same shape/lifecycle as the maps above: held on `ReconcileState` so
+   * `reconcile()` can READ it and stay pure (it pushes the epic id onto
+   * `decision.rejectedClears` but does NOT mutate this set); the cycle glue
+   * (`driveCycle`) RECORDS the id here AFTER posting the clear request to main.
+   *
+   * IN-MEMORY ONLY — never the event log / projections / reducer. Boots EMPTY on
+   * restart (safe: a still-rejected epic gets at most ONE more auto-clear after
+   * a daemon bounce, never a loop). The recovered approval IS durable — it lands
+   * in the gitignored runtime sidecar via the sanctioned RPC and folds back
+   * through the plan-worker like any human re-approve.
+   */
+  autoClearedRejections: Set<string>;
+  /**
    * Global ceiling on how many root-occupants this reconciler dispatches
    * at once across ALL epics/roots (fn-725). `null` = unlimited (today's
    * behavior — no cap). Threaded daemon → workerData → here so the cap
@@ -742,6 +775,19 @@ export interface LiveDispatch {
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
   completedRowIds: Set<string>;
+  /**
+   * fn-742.2 — epic ids whose close-row verdict is `{kind:"job-rejected"}` and
+   * which have NOT yet been auto-cleared this process (`epicId NOT IN
+   * state.autoClearedRejections`). The cycle glue (`driveCycle`) posts a
+   * one-shot `clear-rejected-approval` request to main for each — routing
+   * through the sanctioned `set_epic_approval` sidecar write to reset the epic
+   * approval to `"pending"` — then records the id in
+   * `state.autoClearedRejections` so it never re-fires. See that field's doc for
+   * the recovery policy. Harvested from the SAME `computeReadiness` pass
+   * `reconcile` already makes (single source of truth); `reconcile` reads
+   * `state.autoClearedRejections` to filter but does NOT mutate it (purity).
+   */
+  rejectedClears: string[];
 }
 
 /**
@@ -759,6 +805,17 @@ export interface ConfirmRunningDeps {
    * byte-identically.
    */
   emitDispatchFailed(payload: DispatchFailedPayload): void;
+  /**
+   * fn-742.2 — request a ONE-SHOT auto-clear of a rejected epic's approval
+   * back to `"pending"` (via the parent thread — the worker never writes the
+   * approval surface). Main calls the sanctioned `set_epic_approval` handler.
+   * Fire-and-forget (no ack): a missed clear is re-requested next cycle. The
+   * cycle glue (`driveCycle`) records the epic id in
+   * `state.autoClearedRejections` right after invoking this, so a genuinely-
+   * rejected epic can't thrash. Optional so the test harness can omit it (the
+   * reconcile/confirm paths never touch it).
+   */
+  emitClearRejectedApproval?(epicId: string): void;
   /**
    * Emit a synthetic `Dispatched` event onto the writable connection (via
    * the parent thread — workers never write the DB) AND AWAIT a durable
@@ -1136,6 +1193,28 @@ export function reconcile(
     }
   }
 
+  // fn-742.2 — harvest the rejected-epic recovery set from the SAME readiness
+  // pass. A close-row verdict of `{kind:"job-rejected"}` (the epic's own
+  // `approval === "rejected"`) is non-dispatchable (`verbForVerdict → null`), so
+  // without intervention the epic sits `[::blocked:job-rejected]` forever. We
+  // request a ONE-SHOT auto-clear back to `pending` (the cycle glue routes it
+  // through the sanctioned `set_epic_approval` sidecar write via main), gated on
+  // the epic NOT already having been auto-cleared this process so a genuinely-
+  // rejected epic can't thrash. READ-ONLY here — `reconcile` stays pure: it
+  // reads `state.autoClearedRejections` to filter but the SET is recorded by
+  // `driveCycle` AFTER it posts the clear. Determinism unaffected (this set is
+  // in-memory cycle state, never folded). See `ReconcileState.autoClearedRejections`.
+  const rejectedClears: string[] = [];
+  for (const [epicId, verdict] of readiness.perCloseRow) {
+    if (
+      verdict.tag === "blocked" &&
+      verdict.reason.kind === "job-rejected" &&
+      !state.autoClearedRejections.has(epicId)
+    ) {
+      rejectedClears.push(epicId);
+    }
+  }
+
   // fn-725 global concurrency cap. Count root-occupants ONCE over the
   // POST-mutex verdicts of BOTH perTask AND perCloseRow — `isRootOccupant`
   // is planner-exempt, matching the per-root mutex predicate so the two
@@ -1304,7 +1383,7 @@ export function reconcile(
     }
   }
 
-  return { launches, completedRowIds };
+  return { launches, completedRowIds, rejectedClears };
 }
 
 /**
@@ -1708,6 +1787,23 @@ export interface DispatchExpiredMessage {
   payload: DispatchExpiredPayload;
 }
 
+/**
+ * Worker → main: ONE-SHOT rejected-epic auto-clear request (fn-742.2). The
+ * worker NEVER writes the approval surface itself — like every DB/sidecar
+ * mutation it describes the intent and main performs it, here by calling the
+ * sanctioned `set_epic_approval` handler to reset `epic_id`'s approval to
+ * `"pending"`. Fire-and-forget (no ack): a missed clear is simply re-requested
+ * on a later cycle (the epic is still `rejected` and not yet in
+ * `autoClearedRejections`), and the worker has already recorded the id so it
+ * won't re-fire within this process. Resets a `job-rejected` epic onto the
+ * normal approve flow — its clean board exit (`.2` acceptance). See
+ * `ReconcileState.autoClearedRejections` for the recovery policy + thrash gate.
+ */
+export interface ClearRejectedApprovalMessage {
+  kind: "clear-rejected-approval";
+  epic_id: string;
+}
+
 type IncomingMessage =
   | SetPausedMessage
   | ShutdownMessage
@@ -1852,6 +1948,9 @@ function main(): void {
     redispatchCooldown: new Map(),
     // fn-742 — per-epic finalizer guard; boots EMPTY for the same reason.
     finalizerGuard: new Map(),
+    // fn-742.2 — rejected-epic one-shot auto-clear ledger; boots EMPTY (safe:
+    // a still-rejected epic gets at most one more auto-clear after a bounce).
+    autoClearedRejections: new Set(),
     maxConcurrentJobs: data.maxConcurrentJobs ?? null,
   };
   // fn-727 — completion-reap toggle. Default `true` (reap) when the
@@ -2039,6 +2138,15 @@ function main(): void {
         kind: "dispatch-failed",
         payload,
       } satisfies DispatchFailedMessage);
+    },
+    emitClearRejectedApproval: (epicId) => {
+      // fn-742.2 — describe the one-shot rejected-epic recovery to main (the
+      // sole approval-surface writer). Fire-and-forget; main calls the
+      // sanctioned `set_epic_approval` handler to reset approval → `pending`.
+      parentPort?.postMessage({
+        kind: "clear-rejected-approval",
+        epic_id: epicId,
+      } satisfies ClearRejectedApprovalMessage);
     },
     emitDispatched: (payload) =>
       new Promise<DispatchedAck>((resolve, reject) => {
@@ -2265,6 +2373,30 @@ function main(): void {
         // forget: it owns its own try/catch and never throws past itself,
         // so it never blocks or wedges the dispatch stagger below.
         reapCompletionSurfaces(decision.completedRowIds);
+        // fn-742.2 — fire the one-shot rejected-epic recovery. For each epic
+        // whose close-row verdict is `job-rejected` and which hasn't been
+        // auto-cleared this process, post a `clear-rejected-approval` to main
+        // (the sanctioned `set_epic_approval` write resets approval → pending)
+        // and RECORD the id so it never re-fires — the thrash gate. Skipped
+        // while paused: a paused autopilot is the safety-off state and must
+        // not mutate any approval (mirrors the dispatch suppression). Recording
+        // here (the cycle glue), NOT in the pure `reconcile`, keeps reconcile a
+        // read-only function of `state` — same discipline as the cooldown /
+        // finalizer-guard stamps. Wrapped: a post/record throw must not wedge
+        // the wake loop (no self-heal).
+        if (!state.paused) {
+          for (const epicId of decision.rejectedClears) {
+            try {
+              deps.emitClearRejectedApproval?.(epicId);
+              state.autoClearedRejections.add(epicId);
+            } catch (err) {
+              console.error(
+                "[autopilot-worker] rejected-approval auto-clear threw (non-fatal):",
+                err,
+              );
+            }
+          }
+        }
         await runReconcileCycle(
           decision,
           state,

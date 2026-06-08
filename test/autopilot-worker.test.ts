@@ -165,6 +165,9 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
     redispatchCooldown: new Map(),
     // fn-742 — per-epic finalizer guard; boots empty, guard tests override it.
     finalizerGuard: new Map(),
+    // fn-742.2 — rejected-epic one-shot auto-clear ledger; boots empty, the
+    // rejected-recovery tests override it.
+    autoClearedRejections: new Set(),
     // Default unlimited — every pre-fn-725 test that omits this must see
     // identical dispatch behavior.
     maxConcurrentJobs: null,
@@ -1192,6 +1195,98 @@ test("fn-742 end-to-end: a dispatched close suppresses the verdict-flipped appro
   // Past the guard window the finalizer is eligible again.
   const decision3 = reconcile(approveSnap, state, stampNow + FINALIZER_GUARD_S);
   expect(decision3.launches.map((p) => p.key)).toEqual(["approve::fn-1-foo"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-742.2 — rejected-epic one-shot auto-clear (the clean board exit)
+// ---------------------------------------------------------------------------
+//
+// A `{kind:"job-rejected"}` close-row verdict (`epic.approval === "rejected"`)
+// is non-dispatchable (`verbForVerdict → null`), so without intervention the
+// epic sits `[::blocked:job-rejected]` forever. The recovery: reconcile emits a
+// ONE-SHOT `rejectedClears` entry; the cycle glue posts a
+// `clear-rejected-approval` to main (sanctioned `set_epic_approval` sidecar
+// write → approval reset to `pending`) and records the epic so it never
+// re-fires — no thrash loop. A genuinely-rejected epic gets exactly one
+// auto-clear; if the re-approve rejects again it stays rejected.
+
+// An epic whose own approval is `rejected` (status done so it's a finalizable
+// close row): close-row verdict → predicate 4 → `{kind:"job-rejected"}`, verb
+// `null` — the stuck state this task recovers.
+function rejectedCloseEpic(epicId: string, projectDir: string): Epic {
+  return makeEpic({
+    epic_id: epicId,
+    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
+    project_dir: projectDir,
+    sort_path: epicId,
+    status: "done",
+    approval: "rejected",
+    tasks: [
+      makeTask({
+        task_id: `${epicId}.1`,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+        approval: "approved",
+      }),
+    ],
+  });
+}
+
+test("fn-742.2 reconcile: a rejected epic emits a one-shot rejectedClear AND no dispatchable launch", () => {
+  const epic = rejectedCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const decision = reconcile(snap, makeState(), 0);
+  // The recovery request fires once...
+  expect(decision.rejectedClears).toEqual(["fn-1-foo"]);
+  // ...and the rejected close row remains non-dispatchable (no verb).
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-742.2 reconcile: an already-auto-cleared epic does NOT re-emit (thrash gate)", () => {
+  // The genuinely-rejected case: the epic was auto-cleared once, the re-approve
+  // rejected it again, so it's STILL rejected this cycle — but its id is already
+  // in `autoClearedRejections`, so reconcile must NOT request a second clear.
+  const epic = rejectedCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState({
+    autoClearedRejections: new Set(["fn-1-foo"]),
+  });
+  const decision = reconcile(snap, state, 0);
+  expect(decision.rejectedClears).toEqual([]);
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-742.2 reconcile: a NON-rejected epic emits no rejectedClear (control)", () => {
+  // An ordinary ready close-row must not appear in `rejectedClears` — only the
+  // job-rejected verdict drives the recovery.
+  const epic = readyCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.rejectedClears).toEqual([]);
+  expect(decision.launches.map((p) => p.key)).toEqual(["close::fn-1-foo"]);
+});
+
+test("fn-742.2 reconcile: rejectedClears is per-epic — one rejected, one ready", () => {
+  // Two epics: one rejected (recovery), one ready (close). Each is handled
+  // independently — the recovery doesn't suppress the unrelated close.
+  const rejected = rejectedCloseEpic("fn-1-foo", "/repo-a");
+  const ready = readyCloseEpic("fn-2-bar", "/repo-b");
+  const snap = makeSnapshot({ epics: [rejected, ready] });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.rejectedClears).toEqual(["fn-1-foo"]);
+  expect(decision.launches.map((p) => p.key)).toEqual(["close::fn-2-bar"]);
+});
+
+test("fn-742.2 reconcile NEVER mutates autoClearedRejections (purity)", () => {
+  // The set is recorded by the cycle glue (driveCycle), never by the pure
+  // reconcile — mirrors the cooldown / finalizer-guard discipline.
+  const epic = rejectedCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const decision = reconcile(snap, state, 0);
+  expect(decision.rejectedClears).toEqual(["fn-1-foo"]);
+  expect(state.autoClearedRejections.size).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
