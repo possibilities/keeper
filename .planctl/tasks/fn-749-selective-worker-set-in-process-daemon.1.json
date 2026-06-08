@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Worker-set selector + minimal-boot migrated tests",
-  "updated_at": "2026-06-08T18:26:04.358936Z"
+  "updated_at": "2026-06-08T21:53:05.222157Z",
+  "worker_done_at": "2026-06-08T21:53:05.222157Z"
 }

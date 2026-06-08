@@ -64,5 +64,5 @@ intent, not a literal contract).
 - [ ] A ≥20x parallel soak completes with 0 failures; `bun run test` umbrella green
 
 ## Done summary
-
+Added DaemonOptions.workers selector to startDaemon (default = full 11-worker set, so production runDaemon is byte-for-byte unchanged); withInProcessDaemon forwards it; migrated UDS/RPC/fold tests boot only wake+server and the plan-fold test adds plan; added regression tests asserting the prod boot spawns the identical 11 and a minimal set spawns only the named workers.
 ## Evidence
