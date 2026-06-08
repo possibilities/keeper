@@ -216,6 +216,12 @@ from pathlib import Path
 # ``jobs.monitors`` nor the embedded occupancy fact; readiness + the autopilot
 # reconciler are the only consumers — so no reader logic changes, only the
 # version whitelist gains 59.
+#
+# v61 (fn-736 task .1) is also whitelist-only: it adds the
+# ``event_ingest_offsets`` table — the NDJSON→events ingest cursor for the
+# lock-free events path. keeper-py reads neither that table nor the per-pid
+# NDJSON files (the daemon's ingester owns both, UPSTREAM of the fold), so no
+# reader logic changes — only the version whitelist gains 61.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -248,6 +254,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         58,
         59,
         60,
+        61,
     }
 )
 

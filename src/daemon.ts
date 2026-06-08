@@ -68,7 +68,13 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import {
+  existsSync,
+  readdirSync,
+  readFileSync,
+  statSync,
+  unlinkSync,
+} from "node:fs";
 import { join } from "node:path";
 import type {
   AutopilotWorkerData,
@@ -93,15 +99,20 @@ import {
   resolveConfig,
   resolveDbPath,
   resolveDeadLetterDir,
+  resolveEventsLogDir,
   resolvePlanRoots,
   resolveUsageRoot,
   runPlanctlApprovalMigration,
 } from "./db";
-import { parseDeadLetterLine } from "./dead-letter";
+import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
 import type {
   DeadLetterChangedMessage,
   DeadLetterWorkerData,
 } from "./dead-letter-worker";
+import type {
+  EventsIngestWorkerData,
+  EventsLogChangedMessage,
+} from "./events-ingest-worker";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type {
   AddDiscoveryRootMessage,
@@ -614,6 +625,349 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 }
 
 /**
+ * The FULL, CURRENT `events` table column list, in CREATE_EVENTS order — the
+ * canonical column→value contract the NDJSON ingester ({@link
+ * scanEventsLogDir}) binds against. Includes the v48 backend-exec coords and
+ * the v51 `background_task_id` that the stale {@link EVENTS_COLUMNS} (frozen at
+ * the fn-643 dead-letter shape) omits. `id` is excluded — it's `INTEGER PRIMARY
+ * KEY AUTOINCREMENT`, assigned by SQLite so the ingested row lands at the tail
+ * of the log and folds at the end of the next drain pass.
+ *
+ * MUST stay in sync with the CREATE_EVENTS literal AND the prepared
+ * `insertEvent` statement in `src/db.ts` — adding an events column touches all
+ * three. The ingester binds only the INTERSECTION of this list and the record's
+ * `bindings` keys (an unknown/forward-compat column from a newer hook is
+ * DROPPED, never folded as a poison value — see the poison-line policy in
+ * `scanEventsLogDir`).
+ */
+const INGEST_EVENTS_COLUMNS = [
+  "ts",
+  "session_id",
+  "pid",
+  "hook_event",
+  "event_type",
+  "tool_name",
+  "matcher",
+  "cwd",
+  "permission_mode",
+  "agent_id",
+  "agent_type",
+  "stop_hook_active",
+  "data",
+  "subagent_agent_id",
+  "spawn_name",
+  "start_time",
+  "slash_command",
+  "skill_name",
+  "planctl_op",
+  "planctl_target",
+  "planctl_epic_id",
+  "planctl_task_id",
+  "planctl_subject_present",
+  "tool_use_id",
+  "config_dir",
+  "planctl_queue_jump",
+  "bash_mutation_kind",
+  "bash_mutation_targets",
+  "planctl_files",
+  "backend_exec_type",
+  "backend_exec_session_id",
+  "backend_exec_pane_id",
+  "background_task_id",
+] as const;
+
+/**
+ * Ingest the per-pid NDJSON events-log files (fn-736 task .1) — the lock-free
+ * events path's analogue of {@link scanDeadLetterDir}. For each `<pid>.ndjson`
+ * file, scan FROM ITS DURABLE BYTE-OFFSET, parse each COMPLETE line, and
+ * `INSERT INTO events` WITH the offset advance in ONE `BEGIN IMMEDIATE` — the
+ * sacred atomic-cursor invariant, applied to NDJSON→events. The fold
+ * (`drain()`/`applyEvent()`) reads `events` UNCHANGED and picks up the new rows
+ * on the next drain pass.
+ *
+ * MUST run on `db` = main's WRITER connection (so the `events` INSERT bumps
+ * `data_version` and the existing wake/server pollers fire for free — the only
+ * other new trigger is the ingest worker's file-watch hint). Called once at
+ * boot (BEFORE the boot drain) and on every `events-log-changed` worker message.
+ *
+ * EXACTLY-ONCE — the idempotency keystone (epic "Early proof point"). The
+ * durable per-pid byte-offset (`event_ingest_offsets`, keyed on `(path,
+ * inode)`) committed atomically with the INSERT means a watcher re-fire or a
+ * daemon restart re-scans from the offset and never double-inserts a line it
+ * already landed (the double-ingest test). NO line-counting — purely byte
+ * offsets.
+ *
+ * STRICT TORN-TAIL — bytes after the file's last `\n` are uncommitted; the
+ * offset advances ONLY to the end of the last COMPLETE, parseable line. A
+ * killed-hook partial trailing line is NOT folded and NOT skipped past — a
+ * later complete append re-reads the now-whole line.
+ *
+ * INODE / OFFSET SAFETY:
+ * - Keyed on `(path, inode)`: a recycled pid re-creating the same filename gets
+ *   a DIFFERENT inode ⇒ a fresh row ⇒ offset 0 (no stale carry-over).
+ * - `stat().size < storedOffset` ⇒ the file was truncated/replaced (inode reuse
+ *   on APFS, or a manual wipe) ⇒ fall the offset to 0 and re-read from the top.
+ *   This is the drop-recovery correctness the epic risk flags: main ALWAYS
+ *   re-reads from the durable offset, NEVER byte 0 unless the size proves a
+ *   reset.
+ *
+ * POISON-LINE POLICY: a `parseEventLogLine` → null line (garbage JSON, partial,
+ * non-finite/nested binding) is treated as a TORN line — STOP scanning this file
+ * at that point, do NOT advance past it, do NOT spin. The offset stays put so a
+ * later append (or a fixed line) re-reads it. A line that parses but whose
+ * `INSERT` THROWS (e.g. a forward-compat column from a newer hook surviving the
+ * intersection filter, a constraint violation) is logged and the WHOLE
+ * transaction rolls back — the offset does NOT advance past it, so we never
+ * silently skip a real event. (The intersection filter already drops unknown
+ * columns, so an INSERT throw here is exotic; rolling back is the safe choice
+ * over spinning OR silently advancing.)
+ *
+ * PER-FILE CLEANUP: a file is deleted ONLY when its offset has reached EOF
+ * (every byte ingested) AND its pid is no longer live (`pidAlive` false) — so a
+ * still-writing live hook's file is never reaped out from under it, and a
+ * fully-drained dead-pid file doesn't accumulate forever. NO 16 MiB size cap
+ * (a long session legitimately exceeds it — unlike dead-letter).
+ *
+ * NEVER THROWS out of the scan: every recoverable error (missing dir, missing
+ * file mid-scan, read error, malformed line, INSERT throw) is swallowed to
+ * stderr — a single bad file must not wedge boot OR the live message loop.
+ * Exported so the test surface can drive it directly without spawning the
+ * worker.
+ */
+export function scanEventsLogDir(db: Database, dir: string): void {
+  // Missing-dir tolerance: a fresh machine has no events-log/ tree, and in
+  // task .1 the hook still INSERTs so the dir stays absent. No-op.
+  if (!existsSync(dir)) {
+    return;
+  }
+
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch (err) {
+    console.error(
+      `[keeperd] events-log scan failed to readdir ${dir}: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    );
+    return;
+  }
+
+  const readOffsetStmt = db.prepare(
+    "SELECT offset FROM event_ingest_offsets WHERE path = ? AND inode = ?",
+  );
+  const upsertOffsetStmt = db.prepare(
+    `INSERT INTO event_ingest_offsets (path, inode, offset, updated_at)
+       VALUES (?, ?, ?, ?)
+     ON CONFLICT(path, inode) DO UPDATE SET
+       offset = excluded.offset,
+       updated_at = excluded.updated_at`,
+  );
+
+  for (const name of names) {
+    if (!name.endsWith(".ndjson")) {
+      // The hook writes per-pid `<pid>.ndjson` files; ignore anything else.
+      continue;
+    }
+    const full = join(dir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(full);
+    } catch (err) {
+      // Read-vs-delete race (file vanished between readdir and stat): skip.
+      console.error(
+        `[keeperd] events-log scan stat failed for ${full}: ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      continue;
+    }
+    if (!st.isFile()) {
+      continue;
+    }
+    const inode = st.ino;
+    const size = st.size;
+
+    // Durable per-file byte-offset. `(path, inode)` keying isolates a recycled
+    // filename (different inode ⇒ fresh row ⇒ offset 0).
+    const offRow = readOffsetStmt.get(full, inode) as {
+      offset: number;
+    } | null;
+    let startOffset = offRow ? offRow.offset : 0;
+    // Truncation / inode-reuse guard: a file shorter than our stored offset was
+    // replaced or wiped — re-read from the top rather than seek past its new
+    // (smaller) content.
+    if (size < startOffset) {
+      startOffset = 0;
+    }
+
+    // Parse the per-pid pid from the filename for the cleanup liveness probe.
+    // A non-numeric stem (shouldn't happen for `<pid>.ndjson`, but be safe)
+    // disables cleanup for that file (treated as "pid unknown / assume live").
+    const pidStem = name.slice(0, -".ndjson".length);
+    const filePid = /^\d+$/.test(pidStem) ? Number(pidStem) : null;
+
+    let newOffset = startOffset;
+    if (size > startOffset) {
+      let text: string;
+      try {
+        // Read the whole file; slice the unread tail. (bun:sqlite + Node fs
+        // have no cheap pread-from-offset; the file is one writer's append log
+        // and a long session is bounded by the session's own event count.)
+        text = readFileSync(full, "utf8");
+      } catch (err) {
+        console.error(
+          `[keeperd] events-log scan read failed for ${full}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+        continue;
+      }
+      // Operate on the byte view so the offset is a true byte count (UTF-8
+      // multibyte chars must not skew `\n` byte positions).
+      const bytes = Buffer.from(text, "utf8");
+      const unread = bytes.subarray(startOffset);
+
+      // Walk complete (`\n`-terminated) lines. The atomic INSERT + offset
+      // advance is per-COMMIT below; we accumulate the parsed records + the
+      // byte position just past the last complete line, then commit once.
+      const records: ReturnType<typeof parseEventLogLine>[] = [];
+      let consumed = 0; // bytes consumed past startOffset (whole lines only)
+      let torn = false;
+      let nlIndex = unread.indexOf(0x0a); // '\n'
+      let lineStart = 0;
+      while (nlIndex !== -1) {
+        const lineBytes = unread.subarray(lineStart, nlIndex);
+        const record = parseEventLogLine(lineBytes.toString("utf8"));
+        if (record === null) {
+          // Poison / torn line: STOP here, do not advance past it. A blank
+          // line (legitimately empty) also parses to null — that is rare in a
+          // single-writer append log and stopping is the safe choice (the
+          // next valid append re-reads from here).
+          torn = true;
+          break;
+        }
+        records.push(record);
+        // +1 for the consumed '\n'.
+        consumed = nlIndex + 1;
+        lineStart = nlIndex + 1;
+        nlIndex = unread.indexOf(0x0a, lineStart);
+      }
+      // Any trailing bytes after the last `\n` are an uncommitted partial line
+      // (strict torn-tail) — `consumed` already excludes them.
+      void torn;
+      newOffset = startOffset + consumed;
+
+      if (records.length > 0) {
+        // Atomic: every INSERT + the offset advance in ONE BEGIN IMMEDIATE. A
+        // throw rolls BOTH back — the offset never advances past an event we
+        // failed to land, and a re-scan retries from the unchanged offset.
+        db.run("BEGIN IMMEDIATE");
+        try {
+          for (const record of records) {
+            if (record === null) continue;
+            const bindings = record.bindings;
+            const presentCols = INGEST_EVENTS_COLUMNS.filter((c) =>
+              Object.hasOwn(bindings, c),
+            );
+            if (presentCols.length === 0) {
+              // A record with no recognized events column is degenerate. Skip
+              // the INSERT but still let the offset advance past it (it carried
+              // no foldable event — unlike a poison column, this is a no-op
+              // line, safe to consume).
+              continue;
+            }
+            const placeholders = presentCols.map(() => "?").join(", ");
+            const values = presentCols.map((c) => {
+              const v = bindings[c];
+              // SQLite storage classes are TEXT / INTEGER / REAL / NULL. The
+              // bindings map is constrained to string / number / boolean /
+              // null; booleans serialize as 0/1 (matches the hook's INSERT
+              // and `recoverOneDeadLetter`).
+              if (typeof v === "boolean") return v ? 1 : 0;
+              return v as string | number | null;
+            });
+            db.prepare(
+              `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`,
+            ).run(...values);
+          }
+          upsertOffsetStmt.run(full, inode, newOffset, Date.now() / 1000);
+          db.run("COMMIT");
+        } catch (err) {
+          try {
+            db.run("ROLLBACK");
+          } catch {
+            // best-effort
+          }
+          // The offset did NOT advance (rolled back) — a re-scan retries this
+          // file from the unchanged offset. Log and move to the next file; do
+          // NOT throw out of the scan.
+          console.error(
+            `[keeperd] events-log INSERT failed for ${full} (offset stays ${startOffset}): ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          continue;
+        }
+      } else if (newOffset !== startOffset) {
+        // No INSERTable records but whole lines WERE consumed (all no-op
+        // lines) — still advance the offset durably so we don't re-read them.
+        try {
+          upsertOffsetStmt.run(full, inode, newOffset, Date.now() / 1000);
+        } catch (err) {
+          console.error(
+            `[keeperd] events-log offset advance failed for ${full}: ${
+              err instanceof Error ? err.message : String(err)
+            }`,
+          );
+          continue;
+        }
+      }
+    }
+
+    // Per-file cleanup: delete ONLY when fully drained (offset at EOF) AND the
+    // pid is no longer live. A live hook's still-growing file is never reaped;
+    // a fully-drained dead-pid file doesn't linger. `pidAlive` is a producer-
+    // side liveness probe (permitted — "Only producers probe liveness").
+    if (filePid !== null && newOffset >= size && !pidAlive(filePid)) {
+      try {
+        unlinkSync(full);
+        // Drop the offset row too so a future inode-reuse at this path starts
+        // clean (the `(path, inode)` key would already isolate it, but pruning
+        // keeps the table from accumulating dead rows).
+        db.prepare(
+          "DELETE FROM event_ingest_offsets WHERE path = ? AND inode = ?",
+        ).run(full, inode);
+      } catch (err) {
+        // Delete race / EPERM — non-fatal; a later scan retries the cleanup.
+        console.error(
+          `[keeperd] events-log cleanup failed for ${full}: ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+  }
+}
+
+/**
+ * `process.kill(pid, 0)` — alive iff resolves or EPERM. ESRCH means the pid is
+ * gone. Mirrors `src/exit-watcher-ffi.ts:pidAlive` / `server-worker.ts:
+ * isPidAlive` deliberately (kept local — two lines — so the ingest scan needs
+ * no cross-module import for one syscall). Producer-side probe, used ONLY for
+ * the events-log file-cleanup gate — never inside a fold.
+ */
+function pidAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    return code === "EPERM";
+  }
+}
+
+/**
  * The full `events` table column list, in CREATE_EVENTS order. Used by
  * {@link recoverOneDeadLetter} to drive a dynamic INSERT against the
  * row's stored `bindings` blob: only the columns the dead-letter record
@@ -931,6 +1285,22 @@ function runDaemon(): void {
     paceMs: BOOT_DRAIN_PACE_MS,
     paceEvents: BOOT_DRAIN_PACE_EVENTS,
   };
+
+  // Step 1b — events-log boot ingest (fn-736 task .1). Land every per-pid
+  // NDJSON line the hook wrote during downtime as an `events` row BEFORE the
+  // boot drain below, so the drain folds those rows in this very boot pass
+  // (the ingester INSERTs at the tail of the log; the drain reads `id > cursor`
+  // and picks them up). MUST precede `drainToCompletion` — mirrors the boot
+  // ordering of the dead-letter scan, but here the write IS into `events`
+  // (the canonical fold source), not an operational sidecar. The scan reads
+  // each file from its DURABLE per-pid byte-offset (exactly-once), is
+  // idempotent under re-scan, and tolerates a missing/empty dir (in task .1
+  // the hook still INSERTs, so the dir is normally absent — a true no-op).
+  // DIRECT writer-connection write (on `db`, main's writer conn) so the INSERT
+  // bumps `data_version` and the downstream pollers wake for free.
+  const eventsLogDir = resolveEventsLogDir();
+  scanEventsLogDir(db, eventsLogDir);
+
   withBootDrainCheckpointTuning(db, () => {
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
     seedKilledSweep(db);
@@ -2244,6 +2614,78 @@ function runDaemon(): void {
     if (!shuttingDown) fatalExit();
   });
 
+  // Spawn the events-ingest worker (fn-736 task .1) in the SAME post-migration
+  // window — the lock-free events path's watch-hint thread, the architectural
+  // twin of the dead-letter worker. It watches the events-log dir for changes
+  // and posts a contentless `{kind:"events-log-changed"}` message. The worker
+  // holds NO DB handle — main is the sole DB writer; on each worker message
+  // main re-runs `scanEventsLogDir` (same primitive as the boot scan above),
+  // which lands each new NDJSON line as an `events` row (from the durable
+  // per-pid offset, exactly-once) and then pumps a wake so the reducer folds
+  // it.
+  //
+  // The boot scan above already ingested every pre-existing file; this live
+  // path covers files the hook writes AFTER the daemon comes up. The worker
+  // spawns AFTER the boot ingest so the offset state is settled before any
+  // live notification arrives (mirrors the dead-letter sequence). In task .1
+  // the hook still INSERTs, so the dir is normally absent and the worker
+  // skip-and-logs at spawn (tolerated) — the path lights up when task .2 flips
+  // the hook to NDJSON.
+  const eventsIngestWorker = new Worker(
+    new URL("./events-ingest-worker.ts", import.meta.url).href,
+    {
+      workerData: { dir: eventsLogDir } satisfies EventsIngestWorkerData,
+    } as WorkerOptions & { workerData: unknown },
+  );
+
+  // Main owns the actual `events` write: an `events-log-changed` message
+  // triggers a fresh `scanEventsLogDir` against the on-disk dir (treating the
+  // watcher event as "go look", never as the data — the CLAUDE.md "safe value"
+  // pattern). The scan is exactly-once (durable per-pid byte-offset), so a
+  // burst of watcher events collapses harmlessly into the same converged row
+  // set. UNLIKE the dead-letter handler, a wake IS pumped here — the write goes
+  // to `events` (the canonical fold source), so the reducer must fold the new
+  // rows into the projections. The ingest INSERT already bumped `data_version`
+  // (the wake worker would catch it within a poll tick regardless), but pumping
+  // here collapses the latency the same way the git/usage synthetic-mint
+  // handlers do.
+  eventsIngestWorker.onmessage = (
+    ev: MessageEvent<EventsLogChangedMessage | undefined>,
+  ): void => {
+    const msg = ev.data;
+    if (!msg || msg.kind !== "events-log-changed") {
+      return;
+    }
+    try {
+      scanEventsLogDir(db, eventsLogDir);
+      wakePending = true;
+      pumpWakes();
+    } catch (err) {
+      // Defense-in-depth: scanEventsLogDir's design contract is "never throw
+      // out of the scan", but an unexpected internal throw must NOT crash the
+      // daemon. Log and continue — the next watcher event will retry the
+      // ingest.
+      console.error(
+        `[keeperd] events-log live ingest threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
+
+  // Same crash policy as the other workers: any thread failure → fatalExit.
+  eventsIngestWorker.onerror = (err: ErrorEvent): void => {
+    console.error("[keeperd] events-ingest worker error:", err.message ?? err);
+    if (!shuttingDown) fatalExit();
+  };
+
+  // Same crash-via-`close` gap: an events-ingest-worker `process.exit(1)`
+  // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
+  // shutdown.
+  eventsIngestWorker.addEventListener("close", () => {
+    if (!shuttingDown) fatalExit();
+  });
+
   // Spawn the autopilot reconciler worker (fn-661 task .4) — the eighth
   // worker thread. It runs the level-triggered dispatch reconcile loop
   // server-side: data_version wake → desired-vs-observed verdict →
@@ -2824,6 +3266,9 @@ function runDaemon(): void {
     deadLetterWorker.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
+    eventsIngestWorker.postMessage({
+      type: "shutdown",
+    } satisfies ShutdownMessage);
     autopilotWorkerInstance.postMessage({
       type: "shutdown",
     } satisfies ShutdownMessage);
@@ -2854,6 +3299,7 @@ function runDaemon(): void {
       exited(gitWorker),
       exited(usageWorker),
       exited(deadLetterWorker),
+      exited(eventsIngestWorker),
       exited(autopilotWorkerInstance),
       exited(restoreWorker),
     ];
@@ -2899,6 +3345,11 @@ function runDaemon(): void {
     }
     try {
       deadLetterWorker.terminate();
+    } catch {
+      // best-effort if it already exited
+    }
+    try {
+      eventsIngestWorker.terminate();
     } catch {
       // best-effort if it already exited
     }

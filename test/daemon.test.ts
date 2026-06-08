@@ -1963,14 +1963,15 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // UNTOUCHED by fn-724 — no new event, no new column, no migration; it
   // landed against the fn-719 schema value (59).
   //
-  // The schema has since LEGITIMATELY advanced to 60 via fn-725 (the
-  // max_concurrent_jobs cap snapshot), which bumped SCHEMA_VERSION AND added
-  // 60 to `SUPPORTED_SCHEMA_VERSIONS` per the CLAUDE.md same-commit invariant
-  // — but left this pin at 59, leaving the daemon test tier red. This pin now
-  // tracks the LIVE schema version: the guard it provides is "an accidental
-  // reducer/schema change must surface as a failing whitelist + this pin",
-  // which still holds — bump both together when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(60);
+  // The schema has since LEGITIMATELY advanced — to 60 via fn-725 (the
+  // max_concurrent_jobs cap snapshot) and to 61 via fn-736 task .1 (the
+  // `event_ingest_offsets` NDJSON→events ingest cursor), each of which bumped
+  // SCHEMA_VERSION AND added its version to `SUPPORTED_SCHEMA_VERSIONS` in the
+  // same commit per the CLAUDE.md same-commit invariant. This pin tracks the
+  // LIVE schema version: the guard it provides is "an accidental reducer/schema
+  // change must surface as a failing whitelist + this pin", which still holds —
+  // bump both together when the schema genuinely moves.
+  expect(SCHEMA_VERSION).toBe(61);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

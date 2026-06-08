@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 60;
+export const SCHEMA_VERSION = 61;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -387,6 +387,32 @@ export function resolveDeadLetterDir(): string {
     return override;
   }
   return join(homedir(), ".local", "state", "keeper", "dead-letters");
+}
+
+/**
+ * Resolve the keeper events-log directory (fn-736). `KEEPER_EVENTS_LOG` env
+ * wins (hermetic tests point it at a tmp dir, mirroring the hook's matching
+ * override); otherwise default to `~/.local/state/keeper/events-log`, a sibling
+ * of the DB file. The directory may not exist at daemon boot on a fresh machine
+ * — and, while task .1 ships before the hook flip (task .2), it stays empty/
+ * absent because the hook still INSERTs directly; the ingester tolerates
+ * absence (`scanEventsLogDir`'s `existsSync` guard + the worker's own guard).
+ *
+ * This is the lock-free-events path's analogue of {@link resolveDeadLetterDir}:
+ * the hook (task .2) appends a per-pid `<pid>.ndjson` line here instead of
+ * opening SQLite, and the daemon's ingester tails the files and lands each line
+ * as a real `events` row. MUST match `resolveEventsLogDir` in
+ * `plugin/hooks/events-writer.ts` byte-for-byte (the hook keeps its own local
+ * copy because it is forbidden from importing `bun:sqlite` — CLAUDE.md "No
+ * third-party deps in the hook"; `src/db.ts` carries this duplicate for the
+ * daemon-side import surface).
+ */
+export function resolveEventsLogDir(): string {
+  const override = process.env.KEEPER_EVENTS_LOG;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "events-log");
 }
 
 /**
@@ -1518,6 +1544,62 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
 `;
 
 /**
+ * Schema-v61 `event_ingest_offsets` table (fn-736 task .1) — the NDJSON→events
+ * ingest cursor. One row per per-pid `<pid>.ndjson` events-log file the hook
+ * writes (task .2); each row carries the durable byte-offset up to which the
+ * daemon's ingester (`scanEventsLogDir` in `src/daemon.ts`) has already landed
+ * lines as `events` rows. The offset advance is committed in the SAME
+ * `BEGIN IMMEDIATE` transaction as the `events` INSERT — that atomic pairing is
+ * exactly-once: a watcher re-fire or a daemon restart re-scans from the durable
+ * offset and never double-inserts a line it already folded. This is the
+ * idempotency keystone the epic's "Early proof point" validates (the
+ * double-ingest test).
+ *
+ * This is NOT a reducer projection — it is NEVER folded, NEVER written inside
+ * the reducer's cursor-advance transaction, and is EXCLUDED from the re-fold
+ * reset DELETE list. The `events` table is the canonical fold source; this
+ * table is a daemon-side operational cursor sitting UPSTREAM of the fold, the
+ * exact mirror role `dead_letters` plays (an events sidecar, not a projection).
+ * It is the SECOND of the epic's "two distinct cursors": this NDJSON→events
+ * ingest offset (per-pid file) and the UNCHANGED `reducer_state.last_event_id`
+ * (events→projections). They never touch.
+ *
+ * Field semantics:
+ * - `path` (TEXT, part of PK): the absolute path of the per-pid NDJSON file
+ *   (`<events-log-dir>/<pid>.ndjson`). Part of the key so a recycled pid that
+ *   re-creates the same filename is keyed jointly with its inode (below).
+ * - `inode` (INTEGER, part of PK): the file's inode number (`statSync().ino`).
+ *   APFS RECYCLES inodes for deleted files, and a recycled pid re-uses the same
+ *   filename — keying on `(path, inode)` means a brand-new file at a re-used
+ *   path is a DIFFERENT row (offset starts at 0), never inheriting a stale
+ *   offset from the prior file. The complementary guard against inode REUSE
+ *   (a new file landing the same inode AND path) is the size-vs-offset
+ *   `stat()` check in `scanEventsLogDir`: `size < offset` ⇒ truncated/replaced
+ *   ⇒ fall the offset to 0 and re-read from the top.
+ * - `offset` (INTEGER, NOT NULL): the byte-offset of the first UNREAD byte —
+ *   i.e. the count of bytes already ingested. Advanced ONLY to the end of the
+ *   last COMPLETE (`\n`-terminated, parseable) line, atomically with that
+ *   line's INSERT. A torn final line (bytes after the last `\n`, or a
+ *   `parseEventLogLine` → null) does NOT advance the offset, so a later
+ *   complete append re-reads the now-whole line (strict torn-tail).
+ * - `updated_at` (REAL, NOT NULL): unix-seconds of the latest offset advance.
+ *   Operational only (debugging / staleness); never read by the fold.
+ *
+ * Defaults match the zero-event projection trivially: a fresh DB has zero rows
+ * here and the ingester reads an empty/absent dir as a no-op, so a from-scratch
+ * re-fold (which never reads this table) is byte-identical.
+ */
+const CREATE_EVENT_INGEST_OFFSETS = `
+CREATE TABLE IF NOT EXISTS event_ingest_offsets (
+    path TEXT NOT NULL,
+    inode INTEGER NOT NULL,
+    offset INTEGER NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (path, inode)
+)
+`;
+
+/**
  * Schema-v31 `file_attributions` projection table — one row per
  * `(project_dir, session_id, file_path)` triple. Records the attribution claim
  * that this session has at least one mutation (tool or bash) on this file in
@@ -2285,6 +2367,7 @@ function migrate(db: Database): void {
       }
       db.run(CREATE_DISPATCH_FAILURES);
       db.run(CREATE_AUTOPILOT_STATE);
+      db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_EPIC_TOMBSTONES);
       db.run(CREATE_EVENT_BLOBS);
@@ -5911,6 +5994,30 @@ function migrate(db: Database): void {
         "max_concurrent_jobs",
         "INTEGER",
       );
+
+      // v60→v61: fn-736 (task .1) — add the `event_ingest_offsets` table, the
+      // NDJSON→events ingest cursor for the lock-free events path. Created via
+      // CREATE TABLE IF NOT EXISTS (naturally idempotent + forward-only — same
+      // pattern as the v56→v57 `event_blobs` add): NO ALTER, NO backfill, NO
+      // data move. The table starts EMPTY; the daemon's ingester
+      // (`scanEventsLogDir`) populates it organically as it tails per-pid NDJSON
+      // files. A fresh v61 DB picks it up in the bootstrap CREATE block above;
+      // an upgraded v60 DB gains the one empty table here on first open with
+      // every prior `events`/`jobs`/`epics` row intact.
+      //
+      // Re-fold safe: the table is NOT a reducer projection — it is never
+      // folded, never written inside the cursor-advance transaction, and
+      // EXCLUDED from the re-fold reset DELETE list. The `events` table stays
+      // the canonical fold source; this cursor sits UPSTREAM of the fold (an
+      // events sidecar, the `dead_letters` role), so a from-scratch cursor=0
+      // re-fold (which never reads it) reproduces byte-identical projections.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 61
+      // in the SAME change — whitelist-only (keeper-py reads neither
+      // `event_ingest_offsets` nor the NDJSON files), but the bump is required
+      // so keeper-py's Python readers (e.g. `planctl render-approve-context`)
+      // on this host don't fail-loud (test/schema-version.test.ts enforces).
+      db.run(CREATE_EVENT_INGEST_OFFSETS);
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

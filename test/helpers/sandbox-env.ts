@@ -12,11 +12,11 @@
  *  - **Family A** (id-clearing CLI-spawn — commit-work / find-task-commit /
  *    session-state): clears the ambient `CLAUDE_CODE_SESSION_ID` /
  *    `JOBCTL_SESSION_ID` / `JOBCTL_JOB_ID` so attribution + the Job-Id trailer
- *    are fully test-controlled, and sets the FIVE state paths. No zellij var.
+ *    are fully test-controlled, and sets the SIX state paths. No zellij var.
  *    Reproduce with `clearAmbientIds: true` (the default).
  *
  *  - **Family B** (hook-spawn — events-writer / integration): does NOT clear
- *    ambient ids and adds a SIXTH var `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684).
+ *    ambient ids and adds a SEVENTH var `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684).
  *    Reproduce with `{ clearAmbientIds: false, includeZellij: true }`.
  *
  * INVARIANT: the state paths are applied LAST — after the `extra` merge AND the
@@ -82,6 +82,7 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   // (CLAUDE.md isolation rule; the leak class fn-657 closed).
   env.KEEPER_DB = dbPath;
   env.KEEPER_DEAD_LETTER_DIR = join(tmpDir, "dead-letters");
+  env.KEEPER_EVENTS_LOG = join(tmpDir, "events-log");
   env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");

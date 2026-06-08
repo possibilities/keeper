@@ -199,3 +199,129 @@ export function parseDeadLetterLine(line: string): DeadLetterRecord | null {
     bindings,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Events-log NDJSON line shape (fn-736 task .1)
+// ---------------------------------------------------------------------------
+//
+// The lock-free events path (epic fn-736) flips the hook from a direct SQLite
+// `INSERT INTO events` to a per-pid NDJSON append (mirroring this module's
+// dead-letter shape) — and the daemon-side ingester (`scanEventsLogDir` in
+// `src/daemon.ts`) tails those files and lands each line as a real `events`
+// row. The fold (`drain()`/`applyEvent()`) reads `events` UNCHANGED, so re-fold
+// determinism is preserved by construction.
+//
+// This is the CONTRACT task .2's writer targets: task .2 flips the hook to emit
+// exactly `serializeEventLogRecord(...)`. Until then the hook still INSERTs
+// directly and the ingester reads an empty/absent dir (no-op).
+//
+// SAME INVARIANT as the dead-letter shape above: this module's import graph is
+// local-only (NO third-party deps, NO `bun:sqlite`) because the hook imports it
+// on its hot path. Both the hook write and the daemon read depend on these pure
+// functions, structurally enforcing a byte-identical round-trip.
+
+/**
+ * One events-log record — one line of NDJSON. The hook writes one record per
+ * hook invocation (it no longer INSERTs); the daemon's ingester
+ * ({@link parseEventLogLine} → `INSERT INTO events`) lands it as an `events`
+ * row.
+ *
+ * The record carries ONLY `bindings` — the full insert-binding map the hook
+ * would have run against `events` (bare column names, the `$` prefix the
+ * prepared statement uses stripped — see `DeadLetterBindings`). Unlike the
+ * dead-letter record there is no `dl_id` / `dl_written_at` envelope: the
+ * ingester's idempotency comes from a durable per-pid byte-offset (committed
+ * atomically with the INSERT), NOT a stable record id, and the `events` table
+ * keeps its `id INTEGER PRIMARY KEY AUTOINCREMENT` schema untouched (no new
+ * UNIQUE column). `bindings` is the SOLE payload; every `events` column the
+ * fold reads — including the SessionStart-scraped `spawn_name` / `start_time` /
+ * `config_dir` that are unrecoverable later — rides inside it.
+ *
+ * Column set is opaque/forward-compat by design (same as `DeadLetterBindings`):
+ * a v61 hook writes whatever bindings v61 produces; a newer hook may add
+ * columns; the ingester binds only the intersection of the live `events`
+ * columns and the record's keys (an unknown column is dropped — never folded as
+ * a poison value that wedges the ingester).
+ */
+export interface EventLogRecord {
+  bindings: DeadLetterBindings;
+}
+
+/**
+ * Serialize one events-log record to a single NDJSON line, terminated by `\n`.
+ * Pure: same input → same output. The hook (task .2) appends the returned
+ * string to the per-pid `<pid>.ndjson` file with ONE `appendFileSync` /
+ * `write(2)`; the trailing `\n` is the record delimiter the line-by-line
+ * {@link parseEventLogLine} reader keys off.
+ *
+ * UNLIKE the dead-letter shape, the events-log line CAN exceed the ~256 B APFS
+ * O_APPEND non-interleave window (a Stop event's `data` blob is large). The
+ * per-pid file naming (`<pid>.ndjson`) is what makes that safe: exactly ONE
+ * writer per file, so no concurrent hook ever interleaves into the same file
+ * and the single-`write()`-per-line discipline keeps the parser reading whole
+ * records or nothing. The size cap the dead-letter scan applies is deliberately
+ * NOT carried over — a long session legitimately produces a multi-MiB file.
+ */
+export function serializeEventLogRecord(record: EventLogRecord): string {
+  return `${JSON.stringify(record)}\n`;
+}
+
+/**
+ * Parse one NDJSON line into an {@link EventLogRecord}, or return `null` if the
+ * line is unparseable / partial / missing `bindings`. The ingester treats
+ * `null` as "skip this line and DO NOT advance past it" — a truncated final
+ * line from a killed hook process must not be folded, and the durable offset
+ * must NOT advance past the partial bytes so a later complete append re-reads
+ * the now-whole line (the strict torn-tail contract).
+ *
+ * Validation mirrors {@link parseDeadLetterLine}'s `bindings` arm exactly:
+ * `bindings` must be a plain object (not array, not null, not a string) and
+ * every entry's value must be one of `string | number | boolean | null`
+ * (finite numbers only). A binding with a nested object/array value returns
+ * `null` for the whole record — SQLite columns can't carry nested values, and a
+ * hook that produced one would never have had a real INSERT to mirror.
+ *
+ * The `\n` terminator is OPTIONAL on the input — the caller (the ingester's
+ * line-by-line reader) strips the newline before calling. An empty /
+ * whitespace-only line returns `null`.
+ */
+export function parseEventLogLine(line: string): EventLogRecord | null {
+  const trimmed = line.trim();
+  if (trimmed.length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(trimmed);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const obj = parsed as Record<string, unknown>;
+  if (
+    obj.bindings === null ||
+    typeof obj.bindings !== "object" ||
+    Array.isArray(obj.bindings)
+  ) {
+    return null;
+  }
+  const bindingsObj = obj.bindings as Record<string, unknown>;
+  const bindings: DeadLetterBindings = {};
+  for (const [key, value] of Object.entries(bindingsObj)) {
+    if (
+      value === null ||
+      typeof value === "string" ||
+      typeof value === "boolean" ||
+      (typeof value === "number" && Number.isFinite(value))
+    ) {
+      bindings[key] = value;
+      continue;
+    }
+    // Nested object / array / non-finite number — never a real `events`
+    // INSERT binding. Treat as a malformed record so the ingester skips it.
+    return null;
+  }
+  return { bindings };
+}
