@@ -55,5 +55,5 @@ malformed sidecar coerces to pending; re-fold byte-identity. Sandbox all five st
 - [ ] bun test green incl. fallback + boot-prime + malformed-sidecar cases
 
 ## Done summary
-
+Keeper expand-reader: folds approval from gitignored runtime sidecars (.planctl/state/{epics,tasks}/<id>.state.json) GATE-FREE via a PERMANENT ladder (sidecar -> committed def -> pending). classifyPlanPath gains epic-state; PlanScanner caches epic/task approval and re-emits the def-composed snapshot (fn-629 gate stays on the DEF read); buildEpic/TaskMessage thread an approvalOverride with def-fallback preserving key order for re-fold byte-identity; boot-prime seeds both caches before def enumeration. set_{task,epic}_approval RPC retargeted to write the sidecar (create-if-absent, task RMW preserves status, traversal-guarded), committed def untouched. keeperd restarted (pid 35546) on committed c1c3fc4, fold arm confirmed live. bun test green (197 keeper unit + e2e approval integration).
 ## Evidence
