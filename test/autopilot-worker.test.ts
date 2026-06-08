@@ -38,8 +38,11 @@ import {
   type DispatchedAck,
   type DispatchedPayload,
   type DispatchFailedPayload,
+  FINALIZER_GUARD_S,
   type FoundJob,
   isCompletionReapCandidate,
+  isFinalizerGuarded,
+  isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
   isReapCandidate,
@@ -50,6 +53,7 @@ import {
   type ReconcileState,
   reconcile,
   runReconcileCycle,
+  sweepFinalizerGuard,
   sweepRedispatchCooldown,
   verbForVerdict,
 } from "../src/autopilot-worker";
@@ -159,6 +163,8 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
     inFlight: new Set(),
     // fn-735 — boots empty; cooldown tests override it.
     redispatchCooldown: new Map(),
+    // fn-742 — per-epic finalizer guard; boots empty, guard tests override it.
+    finalizerGuard: new Map(),
     // Default unlimited — every pre-fn-725 test that omits this must see
     // identical dispatch behavior.
     maxConcurrentJobs: null,
@@ -861,6 +867,331 @@ test("fn-735 runReconcileCycle: a definitive launch failure CLEARS the cooldown 
   // Cooldown cleared → the key is re-dispatchable (failedKeys, not the
   // cooldown, holds it now).
   expect(state.redispatchCooldown.has("work::fn-1-foo.1")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-742 — per-epic finalizer guard (close ↔ approve serialization)
+// ---------------------------------------------------------------------------
+//
+// The fn-740 race: for a SINGLE epic the close-row verdict flips between
+// `ready` → `close` and `blocked:job-pending` → `approve` across adjacent
+// cycles. `close::<epic>` and `approve::<epic>` are DISTINCT redispatchCooldown
+// keys, so the fn-735 same-key arm does NOT serialize them. The per-epic
+// finalizer guard (keyed by epic id) does: a stamp from EITHER finalizer
+// suppresses the OTHER for that epic until it folds/clears.
+
+// A close-row → `close` (ready): a completed task on an epic that is NOT itself
+// done → close-row verdict `ready` → verb `close`.
+function readyCloseEpic(epicId: string, projectDir: string): Epic {
+  return makeEpic({
+    epic_id: epicId,
+    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
+    project_dir: projectDir,
+    sort_path: epicId,
+    tasks: [
+      makeTask({
+        task_id: `${epicId}.1`,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+      }),
+    ],
+  });
+}
+
+// A close-row → `approve` (job-pending): epic at `status:done` +
+// `approval:pending` whose single task is approved-completed → close-row falls
+// through to predicate 7 → job-pending → verb `approve`.
+function approveCloseRowEpic(epicId: string, projectDir: string): Epic {
+  return makeEpic({
+    epic_id: epicId,
+    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
+    project_dir: projectDir,
+    sort_path: epicId,
+    status: "done",
+    approval: "pending",
+    tasks: [
+      makeTask({
+        task_id: `${epicId}.1`,
+        epic_id: epicId,
+        worker_phase: "done",
+        runtime_status: "done",
+        approval: "approved",
+      }),
+    ],
+  });
+}
+
+test("fn-742 isFinalizerVerb: close + approve are finalizers; work + null are not", () => {
+  expect(isFinalizerVerb("close")).toBe(true);
+  expect(isFinalizerVerb("approve")).toBe(true);
+  expect(isFinalizerVerb("work")).toBe(false);
+  expect(isFinalizerVerb(null)).toBe(false);
+});
+
+test("fn-742 isFinalizerGuarded: unit-seconds predicate edge cases", () => {
+  const guard = new Map<string, number>([["fn-1-foo", 1000]]);
+  // Absent epic → not guarded.
+  expect(isFinalizerGuarded(guard, "fn-2-bar", 1000)).toBe(false);
+  // Exactly at stamp → guarded (0 < GUARD).
+  expect(isFinalizerGuarded(guard, "fn-1-foo", 1000)).toBe(true);
+  // One second before expiry → still guarded.
+  expect(
+    isFinalizerGuarded(guard, "fn-1-foo", 1000 + FINALIZER_GUARD_S - 1),
+  ).toBe(true);
+  // Exactly at expiry → NOT guarded (strict `<`).
+  expect(isFinalizerGuarded(guard, "fn-1-foo", 1000 + FINALIZER_GUARD_S)).toBe(
+    false,
+  );
+});
+
+test("fn-742 guard constant aligns with the fold-lag window (REDISPATCH_COOLDOWN_S)", () => {
+  expect(FINALIZER_GUARD_S).toBe(REDISPATCH_COOLDOWN_S);
+});
+
+test("fn-742 guard: a stamped close::<epic> suppresses approve::<epic> for the SAME epic (close→approve race)", () => {
+  // The headline race: cycle N dispatched `close::fn-1-foo` (guard stamped).
+  // The fold lags; the close-row verdict flips to job-pending → `approve`. The
+  // per-epic guard (keyed by epic id) suppresses that approve — close and
+  // approve never dispatch concurrently for the same epic.
+  const epic = approveCloseRowEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const stampedAt = 1000;
+  const state = makeState({
+    finalizerGuard: new Map([["fn-1-foo", stampedAt]]),
+  });
+
+  // Inside the window → the sibling approve is suppressed.
+  const suppressed = reconcile(snap, state, stampedAt + 1);
+  expect(
+    suppressed.launches.find((p) => p.key === "approve::fn-1-foo"),
+  ).toBeUndefined();
+  // Past the window → the finalizer re-dispatches.
+  const reopened = reconcile(snap, state, stampedAt + FINALIZER_GUARD_S);
+  expect(reopened.launches.map((p) => p.key)).toEqual(["approve::fn-1-foo"]);
+});
+
+test("fn-742 guard: a stamped approve::<epic> suppresses close::<epic> for the SAME epic (approve→close race)", () => {
+  // The symmetric direction: an in-flight approve holds the epic, so a verdict
+  // that flips to `ready` → `close` is suppressed until the approve clears.
+  const epic = readyCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const stampedAt = 1000;
+  const state = makeState({
+    finalizerGuard: new Map([["fn-1-foo", stampedAt]]),
+  });
+
+  const suppressed = reconcile(snap, state, stampedAt + 1);
+  expect(
+    suppressed.launches.find((p) => p.key === "close::fn-1-foo"),
+  ).toBeUndefined();
+  const reopened = reconcile(snap, state, stampedAt + FINALIZER_GUARD_S);
+  expect(reopened.launches.map((p) => p.key)).toEqual(["close::fn-1-foo"]);
+});
+
+test("fn-742 guard scope: a stamp for ONE epic does NOT suppress a DIFFERENT epic's finalizer", () => {
+  // The guard is per-epic. fn-1-foo's stamp must not bleed into fn-2-bar's
+  // close-row — each epic serializes independently.
+  const foo = approveCloseRowEpic("fn-1-foo", "/repo-a");
+  const bar = approveCloseRowEpic("fn-2-bar", "/repo-b");
+  const snap = makeSnapshot({ epics: [foo, bar] });
+  const stampedAt = 1000;
+  const state = makeState({
+    finalizerGuard: new Map([["fn-1-foo", stampedAt]]),
+  });
+  const decision = reconcile(snap, state, stampedAt + 1);
+  // fn-1-foo suppressed; fn-2-bar still launches.
+  expect(decision.launches.map((p) => p.key)).toEqual(["approve::fn-2-bar"]);
+});
+
+test("fn-742 NO DEADLOCK: a TASK-level approve backlog still drains (the guard is epic-finalizer-only, fn-728 preserved)", () => {
+  // The fn-728 invariant: a backlog of pending-approval TASKS must still drain.
+  // Task-level approves (`approve::<task-id>`) are NOT epic finalizers — they
+  // never touch the per-epic guard. Even with EVERY epic id pre-stamped, the
+  // task-level approves all fire. (A blanket approve suppression would deadlock
+  // here — this pins that we never built one.)
+  const a = approveTaskEpic("fn-1-a", "/repo-a");
+  const b = approveTaskEpic("fn-2-b", "/repo-b");
+  const c = approveTaskEpic("fn-3-c", "/repo-c");
+  const snap = makeSnapshot({ epics: [a, b, c] });
+  const state = makeState({
+    // Pre-stamp every epic id — if the guard wrongly gated task-level approves
+    // these stamps would suppress them all.
+    finalizerGuard: new Map([
+      ["fn-1-a", 1000],
+      ["fn-2-b", 1000],
+      ["fn-3-c", 1000],
+    ]),
+  });
+  const decision = reconcile(snap, state, 1001);
+  expect(decision.launches.map((p) => p.key).sort()).toEqual([
+    "approve::fn-1-a.1",
+    "approve::fn-2-b.1",
+    "approve::fn-3-c.1",
+  ]);
+});
+
+test("fn-742 guard: reconcile NEVER mutates the finalizer guard (purity)", () => {
+  // `reconcile` reads the guard via `state` but must not write it — the
+  // stamp/clear/sweep live entirely in the cycle glue.
+  const epic = readyCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const decision = reconcile(snap, state, 5000);
+  expect(decision.launches.map((p) => p.key)).toEqual(["close::fn-1-foo"]);
+  expect(state.finalizerGuard.size).toBe(0);
+});
+
+test("fn-742 sweep: prunes entries past the window, keeps fresh ones (no unbounded growth)", () => {
+  const guard = new Map<string, number>([
+    ["fn-1-fresh", 1000 + FINALIZER_GUARD_S - 1],
+    ["fn-2-stale", 0],
+    ["fn-3-edge", 1000],
+  ]);
+  sweepFinalizerGuard(guard, 1000 + FINALIZER_GUARD_S);
+  expect(guard.has("fn-1-fresh")).toBe(true); // age 1 < GUARD → kept
+  expect(guard.has("fn-2-stale")).toBe(false); // way past → pruned
+  expect(guard.has("fn-3-edge")).toBe(false); // age exactly GUARD → pruned
+});
+
+test("fn-742 sweep: empty map is a no-op (no throw)", () => {
+  const guard = new Map<string, number>();
+  expect(() => sweepFinalizerGuard(guard, 99999)).not.toThrow();
+  expect(guard.size).toBe(0);
+});
+
+test("fn-742 runReconcileCycle: an epic-finalizer launch STAMPS the guard (keyed by epic id) and KEEPS it on indoubt", async () => {
+  // The fold-lag-immune stamp: a close-row finalizer launch stamps the guard
+  // BEFORE the confirm await, keyed by EPIC id (not the ${verb}::${id} key), so
+  // a slow cold-boot `indoubt` resolution leaves the SIBLING finalizer
+  // suppressed.
+  const stampNow = 1700000000;
+  const { deps, log } = makeFakeDeps({
+    ceilingMs: 5,
+    pollIntervalMs: 1,
+    now: stampNow,
+  });
+  const epic = readyCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, stampNow);
+  expect(decision.launches.map((p) => p.key)).toEqual(["close::fn-1-foo"]);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches.length).toBe(1);
+  expect(state.inFlight.size).toBe(0);
+  // Stamp keyed by the EPIC id, persists through indoubt.
+  expect(state.finalizerGuard.get("fn-1-foo")).toBe(stampNow);
+});
+
+test("fn-742 runReconcileCycle: a task-level approve launch does NOT stamp the finalizer guard", async () => {
+  // A task-level approve is not an epic finalizer (isEpicFinalizer unset), so
+  // it must leave the guard untouched — otherwise a task approve would lock its
+  // epic's close-row.
+  const { deps } = makeFakeDeps({
+    ceilingMs: 5,
+    pollIntervalMs: 1,
+    now: 1700000000,
+  });
+  const epic = approveTaskEpic("fn-1-a", "/repo-a");
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 1700000000);
+  expect(decision.launches.map((p) => p.key)).toEqual(["approve::fn-1-a.1"]);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // Guard stays empty — no epic finalizer fired.
+  expect(state.finalizerGuard.size).toBe(0);
+});
+
+test("fn-742 runReconcileCycle: a definitive launch failure CLEARS the finalizer guard (retry path)", async () => {
+  // On `launch.ok===false` the finalizer never ran, so the guard entry is
+  // deleted — the sibling finalizer (and retry_dispatch) need not wait it out.
+  const { deps } = makeFakeDeps({
+    launch: async () => ({ ok: false, error: "zellij ENOENT" }),
+  });
+  const epic = readyCloseEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 0);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(state.finalizerGuard.has("fn-1-foo")).toBe(false);
+});
+
+test("fn-742 end-to-end: a dispatched close suppresses the verdict-flipped approve in the NEXT cycle (fold-lag-immune)", async () => {
+  // The full fn-740 scenario through the real cycle glue. Cycle 1: a ready
+  // close-row dispatches `close::fn-1-foo` (indoubt — the jobs row never binds
+  // inside the ceiling, exactly the fold-lag window). Cycle 2: the same epic's
+  // verdict has flipped to job-pending → `approve` (simulated by swapping the
+  // snapshot), but the projection arms are still blind (empty jobs/liveTabKeys
+  // — the fold lagged). ONLY the in-memory finalizer guard suppresses the
+  // concurrent approve. Past the window it re-opens.
+  const stampNow = 1700000000;
+  const { deps } = makeFakeDeps({
+    ceilingMs: 5,
+    pollIntervalMs: 1,
+    now: stampNow,
+  });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+
+  // Cycle 1 — ready close-row → dispatch close, stamp the guard.
+  const readySnap = makeSnapshot({
+    epics: [readyCloseEpic("fn-1-foo", "/repo")],
+  });
+  const decision1 = reconcile(readySnap, state, stampNow);
+  expect(decision1.launches.map((p) => p.key)).toEqual(["close::fn-1-foo"]);
+  await runReconcileCycle(
+    decision1,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+  expect(state.finalizerGuard.get("fn-1-foo")).toBe(stampNow);
+
+  // Cycle 2 — verdict flipped to job-pending → approve, projections still
+  // blind. The guard suppresses the concurrent approve.
+  const approveSnap = makeSnapshot({
+    epics: [approveCloseRowEpic("fn-1-foo", "/repo")],
+  });
+  const decision2 = reconcile(approveSnap, state, stampNow + 1);
+  expect(
+    decision2.launches.find((p) => p.key === "approve::fn-1-foo"),
+  ).toBeUndefined();
+
+  // Past the guard window the finalizer is eligible again.
+  const decision3 = reconcile(approveSnap, state, stampNow + FINALIZER_GUARD_S);
+  expect(decision3.launches.map((p) => p.key)).toEqual(["approve::fn-1-foo"]);
 });
 
 // ---------------------------------------------------------------------------

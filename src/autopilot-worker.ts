@@ -188,6 +188,89 @@ export type DispatchKey = string;
 export const REDISPATCH_COOLDOWN_S = 120;
 
 /**
+ * fn-742 — the in-process per-epic FINALIZER guard window, in SECONDS.
+ *
+ * The fn-740 race: for a single epic the close-row verdict flips between
+ * `ready` → `close` and `blocked:job-pending` → `approve` across adjacent
+ * cycles. `close::<epic>` and `approve::<epic>` are DIFFERENT
+ * `redispatchCooldown` keys, so the fn-735 same-key cooldown does NOT serialize
+ * them — cycle N dispatches `close::<epic>`, the fold lags, cycle N+1 sees the
+ * verdict flip and dispatches `approve::<epic>` CONCURRENTLY. The close-side
+ * quality audit then races the approve and lands a bogus `rejected`, sticking
+ * the epic at `[::blocked:job-rejected]`.
+ *
+ * This guard closes that gap: when EITHER finalizer (`close` or `approve`) for
+ * an epic is dispatched, the epic id is stamped; `reconcile` suppresses the
+ * OTHER finalizer for that epic until the stamp clears (or the durable
+ * projection arms catch up). Keyed by EPIC ID (not `${verb}::${id}`) so one
+ * stamp covers both finalizer verbs — that's the whole point. The fold-lag-
+ * immune arm, mirroring fn-735: stamp BEFORE the confirm await, read in the
+ * pure `reconcile`, sweep in `driveCycle`.
+ *
+ * SCOPE: epic-level finalizers ONLY. A TASK-level `approve::<task-id>` is NOT
+ * an epic finalizer (it's keyed off the task id, never reaches this map), so a
+ * pending-approval backlog of tasks still drains — the fn-728 cap-exemption is
+ * preserved and the gate is per-epic close↔approve, never a blanket approve
+ * suppression.
+ *
+ * Aligned to `REDISPATCH_COOLDOWN_S` (= `PENDING_DISPATCH_TTL_MS / 1000` = 120
+ * s): conservatively longer than any plausible fold lag, same as fn-735.
+ *
+ * UNIT TRAP: unit-SECONDS throughout (`reconcile`'s `now`). NEVER compare
+ * against the ms-valued `*_TTL_MS` constants.
+ */
+export const FINALIZER_GUARD_S = REDISPATCH_COOLDOWN_S;
+
+/** The two epic-level finalizer verbs the per-epic guard serializes (fn-742). */
+const FINALIZER_VERBS: ReadonlySet<Verb> = new Set<Verb>(["close", "approve"]);
+
+/**
+ * fn-742 — `true` IFF the epic-level finalizer for `epicId` is `close` or
+ * `approve`, the only two verbs the per-epic guard serializes. A close-row
+ * verdict mapping to `null` (running / blocked-on-other / completed) is not a
+ * finalizer and is never stamped or gated.
+ */
+export function isFinalizerVerb(verb: Verb | null): verb is Verb {
+  return verb !== null && FINALIZER_VERBS.has(verb);
+}
+
+/**
+ * fn-742 — pure per-epic finalizer-guard predicate. `true` IFF some finalizer
+ * (`close` or `approve`) for `epicId` was dispatched within the last
+ * `FINALIZER_GUARD_S` seconds. `now` and the stored stamp are BOTH
+ * unit-SECONDS. An absent entry (cleared on launch failure, swept on expiry, or
+ * never stamped) is NOT guarded. Mirrors {@link isInCooldown}: read inside the
+ * pure `reconcile`; the Map is mutated only in the cycle glue.
+ */
+export function isFinalizerGuarded(
+  guard: Map<string, number>,
+  epicId: string,
+  now: number,
+): boolean {
+  const stampedAt = guard.get(epicId);
+  return stampedAt !== undefined && now - stampedAt < FINALIZER_GUARD_S;
+}
+
+/**
+ * fn-742 — prune finalizer-guard entries older than the guard window. Mirrors
+ * {@link sweepRedispatchCooldown}: walk the Map, DELETE every epic id whose
+ * stamp is past `FINALIZER_GUARD_S` (it can no longer suppress, so it's pure
+ * leak). Run once per cycle so the Map stays bounded over daemon uptime. `now`
+ * is unit-SECONDS. Mutates in place — called ONLY from `driveCycle`, never
+ * inside the pure `reconcile`. The caller wraps it in try/catch (no self-heal).
+ */
+export function sweepFinalizerGuard(
+  guard: Map<string, number>,
+  now: number,
+): void {
+  for (const [epicId, stampedAt] of guard) {
+    if (now - stampedAt >= FINALIZER_GUARD_S) {
+      guard.delete(epicId);
+    }
+  }
+}
+
+/**
  * `~/code/arthack` root (kept for any non-plugin-dir callers and for tests
  * that pin the legacy variable). Env-overridable via `ARTHACK_ROOT`. `~`
  * is expanded eagerly at module load so the assembled string carries an
@@ -566,6 +649,30 @@ export interface ReconcileState {
    */
   redispatchCooldown: Map<DispatchKey, number>;
   /**
+   * fn-742 — the in-process per-epic FINALIZER guard. Maps an EPIC ID →
+   * the unix-SECONDS timestamp at which a finalizer (`close` OR `approve`) for
+   * that epic was last dispatched. Same shape/lifecycle as `redispatchCooldown`
+   * above: held on `ReconcileState` so `reconcile()` can READ it and stay pure;
+   * MUTATED only in the cycle glue (`runReconcileCycle` stamps/clears,
+   * `driveCycle` sweeps), NEVER inside `reconcile`.
+   *
+   * The cross-VERB serializer fn-735 cannot be: `redispatchCooldown` keys off
+   * `${verb}::${id}`, so `close::<epic>` and `approve::<epic>` are distinct keys
+   * and the same-key cooldown lets the close↔approve race fire in the fold-lag
+   * window (the fn-740 incident). This map keys off the epic id alone, so one
+   * stamp suppresses the SIBLING finalizer until it clears.
+   *
+   * SCOPE is epic finalizers ONLY — a task-level `approve::<task-id>` never
+   * touches this map, so a pending-approval backlog still drains (fn-728
+   * cap-exemption preserved; the gate is per-epic close↔approve, not a blanket
+   * approve suppression).
+   *
+   * IN-MEMORY ONLY — never the event log / projections / reducer / RPC surface.
+   * Boots EMPTY on restart (safe: autopilot boots paused; the first cycle
+   * rebuilds suppression from the live projection). Timestamps are unit-SECONDS.
+   */
+  finalizerGuard: Map<string, number>;
+  /**
    * Global ceiling on how many root-occupants this reconciler dispatches
    * at once across ALL epics/roots (fn-725). `null` = unlimited (today's
    * behavior — no cap). Threaded daemon → workerData → here so the cap
@@ -592,6 +699,14 @@ export interface PlannedLaunch {
   workerCommand: string;
   /** Task `tier`, only set for `work` rows. */
   tier: string | null;
+  /**
+   * fn-742 — `true` IFF this is an EPIC-level finalizer (`close` or `approve`
+   * emitted at the close-row site, keyed by epic id). The cycle glue stamps
+   * `state.finalizerGuard[id]` for these and only these, so a task-level
+   * `approve::<task>` (never set here) stays out of the per-epic guard. Set
+   * once at the close-row push; absent/false on every task launch.
+   */
+  isEpicFinalizer?: boolean;
 }
 
 /**
@@ -1147,6 +1262,20 @@ export function reconcile(
         // too (miss it and close rows still DUP-DISPATCH). READ-ONLY; same
         // unit-seconds `now`. ABOVE the budget gate, NOT approve-exempt.
         !isInCooldown(state.redispatchCooldown, closeKey, now) &&
+        // fn-742 — the per-epic FINALIZER guard. `close::<epic>` and
+        // `approve::<epic>` are distinct `redispatchCooldown` keys, so the
+        // same-key arm above does NOT serialize them; this guard keys off the
+        // epic id, so a stamp from EITHER finalizer suppresses the OTHER for
+        // this epic until it folds/clears — the fold-lag-immune fix for the
+        // fn-740 close↔approve race. READ-ONLY here; the stamp/clear live in
+        // `runReconcileCycle`, the sweep in `driveCycle`. Applies ONLY at the
+        // close-row site (epic finalizers), so a TASK-level `approve` backlog
+        // is untouched (fn-728 preserved). NOT approve-exempt: an in-flight
+        // close must suppress this epic's approve and vice-versa.
+        !(
+          isFinalizerVerb(closeVerb) &&
+          isFinalizerGuarded(state.finalizerGuard, epicId, now)
+        ) &&
         // fn-725 cap — the close-row push shares the SAME decrementing
         // budget as the task push above, so a closer can't blow the cap.
         // fn-728: `approve` is exempt at this site too (the close-row
@@ -1164,6 +1293,9 @@ export function reconcile(
           cwd: projectDir,
           workerCommand: buildWorkerCommand(closeVerb, epicId, projectDir),
           tier: null,
+          // fn-742 — every close-row launch is an epic finalizer (`close` or
+          // `approve`); the cycle glue stamps the per-epic guard for these.
+          isEpicFinalizer: true,
         });
         if (closeVerb !== "approve") {
           budget--;
@@ -1388,6 +1520,16 @@ export async function runReconcileCycle(
     // `outcome==="ok"` would leave exactly those slow launches
     // re-dispatchable. unit-SECONDS, matching `reconcile`'s `now`.
     state.redispatchCooldown.set(plan.key, deps.now());
+    // fn-742 — STAMP the per-epic finalizer guard at the SAME point (before
+    // the confirm await) for an epic-level finalizer launch. `isEpicFinalizer`
+    // is set ONLY at the close-row push in `reconcile` (the sole emitter of a
+    // `close`/`approve` keyed by an epic id), so a task-level `approve::<task>`
+    // never reaches the guard — explicit flag, not an id-shape heuristic. Same
+    // indoubt-covering rationale as the cooldown stamp above; unit-SECONDS,
+    // keyed by epic id (= `plan.id`).
+    if (plan.isEpicFinalizer) {
+      state.finalizerGuard.set(plan.id, deps.now());
+    }
     const argv = buildLaunchArgv(shell, plan.workerCommand);
     try {
       const outcome = await confirmRunning(
@@ -1408,6 +1550,14 @@ export async function runReconcileCycle(
       // in this process. `ok` and `indoubt` KEEP the stamp.
       if (outcome === "failed" || outcome === "aborted") {
         state.redispatchCooldown.delete(plan.key);
+        // fn-742 — on a definitive launch failure / pre-launch abort, the
+        // finalizer never actually ran, so release the per-epic guard too
+        // (same rationale as the cooldown clear: don't make the sibling
+        // finalizer wait out the window for a launch that didn't happen).
+        // `ok`/`indoubt` KEEP the stamp.
+        if (plan.isEpicFinalizer) {
+          state.finalizerGuard.delete(plan.id);
+        }
       }
       if (outcome === "ok") {
         // Promote to liveDispatches so the reap pass can find it. The
@@ -1700,6 +1850,8 @@ function main(): void {
     // fn-735 — boots EMPTY (safe: autopilot boots paused; the first cycle
     // rebuilds suppression from the live projection). In-memory only.
     redispatchCooldown: new Map(),
+    // fn-742 — per-epic finalizer guard; boots EMPTY for the same reason.
+    finalizerGuard: new Map(),
     maxConcurrentJobs: data.maxConcurrentJobs ?? null,
   };
   // fn-727 — completion-reap toggle. Default `true` (reap) when the
@@ -2090,6 +2242,19 @@ function main(): void {
         } catch (err) {
           console.error(
             "[autopilot-worker] cooldown sweep threw (non-fatal):",
+            err,
+          );
+        }
+        // fn-742 — prune expired per-epic finalizer-guard entries each cycle
+        // (mirror the cooldown sweep). Wrapped: a sweep throw must not crash
+        // the worker and bounce the daemon (no self-heal). Runs BEFORE
+        // `reconcile` reads the Map so a just-expired epic is re-dispatchable
+        // this very cycle.
+        try {
+          sweepFinalizerGuard(state.finalizerGuard, deps.now());
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] finalizer-guard sweep threw (non-fatal):",
             err,
           );
         }
