@@ -113,7 +113,9 @@ page that doubles as a live subscription. Seven collections register today —
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection; both the epic and each embedded task carry an `approval` field
 valued `"approved" | "rejected" | "pending"`, surfaced as a pill in the
-epics client), `subagent_invocations` (the per-job timeline of Task-tool
+epics client — folded GATE-FREE from the gitignored runtime sidecar
+`.planctl/state/{epics,tasks}/<id>.state.json` with a permanent fallback to the
+committed def, fn-732), `subagent_invocations` (the per-job timeline of Task-tool
 subagent calls — one row per `PreToolUse:Agent` paired with its later
 `PostToolUse:Agent` via `events.tool_use_id`, carrying lifecycle status
 `running | ok | failed | unknown | superseded` and a populated `duration_ms`
@@ -174,12 +176,17 @@ read-only connection, polling `data_version` like the reducer-wake worker.
 frames that dispatch to registered server-side handlers, which write *external
 resources* through a dedicated writer owned by the server-worker. The three
 concrete RPCs are `set_task_approval` and `set_epic_approval` (each writes
-the top-level `approval` field on the target `.planctl/{epics,tasks}/<id>.json`
-file via atomic temp+rename under a per-file single-flight lock — the change
-is observed by `@parcel/watcher` and round-trips through the plan worker as
-an `EpicSnapshot` / `TaskSnapshot` event, so the reducer's `epics` projection
-and the `events` log keep their canonical-owner writers and re-fold
-determinism extends to approval) and `replay_dead_letter` (the scoped
+the `approval` field to the GITIGNORED runtime sidecar
+`.planctl/state/{epics,tasks}/<id>.state.json` — fn-732, NOT the committed def —
+create-if-absent + RMW preserving the sidecar's status/claim fields, via atomic
+temp+rename under a per-file single-flight lock; the change is observed by
+`@parcel/watcher` and round-trips through the plan worker as an `EpicSnapshot` /
+`TaskSnapshot` event, so the reducer's `epics` projection and the `events` log
+keep their canonical-owner writers and re-fold determinism extends to approval.
+The fold resolves approval via a PERMANENT ladder — sidecar → committed def →
+`pending` — so keeper folds approval GATE-FREE (no commit on the critical path,
+killing the approve-fold lag) while staying resolvable on a keeper that predates
+any sidecar) and `replay_dead_letter` (the scoped
 synthetic-event-write recovery verb added by schema v37 / fn-643: the
 server-worker bridges the call to main via the in-process message bus,
 and main picks the oldest `waiting` row from `dead_letters`, appends a
@@ -204,12 +211,13 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   reducer's `jobs` / `epics` projections and the `events` log have one
   canonical writer each (the hook for hook events; main for synthetic
   events). The socket DOES carry `rpc` frames, but RPC handlers may write
-  only the `approval` field on external `.planctl/{epics,tasks}` JSON files
-  (via `set_task_approval` / `set_epic_approval`, atomic temp+rename, server-
-  worker-owned single-flight) — never the reducer's projections or the
-  `events` log. The change round-trips through the plan-worker file watcher,
-  so the reducer remains the sole writer of `epics`. Consumers may still
-  read any of it directly from SQLite.
+  only the `approval` field, into the GITIGNORED runtime sidecar
+  `.planctl/state/{epics,tasks}/<id>.state.json` (fn-732, NOT the committed def;
+  via `set_task_approval` / `set_epic_approval`, create-if-absent + RMW, atomic
+  temp+rename, server-worker-owned single-flight) — never the reducer's
+  projections or the `events` log. The change round-trips through the plan-worker
+  file watcher, so the reducer remains the sole writer of `epics`. Consumers may
+  still read any of it directly from SQLite.
 - **No live membership stream** — `meta.total` signals that the filtered set's
   size or membership *changed*, but it does NOT deliver the new members. Frozen
   membership stands: the live page never reflows. `meta` is a count/staleness
@@ -240,10 +248,11 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   jobs-side writes whenever a SessionStart spawn name parses as
   `{plan|work|close|approve}::<ref>`). The socket carries plan mutations *scoped to
   the `approval` field only* — the `set_task_approval` / `set_epic_approval`
-  RPCs write `approval` on the target `.planctl` file via atomic temp+rename,
-  and the plan worker round-trips the change back as a snapshot event. Every
-  other field of every `.planctl` file remains read-only end to end, same
-  fence as `jobs`.
+  RPCs write `approval` into the gitignored runtime sidecar
+  `.planctl/state/{epics,tasks}/<id>.state.json` (fn-732, NOT the committed def)
+  via atomic temp+rename, and the plan worker round-trips the change back as a
+  snapshot event. Every other field of every `.planctl` file remains read-only
+  end to end, same fence as `jobs`.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
 - **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —

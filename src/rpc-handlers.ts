@@ -10,11 +10,15 @@
  *
  * Currently registers THREE handlers:
  *
- * - `set_task_approval { epic_id, task_id, status }` — mutate the `approval`
- *   field on `<root>/.planctl/tasks/<task_id>.json` to `status`. (Schema v13
- *   — see the fn-592-approval-as-planctl-field epic.)
- * - `set_epic_approval { epic_id, status }` — mutate the `approval` field on
- *   `<root>/.planctl/epics/<epic_id>.json` to `status`. (Same.)
+ * - `set_task_approval { epic_id, task_id, status }` — write the `approval`
+ *   field into the gitignored runtime sidecar
+ *   `<root>/.planctl/state/tasks/<task_id>.state.json` (create-if-absent, RMW
+ *   preserving the sidecar's status/claim fields). (fn-732 — approval moved
+ *   out of the committed def into the runtime sidecar so keeper folds it
+ *   gate-free. Was schema v13 def-rewrite — fn-592-approval-as-planctl-field.)
+ * - `set_epic_approval { epic_id, status }` — write the `approval` field into
+ *   `<root>/.planctl/state/epics/<epic_id>.state.json` (create-if-absent).
+ *   (Same fn-732 retarget.)
  * - `replay_dead_letter` (no params) — ASYNC RPC. Asks main to recover ONE
  *   oldest `waiting` dead-letter row by appending the stored bindings back
  *   into the `events` log and flipping the row to `recovered`, all in one
@@ -59,8 +63,8 @@
  */
 
 import type { Database } from "bun:sqlite";
-import { existsSync, readdirSync, readFileSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { atomicWriteFile, resolvePlanRoots, serializePlanctlJson } from "./db";
 import {
   BadParamsError,
@@ -283,23 +287,72 @@ export function resolvePlanFile(
 }
 
 /**
- * Load the JSON object at `path`, mutate `approval = status` (preserving every
- * other top-level field), serialize via `serializePlanctlJson`, atomic-write.
+ * Map a committed plan-def file path
+ * `<planctl>/{epics,tasks}/<id>.json` to its gitignored runtime sidecar
+ * `<planctl>/state/{epics,tasks}/<id>.state.json` (fn-732). Pure path
+ * arithmetic; mirrors the plan-worker's `taskDefPathFromStatePath` /
+ * `epicDefPathFromStatePath` in reverse. Exported for unit reach.
+ *
+ * The def path is the RESOLVED path from {@link resolvePlanFile} — proven to
+ * exist under a configured root's `.planctl/{epics,tasks}/` — so the derived
+ * sidecar lands inside the SAME `.planctl`, and the leaf id is the same
+ * already-traversal-guarded token. No new untrusted component enters the path.
+ */
+export function sidecarPathFromDef(
+  defPath: string,
+  collection: "epics" | "tasks",
+): string {
+  // `<planctl>/<collection>/<id>.json` → defDir = `<planctl>/<collection>`,
+  // planctl = `<planctl>`. Insert `state/` and swap `.json` → `.state.json`.
+  const collectionDir = dirname(defPath); // `<planctl>/<collection>`
+  const planctlDir = dirname(collectionDir); // `<planctl>`
+  const base = defPath.slice(collectionDir.length + 1); // `<id>.json`
+  const id = base.endsWith(".json") ? base.slice(0, -".json".length) : base;
+  return join(planctlDir, "state", collection, `${id}.state.json`);
+}
+
+/**
+ * Write the runtime `approval` into the gitignored sidecar (fn-732),
+ * create-if-absent and read-modify-write so EVERY pre-existing field on the
+ * sidecar (notably a task sidecar's `status` / claim fields written by planctl
+ * `LocalFileStateStore`) is preserved. Mirrors planctl's own RMW discipline
+ * (load → set one key → atomic write); `serializePlanctlJson` + the
+ * same-dir-temp + `renameSync` keep the on-disk form canonical and the write
+ * atomic. Creates the `state/{epics,tasks}/` dir tree on first write.
+ *
+ * The previous (schema v13) implementation rewrote the approval on the
+ * COMMITTED def file; fn-732 moves approval to the runtime sidecar so keeper
+ * folds it gate-free (no commit on the critical path). The plan-worker's
+ * PERMANENT ladder (sidecar → committed def → pending) keeps approval
+ * resolvable on a keeper that hasn't been restarted yet.
  *
  * Throws on read/parse/write failure — the dispatcher's `rpc_failed` path
  * frames the error. Exported for unit reach.
  */
-export function rewriteApprovalField(
-  path: string,
+export function rewriteSidecarApproval(
+  sidecarPath: string,
   status: ApprovalStatus,
 ): void {
-  const raw = readFileSync(path, "utf8");
-  const parsed = JSON.parse(raw);
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    throw new Error(`${path}: planctl file is not a JSON object`);
+  // RMW: start from the existing sidecar (preserving status / claim / evidence
+  // fields) when present; otherwise start from an empty object (create).
+  let obj: Record<string, unknown> = {};
+  if (existsSync(sidecarPath)) {
+    const raw = readFileSync(sidecarPath, "utf8");
+    const parsed = JSON.parse(raw);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
+      throw new Error(`${sidecarPath}: planctl sidecar is not a JSON object`);
+    }
+    obj = parsed as Record<string, unknown>;
   }
-  (parsed as Record<string, unknown>).approval = status;
-  atomicWriteFile(path, serializePlanctlJson(parsed));
+  obj.approval = status;
+  // `atomicWriteFile` does not mkdir; ensure the `state/{epics,tasks}/` tree
+  // exists before the same-dir temp+rename (create-if-absent on first write).
+  mkdirSync(dirname(sidecarPath), { recursive: true });
+  atomicWriteFile(sidecarPath, serializePlanctlJson(obj));
 }
 
 // ---------------------------------------------------------------------------
@@ -328,16 +381,22 @@ export function setTaskApprovalHandler(
 ): SetTaskApprovalResult {
   const { epic_id, task_id, status } = validateSetTaskApprovalParams(params);
   const roots = resolvePlanRoots();
-  const path = resolvePlanFile(roots, "tasks", task_id);
-  if (path === null) {
+  // Resolve the committed def first — it proves the task exists and locates the
+  // owning `.planctl`; the sidecar (which may not exist yet) is derived from it
+  // so create-if-absent lands in the right tree (fn-732).
+  const defPath = resolvePlanFile(roots, "tasks", task_id);
+  if (defPath === null) {
     throw new Error(
       `set_task_approval: no planctl task file found for task_id '${task_id}' in any configured plan root`,
     );
   }
-  rewriteApprovalField(path, status);
-  // fn-701 task .2: the approval write made the file dirty/uncommitted. Kick
-  // the plan-worker into a GATED recheck so an approval that never commits
-  // still converges promptly, instead of waiting on the 60s heartbeat.
+  const sidecarPath = sidecarPathFromDef(defPath, "tasks");
+  // RMW preserves the sidecar's runtime fields (status / claim / evidence)
+  // written by planctl; we only set `approval`.
+  rewriteSidecarApproval(sidecarPath, status);
+  // fn-701 task .2: kick the plan-worker into a GATED recheck so an approval
+  // converges promptly instead of waiting on the 60s heartbeat. KEPT for now —
+  // fn-732 task .4 removes it once the sidecar fold is the sole path.
   fireApprovalKick();
   return { ok: true, epic_id, task_id, approval: status };
 }
@@ -354,15 +413,17 @@ export function setEpicApprovalHandler(
 ): SetEpicApprovalResult {
   const { epic_id, status } = validateSetEpicApprovalParams(params);
   const roots = resolvePlanRoots();
-  const path = resolvePlanFile(roots, "epics", epic_id);
-  if (path === null) {
+  const defPath = resolvePlanFile(roots, "epics", epic_id);
+  if (defPath === null) {
     throw new Error(
       `set_epic_approval: no planctl epic file found for epic_id '${epic_id}' in any configured plan root`,
     );
   }
-  rewriteApprovalField(path, status);
+  const sidecarPath = sidecarPathFromDef(defPath, "epics");
+  rewriteSidecarApproval(sidecarPath, status);
   // fn-701 task .2: kick the plan-worker into a GATED recheck (see the
-  // matching call in `setTaskApprovalHandler`).
+  // matching call in `setTaskApprovalHandler`). KEPT for now — removed in
+  // fn-732 task .4.
   fireApprovalKick();
   return { ok: true, epic_id, approval: status };
 }

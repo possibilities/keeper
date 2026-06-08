@@ -37,6 +37,8 @@ import {
   classifyPlanPath,
   coerceRuntimeStatus,
   discoverPlanctlDirs,
+  epicDefPathFromStatePath,
+  epicIdFromStatePath,
   epicNumberFromId,
   isPathInHead,
   isPathInHeadBatch,
@@ -141,6 +143,48 @@ test("taskIdFromStatePath / taskDefPathFromStatePath: pure path arithmetic", () 
   ).toBe("/a/b/.planctl/tasks/fn-1-x.2.json");
   // A path that doesn't match the 4-segment shape rejects.
   expect(taskDefPathFromStatePath("/a/.planctl/tasks/fn-1-x.json")).toBeNull();
+});
+
+test("classifyPlanPath: .planctl/state/epics/*.state.json → epic-state (fn-732)", () => {
+  // Positive: the planctl LocalFileStateStore shape for the epic approval
+  // sidecar — 4-segment tail under `state/epics/` with `.state.json` suffix.
+  expect(classifyPlanPath("/a/b/.planctl/state/epics/fn-1-x.state.json")).toBe(
+    "epic-state",
+  );
+  // Sibling task-state arm still classifies independently.
+  expect(
+    classifyPlanPath("/a/b/.planctl/state/tasks/fn-1-x.2.state.json"),
+  ).toBe("task-state");
+  // Negative: a stray non-state `.json` under state/epics/ rejects.
+  expect(classifyPlanPath("/a/b/.planctl/state/epics/fn-1-x.json")).toBeNull();
+  // Negative: a deeper-nested match rejects (exact trailing-4 probe).
+  expect(
+    classifyPlanPath("/a/.planctl/state/epics/sub/fn-1-x.state.json"),
+  ).toBeNull();
+  // Negative: an unrelated leaf dir under state/ rejects.
+  expect(
+    classifyPlanPath("/a/.planctl/state/sessions/fn-1-x.state.json"),
+  ).toBeNull();
+});
+
+test("epicIdFromStatePath / epicDefPathFromStatePath: pure path arithmetic (fn-732)", () => {
+  // Strip the `.state.json` suffix from the basename to recover the epic id.
+  expect(epicIdFromStatePath("/a/.planctl/state/epics/fn-1-x.state.json")).toBe(
+    "fn-1-x",
+  );
+  // A basename without the suffix rejects.
+  expect(epicIdFromStatePath("/a/.planctl/state/epics/fn-1-x.json")).toBeNull();
+  // Map an epic state-file path to the committed epic-definition path.
+  expect(
+    epicDefPathFromStatePath("/a/b/.planctl/state/epics/fn-1-x.state.json"),
+  ).toBe("/a/b/.planctl/epics/fn-1-x.json");
+  // A path under the WRONG leaf dir (state/tasks/) rejects — the epic mapper is
+  // dir-specific even though the id-from-basename transform is shared.
+  expect(
+    epicDefPathFromStatePath("/a/b/.planctl/state/tasks/fn-1-x.state.json"),
+  ).toBeNull();
+  // A path that doesn't match the 4-segment shape rejects.
+  expect(epicDefPathFromStatePath("/a/.planctl/epics/fn-1-x.json")).toBeNull();
 });
 
 test("coerceRuntimeStatus: enum passes through; missing → 'todo' silently; invalid → 'todo' with log", () => {
@@ -301,6 +345,63 @@ test("buildTaskMessage coerces an invalid approval value (wrong type) to 'pendin
   expect(logs.length).toBe(1);
   expect(logs[0]).toContain("invalid approval value on task fn-9-x.1");
   expect(logs[0]).toContain("42");
+});
+
+// ---------------------------------------------------------------------------
+// (a.approval-ladder) fn-732 PERMANENT resolution ladder: a cached sidecar
+// approval (the override) WINS; on a cache miss (`undefined`) the build*
+// functions FALL BACK to the committed def's own `approval`. The fallback is
+// load-bearing and permanent — never gated away.
+// ---------------------------------------------------------------------------
+
+test("buildEpicMessage: approvalOverride WINS over the committed def's approval (fn-732 sidecar)", () => {
+  // Def says "pending", sidecar (override) says "approved" → sidecar wins.
+  const msg = buildEpicMessage(
+    { id: "fn-9-x", approval: "pending" },
+    undefined,
+    "approved",
+  );
+  expect(msg?.approval).toBe("approved");
+});
+
+test("buildEpicMessage: cache miss (undefined override) FALLS BACK to the committed def's approval (fn-732 ladder)", () => {
+  // No sidecar (override === undefined) → read the def's own value.
+  const msg = buildEpicMessage(
+    { id: "fn-9-x", approval: "approved" },
+    undefined,
+    undefined,
+  );
+  expect(msg?.approval).toBe("approved");
+  // And a def with NO approval falls all the way through to "pending".
+  expect(
+    buildEpicMessage({ id: "fn-9-x" }, undefined, undefined)?.approval,
+  ).toBe("pending");
+});
+
+test("buildTaskMessage: approvalOverride WINS; cache miss FALLS BACK to def (fn-732 ladder)", () => {
+  // Override present → wins over the def.
+  expect(
+    buildTaskMessage(
+      { id: "fn-9-x.1", approval: "pending" },
+      "todo",
+      undefined,
+      "rejected",
+    )?.approval,
+  ).toBe("rejected");
+  // Override absent → fall back to the def's approval.
+  expect(
+    buildTaskMessage(
+      { id: "fn-9-x.1", approval: "approved" },
+      "todo",
+      undefined,
+      undefined,
+    )?.approval,
+  ).toBe("approved");
+  // Override absent AND def absent → "pending".
+  expect(
+    buildTaskMessage({ id: "fn-9-x.1" }, "todo", undefined, undefined)
+      ?.approval,
+  ).toBe("pending");
 });
 
 test("PlanScanner.onChange routes invalid approval log through its `log` sink", () => {
@@ -1441,6 +1542,223 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
   expect(
     (taskMsgs[0] as { id: string; runtimeStatus: string }).runtimeStatus,
   ).toBe("todo");
+});
+
+// ---------------------------------------------------------------------------
+// (a.732) fn-732 approval-from-sidecar fold. Keeper folds approval from the
+// gitignored runtime sidecars (`state/{epics,tasks}/<id>.state.json`) GATE-FREE
+// (no commit) and falls back to the committed def on cache miss (the PERMANENT
+// ladder). The fn-629 in-HEAD gate STILL applies to the DEF read these arms
+// compose against — the gateless scanner (default `() => true`) emits, while a
+// gated scanner that says "def not in HEAD" stashes to pending.
+// ---------------------------------------------------------------------------
+
+/** Write an epic runtime-state sidecar and return its path. */
+function writeEpicState(id: string, body: Record<string, unknown>): string {
+  const dir = join(tmpDir, ".planctl", "state", "epics");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${id}.state.json`);
+  writeFileSync(path, JSON.stringify(body));
+  return path;
+}
+
+/** Write a task runtime-state sidecar and return its path. */
+function writeTaskState(id: string, body: Record<string, unknown>): string {
+  const dir = join(tmpDir, ".planctl", "state", "tasks");
+  mkdirSync(dir, { recursive: true });
+  const path = join(dir, `${id}.state.json`);
+  writeFileSync(path, JSON.stringify(body));
+  return path;
+}
+
+test("epic-state arm folds approval GATE-FREE from the sidecar (fn-732)", () => {
+  const emitted: PlanMessage[] = [];
+  // Gateless scanner — but ALSO assert via an explicit always-false gate below
+  // that the EPIC-STATE arm composes against a gated DEF read.
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  // Def says pending; the sidecar flips it to approved without any commit.
+  const defPath = writeEpic("fn-1-x", { title: "E", approval: "pending" });
+  scanner.onChange(defPath);
+  expect((emitted.at(-1) as { approval: string }).approval).toBe("pending");
+
+  const statePath = writeEpicState("fn-1-x", { approval: "approved" });
+  const did = scanner.onChange(statePath);
+  expect(did).toBe(true);
+  const epicMsgs = emitted.filter((m) => m.kind === "plan-epic");
+  expect((epicMsgs.at(-1) as { approval: string }).approval).toBe("approved");
+});
+
+test("epic-state arm re-emit composes against a GATED def read (fn-629 gate still applies to the DEF)", () => {
+  // The sidecar is gitignored (never in a commit's file list), so the def-file
+  // in-HEAD gate stays in force on the def the arm composes against. With a
+  // gate that says "def not in HEAD", the sidecar change stashes to pending and
+  // emits nothing.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    () => false, // def never in HEAD
+  );
+  writeEpic("fn-1-x", { title: "E", approval: "pending" });
+  const statePath = writeEpicState("fn-1-x", { approval: "approved" });
+  const did = scanner.onChange(statePath);
+  expect(did).toBe(false);
+  expect(emitted.filter((m) => m.kind === "plan-epic").length).toBe(0);
+});
+
+test("task-state arm folds approval from the sidecar AND preserves runtime status (fn-732)", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  writeTask("fn-1-x.1", { epic: "fn-1-x", title: "T", approval: "pending" });
+  scanner.onChange(join(planctlDir("tasks"), "fn-1-x.1.json"));
+
+  // Sidecar carries BOTH status and approval (fn-732).
+  const statePath = writeTaskState("fn-1-x.1", {
+    status: "in_progress",
+    approval: "approved",
+  });
+  const did = scanner.onChange(statePath);
+  expect(did).toBe(true);
+  const last = emitted.at(-1) as { approval: string; runtimeStatus: string };
+  expect(last.approval).toBe("approved");
+  expect(last.runtimeStatus).toBe("in_progress");
+});
+
+test("def-fallback on cache miss: no sidecar → approval reads from the committed def (PERMANENT ladder, fn-732)", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  // No sidecar written at all — the def's own approval is the source of truth.
+  const epicDef = writeEpic("fn-1-x", { title: "E", approval: "approved" });
+  scanner.onChange(epicDef);
+  expect((emitted.at(-1) as { approval: string }).approval).toBe("approved");
+
+  const taskDef = writeTask("fn-1-x.1", {
+    epic: "fn-1-x",
+    title: "T",
+    approval: "rejected",
+  });
+  scanner.onChange(taskDef);
+  const taskMsg = emitted.filter((m) => m.kind === "plan-task").at(-1);
+  expect((taskMsg as { approval: string }).approval).toBe("rejected");
+});
+
+test("malformed approval in a sidecar coerces to 'pending' with a log (fn-732 safe-value)", () => {
+  const emitted: PlanMessage[] = [];
+  const logs: string[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    (l) => logs.push(l),
+  );
+  writeEpic("fn-1-x", { title: "E", approval: "approved" });
+  scanner.onChange(join(planctlDir("epics"), "fn-1-x.json"));
+  // Garbage approval in the sidecar — coerces to "pending" (NOT the def's
+  // "approved"; the sidecar is observed, just unparseable into the enum).
+  const statePath = writeEpicState("fn-1-x", { approval: "approvedd" });
+  scanner.onChange(statePath);
+  expect((emitted.at(-1) as { approval: string }).approval).toBe("pending");
+  expect(logs.some((l) => l.includes("invalid approval value"))).toBe(true);
+});
+
+test("epic-state delete reverts approval to the committed def (ladder fallback, fn-732)", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  writeEpic("fn-1-x", { title: "E", approval: "pending" });
+  scanner.onChange(join(planctlDir("epics"), "fn-1-x.json"));
+  const statePath = writeEpicState("fn-1-x", { approval: "approved" });
+  scanner.onChange(statePath);
+  expect((emitted.at(-1) as { approval: string }).approval).toBe("approved");
+  // Delete the sidecar → re-emit composed from the def → back to "pending".
+  scanner.onDelete(statePath);
+  expect((emitted.at(-1) as { approval: string }).approval).toBe("pending");
+});
+
+test("scanRoot: primes BOTH approval caches from state/{epics,tasks}/ BEFORE the def loop (fn-732 boot-prime order)", () => {
+  // Boot-path: pre-existing sidecars must seed the approval caches before the
+  // def enumeration so the FIRST emitted snapshot carries the sidecar approval
+  // rather than resetting to the committed-def fallback for the whole window.
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+
+  // Sidecars on disk at boot — def says "pending", sidecars say "approved".
+  writeEpicState("fn-1-x", { approval: "approved" });
+  writeTaskState("fn-1-x.1", { status: "done", approval: "approved" });
+  // Then the committed defs (pending), which the boot loop reads SECOND.
+  writeEpic("fn-1-x", { title: "E", approval: "pending" });
+  writeTask("fn-1-x.1", { epic: "fn-1-x", title: "T", approval: "pending" });
+
+  scanRoot(tmpDir, scanner);
+
+  // Exactly one of each, both carrying the sidecar "approved" — proving the
+  // prime ran BEFORE the def emit (otherwise the first snapshot would show the
+  // def's "pending" and a redundant re-emit would be needed).
+  const epicMsgs = emitted.filter((m) => m.kind === "plan-epic");
+  const taskMsgs = emitted.filter((m) => m.kind === "plan-task");
+  expect(epicMsgs.length).toBe(1);
+  expect(taskMsgs.length).toBe(1);
+  expect((epicMsgs[0] as { approval: string }).approval).toBe("approved");
+  expect((taskMsgs[0] as { approval: string }).approval).toBe("approved");
+  // The task sidecar's status primed too (proves the shared Pass-1 read).
+  expect((taskMsgs[0] as { runtimeStatus: string }).runtimeStatus).toBe("done");
+});
+
+test("scanRoot: malformed approval in a sidecar skips the cache prime; def-fallback applies (fn-732)", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  // Garbage approval in the epic sidecar at boot — prime is SKIPPED, so the
+  // ladder falls back to the committed def's "approved".
+  writeEpicState("fn-1-x", { approval: 99 });
+  writeEpic("fn-1-x", { title: "E", approval: "approved" });
+
+  scanRoot(tmpDir, scanner);
+
+  const epicMsgs = emitted.filter((m) => m.kind === "plan-epic");
+  expect(epicMsgs.length).toBe(1);
+  expect((epicMsgs[0] as { approval: string }).approval).toBe("approved");
+});
+
+test("scanRoot: re-fold is byte-identical across two boot scans with sidecars (fn-732 determinism)", () => {
+  // Re-fold determinism: a second from-scratch scan with the same on-disk state
+  // must reproduce byte-identical messages (the change-gate suppresses the
+  // re-emit, and a fresh scanner emits the identical serialized snapshot).
+  const first: PlanMessage[] = [];
+  const s1 = new PlanScanner(
+    (m) => first.push(m),
+    () => {},
+  );
+  writeEpicState("fn-1-x", { approval: "approved" });
+  writeTaskState("fn-1-x.1", { status: "done", approval: "rejected" });
+  writeEpic("fn-1-x", { title: "E", approval: "pending" });
+  writeTask("fn-1-x.1", { epic: "fn-1-x", title: "T", approval: "pending" });
+  scanRoot(tmpDir, s1);
+
+  const second: PlanMessage[] = [];
+  const s2 = new PlanScanner(
+    (m) => second.push(m),
+    () => {},
+  );
+  scanRoot(tmpDir, s2);
+
+  // Same on-disk state → byte-identical serialized snapshots from a fresh
+  // scanner (the seed/change-gate compare is a JSON.stringify byte compare).
+  expect(JSON.stringify(second)).toBe(JSON.stringify(first));
 });
 
 // ---------------------------------------------------------------------------

@@ -447,7 +447,7 @@ const PRUNE_DIRS = new Set([
 ]);
 
 /** Which `.planctl` collection a path belongs to (or none). */
-type PlanKind = "epic" | "task" | "task-state";
+type PlanKind = "epic" | "task" | "task-state" | "epic-state";
 
 /**
  * Classify a watched path as an epic file, a task file, a task runtime-state
@@ -460,12 +460,17 @@ type PlanKind = "epic" | "task" | "task-state";
  * - `.planctl/epics/<id>.json` (3-segment tail) → `"epic"`
  * - `.planctl/tasks/<id>.json` (3-segment tail) → `"task"`
  * - `.planctl/state/tasks/<id>.state.json` (4-segment tail) → `"task-state"`
+ * - `.planctl/state/epics/<id>.state.json` (4-segment tail) → `"epic-state"`
  *
  * The 3-segment check is tried first so an `.json`-suffixed file under a
- * 3-tail layout never falls through to the 4-tail probe. The 4-tail probe
- * matches the planctl `LocalFileStateStore` shape (see
+ * 3-tail layout never falls through to the 4-tail probe. The 4-tail probes
+ * match the planctl `LocalFileStateStore` shape (see
  * `apps/planctl/planctl/store.py:151`); files there end in `.state.json` so a
- * stray `*.json` (non-state) under `.planctl/state/tasks/` rejects.
+ * stray `*.json` (non-state) under `.planctl/state/{tasks,epics}/` rejects.
+ * The epic-state sidecar (`fn-732`) is the gitignored runtime carrier for the
+ * `approval` field; keeper folds approval from it gate-free (no commit), then
+ * falls back to the committed epic def when no sidecar exists (PERMANENT
+ * resolution ladder — see {@link PlanScanner}).
  *
  * Pure — does no I/O. Exported for unit reach.
  */
@@ -495,10 +500,16 @@ export function classifyPlanPath(path: string): PlanKind | null {
     n >= 4 &&
     segments[n - 4] === ".planctl" &&
     segments[n - 3] === "state" &&
-    segments[n - 2] === "tasks" &&
     segments[n - 1].endsWith(".state.json")
   ) {
-    return "task-state";
+    if (segments[n - 2] === "tasks") {
+      return "task-state";
+    }
+    // 4-segment tail: `.planctl/state/epics/<id>.state.json`. Same shape rules
+    // as task-state, different leaf dir (fn-732 epic approval sidecar).
+    if (segments[n - 2] === "epics") {
+      return "epic-state";
+    }
   }
   return null;
 }
@@ -565,14 +576,27 @@ interface RawTask {
 }
 
 /**
- * Raw planctl runtime-state JSON shape — only the field we project. The state
+ * Raw planctl runtime-state JSON shape — only the fields we project. The state
  * file (`.planctl/state/tasks/<task_id>.state.json`) is written by planctl
  * `LocalFileStateStore` (`apps/planctl/planctl/store.py:151`) and carries
  * `assignee` / `claim_note` / `claimed_at` / `evidence` / `status` /
- * `updated_at`; keeper only ingests `status`.
+ * `updated_at`; keeper ingests `status` AND (fn-732) the runtime `approval`
+ * field, which migrated out of the committed def into this gitignored sidecar.
  */
 interface RawTaskState {
   status?: unknown;
+  approval?: unknown;
+}
+
+/**
+ * Raw planctl epic runtime-state JSON shape (fn-732). The epic state file
+ * (`.planctl/state/epics/<epic_id>.state.json`) is the gitignored runtime
+ * carrier for the `approval` field — the only field keeper ingests from it.
+ * Mirrors {@link RawTaskState}; the epic sidecar has no `status` (epic status
+ * lives on the committed def).
+ */
+interface RawEpicState {
+  approval?: unknown;
 }
 
 /** Coerce a value to a non-empty string, else null. */
@@ -624,6 +648,49 @@ export function taskDefPathFromStatePath(statePath: string): string | null {
   // Replace the trailing `state/tasks/<id>.state.json` with `tasks/<id>.json`.
   const planctlPrefix = segments.slice(0, n - 3);
   return [...planctlPrefix, "tasks", `${taskId}.json`].join(sep);
+}
+
+/**
+ * Derive the planctl epic id from an epic state-file path:
+ * `.../.planctl/state/epics/<epic_id>.state.json` → `<epic_id>`. Returns null
+ * if the basename does not end in `.state.json` (caller has already
+ * classified — this stays a pure transform on the matched shape). Mirrors
+ * {@link taskIdFromStatePath}.
+ *
+ * Pure. Exported for unit reach.
+ */
+export function epicIdFromStatePath(path: string): string | null {
+  // Same basename arithmetic as the task variant — the id-from-basename
+  // transform is dir-agnostic, so reuse it directly.
+  return taskIdFromStatePath(path);
+}
+
+/**
+ * Map an epic state-file path
+ * `.../.planctl/state/epics/<epic_id>.state.json` to the committed epic
+ * definition file path `.../.planctl/epics/<epic_id>.json`. Pure path
+ * arithmetic — does no I/O. Returns null on a shape mismatch (caller has
+ * already classified, so this is defensive only). Mirrors
+ * {@link taskDefPathFromStatePath}.
+ */
+export function epicDefPathFromStatePath(statePath: string): string | null {
+  const segments = statePath.split(sep);
+  const n = segments.length;
+  if (
+    n < 4 ||
+    segments[n - 4] !== ".planctl" ||
+    segments[n - 3] !== "state" ||
+    segments[n - 2] !== "epics"
+  ) {
+    return null;
+  }
+  const epicId = epicIdFromStatePath(statePath);
+  if (epicId === null) {
+    return null;
+  }
+  // Replace the trailing `state/epics/<id>.state.json` with `epics/<id>.json`.
+  const planctlPrefix = segments.slice(0, n - 3);
+  return [...planctlPrefix, "epics", `${epicId}.json`].join(sep);
 }
 
 /**
@@ -799,6 +866,27 @@ export class PlanScanner {
    * (definition) path — the cache is the state file's projection.
    */
   private readonly runtimeStatusCache = new Map<string, string>();
+  /**
+   * Per-task cache of the latest approval enum observed in the task's
+   * gitignored runtime sidecar (`.planctl/state/tasks/<id>.state.json`,
+   * `approval` field). Keyed by planctl task id (fn-732). A task NOT in this
+   * cache reads its approval from the committed def via the PERMANENT ladder
+   * (sidecar → committed def → `"pending"`) — see {@link buildTaskMessage}.
+   *
+   * Updated by an `onChange` over a `task-state` path AFTER the file
+   * coerce-parses cleanly, and dropped by `onDelete` over the same path (a
+   * sidecar vanishing reverts the task to the committed-def value). NEVER
+   * mutated from a `task` (definition) path — the cache is the sidecar's
+   * projection, and the def stays the fallback layer underneath it.
+   */
+  private readonly taskApprovalCache = new Map<string, Approval>();
+  /**
+   * Per-epic cache of the latest approval enum observed in the epic's
+   * gitignored runtime sidecar (`.planctl/state/epics/<id>.state.json`,
+   * `approval` field). Keyed by planctl epic id (fn-732). Same PERMANENT
+   * ladder + lifecycle as {@link taskApprovalCache}, for epics.
+   */
+  private readonly epicApprovalCache = new Map<string, Approval>();
   /**
    * The set of planctl ids whose backing `.json` file was actually enumerated
    * on disk by a boot scan ({@link markSeen}, called from `scanPlanctlDir` for
@@ -1051,6 +1139,27 @@ export class PlanScanner {
   }
 
   /**
+   * Boot-prime poke for the per-task approval cache (fn-732). Same write-only
+   * discipline as {@link primeRuntimeStatus}: the caller has already coerced
+   * the value through {@link coerceApproval} (so only the three-value enum is
+   * ever stored), and this MUST run before the `tasks/` def enumeration so the
+   * first emitted TaskSnapshot carries the sidecar approval rather than
+   * resetting it to the committed-def fallback.
+   */
+  primeTaskApproval(taskId: string, approval: Approval): void {
+    this.taskApprovalCache.set(taskId, approval);
+  }
+
+  /**
+   * Boot-prime poke for the per-epic approval cache (fn-732). Mirrors
+   * {@link primeTaskApproval} for epics; MUST run before the `epics/` def
+   * enumeration.
+   */
+  primeEpicApproval(epicId: string, approval: Approval): void {
+    this.epicApprovalCache.set(epicId, approval);
+  }
+
+  /**
    * Process a delete for `path`. Emits a tombstone so the projection retracts,
    * then drops the change-gate entry (so a re-created file re-emits). A path
    * with no change-gate entry (never folded) emits nothing — nothing to retract.
@@ -1070,8 +1179,9 @@ export class PlanScanner {
   onDelete(path: string): void {
     const kind = classifyPlanPath(path);
     if (kind === "task-state") {
-      // Sidecar delete: drop the cache entry (reverts the task to the planctl
-      // default "todo") and re-emit a TaskSnapshot from the still-present
+      // Sidecar delete: drop the cache entries (reverts the task to the planctl
+      // default "todo" for status, and to the committed-def value for approval
+      // via the fn-732 ladder) and re-emit a TaskSnapshot from the still-present
       // task-definition file. A state-file path is NOT tracked in
       // `pathToId` (the cache key is the task id directly), so there is no
       // entry to drop there.
@@ -1079,11 +1189,14 @@ export class PlanScanner {
       if (taskId === null) {
         return;
       }
-      const hadCache = this.runtimeStatusCache.has(taskId);
+      const hadCache =
+        this.runtimeStatusCache.has(taskId) ||
+        this.taskApprovalCache.has(taskId);
       this.runtimeStatusCache.delete(taskId);
+      this.taskApprovalCache.delete(taskId);
       if (!hadCache) {
-        // The cache was already empty (reading "todo"); deleting a never-cached
-        // sidecar can't change the projection. Skip the re-emit.
+        // Both caches were already empty (reading defaults); deleting a
+        // never-cached sidecar can't change the projection. Skip the re-emit.
         return;
       }
       const defPath = taskDefPathFromStatePath(path);
@@ -1091,6 +1204,27 @@ export class PlanScanner {
         return;
       }
       this.reemitTaskFromDef(defPath);
+      return;
+    }
+
+    // fn-732: epic-state sidecar delete — drop the epic approval cache (reverts
+    // approval to the committed-def value via the ladder) and re-emit the
+    // EpicSnapshot from the still-present epic-definition file.
+    if (kind === "epic-state") {
+      const epicId = epicIdFromStatePath(path);
+      if (epicId === null) {
+        return;
+      }
+      const hadCache = this.epicApprovalCache.has(epicId);
+      this.epicApprovalCache.delete(epicId);
+      if (!hadCache) {
+        return;
+      }
+      const defPath = epicDefPathFromStatePath(path);
+      if (defPath === null) {
+        return;
+      }
+      this.reemitEpicFromDef(defPath);
       return;
     }
 
@@ -1106,6 +1240,10 @@ export class PlanScanner {
     }
     if (kind === "epic") {
       this.onSnapshot({ kind: "plan-epic-deleted", id });
+      // Definition file is gone: drop the epic approval cache too (fn-732), so
+      // a re-created epic file starts from its committed-def value rather than
+      // a stale cached sidecar approval.
+      this.epicApprovalCache.delete(id);
     } else if (kind === "task") {
       // Recover the parent epic id from the last-emitted task snapshot — the
       // file is gone, so this is the only surviving link. Parse defensively;
@@ -1124,10 +1262,11 @@ export class PlanScanner {
         }
       }
       this.onSnapshot({ kind: "plan-task-deleted", id, epicId });
-      // Definition file is gone: drop the runtime-status cache too, so a
-      // re-created task file starts from the planctl "todo" default rather
-      // than a stale cached value.
+      // Definition file is gone: drop the runtime-status AND approval caches
+      // (fn-732), so a re-created task file starts from the planctl "todo"
+      // default + its committed-def approval rather than stale cached values.
       this.runtimeStatusCache.delete(id);
+      this.taskApprovalCache.delete(id);
     }
     // Drop the change-gate so a re-created file re-emits its snapshot.
     this.pathToId.delete(path);
@@ -1191,7 +1330,15 @@ export class PlanScanner {
       return false;
     }
     const runtimeStatus = this.runtimeStatusCache.get(id) ?? "todo";
-    const msg = buildTaskMessage(raw, runtimeStatus, this.log);
+    // fn-732 ladder: thread the cached sidecar approval; a miss falls back to
+    // the committed def's `approval` inside buildTaskMessage.
+    const approvalOverride = this.taskApprovalCache.get(id);
+    const msg = buildTaskMessage(
+      raw,
+      runtimeStatus,
+      this.log,
+      approvalOverride,
+    );
     if (msg === null) {
       return false;
     }
@@ -1199,6 +1346,83 @@ export class PlanScanner {
     // The sidecar state file fired this re-emit, but the def file is what
     // we project; if the def file isn't in HEAD yet, stash and wait for
     // the next git-worker pulse to drain it via {@link recheckPending}.
+    if (!this.isTracked(defPath)) {
+      this.addPending(defPath);
+      return false;
+    }
+    this.deletePending(defPath);
+    this.pathToId.set(defPath, msg.id);
+    const serialized = JSON.stringify(msg);
+    if (this.lastEmitted.get(msg.id) === serialized) {
+      return false;
+    }
+    this.lastEmitted.set(msg.id, serialized);
+    this.onSnapshot(msg);
+    return true;
+  }
+
+  /**
+   * Read the epic-definition file at `defPath` (if present) and re-emit an
+   * EpicSnapshot composed with the latest cached `approval` (fn-732). Used by
+   * the `epic-state` change/delete arms — the sidecar carries only the
+   * approval field, but the snapshot the reducer folds is full. Mirrors
+   * {@link reemitTaskFromDef}.
+   *
+   * A missing/unreadable/malformed definition file is skip-and-logged without
+   * emitting; the next true `epic` event replays through {@link onChange}. The
+   * fn-629 def-file gate STAYS in force here: epic-state sidecars are
+   * gitignored and never appear in a commit's file list, so the commit-driven
+   * bypass never reaches this method.
+   *
+   * Returns `true` iff a snapshot was emitted.
+   */
+  private reemitEpicFromDef(defPath: string): boolean {
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(defPath);
+    } catch {
+      // Definition file absent (or read-vs-delete race) — the sidecar changed
+      // for an epic whose def hasn't appeared yet. The cache already updated;
+      // when the def lands, its `epic` `onChange` reads the cache and emits.
+      return false;
+    }
+    if (!st.isFile() || st.size > MAX_PLAN_FILE_BYTES) {
+      return false;
+    }
+    let text: string;
+    try {
+      text = readFileSync(defPath, "utf8");
+    } catch (err) {
+      this.log(
+        `[plan-worker] read failed for ${defPath}: ${stringifyErr(err)}`,
+      );
+      return false;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      this.log(
+        `[plan-worker] malformed JSON in ${defPath}: ${stringifyErr(err)}`,
+      );
+      return false;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      return false;
+    }
+    const raw = parsed as RawEpic;
+    const id = asString(raw.id);
+    if (id === null) {
+      return false;
+    }
+    // fn-732 ladder: thread the cached sidecar approval; a miss falls back to
+    // the committed def's `approval` inside buildEpicMessage.
+    const approvalOverride = this.epicApprovalCache.get(id);
+    const msg = buildEpicMessage(raw, this.log, approvalOverride);
+    if (msg === null) {
+      return false;
+    }
+    // Observation gate (fn-629): same as {@link reemitTaskFromDef}.
     if (!this.isTracked(defPath)) {
       this.addPending(defPath);
       return false;
@@ -1298,10 +1522,23 @@ export class PlanScanner {
           `[plan-worker] invalid runtime status in ${path}: ${JSON.stringify(bad)}; defaulting to "todo"`,
         );
       });
-      const prior = this.runtimeStatusCache.get(taskId) ?? "todo";
+      // fn-732: the task sidecar now ALSO carries the runtime `approval`.
+      const approval = coerceApproval(raw.approval, (bad) => {
+        this.log(
+          `[plan-worker] invalid approval value in ${path}: ${JSON.stringify(bad)}; coercing to "pending"`,
+        );
+      });
+      const priorStatus = this.runtimeStatusCache.get(taskId) ?? "todo";
+      // A cache MISS reads as the committed-def value (the ladder fallback),
+      // not "pending"; compare against `undefined` so a first-observed approval
+      // that happens to match the def still re-emits if status also changed,
+      // and so flipping FROM the def fallback TO an equal sidecar value is a
+      // no-op-safe (the change-gate suppresses a byte-identical re-emit anyway).
+      const priorApproval = this.taskApprovalCache.get(taskId);
       this.runtimeStatusCache.set(taskId, runtimeStatus);
-      if (prior === runtimeStatus) {
-        // Same value as already cached: the composed TaskSnapshot wouldn't
+      this.taskApprovalCache.set(taskId, approval);
+      if (priorStatus === runtimeStatus && priorApproval === approval) {
+        // Both cached values unchanged: the composed TaskSnapshot wouldn't
         // change and the change-gate would suppress it anyway. Skip the
         // re-emit work.
         return false;
@@ -1316,13 +1553,51 @@ export class PlanScanner {
       return this.reemitTaskFromDef(defPath);
     }
 
+    // fn-732: epic-state sidecar (`.planctl/state/epics/<id>.state.json`)
+    // carries the runtime `approval`. Cache it + re-emit the EpicSnapshot
+    // composed against the committed def (which supplies every other field).
+    if (kind === "epic-state") {
+      const epicId = epicIdFromStatePath(path);
+      if (epicId === null) {
+        return false;
+      }
+      const raw = parsed as RawEpicState;
+      const approval = coerceApproval(raw.approval, (bad) => {
+        this.log(
+          `[plan-worker] invalid approval value in ${path}: ${JSON.stringify(bad)}; coercing to "pending"`,
+        );
+      });
+      const prior = this.epicApprovalCache.get(epicId);
+      this.epicApprovalCache.set(epicId, approval);
+      if (prior === approval) {
+        // Same cached value: the change-gate would suppress the re-emit anyway.
+        return false;
+      }
+      const defPath = epicDefPathFromStatePath(path);
+      if (defPath === null) {
+        return false;
+      }
+      // Gitignored sidecar — never in a commit file list, so the fn-629
+      // def-file gate inside `reemitEpicFromDef` stays in force on the DEF read.
+      return this.reemitEpicFromDef(defPath);
+    }
+
     // Pass the scanner's own `log` so a malformed `approval` field is logged
     // through the same sink as every other skip-and-log (stderr in production,
     // captured in tests). The build* functions stay pure otherwise — every
     // other coercion result is a return value, not a side effect.
+    //
+    // fn-732 ladder: thread the cached sidecar approval (the override) into the
+    // build* call. A cache miss (`undefined`) makes build* FALL BACK to the
+    // committed def's own `approval` field — the PERMANENT fallback that keeps
+    // approval resolvable before any sidecar exists.
     let msg: PlanEpicMessage | PlanTaskMessage | null;
     if (kind === "epic") {
-      msg = buildEpicMessage(parsed as RawEpic, this.log);
+      const raw = parsed as RawEpic;
+      const id = asString(raw.id);
+      const approvalOverride =
+        id !== null ? this.epicApprovalCache.get(id) : undefined;
+      msg = buildEpicMessage(raw, this.log, approvalOverride);
     } else {
       // `kind === "task"`: thread the cached runtime status (default `"todo"`
       // when never observed) so the composed TaskSnapshot carries the sidecar
@@ -1331,7 +1606,9 @@ export class PlanScanner {
       const id = asString(raw.id);
       const runtimeStatus =
         id !== null ? (this.runtimeStatusCache.get(id) ?? "todo") : "todo";
-      msg = buildTaskMessage(raw, runtimeStatus, this.log);
+      const approvalOverride =
+        id !== null ? this.taskApprovalCache.get(id) : undefined;
+      msg = buildTaskMessage(raw, runtimeStatus, this.log, approvalOverride);
     }
     if (msg === null) {
       // No usable id — can't key the projection. Skip-and-log.
@@ -1668,24 +1945,37 @@ export function isWithinRoots(
 /**
  * Build a `plan-epic` message from a parsed epic JSON, or null when the file
  * has no usable id (the projection pk). The number is derived from the id; every
- * other field is taken verbatim (coerced to string-or-null). `approval` rides
- * through {@link coerceApproval} — a missing value silently defaults to
- * `"pending"` (forward-compat with old planctl), an invalid one logs via `log`
- * and falls back to `"pending"` (the CLAUDE.md "safe value" invariant).
+ * other field is taken verbatim (coerced to string-or-null).
+ *
+ * `approval` resolves via the fn-732 PERMANENT ladder: the caller passes
+ * `approvalOverride` when the epic's gitignored runtime sidecar
+ * (`.planctl/state/epics/<id>.state.json`) has been observed (cache hit); on a
+ * cache miss it passes `undefined` and we FALL BACK to the committed def's own
+ * `approval` field. Either source rides through {@link coerceApproval} — a
+ * missing value silently defaults to `"pending"`, an invalid one logs via `log`
+ * and falls back to `"pending"` (the CLAUDE.md "safe value" invariant). The
+ * def-fallback is load-bearing and PERMANENT (it makes the parallel-change
+ * deploy order non-fragile): NEVER gate it away.
  */
 export function buildEpicMessage(
   raw: RawEpic,
   log: (msg: string) => void = (m) => console.error(m),
+  approvalOverride?: Approval,
 ): PlanEpicMessage | null {
   const id = asString(raw.id);
   if (id === null) {
     return null;
   }
-  const approval = coerceApproval(raw.approval, (bad) =>
-    log(
-      `[plan-worker] invalid approval value on epic ${id}: ${JSON.stringify(bad)}; coercing to "pending"`,
-    ),
-  );
+  // Ladder: sidecar cache (override) wins; on a miss, fall back to the
+  // committed def's `approval`. Both routes run through coerceApproval so a
+  // malformed value never throws and coerces to "pending".
+  const approval =
+    approvalOverride ??
+    coerceApproval(raw.approval, (bad) =>
+      log(
+        `[plan-worker] invalid approval value on epic ${id}: ${JSON.stringify(bad)}; coercing to "pending"`,
+      ),
+    );
   return {
     kind: "plan-epic",
     id,
@@ -1712,7 +2002,12 @@ export function buildEpicMessage(
  *   passed in by the caller (the {@link PlanScanner}, which caches the last
  *   per-task value). When absent / never-observed, the caller passes `"todo"`
  *   (planctl's `merge_task_state` default).
- * - `approval` follows the {@link buildEpicMessage} coercion semantics.
+ * - `approval` resolves via the fn-732 PERMANENT ladder (same as
+ *   {@link buildEpicMessage}): `approvalOverride` is the value cached from the
+ *   gitignored runtime sidecar (`.planctl/state/tasks/<id>.state.json`); on a
+ *   cache miss the caller passes `undefined` and we FALL BACK to the committed
+ *   def's own `approval` field. Both routes run through {@link coerceApproval}.
+ *   The def-fallback is PERMANENT — NEVER gate it away.
  *
  * The OBJECT-LITERAL SLOT ORDER below is load-bearing — the change-gate
  * compares `JSON.stringify` output byte-for-byte, and the seed reconstruction
@@ -1723,16 +2018,21 @@ export function buildTaskMessage(
   raw: RawTask,
   runtimeStatus: string = "todo",
   log: (msg: string) => void = (m) => console.error(m),
+  approvalOverride?: Approval,
 ): PlanTaskMessage | null {
   const id = asString(raw.id);
   if (id === null) {
     return null;
   }
-  const approval = coerceApproval(raw.approval, (bad) =>
-    log(
-      `[plan-worker] invalid approval value on task ${id}: ${JSON.stringify(bad)}; coercing to "pending"`,
-    ),
-  );
+  // Ladder: sidecar cache (override) wins; on a miss, fall back to the
+  // committed def's `approval`. See {@link buildEpicMessage}.
+  const approval =
+    approvalOverride ??
+    coerceApproval(raw.approval, (bad) =>
+      log(
+        `[plan-worker] invalid approval value on task ${id}: ${JSON.stringify(bad)}; coercing to "pending"`,
+      ),
+    );
   return {
     kind: "plan-task",
     id,
@@ -2058,12 +2358,18 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
 }
 
 /**
- * Enumerate one `.planctl` dir's `state/tasks/` + `epics/` + `tasks/` files
- * and run each through the scanner. A missing subdir is fine (skip). The
- * change-gate handles re-emit suppression.
+ * Enumerate one `.planctl` dir's `state/tasks/` + `state/epics/` + `epics/` +
+ * `tasks/` files and run each through the scanner. A missing subdir is fine
+ * (skip). The change-gate handles re-emit suppression.
  *
- * The `state/tasks/` pass runs FIRST so the per-task runtime-status cache is
- * primed before any task definition file is read: a state file existing at
+ * The two `state/` passes run FIRST so the per-task runtime-status cache AND
+ * the fn-732 approval caches (task + epic) are primed before any definition
+ * file is read — otherwise the first snapshot would reset approval to the
+ * committed-def fallback (or runtime_status to "todo") for the whole boot
+ * window. The `state/tasks/` pass also primes the task approval cache from the
+ * SAME file (the task sidecar carries both `status` and `approval`).
+ *
+ * The original rationale, for the runtime-status case: a state file existing at
  * daemon boot (planctl's `LocalFileStateStore` writes `<id>.state.json` on
  * every status transition) would otherwise be ignored until the next live
  * write touched it, and the projection's `runtime_status` would silently
@@ -2158,7 +2464,7 @@ function scanPlanctlDir(
     if (!parsed || typeof parsed !== "object") {
       continue;
     }
-    const raw = parsed as { status?: unknown };
+    const raw = parsed as { status?: unknown; approval?: unknown };
     let primed = true;
     const coerced = coerceRuntimeStatus(raw.status, (bad) => {
       // Match the live onChange arm: an invalid value logs and is SKIPPED
@@ -2169,10 +2475,93 @@ function scanPlanctlDir(
       );
       primed = false;
     });
+    if (primed) {
+      scanner.primeRuntimeStatus(taskId, coerced);
+    }
+    // fn-732: same file ALSO carries the runtime `approval`. Prime the task
+    // approval cache BEFORE the def enumeration so the first TaskSnapshot
+    // carries the sidecar value instead of falling back to the committed def.
+    // A malformed value logs + is SKIPPED (the ladder then falls back to the
+    // def), matching the live `task-state` arm's safe-value discipline.
+    let approvalPrimed = true;
+    const approval = coerceApproval(raw.approval, (bad) => {
+      console.error(
+        `[plan-worker] boot scan invalid approval in ${full}: ${JSON.stringify(bad)}; skipping cache prime`,
+      );
+      approvalPrimed = false;
+    });
+    if (approvalPrimed) {
+      scanner.primeTaskApproval(taskId, approval);
+    }
+  }
+
+  // Pass 1b: prime `epicApprovalCache` from `state/epics/*.state.json` (fn-732).
+  // Same write-only discipline as Pass 1; MUST run before the Pass-2 `epics/`
+  // enumeration so the first EpicSnapshot carries the sidecar approval. A
+  // missing dir is fine (no epic sidecars yet — the ladder falls back to the
+  // committed def). Malformed JSON / bad-approval / oversized files skip-and-log
+  // without poisoning the cache.
+  const epicStateDir = join(planctlDir, "state", "epics");
+  let epicStateNames: string[];
+  try {
+    epicStateNames = readdirSync(epicStateDir);
+  } catch {
+    epicStateNames = []; // No state/epics/ subdir — nothing to prime.
+  }
+  for (const name of epicStateNames) {
+    if (!name.endsWith(".state.json")) {
+      continue;
+    }
+    const epicId = name.slice(0, -".state.json".length);
+    if (epicId.length === 0) {
+      continue;
+    }
+    const full = join(epicStateDir, name);
+    let st: ReturnType<typeof statSync>;
+    try {
+      st = statSync(full);
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan stat failed for ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    if (!st.isFile() || st.size > MAX_PLAN_FILE_BYTES) {
+      continue;
+    }
+    let text: string;
+    try {
+      text = readFileSync(full, "utf8");
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan read failed for ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch (err) {
+      console.error(
+        `[plan-worker] boot scan malformed JSON in ${full}: ${stringifyErr(err)}`,
+      );
+      continue;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      continue;
+    }
+    const raw = parsed as { approval?: unknown };
+    let primed = true;
+    const approval = coerceApproval(raw.approval, (bad) => {
+      console.error(
+        `[plan-worker] boot scan invalid approval in ${full}: ${JSON.stringify(bad)}; skipping cache prime`,
+      );
+      primed = false;
+    });
     if (!primed) {
       continue;
     }
-    scanner.primeRuntimeStatus(taskId, coerced);
+    scanner.primeEpicApproval(epicId, approval);
   }
 
   // Pass 2: enumerate the canonical definition trees. Tasks now read the

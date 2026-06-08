@@ -65,12 +65,21 @@ shape because a consumer reads it.
 
 - **No general write path into the reducer.** The socket carries `query` (read)
   and `rpc` (mutate). RPC may write ONLY four surfaces, each of which round-trips
-  through a synthetic event so a re-fold sees it: (1) the `approval` field on
-  `.planctl` files, (2) `replay_dead_letter`, (3) `retry_dispatch`, (4)
-  `set_autopilot_paused`. RPC handlers MUST NOT write `jobs`/`epics`/etc directly.
+  through a synthetic event so a re-fold sees it: (1) the `approval` field, written
+  to the gitignored runtime sidecar `.planctl/state/{epics,tasks}/<id>.state.json`
+  (fn-732 — NOT the committed def), (2) `replay_dead_letter`, (3) `retry_dispatch`,
+  (4) `set_autopilot_paused`. RPC handlers MUST NOT write `jobs`/`epics`/etc directly.
 - **Plans are READ-ONLY except `approval`.** The plan worker folds
   `.planctl/{epics,tasks}` snapshots into `epics`; the only writable field is
-  `approval`.
+  `approval`. fn-732 moved `approval` out of the committed def into the gitignored
+  runtime sidecar (`.planctl/state/{epics,tasks}/<id>.state.json`) so keeper folds
+  it GATE-FREE (no commit on the critical path — eliminating the approve-fold lag).
+  The fold resolves approval via a PERMANENT ladder — **sidecar → committed def →
+  `pending`** — so approval stays resolvable on a keeper that predates a sidecar,
+  and the parallel-change deploy order (reader-first) is non-fragile. NEVER gate
+  away the def-fallback; it's the safety net the whole epic depends on. The
+  `set_{task,epic}_approval` RPC writes the sidecar (create-if-absent; task RMW
+  preserves the sidecar's status/claim fields; traversal-guarded).
 - **Sole-writer rules.** The hook writes hook events + per-pid dead-letters. Main
   writes all synthetic events + the `dead_letters` sidecar + the replay path.
   Workers feed the log only via main; they never write the DB themselves.

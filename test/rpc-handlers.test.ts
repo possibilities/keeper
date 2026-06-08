@@ -5,11 +5,18 @@
  * `KEEPER_CONFIG`, opens a writer DB against a separate tmpdir, calls the
  * handler directly, and asserts on the on-disk file + return value.
  *
+ * fn-732: the approval handlers now write the GITIGNORED runtime sidecar
+ * (`.planctl/state/{epics,tasks}/<id>.state.json`), create-if-absent + RMW
+ * preserving the sidecar's existing fields, and LEAVE THE COMMITTED DEF
+ * UNTOUCHED. The handler still resolves the committed def first (to prove the
+ * entity exists + locate the owning `.planctl`); the sidecar is derived from
+ * that resolved path. The keeper read-side folds approval from the sidecar
+ * gate-free with a permanent fallback to the def — see `src/plan-worker.ts`.
+ *
  * The end-to-end "CLI → daemon → RPC → file" smoke lives in
  * `test/integration.test.ts`. These tests prove the handler's contract
  * against the canonical planctl serializer (`serializePlanctlJson` in
- * `src/db.ts`) — task `.1` of the fn-592-approval-as-planctl-field epic
- * locked the byte-for-byte form.
+ * `src/db.ts`).
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
@@ -31,6 +38,7 @@ import {
   setAutopilotPausedHandler,
   setEpicApprovalHandler,
   setTaskApprovalHandler,
+  sidecarPathFromDef,
 } from "../src/rpc-handlers";
 import { BadParamsError, type ReplayBridge } from "../src/server-worker";
 
@@ -121,16 +129,25 @@ function seedTask(id: string, extra: Record<string, unknown> = {}): string {
   return path;
 }
 
+/** Absolute path to the epic approval sidecar for `id` under this plan root. */
+function epicSidecarPath(id: string): string {
+  return join(planRoot, ".planctl", "state", "epics", `${id}.state.json`);
+}
+
+/** Absolute path to the task approval sidecar for `id` under this plan root. */
+function taskSidecarPath(id: string): string {
+  return join(planRoot, ".planctl", "state", "tasks", `${id}.state.json`);
+}
+
 // ---------------------------------------------------------------------------
-// Happy paths: set_task_approval / set_epic_approval
+// Happy paths: set_task_approval / set_epic_approval (fn-732 → sidecar writes)
 // ---------------------------------------------------------------------------
 
-test("set_task_approval writes the field, preserves every other field, byte-identical to planctl serializer", () => {
+test("set_task_approval writes the SIDECAR (create-if-absent), leaves the committed def UNTOUCHED (fn-732)", () => {
   const { db } = openDb(dbPath, { readonly: false });
   try {
-    const path = seedTask("fn-1.2", { extra_field: "preserved" });
-    const before = readFileSync(path, "utf8");
-    const beforeObj = JSON.parse(before) as Record<string, unknown>;
+    const defPath = seedTask("fn-1.2", { extra_field: "preserved" });
+    const defBefore = readFileSync(defPath, "utf8");
 
     const result = setTaskApprovalHandler(db, {
       epic_id: "fn-1",
@@ -145,36 +162,67 @@ test("set_task_approval writes the field, preserves every other field, byte-iden
       approval: "approved",
     });
 
-    const after = readFileSync(path, "utf8");
+    // The COMMITTED def is byte-identical — no approval write landed there.
+    expect(readFileSync(defPath, "utf8")).toBe(defBefore);
+    expect((JSON.parse(defBefore) as Record<string, unknown>).approval).toBe(
+      undefined,
+    );
+
+    // The SIDECAR was created and carries approval, in the canonical form.
+    const sidecar = taskSidecarPath("fn-1.2");
+    const after = readFileSync(sidecar, "utf8");
     const afterObj = JSON.parse(after) as Record<string, unknown>;
     expect(afterObj.approval).toBe("approved");
-
-    // Every prior field preserved.
-    for (const [k, v] of Object.entries(beforeObj)) {
-      expect(afterObj[k]).toEqual(v);
-    }
-    // Plus extra_field survived (forward-compat).
-    expect(afterObj.extra_field).toBe("preserved");
-
-    // Byte-identical to a fresh serializer pass on the post-mutation object.
-    const expected = serializePlanctlJson({
-      ...beforeObj,
-      approval: "approved",
-    });
-    expect(after).toBe(expected);
+    expect(after).toBe(serializePlanctlJson({ approval: "approved" }));
   } finally {
     db.close();
   }
 });
 
-test("set_epic_approval writes the field, preserves every other field", () => {
+test("set_task_approval RMW preserves the sidecar's existing runtime fields (status/claim) (fn-732)", () => {
   const { db } = openDb(dbPath, { readonly: false });
   try {
-    const path = seedEpic("fn-1", { unknown_key: 42 });
-    const before = JSON.parse(readFileSync(path, "utf8")) as Record<
+    seedTask("fn-1.4");
+    // Pre-existing sidecar with planctl runtime fields (the LocalFileStateStore
+    // shape) — the RMW must keep them and only set `approval`.
+    const sidecar = taskSidecarPath("fn-1.4");
+    mkdirSync(join(planRoot, ".planctl", "state", "tasks"), {
+      recursive: true,
+    });
+    writeFileSync(
+      sidecar,
+      serializePlanctlJson({
+        status: "done",
+        assignee: "worker-7",
+        evidence: ["x"],
+      }),
+    );
+
+    setTaskApprovalHandler(db, {
+      epic_id: "fn-1",
+      task_id: "fn-1.4",
+      status: "approved",
+    });
+
+    const obj = JSON.parse(readFileSync(sidecar, "utf8")) as Record<
       string,
       unknown
     >;
+    expect(obj.approval).toBe("approved");
+    // Every prior runtime field preserved.
+    expect(obj.status).toBe("done");
+    expect(obj.assignee).toBe("worker-7");
+    expect(obj.evidence).toEqual(["x"]);
+  } finally {
+    db.close();
+  }
+});
+
+test("set_epic_approval writes the SIDECAR, leaves the committed def UNTOUCHED (fn-732)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  try {
+    const defPath = seedEpic("fn-1", { unknown_key: 42 });
+    const defBefore = readFileSync(defPath, "utf8");
 
     const result = setEpicApprovalHandler(db, {
       epic_id: "fn-1",
@@ -183,30 +231,43 @@ test("set_epic_approval writes the field, preserves every other field", () => {
 
     expect(result).toEqual({ ok: true, epic_id: "fn-1", approval: "rejected" });
 
-    const after = JSON.parse(readFileSync(path, "utf8")) as Record<
+    // Committed def untouched.
+    expect(readFileSync(defPath, "utf8")).toBe(defBefore);
+
+    // Sidecar created with approval.
+    const sidecar = epicSidecarPath("fn-1");
+    const obj = JSON.parse(readFileSync(sidecar, "utf8")) as Record<
       string,
       unknown
     >;
-    expect(after.approval).toBe("rejected");
-    expect(after.unknown_key).toBe(42);
-    for (const [k, v] of Object.entries(before)) {
-      expect(after[k]).toEqual(v);
-    }
+    expect(obj.approval).toBe("rejected");
   } finally {
     db.close();
   }
 });
 
-test("set_task_approval overwrites an existing approval value", () => {
+test("sidecarPathFromDef maps a committed def path to its runtime sidecar (fn-732)", () => {
+  const defT = join(planRoot, ".planctl", "tasks", "fn-1.2.json");
+  expect(sidecarPathFromDef(defT, "tasks")).toBe(
+    join(planRoot, ".planctl", "state", "tasks", "fn-1.2.state.json"),
+  );
+  const defE = join(planRoot, ".planctl", "epics", "fn-1.json");
+  expect(sidecarPathFromDef(defE, "epics")).toBe(
+    join(planRoot, ".planctl", "state", "epics", "fn-1.state.json"),
+  );
+});
+
+test("set_task_approval overwrites an existing sidecar approval value (fn-732)", () => {
   const { db } = openDb(dbPath, { readonly: false });
   try {
-    const path = seedTask("fn-1.3", { approval: "pending" });
+    seedTask("fn-1.3");
+    const sidecar = taskSidecarPath("fn-1.3");
     setTaskApprovalHandler(db, {
       epic_id: "fn-1",
       task_id: "fn-1.3",
       status: "rejected",
     });
-    const obj = JSON.parse(readFileSync(path, "utf8")) as Record<
+    const obj = JSON.parse(readFileSync(sidecar, "utf8")) as Record<
       string,
       unknown
     >;
@@ -218,7 +279,7 @@ test("set_task_approval overwrites an existing approval value", () => {
       task_id: "fn-1.3",
       status: "approved",
     });
-    const obj2 = JSON.parse(readFileSync(path, "utf8")) as Record<
+    const obj2 = JSON.parse(readFileSync(sidecar, "utf8")) as Record<
       string,
       unknown
     >;
@@ -242,10 +303,11 @@ test("set_epic_approval accepts pending status", () => {
   }
 });
 
-test("back-to-back same-file writes both succeed; last write wins", () => {
+test("back-to-back same-file writes both succeed; last write wins (fn-732 sidecar)", () => {
   const { db } = openDb(dbPath, { readonly: false });
   try {
-    const path = seedTask("fn-1.5");
+    seedTask("fn-1.5");
+    const sidecar = taskSidecarPath("fn-1.5");
     // Two writes in quick succession (synchronous handler — JS single-thread
     // serializes them naturally; spec calls out per-file single-flight).
     setTaskApprovalHandler(db, {
@@ -258,7 +320,7 @@ test("back-to-back same-file writes both succeed; last write wins", () => {
       task_id: "fn-1.5",
       status: "rejected",
     });
-    const obj = JSON.parse(readFileSync(path, "utf8")) as Record<
+    const obj = JSON.parse(readFileSync(sidecar, "utf8")) as Record<
       string,
       unknown
     >;
@@ -272,7 +334,7 @@ test("back-to-back same-file writes both succeed; last write wins", () => {
 // Atomic write: temp file goes through rename, no `.tmp` lingers
 // ---------------------------------------------------------------------------
 
-test("set_task_approval leaves no `.tmp` files behind after a successful write", () => {
+test("set_task_approval leaves no `.tmp` files behind after a successful sidecar write (fn-732)", () => {
   const { db } = openDb(dbPath, { readonly: false });
   try {
     seedTask("fn-1.7");
@@ -282,10 +344,11 @@ test("set_task_approval leaves no `.tmp` files behind after a successful write",
       status: "approved",
     });
     const { readdirSync } = require("node:fs") as typeof import("node:fs");
-    const names = readdirSync(tasksDir);
+    const stateTasksDir = join(planRoot, ".planctl", "state", "tasks");
+    const names = readdirSync(stateTasksDir);
     expect(names.some((n) => n.includes(".tmp."))).toBe(false);
-    // The canonical file is there.
-    expect(names).toContain("fn-1.7.json");
+    // The canonical sidecar file is there.
+    expect(names).toContain("fn-1.7.state.json");
   } finally {
     db.close();
   }

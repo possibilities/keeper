@@ -625,11 +625,12 @@ test("end-to-end: UDS subscribe server — query→result, then patch after a fo
   expect(existsSync(sockPath)).toBe(false);
 }, 30000);
 
-test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_approval rewrites the epic file", async () => {
+test("end-to-end: set_task_approval / set_epic_approval RPC → atomic SIDECAR write, committed def untouched (fn-732)", async () => {
   // Hermetic plan tree: write two real planctl files into the tmp planRoot
   // so the daemon's plan worker can see them via @parcel/watcher (the
   // watcher path is exercised more thoroughly in plan-worker.test.ts; here
-  // we just prove the RPC writes the file with the right shape).
+  // we just prove the RPC writes the gitignored runtime SIDECAR with the right
+  // shape and LEAVES THE COMMITTED DEF UNTOUCHED (fn-732 retarget).
   const { mkdirSync, readFileSync, writeFileSync } =
     require("node:fs") as typeof import("node:fs");
   const { serializePlanctlJson } =
@@ -720,7 +721,22 @@ test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_a
     });
   }
 
-  // --- set_task_approval: rewrites the task file's `approval` field. ---
+  const taskSidecarPath = join(
+    planRoot,
+    ".planctl",
+    "state",
+    "tasks",
+    "fn-99-rpc-e2e.1.state.json",
+  );
+  const epicSidecarPath = join(
+    planRoot,
+    ".planctl",
+    "state",
+    "epics",
+    "fn-99-rpc-e2e.state.json",
+  );
+
+  // --- set_task_approval: writes the task SIDECAR's `approval` field. ---
   const taskResult = (await rpc("set_task_approval", {
     epic_id: "fn-99-rpc-e2e",
     task_id: "fn-99-rpc-e2e.1",
@@ -732,14 +748,20 @@ test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_a
     task_id: "fn-99-rpc-e2e.1",
     approval: "approved",
   });
-  const taskAfter = JSON.parse(readFileSync(taskPath, "utf8")) as {
+  // Sidecar carries the approval.
+  const taskSidecar = JSON.parse(readFileSync(taskSidecarPath, "utf8")) as {
+    approval: string;
+  };
+  expect(taskSidecar.approval).toBe("approved");
+  // Committed def is UNTOUCHED — still `pending`, title intact.
+  const taskDefAfter = JSON.parse(readFileSync(taskPath, "utf8")) as {
     approval: string;
     title: string;
   };
-  expect(taskAfter.approval).toBe("approved");
-  expect(taskAfter.title).toBe("T1");
+  expect(taskDefAfter.approval).toBe("pending");
+  expect(taskDefAfter.title).toBe("T1");
 
-  // --- set_epic_approval: rewrites the epic file's `approval` field. ---
+  // --- set_epic_approval: writes the epic SIDECAR's `approval` field. ---
   const epicResult = (await rpc("set_epic_approval", {
     epic_id: "fn-99-rpc-e2e",
     status: "rejected",
@@ -749,12 +771,17 @@ test("end-to-end: set_task_approval RPC → atomic plan-file rewrite, set_epic_a
     epic_id: "fn-99-rpc-e2e",
     approval: "rejected",
   });
-  const epicAfter = JSON.parse(readFileSync(epicPath, "utf8")) as {
+  const epicSidecar = JSON.parse(readFileSync(epicSidecarPath, "utf8")) as {
+    approval: string;
+  };
+  expect(epicSidecar.approval).toBe("rejected");
+  // Committed def untouched.
+  const epicDefAfter = JSON.parse(readFileSync(epicPath, "utf8")) as {
     approval: string;
     title: string;
   };
-  expect(epicAfter.approval).toBe("rejected");
-  expect(epicAfter.title).toBe("RPC E2E");
+  expect(epicDefAfter.approval).toBe("pending");
+  expect(epicDefAfter.title).toBe("RPC E2E");
 
   // --- bad enum: server returns `bad_params`, the connection survives. ---
   try {
