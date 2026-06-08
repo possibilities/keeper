@@ -4,10 +4,11 @@
   "bundles": [],
   "created_at": "2026-06-07T22:14:25.303603Z",
   "depends_on_epics": [
-    "fn-732-move-approval-to-runtime-sidecar"
+    "fn-732-move-approval-to-runtime-sidecar",
+    "fn-735-autopilot-redispatch-cooldown-guard"
   ],
   "id": "fn-734-two-condition-approve-dispatch-discharge",
-  "last_validated_at": "2026-06-07T22:14:25.398616Z",
+  "last_validated_at": "2026-06-08T02:58:41.611225Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -16,5 +17,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-07T22:14:25.303603Z"
+  "updated_at": "2026-06-08T02:58:41.580570Z"
 }
