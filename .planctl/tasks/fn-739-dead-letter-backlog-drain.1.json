@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Triage, drain, and diagnose the dead-letter backlog",
-  "updated_at": "2026-06-08T04:43:19.235152Z"
+  "updated_at": "2026-06-08T11:29:04.818917Z",
+  "worker_done_at": "2026-06-08T11:29:04.818917Z"
 }
