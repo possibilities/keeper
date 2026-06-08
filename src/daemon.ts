@@ -122,6 +122,11 @@ import type {
   GitWorkerData,
   GitWorkerMessage,
 } from "./git-worker";
+import {
+  INTEGRITY_PROBE_INTERVAL_MS,
+  liveIntegrityProbeDeps,
+  runIntegrityProbe,
+} from "./integrity-probe";
 import type {
   PlanctlCommitChangedMessage,
   PlanWorkerData,
@@ -3549,6 +3554,26 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }, WAL_CHECKPOINT_INTERVAL_MS);
 
+  // fn-746 .1 — periodic SQLite integrity probe. Proactively catches the
+  // 2026-06-07 "database disk image is malformed" class on the ~2 GB DB, which
+  // previously surfaced only when a query happened to hit a bad page. Runs a
+  // bounded `PRAGMA quick_check` on a DEDICATED short-lived READ-ONLY connection
+  // (opened + closed per probe inside `liveQuickCheck`) — read-only never takes
+  // the writer lock, so the probe can NEVER starve the daemon's sole writer or a
+  // concurrent hook INSERT. Producer-side health check: reads no projection,
+  // writes nothing, mints no synthetic event, never inside a fold — re-fold
+  // determinism and the sole-writer rules are untouched. Its only side effect is
+  // an out-of-band Telegram page (the "Keeper" topic) on failure; a healthy
+  // probe is silent. Never-throws out (the probe runner degrades internally),
+  // matching the compaction / checkpoint timers. Stored so shutdown can clear it
+  // (an outstanding timer pins a ref on the main loop). The cadence is slack
+  // (15 min) so the bounded structural sweep is steady-state negligible.
+  const integrityProbeDeps = liveIntegrityProbeDeps(dbPath);
+  const integrityProbeTimer = setInterval(() => {
+    if (shuttingDown) return;
+    runIntegrityProbe(integrityProbeDeps);
+  }, INTEGRITY_PROBE_INTERVAL_MS);
+
   // fn-749: crash-handler guard — wired only when the worker was selected.
   if (autopilotWorkerInstance) {
     const aw = autopilotWorkerInstance;
@@ -3677,6 +3702,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // fn-744 .2 — clear the steady-state checkpoint heartbeat so a PASSIVE
     // checkpoint can't fire into the writer connection mid-teardown.
     clearInterval(walCheckpointTimer);
+    // fn-746 .1 — clear the integrity probe heartbeat. The probe uses its own
+    // short-lived read-only connection (never the writer), so this is purely
+    // timer hygiene — an outstanding timer would pin a ref on the main loop and
+    // hang teardown at the shutdown deadline.
+    clearInterval(integrityProbeTimer);
 
     // fn-749: the set of workers actually spawned this boot (filter out the
     // `null`s for any unselected worker). Teardown iterates THIS list, so a
