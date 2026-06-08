@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Drop the data_version snapshot fan-out arm",
-  "updated_at": "2026-06-08T17:33:34.056128Z"
+  "updated_at": "2026-06-08T23:42:21.135098Z",
+  "worker_done_at": "2026-06-08T23:42:21.135098Z"
 }

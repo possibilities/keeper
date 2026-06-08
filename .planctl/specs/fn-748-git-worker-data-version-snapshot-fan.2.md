@@ -55,5 +55,5 @@ does not fan to B/C/D) lands in .3 against the live/sandboxed daemon.
 - [ ] No new DB write / synthetic event / RPC; kick contract + membership-reconcile-on-advance preserved (producer-side, read-only DB).
 
 ## Done summary
-
+Removed the data_version snapshot fan-out: decideDataVersionWake now returns {reconcile} only and drives O(1) membership reconcile, never an O(roots) per-root snapshot. Deleted the poll-loop fan-out branch, the dead DATA_VERSION_SCHEDULE_FLOOR_MS floor, and lastDataVersionScheduleAtMs; kept lastDataVersion. Per-root snapshots now come solely from worktree+git-dir FSEvents subs + the 60s heartbeat. JSDoc/module docblock and the five pinned tests rewritten in lockstep; bun test green (123 pass).
 ## Evidence
