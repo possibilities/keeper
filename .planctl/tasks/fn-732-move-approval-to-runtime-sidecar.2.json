@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "planctl one-shot approval backfill+strip script",
-  "updated_at": "2026-06-08T00:23:54.451565Z"
+  "updated_at": "2026-06-08T02:20:58.890680Z",
+  "worker_done_at": "2026-06-08T02:20:58.890680Z"
 }

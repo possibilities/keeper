@@ -48,5 +48,5 @@ strip pops def approval clean.
 - [ ] pytest green
 
 ## Done summary
-
+Made planctl approve runtime-state-only: it writes only the gitignored sidecar and emits a read-only invocation (no commit), mirroring claim/block. Added scripts/migrate_approval_to_sidecar.py — idempotent fill-if-absent SEED (def -> sidecar) plus a gated --strip that pops def approval after a positive verify, both with --dry-run. Updated docs to reclassify approve. The verify gate and live --strip run are human-executed.
 ## Evidence
