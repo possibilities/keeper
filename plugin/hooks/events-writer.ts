@@ -1,30 +1,16 @@
 #!/usr/bin/env bun
 /**
  * Keeper events writer hook. Invoked by Claude Code once per hook event with
- * the payload on stdin. Appends a single per-pid NDJSON line under the keeper
- * events-log dir and exits — the daemon-side ingester (`scanEventsLogDir` in
- * `src/daemon.ts`) tails those files and lands each line as a real `events`
- * row, where the existing `drain()`/`applyEvent()` fold reads it unchanged
- * (fn-736: the lock-free events path).
- *
- * The hook NO LONGER opens SQLite. It used to `openDb`→`INSERT INTO events`→
- * `db.close()` on every fire, importing the 6.5k-line `src/db.ts` (~11ms parse)
- * just for `openDb`/`resolveDbPath` and paying ~7.5ms for the connection +
- * pragmas + `BEGIN IMMEDIATE` + insert, serializing under WAL (60→343ms at
- * 1→16 concurrent writers). The per-pid append is lock-free, contention-flat,
- * and drops the `db.ts`/`bun:sqlite` import entirely (~22.5ms → ~6–10ms/call).
+ * the payload on stdin. Writes a single row to the `events` table and exits.
  *
  * Hard guarantees:
- * - **Always exit 0** — even on parse failure, append failure, or any thrown
+ * - **Always exit 0** — even on parse failure, DB failure, or any thrown
  *   exception. Per the epic's locked decision: a hook MUST NOT block Claude.
  *   Losing one event row is acceptable; wedging the agent is not. Errors log
  *   to stderr so they surface in `claude --debug` output.
- * - **Minimal import graph** — only `node:fs`/`node:os`/`node:path`, the local
- *   dep-free `src/dead-letter.ts` serializers, and the pure `src/derivers.ts` /
- *   `src/exec-backend.ts` helpers. NO `bun:sqlite`, NO `src/db.ts`. Bun cold
- *   start is ~30ms and the SessionEnd hook has a 1.5s timeout cap; every extra
- *   import is borrowed from that budget, and `src/db.ts` was the single biggest
- *   line item.
+ * - **Minimal import graph** — only `bun:sqlite` (via `src/db.ts`) and the
+ *   local resolver. Bun cold start is ~30ms and the SessionEnd hook has a
+ *   1.5s timeout cap; every extra import is borrowed from that budget.
  * - **`pid = process.ppid`** — matches `os.getppid()` semantics in the
  *   reference python hook. Pairs with `start_time` (captured on SessionStart
  *   only) as a recycle-safe `(pid, start_time)` two-field identity: the bare
@@ -41,15 +27,12 @@
 import { appendFileSync, chmodSync, mkdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { openDb, resolveDbPath } from "../../src/db";
 import type {
   DeadLetterBindings,
   DeadLetterRecord,
-  EventLogRecord,
 } from "../../src/dead-letter";
-import {
-  serializeDeadLetterRecord,
-  serializeEventLogRecord,
-} from "../../src/dead-letter";
+import { serializeDeadLetterRecord } from "../../src/dead-letter";
 import {
   extractBackgroundTaskId,
   extractBashMutation,
@@ -414,27 +397,41 @@ function resolveDeadLetterDir(): string {
 }
 
 /**
- * Resolve the keeper events-log directory (fn-736). `KEEPER_EVENTS_LOG` env
- * wins (hermetic tests point it at a tmp dir, mirroring the daemon's matching
- * override); otherwise default to `~/.local/state/keeper/events-log`, a sibling
- * of the DB file.
- *
- * This is the lock-free-events path's happy-path destination: instead of
- * opening SQLite, the hook appends a per-pid `<pid>.ndjson` line here and the
- * daemon's ingester tails the files and lands each line as a real `events` row.
- * MUST match `resolveEventsLogDir` in `src/db.ts` byte-for-byte — the hook
- * keeps its own local copy because it is FORBIDDEN from importing `bun:sqlite`
- * (CLAUDE.md "No third-party deps in the hook"); `src/db.ts` carries the
- * daemon-side duplicate. The shared dep-free `serializeEventLogRecord`
- * structurally enforces the byte-identical line round-trip between the two
- * sides.
+ * `SQLITE_BUSY` / `SQLITE_LOCKED` predicate. The bun:sqlite error carries
+ * BOTH `.code` (e.g. `"SQLITE_BUSY"`) and a libsqlite-style `.message`
+ * containing `"database is locked"`. Check both — the message text is the
+ * stable cross-binding shape and `.code` may shift across bun versions.
+ * `SQLITE_BUSY_SNAPSHOT` and every other error are NOT retriable: the
+ * `BEGIN IMMEDIATE` already avoids the lock-upgrade snapshot path and the
+ * caller goes straight to dead-letter on anything else.
  */
-function resolveEventsLogDir(): string {
-  const override = process.env.KEEPER_EVENTS_LOG;
-  if (override && override.length > 0) {
-    return override;
+function isRetriableLockError(err: unknown): boolean {
+  if (err === null || typeof err !== "object") {
+    return false;
   }
-  return join(homedir(), ".local", "state", "keeper", "events-log");
+  const e = err as { code?: unknown; message?: unknown };
+  const code = typeof e.code === "string" ? e.code : "";
+  const message = typeof e.message === "string" ? e.message : "";
+  // `SQLITE_BUSY_SNAPSHOT` is NOT retriable (the BEGIN IMMEDIATE path avoids
+  // it; if it surfaces anyway, dead-letter immediately).
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") {
+    return true;
+  }
+  return message.includes("database is locked");
+}
+
+/**
+ * Synchronous sleep for `ms` milliseconds. The hook runs without an event
+ * loop after `main()` returns control, so `setTimeout` is unavailable inside
+ * the retry path. `Atomics.wait` on a fresh, zero-initialized SharedArrayBuffer
+ * blocks the current thread for up to the timeout — no event loop required.
+ * The wait always returns `"timed-out"` since nothing else holds a handle to
+ * the buffer to notify.
+ */
+function sleepSync(ms: number): void {
+  const buf = new SharedArrayBuffer(4);
+  const view = new Int32Array(buf);
+  Atomics.wait(view, 0, 0, ms);
 }
 
 /**
@@ -473,78 +470,11 @@ function writeDeadLetter(record: DeadLetterRecord): void {
 }
 
 /**
- * Append-one-line write of an events-log record to the per-pid NDJSON file
- * (fn-736 — the lock-free happy path that replaced the SQLite INSERT). Returns
- * `true` on a durable append, `false` on hard failure (the caller then
- * dead-letters so the event is not silently lost).
- *
- * Mirrors {@link writeDeadLetter}'s per-pid discipline exactly: 0o700 dir, a
- * single `appendFileSync` (one `write(2)`) per complete `\n`-terminated line,
- * best-effort 0o600 chmod, NO fsync (SQLite WAL is the durability boundary; the
- * ingester re-reads from a durable byte-offset so a lost-buffer crash is
- * lag-not-loss). The per-pid filename (`<pid>.ndjson`) is the interleave
- * guard — events-log lines CAN exceed the ~256 B APFS O_APPEND non-interleave
- * window (a Stop event's `data` blob is large), and exactly one writer per file
- * makes that safe.
- *
- * Failure handling: a first `appendFileSync` that throws `ENOENT` is almost
- * always a mkdir race (the dir was reaped between our mkdir and the append, or
- * a concurrent prune) — re-mkdir once and retry the single append. Any OTHER
- * error (EACCES, ENOSPC, EROFS, …) or a still-failing ENOENT retry returns
- * `false`; the caller routes the event to the dead-letter recovery path so the
- * daemon's existing dead-letter import + replay recovers it. The hook never
- * throws past this helper — the exit-0 contract holds regardless.
+ * Hook-local `busy_timeout` (ms). Lower than the shared 5s `applyPragmas`
+ * value because the hook lives inside Claude's SessionEnd 1.5s budget. Named
+ * so the diagnostic drop-log can report the value the hook actually waited on.
  */
-function writeEventLog(record: EventLogRecord): boolean {
-  const dir = resolveEventsLogDir();
-  const file = join(dir, `${process.pid}.ndjson`);
-  const line = serializeEventLogRecord(record);
-  const ensureDir = (): void => {
-    try {
-      mkdirSync(dir, { recursive: true, mode: 0o700 });
-    } catch {
-      // Recursive mkdir is idempotent on absence; an existing dir with a
-      // different mode throws harmlessly here. The append below is the real
-      // success signal.
-    }
-  };
-  try {
-    ensureDir();
-    appendFileSync(file, line);
-  } catch (err) {
-    // ENOENT after our mkdir is a dir-reaped-mid-write race — re-create the
-    // dir and retry the single append exactly once. Every other errno
-    // (EACCES / ENOSPC / EROFS / …) is a hard failure: fall through to the
-    // dead-letter path below.
-    const code = (err as { code?: unknown }).code;
-    if (code === "ENOENT") {
-      try {
-        ensureDir();
-        appendFileSync(file, line);
-      } catch (retryErr) {
-        process.stderr.write(
-          `keeper events-writer: events-log append failed (ENOENT retry): ${retryErr}\n`,
-        );
-        return false;
-      }
-    } else {
-      process.stderr.write(
-        `keeper events-writer: events-log append failed: ${err}\n`,
-      );
-      return false;
-    }
-  }
-  // chmod best-effort 0o600 — the serialized bindings can carry prompt text and
-  // file paths the user reasonably considers private. A failure here does NOT
-  // un-write the line, so it does not flip the success return.
-  try {
-    chmodSync(file, 0o600);
-  } catch {
-    // The file may have been created by a prior hook whose process can't chmod
-    // it now; the data is still on disk and ingestible.
-  }
-  return true;
-}
+const HOOK_BUSY_TIMEOUT_MS = 1200;
 
 /**
  * The full set of `events`-column names the hook knows how to populate.
@@ -553,11 +483,11 @@ function writeEventLog(record: EventLogRecord): boolean {
  * below — every key here is the bare column name (no `$` prefix); every
  * value in `insertBindings` is prefixed `$col`.
  *
- * The daemon-side ingester (fn-736 `scanEventsLogDir`) takes the intersection
- * of the per-pid NDJSON record's bindings with the live DB's `events` columns
- * (post-migrate, race-free) and binds only the survivors. A column the live DB
- * lacks — because the daemon (sole migrator) hasn't applied a fresh
- * `ALTER TABLE` yet — is simply omitted from the INSERT and lands
+ * The adaptive INSERT (fn-669) takes the intersection of this set with
+ * the live DB's `events` columns (probed once per invocation via
+ * `PRAGMA table_info('events')`) and binds only the survivors. A column
+ * the live DB lacks — because the daemon (sole migrator) hasn't applied a
+ * fresh `ALTER TABLE` yet — is simply omitted from the INSERT and lands
  * NULL after migration runs; identical to the deriver's zero-event value.
  * This turns the schema-bump-deploy-skew window from a total-drop into a
  * lossless-degraded one (~78-row whole-feed drop on the 2026-06-01 v48
@@ -858,21 +788,21 @@ async function main(): Promise<void> {
     $background_task_id: backgroundTaskId,
   };
 
-  // Dead-letter on events-log APPEND failure (fn-736 — repurposed from the
-  // fn-643 INSERT-failure fallback). The happy path is now `writeEventLog`
-  // (a per-pid NDJSON append); when THAT fails hard (EACCES / ENOSPC / EROFS /
-  // ENOENT-after-retry), this closure routes the event to the dead-letter
-  // recovery file so the daemon's existing dead-letter import + replay path
-  // recovers it — the event is never silently lost. The closure captures the
-  // resolved `insertBindings` + envelope fields once; it fires from at most one
-  // call site post-bindings, so the on-disk `dl_id` is unique per dropped
-  // event. Inline (not an outer helper) so it closes over the resolved bindings
-  // and the SessionStart-scraped fields without re-plumbing them through a long
-  // argument list.
-  const deadLetter = (lastError: unknown): void => {
-    // Bare-column bindings (strip the `$` prefix the events-log/INSERT path
-    // uses) so the daemon-side dead-letter import / replay can map it 1:1 to
-    // the `events` columns.
+  // Dead-letter on FINAL INSERT failure (fn-643 task .2). The closure
+  // captures the resolved `insertBindings` + envelope fields once; the call
+  // site fires it after `openDb` failure OR after the bounded retry has
+  // exhausted. The hook ALWAYS reaches one of those two call sites
+  // post-bindings, never both, so the on-disk dl_id is unique per dropped
+  // INSERT. Inline (not an outer helper) so it closes over the resolved
+  // bindings and the SessionStart-scraped fields without re-plumbing them
+  // through a long argument list.
+  const deadLetter = (
+    lastError: unknown,
+    diag?: { attempts: number; wait_ms: number },
+  ): void => {
+    // Bare-column bindings (strip the `$` prefix the prepared-statement
+    // uses) so the daemon-side import (task .3) can map it 1:1 to the
+    // `events` columns on a future replay.
     const bindings: DeadLetterBindings = {};
     for (const [key, value] of Object.entries(insertBindings)) {
       const column = key.startsWith("$") ? key.slice(1) : key;
@@ -889,9 +819,10 @@ async function main(): Promise<void> {
     };
     writeDeadLetter(record);
     // Diagnostic drop-log (instrumentation, SEPARATE from the recovery record
-    // above): capture WHY the append failed, so drop bursts can be attributed
-    // to a cause (ENOSPC / EACCES / other) and time-correlated with the
-    // daemon's traces. Best-effort — never affects the hook outcome.
+    // above): capture WHY the INSERT failed and how long the hook waited, so
+    // drop bursts can be attributed to a cause (SQLITE_BUSY contention vs
+    // schema-mismatch vs other) and time-correlated with the daemon's
+    // `[fold-slow]` trace. Best-effort — never affects the hook outcome.
     try {
       const e = lastError as { code?: unknown; message?: unknown } | null;
       writeDropLog(
@@ -900,12 +831,15 @@ async function main(): Promise<void> {
           hook_event: hookEvent,
           session_id: sessionId,
           pid,
-          phase: "events_log_append",
+          phase: diag != null ? "insert" : "open",
           error_code: typeof e?.code === "string" ? e.code : null,
           error_message: (typeof e?.message === "string"
             ? e.message
             : String(lastError)
           ).slice(0, 300),
+          attempts: diag?.attempts ?? 0,
+          wait_ms: diag?.wait_ms ?? 0,
+          busy_timeout_ms: HOOK_BUSY_TIMEOUT_MS,
         })}\n`,
       );
     } catch {
@@ -914,30 +848,152 @@ async function main(): Promise<void> {
     // Surface the underlying cause to stderr too — useful in
     // `claude --debug` output for diagnosing recurring drops.
     process.stderr.write(
-      `keeper events-writer: events-log append failed (dead-lettered): ${lastError}\n`,
+      `keeper events-writer: INSERT failed (dead-lettered): ${lastError}\n`,
     );
   };
 
-  // Build the events-log record from the resolved bindings (strip the `$`
-  // prefix every key carries — the on-disk shape is bare column names, matching
-  // `DeadLetterBindings` / the daemon ingester's `INSERT INTO events`). This is
-  // the lock-free happy path (fn-736): no SQLite open, no PRAGMA probe, no
-  // BEGIN IMMEDIATE — just a single per-pid append. The daemon's ingester
-  // (`scanEventsLogDir`) intersects these bindings with the live `events`
-  // columns at ingest time, so the column-skew degrade fn-669 handled in the
-  // hook now lives entirely daemon-side (post-migrate, race-free).
-  const eventLogBindings: DeadLetterBindings = {};
-  for (const [key, value] of Object.entries(insertBindings)) {
-    const column = key.startsWith("$") ? key.slice(1) : key;
-    eventLogBindings[column] = value;
+  // `migrate: false` — the daemon is the sole migrator (see CLAUDE.md
+  // "Migrations are forward-only"). A fresh install must boot the daemon
+  // at least once before the hook can write; the LaunchAgent handles this
+  // on login.
+  //
+  // `prepareStmts: false` — the shared static `insertEvent` statement names
+  // every events column known at build time, so on a schema-bump deploy race
+  // (daemon hasn't yet applied the new ALTER) `db.prepare()` would throw
+  // "no such column" INSIDE `openDb` before it returned. By skipping the
+  // shared prepare, the hook can intersect known ∩ live columns via
+  // `PRAGMA table_info` below and build a narrowed INSERT that lands
+  // every column the live DB has — fn-669, the lossless-degraded fix for
+  // the 2026-06-01 v48 backend_exec total-drop incident.
+  //
+  // A genuinely-broken DB (no `events` table, corrupt DB, real BUSY on
+  // open) still throws inside `openDb` / the PRAGMA probe — the
+  // dead-letter path below captures it. The exit-0 contract still holds.
+  let opened: ReturnType<typeof openDb>;
+  try {
+    opened = openDb(resolveDbPath(), {
+      migrate: false,
+      prepareStmts: false,
+      // Pass the hook's tight budget so `applyPragmas` sets busy_timeout BEFORE
+      // the `journal_mode = WAL` switch — otherwise that switch fails instantly
+      // under contention (the `open:SQLITE_BUSY` drops). No later override
+      // needed: this value rides every statement on the connection.
+      busyTimeoutMs: HOOK_BUSY_TIMEOUT_MS,
+    });
+  } catch (err) {
+    deadLetter(err);
+    return;
   }
-  const appended = writeEventLog({ bindings: eventLogBindings });
-  if (!appended) {
-    // Hard append failure (ENOSPC / EACCES / EROFS / ENOENT-after-retry): route
-    // the event to the dead-letter recovery path so the daemon recovers it.
-    // `writeEventLog` already logged the underlying errno to stderr; pass a
-    // marker so the drop-log records the append-failure phase.
-    deadLetter(new Error("events-log append returned failure"));
+  const { db } = opened;
+  try {
+    // Probe the live `events` columns ONCE per invocation (fn-669). sqlite_schema
+    // is page 1 and warm in the daemon's open WAL, so this is microseconds —
+    // well inside the ~30ms cold-start budget. The probe runs OUTSIDE the
+    // retry loop: one prepared statement, reused on every attempt. A failure
+    // here (missing `events` table → "no such table" / corrupt DB) falls
+    // through to `deadLetter` per the carve-out — the lossless degrade
+    // covers ONLY known-missing columns, not a broken DB.
+    let adaptiveInsert: ReturnType<typeof db.prepare>;
+    try {
+      const rows = db.prepare("PRAGMA table_info('events')").all() as {
+        name: string;
+      }[];
+      const liveColumns = new Set(rows.map((r) => r.name));
+      if (liveColumns.size === 0) {
+        // Empty `PRAGMA table_info` on a non-existent table is silent — surface
+        // it explicitly so the dead-letter / drop-log records the right cause.
+        throw new Error("events table is missing from live schema");
+      }
+      // Intersect known ∩ live in the order of KNOWN_EVENT_COLUMNS so the
+      // INSERT shape is deterministic (no Set-iteration order surprises).
+      const bindingCols: string[] = [];
+      const droppedCols: string[] = [];
+      for (const col of KNOWN_EVENT_COLUMNS) {
+        if (liveColumns.has(col)) {
+          bindingCols.push(col);
+        } else {
+          droppedCols.push(col);
+        }
+      }
+      if (droppedCols.length > 0) {
+        // One stderr line per invocation listing every dropped column, so the
+        // skew window is greppable in `claude --debug` output AND survives the
+        // hook's exit. Observability without failing the write: the dropped
+        // columns LAND NULL after the daemon migrates — same as the deriver's
+        // zero-event value, so the fold is unchanged.
+        process.stderr.write(
+          `keeper events-writer: schema skew — INSERT narrowed, dropping columns: ${droppedCols.join(", ")}\n`,
+        );
+      }
+      // Named `$col` bindings only — preserve the canonical convention; the
+      // bindings object below stays keyed by `$col`, and `bun:sqlite`
+      // silently ignores extra named-binding keys (already verified by the
+      // existing `insertBindings` map carrying every column unconditionally).
+      const colList = bindingCols.join(", ");
+      const valList = bindingCols.map((c) => `$${c}`).join(", ");
+      adaptiveInsert = db.prepare(
+        `INSERT INTO events (${colList}) VALUES (${valList})`,
+      );
+    } catch (err) {
+      deadLetter(err);
+      return;
+    }
+
+    // busy_timeout is already HOOK_BUSY_TIMEOUT_MS — `openDb` set it FIRST in
+    // applyPragmas (before the journal_mode=WAL switch), so the hook stays
+    // inside Claude's SessionEnd 1.5s budget AND the WAL switch no longer fails
+    // instantly under contention. No re-set needed here.
+
+    // BEGIN IMMEDIATE avoids the lock-upgrade SQLITE_BUSY path: a plain BEGIN
+    // would start read-only and need to upgrade to write on INSERT, which
+    // bypasses busy_timeout and errors immediately on contention. IMMEDIATE
+    // grabs the reserved lock up front and waits per busy_timeout for any
+    // in-flight writer.
+    //
+    // Bounded retry (fn-643 task .2): on `SQLITE_BUSY`/`SQLITE_LOCKED`
+    // (either `.code` match or `"database is locked"` in `.message`), sleep
+    // ~30ms synchronously and retry exactly ONCE. Every other error
+    // (`SQLITE_BUSY_SNAPSHOT`, schema mismatch, constraint violation, etc.)
+    // is non-retriable → straight to dead-letter. The retry budget is
+    // bounded (1 attempt + 1 short sleep + 1 retry) so the hook stays
+    // safely inside the SessionEnd 1.5s budget even on contention.
+    const insert = db.transaction(() => {
+      // Named bindings: a missed column on a future ALTER no longer silently
+      // shifts data into the next slot. `start_time` is captured on
+      // SessionStart only as a platform-tagged opaque string — null on every
+      // other event by design. The narrowed `adaptiveInsert` ignores any
+      // `insertBindings` keys whose columns aren't live on this DB.
+      adaptiveInsert.run(insertBindings);
+    });
+
+    const insertStartedAt = Date.now();
+    let lastError: unknown = null;
+    let succeeded = false;
+    let attemptsMade = 0;
+    for (let attempt = 0; attempt < 2; attempt++) {
+      attemptsMade = attempt + 1;
+      try {
+        insert();
+        succeeded = true;
+        break;
+      } catch (err) {
+        lastError = err;
+        if (attempt === 0 && isRetriableLockError(err)) {
+          sleepSync(30);
+          continue;
+        }
+        break;
+      }
+    }
+
+    if (!succeeded) {
+      deadLetter(lastError, {
+        attempts: attemptsMade,
+        wait_ms: Date.now() - insertStartedAt,
+      });
+    }
+  } finally {
+    db.close();
   }
 }
 
