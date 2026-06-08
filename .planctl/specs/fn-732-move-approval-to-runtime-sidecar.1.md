@@ -50,5 +50,5 @@ auto-commits); task RMW preserves status; ladder resolves sidecar>def>pending.
 - [ ] pytest green incl. dual-write + concurrent-writer + ladder cases
 
 ## Done summary
-
+Expand-writer: planctl approve now dual-writes approval to gitignored runtime sidecars (task state file via lock_task RMW; new epic sidecar) AND keeps writing+committing the def-file approval. All readers/gates resolve approval via the sidecar>def>pending ladder; the pending default moved from normalize_* into merge_task_state/new merge_epic_state. approve still auto-commits (not reclassified).
 ## Evidence
