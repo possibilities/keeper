@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-747-parallelize-slow-test-tier-soak-harness",
   "bundles": [],
+  "closer_done_at": "2026-06-08T21:08:54.122278Z",
   "created_at": "2026-06-08T15:35:54.373612Z",
   "depends_on_epics": [],
   "id": "fn-747-parallelize-slow-test-tier-soak-harness",
@@ -9,10 +10,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Parallelize slow test tier + soak harness",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T18:03:11.791211Z"
+  "updated_at": "2026-06-08T21:08:54.122278Z"
 }
