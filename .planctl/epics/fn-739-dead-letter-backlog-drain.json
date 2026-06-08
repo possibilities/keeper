@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-739-dead-letter-backlog-drain",
   "bundles": [],
+  "closer_done_at": "2026-06-08T11:34:50.290239Z",
   "created_at": "2026-06-08T04:43:19.235152Z",
   "depends_on_epics": [
     "fn-738-babysitter-signal-quality"
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Dead-letter backlog drain",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T04:43:19.235152Z"
+  "updated_at": "2026-06-08T11:34:50.290239Z"
 }
