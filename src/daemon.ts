@@ -318,6 +318,37 @@ export const EVENTS_INGEST_FALLBACK_INTERVAL_MS = 3_000;
 export const COMPACTION_INTERVAL_MS = 300_000;
 
 /**
+ * Steady-state WAL checkpoint cadence (ms) — fn-744 .2 serve-side lever.
+ *
+ * The writer connection runs at the default `wal_autocheckpoint = 1000` pages
+ * ({@link WAL_AUTOCHECKPOINT_PAGES}), so under a quiescent-to-light write load
+ * the WAL can sit large for a long time before a fold COMMIT happens to cross
+ * the page threshold. fn-744 .1 attributed part of the under-load read-latency
+ * degradation (slow board CONNECT serving the ~2MB snapshot, late UPDATEs) to a
+ * large WAL: every read on the RO poller / serve connection has to walk the WAL
+ * frame index in front of the main DB, and that index grows with WAL size. The
+ * compaction pass already issues a PASSIVE checkpoint, but ONLY when it actually
+ * relocated bytes — once the cold-blob backlog is drained, a steady fold stream
+ * with no relocation never triggers it, so the WAL is left to the page-count
+ * auto-checkpoint alone.
+ *
+ * This independent heartbeat issues a `wal_checkpoint(PASSIVE)` on cadence so
+ * the WAL is flushed back into the main DB regardless of compaction activity,
+ * keeping serve/poll read latency bounded. PASSIVE (never TRUNCATE) is
+ * mandatory: TRUNCATE waits for any concurrent writer and would starve a
+ * contending hook INSERT into a dead-letter (CLAUDE.md "No kernel watchers" /
+ * the bounce-window rationale on {@link withBootDrainCheckpointTuning}); PASSIVE
+ * checkpoints what it can without blocking a writer and returns immediately if
+ * the writer lock is held. Runs on MAIN's writable connection.
+ *
+ * 30s is slacker than the realtime fold bar yet frequent enough that the WAL
+ * never grows unbounded between the sparse page-threshold auto-checkpoints under
+ * a bursty-then-idle write pattern. It is NOT a projection input and reads no
+ * wall-clock that feeds a fold, so re-fold determinism is untouched.
+ */
+export const WAL_CHECKPOINT_INTERVAL_MS = 30_000;
+
+/**
  * Pure helper: select every `pending_dispatches` row aged past the TTL
  * that does NOT already have an open `dispatch_failures` row for the
  * same `(verb, id)`. Used by the producer-side TTL sweep in
@@ -3324,6 +3355,31 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     runCompactionPass();
   }, COMPACTION_INTERVAL_MS);
 
+  // fn-744 .2 — steady-state WAL checkpoint cadence. Independent of compaction
+  // (whose PASSIVE checkpoint only fires when it relocated bytes), this flushes
+  // the WAL back into the main DB on cadence so serve/poll read latency stays
+  // bounded even under a steady fold stream with no compaction activity. PASSIVE
+  // never waits on a writer — if a hook holds the writer lock this returns a
+  // no-op immediately, so it can never starve a concurrent INSERT. Fires on the
+  // MAIN THREAD against the writable connection; stored so shutdown can clear it
+  // (an outstanding timer pins a ref on the main loop, and a checkpoint must not
+  // fire into the writer connection mid-teardown).
+  const walCheckpointTimer = setInterval(() => {
+    try {
+      db.run("PRAGMA wal_checkpoint(PASSIVE)");
+    } catch (err) {
+      // A checkpoint failure is pure space/latency reclamation loss, never a
+      // correctness issue (the WAL stays intact and the page-threshold
+      // auto-checkpoint remains the backstop). Log non-fatally — same crash
+      // policy as the compaction PASSIVE checkpoint above.
+      console.error(
+        `[keeperd] steady-state PASSIVE checkpoint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  }, WAL_CHECKPOINT_INTERVAL_MS);
+
   // Same crash policy as the other workers: any thread failure →
   // fatalExit → exit 1 → launchd restart.
   autopilotWorkerInstance.onerror = (err: ErrorEvent): void => {
@@ -3442,6 +3498,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // Likewise clear the compaction heartbeat — a relocation batch must not
     // fire into the writer connection mid-teardown.
     clearInterval(compactionTimer);
+    // fn-744 .2 — clear the steady-state checkpoint heartbeat so a PASSIVE
+    // checkpoint can't fire into the writer connection mid-teardown.
+    clearInterval(walCheckpointTimer);
 
     worker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
     serverWorker.postMessage({ type: "shutdown" } satisfies ShutdownMessage);

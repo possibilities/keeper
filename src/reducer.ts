@@ -156,11 +156,23 @@ import type {
 import { API_ERROR_KINDS } from "./types";
 
 /**
- * Default batch size for {@link drain}. Keeps each writer transaction short so
- * the reducer never holds the WAL writer lock long enough to block hook
- * inserts; the caller loops until `drain()` returns 0.
+ * Default batch size for {@link drain}. Each event folds in its OWN
+ * `BEGIN IMMEDIATE` transaction, so the batch size never extends a single
+ * writer-lock hold — but it does bound how many transactions `drain()` runs
+ * back-to-back before returning to {@link drainToCompletion}, which is the only
+ * loop boundary at which a contending hook INSERT reliably wins the writer
+ * lock. fn-744 .1 attributed the live-scale 5.4s-fold tail to a batch landing
+ * during a `GitSnapshot`/`Commit` burst: those folds re-fan git-status /
+ * planctl-links across the ~870-epic projection (p95 ~141ms, max ~338ms each),
+ * and 200 of them run uninterrupted inside one `drain()` call. Shrinking the
+ * batch to 50 gives a contending hook ~4x more frequent writer windows (one per
+ * `drain()` boundary) WITHOUT changing throughput — the caller loops until
+ * `drain()` returns 0 — or per-event fold semantics, or re-fold determinism
+ * (the batch size is not an input to any projection write). The boot drain's
+ * post-COMMIT pacing (`DrainOptions.paceMs`) is the complementary intra-batch
+ * lever; this knob governs steady state.
  */
-export const DEFAULT_BATCH_SIZE = 200;
+export const DEFAULT_BATCH_SIZE = 50;
 
 /**
  * Test-only seam. When set, {@link applyEvent} invokes this AFTER the jobs

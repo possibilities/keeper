@@ -71,7 +71,7 @@ import {
   selectVersionsByIdsChunked,
 } from "../src/collections";
 import { openDb } from "../src/db";
-import { applyEvent } from "../src/reducer";
+import { applyEvent, DEFAULT_BATCH_SIZE, drain } from "../src/reducer";
 import {
   diffTick,
   resolveFilter,
@@ -555,6 +555,95 @@ function measureFold(
 }
 
 // ---------------------------------------------------------------------------
+// Leg 4 — drain-batch writer-lock hold (fn-744 .2 batch-tuning lever)
+// ---------------------------------------------------------------------------
+
+interface BatchHoldResult {
+  /** Batch sizes compared (the configured default plus a control). */
+  batches: {
+    batchSize: number;
+    /** Wall-clock per full drain() call = uninterrupted writer-lock run. */
+    batchMs: ReturnType<typeof summary>;
+    /** Events actually folded per drain() call (≤ batchSize). */
+    eventsPerBatch: number;
+  }[];
+  /** The shipped DEFAULT_BATCH_SIZE, for the verdict line. */
+  defaultBatchSize: number;
+}
+
+/**
+ * Leg 4 — the fn-744 .2 batch-tuning lever, measured directly. The dominant
+ * live-scale cost `.1` attributed was a `drain()` BATCH (200 events) landing on
+ * a `GitSnapshot`/`Commit` burst and running every fold back-to-back, holding
+ * the writer for the batch's full duration — the window a contending hook INSERT
+ * waits through. Each event folds in its OWN transaction, so the lever is the
+ * batch boundary: a smaller `batchSize` returns control to `drainToCompletion`
+ * (the only point a contending hook reliably wins the writer) sooner.
+ *
+ * This leg re-folds the SAME tail window at several batch sizes and reports the
+ * wall-clock a single `drain()` call holds the writer = max contiguous
+ * starvation window per batch. The shipped {@link DEFAULT_BATCH_SIZE} (50) vs a
+ * 200-event control makes the before/after improvement on the targeted cost
+ * explicit. We rewind the cursor between batch-size sweeps so each sweep folds
+ * the identical window (idempotent upserts — re-folding is byte-identical, the
+ * re-fold-determinism invariant the harness must not violate).
+ */
+function measureBatchHold(
+  db: ReturnType<typeof openDb>["db"],
+  windowSize: number,
+  batchSizes: number[],
+): BatchHoldResult {
+  const head = (
+    db.query(`SELECT COALESCE(MAX(id), 0) m FROM events`).get() as { m: number }
+  ).m;
+  const from = Math.max(0, head - windowSize);
+  // Snapshot the live cursor so we can restore it after the destructive sweeps
+  // (each drain() advances reducer_state.last_event_id). The folds themselves
+  // are idempotent upserts, so the projection is unchanged; only the cursor
+  // moves, and we put it back.
+  const savedCursor = (
+    db.query(`SELECT last_event_id FROM reducer_state WHERE id = 1`).get() as {
+      last_event_id: number;
+    } | null
+  )?.last_event_id;
+
+  const rewind = (): void => {
+    db.run(`UPDATE reducer_state SET last_event_id = ? WHERE id = 1`, [from]);
+  };
+
+  const batches = batchSizes.map((batchSize) => {
+    rewind();
+    const perBatch: number[] = [];
+    let totalFolded = 0;
+    let calls = 0;
+    for (;;) {
+      const t0 = performance.now();
+      const folded = drain(db, batchSize);
+      perBatch.push(performance.now() - t0);
+      if (folded === 0) break;
+      totalFolded += folded;
+      calls += 1;
+    }
+    return {
+      batchSize,
+      batchMs: summary(perBatch),
+      eventsPerBatch: calls > 0 ? Math.round(totalFolded / calls) : 0,
+    };
+  });
+
+  // Restore the cursor so the harness leaves reducer_state where it found it
+  // (the DB is a disposable copy/tmp, but restoring keeps a --db copy re-runnable
+  // and the synthesized-tmp path symmetric).
+  if (savedCursor !== undefined) {
+    db.run(`UPDATE reducer_state SET last_event_id = ? WHERE id = 1`, [
+      savedCursor,
+    ]);
+  }
+
+  return { batches, defaultBatchSize: DEFAULT_BATCH_SIZE };
+}
+
+// ---------------------------------------------------------------------------
 // Driver
 // ---------------------------------------------------------------------------
 
@@ -643,6 +732,7 @@ function printReport(
   cold: ColdConnectResult,
   burst: UpdateBurstResult,
   fold: FoldResult,
+  batchHold: BatchHoldResult,
 ): void {
   const L = (s: string) => process.stdout.write(`${s}\n`);
   L("");
@@ -697,6 +787,17 @@ function printReport(
   for (const t of fold.byType.slice(0, 6)) {
     L(
       `    ${t.type.padEnd(20)}${String(t.n).padStart(6)}${`${t.p50.toFixed(2)}ms`.padStart(9)}${`${t.p95.toFixed(2)}ms`.padStart(9)}${`${t.max.toFixed(1)}ms`.padStart(9)}${`${t.totalMs.toFixed(0)}ms`.padStart(10)}`,
+    );
+  }
+  L("");
+  L("── Leg 4: DRAIN-BATCH WRITER-LOCK HOLD (fn-744 .2 batch-tuning lever) ──");
+  L(
+    `  per-drain() wall-clock = max contiguous writer hold a hook INSERT waits through`,
+  );
+  for (const b of batchHold.batches) {
+    const tag = b.batchSize === batchHold.defaultBatchSize ? " (shipped)" : "";
+    L(
+      `  batch=${String(b.batchSize).padStart(3)}${tag.padEnd(10)} p50 ${fmt(b.batchMs.p50)}  p95 ${fmt(b.batchMs.p95)}  p99 ${fmt(b.batchMs.p99)}  max ${fmt(b.batchMs.max)}`,
     );
   }
   L("");
@@ -758,6 +859,14 @@ async function main(argv: string[]): Promise<void> {
       args.iterations,
     );
     const fold = measureFold(db, args.foldEvents);
+    // Leg 4 — compare the shipped DEFAULT_BATCH_SIZE against the pre-fn-744 .2
+    // 200-event control on the SAME tail window so the batch-tuning win is
+    // explicit. MUST run AFTER measureFold (both advance the cursor; this leg
+    // saves+restores it, but running it last keeps the fold leg's window clean).
+    const batchHold = measureBatchHold(db, args.foldEvents, [
+      DEFAULT_BATCH_SIZE,
+      200,
+    ]);
 
     if (args.json) {
       process.stdout.write(
@@ -769,6 +878,7 @@ async function main(argv: string[]): Promise<void> {
             coldConnect: cold,
             updateBurst: burst,
             fold,
+            batchHold,
             verdict: dominantVerdict(cold, burst, fold),
           },
           null,
@@ -782,6 +892,7 @@ async function main(argv: string[]): Promise<void> {
         cold,
         burst,
         fold,
+        batchHold,
       );
     }
   } finally {

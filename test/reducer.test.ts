@@ -6928,10 +6928,90 @@ test("drain consumes events id > cursor in batches and returns count", () => {
 });
 
 test("drain default batch size is exported and used", () => {
-  expect(DEFAULT_BATCH_SIZE).toBe(200);
+  // fn-744 .2: shrunk 200 -> 50 so a GitSnapshot/Commit fold burst can't run
+  // 200 expensive per-event transactions uninterrupted in one drain() call —
+  // a smaller batch yields the writer lock back to contending hook INSERTs ~4x
+  // more often (one window per drain() boundary). Throughput is unchanged: the
+  // caller loops until drain() returns 0.
+  expect(DEFAULT_BATCH_SIZE).toBe(50);
   insertEvent({ hook_event: "SessionStart" });
   expect(drain(db)).toBe(1);
   expect(drain(db)).toBe(0);
+});
+
+test("fold is batch-size-invariant — same log, same projection + cursor (fn-744 .2)", () => {
+  // fn-744 .2 shrank DEFAULT_BATCH_SIZE 200 -> 50. The batch size is purely a
+  // writer-lock-yield granularity knob; it must never change WHAT the fold
+  // produces. This pins the determinism safety net the batch-tuning lever rests
+  // on: a mixed log folded at batch=50 vs batch=200 yields a BYTE-IDENTICAL
+  // jobs/git_status/epics projection AND an identical cursor. (The "delta board
+  // == full-snapshot board" acceptance, expressed in fold terms — a smaller
+  // batch can't drop or reorder a fold.)
+  const seed = (): void => {
+    // A SessionStart + lifecycle on one session, plus the two expensive arms the
+    // .1 finding fingered (GitSnapshot re-fans git-status, Commit re-fans
+    // planctl-links) so the invariance covers the costly multi-table folds, not
+    // just the cheap jobs upsert.
+    insertEvent({ hook_event: "SessionStart" });
+    insertEvent({ hook_event: "UserPromptSubmit" });
+    insertEvent({
+      hook_event: "GitSnapshot",
+      session_id: "/repo",
+      cwd: "/repo",
+      data: JSON.stringify({
+        project_dir: "/repo",
+        dirty_count: 3,
+        unattributed_to_live_count: 1,
+        orphan_count: 0,
+        attributions: [],
+      }),
+    });
+    for (let i = 0; i < 120; i++) {
+      insertEvent({ hook_event: "PreToolUse", tool_name: "Bash" });
+      insertEvent({ hook_event: "PostToolUse", tool_name: "Bash" });
+    }
+    insertEvent({ hook_event: "Stop" });
+  };
+
+  // Pass A — fold the whole log at batch=50 (the shipped default).
+  seed();
+  let n: number;
+  do {
+    n = drain(db, 50);
+  } while (n > 0);
+  const cursorA = getCursor();
+  const jobsA = JSON.stringify(
+    db.query("SELECT * FROM jobs ORDER BY job_id").all(),
+  );
+  const gitA = JSON.stringify(
+    db.query("SELECT * FROM git_status ORDER BY project_dir").all(),
+  );
+  const epicsA = JSON.stringify(
+    db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+  );
+
+  // Re-fold the identical log from cursor=0 at batch=200 (the pre-fn-744 .2
+  // size). Drop the projections, rewind, re-drain at the larger batch.
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM epics");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  do {
+    n = drain(db, 200);
+  } while (n > 0);
+
+  expect(getCursor()).toBe(cursorA);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(jobsA);
+  expect(
+    JSON.stringify(
+      db.query("SELECT * FROM git_status ORDER BY project_dir").all(),
+    ),
+  ).toBe(gitA);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM epics ORDER BY epic_id").all()),
+  ).toBe(epicsA);
 });
 
 test("drain returns 0 when caught up (no new event rows)", () => {
