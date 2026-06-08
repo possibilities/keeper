@@ -539,6 +539,58 @@ describe("detectApprovalReview", () => {
     expect(findings).toHaveLength(2);
     expect(findings.every((f) => f.severity === "info")).toBe(true);
   });
+
+  test("single-session approval is NOT tagged multipleApprovers (merit-unknown path)", () => {
+    // One target, one approving session, thin evidence — the scanner surfaces
+    // it merit-BLIND (info), and tags multipleApprovers:false so the agent
+    // treats it as merit-unknown, not duplicate-approver. (fn-738)
+    const base = 12_000_000;
+    const findings = detectApprovalReview([
+      ev({
+        id: 1,
+        ts: base,
+        session_id: "solo",
+        planctl_op: "approve",
+        planctl_target: "fn-7-thin.1",
+      }),
+    ]);
+    expect(findings).toHaveLength(1);
+    const f = findings[0];
+    expect(f.severity).toBe("info"); // scanner stays merit-blind
+    expect(f.evidence.multipleApprovers).toBe(false);
+  });
+
+  test("multi-session target tags every review item multipleApprovers:true (duplicate-approver signal)", () => {
+    // Same target approved by 2 distinct sessions in-window → the dup-approve
+    // signal is reused as a merit-BLIND evidence tag on EACH per-op review item,
+    // so the agent can split "work merited but duplicate approver" from
+    // "merit unknown". The scanner itself renders no merit judgment. (fn-738)
+    const target = "fn-732-cross-repo.2";
+    const base = 13_000_000;
+    const findings = detectApprovalReview([
+      ev({
+        id: 1,
+        ts: base,
+        session_id: "sess-a",
+        planctl_op: "approve",
+        planctl_target: target,
+      }),
+      ev({
+        id: 2,
+        ts: base + 30,
+        session_id: "sess-b",
+        planctl_op: "approve",
+        planctl_target: target,
+      }),
+    ]);
+    expect(findings).toHaveLength(2);
+    expect(findings.every((f) => f.category === "approval-review")).toBe(true);
+    expect(findings.every((f) => f.severity === "info")).toBe(true); // still merit-blind
+    expect(findings.every((f) => f.evidence.target === target)).toBe(true);
+    expect(findings.every((f) => f.evidence.multipleApprovers === true)).toBe(
+      true,
+    );
+  });
 });
 
 // ---------------------------------------------------------------------------
