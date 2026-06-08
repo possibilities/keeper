@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T04:01:29.706859Z",
+  "depends_on": [],
+  "epic": "fn-736-lock-free-events-writer-via-ndjson",
+  "id": "fn-736-lock-free-events-writer-via-ndjson.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Daemon NDJSON events ingester",
+  "updated_at": "2026-06-08T04:01:29.706859Z"
+}
