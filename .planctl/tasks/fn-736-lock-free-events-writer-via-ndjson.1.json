@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Daemon NDJSON events ingester",
-  "updated_at": "2026-06-08T04:01:29.706859Z"
+  "updated_at": "2026-06-08T04:24:23.291564Z",
+  "worker_done_at": "2026-06-08T04:24:23.291564Z"
 }

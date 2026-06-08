@@ -71,5 +71,5 @@ Mirror test/dead-letter-worker.test.ts. Must add: double-ingest idempotency, tor
 - [ ] Per-pid file cleanup only after offset-at-EOF + pid dead; no 16 MiB cap
 
 ## Done summary
-
+Added the daemon-side NDJSON->events ingester: scanEventsLogDir lands per-pid NDJSON lines as events rows with the offset advance committed atomically with the INSERT in one BEGIN IMMEDIATE (exactly-once), plus the events-ingest watch-hint Worker, boot-ingest-before-drain ordering, the event_ingest_offsets table (SCHEMA_VERSION 60->61 + SUPPORTED_SCHEMA_VERSIONS co-commit), and the EventLogRecord serializer/parser contract task .2 targets. The fold reads events unchanged; offset-at-EOF + pid-dead cleanup, no 16 MiB cap.
 ## Evidence
