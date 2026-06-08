@@ -7,7 +7,13 @@
  */
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -23,12 +29,14 @@ import {
   PENDING_DISPATCH_TTL_MS,
   prewarmWatcherAddon,
   recoverOneDeadLetter,
+  scanDeadLetterDir,
   selectExpiredPendingDispatches,
   serializeUsageSnapshot,
   WAL_AUTOCHECKPOINT_PAGES,
   withBootDrainCheckpointTuning,
 } from "../src/daemon";
 import { openDb, SCHEMA_VERSION } from "../src/db";
+import { serializeDeadLetterRecord } from "../src/dead-letter";
 import { drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
@@ -1598,6 +1606,170 @@ test("recoverOneDeadLetter does NOT touch dead_letters on a re-fold (the row sur
   // one record at a time, and a partial recovery is still strictly better
   // than the row never appearing on the board).
   expect(job.state).toBe("stopped");
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-739 task .1 — backlog-drain: end-to-end scan→replay re-fold parity, and
+// the torn-tail scan-skip. The earlier `recoverOneDeadLetter` block seeds the
+// `dead_letters` row directly; these two drive the FULL on-disk NDJSON path
+// (`scanDeadLetterDir` import → `recoverOneDeadLetter` replay) so the file
+// import + idempotency + torn-tail contracts are exercised together.
+// ---------------------------------------------------------------------------
+
+test("scan→replay re-fold parity: a record imported from an NDJSON file folds byte-identically to a directly-landed event", () => {
+  // Bindings the hook would have written had its INSERT not been dropped — a
+  // full SessionStart binding incl. the SessionStart-scraped fields.
+  const bindings = {
+    ts: 1_700_000_500,
+    session_id: "sess-parity",
+    pid: 4242,
+    hook_event: "SessionStart",
+    event_type: "lifecycle",
+    data: "{}",
+    cwd: "/tmp/parity",
+    permission_mode: null,
+    spawn_name: "agent-parity",
+    start_time: "darwin:Mon Jan  1 00:00:00 2026",
+    config_dir: null,
+  };
+
+  // (A) Directly-landed reference: INSERT the same bindings straight into
+  // `events` and fold — this is what the hook's original INSERT would have
+  // produced.
+  const refPath = join(tmpDir, "ref.db");
+  const { db: refDb } = openDb(refPath);
+  const refCols = Object.keys(bindings);
+  refDb.run(
+    `INSERT INTO events (${refCols.join(", ")}) VALUES (${refCols.map(() => "?").join(", ")})`,
+    refCols.map(
+      (c) => (bindings as Record<string, unknown>)[c] as string | number | null,
+    ),
+  );
+  drainToCompletion(refDb);
+  const refJob = refDb
+    .query("SELECT * FROM jobs WHERE job_id = 'sess-parity'")
+    .get() as Record<string, unknown>;
+  refDb.close();
+
+  // (B) Replayed path: write the record to an on-disk per-pid NDJSON file,
+  // import via `scanDeadLetterDir`, replay via `recoverOneDeadLetter`, fold.
+  const { db } = openDb(dbPath);
+  const dlDir = join(tmpDir, "dead-letters");
+  mkdirSync(dlDir, { recursive: true });
+  writeFileSync(
+    join(dlDir, "4242.ndjson"),
+    serializeDeadLetterRecord({
+      dl_id: "dl-parity",
+      session_id: "sess-parity",
+      hook_event: "SessionStart",
+      ts: 1_700_000_500,
+      dl_written_at: 1_700_000_501,
+      pid: 4242,
+      bindings,
+    }),
+  );
+  scanDeadLetterDir(db, dlDir);
+  expect(recoverOneDeadLetter(db)).toBe("dl-parity");
+  drainToCompletion(db);
+  const job = db
+    .query("SELECT * FROM jobs WHERE job_id = 'sess-parity'")
+    .get() as Record<string, unknown>;
+
+  // The replayed-path projection row is byte-identical to the directly-landed
+  // one — the re-fold determinism invariant holds through the replay path.
+  expect(job).toEqual(refJob);
+  db.close();
+});
+
+test("scan→replay idempotency: importing + replaying twice yields exactly one events row (no dup on re-run)", () => {
+  const { db } = openDb(dbPath);
+  const dlDir = join(tmpDir, "dead-letters");
+  mkdirSync(dlDir, { recursive: true });
+  const line = serializeDeadLetterRecord({
+    dl_id: "dl-idem",
+    session_id: "sess-idem",
+    hook_event: "SessionStart",
+    ts: 9,
+    dl_written_at: 9,
+    pid: 7,
+    bindings: {
+      ts: 9,
+      session_id: "sess-idem",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+  writeFileSync(join(dlDir, "7.ndjson"), line);
+
+  // First drain: import (INSERT OR IGNORE on dl_id) + replay.
+  scanDeadLetterDir(db, dlDir);
+  expect(recoverOneDeadLetter(db)).toBe("dl-idem");
+
+  // Re-run the WHOLE path (file still on disk — as it is in production until a
+  // cleanup pass moves it): the re-scan's INSERT OR IGNORE is a no-op on the
+  // existing dl_id, and the row is already `recovered` so replay skips it.
+  scanDeadLetterDir(db, dlDir);
+  expect(recoverOneDeadLetter(db)).toBeNull();
+
+  // Exactly one events row for the session — no duplicate.
+  const n = (
+    db
+      .query("SELECT COUNT(*) AS n FROM events WHERE session_id = 'sess-idem'")
+      .get() as { n: number }
+  ).n;
+  expect(n).toBe(1);
+  db.close();
+});
+
+test("scanDeadLetterDir skips a torn final line — the partial record is never imported or replayed", () => {
+  const { db } = openDb(dbPath);
+  const dlDir = join(tmpDir, "dead-letters");
+  mkdirSync(dlDir, { recursive: true });
+
+  const whole = serializeDeadLetterRecord({
+    dl_id: "dl-whole",
+    session_id: "sess-whole",
+    hook_event: "SessionStart",
+    ts: 1,
+    dl_written_at: 1,
+    pid: 1,
+    bindings: {
+      ts: 1,
+      session_id: "sess-whole",
+      hook_event: "SessionStart",
+      event_type: "lifecycle",
+      data: "{}",
+    },
+  });
+  // A second record truncated mid-write (no trailing newline, JSON cut off) —
+  // exactly what a killed hook process leaves behind.
+  const torn = '{"dl_id":"dl-torn","session_id":"sess-torn","hook_eve';
+  writeFileSync(join(dlDir, "1.ndjson"), whole + torn);
+
+  scanDeadLetterDir(db, dlDir);
+
+  // Only the whole record imported; the torn tail produced no row.
+  const ids = (
+    db.query("SELECT dl_id FROM dead_letters ORDER BY dl_id").all() as {
+      dl_id: string;
+    }[]
+  ).map((r) => r.dl_id);
+  expect(ids).toEqual(["dl-whole"]);
+
+  // And replay drains only the whole one; the torn record never replays.
+  expect(recoverOneDeadLetter(db)).toBe("dl-whole");
+  expect(recoverOneDeadLetter(db)).toBeNull();
+  expect(
+    (
+      db
+        .query(
+          "SELECT COUNT(*) AS n FROM events WHERE session_id = 'sess-torn'",
+        )
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
   db.close();
 });
 
