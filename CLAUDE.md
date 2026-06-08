@@ -168,9 +168,8 @@ per-test tmpdir: `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`,
 — it strands the others at production defaults and pollutes the real feed. Build
 the env via the shared `sandboxEnv(...)` in `test/helpers/sandbox-env.ts`, which
 applies the state paths LAST (after any caller `extra`/undefined-clear) so a
-caller can't re-strand one: pass `clearAmbientIds: true` for CLI-spawn tests
-(clears `CLAUDE_CODE_SESSION_ID`/`JOBCTL_*`), `includeZellij: true` to add the
-sixth `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684) for hook-spawn tests.
+caller can't re-strand one: pass `includeZellij: true` to add the sixth
+`KEEPER_ZELLIJ_EVENTS_DIR` (fn-684) for hook-spawn tests.
 
 ## Autopilot
 

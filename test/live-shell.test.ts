@@ -17,18 +17,18 @@
  * mid-evaluation. A `bunfig.toml` `[test] preload` that early-imports
  * `@opentui/core` does NOT hold (the preload's own `await import` hits
  * the same TDZ). `package.json`'s `test` script therefore runs the
- * non-OpenTUI suite under `--isolate` (`test:isolated`) and this pair
- * separately under plain `bun test` (`test:opentui`).
+ * non-OpenTUI suite under `--parallel` (path-ignoring this pair) and
+ * this pair separately under plain `bun test` (`test:opentui`).
  *
  * MAINTENANCE: the split is an explicit allowlist. Any NEW test file
  * that imports `@opentui/core` runtime values must be added to BOTH
- * `test:opentui` AND `test:isolated`'s `--path-ignore-patterns` in
- * `package.json` — otherwise it lands in the `--isolate` pass and
+ * `test:opentui` AND the `--path-ignore-patterns` of the `--parallel`
+ * pass in `test` — otherwise it lands in the parallel pass and
  * re-trips this TDZ, false-reding `bun run test`. (And validate the
- * suite via `bun run test`, never a bare `bun test --isolate`, which
+ * suite via `bun run test`, never a bare `bun test --parallel`, which
  * deliberately re-includes these files and will always show the TDZ.)
  * Minimal upstream repro (Bun 1.3.14 / @opentui/core 0.3.0):
- *   `bun test --isolate test/ansi-to-styled.test.ts test/live-shell.test.ts`
+ *   `bun test --parallel test/ansi-to-styled.test.ts test/live-shell.test.ts`
  * — fails with the TDZ above; filing upstream is deferred to a
  * separate human-approved task.
  *
