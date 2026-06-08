@@ -36,5 +36,5 @@ bun test: no kick emitted on approve; no dead references; approval-fold tests st
 - [ ] bun test green
 
 ## Done summary
-
+Removed the now-dead fn-701 approval-kick machinery (approvalKickSignal/setApprovalKickSignal/fireApprovalKick + kick-plan-worker-request wiring across rpc-handlers/server-worker/daemon). The sidecar fold is gate-free so the committed-def fold-lag kick is no longer needed; def-fallback ladder retained as the permanent safety net. Added a regression guard and confirmed no dead references; bun test green.
 ## Evidence
