@@ -46,5 +46,5 @@ Branch the `backstop-staleness` finding detail/title on `row.class` so
 - [ ] `key`/`fingerprint` unchanged; tests cover both variants.
 
 ## Done summary
-
+Branched backstop-staleness and missed-wake-delta detail wording on row.class: timeout-class rows now render elapsed dispatch/confirm/sweep timeout wording (no 'fast path' language) while missed-wake rows keep dropped-fast-path wording. key/fingerprint unchanged; tests cover both variants.
 ## Evidence
