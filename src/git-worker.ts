@@ -61,6 +61,15 @@ import type { ShutdownMessage } from "./wake-worker";
 
 export interface GitWorkerData {
   dbPath: string;
+  /**
+   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
+   * `@parcel/watcher` — it skips the live FSEvents subscribe + DB-poll/heartbeat
+   * reconcile (which exist only to manage watcher subscriptions) and stays alive
+   * only for the shutdown handshake. The in-process daemon harness sets this so
+   * the parallel slow-test tier never dlopens the NAPI addon in a worker thread.
+   * Git snapshots are not exercised by the in-process fold-pipeline tier.
+   */
+  disableNativeWatcher?: boolean;
 }
 
 /**
@@ -2754,6 +2763,17 @@ function startWorker(): void {
       process.exit(0);
     })();
   });
+
+  // fn-747 watcher seam: skip the native addon dlopen entirely in the in-process
+  // tier. `reconcileRoots`/`subscribeRoot` early-return while `watcherModule`
+  // stays null, so the DB-poll + heartbeat timers (armed inside the `.then`
+  // below) never arm and no GitSnapshot work runs — git snapshots are not
+  // exercised by the in-process fold-pipeline tier. The worker stays alive (the
+  // parentPort listener keeps the event loop running) for the shutdown
+  // handshake.
+  if (data.disableNativeWatcher) {
+    return;
+  }
 
   void import("@parcel/watcher")
     .then(async (mod) => {

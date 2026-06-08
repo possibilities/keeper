@@ -71,6 +71,16 @@ export interface DeadLetterWorkerData {
    * point at hermetic tmp dirs.
    */
   dir: string;
+  /**
+   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
+   * `@parcel/watcher` — it skips the live FSEvents subscribe and stays alive
+   * only for the shutdown handshake. The in-process daemon harness sets this so
+   * the parallel slow-test tier never dlopens the NAPI addon in a worker thread.
+   * Main's boot scan already imported every `waiting` dead-letter at startup;
+   * the live subscribe is a latency hint for new drops, which the in-process
+   * tier does not exercise.
+   */
+  disableNativeWatcher?: boolean;
 }
 
 /**
@@ -169,6 +179,14 @@ function main(): void {
     console.error(
       `[dead-letter-worker] dead-letters dir ${dir} does not exist; not watching`,
     );
+    return;
+  }
+
+  // fn-747 watcher seam: skip the native addon dlopen entirely in the
+  // in-process tier. Main's boot scan already imported every `waiting`
+  // dead-letter; this worker just stays alive (the parentPort listener keeps the
+  // event loop running) for the shutdown handshake.
+  if (data.disableNativeWatcher) {
     return;
   }
 

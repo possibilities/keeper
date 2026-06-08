@@ -76,6 +76,17 @@ export interface EventsIngestWorkerData {
    * hermetic tmp dirs.
    */
   dir: string;
+  /**
+   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
+   * `@parcel/watcher` — it skips the live FSEvents subscribe and stays alive
+   * only for the shutdown handshake. The in-process daemon harness sets this so
+   * the parallel slow-test tier never dlopens the NAPI addon in a worker thread
+   * (the SIGTRAP source). Correctness is preserved: main's own
+   * `eventsIngestFallbackTimer` poll (re-scan each per-pid file from its durable
+   * byte-offset every interval) ingests every NDJSON line regardless — the
+   * watcher subscribe is a latency hint, not the data path.
+   */
+  disableNativeWatcher?: boolean;
 }
 
 /**
@@ -174,6 +185,14 @@ function main(): void {
     console.error(
       `[events-ingest-worker] events-log dir ${dir} does not exist; not watching`,
     );
+    return;
+  }
+
+  // fn-747 watcher seam: skip the native addon dlopen entirely in the
+  // in-process tier. Main's `eventsIngestFallbackTimer` poll still ingests every
+  // NDJSON line, so this worker just stays alive (the parentPort listener keeps
+  // the event loop running) for the shutdown handshake.
+  if (data.disableNativeWatcher) {
     return;
   }
 

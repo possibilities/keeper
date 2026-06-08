@@ -126,6 +126,22 @@ export interface PlanWorkerData {
    * it unset (the production cadence is the constant).
    */
   pollMs?: number;
+  /**
+   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
+   * `@parcel/watcher` — it skips the live FSEvents subscribe + the reflog watches
+   * and instead runs a POLLING degrade: the boot scan per root (so the
+   * projection seeds + the ghost sweep fires) plus the fast `data_version` poll
+   * and the periodic `reconcilePlanctlDirs` heartbeat (both armed BEFORE the
+   * watcher block, so they carry the live `.planctl` fold pipeline at poll/
+   * heartbeat cadence instead of FSEvents cadence). The in-process daemon
+   * harness sets this so the parallel slow-test tier never dlopens the NAPI addon
+   * in a worker thread. `reflogWatcherModule` stays null and
+   * `reconcileReflogWatches` is already null-guarded, so the reflog fast path is
+   * simply absent (covered by the heartbeat). This is a real resilience path, not
+   * just test scaffolding — it is the degrade keeper would take if the addon ever
+   * failed to load.
+   */
+  disableNativeWatcher?: boolean;
 }
 
 /**
@@ -3584,6 +3600,39 @@ function main(): void {
       console.error(`[plan-worker] boot sweep failed: ${stringifyErr(err)}`);
     }
   };
+
+  // fn-747 watcher seam: skip the native addon dlopen in the in-process tier and
+  // run a polling degrade instead. The boot scan per root still seeds the
+  // projection and advances the ghost-sweep barrier; the `data_version` poll +
+  // periodic heartbeat (armed above) carry the live `.planctl` fold pipeline at
+  // poll/heartbeat cadence. `reflogWatcherModule` stays null (the reflog fast
+  // path is absent, covered by the heartbeat).
+  if (data.disableNativeWatcher) {
+    for (const root of data.roots) {
+      if (!existsSync(root)) {
+        console.error(
+          `[plan-worker] root ${root} does not exist; not watching`,
+        );
+        // Still counts toward the sweep barrier — otherwise a missing root
+        // would stall the boot ghost-sweep forever.
+        noteBootScanDone();
+        continue;
+      }
+      // Boot scan: pick up files that pre-existed this daemon's start without
+      // waiting for a watcher event. The change-gate suppresses unchanged files.
+      // A scan throw must not crash the worker (no self-heal) — log + advance the
+      // barrier so a bad root can't stall the sweep for the others.
+      try {
+        scanRoot(root, scanner);
+      } catch (err) {
+        console.error(
+          `[plan-worker] boot scan failed for ${root}: ${stringifyErr(err)}`,
+        );
+      }
+      noteBootScanDone();
+    }
+    return;
+  }
 
   void import("@parcel/watcher")
     .then((watcher) => {

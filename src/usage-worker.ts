@@ -85,6 +85,15 @@ export interface UsageWorkerData {
    * dir appears — agentuse may not have run yet).
    */
   root: string;
+  /**
+   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
+   * `@parcel/watcher` — it skips the live FSEvents subscribe + the boot scan and
+   * stays alive only for the shutdown handshake. The in-process daemon harness
+   * sets this so the parallel slow-test tier never dlopens the NAPI addon in a
+   * worker thread. Usage snapshots are not exercised by the in-process
+   * fold-pipeline tier.
+   */
+  disableNativeWatcher?: boolean;
 }
 
 /** Snapshot message for one `~/.local/state/agentuse/<id>.json` file. */
@@ -773,6 +782,14 @@ function main(): void {
       })();
     }
   });
+
+  // fn-747 watcher seam: skip the native addon dlopen entirely in the
+  // in-process tier. Usage snapshots are not exercised by the in-process
+  // fold-pipeline tier, so this worker just stays alive (the parentPort listener
+  // keeps the event loop running) for the shutdown handshake.
+  if (data.disableNativeWatcher) {
+    return;
+  }
 
   void import("@parcel/watcher")
     .then((watcher) => {

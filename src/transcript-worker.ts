@@ -71,6 +71,15 @@ export interface TranscriptWorkerData {
    * back to `~/.claude/projects` if a caller omits it.
    */
   watchRoot?: string;
+  /**
+   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
+   * `@parcel/watcher` — it skips the live FSEvents subscribe + the startup
+   * current-title fold and stays alive only for the shutdown handshake. The
+   * in-process daemon harness sets this so the parallel slow-test tier never
+   * dlopens the NAPI addon in a worker thread. Transcript titles are not
+   * exercised by the in-process fold-pipeline tier.
+   */
+  disableNativeWatcher?: boolean;
 }
 
 /** Message posted to the parent on a NEW (changed) title for a session. */
@@ -1134,6 +1143,14 @@ function main(): void {
     // Stay alive (don't exit non-zero — a missing root is not a crash) so the
     // shutdown handshake still works. The parentPort listener keeps the event
     // loop alive.
+    return;
+  }
+
+  // fn-747 watcher seam: skip the native addon dlopen entirely in the
+  // in-process tier. Transcript titles are not exercised by the in-process
+  // fold-pipeline tier, so this worker just stays alive (the parentPort listener
+  // keeps the event loop running) for the shutdown handshake.
+  if (data.disableNativeWatcher) {
     return;
   }
 

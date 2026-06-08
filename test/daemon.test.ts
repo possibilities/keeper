@@ -38,9 +38,12 @@ import {
 } from "../src/daemon";
 import { openDb, SCHEMA_VERSION } from "../src/db";
 import { serializeDeadLetterRecord } from "../src/dead-letter";
+import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
 import { drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
+import { withInProcessDaemon } from "./helpers/in-process-daemon";
+import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -2615,4 +2618,103 @@ test("boot smoke: after main pre-warm, a fleet of @parcel/watcher workers all su
   // concurrent-dlopen race re-opening.
   expect(failures).toEqual([]);
   expect(results.filter((r) => r.ok)).toHaveLength(N);
+}, 30_000);
+
+// ---------------------------------------------------------------------------
+// fn-747 task .2 — in-process daemon keystone
+// ---------------------------------------------------------------------------
+
+/**
+ * The fn-747 keystone proof: a REAL daemon booted IN THIS PROCESS via
+ * `startDaemon({ disableNativeWatcher: true })` runs the full fold pipeline
+ * (event INSERT → wake-worker drain → `jobs` projection → UDS query) and tears
+ * down cleanly via `stop()` — with NO worker-thread `@parcel/watcher` dlopen
+ * (the SIGTRAP source the serial slow tier exists to dodge). This is what lets
+ * the slow tier go `--parallel`: the heavyweight, addon-dlopening boot is gone.
+ *
+ * The trigger is a direct synthetic-event INSERT through a SECOND writer
+ * connection to the sandboxed DB — the daemon's wake worker polls
+ * `PRAGMA data_version`, sees the cross-connection write, and drains it through
+ * main's reducer exactly as a hook-sourced row would flow. We then prove BOTH
+ * halves: the projection landed (read-only DB) AND the server worker serves it
+ * over the bound UDS (`query → result`).
+ */
+test("fn-747: in-process daemon folds an event and serves it over UDS, then stops clean (no watcher dlopen)", async () => {
+  await withInProcessDaemon(async ({ dbPath, sockPath }) => {
+    const sessionId = "sess-inproc-keystone";
+
+    // Trigger: INSERT one SessionStart lifecycle event via a SECOND writer
+    // connection. The daemon holds its own writer; this cross-connection commit
+    // bumps `data_version`, which the wake worker polls and drains — the same
+    // path a hook-sourced events-log row takes once main ingests it.
+    const writer = openDb(dbPath).db;
+    writer.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, permission_mode, data)
+         VALUES (?, ?, ?, 'SessionStart', 'lifecycle', ?, 'default', '{}')`,
+      [Date.now() / 1000, sessionId, 4242, "/tmp/inproc-work"],
+    );
+    writer.close();
+
+    // Half 1 — the fold pipeline ran in-process: the reducer projected the job.
+    const reader = openDb(dbPath, { readonly: true }).db;
+    const projected = await retryUntil(() => {
+      const row = reader
+        .query("SELECT job_id FROM jobs WHERE job_id = ?")
+        .get(sessionId) as { job_id: string } | null;
+      return row ?? null;
+    }, 10_000);
+    reader.close();
+    expect(projected).not.toBeNull();
+
+    // Half 2 — the server worker serves that row over the bound UDS.
+    const frames: ServerFrame[] = [];
+    const buffer = new LineBuffer();
+    const socket = await Bun.connect({
+      unix: sockPath,
+      socket: {
+        data(_sock, chunk) {
+          for (const line of buffer.push(chunk.toString("utf8"))) {
+            if (line.trim().length > 0) {
+              frames.push(JSON.parse(line) as ServerFrame);
+            }
+          }
+        },
+      },
+    });
+    try {
+      // Query by the `job_id` pk (a detail-subscribe lookup) — this bypasses the
+      // `jobs` default `state NOT IN (ended,killed)` scope, so the served page
+      // contains our row regardless of state (a synthetic job whose `pid` isn't
+      // a live process gets reaped to `killed` by the liveness sweep — incidental
+      // to "does the server worker serve a folded row").
+      //
+      // The server worker serves `result` from its OWN read connection, which
+      // converges on its independent `data_version` poll — so a single query can
+      // race ahead of the server's fold. Re-query until the served page contains
+      // our row.
+      const served = await retryUntil(() => {
+        socket.write(
+          encodeFrame({
+            type: "query",
+            collection: "jobs",
+            filter: { job_id: sessionId },
+            id: "q1",
+          }),
+        );
+        const hit = frames.find(
+          (f) =>
+            f.type === "result" &&
+            f.collection === "jobs" &&
+            f.rows.some((r) => r.job_id === sessionId),
+        );
+        return hit ?? null;
+      }, 10_000);
+      expect(served).not.toBeNull();
+    } finally {
+      socket.end();
+    }
+  });
+  // Reaching here means the harness's `stop()` tore down all workers + db
+  // WITHOUT a `process.exit` (a `process.exit` would have killed the test
+  // runner). Clean in-process boot → fold → query → stop, proven.
 }, 30_000);

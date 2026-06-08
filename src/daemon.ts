@@ -103,6 +103,7 @@ import {
   resolveDeadLetterDir,
   resolveEventsLogDir,
   resolvePlanRoots,
+  resolveSockPath,
   resolveUsageRoot,
   runPlanctlApprovalMigration,
 } from "./db";
@@ -1238,13 +1239,60 @@ export function prewarmWatcherAddon(
 }
 
 /**
- * Run the daemon. Returns once the process is wired up and the steady-state
- * wake loop is running; the loop itself keeps the event loop alive until SIGTERM
- * or a crash. Exported (rather than executed at import) so a test can drive boot
- * drain in isolation via {@link drainToCompletion} without spawning the worker.
+ * fn-747 — options for {@link startDaemon}. The production
+ * `import.meta.main → runDaemon()` boot passes none (every field falls to its
+ * production default); the in-process test harness sets `disableNativeWatcher`.
  */
-function runDaemon(): void {
+export interface DaemonOptions {
+  /**
+   * fn-747 watcher seam. When `true`, every watcher worker (plan / git /
+   * transcript / usage / dead-letter / events-ingest) skips its
+   * `import("@parcel/watcher")` and main skips the {@link prewarmWatcherAddon}
+   * pre-warm — so an in-process daemon runs the fold pipeline WITHOUT a
+   * worker-thread NAPI-addon dlopen (the SIGTRAP source under the parallel
+   * slow-test tier). The plan-worker degrades to its `data_version`-poll +
+   * heartbeat fold path; main's events-log fallback poll still ingests every
+   * NDJSON line. Production leaves it `false` — the live FSEvents fast paths and
+   * the pre-warm are unchanged.
+   */
+  disableNativeWatcher?: boolean;
+}
+
+/**
+ * fn-747 — the handle {@link startDaemon} returns. `stop()` runs the full
+ * teardown LOGIC (set shutdown flag → post `{type:"shutdown"}` → race worker
+ * `close` vs the deadline → terminate → `db.close()`) WITHOUT `process.exit`, so
+ * a test can boot and tear down an in-process daemon many times in one process.
+ * `sockPath` is the UDS path the server worker bound (resolved the same way the
+ * worker resolves it), so the harness can `waitForDaemon(sockPath)`.
+ */
+export interface DaemonHandle {
+  /** Tear down all workers + db WITHOUT `process.exit`. Idempotent. */
+  stop(): Promise<void>;
+  /** The UDS socket path the server worker bound. */
+  sockPath: string;
+}
+
+/**
+ * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
+ * same migrate → boot-drain → seed-sweep → worker-spawn sequence as the
+ * production boot, but returns a handle whose `stop()` tears everything down
+ * WITHOUT `process.exit` — so the in-process slow-test tier (fn-747) can boot a
+ * real daemon, fold + query against it, and stop it cleanly, all in one process.
+ *
+ * The production entry point {@link runDaemon} is a thin wrapper: it calls
+ * `startDaemon()` (no opts) and installs the SIGTERM/SIGINT → exit-0 handlers,
+ * preserving the launchd `KeepAlive.SuccessfulExit=false` contract byte-for-byte
+ * (a clean stop exits 0 → launchd does NOT restart; a crash takes `fatalExit` →
+ * exit 1 → restart). `import.meta.main` still gates `runDaemon()` so a plain
+ * import stays inert.
+ */
+export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.title = "keeperd";
+  // fn-747 — resolve the UDS path the same way the server worker does, so the
+  // returned handle exposes it for `waitForDaemon` (the server worker defaults to
+  // `resolveSockPath()` when `workerData.sockPath` is omitted, which it is).
+  const sockPath = resolveSockPath();
 
   const dbPath = resolveDbPath();
   // 256MB page cache on the writer connection: folds run here under the
@@ -1567,14 +1615,21 @@ function runDaemon(): void {
   // needed). A genuine permanent load failure logs the loud boot assertion
   // inside the helper, then we take the single recovery path. See
   // {@link prewarmWatcherAddon}.
-  try {
-    prewarmWatcherAddon();
-  } catch {
-    // The loud assertion (bun version + context) already fired inside the
-    // helper. Escalate to the sole recovery path — exit non-zero so launchd
-    // restarts us. NO in-process self-heal.
-    fatalExit();
-    return;
+  // fn-747 watcher seam: when the watcher workers won't dlopen the addon at all
+  // (in-process tier), there is no first-dlopen race to pre-warm — and we MUST
+  // NOT load the addon on main either, or the in-process daemon dlopens it after
+  // all (defeating the SIGTRAP avoidance). Skip the pre-warm entirely in that
+  // mode.
+  if (!opts.disableNativeWatcher) {
+    try {
+      prewarmWatcherAddon();
+    } catch {
+      // The loud assertion (bun version + context) already fired inside the
+      // helper. Escalate to the sole recovery path — exit non-zero so launchd
+      // restarts us. NO in-process self-heal.
+      fatalExit();
+      return null as unknown as DaemonHandle;
+    }
   }
 
   // Step 3 — spawn the wake worker. Bun uses the web Worker API; `workerData`
@@ -1874,6 +1929,7 @@ function runDaemon(): void {
       workerData: {
         dbPath,
         watchRoot: resolveClaudeProjectsRoot(),
+        disableNativeWatcher: opts.disableNativeWatcher,
       } satisfies TranscriptWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
@@ -2083,6 +2139,7 @@ function runDaemon(): void {
       workerData: {
         dbPath,
         roots: planRoots,
+        disableNativeWatcher: opts.disableNativeWatcher,
       } satisfies PlanWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
@@ -2368,7 +2425,10 @@ function runDaemon(): void {
   const gitWorker = new Worker(
     new URL("./git-worker.ts", import.meta.url).href,
     {
-      workerData: { dbPath } satisfies GitWorkerData,
+      workerData: {
+        dbPath,
+        disableNativeWatcher: opts.disableNativeWatcher,
+      } satisfies GitWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
   // fn-705: publish the git-worker ref so the plan-worker `onmessage` handler's
@@ -2506,6 +2566,7 @@ function runDaemon(): void {
       workerData: {
         dbPath,
         root: resolveUsageRoot(),
+        disableNativeWatcher: opts.disableNativeWatcher,
       } satisfies UsageWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
@@ -2604,7 +2665,10 @@ function runDaemon(): void {
   const deadLetterWorker = new Worker(
     new URL("./dead-letter-worker.ts", import.meta.url).href,
     {
-      workerData: { dir: deadLetterDir } satisfies DeadLetterWorkerData,
+      workerData: {
+        dir: deadLetterDir,
+        disableNativeWatcher: opts.disableNativeWatcher,
+      } satisfies DeadLetterWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
 
@@ -2672,7 +2736,10 @@ function runDaemon(): void {
   const eventsIngestWorker = new Worker(
     new URL("./events-ingest-worker.ts", import.meta.url).href,
     {
-      workerData: { dir: eventsLogDir } satisfies EventsIngestWorkerData,
+      workerData: {
+        dir: eventsLogDir,
+        disableNativeWatcher: opts.disableNativeWatcher,
+      } satisfies EventsIngestWorkerData,
     } as WorkerOptions & { workerData: unknown },
   );
 
@@ -3340,9 +3407,16 @@ function runDaemon(): void {
     fatalExit();
   });
 
-  // Step 5 — clean shutdown. The ONLY path that exits 0; under
-  // KeepAlive.SuccessfulExit = false a clean exit tells launchd NOT to restart.
-  async function shutdown(): Promise<void> {
+  // Step 5 — clean teardown. fn-747: this is the TEARDOWN LOGIC ONLY — it sets
+  // the shutdown flag FIRST (so the `!shuttingDown` guards on every worker
+  // `onerror`/`close` keep teardown noise from tripping `fatalExit`), posts
+  // `{type:"shutdown"}` to every worker, races their `close` against the shared
+  // deadline, terminates, and closes the db — WITHOUT `process.exit`. The
+  // production exit-0 contract lives in the {@link shutdown} wrapper below (the
+  // ONLY path that exits 0); the in-process test harness calls `stop` directly
+  // so it can boot+tear-down many daemons in one process. Idempotent (the
+  // `shuttingDown` early-return makes a second call a no-op).
+  async function stop(): Promise<void> {
     if (shuttingDown) {
       return;
     }
@@ -3484,16 +3558,38 @@ function runDaemon(): void {
     } catch {
       // best-effort
     }
-
-    process.exit(0);
+    // NO `process.exit` here — the production exit-0 contract lives in
+    // {@link shutdown} (the SIGTERM/SIGINT wrapper, installed only by
+    // `runDaemon`). An in-process harness caller gets a resolved promise once
+    // teardown lands and keeps running.
   }
 
-  process.on("SIGTERM", () => {
-    void shutdown();
-  });
-  process.on("SIGINT", () => {
-    void shutdown();
-  });
+  // fn-747 — boot complete. Return the programmatic handle. The production
+  // `runDaemon` wrapper installs the SIGTERM/SIGINT → exit-0 handlers around
+  // this; an in-process caller drives `stop()` directly.
+  return { stop, sockPath };
+}
+
+/**
+ * Production daemon entry point. Boots via {@link startDaemon} (no opts — every
+ * watcher worker dlopens the addon, the pre-warm runs, full FSEvents fast paths)
+ * and installs the SIGTERM/SIGINT → clean-exit-0 handlers. This is the ONLY path
+ * that calls `process.exit(0)`: under launchd `KeepAlive.SuccessfulExit=false` a
+ * clean exit tells launchd NOT to restart, while a crash takes `fatalExit` →
+ * exit 1 → restart. Byte-for-byte the pre-fn-747 contract.
+ */
+function runDaemon(): void {
+  const { stop } = startDaemon();
+  // The ONLY path that exits 0. `stop()` runs the full teardown LOGIC (idempotent
+  // via its own `shuttingDown` guard); we exit 0 once it resolves so launchd
+  // (SuccessfulExit=false) does NOT restart a daemon that stopped cleanly.
+  const shutdown = (): void => {
+    void stop().then(() => {
+      process.exit(0);
+    });
+  };
+  process.on("SIGTERM", shutdown);
+  process.on("SIGINT", shutdown);
 }
 
 // Only boot the daemon when this file is the process entry point. A plain
