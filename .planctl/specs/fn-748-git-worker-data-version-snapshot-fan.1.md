@@ -61,5 +61,5 @@ measured numbers into the .1 done-summary.
 - [ ] Foreign-change observation latency under the storm is measured (baseline for the drop-recovery tradeoff).
 
 ## Done summary
-
+Built scripts/git-worker-cpu-soak.ts — the fn-748 evidence gate. (1) Faithful hook-feed write storm against the live daemon (PID-attributed git-child descendant tree, 30ms churn poll for short-lived git-status spawns the 1s ps misses). Measured: daemon CPU 6.6-24.5% baseline → 80-101% peak under 9-14 roots at 5/root/s (~30-70 foreign writes/s) — reproduces the 144% fan-out class; the data_version poll/fan-out scheduling machinery is the dominant cost even when fn-716 throttles raw git count to ~0. (2) FSEvents coverage VERDICT: FSEVENTS-EXHAUSTIVE — all six git-status axes (working-tree untracked/modified/deleted via the worktree sub; index/.git/index, HEAD-commit/refs/heads, HEAD-switch/.git/HEAD via the git-common-dir sub) land under a watched non-ignored path. No FSEvents-invisible-but-data_version-visible class — GO for the .2 drop. (3) Foreign-change latency: 135-301ms fast-path (SessionStart probe); worst case under FSEvents-only is the 60s heartbeat. Commit 5aae081.
 ## Evidence
