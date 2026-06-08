@@ -782,6 +782,25 @@ describe("detectBackstopTelemetry", () => {
     expect(stale?.category).toBe("backstop-degraded");
     expect(stale?.severity).toBe("critical");
     expect(stale?.evidence.stalenessMs).toBe(143108);
+    // timeout-class renders elapsed-timeout wording — NOT dropped-fast-path.
+    expect(stale?.detail).toContain("timeout");
+    expect(stale?.detail).not.toContain("fast path");
+  });
+
+  test("missed-wake-class staleness renders dropped-fast-path wording", () => {
+    const text = `${rescueLine({
+      backstop: "plan-heartbeat",
+      cls: "missed-wake",
+      staleness_ms: 143108,
+    })}\n`;
+    const { findings } = detectBackstopTelemetry({
+      text,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
+    expect(stale).toBeDefined();
+    expect(stale?.detail).toContain("fast path dropped a wake-up");
   });
 
   test("skips a null-staleness rescue (cold boot) — no finding", () => {
