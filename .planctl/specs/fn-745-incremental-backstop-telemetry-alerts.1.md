@@ -110,5 +110,5 @@ Update the `version: 1` baseline literals (866/884/909/967) to `version: 2` + wa
 - [ ] `bun test test/keeper-watch.test.ts test/backstop-stats.test.ts` passes
 
 ## Done summary
-
+Made both keeper-watch backstop detectors incremental: staleness alarm now windows on a per-(backstop,class) rescue-ts high-watermark (one old resolved rescue no longer re-pages), and the missed-wake delta keys off rescues_total instead of fires_total. Bumped BACKSTOP_BASELINE_VERSION 1->2 for a silent reseed (first tick fires nothing, seeds the watermark); rescue-only buckets persist a watermark with optional counters. StatsRow gained additive per-rescue {ts, staleness_ms} samples.
 ## Evidence
