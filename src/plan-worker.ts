@@ -409,6 +409,19 @@ const MAX_PLAN_FILE_BYTES = 1024 * 1024;
 const BACKSTOP_ALARM_COOLDOWN_MS = 60_000;
 
 /**
+ * fn-737 per-wake-path attribution window (ms). When a missed-wake backstop
+ * fires, {@link PlanScanner.recentFastPaths} reports which fast-path labels
+ * stamped {@link PlanScanner.markFastPath} within this trailing window — the
+ * evidence that disambiguates a heartbeat defaulting `fast_path:
+ * "data_version_poll"` from the real miss (e.g. a no-reflog-watch commit, where
+ * NO fast path fired at all). One git-worker heartbeat (60s) wide so a recent
+ * foreign-commit signal is still in view when the plan heartbeat next fires;
+ * the stamp list is pruned to this window so it stays bounded. Producer-side
+ * only — never read in a fold.
+ */
+const FAST_PATH_ATTRIBUTION_WINDOW_MS = 60_000;
+
+/**
  * Aggressive POSITIVE ignore globs — the #1 perf lever for broad roots like
  * `~/code` / `~/src`. Without these, every git/npm/build churn under the root
  * floods the FSEvents callback. These are passed to `@parcel/watcher`'s
@@ -998,6 +1011,17 @@ export class PlanScanner {
    * counters are NEVER gated, so the metric stays complete).
    */
   private lastFastPathAt: number | null = null;
+  /**
+   * fn-737 per-wake-path attribution: the recent fast-path stamps, each
+   * `{label, at}`, most-recent LAST (append order). {@link recentFastPaths}
+   * filters this to the attribution window when a heartbeat fires, so a
+   * missed-wake record can name WHICH fast path(s) recently delivered work —
+   * disambiguating a heartbeat that defaults `fast_path:"data_version_poll"`
+   * from the real miss (e.g. a no-reflog-watch commit). Bounded by pruning to
+   * the window on every {@link markFastPath} stamp. Pure in-memory; producer-
+   * side only (never read in a fold).
+   */
+  private readonly fastPathStamps: { label: string; at: number }[] = [];
   private readonly backstopCounters = new BackstopCounters();
   private readonly backstopAlarmLimiter = new BackstopRateLimiter(
     BACKSTOP_ALARM_COOLDOWN_MS,
@@ -1009,9 +1033,49 @@ export class PlanScanner {
    * `data_version`-poll re-scan, the reflog-driven `recheckPending` drain) — NOT
    * on a heartbeat / FSEvents-drop fire (those are the BACKSTOPS that READ this
    * value to compute staleness). Pure in-memory; no I/O.
+   *
+   * fn-737: `label` names which fast path stamped (e.g. `fsevents`, `db-poll`,
+   * `reflog`); it's appended to {@link fastPathStamps} (pruned to the
+   * attribution window) so a later backstop can attribute the miss. The label
+   * defaults to a generic marker so legacy call sites stay valid; the live
+   * worker passes the specific path.
    */
-  markFastPath(): void {
-    this.lastFastPathAt = this.now();
+  markFastPath(label = "unknown"): void {
+    const now = this.now();
+    this.lastFastPathAt = now;
+    this.fastPathStamps.push({ label, at: now });
+    // Prune to the attribution window so the list stays bounded (the heartbeat
+    // attribution only cares about recent stamps; an old one is just noise).
+    const floor = now - FAST_PATH_ATTRIBUTION_WINDOW_MS;
+    while (
+      this.fastPathStamps.length > 0 &&
+      this.fastPathStamps[0].at < floor
+    ) {
+      this.fastPathStamps.shift();
+    }
+  }
+
+  /**
+   * fn-737: the fast-path labels that stamped within the attribution window
+   * ending at `now`, MOST-RECENT FIRST, de-duplicated (a path that fired twice
+   * in the window appears once, at its latest position). Drives the
+   * `recent_fast_paths` attribution on a missed-wake record. Returns `[]` when
+   * no fast path fired in the window (cold boot or a long stall) — the caller
+   * then OMITS the field so the legacy record shape is preserved.
+   */
+  recentFastPaths(now: number): string[] {
+    const floor = now - FAST_PATH_ATTRIBUTION_WINDOW_MS;
+    const seen = new Set<string>();
+    const out: string[] = [];
+    // Walk newest→oldest so the first sighting of each label is its latest.
+    for (let i = this.fastPathStamps.length - 1; i >= 0; i--) {
+      const stamp = this.fastPathStamps[i];
+      if (stamp.at < floor) break;
+      if (seen.has(stamp.label)) continue;
+      seen.add(stamp.label);
+      out.push(stamp.label);
+    }
+    return out;
   }
 
   /**
@@ -1029,9 +1093,20 @@ export class PlanScanner {
     backstop: "plan-heartbeat" | "rescan-drop",
     fastPath: string,
     rescued: boolean,
+    /**
+     * fn-737 per-wake-path attribution: whether a `.git/logs/HEAD` reflog watch
+     * was ARMED at fire time for the repo(s) this backstop covers. The worker
+     * passes `present` when at least one currently-pending repo had a live
+     * reflog subscription, `absent` when a pending repo had none (the prime-
+     * suspect slow path), and omits it when there's no per-repo notion. Carried
+     * onto the missed-wake record; producer-side only.
+     */
+    reflogWatch?: "present" | "absent",
   ): void {
     this.backstopCounters.bump(backstop, "missed-wake", rescued);
     if (!rescued) return;
+    const now = this.now();
+    const recent = this.recentFastPaths(now);
     this.postBackstop({
       kind: "backstop",
       record: buildMissedWakeRecord({
@@ -1039,8 +1114,10 @@ export class PlanScanner {
         worker: "plan-worker",
         fastPath,
         rescued: true,
-        now: this.now(),
+        now,
         lastFastPathAt: this.lastFastPathAt,
+        reflogWatch,
+        recentFastPaths: recent.length > 0 ? recent : undefined,
       }),
     });
   }
@@ -1708,7 +1785,10 @@ export class PlanScanner {
     // FAST path — stamp `last_fast_path_at` so a later heartbeat measures
     // staleness against it. Stamped after the empty-check so a no-op recheck
     // (nothing pending) does NOT pretend a fast path delivered work.
-    this.markFastPath();
+    // fn-737: label as `recheck-pending` so a later backstop's attribution can
+    // name this path; the reflog watch is the dominant driver of this drain for
+    // the no-pending-repo-commit case the epic targets.
+    this.markFastPath("recheck-pending");
     // Group the in-scope pending paths by repo root. `root` set → only that
     // repo's paths; absent → every repo with at least one pending path. A path
     // whose repo root can't be derived (shape drift) is skipped — it has no
@@ -3008,6 +3088,24 @@ function main(): void {
     }
   };
 
+  // fn-737 per-wake-path attribution. Classify, at backstop-fire time, whether
+  // the currently-pending repos had a reflog watch armed. Returns `absent` when
+  // AT LEAST ONE pending repo has NO live reflog subscription (the prime-suspect
+  // slow path: a commit in a no-pending-repo never armed a watch, so the
+  // in-HEAD transition had no FSEvents trigger and fell to this heartbeat),
+  // `present` when every pending repo had a watch (so a present-but-missed
+  // FSEvents signal, not a coverage gap), and `undefined` when nothing is
+  // pending (no per-repo notion to attribute). Pure read of the live watch set;
+  // producer-side only, never consulted in a fold.
+  const reflogWatchAttribution = (): "present" | "absent" | undefined => {
+    const pending = scanner.pendingRepos();
+    if (pending.size === 0) return undefined;
+    for (const root of pending) {
+      if (!reflogSubs.has(root)) return "absent";
+    }
+    return "present";
+  };
+
   // ── fn-705 discovery nudge ─────────────────────────────────────────────────
   // The git-worker discovers repos to watch from `jobs.cwd` seen-cwds, so a
   // repo keeper has never seen a session in is unwatched — no GitSnapshot /
@@ -3276,7 +3374,19 @@ function main(): void {
         "heartbeat",
         nudgeFromPlanctlDir,
       );
-      scanner.fireBackstop("plan-heartbeat", "data_version_poll", rescued);
+      // fn-737 per-wake-path attribution: classify whether the rescued repos
+      // had a reflog watch armed. `absent` is the prime-suspect slow path — a
+      // commit in a no-pending repo (so no reflog watch, no DB write) is
+      // invisible to every fast path until this heartbeat. `present` means a
+      // reflog watch existed but its FSEvents signal was nonetheless missed
+      // (an FSEvents-reliability miss, not a coverage gap). Omit when nothing
+      // is pending (no per-repo notion).
+      scanner.fireBackstop(
+        "plan-heartbeat",
+        "data_version_poll",
+        rescued,
+        reflogWatchAttribution(),
+      );
     } catch (err) {
       console.error(
         `[plan-worker] periodic reconcile failed: ${stringifyErr(err)}`,
@@ -3329,7 +3439,8 @@ function main(): void {
       // fn-720: the `data_version` poll IS a fast path — stamp `last_fast_path_at`
       // so a later heartbeat can compute staleness against it. NOT a missed-wake
       // record (a db-poll emit is a normal fast-path success, never a rescue).
-      scanner.markFastPath();
+      // fn-737: label `db-poll` for per-wake-path attribution.
+      scanner.markFastPath("db-poll");
       reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
     },
     () => shuttingDown,
@@ -3440,7 +3551,15 @@ function main(): void {
             "fswatcher-drop",
             nudgeFromPlanctlDir,
           );
-          scanner.fireBackstop("rescan-drop", "fsevents", rescued);
+          // fn-737: this drop-rescan is scoped to ONE `root`, so attribute the
+          // reflog watch for that root specifically — `present`/`absent` only
+          // when the root is actually pending (otherwise no per-repo notion).
+          const reflogWatch = scanner.pendingRepos().has(root)
+            ? reflogSubs.has(root)
+              ? "present"
+              : "absent"
+            : undefined;
+          scanner.fireBackstop("rescan-drop", "fsevents", rescued, reflogWatch);
         });
         schedulers.push(rescan);
         watcher
@@ -3467,7 +3586,8 @@ function main(): void {
               // files — stamp `last_fast_path_at` so a later heartbeat measures
               // staleness against it (and a working watcher keeps the heartbeat
               // a perpetual no-op rescue).
-              scanner.markFastPath();
+              // fn-737: label `fsevents` for per-wake-path attribution.
+              scanner.markFastPath("fsevents");
               for (const ev of events) {
                 // The in-callback `.planctl/{epics,tasks}/*.json` filter (via
                 // classifyPlanPath, applied inside onChange) is what guarantees

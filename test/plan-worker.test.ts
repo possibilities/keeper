@@ -30,6 +30,7 @@ import type {
   BackstopRecord,
   BackstopRollup,
 } from "../src/backstop-telemetry";
+import { buildMissedWakeRecord } from "../src/backstop-telemetry";
 import { openDb } from "../src/db";
 import {
   buildEpicMessage,
@@ -47,6 +48,7 @@ import {
   PLAN_DB_POLL_MS,
   type PlanMessage,
   PlanScanner,
+  RECONCILE_HEARTBEAT_MS,
   reconcilePlanctlDirs,
   repoRootFromPlanctlPath,
   scanRoot,
@@ -3731,4 +3733,475 @@ test("fn-720: recheckPending stamps a fast path (so a later heartbeat measures s
   scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
   expect(records[0]?.last_fast_path_at).toBe(3000);
   expect(records[0]?.staleness_ms).toBe(6000);
+});
+
+// ---------------------------------------------------------------------------
+// (z2) fn-737 per-wake-path attribution — the missed-wake record now names
+//      WHICH fast paths recently stamped (recent_fast_paths) and whether a
+//      reflog watch was present, so a slow fold can be attributed to a coverage
+//      gap (no reflog watch) vs an FSEvents-reliability miss. Producer-side
+//      only — driven through the pure PlanScanner + buildMissedWakeRecord.
+// ---------------------------------------------------------------------------
+
+test("fn-737 attribution: a heartbeat rescue carries recent_fast_paths naming the labels that recently stamped (most-recent first, de-duped)", () => {
+  const { scanner, records, setNow } = backstopScanner();
+  // Three labelled fast-path stamps within the attribution window, db-poll
+  // twice (the de-dup case).
+  setNow(1000);
+  scanner.markFastPath("db-poll");
+  setNow(2000);
+  scanner.markFastPath("fsevents");
+  setNow(3000);
+  scanner.markFastPath("db-poll");
+
+  // Heartbeat fires at t=4000 — well inside the 60s window.
+  setNow(4000);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
+
+  expect(records).toHaveLength(1);
+  // Most-recent first, each label once: db-poll (t=3000) then fsevents (t=2000).
+  expect(records[0]?.recent_fast_paths).toEqual(["db-poll", "fsevents"]);
+});
+
+test("fn-737 attribution: stamps older than the attribution window are pruned out of recent_fast_paths", () => {
+  const { scanner, records, setNow } = backstopScanner();
+  // A stamp far in the past (outside the 60s window when the heartbeat fires).
+  setNow(0);
+  scanner.markFastPath("db-poll");
+  // A recent stamp inside the window.
+  setNow(100_000);
+  scanner.markFastPath("fsevents");
+
+  // Heartbeat at t=100_001 — only the fsevents stamp is within the 60s window.
+  setNow(100_001);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
+  expect(records[0]?.recent_fast_paths).toEqual(["fsevents"]);
+});
+
+test("fn-737 attribution: a missed-wake record with NO fast path in window OMITS recent_fast_paths (legacy shape preserved)", () => {
+  const { scanner, records, setNow } = backstopScanner();
+  // No markFastPath ever → cold boot.
+  setNow(5000);
+  scanner.fireBackstop("plan-heartbeat", "data_version_poll", true);
+  expect(records).toHaveLength(1);
+  // Field absent (not undefined-keyed) — exact legacy shape.
+  expect("recent_fast_paths" in (records[0] as object)).toBe(false);
+  expect("reflog_watch" in (records[0] as object)).toBe(false);
+});
+
+test("fn-737 attribution: buildMissedWakeRecord carries reflog_watch present|absent when supplied, omits it otherwise", () => {
+  const present = buildMissedWakeRecord({
+    backstop: "plan-heartbeat",
+    worker: "plan-worker",
+    fastPath: "data_version_poll",
+    rescued: true,
+    now: 10,
+    lastFastPathAt: 5,
+    reflogWatch: "present",
+  });
+  expect(present.reflog_watch).toBe("present");
+
+  const absent = buildMissedWakeRecord({
+    backstop: "plan-heartbeat",
+    worker: "plan-worker",
+    fastPath: "data_version_poll",
+    rescued: true,
+    now: 10,
+    lastFastPathAt: 5,
+    reflogWatch: "absent",
+  });
+  expect(absent.reflog_watch).toBe("absent");
+
+  const omitted = buildMissedWakeRecord({
+    backstop: "plan-heartbeat",
+    worker: "plan-worker",
+    fastPath: "data_version_poll",
+    rescued: true,
+    now: 10,
+    lastFastPathAt: 5,
+  });
+  expect("reflog_watch" in omitted).toBe(false);
+});
+
+test("fn-737 attribution: an empty recentFastPaths array is omitted (no empty-array noise on the record)", () => {
+  const rec = buildMissedWakeRecord({
+    backstop: "plan-heartbeat",
+    worker: "plan-worker",
+    fastPath: "data_version_poll",
+    rescued: true,
+    now: 10,
+    lastFastPathAt: 5,
+    recentFastPaths: [],
+  });
+  expect("recent_fast_paths" in rec).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// (z3) fn-737 controlled before/after fold-latency harness — the acceptance
+//      instrument for task .2. Drives REAL git commits (Bun.spawnSync) through
+//      a REAL spawned plan-worker for BOTH (a) a pending-repo planctl change
+//      and (b) a no-pending-repo foreign commit, measuring op->snapshot fold
+//      latency and reporting p50/p95. The latency signal mirrors
+//      cli/keeper-watch.ts detectFoldLatency (snapshot.ts - op.ts), measured
+//      here as wall-clock from "git commit returned" to "plan-worker emitted
+//      the snapshot for that entity". Re-runnable as the .2 proof harness.
+// ---------------------------------------------------------------------------
+
+/**
+ * Percentile over a sorted ascending sample (ms). Mirrors the index formula in
+ * scripts/backstop-stats.ts so the harness reports the same shape the .2 proof
+ * will. Returns null on an empty sample.
+ */
+function pct(sortedAsc: number[], p: number): number | null {
+  if (sortedAsc.length === 0) return null;
+  const idx = Math.min(
+    sortedAsc.length - 1,
+    Math.max(0, Math.floor((p / 100) * sortedAsc.length)),
+  );
+  return sortedAsc[idx];
+}
+
+/**
+ * Wait until `cond()` is true or the deadline passes; poll at `stepMs`.
+ * Returns whether the condition was met.
+ */
+async function waitFor(
+  cond: () => boolean,
+  timeoutMs: number,
+  stepMs = 10,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond() && Date.now() < deadline) {
+    await Bun.sleep(stepMs);
+  }
+  return cond();
+}
+
+test("fn-737 latency harness: measures op->snapshot fold latency for a pending-repo planctl change (real git, p50/p95)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  // Bootstrap schema; a separate writer connection synthesizes the close->approve
+  // `Commit` DB write that bumps the worker's read-only data_version (the realtime
+  // db-poll trigger for a repo keeper IS already watching, i.e. has a pending path).
+  openDb(dbPath).db.close();
+
+  const root = join(tmpDir, "pending-repo");
+  mkdirSync(root);
+  gitInit(root);
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    { workerData: { dbPath, roots: [root], pollMs: 25 } } as WorkerOptions & {
+      workerData: unknown;
+    },
+  );
+
+  const seen = new Map<string, number>(); // epic id -> wall-clock ms first seen
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const m = ev.data as { kind?: string; id?: string };
+    if (
+      m?.kind === "plan-epic" &&
+      typeof m.id === "string" &&
+      !seen.has(m.id)
+    ) {
+      seen.set(m.id, performance.now());
+    }
+  });
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  await Bun.sleep(250); // boot + subscribe + boot-scan
+  expect(crashed).toBe(false);
+
+  const writer = openDb(dbPath).db;
+  const insert = writer.query(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (?, 's', 'Stop', 'lifecycle', '{}')",
+  );
+
+  const ROUNDS = 5;
+  const latencies: number[] = [];
+  for (let i = 0; i < ROUNDS; i++) {
+    const id = `fn-${100 + i}-pending`;
+    const epicPath = join(epicDir, `${id}.json`);
+    writeFileSync(
+      epicPath,
+      JSON.stringify({
+        id,
+        title: "Pending",
+        status: "open",
+        primary_repo: root,
+      }),
+    );
+    // Let the uncommitted write bounce into pending (gated, not emitted) so the
+    // repo IS pending and a reflog watch arms — then commit + bump data_version
+    // (the realtime path). The deadline is wider than RECONCILE_HEARTBEAT_MS so
+    // the 5s heartbeat is a guaranteed backstop and no round hard-fails on a
+    // dropped fast path — the MEASURED latency (fast or heartbeat-bound) is the
+    // honest signal.
+    await Bun.sleep(120);
+    git(root, "add", epicPath);
+    git(root, "commit", "-q", "-m", `add ${id}`);
+    const op = performance.now();
+    insert.run(i + 1);
+    const ok = await waitFor(() => seen.has(id), 8000);
+    expect(ok).toBe(true);
+    latencies.push((seen.get(id) as number) - op);
+  }
+  writer.close();
+
+  // The harness deterministically measured op->snapshot latency for every round.
+  expect(latencies).toHaveLength(ROUNDS);
+  for (const l of latencies) expect(l).toBeGreaterThanOrEqual(0);
+  const sorted = [...latencies].sort((a, b) => a - b);
+  const p50 = pct(sorted, 50);
+  const p95 = pct(sorted, 95);
+  expect(p50).not.toBeNull();
+  expect(p95).not.toBeNull();
+  console.log(
+    `[fn-737 harness] pending-repo planctl change op->snapshot latency: ` +
+      `p50=${Math.round(p50 as number)}ms p95=${Math.round(p95 as number)}ms ` +
+      `n=${ROUNDS} samples=[${sorted.map((x) => Math.round(x)).join(",")}]ms`,
+  );
+
+  worker.postMessage({ type: "shutdown" });
+  const res = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(res).toBe("exited");
+  expect(crashed).toBe(false);
+});
+
+test("fn-737 latency harness: measures op->snapshot fold latency for a no-pending-repo foreign commit + attributes the rescuing path (real git, p50/p95)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  // Bootstrap schema then NEVER write the DB again — this isolates the
+  // NO-data_version-bump, NO-recheck-pending-post path the epic's prime-suspect
+  // names: a commit in a repo whose `.planctl` change keeper sees only via
+  // FSEvents/reflog, never via a DB write. With a LONG db-poll (below) the
+  // data_version poll is excluded, so the realtime trigger is FSEvents (the file
+  // creation bounces to pending + arms a `.git/logs/HEAD` reflog watch) → the
+  // reflog watch fires on commit → recheckPending → emit. The HEARTBEAT (5s) is
+  // the backstop if that chain drops. The harness MEASURES whichever fired and
+  // CAPTURES the backstop attribution so the diagnosis is grounded, not assumed.
+  openDb(dbPath).db.close();
+
+  const root = join(tmpDir, "foreign-repo");
+  mkdirSync(root);
+  gitInit(root); // reflogs on
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    // A LONG poll so the data_version poll can't be the trigger; only FSEvents/
+    // reflog or the heartbeat (RECONCILE_HEARTBEAT_MS=5s) can clear the commit.
+    {
+      workerData: { dbPath, roots: [root], pollMs: 60_000 },
+    } as WorkerOptions & {
+      workerData: unknown;
+    },
+  );
+
+  const seen = new Map<string, number>();
+  // fn-737: capture the worker's backstop telemetry to attribute the rescue.
+  const backstops: BackstopRecord[] = [];
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const m = ev.data as {
+      kind?: string;
+      id?: string;
+      record?: BackstopRecord | BackstopRollup;
+    };
+    if (
+      m?.kind === "plan-epic" &&
+      typeof m.id === "string" &&
+      !seen.has(m.id)
+    ) {
+      seen.set(m.id, performance.now());
+    } else if (m?.kind === "backstop" && m.record?.kind === "backstop-rescue") {
+      backstops.push(m.record);
+    }
+  });
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  await Bun.sleep(300); // boot + subscribe + boot-scan
+  expect(crashed).toBe(false);
+
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+
+  // Two rounds keep the test bounded (each round may wait a heartbeat).
+  const ROUNDS = 2;
+  const latencies: number[] = [];
+  for (let i = 0; i < ROUNDS; i++) {
+    const id = `fn-${200 + i}-foreign`;
+    const epicPath = join(epicDir, `${id}.json`);
+    writeFileSync(
+      epicPath,
+      JSON.stringify({
+        id,
+        title: "Foreign",
+        status: "open",
+        primary_repo: root,
+      }),
+    );
+    git(root, "add", epicPath);
+    git(root, "commit", "-q", "-m", `add ${id}`);
+    const op = performance.now();
+    // Generous deadline: this path may be heartbeat-bound (5s) if FSEvents/reflog drop.
+    const ok = await waitFor(() => seen.has(id), 20_000, 50);
+    expect(ok).toBe(true);
+    latencies.push((seen.get(id) as number) - op);
+  }
+
+  expect(latencies).toHaveLength(ROUNDS);
+  for (const l of latencies) expect(l).toBeGreaterThanOrEqual(0);
+  const sorted = [...latencies].sort((a, b) => a - b);
+  const p50 = pct(sorted, 50);
+  const p95 = pct(sorted, 95);
+  expect(p50).not.toBeNull();
+  expect(p95).not.toBeNull();
+  // Attribution surface: any heartbeat rescue in this no-data_version window
+  // carries the fn-737 per-wake-path fields (reflog_watch present/absent +
+  // recent_fast_paths). We don't ASSERT a specific rescue fired (the fast path
+  // may have caught it sub-heartbeat — itself the key diagnosis), we report it.
+  const attribution = backstops.map((b) => ({
+    backstop: b.backstop,
+    reflog_watch: b.reflog_watch ?? "(omitted)",
+    recent_fast_paths: b.recent_fast_paths ?? [],
+    staleness_ms: b.staleness_ms,
+  }));
+  console.log(
+    `[fn-737 harness] no-pending-repo foreign commit op->snapshot latency: ` +
+      `p50=${Math.round(p50 as number)}ms p95=${Math.round(p95 as number)}ms ` +
+      `n=${ROUNDS} samples=[${sorted.map((x) => Math.round(x)).join(",")}]ms`,
+  );
+  console.log(
+    `[fn-737 harness] backstop rescues during window: ` +
+      `${backstops.length} — ${JSON.stringify(attribution)}`,
+  );
+
+  worker.postMessage({ type: "shutdown" });
+  const res = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(res).toBe("exited");
+  expect(crashed).toBe(false);
+});
+
+test("fn-737 latency harness: reflogs-OFF degrades to the `.git/HEAD` directory watch (NOT the 5s heartbeat) — the measured finding that the realtime triggers are robust", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  // This is the harness's KEY DIAGNOSTIC. The epic's prime-suspect hypothesis is
+  // "a no-pending / no-reflog-watch commit is invisible until the 5s heartbeat."
+  // The harness DISPROVES that for a CONFIGURED-ROOT watch:
+  //   - reflogs OFF + `.git/logs` removed → resolveReflogTarget falls back to
+  //     `.git/HEAD`. But `@parcel/watcher` watches the `.git` DIRECTORY
+  //     (dirname of the target) and the reflog callback fires on ANY `.git`
+  //     write — and a commit writes `.git/index`, `.git/refs/...`,
+  //     `.git/COMMIT_EDITMSG`, etc. So even with reflogs OFF the fallback watch
+  //     is a de-facto commit signal → recheckPending → emit, sub-second.
+  //   - a LONG db-poll + never writing the DB → no data_version trigger.
+  // The measured result: the commit surfaces via the reflog FALLBACK watch in
+  // ~1s, NOT the 5s heartbeat. The 5s heartbeat-bound case is therefore NARROW
+  // (it needs the realtime triggers to genuinely drop), which directs .2 at
+  // reflog-coverage WIDENING rather than at the heartbeat cadence. The
+  // synthetic-clock unit tests above cover the pure heartbeat-rescue path.
+  openDb(dbPath).db.close();
+
+  const root = join(tmpDir, "reflogoff-repo");
+  mkdirSync(root);
+  gitInit(root);
+  git(root, "config", "core.logAllRefUpdates", "false");
+  rmSync(join(root, ".git", "logs"), { recursive: true, force: true });
+
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  const id = "fn-300-reflogoff";
+  const epicPath = join(epicDir, `${id}.json`);
+  writeFileSync(
+    epicPath,
+    JSON.stringify({
+      id,
+      title: "ReflogOff",
+      status: "open",
+      primary_repo: root,
+    }),
+  );
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath, roots: [root], pollMs: 60_000 },
+    } as WorkerOptions & {
+      workerData: unknown;
+    },
+  );
+
+  let seenAt: number | null = null;
+  const backstops: BackstopRecord[] = [];
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const m = ev.data as {
+      kind?: string;
+      id?: string;
+      record?: BackstopRecord | BackstopRollup;
+    };
+    if (m?.kind === "plan-epic" && m.id === id && seenAt === null) {
+      seenAt = performance.now();
+    } else if (m?.kind === "backstop" && m.record?.kind === "backstop-rescue") {
+      backstops.push(m.record);
+    }
+  });
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  // Boot + boot-scan: the uncommitted epic bounces to pending (NOT emitted) and
+  // a `.git/HEAD`-fallback reflog watch on the `.git` dir is armed.
+  await Bun.sleep(300);
+  expect(crashed).toBe(false);
+  expect(seenAt).toBeNull();
+
+  // Commit — `.git` dir churns (index/refs/COMMIT_EDITMSG), the fallback watch
+  // fires → recheckPending → in-HEAD → emit. NO DB write, NO heartbeat needed.
+  git(root, "add", epicPath);
+  git(root, "commit", "-q", "-m", `add ${id}`);
+  const op = performance.now();
+  const ok = await waitFor(() => seenAt !== null, 20_000, 50);
+  expect(ok).toBe(true);
+  // `seenAt` is set inside the message listener (invisible to control-flow
+  // analysis, which narrowed it to `null` at line ~4152), so cast through
+  // `unknown` — `ok === true` guarantees it is a number here.
+  const latency = (seenAt as unknown as number) - op;
+
+  // The defining assertion: this is FAST (the fallback `.git` watch caught it),
+  // well UNDER one heartbeat — disproving the heartbeat-bound hypothesis for a
+  // configured-root watch and pinning the real lever (reflog coverage) for .2.
+  expect(latency).toBeLessThan(RECONCILE_HEARTBEAT_MS);
+  console.log(
+    `[fn-737 harness] reflogs-OFF (.git/HEAD fallback dir watch) op->snapshot ` +
+      `latency: ${Math.round(latency)}ms (< RECONCILE_HEARTBEAT_MS=${RECONCILE_HEARTBEAT_MS}); ` +
+      `heartbeat rescues during window: ${backstops.filter((b) => b.backstop === "plan-heartbeat").length}`,
+  );
+
+  worker.postMessage({ type: "shutdown" });
+  const res2 = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(res2).toBe("exited");
+  expect(crashed).toBe(false);
 });
