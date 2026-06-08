@@ -43,5 +43,5 @@ writes don't bump data_version, so keep the explicit kick).
   + single-writer transaction + poll/kick contract unchanged.
 
 ## Done summary
-
+Pulled the .1 fold-batch lever: shrank DEFAULT_BATCH_SIZE 200->50 (yields the writer lock to hook INSERTs ~4x more often) and added a 30s steady-state wal_checkpoint(PASSIVE) heartbeat. Harness leg 4 on a live keeper.db copy proves the p95 win: per-drain() writer-lock hold (the window a hook INSERT waits) p95 2977ms->688ms (~4.3x), addressing the 5.4s-fold tail. Pinned batch-size fold-invariance (byte-identical projection+cursor at batch=50 vs 200); single-writer txn, re-fold determinism, and the data_version poll/kick contract unchanged.
 ## Evidence
