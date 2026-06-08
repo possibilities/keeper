@@ -1,74 +1,69 @@
 ## Description
 
-**Size:** S
-**Files:** scripts/soak-slow-tests.ts (new), package.json
+**Size:** M
+**Files:** test/integration.test.ts, test/plan-worker.test.ts, test/daemon.test.ts, scripts/soak-slow-tests.ts, package.json, README.md, CLAUDE.md
 
 ### Approach
 
-Two coupled changes that land together and are verified by running the
-new harness:
+With the in-process harness + watcher seam from `.2`, lighten the slow
+tier so it is parallel-safe, then prove it with the soak harness.
 
-1. **Add `scripts/soak-slow-tests.ts`** — `#!/usr/bin/env bun`,
-   executable, matching the repo's Bun-native `scripts/*.ts` convention
-   (NOT a `.sh` — that would be the repo's first shell script and drag in
-   shellcheck). It runs the slow tier N times (default 20; override via
-   argv/env), **sequentially** (parallel iterations would multiply socket
-   collisions and become a flake source themselves), **run-all** (don't
-   stop on first fail — a full N gives a flake-RATE, e.g. 2/20, not just
-   a yes/no), with an optional `--bail`/stop flag. Each iteration shells
-   a fresh `bun test <slow-tier files>` via `Bun.spawn` (NOT
-   `bun test --rerun-each`, which has a known beforeEach/afterEach count
-   bug, oven-sh/bun#13493), captures exit code + elapsed + stderr to a
-   per-run log file, prints a per-run line, and ends with a summary
-   table (Runs / Passes / Fails / which runs failed / PASS|FLAKY).
-   **Exit non-zero iff any iteration failed.** Mirror
-   `scripts/backstop-stats.ts` aggregation/reporting style.
-2. **Flip `test:slow`** in `package.json` to add `--parallel` across the
-   3 files, and add a `test:soak` npm script invoking the harness.
-3. **Verify by soaking** ≥20x with 0 failures before considering done.
+1. **Convert the daemon-dependent integration tests** that only assert UDS
+   query/RPC/fold (`integration.test.ts:475, 628, 804, 1012, 1104, 1207`)
+   to `withInProcessDaemon`. KEEP ~4 true subprocess smoke tests for the
+   real process boundary: `:288` (hook→event→fold→exit 0), `:1610`
+   (restart-reconcile), `:1813` (SIGKILL exit-watcher), `:2015` (argv
+   assertion).
+2. **Convert the worker-spawn tests** in `plan-worker.test.ts`
+   (`:2693/2760/2864/2948/3536`) and `daemon.test.ts` to the no-addon-dlopen
+   path where possible; keep the single native-addon smoke
+   (`plan-worker.test.ts:3489`) isolated. The pure `PlanScanner` layer is
+   already parallel-safe.
+3. **Recompose `package.json`** — flip `test:slow` to `--parallel` over the
+   now-light tier (drop the fallback `&& plan-worker serial` split); keep
+   the `test:soak` script.
+4. **Rewrite `scripts/soak-slow-tests.ts`** — its header narrative and
+   `TIER_PHASES` const bake in the now-stale "plan-worker STAYS SERIAL /
+   Bun 1.3.14's fix doesn't cover the addon" fallback. Re-point at the
+   lightened single-phase parallel tier.
+5. **Soak ≥20x = 0 fails;** confirm umbrella green; fix README (~L510-528)
+   + CLAUDE.md Test-isolation prose that implies the slow tier is serial.
 
 ### Investigation targets
 
 **Required** (read before coding):
-- package.json:11-16 — the `test:*` block; `test:slow` is the line to flip, `test` is the umbrella to keep accurate
-- scripts/backstop-stats.ts — Bun `.ts` reporter shape + aggregation style to mirror
-- .planctl/specs/fn-722-fast-two-tier-keeper-test-gate.md (and `.1`) — the plan-worker `@parcel/watcher` `--parallel`-panic carve-out: the exact premise this task must re-verify
-- test/helpers/wait-for-daemon.ts — why the slow tier carries 30s boot ceilings (contention sensitivity); informs why soak gates on pass/fail, not timing
+- test/helpers/in-process-daemon.ts — the `.2` harness to migrate onto
+- test/integration.test.ts — convert :475/628/804/1012/1104/1207; keep :288/1610/1813/2015 as subprocess
+- scripts/soak-slow-tests.ts — header + `TIER_PHASES` to rewrite (currently the stale fallback split)
+- package.json:11-16 — `test:slow` / `test:soak` / the umbrella `test`
 
 **Optional** (reference as needed):
-- test/helpers/sandbox-env.ts — the six-path sandbox; the harness only shells `bun test`, so it inherits the test files' own sandboxing and must NOT invent its own un-sandboxed daemon spawn
-- src/plan-worker.ts:23-51 — `@parcel/watcher` external-resource ownership (the native addon in question)
+- test/plan-worker.test.ts:2693/2760/2864/2948/3536 (Worker spawns), :3489 (addon smoke)
+- README.md ~L510-528, CLAUDE.md Test isolation section
 
 ### Risks
 
-- **plan-worker may panic under `--parallel`** — the documented reason
-  (9558382) it was made serial. Lighter 3-file load + Bun 1.3.14's
-  parallel/isolate fix mean it MAY be clean now, but the soak must prove
-  it. **Fallback:** parallelize `integration`+`daemon` only, keep
-  `plan-worker` serial (e.g. `test:slow` =
-  `bun test --parallel test/integration.test.ts test/daemon.test.ts && bun test test/plan-worker.test.ts`),
-  and point the harness at the final tier composition.
-- **Contention-driven wall-time spikes** — fn-722.7 saw the tier slip
-  10s→36s under box load. The harness must gate on pass/fail ONLY; treat
-  timing as informational, never a hard threshold.
-- **Real-feed pollution** — safe only because the slow test files
-  self-sandbox the six `KEEPER_*` state paths. The harness must not spawn
-  its own daemon; it only reruns `bun test`.
+- A converted test may still need the live `.planctl` watch (e.g.
+  `integration.test.ts:1207` plan-worker fold) — use the `.2`
+  manual-rescan/poll seam instead of the native subscribe.
+- Contention wall-time spikes (fn-722.7: 10s→36s under box load) are
+  environmental; the soak gates on pass/fail ONLY, never timing.
 
 ### Test notes
 
-- Verification IS the soak: ≥20 consecutive runs, 0 failures; paste the
-  summary table as Evidence. Mirror the repo's existing
-  "0 flakes over N consecutive runs" vocabulary (fn-722 / fn-683).
-- Confirm the full `bun run test` umbrella stays green after the flip.
+- Verification IS the soak: ≥20 consecutive parallel runs, 0 failures;
+  paste the summary table as Evidence. Mirror the repo's "0 flakes over N
+  consecutive runs" vocabulary (fn-722 / fn-683). Confirm `bun run test`
+  umbrella green.
 
 ## Acceptance
 
-- [ ] `scripts/soak-slow-tests.ts` exists, `#!/usr/bin/env bun`, executable; runs the slow tier N times (default 20) sequentially, run-all, per-run + summary output, exits non-zero on any failure
-- [ ] `test:soak` npm script added; `test:slow` runs `--parallel` over the verified-safe tier composition (all 3, or integration+daemon parallel + plan-worker serial if the soak shows plan-worker panics)
-- [ ] A ≥20-iteration soak completes with 0 failures (summary table in Evidence)
+- [ ] Slow-tier daemon-dependent tests run via the in-process harness; ~1-2 true subprocess smoke tests retained for the process boundary
+- [ ] `package.json` `test:slow` runs `--parallel` over the lightened tier (no serial plan-worker split); `test:soak` retained
+- [ ] `scripts/soak-slow-tests.ts` header + `TIER_PHASES` rewritten to the lightened parallel tier (no stale "plan-worker serial" narrative)
+- [ ] A ≥20-iteration parallel soak completes with 0 failures (summary table in Evidence)
 - [ ] `bun run test` umbrella green
-- [ ] No README/CLAUDE.md prose left asserting the slow tier is inherently serial (light touch — fix only a sentence that now reads false)
+- [ ] No README/CLAUDE.md prose left asserting the slow tier is inherently serial
 
 ## Done summary
 
