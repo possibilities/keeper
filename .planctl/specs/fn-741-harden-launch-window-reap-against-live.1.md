@@ -57,5 +57,5 @@ broke during the 2026-06-08 fn-736 freeze, killing live workers).
 - [ ] Tests cover live-veto, ghost-reap, and discharged-worker cases; `bun test` green.
 
 ## Done summary
-
+Added an 'exited === false' live-veto to both reap predicates (isReapCandidate pause/boot reap + isCompletionReapCandidate fn-727 completion reap) in src/autopilot-worker.ts. A demonstrably-live worker pane is never closed, independent of the fold-latency-dependent pending_dispatches/completed-id signal that broke during the 2026-06-08 fn-736 freeze. Only explicit false vetoes; true/undefined still reap (ghost behavior preserved). Applied to BOTH predicates per spec default — the inverse-polarity veto does not reinstate the rejected is_exited==true rule; the live-at-approval approver still reaps on a later list-panes once exited.
 ## Evidence
