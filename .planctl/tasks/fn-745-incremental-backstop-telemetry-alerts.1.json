@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T15:03:57.740453Z",
+  "depends_on": [],
+  "epic": "fn-745-incremental-backstop-telemetry-alerts",
+  "id": "fn-745-incremental-backstop-telemetry-alerts.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Window backstop staleness and missed-wake",
+  "updated_at": "2026-06-08T15:03:57.740453Z"
+}
