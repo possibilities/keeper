@@ -74,5 +74,5 @@ cli/keeper-watch.ts:582) only surfaces per-op and must STAY merit-blind.
 - [ ] Tests cover thin-evidence, duplicate-approver, and cross-repo cases.
 
 ## Done summary
-
+Rewrote babysitter agent §2 merit judgment: require commit/test/context evidence before 'unmerited'; thin/ERROR/empty evidence is low-confidence 'merit unknown'; split 'work merited but duplicate approver' from merit-unknown and unmerited; cross-repo targets point at both keeper and planctl via epic touched_repos. detectApprovalReview now tags each item with a merit-blind evidence.multipleApprovers flag (reused dup-approve signal); scanner stays judgment-free.
 ## Evidence
