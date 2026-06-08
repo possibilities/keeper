@@ -165,6 +165,29 @@ export type Verb = "work" | "close" | "approve";
 export type DispatchKey = string;
 
 /**
+ * fn-735 — the in-process re-dispatch cooldown window, in SECONDS.
+ *
+ * This is the fold-lag-immune suppression arm. The projection-backed dedup
+ * arms (`failedKeys`, `isOccupyingJob`, `liveTabKeys`) all read PROJECTIONS;
+ * when the reducer lags 15-60s+ behind reality every one of them is blind to
+ * a dispatch that already fired, and the same `${verb}::${id}` is re-launched
+ * (the observed two-`close::fn-651`-workers / infinite-re-approve class). The
+ * cooldown holds a just-dispatched key suppressed for this many seconds —
+ * regardless of projection lag — until the durable arms catch up and own
+ * suppression again. The cooldown is ADDITIVE, never the sole suppressor.
+ *
+ * Aligned to `PENDING_DISPATCH_TTL_MS` (120_000 ms = 120 s, src/daemon.ts):
+ * conservatively longer than any plausible fold lag (k8s #129795 — a TTL
+ * shorter than the lag re-introduces over-dispatch at expiry).
+ *
+ * UNIT TRAP (a 1000x bug if mixed up): `reconcile`'s `now` is unix SECONDS
+ * (`deps.now` = `Math.floor(Date.now()/1000)`). This constant and the
+ * cooldown Map's timestamps are ALL in seconds. NEVER compare them against
+ * the ms-valued `*_TTL_MS` constants directly.
+ */
+export const REDISPATCH_COOLDOWN_S = 120;
+
+/**
  * `~/code/arthack` root (kept for any non-plugin-dir callers and for tests
  * that pin the legacy variable). Env-overridable via `ARTHACK_ROOT`. `~`
  * is expanded eagerly at module load so the assembled string carries an
@@ -314,6 +337,45 @@ export function dispatchKey(verb: Verb, id: string): DispatchKey {
 }
 
 /**
+ * fn-735 — pure cooldown predicate. `true` IFF `key` was dispatched within
+ * the last `REDISPATCH_COOLDOWN_S` seconds. `now` and the stored stamp are
+ * BOTH unit-SECONDS (matching `reconcile`'s `now` = `Math.floor(Date.now()
+ * /1000)`); never mix with the ms-valued `*_TTL_MS` constants. An absent
+ * entry (cleared on launch failure, swept on expiry, or never stamped) is
+ * NOT in cooldown. Read inside the pure `reconcile`; the Map is mutated only
+ * in the cycle glue.
+ */
+export function isInCooldown(
+  cooldown: Map<DispatchKey, number>,
+  key: DispatchKey,
+  now: number,
+): boolean {
+  const stampedAt = cooldown.get(key);
+  return stampedAt !== undefined && now - stampedAt < REDISPATCH_COOLDOWN_S;
+}
+
+/**
+ * fn-735 — prune cooldown entries older than the cooldown window. Mirrors
+ * `server-worker.ts`'s `reapStuckPending` Map-reaper: walk the Map, DELETE
+ * every key whose stamp is past `REDISPATCH_COOLDOWN_S` (an entry that can
+ * no longer suppress, so it's pure leak). Run once per cycle so the Map
+ * stays bounded over daemon uptime. `now` is unit-SECONDS. Mutates the Map
+ * in place — called ONLY from the cycle glue (`driveCycle`), never inside
+ * the pure `reconcile`. The caller wraps this in try/catch (no self-heal: a
+ * sweep throw must not crash the worker and bounce the daemon).
+ */
+export function sweepRedispatchCooldown(
+  cooldown: Map<DispatchKey, number>,
+  now: number,
+): void {
+  for (const [key, stampedAt] of cooldown) {
+    if (now - stampedAt >= REDISPATCH_COOLDOWN_S) {
+      cooldown.delete(key);
+    }
+  }
+}
+
+/**
  * fn-724 — pure reap-candidate predicate for `ExecBackend.reapSurfaces`.
  * Exported so the worker's pause handler and the test suite share the
  * EXACT safety gate (the highest-blast-radius decision in this epic).
@@ -454,6 +516,27 @@ export interface ReconcileSnapshot {
 export interface ReconcileState {
   paused: boolean;
   inFlight: Set<DispatchKey>;
+  /**
+   * fn-735 — the in-process re-dispatch cooldown. Maps `${verb}::${id}` →
+   * the unix-SECONDS timestamp at which the key was last dispatched. Same
+   * shape/lifecycle as `inFlight` above and `server-worker.ts`'s
+   * `lastSent`/`reapStuckPending` Map-reaper: held on `ReconcileState` so
+   * `reconcile()` can READ it (like `inFlight`) and stay pure — it is
+   * MUTATED only in the cycle glue (`runReconcileCycle` stamps/clears,
+   * `driveCycle` sweeps), NEVER inside `reconcile`.
+   *
+   * The fold-lag-immune suppression arm: `inFlight` is released in the
+   * `finally` the moment `confirmRunning` resolves, but the
+   * projection-backed `liveTabKeys` (from `pending_dispatches`) may not
+   * have folded yet — so the next cycle would re-dispatch the same key.
+   * The cooldown bridges that gap for `REDISPATCH_COOLDOWN_S` seconds.
+   *
+   * IN-MEMORY ONLY — never written to the event log, projections, reducer,
+   * or RPC surface. Boots EMPTY on restart (safe: autopilot boots paused,
+   * and the first cycle rebuilds suppression from the live projection). The
+   * timestamps are unit-SECONDS, matching `reconcile`'s `now`.
+   */
+  redispatchCooldown: Map<DispatchKey, number>;
   /**
    * Global ceiling on how many root-occupants this reconciler dispatches
    * at once across ALL epics/roots (fn-725). `null` = unlimited (today's
@@ -967,6 +1050,17 @@ export function reconcile(
         // by covering the pre-SessionStart gap.
         continue;
       }
+      // fn-735 — fold-lag-immune cooldown arm. Suppress re-dispatch of a
+      // key dispatched within the last `REDISPATCH_COOLDOWN_S` seconds even
+      // when EVERY projection arm above is blind to it (the reducer lagged
+      // the prior dispatch's fold). READ-ONLY here — purity is sacred; the
+      // stamp/clear live in `runReconcileCycle`, the sweep in `driveCycle`.
+      // Placed ABOVE the fn-728 approve-exempt budget gate and DELIBERATELY
+      // NOT approve-exempt — the cooldown must cover approve too (the
+      // fn-734 dup-re-approve case this epic supersedes).
+      if (isInCooldown(state.redispatchCooldown, key, now)) {
+        continue;
+      }
       const cwd =
         task.target_repo != null && task.target_repo !== ""
           ? task.target_repo
@@ -1021,6 +1115,10 @@ export function reconcile(
         // session is proof a launched closer occupies the slot before
         // its SessionStart binds. Same shape as the task arm above.
         !snapshot.liveTabKeys.has(closeKey) &&
+        // fn-735 — the fold-lag-immune cooldown arm at the close-row site
+        // too (miss it and close rows still DUP-DISPATCH). READ-ONLY; same
+        // unit-seconds `now`. ABOVE the budget gate, NOT approve-exempt.
+        !isInCooldown(state.redispatchCooldown, closeKey, now) &&
         // fn-725 cap — the close-row push shares the SAME decrementing
         // budget as the task push above, so a closer can't blow the cap.
         // fn-728: `approve` is exempt at this site too (the close-row
@@ -1254,6 +1352,14 @@ export async function runReconcileCycle(
       }
     }
     state.inFlight.add(plan.key);
+    // fn-735 — STAMP the cooldown at the SAME point as `inFlight.add`,
+    // BEFORE the confirm await, so it covers BOTH the `ok` AND the
+    // `indoubt` outcomes. The slow cold-boot `indoubt` case (worker live,
+    // `pending_dispatches` real, `jobs` row not yet bound, the `Dispatched`
+    // fold still lagging) IS the headline bug — gating the stamp on
+    // `outcome==="ok"` would leave exactly those slow launches
+    // re-dispatchable. unit-SECONDS, matching `reconcile`'s `now`.
+    state.redispatchCooldown.set(plan.key, deps.now());
     const argv = buildLaunchArgv(shell, plan.workerCommand);
     try {
       const outcome = await confirmRunning(
@@ -1264,6 +1370,17 @@ export async function runReconcileCycle(
         signal,
         deps,
       );
+      // fn-735 — on a DEFINITIVE launch failure (`launch.ok===false` →
+      // `DispatchFailed`, surfaced here as `outcome==="failed"`) or an
+      // abort BEFORE the launch happened (`outcome==="aborted"`: shutdown
+      // or a durable-ack reject — the launch never fired), DELETE the
+      // cooldown entry. `failedKeys` then owns stickiness for `failed`, and
+      // the human's `retry_dispatch` (which clears `failedKeys`, not worker
+      // memory) re-dispatches without first having to wait out the cooldown
+      // in this process. `ok` and `indoubt` KEEP the stamp.
+      if (outcome === "failed" || outcome === "aborted") {
+        state.redispatchCooldown.delete(plan.key);
+      }
       if (outcome === "ok") {
         // Promote to liveDispatches so the reap pass can find it. The
         // `controller` is the per-dispatch abort handle (shutdown
@@ -1552,6 +1669,9 @@ function main(): void {
   const state: ReconcileState = {
     paused: data.paused ?? true,
     inFlight: new Set(),
+    // fn-735 — boots EMPTY (safe: autopilot boots paused; the first cycle
+    // rebuilds suppression from the live projection). In-memory only.
+    redispatchCooldown: new Map(),
     maxConcurrentJobs: data.maxConcurrentJobs ?? null,
   };
   // fn-727 — completion-reap toggle. Default `true` (reap) when the
@@ -1932,6 +2052,19 @@ function main(): void {
           return;
         }
         const snapshot = await loadReconcileSnapshot(db);
+        // fn-735 — prune expired cooldown entries each cycle (mirror
+        // `reapStuckPending`). Wrapped so a sweep throw can't crash the
+        // worker and bounce the daemon (no self-heal). Runs BEFORE
+        // `reconcile` reads the Map so a just-expired key is re-dispatchable
+        // this very cycle.
+        try {
+          sweepRedispatchCooldown(state.redispatchCooldown, deps.now());
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] cooldown sweep threw (non-fatal):",
+            err,
+          );
+        }
         const decision = reconcile(snapshot, state, deps.now());
         // fn-727 — fire the completion reap with THIS cycle's approved-
         // completion set (recomputed every cycle from the one readiness

@@ -1819,8 +1819,36 @@ suppression arm (sitting alongside the `isOccupyingJob` arm) is PRESERVED for
 same-key re-dispatch — orthogonal to the cross-sibling demotion the occupant
 does. `reconcile()` stays pure — it reads the synchronous pending-rows
 snapshot, never the backend, so re-fold determinism is preserved
-(`dispatch-pending` is a read-time client verdict, NOT a folded one). The row
-discharges when `SessionStart` folds (reducer DELETE) or via a producer-side
+(`dispatch-pending` is a read-time client verdict, NOT a folded one).
+**fn-735 adds a fold-lag-immune in-process re-dispatch cooldown as the
+suppression source of truth** — every other dedup arm (`failedKeys`,
+`isOccupyingJob`, `liveTabKeys`, the `dispatch-pending` occupant) reads a
+PROJECTION, so when the reducer lags 15-60s+ behind reality all of them are
+blind to a dispatch that already fired and the same `verb::id` is re-launched
+(the observed two-`close::fn-651`-workers / infinite-re-approve class). The
+cooldown is an in-memory `Map<verb::id, unix-seconds>` on `ReconcileState`
+(the optimistic-in-flight-set pattern, cf. Kubernetes
+`UIDTrackingControllerExpectations`): `runReconcileCycle` STAMPS the key at
+dispatch — BEFORE the confirm await, so it covers BOTH the `ok` and the slow-
+cold-boot `indoubt` outcomes (the headline bug) — and `reconcile` reads it (a
+read-only gate at BOTH dispatch sites, above the fn-728 budget gate and NOT
+approve-exempt, so it covers work/close/approve alike) to suppress re-dispatch
+for `REDISPATCH_COOLDOWN_S` (120s, aligned to `PENDING_DISPATCH_TTL_MS` and
+conservatively longer than any plausible fold lag — a shorter TTL would re-
+introduce over-dispatch at expiry, k8s #129795, safe here only because the
+durable arms remain and the cooldown is ADDITIVE). It is dispatch-side
+scheduling ONLY: in-memory, never written to the event log / projections /
+reducer / RPC surface, boots EMPTY on restart (safe — autopilot boots paused
+and the first cycle rebuilds suppression from the live projection), and is
+mutated ONLY in the cycle glue (`reconcile` stays pure — it never writes the
+Map). A definitive launch failure (`launch.ok===false` → `DispatchFailed`) or
+an abort-before-launch CLEARS the entry so `failedKeys` owns stickiness and a
+human `retry_dispatch` re-dispatches without waiting out the cooldown. Each
+cycle prunes expired entries (`sweepRedispatchCooldown`, mirroring
+`server-worker.ts`'s `reapStuckPending`, wrapped so a sweep throw can't bounce
+the daemon). **This supersedes the approve-only, reducer-side fn-734** —
+fn-735 generalizes the same concept to all verbs, dispatch-side, in-memory.
+The row discharges when `SessionStart` folds (reducer DELETE) or via a producer-side
 TTL sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s,
 `DispatchExpired`) — so both the launch → SessionStart blind window and the
 `dispatch-pending` occupancy self-clear without any live zellij probe (the

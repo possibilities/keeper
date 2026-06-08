@@ -40,14 +40,17 @@ import {
   type DispatchFailedPayload,
   type FoundJob,
   isCompletionReapCandidate,
+  isInCooldown,
   isOccupyingJob,
   isReapCandidate,
   type LaunchResult,
   type LiveDispatch,
+  REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
   reconcile,
   runReconcileCycle,
+  sweepRedispatchCooldown,
   verbForVerdict,
 } from "../src/autopilot-worker";
 import { PENDING_DISPATCH_TTL_MS } from "../src/daemon";
@@ -154,6 +157,8 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
   return {
     paused: false,
     inFlight: new Set(),
+    // fn-735 — boots empty; cooldown tests override it.
+    redispatchCooldown: new Map(),
     // Default unlimited — every pre-fn-725 test that omits this must see
     // identical dispatch behavior.
     maxConcurrentJobs: null,
@@ -645,6 +650,217 @@ test("reconcile dedup (fn-674): liveTabKeys on close::<epic> blocks the close-ro
   // The `approve` verb dispatches for status=done + approval=pending,
   // and the liveTabKeys arm gates it identically to the task path.
   expect(decision.launches.find((p) => p.verb === "approve")).toBeUndefined();
+});
+
+// ---------------------------------------------------------------------------
+// fn-735 — fold-lag-immune re-dispatch cooldown
+// ---------------------------------------------------------------------------
+
+test("fn-735 cooldown (work): a fresh stamp suppresses re-dispatch; an expired stamp re-dispatches", () => {
+  // The cooldown is the ONLY suppressor here — every projection arm is
+  // empty (no jobs, no failedKeys, no liveTabKeys). Stamp `work::id` at
+  // t=1000; reconcile at t < 1000+COOLDOWN sees it suppressed, at
+  // t >= 1000+COOLDOWN sees it re-dispatchable. Proves the arm bridges the
+  // fold-lag gap the projection arms can't see.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const stampedAt = 1000;
+  const state = makeState({
+    redispatchCooldown: new Map([["work::fn-1-foo.1", stampedAt]]),
+  });
+
+  // Inside the window → suppressed.
+  expect(
+    reconcile(snap, state, stampedAt + REDISPATCH_COOLDOWN_S - 1).launches,
+  ).toEqual([]);
+  // At/past the window → re-dispatchable.
+  const reopened = reconcile(snap, state, stampedAt + REDISPATCH_COOLDOWN_S);
+  expect(reopened.launches.map((p) => p.key)).toEqual(["work::fn-1-foo.1"]);
+});
+
+test("fn-735 cooldown (close): a fresh stamp suppresses the close-row dispatch", () => {
+  // The close-row dispatch site must honor the cooldown too (miss it and
+  // close rows DUP-DISPATCH). A ready close row whose `close::<epic>` key is
+  // freshly stamped produces no launch.
+  const completedTask: Task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic = makeEpic({ tasks: [completedTask] });
+  const snap = makeSnapshot({ epics: [epic] });
+  const stampedAt = 1000;
+  const state = makeState({
+    redispatchCooldown: new Map([["close::fn-1-foo", stampedAt]]),
+  });
+
+  // Inside the window → no close launch.
+  const suppressed = reconcile(snap, state, stampedAt + 1);
+  expect(suppressed.launches.find((p) => p.verb === "close")).toBeUndefined();
+  // Past the window → close re-dispatches.
+  const reopened = reconcile(snap, state, stampedAt + REDISPATCH_COOLDOWN_S);
+  const closePlan = reopened.launches.find((p) => p.verb === "close");
+  expect(closePlan?.key).toBe("close::fn-1-foo");
+});
+
+test("fn-735 cooldown (approve): NOT approve-exempt — a fresh stamp suppresses re-approve (supersedes fn-734)", () => {
+  // The fn-734 case this epic supersedes: a freshly-dispatched `approve`
+  // must NOT re-dispatch (the infinite re-approve loop). The gate is
+  // DELIBERATELY above the fn-728 approve-exempt budget gate and is itself
+  // NOT approve-exempt.
+  const epic = approveTaskEpic("fn-1-foo", "/repo");
+  const snap = makeSnapshot({ epics: [epic] });
+  const stampedAt = 1000;
+  const state = makeState({
+    redispatchCooldown: new Map([["approve::fn-1-foo.1", stampedAt]]),
+  });
+
+  // Inside the window → no approve launch.
+  const suppressed = reconcile(snap, state, stampedAt + 1);
+  expect(suppressed.launches.find((p) => p.verb === "approve")).toBeUndefined();
+  // Past the window → approve re-dispatches.
+  const reopened = reconcile(snap, state, stampedAt + REDISPATCH_COOLDOWN_S);
+  const approvePlan = reopened.launches.find((p) => p.verb === "approve");
+  expect(approvePlan?.key).toBe("approve::fn-1-foo.1");
+});
+
+test("fn-735 cooldown: reconcile NEVER mutates the cooldown Map (purity)", () => {
+  // `reconcile` reads the cooldown via `state` but must not write it — the
+  // stamp/clear/sweep live entirely in the cycle glue. After a read,
+  // the Map is byte-identical.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  // A reconcile that DOES dispatch must not stamp the cooldown itself.
+  const decision = reconcile(snap, state, 5000);
+  expect(decision.launches.map((p) => p.key)).toEqual(["work::fn-1-foo.1"]);
+  expect(state.redispatchCooldown.size).toBe(0);
+});
+
+test("fn-735 isInCooldown: unit-seconds predicate edge cases", () => {
+  const cooldown = new Map<string, number>([["work::x", 1000]]);
+  // Absent key → not in cooldown.
+  expect(isInCooldown(cooldown, "work::missing", 1000)).toBe(false);
+  // Exactly at stamp → in cooldown (0 < COOLDOWN).
+  expect(isInCooldown(cooldown, "work::x", 1000)).toBe(true);
+  // One second before expiry → still in cooldown.
+  expect(
+    isInCooldown(cooldown, "work::x", 1000 + REDISPATCH_COOLDOWN_S - 1),
+  ).toBe(true);
+  // Exactly at expiry → NOT in cooldown (strict `<`).
+  expect(isInCooldown(cooldown, "work::x", 1000 + REDISPATCH_COOLDOWN_S)).toBe(
+    false,
+  );
+});
+
+test("fn-735 cooldown constant is unit-consistent with PENDING_DISPATCH_TTL_MS (seconds, not ms)", () => {
+  // The documented unit trap: a 1000x bug if seconds get compared to ms.
+  // The cooldown (seconds) aligns to PENDING_DISPATCH_TTL_MS (ms).
+  expect(REDISPATCH_COOLDOWN_S).toBe(PENDING_DISPATCH_TTL_MS / 1000);
+});
+
+test("fn-735 sweep: prunes entries past the window, keeps fresh ones (no unbounded growth)", () => {
+  const cooldown = new Map<string, number>([
+    ["work::fresh", 1000],
+    ["work::stale", 1000],
+    ["work::edge", 1000],
+  ]);
+  // now = 1000 + COOLDOWN → `stale`/`edge` are exactly at/over expiry; only
+  // a strictly-fresher entry survives. Sweep at now where `fresh` is still
+  // inside the window and `stale` is well past it.
+  cooldown.set("work::fresh", 1000 + REDISPATCH_COOLDOWN_S - 1);
+  cooldown.set("work::stale", 0);
+  cooldown.set("work::edge", 1000);
+  sweepRedispatchCooldown(cooldown, 1000 + REDISPATCH_COOLDOWN_S);
+  // `fresh` (stamped at 1000+COOLDOWN-1) → age 1 < COOLDOWN → kept.
+  expect(cooldown.has("work::fresh")).toBe(true);
+  // `stale` (stamped at 0) → age way past COOLDOWN → pruned.
+  expect(cooldown.has("work::stale")).toBe(false);
+  // `edge` (stamped at 1000) → age exactly COOLDOWN → pruned (>= window).
+  expect(cooldown.has("work::edge")).toBe(false);
+});
+
+test("fn-735 sweep: empty map is a no-op (no throw)", () => {
+  const cooldown = new Map<string, number>();
+  expect(() => sweepRedispatchCooldown(cooldown, 99999)).not.toThrow();
+  expect(cooldown.size).toBe(0);
+});
+
+test("fn-735 runReconcileCycle: stamps the cooldown at dispatch and KEEPS it on the indoubt outcome", async () => {
+  // The headline bug: a slow cold-boot `indoubt` (launch.ok but the jobs
+  // row never bound inside the ceiling) MUST leave the cooldown stamped, or
+  // the next cycle re-dispatches the same slow launch. The stamp is set
+  // BEFORE the confirm await, so it survives an `indoubt` resolution.
+  const stampNow = 1700000000;
+  const { deps, log } = makeFakeDeps({
+    // No jobsByKey hit → confirmRunning's poll never finds a job → ceiling
+    // elapses → `indoubt`.
+    ceilingMs: 5,
+    pollIntervalMs: 1,
+    now: stampNow,
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, stampNow);
+  expect(decision.launches.length).toBe(1);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // Launch fired, no DispatchFailed (indoubt suppresses it), inFlight
+  // released — but the cooldown stamp PERSISTS.
+  expect(log.launches.length).toBe(1);
+  expect(log.emissions).toEqual([]);
+  expect(state.inFlight.size).toBe(0);
+  expect(state.redispatchCooldown.get("work::fn-1-foo.1")).toBe(stampNow);
+});
+
+test("fn-735 runReconcileCycle: a definitive launch failure CLEARS the cooldown (retry_dispatch path)", async () => {
+  // On `launch.ok===false` → DispatchFailed → outcome `failed`, the cooldown
+  // entry is deleted so `failedKeys` owns stickiness and a human's
+  // retry_dispatch re-dispatches without first waiting out the cooldown.
+  const { deps, log } = makeFakeDeps({
+    launch: async () => ({ ok: false, error: "zellij ENOENT" }),
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 0);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.emissions.length).toBe(1); // sticky DispatchFailed
+  // Cooldown cleared → the key is re-dispatchable (failedKeys, not the
+  // cooldown, holds it now).
+  expect(state.redispatchCooldown.has("work::fn-1-foo.1")).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

@@ -154,6 +154,29 @@ and now approve-exempt) before per-epic dispatch; the budget governs only
 sites — they skip the budget gate and never decrement it — so a backlog of
 pending-approval rows can't deadlock the very approvers that would drain it.
 
+**Re-dispatch cooldown (`REDISPATCH_COOLDOWN_S` = 120, fn-735).** The fold-lag-
+immune suppression arm — and the suppression source of truth. Every other dedup
+arm (`failedKeys`, `isOccupyingJob`, `liveTabKeys`, the `dispatch-pending`
+occupant) reads a PROJECTION, so when the reducer lags 15-60s+ behind reality
+all of them go blind to a just-fired dispatch and the same `verb::id`
+re-launches (the two-`close`-workers / infinite-re-approve class). The cooldown
+is an in-memory `Map<verb::id, unix-seconds>` on `ReconcileState`
+(optimistic-in-flight-set, cf. k8s `UIDTrackingControllerExpectations`):
+`runReconcileCycle` STAMPS the key at dispatch BEFORE the confirm await (covers
+both `ok` and the slow-cold-boot `indoubt`), `reconcile` READS it (gate at BOTH
+dispatch sites, above the fn-728 budget gate and NOT approve-exempt — covers
+work/close/approve), suppressing re-dispatch for the window (aligned to
+`PENDING_DISPATCH_TTL_MS`, conservatively > any fold lag). A definitive launch
+failure or abort-before-launch CLEARS the entry (so `failedKeys` owns stickiness
+and `retry_dispatch` re-dispatches without waiting it out); each cycle prunes
+expired entries (`sweepRedispatchCooldown`, wrapped — no self-heal). UNIT TRAP:
+everything is unit-SECONDS (matching `reconcile`'s `now`); never mix with the
+ms-valued `*_TTL_MS` constants. In-memory ONLY — never the event log /
+projections / reducer / RPC surface; boots EMPTY on restart (safe — boots paused,
+first cycle rebuilds suppression from the live projection); `reconcile` stays
+pure (reads via `state`, never mutates). **Supersedes the approve-only,
+reducer-side fn-734** — generalized to all verbs, dispatch-side, in-memory.
+
 **Completion reap (`autoclose_windows`, default `true`, fn-727).** When a row
 reaches the `{tag:"completed"}` verdict (worker done + approved + idle), the
 reconcile cycle closes its zellij surfaces via `ExecBackend.reapSurfaces`
