@@ -52,6 +52,20 @@ export interface InProcessDaemonContext {
   sockPath: string;
 }
 
+/** Options for {@link withInProcessDaemon}. */
+export interface WithInProcessDaemonOptions {
+  /**
+   * Extra env applied alongside the six sandbox paths during the SAME
+   * synchronous boot window and restored EXACTLY afterward. The plan/usage/
+   * transcript workers resolve their hermetic roots from `KEEPER_CONFIG` at boot,
+   * so a test that needs the daemon to watch a tmp plan tree passes
+   * `{ env: { KEEPER_CONFIG: configPath } }` here. Applied/snapshotted/restored
+   * exactly like the sandbox keys, so it stays parallel-safe (the restore lands
+   * before any `await` — a sibling parallel test never observes it).
+   */
+  env?: Record<string, string>;
+}
+
 /** The six sandboxed `KEEPER_*` state-path keys, plus the per-test socket. */
 const STATE_KEYS = [
   "KEEPER_DB",
@@ -76,6 +90,7 @@ const STATE_KEYS = [
  */
 export async function withInProcessDaemon(
   fn: (ctx: InProcessDaemonContext) => Promise<void> | void,
+  opts: WithInProcessDaemonOptions = {},
 ): Promise<void> {
   const tmpDir = mkdtempSync(join(tmpdir(), "keeper-inproc-daemon-"));
   const dbPath = join(tmpDir, "keeper.db");
@@ -96,9 +111,15 @@ export async function withInProcessDaemon(
     KEEPER_RESTORE_FILE: join(tmpDir, "restore.json"),
     KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
     KEEPER_SOCK: sockPath,
+    // Caller-supplied boot env (e.g. KEEPER_CONFIG for a hermetic plan root) —
+    // applied/snapshotted/restored in the same window as the sandbox keys.
+    ...opts.env,
   };
+  // Snapshot every key we touch (the fixed six + sock + any caller-supplied
+  // env) so the restore is EXACT — an absent key goes back to absent.
+  const touchedKeys = [...STATE_KEYS, ...Object.keys(opts.env ?? {})];
   const prior: Record<string, string | undefined> = {};
-  for (const k of STATE_KEYS) prior[k] = process.env[k];
+  for (const k of touchedKeys) prior[k] = process.env[k];
 
   let handle: DaemonHandle | null = null;
   try {
@@ -110,7 +131,7 @@ export async function withInProcessDaemon(
       handle = startDaemon({ disableNativeWatcher: true });
     } finally {
       // Restore EXACTLY — delete keys that were absent, restore the rest.
-      for (const k of STATE_KEYS) {
+      for (const k of touchedKeys) {
         const v = prior[k];
         if (v === undefined) delete process.env[k];
         else process.env[k] = v;

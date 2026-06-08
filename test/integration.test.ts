@@ -32,6 +32,7 @@ import type { Subprocess } from "bun";
 import { openDb } from "../src/db";
 import { epicNumberFromId, taskNumberFromId } from "../src/plan-worker";
 import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
+import { withInProcessDaemon } from "./helpers/in-process-daemon";
 import { retryUntil } from "./helpers/retry-until";
 import { sandboxEnv } from "./helpers/sandbox-env";
 import { waitForDaemon } from "./helpers/wait-for-daemon";
@@ -285,6 +286,50 @@ async function fireHook(payload: Record<string, unknown>): Promise<void> {
   }
 }
 
+/**
+ * fn-747: inject one lifecycle event straight into the sandboxed DB via a
+ * SECOND writer connection — the in-process-daemon analogue of {@link fireHook}.
+ * The daemon's wake worker polls `PRAGMA data_version`, sees the cross-
+ * connection commit, and drains it through main's reducer exactly as a
+ * hook-sourced events-log row would once main ingests it (mirrors the keystone
+ * in daemon.test.ts). Used by the tests migrated onto {@link withInProcessDaemon}
+ * — the real subprocess hook stays in the retained subprocess smoke tests.
+ */
+function injectLifecycleEvent(
+  dbFile: string,
+  sessionId: string,
+  hookEvent: string,
+  opts: {
+    pid?: number;
+    cwd?: string | null;
+    permissionMode?: string | null;
+    data?: string;
+  } = {},
+): void {
+  const writer = openDb(dbFile).db;
+  try {
+    writer.run(
+      `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, permission_mode, data)
+         VALUES (?, ?, ?, ?, 'lifecycle', ?, ?, ?)`,
+      [
+        Date.now() / 1000,
+        sessionId,
+        // Default to a LIVE pid (the test runner's own) so the liveness sweep
+        // doesn't reap the synthetic job to `killed` — which would drop it from
+        // the default `jobs` query scope (`state NOT IN (ended,killed)`). Tests
+        // that need a dead pid pass one explicitly.
+        opts.pid ?? process.pid,
+        hookEvent,
+        opts.cwd ?? null,
+        opts.permissionMode ?? null,
+        opts.data ?? "{}",
+      ],
+    );
+  } finally {
+    writer.close();
+  }
+}
+
 test("end-to-end: hook writes → wake worker → reducer folds → jobs projection", async () => {
   const sessionId = "sess-e2e";
 
@@ -473,156 +518,114 @@ async function connectClient(unix: string): Promise<{
 }
 
 test("end-to-end: UDS subscribe server — query→result, then patch after a fold", async () => {
-  const sessionId = "sess-subscribe-e2e";
+  // fn-747: in-process daemon. The clean-shutdown / socket-unlink contract is a
+  // subprocess concern, covered by the retained subprocess smoke tests; here we
+  // assert only the fold→serve→subscribe path, which is process-model-agnostic.
+  await withInProcessDaemon(async ({ dbPath, sockPath }) => {
+    const sessionId = "sess-subscribe-e2e";
 
-  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
-    cwd: ROOT,
-    env: daemonSpawnEnv(),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+    // Fold one job so the query has a row to page + watch.
+    injectLifecycleEvent(dbPath, sessionId, "SessionStart", {
+      cwd: "/tmp/work",
+      permissionMode: "default",
+    });
 
-  // Boot: writer conn + boot drain + spawn both workers + bind the socket. The
-  // server worker binds AFTER migrate, so poll for the socket file rather than
-  // racing it with a fixed sleep.
-  const bound = await retryUntil(
-    () => (existsSync(sockPath) ? true : null),
-    3000,
-  );
-  if (!bound) {
-    const out = await readStream(daemon.stdout);
-    const err = await readStream(daemon.stderr);
-    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
-  }
+    // Wait for the reducer to project the job (read-only observer mirrors the
+    // server's own view) before we query, so the result page is non-empty.
+    const reader = openDb(dbPath, { readonly: true }).db;
+    const projected = await retryUntil(() => {
+      const row = reader
+        .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+        .get(sessionId) as { last_event_id: number } | null;
+      return row ? row : null;
+    });
+    reader.close();
+    expect(projected).not.toBeNull();
 
-  // Fold one job so the query has a row to page + watch.
-  await fireHook({
-    hook_event_name: "SessionStart",
-    session_id: sessionId,
-    cwd: "/tmp/work",
-    permission_mode: "default",
-  });
-
-  // Wait for the reducer to project the job (read-only observer mirrors the
-  // server's own view) before we query, so the result page is non-empty.
-  const reader = openDb(dbPath, { readonly: true }).db;
-  const projected = await retryUntil(() => {
-    const row = reader
-      .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
-      .get(sessionId) as { last_event_id: number } | null;
-    return row ? row : null;
-  });
-  reader.close();
-  if (!projected) {
-    const out = await readStream(daemon.stdout);
-    const err = await readStream(daemon.stderr);
-    throw new Error(`job never projected.\nstdout:\n${out}\nstderr:\n${err}`);
-  }
-
-  const client = await connectClient(sockPath);
-  try {
-    // --- query → result: ordered page, frozen membership, world rev. The
-    // query now carries a required `collection`; result/patch echo it and the
-    // patch payload is `row` (not `job`). ---
-    client.send({ type: "query", collection: "jobs", id: "q1" });
-    const result = await retryUntil(
-      () => client.frames.find((f) => f.type === "result") ?? null,
-    );
-    if (!result || result.type !== "result") {
-      const out = await readStream(daemon.stdout);
-      const err = await readStream(daemon.stderr);
-      throw new Error(
-        `result never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
+    const client = await connectClient(sockPath);
+    try {
+      // --- query → result: ordered page, frozen membership, world rev. The
+      // query now carries a required `collection`; result/patch echo it and the
+      // patch payload is `row` (not `job`). ---
+      client.send({ type: "query", collection: "jobs", id: "q1" });
+      const result = await retryUntil(
+        () => client.frames.find((f) => f.type === "result") ?? null,
       );
+      expect(result).not.toBeNull();
+      if (!result || result.type !== "result") {
+        throw new Error("unreachable: result presence asserted above");
+      }
+      expect(result.id).toBe("q1");
+      expect(result.collection).toBe("jobs");
+      // The result carries the filtered-set total (≥ the one job we folded).
+      expect(typeof result.total).toBe("number");
+      expect(result.total).toBeGreaterThanOrEqual(1);
+      const baselineTotal = result.total;
+      expect(result.rows.some((r) => r.job_id === sessionId)).toBe(true);
+      const watchedRow = result.rows.find((r) => r.job_id === sessionId);
+      if (!watchedRow) {
+        throw new Error("unreachable: row presence asserted above");
+      }
+      const baselineEventId = watchedRow.last_event_id as number;
+
+      // --- fold a change to the watched row → expect a patch (live cell). ---
+      injectLifecycleEvent(dbPath, sessionId, "UserPromptSubmit", {
+        permissionMode: "plan",
+      });
+
+      const patch = await retryUntil(
+        () =>
+          client.frames.find(
+            (f) =>
+              f.type === "patch" &&
+              f.row.job_id === sessionId &&
+              (f.row.last_event_id as number) > baselineEventId,
+          ) ?? null,
+      );
+      expect(patch).not.toBeNull();
+      if (!patch || patch.type !== "patch") {
+        throw new Error("unreachable: patch presence asserted above");
+      }
+      expect(patch.collection).toBe("jobs");
+      expect(patch.row.job_id).toBe(sessionId);
+      expect(patch.row.state).toBe("working");
+      expect(patch.rev).toBeGreaterThanOrEqual(
+        patch.row.last_event_id as number,
+      );
+
+      // --- a NEW session enters the (unfiltered) set → a live `meta` with the
+      // incremented total. Frozen membership means the new row is NOT pushed; the
+      // meta is just the "set changed" count signal. ---
+      const otherSession = "sess-subscribe-e2e-2";
+      injectLifecycleEvent(dbPath, otherSession, "SessionStart", {
+        cwd: "/tmp/work2",
+        permissionMode: "default",
+      });
+
+      const meta = await retryUntil(
+        () =>
+          client.frames.find(
+            (f) =>
+              f.type === "meta" &&
+              f.collection === "jobs" &&
+              f.total > baselineTotal,
+          ) ?? null,
+      );
+      expect(meta).not.toBeNull();
+      if (!meta || meta.type !== "meta") {
+        throw new Error("unreachable: meta presence asserted above");
+      }
+      expect(meta.total).toBe(baselineTotal + 1);
+      // The new member's row never arrived as a patch (frozen membership).
+      expect(
+        client.frames.some(
+          (f) => f.type === "patch" && f.row.job_id === otherSession,
+        ),
+      ).toBe(false);
+    } finally {
+      client.socket.end();
     }
-    expect(result.id).toBe("q1");
-    expect(result.collection).toBe("jobs");
-    // The result carries the filtered-set total (≥ the one job we folded).
-    expect(typeof result.total).toBe("number");
-    expect(result.total).toBeGreaterThanOrEqual(1);
-    const baselineTotal = result.total;
-    expect(result.rows.some((r) => r.job_id === sessionId)).toBe(true);
-    const watchedRow = result.rows.find((r) => r.job_id === sessionId);
-    if (!watchedRow) {
-      throw new Error("unreachable: row presence asserted above");
-    }
-    const baselineEventId = watchedRow.last_event_id as number;
-
-    // --- fold a change to the watched row → expect a patch (live cell). ---
-    await fireHook({
-      hook_event_name: "UserPromptSubmit",
-      session_id: sessionId,
-      permission_mode: "plan",
-    });
-
-    const patch = await retryUntil(
-      () =>
-        client.frames.find(
-          (f) =>
-            f.type === "patch" &&
-            f.row.job_id === sessionId &&
-            (f.row.last_event_id as number) > baselineEventId,
-        ) ?? null,
-    );
-    if (!patch || patch.type !== "patch") {
-      const out = await readStream(daemon.stdout);
-      const err = await readStream(daemon.stderr);
-      throw new Error(`patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`);
-    }
-    expect(patch.collection).toBe("jobs");
-    expect(patch.row.job_id).toBe(sessionId);
-    expect(patch.row.state).toBe("working");
-    expect(patch.rev).toBeGreaterThanOrEqual(patch.row.last_event_id as number);
-
-    // --- a NEW session enters the (unfiltered) set → a live `meta` with the
-    // incremented total. Frozen membership means the new row is NOT pushed; the
-    // meta is just the "set changed" count signal. ---
-    const otherSession = "sess-subscribe-e2e-2";
-    await fireHook({
-      hook_event_name: "SessionStart",
-      session_id: otherSession,
-      cwd: "/tmp/work2",
-      permission_mode: "default",
-    });
-
-    const meta = await retryUntil(
-      () =>
-        client.frames.find(
-          (f) =>
-            f.type === "meta" &&
-            f.collection === "jobs" &&
-            f.total > baselineTotal,
-        ) ?? null,
-    );
-    if (!meta || meta.type !== "meta") {
-      const out = await readStream(daemon.stdout);
-      const err = await readStream(daemon.stderr);
-      throw new Error(`meta never arrived.\nstdout:\n${out}\nstderr:\n${err}`);
-    }
-    expect(meta.total).toBe(baselineTotal + 1);
-    // The new member's row never arrived as a patch (frozen membership).
-    expect(
-      client.frames.some(
-        (f) => f.type === "patch" && f.row.job_id === otherSession,
-      ),
-    ).toBe(false);
-
-    // --- and a leave decrements it. End the new session → SessionEnd folds it
-    // to `ended`, but it remains a row (state sticky) so the unfiltered total is
-    // unchanged. To prove a decrement, filter is the cleaner lever — but this
-    // e2e watches the unfiltered set, where rows are never deleted in v1. The
-    // decrement path is covered by the diffTick unit tests (row leave / delete).
-  } finally {
-    client.socket.end();
-  }
-
-  // --- clean shutdown: SIGTERM removes the socket file + exits 0. ---
-  daemon.kill("SIGTERM");
-  const exitCode = await daemon.exited;
-  expect(exitCode).toBe(0);
-  // The server worker's shutdown handler unlinks the socket (it's process-owned;
-  // terminate() alone wouldn't release it).
-  expect(existsSync(sockPath)).toBe(false);
+  });
 }, 30000);
 
 test("end-to-end: set_task_approval / set_epic_approval RPC → atomic SIDECAR write, committed def untouched (fn-732)", async () => {
@@ -660,353 +663,311 @@ test("end-to-end: set_task_approval / set_epic_approval RPC → atomic SIDECAR w
     }),
   );
 
-  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
-    cwd: ROOT,
-    env: daemonSpawnEnv(),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  // fn-747: in-process daemon, with the hermetic plan root wired through
+  // `KEEPER_CONFIG` so the RPC handler scans `planRoot` for the committed def
+  // before writing the sidecar next to it. (The watcher is disabled in-process;
+  // the RPC's root scan is filesystem-direct and never touches the projection.)
+  await withInProcessDaemon(
+    async ({ sockPath }) => {
+      // Build a one-shot RPC client (inline — no scripts/approve.ts dependency
+      // since that CLI is updated to the new RPCs in a later task).
+      async function rpc(
+        method: string,
+        params: Record<string, unknown>,
+      ): Promise<unknown> {
+        const buffer = new LineBuffer();
+        const id = crypto.randomUUID();
+        return new Promise((resolve, reject) => {
+          Bun.connect({
+            unix: sockPath,
+            socket: {
+              open(s) {
+                s.write(encodeFrame({ type: "rpc", id, method, params }));
+              },
+              data(s, chunk) {
+                for (const line of buffer.push(chunk.toString("utf8"))) {
+                  if (line.trim().length === 0) continue;
+                  const frame = JSON.parse(line) as ServerFrame;
+                  if ((frame as { id?: string }).id !== id) continue;
+                  if (frame.type === "rpc_result") {
+                    resolve(frame.value);
+                  } else if (frame.type === "error") {
+                    reject(
+                      new Error(
+                        `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
+                      ),
+                    );
+                  }
+                  s.end();
+                  return;
+                }
+              },
+              close() {
+                // resolved/rejected already, nothing to do
+              },
+              error(_s, err) {
+                reject(err);
+              },
+            },
+          }).catch(reject);
+        });
+      }
 
-  const bound = await retryUntil(
-    () => (existsSync(sockPath) ? true : null),
-    3000,
+      const taskSidecarPath = join(
+        planRoot,
+        ".planctl",
+        "state",
+        "tasks",
+        "fn-99-rpc-e2e.1.state.json",
+      );
+      const epicSidecarPath = join(
+        planRoot,
+        ".planctl",
+        "state",
+        "epics",
+        "fn-99-rpc-e2e.state.json",
+      );
+
+      // --- set_task_approval: writes the task SIDECAR's `approval` field. ---
+      const taskResult = (await rpc("set_task_approval", {
+        epic_id: "fn-99-rpc-e2e",
+        task_id: "fn-99-rpc-e2e.1",
+        status: "approved",
+      })) as {
+        ok: boolean;
+        epic_id: string;
+        task_id: string;
+        approval: string;
+      };
+      expect(taskResult).toEqual({
+        ok: true,
+        epic_id: "fn-99-rpc-e2e",
+        task_id: "fn-99-rpc-e2e.1",
+        approval: "approved",
+      });
+      // Sidecar carries the approval.
+      const taskSidecar = JSON.parse(readFileSync(taskSidecarPath, "utf8")) as {
+        approval: string;
+      };
+      expect(taskSidecar.approval).toBe("approved");
+      // Committed def is UNTOUCHED — still `pending`, title intact.
+      const taskDefAfter = JSON.parse(readFileSync(taskPath, "utf8")) as {
+        approval: string;
+        title: string;
+      };
+      expect(taskDefAfter.approval).toBe("pending");
+      expect(taskDefAfter.title).toBe("T1");
+
+      // --- set_epic_approval: writes the epic SIDECAR's `approval` field. ---
+      const epicResult = (await rpc("set_epic_approval", {
+        epic_id: "fn-99-rpc-e2e",
+        status: "rejected",
+      })) as { ok: boolean; epic_id: string; approval: string };
+      expect(epicResult).toEqual({
+        ok: true,
+        epic_id: "fn-99-rpc-e2e",
+        approval: "rejected",
+      });
+      const epicSidecar = JSON.parse(readFileSync(epicSidecarPath, "utf8")) as {
+        approval: string;
+      };
+      expect(epicSidecar.approval).toBe("rejected");
+      // Committed def untouched.
+      const epicDefAfter = JSON.parse(readFileSync(epicPath, "utf8")) as {
+        approval: string;
+        title: string;
+      };
+      expect(epicDefAfter.approval).toBe("pending");
+      expect(epicDefAfter.title).toBe("RPC E2E");
+
+      // --- bad enum: server returns `bad_params`, the connection survives. ---
+      try {
+        await rpc("set_task_approval", {
+          epic_id: "fn-99-rpc-e2e",
+          task_id: "fn-99-rpc-e2e.1",
+          status: "garbage",
+        });
+        throw new Error("expected rejection");
+      } catch (e) {
+        expect(String(e)).toMatch(/bad_params/);
+      }
+    },
+    { env: { KEEPER_CONFIG: configPath } },
   );
-  if (!bound) {
-    const out = await readStream(daemon.stdout);
-    const err = await readStream(daemon.stderr);
-    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
-  }
-
-  // Build a one-shot RPC client (inline — no scripts/approve.ts dependency
-  // since that CLI is updated to the new RPCs in a later task).
-  async function rpc(
-    method: string,
-    params: Record<string, unknown>,
-  ): Promise<unknown> {
-    const buffer = new LineBuffer();
-    const id = crypto.randomUUID();
-    return new Promise((resolve, reject) => {
-      Bun.connect({
-        unix: sockPath,
-        socket: {
-          open(s) {
-            s.write(encodeFrame({ type: "rpc", id, method, params }));
-          },
-          data(s, chunk) {
-            for (const line of buffer.push(chunk.toString("utf8"))) {
-              if (line.trim().length === 0) continue;
-              const frame = JSON.parse(line) as ServerFrame;
-              if ((frame as { id?: string }).id !== id) continue;
-              if (frame.type === "rpc_result") {
-                resolve(frame.value);
-              } else if (frame.type === "error") {
-                reject(
-                  new Error(
-                    `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
-                  ),
-                );
-              }
-              s.end();
-              return;
-            }
-          },
-          close() {
-            // resolved/rejected already, nothing to do
-          },
-          error(_s, err) {
-            reject(err);
-          },
-        },
-      }).catch(reject);
-    });
-  }
-
-  const taskSidecarPath = join(
-    planRoot,
-    ".planctl",
-    "state",
-    "tasks",
-    "fn-99-rpc-e2e.1.state.json",
-  );
-  const epicSidecarPath = join(
-    planRoot,
-    ".planctl",
-    "state",
-    "epics",
-    "fn-99-rpc-e2e.state.json",
-  );
-
-  // --- set_task_approval: writes the task SIDECAR's `approval` field. ---
-  const taskResult = (await rpc("set_task_approval", {
-    epic_id: "fn-99-rpc-e2e",
-    task_id: "fn-99-rpc-e2e.1",
-    status: "approved",
-  })) as { ok: boolean; epic_id: string; task_id: string; approval: string };
-  expect(taskResult).toEqual({
-    ok: true,
-    epic_id: "fn-99-rpc-e2e",
-    task_id: "fn-99-rpc-e2e.1",
-    approval: "approved",
-  });
-  // Sidecar carries the approval.
-  const taskSidecar = JSON.parse(readFileSync(taskSidecarPath, "utf8")) as {
-    approval: string;
-  };
-  expect(taskSidecar.approval).toBe("approved");
-  // Committed def is UNTOUCHED — still `pending`, title intact.
-  const taskDefAfter = JSON.parse(readFileSync(taskPath, "utf8")) as {
-    approval: string;
-    title: string;
-  };
-  expect(taskDefAfter.approval).toBe("pending");
-  expect(taskDefAfter.title).toBe("T1");
-
-  // --- set_epic_approval: writes the epic SIDECAR's `approval` field. ---
-  const epicResult = (await rpc("set_epic_approval", {
-    epic_id: "fn-99-rpc-e2e",
-    status: "rejected",
-  })) as { ok: boolean; epic_id: string; approval: string };
-  expect(epicResult).toEqual({
-    ok: true,
-    epic_id: "fn-99-rpc-e2e",
-    approval: "rejected",
-  });
-  const epicSidecar = JSON.parse(readFileSync(epicSidecarPath, "utf8")) as {
-    approval: string;
-  };
-  expect(epicSidecar.approval).toBe("rejected");
-  // Committed def untouched.
-  const epicDefAfter = JSON.parse(readFileSync(epicPath, "utf8")) as {
-    approval: string;
-    title: string;
-  };
-  expect(epicDefAfter.approval).toBe("pending");
-  expect(epicDefAfter.title).toBe("RPC E2E");
-
-  // --- bad enum: server returns `bad_params`, the connection survives. ---
-  try {
-    await rpc("set_task_approval", {
-      epic_id: "fn-99-rpc-e2e",
-      task_id: "fn-99-rpc-e2e.1",
-      status: "garbage",
-    });
-    throw new Error("expected rejection");
-  } catch (e) {
-    expect(String(e)).toMatch(/bad_params/);
-  }
-
-  // --- clean shutdown. ---
-  daemon.kill("SIGTERM");
-  expect(await daemon.exited).toBe(0);
-  expect(existsSync(sockPath)).toBe(false);
 }, 30000);
 
 test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends real event, flips waiting→recovered, session reappears", async () => {
-  // Hermetic dead-letters dir under the per-test tmp tree so the boot scan
-  // imports rows we control instead of the user's real dropped-events file.
-  // `KEEPER_DEAD_LETTER_DIR` is the env override (see `resolveDeadLetterDir`).
-  const { mkdirSync } = require("node:fs") as typeof import("node:fs");
-  const deadLetterDir = join(tmpDir, "dead-letters");
-  mkdirSync(deadLetterDir, { recursive: true });
-
-  // Seed two `waiting` rows by hand: the daemon's boot scan only imports
-  // from per-pid NDJSON files via `parseDeadLetterLine`, so we open the DB,
-  // INSERT the rows, close, and let the spawned daemon pick them up via the
-  // SAME schema.
-  //
-  // Note: the boot scan above is bypassed; we INSERT directly into
-  // `dead_letters` (mirroring what the scan would have produced) so the
-  // test is hermetic against the dead-letter parser and the NDJSON file
-  // format. The post-replay assertions still drive the full
-  // worker→main→reducer round-trip.
-  {
-    const { openDb } = require("../src/db") as typeof import("../src/db");
-    const { db } = openDb(dbPath);
-    try {
-      const insertStmt = db.prepare(
-        `INSERT INTO dead_letters
-           (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
-            status, recovered_at, replayed_event_id, source_file)
-         VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, NULL)`,
-      );
-      // First (oldest) waiting row: a dropped SessionStart for sess-replay-1.
-      insertStmt.run(
-        "dl-first",
-        "sess-replay-1",
-        "SessionStart",
-        1_700_000_000,
-        100,
-        4321,
-        JSON.stringify({
-          ts: 1_700_000_000,
-          session_id: "sess-replay-1",
-          pid: 4321,
-          hook_event: "SessionStart",
-          event_type: "lifecycle",
-          data: "{}",
-          cwd: "/tmp/replay",
-        }),
-      );
-      // Second waiting row — newer dl_written_at; should NOT be picked first.
-      insertStmt.run(
-        "dl-second",
-        "sess-replay-2",
-        "SessionStart",
-        1_700_000_005,
-        200,
-        4322,
-        JSON.stringify({
-          ts: 1_700_000_005,
-          session_id: "sess-replay-2",
-          pid: 4322,
-          hook_event: "SessionStart",
-          event_type: "lifecycle",
-          data: "{}",
-          cwd: "/tmp/replay-2",
-        }),
-      );
-    } finally {
-      db.close();
-    }
-  }
-
-  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
-    cwd: ROOT,
-    // `daemonSpawnEnv` already routes KEEPER_DEAD_LETTER_DIR to
-    // `join(tmpDir, "dead-letters")` — the exact `deadLetterDir` this test
-    // scans — so the boot dead-letter import stays hermetic without an explicit
-    // override here.
-    env: daemonSpawnEnv(),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
-
-  const bound = await retryUntil(
-    () => (existsSync(sockPath) ? true : null),
-    3000,
-  );
-  if (!bound) {
-    const out = await readStream(daemon.stdout);
-    const err = await readStream(daemon.stderr);
-    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
-  }
-
-  async function rpc(
-    method: string,
-    params: Record<string, unknown> | undefined,
-  ): Promise<unknown> {
-    const buffer = new LineBuffer();
-    const id = crypto.randomUUID();
-    return new Promise((resolve, reject) => {
-      Bun.connect({
-        unix: sockPath,
-        socket: {
-          open(s) {
-            s.write(
-              encodeFrame(
-                params === undefined
-                  ? { type: "rpc", id, method }
-                  : { type: "rpc", id, method, params },
-              ),
-            );
-          },
-          data(s, chunk) {
-            for (const line of buffer.push(chunk.toString("utf8"))) {
-              if (line.trim().length === 0) continue;
-              const frame = JSON.parse(line) as ServerFrame;
-              if ((frame as { id?: string }).id !== id) continue;
-              if (frame.type === "rpc_result") {
-                resolve(frame.value);
-              } else if (frame.type === "error") {
-                reject(
-                  new Error(
-                    `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
-                  ),
-                );
-              }
-              s.end();
-              return;
-            }
-          },
-          close() {},
-          error(_s, err) {
-            reject(err);
-          },
-        },
-      }).catch(reject);
-    });
-  }
-
-  // First replay: oldest waiting row (dl-first, sess-replay-1) flips to
-  // recovered; the events log gains a real SessionStart row; the reducer
-  // folds it into a fresh `jobs` row.
-  const first = (await rpc("replay_dead_letter", {})) as {
-    ok: boolean;
-    recovered_dl_id: string | null;
-  };
-  expect(first).toEqual({ ok: true, recovered_dl_id: "dl-first" });
-
-  // Poll the jobs projection for the recovered session.
-  const verify = await retryUntil(() => {
-    const { openDb } = require("../src/db") as typeof import("../src/db");
-    const { db } = openDb(dbPath, { readonly: true });
-    try {
-      const job = db
-        .query(
-          "SELECT job_id, state, cwd FROM jobs WHERE job_id = 'sess-replay-1'",
-        )
-        .get() as { job_id: string; state: string; cwd: string } | null;
-      const dl = db
-        .query(
-          "SELECT status, replayed_event_id FROM dead_letters WHERE dl_id = 'dl-first'",
-        )
-        .get() as {
-        status: string;
-        replayed_event_id: number | null;
-      } | null;
-      if (
-        job &&
-        dl &&
-        dl.status === "recovered" &&
-        dl.replayed_event_id !== null
-      ) {
-        return { job, dl };
+  // fn-747: in-process daemon. The replay path is pure DB + RPC + fold (no file
+  // watch), so it converts cleanly. We INSERT the seed `waiting` rows AFTER boot
+  // (the harness creates + migrates the DB at boot) via a SECOND writer
+  // connection, mirroring what the dead-letter boot scan would have produced.
+  await withInProcessDaemon(async ({ dbPath, sockPath }) => {
+    // Seed two `waiting` rows by hand. We INSERT directly into `dead_letters`
+    // (mirroring what the scan would have produced) so the test is hermetic
+    // against the dead-letter parser and the NDJSON file format. The post-replay
+    // assertions still drive the full worker→main→reducer round-trip.
+    {
+      const { db } = openDb(dbPath);
+      try {
+        const insertStmt = db.prepare(
+          `INSERT INTO dead_letters
+             (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
+              status, recovered_at, replayed_event_id, source_file)
+           VALUES (?, ?, ?, ?, ?, ?, ?, 'waiting', NULL, NULL, NULL)`,
+        );
+        // First (oldest) waiting row: a dropped SessionStart for sess-replay-1.
+        insertStmt.run(
+          "dl-first",
+          "sess-replay-1",
+          "SessionStart",
+          1_700_000_000,
+          100,
+          4321,
+          JSON.stringify({
+            ts: 1_700_000_000,
+            session_id: "sess-replay-1",
+            pid: 4321,
+            hook_event: "SessionStart",
+            event_type: "lifecycle",
+            data: "{}",
+            cwd: "/tmp/replay",
+          }),
+        );
+        // Second waiting row — newer dl_written_at; should NOT be picked first.
+        insertStmt.run(
+          "dl-second",
+          "sess-replay-2",
+          "SessionStart",
+          1_700_000_005,
+          200,
+          4322,
+          JSON.stringify({
+            ts: 1_700_000_005,
+            session_id: "sess-replay-2",
+            pid: 4322,
+            hook_event: "SessionStart",
+            event_type: "lifecycle",
+            data: "{}",
+            cwd: "/tmp/replay-2",
+          }),
+        );
+      } finally {
+        db.close();
       }
-      return null;
-    } finally {
-      db.close();
     }
-  }, 3000);
-  expect(verify).not.toBeNull();
-  expect(verify?.job.job_id).toBe("sess-replay-1");
-  expect(verify?.job.cwd).toBe("/tmp/replay");
 
-  // Second replay: drains the next oldest (dl-second).
-  const second = (await rpc("replay_dead_letter", {})) as {
-    ok: boolean;
-    recovered_dl_id: string | null;
-  };
-  expect(second).toEqual({ ok: true, recovered_dl_id: "dl-second" });
+    async function rpc(
+      method: string,
+      params: Record<string, unknown> | undefined,
+    ): Promise<unknown> {
+      const buffer = new LineBuffer();
+      const id = crypto.randomUUID();
+      return new Promise((resolve, reject) => {
+        Bun.connect({
+          unix: sockPath,
+          socket: {
+            open(s) {
+              s.write(
+                encodeFrame(
+                  params === undefined
+                    ? { type: "rpc", id, method }
+                    : { type: "rpc", id, method, params },
+                ),
+              );
+            },
+            data(s, chunk) {
+              for (const line of buffer.push(chunk.toString("utf8"))) {
+                if (line.trim().length === 0) continue;
+                const frame = JSON.parse(line) as ServerFrame;
+                if ((frame as { id?: string }).id !== id) continue;
+                if (frame.type === "rpc_result") {
+                  resolve(frame.value);
+                } else if (frame.type === "error") {
+                  reject(
+                    new Error(
+                      `${(frame as { code: string }).code}: ${(frame as { message: string }).message}`,
+                    ),
+                  );
+                }
+                s.end();
+                return;
+              }
+            },
+            close() {},
+            error(_s, err) {
+              reject(err);
+            },
+          },
+        }).catch(reject);
+      });
+    }
 
-  // Third replay: backlog empty → clean ack, NOT an error.
-  const third = (await rpc("replay_dead_letter", undefined)) as {
-    ok: boolean;
-    recovered_dl_id: string | null;
-  };
-  expect(third).toEqual({ ok: true, recovered_dl_id: null });
+    // First replay: oldest waiting row (dl-first, sess-replay-1) flips to
+    // recovered; the events log gains a real SessionStart row; the reducer
+    // folds it into a fresh `jobs` row.
+    const first = (await rpc("replay_dead_letter", {})) as {
+      ok: boolean;
+      recovered_dl_id: string | null;
+    };
+    expect(first).toEqual({ ok: true, recovered_dl_id: "dl-first" });
 
-  // A bad params payload is rejected as `bad_params` and the connection
-  // survives — the dispatcher contract for typed validation throws.
-  try {
-    await rpc("replay_dead_letter", { dl_id: "nope" });
-    throw new Error("expected bad_params rejection");
-  } catch (e) {
-    expect(String(e)).toMatch(/bad_params/);
-  }
+    // Poll the jobs projection for the recovered session.
+    const verify = await retryUntil(() => {
+      const { db } = openDb(dbPath, { readonly: true });
+      try {
+        const job = db
+          .query(
+            "SELECT job_id, state, cwd FROM jobs WHERE job_id = 'sess-replay-1'",
+          )
+          .get() as { job_id: string; state: string; cwd: string } | null;
+        const dl = db
+          .query(
+            "SELECT status, replayed_event_id FROM dead_letters WHERE dl_id = 'dl-first'",
+          )
+          .get() as {
+          status: string;
+          replayed_event_id: number | null;
+        } | null;
+        if (
+          job &&
+          dl &&
+          dl.status === "recovered" &&
+          dl.replayed_event_id !== null
+        ) {
+          return { job, dl };
+        }
+        return null;
+      } finally {
+        db.close();
+      }
+    }, 3000);
+    expect(verify).not.toBeNull();
+    expect(verify?.job.job_id).toBe("sess-replay-1");
+    expect(verify?.job.cwd).toBe("/tmp/replay");
 
-  daemon.kill("SIGTERM");
-  expect(await daemon.exited).toBe(0);
-  expect(existsSync(sockPath)).toBe(false);
+    // Second replay: drains the next oldest (dl-second).
+    const second = (await rpc("replay_dead_letter", {})) as {
+      ok: boolean;
+      recovered_dl_id: string | null;
+    };
+    expect(second).toEqual({ ok: true, recovered_dl_id: "dl-second" });
+
+    // Third replay: backlog empty → clean ack, NOT an error.
+    const third = (await rpc("replay_dead_letter", undefined)) as {
+      ok: boolean;
+      recovered_dl_id: string | null;
+    };
+    expect(third).toEqual({ ok: true, recovered_dl_id: null });
+
+    // A bad params payload is rejected as `bad_params` and the connection
+    // survives — the dispatcher contract for typed validation throws.
+    try {
+      await rpc("replay_dead_letter", { dl_id: "nope" });
+      throw new Error("expected bad_params rejection");
+    } catch (e) {
+      expect(String(e)).toMatch(/bad_params/);
+    }
+  });
 }, 30000);
 
 test("end-to-end: transcript worker → custom-title write flips jobs.title to 'transcript'", async () => {
@@ -1099,7 +1060,14 @@ test("end-to-end: transcript worker → custom-title write flips jobs.title to '
   daemon.kill("SIGTERM");
   const exitCode = await daemon.exited;
   expect(exitCode).toBe(0);
-}, 30000);
+  // fn-747: one of the retained TRUE-watcher subprocess smoke tests (live
+  // FSEvents transcript tail). It boots a real subprocess daemon WITH the native
+  // watcher — one of the two reasons `test:slow` stays SERIAL (concurrent
+  // subprocess-daemon addon teardown segfaults under --parallel). Real boot +
+  // FSEvents latency is still load-variable (fn-722.7 saw 10s→36s under box
+  // load), so a 60s budget keeps it pass/fail-stable. Soak gates on pass/fail
+  // only, never timing.
+}, 60000);
 
 test("end-to-end: rename-while-down → folded at boot via the startup transcript scan", async () => {
   const sessionId = "sess-rename-while-down";
@@ -1202,7 +1170,11 @@ test("end-to-end: rename-while-down → folded at boot via the startup transcrip
   daemon.kill("SIGTERM");
   const code2 = await daemon.exited;
   expect(code2).toBe(0);
-}, 30000);
+  // fn-747: the second retained TRUE-watcher subprocess smoke test (boot-scan
+  // transcript fold across a restart). Two real subprocess-daemon boots WITH the
+  // native watcher — part of why `test:slow` stays SERIAL; a 60s budget absorbs
+  // the load-variable boot latency (fn-722.7). Soak gates on pass/fail only.
+}, 60000);
 
 test("end-to-end: plan worker → .planctl write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
   const epicId = "fn-9-keeper-e2e-plans";
@@ -1260,351 +1232,307 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
   gitInitPlanRoot(planRoot);
   gitCommitPlanRoot(planRoot, "add epic + task");
 
-  daemon = Bun.spawn(["bun", "run", DAEMON_ENTRY], {
-    cwd: ROOT,
-    env: daemonSpawnEnv(),
-    stdout: "pipe",
-    stderr: "pipe",
-  });
+  // fn-747: in-process daemon, plan root wired through `KEEPER_CONFIG`. The plan
+  // worker's `disableNativeWatcher` degrade still runs its BOOT SCAN per root, so
+  // the pre-committed plan files are emitted as synthetic snapshot events without
+  // any FSEvents involvement; the later live-patch assertions already drive the
+  // event→fold→UDS-patch chain via direct event INSERT, so they are unaffected by
+  // the watcher being off.
+  await withInProcessDaemon(
+    async ({ dbPath, sockPath }) => {
+      const { db: reader } = openDb(dbPath, { readonly: true });
+      try {
+        // --- synthetic events land, with the right hook_event + entity key. ---
+        const events = await retryUntil(() => {
+          const rows = reader
+            .query(
+              "SELECT session_id, hook_event FROM events WHERE hook_event IN ('EpicSnapshot', 'TaskSnapshot') ORDER BY id ASC",
+            )
+            .all() as Array<{ session_id: string; hook_event: string }>;
+          return rows.length >= 2 ? rows : null;
+        }, 8000);
+        if (!events) {
+          throw new Error("synthetic plan events never landed");
+        }
+        expect(events).toContainEqual({
+          session_id: epicId,
+          hook_event: "EpicSnapshot",
+        });
+        expect(events).toContainEqual({
+          session_id: taskId,
+          hook_event: "TaskSnapshot",
+        });
 
-  // Boot: writer conn + boot drain + spawn all four workers + bind the socket.
-  const bound = await retryUntil(
-    () => (existsSync(sockPath) ? true : null),
-    3000,
+        // --- epics projection: one row with the folded columns. ---
+        const epic = await retryUntil(() => {
+          const row = reader
+            .query(
+              "SELECT epic_id, epic_number, title, project_dir, status, last_event_id FROM epics WHERE epic_id = ?",
+            )
+            .get(epicId) as {
+            epic_id: string;
+            epic_number: number | null;
+            title: string | null;
+            project_dir: string | null;
+            status: string | null;
+            last_event_id: number;
+          } | null;
+          return row ? row : null;
+        }, 8000);
+        if (!epic) {
+          throw new Error("epic never projected");
+        }
+        expect(epic.epic_number).toBe(9);
+        expect(epic.title).toBe("Keeper E2E Plans Epic");
+        expect(epic.project_dir).toBe("/tmp/keeper-e2e-repo");
+        expect(epic.status).toBe("open");
+        const baselineEpicEventId = epic.last_event_id;
+
+        // --- tasks projection: embedded in the parent epic's `tasks` array (schema
+        // v7 — no standalone tasks table). Read the epic's array and find the task. ---
+        interface EmbeddedTask {
+          task_id: string;
+          epic_id: string | null;
+          task_number: number | null;
+          title: string | null;
+          target_repo: string | null;
+          // Schema v19: legacy `status` was renamed to `worker_phase` (derived
+          // worker-phase binary) to free up `runtime_status` (planctl-native
+          // enum) as a sibling field. Both ride inside the embedded element.
+          worker_phase: string | null;
+          runtime_status: string;
+        }
+        const task = await retryUntil(() => {
+          const row = reader
+            .query("SELECT tasks FROM epics WHERE epic_id = ?")
+            .get(epicId) as { tasks: string | null } | null;
+          if (row == null || row.tasks == null || row.tasks.length === 0) {
+            return null;
+          }
+          const arr = JSON.parse(row.tasks) as EmbeddedTask[];
+          return arr.find((t) => t.task_id === taskId) ?? null;
+        }, 8000);
+        if (!task) {
+          throw new Error("task never projected");
+        }
+        expect(task.epic_id).toBe(epicId);
+        expect(task.task_number).toBe(1);
+        expect(task.title).toBe("First plans task");
+        expect(task.target_repo).toBe("/tmp/keeper-e2e-repo");
+        // Schema v19: assert both task-status fields. `worker_phase` is the
+        // derived binary (was `status`); `runtime_status` defaults to "todo"
+        // when the task has no `.planctl/state/tasks/<id>.state.json` sidecar.
+        expect(task.worker_phase).toBe("open");
+        expect(task.runtime_status).toBe("todo");
+
+        // --- UDS subscribe over the epics collection: query → result, then a live
+        // patch when the epic file changes (state-on-disk → snapshot → fold). ---
+        const client = await connectClient(sockPath);
+        try {
+          client.send({ type: "query", collection: "epics", id: "qe" });
+          const result = await retryUntil(
+            () => client.frames.find((f) => f.type === "result") ?? null,
+          );
+          if (!result || result.type !== "result") {
+            throw new Error("epics result never arrived");
+          }
+          expect(result.collection).toBe("epics");
+          expect(result.rows.some((r) => r.epic_id === epicId)).toBe(true);
+
+          // Trigger a live patch by inserting a synthetic EpicSnapshot event
+          // directly — the same thing the plan worker emits on a file change. This
+          // tests the key event→fold→UDS-patch chain without relying on FSEvents
+          // delivery timing under full-suite load (FSEvents is unreliable when
+          // many test processes run concurrently).
+          const { db: patchWriter, stmts: patchStmts } = openDb(dbPath);
+          patchStmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: epicId,
+            $pid: null,
+            $hook_event: "EpicSnapshot",
+            $event_type: "plan_snapshot",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify({
+              epic_number: epicNumberFromId(epicId),
+              title: "Keeper E2E Plans Epic",
+              project_dir: "/tmp/keeper-e2e-repo",
+              status: "done",
+            }),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+          });
+          patchWriter.close();
+
+          const patch = await retryUntil(
+            () =>
+              client.frames.find(
+                (f) =>
+                  f.type === "patch" &&
+                  f.collection === "epics" &&
+                  f.row.epic_id === epicId &&
+                  (f.row.last_event_id as number) > baselineEpicEventId,
+              ) ?? null,
+            8000,
+          );
+          if (!patch || patch.type !== "patch") {
+            throw new Error("epics patch never arrived");
+          }
+          expect(patch.collection).toBe("epics");
+          expect(patch.row.status).toBe("done");
+
+          // A TaskSnapshot folds into its PARENT epic's embedded array — it arrives
+          // as a `patch` on the epic row (not its own collection). Insert a
+          // synthetic TaskSnapshot for the same task with a flipped status and
+          // assert the parent epic patches with the updated element in `tasks`.
+          const epicEventIdAfterEpicPatch = patch.row.last_event_id as number;
+          const { db: taskWriter, stmts: taskStmts } = openDb(dbPath);
+          taskStmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: taskId,
+            $pid: null,
+            $hook_event: "TaskSnapshot",
+            $event_type: "plan_snapshot",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify({
+              epic_id: epicId,
+              task_number: taskNumberFromId(taskId),
+              title: "First plans task",
+              target_repo: "/tmp/keeper-e2e-repo",
+              status: "done",
+            }),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+          });
+          taskWriter.close();
+
+          const taskPatch = await retryUntil(
+            () =>
+              client.frames.find(
+                (f) =>
+                  f.type === "patch" &&
+                  f.collection === "epics" &&
+                  f.row.epic_id === epicId &&
+                  (f.row.last_event_id as number) > epicEventIdAfterEpicPatch,
+              ) ?? null,
+            8000,
+          );
+          if (!taskPatch || taskPatch.type !== "patch") {
+            throw new Error("task-into-epic patch never arrived");
+          }
+          // The embedded array (a decoded `Task[]` on the wire) carries the task
+          // with its flipped worker-phase. Schema v19: the legacy `status` blob
+          // field is read defensively (`worker_phase ?? status`) by the reducer
+          // for re-fold determinism across the v18→v19 boundary, so a pre-v19
+          // shape with `status: "done"` lands as `worker_phase: "done"`.
+          const embedded = taskPatch.row.tasks as {
+            task_id: string;
+            worker_phase: string;
+          }[];
+          expect(Array.isArray(embedded)).toBe(true);
+          const folded = embedded.find((t) => t.task_id === taskId);
+          expect(folded?.worker_phase).toBe("done");
+
+          // --- deletion retraction: a TaskDeleted tombstone splices the element
+          // out of the parent epic's array; the epic patches with `tasks` empty.
+          // Inserted directly (same as the snapshots above) to test the
+          // event→fold→UDS-patch chain without FSEvents delivery timing. ---
+          const epicEventIdAfterTaskPatch = taskPatch.row
+            .last_event_id as number;
+          const { db: delTaskWriter, stmts: delTaskStmts } = openDb(dbPath);
+          delTaskStmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: taskId,
+            $pid: null,
+            $hook_event: "TaskDeleted",
+            $event_type: "plan_snapshot",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify({ epic_id: epicId }),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+          });
+          delTaskWriter.close();
+
+          const taskDeletePatch = await retryUntil(
+            () =>
+              client.frames.find(
+                (f) =>
+                  f.type === "patch" &&
+                  f.collection === "epics" &&
+                  f.row.epic_id === epicId &&
+                  (f.row.last_event_id as number) > epicEventIdAfterTaskPatch,
+              ) ?? null,
+            8000,
+          );
+          if (!taskDeletePatch || taskDeletePatch.type !== "patch") {
+            throw new Error("task-delete patch never arrived");
+          }
+          const afterDelete = taskDeletePatch.row.tasks as {
+            task_id: string;
+          }[];
+          expect(Array.isArray(afterDelete)).toBe(true);
+          expect(afterDelete.some((t) => t.task_id === taskId)).toBe(false);
+
+          // --- an EpicDeleted tombstone removes the epic row; it leaves the page.
+          const { db: delEpicWriter, stmts: delEpicStmts } = openDb(dbPath);
+          delEpicStmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: epicId,
+            $pid: null,
+            $hook_event: "EpicDeleted",
+            $event_type: "plan_snapshot",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: "",
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+          });
+          delEpicWriter.close();
+
+          const epicGone = await retryUntil(() => {
+            const row = reader
+              .query("SELECT epic_id FROM epics WHERE epic_id = ?")
+              .get(epicId) as { epic_id: string } | null;
+            return row == null ? true : null;
+          }, 8000);
+          if (!epicGone) {
+            throw new Error("epic row never deleted");
+          }
+        } finally {
+          client.socket.end();
+        }
+      } finally {
+        reader.close();
+      }
+    },
+    { env: { KEEPER_CONFIG: configPath } },
   );
-  if (!bound) {
-    const out = await readStream(daemon.stdout);
-    const err = await readStream(daemon.stderr);
-    throw new Error(`socket never bound.\nstdout:\n${out}\nstderr:\n${err}`);
-  }
-  // No anchor sleep: the boot scan runs synchronously inside subscribe().then(),
-  // so events land within seconds of socket bind without FSEvents involvement.
-
-  const { db: reader } = openDb(dbPath, { readonly: true });
-  try {
-    // --- synthetic events land, with the right hook_event + entity key. ---
-    const events = await retryUntil(() => {
-      const rows = reader
-        .query(
-          "SELECT session_id, hook_event FROM events WHERE hook_event IN ('EpicSnapshot', 'TaskSnapshot') ORDER BY id ASC",
-        )
-        .all() as Array<{ session_id: string; hook_event: string }>;
-      return rows.length >= 2 ? rows : null;
-    }, 8000);
-    if (!events) {
-      const out = await readStream(daemon.stdout);
-      const err = await readStream(daemon.stderr);
-      throw new Error(
-        `synthetic plan events never landed.\nstdout:\n${out}\nstderr:\n${err}`,
-      );
-    }
-    expect(events).toContainEqual({
-      session_id: epicId,
-      hook_event: "EpicSnapshot",
-    });
-    expect(events).toContainEqual({
-      session_id: taskId,
-      hook_event: "TaskSnapshot",
-    });
-
-    // --- epics projection: one row with the folded columns. ---
-    const epic = await retryUntil(() => {
-      const row = reader
-        .query(
-          "SELECT epic_id, epic_number, title, project_dir, status, last_event_id FROM epics WHERE epic_id = ?",
-        )
-        .get(epicId) as {
-        epic_id: string;
-        epic_number: number | null;
-        title: string | null;
-        project_dir: string | null;
-        status: string | null;
-        last_event_id: number;
-      } | null;
-      return row ? row : null;
-    }, 8000);
-    if (!epic) {
-      const out = await readStream(daemon.stdout);
-      const err = await readStream(daemon.stderr);
-      throw new Error(
-        `epic never projected.\nstdout:\n${out}\nstderr:\n${err}`,
-      );
-    }
-    expect(epic.epic_number).toBe(9);
-    expect(epic.title).toBe("Keeper E2E Plans Epic");
-    expect(epic.project_dir).toBe("/tmp/keeper-e2e-repo");
-    expect(epic.status).toBe("open");
-    const baselineEpicEventId = epic.last_event_id;
-
-    // --- tasks projection: embedded in the parent epic's `tasks` array (schema
-    // v7 — no standalone tasks table). Read the epic's array and find the task. ---
-    interface EmbeddedTask {
-      task_id: string;
-      epic_id: string | null;
-      task_number: number | null;
-      title: string | null;
-      target_repo: string | null;
-      // Schema v19: legacy `status` was renamed to `worker_phase` (derived
-      // worker-phase binary) to free up `runtime_status` (planctl-native
-      // enum) as a sibling field. Both ride inside the embedded element.
-      worker_phase: string | null;
-      runtime_status: string;
-    }
-    const task = await retryUntil(() => {
-      const row = reader
-        .query("SELECT tasks FROM epics WHERE epic_id = ?")
-        .get(epicId) as { tasks: string | null } | null;
-      if (row == null || row.tasks == null || row.tasks.length === 0) {
-        return null;
-      }
-      const arr = JSON.parse(row.tasks) as EmbeddedTask[];
-      return arr.find((t) => t.task_id === taskId) ?? null;
-    }, 8000);
-    if (!task) {
-      const out = await readStream(daemon.stdout);
-      const err = await readStream(daemon.stderr);
-      throw new Error(
-        `task never projected.\nstdout:\n${out}\nstderr:\n${err}`,
-      );
-    }
-    expect(task.epic_id).toBe(epicId);
-    expect(task.task_number).toBe(1);
-    expect(task.title).toBe("First plans task");
-    expect(task.target_repo).toBe("/tmp/keeper-e2e-repo");
-    // Schema v19: assert both task-status fields. `worker_phase` is the
-    // derived binary (was `status`); `runtime_status` defaults to "todo"
-    // when the task has no `.planctl/state/tasks/<id>.state.json` sidecar.
-    expect(task.worker_phase).toBe("open");
-    expect(task.runtime_status).toBe("todo");
-
-    // --- UDS subscribe over the epics collection: query → result, then a live
-    // patch when the epic file changes (state-on-disk → snapshot → fold). ---
-    const client = await connectClient(sockPath);
-    try {
-      client.send({ type: "query", collection: "epics", id: "qe" });
-      const result = await retryUntil(
-        () => client.frames.find((f) => f.type === "result") ?? null,
-      );
-      if (!result || result.type !== "result") {
-        const out = await readStream(daemon.stdout);
-        const err = await readStream(daemon.stderr);
-        throw new Error(
-          `epics result never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
-        );
-      }
-      expect(result.collection).toBe("epics");
-      expect(result.rows.some((r) => r.epic_id === epicId)).toBe(true);
-
-      // Trigger a live patch by inserting a synthetic EpicSnapshot event
-      // directly — the same thing the plan worker emits on a file change. This
-      // tests the key event→fold→UDS-patch chain without relying on FSEvents
-      // delivery timing under full-suite load (FSEvents is unreliable when
-      // many test processes run concurrently).
-      const { db: patchWriter, stmts: patchStmts } = openDb(dbPath);
-      patchStmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: epicId,
-        $pid: null,
-        $hook_event: "EpicSnapshot",
-        $event_type: "plan_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: JSON.stringify({
-          epic_number: epicNumberFromId(epicId),
-          title: "Keeper E2E Plans Epic",
-          project_dir: "/tmp/keeper-e2e-repo",
-          status: "done",
-        }),
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-      });
-      patchWriter.close();
-
-      const patch = await retryUntil(
-        () =>
-          client.frames.find(
-            (f) =>
-              f.type === "patch" &&
-              f.collection === "epics" &&
-              f.row.epic_id === epicId &&
-              (f.row.last_event_id as number) > baselineEpicEventId,
-          ) ?? null,
-        8000,
-      );
-      if (!patch || patch.type !== "patch") {
-        const out = await readStream(daemon.stdout);
-        const err = await readStream(daemon.stderr);
-        throw new Error(
-          `epics patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
-        );
-      }
-      expect(patch.collection).toBe("epics");
-      expect(patch.row.status).toBe("done");
-
-      // A TaskSnapshot folds into its PARENT epic's embedded array — it arrives
-      // as a `patch` on the epic row (not its own collection). Insert a
-      // synthetic TaskSnapshot for the same task with a flipped status and
-      // assert the parent epic patches with the updated element in `tasks`.
-      const epicEventIdAfterEpicPatch = patch.row.last_event_id as number;
-      const { db: taskWriter, stmts: taskStmts } = openDb(dbPath);
-      taskStmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: taskId,
-        $pid: null,
-        $hook_event: "TaskSnapshot",
-        $event_type: "plan_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: JSON.stringify({
-          epic_id: epicId,
-          task_number: taskNumberFromId(taskId),
-          title: "First plans task",
-          target_repo: "/tmp/keeper-e2e-repo",
-          status: "done",
-        }),
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-      });
-      taskWriter.close();
-
-      const taskPatch = await retryUntil(
-        () =>
-          client.frames.find(
-            (f) =>
-              f.type === "patch" &&
-              f.collection === "epics" &&
-              f.row.epic_id === epicId &&
-              (f.row.last_event_id as number) > epicEventIdAfterEpicPatch,
-          ) ?? null,
-        8000,
-      );
-      if (!taskPatch || taskPatch.type !== "patch") {
-        const out = await readStream(daemon.stdout);
-        const err = await readStream(daemon.stderr);
-        throw new Error(
-          `task-into-epic patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
-        );
-      }
-      // The embedded array (a decoded `Task[]` on the wire) carries the task
-      // with its flipped worker-phase. Schema v19: the legacy `status` blob
-      // field is read defensively (`worker_phase ?? status`) by the reducer
-      // for re-fold determinism across the v18→v19 boundary, so a pre-v19
-      // shape with `status: "done"` lands as `worker_phase: "done"`.
-      const embedded = taskPatch.row.tasks as {
-        task_id: string;
-        worker_phase: string;
-      }[];
-      expect(Array.isArray(embedded)).toBe(true);
-      const folded = embedded.find((t) => t.task_id === taskId);
-      expect(folded?.worker_phase).toBe("done");
-
-      // --- deletion retraction: a TaskDeleted tombstone splices the element
-      // out of the parent epic's array; the epic patches with `tasks` empty.
-      // Inserted directly (same as the snapshots above) to test the
-      // event→fold→UDS-patch chain without FSEvents delivery timing. ---
-      const epicEventIdAfterTaskPatch = taskPatch.row.last_event_id as number;
-      const { db: delTaskWriter, stmts: delTaskStmts } = openDb(dbPath);
-      delTaskStmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: taskId,
-        $pid: null,
-        $hook_event: "TaskDeleted",
-        $event_type: "plan_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: JSON.stringify({ epic_id: epicId }),
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-      });
-      delTaskWriter.close();
-
-      const taskDeletePatch = await retryUntil(
-        () =>
-          client.frames.find(
-            (f) =>
-              f.type === "patch" &&
-              f.collection === "epics" &&
-              f.row.epic_id === epicId &&
-              (f.row.last_event_id as number) > epicEventIdAfterTaskPatch,
-          ) ?? null,
-        8000,
-      );
-      if (!taskDeletePatch || taskDeletePatch.type !== "patch") {
-        const out = await readStream(daemon.stdout);
-        const err = await readStream(daemon.stderr);
-        throw new Error(
-          `task-delete patch never arrived.\nstdout:\n${out}\nstderr:\n${err}`,
-        );
-      }
-      const afterDelete = taskDeletePatch.row.tasks as { task_id: string }[];
-      expect(Array.isArray(afterDelete)).toBe(true);
-      expect(afterDelete.some((t) => t.task_id === taskId)).toBe(false);
-
-      // --- an EpicDeleted tombstone removes the epic row; it leaves the page.
-      const { db: delEpicWriter, stmts: delEpicStmts } = openDb(dbPath);
-      delEpicStmts.insertEvent.run({
-        $ts: Date.now() / 1000,
-        $session_id: epicId,
-        $pid: null,
-        $hook_event: "EpicDeleted",
-        $event_type: "plan_snapshot",
-        $tool_name: null,
-        $matcher: null,
-        $cwd: null,
-        $permission_mode: null,
-        $agent_id: null,
-        $agent_type: null,
-        $stop_hook_active: null,
-        $data: "",
-        $subagent_agent_id: null,
-        $spawn_name: null,
-        $start_time: null,
-      });
-      delEpicWriter.close();
-
-      const epicGone = await retryUntil(() => {
-        const row = reader
-          .query("SELECT epic_id FROM epics WHERE epic_id = ?")
-          .get(epicId) as { epic_id: string } | null;
-        return row == null ? true : null;
-      }, 8000);
-      if (!epicGone) {
-        const out = await readStream(daemon.stdout);
-        const err = await readStream(daemon.stderr);
-        throw new Error(
-          `epic row never deleted.\nstdout:\n${out}\nstderr:\n${err}`,
-        );
-      }
-    } finally {
-      client.socket.end();
-    }
-  } finally {
-    reader.close();
-  }
-
-  // Clean shutdown: SIGTERM → all four workers tear down → exit 0. The plan
-  // worker unsubscribes its watch in its shutdown handler.
-  daemon.kill("SIGTERM");
-  const exitCode = await daemon.exited;
-  expect(exitCode).toBe(0);
 }, 30000);
 
 test("end-to-end: downtime file deletion is reconciled on restart via the boot sweep", async () => {

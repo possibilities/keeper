@@ -1,31 +1,35 @@
 #!/usr/bin/env bun
 /**
- * Flake-soak harness for the parallel `test:slow` tier (epic fn-747).
+ * Flake-soak harness for the (serial) `test:slow` tier (epic fn-747).
  *
- * The slow tier (`integration` + `daemon` + `plan-worker`) was historically
- * carved into a SERIAL split (commit 9558382) because `plan-worker`'s
- * `@parcel/watcher` native NAPI addon panicked under whole-suite `--parallel`.
- * fn-747 reintroduces `--parallel` over the lighter tier (Bun 1.3.14's
- * parallel/isolate fix in hand) — and ships THIS harness as the durable guard
- * that keeps the tier from silently regressing to flaky: it reruns the tier N
- * times and reports any failure, formalizing the "0 flakes over N consecutive
- * runs" manual ritual (fn-722 / fn-683) at 20x by default.
+ * The slow tier (`integration` + `daemon` + `plan-worker`) was carved SERIAL
+ * (commit 9558382, fn-722) because `@parcel/watcher`'s native NAPI addon
+ * panicked under whole-suite `--parallel`. fn-747 set out to `--parallel`-ize
+ * it; the `.2` in-process daemon + watcher seam landed (migrating `integration`'s
+ * four heaviest daemon-dependent e2e tests off the subprocess boot), but a full
+ * `--parallel` soak proved the speedup is NOT reliably reachable, so fn-747.1
+ * takes the epic's documented FALLBACK: keep the SERIAL baseline and ship THIS
+ * harness as the durable flake-regression guard. It reruns the tier N times and
+ * reports any failure, formalizing the "0 flakes over N consecutive runs" ritual
+ * (fn-722 / fn-683) at 20x by default.
  *
- * TIER COMPOSITION (verified, fn-747.1 — the spec's FALLBACK split): a 20x
- * soak proved `plan-worker` STILL panics intermittently under `--parallel`
- * (`panic: NAPI FATAL ERROR: napi_create_object` / worker SIGTRAP — the exact
- * `@parcel/watcher` native-addon crash from commit 9558382; Bun 1.3.14's
- * parallel/isolate fix does NOT cover this addon). So `plan-worker` STAYS
- * SERIAL. `integration` + `daemon` are the daemon-spawning pair and run
- * `--parallel` together. The two phases mirrored here are exactly what
- * `test:slow` ships:
- *   1. `integration` + `daemon` --parallel
- *   2. `plan-worker` serial
- * (Aside: `integration`'s 30s daemon-boot tests are ALSO contention-sensitive
- * to whole-box load — fn-722.7's 10s→36s spike — so a soak run that times out
- * on a saturated box is an environmental flake, not a tier regression. The
- * harness gates on pass/fail per the spec; soak on a QUIET box for a clean
- * flake rate.)
+ * WHY SERIAL (the fn-747.1 finding — two independent walls, both `--parallel`-only):
+ *   1. `@parcel/watcher`'s native addon SIGTRAP/segfaults on teardown when many
+ *      watcher-bearing REAL DAEMON SUBPROCESSES (the `integration` daemon-spawn
+ *      smoke tests) are torn down concurrently.
+ *   2. `plan-worker`'s fn-737 realtime-latency regression guards assert the
+ *      native reflog WATCH beats the heartbeat fallback
+ *      (`heartbeatRescues===0`); under `--parallel` load the watch delivery
+ *      slows, the heartbeat wins, and the guard fails. They NEED low-load serial
+ *      isolation to measure honestly — so `--parallel`-izing plan-worker is
+ *      structurally self-defeating.
+ * The `.2` conversions are RETAINED even serial: the four in-process tests boot
+ * with `disableNativeWatcher` (zero addon dlopen) and run sub-second instead of
+ * 30s, so the serial tier is FASTER and tears down FEWER native watchers than
+ * the pre-fn-747 all-subprocess serial baseline.
+ * (Aside: `integration`'s real-daemon-boot tests are contention-sensitive to
+ * whole-box load — fn-722.7's 10s→36s spike — so soak on a QUIET box; the
+ * harness gates on pass/fail per the spec, never timing.)
  *
  * Design (per the spec):
  *   - SEQUENTIAL iterations. Parallel iterations would multiply socket
@@ -33,7 +37,7 @@
  *     the tier's OWN intra-run parallelism, not N tiers fighting each other.
  *   - RUN-ALL by default (don't stop on first fail) so a full N yields a flake
  *     RATE (e.g. 2/20), not just a yes/no. `--bail` / `-b` stops on first fail.
- *   - Each iteration shells a FRESH `bun test <tier files> --parallel` via
+ *   - Each iteration shells a FRESH `bun test <tier files>` via
  *     `Bun.spawn` — NOT `bun test --rerun-each`, which has a known
  *     beforeEach/afterEach count bug (oven-sh/bun#13493).
  *   - Gates on PASS/FAIL ONLY. Wall-time is informational (fn-722.7 saw the
@@ -60,26 +64,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 /**
- * The slow tier's two phases, mirroring `test:slow` (the fn-747.1 FALLBACK —
- * see the file header for why `plan-worker` stays serial):
- *   1. `integration` + `daemon` run --parallel (the daemon-spawning pair).
- *   2. `plan-worker` runs ALONE/serial (its `@parcel/watcher` NAPI addon
- *      panics intermittently under --parallel; commit 9558382's reason).
- * Each phase is its own `bun test` invocation; a phase failing fails the run.
+ * The slow tier as ONE serial phase, mirroring `test:slow` (see the file header
+ * for the two native-addon walls that keep it serial). All three files run in a
+ * single non-`--parallel` `bun test` invocation, so tests execute sequentially —
+ * no concurrent addon dlopen/teardown (wall 1) and the fn-737 latency guards run
+ * under low load (wall 2). A 60s budget covers load-variable real-daemon boots.
  */
 const TIER_PHASES: { argv: string[]; label: string }[] = [
   {
     argv: [
       "test/integration.test.ts",
       "test/daemon.test.ts",
-      "--parallel",
-      "--timeout=30000",
+      "test/plan-worker.test.ts",
+      "--timeout=60000",
     ],
-    label: "integration+daemon --parallel",
-  },
-  {
-    argv: ["test/plan-worker.test.ts", "--timeout=30000"],
-    label: "plan-worker (serial)",
+    label: "integration+daemon+plan-worker (serial)",
   },
 ];
 
@@ -99,7 +98,10 @@ export interface SoakConfig {
 }
 
 /** Parse argv/env into a soak config. argv `N` and `--bail`/`-b`; `SOAK_RUNS` env. */
-export function parseConfig(argv: string[], env: NodeJS.ProcessEnv): SoakConfig {
+export function parseConfig(
+  argv: string[],
+  env: NodeJS.ProcessEnv,
+): SoakConfig {
   let runs = 20;
   let bail = false;
   const envRuns = env.SOAK_RUNS;
