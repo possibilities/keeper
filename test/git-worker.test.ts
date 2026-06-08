@@ -2920,64 +2920,53 @@ test("fn-716 throttle: a bursty-then-quiet edit still flushes on the trailing de
 });
 
 // ---------------------------------------------------------------------------
-// decideDataVersionWake — epic fn-716. The narrowed data_version poll. The
-// pre-fn-716 poll re-scheduled every subscribed root on every bump, and the
-// worker's own GitSnapshot insert bumps data_version → a self-feeding storm.
-// The fix: reconcile membership on any advance (so a foreign change is never
-// missed), but gate re-snapshot scheduling on advance + a min-elapsed floor.
+// decideDataVersionWake — epic fn-748. The data_version poll drives membership
+// reconcile ONLY. `data_version` carries no root attribution, so it must never
+// fan a per-root snapshot out (the O(roots) fan-out that pegged the daemon was
+// removed here). Per-root snapshots now come solely from the worktree +
+// git-common-dir FSEvents subs + the 60s heartbeat backstop. The decision
+// collapses to membership-only: `reconcile` is true on any version advance.
 // ---------------------------------------------------------------------------
 
-const FLOOR = 1000; // DATA_VERSION_SCHEDULE_FLOOR_MS
-
-test("decideDataVersionWake: no advance → no reconcile, no schedule, floor unchanged", () => {
-  expect(decideDataVersionWake(5, 5, 10_000, 9_500, FLOOR)).toEqual({
+test("decideDataVersionWake: no advance → no reconcile", () => {
+  expect(decideDataVersionWake(5, 5)).toEqual({
     reconcile: false,
-    schedule: false,
-    nextScheduleAtMs: 9_500,
   } satisfies DataVersionWakeDecision);
 });
 
-test("decideDataVersionWake: advance past the floor → reconcile AND schedule, floor advances to now", () => {
-  expect(decideDataVersionWake(6, 5, 10_000, 8_000, FLOOR)).toEqual({
+test("decideDataVersionWake: a version advance → reconcile (membership only)", () => {
+  expect(decideDataVersionWake(6, 5)).toEqual({
     reconcile: true,
-    schedule: true,
-    nextScheduleAtMs: 10_000,
   } satisfies DataVersionWakeDecision);
 });
 
-test("decideDataVersionWake: self-write inside the floor → reconcile but do NOT schedule (self-feed guard)", () => {
-  // The worker's own GitSnapshot insert bumped data_version a few ms after the
-  // last scheduling wake. Membership still reconciles (cheap, idempotent), but
-  // the re-snapshot scheduling is suppressed so the storm can't form.
-  const d = decideDataVersionWake(7, 6, 8_010, 8_000, FLOOR);
-  expect(d.reconcile).toBe(true);
-  expect(d.schedule).toBe(false);
-  // Floor carried forward unchanged — a later genuine foreign change still
-  // measures from the last real scheduling wake.
-  expect(d.nextScheduleAtMs).toBe(8_000);
+test("decideDataVersionWake: a self-write advance still reconciles (cheap, idempotent — no snapshot fan-out)", () => {
+  // The worker's own GitSnapshot insert bumps data_version. With the snapshot
+  // fan-out removed, that self-write is harmless: it only reconciles membership
+  // (O(1), idempotent) and never re-arms a per-root snapshot, so no storm forms.
+  expect(decideDataVersionWake(7, 6)).toEqual({
+    reconcile: true,
+  } satisfies DataVersionWakeDecision);
 });
 
-test("decideDataVersionWake: a foreign change spaced past the floor schedules even after suppressed self-writes", () => {
-  // Self-write at t=8010 (suppressed, floor stays 8000), then a real foreign
-  // change at t=9100 — now >= FLOOR past 8000 → schedules.
-  const selfWrite = decideDataVersionWake(7, 6, 8_010, 8_000, FLOOR);
-  expect(selfWrite.schedule).toBe(false);
-  const foreign = decideDataVersionWake(
-    8,
-    7,
-    9_100,
-    selfWrite.nextScheduleAtMs,
-    FLOOR,
-  );
-  expect(foreign.reconcile).toBe(true);
-  expect(foreign.schedule).toBe(true);
-  expect(foreign.nextScheduleAtMs).toBe(9_100);
+test("decideDataVersionWake: a back-to-back foreign change reconciles every advance", () => {
+  // No floor / no rate gate — every distinct advance reconciles membership. The
+  // cost is bounded by O(1) reconcile, not O(roots) snapshot, so back-to-back
+  // advances are safe.
+  expect(decideDataVersionWake(8, 7)).toEqual({
+    reconcile: true,
+  } satisfies DataVersionWakeDecision);
+  expect(decideDataVersionWake(9, 8)).toEqual({
+    reconcile: true,
+  } satisfies DataVersionWakeDecision);
 });
 
-test("decideDataVersionWake: first advance after boot (lastSchedule = -Infinity) always schedules", () => {
-  const d = decideDataVersionWake(2, 1, 50, Number.NEGATIVE_INFINITY, FLOOR);
-  expect(d.schedule).toBe(true);
-  expect(d.nextScheduleAtMs).toBe(50);
+test("decideDataVersionWake: first advance after boot reconciles", () => {
+  // lastDataVersion seeds to the cur value at boot, so the first genuine bump
+  // reads as an advance and reconciles.
+  expect(decideDataVersionWake(2, 1)).toEqual({
+    reconcile: true,
+  } satisfies DataVersionWakeDecision);
 });
 
 // ---------------------------------------------------------------------------
