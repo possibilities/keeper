@@ -61,5 +61,5 @@ Compose the already-exported `discoverPlanctlDirs`, `PlanScanner`,
 - [ ] No Worker / `@parcel/watcher` / real `~/code` access in the new unit tests
 
 ## Done summary
-
+Extracted fn-737 reflog watch-set wiring to pure module-scope helpers (resolveReflogTarget, discoverPlanctlRepos, desiredReflogRepos, reflogWatchDiff), all exported; reconcileReflogWatches now composes them with I/O + live-set mutation staying in the closure. Added pure unit tests covering all four; existing live reflog tests still green (no behavior change).
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Extract and unit-test the fn-737 reflog seam",
-  "updated_at": "2026-06-08T21:16:36.725067Z"
+  "updated_at": "2026-06-08T22:07:37.757307Z",
+  "worker_done_at": "2026-06-08T22:07:37.757307Z"
 }
