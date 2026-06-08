@@ -1,0 +1,20 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-753-trigger-catch-up-backup-on-boot-when",
+  "bundles": [],
+  "created_at": "2026-06-08T23:11:16.263112Z",
+  "depends_on_epics": [
+    "fn-746-keeper-db-corruption-resilience"
+  ],
+  "id": "fn-753-trigger-catch-up-backup-on-boot-when",
+  "last_validated_at": "2026-06-08T23:11:16.527389Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "trigger catch-up backup on boot when overdue",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-08T23:11:16.263112Z"
+}

@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T23:11:16.263112Z",
+  "depends_on": [],
+  "epic": "fn-753-trigger-catch-up-backup-on-boot-when",
+  "id": "fn-753-trigger-catch-up-backup-on-boot-when.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "add boot-time backup overdue check",
+  "updated_at": "2026-06-08T23:11:16.263112Z"
+}
