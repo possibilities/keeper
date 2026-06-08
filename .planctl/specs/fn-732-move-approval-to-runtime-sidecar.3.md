@@ -1,84 +1,58 @@
 ## Description
 
 **Size:** M
-**Files:** src/plan-worker.ts, test/plan-classifier.test.ts, test/plan-worker.test.ts, CLAUDE.md, README.md
+**Files:** src/plan-worker.ts, src/rpc-handlers.ts, test/plan-classifier.test.ts, test/plan-worker.test.ts, CLAUDE.md, README.md
 
-Teach keeper's plan-worker to fold `approval` from the gitignored sidecars
-(gate-free), symmetric across tasks and epics, per the epic's Sidecar
-contract.
+**EXPAND READER (Phase 1) — lands FIRST (deps: none).** Teach keeper to fold
+`approval` from the gitignored sidecars with a PERMANENT resolution ladder
+(sidecar → committed def → pending). No sidecars yet → falls through to def
+→ behavior unchanged → safe to deploy before planctl changes.
 
 ### Approach
 
-- **Classify (`classifyPlanPath`):** add an `"epic-state"` kind for the
-  4-segment tail `.planctl/state/epics/<id>.state.json` (mirror the
-  existing `task-state` 4-segment arm). Add `epicIdFromStatePath` /
-  `epicDefPathFromStatePath`.
-- **Cache + arms:** add `RawEpicState { approval? }`; add an
-  `epicApprovalCache` and a task-approval cache. Extend the `task-state`
-  `onChange` arm to cache `approval` (alongside status); add a new
-  `epic-state` arm → cache approval + `reemitEpicFromDef` (a near-clone of
-  `reemitTaskFromDef`; the fn-629 in-HEAD gate STILL applies to the DEF
-  read — correct, do not bypass it).
-- **Message build:** `buildTaskMessage` / `buildEpicMessage` source
-  `approval` from the cache (NOT `raw.approval`), with a def-fallback when
-  the cache has no entry for that id (read `raw.approval`), default
-  `pending`. PRESERVE the exact object-literal key order (change-gate is a
-  byte compare; re-fold determinism depends on it). Route every approval
-  read through `coerceApproval` (never throw on malformed sidecar).
-- **Boot prime (`scanPlanctlDir`):** Pass-1 (state/tasks) must ALSO prime
-  the task-approval cache; add a Pass-1b enumerating `state/epics/` to
-  prime the epic-approval cache, ordered BEFORE Pass-2 reads `epics/` —
-  else the first boot snapshot emits stale `pending`. Emission stays
-  exclusively in the sorted Pass-2 def enumeration (caches are write-only
-  in Pass-1/1b), preserving re-fold determinism.
-- **Reducer:** confirm `src/reducer.ts` needs NO change (it folds
-  `snapshot.approval` from the event blob). Add a regression test if
-  helpful but do not alter the fold.
-- **Docs:** keeper `CLAUDE.md` — change "Plans are READ-ONLY except
-  `approval`" → "Plans are READ-ONLY" (approval folded from gitignored
-  sidecars); fix the "Writes are tightly scoped" item (1) and the
-  Sole-writer approval carve-out. `README.md` — RPC description + the
-  fn-629 plan-worker prose (approval no longer rides the def-file
-  commit/in-HEAD path).
+- **classifyPlanPath:** add `epic-state` kind for
+  `.planctl/state/epics/<id>.state.json` (mirror the 4-segment `task-state`
+  arm); add epic id/def-path helpers.
+- **Fold arms + ladder:** epic-approval + task-approval caches; `task-state`
+  arm caches approval; new `epic-state` arm caches approval +
+  `reemitEpicFromDef` (fn-629 in-HEAD gate STILL applies to the DEF read).
+  `buildTaskMessage`/`buildEpicMessage` source approval from cache,
+  **def-fallback on cache miss**, default pending — PRESERVE object-literal
+  key order (re-fold byte compare). Route via `coerceApproval` (never throw).
+- **Boot-prime (scanPlanctlDir):** prime both caches BEFORE def enumeration
+  (Pass-1/1b before Pass-2); caches write-only in Pass-1/1b (re-fold determinism).
+- **RPC retarget (rpc-handlers.ts):** `set_task_approval`/`set_epic_approval`
+  write the sidecar (create-if-absent; task RMW preserves status;
+  traversal-guarded). KEEP the approval kick for now (removed in `.4`).
+- **DEPLOY:** restart keeperd and CONFIRM the fold arm is live (daemon picks
+  up code only on restart) — acceptance gate.
 
 ### Investigation targets
 
-**Required:**
-- src/plan-worker.ts:472-504 — `classifyPlanPath` (add epic-state kind)
-- src/plan-worker.ts:1290-1317 — the `task-state` onChange arm (the template)
-- src/plan-worker.ts:1153-1215 — `reemitTaskFromDef` (mirror for epics; note the :1198-1205 in-HEAD gate stays)
-- src/plan-worker.ts:1676-1749 — `buildEpicMessage` / `buildTaskMessage` (approval source + key-order comment ~:1717)
-- src/plan-worker.ts:2097-2214 — `scanPlanctlDir` boot-prime ordering (Pass-1 then Pass-2)
-- src/reducer.ts:802-826, :977, :1014 — confirm approval fold is source-agnostic
-
-**Optional:**
-- test/plan-classifier.test.ts, test/plan-worker.test.ts — test homes; helpers are exported "for unit reach"
+**Required** (read before coding):
+- src/plan-worker.ts:472-504 classifyPlanPath; :1290-1317 task-state arm (template); :1153-1215 reemitTaskFromDef; :1676-1749 buildEpic/TaskMessage (key order); :2097-2214 scanPlanctlDir boot-prime
+- src/reducer.ts:802-826,:977,:1014 — confirm approval fold is source-agnostic (folds snapshot.approval from the event)
+- src/rpc-handlers.ts:292-360 — approval handlers to retarget
 
 ### Risks
 
-- Object-literal key-order drift → every epic/task re-emits on each boot
-  (silent until a re-fold diff). Keep `approval` in the identical slot.
-- Boot-prime ordering wrong → first boot snapshot resets approval to
-  pending. Pass-1/1b strictly before Pass-2.
-- The def-fallback must apply ONLY on a cache miss; once a sidecar exists
-  the cache wins (so a stale def value can't clobber the sidecar value).
+- Object-literal key-order drift → re-emit storm / re-fold diff. Keep approval in the identical slot.
+- Boot-prime ordering wrong → first snapshot resets approval to pending.
+- The def-fallback is PERMANENT and load-bearing — do not gate it away.
 
 ### Test notes
 
-bun test: `classifyPlanPath` returns `epic-state` for the new path;
-epic-state arm folds approval gate-free (no commit needed); task approval
-sourced from sidecar; def-fallback on cache miss; boot-prime order
-(epic sidecar primed before epic def read); malformed sidecar coerces to
-pending without throwing; re-fold byte-identity (key order). Sandbox all
-five state paths per CLAUDE.md test-isolation.
+bun test: classifyPlanPath→epic-state; epic-state arm folds gate-free; task
+approval from sidecar; **def-fallback on cache miss**; boot-prime order;
+malformed sidecar coerces to pending; re-fold byte-identity. Sandbox all five state paths.
 
 ## Acceptance
 
-- [ ] `classifyPlanPath` recognizes `.planctl/state/epics/<id>.state.json` as `epic-state`; new arm folds epic approval gate-free.
-- [ ] Task + epic `approval` source from the sidecar cache (def-fallback on cache miss); never throws on malformed sidecar.
-- [ ] Boot-prime primes both caches before def enumeration; re-fold reproduces byte-identical rows (key order preserved).
-- [ ] reducer.ts unchanged; keeper docs updated.
-- [ ] bun test green incl. new epic-state + boot-prime + def-fallback cases.
+- [ ] keeper folds approval from sidecar gate-free AND falls back to committed def on cache miss (PERMANENT ladder)
+- [ ] RPC approval handlers write the sidecar (create-if-absent, RMW preserves status, traversal-guarded)
+- [ ] boot-prime primes caches before def enumeration; re-fold byte-identical (key order)
+- [ ] keeperd restarted and fold arm confirmed live
+- [ ] bun test green incl. fallback + boot-prime + malformed-sidecar cases
 
 ## Done summary
 

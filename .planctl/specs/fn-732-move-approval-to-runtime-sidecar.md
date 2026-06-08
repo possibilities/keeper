@@ -1,92 +1,64 @@
 ## Overview
 
-Move planctl `approval` out of the git-tracked def files
-(`.planctl/{tasks,epics}/<id>.json`) into gitignored runtime sidecars so
-keeper's plan-worker folds it **gate-free** — eliminating the autopilot's
-tens-of-seconds lag reacting to `/approve` completions. Today `status`
-rides the gitignored `.planctl/state/tasks/<id>.state.json` sidecar, which
-keeper's `task-state` fold arm projects immediately (bypassing the fn-629
-in-HEAD observation gate). `approval` lives only in the tracked def file,
-held behind that gate until keeperd observes the approve commit — the
-slow/racy path. Full symmetric move across BOTH tasks and epics; approval
-leaves git history entirely (lives only in the sidecar + keeper's event
-log — confirmed wanted out of git).
+Move planctl `approval` out of git-tracked def files into gitignored runtime
+sidecars so keeper folds it gate-free (eliminating the approve-fold lag). The
+DESTINATION design is unchanged and sound; this epic is RE-DECOMPOSED after a
+failed first attempt that landed task-by-task and **black-holed approvals**
+(planctl stopped writing the def file before keeper could read the sidecar,
+and keeper had no fallback → approval stuck `pending` → autopilot re-approved
+infinitely → unusable; reverted as planctl 34510d1).
 
-Root cause confirmed against the live system: the autopilot reconciler
-dispatches the next action in the SAME second the approval folds; the
-entire delay is fold latency, not reconcile latency.
+## Landing strategy — Parallel Change (expand/contract), reader-first
 
-## Sidecar contract (BOTH repos MUST agree byte-for-byte)
+Safe ordering for a writer (planctl, editable install, instant) and a reader
+(keeperd, long-running daemon, needs restart) that must agree at EVERY commit.
+Deps enforce `.3 → .1 → .2 → .4`:
 
-- **Task sidecar** — existing `.planctl/state/tasks/<task_id>.state.json`
-  gains an `"approval"` key alongside `"status"`. Two writers now share this
-  file (`claim`/`block` write `status`, `approve` writes `approval`), so the
-  approve write MUST be read-modify-write under `lock_task` — never a blind
-  full-object replace, or it clobbers a concurrent status write.
-- **Epic sidecar** — NEW `.planctl/state/epics/<epic_id>.state.json`,
-  `{ "approval": "...", "updated_at": "..." }`. Single writer.
-- **Resolution ladder (every reader, both repos, identical):** valid
-  sidecar `approval` wins → on sidecar absent / no `approval` key /
-  parse-fail, fall back to the def-file `approval` → absent everywhere →
-  `"pending"`. (The def-fallback is the cutover safety net; after the
-  backfill strips def approval it inertly yields `pending`.)
-- **keeper determinism:** the sidecar is read PRODUCER-side (plan-worker
-  cache), threaded into the snapshot event; the reducer is unchanged and
-  folds `snapshot.approval` from the event blob. Re-fold stays
-  byte-identical (events are self-contained; object-literal key order in
-  `buildTaskMessage`/`buildEpicMessage` is load-bearing for the change-gate).
-- `.planctl/state/` is already gitignored in both repos — no gitignore edit.
-- **No schema bump** — the `approval` column already exists (v13); only its
-  source path moves. Do not touch `SCHEMA_VERSION` /
-  `SUPPORTED_SCHEMA_VERSIONS` unless the snapshot blob shape actually changes.
+1. **Expand reader FIRST (`.3`, keeper):** fold approval via a PERMANENT
+   ladder sidecar → committed def → pending. No sidecars yet → falls through
+   to def → behavior unchanged → safe to deploy first. Restart keeperd +
+   confirm live. The def-fallback is the safety net that makes deploy order
+   non-fragile — never remove it.
+2. **Expand writer (`.1`, planctl):** DUAL-WRITE approval to sidecar AND the
+   committed def (approve keeps auto-committing). Not-yet-restarted keeper
+   reads def; restarted keeper reads sidecar. No keeper is ever starved.
+3. **Backfill + contract (`.2`, planctl):** idempotent backfill seeds
+   sidecars; THEN — gated on a positive end-to-end verify that keeper folds
+   approval from the sidecar, in a quiesced window — planctl stops
+   writing/committing def approval and strips it. The only irreversible step,
+   LAST.
+4. **Cleanup (`.4`, keeper):** remove the now-dead approval kick. Keep the
+   def-fallback ladder permanently.
+
+**Invariant (the test):** stop after ANY single task and run forever —
+approval still resolves in both repos. No commit may black-hole approval.
 
 ## Quick commands
 
 - `cd ~/code/planctl && uv run pytest tests/test_run_approve.py tests/test_models.py -q`
 - `cd ~/code/keeper && bun test test/plan-worker.test.ts test/plan-classifier.test.ts test/rpc-handlers.test.ts`
-- End-to-end smoke (post-cutover): approve a done task, confirm keeper folds
-  `approval=approved` within ~1s (no commit, no 60s wait) —
-  `keeper` board / readiness shows the row `completed` promptly.
-
-## Cutover (serialized / quiesced — no staged dual-read window)
-
-Processing is linear/serialized, so cut over while no epic is in flight:
-1. Land all four tasks in both repos.
-2. Run the one-shot backfill (task .2) per repo: seeds sidecars from
-   existing def `approval` AND strips `approval` from def files.
-3. Restart keeperd. The keeper def-fallback makes step-2-vs-3 ordering
-   non-fatal (if keeper boots first it reads the still-present def approval
-   instead of resetting historical approvals to `pending`).
+- Verify gate (before `.2` contract): approve a done task, confirm keeper folds `approval=approved` from the sidecar within ~1s.
 
 ## Acceptance
 
-- [ ] `/plan:approve` of a done task/epic folds into keeper's projection
-      within ~1s (gate-free), with no `chore(planctl): approve` commit.
-- [ ] Approval is absent from all tracked def files after cutover; it lives
-      only in the sidecars + keeper's event log.
-- [ ] Existing historical approvals are NOT reset to `pending` at cutover
-      (backfill + def-fallback).
-- [ ] Concurrent `claim`/`block` (status) and `approve` (approval) on the
-      same task sidecar do not clobber each other.
-- [ ] keeper re-fold from empty reproduces byte-identical rows.
-- [ ] Both test suites green; invariant docs updated to match.
+- [ ] Every intermediate commit leaves approval resolvable in BOTH repos (no black-hole)
+- [ ] keeper read-side (ladder + restart + live-verify) lands before planctl drops the def write
+- [ ] planctl dual-writes during transition; def write removed only after the verify gate
+- [ ] backfill idempotent; def-strip + def-write-removal is the last gated step
+- [ ] keeper def-fallback retained permanently; both suites green; re-fold byte-identical
 
 ## Early proof point
 
-Task that proves the approach: `.3` (keeper sidecar fold arms) — a unit test
-showing the new `epic-state` arm + task approval source fold `approval`
-gate-free (no in-HEAD gate on the sidecar path) is the keystone. If it
-fails: the per-id `.state.json` shape isn't foldable as assumed — fall back
-to having `planctl approve` ALSO emit a keeperd RPC kick (option A from the
-investigation) rather than relying on the sidecar watch.
+Task `.3` (keeper expand-reader): folds approval gate-free from the sidecar
+AND falls back to the committed def when no sidecar exists. If the
+`.state.json` shape isn't foldable as assumed, fall back to a keeperd RPC kick
+on approve rather than the sidecar watch.
 
 ## References
 
-- planctl precedent: `scripts/migrate_acks_to_state.py` (fn-488 moved
-  `closer_acked_at`/`worker_acked_at` off tracked JSON) — the backfill
-  template; `planctl/acks.py` (gitignored-state read discipline).
-- keeper precedent: the `task-state` fold arm in `src/plan-worker.ts`
-  (`classifyPlanPath`, `reemitTaskFromDef`, `runtimeStatusCache`,
-  `scanPlanctlDir` boot-prime) — the epic-state arm mirrors it.
-- fn-629 (in-HEAD observation gate), fn-701 (approval kick — becomes dead),
-  fn-488 (acks gitignored-state move).
+- Reverted first attempt: planctl `07a52e0` → revert `34510d1`. Failure mode: writer switched before reader could read, no fallback.
+- Parallel Change / expand-contract: reader-supports-both before writer-switches; resolution ladder removes deploy-order fragility; contract is last + gated on positive verify; backfill idempotent; dual-write during transition. [Fowler ParallelChange; LaunchDarkly; PlanetScale]
+- keeperd needs RESTART to pick up code; planctl (editable) is instant → reader-first + permanent fallback mandatory.
+- precedents: keeper `task-state` fold arm (src/plan-worker.ts); planctl scripts/migrate_acks_to_state.py + acks.py.
+- **fn-734** depends on this epic and is stale — re-plan AFTER this lands; out of scope here.
+- NOTE: task titles below are stale from the prior decomposition; the SPECS are authoritative for each task's current role.
