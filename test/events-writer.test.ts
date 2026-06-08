@@ -1,14 +1,26 @@
 /**
- * Tests for the events-writer hook's spawn-name capture (fn-545).
+ * Tests for the events-writer hook's spawn-name capture (fn-545) and the
+ * lock-free NDJSON write path (fn-736).
+ *
+ * fn-736 flipped the hook from a direct SQLite `INSERT INTO events` to a per-pid
+ * NDJSON append under the events-log dir (`KEEPER_EVENTS_LOG`). The hook no
+ * longer touches SQLite at all; the daemon-side ingester (`scanEventsLogDir`)
+ * tails those files and lands each line as a real `events` row. So the
+ * integration assertions here read the APPENDED NDJSON line (via
+ * `readEventBinding`, which parses the per-pid file with the SAME
+ * `parseEventLogLine` the ingester uses) instead of SELECTing from the DB —
+ * a byte-identical-round-trip check that the binding the hook produced is the
+ * one the ingester will INSERT.
  *
  * Two layers:
  * - `nameFromArgs` unit cases — the pure, exported flag parser. All flag forms
  *   (`--name=X` / `--name X` / `-n X`) parse to a single token; flag-boundary
  *   anchoring rejects `--rename`/`--username`; absent/empty → null.
  * - Hook-process integration — drive the real hook as a spawned process whose
- *   PARENT argv carries `--name <session>`, and assert: SessionStart populates
- *   `events.spawn_name`; a non-SessionStart event leaves it NULL; the hook
- *   always exits 0 even when the `ps` scrape can't find a name.
+ *   PARENT argv carries `--name <session>`, and assert via the appended NDJSON
+ *   line: SessionStart populates `spawn_name`; a non-SessionStart event leaves
+ *   it NULL; the hook always exits 0 even when the `ps` scrape can't find a
+ *   name; an append failure still exits 0 and dead-letters.
  *
  * The parent-argv carrier is a tiny launcher script (`spawn-launcher.ts`)
  * written into the tmpdir: when run as `bun run spawn-launcher.ts --name <X>`,
@@ -38,7 +50,11 @@ import {
   splitArgsLstart,
 } from "../plugin/hooks/events-writer";
 import { openDb } from "../src/db";
-import { parseDeadLetterLine } from "../src/dead-letter";
+import {
+  type DeadLetterBindings,
+  parseDeadLetterLine,
+  parseEventLogLine,
+} from "../src/dead-letter";
 import {
   extractPlanctlInvocation,
   extractSkillName,
@@ -154,6 +170,40 @@ async function fireViaLauncher(
   return await proc.exited;
 }
 
+/**
+ * Read every per-pid `<pid>.ndjson` file under the sandboxed events-log dir,
+ * parse each line with the SAME `parseEventLogLine` the daemon ingester uses,
+ * and return the FIRST record whose bindings match `session_id` (and
+ * `hook_event`, when given). Returns `null` if no matching record was appended.
+ *
+ * This replaces the old `SELECT ... FROM events` DB read: post-fn-736 the hook
+ * only appends NDJSON (no daemon runs in these tests to ingest it), so the
+ * appended line IS the assertion surface — and asserting on the parsed bindings
+ * proves the byte-identical round-trip the ingester relies on.
+ */
+function readEventBinding(
+  sessionId: string,
+  hookEvent?: string,
+): DeadLetterBindings | null {
+  const dir = join(tmpDir, "events-log");
+  if (!existsSync(dir)) return null;
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ndjson"));
+  for (const file of files) {
+    const lines = readFileSync(join(dir, file), "utf8")
+      .split("\n")
+      .filter((s) => s.length > 0);
+    for (const line of lines) {
+      const record = parseEventLogLine(line);
+      if (record === null) continue;
+      const b = record.bindings;
+      if (b.session_id !== sessionId) continue;
+      if (hookEvent !== undefined && b.hook_event !== hookEvent) continue;
+      return b;
+    }
+  }
+  return null;
+}
+
 // ---------------------------------------------------------------------------
 // nameFromArgs unit
 // ---------------------------------------------------------------------------
@@ -205,17 +255,8 @@ test("SessionStart populates events.spawn_name from the parent argv --name", asy
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT spawn_name FROM events WHERE session_id = 'sess-spawn' AND hook_event = 'SessionStart'",
-      )
-      .get() as { spawn_name: string | null } | null;
-    expect(row?.spawn_name).toBe("my-session");
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-spawn", "SessionStart");
+  expect(b?.spawn_name).toBe("my-session");
 });
 
 test("SessionStart populates events.start_time platform-tagged", async () => {
@@ -230,29 +271,21 @@ test("SessionStart populates events.start_time platform-tagged", async () => {
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT start_time FROM events WHERE session_id = 'sess-stime' AND hook_event = 'SessionStart'",
-      )
-      .get() as { start_time: string | null } | null;
-    expect(row?.start_time).not.toBeNull();
-    const expectedPrefix =
-      process.platform === "darwin"
-        ? "darwin:"
-        : process.platform === "linux"
-          ? "linux:"
-          : null;
-    if (expectedPrefix !== null) {
-      expect(row?.start_time?.startsWith(expectedPrefix)).toBe(true);
-      // Body after the prefix is non-empty (24-char lstart / digit jiffies).
-      expect(
-        (row?.start_time?.slice(expectedPrefix.length) ?? "").length,
-      ).toBeGreaterThan(0);
-    }
-  } finally {
-    db.close();
+  const b = readEventBinding("sess-stime", "SessionStart");
+  const startTime = b?.start_time as string | null | undefined;
+  expect(startTime).not.toBeNull();
+  const expectedPrefix =
+    process.platform === "darwin"
+      ? "darwin:"
+      : process.platform === "linux"
+        ? "linux:"
+        : null;
+  if (expectedPrefix !== null) {
+    expect(startTime?.startsWith(expectedPrefix)).toBe(true);
+    // Body after the prefix is non-empty (24-char lstart / digit jiffies).
+    expect(
+      (startTime?.slice(expectedPrefix.length) ?? "").length,
+    ).toBeGreaterThan(0);
   }
 });
 
@@ -264,18 +297,9 @@ test("a non-SessionStart event leaves spawn_name AND start_time NULL", async () 
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess-ups' AND hook_event = 'UserPromptSubmit'",
-      )
-      .get() as { spawn_name: string | null; start_time: string | null } | null;
-    expect(row?.spawn_name).toBeNull();
-    expect(row?.start_time).toBeNull();
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-ups", "UserPromptSubmit");
+  expect(b?.spawn_name).toBeNull();
+  expect(b?.start_time).toBeNull();
 });
 
 test("hook exits 0 and writes a row even when the parent argv has no name", async () => {
@@ -290,22 +314,13 @@ test("hook exits 0 and writes a row even when the parent argv has no name", asyn
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess-noname'",
-      )
-      .get() as { spawn_name: string | null; start_time: string | null } | null;
-    expect(row).not.toBeNull();
-    expect(row?.spawn_name).toBeNull();
-    // start_time should still populate on supported platforms; we don't strand
-    // it on the no-name path.
-    if (process.platform === "darwin" || process.platform === "linux") {
-      expect(row?.start_time).not.toBeNull();
-    }
-  } finally {
-    db.close();
+  const b = readEventBinding("sess-noname");
+  expect(b).not.toBeNull();
+  expect(b?.spawn_name).toBeNull();
+  // start_time should still populate on supported platforms; we don't strand
+  // it on the no-name path.
+  if (process.platform === "darwin" || process.platform === "linux") {
+    expect(b?.start_time).not.toBeNull();
   }
 });
 
@@ -349,22 +364,13 @@ test("hook exits 0 with NULL start_time when the ps probe is force-broken", asyn
   const code = await proc.exited;
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT spawn_name, start_time FROM events WHERE session_id = 'sess-broken-ps'",
-      )
-      .get() as { spawn_name: string | null; start_time: string | null } | null;
-    expect(row).not.toBeNull();
-    if (process.platform === "darwin") {
-      // Darwin path: the single ps probe yields BOTH fields, so a broken ps
-      // strands both as NULL.
-      expect(row?.spawn_name).toBeNull();
-      expect(row?.start_time).toBeNull();
-    }
-  } finally {
-    db.close();
+  const b = readEventBinding("sess-broken-ps");
+  expect(b).not.toBeNull();
+  if (process.platform === "darwin") {
+    // Darwin path: the single ps probe yields BOTH fields, so a broken ps
+    // strands both as NULL.
+    expect(b?.spawn_name).toBeNull();
+    expect(b?.start_time).toBeNull();
   }
 });
 
@@ -726,18 +732,9 @@ test("hook writes slash_command on UserPromptSubmit with /plan:work prompt", asy
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT slash_command, skill_name FROM events WHERE session_id = 'sess-slash'",
-      )
-      .get() as { slash_command: string | null; skill_name: string | null };
-    expect(row.slash_command).toBe("/plan:work");
-    expect(row.skill_name).toBeNull();
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-slash");
+  expect(b?.slash_command).toBe("/plan:work");
+  expect(b?.skill_name).toBeNull();
 });
 
 // The slash_command NULL cases below are deriver-input mappings, not wiring:
@@ -766,18 +763,9 @@ test("hook writes skill_name on PreToolUse + Skill", async () => {
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT slash_command, skill_name FROM events WHERE session_id = 'sess-skill'",
-      )
-      .get() as { slash_command: string | null; skill_name: string | null };
-    expect(row.slash_command).toBeNull();
-    expect(row.skill_name).toBe("plan:plan");
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-skill");
+  expect(b?.slash_command).toBeNull();
+  expect(b?.skill_name).toBe("plan:plan");
 });
 
 // The non-Skill negative is a deriver gate, not wiring (the PreToolUse:Skill
@@ -816,29 +804,12 @@ test("hook writes planctl_* columns on PostToolUse:Bash with a planctl envelope 
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        `SELECT planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-                planctl_subject_present
-           FROM events WHERE session_id = 'sess-planctl-create'`,
-      )
-      .get() as {
-      planctl_op: string | null;
-      planctl_target: string | null;
-      planctl_epic_id: string | null;
-      planctl_task_id: string | null;
-      planctl_subject_present: number | null;
-    };
-    expect(row.planctl_op).toBe("epic-create");
-    expect(row.planctl_target).toBe("fn-42-foo");
-    expect(row.planctl_epic_id).toBe("fn-42-foo");
-    expect(row.planctl_task_id).toBeNull();
-    expect(row.planctl_subject_present).toBe(1);
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-planctl-create");
+  expect(b?.planctl_op).toBe("epic-create");
+  expect(b?.planctl_target).toBe("fn-42-foo");
+  expect(b?.planctl_epic_id).toBe("fn-42-foo");
+  expect(b?.planctl_task_id).toBeNull();
+  expect(b?.planctl_subject_present).toBe(1);
 });
 
 // The deriver-shape cases below (task-ref split, no-envelope, PreToolUse gate)
@@ -896,25 +867,17 @@ test("hook exits 0 on PostToolUse:Bash with a malformed tool_response.stdout (de
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT planctl_op FROM events WHERE session_id = 'sess-planctl-malformed'",
-      )
-      .get() as { planctl_op: string | null } | null;
-    expect(row).not.toBeNull();
-    expect(row?.planctl_op).toBeNull();
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-planctl-malformed");
+  expect(b).not.toBeNull();
+  expect(b?.planctl_op).toBeNull();
 });
 
-test("hook writes jobs.plan_verb/plan_ref via reducer when SessionStart spawn_name matches", async () => {
-  // Fire SessionStart whose parent argv carries the canonical spawn name —
-  // the hook captures `spawn_name`, the reducer derives plan_verb/plan_ref.
-  // We open the writer DB to drive the drain (the readonly handle the other
-  // tests use doesn't include the reducer).
+test("end-to-end: hook append → ingester → events row → fold derives jobs.plan_verb/plan_ref", async () => {
+  // The full fn-736 path: fire SessionStart whose parent argv carries the
+  // canonical spawn name — the hook APPENDS the NDJSON line (no SQLite). The
+  // daemon-side ingester (`scanEventsLogDir`) then lands it as a real `events`
+  // row, and the existing fold derives plan_verb/plan_ref. Proves the lock-free
+  // ingest path round-trips byte-identically into the unchanged reducer.
   const code = await fireViaLauncher("close::fn-575-osc-parser", {
     hook_event_name: "SessionStart",
     session_id: "sess-close",
@@ -922,10 +885,14 @@ test("hook writes jobs.plan_verb/plan_ref via reducer when SessionStart spawn_na
   });
   expect(code).toBe(0);
 
-  // Drain via the same code path the daemon uses.
+  // Ingest the appended NDJSON into `events`, then drain via the same code
+  // paths the daemon uses.
   const { db } = openDb(dbPath);
   try {
-    const { drainToCompletion } = await import("../src/daemon");
+    const { drainToCompletion, scanEventsLogDir } = await import(
+      "../src/daemon"
+    );
+    scanEventsLogDir(db, join(tmpDir, "events-log"));
     drainToCompletion(db);
     const row = db
       .prepare(
@@ -956,17 +923,8 @@ test("PreToolUse:Bash with tool_use_id populates events.tool_use_id", async () =
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT tool_use_id FROM events WHERE session_id = 'sess-bash-tuid' AND hook_event = 'PreToolUse'",
-      )
-      .get() as { tool_use_id: string | null } | null;
-    expect(row?.tool_use_id).toBe("toolu_01ABCDEF");
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-bash-tuid", "PreToolUse");
+  expect(b?.tool_use_id).toBe("toolu_01ABCDEF");
 });
 
 test("PostToolUse:Agent with tool_use_id populates events.tool_use_id", async () => {
@@ -982,23 +940,11 @@ test("PostToolUse:Agent with tool_use_id populates events.tool_use_id", async ()
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT tool_use_id, subagent_agent_id FROM events WHERE session_id = 'sess-agent-tuid' AND hook_event = 'PostToolUse'",
-      )
-      .get() as {
-      tool_use_id: string | null;
-      subagent_agent_id: string | null;
-    } | null;
-    expect(row?.tool_use_id).toBe("toolu_AGENT_42");
-    // Cross-check: extractSubagentAgentId still stamps the existing bridge
-    // column on the same row (the two derivers are independent).
-    expect(row?.subagent_agent_id).toBe("agent-xyz");
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-agent-tuid", "PostToolUse");
+  expect(b?.tool_use_id).toBe("toolu_AGENT_42");
+  // Cross-check: extractSubagentAgentId still stamps the existing bridge
+  // column on the same row (the two derivers are independent).
+  expect(b?.subagent_agent_id).toBe("agent-xyz");
 });
 
 // The kept PreToolUse:Bash + PostToolUse:Agent spawns above prove the
@@ -1137,13 +1083,16 @@ async function fireViaLauncherWithEnv(
   }
   // Apply the sandboxed state-bearing keys AFTER the overlay-clear loop so a
   // caller overlay (which uses `undefined` to delete keys) can NEVER strand
-  // KEEPER_DROP_LOG / KEEPER_DEAD_LETTER_DIR back at their production
-  // defaults. fn-657: the drop-log leak class lived precisely in the gap a
-  // caller could open by clearing a state key on an inherited base.
+  // KEEPER_DROP_LOG / KEEPER_DEAD_LETTER_DIR / KEEPER_EVENTS_LOG back at their
+  // production defaults. fn-657: the drop-log leak class lived precisely in the
+  // gap a caller could open by clearing a state key on an inherited base. The
+  // events-log dir (fn-736) is now the hook's HAPPY-path write target — leaking
+  // it pollutes the user's real feed, so it must be sandboxed too.
   const sandbox = sandboxedBaseEnv();
   env.KEEPER_DB = sandbox.KEEPER_DB;
   env.KEEPER_DEAD_LETTER_DIR = sandbox.KEEPER_DEAD_LETTER_DIR;
   env.KEEPER_DROP_LOG = sandbox.KEEPER_DROP_LOG;
+  env.KEEPER_EVENTS_LOG = sandbox.KEEPER_EVENTS_LOG;
   const proc = Bun.spawn(args, {
     cwd: ROOT,
     env,
@@ -1165,17 +1114,8 @@ test("SessionStart stamps events.config_dir from CLAUDE_CONFIG_DIR env", async (
   );
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-set' AND hook_event = 'SessionStart'",
-      )
-      .get() as { config_dir: string | null } | null;
-    expect(row?.config_dir).toBe("/Users/x/.claude-profiles/profile-a");
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-cfg-set", "SessionStart");
+  expect(b?.config_dir).toBe("/Users/x/.claude-profiles/profile-a");
 });
 
 // The trailing-slash / unset / empty cases are pure `configDirFromEnv`
@@ -1231,17 +1171,8 @@ test("a non-SessionStart event leaves config_dir NULL even when CLAUDE_CONFIG_DI
   );
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT config_dir FROM events WHERE session_id = 'sess-cfg-ups' AND hook_event = 'UserPromptSubmit'",
-      )
-      .get() as { config_dir: string | null } | null;
-    expect(row?.config_dir).toBeNull();
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-cfg-ups", "UserPromptSubmit");
+  expect(b?.config_dir).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -1250,11 +1181,11 @@ test("a non-SessionStart event leaves config_dir NULL even when CLAUDE_CONFIG_DI
 
 /**
  * Fire the launcher with an explicit `KEEPER_DEAD_LETTER_DIR` override so
- * the test can inspect the per-pid NDJSON file without touching the user's
- * real `~/.local/state/keeper/dead-letters/` directory. Also accepts an
- * `extraEnv` overlay so a single test can clear `KEEPER_DB` (forcing the
- * hook into a fresh-DB no-schema scenario) without mutating the shared
- * `fireViaLauncher` helper.
+ * the test can inspect the per-pid NDJSON dead-letter file without touching
+ * the user's real `~/.local/state/keeper/dead-letters/` directory. Also
+ * accepts an `extraEnv` overlay so a single test can FORCE an events-log
+ * APPEND failure (point `KEEPER_EVENTS_LOG` at an un-mkdir-able path — fn-736)
+ * without mutating the shared `fireViaLauncher` helper.
  *
  * Returns both the launcher exit code AND the resolved dead-letter dir so
  * callers can scan the directory for the pid-keyed NDJSON file. The
@@ -1285,9 +1216,9 @@ async function fireViaLauncherWithDeadLetter(
     }
   }
   // KEEPER_DROP_LOG is never a legitimate extraEnv target for these tests
-  // (the only state keys callers manipulate are KEEPER_DB and the dead-letter
-  // dir). Re-apply the sandbox value after the overlay loop so a future
-  // caller can't accidentally re-leak it. fn-657.
+  // (the only state keys callers manipulate are KEEPER_EVENTS_LOG and the
+  // dead-letter dir). Re-apply the sandbox value after the overlay loop so a
+  // future caller can't accidentally re-leak it. fn-657.
   env.KEEPER_DROP_LOG = sandboxedBaseEnv().KEEPER_DROP_LOG;
   const proc = Bun.spawn(args, {
     cwd: ROOT,
@@ -1299,16 +1230,26 @@ async function fireViaLauncherWithDeadLetter(
   return { code, deadLetterDir, launcherPid: proc.pid ?? -1 };
 }
 
-test("a forced INSERT failure writes a per-pid NDJSON dead-letter and exits 0", async () => {
-  // Point KEEPER_DB at a brand-new, unmigrated DB file. The hook opens with
-  // `migrate: false`, so `prepareStmts` throws on the missing `events` table
-  // — the canonical "schema-transition window during a deploy" failure mode
-  // from the epic. Per fn-643 task .2, the dead-letter helper captures the
-  // resolved bindings to disk and the hook still exits 0.
-  const freshDb = join(tmpDir, "no-schema.db");
-  // Don't pre-migrate this DB — the parent dir exists (tmpDir) but the file
-  // doesn't, so `openDb({migrate:false})` opens it `create:true` and then
-  // `prepareStmts` throws on the missing `events` table.
+/**
+ * Build an events-log path that makes the hook's `appendFileSync` fail HARD
+ * (fn-736): point `KEEPER_EVENTS_LOG` at a sub-path UNDER a regular file. The
+ * hook's `mkdirSync(dir, {recursive})` throws `ENOTDIR` (a path component is a
+ * file, not a dir) — not the ENOENT-retry case — so the append falls straight
+ * to the dead-letter fallback. Returns the poisoned dir path.
+ */
+function poisonedEventsLogDir(): string {
+  const blocker = join(tmpDir, "events-log-blocker");
+  // A regular file where a directory is expected.
+  writeFileSync(blocker, "not a directory");
+  return join(blocker, "events-log");
+}
+
+test("a forced events-log append failure writes a per-pid NDJSON dead-letter and exits 0", async () => {
+  // fn-736: the happy path is a per-pid events-log append. Force it to fail by
+  // pointing KEEPER_EVENTS_LOG under a regular file (mkdir → ENOTDIR), the
+  // canonical "ENOSPC/EACCES/EROFS hard-failure" class. The repurposed
+  // dead-letter fallback captures the resolved bindings to disk and the hook
+  // still exits 0.
   const dlDir = join(tmpDir, "dead-letters");
 
   const { code } = await fireViaLauncherWithDeadLetter(
@@ -1319,9 +1260,9 @@ test("a forced INSERT failure writes a per-pid NDJSON dead-letter and exits 0", 
       cwd: "/tmp/work",
     },
     dlDir,
-    { KEEPER_DB: freshDb },
+    { KEEPER_EVENTS_LOG: poisonedEventsLogDir() },
   );
-  // Exit-0 contract holds even when the INSERT side fails — the hook must
+  // Exit-0 contract holds even when the append side fails — the hook must
   // never wedge Claude's session.
   expect(code).toBe(0);
 
@@ -1372,27 +1313,23 @@ test("a forced INSERT failure writes a per-pid NDJSON dead-letter and exits 0", 
   }
 });
 
-test("dead-letter file is mode 0o600 (private — bindings can carry secrets)", async () => {
-  const freshDb = join(tmpDir, "no-schema-mode.db");
-  const dlDir = join(tmpDir, "dead-letters-mode");
-
-  const { code } = await fireViaLauncherWithDeadLetter(
-    "any",
-    {
-      hook_event_name: "SessionStart",
-      session_id: "sess-mode",
-      cwd: "/tmp/work",
-    },
-    dlDir,
-    { KEEPER_DB: freshDb },
-  );
+test("events-log append file is mode 0o600 (private — bindings can carry secrets)", async () => {
+  // fn-736: the happy-path events-log file (like the dead-letter file before
+  // it) carries prompt text / file paths the user reasonably considers
+  // private — assert the per-pid file is chmod 0o600.
+  const code = await fireViaLauncher("any", {
+    hook_event_name: "SessionStart",
+    session_id: "sess-mode",
+    cwd: "/tmp/work",
+  });
   expect(code).toBe(0);
 
-  const files = readdirSync(dlDir).filter((f) => f.endsWith(".ndjson"));
+  const dir = join(tmpDir, "events-log");
+  const files = readdirSync(dir).filter((f) => f.endsWith(".ndjson"));
   expect(files.length).toBe(1);
   const [fileName] = files;
-  if (fileName === undefined) throw new Error("expected one dead-letter file");
-  const path = join(dlDir, fileName);
+  if (fileName === undefined) throw new Error("expected one events-log file");
+  const path = join(dir, fileName);
   // Stat: file mode masked to permission bits = 0o600 on platforms that
   // honor chmod (everywhere bun runs except Windows, which we don't ship).
   const { statSync } = await import("node:fs");
@@ -1400,10 +1337,10 @@ test("dead-letter file is mode 0o600 (private — bindings can carry secrets)", 
   expect(mode).toBe(0o600);
 });
 
-test("steady-state success writes NO dead-letter file", async () => {
-  // Normal happy path: the schema is pre-migrated (by `beforeEach`), so the
-  // INSERT succeeds on the first attempt and the dead-letter helper is
-  // never invoked. The override dir stays empty / absent.
+test("steady-state success appends events-log line and writes NO dead-letter file", async () => {
+  // Normal happy path (fn-736): the events-log append succeeds, so the
+  // dead-letter fallback is never invoked. The dead-letter override dir stays
+  // empty / absent; the events-log dir carries exactly one per-pid line.
   const dlDir = join(tmpDir, "dead-letters-happy");
   const { code } = await fireViaLauncherWithDeadLetter(
     "my-session",
@@ -1423,16 +1360,9 @@ test("steady-state success writes NO dead-letter file", async () => {
     expect(files.length).toBe(0);
   }
 
-  // And the event row landed in the DB as expected.
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare("SELECT spawn_name FROM events WHERE session_id = 'sess-happy'")
-      .get() as { spawn_name: string | null } | null;
-    expect(row).not.toBeNull();
-  } finally {
-    db.close();
-  }
+  // And the event landed as an appended NDJSON line (the happy path).
+  const b = readEventBinding("sess-happy", "SessionStart");
+  expect(b).not.toBeNull();
 });
 
 test("A non-string tool_use_id (defensive path) lands NULL, hook still exits 0", async () => {
@@ -1448,140 +1378,30 @@ test("A non-string tool_use_id (defensive path) lands NULL, hook still exits 0",
   });
   expect(code).toBe(0);
 
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        "SELECT tool_use_id FROM events WHERE session_id = 'sess-bad-tuid'",
-      )
-      .get() as { tool_use_id: string | null } | null;
-    expect(row?.tool_use_id).toBeNull();
-  } finally {
-    db.close();
-  }
+  const b = readEventBinding("sess-bad-tuid");
+  expect(b?.tool_use_id).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
-// Schema-skew degrade (fn-669)
+// Full-column round-trip (fn-736)
 // ---------------------------------------------------------------------------
 //
-// The schema-bump deploy race the hook MUST tolerate: the daemon is the sole
-// migrator (hook opens `{migrate:false}`), so during the window between the
-// hook's latest committed code and keeperd's next restart-with-migration, the
-// live DB lacks columns the hook knows. The pre-fn-669 hook total-dropped
-// every INSERT in that window (prepare threw "no such column" inside
-// `prepareStmts`). Post-fn-669, the hook probes `PRAGMA table_info('events')`
-// once, intersects known ∩ live, and INSERTs the narrowed shape; the
-// not-yet-migrated column lands NULL after migration — identical to the
-// deriver's zero-event value.
+// The pre-fn-736 hook OPENED the DB and ran an adaptive `PRAGMA table_info` ∩
+// known INSERT — the schema-bump deploy race lived there (fn-669). fn-736 flips
+// the hook to a per-pid NDJSON append and moves the column-intersection degrade
+// daemon-side (the ingester `scanEventsLogDir` intersects bindings ∩ live
+// columns post-migrate, race-free; covered by `test/events-ingest-worker.test.ts`).
+// So the hook-side fn-669 SKEW / NEGATIVE-broken-DB / HAPPY tests retired with
+// the SQLite path. What stays is the appended-line full-column round-trip below
+// + the LOCKSTEP triple-pin.
 
-test("fn-669 SKEW: hook degrades and writes a row when a known column is missing live", async () => {
-  // Hand-build a fresh DB whose `events` table is missing one (current) known
-  // hook column — simulating exactly the deploy race: hook code knows the
-  // column, daemon hasn't migrated yet. We DROP `backend_exec_pane_id` (the
-  // v48 column the 2026-06-01 incident centered on) from the migrated
-  // beforeEach-built table. SQLite supports `ALTER TABLE ... DROP COLUMN`
-  // since 3.35; bun:sqlite ships a newer build.
-  const skewDb = join(tmpDir, "skew.db");
-  // Start from a fully-migrated table, then drop the column to mimic an
-  // old-schema daemon. (Easier than re-CREATEing a stripped-down events
-  // shape and re-applying every dependent index.)
-  openDb(skewDb).db.close();
-  {
-    const { Database } = await import("bun:sqlite");
-    const raw = new Database(skewDb);
-    raw.run("ALTER TABLE events DROP COLUMN backend_exec_pane_id");
-    raw.close();
-  }
-
-  const dlDir = join(tmpDir, "dead-letters-skew");
-  const { code } = await fireViaLauncherWithDeadLetter(
-    "my-session",
-    {
-      hook_event_name: "SessionStart",
-      session_id: "sess-skew",
-      cwd: "/tmp/work",
-    },
-    dlDir,
-    { KEEPER_DB: skewDb },
-  );
-  // Exit-0 contract holds — same as always.
-  expect(code).toBe(0);
-
-  // The lossless degrade — NO dead-letter file. Either the dir was never
-  // created, or it is empty.
-  if (existsSync(dlDir)) {
-    const files = readdirSync(dlDir);
-    expect(files.length).toBe(0);
-  }
-
-  // The row LANDED on the narrowed INSERT, carrying every other column.
-  // Read it back through bun:sqlite directly so we don't trip our own
-  // openDb's schema expectations against the dropped column.
-  const { Database } = await import("bun:sqlite");
-  const raw = new Database(skewDb, { readonly: true });
-  try {
-    const row = raw
-      .prepare(
-        "SELECT spawn_name, backend_exec_session_id FROM events WHERE session_id = 'sess-skew'",
-      )
-      .get() as {
-      spawn_name: string | null;
-      backend_exec_session_id: string | null;
-    } | null;
-    expect(row).not.toBeNull();
-    // Sibling columns kept their values — narrowing intersects, never
-    // reorders.
-    expect(row?.spawn_name).toBe("my-session");
-  } finally {
-    raw.close();
-  }
-});
-
-test("fn-669 NEGATIVE: a genuinely-broken DB (no events table) STILL dead-letters and exits 0", async () => {
-  // Carve-out: the degrade covers ONLY known-missing columns. A missing
-  // `events` table is a genuine failure and must flow to the dead-letter
-  // path unchanged — otherwise a fresh-install pre-daemon-boot session
-  // would silently swallow rows it cannot persist.
-  const brokenDb = join(tmpDir, "no-events-table.db");
-  {
-    const { Database } = await import("bun:sqlite");
-    const raw = new Database(brokenDb, { create: true });
-    // Open & close — file exists, but it has no `events` table. The hook
-    // opens with `migrate: false` so it does NOT mint the table itself.
-    raw.close();
-  }
-
-  const dlDir = join(tmpDir, "dead-letters-broken");
-  const { code } = await fireViaLauncherWithDeadLetter(
-    "my-session",
-    {
-      hook_event_name: "SessionStart",
-      session_id: "sess-broken",
-      cwd: "/tmp/work",
-    },
-    dlDir,
-    { KEEPER_DB: brokenDb },
-  );
-  // Exit-0 contract holds even on the dead-letter path.
-  expect(code).toBe(0);
-
-  // The dead-letter recovery file lands — confirming the carve-out: a
-  // genuinely broken DB still flows to deadLetter(), it is NOT silently
-  // swallowed by the column-intersection degrade.
-  expect(existsSync(dlDir)).toBe(true);
-  const files = readdirSync(dlDir).filter((f) => f.endsWith(".ndjson"));
-  expect(files.length).toBe(1);
-});
-
-test("fn-669 HAPPY: full-column INSERT (intersection is identity) on a migrated DB", async () => {
-  // Sanity: when the daemon HAS migrated and the live `events` carries every
-  // known column, the intersection is identity and the INSERT shape is the
-  // full column list — no narrowing, no stderr warning, no behavioral drift
-  // from pre-fn-669. The existing happy-path tests above already cover this
-  // implicitly; this test asserts every known column round-trips, so a
-  // future regression that breaks the intersection ordering or drops a
-  // legitimate column shows up here.
+test("fn-736 FULL-COLUMN: the appended NDJSON line carries every known column binding", async () => {
+  // The hook builds the events-log record from the same `insertBindings` map
+  // that the deleted INSERT used. Assert the appended line's bindings carry
+  // EVERY `KNOWN_EVENT_COLUMNS` key — so a future regression that drops a
+  // legitimate column from the record (and would silently never reach the
+  // ingester's INSERT) shows up here. SessionStart-attributable columns carry
+  // real values; sibling columns are present-with-NULL.
   const code = await fireViaLauncher("happy-session", {
     hook_event_name: "SessionStart",
     session_id: "sess-fullcols",
@@ -1589,31 +1409,18 @@ test("fn-669 HAPPY: full-column INSERT (intersection is identity) on a migrated 
   });
   expect(code).toBe(0);
 
-  // Pull every known column off the row and confirm at least the
-  // SessionStart-attributable ones populate. Sibling columns may be NULL
-  // (they're not lifted on SessionStart), but the SELECT compiling proves
-  // the live schema has every name.
-  const { db } = openDb(dbPath, { readonly: true });
-  try {
-    const row = db
-      .prepare(
-        `SELECT ts, session_id, pid, hook_event, event_type, tool_name, matcher,
-                cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
-                subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-                planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-                planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-                bash_mutation_kind, bash_mutation_targets, planctl_files,
-                backend_exec_type, backend_exec_session_id, backend_exec_pane_id
-         FROM events WHERE session_id = 'sess-fullcols'`,
-      )
-      .get() as Record<string, unknown> | null;
-    expect(row).not.toBeNull();
-    expect(row?.hook_event).toBe("SessionStart");
-    expect(row?.event_type).toBe("session_start");
-    expect(row?.spawn_name).toBe("happy-session");
-  } finally {
-    db.close();
+  const b = readEventBinding("sess-fullcols", "SessionStart");
+  expect(b).not.toBeNull();
+  if (b === null) throw new Error("expected an appended events-log binding");
+  // Every known column is present as a binding key (NULL-valued where not
+  // lifted on SessionStart). The ingester binds the intersection of these with
+  // the live `events` columns, so a missing key here is a permanent drop.
+  for (const col of KNOWN_EVENT_COLUMNS) {
+    expect(col in b).toBe(true);
   }
+  expect(b.hook_event).toBe("SessionStart");
+  expect(b.event_type).toBe("session_start");
+  expect(b.spawn_name).toBe("happy-session");
 });
 
 test("fn-672 LOCKSTEP: KNOWN_EVENT_COLUMNS == events table columns == insertBindings keys", async () => {

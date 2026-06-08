@@ -1,9 +1,12 @@
 keeper — event-sourced Claude Code control-data daemon (Bun + bun:sqlite).
 
-The hook plugin writes one `events` row per Claude Code hook invocation; the
-`keeperd` daemon folds those events into the `jobs`/`epics` projections and
-serves them read-only over a UDS subscribe socket. System map, rationale, and
-incident history: `README.md` `## Architecture` and the `.planctl/` epic specs.
+The hook plugin appends one per-pid NDJSON line per Claude Code hook invocation
+(fn-736 — lock-free, no SQLite open); the `keeperd` daemon's events-log ingester
+tails those files and lands each line as one `events` row, then folds those
+events into the `jobs`/`epics` projections and serves them read-only over a UDS
+subscribe socket. The `events` table stays the canonical fold source, so re-fold
+determinism is preserved by construction. System map, rationale, and incident
+history: `README.md` `## Architecture` and the `.planctl/` epic specs.
 
 ## Repo facts
 
@@ -40,14 +43,21 @@ shape because a consumer reads it.
 
 ## Hook rules
 
-- **Always exit 0.** A non-zero exit can fail-closed the human's session. On a
-  failed INSERT, write a per-pid NDJSON dead-letter and still exit 0. Losing one
-  row is acceptable; wedging the agent is not.
-- **No third-party deps.** Keep the hook's imports to `bun:sqlite` + local files
-  (cold start budget).
-- **The hook never migrates** — it opens `{ migrate: false }` and tolerates a
-  behind-schema DB by intersecting its known `events` columns with the live shape
-  (missing column lands NULL).
+- **Always exit 0.** A non-zero exit can fail-closed the human's session. The
+  hook's happy path is a per-pid NDJSON append (fn-736); on a HARD append failure
+  (ENOSPC/EACCES/EROFS, or ENOENT after one mkdir-race retry) it writes a per-pid
+  NDJSON dead-letter as the recovery fallback and still exits 0. Losing one row is
+  acceptable; wedging the agent is not.
+- **No third-party deps, and NO `bun:sqlite`/`src/db.ts`.** The hook NO LONGER
+  opens SQLite (fn-736 — dropping the ~11ms `db.ts` parse + ~7.5ms open/insert was
+  the perf win). Keep its imports to `node:fs`/`node:os`/`node:path`, the dep-free
+  `src/dead-letter.ts` serializers, and the pure `src/derivers.ts`/
+  `src/exec-backend.ts` helpers (cold start budget). A stray `db.ts` symbol
+  re-drags the 6.5k-line module and erases the win.
+- **The hook never opens the DB, so it never migrates or probes schema.** The
+  schema-skew degrade (intersect known `events` columns ∩ live shape, missing
+  column lands NULL) moved DAEMON-side: the events-log ingester does it
+  post-migrate, race-free. The hook just appends every known binding.
 - **Scraping is scoped.** On `SessionStart` only: parent claude `--name`/`-n` +
   `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event: `ZELLIJ*`
   env reads (synchronous, no fork/fs). No other scraping, no env read in a fold.
@@ -80,7 +90,11 @@ shape because a consumer reads it.
   away the def-fallback; it's the safety net the whole epic depends on. The
   `set_{task,epic}_approval` RPC writes the sidecar (create-if-absent; task RMW
   preserves the sidecar's status/claim fields; traversal-guarded).
-- **Sole-writer rules.** The hook writes hook events + per-pid dead-letters. Main
+- **Sole-writer rules.** The hook writes ONLY per-pid NDJSON files — the
+  events-log feed (happy path, fn-736) + per-pid dead-letters (append-failure
+  fallback). It NEVER touches the DB. The daemon's events-log ingester is the
+  sole writer of hook-sourced `events` rows (read each per-pid file from its
+  durable byte-offset → INSERT + offset advance in one `BEGIN IMMEDIATE`). Main
   writes all synthetic events + the `dead_letters` sidecar + the replay path.
   Workers feed the log only via main; they never write the DB themselves.
 - **The babysitter is a pure read-only external scanner.** `cli/keeper-watch.ts`

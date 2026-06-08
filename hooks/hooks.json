@@ -1,5 +1,5 @@
 {
-  "description": "Keeper events writer: one row per hook invocation into keeper.db; reducer daemon folds them into the jobs projection",
+  "description": "Keeper events writer: appends one per-pid NDJSON line per hook invocation (lock-free, no SQLite); the keeperd ingester tails those files into the events table and the reducer daemon folds them into the jobs projection",
   "hooks": {
     "SessionStart": [
       {

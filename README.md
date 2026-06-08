@@ -3,8 +3,10 @@
 ## What keeper is
 
 Keeper is an event-sourced control-data daemon for Claude Code agents. A small
-TypeScript hook plugin writes one row per Claude Code hook invocation into a
-SQLite `events` table — the durable, append-only log. A long-running Bun daemon
+TypeScript hook plugin appends one per-pid NDJSON line per Claude Code hook
+invocation (lock-free — it never opens SQLite, fn-736); the daemon's events-log
+ingester tails those per-pid files and lands each line as one row in the SQLite
+`events` table — the durable, append-only log. A long-running Bun daemon
 (`keeperd`, managed by a macOS LaunchAgent) tails that table and folds new
 events into a minimal `jobs` projection: one row per session, carrying the live
 `state` (`working` / `stopped` / `ended` / `killed`), a human-readable `title`
@@ -153,8 +155,9 @@ derived `profile_name = basename(config_dir)` join key against
 `usage.id`; the
 `''` sentinel collapses default `~/.claude` so a single PK groups every
 NULL-`CLAUDE_CONFIG_DIR` session), and `dead_letters` (schema v37, fn-643 —
-the OPERATIONAL sidecar table, one row per unrecoverable hook INSERT failure
-imported from the per-pid NDJSON files the hook writes to
+the OPERATIONAL sidecar table, one row per unrecoverable hook write failure
+(fn-643 covered the SQLite-INSERT path; fn-736 repurposed it as the events-log
+APPEND-failure fallback) imported from the per-pid NDJSON files the hook writes to
 `~/.local/state/keeper/dead-letters/` when its bounded retry exhausts;
 keyed by `dl_id` and idempotent under re-scan; status flips
 `waiting → recovered` only when the human triggers the `replay_dead_letter`
@@ -384,30 +387,31 @@ Keeper has no `install` verb. Wire it up manually:
    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeperd.plist
    ```
 
-   **The daemon must boot at least once before the hook can write events.**
-   The hook opens its sqlite connection with `{ migrate: false }` — the
-   daemon is the sole migrator (see CLAUDE.md "Migrations are forward-only").
-   On a fresh install the LaunchAgent runs the daemon at login, which creates
-   the DB and runs `migrate()` to converge the schema; only after that does
-   the hook have tables to INSERT into. Two failure modes, two outcomes:
+   **The daemon does the schema work, but the hook no longer needs it to be
+   booted to capture events.** Since fn-736 the hook does NOT open SQLite at
+   all — it appends a per-pid NDJSON line under the events-log dir
+   (`KEEPER_EVENTS_LOG`, default `~/.local/state/keeper/events-log`) and exits.
+   The daemon is still the sole migrator and the sole writer of `events` rows:
+   on a fresh install the LaunchAgent runs the daemon at login, which creates
+   the DB, runs `migrate()` to converge the schema, and starts the events-log
+   ingester. Failure / skew modes, all lag-not-loss:
 
-   1. **No `events` table at all** (fresh install, pre-daemon-boot, or a
-      corrupt DB). The hook's `PRAGMA table_info('events')` probe returns
-      empty, the INSERT cannot run, the hook writes a per-pid NDJSON
-      dead-letter file (recoverable via `replay_dead_letter`), logs to
-      stderr, and exits 0 — the event is captured for replay but the
-      session is not blocked. The manual recovery is `launchctl bootstrap`
-      above; subsequent sessions write normally.
-   2. **`events` table behind by a column** (the daemon hasn't yet applied
-      a fresh `ALTER TABLE` from the latest commit). The hook intersects
-      its known column set with the live one and INSERTs a narrowed shape
-      via `$col` named bindings — the not-yet-migrated column is simply
-      omitted and lands NULL after the daemon next runs `migrate()`,
-      identical to the deriver's zero-event value. The hook writes a
-      stderr line naming the dropped columns for observability but the
-      row LANDS — no dead-letter. fn-669 added this; before it, a
-      schema-bump deploy race total-dropped every hook INSERT in the
-      window between the hook's new code and keeperd's next restart.
+   1. **Daemon not booted yet** (fresh install, pre-`launchctl bootstrap`).
+      The hook's NDJSON appends pile up in the events-log dir; nothing is lost.
+      The first daemon boot runs a boot ingest that drains every backed-up
+      per-pid file into `events` (from its durable byte-offset, exactly-once),
+      then folds. The manual recovery is the `launchctl bootstrap` above.
+   2. **`events` table behind by a column** (the daemon hasn't yet applied a
+      fresh `ALTER TABLE` from the latest commit). This is now handled
+      DAEMON-side and race-free: the ingester intersects each record's bindings
+      with the live `events` columns at INSERT time (post-migrate), so a
+      not-yet-known column is simply omitted and lands NULL after the next
+      `migrate()` — identical to the deriver's zero-event value. The hook,
+      knowing nothing about the live schema, just appends every binding.
+   3. **Hard append failure** (ENOSPC / EACCES / EROFS on the events-log dir).
+      The hook writes a per-pid NDJSON dead-letter file (recoverable via
+      `replay_dead_letter`), logs to stderr, and exits 0 — the event is
+      captured for replay but the session is never blocked.
 
    **Upgrade-from-pre-trace-gate note:** if you are re-bootstrapping over an
    existing install whose `server.stderr` predates the `KEEPER_TRACE_SERVER`
@@ -1036,6 +1040,25 @@ connection polls `PRAGMA data_version` at ~25ms and posts contentless wake
 messages; each wake triggers a drain to completion. On macOS, FSEvents/kqueue
 drop same-process writes and miss WAL writes entirely, so `data_version`
 polling — not a file watcher — is the correct change-detection primitive.
+
+The hook no longer INSERTs into `events` directly (fn-736 — that opened SQLite
+on every fire, importing the 6.5k-line `src/db.ts` and serializing under WAL:
+60→343ms at 1→16 concurrent writers). Instead the hook **appends a per-pid
+NDJSON line** under the events-log dir (`KEEPER_EVENTS_LOG`, default
+`~/.local/state/keeper/events-log`) and exits; an **events-log ingester** Worker
+(mirroring the dead-letter-worker) watches that dir and posts a contentless
+go-look hint, and MAIN reads each per-pid file from its durable byte-offset and
+`INSERT`s the rows (+ offset advance) in one `BEGIN IMMEDIATE`. Two distinct
+cursors live side by side: the NEW ingest byte-offset (NDJSON→`events`, per-pid
+file, in the `event_ingest_offsets` table) and the UNCHANGED
+`reducer_state.last_event_id` (`events`→projections). The NDJSON append itself
+does NOT bump `data_version`, but the ingester's own `events` INSERT (on MAIN's
+writer connection) DOES — so the downstream `data_version` pollers wake for free;
+the only new file-watch trigger is the ingester worker's hint. The `events`
+table stays the canonical fold source, so re-fold determinism is preserved by
+construction. Skew is lag-not-loss: a new-hook/old-daemon window backs up NDJSON
+(drained at the next daemon boot ingest); an old-hook/new-daemon window INSERTs
+directly while the ingester finds an empty dir.
 
 A **second** Worker thread runs the read-only UDS subscribe server. It mirrors
 the wake worker's archetype — its own read-only connection, its own
