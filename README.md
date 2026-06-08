@@ -431,7 +431,9 @@ Keeper has no `install` verb. Wire it up manually:
 
 8. **Install the babysitter scanner** (optional) so keeper's recurring failure
    classes — autopilot stalls, duplicate dispatches / approvals, reducer wedge,
-   dead-letter growth — page you automatically instead of being noticed after
+   dead-letter growth, **backstop self-telemetry degradation** (a missed-wake
+   rescue or rising missed-wake counters), and **event→projection fold latency**
+   over the realtime bar — page you automatically instead of being noticed after
    the fact:
 
    ```sh
@@ -449,7 +451,31 @@ Keeper has no `install` verb. Wire it up manually:
    escalation follow-up prompts (`followups/latest.md` + per-finding history)
    live under `~/.local/state/keeper-watch/`. Inspect with
    `launchctl print gui/$(id -u)/arthack.keeper-babysit`, or force a tick with
-   `launchctl kickstart gui/$(id -u)/arthack.keeper-babysit`.
+   `launchctl kickstart gui/$(id -u)/arthack.keeper-babysit`. As the last action
+   on every completed tick the scanner stamps a liveness `heartbeat.json` under
+   `~/.local/state/keeper-watch/` — the input the watchdog in step 8b reads.
+
+   8b. **Install the babysitter watchdog** ("who watches the watcher") so the
+   one failure class the babysitter structurally cannot self-report — its own
+   crash / hang — still pages you:
+
+   ```sh
+   ln -s "$PWD/plist/arthack.keeper-watchdog.plist" ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeper-watchdog.plist
+   ```
+
+   This is a SEPARATE user-LaunchAgent that runs the standalone `keeper-watchdog`
+   every 10 minutes (`StartInterval 600`, mirroring orphanwatch/dropwatch). It
+   reads ONLY the babysitter's `heartbeat.json` and alarms (`notifyctl` +
+   `botctl` — hence `~/.local/bin` on its `PATH`) when the heartbeat goes stale
+   (older than 900s = 3× the babysitter interval, floored for launchd jitter). It
+   is deliberately standalone: it never opens `keeper.db`, never talks to
+   keeperd, and does NOT depend on `keeper-watch` or keeperd being up (the exact
+   case it exists to catch). Silent first-run (no heartbeat yet ≠ dead); a
+   once-daily all-clear so silence never means the watchdog itself died. Logs
+   under `~/.local/state/keeper-watch/watchdog.{stdout,stderr}`; inspect with
+   `launchctl print gui/$(id -u)/arthack.keeper-watchdog` or peek at the live
+   decision with `bun run cli/keeper-watchdog.ts --json`.
 
 9. **Verify** the agent is loaded and the projection is live:
 
@@ -973,12 +999,14 @@ Reverse of install:
 ```sh
 launchctl bootout gui/$(id -u)/arthack.keeperd
 rm ~/Library/LaunchAgents/arthack.keeperd.plist
-# If installed: the rotation sidecar and the babysitter scanner.
+# If installed: the rotation sidecar, the babysitter scanner, and its watchdog.
 launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
 launchctl bootout gui/$(id -u)/arthack.keeper-babysit
 rm ~/Library/LaunchAgents/arthack.keeper-babysit.plist
-rm -rf ~/.local/state/keeper-watch   # babysitter seen-state, logs, + follow-up prompts
+launchctl bootout gui/$(id -u)/arthack.keeper-watchdog
+rm ~/Library/LaunchAgents/arthack.keeper-watchdog.plist
+rm -rf ~/.local/state/keeper-watch   # babysitter seen-state, heartbeat, logs, + follow-up prompts
 # Stop loading the plugin: remove `--plugin-dir ~/code/keeper` from
 # whatever entrypoint launches `claude` (e.g. the arthack launcher).
 # Optional — drops all captured state, including the events log:
@@ -1957,13 +1985,25 @@ The babysitter (`cli/keeper-watch.ts`, its OWN binary — NOT a `keeper`
 subcommand) is an out-of-process read-only scanner: run every 5 minutes under
 launchd, it opens `keeper.db` read-only, deterministically detects the recurring
 failure classes (autopilot stalls, duplicate dispatches / approvals, reducer
-wedge, dead-letter growth, stuck jobs), and escalates only genuinely-new
-signatures to a headless agent — it never writes the DB, mints no synthetic
-events, and performs no RPC. On escalation the agent writes a self-contained,
-injection-safe investigation prompt per paged finding under
+wedge, dead-letter growth, stuck jobs, backstop self-telemetry degradation, and
+event→projection fold latency), and escalates only genuinely-new signatures to a
+headless agent — it never writes the DB, mints no synthetic events, and performs
+no RPC. Its second read-only input is keeper's own `backstop.ndjson` self-
+telemetry (missed-wake counters + rescue staleness); it is consumed the same
+no-write/no-RPC way as `keeper.db`. On escalation the agent writes a self-
+contained, injection-safe investigation prompt per paged finding under
 `~/.local/state/keeper-watch/followups/` (plus a stable `latest.md`) and the
 notification points at that file, so closing the loop is just handing the
 prompt to a fresh agent (`claude < followups/latest.md`).
+
+Because a dead monitor never runs its own monitor, the babysitter stamps a
+liveness `heartbeat.json` as the LAST action on every completed tick, and a
+SEPARATE launchd dead-man — `cli/keeper-watchdog.ts` (also its own binary,
+`StartInterval 600`) — reads ONLY that heartbeat and pages (`notifyctl` +
+`botctl`) when it goes stale (> 900s). The watchdog is deliberately standalone:
+it never opens `keeper.db`, never talks to keeperd, and does not depend on
+`keeper-watch` or keeperd being up — the exact case it exists to catch. Silent
+first-run, once-daily all-clear (so silence never means the watchdog died).
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

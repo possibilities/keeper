@@ -21,7 +21,13 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
@@ -52,6 +58,7 @@ import {
   loadSeenState,
   MAX_SPAWN_RETRIES,
   resolveBackstopBaselinePath,
+  resolveHeartbeatPath,
   resolveSeenStatePath,
   type ScanDeps,
   type SeenState,
@@ -64,6 +71,7 @@ import {
   sortFindings,
   type TickDeps,
   tick,
+  writeHeartbeat,
 } from "../cli/keeper-watch";
 import { openDb } from "../src/db";
 
@@ -1644,5 +1652,90 @@ describe("tick", () => {
     expect(spawnCalls).toBe(0);
     // The re-baseline overwrote the corrupt file with a valid one.
     expect(loadSeenState(seenPath()).version).toBe(1);
+  });
+});
+
+// ===========================================================================
+// Heartbeat write (fn-733): tick stamps heartbeat.json as the LAST action on
+// every COMPLETED path — including the missing-DB early-return.
+// ===========================================================================
+
+describe("writeHeartbeat / tick liveness heartbeat", () => {
+  const seenPath = (): string => join(seenStateDir, "seen.json");
+  // Default heartbeatPath param resolves via KEEPER_WATCH_STATE_DIR (sandboxed
+  // to seenStateDir), so the heartbeat lands beside seen.json in the tmpdir.
+  const heartbeatPath = (): string => join(seenStateDir, "heartbeat.json");
+
+  function tickDeps(nowSecs: number, spawnAgent: SpawnAgentFn): TickDeps {
+    return { ...quietDeps(nowSecs), spawnAgent };
+  }
+
+  function seedDispatchFailure(): void {
+    const writer = openDb(dbPath);
+    writer.db
+      .query(
+        `INSERT INTO dispatch_failures
+           (verb, id, reason, dir, ts, last_event_id, created_at, updated_at)
+         VALUES ('work', 'fn-3-bar.1', 'dirty repo', '/x', 1, 1, 1, 1)`,
+      )
+      .run();
+    writer.db.close();
+  }
+
+  function readHeartbeatTs(): number {
+    const raw = JSON.parse(readFileSync(heartbeatPath(), "utf8")) as {
+      ts: number;
+    };
+    return raw.ts;
+  }
+
+  test("resolveHeartbeatPath honors KEEPER_WATCH_STATE_DIR and is heartbeat.json", () => {
+    expect(resolveHeartbeatPath()).toBe(join(seenStateDir, "heartbeat.json"));
+  });
+
+  test("writeHeartbeat stamps { ts } atomically and creates the dir", () => {
+    const path = join(seenStateDir, "nested", "heartbeat.json");
+    expect(existsSync(path)).toBe(false);
+    writeHeartbeat(path, 12345);
+    expect(JSON.parse(readFileSync(path, "utf8"))).toEqual({ ts: 12345 });
+  });
+
+  test("missing-DB early return STILL stamps the heartbeat", async () => {
+    const now = 1_700_000_000;
+    const spawn: SpawnAgentFn = async () => ({
+      exitCode: 0,
+      ackedFingerprints: [],
+    });
+    // Fresh tmpdir: keeper.db does not exist (the missing-DB path).
+    expect(existsSync(dbPath)).toBe(false);
+    await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    // The heartbeat was stamped even though scan never ran.
+    expect(existsSync(heartbeatPath())).toBe(true);
+    expect(readHeartbeatTs()).toBe(now);
+  });
+
+  test("normal completed tick (cold-start baseline) stamps the heartbeat", async () => {
+    seedDispatchFailure();
+    const now = 1_700_000_100;
+    const spawn: SpawnAgentFn = async () => ({
+      exitCode: 0,
+      ackedFingerprints: [],
+    });
+    const res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    expect(res.baselined).toBe(true);
+    expect(readHeartbeatTs()).toBe(now);
+  });
+
+  test("each completed tick advances the heartbeat ts", async () => {
+    seedDispatchFailure();
+    const spawn: SpawnAgentFn = async () => ({
+      exitCode: 0,
+      ackedFingerprints: [],
+    });
+    await tick(dbPath, 3600, tickDeps(1000, spawn), seenPath());
+    expect(readHeartbeatTs()).toBe(1000);
+    // A later, no-new-findings silent tick still re-stamps.
+    await tick(dbPath, 3600, tickDeps(2000, spawn), seenPath());
+    expect(readHeartbeatTs()).toBe(2000);
   });
 });

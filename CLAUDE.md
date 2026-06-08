@@ -76,8 +76,15 @@ shape because a consumer reads it.
   Workers feed the log only via main; they never write the DB themselves.
 - **The babysitter is a pure read-only external scanner.** `cli/keeper-watch.ts`
   opens `keeper.db` read-only and only observes — no event-log write, no
-  synthetic events, no RPC. Its own seen-state and the escalation follow-up
-  prompt files live outside the DB under `~/.local/state/keeper-watch/`.
+  synthetic events, no RPC. Its SECOND read-only input is keeper's own
+  `backstop.ndjson` self-telemetry (read via `KEEPER_BACKSTOP_LOG`), consumed the
+  same no-write/no-RPC way — never a DB write, synthetic event, or RPC. Its own
+  seen-state, the liveness `heartbeat.json` it stamps as the last action on every
+  completed tick, and the escalation follow-up prompt files live outside the DB
+  under `~/.local/state/keeper-watch/`. A SEPARATE launchd dead-man
+  (`cli/keeper-watchdog.ts`) reads ONLY that heartbeat and pages on staleness; it
+  is standalone (no `keeper.db`, no keeperd, no `keeper-watch` dependency) so it
+  still runs when the thing it watches has died.
 
 ## No kernel watchers on keeper's OWN DB
 
