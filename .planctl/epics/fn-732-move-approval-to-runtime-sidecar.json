@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-732-move-approval-to-runtime-sidecar",
   "bundles": [],
+  "closer_done_at": "2026-06-08T03:42:17.355646Z",
   "created_at": "2026-06-07T21:41:16.435863Z",
   "depends_on_epics": [
     "fn-735-autopilot-redispatch-cooldown-guard"
@@ -11,11 +12,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Move approval to runtime sidecar",
   "touched_repos": [
     "/Users/mike/code/keeper",
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-08T02:58:41.422160Z"
+  "updated_at": "2026-06-08T03:42:17.355646Z"
 }
