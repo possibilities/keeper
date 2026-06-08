@@ -4205,3 +4205,220 @@ test("fn-737 latency harness: reflogs-OFF degrades to the `.git/HEAD` directory 
   expect(res2).toBe("exited");
   expect(crashed).toBe(false);
 });
+
+// (z4) fn-737 THE LEVER — reflog-coverage WIDENING. Task .1's diagnosis named
+//      the dominant production fold-latency tail: a commit in a repo that holds
+//      a `.planctl` tree but NO currently-pending path. Pre-fn-737 the reflog
+//      watch set was `pendingRepos()`-only, so such a repo had NO `.git/logs/HEAD`
+//      watch armed — the in-HEAD change was invisible to every fast path until
+//      the git-worker's 60s heartbeat. fn-737 widens the watch set to EVERY
+//      discovered planctl repo, so a no-pending-repo commit is caught sub-second
+//      by the widened reflog watch + the change-gated `scanPlanctlDir` re-scan.
+// ---------------------------------------------------------------------------
+test("fn-737 lever: a commit in a repo with NO pending path is caught sub-heartbeat by the widened reflog watch (the no-pending-repo regression guard)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  // Bootstrap schema then NEVER write the DB again — isolates the
+  // NO-data_version-bump path (the db-poll can't be the trigger). With a LONG
+  // db-poll below, the ONLY fast signal for the second commit is the reflog
+  // watch (which pre-fn-737 would NOT exist, since the repo has no pending path
+  // when the second commit lands). The 5s heartbeat is the backstop the fix must
+  // beat.
+  openDb(dbPath).db.close();
+
+  const root = join(tmpDir, "no-pending-repo");
+  mkdirSync(root);
+  gitInit(root); // reflogs on → `.git/logs/HEAD` exists
+
+  // Commit a FIRST epic BEFORE the worker spawns, so the worker's boot-scan
+  // folds it straight from HEAD (it is already committed → in-HEAD → emitted, it
+  // never lands in `pending`). After boot the repo holds ZERO pending paths —
+  // exactly the state pre-fn-737 left without a reflog watch.
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+  const firstId = "fn-400-already-committed";
+  const firstPath = join(epicDir, `${firstId}.json`);
+  writeFileSync(
+    firstPath,
+    JSON.stringify({
+      id: firstId,
+      title: "First",
+      status: "open",
+      primary_repo: root,
+    }),
+  );
+  git(root, "add", firstPath);
+  git(root, "commit", "-q", "-m", `add ${firstId}`);
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    // LONG poll → the data_version poll can NOT be the trigger; only the reflog
+    // watch (the fn-737 widening) or the 5s heartbeat can surface the commit.
+    {
+      workerData: { dbPath, roots: [root], pollMs: 60_000 },
+    } as WorkerOptions & {
+      workerData: unknown;
+    },
+  );
+
+  const seen = new Map<string, number>();
+  const backstops: BackstopRecord[] = [];
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const m = ev.data as {
+      kind?: string;
+      id?: string;
+      record?: BackstopRecord | BackstopRollup;
+    };
+    if (
+      m?.kind === "plan-epic" &&
+      typeof m.id === "string" &&
+      !seen.has(m.id)
+    ) {
+      seen.set(m.id, performance.now());
+    } else if (m?.kind === "backstop" && m.record?.kind === "backstop-rescue") {
+      backstops.push(m.record);
+    }
+  });
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  // Boot + boot-scan: the first (already-committed) epic emits; the widened
+  // reflog watch arms for this repo even though it holds NO pending path.
+  await Bun.sleep(400);
+  expect(crashed).toBe(false);
+  expect(seen.has(firstId)).toBe(true); // boot-scan folded the committed epic
+
+  // Now commit a SECOND epic. The repo has no pending path, so pre-fn-737 there
+  // is no reflog watch and this is invisible until the 5s heartbeat. With the
+  // widening, the `.git/logs/HEAD` append fires the watch → change-gated
+  // `scanPlanctlDir` re-scan → the now-in-HEAD second epic emits sub-second.
+  const secondId = "fn-401-no-pending-commit";
+  const secondPath = join(epicDir, `${secondId}.json`);
+  writeFileSync(
+    secondPath,
+    JSON.stringify({
+      id: secondId,
+      title: "Second",
+      status: "open",
+      primary_repo: root,
+    }),
+  );
+  git(root, "add", secondPath);
+  git(root, "commit", "-q", "-m", `add ${secondId}`);
+  const op = performance.now();
+  // Generous deadline so a (regressed) heartbeat-bound path still resolves and
+  // the MEASURED latency is the honest signal rather than a hard timeout.
+  const ok = await waitFor(() => seen.has(secondId), 20_000, 25);
+  expect(ok).toBe(true);
+  const latency = (seen.get(secondId) as number) - op;
+
+  // The defining assertion: the no-pending-repo commit surfaces FAST — well
+  // under one heartbeat — proving the widened reflog watch (not the 5s
+  // heartbeat) caught it. Pre-fn-737 this would be ~RECONCILE_HEARTBEAT_MS-bound.
+  expect(latency).toBeGreaterThanOrEqual(0);
+  expect(latency).toBeLessThan(RECONCILE_HEARTBEAT_MS);
+  // And no heartbeat RESCUE fired for it (the fast path delivered, not the
+  // backstop) — the cleanest evidence the coverage gap is closed.
+  const heartbeatRescues = backstops.filter(
+    (b) => b.backstop === "plan-heartbeat",
+  ).length;
+  console.log(
+    `[fn-737 lever] no-pending-repo commit op->snapshot latency: ` +
+      `${Math.round(latency)}ms (< RECONCILE_HEARTBEAT_MS=${RECONCILE_HEARTBEAT_MS}); ` +
+      `heartbeat rescues during window: ${heartbeatRescues}`,
+  );
+  expect(heartbeatRescues).toBe(0);
+
+  worker.postMessage({ type: "shutdown" });
+  const res = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(res).toBe("exited");
+  expect(crashed).toBe(false);
+});
+
+// (z5) fn-737 — the widened reflog watch also debounces a commit BURST: many
+//      commits in quick succession into a no-pending repo must NOT each spawn a
+//      per-path git storm. The watch fires the repo-SCOPED `recheckPending` +
+//      one change-gated `scanPlanctlDir`; the change-gate suppresses unchanged
+//      files so a burst converges WITHOUT the fn-712/fn-716 storm. We assert the
+//      terminal state (every committed epic folds) and that the worker stays
+//      healthy (no crash, clean shutdown) under the burst.
+// ---------------------------------------------------------------------------
+test("fn-737 lever: a commit burst in a no-pending repo converges (every epic folds, no storm/crash)", async () => {
+  const dbPath = join(tmpDir, "keeper.db");
+  openDb(dbPath).db.close();
+
+  const root = join(tmpDir, "burst-repo");
+  mkdirSync(root);
+  gitInit(root);
+  const epicDir = join(root, ".planctl", "epics");
+  mkdirSync(epicDir, { recursive: true });
+
+  const worker = new Worker(
+    new URL("../src/plan-worker.ts", import.meta.url).href,
+    {
+      workerData: { dbPath, roots: [root], pollMs: 60_000 },
+    } as WorkerOptions & {
+      workerData: unknown;
+    },
+  );
+
+  const seen = new Set<string>();
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const m = ev.data as { kind?: string; id?: string };
+    if (m?.kind === "plan-epic" && typeof m.id === "string") seen.add(m.id);
+  });
+  const exited = new Promise<void>((resolve) => {
+    worker.addEventListener("close", () => resolve());
+  });
+  let crashed = false;
+  worker.addEventListener("error", () => {
+    crashed = true;
+  });
+
+  await Bun.sleep(300);
+  expect(crashed).toBe(false);
+
+  // Burst: BACK-TO-BACK commits, each adding one epic (each appends one
+  // `.git/logs/HEAD` line → one reflog fire). No sleep between them, so they
+  // coalesce against the widened watch.
+  const ids: string[] = [];
+  for (let i = 0; i < 6; i++) {
+    const id = `fn-${500 + i}-burst`;
+    ids.push(id);
+    const p = join(epicDir, `${id}.json`);
+    writeFileSync(
+      p,
+      JSON.stringify({
+        id,
+        title: "Burst",
+        status: "open",
+        primary_repo: root,
+      }),
+    );
+    git(root, "add", p);
+    git(root, "commit", "-q", "-m", `add ${id}`);
+  }
+
+  // The terminal state: every burst epic is folded (the change-gated re-scan
+  // re-reads each committed file). The heartbeat backstop guarantees eventual
+  // convergence even if a reflog edge coalesced, but the assertion is the
+  // CONVERGED set — the storm class never converges because it starves the loop.
+  const ok = await waitFor(() => ids.every((id) => seen.has(id)), 20_000, 50);
+  expect(ok).toBe(true);
+  expect(crashed).toBe(false);
+
+  worker.postMessage({ type: "shutdown" });
+  const res = await Promise.race([
+    exited.then(() => "exited" as const),
+    Bun.sleep(3000).then(() => "timeout" as const),
+  ]);
+  expect(res).toBe("exited");
+  expect(crashed).toBe(false);
+});

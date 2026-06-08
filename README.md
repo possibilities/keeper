@@ -1170,11 +1170,26 @@ share) so every keeper DB write, the close→approve fold included, drives a
 single-flight gated rescan that drains `pending` + re-ingests changed
 `.planctl` files in ~50ms — the realtime complement to the best-effort
 FSEvents subscription, closing the up-to-60s fold lag the heartbeat used to
-impose. It ALSO watches each watched repo's `.git/logs/HEAD` reflog with
+impose. It ALSO watches each planctl repo's `.git/logs/HEAD` reflog with
 `@parcel/watcher` (a commit always appends there) to close the
-brand-new/never-seen-repo tail, where the in-HEAD transition fires no DB
-write and no `recheck-pending` post — the worker reconciles those external
-reflog watches against its live `pending` repo set. The two remaining drain
+no-DB-write commit tail, where the in-HEAD transition fires no DB
+write and no `recheck-pending` post — the broad recursive watch IGNORES
+`.git` (`IGNORE_GLOBS`), so the per-repo reflog watch is the only FSEvents
+commit signal. As of fn-737 the worker reconciles those external reflog
+watches against the UNION of its live `pending` repo set AND every repo that
+holds a `.planctl` tree under the configured roots (`discoverPlanctlDirs`),
+not just the pending ones — fn-705 armed a watch only while a repo held a
+pending path, so a commit in a planctl repo with NO pending path (a
+steady-state `.planctl` change whose file-write FSEvent was a no-op or
+coalesced) had no realtime signal and fell to the git-worker's 60s heartbeat
+(task fn-737 measured that as the dominant fold-latency tail). The widening is
+bounded — the watch count is the number of planctl-tracked repos under the
+roots, and since the broad watch ignores `.git` these per-repo `.git/logs`
+watches don't overlap it (no fseventsd bad-state). On the reflog append the
+worker runs the repo-SCOPED gated `recheckPending(root)` PLUS a change-gated
+`scanPlanctlDir` re-scan of that repo's `.planctl` dir (the latter recovers a
+committed change that was never gated into `pending`); neither writes the DB.
+The two remaining drain
 triggers are main's `recheck-pending` post on every `GitSnapshot` / `Commit`
 it writes, and the heartbeat — DEMOTED from a 60s latency floor to a 5s
 should-never-fire paranoia backstop (`RECONCILE_HEARTBEAT_MS`); when the

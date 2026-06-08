@@ -1485,8 +1485,7 @@ describe("tick", () => {
     // Fresh tmpdir: keeper.db does not exist yet. The read-only openDb in scan
     // would let SQLite throw; tick's existsSync guard must short-circuit.
     expect(existsSync(dbPath)).toBe(false);
-    let res!: Awaited<ReturnType<typeof tick>>;
-    res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
+    const res = await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
     expect(res).toEqual({
       baselined: false,
       spawned: false,

@@ -2980,13 +2980,35 @@ function main(): void {
   // it isn't watching that repo's `.git`; the commit produces NO DB write (the
   // poll never wakes) and leaves the file bytes unchanged (no second FSEvent).
   // The in-HEAD transition has no realtime trigger. Fix: watch
-  // `.git/logs/HEAD` (a commit ALWAYS appends there) for every repo that
-  // currently holds a `pending` path, and run the GATED `recheckPending()`
-  // scoped to that repo on the append — now in HEAD → emit.
+  // `.git/logs/HEAD` (a commit ALWAYS appends there) and, on the append, run the
+  // GATED `recheckPending()` scoped to that repo (now in HEAD → emit) PLUS a
+  // change-gated `scanPlanctlDir` re-scan (recover a committed `.planctl` change
+  // that was never gated into pending).
   //
-  // Lifecycle is bounded: a watch is ADDED when a repo gains a pending path and
-  // DROPPED when its pending set empties (`reconcileReflogWatches` diffs
-  // `scanner.pendingRepos()` against `reflogSubs.keys()`). Per FSEvents
+  // fn-737 WIDENING. The pending-only watch set left the epic's confirmed slow
+  // path open: a commit in a repo that holds a `.planctl` tree but NO currently-
+  // pending path (a steady-state planctl change — e.g. a `done`/`reset` that
+  // edits then commits, or any `.planctl` mutation whose file-write FSEvent the
+  // kernel coalesced so it never bounced into `pending`). With no pending path
+  // no reflog watch was armed, the broad recursive watch IGNORES `.git`
+  // (IGNORE_GLOBS), and a foreign commit writes no keeper DB row — so the
+  // in-HEAD change was invisible until the git-worker's 60s heartbeat (task .1's
+  // measured diagnosis: that is the dominant production fold-latency tail). Fix:
+  // arm a `.git/logs/HEAD` reflog watch for EVERY repo that holds a `.planctl`
+  // tree under the configured roots — `pendingRepos()` ∪ the discovered planctl-
+  // repo set — not just the pending ones. Bounded + safe: the watch count is the
+  // number of planctl-tracked repos under the roots (a handful), the broad watch
+  // already ignores `.git` so these per-repo `.git/logs` watches do NOT overlap
+  // it (no fseventsd bad-state from overlapping subtree watches), and the
+  // callback stays repo-SCOPED (`recheckPending(root)` + one `scanPlanctlDir` —
+  // no fn-712/fn-716 global-recheck storm). The poll stays trigger-only: the
+  // re-scan is change-gated, re-probes the in-HEAD gate, and writes no DB row.
+  //
+  // Lifecycle is bounded: a watch is ADDED when a repo gains a pending path OR
+  // is discovered to hold a `.planctl` tree, and DROPPED when it neither holds a
+  // pending path NOR a `.planctl` tree any longer (`reconcileReflogWatches`
+  // diffs `pendingRepos()` ∪ `discoverPlanctlRepos()` against
+  // `reflogSubs.keys()`). Per FSEvents
   // discipline the append is a HINT, not data — `recheckPending` re-probes
   // `isPathInHead`, so a spurious fire is an idempotent no-op and a missed fire
   // is covered by the lowered heartbeat floor.
@@ -3012,25 +3034,50 @@ function main(): void {
     return null;
   };
 
-  // Bring the live reflog-watch set into agreement with the repos that
-  // currently own a pending path. Idempotent + cheap (a no-op when the pending
-  // repo set hasn't changed). Fired by the scanner's `onPendingChange` on every
-  // pending mutation AND once after the watcher module loads (to catch any
-  // pending accrued before the module was ready).
+  // fn-737: the discovered planctl-repo set — every `<root>/<project>` that
+  // holds a `.planctl` tree under the configured roots, via the same
+  // `discoverPlanctlDirs` walk the heartbeat reconcile uses (a shallow
+  // readdir+stat per root, no DB read, no emission). Each `.planctl` dir's
+  // parent IS its repo root (`repoRootFromPlanctlPath`-shaped), so a commit in
+  // any of these repos can be caught by a reflog watch even when it holds no
+  // currently-pending path. Pure I/O; failures inside `discoverPlanctlDirs`
+  // skip-and-log (so a transient read miss just yields a smaller set this cycle,
+  // re-derived on the next reconcile).
+  const discoverPlanctlRepos = (): Set<string> => {
+    const repos = new Set<string>();
+    for (const planctlDir of discoverPlanctlDirs(data.roots)) {
+      repos.add(dirname(planctlDir));
+    }
+    return repos;
+  };
+
+  // Bring the live reflog-watch set into agreement with the repos that should
+  // hold a `.git/logs/HEAD` reflog watch: every repo that currently owns a
+  // pending path UNION every repo that holds a `.planctl` tree under the
+  // configured roots (fn-737 widening — the latter closes the no-pending-repo
+  // commit tail). Idempotent + cheap (a no-op when the union hasn't changed).
+  // Fired by the scanner's `onPendingChange` on every pending mutation, by the
+  // heartbeat (so a brand-new `.planctl` repo arms its watch within one interval
+  // even with no pending path), AND once after the watcher module loads (to
+  // catch any pending/discovered repos accrued before the module was ready).
   const reconcileReflogWatches = (): void => {
     if (shuttingDown || reflogWatcherModule === null) return;
     const watcher = reflogWatcherModule;
     const desired = scanner.pendingRepos();
-    // Drop watches for repos whose pending set has drained.
+    for (const repo of discoverPlanctlRepos()) {
+      desired.add(repo);
+    }
+    // Drop watches for repos that are no longer in the desired union (neither
+    // pending nor holding a `.planctl` tree any longer).
     for (const [root, sub] of [...reflogSubs]) {
       if (!desired.has(root)) {
         reflogSubs.delete(root);
         void sub.unsubscribe().catch(() => {
-          // best-effort; the repo is no longer pending either way.
+          // best-effort; the repo is no longer desired either way.
         });
       }
     }
-    // Add watches for newly-pending repos (skip ones already subscribed or
+    // Add watches for newly-desired repos (skip ones already subscribed or
     // mid-subscribe).
     for (const root of desired) {
       if (reflogSubs.has(root) || reflogSubscribing.has(root)) continue;
@@ -3068,12 +3115,40 @@ function main(): void {
               `[plan-worker] reflog recheckPending failed for ${root}: ${stringifyErr(e)}`,
             );
           }
+          // fn-737: `recheckPending(root)` only drains paths ALREADY in the
+          // pending gate. The widened-watch slow path is a commit in a repo with
+          // NO pending path — the `.planctl` change was never gated in (its
+          // file-write FSEvent was a no-op or coalesced), so a pending drain is
+          // a no-op. Re-scan this repo's `.planctl` dir directly via the same
+          // change-gated `scanPlanctlDir` the heartbeat/db-poll reconcile uses:
+          // it re-reads the now-COMMITTED bytes, re-probes the in-HEAD gate per
+          // file, and emits only changed-and-in-HEAD files (the change-gate
+          // suppresses unchanged ones, so a spurious fire is an idempotent
+          // no-op). Repo-SCOPED to this `root`'s `.planctl` only — no global
+          // re-discovery, no per-path git storm (fn-712/fn-716 guardrail). The
+          // re-scan never writes the DB (poll-is-trigger-only). Tagged
+          // `fswatcher-drop` (this IS a watcher edge a fast path would otherwise
+          // need the heartbeat to recover).
+          try {
+            scanPlanctlDir(join(root, ".planctl"), scanner, "fswatcher-drop");
+          } catch (e) {
+            console.error(
+              `[plan-worker] reflog scanPlanctlDir failed for ${root}: ${stringifyErr(e)}`,
+            );
+          }
         })
         .then((sub) => {
           reflogSubscribing.delete(root);
-          // Lost-the-race teardown: shutdown or the repo drained while we were
-          // subscribing — release immediately.
-          if (shuttingDown || !scanner.pendingRepos().has(root)) {
+          // Lost-the-race teardown: shutdown, or the repo left the desired union
+          // (its pending set drained AND it no longer holds a `.planctl` tree)
+          // while we were subscribing — release immediately. fn-737: check the
+          // FULL desired union (pending ∪ discovered planctl repos), not just
+          // `pendingRepos()`, or a freshly-discovered no-pending repo's watch
+          // would be torn down the instant it resolved.
+          const stillDesired =
+            scanner.pendingRepos().has(root) ||
+            discoverPlanctlRepos().has(root);
+          if (shuttingDown || !stillDesired) {
             void sub.unsubscribe().catch(() => {});
             return;
           }
@@ -3096,7 +3171,10 @@ function main(): void {
   // `present` when every pending repo had a watch (so a present-but-missed
   // FSEvents signal, not a coverage gap), and `undefined` when nothing is
   // pending (no per-repo notion to attribute). Pure read of the live watch set;
-  // producer-side only, never consulted in a fold.
+  // producer-side only, never consulted in a fold. POST-fn-737-WIDENING: every
+  // discovered planctl repo arms a watch, so `absent` should now be RARE — a
+  // sustained run of `present` (or no rescue at all) is the evidence the
+  // coverage gap closed.
   const reflogWatchAttribution = (): "present" | "absent" | undefined => {
     const pending = scanner.pendingRepos();
     if (pending.size === 0) return undefined;
@@ -3387,6 +3465,14 @@ function main(): void {
         rescued,
         reflogWatchAttribution(),
       );
+      // fn-737: re-reconcile the reflog watches against the live union (pending
+      // ∪ discovered planctl repos). `onPendingChange` only fires on a pending
+      // mutation, so a brand-new `.planctl` repo that never accrues a pending
+      // path (a foreign commit lands its files already-in-HEAD before any
+      // FSEvent gated them) would otherwise never arm its watch. This periodic
+      // re-reconcile picks it up within one heartbeat — cheap (a shallow
+      // readdir+stat per root; a no-op when the union hasn't changed).
+      reconcileReflogWatches();
     } catch (err) {
       console.error(
         `[plan-worker] periodic reconcile failed: ${stringifyErr(err)}`,
