@@ -32,6 +32,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   applyHeldGate,
+  BACKSTOP_BASELINE_VERSION,
   type BackstopBaseline,
   COOLDOWN_SECS,
   countDeadLetters,
@@ -734,9 +735,10 @@ describe("detectBackstopTelemetry", () => {
     backstop: string;
     cls: string;
     staleness_ms: number | null;
+    ts?: number;
   }): string {
     return JSON.stringify({
-      ts: 1780868400000,
+      ts: over.ts ?? 1780868400000,
       kind: "backstop-rescue",
       class: over.cls,
       backstop: over.backstop,
@@ -766,6 +768,21 @@ describe("detectBackstopTelemetry", () => {
 
   const ID = { dev: 1, ino: 100 };
 
+  /**
+   * A prior baseline that has ALREADY observed `bucket` with a watermark below
+   * the rescue `ts` the fixtures use (1780868400000), so a fresh rescue is
+   * genuinely-NEW (`ts > watermark`) and arms the staleness alarm. Mirrors the
+   * steady state after the first reseed tick.
+   */
+  function priorWith(bucket: string, watermark = 0): BackstopBaseline {
+    return {
+      version: BACKSTOP_BASELINE_VERSION,
+      dev: ID.dev,
+      ino: ID.ino,
+      buckets: { [bucket]: { rescue_watermark_ts: watermark } },
+    };
+  }
+
   test("today's incident: pending-dispatch-sweep rescue at staleness=143108 fires", () => {
     const text = `${rescueLine({
       backstop: "pending-dispatch-sweep",
@@ -774,7 +791,7 @@ describe("detectBackstopTelemetry", () => {
     })}\n`;
     const { findings } = detectBackstopTelemetry({
       text,
-      prior: emptyBackstopBaseline(),
+      prior: priorWith("pending-dispatch-sweep timeout"),
       identity: ID,
     });
     const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
@@ -795,7 +812,7 @@ describe("detectBackstopTelemetry", () => {
     })}\n`;
     const { findings } = detectBackstopTelemetry({
       text,
-      prior: emptyBackstopBaseline(),
+      prior: priorWith("plan-heartbeat missed-wake"),
       identity: ID,
     });
     const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
@@ -811,7 +828,7 @@ describe("detectBackstopTelemetry", () => {
     })}\n`;
     const { findings } = detectBackstopTelemetry({
       text,
-      prior: emptyBackstopBaseline(),
+      prior: priorWith("plan-heartbeat missed-wake"),
       identity: ID,
     });
     expect(
@@ -829,7 +846,7 @@ describe("detectBackstopTelemetry", () => {
     ).toHaveLength(0);
   });
 
-  test("missed-wake DELTA: seeds silently, then fires when fires_total rises past the threshold", () => {
+  test("missed-wake DELTA: seeds silently, then fires when rescues_total rises past the threshold", () => {
     const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
     // Tick 1: first observation seeds the baseline silently (no delta fire).
     const t1 = `${rollupLine({ ...bucket, fires_total: 10, rescues_total: 4 })}\n`;
@@ -841,12 +858,15 @@ describe("detectBackstopTelemetry", () => {
     expect(
       seed.findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
     ).toHaveLength(0);
-    expect(seed.next.buckets["git-heartbeat missed-wake"].fires_total).toBe(10);
+    expect(seed.next.buckets["git-heartbeat missed-wake"].rescues_total).toBe(
+      4,
+    );
     expect(seed.next.dev).toBe(ID.dev);
     expect(seed.next.ino).toBe(ID.ino);
 
-    // Tick 2: fires_total jumped by 8 (> MISSED_WAKE_DELTA=5) → fires.
-    const t2 = `${rollupLine({ ...bucket, fires_total: 18, rescues_total: 6 })}\n`;
+    // Tick 2: rescues_total jumped by 8 (> MISSED_WAKE_DELTA=5) → fires; the
+    // delta keys off rescues_total, NOT fires_total.
+    const t2 = `${rollupLine({ ...bucket, fires_total: 30, rescues_total: 12 })}\n`;
     const second = detectBackstopTelemetry({
       text: t2,
       prior: seed.next,
@@ -857,20 +877,52 @@ describe("detectBackstopTelemetry", () => {
     );
     expect(delta).toBeDefined();
     expect(delta?.evidence.delta).toBe(8);
-    expect(delta?.evidence.baselineFires).toBe(10);
-    expect(delta?.evidence.currentFires).toBe(18);
+    expect(delta?.evidence.baselineRescues).toBe(4);
+    expect(delta?.evidence.currentRescues).toBe(12);
+    // fires_total retained in evidence for continuity.
+    expect(delta?.evidence.currentFires).toBe(30);
+    // rescue-based wording.
+    expect(delta?.detail).toContain("rescues_total rose");
+    expect(delta?.title).toContain("rescued");
   });
 
-  test("a tiny rise (≤ threshold) does NOT fire", () => {
+  test("fires_total rising while rescues_total stays flat does NOT fire (keys off rescues)", () => {
     const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
     const prior: BackstopBaseline = {
-      version: 1,
+      version: BACKSTOP_BASELINE_VERSION,
       dev: ID.dev,
       ino: ID.ino,
       buckets: {
-        "git-heartbeat missed-wake": { fires_total: 10, rescues_total: 4 },
+        "git-heartbeat missed-wake": {
+          fires_total: 10,
+          rescues_total: 4,
+          rescue_watermark_ts: 0,
+        },
       },
     };
+    // fires_total +10 (normal periodic wake-ups), rescues_total flat → quiet.
+    const text = `${rollupLine({ ...bucket, fires_total: 20, rescues_total: 4 })}\n`;
+    const { findings } = detectBackstopTelemetry({ text, prior, identity: ID });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
+    ).toHaveLength(0);
+  });
+
+  test("a tiny rescues rise (≤ threshold) does NOT fire", () => {
+    const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
+    const prior: BackstopBaseline = {
+      version: BACKSTOP_BASELINE_VERSION,
+      dev: ID.dev,
+      ino: ID.ino,
+      buckets: {
+        "git-heartbeat missed-wake": {
+          fires_total: 10,
+          rescues_total: 4,
+          rescue_watermark_ts: 0,
+        },
+      },
+    };
+    // rescues_total +1 → ≤ MISSED_WAKE_DELTA(5) → quiet.
     const text = `${rollupLine({ ...bucket, fires_total: 13, rescues_total: 5 })}\n`;
     const { findings } = detectBackstopTelemetry({ text, prior, identity: ID });
     expect(
@@ -878,20 +930,24 @@ describe("detectBackstopTelemetry", () => {
     ).toHaveLength(0);
   });
 
-  test("counter RESET (current < baseline) reads as a reset, NOT a regression", () => {
+  test("counter RESET (current rescues < baseline) reads as a reset, NOT a regression", () => {
     const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
-    // Baseline at 100; daemon restarted → current counter is 7 (< baseline).
+    // Baseline rescues at 40; daemon restarted → current rescues is 7 (< base).
     const prior: BackstopBaseline = {
-      version: 1,
+      version: BACKSTOP_BASELINE_VERSION,
       dev: ID.dev,
       ino: ID.ino,
       buckets: {
-        "git-heartbeat missed-wake": { fires_total: 100, rescues_total: 40 },
+        "git-heartbeat missed-wake": {
+          fires_total: 100,
+          rescues_total: 40,
+          rescue_watermark_ts: 0,
+        },
       },
     };
-    // 7 < 100 → reset → delta = 7, but a reset NEVER fires even though
+    // 7 < 40 → reset → delta = 7, but a reset NEVER fires even though
     // 7 > MISSED_WAKE_DELTA(5).
-    const text = `${rollupLine({ ...bucket, fires_total: 7, rescues_total: 2 })}\n`;
+    const text = `${rollupLine({ ...bucket, fires_total: 9, rescues_total: 7 })}\n`;
     const { findings, next } = detectBackstopTelemetry({
       text,
       prior,
@@ -901,36 +957,201 @@ describe("detectBackstopTelemetry", () => {
       findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
     ).toHaveLength(0);
     // The baseline re-seeds to the post-reset value for the next tick.
-    expect(next.buckets["git-heartbeat missed-wake"].fires_total).toBe(7);
+    expect(next.buckets["git-heartbeat missed-wake"].rescues_total).toBe(7);
   });
 
-  test("file-identity change (dev,ino) invalidates the whole baseline — no delta fire", () => {
+  test("file-identity change (dev,ino) invalidates the whole baseline — no delta fire, watermark reseeds silently", () => {
     const bucket = { backstop: "git-heartbeat", cls: "missed-wake" };
     const prior: BackstopBaseline = {
-      version: 1,
+      version: BACKSTOP_BASELINE_VERSION,
       dev: 1,
       ino: 100,
       buckets: {
-        "git-heartbeat missed-wake": { fires_total: 10, rescues_total: 4 },
+        "git-heartbeat missed-wake": {
+          fires_total: 10,
+          rescues_total: 4,
+          rescue_watermark_ts: 0,
+        },
       },
     };
-    // The log rotated → new inode. A big jump would normally fire, but the
-    // identity changed → invalidate → re-seed silently this tick.
-    const text = `${rollupLine({ ...bucket, fires_total: 99, rescues_total: 40 })}\n`;
+    // The log rotated → new inode. A big jump (rescues AND a high-staleness
+    // rescue) would normally fire, but the identity changed → invalidate →
+    // re-seed silently this tick (no delta fire, no staleness fire).
+    const text =
+      `${rollupLine({ ...bucket, fires_total: 99, rescues_total: 40 })}\n` +
+      `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868900000 })}\n`;
     const { findings, next } = detectBackstopTelemetry({
       text,
       prior,
       identity: { dev: 1, ino: 999 },
     });
     expect(
-      findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
+      findings.filter((f) => f.category === "backstop-degraded"),
     ).toHaveLength(0);
     expect(next.dev).toBe(1);
     expect(next.ino).toBe(999);
-    expect(next.buckets["git-heartbeat missed-wake"].fires_total).toBe(99);
+    expect(next.buckets["git-heartbeat missed-wake"].rescues_total).toBe(40);
+    // Watermark seeded to the rescue ts seen this tick (no fire).
+    expect(next.buckets["git-heartbeat missed-wake"].rescue_watermark_ts).toBe(
+      1780868900000,
+    );
+  });
+
+  test("version 1→2 / empty baseline: first tick fires nothing and seeds the watermark", () => {
+    const bucket = { backstop: "pending-dispatch-sweep", cls: "timeout" };
+    // A high-staleness rescue against a fresh (reseeded) baseline must fire
+    // NOTHING — the first post-1→2 tick re-paging all history is the regression
+    // this whole epic prevents. Instead the watermark seeds to max(ts).
+    const text = `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868700000 })}\n`;
+    const { findings, next } = detectBackstopTelemetry({
+      text,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-staleness:")),
+    ).toHaveLength(0);
+    expect(
+      next.buckets["pending-dispatch-sweep timeout"].rescue_watermark_ts,
+    ).toBe(1780868700000);
+  });
+
+  test("old stale rescue (ts ≤ watermark) does NOT fire across two ticks", () => {
+    const bucket = { backstop: "pending-dispatch-sweep", cls: "timeout" };
+    // Tick 1: a high-staleness rescue arrives against a fresh baseline → seeds
+    // the watermark, fires nothing.
+    const t1 = `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868700000 })}\n`;
+    const first = detectBackstopTelemetry({
+      text: t1,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    expect(
+      first.findings.filter((f) => f.key.startsWith("backstop-staleness:")),
+    ).toHaveLength(0);
+
+    // Tick 2: the SAME old rescue is still in the file (ts ≤ watermark) plus a
+    // clean rollup → still no staleness finding (the exclusive cursor windows
+    // it out).
+    const t2 =
+      `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868700000 })}\n` +
+      `${rollupLine({ ...bucket, fires_total: 5, rescues_total: 1 })}\n`;
+    const second = detectBackstopTelemetry({
+      text: t2,
+      prior: first.next,
+      identity: ID,
+    });
+    expect(
+      second.findings.filter((f) => f.key.startsWith("backstop-staleness:")),
+    ).toHaveLength(0);
+  });
+
+  test("a genuinely-new rescue (ts > watermark) over threshold fires the WINDOWED staleness", () => {
+    const bucket = { backstop: "pending-dispatch-sweep", cls: "timeout" };
+    // Prior watermark already past an OLD low-staleness rescue; a NEW rescue
+    // (ts > watermark) with high staleness must fire with the windowed (new)
+    // staleness in evidence — NOT an all-history max.
+    const prior: BackstopBaseline = {
+      version: BACKSTOP_BASELINE_VERSION,
+      dev: ID.dev,
+      ino: ID.ino,
+      buckets: {
+        "pending-dispatch-sweep timeout": {
+          rescue_watermark_ts: 1780868500000,
+        },
+      },
+    };
+    const text =
+      // old, below-threshold rescue at/under the watermark → ignored.
+      `${rescueLine({ ...bucket, staleness_ms: 200000, ts: 1780868500000 })}\n` +
+      // new rescue over threshold → fires with THIS staleness.
+      `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868600000 })}\n`;
+    const { findings, next } = detectBackstopTelemetry({
+      text,
+      prior,
+      identity: ID,
+    });
+    const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
+    expect(stale).toBeDefined();
+    // Windowed staleness = the new rescue's 143108 — NOT the old 200000.
+    expect(stale?.evidence.stalenessMs).toBe(143108);
+    // Watermark advances to the newest ts seen.
+    expect(
+      next.buckets["pending-dispatch-sweep timeout"].rescue_watermark_ts,
+    ).toBe(1780868600000);
+  });
+
+  test("a null-staleness rescue advances the watermark but does not arm the alarm", () => {
+    const bucket = { backstop: "plan-heartbeat", cls: "missed-wake" };
+    const prior: BackstopBaseline = {
+      version: BACKSTOP_BASELINE_VERSION,
+      dev: ID.dev,
+      ino: ID.ino,
+      buckets: {
+        "plan-heartbeat missed-wake": { rescue_watermark_ts: 1780868500000 },
+      },
+    };
+    // A NEW (ts > watermark) rescue but with null staleness (cold boot) → no
+    // fire, yet the watermark advances to its ts.
+    const text = `${rescueLine({ ...bucket, staleness_ms: null, ts: 1780868600000 })}\n`;
+    const { findings, next } = detectBackstopTelemetry({
+      text,
+      prior,
+      identity: ID,
+    });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-staleness:")),
+    ).toHaveLength(0);
+    expect(next.buckets["plan-heartbeat missed-wake"].rescue_watermark_ts).toBe(
+      1780868600000,
+    );
+  });
+
+  test("rescue-only bucket persists a watermark (writeback lifted out of the rollup guard)", () => {
+    const bucket = { backstop: "plan-heartbeat", cls: "missed-wake" };
+    // No rollup line — only a rescue. The bucket must STILL persist an entry
+    // carrying its watermark (and leave the counters undefined so a later
+    // rollup seeds silently, not against a phantom 0).
+    const text = `${rescueLine({ ...bucket, staleness_ms: 1000, ts: 1780868600000 })}\n`;
+    const { next } = detectBackstopTelemetry({
+      text,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    const entry = next.buckets["plan-heartbeat missed-wake"];
+    expect(entry).toBeDefined();
+    expect(entry.rescue_watermark_ts).toBe(1780868600000);
+    expect(entry.fires_total).toBeUndefined();
+    expect(entry.rescues_total).toBeUndefined();
+  });
+
+  test("rescue-only bucket then a rollup seeds the counter silently (no phantom delta)", () => {
+    const bucket = { backstop: "plan-heartbeat", cls: "missed-wake" };
+    // Tick 1: rescue-only → watermark persists, counters undefined.
+    const t1 = `${rescueLine({ ...bucket, staleness_ms: 1000, ts: 1780868600000 })}\n`;
+    const first = detectBackstopTelemetry({
+      text: t1,
+      prior: emptyBackstopBaseline(),
+      identity: ID,
+    });
+    // Tick 2: a rollup with a high rescues_total arrives. Because the prior
+    // entry had NO rescues_total, this seeds silently — NOT a phantom delta vs 0.
+    const t2 = `${rollupLine({ ...bucket, fires_total: 50, rescues_total: 30 })}\n`;
+    const second = detectBackstopTelemetry({
+      text: t2,
+      prior: first.next,
+      identity: ID,
+    });
+    expect(
+      second.findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
+    ).toHaveLength(0);
+    expect(
+      second.next.buckets["plan-heartbeat missed-wake"].rescues_total,
+    ).toBe(30);
   });
 
   test("fingerprint is stable across ticks for the same bucket+signal", () => {
+    const prior = priorWith("pending-dispatch-sweep timeout");
     const text = `${rescueLine({
       backstop: "pending-dispatch-sweep",
       cls: "timeout",
@@ -938,12 +1159,12 @@ describe("detectBackstopTelemetry", () => {
     })}\n`;
     const a = detectBackstopTelemetry({
       text,
-      prior: emptyBackstopBaseline(),
+      prior,
       identity: ID,
     }).findings.find((f) => f.key.startsWith("backstop-staleness:"));
     const b = detectBackstopTelemetry({
       text,
-      prior: emptyBackstopBaseline(),
+      prior,
       identity: ID,
     }).findings.find((f) => f.key.startsWith("backstop-staleness:"));
     expect(a?.fingerprint).toBe(b?.fingerprint);
@@ -965,11 +1186,15 @@ describe("backstop-baseline sidecar", () => {
   test("save then load round-trips the baseline", () => {
     const p = resolveBackstopBaselinePath();
     const baseline: BackstopBaseline = {
-      version: 1,
+      version: BACKSTOP_BASELINE_VERSION,
       dev: 5,
       ino: 55,
       buckets: {
-        "git-heartbeat missed-wake": { fires_total: 7, rescues_total: 3 },
+        "git-heartbeat missed-wake": {
+          fires_total: 7,
+          rescues_total: 3,
+          rescue_watermark_ts: 1780868600000,
+        },
       },
     };
     saveBackstopBaseline(p, baseline);
@@ -1125,10 +1350,21 @@ describe("scan (DB layer)", () => {
     expect(fl?.evidence.latencySecs).toBe(10);
   });
 
-  test("backstop ingest: a high-staleness rescue surfaces through scan via injected deps", async () => {
+  test("backstop ingest: a NEW high-staleness rescue surfaces through scan via injected deps", async () => {
     openDb(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     const baselinePath = resolveBackstopBaselinePath();
+    // Pre-seed a baseline that has already observed this bucket with a watermark
+    // below the rescue ts, so the rescue is genuinely-NEW and arms the alarm
+    // (a fresh baseline would fire nothing — the R5 reseed rule).
+    saveBackstopBaseline(baselinePath, {
+      version: BACKSTOP_BASELINE_VERSION,
+      dev: 1,
+      ino: 100,
+      buckets: {
+        "pending-dispatch-sweep timeout": { rescue_watermark_ts: 0 },
+      },
+    });
     const deps: ScanDeps = {
       ...quietDeps(now),
       readBackstop: () => ({

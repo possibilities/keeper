@@ -103,7 +103,11 @@ shape because a consumer reads it.
   `backstop.ndjson` self-telemetry (read via `KEEPER_BACKSTOP_LOG`), consumed the
   same no-write/no-RPC way — never a DB write, synthetic event, or RPC. Its own
   seen-state, the liveness `heartbeat.json` it stamps as the last action on every
-  completed tick, and the escalation follow-up prompt files live outside the DB
+  completed tick, the `backstop-baseline.json` sidecar (per-(backstop,class)
+  `rescues_total` baseline + a rescue-`ts` high-watermark — version-tagged;
+  `BACKSTOP_BASELINE_VERSION` 1→2 silently reseeds every deployed baseline, so a
+  dev inspecting `~/.local/state/keeper-watch/` should expect a fresh file), and
+  the escalation follow-up prompt files live outside the DB
   under `~/.local/state/keeper-watch/`. A SEPARATE launchd dead-man
   (`cli/keeper-watchdog.ts`) reads ONLY that heartbeat and pages on staleness; it
   is standalone (no `keeper.db`, no keeperd, no `keeper-watch` dependency) so it

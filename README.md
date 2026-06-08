@@ -519,7 +519,9 @@ Keeper has no `install` verb. Wire it up manually:
    feeds a projection — so a write failure is best-effort/swallowed.
    `scripts/backstop-stats.ts` aggregates it into per-(backstop,class)
    rescue count, rescue RATE (rescues ÷ total fires, from the rollup
-   denominator), and staleness p50/p95/p99. Spawn-tests MUST override this
+   denominator), staleness p50/p95/p99, and per-rescue `{ts, staleness_ms}`
+   samples (which `keeper-watch` windows by a `ts` watermark so an old resolved
+   rescue never re-pages). Spawn-tests MUST override this
    path too (alongside `KEEPER_DB` / `KEEPER_DROP_LOG` /
    `KEEPER_DEAD_LETTER_DIR` / `KEEPER_RESTORE_FILE`) so the suite never
    writes the user's real state dir — build the sandboxed env via the shared
@@ -2064,8 +2066,13 @@ wedge, dead-letter growth, stuck jobs, backstop self-telemetry degradation, and
 event→projection fold latency), and escalates only genuinely-new signatures to a
 headless agent — it never writes the DB, mints no synthetic events, and performs
 no RPC. Its second read-only input is keeper's own `backstop.ndjson` self-
-telemetry (missed-wake counters + rescue staleness); it is consumed the same
-no-write/no-RPC way as `keeper.db`. On escalation the agent writes a self-
+telemetry (the missed-wake `rescues_total` counter + rescue staleness); it is
+consumed the same no-write/no-RPC way as `keeper.db`. Both backstop signals are
+INCREMENTAL: the missed-wake delta keys off `rescues_total` (the bad-outcome
+counter, not total wake-ups), and the staleness alarm fires only on a rescue
+whose `ts` exceeds a per-bucket high-watermark cursor persisted in the
+`backstop-baseline.json` sidecar — so one old resolved rescue never re-pages
+every cooldown window. On escalation the agent writes a self-
 contained, injection-safe investigation prompt per paged finding under
 `~/.local/state/keeper-watch/followups/` (plus a stable `latest.md`) and the
 notification points at that file, so closing the loop is just handing the
