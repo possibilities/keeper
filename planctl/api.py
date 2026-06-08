@@ -65,12 +65,12 @@ def load_epic(project: ProjectContext, epic_id: str) -> dict:
     epic file is absent or ``json.JSONDecodeError`` on a half-written /
     malformed file. Callers handle the retry/skip decision.
 
-    fn-732: epics now carry a gitignored ``approval`` sidecar
+    fn-732: ``approval`` lives canonically in a gitignored sidecar
     (``.planctl/state/epics/<id>.state.json``). ``merge_epic_state`` folds it
     over the committed def and resolves the ladder sidecar → def → pending, so
-    a caller reading ``epic["approval"]`` sees the fully-resolved value during
-    (and after) the dual-write transition. No other runtime field overlays an
-    epic today.
+    a caller reading ``epic["approval"]`` sees the fully-resolved value. The
+    committed def is the permanent fallback rung for the keeper-boots-first
+    race and for legacy defs. No other runtime field overlays an epic today.
     """
     from planctl.store import LocalFileStateStore
 

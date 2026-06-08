@@ -25,9 +25,11 @@ No agent-authored commit messages. No outer skill coordination. No "what
 landed since last time" audit-table scan.
 
 The model is fail-safe at the verb: any path that emits a
-`planctl_invocation` envelope commits its own scope, including a verb
-fired outside a `/plan:*` skill — notably `approve` from a human-typed
-CLI.
+`planctl_invocation` envelope with a populated `files` list commits its
+own scope, including a verb fired outside a `/plan:*` skill — e.g. `done`
+from a worker exit or a verb run from a human-typed CLI. Runtime-state-only
+verbs (`claim`, `block`, `approve`) emit a NULL-`files` envelope and land no
+commit; their target lives in gitignored `.planctl/state/`.
 
 ---
 
@@ -160,11 +162,11 @@ in a non-git dir, takes the read-only `emit()` path and lands no commit.
 
 | Class | Envelope | Auto-commit | Pre-commit-raise behavior |
 |---|---|---|---|
-| Mutating, single-field (`done`, `approve`, `epic close`, `epic invalidate`, `epic add-dep`/`add-deps`/`rm-dep`, every `epic set-*` / `task set-*`, `task reset`, ...) | non-null `subject`, populated `files` | yes (inline) | every write is a rewrite of a pre-existing tracked file via atomic_write rename-atomic; prior valid contents stay in place |
+| Mutating, single-field (`done`, `epic close`, `epic invalidate`, `epic add-dep`/`add-deps`/`rm-dep`, every `epic set-*` / `task set-*`, `task reset`, ...) | non-null `subject`, populated `files` | yes (inline) | every write is a rewrite of a pre-existing tracked file via atomic_write rename-atomic; prior valid contents stay in place |
 | Mutating, whole-tree (`scaffold`, `refine-apply`, `epic create`) | non-null `subject`, `files` covers the full epic+tasks+specs+deps tree | yes (inline, one commit) | the LOCAL write-phase block unwinds a mid-write crash; a pre-commit raise from the seam leaves the fully-written tree on disk (§10), invisible to the autopilot via the keeper HEAD-gate |
 | Mutating, whole-tree delete (`epic rm`, fn-623) | non-null `subject`, `files` lists every unlinked path (epic JSON, every task JSON, epic + task specs, runtime state, locks) — paths are recorded BEFORE the unlink so the `touched ∩ dirty` pathspec captures the deletions | yes (inline, one commit) | the verb is a delete — a pre-commit raise leaves the deletes in place (§10), nothing to re-create |
 | Mutating, self-built payload (`init`) | non-null `subject`, `files` is the explicit bootstrap set it created; NO `session_id` key (no `Session-Id:` trailer) | yes (inline, via `emit(planctl_invocation=...)`), only when something was written AND inside a git work tree | the writes are fresh files; a pre-commit raise leaves them on disk (§10), and an idempotent re-run is the read-only `emit()` path |
-| Runtime-state-only (`claim`, `block`) | `subject=null`, `files=null` | none (gitignored state) | n/a |
+| Runtime-state-only (`claim`, `block`, `approve`) | `subject=null`, `files=null` | none (gitignored state) | n/a |
 | Read-only (`show`, `cat`, `list`, ...) | `subject=null`, `files=null` (via decorator) | none | n/a |
 | `validate --epic <id>` (first-ever valid) | non-null `subject`, single file | yes (manual `auto_commit_from_invocation` call from the validate runner, which bypasses `emit()` to preserve its `{valid, errors, warnings}` envelope shape) | bypass — documented out-of-scope per §13's `validate --epic` row, see the asymmetry note below |
 | `refine-context --invalidate` (conditionally-mutating) | non-null `subject`, single file | yes (inline) | envelope shape is `emit()`-compatible; the single-field rewrite is a rename-atomic over a pre-existing tracked file, so prior valid contents stay in place |
@@ -226,7 +228,7 @@ stdout with exit 1. For the multi-file mint verbs (`scaffold`,
 `refine-apply`, `epic create`), a MID-WRITE crash is still unwound by
 their LOCAL write-phase try/except block (single-writer atomicity); the
 commit-failure window is NOT covered, so a fully-written tree persists.
-For the single-field verbs (`done`, `approve`, every `set-*`, etc.) each
+For the single-field verbs (`done`, every `set-*`, etc.) each
 write is a rename-atomic rewrite of a pre-existing tracked file — the
 prior valid contents stay in place. An uncommitted tree is harmless: the
 keeper HEAD-gate (§3) never observes it, so the autopilot never dispatches
@@ -262,15 +264,15 @@ the autopilot via the keeper HEAD-gate; the next mutating verb whose
 chore(planctl): <op> <target>
 ```
 
-`<op>` is the verb's audit op (`done`, `approve`, `scaffold`,
+`<op>` is the verb's audit op (`done`, `scaffold`,
 `refine-apply`, `epic-invalidate`, ...). `<target>` is the entity id
-the verb scoped to.
+the verb scoped to. Runtime-state-only verbs (`claim`, `block`, `approve`)
+produce no commit, so they never appear as a `<op>` here.
 
 Examples:
 
 ```
 chore(planctl): done fn-7-add-auth.2
-chore(planctl): approve fn-7-add-auth
 chore(planctl): scaffold fn-7-add-auth
 chore(planctl): refine-apply fn-7-add-auth
 chore(planctl): init <project-name>
@@ -496,7 +498,7 @@ Auto-commit failure is a **hard error** (the Option C contract). See
   create`), a MID-WRITE crash is still unwound by their LOCAL
   write-phase try/except block; a pre-commit raise after the write phase
   completed leaves the fully-written tree on disk. For the single-field
-  verbs (`done`, `approve`, every `set-*`, etc.), each write is a
+  verbs (`done`, every `set-*`, etc.), each write is a
   rename-atomic rewrite of a pre-existing tracked file, so prior valid
   contents stay in place. For `epic rm` the deletes already landed and
   stay deleted.
@@ -644,7 +646,7 @@ Per-test `tmp_path` + `git init` + `commit.gpgsign=false` +
 | Concurrent-sweep race | Verb A commits the files; Verb B re-confirms clean files and returns `None` (no empty commit); pathspec-scoped commits never cross-contaminate |
 | `done` verb | `chore(planctl): done <task_id>` commit lands in one verb call |
 | `task ack` | Writes `acks.db` only; no commit; envelope carries `subject=null`/`files=null` |
-| `approve` (paradigmatic any-cwd case) | Verb fires from any cwd (no `/plan:*` skill) — commit still lands |
+| `approve` (runtime-state-only, fn-732) | Writes the gitignored sidecar (`state/{tasks,epics}/<id>.state.json`) only; no commit; envelope carries `subject=null`/`files=null`. Mirrors `claim`/`block` |
 | `scaffold` whole-tree | One commit covers epic + tasks + specs + deps; envelope `files` lists every written path |
 | `scaffold` integrity-gate failure (fn-623) | `scan_max_epic_id` unchanged; zero orphan `specs/fn-N-*.md` on disk (in-memory `epic_spec_content=` pass means no spec lands before the gate); failure envelope only, no commit |
 | Seam pre-commit persistence (fn-640) | Multi-file mint verb raises AFTER the write phase (invocation-build raise or simulated `git` failure); the fully-written tree PERSISTS on disk (no seam unwind); the failure envelope lands; `_epic_id_lock` releases before the git commit runs (no nesting regression) |
