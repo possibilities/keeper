@@ -9,7 +9,7 @@
   "scripts": {
     "start": "exec bun run src/daemon.ts",
     "dev": "exec bun --watch run src/daemon.ts",
-    "lint": "biome check --no-errors-on-unmatched cli src test",
+    "lint": "biome check --no-errors-on-unmatched babysitters cli src test",
     "typecheck": "tsc --noEmit",
     "test:fast": "bun test --parallel --timeout=30000 --path-ignore-patterns='test/ansi-to-styled.test.ts' --path-ignore-patterns='test/live-shell.test.ts' --path-ignore-patterns='test/integration.test.ts' --path-ignore-patterns='test/daemon.test.ts' --path-ignore-patterns='test/plan-worker.test.ts'",
     "test:slow": "bun test test/integration.test.ts test/daemon.test.ts test/plan-worker.test.ts",

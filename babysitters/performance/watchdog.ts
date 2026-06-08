@@ -1,40 +1,44 @@
 #!/usr/bin/env bun
 /**
- * `keeper-watchdog` — the external dead-man for the keeper babysitter
- * (`keeper-watch`). The babysitter writes a `heartbeat.json` stamp as the LAST
- * action on every completed tick (see `cli/keeper-watch.ts` `writeHeartbeat`).
- * This watchdog — a SEPARATE launchd job — reads that heartbeat and alarms if it
- * goes stale, catching the one failure class the babysitter structurally cannot
- * self-report: its own death (a crashed / hung tick never reaches its heartbeat
- * write, and a dead monitor never runs its own monitor).
+ * `babysitters/performance/watchdog.ts` — the external dead-man for the
+ * `performance` sitter's scanner (`watch.ts`). The sitter writes a
+ * `heartbeat.json` stamp as the LAST action on every completed tick (see
+ * `watch.ts` `writeHeartbeat`). This watchdog — a SEPARATE launchd job — reads
+ * that heartbeat and alarms if it goes stale, catching the one failure class the
+ * sitter structurally cannot self-report: its own death (a crashed / hung tick
+ * never reaches its heartbeat write, and a dead monitor never runs its monitor).
  *
  * "Who watches the watcher": this binary is deliberately STANDALONE. It reads
  * ONLY the heartbeat file — it does NOT open keeper.db, does NOT talk to the
- * keeperd socket, does NOT import keeper-watch's scan path, and does NOT depend
- * on either keeper-watch or keeperd being up. So when those die (the exact case
+ * keeperd socket, does NOT import the sitter's scan path, and does NOT depend
+ * on either the sitter or keeperd being up. So when those die (the exact case
  * it exists to catch) the watchdog still runs and still pages.
  *
  * Mirrors the orphanwatch/dropwatch shell dead-men (silent first-run, once-daily
  * all-clear so silence never means the watchdog itself died), but is a tiny Bun
  * CLI rather than a shell script for testability + consistency with the repo's
- * Bun-first, biome-linted `cli/`. Decision logic is a PURE function of injected
+ * Bun-first, biome-linted tooling. Decision logic is a PURE function of injected
  * (now, heartbeat-read, last-all-clear-day) so it unit-tests with no real
- * notifyctl/botctl and no real clock.
+ * botctl and no real clock. Pages go to Telegram only (the "Keeper" topic) —
+ * no desktop notifyctl.
  *
- * NOT a `keeper` subcommand — its own binary, like `keeper-watch`.
+ * NOT a `keeper` subcommand — its own binary, like the sitter's `watch.ts`.
  */
 
 import { existsSync, mkdirSync, readFileSync } from "node:fs";
-import { homedir } from "node:os";
 import { join } from "node:path";
-import { atomicWriteFile } from "../src/db";
+import { atomicWriteFile } from "../../src/db";
+import { babysitterStateDir } from "../lib/state";
 
-const HELP = `keeper-watchdog [options]
+/** The sitter this watchdog guards — its heartbeat lives under this slug. */
+const SLUG = "performance";
 
-External dead-man for the keeper babysitter. Reads the babysitter's
-heartbeat.json and alarms (notifyctl + botctl) when it goes stale. Standalone:
+const HELP = `babysitter performance — watchdog [options]
+
+External dead-man for the performance sitter. Reads the sitter's
+heartbeat.json and alarms (botctl Telegram, "Keeper" topic) when it goes stale. Standalone:
 reads ONLY the heartbeat file — never opens keeper.db, never talks to keeperd,
-never depends on keeper-watch being up. NOT a 'keeper' subcommand.
+never depends on the sitter being up. NOT a 'keeper' subcommand.
 
 Options:
   --json   Emit the decision as JSON instead of acting on it (no notify)
@@ -45,7 +49,7 @@ Options:
 // Thresholds
 // ---------------------------------------------------------------------------
 
-/** The babysitter's launchd interval (keeper-babysit StartInterval), seconds. */
+/** The sitter's launchd interval (…performance.watch StartInterval), seconds. */
 export const WATCH_INTERVAL_SECS = 300;
 
 /**
@@ -57,24 +61,17 @@ export const WATCH_INTERVAL_SECS = 300;
 export const WATCHDOG_STALE_SECS = Math.max(3 * WATCH_INTERVAL_SECS, 900);
 
 // ---------------------------------------------------------------------------
-// Path resolvers (pure; mirror keeper-watch's resolveSeenStatePath shape)
+// Path resolvers (pure; share the sitter state-dir helper with watch.ts)
 // ---------------------------------------------------------------------------
 
-function watchStateDir(): string {
-  const override = process.env.KEEPER_WATCH_STATE_DIR;
-  return override && override.length > 0
-    ? override
-    : join(homedir(), ".local", "state", "keeper-watch");
-}
-
-/** The babysitter's liveness heartbeat — the ONLY input this watchdog reads. */
+/** The sitter's liveness heartbeat — the ONLY input this watchdog reads. */
 export function resolveHeartbeatPath(): string {
-  return join(watchStateDir(), "heartbeat.json");
+  return join(babysitterStateDir(SLUG), "heartbeat.json");
 }
 
 /** The watchdog's OWN once-a-day all-clear marker (its only persisted state). */
 export function resolveWatchdogDayPath(): string {
-  return join(watchStateDir(), "watchdog.day");
+  return join(babysitterStateDir(SLUG), "watchdog.day");
 }
 
 // ---------------------------------------------------------------------------
@@ -145,7 +142,7 @@ export function decideWatchdog(input: {
       heartbeatTs: null,
       ageSecs: null,
       message:
-        "keeper-watchdog: no heartbeat yet (babysitter not yet ticked) — silent first-run.",
+        "babysitter performance: no heartbeat yet (babysitter not yet ticked) — silent first-run.",
     };
   }
   const ageSecs = input.nowSecs - input.heartbeatTs;
@@ -155,9 +152,9 @@ export function decideWatchdog(input: {
       action: "alarm",
       heartbeatTs: input.heartbeatTs,
       ageSecs,
-      message: `keeper-watchdog: 🚨 babysitter heartbeat STALE — last tick ${mins} min ago (> ${Math.round(
+      message: `babysitter performance: 🚨 sitter heartbeat STALE — last tick ${mins} min ago (> ${Math.round(
         stale / 60,
-      )} min threshold). keeper-watch is dead or hung; it can no longer self-report. Investigate launchctl print gui/$(id -u)/arthack.keeper-babysit.`,
+      )} min threshold). The performance sitter is dead or hung; it can no longer self-report. Investigate launchctl print gui/$(id -u)/arthack.babysitter.performance.watch.`,
     };
   }
   // Fresh heartbeat. Emit a once-a-day all-clear so a silent watchdog never
@@ -169,14 +166,14 @@ export function decideWatchdog(input: {
       action: "all-clear",
       heartbeatTs: input.heartbeatTs,
       ageSecs,
-      message: `keeper-watchdog: ✅ babysitter alive — last heartbeat ${mins} min ago. (Daily all-clear; the dead-man is watching.)`,
+      message: `babysitter performance: ✅ babysitter alive — last heartbeat ${mins} min ago. (Daily all-clear; the dead-man is watching.)`,
     };
   }
   return {
     action: "ok",
     heartbeatTs: input.heartbeatTs,
     ageSecs,
-    message: "keeper-watchdog: heartbeat fresh — ok (silent).",
+    message: "babysitter performance: heartbeat fresh — ok (silent).",
   };
 }
 
@@ -206,45 +203,27 @@ export function writeLastAllClearDay(path: string, day: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Alarm sinks (notifyctl desktop + botctl Telegram) — both best-effort
+// Alarm sink (botctl Telegram, "Keeper" topic) — best-effort, Telegram-only
 // ---------------------------------------------------------------------------
 
-/** The shape the CLI hands its notifiers; injectable for tests. */
+/** The Telegram topic every babysitter routes its pages to. */
+export const KEEPER_TOPIC = "Keeper";
+
+/** The shape the CLI hands its notifier; injectable for tests. */
 export interface NotifyDeps {
-  /** Desktop notification (notifyctl). */
-  notify: (title: string, message: string) => void;
-  /** Chat message (botctl --topic Chat). */
+  /** Chat message (botctl --topic Keeper). The ONLY channel — no desktop notify. */
   chat: (message: string) => void;
 }
 
-/** Production notifiers: shell out to notifyctl + botctl (both on ~/.local/bin). */
+/** Production notifier: shell out to botctl (Telegram only; no notifyctl). */
 export function liveNotifyDeps(): NotifyDeps {
   return {
-    notify: (title, message) => {
-      try {
-        Bun.spawnSync(
-          [
-            "notifyctl",
-            "show-message",
-            "-t",
-            title,
-            "-m",
-            message,
-            "--sound",
-            "Basso",
-          ],
-          { stdout: "ignore", stderr: "ignore" },
-        );
-      } catch {
-        // Best-effort: a missing notifyctl must not crash the dead-man.
-      }
-    },
     chat: (message) => {
       try {
-        Bun.spawnSync(["botctl", "send-message", "--topic", "Chat", message], {
-          stdout: "ignore",
-          stderr: "ignore",
-        });
+        Bun.spawnSync(
+          ["botctl", "send-message", "--topic", KEEPER_TOPIC, message],
+          { stdout: "ignore", stderr: "ignore" },
+        );
       } catch {
         // Best-effort: a missing botctl must not crash the dead-man.
       }
@@ -285,7 +264,6 @@ export function run(deps: RunDeps): WatchdogDecision {
   const decision = decideWatchdog({ nowSecs, heartbeatTs, lastAllClearDay });
 
   if (decision.action === "alarm") {
-    deps.notify.notify("keeper-watchdog: babysitter STALE", decision.message);
     deps.notify.chat(decision.message);
   } else if (decision.action === "all-clear") {
     deps.notify.chat(decision.message);

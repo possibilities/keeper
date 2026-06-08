@@ -3842,7 +3842,7 @@ test("fn-737 attribution: an empty recentFastPaths array is omitted (no empty-ar
 //      a REAL spawned plan-worker for BOTH (a) a pending-repo planctl change
 //      and (b) a no-pending-repo foreign commit, measuring op->snapshot fold
 //      latency and reporting p50/p95. The latency signal mirrors
-//      cli/keeper-watch.ts detectFoldLatency (snapshot.ts - op.ts), measured
+//      babysitters/performance/watch.ts detectFoldLatency (snapshot.ts - op.ts), measured
 //      here as wall-clock from "git commit returned" to "plan-worker emitted
 //      the snapshot for that entity". Re-runnable as the .2 proof harness.
 // ---------------------------------------------------------------------------

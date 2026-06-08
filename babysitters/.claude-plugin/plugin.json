@@ -1,0 +1,6 @@
+{
+  "name": "babysitters",
+  "description": "Read-only safety-triage sitters for keeper and its host — one escalation agent per concern (performance, …)",
+  "version": "1.0.0",
+  "author": { "name": "arthack" }
+}

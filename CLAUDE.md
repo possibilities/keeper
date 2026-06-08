@@ -12,9 +12,16 @@ history: `README.md` `## Architecture` and the `.planctl/` epic specs.
 
 - **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate.
 - **The repo root is the Claude plugin**, loaded via `claude --plugin-dir
-  ~/code/keeper`. Exactly ONE manifest (`./.claude-plugin/plugin.json`) and ONE
-  `./hooks/hooks.json` — never duplicate either, and never restore the retired
-  `~/.claude/plugins/keeper` symlink (double-registers the hook).
+  ~/code/keeper`. The HOOK plugin has exactly ONE manifest
+  (`./.claude-plugin/plugin.json`) and ONE `./hooks/hooks.json` — never duplicate
+  either, and never restore the retired `~/.claude/plugins/keeper` symlink
+  (double-registers the hook). **Carve-out:** `babysitters/.claude-plugin/plugin.json`
+  is a SECOND, deliberate plugin manifest — the agents-only `babysitters` plugin
+  (NO `hooks.json`), loaded out-of-process by each sitter's scanner via its own
+  `--plugin-dir <repo>/babysitters`. It does NOT double-register the hook (no
+  hooks.json) and `--plugin-dir` does not recurse, so the root hook-plugin load
+  never picks it up. The one-manifest rule is about the HOOK plugin; the
+  babysitters plugin is separate and allowed.
 
 ## Design stance
 
@@ -97,21 +104,31 @@ shape because a consumer reads it.
   durable byte-offset → INSERT + offset advance in one `BEGIN IMMEDIATE`). Main
   writes all synthetic events + the `dead_letters` sidecar + the replay path.
   Workers feed the log only via main; they never write the DB themselves.
-- **The babysitter is a pure read-only external scanner.** `cli/keeper-watch.ts`
-  opens `keeper.db` read-only and only observes — no event-log write, no
-  synthetic events, no RPC. Its SECOND read-only input is keeper's own
-  `backstop.ndjson` self-telemetry (read via `KEEPER_BACKSTOP_LOG`), consumed the
-  same no-write/no-RPC way — never a DB write, synthetic event, or RPC. Its own
-  seen-state, the liveness `heartbeat.json` it stamps as the last action on every
-  completed tick, the `backstop-baseline.json` sidecar (per-(backstop,class)
-  `rescues_total` baseline + a rescue-`ts` high-watermark — version-tagged;
-  `BACKSTOP_BASELINE_VERSION` 1→2 silently reseeds every deployed baseline, so a
-  dev inspecting `~/.local/state/keeper-watch/` should expect a fresh file), and
-  the escalation follow-up prompt files live outside the DB
-  under `~/.local/state/keeper-watch/`. A SEPARATE launchd dead-man
-  (`cli/keeper-watchdog.ts`) reads ONLY that heartbeat and pages on staleness; it
-  is standalone (no `keeper.db`, no keeperd, no `keeper-watch` dependency) so it
-  still runs when the thing it watches has died.
+- **The babysitters are pure read-only external scanners.** They live under
+  `babysitters/` — an agents-only Claude-Code plugin, one sitter per concern
+  (today: `performance`; planned: `git-orphans`, `dead-letters`). Each sitter
+  owns `babysitters/<slug>/` code, a `babysitters/agents/<slug>.md` triage agent
+  (addressed `babysitters:<slug>`, spawned with `--plugin-dir <repo>/babysitters`
+  so the keeper hook stays UNLOADED), and a PRIVATE state tree
+  `~/.local/state/babysitters/<slug>/` (resolved via the shared
+  `babysitters/lib/state.ts` `babysitterStateDir(slug)` — `BABYSITTER_STATE_DIR`
+  root override + slug; deliberately NOT a `KEEPER_*` path, so a keeper.db re-fold
+  never observes a sitter's bookkeeping). The performance sitter
+  (`babysitters/performance/watch.ts`) opens `keeper.db` read-only and only
+  observes — no event-log write, no synthetic events, no RPC. Its SECOND
+  read-only input is keeper's own `backstop.ndjson` self-telemetry (read via
+  `KEEPER_BACKSTOP_LOG` — keeper's, NOT a sitter path), consumed the same
+  no-write/no-RPC way. Its seen-state, the liveness `heartbeat.json` it stamps as
+  the last action on every completed tick, the `backstop-baseline.json` sidecar
+  (per-(backstop,class) `rescues_total` baseline + a rescue-`ts` high-watermark —
+  version-tagged; `BACKSTOP_BASELINE_VERSION` 1→2 silently reseeds every deployed
+  baseline, so a dev inspecting `~/.local/state/babysitters/performance/` should
+  expect a fresh file), and the escalation follow-up prompt files all live there,
+  outside the DB. Pages go to Telegram only (`botctl`, the `Keeper` topic) — no
+  desktop notifyctl. A SEPARATE launchd dead-man
+  (`babysitters/performance/watchdog.ts`) reads ONLY that heartbeat and pages on
+  staleness; it is standalone (no `keeper.db`, no keeperd, no scanner dependency)
+  so it still runs when the thing it watches has died.
 
 ## No kernel watchers on keeper's OWN DB
 

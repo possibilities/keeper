@@ -7,18 +7,19 @@
  *     once-a-day all-clear de-dup.
  *  2. The heartbeat read (`readHeartbeatTs`) degrade-don't-throw on
  *     missing/corrupt files.
- *  3. The `run` wiring — alarms fire BOTH sinks on stale, the all-clear writes
- *     the day marker, and first-run / ok stay silent — all with INJECTED
- *     clock + file paths + notifiers (no real notifyctl/botctl, no real clock).
+ *  3. The `run` wiring — an alarm/all-clear fires the chat sink (Telegram only),
+ *     the all-clear writes the day marker, and first-run / ok stay silent — all
+ *     with INJECTED clock + file paths + notifier (no real botctl, no real clock).
  *
- * Sandboxes KEEPER_WATCH_STATE_DIR under a per-test tmpdir.
+ * Sandboxes BABYSITTER_STATE_DIR under a per-test tmpdir (the sitter joins its
+ * "performance" slug onto the root, so stateDir = <root>/performance).
  */
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { writeHeartbeat } from "../cli/keeper-watch";
+import { writeHeartbeat } from "../babysitters/performance/watch";
 import {
   decideWatchdog,
   type NotifyDeps,
@@ -30,7 +31,7 @@ import {
   run,
   utcDay,
   WATCHDOG_STALE_SECS,
-} from "../cli/keeper-watchdog";
+} from "../babysitters/performance/watchdog";
 
 let tmpDir: string;
 let stateDir: string;
@@ -38,14 +39,15 @@ let savedEnv: string | undefined;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-watchdog-"));
-  stateDir = join(tmpDir, "watch-state");
-  savedEnv = process.env.KEEPER_WATCH_STATE_DIR;
-  process.env.KEEPER_WATCH_STATE_DIR = stateDir;
+  const bbRoot = join(tmpDir, "bb-state");
+  stateDir = join(bbRoot, "performance");
+  savedEnv = process.env.BABYSITTER_STATE_DIR;
+  process.env.BABYSITTER_STATE_DIR = bbRoot;
 });
 
 afterEach(() => {
-  if (savedEnv === undefined) delete process.env.KEEPER_WATCH_STATE_DIR;
-  else process.env.KEEPER_WATCH_STATE_DIR = savedEnv;
+  if (savedEnv === undefined) delete process.env.BABYSITTER_STATE_DIR;
+  else process.env.BABYSITTER_STATE_DIR = savedEnv;
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
@@ -54,7 +56,7 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("path resolvers", () => {
-  test("heartbeat + day paths honor KEEPER_WATCH_STATE_DIR", () => {
+  test("heartbeat + day paths honor BABYSITTER_STATE_DIR", () => {
     expect(resolveHeartbeatPath()).toBe(join(stateDir, "heartbeat.json"));
     expect(resolveWatchdogDayPath()).toBe(join(stateDir, "watchdog.day"));
   });
@@ -160,17 +162,13 @@ describe("run", () => {
 
   function captureNotify(): {
     deps: NotifyDeps;
-    notifyCalls: string[];
     chatCalls: string[];
   } {
-    const notifyCalls: string[] = [];
     const chatCalls: string[] = [];
     return {
       deps: {
-        notify: (_t, m) => notifyCalls.push(m),
         chat: (m) => chatCalls.push(m),
       },
-      notifyCalls,
       chatCalls,
     };
   }
@@ -184,31 +182,28 @@ describe("run", () => {
     };
   }
 
-  test("no heartbeat → first-run, NEITHER sink fires", () => {
-    const { deps, notifyCalls, chatCalls } = captureNotify();
+  test("no heartbeat → first-run, the chat sink stays silent", () => {
+    const { deps, chatCalls } = captureNotify();
     const d = run(runDeps(now, deps));
     expect(d.action).toBe("first-run");
-    expect(notifyCalls).toHaveLength(0);
     expect(chatCalls).toHaveLength(0);
   });
 
-  test("stale heartbeat → alarm fires BOTH sinks", () => {
+  test("stale heartbeat → alarm fires the chat sink (Telegram only)", () => {
     writeHeartbeat(join(stateDir, "heartbeat.json"), now - 100000);
-    const { deps, notifyCalls, chatCalls } = captureNotify();
+    const { deps, chatCalls } = captureNotify();
     const d = run(runDeps(now, deps));
     expect(d.action).toBe("alarm");
-    expect(notifyCalls).toHaveLength(1);
     expect(chatCalls).toHaveLength(1);
     // No day marker written on an alarm (only the all-clear writes it).
     expect(existsSync(join(stateDir, "watchdog.day"))).toBe(false);
   });
 
-  test("fresh heartbeat, no prior all-clear → all-clear (chat only) + day marker", () => {
+  test("fresh heartbeat, no prior all-clear → all-clear (chat) + day marker", () => {
     writeHeartbeat(join(stateDir, "heartbeat.json"), now - 60);
-    const { deps, notifyCalls, chatCalls } = captureNotify();
+    const { deps, chatCalls } = captureNotify();
     const d = run(runDeps(now, deps));
     expect(d.action).toBe("all-clear");
-    expect(notifyCalls).toHaveLength(0); // all-clear is a desktop-quiet chat
     expect(chatCalls).toHaveLength(1);
     expect(readLastAllClearDay(join(stateDir, "watchdog.day"))).toBe(
       utcDay(now),
@@ -225,6 +220,5 @@ describe("run", () => {
     const d = run(runDeps(now + 120, second.deps));
     expect(d.action).toBe("ok");
     expect(second.chatCalls).toHaveLength(0);
-    expect(second.notifyCalls).toHaveLength(0);
   });
 });

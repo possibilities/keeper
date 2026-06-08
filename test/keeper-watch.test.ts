@@ -73,7 +73,7 @@ import {
   type TickDeps,
   tick,
   writeHeartbeat,
-} from "../cli/keeper-watch";
+} from "../babysitters/performance/watch";
 import { openDb } from "../src/db";
 
 // ---------------------------------------------------------------------------
@@ -93,15 +93,17 @@ const FIVE_PATHS = [
   "KEEPER_BACKSTOP_LOG",
 ] as const;
 
-// The seen-state dir is the watcher's OWN dir (NOT a KEEPER_* path); its
-// override is sandboxed alongside the five so no test touches the real
-// ~/.local/state/keeper-watch.
-const SANDBOXED_ENV = [...FIVE_PATHS, "KEEPER_WATCH_STATE_DIR"] as const;
+// The sitter's state dir is its OWN tree (NOT a KEEPER_* path); the
+// BABYSITTER_STATE_DIR root override is sandboxed alongside the five so no test
+// touches the real ~/.local/state/babysitters/performance. The sitter joins its
+// "performance" slug onto the root, so seenStateDir = <root>/performance.
+const SANDBOXED_ENV = [...FIVE_PATHS, "BABYSITTER_STATE_DIR"] as const;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-watch-"));
   dbPath = join(tmpDir, "keeper.db");
-  seenStateDir = join(tmpDir, "watch-state");
+  const bbRoot = join(tmpDir, "bb-state");
+  seenStateDir = join(bbRoot, "performance");
   savedEnv = {};
   for (const k of SANDBOXED_ENV) savedEnv[k] = process.env[k];
   process.env.KEEPER_DB = dbPath;
@@ -109,7 +111,7 @@ beforeEach(() => {
   process.env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   process.env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   process.env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
-  process.env.KEEPER_WATCH_STATE_DIR = seenStateDir;
+  process.env.BABYSITTER_STATE_DIR = bbRoot;
 });
 
 afterEach(() => {
@@ -1176,11 +1178,11 @@ describe("detectBackstopTelemetry", () => {
 // ---------------------------------------------------------------------------
 
 describe("backstop-baseline sidecar", () => {
-  test("resolveBackstopBaselinePath honors KEEPER_WATCH_STATE_DIR (its OWN dir)", () => {
+  test("resolveBackstopBaselinePath honors BABYSITTER_STATE_DIR (its OWN dir)", () => {
     const p = resolveBackstopBaselinePath();
     expect(p).toBe(join(seenStateDir, "backstop-baseline.json"));
     // NOT under the keeper DB's dir — segregated from keeper.db.
-    expect(p.startsWith(join(tmpDir, "watch-state"))).toBe(true);
+    expect(p.startsWith(seenStateDir)).toBe(true);
   });
 
   test("save then load round-trips the baseline", () => {
@@ -1435,7 +1437,7 @@ function mkFinding(over: Partial<Finding> & { key: string }): Finding {
 }
 
 describe("resolveSeenStatePath", () => {
-  test("honors KEEPER_WATCH_STATE_DIR and is its OWN dir (not under KEEPER_DB)", () => {
+  test("honors BABYSITTER_STATE_DIR and is its OWN dir (not under KEEPER_DB)", () => {
     const p = resolveSeenStatePath();
     expect(p).toBe(join(seenStateDir, "seen.json"));
     // NOT under the keeper DB's dir — the monitor's bookkeeping is segregated.
@@ -1968,7 +1970,7 @@ describe("tick", () => {
 
 describe("writeHeartbeat / tick liveness heartbeat", () => {
   const seenPath = (): string => join(seenStateDir, "seen.json");
-  // Default heartbeatPath param resolves via KEEPER_WATCH_STATE_DIR (sandboxed
+  // Default heartbeatPath param resolves via BABYSITTER_STATE_DIR (sandboxed
   // to seenStateDir), so the heartbeat lands beside seen.json in the tmpdir.
   const heartbeatPath = (): string => join(seenStateDir, "heartbeat.json");
 
@@ -1995,7 +1997,7 @@ describe("writeHeartbeat / tick liveness heartbeat", () => {
     return raw.ts;
   }
 
-  test("resolveHeartbeatPath honors KEEPER_WATCH_STATE_DIR and is heartbeat.json", () => {
+  test("resolveHeartbeatPath honors BABYSITTER_STATE_DIR and is heartbeat.json", () => {
     expect(resolveHeartbeatPath()).toBe(join(seenStateDir, "heartbeat.json"));
   });
 

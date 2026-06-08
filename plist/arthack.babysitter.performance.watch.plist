@@ -1,17 +1,18 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  LaunchAgent template for the keeper babysitter scanner (keeper-watch).
+  LaunchAgent template for the babysitters PERFORMANCE sitter's scanner
+  (babysitters/performance/watch.ts).
 
   This is a TEMPLATE, not an installed agent: keeper ships no `install` verb.
   See README.md "Install" for the manual symlink + `launchctl bootstrap` steps.
 
-  What it does: every 5 minutes, runs the read-only `keeper-watch --tick`
-  scanner over `keeper.db`, diffs findings against its own seen-state, and
-  escalates genuinely-new failure signatures via the headless babysitter agent.
-  It is a PURE EXTERNAL OBSERVER: opens the DB read-only, never writes it,
-  mints no synthetic events, performs no RPC. `keeper-watch` is its OWN binary,
-  NOT a `keeper` subcommand.
+  What it does: every 5 minutes, runs the read-only `watch.ts --tick` scanner
+  over `keeper.db`, diffs findings against its own seen-state, and escalates
+  genuinely-new failure signatures via the headless `babysitters:performance`
+  triage agent (loaded with `--plugin-dir <repo>/babysitters`). It is a PURE
+  EXTERNAL OBSERVER: opens the DB read-only, never writes it, mints no synthetic
+  events, performs no RPC. Its OWN binary, NOT a `keeper` subcommand.
 
   Paths are hard-coded absolute because launchd does NOT source your shell rc,
   so `bun` cannot be found by name. The values below assume:
@@ -19,12 +20,12 @@
       (Intel Macs: /usr/local/bin/bun — edit ProgramArguments + PATH below)
     - the repo checked out at /Users/mike/code/keeper
     - keeper.db under /Users/mike/.local/state/keeper
-    - babysitter seen-state + logs under /Users/mike/.local/state/keeper-watch
+    - sitter seen-state + logs under /Users/mike/.local/state/babysitters/performance
   Edit these for your own username / arch before bootstrapping.
 
   PATH below MUST include /Users/mike/.local/bin: the escalation path shells out
-  to `notifyctl` + `botctl`, which live there and would otherwise be unfound
-  (launchd inherits no login PATH).
+  to `claude` (and the agent to `botctl`), which live there and would otherwise
+  be unfound (launchd inherits no login PATH).
 
   Periodic via StartInterval (300s), NOT KeepAlive — mixing the two defeats the
   interval (KeepAlive would restart the one-shot scanner immediately). The
@@ -34,26 +35,26 @@
   cleanly if keeper.db is missing, so an early load is harmless.
 
   Install:
-    ln -s "$PWD/plist/arthack.keeper-babysit.plist" ~/Library/LaunchAgents/
-    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.keeper-babysit.plist
+    ln -s "$PWD/plist/arthack.babysitter.performance.watch.plist" ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.babysitter.performance.watch.plist
 
   Uninstall:
-    launchctl bootout gui/$(id -u)/arthack.keeper-babysit
-    rm ~/Library/LaunchAgents/arthack.keeper-babysit.plist
+    launchctl bootout gui/$(id -u)/arthack.babysitter.performance.watch
+    rm ~/Library/LaunchAgents/arthack.babysitter.performance.watch.plist
 
   Failures are observable via:
-    launchctl print gui/$(id -u)/arthack.keeper-babysit
-    /Users/mike/.local/state/keeper-watch/watch.stderr
+    launchctl print gui/$(id -u)/arthack.babysitter.performance.watch
+    /Users/mike/.local/state/babysitters/performance/watch.stderr
 -->
 <plist version="1.0">
 <dict>
 	<key>Label</key>
-	<string>arthack.keeper-babysit</string>
+	<string>arthack.babysitter.performance.watch</string>
 	<key>ProgramArguments</key>
 	<array>
 		<string>/opt/homebrew/bin/bun</string>
 		<string>run</string>
-		<string>/Users/mike/code/keeper/cli/keeper-watch.ts</string>
+		<string>/Users/mike/code/keeper/babysitters/performance/watch.ts</string>
 		<string>--tick</string>
 	</array>
 	<key>EnvironmentVariables</key>
@@ -70,8 +71,8 @@
 	<key>WorkingDirectory</key>
 	<string>/Users/mike/code/keeper</string>
 	<key>StandardOutPath</key>
-	<string>/Users/mike/.local/state/keeper-watch/watch.stdout</string>
+	<string>/Users/mike/.local/state/babysitters/performance/watch.stdout</string>
 	<key>StandardErrorPath</key>
-	<string>/Users/mike/.local/state/keeper-watch/watch.stderr</string>
+	<string>/Users/mike/.local/state/babysitters/performance/watch.stderr</string>
 </dict>
 </plist>

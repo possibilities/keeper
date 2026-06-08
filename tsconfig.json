@@ -16,6 +16,6 @@
     },
     "types": ["bun-types"]
   },
-  "include": ["cli", "src", "test"],
+  "include": ["babysitters", "cli", "src", "test"],
   "exclude": ["node_modules"]
 }
