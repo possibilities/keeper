@@ -20,7 +20,6 @@ from planctl import acks
 from planctl.ids import ID_REGEX, JOB_ID_REGEX, is_epic_id, is_job_id, is_task_id
 from planctl.models import (
     RUNTIME_FIELDS,
-    merge_epic_state,
     merge_task_state,
     normalize_epic,
     normalize_task,
@@ -59,24 +58,16 @@ def expected_worker_cwd(task: dict[str, Any], epic: dict[str, Any], proj: str) -
 
 
 def load_epic(project: ProjectContext, epic_id: str) -> dict:
-    """Load an epic definition with its runtime sidecar merged in.
+    """Load and normalize an epic definition.
 
-    Returns the merged epic dict. Raises ``FileNotFoundError`` if the
+    Returns the normalized epic dict. Raises ``FileNotFoundError`` if the
     epic file is absent or ``json.JSONDecodeError`` on a half-written /
     malformed file. Callers handle the retry/skip decision.
-
-    The only runtime field an epic carries is ``approval`` (fn-732), held in
-    the gitignored ``state/epics/<id>.state.json`` sidecar. ``merge_epic_state``
-    resolves it via the sidecar > def > pending ladder so callers reading the
-    returned dict's ``approval`` always get the canonical value.
+    Does not merge runtime state (epics have no runtime overlay).
     """
-    from planctl.store import LocalFileStateStore
-
     epic_path = project.data_dir / "epics" / f"{epic_id}.json"
     data = json.loads(epic_path.read_text())
-    state_store = LocalFileStateStore(project.state_dir)
-    runtime = state_store.load_epic_runtime(epic_id)
-    return merge_epic_state(data, runtime)
+    return normalize_epic(data)
 
 
 def load_tasks_for_epic(project: ProjectContext, epic_id: str) -> list[dict]:
@@ -145,7 +136,6 @@ __all__ = [
     "load_epic",
     "load_runtime",
     "load_tasks_for_epic",
-    "merge_epic_state",
     "merge_task_state",
     "normalize_epic",
     "normalize_task",

@@ -11,24 +11,16 @@ the enum via ``click.Choice``; the runner re-validates defensively as a
 belt-and-suspenders against hand-built ``SimpleNamespace`` invocations
 (tests, future programmatic callers).
 
-**fn-732: approval lives in the gitignored runtime sidecars, not the def
-files.** The task surface read-modify-writes
-``.planctl/state/tasks/<task_id>.state.json`` (alongside the ``status`` key
-that ``claim``/``block`` own) UNDER ``lock_task`` — load runtime, set only
-``approval`` + ``updated_at``, save — so a concurrent status write is never
-clobbered. The epic surface writes a single-writer
-``.planctl/state/epics/<epic_id>.state.json`` (``{"approval", "updated_at"}``)
-under ``lock_epic``. The tracked def file is no longer touched; ``approve``
-is therefore reclassified runtime-state-only (mirrors ``claim``/``block``):
-it emits a read-only ``planctl_invocation`` payload (NULL ``subject``/
-``files``) so no ``chore(planctl): approve`` commit lands. keeper folds the
-sidecar gate-free. The serializer keeps planctl's standard form:
+Atomic temp+rename in the same directory via ``store.atomic_write_json`` ->
+``planctl._util.atomic_write`` (fsync data, ``os.replace``, fsync parent
+dir). The serializer keeps planctl's standard form:
 ``json.dumps(data, indent=2, sort_keys=True) + "\\n"``.
 
-**Resolution ladder (every reader).** A valid sidecar ``approval`` wins →
-sidecar absent / no key / null falls back to the def-file ``approval`` →
-absent everywhere → ``"pending"``. The def rung is the cutover safety net;
-``merge_task_state`` / ``merge_epic_state`` own the ladder.
+**Round-trip preservation.** Every unknown top-level field on the loaded
+file is carried through unchanged because the runner mutates the in-memory
+dict (``data["approval"] = status``) rather than rebuilding it from a fixed
+schema. ``normalize_epic`` / ``normalize_task`` only ADD defaults; they
+never strip unknown keys. Tested in tests/test_run_approve.py.
 
 NOT in ``VALIDATION_RESTAMP_VERBS`` — approval is human gating state, not
 structural plan content; flipping it must not invalidate the epic's
@@ -38,17 +30,16 @@ structural plan content; flipping it must not invalidate the epic's
 runner refuses to write unless the target is in a clean approvable state:
 
   * Task approve: the merged task state's ``status`` must be ``"done"``.
-    (Task status lives in runtime state under ``.planctl/state/tasks/``;
+    (Task status lives in runtime state under ``.planctl/state/runtime/``;
     we merge def + runtime via ``merge_task_state`` and read the result.)
   * Epic approve: the epic JSON's ``status`` must be ``"done"`` AND every
     embedded task must also have merged ``status == "done"`` AND every
-    embedded task must have merged ``approval == "approved"`` (read via the
-    resolution ladder, not the def field).
+    embedded task must have ``approval == "approved"``.
 
 ``rejected`` and ``pending`` writes are ALWAYS allowed — the gates fire on
 approve only.  External writers (keeperd's ``set_task_approval`` /
 ``set_epic_approval`` RPCs) bypass these gates by design; they write the
-sidecar directly without going through the CLI.
+JSON directly without going through the CLI.
 
 **Cwd-agnostic resolution.** Three-step lookup: ``--project <path>`` →
 cwd → roots discovery. The cwd-first short-circuit keeps the single-repo
@@ -226,10 +217,7 @@ def _gate_epic_approve(epic_id: str, epic_def: dict, ctx, emit_error_fn) -> None
                 f"Cannot approve epic {epic_id}: task {tid} status is "
                 f"{tstatus!r}, must be 'done'"
             )
-        # fn-732: approval lives in the task sidecar — read the MERGED value
-        # (sidecar > def > pending), not the soon-empty def field, or every
-        # epic-approve refuses once def approval is stripped.
-        tapproval = merged.get("approval", "pending") or "pending"
+        tapproval = task_def.get("approval", "pending") or "pending"
         if tapproval != "approved":
             emit_error_fn(
                 f"Cannot approve epic {epic_id}: task {tid} approval is "
@@ -241,7 +229,7 @@ def run(args: SimpleNamespace) -> int:
     from planctl.ids import is_epic_id, is_task_id
     from planctl.models import APPROVAL_STATUSES
     from planctl.output import emit, emit_error
-    from planctl.store import load_json, now_iso
+    from planctl.store import atomic_write_json, load_json, now_iso
 
     epic_id: str = args.epic_id
     task_id: str | None = getattr(args, "task_id", None)
@@ -277,15 +265,11 @@ def run(args: SimpleNamespace) -> int:
     ctx = _resolve_project_for_approve(epic_id, task_id, project)
     data_dir = ctx.data_dir
 
-    from planctl.invocation import build_planctl_invocation_readonly
-    from planctl.store import LocalFileStateStore
-
-    state_store = LocalFileStateStore(ctx.state_dir)
-
     if task_id is not None:
         # Task-level approval. The task_id well-formedness and parent-epic
         # match were validated above (before project resolution); the
         # resolver also guarantees the task JSON exists on disk in ctx.
+        task_path = data_dir / "tasks" / f"{task_id}.json"
 
         # Gate: task approve requires status == done.  Rejected/pending are
         # always allowed (operator can flip a previously-approved task back
@@ -293,27 +277,22 @@ def run(args: SimpleNamespace) -> int:
         if status == "approved":
             _gate_task_approve(task_id, ctx, emit_error)
 
-        # fn-732: approval rides the gitignored task sidecar
-        # (.planctl/state/tasks/<id>.state.json) alongside `status`, NOT the
-        # tracked def file. Two writers share this file (`claim`/`block` write
-        # `status`; `approve` writes `approval`), so the write is a
-        # read-modify-write under `lock_task` — load current runtime, set only
-        # `approval` + `updated_at`, save — never a blind full-object replace,
-        # or a concurrent status write is clobbered.
-        with state_store.lock_task(task_id):
-            runtime = state_store.load_runtime(task_id) or {}
-            runtime["approval"] = status
-            runtime["updated_at"] = now_iso()
-            state_store.save_runtime(task_id, runtime)
+        # Load -> mutate known field -> rewrite. Unknown top-level fields
+        # ride through untouched because we mutate the same dict.
+        task_def = load_json(task_path)
+        task_def["approval"] = status
+        task_def["updated_at"] = now_iso()
+        atomic_write_json(task_path, task_def)
 
-        # fn-732: approve is runtime-state-only (gitignored sidecar) —
-        # reclassified to the `claim`/`block` no-commit class. The readonly
-        # invocation payload carries NULL `subject`/`files` so
-        # `auto_commit_from_invocation` no-ops (no `chore(planctl): approve`
-        # commit). keeper folds the sidecar gate-free.
-        pc = build_planctl_invocation_readonly(
-            "approve", task_id, repo_root=ctx.project_path
-        )
+        # Resolve epic's primary_repo for the invocation envelope's
+        # state_repo routing (multi-repo projects).
+        from planctl.store import load_json_safe
+
+        epic_def = load_json_safe(data_dir / "epics" / f"{epic_id}.json") or {}
+        primary_repo = epic_def.get("primary_repo")
+
+        # fn-629 task .3: route through the central seam. Rewrite of a
+        # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
         emit(
             {
                 "epic_id": epic_id,
@@ -321,7 +300,10 @@ def run(args: SimpleNamespace) -> int:
                 "approval": status,
             },
             text_renderer=_render_human,
-            planctl_invocation=pc,
+            verb="approve",
+            target=task_id,
+            repo_root=ctx.project_path,
+            primary_repo=primary_repo,
         )
         return 0
 
@@ -337,25 +319,22 @@ def run(args: SimpleNamespace) -> int:
     if status == "approved":
         _gate_epic_approve(epic_id, epic_def, ctx, emit_error)
 
-    # fn-732: epic approval rides the NEW gitignored epic sidecar
-    # (.planctl/state/epics/<id>.state.json), single writer. Lock for
-    # symmetry with the task path; the def file is no longer touched.
-    with state_store.lock_epic(epic_id):
-        epic_runtime = state_store.load_epic_runtime(epic_id) or {}
-        epic_runtime["approval"] = status
-        epic_runtime["updated_at"] = now_iso()
-        state_store.save_epic_runtime(epic_id, epic_runtime)
+    epic_def["approval"] = status
+    epic_def["updated_at"] = now_iso()
+    atomic_write_json(epic_path, epic_def)
 
-    # fn-732: runtime-state-only — no auto-commit (see task branch above).
-    pc = build_planctl_invocation_readonly(
-        "approve", epic_id, repo_root=ctx.project_path
-    )
+    primary_repo = epic_def.get("primary_repo")
+    # fn-629 task .3: route through the central seam. Rewrite of a
+    # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     emit(
         {
             "epic_id": epic_id,
             "approval": status,
         },
         text_renderer=_render_human,
-        planctl_invocation=pc,
+        verb="approve",
+        target=epic_id,
+        repo_root=ctx.project_path,
+        primary_repo=primary_repo,
     )
     return 0

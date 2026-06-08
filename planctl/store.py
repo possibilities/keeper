@@ -139,30 +139,15 @@ def read_file_or_stdin(file_arg: str | None) -> str:
 
 
 class LocalFileStateStore:
-    """File-based state store with fcntl locking.
-
-    Backs the gitignored ``.planctl/state/`` sidecars for both tasks
-    (``state/tasks/<task_id>.state.json``) and epics
-    (``state/epics/<epic_id>.state.json``). Task sidecars carry runtime
-    ``status`` (written by ``claim`` / ``block``) AND ``approval`` (written
-    by ``approve``); the two writers share one file, so the ``approve`` write
-    is a read-modify-write under :meth:`lock_task`. Epic sidecars carry only
-    ``approval`` (single writer). Reads never create the file — an absent
-    sidecar yields ``None``, mirroring ``acks.py``'s read-never-creates
-    discipline.
-    """
+    """File-based state store with fcntl locking."""
 
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
         self.tasks_dir = state_dir / "tasks"
-        self.epics_dir = state_dir / "epics"
         self.locks_dir = state_dir / "locks"
 
     def _state_path(self, task_id: str) -> Path:
         return self.tasks_dir / f"{task_id}.state.json"
-
-    def _epic_state_path(self, epic_id: str) -> Path:
-        return self.epics_dir / f"{epic_id}.state.json"
 
     def _lock_path(self, task_id: str) -> Path:
         return self.locks_dir / f"{task_id}.lock"
@@ -185,30 +170,6 @@ class LocalFileStateStore:
         content = json.dumps(data, indent=2, sort_keys=True) + "\n"
         atomic_write(state_path, content)
 
-    def load_epic_runtime(self, epic_id: str) -> dict | None:
-        """Load runtime state for an epic.
-
-        Returns ``None`` when the sidecar is absent or unreadable — the
-        read-never-creates discipline (acks.py): a bare read of a fresh
-        checkout must not splatter a 0-key file into the gitignored state
-        dir. Callers treat ``None`` as "no runtime approval recorded yet".
-        """
-        state_path = self._epic_state_path(epic_id)
-        if not state_path.exists():
-            return None
-        try:
-            with open(state_path, encoding="utf-8") as f:
-                return json.load(f)
-        except (OSError, json.JSONDecodeError):
-            return None
-
-    def save_epic_runtime(self, epic_id: str, data: dict) -> None:
-        """Save runtime state for an epic."""
-        self.epics_dir.mkdir(parents=True, exist_ok=True)
-        state_path = self._epic_state_path(epic_id)
-        content = json.dumps(data, indent=2, sort_keys=True) + "\n"
-        atomic_write(state_path, content)
-
     @contextmanager
     def lock_task(self, task_id: str):
         """Acquire exclusive lock for task operations."""
@@ -216,26 +177,6 @@ class LocalFileStateStore:
 
         self.locks_dir.mkdir(parents=True, exist_ok=True)
         lock_path = self._lock_path(task_id)
-        with open(lock_path, "w") as f:
-            try:
-                fcntl.flock(f, fcntl.LOCK_EX)
-                yield
-            finally:
-                fcntl.flock(f, fcntl.LOCK_UN)
-
-    @contextmanager
-    def lock_epic(self, epic_id: str):
-        """Acquire exclusive lock for epic operations.
-
-        Mirrors :meth:`lock_task` against an ``<epic_id>.lock`` file in the
-        same locks dir. Epic approval has a single writer today, but the
-        lock keeps the write path symmetric with tasks and forward-safe if a
-        second epic-sidecar writer ever appears.
-        """
-        import fcntl
-
-        self.locks_dir.mkdir(parents=True, exist_ok=True)
-        lock_path = self._lock_path(epic_id)
         with open(lock_path, "w") as f:
             try:
                 fcntl.flock(f, fcntl.LOCK_EX)

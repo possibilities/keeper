@@ -1,34 +1,26 @@
-"""Tests for planctl approve — approval gate field + gates + sidecar move.
+"""Tests for planctl approve — approval gate field + gates (fn-592 task .1).
 
 Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
 tests set it explicitly.
 
-fn-732: ``approval`` moved off the tracked def files into the gitignored
-runtime sidecars (``state/tasks/<id>.state.json`` alongside ``status``;
-new ``state/epics/<id>.state.json``). ``approve`` is reclassified
-runtime-state-only — it no longer mutates the def file and lands no commit.
-The resolution ladder (sidecar > def > pending) lives in
-``merge_task_state`` / ``merge_epic_state``.
+Renamed from ``test_set_approval.py`` when the verb was renamed from
+``set-approval`` to ``approve``.  Covers the original four cases plus the
+new approve-gates layered in by task .1:
 
-Covers:
-
-(a) ``approve`` writes the SIDECAR (task: RMW under lock preserving a
-    concurrent ``status``; epic: new sidecar) and the def file carries no
-    approval after.
-(b) Round-trip preserves unknown top-level fields on the def file (which
-    approve no longer touches).
+(a) ``approve`` writes the file atomically and lands the correct status
+    (both epic-level and task-level surfaces).
+(b) Round-trip preserves unknown top-level fields.
 (c) Invalid status enum is rejected at the CLI boundary.
 (d) Approve-gates (fn-592 task .1):
     - Task ``approved`` requires merged ``status == "done"``.
     - Epic ``approved`` requires epic ``status == "done"`` AND every
-      embedded task ``status == "done"`` AND every embedded task merged
-      ``approval == "approved"`` (read via the ladder, not the def field).
+      embedded task ``status == "done"`` AND every embedded task
+      ``approval == "approved"``.
     - ``rejected`` / ``pending`` writes are always allowed.
-(e) ``approve`` is runtime-state-only — no auto-commit.
 
 Also pins the serializer form (indent, key order, trailing newline) so
-keeperd writers can match byte-for-byte, and asserts the verb stays OUT of
-``VALIDATION_RESTAMP_VERBS``.
+keeperd writers can match byte-for-byte, and asserts the new verb name
+stays OUT of ``VALIDATION_RESTAMP_VERBS``.
 """
 
 from __future__ import annotations
@@ -38,7 +30,6 @@ import json
 import os
 from pathlib import Path
 
-import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 from planctl.models import APPROVAL_STATUSES, normalize_epic, normalize_task
@@ -99,36 +90,6 @@ def _read_task(project_path, task_id) -> dict:
     return json.loads(task_path.read_text())
 
 
-def _read_task_sidecar(project_path, task_id) -> dict | None:
-    """Load the gitignored task runtime sidecar, or None if absent (fn-732)."""
-    store = LocalFileStateStore(project_path / ".planctl" / "state")
-    return store.load_runtime(task_id)
-
-
-def _read_epic_sidecar(project_path, epic_id) -> dict | None:
-    """Load the gitignored epic runtime sidecar, or None if absent (fn-732)."""
-    store = LocalFileStateStore(project_path / ".planctl" / "state")
-    return store.load_epic_runtime(epic_id)
-
-
-def _merged_task_approval(project_path, task_id) -> str:
-    """Resolve a task's merged approval via the public ladder (fn-732)."""
-    from planctl.models import merge_task_state
-
-    task_def = _read_task(project_path, task_id)
-    runtime = _read_task_sidecar(project_path, task_id)
-    return merge_task_state(task_def, runtime)["approval"]
-
-
-def _merged_epic_approval(project_path, epic_id) -> str:
-    """Resolve an epic's merged approval via the public ladder (fn-732)."""
-    from planctl.models import merge_epic_state
-
-    epic_def = _read_epic(project_path, epic_id)
-    runtime = _read_epic_sidecar(project_path, epic_id)
-    return merge_epic_state(epic_def, runtime)["approval"]
-
-
 def _make_epic_with_tasks(n_tasks: int = 1):
     from .conftest import seed_epic
 
@@ -180,50 +141,59 @@ def _force_epic_done(project_path: Path, epic_id: str) -> None:
 
 
 def _force_task_approval(project_path: Path, task_id: str, status: str) -> None:
-    """Stamp ``approval`` directly on the task SIDECAR (bypassing the CLI gate).
-
-    fn-732: approval lives in the gitignored runtime sidecar, not the def
-    file, so the epic-gate's merged read resolves it from here.
-    """
-    store = LocalFileStateStore(project_path / ".planctl" / "state")
-    runtime = store.load_runtime(task_id) or {}
-    runtime["approval"] = status
-    runtime["updated_at"] = now_iso()
-    store.save_runtime(task_id, runtime)
+    """Stamp ``approval`` directly on the task JSON (bypassing the CLI gate)."""
+    task_path = project_path / ".planctl" / "tasks" / f"{task_id}.json"
+    data = json.loads(task_path.read_text())
+    data["approval"] = status
+    data["updated_at"] = now_iso()
+    atomic_write_json(task_path, data)
 
 
 # ---------------------------------------------------------------------------
-# fn-732: the "pending" default lives ONLY in the merge step, not normalize_*.
-# normalize must neither default nor strip a def `approval` value.
+# normalize_*: missing field defaults to "pending"
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_epic_does_not_default_approval():
-    """fn-732: normalize_epic no longer injects the "pending" default."""
+def test_normalize_epic_defaults_approval_to_pending():
+    """A legacy epic dict missing `approval` gets the implicit pending default."""
     data = {"id": "fn-1-test", "title": "Test", "status": "open"}
     normalize_epic(data)
-    assert "approval" not in data
+    assert data["approval"] == "pending"
 
 
-def test_normalize_task_does_not_default_approval():
-    """fn-732: normalize_task no longer injects the "pending" default."""
+def test_normalize_task_defaults_approval_to_pending():
+    """A legacy task dict missing `approval` gets the implicit pending default."""
     data = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Test"}
     normalize_task(data)
-    assert "approval" not in data
+    assert data["approval"] == "pending"
 
 
-def test_normalize_epic_preserves_existing_def_approval():
-    """normalize_epic carries a pre-cutover def `approval` through untouched."""
+def test_normalize_epic_preserves_existing_approval():
+    """normalize_epic does not overwrite an explicitly-set approval."""
     data = {"id": "fn-1-t", "title": "X", "status": "open", "approval": "approved"}
     normalize_epic(data)
     assert data["approval"] == "approved"
 
 
-def test_normalize_task_preserves_existing_def_approval():
-    """normalize_task carries a pre-cutover def `approval` through untouched."""
+def test_normalize_task_preserves_existing_approval():
+    """normalize_task does not overwrite an explicitly-set approval."""
     data = {"id": "fn-1-t.1", "epic": "fn-1-t", "title": "X", "approval": "rejected"}
     normalize_task(data)
     assert data["approval"] == "rejected"
+
+
+def test_normalize_epic_coerces_null_to_pending():
+    """A serialized `approval: null` round-trips back to "pending" on read."""
+    data = {"id": "fn-1-t", "title": "X", "status": "open", "approval": None}
+    normalize_epic(data)
+    assert data["approval"] == "pending"
+
+
+def test_normalize_task_coerces_null_to_pending():
+    """A serialized `approval: null` on a task round-trips back to "pending"."""
+    data = {"id": "fn-1-t.1", "epic": "fn-1-t", "title": "X", "approval": None}
+    normalize_task(data)
+    assert data["approval"] == "pending"
 
 
 # ---------------------------------------------------------------------------
@@ -233,47 +203,30 @@ def test_normalize_task_preserves_existing_def_approval():
 # ---------------------------------------------------------------------------
 
 
-def test_approve_epic_writes_sidecar_when_clean(tmp_path, monkeypatch):
-    """`planctl approve <epic_id> approved` writes the epic SIDECAR when gates pass.
-
-    fn-732: the def file is NOT mutated; the new gitignored epic sidecar
-    carries the approval.
-    """
+def test_approve_epic_writes_field_when_clean(tmp_path, monkeypatch):
+    """`planctl approve <epic_id> approved` writes the field when all gates pass."""
     _create_project(tmp_path, monkeypatch)
     epic_id, task_id = _make_epic_with_task()
     _force_task_done(tmp_path, task_id)
     _force_task_approval(tmp_path, task_id, "approved")
     _force_epic_done(tmp_path, epic_id)
 
-    def_before = _read_epic(tmp_path, epic_id)
     code, obj, output = _invoke(["approve", epic_id, "approved"])
     assert code == 0, output
     assert obj is not None
     assert obj.get("epic_id") == epic_id
     assert obj.get("approval") == "approved"
 
-    # Sidecar carries the new value.
-    sidecar = _read_epic_sidecar(tmp_path, epic_id)
-    assert sidecar is not None
-    assert sidecar.get("approval") == "approved"
-    assert sidecar.get("updated_at")
-    # Def file's approval field is unchanged by approve (no def mutation).
-    def_after = _read_epic(tmp_path, epic_id)
-    assert def_after.get("approval") == def_before.get("approval")
-    # Merged read resolves to the sidecar value.
-    assert _merged_epic_approval(tmp_path, epic_id) == "approved"
+    after = _read_epic(tmp_path, epic_id)
+    assert after.get("approval") == "approved"
 
 
-def test_approve_task_writes_sidecar_when_done(tmp_path, monkeypatch):
-    """`planctl approve <epic_id> <task_id> approved` writes the task SIDECAR.
-
-    fn-732: the def file is NOT mutated.
-    """
+def test_approve_task_writes_field_when_done(tmp_path, monkeypatch):
+    """`planctl approve <epic_id> <task_id> approved` writes when task is done."""
     _create_project(tmp_path, monkeypatch)
     epic_id, task_id = _make_epic_with_task()
     _force_task_done(tmp_path, task_id)
 
-    def_before = _read_task(tmp_path, task_id)
     code, obj, output = _invoke(["approve", epic_id, task_id, "approved"])
     assert code == 0, output
     assert obj is not None
@@ -281,71 +234,20 @@ def test_approve_task_writes_sidecar_when_done(tmp_path, monkeypatch):
     assert obj.get("task_id") == task_id
     assert obj.get("approval") == "approved"
 
-    sidecar = _read_task_sidecar(tmp_path, task_id)
-    assert sidecar is not None
-    assert sidecar.get("approval") == "approved"
-    # Def file's approval field is unchanged by approve.
-    def_after = _read_task(tmp_path, task_id)
-    assert def_after.get("approval") == def_before.get("approval")
-    assert _merged_task_approval(tmp_path, task_id) == "approved"
-
-
-def test_approve_task_rmw_preserves_status(tmp_path, monkeypatch):
-    """fn-732: task approve is RMW — it preserves a concurrent `status` write.
-
-    `_force_task_done` writes a full runtime sidecar with `status=done`.
-    The approve write must add `approval` WITHOUT clobbering `status` (or any
-    other key the status writer set).
-    """
-    _create_project(tmp_path, monkeypatch)
-    epic_id, task_id = _make_epic_with_task()
-    _force_task_done(tmp_path, task_id)
-
-    before = _read_task_sidecar(tmp_path, task_id)
-    assert before is not None
-    assert before.get("status") == "done"
-
-    code, _, output = _invoke(["approve", epic_id, task_id, "approved"])
-    assert code == 0, output
-
-    after = _read_task_sidecar(tmp_path, task_id)
-    assert after is not None
-    # approval added …
+    after = _read_task(tmp_path, task_id)
     assert after.get("approval") == "approved"
-    # … and the status writer's fields survived (RMW, not blind replace).
-    assert after.get("status") == "done"
-    assert after.get("assignee") == before.get("assignee")
-    assert after.get("claimed_at") == before.get("claimed_at")
-    assert after.get("evidence") == before.get("evidence")
-
-
-def test_approve_task_creates_sidecar_when_absent(tmp_path, monkeypatch):
-    """fn-732: an unguarded task approve creates the sidecar from scratch.
-
-    A freshly-scaffolded task has no runtime sidecar yet (status defaults to
-    todo). A `rejected` approve must create the sidecar with `approval` and
-    not raise on the absent file (load-or-default to {}).
-    """
-    _create_project(tmp_path, monkeypatch)
-    epic_id, task_id = _make_epic_with_task()
-    assert _read_task_sidecar(tmp_path, task_id) is None
-
-    code, _, output = _invoke(["approve", epic_id, task_id, "rejected"])
-    assert code == 0, output
-    sidecar = _read_task_sidecar(tmp_path, task_id)
-    assert sidecar is not None
-    assert sidecar.get("approval") == "rejected"
 
 
 def test_approve_task_rejected_unguarded(tmp_path, monkeypatch):
     """`approve <epic_id> <task_id> rejected` always succeeds — no done gate."""
     _create_project(tmp_path, monkeypatch)
     epic_id, task_id = _make_epic_with_task()
-    # Task is NOT done — rejected write must still land (on the sidecar).
+    # Task is NOT done — rejected write must still land.
     code, obj, output = _invoke(["approve", epic_id, task_id, "rejected"])
     assert code == 0, output
     assert obj is not None
-    assert _merged_task_approval(tmp_path, task_id) == "rejected"
+    after = _read_task(tmp_path, task_id)
+    assert after.get("approval") == "rejected"
 
 
 def test_approve_overwrites_previous_value(tmp_path, monkeypatch):
@@ -356,18 +258,19 @@ def test_approve_overwrites_previous_value(tmp_path, monkeypatch):
     for status in ("rejected", "pending", "rejected"):
         code, _, output = _invoke(["approve", epic_id, status])
         assert code == 0, output
-        assert _merged_epic_approval(tmp_path, epic_id) == status
+        after = _read_epic(tmp_path, epic_id)
+        assert after.get("approval") == status
 
 
 def test_approve_uses_temp_rename_in_same_dir(tmp_path, monkeypatch):
-    """After approve, no stray .tmp files remain in the state/epics/ dir."""
+    """After approve, no stray .tmp files remain in the epics/ dir."""
     _create_project(tmp_path, monkeypatch)
     epic_id, _ = _make_epic_with_task()
     code, _, output = _invoke(["approve", epic_id, "rejected"])
     assert code == 0, output
 
-    epics_state_dir = tmp_path / ".planctl" / "state" / "epics"
-    stray = list(epics_state_dir.glob("*.tmp")) + list(epics_state_dir.glob("tmp*"))
+    epics_dir = tmp_path / ".planctl" / "epics"
+    stray = list(epics_dir.glob("*.tmp")) + list(epics_dir.glob("tmp*"))
     assert stray == [], f"atomic_write left tmp files behind: {stray}"
 
 
@@ -376,13 +279,13 @@ def test_approve_uses_temp_rename_in_same_dir(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_approve_leaves_def_file_untouched(tmp_path, monkeypatch):
-    """fn-732: approve does NOT rewrite the def file at all.
+def test_round_trip_preserves_unknown_top_level_fields(tmp_path, monkeypatch):
+    """Load -> mutate approval -> rewrite must NOT strip unknown keys.
 
-    The def file is byte-stable across an approve (approval moved to the
-    sidecar), so unknown future keeper fields trivially survive AND the
-    approval the def already carried is unchanged. The merged read picks up
-    the new value from the sidecar.
+    Forward-compat blind spot: keeperd RPCs may write future fields planctl
+    doesn't know about; the next rewrite must round-trip them. Mutating the
+    in-memory dict (rather than rebuilding from a fixed schema) means any
+    key the loader saw goes back out.
     """
     _create_project(tmp_path, monkeypatch)
     epic_id, task_id = _make_epic_with_task()
@@ -393,33 +296,27 @@ def test_approve_leaves_def_file_untouched(tmp_path, monkeypatch):
     epic_data["future_keeper_field"] = {"shape": "nested", "n": 42}
     epic_data["future_scalar"] = "opaque-value"
     epic_path.write_text(json.dumps(epic_data, indent=2, sort_keys=True) + "\n")
-    epic_bytes_before = epic_path.read_bytes()
 
     task_path = tmp_path / ".planctl" / "tasks" / f"{task_id}.json"
     task_data = json.loads(task_path.read_text())
     task_data["future_task_field"] = ["a", "b", "c"]
     task_path.write_text(json.dumps(task_data, indent=2, sort_keys=True) + "\n")
-    task_bytes_before = task_path.read_bytes()
 
-    # Mutate approval through the CLI.  Use unguarded statuses so the fn-592
-    # approve-gates don't fire.
+    # Mutate approval through the CLI; unknown fields must survive.  Use
+    # unguarded statuses so the fn-592 approve-gates don't fire.
     code, _, output = _invoke(["approve", epic_id, "rejected"])
     assert code == 0, output
     code, _, output = _invoke(["approve", epic_id, task_id, "rejected"])
     assert code == 0, output
 
-    # Def files are byte-identical — approve never touched them.
-    assert epic_path.read_bytes() == epic_bytes_before
-    assert task_path.read_bytes() == task_bytes_before
-    # Unknown fields trivially survived.
     epic_after = json.loads(epic_path.read_text())
+    assert epic_after["approval"] == "rejected"
     assert epic_after["future_keeper_field"] == {"shape": "nested", "n": 42}
     assert epic_after["future_scalar"] == "opaque-value"
+
     task_after = json.loads(task_path.read_text())
+    assert task_after["approval"] == "rejected"
     assert task_after["future_task_field"] == ["a", "b", "c"]
-    # Merged reads pick up the sidecar value.
-    assert _merged_epic_approval(tmp_path, epic_id) == "rejected"
-    assert _merged_task_approval(tmp_path, task_id) == "rejected"
 
 
 # ---------------------------------------------------------------------------
@@ -497,7 +394,7 @@ def test_approve_task_rejected_works_when_not_done(tmp_path, monkeypatch):
     for status in ("rejected", "pending"):
         code, _, output = _invoke(["approve", epic_id, task_id, status])
         assert code == 0, output
-        assert _merged_task_approval(tmp_path, task_id) == status
+        assert _read_task(tmp_path, task_id)["approval"] == status
 
 
 def test_approve_epic_refuses_when_epic_not_done(tmp_path, monkeypatch):
@@ -513,7 +410,7 @@ def test_approve_epic_refuses_when_epic_not_done(tmp_path, monkeypatch):
     assert "epic" in output.lower() and (
         "must be 'done'" in output or "status is" in output
     )
-    assert _merged_epic_approval(tmp_path, epic_id) != "approved"
+    assert _read_epic(tmp_path, epic_id).get("approval") != "approved"
 
 
 def test_approve_epic_refuses_when_any_task_not_done(tmp_path, monkeypatch):
@@ -530,21 +427,16 @@ def test_approve_epic_refuses_when_any_task_not_done(tmp_path, monkeypatch):
     code, _, output = _invoke(["approve", epic_id, "approved"])
     assert code != 0, output
     assert t2 in output
-    assert _merged_epic_approval(tmp_path, epic_id) != "approved"
+    assert _read_epic(tmp_path, epic_id).get("approval") != "approved"
 
 
 def test_approve_epic_refuses_when_any_task_not_approved(tmp_path, monkeypatch):
-    """Gate: epic `approved` fails when at least one task isn't approved.
-
-    fn-732: the gate reads each task's MERGED approval (sidecar > def >
-    pending). t1's approval is in its sidecar; t2 is pending (no sidecar
-    approval) — the gate must refuse, proving it reads the merged value.
-    """
+    """Gate: epic `approved` fails when at least one task isn't approved."""
     _create_project(tmp_path, monkeypatch)
     epic_id, task_ids = _make_epic_with_tasks(n_tasks=2)
     t1, t2 = task_ids
 
-    # Both tasks done; only t1 approved (via the sidecar).
+    # Both tasks done; only t1 approved.
     _force_task_done(tmp_path, t1)
     _force_task_done(tmp_path, t2)
     _force_task_approval(tmp_path, t1, "approved")
@@ -555,16 +447,11 @@ def test_approve_epic_refuses_when_any_task_not_approved(tmp_path, monkeypatch):
     assert code != 0, output
     assert t2 in output
     assert "approved" in output.lower()
-    assert _merged_epic_approval(tmp_path, epic_id) != "approved"
+    assert _read_epic(tmp_path, epic_id).get("approval") != "approved"
 
 
 def test_approve_epic_succeeds_when_fully_clean(tmp_path, monkeypatch):
-    """Gate happy path: epic done + every task done + every task approved → success.
-
-    fn-732 keystone: every task's approval is in its SIDECAR (not the def
-    file). The epic gate's merged read must resolve them all to "approved"
-    and let the epic approve land on the epic sidecar.
-    """
+    """Gate happy path: epic done + every task done + every task approved → success."""
     _create_project(tmp_path, monkeypatch)
     epic_id, task_ids = _make_epic_with_tasks(n_tasks=3)
 
@@ -575,7 +462,7 @@ def test_approve_epic_succeeds_when_fully_clean(tmp_path, monkeypatch):
 
     code, _, output = _invoke(["approve", epic_id, "approved"])
     assert code == 0, output
-    assert _merged_epic_approval(tmp_path, epic_id) == "approved"
+    assert _read_epic(tmp_path, epic_id)["approval"] == "approved"
 
 
 def test_approve_epic_rejected_unguarded_across_all_states(tmp_path, monkeypatch):
@@ -588,7 +475,7 @@ def test_approve_epic_rejected_unguarded_across_all_states(tmp_path, monkeypatch
     for status in ("rejected", "pending"):
         code, _, output = _invoke(["approve", epic_id, status])
         assert code == 0, output
-        assert _merged_epic_approval(tmp_path, epic_id) == status
+        assert _read_epic(tmp_path, epic_id)["approval"] == status
 
     # State combo 2: epic done but tasks still mixed — rejected still fine.
     _force_task_done(tmp_path, t1)
@@ -596,7 +483,7 @@ def test_approve_epic_rejected_unguarded_across_all_states(tmp_path, monkeypatch
     for status in ("rejected", "pending"):
         code, _, output = _invoke(["approve", epic_id, status])
         assert code == 0, output
-        assert _merged_epic_approval(tmp_path, epic_id) == status
+        assert _read_epic(tmp_path, epic_id)["approval"] == status
 
     # State combo 3: everything ready for approval — rejected still allowed
     # (operator may want to flip an already-approvable epic into the reject
@@ -607,7 +494,7 @@ def test_approve_epic_rejected_unguarded_across_all_states(tmp_path, monkeypatch
     for status in ("rejected", "pending"):
         code, _, output = _invoke(["approve", epic_id, status])
         assert code == 0, output
-        assert _merged_epic_approval(tmp_path, epic_id) == status
+        assert _read_epic(tmp_path, epic_id)["approval"] == status
 
 
 # ---------------------------------------------------------------------------
@@ -616,22 +503,19 @@ def test_approve_epic_rejected_unguarded_across_all_states(tmp_path, monkeypatch
 
 
 def test_serializer_form_is_indent2_sortkeys_trailing_newline(tmp_path, monkeypatch):
-    """Pin the exact sidecar form so keeperd can match byte-for-byte:
+    """Pin the exact on-disk form so keeperd can match byte-for-byte:
     - indent=2 spaces
     - sort_keys=True (keys lexicographic)
     - trailing newline (single "\\n" after the closing "}")
     - UTF-8 encoding
-
-    fn-732: approval now lands on the gitignored epic sidecar, so pin THAT
-    file's form (the def file is no longer written by approve).
     """
     _create_project(tmp_path, monkeypatch)
     epic_id, _ = _make_epic_with_task()
     code, _, output = _invoke(["approve", epic_id, "rejected"])
     assert code == 0, output
 
-    sidecar_path = tmp_path / ".planctl" / "state" / "epics" / f"{epic_id}.state.json"
-    raw = sidecar_path.read_bytes()
+    epic_path = tmp_path / ".planctl" / "epics" / f"{epic_id}.json"
+    raw = epic_path.read_bytes()
     assert raw.endswith(b"\n"), "missing trailing newline"
     text = raw.decode("utf-8")
     parsed = json.loads(text)
@@ -677,7 +561,7 @@ def test_approval_statuses_constant():
 
 
 def test_approve_envelope_carries_planctl_invocation(tmp_path, monkeypatch):
-    """approve emits a planctl_invocation payload with op=approve."""
+    """Mutating verbs emit a planctl_invocation payload with op=approve."""
     _create_project(tmp_path, monkeypatch)
     epic_id, _ = _make_epic_with_task()
     runner = CliRunner()
@@ -685,149 +569,6 @@ def test_approve_envelope_carries_planctl_invocation(tmp_path, monkeypatch):
     assert result.exit_code == 0, result.output
     assert '"planctl_invocation"' in result.output
     assert '"approve"' in result.output
-
-
-def test_approve_envelope_is_runtime_state_only(tmp_path, monkeypatch):
-    """fn-732: approve is runtime-state-only — NULL subject/files, no commit.
-
-    Mirrors `claim`/`block`: the readonly invocation payload carries NULL
-    `subject`/`files` so `auto_commit_from_invocation` no-ops. Asserts the
-    envelope shape directly (the parsed invocation), the authoritative signal
-    that no `chore(planctl): approve` commit lands.
-    """
-    _create_project(tmp_path, monkeypatch)
-    epic_id, task_id = _make_epic_with_task()
-
-    for args in (
-        ["approve", epic_id, "rejected"],
-        ["approve", epic_id, task_id, "rejected"],
-    ):
-        runner = CliRunner()
-        result = runner.invoke(cli, args, env=_ENV)
-        assert result.exit_code == 0, result.output
-        # Find the planctl_invocation envelope line.
-        pc = None
-        for line in result.output.splitlines():
-            line = line.strip()
-            if line.startswith("{") and "planctl_invocation" in line:
-                with contextlib.suppress(json.JSONDecodeError):
-                    obj = json.loads(line)
-                    if "planctl_invocation" in obj:
-                        pc = obj["planctl_invocation"]
-                        break
-        assert pc is not None, f"no planctl_invocation in output:\n{result.output}"
-        assert pc.get("op") == "approve"
-        assert pc.get("subject") is None, "approve must carry NULL subject (no commit)"
-        assert pc.get("files") is None, "approve must carry NULL files (no commit)"
-
-
-@pytest.mark.real_git
-def test_approve_lands_no_commit(planctl_git_repo):
-    """fn-732 end-to-end: approve mutates only gitignored state, lands no commit.
-
-    Uses the real-git fixture (auto-commit not mocked) so a stray
-    `chore(planctl): approve` commit would show up. After an approve the
-    repo's commit count must be unchanged.
-    """
-    from .conftest import _git_commit_count, seed_epic
-
-    project = planctl_git_repo
-    epic_id, _ = seed_epic(project, title="no-commit", n_tasks=1, env=_ENV)
-    before = _git_commit_count(project)
-
-    code, _, output = _invoke(["approve", epic_id, "rejected"])
-    assert code == 0, output
-
-    after = _git_commit_count(project)
-    assert after == before, (
-        f"approve must not land a commit (runtime-state-only): {before} -> {after}"
-    )
-    # The sidecar carries the value despite no commit.
-    assert _merged_epic_approval(project, epic_id) == "rejected"
-
-
-# ---------------------------------------------------------------------------
-# Resolution ladder — merge_task_state / merge_epic_state (fn-732)
-# ---------------------------------------------------------------------------
-
-
-def test_merge_task_state_approval_ladder():
-    """fn-732: sidecar > def > pending precedence for merged task approval."""
-    from planctl.models import merge_task_state
-
-    base = {"id": "fn-1-x.1", "epic": "fn-1-x", "title": "X"}
-
-    # Rung 1: sidecar wins over def.
-    merged = merge_task_state(
-        {**base, "approval": "rejected"}, {"status": "done", "approval": "approved"}
-    )
-    assert merged["approval"] == "approved"
-
-    # Rung 2: sidecar absent / no approval key → def fallback.
-    merged = merge_task_state({**base, "approval": "rejected"}, {"status": "done"})
-    assert merged["approval"] == "rejected"
-    merged = merge_task_state({**base, "approval": "rejected"}, None)
-    assert merged["approval"] == "rejected"
-
-    # Rung 2b: sidecar approval null → def fallback (not the null).
-    merged = merge_task_state(
-        {**base, "approval": "rejected"}, {"status": "done", "approval": None}
-    )
-    assert merged["approval"] == "rejected"
-
-    # Rung 3: absent everywhere → pending.
-    merged = merge_task_state(base, {"status": "done"})
-    assert merged["approval"] == "pending"
-    merged = merge_task_state(base, None)
-    assert merged["approval"] == "pending"
-
-
-def test_merge_epic_state_approval_ladder():
-    """fn-732: sidecar > def > pending precedence for merged epic approval."""
-    from planctl.models import merge_epic_state
-
-    base = {"id": "fn-1-x", "title": "X", "status": "done"}
-
-    # Rung 1: sidecar wins over def.
-    merged = merge_epic_state(
-        {**base, "approval": "rejected"}, {"approval": "approved"}
-    )
-    assert merged["approval"] == "approved"
-
-    # Rung 2: sidecar absent → def fallback.
-    merged = merge_epic_state({**base, "approval": "rejected"}, None)
-    assert merged["approval"] == "rejected"
-    merged = merge_epic_state({**base, "approval": "rejected"}, {})
-    assert merged["approval"] == "rejected"
-
-    # Rung 3: absent everywhere → pending.
-    merged = merge_epic_state(base, None)
-    assert merged["approval"] == "pending"
-    merged = merge_epic_state(base, {})
-    assert merged["approval"] == "pending"
-
-
-def test_load_epic_merges_sidecar_approval(tmp_path, monkeypatch):
-    """api.load_epic resolves approval via the sidecar ladder (fn-732)."""
-    from planctl import api
-    from planctl.project import ProjectContext
-
-    _create_project(tmp_path, monkeypatch)
-    epic_id, _ = _make_epic_with_task()
-    # No sidecar yet → pending.
-    planctl_dir = tmp_path / ".planctl"
-    ctx = ProjectContext(
-        name=tmp_path.name,
-        data_dir=planctl_dir,
-        state_dir=planctl_dir / "state",
-        project_path=tmp_path,
-    )
-    assert api.load_epic(ctx, epic_id)["approval"] == "pending"
-
-    # Approve via the CLI (writes sidecar) → load_epic reflects it.
-    code, _, output = _invoke(["approve", epic_id, "rejected"])
-    assert code == 0, output
-    assert api.load_epic(ctx, epic_id)["approval"] == "rejected"
 
 
 # ---------------------------------------------------------------------------
@@ -913,8 +654,8 @@ def test_approve_task_from_outside_epic_repo(tmp_path, monkeypatch):
     assert obj.get("task_id") == task_id
     assert obj.get("approval") == "approved"
 
-    # fn-732: approval lands on proj_b's task sidecar, not its def file.
-    assert _merged_task_approval(proj_b, task_id) == "approved"
+    after = _read_task(proj_b, task_id)
+    assert after.get("approval") == "approved"
 
 
 def test_approve_epic_from_outside_epic_repo(tmp_path, monkeypatch):
@@ -937,8 +678,8 @@ def test_approve_epic_from_outside_epic_repo(tmp_path, monkeypatch):
     assert obj.get("epic_id") == epic_id
     assert obj.get("approval") == "approved"
 
-    # fn-732: approval lands on proj_b's epic sidecar, not its def file.
-    assert _merged_epic_approval(proj_b, epic_id) == "approved"
+    after = _read_epic(proj_b, epic_id)
+    assert after.get("approval") == "approved"
 
 
 def test_approve_task_not_found_when_no_project_holds_it(tmp_path, monkeypatch):
