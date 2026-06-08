@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "babysitter self-watchdog heartbeat",
-  "updated_at": "2026-06-07T21:47:29.268895Z"
+  "updated_at": "2026-06-08T00:18:26.864634Z",
+  "worker_done_at": "2026-06-08T00:18:26.864634Z"
 }

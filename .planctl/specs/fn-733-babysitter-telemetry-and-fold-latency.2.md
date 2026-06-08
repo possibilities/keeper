@@ -66,5 +66,5 @@ babysitter, wait, confirm the watchdog pages.
 - [ ] Watchdog decision unit-tested; `bun run lint && typecheck && test:fast` pass
 
 ## Done summary
-
+tick() stamps heartbeat.json atomically as the last action on every completed path (incl. missing-DB); new standalone cli/keeper-watchdog.ts dead-man reads only the heartbeat and alarms via notifyctl+botctl on staleness (>900s) with silent first-run + daily all-clear; arthack.keeper-watchdog.plist mirrors orphanwatch conventions; README + CLAUDE.md updated. Watchdog decision unit-tested; lint/typecheck/test:fast pass.
 ## Evidence
