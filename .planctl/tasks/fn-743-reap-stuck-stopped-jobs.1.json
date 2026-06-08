@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T15:02:02.053920Z",
+  "depends_on": [],
+  "epic": "fn-743-reap-stuck-stopped-jobs",
+  "id": "fn-743-reap-stuck-stopped-jobs.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Diagnose NULL-pid origin and reap terminal stopped rows",
+  "updated_at": "2026-06-08T15:02:02.053920Z"
+}
