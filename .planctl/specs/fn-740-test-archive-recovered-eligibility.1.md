@@ -10,5 +10,5 @@ Finding F2 from fn-739-dead-letter-backlog-drain audit: scripts/archive-recovere
 - [ ] Test: --apply moves eligible file to archive/ subdir
 
 ## Done summary
-
+Added four subprocess-driven tests in test/daemon.test.ts pinning archive-recovered-dead-letters.ts eligibility branches: still-waiting record leaves file in place (allConfirmed gate), recovered-but-no-replayed_event_id excluded, all-torn file (ids.length===0) untouched, and --apply moves a fully-confirmed file to archive/.
 ## Evidence
