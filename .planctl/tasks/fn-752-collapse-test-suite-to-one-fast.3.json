@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-08T21:16:36.725067Z",
+  "depends_on": [
+    "fn-752-collapse-test-suite-to-one-fast.2"
+  ],
+  "epic": "fn-752-collapse-test-suite-to-one-fast",
+  "id": "fn-752-collapse-test-suite-to-one-fast.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Collapse to one parallel tier; drop soak",
+  "updated_at": "2026-06-08T21:16:36.725067Z"
+}
