@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-737-plan-worker-fold-latency-to-seconds",
   "bundles": [],
+  "closer_done_at": "2026-06-08T07:14:46.152620Z",
   "created_at": "2026-06-08T04:06:39.253350Z",
   "depends_on_epics": [
     "fn-736-lock-free-events-writer-via-ndjson"
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Plan-worker fold latency to seconds",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T05:11:25.310043Z"
+  "updated_at": "2026-06-08T07:14:46.152620Z"
 }
