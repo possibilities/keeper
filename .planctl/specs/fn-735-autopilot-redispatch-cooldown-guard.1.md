@@ -64,5 +64,5 @@ Add an in-process per-`verb::id` re-dispatch cooldown to the autopilot worker �
 - [ ] DEPLOY: after merge, restart keeperd via `launchctl kickstart -k gui/$(id -u)/arthack.keeperd` (the running daemon won't pick up the code otherwise); autopilot boots paused — confirm no dup-dispatch on the next unpause.
 
 ## Done summary
-
+Added a fold-lag-immune in-process re-dispatch cooldown to the autopilot reconciler: an in-memory Map<verb::id, unix-seconds> on ReconcileState, stamped at dispatch (before the confirm await, covering ok+indoubt), read as a pure gate at both dispatch sites (above the fn-728 budget gate, not approve-exempt — covers work/close/approve), cleared on launch failure/abort, and swept each cycle. REDISPATCH_COOLDOWN_S=120 in seconds. Supersedes fn-734. README + CLAUDE.md updated; full bun test green (2669 pass).
 ## Evidence

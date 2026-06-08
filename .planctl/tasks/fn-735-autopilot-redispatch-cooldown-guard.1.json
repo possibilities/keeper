@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "In-process per-verb cooldown guard",
-  "updated_at": "2026-06-08T02:58:19.912489Z"
+  "updated_at": "2026-06-08T03:14:50.368885Z",
+  "worker_done_at": "2026-06-08T03:14:50.368885Z"
 }
