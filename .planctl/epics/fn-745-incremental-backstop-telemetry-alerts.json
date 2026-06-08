@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-745-incremental-backstop-telemetry-alerts",
   "bundles": [],
+  "closer_done_at": "2026-06-08T15:19:40.732004Z",
   "created_at": "2026-06-08T15:03:57.740453Z",
   "depends_on_epics": [
     "fn-742-serialize-epic-finalizer-dispatch",
@@ -13,10 +14,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Incremental backstop telemetry alerts",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T15:16:35.827738Z"
+  "updated_at": "2026-06-08T15:19:40.732004Z"
 }
