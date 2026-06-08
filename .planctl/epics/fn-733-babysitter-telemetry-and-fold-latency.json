@@ -1,5 +1,5 @@
 {
-  "approval": "pending",
+  "approval": "approved",
   "branch_name": "fn-733-babysitter-telemetry-and-fold-latency",
   "bundles": [],
   "closer_done_at": "2026-06-08T00:47:22.097871Z",
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T00:47:22.097871Z"
+  "updated_at": "2026-06-08T00:49:13.751047Z"
 }
