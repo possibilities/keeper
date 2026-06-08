@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Per-epic close/approve finalizer serialization",
-  "updated_at": "2026-06-08T15:02:01.647223Z"
+  "updated_at": "2026-06-08T15:31:08.063039Z",
+  "worker_done_at": "2026-06-08T15:31:08.063039Z"
 }

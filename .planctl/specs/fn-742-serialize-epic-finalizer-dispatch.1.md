@@ -52,5 +52,5 @@ the gate is per-epic close↔approve only, never a blanket approve suppression
 - [ ] Tests cover concurrent-finalizer suppression + the no-deadlock case.
 
 ## Done summary
-
+Added an in-memory per-epic finalizer guard on ReconcileState (mirroring fn-735) that serializes close↔approve for the same epic: stamp the epic id at the close-row dispatch before the confirm await, suppress the sibling finalizer in pure reconcile, sweep in driveCycle. Keyed by epic id so one stamp covers both finalizer verbs; scoped to epic finalizers only (isEpicFinalizer flag) so task-level approve backlogs still drain (fn-728 preserved).
 ## Evidence
