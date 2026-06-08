@@ -21,9 +21,13 @@
  * `PRAGMA data_version` bump on keeper's own DB (new jobs row → root-membership
  * may have changed → re-reconcile worktree subscriptions; the attribution
  * join itself runs in the reducer, not here), or (4) a 60s heartbeat
- * safety-net. Each signal feeds a per-root `RescanScheduler` (trailing-
- * debounce + single-flight) so a flurry collapses into one `git status`
- * shell-out. The per-root `lastByRoot` JSON dedupe absorbs no-op snapshots.
+ * safety-net. Signal (3) drives membership reconcile ONLY — it carries no root
+ * attribution, so it never fans a per-root snapshot out (that O(roots) fan-out
+ * was the CPU-flood source removed in this epic); the per-root snapshots come
+ * from the FSEvents signals (1)+(2) feeding a per-root `RescanScheduler`
+ * (trailing-debounce + single-flight, so a flurry collapses into one `git
+ * status` shell-out), with (4) as the slow drop backstop. The per-root
+ * `lastByRoot` JSON dedupe absorbs no-op snapshots.
  *
  * `PRAGMA data_version` polling is the only sanctioned DB change primitive
  * per the CLAUDE.md DO-NOT — it's a sub-ms autocommit counter read, not a
@@ -379,17 +383,6 @@ const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
  * 1.5s sits inside the epic's "≤1 per ~1-2s" bar.
  */
 const GIT_SNAPSHOT_MAX_WAIT_MS = 1500;
-/**
- * Min elapsed between two `data_version`-poll SCHEDULING wakes (epic fn-716).
- * The self-write guard: the worker's own GitSnapshot inserts bump
- * `data_version`, and back-to-back round-trips land within a few ms; gating the
- * re-snapshot scheduling on this floor means a self-write reconciles membership
- * (cheap, idempotent) but does NOT re-arm the scheduler, breaking the
- * self-feeding loop. A genuine foreign change spaced past the floor still
- * schedules; the heartbeat ({@link HEARTBEAT_MS}) is the slow backstop for one
- * that lands inside it with no other trigger.
- */
-const DATA_VERSION_SCHEDULE_FLOOR_MS = 1000;
 const GIT_TIMEOUT_MS = 2000;
 /**
  * Per-root TTL on the watch-membership verdict ({@link probeWatchMembership})
@@ -2008,61 +2001,31 @@ export function semanticSnapshotKey(snapshot: GitSnapshotPayload): string {
 }
 
 /**
- * Pure decision for the `data_version` poll wake (epic fn-716). The pre-fn-716
- * poll re-scheduled EVERY subscribed root on EVERY `data_version` bump — and the
- * worker's own `GitSnapshot` insert bumps `data_version`, so the poll fed itself
- * a snapshot-per-root storm (one of the two flood defects this epic fixes).
+ * Pure decision for the `data_version` poll wake. The `data_version` pragma
+ * signals "SOMETHING committed to keeper.db" with no root attribution — a hook
+ * tool event dirtying repo A bumps the same counter as one dirtying repo B — so
+ * it must only drive an O(1) membership reconcile, NEVER an O(roots) per-root
+ * snapshot fan-out (that fan-out was the CPU-flood source this epic removes).
  *
- * The narrowed wake separates two concerns:
+ * The wake is membership-only: `reconcile` is true on any advance — a foreign
+ * write (a tool event dirtying a repo, a new job row) may have changed which
+ * roots should be watched, and that reconcile is cheap + idempotent. NEVER
+ * gated, so a real foreign change still re-evaluates membership. Per-root
+ * snapshots come SOLELY from the worktree + git-common-dir FSEvents subs (with
+ * the drop-triggered rescan) and the 60s heartbeat backstop — never from this
+ * unattributed poll.
  *
- * - **Membership** (`reconcile`) runs on any advance — a foreign write (a hook
- *   tool event dirtying a repo, a new job row) may have changed which roots
- *   should be watched, and that reconcile is cheap + idempotent. NEVER gated, so
- *   a real foreign dirty-tree change is still observed (acceptance bar #4).
- * - **Real-work scheduling** (re-snapshotting the already-subscribed roots) is
- *   gated on BOTH (a) an actual version advance AND (b) a min-elapsed floor
- *   since the last *scheduling* wake. The floor is the self-write guard: the
- *   worker's own back-to-back GitSnapshot round-trips bump `data_version` within
- *   a few ms of each other, well under the floor, so they reconcile membership
- *   but do NOT re-trigger a snapshot storm. A genuine foreign change spaced past
- *   the floor still schedules.
- *
- * The throttle (`schedulerFor`'s max-wait ceiling) is the second line of
- * defense even when scheduling does fire — but gating here keeps the poll from
- * arming the scheduler on every self-write in the first place.
- *
- * Returns `{ reconcile, schedule, nextScheduleAtMs }`: `reconcile` is true on
- * any advance; `schedule` is true only when also past the floor;
- * `nextScheduleAtMs` is the floor stamp to carry forward (unchanged when we
- * don't schedule, `nowMs` when we do).
+ * Returns `{ reconcile }`: true on any version advance, false otherwise.
  */
 export interface DataVersionWakeDecision {
   reconcile: boolean;
-  schedule: boolean;
-  nextScheduleAtMs: number;
 }
 
 export function decideDataVersionWake(
   curVersion: number,
   lastVersion: number,
-  nowMs: number,
-  lastScheduleAtMs: number,
-  minScheduleElapsedMs: number,
 ): DataVersionWakeDecision {
-  const advanced = curVersion !== lastVersion;
-  if (!advanced) {
-    return {
-      reconcile: false,
-      schedule: false,
-      nextScheduleAtMs: lastScheduleAtMs,
-    };
-  }
-  const pastFloor = nowMs - lastScheduleAtMs >= minScheduleElapsedMs;
-  return {
-    reconcile: true,
-    schedule: pastFloor,
-    nextScheduleAtMs: pastFloor ? nowMs : lastScheduleAtMs,
-  };
+  return { reconcile: curVersion !== lastVersion };
 }
 
 function startWorker(): void {
@@ -2194,18 +2157,13 @@ function startWorker(): void {
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
   let lastDataVersion: number | null = null;
-  /**
-   * Epic fn-716: monotonic-clock stamp of the last data_version-poll SCHEDULING
-   * wake (the min-elapsed floor in {@link decideDataVersionWake}). Seeded to
-   * `-Infinity` so the first real advance after boot always schedules.
-   */
-  let lastDataVersionScheduleAtMs = Number.NEGATIVE_INFINITY;
   let shuttingDown = false;
 
   // ── fn-720 backstop telemetry ──────────────────────────────────────────────
   // `lastFastPathAt` is stamped at every confirmed FAST-path fire (the FSEvents
-  // scheduler debounced emit, the `data_version`-poll re-snapshot); the 60s
-  // heartbeat (the slow backstop) reads it to compute staleness. `null` until
+  // scheduler debounced emit — the only fast-path snapshot source now that the
+  // data_version poll drives membership reconcile only); the 60s heartbeat (the
+  // slow backstop) reads it to compute staleness. `null` until
   // the first fast path fires — the cold-boot sentinel that keeps a giant false
   // staleness off the histogram (buildMissedWakeRecord nulls staleness then).
   // The counters accumulate fires/rescues per (backstop,class) for the
@@ -2411,9 +2369,10 @@ function startWorker(): void {
     // debounce alone re-arms forever under sustained edits and never flushes.
     s = new RescanScheduler(
       () => {
-        // fn-720: a debounced scheduler fire IS the fast path (FSEvents change
-        // or db-poll re-snapshot) — stamp `last_fast_path_at` so a later
-        // heartbeat measures staleness against it. The heartbeat calls
+        // fn-720: a debounced scheduler fire IS the fast path (an FSEvents
+        // worktree/git-dir change, or the drop-triggered rescan) — stamp
+        // `last_fast_path_at` so a later heartbeat measures staleness against
+        // it. The heartbeat calls
         // `emitSnapshot` DIRECTLY (not through the scheduler), so it never
         // stamps — exactly the fast-path/backstop distinction we want.
         markFastPath();
@@ -2783,21 +2742,15 @@ function startWorker(): void {
       // DB-wake trigger. Per CLAUDE.md DO-NOT, `PRAGMA data_version` is the
       // ONLY sanctioned DB change primitive — `wake-worker.ts` uses the same
       // pattern. A bump means SOMETHING committed (new tool event, new job
-      // row, new epic/task snapshot) and the touched-set or root membership
-      // may have changed.
+      // row, new epic/task snapshot) and root membership may have changed.
       //
-      // Epic fn-716 narrowing: the pre-fn-716 poll re-scheduled a re-snapshot
-      // for EVERY subscribed root on EVERY bump — and the worker's own
-      // GitSnapshot insert bumps `data_version`, so the poll fed itself a
-      // snapshot-per-root storm (one of the two flood defects). Now:
-      //   - membership reconcile runs on ANY advance (cheap, idempotent; a
-      //     foreign dirty-tree write may have changed which roots to watch — so
-      //     a real foreign change is never missed), but
-      //   - re-snapshot scheduling is gated on an actual advance PLUS a
-      //     min-elapsed floor ({@link DATA_VERSION_SCHEDULE_FLOOR_MS}) since the
-      //     last scheduling wake — the self-write guard, so the worker's own
-      //     back-to-back round-trips reconcile but don't re-arm the scheduler.
-      // See {@link decideDataVersionWake}.
+      // `data_version` carries NO root attribution, so it drives membership
+      // reconcile ONLY (cheap, O(1), idempotent — a foreign write may have
+      // changed which roots to watch). It does NOT fan a per-root snapshot out:
+      // that O(roots) fan-out was the CPU-flood source this epic removed. Every
+      // per-root snapshot now comes from the worktree + git-common-dir FSEvents
+      // subs (plus the drop-triggered rescan) with the 60s heartbeat as the
+      // single drop backstop. See {@link decideDataVersionWake}.
       const dataVersionQuery = db.query("PRAGMA data_version");
       lastDataVersion = (dataVersionQuery.get() as { data_version: number })
         .data_version;
@@ -2805,22 +2758,10 @@ function startWorker(): void {
         if (shuttingDown) return;
         const cur = (dataVersionQuery.get() as { data_version: number })
           .data_version;
-        const decision = decideDataVersionWake(
-          cur,
-          lastDataVersion ?? cur,
-          performance.now(),
-          lastDataVersionScheduleAtMs,
-          DATA_VERSION_SCHEDULE_FLOOR_MS,
-        );
+        const decision = decideDataVersionWake(cur, lastDataVersion ?? cur);
         if (!decision.reconcile) return;
         lastDataVersion = cur;
         void reconcileRoots();
-        if (decision.schedule) {
-          lastDataVersionScheduleAtMs = decision.nextScheduleAtMs;
-          for (const root of subscriptions.keys()) {
-            schedulerFor(root).schedule();
-          }
-        }
       }, DB_POLL_MS);
 
       // Silent-watcher backstop, mirroring transcript-worker. If a watcher
