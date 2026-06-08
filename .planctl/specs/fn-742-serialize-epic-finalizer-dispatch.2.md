@@ -41,5 +41,5 @@ handles recovering existing/legit rejected epics.)
 - [ ] Approval changes route through the sanctioned write path only.
 
 ## Done summary
-
+Gave a job-rejected epic a clean board exit: reconcile emits a one-shot rejectedClears entry, the cycle glue resets the epic approval to pending via main's sanctioned set_epic_approval handler, gated by an in-memory autoClearedRejections ledger so a genuine rejection can't thrash (one auto-clear per epic per process). In-memory, fold-lag-immune, skipped while paused.
 ## Evidence
