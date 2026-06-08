@@ -7,7 +7,7 @@
     "fn-736-lock-free-events-writer-via-ndjson"
   ],
   "id": "fn-737-plan-worker-fold-latency-to-seconds",
-  "last_validated_at": "2026-06-08T04:43:29.478130Z",
+  "last_validated_at": "2026-06-08T05:11:25.309947Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -16,5 +16,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-08T04:43:29.361456Z"
+  "updated_at": "2026-06-08T05:11:25.310043Z"
 }

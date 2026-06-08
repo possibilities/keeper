@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Diagnose and instrument fold latency",
-  "updated_at": "2026-06-08T04:06:39.253350Z"
+  "updated_at": "2026-06-08T05:11:25.250090Z",
+  "worker_done_at": null
 }
