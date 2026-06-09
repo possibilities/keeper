@@ -47,5 +47,5 @@ Manually parse `key` out of 3-4 real legacy followups and confirm the regex/extr
 - [ ] No change to scanner detection logic or any keeper write path
 
 ## Done summary
-
+Wrote babysitters/FINDINGS-LEDGER.md (home layout, charter sections, processed.jsonl key-primary row schema, verdict enum incl. routed, resurface rule) and enriched performance.md followup heredoc with guarded YAML frontmatter (fingerprint/category/severity/key) declared canonical over the Evidence-fence echo. key-as-primary join verified against 247 live legacy followups (245 key:, 1 finding key:, 1 broken placeholder); fallback re-key plan not needed.
 ## Evidence
