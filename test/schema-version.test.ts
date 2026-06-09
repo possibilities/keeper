@@ -10,11 +10,14 @@
  * CLAUDE.md alone is not enough — this assertion fails the build the moment
  * the daemon's version outruns the reader's whitelist.
  *
- * The whitelist is a hard set (an unrecognized version raises, even one keeper
- * never reads from), but a forward-only schema can only grow, so asserting the
- * frozenset's max covers `SCHEMA_VERSION` is the necessary-and-sufficient
- * guard: it catches the "bumped db.ts, forgot api.py" miss without forbidding
- * keeper-py from dropping ancient floor versions it no longer supports.
+ * The whitelist is a hard set: an unrecognized version raises, even one keeper
+ * never reads from. So the guard is MEMBERSHIP, not max — the live
+ * `SCHEMA_VERSION` must appear IN the frozenset, because that exact version is
+ * what keeper-py will be handed on the host. (fn-762.3 tightened this from a
+ * `max >= SCHEMA_VERSION` check, which a non-contiguous set could satisfy
+ * without actually listing the current version.) keeper-py stays free to drop
+ * ancient floor versions it no longer supports — membership only pins the
+ * current one.
  */
 
 import { expect, test } from "bun:test";
@@ -53,13 +56,13 @@ function readSupportedVersions(): number[] {
     });
 }
 
-test("keeper-py SUPPORTED_SCHEMA_VERSIONS covers the daemon SCHEMA_VERSION", () => {
+test("keeper-py SUPPORTED_SCHEMA_VERSIONS contains the daemon SCHEMA_VERSION", () => {
   const supported = readSupportedVersions();
   expect(supported.length).toBeGreaterThan(0);
-  const max = Math.max(...supported);
   // If this fails: you bumped SCHEMA_VERSION in src/db.ts but did not add the
   // new version to keeper/api.py's SUPPORTED_SCHEMA_VERSIONS frozenset. Add it
   // (and a matching doc-comment line) in the same change — see CLAUDE.md
-  // "Migrations are forward-only".
-  expect(max).toBeGreaterThanOrEqual(SCHEMA_VERSION);
+  // "Migrations are forward-only". Membership (not max): keeper-py is handed
+  // this exact version on the host, and its whitelist is a hard set.
+  expect(supported).toContain(SCHEMA_VERSION);
 });

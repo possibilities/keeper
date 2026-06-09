@@ -2356,6 +2356,22 @@ function migrate(db: Database): void {
       )
     : 0;
 
+  // fn-762.3: runtime downgrade guard. Refuse to run an old binary against a DB
+  // a NEWER keeperd already migrated. Thrown BEFORE the migrate transaction
+  // opens, so no version-guarded ALTER ever runs against a newer schema and the
+  // unconditional meta stamp (`String(SCHEMA_VERSION)`, below) can't silently
+  // regress the stored version. Strictly-greater so a fresh DB (version 0) and
+  // a same-version DB both pass; only a future stamp trips it. The throw
+  // propagates uncaught out of openDb at daemon boot — a hard, loud crash plus a
+  // LaunchAgent restart loop until the operator deploys the newer binary is the
+  // INTENDED behavior (forward-only, mechanized; no fatalExit wrapper, no silent
+  // read-only fallback).
+  if (preMigrateStoredVersion > SCHEMA_VERSION) {
+    throw new Error(
+      `DB schema v${preMigrateStoredVersion} is newer than this binary's v${SCHEMA_VERSION} — deploy the newer keeperd (or restore the matching binary); refusing to run rather than silently downgrade`,
+    );
+  }
+
   // fn-717.2: decide BEFORE the migrate transaction whether the v57→v58
   // `events.data` NOT NULL → nullable rebuild will run, so we can toggle
   // `PRAGMA foreign_keys` AROUND the transaction. The rebuild DROPs the

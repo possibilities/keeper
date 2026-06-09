@@ -73,6 +73,14 @@ shape because a consumer reads it.
 
 - **Forward-only** via `meta(schema_version)`; non-idempotent steps are
   version-guarded. The **daemon is the sole migrator.**
+- **Runtime downgrade guard (fn-762.3).** `migrate()` throws BEFORE its
+  transaction opens when the stored `schema_version` is strictly greater than
+  the binary's `SCHEMA_VERSION` — naming both versions + the remediation — so an
+  old binary refuses to run (and never silently downgrades) a DB a newer keeperd
+  already migrated. The throw propagates uncaught out of `openDb` at boot: a hard
+  crash + LaunchAgent restart loop until the operator deploys the newer binary is
+  intended (no fatalExit wrapper, no read-only fallback). Fresh DB (version 0)
+  and same-version DB both pass.
 - **When you bump `SCHEMA_VERSION`, add the version to `SUPPORTED_SCHEMA_VERSIONS`
   in `keeper/api.py` in the SAME commit** — it's a hard whitelist; an unlisted
   version fails every keeper-py read on the host. `test/schema-version.test.ts`

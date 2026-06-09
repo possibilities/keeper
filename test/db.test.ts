@@ -407,6 +407,41 @@ test("schema_version is stamped in meta", () => {
   db.close();
 });
 
+test("openDb refuses to downgrade a DB stamped newer than this binary (fn-762.3)", () => {
+  // Migrate a current DB, then hand-stamp its meta schema_version one ahead of
+  // the binary — the shape a host left behind after a newer keeperd migrated it.
+  const downgradePath = join(tmpDir, "newer-schema.db");
+  const seeded = openDb(downgradePath);
+  seeded.db
+    .prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'")
+    .run(String(SCHEMA_VERSION + 1));
+  seeded.db.close();
+
+  let error: unknown = null;
+  try {
+    openDb(downgradePath);
+  } catch (err) {
+    error = err;
+  }
+  // The guard throws BEFORE the migrate transaction — a hard, loud crash.
+  expect(error).not.toBeNull();
+  const message = String((error as Error).message ?? error);
+  // Both versions named, plus the remediation, so the operator knows exactly
+  // what to do.
+  expect(message).toContain(`v${SCHEMA_VERSION + 1}`);
+  expect(message).toContain(`v${SCHEMA_VERSION}`);
+  expect(message).toMatch(/refusing to run rather than silently downgrade/);
+
+  // The stamp is unchanged — the guard precedes the unconditional meta stamp,
+  // so the newer version was never regressed to the binary's version.
+  const after = new Database(downgradePath, { readonly: true });
+  const stamp = after
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(stamp.value).toBe(String(SCHEMA_VERSION + 1));
+  after.close();
+});
+
 test("autopilot_state has a NOT NULL mode column defaulting 'yolo'; armed_epics presence table exists (fn-751 v62)", () => {
   const { db } = openDb(":memory:");
   // The `mode` column is NOT NULL with DEFAULT 'yolo' (the zero-event /
