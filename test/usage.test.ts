@@ -6,9 +6,11 @@
  * the id chip + target/multiplier chip, then one indented body line per
  * quota window (session / week / sonnet-where-present). Each body line
  * is `label [bar] pct rel` — a 30-wide ASCII bar (`█`/`░`) followed by
- * the numeric pct and a bare relative reset time. Future times render
- * without an `in ` prefix (`3h 5m` / `5m` / `now`) since the column
- * context makes the direction unambiguous; past times keep `2m ago`.
+ * the numeric pct and a bare relative reset countdown. Future times
+ * render without an `in ` prefix (`3h 5m` / `5m` / `now`) since the
+ * column context makes the direction unambiguous; a reset that has
+ * slipped past (only ever a stale row) collapses to `now`, never a
+ * misleading `<rel> ago` (the forward-only guard).
  *
  * `nowMs` is an explicit parameter so tests can drive deterministic
  * snapshots — the live script passes `Date.now()` from both the
@@ -84,10 +86,13 @@ test("renders the round boundary as 'now'", () => {
   expect(bodyLine(lines, "week")).toMatch(/ now$/);
 });
 
-test("renders past reset times with the 'ago' suffix and spaced units", () => {
-  // Defensive: reset times should be in the future, but a stale
-  // projection or clock skew could surface a past timestamp. Render
-  // it honestly rather than swallowing.
+test("collapses a past reset countdown to 'now', never '<rel> ago'", () => {
+  // A reset cell is a strictly-forward countdown — agentuse always resolves
+  // `*_resets_at` into the future at scrape time, so a past timestamp is a
+  // STALE countdown (envelope didn't refresh past the boundary), not an
+  // elapsed event. The forward-only guard collapses it to "now" rather than
+  // rendering the misleading "<rel> ago" (an age label on an "until" value).
+  // Staleness itself is surfaced separately by the `stale Nm` line.
   const lines = renderRowLines(
     [
       {
@@ -102,8 +107,10 @@ test("renders past reset times with the 'ago' suffix and spaced units", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toMatch(/ 2m ago$/);
-  expect(bodyLine(lines, "week")).toMatch(/ 2h 5m ago$/);
+  expect(bodyLine(lines, "session")).toMatch(/ now$/);
+  expect(bodyLine(lines, "week")).toMatch(/ now$/);
+  expect(bodyLine(lines, "session")).not.toMatch(/ago/);
+  expect(bodyLine(lines, "week")).not.toMatch(/ago/);
 });
 
 test("collapses to days at the day boundary; drops residual minutes", () => {

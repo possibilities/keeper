@@ -60,10 +60,14 @@
  * both subscribe handles (the three-handle teardown).
  *
  * Reset cells render as minute-rounded humanized relative time
- * (`5d 21h`, `3h 5m`, `5m`, `now`, `2h 5m ago`) against the current
- * wall clock — future times drop the `in ` prefix since the column
- * context (a reset countdown) makes the direction unambiguous; past
- * times keep `ago` to flag the inversion. For the live frame in TUI
+ * (`5d 21h`, `3h 5m`, `5m`, `now`) against the current wall clock —
+ * future times drop the `in ` prefix since the column context (a
+ * reset countdown) makes the direction unambiguous. A reset cell is a
+ * strictly-forward countdown (agentuse always resolves `*_resets_at`
+ * into the future at scrape time), so a value that has slipped behind
+ * `now` is a STALE countdown, not an age — it collapses to `now`
+ * (forward-only guard) rather than a misleading `<rel> ago`. For the
+ * live frame in TUI
  * mode a 30s tick re-renders via `liveShell.refreshLive` so the visible
  * countdown ticks forward without growing history or writing sidecars;
  * historical scroll-back keeps each frame's at-capture rendering, so the
@@ -115,8 +119,10 @@ Each profile renders as a stacked block — a header line with the id
 chip + target/multiplier chip, then one indented body line per quota
 window (session, week, and sonnet where present). Each body line
 carries a 30-wide ASCII bar (\`█\` filled / \`░\` empty) followed by
-the numeric pct and a bare relative reset time (\`5d 21h\` / \`1h 16m\`
-/ \`5m\` / \`now\` / \`2m ago\`). A tracked stack carrying a rate-limit
+the numeric pct and a bare relative reset countdown (\`5d 21h\` /
+\`1h 16m\` / \`5m\` / \`now\`; a reset that has slipped past — only ever
+a stale row — collapses to \`now\`, never a misleading \`<rel> ago\`).
+A tracked stack carrying a rate-limit
 annotation (schema v35 / fn-642) gets a colocated \`rate-limited\` line
 under its quota lines; as of schema v41 (fn-651) that line is a
 forward-looking lift countdown — \`rate-limited for <rel>\` when
@@ -163,17 +169,29 @@ function pct(v: unknown): string {
  *
  * Zero residuals collapse: `1w` not `1w 0d`, `1d` not `1d 0h`, `1h`
  * not `1h 0m`. Future times render bare (`<body>`) — the column
- * context (reset countdown) makes direction unambiguous; past times
- * keep the `<body> ago` suffix to flag the inversion.
+ * context (reset countdown) makes direction unambiguous.
+ *
+ * Past times render `<body> ago` by default. `forwardOnly` flips that:
+ * a target already `<= now` collapses to `"now"` instead. The three
+ * quota-reset cells (session / week / sonnet) pass it — agentuse always
+ * resolves `*_resets_at` into the FUTURE at scrape time (it bumps a
+ * past clock time forward a day / a week-time forward a year), so a
+ * reset cell is a strictly-forward countdown and only crosses zero when
+ * the envelope goes stale past the boundary. Rendering that as
+ * "<rel> ago" reads as an age for a value whose meaning is "until
+ * reset"; `now` reads as "reset is due, data hasn't refreshed yet"
+ * (staleness itself is surfaced separately by the `stale Nm` line).
+ * Mirrors the rate-limit line's past-reset guard (fn-651). Age cells
+ * (`error_at`, session-log timestamps) keep the default `ago`.
  *
  * `nowMs` is a parameter (not `Date.now()` baked in) so tests can drive
  * deterministic snapshots AND so the 30s tick can pass a fresh clock
  * read without `renderRowLines` doing any wall-clock IO of its own.
  */
-function relTime(iso: string, nowMs: number): string {
+function relTime(iso: string, nowMs: number, forwardOnly = false): string {
   if (iso === "") return "";
   const target = Date.parse(iso);
-  return relTimeFromMs(target, nowMs, iso);
+  return relTimeFromMs(target, nowMs, iso, forwardOnly);
 }
 
 /**
@@ -207,11 +225,16 @@ function relTimeFromMs(
   targetMs: number,
   nowMs: number,
   fallback: string,
+  forwardOnly = false,
 ): string {
   if (Number.isNaN(targetMs)) return fallback;
   const diffMin = Math.round((targetMs - nowMs) / 60000);
   if (diffMin === 0) return "now";
   const past = diffMin < 0;
+  // Forward-only cells (the quota-reset countdowns) never render an age:
+  // a target already behind `now` is a stale countdown, not an elapsed
+  // event, so collapse it to "now" rather than the misleading "<rel> ago".
+  if (past && forwardOnly) return "now";
   const total = Math.abs(diffMin);
   const days = Math.floor(total / 1440);
   const weeks = Math.floor(days / 7);
@@ -455,13 +478,15 @@ export function renderRowLines(
       status: seg(row.status),
       sBar: bar(row.session_percent),
       sPct: pct(row.session_percent),
-      sReset: relTime(seg(row.session_resets_at), nowMs),
+      sReset: relTime(seg(row.session_resets_at), nowMs, true),
       wBar: bar(row.week_percent),
       wPct: pct(row.week_percent),
-      wReset: relTime(seg(row.week_resets_at), nowMs),
+      wReset: relTime(seg(row.week_resets_at), nowMs, true),
       swBar: hasSonnet ? bar(row.sonnet_week_percent) : null,
       swPct: hasSonnet ? pct(row.sonnet_week_percent) : null,
-      swReset: hasSonnet ? relTime(seg(row.sonnet_week_resets_at), nowMs) : "",
+      swReset: hasSonnet
+        ? relTime(seg(row.sonnet_week_resets_at), nowMs, true)
+        : "",
       rlRel,
       staleRel,
       errContent,
