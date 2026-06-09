@@ -38,5 +38,5 @@ Dry-run the sweep (list what WOULD archive) before moving anything; confirm resu
 - [ ] Marked clearly as the deferred/optional stretch of the epic
 
 ## Done summary
-
+Added opt-in Step 11 retention sweep to /babysit: ledger-driven archive (never delete) of terminally-resolved (fixed/wontfix/landed-elsewhere), non-resurfaced followups into followups/archive/; never touches unprocessed/routed/needs-work/stale/duplicate-of/resurfaced keys; mandatory dry-run before any move; marked as the deferred/optional fn-755 stretch.
 ## Evidence
