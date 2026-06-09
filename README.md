@@ -1050,16 +1050,6 @@ commits only that session's attributed files. The other three are read-only.
   keeper commit-work "test(scope): msg"       # stage → lint → commit → push
   ```
 
-- `find-task-commit.ts` — emit the commit(s) carrying a matching
-  `Task: <id>` trailer as a pretty JSON envelope (planctl consumes this as a
-  fail-loud contract). Pre-filters with `git log --grep -F`, then confirms a
-  real trailer via `git interpret-trailers`. Repo scope derives from the
-  epic's `touched_repos` (or `--repos` override), defaulting to the cwd repo.
-
-  ```sh
-  keeper find-task-commit fn-700-foo.1        # pretty {success, commits:[...]}
-  ```
-
 - `session-state.ts` — emit the current session's git context (branch, head
   sha, porcelain status, recent log) plus its on-hook dirty file list as a
   pretty JSON envelope. Purely informational — no lock, no commit; a DB

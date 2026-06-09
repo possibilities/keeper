@@ -9,8 +9,8 @@
  * Two shape-families existed inline across the suite, reconciled here into one
  * parameterized core:
  *
- *  - **Family A** (id-clearing CLI-spawn — commit-work / find-task-commit /
- *    session-state): clears the ambient `CLAUDE_CODE_SESSION_ID` /
+ *  - **Family A** (id-clearing CLI-spawn — commit-work / session-state):
+ *    clears the ambient `CLAUDE_CODE_SESSION_ID` /
  *    `JOBCTL_SESSION_ID` / `JOBCTL_JOB_ID` so attribution + the Job-Id trailer
  *    are fully test-controlled, and sets the SIX state paths. No zellij var.
  *    Reproduce with `clearAmbientIds: true` (the default).

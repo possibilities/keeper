@@ -31,7 +31,6 @@ export const SUBCOMMANDS = [
   "autopilot",
   "await",
   "commit-work",
-  "find-task-commit",
   "session-state",
   "show-session-files",
 ] as const;
@@ -50,7 +49,6 @@ Subcommands:
   autopilot           Dispatch log viewer
   await               Block until a planctl/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
-  find-task-commit    Find the commit(s) carrying a Task: trailer (JSON)
   session-state       Current session git context + on-hook files (JSON)
   show-session-files  Session's on-hook dirty files grouped by repo (JSON)
 
@@ -133,8 +131,6 @@ export async function main(): Promise<void> {
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
-    "find-task-commit": async (argv) =>
-      (await import("./find-task-commit")).main(argv),
     "session-state": async (argv) =>
       (await import("./session-state")).main(argv),
     "show-session-files": async (argv) =>
