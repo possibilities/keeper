@@ -4,7 +4,7 @@ Replaces the prior ``from promptctl.api import inline_sketch_refs,
 SketchResolutionError`` coupling on planctl's 4 write paths (``scaffold``,
 ``refine-apply``, ``epic set-bundles``, ``task set-bundles``). Calls the
 promptctl CLI verb as a literal ``["promptctl", ...]`` subprocess — the
-exact pattern ``run_claim._render_snippet_context`` already uses for
+exact pattern ``brief._render_snippet_context`` already uses for
 ``promptctl render-spec`` — so planctl carries zero in-repo Python
 dependency on any arthack package and stays extraction-ready.
 

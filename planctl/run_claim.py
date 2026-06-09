@@ -9,16 +9,21 @@ start) into one call:
    well-formed, task exists, target_repo resolves, status/deps gate passes.
    Each failure returns a typed ``{success:false, error:{code,message,details}}``
    envelope and exits 1; nothing is mutated so no audit row lands.
-2. **Compute** all read-only briefing context (task + epic spec markdown, repos,
-   tier, folded-in ``promptctl render-spec`` snippet context) BEFORE the single
-   mutation, so a render failure strands nothing.
+2. **Compute** the brief out-of-band (task + epic spec markdown, repos, tier,
+   folded-in ``promptctl render-spec`` snippet context) via
+   :func:`planctl.brief.assemble_brief` BEFORE the single mutation, so a render
+   failure strands nothing.
 3. **CAS** under ``lock_task``: read-merge-decide-write in one lock. Outcomes:
    ``CLAIMED`` (todo→in_progress), ``ALREADY_MINE`` (same actor, idempotent),
    ``CLAIMED_BY_OTHER`` (error). ``--force`` takes over and bypasses
    ``CLAIMED_BY_OTHER`` / ``TASK_BLOCKED`` / ``DEPS_UNMET`` but never ``TASK_DONE``.
-4. **Emit** the 11-key briefing envelope with the readonly invocation builder —
-   ``claim`` mutates only the gitignored ``.planctl/state/``; no commit-plan seam
-   covers it.
+   On ``CLAIMED`` / ``ALREADY_MINE``, AFTER ``save_runtime``, atomically write
+   the brief to ``<primary_repo>/.planctl/state/briefs/<task_id>.json`` (a
+   write failure leaves the task ``in_progress`` — repair-on-reclaim).
+4. **Emit** the briefing envelope with the readonly invocation builder. The
+   envelope carries a ``brief_ref`` handle (absolute path) instead of inlining
+   the prose; ``claim`` mutates only the gitignored ``.planctl/state/``, so no
+   commit lands.
 
 Resolution is cwd-agnostic (fn-542 task .3): the owning project is found via
 roots discovery (scan the configured ``roots`` for the project whose
@@ -30,7 +35,6 @@ runs from any directory. ``AMBIGUOUS_TASK_ID`` (with candidate paths) and
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -181,49 +185,8 @@ def _resolve_project_for_task(task_id: str, project: str | None):
     )
 
 
-def _render_snippet_context(task_id: str, primary_repo: str) -> str:
-    """Shell ``promptctl render-spec <task_id> --format human`` with cwd=primary_repo.
-
-    Computed BEFORE the CAS so a render failure strands no claim. Empty stdout
-    on exit 0 → ``""``; non-zero exit → ``SNIPPET_RENDER_FAILED`` (no mutation).
-    No ``--session-id`` is passed — dedup-against-seen-set is a worker-render
-    concern, not the briefing fetch.
-    """
-    try:
-        proc = subprocess.run(
-            ["promptctl", "render-spec", task_id, "--format", "human"],
-            cwd=str(Path(primary_repo).resolve()),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        _emit_claim_error(
-            "SNIPPET_RENDER_FAILED",
-            f"failed to shell promptctl render-spec for {task_id}: {exc}",
-        )
-    if proc.returncode != 0:
-        _emit_claim_error(
-            "SNIPPET_RENDER_FAILED",
-            f"promptctl render-spec exited {proc.returncode} for {task_id}",
-            details={"stderr": (proc.stderr or "").strip()},
-        )
-    return proc.stdout
-
-
-def _read_spec_md(data_dir: Path, spec_id: str) -> str:
-    """Read the raw spec markdown for an epic/task id (mirrors run_cat.py).
-
-    Missing spec → empty string (the briefing tolerates a spec-less entity;
-    existence of the task JSON is already gated upstream).
-    """
-    spec_path = data_dir / "specs" / f"{spec_id}.md"
-    if not spec_path.exists():
-        return ""
-    return spec_path.read_text(encoding="utf-8")
-
-
 def run(args: SimpleNamespace) -> int:
+    from planctl.brief import BriefRenderError, assemble_brief, write_brief
     from planctl.ids import epic_id_from_task, is_task_id
     from planctl.invocation import build_planctl_invocation_readonly
     from planctl.models import merge_task_state
@@ -312,13 +275,29 @@ def run(args: SimpleNamespace) -> int:
                     details={"unmet": unmet},
                 )
 
-    # --- Read-only briefing context (computed BEFORE the single mutation) ---
-
-    task_spec_md = _read_spec_md(data_dir, task_id)
-    epic_spec_md = _read_spec_md(data_dir, epic_id)
+    # --- Assemble the brief out-of-band (computed BEFORE the single mutation) ---
+    #
+    # state_repo = epic.primary_repo falling back to repo_root; equals the
+    # computed primary_repo here, but kept distinct from target_repo for
+    # cross-repo epics. render-spec shells with cwd=primary_repo; a render
+    # failure raises BriefRenderError which we translate to the existing
+    # SNIPPET_RENDER_FAILED emit (so a render failure strands no claim).
     tier = task_def.get("tier")
-    # render-spec shells with cwd=primary_repo; non-zero exit aborts pre-CAS.
-    snippet_context = _render_snippet_context(task_id, primary_repo)
+    state_repo = primary_repo
+    try:
+        brief_dict = assemble_brief(
+            task_id=task_id,
+            epic_id=epic_id,
+            target_repo=target_repo,
+            primary_repo=primary_repo,
+            state_repo=state_repo,
+            tier=tier,
+            data_dir=data_dir,
+        )
+    except BriefRenderError as exc:
+        _emit_claim_error(
+            "SNIPPET_RENDER_FAILED", str(exc), details=exc.details or None
+        )
 
     # --- CAS under lock: read-merge-decide-write in one lock ---
 
@@ -377,6 +356,22 @@ def run(args: SimpleNamespace) -> int:
         }
         state_store.save_runtime(task_id, new_state)
 
+        # Write the brief AFTER save_runtime, inside the lock, only on
+        # CLAIMED / ALREADY_MINE (both reach here; CLAIMED_BY_OTHER / TASK_DONE
+        # already errored out). A crash between save_runtime and write_brief
+        # leaves the task in_progress with no brief — acceptable, the next
+        # claim (ALREADY_MINE) or worker resume regenerates it (repair-on-
+        # reclaim). Do NOT unwind the state write. A write failure surfaces as
+        # BRIEF_WRITE_FAILED and likewise leaves the task in_progress.
+        briefs_dir = ctx.state_dir / "briefs"
+        try:
+            brief_ref = str(write_brief(briefs_dir, task_id, brief_dict))
+        except OSError as exc:
+            _emit_claim_error(
+                "BRIEF_WRITE_FAILED",
+                f"failed to write brief for {task_id}: {exc}",
+            )
+
     task_state: dict[str, Any] = {
         "status": "in_progress",
         "assignee": actor,
@@ -400,11 +395,9 @@ def run(args: SimpleNamespace) -> int:
             "target_repo": target_repo,
             "primary_repo": primary_repo,
             "tier": tier,
-            "task_spec_md": task_spec_md,
-            "epic_spec_md": epic_spec_md,
             "task_state": task_state,
             "epic_state": epic_state,
-            "snippet_context": snippet_context,
+            "brief_ref": brief_ref,
         },
         planctl_invocation=pc,
     )

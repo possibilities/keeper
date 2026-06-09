@@ -1,17 +1,18 @@
-"""Tests for ``planctl claim`` (fn-542 task .2).
+"""Tests for ``planctl claim`` (fn-542 task .2; brief-file handoff fn-5 task .1).
 
 Locks the enriched claim verb: typed error envelopes for every precondition,
-the 11-key happy-path briefing envelope, CAS outcomes
-(CLAIMED / ALREADY_MINE / CLAIMED_BY_OTHER), ``--force`` takeover (never over
-TASK_DONE), the folded-in ``render-spec`` snippet context + SNIPPET_RENDER_FAILED,
+the brief-handle happy-path envelope (``brief_ref``, no inline prose), CAS
+outcomes (CLAIMED / ALREADY_MINE / CLAIMED_BY_OTHER), ``--force`` takeover
+(never over TASK_DONE), the out-of-band brief write + SNIPPET_RENDER_FAILED,
 and the no-audit-row-on-failure invariant.
 
 Strategy: drive the real verb in-process via CliRunner against the
 ``planctl_git_repo`` fixture (git init + planctl init, chdir'd). ``PLANCTL_ACTOR``
 env var pins identity so multi-actor CAS outcomes are deterministic. The
 ``render-spec`` shell-out resolves to an empty render (the seeded tasks carry
-no snippets) → ``snippet_context == ""`` on the happy path; SNIPPET_RENDER_FAILED
-is exercised by monkeypatching the subprocess to return a non-zero exit.
+no snippets) → the on-disk brief's ``snippet_context == ""`` on the happy path;
+SNIPPET_RENDER_FAILED is exercised by monkeypatching ``planctl.brief``'s
+subprocess to return a non-zero exit.
 """
 
 from __future__ import annotations
@@ -108,35 +109,118 @@ def _has_invocation_line(output: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Happy path: 11-key briefing envelope
+# Happy path: brief-handle briefing envelope + on-disk brief file
 # ---------------------------------------------------------------------------
 
 
 def test_claim_happy_path_envelope(planctl_git_repo):
+    from pathlib import Path
+
     epic_id, task_id = _make_epic_with_task()
 
     r = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
     assert r.exit_code == 0, r.output
     payload = _first_line_json(r.output)
 
-    # 11 keys: success + 9 briefing fields + planctl_invocation.
+    # Envelope carries a brief_ref handle, NOT the inlined prose fields.
     assert payload["success"] is True
     assert payload["task_id"] == task_id
     assert payload["epic_id"] == epic_id
     assert payload["target_repo"]  # resolved, non-empty
     assert payload["primary_repo"]
     assert "tier" in payload  # may be None when unset
-    assert "task_spec_md" in payload
-    assert "epic_spec_md" in payload
     assert payload["task_state"]["status"] == "in_progress"
     assert payload["task_state"]["assignee"] == "alice@example.com"
     assert payload["task_state"]["outcome"] == "CLAIMED"
     assert payload["epic_state"]["id"] == epic_id
-    # No snippets seeded → empty render.
-    assert payload["snippet_context"] == ""
+
+    # The three prose fields are GONE from the envelope.
+    assert "task_spec_md" not in payload
+    assert "epic_spec_md" not in payload
+    assert "snippet_context" not in payload
+
+    # brief_ref is present and absolute, pointing at state/briefs/<task_id>.json.
+    brief_ref = payload["brief_ref"]
+    assert brief_ref
+    brief_path = Path(brief_ref)
+    assert brief_path.is_absolute()
+    assert brief_path.name == f"{task_id}.json"
+    assert brief_path.parent.name == "briefs"
+    assert brief_path.exists()
+
+    # The on-disk brief parses with the full schema.
+    brief = json.loads(brief_path.read_text(encoding="utf-8"))
+    assert brief["schema_version"] == 1
+    assert isinstance(brief["schema_version"], int)
+    assert brief["generated_at"]
+    assert brief["task_id"] == task_id
+    assert brief["epic_id"] == epic_id
+    assert brief["target_repo"] == payload["target_repo"]
+    assert brief["primary_repo"] == payload["primary_repo"]
+    # state_repo = epic.primary_repo falling back to repo_root.
+    assert brief["state_repo"] == payload["primary_repo"]
+    assert "tier" in brief
+    assert "task_spec_md" in brief
+    assert "epic_spec_md" in brief
+    # No snippets seeded → empty render, present as "" (not omitted).
+    assert brief["snippet_context"] == ""
+
+    # claim stays readonly — NULL subject/files, no commit.
     assert payload["planctl_invocation"]["op"] == "claim"
     assert payload["planctl_invocation"]["subject"] is None
     assert payload["planctl_invocation"]["files"] is None
+
+
+def test_claim_brief_file_is_gitignored(planctl_git_repo):
+    """The brief lands under gitignored state/ — git never sees it as tracked."""
+    from pathlib import Path
+
+    _epic_id, task_id = _make_epic_with_task()
+    r = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
+    assert r.exit_code == 0, r.output
+    brief_path = Path(_first_line_json(r.output)["brief_ref"])
+    assert brief_path.exists()
+
+    # `git status --porcelain` of the brief path returns nothing → ignored.
+    status = subprocess.run(
+        ["git", "status", "--porcelain", "--", str(brief_path)],
+        cwd=str(planctl_git_repo),
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    assert status.stdout.strip() == "", status.stdout
+    # And git agrees it is ignored.
+    ignored = subprocess.run(
+        ["git", "check-ignore", str(brief_path)],
+        cwd=str(planctl_git_repo),
+        capture_output=True,
+        text=True,
+    )
+    assert ignored.returncode == 0, "brief path should be gitignored"
+
+
+def test_claim_already_mine_regenerates_brief(planctl_git_repo):
+    """An ALREADY_MINE re-claim re-writes the brief (repair-on-reclaim)."""
+    from pathlib import Path
+
+    env = {"PLANCTL_ACTOR": "alice@example.com"}
+    _epic_id, task_id = _make_epic_with_task()
+
+    r1 = _invoke(["claim", task_id], env=env)
+    assert r1.exit_code == 0, r1.output
+    brief_path = Path(_first_line_json(r1.output)["brief_ref"])
+    # Delete the brief to simulate a missing/corrupt cache.
+    brief_path.unlink()
+    assert not brief_path.exists()
+
+    r2 = _invoke(["claim", task_id], env=env)
+    assert r2.exit_code == 0, r2.output
+    payload2 = _first_line_json(r2.output)
+    assert payload2["task_state"]["outcome"] == "ALREADY_MINE"
+    # Brief regenerated by the idempotent re-claim.
+    assert brief_path.exists()
+    assert payload2["brief_ref"] == str(brief_path)
 
 
 # ---------------------------------------------------------------------------
@@ -312,6 +396,8 @@ def test_claim_force_takeover(planctl_git_repo):
 
 
 def test_claim_snippet_render_failed(planctl_git_repo, monkeypatch):
+    from pathlib import Path
+
     _epic_id, task_id = _make_epic_with_task()
 
     real_run = subprocess.run
@@ -323,7 +409,8 @@ def test_claim_snippet_render_failed(planctl_git_repo, monkeypatch):
             )
         return real_run(cmd, *args, **kwargs)
 
-    monkeypatch.setattr("planctl.run_claim.subprocess.run", _fake_run)
+    # The render now lives in planctl.brief; monkeypatch its subprocess.
+    monkeypatch.setattr("planctl.brief.subprocess.run", _fake_run)
 
     r = _invoke(["claim", task_id])
     assert r.exit_code == 1, r.output
@@ -332,14 +419,63 @@ def test_claim_snippet_render_failed(planctl_git_repo, monkeypatch):
     # No mutation happened — task stays todo, no audit row.
     assert not _has_invocation_line(r.output)
 
+    # The brief is assembled BEFORE the CAS: a render failure aborts before any
+    # brief file is written.
+    brief_path = (
+        Path(planctl_git_repo) / ".planctl" / "state" / "briefs" / f"{task_id}.json"
+    )
+    assert not brief_path.exists()
+
     # Render failure aborts BEFORE the CAS: the task is still todo, so a
     # subsequent (un-patched) claim transitions todo→in_progress (CLAIMED),
     # not ALREADY_MINE.
-    monkeypatch.setattr("planctl.run_claim.subprocess.run", real_run)
+    monkeypatch.setattr("planctl.brief.subprocess.run", real_run)
     r2 = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
     assert r2.exit_code == 0, r2.output
     payload2 = _first_line_json(r2.output)
     assert payload2["task_state"]["outcome"] == "CLAIMED"
+
+
+def test_claim_brief_write_failed_leaves_in_progress(planctl_git_repo, monkeypatch):
+    """A brief-write failure surfaces BRIEF_WRITE_FAILED but leaves task in_progress.
+
+    The brief write happens AFTER save_runtime inside the lock; a failure there
+    must NOT unwind the state write (repair-on-reclaim).
+    """
+    from pathlib import Path
+
+    _epic_id, task_id = _make_epic_with_task()
+
+    real_write = __import__("planctl.brief", fromlist=["write_brief"]).write_brief
+
+    def _boom(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    # Patch only the brief writer (not the autouse roots config); undo by
+    # restoring the real callable so the follow-up claim still resolves roots.
+    monkeypatch.setattr("planctl.brief.write_brief", _boom)
+
+    r = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
+    assert r.exit_code == 1, r.output
+    payload = _first_line_json(r.output)
+    assert payload["error"]["code"] == "BRIEF_WRITE_FAILED"
+
+    # save_runtime already landed inside the lock before the write failed — the
+    # state write is NOT unwound. No brief file exists yet.
+    brief_path = (
+        Path(planctl_git_repo) / ".planctl" / "state" / "briefs" / f"{task_id}.json"
+    )
+    assert not brief_path.exists()
+
+    # Re-claim with the real writer: ALREADY_MINE confirms the task stayed
+    # in_progress (owned by alice) and the brief regenerates (repair-on-reclaim).
+    monkeypatch.setattr("planctl.brief.write_brief", real_write)
+    r2 = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
+    assert r2.exit_code == 0, r2.output
+    payload2 = _first_line_json(r2.output)
+    assert payload2["task_state"]["status"] == "in_progress"
+    assert payload2["task_state"]["outcome"] == "ALREADY_MINE"
+    assert brief_path.exists()
 
 
 # ---------------------------------------------------------------------------
