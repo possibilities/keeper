@@ -22,5 +22,5 @@ and `touched_repos`.
 - [ ] All existing reconcile tests continue to pass
 
 ## Done summary
-
+Added two cross-repo reconcile tests: target_repo != state_repo source scan producing a done verdict attributed to target_repo, and dedup of a repo reachable via both target_repo and touched_repos.
 ## Evidence

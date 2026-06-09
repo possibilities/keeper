@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "medium",
   "title": "test multi-repo source scan in reconcile",
-  "updated_at": "2026-06-09T20:09:31.952800Z"
+  "updated_at": "2026-06-09T22:17:16.572082Z",
+  "worker_done_at": "2026-06-09T22:17:16.572082Z"
 }
