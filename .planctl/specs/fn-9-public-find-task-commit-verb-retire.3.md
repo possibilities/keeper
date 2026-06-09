@@ -46,5 +46,5 @@ Run keeper's own lint + typecheck + full test suite (not planctl's). `grep -rn "
 - [ ] keeper's own lint/typecheck/test matrix green; `grep -rn "find-task-commit" ../keeper` returns nothing
 
 ## Done summary
-
+Deleted keeper's redundant find-task-commit verb, its test, and the dead src/commit-work/trailers.ts module; de-registered from keeper.ts SUBCOMMANDS/USAGE/dispatch and dropped all test/README/sandbox-env refs. parseTaskTrailers (derivers.ts) survives. Keeper lint/typecheck/test matrix green; zero find-task-commit refs remain in keeper.
 ## Evidence
