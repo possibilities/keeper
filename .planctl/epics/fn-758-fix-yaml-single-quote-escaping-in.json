@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-758-fix-yaml-single-quote-escaping-in",
+  "bundles": [],
+  "created_at": "2026-06-09T18:19:01.222911Z",
+  "depends_on_epics": [
+    "fn-755-babysitter-findings-triage-workflow"
+  ],
+  "id": "fn-758-fix-yaml-single-quote-escaping-in",
+  "last_validated_at": "2026-06-09T18:19:01.528862Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "fix YAML single-quote escaping in babysit worker",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-09T18:19:01.222911Z"
+}

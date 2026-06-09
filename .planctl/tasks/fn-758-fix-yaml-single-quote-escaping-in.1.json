@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T18:19:01.222911Z",
+  "depends_on": [],
+  "epic": "fn-758-fix-yaml-single-quote-escaping-in",
+  "id": "fn-758-fix-yaml-single-quote-escaping-in.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "fix yq() YAML escaping in performance.md",
+  "updated_at": "2026-06-09T18:19:01.222911Z"
+}
