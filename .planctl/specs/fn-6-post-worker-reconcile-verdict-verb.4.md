@@ -36,5 +36,5 @@ No code tests. Verify the mermaid still parses; grep for accidental "used to"/"f
 - [ ] All edits present-tense; no backward-facing tombstones.
 
 ## Done summary
-
+Synced human-facing docs to the reconcile verb + consolidated post-worker flow: CLAUDE.md/AGENTS.md read-only verb list + reconcile bullet + worker-contract/recovery paragraphs, commit-at-mutation-boundary.md §3/§9/§13, README command map, and the workflow mermaid (verify→reconcile, quality node removed, reads-cli_layer edge, verdict=done→ship). All present-tense, no tombstones.
 ## Evidence
