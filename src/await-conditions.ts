@@ -72,8 +72,8 @@
  * `met` for `complete` is presence-driven on epics (the spec's "pops off
  * the board" semantics) — the epic disappearing from the default-visible
  * scope is the signal, NOT an explicit `status` value. For tasks `met`
- * reads raw fields directly: `worker_phase === "done" && approval ===
- * "approved"`.
+ * reads the raw field directly: `worker_phase === "done"` (fn-756 — the
+ * approval enum no longer gates completion).
  */
 
 import type { MonitorEntry } from "./derivers";
@@ -417,8 +417,8 @@ export interface AwaitInputs {
  *       disambiguates that from a real deletion.)
  *
  *   - Target present in `inputs.epics`:
- *       condition='complete'  → read raw fields:
- *           task: `worker_phase==='done' && approval==='approved'`
+ *       condition='complete'  → read the raw field:
+ *           task: `worker_phase==='done'` (fn-756 — no approval gate)
  *           epic: never `met` on the present branch (an epic that's
  *                 truly complete has popped off the board scope — see
  *                 absent branch above). If the epic is still on the
@@ -453,12 +453,14 @@ function evaluateTaskAwait(
   }
   if (target.condition === "complete") {
     const { task } = hit;
-    if (task.worker_phase === "done" && task.approval === "approved") {
-      return { kind: "met", detail: "task complete (done + approved)" };
+    // fn-756: completion is the worker-done signal alone; the approval enum
+    // no longer gates.
+    if (task.worker_phase === "done") {
+      return { kind: "met", detail: "task complete (worker done)" };
     }
     return {
       kind: "waiting",
-      detail: `task not complete (worker_phase=${task.worker_phase ?? "null"} approval=${task.approval})`,
+      detail: `task not complete (worker_phase=${task.worker_phase ?? "null"})`,
     };
   }
   // unblocked

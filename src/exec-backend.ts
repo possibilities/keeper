@@ -668,13 +668,15 @@ export function collectPanesFromListJson(payload: unknown): ZellijPane[] {
 }
 
 /**
- * Verb-prefixed dispatch-key matcher: `work::<id>` / `approve::<id>` /
- * `close::<id>` — the `--name` the reconciler bakes into the worker argv
- * (`claude … --name work::fn-1-x.1 …`) and the autopilot dedup key. The
+ * Verb-prefixed dispatch-key matcher: `work::<id>` / `close::<id>` — the
+ * `--name` the reconciler bakes into the worker argv (`claude … --name
+ * work::fn-1-x.1 …`) and the autopilot dedup key. fn-756 dropped `approve`
+ * along with the verb, so an `approve::` pane is never minted (and a stale
+ * one from before the deploy is left for the human, not name-matched). The
  * id run stops at the first whitespace / quote so the surrounding shell
  * argv (`… --name work::id --plugin-dir …`) peels cleanly.
  */
-const DISPATCH_KEY_RE = /(work|approve|close)::([^\s'"]+)/;
+const DISPATCH_KEY_RE = /(work|close)::([^\s'"]+)/;
 
 /**
  * Lift the `verb::id` dispatch key off a pane, or `null` when none is
@@ -684,7 +686,7 @@ const DISPATCH_KEY_RE = /(work|approve|close)::([^\s'"]+)/;
  * lives ONLY in the pane's `terminal_command` (the `claude --name
  * verb::id` arg). We scan `tab_name` FIRST (so a future named-tab launch
  * path still matches) then fall back to `terminal_command`, returning
- * the first `(work|approve|close)::<id>` token found. The match is the
+ * the first `(work|close)::<id>` token found. The match is the
  * reap CANDIDATE filter only — the safety gate is the caller's open-
  * `pending_dispatches` intersect, never the name alone (list-panes lags
  * zellij reality, so a name match on a live worker MUST NOT authorize a
@@ -865,7 +867,7 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
    * when absent/EXITED, color-capable env on the mint spawn, ~50ms poll
    * up to 5s. A freshly-minted session KEEPS its empty default `Tab #1`
    * as a permanent keepalive ANCHOR — it is NOT reaped — so the fn-727
-   * completion-reap (which only matches `(work|approve|close)::<id>`
+   * completion-reap (which only matches `(work|close)::<id>`
    * dispatch-key panes) can never empty the session to zero tabs and
    * collapse it into a re-mint loop. NEVER throws — every failure mode
    * (binary missing, mint timeout) degrades to a noteLine warn, and the

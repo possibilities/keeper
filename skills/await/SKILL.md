@@ -125,9 +125,9 @@ Refuse to wire Monitor in any of these cases — the event will never fire:
 - **Nonexistent** — `planctl show` exits non-zero or returns `success:
   false`. Tell the user the id doesn't exist; ask them to double-check.
 - **Already complete** (for `condition=complete`):
-  - Task: `task.runtime_status == "done"` AND `task.approval ==
-    "approved"`.
-  - Epic: `epic.status == "closed"` AND `epic.approval == "approved"`.
+  - Task: `task.runtime_status == "done"` (fn-756 — completion is the
+    worker-done signal alone; no approval gate).
+  - Epic: `epic.status == "closed"`.
   Tell the user the target has already popped off the board — there's
   nothing to await — and offer to just run the follow-up now.
 

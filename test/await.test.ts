@@ -1050,16 +1050,29 @@ test("stuck default: armed but no terminal — keep waiting", async () => {
   }
   sock.takeOutbound();
 
-  // Task rejected → stuck reason kind. Epic approval=approved so the
-  // task itself reaches the predicate that fires `job-rejected`.
-  const taskRejected = makeTaskRow({ approval: "rejected" });
+  // fn-756: the `job-rejected` stuck path is gone with the approval enum. The
+  // surviving human-only-recoverable terminal blocker is `dep-on-epic-dangling`
+  // — a task whose epic points at an unresolvable upstream.
+  const task = makeTaskRow({});
   deliverFiveWithEpic(
     sock,
     idPrefix,
-    makeEpicRow({ approval: "approved", tasks: [taskRejected] }),
+    makeEpicRow({
+      tasks: [task],
+      depends_on_epics: ["fn-99-ghost"],
+      resolved_epic_deps: [
+        {
+          dep_token: "fn-99-ghost",
+          resolved_epic_id: null,
+          cross_project: false,
+          project_basename: null,
+          state: "dangling",
+        },
+      ],
+    }),
   );
 
-  // Armed line emitted; no terminal.
+  // Armed line emitted; no terminal (stuck stays waiting without --fail-on-stuck).
   expect(h.stdout[0]).toContain("armed");
   expect(h.exitCode).toBeNull();
   // Only the armed line on stdout.
@@ -1082,11 +1095,25 @@ test("--fail-on-stuck: stuck verdict → failed reason=stuck exit 5", async () =
   }
   sock.takeOutbound();
 
-  const taskRejected = makeTaskRow({ approval: "rejected" });
+  // fn-756: stuck via `dep-on-epic-dangling` (the surviving terminal blocker)
+  // rather than the removed `job-rejected` path.
+  const task = makeTaskRow({});
   deliverFiveWithEpic(
     sock,
     idPrefix,
-    makeEpicRow({ approval: "approved", tasks: [taskRejected] }),
+    makeEpicRow({
+      tasks: [task],
+      depends_on_epics: ["fn-99-ghost"],
+      resolved_epic_deps: [
+        {
+          dep_token: "fn-99-ghost",
+          resolved_epic_id: null,
+          cross_project: false,
+          project_basename: null,
+          state: "dangling",
+        },
+      ],
+    }),
   );
 
   // Armed then failed reason=stuck.

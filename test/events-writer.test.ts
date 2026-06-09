@@ -638,17 +638,21 @@ test("planVerbRefFromSpawnName: plan::<ref> → {plan, ref}", () => {
   });
 });
 
-test("planVerbRefFromSpawnName: approve::<epic-task> → {approve, ref}", () => {
+test("fn-756: approve::<epic-task> → {null, null} (approve dropped from the whitelist)", () => {
+  // fn-756 removed `approve` from the locked verb whitelist along with the
+  // verb. A stale `approve::` spawn name (from before the deploy) no longer
+  // parses to a `{verb, ref}` pair — it falls through to {null, null} like any
+  // other non-whitelisted verb.
   expect(planVerbRefFromSpawnName("approve::fn-619-pin-foo.1")).toEqual({
-    plan_verb: "approve",
-    plan_ref: "fn-619-pin-foo.1",
+    plan_verb: null,
+    plan_ref: null,
   });
 });
 
-test("planVerbRefFromSpawnName: approve::<epic> → {approve, epic-id}", () => {
+test("fn-756: approve::<epic> → {null, null} (approve dropped from the whitelist)", () => {
   expect(planVerbRefFromSpawnName("approve::fn-619-pin-foo")).toEqual({
-    plan_verb: "approve",
-    plan_ref: "fn-619-pin-foo",
+    plan_verb: null,
+    plan_ref: null,
   });
 });
 

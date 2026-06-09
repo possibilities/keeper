@@ -1348,15 +1348,16 @@ test("dispatchKeyForPane: lifts verb::id from terminal_command (fn-711 unnamed t
   expect(dispatchKeyForPane(pane)).toBe("work::fn-724-x.2");
 });
 
-test("dispatchKeyForPane: tab_name takes precedence; approve/close verbs match; none → null", () => {
+test("dispatchKeyForPane: tab_name takes precedence; work/close verbs match; none → null", () => {
   // A named-tab launch path (future / restore) still matches via tab_name.
+  // fn-756: the verb whitelist is `work|close` (approve dropped).
   expect(
     dispatchKeyForPane({
       id: "1",
-      tab_name: "approve::fn-1-foo.3",
+      tab_name: "work::fn-1-foo.3",
       terminal_command: "claude --name close::other.1",
     }),
-  ).toBe("approve::fn-1-foo.3");
+  ).toBe("work::fn-1-foo.3");
   // close:: verb
   expect(
     dispatchKeyForPane({
@@ -1567,13 +1568,12 @@ test("reapSurfaces: list-panes ENOENT (spawn throws) → skippedNoSnapshot, no t
 // reap tests use.
 // ---------------------------------------------------------------------------
 
-test("completion reap: approving a completed task reaps work::<id> AND approve::<id> together", async () => {
+test("completion reap: a completed task reaps work::<id> (fn-756: no approve pane to pair)", async () => {
   const calls: string[][] = [];
-  // Live session: the completed task's work pane + its approve pane, plus
-  // an unrelated worker on a non-completed id and a human tab.
-  // The completed pair's panes have exited by reap time (exited true/
-  // undefined). fn-741's live-veto only spares an explicit `exited:false`
-  // pane (covered separately), so the pair-reap is unaffected here.
+  // Live session: the completed task's work pane, plus an unrelated worker on
+  // a non-completed id and a human tab. fn-756: there is no `approve::` pane
+  // any more, and even a stale one (id 2 below) is no longer name-matched, so
+  // only the `work::<id>` pane reaps.
   const json = JSON.stringify([
     { id: 1, tab_name: "work::fn-1-foo.3", terminal_command: "claude" },
     {
@@ -1594,18 +1594,20 @@ test("completion reap: approving a completed task reaps work::<id> AND approve::
   const result = await backend.reapSurfaces((pane) =>
     isCompletionReapCandidate(completed, pane),
   );
-  // Exactly the work + approve pair for the completed id.
-  expect(result.reaped).toBe(2);
+  // Exactly the work pane for the completed id — the stale approve pane (id 2)
+  // is no longer a dispatch key and is NOT reaped.
+  expect(result.reaped).toBe(1);
   expect(result.failed).toBe(0);
   const closes = calls.filter((c) => c[4] === "close-pane").map((c) => c[6]);
-  expect(closes.sort()).toEqual(["terminal_1", "terminal_2"]);
-  // The non-completed worker (terminal_3) and the human tab (terminal_4)
-  // were NEVER touched.
+  expect(closes.sort()).toEqual(["terminal_1"]);
+  // The stale approve pane (terminal_2), the non-completed worker (terminal_3)
+  // and the human tab (terminal_4) were NEVER touched.
+  expect(closes.includes("terminal_2")).toBe(false);
   expect(closes.includes("terminal_3")).toBe(false);
   expect(closes.includes("terminal_4")).toBe(false);
 });
 
-test("completion reap: approving a completed close-row reaps close::<id> AND approve::<id>", async () => {
+test("completion reap: a completed close-row reaps close::<id> (fn-756: no approve pane to pair)", async () => {
   const calls: string[][] = [];
   const json = JSON.stringify([
     { id: 1, tab_name: "close::fn-2-bar", terminal_command: "claude" },
@@ -1624,9 +1626,10 @@ test("completion reap: approving a completed close-row reaps close::<id> AND app
   const result = await backend.reapSurfaces((pane) =>
     isCompletionReapCandidate(completed, pane),
   );
-  expect(result.reaped).toBe(2);
+  // Only the close pane — the stale approve pane is no longer name-matched.
+  expect(result.reaped).toBe(1);
   const closes = calls.filter((c) => c[4] === "close-pane").map((c) => c[6]);
-  expect(closes.sort()).toEqual(["terminal_1", "terminal_2"]);
+  expect(closes.sort()).toEqual(["terminal_1"]);
 });
 
 test("completion reap: pending / rejected / worker-ended-unapproved surfaces are NOT reaped", async () => {

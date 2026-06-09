@@ -253,7 +253,7 @@ test("task-complete: done + approved → met", () => {
   expect(state.kind).toBe("met");
 });
 
-test("task-complete: done + pending → waiting", () => {
+test("fn-756 task-complete: done + pending → met (worker-done alone is complete)", () => {
   const task = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -265,7 +265,8 @@ test("task-complete: done + pending → waiting", () => {
     { epics: [epic], snapshot: snap, priorPresence: true },
     { id: task.task_id, kind: "task", condition: "complete" },
   );
-  expect(state.kind).toBe("waiting");
+  // fn-756: the approval enum no longer gates completion — worker-done is met.
+  expect(state.kind).toBe("met");
 });
 
 test("task-complete: open + approved → waiting (worker hasn't finished)", () => {
@@ -283,7 +284,7 @@ test("task-complete: open + approved → waiting (worker hasn't finished)", () =
   expect(state.kind).toBe("waiting");
 });
 
-test("task-complete: done + rejected → waiting (rejection is not completion)", () => {
+test("fn-756 task-complete: done + (ignored) rejected → met (approval no longer gates)", () => {
   const task = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -295,10 +296,9 @@ test("task-complete: done + rejected → waiting (rejection is not completion)",
     { epics: [epic], snapshot: snap, priorPresence: true },
     { id: task.task_id, kind: "task", condition: "complete" },
   );
-  // The task is not complete (approval !== "approved"); the command's
-  // `--fail-on-stuck` flag is what would surface rejected-as-terminal,
-  // and that flag operates on the `unblocked` condition, not `complete`.
-  expect(state.kind).toBe("waiting");
+  // fn-756: a worker-done task is complete; the (now-ignored) `approval` field
+  // does not hold it back.
+  expect(state.kind).toBe("met");
 });
 
 // ---------------------------------------------------------------------------
@@ -626,20 +626,11 @@ test("epic-unblocked: every row genuinely blocked → waiting", () => {
 // Stuck — only `job-rejected` and `dep-on-epic-dangling` qualify.
 // ---------------------------------------------------------------------------
 
-test("stuck (task): approval=rejected → stuck", () => {
-  const task = makeTask({ worker_phase: "done", approval: "rejected" });
-  const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
-  expect(snap.perTask.get(task.task_id)).toEqual({
-    tag: "blocked",
-    reason: { kind: "job-rejected" },
-  });
-  const state = evaluateAwaitCondition(
-    { epics: [epic], snapshot: snap, priorPresence: true },
-    { id: task.task_id, kind: "task", condition: "unblocked" },
-  );
-  expect(state.kind).toBe("stuck");
-});
+// fn-756: the `approval=rejected → job-rejected → stuck` task path is REMOVED.
+// The approval enum no longer gates, so a worker-done task is `completed`
+// regardless of any (now-ignored) `approval` value — there is no `job-rejected`
+// verdict to render `stuck`. The `dep-on-epic-dangling → stuck` path below is
+// the surviving human-only-recoverable terminal blocker.
 
 test("stuck (task): dep-on-epic-dangling → stuck", () => {
   const t = makeTask({ task_id: "fn-1-foo.1" });
@@ -718,19 +709,10 @@ test("fn-721 (task): a sibling demoted by a dispatch-pending occupant stays work
   expect(state.kind).toBe("met");
 });
 
-test("stuck (epic): every row in the epic is rejected → stuck", () => {
-  // Single rejected task whose epic has no other workable rows. The
-  // epic-level unblocked check elevates this to stuck (no workable row
-  // AND at least one row is human-only-blocked).
-  const task = makeTask({ worker_phase: "done", approval: "rejected" });
-  const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
-  const state = evaluateAwaitCondition(
-    { epics: [epic], snapshot: snap, priorPresence: true },
-    { id: epic.epic_id, kind: "epic", condition: "unblocked" },
-  );
-  expect(state.kind).toBe("stuck");
-});
+// fn-756: the epic-level "every row rejected → stuck" test is REMOVED — a
+// worker-done task no longer renders `job-rejected` (it's `completed`), so the
+// rejected-row stuck path is unreachable. `dep-on-epic-dangling` (below) is the
+// surviving epic-level human-only-recoverable terminal blocker.
 
 test("stuck (epic): dep-on-epic-dangling on the only task → stuck", () => {
   const t = makeTask({ task_id: "fn-1-foo.1" });

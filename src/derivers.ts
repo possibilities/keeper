@@ -11,7 +11,7 @@
  *   out of a Pre/PostToolUse-on-Skill payload, gated by event + tool name and
  *   defensive against non-object/non-string fields.
  * - `planVerbRefFromSpawnName(spawnName)` — split a
- *   `{plan,work,close,approve}::<ref>` spawn name into its verb + ref
+ *   `{plan,work,close}::<ref>` spawn name into its verb + ref
  *   components for the jobs projection.
  * - `parseSessionIdTrailer(raw)` / `extractCommit(event)` — take-last
  *   parser for the `Session-Id:` trailer block git emits via
@@ -68,14 +68,15 @@ const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
 /**
  * Anchored spawn-name → `{verb, ref}` match. The strict shape:
  *
- *   `{plan|work|close|approve}` + `::` + `fn-\d+-[a-z0-9-]+` + optional `.\d+`
+ *   `{plan|work|close}` + `::` + `fn-\d+-[a-z0-9-]+` + optional `.\d+`
  *
- * Whitelist of verbs is locked: `plan`, `work`, `close`, `approve`.
- * `audit::` / `develop::` / any future verb does NOT match and returns
- * `(null, null)` — adding a verb is a deliberate one-line edit here, never
- * silent. The `$` anchor rejects extra `::` segments
- * (`work::fn-1-foo::extra` is malformed and folds to both null) so a typo
- * never partial-matches and lands wrong data in the projection.
+ * Whitelist of verbs is locked: `plan`, `work`, `close` (fn-756 dropped
+ * `approve` along with the approval window). `audit::` / `develop::` /
+ * `approve::` / any other verb does NOT match and returns `(null, null)` —
+ * adding a verb is a deliberate one-line edit here, never silent. The `$`
+ * anchor rejects extra `::` segments (`work::fn-1-foo::extra` is malformed
+ * and folds to both null) so a typo never partial-matches and lands wrong
+ * data in the projection.
  *
  * Ref shape `fn-\d+-[a-z0-9-]+(?:\.\d+)?` matches both epic refs
  * (`fn-575-osc-parser`) and task refs (`fn-575-osc-parser.3`); the optional
@@ -84,8 +85,7 @@ const SLASH_COMMAND_RE = /^\/[a-z][\w:-]*/;
  * are kebab-only and never carry `_` or `:`, so allowing them would mask
  * shape errors.
  */
-const SPAWN_VERB_REF_RE =
-  /^(plan|work|close|approve)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
+const SPAWN_VERB_REF_RE = /^(plan|work|close)::(fn-\d+-[a-z0-9-]+(?:\.\d+)?)$/;
 
 /**
  * Extract the leading slash command from a `UserPromptSubmit`'s
@@ -156,9 +156,9 @@ export interface PlanVerbRef {
 /**
  * Split a spawn name (the parent claude process's `--name`/`-n` token,
  * scraped by the hook on `SessionStart`) into `(plan_verb, plan_ref)` per
- * the canonical `{plan,work,close,approve}::<ref>` shape. Returns both
- * NULL on a NULL spawn name, an `audit::` / `develop::` / other-verb
- * prefix, a malformed body, or anything trailing the ref (extra `::`
+ * the canonical `{plan,work,close}::<ref>` shape. Returns both
+ * NULL on a NULL spawn name, an `audit::` / `develop::` / `approve::` /
+ * other-verb prefix, a malformed body, or anything trailing the ref (extra `::`
  * segments).
  *
  * The strict whitelist matches a deliberate locked design decision: only

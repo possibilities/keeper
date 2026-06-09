@@ -150,13 +150,14 @@ import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 import { watchLoop } from "./wake-worker";
 
 /**
- * The three planctl verbs the reconciler dispatches. Mirrors the
+ * The two planctl verbs the reconciler dispatches. Mirrors the
  * `buildWorkerCommand` verb union in `cli/autopilot.ts` (single source of
- * truth for the argv shape lives there; we only need the type alias
- * here). `approve` runs for `blocked:job-pending` rows; `work` /
- * `close` run for `ready` rows.
+ * truth for the argv shape lives there; we only need the type alias here).
+ * `work` runs for a `ready` task row; `close` for a `ready` close row.
+ * fn-756 removed `approve` along with the approval window — no verb maps to
+ * the (now-deleted) `job-pending` verdict.
  */
-export type Verb = "work" | "close" | "approve";
+export type Verb = "work" | "close";
 
 /**
  * The dedup / in-flight key shape — exactly `${verb}::${id}`, matching
@@ -191,28 +192,16 @@ export const REDISPATCH_COOLDOWN_S = 120;
 /**
  * fn-742 — the in-process per-epic FINALIZER guard window, in SECONDS.
  *
- * The fn-740 race: for a single epic the close-row verdict flips between
- * `ready` → `close` and `blocked:job-pending` → `approve` across adjacent
- * cycles. `close::<epic>` and `approve::<epic>` are DIFFERENT
- * `redispatchCooldown` keys, so the fn-735 same-key cooldown does NOT serialize
- * them — cycle N dispatches `close::<epic>`, the fold lags, cycle N+1 sees the
- * verdict flip and dispatches `approve::<epic>` CONCURRENTLY. The close-side
- * quality audit then races the approve and lands a bogus `rejected`, sticking
- * the epic at `[::blocked:job-rejected]`.
- *
- * This guard closes that gap: when EITHER finalizer (`close` or `approve`) for
- * an epic is dispatched, the epic id is stamped; `reconcile` suppresses the
- * OTHER finalizer for that epic until the stamp clears (or the durable
- * projection arms catch up). Keyed by EPIC ID (not `${verb}::${id}`) so one
- * stamp covers both finalizer verbs — that's the whole point. The fold-lag-
- * immune arm, mirroring fn-735: stamp BEFORE the confirm await, read in the
- * pure `reconcile`, sweep in `driveCycle`.
- *
- * SCOPE: epic-level finalizers ONLY. A TASK-level `approve::<task-id>` is NOT
- * an epic finalizer (it's keyed off the task id, never reaches this map), so a
- * pending-approval backlog of tasks still drains — the fn-728 cap-exemption is
- * preserved and the gate is per-epic close↔approve, never a blanket approve
- * suppression.
+ * Originally closed the fn-740 close↔approve race: for a single epic the
+ * close-row verdict flipped between `ready` → `close` and
+ * `blocked:job-pending` → `approve` across adjacent cycles, and those were
+ * DIFFERENT `redispatchCooldown` keys so the fn-735 same-key cooldown did NOT
+ * serialize them. fn-756 deleted the `approve` verb, so the close↔approve race
+ * is structurally gone; `close` is now the SOLE epic finalizer. The guard is
+ * retained (keyed by EPIC ID) as a fold-lag-immune backstop against any future
+ * second finalizer verb and against a `close` re-dispatch the same-key fn-735
+ * cooldown would already suppress — it stamps BEFORE the confirm await, reads
+ * in the pure `reconcile`, sweeps in `driveCycle`.
  *
  * Aligned to `REDISPATCH_COOLDOWN_S` (= `PENDING_DISPATCH_TTL_MS / 1000` = 120
  * s): conservatively longer than any plausible fold lag, same as fn-735.
@@ -222,22 +211,22 @@ export const REDISPATCH_COOLDOWN_S = 120;
  */
 export const FINALIZER_GUARD_S = REDISPATCH_COOLDOWN_S;
 
-/** The two epic-level finalizer verbs the per-epic guard serializes (fn-742). */
-const FINALIZER_VERBS: ReadonlySet<Verb> = new Set<Verb>(["close", "approve"]);
+/** The epic-level finalizer verb the per-epic guard serializes (fn-742). fn-756: `close`-only. */
+const FINALIZER_VERBS: ReadonlySet<Verb> = new Set<Verb>(["close"]);
 
 /**
- * fn-742 — `true` IFF the epic-level finalizer for `epicId` is `close` or
- * `approve`, the only two verbs the per-epic guard serializes. A close-row
- * verdict mapping to `null` (running / blocked-on-other / completed) is not a
- * finalizer and is never stamped or gated.
+ * fn-742 — `true` IFF the epic-level finalizer for `epicId` is `close` (the
+ * sole finalizer verb after fn-756). A close-row verdict mapping to `null`
+ * (running / blocked-on-other / completed) is not a finalizer and is never
+ * stamped or gated.
  */
 export function isFinalizerVerb(verb: Verb | null): verb is Verb {
   return verb !== null && FINALIZER_VERBS.has(verb);
 }
 
 /**
- * fn-742 — pure per-epic finalizer-guard predicate. `true` IFF some finalizer
- * (`close` or `approve`) for `epicId` was dispatched within the last
+ * fn-742 — pure per-epic finalizer-guard predicate. `true` IFF a finalizer
+ * (`close`) for `epicId` was dispatched within the last
  * `FINALIZER_GUARD_S` seconds. `now` and the stored stamp are BOTH
  * unit-SECONDS. An absent entry (cleared on launch failure, swept on expiry, or
  * never stamped) is NOT guarded. Mirrors {@link isInCooldown}: read inside the
@@ -403,11 +392,9 @@ export function buildWorkerCommand(
 ): string {
   const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
   const flags: string[] = [];
-  if (verb === "approve") {
-    flags.push("--model", "sonnet", "--effort", "low");
-  } else {
-    flags.push("--model", "sonnet", "--effort", "max");
-  }
+  // fn-756: the `approve`-verb low-effort branch is gone with the verb; both
+  // surviving verbs (`work`/`close`) launch at max effort.
+  flags.push("--model", "sonnet", "--effort", "max");
   flags.push("--name", `${verb}::${id}`);
   if (verb === "work" && tier != null && tier !== "") {
     flags.push("--plugin-dir", workPluginDir(tier));
@@ -464,7 +451,7 @@ export function sweepRedispatchCooldown(
  * Exported so the worker's pause handler and the test suite share the
  * EXACT safety gate (the highest-blast-radius decision in this epic).
  *
- * A pane is a reap candidate IFF it carries a `(work|approve|close)::<id>`
+ * A pane is a reap candidate IFF it carries a `(work|close)::<id>`
  * dispatch key (lifted from `tab_name` / `terminal_command` by
  * `dispatchKeyForPane`) AND that key is in `openPendingKeys` — the set of
  * `${verb}::${id}` for every row still present in `pending_dispatches`.
@@ -502,40 +489,46 @@ export function isReapCandidate(
  * A SIBLING of `isReapCandidate`, NOT an overload: the two gate on
  * OPPOSITE sets. `isReapCandidate` reaps the pause-window ghost — a pane
  * whose key is still OPEN in `pending_dispatches` (not-yet-bound launch).
- * This predicate reaps the APPROVED-COMPLETION pair — a pane whose key's
+ * This predicate reaps the COMPLETED row's surface — a pane whose key's
  * `<id>` reached the durable `{tag:"completed"}` readiness verdict this
  * cycle.
  *
- * A pane is a completion-reap candidate IFF its `(work|approve|close)::<id>`
+ * A pane is a completion-reap candidate IFF its `(work|close)::<id>`
  * dispatch key (lifted by `dispatchKeyForPane`) has its `<id>` in
  * `completedRowIds` — the set of task ids / epic ids whose readiness
- * verdict is `{tag:"completed"}` this cycle. So a completed task reaps
- * BOTH `work::<id>` and `approve::<id>`; a completed close row reaps BOTH
- * `close::<id>` and `approve::<id>` (same id, two surfaces).
+ * verdict is `{tag:"completed"}` this cycle. fn-756: a completed task reaps
+ * `work::<id>` and a completed close row reaps `close::<id>` (the
+ * `approve::<id>` surface no longer exists — the approve verb is gone).
  *
  * SAFETY — DELIBERATE DIVERGENCE from practice-scout's universal "match
  * name AND `is_exited==true`" rule: `is_exited` (the pane's `exited`
- * field) is INTENTIONALLY NOT gated. The approver pane is LIVE at the
- * instant of approval, so an `is_exited` gate would NEVER reap it. The
- * durable `{tag:"completed"}` verdict is the SOLE authorization; the name
- * match only LOCATES the panes. Per the human's design call: an
- * `approve::<id>` surface existing implies a completed corresponding job —
- * a completed+approved row cannot have a concurrent live worker for the
- * same id (a re-dispatch would flip the row OFF `completed`). Do NOT "fix"
- * this back to the `is_exited` default. A pane with no dispatch key (a
- * human's ad-hoc tab) is never touched.
+ * field) is INTENTIONALLY NOT gated. fn-756: the reap now fires the instant
+ * the worker exits (worker-done completion, no approval delay), and the
+ * worker pane may still be live on the cycle the verdict flips to
+ * `completed`, so an `is_exited` gate could miss it. The durable
+ * `{tag:"completed"}` verdict is the SOLE authorization; the name match
+ * only LOCATES the pane. A completed row cannot have a concurrent live
+ * worker for the same id (a re-dispatch would flip the row OFF `completed`).
+ * Do NOT "fix" this back to the `is_exited` default. A pane with no dispatch
+ * key (a human's ad-hoc tab) is never touched.
  *
  * fn-741 LIVE-VETO: the same `exited === false` safety net the pause reap
  * carries is layered here too. This does NOT reinstate the rejected
  * "match name AND is_exited==true" rule — that gated on `exited === true`,
- * which would NEVER reap the live-at-approval approver. The veto is the
+ * which would never reap a still-live-at-completion worker. The veto is the
  * INVERSE polarity: it blocks ONLY a demonstrably-live (`exited === false`)
  * pane, while `true` AND `undefined` still fall through to the
- * `{tag:"completed"}` authorization. So the approver pane (live at approval,
- * `exited` undefined or true on the next list-panes) still reaps normally;
+ * `{tag:"completed"}` authorization. So a worker pane that has wound down
+ * (`exited` undefined or true on the next list-panes) still reaps normally;
  * only a pane zellij explicitly reports as still-running is spared one cycle.
  * Defense-in-depth against any fold-latency edge where a still-live worker's
  * id transiently appears in `completedRowIds`.
+ *
+ * IDEMPOTENCY (fn-756): the reap fires immediately on worker exit, and a
+ * `data_version` double-fire can re-select an already-closed pane.
+ * `ExecBackend.reapSurfaces` treats a failed `close-pane` (already-gone
+ * pane) as a best-effort no-op (`failed++` + warn + continue), NEVER a
+ * throw — so a double-reap can't crash the worker path into `fatalExit`.
  */
 export function isCompletionReapCandidate(
   completedRowIds: Set<string>,
@@ -550,7 +543,7 @@ export function isCompletionReapCandidate(
   }
   // Key is `${verb}::${id}`; `<id>` is everything after the first `::`.
   // Ids never contain `::` (verb-prefixed keys are `verb::id` with the
-  // verb being one of work|approve|close), so a single split is exact.
+  // verb being one of work|close), so a single split is exact.
   const sep = key.indexOf("::");
   if (sep < 0) {
     return false;
@@ -669,61 +662,22 @@ export interface ReconcileState {
   redispatchCooldown: Map<DispatchKey, number>;
   /**
    * fn-742 — the in-process per-epic FINALIZER guard. Maps an EPIC ID →
-   * the unix-SECONDS timestamp at which a finalizer (`close` OR `approve`) for
-   * that epic was last dispatched. Same shape/lifecycle as `redispatchCooldown`
-   * above: held on `ReconcileState` so `reconcile()` can READ it and stay pure;
-   * MUTATED only in the cycle glue (`runReconcileCycle` stamps/clears,
-   * `driveCycle` sweeps), NEVER inside `reconcile`.
+   * the unix-SECONDS timestamp at which a finalizer (`close`) for that epic was
+   * last dispatched. Same shape/lifecycle as `redispatchCooldown` above: held
+   * on `ReconcileState` so `reconcile()` can READ it and stay pure; MUTATED
+   * only in the cycle glue (`runReconcileCycle` stamps/clears, `driveCycle`
+   * sweeps), NEVER inside `reconcile`.
    *
-   * The cross-VERB serializer fn-735 cannot be: `redispatchCooldown` keys off
-   * `${verb}::${id}`, so `close::<epic>` and `approve::<epic>` are distinct keys
-   * and the same-key cooldown lets the close↔approve race fire in the fold-lag
-   * window (the fn-740 incident). This map keys off the epic id alone, so one
-   * stamp suppresses the SIBLING finalizer until it clears.
-   *
-   * SCOPE is epic finalizers ONLY — a task-level `approve::<task-id>` never
-   * touches this map, so a pending-approval backlog still drains (fn-728
-   * cap-exemption preserved; the gate is per-epic close↔approve, not a blanket
-   * approve suppression).
+   * fn-756: originally serialized the fn-740 close↔approve race (distinct
+   * `redispatchCooldown` keys for `close::<epic>` vs `approve::<epic>`). With
+   * `approve` deleted, `close` is the sole finalizer — the guard is retained as
+   * an epic-id-keyed fold-lag-immune backstop against a `close` re-dispatch.
    *
    * IN-MEMORY ONLY — never the event log / projections / reducer / RPC surface.
    * Boots EMPTY on restart (safe: autopilot boots paused; the first cycle
    * rebuilds suppression from the live projection). Timestamps are unit-SECONDS.
    */
   finalizerGuard: Map<string, number>;
-  /**
-   * fn-742.2 — the in-process per-epic ONE-SHOT auto-clear ledger for rejected
-   * epics. An epic whose close-row verdict is `{kind:"job-rejected"}`
-   * (`epic.approval === "rejected"`) is otherwise PERMANENTLY stuck: its verdict
-   * maps to `verbForVerdict → null`, so the autopilot has no dispatchable verb
-   * and the epic sits `[::blocked:job-rejected]` forever. The fn-740 incident
-   * minted exactly such a BOGUS rejection (the close↔approve race `.1` now
-   * prevents) and left the epic wedged with no recourse.
-   *
-   * RECOVERY POLICY (`.2`): the FIRST time `reconcile` sees a still-`rejected`
-   * epic this process, it requests a one-shot auto-clear of the epic approval
-   * back to `"pending"` — routed through the SANCTIONED `set_epic_approval`
-   * sidecar write (via main; the worker never writes). That re-runs the normal
-   * approve flow (next cycle the close-row verdict flips
-   * `job-pending → approve`). The epic id is then recorded HERE so a SECOND
-   * rejection — a genuinely-rejected epic, or one the re-approve rejected
-   * again — is NOT auto-cleared a second time. No thrash loop: at most one
-   * auto-clear per epic per daemon process; a legitimately-rejected epic stays
-   * rejected and an operator's manual re-approve / `retry_dispatch` is the
-   * recourse.
-   *
-   * Same shape/lifecycle as the maps above: held on `ReconcileState` so
-   * `reconcile()` can READ it and stay pure (it pushes the epic id onto
-   * `decision.rejectedClears` but does NOT mutate this set); the cycle glue
-   * (`driveCycle`) RECORDS the id here AFTER posting the clear request to main.
-   *
-   * IN-MEMORY ONLY — never the event log / projections / reducer. Boots EMPTY on
-   * restart (safe: a still-rejected epic gets at most ONE more auto-clear after
-   * a daemon bounce, never a loop). The recovered approval IS durable — it lands
-   * in the gitignored runtime sidecar via the sanctioned RPC and folds back
-   * through the plan-worker like any human re-approve.
-   */
-  autoClearedRejections: Set<string>;
   /**
    * Global ceiling on how many root-occupants this reconciler dispatches
    * at once across ALL epics/roots (fn-725). `null` = unlimited (today's
@@ -787,26 +741,13 @@ export interface LiveDispatch {
  * NOT recompute readiness to derive it. It holds task ids (from
  * `readiness.perTask`) and epic ids (from `readiness.perCloseRow`) whose
  * verdict tag is `completed`. The completion-reap predicate keys off
- * `<id>` only, so a completed task authorizes reaping `work::<id>` AND
- * `approve::<id>`, and a completed close row authorizes `close::<id>` AND
- * `approve::<id>`.
+ * `<id>` only, so a completed task authorizes reaping `work::<id>` and a
+ * completed close row authorizes `close::<id>` (fn-756: no `approve::<id>`
+ * surface is ever dispatched, so none is reaped).
  */
 export interface ReconcileDecision {
   launches: PlannedLaunch[];
   completedRowIds: Set<string>;
-  /**
-   * fn-742.2 — epic ids whose close-row verdict is `{kind:"job-rejected"}` and
-   * which have NOT yet been auto-cleared this process (`epicId NOT IN
-   * state.autoClearedRejections`). The cycle glue (`driveCycle`) posts a
-   * one-shot `clear-rejected-approval` request to main for each — routing
-   * through the sanctioned `set_epic_approval` sidecar write to reset the epic
-   * approval to `"pending"` — then records the id in
-   * `state.autoClearedRejections` so it never re-fires. See that field's doc for
-   * the recovery policy. Harvested from the SAME `computeReadiness` pass
-   * `reconcile` already makes (single source of truth); `reconcile` reads
-   * `state.autoClearedRejections` to filter but does NOT mutate it (purity).
-   */
-  rejectedClears: string[];
 }
 
 /**
@@ -824,17 +765,6 @@ export interface ConfirmRunningDeps {
    * byte-identically.
    */
   emitDispatchFailed(payload: DispatchFailedPayload): void;
-  /**
-   * fn-742.2 — request a ONE-SHOT auto-clear of a rejected epic's approval
-   * back to `"pending"` (via the parent thread — the worker never writes the
-   * approval surface). Main calls the sanctioned `set_epic_approval` handler.
-   * Fire-and-forget (no ack): a missed clear is re-requested next cycle. The
-   * cycle glue (`driveCycle`) records the epic id in
-   * `state.autoClearedRejections` right after invoking this, so a genuinely-
-   * rejected epic can't thrash. Optional so the test harness can omit it (the
-   * reconcile/confirm paths never touch it).
-   */
-  emitClearRejectedApproval?(epicId: string): void;
   /**
    * Emit a synthetic `Dispatched` event onto the writable connection (via
    * the parent thread — workers never write the DB) AND AWAIT a durable
@@ -1087,9 +1017,11 @@ export function buildLaunchArgv(
  * reconciler would dispatch for it, or `null` to dispatch nothing.
  *
  *   - `{ tag: "ready" }` on a task → `"work"`; on a close row → `"close"`.
- *   - `{ tag: "blocked", reason: { kind: "job-pending" } }` → `"approve"`.
- *   - Everything else → `null` (running / blocked-on-other-reasons /
- *     completed / undefined verdict).
+ *   - Everything else → `null` (running / blocked / completed / undefined
+ *     verdict).
+ *
+ * fn-756: the `blocked:job-pending → "approve"` arm is gone — there is no
+ * approval window and no `job-pending` verdict to dispatch against.
  *
  * Pure — exported for tests. Mirrors the dispatch table in
  * `cli/autopilot.ts` (`gateAndDispatch` branches at :2778-2851) so the
@@ -1105,9 +1037,6 @@ export function verbForVerdict(
   }
   if (verdict.tag === "ready") {
     return kind === "task" ? "work" : "close";
-  }
-  if (verdict.tag === "blocked" && verdict.reason.kind === "job-pending") {
-    return "approve";
   }
   return null;
 }
@@ -1193,13 +1122,12 @@ export function reconcile(
     snapshot.pendingDispatches,
   );
 
-  // fn-727: harvest the approved-completion set from the ONE readiness pass
-  // above (never a second `computeReadiness`). A `{tag:"completed"}` task
-  // verdict authorizes reaping `work::<id>` + `approve::<id>`; a completed
-  // close-row verdict authorizes `close::<id>` + `approve::<id>` — the
-  // completion-reap predicate keys off `<id>` only, so one id covers its
-  // pair. Both maps feed the same id set (task ids and epic ids never
-  // collide — `fn-N-slug.M` vs `fn-N-slug`).
+  // fn-727: harvest the completion set from the ONE readiness pass above
+  // (never a second `computeReadiness`). A `{tag:"completed"}` task verdict
+  // authorizes reaping `work::<id>`; a completed close-row verdict authorizes
+  // `close::<id>` — the completion-reap predicate keys off `<id>` only (fn-756:
+  // no `approve::<id>` surface to pair). Both maps feed the same id set (task
+  // ids and epic ids never collide — `fn-N-slug.M` vs `fn-N-slug`).
   const completedRowIds = new Set<string>();
   for (const [taskId, verdict] of readiness.perTask) {
     if (verdict.tag === "completed") {
@@ -1212,27 +1140,11 @@ export function reconcile(
     }
   }
 
-  // fn-742.2 — harvest the rejected-epic recovery set from the SAME readiness
-  // pass. A close-row verdict of `{kind:"job-rejected"}` (the epic's own
-  // `approval === "rejected"`) is non-dispatchable (`verbForVerdict → null`), so
-  // without intervention the epic sits `[::blocked:job-rejected]` forever. We
-  // request a ONE-SHOT auto-clear back to `pending` (the cycle glue routes it
-  // through the sanctioned `set_epic_approval` sidecar write via main), gated on
-  // the epic NOT already having been auto-cleared this process so a genuinely-
-  // rejected epic can't thrash. READ-ONLY here — `reconcile` stays pure: it
-  // reads `state.autoClearedRejections` to filter but the SET is recorded by
-  // `driveCycle` AFTER it posts the clear. Determinism unaffected (this set is
-  // in-memory cycle state, never folded). See `ReconcileState.autoClearedRejections`.
-  const rejectedClears: string[] = [];
-  for (const [epicId, verdict] of readiness.perCloseRow) {
-    if (
-      verdict.tag === "blocked" &&
-      verdict.reason.kind === "job-rejected" &&
-      !state.autoClearedRejections.has(epicId)
-    ) {
-      rejectedClears.push(epicId);
-    }
-  }
+  // fn-756: the fn-742.2 rejected-epic auto-clear is REMOVED. It harvested
+  // close-row `{kind:"job-rejected"}` verdicts and requested a one-shot
+  // `set_epic_approval` sidecar write back to `pending`. With the approval
+  // enum no longer gating, no close row is ever `job-rejected`, so there is
+  // nothing to recover.
 
   // fn-725 global concurrency cap. Count root-occupants ONCE over the
   // POST-mutex verdicts of BOTH perTask AND perCloseRow — `isRootOccupant`
@@ -1298,9 +1210,8 @@ export function reconcile(
       // fn-751 — armed-mode gate. Suppress a `work` launch for an epic NOT in
       // the eligible set (armed ∪ transitive upstreams). Placed ABOVE the
       // budget gate so a non-eligible epic never consumes `max_concurrent_jobs`
-      // budget. WORK-ONLY: `approve` on a task row is mode-exempt (mirrors the
-      // close-row finalizer exemption) so a disarmed-but-in-flight epic still
-      // approves its tasks. No-op in `yolo` mode (`armedMode === false`).
+      // budget. A task verdict only ever maps to `work` (fn-756), so this gate
+      // covers every task launch. No-op in `yolo` mode (`armedMode === false`).
       if (armedMode && verb === "work" && !eligible.has(epic.epic_id)) {
         continue;
       }
@@ -1326,9 +1237,7 @@ export function reconcile(
       // when EVERY projection arm above is blind to it (the reducer lagged
       // the prior dispatch's fold). READ-ONLY here — purity is sacred; the
       // stamp/clear live in `runReconcileCycle`, the sweep in `driveCycle`.
-      // Placed ABOVE the fn-728 approve-exempt budget gate and DELIBERATELY
-      // NOT approve-exempt — the cooldown must cover approve too (the
-      // fn-734 dup-re-approve case this epic supersedes).
+      // Placed ABOVE the budget gate.
       if (isInCooldown(state.redispatchCooldown, key, now)) {
         continue;
       }
@@ -1345,18 +1254,10 @@ export function reconcile(
       // fn-725 cap — LAST gate, after every per-task/per-epic/per-root
       // verdict is computed (so debug verdicts aren't masked). A budget
       // skip does NOT hold a slot; it just defers this launch to a later
-      // cycle once an occupant frees up.
-      //
-      // fn-728: `approve` is EXEMPT from the cap at the launch boundary —
-      // the budget governs new WORK entering the system (`work`/`close`),
-      // never the approvals that retire it. Counting a finished-but-pending
-      // root as an occupant (via `isRootOccupant`) lets the budget hit zero
-      // while the very approvers that would drain those roots are the only
-      // launches that could free a slot — the resource-cap deadlock. The
-      // gate-skip and the decrement-skip MUST share the same `verb !==
-      // "approve"` predicate; an in-flight approver still occupies a slot
-      // against NEW work on later cycles (correct — `occupied` is unchanged).
-      if (verb !== "approve" && budget <= 0) {
+      // cycle once an occupant frees up. fn-756: the fn-728 `approve`
+      // cap-exemption is gone with the `approve` verb — every task launch is
+      // `work` and counts against the budget.
+      if (budget <= 0) {
         continue;
       }
       launches.push({
@@ -1367,9 +1268,7 @@ export function reconcile(
         workerCommand: buildWorkerCommand(verb, taskId, cwd, task.tier),
         tier: verb === "work" ? task.tier : null,
       });
-      if (verb !== "approve") {
-        budget--;
-      }
+      budget--;
     }
     // Close row.
     const epicId = epic.epic_id;
@@ -1388,31 +1287,22 @@ export function reconcile(
         !snapshot.liveTabKeys.has(closeKey) &&
         // fn-735 — the fold-lag-immune cooldown arm at the close-row site
         // too (miss it and close rows still DUP-DISPATCH). READ-ONLY; same
-        // unit-seconds `now`. ABOVE the budget gate, NOT approve-exempt.
+        // unit-seconds `now`. ABOVE the budget gate.
         !isInCooldown(state.redispatchCooldown, closeKey, now) &&
-        // fn-742 — the per-epic FINALIZER guard. `close::<epic>` and
-        // `approve::<epic>` are distinct `redispatchCooldown` keys, so the
-        // same-key arm above does NOT serialize them; this guard keys off the
-        // epic id, so a stamp from EITHER finalizer suppresses the OTHER for
-        // this epic until it folds/clears — the fold-lag-immune fix for the
-        // fn-740 close↔approve race. READ-ONLY here; the stamp/clear live in
-        // `runReconcileCycle`, the sweep in `driveCycle`. Applies ONLY at the
-        // close-row site (epic finalizers), so a TASK-level `approve` backlog
-        // is untouched (fn-728 preserved). NOT approve-exempt: an in-flight
-        // close must suppress this epic's approve and vice-versa.
+        // fn-742 — the per-epic FINALIZER guard. fn-756: `close` is now the
+        // sole finalizer verb, so this guards a `close` re-dispatch (also
+        // covered by the same-key fn-735 cooldown — kept as a fold-lag-immune
+        // backstop keyed by epic id). READ-ONLY here; the stamp/clear live in
+        // `runReconcileCycle`, the sweep in `driveCycle`.
         !(
           isFinalizerVerb(closeVerb) &&
           isFinalizerGuarded(state.finalizerGuard, epicId, now)
         ) &&
         // fn-725 cap — the close-row push shares the SAME decrementing
         // budget as the task push above, so a closer can't blow the cap.
-        // fn-728: `approve` is exempt at this site too (the close-row
-        // `blocked:job-pending` verdict also maps to `approve` via
-        // `verbForVerdict`). The gate-skip below and the decrement-skip
-        // further down MUST use the EXACT same `closeVerb === "approve"`
-        // predicate — a De Morgan inversion here would let an approve
-        // close-row decrement budget on a path the gate didn't guard.
-        (closeVerb === "approve" || budget > 0);
+        // fn-756: the fn-728 `approve` cap-exemption is gone — every close-row
+        // launch is `close` and counts against the budget.
+        budget > 0;
       if (okToPlan && projectDir !== "") {
         launches.push({
           verb: closeVerb,
@@ -1421,18 +1311,16 @@ export function reconcile(
           cwd: projectDir,
           workerCommand: buildWorkerCommand(closeVerb, epicId, projectDir),
           tier: null,
-          // fn-742 — every close-row launch is an epic finalizer (`close` or
-          // `approve`); the cycle glue stamps the per-epic guard for these.
+          // fn-742 — every close-row launch is an epic finalizer (`close`);
+          // the cycle glue stamps the per-epic guard for these.
           isEpicFinalizer: true,
         });
-        if (closeVerb !== "approve") {
-          budget--;
-        }
+        budget--;
       }
     }
   }
 
-  return { launches, completedRowIds, rejectedClears };
+  return { launches, completedRowIds };
 }
 
 /**
@@ -1751,8 +1639,9 @@ export interface AutopilotWorkerData {
   maxConcurrentJobs?: number | null;
   /**
    * fn-727 — completion-reap toggle. When `true` (the default), the
-   * reconcile cycle reaps the zellij surfaces of an approved-completion
-   * row (`work`/`close` + its `approve` pane). `false` makes the reap
+   * reconcile cycle reaps the zellij surface of a completed row (`work::<id>`
+   * for a task, `close::<id>` for an epic — fn-756 dropped the `approve`
+   * pane along with the verb). `false` makes the reap
    * pass a no-op AND skips the `list-panes` spawn. Threaded in from
    * `resolveConfig().autocloseWindows`; like `zellijSession`, config I/O
    * happens once on main and the resolved value rides workerData.
@@ -1837,16 +1726,15 @@ export interface DispatchExpiredMessage {
 }
 
 /**
- * Worker → main: ONE-SHOT rejected-epic auto-clear request (fn-742.2). The
- * worker NEVER writes the approval surface itself — like every DB/sidecar
- * mutation it describes the intent and main performs it, here by calling the
- * sanctioned `set_epic_approval` handler to reset `epic_id`'s approval to
- * `"pending"`. Fire-and-forget (no ack): a missed clear is simply re-requested
- * on a later cycle (the epic is still `rejected` and not yet in
- * `autoClearedRejections`), and the worker has already recorded the id so it
- * won't re-fire within this process. Resets a `job-rejected` epic onto the
- * normal approve flow — its clean board exit (`.2` acceptance). See
- * `ReconcileState.autoClearedRejections` for the recovery policy + thrash gate.
+ * Worker → main: ONE-SHOT rejected-epic auto-clear request (fn-742.2).
+ *
+ * fn-756: the WORKER NO LONGER SENDS this — the rejected-epic auto-clear was
+ * deleted along with the approval window (no close row is ever `job-rejected`).
+ * The wire shape is RETAINED only because `daemon.ts` still imports it for its
+ * (now-unreached) RPC handler; that handler is removed in the schema-drop task
+ * `.2`. Historically: the worker described the intent and main performed it by
+ * calling the sanctioned `set_epic_approval` handler to reset `epic_id`'s
+ * approval to `"pending"`.
  */
 export interface ClearRejectedApprovalMessage {
   kind: "clear-rejected-approval";
@@ -2017,9 +1905,6 @@ function main(): void {
     redispatchCooldown: new Map(),
     // fn-742 — per-epic finalizer guard; boots EMPTY for the same reason.
     finalizerGuard: new Map(),
-    // fn-742.2 — rejected-epic one-shot auto-clear ledger; boots EMPTY (safe:
-    // a still-rejected epic gets at most one more auto-clear after a bounce).
-    autoClearedRejections: new Set(),
     maxConcurrentJobs: data.maxConcurrentJobs ?? null,
   };
   // fn-727 — completion-reap toggle. Default `true` (reap) when the
@@ -2208,15 +2093,9 @@ function main(): void {
         payload,
       } satisfies DispatchFailedMessage);
     },
-    emitClearRejectedApproval: (epicId) => {
-      // fn-742.2 — describe the one-shot rejected-epic recovery to main (the
-      // sole approval-surface writer). Fire-and-forget; main calls the
-      // sanctioned `set_epic_approval` handler to reset approval → `pending`.
-      parentPort?.postMessage({
-        kind: "clear-rejected-approval",
-        epic_id: epicId,
-      } satisfies ClearRejectedApprovalMessage);
-    },
+    // fn-756: the fn-742.2 `emitClearRejectedApproval` sender is removed — no
+    // close row is ever `job-rejected`, so the worker never requests an
+    // auto-clear. The daemon-side handler stays (removed in task `.2`).
     emitDispatched: (payload) =>
       new Promise<DispatchedAck>((resolve, reject) => {
         // fn-724: post an id-correlated request and AWAIT main's durable
@@ -2338,14 +2217,14 @@ function main(): void {
   // fn-727 — completion reap. Distinct from the pause/boot reap above:
   // that one gates on the OPEN `pending_dispatches` intersect (a
   // not-yet-bound launch-window ghost); THIS one gates on the durable
-  // approved-completion verdict surfaced by `reconcile` this cycle. When a
-  // row reaches `{tag:"completed"}` (worker_phase done + approval approved
-  // + idle), every live surface sharing that row's id is reaped: a task
-  // completion reaps `work::<id>` AND `approve::<id>`; an epic close-row
-  // completion reaps `close::<id>` AND `approve::<id>`. Pending, rejected,
-  // and just-worker-ended (unapproved) surfaces stay open for human
-  // inspection — they never reach `{tag:"completed"}`, so their ids are
-  // never in `completedRowIds`.
+  // completion verdict surfaced by `reconcile` this cycle. When a row
+  // reaches `{tag:"completed"}` (fn-756: worker_phase done for a task,
+  // status done for an epic, + idle), every live surface sharing that row's
+  // id is reaped: a task completion reaps `work::<id>`; an epic close-row
+  // completion reaps `close::<id>` (no `approve::<id>` surface exists — the
+  // approve verb is gone). Not-yet-completed and just-worker-ended surfaces
+  // stay open — they never reach `{tag:"completed"}`, so their ids are never
+  // in `completedRowIds`.
   //
   // Built on the SURVIVING live-probe path (`reapSurfaces` +
   // `buildZellijClosePaneArgs`), NOT the torn-out fn-710 jobs-row
@@ -2442,30 +2321,8 @@ function main(): void {
         // forget: it owns its own try/catch and never throws past itself,
         // so it never blocks or wedges the dispatch stagger below.
         reapCompletionSurfaces(decision.completedRowIds);
-        // fn-742.2 — fire the one-shot rejected-epic recovery. For each epic
-        // whose close-row verdict is `job-rejected` and which hasn't been
-        // auto-cleared this process, post a `clear-rejected-approval` to main
-        // (the sanctioned `set_epic_approval` write resets approval → pending)
-        // and RECORD the id so it never re-fires — the thrash gate. Skipped
-        // while paused: a paused autopilot is the safety-off state and must
-        // not mutate any approval (mirrors the dispatch suppression). Recording
-        // here (the cycle glue), NOT in the pure `reconcile`, keeps reconcile a
-        // read-only function of `state` — same discipline as the cooldown /
-        // finalizer-guard stamps. Wrapped: a post/record throw must not wedge
-        // the wake loop (no self-heal).
-        if (!state.paused) {
-          for (const epicId of decision.rejectedClears) {
-            try {
-              deps.emitClearRejectedApproval?.(epicId);
-              state.autoClearedRejections.add(epicId);
-            } catch (err) {
-              console.error(
-                "[autopilot-worker] rejected-approval auto-clear threw (non-fatal):",
-                err,
-              );
-            }
-          }
-        }
+        // fn-756: the fn-742.2 rejected-epic auto-clear recovery is removed —
+        // no close row is ever `job-rejected`, so there is nothing to recover.
         await runReconcileCycle(
           decision,
           state,

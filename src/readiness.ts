@@ -9,23 +9,24 @@
  * fixture pin a verdict for a given snapshot, and lets autopilot consume the
  * verdict's discriminated-union tag without parsing strings.
  *
- * Predicate pipeline — first-match-wins, fourteen ordered checks per row:
- *   1. terminal-completed          — task (fn-671): worker_phase==="done" && approval==="approved"
+ * Predicate pipeline — first-match-wins, ordered checks per row. fn-756
+ * removed the approval-gated checks (old predicates 4 own-approval-rejected,
+ * 6.5 git-cleanliness, 7 own-approval-pending); completion is now a single
+ * signal — worker-done for tasks, status-done for epics:
+ *   1. terminal-completed          — task (fn-756): worker_phase==="done"
  *                                    AND no embedded job is `working` AND no
  *                                    running sub-agent under any embedded job.
  *                                    The two liveness clauses hold the verdict
  *                                    at `running:*` (predicate 5/6) until the
  *                                    Claude session is genuinely idle, so the
  *                                    per-epic and per-root mutexes stay held
- *                                    while the worker is still alive — mirrors
- *                                    predicate 7's race rationale.
- *                                    close: epic.status==="done" && epic.approval==="approved"
+ *                                    while the worker is still alive.
+ *                                    close: epic.status==="done"
  *   2. epic-not-validated          — parent epic.last_validated_at == null
  *   3. planner-running             — any epic.job_links entry whose job is `working`
- *   4. own-approval-rejected       — task.approval==="rejected" → job-rejected
- *                                    (rejection is permanent regardless of session state, so it
- *                                    ranks ABOVE the session-running checks; pending is split off
- *                                    to predicate 7 so it cannot fire while a worker is still alive)
+ *   4. own-approval-rejected       — REMOVED (fn-756). The approval enum no
+ *                                    longer gates; the field is still present
+ *                                    on the projection but read by no gate.
  *   5. own-progress-main           — task: any embedded jobs[] entry on this row state==="working"
  *                                    close: any embedded jobs[] entry on the epic OR on any ALREADY-COMPLETED
  *                                    task state==="working" (completed-scoped fan-in — see `evaluateCloseRow`)
@@ -34,64 +35,35 @@
  *                                    close: same predicate but joined against worker session ids from
  *                                    epic-level AND every ALREADY-COMPLETED task's embedded jobs[]
  *   6.5. git-uncommitted / git-orphans
- *                                  — task (gated worker_phase==="done"): look up the live `git_status`
- *                                    row for `task.target_repo ?? epic.project_dir` via
- *                                    `gitStatusByProjectDir`; if its dirty_count > 0 → git-uncommitted,
- *                                    else if unattributed_to_live_count > 0 → git-orphans. Skipped
- *                                    when no entry exists for the root (no snapshot yet, or
- *                                    simulator's empty map) or worker_phase !== "done".
- *                                    close (gated epic.status==="done"): same idea keyed by
- *                                    `epic.project_dir`. Mechanical gate that lifts the inferred git
- *                                    cleanliness check out of /plan:approve's LLM cascade into
- *                                    keeper's deterministic readiness pipeline. Placed AFTER
- *                                    session-running (5/6) and BEFORE approval-pending (7) for the
- *                                    same race rationale as predicate 7: the gate must wait until
- *                                    every worker session and sub-agent is actually idle before
- *                                    sampling git state, otherwise mid-yield Stops produce stale
- *                                    dirty-tree readings that flap the pill. Reads off the live
- *                                    project-wide `git_status` row (not the embedded per-job count
- *                                    columns) — those columns freeze on terminal worker transition
- *                                    while the project's git state may have moved on.
- *                                    The block-reason `kind` is `git-orphans` (preserved for
- *                                    backward compatibility with autopilot's reason enumeration —
- *                                    `scripts/autopilot.ts:230,238,449` consume the literal
- *                                    string), but the underlying signal is the schema-v31
- *                                    `git_unattributed_to_live_count` column (the legacy v28
- *                                    "orphan" semantic preserved under its new name — dirty files
- *                                    no live session is on the hook for). The new strict-mystery
- *                                    `git_orphan_count` column (files with ZERO active
- *                                    attribution from any tracked session) is INFORMATIONAL ONLY
- *                                    at v31 — not a block reason, not a predicate; it surfaces in
- *                                    `scripts/git.ts` for human inspection. See the
- *                                    `gitStatusByProjectDir` doc on `computeReadiness` below for
- *                                    the column-name-vs-reason-kind divergence rationale.
- *   7. own-approval-pending        — task.approval==="pending" && status==="done" → job-pending
- *                                    close: epic.approval==="pending" && epic.status==="done" → job-pending
- *                                    Deliberately ranks BELOW 5/6: `worker_phase==="done"` is stamped
- *                                    by `planctl done` and can race ahead of the Claude session's
- *                                    Stop/SessionEnd, so `job-pending` must wait for the session
- *                                    (and any sub-agent) to actually be idle. Otherwise consumers
- *                                    (autopilot's approval-pending notify) fire prematurely while
- *                                    the worker is still in-flight.
+ *                                  — REMOVED (fn-756). This was the fn-703
+ *                                    git-cleanliness lift that gated the now-
+ *                                    deleted `/plan:approve` dispatch on a clean
+ *                                    worktree. With the approval window gone the
+ *                                    lift is dead; the worker commits its own
+ *                                    work before yielding (`keeper commit-work`).
+ *   7. own-approval-pending        — REMOVED (fn-756). Predicate 1 marks the
+ *                                    row `completed` on the worker-/status-done
+ *                                    signal alone, so there is no `job-pending`
+ *                                    window and no approval-pending notify.
  *   8. dep-on-task                 — any depends_on upstream NOT { tag:"completed" }
  *   9. dep-on-epic                 — any depends_on_epics upstream's close NOT completed
  *  10. dep-on-task-synthetic-close — for the synthetic close row: any non-completed task
  *  11. single-task-per-epic        — post-pass: one non-completed slot per epic
  *                                    Occupancy keys on `isLiveWorkOccupant`, which
  *                                    INCLUDES `planner-running` — a planner blocks its
- *                                    OWN epic from dispatching sibling tasks — AND the
- *                                    approval-pending git verdicts (git-uncommitted,
- *                                    git-orphans), so the whole done+pending window
- *                                    holds the slot (fn-703).
+ *                                    OWN epic from dispatching sibling tasks — and
+ *                                    `dispatch-pending` (a launched-but-unbound
+ *                                    worker). fn-756 dropped the approval-pending
+ *                                    occupancy arm (`job-pending` + the fn-703 git
+ *                                    verdicts) along with the approval window.
  *  12. single-task-per-root        — post-pass: one non-completed slot per project root
  *                                    Occupancy keys on `isRootOccupant`, which EXCLUDES
  *                                    `planner-running` (fn-663) — a planner does NOT
  *                                    claim the root, so a sibling epic's ready task on
  *                                    the same root may dispatch concurrently with a
  *                                    planner. Real workers (job-running,
- *                                    sub-agent-running, sub-agent-stale, job-pending)
- *                                    and the approval-pending git verdicts
- *                                    (git-uncommitted, git-orphans, fn-703) still claim.
+ *                                    sub-agent-running, sub-agent-stale) and
+ *                                    `dispatch-pending` still claim.
  *                                    Per-epic and per-root therefore diverge on
  *                                    `planner-running`: blocking inside the planner's
  *                                    own epic, exempt across the rest of the root.
@@ -163,25 +135,17 @@ export function resolveEpicDep(
  * Structured block reason — discriminated union with structured payloads so
  * consumers can branch on `kind` without parsing strings.
  *
- * - `job-rejected` / `job-pending`     — this row's own approval state.
+ * - `job-rejected` / `job-pending`     — RETAINED-BUT-UNPRODUCED (fn-756). These were this row's own
+ *                                        approval state (predicates 4 and 7); the approval window is
+ *                                        gone, so no predicate emits them. The kinds stay in the union
+ *                                        (label/pill plumbing — removed in the schema-drop task `.2`).
  * - `epic-not-validated`               — parent epic has no `last_validated_at`.
- * - `git-uncommitted`                  — the live `git_status` row for this row's project root has
- *                                        `dirty_count > 0` (mechanical gate inserted at rank 6.5;
- *                                        payload-less by design — see the predicate-pipeline docstring
- *                                        for the rationale on placement).
- * - `git-orphans`                      — the live `git_status` row for this row's project root has
- *                                        `unattributed_to_live_count > 0` (mechanical gate inserted
- *                                        at rank 6.5; payload-less by design — complements
- *                                        `git-uncommitted` and fires when dirty count is zero but
- *                                        the project has dirty files no LIVE session is on the hook
- *                                        for). The reason kind string stays `git-orphans` for
- *                                        backward compatibility with autopilot's literal
- *                                        comparisons (`scripts/autopilot.ts:230,238,449`); the
- *                                        underlying column is the schema-v31 rename
- *                                        `git_unattributed_to_live_count` (legacy v28 "orphan"
- *                                        semantic preserved). The new strict-mystery
- *                                        `git_orphan_count` (zero-attribution from any session)
- *                                        is informational only at v31 and does not feed this kind.
+ * - `git-uncommitted` / `git-orphans`  — RETAINED-BUT-UNPRODUCED (fn-756). These were the fn-703
+ *                                        git-cleanliness gate at rank 6.5 that blocked the now-deleted
+ *                                        `/plan:approve` dispatch on a dirty worktree. With the
+ *                                        approval window gone, predicate 6.5 is deleted and no path
+ *                                        emits these kinds. They stay in the union for label/pill
+ *                                        plumbing — removed in the schema-drop task `.2`.
  * - `dep-on-task`                      — an upstream task is not completed (carries the upstream id).
  * - `dep-on-epic`                      — an upstream epic's close is not completed. Carries the
  *                                        resolved full epic id as `upstream`. When the upstream's
@@ -670,7 +634,11 @@ function evaluateTask(
   // call-site symmetry with `evaluateCloseRow` and the
   // post-pass mutex helpers.
   _perCloseRow: Map<string, Verdict>,
-  gitStatusByProjectDir: Map<
+  // fn-756: the fn-703 git-cleanliness lift (predicate 6.5) was the sole
+  // reader of this map at the task layer; with the approval window gone it
+  // is no longer consulted here. Retained in the signature (underscored) for
+  // call-site symmetry with `computeReadiness`'s public surface.
+  _gitStatusByProjectDir: Map<
     string,
     { dirty_count: number; unattributed_to_live_count: number }
   >,
@@ -680,9 +648,9 @@ function evaluateTask(
   now: number,
   // fn-721: the canonical `verb::id` keys of every open `pending_dispatches`
   // row, and the running set of keys MATCHED so far. The task arm matches
-  // `work::<task_id>` and `approve::<task_id>`; a match records the key into
-  // `matchedPendingKeys` (so it does NOT also drive the root-fallback) and
-  // sets the late-rank `dispatch-pending` occupant verdict below.
+  // `work::<task_id>`; a match records the key into `matchedPendingKeys` (so
+  // it does NOT also drive the root-fallback) and sets the late-rank
+  // `dispatch-pending` occupant verdict below.
   pendingKeys: Set<string>,
   matchedPendingKeys: Set<string>,
 ): Verdict {
@@ -749,7 +717,6 @@ function evaluateTask(
   // first two clauses hold it at `job-running` / `sub-agent-running`.
   if (
     task.worker_phase === "done" &&
-    task.approval === "approved" &&
     !anyEmbeddedJobWorking(task.jobs) &&
     !anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId) &&
     !embeddedMonitorOccupies(task.jobs, now)
@@ -783,13 +750,10 @@ function evaluateTask(
     return { tag: "running", reason: { kind: "planner-running" } };
   }
 
-  // 4. own-approval-rejected — rejection is permanent regardless of session
-  // state, so it ranks ABOVE the session-running checks. The `pending` half
-  // of own-approval is split off to predicate 7 (below 5/6) so it cannot
-  // fire while a worker session is still alive — see predicate 7's comment.
-  if (task.approval === "rejected") {
-    return { tag: "blocked", reason: { kind: "job-rejected" } };
-  }
+  // 4. own-approval-rejected — REMOVED (fn-756). The approval enum no longer
+  // gates completion; a task completes on `worker_phase==="done"` alone
+  // (predicate 1 above). `task.approval` is still physically present on the
+  // projection but is read by no gate.
 
   // 5. own-progress-main — embedded jobs[] state vocabulary, no verb check
   // (the embedded array's verb is implied by where it lives — task-level
@@ -870,67 +834,19 @@ function evaluateTask(
     return { tag: "running", reason: { kind: "monitor-running" } };
   }
 
-  // 6.5. git-uncommitted / git-orphans — mechanical gate that blocks autopilot's
-  // /plan:approve dispatch when the worker's worktree has uncommitted dirty
-  // files or the project has dirty files no live session is on the hook for.
-  // Lifted from the /plan:approve skill's inferred LLM-as-judge cascade into
-  // this deterministic predicate.
-  //
-  // Gated on `worker_phase==="done"` (planctl stamped `worker_done_at`): the
-  // task hasn't reached the approval window before that, so the git state
-  // can't matter yet. Placed between 6 and 7 for the same race rationale as
-  // predicate 7: until every worker session AND every sub-agent is actually
-  // idle, the git read could capture a mid-yield Stop's stale dirty-tree
-  // reading and flap the pill.
-  //
-  // Source of counts: the live, project-wide `git_status` row keyed by
-  // `task.target_repo ?? epic.project_dir` (mirrors `effectiveRoot`'s
-  // task-row resolution). The per-job `git_dirty_count` /
-  // `git_unattributed_to_live_count` columns on the embedded jobs[] are a
-  // historical record of what each job's last live tick saw and freeze on
-  // terminal transition — reading them here would produce false
-  // `git-orphans` blocks against a since-clean tree. A missing map entry
-  // (no `git_status` snapshot for this root yet, or the autopilot
-  // simulator's deliberately-empty map) → skip the predicate and fall
-  // through to 7.
-  //
-  // Schema-v31 rename: the `unattributed_to_live_count` field on the
-  // readiness map sources the renamed `git_unattributed_to_live_count`
-  // column (legacy v28 "orphan" semantic, preserved under the new
-  // vocabulary — dirty files no LIVE session is on the hook for). The
-  // block-reason kind is `git-orphans` (NOT renamed) for backward
-  // compatibility with autopilot consumers — see `gitStatusByProjectDir`'s
-  // doc on `computeReadiness` for the column-name-vs-reason-kind
-  // divergence rationale.
-  if (task.worker_phase === "done") {
-    const root = task.target_repo ?? epic.project_dir;
-    const gs = root === null ? undefined : gitStatusByProjectDir.get(root);
-    if (gs !== undefined) {
-      if (gs.dirty_count > 0) {
-        return { tag: "blocked", reason: { kind: "git-uncommitted" } };
-      }
-      if (gs.unattributed_to_live_count > 0) {
-        return { tag: "blocked", reason: { kind: "git-orphans" } };
-      }
-    }
-  }
+  // 6.5. git-uncommitted / git-orphans — REMOVED (fn-756). This was the
+  // fn-703 git-cleanliness lift tied to the approval window: it blocked the
+  // autopilot's `/plan:approve` dispatch when the worktree was dirty. With
+  // the approval window gone (a task completes on `worker_phase==="done"`
+  // alone — predicate 1), there is no approve dispatch to gate, so the lift
+  // is dead. The worker commits its own work before yielding (`keeper
+  // commit-work`), so a clean tree is the worker's responsibility, not a
+  // completion gate.
 
-  // 7. own-approval-pending — deliberately ranks BELOW 5/6. `worker_phase`
-  // flips to "done" when planctl stamps `worker_done_at`, which can race
-  // ahead of the Claude session's Stop/SessionEnd (planctl `done` returns
-  // before the session exits). If `job-pending` fired here without 5/6
-  // clearing first, autopilot's approval-pending notify would page the
-  // human while the worker is still in-flight — exactly the bug this
-  // ordering exists to prevent. Once the session's embedded job state
-  // leaves `working` AND every sub-agent invocation finishes, this
-  // predicate fires and the notify lands at the right moment. The reducer's
-  // Stop arm carries a sub-running guard that keeps `state='working'` across
-  // a parent's mid-yield Stop while a sub-agent runs — without it the
-  // sequence (Stop while sub running → SubagentStop → UPS-resume → Stop)
-  // would dup-clear this predicate twice (see `src/reducer.ts` Stop arm).
-  if (task.approval === "pending" && task.worker_phase === "done") {
-    return { tag: "blocked", reason: { kind: "job-pending" } };
-  }
+  // 7. own-approval-pending — REMOVED (fn-756). The approval enum no longer
+  // gates completion; predicate 1 marks the task `completed` on
+  // `worker_phase==="done"` alone, so there is no `job-pending` window. The
+  // `task.approval` field is still physically present but read by no gate.
 
   // 8. dep-on-task — any upstream NOT `{ tag: "completed" }`. The pre-sorted
   // tasks order means typical intra-epic deps already have their upstream
@@ -952,9 +868,9 @@ function evaluateTask(
   // fan-out). Each entry is a {@link ResolvedEpicDep} carrying the
   // resolved upstream + a tri-state `state` field:
   //
-  //   - `satisfied` — upstream is `status==="done" && approval==="approved"`;
+  //   - `satisfied` — upstream is `status==="done"` (fn-756: no approval gate);
   //     dependency met. Skip.
-  //   - `blocked-incomplete` — upstream resolved but NOT done-and-approved.
+  //   - `blocked-incomplete` — upstream resolved but NOT done.
   //     Emit `dep-on-epic` (amber), carrying the resolved upstream id and the
   //     cross-project basename when `cross_project === true`. Same payload
   //     shape autopilot's BlockReason consumer reads byte-for-byte.
@@ -1082,7 +998,10 @@ function evaluateCloseRow(
   _jobs: Map<string, Job>,
   subRunningByJobId: Map<string, SubagentInvocation[]>,
   perTask: Map<string, Verdict>,
-  gitStatusByProjectDir: Map<
+  // fn-756: the fn-703 close-row git-cleanliness lift (predicate 6.5) was
+  // the sole reader of this map at the close-row layer; removed with the
+  // approval window. Retained (underscored) for call-site symmetry.
+  _gitStatusByProjectDir: Map<
     string,
     { dirty_count: number; unattributed_to_live_count: number }
   >,
@@ -1108,8 +1027,9 @@ function evaluateCloseRow(
     matchedPendingKeys.add(`close::${epic.epic_id}`);
   }
 
-  // 1. terminal-completed (close-row variant).
-  if (epic.status === "done" && epic.approval === "approved") {
+  // 1. terminal-completed (close-row variant). fn-756: completes on
+  // `epic.status==="done"` alone; the approval enum no longer gates.
+  if (epic.status === "done") {
     return { tag: "completed" };
   }
 
@@ -1138,13 +1058,10 @@ function evaluateCloseRow(
     return { tag: "running", reason: { kind: "planner-running" } };
   }
 
-  // 4. own-approval-rejected — the close row's own approval lives on the
-  // EPIC. Rejection is permanent regardless of session state and stays at
-  // rank 4; the `pending` half is split off to predicate 7 below the
-  // session-running checks.
-  if (epic.approval === "rejected") {
-    return { tag: "blocked", reason: { kind: "job-rejected" } };
-  }
+  // 4. own-approval-rejected — REMOVED (fn-756). The approval enum no longer
+  // gates completion; the close row completes on `epic.status==="done"`
+  // alone (predicate 1 above). `epic.approval` is still physically present
+  // but read by no gate.
 
   // 5. own-progress-main — close-row blocks on a running worker session at
   // EITHER scope: epic-level (close-verb) embedded jobs (the primary source),
@@ -1226,48 +1143,16 @@ function evaluateCloseRow(
     return { tag: "running", reason: { kind: "monitor-running" } };
   }
 
-  // 6.5. git-uncommitted / git-orphans — close-row variant. Gated on
-  // `epic.status === "done"` (planctl stamped the epic-level done status):
-  // the close row hasn't reached the approval window before that, so the
-  // git state can't matter yet. Same placement rationale as the task path
-  // (between 6 and 7 to avoid mid-yield Stop's stale dirty-tree readings).
-  //
-  // Source of counts: the live, project-wide `git_status` row keyed by
-  // `epic.project_dir` (no per-row override on the synthetic close row).
-  // Same rationale as the task path — the per-job `git_dirty_count` /
-  // `git_unattributed_to_live_count` columns freeze on terminal transition;
-  // the live `git_status` row is the honest source of truth.
-  //
-  // Schema-v31 rename: same column-name-vs-reason-kind divergence as the
-  // task path — read `unattributed_to_live_count` (the renamed legacy v28
-  // "orphan" column under its honest new name) but emit the unchanged
-  // `git-orphans` reason kind for autopilot backward compatibility. See
-  // the task path's predicate 6.5 comment and the `gitStatusByProjectDir`
-  // doc on `computeReadiness` for the full rationale.
-  if (epic.status === "done") {
-    const gs =
-      epic.project_dir === null
-        ? undefined
-        : gitStatusByProjectDir.get(epic.project_dir);
-    if (gs !== undefined) {
-      if (gs.dirty_count > 0) {
-        return { tag: "blocked", reason: { kind: "git-uncommitted" } };
-      }
-      if (gs.unattributed_to_live_count > 0) {
-        return { tag: "blocked", reason: { kind: "git-orphans" } };
-      }
-    }
-  }
+  // 6.5. git-uncommitted / git-orphans — REMOVED (fn-756). The close-row
+  // variant of the fn-703 git-cleanliness lift was gated on
+  // `epic.status==="done"` — exactly what predicate 1 now treats as
+  // `completed`, so this branch became unreachable AND its purpose (gating
+  // the approve dispatch) is gone with the approval window. Deleted.
 
-  // 7. own-approval-pending — close-row variant, mirrors the task path's
-  // rationale: `epic.status` flips to "done" via the planctl close-verb
-  // synthesis, which can race ahead of the close session's Stop/SessionEnd.
-  // Placing this below 5/6 ensures `job-pending` only fires once every
-  // close-verb AND work-verb session (and any sub-agent) is actually idle,
-  // so autopilot's approval notify lands at the right moment.
-  if (epic.approval === "pending" && epic.status === "done") {
-    return { tag: "blocked", reason: { kind: "job-pending" } };
-  }
+  // 7. own-approval-pending — REMOVED (fn-756). Predicate 1 marks the close
+  // row `completed` on `epic.status==="done"` alone, so there is no
+  // `job-pending` window. `epic.approval` is still physically present but
+  // read by no gate.
 
   // 8. dep-on-task — not applicable to the close row (it has no direct
   // task deps; predicate 10 below synthesizes those from the epic's tasks).
@@ -1290,8 +1175,7 @@ function evaluateCloseRow(
   // during active scaffolding, and perturb the predicate-2-precedence
   // tests. This rank catches EXACTLY the vacuous fall-through and nothing
   // else: every more-specific verdict above (completed, epic-not-validated,
-  // planner-running, job-rejected, job-running / sub-agent-running,
-  // git-uncommitted, job-pending) still wins.
+  // planner-running, job-running / sub-agent-running) still wins.
   if (epic.tasks.length === 0) {
     return { tag: "blocked", reason: { kind: "epic-no-tasks" } };
   }
@@ -1358,25 +1242,17 @@ function evaluateCloseRow(
  */
 /**
  * "Live work" predicate. A row whose verdict claims a mutex slot in pass-1
- * regardless of iteration order. The set is the running/queued/approval-pending
- * states that represent ACTUAL ongoing worker activity OR an open
- * approval-pending window on a target — the states where dispatching another
- * job to the same scope would land us with two live workers on one target, or
- * jump a sibling ahead of an in-flight approval.
+ * regardless of iteration order. The set is the running/queued states that
+ * represent ACTUAL ongoing worker activity on a target — the states where
+ * dispatching another job to the same scope would land us with two live
+ * workers on one target.
  *
  * Occupants:
  *   - every `running` verdict (job-running, sub-agent-running,
  *     sub-agent-stale, planner-running);
- *   - `job-pending` — the approval-pending notify window, ranked below the
- *     session-liveness checks (predicate 7);
- *   - `git-uncommitted` / `git-orphans` — the two predicate-6.5 git verdicts.
- *     These are sound occupants because predicate 6.5 is `worker_phase==="done"`-
- *     gated (:638) and ranks below predicate 1 (`completed`, requires approved)
- *     and predicate 4 (`job-rejected`), so a git verdict STRICTLY IMPLIES the
- *     done + approval-pending window — same administrative-state-vs-mutex race
- *     class as fn-671, one rank lower. Holding the slot keeps a depless ready
- *     sibling from jumping the queue while the dirty repo blocks the approve
- *     dispatch (fn-703).
+ *   - fn-756: the approval-pending occupants (`job-pending` and the fn-703
+ *     `git-uncommitted`/`git-orphans` verdicts) are REMOVED along with the
+ *     approval window — those verdicts are no longer produced;
  *   - `dispatch-pending` — fn-721. A worker autopilot LAUNCHED but whose
  *     SessionStart has not folded yet (an open `pending_dispatches` row). No
  *     `jobs` row exists in the launch → SessionStart blind window, so this is
@@ -1404,19 +1280,16 @@ function evaluateCloseRow(
 function isLiveWorkOccupant(verdict: Verdict): boolean {
   return (
     verdict.tag === "running" ||
+    // fn-756: the approval-pending occupancy arm (`job-pending` + the fn-703
+    // `git-uncommitted`/`git-orphans` approval-window verdicts) is REMOVED
+    // along with the approval window itself — none of those verdicts are
+    // produced any more. The sole remaining blocked-but-occupying signal is
+    // `dispatch-pending`.
     (verdict.tag === "blocked" &&
-      (verdict.reason.kind === "job-pending" ||
-        // fn-703: a git verdict ⟹ done + approval-pending window (predicate
-        // 6.5 is done-gated and ranks below `completed`/`job-rejected`), so
-        // the whole approval-pending window — not just the bare `job-pending`
-        // pill — holds the mutex. Additive, placed AFTER `job-pending`; never
-        // outranks `running`.
-        verdict.reason.kind === "git-uncommitted" ||
-        verdict.reason.kind === "git-orphans" ||
-        // fn-721: a launched-but-not-yet-bound worker (open `pending_dispatches`
-        // row) holds the mutex through the launch → SessionStart blind window
-        // — the ONE signal the slot is taken before a `jobs` row exists.
-        verdict.reason.kind === "dispatch-pending"))
+      // fn-721: a launched-but-not-yet-bound worker (open `pending_dispatches`
+      // row) holds the mutex through the launch → SessionStart blind window
+      // — the ONE signal the slot is taken before a `jobs` row exists.
+      verdict.reason.kind === "dispatch-pending")
   );
 }
 
@@ -1428,9 +1301,9 @@ function isLiveWorkOccupant(verdict: Verdict): boolean {
  * (git `index.lock` contention is absorbed by the git worker's
  * `busy_timeout`, and dirty-file multi-attribution mid-flight is resolved
  * after-the-fact by the mtime attribution pass). Real workers
- * (`job-running`, `sub-agent-running`, `sub-agent-stale`, `job-pending`) and
- * the approval-pending git verdicts (`git-uncommitted`, `git-orphans`) still
- * occupy via the `isLiveWorkOccupant` delegate (fn-703).
+ * (`job-running`, `sub-agent-running`, `sub-agent-stale`) and
+ * `dispatch-pending` still occupy via the `isLiveWorkOccupant` delegate
+ * (fn-756 dropped the approval-pending occupants).
  *
  * The per-EPIC mutex deliberately stays on `isLiveWorkOccupant` — a planner
  * still blocks its OWN epic from dispatching sibling tasks (predicate 3
@@ -1540,17 +1413,12 @@ export function applySingleTaskPerEpicMutex(
  * filters out a purely planner-derived close row, so a `planner-running`
  * close row never reaches this gate.
  *
- * fn-703 close-row mirror: the epic-level-running gate above does NOT cover a
- * quiescent done-but-unapproved epic on a dirty repo — predicate 6.5 renders
- * its close row `git-uncommitted` / `git-orphans` (gated on `epic.status ===
- * "done"`) with ZERO live epic-level job/sub-agent, so `epicLevelRunning` is
- * false yet the approval-pending window must still hold the epic's OWN root.
- * So the gate also claims when the close verdict is one of those two
- * predicate-6.5 git kinds. This stays strictly scoped to
- * `effectiveRoot(null, epic.project_dir)` — a git close row NEVER claims any
- * other root, so the fn-655/fn-663 cross-root phantom-lock narrowing is
- * preserved (the git state is the epic's own project_dir fact). Mirrors the
- * task-level fn-703 widening of `isLiveWorkOccupant`.
+ * fn-756: the fn-703 close-row git-verdict mirror is REMOVED. With the
+ * approval window gone, predicate 1 marks the close row `completed` on
+ * `epic.status === "done"` alone and predicate 6.5 is deleted, so a close
+ * verdict no longer carries `git-uncommitted`/`git-orphans` — the only
+ * non-running occupant the close-row gate now claims on is `dispatch-pending`
+ * (fn-721, below).
  *
  * fn-721 close-row mirror: same shape again for a `close::<epic_id>` launched
  * but not-yet-bound closer — the close row renders `dispatch-pending` with NO
@@ -1621,31 +1489,21 @@ export function applySingleTaskPerRootMutex(
       const epicLevelRunning =
         anyEmbeddedJobWorking(epic.jobs) ||
         anyEmbeddedJobHasRunningSubagent(epic.jobs, subRunningByJobId);
-      // fn-703: a quiescent done-but-unapproved epic on a dirty repo renders
-      // a close-row git verdict (predicate 6.5, gated on `epic.status ===
-      // "done"`) with NO live epic-level job/sub-agent — so `epicLevelRunning`
-      // is false and the running-derived claim above never fires, yet the
-      // approval-pending window must still hold the epic's OWN root (the
-      // close-row mirror of the task-level fn-703 fix). The git-verdict
-      // disjunct claims on either of the two predicate-6.5 reason kinds.
-      // Strictly scoped to `effectiveRoot(null, projectDir)` (the epic's own
-      // project_dir) — it does NOT broaden to any other root, preserving the
-      // fn-655/fn-663 narrowing that prevents cross-root phantom locks.
-      const closeRowGitVerdict =
-        closeVerdict.tag === "blocked" &&
-        (closeVerdict.reason.kind === "git-uncommitted" ||
-          closeVerdict.reason.kind === "git-orphans");
+      // fn-756: the fn-703 close-row git-verdict disjunct is REMOVED — the
+      // close row no longer produces `git-uncommitted`/`git-orphans` (predicate
+      // 6.5 deleted), so the only non-running occupant a close verdict can
+      // carry past `isRootOccupant` is `dispatch-pending`.
       // fn-721: a `close::<epic_id>` closer was LAUNCHED but not yet bound, so
       // the close row renders `dispatch-pending` with NO live epic-level job —
-      // `epicLevelRunning` is false. Same close-row mirror as the fn-703 git
-      // case: the launch-window occupancy is the epic's OWN project_dir fact
-      // (the closer was launched against THIS epic), so it must hold the
-      // epic's own root. Strictly scoped to `effectiveRoot(null, projectDir)`
-      // — preserving the fn-655/fn-663 no-cross-root-phantom-lock narrowing.
+      // `epicLevelRunning` is false. The launch-window occupancy is the epic's
+      // OWN project_dir fact (the closer was launched against THIS epic), so it
+      // must hold the epic's own root. Strictly scoped to
+      // `effectiveRoot(null, projectDir)` — preserving the fn-655/fn-663
+      // no-cross-root-phantom-lock narrowing.
       const closeRowDispatchPending =
         closeVerdict.tag === "blocked" &&
         closeVerdict.reason.kind === "dispatch-pending";
-      if (epicLevelRunning || closeRowGitVerdict || closeRowDispatchPending) {
+      if (epicLevelRunning || closeRowDispatchPending) {
         const root = effectiveRoot(null, projectDir);
         occupiedRoots.add(root);
       }

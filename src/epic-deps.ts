@@ -113,9 +113,12 @@ export function profileNameForUsageId(usageId: string): string {
  * (`default_visible=0`) and supplied to the resolver only via the
  * completed-epics index. Kept as a single helper so the resolver and the
  * close-row never drift on what "done" means.
+ *
+ * fn-756: collapsed to `status === "done"` alone — the approval enum no
+ * longer gates completion, matching `evaluateCloseRow`'s predicate 1.
  */
 export function epicIsCompleted(epic: Epic): boolean {
-  return epic.status === "done" && epic.approval === "approved";
+  return epic.status === "done";
 }
 
 /** Resolver outcome — discriminated union so callers can branch on `kind`. */
@@ -131,8 +134,8 @@ export type EpicDepResolution =
       cross_project: string | null;
       /**
        * fn-637: `true` when the resolved upstream is itself completed
-       * (`status==="done" && approval==="approved"` — the same terminal
-       * predicate `evaluateCloseRow` uses). A completed upstream satisfies
+       * (fn-756: `status==="done"` — the same terminal predicate
+       * `evaluateCloseRow` uses). A completed upstream satisfies
        * the dependency outright; predicate 9 skips it without consulting
        * `perCloseRow` (the completed upstream is pruned from the
        * default-visible page and reaches the resolver only via the

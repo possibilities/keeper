@@ -241,10 +241,14 @@ test("isRootOccupant: real running workers occupy the root", () => {
   expect(isRootOccupant(running({ kind: "monitor-stale" }))).toBe(true);
 });
 
-test("isRootOccupant: the job-pending + approval-pending window occupies (fn-703)", () => {
-  expect(isRootOccupant(blocked({ kind: "job-pending" }))).toBe(true);
-  expect(isRootOccupant(blocked({ kind: "git-uncommitted" }))).toBe(true);
-  expect(isRootOccupant(blocked({ kind: "git-orphans" }))).toBe(true);
+test("fn-756: the approval-pending occupants (job-pending / git verdicts) NO LONGER occupy", () => {
+  // fn-756 dropped the approval window: `isLiveWorkOccupant` no longer treats
+  // `job-pending` or the fn-703 `git-uncommitted`/`git-orphans` verdicts as
+  // occupants (none of those verdicts is even produced any more). Only `running`
+  // and `dispatch-pending` claim a slot.
+  expect(isRootOccupant(blocked({ kind: "job-pending" }))).toBe(false);
+  expect(isRootOccupant(blocked({ kind: "git-uncommitted" }))).toBe(false);
+  expect(isRootOccupant(blocked({ kind: "git-orphans" }))).toBe(false);
 });
 
 test("isRootOccupant: a launch-window dispatch-pending row occupies (fn-721)", () => {
@@ -635,32 +639,12 @@ test("fn-719: a still-working job outranks the monitor fact (predicate 5 wins ov
   );
 });
 
-test("fn-719 close-row: epic-level close-verb job with a live monitor → close row running:monitor-running", () => {
-  // The PRIMARY close-row case: a `close` session that backgrounded its own
-  // suite, Stopped (embedded job `stopped`), planctl stamped epic status
-  // `done`, but approval is still `pending` — the approval window that
-  // bypasses close-row predicate 1 and reaches the 5/6/6.6 session-liveness
-  // checks (same window the close-row git predicate 6.5 fires in). The
-  // close-row predicate-6.6 twin holds it at `running:monitor-running`, so
-  // the closer/approve cannot dispatch into a not-actually-idle close session.
-  const epic = makeEpic({
-    status: "done",
-    approval: "pending",
-    tasks: [],
-    jobs: [
-      makeEmbeddedJob({
-        job_id: "closer-1",
-        plan_verb: "close",
-        state: "stopped",
-        has_live_worker_monitor: true,
-      }),
-    ],
-  });
-  const snap = run([epic]);
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    running({ kind: "monitor-running" }),
-  );
-});
+// fn-756: the close-row predicate-6.6 live-monitor case for a `status:done`
+// epic is REMOVED. The old test relied on the `status:done + approval:pending`
+// window bypassing close-row predicate 1 to reach the 6.6 liveness check. With
+// the approval gate gone, a `status:done` close row is `completed` at predicate
+// 1 — a still-live closer pane is spared by the completion-reap's `exited ===
+// false` live-veto, so no mutex-holding monitor verdict is needed.
 
 test("predicate 1 wins over 2 (epic-not-validated)", () => {
   const task = makeTask({ worker_phase: "done", approval: "approved" });
@@ -767,44 +751,18 @@ test("predicate 3 (planner-running) wins over 4 (own-approval-rejected)", () => 
   );
 });
 
-test("predicate 4 own-approval-rejected: job-rejected fires for a done+rejected task", () => {
-  // Rejection is permanent regardless of session state, so rejected ranks
-  // above 5/6/7. The `pending` half lives at predicate 7 and is exercised
-  // separately below.
-  const task = makeTask({ worker_phase: "done", approval: "rejected" });
-  const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-rejected" }),
-  );
-});
+// fn-756: predicate 4 (own-approval-rejected → job-rejected) is REMOVED. The
+// approval enum no longer gates completion, so a `done` task is `completed`
+// regardless of any (now-ignored) `approval` value. The two former predicate-4
+// tests are deleted.
 
-test("predicate 4 (own-approval-rejected) wins over 5 (own-progress-main)", () => {
-  // A rejected task whose worker is still running shows `job-rejected` —
-  // rejection is the terminal verdict on this row regardless of session
-  // state.
-  const task = makeTask({
-    worker_phase: "open",
-    approval: "rejected",
-    jobs: [makeEmbeddedJob({ state: "working" })],
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-rejected" }),
-  );
-});
-
-test("predicate 5 (own-progress-main) wins over 7 (own-approval-pending)", () => {
-  // The regression this guards: `worker_phase` flips to "done" when
-  // planctl stamps `worker_done_at`, which can race ahead of the Claude
-  // session's Stop/SessionEnd. If `job-pending` fired at the old rank-4
-  // position, autopilot's approval notify would page the human while the
-  // worker is still in-flight. The worker-still-running row reports
-  // `job-running`, NOT `job-pending`.
+test("fn-756: predicate 5 (own-progress-main) still holds a worker-done task at job-running", () => {
+  // A worker-done task whose embedded job is still `working` must NOT collapse
+  // to `completed` (predicate 1 ANDs in the no-live-work clauses); it reports
+  // `job-running` until the session winds down. This is the race guard that
+  // keeps the per-epic/per-root mutexes held while the worker is alive.
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ state: "working" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -942,10 +900,11 @@ test("predicate 6: default `now` (NEGATIVE_INFINITY) never flips to sub-agent-st
   );
 });
 
-test("predicate 7 (own-approval-pending) fires once the worker session is idle", () => {
-  // Worker has stopped (embedded job state="stopped"), no sub-agents
-  // running, approval still pending — this is the moment autopilot is
-  // allowed to page the human.
+test("fn-756: a worker-done task with an idle session is COMPLETED (no approval gate)", () => {
+  // Pre-fn-756 this row (worker done, embedded job stopped, no sub-agents,
+  // approval pending) fired predicate 7 → `job-pending`. fn-756 collapsed
+  // predicate 1 to `worker_phase === "done"` alone, so the idle worker-done
+  // row is now terminal `completed` — the approval enum is ignored.
   const task = makeTask({
     worker_phase: "done",
     approval: "pending",
@@ -953,252 +912,7 @@ test("predicate 7 (own-approval-pending) fires once the worker session is idle",
   });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-pending" }),
-  );
-});
-
-// ---------------------------------------------------------------------------
-// Predicate 6.5 (git-uncommitted / git-orphans) — fn-620 mechanical
-// git-cleanliness gate. Insertion-point race rationale mirrors predicate 7:
-// the gate must wait until every worker session and sub-agent is actually
-// idle before sampling git state, otherwise mid-yield Stops produce stale
-// dirty-tree readings.
-// ---------------------------------------------------------------------------
-
-test("predicate 6.5 git-uncommitted wins over 7 (own-approval-pending)", () => {
-  // Worker idle, approval pending, and the live `git_status` map for the
-  // epic's project_dir reports dirty_count > 0 — the mechanical gate
-  // fires and blocks autopilot's approve dispatch before predicate 7 ever
-  // gets a look. fn-626: predicate 6.5 now reads off the live project-wide
-  // `git_status` row, not the embedded per-job count columns.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 3, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "git-uncommitted" }),
-  );
-});
-
-test("predicate 6.5 git-orphans fires when dirty count is zero but orphan count > 0", () => {
-  // git-uncommitted takes priority over git-orphans; with dirty=0 and
-  // orphans>0, the predicate reports git-orphans.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 0, unattributed_to_live_count: 2 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "git-orphans" }),
-  );
-});
-
-test("predicate 5 (own-progress-main) wins over 6.5 git-uncommitted", () => {
-  // The worker is still running AND the live tree is dirty. Predicate 5
-  // fires first — git state is captured opportunistically and might be
-  // stale mid-yield; the gate must wait for session idle.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-    jobs: [makeEmbeddedJob({ plan_verb: "work", state: "working" })],
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 5, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    running({ kind: "job-running" }),
-  );
-});
-
-test("predicate 6 (own-progress-sub) wins over 6.5 git-uncommitted", () => {
-  // Worker stopped but a sub-agent is still running. Same race as 5/6.5:
-  // git state could be stale while the sub-agent is mid-edit; the gate
-  // must wait for sub-agent idle.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        job_id: "worker-1",
-        plan_verb: "work",
-        state: "stopped",
-      }),
-    ],
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const subs = [makeSub({ job_id: "worker-1", status: "running" })];
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 3, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), subs, gitMap);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    running({ kind: "sub-agent-running" }),
-  );
-});
-
-test("predicate 6.5 skipped when worker_phase !== 'done' (task path)", () => {
-  // Gate is gated on worker_phase==="done". A worker still mid-flight with
-  // worker_phase="open" never reaches the approval window, so git state
-  // doesn't matter yet — the gate is skipped and the row falls through.
-  // Here predicate 7 also fails (worker_phase != "done") so the row is
-  // ready (then per-epic/per-root mutexes apply, but with a single task,
-  // ready stands).
-  const task = makeTask({
-    worker_phase: "open",
-    approval: "pending",
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 5, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "ready" });
-});
-
-test("predicate 6.5 skipped when no git_status entry for the project root (task path)", () => {
-  // fn-626: the predicate looks up `task.target_repo ?? epic.project_dir`
-  // in the `gitStatusByProjectDir` map. A missing entry (no live snapshot
-  // for the root yet, or the autopilot simulator's deliberately-empty map)
-  // → skip and fall through to 7, which fires.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const snap = run([epic]); // empty git map by default
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "job-pending" }),
-  );
-});
-
-test("predicate 6.5 uses task.target_repo when set, falling back to epic.project_dir otherwise", () => {
-  // Cross-repo task: target_repo points to a different worktree than the
-  // epic. The predicate must look up the live `git_status` for the task's
-  // target_repo, NOT the epic's project_dir. Same root-resolution shape
-  // `effectiveRoot` uses for the per-root mutex.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-    target_repo: "/other-repo",
-  });
-  const epic = makeEpic({ tasks: [task], project_dir: "/repo" });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
-    ["/other-repo", { dirty_count: 0, unattributed_to_live_count: 7 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "git-orphans" }),
-  );
-});
-
-test("fn-690 scoping: an incidental watched non-target repo does not affect dispatch", () => {
-  // The fn-690 dynamic watch-membership gate (src/git-worker.ts) widens
-  // the watched set to ANY dirty / ahead-of-upstream repo, including
-  // ones that are not a `task.target_repo` or `epic.project_dir`. The
-  // load-bearing invariant is that predicate 6.5 ONLY consults the
-  // git_status row keyed by `task.target_repo ?? epic.project_dir`, so
-  // an incidental watched repo (no plan ties) cannot affect dispatch.
-  //
-  // Scenario: the task targets `/repo` (clean). The gitMap ALSO carries
-  // a `/other` row (the incidental watched repo) with dirty_count=5 +
-  // unattributed=5. Predicate 6.5 must read /repo (clean → skip the
-  // gate) and ignore /other entirely.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-    target_repo: "/repo",
-  });
-  const epic = makeEpic({ tasks: [task], project_dir: "/repo" });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
-    // Incidental watched non-target repo — dirty + orphaned but it's NOT
-    // this task's target. Predicate 6.5 must not key on it.
-    ["/other", { dirty_count: 5, unattributed_to_live_count: 5 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  // Falls through to predicate 7 (approval pending → job-pending).
-  // Specifically NOT blocked on git-uncommitted / git-orphans — the
-  // incidental watched repo is invisible to the task's gate.
-  const verdict = snap.perTask.get(task.task_id);
-  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
-  expect(verdict).not.toEqual(blocked({ kind: "git-uncommitted" }));
-  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
-});
-
-test("predicate 6.5 fires for evaluateCloseRow keyed by epic.project_dir", () => {
-  // Close-row variant — the gate reads the live `git_status` row for
-  // `epic.project_dir` (no per-row override on the synthetic close row).
-  // Epic.status === "done" gates the predicate; the live row's
-  // dirty_count > 0 fires the block.
-  const task = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "approved",
-  });
-  const epic = makeEpic({
-    tasks: [task],
-    status: "done",
-    approval: "pending",
-  });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 4, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    blocked({ kind: "git-uncommitted" }),
-  );
-});
-
-test("predicate 6.5 skipped when epic.status !== 'done' (close-row path)", () => {
-  // Gate is gated on epic.status==="done". An epic still mid-flight never
-  // reaches the close-approval window, so git state doesn't matter yet —
-  // the gate is skipped. Predicate 10 (dep-on-task-synthetic-close) then
-  // blocks the close row because the only task is not completed.
-  const task = makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" });
-  const epic = makeEpic({
-    tasks: [task],
-    status: "open",
-    approval: "pending",
-  });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 5, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    blocked({ kind: "dep-on-task", upstream: "fn-1-foo.1" }),
-  );
-});
-
-test("predicate 6.5 skipped when no git_status entry for epic.project_dir (close-row path)", () => {
-  // Close row with epic.status==="done" but no live git_status entry —
-  // the predicate falls through to 7 which fires.
-  const task = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "approved",
-  });
-  const epic = makeEpic({
-    tasks: [task],
-    status: "done",
-    approval: "pending",
-  });
-  const snap = run([epic]); // empty git map
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    blocked({ kind: "job-pending" }),
-  );
+  expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
 });
 
 // ---------------------------------------------------------------------------
@@ -1244,163 +958,6 @@ test("fn-700 rollup: zero-task epic header surfaces blocked:epic-no-tasks (no ro
   const snap = run([epic]);
   expect(snap.perEpic.get(epic.epic_id)).toEqual(
     blocked({ kind: "epic-no-tasks" }),
-  );
-});
-
-// ---------------------------------------------------------------------------
-// fn-626 regression: terminal worker carries a stale per-job count, but the
-// live `git_status` row says zero. The fix moved predicate 6.5 off the
-// embedded per-job columns (which freeze on terminal worker transition)
-// and onto the live project-wide `git_status` map. A re-running predicate
-// MUST read the live count and verdict `ready`, not block on `git-orphans`.
-// ---------------------------------------------------------------------------
-
-test("fn-626 task arm: terminal worker with stale git_orphan_count > 0 but fresh git_status unattributed_to_live_count == 0 → does not block on git-orphans", () => {
-  // The witnessed bug: epic 623 task 1's worker (state=ended) carried
-  // git_orphan_count=2 frozen on terminal transition, but the live
-  // git_status row for /Users/mike/code/keeper correctly says 0. Predicate
-  // 6.5 must read the live row (the map), not the stale per-job column,
-  // so the task verdict no longer reports `git-orphans`.
-  //
-  // Approval is pending here so the row reaches predicate 6.5 (predicate 1
-  // would short-circuit a done+approved task to `completed`); the
-  // load-bearing assertion is that the stale per-job count cannot resurrect
-  // a `git-orphans` block when the live count is 0 — instead the row falls
-  // through to predicate 7 (`job-pending`).
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        job_id: "worker-1",
-        plan_verb: "work",
-        state: "ended", // terminal — per-job counts are now frozen
-        git_dirty_count: 0,
-        git_orphan_count: 2, // stale snapshot from when the worker was live
-      }),
-    ],
-  });
-  const epic = makeEpic({ tasks: [task] });
-  // Live `git_status` row for /repo reports clean — the project-wide
-  // state has moved on since the worker froze its per-job counts.
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  const verdict = snap.perTask.get(task.task_id);
-  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
-  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
-});
-
-test("fn-626 close-row arm: stale embedded close-verb git_orphan_count > 0 but fresh git_status unattributed_to_live_count == 0 → does not block on git-orphans", () => {
-  // Mirror of the task-arm regression for the close row. Epic.status="done"
-  // with a terminal close-verb embedded job carrying frozen
-  // git_orphan_count=2, but the live `git_status` for the epic's
-  // project_dir reports 0 — the close row must not block on `git-orphans`.
-  const task = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "approved",
-  });
-  const epic = makeEpic({
-    tasks: [task],
-    status: "done",
-    approval: "pending",
-    jobs: [
-      makeEmbeddedJob({
-        job_id: "closer-1",
-        plan_verb: "close",
-        state: "ended", // terminal — counts frozen
-        git_dirty_count: 0,
-        git_orphan_count: 2, // stale frozen snapshot
-      }),
-    ],
-  });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  const verdict = snap.perCloseRow.get(epic.epic_id);
-  // Live count is 0 → predicate 6.5 doesn't fire. Falls through to 7
-  // (epic.approval="pending", epic.status="done") → job-pending. The
-  // load-bearing assertion is that `git-orphans` does NOT fire on the
-  // stale per-job count.
-  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
-  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
-});
-
-// ---------------------------------------------------------------------------
-// fn-633.7 acceptance: predicate 6.5 sources from `unattributed_to_live_count`
-// (the renamed legacy v28 "orphan" column under its honest new name), not
-// from the new strict-mystery `git_orphan_count`. The strict-mystery column
-// is informational only at v31 — it captures truly orphan files (no
-// attribution from ANY session past or present) and surfaces in
-// `scripts/git.ts` for human inspection, but does NOT block readiness.
-// ---------------------------------------------------------------------------
-
-test("fn-633.7 task arm: strict-mystery orphan_count > 0 with unattributed_to_live_count == 0 does NOT block predicate 6.5", () => {
-  // The readiness map only carries `unattributed_to_live_count` (the
-  // legacy v28 "orphan" semantic). The new schema-v31 strict-mystery
-  // `git_orphan_count` on the wire is not projected into the map by
-  // design — it's informational only. So a project with strict-mystery
-  // orphans but zero unattributed-to-live files must NOT trigger
-  // predicate 6.5; the row falls through to predicate 7.
-  //
-  // Concretely: the readiness map is the only signal predicate 6.5
-  // reads, and it carries `unattributed_to_live_count: 0`. The test
-  // asserts the predicate does not block — that's the v31 contract:
-  // strict-mystery is informational, only unattributed-to-live blocks.
-  const task = makeTask({
-    worker_phase: "done",
-    approval: "pending",
-  });
-  const epic = makeEpic({ tasks: [task] });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  const verdict = snap.perTask.get(task.task_id);
-  // Predicate 6.5 does not fire; falls through to 7 (`job-pending`)
-  // because `worker_phase==="done"` and `approval==="pending"`.
-  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
-  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
-});
-
-test("fn-633.7 close-row arm: strict-mystery orphan_count > 0 with unattributed_to_live_count == 0 does NOT block predicate 6.5", () => {
-  // Close-row mirror of the task-arm test. Same v31 contract: only
-  // `unattributed_to_live_count > 0` triggers `git-orphans`; the
-  // strict-mystery column on the wire is informational only.
-  const task = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "approved",
-  });
-  const epic = makeEpic({
-    tasks: [task],
-    status: "done",
-    approval: "pending",
-  });
-  const gitMap = new Map([
-    ["/repo", { dirty_count: 0, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  const verdict = snap.perCloseRow.get(epic.epic_id);
-  expect(verdict).toEqual(blocked({ kind: "job-pending" }));
-  expect(verdict).not.toEqual(blocked({ kind: "git-orphans" }));
-});
-
-test("close row: predicate 5 (own-progress-main) wins over 7 (own-approval-pending)", () => {
-  // Close-row variant of the same race. Epic.status==="done" can be
-  // synthesized while the close-verb session is still alive; the close
-  // row must not flip to `job-pending` until that session is idle.
-  const epic = makeEpic({
-    status: "done",
-    approval: "pending",
-    jobs: [makeEmbeddedJob({ state: "working" })],
-  });
-  const snap = run([epic]);
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    running({ kind: "job-running" }),
   );
 });
 
@@ -1598,61 +1155,15 @@ test("per-epic: doesn't fire when only one non-completed task exists", () => {
 // predicate-6.5 git verdict. That verdict now occupies the mutex slot for the
 // whole approval-pending window, so a depless ready sibling is held instead of
 // jumping the queue (the observed "task 3 running before task 2" bug).
-test("per-epic: git-uncommitted (done+pending+dirty) occupies → depless ready sibling blocks", () => {
-  const blocked6_5 = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "pending",
-    target_repo: "/r",
-  });
-  const ready = makeTask({
-    task_id: "fn-1-foo.2",
-    task_number: 2,
-    target_repo: "/r",
-  });
-  const epic = makeEpic({ tasks: [blocked6_5, ready], project_dir: "/r" });
-  const gitMap = new Map([
-    ["/r", { dirty_count: 2, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
-    blocked({ kind: "git-uncommitted" }),
-  );
-  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
-    blocked({ kind: "single-task-per-epic" }),
-  );
-});
+// fn-756: the per-epic git-occupancy tests are REMOVED. They relied on a
+// `done+pending+dirty` task rendering predicate 6.5 (`git-uncommitted`/
+// `git-orphans`) and holding the per-epic mutex. With predicate 6.5 gone, a
+// worker-done task is `completed` (which does NOT occupy), so a ready sibling
+// simply wins the slot — no git-derived occupancy remains.
 
-test("per-epic: git-orphans variant (done+pending, orphans>0) occupies identically", () => {
-  const blocked6_5 = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "pending",
-    target_repo: "/r",
-  });
-  const ready = makeTask({
-    task_id: "fn-1-foo.2",
-    task_number: 2,
-    target_repo: "/r",
-  });
-  const epic = makeEpic({ tasks: [blocked6_5, ready], project_dir: "/r" });
-  const gitMap = new Map([
-    ["/r", { dirty_count: 0, unattributed_to_live_count: 1 }],
-  ]);
-  const snap = run([epic], new Map(), [], gitMap);
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
-    blocked({ kind: "git-orphans" }),
-  );
-  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
-    blocked({ kind: "single-task-per-epic" }),
-  );
-});
-
-// Guard (fn-703): occupancy here relies on predicate 6.5's done-gate, which
-// makes the git verdict strictly imply the done+approval-pending window. Pin
-// that gate so a future ladder reorder fails loudly instead of silently
-// over-claiming. A NOT-done task in a dirty repo must NOT render a git verdict.
-test("guard: a not-done task in a dirty repo does NOT get a git verdict (pins 6.5 done-gate)", () => {
+// fn-756: a not-done task in a dirty repo is `ready` (the git lift is gone, so
+// git state never produces a verdict on any row).
+test("a not-done task in a dirty repo is ready (no git lift)", () => {
   const notDone = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "open",
@@ -1664,8 +1175,6 @@ test("guard: a not-done task in a dirty repo does NOT get a git verdict (pins 6.
     ["/r", { dirty_count: 9, unattributed_to_live_count: 9 }],
   ]);
   const snap = run([epic], new Map(), [], gitMap);
-  // worker_phase !== "done" → predicate 6.5 is skipped → falls through to
-  // ready (no blocking predicate above it applies).
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
 });
 
@@ -1704,54 +1213,16 @@ test("per-root: same-root tasks in DIFFERENT epics → first wins, second blocks
 // fn-703: a done+pending+dirty task (git verdict) in epic 1 claims its root,
 // so a ready task in epic 2 on the SAME root is demoted to single-task-per-root
 // — the cross-epic mirror of the per-epic occupancy fix.
-test("per-root: git-uncommitted (done+pending+dirty) in one epic occupies the root → cross-epic ready task blocks", () => {
-  const e1t1 = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "pending",
-    target_repo: "/r",
-  });
-  const e1 = makeEpic({
-    epic_id: "fn-1-foo",
-    epic_number: 1,
-    project_dir: "/r",
-    tasks: [e1t1],
-  });
-  const e2t1 = makeTask({
-    task_id: "fn-2-bar.1",
-    epic_id: "fn-2-bar",
-    target_repo: "/r",
-  });
-  const e2 = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/r",
-    tasks: [e2t1],
-  });
-  const gitMap = new Map([
-    ["/r", { dirty_count: 1, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([e1, e2], new Map(), [], gitMap);
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
-    blocked({ kind: "git-uncommitted" }),
-  );
-  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
-    blocked({ kind: "single-task-per-root" }),
-  );
-});
+// fn-756: the per-root git-occupancy tests are REMOVED. They relied on a
+// `done+pending+dirty` task (predicate 6.5 `git-uncommitted`/`git-orphans`) or a
+// quiescent done-but-unapproved epic's close-row git verdict claiming the root.
+// With predicate 6.5 gone and a `status:done` epic collapsing to `completed`,
+// neither verdict exists — a completed row never claims a root.
 
-// fn-703 (task .2): a QUIESCENT done-but-unapproved epic on a dirty repo —
-// all tasks completed, NO live epic-level job/sub-agent — renders a close-row
-// git verdict (predicate 6.5). That close row claims the epic's OWN root, so a
-// sibling epic's ready task on the SAME root is demoted single-task-per-root.
-// This is the close-row mirror of the task-level fn-703 occupancy fix; it FAILS
-// with only task .1's change (the close-row claim gate was epicLevelRunning-only
-// and never fired on a quiescent git close verdict) and passes with the gate
-// edit adding the git-verdict disjunct.
-test("per-root: quiescent done+pending epic with close-row git-uncommitted claims its root → cross-epic ready task blocks", () => {
-  // epic 1: status=done, approval=pending, all tasks completed
-  // (done+approved → per-task predicate 1 collapses to `completed`, NOT an
-  // occupant), NO jobs/subs. Close row hits predicate 6.5 → git-uncommitted.
+// fn-756: a COMPLETED close row (status=done) does NOT claim the root — a
+// sibling epic's ready task on the same root stays ready. (Was: a quiescent
+// done+pending close row rendered `job-pending`, also a non-occupant.)
+test("per-root: a completed close row does NOT claim the root → cross-epic ready task stays ready", () => {
   const e1t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -1763,7 +1234,6 @@ test("per-root: quiescent done+pending epic with close-row git-uncommitted claim
     epic_number: 1,
     project_dir: "/r",
     status: "done",
-    approval: "pending",
     tasks: [e1t1],
   });
   const e2t1 = makeTask({
@@ -1777,101 +1247,9 @@ test("per-root: quiescent done+pending epic with close-row git-uncommitted claim
     project_dir: "/r",
     tasks: [e2t1],
   });
-  const gitMap = new Map([
-    ["/r", { dirty_count: 3, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([e1, e2], new Map(), [], gitMap);
-  // sanity: the quiescent epic's completed task is NOT a root occupant, and
-  // the close row carries the git verdict.
-  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "completed" });
-  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
-    blocked({ kind: "git-uncommitted" }),
-  );
-  // the close-row git verdict claims /r → epic 2's ready task demoted.
-  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
-    blocked({ kind: "single-task-per-root" }),
-  );
-});
-
-// fn-703 (task .2): the git-verdict disjunct stays STRICTLY scoped to the
-// epic's OWN project_dir — a quiescent git close row in epic 1 (root /r1)
-// must NOT phantom-lock an UNRELATED root /r2 where a sibling epic's ready
-// task lives. Pins the fn-655/fn-663 narrowing against regression.
-test("per-root: quiescent close-row git verdict does NOT claim a different root (no phantom lock)", () => {
-  const e1t1 = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "approved",
-    target_repo: "/r1",
-  });
-  const e1 = makeEpic({
-    epic_id: "fn-1-foo",
-    epic_number: 1,
-    project_dir: "/r1",
-    status: "done",
-    approval: "pending",
-    tasks: [e1t1],
-  });
-  const e2t1 = makeTask({
-    task_id: "fn-2-bar.1",
-    epic_id: "fn-2-bar",
-    target_repo: "/r2",
-  });
-  const e2 = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/r2",
-    tasks: [e2t1],
-  });
-  const gitMap = new Map([
-    ["/r1", { dirty_count: 3, unattributed_to_live_count: 0 }],
-  ]);
-  const snap = run([e1, e2], new Map(), [], gitMap);
-  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
-    blocked({ kind: "git-uncommitted" }),
-  );
-  // epic 2 is on /r2 — untouched by the /r1 close-row claim.
-  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
-});
-
-// fn-703 (task .2) regression: the NON-git close-row path is unchanged. A
-// quiescent done+pending epic on a CLEAN repo with no live epic-level work
-// renders its close row `job-pending` (predicate 7) — NOT a git verdict and
-// NOT epicLevelRunning — so it does NOT claim the root, and a sibling epic's
-// ready task on the same root stays ready. Confirms the git-verdict disjunct
-// did not widen the claim beyond the two predicate-6.5 kinds.
-test("per-root: quiescent non-git close row (clean repo, job-pending) does NOT claim the root", () => {
-  const e1t1 = makeTask({
-    task_id: "fn-1-foo.1",
-    worker_phase: "done",
-    approval: "approved",
-    target_repo: "/r",
-  });
-  const e1 = makeEpic({
-    epic_id: "fn-1-foo",
-    epic_number: 1,
-    project_dir: "/r",
-    status: "done",
-    approval: "pending",
-    tasks: [e1t1],
-  });
-  const e2t1 = makeTask({
-    task_id: "fn-2-bar.1",
-    epic_id: "fn-2-bar",
-    target_repo: "/r",
-  });
-  const e2 = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/r",
-    tasks: [e2t1],
-  });
-  // clean repo (no git map entry / zero counts) → predicate 6.5 skipped →
-  // close row falls through to job-pending (predicate 7), NOT a root occupant.
   const snap = run([e1, e2]);
-  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
-    blocked({ kind: "job-pending" }),
-  );
+  // epic 1's close row is `completed` (status=done) → NOT a root occupant.
+  expect(snap.perCloseRow.get("fn-1-foo")).toEqual({ tag: "completed" });
   expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
 });
 
@@ -2031,24 +1409,21 @@ test("epic header rollup: zero-task epic — header = close-row verdict (blocked
   );
 });
 
-test("epic header rollup: all tasks done+approved + close blocked → header inherits close reason", () => {
-  // Close row is pending → predicate 7 fires job-pending, but only when
-  // epic.status === "done". With status=open the close row is just `ready`
-  // (after dep-on-task-synthetic-close passes). To get a non-ready close
-  // we set status=open + pending approval (no own-approval fire) — close
-  // is ready. To produce a blocked close, mark epic.approval=rejected.
+test("epic header rollup: a blocked close (epic-not-validated) → header inherits it", () => {
+  // fn-756: with the approval enum gone there's no `job-rejected`/`job-pending`
+  // close-row block. A non-validated epic blocks BOTH its task and its close
+  // row with `epic-not-validated`; the header inherits that reason.
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
-  const epic = makeEpic({ tasks: [t], approval: "rejected" });
+  const epic = makeEpic({ tasks: [t], last_validated_at: null });
   const snap = run([epic]);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    blocked({ kind: "job-rejected" }),
+    blocked({ kind: "epic-not-validated" }),
   );
   expect(snap.perEpic.get(epic.epic_id)).toEqual(
-    blocked({ kind: "job-rejected" }),
+    blocked({ kind: "epic-not-validated" }),
   );
 });
 
@@ -2056,39 +1431,43 @@ test("epic header rollup: completed close → completed header", () => {
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
   const epic = makeEpic({
     tasks: [t],
     status: "done",
-    approval: "approved",
   });
   const snap = run([epic]);
   expect(snap.perEpic.get(epic.epic_id)).toEqual({ tag: "completed" });
 });
 
 test("epic header rollup: mixed states — reason from FIRST non-completed in traversal", () => {
+  // fn-756: the FIRST non-completed (and non-ready) task in traversal drives
+  // the header. Task 1 is completed (worker-done); task 2 is blocked on a
+  // dangling epic dep; task 3 is also blocked on the same dangling dep (no
+  // ready row exists to elevate the header to `ready`). The rollup picks task
+  // 2's `dep-on-epic-dangling` — the first non-completed in traversal order.
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
     task_number: 2,
-    worker_phase: "done",
-    approval: "rejected", // first non-completed in traversal
+    worker_phase: "open",
   });
   const t3 = makeTask({
     task_id: "fn-1-foo.3",
     task_number: 3,
-    worker_phase: "done",
-    approval: "pending", // would fire job-pending if reached first
+    worker_phase: "open",
   });
-  const epic = makeEpic({ tasks: [t1, t2, t3] });
+  const epic = makeEpic({
+    tasks: [t1, t2, t3],
+    depends_on_epics: ["fn-99-ghost"],
+    resolved_epic_deps: [makeResolvedDep({ dep_token: "fn-99-ghost" })],
+  });
   const snap = run([epic]);
   expect(snap.perEpic.get(epic.epic_id)).toEqual(
-    blocked({ kind: "job-rejected" }),
+    blocked({ kind: "dep-on-epic-dangling", upstream: "fn-99-ghost" }),
   );
 });
 
@@ -2509,20 +1888,22 @@ test("applySingleTaskPerEpicMutex: standalone invocation mutates verdict map in 
 
 test("applySingleTaskPerEpicMutex: live-work blocked row claims the epic slot", () => {
   // Pass-1 semantics: a verdict from the `isLiveWorkOccupant` whitelist —
-  // one of `job-running`, `sub-agent-running`, `planner-running`,
-  // `job-pending` — claims the epic slot regardless of iteration order, so
-  // the later ready row gets demoted. Dependency / admin / repo-state /
-  // mutex-synthesized blocks do NOT claim in pass-1 (see the negative-
-  // control test below for `dep-on-task`).
+  // a `running` kind or (fn-756) the sole blocked occupant `dispatch-pending`
+  // — claims the epic slot regardless of iteration order, so the later ready
+  // row gets demoted. Dependency / admin / repo-state / mutex-synthesized
+  // blocks do NOT claim in pass-1 (see the negative-control test below for
+  // `dep-on-task`).
   const t1 = makeTask({ task_id: "fn-1-foo.1" });
   const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
   const epic = makeEpic({ tasks: [t1, t2] });
   const perTask = new Map<string, Verdict>([
-    ["fn-1-foo.1", blocked({ kind: "job-pending" })],
+    ["fn-1-foo.1", blocked({ kind: "dispatch-pending" })],
     ["fn-1-foo.2", { tag: "ready" }],
   ]);
   applySingleTaskPerEpicMutex([epic], perTask);
-  expect(perTask.get("fn-1-foo.1")).toEqual(blocked({ kind: "job-pending" }));
+  expect(perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dispatch-pending" }),
+  );
   expect(perTask.get("fn-1-foo.2")).toEqual(
     blocked({ kind: "single-task-per-epic" }),
   );
@@ -2530,9 +1911,9 @@ test("applySingleTaskPerEpicMutex: live-work blocked row claims the epic slot", 
 
 test("applySingleTaskPerEpicMutex: dep-on-task row does NOT claim the epic slot (negative control)", () => {
   // Negative control for the pass-1 whitelist. A `dep-on-task` block is
-  // NOT one of the four `isLiveWorkOccupant` kinds (`job-running`,
-  // `sub-agent-running`, `planner-running`, `job-pending`) — it represents
-  // waiting, not concurrent worker activity. So a later ready sibling must
+  // NOT an `isLiveWorkOccupant` kind (the `running` kinds + fn-756's sole
+  // blocked occupant `dispatch-pending`) — it represents waiting, not
+  // concurrent worker activity. So a later ready sibling must
   // win the slot rather than be demoted to single-task-per-epic. Locks in
   // the narrowed whitelist against future regression that would silently
   // re-broaden to "any non-completed verdict".

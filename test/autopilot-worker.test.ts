@@ -3,18 +3,18 @@
  *
  * Coverage (per the epic fn-661 acceptance bar):
  *
- *   - `reconcile()` decides launches for `ready` (work/close) and
- *     `blocked:job-pending` (approve) verdicts, suppressing on the
- *     four rules (paused / in-flight / failed-keys / occupying-job).
+ *   - `reconcile()` decides launches for `ready` (work/close) verdicts
+ *     (fn-756 — the approve verb is gone; no blocked verdict dispatches),
+ *     suppressing on the four rules (paused / in-flight / failed-keys /
+ *     occupying-job).
  *   - `confirmRunning()` GOOD: job appears before ceiling → "ok".
  *   - `confirmRunning()` BAD: ceiling elapses → DispatchFailed emitted
  *     with the surfaced reason; no auto-retry.
  *   - Dedup suppression: occupying job (working/stopped) / open
  *     dispatch_failures row / in-flight set all block re-dispatch.
  *   - No-op fast path: nothing ready → empty decision.
- *   - `git_status` fed to computeReadiness (predicate 6.5 fires) —
- *     a dirty project_dir on a `done` close row blocks with
- *     `git-uncommitted` and stops the dispatch.
+ *   - fn-756: a `done` epic is `completed` (predicate 1) regardless of the
+ *     `git_status` feed — the predicate-6.5 git lift is gone.
  *   - Watermark excludes a stale terminal/resumed jobs row carrying a
  *     pre-watermark `last_event_id` for the same (verb, id).
  *   - Launches serialized one-at-a-time (fn-644 stagger) — a
@@ -177,9 +177,6 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
     redispatchCooldown: new Map(),
     // fn-742 — per-epic finalizer guard; boots empty, guard tests override it.
     finalizerGuard: new Map(),
-    // fn-742.2 — rejected-epic one-shot auto-clear ledger; boots empty, the
-    // rejected-recovery tests override it.
-    autoClearedRejections: new Set(),
     // Default unlimited — every pre-fn-725 test that omits this must see
     // identical dispatch behavior.
     maxConcurrentJobs: null,
@@ -336,10 +333,12 @@ test("verbForVerdict: ready task → work, ready close → close", () => {
   expect(verbForVerdict("close", ready)).toBe("close");
 });
 
-test("verbForVerdict: blocked job-pending → approve (both kinds)", () => {
+test("fn-756: verbForVerdict never maps to approve — no blocked reason is dispatchable", () => {
+  // The approve verb is gone; `verbForVerdict` maps ONLY `ready` → work/close.
+  // Every blocked reason (including the now-unproduced job-pending) → null.
   const jp: Verdict = { tag: "blocked", reason: { kind: "job-pending" } };
-  expect(verbForVerdict("task", jp)).toBe("approve");
-  expect(verbForVerdict("close", jp)).toBe("approve");
+  expect(verbForVerdict("task", jp)).toBeNull();
+  expect(verbForVerdict("close", jp)).toBeNull();
 });
 
 test("verbForVerdict: other blocked / running / completed / undefined → null", () => {
@@ -359,9 +358,10 @@ test("verbForVerdict: other blocked / running / completed / undefined → null",
   expect(verbForVerdict("task", undefined)).toBeNull();
 });
 
-// fn-703: the predicate-6.5 git verdicts now hold the mutex slot, but the held
-// slot must stay UNDISPATCHABLE — `verbForVerdict` returns null so the
-// occupied root isn't handed an approve/work dispatch while the repo is dirty.
+// fn-756: the predicate-6.5 git verdicts are no longer produced, but they
+// remain in the BlockReason type — `verbForVerdict` returns null for them (as
+// for every blocked reason), so even a stale/hand-built git verdict is never
+// handed a dispatch.
 test("verbForVerdict: git-uncommitted / git-orphans → null (held slot stays undispatchable)", () => {
   const gu: Verdict = { tag: "blocked", reason: { kind: "git-uncommitted" } };
   const go: Verdict = { tag: "blocked", reason: { kind: "git-orphans" } };
@@ -373,12 +373,12 @@ test("verbForVerdict: git-uncommitted / git-orphans → null (held slot stays un
 
 test("fn-700: verbForVerdict('close', blocked:epic-no-tasks) → null (autopilot lock)", () => {
   // Locks the autopilot side to the fn-700 readiness fix: a zero-task epic's
-  // close verdict is `blocked:epic-no-tasks`, and the only blocked reason
-  // that maps to a verb is `job-pending`. This guards against a future
-  // verdict refactor silently re-opening the dispatch-a-closer-against-an-
-  // empty-epic hole — even if a regression made the close row `ready` again,
-  // this assertion pins the contract that the closer must NOT be dispatched
-  // for an epic-no-tasks verdict.
+  // close verdict is `blocked:epic-no-tasks`, and (fn-756) NO blocked reason
+  // maps to a verb. This guards against a future verdict refactor silently
+  // re-opening the dispatch-a-closer-against-an-empty-epic hole — even if a
+  // regression made the close row `ready` again, this assertion pins the
+  // contract that the closer must NOT be dispatched for an epic-no-tasks
+  // verdict.
   const v: Verdict = { tag: "blocked", reason: { kind: "epic-no-tasks" } };
   expect(verbForVerdict("close", v)).toBeNull();
 });
@@ -387,12 +387,11 @@ test("fn-712: verbForVerdict('task'|'close', blocked:epic-not-materialized) → 
   // Locks the autopilot side to the fn-712 readiness fix: a not-yet-
   // materialized epic (status:null, no EpicSnapshot folded) reports
   // `blocked:epic-not-materialized` on BOTH the per-task and per-close-row
-  // paths, and the only blocked reason that maps to a verb is `job-pending`.
-  // So neither a worker NOR a closer can be dispatched against the shell row
-  // — the autopilot waits for the same `status IS NOT NULL` materialized
-  // state the board uses to surface the epic. No code change in
-  // verbForVerdict (it already returns null for every blocked reason except
-  // job-pending); this pins the contract against a future verdict refactor.
+  // paths, and (fn-756) NO blocked reason maps to a verb. So neither a worker
+  // NOR a closer can be dispatched against the shell row — the autopilot
+  // waits for the same `status IS NOT NULL` materialized state the board uses
+  // to surface the epic. This pins the contract against a future verdict
+  // refactor.
   const v: Verdict = {
     tag: "blocked",
     reason: { kind: "epic-not-materialized" },
@@ -405,11 +404,11 @@ test("fn-719: verbForVerdict(monitor-running | monitor-stale) → null (held slo
   // Locks the autopilot side to the fn-719 readiness occupant: a task whose
   // embedded work job carries a live worker-launched monitor renders
   // `running:monitor-running` (or `running:monitor-stale` past the soft TTL).
-  // Both are `running` verdicts, so `verbForVerdict` already returns null (it
-  // only maps `ready` → work/close and `blocked:job-pending` → approve) — the
-  // occupied root holds the mutex but is NEVER handed an approve/work/close
-  // dispatch. This pins that occupancy never leaks into a dispatch, guarding
-  // against a future refactor that might map a `running` verdict to a verb.
+  // Both are `running` verdicts, so `verbForVerdict` returns null (fn-756: it
+  // maps ONLY `ready` → work/close) — the occupied root holds the mutex but
+  // is NEVER handed a work/close dispatch. This pins that occupancy never
+  // leaks into a dispatch, guarding against a future refactor that might map a
+  // `running` verdict to a verb.
   const mr: Verdict = { tag: "running", reason: { kind: "monitor-running" } };
   const ms: Verdict = { tag: "running", reason: { kind: "monitor-stale" } };
   expect(verbForVerdict("task", mr)).toBeNull();
@@ -421,11 +420,10 @@ test("fn-719: verbForVerdict(monitor-running | monitor-stale) → null (held slo
 test("fn-721: verbForVerdict(dispatch-pending) → null (launch-window slot stays undispatchable)", () => {
   // Locks the autopilot side to the fn-721 readiness occupant: a launched-
   // but-not-yet-bound worker renders `blocked:dispatch-pending` on its row.
-  // The only blocked reason `verbForVerdict` maps to a verb is `job-pending`,
-  // so dispatch-pending returns null on BOTH paths — the held mutex slot is
-  // never handed a work/approve/close dispatch (occupancy must never leak
-  // into a dispatch; the fn-700/fn-703/fn-719 precedent). This pins the
-  // contract against a future verdict-refactor regression.
+  // fn-756: NO blocked reason maps to a verb, so dispatch-pending returns null
+  // on BOTH paths — the held mutex slot is never handed a work/close dispatch
+  // (occupancy must never leak into a dispatch; the fn-700/fn-719 precedent).
+  // This pins the contract against a future verdict-refactor regression.
   const v: Verdict = { tag: "blocked", reason: { kind: "dispatch-pending" } };
   expect(verbForVerdict("task", v)).toBeNull();
   expect(verbForVerdict("close", v)).toBeNull();
@@ -486,10 +484,13 @@ test("isOccupyingJob: ended / killed terminal rows do not occupy", () => {
   expect(isOccupyingJob(jobs, "work", "fn-1-foo.1")).toBe(false);
 });
 
-test("isOccupyingJob: plan_verb mismatch (approve vs work share plan_ref) → no false match", () => {
-  // The `approve::id` and `work::id` share `plan_ref` — dedup MUST gate
-  // on `plan_verb` too. An `approve` row in 'working' must not block a
-  // `work` dispatch on the same task id.
+test("isOccupyingJob: plan_verb mismatch (stale non-work verb shares plan_ref) → no false match", () => {
+  // dedup MUST gate on `plan_verb` too — a foreign-verb row (e.g. a stale
+  // `approve::id` left in the projection from before fn-756 dropped the verb)
+  // that happens to share `plan_ref` with a `work::id` must NOT block the
+  // `work` dispatch on the same task id. `plan_verb` is a free `string`
+  // column, so a stale verb still loads; the gate is the verb equality, not a
+  // whitelist.
   const jobs = new Map<string, Job>();
   jobs.set(
     "j-1",
@@ -501,7 +502,6 @@ test("isOccupyingJob: plan_verb mismatch (approve vs work share plan_ref) → no
     }),
   );
   expect(isOccupyingJob(jobs, "work", "fn-1-foo.1")).toBe(false);
-  expect(isOccupyingJob(jobs, "approve", "fn-1-foo.1")).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
@@ -657,20 +657,21 @@ test("reconcile dedup (fn-674): liveTabKeys.has(key) blocks re-dispatch in the l
 
 test("reconcile dedup (fn-674): liveTabKeys on close::<epic> blocks the close-row dispatch", () => {
   // Same shape as the task arm but for the close row — proves the
-  // standing arm covers the (verb='close', id=epic_id) shape too.
-  const epic = makeEpic({
-    epic_id: "fn-1-foo",
-    status: "done",
-    approval: "pending",
+  // standing arm covers the (verb='close', id=epic_id) shape too. A
+  // status:open epic whose single task is worker-done has a `ready` close
+  // row; a live `close::<epic>` tab must suppress its dispatch.
+  const completedTask: Task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    runtime_status: "done",
   });
+  const epic = makeEpic({ epic_id: "fn-1-foo", tasks: [completedTask] });
   const snap = makeSnapshot({
     epics: [epic],
-    liveTabKeys: new Set(["approve::fn-1-foo"]),
+    liveTabKeys: new Set(["close::fn-1-foo"]),
   });
   const decision = reconcile(snap, makeState(), 0);
-  // The `approve` verb dispatches for status=done + approval=pending,
-  // and the liveTabKeys arm gates it identically to the task path.
-  expect(decision.launches.find((p) => p.verb === "approve")).toBeUndefined();
+  expect(decision.launches.find((p) => p.verb === "close")).toBeUndefined();
 });
 
 // ---------------------------------------------------------------------------
@@ -724,27 +725,6 @@ test("fn-735 cooldown (close): a fresh stamp suppresses the close-row dispatch",
   const reopened = reconcile(snap, state, stampedAt + REDISPATCH_COOLDOWN_S);
   const closePlan = reopened.launches.find((p) => p.verb === "close");
   expect(closePlan?.key).toBe("close::fn-1-foo");
-});
-
-test("fn-735 cooldown (approve): NOT approve-exempt — a fresh stamp suppresses re-approve (supersedes fn-734)", () => {
-  // The fn-734 case this epic supersedes: a freshly-dispatched `approve`
-  // must NOT re-dispatch (the infinite re-approve loop). The gate is
-  // DELIBERATELY above the fn-728 approve-exempt budget gate and is itself
-  // NOT approve-exempt.
-  const epic = approveTaskEpic("fn-1-foo", "/repo");
-  const snap = makeSnapshot({ epics: [epic] });
-  const stampedAt = 1000;
-  const state = makeState({
-    redispatchCooldown: new Map([["approve::fn-1-foo.1", stampedAt]]),
-  });
-
-  // Inside the window → no approve launch.
-  const suppressed = reconcile(snap, state, stampedAt + 1);
-  expect(suppressed.launches.find((p) => p.verb === "approve")).toBeUndefined();
-  // Past the window → approve re-dispatches.
-  const reopened = reconcile(snap, state, stampedAt + REDISPATCH_COOLDOWN_S);
-  const approvePlan = reopened.launches.find((p) => p.verb === "approve");
-  expect(approvePlan?.key).toBe("approve::fn-1-foo.1");
 });
 
 test("fn-735 cooldown: reconcile NEVER mutates the cooldown Map (purity)", () => {
@@ -885,15 +865,13 @@ test("fn-735 runReconcileCycle: a definitive launch failure CLEARS the cooldown 
 });
 
 // ---------------------------------------------------------------------------
-// fn-742 — per-epic finalizer guard (close ↔ approve serialization)
+// fn-742 — per-epic finalizer guard (close re-dispatch serialization)
 // ---------------------------------------------------------------------------
 //
-// The fn-740 race: for a SINGLE epic the close-row verdict flips between
-// `ready` → `close` and `blocked:job-pending` → `approve` across adjacent
-// cycles. `close::<epic>` and `approve::<epic>` are DISTINCT redispatchCooldown
-// keys, so the fn-735 same-key arm does NOT serialize them. The per-epic
-// finalizer guard (keyed by epic id) does: a stamp from EITHER finalizer
-// suppresses the OTHER for that epic until it folds/clears.
+// fn-756: `close` is the SOLE finalizer verb (the approve verb is gone), so
+// the original close↔approve race is structurally impossible. The guard is
+// retained, keyed by epic id, as a fold-lag-immune backstop against a `close`
+// re-dispatch (also covered by the same-key fn-735 cooldown).
 
 // A close-row → `close` (ready): a completed task on an epic that is NOT itself
 // done → close-row verdict `ready` → verb `close`.
@@ -914,32 +892,8 @@ function readyCloseEpic(epicId: string, projectDir: string): Epic {
   });
 }
 
-// A close-row → `approve` (job-pending): epic at `status:done` +
-// `approval:pending` whose single task is approved-completed → close-row falls
-// through to predicate 7 → job-pending → verb `approve`.
-function approveCloseRowEpic(epicId: string, projectDir: string): Epic {
-  return makeEpic({
-    epic_id: epicId,
-    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
-    project_dir: projectDir,
-    sort_path: epicId,
-    status: "done",
-    approval: "pending",
-    tasks: [
-      makeTask({
-        task_id: `${epicId}.1`,
-        epic_id: epicId,
-        worker_phase: "done",
-        runtime_status: "done",
-        approval: "approved",
-      }),
-    ],
-  });
-}
-
-test("fn-742 isFinalizerVerb: close + approve are finalizers; work + null are not", () => {
+test("fn-742/fn-756 isFinalizerVerb: close is the sole finalizer; work + null are not", () => {
   expect(isFinalizerVerb("close")).toBe(true);
-  expect(isFinalizerVerb("approve")).toBe(true);
   expect(isFinalizerVerb("work")).toBe(false);
   expect(isFinalizerVerb(null)).toBe(false);
 });
@@ -964,31 +918,9 @@ test("fn-742 guard constant aligns with the fold-lag window (REDISPATCH_COOLDOWN
   expect(FINALIZER_GUARD_S).toBe(REDISPATCH_COOLDOWN_S);
 });
 
-test("fn-742 guard: a stamped close::<epic> suppresses approve::<epic> for the SAME epic (close→approve race)", () => {
-  // The headline race: cycle N dispatched `close::fn-1-foo` (guard stamped).
-  // The fold lags; the close-row verdict flips to job-pending → `approve`. The
-  // per-epic guard (keyed by epic id) suppresses that approve — close and
-  // approve never dispatch concurrently for the same epic.
-  const epic = approveCloseRowEpic("fn-1-foo", "/repo");
-  const snap = makeSnapshot({ epics: [epic] });
-  const stampedAt = 1000;
-  const state = makeState({
-    finalizerGuard: new Map([["fn-1-foo", stampedAt]]),
-  });
-
-  // Inside the window → the sibling approve is suppressed.
-  const suppressed = reconcile(snap, state, stampedAt + 1);
-  expect(
-    suppressed.launches.find((p) => p.key === "approve::fn-1-foo"),
-  ).toBeUndefined();
-  // Past the window → the finalizer re-dispatches.
-  const reopened = reconcile(snap, state, stampedAt + FINALIZER_GUARD_S);
-  expect(reopened.launches.map((p) => p.key)).toEqual(["approve::fn-1-foo"]);
-});
-
-test("fn-742 guard: a stamped approve::<epic> suppresses close::<epic> for the SAME epic (approve→close race)", () => {
-  // The symmetric direction: an in-flight approve holds the epic, so a verdict
-  // that flips to `ready` → `close` is suppressed until the approve clears.
+test("fn-742 guard: a stamped close::<epic> suppresses the close re-dispatch for the SAME epic", () => {
+  // A ready close-row whose epic id is freshly stamped is suppressed until the
+  // window expires (the fold-lag-immune backstop against a `close` re-dispatch).
   const epic = readyCloseEpic("fn-1-foo", "/repo");
   const snap = makeSnapshot({ epics: [epic] });
   const stampedAt = 1000;
@@ -1007,8 +939,8 @@ test("fn-742 guard: a stamped approve::<epic> suppresses close::<epic> for the S
 test("fn-742 guard scope: a stamp for ONE epic does NOT suppress a DIFFERENT epic's finalizer", () => {
   // The guard is per-epic. fn-1-foo's stamp must not bleed into fn-2-bar's
   // close-row — each epic serializes independently.
-  const foo = approveCloseRowEpic("fn-1-foo", "/repo-a");
-  const bar = approveCloseRowEpic("fn-2-bar", "/repo-b");
+  const foo = readyCloseEpic("fn-1-foo", "/repo-a");
+  const bar = readyCloseEpic("fn-2-bar", "/repo-b");
   const snap = makeSnapshot({ epics: [foo, bar] });
   const stampedAt = 1000;
   const state = makeState({
@@ -1016,34 +948,7 @@ test("fn-742 guard scope: a stamp for ONE epic does NOT suppress a DIFFERENT epi
   });
   const decision = reconcile(snap, state, stampedAt + 1);
   // fn-1-foo suppressed; fn-2-bar still launches.
-  expect(decision.launches.map((p) => p.key)).toEqual(["approve::fn-2-bar"]);
-});
-
-test("fn-742 NO DEADLOCK: a TASK-level approve backlog still drains (the guard is epic-finalizer-only, fn-728 preserved)", () => {
-  // The fn-728 invariant: a backlog of pending-approval TASKS must still drain.
-  // Task-level approves (`approve::<task-id>`) are NOT epic finalizers — they
-  // never touch the per-epic guard. Even with EVERY epic id pre-stamped, the
-  // task-level approves all fire. (A blanket approve suppression would deadlock
-  // here — this pins that we never built one.)
-  const a = approveTaskEpic("fn-1-a", "/repo-a");
-  const b = approveTaskEpic("fn-2-b", "/repo-b");
-  const c = approveTaskEpic("fn-3-c", "/repo-c");
-  const snap = makeSnapshot({ epics: [a, b, c] });
-  const state = makeState({
-    // Pre-stamp every epic id — if the guard wrongly gated task-level approves
-    // these stamps would suppress them all.
-    finalizerGuard: new Map([
-      ["fn-1-a", 1000],
-      ["fn-2-b", 1000],
-      ["fn-3-c", 1000],
-    ]),
-  });
-  const decision = reconcile(snap, state, 1001);
-  expect(decision.launches.map((p) => p.key).sort()).toEqual([
-    "approve::fn-1-a.1",
-    "approve::fn-2-b.1",
-    "approve::fn-3-c.1",
-  ]);
+  expect(decision.launches.map((p) => p.key)).toEqual(["close::fn-2-bar"]);
 });
 
 test("fn-742 guard: reconcile NEVER mutates the finalizer guard (purity)", () => {
@@ -1078,8 +983,7 @@ test("fn-742 sweep: empty map is a no-op (no throw)", () => {
 test("fn-742 runReconcileCycle: an epic-finalizer launch STAMPS the guard (keyed by epic id) and KEEPS it on indoubt", async () => {
   // The fold-lag-immune stamp: a close-row finalizer launch stamps the guard
   // BEFORE the confirm await, keyed by EPIC id (not the ${verb}::${id} key), so
-  // a slow cold-boot `indoubt` resolution leaves the SIBLING finalizer
-  // suppressed.
+  // a slow cold-boot `indoubt` resolution leaves the re-dispatch suppressed.
   const stampNow = 1700000000;
   const { deps, log } = makeFakeDeps({
     ceilingMs: 5,
@@ -1108,21 +1012,25 @@ test("fn-742 runReconcileCycle: an epic-finalizer launch STAMPS the guard (keyed
   expect(state.finalizerGuard.get("fn-1-foo")).toBe(stampNow);
 });
 
-test("fn-742 runReconcileCycle: a task-level approve launch does NOT stamp the finalizer guard", async () => {
-  // A task-level approve is not an epic finalizer (isEpicFinalizer unset), so
-  // it must leave the guard untouched — otherwise a task approve would lock its
-  // epic's close-row.
+test("fn-742 runReconcileCycle: a task-level work launch does NOT stamp the finalizer guard", async () => {
+  // A task-level work launch is not an epic finalizer (isEpicFinalizer unset),
+  // so it must leave the guard untouched — otherwise a task launch would lock
+  // its epic's close-row.
   const { deps } = makeFakeDeps({
     ceilingMs: 5,
     pollIntervalMs: 1,
     now: 1700000000,
   });
-  const epic = approveTaskEpic("fn-1-a", "/repo-a");
+  const epic = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo-a",
+    tasks: [makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" })],
+  });
   const snap = makeSnapshot({ epics: [epic] });
   const state = makeState();
   const liveDispatches = new Map<string, LiveDispatch>();
   const decision = reconcile(snap, state, 1700000000);
-  expect(decision.launches.map((p) => p.key)).toEqual(["approve::fn-1-a.1"]);
+  expect(decision.launches.map((p) => p.key)).toEqual(["work::fn-1-a.1"]);
 
   await runReconcileCycle(
     decision,
@@ -1139,7 +1047,7 @@ test("fn-742 runReconcileCycle: a task-level approve launch does NOT stamp the f
 
 test("fn-742 runReconcileCycle: a definitive launch failure CLEARS the finalizer guard (retry path)", async () => {
   // On `launch.ok===false` the finalizer never ran, so the guard entry is
-  // deleted — the sibling finalizer (and retry_dispatch) need not wait it out.
+  // deleted — the re-dispatch (and retry_dispatch) need not wait it out.
   const { deps } = makeFakeDeps({
     launch: async () => ({ ok: false, error: "zellij ENOENT" }),
   });
@@ -1159,146 +1067,6 @@ test("fn-742 runReconcileCycle: a definitive launch failure CLEARS the finalizer
   );
 
   expect(state.finalizerGuard.has("fn-1-foo")).toBe(false);
-});
-
-test("fn-742 end-to-end: a dispatched close suppresses the verdict-flipped approve in the NEXT cycle (fold-lag-immune)", async () => {
-  // The full fn-740 scenario through the real cycle glue. Cycle 1: a ready
-  // close-row dispatches `close::fn-1-foo` (indoubt — the jobs row never binds
-  // inside the ceiling, exactly the fold-lag window). Cycle 2: the same epic's
-  // verdict has flipped to job-pending → `approve` (simulated by swapping the
-  // snapshot), but the projection arms are still blind (empty jobs/liveTabKeys
-  // — the fold lagged). ONLY the in-memory finalizer guard suppresses the
-  // concurrent approve. Past the window it re-opens.
-  const stampNow = 1700000000;
-  const { deps } = makeFakeDeps({
-    ceilingMs: 5,
-    pollIntervalMs: 1,
-    now: stampNow,
-  });
-  const state = makeState();
-  const liveDispatches = new Map<string, LiveDispatch>();
-
-  // Cycle 1 — ready close-row → dispatch close, stamp the guard.
-  const readySnap = makeSnapshot({
-    epics: [readyCloseEpic("fn-1-foo", "/repo")],
-  });
-  const decision1 = reconcile(readySnap, state, stampNow);
-  expect(decision1.launches.map((p) => p.key)).toEqual(["close::fn-1-foo"]);
-  await runReconcileCycle(
-    decision1,
-    state,
-    liveDispatches,
-    "/bin/zsh",
-    new AbortController().signal,
-    deps,
-  );
-  expect(state.finalizerGuard.get("fn-1-foo")).toBe(stampNow);
-
-  // Cycle 2 — verdict flipped to job-pending → approve, projections still
-  // blind. The guard suppresses the concurrent approve.
-  const approveSnap = makeSnapshot({
-    epics: [approveCloseRowEpic("fn-1-foo", "/repo")],
-  });
-  const decision2 = reconcile(approveSnap, state, stampNow + 1);
-  expect(
-    decision2.launches.find((p) => p.key === "approve::fn-1-foo"),
-  ).toBeUndefined();
-
-  // Past the guard window the finalizer is eligible again.
-  const decision3 = reconcile(approveSnap, state, stampNow + FINALIZER_GUARD_S);
-  expect(decision3.launches.map((p) => p.key)).toEqual(["approve::fn-1-foo"]);
-});
-
-// ---------------------------------------------------------------------------
-// fn-742.2 — rejected-epic one-shot auto-clear (the clean board exit)
-// ---------------------------------------------------------------------------
-//
-// A `{kind:"job-rejected"}` close-row verdict (`epic.approval === "rejected"`)
-// is non-dispatchable (`verbForVerdict → null`), so without intervention the
-// epic sits `[::blocked:job-rejected]` forever. The recovery: reconcile emits a
-// ONE-SHOT `rejectedClears` entry; the cycle glue posts a
-// `clear-rejected-approval` to main (sanctioned `set_epic_approval` sidecar
-// write → approval reset to `pending`) and records the epic so it never
-// re-fires — no thrash loop. A genuinely-rejected epic gets exactly one
-// auto-clear; if the re-approve rejects again it stays rejected.
-
-// An epic whose own approval is `rejected` (status done so it's a finalizable
-// close row): close-row verdict → predicate 4 → `{kind:"job-rejected"}`, verb
-// `null` — the stuck state this task recovers.
-function rejectedCloseEpic(epicId: string, projectDir: string): Epic {
-  return makeEpic({
-    epic_id: epicId,
-    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
-    project_dir: projectDir,
-    sort_path: epicId,
-    status: "done",
-    approval: "rejected",
-    tasks: [
-      makeTask({
-        task_id: `${epicId}.1`,
-        epic_id: epicId,
-        worker_phase: "done",
-        runtime_status: "done",
-        approval: "approved",
-      }),
-    ],
-  });
-}
-
-test("fn-742.2 reconcile: a rejected epic emits a one-shot rejectedClear AND no dispatchable launch", () => {
-  const epic = rejectedCloseEpic("fn-1-foo", "/repo");
-  const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), 0);
-  // The recovery request fires once...
-  expect(decision.rejectedClears).toEqual(["fn-1-foo"]);
-  // ...and the rejected close row remains non-dispatchable (no verb).
-  expect(decision.launches).toEqual([]);
-});
-
-test("fn-742.2 reconcile: an already-auto-cleared epic does NOT re-emit (thrash gate)", () => {
-  // The genuinely-rejected case: the epic was auto-cleared once, the re-approve
-  // rejected it again, so it's STILL rejected this cycle — but its id is already
-  // in `autoClearedRejections`, so reconcile must NOT request a second clear.
-  const epic = rejectedCloseEpic("fn-1-foo", "/repo");
-  const snap = makeSnapshot({ epics: [epic] });
-  const state = makeState({
-    autoClearedRejections: new Set(["fn-1-foo"]),
-  });
-  const decision = reconcile(snap, state, 0);
-  expect(decision.rejectedClears).toEqual([]);
-  expect(decision.launches).toEqual([]);
-});
-
-test("fn-742.2 reconcile: a NON-rejected epic emits no rejectedClear (control)", () => {
-  // An ordinary ready close-row must not appear in `rejectedClears` — only the
-  // job-rejected verdict drives the recovery.
-  const epic = readyCloseEpic("fn-1-foo", "/repo");
-  const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), 0);
-  expect(decision.rejectedClears).toEqual([]);
-  expect(decision.launches.map((p) => p.key)).toEqual(["close::fn-1-foo"]);
-});
-
-test("fn-742.2 reconcile: rejectedClears is per-epic — one rejected, one ready", () => {
-  // Two epics: one rejected (recovery), one ready (close). Each is handled
-  // independently — the recovery doesn't suppress the unrelated close.
-  const rejected = rejectedCloseEpic("fn-1-foo", "/repo-a");
-  const ready = readyCloseEpic("fn-2-bar", "/repo-b");
-  const snap = makeSnapshot({ epics: [rejected, ready] });
-  const decision = reconcile(snap, makeState(), 0);
-  expect(decision.rejectedClears).toEqual(["fn-1-foo"]);
-  expect(decision.launches.map((p) => p.key)).toEqual(["close::fn-2-bar"]);
-});
-
-test("fn-742.2 reconcile NEVER mutates autoClearedRejections (purity)", () => {
-  // The set is recorded by the cycle glue (driveCycle), never by the pure
-  // reconcile — mirrors the cooldown / finalizer-guard discipline.
-  const epic = rejectedCloseEpic("fn-1-foo", "/repo");
-  const snap = makeSnapshot({ epics: [epic] });
-  const state = makeState();
-  const decision = reconcile(snap, state, 0);
-  expect(decision.rejectedClears).toEqual(["fn-1-foo"]);
-  expect(state.autoClearedRejections.size).toBe(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -1502,126 +1270,18 @@ test("fn-725 cap: the budget is shared across task + close-row push sites (a clo
 });
 
 // ---------------------------------------------------------------------------
-// fn-728 — approve is exempt from the budget cap at the launch boundary
+// fn-728/fn-756 — the budget cap governs BOTH `work` and `close` (no exemption)
 // ---------------------------------------------------------------------------
 //
-// The fn-725 cap counts a finished-but-pending root (`blocked:job-pending`)
-// as an `isRootOccupant`, so a backlog of pending-approval rows drives
-// `budget = max(0, cap - occupied)` to zero and the `budget <= 0` gate skips
-// EVERY launch — including the `approve` workers that would drain those rows
-// (the resource-cap deadlock). The fix exempts `approve` at BOTH push sites:
-// it skips the budget gate AND the budget decrement, sharing one
-// `verb !== "approve"` predicate. `occupied` is left unchanged, so an
-// in-flight approver still pushes back on NEW work on later cycles.
-//
-// Distinct-root discipline (same as the fn-725 helpers above): approve /
-// ready / occupant rows go in SEPARATE project_dirs so the per-root mutex
-// doesn't pre-empt the budget under test.
+// The fn-728 `approve` cap-exemption is gone with the approve verb (fn-756).
+// The fn-725 cap now governs every launch — `work` and `close` both count
+// against the budget and both are skipped at `budget <= 0`. There is no longer
+// any verb the cap exempts.
 
-// A `blocked:job-pending` task → its done + approval-pending row with an
-// embedded STOPPED job renders `blocked:job-pending` (predicate 7): predicate
-// 5 (`job-running`) needs a *working* embedded job, so `stopped` falls through
-// to 7. verb → `approve`. Lives in its own epic+root.
-function approveTaskEpic(epicId: string, projectDir: string): Epic {
-  const taskId = `${epicId}.1`;
-  return makeEpic({
-    epic_id: epicId,
-    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
-    project_dir: projectDir,
-    sort_path: epicId,
-    tasks: [
-      makeTask({
-        task_id: taskId,
-        epic_id: epicId,
-        worker_phase: "done",
-        runtime_status: "done",
-        approval: "pending",
-        jobs: [
-          // Embedded STOPPED job → predicates 5/6/6.6 all clear, so the row
-          // falls through to predicate 7 (own-approval-pending) → job-pending.
-          {
-            job_id: `j-${epicId}`,
-            state: "stopped",
-          } as unknown as EmbeddedJob,
-        ],
-      }),
-    ],
-  });
-}
-
-// A `blocked:job-pending` CLOSE row → an epic at `status:done` +
-// `approval:pending` whose single task is `completed` (so predicate 10's
-// dep-on-task doesn't block and predicate 9.5 epic-no-tasks doesn't fire).
-// Predicate 1 (terminal-completed) needs `approval:approved`, so `pending`
-// falls through to predicate 7 → job-pending → verb `approve` on the close row.
-function approveCloseEpic(epicId: string, projectDir: string): Epic {
-  const taskId = `${epicId}.1`;
-  return makeEpic({
-    epic_id: epicId,
-    epic_number: Number(epicId.match(/fn-(\d+)/)?.[1] ?? 1),
-    project_dir: projectDir,
-    sort_path: epicId,
-    status: "done",
-    approval: "pending",
-    tasks: [
-      makeTask({
-        task_id: taskId,
-        epic_id: epicId,
-        worker_phase: "done",
-        runtime_status: "done",
-        approval: "approved",
-      }),
-    ],
-  });
-}
-
-test("fn-728 approve exempt: occupied >= cap + a job-pending approve in a distinct root → approve launches, no work", () => {
-  // cap=1, one job-running occupant → occupied=1 → budget=0. A job-pending
-  // approve in a DISTINCT root must still launch (exempt); a co-considered
-  // ready `work` in YET another root stays budget-skipped.
-  const occ = occupantEpic("fn-1-a", "/repo-a");
-  const approveT = approveTaskEpic("fn-2-b", "/repo-b");
-  const ready = readyEpic("fn-3-c", "/repo-c");
-  const snap = makeSnapshot({ epics: [occ, approveT, ready] });
-  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
-  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-2-b.1"]);
-});
-
-test("fn-728 approve exempt: task-level approve at budget=0 fires and does NOT decrement budget", () => {
-  // budget starts at 0 (cap=1, one occupant). The approve fires WITHOUT
-  // consuming the slot; a ready `work` in another root proves no decrement
-  // happened (it stays skipped at budget=0, but the approve still got out —
-  // i.e. the approve didn't push budget negative or otherwise perturb work).
-  const occ = occupantEpic("fn-1-a", "/repo-a");
-  const approveT = approveTaskEpic("fn-2-b", "/repo-b");
-  const ready = readyEpic("fn-3-c", "/repo-c");
-  const snap = makeSnapshot({ epics: [occ, approveT, ready] });
-  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
-  // Only the approve — the work stays budget-gated.
-  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-2-b.1"]);
-  expect(decision.launches.find((l) => l.verb === "work")).toBeUndefined();
-});
-
-test("fn-728 approve exempt: epic close-row approve at budget=0 fires AND budget unchanged (De Morgan pin)", () => {
-  // cap=1, one job-running occupant → budget=0. A close-row job-pending
-  // approve in a DISTINCT root must launch (close-row exemption). A ready
-  // `work` in a THIRD root stays skipped — proving the close-row approve did
-  // not decrement budget (if it had wrapped to -1 the gate would still skip
-  // work, but the close approve itself must have fired through the
-  // `closeVerb === "approve"` gate-skip; the work-skip pins budget at 0).
-  const occ = occupantEpic("fn-1-a", "/repo-a");
-  const approveClose = approveCloseEpic("fn-2-b", "/repo-b");
-  const ready = readyEpic("fn-3-c", "/repo-c");
-  const snap = makeSnapshot({ epics: [occ, approveClose, ready] });
-  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
-  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-2-b"]);
-  expect(decision.launches.find((l) => l.verb === "work")).toBeUndefined();
-});
-
-test("fn-728 regression: a work and a close row still respect budget<=0 (only approve is exempt)", () => {
+test("fn-756 budget: a work and a close row both respect budget<=0 (no exemption)", () => {
   // cap=1, one job-running occupant → budget=0. A ready work row (distinct
   // root) and a ready close row (distinct root) are BOTH budget-gated and
-  // neither launches — the exemption is approve-only.
+  // neither launches.
   const occ = occupantEpic("fn-1-a", "/repo-a");
   const ready = readyEpic("fn-2-b", "/repo-b");
   const completedTask = makeTask({
@@ -1642,23 +1302,28 @@ test("fn-728 regression: a work and a close row still respect budget<=0 (only ap
   expect(decision.launches).toEqual([]);
 });
 
-test("fn-728 mutex not budget: same-root approve + ready sibling → sibling suppressed by per-root mutex", () => {
-  // An approve and a ready `work` in the SAME root. The approve is exempt
-  // from the budget, but the ready sibling is suppressed by the PER-ROOT
-  // mutex (the approve row occupies the root via isRootOccupant), NOT by the
-  // budget. cap=null so the budget can't be the cause — proving the mutex is.
-  const approveT = approveTaskEpic("fn-1-a", "/repo-shared");
-  const ready = makeEpic({
+test("fn-756 budget: with one free slot, the close row launches and consumes it (no work after)", () => {
+  // cap=2, one occupant → budget=1. A ready close row launches and decrements
+  // the budget to 0; a ready work row in a third root is then budget-gated.
+  const occ = occupantEpic("fn-1-a", "/repo-a");
+  const completedTask = makeTask({
+    task_id: "fn-2-b.1",
+    epic_id: "fn-2-b",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const closeEpic = makeEpic({
     epic_id: "fn-2-b",
     epic_number: 2,
-    project_dir: "/repo-shared",
+    project_dir: "/repo-b",
     sort_path: "fn-2-b",
-    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+    tasks: [completedTask],
   });
-  const snap = makeSnapshot({ epics: [approveT, ready] });
-  const decision = reconcile(snap, makeState({ maxConcurrentJobs: null }), 0);
-  // The approve fires; the same-root ready sibling is mutex-suppressed.
-  expect(decision.launches.map((l) => l.key)).toEqual(["approve::fn-1-a.1"]);
+  const ready = readyEpic("fn-3-c", "/repo-c");
+  const snap = makeSnapshot({ epics: [occ, closeEpic, ready] });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 2 }), 0);
+  // The close consumed the one free slot; the work is budget-gated.
+  expect(decision.launches.map((l) => l.key)).toEqual(["close::fn-2-b"]);
 });
 
 test("fn-721 parity: autopilot reconcile path and the board/CLI computeReadiness path agree", () => {
@@ -1736,18 +1401,18 @@ test("fn-721 parity: autopilot reconcile path and the board/CLI computeReadiness
 });
 
 // ---------------------------------------------------------------------------
-// reconcile — git_status feed (fn-638 predicate 6.5)
+// reconcile — git_status feed no longer gates completion (fn-756 removed 6.5)
 // ---------------------------------------------------------------------------
 
-test("reconcile: live git_status feeds computeReadiness (predicate 6.5 gates close-row)", () => {
-  // An epic at `status="done"` with dirty files in its project_dir
-  // hits predicate 6.5 on the close row: `git-uncommitted`. The
-  // reconciler must NOT dispatch close in that case.
+test("fn-756: a status=done epic with a dirty repo is COMPLETED (the git lift no longer gates)", () => {
+  // Pre-fn-756 a `status=done` epic with dirty files hit predicate 6.5 on the
+  // close row (`git-uncommitted`) and held it open. fn-756 deleted that lift:
+  // a `status=done` epic now reaches predicate 1 → `completed`, so its close
+  // row produces NO dispatch regardless of the dirty git_status feed.
   const epic = makeEpic({
     epic_id: "fn-1-foo",
     project_dir: "/repo",
     status: "done",
-    approval: "pending",
   });
   const gitStatus = new Map<
     string,
@@ -1762,26 +1427,8 @@ test("reconcile: live git_status feeds computeReadiness (predicate 6.5 gates clo
     gitStatusByProjectDir: gitStatus,
   });
   const decision = reconcile(snap, makeState(), 0);
-  // No close launch — git-uncommitted blocks it.
-  const closeLaunch = decision.launches.find((p) => p.verb === "close");
-  expect(closeLaunch).toBeUndefined();
-});
-
-test("reconcile: empty git_status map → predicate 6.5 stays inert (default semantics)", () => {
-  // No git_status row for the project → predicate 6.5 cannot fire, so
-  // a done+pending close row can reach the approve dispatch path.
-  const epic = makeEpic({
-    epic_id: "fn-1-foo",
-    status: "done",
-    approval: "pending",
-  });
-  const snap = makeSnapshot({ epics: [epic] });
-  const decision = reconcile(snap, makeState(), 0);
-  // Approve close should fire (status=done && approval=pending →
-  // job-pending verdict → `approve` verb).
-  const approveLaunch = decision.launches.find((p) => p.verb === "approve");
-  expect(approveLaunch).not.toBeUndefined();
-  expect(approveLaunch?.id).toBe("fn-1-foo");
+  // No launch at all — the close row is `completed`, not git-blocked.
+  expect(decision.launches).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
@@ -2311,15 +1958,12 @@ test("checkWorkPluginManifest: missing dir → not ok with remediation hint", ()
 // buildWorkerCommand parity with cli/autopilot.ts shape
 // ---------------------------------------------------------------------------
 
-test("buildWorkerCommand mirrors cli/autopilot.ts: work / close / approve flag shapes", () => {
+test("buildWorkerCommand: work / close flag shapes (fn-756: approve verb gone)", () => {
   expect(buildWorkerCommand("work", "fn-1-foo.1", "/repo")).toBe(
     "cd /repo && claude --model sonnet --effort max --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
   expect(buildWorkerCommand("close", "fn-1-foo", "/repo")).toBe(
     "cd /repo && claude --model sonnet --effort max --name close::fn-1-foo '/plan:close fn-1-foo'",
-  );
-  expect(buildWorkerCommand("approve", "fn-1-foo.1", "/repo")).toBe(
-    "cd /repo && claude --model sonnet --effort low --name approve::fn-1-foo.1 '/plan:approve fn-1-foo.1'",
   );
   // Empty projectDir → no `cd` prefix (degenerate test path).
   expect(buildWorkerCommand("work", "fn-1-foo.1", "")).toBe(
@@ -2399,8 +2043,8 @@ test("isReapCandidate: empty open set never reaps (nothing pending → no ghost)
 });
 
 test("isReapCandidate: pane with no verb-prefixed key (human tab) is never a candidate", () => {
-  // A non-worker pane carries no work::/approve::/close:: token — even
-  // with a non-empty open set it must never match.
+  // A non-worker pane carries no work::/close:: token — even with a non-empty
+  // open set it must never match.
   const open = new Set(["work::A"]);
   expect(
     isReapCandidate(
@@ -2410,10 +2054,10 @@ test("isReapCandidate: pane with no verb-prefixed key (human tab) is never a can
   ).toBe(false);
 });
 
-test("isReapCandidate: approve:: and close:: surfaces match when open", () => {
-  const open = new Set(["approve::fn-1-foo.3", "close::fn-2-bar"]);
+test("isReapCandidate: work:: and close:: surfaces match when open", () => {
+  const open = new Set(["work::fn-1-foo.3", "close::fn-2-bar"]);
   expect(
-    isReapCandidate(open, pane({ id: "1", tab_name: "approve::fn-1-foo.3" })),
+    isReapCandidate(open, pane({ id: "1", tab_name: "work::fn-1-foo.3" })),
   ).toBe(true);
   expect(
     isReapCandidate(
@@ -2421,6 +2065,16 @@ test("isReapCandidate: approve:: and close:: surfaces match when open", () => {
       pane({ id: "2", terminal_command: "claude --name close::fn-2-bar" }),
     ),
   ).toBe(true);
+});
+
+test("fn-756: an approve:: pane is no longer a dispatch key — never reaped by name", () => {
+  // The approve verb is gone; `DISPATCH_KEY_RE` no longer matches `approve::`,
+  // so a stale approve pane (left from before the deploy) yields a null key and
+  // is never name-matched for reap — the human cleans it up.
+  const open = new Set(["approve::fn-1-foo.3"]);
+  expect(
+    isReapCandidate(open, pane({ id: "1", tab_name: "approve::fn-1-foo.3" })),
+  ).toBe(false);
 });
 
 test("isReapCandidate: fn-741 live-veto — exited:false pane with an OPEN key is NOT reaped", () => {
@@ -2465,18 +2119,19 @@ test("isReapCandidate: fn-741 — exited true/undefined with an OPEN key still r
 });
 
 // ---------------------------------------------------------------------------
-// fn-727 — isCompletionReapCandidate (approved-completion reap gate)
+// fn-727 — isCompletionReapCandidate (completion reap gate)
 //
 // A SIBLING of isReapCandidate, NOT an overload: this one gates on the
 // completed-row-id SET (the `{tag:"completed"}` verdict), keying off the
-// `<id>` of a `(work|approve|close)::<id>` pane name — so one completed
-// id authorizes reaping BOTH its work/close pane AND its approve pane.
-// Pane liveness is NOT the authorization (the `{tag:"completed"}` verdict
-// is), but fn-741 layers an `exited === false` VETO: a demonstrably-live
-// pane is spared even on a completed id. `exited` true/undefined still reap.
+// `<id>` of a `(work|close)::<id>` pane name — fn-756: a completed task
+// authorizes reaping its `work::<id>` pane, a completed epic its `close::<id>`
+// pane (the `approve::<id>` surface no longer exists). Pane liveness is NOT the
+// authorization (the `{tag:"completed"}` verdict is), but fn-741 layers an
+// `exited === false` VETO: a demonstrably-live pane is spared even on a
+// completed id. `exited` true/undefined still reap.
 // ---------------------------------------------------------------------------
 
-test("isCompletionReapCandidate: a completed task id reaps work::<id> AND approve::<id>", () => {
+test("isCompletionReapCandidate: a completed task id reaps work::<id>", () => {
   const completed = new Set(["fn-1-foo.3"]);
   expect(
     isCompletionReapCandidate(
@@ -2484,6 +2139,22 @@ test("isCompletionReapCandidate: a completed task id reaps work::<id> AND approv
       pane({ id: "1", tab_name: "work::fn-1-foo.3" }),
     ),
   ).toBe(true);
+});
+
+test("isCompletionReapCandidate: a completed epic id reaps close::<id>", () => {
+  const completed = new Set(["fn-2-bar"]);
+  expect(
+    isCompletionReapCandidate(
+      completed,
+      pane({ id: "1", tab_name: "close::fn-2-bar" }),
+    ),
+  ).toBe(true);
+});
+
+test("fn-756: a completed id does NOT reap an approve:: pane (no such key any more)", () => {
+  // A stale `approve::<id>` pane yields a null key (the verb is gone from the
+  // regex), so even a completed id never name-matches it.
+  const completed = new Set(["fn-1-foo.3"]);
   expect(
     isCompletionReapCandidate(
       completed,
@@ -2494,33 +2165,12 @@ test("isCompletionReapCandidate: a completed task id reaps work::<id> AND approv
           "claude --name approve::fn-1-foo.3 '/plan:approve ...'",
       }),
     ),
-  ).toBe(true);
+  ).toBe(false);
 });
 
-test("isCompletionReapCandidate: a completed epic id reaps close::<id> AND approve::<id>", () => {
-  const completed = new Set(["fn-2-bar"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "1", tab_name: "close::fn-2-bar" }),
-    ),
-  ).toBe(true);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({
-        id: "2",
-        tab_name: "Tab #2",
-        terminal_command: "claude --name approve::fn-2-bar",
-      }),
-    ),
-  ).toBe(true);
-});
-
-test("isCompletionReapCandidate: a NON-completed id is never a candidate (pending/rejected/worker-ended stay open)", () => {
-  // The id is not in the completed set — its surfaces are NOT reaped,
-  // regardless of pane state. This is the pending / rejected /
-  // worker-ended-but-unapproved hold-open guard.
+test("isCompletionReapCandidate: a NON-completed id is never a candidate (not-yet-completed/worker-ended stay open)", () => {
+  // The id is not in the completed set — its surface is NOT reaped, regardless
+  // of pane state. This is the not-yet-completed / worker-ended hold-open guard.
   const completed = new Set(["fn-1-foo.3"]);
   expect(
     isCompletionReapCandidate(
@@ -2531,7 +2181,7 @@ test("isCompletionReapCandidate: a NON-completed id is never a candidate (pendin
   expect(
     isCompletionReapCandidate(
       completed,
-      pane({ id: "6", tab_name: "approve::fn-9-other.1" }),
+      pane({ id: "6", tab_name: "close::fn-9-other" }),
     ),
   ).toBe(false);
 });
@@ -2566,7 +2216,7 @@ test("isCompletionReapCandidate: fn-741 live-veto — exited:false pane on a com
   expect(
     isCompletionReapCandidate(
       completed,
-      pane({ id: "2", tab_name: "approve::fn-1-foo.3", exited: false }),
+      pane({ id: "2", tab_name: "work::fn-1-foo.3", exited: false }),
     ),
   ).toBe(false);
 });
@@ -2574,12 +2224,12 @@ test("isCompletionReapCandidate: fn-741 live-veto — exited:false pane on a com
 test("isCompletionReapCandidate: exited true/undefined on a completed id still reap (no regression)", () => {
   // Only an explicit `false` vetoes. An exited ghost and an unknown-state
   // pane (zellij omits the field) both still reap on the completed verdict —
-  // the approver, live at approval, exits and reaps on a later list-panes.
+  // a worker pane that has wound down reaps on a later list-panes.
   const completed = new Set(["fn-1-foo.3"]);
   expect(
     isCompletionReapCandidate(
       completed,
-      pane({ id: "2", tab_name: "approve::fn-1-foo.3", exited: true }),
+      pane({ id: "2", tab_name: "work::fn-1-foo.3", exited: true }),
     ),
   ).toBe(true);
   expect(
@@ -2594,20 +2244,18 @@ test("isCompletionReapCandidate: exited true/undefined on a completed id still r
 // fn-727 — reconcile surfaces completedRowIds (no second computeReadiness)
 // ---------------------------------------------------------------------------
 
-test("reconcile: completedRowIds carries approved-completed task ids and close-row epic ids", () => {
-  // A done+approved task → `{tag:"completed"}` perTask verdict → its id in
-  // the set. An epic with that task completed + status done+approved →
-  // close-row `{tag:"completed"}` → epic id in the set too.
+test("reconcile: completedRowIds carries worker-done task ids and status-done close-row epic ids", () => {
+  // fn-756: a worker-done task → `{tag:"completed"}` perTask verdict → its id
+  // in the set. A status-done epic → close-row `{tag:"completed"}` → epic id in
+  // the set too. The approval enum no longer participates.
   const completedTask = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
     runtime_status: "done",
-    approval: "approved",
   });
   const epic = makeEpic({
     epic_id: "fn-1-foo",
     status: "done",
-    approval: "approved",
     tasks: [completedTask],
   });
   const snap = makeSnapshot({ epics: [epic] });
@@ -2862,32 +2510,6 @@ test("reconcile armed: non-eligible epic does NOT decrement budget", () => {
     .filter((p) => p.verb === "work")
     .map((p) => p.id);
   expect(workIds).toEqual(["fn-2-b.1"]);
-});
-
-test("reconcile armed: approve fires for a disarmed-but-in-flight epic's task", () => {
-  // A task that is done+pending-approval maps to `approve`, a finalizer that
-  // is mode-exempt — so a NON-eligible epic still gets its task approved.
-  const epic = makeEpic({
-    epic_id: "fn-5-disarmed",
-    resolved_epic_deps: [],
-    tasks: [
-      makeTask({
-        task_id: "fn-5-disarmed.1",
-        epic_id: "fn-5-disarmed",
-        worker_phase: "done",
-        runtime_status: "done",
-        approval: "pending",
-      }),
-    ],
-  });
-  const snap = makeSnapshot({
-    epics: [epic],
-    mode: "armed",
-    armedIds: new Set(), // nothing armed → epic is NOT eligible
-  });
-  const decision = reconcile(snap, makeState(), 0);
-  const approvePlan = decision.launches.find((p) => p.id === "fn-5-disarmed.1");
-  expect(approvePlan?.verb).toBe("approve");
 });
 
 test("reconcile armed: close fires for a disarmed-but-in-flight epic", () => {
