@@ -348,7 +348,7 @@ export interface RetryDispatchResult {
  * projection read at the next reconcile, never the RPC payload):
  *
  * - Non-empty string with exactly one `::` separator.
- * - `verb` is one of `work` / `close` / `approve`.
+ * - `verb` is one of `work` / `close`.
  * - `id` is a non-empty token AND passes the {@link rejectPathTraversal}
  *   filename-safety predicate (no path separators, no embedded null, no
  *   leading dot). The `dispatch_id` never feeds a filesystem path, but
@@ -382,7 +382,7 @@ export function parseDispatchKey(value: unknown): {
   const idRaw = value.slice(sep + 2);
   if (!RETRY_DISPATCH_VERBS.has(verbRaw as RetryDispatchVerb)) {
     throw new BadParamsError(
-      `retry_dispatch: \`verb\` must be one of work|close|approve (got ${JSON.stringify(verbRaw)})`,
+      `retry_dispatch: \`verb\` must be one of work|close (got ${JSON.stringify(verbRaw)})`,
     );
   }
   rejectDispatchIdToken(idRaw);
