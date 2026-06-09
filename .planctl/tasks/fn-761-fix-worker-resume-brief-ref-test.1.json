@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T22:01:40.098090Z",
+  "depends_on": [],
+  "epic": "fn-761-fix-worker-resume-brief-ref-test",
+  "id": "fn-761-fix-worker-resume-brief-ref-test.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "high",
+  "title": "Reconcile worker-resume envelope with brief-ref",
+  "updated_at": "2026-06-09T22:01:40.098090Z"
+}
