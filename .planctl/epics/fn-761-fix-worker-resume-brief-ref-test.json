@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-761-fix-worker-resume-brief-ref-test",
   "bundles": [],
+  "closer_done_at": "2026-06-09T22:41:17.720763Z",
   "created_at": "2026-06-09T22:01:40.098090Z",
   "depends_on_epics": [],
   "id": "fn-761-fix-worker-resume-brief-ref-test",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix worker-resume brief-ref test regression",
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-09T22:01:40.098090Z"
+  "updated_at": "2026-06-09T22:41:17.720763Z"
 }
