@@ -49,5 +49,5 @@ screen shows mode + the armed list.
 - [ ] CLAUDE.md "writes are tightly scoped" + "Autopilot" sections and README RPC/CLI/non-goals updated to include the two verbs and the mode/armed model.
 
 ## Done summary
-
+Control plane for autopilot mode/arm: set_autopilot_mode + set_epic_armed RPCs (append-only, no relay), daemon synthetic-event appends, keeper autopilot mode|arm|disarm subcommands, banner mode+armed-count + --- armed --- section, and CLAUDE.md/README docs.
 ## Evidence
