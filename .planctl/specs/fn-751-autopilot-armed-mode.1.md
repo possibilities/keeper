@@ -53,5 +53,5 @@ Clone the `AutopilotPaused`/`AutopilotCapSet` path verbatim.
 - [ ] Re-fold determinism holds with `armed_epics` in the DELETE list.
 
 ## Done summary
-
+Added schema v62: autopilot 'mode' enum column on the autopilot_state singleton + the armed_epics presence table. AutopilotMode/EpicArmed synthetic-event folds (sibling-column-preserving UPSERT; presence INSERT-OR-REPLACE/DELETE), migration 61->62 lockstep-matched, ARMED_EPICS_DESCRIPTOR registered, api.py whitelist += 62, README v62 narrative, fold + re-fold-determinism tests.
 ## Evidence
