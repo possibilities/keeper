@@ -14,7 +14,7 @@ shape in the opposite direction (set vs clear).
 
 This verb is intentionally NOT in VALIDATION_RESTAMP_VERBS. queue_jump is a
 board-priority signal, not structural plan content — the same stance as
-invalidate, approve, and task-set-tier.
+invalidate and task-set-tier.
 """
 
 from __future__ import annotations

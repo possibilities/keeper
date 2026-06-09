@@ -26,15 +26,6 @@ TASK_STATUSES = ["todo", "in_progress", "blocked", "done"]
 
 TASK_TIERS = ("medium", "high", "xhigh", "max")
 
-# fn-592: approval state — top-level field on both epics and tasks. Replaces
-# keeper's `approvals` sidecar SQLite table; planctl JSON files are the
-# canonical source. Missing field defaults to "pending" (see normalize_epic /
-# normalize_task). Validated at every read/write boundary in run_validate.py
-# and by the `approve` subcommand's click.Choice. "pending" is the implicit
-# default for new epics/tasks; the operator flips it via
-# `planctl approve <epic_id> [<task_id>] {approved,rejected,pending}`.
-APPROVAL_STATUSES = ("approved", "rejected", "pending")
-
 # fn-586: dormant infrastructure for codex-backed worker subagents. The field
 # is additive on every task JSON but nothing reads it today — no setter verb,
 # no `/plan:work` routing, no `planctl show` surface. The allowlist is
@@ -51,31 +42,22 @@ def normalize_epic(data: dict) -> dict:
     # checkout that hasn't run the scrub) cannot reintroduce the dead key.
     # Silent on purpose — no log, no warn.
     data.pop("draft", None)
-    # fn-488: ``closer_acked_at`` migrated off the tracked epic JSON into
-    # the gitignored ``.planctl/state/acks.db`` SQLite store.  Mirrors
-    # the ``draft`` pop above — any future load of a pre-fn-488 file
-    # (or a half-migrated checkout) gets the stale stamp scrubbed on
-    # the next write so the value can never desync the source of truth
-    # in acks.db.  Silent — no log, no warn.
-    data.pop("closer_acked_at", None)
     # fn-502: ``audited_into`` was a forward pointer from a closed epic
     # to the follow-up created by /plan:audit, written by ``epic close
     # --audited-into``.  The flag has been deleted; the audit skill now
     # threads the follow-up id through ``commit-plan after-audit
-    # --followup <eid>`` directly.  Mirrors the ``draft`` and
-    # ``closer_acked_at`` pops above — any future load of a pre-fn-502
-    # file gets the dead key scrubbed on the next write so it cannot
-    # reintroduce itself.  Silent — no log, no warn.
+    # --followup <eid>`` directly.  Mirrors the ``draft`` pop above — any
+    # future load of a pre-fn-502 file gets the dead key scrubbed on the
+    # next write so it cannot reintroduce itself.  Silent — no log, no warn.
     data.pop("audited_into", None)
     # fn-559: ``auditor_done_at`` was the fn-521 audit-gate stamp written by
     # the standalone ``/plan:audit`` flow (``epic auditor-done`` / close
     # ``--no-audit-required``).  The auditor concept was torn down — the audit
     # now runs INLINE inside ``/plan:close`` before the irreversible close
     # mutation, so there is no separate auditor stamp.  Mirrors the ``draft`` /
-    # ``closer_acked_at`` / ``audited_into`` pops above: any future load of a
-    # pre-fn-559 file gets the dead key scrubbed on the next write so it cannot
-    # reintroduce itself.  Build-forward — no migration, no SCHEMA_VERSION bump.
-    # Silent — no log, no warn.
+    # ``audited_into`` pops above: any future load of a pre-fn-559 file gets the
+    # dead key scrubbed on the next write so it cannot reintroduce itself.
+    # Build-forward — no migration, no SCHEMA_VERSION bump.  Silent.
     data.pop("auditor_done_at", None)
     if "branch_name" not in data:
         data["branch_name"] = None
@@ -88,27 +70,21 @@ def normalize_epic(data: dict) -> dict:
         data["primary_repo"] = None
     if "touched_repos" not in data:
         data["touched_repos"] = None
-    # Manual-approval-gate fields (fn-386 + fn-488).  `closer_done_at` is
-    # still stamped on the tracked epic JSON when `epic close` lands —
-    # the close event is single-source (one human-driven mutation per
-    # epic lifetime) and benefits from being committed alongside the
-    # other epic fields.  `closer_acked_at` lives in `acks.db` (fn-488)
-    # and is merged into the bundle by the plug-side bundle builder;
-    # the field is intentionally NOT defaulted here so downstream
-    # consumers always source it from acks.db via the merge.  Pre-
-    # existing closed epics with `closer_done_at` null are grandfathered
-    # (gate doesn't fire).
+    # `closer_done_at` is stamped on the tracked epic JSON when `epic close`
+    # lands — the close event is single-source (one human-driven mutation per
+    # epic lifetime) and is committed alongside the other epic fields. It is
+    # the completion signal keeper folds: an epic with `closer_done_at` set is
+    # done. Legacy records with `closer_done_at` null load fine; the field
+    # defaults to None.
     if "closer_done_at" not in data:
         data["closer_done_at"] = None
     # Close-provenance field — null on legacy records and on closes that
     # predate this stamp. ``close_reason`` carries the closer's terminal
-    # decision: today the only literal that flows downstream is
-    # ``"discarded"``, which ``runtime_status.derive_epic_runtime_status``
-    # short-circuits as a self-acked terminal state (no human ack-gate
-    # needed). Written by ``run_epic_close.run`` at close time.
-    # Previously stored alongside an ``audited_into`` forward pointer;
-    # removed in fn-502 in favor of explicit ``commit-plan after-audit
-    # --followup <eid>`` (see the ``data.pop`` migration above).
+    # decision: the only literal that flows downstream is ``"discarded"``,
+    # which ``runtime_status.derive_epic_runtime_status`` short-circuits as a
+    # terminal complete state (a discarded epic clears its downstream dep gate
+    # immediately, even with no tasks). Written by ``run_epic_close.run`` at
+    # close time.
     if "close_reason" not in data:
         data["close_reason"] = None
     # fn-513: snippet-substrate metadata. Additive list fields, no
@@ -120,13 +96,6 @@ def normalize_epic(data: dict) -> dict:
         data["snippets"] = []
     if "bundles" not in data:
         data["bundles"] = []
-    # fn-732: the ``approval`` pending default moved OUT of normalize and into
-    # the merge step (``merge_epic_state``). normalize_epic carries through
-    # whatever ``approval`` the def file holds (including a literal None /
-    # absent) untouched; the resolution ladder sidecar → def → pending lives
-    # at merge so the def's pending-vs-absent distinction survives to the
-    # reader. A def written by scaffold/epic create still carries an explicit
-    # "pending"; legacy/absent defs resolve to pending only after the merge.
     # fn-595: queue_jump signals to keeper that this epic should sort above all
     # other root epics on the board (via a `!`-prefixed sort_path).
     # The signal is server-derived from a scaffold YAML opt-in (`queue_jump:
@@ -134,7 +103,7 @@ def normalize_epic(data: dict) -> dict:
     # field rides the planctl_invocation envelope (the canonical seam keeper
     # folds) so a re-fold from event 0 reproduces it deterministically. Missing
     # field defaults to False; mirrors the additive precedents (snippets,
-    # bundles, approval) — no SCHEMA_VERSION bump.
+    # bundles) — no SCHEMA_VERSION bump.
     if "queue_jump" not in data:
         data["queue_jump"] = False
     return data
@@ -142,13 +111,6 @@ def normalize_epic(data: dict) -> dict:
 
 def normalize_task(data: dict) -> dict:
     """Apply defaults for optional task fields."""
-    # fn-488: ``worker_acked_at`` migrated off the tracked task JSON
-    # into the gitignored ``.planctl/state/acks.db`` SQLite store.
-    # Mirrors the ``draft`` pop in ``normalize_epic`` — any future load
-    # of a pre-fn-488 file (or a half-migrated checkout) gets the stale
-    # stamp scrubbed on the next write so the value can never desync
-    # the source of truth in acks.db.  Silent — no log, no warn.
-    data.pop("worker_acked_at", None)
     if "priority" not in data:
         data["priority"] = None
     if "depends_on" not in data:
@@ -156,15 +118,11 @@ def normalize_task(data: dict) -> dict:
     # Multi-repo field — null on legacy records.
     if "target_repo" not in data:
         data["target_repo"] = None
-    # Manual-approval-gate fields (fn-386 + fn-488).  `worker_done_at` is
-    # still stamped on the tracked task JSON when `done` lands — the
-    # done event is single-source (worker exit) and benefits from being
-    # committed alongside the other task fields.  `worker_acked_at`
-    # lives in `acks.db` (fn-488) and is merged into the bundle by the
-    # plug-side bundle builder; the field is intentionally NOT defaulted
-    # here so downstream consumers always source it from acks.db via
-    # the merge.  Pre-existing done tasks with `worker_done_at` null
-    # are grandfathered (gate doesn't fire).
+    # `worker_done_at` is stamped on the tracked task JSON when `done` lands —
+    # the done event is single-source (worker exit) and is committed alongside
+    # the other task fields. It is the completion signal keeper folds (a task
+    # with `worker_done_at` set is done). Legacy records with `worker_done_at`
+    # null load fine; the field defaults to None.
     if "worker_done_at" not in data:
         data["worker_done_at"] = None
     # Worker reasoning-tier persistence (fn-405). LOAD-TIME default only —
@@ -196,51 +154,36 @@ def normalize_task(data: dict) -> dict:
         data["snippets"] = []
     if "bundles" not in data:
         data["bundles"] = []
-    # fn-732: the ``approval`` pending default moved OUT of normalize and into
-    # the merge step (``merge_task_state``). normalize_task carries through the
-    # def's ``approval`` untouched; the resolution ladder sidecar → def →
-    # pending lives at merge (see normalize_epic for the rationale).
     return data
 
 
 def merge_task_state(definition: dict, runtime: dict | None) -> dict:
-    """Merge task definition with runtime state.
+    """Merge task definition with its runtime sidecar.
 
-    If runtime is None, default to {"status": "todo"}.
-    Runtime fields overwrite definition fields.
-
-    fn-732: the runtime sidecar (``.planctl/state/tasks/<id>.state.json``) may
-    carry an ``approval`` value alongside ``status``. Because runtime fields
-    overwrite definition fields, a sidecar ``approval`` shadows the committed
-    def's ``approval`` — that's the sidecar → def half of the resolution
-    ladder. The final ``pending`` default (the def → pending tail) is applied
-    here, AFTER the merge, so a reader sees a fully-resolved value:
-    sidecar > committed def > "pending".
+    If runtime is None, default to {"status": "todo"}. Runtime fields from the
+    gitignored sidecar (``.planctl/state/tasks/<id>.state.json``) overwrite
+    definition fields, so the merged dict carries the live ``status`` (and the
+    other runtime overlay fields) on top of the committed def.
     """
     if runtime is None:
         runtime = {"status": "todo"}
     merged = {**definition, **runtime}
     normalize_task(merged)
-    if merged.get("approval") is None:
-        merged["approval"] = "pending"
     return merged
 
 
 def merge_epic_state(definition: dict, epic_runtime: dict | None) -> dict:
-    """Merge an epic definition with its runtime sidecar (fn-732).
+    """Merge an epic definition with its runtime sidecar.
 
-    Epics have no ``status`` overlay — the sidecar carries only ``approval``
-    today. The merge runs the same resolution ladder as ``merge_task_state``:
-    a sidecar ``approval`` shadows the committed def's ``approval``, and an
-    absent value on both resolves to ``"pending"`` here (not in
-    ``normalize_epic``). ``epic_runtime`` is ``None`` when no sidecar exists,
-    which falls straight through to the def → pending tail.
+    Epics have no ``status`` overlay, so the sidecar carries no runtime field
+    that shadows the committed def today. ``epic_runtime`` is ``None`` when no
+    sidecar exists; the merge is then a normalize pass over the def. The
+    call-shape is kept symmetric with ``merge_task_state`` so the load path is
+    uniform across both surfaces.
     """
     runtime = epic_runtime or {}
     merged = {**definition, **runtime}
     normalize_epic(merged)
-    if merged.get("approval") is None:
-        merged["approval"] = "pending"
     return merged
 
 

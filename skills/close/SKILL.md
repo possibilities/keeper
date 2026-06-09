@@ -395,7 +395,7 @@ The reversible audit work is done (or there were no findings). Close the source 
 planctl epic close <epic_id>
 ```
 
-Never pass `--force`. `epic close` stamps `closer_done_at`; the epic flips to `pending_approval` for the human ack (no audit gate — the audit already ran inline).
+Never pass `--force`. `epic close` stamps `closer_done_at` — the completion signal keeper folds. A closed epic is terminal and completes the instant the stamp lands (no audit gate — the audit already ran inline).
 
 ---
 

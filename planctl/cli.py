@@ -15,19 +15,15 @@ import click
 from planctl._util import FormattedGroup, agent_help_option
 from planctl.output import INVOCATION_EMITTED_SENTINEL
 
-_NO_TRACK_COMMANDS: frozenset[str] = frozenset(
-    {"cat", "validate", "render-approve-context"}
-)
+_NO_TRACK_COMMANDS: frozenset[str] = frozenset({"cat", "validate"})
 """Verbs that own their stdout contract and must bypass the invocation decorator.
 
 ``cat`` emits raw markdown (no JSON wrapper); ``validate`` emits a non-standard
 ``{"valid": bool, "errors": [...], "warnings": [...]}`` envelope via
-``format_output`` directly (not ``output.emit()``); ``render-approve-context``
-emits the byte-for-byte marker-bearing markdown contract the ``/plan:approve``
-LLM-as-judge cascade matches on.  Appending a trailing NDJSON line to any of
-these verbs' stdout breaks the contract.  The trade-off — no tracking row for
-these verbs — is accepted because they are workflow-control surfaces, not
-state mutators in the audit-trail sense.
+``format_output`` directly (not ``output.emit()``).  Appending a trailing
+NDJSON line to either verb's stdout breaks the contract.  The trade-off — no
+tracking row for these verbs — is accepted because they are workflow-control
+surfaces, not state mutators in the audit-trail sense.
 """
 
 
@@ -209,9 +205,7 @@ planctl claim TASK_ID                           # Assert + claim + return briefi
 planctl done TASK_ID --summary "..."            # Complete with summary
 planctl block TASK_ID --reason "Waiting on X"  # Mark blocked
 planctl task reset TASK_ID                      # Reset to todo
-planctl task ack TASK_ID                        # Ack a worker drain (clear approval gate)
 planctl epic close EPIC_ID                      # Close when all tasks done
-planctl epic ack EPIC_ID                        # Ack a closer drain (clear approval gate)
 planctl epic invalidate EPIC_ID                 # Clear validation marker (force re-validate)
 ```
 
@@ -876,35 +870,6 @@ def cat_cmd(id):
     return _lazy_import("planctl.run_cat")(id=id)
 
 
-@cli.command("render-approve-context")
-@click.argument("id")
-def render_approve_context_cmd(id):
-    """Emit the markdown approve-context document for an epic or task.
-
-    Format-free verb that pulls keeper-projected lifecycle data through
-    keeper-py, picks the freshest target job, reads its transcript JSONL,
-    and emits the byte-for-byte marker-bearing markdown the ``/plan:approve``
-    SKILL.md cascade parses (``## last message`` wrapped in
-    ``--- BEGIN/END TRANSCRIPT ---``; ``## ERROR: keeperd unavailable`` and
-    ``## ERROR: no readable final message`` markers exit 0; spec-error
-    "id not found / no job" exits non-zero).  The transcript body is
-    sanitized so a worker cannot break out of the evidence delimiters and
-    self-approve.
-
-    Registered in ``_NO_TRACK_COMMANDS`` so the invocation decorator does
-    NOT append a trailing ``planctl_invocation`` NDJSON line — appending
-    one would corrupt the marker contract the skill body matches on.
-    """
-    result = _lazy_import("planctl.run_render_approve_context")(id=id)
-    # click drops the callback's return value silently in standalone mode —
-    # mirror the ``scaffold`` / ``refine-apply`` shape and sys.exit on a
-    # non-zero rc so the marker-contract failure modes (RenderError → exit 1)
-    # actually surface to the shell.
-    if result:
-        sys.exit(result)
-    return result
-
-
 @cli.command("gist")
 @click.argument("epic_id")
 @click.option("--public", is_flag=True, help="Make the gist public (default: secret)")
@@ -917,99 +882,6 @@ def gist_cmd(epic_id, public, no_open, description):
         public=public,
         no_open=no_open,
         description=description,
-    )
-
-
-_APPROVE_AGENT_HELP = """\
-planctl approve <epic_id> [<task_id>] <status>
-
-Set the approval gate on an epic or a task. fn-592 promotes the approval
-state from keeper's `approvals` SQLite sidecar into a top-level field on the
-canonical planctl JSON. Two forms:
-
-  planctl approve <epic_id> <status>              # epic-level
-  planctl approve <epic_id> <task_id> <status>    # task-level
-
-``<status>`` is one of: ``approved``, ``rejected``, ``pending``. Invalid
-values are rejected by click.Choice before any I/O. ``pending`` is the
-implicit default for new epics/tasks (missing field == pending), but an
-explicit ``approve ... pending`` is supported so an operator can flip a
-previously-approved epic back into the gate.
-
-Writes atomically via temp+rename in the same directory. Round-trip
-preserves all unknown top-level fields (forward-compat with keeperd writers
-that may add fields planctl doesn't yet know about).
-
-NOT in VALIDATION_RESTAMP_VERBS — approval is human gating state, not
-structural plan content; flipping it must not invalidate the epic's
-``last_validated_at`` marker.
-
-**Approval gates (fn-592 task .1).** When ``<status> == "approved"`` the
-verb refuses to write unless the target is in a clean approvable state:
-
-  * Task approve: the merged task ``status`` must be ``"done"``.
-  * Epic approve: the epic ``status`` must be ``"done"`` AND every embedded
-    task must have merged ``status == "done"`` AND every embedded task must
-    have ``approval == "approved"``.
-
-``rejected`` and ``pending`` writes are unguarded.  External writers
-(keeperd's ``set_task_approval`` / ``set_epic_approval`` RPCs) bypass these
-gates by design — they write the JSON directly, not via this CLI.
-
-**Cwd-agnostic resolution.** Three-step lookup: ``--project <path>`` →
-cwd → configured ``roots`` (~/.config/planctl/config.yaml). Cwd-first keeps
-single-repo workflows working without configured roots; discovery covers
-the multi-repo case (``epic.primary_repo`` in a sibling project). Pass
-``--project <path>`` to bypass both — e.g. for targets outside the roots,
-or to disambiguate when the same id exists in multiple discovered
-projects.
-"""
-
-
-@cli.command("approve")
-@click.argument("epic_id")
-@click.argument("rest", nargs=-1, required=True)
-@click.option(
-    "--project",
-    default=None,
-    help=(
-        "Project path to resolve the epic/task in, bypassing roots discovery. "
-        "Use this for targets in projects outside the configured roots, or to "
-        "disambiguate when the same id exists in multiple projects."
-    ),
-)
-@agent_help_option(_APPROVE_AGENT_HELP)
-def approve_cmd(epic_id, rest, project):
-    """Approve an epic or task: <epic_id> [<task_id>] <status> (fn-592)."""
-    from planctl.models import APPROVAL_STATUSES
-    from planctl.output import emit_error
-
-    # Two-form dispatch on positional count:
-    #   `<epic_id> <status>`              -> epic-level
-    #   `<epic_id> <task_id> <status>`    -> task-level
-    # click.Choice can't gate this directly because the status's positional
-    # slot depends on whether task_id is present; we re-validate inside the
-    # runner (defense in depth for non-CLI callers).
-    if len(rest) == 1:
-        task_id = None
-        status = rest[0]
-    elif len(rest) == 2:
-        task_id = rest[0]
-        status = rest[1]
-    else:
-        emit_error(
-            "approve: too many positional arguments. "
-            "Usage: approve <epic_id> [<task_id>] <status>"
-        )
-
-    if status not in APPROVAL_STATUSES:
-        emit_error(
-            f"Invalid approval status: {status!r}. "
-            f"Must be one of: {', '.join(APPROVAL_STATUSES)}"
-        )
-
-    return _lazy_import("planctl.run_approve")(
-        epic_id=epic_id, task_id=task_id, status=status, project=project
     )
 
 
@@ -1086,7 +958,7 @@ JSON, every child task JSON, the epic spec markdown, every task spec
 markdown, runtime state files, and lock files. Unlinks them all and
 auto-commits the deletions into the owning project's `.planctl/` via the
 standard `planctl_invocation` envelope path (so the state commit lands in
-`epic.primary_repo`, not the caller's cwd — same routing as `approve`).
+`epic.primary_repo`, not the caller's cwd).
 
 Resolution is cwd-then-global via `discovery.resolve_epic_globally`: if
 cwd is a planctl project carrying the id, it wins; otherwise scan the
@@ -1160,13 +1032,6 @@ def epic_rm_cmd(epic_id, force, dry_run, project):
         dry_run=dry_run,
         project=project,
     )
-
-
-@epic_group.command("ack")
-@click.argument("epic_id")
-def epic_ack_cmd(epic_id):
-    """Acknowledge a closer drain so the approval gate clears (fn-386)."""
-    return _lazy_import("planctl.run_epic_ack")(epic_id=epic_id)
 
 
 @epic_group.command("invalidate")
@@ -1465,13 +1330,6 @@ def task_set_bundles_cmd(task_id, bundles):
 def task_reset_cmd(task_id, cascade):
     """Reset a task to todo status."""
     return _lazy_import("planctl.run_task_reset")(task_id=task_id, cascade=cascade)
-
-
-@task_group.command("ack")
-@click.argument("task_id")
-def task_ack_cmd(task_id):
-    """Acknowledge a worker drain so the approval gate clears (fn-386)."""
-    return _lazy_import("planctl.run_task_ack")(task_id=task_id)
 
 
 @task_group.command("set-target-repo")

@@ -58,10 +58,9 @@ def run(args: SimpleNamespace) -> int:
     now = now_iso()
     epic_def["status"] = "done"
     epic_def["updated_at"] = now
-    # fn-386: stamp closer_done_at on the tracked epic definition. This is the
-    # gate's input at the epic level — `derive_epic_runtime_status` returns
-    # "pending_approval" until a matching `closer_acked_at` lands via
-    # `planctl epic ack`.
+    # Stamp closer_done_at on the tracked epic definition. This is the
+    # completion signal keeper folds at the epic level: a closed epic with
+    # closer_done_at set is complete.
     epic_def["closer_done_at"] = now
     if close_reason is not None:
         epic_def["close_reason"] = close_reason

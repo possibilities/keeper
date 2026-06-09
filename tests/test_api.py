@@ -141,18 +141,6 @@ class TestCrossCliReExports:
     owning submodule. Smoke-test identity to catch accidental shadowing.
     """
 
-    def test_acks_submodule_round_trips(self, tmp_path: Path) -> None:
-        # Real acks.db round trip via the re-exported module.
-        papi.acks.save_epic_ack(
-            "fn-77-slug", "2026-05-16T00:00:00Z", repo_root=tmp_path
-        )
-        result = papi.acks.all_epic_acks(repo_root=tmp_path)
-        assert result == {"fn-77-slug": "2026-05-16T00:00:00Z"}
-        assert (
-            papi.acks.get_epic_ack("fn-77-slug", repo_root=tmp_path)
-            == "2026-05-16T00:00:00Z"
-        )
-
     def test_id_regex_is_canonical_re(self) -> None:
         from planctl.ids import ID_REGEX as canonical
 

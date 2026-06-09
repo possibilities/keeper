@@ -14,7 +14,6 @@ def _render_human(data: dict) -> str:
 
 
 def run(args: SimpleNamespace) -> int:
-    from planctl import acks
     from planctl.deps import find_dependents
     from planctl.ids import epic_id_from_task
     from planctl.output import emit, emit_error
@@ -71,19 +70,10 @@ def run(args: SimpleNamespace) -> int:
         atomic_write(spec_path, spec_content)
 
         t_def["updated_at"] = now
-        # fn-386: clear ack-gate fields so re-running the worker stamps a
-        # fresh `worker_done_at` and the gate fires again naturally.
-        # fn-488: `worker_acked_at` now lives in `.planctl/state/acks.db`
-        # (gitignored), not on the tracked task JSON.  The on-disk drop
-        # of `worker_done_at` still happens here; the ack row drops via
-        # `acks.clear_task_ack` below.  Defensive `pop` on
-        # `worker_acked_at` survives the load-from-pre-fn-488 JSON path
-        # the same way `models.normalize_task` does (any stale stamp
-        # gets scrubbed on the next write).
+        # Clear `worker_done_at` so re-running the worker stamps a fresh one
+        # and the task reads as un-done again.
         t_def["worker_done_at"] = None
-        t_def.pop("worker_acked_at", None)
         atomic_write_json(t_path, t_def)
-        acks.clear_task_ack(tid, repo_root=ctx.project_path)
 
     # Reset the target task
     reset_single_task(task_id)

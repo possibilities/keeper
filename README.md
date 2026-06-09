@@ -57,18 +57,16 @@ planctl validate
 Top-level commands:
 
 - `init`, `detect`, `status`, `validate`, `state-path`
-- `claim`, `resolve-task`, `done`, `block`, `ready`, `approve`
+- `claim`, `resolve-task`, `done`, `block`, `ready`
 - `show`, `epics`, `tasks`, `list`, `cat`
 - `epic`, `task`, `dep`
-
-`approve <epic_id> [<task_id>] <status>` (fn-592) — gated approval verb. Status is one of `approved | rejected | pending`. Gates: task→`status == done`; epic→`status == done` AND every embedded task `status == done` with `approval == approved` (resolved via the sidecar → def → pending ladder). Driven by `/plan:approve <id>` from a claude session. **Runtime-state-only (fn-732):** the verb writes approval to the gitignored runtime sidecar ONLY (task state file via a `lock_task` RMW that preserves a concurrent `status` write; `epics/{id}.state.json` for epics) and emits a read-only invocation (NULL `subject`/`files`) — no `.planctl/` commit lands, mirroring `claim`/`block`. The committed-def rung of the resolution ladder is keeper's permanent fallback for the keeper-boots-first race and for legacy defs; `scripts/migrate_approval_to_sidecar.py` seeds existing def approvals into sidecars and (gated `--strip`) removes them from the def.
 
 `resolve-task <task_id>` (fn-593) — read-only routing lookup returning the subset of `claim`'s envelope an external consumer needs to pick a tier-plugin and police cwd. Retained as a public CLI surface; no longer wired to the `arthack-claude.py` launcher (keeper reads `task.tier` from its own projected Task data and launches with the matching `--plugin-dir` itself). Cwd-agnostic (scans configured `roots`); supports `--project <path>` to disambiguate. Returns `{task_id, epic_id, project_path, target_repo, primary_repo, tier, status}` — `tier` is one of `medium|high|xhigh|max` or `null`. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID | NOT_A_PROJECT`.
 
 Subcommands:
 
-- `epic`: `create`, `set-plan`, `set-branch`, `set-title`, `close`, `rm`, `ack`, `add-dep`, `rm-dep`
-- `task`: `create`, `set-description`, `set-acceptance`, `set-spec`, `reset`, `ack`, `set-deps`
+- `epic`: `create`, `set-plan`, `set-branch`, `set-title`, `close`, `rm`, `add-dep`, `rm-dep`
+- `task`: `create`, `set-description`, `set-acceptance`, `set-spec`, `reset`, `set-deps`
 - `dep`: `add`
 - `worker`: `resume`
 
@@ -84,16 +82,10 @@ All data lives in `.planctl/` inside the project directory:
   specs/{task-id}.md
   tasks/{task-id}.json
   state/                    # gitignored -- ephemeral runtime data
-    tasks/{task-id}.state.json    # task runtime status + approval (fn-732)
-    epics/{epic-id}.state.json    # epic approval sidecar (fn-732)
+    tasks/{task-id}.state.json    # task runtime status
+    epics/{epic-id}.state.json    # epic runtime sidecar
     locks/{task-id}.lock
 ```
-
-Approval lives canonically in the gitignored runtime sidecars (`approval`
-key on the task state file; `epics/{epic-id}.state.json` for epics) so keeper
-folds it gate-free. Every approval reader resolves it via the ladder
-**sidecar → committed def → `pending`**, defaulted at the merge step
-(`merge_task_state` / `merge_epic_state`), never in `normalize_*`.
 
 Specs are written in place to `specs/{id}.md` by commands that mutate spec content (`done`, `task set-description`, `task set-acceptance`, `task set-spec`, `task reset`, `epic set-plan`, `task create`, `epic create`). Git history provides the audit trail.
 
@@ -104,7 +96,7 @@ Environment variables:
 
 ## Auto-commit
 
-Every planctl CLI invocation emits a `planctl_invocation` NDJSON envelope on stdout. Mutating verbs additionally land a `chore(planctl): <op> <target>` commit inline at `output.emit()` via `planctl.commit.auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.planctl/` commit landed. Read-only verbs (and runtime-only verbs like `claim`/`block`/`ack`) emit the envelope but skip the git commit (`files` is empty → no-op). On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
+Every planctl CLI invocation emits a `planctl_invocation` NDJSON envelope on stdout. Mutating verbs additionally land a `chore(planctl): <op> <target>` commit inline at `output.emit()` via `planctl.commit.auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.planctl/` commit landed. Read-only verbs (and runtime-only verbs like `claim`/`block`) emit the envelope but skip the git commit (`files` is empty → no-op). On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
 
 `init` is the session-id-free mutating verb: it builds its own commit payload directly (an explicit list of the bootstrap files it created), so it needs neither the touched-paths log nor `CLAUDE_CODE_SESSION_ID`. It lands a `chore(planctl): init <project-name>` commit with no `Session-Id:` trailer, but only when it wrote something AND the cwd is inside a git work tree — an idempotent re-run or an `init` in a non-git dir takes the read-only path with no commit.
 
@@ -162,7 +154,7 @@ Four slash commands handle epic creation, refinement, the post-epic-close phase,
 | `/plan <request>` | Any new feature — spawns scouts, runs gap-analyst, full outer-loop quality pass. Use for anything non-trivial. |
 | `/plan:defer <subject>` | The sole single-task scaffolder. Mainlines the actionable work in the conversation into a single-task epic at normal epic-number order — no priority jump — and stops on overrun rather than silently scaling up. Member of the `/plan:plan` family (not a job-launcher). Hand-written tracked skill. |
 | `/plan:next <epic_id>` | Flips board priority on an *existing* epic so it jumps to the front of the queue. Calls `planctl epic queue-jump`, which sets `queue_jump=true` and emits an envelope carrying `queue_jump: true` — keeperd folds it into the `epics.queue_jump` projection column and stamps a `!`-prefixed `sort_path` so the epic sorts above all other root epics on the board. Read-only short-circuit when already set. Does NOT scaffold. Hand-written tracked skill. |
-| `/plan:close <epic_id>` | After all tasks in an epic are done: spawn `quality-auditor` → spawn `classifier` subagent (parses `<VERDICT_JSON>` block) → branch on `fatal` (off the in-memory verdict) → `planctl epic close <epic_id>` (stamps `closer_done_at`). **fn-559**: the audit runs INLINE inside close before the irreversible close mutation — no `--audit-required` / `--no-audit-required` flag, no `auditor_done_at` stamp, no separate `/plan:audit` session. `fatal` is the only ship-block signal; the closed epic flips straight to `pending_approval` for the human ack. Halts without closing on fatal verdict or parse/schema failure (no status stamp — the absence of a close is the signal). The findings follow-up tree (when the inline audit produces one) is scaffolded as a normal epic — `epic.depends_on_epics: [<source_eid>]` carries the source-link, and the `scaffold` verb's inline auto-commit lands the tree. |
+| `/plan:close <epic_id>` | After all tasks in an epic are done: spawn `quality-auditor` → spawn `classifier` subagent (parses `<VERDICT_JSON>` block) → branch on `fatal` (off the in-memory verdict) → `planctl epic close <epic_id>` (stamps `closer_done_at`). **fn-559**: the audit runs INLINE inside close before the irreversible close mutation — no `--audit-required` / `--no-audit-required` flag, no `auditor_done_at` stamp, no separate `/plan:audit` session. `fatal` is the only ship-block signal; a closed epic is terminal (`closer_done_at` stamped) and completes the instant close lands. Halts without closing on fatal verdict or parse/schema failure (no status stamp — the absence of a close is the signal). The findings follow-up tree (when the inline audit produces one) is scaffolded as a normal epic — `epic.depends_on_epics: [<source_eid>]` carries the source-link, and the `scaffold` verb's inline auto-commit lands the tree. |
 
 ## Help for Agents
 

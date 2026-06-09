@@ -32,7 +32,6 @@ def _make_bundle(
     primary_repo: str | None = None,
     touched_repos: list[str] | None = None,
     closer_done_at: str | None = None,
-    closer_acked_at: str | None = None,
     close_reason: str | None = None,
 ) -> dict:
     epic = {
@@ -46,8 +45,6 @@ def _make_bundle(
     }
     if closer_done_at is not None:
         epic["closer_done_at"] = closer_done_at
-    if closer_acked_at is not None:
-        epic["closer_acked_at"] = closer_acked_at
     if close_reason is not None:
         epic["close_reason"] = close_reason
     return {"epic": epic, "tasks": tasks or []}
@@ -60,7 +57,6 @@ def _make_task(
     depends_on: list[str] | None = None,
     target_repo: str | None = None,
     worker_done_at: str | None = None,
-    worker_acked_at: str | None = None,
 ) -> dict:
     row: dict = {
         "id": task_id,
@@ -71,8 +67,6 @@ def _make_task(
     }
     if worker_done_at is not None:
         row["worker_done_at"] = worker_done_at
-    if worker_acked_at is not None:
-        row["worker_acked_at"] = worker_acked_at
     return row
 
 
@@ -222,8 +216,9 @@ class TestDeriveGlobalStateWorkable:
         assert len(result["workable"]) == 1
         assert result["workable"][0]["action_id"] == "fn-1-epic.2"
 
-    def test_pending_approval_task_dep_blocks_workable(self):
-        """A dep task in pending_approval is not 'complete' → blocks downstream."""
+    def test_done_task_dep_unblocks_workable(self):
+        """A done dep task is 'complete' the instant the worker finishes —
+        no ack stands between done and unblocking the downstream task."""
         plans = {
             f"{PROJ}::fn-1-epic": _make_bundle(
                 "fn-1-epic",
@@ -232,28 +227,6 @@ class TestDeriveGlobalStateWorkable:
                         "fn-1-epic.1",
                         status="done",
                         worker_done_at="2026-01-01T00:00:00Z",
-                        # No worker_acked_at — pending_approval.
-                    ),
-                    _make_task(
-                        "fn-1-epic.2", status="todo", depends_on=["fn-1-epic.1"]
-                    ),
-                ],
-            )
-        }
-        result = derive_global_state(plans)
-        workable_ids = [w["action_id"] for w in result["workable"]]
-        assert "fn-1-epic.2" not in workable_ids
-
-    def test_acked_task_dep_unblocks_workable(self):
-        plans = {
-            f"{PROJ}::fn-1-epic": _make_bundle(
-                "fn-1-epic",
-                tasks=[
-                    _make_task(
-                        "fn-1-epic.1",
-                        status="done",
-                        worker_done_at="2026-01-01T00:00:00Z",
-                        worker_acked_at="2026-01-01T00:00:01Z",
                     ),
                     _make_task(
                         "fn-1-epic.2", status="todo", depends_on=["fn-1-epic.1"]
@@ -391,50 +364,16 @@ class TestDeriveGlobalStateBlockedEpics:
         assert result["blocked_epics"] == {}
         assert len(result["workable"]) == 1
 
-    def test_dep_epic_pending_approval_blocks_downstream(self):
-        """fn-559: a closed-and-drained dep epic in pending_approval blocks
-        downstream until acked.
-
-        ``_dep_status`` classifies the dep as ``done`` (status==done) and does
-        NOT add it to ``blocked_epics``.  The dep then passes to
-        ``_dep_epics_runtime_complete`` which calls
-        ``derive_epic_runtime_status`` — that returns ``pending_approval``
-        (not ``complete``), so the runtime-complete gate rejects the dep and
-        the downstream epic's tasks are hidden from workable (without
-        appearing in blocked_epics).
+    def test_closed_dep_epic_unblocks_downstream(self):
+        """A closed-and-drained dep epic (status==done, closer_done_at set) is
+        runtime-complete the instant the closer finishes — no ack gate stands
+        between close and unblocking the downstream epic's tasks.
         """
         plans = {
             f"{PROJ}::fn-1-dep": _make_bundle(
                 "fn-1-dep",
                 epic_status="done",
                 closer_done_at="2026-01-01T00:00:00Z",
-                # No closer_acked_at — surfaces as pending_approval.
-                tasks=[_make_task("fn-1-dep.1", status="done")],
-            ),
-            f"{PROJ}::fn-2-epic": _make_bundle(
-                "fn-2-epic",
-                epic_deps=["fn-1-dep"],
-                tasks=[_make_task("fn-2-epic.1", status="todo")],
-            ),
-        }
-        result = derive_global_state(plans)
-        workable_ids = [w["action_id"] for w in result["workable"]]
-        assert "fn-2-epic.1" not in workable_ids
-        # The dep epic itself is closed (status=done) so it is filtered out
-        # of the open-bundles iteration that populates close_ready — it
-        # appears in neither bucket while pending approval.
-        close_ids = [c["action_id"] for c in result["close_ready"]]
-        assert "fn-1-dep" not in close_ids
-        # Also not in blocked_epics — _dep_status saw status==done.
-        assert f"{PROJ}::fn-2-epic" not in result["blocked_epics"]
-
-    def test_dep_epic_acked_unblocks_downstream(self):
-        plans = {
-            f"{PROJ}::fn-1-dep": _make_bundle(
-                "fn-1-dep",
-                epic_status="done",
-                closer_done_at="2026-01-01T00:00:00Z",
-                closer_acked_at="2026-01-01T00:00:01Z",
                 tasks=[_make_task("fn-1-dep.1", status="done")],
             ),
             f"{PROJ}::fn-2-epic": _make_bundle(
@@ -446,6 +385,12 @@ class TestDeriveGlobalStateBlockedEpics:
         result = derive_global_state(plans)
         workable_ids = [w["action_id"] for w in result["workable"]]
         assert "fn-2-epic.1" in workable_ids
+        # The dep epic itself is closed (status=done) so it is filtered out of
+        # the open-bundles iteration that populates close_ready.
+        close_ids = [c["action_id"] for c in result["close_ready"]]
+        assert "fn-1-dep" not in close_ids
+        # Not in blocked_epics — the dep resolved as complete.
+        assert f"{PROJ}::fn-2-epic" not in result["blocked_epics"]
 
     def test_epic_with_multiple_unmet_deps_lists_all(self):
         plans = {

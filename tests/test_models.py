@@ -163,47 +163,49 @@ def test_normalize_task_preserves_existing_bundles():
 
 
 # ---------------------------------------------------------------------------
-# fn-732: approval resolution ladder lives in the merge step, not normalize.
+# merge_task_state / merge_epic_state — runtime overlay, no approval field.
 # ---------------------------------------------------------------------------
 
 
-def test_normalize_epic_no_longer_defaults_approval():
-    """fn-732: normalize_epic leaves a missing approval absent (merge defaults it)."""
+def test_normalize_epic_does_not_add_approval():
+    """No approval concept survives — normalize never injects the field."""
     data = {"id": "fn-1-test", "title": "Test", "status": "open"}
     normalize_epic(data)
     assert "approval" not in data
 
 
-def test_normalize_task_no_longer_defaults_approval():
-    """fn-732: normalize_task leaves a missing approval absent (merge defaults it)."""
+def test_normalize_task_does_not_add_approval():
+    """No approval concept survives — normalize never injects the field."""
     data = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Task"}
     normalize_task(data)
     assert "approval" not in data
 
 
-def test_merge_task_state_defaults_approval_pending():
-    """fn-732: merge_task_state applies the def → pending approval tail."""
+def test_merge_task_state_no_runtime_defaults_to_todo():
+    """A task with no runtime sidecar merges to status todo, no approval field."""
     merged = merge_task_state({"id": "fn-1-t.1", "epic": "fn-1-t", "title": "X"}, None)
-    assert merged["approval"] == "pending"
+    assert merged["status"] == "todo"
+    assert "approval" not in merged
 
 
-def test_merge_task_state_sidecar_approval_wins():
-    """fn-732 ladder: a sidecar (runtime) approval shadows the def approval."""
+def test_merge_task_state_runtime_status_overlays_def():
+    """The runtime sidecar's status overwrites the def's spec-side status."""
     definition = {
         "id": "fn-1-t.1",
         "epic": "fn-1-t",
         "title": "X",
-        "approval": "pending",
+        "status": "todo",
     }
-    merged = merge_task_state(definition, {"status": "done", "approval": "approved"})
-    assert merged["approval"] == "approved"
+    merged = merge_task_state(definition, {"status": "done"})
+    assert merged["status"] == "done"
+    assert "approval" not in merged
 
 
-def test_merge_epic_state_defaults_and_ladder():
-    """fn-732: merge_epic_state defaults to pending and lets the sidecar win."""
+def test_merge_epic_state_normalizes_without_approval():
+    """merge_epic_state is a normalize pass over the def — no approval field."""
     base = {"id": "fn-1-t", "title": "X", "status": "open"}
-    assert merge_epic_state(base, None)["approval"] == "pending"
-    assert merge_epic_state(base, {"approval": "approved"})["approval"] == "approved"
+    assert "approval" not in merge_epic_state(base, None)
+    assert "approval" not in merge_epic_state(base, {})
 
 
 # ---------------------------------------------------------------------------

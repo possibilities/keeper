@@ -785,14 +785,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             "id": epic_id,
             "title": epic_title,
             "status": "open",
-            # fn-592: pin the approval gate to "pending" at mint time. The
-            # read-time normalize_epic default also folds missing → "pending",
-            # but raw-JSON consumers that skip normalize (keeperd's schema-v13
-            # approval migration, which backfills any field-LESS epic to
-            # "approved") would otherwise sweep a fresh epic to approved.
-            # Writing the field explicitly makes the epic self-describing and
-            # immune to that backfill.
-            "approval": "pending",
             "branch_name": branch_name,
             "depends_on_epics": list(depends_on_epics),
             "primary_repo": primary_repo,

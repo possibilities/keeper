@@ -149,11 +149,6 @@ def run(args: SimpleNamespace) -> int:
             "id": epic_id,
             "title": title,
             "status": "open",
-            # fn-592: pin the approval gate to "pending" at mint time so the
-            # epic is self-describing and immune to keeperd's schema-v13
-            # approval migration, which backfills any field-LESS epic to
-            # "approved" (mirrors run_scaffold.py).
-            "approval": "pending",
             "branch_name": branch_name,
             "depends_on_epics": [],
             "primary_repo": primary_repo,

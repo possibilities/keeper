@@ -9,14 +9,13 @@ core (``_check_epic_tree``).
 Coverage (matches the legacy ``run_validate.py:--epic`` block 1:1):
 
 - meta fields on the epic JSON (id / title / status / status-in-enum)
-- ``approval`` enum (epic and per-task)
 - epic spec file present
 - epic-level ``depends_on_epics`` shape + existence
 - epic-level ``depends_on_epics`` cycle detection across the project's
   epic-dep graph (requires the caller to pass ``all_epic_deps``)
 - multi-repo fields (``primary_repo`` / ``touched_repos``) when present —
   filesystem ``.git/`` checks
-- per-task fields (id / epic / title / status / approval / preferred_backend)
+- per-task fields (id / epic / title / status / preferred_backend)
 - task spec heading validation
 - task-level ``depends_on`` shape + cross-epic check
 - dep existence + cycle detection across the epic's task graph
@@ -152,7 +151,6 @@ def _check_epic_tree(  # noqa: PLR0912, PLR0915 — single linear check matches 
     from planctl.deps import detect_cycles
     from planctl.ids import epic_id_from_task, is_epic_id, is_task_id
     from planctl.models import (
-        APPROVAL_STATUSES,
         EPIC_STATUSES,
         TASK_BACKENDS,
         TASK_STATUSES,
@@ -171,16 +169,6 @@ def _check_epic_tree(  # noqa: PLR0912, PLR0915 — single linear check matches 
     status = epic_data.get("status", "")
     if status not in EPIC_STATUSES:
         errors.append(f"Epic {eid}: invalid status '{status}'")
-
-    # fn-592: approval enum check. Missing/null is the implicit "pending"
-    # default (see normalize_epic) and is NOT an error.
-    if "approval" in epic_data:
-        approval = epic_data["approval"]
-        if approval is not None and approval not in APPROVAL_STATUSES:
-            errors.append(
-                f"Epic {eid}: invalid approval {approval!r} "
-                f"(must be null or one of {list(APPROVAL_STATUSES)})"
-            )
 
     # Epic spec presence: on-disk by default; in-memory when the caller passed
     # ``epic_spec_content`` (scaffold's pre-write gate; see param docs).
@@ -293,15 +281,6 @@ def _check_epic_tree(  # noqa: PLR0912, PLR0915 — single linear check matches 
                         )
                 except ValueError:
                     errors.append(f"Task {tid}: invalid dependency ID: {dep_tid}")
-
-        # fn-592: approval enum check on tasks.
-        if "approval" in task_data:
-            task_approval = task_data["approval"]
-            if task_approval is not None and task_approval not in APPROVAL_STATUSES:
-                errors.append(
-                    f"Task {tid}: invalid approval {task_approval!r} "
-                    f"(must be null or one of {list(APPROVAL_STATUSES)})"
-                )
 
         # preferred_backend allowlist check (fn-586 dormant infra).
         if "preferred_backend" in task_data:

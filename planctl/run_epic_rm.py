@@ -1,8 +1,8 @@
 """planctl epic rm — remove an epic and all its artifacts (fn-623 task .1).
 
 Companion to `epic close`: where close stamps `closer_done_at` and leaves the
-epic on the board for the approval/audit/keeper-stamp cycle, `rm` is the
-sanctioned delete verb — it physically unlinks every file the epic owns
+epic on the board as a completed row, `rm` is the sanctioned delete verb —
+it physically unlinks every file the epic owns
 (epic JSON, task JSONs, epic + task spec markdowns, runtime state files,
 lock files) and auto-commits the deletions into the owning project's
 `.planctl/`.
@@ -26,8 +26,7 @@ Auto-commit routing
 -------------------
 
 The state commit must land in the *owning* repo's `.planctl/`, not the
-caller's cwd repo (a major-mode bug we lived with for the `approve` rewrite
-— see `run_approve.py`). We read `epic.primary_repo` BEFORE deleting the
+caller's cwd repo. We read `epic.primary_repo` BEFORE deleting the
 epic JSON and pass it through as `primary_repo=` to
 `build_planctl_invocation`, which the auto-commit step routes by.
 
@@ -77,8 +76,8 @@ _EPIC_ID_PATH_RE = re.compile(r"^[A-Za-z0-9_\-]+$")
 def _context_for_root(project_root: Path):
     """Build a ProjectContext from a project root dir (the `.planctl/` parent).
 
-    Mirrors `run_approve._context_for_root`. Kept private to this module so
-    a future refactor moving it into `project.py` is mechanical.
+    Kept private to this module so a future refactor moving it into
+    `project.py` is mechanical.
     """
     from planctl.project import ProjectContext
 

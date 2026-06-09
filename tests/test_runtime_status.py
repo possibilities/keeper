@@ -1,10 +1,10 @@
 """Tests for planctl.runtime_status — plan-state-only derivation.
 
-The fn-614 collapse removed every join with running-job data: there is no
-``jobs`` parameter, no subagent-invocation walk, no closer overlay.  Derive
-functions read plan-state alone — done→complete, pending_approval if a
-``worker_done_at`` ack is pending, else→untouched.  ``derive_closer_runtime_status``
-always returns ``None``.
+The derive functions read plan-state alone: a task is ``complete`` iff its
+``status == "done"``, an epic is ``complete`` iff it is ``status == "done"``
+with every task complete (or close_reason "discarded"), else ``untouched``.
+There is no ``pending_approval`` state and no ack gate.
+``derive_closer_runtime_status`` always returns ``None``.
 """
 
 from __future__ import annotations
@@ -13,10 +13,8 @@ import pytest
 from planctl.runtime_status import (
     RuntimeStatus,
     _dep_epics_runtime_complete,
-    _epic_pending_approval,
     _expected_closer_cwd,
     _expected_worker_cwd,
-    _task_pending_approval,
     derive_closer_runtime_status,
     derive_epic_runtime_status,
     derive_task_runtime_status,
@@ -64,50 +62,18 @@ class TestTaskDone:
         task = _make_task("fn-1-epic.1", status="done")
         assert derive_task_runtime_status(task, {}, PROJ) == "complete"
 
-    def test_done_no_worker_done_at_grandfathered_returns_complete(self):
-        """Pre-existing done tasks without the ack stamp surface as complete."""
+    def test_done_with_worker_done_at_returns_complete(self):
+        """worker_done_at rides the JSON but does not gate the deriver."""
+        task = _make_task(
+            "fn-1-epic.1",
+            status="done",
+            worker_done_at="2026-01-01T00:00:00Z",
+        )
+        assert derive_task_runtime_status(task, {}, PROJ) == "complete"
+
+    def test_done_no_worker_done_at_returns_complete(self):
+        """A done task with no worker_done_at stamp is still complete."""
         task = _make_task("fn-1-epic.1", status="done")
-        # No worker_done_at — grandfathered.
-        assert derive_task_runtime_status(task, {}, PROJ) == "complete"
-
-    def test_done_acked_returns_complete(self):
-        task = _make_task(
-            "fn-1-epic.1",
-            status="done",
-            worker_done_at="2026-01-01T00:00:00Z",
-            worker_acked_at="2026-01-01T00:00:01Z",
-        )
-        assert derive_task_runtime_status(task, {}, PROJ) == "complete"
-
-
-class TestTaskPendingApproval:
-    def test_done_drained_pending_approval_returns_pending_approval(self):
-        """worker_done_at set + worker_acked_at absent → pending_approval."""
-        task = _make_task(
-            "fn-1-epic.1",
-            status="done",
-            worker_done_at="2026-01-01T00:00:00Z",
-        )
-        assert derive_task_runtime_status(task, {}, PROJ) == "pending_approval"
-
-    def test_stale_ack_returns_pending_approval(self):
-        """worker_acked_at before a newer worker_done_at → pending_approval."""
-        task = _make_task(
-            "fn-1-epic.1",
-            status="done",
-            worker_done_at="2026-01-02T00:00:00Z",
-            worker_acked_at="2026-01-01T00:00:00Z",
-        )
-        assert derive_task_runtime_status(task, {}, PROJ) == "pending_approval"
-
-    def test_same_second_ack_treated_as_acked_returns_complete(self):
-        """acked_at == done_at → safe-fail toward complete."""
-        task = _make_task(
-            "fn-1-epic.1",
-            status="done",
-            worker_done_at="2026-01-01T00:00:00Z",
-            worker_acked_at="2026-01-01T00:00:00Z",
-        )
         assert derive_task_runtime_status(task, {}, PROJ) == "complete"
 
 
@@ -151,6 +117,20 @@ class TestEpicComplete:
             derive_epic_runtime_status(epic, tasks, PROJ, task_statuses) == "complete"
         )
 
+    def test_done_epic_with_closer_done_at_returns_complete(self):
+        """A closed-and-drained epic is complete the instant the closer
+        finishes — no ack gate stands between closer_done_at and complete."""
+        epic = _make_epic(
+            "fn-1-epic",
+            status="done",
+            closer_done_at="2026-01-01T00:00:00Z",
+        )
+        task = _make_task("fn-1-epic.1", status="done")
+        task_statuses: dict[str, RuntimeStatus] = {"fn-1-epic.1": "complete"}
+        assert (
+            derive_epic_runtime_status(epic, [task], PROJ, task_statuses) == "complete"
+        )
+
     def test_open_epic_with_all_tasks_complete_returns_untouched(self):
         """tasks_complete_all but epic still open → not complete."""
         epic = _make_epic("fn-1-epic", status="open")
@@ -175,78 +155,8 @@ class TestEpicComplete:
         )
 
 
-class TestEpicPendingApproval:
-    """fn-559: closed-and-drained epic surfaces as pending_approval until ack."""
-
-    def test_closed_drained_pending_approval_returns_pending_approval(self):
-        epic = _make_epic(
-            "fn-1-epic",
-            status="done",
-            closer_done_at="2026-01-01T00:00:00Z",
-        )
-        task = _make_task("fn-1-epic.1", status="done")
-        task_statuses: dict[str, RuntimeStatus] = {"fn-1-epic.1": "complete"}
-        assert (
-            derive_epic_runtime_status(epic, [task], PROJ, task_statuses)
-            == "pending_approval"
-        )
-
-    def test_closed_drained_acked_returns_complete(self):
-        epic = _make_epic(
-            "fn-1-epic",
-            status="done",
-            closer_done_at="2026-01-01T00:00:00Z",
-            closer_acked_at="2026-01-01T00:00:01Z",
-        )
-        task = _make_task("fn-1-epic.1", status="done")
-        task_statuses: dict[str, RuntimeStatus] = {"fn-1-epic.1": "complete"}
-        assert (
-            derive_epic_runtime_status(epic, [task], PROJ, task_statuses) == "complete"
-        )
-
-    def test_grandfathered_done_no_closer_done_at_returns_complete(self):
-        """Pre-existing closed epic with no closer_done_at — gate doesn't fire."""
-        epic = _make_epic("fn-1-epic", status="done")
-        task = _make_task("fn-1-epic.1", status="done")
-        task_statuses: dict[str, RuntimeStatus] = {"fn-1-epic.1": "complete"}
-        assert (
-            derive_epic_runtime_status(epic, [task], PROJ, task_statuses) == "complete"
-        )
-
-    def test_pending_approval_dominates_complete(self):
-        """closer_done_at + ack absent fires before the tasks_complete_all branch."""
-        epic = _make_epic(
-            "fn-1-epic",
-            status="done",
-            closer_done_at="2026-01-01T00:00:00Z",
-        )
-        # All tasks complete — would normally fire the complete branch — but
-        # pending_approval gate runs first.
-        task = _make_task("fn-1-epic.1", status="done")
-        task_statuses: dict[str, RuntimeStatus] = {"fn-1-epic.1": "complete"}
-        assert (
-            derive_epic_runtime_status(epic, [task], PROJ, task_statuses)
-            == "pending_approval"
-        )
-
-    def test_legacy_auditor_done_at_is_ignored(self):
-        """fn-559: legacy auditor_done_at field does not gate the predicate."""
-        epic = _make_epic(
-            "fn-1-epic",
-            status="done",
-            closer_done_at="2026-01-01T00:00:00Z",
-            auditor_done_at=None,
-        )
-        task = _make_task("fn-1-epic.1", status="done")
-        task_statuses: dict[str, RuntimeStatus] = {"fn-1-epic.1": "complete"}
-        assert (
-            derive_epic_runtime_status(epic, [task], PROJ, task_statuses)
-            == "pending_approval"
-        )
-
-
 class TestEpicDiscardedShortCircuit:
-    """Discarded close (closer self-acked) short-circuits to complete."""
+    """Discarded close (terminal) short-circuits to complete."""
 
     def test_discarded_taskless_returns_complete(self):
         epic = _make_epic(
@@ -255,7 +165,6 @@ class TestEpicDiscardedShortCircuit:
             close_reason="discarded",
             closer_done_at="2026-01-01T00:00:00Z",
         )
-        # closer_acked_at intentionally absent — discarded skips the ack gate.
         assert derive_epic_runtime_status(epic, [], PROJ, {}) == "complete"
 
     def test_discarded_with_unfinished_tasks_returns_complete(self):
@@ -267,22 +176,6 @@ class TestEpicDiscardedShortCircuit:
         )
         task = _make_task("fn-1-discarded.1", status="todo")
         task_statuses: dict[str, RuntimeStatus] = {"fn-1-discarded.1": "untouched"}
-        assert (
-            derive_epic_runtime_status(epic, [task], PROJ, task_statuses) == "complete"
-        )
-
-    def test_discarded_skips_ack_gate(self):
-        """Discarded close ignores closer_acked_at — no human ack needed."""
-        epic = _make_epic(
-            "fn-1-discarded",
-            status="done",
-            close_reason="discarded",
-            closer_done_at="2026-01-01T00:00:00Z",
-        )
-        # No closer_acked_at — would return pending_approval but for the
-        # discarded short-circuit.
-        task = _make_task("fn-1-discarded.1", status="done")
-        task_statuses: dict[str, RuntimeStatus] = {"fn-1-discarded.1": "complete"}
         assert (
             derive_epic_runtime_status(epic, [task], PROJ, task_statuses) == "complete"
         )
@@ -314,87 +207,6 @@ class TestCloserRuntimeStatus:
     def test_returns_none_for_discarded_epic(self):
         epic = _make_epic("fn-1-epic", status="done", close_reason="discarded")
         assert derive_closer_runtime_status(epic, PROJ) is None
-
-
-# ---------------------------------------------------------------------------
-# _task_pending_approval / _epic_pending_approval predicates
-# ---------------------------------------------------------------------------
-
-
-class TestTaskAckPredicate:
-    def test_no_done_at_returns_false_grandfathered(self):
-        assert _task_pending_approval({}) is False
-        assert _task_pending_approval({"worker_done_at": None}) is False
-
-    def test_done_at_set_no_acked_at_returns_true(self):
-        assert (
-            _task_pending_approval({"worker_done_at": "2026-01-01T00:00:00Z"}) is True
-        )
-
-    def test_acked_at_after_done_at_returns_false(self):
-        assert (
-            _task_pending_approval(
-                {
-                    "worker_done_at": "2026-01-01T00:00:00Z",
-                    "worker_acked_at": "2026-01-01T00:00:01Z",
-                }
-            )
-            is False
-        )
-
-    def test_acked_at_before_done_at_returns_true(self):
-        assert (
-            _task_pending_approval(
-                {
-                    "worker_done_at": "2026-01-02T00:00:00Z",
-                    "worker_acked_at": "2026-01-01T00:00:00Z",
-                }
-            )
-            is True
-        )
-
-    def test_same_second_treats_as_acked(self):
-        assert (
-            _task_pending_approval(
-                {
-                    "worker_done_at": "2026-01-01T00:00:00Z",
-                    "worker_acked_at": "2026-01-01T00:00:00Z",
-                }
-            )
-            is False
-        )
-
-
-class TestEpicAckPredicate:
-    def test_no_done_at_returns_false_grandfathered(self):
-        assert _epic_pending_approval({}) is False
-
-    def test_done_at_set_no_acked_at_returns_true(self):
-        assert (
-            _epic_pending_approval({"closer_done_at": "2026-01-01T00:00:00Z"}) is True
-        )
-
-    def test_acked_at_after_done_at_returns_false(self):
-        assert (
-            _epic_pending_approval(
-                {
-                    "closer_done_at": "2026-01-01T00:00:00Z",
-                    "closer_acked_at": "2026-01-01T00:00:01Z",
-                }
-            )
-            is False
-        )
-
-    def test_stale_ack_returns_true(self):
-        assert (
-            _epic_pending_approval(
-                {
-                    "closer_done_at": "2026-01-01T00:00:05Z",
-                    "closer_acked_at": "2026-01-01T00:00:00Z",
-                }
-            )
-            is True
-        )
 
 
 # ---------------------------------------------------------------------------
@@ -537,33 +349,28 @@ class TestDepEpicsRuntimeComplete:
         assert result is expected
 
 
-class TestDepEpicsRuntimeCompleteGatesPendingApproval:
-    """A dep epic in pending_approval state is not runtime-complete."""
+class TestDepEpicsRuntimeCompleteOnClose:
+    """A closed-and-drained dep epic is runtime-complete immediately."""
 
-    def test_dep_pending_approval_blocks_complete(self):
+    def test_dep_closer_done_at_returns_complete(self):
         dep_epic = _make_epic(
             "fn-1-dep",
             status="done",
             closer_done_at="2026-01-01T00:00:00Z",
-        )
-        dep_task = _make_task("fn-1-dep.1", status="done")
-        dep_epic_lookup: dict[tuple[str, str], tuple[dict, list[dict]]] = {
-            (PROJ, "fn-1-dep"): (dep_epic, [dep_task])
-        }
-        assert _dep_epics_runtime_complete(["fn-1-dep"], PROJ, dep_epic_lookup) is False
-
-    def test_dep_acked_returns_complete(self):
-        dep_epic = _make_epic(
-            "fn-1-dep",
-            status="done",
-            closer_done_at="2026-01-01T00:00:00Z",
-            closer_acked_at="2026-01-01T00:00:01Z",
         )
         dep_task = _make_task("fn-1-dep.1", status="done")
         dep_epic_lookup: dict[tuple[str, str], tuple[dict, list[dict]]] = {
             (PROJ, "fn-1-dep"): (dep_epic, [dep_task])
         }
         assert _dep_epics_runtime_complete(["fn-1-dep"], PROJ, dep_epic_lookup) is True
+
+    def test_dep_open_blocks_complete(self):
+        dep_epic = _make_epic("fn-1-dep", status="open")
+        dep_task = _make_task("fn-1-dep.1", status="todo")
+        dep_epic_lookup: dict[tuple[str, str], tuple[dict, list[dict]]] = {
+            (PROJ, "fn-1-dep"): (dep_epic, [dep_task])
+        }
+        assert _dep_epics_runtime_complete(["fn-1-dep"], PROJ, dep_epic_lookup) is False
 
 
 class TestDepEpicsCrossProjectFallback:

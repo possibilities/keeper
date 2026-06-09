@@ -136,10 +136,9 @@ def run(args: SimpleNamespace) -> int:
     # Update definition
     now = now_iso()
     task_def["updated_at"] = now
-    # fn-386: stamp worker_done_at on the tracked task definition (NOT on the
-    # gitignored runtime-state file). This stamp is the gate's input —
-    # `derive_task_runtime_status` returns "pending_approval" until a matching
-    # `worker_acked_at` lands via `planctl task ack`.
+    # Stamp worker_done_at on the tracked task definition (NOT on the
+    # gitignored runtime-state file). This stamp is the completion signal
+    # keeper folds: a task with worker_done_at set is complete.
     task_def["worker_done_at"] = now
     atomic_write_json(task_path, task_def)
 

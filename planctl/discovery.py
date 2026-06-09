@@ -62,7 +62,7 @@ def resolve_epic_globally(
 ) -> ResolveResult:
     """Resolve an epic id cwd-then-global, distinguishing not-found from ambiguous.
 
-    Resolution order mirrors ``run_approve.py::_resolve_project_for_approve``:
+    Resolution order (shared cwd-then-roots lookup):
 
     1. **Cwd**: if the current working directory is a planctl project AND its
        ``.planctl/epics/<epic_id>.json`` exists, return it. This preserves the
@@ -160,8 +160,8 @@ def find_projects_with_epic(
     """Return discovered project roots whose ``.planctl/epics/<epic_id>.json`` exists.
 
     Sibling of :func:`find_projects_with_task` for epic-keyed lookups. Used by
-    ``approve`` to resolve an epic's owning project cwd-agnostically when the
-    operator invokes ``planctl approve <epic_id> ...`` from outside the repo
+    epic-keyed verbs (e.g. ``epic rm``) to resolve an epic's owning project
+    cwd-agnostically when the operator invokes them from outside the repo
     whose ``.planctl/`` holds the epic.
     """
     matches: list[Path] = []

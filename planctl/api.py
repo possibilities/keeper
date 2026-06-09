@@ -7,8 +7,8 @@ this module is safe to import outside a planctl git root.
 
 This module is the **only** legal cross-CLI import surface for planctl
 (enforced by ``scripts/lint-cli-boundaries.py``). Sibling CLIs that need
-helpers from ``acks``, ``ids``, or ``runtime_status``
-import them via this façade — never directly.
+helpers from ``ids`` or ``runtime_status`` import them via this façade —
+never directly.
 """
 
 from __future__ import annotations
@@ -16,7 +16,6 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from planctl import acks
 from planctl.ids import ID_REGEX, JOB_ID_REGEX, is_epic_id, is_job_id, is_task_id
 from planctl.models import (
     RUNTIME_FIELDS,
@@ -65,12 +64,10 @@ def load_epic(project: ProjectContext, epic_id: str) -> dict:
     epic file is absent or ``json.JSONDecodeError`` on a half-written /
     malformed file. Callers handle the retry/skip decision.
 
-    fn-732: ``approval`` lives canonically in a gitignored sidecar
-    (``.planctl/state/epics/<id>.state.json``). ``merge_epic_state`` folds it
-    over the committed def and resolves the ladder sidecar → def → pending, so
-    a caller reading ``epic["approval"]`` sees the fully-resolved value. The
-    committed def is the permanent fallback rung for the keeper-boots-first
-    race and for legacy defs. No other runtime field overlays an epic today.
+    The epic runtime sidecar (``.planctl/state/epics/<id>.state.json``) carries
+    no field that overlays the committed def today; ``merge_epic_state`` is a
+    normalize pass over the def, kept for call-shape symmetry with the task
+    load path.
     """
     from planctl.store import LocalFileStateStore
 
@@ -137,7 +134,6 @@ __all__ = [
     "JOB_ID_REGEX",
     "ProjectContext",
     "RUNTIME_FIELDS",
-    "acks",
     "epic_id_from_task",
     "expected_closer_cwd",
     "expected_worker_cwd",

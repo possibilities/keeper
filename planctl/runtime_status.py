@@ -14,55 +14,11 @@ from typing import Any, Literal
 # Types
 # ---------------------------------------------------------------------------
 
-RuntimeStatus = Literal["complete", "untouched", "pending_approval"]
+RuntimeStatus = Literal["complete", "untouched"]
 
 # ---------------------------------------------------------------------------
 # Public helpers
 # ---------------------------------------------------------------------------
-
-
-def _task_pending_approval(task: dict[str, Any]) -> bool:
-    """Return True iff a task has a worker drain that has not been acked (fn-386).
-
-    Predicate: ``worker_done_at is not None AND (worker_acked_at is None OR
-    worker_acked_at < worker_done_at)``. Same-second collision (``==``) treats
-    the ack as current (safe-fail toward complete).
-
-    Pre-existing done tasks with no ``worker_done_at`` field set are
-    grandfathered (returns False) — gate only applies to forward completions.
-    Reads via ``dict.get`` so un-normalized records do not raise.
-    """
-    done_at = task.get("worker_done_at")
-    if done_at is None:
-        return False
-    acked_at = task.get("worker_acked_at")
-    if acked_at is None:
-        return True
-    return acked_at < done_at
-
-
-def _epic_pending_approval(epic: dict[str, Any]) -> bool:
-    """Return True iff an epic has a closer drain that has not been acked (fn-386).
-
-    Predicate: ``closer_done_at is not None AND (closer_acked_at is None
-    OR closer_acked_at < closer_done_at)``.
-
-    fn-559 reverted the fn-521 ``auditor_done_at`` clause: the standalone
-    auditor concept was torn down (the audit now runs inline inside
-    ``/plan:close`` before the close mutation), so a closed epic flips
-    straight to ``pending_approval`` once ``closer_done_at`` lands — there is
-    no separate audit gate to satisfy first.
-
-    Pre-existing closed epics with no ``closer_done_at`` field set are
-    grandfathered (returns False).
-    """
-    done_at = epic.get("closer_done_at")
-    if done_at is None:
-        return False
-    acked_at = epic.get("closer_acked_at")
-    if acked_at is None:
-        return True
-    return acked_at < done_at
 
 
 def _expected_worker_cwd(task: dict[str, Any], epic: dict[str, Any], proj: str) -> str:
@@ -92,9 +48,13 @@ def derive_task_runtime_status(
     Predicate:
 
         if task["status"] == "done":
-            if _task_pending_approval(task):  return "pending_approval"
             return "complete"
         return "untouched"
+
+    Work auto-completes the instant the worker finishes: a ``done`` task is
+    ``complete`` directly off ``status``. ``worker_done_at`` still rides the
+    tracked task JSON (keeper's completion signal), but the deriver no longer
+    gates on it.
 
     Args:
         task: Task dict from the plans bundle (must have ``status``).
@@ -104,8 +64,7 @@ def derive_task_runtime_status(
         proj: Absolute project path.  Accepted for the same parity reason.
 
     Returns:
-        ``"complete"`` for done+acked tasks, ``"pending_approval"`` for
-        done tasks awaiting a human ack, ``"untouched"`` for everything else
+        ``"complete"`` for done tasks, ``"untouched"`` for everything else
         (todo, in_progress, blocked).
     """
     # epic / proj retained in the signature for call-shape parity with the
@@ -113,8 +72,6 @@ def derive_task_runtime_status(
     del epic, proj
     status = task.get("status", "")
     if status == "done":
-        if _task_pending_approval(task):
-            return "pending_approval"
         return "complete"
     return "untouched"
 
@@ -133,10 +90,6 @@ def derive_epic_runtime_status(
         if epic.status == "done" and epic.close_reason == "discarded":
             return "complete"
 
-        # Pending-approval gate (fn-386).
-        if epic.status == "done" and _epic_pending_approval(epic):
-            return "pending_approval"
-
         # tasks_complete_all + status==done → complete.
         tasks_complete_all = bool(tasks) and all(
             task_statuses[t.id] == "complete" for t in tasks
@@ -144,9 +97,6 @@ def derive_epic_runtime_status(
         if tasks_complete_all and epic.status == "done":
             return "complete"
 
-        # Anything-touched fallthrough.
-        if tasks and any(task_statuses[t.id] != "untouched" for t in tasks):
-            return "wrapped" -> NO, plan-state only emits "untouched".
         return "untouched"
 
     Args:
@@ -158,19 +108,15 @@ def derive_epic_runtime_status(
                        epic's tasks (from ``derive_task_runtime_status``).
 
     Returns:
-        ``"complete"``, ``"untouched"``, or ``"pending_approval"``.
+        ``"complete"`` or ``"untouched"``.
     """
     del proj  # call-shape parity; not consumed
 
     # Discarded close (closer's own decision: "this epic was thrown away") is
-    # terminal and self-acked — no human ack-gate needed.  Clears any
-    # downstream dep gate immediately.
+    # terminal — it clears any downstream dep gate immediately, even when the
+    # epic shipped no tasks.
     if epic.get("status") == "done" and epic.get("close_reason") == "discarded":
         return "complete"
-
-    # Pending-approval gate (fn-386).
-    if epic.get("status") == "done" and _epic_pending_approval(epic):
-        return "pending_approval"
 
     tasks_complete_all = bool(tasks) and all(
         task_statuses.get(t.get("id", "")) == "complete" for t in tasks

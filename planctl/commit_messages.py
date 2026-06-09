@@ -72,16 +72,13 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     # Queue-jump verb (fn-1) — priority-flag verb, not structural: flips
     # queue_jump=true post-hoc on an existing epic so keeper sorts it to the
     # front of the board. NOT in VALIDATION_RESTAMP_VERBS (same stance as
-    # invalidate/approve/task-set-tier).
+    # invalidate/task-set-tier).
     "queue-jump": lambda t, d: _subject("queue-jump", t, d),
     # Project bootstrap (fn-2) — the one mutating verb that builds its own
     # invocation payload directly (explicit fixed file list), without the
     # touched-paths log or CLAUDE_CODE_SESSION_ID. NOT in
     # VALIDATION_RESTAMP_VERBS — it mints no epic. Target is the project name.
     "init": lambda t, d: _subject("init", t, d),
-    # Manual-approval-gate ack verbs (fn-386)
-    "task-ack": lambda t, d: _subject("task-ack", t, d),
-    "epic-ack": lambda t, d: _subject("epic-ack", t, d),
     # Whole-tree epic scaffold (fn-544) — materializes an epic + N tasks
     # + cross-task deps + specs from one YAML in a single transactional
     # call. Target is the freshly-allocated epic id; the per-task writes
@@ -104,15 +101,6 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     # Worker reasoning-tier persistence (fn-405) — runtime detail, not in
     # VALIDATION_RESTAMP_VERBS.
     "task-set-tier": lambda t, d: _subject("task-set-tier", t, d),
-    # Approval gate (fn-592) — top-level verb covering both epic and task
-    # surfaces.  Human gating state, NOT structural, so it is NOT in
-    # VALIDATION_RESTAMP_VERBS.  The target id is the epic id (epic-level
-    # approval) or the task id (task-level approval); the subject form is
-    # identical for both — the id distinguishes which surface.
-    # Renamed from `set-approval` to `approve` in fn-592 task .1; the new
-    # verb additionally gates the `approved` write on task→done /
-    # epic→done+all-tasks-done+all-tasks-approved.
-    "approve": lambda t, d: _subject("approve", t, d),
 }
 
 
