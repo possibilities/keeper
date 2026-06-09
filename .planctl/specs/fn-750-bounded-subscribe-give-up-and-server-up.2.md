@@ -63,5 +63,5 @@ SKILL.md, and the `src/readiness-client.ts` module JSDoc to add server-up +
 - [ ] existing await tests still pass; new server-up + unreachable tests added
 
 ## Done summary
-
+Wired keeper await's give-up: onFatal branches code=unreachable into a distinct 'failed reason=unreachable ... advice=' exit 1 (deduped via the terminating latch), with the give-up policy + injectable clock threaded to the readiness/git/jobs streams. Added the server-up nullary condition: its own give-up-exempt reconnect-forever subscribe that fires met on first paint, mutually exclusive with 'and' at parse time. HELP/README/SKILL.md/readiness-client JSDoc synced; new server-up + unreachable tests added (170 tests green).
 ## Evidence
