@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-8-expand-reconcile-test-coverage",
   "bundles": [],
+  "closer_done_at": "2026-06-09T22:22:17.491431Z",
   "created_at": "2026-06-09T20:09:31.952800Z",
   "depends_on_epics": [
     "fn-6-post-worker-reconcile-verdict-verb"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/planctl",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "expand reconcile test coverage",
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-09T20:09:31.952800Z"
+  "updated_at": "2026-06-09T22:22:17.491431Z"
 }
