@@ -152,6 +152,8 @@ The success envelope on stdout carries `status: done` — that's your confirmati
 
 If `planctl done` itself fails (rare — local file write), surface the failure verbatim and stop. The source commit already shipped, so the parent can detect the trailer and complete the task on a re-run.
 
+**Delivery self-check (before you return).** Delivery cleanliness is yours, not the orchestrator's. Run `keeper session-state` once more and confirm `session_files` is empty — everything you touched is committed. If any session file is still dirty, commit it with `keeper commit-work` (same contract as Phase 4) before returning. A `keeper session-state` / `keeper commit-work` failure here follows the existing `BLOCKED: TOOLING_FAILURE` path — don't patch the tool you're calling.
+
 ## Phase 6 — Return summary
 
 Brief, structured. No file writes, no extra tool calls — just text:
