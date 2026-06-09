@@ -48,5 +48,5 @@ be unaffected (their stored version is never > SCHEMA_VERSION).
 - [ ] full bun test green; no schema bump, no keeper-py diff
 
 ## Done summary
-
+migrate() now throws pre-transaction when the stored schema_version exceeds the binary's SCHEMA_VERSION (both versions + remediation in the message), so an old keeperd refuses to silently downgrade a newer DB. Schema-version test flipped from max to membership; downgrade case added to db.test.ts; CLAUDE.md Migrations updated. No schema bump, no keeper-py change.
 ## Evidence

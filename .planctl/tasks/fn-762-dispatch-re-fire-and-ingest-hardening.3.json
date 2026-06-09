@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Migration downgrade guard",
-  "updated_at": "2026-06-09T22:06:08.002453Z"
+  "updated_at": "2026-06-09T23:23:05.471780Z",
+  "worker_done_at": "2026-06-09T23:23:05.471780Z"
 }
