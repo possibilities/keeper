@@ -35,5 +35,5 @@ Run the affected test file: `uv run pytest tests/test_arthack_claude_agent_overr
 - [ ] `.planctl/specs/` history untouched.
 
 ## Done summary
-
+Dropped the three /plan:approve test prompts from the launcher role-name test (system/tests/test_launcher_plan_role_names.py — the only arthack /plan:approve reference); CLAUDE.md had no keeper/planctl approval refs (only the auto-approve permission-hook prose, left intact). Affected test green (4 passed).
 ## Evidence
