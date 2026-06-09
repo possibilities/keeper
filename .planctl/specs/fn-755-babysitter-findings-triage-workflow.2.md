@@ -47,5 +47,5 @@ Render via `promptctl render-plugin-templates` and confirm `commands/babysit-new
 - [ ] The new home is committed to the ~/docs git repo
 
 ## Done summary
-
+Added claude/arthack/template/commands/babysit-new.md.tmpl: a human-invoke-only slash command that interviews for a sitter's triage goals and idempotently scaffolds ~/docs/babysitters/<slug>/ (charter.md, empty processed.jsonl, rounds/, README.md) per the fn-755 ledger contract, never clobbering an existing charter/ledger, and commits the new home to the ~/docs git repo.
 ## Evidence
