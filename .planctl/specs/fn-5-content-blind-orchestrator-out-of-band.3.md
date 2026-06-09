@@ -39,5 +39,5 @@ Run `tests/test_work_skill_consistency.py` after edits. If the project exposes a
 - [ ] `tests/test_work_skill_consistency.py` green; ruff clean.
 
 ## Done summary
-
+Agent-facing prose consumes the brief out-of-band: both worker templates read BRIEF_REF JSON and self-check identity/repos/schema (codex sub-prompt planctl cat asymmetry preserved); work.md.tmpl passes BRIEF_REF with no prose inlining, nudges on resume with process facts only, and auto-resumes dirty-after-done within the 5-attempt budget.
 ## Evidence
