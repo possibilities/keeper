@@ -9,11 +9,11 @@
  * the numeric pct and a bare relative reset countdown. Future times
  * render without an `in ` prefix (`3h 5m` / `5m` / `now`) since the
  * column context makes the direction unambiguous. A reset is strictly
- * forward, so a past value never reads as an age: an elapsed reset dashes
- * to `—` (its prediction can't be trusted — a frozen/erroring profile),
- * and a whole keeper-stale row dashes every reset cell plus the rate-limit
- * lift, with the `stale Nm` line carrying the why. Only a genuine
- * zero-crossing renders `now`.
+ * forward, so a past value never reads as an age: an elapsed-but-fresh
+ * reset collapses to `now`, never `<rel> ago`. The ONLY `—` trigger is a
+ * keeper-stale row (fold stamp past the threshold), which dashes every
+ * reset cell AND drops the rate-limit line, with the `stale Nm` line
+ * carrying the why. There is no per-cell dash.
  *
  * `nowMs` is an explicit parameter so tests can drive deterministic
  * snapshots — the live script passes `Date.now()` from both the
@@ -89,15 +89,13 @@ test("renders the round boundary as 'now'", () => {
   expect(bodyLine(lines, "week")).toMatch(/ now$/);
 });
 
-test("dashes an elapsed reset to '—', never 'now' or '<rel> ago'", () => {
+test("collapses an elapsed-but-fresh reset to 'now', never '—' or '<rel> ago'", () => {
   // A reset cell is a strictly-forward countdown — agentuse always resolves
-  // `*_resets_at` into the future at scrape time, so a PAST timestamp is a
-  // prediction whose moment elapsed before a fresh scrape replaced it (a
-  // single erroring/frozen profile, even while keeper folds the rest). It is
-  // neither an age (`<rel> ago` would mislabel an "until" value) nor a fresh
-  // "now" (that read as "everything just reset" on a dead producer) — it
-  // renders `—`. This fires on the cell's OWN value; the row need not be
-  // keeper-stale.
+  // `*_resets_at` into the future at scrape time. On a FRESH row (no keeper
+  // staleness) a PAST timestamp means "the reset is due; a fresh scrape just
+  // hasn't landed yet" → `now`. It is neither an age (`<rel> ago` would
+  // mislabel an "until" value) nor `—` (that is reserved exclusively for a
+  // keeper-stale row). There is no per-cell dash.
   const lines = renderRowLines(
     [
       {
@@ -112,10 +110,10 @@ test("dashes an elapsed reset to '—', never 'now' or '<rel> ago'", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toMatch(/ —$/);
-  expect(bodyLine(lines, "week")).toMatch(/ —$/);
-  expect(bodyLine(lines, "session")).not.toMatch(/now|ago/);
-  expect(bodyLine(lines, "week")).not.toMatch(/now|ago/);
+  expect(bodyLine(lines, "session")).toMatch(/ now$/);
+  expect(bodyLine(lines, "week")).toMatch(/ now$/);
+  expect(bodyLine(lines, "session")).not.toMatch(/—|ago/);
+  expect(bodyLine(lines, "week")).not.toMatch(/—|ago/);
 });
 
 test("collapses to days at the day boundary; drops residual minutes", () => {
@@ -461,9 +459,9 @@ test("emits 'rate-limited for <rel>' when rate_limit_lifts_at is known and futur
   expect(row as string).not.toMatch(/ ago$/);
 });
 
-test("renders 'rate-limited n/a' when rate_limit_lifts_at is NULL (v41)", () => {
-  // The lift column is NULL → render the explicit `n/a` token, not the
-  // fired-time fallback.
+test("omits the rate-limited line when rate_limit_lifts_at is NULL (v41)", () => {
+  // A NULL lift means no window is currently >=100% — the limit has lifted, so
+  // a `rate-limited` line would lie. Drop it (no `n/a`, no `—`, no fired-time).
   const lines = renderRowLines(
     [
       {
@@ -481,15 +479,13 @@ test("renders 'rate-limited n/a' when rate_limit_lifts_at is NULL (v41)", () => 
     ],
     NOW_MS,
   );
-  const row = bodyLineExact(lines, "rate-limited") as string;
-  expect(row).toMatch(/ n\/a$/);
-  expect(row).not.toMatch(/ ago$/);
+  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("rate-limited");
 });
 
-test("renders 'rate-limited n/a' when rate_limit_lifts_at is in the past (v41 guard)", () => {
-  // Past-reset guard: `relTime` would otherwise render "<rel> ago" for a
-  // past lift instant — the rate-limited line MUST intercept that and
-  // render `n/a` instead. Lift was 2h ago.
+test("omits the rate-limited line when rate_limit_lifts_at is clearly past (v41)", () => {
+  // A clearly-past lift on a fresh row means the limit has lifted — drop the
+  // line rather than render a stale `n/a` / "<rel> ago". Lift was 2h ago.
   const lines = renderRowLines(
     [
       {
@@ -507,9 +503,34 @@ test("renders 'rate-limited n/a' when rate_limit_lifts_at is in the past (v41 gu
     ],
     NOW_MS,
   );
+  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("rate-limited");
+});
+
+test("renders 'rate-limited now' when the lift is within the rounding gap (v41)", () => {
+  // A lift ~20s out rounds to "now" — the limit is lifting this instant. This
+  // is the one past-ish state that still renders: the line stays and shows
+  // `now` (not `for …`, not `—`, not omitted).
+  const lines = renderRowLines(
+    [
+      {
+        id: "claude-multi-3",
+        target: "claude",
+        multiplier: 20,
+        session_percent: 16,
+        session_resets_at: isoOffset(29),
+        week_percent: 36,
+        week_resets_at: isoOffset(4 * 24 * 60 + 5 * 60),
+        last_rate_limit_at: NOW_SEC - (3 * 3600 + 12 * 60),
+        rate_limit_lifts_at: new Date(NOW_MS + 20_000).toISOString(),
+      },
+    ],
+    NOW_MS,
+  );
   const row = bodyLineExact(lines, "rate-limited") as string;
-  expect(row).toMatch(/ n\/a$/);
-  expect(row).not.toMatch(/ ago$/);
+  expect(row, "expected a rate-limited line").toBeDefined();
+  expect(row).toMatch(/ now$/);
+  expect(row).not.toMatch(/for|ago|—/);
 });
 
 test("omits the rate-limited line when last_rate_limit_at is NULL", () => {
@@ -737,13 +758,11 @@ test("no 'stale' line when last_usage_fold_at is NULL (no successful fold to age
   expect(bodyLineExact(lines, "stale")).toBeUndefined();
 });
 
-test("stale and rate-limited render together as visually distinct lines", () => {
-  // Both warnings can fire on the same row — the three states (idle is a
-  // header chip, rate-limited is the colocated line, stale is its own
-  // labelled line) must stay visually distinct. On a STALE row the
-  // rate-limit lift can't be trusted (a frozen snapshot's future lift has
-  // necessarily elapsed), so the tail dashes to `—` rather than showing a
-  // confident-but-wrong `for 30m`. The `stale Nm` line carries the why.
+test("a keeper-stale row drops the rate-limited line entirely", () => {
+  // On a STALE row the lift can't be trusted (a frozen snapshot's future lift
+  // has necessarily elapsed). Rather than a dashed `rate-limited —`, the line
+  // is dropped ENTIRELY — the `stale Nm` line is the single signal that the
+  // row is frozen, and the reset cells still dash to `—`.
   const lines = renderRowLines(
     [
       {
@@ -761,13 +780,15 @@ test("stale and rate-limited render together as visually distinct lines", () => 
     ],
     NOW_MS,
   );
-  // header + session + week + rate-limited + stale = 5 lines.
-  expect(lines).toHaveLength(5);
-  const rl = bodyLineExact(lines, "rate-limited") as string;
+  // header + session + week + stale = 4 lines; no rate-limited line.
+  expect(lines).toHaveLength(4);
+  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("rate-limited");
   const stale = bodyLineExact(lines, "stale") as string;
-  expect(rl).toMatch(/ —$/);
-  expect(rl).not.toMatch(/for/);
   expect(stale).toMatch(/ 20m$/);
+  // Reset cells on the stale row still dash to `—`.
+  expect(bodyLine(lines, "session")).toMatch(/ —$/);
+  expect(bodyLine(lines, "week")).toMatch(/ —$/);
 });
 
 test("a stale row dashes its reset countdowns instead of showing a value", () => {
@@ -798,6 +819,51 @@ test("a stale row dashes its reset countdowns instead of showing a value", () =>
   expect(bodyLine(lines, "sonnet")).toMatch(/ —$/);
   // No relative-time vocabulary leaks onto the stale reset tail.
   expect(bodyLine(lines, "session")).not.toMatch(/(now|ago|\dm|\dh|\dd)$/);
+});
+
+test("omits the session line when the weekly window is depleted (>=100%)", () => {
+  // A maxed weekly window collapses the session window to a reset-less 0% on
+  // the /usage panel (agentuse emits session with a null reset). The renderer
+  // suppresses the now-noise `session` line entirely — only `week` renders.
+  const lines = renderRowLines(
+    [
+      {
+        id: "mc2",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 0,
+        session_resets_at: null,
+        week_percent: 100,
+        week_resets_at: isoOffset(4 * 24 * 60),
+      },
+    ],
+    NOW_MS,
+  );
+  // header + week only — the session line is gone.
+  expect(lines).toHaveLength(2);
+  expect(bodyLineExact(lines, "session")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("session");
+  expect(bodyLine(lines, "week")).toMatch(/ 100%/);
+});
+
+test("keeps the session line while the weekly window is under 100%", () => {
+  // Guard the boundary: a 99% week still renders the session line normally.
+  const lines = renderRowLines(
+    [
+      {
+        id: "mc2",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 40,
+        session_resets_at: isoOffset(30),
+        week_percent: 99,
+        week_resets_at: isoOffset(4 * 24 * 60),
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLine(lines, "session")).toMatch(/ 40%/);
+  expect(bodyLine(lines, "week")).toMatch(/ 99%/);
 });
 
 // ---------------------------------------------------------------------------
