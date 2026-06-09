@@ -401,6 +401,31 @@ interface PathState {
 export class TranscriptLineStream {
   private readonly pathState = new Map<string, PathState>();
   private readonly lastEmitted = new Map<string, string>();
+  /**
+   * fn-759: per-path {size, mtimeMs} stat memo gating `scanFile`'s full re-read.
+   * The 60s heartbeat (and the FSEvents-drop rescan) walks every
+   * `jobs.transcript_path` row and re-read ~733 MB/min of unchanged transcripts
+   * end-to-end; this memo skips a file whose size AND mtimeMs are byte-identical
+   * to the last successful scan, returning the no-emit/rescued=false path.
+   *
+   * Deliberately SEPARATE from `pathState` (the live-tail offset memo) — scanFile
+   * stays transient w.r.t. the live tail (:482-486); this memo is the ONLY new
+   * state it writes. Written ONLY after a successful stat AND a successful full
+   * scan, so a transient EACCES/EIO never poisons a path into permanent
+   * suppression. ENOENT clears the entry (a re-appeared file always re-scans).
+   *
+   * mtimeMs is Bun's sub-second float (APFS stores ns); gating on whole seconds
+   * would false-skip a same-second append, so we compare the float verbatim and
+   * gate on size first. In-memory only — no sidecar, no persistence: an empty
+   * memo on restart just costs one full re-scan (safe). Bounded by
+   * `jobs.transcript_path` cardinality, no eviction. Append-only assumption:
+   * transcripts only grow; a same-size in-place rewrite would defeat
+   * size+mtimeMs — acceptable because no writer does that.
+   */
+  private readonly scanStatMemo = new Map<
+    string,
+    { size: number; mtimeMs: number }
+  >();
 
   /**
    * Live forward-tail driver. `onTitle` is called for each NEW (changed)
@@ -499,12 +524,14 @@ export class TranscriptLineStream {
    */
   scanFile(path: string): boolean {
     let size: number;
+    let mtimeMs: number;
     try {
       const st = statSync(path);
       if (!st.isFile()) {
         return false;
       }
       size = st.size;
+      mtimeMs = st.mtimeMs;
     } catch (err) {
       // ENOENT is the EXPECTED case, not an error: `scanJobsForTitles` walks
       // every `jobs.transcript_path` row — thousands of historical sessions
@@ -517,10 +544,24 @@ export class TranscriptLineStream {
         this.log(
           `[transcript-worker] boot scan stat failed for ${path}: ${stringifyErr(err)}`,
         );
+      } else {
+        // fn-759: drop a memo entry for a vanished path so an un-vanished file
+        // (same path, fresh inode) is always re-scanned — never cache "gone".
+        this.scanStatMemo.delete(path);
       }
       return false;
     }
     if (size <= 0) {
+      return false;
+    }
+
+    // fn-759: change-gate the full re-read on size+mtimeMs. A grown file (or a
+    // same-size mtime bump) re-scans; a truncation/rotation (`size < memo.size`)
+    // re-scans from 0 (the read loop below already starts at offset 0). Only a
+    // byte-identical {size, mtimeMs} skips — flowing into the no-emit/
+    // rescued=false return, identical to a scan that matched no new title.
+    const memo = this.scanStatMemo.get(path);
+    if (memo && size === memo.size && mtimeMs === memo.mtimeMs) {
       return false;
     }
 
@@ -598,6 +639,14 @@ export class TranscriptLineStream {
         // best-effort
       }
     }
+
+    // fn-759: the full scan completed without a read error (any readSync failure
+    // above `return false`s BEFORE here, leaving the memo absent/stale so the
+    // next healthy tick re-scans). Record the snapshot we just consumed so an
+    // unchanged file is skipped next tick. Written from the pre-read stat
+    // (`size`/`mtimeMs`), so a mid-read append lands a smaller-than-current
+    // memo and is conservatively caught next tick.
+    this.scanStatMemo.set(path, { size, mtimeMs });
 
     // Emit the current title per session through the shared change-gate: a title
     // already folded (seeded by seedFromDb) is suppressed; a changed one emits

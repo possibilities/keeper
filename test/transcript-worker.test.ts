@@ -16,10 +16,14 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import {
   appendFileSync,
+  chmodSync,
   mkdirSync,
   mkdtempSync,
   rmSync,
+  statSync,
   truncateSync,
+  unlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -377,6 +381,166 @@ test("scanJobsForTitles: boot then drop-recovery over an unchanged file emits no
   } finally {
     db.close();
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-759: the heartbeat/drop-rescan stat memo — an unchanged file is skipped
+// without reading any bytes; changed/truncated files still scan; failure paths
+// never poison the memo; ENOENT clears it.
+// ---------------------------------------------------------------------------
+
+// A fixed whole-second mtime the tests pin every file to. utimesSync carries
+// only the precision a JS Date holds (whole ms), and APFS/Bun report mtimeMs as
+// a sub-ms float — so pinning to a whole second guarantees a reproducible
+// mtimeMs across writes (no sub-ms drift the memo would (correctly) treat as a
+// change). The memo gates on the verbatim float; pinning makes that float stable.
+const PINNED_MTIME = new Date(1_700_000_000_000); // 2023-11-14T22:13:20.000Z
+
+// Pin a file's atime+mtime to PINNED_MTIME so its mtimeMs is reproducible.
+function pinMtime(path: string): void {
+  utimesSync(path, PINNED_MTIME, PINNED_MTIME);
+}
+
+// Helper: snapshot a file's size, mutate its content in place to a NEW title,
+// then forcibly restore byte-identical {size, mtimeMs} (size via pad/truncate,
+// mtimeMs via the PINNED_MTIME). A subsequent scan that reads the file would
+// observe the poisoned content (and emit its title); a memo-skipped scan never
+// reads it. So an emit here is a black-box "the file WAS read" signal.
+function poisonContentKeepingStat(path: string, newContent: string): void {
+  const beforeSize = statSync(path).size;
+  writeFileSync(path, newContent);
+  const after = statSync(path);
+  if (after.size < beforeSize) {
+    appendFileSync(path, " ".repeat(beforeSize - after.size));
+  } else if (after.size > beforeSize) {
+    truncateSync(path, beforeSize);
+  }
+  pinMtime(path);
+  const restored = statSync(path);
+  // Sanity: the memo gates on the float pair; both must match for the skip arm.
+  expect(restored.size).toBe(beforeSize);
+  expect(restored.mtimeMs).toBe(PINNED_MTIME.getTime());
+}
+
+test("scanFile memo: an unchanged file is skipped without reading bytes (poisoned content never surfaces)", () => {
+  const path = join(tmpDir, "memo-unchanged.jsonl");
+  writeFileSync(path, `${titleLine("memo-sess", "Original")}\n`);
+  pinMtime(path);
+
+  const emitted: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    () => {},
+  );
+
+  // First scan reads + emits, and records the {size, mtimeMs} memo.
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["Original"]);
+
+  // Poison the file with a DIFFERENT title at byte-identical {size, mtimeMs}.
+  // If the second scan read the file it would emit "Poisoned" (the change-gate
+  // would NOT suppress it — the title differs). A memo skip never reads it.
+  poisonContentKeepingStat(path, `${titleLine("memo-sess", "Poisoned")}\n`);
+
+  expect(stream.scanFile(path)).toBe(false);
+  expect(emitted).toEqual(["Original"]);
+});
+
+test("scanFile memo: an appended file rescans and emits the new title", () => {
+  const path = join(tmpDir, "memo-append.jsonl");
+  writeFileSync(path, `${titleLine("append-sess", "First")}\n`);
+
+  const emitted: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    () => {},
+  );
+
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["First"]);
+
+  // A real append grows size (and bumps mtimeMs) — the memo no longer matches.
+  appendFileSync(path, `${titleLine("append-sess", "Second")}\n`);
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["First", "Second"]);
+});
+
+test("scanFile memo: a truncated/rotated file rescans from 0", () => {
+  const path = join(tmpDir, "memo-truncate.jsonl");
+  // Two titles so the file is comfortably larger than the rotated content.
+  writeFileSync(
+    path,
+    `${titleLine("rot-sess", "Old A")}\n${titleLine("rot-sess", "Old B")}\n`,
+  );
+
+  const emitted: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    () => {},
+  );
+
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["Old B"]);
+
+  // Rotation: file shrinks to a fresh, smaller body with a new title. size <
+  // memo.size — the memo treats it as changed and rescans from offset 0.
+  writeFileSync(path, `${titleLine("rot-sess", "Rotated")}\n`);
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["Old B", "Rotated"]);
+});
+
+test("scanFile memo: a stat failure leaves no memo entry so the next healthy tick rescans", () => {
+  const path = join(tmpDir, "memo-eacces.jsonl");
+  writeFileSync(path, `${titleLine("eacces-sess", "Healthy")}\n`);
+
+  const logs: string[] = [];
+  const emitted: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    (m) => logs.push(m),
+  );
+
+  // Make the file unreadable -> statSync still succeeds on macOS, but openSync
+  // fails (EACCES). The open-failure path `return false`s BEFORE the memo write,
+  // so no entry is recorded.
+  chmodSync(path, 0o000);
+  expect(stream.scanFile(path)).toBe(false);
+  expect(emitted).toEqual([]);
+  expect(logs.some((m) => m.includes("open failed"))).toBe(true);
+
+  // Heal the file: the absent memo means the next tick performs a full rescan
+  // (poisoning would have been read had a memo wrongly suppressed it).
+  chmodSync(path, 0o600);
+  poisonContentKeepingStat(path, `${titleLine("eacces-sess", "Rescued")}\n`);
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["Rescued"]);
+});
+
+test("scanFile memo: ENOENT clears the entry so a re-appeared file rescans", () => {
+  const path = join(tmpDir, "memo-enoent.jsonl");
+  writeFileSync(path, `${titleLine("enoent-sess", "Before")}\n`);
+
+  const emitted: string[] = [];
+  const stream = new TranscriptLineStream(
+    (_s, title) => emitted.push(title),
+    () => {},
+  );
+
+  // Seed the memo.
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["Before"]);
+
+  // File vanishes -> ENOENT clears the memo entry (no cached "gone").
+  unlinkSync(path);
+  expect(stream.scanFile(path)).toBe(false);
+
+  // A re-appeared file at the SAME path, byte-identical {size, mtimeMs} to the
+  // pre-vanish snapshot, MUST still rescan because ENOENT cleared the memo.
+  // Recreate "Before" first, restore its stat, then poison the content.
+  writeFileSync(path, `${titleLine("enoent-sess", "Before")}\n`);
+  poisonContentKeepingStat(path, `${titleLine("enoent-sess", "After")}\n`);
+  expect(stream.scanFile(path)).toBe(true);
+  expect(emitted).toEqual(["Before", "After"]);
 });
 
 test("scanJobsForTitles: a title changed between boot and recovery emits exactly its delta", () => {

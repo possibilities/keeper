@@ -1206,7 +1206,12 @@ flip `state → 'stopped'` — this is the only signal for built-in
 interactive tools that fire no hook of their own). Main — the sole
 writer — turns each producer message into the matching events row on
 its writable connection and pumps a wake; the reducer's terminal-guarded
-arms do the projection work.
+arms do the projection work. The 60s heartbeat / FSEvents-drop backstop
+re-scans every `jobs.transcript_path` row, but a per-path `{size, mtimeMs}`
+stat memo (separate from the live-tail offset state, written only after a
+successful stat+scan, cleared on ENOENT) skips any file unchanged since its
+last scan — so the backstop no longer re-reads hundreds of MB/min of static
+transcripts, while the fn-720 rescued accounting is byte-identical.
 
 A **fourth** Worker thread is the plan producer: it watches each configured
 project root (from `~/.config/keeper/config.yaml`, default `~/code`) for
