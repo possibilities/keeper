@@ -23,12 +23,19 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   rmSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { scanEventsLogDir } from "../src/daemon";
+import { BackstopCounters } from "../src/backstop-telemetry";
+import type { EventsIngestContext } from "../src/daemon";
+import {
+  INGEST_EVENTS_COLUMNS,
+  recoverOneDeadLetter,
+  scanEventsLogDir,
+} from "../src/daemon";
 import { openDb } from "../src/db";
 import type { EventLogRecord } from "../src/dead-letter";
 import { serializeEventLogRecord } from "../src/dead-letter";
@@ -345,6 +352,372 @@ test("scanEventsLogDir tolerates a missing dir (fresh machine / pre-hook-flip)",
   ).c;
   expect(count).toBe(0);
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-762 — poison-line parking + replay column binding.
+// ---------------------------------------------------------------------------
+
+/**
+ * Build the optional telemetry sink `scanEventsLogDir` threads through so a
+ * parked poison line emits an `events-ingest-poison` backstop record. The
+ * NDJSON path lands under the per-test tmpdir.
+ */
+function makeIngestCtx(): {
+  ctx: EventsIngestContext;
+  backstopLogPath: string;
+} {
+  const backstopLogPath = join(tmpDir, "backstop.ndjson");
+  return {
+    ctx: { counters: new BackstopCounters(), backstopLogPath },
+    backstopLogPath,
+  };
+}
+
+/** Read the backstop NDJSON sidecar (one JSON object per line), or `[]`. */
+function readBackstopRecords(logPath: string): Record<string, unknown>[] {
+  if (!existsSync(logPath)) return [];
+  return readFileSync(logPath, "utf8")
+    .split("\n")
+    .filter((l) => l.trim().length > 0)
+    .map((l) => JSON.parse(l) as Record<string, unknown>);
+}
+
+test("scanEventsLogDir parks a poison line, advances past it, and ingests the following valid line in the same scan", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const { ctx, backstopLogPath } = makeIngestCtx();
+
+  // valid line, POISON line (garbage JSON), valid line — all newline-terminated.
+  const v1 = serializeEventLogRecord(makeRecord("aaa"));
+  const poisonLine = `{not valid json at all\n`;
+  const v2 = serializeEventLogRecord(makeRecord("bbb"));
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(file, v1 + poisonLine + v2);
+
+  scanEventsLogDir(db, eventsLogDir, ctx);
+
+  // Both valid lines ingested in the SAME scan — the loop continued past the
+  // poison line instead of stopping at it.
+  const rows = db
+    .query("SELECT session_id FROM events ORDER BY id ASC")
+    .all() as { session_id: string }[];
+  expect(rows.map((r) => r.session_id)).toEqual(["aaa", "bbb"]);
+
+  // Offset advanced to EOF (every complete line consumed, poison included).
+  const offRow = db
+    .query("SELECT offset FROM event_ingest_offsets WHERE path = ?")
+    .get(file) as { offset: number };
+  expect(offRow.offset).toBe(Buffer.byteLength(v1 + poisonLine + v2, "utf8"));
+
+  // The poison line is parked with status='poison' and the deterministic dl_id
+  // keyed on (basename, inode, absolute start offset).
+  const dl = db
+    .query(
+      "SELECT dl_id, status, hook_event, session_id, source_file, bindings FROM dead_letters",
+    )
+    .all() as {
+    dl_id: string;
+    status: string;
+    hook_event: string;
+    session_id: string;
+    source_file: string;
+    bindings: string;
+  }[];
+  expect(dl.length).toBe(1);
+  const row = dl[0];
+  if (!row) throw new Error("expected one poison dead_letters row");
+  expect(row.status).toBe("poison");
+  expect(row.hook_event).toBe("PoisonLine");
+  expect(row.session_id).toBe("poison");
+  const absStart = Buffer.byteLength(v1, "utf8");
+  // dl_id = `poison:<basename>:<inode>:<absStart>`. The inode is runtime-
+  // dependent, so assert the prefix (basename) and suffix (absolute start
+  // offset) rather than hard-coding the middle.
+  expect(row.dl_id.startsWith(`poison:${LIVE_PID}.ndjson:`)).toBe(true);
+  expect(row.dl_id.endsWith(`:${absStart}`)).toBe(true);
+  // Bindings carry the capped raw + byte span for triage.
+  const parsedBindings = JSON.parse(row.bindings) as Record<string, unknown>;
+  expect(parsedBindings.start_offset).toBe(absStart);
+  expect(typeof parsedBindings.raw).toBe("string");
+
+  // One backstop record emitted post-COMMIT.
+  const recs = readBackstopRecords(backstopLogPath);
+  const poisonRecs = recs.filter((r) => r.backstop === "events-ingest-poison");
+  expect(poisonRecs.length).toBe(1);
+  const rec = poisonRecs[0];
+  if (!rec) throw new Error("expected one poison backstop record");
+  expect(rec.class).toBe("timeout");
+  expect(rec.rescued).toBe(true);
+  expect((rec.detail as Record<string, string>).dl_id).toBe(row.dl_id);
+
+  db.close();
+});
+
+test("scanEventsLogDir drains a multi-poison file: every poison line parked, every valid line ingested, in one scan", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const { ctx, backstopLogPath } = makeIngestCtx();
+
+  const v1 = serializeEventLogRecord(makeRecord("aaa"));
+  const v2 = serializeEventLogRecord(makeRecord("bbb"));
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(file, `garbage-one\n${v1}[1,2,3]\n${v2}also bad\n`);
+
+  scanEventsLogDir(db, eventsLogDir, ctx);
+
+  const rows = db
+    .query("SELECT session_id FROM events ORDER BY id ASC")
+    .all() as { session_id: string }[];
+  expect(rows.map((r) => r.session_id)).toEqual(["aaa", "bbb"]);
+
+  const poisonCount = (
+    db
+      .query("SELECT count(*) AS c FROM dead_letters WHERE status = 'poison'")
+      .get() as { c: number }
+  ).c;
+  expect(poisonCount).toBe(3);
+
+  // Offset at EOF — the whole file drained in one pass.
+  const offRow = db
+    .query("SELECT offset FROM event_ingest_offsets WHERE path = ?")
+    .get(file) as { offset: number };
+  expect(offRow.offset).toBe(
+    Buffer.byteLength(`garbage-one\n${v1}[1,2,3]\n${v2}also bad\n`, "utf8"),
+  );
+
+  expect(
+    readBackstopRecords(backstopLogPath).filter(
+      (r) => r.backstop === "events-ingest-poison",
+    ).length,
+  ).toBe(3);
+
+  db.close();
+});
+
+test("scanEventsLogDir advances past a blank line WITHOUT dead-lettering it", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const { ctx, backstopLogPath } = makeIngestCtx();
+
+  const v1 = serializeEventLogRecord(makeRecord("aaa"));
+  const v2 = serializeEventLogRecord(makeRecord("bbb"));
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  // A blank line (just "\n") and a whitespace-only line between two valid ones.
+  writeFileSync(file, `${v1}\n   \n${v2}`);
+
+  scanEventsLogDir(db, eventsLogDir, ctx);
+
+  const rows = db
+    .query("SELECT session_id FROM events ORDER BY id ASC")
+    .all() as { session_id: string }[];
+  expect(rows.map((r) => r.session_id)).toEqual(["aaa", "bbb"]);
+
+  // No dead-letter rows — blank lines are NOT poison.
+  const dlCount = (
+    db.query("SELECT count(*) AS c FROM dead_letters").get() as { c: number }
+  ).c;
+  expect(dlCount).toBe(0);
+  // No poison backstop records.
+  expect(
+    readBackstopRecords(backstopLogPath).filter(
+      (r) => r.backstop === "events-ingest-poison",
+    ).length,
+  ).toBe(0);
+
+  db.close();
+});
+
+test("scanEventsLogDir still blocks on a torn (no-newline) trailing garbage line — offset stays put", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const { ctx } = makeIngestCtx();
+
+  const v1 = serializeEventLogRecord(makeRecord("aaa"));
+  // Trailing garbage with NO newline — a hook killed mid-write. The poison arm
+  // is unreachable for it (no terminator), so it must NOT be dead-lettered and
+  // the offset must NOT advance past it.
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(file, `${v1}{garbage no newline`);
+
+  scanEventsLogDir(db, eventsLogDir, ctx);
+
+  const rows = db
+    .query("SELECT session_id FROM events ORDER BY id ASC")
+    .all() as { session_id: string }[];
+  expect(rows.map((r) => r.session_id)).toEqual(["aaa"]);
+
+  const offRow = db
+    .query("SELECT offset FROM event_ingest_offsets WHERE path = ?")
+    .get(file) as { offset: number };
+  expect(offRow.offset).toBe(Buffer.byteLength(v1, "utf8"));
+
+  // The torn tail is NOT dead-lettered (it could still be completed by a later
+  // append).
+  const dlCount = (
+    db.query("SELECT count(*) AS c FROM dead_letters").get() as { c: number }
+  ).c;
+  expect(dlCount).toBe(0);
+
+  db.close();
+});
+
+test("scanEventsLogDir poison parking is idempotent under re-scan (ON CONFLICT) — no duplicate row, offset stable", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const { ctx } = makeIngestCtx();
+
+  const poisonLine = `nope not json\n`;
+  const v1 = serializeEventLogRecord(makeRecord("aaa"));
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(file, poisonLine + v1);
+
+  scanEventsLogDir(db, eventsLogDir, ctx);
+  const firstDl = db.query("SELECT dl_id FROM dead_letters").all() as {
+    dl_id: string;
+  }[];
+  expect(firstDl.length).toBe(1);
+  const firstOffset = (
+    db
+      .query("SELECT offset FROM event_ingest_offsets WHERE path = ?")
+      .get(file) as { offset: number }
+  ).offset;
+
+  // Simulate a re-scan that re-presents the SAME poison line at the SAME offset
+  // (e.g. a crash-before-commit on a real DB): force the offset back to 0 so the
+  // poison line is re-read with the identical deterministic dl_id.
+  db.query("UPDATE event_ingest_offsets SET offset = 0 WHERE path = ?").run(
+    file,
+  );
+  scanEventsLogDir(db, eventsLogDir, ctx);
+
+  // ON CONFLICT(dl_id) DO NOTHING — still exactly one poison row.
+  const secondDl = db.query("SELECT dl_id FROM dead_letters").all() as {
+    dl_id: string;
+  }[];
+  expect(secondDl.length).toBe(1);
+  expect(secondDl[0]?.dl_id).toBe(firstDl[0]?.dl_id);
+
+  // Offset re-converges to EOF (the valid line is NOT double-inserted because of
+  // its own re-read; here we only assert the offset, the duplicate-event guard
+  // is covered by the exactly-once test above).
+  const secondOffset = (
+    db
+      .query("SELECT offset FROM event_ingest_offsets WHERE path = ?")
+      .get(file) as { offset: number }
+  ).offset;
+  expect(secondOffset).toBe(firstOffset);
+
+  db.close();
+});
+
+test("scanEventsLogDir parks poison even without a telemetry ctx (backstop emit is optional, parking is not)", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(file, `bad line here\n`);
+
+  // No ctx — the dead-letter parking must STILL happen (it needs only `db`).
+  scanEventsLogDir(db, eventsLogDir);
+
+  const poisonCount = (
+    db
+      .query("SELECT count(*) AS c FROM dead_letters WHERE status = 'poison'")
+      .get() as { c: number }
+  ).c;
+  expect(poisonCount).toBe(1);
+
+  db.close();
+});
+
+test("recoverOneDeadLetter never recovers a status='poison' row (replay filters on status='waiting')", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const { ctx } = makeIngestCtx();
+
+  // Seed one poison row via the ingester.
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(file, `garbage\n`);
+  scanEventsLogDir(db, eventsLogDir, ctx);
+  expect(
+    (
+      db
+        .query("SELECT count(*) AS c FROM dead_letters WHERE status = 'poison'")
+        .get() as { c: number }
+    ).c,
+  ).toBe(1);
+
+  // Replay drains only `waiting` rows — a poison-only backlog returns null and
+  // touches nothing.
+  expect(recoverOneDeadLetter(db)).toBeNull();
+  // The poison row is untouched (never flipped to 'recovered', no replay).
+  const row = db
+    .query("SELECT status, recovered_at FROM dead_letters")
+    .get() as { status: string; recovered_at: number | null };
+  expect(row.status).toBe("poison");
+  expect(row.recovered_at).toBeNull();
+
+  db.close();
+});
+
+test("recoverOneDeadLetter binds INGEST_EVENTS_COLUMNS — a replayed row carries the live v48/v51 columns", () => {
+  const { db } = openDb(dbPath);
+
+  // Seed a waiting dead-letter whose bindings include a column the OLD 29-col
+  // EVENTS_COLUMNS list omitted (e.g. `background_task_id`, `backend_exec_type`).
+  // After fn-762 repointed replay to INGEST_EVENTS_COLUMNS, that column must land.
+  const bindings = {
+    ts: 1_700_000_000.5,
+    session_id: "replay-live-cols",
+    hook_event: "PostToolUse",
+    event_type: "tool_use",
+    background_task_id: "bg-123",
+    backend_exec_type: "zellij",
+  };
+  db.query(
+    `INSERT INTO dead_letters
+       (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings, status)
+     VALUES ('dl-live', 'replay-live-cols', 'PostToolUse', 1700000000.5,
+             1700000000.5, 4242, ?, 'waiting')`,
+  ).run(JSON.stringify(bindings));
+
+  const recovered = recoverOneDeadLetter(db);
+  expect(recovered).toBe("dl-live");
+
+  const ev = db
+    .query(
+      "SELECT session_id, background_task_id, backend_exec_type FROM events WHERE session_id = ?",
+    )
+    .get("replay-live-cols") as {
+    session_id: string;
+    background_task_id: string | null;
+    backend_exec_type: string | null;
+  } | null;
+  expect(ev).not.toBeNull();
+  // The columns the stale EVENTS_COLUMNS would have DROPPED now round-trip.
+  expect(ev?.background_task_id).toBe("bg-123");
+  expect(ev?.backend_exec_type).toBe("zellij");
+
+  db.close();
+});
+
+test("fn-672 LOCKSTEP: INGEST_EVENTS_COLUMNS == live events table columns", () => {
+  // The ingester AND dead-letter replay bind INGEST_EVENTS_COLUMNS. If a new
+  // column is added to CREATE_EVENTS without a matching entry here, it silently
+  // drops from BOTH ingest and replay — this set-equality pins the list to the
+  // live migrated schema so that regression fails loud.
+  const { db } = openDb(dbPath);
+  let liveCols: Set<string>;
+  try {
+    const rows = db.prepare("PRAGMA table_info('events')").all() as {
+      name: string;
+    }[];
+    liveCols = new Set(rows.map((r) => r.name).filter((n) => n !== "id"));
+  } finally {
+    db.close();
+  }
+  expect([...liveCols].sort()).toEqual([...INGEST_EVENTS_COLUMNS].sort());
 });
 
 test("scanEventsLogDir tolerates an empty dir (no .ndjson files)", () => {

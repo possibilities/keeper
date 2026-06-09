@@ -193,10 +193,16 @@ any sidecar) and `replay_dead_letter` (the scoped
 synthetic-event-write recovery verb added by schema v37 / fn-643: the
 server-worker bridges the call to main via the in-process message bus,
 and main picks the oldest `waiting` row from `dead_letters`, appends a
-plain real event with the row's preserved `bindings` + `ts`, and flips
-`status` to `recovered` in ONE `BEGIN IMMEDIATE` — the recovered event
-then folds through the normal id-ordered drain, and the audit row keeps
-its `replayed_event_id` for posterity). Three more verbs mint a synthetic
+plain real event with the row's preserved `bindings` + `ts` — binding the
+intersection of those bindings with `INGEST_EVENTS_COLUMNS`, the SAME live
+events-column list the NDJSON ingester uses (fn-762 repointed replay off the
+stale fn-643 list, so a recovered row carries the newer v48/v51 columns instead
+of silently dropping them) — and flips `status` to `recovered` in ONE
+`BEGIN IMMEDIATE`. The recovered event then folds through the normal id-ordered
+drain, and the audit row keeps its `replayed_event_id` for posterity. A
+`status='poison'` row (a line the ingester could not parse — see the failure
+modes below) is structurally unreachable here: the picker filters on
+`status='waiting'`. Three more verbs mint a synthetic
 event through the same main-bridge: `retry_dispatch` (clears a sticky
 `dispatch_failures` row via a `DispatchCleared` event) and the fn-751 autopilot
 control pair — `set_autopilot_mode` (`AutopilotMode` → the `autopilot_state`
@@ -423,6 +429,22 @@ Keeper has no `install` verb. Wire it up manually:
       The hook writes a per-pid NDJSON dead-letter file (recoverable via
       `replay_dead_letter`), logs to stderr, and exits 0 — the event is
       captured for replay but the session is never blocked.
+   4. **Poison line in an events-log file** (a `\n`-terminated line the ingester
+      cannot parse — corrupt JSON, a non-object, a nested/non-finite binding).
+      Pre-fn-762 the ingester STOPPED at it and the file's byte-offset stuck
+      there forever, silently wedging every later line behind it. Now the
+      ingester PARKS the poison line as a `dead_letters` row with
+      `status='poison'` (deterministic `dl_id` keyed on the file inode + byte
+      offset, `ON CONFLICT DO NOTHING` so a re-scan never duplicates it),
+      committed in the SAME `BEGIN IMMEDIATE` as the surrounding events INSERTs +
+      the offset advance, then ADVANCES past it — one scan drains a multi-poison
+      file and still ingests every valid line after the bad one. A poison row is
+      non-replayable by construction (replay filters `status='waiting'`); each
+      parked line emits an `events-ingest-poison` backstop record for
+      observability. A torn TAIL (bytes after the last `\n`, no terminator) is
+      NOT poison and still blocks — a later append can complete it. A transient
+      DB failure during the transaction rolls EVERYTHING back (offset included)
+      and the next scan retries — block, never advance.
 
    **Upgrade-from-pre-trace-gate note:** if you are re-bootstrapping over an
    existing install whose `server.stderr` predates the `KEEPER_TRACE_SERVER`

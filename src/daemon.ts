@@ -686,21 +686,29 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 
 /**
  * The FULL, CURRENT `events` table column list, in CREATE_EVENTS order — the
- * canonical column→value contract the NDJSON ingester ({@link
- * scanEventsLogDir}) binds against. Includes the v48 backend-exec coords and
- * the v51 `background_task_id` that the stale {@link EVENTS_COLUMNS} (frozen at
- * the fn-643 dead-letter shape) omits. `id` is excluded — it's `INTEGER PRIMARY
- * KEY AUTOINCREMENT`, assigned by SQLite so the ingested row lands at the tail
- * of the log and folds at the end of the next drain pass.
+ * canonical column→value contract BOTH the NDJSON ingester ({@link
+ * scanEventsLogDir}) AND the dead-letter replay ({@link recoverOneDeadLetter})
+ * bind against. Includes the v48 backend-exec coords and the v51
+ * `background_task_id` that the now-deleted fn-643 dead-letter shape omitted
+ * (fn-762 repointed replay here, so a recovered dead-letter binds the live
+ * schema instead of silently dropping the newer columns). `id` is excluded —
+ * it's `INTEGER PRIMARY KEY AUTOINCREMENT`, assigned by SQLite so the ingested
+ * row lands at the tail of the log and folds at the end of the next drain pass.
  *
  * MUST stay in sync with the CREATE_EVENTS literal AND the prepared
  * `insertEvent` statement in `src/db.ts` — adding an events column touches all
- * three. The ingester binds only the INTERSECTION of this list and the record's
+ * three. A fn-672-style LOCKSTEP test
+ * (`test/events-ingest-worker.test.ts`) pins this list to a live migrated DB's
+ * `events` columns so a new column added to `CREATE_EVENTS` without a matching
+ * entry here fails loud instead of silently dropping from ingest + replay.
+ * Exported for that test's direct reach.
+ *
+ * The ingester/replay bind only the INTERSECTION of this list and the record's
  * `bindings` keys (an unknown/forward-compat column from a newer hook is
  * DROPPED, never folded as a poison value — see the poison-line policy in
  * `scanEventsLogDir`).
  */
-const INGEST_EVENTS_COLUMNS = [
+export const INGEST_EVENTS_COLUMNS = [
   "ts",
   "session_id",
   "pid",
@@ -737,6 +745,22 @@ const INGEST_EVENTS_COLUMNS = [
 ] as const;
 
 /**
+ * fn-762 — the optional telemetry sink {@link scanEventsLogDir} threads through
+ * so a parked poison line emits an `events-ingest-poison` backstop record. Held
+ * separately from `db` because the dead-letter parking needs only `db` (it is
+ * unconditional), while the backstop emit is observational and may be absent
+ * (e.g. a test that doesn't assert telemetry). The two fields mirror main's
+ * sole-writer pending-dispatch-sweep emit: bump the in-memory `counters` (the
+ * denominator) and append the NDJSON line at `backstopLogPath` (the rescue
+ * record). Main is the sole sidecar writer, so `scanEventsLogDir` runs on the
+ * main thread and writes the line directly (no Worker round-trip).
+ */
+export type EventsIngestContext = {
+  counters: BackstopCounters;
+  backstopLogPath: string;
+};
+
+/**
  * Ingest the per-pid NDJSON events-log files (fn-736 task .1) — the lock-free
  * events path's analogue of {@link scanDeadLetterDir}. For each `<pid>.ndjson`
  * file, scan FROM ITS DURABLE BYTE-OFFSET, parse each COMPLETE line, and
@@ -771,16 +795,34 @@ const INGEST_EVENTS_COLUMNS = [
  *   re-reads from the durable offset, NEVER byte 0 unless the size proves a
  *   reset.
  *
- * POISON-LINE POLICY: a `parseEventLogLine` → null line (garbage JSON, partial,
- * non-finite/nested binding) is treated as a TORN line — STOP scanning this file
- * at that point, do NOT advance past it, do NOT spin. The offset stays put so a
- * later append (or a fixed line) re-reads it. A line that parses but whose
- * `INSERT` THROWS (e.g. a forward-compat column from a newer hook surviving the
- * intersection filter, a constraint violation) is logged and the WHOLE
- * transaction rolls back — the offset does NOT advance past it, so we never
- * silently skip a real event. (The intersection filter already drops unknown
- * columns, so an INSERT throw here is exotic; rolling back is the safe choice
- * over spinning OR silently advancing.)
+ * POISON-LINE POLICY (fn-762): a `parseEventLogLine` → null line INSIDE the
+ * newline-terminated loop is classified, in this order:
+ *   - BLANK (trimmed-empty bytes): a legitimately empty line in the append log.
+ *     ADVANCE past it silently — no dead-letter, no backstop.
+ *   - POISON (garbage JSON, non-object, bad/nested/non-finite binding): the line
+ *     is unparseable and a later append CANNOT fix it (it is `\n`-terminated and
+ *     immutable). PARK it: build a `dead_letters` row with `status='poison'`
+ *     (replay's `WHERE status='waiting'` skips it structurally) and a
+ *     deterministic `dl_id` (`poison:<basename>:<inode>:<startOffset+lineStart>`),
+ *     INSERTed `ON CONFLICT(dl_id) DO NOTHING` in the SAME `BEGIN IMMEDIATE` as
+ *     the events INSERTs + offset advance, then ADVANCE past it and CONTINUE the
+ *     loop — one scan drains a multi-poison file and ingests the valid lines
+ *     after it. After COMMIT, emit one `events-ingest-poison` backstop record per
+ *     parked line (best-effort; counters/NDJSON never rate-limited). Because
+ *     every parked row value is constructible from data already in hand, the
+ *     INSERT can never fail on a well-formed schema — so parking never wedges the
+ *     offset worse than today.
+ * The poison arm is reachable ONLY inside the newline loop; the trailing torn
+ * remainder (bytes after the last `\n`, NO terminator) is UNTOUCHED — it stays
+ * unconsumed exactly as before so a mid-write event is never dropped.
+ *
+ * A line that PARSES but whose `INSERT` THROWS (e.g. a forward-compat column from
+ * a newer hook surviving the intersection filter, a constraint violation, or a
+ * transient DB failure) is logged and the WHOLE transaction rolls back — the
+ * offset does NOT advance past it, so we never silently skip a real event (block
+ * + retry, never advance). The poison-park INSERT rides inside that same
+ * transaction, so a transient DB failure rolls BOTH the events INSERTs and the
+ * poison parking back together — identical block-and-retry semantics.
  *
  * PER-FILE CLEANUP: a file is deleted ONLY when its offset has reached EOF
  * (every byte ingested) AND its pid is no longer live (`pidAlive` false) — so a
@@ -793,8 +835,19 @@ const INGEST_EVENTS_COLUMNS = [
  * stderr — a single bad file must not wedge boot OR the live message loop.
  * Exported so the test surface can drive it directly without spawning the
  * worker.
+ *
+ * `ctx` (fn-762, optional) carries the backstop-telemetry sink so a parked
+ * poison line emits an `events-ingest-poison` record. When absent (a test that
+ * doesn't assert telemetry, or a hypothetical caller before the sidecar is
+ * wired), poison lines are STILL parked in `dead_letters` and the offset STILL
+ * advances — only the backstop record is skipped. The dead-letter parking
+ * itself needs only `db`, so it is unconditional.
  */
-export function scanEventsLogDir(db: Database, dir: string): void {
+export function scanEventsLogDir(
+  db: Database,
+  dir: string,
+  ctx?: EventsIngestContext,
+): void {
   // Missing-dir tolerance: a fresh machine has no events-log/ tree, and in
   // task .1 the hook still INSERTs so the dir stays absent. No-op.
   if (!existsSync(dir)) {
@@ -892,20 +945,52 @@ export function scanEventsLogDir(db: Database, dir: string): void {
       // advance is per-COMMIT below; we accumulate the parsed records + the
       // byte position just past the last complete line, then commit once.
       const records: ReturnType<typeof parseEventLogLine>[] = [];
+      // fn-762: poison lines parked in `dead_letters` (status='poison') inside
+      // the SAME transaction as the events INSERTs + offset advance. The loop
+      // CONTINUES past a poison line (no longer STOPs), so one scan drains a
+      // multi-poison file and ingests the valid lines after it.
+      const poison: {
+        dlId: string;
+        rawCapped: string;
+        startOffset: number;
+        endOffset: number;
+      }[] = [];
       let consumed = 0; // bytes consumed past startOffset (whole lines only)
-      let torn = false;
       let nlIndex = unread.indexOf(0x0a); // '\n'
       let lineStart = 0;
       while (nlIndex !== -1) {
         const lineBytes = unread.subarray(lineStart, nlIndex);
-        const record = parseEventLogLine(lineBytes.toString("utf8"));
+        const lineText = lineBytes.toString("utf8");
+        const record = parseEventLogLine(lineText);
         if (record === null) {
-          // Poison / torn line: STOP here, do not advance past it. A blank
-          // line (legitimately empty) also parses to null — that is rare in a
-          // single-writer append log and stopping is the safe choice (the
-          // next valid append re-reads from here).
-          torn = true;
-          break;
+          // `parseEventLogLine` → null is EITHER a blank line OR poison.
+          // Classify INLINE (parseEventLogLine's signature is frozen — the hook
+          // imports it from src/dead-letter.ts, so we can't widen its return).
+          if (lineText.trim().length === 0) {
+            // BLANK line (legitimately empty in the append log): advance past it
+            // silently — no dead-letter, no backstop. Fall through to the
+            // consume/advance below.
+          } else {
+            // POISON: an unparseable `\n`-terminated line a later append cannot
+            // fix. Park it (deterministic dl_id keyed on the inode + absolute
+            // start offset → idempotent on any re-scan path) and CONTINUE.
+            const absStart = startOffset + lineStart;
+            const absEnd = startOffset + nlIndex + 1; // past the consumed '\n'
+            poison.push({
+              dlId: `poison:${name}:${inode}:${absStart}`,
+              // Cap the captured raw at 64 KiB so a pathological line can't bloat
+              // the row; the dead_letters bindings blob is for triage, not replay.
+              rawCapped: lineText.slice(0, 64 * 1024),
+              startOffset: absStart,
+              endOffset: absEnd,
+            });
+          }
+          // Both blank and poison ADVANCE past the line (unlike the old
+          // STOP-at-null behavior) so the offset never sticks on a non-event.
+          consumed = nlIndex + 1;
+          lineStart = nlIndex + 1;
+          nlIndex = unread.indexOf(0x0a, lineStart);
+          continue;
         }
         records.push(record);
         // +1 for the consumed '\n'.
@@ -914,14 +999,19 @@ export function scanEventsLogDir(db: Database, dir: string): void {
         nlIndex = unread.indexOf(0x0a, lineStart);
       }
       // Any trailing bytes after the last `\n` are an uncommitted partial line
-      // (strict torn-tail) — `consumed` already excludes them.
-      void torn;
+      // (strict torn-tail) — `consumed` already excludes them, and the poison
+      // arm above is unreachable for it (it has no `\n` so the loop never visits
+      // it). A mid-write event is never dead-lettered or skipped.
       newOffset = startOffset + consumed;
 
-      if (records.length > 0) {
-        // Atomic: every INSERT + the offset advance in ONE BEGIN IMMEDIATE. A
-        // throw rolls BOTH back — the offset never advances past an event we
-        // failed to land, and a re-scan retries from the unchanged offset.
+      if (records.length > 0 || poison.length > 0) {
+        // Atomic: every events INSERT + every poison park + the offset advance
+        // in ONE BEGIN IMMEDIATE. A throw rolls ALL back — the offset never
+        // advances past a line we failed to land/park (block + retry), and a
+        // re-scan retries from the unchanged offset. (Reached when there is at
+        // least one event to insert OR one poison to park; the all-blank case
+        // — records and poison both empty but `consumed > 0` — advances the
+        // offset in the `else if` branch below.)
         db.run("BEGIN IMMEDIATE");
         try {
           for (const record of records) {
@@ -951,8 +1041,65 @@ export function scanEventsLogDir(db: Database, dir: string): void {
               `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`,
             ).run(...values);
           }
+          // fn-762: park every poison line as a `dead_letters` row with
+          // status='poison' (replay's `WHERE status='waiting'` skips it
+          // structurally). `ON CONFLICT(dl_id) DO NOTHING` makes it idempotent
+          // on any re-scan path (e.g. a crash before COMMIT re-presents the same
+          // line at the same offset → same dl_id → no duplicate). Every value is
+          // constructible from data in hand — `ts`/`dl_written_at` are scan
+          // wall-clock (dead_letters is an operational sidecar, never folded, so
+          // no determinism requirement) — so this INSERT can never fail on a
+          // well-formed schema and never wedges the offset worse than before.
+          const nowSec = Date.now() / 1000;
+          for (const p of poison) {
+            db.prepare(
+              `INSERT INTO dead_letters
+                 (dl_id, session_id, hook_event, ts, dl_written_at, pid,
+                  bindings, status, recovered_at, replayed_event_id, source_file)
+               VALUES (?, 'poison', 'PoisonLine', ?, ?, ?, ?, 'poison', NULL, NULL, ?)
+               ON CONFLICT(dl_id) DO NOTHING`,
+            ).run(
+              p.dlId,
+              nowSec,
+              nowSec,
+              filePid,
+              JSON.stringify({
+                raw: p.rawCapped,
+                file: full,
+                start_offset: p.startOffset,
+                end_offset: p.endOffset,
+              }),
+              full,
+            );
+          }
           upsertOffsetStmt.run(full, inode, newOffset, Date.now() / 1000);
           db.run("COMMIT");
+          // fn-762: AFTER a durable COMMIT, emit one `events-ingest-poison`
+          // backstop record per parked line (the rescue numerator) when the
+          // telemetry sink is wired. Counters/NDJSON are NEVER rate-limited;
+          // emitting post-COMMIT keeps the metric honest (a rolled-back parse
+          // never counts). Best-effort — `appendBackstopRecord` swallows to
+          // stderr, and a throw here would NOT un-commit the durable park.
+          if (ctx !== undefined && poison.length > 0) {
+            for (const p of poison) {
+              ctx.counters.bump("events-ingest-poison", "timeout", true);
+              appendBackstopRecord(
+                buildTimeoutRecord({
+                  backstop: "events-ingest-poison",
+                  worker: "main",
+                  rescued: true,
+                  now: Date.now(),
+                  stalenessMs: null,
+                  detail: {
+                    file: full,
+                    start_offset: String(p.startOffset),
+                    dl_id: p.dlId,
+                  },
+                }),
+                ctx.backstopLogPath,
+              );
+            }
+          }
         } catch (err) {
           try {
             db.run("ROLLBACK");
@@ -1028,53 +1175,6 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
- * The full `events` table column list, in CREATE_EVENTS order. Used by
- * {@link recoverOneDeadLetter} to drive a dynamic INSERT against the
- * row's stored `bindings` blob: only the columns the dead-letter record
- * actually carries are bound, so a re-fold reproduces byte-identical to
- * what the hook would have written had its INSERT not failed. Held as a
- * module constant so adding a column means touching THIS list AND the
- * CREATE_EVENTS literal AND the prepared `insertEvent` statement
- * (a shared boundary that's been tight in this repo since fn-456).
- *
- * `id` is omitted — it's `INTEGER PRIMARY KEY AUTOINCREMENT`, SQLite
- * picks a fresh higher value than every existing row so the replayed
- * event lands at the tail of the log and folds at the end of the next
- * drain pass.
- */
-const EVENTS_COLUMNS = [
-  "ts",
-  "session_id",
-  "pid",
-  "hook_event",
-  "event_type",
-  "tool_name",
-  "matcher",
-  "cwd",
-  "permission_mode",
-  "agent_id",
-  "agent_type",
-  "stop_hook_active",
-  "data",
-  "subagent_agent_id",
-  "spawn_name",
-  "start_time",
-  "slash_command",
-  "skill_name",
-  "planctl_op",
-  "planctl_target",
-  "planctl_epic_id",
-  "planctl_task_id",
-  "planctl_subject_present",
-  "tool_use_id",
-  "config_dir",
-  "planctl_queue_jump",
-  "bash_mutation_kind",
-  "bash_mutation_targets",
-  "planctl_files",
-] as const;
-
-/**
  * Recover ONE oldest `waiting` dead-letter row (fn-643 task .4). Picks the
  * row with the smallest `(dl_written_at, dl_id)` tuple, rebuilds an
  * `events` INSERT from its stored `bindings`, and flips the row to
@@ -1096,9 +1196,10 @@ const EVENTS_COLUMNS = [
  * Transactional shape (`BEGIN IMMEDIATE`):
  * 1. SELECT the oldest waiting row (`ORDER BY dl_written_at, dl_id LIMIT 1`).
  * 2. If none, COMMIT and return null.
- * 3. Build the INSERT column list from `EVENTS_COLUMNS ∩ keys(bindings)`
- *    — forward-compat: a future-schema binding for an unknown column is
- *    dropped on replay (per the dead-letter docstring's contract).
+ * 3. Build the INSERT column list from `INGEST_EVENTS_COLUMNS ∩ keys(bindings)`
+ *    — the LIVE events shape (fn-762; was the stale fn-643 `EVENTS_COLUMNS`).
+ *    Forward-compat: a future-schema binding for an unknown column is dropped
+ *    on replay (per the dead-letter docstring's contract).
  * 4. Run the INSERT, capture `lastInsertRowid` as `replayed_event_id`.
  * 5. UPDATE the `dead_letters` row: status='recovered', recovered_at=now,
  *    replayed_event_id=<captured>.
@@ -1182,9 +1283,13 @@ export function recoverOneDeadLetter(db: Database): string | null {
     // Build the INSERT column list from the intersection of the events
     // column set and the bindings keys. Unknown keys are dropped; missing
     // known keys bind NULL via the `?? null` in the values mapper below.
-    // The column list is interpolated directly because EVENTS_COLUMNS is
-    // a module constant (no wire text); values are bound positionally.
-    const presentCols = EVENTS_COLUMNS.filter((c) =>
+    // The column list is interpolated directly because INGEST_EVENTS_COLUMNS
+    // is a module constant (no wire text); values are bound positionally.
+    // fn-762: bind the LIVE column list (`INGEST_EVENTS_COLUMNS`), not the
+    // stale 29-col fn-643 `EVENTS_COLUMNS` (deleted) — a replayed row carrying
+    // a v48/v51 column (backend-exec coords, `background_task_id`) now lands
+    // it instead of permanently dropping it on recovery.
+    const presentCols = INGEST_EVENTS_COLUMNS.filter((c) =>
       Object.hasOwn(bindings, c),
     );
     if (presentCols.length === 0) {
@@ -1488,6 +1593,35 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // the hook still INSERTs, so the dir is normally absent — a true no-op).
   // DIRECT writer-connection write (on `db`, main's writer conn) so the INSERT
   // bumps `data_version` and the downstream pollers wake for free.
+  // Backstop-telemetry sidecar (epic fn-720). Main is the SOLE writer — each
+  // backstop-emitting worker (wired in tasks .2/.3) maintains its own
+  // in-memory counters + `last_fast_path_at` and posts a built
+  // `{kind:"backstop"}` record/rollup up; `handleBackstopMessage` writes the
+  // single NDJSON line. The path is resolved once at boot; the writer opens
+  // for append per-call. `mainBackstopCounters` is held by main for any
+  // main-produced backstop (the pending-dispatch sweep; fn-762's events-ingest
+  // poison parking) and is flushed as an on-shutdown rollup so the denominator
+  // survives a clean stop. Declared BEFORE the boot events-log scan so that
+  // scan can thread the same sink into `scanEventsLogDir` (fn-762 — a poison
+  // line seen by the boot scan still emits a backstop record).
+  const backstopLogPath = resolveBackstopLogPath();
+  const mainBackstopCounters = new BackstopCounters();
+  // Sole-writer entry point: write whatever record/rollup a worker posted up.
+  // Best-effort + swallow-to-stderr lives in `appendBackstopRecord`; this
+  // wrapper exists so the daemon's worker `onmessage` handlers (tasks .2/.3)
+  // route a `{kind:"backstop"}` message through one place.
+  const handleBackstopMessage = (msg: BackstopMessage): void => {
+    appendBackstopRecord(msg.record, backstopLogPath);
+  };
+  // fn-762: the shared telemetry sink every `scanEventsLogDir` call site threads
+  // so a parked poison line emits an `events-ingest-poison` record (sole-writer:
+  // main writes the line directly; the events-ingest worker only posts a
+  // contentless "go look" hint, never a record).
+  const eventsIngestCtx: EventsIngestContext = {
+    counters: mainBackstopCounters,
+    backstopLogPath,
+  };
+
   const eventsLogDir = resolveEventsLogDir();
   // fn-742: the events-ingest worker subscribes to this dir ONCE at spawn and
   // goes inert with NO retry if it's absent (events-ingest-worker.ts: the
@@ -1500,7 +1634,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // worker always finds it and subscribes regardless of deploy ordering. The
   // hook also mkdirs on append; this just guarantees existence at spawn time.
   mkdirSync(eventsLogDir, { recursive: true });
-  scanEventsLogDir(db, eventsLogDir);
+  scanEventsLogDir(db, eventsLogDir, eventsIngestCtx);
 
   withBootDrainCheckpointTuning(db, () => {
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
@@ -1644,24 +1778,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // This is a DIRECT operational-table write — NOT an event fold.
   const deadLetterDir = resolveDeadLetterDir();
   scanDeadLetterDir(db, deadLetterDir);
-
-  // Backstop-telemetry sidecar (epic fn-720). Main is the SOLE writer — each
-  // backstop-emitting worker (wired in tasks .2/.3) maintains its own
-  // in-memory counters + `last_fast_path_at` and posts a built
-  // `{kind:"backstop"}` record/rollup up; `handleBackstopMessage` writes the
-  // single NDJSON line. The path is resolved once at boot; the writer opens
-  // for append per-call. `mainBackstopCounters` is held by main for any
-  // main-produced backstop (e.g. the future pending-dispatch sweep) and is
-  // flushed as an on-shutdown rollup so the denominator survives a clean stop.
-  const backstopLogPath = resolveBackstopLogPath();
-  const mainBackstopCounters = new BackstopCounters();
-  // Sole-writer entry point: write whatever record/rollup a worker posted up.
-  // Best-effort + swallow-to-stderr lives in `appendBackstopRecord`; this
-  // wrapper exists so the daemon's worker `onmessage` handlers (tasks .2/.3)
-  // route a `{kind:"backstop"}` message through one place.
-  const handleBackstopMessage = (msg: BackstopMessage): void => {
-    appendBackstopRecord(msg.record, backstopLogPath);
-  };
 
   // Coalescing flag: every wake sets it; the run loop resets it before each
   // drain pass. A wake arriving mid-drain leaves the flag set, so the loop runs
@@ -3076,7 +3192,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         return;
       }
       try {
-        scanEventsLogDir(db, eventsLogDir);
+        scanEventsLogDir(db, eventsLogDir, eventsIngestCtx);
         wakePending = true;
         pumpWakes();
       } catch (err) {
@@ -3543,7 +3659,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   const eventsIngestFallbackTimer = setInterval(() => {
     if (shuttingDown) return;
     try {
-      scanEventsLogDir(db, eventsLogDir);
+      scanEventsLogDir(db, eventsLogDir, eventsIngestCtx);
       wakePending = true;
       pumpWakes();
     } catch (err) {
