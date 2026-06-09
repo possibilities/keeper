@@ -1,8 +1,18 @@
-"""Emit a ready-to-paste CONTEXT-respawn prompt for a dropped worker task."""
+"""Emit a typed resume envelope + freshly-baked brief for a dropped worker task.
+
+``worker resume`` is the resume entrypoint for the content-blind orchestrator.
+It is content-blind itself: it never inlines spec prose into the envelope.
+Instead it REGENERATES the out-of-band brief fresh (bake-fresh-on-each-entrypoint)
+via :func:`planctl.brief.assemble_brief` / :func:`planctl.brief.write_brief`,
+returns a ``brief_ref`` handle, and a one-line process ``nudge``. The respawned
+worker reads ``BRIEF_REF`` itself and finishes commit-then-done.
+
+Runtime-state-only / readonly — regenerating the brief lands it under gitignored
+``state/briefs/``; no ``.planctl/`` commit fires.
+"""
 
 from __future__ import annotations
 
-import re
 import subprocess
 from types import SimpleNamespace
 
@@ -29,93 +39,47 @@ def _read_git_state() -> str:
     return "\n".join(parts)
 
 
-def _extract_files_line(description_text: str) -> list[str]:
-    """Extract file paths from the **Files:** line inside ## Description.
+def _find_source_commit_sha(task_id: str) -> str | None:
+    """Return the short sha of the task's source commit, or ``None`` if none.
 
-    Returns a list of path strings (may be empty if the line is missing or
-    malformed).
+    Cheap local lookup: ``git log`` for the ``Task: <task_id>`` trailer the
+    worker contract stamps on every source commit. No keeper shell-out — a
+    resume must work even when keeper is unavailable. Any git failure (missing
+    binary, not a repo) yields ``None`` rather than raising.
     """
-    # Match **Files:** (with optional bold variants and leading whitespace)
-    # followed by a comma-separated or space-separated list on the same line.
-    match = re.search(
-        r"^\*{1,2}Files:\*{0,2}\s*(.+)$",
-        description_text,
-        flags=re.MULTILINE | re.IGNORECASE,
-    )
-    if not match:
-        return []
-
-    raw = match.group(1).strip()
-    # Split on commas or semicolons, strip each token
-    tokens = [t.strip() for t in re.split(r"[,;]+", raw)]
-    return [t for t in tokens if t]
-
-
-def _build_prompt(
-    task_id: str,
-    epic_id: str,
-    files: list[str],
-    git_state: str,
-    files_missing: bool,
-) -> str:
-    """Assemble the full respawn prompt."""
-    lines = []
-
-    # --- Literal worker template (copied verbatim from SKILL.md:131-140) ---
-    lines.append("Implement a planctl task.")
-    lines.append("")
-    lines.append(f"TASK_ID: {task_id}")
-    lines.append(f"EPIC_ID: {epic_id}")
-    lines.append("PLANCTL: planctl")
-    lines.append("")
-    lines.append("Follow the phases in your agent spec exactly.")
-    lines.append("")
-
-    # --- CONTEXT preamble ---
-    lines.append("CONTEXT: The previous worker invocation was cut off before it could")
-    lines.append("commit and call `planctl done`. The implementation may already be")
-    lines.append("complete or partially complete.")
-    lines.append("")
-    lines.append("Your job is to:")
-    lines.append(
-        "1. Verify the implementation is sound (git status shows the right files changed)"
-    )
-    lines.append("2. Commit the changes")
-    lines.append(f"3. Call `planctl done {task_id}` to mark the task done")
-    lines.append("")
-
-    # --- Git state ---
-    if git_state:
-        lines.append("Git state at respawn time:")
-        for gl in git_state.splitlines():
-            lines.append(f"  {gl}")
-        lines.append("")
-
-    # --- Files block ---
-    if files_missing:
-        lines.append("Files: (could not parse **Files:** from spec — run")
-        lines.append(f"  `planctl cat {task_id}` to find the expected file list)")
-    else:
-        lines.append("Files changed:")
-        for f in files:
-            lines.append(f"- {f}")
-
-    return "\n".join(lines)
-
-
-def _render_human(data: dict) -> str:
-    """Render the worker-resume envelope as the raw prompt text."""
-    prompt = data.get("prompt", "")
-    return prompt
+    try:
+        result = subprocess.run(
+            [
+                "git",
+                "log",
+                "-1",
+                "--format=%h",
+                f"--grep=Task: {task_id}",
+                "--fixed-strings",
+            ],
+            check=False,
+            capture_output=True,
+            text=True,
+        )
+    except FileNotFoundError:
+        return None
+    if result.returncode != 0:
+        return None
+    sha = result.stdout.strip()
+    return sha or None
 
 
 def run(args: SimpleNamespace) -> int:
+    import json
+
+    from planctl.brief import BriefRenderError, assemble_brief, write_brief
     from planctl.ids import is_task_id
     from planctl.models import merge_task_state
     from planctl.output import emit, emit_error
     from planctl.project import resolve_project
-    from planctl.specs import get_task_section
+    from planctl.runtime_status import _expected_worker_cwd
     from planctl.store import LocalFileStateStore
+    from pathlib import Path
 
     task_id: str = args.task_id
 
@@ -129,20 +93,17 @@ def run(args: SimpleNamespace) -> int:
     if not spec_path.exists():
         emit_error(f"Task spec not found: {task_id}")
 
-    # Read task status. Under the commit-then-done worker contract, `done` is
-    # the last thing the worker fires — observing `done` here means the source
-    # commit already landed (the harness-dropped predecessor's trailer commit
-    # is discoverable via `keeper find-task-commit`). The respawned worker just
-    # needs to verify and call `planctl done` (idempotent re-call is fine; the
-    # planctl mutation hook handles state commits).
+    # Read task status + tier. Under the commit-then-done worker contract, `done`
+    # is the last thing the worker fires — observing `done` here means the source
+    # commit already landed. The respawned worker just needs to verify and call
+    # `planctl done` (idempotent re-call is fine).
     task_path = data_dir / "tasks" / f"{task_id}.json"
     status = "unknown"
     tier = None
     epic_id = task_id.rsplit(".", 1)[0] if "." in task_id else task_id
     state_store = LocalFileStateStore(ctx.state_dir)
+    task_def: dict = {}
     if task_path.exists():
-        import json
-
         try:
             task_def = json.loads(task_path.read_text(encoding="utf-8"))
             runtime = state_store.load_runtime(task_id)
@@ -151,61 +112,87 @@ def run(args: SimpleNamespace) -> int:
             epic_id = merged.get("epic", epic_id)
             tier = merged.get("tier")
         except Exception:
-            pass
+            task_def = {}
 
-    # Capture git state exactly once
+    # Resolve repos exactly as `claim` does so the cold-resume spawn prompt is
+    # byte-uniform with the claim-path prompt: target_repo via the three-level
+    # fallback, primary_repo via epic.primary_repo → project_path.
+    epic_def: dict = {}
+    epic_path = data_dir / "epics" / f"{epic_id}.json"
+    if epic_path.exists():
+        try:
+            epic_def = json.loads(epic_path.read_text(encoding="utf-8"))
+        except Exception:
+            epic_def = {}
+
+    proj_path = str(ctx.project_path)
+    target_repo = str(
+        Path(_expected_worker_cwd(task_def, epic_def, proj_path)).resolve()
+    )
+    primary_repo = str(Path(epic_def.get("primary_repo") or proj_path).resolve())
+    state_repo = primary_repo
+
+    # --- Regenerate the brief fresh (bake-fresh-on-each-entrypoint) ---
+    # `worker resume` always overwrites: it never reads a foreign brief, so the
+    # reader-side schema_version gate is moot here.
+    try:
+        brief_dict = assemble_brief(
+            task_id=task_id,
+            epic_id=epic_id,
+            target_repo=target_repo,
+            primary_repo=primary_repo,
+            state_repo=state_repo,
+            tier=tier,
+            data_dir=data_dir,
+        )
+    except BriefRenderError as exc:
+        emit_error(str(exc))
+
+    briefs_dir = ctx.state_dir / "briefs"
+    try:
+        brief_ref = str(write_brief(briefs_dir, task_id, brief_dict))
+    except OSError as exc:
+        emit_error(f"failed to write brief for {task_id}: {exc}")
+
+    # Cheap process facts for the nudge.
+    source_commit_sha = _find_source_commit_sha(task_id)
     git_state = _read_git_state()
-
-    # Parse **Files:** from spec
-    spec_content = spec_path.read_text(encoding="utf-8")
-    description_text = get_task_section(spec_content, "## Description")
-    files = _extract_files_line(description_text)
-    files_missing = len(files) == 0
-
-    prompt = _build_prompt(
-        task_id=task_id,
-        epic_id=epic_id,
-        files=files,
-        git_state=git_state,
-        files_missing=files_missing,
+    dirty_session_file_count = (
+        len([ln for ln in git_state.splitlines() if ln.strip()]) if git_state else 0
     )
 
-    # Stderr warnings always emit (independent of format), since they inform
-    # the human without cluttering the JSON/YAML stdout envelope.
+    nudge = (
+        f"Resume task {task_id}. status={status} "
+        f"source_commit={source_commit_sha or 'null'} "
+        f"dirty_session_files={dirty_session_file_count}. "
+        "Read BRIEF_REF, finish commit-then-done."
+    )
+
+    # Stderr notes always emit (independent of format) to inform the human
+    # without cluttering the JSON/YAML stdout envelope.
     import click
 
-    if files_missing:
-        click.echo(
-            f"Warning: could not parse **Files:** from spec for {task_id}",
-            err=True,
-        )
     if status not in ("in_progress", "unknown"):
         click.echo(
             f"Note: task {task_id} status is {status!r} (not in_progress)",
             err=True,
         )
-    # fn-594: build-forward — tier is required at mint time by scaffold /
-    # refine-apply, so the only null-tier records left in the wild are
-    # pre-fn-594 legacy on-disk tasks. The cold-resume null-tier heuristic
-    # path was deleted; keeper now fails loud on a null tier,
-    # and humans remediate via `/plan:plan <epic_id>` refine. The envelope
-    # still emits the raw value so the skill consumer can branch on it.
     click.echo(
         f"Note: task {task_id} tier is {tier!r}",
         err=True,
     )
 
-    # fn-589 task .1 (item 5): surface the persisted tier on the envelope so
-    # /plan:work's cold-resume can branch on it without a separate `task show`
-    # round trip.  Explicit JSON null (not key-omission) when the tier was
-    # never set — the skill cold-path branches on `tier is None`.
     emit(
         {
-            "prompt": prompt,
             "task_id": task_id,
             "status": status,
             "tier": tier,
-        },
-        text_renderer=_render_human,
+            "brief_ref": brief_ref,
+            "nudge": nudge,
+            "target_repo": target_repo,
+            "primary_repo": primary_repo,
+            "source_commit_sha": source_commit_sha,
+            "dirty_session_file_count": dirty_session_file_count,
+        }
     )
     return 0
