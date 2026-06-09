@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T14:47:34.366677Z",
+  "depends_on": [
+    "fn-755-babysitter-findings-triage-workflow.1"
+  ],
+  "epic": "fn-755-babysitter-findings-triage-workflow",
+  "id": "fn-755-babysitter-findings-triage-workflow.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "high",
+  "title": "babysit-new creator command",
+  "updated_at": "2026-06-09T14:47:34.366677Z"
+}

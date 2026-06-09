@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T14:47:34.366677Z",
+  "depends_on": [],
+  "epic": "fn-755-babysitter-findings-triage-workflow",
+  "id": "fn-755-babysitter-findings-triage-workflow.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "ledger contract and producer stamp",
+  "updated_at": "2026-06-09T14:47:34.366677Z"
+}

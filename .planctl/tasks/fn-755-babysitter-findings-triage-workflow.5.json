@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T14:47:34.366677Z",
+  "depends_on": [
+    "fn-755-babysitter-findings-triage-workflow.3"
+  ],
+  "epic": "fn-755-babysitter-findings-triage-workflow",
+  "id": "fn-755-babysitter-findings-triage-workflow.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "medium",
+  "title": "followup retention sweep (deferred)",
+  "updated_at": "2026-06-09T14:47:34.366677Z"
+}
