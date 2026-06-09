@@ -3337,11 +3337,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
       });
-      // Durably inserted — pump the reducer so the `pending_dispatches` row
-      // folds promptly, THEN ack. (The ack only promises durability of the
-      // event, not the fold; the fold is idempotent on the next drain.)
-      wakePending = true;
-      pumpWakes();
+      // fn-724: the ack promises INSERT durability ONLY — not the fold (which
+      // is idempotent on the next drain). The committed INSERT is the whole
+      // contract, so the moment `insertEvent.run` returns we have everything
+      // the `ok=true` ack asserts.
       ok = true;
     } catch (err) {
       console.error(
@@ -3352,6 +3351,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
     // Reply on EVERY path — the worker is blocked awaiting this ack before
     // it launches. A `false` reply tells the worker to abort the dispatch.
+    // fn-762: reply IMMEDIATELY after the (durable-or-failed) INSERT, BEFORE
+    // the reducer pump below. A pump is a potentially slow drain; the worker's
+    // launch must not wait on it, and the ack already reflects everything it
+    // promises (INSERT durability). Outbox ordering is UNCHANGED — the insert
+    // still precedes the launch (`confirmRunning` awaits this ack first); only
+    // the ack moves ahead of the drain.
     // fn-749: `?.` — this helper lives at function scope (outside the
     // onmessage guard); it only ever runs in response to a worker message, so
     // the worker is non-null in practice, but the optional-chain keeps it
@@ -3361,6 +3366,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       id,
       ok,
     } satisfies DispatchedAckMessage);
+    // fn-762: pump the reducer AFTER the ack, in its own guarded block. A
+    // pump throw here is logged (the existing non-fatal error path) but can
+    // neither flip the already-sent ack nor escape this handler. Only pump
+    // when the insert actually landed — a failed insert has nothing to fold.
+    if (ok) {
+      try {
+        wakePending = true;
+        pumpWakes();
+      } catch (err) {
+        console.error(
+          `[keeperd] Dispatched pump threw (non-fatal, ack already sent): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
   }
 
   /**

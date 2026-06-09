@@ -58,7 +58,10 @@ import {
   sweepRedispatchCooldown,
   verbForVerdict,
 } from "../src/autopilot-worker";
-import { PENDING_DISPATCH_TTL_MS } from "../src/daemon";
+import {
+  PENDING_DISPATCH_SWEEP_INTERVAL_MS,
+  PENDING_DISPATCH_TTL_MS,
+} from "../src/daemon";
 import type { ZellijPane } from "../src/exec-backend";
 import {
   computeReadiness,
@@ -756,10 +759,21 @@ test("fn-735 isInCooldown: unit-seconds predicate edge cases", () => {
   );
 });
 
-test("fn-735 cooldown constant is unit-consistent with PENDING_DISPATCH_TTL_MS (seconds, not ms)", () => {
-  // The documented unit trap: a 1000x bug if seconds get compared to ms.
-  // The cooldown (seconds) aligns to PENDING_DISPATCH_TTL_MS (ms).
-  expect(REDISPATCH_COOLDOWN_S).toBe(PENDING_DISPATCH_TTL_MS / 1000);
+test("fn-762 cooldown is STRICTLY GREATER than TTL + sweep (unit-seconds; the headroom rationale)", () => {
+  // The documented unit trap: a 1000x bug if seconds get compared to ms. The
+  // cooldown is unit-SECONDS; the TTL + sweep are unit-MS — divide by 1000
+  // before comparing. fn-762: the 2026-06-09 incident triple-dispatched
+  // because the cooldown CO-EXPIRED with the 120s TTL while fold lag still
+  // outlived both. The window must outlast the WHOLE round-trip: a pending row
+  // can survive up to TTL, then the producer-side sweep takes up to one more
+  // sweep-granularity tick to clear the phantom. So cooldown > TTL/1000 +
+  // sweep/1000 (= 120 + 60 = 180), with headroom.
+  const ttlS = PENDING_DISPATCH_TTL_MS / 1000;
+  const sweepS = PENDING_DISPATCH_SWEEP_INTERVAL_MS / 1000;
+  expect(REDISPATCH_COOLDOWN_S).toBeGreaterThan(ttlS + sweepS);
+  // Pin the chosen value so a future TTL/sweep bump that erodes the headroom
+  // trips this test.
+  expect(REDISPATCH_COOLDOWN_S).toBe(200);
 });
 
 test("fn-735 sweep: prunes entries past the window, keeps fresh ones (no unbounded growth)", () => {
@@ -860,6 +874,133 @@ test("fn-735 runReconcileCycle: a definitive launch failure CLEARS the cooldown 
   // Cooldown cleared → the key is re-dispatchable (failedKeys, not the
   // cooldown, holds it now).
   expect(state.redispatchCooldown.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("fn-762 runReconcileCycle: a POST-LAUNCH abort KEEPS the cooldown stamp (ghost-worker suppression)", async () => {
+  // The launch FIRED, then a mid-poll shutdown aborted the confirm →
+  // outcome `aborted-postlaunch`. Unlike a pre-launch abort, the launch
+  // happened, so a ghost worker may exist; the stamp MUST persist so a
+  // fold-lag-blind re-dispatch can't double-launch the same worktree.
+  const stampNow = 1700000000;
+  const ctrl = new AbortController();
+  const { deps, log } = makeFakeDeps({
+    ceilingMs: 50,
+    pollIntervalMs: 5,
+    now: stampNow,
+    // Abort AFTER launch resolves but before the poll loop confirms — the
+    // post-launch `signal.aborted` check (or the in-loop one) then fires.
+    launch: async () => {
+      ctrl.abort();
+      return { ok: true };
+    },
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, stampNow);
+  expect(decision.launches.length).toBe(1);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    ctrl.signal,
+    deps,
+  );
+
+  // Launch fired, no DispatchFailed, no live entry (we never confirmed) — but
+  // the stamp PERSISTS (post-launch abort keeps it).
+  expect(log.launches.length).toBe(1);
+  expect(log.emissions).toEqual([]);
+  expect(liveDispatches.has("work::fn-1-foo.1")).toBe(false);
+  expect(state.redispatchCooldown.get("work::fn-1-foo.1")).toBe(stampNow);
+});
+
+test("fn-762 runReconcileCycle: a PRE-LAUNCH abort CLEARS the cooldown stamp (nothing launched)", async () => {
+  // Main's durable insert failed (ack {ok:false}) → confirmRunning aborts
+  // WITHOUT launching → outcome `aborted-prelaunch`. The launch never
+  // happened, so the stamp is CLEARED (failedKeys/retry_dispatch own the
+  // re-dispatch; no ghost to suppress).
+  const stampNow = 1700000000;
+  const { deps, log } = makeFakeDeps({
+    ceilingMs: 50,
+    pollIntervalMs: 5,
+    now: stampNow,
+    dispatchedAck: { ok: false },
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, stampNow);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  // Never launched, no DispatchFailed, stamp CLEARED.
+  expect(log.launches.length).toBe(0);
+  expect(log.emissions).toEqual([]);
+  expect(state.redispatchCooldown.has("work::fn-1-foo.1")).toBe(false);
+});
+
+test("fn-762 runReconcileCycle: indoubt RE-STAMPS the cooldown ONCE at resolution (moving timestamp)", async () => {
+  // The fn-762 headroom fix: the dispatch-time stamp is up to `ceilingMs`
+  // stale by the time an `indoubt` resolves, so it would expire early. The
+  // resolution re-stamps it ONCE to the current clock — never compounding.
+  // An advancing `now` proves the stamp MOVED (a fixed clock can't tell a
+  // re-stamp from a no-op). The clock ticks 1s per call: stamp #1 at dispatch
+  // (1000), the emitDispatched ts (1001), then the indoubt re-stamp at
+  // resolution (a strictly later tick).
+  let clock = 1000;
+  const { deps, log } = makeFakeDeps({
+    // No jobs row → poll never confirms → ceiling elapses → `indoubt`.
+    ceilingMs: 5,
+    pollIntervalMs: 1,
+    now: () => clock++,
+  });
+  const epic = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const snap = makeSnapshot({ epics: [epic] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 1000);
+  expect(decision.launches.length).toBe(1);
+
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    new AbortController().signal,
+    deps,
+  );
+
+  expect(log.launches.length).toBe(1);
+  expect(log.emissions).toEqual([]);
+  // The stamp MOVED past the dispatch-time value (1000) — re-stamped at the
+  // later indoubt-resolution tick.
+  const restamped = state.redispatchCooldown.get("work::fn-1-foo.1");
+  expect(restamped).toBeDefined();
+  expect(restamped).toBeGreaterThan(1000);
 });
 
 // ---------------------------------------------------------------------------
@@ -1555,9 +1696,10 @@ test("confirmRunning pre-ceiling confirm: bumps the rescued:false denominator (n
 });
 
 test("confirmRunning aborted: no timeout-backstop record (shutdown is not a rescue)", async () => {
-  // A shutdown during the poll resolves "aborted" WITHOUT emitting
+  // A shutdown during the poll resolves "aborted-postlaunch" WITHOUT emitting
   // DispatchFailed — and likewise must NOT post a timeout rescue (the
-  // dispatch was never confirmed nor genuinely failed).
+  // dispatch was never confirmed nor genuinely failed). The abort lands
+  // mid-poll, AFTER launch() fired → fn-762 post-launch flavor.
   const { deps, log } = makeFakeDeps({
     maxEventId: 100,
     pollIntervalMs: 5,
@@ -1575,7 +1717,7 @@ test("confirmRunning aborted: no timeout-backstop record (shutdown is not a resc
   // Abort mid-poll.
   setTimeout(() => ctrl.abort(), 8);
   const outcome = await promise;
-  expect(outcome).toBe("aborted");
+  expect(outcome).toBe("aborted-postlaunch");
   expect(log.emissions).toEqual([]);
   expect(log.timeoutBackstops).toEqual([]);
 });
@@ -1631,7 +1773,7 @@ test("confirmRunning: watermark captured BEFORE launch (excludes stale terminal 
   expect(log.emissions).toEqual([]);
 });
 
-test("confirmRunning ABORTED: shutdown signal during poll → aborted, no emission", async () => {
+test("confirmRunning ABORTED: shutdown signal during poll → aborted-postlaunch, no emission", async () => {
   const { deps, log } = makeFakeDeps({
     pollIntervalMs: 50,
     ceilingMs: 500,
@@ -1649,7 +1791,8 @@ test("confirmRunning ABORTED: shutdown signal during poll → aborted, no emissi
   await Bun.sleep(20);
   ctrl.abort();
   const outcome = await promise;
-  expect(outcome).toBe("aborted");
+  // fn-762: the launch fired, then a mid-poll shutdown → post-launch flavor.
+  expect(outcome).toBe("aborted-postlaunch");
   expect(log.emissions).toEqual([]); // a shutdown is NOT a sticky failure
 });
 
@@ -1696,10 +1839,10 @@ test("confirmRunning (fn-724): launch() is NOT called until the dispatched-ack r
   expect(log.launches.length).toBe(1);
 });
 
-test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted, NO DispatchFailed", async () => {
+test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted-prelaunch, NO DispatchFailed", async () => {
   // Main's durable insert failed → the dispatch aborts WITHOUT launching.
   // No row landed, so no DispatchFailed (a real worker never spawned). The
-  // next reconcile cycle re-attempts.
+  // next reconcile cycle re-attempts. fn-762: nothing launched → pre-launch.
   const { deps, log } = makeFakeDeps({
     maxEventId: 100,
     pollIntervalMs: 5,
@@ -1715,7 +1858,7 @@ test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted, NO Dispatc
     ctrl.signal,
     deps,
   );
-  expect(outcome).toBe("aborted");
+  expect(outcome).toBe("aborted-prelaunch");
   expect(log.launches.length).toBe(0); // never launched
   expect(log.emissions).toEqual([]); // no DispatchFailed
   // The mint request was still issued (it's what got rejected by main).
@@ -1750,7 +1893,8 @@ test("confirmRunning (fn-724): ack-wait that never resolves → aborted on signa
   // Reject the ack-wait (the timeout/shutdown flavor) → confirm aborts.
   neverGate.reject(new Error("dispatched-ack timeout"));
   const outcome = await promise;
-  expect(outcome).toBe("aborted");
+  // fn-762: the ack-wait rejected before launch() → pre-launch flavor.
+  expect(outcome).toBe("aborted-prelaunch");
   expect(log.launches.length).toBe(0); // never launched
   expect(log.emissions).toEqual([]); // no DispatchFailed
 });

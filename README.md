@@ -1775,7 +1775,13 @@ now DURABLE-ack'd: `confirmRunning` AWAITS main's `Dispatched` insert
 ordering — intent committed before side-effect — is load-bearing rather than
 fire-and-forget; on `ok:false` or ack-timeout the worker aborts without
 launching (any phantom row clears via the TTL sweep), closing the
-SessionStart-drains-before-`dispatched` double-dispatch race. The launch
+SessionStart-drains-before-`dispatched` double-dispatch race. fn-762 moved the
+ack AHEAD of the reducer drain: main replies the moment `insertEvent.run`
+returns (the ack promises INSERT durability only — never the fold), THEN pumps
+the reducer in its own guarded block, so a slow or throwing pump can neither
+delay the worker's launch nor flip the already-sent ack. Outbox ordering is
+UNCHANGED — the insert still precedes the launch; only the ack moves ahead of
+the drain. The launch
 outcome is now three-way (`ConfirmOutcome`): a launch-failure
 (`launch.ok===false`) still mints `DispatchFailed`; a clean bind before the
 ceiling is `"ok"`; but a ceiling hit (60s) with `launch.ok===true` is
@@ -1956,7 +1962,12 @@ busy_timeout + a boot-drain so boot dispatches don't false-abort), so outbox
 ordering (intent committed before side-effect) is load-bearing rather than
 fire-and-forget; on `ok:false` or ack-timeout it ABORTS without launching (no
 double-dispatch — a phantom row clears via the TTL sweep), closing the
-SessionStart-drains-before-`dispatched` race (fn-627 class). The reducer folds
+SessionStart-drains-before-`dispatched` race (fn-627 class). fn-762: main
+replies the ack the moment the `Dispatched` INSERT commits — the ack promises
+INSERT durability only, not the fold — and runs the reducer pump AFTERWARD in
+its own guarded block, so a slow or throwing pump can't delay the worker's
+launch or flip the already-sent ack. Outbox ordering is unchanged (insert still
+precedes launch); only the ack moves ahead of the drain. The reducer folds
 the `Dispatched` event into a `pending_dispatches` row keyed `(verb, id)`;
 `loadReconcileSnapshot` reads the table each cycle. As of fn-721 those rows
 feed `computeReadiness` directly as the `dispatch-pending` mutex occupant —
@@ -1987,17 +1998,28 @@ dispatch — BEFORE the confirm await, so it covers BOTH the `ok` and the slow-
 cold-boot `indoubt` outcomes (the headline bug) — and `reconcile` reads it (a
 read-only gate at BOTH dispatch sites, above the fn-728 budget gate and NOT
 approve-exempt, so it covers work/close/approve alike) to suppress re-dispatch
-for `REDISPATCH_COOLDOWN_S` (120s, aligned to `PENDING_DISPATCH_TTL_MS` and
-conservatively longer than any plausible fold lag — a shorter TTL would re-
-introduce over-dispatch at expiry, k8s #129795, safe here only because the
-durable arms remain and the cooldown is ADDITIVE). It is dispatch-side
-scheduling ONLY: in-memory, never written to the event log / projections /
-reducer / RPC surface, boots EMPTY on restart (safe — autopilot boots paused
-and the first cycle rebuilds suppression from the live projection), and is
-mutated ONLY in the cycle glue (`reconcile` stays pure — it never writes the
-Map). A definitive launch failure (`launch.ok===false` → `DispatchFailed`) or
-an abort-before-launch CLEARS the entry so `failedKeys` owns stickiness and a
-human `retry_dispatch` re-dispatches without waiting out the cooldown. Each
+for `REDISPATCH_COOLDOWN_S`. fn-762 set that window to 200s, STRICTLY GREATER
+than `PENDING_DISPATCH_TTL_MS / 1000` (120) + the `PENDING_DISPATCH_SWEEP`
+granularity (60): the 2026-06-09 incident triple-dispatched one worktree
+because the cooldown CO-EXPIRED with the 120s TTL while fold lag still outlived
+both — the window must outlast the WHOLE round-trip (pending row surviving a
+full TTL, then the sweep tick that clears the phantom), not merely the TTL. The
+load-bearing ordering chain is `ceilingMs (60s) < PENDING_DISPATCH_TTL_MS
+(120s) < REDISPATCH_COOLDOWN_S (200s)` (a shorter window re-introduces
+over-dispatch at expiry, k8s #129795). It is dispatch-side scheduling ONLY:
+in-memory, never written to the event log / projections / reducer / RPC
+surface, boots EMPTY on restart (safe — autopilot boots paused and the first
+cycle rebuilds suppression from the live projection), and is mutated ONLY in
+the cycle glue (`reconcile` stays pure — it never writes the Map). A definitive
+launch failure (`launch.ok===false` → `DispatchFailed`) or a PRE-LAUNCH abort
+(`aborted-prelaunch` — ack reject / `{ok:false}` / shutdown racing the ack:
+nothing launched) CLEARS the entry so `failedKeys` owns stickiness and a human
+`retry_dispatch` re-dispatches without waiting out the cooldown; `ok`,
+`indoubt`, and a POST-LAUNCH abort (`aborted-postlaunch` — a mid-poll shutdown
+after the launch fired, when a ghost worker may exist) all KEEP it. The
+`indoubt` outcome RE-STAMPS the entry ONCE at resolution (the dispatch-time
+stamp is up to `ceilingMs` stale by then; a single refresh restarts the
+window — never compounding across cycles, the perpetual-suppression trap). Each
 cycle prunes expired entries (`sweepRedispatchCooldown`, mirroring
 `server-worker.ts`'s `reapStuckPending`, wrapped so a sweep throw can't bounce
 the daemon). **This supersedes the approve-only, reducer-side fn-734** —

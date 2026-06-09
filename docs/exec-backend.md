@@ -140,7 +140,10 @@ launch-window dedup and feeds `computeReadiness` as the
 `dispatch-pending` occupant. The reconciler awaits main's durable
 `Dispatched` insert *before* calling `launch` (outbox ordering — intent
 committed before the side-effect), so a crash between ack and launch
-leaves only a phantom row the TTL sweep clears.
+leaves only a phantom row the TTL sweep clears. fn-762: main replies that
+ack the instant the INSERT commits (it promises INSERT durability only),
+then pumps the reducer afterward in a guarded block — so the ack timing is
+independent of fold latency while outbox ordering stays unchanged.
 
 The zellij **tab name is purely cosmetic** — no control path ever reads
 it back. Correlation is the projection edge, full stop.

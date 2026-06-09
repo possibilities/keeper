@@ -35,10 +35,10 @@
  *      deps.emitDispatched({verb, id, ...})` posts a `Dispatched` intent
  *      to main for durable insert and BLOCKS on the id-correlated
  *      `dispatched-ack{id, ok}` reply. `{ok:false}` from the ack OR an
- *      ack-wait timeout → ABORT without launching (resolve `"aborted"`,
- *      no emit; a phantom `pending_dispatches` row, if one landed, is
- *      cleared by the TTL sweep). Outbox ordering — intent committed
- *      BEFORE the launch side-effect — is load-bearing (closes the
+ *      ack-wait timeout → ABORT without launching (resolve
+ *      `"aborted-prelaunch"`, no emit; a phantom `pending_dispatches` row, if
+ *      one landed, is cleared by the TTL sweep). Outbox ordering — intent
+ *      committed BEFORE the launch side-effect — is load-bearing (closes the
  *      SessionStart-drains-before-`dispatched` race, fn-627 class).
  *   2b. `res = await deps.launch(argv, name)`, ONLY after the durable
  *      `dispatched-ack{ok:true}`. `{ok:false}` (or throw) → emit
@@ -178,8 +178,17 @@ export type DispatchKey = string;
  * regardless of projection lag — until the durable arms catch up and own
  * suppression again. The cooldown is ADDITIVE, never the sole suppressor.
  *
- * Aligned to `PENDING_DISPATCH_TTL_MS` (120_000 ms = 120 s, src/daemon.ts):
- * conservatively longer than any plausible fold lag (k8s #129795 — a TTL
+ * fn-762 — set to 200 s, STRICTLY GREATER than
+ * `PENDING_DISPATCH_TTL_MS / 1000` (120 s) + the `PENDING_DISPATCH_SWEEP`
+ * granularity (60 s). The 2026-06-09 incident triple-dispatched one worktree
+ * because the cooldown co-EXPIRED with the 120 s pending-dispatch TTL while
+ * fold lag still outlived both — at the shared 120 s boundary the suppression
+ * lapsed in the very window the TTL sweep was still clearing the phantom row,
+ * re-opening the dispatch. The window must outlast the WHOLE round-trip: the
+ * pending row can survive up to TTL, then the producer-side sweep takes up to
+ * one more sweep-granularity tick to mint `DispatchExpired`; the cooldown
+ * therefore has to cover TTL + sweep + headroom (k8s ExpectationsTimeout —
+ * suppression must outlast worst-case delivery delay; #129795 — a window
  * shorter than the lag re-introduces over-dispatch at expiry).
  *
  * UNIT TRAP (a 1000x bug if mixed up): `reconcile`'s `now` is unix SECONDS
@@ -187,7 +196,7 @@ export type DispatchKey = string;
  * cooldown Map's timestamps are ALL in seconds. NEVER compare them against
  * the ms-valued `*_TTL_MS` constants directly.
  */
-export const REDISPATCH_COOLDOWN_S = 120;
+export const REDISPATCH_COOLDOWN_S = 200;
 
 /**
  * fn-742 — the in-process per-epic FINALIZER guard window, in SECONDS.
@@ -203,8 +212,9 @@ export const REDISPATCH_COOLDOWN_S = 120;
  * cooldown would already suppress — it stamps BEFORE the confirm await, reads
  * in the pure `reconcile`, sweeps in `driveCycle`.
  *
- * Aligned to `REDISPATCH_COOLDOWN_S` (= `PENDING_DISPATCH_TTL_MS / 1000` = 120
- * s): conservatively longer than any plausible fold lag, same as fn-735.
+ * Tracks `REDISPATCH_COOLDOWN_S` (fn-762: now 200 s, strictly > the 120 s
+ * pending-dispatch TTL + 60 s sweep granularity): conservatively longer than
+ * any plausible fold-lag round-trip, same headroom rationale as fn-735.
  *
  * UNIT TRAP: unit-SECONDS throughout (`reconcile`'s `now`). NEVER compare
  * against the ms-valued `*_TTL_MS` constants.
@@ -946,14 +956,28 @@ export interface DispatchExpiredPayload {
  *    `pending_dispatches` row is KEPT so the producer-side TTL sweep
  *    eventually mints `DispatchExpired` if the bind truly never arrives.
  *    `inFlight` is released (same as `ok`/`failed`).
- *  - `"aborted"` — shutdown OR a DURABLE-ack abort (fn-724: `emitDispatched`
- *    resolved `{ok:false}` or its ack-wait rejected on timeout/shutdown).
- *    Drop the in-flight entry and exit WITHOUT emitting (no DispatchFailed
- *    for a worker shutdown; and no DispatchFailed for an ack abort — a
- *    phantom row, if one landed, is cleared by the TTL sweep). The launch
- *    NEVER happened on an ack abort, so there is no worker to write off.
+ *  - `"aborted-prelaunch"` (fn-762) — an abort that fired BEFORE `launch()`
+ *    ran: a durable-ack `{ok:false}`, an ack-wait reject (timeout/shutdown),
+ *    or a shutdown signal racing the ack. The launch NEVER happened, so there
+ *    is no worker to write off and nothing to clean up beyond a possible
+ *    phantom `pending_dispatches` row (cleared by the TTL sweep). The cycle
+ *    glue CLEARS the cooldown + finalizer-guard stamps on this outcome —
+ *    `failedKeys` owns stickiness and `retry_dispatch` re-dispatches without
+ *    waiting the window out.
+ *  - `"aborted-postlaunch"` (fn-762) — an abort observed AFTER `launch()`
+ *    fired (a shutdown signal seen mid-poll). The launch DID happen, so a
+ *    ghost worker may exist and the pause-reap projection may lag behind it;
+ *    the cycle glue KEEPS the cooldown + finalizer-guard stamps (same as
+ *    `ok`/`indoubt`) so a fold-lag-blind re-dispatch can't double-launch the
+ *    same worktree. No DispatchFailed either way (shutdown is a clean
+ *    teardown, not a sticky failure).
  */
-export type ConfirmOutcome = "ok" | "failed" | "indoubt" | "aborted";
+export type ConfirmOutcome =
+  | "ok"
+  | "failed"
+  | "indoubt"
+  | "aborted-prelaunch"
+  | "aborted-postlaunch";
 
 /**
  * Default poll cadence — every 1s. Spec says ~1-2s; we pick 1000ms so a
@@ -1338,9 +1362,13 @@ export function reconcile(
  * booting (24-33s cold `claude` start) keeps its slot held until
  * `SessionStart` folds and discharges the row.
  *
- * Abort handling: `signal.aborted` after any internal sleep resolves
- * `"aborted"` without emitting `DispatchFailed`. Shutdown is a clean
- * teardown, not a sticky failure.
+ * Abort handling (fn-762): an abort BEFORE `launch()` resolves
+ * `"aborted-prelaunch"` (ack reject / `{ok:false}` / shutdown racing the
+ * ack); an abort observed AFTER `launch()` fired resolves
+ * `"aborted-postlaunch"`. Neither emits `DispatchFailed` — shutdown is a
+ * clean teardown, not a sticky failure — but the two split so the cycle glue
+ * can CLEAR the cooldown on the pre-launch case (nothing launched) and KEEP
+ * it on the post-launch case (a ghost worker may exist).
  *
  * Pure with-injected-deps — tests pass fake `launch` / `findJob` /
  * `now` / `sleep` to drive every branch deterministically.
@@ -1374,10 +1402,10 @@ export async function confirmRunning(
   //          — the row MAY have landed (a slow insert that replied after the
   //          wait gave up); the producer-side TTL sweep clears any such
   //          phantom via `DispatchExpired`. Abort cleanly.
-  //    Either way we return `"aborted"` (no `DispatchFailed` — the launch
-  //    never happened, so there is no worker to write off). A phantom row
-  //    delaying a real re-dispatch by up to 120s is strictly preferable to
-  //    double-dispatch.
+  //    Either way we return `"aborted-prelaunch"` (no `DispatchFailed` — the
+  //    launch never happened, so there is no worker to write off). A phantom
+  //    row delaying a real re-dispatch by up to one TTL window is strictly
+  //    preferable to double-dispatch.
   let ack: DispatchedAck;
   try {
     ack = await deps.emitDispatched({
@@ -1388,16 +1416,16 @@ export async function confirmRunning(
     });
   } catch {
     // Ack-wait rejected (timeout or shutdown). Abort without launching.
-    return "aborted";
+    return "aborted-prelaunch";
   }
   if (!ack.ok) {
     // Durable insert failed on main. Abort without launching — no row
     // landed, so no TTL cleanup needed; the next reconcile cycle re-attempts.
-    return "aborted";
+    return "aborted-prelaunch";
   }
   if (signal.aborted) {
     // Shutdown raced the ack. Abort before the side-effect.
-    return "aborted";
+    return "aborted-prelaunch";
   }
   // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`.
   const launchResult: LaunchResult | { ok: false; error: string } = await deps
@@ -1417,7 +1445,10 @@ export async function confirmRunning(
     return "failed";
   }
   if (signal.aborted) {
-    return "aborted";
+    // Shutdown observed right after a SUCCESSFUL launch — the worker is live
+    // (or booting). Post-launch: keep the stamps so a fold-lag re-dispatch
+    // can't double-launch this worktree.
+    return "aborted-postlaunch";
   }
   // 4. Poll loop — wait for the SessionStart jobs row. The
   //    `pending_dispatches` row (minted above) keeps the `liveTabKeys`
@@ -1432,7 +1463,8 @@ export async function confirmRunning(
     const sleepMs = Math.min(pollIntervalMs, remainingMs);
     await deps.sleep(sleepMs, signal);
     if (signal.aborted) {
-      return "aborted";
+      // Mid-poll shutdown — launch already fired. Post-launch (keep stamps).
+      return "aborted-postlaunch";
     }
     elapsedMs += sleepMs;
     const hit = deps.findJob(verb, id, watermark);
@@ -1445,7 +1477,8 @@ export async function confirmRunning(
       return "ok";
     }
     if (signal.aborted) {
-      return "aborted";
+      // Mid-poll shutdown — launch already fired. Post-launch (keep stamps).
+      return "aborted-postlaunch";
     }
   }
   // Ceiling elapsed with no jobs row. fn-724: the launch SUCCEEDED
@@ -1459,9 +1492,13 @@ export async function confirmRunning(
   //   - KEEP the `pending_dispatches` row (minted + ack'd above). It holds
   //     the launch-window slot AND, if the bind truly never arrives, the
   //     producer-side TTL sweep (120s, > this 60s ceiling) mints
-  //     `DispatchExpired` to clear it. The `ceilingMs < PENDING_DISPATCH_
-  //     TTL_MS` invariant is load-bearing here: were the sweep < ceiling it
-  //     would clear the row mid-confirm and re-open the dispatch.
+  //     `DispatchExpired` to clear it. The full ordering chain is load-bearing
+  //     (fn-762): `ceilingMs (60s) < PENDING_DISPATCH_TTL_MS (120s) <
+  //     REDISPATCH_COOLDOWN_S (200s)`. ceiling < TTL: were the sweep < ceiling
+  //     it would clear the row mid-confirm and re-open the dispatch. TTL <
+  //     cooldown: the cooldown must outlast the worst-case round-trip (the
+  //     pending row surviving a full TTL plus the sweep tick that clears it)
+  //     so suppression never lapses while a phantom is still in flight.
   // The reducer is UNCHANGED — `foldDispatchExpired` already DELETEs the
   // row idempotently; the coupling break is entirely producer-side
   // suppression of the emit.
@@ -1556,23 +1593,47 @@ export async function runReconcileCycle(
         signal,
         deps,
       );
-      // fn-735 — on a DEFINITIVE launch failure (`launch.ok===false` →
-      // `DispatchFailed`, surfaced here as `outcome==="failed"`) or an
-      // abort BEFORE the launch happened (`outcome==="aborted"`: shutdown
-      // or a durable-ack reject — the launch never fired), DELETE the
-      // cooldown entry. `failedKeys` then owns stickiness for `failed`, and
-      // the human's `retry_dispatch` (which clears `failedKeys`, not worker
-      // memory) re-dispatches without first having to wait out the cooldown
-      // in this process. `ok` and `indoubt` KEEP the stamp.
-      if (outcome === "failed" || outcome === "aborted") {
+      // fn-735/fn-762 — CLEAR the cooldown only when nothing actually
+      // launched: a DEFINITIVE launch failure (`launch.ok===false` →
+      // `DispatchFailed`, surfaced here as `outcome==="failed"`) or an abort
+      // BEFORE `launch()` fired (`outcome==="aborted-prelaunch"`: a
+      // durable-ack reject / `{ok:false}` / shutdown racing the ack — the
+      // launch never happened). `failedKeys` then owns stickiness for
+      // `failed`, and the human's `retry_dispatch` (which clears
+      // `failedKeys`, not worker memory) re-dispatches without first having
+      // to wait out the cooldown in this process.
+      //
+      // `ok` / `indoubt` / `aborted-postlaunch` KEEP the stamp — the launch
+      // DID fire in all three, so a fold-lag-blind re-dispatch could
+      // double-launch the same worktree (the 2026-06-09 incident class).
+      // `aborted-postlaunch` is the fn-762 split that makes a mid-poll
+      // shutdown keep the stamp: the ghost worker may outlive the pause-reap
+      // projection lag, so suppression must hold.
+      if (outcome === "failed" || outcome === "aborted-prelaunch") {
         state.redispatchCooldown.delete(plan.key);
         // fn-742 — on a definitive launch failure / pre-launch abort, the
         // finalizer never actually ran, so release the per-epic guard too
         // (same rationale as the cooldown clear: don't make the sibling
         // finalizer wait out the window for a launch that didn't happen).
-        // `ok`/`indoubt` KEEP the stamp.
+        // Kept in lockstep with the cooldown clear above (fn-742 parity).
+        // `ok` / `indoubt` / `aborted-postlaunch` KEEP the stamp.
         if (plan.isEpicFinalizer) {
           state.finalizerGuard.delete(plan.id);
+        }
+      } else if (outcome === "indoubt") {
+        // fn-762 — re-stamp ONCE at the indoubt resolution. The original
+        // stamp (set at dispatch, before the confirm await) is now up to
+        // `ceilingMs` (60s) stale by the time the ceiling elapses, so it
+        // would expire 60s early relative to the in-doubt launch it must
+        // suppress. Refreshing it here restarts the full window from the
+        // resolution instant. This is a SINGLE refresh at resolution — never
+        // compounding across cycles: the next cycle's dispatch path re-stamps
+        // normally only if it actually re-dispatches (the openclaw#23516
+        // perpetual-suppression trap is re-stamping on EVERY retry). Kept in
+        // lockstep with the finalizer guard (fn-742 parity). unit-SECONDS.
+        state.redispatchCooldown.set(plan.key, deps.now());
+        if (plan.isEpicFinalizer) {
+          state.finalizerGuard.set(plan.id, deps.now());
         }
       }
       if (outcome === "ok") {
@@ -1595,10 +1656,14 @@ export async function runReconcileCycle(
       //   elapsed with no jobs row; NO DispatchFailed, the pending row is
       //   kept (TTL sweep clears it if the bind never lands). No live entry
       //   recorded (we never observed the confirm), but inFlight IS released
-      //   (the `finally` below) — same as ok/failed.
-      // outcome === "aborted" → shutdown OR a durable-ack abort (fn-724:
-      //   emitDispatched {ok:false} or its ack-wait rejected); no emission,
-      //   no live entry. On an ack abort the launch never happened.
+      //   (the `finally` below) — same as ok/failed. Stamps re-stamped above.
+      // outcome === "aborted-prelaunch" (fn-762) → a durable-ack abort
+      //   (emitDispatched {ok:false} / ack-wait reject) or a shutdown racing
+      //   the ack; no emission, no live entry, the launch never happened —
+      //   stamps cleared above.
+      // outcome === "aborted-postlaunch" (fn-762) → a mid-poll shutdown after
+      //   `launch()` fired; no emission, no live entry, but the launch DID
+      //   happen — stamps KEPT above (a ghost worker may exist).
     } finally {
       state.inFlight.delete(plan.key);
     }
@@ -1965,7 +2030,8 @@ function main(): void {
       cycleController.abort();
       // Reject every parked ack-wait so an in-flight `confirmRunning` that
       // launched its `emitDispatched` request before shutdown resolves
-      // promptly (as `"aborted"`) instead of hanging until its timeout.
+      // promptly (as `"aborted-prelaunch"`) instead of hanging until its
+      // timeout.
       for (const [id, pending] of pendingDispatchAcks) {
         pendingDispatchAcks.delete(id);
         pending.reject(new Error("autopilot worker shutting down"));
