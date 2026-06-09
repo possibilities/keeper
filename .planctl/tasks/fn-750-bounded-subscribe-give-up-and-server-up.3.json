@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reproduce and fix subscribe-client memory leak",
-  "updated_at": "2026-06-08T20:38:08.465288Z"
+  "updated_at": "2026-06-09T11:18:56.029789Z",
+  "worker_done_at": "2026-06-09T11:18:56.029789Z"
 }

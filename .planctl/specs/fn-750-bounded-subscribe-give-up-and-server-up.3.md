@@ -70,5 +70,5 @@ collide.
 - [ ] the harness is bounded / opt-in so it does not bloat the default test tier
 
 ## Done summary
-
+Killed the ~2GB keeper await reconnect leak: client-initiated teardowns now terminate() the socket (hard-destroy) instead of end()/null-drop, so a half-up/dead daemon can't pin native socket buffers across reconnects. Root-caused via isolated probes + a new bounded/opt-in bounce-soak harness (scripts/subscribe-bounce-soak.ts) whose slope-aware verdict shows pre-fix +4.64 MB/1k linear leak (FAIL) vs post-fix +0.08 MB/1k flat (PASS); existing readiness-client tests stay green plus two new terminate-on-teardown assertions.
 ## Evidence
