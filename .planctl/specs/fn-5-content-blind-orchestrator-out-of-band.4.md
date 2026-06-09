@@ -37,5 +37,5 @@ No code tests. Verify mermaid still parses if a linter exists; otherwise visual 
 - [ ] All edits present-tense; no backward-facing tombstones.
 
 ## Done summary
-
+Synced human-facing reference docs to the brief-file handoff and content-blind orchestrator contract: CLAUDE.md/AGENTS.md (claim brief write + brief_ref, worker resume envelope, content-blind principle), commit-at-mutation-boundary.md (runtime-state-only row + §9 dirty-after-done auto-resume), README.md, and the workflow mermaid claim node. All present-tense, mermaid re-renders clean.
 ## Evidence
