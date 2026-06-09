@@ -166,7 +166,7 @@ in a non-git dir, takes the read-only `emit()` path and lands no commit.
 | Mutating, whole-tree (`scaffold`, `refine-apply`, `epic create`) | non-null `subject`, `files` covers the full epic+tasks+specs+deps tree | yes (inline, one commit) | the LOCAL write-phase block unwinds a mid-write crash; a pre-commit raise from the seam leaves the fully-written tree on disk (§10), invisible to the autopilot via the keeper HEAD-gate |
 | Mutating, whole-tree delete (`epic rm`, fn-623) | non-null `subject`, `files` lists every unlinked path (epic JSON, every task JSON, epic + task specs, runtime state, locks) — paths are recorded BEFORE the unlink so the `touched ∩ dirty` pathspec captures the deletions | yes (inline, one commit) | the verb is a delete — a pre-commit raise leaves the deletes in place (§10), nothing to re-create |
 | Mutating, self-built payload (`init`) | non-null `subject`, `files` is the explicit bootstrap set it created; NO `session_id` key (no `Session-Id:` trailer) | yes (inline, via `emit(planctl_invocation=...)`), only when something was written AND inside a git work tree | the writes are fresh files; a pre-commit raise leaves them on disk (§10), and an idempotent re-run is the read-only `emit()` path |
-| Runtime-state-only (`claim`, `block`, `approve`) | `subject=null`, `files=null` | none (gitignored state) | n/a |
+| Runtime-state-only (`claim`, `block`, `approve`) | `subject=null`, `files=null` | none (gitignored state) | n/a — `claim` also writes the worker brief to `state/briefs/<task_id>.json` (gitignored), so that write lands no commit either |
 | Read-only (`show`, `cat`, `list`, ...) | `subject=null`, `files=null` (via decorator) | none | n/a |
 | `validate --epic <id>` (first-ever valid) | non-null `subject`, single file | yes (manual `auto_commit_from_invocation` call from the validate runner, which bypasses `emit()` to preserve its `{valid, errors, warnings}` envelope shape) | bypass — documented out-of-scope per §13's `validate --epic` row, see the asymmetry note below |
 | `refine-context --invalidate` (conditionally-mutating) | non-null `subject`, single file | yes (inline) | envelope shape is `emit()`-compatible; the single-field rewrite is a rename-atomic over a pre-existing tracked file, so prior valid contents stay in place |
@@ -471,6 +471,20 @@ A harness drop can land at three places under this contract:
 - **Drop after `planctl done` (both commits in place):** task `done`,
   both commits in history. Parent loses only the worker's free-text
   return summary.
+
+A fourth, non-drop incompleteness rides the same primitive:
+
+- **Dirty-after-done (task `done`, tree still dirty):** the worker
+  stamped `done` but left uncommitted source in its `session_files`.
+  The content-blind orchestrator does NOT commit on the worker's behalf;
+  within the 5-attempt budget it auto-resumes the worker (`planctl
+  worker resume`) with a process nudge to commit the remaining hunks.
+  Only after the budget is exhausted does it surface the dirty tree.
+
+Both the drop cases and the dirty-after-done case funnel to one
+primitive — resume the worker with a minimal process nudge. The
+orchestrator never commits source, never runs `planctl done`, and never
+edits the worker's content.
 
 The recovery budget is **5 attempts (1 spawn + 4 retries)** — each warm
 SendMessage resume and each cold fresh-respawn counts one attempt toward

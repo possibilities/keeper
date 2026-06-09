@@ -47,7 +47,7 @@ flowchart TB
 
         subgraph task_loop["Run Task"]
             direction TB
-            start["planctl claim\n(assert + claim + briefing envelope)"]
+            start["planctl claim\n(assert + claim +\nwrite brief file, return brief_ref)"]
 
             subgraph worker_box["Spawn `work:worker` (tier from task metadata; keeper loaded matching `claude/work-plugins/<tier>/` pre-boot)"]
                 direction TB

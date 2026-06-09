@@ -43,7 +43,7 @@ planctl scaffold --file plan.yaml
 # 3) Refine an existing epic later (add tasks, rewrite specs/deps)
 planctl refine-apply fn-1-add-auth --file delta.yaml
 
-# 4) Work the task lifecycle (claim asserts + claims + returns the worker briefing)
+# 4) Work the task lifecycle (claim asserts + claims + writes the worker brief, returns a brief_ref)
 planctl claim fn-1-add-auth.1
 planctl done fn-1-add-auth.1 --summary "Chose JWT strategy"
 
@@ -96,7 +96,7 @@ Environment variables:
 
 ## Auto-commit
 
-Every planctl CLI invocation emits a `planctl_invocation` NDJSON envelope on stdout. Mutating verbs additionally land a `chore(planctl): <op> <target>` commit inline at `output.emit()` via `planctl.commit.auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.planctl/` commit landed. Read-only verbs (and runtime-only verbs like `claim`/`block`) emit the envelope but skip the git commit (`files` is empty → no-op). On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
+Every planctl CLI invocation emits a `planctl_invocation` NDJSON envelope on stdout. Mutating verbs additionally land a `chore(planctl): <op> <target>` commit inline at `output.emit()` via `planctl.commit.auto_commit_from_invocation` — the commit happens BEFORE the success envelope prints, so the envelope's appearance on stdout is the authoritative signal that the `.planctl/` commit landed. Read-only verbs (and runtime-only verbs like `claim`/`block`) emit the envelope but skip the git commit (`files` is empty → no-op). `claim` writes the worker brief to `<primary_repo>/.planctl/state/briefs/<task_id>.json` and returns a `brief_ref` handle, but that brief lives under gitignored `state/`, so it too lands no commit. On commit failure the runner prints a structured `{"success": false, "error": "commit_failed", "details": {...}}` envelope on stdout and exits 1 — the success envelope is NOT printed.
 
 `init` is the session-id-free mutating verb: it builds its own commit payload directly (an explicit list of the bootstrap files it created), so it needs neither the touched-paths log nor `CLAUDE_CODE_SESSION_ID`. It lands a `chore(planctl): init <project-name>` commit with no `Session-Id:` trailer, but only when it wrote something AND the cwd is inside a git work tree — an idempotent re-run or an `init` in a non-git dir takes the read-only path with no commit.
 
