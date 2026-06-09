@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 61;
+export const SCHEMA_VERSION = 62;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -1539,7 +1539,34 @@ CREATE TABLE IF NOT EXISTS autopilot_state (
     last_event_id INTEGER NOT NULL,
     created_at REAL NOT NULL,
     updated_at REAL NOT NULL,
-    max_concurrent_jobs INTEGER
+    max_concurrent_jobs INTEGER,
+    mode TEXT NOT NULL DEFAULT 'yolo'
+)
+`;
+
+/**
+ * Schema-v62 `armed_epics` PRESENCE table (fn-751 task .1) — the per-epic
+ * "armed" flag the autopilot's `armed` mode reads each reconcile cycle to
+ * decide which epics (plus their transitive upstream dep-closure) it is
+ * allowed to dispatch `work` against. Keyed by `epic_id`; a row's PRESENCE
+ * means the epic is explicitly armed, its ABSENCE means it is not. Mirrors
+ * the `autopilot_state` singleton's projection discipline (`last_event_id` /
+ * `created_at` / `updated_at`), but as a per-row PRESENCE table rather than a
+ * singleton — `armed:true` INSERTs/REPLACEs the row, `armed:false` DELETEs it.
+ *
+ * Populated exclusively by the reducer's `EpicArmed` fold arm (fed by main's
+ * `set_epic_armed` RPC bridge); it is a reducer projection, so a from-scratch
+ * re-fold rebuilds it byte-identically from the `EpicArmed` events in the log
+ * and it MUST join the rewind-and-redrain DELETE list. Starts EMPTY on a fresh
+ * DB (the zero-event projection = "no epics armed", matching the
+ * `mode='yolo'`-defaults-to-work-everything baseline).
+ */
+const CREATE_ARMED_EPICS = `
+CREATE TABLE IF NOT EXISTS armed_epics (
+    epic_id TEXT PRIMARY KEY,
+    last_event_id INTEGER NOT NULL,
+    created_at REAL NOT NULL,
+    updated_at REAL NOT NULL
 )
 `;
 
@@ -2367,6 +2394,7 @@ function migrate(db: Database): void {
       }
       db.run(CREATE_DISPATCH_FAILURES);
       db.run(CREATE_AUTOPILOT_STATE);
+      db.run(CREATE_ARMED_EPICS);
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_EPIC_TOMBSTONES);
@@ -4917,6 +4945,13 @@ function migrate(db: Database): void {
         // migrate(), but is empty — no `Dispatched` events have ever
         // landed in a pre-v50 log).
         db.run("DELETE FROM pending_dispatches");
+        // fn-751 (schema v62): `armed_epics` is a reducer projection (epic
+        // fn-751); it joins the rewind-and-redrain set here so the canonical
+        // "wipe every reducer-owned projection table" list stays complete for
+        // any FUTURE rewind. Harmless on a v41→v42 upgrade (the table exists
+        // by the bootstrap CREATE that runs first in migrate(), but is empty —
+        // no `EpicArmed` events have ever landed in a pre-v62 log).
+        db.run("DELETE FROM armed_epics");
       }
 
       // v42→v43: fn-661 — `dispatch_failures` projection table, the durable
@@ -6018,6 +6053,49 @@ function migrate(db: Database): void {
       // so keeper-py's Python readers (e.g. `planctl render-approve-context`)
       // on this host don't fail-loud (test/schema-version.test.ts enforces).
       db.run(CREATE_EVENT_INGEST_OFFSETS);
+
+      // v61→v62: fn-751 (task .1) — the explicit autopilot mode enum + the
+      // per-epic armed flag (the storage foundation the `armed` reconcile arm
+      // and control plane build on). Two additive schema steps:
+      //
+      // (1) A NOT NULL `autopilot_state.mode TEXT DEFAULT 'yolo'` column on
+      //     the existing singleton. The DEFAULT 'yolo' makes the zero-event /
+      //     pre-existing-row projection = today's "work everything" behavior,
+      //     and satisfies the NOT NULL constraint for the daemon's boot re-arm
+      //     INSERTs (the paused / cap arms, which are the FIRST writers to the
+      //     singleton on a fresh DB and bind no `mode` value). The column
+      //     populates from the reducer's new `AutopilotMode` fold arm, fed by
+      //     the daemon's boot-append + main's `set_autopilot_mode` RPC bridge.
+      //
+      //     Lockstep ALTER vs CREATE: this ALTER literal byte-matches the
+      //     `mode TEXT NOT NULL DEFAULT 'yolo'` column in CREATE_AUTOPILOT_STATE
+      //     above so a fresh v62 DB and an upgraded v61-shaped DB produce
+      //     byte-identical PRAGMA table_info rows. `addColumnIfMissing` is
+      //     idempotent on column presence (no-op on the freshly CREATE'd table
+      //     / a re-open of an already-migrated DB). The column IS part of the
+      //     `autopilot_state` reducer projection — it rides the existing
+      //     `DELETE FROM autopilot_state` rewind entry (no new rewind entry).
+      //
+      // (2) The `armed_epics` PRESENCE table. Created via CREATE TABLE IF NOT
+      //     EXISTS (naturally idempotent + forward-only — the v60→v61
+      //     `event_ingest_offsets` precedent). NO backfill — the table starts
+      //     EMPTY and populates organically from the reducer's `EpicArmed`
+      //     fold arm. It IS a reducer projection (unlike `event_ingest_offsets`)
+      //     and joins the rewind-and-redrain DELETE list (the v41→v42 slot
+      //     above gains `DELETE FROM armed_epics`).
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 62
+      // in the SAME change — whitelist-only (keeper-py reads neither
+      // `autopilot_state` nor `armed_epics`), but the bump is required so
+      // keeper-py's Python readers (e.g. `planctl render-approve-context`) on
+      // this host don't fail-loud (test/schema-version.test.ts enforces).
+      addColumnIfMissing(
+        db,
+        "autopilot_state",
+        "mode",
+        "TEXT NOT NULL DEFAULT 'yolo'",
+      );
+      db.run(CREATE_ARMED_EPICS);
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

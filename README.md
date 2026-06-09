@@ -1573,6 +1573,38 @@ for re-fold determinism (no migration seed → `created_at` derived purely
 from the event log). keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
 gains `47` (whitelist-only; keeper-py reads neither `autopilot_state`
 nor `AutopilotPaused`).
+As of schema v62 (fn-751), the autopilot gains an explicit mode enum plus a
+per-epic armed flag. A NOT NULL `autopilot_state.mode TEXT DEFAULT 'yolo'`
+column rides the SAME singleton row as `paused` / `max_concurrent_jobs`:
+`yolo` (the backward-compatible default) works every ready epic until none
+remain; `armed` works ONLY explicitly-armed epics PLUS their transitive
+upstream dependency closure (arming an epic pulls in the prerequisites it
+can't complete without, instead of deadlocking on them). The `DEFAULT 'yolo'`
+makes the zero-event / pre-existing-row projection identical to today's
+behavior and satisfies the NOT NULL constraint for the daemon's boot re-arm
+INSERTs (the paused / cap arms bind no `mode`). Main mints
+`AutopilotMode{mode:'yolo'|'armed'}` synthetic events; the reducer's
+`foldAutopilotMode` arm UPSERTs on the singleton id setting ONLY `mode` and
+PRESERVING `paused` + `max_concurrent_jobs` on conflict (the three arms share
+`id = 1`, so each preserves the others' columns — a mode flip never clobbers
+the live pause flag or the cap, and the sibling folds were extended to
+preserve `mode`). A new `armed_epics` PRESENCE table (`epic_id TEXT PRIMARY
+KEY`, plus `last_event_id` / `created_at` / `updated_at`) carries the per-epic
+armed flag: `EpicArmed{epic_id,armed}` synthetic events fold via
+`foldEpicArmed` — `armed:true` → `INSERT OR REPLACE` the row, `armed:false` →
+`DELETE` the row (a row's presence means armed). The reconcile worker reads
+both `mode` and the armed set from the projection snapshot every cycle (no
+relay, no in-memory cache) so the state survives restart for free. Both folds
+are re-fold-deterministic (no `Date.now`, no env reads — `created_at` /
+`updated_at` both derive from `event.ts`; a malformed / unknown-enum payload
+folds to a safe no-op with the cursor still advancing), and both projection
+tables join the rewind-and-redrain DELETE list so a from-scratch re-fold
+rebuilds them byte-identically. The `keeper autopilot` viewer subscribes
+`mode` next to the play/pause pill and renders the armed-epics section; the
+board flags armed epics with an `[armed]` pill (both subscribe the new
+`armed_epics` collection over the UDS socket). keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `62` (whitelist-only; keeper-py
+reads neither `autopilot_state` nor `armed_epics`).
 As of schema v51 (fn-682), the new `jobs.monitors` JSON-array column is the
 live per-job view of the background shells a session is running — the
 plugin-armed chatctl bus, an agent-armed `keeper await`, a backgrounded

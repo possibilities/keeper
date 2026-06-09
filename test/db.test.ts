@@ -407,6 +407,53 @@ test("schema_version is stamped in meta", () => {
   db.close();
 });
 
+test("autopilot_state has a NOT NULL mode column defaulting 'yolo'; armed_epics presence table exists (fn-751 v62)", () => {
+  const { db } = openDb(":memory:");
+  // The `mode` column is NOT NULL with DEFAULT 'yolo' (the zero-event /
+  // work-everything baseline). Lockstep ALTER-vs-CREATE: the bootstrap CREATE
+  // and the migration ALTER literal byte-match, so the column shape is
+  // identical on a fresh DB and an upgraded one.
+  const stateCols = db.prepare("PRAGMA table_info(autopilot_state)").all() as {
+    name: string;
+    notnull: number;
+    dflt_value: string | null;
+  }[];
+  const mode = stateCols.find((c) => c.name === "mode");
+  expect(mode).toBeDefined();
+  expect(mode?.notnull).toBe(1);
+  expect(mode?.dflt_value).toBe("'yolo'");
+
+  // The NOT NULL DEFAULT is what lets the daemon's boot re-arm (which INSERTs
+  // paused FIRST and binds no `mode`) satisfy the constraint. Prove it: an
+  // INSERT that omits `mode` reads 'yolo'.
+  db.prepare(
+    "INSERT INTO autopilot_state (id, paused, last_event_id, created_at, updated_at) VALUES (1, 1, 0, 1, 1)",
+  ).run();
+  const r = db
+    .prepare("SELECT mode FROM autopilot_state WHERE id = 1")
+    .get() as { mode: string };
+  expect(r.mode).toBe("yolo");
+
+  // The armed_epics presence table exists with the right column shape.
+  const armedCols = db.prepare("PRAGMA table_info(armed_epics)").all() as {
+    name: string;
+    pk: number;
+  }[];
+  expect(armedCols.map((c) => c.name)).toEqual([
+    "epic_id",
+    "last_event_id",
+    "created_at",
+    "updated_at",
+  ]);
+  expect(armedCols.find((c) => c.name === "epic_id")?.pk).toBe(1);
+  // Zero-event projection: empty.
+  const count = (
+    db.prepare("SELECT COUNT(*) AS n FROM armed_epics").get() as { n: number }
+  ).n;
+  expect(count).toBe(0);
+  db.close();
+});
+
 test("events has a nullable spawn_name column; jobs has a nullable title_source column", () => {
   const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {

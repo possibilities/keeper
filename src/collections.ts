@@ -728,6 +728,12 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
     // subscribe wire so the viewer renders it next to the play/pause pill
     // from the socket ONLY (never reads config.yaml). NULL = unlimited → `∞`.
     "max_concurrent_jobs",
+    // fn-751 (schema v62): the explicit autopilot mode enum (`'yolo'` |
+    // `'armed'`). Rides the subscribe wire so the `keeper autopilot` viewer
+    // renders the mode next to the play/pause pill from the socket ONLY.
+    // Defaults `'yolo'` (the work-everything baseline) on a zero-event /
+    // pre-existing row.
+    "mode",
   ],
   pk: "id",
   version: "last_event_id",
@@ -735,6 +741,36 @@ export const AUTOPILOT_STATE_DESCRIPTOR: CollectionDescriptor = {
   defaultSort: { column: "id", dir: "asc" },
   filters: {
     id: "id",
+  },
+  jsonColumns: new Set(),
+};
+
+/**
+ * The `armed_epics` descriptor (schema v62, epic fn-751). The per-epic armed
+ * PRESENCE table the autopilot's `armed` mode reads each reconcile cycle to
+ * decide which epics (plus their transitive upstream dep-closure) it may
+ * dispatch `work` against. One row per explicitly-armed epic; a row's PRESENCE
+ * means armed, its absence means not. Registering it here is the ONLY step
+ * that makes the table subscribable/queryable over the UDS socket (the
+ * `keeper autopilot` screen's armed-epics section + the board's `[armed]`
+ * pill subscribe it).
+ *
+ * Pk is `epic_id`. `version: 'last_event_id'` so the wire diff fires on every
+ * INSERT/REPLACE (the reducer bumps `last_event_id` on every fold).
+ * `defaultSort` is `created_at DESC` (most-recently-armed on top). No
+ * `jsonColumns` — every column is a scalar. All interpolated identifiers stay
+ * trusted constants (the SQL-injection invariant the registry enforces).
+ */
+export const ARMED_EPICS_DESCRIPTOR: CollectionDescriptor = {
+  name: "armed_epics",
+  table: "armed_epics",
+  columns: ["epic_id", "last_event_id", "created_at", "updated_at"],
+  pk: "epic_id",
+  version: "last_event_id",
+  sortable: new Set(["epic_id", "last_event_id", "created_at", "updated_at"]),
+  defaultSort: { column: "created_at", dir: "desc" },
+  filters: {
+    epic_id: "epic_id",
   },
   jsonColumns: new Set(),
 };
@@ -797,7 +833,8 @@ export const PENDING_DISPATCHES_DESCRIPTOR: CollectionDescriptor = {
  * `dispatch_failures` autopilot-reconciler sticky-failure projection
  * (schema v43, fn-661) + the `autopilot_state` singleton paused/playing
  * projection (schema v47, fn-667) + the `pending_dispatches` in-flight
- * launch-window projection (schema v50, fn-678).
+ * launch-window projection (schema v50, fn-678) + the `armed_epics` per-epic
+ * armed presence projection (schema v62, fn-751).
  */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -810,6 +847,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [DISPATCH_FAILURES_DESCRIPTOR.name, DISPATCH_FAILURES_DESCRIPTOR],
   [AUTOPILOT_STATE_DESCRIPTOR.name, AUTOPILOT_STATE_DESCRIPTOR],
   [PENDING_DISPATCHES_DESCRIPTOR.name, PENDING_DISPATCHES_DESCRIPTOR],
+  [ARMED_EPICS_DESCRIPTOR.name, ARMED_EPICS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

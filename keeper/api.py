@@ -222,6 +222,13 @@ from pathlib import Path
 # lock-free events path. keeper-py reads neither that table nor the per-pid
 # NDJSON files (the daemon's ingester owns both, UPSTREAM of the fold), so no
 # reader logic changes — only the version whitelist gains 61.
+#
+# v62 (fn-751 task .1) is also whitelist-only: it adds a NOT NULL
+# ``autopilot_state.mode TEXT DEFAULT 'yolo'`` column (the explicit autopilot
+# mode enum) and a new ``armed_epics`` per-epic armed presence table. keeper-py
+# reads neither ``autopilot_state`` nor ``armed_epics`` (the autopilot
+# reconciler + the ``keeper autopilot``/board viewers are the only consumers),
+# so no reader logic changes — only the version whitelist gains 62.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -255,6 +262,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         59,
         60,
         61,
+        62,
     }
 )
 

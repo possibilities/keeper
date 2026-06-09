@@ -15066,6 +15066,286 @@ test("from-scratch re-fold reproduces autopilot_state byte-identically with mixe
 });
 
 // ---------------------------------------------------------------------------
+// Schema v62 (fn-751) — `AutopilotMode{mode}` folds the explicit autopilot
+// mode enum into the SAME singleton `autopilot_state` row as `paused` /
+// `max_concurrent_jobs`, and `EpicArmed{epic_id,armed}` folds the per-epic
+// armed flag into the `armed_epics` PRESENCE table. The three autopilot_state
+// fold arms (paused / cap / mode) share `id = 1`, so each MUST preserve the
+// others' columns on conflict. `armed_epics` is a presence table: armed:true
+// INSERT-OR-REPLACEs the row, armed:false DELETEs it. Both folds are re-fold
+// deterministic and malformed payloads no-op without throwing.
+// ---------------------------------------------------------------------------
+
+function autopilotModeEvent(
+  mode: "yolo" | "armed",
+  sessionId = "autopilot",
+): number {
+  return insertEvent({
+    hook_event: "AutopilotMode",
+    session_id: sessionId,
+    data: JSON.stringify({ mode }),
+  });
+}
+
+function getAutopilotStateWithMode() {
+  return db.query("SELECT * FROM autopilot_state WHERE id = 1").get() as {
+    id: number;
+    paused: number;
+    last_event_id: number;
+    created_at: number;
+    updated_at: number;
+    max_concurrent_jobs: number | null;
+    mode: string;
+  } | null;
+}
+
+function epicArmedEvent(
+  epicId: string,
+  armed: boolean,
+  sessionId = "autopilot",
+): number {
+  return insertEvent({
+    hook_event: "EpicArmed",
+    session_id: sessionId,
+    data: JSON.stringify({ epic_id: epicId, armed }),
+  });
+}
+
+function getArmedEpics() {
+  return db.query("SELECT * FROM armed_epics ORDER BY epic_id ASC").all() as {
+    epic_id: string;
+    last_event_id: number;
+    created_at: number;
+    updated_at: number;
+  }[];
+}
+
+test("zero-event projection: a fresh DB has zero armed_epics rows and (when present) mode defaults yolo (fn-751)", () => {
+  const armedCount = (
+    db.query("SELECT COUNT(*) AS n FROM armed_epics").get() as { n: number }
+  ).n;
+  expect(armedCount).toBe(0);
+  // The autopilot_state singleton is empty on a zero-event DB; a row only
+  // lands once a paused/cap/mode event folds. The `mode` column's DEFAULT
+  // 'yolo' guarantees the work-everything baseline whenever a row IS created
+  // by a sibling fold (see the paused-INSERT-defaults-mode test below).
+  const stateCount = (
+    db.query("SELECT COUNT(*) AS n FROM autopilot_state").get() as { n: number }
+  ).n;
+  expect(stateCount).toBe(0);
+});
+
+test("AutopilotMode UPSERTs the singleton mode and advances the cursor (fn-751)", () => {
+  const eventId = autopilotModeEvent("armed");
+  expect(drainAll()).toBe(1);
+  const row = getAutopilotStateWithMode();
+  expect(row).not.toBeNull();
+  expect(row?.id).toBe(1);
+  expect(row?.mode).toBe("armed");
+  expect(row?.last_event_id).toBe(eventId);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("AutopilotMode INSERT path (mode before any pause) defaults paused=1 and cap NULL (fn-751)", () => {
+  // A log whose FIRST autopilot_state event is a mode set hits the INSERT
+  // branch, which binds paused=1 (boots-paused) and leaves the cap NULL.
+  autopilotModeEvent("armed");
+  drainAll();
+  const row = getAutopilotStateWithMode();
+  expect(row?.mode).toBe("armed");
+  expect(row?.paused).toBe(1);
+  expect(row?.max_concurrent_jobs).toBeNull();
+});
+
+test("AutopilotPaused INSERT path defaults mode to 'yolo' (DEFAULT covers the boot re-arm) (fn-751)", () => {
+  // The daemon's boot re-arm appends AutopilotPaused FIRST — that INSERT binds
+  // no `mode`, so the NOT NULL column relies on its DEFAULT 'yolo'. Verify the
+  // boot-order first-writer satisfies the constraint and reads yolo.
+  autopilotPausedEvent(true);
+  drainAll();
+  const row = getAutopilotStateWithMode();
+  expect(row?.paused).toBe(1);
+  expect(row?.mode).toBe("yolo");
+});
+
+test("AutopilotMode preserves paused + max_concurrent_jobs on conflict (fn-751)", () => {
+  // Seed paused + cap, then flip the mode — the mode UPSERT MUST preserve both
+  // sibling columns (the three arms share id = 1).
+  autopilotPausedEvent(false);
+  autopilotCapSetEvent(4);
+  drainAll();
+  expect(getAutopilotStateWithMode()?.paused).toBe(0);
+  expect(getAutopilotStateWithMode()?.max_concurrent_jobs).toBe(4);
+  autopilotModeEvent("armed");
+  drainAll();
+  const row = getAutopilotStateWithMode();
+  expect(row?.mode).toBe("armed"); // mode flip landed
+  expect(row?.paused).toBe(0); // paused PRESERVED
+  expect(row?.max_concurrent_jobs).toBe(4); // cap PRESERVED
+});
+
+test("sibling folds (paused / cap) preserve mode on conflict (fn-751)", () => {
+  // Set mode armed, then a pause toggle + a cap re-arm — neither sibling UPSERT
+  // may clobber the live mode.
+  autopilotModeEvent("armed");
+  drainAll();
+  expect(getAutopilotStateWithMode()?.mode).toBe("armed");
+  autopilotPausedEvent(true);
+  drainAll();
+  expect(getAutopilotStateWithMode()?.mode).toBe("armed"); // preserved by paused fold
+  autopilotCapSetEvent(2);
+  drainAll();
+  expect(getAutopilotStateWithMode()?.mode).toBe("armed"); // preserved by cap fold
+});
+
+test("AutopilotMode UPSERT preserves created_at across a mode flip (fn-751)", () => {
+  const firstId = autopilotModeEvent("yolo");
+  drainAll();
+  const createdAt = getAutopilotStateWithMode()?.created_at;
+  expect(createdAt).not.toBeUndefined();
+  const secondId = autopilotModeEvent("armed");
+  drainAll();
+  const after = getAutopilotStateWithMode();
+  expect(after?.mode).toBe("armed");
+  expect(after?.last_event_id).toBe(secondId);
+  expect(after?.last_event_id).toBeGreaterThan(firstId);
+  expect(after?.created_at).toBe(createdAt as number); // created_at PRESERVED
+});
+
+test("AutopilotMode with a malformed/unknown-enum payload is a safe no-op (fn-751)", () => {
+  // Seed a known mode first so we can assert it is UNCHANGED by the bad folds.
+  autopilotModeEvent("armed");
+  drainAll();
+  expect(getAutopilotStateWithMode()?.mode).toBe("armed");
+  const malformed = [
+    { data: "{ not json" },
+    { data: JSON.stringify({}) }, // missing mode
+    { data: JSON.stringify({ mode: "turbo" }) }, // unknown enum
+    { data: JSON.stringify({ mode: 1 }) }, // non-string
+    { data: JSON.stringify({ mode: null }) }, // null
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: "AutopilotMode",
+      session_id: "autopilot",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  expect(getAutopilotStateWithMode()?.mode).toBe("armed"); // UNCHANGED
+  expect(getCursor()).toBe(lastId); // cursor still advances
+});
+
+test("EpicArmed armed:true INSERTs a presence row; armed:false DELETEs it (fn-751)", () => {
+  const armId = epicArmedEvent("fn-10-foo", true);
+  expect(drainAll()).toBe(1);
+  let rows = getArmedEpics();
+  expect(rows.length).toBe(1);
+  expect(rows[0]?.epic_id).toBe("fn-10-foo");
+  expect(rows[0]?.last_event_id).toBe(armId);
+  expect(getCursor()).toBe(armId);
+
+  // Disarm DELETEs the row.
+  const disarmId = epicArmedEvent("fn-10-foo", false);
+  drainAll();
+  rows = getArmedEpics();
+  expect(rows.length).toBe(0);
+  expect(getCursor()).toBe(disarmId);
+});
+
+test("EpicArmed tracks multiple epics independently as a presence set (fn-751)", () => {
+  epicArmedEvent("fn-10-foo", true);
+  epicArmedEvent("fn-11-bar", true);
+  epicArmedEvent("fn-12-baz", true);
+  drainAll();
+  expect(getArmedEpics().map((r) => r.epic_id)).toEqual([
+    "fn-10-foo",
+    "fn-11-bar",
+    "fn-12-baz",
+  ]);
+  // Disarm only the middle one — the other two stay armed.
+  epicArmedEvent("fn-11-bar", false);
+  drainAll();
+  expect(getArmedEpics().map((r) => r.epic_id)).toEqual([
+    "fn-10-foo",
+    "fn-12-baz",
+  ]);
+});
+
+test("EpicArmed armed:false on an unarmed epic is a harmless no-op (fn-751)", () => {
+  const id = epicArmedEvent("fn-99-never-armed", false);
+  expect(drainAll()).toBe(1);
+  expect(getArmedEpics().length).toBe(0);
+  expect(getCursor()).toBe(id); // cursor advances on the no-op DELETE
+});
+
+test("EpicArmed with a malformed payload is a safe no-op (cursor still advances) (fn-751)", () => {
+  const malformed = [
+    { data: "{ not json" },
+    { data: JSON.stringify({}) }, // missing both fields
+    { data: JSON.stringify({ epic_id: "fn-1-x" }) }, // missing armed
+    { data: JSON.stringify({ armed: true }) }, // missing epic_id
+    { data: JSON.stringify({ epic_id: "", armed: true }) }, // empty epic_id
+    { data: JSON.stringify({ epic_id: "fn-1-x", armed: "true" }) }, // non-boolean
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: "EpicArmed",
+      session_id: "autopilot",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  expect(getArmedEpics().length).toBe(0);
+  expect(getCursor()).toBe(lastId);
+});
+
+test("from-scratch re-fold reproduces autopilot_state + armed_epics byte-identically (fn-751)", () => {
+  // Mixed sequence across all four event kinds: boot pause+cap+mode re-arm,
+  // steady-state mode flip, and a series of arm/disarm events that exercise
+  // the presence-table INSERT/REPLACE/DELETE paths.
+  autopilotPausedEvent(true);
+  autopilotCapSetEvent(3);
+  autopilotModeEvent("armed");
+  autopilotModeEvent("yolo");
+  autopilotModeEvent("armed");
+  epicArmedEvent("fn-10-foo", true);
+  epicArmedEvent("fn-11-bar", true);
+  epicArmedEvent("fn-10-foo", false); // disarm
+  epicArmedEvent("fn-12-baz", true);
+  epicArmedEvent("fn-11-bar", true); // re-arm of an already-armed epic
+  drainAll();
+  const stateBefore = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  const armedBefore = db
+    .query("SELECT * FROM armed_epics ORDER BY epic_id ASC")
+    .all();
+  // Sanity: final state.
+  expect(getAutopilotStateWithMode()?.mode).toBe("armed");
+  expect(getArmedEpics().map((r) => r.epic_id)).toEqual([
+    "fn-11-bar",
+    "fn-12-baz",
+  ]);
+  // Rewind + wipe BOTH projection tables (armed_epics MUST join the DELETE
+  // list) + re-drain → byte-identical rows.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM autopilot_state");
+  db.run("DELETE FROM armed_epics");
+  drainAll();
+  const stateAfter = db
+    .query("SELECT * FROM autopilot_state ORDER BY id ASC")
+    .all();
+  const armedAfter = db
+    .query("SELECT * FROM armed_epics ORDER BY epic_id ASC")
+    .all();
+  expect(stateAfter).toEqual(stateBefore);
+  expect(armedAfter).toEqual(armedBefore);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v46 / fn-666 — planctl-file attribution mint
 // ---------------------------------------------------------------------------
 

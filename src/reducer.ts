@@ -4069,6 +4069,174 @@ function foldAutopilotCapSet(db: Database, event: Event): void {
 }
 
 /**
+ * `AutopilotMode` synthetic-event payload (fn-751) — the explicit autopilot
+ * mode enum that rides the SAME singleton `autopilot_state` row as `paused`
+ * and `max_concurrent_jobs`. `yolo` (the backward-compatible default) works
+ * every ready epic; `armed` works ONLY explicitly-armed epics plus their
+ * transitive upstream dep-closure.
+ *
+ * `mode`: a literal `"yolo" | "armed"` enum. Like {@link AutopilotPausedPayload}
+ * (and unlike the null-tolerant cap), a typed value-carrying event rather than
+ * a generic `SettingChanged{key,value}` so the per-knob enum invariant stays
+ * co-located and validatable.
+ */
+interface AutopilotModePayload {
+  mode: "yolo" | "armed";
+}
+
+/**
+ * Parse an `AutopilotMode` event payload. Returns null on any structural miss
+ * OR an unknown enum value — {@link foldAutopilotMode} folds null to a safe
+ * no-op (cursor still advances; `mode` unchanged). STRICT, mirroring
+ * {@link extractAutopilotPausedPayload}: `mode` MUST be exactly `"yolo"` or
+ * `"armed"`. We do NOT coerce or guess — the only legal producers are main's
+ * `set_autopilot_mode` bridge and the daemon's boot-append, both of which emit
+ * a literal enum member. Any other shape signals a corrupted producer and
+ * folds to a safe no-op rather than a guessed mode. NEVER throws (a throw
+ * inside the fold rolls back the cursor and wedges the reducer).
+ */
+function extractAutopilotModePayload(
+  event: Event,
+): AutopilotModePayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<AutopilotModePayload>;
+    if (parsed.mode !== "yolo" && parsed.mode !== "armed") {
+      return null;
+    }
+    return { mode: parsed.mode };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse AutopilotMode payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `AutopilotMode` event (fn-751). UPSERT on the singleton
+ * `id = 1`, setting ONLY `mode` and PRESERVING `paused` + `max_concurrent_jobs`
+ * on conflict — the three arms ({@link foldAutopilotPaused},
+ * {@link foldAutopilotCapSet}, this) share `id = 1`, so each MUST preserve the
+ * others' columns or a write clobbers a sibling.
+ *
+ * The INSERT path (first-ever event on a fresh row) binds defaults for the
+ * other NOT NULL columns — `paused = 1` (autopilot's boots-paused contract,
+ * matching {@link foldAutopilotCapSet}'s INSERT default) and leaves
+ * `max_concurrent_jobs` to its column default (NULL = unlimited). In practice
+ * the daemon's boot-append orders `AutopilotPaused` FIRST, so this arm always
+ * hits the CONFLICT branch; the INSERT defaults are a defensive fallback for a
+ * log whose first autopilot_state event is a mode set (re-fold over such a log
+ * still converges: paused boots true).
+ *
+ * Pure function of the event payload + persisted row — no `Date.now()`, no env
+ * read. Runs INSIDE the open `BEGIN IMMEDIATE` transaction; performs zero
+ * cursor work. Malformed/unknown-enum payload → safe no-op (mode unchanged),
+ * never a throw — the cursor still advances.
+ */
+function foldAutopilotMode(db: Database, event: Event): void {
+  const payload = extractAutopilotModePayload(event);
+  if (payload == null) {
+    return;
+  }
+  db.run(
+    `INSERT INTO autopilot_state (
+       id, paused, last_event_id, created_at, updated_at, mode
+     ) VALUES (1, 1, ?, ?, ?, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       mode = excluded.mode,
+       last_event_id = excluded.last_event_id,
+       -- paused + max_concurrent_jobs NOT touched here: shared singleton row
+       -- with foldAutopilotPaused / foldAutopilotCapSet — a mode flip MUST
+       -- preserve the live pause/play flag and the concurrency cap. created_at
+       -- preserved (first-observation "since").
+       updated_at = excluded.updated_at`,
+    [event.id, event.ts, event.ts, payload.mode],
+  );
+}
+
+/**
+ * `EpicArmed` synthetic-event payload (fn-751) — the per-epic armed flag that
+ * folds into the `armed_epics` PRESENCE table (its OWN `event_type`, since
+ * `armed_epics` is a separate per-row table from the `autopilot_state`
+ * singleton). `armed:true` arms the epic (row PRESENT); `armed:false` disarms
+ * it (row ABSENT).
+ *
+ * `epic_id`: a non-empty string. `armed`: a literal boolean (strict, mirroring
+ * the paused extractor — no coercion).
+ */
+interface EpicArmedPayload {
+  epic_id: string;
+  armed: boolean;
+}
+
+/**
+ * Parse an `EpicArmed` event payload. Returns null on any structural miss —
+ * {@link foldEpicArmed} folds null to a safe no-op (cursor still advances).
+ * STRICT: `epic_id` MUST be a non-empty string and `armed` MUST be a literal
+ * boolean. NEVER throws (a throw inside the fold wedges the reducer).
+ */
+function extractEpicArmedPayload(event: Event): EpicArmedPayload | null {
+  if (event.data == null || event.data.length === 0) {
+    return null;
+  }
+  try {
+    const parsed = JSON.parse(event.data) as Partial<EpicArmedPayload>;
+    if (
+      typeof parsed.epic_id !== "string" ||
+      parsed.epic_id.length === 0 ||
+      typeof parsed.armed !== "boolean"
+    ) {
+      return null;
+    }
+    return { epic_id: parsed.epic_id, armed: parsed.armed };
+  } catch (err) {
+    console.error(
+      `keeper reducer: failed to parse EpicArmed payload for event id=${event.id} session=${event.session_id}: ${err}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Fold one synthetic `EpicArmed` event (fn-751). `armed_epics` is a PRESENCE
+ * table: a row's presence means the epic is armed, its absence means it is not.
+ * `armed:true` → INSERT OR REPLACE the row (stamped `last_event_id` /
+ * `created_at` / `updated_at` from the event); `armed:false` → DELETE the row.
+ *
+ * INSERT OR REPLACE (not UPSERT-preserving-created_at) is deliberate: a disarm
+ * DELETEs the row, so a subsequent re-arm has no prior `created_at` to preserve
+ * — the row's "since" is correctly the most-recent arm. A re-arm of an
+ * already-armed epic (no intervening disarm) re-stamps `created_at` to the
+ * latest arm event; this is re-fold-deterministic (a from-scratch re-drain
+ * reproduces the same final stamp) and the table is a presence flag, not an
+ * audit log, so the re-stamp is semantically fine.
+ *
+ * Pure function of the event payload — no `Date.now()`, no env read. Runs
+ * INSIDE the open `BEGIN IMMEDIATE` transaction; performs zero cursor work.
+ * Malformed payload → safe no-op (no row change), never a throw — the cursor
+ * still advances.
+ */
+function foldEpicArmed(db: Database, event: Event): void {
+  const payload = extractEpicArmedPayload(event);
+  if (payload == null) {
+    return;
+  }
+  if (payload.armed) {
+    db.run(
+      `INSERT OR REPLACE INTO armed_epics (
+         epic_id, last_event_id, created_at, updated_at
+       ) VALUES (?, ?, ?, ?)`,
+      [payload.epic_id, event.id, event.ts, event.ts],
+    );
+  } else {
+    db.run("DELETE FROM armed_epics WHERE epic_id = ?", [payload.epic_id]);
+  }
+}
+
+/**
  * Sweep open `status='running'` subagent_invocations rows for a job to
  * `status='unknown'` in a single bulk UPDATE. Called from the SessionEnd and
  * Killed arms of {@link projectJobsRow} on the proven write path (after the
@@ -8068,6 +8236,10 @@ export function applyEvent(
       foldAutopilotPaused(db, event);
     } else if (event.hook_event === "AutopilotCapSet") {
       foldAutopilotCapSet(db, event);
+    } else if (event.hook_event === "AutopilotMode") {
+      foldAutopilotMode(db, event);
+    } else if (event.hook_event === "EpicArmed") {
+      foldEpicArmed(db, event);
     } else if (event.hook_event === "BackendExecSnapshot") {
       // retired fn-684 — fold to no-op so historical events advance the
       // cursor without touching the jobs projection. MUST stay an explicit
