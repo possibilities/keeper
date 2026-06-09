@@ -54,5 +54,5 @@ Render and dry-run against the live `performance` backlog (read-only re-verify; 
 - [ ] Missing-home and empty-backlog cases handled gracefully; no scanner re-run
 
 ## Done summary
-
+Added /babysit <slug> command (arthack: claude/arthack/template/commands/babysit.md.tmpl) — human-invoke-only, disable-model-invocation. One round: reads followups with three-shape key extraction, left-anti-joins processed.jsonl with the resurface rule, dedups by category+key (never across severity), re-verifies each cluster against HEAD via git/keeper/planctl + read-only seen.json staleness (no scanner re-run), ranks by confidence x severity x staleness with a 5-10 cluster cap, writes rounds/<ts>.md tmp-then-rename, appends verdict rows (incl. routed+resolved_ref), proposes charter heuristics as a human-gated diff, routes survivors to commit//sketch//plan:plan. Untrusted-data + human-gated-charter + missing-home + empty-backlog handled. Dry-run validated against the 258 live performance followups (7 frontmatter / 250 fence / 1 filename-fallback keys).
 ## Evidence
