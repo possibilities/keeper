@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "lift-aware staleness + limited line",
-  "updated_at": "2026-06-09T14:36:43.066735Z"
+  "updated_at": "2026-06-09T14:47:20.450215Z",
+  "worker_done_at": "2026-06-09T14:47:20.450215Z"
 }

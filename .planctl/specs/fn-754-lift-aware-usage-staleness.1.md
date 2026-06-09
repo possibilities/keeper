@@ -109,5 +109,5 @@ reducer, or agentuse change. `rate_limit_lifts_at` / `week_resets_at` /
 - [ ] `bun test test/usage.test.ts` and `bun run lint` pass.
 
 ## Done summary
-
+Made keeper usage staleness lift-aware (anchor max(last_usage_fold_at, rate_limit_lifts_at)) and relabeled the rate-limited line to 'limited', gated on the future lift itself so a depleted-but-quiet profile surfaces 'limited lifts in <rel>' instead of '—' + stale.
 ## Evidence
