@@ -803,6 +803,31 @@ def resolve_task_cmd(task_id, project):
     return _lazy_import("planctl.run_resolve_task")(task_id=task_id, project=project)
 
 
+@cli.command("reconcile")
+@click.argument("task_id")
+@click.option(
+    "--project",
+    default=None,
+    help=(
+        "Project path to resolve the task in, bypassing roots discovery. "
+        "Use this for tasks in projects outside the configured roots, or to "
+        "disambiguate an AMBIGUOUS_TASK_ID."
+    ),
+)
+def reconcile_cmd(task_id, project):
+    """Read-only post-worker verdict — collapse reconciliation into one switch.
+
+    The /plan:work orchestrator's post-worker keystone: returns a typed verdict
+    (done | in_progress_committed | in_progress_uncommitted | blocked |
+    state_uncommitted | not_started | tooling_error) computed entirely from
+    planctl-native data — merged status, trailer-authentic source commits,
+    HEAD-visibility of the committed task JSON, and an epic tally. No keeper
+    call, no mutation, no commit. Cwd-agnostic (scans configured roots); pass
+    --project to disambiguate an AMBIGUOUS_TASK_ID.
+    """
+    return _lazy_import("planctl.run_reconcile")(task_id=task_id, project=project)
+
+
 @cli.command("done")
 @click.argument("task_id")
 @click.option("--summary", default=None, help="Completion summary text")
