@@ -122,6 +122,7 @@ import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
+import { computeEligibleEpics } from "./armed-closure";
 import {
   BackstopCounters,
   type BackstopMessage,
@@ -610,6 +611,24 @@ export interface ReconcileSnapshot {
    * (same-key dedup vs cross-sibling demotion — see that field's doc).
    */
   pendingDispatches: PendingDispatch[];
+  /**
+   * fn-751 — the autopilot mode enum, read fresh from the `autopilot_state`
+   * singleton each cycle (NOT threaded through `workerData`, NOT cached on
+   * `ReconcileState` — the projection is the single source of truth and
+   * survives a daemon restart for free). `'yolo'` (the default on a
+   * zero-event / pre-existing row) works every ready epic — byte-for-byte the
+   * pre-fn-751 behavior; `'armed'` gates `work` to {@link armedIds} plus their
+   * transitive upstream dep-closure.
+   */
+  mode: "yolo" | "armed";
+  /**
+   * fn-751 — the explicitly-armed epic ids, read fresh from the `armed_epics`
+   * presence projection each cycle. Empty in `yolo` mode (the arm is a no-op
+   * there) and whenever no epic is armed. In `armed` mode `reconcile` expands
+   * this into the eligible set (armed ∪ transitive upstreams) via
+   * {@link computeEligibleEpics} and suppresses `work` for any epic outside it.
+   */
+  armedIds: Set<string>;
 }
 
 /**
@@ -1240,6 +1259,27 @@ export function reconcile(
   let budget =
     cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - occupied);
 
+  // fn-751 — the armed-mode eligibility gate. In `armed` mode `work` is
+  // dispatched ONLY for explicitly-armed epics PLUS their transitive upstream
+  // dep-closure; everything else is suppressed. Compute the eligible set ONCE
+  // per cycle here (recomputed every cycle — caching would reintroduce
+  // staleness when the DAG shifts) by expanding `snapshot.armedIds` over the
+  // reversed dep edges. In `yolo` mode the arm is a no-op and we skip the
+  // closure entirely. `armedMode` gates the per-row checks below; `eligible`
+  // is consulted only when it is true.
+  //
+  // WORK-ONLY: the arm gates `work` launches alone. `approve` / `close`
+  // finalizers and completion-reap stay mode-exempt (mirroring how `approve`
+  // is already budget-exempt) so disarming an epic mid-flight still finishes
+  // and reaps cleanly rather than orphaning a live worker or leaking surfaces.
+  const armedMode = snapshot.mode === "armed";
+  const eligible: Set<string> = armedMode
+    ? computeEligibleEpics(
+        snapshot.armedIds,
+        new Map(snapshot.epics.map((e) => [e.epic_id, e])),
+      )
+    : new Set<string>();
+
   // Walk every row. For each (kind, id), compute the wanted verb and
   // record whichever launches survive suppression.
   for (const epic of snapshot.epics) {
@@ -1253,6 +1293,15 @@ export function reconcile(
       }
       const key = dispatchKey(verb, taskId);
       if (state.paused) {
+        continue;
+      }
+      // fn-751 — armed-mode gate. Suppress a `work` launch for an epic NOT in
+      // the eligible set (armed ∪ transitive upstreams). Placed ABOVE the
+      // budget gate so a non-eligible epic never consumes `max_concurrent_jobs`
+      // budget. WORK-ONLY: `approve` on a task row is mode-exempt (mirrors the
+      // close-row finalizer exemption) so a disarmed-but-in-flight epic still
+      // approves its tasks. No-op in `yolo` mode (`armedMode === false`).
+      if (armedMode && verb === "work" && !eligible.has(epic.epic_id)) {
         continue;
       }
       if (state.inFlight.has(key)) {
@@ -1897,6 +1946,24 @@ async function loadReconcileSnapshot(
   }
   const pendingDispatches = projectPendingDispatches(pendingRows);
 
+  // fn-751 — read the autopilot `mode` from the `autopilot_state` singleton
+  // and the explicitly-armed id set from the `armed_epics` presence
+  // projection. PROJECTION-PULL only (no `workerData`, no `ReconcileState`
+  // cache) so the gate survives a daemon restart and there is one source of
+  // truth. A missing / malformed `mode` scalar defaults to `'yolo'` (the
+  // work-everything baseline, matching the column's `DEFAULT 'yolo'`).
+  const autopilotRows = read("autopilot_state");
+  const modeRaw = (autopilotRows[0] as { mode?: unknown } | undefined)?.mode;
+  const mode: "yolo" | "armed" = modeRaw === "armed" ? "armed" : "yolo";
+
+  const armedIds = new Set<string>();
+  for (const row of read("armed_epics")) {
+    const epicId = (row as { epic_id?: unknown }).epic_id;
+    if (typeof epicId === "string") {
+      armedIds.add(epicId);
+    }
+  }
+
   return {
     epics,
     jobs,
@@ -1905,6 +1972,8 @@ async function loadReconcileSnapshot(
     failedKeys,
     liveTabKeys,
     pendingDispatches,
+    mode,
+    armedIds,
   };
 }
 

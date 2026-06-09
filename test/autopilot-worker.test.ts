@@ -28,6 +28,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { computeEligibleEpics } from "../src/armed-closure";
 import {
   buildLaunchArgv,
   buildWorkerCommand,
@@ -65,7 +66,13 @@ import {
   type Verdict,
 } from "../src/readiness";
 import { projectPendingDispatches } from "../src/readiness-client";
-import type { EmbeddedJob, Epic, Job, Task } from "../src/types";
+import type {
+  EmbeddedJob,
+  Epic,
+  Job,
+  ResolvedEpicDep,
+  Task,
+} from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Fixture helpers (same shape as test/autopilot.test.ts)
@@ -153,6 +160,11 @@ function makeSnapshot(
     // `dispatch-pending` occupant. Default empty; tests that exercise the
     // occupant override it.
     pendingDispatches: [],
+    // fn-751: autopilot mode + armed set. Default `yolo` / empty so every
+    // pre-fn-751 test sees byte-for-byte identical dispatch behavior; the
+    // armed-mode tests override these.
+    mode: "yolo",
+    armedIds: new Set(),
     ...overrides,
   };
 }
@@ -2614,4 +2626,319 @@ test("reconcile: a non-completed task id is NOT in completedRowIds", () => {
   const snap = makeSnapshot({ epics: [epic] });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.completedRowIds.has("fn-1-foo.1")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-751 — computeEligibleEpics (armed-mode transitive upstream closure)
+// ---------------------------------------------------------------------------
+
+/** Build a `resolved_epic_deps` entry pointing at `resolvedId` (null=dangling). */
+function makeDep(resolvedId: string | null): ResolvedEpicDep {
+  return {
+    dep_token: resolvedId ?? "dangling-token",
+    resolved_epic_id: resolvedId,
+    epic_number: null,
+    project_basename: null,
+    cross_project: false,
+    state: resolvedId === null ? "dangling" : "blocked-incomplete",
+  };
+}
+
+/** Index a list of epics by `epic_id` (the snapshot lookup the helper takes). */
+function indexEpics(epics: Epic[]): Map<string, Epic> {
+  return new Map(epics.map((e) => [e.epic_id, e]));
+}
+
+test("computeEligibleEpics: single armed epic with no deps → {itself}", () => {
+  const a = makeEpic({ epic_id: "fn-1-a", resolved_epic_deps: [] });
+  const eligible = computeEligibleEpics(new Set(["fn-1-a"]), indexEpics([a]));
+  expect([...eligible].sort()).toEqual(["fn-1-a"]);
+});
+
+test("computeEligibleEpics: armed B depends on unarmed A → {A, B}", () => {
+  const a = makeEpic({ epic_id: "fn-1-a", resolved_epic_deps: [] });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    resolved_epic_deps: [makeDep("fn-1-a")],
+  });
+  const eligible = computeEligibleEpics(
+    new Set(["fn-2-b"]),
+    indexEpics([a, b]),
+  );
+  expect([...eligible].sort()).toEqual(["fn-1-a", "fn-2-b"]);
+});
+
+test("computeEligibleEpics: deep chain C→B→A pulls the whole upstream", () => {
+  const a = makeEpic({ epic_id: "fn-1-a", resolved_epic_deps: [] });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    resolved_epic_deps: [makeDep("fn-1-a")],
+  });
+  const c = makeEpic({
+    epic_id: "fn-3-c",
+    resolved_epic_deps: [makeDep("fn-2-b")],
+  });
+  const eligible = computeEligibleEpics(
+    new Set(["fn-3-c"]),
+    indexEpics([a, b, c]),
+  );
+  expect([...eligible].sort()).toEqual(["fn-1-a", "fn-2-b", "fn-3-c"]);
+});
+
+test("computeEligibleEpics: cyclic deps terminate with the cycle members", () => {
+  // A ↔ B (each depends on the other) — a user-authored cycle must not hang.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    resolved_epic_deps: [makeDep("fn-2-b")],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    resolved_epic_deps: [makeDep("fn-1-a")],
+  });
+  const eligible = computeEligibleEpics(
+    new Set(["fn-1-a"]),
+    indexEpics([a, b]),
+  );
+  expect([...eligible].sort()).toEqual(["fn-1-a", "fn-2-b"]);
+});
+
+test("computeEligibleEpics: dangling (null) upstream is skipped, no throw", () => {
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    resolved_epic_deps: [makeDep(null)],
+  });
+  const eligible = computeEligibleEpics(new Set(["fn-2-b"]), indexEpics([b]));
+  expect([...eligible].sort()).toEqual(["fn-2-b"]);
+});
+
+test("computeEligibleEpics: absent (unfolded) upstream id is skipped, no throw", () => {
+  // B depends on fn-9-x, which is NOT in the lookup (stale/unfolded).
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    resolved_epic_deps: [makeDep("fn-9-x")],
+  });
+  const eligible = computeEligibleEpics(new Set(["fn-2-b"]), indexEpics([b]));
+  expect([...eligible].sort()).toEqual(["fn-2-b"]);
+});
+
+test("computeEligibleEpics: null resolved_epic_deps array → no edges, no throw", () => {
+  const a = makeEpic({ epic_id: "fn-1-a", resolved_epic_deps: null });
+  const eligible = computeEligibleEpics(new Set(["fn-1-a"]), indexEpics([a]));
+  expect([...eligible].sort()).toEqual(["fn-1-a"]);
+});
+
+test("computeEligibleEpics: cross-project upstream is included (no special-casing)", () => {
+  const upstream = makeEpic({
+    epic_id: "fn-1-other",
+    project_dir: "/other-repo",
+    resolved_epic_deps: [],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo",
+    resolved_epic_deps: [{ ...makeDep("fn-1-other"), cross_project: true }],
+  });
+  const eligible = computeEligibleEpics(
+    new Set(["fn-2-b"]),
+    indexEpics([upstream, b]),
+  );
+  expect([...eligible].sort()).toEqual(["fn-1-other", "fn-2-b"]);
+});
+
+test("computeEligibleEpics: empty armed set → empty result", () => {
+  const a = makeEpic({ epic_id: "fn-1-a", resolved_epic_deps: [] });
+  const eligible = computeEligibleEpics(new Set(), indexEpics([a]));
+  expect(eligible.size).toBe(0);
+});
+
+test("computeEligibleEpics: armed id absent from lookup is still in the set", () => {
+  // An armed id whose epic hasn't folded yet is eligible via its own
+  // membership (we just can't walk its deps).
+  const eligible = computeEligibleEpics(new Set(["fn-9-ghost"]), new Map());
+  expect([...eligible]).toEqual(["fn-9-ghost"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-751 — reconcile armed-mode dispatch gating
+// ---------------------------------------------------------------------------
+
+test("reconcile armed: dispatches work only for the eligible set", () => {
+  // Armed B (depends on A); C is unarmed and not in B's closure. Distinct
+  // project dirs so the single-task-per-root mutex doesn't collapse them.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo-a",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" })],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo-b",
+    resolved_epic_deps: [makeDep("fn-1-a")],
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const c = makeEpic({
+    epic_id: "fn-3-c",
+    project_dir: "/repo-c",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-3-c.1", epic_id: "fn-3-c" })],
+  });
+  const snap = makeSnapshot({
+    epics: [a, b, c],
+    mode: "armed",
+    armedIds: new Set(["fn-2-b"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workIds = decision.launches
+    .filter((p) => p.verb === "work")
+    .map((p) => p.id)
+    .sort();
+  // A (B's upstream) is eligible and ready → worked. B is eligible too but
+  // readiness dep-blocks it until A is done+approved (the closure's whole
+  // point — pull the prerequisite in so it CAN be worked). C (non-eligible)
+  // is suppressed by the MODE arm, not readiness.
+  expect(workIds).toEqual(["fn-1-a.1"]);
+  // Prove C's absence is the MODE arm, not readiness: the SAME fixture in
+  // yolo mode works both A and C (C has no deps, so it's ready).
+  const yoloIds = reconcile(
+    makeSnapshot({ epics: [a, b, c], mode: "yolo", armedIds: new Set() }),
+    makeState(),
+    0,
+  )
+    .launches.filter((p) => p.verb === "work")
+    .map((p) => p.id)
+    .sort();
+  expect(yoloIds).toEqual(["fn-1-a.1", "fn-3-c.1"]);
+});
+
+test("reconcile armed: an armed epic's unarmed upstream still gets worked", () => {
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo-a",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" })],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo-b",
+    resolved_epic_deps: [makeDep("fn-1-a")],
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const snap = makeSnapshot({
+    epics: [a, b],
+    mode: "armed",
+    armedIds: new Set(["fn-2-b"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workA = decision.launches.find((p) => p.id === "fn-1-a.1");
+  expect(workA?.verb).toBe("work");
+});
+
+test("reconcile armed: non-eligible epic does NOT decrement budget", () => {
+  // cap=1; an armed eligible epic and a non-eligible epic both have a ready
+  // task. The non-eligible task must be suppressed ABOVE the budget gate, so
+  // the eligible task still gets the single slot.
+  const armed = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo-b",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const other = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo-a",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" })],
+  });
+  // `other` sorts first in the epic list — if the suppression were BELOW the
+  // budget gate it would consume the single slot and starve the armed epic.
+  const snap = makeSnapshot({
+    epics: [other, armed],
+    mode: "armed",
+    armedIds: new Set(["fn-2-b"]),
+  });
+  const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
+  const workIds = decision.launches
+    .filter((p) => p.verb === "work")
+    .map((p) => p.id);
+  expect(workIds).toEqual(["fn-2-b.1"]);
+});
+
+test("reconcile armed: approve fires for a disarmed-but-in-flight epic's task", () => {
+  // A task that is done+pending-approval maps to `approve`, a finalizer that
+  // is mode-exempt — so a NON-eligible epic still gets its task approved.
+  const epic = makeEpic({
+    epic_id: "fn-5-disarmed",
+    resolved_epic_deps: [],
+    tasks: [
+      makeTask({
+        task_id: "fn-5-disarmed.1",
+        epic_id: "fn-5-disarmed",
+        worker_phase: "done",
+        runtime_status: "done",
+        approval: "pending",
+      }),
+    ],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    mode: "armed",
+    armedIds: new Set(), // nothing armed → epic is NOT eligible
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const approvePlan = decision.launches.find((p) => p.id === "fn-5-disarmed.1");
+  expect(approvePlan?.verb).toBe("approve");
+});
+
+test("reconcile armed: close fires for a disarmed-but-in-flight epic", () => {
+  // All tasks completed + epic not yet done → close-row is ready and maps to
+  // `close`, a mode-exempt finalizer. A non-eligible epic still gets closed.
+  const completedTask = makeTask({
+    task_id: "fn-5-disarmed.1",
+    epic_id: "fn-5-disarmed",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic = makeEpic({
+    epic_id: "fn-5-disarmed",
+    resolved_epic_deps: [],
+    tasks: [completedTask],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    mode: "armed",
+    armedIds: new Set(), // not eligible
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const closePlan = decision.launches.find((p) => p.verb === "close");
+  expect(closePlan).not.toBeUndefined();
+  expect(closePlan?.id).toBe("fn-5-disarmed");
+});
+
+test("reconcile yolo: dispatch is unchanged (mode arm is a no-op)", () => {
+  // Identical fixture to the armed test, but mode=yolo (default). Even though
+  // nothing is armed, EVERY ready task is worked — byte-for-byte pre-fn-751.
+  const a = makeEpic({
+    epic_id: "fn-1-a",
+    project_dir: "/repo-a",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-1-a.1", epic_id: "fn-1-a" })],
+  });
+  const b = makeEpic({
+    epic_id: "fn-2-b",
+    project_dir: "/repo-b",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-2-b.1", epic_id: "fn-2-b" })],
+  });
+  const snap = makeSnapshot({
+    epics: [a, b],
+    mode: "yolo",
+    armedIds: new Set(), // ignored in yolo
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workIds = decision.launches
+    .filter((p) => p.verb === "work")
+    .map((p) => p.id)
+    .sort();
+  expect(workIds).toEqual(["fn-1-a.1", "fn-2-b.1"]);
 });
