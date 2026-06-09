@@ -1444,6 +1444,34 @@ export class PlanScanner {
       return false;
     }
 
+    // fn-759: the cheap in-memory change-gate runs BEFORE the fn-629 in-HEAD
+    // probe. For ~99% of scans (unchanged files re-read by the 5s heartbeat /
+    // boot / drop-rescan) `lastEmitted` already holds the identical
+    // serialization, so we suppress here and NEVER fork the `git cat-file -e`
+    // probe — eliminating the per-scan subprocess storm (~1.7M forks/day) that
+    // starved the realtime plan pipeline. macOS spawn is ~2-5ms; this compare
+    // is nanoseconds.
+    //
+    // Accepted semantic shift (the ONE behavior change): in-HEAD-ness is
+    // re-verified only when content changes. An unchanged file's HEAD-membership
+    // regression (e.g. a branch switch that drops the file from HEAD without
+    // touching its bytes) has no observable effect — the change-gate suppresses
+    // re-emits regardless, so we'd emit nothing either way.
+    const serialized = JSON.stringify(msg);
+    if (this.lastEmitted.get(msg.id) === serialized) {
+      // Unchanged snapshot: suppress with NO probe and NO pending mutation.
+      // `pathToId.set` is REQUIRED on this branch — boot seeds `lastEmitted`
+      // from the projection but leaves `pathToId` empty (the boot-seed
+      // asymmetry), and delete-tombstone routing in {@link onDelete} keys off
+      // `pathToId`. Without this set, a boot-seeded entity whose file is later
+      // deleted would leave a permanent projection ghost (no tombstone). We do
+      // NOT call deletePending here — fail-closed: an unchanged path cannot
+      // legitimately be pending, because the fn-629 gate means an uncommitted
+      // path never earned a `lastEmitted` entry to match against.
+      this.pathToId.set(path, msg.id);
+      return false; // change-gate: unchanged snapshot, suppress.
+    }
+
     // Observation gate (fn-629): for epic/task DEFINITION files, suppress
     // emission unless the file is in git HEAD. An uncommitted file goes to
     // {@link pending}; the worker drains the set on the next git-worker
@@ -1461,6 +1489,8 @@ export class PlanScanner {
     // fail-closed timeout) is the silent-bounce-to-pending bug this epic
     // fixes. A bounce on the commit path is now impossible by construction;
     // only the genuinely-uncertain FSEvents/recheck paths reach `isTracked`.
+    // The `triggeredByCommit` bypass still flows through the change-gate above,
+    // so a commit re-ingest of an unchanged file suppresses cheaply too.
     //
     // We do NOT touch `pathToId` / `lastEmitted` for a gated path: the
     // reducer never saw the entity, so there is nothing to retract on a
@@ -1478,15 +1508,11 @@ export class PlanScanner {
       return false;
     }
     // The file IS in HEAD now (or the gate is disabled, or this is a
-    // commit-driven bypass). If this path was previously pending, drop it
-    // from the set — it has now drained.
+    // commit-driven bypass) AND its content changed. If this path was
+    // previously pending, drop it from the set — it has now drained.
     this.deletePending(path);
 
     this.pathToId.set(path, msg.id);
-    const serialized = JSON.stringify(msg);
-    if (this.lastEmitted.get(msg.id) === serialized) {
-      return false; // change-gate: unchanged snapshot, suppress.
-    }
     this.lastEmitted.set(msg.id, serialized);
     this.onSnapshot(msg);
     return true;

@@ -1746,6 +1746,171 @@ test("onChange: uncommitted task file is gated; commit drains it via recheckPend
   expect(scanner.pendingSize()).toBe(0);
 });
 
+// ---------------------------------------------------------------------------
+// fn-759: the cheap change-gate runs BEFORE the fn-629 in-HEAD probe, so an
+// unchanged re-scan never forks `git cat-file -e`. These cases spy on the
+// injected `isTracked` predicate (3rd ctor arg) to PIN that the probe fires
+// only on changed / first-seen snapshots, without weakening the gate
+// bookkeeping invariants (plan-worker.ts onChange doc block).
+// ---------------------------------------------------------------------------
+
+test("fn-759: unchanged re-scan calls isTracked zero times and emits nothing", () => {
+  const emitted: PlanMessage[] = [];
+  const probed: string[] = [];
+  // A committed-everywhere spy: tracks every probe but always returns true so
+  // the first emit lands; the SECOND (unchanged) scan must not reach it.
+  const isTracked = (path: string): boolean => {
+    probed.push(path);
+    return true;
+  };
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isTracked,
+  );
+
+  const path = writeEpic("fn-3-demo", {
+    title: "Demo",
+    status: "open",
+    primary_repo: "/repo",
+  });
+
+  // First scan: changed (first-seen) → probe fires once, emits.
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+  expect(probed).toEqual([path]);
+
+  // Unchanged re-scan: the change-gate suppresses BEFORE the probe — isTracked
+  // is NOT called again, and nothing emits.
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+  expect(probed).toEqual([path]); // still exactly one probe, total.
+});
+
+test("fn-759: first-seen uncommitted lands pending; isTracked fires; lastEmitted untouched (gate semantics preserved)", () => {
+  const emitted: PlanMessage[] = [];
+  const probed: string[] = [];
+  const isTracked = (path: string): boolean => {
+    probed.push(path);
+    return false; // not in HEAD → gated.
+  };
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isTracked,
+  );
+
+  const path = writeEpic("fn-3-demo", {
+    title: "Demo",
+    status: "open",
+    primary_repo: "/repo",
+  });
+
+  // First-seen, uncommitted: change-gate has no entry → probe fires → gated.
+  scanner.onChange(path);
+  expect(emitted).toEqual([]);
+  expect(probed).toEqual([path]);
+  expect(scanner.pendingSize()).toBe(1);
+
+  // A re-scan of the SAME uncommitted content must NOT be suppressed by the
+  // change-gate — a gated path never earned a lastEmitted entry, so the probe
+  // fires AGAIN (re-confirming HEAD-membership). This is the fn-627/fn-629
+  // pin: advancing lastEmitted before the probe would make the post-commit
+  // drain see "unchanged" and never emit.
+  scanner.onChange(path);
+  expect(emitted).toEqual([]);
+  expect(probed).toEqual([path, path]); // probed twice — gate did NOT shortcut.
+  expect(scanner.pendingSize()).toBe(1);
+});
+
+test("fn-759: changed committed snapshot probes once per change and emits", () => {
+  const emitted: PlanMessage[] = [];
+  const probed: string[] = [];
+  const isTracked = (path: string): boolean => {
+    probed.push(path);
+    return true;
+  };
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isTracked,
+  );
+
+  const path = writeEpic("fn-3-demo", {
+    title: "Demo",
+    status: "open",
+    primary_repo: "/repo",
+  });
+
+  scanner.onChange(path);
+  expect(emitted.length).toBe(1);
+  expect(probed.length).toBe(1);
+
+  // Real content change (status flip) → change-gate misses → probe fires
+  // again, emits the new snapshot.
+  writeFileSync(
+    path,
+    JSON.stringify({
+      id: "fn-3-demo",
+      title: "Demo",
+      status: "done",
+      primary_repo: "/repo",
+    }),
+  );
+  scanner.onChange(path);
+  expect(emitted.length).toBe(2);
+  expect(probed.length).toBe(2);
+  expect((emitted[1] as { status: string }).status).toBe("done");
+});
+
+test("fn-759: boot-seed asymmetry — seeded lastEmitted + empty pathToId → unchanged scan still routes a later delete tombstone", () => {
+  const emitted: PlanMessage[] = [];
+  const probed: string[] = [];
+  const isTracked = (path: string): boolean => {
+    probed.push(path);
+    return true;
+  };
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+    isTracked,
+  );
+
+  const path = writeEpic("fn-3-demo", {
+    title: "Demo",
+    status: "open",
+    primary_repo: "/repo",
+  });
+
+  // Simulate boot: seed the change-gate from the projection (matching the
+  // serialization onChange would produce) WITHOUT populating pathToId — the
+  // boot-seed asymmetry the unchanged-branch pathToId.set guards against.
+  const expectedMsg: PlanMessage = {
+    kind: "plan-epic",
+    id: "fn-3-demo",
+    number: 3,
+    title: "Demo",
+    projectDir: "/repo",
+    status: "open",
+    dependsOnEpics: [],
+    lastValidatedAt: null,
+  };
+  scanner.seed("fn-3-demo", JSON.stringify(expectedMsg));
+
+  // Boot scan reads the unchanged file: change-gate suppresses (no emit, no
+  // probe), but pathToId IS populated on this branch.
+  scanner.onChange(path);
+  expect(emitted).toEqual([]);
+  expect(probed).toEqual([]); // unchanged → probe never forked.
+
+  // Now delete the file. Without the unchanged-branch pathToId.set, onDelete
+  // would find no id and emit no tombstone — a permanent projection ghost.
+  // With it, the tombstone fires.
+  scanner.onDelete(path);
+  expect(emitted.length).toBe(1);
+  expect(emitted[0]).toEqual({ kind: "plan-epic-deleted", id: "fn-3-demo" });
+});
+
 test("onChange: multi-file tree — epic committed before its task lands → only the epic emits; task remains gated", () => {
   gitInit(tmpDir);
 

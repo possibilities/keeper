@@ -1229,7 +1229,20 @@ failure reads as not-in-HEAD). When the predicate returns false, the
 path lands in a per-scanner `pending` set and NO `EpicSnapshot` /
 `TaskSnapshot` is emitted — so the reducer never folds an uncommitted
 epic and the autopilot dispatch gate (see CLAUDE.md § Autopilot
-dispatch gates) cannot observe it. Critically, the gate lives at the
+dispatch gates) cannot observe it. As of fn-759 the cheap in-memory
+**change-gate runs BEFORE this probe**: `onChange` first compares the
+new serialization against the per-id `lastEmitted` it already holds, and
+on a match suppresses with NO `isTracked` fork — so the ~99% of scans
+that re-read unchanged files (the 5s heartbeat, boot, the drop-rescan)
+no longer spawn a `git cat-file -e` per file (the fork storm that starved
+the realtime pipeline to ~227s staleness). The probe fires ONLY on
+changed / first-seen snapshots; gated paths still never earn a
+`lastEmitted` entry, so an uncommitted file is re-probed every scan
+(the fn-627/fn-629 post-commit-drain pin) rather than wrongly shortcut.
+The one accepted semantic shift: in-HEAD-ness is re-verified only when
+content changes — an unchanged file's HEAD-membership regression (a
+branch switch) has no observable effect, since the change-gate suppresses
+re-emits regardless. Critically, the gate lives at the
 **producer**, not the reducer: re-fold determinism is non-negotiable
 (the reducer must never read git / fs / wallclock), so the predicate
 fires once at fold-time on the producer side, never inside the
