@@ -805,6 +805,70 @@ def resolve_task_cmd(task_id, project):
     return _lazy_import("planctl.run_resolve_task")(task_id=task_id, project=project)
 
 
+_FIND_TASK_COMMIT_AGENT_HELP = """\
+planctl find-task-commit <task_id> [--project <abs-path>]
+
+Read-only commit lookup for a single task. Wraps the native `git log --grep` +
+`git interpret-trailers --parse` trailer scan (`planctl.commit_lookup`) and
+emits the flat, keeper-compatible envelope the worker's predecessor-detection
+branch consumes.
+
+Returned envelope (success, exit 0):
+
+  {"success": true,
+   "commits": [{"sha": "<full %H>", "repo": "<abs-path>"}, ...],
+   "planctl_invocation": {...}}   # read-only invocation line (decorator-emitted)
+
+`commits` flattens the per-repo grouped scan to one list — repo-outer first-seen
+order (= `touched_repos` order), per-repo grep order, SHAs deduped within a repo.
+Field names are `sha` / `repo` (full `%H`, NOT `sha256` / `repo_path`).
+
+A clean miss (no commit carries a confirmed `Task: <task_id>` trailer) is a
+normal empty success: `commits: []`, exit 0 — NEVER an error.
+
+Resolution: the owning project is found cwd-agnostically via roots discovery;
+`primary_repo` / `touched_repos` are read off the epic record to seed the scan
+set. Pass `--project <abs-path>` to bypass discovery (disambiguate an
+AMBIGUOUS_TASK_ID, or target a project outside the configured roots). The worker
+runs from inside the repo, so cwd ≈ primary_repo in practice.
+
+Failure envelope (no mutation; exit 1):
+
+  {"success": false,
+   "error": {"code": "<code>", "message": "<msg>", "details": {...}}}
+
+Codes: `BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID` (with
+`details.candidates`), `NOT_A_PROJECT`, `COMMIT_LOOKUP_FAILED` (every repo in the
+scan set missing or not a git repo; `details.broken_repos` lists them).
+"""
+
+
+@cli.command("find-task-commit")
+@click.argument("task_id")
+@click.option(
+    "--project",
+    default=None,
+    help=(
+        "Project path to resolve the task in, bypassing roots discovery. "
+        "Use this for tasks in projects outside the configured roots, or to "
+        "disambiguate an AMBIGUOUS_TASK_ID."
+    ),
+)
+@agent_help_option(_FIND_TASK_COMMIT_AGENT_HELP)
+def find_task_commit_cmd(task_id, project):
+    """Read-only commit lookup — emit the flat keeper-compatible {commits:[{sha,repo}]}.
+
+    Wraps the native trailer scan (`planctl.commit_lookup`) behind the envelope
+    the worker's predecessor-detection consumes. Clean miss → empty success
+    (exit 0); all-repos-broken → COMMIT_LOOKUP_FAILED (exit 1). Read-only: no
+    .planctl/ write, no commit. Cwd-agnostic (scans configured roots); pass
+    --project to disambiguate an AMBIGUOUS_TASK_ID.
+    """
+    return _lazy_import("planctl.run_find_task_commit")(
+        task_id=task_id, project=project
+    )
+
+
 @cli.command("reconcile")
 @click.argument("task_id")
 @click.option(
