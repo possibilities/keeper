@@ -412,6 +412,120 @@ def test_reconcile_comma_split_trailer_matches_both(planctl_git_repo):
 
 
 # ---------------------------------------------------------------------------
+# Cross-repo source scan: target_repo != state_repo, commit lands in target_repo
+# ---------------------------------------------------------------------------
+
+
+def _init_git_repo(repo: Path) -> None:
+    """git init *repo* with one commit so HEAD is born (born-branch fixture)."""
+    repo.mkdir(parents=True, exist_ok=True)
+    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
+    (repo / "README.md").write_text("# target repo\n", encoding="utf-8")
+    _git(["add", "README.md"], repo)
+    _git(["commit", "-m", "chore: initial commit"], repo)
+
+
+def _set_task_target_repo(project: Path, task_id: str, target_repo: Path) -> None:
+    """Repoint the on-disk task JSON's ``target_repo`` at *target_repo*.
+
+    Scaffold collapses ``target_repo`` to the project root and its mint-time
+    integrity check rejects a non-``.git`` path — so we rewrite the field AFTER
+    the seed (reconcile re-reads the JSON and does not re-run that check).
+    """
+    rel = f".planctl/tasks/{task_id}.json"
+    task_path = project / rel
+    data = json.loads(task_path.read_text(encoding="utf-8"))
+    data["target_repo"] = str(target_repo)
+    task_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _set_epic_touched_repos(project: Path, epic_id: str, repos: list[str]) -> None:
+    """Write ``touched_repos`` onto the on-disk epic JSON."""
+    rel = f".planctl/epics/{epic_id}.json"
+    epic_path = project / rel
+    data = json.loads(epic_path.read_text(encoding="utf-8"))
+    data["touched_repos"] = list(repos)
+    epic_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def test_reconcile_cross_repo_source_scan_done(planctl_git_repo, tmp_path):
+    """target_repo != state_repo: a `Task:` commit in target_repo → `done`.
+
+    The cross-project shape the single-repo verdict tests never exercise. The
+    source scan must walk ``target_repo`` (distinct from ``state_repo``) and
+    pick up the trailer-authentic commit there, while ``state_head_visible``
+    cat-files against ``state_repo``. We seed the epic in ``planctl_git_repo``
+    (the state_repo), repoint the task's ``target_repo`` at a SEPARATE git repo,
+    land the source commit THERE, stamp+commit worker_done_at in the state_repo,
+    and assert the `done` verdict carries a source commit attributed to the
+    target_repo.
+    """
+    epic_id, task_id = _make_epic_with_task(title="Cross repo")
+    target_repo = tmp_path / "target_repo"
+    _init_git_repo(target_repo)
+    _set_task_target_repo(planctl_git_repo, task_id, target_repo)
+
+    # Source commit with the trailer lands in the SEPARATE target_repo, never
+    # in the state_repo (planctl_git_repo).
+    sha = _commit_with_trailer(
+        target_repo,
+        f"feat(x): cross-repo work\n\nbody line.\n\nTask: {task_id}",
+    )
+
+    # Drive the task done in the state_repo: sidecar flip + the on-HEAD stamp.
+    _set_runtime(planctl_git_repo, task_id, {"status": "done"})
+    _commit_task_json_with_done_stamp(planctl_git_repo, task_id)
+
+    code, obj, output = _invoke(["reconcile", task_id])
+    assert code == 0, output
+    assert obj is not None
+    assert obj.get("verdict") == "done", (
+        "cross-repo target_repo source scan regressed — wrong verdict for a "
+        "finished cross-project task"
+    )
+    assert obj.get("status") == "done"
+    assert obj.get("state_head_visible") is True
+    commits = obj.get("source_commits")
+    assert commits, "the target_repo Task: commit must be surfaced"
+    match = next((c for c in commits if c["sha"] == sha), None)
+    assert match is not None, f"target_repo commit {sha} not in {commits}"
+    assert match["repo"] == str(target_repo), (
+        "the source commit must be attributed to target_repo, not state_repo"
+    )
+
+
+def test_reconcile_cross_repo_dedup_no_duplicate_scan(planctl_git_repo, tmp_path):
+    """A repo reachable via both target_repo AND touched_repos is scanned once.
+
+    ``ordered_scan_repos`` dedups (realpath-normalized, order-preserving), so a
+    target_repo that ALSO appears in ``epic.touched_repos`` must not yield two
+    copies of the same source commit. Without the dedup the orchestrator would
+    see a doubled ``source_commits`` list for the same sha.
+    """
+    epic_id, task_id = _make_epic_with_task(title="Cross repo dedup")
+    target_repo = tmp_path / "dedup_repo"
+    _init_git_repo(target_repo)
+    _set_task_target_repo(planctl_git_repo, task_id, target_repo)
+    # Same repo reachable a second time via touched_repos → must be deduped.
+    _set_epic_touched_repos(planctl_git_repo, epic_id, [str(target_repo)])
+
+    sha = _commit_with_trailer(
+        target_repo,
+        f"feat(x): dedup work\n\nTask: {task_id}",
+    )
+    _set_runtime(planctl_git_repo, task_id, {"status": "in_progress"})
+
+    code, obj, output = _invoke(["reconcile", task_id])
+    assert code == 0, output
+    assert obj is not None
+    assert obj.get("verdict") == "in_progress_committed"
+    matching = [c for c in obj.get("source_commits", []) if c["sha"] == sha]
+    assert len(matching) == 1, (
+        f"target_repo also in touched_repos must scan once, got {matching}"
+    )
+
+
+# ---------------------------------------------------------------------------
 # Unborn-branch guard: empty HEAD is a distinct signal, not tooling_error
 # ---------------------------------------------------------------------------
 
