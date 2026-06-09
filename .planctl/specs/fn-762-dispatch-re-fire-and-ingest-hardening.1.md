@@ -76,5 +76,5 @@ Extend makeFakeDeps shapes: (a) post-launch abort — flip the AbortController A
 - [ ] CLAUDE.md/README/exec-backend.md passages updated; full bun test green
 
 ## Done summary
-
+Closed the dispatch re-fire windows (cluster A): REDISPATCH_COOLDOWN_S 120->200 (strictly > TTL+sweep), split ConfirmOutcome aborted into pre/post-launch flavors so stamps clear only when nothing launched, re-stamp once at indoubt resolution, and moved the dispatched-ack ahead of the reducer drain with a guarded pump. Docs updated in CLAUDE.md/README/exec-backend.md; full suite green.
 ## Evidence
