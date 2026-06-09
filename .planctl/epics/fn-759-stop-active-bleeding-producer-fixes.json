@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-759-stop-active-bleeding-producer-fixes",
   "bundles": [],
+  "closer_done_at": "2026-06-09T21:51:00.171457Z",
   "created_at": "2026-06-09T19:41:10.006038Z",
   "depends_on_epics": [],
   "id": "fn-759-stop-active-bleeding-producer-fixes",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Stop active bleeding producer fixes",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-09T21:36:13.860911Z"
+  "updated_at": "2026-06-09T21:51:00.171457Z"
 }
