@@ -955,7 +955,8 @@ collapses to plain stream output. Run any of them with
 
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
   + AND grammar widened in fn-713, `monitor-running` added in fn-718,
-  `server-up` + `reason=unreachable` added in fn-750.2). Non-TUI: emits a
+  `server-up` + `reason=unreachable` added in fn-750.2, give-up made
+  opt-in via `--connect-timeout` in fn-757). Non-TUI: emits a
   Monitor-shaped event
   stream on stdout — exactly one `[keeper-await] armed …` line after the
   on-board check, then exactly one terminal `[keeper-await] met …` or
@@ -968,9 +969,10 @@ collapses to plain stream output. Run any of them with
   (`job_id != CLAUDE_CODE_SESSION_ID`) with `state=working` has a cwd
   inside the cwd's git root; `server-up` blocks until keeperd is reachable
   and serving, firing `met` on the first snapshot — it reconnects FOREVER
-  (opts out of the give-up deadline) so it survives a daemon bounce, takes
-  no id, has no planctl pre-check, and CANNOT be ANDed with another
-  condition (rejected at parse time); `monitor-running <selector>` blocks
+  (permanently give-up-exempt) so it survives a daemon bounce, takes
+  no id, has no planctl pre-check, CANNOT be ANDed with another
+  condition (rejected at parse time), and CANNOT be combined with
+  `--connect-timeout`; `monitor-running <selector>` blocks
   until the matching background monitor in the CALLER'S OWN session
   (`job_id == CLAUDE_CODE_SESSION_ID`) is no longer running — the selector
   is `cmd:<full command>`, `kind:<monitor|bash-bg|ambient>`, or a bare
@@ -983,13 +985,21 @@ collapses to plain stream output. Run any of them with
   triggered, glitch-free); only the subscriptions a condition needs are
   opened. "unblocked" deliberately excludes autopilot's
   `single-task-per-epic` / `single-task-per-root` concurrency mutexes
-  (every other blocker still blocks). Every give-up-eligible subscribe
-  (everything except `server-up`) carries a bounded continuous-unpainted
-  give-up (fn-750.1/.2): a daemon down / mid-bounce / half-up past the
-  deadline fires `failed reason=unreachable … advice=<…>` exit 1 instead of
-  hanging forever — distinct from `reason=connect` (a query-shape rejection
-  keeperd returned). Exit codes: 0 met, 1
-  not-found/`no-match`/usage/connection/`no-git-root`/`unreachable`, 3
+  (every other blocker still blocks). By default every condition reconnects
+  FOREVER — a plain `keeper await <cond>` survives an arbitrarily long
+  keeperd bounce and never emits `reason=unreachable` (fn-757; the shared
+  driver's give-up policy is opt-in, and `server-up` always relied on the
+  default-off behavior). The opt-in `--connect-timeout <dur>` flag re-arms
+  the bounded continuous-unpainted give-up (fn-750.1; the `GiveUpPolicy`
+  machinery stays) for non-interactive / CI callers: a daemon down /
+  mid-bounce / half-up past the deadline fires `failed reason=unreachable …
+  advice=<…>` exit 1 instead of blocking — distinct from `reason=connect`
+  (a query-shape rejection keeperd returned). It is orthogonal to
+  `--timeout` (the condition deadline); set it `<= --timeout` and the first
+  to fire wins. `--connect-timeout` is rejected with `server-up` at parse
+  time. Exit codes: 0 met, 1
+  not-found/`no-match`/usage/connection/`no-git-root`/`unreachable`
+  (`unreachable` only with `--connect-timeout`), 3
   timeout (SIGTERM), 4 deleted, 5 stuck (only under `--fail-on-stuck`).
 
   ```sh
@@ -998,6 +1008,7 @@ collapses to plain stream output. Run any of them with
   keeper await server-up                                   # daemon serving
   keeper await monitor-running cmd:bun run dev             # my dev server done
   keeper await git-clean and agents-idle                   # both, ANDed
+  keeper await complete fn-1-foo --connect-timeout 30s     # opt-in give-up
   ```
 
 - `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends

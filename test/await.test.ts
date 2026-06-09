@@ -395,6 +395,7 @@ function singleArgs(
   return {
     segments: [{ condition, target: { id, kind, condition } }],
     timeoutMs: null,
+    connectTimeoutMs: null,
     failOnStuck: false,
     noArmedLine: false,
     requireTransition: false,
@@ -412,6 +413,7 @@ function argsFor(
   return {
     segments,
     timeoutMs: null,
+    connectTimeoutMs: null,
     failOnStuck: false,
     noArmedLine: false,
     requireTransition: false,
@@ -486,6 +488,8 @@ test("parseAwaitArgs: complete + task id classifies as task", () => {
   expect(seg.target.kind).toBe("task");
   expect(r.args.json).toBe(false);
   expect(r.args.timeoutMs).toBeNull();
+  // fn-757: no flag = reconnect forever.
+  expect(r.args.connectTimeoutMs).toBeNull();
 });
 
 test("parseAwaitArgs: unblocked + bare epic id", () => {
@@ -537,6 +541,41 @@ test("parseAwaitArgs: missing positional id for planctl → usage error", () => 
 test("parseAwaitArgs: bad timeout → usage error", () => {
   const r = parseAwaitArgs(["complete", "fn-1-foo.1", "--timeout", "abc"]);
   expect(r.ok).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// parseAwaitArgs — fn-757 --connect-timeout (opt-in give-up deadline)
+// ---------------------------------------------------------------------------
+
+test("parseAwaitArgs: --connect-timeout 30s → connectTimeoutMs === 30_000", () => {
+  const r = parseAwaitArgs([
+    "complete",
+    "fn-1-foo.1",
+    "--connect-timeout",
+    "30s",
+  ]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  expect(r.args.connectTimeoutMs).toBe(30_000);
+});
+
+test("parseAwaitArgs: bad --connect-timeout → usage error", () => {
+  const r = parseAwaitArgs([
+    "complete",
+    "fn-1-foo.1",
+    "--connect-timeout",
+    "abc",
+  ]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: --connect-timeout + server-up → usage error", () => {
+  const r = parseAwaitArgs(["server-up", "--connect-timeout", "30s"]);
+  expect(r.ok).toBe(false);
+  if (!r.ok) {
+    expect(r.message).toContain("cannot be combined");
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -1484,17 +1523,23 @@ test("server-up: --timeout still fires failed reason=timeout exit 3", async () =
   expect(h.exitCode).toBe(3);
 });
 
-test("unreachable: give-up deadline → failed reason=unreachable + advice exit 1", async () => {
+test("unreachable: --connect-timeout give-up → failed reason=unreachable + advice exit 1", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   // Inject a controllable clock the give-up deadline measures against. The
   // driver arms the unpainted anchor at `now()` on subscribe start; we never
   // deliver a frame, advance past the 30s deadline, then re-iterate the
   // reconnect loop (closeFromServer) so the loop-top `checkGiveUp` fires.
+  // fn-757: the give-up path is now OPT-IN — without --connect-timeout
+  // (connectTimeoutMs) the runner builds no giveUpExtras, so neither the
+  // policy nor the injected `now` reaches the driver and this never trips.
   let clock = 0;
   h.deps.now = () => clock;
 
-  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+  await runAndCatch(
+    singleArgs("complete", "fn-1-foo.1", "task", { connectTimeoutMs: 30_000 }),
+    h.deps,
+  );
 
   const sock = socketRef.current;
   if (!sock) {
@@ -1519,13 +1564,65 @@ test("unreachable: give-up deadline → failed reason=unreachable + advice exit 
   expect(h.exitCode).toBe(1);
 });
 
+test("unreachable: post-paint-drop past --connect-timeout → reason=unreachable exit 1", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+  // fn-757: the give-up driver re-arms the unpainted anchor on a post-paint
+  // drop (was-connected-then-lost), so an opted-in wait that painted once and
+  // then loses keeperd past the deadline still fires unreachable.
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(
+    singleArgs("complete", "fn-1-foo.1", "task", { connectTimeoutMs: 30_000 }),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: task present but not complete → armed, no terminal.
+  const taskOpen = makeTaskRow({ worker_phase: "open", approval: "pending" });
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ tasks: [taskOpen] }));
+  expect(h.stdout[0]).toContain("[keeper-await] armed");
+  expect(h.exitCode).toBeNull();
+
+  // First drop (at clock=0) re-arms the unpainted anchor fresh (post-paint
+  // case). No terminal yet — the window has just started.
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+  expect(h.exitCode).toBeNull();
+
+  // Advance past the re-armed deadline, then bounce again so the reconnect
+  // loop-top checkGiveUp measures against the post-paint anchor and fires.
+  clock = 31_000;
+  const reSock = socketRef.current;
+  if (!reSock) {
+    throw new Error("reconnect socket never installed");
+  }
+  reSock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=unreachable");
+  expect(h.exitCode).toBe(1);
+});
+
 test("unreachable: emitted once across handles (terminating latch dedups)", async () => {
   const { factory, socketRef } = makeMockConnect();
   const h = makeHarness(factory);
   let clock = 0;
   h.deps.now = () => clock;
 
-  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+  await runAndCatch(
+    singleArgs("complete", "fn-1-foo.1", "task", { connectTimeoutMs: 30_000 }),
+    h.deps,
+  );
 
   const sock = socketRef.current;
   if (!sock) {
@@ -1545,6 +1642,57 @@ test("unreachable: emitted once across handles (terminating latch dedups)", asyn
   expect(failedLines).toHaveLength(1);
   expect(failedLines[0]).toContain("reason=unreachable");
   expect(h.exitCode).toBe(1);
+});
+
+test("default path: no --connect-timeout reconnects forever; bounce past 30s yields no terminal, then met after re-paint", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+  // fn-757: a plain await (no --connect-timeout) reconnects forever. We inject
+  // a clock and advance WAY past the old 30s give-up window — with no policy
+  // armed, the driver never tears down with `unreachable`. A later re-paint
+  // that satisfies the condition still fires `met`.
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: task present, not complete → armed.
+  const taskOpen = makeTaskRow({ worker_phase: "open", approval: "pending" });
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ tasks: [taskOpen] }));
+  expect(h.stdout[0]).toContain("[keeper-await] armed");
+
+  // Bounce, then sit unpainted PAST the old 30s give-up window. No flag =
+  // reconnect forever = NO terminal.
+  clock = 120_000;
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+  await new Promise<void>((r) => setTimeout(r, 200));
+
+  expect(h.exitCode).toBeNull();
+  expect(
+    h.stdout.filter((l) => l.includes("[keeper-await] failed")),
+  ).toHaveLength(0);
+
+  // The reconnect installed a fresh socket as socketRef.current. Deliver a
+  // satisfying re-paint on it → met (exit 0).
+  const reSock = socketRef.current;
+  if (!reSock) {
+    throw new Error("reconnect socket never installed");
+  }
+  reSock.takeOutbound();
+  const taskDone = makeTaskRow({ worker_phase: "done", approval: "approved" });
+  deliverFiveWithEpic(reSock, idPrefix, makeEpicRow({ tasks: [taskDone] }));
+
+  const lines = h.stdout.join("");
+  expect(lines).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
 });
 
 // ===========================================================================

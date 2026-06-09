@@ -23,9 +23,12 @@
  * `reason=unreachable` (exit 1) is distinct from `reason=connect`: connect
  * is a terminal query-shape error keeperd rejected; unreachable is the
  * give-up deadline firing because keeperd never painted a first snapshot
- * (down / mid-bounce / half-up). The `keeper await server-up` condition
- * opts OUT of the give-up deadline (reconnect-forever) so a watching agent
- * can block through a bounce and re-arm.
+ * (down / mid-bounce / half-up). It is OPT-IN ONLY (fn-757): a plain
+ * `keeper await` reconnects forever and never emits `unreachable`; pass
+ * `--connect-timeout <dur>` to arm the bounded path for a non-interactive /
+ * CI caller that wants a give-up deadline. `server-up` is permanently
+ * give-up-exempt (reconnect-forever, and `--connect-timeout` is rejected
+ * with it at parse time).
  *
  * Authority for both "on board" and "verdict" is `subscribeReadiness`
  * (board-scoped). Tasks live embedded inside epics; the scope-exempt
@@ -74,24 +77,6 @@ import {
 import type { Epic, GitStatus, Job } from "../src/types";
 
 // ---------------------------------------------------------------------------
-// Give-up deadline (fn-750.2)
-// ---------------------------------------------------------------------------
-
-/**
- * Continuous-unpainted give-up deadline for `keeper await` (fn-750.2). When
- * no first snapshot lands within this wall-clock window — never-connected OR
- * was-connected-then-lost — the subscribe driver tears down and fires
- * `onFatal({ code: "unreachable" })`, which we render as `failed
- * reason=unreachable … advice=<…>` exit 1 instead of hanging forever. The
- * `server-up` condition opts OUT of this (it's the escape hatch for a slow
- * cold boot — reconnect-forever).
- */
-const AWAIT_GIVE_UP_MS = 30_000;
-
-/** The give-up policy `keeper await` passes to its give-up-eligible streams. */
-const AWAIT_GIVE_UP_POLICY: GiveUpPolicy = { deadlineMs: AWAIT_GIVE_UP_MS };
-
-// ---------------------------------------------------------------------------
 // Help text
 // ---------------------------------------------------------------------------
 
@@ -118,11 +103,11 @@ Conditions:
                   state=working has a cwd inside the cwd's git root. Takes
                   no id.
   server-up       Block until keeperd is reachable and serving, then fire
-                  met on the first snapshot. Reconnects FOREVER (opts out of
-                  the give-up deadline) so it survives a daemon bounce — the
-                  escape hatch for a slow cold boot. Takes no id, has no
-                  planctl pre-check, and CANNOT be ANDed with another
-                  condition.
+                  met on the first snapshot. Reconnects FOREVER (permanently
+                  give-up-exempt) so it survives a daemon bounce — the escape
+                  hatch for a slow cold boot. Takes no id, has no planctl
+                  pre-check, CANNOT be ANDed with another condition, and
+                  CANNOT be combined with --connect-timeout.
   monitor-running <selector>
                   Block until the matching background monitor in YOUR OWN
                   session (job_id == CLAUDE_CODE_SESSION_ID) is no longer
@@ -139,9 +124,16 @@ simultaneously (level-triggered, glitch-free). A planctl sub-condition going
 not-found / deleted / stuck short-circuits the whole wait with that reason.
 
 Flags:
-  --timeout <dur>        Own deadline (e.g. 30s, 5m). Default: none.
-                         Emits failed reason=timeout exit 3. Use BELOW
-                         Monitor's kill timeout if combined.
+  --timeout <dur>        Own condition deadline (e.g. 30s, 5m). Default:
+                         none. Emits failed reason=timeout exit 3. Use
+                         BELOW Monitor's kill timeout if combined.
+  --connect-timeout <dur>
+                         Bounded reach-the-server deadline (e.g. 30s).
+                         Default: none = reconnect forever. When set and
+                         > 0, an unpainted wait past the window fires
+                         failed reason=unreachable exit 1 (never-connected
+                         OR was-connected-then-lost). Set it <= --timeout;
+                         first to fire wins. Rejected with server-up.
   --fail-on-stuck        Treat "stuck" verdicts (job-rejected,
                          dep-on-epic-dangling) as terminal exit 5.
                          Default: keep waiting.
@@ -160,14 +152,16 @@ Reasons (failed lines):
   no-match   monitor-running selector matched nothing
   no-git-root  cwd isn't inside a git worktree
   connect    a terminal (unrecoverable) query-shape error from keeperd
-  unreachable  keeperd stayed unreachable past the give-up deadline; wait
+  unreachable  keeperd stayed unreachable past --connect-timeout (only with
+               --connect-timeout; a plain await reconnects forever); wait
                with 'keeper await server-up' then re-arm this command
   deleted    planctl target was on board then vanished
   timeout    --timeout / Monitor wall-clock deadline hit
   stuck      job-rejected / dep-dangling (only under --fail-on-stuck)
 
 Exit codes:
-  0 met   1 not-found/no-match/usage/connect/unreachable   3 timeout   4 deleted   5 stuck
+  0 met   1 not-found/no-match/usage/connect/unreachable (unreachable only
+  with --connect-timeout)   3 timeout   4 deleted   5 stuck
 `;
 
 // ---------------------------------------------------------------------------
@@ -237,6 +231,12 @@ export interface ParsedArgs {
   /** One or more condition segments, ANDed. Always >= 1. */
   segments: ConditionSegment[];
   timeoutMs: number | null;
+  /**
+   * Opt-in reach-the-server give-up deadline (fn-757). `null`/`0` =
+   * reconnect forever (the default). When `> 0`, await arms the bounded
+   * `reason=unreachable` path; mutually exclusive with `server-up`.
+   */
+  connectTimeoutMs: number | null;
   failOnStuck: boolean;
   noArmedLine: boolean;
   requireTransition: boolean;
@@ -352,6 +352,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       options: {
         help: { type: "boolean", short: "h" },
         timeout: { type: "string" },
+        "connect-timeout": { type: "string" },
         "fail-on-stuck": { type: "boolean" },
         "no-armed-line": { type: "boolean" },
         "require-transition": { type: "boolean" },
@@ -489,6 +490,21 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     };
   }
 
+  // `--connect-timeout` arms the bounded `reason=unreachable` give-up path,
+  // which `server-up` is permanently exempt from (reconnect-forever). The two
+  // are incoherent together, so reject at parse time (fn-757) — alongside the
+  // server-up exclusivity check above.
+  if (
+    typeof values["connect-timeout"] === "string" &&
+    segments.some((s) => s.condition === "server-up")
+  ) {
+    return {
+      ok: false,
+      message:
+        "condition 'server-up' cannot be combined with --connect-timeout",
+    };
+  }
+
   let timeoutMs: number | null = null;
   const timeoutRaw = values.timeout;
   if (typeof timeoutRaw === "string" && timeoutRaw.length > 0) {
@@ -502,6 +518,21 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     timeoutMs = parsed;
   }
 
+  // `--connect-timeout` clones the `--timeout` parse-and-validate block,
+  // reusing `parseDurationMs` (fn-757). `null`/`0`/absent = reconnect forever.
+  let connectTimeoutMs: number | null = null;
+  const connectTimeoutRaw = values["connect-timeout"];
+  if (typeof connectTimeoutRaw === "string" && connectTimeoutRaw.length > 0) {
+    const parsed = parseDurationMs(connectTimeoutRaw);
+    if (parsed === null) {
+      return {
+        ok: false,
+        message: `invalid --connect-timeout '${connectTimeoutRaw}' (expected e.g. 30s, 5m, 2h, or ms integer)`,
+      };
+    }
+    connectTimeoutMs = parsed;
+  }
+
   const sock =
     typeof values.sock === "string"
       ? (values.sock as string)
@@ -512,6 +543,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     args: {
       segments,
       timeoutMs,
+      connectTimeoutMs,
       failOnStuck: values["fail-on-stuck"] === true,
       noArmedLine: values["no-armed-line"] === true,
       requireTransition: values["require-transition"] === true,
@@ -701,8 +733,11 @@ export async function runAwait(
   // `server-up` (fn-750.2) is a dedicated minimal subscribe: it needs a
   // CONNECTION but NO git root / planctl / jobs rows, and it fires `met` on
   // first paint. It's always the SOLE segment (parse rejects ANDing it), so
-  // it doesn't combine with any other stream. Crucially it opts OUT of the
-  // give-up deadline — reconnect-forever — so it survives a daemon bounce.
+  // it doesn't combine with any other stream. It is PERMANENTLY give-up-exempt
+  // — reconnect-forever — so it survives a daemon bounce. (fn-757: every
+  // stream is now give-up-exempt by default; `--connect-timeout` re-arms a
+  // bounded deadline for the give-up-eligible streams but is rejected with
+  // server-up at parse time.)
   const hasServerUp = args.segments.some((s) => s.condition === "server-up");
   // `monitor-running` reads jobs rows but is own-session-scoped — it needs
   // NO git root (unlike `agents-idle`, which scopes by cwd containment).
@@ -715,9 +750,9 @@ export async function runAwait(
   const openReadiness = hasPlanctl;
   const openGitCollection = hasGitClean && !hasPlanctl;
   const openJobsCollection = needsJobs && !hasPlanctl;
-  // `server-up` gets its OWN minimal readiness subscribe (give-up-exempt) —
-  // NOT bolted onto `openReadiness`, which would drag in the planctl
-  // re-query machinery and a give-up policy.
+  // `server-up` gets its OWN minimal readiness subscribe (always
+  // give-up-exempt) — NOT bolted onto `openReadiness`, which would drag in
+  // the planctl re-query machinery.
   const openServerUp = hasServerUp;
 
   // Build the latched slots in segment order (the line render walks them).
@@ -1530,12 +1565,23 @@ export async function runAwait(
   }
 
   // The give-up policy + injected clock the give-up-eligible streams carry
-  // (fn-750.2). `server-up` opts OUT — it's reconnect-forever — so it never
-  // sees either. The `now` clock is test-only injection; production omits it.
-  const giveUpExtras = {
-    giveUpPolicy: AWAIT_GIVE_UP_POLICY,
-    ...(deps.now === undefined ? {} : { now: deps.now }),
-  };
+  // (fn-757). Built ONLY when `--connect-timeout` is set and > 0 (mirrors the
+  // `--timeout > 0` arming guard below); `0`/absent = no deadline =
+  // reconnect-forever, the default. When unset we spread NOTHING, so the
+  // streams default to reconnect-forever exactly like `server-up`. `now` is a
+  // test-only clock that rides INSIDE the policy object so it stays paired
+  // with `giveUpPolicy` — never forwarded when the flag is unset (otherwise a
+  // stranded `now` could drive the driver's give-up anchor with no policy).
+  const giveUpExtras: {
+    giveUpPolicy: GiveUpPolicy;
+    now?: () => number;
+  } | null =
+    args.connectTimeoutMs !== null && args.connectTimeoutMs > 0
+      ? {
+          giveUpPolicy: { deadlineMs: args.connectTimeoutMs },
+          ...(deps.now === undefined ? {} : { now: deps.now }),
+        }
+      : null;
 
   // Open ONLY the subscriptions the active conditions need.
   if (openReadiness) {
@@ -1545,7 +1591,7 @@ export async function runAwait(
       onSnapshot: onReadinessSnapshot,
       onLifecycle: onLifecycle("readiness"),
       onFatal,
-      ...giveUpExtras,
+      ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
   }
@@ -1557,7 +1603,7 @@ export async function runAwait(
       onRows: onGitRows,
       onLifecycle: onLifecycle("git"),
       onFatal,
-      ...giveUpExtras,
+      ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
   }
@@ -1569,16 +1615,18 @@ export async function runAwait(
       onRows: onJobRows,
       onLifecycle: onLifecycle("jobs"),
       onFatal,
-      ...giveUpExtras,
+      ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
   }
-  // `server-up` (fn-750.2): its OWN minimal readiness subscribe that opts OUT
-  // of give-up (reconnect-forever — the slow-cold-boot escape hatch). We
-  // don't read any rows off the snapshot; the first `onSnapshot` IS the
-  // signal ("the daemon is serving"), so `onServerUpSnapshot` flips the
-  // paint flag and `evaluate()` latches `met` on first paint. NO give-up
-  // extras and NO planctl re-query machinery.
+  // `server-up` (fn-750.2): its OWN minimal readiness subscribe that is
+  // PERMANENTLY give-up-exempt (reconnect-forever — the slow-cold-boot escape
+  // hatch; `--connect-timeout` is rejected with it at parse time). We don't
+  // read any rows off the snapshot; the first `onSnapshot` IS the signal
+  // ("the daemon is serving"), so `onServerUpSnapshot` flips the paint flag
+  // and `evaluate()` latches `met` on first paint. NEVER any give-up extras
+  // and NO planctl re-query machinery. (fn-757: the give-up-eligible streams
+  // above are ALSO exempt unless `--connect-timeout` arms `giveUpExtras`.)
   if (openServerUp) {
     readinessHandle = subscribeReadiness({
       sockPath: args.sock,

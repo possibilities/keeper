@@ -74,7 +74,7 @@ the literal `and` token.
 | `unblocked <id>` | A planctl id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
-| `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot. Reconnects FOREVER (opts out of the give-up deadline), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition (parse-time usage error). | `server-up` |
+| `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot. Reconnects FOREVER (permanently give-up-exempt), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition, and **CANNOT be combined with `--connect-timeout`** (both parse-time usage errors). | `server-up` |
 | `monitor-running <selector>` | Any "wait until my dev server / script / background task / build watcher finishes" phrasing. Scoped to THIS session's own monitors. **Takes one selector token:** `cmd:<full command>`, `kind:<monitor\|bash-bg\|ambient>`, or a bare token (= `cmd:<token>`). Exact match, never substring. | `monitor-running cmd:bun run dev` |
 
 | Field | How to derive | Example |
@@ -217,7 +217,7 @@ Reasons + exit codes:
 | `failed reason=no-git-root …` | 1 | A `git-clean` / `agents-idle` condition was requested but the cwd isn't inside a git worktree. | Tell the user; the wait can't be evaluated. Do NOT run the follow-up. |
 | `failed reason=no-match …` | 1 | A `monitor-running` selector matched no running monitor in this session at arm time (likely armed the same turn the monitor launched, or the selector is wrong). | Tell the user nothing matched; suggest re-arming after the monitor shows in `keeper jobs`, or fixing the selector. Do NOT run the follow-up. |
 | `failed reason=connect …` | 1 | A terminal query-shape error keeperd rejected (a malformed/unrecoverable query). | Tell the user the query was rejected; the wait can't proceed. |
-| `failed reason=unreachable …` | 1 | keeperd stayed unreachable past the give-up deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=`. | Tell the user the daemon is down. To block THROUGH the bounce: `keeper await server-up` first, then re-arm this command once it's back. Do NOT run the follow-up. |
+| `failed reason=unreachable …` | 1 | **Only with `--connect-timeout`.** keeperd stayed unreachable past that opt-in deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=`. A plain await (no flag) NEVER emits this — it reconnects forever. | Tell the user the daemon is down. To block THROUGH the bounce, drop `--connect-timeout` (a plain await waits forever), or `keeper await server-up` first then re-arm once it's back. Do NOT run the follow-up. |
 | `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
 | `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit. | Tell the user it timed out; ask whether to extend or move on. |
 | `failed reason=stuck …` | 5 | Under `--fail-on-stuck` only. | Tell the user the target is stuck; surface the verdict. |
@@ -282,9 +282,14 @@ how they want to proceed — do NOT silently run the follow-up.
    keeperd to serve then show board", persistent: true })`.
 3. On `[keeper-await] met condition=server-up …` → run the follow-up.
 
-This is also the recovery path when a plain `keeper await <id>` exits
-`failed reason=unreachable`: arm `keeper await server-up` to block through
-the bounce, then re-arm the original wait once it fires `met`.
+A plain `keeper await <id>` reconnects FOREVER (fn-757) — it blocks
+straight through a keeperd bounce and never exits `reason=unreachable`, so
+in the common case you do NOT need this recovery dance; just let the
+original wait ride. `server-up` is only the recovery path for a wait armed
+with the opt-in `--connect-timeout` flag (which DOES exit
+`reason=unreachable` past its deadline): arm `keeper await server-up` to
+block through the bounce, then re-arm the original wait — or simply re-arm
+it WITHOUT `--connect-timeout` so it waits forever.
 
 ### Wait until my background script finishes (monitor-running)
 
