@@ -65,7 +65,14 @@
  *     "waiting" }` scope means "no dropped events to recover," not "no
  *     subscription."
  *   - Capped-backoff reconnect: 250 ms → 5000 ms doubling per attempt;
- *     resets on a successful connection.
+ *     resets on a successful connection. By DEFAULT this is reconnect-
+ *     forever (the board/TUI contract). An opt-in per-caller `giveUpPolicy`
+ *     (fn-750.1) bounds the CONTINUOUS-UNPAINTED window instead: when no
+ *     first `result` lands within `deadlineMs` (anchor armed at subscribe
+ *     start, cleared on first paint, re-armed on a post-paint drop), the
+ *     driver tears down and fires `onFatal({ code: "unreachable" })` once.
+ *     Bounds both never-connected and was-connected-then-lost; `keeper
+ *     await` opts in, the board does not.
  *   - Steady-poll backstop (500 ms) refetches each subscribed collection
  *     every tick, coalesced per collection via `queryInFlight` /
  *     `refetchDirty`.
@@ -208,6 +215,35 @@ export interface FatalError {
   readonly code: string;
   readonly rev?: number;
   readonly message: string;
+}
+
+/**
+ * Opt-in bounded give-up policy (fn-750.1). When set, the driver bounds how
+ * long it will spin reconnecting without ever PAINTING (producing a first
+ * `result`). The deadline is a CONTINUOUS-UNPAINTED wall-clock budget, not an
+ * attempt count: `attempt` resets to 0 on every socket `open`, so a flapping
+ * connection that accepts-then-drops forever would never trip an attempt
+ * cap. The unpainted anchor is armed at subscribe start, CLEARED on first
+ * paint (the first `result` frame — NOT socket `open`, so a half-up daemon
+ * that accepts the connection but never serves still gives up), and RE-ARMED
+ * on any drop after a paint (so the post-bounce window is fresh). When
+ * `now() - anchor >= deadlineMs`, the driver tears the connection down and
+ * fires `onFatal({ code: "unreachable", ... })` exactly once — same
+ * teardown-before-`onFatal` ordering as the terminal-query-shape error path.
+ *
+ * Default (no policy) is reconnect-forever — the board TUI and every other
+ * current caller is untouched (zero edits). `keeper await` opts in.
+ *
+ * Bounds BOTH the never-connected case (anchor armed at start, never cleared)
+ * and the was-connected-then-lost case (re-armed on a post-paint drop).
+ */
+export interface GiveUpPolicy {
+  /**
+   * Continuous-unpainted wall-clock budget in milliseconds. Measured against
+   * the injected `now()` clock (see `MultiOptions.now`), so the fake-timer
+   * test harness can drive the deadline without advancing real wall-clock.
+   */
+  readonly deadlineMs: number;
 }
 
 /**
@@ -619,6 +655,20 @@ interface MultiOptions {
   readonly onLifecycle?: LifecycleCallback;
   readonly onFatal: (err: FatalError) => void;
   readonly connect: ConnectFactory;
+  /**
+   * Opt-in bounded give-up (fn-750.1). Absent → reconnect-forever (the
+   * board/TUI default, zero-touch). Forwarded verbatim by both public
+   * helpers.
+   */
+  readonly giveUpPolicy?: GiveUpPolicy;
+  /**
+   * Injectable monotonic-ish clock (unix ms), default `Date.now`. The
+   * give-up deadline is measured against THIS, not `Date.now()` directly,
+   * so the fake-timer test harness — which fast-forwards `setTimeout`
+   * synchronously WITHOUT advancing `Date.now()` — can drive the deadline
+   * deterministically. Production callers omit it.
+   */
+  readonly now?: () => number;
 }
 
 /**
@@ -638,7 +688,9 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     onLifecycle,
     onFatal,
     connect,
+    giveUpPolicy,
   } = opts;
+  const now = opts.now ?? Date.now;
   const byCollection = new Map(states.map((s) => [s.collection, s]));
   // Parallel id-keyed index for multi-sub-aware routing. The server (post
   // fn-632.1) echoes each query's `id` on its `result`/`patch`/`meta`
@@ -671,6 +723,99 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   // backoff doesn't leak the timer. Use `setTimeout` directly (not
   // `Bun.sleep`) so we can `clearTimeout` from `dispose()`.
   let sleepResolve: (() => void) | null = null;
+  // ---- fn-750.1 bounded give-up state ----
+  // The continuous-unpainted wall-clock anchor (unix ms via the injected
+  // `now()` clock). `null` = currently painted (or no policy). Armed at
+  // subscribe start, CLEARED on first paint, RE-ARMED on a post-paint drop.
+  let unpaintedAnchor: number | null = null;
+  // Whether ANY collection has ever produced a `result`. Distinguishes the
+  // never-connected case (don't re-arm the anchor on a drop we never
+  // painted from — it's already armed and counting) from the
+  // was-connected-then-lost case (re-arm: the post-bounce window is fresh).
+  let everPainted = false;
+  // A wall-clock timer that backstops the loop-top deadline check: a
+  // half-up daemon that accepts the connection and holds it open WITHOUT
+  // ever serving never closes the socket, so `connectOnce` never returns
+  // and the `connectWithRetry` loop never re-iterates to run its
+  // synchronous deadline check. This timer fires `fireGiveUp` independently.
+  // Cancelled in `dispose()` and re-armed (never accumulated) on each
+  // anchor (re-)arm.
+  let giveUpTimer: ReturnType<typeof setTimeout> | null = null;
+
+  /**
+   * Arm (or re-arm) the unpainted anchor + its backstop timer. No-op when
+   * there is no give-up policy or we're shutting down. Always cancels any
+   * prior timer first so timers never accumulate across reconnects.
+   */
+  function armGiveUp(): void {
+    if (!giveUpPolicy || shuttingDown) {
+      return;
+    }
+    unpaintedAnchor = now();
+    if (giveUpTimer !== null) {
+      clearTimeout(giveUpTimer);
+      giveUpTimer = null;
+    }
+    giveUpTimer = setTimeout(() => {
+      giveUpTimer = null;
+      checkGiveUp();
+    }, giveUpPolicy.deadlineMs);
+  }
+
+  /** Clear the anchor + cancel the backstop timer (called on first paint). */
+  function clearGiveUp(): void {
+    unpaintedAnchor = null;
+    if (giveUpTimer !== null) {
+      clearTimeout(giveUpTimer);
+      giveUpTimer = null;
+    }
+  }
+
+  /**
+   * Check whether the continuous-unpainted deadline has elapsed and, if so,
+   * give up. Measured against the injected `now()` clock so the fake-timer
+   * harness can drive it without real wall-clock advancing.
+   *
+   * Called from two sites: (1) the top of every `connectWithRetry` backoff
+   * iteration (the deterministic path — the synchronous reject loop), and
+   * (2) the backstop timer's callback (the half-up-daemon path). The
+   * backstop timer is self-correcting under the fast-forward harness: if it
+   * fires before the `now()`-measured deadline is actually reached (the
+   * harness runs `setTimeout` synchronously without advancing `Date.now()`
+   * / the injected clock), it RE-ARMS instead of firing — the deadline is
+   * owned by `now()`, not the timer's nominal delay.
+   */
+  function checkGiveUp(): void {
+    if (!giveUpPolicy || shuttingDown || unpaintedAnchor === null) {
+      return;
+    }
+    if (now() - unpaintedAnchor < giveUpPolicy.deadlineMs) {
+      // Backstop timer fired early relative to the injected clock — re-arm
+      // off the residual budget rather than giving up prematurely.
+      if (giveUpTimer === null) {
+        giveUpTimer = setTimeout(
+          () => {
+            giveUpTimer = null;
+            checkGiveUp();
+          },
+          giveUpPolicy.deadlineMs - (now() - unpaintedAnchor),
+        );
+      }
+      return;
+    }
+    // Deadline reached. Replicate the terminal-error ordering: mark
+    // shutting-down, tear the connection down, THEN hand off to `onFatal`
+    // (so a custom `onFatal` observes the helper fully shut down, and
+    // exceptions propagate — same no-self-heal contract). `code` is the
+    // free-string `FatalError.code` (no new union member).
+    shuttingDown = true;
+    unpaintedAnchor = null;
+    teardownConnection();
+    onFatal({
+      code: "unreachable",
+      message: `give-up: no first paint within ${giveUpPolicy.deadlineMs}ms`,
+    });
+  }
 
   function emit(event: string, detail?: Record<string, unknown>): void {
     onLifecycle?.(event, detail);
@@ -881,6 +1026,15 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         }
       }
       state.gotResult = true;
+      // fn-750.1: FIRST PAINT clears the give-up anchor. Keyed off the
+      // first `result` frame (this is the only `gotResult = false → true`
+      // transition site), NOT socket `open` — a half-up daemon that
+      // accepts the connection but never serves a `result` must still give
+      // up. `everPainted` latches so a later drop re-arms a FRESH window.
+      if (unpaintedAnchor !== null) {
+        everPainted = true;
+        clearGiveUp();
+      }
       onResult(state);
       if (state.refetchDirty) {
         state.refetchDirty = false;
@@ -1051,6 +1205,16 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         // reconnect after this cycle isn't permanently suppressed.
         reconnecting = false;
         teardownConnection();
+        // fn-750.1: re-arm the give-up anchor on a POST-PAINT drop so the
+        // post-bounce window is fresh (bounds the was-connected-then-lost
+        // case). A drop BEFORE any paint leaves the start-armed anchor
+        // running — re-arming there would reset its clock and let an
+        // accept-then-drop flap dodge give-up forever. Only re-arm when the
+        // anchor is currently cleared (we were painted); a still-armed
+        // anchor keeps counting from where it started.
+        if (everPainted && unpaintedAnchor === null) {
+          armGiveUp();
+        }
         emit("disconnected");
         void connectWithRetry();
       },
@@ -1063,6 +1227,14 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   async function connectWithRetry(): Promise<void> {
     emit("connecting", { sock: sockPath });
     while (!shuttingDown) {
+      // fn-750.1: check the continuous-unpainted deadline at the top of
+      // every backoff iteration — the deterministic give-up path for the
+      // synchronous reject loop (the half-up-daemon path rides the backstop
+      // timer instead). `checkGiveUp` may set `shuttingDown`; bail if so.
+      checkGiveUp();
+      if (shuttingDown) {
+        return;
+      }
       try {
         await connectOnce();
         return;
@@ -1095,6 +1267,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     }
   }
 
+  // fn-750.1: arm the give-up anchor from subscribe start so the
+  // never-connected case is bounded from the very first attempt (the anchor
+  // clears on first paint; if no paint ever lands, the deadline trips). No-op
+  // without a policy. Armed BEFORE the loop boots so the first iteration's
+  // top-of-loop `checkGiveUp` sees a live anchor.
+  armGiveUp();
+
   // Boot the reconnect loop. Caller does not await — they consume snapshots
   // via the callback and rely on `dispose()` for shutdown.
   void connectWithRetry();
@@ -1111,6 +1290,14 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         clearInterval(pollTimer);
         pollTimer = null;
       }
+      // fn-750.1: cancel the give-up backstop timer so `dispose()` leaves no
+      // live timer holding the event loop open (the no-timer-accumulation
+      // contract — same as `pollTimer` / `reconnectTimer` above).
+      if (giveUpTimer !== null) {
+        clearTimeout(giveUpTimer);
+        giveUpTimer = null;
+      }
+      unpaintedAnchor = null;
       if (reconnectTimer) {
         clearTimeout(reconnectTimer);
         reconnectTimer = null;
@@ -1181,6 +1368,14 @@ export interface SubscribeCollectionOptions {
   readonly onLifecycle?: LifecycleCallback;
   readonly onFatal?: (err: FatalError) => void;
   readonly connect?: ConnectFactory;
+  /**
+   * Opt-in bounded give-up (fn-750.1). Absent → reconnect-forever (the
+   * sidecar/TUI default, zero-touch). When set, a continuous-unpainted
+   * window exceeding `deadlineMs` fires `onFatal({ code: "unreachable" })`.
+   */
+  readonly giveUpPolicy?: GiveUpPolicy;
+  /** Injectable clock for the give-up deadline (default `Date.now`). */
+  readonly now?: () => number;
 }
 
 /**
@@ -1242,6 +1437,10 @@ export function subscribeCollection(
       : { onLifecycle: opts.onLifecycle }),
     onFatal,
     connect,
+    ...(opts.giveUpPolicy === undefined
+      ? {}
+      : { giveUpPolicy: opts.giveUpPolicy }),
+    ...(opts.now === undefined ? {} : { now: opts.now }),
   });
 }
 
@@ -1278,6 +1477,15 @@ export interface SubscribeOptions {
   readonly onLifecycle?: LifecycleCallback;
   readonly onFatal?: (err: FatalError) => void;
   readonly connect?: ConnectFactory;
+  /**
+   * Opt-in bounded give-up (fn-750.1). Absent → reconnect-forever (the
+   * board/TUI default, zero-touch — `cli/board.ts` needs no edit). When
+   * set, a continuous-unpainted window exceeding `deadlineMs` fires
+   * `onFatal({ code: "unreachable" })`.
+   */
+  readonly giveUpPolicy?: GiveUpPolicy;
+  /** Injectable clock for the give-up deadline (default `Date.now`). */
+  readonly now?: () => number;
 }
 
 /**
@@ -1520,5 +1728,9 @@ export function subscribeReadiness(
     ...(onLifecycle === undefined ? {} : { onLifecycle }),
     onFatal,
     connect,
+    ...(opts.giveUpPolicy === undefined
+      ? {}
+      : { giveUpPolicy: opts.giveUpPolicy }),
+    ...(opts.now === undefined ? {} : { now: opts.now }),
   });
 }

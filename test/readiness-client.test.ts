@@ -50,6 +50,7 @@ import { encodeFrame, type ServerFrame } from "../src/protocol";
 import {
   type ConnectFactory,
   type FatalError,
+  type GiveUpPolicy,
   type ReadinessClientSnapshot,
   type ReadinessSocket,
   type SocketHandlers,
@@ -562,6 +563,300 @@ test("subscribeReadiness: capped-backoff reconnect sequence — 250, 500, 1000, 
     handle.dispose();
   } finally {
     globalThis.setTimeout = realSetTimeout;
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bounded give-up coverage (fn-750.1)
+//
+// `giveUpPolicy` bounds the CONTINUOUS-UNPAINTED window. The deadline is
+// measured against the injected `now()` clock — NOT `Date.now()` — because
+// the fake-timer harness fast-forwards `setTimeout` synchronously WITHOUT
+// advancing real wall-clock, so a `Date.now()`-keyed deadline would never
+// trip in test. The deterministic give-up path is the top-of-loop
+// `checkGiveUp()` in `connectWithRetry`; we drive it by advancing the
+// injected clock inside the intercepted `setTimeout` (simulating wall-clock
+// passing during each backoff sleep) so the next loop iteration's check sees
+// the deadline elapsed.
+// ---------------------------------------------------------------------------
+
+/**
+ * Intercept `setTimeout`: for each positive backoff sleep the helper
+ * schedules, advance the supplied `clock` by that delay (wall-clock passes
+ * during the sleep) and fire the callback on the next microtask so the
+ * `connectWithRetry` loop advances without real delay. Returns a `restore()`.
+ * Mirrors the capped-backoff test's interceptor, plus the clock advance.
+ */
+function installBackoffClockAdvancer(clock: { ms: number }): {
+  restore: () => void;
+} {
+  const realSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = ((
+    handler: Parameters<typeof realSetTimeout>[0],
+    timeout?: number,
+    ...args: unknown[]
+  ) => {
+    if (typeof timeout === "number" && timeout > 0) {
+      // Wall-clock advances by the sleep duration before the loop resumes.
+      clock.ms += timeout;
+      queueMicrotask(() => {
+        (handler as () => void)();
+      });
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }
+    return realSetTimeout(handler as () => void, timeout, ...args);
+  }) as typeof setTimeout;
+  return {
+    restore() {
+      globalThis.setTimeout = realSetTimeout;
+    },
+  };
+}
+
+test("give-up: continuously-unpainted >= deadline fires onFatal({code:'unreachable'}) exactly once", async () => {
+  // INVERTS the capped-backoff test's "onFatal must not fire" assertion: a
+  // connect that NEVER succeeds, under an opt-in `giveUpPolicy`, must give
+  // up — `onFatal({code:"unreachable"})` fires once after the
+  // continuous-unpainted deadline elapses.
+  const clock = { ms: 1_000_000 };
+  const advancer = installBackoffClockAdvancer(clock);
+  try {
+    let calls = 0;
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+
+    // Reject forever — an unreachable socket (never calls `open`, never
+    // paints). Each rejection schedules one backoff sleep; the advancer
+    // bumps the clock so a few iterations cross the 2 s deadline.
+    const factory: ConnectFactory = (_path, _handlers) => {
+      calls += 1;
+      return Promise.reject(new Error(`refused #${calls}`));
+    };
+
+    const fatals: FatalError[] = [];
+    const giveUpPolicy: GiveUpPolicy = { deadlineMs: 2_000 };
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-giveup",
+      onSnapshot: () => {
+        throw new Error("onSnapshot must not fire — no result ever delivered");
+      },
+      onFatal: (err) => {
+        fatals.push(err);
+        resolveDone?.();
+        resolveDone = null;
+      },
+      connect: factory,
+      giveUpPolicy,
+      now: () => clock.ms,
+    });
+
+    await done;
+    // Let any straggler microtasks flush so a second give-up (if the code
+    // were buggy) would be observable.
+    await Promise.resolve();
+    await Promise.resolve();
+
+    // Fired exactly once, with the `unreachable` code.
+    expect(fatals).toHaveLength(1);
+    expect(fatals[0]?.code).toBe("unreachable");
+    // The deadline was 2 s; the backoff sequence (250+500+1000+2000=3750)
+    // crosses it on the 4th iteration's top-of-loop check — well before any
+    // attempt cap would matter. The loop stopped: no further connect calls
+    // after the give-up.
+    const callsAtGiveUp = calls;
+    await Promise.resolve();
+    expect(calls).toBe(callsAtGiveUp);
+
+    handle.dispose();
+  } finally {
+    advancer.restore();
+  }
+});
+
+test("give-up: first paint resets the clock; a later post-paint drop re-arms a fresh window", () => {
+  // Two-part: (1) a successful first-paint CLEARS the anchor, so advancing
+  // the clock past the deadline WHILE PAINTED never fires give-up; (2) a
+  // post-paint drop RE-ARMS the anchor — the post-bounce window is fresh,
+  // so a subsequent continuous-unpainted span >= deadline DOES fire.
+  const clock = { ms: 1_000_000 };
+  const realSetTimeout = globalThis.setTimeout;
+  // Swallow the helper's backoff sleeps so the reconnect loop sits idle
+  // between our manual clock pushes (we drive give-up via the loop-top
+  // check on the NEXT connect attempt, fired by `closeFromServer`).
+  const scheduled: (() => void)[] = [];
+  globalThis.setTimeout = ((
+    handler: Parameters<typeof realSetTimeout>[0],
+    timeout?: number,
+    ...args: unknown[]
+  ) => {
+    if (typeof timeout === "number" && timeout > 0) {
+      scheduled.push(handler as () => void);
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }
+    return realSetTimeout(handler as () => void, timeout, ...args);
+  }) as typeof setTimeout;
+  try {
+    const fatals: FatalError[] = [];
+    let openCount = 0;
+    // A factory that opens (paints-capable) on the first connect, then on
+    // the post-drop reconnect rejects forever (unreachable after the
+    // bounce) so the loop-top check is the only give-up driver.
+    const socketRef: { current: MockSocket | null } = { current: null };
+    const factory: ConnectFactory = async (_path, handlers) => {
+      openCount += 1;
+      if (openCount > 1) {
+        // Post-bounce: unreachable. Reject so the loop iterates and the
+        // top-of-loop `checkGiveUp` sees the re-armed anchor.
+        return Promise.reject(new Error("refused post-bounce"));
+      }
+      let resolveDone: (() => void) | null = null;
+      const done = new Promise<void>((resolve) => {
+        resolveDone = resolve;
+      });
+      const sock: MockSocket = {
+        outbound: [],
+        ended: false,
+        handlers,
+        write(data: string): void {
+          sock.outbound.push(data);
+        },
+        end(): void {
+          sock.ended = true;
+          resolveDone?.();
+          resolveDone = null;
+        },
+        deliver(frames: ServerFrame[]): void {
+          const payload = frames.map(encodeFrame).join("");
+          sock.handlers.data(sock, Buffer.from(payload, "utf8"));
+        },
+        closeFromServer(): void {
+          sock.handlers.close();
+          resolveDone?.();
+          resolveDone = null;
+        },
+        takeOutbound(): unknown[] {
+          const parsed = sock.outbound.map((line) => {
+            const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
+            return JSON.parse(trimmed);
+          });
+          sock.outbound.length = 0;
+          return parsed;
+        },
+      };
+      socketRef.current = sock;
+      handlers.open(sock);
+      await done;
+      return sock;
+    };
+
+    const giveUpPolicy: GiveUpPolicy = { deadlineMs: 2_000 };
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-giveup-rearm",
+      onSnapshot: () => {
+        /* ignore */
+      },
+      onFatal: (err) => fatals.push(err),
+      connect: factory,
+      giveUpPolicy,
+      now: () => clock.ms,
+    });
+
+    const sock = socketRef.current;
+    if (!sock) {
+      throw new Error("mock socket never installed");
+    }
+
+    // (1) First paint: ANY collection's first `result` clears the anchor.
+    sock.deliver([emptyResult("epics", "test-giveup-rearm-epics")]);
+    // Advance WELL past the deadline while painted — give-up must NOT fire.
+    clock.ms += 10_000;
+    // Drain any scheduled backoff (none expected on the painted path).
+    expect(fatals).toHaveLength(0);
+
+    // (2) Post-paint drop: re-arms a FRESH anchor at the current clock.
+    sock.closeFromServer();
+    // The reconnect loop now rejects forever (openCount > 1). Drive a few
+    // backoff iterations, advancing the clock past the fresh deadline so the
+    // top-of-loop check trips.
+    clock.ms += 2_500;
+    // Flush the rejected-connect microtask chain + the swallowed backoff
+    // callbacks so the loop re-iterates and runs `checkGiveUp`.
+    return (async () => {
+      for (let i = 0; i < 8 && fatals.length === 0; i++) {
+        // Fire any swallowed backoff callbacks to advance the loop.
+        const pending = scheduled.splice(0);
+        for (const cb of pending) {
+          cb();
+        }
+        await Promise.resolve();
+        await Promise.resolve();
+      }
+      expect(fatals).toHaveLength(1);
+      expect(fatals[0]?.code).toBe("unreachable");
+      handle.dispose();
+    })();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+  }
+});
+
+test("give-up: no policy (default) — reconnect-forever, onFatal never fires even past any deadline", async () => {
+  // Regression: the board/TUI contract. With NO `giveUpPolicy`, the helper
+  // reconnects forever; an injected clock advanced arbitrarily far never
+  // produces a give-up. (The capped-backoff sequence + no-onFatal assertion
+  // for the no-policy case is covered by the dedicated capped-backoff test
+  // above; this asserts the give-up arm specifically stays inert.)
+  const clock = { ms: 1_000_000 };
+  const advancer = installBackoffClockAdvancer(clock);
+  try {
+    let calls = 0;
+    let resolveAfterN: (() => void) | null = null;
+    const observedEnough = new Promise<void>((resolve) => {
+      resolveAfterN = resolve;
+    });
+    const factory: ConnectFactory = (_path, _handlers) => {
+      calls += 1;
+      if (calls >= 12) {
+        // Plenty of reject iterations (clock now far past any plausible
+        // deadline). Hand back a never-resolving promise to idle the loop.
+        resolveAfterN?.();
+        resolveAfterN = null;
+        return new Promise<ReadinessSocket>(() => {
+          /* never resolves — held until dispose() */
+        });
+      }
+      return Promise.reject(new Error(`refused #${calls}`));
+    };
+
+    const fatals: FatalError[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-noinpolicy",
+      onSnapshot: () => {
+        throw new Error("onSnapshot must not fire");
+      },
+      onFatal: (err) => fatals.push(err),
+      connect: factory,
+      // No giveUpPolicy. Inject `now` to prove the give-up arm stays inert
+      // even with a controllable clock advanced far past any deadline.
+      now: () => clock.ms,
+    });
+
+    await observedEnough;
+    await Promise.resolve();
+
+    // Clock has advanced by the full backoff sum (>> any deadline), yet
+    // give-up never fired — default is reconnect-forever.
+    expect(fatals).toHaveLength(0);
+    expect(clock.ms).toBeGreaterThan(1_000_000 + 10_000);
+
+    handle.dispose();
+  } finally {
+    advancer.restore();
   }
 });
 
