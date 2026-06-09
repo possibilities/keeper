@@ -80,7 +80,16 @@
  *     `state.byId`, `state.order`, AND `gotResult = false` for every
  *     collection. The `gotResult` reset is what board.ts has and
  *     autopilot.ts's previous standalone code was missing — centralized
- *     here so both consumers inherit the correct behavior.
+ *     here so both consumers inherit the correct behavior. fn-750.3: a
+ *     client-initiated teardown also HARD-destroys the held socket
+ *     (`destroySocket` → `Bun.Socket.terminate()`, NOT `end()`) so the
+ *     native read/write buffer + libuv handle are freed IMMEDIATELY rather
+ *     than pinned until a (possibly half-up / never-arriving) peer FIN.
+ *     A graceful `end()` against a wedged daemon left ~1.4–2.2 KB of native
+ *     memory — invisible to the JS heap, surviving full GC — leaking per
+ *     reconnect; on a flapping daemon that compounds to the observed ~2GB
+ *     `keeper await` runaway. `scripts/subscribe-bounce-soak.ts` is the
+ *     repro + flat-RSS evidence gate.
  *   - `dispose()` is idempotent: pre-first-paint bails clean (no callback
  *     fires); during reconnect backoff cancels the pending timer and marks
  *     `shuttingDown`; called twice is a no-op.
@@ -248,13 +257,30 @@ export interface GiveUpPolicy {
 
 /**
  * Minimal socket shape the helper drives. Matches the surface area of
- * `Bun.Socket` that the driver touches — `write` to push frames,
- * `end` to half-close. Surfaced as a named type so the test-injection
- * `connect` factory can return a mock without depending on `bun:types`.
+ * `Bun.Socket` that the driver touches — `write` to push frames, `end` to
+ * half-close (graceful FIN), `terminate` to HARD-close. Surfaced as a named
+ * type so the test-injection `connect` factory can return a mock without
+ * depending on `bun:types`.
+ *
+ * `terminate` is the fn-750.3 leak fix. On EVERY client-initiated teardown the
+ * driver must `terminate()` the socket, NOT `end()` it. `end()` is a graceful
+ * FIN: against a HALF-UP or dead daemon that never closes its side, the socket
+ * lingers and its native read/write buffer + libuv socket handle — invisible to
+ * the JS heap, so they NEVER raise heap pressure and never trigger a GC — stay
+ * PINNED and survive a full `Bun.gc(true)`. One leaks per reconnect; a flapping
+ * daemon over hours accumulates millions → the observed ~2GB `keeper await`
+ * runaway. `terminate()` forcibly frees the native resources immediately,
+ * peer-cooperation-free. (Measured: ~1.4–2.2 KB pinned per `end()`/dropped
+ * socket, ~0 per `terminate()`d socket — `scripts/subscribe-bounce-soak.ts`.)
+ *
+ * Optional so the in-memory mock socket (tests) needn't implement it; the
+ * driver feature-detects (`sock.terminate?.()`) and the production
+ * `Bun.connect` socket always provides it.
  */
 export interface ReadinessSocket {
   write(data: string): void;
   end(): void;
+  terminate?(): void;
 }
 
 /**
@@ -863,17 +889,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       sock: sockPath,
       age_ms: ageMs,
     });
-    // Grab the socket reference BEFORE `teardownConnection()` nulls
-    // `currentSock` — otherwise the `end()` below is silently a no-op
-    // and the underlying socket never closes, no `close` callback ever
-    // fires, and `connectWithRetry` never re-runs.
-    const sock = currentSock;
+    // `teardownConnection()` now HARD-destroys the held `currentSock`
+    // (fn-750.3 `destroySocket` → `terminate()`) before nulling it, so the
+    // socket is forcibly closed here — no separate `end()` needed (and
+    // `terminate()` releases the native buffers that a graceful `end()` left
+    // pinned against a wedged peer, which is the leak this path drove). The
+    // resulting `close` callback still fires, so `connectWithRetry` re-runs.
     teardownConnection();
-    try {
-      sock?.end();
-    } catch {
-      // already torn down
-    }
   }
 
   function pollAll(): void {
@@ -1099,17 +1121,14 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       // recover.
       if (isTerminal(states)) {
         shuttingDown = true;
-        try {
-          currentSock?.end();
-        } catch {
-          // already torn down
-        }
-        // Release the steady-poll interval and reset per-collection state
-        // before handing the terminal error to the caller. The default
-        // `onFatal` is `process.exit(1)` so the leak is invisible there,
-        // but a custom `onFatal` that returns (tests, in-process
-        // consumers) would otherwise leave a live `setInterval` holding
-        // the event loop open indefinitely.
+        // Release the steady-poll interval, HARD-destroy the socket
+        // (`teardownConnection` → `destroySocket` → `terminate()`, fn-750.3 —
+        // no separate `end()` needed), and reset per-collection state before
+        // handing the terminal error to the caller. The default `onFatal` is
+        // `process.exit(1)` so the leak is invisible there, but a custom
+        // `onFatal` that returns (tests, in-process consumers) would otherwise
+        // leave a live `setInterval` + an undestroyed socket holding the event
+        // loop open indefinitely.
         teardownConnection();
         // Hand the terminal error off to the caller (default:
         // `process.exit(1)`) AFTER tearing the connection down, so a
@@ -1126,10 +1145,39 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     }
   }
 
+  /**
+   * fn-750.3: HARD-destroy a socket on a client-initiated teardown. The leak
+   * fix — `terminate()` (not `end()`) forcibly frees the native read/write
+   * buffer + libuv handle immediately, so a half-up/dead daemon that never
+   * closes its side can't pin them across reconnects (the ~2GB runaway). Falls
+   * back to `end()` for any socket without `terminate` (the in-memory test
+   * mock), and is fully guarded — a teardown must never throw.
+   */
+  function destroySocket(sock: ReadinessSocket): void {
+    try {
+      if (typeof sock.terminate === "function") {
+        sock.terminate();
+      } else {
+        sock.end();
+      }
+    } catch {
+      // socket already gone — nothing to release
+    }
+  }
+
   function teardownConnection(): void {
     if (pollTimer) {
       clearInterval(pollTimer);
       pollTimer = null;
+    }
+    // fn-750.3: destroy the live socket BEFORE dropping the reference. Pre-fix
+    // this only nulled `currentSock`, leaving an `end()`-or-undestroyed socket
+    // whose native buffers leaked on a flapping daemon. `currentSock` is the
+    // peer-closed socket on the `close`-handler path (already releasing) and
+    // the still-open socket on the give-up/`checkGiveUp` path (the one that
+    // genuinely leaks without this) — destroying both is safe and idempotent.
+    if (currentSock !== null) {
+      destroySocket(currentSock);
     }
     currentSock = null;
     for (const s of states) {
@@ -1178,13 +1226,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         } catch (err) {
           // A protocol-frame parse failure is fatal for this connection
           // but not for the caller's process — surface via lifecycle
-          // and tear down. The reconnect loop will try again.
+          // and tear down. The reconnect loop will try again. fn-750.3:
+          // HARD-destroy (not `end()`) so the native socket buffers are freed
+          // immediately even if the peer is wedged; the `close` callback still
+          // fires and drives the reconnect.
           emit("error", { message: (err as Error).message });
-          try {
-            sock.end();
-          } catch {
-            // ignore
-          }
+          destroySocket(sock);
           return;
         }
         for (const line of lines) {
@@ -1306,14 +1353,18 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         sleepResolve?.();
         sleepResolve = null;
       }
-      try {
-        // No `id` → drop every subscription on this connection in one frame.
-        if (currentSock != null) {
+      if (currentSock != null) {
+        try {
+          // No `id` → drop every subscription on this connection in one frame
+          // (best-effort server etiquette; the daemon may already be gone).
           currentSock.write(encodeFrame({ type: "unsubscribe" }));
-          currentSock.end();
+        } catch {
+          // socket already gone — the unsubscribe is best-effort
         }
-      } catch {
-        // socket already gone — nothing to release
+        // fn-750.3: HARD-destroy (not `end()`) so `dispose()` against a dead /
+        // half-up daemon frees the native socket buffers immediately instead of
+        // leaving them pinned in FIN_WAIT — the same leak the reconnect path hit.
+        destroySocket(currentSock);
       }
       currentSock = null;
     },

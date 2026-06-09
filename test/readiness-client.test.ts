@@ -65,6 +65,13 @@ import {
 interface MockSocket extends ReadinessSocket {
   readonly outbound: string[];
   ended: boolean;
+  /**
+   * fn-750.3: count of `terminate()` calls (the leak-fix hard-destroy).
+   * Optional so the many inline mock-socket factories that don't care about
+   * teardown-destroy needn't all wire it; the leak-fix test uses the shared
+   * `makeMockConnect`, which does.
+   */
+  terminated?: number;
   handlers: SocketHandlers;
   /** Deliver one or more newline-terminated frames to the helper's `data`. */
   deliver(frames: ServerFrame[]): void;
@@ -102,6 +109,7 @@ function makeMockConnect(): MockConnectResult {
     const sock: MockSocket = {
       outbound: [],
       ended: false,
+      terminated: 0,
       handlers,
       write(data: string): void {
         sock.outbound.push(data);
@@ -113,6 +121,15 @@ function makeMockConnect(): MockConnectResult {
         // in `connectOnce` unblocks, but only fire `close` if the test
         // explicitly asks via `closeFromServer()` — otherwise tests
         // that just call `dispose()` would race the reconnect path.
+        resolveDone?.();
+        resolveDone = null;
+      },
+      terminate(): void {
+        // fn-750.3: the leak-fix hard-destroy. Count it and resolve the
+        // `connect` promise (same as `end`), since a real `terminate()` also
+        // ends the socket's life so the driver's `await connect(...)` unblocks.
+        sock.terminated = (sock.terminated ?? 0) + 1;
+        sock.ended = true;
         resolveDone?.();
         resolveDone = null;
       },
@@ -371,6 +388,80 @@ test("subscribeReadiness: dispose() is idempotent — second call is a no-op", (
   expect(snapshots.length).toBe(snapsBefore);
   expect(lifecycle.length).toBe(lifecycleBefore);
   expect(fatalCalls).toBe(fatalBefore);
+});
+
+// ---------------------------------------------------------------------------
+// fn-750.3: client-initiated teardown HARD-destroys the socket
+// (`terminate()`), not just `end()`/null. The ~2GB `keeper await` leak was
+// `end()` against a wedged daemon leaving native socket buffers pinned across
+// reconnects; the fix routes every teardown through `terminate()`. Runtime
+// repro + flat-RSS evidence: `scripts/subscribe-bounce-soak.ts`.
+// ---------------------------------------------------------------------------
+
+test("subscribeReadiness: dispose() terminate()s the socket (fn-750.3 leak fix)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-term",
+    onSnapshot: () => {},
+    onFatal: () => {},
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Reach first-paint so a live socket exists to tear down.
+  sock.takeOutbound();
+  sock.deliver([
+    emptyResult("epics", "test-term-epics"),
+    emptyResult("jobs", "test-term-jobs"),
+    emptyResult("subagent_invocations", "test-term-subagent-invocations"),
+    emptyResult("git", "test-term-git"),
+    emptyResult("dead_letters", "test-term-dead-letters"),
+    emptyResult("pending_dispatches", "test-term-pending-dispatches"),
+  ]);
+
+  expect(sock.terminated ?? 0).toBe(0);
+  handle.dispose();
+  // The unsubscribe still goes out (best-effort etiquette), THEN terminate().
+  expect(sock.terminated ?? 0).toBe(1);
+});
+
+test("subscribeReadiness: a post-paint disconnect terminate()s the dropped socket (fn-750.3)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-term2",
+    onSnapshot: () => {},
+    onFatal: () => {},
+    connect: factory,
+  });
+  const sock1 = socketRef.current;
+  if (!sock1) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Paint, then simulate the daemon dropping the connection. The `close`
+  // handler tears down (terminate the held socket) and spawns a reconnect —
+  // socketRef now points at the FRESH socket, so we capture sock1 first.
+  sock1.deliver([
+    emptyResult("epics", "test-term2-epics"),
+    emptyResult("jobs", "test-term2-jobs"),
+    emptyResult("subagent_invocations", "test-term2-subagent-invocations"),
+    emptyResult("git", "test-term2-git"),
+    emptyResult("dead_letters", "test-term2-dead-letters"),
+    emptyResult("pending_dispatches", "test-term2-pending-dispatches"),
+  ]);
+  expect(sock1.terminated ?? 0).toBe(0);
+
+  sock1.closeFromServer();
+
+  // The dropped socket was hard-destroyed on teardown (no `end()`/null leak).
+  expect(sock1.terminated ?? 0).toBe(1);
+
+  handle.dispose();
 });
 
 // ---------------------------------------------------------------------------
