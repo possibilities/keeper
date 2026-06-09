@@ -82,5 +82,5 @@ test fails if a column is added to events without INGEST_EVENTS_COLUMNS.
 - [ ] README failure-mode + replay prose updated; full bun test green
 
 ## Done summary
-
+Events-log ingester now parks unparseable poison lines as dead_letters (status='poison', deterministic dl_id, ON CONFLICT DO NOTHING) in the same transaction as the events INSERTs + offset advance, then advances past them — draining multi-poison files while torn tails still block; emits an events-ingest-poison backstop per parked line. Dead-letter replay (recoverOneDeadLetter) repointed from the stale 29-col EVENTS_COLUMNS (deleted) to the live 33-col INGEST_EVENTS_COLUMNS, with a lockstep test pinning that list to the live events schema.
 ## Evidence

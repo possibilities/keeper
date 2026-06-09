@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Poison-line ingest parking",
-  "updated_at": "2026-06-09T22:06:08.002453Z"
+  "updated_at": "2026-06-09T23:13:04.223029Z",
+  "worker_done_at": "2026-06-09T23:13:04.223029Z"
 }
