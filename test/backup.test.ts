@@ -32,9 +32,12 @@ import {
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BACKUP_INTERVAL_MS,
   backupDb,
   DEFAULT_BACKUP_RETENTION,
+  isCatchUpDue,
   isVerifiedOk,
+  newestSnapshotMs,
   pruneSnapshots,
   resolveBackupDir,
   restoreInstructions,
@@ -83,6 +86,59 @@ test("isVerifiedOk: exactly one `ok` row is healthy; anything else is not", () =
 
 test("resolveBackupDir: a sibling `backups/` of the DB", () => {
   expect(resolveBackupDir("/a/b/keeper.db")).toBe("/a/b/backups");
+});
+
+// ---------------------------------------------------------------------------
+// fn-753 — boot-time catch-up overdue check
+// ---------------------------------------------------------------------------
+
+test("newestSnapshotMs: null on a missing/empty dir or no matching files", () => {
+  const dir = join(tmpDir, "backups");
+  // Missing dir.
+  expect(newestSnapshotMs(dir)).toBe(null);
+  // Empty dir.
+  mkdirSync(dir, { recursive: true });
+  expect(newestSnapshotMs(dir)).toBe(null);
+  // Non-snapshot files are ignored.
+  writeFileSync(join(dir, "notes.txt"), "x");
+  writeFileSync(join(dir, "keeper.db"), "x");
+  expect(newestSnapshotMs(dir)).toBe(null);
+});
+
+test("newestSnapshotMs: parses the lexically-newest stamp as local time", () => {
+  const dir = join(tmpDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, snapshotName(new Date(2026, 5, 7, 1, 0, 0))), "x");
+  const newest = new Date(2026, 5, 7, 3, 30, 15);
+  writeFileSync(join(dir, snapshotName(newest)), "x");
+  writeFileSync(join(dir, snapshotName(new Date(2026, 5, 7, 2, 0, 0))), "x");
+  expect(newestSnapshotMs(dir)).toBe(newest.getTime());
+});
+
+test("isCatchUpDue: NO snapshots ⇒ due (boot with no prior snapshot)", () => {
+  const dir = join(tmpDir, "backups");
+  expect(isCatchUpDue(dir, Date.now())).toBe(true);
+});
+
+test("isCatchUpDue: OVERDUE snapshot ⇒ due (older than the interval)", () => {
+  const dir = join(tmpDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  const old = new Date(Date.now() - BACKUP_INTERVAL_MS - 60_000);
+  writeFileSync(join(dir, snapshotName(old)), "x");
+  expect(isCatchUpDue(dir, Date.now())).toBe(true);
+  // Exactly at the interval boundary is also due (>=).
+  const boundary = new Date(Date.now() - BACKUP_INTERVAL_MS);
+  rmSync(join(dir, snapshotName(old)));
+  writeFileSync(join(dir, snapshotName(boundary)), "x");
+  expect(isCatchUpDue(dir, Date.now())).toBe(true);
+});
+
+test("isCatchUpDue: FRESH snapshot ⇒ NOT due (regular timer unchanged)", () => {
+  const dir = join(tmpDir, "backups");
+  mkdirSync(dir, { recursive: true });
+  const fresh = new Date(Date.now() - 60_000); // 1 min ago, well within 24h
+  writeFileSync(join(dir, snapshotName(fresh)), "x");
+  expect(isCatchUpDue(dir, Date.now())).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

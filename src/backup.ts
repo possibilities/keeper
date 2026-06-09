@@ -121,6 +121,74 @@ export function snapshotName(now: Date): string {
   return `keeper-${stamp}.db`;
 }
 
+/**
+ * Default startup delay (ms) before a boot-time catch-up backup fires (fn-753).
+ * Short enough that a keeperd that restarts more often than the 24h interval
+ * (the LaunchAgent crash-recovery scenario, where a plain `setInterval` would
+ * silently never reach its first fire) still lands a snapshot promptly, but
+ * long enough to stay off the boot-drain critical path — the catch-up is a
+ * heavy `VACUUM INTO`, so it waits for the daemon to settle first.
+ */
+export const BACKUP_CATCHUP_DELAY_MS = 45_000;
+
+/**
+ * The chronological epoch-ms of the NEWEST verified snapshot in `backupDir`, or
+ * `null` if the dir is missing/empty or holds no `keeper-<stamp>.db` file.
+ *
+ * Snapshot names sort chronologically by their lexical `YYYYMMDDTHHMMSS` stamp
+ * (see {@link snapshotName}), so the lexically-greatest matching name is the
+ * newest — no `statSync` mtime trust (a copy/restore rewrites mtimes). The
+ * stamp is parsed as LOCAL time to match how {@link snapshotName} mints it
+ * (`getFullYear`/`getHours`/etc.), so the round-trip is symmetric across DST.
+ * Pure read of the dir; never throws (a missing dir or unparseable name ⇒
+ * `null`).
+ */
+export function newestSnapshotMs(backupDir: string): number | null {
+  let names: string[];
+  try {
+    names = readdirSync(backupDir);
+  } catch {
+    return null; // dir missing ⇒ no snapshots
+  }
+  const newest = names
+    .filter((n) => /^keeper-\d{8}T\d{6}\.db$/.test(n))
+    .sort()
+    .at(-1);
+  if (newest === undefined) return null;
+  // keeper-YYYYMMDDTHHMMSS.db — slice the fixed-width stamp out of the name.
+  const m = newest.match(
+    /^keeper-(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})\.db$/,
+  );
+  if (m === null) return null;
+  const [, y, mo, d, h, mi, s] = m;
+  const ts = new Date(
+    Number(y),
+    Number(mo) - 1,
+    Number(d),
+    Number(h),
+    Number(mi),
+    Number(s),
+  ).getTime();
+  return Number.isNaN(ts) ? null : ts;
+}
+
+/**
+ * Whether a boot-time catch-up backup is due (fn-753): true iff there is NO
+ * newest snapshot, OR the newest is at least `intervalMs` old as of `nowMs`.
+ * Pure given its inputs (`nowMs` injectable for tests; production passes
+ * `Date.now()`). A future-dated snapshot (clock skew) reads as fresh ⇒ no
+ * catch-up, the conservative choice.
+ */
+export function isCatchUpDue(
+  backupDir: string,
+  nowMs: number,
+  intervalMs: number = BACKUP_INTERVAL_MS,
+): boolean {
+  const newest = newestSnapshotMs(backupDir);
+  if (newest === null) return true;
+  return nowMs - newest >= intervalMs;
+}
+
 /** Outcome of a single backup run — pure data the caller logs / asserts. */
 export interface BackupResult {
   /** Absolute path of the verified snapshot, or `null` on failure. */

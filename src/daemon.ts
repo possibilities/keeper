@@ -93,7 +93,14 @@ import {
   type BackstopRecord,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
-import { BACKUP_INTERVAL_MS, backupDb, liveBackupPage } from "./backup";
+import {
+  BACKUP_CATCHUP_DELAY_MS,
+  BACKUP_INTERVAL_MS,
+  backupDb,
+  isCatchUpDue,
+  liveBackupPage,
+  resolveBackupDir,
+} from "./backup";
 import { compactColdBlobs, countAbsentBlobs } from "./compaction";
 import {
   openDb,
@@ -3730,7 +3737,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // main loop, and a backup must not fire mid-teardown). 24h cadence — backup
   // is a heavy op and a daily verified snapshot is the right recovery floor.
   const backupPage = liveBackupPage();
-  const backupTimer = setInterval(() => {
+  // The single backup callback — shared by BOTH the regular 24h interval and
+  // the fn-753 boot-time catch-up one-shot below. Never-throws out, logs on
+  // failure, pages on failure (recovery is degraded); a success is silent.
+  function runBackupPass(): void {
     if (shuttingDown) return;
     try {
       const result = backupDb(dbPath);
@@ -3764,7 +3774,29 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
-  }, BACKUP_INTERVAL_MS);
+  }
+  const backupTimer = setInterval(runBackupPass, BACKUP_INTERVAL_MS);
+
+  // fn-753 — boot-time catch-up. The regular `setInterval` resets on every
+  // daemon boot, so a keeperd that restarts more often than `BACKUP_INTERVAL_MS`
+  // (the LaunchAgent crash-recovery path) would silently never reach its first
+  // fire — the automatic backup floor never lands. If the newest snapshot is
+  // overdue (or none exists), schedule a one-shot that runs the SAME backup
+  // callback after a short startup delay, before the regular interval begins.
+  // Shares the full never-throw / log-on-failure / page-on-failure contract by
+  // construction (it calls the identical `runBackupPass`). The check is pure
+  // (`isCatchUpDue` parses the newest snapshot's `YYYYMMDDTHHMMSS` stamp; no
+  // mtime trust); a fresh snapshot ⇒ no timer scheduled and regular behavior is
+  // unchanged. Stored so shutdown can clear it before it fires within the delay
+  // window (an outstanding timer pins a ref on the main loop, and a backup must
+  // not fire mid-teardown).
+  let backupCatchUpTimer: ReturnType<typeof setTimeout> | null = null;
+  if (isCatchUpDue(resolveBackupDir(dbPath), Date.now())) {
+    backupCatchUpTimer = setTimeout(() => {
+      backupCatchUpTimer = null;
+      runBackupPass();
+    }, BACKUP_CATCHUP_DELAY_MS);
+  }
 
   // fn-749: crash-handler guard — wired only when the worker was selected.
   if (autopilotWorkerInstance) {
@@ -3904,6 +3936,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // only a sidecar snapshot file, so this is timer hygiene — an outstanding
     // timer would pin a ref on the main loop and hang teardown.
     clearInterval(backupTimer);
+    // fn-753 — clear the boot-time catch-up one-shot if it hasn't fired yet
+    // (the daemon stopped within the startup-delay window). Same timer hygiene
+    // as the backup interval: an outstanding timeout would pin a ref on the
+    // main loop and could fire a heavy backup mid-teardown.
+    if (backupCatchUpTimer !== null) {
+      clearTimeout(backupCatchUpTimer);
+      backupCatchUpTimer = null;
+    }
 
     // fn-749: the set of workers actually spawned this boot (filter out the
     // `null`s for any unselected worker). Teardown iterates THIS list, so a
