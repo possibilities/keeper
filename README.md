@@ -921,16 +921,20 @@ collapses to plain stream output. Run any of them with
   target, multiplier, session+week percent + reset timestamps, plus the
   schema-v35 colocated `last_rate_limit_at` +
   `last_rate_limit_session_id` and the schema-v41 `rate_limit_lifts_at` +
-  `last_usage_fold_at`). Each row's stack carries the colocated
-  rate-limit line when set — as of schema v41 (fn-651) that line is a
-  forward-looking lift countdown (`rate-limited for <rel>` when the
-  lift instant is known and still in the future, `rate-limited n/a`
-  when it is absent or already past — never a "<rel> ago" countdown
-  and never a fallback to the fired-time). A v41 `stale Nm` line also
-  surfaces under any row whose `last_usage_fold_at` is older than the
-  renderer's `STALENESS_THRESHOLD_MS` cutoff (currently ~15m) —
-  driven only off that stamp, never `updated_at` (a rate-limit fold
-  bumps that) and never agentuse's own `status` (which tracks its
+  `last_usage_fold_at`). Each row's stack carries a `limited lifts in
+  <rel>` line whenever a non-codex row has a known FUTURE lift
+  (`rate_limit_lifts_at`, schema v41 / fn-651) — `limited lifts now`
+  within the ±30s rounding gap; a past/NULL lift omits the line. As of
+  fn-754 the gate is the future lift itself, NOT the fired-time
+  `last_rate_limit_at`, so a depleted-but-quiet row (weekly 100%,
+  agentuse paused polling until its lift) still surfaces its countdown
+  instead of going blank. A v41 `stale Nm` line surfaces under any row
+  whose stale anchor — `max(last_usage_fold_at, rate_limit_lifts_at)`
+  (fn-754) — is older than the renderer's `STALENESS_THRESHOLD_MS`
+  cutoff (currently ~15m); anchoring to the lift keeps a deliberately-
+  idle producer (paused with a known resume time) from being misread as
+  dead. Driven only off that anchor, never `updated_at` (a rate-limit
+  fold bumps that) and never agentuse's own `status` (which tracks its
   scrape failures rather than keeper's ingestion health) — so a wedged
   usage worker becomes visible instead of silently frozen. Untracked
   profiles (rate-limited but with no agentuse usage row) do not render.
@@ -1803,12 +1807,15 @@ stamp survives until a real successful fold replaces it. Both columns
 are symmetric to the v35 rate-limit columns: a rate-limit fold's
 `UPDATE usage SET ...` excludes both (so a stale rate-limit event
 cannot clobber a fresh percentage fold's lift / freshness), and the
-percentage path owns them outright. The renderer compares
-`last_usage_fold_at` against the wall clock to surface a staleness
-warning when ingestion has wedged, and renders the rate-limit line as
-a "rate-limited for `<rel>`" countdown off `rate_limit_lifts_at`
-(`n/a` when absent or already in the past — never a confusing
-"`<rel>` ago" countdown).
+percentage path owns them outright. The renderer compares the stale
+anchor — `max(last_usage_fold_at, rate_limit_lifts_at)` (fn-754) —
+against the wall clock to surface a staleness warning when ingestion
+has wedged, anchoring to the lift so a deliberately-idle producer
+(agentuse paused polling a maxed account until its lift, freezing the
+fold stamp) is not misread as dead, and renders a `limited lifts in
+`<rel>`` countdown off `rate_limit_lifts_at` (`limited lifts now`
+within the ±30s gap; omitted when the lift is absent or already past —
+never a confusing "`<rel>` ago" countdown).
 As of schema v25, each `epics.job_links`
 entry embeds the linked job's `title` / `state` / `last_api_error_at` /
 `last_api_error_kind` / `last_input_request_at` /

@@ -11,9 +11,9 @@
  * column context makes the direction unambiguous. A reset is strictly
  * forward, so a past value never reads as an age: an elapsed-but-fresh
  * reset collapses to `now`, never `<rel> ago`. The ONLY `—` trigger is a
- * keeper-stale row (fold stamp past the threshold), which dashes every
- * reset cell AND drops the rate-limit line, with the `stale Nm` line
- * carrying the why. There is no per-cell dash.
+ * keeper-stale row (the `max(fold stamp, lift)` anchor past the threshold),
+ * which dashes every reset cell AND drops the `limited` line, with the
+ * `stale Nm` line carrying the why. There is no per-cell dash.
  *
  * `nowMs` is an explicit parameter so tests can drive deterministic
  * snapshots — the live script passes `Date.now()` from both the
@@ -410,28 +410,29 @@ test("pct cells right-align to the widest pct across all body lines", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Colocated rate-limit line (schema v35 / fn-642). `usage` rows now carry
-// `last_rate_limit_at` (REAL unix-SECONDS) inline; `renderRowLines` emits a
-// `rate-limited <rel>` line under the quota lines for tracked stacks that
-// have been rate-limited, omits the line for never-limited rows and for the
-// codex stack (which has no rate-limit concept), and untracked profiles do
-// not render at all (they have no `usage` row).
+// Colocated `limited` lift line (schema v41 / fn-651, relabeled + lift-gated
+// in fn-754). `usage` rows carry `rate_limit_lifts_at` (ISO, the soonest
+// reset among >=100% windows); `renderRowLines` emits a `limited lifts in
+// <rel>` line under the quota lines for any non-codex row with a known FUTURE
+// lift, `limited lifts now` within the ±30s gap, and omits the line for a
+// past/NULL lift and for the codex stack. The gate is the future lift itself,
+// NOT the fired-time `last_rate_limit_at`, so a depleted-but-quiet row (weekly
+// 100%, `last_rate_limit_at` NULL) still renders its countdown.
 // ---------------------------------------------------------------------------
 
 const NOW_SEC = Math.floor(NOW_MS / 1000);
 
 /** Find the body line whose label starts with `label` (after the indent),
- *  matching the literal label exactly (handles dashed labels like
- *  `rate-limited`; the bodyLine helper above appends a trailing space). */
+ *  matching the literal label exactly (the bodyLine helper above appends a
+ *  trailing space, which is fine for single-word labels like `limited`). */
 function bodyLineExact(lines: string[], label: string): string | undefined {
   return lines.find((l) => l.trimStart().startsWith(`${label} `));
 }
 
-test("emits 'rate-limited for <rel>' when rate_limit_lifts_at is known and future (v41)", () => {
-  // Schema v41 (fn-651): the rate-limited line is a forward-looking lift
-  // countdown. A tracked stack with a known future `rate_limit_lifts_at`
-  // renders `rate-limited for <rel>` — never the fired-time
-  // `last_rate_limit_at`.
+test("emits 'limited lifts in <rel>' when rate_limit_lifts_at is known and future (fn-754)", () => {
+  // fn-754: the `limited` line is a forward-looking lift countdown. A stack
+  // with a known future `rate_limit_lifts_at` renders `limited lifts in
+  // <rel>` — never the fired-time `last_rate_limit_at`.
   const lines = renderRowLines(
     [
       {
@@ -450,18 +451,18 @@ test("emits 'rate-limited for <rel>' when rate_limit_lifts_at is known and futur
     ],
     NOW_MS,
   );
-  // header + session + week + rate-limited = 4 lines.
+  // header + session + week + limited = 4 lines.
   expect(lines).toHaveLength(4);
-  const row = bodyLineExact(lines, "rate-limited");
-  expect(row, "expected a rate-limited line").toBeDefined();
-  expect(row as string).toMatch(/ for 1h 2m$/);
+  const row = bodyLineExact(lines, "limited");
+  expect(row, "expected a limited line").toBeDefined();
+  expect(row as string).toMatch(/ lifts in 1h 2m$/);
   // Defensive: never a fallback to the fired-time "ago" rendering.
   expect(row as string).not.toMatch(/ ago$/);
 });
 
-test("omits the rate-limited line when rate_limit_lifts_at is NULL (v41)", () => {
+test("omits the limited line when rate_limit_lifts_at is NULL (fn-754)", () => {
   // A NULL lift means no window is currently >=100% — the limit has lifted, so
-  // a `rate-limited` line would lie. Drop it (no `n/a`, no `—`, no fired-time).
+  // a `limited` line would lie. Drop it (no `—`, no fired-time fallback).
   const lines = renderRowLines(
     [
       {
@@ -479,13 +480,14 @@ test("omits the rate-limited line when rate_limit_lifts_at is NULL (v41)", () =>
     ],
     NOW_MS,
   );
-  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
-  expect(lines.join("\n")).not.toContain("rate-limited");
+  expect(bodyLineExact(lines, "limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("limited");
 });
 
-test("omits the rate-limited line when rate_limit_lifts_at is clearly past (v41)", () => {
+test("omits the limited line when rate_limit_lifts_at is clearly past (fn-754)", () => {
   // A clearly-past lift on a fresh row means the limit has lifted — drop the
-  // line rather than render a stale `n/a` / "<rel> ago". Lift was 2h ago.
+  // line rather than render "<rel> ago". Lift was 2h ago; the row is fresh
+  // (recent fold) so the past lift doesn't keep it anchored.
   const lines = renderRowLines(
     [
       {
@@ -498,19 +500,20 @@ test("omits the rate-limited line when rate_limit_lifts_at is clearly past (v41)
         week_resets_at: isoOffset(4 * 24 * 60 + 5 * 60),
         last_rate_limit_at: NOW_SEC - (3 * 3600 + 12 * 60),
         last_rate_limit_session_id: "s2",
+        last_usage_fold_at: NOW_SEC - 60,
         rate_limit_lifts_at: isoOffset(-120),
       },
     ],
     NOW_MS,
   );
-  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
-  expect(lines.join("\n")).not.toContain("rate-limited");
+  expect(bodyLineExact(lines, "limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("limited");
 });
 
-test("renders 'rate-limited now' when the lift is within the rounding gap (v41)", () => {
+test("renders 'limited lifts now' when the lift is within the rounding gap (fn-754)", () => {
   // A lift ~20s out rounds to "now" — the limit is lifting this instant. This
   // is the one past-ish state that still renders: the line stays and shows
-  // `now` (not `for …`, not `—`, not omitted).
+  // `lifts now` (not `lifts in …`, not `—`, not omitted).
   const lines = renderRowLines(
     [
       {
@@ -527,43 +530,15 @@ test("renders 'rate-limited now' when the lift is within the rounding gap (v41)"
     ],
     NOW_MS,
   );
-  const row = bodyLineExact(lines, "rate-limited") as string;
-  expect(row, "expected a rate-limited line").toBeDefined();
-  expect(row).toMatch(/ now$/);
-  expect(row).not.toMatch(/for|ago|—/);
+  const row = bodyLineExact(lines, "limited") as string;
+  expect(row, "expected a limited line").toBeDefined();
+  expect(row).toMatch(/ lifts now$/);
+  expect(row).not.toMatch(/in|ago|—/);
 });
 
-test("omits the rate-limited line when last_rate_limit_at is NULL", () => {
-  // A tracked stack with no rate-limit annotation renders no
-  // `rate-limited` line at all — no `—` placeholder.
-  const lines = renderRowLines(
-    [
-      {
-        id: "claude-default",
-        target: "claude",
-        multiplier: 5,
-        session_percent: 10,
-        session_resets_at: isoOffset(60),
-        week_percent: 17,
-        week_resets_at: isoOffset(5 * 24 * 60),
-        last_rate_limit_at: null,
-        last_rate_limit_session_id: null,
-      },
-    ],
-    NOW_MS,
-  );
-  // header + session + week only.
-  expect(lines).toHaveLength(3);
-  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
-  // And no leaked em-dash or `rate-limited` literal anywhere.
-  expect(lines.join("\n")).not.toContain("rate-limited");
-  expect(lines.join("\n")).not.toContain("—");
-});
-
-test("omits the rate-limited line for the codex stack", () => {
-  // The codex stack has no rate-limit concept; even if a non-null
-  // `last_rate_limit_at` were on the wire (it shouldn't be), the
-  // renderer must suppress the line.
+test("omits the limited line for the codex stack", () => {
+  // The codex stack has no rate-limit concept; even if a future lift were on
+  // the wire (it shouldn't be), the renderer must suppress the line.
   const lines = renderRowLines(
     [
       {
@@ -577,22 +552,22 @@ test("omits the rate-limited line for the codex stack", () => {
         // Defensive: a wire bug delivering a non-null limit should still
         // not render for codex.
         last_rate_limit_at: NOW_SEC - 60,
+        rate_limit_lifts_at: isoOffset(60),
       },
     ],
     NOW_MS,
   );
   expect(lines).toHaveLength(3);
-  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
-  expect(lines.join("\n")).not.toContain("rate-limited");
+  expect(bodyLineExact(lines, "limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("limited");
 });
 
-test("rate-limited line indent + label-padding align under the chip", () => {
-  // The rate-limited body line shares the same indent (`wId + 1` spaces,
+test("limited line indent + label-padding align under the chip", () => {
+  // The `limited` body line shares the same indent (`wId + 1` spaces,
   // landing under the chip's `[`) as the quota lines, and pads its label
-  // to the widest of the labels actually rendered. With `rate-limited`
-  // in the pool (12 chars), `session` (7) padEnds to 12, so the quota
-  // labels gain trailing whitespace to keep their bars aligned under
-  // the rate-limited row's rel-time column position.
+  // to the widest of the labels actually rendered. `limited` (7) is no
+  // wider than `session` (7), so the label column is 7 and the quota
+  // labels keep their normal padding.
   const lines = renderRowLines(
     [
       {
@@ -604,9 +579,9 @@ test("rate-limited line indent + label-padding align under the chip", () => {
         week_percent: 5,
         week_resets_at: isoOffset(5),
         last_rate_limit_at: NOW_SEC - 5 * 60,
-        // v41: a known future lift renders `rate-limited for <rel>`;
+        // fn-754: a known future lift renders `limited lifts in <rel>`;
         // a 5m offset round-trips to body "5m" so the trailing tail
-        // is "for 5m".
+        // is "lifts in 5m".
         rate_limit_lifts_at: isoOffset(5),
       },
     ],
@@ -615,30 +590,26 @@ test("rate-limited line indent + label-padding align under the chip", () => {
   const header = lines[0];
   const bracket = header.indexOf("[");
   expect(bracket).toBe("(claude-multi-3)".length + 1);
-  const rl = bodyLineExact(lines, "rate-limited") as string;
-  // The rate-limited literal lands at the chip's `[` column.
-  expect(rl.indexOf("rate-limited")).toBe(bracket);
-  // `rate-limited` is 12 chars (the widest label here), padEnd(12) leaves
-  // zero trailing spaces; one separator space precedes the lift-countdown
-  // body `for 5m`.
-  expect(rl).toBe(`${" ".repeat(bracket)}rate-limited for 5m`);
-  // Quota labels are padded to width 12 too so they share the column
-  // landing; session is 7 → 5 trailing spaces, week is 4 → 8 trailing.
+  const rl = bodyLineExact(lines, "limited") as string;
+  // The `limited` literal lands at the chip's `[` column.
+  expect(rl.indexOf("limited")).toBe(bracket);
+  // `limited` is 7 chars (tied with `session` for widest), padEnd(7) leaves
+  // zero trailing spaces; one separator space precedes the lift body.
+  expect(rl).toBe(`${" ".repeat(bracket)}limited lifts in 5m`);
+  // `session` (7) is the widest, padEnd(7) → zero trailing; `week` (4) → 3.
   const session = bodyLineExact(lines, "session") as string;
-  expect(
-    session.startsWith(`${" ".repeat(bracket)}session${" ".repeat(5)} [`),
-  ).toBe(true);
+  expect(session.startsWith(`${" ".repeat(bracket)}session [`)).toBe(true);
   const week = bodyLineExact(lines, "week") as string;
-  expect(week.startsWith(`${" ".repeat(bracket)}week${" ".repeat(8)} [`)).toBe(
+  expect(week.startsWith(`${" ".repeat(bracket)}week${" ".repeat(3)} [`)).toBe(
     true,
   );
 });
 
-test("label padding ignores 'rate-limited' when no row renders one", () => {
-  // Mirror of the existing label-padding test: `rate-limited` must only
-  // join the label-width pool when at least one row will render that
-  // line, so a limit-less screen keeps its quota labels at width 7
-  // (`session`) rather than 12 (`rate-limited`).
+test("label padding ignores 'limited' when no row renders one", () => {
+  // `limited` must only join the label-width pool when at least one row
+  // will render that line. Since `limited` (7) ties `session` (7), this is
+  // a no-op for width — but it must still not add a phantom label. A
+  // limit-less screen keeps its quota labels at width 7 (`session`).
   const lines = renderRowLines(
     [
       {
@@ -659,10 +630,12 @@ test("label padding ignores 'rate-limited' when no row renders one", () => {
   );
 });
 
-test("rate-limited line absent when last_rate_limit_at is NULL even if lift is set", () => {
-  // The presence-gate is still `last_rate_limit_at` (the v35 fired-time —
-  // proof the row has ever been rate-limited). A future lift without an
-  // underlying fired-time renders no rate-limited line at all.
+test("limited line renders when last_rate_limit_at is NULL but a future lift is set (fn-754)", () => {
+  // fn-754 dropped the fired-time gate: the presence test is now the FUTURE
+  // lift itself. A depleted-but-quiet row (`last_rate_limit_at` NULL because
+  // agentuse paused polling) with a known future `rate_limit_lifts_at` now
+  // renders a `limited lifts in <rel>` line — the inverse of the old v41
+  // behavior.
   const lines = renderRowLines(
     [
       {
@@ -679,8 +652,9 @@ test("rate-limited line absent when last_rate_limit_at is NULL even if lift is s
     ],
     NOW_MS,
   );
-  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
-  expect(lines.join("\n")).not.toContain("rate-limited");
+  const row = bodyLineExact(lines, "limited") as string;
+  expect(row, "expected a limited line").toBeDefined();
+  expect(row).toMatch(/ lifts in 1h$/);
 });
 
 // ---------------------------------------------------------------------------
@@ -758,11 +732,162 @@ test("no 'stale' line when last_usage_fold_at is NULL (no successful fold to age
   expect(bodyLineExact(lines, "stale")).toBeUndefined();
 });
 
-test("a keeper-stale row drops the rate-limited line entirely", () => {
-  // On a STALE row the lift can't be trusted (a frozen snapshot's future lift
-  // has necessarily elapsed). Rather than a dashed `rate-limited —`, the line
-  // is dropped ENTIRELY — the `stale Nm` line is the single signal that the
-  // row is frozen, and the reset cells still dash to `—`.
+// ---------------------------------------------------------------------------
+// Lift-aware staleness anchor (fn-754). The stale clock anchors to
+// `max(last_usage_fold_at, rate_limit_lifts_at)` so a depleted-but-quiet row
+// (agentuse paused polling until its known lift, freezing the fold stamp)
+// stays FRESH while the lift is future — surfacing the week countdown + a
+// `limited` line instead of `—` + `stale`. After the lift passes, the normal
+// 15m grace is measured FROM the lift.
+// ---------------------------------------------------------------------------
+
+test("depleted row with a future lift stays fresh: week countdown + limited line, no stale (fn-754)", () => {
+  // The headline case: weekly 100%, fold stamp 41m old (would trip the 15m
+  // threshold off `last_usage_fold_at` alone), but `rate_limit_lifts_at` is
+  // future → the anchor picks the lift → row is NOT stale. The week reset
+  // cell renders its countdown (not `—`), a `limited lifts in <rel>` line is
+  // present, and there is NO `stale` line. `last_rate_limit_at` is NULL — the
+  // depletion case — proving the fired-time gate is gone.
+  const lines = renderRowLines(
+    [
+      {
+        id: "mc",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 0,
+        session_resets_at: null,
+        week_percent: 100,
+        week_resets_at: isoOffset(2 * 24 * 60),
+        last_rate_limit_at: null,
+        rate_limit_lifts_at: isoOffset(90),
+        last_usage_fold_at: NOW_SEC - 41 * 60,
+      },
+    ],
+    NOW_MS,
+  );
+  // Week cell shows a real countdown, not the stale dash.
+  const week = bodyLine(lines, "week");
+  expect(week).not.toMatch(/ —$/);
+  expect(week).toMatch(/ 2d$/);
+  // The limited line is present with a forward countdown.
+  const limited = bodyLineExact(lines, "limited") as string;
+  expect(limited, "expected a limited line").toBeDefined();
+  expect(limited).toMatch(/ lifts in 1h 30m$/);
+  // And NO stale line.
+  expect(bodyLineExact(lines, "stale")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("stale");
+});
+
+test("lift within ±30s keeps the row fresh and renders 'limited lifts now' (fn-754)", () => {
+  // A lift ~20s out anchors fresh (max picks it) and rounds to `lifts now`.
+  const lines = renderRowLines(
+    [
+      {
+        id: "mc",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 0,
+        session_resets_at: null,
+        week_percent: 100,
+        week_resets_at: isoOffset(2 * 24 * 60),
+        last_rate_limit_at: null,
+        rate_limit_lifts_at: new Date(NOW_MS + 20_000).toISOString(),
+        last_usage_fold_at: NOW_SEC - 41 * 60,
+      },
+    ],
+    NOW_MS,
+  );
+  const limited = bodyLineExact(lines, "limited") as string;
+  expect(limited, "expected a limited line").toBeDefined();
+  expect(limited).toMatch(/ lifts now$/);
+  expect(bodyLineExact(lines, "stale")).toBeUndefined();
+  // Week cell is fresh, not dashed.
+  expect(bodyLine(lines, "week")).not.toMatch(/ —$/);
+});
+
+test("a past lift beyond the 15m grace reverts the row to stale (fn-754)", () => {
+  // Lift 20m ago, fold even older (1h ago) → anchor is the lift (-20m), past
+  // the 15m grace → row stale again: week `—`, a `stale` line, no `limited`.
+  const lines = renderRowLines(
+    [
+      {
+        id: "mc",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 0,
+        session_resets_at: null,
+        week_percent: 100,
+        week_resets_at: isoOffset(2 * 24 * 60),
+        last_rate_limit_at: null,
+        rate_limit_lifts_at: isoOffset(-20),
+        last_usage_fold_at: NOW_SEC - 60 * 60,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLine(lines, "week")).toMatch(/ —$/);
+  expect(bodyLineExact(lines, "stale")).toBeDefined();
+  expect(bodyLineExact(lines, "limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("limited");
+});
+
+test("a past lift within the 15m grace is not yet stale (fn-754)", () => {
+  // Lift 5m ago, fold older (1h ago) → anchor is the lift (-5m), within the
+  // 15m grace → NOT stale yet. Week cell renders (not `—`), no `stale` line.
+  // The lift is past, so the `limited` line is omitted (no future lift).
+  const lines = renderRowLines(
+    [
+      {
+        id: "mc",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 0,
+        session_resets_at: null,
+        week_percent: 100,
+        week_resets_at: isoOffset(2 * 24 * 60),
+        last_rate_limit_at: null,
+        rate_limit_lifts_at: isoOffset(-5),
+        last_usage_fold_at: NOW_SEC - 60 * 60,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLine(lines, "week")).not.toMatch(/ —$/);
+  expect(bodyLineExact(lines, "stale")).toBeUndefined();
+  // Past lift → no limited line.
+  expect(bodyLineExact(lines, "limited")).toBeUndefined();
+});
+
+test("never-folded row stays fresh regardless of lift (fn-754)", () => {
+  // `last_usage_fold_at` NULL → foldAtMs NaN. A NULL lift leaves the anchor
+  // NaN → `-1` short-circuit → fresh (unchanged from before fn-754).
+  const lines = renderRowLines(
+    [
+      {
+        id: "mc",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 10,
+        week_resets_at: isoOffset(60),
+        last_usage_fold_at: null,
+        rate_limit_lifts_at: null,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLineExact(lines, "stale")).toBeUndefined();
+  expect(bodyLine(lines, "week")).not.toMatch(/ —$/);
+});
+
+test("a keeper-stale row drops the limited line entirely", () => {
+  // On a STALE row the lift can't be trusted (a frozen snapshot's lift has
+  // necessarily elapsed past the grace). Rather than a dashed `limited —`,
+  // the line is dropped ENTIRELY — the `stale Nm` line is the single signal
+  // that the row is frozen, and the reset cells still dash to `—`. fn-754:
+  // the lift here is PAST (and beyond the 15m grace) so the anchor stays
+  // stale; a future lift would keep the row fresh instead.
   const lines = renderRowLines(
     [
       {
@@ -774,16 +899,16 @@ test("a keeper-stale row drops the rate-limited line entirely", () => {
         week_percent: 10,
         week_resets_at: isoOffset(60),
         last_rate_limit_at: NOW_SEC - 3 * 60 * 60,
-        rate_limit_lifts_at: isoOffset(30),
+        rate_limit_lifts_at: isoOffset(-30),
         last_usage_fold_at: NOW_SEC - 20 * 60,
       },
     ],
     NOW_MS,
   );
-  // header + session + week + stale = 4 lines; no rate-limited line.
+  // header + session + week + stale = 4 lines; no limited line.
   expect(lines).toHaveLength(4);
-  expect(bodyLineExact(lines, "rate-limited")).toBeUndefined();
-  expect(lines.join("\n")).not.toContain("rate-limited");
+  expect(bodyLineExact(lines, "limited")).toBeUndefined();
+  expect(lines.join("\n")).not.toContain("limited");
   const stale = bodyLineExact(lines, "stale") as string;
   expect(stale).toMatch(/ 20m$/);
   // Reset cells on the stale row still dash to `—`.
@@ -1162,7 +1287,7 @@ test("missing/null status leaves the header without a status token", () => {
 });
 
 test("stale error renders as an indented body line with type:message and ticking error_at", () => {
-  // The error line mirrors renderRateLimit's idiom — body indent + label
+  // The error line mirrors renderLimited's idiom — body indent + label
   // padding matches the quota lines, with the relative-time stamp landing in
   // the same column as the reset stamps. Content short enough to fit in the
   // bar+pct cell width (BAR_WIDTH=30 + brackets + space + wPct=3 ≈ 36 chars).
@@ -1282,7 +1407,7 @@ test("error_at column aligns under the quota reset column (same cell width)", ()
   // The error body content is padded to bar+pct cell width so the relative
   // time stamp lands in the SAME column as the reset stamps on the
   // session/week lines. This is the alignment contract that mirrors
-  // renderRateLimit's column landing.
+  // renderLimited's column landing.
   const lines = renderRowLines(
     [
       {
@@ -1316,7 +1441,7 @@ test("error_at column aligns under the quota reset column (same cell width)", ()
 });
 
 test("label padding ignores 'error' when no row renders a stale error", () => {
-  // Mirror of the rate-limited label-pool rule: `error` (5 chars) must only
+  // Mirror of the `limited` label-pool rule: `error` (5 chars) must only
   // join the label-width pool when a row will render it; otherwise the
   // quota labels stay at width 7 (`session`).
   const lines = renderRowLines(
