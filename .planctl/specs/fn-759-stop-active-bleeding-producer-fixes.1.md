@@ -73,5 +73,5 @@ assertion should compare file bytes (or content hashes), not mtimes.
 - [ ] full `bun test` green; no SCHEMA_VERSION bump, no keeper-py diff
 
 ## Done summary
-
+Deleted the v13 approval FS backfill (runPlanctlApprovalMigration + helpers + the v12->v13 TEMP overlay snapshot) and its daemon boot call site; kept the SQL ADD COLUMN/DROP TABLE half so the forward-only ladder replays. Rewrote db.test.ts to pin SQL-half-only migration plus a byte-identical boot-safety check.
 ## Evidence

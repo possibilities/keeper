@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Remove v13 approval FS backfill",
-  "updated_at": "2026-06-09T19:41:10.006038Z"
+  "updated_at": "2026-06-09T19:56:27.074811Z",
+  "worker_done_at": "2026-06-09T19:56:27.074811Z"
 }
