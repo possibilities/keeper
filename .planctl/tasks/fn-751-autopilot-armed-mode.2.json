@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Reconcile dep-closure mode gating",
-  "updated_at": "2026-06-08T20:32:29.239972Z"
+  "updated_at": "2026-06-09T00:55:25.522865Z",
+  "worker_done_at": "2026-06-09T00:55:25.522865Z"
 }

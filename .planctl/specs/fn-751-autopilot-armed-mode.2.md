@@ -45,5 +45,5 @@ touched — mode is a pure post-readiness dispatch concern.
 - [ ] `yolo` mode dispatch is unchanged; reconcile stays pure and never throws.
 
 ## Done summary
-
+Added armed-mode work gating to the reconcile loop. New src/armed-closure.ts computeEligibleEpics does a multi-source reversed-edge BFS expanding the armed set to armed nodes plus transitive upstreams (cycle-safe, skips dangling/absent ids, no cross-project special-casing). loadReconcileSnapshot now pulls mode + armed set from the projection each cycle; the mode arm suppresses work for non-eligible epics above the budget gate, with approve/close/reap mode-exempt; yolo unchanged.
 ## Evidence
