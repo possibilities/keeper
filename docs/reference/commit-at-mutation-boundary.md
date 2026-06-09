@@ -168,6 +168,7 @@ in a non-git dir, takes the read-only `emit()` path and lands no commit.
 | Mutating, self-built payload (`init`) | non-null `subject`, `files` is the explicit bootstrap set it created; NO `session_id` key (no `Session-Id:` trailer) | yes (inline, via `emit(planctl_invocation=...)`), only when something was written AND inside a git work tree | the writes are fresh files; a pre-commit raise leaves them on disk (§10), and an idempotent re-run is the read-only `emit()` path |
 | Runtime-state-only (`claim`, `block`, `approve`) | `subject=null`, `files=null` | none (gitignored state) | n/a — `claim` also writes the worker brief to `state/briefs/<task_id>.json` (gitignored), so that write lands no commit either |
 | Read-only (`show`, `cat`, `list`, ...) | `subject=null`, `files=null` (via decorator) | none | n/a |
+| Read-only, git-reading (`reconcile`, fn-6) | `subject=null`, `files=null` (via decorator) | none | n/a — reads git (`git log` trailer parse against `target_repo`/`epic.touched_repos`, `git cat-file` against `state_repo`) to compute the typed verdict, but never writes or commits; any git subprocess failure fails closed to a `tooling_error` verdict, never a silent state mutation |
 | `validate --epic <id>` (first-ever valid) | non-null `subject`, single file | yes (manual `auto_commit_from_invocation` call from the validate runner, which bypasses `emit()` to preserve its `{valid, errors, warnings}` envelope shape) | bypass — documented out-of-scope per §13's `validate --epic` row, see the asymmetry note below |
 | `refine-context --invalidate` (conditionally-mutating) | non-null `subject`, single file | yes (inline) | envelope shape is `emit()`-compatible; the single-field rewrite is a rename-atomic over a pre-existing tracked file, so prior valid contents stay in place |
 
@@ -457,32 +458,47 @@ last act; the state commit lands as a side effect.
 
 ### Recovery property
 
-A harness drop can land at three places under this contract:
+The orchestrator detects where a harness drop landed through ONE
+read-only call — `planctl reconcile <task_id>` — and switches on its
+typed verdict. There is no separate orchestrator test phase, and no
+hand-fired `keeper session-state` / `keeper find-task-commit` /
+`validate --epic`; the verdict is computed entirely from planctl-native
+data (merged status, trailer-authentic source commits, HEAD-visibility
+of the committed task JSON, an epic tally). A harness drop can land at
+three places under this contract, each mapping to a verdict:
 
 - **Drop before source commit (mid-implementation):** task
-  `in_progress`, source uncommitted. `keeper session-state` shows dirty
-  `session_files`. Warm SendMessage resume asks the resumed worker to
-  finish + commit + done. Cold spawn takes the HARNESS_DROPPED carve
-  and continues from Phase 3.
+  `in_progress`, no trailer commit → verdict
+  `in_progress_uncommitted`. Warm SendMessage resume asks the resumed
+  worker to finish + commit + done; the cold spawn takes the
+  HARNESS_DROPPED carve and continues.
 - **Drop between source commit and `planctl done` (source committed,
-  not done):** task `in_progress`, `keeper find-task-commit $TASK_ID`
-  returns the trailer commit. Resume / fresh worker skips to `planctl
-  done`; the state commit lands inline as the verb fires.
+  not done):** task `in_progress`, the trailer commit is present →
+  verdict `in_progress_committed`. Resume / fresh worker skips to
+  `planctl done`; the state commit lands inline as the verb fires.
 - **Drop after `planctl done` (both commits in place):** task `done`,
-  both commits in history. Parent loses only the worker's free-text
-  return summary.
+  the `.planctl/` state commit visible in HEAD → verdict `done`. Parent
+  loses only the worker's free-text return summary and continues to the
+  report phase.
 
-A fourth, non-drop incompleteness rides the same primitive:
+A fourth incompleteness rides the same primitive:
 
-- **Dirty-after-done (task `done`, tree still dirty):** the worker
-  stamped `done` but left uncommitted source in its `session_files`.
-  The content-blind orchestrator does NOT commit on the worker's behalf;
-  within the 5-attempt budget it auto-resumes the worker (`planctl
-  worker resume`) with a process nudge to commit the remaining hunks.
-  Only after the budget is exhausted does it surface the dirty tree.
+- **State not yet in HEAD (task `done`, state commit not visible):**
+  the worker stamped `done` but the `.planctl/` state commit isn't yet
+  in HEAD → verdict `state_uncommitted`. Within the 5-attempt budget the
+  orchestrator auto-resumes the worker (`planctl worker resume`) with a
+  process nudge; only after the budget is exhausted does it surface the
+  unreconciled state.
 
-Both the drop cases and the dirty-after-done case funnel to one
-primitive — resume the worker with a minimal process nudge. The
+The worker self-checks its own delivery cleanliness (its session files
+committed) before returning, so delivery-attribution never reaches the
+orchestrator — there is no `dirty_session_files` signal in the verdict
+and the orchestrator never inspects git porcelain. A `tooling_error`
+verdict (any git subprocess failure) fails closed: surface and stop,
+never resume against an unreliable verdict.
+
+The non-`done` `in_progress_*` / `state_uncommitted` verdicts funnel to
+one primitive — resume the worker with a minimal process nudge. The
 orchestrator never commits source, never runs `planctl done`, and never
 edits the worker's content.
 
@@ -496,7 +512,8 @@ gets its own fresh budget). No attempt-count field is persisted on the
 task.
 
 The orphan layer is always one of {source uncommitted, source committed
-but no done stamp} — both loud (`git status`, `planctl show`).
+but no done stamp} — both surfaced loud by `planctl reconcile`'s typed
+verdict (`in_progress_uncommitted` / `in_progress_committed`).
 
 ---
 
@@ -669,6 +686,7 @@ Per-test `tmp_path` + `git init` + `commit.gpgsign=false` +
 | `epic rm` whole-tree delete | One `chore(planctl): rm <epic_id>` commit covers every unlinked path; touched paths recorded BEFORE unlink so `touched ∩ dirty` captures the deletions; `--dry-run` emits the same envelope shape minus `planctl_invocation` and lands no commit |
 | `validate --epic` first-stamp | Manual `auto_commit_from_invocation` call from the runner lands the marker commit; bypasses `emit()` to preserve the `{valid, errors, warnings}` envelope shape |
 | `epic followup-of` (read-only) | Envelope `{found, epic_id, actual_tasks, depends_on_epics, status}` for the first open epic whose `depends_on_epics` contains the source; `{found: false}` when none; envelope carries `subject=null`/`files=null`; no commit |
+| `reconcile` (read-only, fn-6) | Per-verdict coverage across all seven values; an exhaustiveness test asserting every verdict has an orchestrator handler; trailer-authentic source detection (no prose false-match, no `fn-N.1`↔`fn-N.10` substring collision); unborn-branch guard (`git cat-file` against an empty/orphan `state_repo` is a distinct signal, not `not_found`/`tooling_error`); fail-closed `tooling_error` on any git subprocess failure; readonly invocation footer (`subject=null`/`files=null`, no commit, never calls a mutating verb or `validate --epic`) |
 
 See `apps/planctl/tests/test_commit.py` for the auto-commit suite.
 

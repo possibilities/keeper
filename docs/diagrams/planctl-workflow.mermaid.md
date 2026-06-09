@@ -74,21 +74,19 @@ flowchart TB
 
             worker_outcome{"Outcome?"}
             block_record["planctl block\n(skill records blocker)"]
-            verify["Verify status=done"]
+            reconcile["planctl reconcile\n(one read-only call →\ntyped verdict switch)"]
 
             start --> worker_box
             worker_box --> worker_outcome
-            worker_outcome -- "done" --> verify
+            worker_outcome -- "done" --> reconcile
             worker_outcome -- "blocked" --> block_record
         end
 
-        quality["Quality\n(tests + lint)"]
         ship["Ship\n(validate + push/PR)"]
 
         resolve_input --> branch_choice
         branch_choice --> task_loop
-        verify --> quality
-        quality --> ship
+        reconcile -- "verdict=done" --> ship
     end
 
     %% ===== CLOSE SKILL =====
@@ -198,6 +196,7 @@ flowchart TB
     ready -. "reads" .-> cli_layer
     done_cmd -. "writes" .-> cli_layer
     block_record -. "writes" .-> cli_layer
+    reconcile -. "reads" .-> cli_layer
     read_epics -. "reads" .-> cli_layer
     approve_cmd -. "writes" .-> cli_layer
     reject_cmd -. "writes" .-> cli_layer
