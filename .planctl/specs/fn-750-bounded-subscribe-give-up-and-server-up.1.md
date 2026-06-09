@@ -59,5 +59,5 @@ accumulate timers across reconnects.
 - [ ] injected `now()` clock; deterministic under the fake-timer harness
 
 ## Done summary
-
+Added opt-in bounded give-up to subscribeMulti: GiveUpPolicy{deadlineMs} + injectable now() clock on MultiOptions, forwarded by both public helpers (default off = reconnect-forever, board/TUI untouched). Continuous-unpainted anchor armed at subscribe start, cleared on FIRST PAINT, re-armed on post-paint drop; deadline checked at top of connectWithRetry loop plus a dispose-cancellable backstop timer for the half-up-daemon case; fires onFatal({code:'unreachable'}) once after teardownConnection(). 3 new deterministic tests under the injected clock.
 ## Evidence
