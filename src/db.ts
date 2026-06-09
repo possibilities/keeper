@@ -162,6 +162,13 @@ export interface KeeperConfig {
   // `null` (unlimited). Enforced as a reconcile-level budget, not a
   // readiness verdict, so the board renders unchanged.
   maxConcurrentJobs?: number | null;
+  // Display aliases for agentuse account ids, keyed by the raw profile id
+  // (the `usage` row pk / jobs `profile_name` — e.g. `multi-claude-2`) →
+  // the label the `keeper usage` TUI shows in its place (e.g. `claude-2`).
+  // Purely cosmetic and client-side: never folded into the event log, never
+  // changes a row's identity. An absent/non-string-map key resolves to `{}`
+  // (no aliasing — every id renders verbatim); unmapped ids pass through.
+  accountAliases: Record<string, string>;
 }
 
 /**
@@ -201,7 +208,9 @@ export function resolveConfigPath(): string {
  * `agentuse_root` (default `~/.local/state/agentuse`), `zellij_session`
  * (default `"autopilot"`, non-empty string required), and
  * `autoclose_windows` (default `true`, explicit boolean required —
- * anything else keeps the default). The config is best-effort and
+ * anything else keeps the default), and `account_aliases` (default `{}` —
+ * a `<profile-id>: <display>` string map; only string→non-empty-string
+ * entries survive). The config is best-effort and
  * must never throw past this resolver. ALL keys resolve INDEPENDENTLY from
  * the same parsed document — a bad `roots` never disturbs `zellij_session`
  * and vice-versa. Only string entries of `roots` survive; non-string junk
@@ -217,6 +226,7 @@ export function resolveConfig(): KeeperConfig {
   let zellijSession: string = DEFAULT_ZELLIJ_SESSION;
   let autocloseWindows: boolean = DEFAULT_AUTOCLOSE_WINDOWS;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
+  let accountAliases: Record<string, string> = {};
   try {
     if (!existsSync(path)) {
       return {
@@ -226,6 +236,7 @@ export function resolveConfig(): KeeperConfig {
         zellijSession,
         autocloseWindows,
         maxConcurrentJobs,
+        accountAliases,
       };
     }
     const raw = Bun.YAML.parse(readFileSync(path, "utf8")) as unknown;
@@ -265,6 +276,20 @@ export function resolveConfig(): KeeperConfig {
       if (typeof mcj === "number" && Number.isInteger(mcj) && mcj > 0) {
         maxConcurrentJobs = mcj;
       }
+      // `account_aliases` is a plain `<profile-id>: <display>` map. Keep only
+      // string→non-empty-string entries (drop null/number/nested junk); an
+      // absent or non-object value leaves the default empty map. Cosmetic —
+      // consumed by the usage TUI, never folded.
+      const aliases = (raw as { account_aliases?: unknown }).account_aliases;
+      if (aliases && typeof aliases === "object" && !Array.isArray(aliases)) {
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(
+          aliases as Record<string, unknown>,
+        )) {
+          if (typeof v === "string" && v.length > 0) out[k] = v;
+        }
+        accountAliases = out;
+      }
     }
   } catch (err) {
     console.error(
@@ -278,6 +303,7 @@ export function resolveConfig(): KeeperConfig {
       zellijSession: DEFAULT_ZELLIJ_SESSION,
       autocloseWindows: DEFAULT_AUTOCLOSE_WINDOWS,
       maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
+      accountAliases: {},
     };
   }
   return {
@@ -287,6 +313,7 @@ export function resolveConfig(): KeeperConfig {
     zellijSession,
     autocloseWindows,
     maxConcurrentJobs,
+    accountAliases,
   };
 }
 

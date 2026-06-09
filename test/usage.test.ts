@@ -866,6 +866,56 @@ test("keeps the session line while the weekly window is under 100%", () => {
   expect(bodyLine(lines, "week")).toMatch(/ 99%/);
 });
 
+test("applies account aliases to the id chip; unmapped ids pass through", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "multi-claude-2",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(30),
+        week_percent: 20,
+        week_resets_at: isoOffset(4 * 24 * 60),
+      },
+      {
+        id: "codex",
+        target: "codex",
+        multiplier: 1,
+        session_percent: 5,
+        session_resets_at: isoOffset(30),
+        week_percent: 5,
+        week_resets_at: isoOffset(30),
+      },
+    ],
+    NOW_MS,
+    { "multi-claude-2": "claude-2" },
+  );
+  // The aliased account renders its display name; the raw id never leaks.
+  expect(lines.join("\n")).toContain("(claude-2)");
+  expect(lines.join("\n")).not.toContain("multi-claude-2");
+  // codex is unmapped → verbatim.
+  expect(lines.join("\n")).toContain("(codex)");
+});
+
+test("no aliases (default arg) renders raw account ids", () => {
+  const lines = renderRowLines(
+    [
+      {
+        id: "multi-claude-2",
+        target: "claude",
+        multiplier: 1,
+        session_percent: 10,
+        session_resets_at: isoOffset(30),
+        week_percent: 20,
+        week_resets_at: isoOffset(4 * 24 * 60),
+      },
+    ],
+    NOW_MS,
+  );
+  expect(lines[0]).toContain("(multi-claude-2)");
+});
+
 // ---------------------------------------------------------------------------
 // renderSessionLines — the "recent sessions" log (schema v36, jobs.profile_name)
 // ---------------------------------------------------------------------------
@@ -908,6 +958,27 @@ test("NULL or empty profile_name renders as (default)", () => {
   const fromEmpty = renderSessionLines([job({ profile_name: "" })], NOW_MS);
   expect(fromNull[0]).toContain("(default)");
   expect(fromEmpty[0]).toContain("(default)");
+});
+
+test("applies account aliases to the session profile label", () => {
+  const lines = renderSessionLines(
+    [job({ profile_name: "multi-claude-2" })],
+    NOW_MS,
+    {
+      "multi-claude-2": "claude-2",
+    },
+  );
+  expect(lines[0]).toContain("claude-2");
+  expect(lines[0]).not.toContain("multi-claude-2");
+});
+
+test("empty profile_name stays (default) even with aliases set", () => {
+  // The `(default)` sentinel is "unknown profile", not the literal `default`
+  // account — aliasing `default` must not rewrite it.
+  const lines = renderSessionLines([job({ profile_name: "" })], NOW_MS, {
+    default: "claude-0",
+  });
+  expect(lines[0]).toContain("(default)");
 });
 
 test("missing/empty title falls back to <untitled>", () => {

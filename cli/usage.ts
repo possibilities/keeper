@@ -97,7 +97,7 @@
 import { appendFileSync, writeFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
-import { resolveSockPath } from "../src/db";
+import { resolveConfig, resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
 import { armViewerExitTriggers } from "../src/view-shell";
@@ -149,6 +149,17 @@ with an indexed meta sidecar; session paths print on SIGINT.
 
 function seg(v: unknown): string {
   return v == null ? "" : String(v);
+}
+
+/**
+ * Resolve an agentuse account id to its configured display alias (purely
+ * cosmetic; see `KeeperConfig.accountAliases`, sourced from `account_aliases`
+ * in `~/.config/keeper/config.yaml`). An unmapped id — including `codex` and
+ * any account the human hasn't aliased — passes through verbatim. The alias
+ * never touches row identity; it is applied only at the render edge.
+ */
+function aliasOf(id: string, aliases: Record<string, string>): string {
+  return aliases[id] ?? id;
 }
 
 function pct(v: unknown): string {
@@ -394,6 +405,7 @@ function bar(v: unknown): string {
 export function renderRowLines(
   rows: Record<string, unknown>[],
   nowMs: number,
+  aliases: Record<string, string> = {},
 ): string[] {
   if (rows.length === 0) return [];
 
@@ -525,7 +537,7 @@ export function renderRowLines(
     const errContent = errType === "" ? "" : `${errType}: ${errMsg}`;
     const errRel = errType === "" ? "" : relTime(errAtIso, nowMs);
     return {
-      id: `(${seg(row.id)})`,
+      id: `(${aliasOf(seg(row.id), aliases)})`,
       target: seg(row.target),
       mult: seg(row.multiplier),
       status: seg(row.status),
@@ -706,6 +718,7 @@ const DEFAULT_PROFILE_LABEL = "(default)";
 export function renderSessionLines(
   jobs: Record<string, unknown>[],
   nowMs: number,
+  aliases: Record<string, string> = {},
 ): string[] {
   if (jobs.length === 0) return [];
 
@@ -719,8 +732,13 @@ export function renderSessionLines(
 
   const cells: SessionCell[] = jobs.map((job) => {
     const pn = job.profile_name;
+    // Empty/NULL profile_name stays the `(default)` sentinel (unknown, not the
+    // literal `default` account); a real id resolves through the alias map so
+    // the session log matches the usage block above it.
     const profile =
-      pn == null || pn === "" ? DEFAULT_PROFILE_LABEL : String(pn);
+      pn == null || pn === ""
+        ? DEFAULT_PROFILE_LABEL
+        : aliasOf(String(pn), aliases);
     const idRaw = seg(job.job_id);
     const id = idRaw.length > 7 ? idRaw.slice(0, 7) : idRaw;
     const titleRaw = seg(job.title);
@@ -769,6 +787,12 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
+  // Account display aliases (cosmetic) resolved once at startup from
+  // ~/.config/keeper/config.yaml. Best-effort — a missing/bad config yields
+  // `{}` (no aliasing). Read once: the config file is operator-edited, not a
+  // live stream, so a restart picks up edits (consistent with the daemon's
+  // own config read).
+  const accountAliases = resolveConfig().accountAliases;
   // Forward-reference slot for the `c`-key copy handler — wired further
   // down once sidecar paths and the last frame text are in scope.
   let onKey: ((key: string) => void) | undefined;
@@ -955,8 +979,12 @@ export async function main(argv: string[]): Promise<void> {
    * annotations, AND session ages) fresh together.
    */
   function composeBody(nowMs: number): string[] {
-    const usageLines = renderRowLines(lastUsageRows, nowMs);
-    const sessionLines = renderSessionLines(lastJobsRows, nowMs);
+    const usageLines = renderRowLines(lastUsageRows, nowMs, accountAliases);
+    const sessionLines = renderSessionLines(
+      lastJobsRows,
+      nowMs,
+      accountAliases,
+    );
     if (sessionLines.length === 0) return usageLines;
     if (usageLines.length === 0) {
       return ["recent sessions", ...sessionLines];

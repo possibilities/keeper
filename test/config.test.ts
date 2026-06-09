@@ -130,3 +130,60 @@ test("a malformed max_concurrent_jobs leaves a sibling key intact (independence)
   expect(cfg.maxConcurrentJobs).toBe(null);
   expect(cfg.zellijSession).toBe("my-session");
 });
+
+// ---------------------------------------------------------------------------
+// account_aliases — cosmetic <profile-id>: <display> map for the usage TUI
+// ---------------------------------------------------------------------------
+
+test("accountAliases defaults to {} when the file is absent", () => {
+  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
+  expect(resolveConfig().accountAliases).toEqual({});
+});
+
+test("accountAliases defaults to {} when the key is absent", () => {
+  writeConfig("roots:\n  - ~/code\n");
+  expect(resolveConfig().accountAliases).toEqual({});
+});
+
+test("account_aliases parses a <profile-id>: <display> map", () => {
+  writeConfig(
+    "account_aliases:\n" +
+      "  default: claude-0\n" +
+      "  multi-claude-1: claude-1\n" +
+      "  multi-claude-2: claude-2\n",
+  );
+  expect(resolveConfig().accountAliases).toEqual({
+    default: "claude-0",
+    "multi-claude-1": "claude-1",
+    "multi-claude-2": "claude-2",
+  });
+});
+
+test("account_aliases drops non-string and empty-string entries", () => {
+  // Only string→non-empty-string survives; null / number / "" are dropped.
+  writeConfig(
+    "account_aliases:\n" +
+      "  default: claude-0\n" +
+      "  multi-claude-1: 7\n" +
+      "  multi-claude-2: null\n" +
+      '  multi-claude-3: ""\n',
+  );
+  expect(resolveConfig().accountAliases).toEqual({ default: "claude-0" });
+});
+
+test("a non-object account_aliases falls back to {}", () => {
+  writeConfig("account_aliases: not-a-map\n");
+  expect(resolveConfig().accountAliases).toEqual({});
+});
+
+test("an array account_aliases falls back to {} (a map is required)", () => {
+  writeConfig("account_aliases:\n  - claude-0\n  - claude-1\n");
+  expect(resolveConfig().accountAliases).toEqual({});
+});
+
+test("account_aliases resolves independently of a malformed sibling key", () => {
+  writeConfig("roots: not-a-list\naccount_aliases:\n  default: claude-0\n");
+  const cfg = resolveConfig();
+  expect(cfg.accountAliases).toEqual({ default: "claude-0" });
+  expect(cfg.roots.length).toBeGreaterThan(0);
+});
