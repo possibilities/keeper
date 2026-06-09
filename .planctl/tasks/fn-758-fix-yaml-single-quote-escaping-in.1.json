@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "fix yq() YAML escaping in performance.md",
-  "updated_at": "2026-06-09T18:19:01.222911Z"
+  "updated_at": "2026-06-09T18:26:46.480877Z",
+  "worker_done_at": "2026-06-09T18:26:46.480877Z"
 }

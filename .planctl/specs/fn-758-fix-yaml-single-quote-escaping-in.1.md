@@ -16,5 +16,5 @@ Evidence path: `babysitters/agents/performance.md:286`, `yq()` function.
 - [ ] Spot-check: a synthetic key `foo'bar` through `yq()` yields `foo''bar`, producing valid YAML when embedded in `key: '$fm_key'`
 
 ## Done summary
-
+Changed yq() sed expr from shell-eval s/'/'\\''/g to YAML s/'/''/g in babysitters/agents/performance.md and updated the prose; spot-check confirms foo'bar -> foo''bar yields valid YAML.
 ## Evidence
