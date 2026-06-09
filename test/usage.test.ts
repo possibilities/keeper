@@ -8,9 +8,12 @@
  * is `label [bar] pct rel` — a 30-wide ASCII bar (`█`/`░`) followed by
  * the numeric pct and a bare relative reset countdown. Future times
  * render without an `in ` prefix (`3h 5m` / `5m` / `now`) since the
- * column context makes the direction unambiguous; a reset that has
- * slipped past (only ever a stale row) collapses to `now`, never a
- * misleading `<rel> ago` (the forward-only guard).
+ * column context makes the direction unambiguous. A reset is strictly
+ * forward, so a past value never reads as an age: an elapsed reset dashes
+ * to `—` (its prediction can't be trusted — a frozen/erroring profile),
+ * and a whole keeper-stale row dashes every reset cell plus the rate-limit
+ * lift, with the `stale Nm` line carrying the why. Only a genuine
+ * zero-crossing renders `now`.
  *
  * `nowMs` is an explicit parameter so tests can drive deterministic
  * snapshots — the live script passes `Date.now()` from both the
@@ -86,13 +89,15 @@ test("renders the round boundary as 'now'", () => {
   expect(bodyLine(lines, "week")).toMatch(/ now$/);
 });
 
-test("collapses a past reset countdown to 'now', never '<rel> ago'", () => {
+test("dashes an elapsed reset to '—', never 'now' or '<rel> ago'", () => {
   // A reset cell is a strictly-forward countdown — agentuse always resolves
-  // `*_resets_at` into the future at scrape time, so a past timestamp is a
-  // STALE countdown (envelope didn't refresh past the boundary), not an
-  // elapsed event. The forward-only guard collapses it to "now" rather than
-  // rendering the misleading "<rel> ago" (an age label on an "until" value).
-  // Staleness itself is surfaced separately by the `stale Nm` line.
+  // `*_resets_at` into the future at scrape time, so a PAST timestamp is a
+  // prediction whose moment elapsed before a fresh scrape replaced it (a
+  // single erroring/frozen profile, even while keeper folds the rest). It is
+  // neither an age (`<rel> ago` would mislabel an "until" value) nor a fresh
+  // "now" (that read as "everything just reset" on a dead producer) — it
+  // renders `—`. This fires on the cell's OWN value; the row need not be
+  // keeper-stale.
   const lines = renderRowLines(
     [
       {
@@ -107,10 +112,10 @@ test("collapses a past reset countdown to 'now', never '<rel> ago'", () => {
     ],
     NOW_MS,
   );
-  expect(bodyLine(lines, "session")).toMatch(/ now$/);
-  expect(bodyLine(lines, "week")).toMatch(/ now$/);
-  expect(bodyLine(lines, "session")).not.toMatch(/ago/);
-  expect(bodyLine(lines, "week")).not.toMatch(/ago/);
+  expect(bodyLine(lines, "session")).toMatch(/ —$/);
+  expect(bodyLine(lines, "week")).toMatch(/ —$/);
+  expect(bodyLine(lines, "session")).not.toMatch(/now|ago/);
+  expect(bodyLine(lines, "week")).not.toMatch(/now|ago/);
 });
 
 test("collapses to days at the day boundary; drops residual minutes", () => {
@@ -735,7 +740,10 @@ test("no 'stale' line when last_usage_fold_at is NULL (no successful fold to age
 test("stale and rate-limited render together as visually distinct lines", () => {
   // Both warnings can fire on the same row — the three states (idle is a
   // header chip, rate-limited is the colocated line, stale is its own
-  // labelled line) must stay visually distinct.
+  // labelled line) must stay visually distinct. On a STALE row the
+  // rate-limit lift can't be trusted (a frozen snapshot's future lift has
+  // necessarily elapsed), so the tail dashes to `—` rather than showing a
+  // confident-but-wrong `for 30m`. The `stale Nm` line carries the why.
   const lines = renderRowLines(
     [
       {
@@ -757,8 +765,39 @@ test("stale and rate-limited render together as visually distinct lines", () => 
   expect(lines).toHaveLength(5);
   const rl = bodyLineExact(lines, "rate-limited") as string;
   const stale = bodyLineExact(lines, "stale") as string;
-  expect(rl).toMatch(/ for 30m$/);
+  expect(rl).toMatch(/ —$/);
+  expect(rl).not.toMatch(/for/);
   expect(stale).toMatch(/ 20m$/);
+});
+
+test("a stale row dashes its reset countdowns instead of showing a value", () => {
+  // The whole point: a frozen snapshot's reset predictions have all
+  // elapsed, so a confident `1h` / `now` would be a lie. Every reset cell
+  // on a stale row renders `—`; the `stale Nm` line is the single place
+  // that explains why. (Freshness is the discriminator — the FUTURE reset
+  // offsets here would render normally on a fresh row.)
+  const lines = renderRowLines(
+    [
+      {
+        id: "p",
+        target: "claude",
+        multiplier: 5,
+        session_percent: 10,
+        session_resets_at: isoOffset(60),
+        week_percent: 36,
+        week_resets_at: isoOffset(4 * 24 * 60),
+        sonnet_week_percent: 8,
+        sonnet_week_resets_at: isoOffset(4 * 24 * 60),
+        last_usage_fold_at: NOW_SEC - 20 * 60,
+      },
+    ],
+    NOW_MS,
+  );
+  expect(bodyLine(lines, "session")).toMatch(/ —$/);
+  expect(bodyLine(lines, "week")).toMatch(/ —$/);
+  expect(bodyLine(lines, "sonnet")).toMatch(/ —$/);
+  // No relative-time vocabulary leaks onto the stale reset tail.
+  expect(bodyLine(lines, "session")).not.toMatch(/(now|ago|\dm|\dh|\dd)$/);
 });
 
 // ---------------------------------------------------------------------------

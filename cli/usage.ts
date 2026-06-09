@@ -61,13 +61,20 @@
  *
  * Reset cells render as minute-rounded humanized relative time
  * (`5d 21h`, `3h 5m`, `5m`, `now`) against the current wall clock —
- * future times drop the `in ` prefix since the column context (a
- * reset countdown) makes the direction unambiguous. A reset cell is a
- * strictly-forward countdown (agentuse always resolves `*_resets_at`
- * into the future at scrape time), so a value that has slipped behind
- * `now` is a STALE countdown, not an age — it collapses to `now`
- * (forward-only guard) rather than a misleading `<rel> ago`. For the
- * live frame in TUI
+ * future times drop the `in ` prefix since the column context (a reset
+ * countdown) makes the direction unambiguous. A reset is strictly
+ * FORWARD (agentuse resolves `*_resets_at` into the future at every
+ * scrape), so a target that has slipped into the PAST is never a real
+ * age — it's a prediction whose moment elapsed before a fresh scrape
+ * replaced it, i.e. STALE. {@link resetCell} renders that as `—`
+ * (`STALE_CELL`), not `now` and not `5h ago`: a 19h-dead producer
+ * rendering a whole screen of confident `now` read as "everything just
+ * reset." Two independent triggers dash a cell — the per-cell past check
+ * above (catches one profile whose scrape is erroring while keeper keeps
+ * folding the rest), and a whole-row `last_usage_fold_at` staleness flag
+ * (catches a wholesale-frozen producer, dashing even a still-future reset
+ * + the rate-limit lift so a dead row reads as uniformly dead). The
+ * `stale Nm` line carries the age + the why. For the live frame in TUI
  * mode a 30s tick re-renders via `liveShell.refreshLive` so the visible
  * countdown ticks forward without growing history or writing sidecars;
  * historical scroll-back keeps each frame's at-capture rendering, so the
@@ -120,20 +127,22 @@ chip + target/multiplier chip, then one indented body line per quota
 window (session, week, and sonnet where present). Each body line
 carries a 30-wide ASCII bar (\`█\` filled / \`░\` empty) followed by
 the numeric pct and a bare relative reset countdown (\`5d 21h\` /
-\`1h 16m\` / \`5m\` / \`now\`; a reset that has slipped past — only ever
-a stale row — collapses to \`now\`, never a misleading \`<rel> ago\`).
-A tracked stack carrying a rate-limit
+\`1h 16m\` / \`5m\` / \`now\`). On a STALE row the reset countdown — and
+the rate-limit lift below — render as \`—\` instead of a confident-but-
+elapsed value (the data is a frozen snapshot; their predicted times have
+all passed). A tracked stack carrying a rate-limit
 annotation (schema v35 / fn-642) gets a colocated \`rate-limited\` line
 under its quota lines; as of schema v41 (fn-651) that line is a
 forward-looking lift countdown — \`rate-limited for <rel>\` when
 \`rate_limit_lifts_at\` is known and still in the future, \`rate-limited
-n/a\` when it is absent or already past (never a "<rel> ago"
-countdown, never a fallback to the fired-time). Codex and never-limited
+n/a\` when it is absent or already past, \`rate-limited —\` when the row
+is stale (never a "<rel> ago" countdown, never a fallback to the
+fired-time). Codex and never-limited
 stacks omit the line. A v41 \`stale Nm\` line appears under any row
 whose \`last_usage_fold_at\` is older than the staleness threshold —
 driven only off that stamp, never \`updated_at\` and never agentuse's
 own \`status\` — surfacing a wedged ingestion path instead of silently
-frozen gauges. Untracked profiles (a rate-limit with no agentuse usage
+frozen gauges, and labelling the \`—\` cells above it. Untracked profiles (a rate-limit with no agentuse usage
 row) do not render. Below the profile stacks, a \`recent sessions\` block logs the
 last 20 jobs (any state) newest-first, each labeled with the profile
 it ran under (\`profile_name\`, schema v36) plus a short id, title,
@@ -169,29 +178,24 @@ function pct(v: unknown): string {
  *
  * Zero residuals collapse: `1w` not `1w 0d`, `1d` not `1d 0h`, `1h`
  * not `1h 0m`. Future times render bare (`<body>`) — the column
- * context (reset countdown) makes direction unambiguous.
+ * context (reset countdown) makes direction unambiguous; past times
+ * render `<body> ago`.
  *
- * Past times render `<body> ago` by default. `forwardOnly` flips that:
- * a target already `<= now` collapses to `"now"` instead. The three
- * quota-reset cells (session / week / sonnet) pass it — agentuse always
- * resolves `*_resets_at` into the FUTURE at scrape time (it bumps a
- * past clock time forward a day / a week-time forward a year), so a
- * reset cell is a strictly-forward countdown and only crosses zero when
- * the envelope goes stale past the boundary. Rendering that as
- * "<rel> ago" reads as an age for a value whose meaning is "until
- * reset"; `now` reads as "reset is due, data hasn't refreshed yet"
- * (staleness itself is surfaced separately by the `stale Nm` line).
- * Mirrors the rate-limit line's past-reset guard (fn-651). Age cells
- * (`error_at`, session-log timestamps) keep the default `ago`.
+ * This is the AGE formatter: its `ago` branch is for cells that are
+ * genuinely backward-looking (`error_at`, the recent-session timestamps).
+ * The forward-looking reset cells DON'T call it directly — they go through
+ * {@link resetCell}, which intercepts an elapsed (past) target and renders
+ * `—` before this `ago` branch can mislabel an "until reset" value as an
+ * age. So in practice `relTime` only ever produces `ago` for a real age.
  *
  * `nowMs` is a parameter (not `Date.now()` baked in) so tests can drive
  * deterministic snapshots AND so the 30s tick can pass a fresh clock
  * read without `renderRowLines` doing any wall-clock IO of its own.
  */
-function relTime(iso: string, nowMs: number, forwardOnly = false): string {
+function relTime(iso: string, nowMs: number): string {
   if (iso === "") return "";
   const target = Date.parse(iso);
-  return relTimeFromMs(target, nowMs, iso, forwardOnly);
+  return relTimeFromMs(target, nowMs, iso);
 }
 
 /**
@@ -225,16 +229,11 @@ function relTimeFromMs(
   targetMs: number,
   nowMs: number,
   fallback: string,
-  forwardOnly = false,
 ): string {
   if (Number.isNaN(targetMs)) return fallback;
   const diffMin = Math.round((targetMs - nowMs) / 60000);
   if (diffMin === 0) return "now";
   const past = diffMin < 0;
-  // Forward-only cells (the quota-reset countdowns) never render an age:
-  // a target already behind `now` is a stale countdown, not an elapsed
-  // event, so collapse it to "now" rather than the misleading "<rel> ago".
-  if (past && forwardOnly) return "now";
   const total = Math.abs(diffMin);
   const days = Math.floor(total / 1440);
   const weeks = Math.floor(days / 7);
@@ -257,6 +256,41 @@ function relTimeFromMs(
   return past ? `${body} ago` : body;
 }
 
+/**
+ * Render a quota-reset countdown cell (`session` / `week` / `sonnet`).
+ *
+ * A reset is a strictly-FORWARD value — "when does this window refill."
+ * agentuse resolves `*_resets_at` into the future at every scrape, so a
+ * healthy cell is always a positive countdown. A target that has slipped
+ * into the PAST is therefore never a real "<rel> ago" age — it's a
+ * prediction whose moment elapsed before a fresh scrape replaced it, i.e.
+ * STALE. Rendering it as `now` (it just reset) or `5h ago` (an age) both
+ * lie; a 19h-dead producer rendered a whole screen of confident `now`
+ * that read as "everything just reset." So:
+ *
+ *   - future        → the countdown (`3d 2h`, `29m`)
+ *   - exactly now    → `now` (genuine zero-crossing, ±30s rounding)
+ *   - elapsed (past) → `STALE_CELL` (`—`) — the prediction can't be trusted
+ *
+ * `rowStale` forces `—` regardless of this cell's own value: when keeper's
+ * ingestion is stale (`last_usage_fold_at` past `STALENESS_THRESHOLD_MS`)
+ * the ENTIRE row is a frozen snapshot, so even a still-future reset on it
+ * is suspect — dash uniformly so a dead row reads as dead. The two
+ * triggers are complementary: `rowStale` catches a wholesale-frozen
+ * producer; the per-cell past check catches a single profile whose scrape
+ * is erroring while keeper keeps folding the others (its resets go stale
+ * even though the row's fold stamp is fresh). Empty input → `""` (no reset
+ * known); an unparseable ISO passes through verbatim (graceful degrade).
+ */
+function resetCell(iso: string, nowMs: number, rowStale: boolean): string {
+  if (iso === "") return "";
+  if (rowStale) return STALE_CELL;
+  const ms = Date.parse(iso);
+  if (Number.isNaN(ms)) return iso;
+  if (Math.round((ms - nowMs) / 60000) < 0) return STALE_CELL;
+  return relTime(iso, nowMs);
+}
+
 const BAR_WIDTH = 30;
 
 /**
@@ -271,6 +305,18 @@ const BAR_WIDTH = 30;
  * named constant so future tuning is one edit.
  */
 const STALENESS_THRESHOLD_MS = 15 * 60_000;
+
+/**
+ * Placeholder rendered in a forward-looking time cell (a quota-reset
+ * countdown or the rate-limit lift) when the row is STALE. A stale row's
+ * gauges are a frozen snapshot of a producer that may be dead, so its
+ * "when does this reset / when does the limit lift" predictions are
+ * provably untrustworthy — every such time has already elapsed. Rendering
+ * a confident `now` / `n/a` there reads as "everything just reset," the
+ * exact lie that made a 19h-dead agentuse look healthy. An em-dash reads
+ * as "unknown"; the adjacent `stale Nm` line carries the age + the why.
+ */
+const STALE_CELL = "—";
 
 /**
  * Fixed-width ASCII progress bar — bracket + `BAR_WIDTH` cells + bracket,
@@ -317,20 +363,26 @@ function bar(v: unknown): string {
  *
  * The bare relative-time tail is unpadded — it lands wherever the
  * pct column ends, with a single separating space. Rows whose reset
- * ISO was empty render no tail at all (no trailing whitespace).
+ * ISO was empty render no tail at all (no trailing whitespace). The
+ * reset tail is the `STALE_CELL` dash (`—`) — see {@link resetCell} —
+ * whenever its prediction can't be trusted: either the value itself has
+ * elapsed (a frozen / erroring profile) or the whole row is keeper-stale.
+ * Only a genuine zero-crossing renders `now`; a future reset renders its
+ * countdown.
  *
  * Rows without sonnet data simply omit the sonnet body line; they do NOT
  * render an empty placeholder. Same rule for the `rate-limited` line:
- * a NULL `last_rate_limit_at` omits the line (no `—` placeholder), and
+ * a NULL `last_rate_limit_at` omits the whole line, and
  * the codex stack (id `codex` / target `codex` — no rate-limit concept)
- * omits it unconditionally. The `rate-limited` line itself is a
+ * omits it unconditionally. When the line DOES render it is a
  * forward-looking lift countdown derived from `rate_limit_lifts_at`
- * (schema v41 / fn-651) — it renders `rate-limited for <rel>` when the
- * lift instant is known and still in the future, and `rate-limited
+ * (schema v41 / fn-651) — `rate-limited for <rel>` when the
+ * lift instant is known and still in the future, `rate-limited
  * n/a` when the column is NULL OR the lift instant is already `<= now`
  * (a past-reset guard — never the misleading "<rel> ago" countdown
  * `relTime` would otherwise produce, and never a fallback to the
- * fired-time `last_rate_limit_at`). The `stale` line (also v41) renders
+ * fired-time `last_rate_limit_at`), and `rate-limited —` (`STALE_CELL`)
+ * when the row is stale — the lift, like the resets, can't be trusted. The `stale` line (also v41) renders
  * only when `last_usage_fold_at` is older than `STALENESS_THRESHOLD_MS`
  * — driven exclusively off that stamp, not `updated_at` (which a
  * rate-limit fold bumps) or agentuse's own `status` (which tracks its
@@ -415,17 +467,43 @@ export function renderRowLines(
     // wire payload were to carry a non-null `last_rate_limit_at`.
     const isCodex = row.id === "codex" || row.target === "codex";
     const rlRaw = row.last_rate_limit_at;
-    // Schema v41 (fn-651): the rate-limited line is a forward-looking
-    // lift countdown rather than the fired-time. `rate_limit_lifts_at`
-    // (ISO) is the soonest reset among >=100% windows. Render the line
-    // when the row has ever been rate-limited (presence of
-    // `last_rate_limit_at` — the v35 fired-time still gates whether
-    // the line appears at all, just no longer what it renders) AND
-    // skip for the codex stack. The tail is `for <rel>` when the lift
-    // is known and STILL IN THE FUTURE; `n/a` when the lift column is
-    // NULL OR the lift instant is `<= now` — the past-reset guard,
-    // which intercepts `relTime`'s default "<rel> ago" rendering so
-    // the row never claims to be rate-limited "for 3h ago".
+    // Schema v41 (fn-651): per-row freshness gate, computed FIRST because
+    // both the rate-limit line and the reset cells below key off it.
+    // `last_usage_fold_at` is REAL unix-SECONDS stamped from the event ts
+    // of the last SUCCESSFUL usage fold (never bumped by a rate-limit fold
+    // or an idle/stale snapshot). A row older than `STALENESS_THRESHOLD_MS`
+    // is STALE: its gauges are a frozen snapshot of a (possibly dead)
+    // producer, so every forward-looking time on the row — the reset
+    // countdowns (via {@link resetCell}, which ALSO dashes a single
+    // elapsed cell even on a fresh row) AND the rate-limit lift — renders
+    // as `STALE_CELL` instead of a confident-but-wrong `now` / `n/a`. A
+    // NULL stamp means no successful fold to age — treat as fresh (a
+    // never-folded row would otherwise always flap stale on first paint).
+    // Codex carries the same freshness contract (its envelope also stamps
+    // the field) — no codex exception.
+    const foldAtRaw = row.last_usage_fold_at;
+    const foldAtMs =
+      typeof foldAtRaw === "number" ? foldAtRaw * 1000 : Number.NaN;
+    const staleAgeMs = Number.isNaN(foldAtMs) ? -1 : nowMs - foldAtMs;
+    const isStale = staleAgeMs >= STALENESS_THRESHOLD_MS;
+    // The `stale Nm` line carries the age + the human-readable "why" behind
+    // the dashed cells. `relTimeFromMs` returns "<body> ago" for past times;
+    // the `stale` label already conveys direction, so trim the suffix for a
+    // tighter `stale 17m` body.
+    const staleRel = isStale
+      ? relTimeFromUnixSec(foldAtRaw as number, nowMs).replace(/ ago$/, "")
+      : "";
+    // Schema v41 (fn-651): the rate-limited line is a forward-looking lift
+    // countdown rather than the fired-time. `rate_limit_lifts_at` (ISO) is
+    // the soonest reset among >=100% windows. Render the line when the row
+    // has ever been rate-limited (presence of `last_rate_limit_at` — the
+    // v35 fired-time still gates whether the line appears, just no longer
+    // what it renders) AND skip for the codex stack. The tail is
+    // `STALE_CELL` when the row is stale (the lift time can't be trusted);
+    // else `for <rel>` when the lift is known and STILL IN THE FUTURE;
+    // else `n/a` when the lift column is NULL OR `<= now` — the past-reset
+    // guard intercepting `relTime`'s "<rel> ago" so the row never claims
+    // to be rate-limited "for 3h ago".
     const liftIso = seg(row.rate_limit_lifts_at);
     const liftMs = liftIso === "" ? Number.NaN : Date.parse(liftIso);
     const liftKnownFuture = !Number.isNaN(liftMs) && liftMs > nowMs;
@@ -433,32 +511,11 @@ export function renderRowLines(
     const rlRel =
       isCodex || !hasFiredTime
         ? ""
-        : liftKnownFuture
-          ? `for ${relTime(liftIso, nowMs)}`
-          : "n/a";
-    // Schema v41 (fn-651): per-row freshness warning. `last_usage_fold_at`
-    // is REAL unix-SECONDS stamped from the event ts of the last
-    // SUCCESSFUL usage fold (never bumped by a rate-limit fold or an
-    // idle/stale snapshot). Compare its age against `STALENESS_THRESHOLD_MS`
-    // to decide whether the row picks up the `stale Nm` line. A NULL
-    // stamp means we have no successful fold to age — leave the
-    // warning off (a row that has never folded would otherwise always
-    // flap stale on first paint). Codex carries the same freshness
-    // contract — its envelope also stamps `last_usage_fold_at` — so
-    // no codex exception here.
-    const foldAtRaw = row.last_usage_fold_at;
-    const foldAtMs =
-      typeof foldAtRaw === "number" ? foldAtRaw * 1000 : Number.NaN;
-    const staleAgeMs = Number.isNaN(foldAtMs) ? -1 : nowMs - foldAtMs;
-    const staleRel =
-      staleAgeMs >= STALENESS_THRESHOLD_MS
-        ? // Use the same minute-rounding body as the reset cells so the
-          // rendered tail matches the rest of the row's relative-time
-          // vocabulary. `relTimeFromMs` returns "<body> ago" for past
-          // times; the `stale` label already conveys direction so trim
-          // the suffix for a tighter `stale 17m` body.
-          relTimeFromUnixSec(foldAtRaw as number, nowMs).replace(/ ago$/, "")
-        : "";
+        : isStale
+          ? STALE_CELL
+          : liftKnownFuture
+            ? `for ${relTime(liftIso, nowMs)}`
+            : "n/a";
     // fn-645: stale-error line. Present only when `error_type` is set
     // (mirrors the agentuse contract — the `error` sub-object is non-null
     // only when status == "stale"). The content is `<type>: <message…>`;
@@ -478,14 +535,14 @@ export function renderRowLines(
       status: seg(row.status),
       sBar: bar(row.session_percent),
       sPct: pct(row.session_percent),
-      sReset: relTime(seg(row.session_resets_at), nowMs, true),
+      sReset: resetCell(seg(row.session_resets_at), nowMs, isStale),
       wBar: bar(row.week_percent),
       wPct: pct(row.week_percent),
-      wReset: relTime(seg(row.week_resets_at), nowMs, true),
+      wReset: resetCell(seg(row.week_resets_at), nowMs, isStale),
       swBar: hasSonnet ? bar(row.sonnet_week_percent) : null,
       swPct: hasSonnet ? pct(row.sonnet_week_percent) : null,
       swReset: hasSonnet
-        ? relTime(seg(row.sonnet_week_resets_at), nowMs, true)
+        ? resetCell(seg(row.sonnet_week_resets_at), nowMs, isStale)
         : "",
       rlRel,
       staleRel,
