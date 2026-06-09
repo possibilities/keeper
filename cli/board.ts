@@ -87,6 +87,7 @@ import { basename, dirname, join } from "node:path";
 import { parseArgs } from "node:util";
 import {
   apiErrorPillSeg,
+  armedPill,
   epicHeaderLabel,
   iconizePills,
   inputRequestPillSeg,
@@ -104,6 +105,7 @@ import type { EpicDepResolution } from "../src/epic-deps";
 import { formatPill, type Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
+  subscribeCollection,
   subscribeReadiness,
 } from "../src/readiness-client";
 import { appendDiagnostic } from "../src/readiness-diagnostics";
@@ -587,6 +589,14 @@ export async function main(argv: string[]): Promise<void> {
     dirname(sockPath),
     "readiness-diagnostics.jsonl",
   );
+  // fn-751: the live explicitly-armed epic-id set, fed by a parallel
+  // `armed_epics` presence-table subscription below (the readiness composite
+  // doesn't carry it). A row's presence means the epic is explicitly armed;
+  // `renderEpicBlock` reads this set to decide the `[armed]` header pill.
+  // Mutated in place (clear+re-add) on each `armed_epics` edge so the closure
+  // identity the renderer captured stays stable. v1 surfaces EXPLICIT-armed
+  // only — the dep-pulled-in closure is a documented future enhancement.
+  const armedSet = new Set<string>();
   const seg = (v: unknown) => (v == null ? "" : String(v));
 
   // --- epic rendering ---
@@ -738,7 +748,11 @@ export async function main(argv: string[]): Promise<void> {
     // (absence ≡ unvalidated, per the omit-default convention). It returns its own
     // leading space + brackets, so it appends self-delimited alongside the
     // dep summary and the slotted-after-closer pill.
-    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${slottedSeg}`;
+    // fn-751: the `[armed]` pill (omit-default) appears only when this epic
+    // is in the live `armed_epics` presence set. Self-delimited (own leading
+    // space), so it appends cleanly after the slotted-after-closer segment.
+    const armedSeg = armedPill(armedSet.has(epicId));
+    const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${slottedSeg}${armedSeg}`;
     const epicHeaderLines =
       epicVerdict.tag === "blocked"
         ? [epicHeader, `  ${iconizePills(formatPill(epicVerdict))}`]
@@ -874,7 +888,13 @@ export async function main(argv: string[]): Promise<void> {
     },
   });
 
+  // fn-751: retain the last readiness snapshot so an `armed_epics` edge that
+  // lands between readiness frames can repaint the `[armed]` pill without
+  // waiting for the next readiness snapshot. Null until the first frame.
+  let lastSnap: ReadinessClientSnapshot | null = null;
+
   function emitFrame(snap: ReadinessClientSnapshot): void {
+    lastSnap = snap;
     // fn-635: drain `snap.readiness.diagnostics` to the JSONL log
     // before the render. The drain is per-snapshot, not per-emit (we
     // want every observed ambiguity recorded even if the render is
@@ -894,7 +914,35 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
-  view.installSigintHandler(() => handle.dispose());
+  // fn-751: a parallel `armed_epics` presence-table subscription. The
+  // readiness composite doesn't carry the armed set, so the board rides its
+  // own `subscribeCollection` (same pattern as `dispatch_failures`). On each
+  // edge we rebuild `armedSet` in place (clear + re-add) and re-emit the last
+  // snapshot so the `[armed]` header pill repaints live. Re-subscribes cleanly
+  // on socket drop via the shared reconnect contract.
+  const armedHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "board",
+    collection: "armed_epics",
+    onRows: (rows) => {
+      armedSet.clear();
+      for (const r of rows) {
+        const id = seg(r.epic_id);
+        if (id !== "") {
+          armedSet.add(id);
+        }
+      }
+      if (lastSnap !== null) {
+        emitFrame(lastSnap);
+      }
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
+  view.installSigintHandler(() => {
+    handle.dispose();
+    armedHandle.dispose();
+  });
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the

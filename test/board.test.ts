@@ -36,6 +36,7 @@ import {
   renderJobLinkLines,
 } from "../cli/board";
 import {
+  armedPill,
   epicHeaderLabel,
   pill,
   pillOrEmpty,
@@ -1477,6 +1478,18 @@ test("validatedPill: non-null last_validated_at → ' [validated]'", () => {
 test("validatedPill: null / undefined → ' [unvalidated]' (absence now shown)", () => {
   expect(validatedPill(null)).toBe(` ${pill("unvalidated")}`);
   expect(validatedPill(undefined)).toBe(` ${pill("unvalidated")}`);
+});
+
+// ---------------------------------------------------------------------------
+// fn-751: armedPill — omit-default behavior (render [armed] only when armed)
+// ---------------------------------------------------------------------------
+
+test("armedPill: armed epic → ' [armed]'", () => {
+  expect(armedPill(true)).toBe(` ${pill("armed")}`);
+});
+
+test("armedPill: unarmed epic → '' (omit-default)", () => {
+  expect(armedPill(false)).toBe("");
 });
 
 // ---------------------------------------------------------------------------

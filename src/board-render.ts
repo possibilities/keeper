@@ -277,6 +277,19 @@ export function validatedPill(lastValidatedAt: unknown): string {
 }
 
 /**
+ * Render the trailing `[armed]` pill segment for a board EPIC HEADER (fn-751).
+ * Omit-default convention (mirrors the pre-fn-713 `validatedPill` shape):
+ * ` [armed]` when the epic is explicitly armed, `""` otherwise — absence ≡
+ * not armed. v1 surfaces EXPLICIT-armed epics only (matches the autopilot
+ * screen's armed list); the dep-pulled-in closure is a documented future
+ * enhancement. Routes through `pill` so it picks up the icon theme; returns
+ * its own leading space so the caller appends self-delimited. Pure.
+ */
+export function armedPill(isArmed: boolean): string {
+  return isArmed ? ` ${pill("armed")}` : "";
+}
+
+/**
  * Render the trailing pill segment for a board TASK LINE (epic fn-708) —
  * the consolidated successor to the old triple
  * `[${runtime_status}] [${worker_phase}] [${approval}]` closure in
@@ -427,6 +440,11 @@ const PILL_COLORS: Record<string, PillBucket> = {
   // is "live, structural relationship visible to the human" rather than
   // a success/error/warn state. See `renderEpicBlock` for the placement.
   "slotted-after-closer": "active",
+  // fn-751 (schema v62): the `[armed]` epic-header pill (rendered when the
+  // epic is present in the `armed_epics` presence table). Active/cyan bucket
+  // — like `slotted-after-closer`, this is a "live, human-chosen structural
+  // signal" rather than a success/error/warn state.
+  armed: "active",
   ok: "success",
   approved: "success",
   validated: "success",
