@@ -65,5 +65,5 @@ entry absent/stale so the next healthy tick rescans; (e) ENOENT clears the entry
 - [ ] README transcript prose updated; full `bun test` green
 
 ## Done summary
-
+Added a per-path {size, mtimeMs} stat memo inside scanFile so the transcript heartbeat / FSEvents-drop rescan skips unchanged files instead of re-reading hundreds of MB/min; memo is separate from pathState, written only after a successful stat+scan, cleared on ENOENT, with truncation rescanning from 0. fn-720 rescued accounting untouched.
 ## Evidence
