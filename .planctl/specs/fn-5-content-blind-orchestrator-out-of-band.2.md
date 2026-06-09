@@ -37,5 +37,5 @@ Replace prose asserts with typed-envelope-field asserts: `brief_ref` present + a
 - [ ] `tests/test_worker_resume.py` rewritten and green; ruff + ty clean.
 
 ## Done summary
-
+Converted worker resume to a content-blind typed envelope: regenerates the brief fresh via brief.py and returns brief_ref + a one-line process nudge plus target_repo/primary_repo; dropped _build_prompt/_extract_files_line and the planctl cat self-reference. Stays readonly. Tests rewritten to typed-field asserts.
 ## Evidence
