@@ -82,5 +82,5 @@ Add a v63 test asserting `epics` has no `approval` column and `table_xinfo` show
 - [ ] `bun test` fully green; a manual re-fold from empty reproduces identical `epics` rows.
 
 ## Done summary
-
+Dropped the keeper approval data surface: schema v63 migration drops epics.approval and rewrites default_visible to status-only; removed approval from the reducer fold/UPSERT/epic-deps SELECTs, plan-worker caches/ladder/coerceApproval, the set_{task,epic}_approval RPC handlers + scripts/approve.ts, the collections filter/column, board pills, and types. v12->v13 ADD COLUMN is now <63-version-guarded so a post-v63 boot never resurrects the column. Full bun suite green; from-empty re-fold reproduces identical epics rows.
 ## Evidence

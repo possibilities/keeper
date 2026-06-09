@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Drop epics.approval column and approval surface (v63)",
-  "updated_at": "2026-06-09T15:08:47.643749Z"
+  "updated_at": "2026-06-09T17:22:36.283860Z",
+  "worker_done_at": "2026-06-09T17:22:36.283860Z"
 }
