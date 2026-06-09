@@ -2,6 +2,7 @@
   "approval": "pending",
   "branch_name": "fn-755-babysitter-findings-triage-workflow",
   "bundles": [],
+  "closer_done_at": "2026-06-09T18:19:06.797154Z",
   "created_at": "2026-06-09T14:47:34.366677Z",
   "depends_on_epics": [],
   "id": "fn-755-babysitter-findings-triage-workflow",
@@ -9,12 +10,12 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "babysitter findings triage workflow",
   "touched_repos": [
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper",
     "/Users/mike/docs"
   ],
-  "updated_at": "2026-06-09T14:47:34.366677Z"
+  "updated_at": "2026-06-09T18:19:06.797154Z"
 }
