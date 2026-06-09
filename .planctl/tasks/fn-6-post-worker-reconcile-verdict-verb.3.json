@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T19:12:00.719802Z",
+  "depends_on": [
+    "fn-6-post-worker-reconcile-verdict-verb.1"
+  ],
+  "epic": "fn-6-post-worker-reconcile-verdict-verb",
+  "id": "fn-6-post-worker-reconcile-verdict-verb.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "work skill post-worker consolidation",
+  "updated_at": "2026-06-09T19:12:00.719802Z"
+}
