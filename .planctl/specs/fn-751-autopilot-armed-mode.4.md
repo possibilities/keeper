@@ -37,5 +37,5 @@ a documented future enhancement).
 - [ ] Board render test covers armed vs unarmed.
 
 ## Done summary
-
+Added armedPill helper (omit-default, routed through pill/iconizePills, with a PILL_COLORS active-bucket entry) and wired the board to subscribe the armed_epics presence table, rendering an [armed] pill on explicitly-armed epic headers. Board retains the last readiness snapshot so an armed_epics edge repaints the pill live. Board render test covers armed vs unarmed.
 ## Evidence
