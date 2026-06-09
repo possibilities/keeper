@@ -65,5 +65,5 @@ Update readiness/autopilot/await/epic-deps tests: completion fixtures drop the a
 - [ ] No change to `work`/`close` dispatch argv or the `worker_done_at → worker_phase` derivation.
 
 ## Done summary
-
+Collapsed keeper completion onto the worker/closer-done signal: readiness completes a task on worker_phase===done and an epic on status===done alone, with predicates 4/6.5/7 and the approve dispatch verb removed. The epics.approval column is untouched (present but read by no gate), defusing the deploy landmine before the schema drop.
 ## Evidence
