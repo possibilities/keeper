@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Transcript heartbeat stat memo",
-  "updated_at": "2026-06-09T19:41:10.006038Z"
+  "updated_at": "2026-06-09T21:36:13.714001Z",
+  "worker_done_at": null
 }
