@@ -410,29 +410,21 @@ test("runQuery applies the default live scope, hiding both terminal states, unle
 
 test("resolveFilter: epics default visible-scope applies bare, is dropped by ANY wire filter, exempts pk lookups", () => {
   // No filter → the descriptor's `defaultClause` is appended. Predicate is
-  // "open OR not-yet-approved", materialized as the schema-v32 VIRTUAL
-  // generated column `default_visible` and queried via the literal
-  // single-column equality `default_visible = 1` (NOT parameterized — the
-  // literal is required for the partial-index matcher to land
-  // `idx_epics_default_visible`).
+  // "status open" (fn-756 dropped the old `approval` branch), materialized as
+  // the schema-v32 VIRTUAL generated column `default_visible` and queried via
+  // the literal single-column equality `default_visible = 1` (NOT
+  // parameterized — the literal is required for the partial-index matcher to
+  // land `idx_epics_default_visible`).
   const def = resolveFilter(EPICS_DESCRIPTOR, undefined);
   expect(def.clause).toBe("WHERE default_visible = 1");
   expect(def.params).toEqual([]);
 
   // An explicit status drops the defaultClause entirely (wire-not-empty is
   // the user's "I know what I want" override). Page now shows ONLY done
-  // epics, including done+approved ones the default would have hidden.
+  // epics, which the default would have hidden.
   const statusOnly = resolveFilter(EPICS_DESCRIPTOR, { status: "done" });
   expect(statusOnly.clause).toBe("WHERE status = ?");
   expect(statusOnly.params).toEqual(["done"]);
-
-  // An explicit approval also drops the defaultClause; page is scoped to the
-  // wire alone. `--show-approved` on the epics client rides this path.
-  const approvalOnly = resolveFilter(EPICS_DESCRIPTOR, {
-    approval: "approved",
-  });
-  expect(approvalOnly.clause).toBe("WHERE approval = ?");
-  expect(approvalOnly.params).toEqual(["approved"]);
 
   // A non-default filter key (project_dir) also counts as "wire-not-empty"
   // and drops the default — the scope is the wire's predicate alone.
@@ -441,8 +433,7 @@ test("resolveFilter: epics default visible-scope applies bare, is dropped by ANY
   expect(byDir.params).toEqual(["/r"]);
 
   // A pk lookup is exempt from the default: it resolves one identity
-  // regardless of status or approval (a detail subscribe of a
-  // done+approved epic must resolve).
+  // regardless of status (a detail subscribe of a done epic must resolve).
   const pk = resolveFilter(EPICS_DESCRIPTOR, { epic_id: "fn-2-done" });
   expect(pk.clause).toBe("WHERE epic_id = ?");
   expect(pk.params).toEqual(["fn-2-done"]);

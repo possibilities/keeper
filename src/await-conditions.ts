@@ -489,14 +489,13 @@ function evaluateEpicAwait(
     return absentBranch(inputs, target);
   }
   if (target.condition === "complete") {
-    // An epic that's truly complete (approval='approved' AND
-    // status='closed' per the EPICS_DESCRIPTOR's default filter) has
-    // popped off the board scope, so it lands on the absent branch
-    // above. If we see it here, it's still on the board — not yet
-    // complete.
+    // An epic that's truly complete (status != 'open' per the
+    // EPICS_DESCRIPTOR's default filter) has popped off the board scope,
+    // so it lands on the absent branch above. If we see it here, it's
+    // still on the board — not yet complete.
     return {
       kind: "waiting",
-      detail: `epic still on board (approval=${epic.approval} status=${epic.status ?? "null"})`,
+      detail: `epic still on board (status=${epic.status ?? "null"})`,
     };
   }
   // unblocked

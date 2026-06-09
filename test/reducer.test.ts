@@ -7093,7 +7093,6 @@ function getEpic(epicId: string) {
     title: string | null;
     project_dir: string | null;
     status: string | null;
-    approval: string;
     last_event_id: number | null;
     updated_at: number;
     tasks: string;
@@ -7107,17 +7106,18 @@ function getEpic(epicId: string) {
     // Schema v34 (fn-637): NULL = not-yet-computed; '[]' = computed, no deps.
     resolved_epic_deps: string | null;
     // Schema v32 (fn-634): VIRTUAL generated column SQLite computes from
-    // `(status, approval)` via `CASE WHEN status='open' OR approval!='approved'
-    // THEN 1 ELSE 0 END`. `SELECT *` enumerates it like any other column.
+    // `status` via `CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE
+    // 0 END` (fn-756 dropped the `approval` branch). `SELECT *` enumerates it
+    // like any other column.
     default_visible: number;
   } | null;
 }
 
 /**
  * The element shape stored in `epics.tasks` as of schema v19. Schema v7
- * introduced the embedded array; v13 added `approval`; v19 renamed `status`
- * to `worker_phase` and added the planctl-native `runtime_status` sibling
- * (defaults to `"todo"`).
+ * introduced the embedded array; v19 renamed `status` to `worker_phase` and
+ * added the planctl-native `runtime_status` sibling (defaults to `"todo"`).
+ * (fn-756 dropped the `approval` element field.)
  */
 interface EmbeddedTask {
   task_id: string;
@@ -7136,7 +7136,6 @@ interface EmbeddedTask {
   tier?: string | null;
   worker_phase?: string | null;
   runtime_status?: string;
-  approval?: "approved" | "rejected" | "pending";
   depends_on: string[];
   jobs?: unknown[];
 }
@@ -7185,9 +7184,6 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     title: "Add OAuth",
     project_dir: "/Users/mike/code/keeper",
     status: "open",
-    // No `approval` in the blob → the fold defaults to "pending" (matches the
-    // schema column NOT NULL DEFAULT and the plan-worker's coercion).
-    approval: "pending",
     last_event_id: id,
     updated_at: epic?.updated_at ?? 0,
     // A first-sight EpicSnapshot defaults the embedded array to empty.
@@ -7218,9 +7214,9 @@ test("EpicSnapshot folds into an epics row with all columns + monotonic last_eve
     // which is the schema-v33→v34 transitional reading on a pre-fold
     // row.
     resolved_epic_deps: "[]",
-    // Schema v32 (fn-634): default_visible is the VIRTUAL generated column
-    // computed from (status, approval). status='open' + approval='pending'
-    // → both branches of the OR hit → 1.
+    // Schema v32 (fn-634): default_visible is the VIRTUAL generated column.
+    // fn-756 (v63) rewrote it to `status IS NOT NULL AND status='open'`;
+    // status='open' → 1.
     default_visible: 1,
   });
   expect(epic?.last_event_id).toBe(id);
@@ -7262,9 +7258,6 @@ test("TaskSnapshot folds into the parent epic's tasks array with all element fie
     tier: "high",
     worker_phase: "done",
     runtime_status: "in_progress",
-    // No `approval` in the blob → the embedded element defaults to "pending"
-    // (matches the plan-worker's coercion + the epic-level schema default).
-    approval: "pending",
     // No depends_on in the blob → the embedded element defaults to [].
     depends_on: [],
     // First-sight task element with no prior plan_ref-bearing jobs folded
@@ -7935,147 +7928,6 @@ test("fn-637: multiple deps preserve source order in `resolved_epic_deps` (mirro
     (e) => e.dep_token,
   );
   expect(tokens).toEqual(["fn-2-up", "fn-1-up", "fn-99-x"]);
-});
-
-// ---------------------------------------------------------------------------
-// Approval folding (schema v13 — fn-592-approval-as-planctl-field)
-// ---------------------------------------------------------------------------
-
-test("EpicSnapshot folds `approval` into the epics row (explicit value)", () => {
-  epicSnapshotEvent("fn-1-app", {
-    epic_number: 1,
-    title: "T",
-    status: "open",
-    approval: "approved",
-  });
-  drainAll();
-  expect(getEpic("fn-1-app")?.approval).toBe("approved");
-});
-
-test("EpicSnapshot defaults missing `approval` to 'pending' on the projection", () => {
-  // A blob from an older daemon build (no `approval` key) folds to the
-  // schema-default "pending" — re-fold determinism preserved.
-  epicSnapshotEvent("fn-2-app", {
-    epic_number: 2,
-    title: "T",
-    status: "open",
-  });
-  drainAll();
-  expect(getEpic("fn-2-app")?.approval).toBe("pending");
-});
-
-test("EpicSnapshot ON CONFLICT updates `approval` (last-write-wins)", () => {
-  epicSnapshotEvent("fn-3-app", {
-    epic_number: 3,
-    title: "T",
-    status: "open",
-    approval: "pending",
-  });
-  drainAll();
-  expect(getEpic("fn-3-app")?.approval).toBe("pending");
-  epicSnapshotEvent("fn-3-app", {
-    epic_number: 3,
-    title: "T",
-    status: "open",
-    approval: "approved",
-  });
-  drainAll();
-  expect(getEpic("fn-3-app")?.approval).toBe("approved");
-});
-
-test("TaskSnapshot folds `approval` into the embedded task element", () => {
-  epicSnapshotEvent("fn-4-app", { epic_number: 4, title: "E", status: "open" });
-  taskSnapshotEvent("fn-4-app.1", {
-    epic_id: "fn-4-app",
-    task_number: 1,
-    title: "T",
-    approval: "rejected",
-  });
-  drainAll();
-  expect(getTask("fn-4-app.1")?.approval).toBe("rejected");
-});
-
-test("TaskSnapshot defaults missing `approval` to 'pending' on the embedded element", () => {
-  epicSnapshotEvent("fn-5-app", { epic_number: 5, title: "E", status: "open" });
-  taskSnapshotEvent("fn-5-app.1", {
-    epic_id: "fn-5-app",
-    task_number: 1,
-    title: "T",
-  });
-  drainAll();
-  expect(getTask("fn-5-app.1")?.approval).toBe("pending");
-});
-
-test("TaskSnapshot RMW updates `approval` on an existing element without clobbering siblings", () => {
-  epicSnapshotEvent("fn-6-app", { epic_number: 6, title: "E", status: "open" });
-  taskSnapshotEvent("fn-6-app.1", {
-    epic_id: "fn-6-app",
-    task_number: 1,
-    title: "T",
-    approval: "pending",
-  });
-  taskSnapshotEvent("fn-6-app.2", {
-    epic_id: "fn-6-app",
-    task_number: 2,
-    title: "U",
-    approval: "approved",
-  });
-  drainAll();
-  // Re-snapshot task 1 with a flipped approval; task 2 stays untouched.
-  taskSnapshotEvent("fn-6-app.1", {
-    epic_id: "fn-6-app",
-    task_number: 1,
-    title: "T",
-    approval: "rejected",
-  });
-  drainAll();
-  expect(getTask("fn-6-app.1")?.approval).toBe("rejected");
-  expect(getTask("fn-6-app.2")?.approval).toBe("approved");
-});
-
-test("from-scratch re-fold reproduces `approval` byte-identically across epic + task", () => {
-  // Build a non-trivial history exercising explicit + default approval values
-  // on BOTH paths. Rewind + re-drain must reproduce the same row contents.
-  epicSnapshotEvent("fn-7-app", {
-    epic_number: 7,
-    title: "E",
-    status: "open",
-    approval: "approved",
-  });
-  taskSnapshotEvent("fn-7-app.1", {
-    epic_id: "fn-7-app",
-    task_number: 1,
-    title: "T1",
-    approval: "rejected",
-  });
-  // A task with no approval — exercises the "pending" default path.
-  taskSnapshotEvent("fn-7-app.2", {
-    epic_id: "fn-7-app",
-    task_number: 2,
-    title: "T2",
-  });
-  // A later TaskSnapshot RMW that does NOT carry approval — preserves the
-  // prior value on the element? NO: TaskSnapshot is a FULL snapshot per the
-  // plan-worker spec, so absent approval folds to "pending" (last-write-wins
-  // on the snapshot). The re-fold test only proves the deterministic shape;
-  // semantic "preservation" of approval on an RMW carrying no field is NOT
-  // intended (the plan-worker always emits the field).
-  epicSnapshotEvent("fn-7-app", {
-    epic_number: 7,
-    title: "E v2",
-    status: "open",
-    approval: "approved",
-  });
-  drainAll();
-
-  const before = db.query("SELECT * FROM epics ORDER BY epic_id").all();
-
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM epics");
-  drainAll();
-
-  const after = db.query("SELECT * FROM epics ORDER BY epic_id").all();
-  expect(after).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------
@@ -10423,7 +10275,7 @@ test("syncPlanctlLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer
     sort_path: "000003.000007",
   });
 
-  // Re-fold an EpicSnapshot (mirrors an approval RPC round-trip).
+  // Re-fold an EpicSnapshot (mirrors a snapshot round-trip).
   insertEvent({
     hook_event: "EpicSnapshot",
     session_id: "fn-7-c29",
@@ -10432,15 +10284,13 @@ test("syncPlanctlLinks v29: EpicSnapshot ON CONFLICT preserves created_by_closer
       title: "C (renamed)",
       project_dir: "/repo",
       status: "open",
-      approval: "approved",
     }),
   });
   drainAll();
 
-  // The scalar flipped to "approved" / new title; the v29 columns survive.
+  // The title flipped; the v29 columns survive.
   const epic = getEpic("fn-7-c29");
   expect(epic?.title).toBe("C (renamed)");
-  expect(epic?.approval).toBe("approved");
   expect(getEpicSortFields("fn-7-c29")).toEqual({
     created_by_closer_of: "fn-3-c29",
     sort_path: "000003.000007",
@@ -10835,25 +10685,23 @@ test("syncPlanctlLinks v30: EpicSnapshot re-fold preserves queue_jump (ON CONFLI
     sort_path: "!000740",
   });
 
-  // Re-fold an EpicSnapshot (mirrors an approval RPC round-trip — a fresh
+  // Re-fold an EpicSnapshot (mirrors a snapshot round-trip — a fresh
   // atomic file write fires a snapshot event into the reducer).
   insertEvent({
     hook_event: "EpicSnapshot",
     session_id: "fn-740-carve30",
     data: JSON.stringify({
       epic_number: 740,
-      title: "Carve30 (approved)",
+      title: "Carve30 (renamed)",
       project_dir: "/repo",
       status: "open",
-      approval: "approved",
     }),
   });
   drainAll();
 
   // Scalars flipped; queue_jump + sort_path survive the carve-out.
   const epic = getEpic("fn-740-carve30");
-  expect(epic?.title).toBe("Carve30 (approved)");
-  expect(epic?.approval).toBe("approved");
+  expect(epic?.title).toBe("Carve30 (renamed)");
   expect(getEpicQueueState("fn-740-carve30")).toEqual({
     queue_jump: 1,
     sort_path: "!000740",

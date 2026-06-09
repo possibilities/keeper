@@ -779,14 +779,15 @@ test("runQuery narrows the epics set by status filter", () => {
   db.close();
 });
 
-test("epics descriptor defaults the view scope to status open OR approval ne approved", () => {
-  // Schema v32 (fn-634): the predicate "open OR not-yet-approved" is
-  // materialized via the VIRTUAL generated column `default_visible` and
-  // queried as a literal single-column equality `default_visible = 1` —
-  // literal-1 (not `params: [1]`) so the partial-index matcher lands
-  // `idx_epics_default_visible WHERE default_visible = 1` reliably across
-  // SQLite versions. ANY wire filter drops the clause (the wire is the
-  // user's "I know what I want" override); a pk subscribe is exempt.
+test("epics descriptor defaults the view scope to status open", () => {
+  // Schema v32 (fn-634): the predicate is materialized via the VIRTUAL
+  // generated column `default_visible` and queried as a literal single-column
+  // equality `default_visible = 1` — literal-1 (not `params: [1]`) so the
+  // partial-index matcher lands `idx_epics_default_visible WHERE
+  // default_visible = 1` reliably across SQLite versions. fn-756 (v63) rewrote
+  // the column expression to `status IS NOT NULL AND status='open'` (the old
+  // `approval` branch dropped). ANY wire filter drops the clause (the wire is
+  // the user's "I know what I want" override); a pk subscribe is exempt.
   expect(EPICS_DESCRIPTOR.defaultClause).toEqual({
     sql: "default_visible = 1",
     params: [],
@@ -796,23 +797,15 @@ test("epics descriptor defaults the view scope to status open OR approval ne app
   expect(EPICS_DESCRIPTOR.defaultFilter).toBeUndefined();
 });
 
-test("runQuery applies the default open-OR-not-approved scope when no filter is given", () => {
+test("runQuery applies the default open scope when no filter is given", () => {
   const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1-open", { epic_number: 1, status: "open" }); // pending
-  seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" }); // pending
-  seedEpic(db, "fn-3-done-approved", { epic_number: 3, status: "done" });
-  db.query("UPDATE epics SET approval = 'approved' WHERE epic_id = ?").run(
-    "fn-3-done-approved",
-  );
-  // No filter → default `status=open OR approval!=approved` keeps fn-1
-  // (open) and fn-2 (done but still pending review). Only fn-3
-  // (done AND approved) falls off the page.
+  seedEpic(db, "fn-1-open", { epic_number: 1, status: "open" });
+  seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" });
+  // No filter → default `status=open` keeps fn-1 (open). fn-2 (done) falls off
+  // the page.
   const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
-  expect(res.total).toBe(2);
-  expect(res.rows.map((r) => String(r.epic_id))).toEqual([
-    "fn-1-open",
-    "fn-2-done",
-  ]);
+  expect(res.total).toBe(1);
+  expect(res.rows.map((r) => String(r.epic_id))).toEqual(["fn-1-open"]);
   db.close();
 });
 
@@ -847,132 +840,6 @@ test("a pk lookup resolves a done epic despite the default open scope", () => {
   );
   expect(res.total).toBe(1);
   expect(String(res.rows[0]?.epic_id)).toBe("fn-2-done");
-  db.close();
-});
-
-// ---------------------------------------------------------------------------
-// Approval filter (schema v13 — fn-592-approval-as-planctl-field)
-// ---------------------------------------------------------------------------
-
-test("epics descriptor exposes `approval` as a filter column", () => {
-  expect(EPICS_DESCRIPTOR.filters.approval).toBe("approval");
-  // Approval is a filter key but NOT a sort key (it's a tiny enum domain).
-  expect(EPICS_DESCRIPTOR.sortable.has("approval")).toBe(false);
-  // The column is served on the wire.
-  expect(EPICS_DESCRIPTOR.columns).toContain("approval");
-});
-
-test("runQuery applies the composed default (open OR !approved) across all combos", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  // Cross-product of (status, approval) — only done-AND-approved should be
-  // hidden by the default scope; every other combination matches at least one
-  // branch of the OR and stays on the page.
-  seedEpic(db, "fn-1", { epic_number: 1, status: "open" }); // open + pending → SHOWN
-  seedEpic(db, "fn-2", { epic_number: 2, status: "open" });
-  db.query("UPDATE epics SET approval = 'approved' WHERE epic_id = ?").run(
-    "fn-2",
-  ); // open + approved → SHOWN (open branch)
-  seedEpic(db, "fn-3", { epic_number: 3, status: "done" }); // done + pending → SHOWN (!approved branch)
-  seedEpic(db, "fn-4", { epic_number: 4, status: "done" });
-  db.query("UPDATE epics SET approval = 'approved' WHERE epic_id = ?").run(
-    "fn-4",
-  ); // done + approved → HIDDEN (matches neither)
-  seedEpic(db, "fn-5", { epic_number: 5, status: "open" });
-  db.query("UPDATE epics SET approval = 'rejected' WHERE epic_id = ?").run(
-    "fn-5",
-  ); // open + rejected → SHOWN (both branches)
-
-  // Default scope: status=open OR approval != approved. Only fn-4 falls off.
-  const res = asResult(runQuery(db, 0, { type: "query", collection: "epics" }));
-  expect(res.total).toBe(4);
-  // epic_number asc — fn-1, fn-2, fn-3, fn-5.
-  expect(res.rows.map((r) => String(r.epic_id))).toEqual([
-    "fn-1",
-    "fn-2",
-    "fn-3",
-    "fn-5",
-  ]);
-  db.close();
-});
-
-test("runQuery: explicit { approval: 'approved' } overrides the default ne", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1", { epic_number: 1, status: "open" });
-  db.query("UPDATE epics SET approval = 'approved' WHERE epic_id = ?").run(
-    "fn-1",
-  );
-  seedEpic(db, "fn-2", { epic_number: 2, status: "open" }); // pending
-  const res = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "epics",
-      filter: { approval: "approved" },
-    }),
-  );
-  expect(res.total).toBe(1);
-  expect(String(res.rows[0]?.epic_id)).toBe("fn-1");
-  db.close();
-});
-
-test("runQuery: { approval: { ne: 'rejected' } } excludes rejected rows", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1", { epic_number: 1, status: "open" }); // pending
-  seedEpic(db, "fn-2", { epic_number: 2, status: "open" });
-  db.query("UPDATE epics SET approval = 'rejected' WHERE epic_id = ?").run(
-    "fn-2",
-  );
-  const res = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "epics",
-      filter: { approval: { ne: "rejected" } },
-    }),
-  );
-  expect(res.total).toBe(1);
-  expect(String(res.rows[0]?.epic_id)).toBe("fn-1");
-  db.close();
-});
-
-test("runQuery: { approval: { in: [approved, rejected] } } narrows the set", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1", { epic_number: 1, status: "open" }); // pending
-  seedEpic(db, "fn-2", { epic_number: 2, status: "open" });
-  db.query("UPDATE epics SET approval = 'approved' WHERE epic_id = ?").run(
-    "fn-2",
-  );
-  seedEpic(db, "fn-3", { epic_number: 3, status: "open" });
-  db.query("UPDATE epics SET approval = 'rejected' WHERE epic_id = ?").run(
-    "fn-3",
-  );
-  const res = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "epics",
-      filter: { approval: { in: ["approved", "rejected"] } },
-    }),
-  );
-  expect(res.total).toBe(2);
-  expect(new Set(res.rows.map((r) => String(r.epic_id)))).toEqual(
-    new Set(["fn-2", "fn-3"]),
-  );
-  db.close();
-});
-
-test("epics result rows carry the `approval` column", () => {
-  const { db } = openDb(dbPath, { readonly: false });
-  seedEpic(db, "fn-1", { epic_number: 1, status: "open" });
-  db.query("UPDATE epics SET approval = 'approved' WHERE epic_id = ?").run(
-    "fn-1",
-  );
-  // Default scope hides approved; force-include via the explicit override.
-  const res = asResult(
-    runQuery(db, 0, {
-      type: "query",
-      collection: "epics",
-      filter: { approval: "approved" },
-    }),
-  );
-  expect(res.rows[0]?.approval).toBe("approved");
   db.close();
 });
 

@@ -18,15 +18,15 @@
  * process-global `RPC_REGISTRY` and runs the handler against a dedicated WRITER
  * connection (opened next to the existing reader in `main()`). Concrete
  * handlers live in `src/rpc-handlers.ts` and are installed once per worker
- * spawn by `main()` calling `installRpcHandlers()`. As of schema v13 (the
- * fn-592-approval-as-planctl-field epic) the registry carries two planctl-
- * native approval handlers (`set_task_approval`, `set_epic_approval`) that
- * write `.planctl/{epics,tasks}/*.json` files directly — the v12 sidecar
- * `set_approval` handler was retired alongside the `approvals` table. The
+ * spawn by `main()` calling `installRpcHandlers()`. The registry carries the
+ * dead-letter replay handler plus the autopilot control-plane async handlers
+ * (`set_autopilot_paused` / `set_autopilot_mode` / `set_epic_armed` /
+ * `retry_dispatch`); each round-trips a mutation through a synthetic event via
+ * the worker→main bridge. (fn-756 retired the `set_task_approval` /
+ * `set_epic_approval` handlers with the rest of the approval surface.) The
  * two-connection split is load-bearing: the reader's `data_version` poll
- * only sees writes from OTHER connections, so any future SQL-mutating RPC
- * writer must be distinct from the poll reader (today's approval handlers
- * write files, not the DB, but the split stays for future SQL handlers).
+ * only sees writes from OTHER connections, so any SQL-mutating RPC writer must
+ * be distinct from the poll reader.
  *
  * Conventions mirror `src/wake-worker.ts`:
  * - `isMainThread`-guarded body — a plain `import` from a test is inert.
@@ -1321,8 +1321,8 @@ export interface ReplayBridge {
  * MUST NOT touch any DB connection — every write goes through the bridge.
  *
  * Why a distinct type from {@link RpcHandler}: the existing SYNC handler
- * contract is load-bearing for `set_task_approval` / `set_epic_approval`
- * (single-threaded JS gives them per-file single-flight for free). The
+ * contract is load-bearing for any file-writing handler (single-threaded JS
+ * gives them per-file single-flight for free). The
  * async path is opt-in and isolated; tagging the handler type makes the
  * dispatch shell route the two paths separately and prevents accidental
  * cross-pollination (a sync handler that suddenly returns a Promise would

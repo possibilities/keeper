@@ -62,7 +62,6 @@ function makeTask(overrides: Partial<Task>): Task {
     tier: null,
     worker_phase: "open",
     runtime_status: "todo",
-    approval: "pending",
     depends_on: [],
     jobs: [],
     ...overrides,
@@ -76,7 +75,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     title: "epic",
     project_dir: "/repo",
     status: "open",
-    approval: "pending",
     last_event_id: 0,
     updated_at: 0,
     depends_on_epics: [],
@@ -242,7 +240,6 @@ test("task-complete: done + approved → met", () => {
   const task = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
@@ -257,7 +254,6 @@ test("fn-756 task-complete: done + pending → met (worker-done alone is complet
   const task = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "pending",
   });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
@@ -273,7 +269,6 @@ test("task-complete: open + approved → waiting (worker hasn't finished)", () =
   const task = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "open",
-    approval: "approved",
   });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
@@ -288,7 +283,6 @@ test("fn-756 task-complete: done + (ignored) rejected → met (approval no longe
   const task = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "rejected",
   });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
@@ -308,16 +302,16 @@ test("fn-756 task-complete: done + (ignored) rejected → met (approval no longe
 // ---------------------------------------------------------------------------
 
 test("epic-complete: epic still on board → waiting (never met on the present branch)", () => {
-  const task = makeTask({ worker_phase: "done", approval: "approved" });
-  const epic = makeEpic({ tasks: [task], approval: "pending" });
+  const task = makeTask({ worker_phase: "done" });
+  const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
   const state = evaluateAwaitCondition(
     { epics: [epic], snapshot: snap, priorPresence: true },
     { id: epic.epic_id, kind: "epic", condition: "complete" },
   );
-  // Even though the only task is done+approved, the epic itself is
-  // still on the board (its approval hasn't flipped yet) — `met` only
-  // fires when it pops off scope.
+  // Even though the only task is done, the epic itself is still on the
+  // board (its status hasn't flipped to done yet) — `met` only fires
+  // when it pops off scope.
   expect(state.kind).toBe("waiting");
 });
 
@@ -385,7 +379,6 @@ test("epic-complete: bare fn-N form looks up by epic_number", () => {
     task_id: "fn-7-x.1",
     epic_id: "fn-7-x",
     worker_phase: "done",
-    approval: "approved",
   });
   const epic = makeEpic({
     epic_id: "fn-7-x",
@@ -502,7 +495,7 @@ test("task-unblocked: completed task is NOT workable → waiting", () => {
   // `completed` is the terminal positive for `complete` checks; it is
   // not "available to start" so `unblocked` reads it as `waiting`. The
   // command's `complete` condition is the right tool for this row.
-  const task = makeTask({ worker_phase: "done", approval: "approved" });
+  const task = makeTask({ worker_phase: "done" });
   const epic = makeEpic({ tasks: [task] });
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
@@ -657,7 +650,7 @@ test("fn-721 (task): dispatch-pending row → waiting, NOT stuck (self-resolves)
   // `dispatch-pending`, which is NOT workable and NOT in STUCK_REASON_KINDS,
   // so an `unblocked` await on it returns `waiting` — it self-resolves on the
   // bind / DispatchFailed / DispatchExpired discharge, no human action needed.
-  const t = makeTask({ task_id: "fn-1-foo.1", approval: "pending" });
+  const t = makeTask({ task_id: "fn-1-foo.1" });
   const epic = makeEpic({ tasks: [t] });
   const snap = computeReadiness(
     [epic],
@@ -683,11 +676,10 @@ test("fn-721 (task): a sibling demoted by a dispatch-pending occupant stays work
   // same-epic ready sibling task 2 is demoted to `single-task-per-epic`,
   // which IS workable (held back ONLY by the concurrency mutex). An
   // `unblocked` await on task 2 therefore returns `met`.
-  const t1 = makeTask({ task_id: "fn-1-foo.1", approval: "pending" });
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
     task_number: 2,
-    approval: "pending",
   });
   const epic = makeEpic({ tasks: [t1, t2] });
   const snap = computeReadiness(
@@ -736,7 +728,6 @@ test("not-stuck (epic): one rejected sibling + one ready task → met (not stuck
   const rejected = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "rejected",
   });
   const ready = makeTask({
     task_id: "fn-1-foo.2",

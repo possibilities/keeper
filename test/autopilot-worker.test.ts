@@ -88,7 +88,6 @@ function makeTask(overrides: Partial<Task>): Task {
     tier: null,
     worker_phase: "open",
     runtime_status: "todo",
-    approval: "approved",
     depends_on: [],
     jobs: [],
     ...overrides,
@@ -102,7 +101,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     title: "epic",
     project_dir: "/repo",
     status: "open",
-    approval: "approved",
     last_event_id: 0,
     updated_at: 0,
     depends_on_epics: [],
@@ -1086,11 +1084,10 @@ test("fn-721 reconcile: a pending dispatch demotes a same-epic ready sibling (no
     epic_id: "fn-1-foo",
     project_dir: "/repo",
     tasks: [
-      makeTask({ task_id: "fn-1-foo.1", approval: "pending" }),
+      makeTask({ task_id: "fn-1-foo.1" }),
       makeTask({
         task_id: "fn-1-foo.2",
         task_number: 2,
-        approval: "pending",
       }),
     ],
   });
@@ -1114,11 +1111,10 @@ test("fn-721 reconcile: without the pending row the sibling is NOT demoted (cont
     epic_id: "fn-1-foo",
     project_dir: "/repo",
     tasks: [
-      makeTask({ task_id: "fn-1-foo.1", approval: "pending" }),
+      makeTask({ task_id: "fn-1-foo.1" }),
       makeTask({
         task_id: "fn-1-foo.2",
         task_number: 2,
-        approval: "pending",
       }),
     ],
   });
@@ -1153,7 +1149,6 @@ function occupantEpic(epicId: string, projectDir: string): Epic {
         epic_id: epicId,
         worker_phase: "done",
         runtime_status: "done",
-        approval: "approved",
         jobs: [
           // Embedded working job → predicate 1 holds the task at
           // `running:job-running`, an `isRootOccupant`.
@@ -1337,11 +1332,10 @@ test("fn-721 parity: autopilot reconcile path and the board/CLI computeReadiness
     epic_id: "fn-1-foo",
     project_dir: "/repo",
     tasks: [
-      makeTask({ task_id: "fn-1-foo.1", approval: "pending" }),
+      makeTask({ task_id: "fn-1-foo.1" }),
       makeTask({
         task_id: "fn-1-foo.2",
         task_number: 2,
-        approval: "pending",
       }),
     ],
   });

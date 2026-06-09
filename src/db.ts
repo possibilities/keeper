@@ -58,7 +58,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Current schema version. Bump only when adding an ALTER block to `migrate()`.
  * Forward-only — never reduce, never branch.
  */
-export const SCHEMA_VERSION = 62;
+export const SCHEMA_VERSION = 63;
 
 /**
  * Resolve the keeper DB path. `KEEPER_DB` env var wins (used by tests and the
@@ -816,7 +816,6 @@ CREATE TABLE IF NOT EXISTS epics (
     title TEXT,
     project_dir TEXT,
     status TEXT,
-    approval TEXT NOT NULL DEFAULT 'pending',
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
     tasks TEXT NOT NULL DEFAULT '[]',
@@ -828,7 +827,7 @@ CREATE TABLE IF NOT EXISTS epics (
     sort_path TEXT NOT NULL DEFAULT '',
     queue_jump INTEGER NOT NULL DEFAULT 0,
     resolved_epic_deps TEXT,
-    default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND (status='open' OR approval!='approved') THEN 1 ELSE 0 END) VIRTUAL
+    default_visible INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE 0 END) VIRTUAL
 )
 `;
 
@@ -2087,7 +2086,7 @@ function renameColumnIfPresent(
  * (the index is a pure function of the current `epics` table, which
  * doesn't change inside this routine — chunked writes against
  * different rows don't affect the resolution-relevant `(epic_id,
- * epic_number, project_dir, status, approval)` columns). The per-chunk
+ * epic_number, project_dir, status)` columns). The per-chunk
  * write cost is O(chunk_size * deps_per_row) ALTER INSERTs +
  * O(chunk_size) UPDATE writes.
  *
@@ -2117,7 +2116,7 @@ function backfillResolvedEpicDeps(db: Database): void {
 
   // Step 2: build the all-epics index ONCE for the full backfill pass.
   // The resolver-relevant columns (`epic_id`, `epic_number`, `project_dir`,
-  // `status`, `approval`) are stable across the backfill: the chunked
+  // `status`) are stable across the backfill: the chunked
   // UPDATEs only touch `resolved_epic_deps` + `last_event_id` +
   // `updated_at`, none of which the resolver reads. So a single index
   // assembly suffices for the whole pass.
@@ -2135,13 +2134,12 @@ function backfillResolvedEpicDeps(db: Database): void {
     epic_number: number | null;
     project_dir: string | null;
     status: string | null;
-    approval: "approved" | "rejected" | "pending";
     depends_on_epics: string | null;
     updated_at: number;
   };
   const indexRows = db
     .prepare(
-      `SELECT epic_id, epic_number, project_dir, status, approval
+      `SELECT epic_id, epic_number, project_dir, status
          FROM epics`,
     )
     .all() as Omit<BackfillEpicRow, "depends_on_epics" | "updated_at">[];
@@ -2154,7 +2152,6 @@ function backfillResolvedEpicDeps(db: Database): void {
       title: null,
       project_dir: row.project_dir,
       status: row.status,
-      approval: row.approval,
       last_event_id: null,
       updated_at: 0,
       depends_on_epics: [],
@@ -2198,7 +2195,7 @@ function backfillResolvedEpicDeps(db: Database): void {
       const placeholders = slice.map(() => "?").join(",");
       const chunkRows = db
         .prepare(
-          `SELECT epic_id, epic_number, project_dir, status, approval,
+          `SELECT epic_id, epic_number, project_dir, status,
                   depends_on_epics, updated_at
              FROM epics
             WHERE epic_id IN (${placeholders})`,
@@ -2211,7 +2208,6 @@ function backfillResolvedEpicDeps(db: Database): void {
           title: null,
           project_dir: row.project_dir,
           status: row.status,
-          approval: row.approval,
           last_event_id: null,
           updated_at: 0,
           depends_on_epics: [],
@@ -2762,19 +2758,28 @@ function migrate(db: Database): void {
       //      ADD COLUMN + DROP TABLE) → `runPlanctlApprovalMigration` (the FS
       //      half, also idempotent) → workers spawn.
       //
-      // The SQL ADD COLUMN is idempotent (no-op when present); the DROP TABLE
-      // IF EXISTS is idempotent (no-op when absent). `NOT NULL DEFAULT
-      // 'pending'` matches CREATE_EPICS so a fresh v13 DB and a migrated v12→v13
-      // DB converge to identical schema. Existing rows backfill to `'pending'`;
-      // the plan-worker emits `'pending'` for any file whose `approval` field is
-      // missing, so a re-fold of an existing event log reproduces the same
-      // reading (re-fold determinism preserved).
-      addColumnIfMissing(
-        db,
-        "epics",
-        "approval",
-        "TEXT NOT NULL DEFAULT 'pending'",
-      );
+      // The SQL ADD COLUMN added `epics.approval` (NOT NULL DEFAULT 'pending').
+      // fn-756 (v62→v63, below) DROPS the column again — so this ADD must be
+      // VERSION-GUARDED on `preMigrateStoredVersion < 63`. Without the guard,
+      // `addColumnIfMissing` is presence-idempotent and would re-add `approval`
+      // on EVERY boot of a post-v63 DB (the column is absent → it re-adds it),
+      // while the v62→v63 drop is `< 63`-guarded and would NOT re-run — leaving
+      // the column resurrected forever. The `< 63` bound (not `< 13`) is
+      // deliberate: a DB stored at 13..62 physically carries `approval`
+      // already, but the intermediate v55→v56 `default_visible` rewrite below
+      // references it in its generated-column expression, so the column MUST be
+      // present for any pre-v63 upgrade path that passes through v56. A DB at
+      // stored ≥ 63 (the column already dropped) skips it. (The FS half + the
+      // `approvals` DROP / TEMP-snapshot below stay unguarded — idempotent
+      // no-ops on an already-migrated DB.)
+      if (preMigrateStoredVersion < 63) {
+        addColumnIfMissing(
+          db,
+          "epics",
+          "approval",
+          "TEXT NOT NULL DEFAULT 'pending'",
+        );
+      }
 
       // Snapshot the v12 `approvals` rows into a connection-scoped TEMP table
       // BEFORE the DROP fires. The FS half (`runPlanctlApprovalMigration`,
@@ -6123,6 +6128,87 @@ function migrate(db: Database): void {
         "TEXT NOT NULL DEFAULT 'yolo'",
       );
       db.run(CREATE_ARMED_EPICS);
+
+      // v62→v63: fn-756 (task .2) — strip the dead `approval` data surface.
+      // With the keeper gates already collapsed in `.1` (completion derives
+      // from `worker_phase==="done"` / `status==="done"` alone, never
+      // `approval`), the `epics.approval` column and its appearance in the
+      // `default_visible` predicate are pure dead weight. This is the v55→v56
+      // virtual-column playbook (above) run IN REVERSE, all inside this one
+      // `BEGIN IMMEDIATE` so a mid-step throw rolls the whole transaction back
+      // cleanly (never a half-applied schema that wedges boot):
+      //   1. DROP the partial index `idx_epics_default_visible` FIRST — it
+      //      references the VIRTUAL column, so SQLite refuses to drop the
+      //      column while the index stands.
+      //   2. DROP the VIRTUAL `default_visible` column. The presence check
+      //      MUST read `PRAGMA table_xinfo` — `table_info` (what
+      //      `dropColumnIfPresent` reads) EXCLUDES generated columns, so it
+      //      would no-op wrongly and strand the old `approval`-referencing
+      //      expression forever.
+      //   3. re-ADD `default_visible` via `addGeneratedColumnIfMissing` with
+      //      the new expression — `CASE WHEN status IS NOT NULL AND
+      //      status='open' THEN 1 ELSE 0 END` — which no longer references
+      //      `approval`. (On a fresh v63 DB the CREATE_EPICS literal already
+      //      landed the new form, so this no-ops.)
+      //   4. recreate the partial index. `CREATE_EPICS_INDEXES` runs
+      //      unconditionally below the migrate transaction on every boot, but
+      //      the column must exist when it runs, so recreate it here too for
+      //      the upgrade boot (IF NOT EXISTS makes both runs idempotent).
+      //   5. DROP the now-orphaned `approval` column itself
+      //      (`dropColumnIfPresent` — `table_info` is correct here, `approval`
+      //      is a real stored column). This MUST follow the `default_visible`
+      //      rewrite: the old generated expression referenced `approval`, so
+      //      SQLite refuses to drop `approval` while that column carries the
+      //      stale dependency.
+      //   6. `PRAGMA quick_check` as a post-rewrite integrity assertion; a
+      //      corrupt result throws and rolls the transaction back rather than
+      //      stamping v63 over damage.
+      //
+      // Version-guarded on `preMigrateStoredVersion < 63` so the rewrite+drop
+      // runs exactly once per upgrade — a fresh v63 DB (CREATE_EPICS already
+      // carries the new expression and omits `approval`) and a steady-state
+      // re-open of an already-v63 DB both skip it.
+      //
+      // Re-fold safe: `default_visible` is a VIRTUAL column SQLite recomputes
+      // on every read — no stored data, no backfill — and a from-scratch
+      // cursor=0 re-fold reproduces byte-identical 0/1 values because the new
+      // expression is a pure function of `status` (which the reducer's
+      // EpicSnapshot UPSERT already writes). The reducer no longer folds
+      // `approval` (fn-756 .2), so the dropped column has no surviving writer
+      // or fold-time SELECT. NO event-log change.
+      //
+      // Keeper-py reader: `keeper/api.py`'s SUPPORTED_SCHEMA_VERSIONS adds 63
+      // in the SAME change — whitelist-only (keeper-py reads neither the column
+      // nor the predicate), but the bump is required so keeper-py's Python
+      // readers on this host don't fail-loud (test/schema-version.test.ts
+      // enforces).
+      if (preMigrateStoredVersion < 63) {
+        const xinfoCols = db.prepare("PRAGMA table_xinfo(epics)").all() as {
+          name: string;
+        }[];
+        if (xinfoCols.some((c) => c.name === "default_visible")) {
+          db.run("DROP INDEX IF EXISTS idx_epics_default_visible");
+          db.run("ALTER TABLE epics DROP COLUMN default_visible");
+        }
+        addGeneratedColumnIfMissing(
+          db,
+          "epics",
+          "default_visible",
+          "INTEGER NOT NULL GENERATED ALWAYS AS (CASE WHEN status IS NOT NULL AND status='open' THEN 1 ELSE 0 END) VIRTUAL",
+        );
+        db.run(
+          "CREATE INDEX IF NOT EXISTS idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1",
+        );
+        dropColumnIfPresent(db, "epics", "approval");
+        const integrity = db.prepare("PRAGMA quick_check").get() as {
+          quick_check: string;
+        } | null;
+        if (integrity?.quick_check !== "ok") {
+          throw new Error(
+            `v62→v63 approval drop / default_visible rewrite failed integrity quick_check: ${integrity?.quick_check ?? "no result"}`,
+          );
+        }
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

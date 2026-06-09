@@ -229,6 +229,14 @@ from pathlib import Path
 # reads neither ``autopilot_state`` nor ``armed_epics`` (the autopilot
 # reconciler + the ``keeper autopilot``/board viewers are the only consumers),
 # so no reader logic changes — only the version whitelist gains 62.
+#
+# v63 (fn-756 task .2) is also whitelist-only: it drops the dead
+# ``epics.approval`` column and rewrites the ``default_visible`` generated
+# column to drop its ``approval`` branch (``CASE WHEN status IS NOT NULL AND
+# status='open' THEN 1 ELSE 0 END``), now that keeper completes work on
+# worker/closer-done alone with no approval gate. keeper-py reads neither the
+# column nor the predicate, so no reader logic changes — only the version
+# whitelist gains 63.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -263,6 +271,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         60,
         61,
         62,
+        63,
     }
 )
 

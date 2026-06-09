@@ -752,8 +752,8 @@ function evaluateTask(
 
   // 4. own-approval-rejected — REMOVED (fn-756). The approval enum no longer
   // gates completion; a task completes on `worker_phase==="done"` alone
-  // (predicate 1 above). `task.approval` is still physically present on the
-  // projection but is read by no gate.
+  // (predicate 1 above). `task.approval` was dropped from the projection in
+  // fn-756 .2 (schema v63).
 
   // 5. own-progress-main — embedded jobs[] state vocabulary, no verb check
   // (the embedded array's verb is implied by where it lives — task-level
@@ -846,7 +846,8 @@ function evaluateTask(
   // 7. own-approval-pending — REMOVED (fn-756). The approval enum no longer
   // gates completion; predicate 1 marks the task `completed` on
   // `worker_phase==="done"` alone, so there is no `job-pending` window. The
-  // `task.approval` field is still physically present but read by no gate.
+  // `task.approval` field was dropped from the projection in fn-756 .2
+  // (schema v63).
 
   // 8. dep-on-task — any upstream NOT `{ tag: "completed" }`. The pre-sorted
   // tasks order means typical intra-epic deps already have their upstream
@@ -1060,8 +1061,8 @@ function evaluateCloseRow(
 
   // 4. own-approval-rejected — REMOVED (fn-756). The approval enum no longer
   // gates completion; the close row completes on `epic.status==="done"`
-  // alone (predicate 1 above). `epic.approval` is still physically present
-  // but read by no gate.
+  // alone (predicate 1 above). `epic.approval` was dropped from the projection
+  // in fn-756 .2 (schema v63).
 
   // 5. own-progress-main — close-row blocks on a running worker session at
   // EITHER scope: epic-level (close-verb) embedded jobs (the primary source),
@@ -1151,8 +1152,8 @@ function evaluateCloseRow(
 
   // 7. own-approval-pending — REMOVED (fn-756). Predicate 1 marks the close
   // row `completed` on `epic.status==="done"` alone, so there is no
-  // `job-pending` window. `epic.approval` is still physically present but
-  // read by no gate.
+  // `job-pending` window. `epic.approval` was dropped from the projection in
+  // fn-756 .2 (schema v63).
 
   // 8. dep-on-task — not applicable to the close row (it has no direct
   // task deps; predicate 10 below synthesizes those from the epic's tasks).

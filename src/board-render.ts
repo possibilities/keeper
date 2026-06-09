@@ -291,13 +291,14 @@ export function armedPill(isArmed: boolean): string {
 
 /**
  * Render the trailing pill segment for a board TASK LINE (epic fn-708) —
- * the consolidated successor to the old triple
- * `[${runtime_status}] [${worker_phase}] [${approval}]` closure in
+ * the consolidated successor to the old pair
+ * `[${runtime_status}] [${worker_phase}]` closure in
  * `cli/board.ts:renderEpicBlock`. Pure `f(task, verdict)` — no readiness
  * recompute, no wall-clock, no env; `verdict` is already in scope at the
- * call site.
+ * call site. (fn-756 dropped the third `[approval]` pill with the rest of
+ * the approval surface.)
  *
- * Three fields, each lossless-consolidated per `~/docs/pill-inventory.md`
+ * Two fields, each lossless-consolidated per `~/docs/pill-inventory.md`
  * Part 4:
  *   - **runtime_status (B10, T1 + de-ambiguate)** — omit `todo` (default);
  *     render `in_progress` / `done` verbatim; relabel `blocked` →
@@ -307,12 +308,9 @@ export function armedPill(isArmed: boolean): string {
  *     render the survivor as the LABELED `[worker-done]` (never bare
  *     `[done]`, which would collide with runtime `done`) and ONLY when the
  *     verdict does not already pin it (see {@link verdictPinsWorkerDone}).
- *   - **approval (B12, T1 + T3)** — never render `[pending]`; drop
- *     `[rejected]` when the verdict is `blocked:job-rejected` (the word is
- *     on screen); drop `[approved]` when the verdict is `completed`.
  *
- * Returns a string beginning with `' '` per appended pill (or `""` when all
- * three fields are at rest), so the caller appends unconditionally.
+ * Returns a string beginning with `' '` per appended pill (or `""` when both
+ * fields are at rest), so the caller appends unconditionally.
  */
 export function renderTaskPills(
   task: Record<string, unknown>,
@@ -320,9 +318,9 @@ export function renderTaskPills(
 ): string {
   // fn-713 follow-on: SHOW every fixed-slot enum at its current value
   // (reverses fn-708 omit-default AND drops the verdict-aware T3 suppression)
-  // — runtime_status / worker_phase / approval now render on every task row,
-  // defaults included, each as an iconized `[<glyph>::<token>]` pill. The
-  // `_verdict` arg is retained for call / test arity but no longer consulted.
+  // — runtime_status / worker_phase now render on every task row, defaults
+  // included, each as an iconized `[<glyph>::<token>]` pill. The `_verdict`
+  // arg is retained for call / test arity but no longer consulted.
   let out = "";
 
   // runtime_status (B10): `blocked` relabels to `rt:blocked` so it never
@@ -335,48 +333,35 @@ export function renderTaskPills(
   // `done`, which collides with runtime `done`); `open` is the resting value.
   out += ` ${pill(task.worker_phase === "done" ? "worker-done" : "open")}`;
 
-  // approval (B12): pending / approved / rejected, all shown.
-  const apRaw = task.approval;
-  const ap = typeof apRaw === "string" && apRaw !== "" ? apRaw : "pending";
-  out += ` ${pill(ap)}`;
-
   return out;
 }
 
 /**
  * Render the trailing pill segment for a board CLOSE ROW (epic fn-708) —
  * the consolidated successor to the old `[${status}] [${approval}]` closure
- * in `cli/board.ts:renderEpicBlock`. Pure `f(epicRow, verdict)`.
+ * in `cli/board.ts:renderEpicBlock`. Pure `f(epicRow, verdict)`. (fn-756
+ * dropped the `[approval]` pill with the rest of the approval surface.)
  *
- *   - **close status (B15, T2 drop-constant)** — the board filter is
- *     `status='open'`, so this pill is the constant `[open]` and carries
- *     zero bits. Dropped here. A custom-filtered view that surfaces
- *     non-open epics must restore it via `seg(epicRow.status)` (kept
- *     available; see the restore note below).
- *   - **close approval (B16, T1 + T3)** — never `[approved]` on the board
- *     (the filter excludes it); omit `[pending]` (default); render
- *     `[rejected]` only when the verdict is not already `blocked:job-rejected`.
+ *   - **close status (B15)** — the board filter is `status='open'`, so this
+ *     pill is the constant `[open]` on the default view; it renders anyway so
+ *     a custom-filtered view that surfaces non-open epics carries the value.
  *
- * In practice the close row collapses to just its title + `[id] <verdict>`.
  * Returns `""` when nothing survives, else a `' '`-prefixed pill string.
  */
 export function renderClosePills(
   epicRow: Record<string, unknown>,
   _verdict: Verdict,
 ): string {
-  // fn-713 follow-on: SHOW the close-row status + approval at their current
-  // values (reverses fn-708 omit-default, the T2 status drop, and the T3
-  // suppression). On the default board filter `status` is the constant
-  // `open`; it renders anyway so every row carries the full state. The
-  // `_verdict` arg is retained for call / test arity.
+  // fn-713 follow-on: SHOW the close-row status at its current value
+  // (reverses fn-708 omit-default + the T2 status drop). On the default board
+  // filter `status` is the constant `open`; it renders anyway so every row
+  // carries the full state. The `_verdict` arg is retained for call / test
+  // arity. (fn-756 dropped the approval pill.)
   let out = "";
   const statusRaw = epicRow.status;
   const status =
     typeof statusRaw === "string" && statusRaw !== "" ? statusRaw : "open";
   out += ` ${pill(status)}`;
-  const apRaw = epicRow.approval;
-  const ap = typeof apRaw === "string" && apRaw !== "" ? apRaw : "pending";
-  out += ` ${pill(ap)}`;
   return out;
 }
 

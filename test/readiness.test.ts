@@ -57,7 +57,6 @@ function makeTask(overrides: Partial<Task>): Task {
     // `tasks` array.
     worker_phase: "open",
     runtime_status: "todo",
-    approval: "pending",
     depends_on: [],
     jobs: [],
     ...overrides,
@@ -71,7 +70,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     title: "epic",
     project_dir: "/repo",
     status: "open",
-    approval: "pending",
     last_event_id: 0,
     updated_at: 0,
     depends_on_epics: [],
@@ -283,7 +281,6 @@ test("predicate 5 (own-progress-main) wins over 1 (terminal-completed): done+app
   // over 5") — the autopilot incident that motivated the rename.
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ state: "working" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -313,7 +310,6 @@ test("fn-671: done+approved task with working embedded job → running:job-runni
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
   });
   const t2 = makeTask({
@@ -342,7 +338,6 @@ test("fn-671: done+approved task with stopped job + running sub-agent → runnin
   // an unkeyed pair already lines up for `subRunningByJobId`.
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -361,7 +356,6 @@ test("fn-671: done+approved task with stale running sub-agent → running:sub-ag
   // pause + manual replay).
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -380,7 +374,6 @@ test("fn-671: done+approved task with idle session → completed (clean collapse
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const t2 = makeTask({
@@ -405,7 +398,6 @@ test("fn-671 regression: T1 done+approved with session-still-working; T2 depends
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
   });
   const t2 = makeTask({
@@ -443,7 +435,6 @@ test("fn-719: done+approved task with live worker monitor → running:monitor-ru
   // clause holds it at `running:monitor-running` via predicate 6.6.
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({ state: "stopped", has_live_worker_monitor: true }),
     ],
@@ -464,7 +455,6 @@ test("fn-719: ambient-only monitor (has_live_worker_monitor=false) → completed
   // identical shape, only the flag flips).
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({ state: "stopped", has_live_worker_monitor: false }),
     ],
@@ -483,7 +473,6 @@ test("fn-719: live worker monitor occupies BOTH per-epic and per-root mutex (blo
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({
         job_id: "worker-1",
@@ -515,7 +504,6 @@ test("fn-719: live worker monitor in epic A occupies the root, demotes a same-ro
   const a1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({
         job_id: "worker-a",
@@ -553,7 +541,6 @@ test("fn-719: live worker monitor past soft TTL (within hard ceiling) → runnin
   // ceiling) — same correctness-over-throughput stance as `sub-agent-stale`.
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({
         state: "stopped",
@@ -576,7 +563,6 @@ test("fn-719: live worker monitor past hard ceiling → slot RELEASED (collapses
   // mutex. An abandoned session can't wedge the slot forever.
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({
         state: "stopped",
@@ -598,7 +584,6 @@ test("fn-719: a fresh live monitor alongside a stale one keeps the task at monit
   // live somewhere.
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({
         job_id: "worker-stale",
@@ -627,7 +612,6 @@ test("fn-719: a still-working job outranks the monitor fact (predicate 5 wins ov
   // job has Stopped — this pins the predicate ordering.
   const task = makeTask({
     worker_phase: "done",
-    approval: "approved",
     jobs: [
       makeEmbeddedJob({ state: "working", has_live_worker_monitor: true }),
     ],
@@ -647,7 +631,7 @@ test("fn-719: a still-working job outranks the monitor fact (predicate 5 wins ov
 // false` live-veto, so no mutex-holding monitor verdict is needed.
 
 test("predicate 1 wins over 2 (epic-not-validated)", () => {
-  const task = makeTask({ worker_phase: "done", approval: "approved" });
+  const task = makeTask({ worker_phase: "done" });
   const epic = makeEpic({ tasks: [task], last_validated_at: null });
   const snap = run([epic]);
   expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
@@ -736,9 +720,9 @@ test("fn-712 perCloseRow: epic-not-materialized ranks ABOVE epic-not-validated",
 });
 
 test("predicate 3 (planner-running) wins over 4 (own-approval-rejected)", () => {
-  // Even an approved+done task blocks when a planner is working on the epic.
-  // (Predicate 1 doesn't fire because approval is `pending`, not `approved`.)
-  const task = makeTask({ worker_phase: "open", approval: "approved" });
+  // A not-yet-done task blocks when a planner is working on the epic.
+  // (Predicate 1 doesn't fire because `worker_phase` is `open`, not `done`.)
+  const task = makeTask({ worker_phase: "open" });
   const epic = makeEpic({
     tasks: [task],
     job_links: [
@@ -778,7 +762,6 @@ test("predicate 6 (own-progress-sub) wins over 7 (own-approval-pending)", () => 
   // sub-agent finishes, `job-pending` is held back.
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -799,7 +782,6 @@ test("predicate 6 (own-progress-sub) wins over 7 (own-approval-pending)", () => 
 test("predicate 6: running sub-agent within freshness window → sub-agent-running", () => {
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -815,7 +797,6 @@ test("predicate 6: running sub-agent within freshness window → sub-agent-runni
 test("predicate 6: running sub-agent past staleness window → sub-agent-stale", () => {
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -835,7 +816,6 @@ test("predicate 6: a mix of stale + fresh running sub-agents stays at sub-agent-
   // making progress somewhere and shouldn't render as stale.
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -868,7 +848,6 @@ test("predicate 6: exact boundary tick (now - ts === threshold) is not yet stale
   // stays at `sub-agent-running`; the next-tick comparison would flip.
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -887,7 +866,6 @@ test("predicate 6: default `now` (NEGATIVE_INFINITY) never flips to sub-agent-st
   // bit-for-bit.
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -907,7 +885,6 @@ test("fn-756: a worker-done task with an idle session is COMPLETED (no approval 
   // row is now terminal `completed` — the approval enum is ignored.
   const task = makeTask({
     worker_phase: "done",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -979,7 +956,6 @@ test("predicate 6 (own-progress-sub) wins over 8 (dep-on-task)", () => {
   const upstream = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
   const dependent = makeTask({
     task_id: "fn-1-foo.2",
@@ -1004,7 +980,6 @@ test("predicate 8 (dep-on-task) wins over 9 (dep-on-epic)", () => {
     title: "bar",
     project_dir: "/other",
     status: "open",
-    approval: "pending",
     tasks: [],
   });
   const upstreamTask = makeTask({
@@ -1047,7 +1022,6 @@ test("predicate 9 (dep-on-epic) wins over 12 (single-task-per-root)", () => {
     title: "bar",
     project_dir: "/repo",
     status: "open",
-    approval: "pending",
     tasks: [makeTask({ task_id: "fn-0-bar.1", epic_id: "fn-0-bar" })],
   });
   const dependent = makeTask({
@@ -1143,7 +1117,6 @@ test("per-epic: doesn't fire when only one non-completed task exists", () => {
   const done = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
   const ready = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
   const epic = makeEpic({ tasks: [done, ready] });
@@ -1167,7 +1140,6 @@ test("a not-done task in a dirty repo is ready (no git lift)", () => {
   const notDone = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "open",
-    approval: "pending",
     target_repo: "/r",
   });
   const epic = makeEpic({ tasks: [notDone], project_dir: "/r" });
@@ -1226,7 +1198,6 @@ test("per-root: a completed close row does NOT claim the root → cross-epic rea
   const e1t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     target_repo: "/r",
   });
   const e1 = makeEpic({
@@ -2534,7 +2505,6 @@ test("close row: every real task completed → close ready (then dep-on-task-syn
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
   const epic = makeEpic({ tasks: [t] });
   const snap = run([epic]);
@@ -2545,7 +2515,6 @@ test("close row: any non-completed task → dep-on-task with FIRST non-completed
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
   });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
@@ -2592,7 +2561,6 @@ test("fn-671: task-level worker still working — task stays at job-running, clo
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
   });
   const epic = makeEpic({ tasks: [t] });
@@ -2610,7 +2578,6 @@ test("fn-671: task-level worker has running sub-agent — task stays at sub-agen
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [t] });
@@ -2630,7 +2597,6 @@ test("fn-671: task-level running sub-agent past staleness window — task is sub
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [t] });
@@ -2654,14 +2620,12 @@ test("fn-671: a fresh sub-agent on one task keeps that task at sub-agent-running
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
     task_number: 2,
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-2", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [t1, t2] });
@@ -2687,7 +2651,6 @@ test("close row: all task workers stopped, no sub-agents running → ready", () 
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [t] });
@@ -2710,7 +2673,6 @@ test("close row: in-flight (non-completed) task working → dep-on-task, NOT job
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "open",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
   });
   const epic = makeEpic({ tasks: [t] });
@@ -2729,7 +2691,6 @@ test("close row: in-flight task with running sub-agent → dep-on-task, NOT sub-
   const t = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "open",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
   });
   const epic = makeEpic({ tasks: [t] });
@@ -2758,14 +2719,12 @@ test("fn-671: completed-racing worker holds per-task running, close row blocks o
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const t2 = makeTask({
     task_id: "fn-1-foo.2",
     task_number: 2,
     worker_phase: "open",
-    approval: "pending",
     jobs: [makeEmbeddedJob({ job_id: "worker-2", state: "working" })],
   });
   const epic = makeEpic({ tasks: [t1, t2] });
@@ -2779,7 +2738,6 @@ test("fn-671: completed-racing worker holds per-task running, close row blocks o
   const t1Racing = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
   });
   const epicRacing = makeEpic({ tasks: [t1Racing, t2] });
@@ -2886,7 +2844,6 @@ test("dispatch-pending: a close:: pending row demotes a same-root ready task in 
   const e1t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "w1", state: "ended" })],
   });
   const e1 = makeEpic({

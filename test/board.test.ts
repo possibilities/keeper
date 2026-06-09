@@ -101,7 +101,6 @@ function makeTask(overrides: Partial<Task>): Task {
     // `tasks` array.
     worker_phase: "open",
     runtime_status: "todo",
-    approval: "approved",
     depends_on: [],
     jobs: [],
     ...overrides,
@@ -115,7 +114,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     title: "epic",
     project_dir: "/repo",
     status: "open",
-    approval: "approved",
     last_event_id: 0,
     updated_at: 0,
     depends_on_epics: [],
@@ -479,7 +477,6 @@ test("collapseSubagentsByName: fn-593.3 collapse → predicate 6 stops blocking"
   // This is the autopilot-unsticking effect of the client-side collapse.
   const task = makeTask({
     worker_phase: "open",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -535,7 +532,6 @@ test("two running invocations on one job_id both reach computeReadiness and bloc
   // (own-progress-sub) must fire.
   const task = makeTask({
     worker_phase: "open",
-    approval: "approved",
     jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "stopped" })],
   });
   const epic = makeEpic({ tasks: [task] });
@@ -1518,10 +1514,6 @@ const JOB_PENDING: Verdict = {
   tag: "blocked",
   reason: { kind: "job-pending" },
 };
-const JOB_REJECTED: Verdict = {
-  tag: "blocked",
-  reason: { kind: "job-rejected" },
-};
 const GIT_UNCOMMITTED: Verdict = {
   tag: "blocked",
   reason: { kind: "git-uncommitted" },
@@ -1535,34 +1527,31 @@ const EPIC_NOT_VALIDATED: Verdict = {
   reason: { kind: "epic-not-validated" },
 };
 
-// fn-713 follow-on: renderTaskPills now ALWAYS appends all three pills
-// (runtime_status, worker_phase, approval) at their current value — defaults
-// included, no verdict-aware suppression. The `_verdict` arg is retained for
-// arity but no longer consulted.
-test("renderTaskPills: all-resting task (todo/open/pending) now shows all three defaults", () => {
+// fn-713 follow-on: renderTaskPills appends runtime_status + worker_phase at
+// their current value — defaults included, no verdict-aware suppression. The
+// `_verdict` arg is retained for arity but no longer consulted. (fn-756 dropped
+// the third [approval] pill with the rest of the approval surface.)
+test("renderTaskPills: all-resting task (todo/open) now shows both defaults", () => {
   expect(
-    renderTaskPills(
-      { runtime_status: "todo", worker_phase: "open", approval: "pending" },
-      READY,
-    ),
-  ).toBe(` ${pill("todo")} ${pill("open")} ${pill("pending")}`);
+    renderTaskPills({ runtime_status: "todo", worker_phase: "open" }, READY),
+  ).toBe(` ${pill("todo")} ${pill("open")}`);
 });
 
 test("renderTaskPills: runtime_status renders todo/in_progress/done verbatim", () => {
   expect(renderTaskPills({ runtime_status: "in_progress" }, READY)).toBe(
-    ` ${pill("in_progress")} ${pill("open")} ${pill("pending")}`,
+    ` ${pill("in_progress")} ${pill("open")}`,
   );
   expect(renderTaskPills({ runtime_status: "done" }, READY)).toBe(
-    ` ${pill("done")} ${pill("open")} ${pill("pending")}`,
+    ` ${pill("done")} ${pill("open")}`,
   );
   expect(renderTaskPills({ runtime_status: "todo" }, READY)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
+    ` ${pill("todo")} ${pill("open")}`,
   );
 });
 
 test("renderTaskPills: runtime_status=blocked relabels to [rt:blocked]", () => {
   expect(renderTaskPills({ runtime_status: "blocked" }, READY)).toBe(
-    ` ${pill("rt:blocked")} ${pill("open")} ${pill("pending")}`,
+    ` ${pill("rt:blocked")} ${pill("open")}`,
   );
   // never the bare [blocked] that would collide with the verdict family.
   expect(renderTaskPills({ runtime_status: "blocked" }, READY)).not.toContain(
@@ -1572,10 +1561,10 @@ test("renderTaskPills: runtime_status=blocked relabels to [rt:blocked]", () => {
 
 test("renderTaskPills: worker_phase=open renders [open] (default now shown)", () => {
   expect(renderTaskPills({ worker_phase: "open" }, READY)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
+    ` ${pill("todo")} ${pill("open")}`,
   );
   expect(renderTaskPills({ worker_phase: "open" }, JOB_RUNNING)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
+    ` ${pill("todo")} ${pill("open")}`,
   );
 });
 
@@ -1589,7 +1578,7 @@ test("renderTaskPills: worker_phase=done renders [worker-done] in the previously
     READY,
   ]) {
     expect(renderTaskPills({ worker_phase: "done" }, v)).toBe(
-      ` ${pill("todo")} ${pill("worker-done")} ${pill("pending")}`,
+      ` ${pill("todo")} ${pill("worker-done")}`,
     );
   }
 });
@@ -1599,7 +1588,7 @@ test("renderTaskPills: worker_phase=done renders [worker-done] in the previously
 test("renderTaskPills: worker_phase=done now SHOWS [worker-done] even where the verdict formerly pinned it", () => {
   for (const v of [COMPLETED, JOB_PENDING, GIT_UNCOMMITTED, GIT_ORPHANS]) {
     expect(renderTaskPills({ worker_phase: "done" }, v)).toBe(
-      ` ${pill("todo")} ${pill("worker-done")} ${pill("pending")}`,
+      ` ${pill("todo")} ${pill("worker-done")}`,
     );
   }
 });
@@ -1613,90 +1602,46 @@ test("renderTaskPills: never renders a bare [done] for worker_phase (de-ambiguat
   expect(out).not.toContain(pill("done"));
 });
 
-test("renderTaskPills: approval renders pending/approved/rejected verbatim (no T3 suppression)", () => {
-  // pending → the default pill now shows.
-  expect(renderTaskPills({ approval: "pending" }, READY)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("pending")}`,
-  );
-  // approved under a non-completed verdict → shown.
-  expect(renderTaskPills({ approval: "approved" }, READY)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("approved")}`,
-  );
-  // approved under completed → still shown (T3 suppression is gone).
-  expect(renderTaskPills({ approval: "approved" }, COMPLETED)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("approved")}`,
-  );
-  // rejected under a non-rejected verdict → shown.
-  expect(renderTaskPills({ approval: "rejected" }, EPIC_NOT_VALIDATED)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("rejected")}`,
-  );
-  // rejected under blocked:job-rejected → still shown (T3 suppression is gone).
-  expect(renderTaskPills({ approval: "rejected" }, JOB_REJECTED)).toBe(
-    ` ${pill("todo")} ${pill("open")} ${pill("rejected")}`,
-  );
-});
-
-test("renderTaskPills: completed task shows all three (runtime done + worker-done + approved)", () => {
-  // [done][worker-done][approved] — all three render their literal value now.
+test("renderTaskPills: completed task shows both (runtime done + worker-done)", () => {
+  // [done][worker-done] — both render their literal value now.
   expect(
     renderTaskPills(
-      { runtime_status: "done", worker_phase: "done", approval: "approved" },
+      { runtime_status: "done", worker_phase: "done" },
       COMPLETED,
     ),
-  ).toBe(` ${pill("done")} ${pill("worker-done")} ${pill("approved")}`);
+  ).toBe(` ${pill("done")} ${pill("worker-done")}`);
 });
 
-test("renderTaskPills: stacks fields in fixed order rt → worker → approval", () => {
-  // in_progress runtime + worker done + approved.
+test("renderTaskPills: stacks fields in fixed order rt → worker", () => {
+  // in_progress runtime + worker done.
   expect(
     renderTaskPills(
       {
         runtime_status: "in_progress",
         worker_phase: "done",
-        approval: "approved",
       },
       JOB_RUNNING,
     ),
-  ).toBe(` ${pill("in_progress")} ${pill("worker-done")} ${pill("approved")}`);
+  ).toBe(` ${pill("in_progress")} ${pill("worker-done")}`);
 });
 
 // ---------------------------------------------------------------------------
-// fn-708: renderClosePills — close-row status (T2) + approval (T1+T3)
+// fn-708: renderClosePills — close-row status (T2). (fn-756 dropped the
+// [approval] pill with the rest of the approval surface.)
 // ---------------------------------------------------------------------------
 
-// fn-713 follow-on: renderClosePills now ALWAYS appends status (default open)
-// then approval (default pending) at their current value — reversing the
-// fn-708 T2 status-drop and T1/T3 suppressions.
-test("renderClosePills: now shows the [status] pill (default open) + approval", () => {
-  expect(renderClosePills({ status: "open", approval: "pending" }, READY)).toBe(
-    ` ${pill("open")} ${pill("pending")}`,
+// fn-713 follow-on: renderClosePills appends status (default open) at its
+// current value — reversing the fn-708 T2 status-drop.
+test("renderClosePills: now shows the [status] pill (default open)", () => {
+  expect(renderClosePills({ status: "open" }, READY)).toBe(` ${pill("open")}`);
+  expect(renderClosePills({ status: "open" }, COMPLETED)).toContain(
+    pill("open"),
   );
-  expect(
-    renderClosePills({ status: "open", approval: "pending" }, COMPLETED),
-  ).toContain(pill("open"));
 });
 
 test("renderClosePills: renders a non-open status value verbatim", () => {
-  expect(
-    renderClosePills({ status: "closed", approval: "pending" }, READY),
-  ).toBe(` ${pill("closed")} ${pill("pending")}`);
-});
-
-test("renderClosePills: approval renders pending/approved/rejected verbatim (no T3 suppression)", () => {
-  expect(renderClosePills({ approval: "pending" }, READY)).toBe(
-    ` ${pill("open")} ${pill("pending")}`,
-  );
-  // approved now renders (the filter no longer hides it from the helper).
-  expect(renderClosePills({ approval: "approved" }, READY)).toBe(
-    ` ${pill("open")} ${pill("approved")}`,
-  );
-  // rejected under a non-rejected verdict → shown.
-  expect(renderClosePills({ approval: "rejected" }, READY)).toBe(
-    ` ${pill("open")} ${pill("rejected")}`,
-  );
-  // rejected under blocked:job-rejected → still shown (T3 suppression is gone).
-  expect(renderClosePills({ approval: "rejected" }, JOB_REJECTED)).toBe(
-    ` ${pill("open")} ${pill("rejected")}`,
+  expect(renderClosePills({ status: "closed" }, READY)).toBe(
+    ` ${pill("closed")}`,
   );
 });
 

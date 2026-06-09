@@ -24,7 +24,6 @@ function makeEpic(overrides: Partial<Epic>): Epic {
     title: "epic",
     project_dir: "/Users/mike/code/keeper",
     status: "open",
-    approval: "pending",
     last_event_id: 0,
     updated_at: 0,
     depends_on_epics: [],

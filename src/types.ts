@@ -1045,17 +1045,6 @@ export interface Epic {
   title: string | null;
   project_dir: string | null;
   status: string | null;
-  /**
-   * Planctl-native approval state. Top-level field on `.planctl/epics/<id>.json`
-   * valued `"approved" | "rejected" | "pending"` (schema v13 — see the
-   * fn-592-approval-as-planctl-field epic). A missing / invalid value coerces
-   * to `"pending"` so a file written by old planctl rides through without
-   * breaking re-fold determinism (defensive "safe value" fold per CLAUDE.md).
-   * Drives the epics UI's default-filter scope; `EPICS_DESCRIPTOR` composes
-   * `{ status: "open", approval: { ne: "approved" } }` so approved epics
-   * drop out of the default page.
-   */
-  approval: "approved" | "rejected" | "pending";
   last_event_id: number | null;
   updated_at: number;
   /**
@@ -1081,9 +1070,8 @@ export interface Epic {
    * Sorted ASC on the `(kind, job_id)` tuple — total-order tiebreaker.
    *
    * Survives an `EpicSnapshot` round-trip (the ON CONFLICT clause explicitly
-   * preserves the column alongside `jobs` / `tasks`) — without this, an
-   * approval RPC → file write → file-watcher → snapshot fold would wipe the
-   * provenance projection.
+   * preserves the column alongside `jobs` / `tasks`) — without this, any
+   * file-watcher → snapshot re-fold would wipe the provenance projection.
    */
   job_links: JobLinkEntry[];
   /**
@@ -1106,9 +1094,8 @@ export interface Epic {
    *
    * Survives an `EpicSnapshot` round-trip — the `projectPlanRow` ON CONFLICT
    * carve-out omits this column alongside `tasks` / `jobs` / `job_links`
-   * (and now {@link sort_path}). Without the carve-out, an approval RPC →
-   * atomic file write → file-watcher → snapshot fold would wipe the link
-   * projection on every approval flip.
+   * (and now {@link sort_path}). Without the carve-out, any file-watcher →
+   * snapshot re-fold would wipe the link projection.
    */
   created_by_closer_of: string | null;
   /**
@@ -1163,8 +1150,8 @@ export interface Epic {
    * Survives an `EpicSnapshot` round-trip — `projectPlanRow` ON CONFLICT
    * carve-out preserves this column alongside `tasks` / `jobs` /
    * `job_links` / `created_by_closer_of` / `sort_path`. Without the carve-out,
-   * an approval RPC → atomic file write → file-watcher → snapshot fold would
-   * wipe the envelope-derived flag back to `0` on every approval flip.
+   * any file-watcher → snapshot re-fold would wipe the envelope-derived flag
+   * back to `0`.
    */
   queue_jump: number;
   /**
@@ -1315,13 +1302,6 @@ export interface Task {
    * string rather than `string | null`.
    */
   runtime_status: string;
-  /**
-   * Planctl-native approval state — top-level field on
-   * `.planctl/tasks/<id>.<n>.json` (schema v13). Same enum + missing/invalid
-   * coercion-to-`"pending"` semantics as {@link Epic.approval}. Lives inside the
-   * parent epic's embedded `tasks` array element (no schema column of its own).
-   */
-  approval: "approved" | "rejected" | "pending";
   /**
    * Task-level dependencies: the planctl `depends_on` task ids (other tasks this
    * one depends on). Lives inside the parent epic's embedded `tasks` JSON array

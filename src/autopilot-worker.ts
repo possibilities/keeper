@@ -1725,21 +1725,10 @@ export interface DispatchExpiredMessage {
   payload: DispatchExpiredPayload;
 }
 
-/**
- * Worker → main: ONE-SHOT rejected-epic auto-clear request (fn-742.2).
- *
- * fn-756: the WORKER NO LONGER SENDS this — the rejected-epic auto-clear was
- * deleted along with the approval window (no close row is ever `job-rejected`).
- * The wire shape is RETAINED only because `daemon.ts` still imports it for its
- * (now-unreached) RPC handler; that handler is removed in the schema-drop task
- * `.2`. Historically: the worker described the intent and main performed it by
- * calling the sanctioned `set_epic_approval` handler to reset `epic_id`'s
- * approval to `"pending"`.
- */
-export interface ClearRejectedApprovalMessage {
-  kind: "clear-rejected-approval";
-  epic_id: string;
-}
+// fn-756: the `ClearRejectedApprovalMessage` worker→main wire shape (fn-742.2's
+// one-shot rejected-epic auto-clear) is gone — the rejected-epic auto-clear was
+// deleted along with the approval window in `.1`, and the now-unreached daemon
+// RPC handler that consumed it is removed in this task (`.2`).
 
 type IncomingMessage =
   | SetPausedMessage

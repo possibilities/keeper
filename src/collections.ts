@@ -51,8 +51,9 @@ export type { Row };
  * - `defaultClause` — an optional RAW SQL fallback scope, applied when the wire
  *   filter is entirely empty (and the lookup is not a pk lookup, which is
  *   exempt from defaults). Used for predicates that can't be expressed as
- *   per-key ANDs — e.g. epics default to `(status = 'open' OR approval !=
- *   'approved')`. The `sql` string is interpolated verbatim into the WHERE so
+ *   per-key ANDs — e.g. epics default to materialized-open via the
+ *   `default_visible = 1` generated-column clause. The `sql` string is
+ *   interpolated verbatim into the WHERE so
  *   columns / operators are the descriptor author's responsibility; `params`
  *   are bound. ANY explicit wire filter drops the whole clause (the wire is
  *   the user's "I know what I want" override). Distinct from `defaultFilter`
@@ -190,7 +191,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
  * `last_event_id` (the monotonic per-row column the diff fires on, bumped by
  * the snapshot fold). `filters` carries the pk (`epic_id` — detail-page
  * single-item subscribe) plus the natural filter columns `status` +
- * `project_dir` + `approval`. `title`/`epic_number` are read-only display —
+ * `project_dir`. `title`/`epic_number` are read-only display —
  * served but out of `sortable`/`filters`. `project_dir` holds opaque foreign-
  * process JSON; it's a bound filter VALUE here, never an interpolated
  * identifier or a filesystem-read driver.
@@ -232,7 +233,6 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     "title",
     "project_dir",
     "status",
-    "approval",
     "last_event_id",
     "updated_at",
     "tasks",
@@ -278,13 +278,14 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // `filters` (clients branch on element shape, not column value).
     "resolved_epic_deps",
     // Schema v32: `default_visible` — VIRTUAL generated column SQLite
-    // computes from `(status, approval)` on every read, materializing
-    // the cross-column predicate as a single-column 0/1 value. As of
-    // fn-712 (schema v56) the expression carries a `status IS NOT NULL`
-    // "epic is materialized" guard: `status IS NOT NULL AND (status='open'
-    // OR approval!='approved')`, so a freshly-scaffolded NULL-status shell
-    // row (no EpicSnapshot folded yet) is hidden from the default page
-    // until it materializes. Served on the wire as
+    // computes from `status` on every read, materializing the
+    // predicate as a single-column 0/1 value. As of fn-712 (schema v56)
+    // the expression carries a `status IS NOT NULL` "epic is materialized"
+    // guard; fn-756 (schema v63) dropped the old `approval` branch, so the
+    // expression is now `status IS NOT NULL AND status='open'` — a
+    // freshly-scaffolded NULL-status shell row (no EpicSnapshot folded
+    // yet) is hidden from the default page until it materializes, and a
+    // done epic falls off the page. Served on the wire as
     // display-only — clients can SEE it (a debug aid for "would this
     // epic render on the default page?") but MUST NOT filter/sort by
     // it. Out of `sortable` / `filters` / `jsonColumns`: the column is
@@ -313,30 +314,22 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     epic_id: "epic_id",
     status: "status",
     project_dir: "project_dir",
-    // `approval` (schema v13 — the fn-592-approval-as-planctl-field epic) is
-    // the epics-UI's default-hide-approved key. The natural-filter slot
-    // matches the same `<wire key> → <SQL column>` shape as `status`; the
-    // descriptor's filter machinery ANDs every key together (see
-    // `resolveFilter` in `src/server-worker.ts`), so the two-key default scope
-    // below composes for free — no new composition machinery required.
-    approval: "approval",
   },
   // Default scope: an epics query with no wire filter shows every
-  // MATERIALIZED epic that is OPEN OR NOT-YET-APPROVED — the union, not the
-  // intersection. Open work (live) and unreviewed work (needs a human) are
-  // both interesting; done-AND-approved epics fall off the page by default,
-  // and (fn-712) so do not-yet-materialized NULL-status shell rows. ANY
-  // explicit wire filter — `--status done`, `--show-approved`, a pk
-  // subscribe — drops this clause entirely (the wire is the user's "I know
-  // what I want" override).
+  // MATERIALIZED epic that is OPEN. Open work (live) is what's interesting;
+  // done epics fall off the page by default, and (fn-712) so do
+  // not-yet-materialized NULL-status shell rows. ANY explicit wire filter —
+  // `--status done`, a pk subscribe — drops this clause entirely (the wire
+  // is the user's "I know what I want" override).
   //
-  // Schema v32 (fn-634): the cross-column OR is materialized as a single
-  // VIRTUAL generated column `default_visible` computed by SQLite from
-  // `(status, approval)` on every read (fn-712 added the `status IS NOT
-  // NULL` materialized guard to the expression), and a partial index
-  // `idx_epics_default_visible WHERE default_visible = 1` makes the SEARCH
-  // covering — no SCAN, no temp B-tree for the `sort_path ASC, epic_id ASC`
-  // ORDER BY. The clause is the literal `default_visible = 1` (NOT a
+  // Schema v32 (fn-634): the predicate is materialized as a single VIRTUAL
+  // generated column `default_visible` computed by SQLite from `status` on
+  // every read (fn-712 added the `status IS NOT NULL` materialized guard to
+  // the expression; fn-756 dropped the old `approval` branch), and a partial
+  // index `idx_epics_default_visible WHERE default_visible = 1` makes the
+  // SEARCH covering — no SCAN, no temp B-tree for the `sort_path ASC,
+  // epic_id ASC` ORDER BY. The clause is the literal `default_visible = 1`
+  // (NOT a
   // parameterized `default_visible = ?` with `params=[1]`): SQLite's
   // partial-index matcher requires the query's WHERE term to syntactically
   // imply the partial index's WHERE clause, and literal-1 matches literal-1

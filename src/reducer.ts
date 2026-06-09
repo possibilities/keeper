@@ -641,12 +641,6 @@ interface PlanSnapshot {
    * deterministically.
    */
   runtime_status?: string | null;
-  /**
-   * Planctl-native approval enum (schema v13). Pre-coerced by the plan-worker
-   * to `"approved" | "rejected" | "pending"`; absent / NULL → folds to
-   * `"pending"` so an old-shape blob still rides through deterministically.
-   */
-  approval?: "approved" | "rejected" | "pending" | null;
   /** Epic-level deps (EpicSnapshot blob) — the planctl `depends_on_epics` ids. */
   depends_on_epics?: string[] | null;
   /** Task-level deps (TaskSnapshot blob) — the planctl `depends_on` task ids. */
@@ -823,21 +817,19 @@ function projectPlanRow(db: Database, event: Event): void {
     // this INSERT/UPDATE by `syncEpicDepsForward` against the post-write
     // row; INSERT defaults it to NULL (the schema column default) and the
     // ON CONFLICT carve-out preserves the just-computed projection
-    // across the next snapshot fold. Without the carve-out, an
-    // approval RPC → atomic file write → file-watcher → EpicSnapshot fold
-    // would wipe the creator/refiner provenance projection (schema v14)
-    // AND the closer-creator link + materialized-path sort key (schema
-    // v29) AND the priority-jump flag (schema v30) AND the resolved-
-    // deps projection (schema v34) on every approval flip.
+    // across the next snapshot fold. Without the carve-out, any
+    // file-watcher → EpicSnapshot re-fold would wipe the creator/refiner
+    // provenance projection (schema v14) AND the closer-creator link +
+    // materialized-path sort key (schema v29) AND the priority-jump flag
+    // (schema v30) AND the resolved-deps projection (schema v34).
     db.run(
-      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, approval, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path, queue_jump)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0)
+      `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path, queue_jump)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0)
        ON CONFLICT(epic_id) DO UPDATE SET
          epic_number = excluded.epic_number,
          title = excluded.title,
          project_dir = excluded.project_dir,
          status = excluded.status,
-         approval = excluded.approval,
          depends_on_epics = excluded.depends_on_epics,
          last_validated_at = excluded.last_validated_at,
          last_event_id = excluded.last_event_id,
@@ -848,13 +840,6 @@ function projectPlanRow(db: Database, event: Event): void {
         snapshot.title ?? null,
         snapshot.project_dir ?? null,
         snapshot.status ?? null,
-        // The plan-worker pre-coerced this to the enum (or `"pending"`); a
-        // missing / NULL value in the blob — a synthetic event from an
-        // older keeperd build — folds to `"pending"` so the schema's NOT NULL
-        // default is honored AND re-fold determinism is preserved across the
-        // v12→v13 boundary (an event produced before approval existed in the
-        // pipeline reproduces a `"pending"` row, same as on the older daemon).
-        snapshot.approval ?? "pending",
         // Stored as a JSON-TEXT array column; decoded back to an array at the
         // read boundary. A missing list folds to the empty array (schema default).
         JSON.stringify(snapshot.depends_on_epics ?? []),
@@ -1005,7 +990,6 @@ function projectPlanRow(db: Database, event: Event): void {
       tier: string | null;
       worker_phase: string | null;
       runtime_status: string;
-      approval: "approved" | "rejected" | "pending";
       depends_on: string[];
       jobs: unknown[];
     } = {
@@ -1036,13 +1020,6 @@ function projectPlanRow(db: Database, event: Event): void {
       // convention (a fresh clone with no `state/` tree reads every task as
       // `todo`).
       runtime_status: snapshot.runtime_status ?? "todo",
-      // Pre-coerced by the plan-worker; a missing / NULL value in a legacy
-      // synthetic event folds to "pending" so re-fold determinism survives the
-      // v12→v13 boundary (same default as the schema column on the parent
-      // epic). The field is placed BEFORE `depends_on` to match the seed
-      // reconstruction order in `plan-worker.ts:seedFromDb` so an unchanged
-      // task on restart suppresses cleanly.
-      approval: snapshot.approval ?? "pending",
       depends_on: snapshot.depends_on ?? [],
       jobs: [],
     };
@@ -6346,7 +6323,7 @@ function cascadeSortPath(
  * Schema v34 (fn-637): row shape lifted from `epics` for the fold-time
  * resolver's all-epics index. Carries the minimal subset
  * `resolveEpicDep` reads off an {@link Epic}: `epic_id`, `epic_number`,
- * `project_dir`, `status`, `approval`. Everything else (`tasks`,
+ * `project_dir`, `status`. Everything else (`tasks`,
  * `jobs`, `job_links`, `depends_on_epics`, etc.) is irrelevant to
  * resolution and excluded from the SELECT to keep the in-fold scan
  * narrow.
@@ -6356,7 +6333,6 @@ interface EpicLite {
   epic_number: number | null;
   project_dir: string | null;
   status: string | null;
-  approval: "approved" | "rejected" | "pending";
 }
 
 /**
@@ -6368,7 +6344,7 @@ interface EpicLite {
  * the same shape as a real {@link Epic} (defense-in-depth — the
  * resolver only reads the five fields above, but the helper builds the
  * full surface so future widening of the resolver doesn't silently miss
- * fields).
+ * fields). The resolver only reads the four fields lifted from `EpicLite`.
  */
 function epicLiteToEpic(row: EpicLite): Epic {
   return {
@@ -6377,7 +6353,6 @@ function epicLiteToEpic(row: EpicLite): Epic {
     title: null,
     project_dir: row.project_dir,
     status: row.status,
-    approval: row.approval,
     last_event_id: null,
     updated_at: 0,
     depends_on_epics: [],
@@ -6400,7 +6375,7 @@ function epicLiteToEpic(row: EpicLite): Epic {
  * work.
  *
  * Read-in-fold is allowed (the autocommit ban in CLAUDE.md is on DB
- * watchers, not query reads). The SELECT is narrow — five columns —
+ * watchers, not query reads). The SELECT is narrow — four columns —
  * and the table sits at ~1k rows in the steady state, so the scan is
  * cheap. Per-call cost dominates the fold; if it becomes hot a future
  * optimization could cache the index inside `applyEvent` and reuse it
@@ -6418,7 +6393,7 @@ function buildEpicIndex(db: Database): {
 } {
   const rows = db
     .query(
-      `SELECT epic_id, epic_number, project_dir, status, approval
+      `SELECT epic_id, epic_number, project_dir, status
          FROM epics`,
     )
     .all() as EpicLite[];
@@ -6463,10 +6438,10 @@ function buildEpicIndex(db: Database): {
  * **Tri-state mapping** (locked):
  * - `dangling` — resolver returned `{kind: "dangling"}`.
  * - `satisfied` — resolver returned `{kind: "found"}` AND
- *   `epicIsCompleted(upstream)` (status='done' AND approval='approved'
- *   — the same terminal predicate `evaluateCloseRow` reads).
+ *   `epicIsCompleted(upstream)` (status='done' — the same terminal
+ *   predicate `evaluateCloseRow` reads).
  * - `blocked-incomplete` — resolver returned `{kind: "found"}` but the
- *   upstream is not completed (any other `status`/`approval` combo).
+ *   upstream is not completed (any other `status`).
  *
  * **Locked key order.** The minimal-subset shape emits keys in the
  * exact order `{dep_token, resolved_epic_id, epic_number,
@@ -6636,7 +6611,7 @@ function syncEpicDepsForward(
   // INSERT/UPDATE has already landed in this transaction.
   const consumerRow = db
     .query(
-      `SELECT epic_id, epic_number, project_dir, status, approval,
+      `SELECT epic_id, epic_number, project_dir, status,
               depends_on_epics
          FROM epics
         WHERE epic_id = ?`,
@@ -6796,7 +6771,7 @@ function syncEpicDepsReverse(
   for (const { consumer_id: consumerId } of consumerRows) {
     const consumerRow = db
       .query(
-        `SELECT epic_id, epic_number, project_dir, status, approval,
+        `SELECT epic_id, epic_number, project_dir, status,
                 depends_on_epics
            FROM epics
           WHERE epic_id = ?`,

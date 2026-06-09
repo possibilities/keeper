@@ -3,46 +3,27 @@
  * The registry is process-global; importing this module from
  * `src/server-worker.ts` is what installs the handlers into the worker thread.
  * No side effect runs at main-thread import time other than the
- * `registerRpc(...)` calls at the bottom of the file — which is the design:
+ * `registerAsyncRpc(...)` calls at the bottom of the file — which is the
+ * design:
  * the worker module imports this, so registration happens once per worker
  * spawn, and tests that import the worker module piecemeal opt out by not
  * importing this file.
  *
- * Currently registers THREE handlers:
+ * Registers the dead-letter replay + the autopilot-control async handlers:
  *
- * - `set_task_approval { epic_id, task_id, status }` — write the `approval`
- *   field into the gitignored runtime sidecar
- *   `<root>/.planctl/state/tasks/<task_id>.state.json` (create-if-absent, RMW
- *   preserving the sidecar's status/claim fields). (fn-732 — approval moved
- *   out of the committed def into the runtime sidecar so keeper folds it
- *   gate-free. Was schema v13 def-rewrite — fn-592-approval-as-planctl-field.)
- * - `set_epic_approval { epic_id, status }` — write the `approval` field into
- *   `<root>/.planctl/state/epics/<epic_id>.state.json` (create-if-absent).
- *   (Same fn-732 retarget.)
  * - `replay_dead_letter` (no params) — ASYNC RPC. Asks main to recover ONE
  *   oldest `waiting` dead-letter row by appending the stored bindings back
  *   into the `events` log and flipping the row to `recovered`, all in one
  *   `BEGIN IMMEDIATE` transaction. (Schema v37 — see fn-643 task .4.) The
  *   actual work runs on main (the sole writer of the events log); this
  *   handler routes through the worker→main bridge.
+ * - `set_autopilot_paused` / `set_autopilot_mode` / `set_epic_armed` /
+ *   `retry_dispatch` — the autopilot control plane (each round-trips through a
+ *   synthetic event via the worker→main bridge).
  *
- * The two approval handlers write the canonical planctl JSON form (see
- * `serializePlanctlJson` in `src/db.ts`) atomically (temp file in same dir,
- * `<final>.tmp.<pid>.<crypto.randomUUID()>` suffix, `renameSync`). The
- * round-trip back into the projection happens via the existing
- * `@parcel/watcher` → plan-worker → reducer pipeline; the RPC return does
- * NOT claim the projection is updated (eventual consistency on the order
- * of one `data_version` poll, ~50ms).
- *
- * Per-file serialization: the dispatcher invokes handlers synchronously on
- * a single thread, and the handler's I/O (`readFileSync` / `writeFileSync` /
- * `renameSync`) is itself synchronous. So two concurrent same-file writes
- * arriving on different connections process strictly in arrival order — the
- * single-flight property holds by virtue of JS being single-threaded on
- * synchronous code, with no explicit lock needed. A future async-handler
- * refactor would need to revisit this with an explicit per-file
- * `Map<path, Promise<void>>` chain (the pattern the planning spec called
- * out), but today's contract is sync-throughout.
+ * (fn-756 removed the `set_task_approval` / `set_epic_approval` handlers along
+ * with the rest of the approval surface — keeper completes work on
+ * worker/closer-done alone.)
  *
  * Contract a handler MUST honor:
  * - Validate `params` shape and throw `BadParamsError` on mismatch (the
@@ -62,320 +43,11 @@
  * any future SQL-mutating RPC.
  */
 
-import type { Database } from "bun:sqlite";
-import { existsSync, mkdirSync, readdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
-import { atomicWriteFile, resolvePlanRoots, serializePlanctlJson } from "./db";
 import {
   BadParamsError,
   type ReplayBridge,
   registerAsyncRpc,
-  registerRpc,
 } from "./server-worker";
-
-/**
- * The planctl-native approval enum. Wire-validated by each handler (a wire
- * value off this enum throws `BadParamsError`). MUST match the planctl
- * serializer (task `.1` evidence) and the plan-worker's `Approval` type.
- */
-export type ApprovalStatus = "approved" | "rejected" | "pending";
-
-const APPROVAL_STATUSES = new Set<ApprovalStatus>([
-  "approved",
-  "rejected",
-  "pending",
-]);
-
-/** `set_task_approval` wire params. */
-export interface SetTaskApprovalParams {
-  epic_id: string;
-  task_id: string;
-  status: ApprovalStatus;
-}
-
-/** `set_epic_approval` wire params. */
-export interface SetEpicApprovalParams {
-  epic_id: string;
-  status: ApprovalStatus;
-}
-
-/** Successful return shape for `set_task_approval`. */
-export interface SetTaskApprovalResult {
-  ok: true;
-  epic_id: string;
-  task_id: string;
-  approval: ApprovalStatus;
-}
-
-/** Successful return shape for `set_epic_approval`. */
-export interface SetEpicApprovalResult {
-  ok: true;
-  epic_id: string;
-  approval: ApprovalStatus;
-}
-
-// ---------------------------------------------------------------------------
-// Wire-boundary validation
-// ---------------------------------------------------------------------------
-
-/**
- * Reject any id token that could escape its target dir (`<root>/.planctl/{epics,tasks}/`)
- * via path-traversal. We disallow path separators (`/`, `\`), embedded null
- * bytes, and any leading-dot value (`.`, `..`, `..foo`, `.hidden`). An
- * id-shaped token (`fn-1-foo`, `fn-1-foo.3`) sails through; a weaponizable
- * token throws `BadParamsError`.
- *
- * NOTE: planctl ids are NOT validated for shape (the slug parser lives in
- * planctl); we only enforce the safety-critical "is this a safe filename
- * component" predicate. Wire validation, not semantic validation.
- */
-function rejectPathTraversal(field: string, value: string): void {
-  if (
-    value.length === 0 ||
-    value.includes("/") ||
-    value.includes("\\") ||
-    value.includes("\0") ||
-    value.startsWith(".")
-  ) {
-    throw new BadParamsError(
-      `set_*_approval: invalid \`${field}\`: rejected path-traversal or empty token`,
-    );
-  }
-}
-
-function validateApprovalStatus(value: unknown): ApprovalStatus {
-  if (
-    typeof value !== "string" ||
-    !APPROVAL_STATUSES.has(value as ApprovalStatus)
-  ) {
-    throw new BadParamsError(
-      "set_*_approval: `status` must be one of approved|rejected|pending",
-    );
-  }
-  return value as ApprovalStatus;
-}
-
-function validateSetTaskApprovalParams(params: unknown): SetTaskApprovalParams {
-  if (params === null || typeof params !== "object") {
-    throw new BadParamsError("set_task_approval: params must be an object");
-  }
-  const obj = params as Record<string, unknown>;
-  if (typeof obj.epic_id !== "string" || obj.epic_id.length === 0) {
-    throw new BadParamsError(
-      "set_task_approval: `epic_id` must be a non-empty string",
-    );
-  }
-  if (typeof obj.task_id !== "string" || obj.task_id.length === 0) {
-    throw new BadParamsError(
-      "set_task_approval: `task_id` must be a non-empty string",
-    );
-  }
-  rejectPathTraversal("epic_id", obj.epic_id);
-  rejectPathTraversal("task_id", obj.task_id);
-  const status = validateApprovalStatus(obj.status);
-  return { epic_id: obj.epic_id, task_id: obj.task_id, status };
-}
-
-function validateSetEpicApprovalParams(params: unknown): SetEpicApprovalParams {
-  if (params === null || typeof params !== "object") {
-    throw new BadParamsError("set_epic_approval: params must be an object");
-  }
-  const obj = params as Record<string, unknown>;
-  if (typeof obj.epic_id !== "string" || obj.epic_id.length === 0) {
-    throw new BadParamsError(
-      "set_epic_approval: `epic_id` must be a non-empty string",
-    );
-  }
-  rejectPathTraversal("epic_id", obj.epic_id);
-  const status = validateApprovalStatus(obj.status);
-  return { epic_id: obj.epic_id, status };
-}
-
-// ---------------------------------------------------------------------------
-// Plan-file mutation
-// ---------------------------------------------------------------------------
-
-/**
- * Resolve the absolute path to a planctl JSON file by id. Walks the
- * configured plan roots looking for the first existing file. Returns null if
- * none of the configured roots has a matching file (the caller surfaces this
- * as a typed error frame rather than a crash).
- *
- * The lookup is shallow — we try `<root>/.planctl/{epics,tasks}/<id>.json`
- * AND `<root>/<project>/.planctl/{epics,tasks}/<id>.json` (one level deep,
- * mirroring `runPlanctlApprovalMigration`'s lookup). A root with no
- * `.planctl` subdir is skipped.
- *
- * Exported for unit reach.
- */
-export function resolvePlanFile(
-  roots: string[],
-  collection: "epics" | "tasks",
-  id: string,
-): string | null {
-  const name = `${id}.json`;
-  for (const root of roots) {
-    // Try the root itself first.
-    const direct = join(root, ".planctl", collection, name);
-    if (existsSync(direct)) {
-      return direct;
-    }
-    // Otherwise walk one level deep — `<root>/<project>/.planctl/...`.
-    let entries: string[];
-    try {
-      entries = readdirSync(root);
-    } catch {
-      continue;
-    }
-    for (const child of entries) {
-      const candidate = join(root, child, ".planctl", collection, name);
-      if (existsSync(candidate)) {
-        return candidate;
-      }
-    }
-  }
-  return null;
-}
-
-/**
- * Map a committed plan-def file path
- * `<planctl>/{epics,tasks}/<id>.json` to its gitignored runtime sidecar
- * `<planctl>/state/{epics,tasks}/<id>.state.json` (fn-732). Pure path
- * arithmetic; mirrors the plan-worker's `taskDefPathFromStatePath` /
- * `epicDefPathFromStatePath` in reverse. Exported for unit reach.
- *
- * The def path is the RESOLVED path from {@link resolvePlanFile} — proven to
- * exist under a configured root's `.planctl/{epics,tasks}/` — so the derived
- * sidecar lands inside the SAME `.planctl`, and the leaf id is the same
- * already-traversal-guarded token. No new untrusted component enters the path.
- */
-export function sidecarPathFromDef(
-  defPath: string,
-  collection: "epics" | "tasks",
-): string {
-  // `<planctl>/<collection>/<id>.json` → defDir = `<planctl>/<collection>`,
-  // planctl = `<planctl>`. Insert `state/` and swap `.json` → `.state.json`.
-  const collectionDir = dirname(defPath); // `<planctl>/<collection>`
-  const planctlDir = dirname(collectionDir); // `<planctl>`
-  const base = defPath.slice(collectionDir.length + 1); // `<id>.json`
-  const id = base.endsWith(".json") ? base.slice(0, -".json".length) : base;
-  return join(planctlDir, "state", collection, `${id}.state.json`);
-}
-
-/**
- * Write the runtime `approval` into the gitignored sidecar (fn-732),
- * create-if-absent and read-modify-write so EVERY pre-existing field on the
- * sidecar (notably a task sidecar's `status` / claim fields written by planctl
- * `LocalFileStateStore`) is preserved. Mirrors planctl's own RMW discipline
- * (load → set one key → atomic write); `serializePlanctlJson` + the
- * same-dir-temp + `renameSync` keep the on-disk form canonical and the write
- * atomic. Creates the `state/{epics,tasks}/` dir tree on first write.
- *
- * The previous (schema v13) implementation rewrote the approval on the
- * COMMITTED def file; fn-732 moves approval to the runtime sidecar so keeper
- * folds it gate-free (no commit on the critical path). The plan-worker's
- * PERMANENT ladder (sidecar → committed def → pending) keeps approval
- * resolvable on a keeper that hasn't been restarted yet.
- *
- * Throws on read/parse/write failure — the dispatcher's `rpc_failed` path
- * frames the error. Exported for unit reach.
- */
-export function rewriteSidecarApproval(
-  sidecarPath: string,
-  status: ApprovalStatus,
-): void {
-  // RMW: start from the existing sidecar (preserving status / claim / evidence
-  // fields) when present; otherwise start from an empty object (create).
-  let obj: Record<string, unknown> = {};
-  if (existsSync(sidecarPath)) {
-    const raw = readFileSync(sidecarPath, "utf8");
-    const parsed = JSON.parse(raw);
-    if (
-      parsed === null ||
-      typeof parsed !== "object" ||
-      Array.isArray(parsed)
-    ) {
-      throw new Error(`${sidecarPath}: planctl sidecar is not a JSON object`);
-    }
-    obj = parsed as Record<string, unknown>;
-  }
-  obj.approval = status;
-  // `atomicWriteFile` does not mkdir; ensure the `state/{epics,tasks}/` tree
-  // exists before the same-dir temp+rename (create-if-absent on first write).
-  mkdirSync(dirname(sidecarPath), { recursive: true });
-  atomicWriteFile(sidecarPath, serializePlanctlJson(obj));
-}
-
-// ---------------------------------------------------------------------------
-// Handlers
-// ---------------------------------------------------------------------------
-
-/**
- * `set_task_approval` handler. Mutates the `approval` field on
- * `<root>/.planctl/tasks/<task_id>.json` to `status`. The filename keys on
- * the task id (not the epic id) per planctl's filename convention; `epic_id`
- * rides as wire context for the caller's UI and is validated but NOT used
- * to locate the file (planctl task ids encode the epic id as a prefix —
- * `<epic_id>.<n>`).
- *
- * Returns `{ ok: true, epic_id, task_id, approval }`. Eventual consistency:
- * the projection reflects the write on the next watcher → plan-worker round
- * trip (~50ms via `@parcel/watcher` + `PRAGMA data_version` poll).
- *
- * The `db` argument is unused (we write the file, not the DB); kept for
- * `RpcHandler` signature parity. The leading underscore swallows the
- * unused-arg lint.
- */
-export function setTaskApprovalHandler(
-  _db: Database,
-  params: unknown,
-): SetTaskApprovalResult {
-  const { epic_id, task_id, status } = validateSetTaskApprovalParams(params);
-  const roots = resolvePlanRoots();
-  // Resolve the committed def first — it proves the task exists and locates the
-  // owning `.planctl`; the sidecar (which may not exist yet) is derived from it
-  // so create-if-absent lands in the right tree (fn-732).
-  const defPath = resolvePlanFile(roots, "tasks", task_id);
-  if (defPath === null) {
-    throw new Error(
-      `set_task_approval: no planctl task file found for task_id '${task_id}' in any configured plan root`,
-    );
-  }
-  const sidecarPath = sidecarPathFromDef(defPath, "tasks");
-  // RMW preserves the sidecar's runtime fields (status / claim / evidence)
-  // written by planctl; we only set `approval`.
-  rewriteSidecarApproval(sidecarPath, status);
-  // fn-732: the sidecar fold is gate-free — keeper folds approval directly
-  // from the runtime sidecar with no commit on the critical path, so the
-  // fn-701 approval-kick (which papered over the committed-def fold lag) is
-  // gone. No kick fires here.
-  return { ok: true, epic_id, task_id, approval: status };
-}
-
-/**
- * `set_epic_approval` handler. Mutates the `approval` field on
- * `<root>/.planctl/epics/<epic_id>.json` to `status`. Returns
- * `{ ok: true, epic_id, approval }`. Same eventual-consistency contract as
- * `set_task_approval`.
- */
-export function setEpicApprovalHandler(
-  _db: Database,
-  params: unknown,
-): SetEpicApprovalResult {
-  const { epic_id, status } = validateSetEpicApprovalParams(params);
-  const roots = resolvePlanRoots();
-  const defPath = resolvePlanFile(roots, "epics", epic_id);
-  if (defPath === null) {
-    throw new Error(
-      `set_epic_approval: no planctl epic file found for epic_id '${epic_id}' in any configured plan root`,
-    );
-  }
-  const sidecarPath = sidecarPathFromDef(defPath, "epics");
-  rewriteSidecarApproval(sidecarPath, status);
-  // fn-732: gate-free sidecar fold — no approval-kick (see the matching note
-  // in `setTaskApprovalHandler`).
-  return { ok: true, epic_id, approval: status };
-}
 
 // ---------------------------------------------------------------------------
 // `replay_dead_letter` (async — routes through the worker→main bridge)
@@ -726,8 +398,7 @@ export function parseDispatchKey(value: unknown): {
  * empty token. The id never feeds a filesystem path inside the
  * reconciler, but rejecting weaponizable shapes at the wire boundary is
  * cheap defense against future code paths that might (e.g. a viewer
- * that ever serialized an id into a path). Mirrors the
- * {@link rejectPathTraversal} predicate the approval handlers apply.
+ * that ever serialized an id into a path).
  */
 function rejectDispatchIdToken(value: string): void {
   if (
@@ -802,8 +473,6 @@ export async function retryDispatchHandler(
  * import the handler and call it, NOT re-register it.
  */
 export function installRpcHandlers(): void {
-  registerRpc("set_task_approval", setTaskApprovalHandler);
-  registerRpc("set_epic_approval", setEpicApprovalHandler);
   registerAsyncRpc("replay_dead_letter", replayDeadLetterHandler);
   registerAsyncRpc("set_autopilot_paused", setAutopilotPausedHandler);
   registerAsyncRpc("set_autopilot_mode", setAutopilotModeHandler);
