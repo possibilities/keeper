@@ -33,5 +33,5 @@ confirm green. Purely a dead-surface removal — no behavior change (no
 - [ ] `bun test` green.
 
 ## Done summary
-
+Collapsed RetryDispatchVerb / RETRY_DISPATCH_VERBS and the three server-worker.ts retry-dispatch verb unions to work|close, fixed the Verb-union mirror comment, and updated the parseDispatchKey test so approve is now a rejected unknown verb. Pure dead-surface removal, no behavior change.
 ## Evidence
