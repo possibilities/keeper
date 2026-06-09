@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Remove approve and ack pipelines from planctl",
-  "updated_at": "2026-06-09T15:08:47.643749Z"
+  "updated_at": "2026-06-09T18:28:58.113192Z",
+  "worker_done_at": "2026-06-09T18:28:58.113192Z"
 }

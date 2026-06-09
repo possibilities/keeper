@@ -63,5 +63,5 @@ Delete test_run_approve.py, test_render_approve_context.py, test_migrate_approva
 - [ ] `uv run pytest` green.
 
 ## Done summary
-
+Stripped both planctl-owned approval gates: deleted approve/render-approve-context/task ack/epic ack verbs, acks.py, run_approve/run_render_approve_context/run_task_ack/run_epic_ack, the approval sidecar readers in store.py, migrate_approval_to_sidecar.py, and skills/approve/; dropped APPROVAL_STATUSES + the approval merge/normalize ladder; collapsed RuntimeStatus to complete|untouched. worker_done_at/closer_done_at stamping retained as keeper's completion fold signal. README/CLAUDE docs scrubbed; removed verbs added to the guardrail list. Suite green (706 passed), ruff+ty clean.
 ## Evidence
