@@ -357,6 +357,61 @@ def test_reconcile_no_substring_collision(planctl_git_repo):
 
 
 # ---------------------------------------------------------------------------
+# Trailer parsing: single-line comma-split `Task: a, b` matches BOTH ids
+# ---------------------------------------------------------------------------
+
+
+def test_reconcile_comma_split_trailer_matches_both(planctl_git_repo):
+    """`Task: <id1>, <id2>` on ONE trailer line is matched for each id.
+
+    `_find_source_commits` normalizes commas → newlines before the exact-equality
+    check, so a single comma-separated `Task:` trailer line covers every id it
+    names. Without that branch a comma-joined trailer would match neither id and
+    reconcile would emit `not_started`/`in_progress_uncommitted` for a finished
+    worker. We seed a two-task epic, drive BOTH tasks to `done` with the stamp in
+    HEAD, land ONE commit whose trailer names both, and assert the `done` verdict
+    for each — plus a direct `_find_source_commits` assertion that the one sha is
+    returned for each id.
+    """
+    from planctl.run_reconcile import _find_source_commits
+
+    from .conftest import seed_epic
+
+    epic_id, task_ids = seed_epic(Path.cwd(), title="Comma split", n_tasks=2)
+    t1, t2 = task_ids
+    # Both tasks done on disk; HEAD task JSONs carry the worker_done_at stamp.
+    _set_runtime(planctl_git_repo, t1, {"status": "done"})
+    _set_runtime(planctl_git_repo, t2, {"status": "done"})
+    _commit_task_json_with_done_stamp(planctl_git_repo, t1)
+    _commit_task_json_with_done_stamp(planctl_git_repo, t2)
+
+    # ONE source commit whose single trailer line names both ids, comma-joined.
+    sha = _commit_with_trailer(
+        planctl_git_repo,
+        f"feat(x): do both things\n\nbody line.\n\nTask: {t1}, {t2}",
+    )
+
+    # Direct parsing-branch assertion: the comma-trailer sha is returned for
+    # each id. (The per-task `chore(planctl): done` stamp commits ALSO carry a
+    # single-id `Task:` trailer, so the scan legitimately returns more than one
+    # sha — what the comma-split branch must guarantee is that THIS sha is among
+    # them for both ids.)
+    assert sha in _find_source_commits(t1, str(planctl_git_repo))
+    assert sha in _find_source_commits(t2, str(planctl_git_repo))
+
+    # And the end-to-end verdict is `done` for each (comma trailer doesn't break).
+    for tid in (t1, t2):
+        code, obj, output = _invoke(["reconcile", tid])
+        assert code == 0, output
+        assert obj is not None
+        assert obj.get("verdict") == "done", (
+            f"{tid} must reach done — comma-split trailer parsing regressed"
+        )
+        assert obj.get("status") == "done"
+        assert obj.get("state_head_visible") is True
+
+
+# ---------------------------------------------------------------------------
 # Unborn-branch guard: empty HEAD is a distinct signal, not tooling_error
 # ---------------------------------------------------------------------------
 
