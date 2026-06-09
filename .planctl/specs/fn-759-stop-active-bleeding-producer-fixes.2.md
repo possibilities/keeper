@@ -82,5 +82,5 @@ pathToId -> unchanged scan -> file delete -> tombstone still emitted.
 - [ ] full `bun test` green
 
 ## Done summary
-
+Reordered PlanScanner.onChange so the in-memory change-gate runs before the fn-629 in-HEAD probe: unchanged re-scans suppress with zero git cat-file forks, eliminating the per-scan subprocess storm. Gate semantics preserved (gated paths never earn lastEmitted; unchanged branch sets pathToId to route boot-seed delete tombstones). Added 4 spy-on-isTracked tests; README fn-629 prose updated to change-gate-first.
 ## Evidence
