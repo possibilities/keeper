@@ -112,7 +112,6 @@ import {
   resolvePlanRoots,
   resolveSockPath,
   resolveUsageRoot,
-  runPlanctlApprovalMigration,
 } from "./db";
 import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
 import type {
@@ -1440,18 +1439,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // short). The short-lived hook deliberately keeps the small default.
   const { db, stmts } = openDb(dbPath, { cacheSizeKb: 262144 });
 
-  // Step 1b — schema-v13 planctl approval migration (filesystem half). The
-  // SQL half (ADD COLUMN `epics.approval` + DROP TABLE `approvals`) ran
-  // inside `openDb`'s migrate(). This pass backfills `approval: "approved"`
-  // onto every existing epic plan file lacking the field and overlays each
-  // (about-to-be-dropped) approvals-table row onto the matching epic/task
-  // plan file. MUST run before the plan worker spawns: a watcher callback
-  // on a half-migrated tree would post a stale snapshot. Naturally
-  // idempotent — a missing-field check skips already-migrated files, the
-  // overlay reads from `approvals` (returns 0 rows after the DROP), and the
-  // table-exists guard skips the SELECT entirely on a fresh-v13 DB.
+  // Plan roots wired to the plan worker below (config → absolute, existing
+  // dirs). Resolved here, in the post-migration window, so the worker spawns
+  // with the same root set the rest of boot uses.
   const planRoots = resolvePlanRoots();
-  runPlanctlApprovalMigration(db, planRoots);
 
   // Step 2 — boot drain + seed sweep, wrapped in boot-drain WAL tuning so the
   // (potentially from-scratch) re-fold doesn't starve concurrent hook INSERTs

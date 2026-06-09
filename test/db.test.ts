@@ -2619,13 +2619,15 @@ test("fn-602: `tier` survives a re-fold from the immutable event log (rides FREE
   db.close();
 });
 
-test("v12 DB migrates: approvals table dropped, epics.approval re-dropped at v63, file backfill + overlay applied, idempotent re-run", () => {
+test("v12 DB migrates: SQL half replays cleanly — approvals table dropped, epics.approval re-dropped at v63", () => {
   // Build a v12-shaped DB by hand: events + jobs + epics + approvals at the
-  // v12 shape, version '12'. The v12→v13 step ADDs `epics.approval`, DROPs
-  // the `approvals` sidecar table, and (in the FS half) backfills epic plan
-  // files + overlays sidecar rows. Seed the FS so the migration has work to
-  // do; then run BOTH halves (openDb for the SQL, runPlanctlApprovalMigration
-  // for the FS) and assert on the final state.
+  // v12 shape, version '12'. The v12→v13 step ADDs `epics.approval` and DROPs
+  // the `approvals` sidecar table (SQL half). fn-759 DELETED the old
+  // filesystem half (the boot-time backfill/overlay that rewrote `.planctl`
+  // files) — so this test now pins ONLY the SQL ladder: the chain replays
+  // cleanly through every step, drops the sidecar, and (via the later v62→v63
+  // fn-756 step) leaves no `approval` column at the live version. No FS tree
+  // is touched.
   const v12 = new Database(dbPath, { create: true });
   v12.run(`
     CREATE TABLE events (
@@ -2739,48 +2741,6 @@ test("v12 DB migrates: approvals table dropped, epics.approval re-dropped at v63
   insertApproval.run("fn-nx:fn-nx.1", "fn-nx", "fn-nx.1", "approved", 400);
   v12.close();
 
-  // Build a hermetic plan-root tree with 2 epic files (one with no `approval`
-  // — eligible for backfill — and one with `approval` already set — proves
-  // idempotent skip) plus 2 task files (the sidecar overlay targets).
-  const { mkdirSync, readFileSync, writeFileSync } =
-    require("node:fs") as typeof import("node:fs");
-  const { serializePlanctlJson, runPlanctlApprovalMigration } =
-    require("../src/db") as typeof import("../src/db");
-  const planRoot = join(tmpDir, "plan-root");
-  const epicsDir = join(planRoot, ".planctl", "epics");
-  const tasksDir = join(planRoot, ".planctl", "tasks");
-  mkdirSync(epicsDir, { recursive: true });
-  mkdirSync(tasksDir, { recursive: true });
-  // Epic A: NO `approval` field — backfill should set it to "approved", then
-  // the close:fn-1-foo overlay should flip it to "rejected".
-  const epicAPath = join(epicsDir, "fn-1-foo.json");
-  writeFileSync(
-    epicAPath,
-    serializePlanctlJson({ id: "fn-1-foo", title: "Foo", status: "open" }),
-  );
-  // Epic B: ALREADY has `approval` → backfill is a no-op (idempotent skip).
-  const epicBPath = join(epicsDir, "fn-2-bar.json");
-  writeFileSync(
-    epicBPath,
-    serializePlanctlJson({
-      id: "fn-2-bar",
-      title: "Bar",
-      status: "open",
-      approval: "pending",
-    }),
-  );
-  // Task 1 + Task 2 (overlay targets).
-  const task1Path = join(tasksDir, "fn-1-foo.1.json");
-  writeFileSync(
-    task1Path,
-    serializePlanctlJson({ id: "fn-1-foo.1", epic: "fn-1-foo", title: "T1" }),
-  );
-  const task2Path = join(tasksDir, "fn-1-foo.2.json");
-  writeFileSync(
-    task2Path,
-    serializePlanctlJson({ id: "fn-1-foo.2", epic: "fn-1-foo", title: "T2" }),
-  );
-
   // Reopen via openDb — migrate() runs the FULL chain. The v12→v13 step ADDs
   // `epics.approval` and DROPs `approvals`; the later v62→v63 step (fn-756)
   // DROPs `epics.approval` again, so the column is GONE at the live version.
@@ -2819,42 +2779,6 @@ test("v12 DB migrates: approvals table dropped, epics.approval re-dropped at v63
     n: number;
   };
   expect(epicsCount.n).toBe(0);
-
-  // Realistic boot path: migrate() snapshotted the pre-DROP `approvals` rows
-  // into a connection-scoped TEMP table BEFORE the DROP fired, and
-  // runPlanctlApprovalMigration reads from that snapshot. So both passes —
-  // backfill AND overlay — land their effects, the sidecar rows are not
-  // silently lost across the DROP, and the overlay contract is honored.
-  runPlanctlApprovalMigration(db, [planRoot]);
-
-  // Epic A: missing-`approval` → backfill set it to "approved", then the
-  // `close:fn-1-foo` sidecar row OVERLAID it to "rejected" (sidecar wins).
-  const epicAAfter = JSON.parse(readFileSync(epicAPath, "utf8")) as {
-    approval: string;
-  };
-  expect(epicAAfter.approval).toBe("rejected");
-  // Epic B unchanged (already had `approval`, no sidecar row targets it).
-  const epicBAfter = JSON.parse(readFileSync(epicBPath, "utf8")) as {
-    approval: string;
-  };
-  expect(epicBAfter.approval).toBe("pending");
-  // Task overlays landed verbatim from the sidecar (approved / rejected).
-  const task1After = JSON.parse(readFileSync(task1Path, "utf8")) as {
-    approval: string;
-  };
-  expect(task1After.approval).toBe("approved");
-  const task2After = JSON.parse(readFileSync(task2Path, "utf8")) as {
-    approval: string;
-  };
-  expect(task2After.approval).toBe("rejected");
-
-  // Re-run is a no-op (idempotent): the TEMP snapshot was dropped after the
-  // first pass and the on-disk files already carry the overlaid values.
-  runPlanctlApprovalMigration(db, [planRoot]);
-  expect(JSON.parse(readFileSync(epicAPath, "utf8")).approval).toBe("rejected");
-  expect(JSON.parse(readFileSync(epicBPath, "utf8")).approval).toBe("pending");
-  expect(JSON.parse(readFileSync(task1Path, "utf8")).approval).toBe("approved");
-  expect(JSON.parse(readFileSync(task2Path, "utf8")).approval).toBe("rejected");
 
   // Second openDb is idempotent — version stays at v13, sibling rows
   // persist, schema_version unchanged.
@@ -4857,147 +4781,69 @@ test("v21 DB migrates to v22: events.config_dir + jobs.config_dir added, rows pr
   db2.close();
 });
 
-test("v12 DB migrates to v13: FS overlay applies sidecar rows BEFORE the DROP TABLE", () => {
-  // Variant of the prior test that exercises the FS migration's OVERLAY pass
-  // by running it against a v12-shaped DB whose `approvals` table is still
-  // present. We don't run openDb here (that would drop the table) — we
-  // directly stand up a v12 DB and call runPlanctlApprovalMigration to prove
-  // pass 2 routes rows correctly: a `close:<epic_id>` task_key writes the
-  // epic file; an `<epic_id>.<n>` task_key writes the task file; an orphan
-  // row (target file missing) logs and skips without throwing.
-  const { mkdirSync, readFileSync, writeFileSync } =
+test("openDb against a current-version DB leaves a seeded .planctl tree byte-identical (fn-759 boot-safety pin)", () => {
+  // fn-759 DELETED the v13 approval FS backfill — the boot-time pass that
+  // rewrote `.planctl` epic files. This pin proves the regression engine is
+  // gone: seed a post-fn-756-shaped plan tree (epic + task JSONs that carry NO
+  // `approval` field — the live committed shape), run the boot path that
+  // previously fired the backfill against a current-version DB, and assert
+  // every file is BYTE-identical afterward (content hash, not mtime).
+  const { mkdirSync, readFileSync, writeFileSync, readdirSync } =
     require("node:fs") as typeof import("node:fs");
-  const { serializePlanctlJson, runPlanctlApprovalMigration } =
-    require("../src/db") as typeof import("../src/db");
-  const planRoot = join(tmpDir, "overlay-root");
+  const { createHash } = require("node:crypto") as typeof import("node:crypto");
+  const planRoot = join(tmpDir, "boot-safety-root");
   const epicsDir = join(planRoot, ".planctl", "epics");
   const tasksDir = join(planRoot, ".planctl", "tasks");
   mkdirSync(epicsDir, { recursive: true });
   mkdirSync(tasksDir, { recursive: true });
-  // Seed plan files. Epic A gets backfilled to "approved" then overlaid to
-  // "rejected" by the close:<epic_id> row. Task 1 + Task 2 land overlay
-  // values. Task missing for the orphan row.
-  const epicPath = join(epicsDir, "fn-1-foo.json");
+  // Post-fn-756 shape: NO `approval` field anywhere — the old backfill would
+  // have injected `approval: "approved"` into each epic file.
   writeFileSync(
-    epicPath,
-    serializePlanctlJson({ id: "fn-1-foo", title: "Foo" }),
+    join(epicsDir, "fn-1-foo.json"),
+    JSON.stringify({ id: "fn-1-foo", title: "Foo", status: "open" }, null, 2),
   );
-  const task1Path = join(tasksDir, "fn-1-foo.1.json");
   writeFileSync(
-    task1Path,
-    serializePlanctlJson({ id: "fn-1-foo.1", epic: "fn-1-foo" }),
+    join(epicsDir, "fn-2-bar.json"),
+    JSON.stringify({ id: "fn-2-bar", title: "Bar", status: "open" }, null, 2),
   );
-  const task2Path = join(tasksDir, "fn-1-foo.2.json");
   writeFileSync(
-    task2Path,
-    serializePlanctlJson({ id: "fn-1-foo.2", epic: "fn-1-foo" }),
+    join(tasksDir, "fn-1-foo.1.json"),
+    JSON.stringify(
+      { id: "fn-1-foo.1", epic: "fn-1-foo", title: "T1" },
+      null,
+      2,
+    ),
   );
 
-  // Build a raw v12 DB with approvals rows still in place.
-  const v12 = new Database(dbPath, { create: true });
-  v12.run(`
-    CREATE TABLE approvals (
-      approval_id TEXT PRIMARY KEY,
-      epic_id TEXT NOT NULL,
-      task_key TEXT NOT NULL,
-      status TEXT CHECK(status IN ('approved', 'rejected')) NOT NULL,
-      updated_at REAL NOT NULL,
-      UNIQUE(epic_id, task_key)
-    )
-  `);
-  v12
-    .prepare(
-      "INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at) VALUES (?, ?, ?, ?, ?)",
-    )
-    .run("a", "fn-1-foo", "fn-1-foo.1", "approved", 1);
-  v12
-    .prepare(
-      "INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at) VALUES (?, ?, ?, ?, ?)",
-    )
-    .run("b", "fn-1-foo", "fn-1-foo.2", "rejected", 2);
-  v12
-    .prepare(
-      "INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at) VALUES (?, ?, ?, ?, ?)",
-    )
-    .run("c", "fn-1-foo", "close:fn-1-foo", "rejected", 3);
-  // Orphan: task_key references a missing task file.
-  v12
-    .prepare(
-      "INSERT INTO approvals (approval_id, epic_id, task_key, status, updated_at) VALUES (?, ?, ?, ?, ?)",
-    )
-    .run("d", "fn-nx", "fn-nx.99", "approved", 4);
-
-  // Capture stderr to verify orphan + log behavior without polluting test output.
-  const logs: string[] = [];
-  runPlanctlApprovalMigration(v12, [planRoot], (m) => logs.push(m));
-
-  // Epic backfilled to "approved" then OVERLAID by close:fn-1-foo → "rejected"
-  // (sidecar wins).
-  const epicAfter = JSON.parse(readFileSync(epicPath, "utf8")) as {
-    approval: string;
+  // Hash every file in the tree, by relative path, before boot.
+  const hashTree = (): Map<string, string> => {
+    const out = new Map<string, string>();
+    for (const dir of [epicsDir, tasksDir]) {
+      for (const name of readdirSync(dir).sort()) {
+        const full = join(dir, name);
+        out.set(
+          full,
+          createHash("sha256").update(readFileSync(full)).digest("hex"),
+        );
+      }
+    }
+    return out;
   };
-  expect(epicAfter.approval).toBe("rejected");
-  // Task overlays.
-  expect(JSON.parse(readFileSync(task1Path, "utf8")).approval).toBe("approved");
-  expect(JSON.parse(readFileSync(task2Path, "utf8")).approval).toBe("rejected");
-  // Orphan row logged a warning.
-  expect(logs.some((l) => /orphan sidecar row/.test(l))).toBe(true);
+  const before = hashTree();
 
-  v12.close();
-});
-
-test("runPlanctlApprovalMigration first-time boot with no approvals table is a clean no-op", () => {
-  // A fresh-v13 DB has never had an `approvals` table. The migration must
-  // skip pass 2 entirely without throwing on the missing table.
-  const { mkdirSync, readFileSync, writeFileSync } =
-    require("node:fs") as typeof import("node:fs");
-  const { serializePlanctlJson, runPlanctlApprovalMigration } =
-    require("../src/db") as typeof import("../src/db");
-  const planRoot = join(tmpDir, "fresh-root");
-  const epicsDir = join(planRoot, ".planctl", "epics");
-  mkdirSync(epicsDir, { recursive: true });
-  const epicPath = join(epicsDir, "fn-9-fresh.json");
-  writeFileSync(
-    epicPath,
-    serializePlanctlJson({ id: "fn-9-fresh", title: "Fresh" }),
-  );
-
-  // Open a fresh-v13 DB (migrate ran, no approvals table created).
-  const { db } = openDb(":memory:");
-  // Backfill ran cleanly — `approval: "approved"` landed.
-  runPlanctlApprovalMigration(db, [planRoot]);
-  const obj = JSON.parse(readFileSync(epicPath, "utf8")) as {
-    approval: string;
-  };
-  expect(obj.approval).toBe("approved");
+  // Boot path: open a current-version DB with the plan root resolvable. The
+  // deleted backfill ran right after `openDb` returned, against exactly this
+  // tree. openDb alone is the SQL half; there is no longer any FS pass to call.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe(String(SCHEMA_VERSION));
   db.close();
-});
 
-test("runPlanctlApprovalMigration walks <root>/<project>/.planctl/... one level deep", () => {
-  // Real plan layouts put `.planctl` inside the project subdir under a
-  // configured root (e.g. `~/code/<project>/.planctl/...`). The lookup must
-  // walk one level deep, not just look at `<root>/.planctl`.
-  const { mkdirSync, readFileSync, writeFileSync } =
-    require("node:fs") as typeof import("node:fs");
-  const { serializePlanctlJson, runPlanctlApprovalMigration } =
-    require("../src/db") as typeof import("../src/db");
-  const outerRoot = join(tmpDir, "outer");
-  const projectDir = join(outerRoot, "myproject");
-  const epicsDir = join(projectDir, ".planctl", "epics");
-  mkdirSync(epicsDir, { recursive: true });
-  const epicPath = join(epicsDir, "fn-1-foo.json");
-  writeFileSync(
-    epicPath,
-    serializePlanctlJson({ id: "fn-1-foo", title: "Foo" }),
-  );
-
-  const { db } = openDb(":memory:");
-  runPlanctlApprovalMigration(db, [outerRoot]);
-  const obj = JSON.parse(readFileSync(epicPath, "utf8")) as {
-    approval: string;
-  };
-  expect(obj.approval).toBe("approved");
-  db.close();
+  // Tree is byte-identical — boot mutated nothing.
+  const after = hashTree();
+  expect(after).toEqual(before);
 });
 
 test("resolveConfig: missing file falls back to default ~/code root", () => {

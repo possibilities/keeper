@@ -515,11 +515,9 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
       // the epics collection's default scope so the unfiltered subscribe sees it.
       status: "open",
       primary_repo: "/tmp/keeper-e2e-repo",
-      // The daemon's v13 boot-time approval migration backfills `approval`
-      // to "approved" on any epic file lacking the field — which the
-      // unfiltered subscribe would then HIDE via the
-      // `{ approval: { ne: "approved" } }` default filter. We write
-      // "pending" up front to opt out of the backfill and stay in scope.
+      // fn-756 stripped the `approval` surface and fn-759 deleted the boot-time
+      // approval backfill, so this field is inert here — kept as a harmless
+      // explicit value so the fixture stays a faithful plan-file shape.
       approval: "pending",
     }),
   );

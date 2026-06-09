@@ -25,7 +25,6 @@ import { Database } from "bun:sqlite";
 import {
   existsSync,
   mkdirSync,
-  readdirSync,
   readFileSync,
   renameSync,
   statSync,
@@ -2745,18 +2744,15 @@ function migrate(db: Database): void {
       // idempotent, so even a v11 DB skipping directly to v13 converges
       // cleanly.
 
-      // v12→v13: planctl-native approval. Two halves:
-      //   1) SQL: add `epics.approval` (NOT NULL DEFAULT 'pending'), drop the
-      //      schema-v12 `approvals` sidecar table.
-      //   2) Filesystem: backfill `approval: "approved"` to every existing
-      //      epic plan file that lacks the field, then overlay each existing
-      //      approvals-table row onto the matching epic/task file. The
-      //      filesystem half lives in `runPlanctlApprovalMigration` (called by
-      //      the daemon AFTER `openDb` returns) because the hook process opens
-      //      a writer connection per invocation and must NOT pay FS migration
-      //      cost. Daemon boot order: `openDb` (this SQL block runs, idempotent
-      //      ADD COLUMN + DROP TABLE) → `runPlanctlApprovalMigration` (the FS
-      //      half, also idempotent) → workers spawn.
+      // v12→v13: planctl-native approval (SQL half only). Add
+      // `epics.approval` (NOT NULL DEFAULT 'pending') and drop the schema-v12
+      // `approvals` sidecar table. The original filesystem half (a boot-time
+      // backfill that rewrote `.planctl` epic files + overlaid sidecar rows)
+      // was DELETED in fn-759: post-fn-756 (v62→v63) the `approval` field has
+      // zero consumers in keeper or planctl, so the backfill served nothing on
+      // any DB version, and it was a boot-time self-fire into the plan-worker's
+      // own watch tree. The forward-only ladder must still replay this SQL half
+      // identically on a fresh DB, so the ADD COLUMN / DROP TABLE stay.
       //
       // The SQL ADD COLUMN added `epics.approval` (NOT NULL DEFAULT 'pending').
       // fn-756 (v62→v63, below) DROPS the column again — so this ADD must be
@@ -2769,58 +2765,15 @@ function migrate(db: Database): void {
       // already, but the intermediate v55→v56 `default_visible` rewrite below
       // references it in its generated-column expression, so the column MUST be
       // present for any pre-v63 upgrade path that passes through v56. A DB at
-      // stored ≥ 63 (the column already dropped) skips it. (The FS half + the
-      // `approvals` DROP / TEMP-snapshot below stay unguarded — idempotent
-      // no-ops on an already-migrated DB.)
+      // stored ≥ 63 (the column already dropped) skips it. (The `approvals`
+      // DROP below stays unguarded — an idempotent no-op on an already-migrated
+      // DB.)
       if (preMigrateStoredVersion < 63) {
         addColumnIfMissing(
           db,
           "epics",
           "approval",
           "TEXT NOT NULL DEFAULT 'pending'",
-        );
-      }
-
-      // Snapshot the v12 `approvals` rows into a connection-scoped TEMP table
-      // BEFORE the DROP fires. The FS half (`runPlanctlApprovalMigration`,
-      // called by the daemon after `openDb` returns) needs to overlay those
-      // rows onto the matching epic/task plan files — but it runs OUTSIDE this
-      // transaction, after the DROP has already executed. Reading from the
-      // real `approvals` table from inside the FS pass therefore sees nothing,
-      // which silently dropped the overlay in prior boots (the bug this task
-      // fixes).
-      //
-      // TEMP tables in sqlite are connection-scoped: they live for the
-      // lifetime of THIS `db` handle and are invisible to every other
-      // connection. Creating one inside this `BEGIN IMMEDIATE` keeps the
-      // schema-migration atomicity invariant — if the transaction rolls back,
-      // the TEMP table goes with it and the DROP never landed either, so a
-      // retry re-snapshots from a still-present `approvals`. Idempotent on
-      // re-run: a fresh-v13 boot has no `approvals` (the table-exists guard
-      // skips the INSERT) and no rows to snapshot, so the FS pass overlays
-      // nothing — exactly the desired no-op.
-      //
-      // We always CREATE the TEMP table (even when `approvals` is absent) so
-      // the FS pass has a stable schema to read from; an empty table is a
-      // clean no-op. `DROP TABLE IF EXISTS` clears any leftover from a prior
-      // `migrate()` call on the same connection (e.g. tests that reopen).
-      db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
-      db.run(`
-      CREATE TEMP TABLE _v13_overlay_pending (
-        epic_id TEXT NOT NULL,
-        task_key TEXT NOT NULL,
-        status TEXT NOT NULL
-      )
-    `);
-      const approvalsTableExists =
-        db
-          .prepare(
-            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
-          )
-          .get() != null;
-      if (approvalsTableExists) {
-        db.run(
-          "INSERT INTO _v13_overlay_pending (epic_id, task_key, status) SELECT epic_id, task_key, status FROM approvals",
         );
       }
 
@@ -6486,306 +6439,5 @@ export function atomicWriteFile(path: string, content: string): void {
       // swallow — original error is the one the caller cares about
     }
     throw err;
-  }
-}
-
-/**
- * The schema-v13 planctl approval migration's FILESYSTEM half (the SQL half —
- * `epics.approval` ADD COLUMN + `approvals` DROP TABLE — runs inside
- * `migrate()` during `openDb`). Two passes over the configured plan roots:
- *
- *   1) BACKFILL — for every `.planctl/epics/*.json` across `roots`, load the
- *      JSON; if `approval` is absent, write `approval: "approved"` and
- *      atomically rewrite the file (canonical serializer, same dir temp+rename).
- *      Idempotent: a file that already has `approval` is skipped.
- *
- *   2) OVERLAY — read every row from the (about-to-be-dropped) `approvals`
- *      sidecar table. For each row, derive the target file:
- *        - `task_key === "close:<epic_id>"` (the autopilot's per-epic
- *          close-approval pill) → write `epic.approval = <status>` to the
- *          epic file (overrides the blanket "approved" backfill — sidecar wins).
- *        - Otherwise treat `task_key` as a task id (`<epic_id>.<n>`) → write
- *          `task.approval = <status>` to that task file.
- *      Orphan rows (target file missing) log to stderr and skip.
- *
- * The DROP TABLE itself happens inside `migrate()`'s `BEGIN IMMEDIATE`; this
- * function runs AFTER `openDb` returns. The caller (the daemon) MUST invoke
- * this BEFORE spawning workers so the file backfill is durable before any
- * `@parcel/watcher` callback could re-read a half-migrated file.
- *
- * Naturally idempotent on re-run: a missing-on-backfill check skips files
- * that already have `approval`; the overlay reads from `approvals` (which
- * has been dropped on a successful prior run, so the SELECT returns 0 rows);
- * a malformed/missing plan file logs+skips. An empty `roots` array is a no-op.
- *
- * Exported for unit reach + daemon boot use.
- */
-export function runPlanctlApprovalMigration(
-  db: Database,
-  roots: string[],
-  log: (msg: string) => void = (m) => console.error(m),
-): void {
-  // Pass 1 — backfill `approval: "approved"` to epic files lacking it.
-  // We walk only `.planctl/epics/*.json` (NOT tasks): the spec is to default
-  // existing epics to "approved" (the autopilot's pre-migration semantics);
-  // tasks default to "pending" via the schema-zero reading + the plan
-  // worker's coerce, so they need no backfill.
-  for (const root of roots) {
-    const epicsDir = locatePlanctlEpicsDir(root);
-    if (epicsDir === null) {
-      continue;
-    }
-    let names: string[];
-    try {
-      names = readdirSync(epicsDir);
-    } catch (err) {
-      log(
-        `[keeper] approval migration: failed to read ${epicsDir}: ${stringifyMigrationErr(err)}`,
-      );
-      continue;
-    }
-    for (const name of names) {
-      if (!name.endsWith(".json")) {
-        continue;
-      }
-      const full = join(epicsDir, name);
-      backfillEpicApproval(full, log);
-    }
-  }
-
-  // Pass 2 — overlay sidecar rows onto plan files.
-  //
-  // Two sources, checked in order:
-  //   1) `temp._v13_overlay_pending` — populated by `migrate()`'s v12→v13
-  //      step BEFORE the DROP TABLE fires. This is the production path: the
-  //      daemon's `openDb` ran migrate on THIS connection, which snapshotted
-  //      pre-DROP rows into the TEMP table. After we drain it we drop it so
-  //      a re-run on the same connection is a clean no-op.
-  //   2) `approvals` — the raw v12 sidecar, used by tests that stand up a
-  //      v12-shaped DB WITHOUT running migrate (so they can exercise the FS
-  //      pass against a still-present sidecar). On a real daemon boot the
-  //      `approvals` table has already been dropped by migrate(), so this
-  //      branch only fires in those test fixtures.
-  //
-  // Defensive: both tables may be absent (e.g. fresh-v13 DB, or a re-run
-  // after a prior boot completed both halves) — the SELECT is gated on
-  // `sqlite_master` so a missing table is a no-op, not a throw.
-  // TEMP tables live in the connection's `temp` schema and are visible via
-  // `temp.sqlite_master` (NOT the main-schema `sqlite_master`).
-  const overlayTableExists =
-    db
-      .prepare(
-        "SELECT name FROM temp.sqlite_master WHERE type = 'table' AND name = '_v13_overlay_pending'",
-      )
-      .get() != null;
-  let rows: { epic_id: string; task_key: string; status: string }[];
-  if (overlayTableExists) {
-    rows = db
-      .prepare("SELECT epic_id, task_key, status FROM _v13_overlay_pending")
-      .all() as { epic_id: string; task_key: string; status: string }[];
-  } else {
-    const approvalsTableExists =
-      db
-        .prepare(
-          "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'approvals'",
-        )
-        .get() != null;
-    if (!approvalsTableExists) {
-      return;
-    }
-    rows = db
-      .prepare("SELECT epic_id, task_key, status FROM approvals")
-      .all() as { epic_id: string; task_key: string; status: string }[];
-  }
-  if (rows.length === 0) {
-    if (overlayTableExists) {
-      db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
-    }
-    return;
-  }
-  // Build a per-root epics-dir lookup so we can locate the target file
-  // without walking each root again per row.
-  const epicsDirs: string[] = [];
-  for (const root of roots) {
-    const dir = locatePlanctlEpicsDir(root);
-    if (dir !== null) {
-      epicsDirs.push(dir);
-    }
-  }
-  for (const row of rows) {
-    overlayApprovalRow(row, epicsDirs, log);
-  }
-
-  // Drop the TEMP snapshot now that overlay is durable on disk. A second
-  // call to `runPlanctlApprovalMigration` on the same connection (e.g. a
-  // test re-invocation) is then a clean no-op — no rows to replay.
-  if (overlayTableExists) {
-    db.run("DROP TABLE IF EXISTS temp._v13_overlay_pending");
-  }
-}
-
-function stringifyMigrationErr(err: unknown): string {
-  return err instanceof Error ? err.message : String(err);
-}
-
-/**
- * Locate the `.planctl/epics` directory under a project root. Walks the root
- * one level deep — `.planctl` lives at `<root>/<project>/.planctl`, not at
- * `<root>/.planctl` directly. A root with no `.planctl` subdir anywhere
- * returns null. Returns the FIRST match (the migration assumes one keeper
- * project per root; multiple matches log+take the first).
- *
- * NOT recursive: a full walk would re-implement plan-worker's PRUNE_DIRS
- * logic and the migration only cares about the configured project roots.
- * Tests can point `roots` directly at the project dir to control the lookup.
- */
-function locatePlanctlEpicsDir(root: string): string | null {
-  // First try the root itself — the test fixtures and many real projects
-  // point `roots` directly at the project dir.
-  const direct = join(root, ".planctl", "epics");
-  if (existsSync(direct)) {
-    return direct;
-  }
-  // Otherwise walk one level deep.
-  let entries: string[];
-  try {
-    entries = readdirSync(root);
-  } catch {
-    return null;
-  }
-  for (const name of entries) {
-    const candidate = join(root, name, ".planctl", "epics");
-    if (existsSync(candidate)) {
-      return candidate;
-    }
-  }
-  return null;
-}
-
-/**
- * Backfill `approval: "approved"` to one epic file if the field is absent.
- * Idempotent (skip-if-present). Any read/parse failure logs+skips — never
- * throws past the caller (one bad file never wedges the migration).
- */
-function backfillEpicApproval(path: string, log: (msg: string) => void): void {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (err) {
-    log(
-      `[keeper] approval migration: failed to read ${path}: ${stringifyMigrationErr(err)}`,
-    );
-    return;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    log(
-      `[keeper] approval migration: failed to parse ${path}: ${stringifyMigrationErr(err)}`,
-    );
-    return;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    log(`[keeper] approval migration: ${path} is not a JSON object; skipping`);
-    return;
-  }
-  const obj = parsed as Record<string, unknown>;
-  if ("approval" in obj) {
-    // Already migrated — idempotent skip.
-    return;
-  }
-  obj.approval = "approved";
-  try {
-    atomicWriteFile(path, serializePlanctlJson(obj));
-  } catch (err) {
-    log(
-      `[keeper] approval migration: failed to write ${path}: ${stringifyMigrationErr(err)}`,
-    );
-  }
-}
-
-/**
- * Apply one sidecar `approvals` row to the matching plan file. Routes by
- * `task_key`:
- *   - `close:<epic_id>` or bare `<epic_id>` → epic file (sets epic.approval).
- *   - Otherwise → task file (`<epicsDir>/../tasks/<task_key>.json`).
- *
- * Orphan rows (target file missing) log+skip. The status is taken verbatim
- * from the row (`approved` / `rejected` — the v12 CHECK constraint ensures
- * this is one of the two; a hand-corrupted DB would log+skip when the file
- * write or schema validation downstream catches it). The sidecar's row WINS
- * over the blanket "approved" backfill — overlay runs after backfill.
- */
-function overlayApprovalRow(
-  row: { epic_id: string; task_key: string; status: string },
-  epicsDirs: string[],
-  log: (msg: string) => void,
-): void {
-  // Resolve the (epic_id, task_key) pair to a concrete file path.
-  const isEpicLevel =
-    row.task_key === row.epic_id || row.task_key === `close:${row.epic_id}`;
-  // Try each configured epics dir; the first existing match wins.
-  for (const epicsDir of epicsDirs) {
-    if (isEpicLevel) {
-      const path = join(epicsDir, `${row.epic_id}.json`);
-      if (existsSync(path)) {
-        writeApprovalField(path, row.status, log);
-        return;
-      }
-    } else {
-      const tasksDir = join(epicsDir, "..", "tasks");
-      const path = join(tasksDir, `${row.task_key}.json`);
-      if (existsSync(path)) {
-        writeApprovalField(path, row.status, log);
-        return;
-      }
-    }
-  }
-  log(
-    `[keeper] approval migration: orphan sidecar row (epic_id=${row.epic_id}, task_key=${row.task_key}) — target file not found; skipping`,
-  );
-}
-
-/**
- * Load a plan file, set `approval = status` (overwriting any prior value),
- * atomically rewrite. Caller has already verified `path` exists; a missing
- * file here means a race we can't help with — log+skip.
- */
-function writeApprovalField(
-  path: string,
-  status: string,
-  log: (msg: string) => void,
-): void {
-  let raw: string;
-  try {
-    raw = readFileSync(path, "utf8");
-  } catch (err) {
-    log(
-      `[keeper] approval migration: failed to read ${path}: ${stringifyMigrationErr(err)}`,
-    );
-    return;
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    log(
-      `[keeper] approval migration: failed to parse ${path}: ${stringifyMigrationErr(err)}`,
-    );
-    return;
-  }
-  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
-    log(`[keeper] approval migration: ${path} is not a JSON object; skipping`);
-    return;
-  }
-  const obj = parsed as Record<string, unknown>;
-  obj.approval = status;
-  try {
-    atomicWriteFile(path, serializePlanctlJson(obj));
-  } catch (err) {
-    log(
-      `[keeper] approval migration: failed to write ${path}: ${stringifyMigrationErr(err)}`,
-    );
   }
 }
