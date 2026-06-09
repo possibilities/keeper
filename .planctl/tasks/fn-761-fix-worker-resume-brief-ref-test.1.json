@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Reconcile worker-resume envelope with brief-ref",
-  "updated_at": "2026-06-09T22:01:40.098090Z"
+  "updated_at": "2026-06-09T22:33:15.010113Z",
+  "worker_done_at": "2026-06-09T22:33:15.010113Z"
 }

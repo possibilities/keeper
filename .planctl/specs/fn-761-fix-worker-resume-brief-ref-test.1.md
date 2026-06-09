@@ -38,5 +38,5 @@ then the full suite, to confirm no collateral.
 - [ ] The fix lands on the correct side: tests updated to the brief_ref envelope (default), OR a named envelope regression fixed in run_worker_resume.py with rationale in Done summary.
 
 ## Done summary
-
+probe
 ## Evidence
