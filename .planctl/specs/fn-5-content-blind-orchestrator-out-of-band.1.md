@@ -48,5 +48,5 @@ Rewrite the happy-path test: assert `task_spec_md`/`epic_spec_md`/`snippet_conte
 - [ ] `tests/test_claim.py` updated and green; ruff + ty clean.
 
 ## Done summary
-
+Added planctl/brief.py (assemble_brief + write_brief + relocated pure spec-read/snippet-render raising BriefRenderError); claim now writes state/briefs/<task_id>.json inside lock_task after save_runtime and returns a brief_ref handle instead of inline prose, with a BRIEF_WRITE_FAILED path that leaves the task in_progress for repair-on-reclaim.
 ## Evidence
