@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Add planctl find-task-commit verb",
-  "updated_at": "2026-06-09T21:16:06.939530Z"
+  "updated_at": "2026-06-09T22:04:13.071856Z",
+  "worker_done_at": "2026-06-09T22:04:13.071856Z"
 }

@@ -43,5 +43,5 @@ Copy `run_resolve_task.py` as the structural template (it is the closest read-on
 - [ ] `uv run pytest tests/test_find_task_commit.py`, `uv run ty check`, `uv run ruff check .` clean
 
 ## Done summary
-
+Added read-only 'planctl find-task-commit <task_id>' verb wrapping commit_lookup.find_commit_groups; emits the flat keeper-compatible {success, commits:[{sha,repo}]} envelope (full %H), clean miss -> empty success exit 0, all-repos-broken -> COMMIT_LOOKUP_FAILED exit 1. Registered with --project + agent-help, kept out of _NO_TRACK_COMMANDS. 13-case suite + ty/ruff clean.
 ## Evidence
