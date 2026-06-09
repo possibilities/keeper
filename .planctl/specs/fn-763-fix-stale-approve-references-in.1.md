@@ -14,5 +14,5 @@ Both are one-liner edits in the same function. No behavioral change.
 - [ ] Tests pass (`bun test`)
 
 ## Done summary
-
+Dropped stale approve from parseDispatchKey error message (line 385) and docstring (line 351); both now read work|close. No behavioral change.
 ## Evidence

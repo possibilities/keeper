@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "fix stale approve strings in rpc-handlers",
-  "updated_at": "2026-06-09T22:40:25.252026Z"
+  "updated_at": "2026-06-09T23:30:43.653261Z",
+  "worker_done_at": "2026-06-09T23:30:43.653261Z"
 }
