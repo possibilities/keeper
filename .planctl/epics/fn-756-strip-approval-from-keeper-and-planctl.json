@@ -1,0 +1,20 @@
+{
+  "approval": "pending",
+  "branch_name": "fn-756-strip-approval-from-keeper-and-planctl",
+  "bundles": [],
+  "created_at": "2026-06-09T15:08:47.643749Z",
+  "depends_on_epics": [],
+  "id": "fn-756-strip-approval-from-keeper-and-planctl",
+  "last_validated_at": "2026-06-09T15:08:47.743287Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Strip approval from keeper and planctl",
+  "touched_repos": [
+    "/Users/mike/code/arthack",
+    "/Users/mike/code/keeper",
+    "/Users/mike/code/planctl"
+  ],
+  "updated_at": "2026-06-09T15:08:47.643749Z"
+}

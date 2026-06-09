@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T15:08:47.643749Z",
+  "depends_on": [
+    "fn-756-strip-approval-from-keeper-and-planctl.1"
+  ],
+  "epic": "fn-756-strip-approval-from-keeper-and-planctl",
+  "id": "fn-756-strip-approval-from-keeper-and-planctl.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "Remove approve and ack pipelines from planctl",
+  "updated_at": "2026-06-09T15:08:47.643749Z"
+}
