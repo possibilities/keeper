@@ -280,10 +280,11 @@ stable join key that survives without re-parsing the fenced body.
 **Guard the delimiter.** `key` (and in principle `category`/`severity`) is
 DB-derived, so a stray value must not break the `---` fence or the YAML. Before
 the heredoc, single-quote-wrap each value and escape any embedded single quote
-(`'` → `'\''`), and strip newlines — so no value can introduce a `---` line or a
+(YAML single-quoted scalar style: `'` → `''`), and strip newlines — so no value
+can introduce a `---` line or a
 second YAML key. Build the four safe scalars first:
 ```
-yq() { printf "%s" "$1" | tr -d '\n\r' | sed "s/'/'\\\\''/g"; }
+yq() { printf "%s" "$1" | tr -d '\n\r' | sed "s/'/''/g"; }
 fm_fingerprint=$(yq "$fingerprint"); fm_category=$(yq "$category")
 fm_severity=$(yq "$severity");       fm_key=$(yq "$key")
 ```
