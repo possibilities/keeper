@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "worker delivery self-check",
-  "updated_at": "2026-06-09T19:12:00.719802Z"
+  "updated_at": "2026-06-09T19:32:12.488418Z",
+  "worker_done_at": "2026-06-09T19:32:12.488418Z"
 }

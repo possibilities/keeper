@@ -31,5 +31,5 @@ After the worker's existing `planctl done` (its Phase 5), add a lightweight deli
 - [ ] Codex sub-prompt asymmetry preserved; prose present-tense; consistency-test invariant groups green.
 
 ## Done summary
-
+Both worker templates (native + codex) add a delivery self-check after planctl done: keeper session-state, then keeper commit-work for any still-dirty session files before returning. Relocates delivery cleanliness from orchestrator to worker; codex sub-prompt asymmetry preserved.
 ## Evidence
