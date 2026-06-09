@@ -57,13 +57,15 @@ planctl validate
 Top-level commands:
 
 - `init`, `detect`, `status`, `validate`, `state-path`
-- `claim`, `resolve-task`, `reconcile`, `done`, `block`, `ready`
+- `claim`, `resolve-task`, `reconcile`, `find-task-commit`, `done`, `block`, `ready`
 - `show`, `epics`, `tasks`, `list`, `cat`
 - `epic`, `task`, `dep`
 
 `resolve-task <task_id>` (fn-593) — read-only routing lookup returning the subset of `claim`'s envelope an external consumer needs to pick a tier-plugin and police cwd. Retained as a public CLI surface; no longer wired to the `arthack-claude.py` launcher (keeper reads `task.tier` from its own projected Task data and launches with the matching `--plugin-dir` itself). Cwd-agnostic (scans configured `roots`); supports `--project <path>` to disambiguate. Returns `{task_id, epic_id, project_path, target_repo, primary_repo, tier, status}` — `tier` is one of `medium|high|xhigh|max` or `null`. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID | NOT_A_PROJECT`.
 
 `reconcile <task_id>` (fn-6) — read-only post-worker verdict verb, the symmetric bookend to `claim`'s pre-worker brief handoff. Collapses the `/plan:work` orchestrator's post-worker reconciliation into one call returning a typed verdict the orchestrator switches on mechanically: `done | in_progress_committed | in_progress_uncommitted | blocked | state_uncommitted | not_started | tooling_error`. Computed entirely from planctl-native data — merged status, trailer-authentic source commits (against `target_repo` + `epic.touched_repos`), HEAD-visibility of the committed task JSON (against `state_repo`), and an epic-progress tally — with NO keeper dependency. Any git subprocess failure fails closed to `tooling_error`. Cwd-agnostic (scans configured `roots`); supports `--project <path>` to disambiguate. Returns `{verdict, task_id, epic_id, status, source_commits, state_head_visible, epic_progress, assessed_at, blocked_reason}`. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID`.
+
+`find-task-commit <task_id>` — read-only commit lookup for a single task. Wraps the native `Task:`-trailer scan in `planctl/commit_lookup.py` and emits the flat envelope a worker's harness-drop predecessor-detection consumes: `{"success": true, "commits": [{"sha": "<%H>", "repo": "<abs-path>"}, ...]}` (`sha`/`repo` field names, full `%H`; repo-outer first-seen order, per-repo grep order, SHAs deduped per repo). A clean miss is a normal empty success (`commits: []`, exit 0). The verb fails loud (`COMMIT_LOOKUP_FAILED`, exit 1, with `details.broken_repos`) only when every repo in the resolved scan set is missing or not a git repo. Resolution is planctl-native: the owning project is found cwd-agnostically via `find_projects_with_task` (`--project <abs>` to disambiguate), then `primary_repo` / `touched_repos` are read off the epic record to seed the scan set. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID | NOT_A_PROJECT`.
 
 Subcommands:
 

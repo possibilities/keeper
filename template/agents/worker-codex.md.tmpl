@@ -76,7 +76,7 @@ Parse the task spec for what matters: **Acceptance** (the bar you must clear), *
 
 **Codex tracks file changes (`tracks_file_changes: true`).** After `[pairctl] completed`, the working tree will be dirty with codex's edits. That is EXPECTED — not a harness-dropped predecessor. Do NOT `git stash` or `git restore` post-completion; that hides codex's work. The "harness-dropped predecessor" rule below applies only to dirty state seen at the very start of your turn, BEFORE you've invoked pairctl.
 
-**Harness-dropped predecessor (pre-invocation only).** If `status_porcelain` already contains files you'd expect codex to write, or `keeper find-task-commit $TASK_ID` returns a commit, a previous worker on this task was cut short:
+**Harness-dropped predecessor (pre-invocation only).** If `status_porcelain` already contains files you'd expect codex to write, or `planctl find-task-commit $TASK_ID` returns a commit, a previous worker on this task was cut short:
 
 - Source commit already shipped → skip Phases 2–4, verify the diff covers the acceptance, jump to Phase 5.
 - Uncommitted work in `status_porcelain` (and `/tmp/pairctl-worker-<task_id>.yaml` exists and is well-formed) → the prior codex run landed work but the wrapper didn't commit. Read the YAML to understand what codex did, verify against acceptance, jump to Phase 4 (commit) and Phase 5 (done).

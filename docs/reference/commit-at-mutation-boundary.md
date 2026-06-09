@@ -460,11 +460,12 @@ last act; the state commit lands as a side effect.
 
 The orchestrator detects where a harness drop landed through ONE
 read-only call — `planctl reconcile <task_id>` — and switches on its
-typed verdict. There is no separate orchestrator test phase, and no
-hand-fired `keeper session-state` / `keeper find-task-commit` /
-`validate --epic`; the verdict is computed entirely from planctl-native
-data (merged status, trailer-authentic source commits, HEAD-visibility
-of the committed task JSON, an epic tally). A harness drop can land at
+typed verdict. There is no separate orchestrator test phase, and the
+orchestrator hand-fires no `keeper session-state` / `planctl
+find-task-commit` / `validate --epic`; `reconcile` computes the verdict
+entirely from planctl-native data (merged status, trailer-authentic
+source commits, HEAD-visibility of the committed task JSON, an epic
+tally). A harness drop can land at
 three places under this contract, each mapping to a verdict:
 
 - **Drop before source commit (mid-implementation):** task

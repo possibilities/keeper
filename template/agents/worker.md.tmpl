@@ -72,7 +72,7 @@ From `keeper session-state` note `status_porcelain` (uncommitted files), `head_s
 
 Parse the task spec for what matters: **Acceptance** (the bar you must clear), **Approach** (hints), **Investigation targets** (files to look at), **Files** (expected paths). The epic's `## Quick commands` are smoke tests you'll run later.
 
-**Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `keeper find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
+**Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `planctl find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
 
 - Source commit already shipped → skip Phases 2–4, verify the diff covers the acceptance, jump to Phase 5.
 - Uncommitted work in `status_porcelain` → continue from Phase 3 against the existing tree.
