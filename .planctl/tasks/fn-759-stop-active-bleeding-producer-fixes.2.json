@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-09T19:41:10.006038Z",
+  "depends_on": [],
+  "epic": "fn-759-stop-active-bleeding-producer-fixes",
+  "id": "fn-759-stop-active-bleeding-producer-fixes.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Change-gate before in-HEAD probe",
+  "updated_at": "2026-06-09T19:41:10.006038Z"
+}
