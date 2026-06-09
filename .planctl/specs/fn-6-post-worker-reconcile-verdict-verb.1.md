@@ -62,5 +62,5 @@ Envelope: `{verdict, task_id, epic_id, status, source_commits, state_head_visibl
 - [ ] `tests/test_reconcile.py` green (incl. exhaustiveness); ruff + ty clean.
 
 ## Done summary
-
+Added read-only 'planctl reconcile <task_id>' verb returning a typed post-worker verdict (done|in_progress_committed|in_progress_uncommitted|blocked|state_uncommitted|not_started|tooling_error) computed entirely from planctl-native data: merged status, trailer-authentic source commits, HEAD-visibility of the committed task JSON against state_repo with an unborn-branch guard, and an epic tally. Trailer-exact (no prose / no fn-N.1↔fn-N.10 collision), fail-closed to tooling_error. Tests cover every verdict, exhaustiveness, readonly footer, and bad/missing/ambiguous id.
 ## Evidence
