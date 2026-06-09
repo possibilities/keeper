@@ -54,5 +54,5 @@ outcomes the bridge feeds).
 - [ ] full bun test green; no schema bump
 
 ## Done summary
-
+COALESCE'd both subagent bridge blob reads (findBridgePreToolUse, findPendingPreToolUseForStart) over LEFT JOIN event_blobs so relocated PreToolUse:Agent blobs re-fold byte-identically; rewrote the false 'ONE non-COALESCE read' claim into an accurate per-site enumeration and added a README event_blobs read-contract paragraph, with relocate-then-assert tests proving the bridge resolves and the re-fold is byte-identical.
 ## Evidence
