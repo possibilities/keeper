@@ -19,5 +19,5 @@ alongside the existing newline-stacked and single-value trailer tests.
 - [ ] All existing reconcile tests continue to pass
 
 ## Done summary
-
+Added a test asserting _find_source_commits matches each id from a single-line comma-separated Task trailer and that reconcile reaches the done verdict for both ids the one commit covers.
 ## Evidence

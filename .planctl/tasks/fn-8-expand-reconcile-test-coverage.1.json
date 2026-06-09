@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "medium",
   "title": "test comma-split Task trailer parsing",
-  "updated_at": "2026-06-09T20:09:31.952800Z"
+  "updated_at": "2026-06-09T22:12:36.691523Z",
+  "worker_done_at": "2026-06-09T22:12:36.691523Z"
 }
