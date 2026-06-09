@@ -367,10 +367,6 @@ test("parseDispatchKey: splits the composite key into a typed {verb, id} pair", 
     verb: "work",
     id: "fn-1-foo.3",
   });
-  expect(parseDispatchKey("approve::fn-1-foo.3")).toEqual({
-    verb: "approve",
-    id: "fn-1-foo.3",
-  });
   expect(parseDispatchKey("close::fn-1-foo")).toEqual({
     verb: "close",
     id: "fn-1-foo",
@@ -386,6 +382,8 @@ test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", 
 test("parseDispatchKey: rejects unknown verbs", () => {
   expect(() => parseDispatchKey("rm::fn-1-foo")).toThrow(BadParamsError);
   expect(() => parseDispatchKey("plan::fn-1-foo")).toThrow(BadParamsError);
+  // fn-756 removed the approve window; `approve` is no longer a dispatch verb.
+  expect(() => parseDispatchKey("approve::fn-1-foo")).toThrow(BadParamsError);
 });
 
 test("parseDispatchKey: rejects nested `::` separators (no command injection)", () => {

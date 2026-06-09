@@ -317,18 +317,14 @@ export async function setEpicArmedHandler(
 // ---------------------------------------------------------------------------
 
 /**
- * The three planctl verbs the reconciler dispatches. Mirrors the
- * `Verb` union in `src/autopilot-worker.ts` (kept local rather than
- * re-imported to keep the rpc-handlers module's import graph narrow —
- * no `bun:sqlite` / `Database` types cross from the worker file).
+ * The planctl verbs the reconciler dispatches. Mirrors the `Verb` union
+ * in `src/autopilot-worker.ts` (kept local rather than re-imported to
+ * keep the rpc-handlers module's import graph narrow — no `bun:sqlite` /
+ * `Database` types cross from the worker file).
  */
-export type RetryDispatchVerb = "work" | "close" | "approve";
+export type RetryDispatchVerb = "work" | "close";
 
-const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>([
-  "work",
-  "close",
-  "approve",
-]);
+const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>(["work", "close"]);
 
 /** `retry_dispatch` wire params. */
 export interface RetryDispatchParams {

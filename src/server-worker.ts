@@ -227,15 +227,15 @@ export interface SetAutopilotPausedResultMessage {
  * Wire shape is the SPLIT pair, not the composite key, so main's mint
  * site stays a pure forward: insert with `verb` / `id` exactly as
  * received. Validation is the handler's job (verb is one of
- * `work` / `close` / `approve`; id is a non-empty token).
+ * `work` / `close`; id is a non-empty token).
  */
 export interface RetryDispatchRequestMessage {
   kind: "retry-dispatch-request";
   id: string;
   /** The dispatch verb half of the failed `${verb}::${id}` key. */
-  verb: "work" | "close" | "approve";
+  verb: "work" | "close";
   /**
-   * The planctl id (epic id for `close`; task id for `work` / `approve`).
+   * The planctl id (epic id for `close`; task id for `work`).
    * Validated by the handler to be a non-empty string; main treats it as
    * an opaque token to mint into the `DispatchCleared` event payload.
    */
@@ -1278,7 +1278,7 @@ export interface ReplayBridge {
    * task .4.
    */
   retryDispatch(
-    verb: "work" | "close" | "approve",
+    verb: "work" | "close",
     dispatch_id: string,
   ): Promise<{
     ok: boolean;
@@ -2833,7 +2833,7 @@ function main(): void {
       });
     },
     retryDispatch(
-      verb: "work" | "close" | "approve",
+      verb: "work" | "close",
       dispatch_id: string,
     ): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
