@@ -46,5 +46,5 @@ confirm the charter + empty ledger drive a sane first round — the real-data te
 - [ ] Committed to the ~/docs repo
 
 ## Done summary
-
+Seeded performance sitter charter.md from fn-729 + chain (Goals/Understanding/End-state=ongoing/Heuristics/Sitter facts incl 11 categories + key/fingerprint scheme), initialized empty processed.jsonl, and wrote README.md mirroring keeper-reliability. Committed f0b5cb3 to ~/docs.
 ## Evidence
