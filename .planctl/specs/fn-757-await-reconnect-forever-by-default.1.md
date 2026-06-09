@@ -115,5 +115,5 @@ default-off behavior. This change only stops await from passing a policy.
 - [ ] `bun test test/await.test.ts` green; `subscribe-bounce-soak.ts` flat RSS.
 
 ## Done summary
-
+Made keeper await reconnect-forever the default for every condition; removed AWAIT_GIVE_UP_MS/POLICY and added opt-in --connect-timeout <dur> (reuses parseDurationMs) to re-arm the bounded reason=unreachable path, with now paired to the policy and server-up rejected at parse time. Rewrote the two unreachable tests to opt in, added never-connected/post-paint-drop/default-path tests (79 pass), and reconciled HELP/README/SKILL docs. Soak flat RSS at 4000 cycles.
 ## Evidence
