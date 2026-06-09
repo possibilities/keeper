@@ -594,8 +594,8 @@ test("limited line indent + label-padding align under the chip", () => {
   // The `limited` literal lands at the chip's `[` column.
   expect(rl.indexOf("limited")).toBe(bracket);
   // `limited` is 7 chars (tied with `session` for widest), padEnd(7) leaves
-  // zero trailing spaces; one separator space precedes the lift body.
-  expect(rl).toBe(`${" ".repeat(bracket)}limited lifts in 5m`);
+  // zero trailing spaces; a ` · ` separator precedes the lift body.
+  expect(rl).toBe(`${" ".repeat(bracket)}limited · lifts in 5m`);
   // `session` (7) is the widest, padEnd(7) → zero trailing; `week` (4) → 3.
   const session = bodyLineExact(lines, "session") as string;
   expect(session.startsWith(`${" ".repeat(bracket)}session [`)).toBe(true);

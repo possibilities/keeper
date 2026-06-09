@@ -358,7 +358,7 @@ function bar(v: unknown): string {
  *                    session  [█████░░░░░░░░░░░░░░░░░░░░░░░░░]  16% 29m
  *                    week     [███████████░░░░░░░░░░░░░░░░░░░]  36% 4d 5h
  *                    sonnet   [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░]   8% 4d 5h
- *                    limited  lifts in 1h 2m
+ *                    limited  · lifts in 1h 2m
  *                    stale    17m
  *
  * Body indent equals `wId + 1` so labels line up under the `[` of the
@@ -642,13 +642,15 @@ export function renderRowLines(
     return rel === "" ? head : `${head} ${rel}`;
   };
 
-  // The `limited` line has no bar and no pct — just `label rel`. Indent
-  // and label-padding match the quota body lines so the relative time
-  // aligns under the quota cells' relative times. The `rel` body is
-  // `lifts in <rel>` (future lift) or `lifts now` (within the ±30s gap)
-  // — composed in the cell mapping above; a past lift omits the line.
+  // The `limited` line has no bar and no pct — just `label · rel`. Indent
+  // and label-padding match the quota body lines; a middot separates the
+  // label from the lift body (the line carries no bar/pct column, so the
+  // separator reads as "label, then its value" rather than a bare gap).
+  // The `rel` body is `lifts in <rel>` (future lift) or `lifts now`
+  // (within the ±30s gap) — composed in the cell mapping above; a past
+  // lift omits the line.
   const renderLimited = (rel: string): string =>
-    `${indent}${"limited".padEnd(wLabel, " ")} ${rel}`;
+    `${indent}${"limited".padEnd(wLabel, " ")} · ${rel}`;
 
   // The stale line mirrors the `limited` line — `label age` with the
   // same indent + label-padding so it column-aligns under the other
