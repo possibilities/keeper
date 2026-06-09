@@ -7,7 +7,9 @@ description: >-
   job state ("wait for the other agents to finish", "wait until everyone
   else is done working", "block until no one else is editing the repo"),
   own-session monitor state ("wait until my dev server / script / build
-  watcher finishes", "block until my background task is done"), or
+  watcher finishes", "block until my background task is done"), daemon
+  readiness ("wait until keeper is up", "block until keeperd is back /
+  serving / reachable"), or
   any AND-combination of these — then run a follow-up action. Use when the
   user says "wait for", "wait until", "block until", "hold off until", "do
   X when Y is done", "do X after fn-N finishes", "review when fn-… is
@@ -72,6 +74,7 @@ the literal `and` token.
 | `unblocked <id>` | A planctl id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
+| `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot. Reconnects FOREVER (opts out of the give-up deadline), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition (parse-time usage error). | `server-up` |
 | `monitor-running <selector>` | Any "wait until my dev server / script / background task / build watcher finishes" phrasing. Scoped to THIS session's own monitors. **Takes one selector token:** `cmd:<full command>`, `kind:<monitor\|bash-bg\|ambient>`, or a bare token (= `cmd:<token>`). Exact match, never substring. | `monitor-running cmd:bun run dev` |
 
 | Field | How to derive | Example |
@@ -94,10 +97,12 @@ invocation, not an ambiguity.
 ## Step 1 — Pre-check planctl targets are on-board (planctl conditions only)
 
 This pre-check applies **only to `complete` / `unblocked`**. The
-`git-clean`, `agents-idle`, and `monitor-running` conditions have **no
-`planctl show` pre-check** — they read live keeper projections that always
-exist, so there is nothing to refuse upfront here; skip straight to step 2
-for them.
+`git-clean`, `agents-idle`, `server-up`, and `monitor-running` conditions
+have **no `planctl show` pre-check** — they read live keeper projections (or,
+for `server-up`, just wait for the daemon to serve), so there is nothing to
+refuse upfront here; skip straight to step 2 for them. `server-up` in
+particular deliberately blocks while keeperd is down, so a "is it on board?"
+check would be self-defeating.
 
 **`monitor-running` self-refuses at arm time.** If the selector matches no
 running monitor in this session, `keeper await` emits `failed
@@ -146,6 +151,7 @@ Examples of the `command` field:
 - `keeper await complete fn-643-keeper-hook-dead-letters.4`
 - `keeper await git-clean`
 - `keeper await agents-idle`
+- `keeper await server-up`
 - `keeper await monitor-running cmd:bun run dev`
 - `keeper await git-clean and agents-idle`
 
@@ -179,8 +185,8 @@ aggregate:
 [keeper-await] met target=<id> kind=<…> condition=<…> detail=<…>
 
 # single git / jobs condition
-[keeper-await] armed condition=<git-clean|agents-idle> state=<…>
-[keeper-await] met condition=<git-clean|agents-idle> detail=<…>
+[keeper-await] armed condition=<git-clean|agents-idle|server-up> state=<…>
+[keeper-await] met condition=<git-clean|agents-idle|server-up> detail=<…>
 
 # single monitor-running condition (carries the selector)
 [keeper-await] armed condition=monitor-running selector=<…> state=<…>
@@ -210,7 +216,8 @@ Reasons + exit codes:
 | `failed reason=not-found …` | 1 | Planctl id absent at startup (pre-check missed it). | Tell the user, do NOT run the follow-up. |
 | `failed reason=no-git-root …` | 1 | A `git-clean` / `agents-idle` condition was requested but the cwd isn't inside a git worktree. | Tell the user; the wait can't be evaluated. Do NOT run the follow-up. |
 | `failed reason=no-match …` | 1 | A `monitor-running` selector matched no running monitor in this session at arm time (likely armed the same turn the monitor launched, or the selector is wrong). | Tell the user nothing matched; suggest re-arming after the monitor shows in `keeper jobs`, or fixing the selector. Do NOT run the follow-up. |
-| `failed reason=connect …` | 1 | Could not connect to keeperd. | Tell the user the daemon is unreachable. |
+| `failed reason=connect …` | 1 | A terminal query-shape error keeperd rejected (a malformed/unrecoverable query). | Tell the user the query was rejected; the wait can't proceed. |
+| `failed reason=unreachable …` | 1 | keeperd stayed unreachable past the give-up deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=`. | Tell the user the daemon is down. To block THROUGH the bounce: `keeper await server-up` first, then re-arm this command once it's back. Do NOT run the follow-up. |
 | `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
 | `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit. | Tell the user it timed out; ask whether to extend or move on. |
 | `failed reason=stuck …` | 5 | Under `--fail-on-stuck` only. | Tell the user the target is stuck; surface the verdict. |
@@ -265,6 +272,20 @@ how they want to proceed — do NOT silently run the follow-up.
    for other agents idle then test", persistent: true })`.
 3. On `met` → run the tests.
 
+### Wait until keeper is back up (server-up)
+
+> User: "Wait until keeper is back up, then show me the board."
+
+1. No pre-check — `server-up` deliberately blocks WHILE keeperd is down, so
+   a board pre-check would be self-defeating. Skip step 1.
+2. `Monitor({ command: "keeper await server-up", description: "wait for
+   keeperd to serve then show board", persistent: true })`.
+3. On `[keeper-await] met condition=server-up …` → run the follow-up.
+
+This is also the recovery path when a plain `keeper await <id>` exits
+`failed reason=unreachable`: arm `keeper await server-up` to block through
+the bounce, then re-arm the original wait once it fires `met`.
+
 ### Wait until my background script finishes (monitor-running)
 
 > User: "Ping me when my dev server stops."
@@ -301,8 +322,13 @@ how they want to proceed — do NOT silently run the follow-up.
 - Do not wire a planctl Monitor without the `planctl show` pre-check — a
   doomed Monitor that immediately exits `failed reason=not-found` is bad
   UX.
-- Do not pass an id to `git-clean` / `agents-idle` — they're nullary and
-  project-scoped to the cwd's git root.
+- Do not pass an id to `git-clean` / `agents-idle` / `server-up` — they're
+  nullary (`git-clean` / `agents-idle` are project-scoped to the cwd's git
+  root; `server-up` is daemon-scoped).
+- Do not AND `server-up` with another condition (`server-up and …`, either
+  order) — it's mutually exclusive and rejected at parse time. To both wait
+  for the daemon AND a board state, run `server-up` first, then re-arm the
+  board wait once it fires `met`.
 - Do not arm `monitor-running` in the SAME turn you launch the background
   task — the own-session monitor list is snapshotted on Stop, so a
   same-turn arm races the snapshot and trips `failed reason=no-match`.

@@ -647,6 +647,52 @@ test("parseAwaitArgs: no positionals → usage error", () => {
 });
 
 // ---------------------------------------------------------------------------
+// parseAwaitArgs — fn-750.2 server-up (nullary, not-ANDable)
+// ---------------------------------------------------------------------------
+
+test("parseAwaitArgs: server-up takes no id", () => {
+  const r = parseAwaitArgs(["server-up"]);
+  expect(r.ok).toBe(true);
+  if (!r.ok) {
+    return;
+  }
+  expect(r.args.segments).toHaveLength(1);
+  expect(r.args.segments[0]?.condition).toBe("server-up");
+});
+
+test("parseAwaitArgs: server-up with a stray id → usage error", () => {
+  const r = parseAwaitArgs(["server-up", "fn-1-foo"]);
+  expect(r.ok).toBe(false);
+});
+
+test("parseAwaitArgs: server-up AND another condition → usage error (either order)", () => {
+  const left = parseAwaitArgs(["server-up", "and", "git-clean"]);
+  expect(left.ok).toBe(false);
+  if (!left.ok) {
+    expect(left.message).toContain("cannot be combined");
+  }
+
+  const right = parseAwaitArgs(["git-clean", "and", "server-up"]);
+  expect(right.ok).toBe(false);
+  if (!right.ok) {
+    expect(right.message).toContain("cannot be combined");
+  }
+
+  const withPlanctl = parseAwaitArgs([
+    "complete",
+    "fn-1-foo.1",
+    "and",
+    "server-up",
+  ]);
+  expect(withPlanctl.ok).toBe(false);
+});
+
+test("parseAwaitArgs: duplicate server-up → usage error", () => {
+  const r = parseAwaitArgs(["server-up", "and", "server-up"]);
+  expect(r.ok).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
 // parseMonitorSelector + monitor-running arg arity (fn-718, T3)
 // ---------------------------------------------------------------------------
 
@@ -1352,6 +1398,126 @@ test("onFatal: connection-fatal error frame → failed reason=connect exit 1 (no
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();
   expect(failed).toContain("reason=connect");
+});
+
+// ===========================================================================
+// fn-750.2: server-up (first-paint met, give-up-exempt) + reason=unreachable
+// ===========================================================================
+
+test("server-up: opens a readiness subscribe and fires met on first snapshot", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(argsFor([{ condition: "server-up" }]), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  // server-up rides a full readiness subscribe (six collections), so the
+  // initial frame batch is the six queries — NOT a bare git/jobs single.
+  const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
+  expect(outbound.length).toBe(6);
+
+  // No terminal before the first snapshot — it blocks.
+  expect(h.exitCode).toBeNull();
+
+  // First paint == the daemon is serving → armed + met (exit 0).
+  deliverFiveEmpty(sock, idPrefix);
+
+  const lines = h.stdout.join("");
+  expect(lines).toContain("[keeper-await] armed");
+  expect(lines).toContain("[keeper-await] met");
+  expect(lines).toContain("condition=server-up");
+  expect(h.exitCode).toBe(0);
+});
+
+test("server-up: --timeout still fires failed reason=timeout exit 3", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+
+  await runAndCatch(
+    argsFor([{ condition: "server-up" }], { timeoutMs: 5000 }),
+    h.deps,
+  );
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // No snapshot ever lands; the --timeout deadline trips.
+  h.fireDeadline();
+
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=timeout");
+  expect(h.exitCode).toBe(3);
+});
+
+test("unreachable: give-up deadline → failed reason=unreachable + advice exit 1", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  // Inject a controllable clock the give-up deadline measures against. The
+  // driver arms the unpainted anchor at `now()` on subscribe start; we never
+  // deliver a frame, advance past the 30s deadline, then re-iterate the
+  // reconnect loop (closeFromServer) so the loop-top `checkGiveUp` fires.
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  // Still connecting/unpainted, before the deadline → no terminal.
+  expect(h.exitCode).toBeNull();
+
+  // Advance the clock past the continuous-unpainted deadline, then bounce
+  // the connection so `connectWithRetry` re-iterates and checks the deadline.
+  clock = 31_000;
+  sock.closeFromServer();
+  // Let the reconnect microtask settle so the loop-top checkGiveUp runs.
+  await new Promise<void>((r) => setTimeout(r, 0));
+
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeDefined();
+  expect(failed).toContain("reason=unreachable");
+  expect(failed).toContain("advice=");
+  expect(failed).not.toContain("reason=connect");
+  expect(h.exitCode).toBe(1);
+});
+
+test("unreachable: emitted once across handles (terminating latch dedups)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  clock = 31_000;
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+  // A second bounce after we've already given up must not re-emit.
+  sock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+
+  const failedLines = h.stdout.filter((l) =>
+    l.includes("[keeper-await] failed"),
+  );
+  expect(failedLines).toHaveLength(1);
+  expect(failedLines[0]).toContain("reason=unreachable");
+  expect(h.exitCode).toBe(1);
 });
 
 // ===========================================================================

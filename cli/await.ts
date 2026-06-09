@@ -15,10 +15,17 @@
  *
  * Exit codes:
  *   0  met
- *   1  not-found / usage / connection fatal
+ *   1  not-found / usage / connection fatal / unreachable
  *   3  timeout (SIGTERM or our own --timeout deadline)
  *   4  deleted (was on board, vanished, re-query miss)
  *   5  stuck under --fail-on-stuck (default: keep waiting)
+ *
+ * `reason=unreachable` (exit 1) is distinct from `reason=connect`: connect
+ * is a terminal query-shape error keeperd rejected; unreachable is the
+ * give-up deadline firing because keeperd never painted a first snapshot
+ * (down / mid-bounce / half-up). The `keeper await server-up` condition
+ * opts OUT of the give-up deadline (reconnect-forever) so a watching agent
+ * can block through a bounce and re-arm.
  *
  * Authority for both "on board" and "verdict" is `subscribeReadiness`
  * (board-scoped). Tasks live embedded inside epics; the scope-exempt
@@ -55,6 +62,7 @@ import {
 } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
 import type { MonitorEntry } from "../src/derivers";
+import type { GiveUpPolicy } from "../src/readiness-client";
 import {
   type ConnectFactory,
   type FatalError,
@@ -64,6 +72,24 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import type { Epic, GitStatus, Job } from "../src/types";
+
+// ---------------------------------------------------------------------------
+// Give-up deadline (fn-750.2)
+// ---------------------------------------------------------------------------
+
+/**
+ * Continuous-unpainted give-up deadline for `keeper await` (fn-750.2). When
+ * no first snapshot lands within this wall-clock window — never-connected OR
+ * was-connected-then-lost — the subscribe driver tears down and fires
+ * `onFatal({ code: "unreachable" })`, which we render as `failed
+ * reason=unreachable … advice=<…>` exit 1 instead of hanging forever. The
+ * `server-up` condition opts OUT of this (it's the escape hatch for a slow
+ * cold boot — reconnect-forever).
+ */
+const AWAIT_GIVE_UP_MS = 30_000;
+
+/** The give-up policy `keeper await` passes to its give-up-eligible streams. */
+const AWAIT_GIVE_UP_POLICY: GiveUpPolicy = { deadlineMs: AWAIT_GIVE_UP_MS };
 
 // ---------------------------------------------------------------------------
 // Help text
@@ -91,6 +117,12 @@ Conditions:
   agents-idle     No OTHER session (job_id != CLAUDE_CODE_SESSION_ID) with
                   state=working has a cwd inside the cwd's git root. Takes
                   no id.
+  server-up       Block until keeperd is reachable and serving, then fire
+                  met on the first snapshot. Reconnects FOREVER (opts out of
+                  the give-up deadline) so it survives a daemon bounce — the
+                  escape hatch for a slow cold boot. Takes no id, has no
+                  planctl pre-check, and CANNOT be ANDed with another
+                  condition.
   monitor-running <selector>
                   Block until the matching background monitor in YOUR OWN
                   session (job_id == CLAUDE_CODE_SESSION_ID) is no longer
@@ -123,8 +155,19 @@ Flags:
   --sock <path>          Socket override ($KEEPER_SOCK / default).
   --help                 Show this help.
 
+Reasons (failed lines):
+  not-found  planctl id absent at startup
+  no-match   monitor-running selector matched nothing
+  no-git-root  cwd isn't inside a git worktree
+  connect    a terminal (unrecoverable) query-shape error from keeperd
+  unreachable  keeperd stayed unreachable past the give-up deadline; wait
+               with 'keeper await server-up' then re-arm this command
+  deleted    planctl target was on board then vanished
+  timeout    --timeout / Monitor wall-clock deadline hit
+  stuck      job-rejected / dep-dangling (only under --fail-on-stuck)
+
 Exit codes:
-  0 met   1 not-found/no-match/usage/connect   3 timeout   4 deleted   5 stuck
+  0 met   1 not-found/no-match/usage/connect/unreachable   3 timeout   4 deleted   5 stuck
 `;
 
 // ---------------------------------------------------------------------------
@@ -187,6 +230,7 @@ export type ConditionSegment =
   | { condition: PlanctlCondition; target: AwaitTarget }
   | { condition: "git-clean" }
   | { condition: "agents-idle" }
+  | { condition: "server-up" }
   | { condition: "monitor-running"; selector: MonitorSelector; raw: string };
 
 export interface ParsedArgs {
@@ -209,6 +253,7 @@ const PLANCTL_CONDITIONS: ReadonlySet<string> = new Set([
 const NULLARY_CONDITIONS: ReadonlySet<string> = new Set([
   "git-clean",
   "agents-idle",
+  "server-up",
 ]);
 /** Conditions that take EXACTLY ONE selector token (a third arity bucket). */
 const SELECTOR_CONDITIONS: ReadonlySet<string> = new Set(["monitor-running"]);
@@ -392,7 +437,9 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
         return { ok: false, message: `duplicate condition '${condRaw}'` };
       }
       seen.add(condRaw);
-      segments.push({ condition: condRaw as "git-clean" | "agents-idle" });
+      segments.push({
+        condition: condRaw as "git-clean" | "agents-idle" | "server-up",
+      });
     } else if (SELECTOR_CONDITIONS.has(condRaw)) {
       if (rest.length !== 1) {
         return {
@@ -421,9 +468,25 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     } else {
       return {
         ok: false,
-        message: `unknown condition '${condRaw}' (expected complete, unblocked, git-clean, agents-idle, monitor-running)`,
+        message: `unknown condition '${condRaw}' (expected complete, unblocked, git-clean, agents-idle, server-up, monitor-running)`,
       };
     }
+  }
+
+  // `server-up` is mutually exclusive with every other condition: it has
+  // its own give-up-exempt reconnect-forever subscribe path and fires on
+  // first paint, so ANDing it with a board/git/jobs condition is incoherent
+  // (and would drag a give-up-bearing handle alongside a give-up-exempt one).
+  // The existing dup-guard only blocks IDENTICAL conditions; this is net-new
+  // exclusivity logic. Rejected at parse time either ordering.
+  if (
+    segments.length > 1 &&
+    segments.some((s) => s.condition === "server-up")
+  ) {
+    return {
+      ok: false,
+      message: "condition 'server-up' cannot be combined with 'and'",
+    };
   }
 
   let timeoutMs: number | null = null;
@@ -502,6 +565,15 @@ export interface RunDeps {
    * self-exclusion becomes a no-op).
    */
   ownSessionId: string | null;
+  /**
+   * Optional injectable clock (unix ms) forwarded to the give-up-eligible
+   * subscribe handles (fn-750.2). The continuous-unpainted give-up deadline
+   * is measured against THIS, so the fake-timer test harness can drive the
+   * `reason=unreachable` path deterministically. Production omits it (the
+   * helper defaults to `Date.now`). NOT forwarded to the `server-up` stream
+   * — that one carries no give-up policy.
+   */
+  now?: () => number;
 }
 
 /**
@@ -568,7 +640,25 @@ interface MonitorSlotState {
   lastVerdictPhrase: string | null;
 }
 
-type SlotState = PlanctlSlotState | GitJobSlotState | MonitorSlotState;
+/**
+ * Per-server-up-slot mutable state (fn-750.2). The minimal nullary slot:
+ * it carries no rows and no pure evaluator — `met` latches the instant the
+ * first readiness snapshot lands (first-paint == "the daemon is serving").
+ * Always the SOLE slot (parse rejects ANDing it), so the AND machinery is
+ * trivially satisfied once it's met.
+ */
+interface ServerUpSlotState {
+  readonly kind: "server-up";
+  met: boolean;
+  lastEval: AwaitState | null;
+  lastVerdictPhrase: string | null;
+}
+
+type SlotState =
+  | PlanctlSlotState
+  | GitJobSlotState
+  | MonitorSlotState
+  | ServerUpSlotState;
 
 interface RunnerState {
   terminating: boolean;
@@ -608,6 +698,12 @@ export async function runAwait(
   const hasMonitorRunning = args.segments.some(
     (s) => s.condition === "monitor-running",
   );
+  // `server-up` (fn-750.2) is a dedicated minimal subscribe: it needs a
+  // CONNECTION but NO git root / planctl / jobs rows, and it fires `met` on
+  // first paint. It's always the SOLE segment (parse rejects ANDing it), so
+  // it doesn't combine with any other stream. Crucially it opts OUT of the
+  // give-up deadline — reconnect-forever — so it survives a daemon bounce.
+  const hasServerUp = args.segments.some((s) => s.condition === "server-up");
   // `monitor-running` reads jobs rows but is own-session-scoped — it needs
   // NO git root (unlike `agents-idle`, which scopes by cwd containment).
   const needsRoot = hasGitClean || hasAgentsIdle;
@@ -619,6 +715,10 @@ export async function runAwait(
   const openReadiness = hasPlanctl;
   const openGitCollection = hasGitClean && !hasPlanctl;
   const openJobsCollection = needsJobs && !hasPlanctl;
+  // `server-up` gets its OWN minimal readiness subscribe (give-up-exempt) —
+  // NOT bolted onto `openReadiness`, which would drag in the planctl
+  // re-query machinery and a give-up policy.
+  const openServerUp = hasServerUp;
 
   // Build the latched slots in segment order (the line render walks them).
   const slots: SlotState[] = args.segments.map((seg): SlotState => {
@@ -666,9 +766,17 @@ export async function runAwait(
     readiness: !openReadiness,
     git: !openGitCollection,
     jobs: !openJobsCollection,
+    // `server-up` (fn-750.2): its own paint flag, off until the dedicated
+    // give-up-exempt readiness stream first-paints. Folded into the same
+    // `allPainted()` AND so `server-up`'s single slot only `met`s once the
+    // daemon is actually serving.
+    serverUp: !openServerUp,
   };
   const allPainted = (): boolean =>
-    paintGate.readiness && paintGate.git && paintGate.jobs;
+    paintGate.readiness &&
+    paintGate.git &&
+    paintGate.jobs &&
+    paintGate.serverUp;
 
   const state: RunnerState = {
     terminating: false,
@@ -685,6 +793,7 @@ export async function runAwait(
     readiness: true,
     git: true,
     jobs: true,
+    serverUp: true,
   };
 
   let readinessHandle: ReadinessClientHandle | null = null;
@@ -1188,6 +1297,16 @@ export async function runAwait(
         logProgress(slot, result);
         slot.met = result.kind === "met";
         evals[i] = result;
+      } else if (slot.kind === "server-up") {
+        // `server-up` (fn-750.2): no rows, no pure evaluator. `evaluate()`
+        // only runs once `allPainted()` clears, which for server-up means
+        // the daemon served its first snapshot — so reaching here IS the
+        // condition. Latch `met` unconditionally.
+        const result: AwaitState = { kind: "met", detail: "serving" };
+        slot.lastEval = result;
+        logProgress(slot, result);
+        slot.met = true;
+        evals[i] = result;
       }
     }
 
@@ -1309,11 +1428,26 @@ export async function runAwait(
     void evaluate();
   };
 
+  // `server-up` (fn-750.2): first-paint IS the signal. We deliberately read
+  // NO rows off the snapshot — the daemon serving its first composed
+  // readiness frame is the whole condition. Flip the paint flag and let
+  // `evaluate()` latch the slot `met`.
+  const onServerUpSnapshot = (_snap: ReadinessClientSnapshot): void => {
+    paintGate.serverUp = true;
+    void evaluate();
+  };
+
   const onLifecycle =
-    (stream: "readiness" | "git" | "jobs") =>
+    (stream: "readiness" | "git" | "jobs" | "serverUp") =>
     (event: string): void => {
       if (event === "disconnected") {
         reconnectStable[stream] = false;
+        // `server-up` (fn-750.2): a disconnect re-closes the paint gate so
+        // a reconnect-forever stream re-fires `met` only when the daemon is
+        // serving AGAIN. Mirrors the readiness/git/jobs gate behavior.
+        if (stream === "serverUp") {
+          paintGate.serverUp = false;
+        }
         if (stream === "readiness") {
           for (const slot of slots) {
             if (slot.kind === "planctl") {
@@ -1326,7 +1460,22 @@ export async function runAwait(
 
   // Custom onFatal — the helper's default `process.exit(1)` would
   // bypass the terminal-line protocol. Route to a proper terminal line.
+  // fn-750.2: the give-up driver fires `onFatal({ code: "unreachable" })`
+  // when keeperd stays unpainted past the deadline. Render that as a
+  // distinct `reason=unreachable` terminal (NOT `reason=connect`, which is
+  // a query-shape rejection) carrying retry `advice`. Both routes share the
+  // `emitTerminal` `terminating` latch, so this dedups across the up-to-three
+  // give-up-eligible handles and preempts the reconnect-blip / `deleted`
+  // swallow (whichever fires first wins, the rest no-op).
   const onFatal = (err: FatalError): void => {
+    if (err.code === "unreachable") {
+      emitTerminal("failed", 1, {
+        reason: "unreachable",
+        advice: "wait with 'keeper await server-up' then re-arm this command",
+        message: err.message,
+      });
+      return;
+    }
     emitTerminal("failed", 1, {
       reason: "connect",
       code: err.code,
@@ -1380,6 +1529,14 @@ export async function runAwait(
     return state.result;
   }
 
+  // The give-up policy + injected clock the give-up-eligible streams carry
+  // (fn-750.2). `server-up` opts OUT — it's reconnect-forever — so it never
+  // sees either. The `now` clock is test-only injection; production omits it.
+  const giveUpExtras = {
+    giveUpPolicy: AWAIT_GIVE_UP_POLICY,
+    ...(deps.now === undefined ? {} : { now: deps.now }),
+  };
+
   // Open ONLY the subscriptions the active conditions need.
   if (openReadiness) {
     readinessHandle = subscribeReadiness({
@@ -1388,6 +1545,7 @@ export async function runAwait(
       onSnapshot: onReadinessSnapshot,
       onLifecycle: onLifecycle("readiness"),
       onFatal,
+      ...giveUpExtras,
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
   }
@@ -1399,6 +1557,7 @@ export async function runAwait(
       onRows: onGitRows,
       onLifecycle: onLifecycle("git"),
       onFatal,
+      ...giveUpExtras,
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
   }
@@ -1409,6 +1568,23 @@ export async function runAwait(
       collection: "jobs",
       onRows: onJobRows,
       onLifecycle: onLifecycle("jobs"),
+      onFatal,
+      ...giveUpExtras,
+      ...(deps.connect === undefined ? {} : { connect: deps.connect }),
+    });
+  }
+  // `server-up` (fn-750.2): its OWN minimal readiness subscribe that opts OUT
+  // of give-up (reconnect-forever — the slow-cold-boot escape hatch). We
+  // don't read any rows off the snapshot; the first `onSnapshot` IS the
+  // signal ("the daemon is serving"), so `onServerUpSnapshot` flips the
+  // paint flag and `evaluate()` latches `met` on first paint. NO give-up
+  // extras and NO planctl re-query machinery.
+  if (openServerUp) {
+    readinessHandle = subscribeReadiness({
+      sockPath: args.sock,
+      idPrefix: `await-${process.pid}`,
+      onSnapshot: onServerUpSnapshot,
+      onLifecycle: onLifecycle("serverUp"),
       onFatal,
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });

@@ -583,7 +583,9 @@ watches the `git` worktree collection; `keeper usage` watches the
 wait-for-condition client (emits a Monitor-shaped `armed`/`met`/`failed`
 event stream on stdout and exits when its condition holds — a planctl
 epic/task going `complete` or `unblocked`, the cwd's repo going
-`git-clean`, other agents going `agents-idle`, the caller's own background
+`git-clean`, other agents going `agents-idle`, keeperd coming back up via
+`server-up` (reconnect-forever; the escape hatch for a slow cold boot),
+the caller's own background
 monitor finishing via `monitor-running <selector>`, or any AND-combination
 like `keeper await git-clean and agents-idle`); `keeper approve` is the
 RPC client (single-shot `rpc` →
@@ -948,19 +950,24 @@ collapses to plain stream output. Run any of them with
   ```
 
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions
-  + AND grammar widened in fn-713, `monitor-running` added in fn-718).
-  Non-TUI: emits a Monitor-shaped event
+  + AND grammar widened in fn-713, `monitor-running` added in fn-718,
+  `server-up` + `reason=unreachable` added in fn-750.2). Non-TUI: emits a
+  Monitor-shaped event
   stream on stdout — exactly one `[keeper-await] armed …` line after the
   on-board check, then exactly one terminal `[keeper-await] met …` or
   `[keeper-await] failed …` line — and exits when its condition holds.
-  Five conditions: `complete <id>` (epic/task pops off the board) and
+  Six conditions: `complete <id>` (epic/task pops off the board) and
   `unblocked <id>` (workable now) are planctl-id forms auto-detecting
   epic vs task by the `.N` suffix; `git-clean` blocks until the cwd's git
   root has `dirty_count=0 AND orphaned_count=0` (no `git_status` row for
   the root counts as clean); `agents-idle` blocks until no OTHER session
   (`job_id != CLAUDE_CODE_SESSION_ID`) with `state=working` has a cwd
-  inside the cwd's git root; `monitor-running <selector>` blocks until the
-  matching background monitor in the CALLER'S OWN session
+  inside the cwd's git root; `server-up` blocks until keeperd is reachable
+  and serving, firing `met` on the first snapshot — it reconnects FOREVER
+  (opts out of the give-up deadline) so it survives a daemon bounce, takes
+  no id, has no planctl pre-check, and CANNOT be ANDed with another
+  condition (rejected at parse time); `monitor-running <selector>` blocks
+  until the matching background monitor in the CALLER'S OWN session
   (`job_id == CLAUDE_CODE_SESSION_ID`) is no longer running — the selector
   is `cmd:<full command>`, `kind:<monitor|bash-bg|ambient>`, or a bare
   token (= `cmd:<token>`), exact-matched against the v51 `jobs.monitors`
@@ -972,13 +979,19 @@ collapses to plain stream output. Run any of them with
   triggered, glitch-free); only the subscriptions a condition needs are
   opened. "unblocked" deliberately excludes autopilot's
   `single-task-per-epic` / `single-task-per-root` concurrency mutexes
-  (every other blocker still blocks). Exit codes: 0 met, 1
-  not-found/`no-match`/usage/connection/`no-git-root`, 3 timeout (SIGTERM),
-  4 deleted, 5 stuck (only under `--fail-on-stuck`).
+  (every other blocker still blocks). Every give-up-eligible subscribe
+  (everything except `server-up`) carries a bounded continuous-unpainted
+  give-up (fn-750.1/.2): a daemon down / mid-bounce / half-up past the
+  deadline fires `failed reason=unreachable … advice=<…>` exit 1 instead of
+  hanging forever — distinct from `reason=connect` (a query-shape rejection
+  keeperd returned). Exit codes: 0 met, 1
+  not-found/`no-match`/usage/connection/`no-git-root`/`unreachable`, 3
+  timeout (SIGTERM), 4 deleted, 5 stuck (only under `--fail-on-stuck`).
 
   ```sh
   keeper await complete fn-646-keeper-cli-opentui-port.1   # task done
   keeper await git-clean                                   # repo clean
+  keeper await server-up                                   # daemon serving
   keeper await monitor-running cmd:bun run dev             # my dev server done
   keeper await git-clean and agents-idle                   # both, ANDed
   ```
