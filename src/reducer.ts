@@ -1599,13 +1599,39 @@ function findExplicitAttributions(
   // before the JSON probe. The reducer's BEGIN IMMEDIATE bounds this scan
   // to the writer lock window — kept narrow by the per-file iteration.
   //
-  // fn-717.2 cold-blob relocation — the TWO-ARM resolution. This scan is the
-  // ONE reducer read of the blob VALUE that is NOT a plain
-  // `COALESCE(events.data, event_blobs.data)` (the drain SELECT + the
-  // commit-trailer reads are), because COALESCE-ing the `json_extract`
-  // predicate would defeat the expression index `idx_events_tool_attr` (defined
-  // ON `json_extract(data, '$.tool_input.file_path')`) and regress this from a
-  // sub-ms covering SEEK to a multi-second full scan of every PostToolUse row.
+  // fn-717.2 cold-blob relocation — the TWO-ARM resolution. Read-contract
+  // inventory of EVERY fold-path read of the blob VALUE (`events.data`), and
+  // why each is relocation-safe (every cold blob must resolve byte-identically
+  // on a from-scratch re-fold of a compacted DB):
+  //   - This two-arm mutation-discharge scan (here, ARM A `events.data` +
+  //     ARM B `event_blobs.data`): the deliberate, index-preserving exception.
+  //     It is NOT a plain `COALESCE(events.data, event_blobs.data)` because
+  //     COALESCE-ing the `json_extract` predicate would defeat the expression
+  //     index `idx_events_tool_attr` (defined ON
+  //     `json_extract(data, '$.tool_input.file_path')`) and regress this from a
+  //     sub-ms covering SEEK to a multi-second full scan of every PostToolUse
+  //     row. The two arms partition the rows (ARM B's `e.data IS NULL` guard)
+  //     and together equal the COALESCE'd scan — see the per-arm notes below.
+  //   - The drain SELECT (`drain`, ~8361): plain
+  //     `COALESCE(events.data, event_blobs.data) AS data`.
+  //   - The two Commit-trailer reads (`loadCommitTrailerInvocations` ~5689,
+  //     `loadCommitTrailerClassifications` ~5761): plain COALESCE; the WHERE
+  //     `json_extract` probes are uncovered by any index, so COALESCE-ing them
+  //     breaks no index.
+  //   - The two subagent bridge reads (`findBridgePreToolUse`,
+  //     `findPendingPreToolUseForStart` in src/subagent-invocations.ts): fixed
+  //     in fn-764 to COALESCE the SELECT projection over a LEFT JOIN while
+  //     keeping the WHERE on indexed scalars (tool_use_id; session_id/
+  //     tool_name/hook_event) the relocator never nulls.
+  //   - Scalar-only fold reads (e.g. the bash-mutation scan ~1721, which reads
+  //     the generated `bash_mutation_targets`/`bash_mutation_kind` columns, and
+  //     every `SELECT id/ts/session_id/...` that never touches `data`): no blob
+  //     value read, so relocation cannot affect them.
+  //   - Migration/compaction-internal reads are EXEMPT, not fold-path: the
+  //     db.ts reads (4278/4687/5161/5400/5919) run inside `migrate()`, before
+  //     any relocation pass; the compaction.ts reads (209/216/288) are the
+  //     relocator itself, and `countAbsentBlobs` deliberately avoids
+  //     materializing blobs.
   //
   // The subtlety task .1 deferred and .2 had to solve: a relocated mutation
   // blob is STILL needed here on a FROM-SCRATCH RE-FOLD. The discharging Commit

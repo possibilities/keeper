@@ -2251,6 +2251,28 @@ keeperd, and does not depend on the sitter or keeperd being up — the exact cas
 it exists to catch. Silent
 first-run, once-daily all-clear (so silence never means the watchdog died).
 
+**event_blobs read-contract.** The cold-blob compaction relocator (fn-717)
+MOVEs an old event's payload out of `events.data` (NULLing the hot column) and
+into the `event_blobs` side table, keyed by `event_id`. Relocation is lossless
+only because every fold-path read of the blob VALUE resolves it back via
+`COALESCE(events.data, event_blobs.data)` over a `LEFT JOIN event_blobs` — so a
+from-scratch re-fold of a compacted DB reproduces byte-identical projections.
+The contract: **every fold-path read of `events.data` either COALESCEs the
+payload column, or documents why it cannot.** The COALESCE wraps the SELECT
+projection ONLY, never a WHERE/filter column — the relocator never touches the
+indexed scalars folds filter on (`tool_use_id`, `session_id`, `tool_name`,
+`hook_event`, generated `bash_mutation_*` columns), and wrapping them would
+defeat their indexes. The one documented exception is the tool-mutation
+attribution scan in `reducer.ts` (`computeFileAttribution`), whose
+`json_extract` predicate is covered by the `idx_events_tool_attr` /
+`idx_event_blobs_tool_attr` expression indexes; it splits into two
+index-preserving arms (inline `events.data` SEEK + relocated `event_blobs.data`
+join, partitioned by `events.data IS NULL`) that together equal the COALESCE'd
+scan without regressing to a full table scan. Migration-internal reads
+(`migrate()`) and the relocator's own reads (`compaction.ts`) run off the
+fold path and are exempt. The authoritative per-site enumeration lives in the
+comment above that two-arm scan in `src/reducer.ts`.
+
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
 
