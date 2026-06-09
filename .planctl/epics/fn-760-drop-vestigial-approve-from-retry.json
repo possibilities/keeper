@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-760-drop-vestigial-approve-from-retry",
   "bundles": [],
+  "closer_done_at": "2026-06-09T22:40:29.941734Z",
   "created_at": "2026-06-09T22:00:33.374609Z",
   "depends_on_epics": [],
   "id": "fn-760-drop-vestigial-approve-from-retry",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Drop vestigial approve from retry-dispatch verb",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-09T22:00:33.374609Z"
+  "updated_at": "2026-06-09T22:40:29.941734Z"
 }
