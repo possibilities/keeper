@@ -61,5 +61,5 @@ Replace the `_fake_invoke` keeper branch. Prefer the `real_git` marker + `multi_
 - [ ] `uv run pytest tests/`, `uv run ty check`, `uv run ruff check .`, `uv run ruff format .` all clean
 
 ## Done summary
-
+Replaced the keeper find-task-commit subprocess in close-preflight with a native in-process git trailer scan in a new planctl/commit_lookup.py module (verb-agnostic, returns grouped [{repo,shas}] or raises AllReposBrokenError), pruned the dead keeper-py dependency, and rewrote four stale doc-lines present-tense. The close-preflight envelope stays byte-identical for the /plan:close auditor.
 ## Evidence
