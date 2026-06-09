@@ -45,5 +45,5 @@ Phase 5 report uses reconcile's `epic_progress` + the worker's returned commit s
 - [ ] `tests/test_work_skill_consistency.py` green.
 
 ## Done summary
-
+Collapsed the work skill's post-worker tail into a single planctl reconcile call + total switch on the seven verdicts; dropped Phase 3 (orchestrator tests) and the per-task validate --epic; folded delivery cleanliness onto the worker; renumbered report to Phase 3 and refreshed guardrails. Consistency tests green.
 ## Evidence
