@@ -40,15 +40,14 @@ planctl claim <task_id>
 
 **On a typed error** — envelope `{"success": false, "error": {"code", "message", "details"}}` — surface `error.message` verbatim and stop. The `code` covers every reject (`BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID`, `TASK_DONE`, `TASK_BLOCKED`, claimed-by-another, unmet deps). `claim` fails loud on bad input — automation always supplies a valid id, so there's no empty-args branch to handle. For an `AMBIGUOUS_TASK_ID` (same id in multiple projects), re-run with `planctl claim <task_id> --project <path>`.
 
-**On success**, read the 11-key briefing envelope and pin these in working memory for the phases below:
+**On success**, read the briefing envelope and pin these in working memory for the phases below:
 
 - `task_id`, `epic_id` — ids.
 - `target_repo` — absolute path the worker cds into for code work (may equal `primary_repo` for single-repo tasks).
 - `primary_repo` — absolute path of the planctl state repo (where the `.planctl/` commit lands).
 - `tier` — persisted tier (`medium | high | xhigh | max`). Keeper already used this to load the matching `work-plugins/<tier>/` plugin; this skill quotes it back for transparency but never picks it.
-- `task_spec_md`, `epic_spec_md` — the spec markdown the worker briefing needs; no re-fetch.
 - `task_state`, `epic_state` — runtime + epic metadata (status, title).
-- `snippet_context` — pre-rendered substrate prose (folded-in `render-spec`); empty string when the task has no curated substrate.
+- `brief_ref` — absolute path to the worker's brief JSON (`<primary_repo>/.planctl/state/briefs/<task_id>.json`). `claim` wrote the task spec, epic spec, and pre-rendered snippet context into this file out-of-band; you pass the handle to the worker, which reads it itself. This skill never opens the brief — it is content-blind.
 
 Quote back a one-line summary so the human sees state is loaded, naming the persisted tier for transparency: *"working `fn-1-foo.3` at `<tier>`: <title>."*
 
@@ -64,10 +63,7 @@ Use the Task tool to invoke the `work:worker` subagent with a minimal config-onl
 
 **Tier is already chosen and loaded** (see the intro) — this skill never picks or persists one. By the time it runs, exactly one `work:worker` is in scope, pinned to its tier's model + `effort:` by the agent file. Spawn it as a bare literal, no `model=`.
 
-**Snippet context for the worker.** The `snippet_context` field from the Phase 1 envelope is the inheritor-tier substrate, already resolved: the planner authored `task.snippets` / `task.bundles` (and inherited `epic.snippets` / `epic.bundles`) at planning time, and `claim` folded in the `render-spec` resolution so this skill never shells it separately.
-
-- **`snippet_context` is non-empty:** prepend a `## Snippet context` section to the worker brief, immediately above the existing `## Task` material — the envelope value is the section body. The worker's agent spec documents this section as authoritative pre-rendered substrate (do not re-fetch via `find-snippets` / `show-snippet` / `render`).
-- **`snippet_context` is the empty string:** task has no curated substrate set. Skip the `## Snippet context` section entirely — do not emit a blank header.
+**Content-blind spawn.** This skill never inlines spec or snippet prose into the worker prompt — `claim` already wrote the task spec, epic spec, and pre-rendered snippet context into the brief JSON at `brief_ref`. You pass the worker only config lines, including `BRIEF_REF`; the worker reads the brief itself in its Phase 1. The planner authored `task.snippets` / `task.bundles` (and inherited `epic.snippets` / `epic.bundles`) at planning time, and `claim` folded the `render-spec` resolution into the brief, so this skill never shells substrate.
 
 **Prompt template:**
 
@@ -79,28 +75,19 @@ EPIC_ID: <fn-N-slug>
 PLANCTL: planctl
 TARGET_REPO: <absolute path to target_repo, or same as PRIMARY_REPO if task.target_repo is null>
 PRIMARY_REPO: <absolute path to the primary_repo (planctl state repo)>
-
-## Snippet context
-<verbatim `snippet_context` value from the Phase 1 claim envelope, omitted entirely when empty>
-
-## Task spec
-
-<verbatim `task_spec_md` value from the Phase 1 claim envelope>
-
-## Epic spec
-
-<verbatim `epic_spec_md` value from the Phase 1 claim envelope>
+BRIEF_REF: <absolute path from the Phase 1 claim envelope's brief_ref>
 
 ## Task
 
-Follow your agent spec. If your turn opens with a directive from this skill instead of this template, the directive overrides the phase scaffolding.
+Follow your agent spec. Read BRIEF_REF in Phase 1 to get the task spec, epic spec, and snippet context. If your turn opens with a directive from this skill instead of this template, the directive overrides the phase scaffolding.
 ```
 
-These sections sit before the `## Task` directive so the worker reads substrate and specs first, action last. The worker's Phase 1 reads `## Task spec` / `## Epic spec` from the brief instead of shelling `planctl cat` twice — one fewer round trip per spawn. Omit any section whose envelope field is empty (matches the `snippet_context` empty-string rule).
+The prompt is config-only — no prose blocks. The worker's Phase 1 reads the brief from `BRIEF_REF` (parsing `task_spec_md` / `epic_spec_md` / `snippet_context`) and self-checks its identity against the brief, so the orchestrator carries no spec content in its own context.
 
-Populate `TARGET_REPO` and `PRIMARY_REPO` directly from the Phase 1 claim envelope — both are already fully resolved to absolute paths:
+Populate `TARGET_REPO`, `PRIMARY_REPO`, and `BRIEF_REF` directly from the Phase 1 claim envelope — all are already fully resolved to absolute paths:
 - `TARGET_REPO` — the envelope's `target_repo`.
 - `PRIMARY_REPO` — the envelope's `primary_repo`.
+- `BRIEF_REF` — the envelope's `brief_ref`.
 
 Invocation:
 
@@ -142,9 +129,9 @@ If `status: done`, continue to Phase 3. If not:
 
      A non-empty `commits` list means the source commit landed; only `planctl done` remains. Otherwise the worker dropped mid-implementation.
 
-  2. Build a tight resume directive — imperative, no narrative:
-     - **No source commit landed:** *"Resume task `<id>`. Finish implementation, run tests, `keeper commit-work`, `planctl done`."*
-     - **Source commit landed but status still `in_progress`:** *"Source commit `<sha>` landed. Run `planctl done <task_id> --summary "..."` now."*
+  2. Build a tight resume directive — process facts only, no spec prose. Carry `BRIEF_REF` (the Phase 1 `brief_ref`) so the worker can re-read context if it needs to, plus the relevant process fact:
+     - **No source commit landed:** *"Resume task `<id>`. BRIEF_REF: `<brief_ref>`. Finish implementation, run tests, `keeper commit-work`, `planctl done`."*
+     - **Source commit landed but status still `in_progress`:** *"Source commit `<sha>` landed for `<id>`. Run `planctl done <task_id> --summary "..."` now."*
 
      The worker's agent spec already says "resume directives outrank phases" and "do not re-anchor" at the top — don't repeat those here. Keep the directive a one-liner that names the next concrete action.
 
@@ -162,15 +149,19 @@ If `status: done`, continue to Phase 3. If not:
 
   Keeper already policed and loaded the tier pre-boot (fn-594 fails loud on a missing/unsupported tier), so `work:worker` resolves correctly here — no tier-read, no fallback.
 
-  1. Shell `planctl worker resume <task_id>` once and read the success envelope's `prompt` field — the CONTEXT preamble to pass into the spawn.
+  1. Shell `planctl worker resume <task_id>` once. It regenerates the brief fresh and returns a typed envelope — read these fields: `brief_ref` (path to the freshly-baked brief), `nudge` (a one-line process-fact summary), `target_repo`, `primary_repo`, plus process facts `status`, `source_commit_sha`, `dirty_session_file_count`. There is no narrative `prompt` field — assemble the spawn prompt yourself from the config lines below.
 
-  2. Spawn ONE fresh worker:
+  2. Spawn ONE fresh worker with a config-only prompt carrying `BRIEF_REF` and the resume `nudge`:
 
      ```
-     Task(subagent_type="work:worker", description="Resume <task_id>", prompt=<envelope.prompt>)
+     Task(
+         subagent_type="work:worker",
+         description="Resume <task_id>",
+         prompt="Resume a planctl task.\n\nTASK_ID: <task_id>\nEPIC_ID: <epic_id>\nPLANCTL: planctl\nTARGET_REPO: <envelope target_repo>\nPRIMARY_REPO: <envelope primary_repo>\nBRIEF_REF: <envelope brief_ref>\n\n## Task\n\n<envelope nudge> Follow your agent spec; read BRIEF_REF in Phase 1.",
+     )
      ```
 
-     No `model=` kwarg — the agent file owns the model. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (uses `keeper find-task-commit` + `keeper session-state` to decide whether to skip ahead to `planctl done` or continue from Phase 3).
+     No `model=` kwarg — the agent file owns the model. The prompt carries process facts only (via the `nudge`) plus `BRIEF_REF` — no spec prose. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (uses `keeper find-task-commit` + `keeper session-state` to decide whether to skip ahead to `planctl done` or continue from Phase 3).
 
   3. Re-check `planctl show <task_id>` after the spawn returns:
      - `done` → continue to Phase 3.
@@ -214,7 +205,12 @@ If tests fail, surface the failure verbatim. Do not auto-fix — the human makes
 
    `status_porcelain` is the *whole tree's* uncommitted files; `session_files` is what this session (orchestrator + subagents, shared parent session_id) touched. **Trust `session_files` as your scope of authority** — anything dirty but not in it is concurrent-agent or human work; leave it alone (the Phase 1 shared-tree rule).
 
-   Under commit-before-done, `status: done` implies the source commit landed. So: every `session_files` path committed → continue. Any *still* dirty → unexpected state; surface `keeper session-state` verbatim and **stop** (no auto-resume, no auto-commit — the human investigates).
+   Under commit-before-done, `status: done` implies the source commit landed. So: every `session_files` path committed → continue. Any `session_files` path *still* dirty after `done` → **dirty-after-done**: the worker stamped `done` but left its own session files uncommitted. Auto-resume to finish the commit (the orchestrator never commits or runs `done` itself):
+
+   - **`worker_agent_id` addressable (warm):** `SendMessage(to=worker_agent_id, message="You returned done but these session files are uncommitted: <list from session_files ∩ dirty>. Commit them with `keeper commit-work`, then you're done — the task is already stamped, no second `planctl done` needed.")`. On a SendMessage error envelope, fall through to cold.
+   - **Cold:** shell `planctl worker resume <task_id>` and respawn one fresh `work:worker` exactly as Phase 2b's cold path does (config-only prompt carrying `BRIEF_REF` + the `nudge`).
+
+   Fold these attempts into the **same 5-attempt best-effort budget** as Phase 2b's harness-drop recovery. If the budget is exhausted and `session_files` are still dirty, **surface `keeper session-state` verbatim and stop** — do not block, do not auto-commit (the human investigates). The shared-tree rule is absolute: only ever act on `session_files ∩ dirty`; anything dirty but not in `session_files` is concurrent-agent or human work — never touch it.
 
 2. **Do NOT close the epic.** `planctl epic close` stays manual.
 
@@ -235,8 +231,8 @@ Include per-task commit sha from worker return. No menu, no follow-up prompts.
 - **Never auto-closes the epic** — `planctl epic close` stays the human's call.
 - **Commit-then-done contract:** the worker commits source (`keeper commit-work`) before stamping `planctl done`. `status: done` after the worker returns implies the source commit already landed.
 - **`keeper commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the human resolves and re-runs.
-- **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — surface and stop. Harness drops *do* auto-recover via Phase 2b's 5-attempt best-effort budget.
+- **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — surface and stop. Harness drops *and* dirty-after-done *do* auto-recover via the shared 5-attempt best-effort budget (Phase 2b harness-drop + Phase 4 dirty-after-done).
 - **Tier routing is owned by keeper + planner, not this skill** — spawn `work:worker` as a bare literal, no `model=`, no tier-read.
-- **Attribution is `session_files`, not `status_porcelain`** (Phase 1 shared-tree rule) — never inspect, classify, or commit dirty files this session didn't write. `done` + dirty session files is an off-happy-path state: surface and stop.
+- **Attribution is `session_files`, not `status_porcelain`** (Phase 1 shared-tree rule) — never inspect, classify, or commit dirty files this session didn't write. `done` + dirty session files auto-resumes the worker to finish the commit (Phase 4, within the 5-attempt budget); the orchestrator never commits or runs `done` itself, and surfaces (not blocks) when the budget is exhausted.
 - **Never reads or writes** outside planctl state + project code. Never use `TodoWrite` — planctl tracks all tasks.
 

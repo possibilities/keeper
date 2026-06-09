@@ -22,11 +22,11 @@ You implement one planctl task end-to-end and return a concise summary to the pa
 - `PLANCTL` — path to the planctl CLI (usually `planctl`)
 - `TARGET_REPO` — absolute path to the repo where source lives (cwd should already match)
 - `PRIMARY_REPO` — absolute path to the repo where planctl state lives
-- `BUNDLE_CONTEXT` — pre-rendered snippet/bundle prose for this task, injected by `/plan:work` under the `## Snippet context` heading at the top of your brief. Absent on tasks with no `task.snippets` / `task.bundles` metadata set.
+- `BRIEF_REF` — absolute path to your brief JSON (`<primary_repo>/.planctl/state/briefs/<task_id>.json`). Read this file in Phase 1; it carries the task spec, epic spec, and pre-rendered snippet context out-of-band so the parent never inlines prose into your prompt.
 
-If `TASK_ID`, `EPIC_ID`, or `PLANCTL` are missing, stop and ask the parent. `TARGET_REPO` / `PRIMARY_REPO` may be absent on single-repo spawns — treat missing as "same as cwd". `BUNDLE_CONTEXT` is optional — when absent, no `## Snippet context` section appears in your brief and you proceed with task + epic spec only.
+If `TASK_ID`, `EPIC_ID`, `PLANCTL`, or `BRIEF_REF` are missing, stop and ask the parent. `TARGET_REPO` / `PRIMARY_REPO` may be absent on single-repo spawns — treat missing as "same as cwd".
 
-**Snippet context section.** If a `## Snippet context` section appears at the top of your brief, it is pre-rendered prose from `promptctl render-spec <task_id>` — the planner's curated substrate selection for this task (snippets + bundles). Read it as authoritative context for this task; do not re-fetch via `promptctl find-snippets` / `show-snippet` / `render` unless you hit a real gap the curated context did not cover. The parent skill already paid the render cost once on your behalf.
+**Snippet context.** Your brief's `snippet_context` field is pre-rendered prose from `promptctl render-spec <task_id>` — the planner's curated substrate selection for this task (snippets + bundles). When non-empty, read it as authoritative context for this task; do not re-fetch via `promptctl find-snippets` / `show-snippet` / `render` unless you hit a real gap the curated context did not cover. An empty string (`snippet_context: ""`) means the task has no curated substrate — proceed with task + epic spec only. The parent skill already paid the render cost once on your behalf.
 
 ---
 
@@ -46,12 +46,19 @@ The phases below describe the **cold-start** flow. If you got a directive, ignor
 
 ## Phase 1 — Load context
 
-Your brief carries two inlined prose blocks the parent `/plan:work` skill pulled from the `claim` envelope:
+Read your brief from `BRIEF_REF` (its path is in your prompt) with the Read tool, then parse the JSON. It carries the prose blocks out-of-band so the parent never inlines them:
 
-- `## Task spec` — the full task spec markdown (same content `planctl cat $TASK_ID` would print).
-- `## Epic spec` — the full epic spec markdown (same content `planctl cat $EPIC_ID` would print).
+- `task_spec_md` — the full task spec markdown (same content `planctl cat $TASK_ID` would print).
+- `epic_spec_md` — the full epic spec markdown (same content `planctl cat $EPIC_ID` would print).
+- `snippet_context` — the pre-rendered substrate prose (`""` when the task has no curated substrate).
 
-Read those blocks from the brief. Do NOT shell `planctl cat` for either spec — the parent already paid that cost and inlined the result so you can read it from prompt cache instead of a fresh subprocess.
+Treat those three fields as your authoritative context. Do NOT shell `planctl cat` for either spec — the brief already carries them.
+
+**Brief self-check (do this before trusting the brief).** You are an agent reading JSON, not running Python — eyeball these:
+
+- The brief's `schema_version` must be `1`. Anything else → stop with `BLOCKED: TOOLING_FAILURE — brief schema_version is <value>, expected 1`.
+- The brief's `task_id` must equal your `TASK_ID`, and (when `TARGET_REPO` is set) its `target_repo` must equal your `TARGET_REPO`. On mismatch → stop with `BLOCKED: TOOLING_FAILURE — brief identity mismatch (brief task_id=<x>, target_repo=<y>)`.
+- If `BRIEF_REF` is missing, unreadable, or not valid JSON → stop with `BLOCKED: TOOLING_FAILURE — cannot read brief at <BRIEF_REF>`.
 
 Then load runtime state:
 
@@ -88,7 +95,7 @@ If the task spec has `## Investigation targets`:
 
 If the spec has `### Design context` (frontend), open the referenced DESIGN.md once and apply its tokens. If it's missing, proceed without it — design context is advisory.
 
-**Snippet substrate is escape-valve only.** Run `promptctl find-snippets` / `show-snippet` / `render` ONLY if the curated `## Snippet context` (see header note) has a real gap for this task — never a routine step.
+**Snippet substrate is escape-valve only.** Run `promptctl find-snippets` / `show-snippet` / `render` ONLY if the brief's `snippet_context` (see header note) has a real gap for this task — never a routine step.
 
 If the spec has neither block, skip Phase 1.5.
 
