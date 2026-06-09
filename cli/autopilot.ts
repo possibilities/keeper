@@ -99,14 +99,23 @@ Usage:
   keeper autopilot [--sock <path>]
   keeper autopilot pause [--sock <path>]
   keeper autopilot play  [--sock <path>]
+  keeper autopilot mode <yolo|armed> [--sock <path>]
+  keeper autopilot arm <epic-id> [--sock <path>]
+  keeper autopilot disarm <epic-id> [--sock <path>]
   keeper autopilot retry <verb::id> [--sock <path>]
   keeper autopilot --help
 
 Subcommands:
   (none)   Open the alt-screen viewer rendering the live current /
-           stopped / failed / dependencies sections plus the paused indicator.
+           stopped / failed / armed / dependencies sections plus the
+           paused + mode + armed-count banner.
   pause    Send set_autopilot_paused {paused:true} and exit.
   play     Send set_autopilot_paused {paused:false} and exit.
+  mode     Send set_autopilot_mode {mode:<yolo|armed>} and exit. yolo works
+           every ready epic; armed works ONLY explicitly-armed epics plus
+           their transitive upstream dep-closure.
+  arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
+  disarm   Send set_epic_armed {epic_id:<id>, armed:false} and exit.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
            the canonical composite key (e.g. work::fn-619-foo.3).
 
@@ -116,8 +125,8 @@ Options:
 
 The viewer is read-only — every dispatch, dedup, confirm, settle, and reap
 decision happens in keeperd's autopilot worker thread. Use pause / play
-to toggle the worker (boots PAUSED for safety) and retry to clear a
-sticky failure row.
+to toggle the worker (boots PAUSED for safety), mode / arm / disarm to gate
+which epics armed mode works, and retry to clear a sticky failure row.
 `;
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
@@ -351,6 +360,43 @@ export function projectMaxConcurrentJobs(
   return raw;
 }
 
+/**
+ * Coerce a singleton `autopilot_state` wire row's `mode` column to the
+ * banner-facing enum. Stored as TEXT (`'yolo'` work-everything, `'armed'`
+ * armed-set-only). Defensive: an empty row set (singleton hasn't folded yet —
+ * sub-ms boot race) returns `null` so the caller leaves the seed untouched;
+ * any value other than the two legal literals falls back to `'yolo'` (the
+ * backward-compatible work-everything default, matching the column default).
+ * Pure — exported for tests. fn-751 task .3.
+ */
+export function projectAutopilotMode(
+  rows: Record<string, unknown>[],
+): "yolo" | "armed" | null {
+  if (rows.length === 0) {
+    return null;
+  }
+  const raw = rows[0]?.mode;
+  return raw === "armed" ? "armed" : "yolo";
+}
+
+/**
+ * Project the `armed_epics` wire rows to a sorted list of the explicitly-armed
+ * epic ids. The descriptor sorts `created_at DESC` server-side; we re-sort by
+ * `epic_id` ASC for a stable, deterministic armed-section render (the screen
+ * lists ids, not arm order). Pure — exported for tests. fn-751 task .3.
+ */
+export function projectArmedEpics(rows: Record<string, unknown>[]): string[] {
+  const out: string[] = [];
+  for (const r of rows) {
+    const id = seg(r.epic_id);
+    if (id !== "") {
+      out.push(id);
+    }
+  }
+  out.sort();
+  return out;
+}
+
 // ---------------------------------------------------------------------------
 // Body renderer — pure (fixtures → lines).
 // ---------------------------------------------------------------------------
@@ -362,6 +408,11 @@ export interface RenderInput {
   dependencies?: string[];
   failed: FailedRow[];
   paused: boolean;
+  /** fn-751: the explicitly-armed epic ids. The `--- armed ---` section
+   * lists them (v1 shows explicit-armed only). An empty array renders
+   * nothing — the "nothing armed in armed mode" callout lives on the banner,
+   * not the body. Optional — an absent field renders no section. */
+  armed?: string[];
 }
 
 /**
@@ -413,6 +464,18 @@ export function renderBody(input: RenderInput): string[] {
     }
   }
 
+  // fn-751: the explicitly-armed epics. v1 lists explicit-armed only; the
+  // dep-pulled-in/effective-set view is a documented future enhancement. The
+  // banner already signals mode + count (incl. the "nothing armed" callout),
+  // so an empty armed set renders no body section here.
+  const armed = input.armed ?? [];
+  if (armed.length > 0) {
+    out.push("--- armed ---");
+    for (const epicId of armed) {
+      out.push(epicId);
+    }
+  }
+
   const dependencies = input.dependencies ?? [];
   if (dependencies.length > 0) {
     out.push("--- dependencies ---");
@@ -450,6 +513,39 @@ export function buildRetryFrame(id: string, dispatchKey: string): ClientFrame {
     id,
     method: "retry_dispatch",
     params: { id: dispatchKey },
+  };
+}
+
+/**
+ * Build a well-formed RPC client frame for `set_autopilot_mode`. Pure —
+ * exported so tests can assert the wire shape. Fn-751 task .3.
+ */
+export function buildSetModeFrame(
+  id: string,
+  mode: "yolo" | "armed",
+): ClientFrame {
+  return {
+    type: "rpc",
+    id,
+    method: "set_autopilot_mode",
+    params: { mode },
+  };
+}
+
+/**
+ * Build a well-formed RPC client frame for `set_epic_armed`. Pure —
+ * exported so tests can assert the wire shape. Fn-751 task .3.
+ */
+export function buildSetArmedFrame(
+  id: string,
+  epicId: string,
+  armed: boolean,
+): ClientFrame {
+  return {
+    type: "rpc",
+    id,
+    method: "set_epic_armed",
+    params: { epic_id: epicId, armed },
   };
 }
 
@@ -605,23 +701,48 @@ interface ViewerState {
   // unlimited (rendered `∞`). Seeded `null` and overwritten by the
   // `autopilot_state` subscribe edge alongside `paused`.
   maxConcurrentJobs: number | null;
+  // fn-751: the explicit autopilot mode, sourced over the socket from the
+  // `autopilot_state` singleton's `mode` column. Seeded `'yolo'` (the
+  // work-everything default) and overwritten by the `autopilot_state`
+  // subscribe edge alongside `paused`.
+  mode: "yolo" | "armed";
+  // fn-751: the explicitly-armed epic ids, sourced over the socket from the
+  // `armed_epics` presence table. v1 shows EXPLICIT-armed only; the
+  // dep-pulled-in/effective-set view is a documented future enhancement.
+  armedEpics: string[];
 }
 
 /**
- * Render the persistent banner pill from viewer state: the play/pause pill
- * plus the fn-725 concurrency-cap suffix. `[playing] · max 3` for a finite
- * cap, `[playing] · max ∞` for unlimited (`null`). Pure — exported for
- * tests. The cap is read from `state.maxConcurrentJobs` (socket-sourced via
- * `projectMaxConcurrentJobs`), never from config.
+ * Render the persistent banner pill from viewer state: the play/pause pill,
+ * the fn-751 mode suffix, the fn-725 concurrency-cap suffix, and (in `armed`
+ * mode) the armed-epic count. `[playing] · yolo · max 3` in yolo mode;
+ * `[playing] · armed · 2 armed · max ∞` with two armed epics. The
+ * empty-armed-set-in-armed-mode case renders DISTINCTLY as
+ * `[playing] · armed · nothing armed` so idle-by-design (armed mode with no
+ * armed epics dispatches nothing) is never mistaken for a broken autopilot.
+ *
+ * Pure — exported for tests. Mode + armed count are socket-sourced (via
+ * `projectAutopilotMode` / `projectArmedEpics`); the cap via
+ * `projectMaxConcurrentJobs`. The viewer never reads config.
  */
 export function autopilotBannerLabel(state: {
   paused: boolean;
   maxConcurrentJobs: number | null;
+  mode: "yolo" | "armed";
+  armedCount: number;
 }): string {
   const pill = state.paused ? "[paused]" : "[playing]";
   const cap =
     state.maxConcurrentJobs === null ? "∞" : String(state.maxConcurrentJobs);
-  return `${pill} · max ${cap}`;
+  // In armed mode surface the armed count — and call out the empty set
+  // distinctly so "nothing armed" reads as a deliberate state, not a bug.
+  const armedSeg =
+    state.mode === "armed"
+      ? state.armedCount === 0
+        ? " · nothing armed"
+        : ` · ${state.armedCount} armed`
+      : "";
+  return `${pill} · ${state.mode}${armedSeg} · max ${cap}`;
 }
 
 async function runViewer(sockPath: string): Promise<void> {
@@ -640,12 +761,25 @@ async function runViewer(sockPath: string): Promise<void> {
     // `autopilot_state` subscribe edge lands the real folded cap. Sourced
     // ONLY over the socket; the viewer never reads config.yaml.
     maxConcurrentJobs: null,
+    // fn-751: seed `'yolo'` (the work-everything default) until the
+    // `autopilot_state` subscribe edge lands the real folded mode.
+    mode: "yolo",
+    // fn-751: seed empty until the `armed_epics` subscribe edge lands.
+    armedEpics: [],
   };
 
   const view = createViewShell<ViewerState>({
     script: "autopilot",
     title: "autopilot",
-    persistentBannerPill: () => autopilotBannerLabel(state),
+    // fn-751: the banner derives mode + armed-count from the live `state`
+    // (the armed count is the explicit-armed list length).
+    persistentBannerPill: () =>
+      autopilotBannerLabel({
+        paused: state.paused,
+        maxConcurrentJobs: state.maxConcurrentJobs,
+        mode: state.mode,
+        armedCount: state.armedEpics.length,
+      }),
     renderBody: (snap) => {
       // The view-shell's TSnap is our own `ViewerState`; we ignore the
       // arg (`snap === state` because we pass it through `view.emit`)
@@ -660,9 +794,13 @@ async function runViewer(sockPath: string): Promise<void> {
           dependencies,
           failed: snap.failed,
           paused: snap.paused,
+          // fn-751: the explicitly-armed epics (v1 lists explicit-armed only).
+          armed: snap.armedEpics,
         }),
         stateJson: {
           paused: snap.paused,
+          mode: snap.mode,
+          armed: snap.armedEpics,
           current,
           dependencies,
           failed: snap.failed,
@@ -671,10 +809,25 @@ async function runViewer(sockPath: string): Promise<void> {
     },
   });
 
-  // Seed the banner immediately so the human sees `[paused] · max ∞`
+  // fn-751: derive the banner state from the live `ViewerState` — mode +
+  // armed-count ride alongside paused + cap. The armed COUNT comes from the
+  // explicit-armed list length.
+  const bannerState = (): {
+    paused: boolean;
+    maxConcurrentJobs: number | null;
+    mode: "yolo" | "armed";
+    armedCount: number;
+  } => ({
+    paused: state.paused,
+    maxConcurrentJobs: state.maxConcurrentJobs,
+    mode: state.mode,
+    armedCount: state.armedEpics.length,
+  });
+
+  // Seed the banner immediately so the human sees `[paused] · yolo · max ∞`
   // before the first snapshot lands — same shape as board's persistent-pill
   // restore pattern.
-  view.liveShell.setStatus(autopilotBannerLabel(state));
+  view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
 
   const readinessHandle = subscribeReadiness({
     sockPath,
@@ -723,7 +876,28 @@ async function runViewer(sockPath: string): Promise<void> {
       // it on every edge so a config-change-then-restart's re-minted cap and
       // a live pause/play toggle both land on the banner. `null` = unlimited.
       state.maxConcurrentJobs = projectMaxConcurrentJobs(rows);
-      view.liveShell.setStatus(autopilotBannerLabel(state));
+      // fn-751: the mode rides the SAME singleton row — fold it on every edge.
+      // `projectAutopilotMode` returns `null` only on an empty row set (already
+      // handled by the `paused === null` early-return above), so here it always
+      // yields a concrete `'yolo' | 'armed'`.
+      state.mode = projectAutopilotMode(rows) ?? "yolo";
+      view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
+      view.emit(state);
+    },
+    onLifecycle: view.emitLifecycle,
+  });
+
+  // fn-751: subscribe the `armed_epics` presence table so the banner's
+  // armed-count + the `--- armed ---` section reflect the live folded set.
+  // A row's presence means the epic is explicitly armed. Re-subscribes cleanly
+  // on socket drop via the shared reconnect contract.
+  const armedHandle = subscribeCollection({
+    sockPath,
+    idPrefix: "autopilot",
+    collection: "armed_epics",
+    onRows: (rows) => {
+      state.armedEpics = projectArmedEpics(rows);
+      view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
       view.emit(state);
     },
     onLifecycle: view.emitLifecycle,
@@ -733,6 +907,7 @@ async function runViewer(sockPath: string): Promise<void> {
     readinessHandle.dispose();
     failuresHandle.dispose();
     pausedHandle.dispose();
+    armedHandle.dispose();
   });
 }
 
@@ -793,8 +968,47 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
 
+  if (subcommand === "mode") {
+    // fn-751: `mode <yolo|armed>` → set_autopilot_mode. Validate the enum
+    // CLI-side so a typo dies with a clear message before the round-trip (the
+    // server also rejects, but a local guard is friendlier).
+    if (rest.length !== 1) {
+      die(
+        `'mode' takes exactly one positional <yolo|armed> (got ${rest.length}); pass --help for usage.`,
+      );
+    }
+    const mode = rest[0];
+    if (mode !== "yolo" && mode !== "armed") {
+      die(`'mode' must be one of yolo | armed (got ${JSON.stringify(mode)})`);
+    }
+    const id = crypto.randomUUID();
+    await sendControlRpc(sockPath, buildSetModeFrame(id, mode), id);
+    return;
+  }
+
+  if (subcommand === "arm" || subcommand === "disarm") {
+    // fn-751: `arm <epic-id>` / `disarm <epic-id>` → set_epic_armed with
+    // armed true/false.
+    if (rest.length !== 1) {
+      die(
+        `'${subcommand}' takes exactly one positional <epic-id> (got ${rest.length}); pass --help for usage.`,
+      );
+    }
+    const epicId = rest[0];
+    if (epicId === undefined || epicId === "") {
+      die(`'${subcommand}' requires a non-empty <epic-id>`);
+    }
+    const id = crypto.randomUUID();
+    await sendControlRpc(
+      sockPath,
+      buildSetArmedFrame(id, epicId, subcommand === "arm"),
+      id,
+    );
+    return;
+  }
+
   die(
-    `unknown subcommand '${subcommand}' (expected pause | play | retry); pass --help for usage.`,
+    `unknown subcommand '${subcommand}' (expected pause | play | mode | arm | disarm | retry); pass --help for usage.`,
   );
 }
 

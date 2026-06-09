@@ -983,11 +983,17 @@ function asyncCtxStub(opts: {
       return opts.replay();
     },
     // Not exercised by the replay async-RPC tests; satisfies the
-    // fn-661-extended interface without affecting these test cases.
+    // fn-661/fn-751-extended interface without affecting these test cases.
     async setAutopilotPaused() {
       return { ok: true };
     },
     async retryDispatch() {
+      return { ok: true };
+    },
+    async setAutopilotMode() {
+      return { ok: true };
+    },
+    async setEpicArmed() {
       return { ok: true };
     },
   };
@@ -1175,6 +1181,12 @@ test("dispatchLine async rpc → handler reaches bridge.setAutopilotPaused (roun
       async retryDispatch() {
         return { ok: true };
       },
+      async setAutopilotMode() {
+        return { ok: true };
+      },
+      async setEpicArmed() {
+        return { ok: true };
+      },
     };
     const ctx: DispatchAsyncCtx = {
       bridge,
@@ -1219,6 +1231,12 @@ test("dispatchLine async rpc → handler reaches bridge.retryDispatch with the s
       },
       async retryDispatch(verb, id) {
         retryCalls.push({ verb, id });
+        return { ok: true };
+      },
+      async setAutopilotMode() {
+        return { ok: true };
+      },
+      async setEpicArmed() {
         return { ok: true };
       },
     };

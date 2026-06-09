@@ -145,8 +145,12 @@ import type {
   RetryDispatchRequestMessage,
   RetryDispatchResultMessage,
   ServerWorkerData,
+  SetAutopilotModeRequestMessage,
+  SetAutopilotModeResultMessage,
   SetAutopilotPausedRequestMessage,
   SetAutopilotPausedResultMessage,
+  SetEpicArmedRequestMessage,
+  SetEpicArmedResultMessage,
 } from "./server-worker";
 import type {
   ApiErrorMessage,
@@ -1846,6 +1850,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | ReplayRequestMessage
         | SetAutopilotPausedRequestMessage
         | RetryDispatchRequestMessage
+        | SetAutopilotModeRequestMessage
+        | SetEpicArmedRequestMessage
         | { kind: "ready" }
         | undefined
       >,
@@ -1976,6 +1982,137 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
               error: err instanceof Error ? err.message : String(err),
             };
           }
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "set-autopilot-mode-request") {
+        // Fn-751 task .3. APPEND an `AutopilotMode` synthetic event onto the
+        // writable connection so the reducer folds it into the
+        // `autopilot_state` singleton's `mode` column, then pump a wake.
+        //
+        // APPEND-ONLY — and DELIBERATELY no `postMessage` relay to the
+        // autopilot worker (unlike the set-autopilot-paused handler above):
+        // the reconciler is level-triggered and re-reads `mode` from the
+        // projection EVERY cycle, woken by the fold's `data_version` bump.
+        // Mode is durable user intent (persisted in the projection), not a
+        // safety reset like `paused`, so there is no in-memory main-side flag
+        // and no boot re-arm. DO NOT "fix" this back to a relay.
+        //
+        // Same ~30-column insertEvent shape as every other synthetic minted
+        // on main (`$session_id: "autopilot"` groups every autopilot_state row
+        // onto the same key; `$event_type: "autopilot_state"` matches the
+        // reducer's fold arm). The mode enum is already validated handler-side.
+        const id = msg.id;
+        let reply: SetAutopilotModeResultMessage;
+        try {
+          stmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: "autopilot",
+            $pid: null,
+            $hook_event: "AutopilotMode",
+            $event_type: "autopilot_state",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify({ mode: msg.mode }),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $planctl_op: null,
+            $planctl_target: null,
+            $planctl_epic_id: null,
+            $planctl_task_id: null,
+            $planctl_subject_present: null,
+            $config_dir: null,
+            $planctl_queue_jump: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $planctl_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
+          });
+          wakePending = true;
+          pumpWakes();
+          reply = { type: "set-autopilot-mode-result", id, ok: true };
+        } catch (err) {
+          reply = {
+            type: "set-autopilot-mode-result",
+            id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
+        }
+        sw.postMessage(reply);
+        return;
+      }
+      if (msg.kind === "set-epic-armed-request") {
+        // Fn-751 task .3. APPEND an `EpicArmed` synthetic event onto the
+        // writable connection so the reducer folds it into the `armed_epics`
+        // PRESENCE table (`armed:true` → row INSERT, `armed:false` → row
+        // DELETE), then pump a wake.
+        //
+        // APPEND-ONLY — same NO-relay contract as the set-autopilot-mode
+        // handler above: the reconciler re-reads the armed set from the
+        // projection each cycle. The wire `epic_id` is a non-empty token
+        // (validated handler-side); main appends it UNCONDITIONALLY — no
+        // existence check — to dodge the fold-lag race where a freshly-planned
+        // epic isn't yet in the `epics` projection. The `$session_id` carries
+        // the epic id so a re-fold can correlate the event to its row without
+        // re-parsing the data blob.
+        const id = msg.id;
+        let reply: SetEpicArmedResultMessage;
+        try {
+          stmts.insertEvent.run({
+            $ts: Date.now() / 1000,
+            $session_id: msg.epic_id,
+            $pid: null,
+            $hook_event: "EpicArmed",
+            $event_type: "armed_epics",
+            $tool_name: null,
+            $matcher: null,
+            $cwd: null,
+            $permission_mode: null,
+            $agent_id: null,
+            $agent_type: null,
+            $stop_hook_active: null,
+            $data: JSON.stringify({ epic_id: msg.epic_id, armed: msg.armed }),
+            $subagent_agent_id: null,
+            $spawn_name: null,
+            $start_time: null,
+            $slash_command: null,
+            $skill_name: null,
+            $planctl_op: null,
+            $planctl_target: null,
+            $planctl_epic_id: null,
+            $planctl_task_id: null,
+            $planctl_subject_present: null,
+            $config_dir: null,
+            $planctl_queue_jump: null,
+            $bash_mutation_kind: null,
+            $bash_mutation_targets: null,
+            $planctl_files: null,
+            $backend_exec_type: null,
+            $backend_exec_session_id: null,
+            $backend_exec_pane_id: null,
+          });
+          wakePending = true;
+          pumpWakes();
+          reply = { type: "set-epic-armed-result", id, ok: true };
+        } catch (err) {
+          reply = {
+            type: "set-epic-armed-result",
+            id,
+            ok: false,
+            error: err instanceof Error ? err.message : String(err),
+          };
         }
         sw.postMessage(reply);
         return;

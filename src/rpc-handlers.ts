@@ -514,6 +514,132 @@ export async function setAutopilotPausedHandler(
 }
 
 // ---------------------------------------------------------------------------
+// `set_autopilot_mode` (async — bridges through main to APPEND an
+// `AutopilotMode` synthetic event; fn-751 task .3)
+// ---------------------------------------------------------------------------
+
+/** The two legal autopilot modes (fn-751). Mirrors the reducer's enum. */
+export type AutopilotMode = "yolo" | "armed";
+
+const AUTOPILOT_MODES = new Set<AutopilotMode>(["yolo", "armed"]);
+
+/** `set_autopilot_mode` wire params. */
+export interface SetAutopilotModeParams {
+  mode: AutopilotMode;
+}
+
+/** Successful return shape for `set_autopilot_mode`. */
+export interface SetAutopilotModeResult {
+  ok: true;
+  mode: AutopilotMode;
+}
+
+function validateSetAutopilotModeParams(
+  params: unknown,
+): SetAutopilotModeParams {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "set_autopilot_mode: params must be an object with `mode: 'yolo'|'armed'`",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  if (
+    typeof obj.mode !== "string" ||
+    !AUTOPILOT_MODES.has(obj.mode as AutopilotMode)
+  ) {
+    throw new BadParamsError(
+      `set_autopilot_mode: \`mode\` must be one of yolo|armed (got ${JSON.stringify(obj.mode)})`,
+    );
+  }
+  return { mode: obj.mode as AutopilotMode };
+}
+
+/**
+ * `set_autopilot_mode` handler. Validates the `mode: 'yolo'|'armed'` enum and
+ * bridges to main, which APPENDS an `AutopilotMode` synthetic event onto the
+ * writable connection and pumps a wake — NO relay to the autopilot worker
+ * (deliberately unlike {@link setAutopilotPausedHandler}: the level-triggered
+ * reconciler re-reads mode from the `autopilot_state` projection every cycle,
+ * woken by the fold's `data_version` bump). Returns `{ ok: true, mode }` once
+ * main has appended. Mode is DURABLE user intent (persisted in the projection),
+ * not a safety reset like paused — so there is no boot re-arm. Fn-751 task .3.
+ */
+export async function setAutopilotModeHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<SetAutopilotModeResult> {
+  const { mode } = validateSetAutopilotModeParams(params);
+  const result = await bridge.setAutopilotMode(mode);
+  if (!result.ok) {
+    throw new Error(
+      result.error ?? "set_autopilot_mode: main reported failure",
+    );
+  }
+  return { ok: true, mode };
+}
+
+// ---------------------------------------------------------------------------
+// `set_epic_armed` (async — bridges through main to APPEND an `EpicArmed`
+// synthetic event; fn-751 task .3)
+// ---------------------------------------------------------------------------
+
+/** `set_epic_armed` wire params. */
+export interface SetEpicArmedParams {
+  epic_id: string;
+  armed: boolean;
+}
+
+/** Successful return shape for `set_epic_armed`. */
+export interface SetEpicArmedResult {
+  ok: true;
+  epic_id: string;
+  armed: boolean;
+}
+
+function validateSetEpicArmedParams(params: unknown): SetEpicArmedParams {
+  if (params === null || typeof params !== "object" || Array.isArray(params)) {
+    throw new BadParamsError(
+      "set_epic_armed: params must be an object with `epic_id: string, armed: boolean`",
+    );
+  }
+  const obj = params as Record<string, unknown>;
+  if (typeof obj.epic_id !== "string" || obj.epic_id.length === 0) {
+    throw new BadParamsError(
+      "set_epic_armed: `epic_id` must be a non-empty string",
+    );
+  }
+  if (typeof obj.armed !== "boolean") {
+    throw new BadParamsError("set_epic_armed: `armed` must be a boolean");
+  }
+  return { epic_id: obj.epic_id, armed: obj.armed };
+}
+
+/**
+ * `set_epic_armed` handler. Validates the `{ epic_id, armed }` shape and
+ * bridges to main, which APPENDS an `EpicArmed` synthetic event onto the
+ * writable connection and pumps a wake (no relay — same level-triggered
+ * re-read contract as {@link setAutopilotModeHandler}).
+ *
+ * NO existence validation on `epic_id`: the event is appended unconditionally
+ * to avoid the fold-lag race where a freshly-planned epic isn't yet in the
+ * `epics` projection but the human wants to arm it now. The reconciler reads
+ * the armed set against the live projection each cycle, so an arm for an epic
+ * that never materializes is a harmless no-op (it pulls in nothing). Returns
+ * `{ ok: true, epic_id, armed }` once main has appended. Fn-751 task .3.
+ */
+export async function setEpicArmedHandler(
+  params: unknown,
+  bridge: ReplayBridge,
+): Promise<SetEpicArmedResult> {
+  const { epic_id, armed } = validateSetEpicArmedParams(params);
+  const result = await bridge.setEpicArmed(epic_id, armed);
+  if (!result.ok) {
+    throw new Error(result.error ?? "set_epic_armed: main reported failure");
+  }
+  return { ok: true, epic_id, armed };
+}
+
+// ---------------------------------------------------------------------------
 // `retry_dispatch` (async — bridges through main to mint a `DispatchCleared`
 // synthetic event; fn-661 task .4)
 // ---------------------------------------------------------------------------
@@ -680,5 +806,7 @@ export function installRpcHandlers(): void {
   registerRpc("set_epic_approval", setEpicApprovalHandler);
   registerAsyncRpc("replay_dead_letter", replayDeadLetterHandler);
   registerAsyncRpc("set_autopilot_paused", setAutopilotPausedHandler);
+  registerAsyncRpc("set_autopilot_mode", setAutopilotModeHandler);
+  registerAsyncRpc("set_epic_armed", setEpicArmedHandler);
   registerAsyncRpc("retry_dispatch", retryDispatchHandler);
 }

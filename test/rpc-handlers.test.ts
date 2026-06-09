@@ -35,8 +35,10 @@ import {
   replayDeadLetterHandler,
   resolvePlanFile,
   retryDispatchHandler,
+  setAutopilotModeHandler,
   setAutopilotPausedHandler,
   setEpicApprovalHandler,
+  setEpicArmedHandler,
   setTaskApprovalHandler,
   sidecarPathFromDef,
 } from "../src/rpc-handlers";
@@ -601,11 +603,17 @@ function stubBridge(
       return result;
     },
     // Not exercised by the replay-dead-letter handler tests; satisfies
-    // the fn-661-extended interface without affecting these test cases.
+    // the fn-661/fn-751-extended interface without affecting these test cases.
     async setAutopilotPaused() {
       return { ok: true };
     },
     async retryDispatch() {
+      return { ok: true };
+    },
+    async setAutopilotMode() {
+      return { ok: true };
+    },
+    async setEpicArmed() {
       return { ok: true };
     },
   };
@@ -680,16 +688,22 @@ test("replay_dead_letter throws a generic message when ok:false carries no error
 function autopilotStubBridge(opts: {
   setPaused?: { ok: boolean; error?: string };
   retry?: { ok: boolean; error?: string };
+  setMode?: { ok: boolean; error?: string };
+  setArmed?: { ok: boolean; error?: string };
 }): {
   bridge: ReplayBridge;
   state: {
     setPausedCalls: boolean[];
     retryCalls: Array<{ verb: string; id: string }>;
+    setModeCalls: string[];
+    setArmedCalls: Array<{ epic_id: string; armed: boolean }>;
   };
 } {
   const state = {
     setPausedCalls: [] as boolean[],
     retryCalls: [] as Array<{ verb: string; id: string }>,
+    setModeCalls: [] as string[],
+    setArmedCalls: [] as Array<{ epic_id: string; armed: boolean }>,
   };
   const bridge: ReplayBridge = {
     async replay() {
@@ -702,6 +716,14 @@ function autopilotStubBridge(opts: {
     async retryDispatch(verb, id) {
       state.retryCalls.push({ verb, id });
       return opts.retry ?? { ok: true };
+    },
+    async setAutopilotMode(mode) {
+      state.setModeCalls.push(mode);
+      return opts.setMode ?? { ok: true };
+    },
+    async setEpicArmed(epic_id, armed) {
+      state.setArmedCalls.push({ epic_id, armed });
+      return opts.setArmed ?? { ok: true };
     },
   };
   return { bridge, state };
@@ -743,6 +765,109 @@ test("set_autopilot_paused throws rpc_failed when the bridge reports ok:false", 
   expect(setAutopilotPausedHandler({ paused: true }, bridge)).rejects.toThrow(
     /no autopilot worker/,
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-751 task .3 — `set_autopilot_mode`
+// ---------------------------------------------------------------------------
+
+test("set_autopilot_mode forwards the validated enum to the bridge and returns ok+mode", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setAutopilotModeHandler({ mode: "armed" }, bridge);
+  expect(result).toEqual({ ok: true, mode: "armed" });
+  expect(state.setModeCalls).toEqual(["armed"]);
+
+  const result2 = await setAutopilotModeHandler({ mode: "yolo" }, bridge);
+  expect(result2).toEqual({ ok: true, mode: "yolo" });
+  expect(state.setModeCalls).toEqual(["armed", "yolo"]);
+});
+
+test("set_autopilot_mode throws BadParamsError on non-object params", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [null, "armed", 1, true, [], undefined]) {
+    expect(setAutopilotModeHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("set_autopilot_mode rejects an unknown enum value (no coercion)", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [{}, { mode: "YOLO" }, { mode: "off" }, { mode: 1 }]) {
+    expect(setAutopilotModeHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  // A rejected enum never reaches the bridge.
+  expect(state.setModeCalls).toEqual([]);
+});
+
+test("set_autopilot_mode throws rpc_failed when the bridge reports ok:false", async () => {
+  const { bridge } = autopilotStubBridge({
+    setMode: { ok: false, error: "insert lock contention" },
+  });
+  expect(setAutopilotModeHandler({ mode: "armed" }, bridge)).rejects.toThrow(
+    /insert lock contention/,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-751 task .3 — `set_epic_armed`
+// ---------------------------------------------------------------------------
+
+test("set_epic_armed forwards (epic_id, armed) to the bridge and returns ok+epic_id+armed", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await setEpicArmedHandler(
+    { epic_id: "fn-1-foo", armed: true },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, epic_id: "fn-1-foo", armed: true });
+  expect(state.setArmedCalls).toEqual([{ epic_id: "fn-1-foo", armed: true }]);
+
+  const result2 = await setEpicArmedHandler(
+    { epic_id: "fn-1-foo", armed: false },
+    bridge,
+  );
+  expect(result2).toEqual({ ok: true, epic_id: "fn-1-foo", armed: false });
+  expect(state.setArmedCalls).toEqual([
+    { epic_id: "fn-1-foo", armed: true },
+    { epic_id: "fn-1-foo", armed: false },
+  ]);
+});
+
+test("set_epic_armed throws BadParamsError on non-object params", async () => {
+  const { bridge } = autopilotStubBridge({});
+  for (const bad of [null, "fn-1-foo", 1, true, [], undefined]) {
+    expect(setEpicArmedHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+});
+
+test("set_epic_armed throws BadParamsError on a missing/empty epic_id or non-boolean armed", async () => {
+  const { bridge, state } = autopilotStubBridge({});
+  for (const bad of [
+    { armed: true },
+    { epic_id: "", armed: true },
+    { epic_id: 1, armed: true },
+    { epic_id: "fn-1-foo" },
+    { epic_id: "fn-1-foo", armed: "true" },
+    { epic_id: "fn-1-foo", armed: 1 },
+  ]) {
+    expect(setEpicArmedHandler(bad, bridge)).rejects.toBeInstanceOf(
+      BadParamsError,
+    );
+  }
+  expect(state.setArmedCalls).toEqual([]);
+});
+
+test("set_epic_armed throws rpc_failed when the bridge reports ok:false", async () => {
+  const { bridge } = autopilotStubBridge({
+    setArmed: { ok: false, error: "writer lock contention" },
+  });
+  expect(
+    setEpicArmedHandler({ epic_id: "fn-1-foo", armed: true }, bridge),
+  ).rejects.toThrow(/writer lock contention/);
 });
 
 // ---------------------------------------------------------------------------

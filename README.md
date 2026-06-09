@@ -177,8 +177,8 @@ The QUERY surface is read-only: the server is just another reader on its own
 read-only connection, polling `data_version` like the reducer-wake worker.
 **Mutation is a separate, scoped path:** the same socket carries `rpc` request
 frames that dispatch to registered server-side handlers, which write *external
-resources* through a dedicated writer owned by the server-worker. The three
-concrete RPCs are `set_task_approval` and `set_epic_approval` (each writes
+resources* through a dedicated writer owned by the server-worker. The concrete
+RPCs are `set_task_approval` and `set_epic_approval` (each writes
 the `approval` field to the GITIGNORED runtime sidecar
 `.planctl/state/{epics,tasks}/<id>.state.json` — fn-732, NOT the committed def —
 create-if-absent + RMW preserving the sidecar's status/claim fields, via atomic
@@ -196,7 +196,14 @@ and main picks the oldest `waiting` row from `dead_letters`, appends a
 plain real event with the row's preserved `bindings` + `ts`, and flips
 `status` to `recovered` in ONE `BEGIN IMMEDIATE` — the recovered event
 then folds through the normal id-ordered drain, and the audit row keeps
-its `replayed_event_id` for posterity). RPC handlers MAY write
+its `replayed_event_id` for posterity). Three more verbs mint a synthetic
+event through the same main-bridge: `retry_dispatch` (clears a sticky
+`dispatch_failures` row via a `DispatchCleared` event) and the fn-751 autopilot
+control pair — `set_autopilot_mode` (`AutopilotMode` → the `autopilot_state`
+singleton's `yolo`/`armed` mode column) and `set_epic_armed` (`EpicArmed` → the
+`armed_epics` presence table). The fn-751 pair is APPEND-ONLY (no main→worker
+relay): the level-triggered reconciler re-reads mode + armed from the projection
+each cycle, woken by the fold's `data_version` bump. RPC handlers MAY write
 `.planctl` files and — via the scoped main-bridge — append real events
 to the log AND flip the `dead_letters` audit row in one transaction;
 never reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO
@@ -213,14 +220,18 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   QUERY surface is read-only (`query` → `result` + `patch` + `meta`); the
   reducer's `jobs` / `epics` projections and the `events` log have one
   canonical writer each (the hook for hook events; main for synthetic
-  events). The socket DOES carry `rpc` frames, but RPC handlers may write
-  only the `approval` field, into the GITIGNORED runtime sidecar
+  events). The socket DOES carry `rpc` frames, but RPC handlers write only a
+  tightly-scoped set of external surfaces — never the reducer's projections
+  directly. The `approval` field lands in the GITIGNORED runtime sidecar
   `.planctl/state/{epics,tasks}/<id>.state.json` (fn-732, NOT the committed def;
   via `set_task_approval` / `set_epic_approval`, create-if-absent + RMW, atomic
-  temp+rename, server-worker-owned single-flight) — never the reducer's
-  projections or the `events` log. The change round-trips through the plan-worker
-  file watcher, so the reducer remains the sole writer of `epics`. Consumers may
-  still read any of it directly from SQLite.
+  temp+rename, server-worker-owned single-flight); the change round-trips through
+  the plan-worker file watcher, so the reducer remains the sole writer of `epics`.
+  The other write verbs (`replay_dead_letter`, `retry_dispatch`, and the fn-751
+  autopilot pair `set_autopilot_mode` / `set_epic_armed`) APPEND a synthetic event
+  through the scoped main-bridge so the reducer — still the sole projection
+  writer — folds it on the next drain. Consumers may still read any of it directly
+  from SQLite.
 - **No live membership stream** — `meta.total` signals that the filtered set's
   size or membership *changed*, but it does NOT deliver the new members. Frozen
   membership stands: the live page never reflows. `meta` is a count/staleness
@@ -801,11 +812,14 @@ collapses to plain stream output. Run any of them with
   autopilot reconciler (the autopilot worker thread inside keeperd; see
   `## Architecture`). All dispatch decision, launch, confirmation, dedup,
   and (config-gated) reap live in the daemon; the CLI carries no dispatch
-  logic of its own. It subscribes through `src/readiness-client.ts` and the
-  `dispatch_failures` collection, renders a two-section frame
+  logic of its own. It subscribes through `src/readiness-client.ts`, the
+  `dispatch_failures` collection, the `autopilot_state` singleton, and the
+  `armed_epics` presence table; it renders a multi-section frame
   (`--- current ---` from `jobs` correlated by `plan_verb`+`plan_ref`,
-  `--- failed ---` from the `dispatch_failures` projection) plus a
-  paused/playing banner, and exposes three control RPCs:
+  `--- failed ---` from the `dispatch_failures` projection, `--- armed ---`
+  from `armed_epics`) plus a banner showing the paused/playing pill, the
+  `yolo`/`armed` mode, the armed count, and the concurrency cap, and exposes
+  these control RPCs:
 
   - `keeper autopilot play` / `keeper autopilot pause` — flip the autopilot
     pause flag on the daemon via `set_autopilot_paused`. The RPC appends an
@@ -826,6 +840,25 @@ collapses to plain stream output. Run any of them with
     next drain and the reconciler is free to re-attempt. There is no
     auto-retry — a failed dispatch is sticky and visible in the `--- failed
     ---` section until a human runs `retry`.
+  - `keeper autopilot mode <yolo|armed>` — set the autopilot mode via
+    `set_autopilot_mode` (fn-751, schema v62). **yolo** (the default) works
+    every ready epic; **armed** works ONLY explicitly-armed epics plus their
+    transitive upstream dep-closure. The RPC APPENDS an `AutopilotMode`
+    synthetic event onto main's writable connection (folded into the
+    `autopilot_state` singleton's `mode` column) and pumps a wake — NO relay:
+    the level-triggered reconciler re-reads mode from the projection each
+    cycle. Mode is durable user intent (persisted), so it survives restart and
+    there is no boot re-arm.
+  - `keeper autopilot arm <epic-id>` / `keeper autopilot disarm <epic-id>` —
+    add/remove an epic from the armed set via `set_epic_armed` (fn-751). The
+    RPC appends an `EpicArmed{epic_id, armed}` event (folded into the
+    `armed_epics` presence table: `armed:true` → row present, `armed:false`
+    → row deleted), same APPEND-ONLY/no-relay contract as `mode`. The
+    `epic_id` is appended UNCONDITIONALLY — no existence check — to dodge the
+    fold-lag race where a freshly-planned epic isn't yet in the `epics`
+    projection. In armed mode the banner shows `· N armed` (or `· nothing
+    armed` distinctly when the set is empty), and the `--- armed ---` section
+    lists the explicitly-armed epic ids.
 
   Alt-screen TUI when stdout is a TTY; keymap `←/h/k` / `→/l/j` / `g` /
   `G/Esc` / `space` pause / `c` copy / `q` quit. SIGINT tears down the
@@ -835,9 +868,13 @@ collapses to plain stream output. Run any of them with
   within ~2s (fn-723).
 
   ```sh
-  keeper autopilot                       # viewer: current / failed + paused state
+  keeper autopilot                       # viewer: current / failed / armed + mode banner
   keeper autopilot play                  # un-pause the reconciler
   keeper autopilot pause                 # pause the reconciler (default at boot)
+  keeper autopilot mode armed            # work only armed epics + their upstream closure
+  keeper autopilot mode yolo             # back to work-everything (default)
+  keeper autopilot arm fn-1-foo          # add fn-1-foo to the armed set
+  keeper autopilot disarm fn-1-foo       # remove fn-1-foo from the armed set
   keeper autopilot retry work::fn-1-x.3  # clear a sticky DispatchFailed
   ```
 

@@ -42,7 +42,12 @@ import {
 } from "../src/daemon";
 import { openDb, SCHEMA_VERSION } from "../src/db";
 import { serializeDeadLetterRecord } from "../src/dead-letter";
-import { encodeFrame, LineBuffer, type ServerFrame } from "../src/protocol";
+import {
+  encodeFrame,
+  LineBuffer,
+  type RpcFrame,
+  type ServerFrame,
+} from "../src/protocol";
 import { drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import { isPidAlive } from "../src/server-worker";
@@ -2681,6 +2686,151 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
   // Reaching here means the harness's `stop()` tore down all workers + db
   // WITHOUT a `process.exit` (a `process.exit` would have killed the test
   // runner). Clean in-process boot → fold → query → stop, proven.
+}, 30_000);
+
+// ---------------------------------------------------------------------------
+// fn-751 task .3 — set_autopilot_mode / set_epic_armed RPC round-trip
+// ---------------------------------------------------------------------------
+
+/**
+ * One control-RPC round-trip on a fresh UDS connection to the in-process
+ * daemon: write the `rpc` frame, await the `rpc_result` / `error` frame whose
+ * `id` matches, close. Mirrors the keystone test's query-socket shape.
+ */
+async function rpcRoundTrip(
+  sockPath: string,
+  frame: RpcFrame,
+): Promise<ServerFrame> {
+  const buffer = new LineBuffer();
+  const frames: ServerFrame[] = [];
+  const socket = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      data(_sock, chunk) {
+        for (const line of buffer.push(chunk.toString("utf8"))) {
+          if (line.trim().length > 0) {
+            frames.push(JSON.parse(line) as ServerFrame);
+          }
+        }
+      },
+    },
+  });
+  try {
+    socket.write(encodeFrame(frame));
+    const reply = await retryUntil(() => {
+      const hit = frames.find(
+        (f) =>
+          (f.type === "rpc_result" || f.type === "error") &&
+          (f as { id?: string }).id === frame.id,
+      );
+      return hit ?? null;
+    }, 10_000);
+    if (reply === null) {
+      throw new Error(
+        `no rpc_result/error frame for ${frame.method} (id ${frame.id}) within 10s`,
+      );
+    }
+    return reply;
+  } finally {
+    socket.end();
+  }
+}
+
+test("fn-751: set_autopilot_mode RPC round-trips and folds the autopilot_state singleton's mode column", async () => {
+  await withInProcessDaemon(
+    async ({ dbPath, sockPath }) => {
+      const reply = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "mode-1",
+        method: "set_autopilot_mode",
+        params: { mode: "armed" },
+      });
+      expect(reply.type).toBe("rpc_result");
+      expect((reply as { value: unknown }).value).toEqual({
+        ok: true,
+        mode: "armed",
+      });
+
+      // The daemon appended an `AutopilotMode` event; the wake worker drained
+      // it into the singleton. Re-query the projection until the fold lands.
+      const reader = openDb(dbPath, { readonly: true }).db;
+      const mode = await retryUntil(() => {
+        const row = reader
+          .query("SELECT mode FROM autopilot_state WHERE id = 1")
+          .get() as { mode: string } | null;
+        return row?.mode === "armed" ? row.mode : null;
+      }, 10_000);
+      reader.close();
+      expect(mode).toBe("armed");
+    },
+    { workers: ["wake", "server"] },
+  );
+}, 30_000);
+
+test("fn-751: set_autopilot_mode rejects an unknown enum value with a bad_params error (no fold)", async () => {
+  await withInProcessDaemon(
+    async ({ sockPath }) => {
+      const reply = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "mode-bad",
+        method: "set_autopilot_mode",
+        params: { mode: "turbo" },
+      });
+      expect(reply.type).toBe("error");
+      expect((reply as { code: string }).code).toBe("bad_params");
+    },
+    { workers: ["wake", "server"] },
+  );
+}, 30_000);
+
+test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence table (arm then disarm)", async () => {
+  await withInProcessDaemon(
+    async ({ dbPath, sockPath }) => {
+      // Arm: the presence row appears.
+      const armReply = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "arm-1",
+        method: "set_epic_armed",
+        params: { epic_id: "fn-42-armed", armed: true },
+      });
+      expect(armReply.type).toBe("rpc_result");
+      expect((armReply as { value: unknown }).value).toEqual({
+        ok: true,
+        epic_id: "fn-42-armed",
+        armed: true,
+      });
+
+      const reader = openDb(dbPath, { readonly: true }).db;
+      const armed = await retryUntil(() => {
+        const row = reader
+          .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
+          .get("fn-42-armed") as { epic_id: string } | null;
+        return row ?? null;
+      }, 10_000);
+      expect(armed).not.toBeNull();
+
+      // Disarm: the presence row is DELETEd.
+      const disarmReply = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "disarm-1",
+        method: "set_epic_armed",
+        params: { epic_id: "fn-42-armed", armed: false },
+      });
+      expect(disarmReply.type).toBe("rpc_result");
+
+      const gone = await retryUntil(() => {
+        const row = reader
+          .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
+          .get("fn-42-armed") as { epic_id: string } | null;
+        // retryUntil treats a non-null return as "settled"; sentinel `true`
+        // means "row is gone".
+        return row === null ? true : null;
+      }, 10_000);
+      reader.close();
+      expect(gone).toBe(true);
+    },
+    { workers: ["wake", "server"] },
+  );
 }, 30_000);
 
 // ---------------------------------------------------------------------------

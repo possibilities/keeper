@@ -81,11 +81,17 @@ shape because a consumer reads it.
 ## Writes are tightly scoped — DO NOT widen them
 
 - **No general write path into the reducer.** The socket carries `query` (read)
-  and `rpc` (mutate). RPC may write ONLY four surfaces, each of which round-trips
+  and `rpc` (mutate). RPC may write ONLY six surfaces, each of which round-trips
   through a synthetic event so a re-fold sees it: (1) the `approval` field, written
   to the gitignored runtime sidecar `.planctl/state/{epics,tasks}/<id>.state.json`
   (fn-732 — NOT the committed def), (2) `replay_dead_letter`, (3) `retry_dispatch`,
-  (4) `set_autopilot_paused`. RPC handlers MUST NOT write `jobs`/`epics`/etc directly.
+  (4) `set_autopilot_paused`, (5) `set_autopilot_mode` (fn-751 — appends an
+  `AutopilotMode` event onto the `autopilot_state` singleton's `mode` column),
+  (6) `set_epic_armed` (fn-751 — appends an `EpicArmed` event onto the
+  `armed_epics` presence table). RPC handlers MUST NOT write `jobs`/`epics`/etc
+  directly. The fn-751 pair is APPEND-ONLY (no main→worker relay, unlike
+  `set_autopilot_paused`): the level-triggered reconciler re-reads mode + armed
+  from the projection each cycle, woken by the fold's `data_version` bump.
 - **Plans are READ-ONLY except `approval`.** The plan worker folds
   `.planctl/{epics,tasks}` snapshots into `epics`; the only writable field is
   `approval`. fn-732 moved `approval` out of the committed def into the gitignored
@@ -190,6 +196,26 @@ the per-epic / per-root mutex. Common gates: won't dispatch against an uncommitt
 epic, into a dirty repo, during the launch→SessionStart blind window, or against a
 taskless epic. To inspect, read `src/readiness.ts` and `src/autopilot-worker.ts`;
 the `[paused]` banner in `keeper autopilot` is authoritative.
+
+**Mode (`yolo` | `armed`, fn-751, schema v62).** An explicit autopilot mode enum
+on the `autopilot_state` singleton's `mode` column (defaults `'yolo'` on a
+zero-event / pre-existing DB — the backward-compatible work-everything baseline).
+**yolo** works every ready epic until none remain (byte-for-byte today's
+behavior). **armed** works ONLY a human-chosen set of armed epics PLUS their
+transitive upstream dep-closure — arming an epic also pulls in the prerequisites
+it can't complete without (multi-source BFS over reversed `resolved_epic_deps`
+edges, cycle-safe), so it never deadlocks on an unarmed (possibly cross-project)
+upstream. The per-epic armed flag is a PRESENCE table (`armed_epics`): row present
+= armed. Both are written via the `set_autopilot_mode` / `set_epic_armed` RPCs
+(synthetic `AutopilotMode` / `EpicArmed` events) and READ FROM THE PROJECTION each
+reconcile cycle — no relay, no `ReconcileState` cache — so they survive restart
+for free. The mode check is a SUPPRESSION ARM inside reconcile (a desired-state
+verdict, not a readiness pre-filter — `readiness.ts` is untouched); `approve` /
+`close` finalizers + completion-reap are mode-EXEMPT, so disarming mid-flight
+never orphans a live worker or leaks zellij surfaces. The human controls it via
+`keeper autopilot mode <yolo|armed>` / `arm <epic>` / `disarm <epic>`; the
+`keeper autopilot` banner shows `[playing] · <mode> · N armed` (empty-armed-in-
+armed-mode renders distinctly as `· nothing armed`).
 
 **Global cap (`max_concurrent_jobs`)** counts root-occupants (planner-exempt,
 and now approve-exempt) before per-epic dispatch; the budget governs only

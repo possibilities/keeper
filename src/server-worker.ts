@@ -251,6 +251,57 @@ export interface RetryDispatchResultMessage {
 }
 
 /**
+ * Worker→main request bridge for the `set_autopilot_mode` RPC (fn-751 task
+ * .3). The async-RPC handler validates the `mode: 'yolo'|'armed'` enum, posts
+ * this message, and awaits the matching {@link SetAutopilotModeResultMessage}
+ * reply. Main APPENDS an `AutopilotMode` synthetic event onto the writable
+ * connection (folded into the `autopilot_state` singleton's `mode` column) and
+ * pumps a wake.
+ *
+ * Deliberately UNLIKE {@link SetAutopilotPausedRequestMessage}: main does NOT
+ * relay to the autopilot worker. The reconciler is level-triggered and re-reads
+ * `mode` from the projection every cycle — the fold's `data_version` bump wakes
+ * it. Mode is durable user intent (persisted), not a safety reset, so there is
+ * no in-memory main-side flag and no boot re-arm.
+ */
+export interface SetAutopilotModeRequestMessage {
+  kind: "set-autopilot-mode-request";
+  id: string;
+  mode: "yolo" | "armed";
+}
+
+/** Main→worker reply paired with {@link SetAutopilotModeRequestMessage}. */
+export interface SetAutopilotModeResultMessage {
+  type: "set-autopilot-mode-result";
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
+ * Worker→main request bridge for the `set_epic_armed` RPC (fn-751 task .3).
+ * The async-RPC handler validates the `{ epic_id, armed }` shape, posts this
+ * message, and awaits the matching {@link SetEpicArmedResultMessage} reply.
+ * Main APPENDS an `EpicArmed` synthetic event onto the writable connection
+ * (folded into the `armed_epics` PRESENCE table) and pumps a wake — same
+ * APPEND-ONLY / no-relay contract as {@link SetAutopilotModeRequestMessage}.
+ */
+export interface SetEpicArmedRequestMessage {
+  kind: "set-epic-armed-request";
+  id: string;
+  epic_id: string;
+  armed: boolean;
+}
+
+/** Main→worker reply paired with {@link SetEpicArmedRequestMessage}. */
+export interface SetEpicArmedResultMessage {
+  type: "set-epic-armed-result";
+  id: string;
+  ok: boolean;
+  error?: string;
+}
+
+/**
  * Poll cadence (ms) for the realtime `data_version` loop. Mirrors the wake
  * worker's defaults — 50 ms is the sweet spot, floored at 25 ms to avoid
  * burning a core.
@@ -1229,6 +1280,32 @@ export interface ReplayBridge {
   retryDispatch(
     verb: "work" | "close" | "approve",
     dispatch_id: string,
+  ): Promise<{
+    ok: boolean;
+    error?: string;
+  }>;
+  /**
+   * Ask main to APPEND an `AutopilotMode` synthetic event onto the writable
+   * connection (folded into the `autopilot_state` singleton's `mode` column)
+   * and pump a wake. Resolves `{ok:true}` once main has inserted the event.
+   * Rejects on bridge timeout. NO relay to the autopilot worker — the
+   * reconciler re-reads mode from the projection each cycle. Fn-751 task .3.
+   */
+  setAutopilotMode(mode: "yolo" | "armed"): Promise<{
+    ok: boolean;
+    error?: string;
+  }>;
+  /**
+   * Ask main to APPEND an `EpicArmed` synthetic event onto the writable
+   * connection (folded into the `armed_epics` PRESENCE table) and pump a wake.
+   * Resolves `{ok:true}` once main has inserted the event. Rejects on bridge
+   * timeout. APPEND-ONLY (no relay), no existence validation on `epic_id` —
+   * the handler appends unconditionally to dodge the fold-lag race. Fn-751
+   * task .3.
+   */
+  setEpicArmed(
+    epic_id: string,
+    armed: boolean,
   ): Promise<{
     ok: boolean;
     error?: string;
@@ -2695,6 +2772,24 @@ function main(): void {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  /** Pending `set_autopilot_mode` requests, correlated by id (fn-751 task .3). */
+  const pendingSetMode = new Map<
+    string,
+    {
+      resolve: (r: SimpleResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
+  /** Pending `set_epic_armed` requests, correlated by id (fn-751 task .3). */
+  const pendingSetArmed = new Map<
+    string,
+    {
+      resolve: (r: SimpleResolution) => void;
+      reject: (e: Error) => void;
+      timer: ReturnType<typeof setTimeout>;
+    }
+  >();
   const bridge: ReplayBridge = {
     replay(): Promise<ReplayResolution> {
       return new Promise<ReplayResolution>((resolve, reject) => {
@@ -2760,6 +2855,49 @@ function main(): void {
           verb,
           dispatch_id,
         } satisfies RetryDispatchRequestMessage);
+      });
+    },
+    setAutopilotMode(mode: "yolo" | "armed"): Promise<SimpleResolution> {
+      return new Promise<SimpleResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingSetMode.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingSetMode.set(reqId, { resolve, reject, timer });
+        parentPort?.postMessage({
+          kind: "set-autopilot-mode-request",
+          id: reqId,
+          mode,
+        } satisfies SetAutopilotModeRequestMessage);
+      });
+    },
+    setEpicArmed(epic_id: string, armed: boolean): Promise<SimpleResolution> {
+      return new Promise<SimpleResolution>((resolve, reject) => {
+        const reqId = crypto.randomUUID();
+        const timer = setTimeout(() => {
+          if (pendingSetArmed.delete(reqId)) {
+            reject(
+              new Error(
+                `no response from main within ${REPLAY_DEADLINE_MS}ms (id ${reqId})`,
+              ),
+            );
+          }
+        }, REPLAY_DEADLINE_MS);
+        timer.unref?.();
+        pendingSetArmed.set(reqId, { resolve, reject, timer });
+        parentPort?.postMessage({
+          kind: "set-epic-armed-request",
+          id: reqId,
+          epic_id,
+          armed,
+        } satisfies SetEpicArmedRequestMessage);
       });
     },
   };
@@ -2830,6 +2968,8 @@ function main(): void {
         | ReplayResultMessage
         | SetAutopilotPausedResultMessage
         | RetryDispatchResultMessage
+        | SetAutopilotModeResultMessage
+        | SetEpicArmedResultMessage
         | undefined,
     ) => {
       if (!msg) return;
@@ -2889,6 +3029,27 @@ function main(): void {
         const entry = pendingRetryDispatch.get(r.id);
         if (!entry) return;
         pendingRetryDispatch.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, error: r.error });
+        return;
+      }
+      if (
+        (msg as SetAutopilotModeResultMessage).type ===
+        "set-autopilot-mode-result"
+      ) {
+        const r = msg as SetAutopilotModeResultMessage;
+        const entry = pendingSetMode.get(r.id);
+        if (!entry) return;
+        pendingSetMode.delete(r.id);
+        clearTimeout(entry.timer);
+        entry.resolve({ ok: r.ok, error: r.error });
+        return;
+      }
+      if ((msg as SetEpicArmedResultMessage).type === "set-epic-armed-result") {
+        const r = msg as SetEpicArmedResultMessage;
+        const entry = pendingSetArmed.get(r.id);
+        if (!entry) return;
+        pendingSetArmed.delete(r.id);
         clearTimeout(entry.timer);
         entry.resolve({ ok: r.ok, error: r.error });
         return;

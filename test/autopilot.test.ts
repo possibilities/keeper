@@ -29,8 +29,12 @@ import {
   autopilotBannerLabel,
   buildCurrentRows,
   buildRetryFrame,
+  buildSetArmedFrame,
+  buildSetModeFrame,
   buildSetPausedFrame,
   type FailedRow,
+  projectArmedEpics,
+  projectAutopilotMode,
   projectAutopilotPaused,
   projectFailedRows,
   projectMaxConcurrentJobs,
@@ -457,6 +461,53 @@ test("renderBody — all four sections emit together in current → stopped → 
   ]);
 });
 
+test("renderBody — armed section lists the explicitly-armed epic ids (fn-751)", () => {
+  const lines = renderBody({
+    current: [],
+    failed: [],
+    paused: false,
+    armed: ["fn-1-foo", "fn-2-bar"],
+  });
+  expect(lines).toEqual(["--- armed ---", "fn-1-foo", "fn-2-bar"]);
+});
+
+test("renderBody — empty/absent armed set renders no armed section (fn-751)", () => {
+  // The "nothing armed in armed mode" callout lives on the BANNER, not the
+  // body — an empty armed set emits no `--- armed ---` header here.
+  expect(
+    renderBody({ current: [], failed: [], paused: false, armed: [] }),
+  ).toEqual([]);
+  expect(renderBody({ current: [], failed: [], paused: false })).toEqual([]);
+});
+
+test("renderBody — armed section sits between failed and dependencies (fn-751)", () => {
+  const lines = renderBody({
+    current: [],
+    failed: [
+      {
+        verb: "work",
+        id: "fn-1-foo.3",
+        reason: "confirm timeout",
+        dir: "/repo",
+        ts: "2026-05-31T12:00:00Z",
+      },
+    ],
+    armed: ["fn-7-armed"],
+    dependencies: ["fn-1-foo", "  ▸ .1"],
+    paused: false,
+  });
+  expect(lines).toEqual([
+    "--- failed ---",
+    "(/repo) work::fn-1-foo.3 — confirm timeout",
+    "--- armed ---",
+    "fn-7-armed",
+    "--- dependencies ---",
+    "legend: ✓ done  ▸ running  ○ ready  · blocked   (← waits for)",
+    "fn-1-foo",
+    "  ▸ .1",
+  ]);
+});
+
 test("renderBody — only stopped populated renders only the stopped header + rows", () => {
   const lines = renderBody({
     current: [
@@ -527,6 +578,94 @@ test("buildRetryFrame — passes the dispatch key verbatim (server validates the
   expect((frame as unknown as { params: { id: string } }).params.id).toBe(
     "garbage",
   );
+});
+
+// ---------------------------------------------------------------------------
+// buildSetModeFrame / buildSetArmedFrame — fn-751 control-RPC frame builders.
+// ---------------------------------------------------------------------------
+
+test("buildSetModeFrame — armed emits the canonical set_autopilot_mode shape (fn-751)", () => {
+  expect(buildSetModeFrame("rpc-uuid-5", "armed")).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-5",
+    method: "set_autopilot_mode",
+    params: { mode: "armed" },
+  });
+});
+
+test("buildSetModeFrame — yolo emits mode:yolo (fn-751)", () => {
+  expect(buildSetModeFrame("rpc-uuid-6", "yolo")).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-6",
+    method: "set_autopilot_mode",
+    params: { mode: "yolo" },
+  });
+});
+
+test("buildSetArmedFrame — arm emits set_epic_armed {epic_id, armed:true} (fn-751)", () => {
+  expect(buildSetArmedFrame("rpc-uuid-7", "fn-1-foo", true)).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-7",
+    method: "set_epic_armed",
+    params: { epic_id: "fn-1-foo", armed: true },
+  });
+});
+
+test("buildSetArmedFrame — disarm emits armed:false (fn-751)", () => {
+  expect(buildSetArmedFrame("rpc-uuid-8", "fn-1-foo", false)).toEqual({
+    type: "rpc",
+    id: "rpc-uuid-8",
+    method: "set_epic_armed",
+    params: { epic_id: "fn-1-foo", armed: false },
+  });
+});
+
+// ---------------------------------------------------------------------------
+// projectAutopilotMode / projectArmedEpics — fn-751 socket-sourced projections.
+// ---------------------------------------------------------------------------
+
+test("projectAutopilotMode — empty row set → null (singleton not folded yet) (fn-751)", () => {
+  expect(projectAutopilotMode([])).toBeNull();
+});
+
+test("projectAutopilotMode — mode='armed' row → 'armed' (fn-751)", () => {
+  expect(projectAutopilotMode([{ id: 1, mode: "armed" }])).toBe("armed");
+});
+
+test("projectAutopilotMode — mode='yolo' row → 'yolo' (fn-751)", () => {
+  expect(projectAutopilotMode([{ id: 1, mode: "yolo" }])).toBe("yolo");
+});
+
+test("projectAutopilotMode — unknown/missing value falls back to 'yolo' (default) (fn-751)", () => {
+  // A non-empty row whose `mode` is missing or garbage defaults to the
+  // work-everything baseline, never `armed` (the safe-to-render fallback).
+  expect(projectAutopilotMode([{ id: 1 }])).toBe("yolo");
+  expect(projectAutopilotMode([{ id: 1, mode: "ARMED" }])).toBe("yolo");
+  expect(projectAutopilotMode([{ id: 1, mode: 7 }])).toBe("yolo");
+});
+
+test("projectArmedEpics — empty rows → [] (fn-751)", () => {
+  expect(projectArmedEpics([])).toEqual([]);
+});
+
+test("projectArmedEpics — projects + sorts the armed epic ids ascending (fn-751)", () => {
+  // Server sends `created_at DESC`; we re-sort by id for a stable render.
+  const rows = [
+    { epic_id: "fn-9-zed", created_at: 3 },
+    { epic_id: "fn-1-foo", created_at: 1 },
+    { epic_id: "fn-4-bar", created_at: 2 },
+  ];
+  expect(projectArmedEpics(rows)).toEqual(["fn-1-foo", "fn-4-bar", "fn-9-zed"]);
+});
+
+test("projectArmedEpics — skips rows with an empty/missing epic_id (fn-751)", () => {
+  const rows = [
+    { epic_id: "fn-1-foo" },
+    { epic_id: "" },
+    { created_at: 5 },
+    { epic_id: "fn-2-bar" },
+  ];
+  expect(projectArmedEpics(rows)).toEqual(["fn-1-foo", "fn-2-bar"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -642,30 +781,75 @@ test("projectMaxConcurrentJobs — non-positive / non-integer values → null (f
 });
 
 // ---------------------------------------------------------------------------
-// autopilotBannerLabel — the persistent banner pill: play/pause pill +
-// concurrency-cap suffix. `[playing] · max 3` (finite) / `· max ∞`
-// (unlimited). Sourced from viewer state, never config. fn-725.
+// autopilotBannerLabel — the persistent banner pill: play/pause pill + mode
+// suffix + concurrency-cap suffix (+ armed count in armed mode). fn-725 (cap)
+// extended by fn-751 (mode + armed). Sourced from viewer state, never config.
 // ---------------------------------------------------------------------------
 
-test("autopilotBannerLabel — finite cap renders `[playing] · max 3` (fn-725)", () => {
-  expect(autopilotBannerLabel({ paused: false, maxConcurrentJobs: 3 })).toBe(
-    "[playing] · max 3",
-  );
+test("autopilotBannerLabel — yolo mode + finite cap renders `[playing] · yolo · max 3` (fn-725/fn-751)", () => {
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: 3,
+      mode: "yolo",
+      armedCount: 0,
+    }),
+  ).toBe("[playing] · yolo · max 3");
 });
 
-test("autopilotBannerLabel — unlimited cap renders `· max ∞` (fn-725)", () => {
-  expect(autopilotBannerLabel({ paused: true, maxConcurrentJobs: null })).toBe(
-    "[paused] · max ∞",
-  );
+test("autopilotBannerLabel — yolo mode never shows an armed count even with a nonzero count (fn-751)", () => {
+  // yolo dispatches everything — the armed set is irrelevant, so the count is
+  // suppressed regardless of what `armed_epics` happens to contain.
+  expect(
+    autopilotBannerLabel({
+      paused: true,
+      maxConcurrentJobs: null,
+      mode: "yolo",
+      armedCount: 4,
+    }),
+  ).toBe("[paused] · yolo · max ∞");
 });
 
-test("autopilotBannerLabel — paused flag drives the pill independent of cap (fn-725)", () => {
-  expect(autopilotBannerLabel({ paused: true, maxConcurrentJobs: 5 })).toBe(
-    "[paused] · max 5",
-  );
-  expect(autopilotBannerLabel({ paused: false, maxConcurrentJobs: null })).toBe(
-    "[playing] · max ∞",
-  );
+test("autopilotBannerLabel — armed mode shows the armed count (fn-751)", () => {
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: 2,
+      mode: "armed",
+      armedCount: 2,
+    }),
+  ).toBe("[playing] · armed · 2 armed · max 2");
+});
+
+test("autopilotBannerLabel — armed mode with NOTHING armed renders distinctly (idle-by-design, not broken) (fn-751)", () => {
+  // The empty-armed-set-in-armed-mode case must read as a deliberate state.
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      mode: "armed",
+      armedCount: 0,
+    }),
+  ).toBe("[playing] · armed · nothing armed · max ∞");
+});
+
+test("autopilotBannerLabel — paused flag drives the pill independent of mode/cap (fn-725/fn-751)", () => {
+  expect(
+    autopilotBannerLabel({
+      paused: true,
+      maxConcurrentJobs: 5,
+      mode: "armed",
+      armedCount: 1,
+    }),
+  ).toBe("[paused] · armed · 1 armed · max 5");
+  expect(
+    autopilotBannerLabel({
+      paused: false,
+      maxConcurrentJobs: null,
+      mode: "yolo",
+      armedCount: 0,
+    }),
+  ).toBe("[playing] · yolo · max ∞");
 });
 
 // ---------------------------------------------------------------------------
