@@ -129,9 +129,9 @@ def test_normalize_epic_adds_default_bundles_on_legacy():
 
 def test_normalize_epic_preserves_existing_bundles():
     """normalize_epic does not overwrite an existing bundles list and preserves order."""
-    data = {"bundles": ["arc/snippeting/main", "bundle/foo"]}
+    data = {"bundles": ["bundle/snippeting-main", "bundle/foo"]}
     normalize_epic(data)
-    assert data["bundles"] == ["arc/snippeting/main", "bundle/foo"]
+    assert data["bundles"] == ["bundle/snippeting-main", "bundle/foo"]
 
 
 def test_normalize_task_adds_default_snippets_on_legacy():
@@ -157,9 +157,9 @@ def test_normalize_task_adds_default_bundles_on_legacy():
 
 def test_normalize_task_preserves_existing_bundles():
     """normalize_task does not overwrite an existing bundles list and preserves order."""
-    data = {"bundles": ["arc/snippeting/main", "sketch/foo"]}
+    data = {"bundles": ["bundle/snippeting-main", "sketch/foo"]}
     normalize_task(data)
-    assert data["bundles"] == ["arc/snippeting/main", "sketch/foo"]
+    assert data["bundles"] == ["bundle/snippeting-main", "sketch/foo"]
 
 
 # ---------------------------------------------------------------------------

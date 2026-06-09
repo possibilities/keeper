@@ -121,7 +121,7 @@ def inline_sketch_refs_batch(
     timeout, non-zero exit, or non-JSON stdout) — fail-visibly, no fallback.
 
     Sketch-free fast path: ``promptctl inline-sketch-refs`` only acts on
-    ``sketch/`` refs — ``bundle/`` / ``arc/`` refs and bare ids pass through
+    ``sketch/`` refs — ``bundle/`` refs and bare ids pass through
     unchanged, and the sole transform on a sketch-free group is a first-seen
     dedup of its ``snippets`` (``promptctl.api.inline_sketch_refs``). So when
     NO group in the batch carries a ``sketch/`` ref, the subprocess is a pure

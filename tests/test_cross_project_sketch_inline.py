@@ -458,12 +458,12 @@ def test_epic_set_bundles_empty_sketch_drops_ref(two_projects):
             "set-bundles",
             epic_id,
             "--bundles",
-            "sketch/esb-empty,arc/snippeting/main",
+            "sketch/esb-empty,bundle/snippeting-main",
         ]
     )
     assert r.exit_code == 0, r.output
     epic_def = _read_json(proj_b / ".planctl" / "epics" / f"{epic_id}.json")
-    assert epic_def["bundles"] == ["arc/snippeting/main"]
+    assert epic_def["bundles"] == ["bundle/snippeting-main"]
     assert epic_def["snippets"] == []
 
 

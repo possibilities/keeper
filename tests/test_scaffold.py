@@ -224,7 +224,7 @@ def test_scaffold_epic_carries_snippets_bundles(planctl_git_repo):
 epic:
   title: snippet metadata
   snippets: [snip-a, snip-b]
-  bundles: [bundle/dev-env, arc/snippeting/main]
+  bundles: [bundle/dev-env, bundle/snippeting-main]
   spec: |
     ## Overview
     yes.
@@ -246,7 +246,7 @@ tasks:
         (planctl_git_repo / ".planctl" / "epics" / f"{epic_id}.json").read_text()
     )
     assert epic_def["snippets"] == ["snip-a", "snip-b"]
-    assert epic_def["bundles"] == ["bundle/dev-env", "arc/snippeting/main"]
+    assert epic_def["bundles"] == ["bundle/dev-env", "bundle/snippeting-main"]
     # fn-587 task .3: Fresh epic from scaffold ships pre-stamped (the in-memory
     # integrity check ran clean, so we mint with last_validated_at = now_iso()).
     # Prior behaviour was None-on-write + normalize_epic filling on load.
@@ -403,7 +403,7 @@ tasks:
     deps: []
     tier: medium
     snippets: [task-pre]
-    bundles: [sketch/draft-task, arc/snippeting/main]
+    bundles: [sketch/draft-task, bundle/snippeting-main]
     spec: |
 {_indent(_VALID_TASK_SPEC, 6)}
 """
@@ -424,7 +424,7 @@ tasks:
         (planctl_git_repo / ".planctl" / "tasks" / f"{epic_id}.1.json").read_text()
     )
     assert task_def["snippets"] == ["task-pre", "task-snip-1"]
-    assert task_def["bundles"] == ["arc/snippeting/main"]
+    assert task_def["bundles"] == ["bundle/snippeting-main"]
     assert all(not b.startswith("sketch/") for b in task_def["bundles"])
 
 
@@ -876,7 +876,7 @@ epic:
 tasks:
   - title: only task
     deps: []
-    bundles: ["arc/foo/../etc"]
+    bundles: ["bundle/foo/../etc"]
     spec: |
 {_indent(_VALID_TASK_SPEC, 6)}
 """

@@ -11,7 +11,7 @@ shape changes, update the SKILL.md per-snippet-id assertion in lockstep.
 from __future__ import annotations
 
 import pytest
-from planctl.bundle_ref import SNIPPET_ID_RE
+from planctl.bundle_ref import BUNDLE_REF_RE, SNIPPET_ID_RE
 
 
 @pytest.mark.parametrize(
@@ -49,3 +49,48 @@ def test_snippet_id_re_rejects_malformed(snippet_id: str) -> None:
 def test_snippet_id_re_accepts_kebab_case(snippet_id: str) -> None:
     """Well-formed kebab-case snippet ids must be accepted."""
     assert SNIPPET_ID_RE.match(snippet_id) is not None
+
+
+# ---------------------------------------------------------------------------
+# BUNDLE_REF_RE shape — the two valid namespaces are ``bundle/`` and
+# ``sketch/``.  Any other namespace prefix (including the legacy ``arc``
+# namespace, fn-654) is rejected outright; the rejection cases below guard
+# against an accidental re-add.
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        # fn-654: the legacy "arc" namespace is no longer valid. Guards re-add.
+        "arc/foo/bar",
+        "arc/snippeting/main",
+        "arc/foo/../etc",
+        # Path-traversal / over-deep / case / empty-segment rejects.
+        "bundle/foo/../etc",
+        "bundle/a/b/c",
+        "Bundle/Dev",
+        "bundle/",
+        "bundle/UPPER",
+        "ftp/x",
+        "/abs/path",
+    ],
+)
+def test_bundle_ref_re_rejects(ref: str) -> None:
+    """Retired "arc" namespace and malformed refs must be rejected."""
+    assert BUNDLE_REF_RE.match(ref) is None
+
+
+@pytest.mark.parametrize(
+    "ref",
+    [
+        "bundle/dev-env",
+        "bundle/snippeting-main",
+        "bundle/foo/bar",
+        "sketch/runtime-substrate",
+        "sketch/draft-1",
+    ],
+)
+def test_bundle_ref_re_accepts(ref: str) -> None:
+    """Well-formed ``bundle/`` and ``sketch/`` refs must be accepted."""
+    assert BUNDLE_REF_RE.match(ref) is not None

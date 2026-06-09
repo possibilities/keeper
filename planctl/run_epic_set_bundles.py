@@ -6,10 +6,10 @@ with no value) clears the list.  No ``--append`` flag.
 
 Each bundle ref must match::
 
-    ^(bundle|arc|sketch)/[a-z][a-z0-9-]*(/[a-z][a-z0-9-]*)?$
+    ^(bundle|sketch)/[a-z][a-z0-9-]*(/[a-z][a-z0-9-]*)?$
 
-which admits ``bundle/dev-env``, ``arc/snippeting/main``,
-``sketch/runtime-substrate`` and rejects path-traversal (``arc/foo/../etc``)
+which admits ``bundle/dev-env``, ``bundle/snippeting-main``,
+``sketch/runtime-substrate`` and rejects path-traversal (``bundle/foo/../etc``)
 before the ref ever flows into a shell at inheritor-tier render time.
 
 Joins ``VALIDATION_RESTAMP_VERBS`` — replacing the bundle list is a structural
@@ -49,7 +49,7 @@ def run(args: SimpleNamespace) -> int:
         if not BUNDLE_REF_RE.match(ref):
             emit_error(
                 f"Invalid bundle ref: {ref!r}. Must match "
-                "(bundle|arc|sketch)/<name>[/<name>] with kebab-case segments."
+                "(bundle|sketch)/<name>[/<name>] with kebab-case segments."
             )
 
     ctx = resolve_project()

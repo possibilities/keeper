@@ -224,8 +224,8 @@ def test_task_set_bundles_success(tmp_path):
 
     # fn-610: ``sketch/`` refs now resolve at write time and inline their
     # snippet ids into the persisted ``snippets``; the ref is dropped from
-    # ``bundles``. Test only the ``bundle/`` + ``arc/`` passthrough here (which
-    # hit the sketch-free fast path and need no ``mock_sketch_refs``); the
+    # ``bundles``. Test only the ``bundle/`` passthrough here (which hits the
+    # sketch-free fast path and needs no ``mock_sketch_refs``); the
     # sketch-inlining happy path lives in ``test_cross_project_sketch_inline.py``.
     result = _run(
         [
@@ -233,14 +233,14 @@ def test_task_set_bundles_success(tmp_path):
             "set-bundles",
             task_id,
             "--bundles",
-            "bundle/dev-env,arc/snippeting/main",
+            "bundle/dev-env,bundle/snippeting-main",
         ],
         cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     assert _read_task_json(tmp_path, task_id)["bundles"] == [
         "bundle/dev-env",
-        "arc/snippeting/main",
+        "bundle/snippeting-main",
     ]
 
 
@@ -267,23 +267,27 @@ def test_task_set_bundles_replaces_not_appends(tmp_path):
         cwd=str(tmp_path),
     )
     _run(
-        ["task", "set-bundles", task_id, "--bundles", "arc/x/y"],
+        ["task", "set-bundles", task_id, "--bundles", "bundle/x/y"],
         cwd=str(tmp_path),
     )
-    assert _read_task_json(tmp_path, task_id)["bundles"] == ["arc/x/y"]
+    assert _read_task_json(tmp_path, task_id)["bundles"] == ["bundle/x/y"]
 
 
 def test_task_set_bundles_rejects_path_traversal(tmp_path):
     _, (task_id,) = _seed(tmp_path)
 
     for bad in [
-        "arc/foo/../etc",
+        "bundle/foo/../etc",
         "bundle/",
         "Bundle/Dev",
         "ftp/x",
-        "arc/a/b/c",
+        "bundle/a/b/c",
         "/abs/path",
         "bundle/UPPER",
+        # fn-654: the legacy "arc" namespace is retired — refs that once
+        # matched it are now rejected outright (guards against re-add).
+        "arc/foo/bar",
+        "arc/snippeting/main",
     ]:
         result = _run(
             ["task", "set-bundles", task_id, "--bundles", bad],
@@ -344,12 +348,12 @@ def test_epic_set_bundles_success_and_marker(tmp_path, fixed_clock):
     _stamp_marker(tmp_path, epic_id)
 
     result = _run(
-        ["epic", "set-bundles", epic_id, "--bundles", "arc/snippeting/main"],
+        ["epic", "set-bundles", epic_id, "--bundles", "bundle/snippeting-main"],
         cwd=str(tmp_path),
     )
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     epic_data = _read_epic_json(tmp_path, epic_id)
-    assert epic_data["bundles"] == ["arc/snippeting/main"]
+    assert epic_data["bundles"] == ["bundle/snippeting-main"]
     assert epic_data["last_validated_at"] == fixed_clock
 
 
@@ -357,7 +361,7 @@ def test_epic_set_bundles_rejects_path_traversal(tmp_path):
     epic_id, _ = _seed(tmp_path)
 
     result = _run(
-        ["epic", "set-bundles", epic_id, "--bundles", "arc/foo/../etc"],
+        ["epic", "set-bundles", epic_id, "--bundles", "bundle/foo/../etc"],
         cwd=str(tmp_path),
     )
     assert result.returncode != 0, f"Expected reject: {result.stdout}"
@@ -438,7 +442,7 @@ def test_show_epic_surfaces_snippets_bundles(tmp_path):
         cwd=str(tmp_path),
     )
     _run(
-        ["epic", "set-bundles", epic_id, "--bundles", "arc/snippeting/main"],
+        ["epic", "set-bundles", epic_id, "--bundles", "bundle/snippeting-main"],
         cwd=str(tmp_path),
     )
 
@@ -446,7 +450,7 @@ def test_show_epic_surfaces_snippets_bundles(tmp_path):
     assert result.returncode == 0, f"{result.stdout}\n{result.stderr}"
     payload = _parse_json_stream(result.stdout)[0]
     assert payload["epic"]["snippets"] == ["epic-snip"]
-    assert payload["epic"]["bundles"] == ["arc/snippeting/main"]
+    assert payload["epic"]["bundles"] == ["bundle/snippeting-main"]
 
     human = _run(
         ["show", epic_id, "--format", "human"],
@@ -454,4 +458,4 @@ def test_show_epic_surfaces_snippets_bundles(tmp_path):
     )
     assert human.returncode == 0, f"{human.stdout}\n{human.stderr}"
     assert "Snippets: epic-snip" in human.stdout
-    assert "Bundles: arc/snippeting/main" in human.stdout
+    assert "Bundles: bundle/snippeting-main" in human.stdout

@@ -46,20 +46,20 @@ planctl detect || planctl init
 
 ### Phase 1a — First-line `--bundle <ref>` / `--snippets a,b,c` wire format
 
-Before any other Phase 1 routing, inspect the first line of `$ARGUMENTS`. When it matches one of these, an upstream author tier (`/arthack:sketch`, `/arc:groom`, or a `bundle/<name>` author) has handed off curated context:
+Before any other Phase 1 routing, inspect the first line of `$ARGUMENTS`. When it matches one of these, an upstream author tier (`/arthack:sketch` or a `bundle/<name>` author) has handed off curated context:
 
-- `^--bundle\s+((bundle|arc|sketch)/\S+)\s*$` — single bundle ref handoff
+- `^--bundle\s+((bundle|sketch)/\S+)\s*$` — single bundle ref handoff
 - `^--snippets\s+([a-z0-9_,-]+)\s*$` — comma-separated snippet ids (no bundle)
 
 **Parse:**
 
-- `--bundle` match: capture the ref (`bundle/<name>`, `arc/<slug>/<id>`, or `sketch/<name>`) as `inherited_bundle`.
+- `--bundle` match: capture the ref (`bundle/<name>` or `sketch/<name>`) as `inherited_bundle`.
 - `--snippets` match: split the list on commas, strip whitespace; each id must match `^[a-z0-9]+(-[a-z0-9]+)*$` (= `planctl.bundle_ref.SNIPPET_ID_RE`; rejects underscores, trailing/double dashes). Capture as `inherited_snippets`.
 - Strip the matched first line (and the blank-line separator after it, if present) from `$ARGUMENTS`. The remaining prose IS the planning subject. Continue Phase 1 against the stripped `$ARGUMENTS` (may be empty, an id, or free text).
 
 **Ref-shape validation (prompt-injection hygiene).** `inherited_bundle` and each `inherited_snippets` id flow through shell calls downstream (`promptctl show-bundle`, `promptctl show-snippet`, `planctl epic/task set-bundles`/`set-snippets`). **Validate ref shape against the regex above before any shell interpolation.** If the first line starts with `--bundle`/`--snippets` but the rest doesn't pass, treat it as malformed: do not capture, do not strip, warn once (*"first line looked like a `--bundle` flag but ref didn't validate — treating as prose"*), and continue with the original `$ARGUMENTS`.
 
-Pin `inherited_bundle` (a ref string or null) and `inherited_snippets` (a list or empty) for Phase 2a / 5b / 5e. Downstream phases ignore both when unset. A `sketch/<name>` ref is inlined to bare snippet ids at write time against the cwd authoring project (fn-610) — the persisted epic carries no `sketch/` ref; `bundle/`/`arc/` refs pass through.
+Pin `inherited_bundle` (a ref string or null) and `inherited_snippets` (a list or empty) for Phase 2a / 5b / 5e. Downstream phases ignore both when unset. A `sketch/<name>` ref is inlined to bare snippet ids at write time against the cwd authoring project (fn-610) — the persisted epic carries no `sketch/` ref; `bundle/` refs pass through.
 
 ### Phase 1b — Subject routing
 
@@ -516,9 +516,9 @@ epic:
   title: "<epic title from 5a>"        # required, non-empty
   branch: <branch-name>                # optional — omit to default to epic_id (5b)
   snippets: [<id1>, <id2>]             # optional, kebab-case ids (5b)
-  bundles: [<ref1>, <ref2>]            # optional, (bundle|arc|sketch)/<name>[/<name>] (5b).
+  bundles: [<ref1>, <ref2>]            # optional, (bundle|sketch)/<name>[/<name>] (5b).
                                        # `sketch/<name>` is inlined into `snippets` at write
-                                       # time and dropped from this list (fn-610); bundle/arc pass through.
+                                       # time and dropped from this list (fn-610); bundle/ refs pass through.
   spec: |                              # optional, raw markdown — the epic spec from 5g
     ## Overview
     ...

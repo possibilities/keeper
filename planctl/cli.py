@@ -235,7 +235,7 @@ epic:
   branch: optional-branch-name        # defaults to epic_id
   depends_on_epics: [fn-1-foo, ...]    # optional, existing epic ids
   snippets: [snippet-id-1, ...]        # optional, kebab-case ids
-  bundles: [bundle/name, arc/slug/id]  # optional, (bundle|arc|sketch)/<name>[/<name>]
+  bundles: [bundle/name, sketch/name]  # optional, (bundle|sketch)/<name>[/<name>]
   spec: |
     ## Overview
     ...
@@ -408,7 +408,7 @@ YAML schema (top-level mapping):
     branch: <str>                 # optional, defaults to epic_id
     depends_on_epics: [<eid>, ...]# optional, existing epic ids (validated upfront)
     snippets: [<id>, ...]         # optional, kebab-case ids
-    bundles: [<ref>, ...]         # optional, (bundle|arc|sketch)/<name>[/<name>].
+    bundles: [<ref>, ...]         # optional, (bundle|sketch)/<name>[/<name>].
                                   # `sketch/<name>` refs are resolved at write
                                   # time against the cwd-derived authoring
                                   # project root and inlined into `snippets`
@@ -1374,7 +1374,7 @@ def epic_set_snippets_cmd(epic_id, snippets):
     default="",
     help=(
         "Comma-separated bundle refs (replaces existing list). "
-        "Each ref: (bundle|arc|sketch)/<name>[/<name>]. "
+        "Each ref: (bundle|sketch)/<name>[/<name>]. "
         "`sketch/<name>` refs are resolved at write time against the "
         "cwd-derived authoring project root and inlined into `snippets` "
         "(dropped from the persisted bundle list) so the record stays "
@@ -1444,7 +1444,7 @@ def task_set_snippets_cmd(task_id, snippets):
     default="",
     help=(
         "Comma-separated bundle refs (replaces existing list). "
-        "Each ref: (bundle|arc|sketch)/<name>[/<name>]. "
+        "Each ref: (bundle|sketch)/<name>[/<name>]. "
         "`sketch/<name>` refs are resolved at write time against the "
         "cwd-derived authoring project root and inlined into `snippets` "
         "(dropped from the persisted bundle list) so the record stays "

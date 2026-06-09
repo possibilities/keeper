@@ -487,7 +487,7 @@ def mock_sketch_refs(monkeypatch):
     JSON array the verb expects (``remaining_bundles`` with every ``sketch/``
     ref dropped, ``merged_snippets`` echoing the group's snippets unchanged —
     no real inlining). Only tests that drive ``sketch/`` refs need this:
-    ``bundle/`` and ``arc/`` refs short-circuit before any spawn.
+    ``bundle/`` refs short-circuit before any spawn.
     """
     calls: list[dict] = []
 

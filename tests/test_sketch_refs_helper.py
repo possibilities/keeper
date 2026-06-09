@@ -193,15 +193,15 @@ def test_no_sketch_ref_skips_subprocess(
     )
     result = inline_sketch_refs_batch(
         [
-            {"bundles": ["bundle/keep", "arc/x/y"], "snippets": ["a", "b"]},
+            {"bundles": ["bundle/keep", "bundle/x/y"], "snippets": ["a", "b"]},
             {"bundles": [], "snippets": []},
         ],
         project_root=tmp_path,
     )
     assert calls == []
     assert isinstance(result[0], _OkSlot)
-    # bundle/ and arc/ refs pass through verbatim, order preserved.
-    assert result[0].remaining_bundles == ["bundle/keep", "arc/x/y"]
+    # bundle/ refs pass through verbatim, order preserved.
+    assert result[0].remaining_bundles == ["bundle/keep", "bundle/x/y"]
     assert result[0].merged_snippets == ["a", "b"]
     assert isinstance(result[1], _OkSlot)
     assert result[1].remaining_bundles == []
