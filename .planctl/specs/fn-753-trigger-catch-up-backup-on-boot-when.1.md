@@ -25,5 +25,5 @@ callback.
 - [ ] Tests cover the three boot-state cases (no snapshots, overdue, fresh).
 
 ## Done summary
-
+Added boot-time catch-up backup: daemon checks newest snapshot age on boot and schedules a one-shot VACUUM INTO via setTimeout when overdue (or no snapshot exists), cleared in shutdown. New pure helpers newestSnapshotMs/isCatchUpDue in backup.ts; tests cover no-snapshot, overdue, and fresh cases.
 ## Evidence

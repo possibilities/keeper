@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "add boot-time backup overdue check",
-  "updated_at": "2026-06-08T23:11:16.263112Z"
+  "updated_at": "2026-06-09T11:29:52.631593Z",
+  "worker_done_at": "2026-06-09T11:29:52.631593Z"
 }
