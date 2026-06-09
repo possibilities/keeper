@@ -548,19 +548,21 @@ Returned envelope (success, exit 0):
    "snippet_context": "<promptctl render-spec output>",
    "planctl_invocation": {...}}   # read-only invocation line (decorator-emitted)
 
-`commit_groups` shells `keeper find-task-commit` per task and groups by repo
-(first-seen order) — it FAILS LOUD on the first keeper failure rather than
-truncating (replicates the old pipeline's `set -eo pipefail`). `snippet_context`
-shells `promptctl render-spec <epic_id> --format human` with cwd=primary_repo;
-empty stdout → "". An empty commit set yields `commit_groups: []`.
+`commit_groups` is assembled in-process by a native `git log --grep` +
+`git interpret-trailers --parse` trailer scan over the epic's resolved repo set
+(`planctl.commit_lookup`), grouped by repo in first-seen order. It FAILS LOUD
+only when every repo in the scan set is missing or not a git repo; a clean miss
+yields `commit_groups: []`. `snippet_context` shells `promptctl render-spec
+<epic_id> --format human` with cwd=primary_repo; empty stdout → "".
 
 Failure envelope (no mutation; exit 1):
 
   {"success": false,
    "error": {"code": "<code>", "message": "<msg>", "details": {...}}}
 
-Codes: `BAD_EPIC_ID`, `EPIC_NOT_FOUND`, `COMMIT_LOOKUP_FAILED` (first keeper
-find-task-commit failure), `SNIPPET_RENDER_FAILED` (render-spec non-zero exit).
+Codes: `BAD_EPIC_ID`, `EPIC_NOT_FOUND`, `COMMIT_LOOKUP_FAILED` (every repo in
+the scan set missing or not a git repo; `details.broken_repos` lists them),
+`SNIPPET_RENDER_FAILED` (render-spec non-zero exit).
 """
 
 

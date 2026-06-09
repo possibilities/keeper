@@ -3,17 +3,10 @@ name = "planctl"
 version = "0.0.0"
 description = "Manage epics, tasks, and specs in structured project workflows"
 requires-python = ">=3.11,<3.14"
-dependencies = ["click>=8.1,<8.2", "jsonschema>=4.21,<5", "pyyaml", "keeper-py"]
+dependencies = ["click>=8.1,<8.2", "jsonschema>=4.21,<5", "pyyaml"]
 
 [project.scripts]
 planctl = "planctl.cli:main"
-
-[tool.uv.sources]
-# Cross-repo editable install — keeper is a polyglot repo whose Python package
-# (keeper-py) lives at its root, so the source is the keeper checkout itself.
-# Assumes ~/code/keeper and ~/code/planctl are sibling checkouts. uv.lock stores
-# the relative path as written; same layout required on every machine.
-keeper-py = { path = "../keeper", editable = true }
 
 [tool.hatch.build.targets.wheel]
 packages = ["planctl"]
@@ -56,14 +49,6 @@ unresolved-attribute = "ignore"
 invalid-await = "ignore"
 unsupported-operator = "ignore"
 invalid-argument-type = "ignore"
-
-[tool.ty.analysis]
-# keeper-py is an editable sibling install (../keeper); ty can't always
-# resolve it during static analysis even though uv sync wires it at runtime.
-allowed-unresolved-imports = [
-    "keeper",
-    "keeper.*",
-]
 
 [dependency-groups]
 dev = [

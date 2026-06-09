@@ -16,11 +16,14 @@ fetch) into a single read-only verb that returns one envelope:
 Resolution is cwd-based via ``resolve_project`` — ``/plan:close`` already
 ``cd``s to ``primary_repo`` in Phase 0a, so no epic-keyed discovery is needed.
 
-**Fail-loud on the first ``keeper find-task-commit`` failure** (replicating the
-old pipeline's ``set -eo pipefail`` semantics) rather than truncating
-``commit_groups``. The render and commit-group fetches are read-only shell-outs;
-any non-zero exit emits a typed ``{success:false, error:{code,message,details}}``
-envelope (claim's single-fetch error shape) and exits 1.
+``commit_groups`` is assembled in-process by :mod:`planctl.commit_lookup` — a
+native ``git log --grep`` + ``git interpret-trailers --parse`` scan over the
+epic's resolved repo set, with zero subprocess to any external CLI. It fails
+loud (``COMMIT_LOOKUP_FAILED``) only when every repo in the scan set is missing
+or not a git repo; a clean miss is a normal empty ``commit_groups``. The snippet
+render is a read-only ``promptctl render-spec`` shell-out; any non-zero exit
+emits a typed ``{success:false, error:{code,message,details}}`` envelope (claim's
+single-fetch error shape) and exits 1.
 
 This is a **read-only** verb: it mutates nothing and rides the
 ``InvocationTrackedGroup`` auto-readonly invocation line (NOT in
@@ -113,61 +116,35 @@ def _render_snippet_context(epic_id: str, primary_repo: str) -> str:
     return proc.stdout
 
 
-def _commit_groups(task_ids: list[str], primary_repo: str) -> list[dict[str, Any]]:
-    """Group ``keeper find-task-commit`` output by repo, fail-loud on first failure.
+def _commit_groups(
+    task_ids: list[str],
+    primary_repo: str,
+    touched_repos: list[str] | None,
+) -> list[dict[str, Any]]:
+    """Group the tasks' source commits by repo via the native trailer scan.
 
-    Replicates the old skill pipeline's ``set -eo pipefail`` semantics + the
-    ``group_by(.repo) | map({repo, shas})`` jq recipe: shell
-    ``keeper find-task-commit <task_id>`` per task, collect every
-    ``{repo, sha}`` commit, and group into ``[{repo, shas:[...]}]`` in
-    first-seen repo order. The FIRST non-zero ``keeper`` exit aborts with a
-    typed ``COMMIT_LOOKUP_FAILED`` error rather than truncating the result.
+    Delegates to :func:`planctl.commit_lookup.find_commit_groups`, which runs an
+    in-process ``git log --grep`` + ``git interpret-trailers --parse`` scan over
+    the epic's resolved repo set and returns ``[{repo, shas:[...]}]`` in
+    first-seen repo order. A clean miss (no matching commit) is a normal empty
+    result. An all-repos-broken condition (every scan-set repo missing or not a
+    git repo) raises :class:`~planctl.commit_lookup.AllReposBrokenError`, which
+    maps here to the typed ``COMMIT_LOOKUP_FAILED`` error envelope carrying the
+    broken repo paths.
     """
-    import json
+    from planctl.commit_lookup import AllReposBrokenError, find_commit_groups
 
-    # repo -> list[sha], preserving first-seen repo order.
-    grouped: dict[str, list[str]] = {}
-    order: list[str] = []
-
-    for task_id in task_ids:
-        try:
-            proc = subprocess.run(
-                ["keeper", "find-task-commit", task_id],
-                cwd=str(Path(primary_repo).resolve()),
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-            )
-        except OSError as exc:
-            _emit_preflight_error(
-                "COMMIT_LOOKUP_FAILED",
-                f"failed to shell keeper find-task-commit for {task_id}: {exc}",
-            )
-        if proc.returncode != 0:
-            _emit_preflight_error(
-                "COMMIT_LOOKUP_FAILED",
-                f"keeper find-task-commit exited {proc.returncode} for {task_id}",
-                details={"task_id": task_id, "stderr": (proc.stderr or "").strip()},
-            )
-        try:
-            payload = json.loads(proc.stdout)
-        except json.JSONDecodeError as exc:
-            _emit_preflight_error(
-                "COMMIT_LOOKUP_FAILED",
-                f"keeper find-task-commit returned unparseable JSON for {task_id}: {exc}",
-                details={"task_id": task_id, "stdout": (proc.stdout or "").strip()},
-            )
-        for commit in payload.get("commits", []):
-            repo = commit.get("repo")
-            sha = commit.get("sha")
-            if repo is None or sha is None:
-                continue
-            if repo not in grouped:
-                grouped[repo] = []
-                order.append(repo)
-            grouped[repo].append(sha)
-
-    return [{"repo": repo, "shas": grouped[repo]} for repo in order]
+    try:
+        return find_commit_groups(task_ids, primary_repo, touched_repos)
+    except AllReposBrokenError as exc:
+        _emit_preflight_error(
+            "COMMIT_LOOKUP_FAILED",
+            (
+                "commit-trailer scan found no usable repo: every repo in the "
+                "scan set is missing or not a git repo"
+            ),
+            details={"broken_repos": exc.broken_repos},
+        )
 
 
 def _context_for_root(project_root: Path):
@@ -234,6 +211,7 @@ def run(args: SimpleNamespace) -> int:
 
     epic_def = load_epic(ctx, epic_id)
     primary_repo = str(Path(epic_def.get("primary_repo") or ctx.project_path).resolve())
+    touched_repos = epic_def.get("touched_repos")
 
     # Tasks, sorted by ordinal, with runtime state merged in.
     merged_tasks = sorted(
@@ -250,8 +228,11 @@ def run(args: SimpleNamespace) -> int:
     ]
     all_done = bool(tasks) and all(t["status"] == "done" for t in tasks)
 
-    # Read-only shell-outs — fail loud on the first failure (no mutation).
-    commit_groups = _commit_groups([t["id"] for t in tasks if t["id"]], primary_repo)
+    # commit_groups via the in-process native trailer scan; snippet_context via
+    # a read-only promptctl shell-out. Both fail loud (no mutation) on error.
+    commit_groups = _commit_groups(
+        [t["id"] for t in tasks if t["id"]], primary_repo, touched_repos
+    )
     snippet_context = _render_snippet_context(epic_id, primary_repo)
 
     emit(

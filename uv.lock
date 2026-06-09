@@ -78,11 +78,6 @@ wheels = [
 ]
 
 [[package]]
-name = "keeper-py"
-version = "0.1.0"
-source = { editable = "../keeper" }
-
-[[package]]
 name = "packaging"
 version = "26.2"
 source = { registry = "https://pypi.org/simple" }
@@ -98,7 +93,6 @@ source = { editable = "." }
 dependencies = [
     { name = "click" },
     { name = "jsonschema" },
-    { name = "keeper-py" },
     { name = "pyyaml" },
 ]
 
@@ -115,7 +109,6 @@ dev = [
 requires-dist = [
     { name = "click", specifier = ">=8.1,<8.2" },
     { name = "jsonschema", specifier = ">=4.21,<5" },
-    { name = "keeper-py", editable = "../keeper" },
     { name = "pyyaml" },
 ]
 
