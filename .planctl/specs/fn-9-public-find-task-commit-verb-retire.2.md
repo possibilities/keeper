@@ -42,5 +42,5 @@ No unit tests; verification is `check-generated` passing + `grep -rn "keeper fin
 - [ ] zero live `keeper find-task-commit` callers remain in the planctl repo
 
 ## Done summary
-
+Repointed worker predecessor-detection from keeper to planctl find-task-commit in both worker templates; reworded reconcile negations present-tense (CLAUDE.md, commit-at-mutation-boundary.md); documented the verb in README. Regenerated the 6 worker plugins + SKILL.md via render-plugin-templates (swap propagated, no residual keeper callers).
 ## Evidence

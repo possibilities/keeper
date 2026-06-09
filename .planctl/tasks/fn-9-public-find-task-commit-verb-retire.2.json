@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Migrate worker runbook to planctl verb",
-  "updated_at": "2026-06-09T21:16:06.939530Z"
+  "updated_at": "2026-06-09T22:08:02.828090Z",
+  "worker_done_at": "2026-06-09T22:08:02.828090Z"
 }
