@@ -83,8 +83,6 @@ test("all expected indexes are present", () => {
   const required = [
     "idx_events_session",
     "idx_events_hook_event",
-    "idx_events_event_type",
-    "idx_events_tool_name",
     "idx_events_ts",
     "idx_events_pid_hook_tool",
     "idx_events_subagent_agent_id",
@@ -95,7 +93,6 @@ test("all expected indexes are present", () => {
     // fn-649: attribution-fold perf indexes (covering variants — the prior
     // key-only idx_events_tool_file_path / idx_events_bash_mutation_kind are
     // dropped in the migrate tail and replaced by these).
-    "idx_events_hook_tool",
     "idx_events_hook_tool_ts",
     "idx_events_tool_attr",
     "idx_events_bash_attr",
@@ -105,6 +102,47 @@ test("all expected indexes are present", () => {
   for (const name of required) {
     expect(names.has(name)).toBe(true);
   }
+  // fn-765.3: three dead events indexes were dropped (removed from
+  // CREATE_EVENTS_INDEXES + DROP IF EXISTS in the migrate tail) — a fresh DB
+  // must never carry them. idx_events_event_type / idx_events_tool_name are
+  // grep-verified consumer-less; idx_events_hook_tool is EXPLAIN-verified dead
+  // (the inferred-attribution self-join rides idx_events_bashwin_pre/_post).
+  for (const gone of [
+    "idx_events_event_type",
+    "idx_events_tool_name",
+    "idx_events_hook_tool",
+  ]) {
+    expect(names.has(gone)).toBe(false);
+  }
+  db.close();
+});
+
+test("idx_events_hook_event serves the Commit trailer scan after the fn-765.3 drops", () => {
+  // fn-765.3: idx_events_hook_tool (the (hook_event, tool_name) composite) was
+  // dropped. The `Commit` trailer self-joins (loadCommitTrailerInvocations and
+  // its sibling, reducer.ts) filter `WHERE hook_event = 'Commit'` and order by
+  // id — the surviving single-column idx_events_hook_event must still SEARCH
+  // them with no full-table SCAN. (EXPLAIN confirmed dropping hook_event too
+  // would fall the scan back onto the composite + a USE TEMP B-TREE FOR ORDER
+  // BY regression, which is why hook_event is kept.)
+  const { db } = openDb(":memory:");
+  const plan = db
+    .prepare(
+      `EXPLAIN QUERY PLAN
+         SELECT COALESCE(events.data, event_blobs.data) AS data
+           FROM events
+           LEFT JOIN event_blobs ON event_blobs.event_id = events.id
+          WHERE hook_event = 'Commit'
+            AND json_extract(COALESCE(events.data, event_blobs.data), '$.committer_session_id') = ?
+            AND json_extract(COALESCE(events.data, event_blobs.data), '$.planctl_op') IS NOT NULL
+          ORDER BY events.id ASC`,
+    )
+    .all("s") as { detail: string }[];
+  const detail = plan.map((r) => r.detail).join(" | ");
+  expect(detail).toContain("idx_events_hook_event");
+  expect(detail).not.toContain("SCAN events");
+  // The dropped composite must be gone so the planner can't pick it.
+  expect(detail).not.toContain("idx_events_hook_tool");
   db.close();
 });
 

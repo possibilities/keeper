@@ -525,17 +525,21 @@ CREATE TABLE IF NOT EXISTS events (
 
 const CREATE_EVENTS_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_session ON events(session_id)",
+  // (hook_event) single-column — serves the `Commit` trailer self-joins
+  // (`loadCommitTrailerInvocations` / its sibling, reducer.ts:~5718/~5790,
+  // `WHERE hook_event = 'Commit' … ORDER BY events.id`). fn-765.3 EXPLAIN-
+  // verified it's the only surviving index that SEARCHes those scans without a
+  // `USE TEMP B-TREE FOR ORDER BY` regression, so it stays.
   "CREATE INDEX IF NOT EXISTS idx_events_hook_event ON events(hook_event)",
-  "CREATE INDEX IF NOT EXISTS idx_events_event_type ON events(event_type)",
-  "CREATE INDEX IF NOT EXISTS idx_events_tool_name ON events(tool_name)",
+  // fn-765.3: idx_events_event_type (grep-verified consumer-less — no
+  // `WHERE event_type = ?` reader), idx_events_tool_name (consumer-less
+  // single-column — every `tool_name = ?` reader pairs it with `hook_event`
+  // and rides a composite), and idx_events_hook_tool (EXPLAIN-verified dead —
+  // the inferred-attribution self-join `computeRepoBashWindows` rides the
+  // covering idx_events_bashwin_pre / _post, never this key) are DROPped in the
+  // migrate tail and no longer created on fresh DBs.
   "CREATE INDEX IF NOT EXISTS idx_events_ts ON events(ts)",
   "CREATE INDEX IF NOT EXISTS idx_events_pid_hook_tool ON events(pid, hook_event, tool_name)",
-  // (hook_event, tool_name) composite — the inferred-attribution self-join
-  // (`findInferredAttributions`) scans all PreToolUse rows via the single-column
-  // `idx_events_hook_event`; this lets the `pre` side seek straight to
-  // PreToolUse:Bash. (`idx_events_pid_hook_tool` leads with `pid`, so it can't
-  // serve a hook_event-first query.)
-  "CREATE INDEX IF NOT EXISTS idx_events_hook_tool ON events(hook_event, tool_name)",
   // (hook_event, tool_name, ts) — the hoisted inferred-attribution window scan
   // (`computeRepoBashWindows`) bounds PreToolUse/PostToolUse:Bash by `ts`; the
   // trailing `ts` keeps that scan under the hook's 1.2s busy_timeout even on a
@@ -4413,11 +4417,20 @@ function migrate(db: Database): void {
       // NOT EXISTS` is idempotent — no SCHEMA_VERSION bump.
       // `ANALYZE epics; ANALYZE jobs; ANALYZE events;` runs unconditionally on
       // every boot so the planner picks the new indexes on first post-upgrade
-      // query — cost is negligible on tables under ~1.1k rows for epics/jobs;
-      // events sits at ~110k rows on the daemon's hot DB and ANALYZE costs
-      // ~10ms there. The fn-628.2 `CREATE_EVENTS_PLANCTL_INDEXES` block
-      // pairs with the OR→UNION rewrite at src/reducer.ts:~2371 so both new
-      // partial indexes are SEARCHed (not just one) at the hot-path sweep.
+      // query — cost is negligible on tables under ~1.1k rows for epics/jobs.
+      // The fn-628.2 `CREATE_EVENTS_PLANCTL_INDEXES` block pairs with the
+      // OR→UNION rewrite at src/reducer.ts:~2371 so both new partial indexes are
+      // SEARCHed (not just one) at the hot-path sweep.
+      //
+      // fn-765.3: the original comment assumed events sat at ~110k rows
+      // (ANALYZE ~10ms); the table is now 624k+ and a full ANALYZE scans every
+      // index — minutes of synchronous work on the boot path. `PRAGMA
+      // analysis_limit` caps the per-index sample at N rows (SQLite's
+      // recommended ~400) so ANALYZE stays approximate-but-bounded regardless of
+      // table size. analysis_limit is connection-scoped and only governs ANALYZE
+      // sampling (writes sqlite_stat1 only — re-fold safe). The three
+      // version-gated historical ANALYZE sites run once and are left as-is.
+      db.run("PRAGMA analysis_limit = 400");
       for (const sql of CREATE_EPICS_INDEXES) {
         db.run(sql);
       }
@@ -4873,6 +4886,21 @@ function migrate(db: Database): void {
       // (pure index swap — fold results, and thus re-fold determinism, unchanged).
       db.run("DROP INDEX IF EXISTS idx_events_tool_file_path");
       db.run("DROP INDEX IF EXISTS idx_events_bash_mutation_kind");
+
+      // fn-765.3: shed three dead events indexes (the CREATEs were removed from
+      // CREATE_EVENTS_INDEXES the same commit, so a fresh DB never builds them;
+      // this tail sheds them from already-migrated DBs). idx_events_event_type
+      // and idx_events_tool_name are grep-verified consumer-less (no
+      // `WHERE event_type = ?` reader; every `tool_name = ?` reader pairs with
+      // `hook_event` and rides a composite). idx_events_hook_tool is
+      // EXPLAIN-verified dead — the inferred-attribution self-join
+      // (`computeRepoBashWindows`) rides the covering idx_events_bashwin_pre /
+      // _post, and the `Commit` trailer scans keep idx_events_hook_event. DROP
+      // IF EXISTS is idempotent; no SCHEMA_VERSION bump (index choice never
+      // changes fold output — re-fold determinism unchanged).
+      db.run("DROP INDEX IF EXISTS idx_events_event_type");
+      db.run("DROP INDEX IF EXISTS idx_events_tool_name");
+      db.run("DROP INDEX IF EXISTS idx_events_hook_tool");
 
       // v41→v42: fn-662 — shared directional mapping between keeper's `''`
       // default-profile sentinel and agentuse's `"default"` usage id. The

@@ -2706,7 +2706,13 @@ function main(): void {
   //     etc), so RPC writes block politely on hook + reducer + planctl-files
   //     writers instead of erroring `SQLITE_BUSY`.
   const { db } = openDb(data.dbPath, { readonly: true });
-  const { db: writerDb } = openDb(data.dbPath);
+  // fn-765.3: main is the sole migrator (CLAUDE.md "Migrations") — it has
+  // already converged the schema before spawning this worker. Pass
+  // `migrate: false` so the server-worker's writer connection skips re-running
+  // the full migration ladder on every spawn (pure redundant work; the DDL is
+  // all `IF NOT EXISTS` / version-guarded, so it was a no-op cost, not a
+  // correctness issue).
+  const { db: writerDb } = openDb(data.dbPath, { migrate: false });
 
   // Install every concrete RPC handler into `RPC_REGISTRY` /
   // `ASYNC_RPC_REGISTRY`. Side-effect import: a plain `import` of
