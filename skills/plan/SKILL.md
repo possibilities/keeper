@@ -125,6 +125,11 @@ agent spec.
 **epic-scout instruction** (refine path adds the exclude line):
 
 ```
+Known context from the human (trust these, do not re-derive):
+- <short typed line, e.g. `depends on fn-12`>
+- <short typed line, e.g. `not related to fn-9`>
+Do NOT spend tool calls re-deriving anything listed above — treat it as verified.
+
 Target epic to exclude: <epic_id>    # refine path only — omit on create
 
 Find inter-epic relationships: dependencies (new plan needs APIs/structures
@@ -133,6 +138,8 @@ for the new plan), overlaps (both edit the same files — conflict risk). Do
 NOT plan or implement. Return the four-bucket markdown report per your
 agent spec.
 ```
+
+Populate the `Known context` block from human-stated facts in the conversation — declared relationships, exclusions, settled decisions. Each line is one short typed key fact, not prose. When nothing applies, **omit the whole block** (header, lines, and the do-not-re-derive negative) — do not emit an empty header. On the refine path, wrap any value sourced from epic-spec prose in backticks so it reads as data, not instruction.
 
 Invocations (create shows all four; refine includes only `run` scouts, same message block):
 
@@ -148,7 +155,7 @@ Task(subagent_type="plan:epic-scout",      description="Scout epic deps for <sho
 - **repo-scout** (headings: Project Conventions / Related Code / Reusable Code / Test Patterns / Design System / Gotchas). Verify any `[INFERRED]` file:line refs before using them as Investigation targets in 5e — drop if the file doesn't exist.
 - **docs-gap-scout** (Doc Locations Found / Likely Updates Needed / No Updates Expected). `Likely Updates Needed` feeds the `## Docs gaps` epic subsection (5g).
 - **practice-scout** (Best Practices / Do / Don't / Real-World Examples / Security / Performance / Source Quality Notes / Sources). Do/Don't/Security/Performance feed the optional `## Best practices` epic subsection (5g).
-- **epic-scout** (four `###` buckets under `## Epic Dependencies`). Carry `### Dependencies` AND `### Overlaps` into Phase 6 (both hard-wire as `epic add-deps` edges); fold `### Reverse Dependencies` into the epic spec References (advisory only).
+- **epic-scout** (four `###` buckets under `## Epic Dependencies`). Carry `### Dependencies` AND `### Overlaps` into Phase 6 (both hard-wire as `epic add-deps` edges); fold `### Reverse Dependencies` into the epic spec References (advisory only). The `### No Relationship` bucket may simply cite the known context you supplied (e.g. an epic the human declared unrelated) — that is expected, not a thin finding.
 
 If a scout returns an empty/near-empty report (greenfield, no docs), proceed — scouts are mandatory to **run**, not to **produce signal**. Note empty state in Phase 8.
 
@@ -156,9 +163,13 @@ If a scout returns an empty/near-empty report (greenfield, no docs), proceed —
 
 Runs after scouts return (or immediately if zero ran on the refine path). The gap-analyst can't run in parallel with scouts — it needs their findings.
 
-**gap-analyst brief** = the **subject context** block + the scout-findings block + the instruction:
+**gap-analyst brief** = the **subject context** block + the optional **known-context** slot + the scout-findings block + the instruction. The known-context slot mirrors the epic-scout one — typed lines above the instruction, closing with the do-not-re-derive negative, omitted entirely when nothing applies:
 
 ```
+Known context from the human (trust these, do not re-derive):
+- <short typed line, e.g. `error path already specced in fn-12.2`>
+Do NOT spend tool calls re-deriving anything listed above — treat it as verified.
+
 Scout findings:
 
 --- repo-scout report ---

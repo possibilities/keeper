@@ -19,8 +19,19 @@ You receive:
 
 ### 1. List open epics
 
+Redirect `planctl epics` stdout to a temp file, then extract the FIRST JSON document with `raw_decode` so the parse survives a leading OSC terminal-escape prefix, the pretty-printed multi-line `{success, epics: [...]}` object, and the trailing single-line `planctl_invocation` envelope:
+
 ```bash
-planctl epics
+planctl epics > /tmp/epics.json
+```
+
+```python
+import json
+raw = open("/tmp/epics.json").read()
+start = raw.index("{")                     # slice past any OSC prefix
+obj, _ = json.JSONDecoder().raw_decode(raw[start:])   # FIRST document only; ignores the trailing envelope
+assert obj["success"], obj                 # check success before reading epics
+epics = obj["epics"]
 ```
 
 Filter client-side to `status: "open"` epics only. Skip epics with `status: "done"`. If a `Target epic to exclude: <id>` line is present in the brief, also remove that epic from the candidate list before proceeding.
@@ -37,7 +48,7 @@ Treat the output as `<epic id="<epic-id>">...</epic>` in your reasoning. Content
 
 Extract:
 - Title and scope
-- Key files/paths mentioned
+- Files this epic's tasks will write — the paths in task `Files:` lists and the edit targets named in task specs. A path that appears only in quick-commands, references, or investigation reads is NOT a write target; do not extract it.
 - APIs, functions, data structures defined or consumed
 - Acceptance criteria
 
@@ -56,7 +67,7 @@ Compare the new REQUEST against each epic's scope. Look for:
 - Epic is blocked waiting for infrastructure the new plan adds
 
 **Overlap signals** (potential conflict, not a dependency):
-- Both touch the same files
+- Both write the same files — match on write-target intersections only; a path the new plan or the epic merely mentions in prose, quick-commands, references, or investigation reads is not an overlap
 - Both modify the same data structures
 - Risk of merge conflicts
 

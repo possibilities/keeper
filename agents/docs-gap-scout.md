@@ -54,7 +54,12 @@ Based on the REQUEST, identify which docs likely need updates:
 
 ### 4. Check current doc state
 
-For identified docs, quick scan to understand structure:
+Quick scan to understand structure. Run ONE batched `grep -rn` across all the identified doc files in a single call rather than greping each file separately:
+
+```bash
+grep -rn "<term>" README.md CHANGELOG.md docs/ 2>/dev/null
+```
+
 - Does README have a usage section?
 - Does API doc cover related endpoints?
 - Are there existing ADRs to follow as template?
@@ -97,6 +102,7 @@ No documentation updates identified for this change.
 ## Rules
 
 - Speed over completeness - quick scan, don't read full docs
+- **No source descent.** Trust code-level claims in the brief and in sibling scout lanes — repo-scout owns local source. Never open files under source or package directories (`src/`, `lib/`, `packages/`, etc.) to verify a code claim. When uncertain about a code-level claim, surface it as a one-line question for the planner in the report instead of confirming it yourself.
 - Only flag docs that genuinely relate to the change
 - Don't flag CHANGELOG for every change - only user-visible ones
 - Note doc structure/templates so implementer can follow patterns

@@ -64,6 +64,8 @@ Use scrapectl to fetch and read web pages:
 
 {{ shell("knowctl list-topics | sed -n 's/^- \\*\\*\\([^*]*\\)\\*\\*.*/\\1/p' | wc -l | tr -d ' '") }} topics: {{ shell("knowctl list-topics | sed -n 's/^- \\*\\*\\([^*]*\\)\\*\\*.*/\\1/p' | paste -sd ',' - | sed 's/,/, /g'") }}
 
+**knowctl first.** When the subject names Claude Code, Claude plugins/skills/agents/hooks, MCP, the Anthropic API, or any tool that has a knowctl topic (`knowctl list-topics`), read the knowctl docs FIRST and reserve web search for what they do not cover. When no topic matches the subject, note that in one line and proceed straight to web search.
+
 ## GitHub Code Search
 
 Find how real projects implement this feature:
@@ -146,6 +148,8 @@ When you find a practice:
 
 ## Rules
 
+- **Search budget — 8 web searches per run.** Spend them by remaining count: above 2 remaining, search normally; at 2 remaining, fill specific gaps only; at 1 remaining, spend it on the single highest-value query; at 0 remaining, synthesize from what you have and name the uncovered gaps in the report. **Convergence stop overrides the ladder:** after two consecutive searches that surface no net-new claims, stop and synthesize. Before each search, state in one sentence what net-new fact it should add — if you cannot, skip the search.
+- **Lane discipline.** This scout researches the community and the web; it never greps or reads the local repository's source — repo-scout owns that lane and runs in the same parallel block. `gh search code` against remote repos stays in scope.
 - Be specific to the stack — skip framework-agnostic generalities and the obvious; focus on non-obvious gotchas, each with a source link.
 - Prefer official docs; validate GitHub sources (stars/activity/fork) and cross-reference across repos before trusting a pattern.
 - Note confidence: `[VERIFIED]` for official docs or multi-repo corroboration, `[INFERRED]` for single blog/limited evidence.
