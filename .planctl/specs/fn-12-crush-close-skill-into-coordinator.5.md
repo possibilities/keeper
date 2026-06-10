@@ -34,5 +34,5 @@ The skill's switch must stay total over CloseOutcome — the task-3 exhaustivene
 - [ ] grep confirms no version-pinned model ids and no <VERDICT_JSON> references under skills/ and agents/
 
 ## Done summary
-
+Rewrote skills/close/SKILL.md as the thin content-blind coordinator (single error pattern, blind quality-auditor + close-planner spawns without model=, QUESTION warm/cold resume, total CloseOutcome switch, 529 backoff kept). Added tests/test_close_skill_consistency.py and swept the docs (CLAUDE.md/AGENTS.md, README, commit-at-mutation-boundary §3/§13, workflow mermaid; Removed-verbs absorbs classifier + epic followup-of).
 ## Evidence
