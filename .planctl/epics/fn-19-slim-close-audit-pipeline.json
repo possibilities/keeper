@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-19-slim-close-audit-pipeline",
   "bundles": [],
+  "closer_done_at": "2026-06-10T18:49:56.314193Z",
   "created_at": "2026-06-10T18:41:57.147707Z",
   "depends_on_epics": [],
   "id": "fn-19-slim-close-audit-pipeline",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/planctl",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Slim close audit pipeline",
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-10T18:41:57.147707Z"
+  "updated_at": "2026-06-10T18:49:56.314193Z"
 }
