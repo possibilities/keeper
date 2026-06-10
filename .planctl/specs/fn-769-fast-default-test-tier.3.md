@@ -33,5 +33,5 @@ Assert conservation: total test count across the 4 shards equals the original 47
 - [ ] Full suite green
 
 ## Done summary
-
+Split the 17k-line reducer.test.ts into 4 runtime-balanced shards (reducer-{lifecycle,plan,links,projections}.test.ts) along existing section boundaries; 470 tests conserved and green, slowest shard ~0.7s solo, original git-rm'd in the same commit. Helpers duplicated verbatim per shard with private tsCounter@1000.
 ## Evidence
