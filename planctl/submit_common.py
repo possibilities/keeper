@@ -170,7 +170,7 @@ def resolve_audit_context(epic_id: str, project: str | None):
             "BRIEF_MISSING",
             (
                 f"no audit brief for {epic_id} at {bp}; "
-                "run `planctl close-preflight {epic_id}` first"
+                f"run `planctl close-preflight {epic_id}` first"
             ),
             details={"expected": str(bp)},
         )

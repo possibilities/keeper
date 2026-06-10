@@ -166,6 +166,11 @@ def test_missing_brief_rejects(project):
     assert r.exit_code == 1
     env = _envelope(r.output)
     assert env["error"]["code"] == "BRIEF_MISSING"
+    # The remediation hint must name the real epic id, not the literal token.
+    msg = env["error"]["message"]
+    assert _EID in msg
+    assert "{epic_id}" not in msg
+    assert f"planctl close-preflight {_EID}" in msg
 
 
 def test_bad_risk_rejects_before_brief(project):
