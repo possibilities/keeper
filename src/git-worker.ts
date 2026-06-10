@@ -1612,6 +1612,36 @@ export function decideReconcileTransitions(
 }
 
 /**
+ * fn-771: derive a missed-wake rescue's TRUE change-to-rescue latency from the
+ * commit times the rescue discharged across all rescued roots. The honest
+ * freshness signal — `now − committed_at_ms` — replaces the idle-inflating
+ * `now − last_fast_path_at` staleness that paged a false critical (a 2s-old
+ * commit caught after 27 quiet minutes reported staleness_ms ≈ 1.6M).
+ *
+ * - WORST CASE: when several commits discharge in one rescue tick, anchor on
+ *   the OLDEST (smallest `committed_at_ms`) — it bounds the longest any
+ *   delivered change waited unobserved.
+ * - NO ANCHOR → `null`: a dirty-tree-only rescue (no commit discharged, so the
+ *   array is empty) has no change to measure latency against. The caller only
+ *   pushes POSITIVE `committed_at_ms` values (enumerateCommitsInDelta clamps an
+ *   unparseable/non-positive commit time to 0, which would otherwise read as a
+ *   ~epoch-sized false latency), so an empty array genuinely means no anchor.
+ * - The negative-latency clamp (clock skew: `committed_at_ms > now`) is owned
+ *   by {@link buildMissedWakeRecord}, which never emits a negative — this
+ *   helper returns the raw signed difference so the clamp lives in one place.
+ *
+ * Pure & exported for unit reach (mirrors {@link decideReconcileTransitions}).
+ */
+export function deriveChangeToRescueMs(
+  dischargedCommitAtMs: number[],
+  now: number,
+): number | null {
+  if (dischargedCommitAtMs.length === 0) return null;
+  const oldest = Math.min(...dischargedCommitAtMs);
+  return now - oldest;
+}
+
+/**
  * Select `git_status` projection rows to tombstone because their worktree
  * vanished from disk. Such a row is unreachable by {@link
  * decideReconcileTransitions} (whose `toDrop` loop only walks
@@ -2126,6 +2156,23 @@ function startWorker(): void {
    */
   const extraCandidateRoots = new Set<string>();
   /**
+   * fn-771 missed-wake re-arm. Roots whose FSEvents subscription went mute and
+   * was rescued by the heartbeat backstop — flagged here so the NEXT
+   * level-triggered reconcile re-derives a FRESH subscription for each (a mute
+   * `@parcel/watcher` stream is replaced, not respawned). This is the existing
+   * reconcile mechanism with ONE extra trigger: the heartbeat NEVER
+   * unsubscribes/resubscribes directly (the no-self-heal invariant — no worker
+   * respawn), it only sets the flag and kicks a reconcile. The reconcile drains
+   * the set (bounded by {@link MAX_SUBSCRIBES_PER_CYCLE}), tears down each
+   * flagged root's FSEvents subs WITHOUT a `git-root-dropped` tombstone (a
+   * re-arm keeps the projection row + the HEAD-oid cache — it is not a drop),
+   * then the normal `toAdd` re-derivation re-subscribes any still-desired root
+   * exactly once. A subscribe failure follows the existing reconcile
+   * error-handling (`subscribeRoot` swallows + logs); nothing throws out of the
+   * heartbeat. No DB write, no synthetic event.
+   */
+  const pendingResubscribe = new Set<string>();
+  /**
    * Epic fn-690: wall-clock (`Date.now()`) timestamp of the last full-history sweep
    * (`runFullSweep: true`). `null` until the first reconcile fires.
    * Throttled to {@link FULL_SWEEP_INTERVAL_MS} so the heavy
@@ -2192,7 +2239,18 @@ function startWorker(): void {
   // (fn-720) — the `rescued` boolean the heartbeat backstop folds into one
   // uniform `missed-wake` record. Every early-return / divergence-suppress /
   // semantic-dedupe coalesce path returns `false`.
-  function emitSnapshot(root: string): boolean {
+  //
+  // fn-771: the optional `dischargedCommitAtMs` collector lets the heartbeat
+  // backstop derive the true change-to-rescue latency. When provided, every
+  // commit this call discharges in the HEAD-oid delta pushes its `committed_at_ms`
+  // (positive only — a 0/unparseable commit time is NOT a usable anchor). The
+  // heartbeat then takes the worst-case (oldest) anchor across all rescued roots
+  // for `now − committed_at_ms`. The fast-path callers (scheduler emit, initial
+  // subscribe) pass nothing — only the slow backstop needs the latency.
+  function emitSnapshot(
+    root: string,
+    dischargedCommitAtMs?: number[],
+  ): boolean {
     if (shuttingDown) return false;
     let status: ParsedGitStatus | null;
     try {
@@ -2268,6 +2326,14 @@ function startWorker(): void {
               planctl_target: c.planctl_target,
               committed_at_ms: c.committed_at_ms,
             } satisfies CommitMessage);
+            // fn-771: collect this discharged commit's time so the heartbeat
+            // backstop can derive the true change-to-rescue latency. Only a
+            // POSITIVE committed_at_ms is a usable anchor — enumerateCommitsInDelta
+            // clamps an unparseable/non-positive commit time to 0, which would
+            // otherwise read as a ~epoch-sized false latency.
+            if (dischargedCommitAtMs !== undefined && c.committed_at_ms > 0) {
+              dischargedCommitAtMs.push(c.committed_at_ms);
+            }
             // Epic fn-681: authoritative commit-driven planctl ingest.
             // Filter the commit's enumerated file list to planctl-shaped
             // paths (epics / tasks / state-tasks) and post one
@@ -2570,6 +2636,36 @@ function startWorker(): void {
     headEnumFailuresByRoot.delete(root);
   }
 
+  /**
+   * fn-771 missed-wake re-arm teardown. Unlike {@link unsubscribeRoot} this is
+   * NOT a drop: it tears down ONLY the (possibly mute) FSEvents subscriptions
+   * and removes the root from the `subscriptions` map so the reconcile's normal
+   * `toAdd` re-derivation re-subscribes it with a fresh stream. It posts NO
+   * `git-root-dropped` tombstone (the projection row stays — the root is still
+   * desired) and PRESERVES `lastHeadOidByRoot` (so the re-subscribe does not
+   * emit a phantom HEAD delta against the pre-rearm state). The debounce
+   * scheduler is left in place — it is re-bound by `schedulerFor` inside the
+   * re-subscribe and carries no stale pending fire that matters. Best-effort
+   * teardown throughout; nothing throws.
+   */
+  async function tearDownForResubscribe(root: string): Promise<void> {
+    const sub = subscriptions.get(root);
+    if (sub == null) return;
+    subscriptions.delete(root);
+    try {
+      await sub.worktree.unsubscribe();
+    } catch {
+      // best-effort
+    }
+    if (sub.gitDir != null) {
+      try {
+        await sub.gitDir.unsubscribe();
+      } catch {
+        // best-effort
+      }
+    }
+  }
+
   async function reconcileRoots(): Promise<void> {
     if (shuttingDown || watcherModule == null) return;
     if (reconciling) {
@@ -2596,6 +2692,25 @@ function startWorker(): void {
         lastFullSweepMs === null ||
         nowMs - lastFullSweepMs >= FULL_SWEEP_INTERVAL_MS;
       if (runFullSweep) lastFullSweepMs = nowMs;
+
+      // fn-771 missed-wake re-arm. Drain the heartbeat-flagged roots BEFORE
+      // computing `currentlyWatched` so a torn-down (re-armed) root falls into
+      // the `toAdd` re-derivation below and re-subscribes exactly once with a
+      // fresh FSEvents stream. Bounded by the same per-cycle cap as new
+      // subscribes; any overflow stays flagged for the next reconcile. The
+      // flag is cleared as it is drained (re-arm is one-shot per flag), so a
+      // root that re-goes-mute simply gets re-flagged by a later heartbeat.
+      if (pendingResubscribe.size > 0) {
+        const toRearm = [...pendingResubscribe].slice(
+          0,
+          MAX_SUBSCRIBES_PER_CYCLE,
+        );
+        for (const root of toRearm) {
+          pendingResubscribe.delete(root);
+          await tearDownForResubscribe(root);
+        }
+        if (pendingResubscribe.size > 0) reconcilePending = true;
+      }
 
       const currentlyWatched = new Set(subscriptions.keys());
 
@@ -2781,11 +2896,29 @@ function startWorker(): void {
         // heartbeat re-delivered a snapshot the FSEvents/db-poll fast paths
         // missed. The shutdown guard above gates the telemetry emit too.
         let rescued = false;
+        // fn-771: collect every discharged commit's time across the rescued
+        // roots so the record carries the TRUE change-to-rescue latency, and
+        // track WHICH roots rescued so each can be flagged for a watcher
+        // re-arm (a rescue means that root's FSEvents stream missed a change).
+        const dischargedCommitAtMs: number[] = [];
+        const rescuedRoots: string[] = [];
         for (const root of subscriptions.keys()) {
-          if (emitSnapshot(root)) rescued = true;
+          if (emitSnapshot(root, dischargedCommitAtMs)) {
+            rescued = true;
+            rescuedRoots.push(root);
+          }
         }
         backstopCounters.bump("git-heartbeat", "missed-wake", rescued);
         if (rescued) {
+          const now = Date.now();
+          // Worst-case (oldest) commit anchor across all roots rescued this
+          // tick → `now − oldest`. No commit anchor (dirty-tree-only rescue) →
+          // null. A negative latency (clock skew: committed_at_ms > now) is
+          // clamped to null by buildMissedWakeRecord, never emitted negative.
+          const changeToRescueMs = deriveChangeToRescueMs(
+            dischargedCommitAtMs,
+            now,
+          );
           port.postMessage({
             kind: "backstop",
             record: buildMissedWakeRecord({
@@ -2793,10 +2926,19 @@ function startWorker(): void {
               worker: "git-worker",
               fastPath: "fsevents",
               rescued: true,
-              now: Date.now(),
+              now,
               lastFastPathAt,
+              changeToRescueMs,
             }),
           } satisfies BackstopMessage);
+          // fn-771 re-arm: flag each rescued root for a fresh subscription and
+          // kick a reconcile to re-derive it. The heartbeat NEVER
+          // unsubscribes/resubscribes directly (no-self-heal); reconcile owns
+          // the teardown + re-subscribe, bounded by MAX_SUBSCRIBES_PER_CYCLE.
+          for (const root of rescuedRoots) {
+            pendingResubscribe.add(root);
+          }
+          void reconcileRoots();
         }
         // Epic fn-716: surface the flood reduction. Log + reset the count of
         // snapshots the semantic dedupe gate coalesced away this window (mostly

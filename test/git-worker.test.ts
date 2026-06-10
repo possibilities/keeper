@@ -33,6 +33,7 @@ import {
   decideHeadCacheAdvance,
   decideHeadDivergence,
   decideReconcileTransitions,
+  deriveChangeToRescueMs,
   discoverProjectRoots,
   enumerateCommitsInDelta,
   filterPlanctlChanges,
@@ -2337,6 +2338,70 @@ test("decideReconcileTransitions: simultaneous add + drop in one cycle", () => {
   );
   expect(result.toAdd).toEqual(["/repo-b"]);
   expect(result.toDrop).toEqual(["/repo-a"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-771 — deriveChangeToRescueMs: a missed-wake rescue's TRUE change-to-rescue
+// latency from the commit times it discharged. Worst-case (oldest) anchor; no
+// anchor (dirty-only rescue) → null. The negative clamp lives in
+// buildMissedWakeRecord, so this helper returns the raw signed difference.
+// ---------------------------------------------------------------------------
+
+test("deriveChangeToRescueMs: a single discharged commit yields now − committed_at_ms", () => {
+  // commit landed at 14:04:07Z, heartbeat caught it 2s later — the Incident B
+  // case that previously paged a false critical via inflated staleness_ms.
+  const committedAt = 1_749_564_247_000;
+  const now = committedAt + 2000;
+  expect(deriveChangeToRescueMs([committedAt], now)).toBe(2000);
+});
+
+test("deriveChangeToRescueMs: several commits in one rescue tick anchor on the OLDEST (worst case)", () => {
+  const now = 1_749_564_300_000;
+  const oldest = now - 90_000;
+  const middle = now - 30_000;
+  const newest = now - 5000;
+  // Order-independent: the worst-case bound is the longest any delivered change
+  // waited unobserved.
+  expect(deriveChangeToRescueMs([newest, oldest, middle], now)).toBe(90_000);
+  expect(deriveChangeToRescueMs([middle, newest, oldest], now)).toBe(90_000);
+});
+
+test("deriveChangeToRescueMs: an empty array (dirty-tree-only rescue, no commit anchor) yields null", () => {
+  expect(deriveChangeToRescueMs([], 1_749_564_300_000)).toBeNull();
+});
+
+test("deriveChangeToRescueMs: clock skew (oldest commit AFTER now) returns the raw negative — buildMissedWakeRecord owns the clamp to null", () => {
+  const now = 1_749_564_300_000;
+  // committed_at_ms > now: a negative latency the record builder clamps to null.
+  const skewed = now + 5000;
+  expect(deriveChangeToRescueMs([skewed], now)).toBe(-5000);
+});
+
+// ---------------------------------------------------------------------------
+// fn-771 — missed-wake re-arm via the reconcile path. The heartbeat NEVER
+// resubscribes directly; it tears the rescued root out of the subscription map
+// (modeled here as removing it from `currentlyWatched`) while the root stays
+// DESIRED, so the existing decideReconcileTransitions re-adds it to `toAdd`
+// exactly once. No worker respawn, no DB write — just one extra reconcile
+// trigger feeding the level-triggered membership re-derivation.
+// ---------------------------------------------------------------------------
+
+test("re-arm: a torn-down-but-still-desired root re-enters toAdd exactly once via decideReconcileTransitions", () => {
+  // After the heartbeat's tearDownForResubscribe, /repo-rearmed is no longer in
+  // the subscription set but is still desired by discovery.
+  const dwell = new Map<string, number>();
+  const result = decideReconcileTransitions(
+    new Set<string>(), // currentlyWatched: torn down → empty
+    new Set(["/repo-rearmed"]), // still desired
+    dwell,
+    50_000,
+    45_000,
+  );
+  expect(result.toAdd).toEqual(["/repo-rearmed"]);
+  expect(result.toDrop).toEqual([]);
+  // No drop/dwell side effect: a re-arm is not a drop, so no dwell timer is
+  // stamped for the re-subscribing root.
+  expect(dwell.has("/repo-rearmed")).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
