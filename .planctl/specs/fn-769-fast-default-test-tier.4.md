@@ -34,5 +34,5 @@ Extend the fn-752 script pattern: default `test` = `bun test --parallel --timeou
 - [ ] CLAUDE.md + README updated per the docs gaps in the epic spec
 
 ## Done summary
-
+Split default 'bun test' into a fast tier (38 files, ~2s wall) and 'test:full' (all 65 files once, opentui not doubled) via --path-ignore-patterns over the ~25 process-level/real-migration files; documented the template-DB vs sandboxEnv helpers and the test:full-is-mandatory rule in CLAUDE.md and README.
 ## Evidence
