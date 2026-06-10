@@ -27,5 +27,5 @@ Per recipe; db.ts is slow-tier — test:full mandatory.
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Scrubbed bloat comments from src/db.ts: -3103 lines (-203602 chars), comment-only by verifier (token + transpile equality). Removed schema-version histories, per-column field-semantics essays, DDL narratives, and ~123 fn-NNN/incident refs; compressed kept constraints (floor item 10, sort_path ASCII invariants, v57-v58 offline rebuild contract). typecheck + biome + test:full green, zero new failures.
 ## Evidence
