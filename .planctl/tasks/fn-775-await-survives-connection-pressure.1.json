@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Retryable cap rejects in client",
-  "updated_at": "2026-06-10T19:04:39.507573Z"
+  "updated_at": "2026-06-10T19:43:35.423930Z",
+  "worker_done_at": "2026-06-10T19:43:35.423930Z"
 }

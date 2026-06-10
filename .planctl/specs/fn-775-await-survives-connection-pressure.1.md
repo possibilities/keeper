@@ -75,5 +75,5 @@ the project's standard gate before commit.
 - [ ] All listed test cases added and green; no server-side changes
 
 ## Done summary
-
+Reclassified max_connections cap rejects as retryable via TRANSIENT_SERVER_CODES: route to capped-backoff reconnect (never onFatal/reason=connect), reset backoff on served-not-accepted so accept-then-reject cycles grow, longer full-jitter cap-reject regime; await re-query one-shots resolve indeterminate on persistent cap reject (never false deleted); corrected epic-complete status literals to 'done'.
 ## Evidence
