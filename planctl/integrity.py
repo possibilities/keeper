@@ -15,7 +15,7 @@ Coverage (matches the legacy ``run_validate.py:--epic`` block 1:1):
   epic-dep graph (requires the caller to pass ``all_epic_deps``)
 - multi-repo fields (``primary_repo`` / ``touched_repos``) when present —
   filesystem ``.git/`` checks
-- per-task fields (id / epic / title / status / preferred_backend)
+- per-task fields (id / epic / title / status)
 - task spec heading validation
 - task-level ``depends_on`` shape + cross-epic check
 - dep existence + cycle detection across the epic's task graph
@@ -152,7 +152,6 @@ def _check_epic_tree(  # noqa: PLR0912, PLR0915 — single linear check matches 
     from planctl.ids import epic_id_from_task, is_epic_id, is_task_id
     from planctl.models import (
         EPIC_STATUSES,
-        TASK_BACKENDS,
         TASK_STATUSES,
         merge_task_state,
     )
@@ -281,15 +280,6 @@ def _check_epic_tree(  # noqa: PLR0912, PLR0915 — single linear check matches 
                         )
                 except ValueError:
                     errors.append(f"Task {tid}: invalid dependency ID: {dep_tid}")
-
-        # preferred_backend allowlist check (fn-586 dormant infra).
-        if "preferred_backend" in task_data:
-            pb = task_data["preferred_backend"]
-            if pb is not None and pb not in TASK_BACKENDS:
-                errors.append(
-                    f"Task {tid}: invalid preferred_backend {pb!r} "
-                    f"(must be null or one of {list(TASK_BACKENDS)})"
-                )
 
         # target_repo validation (new-style tasks only — null skips).
         target_repo = task_data.get("target_repo")

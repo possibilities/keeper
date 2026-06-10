@@ -36,7 +36,7 @@ from planctl.cli import cli
 # of these, we keep both words as the argv; otherwise we keep just the first.
 # Sourced from `planctl --help` (top-level groups with subcommands).
 _MULTIWORD_PREFIXES: frozenset[str] = frozenset(
-    {"epic", "task", "worker", "dep", "config", "codex"}
+    {"epic", "task", "worker", "dep", "config"}
 )
 
 _TMPL_PATH: Path = (
@@ -166,10 +166,10 @@ def test_agentid_regex_requires_search_not_match():
 # spawn site (it now lives in keeper's `--plugin-dir` choice).
 #
 # This group pins the new shape:
-#   - The OLD `apps/planctl/agents/worker-{medium,high,xhigh,max}.md` and
-#     `worker-codex-{medium,high}.md` files MUST NOT exist on disk — they
-#     were deleted in fn-593 task .6 and the agent-template fan-out now
-#     emits directly into `claude/work-plugins/<tier>/agents/worker.md`.
+#   - The OLD `apps/planctl/agents/worker-{medium,high,xhigh,max}.md` files
+#     MUST NOT exist on disk — they were deleted in fn-593 task .6 and the
+#     agent-template fan-out now emits directly into
+#     `claude/work-plugins/<tier>/agents/worker.md`.
 #   - The NEW `claude/work-plugins/<tier>/agents/worker.md` files MUST exist
 #     for every claude tier, set `model: opus`, and declare the
 #     matching `effort:`.
@@ -183,8 +183,6 @@ _DELETED_AGENT_BASENAMES: tuple[str, ...] = (
     "worker-high.md",
     "worker-xhigh.md",
     "worker-max.md",
-    "worker-codex-medium.md",
-    "worker-codex-high.md",
 )
 
 
@@ -230,7 +228,7 @@ def test_old_tier_suffixed_agent_files_removed(basename: str):
         f"agents from planctl's plugin. The fan-out now emits to "
         f"`claude/work-plugins/<tier>/agents/worker.md` via the template's "
         f"`render_to:` frontmatter. Delete this file and check that "
-        f"`template/agents/worker[-codex].md.tmpl` still carries "
+        f"`template/agents/worker.md.tmpl` still carries "
         f"the cross-boundary `render_to:` directive."
     )
 

@@ -31,7 +31,7 @@ _DEFER_SKILL: Path = _REPO_PLANCTL / "skills" / "defer" / "SKILL.md"
 
 # Multi-word verb prefixes — sourced from work_skill_consistency for symmetry.
 _MULTIWORD_PREFIXES: frozenset[str] = frozenset(
-    {"epic", "task", "worker", "dep", "config", "codex"}
+    {"epic", "task", "worker", "dep", "config"}
 )
 
 

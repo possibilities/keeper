@@ -209,42 +209,6 @@ def test_merge_epic_state_normalizes_without_approval():
 
 
 # ---------------------------------------------------------------------------
-# fn-586: preferred_backend — additive null-defaulted task field (dormant infra)
-# ---------------------------------------------------------------------------
-
-
-def test_normalize_task_adds_null_preferred_backend_on_legacy():
-    """Legacy task dict missing preferred_backend gets null default."""
-    data = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Task"}
-    normalize_task(data)
-    assert "preferred_backend" in data
-    assert data["preferred_backend"] is None
-
-
-def test_normalize_task_preserves_claude_preferred_backend():
-    """normalize_task does not overwrite preferred_backend='claude'."""
-    data = {"preferred_backend": "claude"}
-    normalize_task(data)
-    assert data["preferred_backend"] == "claude"
-
-
-def test_normalize_task_preserves_codex_preferred_backend():
-    """normalize_task does not overwrite preferred_backend='codex'."""
-    data = {"preferred_backend": "codex"}
-    normalize_task(data)
-    assert data["preferred_backend"] == "codex"
-
-
-def test_normalize_task_preferred_backend_round_trip_idempotent():
-    """Load -> normalize -> dump -> load -> normalize is identical."""
-    data = {"id": "fn-1-test.1", "epic": "fn-1-test", "title": "Task"}
-    normalize_task(data)
-    first_snapshot = json.loads(json.dumps(data))
-    normalize_task(first_snapshot)
-    assert first_snapshot == data
-
-
-# ---------------------------------------------------------------------------
 # Epic create — new-record field assignment
 # ---------------------------------------------------------------------------
 

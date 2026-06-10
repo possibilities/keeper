@@ -26,13 +26,6 @@ TASK_STATUSES = ["todo", "in_progress", "blocked", "done"]
 
 TASK_TIERS = ("medium", "high", "xhigh", "max")
 
-# fn-586: dormant infrastructure for codex-backed worker subagents. The field
-# is additive on every task JSON but nothing reads it today — no setter verb,
-# no `/plan:work` routing, no `planctl show` surface. The allowlist is
-# {None, "claude", "codex"}; empty string is rejected by `validate` as
-# distinct from None. Future routing epic will wire selection.
-TASK_BACKENDS = ("claude", "codex")
-
 
 def normalize_epic(data: dict) -> dict:
     """Apply defaults for optional epic fields."""
@@ -136,16 +129,6 @@ def normalize_task(data: dict) -> dict:
     # via `/plan:plan <epic_id>` refine (build-forward).
     if "tier" not in data:
         data["tier"] = None
-    # fn-586: dormant infrastructure for codex-backed worker subagents.
-    # Additive null-defaulted field, no SCHEMA_VERSION bump (mirrors `tier`
-    # above and the `snippets` / `primary_repo` additive precedents).
-    # Allowlist enforced in `run_validate.py`: {None, "claude", "codex"};
-    # empty string is rejected distinctly from None. No setter verb today,
-    # no `/plan:work` routing reads this field, no `planctl show` surface.
-    # Future maintainers grepping for `preferred_backend`: the routing epic
-    # owns selection — this stub only carries the schema slot.
-    if "preferred_backend" not in data:
-        data["preferred_backend"] = None
     # fn-513: snippet-substrate metadata. Additive list fields, no
     # SCHEMA_VERSION bump (mirrors normalize_epic above). Order matters
     # in the lists (first-occurrence preservation per the runtime-substrate
