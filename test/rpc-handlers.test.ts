@@ -23,7 +23,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb } from "../src/db";
 import {
   parseDispatchKey,
   replayDeadLetterHandler,
@@ -33,9 +32,9 @@ import {
   setEpicArmedHandler,
 } from "../src/rpc-handlers";
 import { BadParamsError, type ReplayBridge } from "../src/server-worker";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
-let dbPath: string;
 let configPath: string;
 let planRoot: string;
 let epicsDir: string;
@@ -44,7 +43,6 @@ let originalKeeperConfig: string | undefined;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-rpc-handlers-test-"));
-  dbPath = join(tmpDir, "keeper.db");
   planRoot = join(tmpDir, "plan-root");
   epicsDir = join(planRoot, ".planctl", "epics");
   tasksDir = join(planRoot, ".planctl", "tasks");
@@ -56,7 +54,11 @@ beforeEach(() => {
   writeFileSync(configPath, `roots:\n  - ${JSON.stringify(planRoot)}\n`);
   originalKeeperConfig = process.env.KEEPER_CONFIG;
   process.env.KEEPER_CONFIG = configPath;
-  openDb(dbPath).db.close();
+  // fn-769 mem variant: no test body opens a DB connection — the handlers run
+  // against stub bridges + the plan-root filesystem — so this bootstrap only
+  // ever needed a migrated schema in process. The in-memory template clone
+  // gives that without the per-test migration ladder.
+  freshMemDb().db.close();
 });
 
 afterEach(() => {

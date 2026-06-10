@@ -21,6 +21,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
 import { createRefoldProgressPoller } from "../src/refold-progress";
+import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -36,7 +37,12 @@ afterEach(() => {
 
 /** Insert `n` rows into `events` and return the rowid of the last one. */
 function seedEvents(path: string, n: number): number {
-  const { db } = openDb(path);
+  // fn-769 file variant: the readonly poller (and any later writer) open this
+  // SAME path, so the migrated schema must live on disk. `freshDbFile` is the
+  // bootstrap — it writes the pre-migrated template image (skipping the ladder)
+  // AND establishes WAL so a later readonly poller open succeeds. Callers only
+  // ever invoke `seedEvents` once per test as the first opener.
+  const { db } = freshDbFile(path);
   try {
     const insert = db.prepare(
       "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (?, 's', 'Stop', 'lifecycle', '{}')",
@@ -54,7 +60,9 @@ function seedEvents(path: string, n: number): number {
 
 /** Advance `reducer_state.last_event_id` to a known value. */
 function setCursor(path: string, cursor: number): void {
-  const { db } = openDb(path);
+  // Always invoked AFTER `seedEvents` has bootstrapped the file, so the schema
+  // is already current — skip the migrate ladder.
+  const { db } = openDb(path, { migrate: false });
   try {
     db.query("UPDATE reducer_state SET last_event_id = ?").run(cursor);
   } finally {
@@ -96,7 +104,9 @@ test("poll returns null on a freshly-migrated DB with zero events", () => {
   // `last_event_id = 0`, and `events` is empty so `MAX(id)` is SQL
   // NULL. The poller surfaces null so the consumer falls back to the
   // plain "connecting" line instead of dividing by zero.
-  openDb(dbPath).db.close();
+  // fn-769 file variant: bootstrap the on-disk schema via the template image
+  // (no prior seedEvents here) so the readonly poller can open it.
+  freshDbFile(dbPath).db.close();
   const poller = createRefoldProgressPoller(dbPath);
   try {
     expect(poller.poll()).toBeNull();
@@ -123,7 +133,7 @@ test("poll returns null on a SELECT-time throw and remains usable", () => {
   // writer connection. The poller's prepared SELECT against
   // `events.id` will throw "no such table" on the next poll; the
   // wrapper swallows it.
-  const writer = openDb(dbPath).db;
+  const writer = openDb(dbPath, { migrate: false }).db;
   try {
     writer.run("DROP TABLE events");
   } finally {

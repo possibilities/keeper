@@ -42,7 +42,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb, resolveRestorePath } from "../src/db";
+import { resolveRestorePath } from "../src/db";
 import {
   buildRestoreTier,
   parsePersistedRestore,
@@ -54,6 +54,7 @@ import {
   serializeForWrite,
 } from "../src/restore-worker";
 import type { Epic, Job } from "../src/types";
+import { freshMemDb } from "./helpers/template-db";
 
 /** Build a fresh two-tier PulseState for the pulse driver tests. */
 function freshState(): {
@@ -90,16 +91,17 @@ function tierKeys(tier: RestoreTier | null): Record<string, string[]> {
 }
 
 let tmpDir: string;
-let dbPath: string;
 let restorePath: string;
 let db: Database;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-restore-worker-test-"));
-  dbPath = join(tmpDir, "keeper.db");
   restorePath = join(tmpDir, "restore.json");
   process.env.KEEPER_RESTORE_FILE = restorePath;
-  db = openDb(dbPath).db;
+  // fn-769 mem variant: this suite holds a single in-process connection (no
+  // second opener, no spawned Worker), so an in-memory clone of the migrated
+  // template is correct and skips the per-test migration ladder.
+  db = freshMemDb().db;
 });
 
 afterEach(() => {

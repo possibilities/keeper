@@ -74,6 +74,7 @@ import {
   type Writable,
   writeFrames,
 } from "../src/server-worker";
+import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -146,8 +147,12 @@ beforeEach(() => {
   dbPath = join(tmpDir, "keeper.db");
   sockPath = join(tmpDir, "keeperd.sock");
   lockPath = join(tmpDir, "keeperd.lock");
-  // Bootstrap schema with a writer so the readonly server connection can open.
-  openDb(dbPath).db.close();
+  // fn-769 file variant: the readonly server connection, the spawned-Worker
+  // shutdown test, and the various reader/writer pairs all open this SAME path
+  // (a `:memory:` clone is connection-private), so the migrated schema must
+  // live on DISK. `freshDbFile` writes the pre-migrated template image to the
+  // path (skipping the 63-version ladder); bodies re-open it migration-free.
+  freshDbFile(dbPath).db.close();
 });
 
 afterEach(() => {
@@ -205,7 +210,7 @@ function jobId(row: Row): string {
 }
 
 test("runQuery returns rows ordered by created_at desc by default", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { created_at: 10 });
   seedJob(db, "b", { created_at: 30 });
   seedJob(db, "c", { created_at: 20 });
@@ -219,7 +224,7 @@ test("runQuery returns rows ordered by created_at desc by default", () => {
 });
 
 test("runQuery honors limit + offset", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   for (let i = 0; i < 5; i++) {
     seedJob(db, `j${i}`, { created_at: i });
   }
@@ -232,7 +237,7 @@ test("runQuery honors limit + offset", () => {
 });
 
 test("runQuery treats limit: 0 as 'no limit' — returns the full filtered set", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   // Seed more rows than the default page (DEFAULT_LIMIT is 100) so a plain
   // unlimited query would otherwise truncate; the 'no limit' sentinel must
   // return every row.
@@ -260,7 +265,7 @@ test("runQuery treats limit: 0 as 'no limit' — returns the full filtered set",
 });
 
 test("runQuery applies a state filter", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w", { state: "working", updated_at: 2 });
   seedJob(db, "s", { state: "stopped", updated_at: 1 });
   const res = asResult(
@@ -275,7 +280,7 @@ test("runQuery applies a state filter", () => {
 });
 
 test("runQuery applies a not-equal (ne) state filter, excluding ended jobs", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w", { state: "working", created_at: 3 });
   seedJob(db, "s", { state: "stopped", created_at: 2 });
   seedJob(db, "e", { state: "ended", created_at: 1 });
@@ -338,7 +343,7 @@ test("resolveFilter: empty in matches nothing (WHERE 0); empty not_in matches ev
 });
 
 test("runQuery applies a not_in state filter, excluding terminal states", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w", { state: "working", created_at: 4 });
   seedJob(db, "s", { state: "stopped", created_at: 3 });
   seedJob(db, "e", { state: "ended", created_at: 2 });
@@ -356,7 +361,7 @@ test("runQuery applies a not_in state filter, excluding terminal states", () => 
 });
 
 test("runQuery applies an in state filter, including only listed states", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w", { state: "working", created_at: 4 });
   seedJob(db, "s", { state: "stopped", created_at: 3 });
   seedJob(db, "e", { state: "ended", created_at: 2 });
@@ -380,7 +385,7 @@ test("jobs descriptor defaults the view scope to live jobs (state NOT IN ended, 
 });
 
 test("runQuery applies the default live scope, hiding both terminal states, unless overridden", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w", { state: "working", created_at: 4 });
   seedJob(db, "s", { state: "stopped", created_at: 3 });
   seedJob(db, "e", { state: "ended", created_at: 2 });
@@ -443,7 +448,7 @@ test("resolveFilter: epics default visible-scope applies bare, is dropped by ANY
 });
 
 test("runQuery resolves the pk filter for a detail-page single-item subscribe", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { updated_at: 2 });
   seedJob(db, "b", { updated_at: 1 });
   const res = asResult(
@@ -466,7 +471,7 @@ function seedTitledJob(db: Database, job_id: string, title: string): void {
 }
 
 test("runQuery result rows serve title; title-less reads null and no title_history", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedTitledJob(db, "titled", "fix-osc");
   seedJob(db, "bare", { updated_at: 0 });
   const res = asResult(runQuery(db, 0, { type: "query", collection: "jobs" }));
@@ -480,7 +485,7 @@ test("runQuery result rows serve title; title-less reads null and no title_histo
 });
 
 test("diffTick patch row carries the updated title (parity with result)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedTitledJob(db, "a", "foo");
   setWorldRev(db, 42);
   const sock = fakeSock();
@@ -501,7 +506,7 @@ test("diffTick patch row carries the updated title (parity with result)", () => 
 });
 
 test("runQuery ignores a wire filter key not declared by the descriptor", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { updated_at: 2 });
   seedJob(db, "b", { updated_at: 1 });
   // `pid` is not in JOBS_DESCRIPTOR.filters → ignored, never interpolated; the
@@ -518,7 +523,7 @@ test("runQuery ignores a wire filter key not declared by the descriptor", () => 
 });
 
 test("runQuery returns unknown_collection for a well-formed unknown collection", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a");
   const frame = runQuery(db, 3, {
     type: "query",
@@ -535,7 +540,7 @@ test("runQuery returns unknown_collection for a well-formed unknown collection",
 });
 
 test("runQuery echoes the query id + collection onto the result", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a");
   const res = asResult(
     runQuery(db, 1, { type: "query", collection: "jobs", id: "q1" }),
@@ -546,7 +551,7 @@ test("runQuery echoes the query id + collection onto the result", () => {
 });
 
 test("runQuery falls back to created_at for an unknown sort column", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { created_at: 1 });
   seedJob(db, "b", { created_at: 2 });
   const res = asResult(
@@ -566,7 +571,7 @@ test("runQuery falls back to created_at for an unknown sort column", () => {
 // ---------------------------------------------------------------------------
 
 test("dispatchLine query seeds the collection + watched-set + lastSent", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   seedJob(db, "b", { last_event_id: 9 });
   const conn = newConn();
@@ -586,7 +591,7 @@ test("dispatchLine query seeds the collection + watched-set + lastSent", () => {
 });
 
 test("dispatchLine unsubscribe clears collection + watched-set", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a");
   const conn = newConn();
   dispatchLine(db, conn, JSON.stringify({ type: "query", collection: "jobs" }));
@@ -605,7 +610,7 @@ test("dispatchLine unsubscribe clears collection + watched-set", () => {
 });
 
 test("dispatchLine query with absent/empty/non-string collection → bad_frame", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a");
   const conn = newConn();
   for (const bad of [
@@ -624,7 +629,7 @@ test("dispatchLine query with absent/empty/non-string collection → bad_frame",
 });
 
 test("dispatchLine unknown collection → unknown_collection AND prior subscription survives", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const conn = newConn();
   // Establish a live subscription first.
@@ -654,7 +659,7 @@ test("dispatchLine unknown collection → unknown_collection AND prior subscript
 });
 
 test("dispatchLine returns an error frame for malformed JSON (connection survives)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conn = newConn();
   const frames = dispatchLine(db, conn, "{not json");
   expect(frames).toHaveLength(1);
@@ -672,7 +677,7 @@ test("dispatchLine returns an error frame for malformed JSON (connection survive
 });
 
 test("dispatchLine returns an error frame for an unknown type", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conn = newConn();
   const frames = dispatchLine(
     db,
@@ -686,7 +691,7 @@ test("dispatchLine returns an error frame for an unknown type", () => {
 });
 
 test("dispatchLine ignores a blank line", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conn = newConn();
   expect(dispatchLine(db, conn, "   ")).toHaveLength(0);
   db.close();
@@ -714,7 +719,7 @@ test("RPC_REGISTRY is empty by default", () => {
 });
 
 test("dispatchLine rpc → rpc_result on a registered handler (echoes id, returns handler value)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withRpc("noop", () => ({ ok: true }));
   try {
     const conn = newConn();
@@ -737,7 +742,7 @@ test("dispatchLine rpc → rpc_result on a registered handler (echoes id, return
 });
 
 test("dispatchLine rpc handler receives the writer connection and params", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const seen: { db: Database | null; params: unknown } = {
     db: null,
     params: "untouched",
@@ -770,7 +775,7 @@ test("dispatchLine rpc handler receives the writer connection and params", () =>
 
 test("dispatchLine rpc → writer connection can INSERT and reader sees the row", () => {
   const { db: reader } = openDb(dbPath, { readonly: true });
-  const { db: writer } = openDb(dbPath, { readonly: false });
+  const { db: writer } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withRpc("write_marker", (handlerDb) => {
     handlerDb.run(
       "INSERT INTO meta (key, value) VALUES ('test_rpc_marker', 'ok') ON CONFLICT(key) DO UPDATE SET value=excluded.value",
@@ -800,7 +805,7 @@ test("dispatchLine rpc → writer connection can INSERT and reader sees the row"
 });
 
 test("dispatchLine rpc with no registered method → unknown_method (echoes id)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conn = newConn();
   const frames = dispatchLine(
     db,
@@ -817,7 +822,7 @@ test("dispatchLine rpc with no registered method → unknown_method (echoes id)"
 });
 
 test("dispatchLine rpc handler throw → rpc_failed (echoes id, connection survives)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withRpc("boom", () => {
     throw new Error("kaboom");
   });
@@ -851,7 +856,7 @@ test("dispatchLine rpc handler throw → rpc_failed (echoes id, connection survi
 });
 
 test("dispatchLine rpc handler throwing BadParamsError → bad_params (distinct from rpc_failed)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withRpc("strict", () => {
     throw new BadParamsError("expected `status` of approve|reject|clear");
   });
@@ -876,7 +881,7 @@ test("dispatchLine rpc handler throwing BadParamsError → bad_params (distinct 
 });
 
 test("dispatchLine rpc missing id → bad_frame (no id echoed)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conn = newConn();
   for (const bad of [
     JSON.stringify({ type: "rpc", method: "noop" }), // absent id
@@ -894,7 +899,7 @@ test("dispatchLine rpc missing id → bad_frame (no id echoed)", () => {
 });
 
 test("dispatchLine rpc missing method → bad_frame (echoes id)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conn = newConn();
   for (const bad of [
     JSON.stringify({ type: "rpc", id: "r1" }), // absent method
@@ -911,7 +916,7 @@ test("dispatchLine rpc missing method → bad_frame (echoes id)", () => {
 });
 
 test("dispatchLine rpc preserves an existing subscription (rpc does not touch ConnState)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withRpc("noop", () => null);
   try {
     seedJob(db, "a", { last_event_id: 5 });
@@ -1013,7 +1018,7 @@ test("ASYNC_RPC_REGISTRY is empty by default", () => {
 });
 
 test("dispatchLine async rpc → returns [] inline; ctx.onAsyncResult delivers rpc_result on resolution", async () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withAsyncRpc("async_noop", async (_params, bridge) => {
     const r = await bridge.replay();
     return { ok: true, dl: r.recovered_dl_id };
@@ -1047,7 +1052,7 @@ test("dispatchLine async rpc → returns [] inline; ctx.onAsyncResult delivers r
 });
 
 test("dispatchLine async rpc → handler throw flows to rpc_failed via onAsyncResult", async () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withAsyncRpc("async_boom", async () => {
     throw new Error("kaboom-async");
   });
@@ -1078,7 +1083,7 @@ test("dispatchLine async rpc → handler throw flows to rpc_failed via onAsyncRe
 });
 
 test("dispatchLine async rpc → BadParamsError throw flows to bad_params via onAsyncResult", async () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withAsyncRpc("async_strict", async () => {
     throw new BadParamsError("nope shape mismatch");
   });
@@ -1107,7 +1112,7 @@ test("dispatchLine async rpc → BadParamsError throw flows to bad_params via on
 });
 
 test("dispatchLine async rpc without asyncCtx → unknown_method (legacy sync caller is unchanged)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withAsyncRpc("async_no_ctx", async () => ({ ok: true }));
   try {
     const conn = newConn();
@@ -1155,7 +1160,7 @@ test("registerRpc collides with a same-name async registration", () => {
 // ---------------------------------------------------------------------------
 
 test("dispatchLine async rpc → handler reaches bridge.setAutopilotPaused (round-trip + rpc_result delivery)", async () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withAsyncRpc("ap_paused_probe", async (_p, bridge) => {
     const r = await bridge.setAutopilotPaused(true);
     return { ok: true, relay: r.ok };
@@ -1208,7 +1213,7 @@ test("dispatchLine async rpc → handler reaches bridge.setAutopilotPaused (roun
 });
 
 test("dispatchLine async rpc → handler reaches bridge.retryDispatch with the split (verb, id) pair", async () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withAsyncRpc("retry_dispatch_probe", async (_p, bridge) => {
     return await bridge.retryDispatch("work", "fn-1-foo.3");
   });
@@ -1498,7 +1503,7 @@ async function retryUntil<T>(
 }
 
 test("diffTick pushes one patch when a watched row advances; rev is stamped", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   setWorldRev(db, 42);
   const sock = fakeSock();
@@ -1520,7 +1525,7 @@ test("diffTick pushes one patch when a watched row advances; rev is stamped", ()
 });
 
 test("diffTick emits nothing when no watched row advanced (no-op tick)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   seedJob(db, "other", { last_event_id: 1 });
   const sock = fakeSock();
@@ -1535,7 +1540,7 @@ test("diffTick emits nothing when no watched row advanced (no-op tick)", () => {
 });
 
 test("diffTick does not double-send: a second tick with no change emits nothing", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const sock = fakeSock();
   watch(db, sock, { a: 5 });
@@ -1555,7 +1560,7 @@ test("diffTick does not double-send: a second tick with no change emits nothing"
 // message handler calls; driving it directly proves the kick emits the pending
 // patch and is idempotent against a subsequent poll/kick double-fire.
 test("handleKick emits the pending patch on a post-fold kick", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   setWorldRev(db, 42);
   const sock = fakeSock();
@@ -1574,7 +1579,7 @@ test("handleKick emits the pending patch on a post-fold kick", () => {
 });
 
 test("handleKick + a subsequent kick/poll double-fire is idempotent", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const sock = fakeSock();
   watch(db, sock, { a: 5 });
@@ -1593,7 +1598,7 @@ test("handleKick + a subsequent kick/poll double-fire is idempotent", () => {
 });
 
 test("handleKick never throws out of the handler when diffTick fails", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const sock = fakeSock();
   watch(db, sock, { a: 5 });
@@ -1616,7 +1621,7 @@ test("handleKick never throws out of the handler when diffTick fails", () => {
 // ---------------------------------------------------------------------------
 
 test("diffTick EPIPE-evicts a dead conn (write<0) from conns and calls end()", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
@@ -1635,7 +1640,7 @@ test("diffTick EPIPE-evicts a dead conn (write<0) from conns and calls end()", (
 });
 
 test("diffTick does NOT evict a live attached conn (no false-evict)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns); // accept=true, closing=false, no pending
@@ -1653,7 +1658,7 @@ test("diffTick does NOT evict a live attached conn (no false-evict)", () => {
 });
 
 test("diffTick stuck-pending TTL evicts a backpressured-too-long conn", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
@@ -1673,7 +1678,7 @@ test("diffTick stuck-pending TTL evicts a backpressured-too-long conn", () => {
 });
 
 test("diffTick stuck-pending TTL does NOT evict a freshly-backpressured conn", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
@@ -1692,7 +1697,7 @@ test("diffTick stuck-pending TTL does NOT evict a freshly-backpressured conn", (
 });
 
 test("diffTick stuck-pending TTL leaves a quiet receive-only conn alone", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
@@ -1724,7 +1729,7 @@ test("diffTick stuck-pending TTL leaves a quiet receive-only conn alone", () => 
 // ---------------------------------------------------------------------------
 
 test("diffTick idle-sweep evicts a zero-sub conn idle past the TTL", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
   conns.add(sock);
@@ -1743,7 +1748,7 @@ test("diffTick idle-sweep evicts a zero-sub conn idle past the TTL", () => {
 });
 
 test("diffTick idle-sweep does NOT evict a fresh zero-sub conn (mid-handshake)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
   conns.add(sock);
@@ -1761,7 +1766,7 @@ test("diffTick idle-sweep does NOT evict a fresh zero-sub conn (mid-handshake)",
 });
 
 test("idle-sweep NEVER evicts a subscribed conn, however long it has been quiet", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const conns = new Set<Writable>();
   const sock = fakeSock(conns);
@@ -1783,7 +1788,7 @@ test("idle-sweep NEVER evicts a subscribed conn, however long it has been quiet"
 });
 
 test("reapConns runs both arms: stuck-pending AND idle zero-sub eviction", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conns = new Set<Writable>();
 
   // Arm 1: a backpressured-too-long conn (stuck-pending TTL).
@@ -1806,7 +1811,7 @@ test("reapConns runs both arms: stuck-pending AND idle zero-sub eviction", () =>
 });
 
 test("an idle-sweep end() throw is swallowed (no-self-heal) and siblings still reap", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const conns = new Set<Writable>();
 
   // First conn's end() throws; the second must still be reaped.
@@ -1934,7 +1939,7 @@ test("overlapping one-shot query churn returns conns to baseline (never approach
 });
 
 test("flush stamps pendingSince on backpressure and clears it on drain", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const sock = fakeSock();
   watch(db, sock, { a: 5 });
@@ -1955,7 +1960,7 @@ test("flush stamps pendingSince on backpressure and clears it on drain", () => {
 });
 
 test("a reap-tick throw is swallowed (no-self-heal) by handleKick", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   const sock = fakeSock();
   watch(db, sock, { a: 5 });
@@ -2027,7 +2032,7 @@ test("max-conn cap rejects a new connection with an error frame + close; the old
 });
 
 test("diffTick fans out only to connections watching the changed id", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   seedJob(db, "b", { last_event_id: 1 });
   const watcherA = fakeSock();
@@ -2046,7 +2051,7 @@ test("diffTick fans out only to connections watching the changed id", () => {
 });
 
 test("diffTick coalesces multiple folds between ticks into one patch", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   const sock = fakeSock();
   watch(db, sock, { a: 1 });
@@ -2063,7 +2068,7 @@ test("diffTick coalesces multiple folds between ticks into one patch", () => {
 });
 
 test("diffTick skips a backpressured socket without stalling others; lastSent not advanced", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   const slow = fakeSock();
   watch(db, slow, { a: 1 });
@@ -2086,7 +2091,7 @@ test("diffTick skips a backpressured socket without stalling others; lastSent no
 });
 
 test("diffTick skips a connection with no active subscriptions", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
 
   // A conn with NO active subscription (empty subs map — e.g. never queried,
@@ -2107,7 +2112,7 @@ test("diffTick skips a connection with no active subscriptions", () => {
 });
 
 test("diffTick groups connections by collection (one selectByIds per group)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   // Two conns on the same collection watching the same id → one shared re-read.
   const w1 = fakeSock();
@@ -2289,7 +2294,7 @@ test("pollLoop drives a patch to a subscriber after a separate writer commits", 
   // Reader connection runs the poll loop (autocommit, observes other conns'
   // commits). A separate writer connection commits a jobs change.
   const { db: reader } = openDb(dbPath, { readonly: true });
-  const { db: writer } = openDb(dbPath, { readonly: false });
+  const { db: writer } = openDb(dbPath, { readonly: false, migrate: false });
 
   seedJob(writer, "a", { last_event_id: 1 });
   setWorldRev(writer, 7);
@@ -2329,7 +2334,7 @@ test("pollLoop drives a patch to a subscriber after a separate writer commits", 
 
 test("pollLoop emits no patch when the committed change misses every watched id", async () => {
   const { db: reader } = openDb(dbPath, { readonly: true });
-  const { db: writer } = openDb(dbPath, { readonly: false });
+  const { db: writer } = openDb(dbPath, { readonly: false, migrate: false });
 
   seedJob(writer, "a", { last_event_id: 1 });
   seedJob(writer, "unwatched", { last_event_id: 1 });
@@ -2376,7 +2381,7 @@ function firstMeta(sock: { frames: ServerFrame[] }): MetaFrame | null {
 }
 
 test("runQuery returns total = filtered-set size, independent of limit/offset", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   for (let i = 0; i < 5; i++) {
     seedJob(db, `j${i}`, { updated_at: i });
   }
@@ -2390,7 +2395,7 @@ test("runQuery returns total = filtered-set size, independent of limit/offset", 
 });
 
 test("runQuery total reflects the filter (not the whole table)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w1", { state: "working" });
   seedJob(db, "w2", { state: "working" });
   seedJob(db, "s1", { state: "stopped" });
@@ -2406,7 +2411,7 @@ test("runQuery total reflects the filter (not the whole table)", () => {
 });
 
 test("countAndToken: token is STABLE across a cell update of a matching row", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   seedJob(db, "b", { last_event_id: 1 });
   const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
@@ -2419,7 +2424,7 @@ test("countAndToken: token is STABLE across a cell update of a matching row", ()
 });
 
 test("countAndToken: token CHANGES on a row entering the set", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a");
   const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
   seedJob(db, "b"); // enters
@@ -2430,7 +2435,7 @@ test("countAndToken: token CHANGES on a row entering the set", () => {
 });
 
 test("countAndToken: token CHANGES on a row leaving the set", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a");
   seedJob(db, "b");
   const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
@@ -2442,7 +2447,7 @@ test("countAndToken: token CHANGES on a row leaving the set", () => {
 });
 
 test("countAndToken: balanced swap changes token but not total", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a");
   seedJob(db, "b");
   const before = countAndToken(db, JOBS_DESCRIPTOR, "", []);
@@ -2456,7 +2461,7 @@ test("countAndToken: balanced swap changes token but not total", () => {
 });
 
 test("countAndToken: empty set normalizes to total=0 / token=''", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   // No jobs match the filter.
   const where = resolveFilter(JOBS_DESCRIPTOR, { state: "nonesuch" });
   const res = countAndToken(db, JOBS_DESCRIPTOR, where.clause, where.params);
@@ -2467,7 +2472,7 @@ test("countAndToken: empty set normalizes to total=0 / token=''", () => {
 
 test("countAndToken: token is order-stable regardless of insertion order", () => {
   // Same identity set inserted in different orders → same token (ORDER BY pk).
-  const { db: db1 } = openDb(dbPath, { readonly: false });
+  const { db: db1 } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db1, "c");
   seedJob(db1, "a");
   seedJob(db1, "b");
@@ -2477,8 +2482,8 @@ test("countAndToken: token is order-stable regardless of insertion order", () =>
   rmSync(tmpDir, { recursive: true, force: true });
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-server-test-"));
   dbPath = join(tmpDir, "keeper.db");
-  openDb(dbPath).db.close();
-  const { db: db2 } = openDb(dbPath, { readonly: false });
+  freshDbFile(dbPath).db.close();
+  const { db: db2 } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db2, "b");
   seedJob(db2, "a");
   seedJob(db2, "c");
@@ -2492,7 +2497,7 @@ test("countAndToken: token is order-stable regardless of insertion order", () =>
 // ---------------------------------------------------------------------------
 
 test("diffTick emits a meta when total grows (a row enters the set)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   setWorldRev(db, 5);
   const sock = fakeSock();
@@ -2514,7 +2519,7 @@ test("diffTick emits a meta when total grows (a row enters the set)", () => {
 });
 
 test("diffTick emits a meta on a balanced swap (token-only change, total steady)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   seedJob(db, "b", { last_event_id: 1 });
   const sock = fakeSock();
@@ -2532,7 +2537,7 @@ test("diffTick emits a meta on a balanced swap (token-only change, total steady)
 });
 
 test("diffTick emits NO meta on a pure cell update (only a patch)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   const sock = fakeSock();
   watch(db, sock, { a: 1 });
@@ -2546,7 +2551,7 @@ test("diffTick emits NO meta on a pure cell update (only a patch)", () => {
 });
 
 test("diffTick emits no meta when nothing about membership changed", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   seedJob(db, "other", { last_event_id: 1 });
   const sock = fakeSock();
@@ -2561,7 +2566,7 @@ test("diffTick emits no meta when nothing about membership changed", () => {
 });
 
 test("diffTick shares one count across two conns on the same filter; both advance", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w1", { state: "working" });
   const w1 = fakeSock();
   watch(db, w1, { w1: 1 }, { state: "working" });
@@ -2580,7 +2585,7 @@ test("diffTick shares one count across two conns on the same filter; both advanc
 });
 
 test("diffTick distinguishes filters: a working-only conn ignores a stopped enter", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "w1", { state: "working" });
   const working = fakeSock();
   watch(db, working, { w1: 1 }, { state: "working" });
@@ -2594,7 +2599,7 @@ test("diffTick distinguishes filters: a working-only conn ignores a stopped ente
 });
 
 test("diffTick backpressure: a pending conn gets no meta and does NOT advance; next tick delivers", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   const sock = fakeSock();
   watch(db, sock, { a: 1 }); // baseline total=1
@@ -2639,7 +2644,7 @@ function requireAnonSub(sock: Writable): SubState {
 }
 
 test("meta throttle: rapid total moves within the interval emit exactly ONE meta", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   setWorldRev(db, 5);
   const sock = fakeSock();
@@ -2669,7 +2674,7 @@ test("meta throttle: rapid total moves within the interval emit exactly ONE meta
 });
 
 test("meta throttle: a move after the interval emits the LATEST state (no lost-final-update)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   setWorldRev(db, 5);
   const sock = fakeSock();
@@ -2707,7 +2712,7 @@ test("meta throttle: pollLoop convergence tick flushes a throttled-away delta", 
   // `reader` runs the poll loop in autocommit so it observes the `writer`'s
   // commits via PRAGMA data_version. `diffTick` runs against `reader`.
   const { db: reader } = openDb(dbPath, { readonly: true });
-  const { db: writer } = openDb(dbPath, { readonly: false });
+  const { db: writer } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(writer, "a", { last_event_id: 1 });
   const sock = fakeSock();
   watch(writer, sock, { a: 1 });
@@ -2747,7 +2752,7 @@ test("meta throttle: pollLoop convergence tick flushes a throttled-away delta", 
 }, 5_000);
 
 test("meta throttle never delays the patch pass: cell updates emit immediately under throttle", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   setWorldRev(db, 5);
   const sock = fakeSock();
@@ -2772,7 +2777,7 @@ test("meta throttle never delays the patch pass: cell updates emit immediately u
 });
 
 test("meta throttle is per-SubState: handleKick and pollLoop share one window", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 1 });
   const sock = fakeSock();
   watch(db, sock, { a: 1 });
@@ -3164,7 +3169,7 @@ function asLine(frames: (ServerFrame | PreSerialized)[]): string {
 }
 
 test("fn-698 byte-fidelity: epics (jsonColumns) line === encodeFrame(runQuery) — id present", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", {
     last_event_id: 10,
     tasks: [{ id: "fn-1.1", title: "t1", jobs: [{ job_id: "j1" }] }],
@@ -3185,7 +3190,7 @@ test("fn-698 byte-fidelity: epics (jsonColumns) line === encodeFrame(runQuery) �
 });
 
 test("fn-698 byte-fidelity: epics line === encodeFrame(runQuery) — id absent", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", {
     last_event_id: 10,
     tasks: [{ id: "fn-1.1", title: "t1" }],
@@ -3209,7 +3214,7 @@ test("fn-698 byte-fidelity: epics line === encodeFrame(runQuery) — id absent",
 });
 
 test("fn-698 byte-fidelity: jobs (plain collection) line === encodeFrame(runQuery)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { created_at: 30, last_event_id: 3 });
   seedJob(db, "b", { created_at: 10, last_event_id: 1 });
   setWorldRev(db, 99);
@@ -3227,7 +3232,7 @@ test("fn-698 byte-fidelity: jobs (plain collection) line === encodeFrame(runQuer
 });
 
 test("fn-698 byte-fidelity: empty rows line === encodeFrame(runQuery)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   // No epics seeded → empty filtered set.
   setWorldRev(db, 5);
 
@@ -3245,7 +3250,7 @@ test("fn-698 byte-fidelity: empty rows line === encodeFrame(runQuery)", () => {
 });
 
 test("fn-698 single-flight: N identical-signature queries → ONE runQuery + ONE stringify", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   for (let i = 0; i < 5; i++) {
     seedEpic(db, `fn-${i}`, {
       epic_number: i,
@@ -3308,7 +3313,7 @@ test("fn-698 single-flight: N identical-signature queries → ONE runQuery + ONE
 });
 
 test("fn-698 distinct signatures cache separately; the rows blob is shared per entry", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-0", {
     epic_number: 0,
     last_event_id: 0,
@@ -3344,7 +3349,7 @@ test("fn-698 distinct signatures cache separately; the rows blob is shared per e
 });
 
 test("fn-698 worldRev advance replaces the cache; new line carries the new rev", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", { last_event_id: 1, tasks: [{ id: "fn-1.1" }] });
   setWorldRev(db, 10);
 
@@ -3377,7 +3382,7 @@ test("fn-698 worldRev advance replaces the cache; new line carries the new rev",
 });
 
 test("fn-698 memo-throw degrades to the un-memoized result path; dispatchLine never throws", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", { last_event_id: 1 });
   setWorldRev(db, 8);
 
@@ -3413,7 +3418,7 @@ test("fn-698 memo-throw degrades to the un-memoized result path; dispatchLine ne
 });
 
 test("fn-698 unknown collection through the memo path mints the same error (not cached)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   setWorldRev(db, 1);
   const memo = newResultMemo();
   const frames = dispatchLine(
@@ -3472,7 +3477,7 @@ test("fn-698 writeFrames writes a PreSerialized line verbatim — backpressure p
 });
 
 test("fn-698 a non-query frame still routes through encodeFrame (object path intact)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   setWorldRev(db, 2);
   const memo = newResultMemo();
   // An unsubscribe returns [] — never touches the memo / pre-serialized path.
@@ -3489,7 +3494,7 @@ test("fn-698 a non-query frame still routes through encodeFrame (object path int
 });
 
 test("fn-698 cap: a NEW signature past the cap runs un-memoized; the hot signature never sheds", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", { last_event_id: 1 });
   setWorldRev(db, 1);
 

@@ -17,7 +17,6 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { closeSync, mkdtempSync, openSync, rmSync, writeSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb } from "../src/db";
 import {
   decideIntegrityProbe,
   type IntegrityProbeDeps,
@@ -26,6 +25,7 @@ import {
   QUICK_CHECK_OK,
   runIntegrityProbe,
 } from "../src/integrity-probe";
+import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -191,9 +191,11 @@ test("runIntegrityProbe: a throwing PAGE sink does not crash the heartbeat", () 
 // ---------------------------------------------------------------------------
 
 test("liveQuickCheck: a HEALTHY real DB returns exactly `ok` and never pages", () => {
-  // Build a real keeper DB (full schema migrate), then close all handles so the
-  // probe's read-only open sees a quiescent file.
-  const { db } = openDb(dbPath);
+  // Build a real keeper DB, then close all handles so the probe's read-only
+  // open sees a quiescent file. fn-769 file variant: the probe opens this SAME
+  // path read-only, so the migrated schema must live on disk. `freshDbFile`
+  // writes the pre-migrated template image (skipping the ladder).
+  const { db } = freshDbFile(dbPath);
   db.run("PRAGMA wal_checkpoint(TRUNCATE)"); // fold the WAL into the main file
   db.close();
 
@@ -212,8 +214,10 @@ test("liveQuickCheck: a HEALTHY real DB returns exactly `ok` and never pages", (
 test("liveQuickCheck: a deliberately-CORRUPTED fixture DB trips the probe and pages", () => {
   // Build a real keeper DB, checkpoint the WAL into the main file so the
   // corruption we splatter onto the main file is what quick_check reads, then
-  // close every handle.
-  const { db } = openDb(dbPath);
+  // close every handle. fn-769 file variant: the probe re-opens this path
+  // read-only and we corrupt the raw on-disk image, so the schema must be on
+  // disk. `freshDbFile` bootstraps it from the template (no migrate ladder).
+  const { db } = freshDbFile(dbPath);
   // Force a non-trivial DB so there are interior B-tree pages to corrupt.
   for (let i = 0; i < 200; i++) {
     db.run("INSERT INTO meta (key, value) VALUES (?, ?)", [

@@ -45,6 +45,7 @@ import {
   verifySnapshot,
 } from "../src/backup";
 import { openDb } from "../src/db";
+import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -56,6 +57,12 @@ beforeEach(() => {
   );
   mkdirSync(tmpDir, { recursive: true });
   dbPath = join(tmpDir, "keeper.db");
+  // fn-769 file variant: the source DB and the online-backup/VACUUM-INTO path
+  // open this SAME path across separate connections, so the migrated schema
+  // must live on disk. Pre-write the template image (skipping the ladder);
+  // later opens pass `migrate: false`. The image is a valid non-WAL DB file;
+  // the size/restore tests do their own `wal_checkpoint(TRUNCATE)` regardless.
+  freshDbFile(dbPath).db.close();
 });
 
 afterEach(() => {
@@ -187,7 +194,7 @@ test("pruneSnapshots: missing dir is a no-op (no throw)", () => {
 
 test("backupDb: produces a VERIFIED snapshot that restores to a matching DB", () => {
   // Real keeper DB with a known marker row in `meta`.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(dbPath, { migrate: false });
   db.run("INSERT INTO meta (key, value) VALUES (?, ?)", [
     "backup-test-marker",
     "load-bearing-value",
@@ -232,7 +239,7 @@ test("backupDb: produces a VERIFIED snapshot that restores to a matching DB", ()
 test("backupDb: VACUUM INTO reclaims freelist — snapshot smaller than a bloated source", () => {
   // Bloat the source: insert then delete a large payload so the freelist grows
   // but the file does not shrink (the fn-746.1 deferred-VACUUM condition).
-  const { db } = openDb(dbPath);
+  const { db } = openDb(dbPath, { migrate: false });
   for (let i = 0; i < 500; i++) {
     db.run("INSERT INTO meta (key, value) VALUES (?, ?)", [
       `bloat-${i}`,
@@ -257,7 +264,7 @@ test("backupDb: a snapshot that fails integrity_check is DELETED, reports failur
   // simulate by corrupting the SOURCE on disk first, then VACUUM INTO either
   // throws (corruption) or yields a snapshot that fails verify — both land in
   // the failure branch with no leftover snapshot.
-  const { db } = openDb(dbPath);
+  const { db } = openDb(dbPath, { migrate: false });
   for (let i = 0; i < 300; i++) {
     db.run("INSERT INTO meta (key, value) VALUES (?, ?)", [
       `pad-${i}`,
@@ -291,7 +298,7 @@ test("backupDb: a snapshot that fails integrity_check is DELETED, reports failur
 });
 
 test("backupDb: prunes to DEFAULT_BACKUP_RETENTION across successive runs", () => {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(dbPath, { migrate: false });
   db.run("PRAGMA wal_checkpoint(TRUNCATE)");
   db.close();
 

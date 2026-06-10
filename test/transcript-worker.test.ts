@@ -35,7 +35,6 @@ import {
   type BackstopRollup,
   buildMissedWakeRecord,
 } from "../src/backstop-telemetry";
-import { openDb } from "../src/db";
 import {
   matchApiError,
   matchAskUserQuestion,
@@ -44,6 +43,7 @@ import {
   TranscriptLineStream,
 } from "../src/transcript-worker";
 import type { ApiErrorKind, InputRequestKind } from "../src/types";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
 
@@ -281,8 +281,10 @@ test("scanFile then live onChange: the live tail does not re-emit the scanned ti
 });
 
 test("scanJobsForTitles: scopes to jobs.transcript_path and folds the current title at boot", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`seedFromDb` /
+  // `scanJobsForTitles` reuse the same `db`); no second opener or worker
+  // touches the path.
+  const { db } = freshMemDb();
   try {
     // A live job whose transcript file carries a title set while the daemon was
     // down (title_source still the lower-priority 'payload', not 'transcript').
@@ -318,8 +320,10 @@ test("scanJobsForTitles: scopes to jobs.transcript_path and folds the current ti
 });
 
 test("scanJobsForTitles: an already-folded transcript title is NOT re-emitted on restart", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`seedFromDb` /
+  // `scanJobsForTitles` reuse the same `db`); no second opener or worker
+  // touches the path.
+  const { db } = freshMemDb();
   try {
     // The session's title already WON at title_source='transcript' (folded by a
     // prior daemon). The transcript file still holds that same title.
@@ -350,8 +354,10 @@ test("scanJobsForTitles: an already-folded transcript title is NOT re-emitted on
 });
 
 test("scanJobsForTitles: boot then drop-recovery over an unchanged file emits nothing the second time", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`seedFromDb` /
+  // `scanJobsForTitles` reuse the same `db`); no second opener or worker
+  // touches the path.
+  const { db } = freshMemDb();
   try {
     const transcriptPath = join(tmpDir, "recover-sess.jsonl");
     writeFileSync(
@@ -544,8 +550,10 @@ test("scanFile memo: ENOENT clears the entry so a re-appeared file rescans", () 
 });
 
 test("scanJobsForTitles: a title changed between boot and recovery emits exactly its delta", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`seedFromDb` /
+  // `scanJobsForTitles` reuse the same `db`); no second opener or worker
+  // touches the path.
+  const { db } = freshMemDb();
   try {
     const transcriptPath = join(tmpDir, "delta-sess.jsonl");
     writeFileSync(transcriptPath, `${titleLine("delta-sess", "First")}\n`);
@@ -1298,8 +1306,10 @@ test("disjointness corpus: the three pre-filter needles never co-fire on the sam
 // ---------------------------------------------------------------------------
 
 test("fn-720: scanJobsForTitles returns true when it emits, false on a change-gated no-op", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`seedFromDb` /
+  // `scanJobsForTitles` reuse the same `db`); no second opener or worker
+  // touches the path.
+  const { db } = freshMemDb();
   try {
     const transcriptPath = join(tmpDir, "ret-sess.jsonl");
     writeFileSync(transcriptPath, `${titleLine("ret-sess", "A Title")}\n`);

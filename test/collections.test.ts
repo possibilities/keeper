@@ -32,6 +32,7 @@ import {
 import { MAX_IN_PARAMS, openDb } from "../src/db";
 import type { ErrorFrame, ResultFrame } from "../src/protocol";
 import { runQuery } from "../src/server-worker";
+import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -39,7 +40,13 @@ let dbPath: string;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-collections-test-"));
   dbPath = join(tmpDir, "keeper.db");
-  openDb(dbPath).db.close();
+  // fn-769 file variant: each test body re-opens this path with a SECOND
+  // `openDb(dbPath)` connection, so the migrated schema must live on DISK (a
+  // `:memory:` clone is connection-private). `freshDbFile` writes the
+  // pre-migrated template image to the path (skipping the 63-version ladder),
+  // then we close — the bodies re-open it migration-free since it's already
+  // at the current schema_version.
+  freshDbFile(dbPath).db.close();
 });
 
 afterEach(() => {
@@ -307,7 +314,7 @@ test("runQuery pages an empty pending_dispatches collection on a fresh DB (schem
   // arm — task .2 of the epic). `runQuery` must serve the empty collection
   // without error so the autopilot viewer's "in-flight" pane renders
   // cleanly on a quiescent system.
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const res = asResult(
     runQuery(db, 0, { type: "query", collection: "pending_dispatches" }),
   );
@@ -319,7 +326,7 @@ test("runQuery pages an empty pending_dispatches collection on a fresh DB (schem
 test("runQuery pages a seeded pending_dispatches row with the served columns (schema v50, fn-678)", () => {
   // Hand-insert a row (no reducer needed — the descriptor + runQuery path
   // is the unit under test). Mirrors the `epics` round-trip test shape.
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   db.query(
     `INSERT INTO pending_dispatches (verb, id, dir, dispatched_at, last_event_id)
      VALUES (?, ?, ?, ?, ?)`,
@@ -387,7 +394,7 @@ test("epics descriptor: created_by_closer_of + sort_path columns are served (sch
 });
 
 test("runQuery decodes the git status JSON columns", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   db.query(
     `INSERT INTO git_status (
        project_dir, branch, dirty_count, orphaned_count,
@@ -422,7 +429,7 @@ test("runQuery decodes the git status JSON columns", () => {
 // ---------------------------------------------------------------------------
 
 test("runQuery pages the epics collection with the served columns + total", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   // Both open so the default `status: open` scope keeps them in the page.
   seedEpic(db, "fn-2-beta", { epic_number: 2, status: "open" });
   seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "open" });
@@ -441,7 +448,7 @@ test("runQuery pages the epics collection with the served columns + total", () =
 });
 
 test("runQuery decodes the embedded tasks JSON-array column into a real array", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const tasks = JSON.stringify([
     {
       task_id: "fn-1-alpha.1",
@@ -477,7 +484,7 @@ test("runQuery decodes the embedded tasks JSON-array column into a real array", 
 });
 
 test("runQuery decodes the depends_on_epics JSON-array column into a real array", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-4-alpha", {
     epic_number: 4,
     status: "open",
@@ -512,7 +519,7 @@ test("runQuery decodes resolved_epic_deps JSON into a real array (schema v34, fn
   // Mirror of the `depends_on_epics` decode test above; the per-entry
   // shape is the task-.3 `ResolvedEpicDep` type but the decode pass is
   // value-agnostic — we round-trip whatever JSON the column carries.
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const resolved = JSON.stringify([
     {
       dep_token: "fn-3",
@@ -566,7 +573,7 @@ test("runQuery preserves NULL on resolved_epic_deps (NOT collapsed to []) — th
   // from a structurally empty dep list. seedEpic stamps the row but never
   // touches `resolved_epic_deps`, so the column reads NULL from the DB;
   // `decodeRow` must preserve that NULL on the wire.
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-7-pending", { epic_number: 7, status: "open" });
   const res = asResult(
     runQuery(db, 0, {
@@ -582,7 +589,7 @@ test("runQuery preserves NULL on resolved_epic_deps (NOT collapsed to []) — th
 });
 
 test("runQuery decodes the embedded jobs JSON-array column into a real array", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const epicJobs = JSON.stringify([
     {
       job_id: "sess-plan-1",
@@ -621,7 +628,7 @@ test("runQuery decodes the jobs.epic_links JSON-array column into a real array (
   // invocation classifier's output. The read boundary parses it to a real
   // array so `result`/`patch` frames serve the decoded shape (consumers
   // never see a JSON string).
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const links = JSON.stringify([
     { kind: "creator", target: "fn-1-alpha" },
     { kind: "refiner", target: "fn-2-beta" },
@@ -650,7 +657,7 @@ test("runQuery decodes the epics.job_links JSON-array column into a real array (
   // (`EPICS_DESCRIPTOR.jsonColumns`) — the per-epic view of the same
   // invocation classifier output (every session whose planctl-CLI footprint
   // created or refined this epic inside a `/plan:plan` window).
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const links = JSON.stringify([
     { kind: "creator", job_id: "sess-planner-1" },
     { kind: "refiner", job_id: "sess-planner-2" },
@@ -683,7 +690,7 @@ test("runQuery nested-decodes task.jobs through the tasks JSON parse", () => {
   // `tasks` column decode parses the outer array; the nested `task.jobs` rides
   // for free (decodeRow returns parsed arrays whose nested array fields are
   // already arrays). No separate jsonColumns entry is needed for task.jobs.
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const tasks = JSON.stringify([
     {
       task_id: "fn-1-foo.1",
@@ -733,7 +740,7 @@ test("runQuery nested-decodes task.jobs through the tasks JSON parse", () => {
 });
 
 test("runQuery decodes a NULL/malformed tasks column to []", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1-alpha", { epic_number: 1, tasks: "{not json" });
   const res = asResult(
     runQuery(db, 0, {
@@ -747,7 +754,7 @@ test("runQuery decodes a NULL/malformed tasks column to []", () => {
 });
 
 test("runQuery resolves the epics pk filter to a single row", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1-alpha", { epic_number: 1 });
   seedEpic(db, "fn-2-beta", { epic_number: 2 });
   const res = asResult(
@@ -763,7 +770,7 @@ test("runQuery resolves the epics pk filter to a single row", () => {
 });
 
 test("runQuery narrows the epics set by status filter", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1-alpha", { epic_number: 1, status: "active" });
   seedEpic(db, "fn-2-beta", { epic_number: 2, status: "done" });
   seedEpic(db, "fn-3-gamma", { epic_number: 3, status: "active" });
@@ -798,7 +805,7 @@ test("epics descriptor defaults the view scope to status open", () => {
 });
 
 test("runQuery applies the default open scope when no filter is given", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1-open", { epic_number: 1, status: "open" });
   seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" });
   // No filter → default `status=open` keeps fn-1 (open). fn-2 (done) falls off
@@ -810,7 +817,7 @@ test("runQuery applies the default open scope when no filter is given", () => {
 });
 
 test("an explicit status filter overrides the default open scope", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1-open", { epic_number: 1, status: "open" });
   seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" });
   // Asking for done overrides the default → only the done epic.
@@ -827,7 +834,7 @@ test("an explicit status filter overrides the default open scope", () => {
 });
 
 test("a pk lookup resolves a done epic despite the default open scope", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-2-done", { epic_number: 2, status: "done" });
   // A detail-page single-item subscribe targets one identity and must resolve
   // whatever its status — the default scope is exempt for a pk lookup.
@@ -859,7 +866,7 @@ test("getCollection returns undefined for `approvals` (retired in schema v13)", 
 // ---------------------------------------------------------------------------
 
 test("selectVersionsByIds: empty ids → empty Map (no SQL run)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   // Seed a row so an erroneous "fetch all" implementation would return non-empty.
   seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 7 });
   const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, []);
@@ -868,7 +875,7 @@ test("selectVersionsByIds: empty ids → empty Map (no SQL run)", () => {
 });
 
 test("selectVersionsByIds: known seed → Map carries (pk, version) pairs, only requested ids", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 11 });
   seedEpic(db, "fn-2", { epic_number: 2, last_event_id: 22 });
   seedEpic(db, "fn-3", { epic_number: 3, last_event_id: 33 });
@@ -884,7 +891,7 @@ test("selectVersionsByIds: known seed → Map carries (pk, version) pairs, only 
 test("selectVersionsByIds: works for the jobs descriptor too (descriptor-agnostic)", () => {
   // The helper is generic over CollectionDescriptor — verify it routes the
   // table/pk/version identifiers correctly for a non-epics descriptor.
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedJob(db, "a", { last_event_id: 5 });
   seedJob(db, "b", { last_event_id: 9 });
   const map = selectVersionsByIds(db, JOBS_DESCRIPTOR, ["a", "b"]);
@@ -895,7 +902,7 @@ test("selectVersionsByIds: works for the jobs descriptor too (descriptor-agnosti
 });
 
 test("selectVersionsByIds: typeof is number for known-non-null versions", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 42 });
   const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, ["fn-1"]);
   const v = map.get("fn-1");
@@ -908,7 +915,7 @@ test("selectVersionsByIds: id absent from the table is not in the result Map", (
   // The schema-never-deletes assumption matches today's `!row` guard in
   // diffTick: a missing id surfaces as `Map.get(id) === undefined`, which the
   // caller treats as "skip silently".
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 7 });
   const map = selectVersionsByIds(db, EPICS_DESCRIPTOR, ["fn-1", "ghost"]);
   expect(map.size).toBe(1);
@@ -918,7 +925,7 @@ test("selectVersionsByIds: id absent from the table is not in the result Map", (
 });
 
 test("selectVersionsByIds: ids.length > MAX_IN_PARAMS throws (mirrors selectByIds)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const ids: string[] = [];
   for (let i = 0; i < MAX_IN_PARAMS + 1; i++) ids.push(`fn-${i}`);
   expect(() => selectVersionsByIds(db, EPICS_DESCRIPTOR, ids)).toThrow(
@@ -935,7 +942,7 @@ test("selectVersionsByIds: ids.length > MAX_IN_PARAMS throws (mirrors selectById
 // ---------------------------------------------------------------------------
 
 test("selectVersionsByIdsChunked: > MAX_IN_PARAMS ids return ALL versions (no throw)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const n = MAX_IN_PARAMS * 2 + 17; // spans 3 batches
   const ids: string[] = [];
   for (let i = 0; i < n; i++) {
@@ -952,7 +959,7 @@ test("selectVersionsByIdsChunked: > MAX_IN_PARAMS ids return ALL versions (no th
 });
 
 test("selectByIdsChunked: > MAX_IN_PARAMS ids return ALL rows (no throw)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const n = MAX_IN_PARAMS + 5; // spans 2 batches
   const ids: string[] = [];
   for (let i = 0; i < n; i++) {
@@ -965,7 +972,7 @@ test("selectByIdsChunked: > MAX_IN_PARAMS ids return ALL rows (no throw)", () =>
 });
 
 test("chunked wrappers pass sub-cap id-sets straight through", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", { epic_number: 1, last_event_id: 11 });
   expect(
     selectVersionsByIdsChunked(db, EPICS_DESCRIPTOR, ["fn-1"]).get("fn-1"),
@@ -981,7 +988,7 @@ test("selectVersionsByIds: never selects JSON columns (no decodeRow path; cheap 
   // never invokes `decodeRow`, populated JSON data can't sneak into the
   // value. This test catches a regression where someone widens the SELECT
   // projection to include arbitrary columns.
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   seedEpic(db, "fn-1", {
     epic_number: 1,
     last_event_id: 99,
@@ -1033,7 +1040,7 @@ test("DEAD_LETTERS_DESCRIPTOR: descriptor shape and registry registration (fn-64
 });
 
 test("dead_letters defaultFilter: recovered rows excluded from default runQuery page (fn-643)", () => {
-  const { db } = openDb(dbPath, { readonly: false });
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
   // Insert one waiting and one recovered row directly — no reducer path.
   db.query(
     `INSERT INTO dead_letters (dl_id, session_id, hook_event, ts, dl_written_at, bindings, status)

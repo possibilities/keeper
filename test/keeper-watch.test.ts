@@ -80,6 +80,7 @@ import {
   writeHeartbeat,
 } from "../babysitters/performance/watch";
 import { openDb } from "../src/db";
+import { freshDbFile } from "./helpers/template-db";
 
 // ---------------------------------------------------------------------------
 // Sandbox: tmpdir DB + ALL FIVE KEEPER_* paths overridden.
@@ -1285,7 +1286,7 @@ describe("sortFindings", () => {
 
 describe("scan (DB layer)", () => {
   test("opens readonly:prepareStmts:false and a write fails at the SQLite layer", () => {
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
     try {
       expect(() =>
@@ -1297,7 +1298,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("detects a dup-dispatch signature end-to-end", async () => {
-    const writer = openDb(dbPath);
+    const writer = freshDbFile(dbPath);
     const now = Math.floor(Date.now() / 1000);
     const dispatchKey = "work::fn-700-x.2";
     // The same verb::id dispatched twice within the window.
@@ -1320,7 +1321,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("bounds the event window — old dispatches outside the window are ignored", async () => {
-    const writer = openDb(dbPath);
+    const writer = freshDbFile(dbPath);
     const now = Math.floor(Date.now() / 1000);
     // Two dispatches of one verb::id, but 2 hours ago — outside the 1h window.
     for (const i of [0, 1]) {
@@ -1341,7 +1342,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("seeds a duplicate-live-worker pair and pages it critical end-to-end", async () => {
-    const writer = openDb(dbPath);
+    const writer = freshDbFile(dbPath);
     const now = Math.floor(Date.now() / 1000);
     // Two non-terminal jobs bound to the SAME plan_ref, both with a pid the
     // injected isAlive reports live → the re-fire signature.
@@ -1372,7 +1373,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("counts poison-parked dead_letters and surfaces poison-arrivals", async () => {
-    const writer = openDb(dbPath);
+    const writer = freshDbFile(dbPath);
     const now = Math.floor(Date.now() / 1000);
     for (const [dlId, status] of [
       ["dl-1", "poison"],
@@ -1396,7 +1397,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("db-growth / events-log-backlog / keeperd-cpu stay OFF for a quiet caller", async () => {
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     // quietDeps wires none of the new optional probes → none of the three fire.
     const findings = await scan(dbPath, 3600, quietDeps(now));
@@ -1406,7 +1407,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("wires the injected db-growth / events-log-backlog / keeperd-cpu probes", async () => {
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     const deps: ScanDeps = {
       ...quietDeps(now),
@@ -1425,7 +1426,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("surfaces daemon-down via injected probes without a live daemon", async () => {
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     const deps: ScanDeps = {
       ...quietDeps(now),
@@ -1439,14 +1440,14 @@ describe("scan (DB layer)", () => {
   });
 
   test("emits no findings on a healthy, quiet empty DB", async () => {
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     const findings = await scan(dbPath, 3600, quietDeps(now));
     expect(findings).toHaveLength(0);
   });
 
   test("fold-latency: a scaffold op + later EpicSnapshot pairs end-to-end", async () => {
-    const writer = openDb(dbPath);
+    const writer = freshDbFile(dbPath);
     const now = Math.floor(Date.now() / 1000);
     const epic = "fn-732-move-approval-to-runtime-sidecar";
     // op 20s ago; matching EpicSnapshot 10s ago → ~10s latency, over the bar.
@@ -1474,7 +1475,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("backstop ingest: a NEW high-staleness rescue surfaces through scan via injected deps", async () => {
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     const baselinePath = resolveBackstopBaselinePath();
     // Pre-seed a baseline that has already observed this bucket with a watermark
@@ -1516,7 +1517,7 @@ describe("scan (DB layer)", () => {
   });
 
   test("backstop ingest is OFF when readBackstop is absent (older caller)", async () => {
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     // quietDeps has no readBackstop → no backstop-degraded findings.
     const findings = await scan(dbPath, 3600, quietDeps(now));
@@ -1962,7 +1963,15 @@ describe("tick", () => {
 
   /** Seed a dispatch_failures row so the scan yields one warning finding. */
   function seedDispatchFailure(): void {
-    const writer = openDb(dbPath);
+    // fn-769 file variant: some callers invoke this as the FIRST opener
+    // (cold-start tick tests, no prior bootstrap), others AFTER a `freshDbFile`
+    // bootstrap + `tick`. Bootstrap the on-disk schema via the template only
+    // when the file is absent (`freshDbFile` overwrites unconditionally — a
+    // blind call would wipe an already-seeded DB); otherwise open the existing
+    // migrated DB writable with the ladder skipped.
+    const writer = existsSync(dbPath)
+      ? openDb(dbPath, { migrate: false })
+      : freshDbFile(dbPath);
     writer.db
       .query(
         `INSERT INTO dispatch_failures
@@ -2037,7 +2046,7 @@ describe("tick", () => {
       return { exitCode: 0, ackedFingerprints: null }; // no ack → commit all handed
     };
     // Tick 1: empty DB → baseline with no findings.
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     await tick(dbPath, 3600, tickDeps(now, spawn), seenPath());
     // Now a NEW finding appears.
     seedDispatchFailure();
@@ -2056,7 +2065,7 @@ describe("tick", () => {
 
   test("agent exit 0 + ack commits ONLY the acked fingerprints", async () => {
     const now = Math.floor(Date.now() / 1000);
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     let handedFingerprint = "";
     // Baseline empty, then a new finding; the spawn acks exactly that fp.
     const spawn: SpawnAgentFn = async (input) => {
@@ -2076,7 +2085,7 @@ describe("tick", () => {
 
   test("non-zero exit commits NOTHING delivered and counts a spawn failure", async () => {
     const now = Math.floor(Date.now() / 1000);
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const spawn: SpawnAgentFn = async () => ({
       exitCode: 1,
       ackedFingerprints: null,
@@ -2096,7 +2105,7 @@ describe("tick", () => {
 
   test("timeout (exitCode null) commits nothing delivered", async () => {
     const now = Math.floor(Date.now() / 1000);
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     const spawn: SpawnAgentFn = async (): Promise<SpawnResult> => ({
       exitCode: null, // hard-timeout kill path
       ackedFingerprints: null,
@@ -2113,7 +2122,7 @@ describe("tick", () => {
 
   test("retry cap: a permanently-failing fingerprint stops re-spawning", async () => {
     const now = Math.floor(Date.now() / 1000);
-    openDb(dbPath).db.close();
+    freshDbFile(dbPath).db.close();
     let spawnCalls = 0;
     const spawn: SpawnAgentFn = async () => {
       spawnCalls++;
@@ -2168,7 +2177,13 @@ describe("writeHeartbeat / tick liveness heartbeat", () => {
   }
 
   function seedDispatchFailure(): void {
-    const writer = openDb(dbPath);
+    // fn-769 file variant (see the sibling in the scan describe): callers
+    // invoke this both as the FIRST opener (cold-start tick tests) and AFTER a
+    // bootstrap. Template-bootstrap only when the file is absent; otherwise
+    // open the existing migrated DB writable with the ladder skipped.
+    const writer = existsSync(dbPath)
+      ? openDb(dbPath, { migrate: false })
+      : freshDbFile(dbPath);
     writer.db
       .query(
         `INSERT INTO dispatch_failures

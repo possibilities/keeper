@@ -26,7 +26,6 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb } from "../src/db";
 import {
   buildUsageMessage,
   idFromUsagePath,
@@ -36,6 +35,7 @@ import {
   type UsageMessage,
   UsageScanner,
 } from "../src/usage-worker";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
 let stateDir: string;
@@ -629,8 +629,9 @@ test("onDelete on an un-seeded path emits nothing (nothing to retract)", () => {
 // ---------------------------------------------------------------------------
 
 test("sweep retracts a projection id whose file was deleted while down", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`sweep` reuses the same
+  // `db`); no second opener or spawned worker touches the path.
+  const { db } = freshMemDb();
   // Seed a usage row for a profile whose file is no longer on disk.
   db.run(
     `INSERT INTO usage (id, target, multiplier, session_percent, session_resets_at,
@@ -667,8 +668,9 @@ test("sweep retracts a projection id whose file was deleted while down", () => {
 });
 
 test("sweep does NOT retract a profile present on disk (even if it failed to parse)", () => {
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`sweep` reuses the same
+  // `db`); no second opener or spawned worker touches the path.
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO usage (id, last_event_id, updated_at)
        VALUES (?, ?, ?)`,
@@ -716,8 +718,9 @@ test("seedFromDb suppresses a re-emit of an already-folded projection row (slot-
   // `seedFromDb`'s reconstruction. If the two diverge on key order or field
   // set, the change-gate compares JSON.stringify byte-for-byte and re-emits
   // every profile on every daemon boot.
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`sweep` reuses the same
+  // `db`); no second opener or spawned worker touches the path.
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO usage (id, target, multiplier, session_percent, session_resets_at,
                         week_percent, week_resets_at, last_event_id, updated_at)
@@ -756,8 +759,9 @@ test("seedFromDb reconstructs fn-645 fields and suppresses re-emit (subscription
   // `buildUsageMessage` output byte-for-byte. Also: `error_at` is in the
   // projection but NOT in the gate, so seeding from a row that carries a
   // different `error_at` than the on-disk file must still suppress.
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`sweep` reuses the same
+  // `db`); no second opener or spawned worker touches the path.
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO usage (id, target, multiplier, session_percent, session_resets_at,
                         week_percent, week_resets_at, status, subscription_active,
@@ -815,8 +819,9 @@ test("seedFromDb reconstructs fn-645 fields and suppresses re-emit (subscription
 test("seedFromDb handles subscription_active=0 (false) round-trip", () => {
   // Confirm the 0→false coercion at seed time matches buildUsageMessage's
   // false output (the no-subscription account case).
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`sweep` reuses the same
+  // `db`); no second opener or spawned worker touches the path.
+  const { db } = freshMemDb();
   db.run(
     `INSERT INTO usage (id, target, multiplier, status, subscription_active,
                         last_event_id, updated_at)
@@ -860,8 +865,9 @@ test("markSeen keys off filename, parse-independent", () => {
   // proving markSeen accepted the valid path silently and ignored the other.
   // (We can't directly inspect seenOnDisk; the sweep behavior is the
   // observable.)
-  const dbPath = join(tmpDir, "keeper.db");
-  const { db } = openDb(dbPath);
+  // fn-769 mem variant: single in-process connection (`sweep` reuses the same
+  // `db`); no second opener or spawned worker touches the path.
+  const { db } = freshMemDb();
   const emitted: UsageMessage[] = [];
   const scanner2 = new UsageScanner(
     (m) => emitted.push(m),

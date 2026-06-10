@@ -37,7 +37,6 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { compactColdBlobs } from "../src/compaction";
-import { openDb } from "../src/db";
 import {
   type BridgeEventInput,
   type CanonicalRow,
@@ -50,6 +49,7 @@ import {
   resolveBridgeAgentId,
   truncateDescription,
 } from "../src/subagent-invocations";
+import { freshMemDb } from "./helpers/template-db";
 
 // ---------------------------------------------------------------------------
 // Fixture loader
@@ -96,13 +96,14 @@ const FIXTURES = loadFixtures();
 // ---------------------------------------------------------------------------
 
 let tmpDir: string;
-let dbPath: string;
 let db: Database;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-subagent-test-"));
-  dbPath = join(tmpDir, "keeper.db");
-  db = openDb(dbPath).db;
+  // fn-769 mem variant: each test drives a single in-process connection and
+  // `compactColdBlobs` relocates into the same DB's `event_blobs` table (no
+  // external sidecar file), so an in-memory template clone is correct.
+  db = freshMemDb().db;
 });
 
 afterEach(() => {
@@ -1072,8 +1073,9 @@ describe("fn-764 cold-blob relocation: bridge reads COALESCE", () => {
     // (2) Fresh DB seeded with the SAME raw events, every blob relocated BEFORE
     // the fold replays — then re-fold from scratch and assert byte-equality.
     db.close();
-    const tmpDir2 = mkdtempSync(join(tmpdir(), "keeper-subagent-reloc-"));
-    const db2 = openDb(join(tmpDir2, "keeper.db")).db;
+    // fn-769 mem variant: the re-fold-from-scratch DB is single-connection and
+    // relocates blobs into its own `event_blobs` table — no file needed.
+    const db2 = freshMemDb().db;
     try {
       // Seed all raw events first (no fold), then relocate everything.
       for (const ev of stream) {
@@ -1249,7 +1251,6 @@ describe("fn-764 cold-blob relocation: bridge reads COALESCE", () => {
       }
     } finally {
       db2.close();
-      rmSync(tmpDir2, { recursive: true, force: true });
     }
   });
 });

@@ -126,14 +126,29 @@ export function freshMemDb(): KeeperDb {
  * body opens a second `openDb(path, { readonly: true })` against the same file).
  *
  * The serialized `:memory:` image is a valid non-WAL DB file by construction, so
- * we just write the Buffer to `path` and reopen with migration skipped — no
- * WAL-checkpoint dance, no `-wal` sidecar to strand. Returns the same
- * {@link KeeperDb} shape as `openDb`.
+ * we just write the Buffer to `path` and reopen with migration skipped. Returns
+ * the same {@link KeeperDb} shape as `openDb`.
+ *
+ * WAL ESTABLISHMENT (fn-769.2). `applyPragmas` (inside `openDb`) runs
+ * `journal_mode = WAL`, which flips the on-disk header to the WAL format
+ * (bytes 18/19 → 2) but does NOT materialize the WAL machinery until the
+ * connection actually commits a write transaction. The template image carries
+ * zero pending work, so without a forcing write a clean close leaves a
+ * WAL-HEADER file with no initialized WAL state — and a later
+ * `openDb(path, { readonly: true })` reader then fails with SQLITE_CANTOPEN
+ * trying to create the `-shm` it can't write. A real `openDb` (full migrate)
+ * never hits this because its migrate transaction does the establishing write.
+ * We replicate that here with one explicit `wal_checkpoint(TRUNCATE)`, which
+ * forces WAL to initialize on disk so the readonly-reader contract this helper
+ * exists to serve actually holds. The checkpoint truncates the WAL back to
+ * empty, so a clean close still strands no `-wal` sidecar.
  */
 export function freshDbFile(path: string): KeeperDb {
   // Write a fresh PRIVATE copy of the template image to disk. `Buffer.from`
   // defensively copies so a downstream truncation/append can never reach the
   // shared immutable template Buffer.
   writeFileSync(path, Buffer.from(template()));
-  return openDb(path, { migrate: false });
+  const kdb = openDb(path, { migrate: false });
+  kdb.db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  return kdb;
 }

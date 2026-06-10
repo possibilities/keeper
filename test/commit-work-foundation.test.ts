@@ -30,6 +30,7 @@ import { gitExec } from "../src/commit-work/git-exec";
 import { resolveSessionId } from "../src/commit-work/session-id";
 import { openDb } from "../src/db";
 import { initRepo } from "./helpers/git-repo";
+import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
 let dbPath: string;
@@ -37,6 +38,11 @@ let dbPath: string;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-commit-work-"));
   dbPath = join(tmpDir, "keeper.db");
+  // fn-769 file variant: seeds and the attribution reader open this SAME path
+  // across separate connections, so the migrated schema must live on disk.
+  // Pre-write the template image once (skipping the ladder); later opens pass
+  // `migrate: false` since the file is already at the current schema_version.
+  freshDbFile(dbPath).db.close();
 });
 
 afterEach(() => {
@@ -92,7 +98,7 @@ function seedAttribution(opts: {
   lastCommitAt?: number | null;
   source?: string;
 }): void {
-  const { db } = openDb(dbPath);
+  const { db } = openDb(dbPath, { migrate: false });
   db.run(
     "INSERT INTO file_attributions " +
       "(project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source) " +

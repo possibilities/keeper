@@ -25,17 +25,18 @@ import {
   computeColdWatermark,
   countAbsentBlobs,
 } from "../src/compaction";
-import { openDb } from "../src/db";
 import { drain } from "../src/reducer";
+import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
-let dbPath: string;
 let db: Database;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-compaction-test-"));
-  dbPath = join(tmpDir, "keeper.db");
-  db = openDb(dbPath).db;
+  // fn-769 mem variant: single in-process connection; `compactColdBlobs`
+  // relocates into this DB's own `event_blobs` table (no external sidecar
+  // file), so an in-memory template clone is correct.
+  db = freshMemDb().db;
 });
 
 afterEach(() => {
