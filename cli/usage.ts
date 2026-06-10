@@ -104,16 +104,35 @@ import { buildDebugSnapshot, copyToClipboard } from "../src/clipboard-debug";
 import { resolveConfig, resolveSockPath } from "../src/db";
 import { createLiveShell } from "../src/live-shell";
 import { subscribeCollection } from "../src/readiness-client";
+import {
+  createSnapshotLatch,
+  DEFAULT_SNAPSHOT_TIMEOUT_MS,
+  formatNoFrameOutput,
+  formatSnapshotOutput,
+  resolveSnapshotMode,
+  SNAPSHOT_SCHEMA_VERSION,
+  SnapshotCliMisuseError,
+  type SnapshotLatchOutcome,
+  type SnapshotMeta,
+  type SnapshotStatus,
+} from "../src/snapshot";
 import { armViewerExitTriggers } from "../src/view-shell";
 
 const COLLECTION = "usage";
 
 const HELP = `keeper usage — live usage frames over the keeper subscribe server
 
-Usage: keeper usage [--sock <path>]
+Usage: keeper usage [--sock <path>] [--snapshot | --watch] [--timeout <s>]
 
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
+  --snapshot     Force one-shot snapshot mode (print one composed frame + a
+                 machine-parseable keeper-meta: line, then exit) even on a TTY
+  --watch        Force the live subscribe stream even when piped
+  --timeout <s>  Snapshot wait before the timeout escape (default ~2s)
   --help         Show this help
+
+By default, stdout that is NOT a TTY (piped into an agent) auto-detects
+snapshot mode; a TTY gets the live TUI. \`CI\` / \`TERM=dumb\` force snapshot.
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
@@ -810,6 +829,11 @@ export async function main(argv: string[]): Promise<void> {
     args: argv,
     options: {
       sock: { type: "string" },
+      snapshot: { type: "boolean", default: false },
+      watch: { type: "boolean", default: false },
+      // parseArgs has no number type — capture as a string and validate
+      // manually below (exit 2 on a non-positive / non-numeric value).
+      timeout: { type: "string" },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -819,6 +843,41 @@ export async function main(argv: string[]): Promise<void> {
     process.stdout.write(HELP);
     process.exit(0);
   }
+
+  // Resolve the run mode (flag > CI/TERM=dumb > stdout.isTTY !== true).
+  // Both `--snapshot` and `--watch` → typed misuse error → exit 2. Shared
+  // with the other four views via `src/snapshot.ts` so the precedence
+  // (and the exit-2 contract) can never drift.
+  let mode: "snapshot" | "watch";
+  try {
+    mode = resolveSnapshotMode({
+      snapshotFlag: values.snapshot ?? false,
+      watchFlag: values.watch ?? false,
+      stdoutIsTTY: process.stdout.isTTY,
+      env: process.env,
+    });
+  } catch (err) {
+    if (err instanceof SnapshotCliMisuseError) {
+      process.stderr.write(`keeper usage: ${err.message}\n`);
+      process.exit(2);
+    }
+    throw err;
+  }
+
+  // Validate `--timeout` (seconds) only when snapshotting — a bad value is
+  // CLI misuse (exit 2). Watch mode ignores it.
+  let timeoutMs = DEFAULT_SNAPSHOT_TIMEOUT_MS;
+  if (values.timeout !== undefined) {
+    const secs = Number(values.timeout);
+    if (!Number.isFinite(secs) || secs <= 0) {
+      process.stderr.write(
+        `keeper usage: --timeout must be a positive number of seconds (got '${values.timeout}')\n`,
+      );
+      process.exit(2);
+    }
+    timeoutMs = Math.round(secs * 1000);
+  }
+  const isSnapshot = mode === "snapshot";
 
   const sockPath = values.sock ?? resolveSockPath();
   // Account display aliases (cosmetic) resolved once at startup from
@@ -830,8 +889,16 @@ export async function main(argv: string[]): Promise<void> {
   // Forward-reference slot for the `c`-key copy handler — wired further
   // down once sidecar paths and the last frame text are in scope.
   let onKey: ((key: string) => void) | undefined;
+  // Snapshot mode never paints a live frame: pass `enabled: false` so no
+  // OpenTUI renderer is constructed and the shell's `pushFrame` /
+  // `refreshLive` / `dispose` are inert no-ops. The snapshot path short-
+  // circuits before any `pushFrame` anyway (it captures rows + composes
+  // once at latch resolution), but a disabled shell is the belt-and-
+  // suspenders guarantee that nothing reaches stdout to corrupt the
+  // single-frame snapshot output — mirrors `createViewShell`'s snapshot
+  // gate in `src/view-shell.ts`.
   const liveShell = createLiveShell({
-    enabled: true,
+    enabled: !isSnapshot,
     title: "usage",
     onUnhandledKey: (key) => onKey?.(key),
   });
@@ -862,6 +929,20 @@ export async function main(argv: string[]): Promise<void> {
   // here is cheaper and clearer, AND it's the documented load-bearing
   // no-flicker guard for the live-tick path).
   let lastLiveLines: string[] = [];
+
+  // Snapshot-mode (fn-772) wiring. Forward-reference report slots wired by
+  // `runSnapshot` to the latch's `reportStream`; no-ops until then so a
+  // callback that races ahead of `runSnapshot` (shouldn't happen — we wire
+  // subscriptions then call it synchronously) is captured into the row caches
+  // and replayed via the once-flags below. Per-stream once-guards keep the
+  // latch's raw report count honest (one report per distinct stream). The
+  // `sawConnected` latch lets the no-frame trailer distinguish `timeout`
+  // (daemon serving, no frame in time) from `daemon-unreachable`.
+  let reportUsageStream: () => void = () => {};
+  let reportJobsStream: () => void = () => {};
+  let usageStreamReported = false;
+  let jobsStreamReported = false;
+  let sawConnected = false;
 
   const prevFrameTmp = `/tmp/keeper-usage.${process.pid}.prev.frame.txt`;
   const metaSidecar = `/tmp/keeper-usage.${process.pid}.meta.txt`;
@@ -1034,6 +1115,14 @@ export async function main(argv: string[]): Promise<void> {
    * without growing history.
    */
   function emitFrame(): void {
+    // Snapshot mode captures rows only — the composition + sidecar write +
+    // stdout print all happen ONCE at latch resolution (`finishSnapshot`),
+    // never per-emit. The row caches (`lastUsageRows` / `lastJobsRows`) are
+    // already updated by the stream callbacks before this fires, so there's
+    // nothing to do here; the per-stream latch report lives in the callbacks.
+    if (isSnapshot) {
+      return;
+    }
     const now = Date.now();
     const bodyLines = composeBody(now);
     const frameText = ["---", ...bodyLines].join("\n");
@@ -1056,6 +1145,15 @@ export async function main(argv: string[]): Promise<void> {
     if (rowsKey === lastUsageRowsKey) return;
     lastUsageRowsKey = rowsKey;
     lastUsageRows = rows;
+    // Snapshot mode: report the `usage` stream to the latch exactly once on
+    // its first delivery. The readiness client's first paint always passes
+    // the change-gate (initial key is `null`), so this fires on the first
+    // real frame; the once-guard keeps a later changed delivery from
+    // over-reporting. Inert in live mode (`reportUsageStream` is a no-op).
+    if (isSnapshot && !usageStreamReported) {
+      usageStreamReported = true;
+      reportUsageStream();
+    }
     emitFrame();
   }
 
@@ -1070,6 +1168,14 @@ export async function main(argv: string[]): Promise<void> {
     if (rowsKey === lastJobsRowsKey) return;
     lastJobsRowsKey = rowsKey;
     lastJobsRows = rows;
+    // Snapshot mode: report the `jobs` stream to the latch exactly once on
+    // its first delivery (mirrors `emitUsage`). Both streams reporting
+    // satisfies the `streamCount: 2` latch — the composed frame reflects the
+    // fully-folded usage + jobs blend, not fold-ordering luck.
+    if (isSnapshot && !jobsStreamReported) {
+      jobsStreamReported = true;
+      reportJobsStream();
+    }
     emitFrame();
   }
 
@@ -1097,13 +1203,22 @@ export async function main(argv: string[]): Promise<void> {
   // on the next snap-to-live (G/End/Esc). The identical-text guard above
   // makes the tick a true no-op when minute-rounding holds, so the live
   // view never flickers between ticks.
-  const tickHandle = setInterval(() => {
-    if (lastUsageRows.length === 0 && lastJobsRows.length === 0) return;
-    const bodyLines = composeBody(Date.now());
-    if (linesEqual(bodyLines, lastLiveLines)) return;
-    lastLiveLines = bodyLines;
-    liveShell.refreshLive(bodyLines);
-  }, 30_000);
+  // NEVER armed in snapshot mode: the one-shot path composes once and exits,
+  // so a live 30s `refreshLive` tick would (a) keep the process alive past
+  // the intended exit and (b) push overlay lines that could corrupt the
+  // single-frame stdout. The shell is `enabled: false` in snapshot mode
+  // anyway (refreshLive is inert), but skipping the interval entirely is the
+  // load-bearing tick-leak fix — `clearInterval` alone wouldn't help if the
+  // snapshot path never reached the teardown.
+  const tickHandle = isSnapshot
+    ? undefined
+    : setInterval(() => {
+        if (lastUsageRows.length === 0 && lastJobsRows.length === 0) return;
+        const bodyLines = composeBody(Date.now());
+        if (linesEqual(bodyLines, lastLiveLines)) return;
+        lastLiveLines = bodyLines;
+        liveShell.refreshLive(bodyLines);
+      }, 30_000);
 
   function emitLifecycle(
     event: string,
@@ -1126,6 +1241,11 @@ export async function main(argv: string[]): Promise<void> {
       lastFrame = null;
       lastUsageRowsKey = null;
       lastJobsRowsKey = null;
+    }
+    // Snapshot mode: latch whether we ever reached `connected` so the
+    // no-frame trailer reports `timeout` vs `daemon-unreachable` honestly.
+    if (event === "connected") {
+      sawConnected = true;
     }
   }
 
@@ -1161,6 +1281,20 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: emitLifecycle,
   });
 
+  // Snapshot mode (fn-772): one-shot. Wait (via the shared `streamCount: 2`
+  // latch) until BOTH the usage + jobs streams have folded their first frame,
+  // compose the body ONCE, write the sidecars once, print the frame + the
+  // shared `keeper-meta:` trailer, dispose the handles, and exit. The trailer
+  // is assembled from the shared `SnapshotMeta` type + `SNAPSHOT_SCHEMA_VERSION`
+  // and serialized via the shared `formatSnapshotOutput` / `formatNoFrameOutput`
+  // formatters, so usage's `keeper-meta:` line is byte-shape-identical to the
+  // four `createViewShell` siblings — only `script: "usage"` differs. Mirrors
+  // `runSnapshot`/`finish` in `src/view-shell.ts`.
+  if (isSnapshot) {
+    runSnapshot();
+    return;
+  }
+
   // Idempotency guard: SIGINT, SIGHUP, stdin-EOF and the ppid-poll can
   // all fire (and overlap) for one dying viewer. The tick-clear + dispose
   // calls are individually idempotent, but the log-then-exit tail must run
@@ -1174,7 +1308,9 @@ export async function main(argv: string[]): Promise<void> {
     // Stop the relative-time tick FIRST so it can't fire against a
     // disposed shell (refreshLive is no-op post-dispose, but skipping
     // the rendered-rows + lines-equal work is cleaner).
-    clearInterval(tickHandle);
+    if (tickHandle !== undefined) {
+      clearInterval(tickHandle);
+    }
     // Three-handle teardown: terminal restoration before subscription
     // teardown, then both subscribe handles disposed in declaration
     // order. Order is load-bearing — `liveShell.dispose()` first so the
@@ -1194,6 +1330,123 @@ export async function main(argv: string[]): Promise<void> {
   // every other viewer (fn-723): SIGHUP, stdin-EOF, and the ppid===1 poll.
   process.on("SIGINT", exitCleanly);
   armViewerExitTriggers(exitCleanly);
+
+  // ── snapshot driver ──────────────────────────────────────────────────
+  // Declared after the subscriptions so it can dispose both handles; only
+  // reached on the `isSnapshot` early-return above (live mode never calls it).
+  function runSnapshot(): void {
+    let settled = false;
+
+    function buildMeta(input: {
+      status: SnapshotStatus;
+      truncated: boolean;
+      frame: number | null;
+      state: string | null;
+      frameTxt: string | null;
+    }): SnapshotMeta {
+      return {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        script: "usage",
+        pid: process.pid,
+        status: input.status,
+        frame: input.frame,
+        frame_count: input.frame === null ? 0 : 1,
+        truncated: input.truncated,
+        state: input.state,
+        frame_txt: input.frameTxt,
+        lifecycle: lifecycleSidecar,
+        meta: metaSidecar,
+        ts: new Date().toISOString(),
+      };
+    }
+
+    function disposeAll(): void {
+      liveShell.dispose();
+      usageHandle.dispose();
+      jobsHandle.dispose();
+    }
+
+    function finish(outcome: SnapshotLatchOutcome): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      latch.cancel();
+
+      // A frame is available iff at least one stream reported — i.e. we have
+      // real row data to compose. `ready` (both streams) and a timeout-degrade
+      // (≥1 stream) both compose; only a 0-report timeout is the no-frame case.
+      const haveFrame = usageStreamReported || jobsStreamReported;
+      if (haveFrame) {
+        const truncated = outcome.kind === "timeout";
+        // Compose the body ONCE against the current clock — same renderer the
+        // live path uses, so the snapshot text matches a live frame captured
+        // at the same instant. `writeSidecars` reads `frameCount` for the
+        // filenames, so bump to 1 first.
+        const bodyLines = composeBody(Date.now());
+        const frameText = ["---", ...bodyLines].join("\n");
+        frameCount = 1;
+        const stateSidecar = `/tmp/keeper-usage.${process.pid}.state.${frameCount}.json`;
+        const frameSidecar = `/tmp/keeper-usage.${process.pid}.frame.${frameCount}.txt`;
+        writeSidecars(frameText);
+        lastFrame = frameText;
+        const meta = buildMeta({
+          status: "ok",
+          truncated,
+          frame: frameCount,
+          state: stateSidecar,
+          frameTxt: frameSidecar,
+        });
+        // The printed frame drops the sidecar's `---` lead (a sidecar/diff
+        // artifact, not part of the human/agent frame).
+        process.stdout.write(
+          formatSnapshotOutput({ frameText: bodyLines.join("\n"), meta }),
+        );
+        disposeAll();
+        process.exit(0);
+      }
+
+      // No frame before the deadline. `daemon-unreachable` iff we never saw a
+      // `connected` lifecycle; otherwise the daemon was serving but didn't
+      // deliver a frame in time → `timeout`.
+      const status: SnapshotStatus = sawConnected
+        ? "timeout"
+        : "daemon-unreachable";
+      const meta = buildMeta({
+        status,
+        truncated: true,
+        frame: null,
+        state: null,
+        frameTxt: null,
+      });
+      const diagnostic =
+        status === "daemon-unreachable"
+          ? `keeper usage: no frame before ${timeoutMs}ms timeout (daemon unreachable)`
+          : `keeper usage: no frame before ${timeoutMs}ms timeout (daemon connected but did not deliver a frame)`;
+      const { stdout, stderr } = formatNoFrameOutput({ meta, diagnostic });
+      process.stderr.write(stderr);
+      process.stdout.write(stdout);
+      disposeAll();
+      process.exit(1);
+    }
+
+    const latch = createSnapshotLatch({
+      streamCount: 2,
+      timeoutMs,
+      onResolve: finish,
+    });
+    // Wire the latch into the per-stream reports + replay any first-frame
+    // report that landed before the latch was armed (a stream `onRows` racing
+    // this synchronous open path).
+    reportUsageStream = () => latch.reportStream();
+    reportJobsStream = () => latch.reportStream();
+    if (usageStreamReported) {
+      latch.reportStream();
+    }
+    if (jobsStreamReported) {
+      latch.reportStream();
+    }
+  }
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the

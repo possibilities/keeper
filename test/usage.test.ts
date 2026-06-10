@@ -24,7 +24,14 @@
  */
 
 import { expect, test } from "bun:test";
+import { join } from "node:path";
 import { renderRowLines, renderSessionLines } from "../cli/usage";
+import {
+  formatMetaLine,
+  formatSnapshotOutput,
+  SNAPSHOT_SCHEMA_VERSION,
+  type SnapshotMeta,
+} from "../src/snapshot";
 
 // Fixed reference clock: 2025-01-15T12:00:00.000Z.
 const NOW_MS = Date.parse("2025-01-15T12:00:00.000Z");
@@ -1463,4 +1470,211 @@ test("label padding ignores 'error' when no row renders a stale error", () => {
   expect(bodyLine(lines, "week")).toContain(
     "week    [██░░░░░░░░░░░░░░░░░░░░░░░░░░░░] 5%",
   );
+});
+
+// ---------------------------------------------------------------------------
+// fn-772: snapshot mode (`keeper usage`). usage is the open-coded outlier —
+// it does NOT use `createViewShell`, so it threads snapshot mode inline while
+// reusing the shared `src/snapshot.ts` helpers (resolver, latch, trailer/
+// no-frame formatters) so its `keeper-meta:` line stays byte-shape-identical
+// to the four `createViewShell` siblings (only `script: "usage"` differs).
+//
+// Two test layers:
+//   1. Pure trailer-shape assertions (no subprocess) — the trailer-drift
+//      guard: a usage `SnapshotMeta` serializes to the SAME key set + value
+//      shapes as a git one. This is the contract the task flags as the entire
+//      reason to import the shared formatter.
+//   2. Real `keeper usage` subprocess (mirrors `test/git.test.ts`): a piped
+//      stdout auto-detects snapshot; `--sock` points at a dead path so the
+//      latch timeout bounds the run deterministically without a daemon —
+//      exercising mode resolution, flag validation, dispose-then-exit, and
+//      the `script: "usage"` trailer end to end.
+// ---------------------------------------------------------------------------
+
+const KEEPER_CLI = join(import.meta.dir, "..", "cli", "keeper.ts");
+const DEAD_SOCK = "/tmp/keeper-usage-snapshot-test-nonexistent.sock";
+
+interface UsageRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/**
+ * Spawn the real `keeper usage <args>` subprocess. stdout is piped (a Bun
+ * pipe → `process.stdout.isTTY === undefined`), so the auto-detect resolves
+ * snapshot mode without `--snapshot`. `CI` is cleared and `TERM` forced to a
+ * non-dumb value so the auto-detect exercises the isTTY arm, not the env arm.
+ */
+async function runUsage(args: string[]): Promise<UsageRun> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    CI: undefined,
+    TERM: "xterm",
+  };
+  const proc = Bun.spawn(["bun", KEEPER_CLI, "usage", ...args], {
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
+/** Parse the LAST non-empty stdout line as the keeper-meta: JSON record. */
+function parseUsageTrailer(stdout: string): Record<string, unknown> {
+  const lines = stdout.split("\n").filter((l) => l.length > 0);
+  const last = lines.at(-1);
+  if (last === undefined) throw new Error(`no stdout lines: ${stdout}`);
+  expect(last.startsWith("keeper-meta: ")).toBe(true);
+  const json = last.slice("keeper-meta: ".length);
+  expect(json).not.toContain("\n");
+  return JSON.parse(json) as Record<string, unknown>;
+}
+
+/** Build a `SnapshotMeta` for `script` with the no-frame shape. */
+function noFrameMeta(script: string): SnapshotMeta {
+  return {
+    schema_version: SNAPSHOT_SCHEMA_VERSION,
+    script,
+    pid: 4242,
+    status: "timeout",
+    frame: null,
+    frame_count: 0,
+    truncated: true,
+    state: null,
+    frame_txt: null,
+    lifecycle: `/tmp/keeper-${script}.4242.lifecycle.txt`,
+    meta: `/tmp/keeper-${script}.4242.meta.txt`,
+    ts: "2025-01-15T12:00:00.000Z",
+  };
+}
+
+test("usage trailer: byte-shape-identical to a git trailer (no drift)", () => {
+  // The trailer-drift guard. usage's trailer must carry the SAME field set
+  // and value shapes as a sibling's — only `script` differs. Serialize both
+  // via the shared `formatMetaLine` and diff the parsed records by key set +
+  // per-key typeof, so a usage-specific hand-rolled field would fail loudly.
+  const usageLine = formatMetaLine(noFrameMeta("usage"));
+  const gitLine = formatMetaLine(noFrameMeta("git"));
+  expect(usageLine.startsWith("keeper-meta: ")).toBe(true);
+  const usageJson = JSON.parse(usageLine.slice("keeper-meta: ".length));
+  const gitJson = JSON.parse(gitLine.slice("keeper-meta: ".length));
+  // Same key set, same iteration order (JSON.stringify is insertion-ordered;
+  // both come from the same struct literal shape).
+  expect(Object.keys(usageJson)).toEqual(Object.keys(gitJson));
+  for (const k of Object.keys(usageJson)) {
+    expect(typeof usageJson[k]).toBe(typeof gitJson[k]);
+  }
+  // Only the script-derived fields differ in VALUE — `script` itself and the
+  // sidecar paths that embed it (`lifecycle` / `meta`). Normalize those three
+  // and the records are otherwise identical, proving no extra/missing field.
+  const norm = (r: Record<string, unknown>): Record<string, unknown> => ({
+    ...r,
+    script: "X",
+    lifecycle: "X",
+    meta: "X",
+  });
+  expect(usageJson.script).toBe("usage");
+  expect(gitJson.script).toBe("git");
+  expect(norm(usageJson)).toEqual(norm(gitJson));
+});
+
+test("usage snapshot output: composed frame text, then the keeper-meta: line LAST", () => {
+  // The full stdout block for a successful usage snapshot is the composed
+  // body, a blank separator, the labeled metadata lines, then the single-line
+  // `keeper-meta:` record LAST. The composed body blends usage + jobs — assert
+  // both halves survive into the printed frame and the trailer trails them.
+  const meta: SnapshotMeta = {
+    ...noFrameMeta("usage"),
+    status: "ok",
+    frame: 1,
+    frame_count: 1,
+    truncated: false,
+    state: "/tmp/keeper-usage.4242.state.1.json",
+    frame_txt: "/tmp/keeper-usage.4242.frame.1.txt",
+  };
+  const body = [
+    "(primary) [claude 2x]",
+    "  session [bar] 42% 5m",
+    "",
+    "recent sessions",
+    "  abc work",
+  ].join("\n");
+  const out = formatSnapshotOutput({ frameText: body, meta });
+  const outLines = out.split("\n");
+  // Frame text is at the top.
+  expect(out).toContain("recent sessions");
+  // The keeper-meta: line is the LAST non-empty line and parses.
+  const last = outLines.filter((l) => l.length > 0).at(-1) as string;
+  expect(last.startsWith("keeper-meta: ")).toBe(true);
+  const parsed = JSON.parse(last.slice("keeper-meta: ".length));
+  expect(parsed.script).toBe("usage");
+  expect(parsed.frame).toBe(1);
+  expect(parsed.truncated).toBe(false);
+});
+
+test("usage --snapshot + --watch → stderr error, exit 2, no trailer", async () => {
+  const res = await runUsage(["--snapshot", "--watch"]);
+  expect(res.code).toBe(2);
+  expect(res.stderr).toContain("--snapshot and --watch are mutually exclusive");
+  expect(res.stdout).not.toContain("keeper-meta:");
+});
+
+test("usage --snapshot: bad --timeout → exit 2", async () => {
+  const bad = await runUsage(["--snapshot", "--timeout", "notanumber"]);
+  expect(bad.code).toBe(2);
+  expect(bad.stderr).toContain("--timeout must be a positive number");
+  const zero = await runUsage(["--snapshot", "--timeout", "0"]);
+  expect(zero.code).toBe(2);
+  const neg = await runUsage(["--snapshot", "--timeout=-3"]);
+  expect(neg.code).toBe(2);
+});
+
+test("usage: piped non-TTY auto-detects snapshot; dead sock → exit 1, daemon-unreachable, frame:null, script:usage", async () => {
+  // No --snapshot flag — the piped stdout (isTTY===undefined) auto-detects
+  // snapshot mode. The dead sock never connects, so after --timeout the run
+  // exits 1 with status daemon-unreachable. The keeper-meta: line is still
+  // the LAST stdout line with frame:null and script:"usage". A clean exit
+  // here also proves the 30s tick was never armed (an un-cleared interval
+  // would pin the process alive past the intended exit).
+  const res = await runUsage(["--sock", DEAD_SOCK, "--timeout", "1"]);
+  expect(res.code).toBe(1);
+  expect(res.stderr).toContain("no frame");
+  const trailer = parseUsageTrailer(res.stdout);
+  expect(trailer.schema_version).toBe(1);
+  expect(trailer.script).toBe("usage");
+  expect(trailer.status).toBe("daemon-unreachable");
+  expect(trailer.frame).toBeNull();
+  expect(trailer.frame_count).toBe(0);
+  expect(trailer.truncated).toBe(true);
+  expect(typeof trailer.lifecycle).toBe("string");
+  expect(typeof trailer.meta).toBe("string");
+});
+
+test("usage --snapshot: forces snapshot on the dead-sock path even from a pipe", async () => {
+  const res = await runUsage([
+    "--snapshot",
+    "--sock",
+    DEAD_SOCK,
+    "--timeout",
+    "1",
+  ]);
+  expect(res.code).toBe(1);
+  const trailer = parseUsageTrailer(res.stdout);
+  expect(trailer.script).toBe("usage");
+  expect(trailer.status).toBe("daemon-unreachable");
+  expect(trailer.frame).toBeNull();
+});
+
+test("usage --help: documents --snapshot / --watch / --timeout", async () => {
+  const res = await runUsage(["--help"]);
+  expect(res.code).toBe(0);
+  expect(res.stdout).toContain("--snapshot");
+  expect(res.stdout).toContain("--watch");
+  expect(res.stdout).toContain("--timeout");
 });
