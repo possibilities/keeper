@@ -42,5 +42,5 @@ present-tense rule only.
 - [ ] `uv run pytest tests/` passes
 
 ## Done summary
-
+Teach resolve_epic_globally/find_projects_with_epic to match bare fn-N epic ids by integer equality (never prefix), exposing the matched full slug as ResolveResult.resolved_id. add-dep/add-deps/scaffold normalize the persisted depends_on_epics edge to the full slug; cross-project same-number collisions route to the existing ambiguous channel.
 ## Evidence
