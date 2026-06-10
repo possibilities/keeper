@@ -27,5 +27,5 @@ Per recipe; test:full mandatory.
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Comment-only scrub of src/types.ts, src/readiness.ts, src/readiness-client.ts: deleted 1625 bloat comment lines (-103889 chars) — fn-NNN/schema-vNN provenance, incident narration, per-field essays. Kept floor item 11 (paired-NULL invariant, types.ts) and floor item 6 (readiness predicate rank-order, readiness.ts); all 5 biome-ignore directives untouched. Verifier token+transpile equality proven post-format; typecheck + targeted tests + test:full green (one SIGTRAP native-worker flake in untouched daemon.test.ts, passed clean on isolated re-run).
 ## Evidence
