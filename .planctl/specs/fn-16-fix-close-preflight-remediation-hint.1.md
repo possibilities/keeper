@@ -21,5 +21,5 @@ literal `{epic_id}` brace token.
 - [ ] A test pins that the `BRIEF_MISSING` message carries no literal `{epic_id}` token.
 
 ## Done summary
-
+Prefixed the BRIEF_MISSING remediation hint's second segment with f so it renders the real epic id instead of the literal {epic_id} token; pinned the rendered message in test_missing_brief_rejects.
 ## Evidence
