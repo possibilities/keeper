@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T20:53:20.268523Z",
+  "depends_on": [],
+  "epic": "fn-778-subscribed-ghost-eviction-and-dup-close",
+  "id": "fn-778-subscribed-ghost-eviction-and-dup-close.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "max",
+  "title": "Root-cause same-second dup close",
+  "updated_at": "2026-06-10T20:53:20.268523Z"
+}
