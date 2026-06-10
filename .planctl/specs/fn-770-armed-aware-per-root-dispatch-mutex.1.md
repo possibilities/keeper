@@ -99,5 +99,5 @@ Run `bun run test:full` before landing (mandatory — reconciler/readiness path)
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Made the per-root dispatch mutex armed-aware: threaded an optional eligibleEpicIds Set through computeReadiness into applySingleTaskPerRootMutex (absent=legacy single-pass, provided=eligible-priority two-pass) so an armed epic wins a shared root over an earlier-sorted unarmed sibling, fixing the armed-mode deadlock. Reconciler computes the eligible closure once per cycle (no BFS in yolo) and reuses it at both readiness and the retained work-gate. Added FAST cases (a)-(h) + 2 SLOW reconcile scenarios; reworded CLAUDE.md + README.
 ## Evidence
