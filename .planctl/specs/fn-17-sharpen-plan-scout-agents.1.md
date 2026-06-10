@@ -97,5 +97,5 @@ drifts.
 - [ ] gap-analyst.md untouched; all prose present-tense forward rules
 
 ## Done summary
-
+Sharpened all four plan-phase scout surfaces: epic-scout raw_decode parse recipe + write-targets-only Overlaps; docs-gap-scout no-source-descent rule + batched grep; practice-scout template search budget ladder, knowctl-first routing, local-grep ban; plan SKILL.md optional known-context slot in epic-scout and gap-analyst briefs.
 ## Evidence
