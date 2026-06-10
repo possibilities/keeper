@@ -31,5 +31,5 @@ From ~/code/arthack: `promptctl validate-bundles` exits 0; `promptctl render bun
 - [ ] Snippet body contains the protected-comment allowlist and zero ticket/epic ids
 
 ## Done summary
-
+Authored the code-comment-style engineering snippet (guard severity, related future-facing-docs + claude-md-scope) via save-snippet and registered it in the engineering-rules bundle. validate-bundles exits 0, the snippet renders in the bundle, and 330 promptctl tests pass.
 ## Evidence
