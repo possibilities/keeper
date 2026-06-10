@@ -65,5 +65,5 @@ stay green untouched.
 - [ ] full bun test green; README backup prose updated
 
 ## Done summary
-
+Moved the 24h verified backup, 15-min integrity probe, and fn-753 boot catch-up onto a dedicated maintenance-worker thread so the synchronous bun:sqlite VACUUM INTO / quick_check no longer stall main's fold loop; worker relays outcomes to main which keeps logging+paging. Also guarded the shutdown postMessage loop and gated countAbsentBlobs on relocated>0.
 ## Evidence
