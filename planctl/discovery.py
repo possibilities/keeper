@@ -246,7 +246,7 @@ def find_projects_with_epic(
     whose ``.planctl/`` holds the epic. Accepts a number-only ``fn-N`` id
     (integer-equality match) as well as a full slug.
     """
-    return [project for project, _full_id in _find_epic_matches(epic_id, roots)]
+    return [project for project, _ in _find_epic_matches(epic_id, roots)]
 
 
 def discover_projects(roots: list[Path] | None = None) -> list[Path]:

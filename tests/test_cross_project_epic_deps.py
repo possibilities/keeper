@@ -308,6 +308,7 @@ def test_add_deps_number_only_cross_project_collision_ambiguous(
     # does NOT carry — seed A and B up to a shared number >= 2.
     epic_c = _seed_epic_in(proj_c, monkeypatch, title="C target")
     num_c, _ = parse_id(epic_c)
+    assert num_c is not None
     collide_num = num_c + 1
 
     # Seed A and B until each carries an epic with `collide_num`, so a bare

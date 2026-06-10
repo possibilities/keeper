@@ -306,6 +306,7 @@ def test_add_deps_number_only_prefix_trap_fn1_not_fn10(project):
     while not ({1, 10} <= created.keys()):
         full = _create_epic(f"Filler {len(created)}")
         n, _ = parse_id(full)
+        assert n is not None
         created[n] = full
 
     epic_id = _create_epic("Target epic")
