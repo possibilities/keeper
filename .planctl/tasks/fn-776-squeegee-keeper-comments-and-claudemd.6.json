@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T19:56:30.555598Z",
+  "depends_on": [
+    "fn-776-squeegee-keeper-comments-and-claudemd.1"
+  ],
+  "epic": "fn-776-squeegee-keeper-comments-and-claudemd",
+  "id": "fn-776-squeegee-keeper-comments-and-claudemd.6",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Scrub autopilot and support modules",
+  "updated_at": "2026-06-10T19:56:30.555598Z"
+}
