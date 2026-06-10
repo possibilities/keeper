@@ -71,5 +71,5 @@ sections read as a complete present-tense contract.
 - [ ] Fixture format-true; verb files untouched; `uv run pytest tests/` passes
 
 ## Done summary
-
+Tightened close-phase audit surfaces: quality-auditor now has an explicit diff-only policy (no suite/typecheck/lint execution) at both the Audit rules and Test Coverage/Budget sites plus a routing predicate sending no-fix observations to What's Good; close-planner emission mandates indent=2 verdict shape; verdict_schema docstring is present-tense; fixture is format-true to the new routing.
 ## Evidence
