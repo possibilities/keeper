@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T02:45:06.892174Z",
+  "depends_on": [
+    "fn-769-fast-default-test-tier.1"
+  ],
+  "epic": "fn-769-fast-default-test-tier",
+  "id": "fn-769-fast-default-test-tier.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Shard reducer tests into four files",
+  "updated_at": "2026-06-10T02:45:06.892174Z"
+}

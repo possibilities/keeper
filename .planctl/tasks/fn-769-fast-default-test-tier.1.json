@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T02:45:06.892174Z",
+  "depends_on": [],
+  "epic": "fn-769-fast-default-test-tier",
+  "id": "fn-769-fast-default-test-tier.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Template DB helper plus reducer adoption",
+  "updated_at": "2026-06-10T02:45:06.892174Z"
+}
