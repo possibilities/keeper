@@ -17,8 +17,6 @@ marker (the ``_mock_autocommit`` template — autouse + early-return on a marker
 
 * ``_planctl_actor`` — session-autouse ``PLANCTL_ACTOR`` env, killing the
   ``git config user.email`` spawn in ``get_actor``.
-* ``_mock_brief_render`` — fakes the ``promptctl render-spec`` spawn in
-  ``planctl.brief`` (opt out: ``real_promptctl``).
 * ``_mock_dirty_probe`` — replaces the ``git status`` dirty-probe in
   ``build_planctl_invocation`` with a ``.planctl/`` disk walk (opt out:
   ``real_git``).
@@ -31,7 +29,7 @@ marker (the ``_mock_autocommit`` template — autouse + early-return on a marker
   real git.
 
 The slow bucket (markers ``real_git`` / ``integration`` / ``wire`` /
-``real_promptctl`` / ``real_sketch``) is skip-by-default and re-enabled with
+``real_sketch``) is skip-by-default and re-enabled with
 ``--run-slow`` via the ``pytest_collection_modifyitems`` hook (skip, never
 deselect). The stubs' fidelity against the real binaries is pinned by
 ``wire``-marked contract tests in ``tests/test_stub_contracts.py``.
@@ -64,12 +62,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers",
         "wire: pins a stub's fake output against the real binary (the live "
-        "git/promptctl wire). Slow bucket: skipped unless --run-slow.",
-    )
-    config.addinivalue_line(
-        "markers",
-        "real_promptctl: spawn the real ``promptctl render-spec`` instead of "
-        "the autouse brief-render stub. Slow bucket: skipped unless --run-slow.",
+        "git wire). Slow bucket: skipped unless --run-slow.",
     )
     config.addinivalue_line(
         "markers",
@@ -87,14 +80,13 @@ def pytest_configure(config):
 
 #: Markers that put a test in the skip-by-default slow bucket. Any test
 #: carrying one of these is skipped unless ``--run-slow`` is passed. They name
-#: the spawn-bearing fast-path seams (real git, real promptctl, the live wire)
+#: the spawn-bearing fast-path seams (real git, real sketch, the live wire)
 #: that the fast gate stubs out — so a slow-bucket test is exactly a test that
 #: needs a real subprocess the fast suite refuses to spawn.
 _SLOW_BUCKET_MARKERS = (
     "real_git",
     "integration",
     "wire",
-    "real_promptctl",
     "real_sketch",
 )
 
@@ -181,51 +173,6 @@ def monkeypatch_session():
     be requested by a session fixture. Undone at session teardown."""
     with pytest.MonkeyPatch.context() as mp:
         yield mp
-
-
-#: Real-shaped placeholder the brief-render stub returns for the no-substrate
-#: case (every seeded fixture task carries no snippets, so the real
-#: ``promptctl render-spec`` returns empty stdout). The ``wire`` contract test
-#: pins this default against the real binary's empty-render shape.
-_FAKE_RENDER_EMPTY = ""
-
-
-@pytest.fixture(autouse=True)
-def _mock_brief_render(request, monkeypatch):
-    """No-op the ``promptctl render-spec`` spawn in ``planctl.brief`` (brief.py).
-
-    ``planctl.brief._render_snippet_context`` shells ``promptctl render-spec
-    <task_id> --format human`` (1.5-7s each) during ``claim`` / ``worker
-    resume`` brief assembly. Every fixture-seeded task carries no snippets, so
-    the real render returns empty stdout — the stub returns that same empty
-    shape, keeping ``snippet_context == ""`` envelope/brief assertions green.
-
-    The stub patches ``planctl.brief.subprocess.run`` (the exact seam
-    ``test_claim`` already monkeypatches for ``SNIPPET_RENDER_FAILED``) so a
-    test that re-patches it inside its body wins — the test's own
-    ``monkeypatch.setattr`` is applied after this autouse fixture. The fake
-    mirrors the real return contract: a ``CompletedProcess``-like object with
-    ``returncode`` / ``stdout`` / ``stderr`` so the verb's exit-code branch and
-    ``BriefRenderError`` failure path stay exercisable.
-
-    Opt out with ``@pytest.mark.real_promptctl`` (slow bucket) to spawn the
-    real binary — for the wire contract tests that pin this stub's fidelity.
-    """
-    if request.node.get_closest_marker("real_promptctl"):
-        return
-
-    import planctl.brief as _brief
-
-    real_run = _brief.subprocess.run
-
-    def _fake_run(cmd, *args, **kwargs):
-        if list(cmd[:2]) == ["promptctl", "render-spec"]:
-            return subprocess.CompletedProcess(
-                cmd, returncode=0, stdout=_FAKE_RENDER_EMPTY, stderr=""
-            )
-        return real_run(cmd, *args, **kwargs)
-
-    monkeypatch.setattr(_brief.subprocess, "run", _fake_run)
 
 
 def _disk_walk_planctl_paths(repo_root) -> set[str]:

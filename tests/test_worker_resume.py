@@ -50,13 +50,6 @@ def _make_task(project: Path) -> str:
     return task_ids[0]
 
 
-def _stub_render(monkeypatch):
-    """Stub the promptctl render-spec shell-out so brief assembly stays hermetic."""
-    import planctl.brief as b
-
-    monkeypatch.setattr(b, "_render_snippet_context", lambda task_id, primary_repo: "")
-
-
 def _brief_path(project: Path, task_id: str) -> Path:
     return project / ".planctl" / "state" / "briefs" / f"{task_id}.json"
 
@@ -65,7 +58,6 @@ def test_worker_resume_typed_envelope(project: Path, monkeypatch):
     """Resume returns the typed envelope with brief_ref + nudge + repos."""
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "M app/foo.py")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
@@ -108,7 +100,6 @@ def test_worker_resume_regenerates_brief_fresh(project: Path, monkeypatch):
     """Each resume rewrites the on-disk brief (bake-fresh-on-each-entrypoint)."""
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
@@ -138,7 +129,6 @@ def test_worker_resume_no_commit_lands(project: Path, monkeypatch):
 
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
@@ -167,7 +157,6 @@ def test_worker_resume_source_commit_sha_in_nudge(project: Path, monkeypatch):
     """A discovered source commit sha rides the envelope + nudge."""
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: "abc1234")
 
@@ -215,7 +204,6 @@ def test_worker_resume_done_task_does_not_flip(project: Path, monkeypatch):
     """
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
@@ -240,7 +228,6 @@ def test_worker_resume_in_progress_is_noop(project: Path, monkeypatch):
     """Already-in_progress tasks are not mutated by resume."""
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
@@ -265,7 +252,6 @@ def test_worker_resume_tier_set_rides_envelope(project: Path, monkeypatch):
     """A persisted non-null tier surfaces as a stderr note AND in the envelope."""
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
@@ -304,7 +290,6 @@ def test_worker_resume_tier_null_emits_raw_note(project: Path, monkeypatch):
     """
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
@@ -331,7 +316,6 @@ def test_worker_resume_blocked_warns_leaves_alone(project: Path, monkeypatch):
     """`blocked` gets a warn but state is not flipped."""
     import planctl.run_worker_resume as m
 
-    _stub_render(monkeypatch)
     monkeypatch.setattr(m, "_read_git_state", lambda: "")
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 

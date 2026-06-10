@@ -1,19 +1,17 @@
 """Tests for the `planctl close-preflight <epic_id>` verb (fn-12 rewrite).
 
 The verb is the close-phase brief handoff (the symmetric bookend to `claim`'s
-worker brief): it assembles the audit brief — snippet context, source commit
-groups, the ordinal-ordered task list with status + done summaries, and the
-canonical `commit_set_hash` — and persists it commit-free under gitignored
+worker brief): it assembles the audit brief — source commit groups, the
+ordinal-ordered task list with status + done summaries, and the canonical
+`commit_set_hash` — and persists it commit-free under gitignored
 `<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`, then emits a
 content-blind envelope `{primary_repo, tasks, all_done, brief_ref,
-commit_set_hash}`. The prose (`snippet_context`, `commit_groups`) lives ONLY in
-the brief file — never in the envelope.
+commit_set_hash}`. The `commit_groups` prose lives ONLY in the brief file —
+never in the envelope. `snippet_context` is a dormant slot, always `""`.
 
 `commit_groups` (inside the brief) is assembled in-process by a native
 `git log --grep` + `interpret-trailers --parse` trailer scan
-(`planctl.commit_lookup`); `snippet_context` shells `promptctl render-spec`. The
-render shell-out is monkeypatched via the module-level `subprocess.run` so the
-tests stay hermetic; the commit scan runs against real git commits (the
+(`planctl.commit_lookup`). The commit scan runs against real git commits (the
 `project` fixture git-inits the project root) under the autouse hermetic git
 config.
 
@@ -23,8 +21,6 @@ Coverage (per the task's Test notes):
 - envelope has brief_ref + commit_set_hash and NO prose fields
 - all_done false → typed TASKS_NOT_DONE with details.not_done
 - task-id input → BAD_EPIC_ID naming the parent epic
-- render failure leaves no brief on disk
-- empty / passthrough render reflected in the brief
 - native scan groups real Task:-trailer commits by repo (first-seen order)
 - all-repos-broken → fail-loud typed COMMIT_LOOKUP_FAILED (details.broken_repos)
 - bad / missing epic id → typed error
@@ -87,34 +83,12 @@ def _make_epic(project, *, statuses):
     for tid, status in zip(task_ids, statuses, strict=True):
         if status == "done":
             # `done --force` skips the in_progress precondition, so flip
-            # todo→done in one call (avoids `claim`, which shells a real
-            # promptctl render-spec that can't resolve a throwaway project).
+            # todo→done in one call (avoids the full claim flow).
             r = runner.invoke(
                 cli, ["done", tid, "--summary", f"summary for {tid}", "--force"]
             )
             assert r.exit_code == 0, r.output
     return epic_id, task_ids
-
-
-def _fake_render(*, render_stdout="", render_rc=0):
-    """Build a fake `subprocess.run` that stubs only `promptctl render-spec`.
-
-    The native commit-trailer scan in `planctl.commit_lookup` uses its own
-    `subprocess` binding (not patched here), so it runs against real git; this
-    fake only intercepts the read-only render shell-out so close-preflight's
-    snippet fetch stays hermetic. Any other command passes through to real
-    `subprocess.run`.
-    """
-    real_run = subprocess.run
-
-    def _run(cmd, *args, **kwargs):
-        if cmd[:2] == ["promptctl", "render-spec"]:
-            return subprocess.CompletedProcess(
-                cmd, render_rc, stdout=render_stdout, stderr="rerr"
-            )
-        return real_run(cmd, *args, **kwargs)
-
-    return _run
 
 
 def _seed_commit(repo, task_id: str, *, body: str | None = None) -> str:
@@ -183,7 +157,6 @@ def _load_brief(project, epic_id) -> dict:
 class TestSuccessEnvelope:
     def test_envelope_is_content_blind(self, project, monkeypatch):
         epic_id, task_ids = _make_epic(project, statuses=["done", "done"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
@@ -201,7 +174,6 @@ class TestSuccessEnvelope:
 
     def test_envelope_hash_matches_brief(self, project, monkeypatch):
         epic_id, _ = _make_epic(project, statuses=["done"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
@@ -218,20 +190,16 @@ class TestSuccessEnvelope:
 
 
 class TestBriefShape:
-    def test_brief_has_full_shape(self, project, monkeypatch):
+    def test_brief_has_full_shape(self, project):
         epic_id, task_ids = _make_epic(project, statuses=["done", "done"])
-        monkeypatch.setattr(
-            run_close_preflight.subprocess,
-            "run",
-            _fake_render(render_stdout="## ctx\nhello"),
-        )
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         brief = _load_brief(project, epic_id)
         assert brief["schema_version"] == 1
         assert brief["epic_id"] == epic_id
         assert brief["primary_repo"] == str(project.resolve())
-        assert brief["snippet_context"] == "## ctx\nhello"
+        # snippet_context is a dormant slot — always present as "".
+        assert brief["snippet_context"] == ""
         assert brief["commit_groups"] == []  # no seeded commits
         # Ordinal-ordered task list with status + done summaries.
         assert [t["id"] for t in brief["tasks"]] == task_ids
@@ -239,20 +207,10 @@ class TestBriefShape:
         assert brief["tasks"][0]["done_summary"] == f"summary for {task_ids[0]}"
         assert brief["tasks"][1]["done_summary"] == f"summary for {task_ids[1]}"
 
-    def test_empty_render_reflected_in_brief(self, project, monkeypatch):
-        epic_id, _ = _make_epic(project, statuses=["done"])
-        monkeypatch.setattr(
-            run_close_preflight.subprocess, "run", _fake_render(render_stdout="")
-        )
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
-        assert r.exit_code == 0, r.output
-        assert _load_brief(project, epic_id)["snippet_context"] == ""
-
     @pytest.mark.real_git
     def test_brief_no_commit_lands(self, project, monkeypatch):
         """The brief write is commit-free: HEAD unmoved, nothing tracked."""
         epic_id, _ = _make_epic(project, statuses=["done"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
 
         def _head():
             return subprocess.run(
@@ -285,7 +243,6 @@ class TestBriefShape:
 class TestTasksNotDone:
     def test_not_all_done_is_typed_error(self, project, monkeypatch):
         epic_id, task_ids = _make_epic(project, statuses=["done", "todo"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
@@ -296,7 +253,6 @@ class TestTasksNotDone:
     def test_not_done_writes_no_brief(self, project, monkeypatch):
         """A not-ready epic must NOT leave a stale brief on disk."""
         epic_id, _ = _make_epic(project, statuses=["todo"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 1, r.output
         assert not brief_path(project, epic_id).exists()
@@ -310,7 +266,6 @@ class TestTasksNotDone:
 class TestCommitGroups:
     def test_empty_commit_set(self, project, monkeypatch):
         epic_id, _ = _make_epic(project, statuses=["done"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         assert _load_brief(project, epic_id)["commit_groups"] == []
@@ -327,7 +282,6 @@ class TestCommitGroups:
         epic_id, task_ids = _make_epic(project, statuses=["done", "done"])
         sha0 = _seed_commit(project, task_ids[0])
         sha1 = _seed_commit(project, task_ids[1])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
@@ -346,7 +300,6 @@ class TestCommitGroups:
             task_ids[0],
             body=f"chore: note\n\nfixes the Task: {task_ids[0]} issue in prose\n",
         )
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         assert _load_brief(project, epic_id)["commit_groups"] == []
@@ -375,7 +328,6 @@ class TestCommitGroups:
             return data
 
         monkeypatch.setattr(_api, "load_epic", _fake_load_epic)
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
@@ -386,28 +338,6 @@ class TestCommitGroups:
         assert env["error"]["details"]["broken_repos"] == [
             str(_Path(str(broken)).resolve())
         ]
-
-
-# ---------------------------------------------------------------------------
-# snippet render-failure leaves no brief
-# ---------------------------------------------------------------------------
-
-
-class TestSnippetContext:
-    def test_render_failure_is_fail_loud_and_leaves_no_brief(
-        self, project, monkeypatch
-    ):
-        epic_id, _ = _make_epic(project, statuses=["done"])
-        monkeypatch.setattr(
-            run_close_preflight.subprocess, "run", _fake_render(render_rc=2)
-        )
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
-        assert r.exit_code == 1, r.output
-        env = _envelope(r.output)
-        assert env["success"] is False
-        assert env["error"]["code"] == "SNIPPET_RENDER_FAILED"
-        # Render runs BEFORE the assemble-then-write, so nothing is on disk.
-        assert not brief_path(project, epic_id).exists()
 
 
 # ---------------------------------------------------------------------------
@@ -439,10 +369,9 @@ class TestGates:
         assert env["error"]["code"] == "EPIC_NOT_FOUND"
 
 
-def test_run_directly_no_click_context(project, monkeypatch):
+def test_run_directly_no_click_context(project):
     """run() tolerates being called without a live click context (sentinel no-op)."""
     epic_id, _ = _make_epic(project, statuses=["done"])
-    monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
     # Direct call — the error path's sentinel set is a no-op without a context.
     rc = run_close_preflight.run(SimpleNamespace(epic_id=epic_id))
     assert rc == 0
@@ -459,7 +388,6 @@ class TestProjectFlag:
         import os
 
         epic_id, _ = _make_epic(project, statuses=["done"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
 
         # chdir away from the planctl project so resolve_project() would fail.
         outside = tmp_path / "outside-the-project"
@@ -486,7 +414,6 @@ class TestProjectFlag:
     def test_project_unset_falls_back_to_cwd_walk(self, project, monkeypatch):
         """Without `--project`, behavior is unchanged (cwd-walk via resolve_project)."""
         epic_id, _ = _make_epic(project, statuses=["done"])
-        monkeypatch.setattr(run_close_preflight.subprocess, "run", _fake_render())
         r = CliRunner().invoke(cli, ["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)

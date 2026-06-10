@@ -3,17 +3,14 @@
 Locks the enriched claim verb: typed error envelopes for every precondition,
 the brief-handle happy-path envelope (``brief_ref``, no inline prose), CAS
 outcomes (CLAIMED / ALREADY_MINE / CLAIMED_BY_OTHER), ``--force`` takeover
-(never over TASK_DONE), the out-of-band brief write + SNIPPET_RENDER_FAILED,
-and the no-audit-row-on-failure invariant.
+(never over TASK_DONE), the out-of-band brief write, and the
+no-audit-row-on-failure invariant.
 
 Strategy: drive the real verb in-process via CliRunner against the
 ``project`` fixture (bare ``.git/`` skeleton + planctl init, chdir'd).
 ``PLANCTL_ACTOR``
-env var pins identity so multi-actor CAS outcomes are deterministic. The
-``render-spec`` shell-out resolves to an empty render (the seeded tasks carry
-no snippets) → the on-disk brief's ``snippet_context == ""`` on the happy path;
-SNIPPET_RENDER_FAILED is exercised by monkeypatching ``planctl.brief``'s
-subprocess to return a non-zero exit.
+env var pins identity so multi-actor CAS outcomes are deterministic. The brief's
+``snippet_context`` is always ``""`` (a dormant present-and-empty slot).
 """
 
 from __future__ import annotations
@@ -172,7 +169,7 @@ def test_claim_happy_path_envelope(project):
     assert "tier" in brief
     assert "task_spec_md" in brief
     assert "epic_spec_md" in brief
-    # No snippets seeded → empty render, present as "" (not omitted).
+    # snippet_context is a dormant slot — always present as "" (not omitted).
     assert brief["snippet_context"] == ""
 
     # claim stays readonly — NULL subject/files, no commit.
@@ -428,47 +425,8 @@ def test_claim_force_takeover(project):
 
 
 # ---------------------------------------------------------------------------
-# SNIPPET_RENDER_FAILED + no-audit-row-on-failure
+# no-audit-row-on-failure
 # ---------------------------------------------------------------------------
-
-
-def test_claim_snippet_render_failed(project, monkeypatch):
-    from pathlib import Path
-
-    _epic_id, task_id = _make_epic_with_task()
-
-    real_run = subprocess.run
-
-    def _fake_run(cmd, *args, **kwargs):
-        if cmd[:2] == ["promptctl", "render-spec"]:
-            return subprocess.CompletedProcess(
-                cmd, returncode=2, stdout="", stderr="boom"
-            )
-        return real_run(cmd, *args, **kwargs)
-
-    # The render now lives in planctl.brief; monkeypatch its subprocess.
-    monkeypatch.setattr("planctl.brief.subprocess.run", _fake_run)
-
-    r = _invoke(["claim", task_id])
-    assert r.exit_code == 1, r.output
-    payload = _first_line_json(r.output)
-    assert payload["error"]["code"] == "SNIPPET_RENDER_FAILED"
-    # No mutation happened — task stays todo, no audit row.
-    assert not _has_invocation_line(r.output)
-
-    # The brief is assembled BEFORE the CAS: a render failure aborts before any
-    # brief file is written.
-    brief_path = Path(project) / ".planctl" / "state" / "briefs" / f"{task_id}.json"
-    assert not brief_path.exists()
-
-    # Render failure aborts BEFORE the CAS: the task is still todo, so a
-    # subsequent (un-patched) claim transitions todo→in_progress (CLAIMED),
-    # not ALREADY_MINE.
-    monkeypatch.setattr("planctl.brief.subprocess.run", real_run)
-    r2 = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
-    assert r2.exit_code == 0, r2.output
-    payload2 = _first_line_json(r2.output)
-    assert payload2["task_state"]["outcome"] == "CLAIMED"
 
 
 def test_claim_brief_write_failed_leaves_in_progress(project, monkeypatch):

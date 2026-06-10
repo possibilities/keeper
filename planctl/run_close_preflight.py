@@ -2,11 +2,11 @@
 
 The fn-12 crush rebuilds ``/plan:close`` as a content-blind coordinator:
 ``close-preflight`` is the pre-pipeline brief handoff (the symmetric bookend to
-``claim``'s worker brief). It assembles the audit brief — snippet context,
-source commit groups, the ordinal-ordered task list with status + done
-summaries, and the canonical ``commit_set_hash`` — and persists it commit-free
-under gitignored ``<primary_repo>/.planctl/state/audits/<epic_id>/brief.json``,
-then returns a content-blind envelope:
+``claim``'s worker brief). It assembles the audit brief — source commit groups,
+the ordinal-ordered task list with status + done summaries, and the canonical
+``commit_set_hash`` — and persists it commit-free under gitignored
+``<primary_repo>/.planctl/state/audits/<epic_id>/brief.json``, then returns a
+content-blind envelope:
 
     {
       "primary_repo": <abs-path>,
@@ -16,17 +16,16 @@ then returns a content-blind envelope:
       "commit_set_hash": <hex>,    # pins the source commit set
     }
 
-The envelope carries NO prose fields — ``snippet_context`` and ``commit_groups``
-live ONLY in the brief file, which the quality-auditor reads itself. The closer's
-context holds only the handle + the hash.
+The envelope carries NO prose fields — ``commit_groups`` lives ONLY in the brief
+file, which the quality-auditor reads itself. The closer's context holds only the
+handle + the hash.
 
 ``all_done`` is always ``true`` on the success path: a not-all-done epic is a
 typed ``TASKS_NOT_DONE`` error (close operates only on a fully-done epic), not a
 ``false`` data field. The id argument names the PARENT EPIC — a task-shaped id is
 rejected with a message pointing at the parent epic; garbage is ``BAD_EPIC_ID``.
 
-The brief is assembled fully BEFORE any write (the ``promptctl render-spec``
-snippet fetch runs first); a render failure strands nothing on disk. The brief
+The brief is assembled fully BEFORE any write. The brief
 writer is commit-free (``audit_artifacts.write_brief_artifact``), so this verb
 mutates only gitignored ``state/`` and draws no ``.planctl/`` commit — it rides
 the ``InvocationTrackedGroup`` auto-readonly invocation line (NOT in
@@ -37,7 +36,6 @@ error envelope.
 
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
@@ -87,36 +85,6 @@ def _set_invocation_sentinel() -> None:
             cctx.obj[INVOCATION_EMITTED_SENTINEL] = True
     except RuntimeError:
         pass
-
-
-def _render_snippet_context(epic_id: str, primary_repo: str) -> str:
-    """Shell ``promptctl render-spec <epic_id> --format human`` with cwd=primary_repo.
-
-    Empty stdout on exit 0 → ``""`` (the epic has no curated substrate set);
-    non-zero exit → ``SNIPPET_RENDER_FAILED`` (no mutation, nothing written —
-    this runs BEFORE the brief assemble-then-write). No ``--session-id`` — the
-    dedup-against-seen-set is a worker-render concern, not the close fetch.
-    """
-    try:
-        proc = subprocess.run(
-            ["promptctl", "render-spec", epic_id, "--format", "human"],
-            cwd=str(Path(primary_repo).resolve()),
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-        )
-    except OSError as exc:
-        _emit_preflight_error(
-            "SNIPPET_RENDER_FAILED",
-            f"failed to shell promptctl render-spec for {epic_id}: {exc}",
-        )
-    if proc.returncode != 0:
-        _emit_preflight_error(
-            "SNIPPET_RENDER_FAILED",
-            f"promptctl render-spec exited {proc.returncode} for {epic_id}",
-            details={"stderr": (proc.stderr or "").strip()},
-        )
-    return proc.stdout
 
 
 def _commit_groups(
@@ -271,25 +239,24 @@ def run(args: SimpleNamespace) -> int:
             details={"not_done": not_done},
         )
 
-    # commit_groups via the in-process native trailer scan; snippet_context via
-    # a read-only promptctl shell-out. Both fail loud (no mutation, nothing
-    # written) on error — render runs BEFORE the brief assemble-then-write.
+    # commit_groups via the in-process native trailer scan. Fails loud (no
+    # mutation, nothing written) on an all-repos-broken condition.
     commit_groups = _commit_groups(
         [t["id"] for t in tasks if t["id"]], primary_repo, touched_repos
     )
-    snippet_context = _render_snippet_context(epic_id, primary_repo)
     commit_set_hash = compute_commit_set_hash(commit_groups)
 
     # Assemble the full brief, then write it atomically + commit-free. The brief
-    # carries the prose (snippet_context, commit_groups) + the ordinal task list
-    # with done summaries; the envelope below carries only the handle + hash.
+    # carries the commit_groups + the ordinal task list with done summaries; the
+    # envelope below carries only the handle + hash. ``snippet_context`` stays
+    # present-and-empty as a dormant slot.
     brief = {
         "schema_version": AUDIT_SCHEMA_VERSION,
         "epic_id": epic_id,
         "primary_repo": primary_repo,
         "commit_set_hash": commit_set_hash,
         "commit_groups": commit_groups,
-        "snippet_context": snippet_context,
+        "snippet_context": "",
         "tasks": [
             {
                 "id": t["id"],

@@ -2,17 +2,15 @@
 
 Renamed from ``planctl start`` (fn-542 task .2). Where ``start`` only flipped
 ``todo → in_progress`` and emitted a thin status envelope, ``claim`` collapses
-the orchestrator's hand-fired sequence (validate / show / cat / render-spec /
-start) into one call:
+the orchestrator's hand-fired sequence (validate / show / cat / start) into one
+call:
 
 1. **Assert** every precondition BEFORE any mutation — project resolves, id is
    well-formed, task exists, target_repo resolves, status/deps gate passes.
    Each failure returns a typed ``{success:false, error:{code,message,details}}``
    envelope and exits 1; nothing is mutated so no audit row lands.
-2. **Compute** the brief out-of-band (task + epic spec markdown, repos, tier,
-   folded-in ``promptctl render-spec`` snippet context) via
-   :func:`planctl.brief.assemble_brief` BEFORE the single mutation, so a render
-   failure strands nothing.
+2. **Compute** the brief out-of-band (task + epic spec markdown, repos, tier)
+   via :func:`planctl.brief.assemble_brief` BEFORE the single mutation.
 3. **CAS** under ``lock_task``: read-merge-decide-write in one lock. Outcomes:
    ``CLAIMED`` (todo→in_progress), ``ALREADY_MINE`` (same actor, idempotent),
    ``CLAIMED_BY_OTHER`` (error). ``--force`` takes over and bypasses
@@ -186,7 +184,7 @@ def _resolve_project_for_task(task_id: str, project: str | None):
 
 
 def run(args: SimpleNamespace) -> int:
-    from planctl.brief import BriefRenderError, assemble_brief, write_brief
+    from planctl.brief import assemble_brief, write_brief
     from planctl.ids import epic_id_from_task, is_task_id
     from planctl.invocation import build_planctl_invocation_readonly
     from planctl.models import merge_task_state, worker_agent_for_tier
@@ -279,25 +277,18 @@ def run(args: SimpleNamespace) -> int:
     #
     # state_repo = epic.primary_repo falling back to repo_root; equals the
     # computed primary_repo here, but kept distinct from target_repo for
-    # cross-repo epics. render-spec shells with cwd=primary_repo; a render
-    # failure raises BriefRenderError which we translate to the existing
-    # SNIPPET_RENDER_FAILED emit (so a render failure strands no claim).
+    # cross-repo epics.
     tier = task_def.get("tier")
     state_repo = primary_repo
-    try:
-        brief_dict = assemble_brief(
-            task_id=task_id,
-            epic_id=epic_id,
-            target_repo=target_repo,
-            primary_repo=primary_repo,
-            state_repo=state_repo,
-            tier=tier,
-            data_dir=data_dir,
-        )
-    except BriefRenderError as exc:
-        _emit_claim_error(
-            "SNIPPET_RENDER_FAILED", str(exc), details=exc.details or None
-        )
+    brief_dict = assemble_brief(
+        task_id=task_id,
+        epic_id=epic_id,
+        target_repo=target_repo,
+        primary_repo=primary_repo,
+        state_repo=state_repo,
+        tier=tier,
+        data_dir=data_dir,
+    )
 
     # --- CAS under lock: read-merge-decide-write in one lock ---
 

@@ -1343,32 +1343,11 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # planctl_invocation.{op,target,subject,queue_jump}).
     repo_distribution = dict(sorted(Counter(resolved_task_target_repos).items()))
 
-    # fn-630 advisory: epic + every task ships with zero snippet/bundle
-    # metadata. The substrate-discovery healthcheck found 0/1044 tasks carrying
-    # metadata; this guardrail makes the empty-shell case visible at write time
-    # without changing exit code or the single-emit / single-commit contract.
-    # The advisory rides the success envelope `data` dict (emit has NO
-    # `warnings` parameter); bundle-health joins this with the save-bundle
-    # zero-snippet warnings to surface the conversion-funnel collapse.
     scaffold_data: dict = {
         "epic_id": epic_id,
         "task_ids": task_ids,
         "repo_distribution": repo_distribution,
     }
-    epic_has_substrate = bool(epic_snippets) or bool(epic_bundles)
-    any_task_has_substrate = any(
-        task_snippets_list[i - 1] or task_bundles_list[i - 1]
-        for i in range(1, n_tasks + 1)
-    )
-    if not epic_has_substrate and not any_task_has_substrate:
-        scaffold_data["warnings"] = [
-            f"epic {epic_id} scaffolded with no snippet/bundle metadata on "
-            "the epic OR any of its tasks (advisory; write proceeds — "
-            "bundle-health diagnostic will surface this as a no-substrate "
-            "epic). Add `epic.snippets` / `epic.bundles` or per-task "
-            "`snippets` / `bundles` in the YAML to give workers curated "
-            "context at `render-spec` time."
-        ]
 
     emit(
         scaffold_data,

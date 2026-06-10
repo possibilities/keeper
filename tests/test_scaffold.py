@@ -267,19 +267,18 @@ tasks:
 
 
 # ---------------------------------------------------------------------------
-# fn-630 advisory: empty-shell epic+tasks (no snippet/bundle metadata anywhere)
-# surfaces a `warnings` entry on the success envelope `data` — exactly ONE
-# emit, ONE commit, contract unchanged.
+# Scaffold never carries a no-substrate advisory: an empty-shell epic+tasks
+# (no snippet/bundle metadata anywhere) emits a clean success envelope with no
+# `warnings` field — substrate is a dormant, unprompted surface.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
-def test_scaffold_no_substrate_emits_advisory_warning(planctl_git_repo):
-    """Epic + tasks with no snippets/bundles anywhere surfaces the advisory.
+def test_scaffold_no_substrate_emits_no_advisory(planctl_git_repo):
+    """Epic + tasks with no snippets/bundles anywhere emit no advisory.
 
-    The advisory rides the success envelope `data` (emit has no `warnings`
-    parameter). Single emit + single commit contract is preserved — exactly
-    one `planctl_invocation` line on stdout.
+    Single emit + single commit contract is preserved — exactly one
+    `planctl_invocation` line on stdout, and no `warnings` field.
     """
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
     r = _invoke(["scaffold", "--file", yaml_path])
@@ -287,74 +286,12 @@ def test_scaffold_no_substrate_emits_advisory_warning(planctl_git_repo):
 
     payload = _parse_envelope(r.output)
     assert payload["success"] is True
-
-    # Advisory must be present on the envelope data.
-    warnings = payload.get("warnings")
-    assert warnings is not None, f"Expected `warnings` on envelope: {payload}"
-    assert isinstance(warnings, list)
-    assert len(warnings) == 1
-    # Naming the epic id keeps the warning useful in batch contexts.
-    assert payload["epic_id"] in warnings[0]
-    assert "snippet/bundle metadata" in warnings[0]
+    assert "warnings" not in payload, (
+        f"Scaffold must never carry a no-substrate advisory: {payload}"
+    )
 
     # Single-emit invariant: exactly ONE planctl_invocation line on stdout.
     assert _count_planctl_invocation_lines(r.output) == 1
-
-
-@pytest.mark.integration
-def test_scaffold_with_epic_substrate_no_advisory(planctl_git_repo):
-    """Epic-level snippets present -> no advisory (even if tasks are empty)."""
-    yaml = f"""\
-epic:
-  title: epic has substrate
-  snippets: [some-snip]
-  spec: |
-    ## Overview
-    yes.
-tasks:
-  - title: only task
-    deps: []
-    tier: medium
-    spec: |
-{_indent(_VALID_TASK_SPEC, 6)}
-"""
-    yaml_path = _write_yaml(planctl_git_repo, yaml)
-    r = _invoke(["scaffold", "--file", yaml_path])
-    assert r.exit_code == 0, r.output
-
-    payload = _parse_envelope(r.output)
-    assert payload["success"] is True
-    assert "warnings" not in payload, (
-        f"No advisory expected when epic carries substrate: {payload}"
-    )
-
-
-@pytest.mark.integration
-def test_scaffold_with_task_substrate_no_advisory(planctl_git_repo):
-    """Any task carrying snippets/bundles -> no advisory (even if epic is empty)."""
-    yaml = f"""\
-epic:
-  title: task has substrate
-  spec: |
-    ## Overview
-    yes.
-tasks:
-  - title: only task
-    deps: []
-    tier: medium
-    snippets: [task-snip]
-    spec: |
-{_indent(_VALID_TASK_SPEC, 6)}
-"""
-    yaml_path = _write_yaml(planctl_git_repo, yaml)
-    r = _invoke(["scaffold", "--file", yaml_path])
-    assert r.exit_code == 0, r.output
-
-    payload = _parse_envelope(r.output)
-    assert payload["success"] is True
-    assert "warnings" not in payload, (
-        f"No advisory expected when a task carries substrate: {payload}"
-    )
 
 
 # ---------------------------------------------------------------------------

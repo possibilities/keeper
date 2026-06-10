@@ -72,7 +72,7 @@ def _find_source_commit_sha(task_id: str) -> str | None:
 def run(args: SimpleNamespace) -> int:
     import json
 
-    from planctl.brief import BriefRenderError, assemble_brief, write_brief
+    from planctl.brief import assemble_brief, write_brief
     from planctl.ids import is_task_id
     from planctl.models import merge_task_state, worker_agent_for_tier
     from planctl.output import emit, emit_error
@@ -135,18 +135,15 @@ def run(args: SimpleNamespace) -> int:
     # --- Regenerate the brief fresh (bake-fresh-on-each-entrypoint) ---
     # `worker resume` always overwrites: it never reads a foreign brief, so the
     # reader-side schema_version gate is moot here.
-    try:
-        brief_dict = assemble_brief(
-            task_id=task_id,
-            epic_id=epic_id,
-            target_repo=target_repo,
-            primary_repo=primary_repo,
-            state_repo=state_repo,
-            tier=tier,
-            data_dir=data_dir,
-        )
-    except BriefRenderError as exc:
-        emit_error(str(exc))
+    brief_dict = assemble_brief(
+        task_id=task_id,
+        epic_id=epic_id,
+        target_repo=target_repo,
+        primary_repo=primary_repo,
+        state_repo=state_repo,
+        tier=tier,
+        data_dir=data_dir,
+    )
 
     briefs_dir = ctx.state_dir / "briefs"
     try:

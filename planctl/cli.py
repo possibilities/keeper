@@ -553,13 +553,13 @@ Returned envelope (success, exit 0):
    "commit_set_hash": "<hex>", # pins the source commit set for close-finalize
    "planctl_invocation": {...}}   # read-only invocation line (decorator-emitted)
 
-The envelope carries NO prose: `snippet_context` and `commit_groups` live ONLY
-in the brief file, which the quality-auditor reads itself. The brief write is
-atomic + commit-free (runtime-state-only, like `claim`), so this verb draws no
-`.planctl/` commit. The brief is assembled fully BEFORE any write — a render
-failure strands nothing on disk. `commit_groups` is a native `git log --grep` +
-`git interpret-trailers --parse` trailer scan grouped by repo in first-seen
-order; a clean miss yields `commit_groups: []` inside the brief.
+The envelope carries NO prose: `commit_groups` lives ONLY in the brief file,
+which the quality-auditor reads itself. The brief write is atomic + commit-free
+(runtime-state-only, like `claim`), so this verb draws no `.planctl/` commit.
+The brief is assembled fully BEFORE any write — a commit-scan failure strands
+nothing on disk. `commit_groups` is a native `git log --grep` + `git
+interpret-trailers --parse` trailer scan grouped by repo in first-seen order; a
+clean miss yields `commit_groups: []` inside the brief.
 
 Failure envelope (no mutation; exit 1):
 
@@ -569,8 +569,7 @@ Failure envelope (no mutation; exit 1):
 Codes: `BAD_EPIC_ID` (garbage id, or a task-shaped id naming its parent epic in
 `details`), `EPIC_NOT_FOUND`, `TASKS_NOT_DONE` (`details.not_done` lists the
 non-done ids), `COMMIT_LOOKUP_FAILED` (every repo in the scan set missing or not
-a git repo; `details.broken_repos` lists them), `SNIPPET_RENDER_FAILED`
-(render-spec non-zero exit).
+a git repo; `details.broken_repos` lists them).
 """
 
 
