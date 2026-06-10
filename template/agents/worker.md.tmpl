@@ -20,11 +20,9 @@ You implement one planctl task end-to-end and return a concise summary to the pa
 - `PLANCTL` — path to the planctl CLI (usually `planctl`)
 - `TARGET_REPO` — absolute path to the repo where source lives (cwd should already match)
 - `PRIMARY_REPO` — absolute path to the repo where planctl state lives
-- `BRIEF_REF` — absolute path to your brief JSON (`<primary_repo>/.planctl/state/briefs/<task_id>.json`). Read this file in Phase 1; it carries the task spec, epic spec, and pre-rendered snippet context out-of-band so the parent never inlines prose into your prompt.
+- `BRIEF_REF` — absolute path to your brief JSON (`<primary_repo>/.planctl/state/briefs/<task_id>.json`). Read this file in Phase 1; it carries the task spec and epic spec out-of-band so the parent never inlines prose into your prompt.
 
 If `TASK_ID`, `EPIC_ID`, `PLANCTL`, or `BRIEF_REF` are missing, stop and ask the parent. `TARGET_REPO` / `PRIMARY_REPO` may be absent on single-repo spawns — treat missing as "same as cwd".
-
-**Snippet context.** Your brief's `snippet_context` field is pre-rendered prose from `promptctl render-spec <task_id>` — the planner's curated substrate selection for this task (snippets + bundles). When non-empty, read it as authoritative context for this task; do not re-fetch via `promptctl find-snippets` / `show-snippet` / `render` unless you hit a real gap the curated context did not cover. An empty string (`snippet_context: ""`) means the task has no curated substrate — proceed with task + epic spec only. The parent skill already paid the render cost once on your behalf.
 
 ---
 
@@ -48,9 +46,8 @@ Read your brief from `BRIEF_REF` (its path is in your prompt) with the Read tool
 
 - `task_spec_md` — the full task spec markdown (same content `planctl cat $TASK_ID` would print).
 - `epic_spec_md` — the full epic spec markdown (same content `planctl cat $EPIC_ID` would print).
-- `snippet_context` — the pre-rendered substrate prose (`""` when the task has no curated substrate).
 
-Treat those three fields as your authoritative context. Do NOT shell `planctl cat` for either spec — the brief already carries them.
+Treat those two fields as your authoritative context. Do NOT shell `planctl cat` for either spec — the brief already carries them.
 
 **Brief self-check (do this before trusting the brief).** You are an agent reading JSON, not running Python — eyeball these:
 
@@ -92,8 +89,6 @@ If the task spec has `## Investigation targets`:
   Pick reuse / extend / new and note the choice for Phase 6.
 
 If the spec has `### Design context` (frontend), open the referenced DESIGN.md once and apply its tokens. If it's missing, proceed without it — design context is advisory.
-
-**Snippet substrate is escape-valve only.** Run `promptctl find-snippets` / `show-snippet` / `render` ONLY if the brief's `snippet_context` (see header note) has a real gap for this task — never a routine step.
 
 If the spec has neither block, skip Phase 1.5.
 

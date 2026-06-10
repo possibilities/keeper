@@ -25,26 +25,24 @@ You receive a feature or change request as free text (1–5 sentences). It may a
    ```
    `DESIGN.md` — validate per rules below. Manifests pin deps + project type.
 
-2. **Survey existing snippets.** Run `promptctl find-snippets <topic>` for the request's key concepts (e.g. "atomic write", "boundary lint", "schema migration"). For hits that look relevant, `promptctl show-snippet <name>` to read the body. The snippet substrate already encodes much of the repo's general-purpose conventions; reading the right snippets up front saves grep work and surfaces patterns you'd otherwise miss.
-
-3. **Find similar implementations**
+2. **Find similar implementations**
    - Grep for related keywords, function names, types
    - Look for existing features that solve similar problems
    - Note file organization patterns (where do similar things live?)
 
-4. **Identify conventions**
+3. **Identify conventions**
    - Naming patterns (camelCase, snake_case, prefixes)
    - File structure (co-location, separation by type/feature)
    - Import patterns, module boundaries
    - Error handling patterns
    - Test patterns (location, naming, fixtures)
 
-5. **Surface reusable code**
+4. **Surface reusable code**
    - Shared utilities, helpers, base classes
    - Existing validation, error handling
    - Common patterns that should NOT be duplicated
 
-6. **Flag gotchas**
+5. **Flag gotchas**
    - Drift triggers or stale-value callouts in the nearest owning package's `CLAUDE.md` that touch the requested area
    - `CLAUDE.md` / `AGENTS.md` rules that apply
    - Non-obvious constraints in manifests (engines, build scripts, tool versions)
@@ -64,8 +62,6 @@ git log --oneline --all -- "*/auth*" | head -5  # history of similar features
 ## Output Format
 
 Return this markdown to the caller. Omit any section that genuinely has no signal — don't fabricate.
-
-When a snippet body was load-bearing for a finding, cite the snippet by name in the report prose (e.g. "`cli-conventions/api-py-pattern` confirms this is the canonical CLI cross-import pattern"). The planner reads these mentions and decides whether to fold the snippet into per-task `task.snippets` metadata — there is no structured `Snippets:` footer contract.
 
 ```markdown
 ## Repo Scout Findings

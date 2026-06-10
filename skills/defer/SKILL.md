@@ -53,7 +53,7 @@ When you spawn:
 
 ```
 Task(
-    subagent_type="repo-scout",
+    subagent_type="plan:repo-scout",
     description="Scout for defer of <short subject>",
     prompt="<subject context + repo-scout instruction>"
 )

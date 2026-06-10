@@ -44,22 +44,9 @@ planctl detect || planctl init
 
 ## Phase 1 — Input handling
 
-### Phase 1a — First-line `--bundle <ref>` / `--snippets a,b,c` wire format
+### Phase 1a — Strip a leading wire-format line
 
-Before any other Phase 1 routing, inspect the first line of `$ARGUMENTS`. When it matches one of these, an upstream author tier (`/arthack:sketch` or a `bundle/<name>` author) has handed off curated context:
-
-- `^--bundle\s+((bundle|sketch)/\S+)\s*$` — single bundle ref handoff
-- `^--snippets\s+([a-z0-9_,-]+)\s*$` — comma-separated snippet ids (no bundle)
-
-**Parse:**
-
-- `--bundle` match: capture the ref (`bundle/<name>` or `sketch/<name>`) as `inherited_bundle`.
-- `--snippets` match: split the list on commas, strip whitespace; each id must match `^[a-z0-9]+(-[a-z0-9]+)*$` (= `planctl.bundle_ref.SNIPPET_ID_RE`; rejects underscores, trailing/double dashes). Capture as `inherited_snippets`.
-- Strip the matched first line (and the blank-line separator after it, if present) from `$ARGUMENTS`. The remaining prose IS the planning subject. Continue Phase 1 against the stripped `$ARGUMENTS` (may be empty, an id, or free text).
-
-**Ref-shape validation (prompt-injection hygiene).** `inherited_bundle` and each `inherited_snippets` id flow through shell calls downstream (`promptctl show-bundle`, `promptctl show-snippet`, `planctl epic/task set-bundles`/`set-snippets`). **Validate ref shape against the regex above before any shell interpolation.** If the first line starts with `--bundle`/`--snippets` but the rest doesn't pass, treat it as malformed: do not capture, do not strip, warn once (*"first line looked like a `--bundle` flag but ref didn't validate — treating as prose"*), and continue with the original `$ARGUMENTS`.
-
-Pin `inherited_bundle` (a ref string or null) and `inherited_snippets` (a list or empty) for Phase 2a / 5b / 5e. Downstream phases ignore both when unset. A `sketch/<name>` ref is inlined to bare snippet ids at write time against the cwd authoring project (fn-610) — the persisted epic carries no `sketch/` ref; `bundle/` refs pass through.
+Before any other Phase 1 routing, inspect the first line of `$ARGUMENTS`. If it matches `^--(bundle|snippets)\b`, strip that line (and the blank-line separator after it, if present) and ignore it — the remaining prose IS the planning subject. Continue Phase 1 against the stripped `$ARGUMENTS` (may be empty, an id, or free text).
 
 ### Phase 1b — Subject routing
 
@@ -96,16 +83,6 @@ Both paths run this block. The **create path** enters here and runs **all four s
   Existing tasks in this epic:
   <one line per task: "<task_id> — <title>">
   ```
-
-### Phase 2a — Browse inherited substrate (when bundle/snippets inherited)
-
-Runs **before** scout spawn only when Phase 1a captured an `inherited_bundle` or non-empty `inherited_snippets`. Skip entirely otherwise (the usual refine case).
-
-**Goal:** know what's in scope without rendering the full bundle into context. At the router tier the planner **browses the menu, never full-renders** — context goes down, not up. Full bundle render is reserved for inheritor-tier `render-spec` in `/plan:work` and `/plan:close`.
-
-1. **Show the bundle** (`inherited_bundle` set): `promptctl show-bundle <inherited_bundle>` — emits snippet-ids + one-line summaries. Pin as `inherited_bundle_menu`. Do **not** `promptctl render` it or `show-snippet` every member.
-2. **Spot-show** a decision-relevant snippet selectively: `promptctl show-snippet <name>`. Pull only what bears on a decision (naming convention, error-handling pattern, validation contract). Multiple calls fine; rendering the whole bundle one snippet at a time is not.
-3. **Fill gaps**: when scout briefs uncover topics the bundle misses, `promptctl find-snippets "<gap topic>"` and spot-show the decision-relevant hits.
 
 ### Phase 2b — Spawn scouts in parallel
 
@@ -160,15 +137,15 @@ agent spec.
 Invocations (create shows all four; refine includes only `run` scouts, same message block):
 
 ```
-Task(subagent_type="repo-scout",      description="Scout repo for <short feature name>",          prompt="<subject context + repo-scout instruction>")
-Task(subagent_type="docs-gap-scout",  description="Scout docs gaps for <short feature name>",      prompt="<docs-gap-scout brief>")
-Task(subagent_type="practice-scout",  description="Scout best practices for <short feature name>", prompt="<subject context + practice-scout instruction>")
-Task(subagent_type="epic-scout",      description="Scout epic deps for <short feature name>",       prompt="<subject context + epic-scout instruction>")
+Task(subagent_type="plan:repo-scout",      description="Scout repo for <short feature name>",          prompt="<subject context + repo-scout instruction>")
+Task(subagent_type="plan:docs-gap-scout",  description="Scout docs gaps for <short feature name>",      prompt="<docs-gap-scout brief>")
+Task(subagent_type="plan:practice-scout",  description="Scout best practices for <short feature name>", prompt="<subject context + practice-scout instruction>")
+Task(subagent_type="plan:epic-scout",      description="Scout epic deps for <short feature name>",       prompt="<subject context + epic-scout instruction>")
 ```
 
 **Using the returns:**
 
-- **repo-scout** (headings: Project Conventions / Related Code / Reusable Code / Test Patterns / Design System / Gotchas). Verify any `[INFERRED]` file:line refs before using them as Investigation targets in 5e — drop if the file doesn't exist. **Harvest snippet-name mentions:** repo-scout cites snippet names in prose (no structured footer), so scan paragraphs for tokens matching `[a-z0-9]+(-[a-z0-9]+)*` named as snippets, `promptctl show-snippet <name>` any you don't recognize, and pin the decision-relevant ids for attachment in 5b (epic) or 5e (per-task). Default to attaching; drop only when clearly off-subject.
+- **repo-scout** (headings: Project Conventions / Related Code / Reusable Code / Test Patterns / Design System / Gotchas). Verify any `[INFERRED]` file:line refs before using them as Investigation targets in 5e — drop if the file doesn't exist.
 - **docs-gap-scout** (Doc Locations Found / Likely Updates Needed / No Updates Expected). `Likely Updates Needed` feeds the `## Docs gaps` epic subsection (5g).
 - **practice-scout** (Best Practices / Do / Don't / Real-World Examples / Security / Performance / Source Quality Notes / Sources). Do/Don't/Security/Performance feed the optional `## Best practices` epic subsection (5g).
 - **epic-scout** (four `###` buckets under `## Epic Dependencies`). Carry `### Dependencies` AND `### Overlaps` into Phase 6 (both hard-wire as `epic add-deps` edges); fold `### Reverse Dependencies` into the epic spec References (advisory only).
@@ -225,7 +202,7 @@ auto-wires overlaps via `epic add-deps` upstream.
 Invocation:
 
 ```
-Task(subagent_type="gap-analyst", description="Gap analysis for <short feature name>", prompt="<gap-analyst brief above>")
+Task(subagent_type="plan:gap-analyst", description="Gap analysis for <short feature name>", prompt="<gap-analyst brief above>")
 ```
 
 Pin the return. `Priority Questions` feed Phase 2d next; `Nice-to-Clarify` items surface as open-question notes in affected task Approach subsections (5e). In Phase 5d, if the gap-analyst surfaces a missing capability no planned task covers, consider a new task — but only when the gap would block a planned task, not reflexively. If the report is thin (greenfield, well-specified), proceed.
@@ -354,7 +331,7 @@ Word choice is load-bearing — the human picks the flow by picking the phrase. 
 
 - **"commit sketch"** (direct-commit) — accept any clear go-forth (*"ship it"*, *"go"*, *"do it"*, *"send it"*, *"commit"*, …). Stop the pipeline entirely — **no Phase 5/6/7/8**; the sketch is the plan. The affirmative is the directive to implement and commit: ask only the questions that block the work, don't re-litigate direction, drive arthack's normal commit-then-go workflow (`keeper commit-work --preview-files` then `keeper commit-work "<msg>"`).
 - **"defer sketch"** (defer-handoff) — accept *"defer"*, *"later"*, *"not now"*, *"follow up"*, *"park it"*, any back-of-line signal. Stop this pipeline and invoke **`/plan:defer`** with the sketch artifact as the subject. Single-task epic at normal sort order, no worker. If the human then wants it at the front of the board, `/plan:next <epic_id>` flips its priority post-hoc via `planctl epic queue-jump`.
-- **"plan sketch"** / **continue planning** — any answer that isn't an affirmative-to-proceed (*"continue"*, *"plan it"*, *"full plan"*, added context that shifts direction). Flows into Phase 5 unchanged. (When `/arthack:sketch` drives this, it saves the curated bundle via `promptctl save-bundle sketch/<slug> --append` and re-enters via the `--bundle sketch/<slug>` first-line wire format in Phase 1a.)
+- **"plan sketch"** / **continue planning** — any answer that isn't an affirmative-to-proceed (*"continue"*, *"plan it"*, *"full plan"*, added context that shifts direction). Flows into Phase 5 unchanged. (When `/arthack:sketch` drives this, it re-enters with a leading `--bundle sketch/<slug>` line; Phase 1a strips and ignores that line, so the prose below it is the planning subject.)
 
 ---
 
@@ -368,15 +345,11 @@ The **refine path (Phase R)** uses `refine-apply`, not `scaffold` (scaffold mint
 
 3–6 words, slugifies cleanly (lowercase letters, digits, hyphens). E.g. "Add health check endpoint" → `add-health-check-endpoint`. You don't pre-allocate the id — scaffold mints the globally-unique `fn-N` and returns it.
 
-### 5b. Decide epic-level branch + snippet/bundle metadata (cognitive)
+### 5b. Decide the epic branch (cognitive)
 
-These become fields on the `epic:` block of the YAML (5h) — no CLI call here.
+This becomes a field on the `epic:` block of the YAML (5h) — no CLI call here.
 
 **Branch** — defaults to the epic id; leave `branch:` out unless the human asked for a specific name (rename later via `planctl epic set-branch`).
-
-**Snippets/bundles — attaching at least one is the default outcome.** The planner almost always has an inherited bundle, a scout-surfaced snippet, or a `find-snippets` hit worth riding into the epic. Sources: `inherited_bundle`/`inherited_snippets` from Phase 1a (**must ride forward** — inherited bundle ids → `epic.bundles`, inherited snippets → `epic.snippets`, never silently dropped); the `inherited_bundle_menu` from 2a (promote individual members to `epic.snippets` only when broadly relevant across tasks — otherwise curate per-task in 5e); the harvested scout snippet mentions from 2b (relevance-filtered); selective `find-snippets` for gaps. When `inherited_bundle` is null but you inferred a different worthwhile bundle, use it — but prefer the inherited ref when one exists (author-tier curation is canonical). Multiple refs allowed.
-
-**The empty case needs a named reason, not a silent default** (applies here and in 5e). If you intend `snippets: []` AND `bundles: []`, state in one sentence what you searched (scout mentions, the inherited menu, `find-snippets` queries) and why nothing fit; pin it for Phase 8. If you can't articulate a reason, revisit the 2b harvest and a `find-snippets` browse before writing. (scaffold emits an advisory on its success envelope when the epic and *every* task ship zero snippets/bundles — treat it as a prompt to revisit attachment.)
 
 ### 5d. Decompose into tasks (cognitive)
 
@@ -399,7 +372,7 @@ For each task, decide:
 
 ### 5e. For each task — assemble the YAML entry (cognitive)
 
-No per-task CLI call. For each task in decomposition order, build one entry in `tasks:` (5h): `title`, `tier`, `deps` (1-based ordinals), `snippets`, `bundles`, `spec`. Scaffold mints ids as `<epic_id>.<M>` (M = 1-based position) and returns them.
+No per-task CLI call. For each task in decomposition order, build one entry in `tasks:` (5h): `title`, `tier`, `deps` (1-based ordinals), `spec`. Scaffold mints ids as `<epic_id>.<M>` (M = 1-based position) and returns them.
 
 **Spec markdown — required:** the 4 H2s `## Description`, `## Acceptance`, `## Done summary`, `## Evidence`, in that order, at every depth. Embed structure as `### subsections` inside `## Description` per the 3b task-depth mapping.
 
@@ -445,8 +418,6 @@ SHORT: only `### Approach` and `### Investigation targets`. DEEP: also `### Deta
 
 **Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
 
-**Per-task snippet/bundle metadata** is additive curation beyond `epic.snippets`/`epic.bundles`; the union is what `render-spec <task_id>` resolves at worker time. Attaching at least one is the default. Sources: the `inherited_bundle_menu` (pick by this task's files/domain/phase), harvested scout mentions relevant to this task, selective `find-snippets "<task topic>"`. The empty case is acceptable only with a named reason — either (1) the epic-level lists already cover this task (name the snippet/bundle it relies on) or (2) nothing on the menu intersects this task's surface (name what you searched) — and pin it for Phase 8.
-
 **Tier** — write the band from 5d as `tier:`. **Required on every task** — scaffold errors `tier_invalid` if missing or unknown. Say the choice in one line per task (*"task 3 is contract-touching — xhigh"*) so the human can redirect.
 
 **Target repo (cross-repo epics only)** — when a task lands outside `primary_repo`, set `target_repo:` to the absolute path (`~` expands); omit otherwise (defaults to `primary_repo`). `primary_repo` is where scaffold runs, so run `/plan:plan` from it. Do **not** hand-set `epic.touched_repos` — the engine auto-derives it from the resolved per-task `target_repo` set. Canonical wording: `planctl scaffold --agent-help`.
@@ -490,14 +461,6 @@ Task that proves the approach: `<task_id>`. If it fails: <recovery plan in 1 sen
 ## Best practices
 
 - **<practice>:** <why it matters> [source]
-
-## Snippet context
-
-Bundles inherited or curated for this epic:
-- `<bundle_ref>` — <one-line description>
-
-Snippets curated at the epic level (apply across multiple tasks):
-- `<snippet_id>` — <one-line summary>
 ```
 
 Omission rules (advisory shape — scaffold validates only task specs, not the epic spec):
@@ -505,7 +468,6 @@ Omission rules (advisory shape — scaffold validates only task specs, not the e
 - **DEEP**: also append `## Alternatives` (considered and rejected), `## Architecture` (embedded mermaid when the data model/architecture changes), `## Rollout` (rollout + rollback plan).
 - Omit `## Docs gaps` if docs-gap-scout returned no `### Likely Updates Needed`; else one bullet per entry (a tracking surface, not an acceptance gate).
 - Omit `## Best practices` if practice-scout returned no signal; else one bullet per distinct non-obvious practice (advisory, not a gate).
-- Omit `## Snippet context` if both `epic.snippets` and `epic.bundles` are empty; else list the inherited/curated bundle refs (5b) and epic-level snippet ids. Per-task deltas (5e) live on the task records, not here.
 
 ### 5h. Build the plan YAML and call scaffold once
 
@@ -515,10 +477,6 @@ Assemble one YAML file from 5a–5g and materialize the whole tree in a single t
 epic:
   title: "<epic title from 5a>"        # required, non-empty
   branch: <branch-name>                # optional — omit to default to epic_id (5b)
-  snippets: [<id1>, <id2>]             # optional, kebab-case ids (5b)
-  bundles: [<ref1>, <ref2>]            # optional, (bundle|sketch)/<name>[/<name>] (5b).
-                                       # `sketch/<name>` is inlined into `snippets` at write
-                                       # time and dropped from this list (fn-610); bundle/ refs pass through.
   spec: |                              # optional, raw markdown — the epic spec from 5g
     ## Overview
     ...
@@ -526,8 +484,6 @@ tasks:                                 # required, ordered list (>=1 entry), dec
   - title: "<task title>"              # required, non-empty (5e)
     tier: xhigh                        # required, one of medium|high|xhigh|max (5d/5e)
     deps: []                           # 1-based ordinals into this list (5f)
-    snippets: []                       # optional (5e)
-    bundles: []                        # optional (5e)
     target_repo: <path>                # optional, absolute path (~ expanded); omit to default
                                        # to primary_repo; epic.touched_repos auto-derives (5e).
     spec: |                            # required, valid four-section task spec (5e)
@@ -554,7 +510,7 @@ YAML_EOF
 
 Capture from the success envelope and pin for Phase 6/8: `epic_id` (`fn-N-slug`), `task_ids` (ordered `<epic_id>.M`), and `repo_distribution` (`{repo_path: count}` — eyeball on a cross-repo epic; an all-primary distribution flags a forgotten `target_repo:`).
 
-**On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`, no writes land): scaffold collected all errors in one pass. Codes — `bad_yaml` (parse/shape/type), `spec_invalid` (task spec malformed), `ref_invalid` (snippet/bundle regex, or an unresolvable `sketch/<name>`), `dep_invalid` (out-of-range/self ordinal), `dep_cycle`, `epic_dep_invalid` (an `epic.depends_on_epics` entry fails the cross-project resolver — bad shape / not found / done / ambiguous / would cycle; fn-600), `id_collision`, `tier_invalid`. Read `details`, fix every entry in the YAML, re-run the single call. Do **not** fall back to incremental verbs.
+**On a failure envelope** (`{success: false, error: {code, message, details: [...]}}`, no writes land): scaffold collected all errors in one pass. Codes — `bad_yaml` (parse/shape/type), `spec_invalid` (task spec malformed), `dep_invalid` (out-of-range/self ordinal), `dep_cycle`, `epic_dep_invalid` (an `epic.depends_on_epics` entry fails the cross-project resolver — bad shape / not found / done / ambiguous / would cycle; fn-600), `id_collision`, `tier_invalid`. Read `details`, fix every entry in the YAML, re-run the single call. Do **not** fall back to incremental verbs.
 
 Scaffold leaves the epic uncommitted-to-deps by design — proceed to Phase 6.
 
@@ -646,7 +602,7 @@ Runs instead of the create path's Phase 2–7 when Phase 1 detected an `fn-N` id
 
 ### R1+R2. Invalidate + fetch current state (one call)
 
-Fire unconditionally the moment Phase 1 detects an `fn-N` id. One call clears `last_validated_at` AND returns the full refine context — collapses the old `epic invalidate` + `refine-context` pair into one envelope and one auto-commit. The envelope carries epic metadata (`title`, `branch`, `last_validated_at` — now `null`), the epic spec (`epic_spec_md`), and a `tasks` list of `{id, title, status, deps, snippets, bundles, spec_md}` (`[]` for an empty epic).
+Fire unconditionally the moment Phase 1 detects an `fn-N` id. One call clears `last_validated_at` AND returns the full refine context — collapses the old `epic invalidate` + `refine-context` pair into one envelope and one auto-commit. The envelope carries epic metadata (`title`, `branch`, `last_validated_at` — now `null`), the epic spec (`epic_spec_md`), and a `tasks` list of `{id, title, status, deps, spec_md}` (`[]` for an empty epic).
 
 ```bash
 planctl refine-context <epic_id> --invalidate   # task route: epic_id = task_id with .M stripped
@@ -709,8 +665,6 @@ add_tasks:                 # new tasks
       ## Description
       ...
     deps: [fn-7.1, 1]      # mix existing task ids (str) + 1-based new-ordinal (int)
-    snippets: [...]        # optional
-    bundles: [...]         # optional
 rewrite_specs:             # spec rewrites on existing tasks
   - task_id: fn-7.2
     spec: | ...

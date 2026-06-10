@@ -32,7 +32,7 @@ The human said "work", "/work", or passed an existing planctl task id to run. Ac
 
 **Shared-tree principle (read first):** This repo runs concurrent agents and the human's in-progress work in parallel — at any moment the working tree may carry uncommitted changes that have nothing to do with this task. Any file you didn't write through this session belongs to someone else: never auto-stash it, never classify it as in-/out-of-scope for the worker, never commit it. Authoritative attribution comes from `keeper session-state`'s `session_files` field (subagent writes share the parent session_id in hookctl's tracker, so the orchestrator's session_files already covers worker output) — anything in `status_porcelain` but not in `session_files` is someone else's territory.
 
-One call asserts invariants, claims the task (`todo` → `in_progress`), and returns the full worker briefing — no `detect`, no separate `show`/`cat`, no `cd`, no standalone `render-spec`. `claim` resolves the owning project cwd-agnostically (scans configured `roots`), so this works from any directory:
+One call asserts invariants, claims the task (`todo` → `in_progress`), and returns the full worker briefing — no `detect`, no separate `show`/`cat`, no `cd`. `claim` resolves the owning project cwd-agnostically (scans configured `roots`), so this works from any directory:
 
 ```bash
 planctl claim <task_id>
@@ -48,7 +48,7 @@ planctl claim <task_id>
 - `tier` — persisted tier (`medium | high | xhigh | max`). This skill quotes it back for transparency but never picks it.
 - `worker_agent` — the subagent name `claim` derived from the tier (`plan:worker-<tier>`), or `null` for a legacy null-tier task. Phase 2a spawns this verbatim; a `null` value is a hard stop (see Phase 2a).
 - `task_state`, `epic_state` — runtime + epic metadata (status, title).
-- `brief_ref` — absolute path to the worker's brief JSON (`<primary_repo>/.planctl/state/briefs/<task_id>.json`). `claim` wrote the task spec, epic spec, and pre-rendered snippet context into this file out-of-band; you pass the handle to the worker, which reads it itself. This skill never opens the brief — it is content-blind.
+- `brief_ref` — absolute path to the worker's brief JSON (`<primary_repo>/.planctl/state/briefs/<task_id>.json`). `claim` wrote the task spec and epic spec into this file out-of-band; you pass the handle to the worker, which reads it itself. This skill never opens the brief — it is content-blind.
 
 Quote back a one-line summary so the human sees state is loaded, naming the persisted tier for transparency: *"working `fn-1-foo.3` at `<tier>`: <title>."*
 
@@ -66,7 +66,7 @@ Use the Task tool to invoke the worker subagent named by the claim envelope's `w
 
 **Tier is already chosen** (see the intro) — this skill never picks or persists one. `claim` already mapped the persisted tier to `worker_agent` (`plan:worker-<tier>`); the target agent file owns the model + `effort:`. Spawn the emitted `worker_agent` verbatim, no `model=`.
 
-**Content-blind spawn.** This skill never inlines spec or snippet prose into the worker prompt — `claim` already wrote the task spec, epic spec, and pre-rendered snippet context into the brief JSON at `brief_ref`. You pass the worker only config lines, including `BRIEF_REF`; the worker reads the brief itself in its Phase 1. The planner authored `task.snippets` / `task.bundles` (and inherited `epic.snippets` / `epic.bundles`) at planning time, and `claim` folded the `render-spec` resolution into the brief, so this skill never shells substrate.
+**Content-blind spawn.** This skill never inlines spec prose into the worker prompt — `claim` already wrote the task spec and epic spec into the brief JSON at `brief_ref`. You pass the worker only config lines, including `BRIEF_REF`; the worker reads the brief itself in its Phase 1.
 
 **Prompt template:**
 
@@ -82,10 +82,10 @@ BRIEF_REF: <absolute path from the Phase 1 claim envelope's brief_ref>
 
 ## Task
 
-Follow your agent spec. Read BRIEF_REF in Phase 1 to get the task spec, epic spec, and snippet context. If your turn opens with a directive from this skill instead of this template, the directive overrides the phase scaffolding.
+Follow your agent spec. Read BRIEF_REF in Phase 1 to get the task spec and epic spec. If your turn opens with a directive from this skill instead of this template, the directive overrides the phase scaffolding.
 ```
 
-The prompt is config-only — no prose blocks. The worker's Phase 1 reads the brief from `BRIEF_REF` (parsing `task_spec_md` / `epic_spec_md` / `snippet_context`) and self-checks its identity against the brief, so the orchestrator carries no spec content in its own context.
+The prompt is config-only — no prose blocks. The worker's Phase 1 reads the brief from `BRIEF_REF` (parsing `task_spec_md` / `epic_spec_md`) and self-checks its identity against the brief, so the orchestrator carries no spec content in its own context.
 
 Populate `TARGET_REPO`, `PRIMARY_REPO`, and `BRIEF_REF` directly from the Phase 1 claim envelope — all are already fully resolved to absolute paths:
 - `TARGET_REPO` — the envelope's `target_repo`.

@@ -23,16 +23,14 @@ flowchart TB
 
         stakeholder["Stakeholder & scope check"]
         gap_analyst["gap-analyst"]
-        snippet_author["Browse bundle / author\nper-task snippet metadata\n(promptctl show-bundle —\nbrowse don't render)"]
-        write_planctl["Write to planctl\nepic + tasks + specs\n(+ snippets/bundles per spec)"]
+        write_planctl["Write to planctl\nepic + tasks + specs"]
         validate_plan["planctl validate"]
         offer["Offer next steps\n(/plan:work, /plan:deps, refine)"]
 
         plan_init --> scouts
         scouts --> gap_analyst
         gap_analyst --> stakeholder
-        stakeholder --> snippet_author
-        snippet_author --> write_planctl
+        stakeholder --> write_planctl
         write_planctl --> validate_plan
         validate_plan --> offer
     end

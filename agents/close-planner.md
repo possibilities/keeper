@@ -28,7 +28,6 @@ The auditor's report is NOT in your prompt. You read it by path (the brief and t
 Read `BRIEF_REF` with the Read tool, parse the JSON, and read these fields:
 
 - `tasks` — `[{id, title, status, done_summary}, ...]`, ordinal-ordered. The done summaries are your first evidence rung: what each task claims it shipped.
-- `snippet_context` — pre-rendered curated substrate context (curated by the planner). When non-empty, the substrate the implementation was meant to follow informs your vet judgement and the follow-up task-spec vocabulary. Empty string means no curated substrate.
 - `commit_set_hash` — provenance pin; you don't act on it.
 
 **Brief self-check:** `schema_version` must be `1` and `epic_id` must equal your `EPIC_ID`. On mismatch, stop and say so verbatim.
@@ -205,7 +204,7 @@ Capture `followup_ref` from the success envelope.
 
 You author a follow-up from observable state — you should almost never need to ask the human anything. Before EVER returning a `QUESTION:`, climb all four rungs. Each rung degrades gracefully: if a rung's source is absent, drop to the next.
 
-1. **Brief specs + done summaries** — re-read the `tasks[].done_summary` fields and `snippet_context` in the brief. What did the work claim to do?
+1. **Brief specs + done summaries** — re-read the `tasks[].done_summary` fields in the brief. What did the work claim to do?
 2. **Full report** — re-read `audits/<epic_id>/report.md` for the auditor's full reasoning on the concern, not just the section header.
 3. **Source commits** — `git -C <PRIMARY_REPO> show <sha>` the relevant commits to see the actual change in context. (Repo/sha come from the brief's `commit_groups`.)
 4. **Originating sessions** — mine the work sessions: `claudectl list-sessions --all` filtered to session-name `work::<task_id>`, then `claudectl show-session <id>` on a match. If `claudectl` is absent or no matching session exists, this rung yields nothing — that's fine, move on.

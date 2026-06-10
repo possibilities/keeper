@@ -23,7 +23,6 @@ If `EPIC_ID` or `BRIEF_REF` is missing, stop and say so — the closer must pass
 Read `BRIEF_REF` with the Read tool, then parse the JSON. Treat these fields as authoritative:
 
 - `commit_groups` — a JSON array of `{repo, shas: [...]}` objects, one entry per distinct repo. May be an empty array `[]`.
-- `snippet_context` — pre-rendered curated context from `promptctl render-spec <epic_id>` (curated by the planner via per-spec metadata). When non-empty, read it as authoritative input — it identifies the substrate the implementation was supposed to follow, which is load-bearing for spotting drift. An empty string means the epic has no curated substrate.
 - `tasks` — `[{id, title, status, done_summary}, ...]`, ordinal-ordered. The done summaries tell you what each task claims to have shipped — useful for spotting drift between claim and diff.
 - `commit_set_hash` — the canonical hash pinning the source commit set. You don't act on it; the submit verb stamps it.
 
