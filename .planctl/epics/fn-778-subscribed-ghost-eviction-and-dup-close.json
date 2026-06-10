@@ -4,7 +4,7 @@
   "created_at": "2026-06-10T20:53:20.268523Z",
   "depends_on_epics": [],
   "id": "fn-778-subscribed-ghost-eviction-and-dup-close",
-  "last_validated_at": "2026-06-10T20:53:20.524936Z",
+  "last_validated_at": "2026-06-10T23:05:48.513532Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": true,
   "snippets": [],
@@ -13,5 +13,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T23:04:49.757374Z"
+  "updated_at": "2026-06-10T23:05:48.387189Z"
 }

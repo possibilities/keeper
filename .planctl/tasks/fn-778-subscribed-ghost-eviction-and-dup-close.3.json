@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T23:05:48.387189Z",
+  "depends_on": [],
+  "epic": "fn-778-subscribed-ghost-eviction-and-dup-close",
+  "id": "fn-778-subscribed-ghost-eviction-and-dup-close.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "max",
+  "title": "Fix UsageDeleted crash loop",
+  "updated_at": "2026-06-10T23:05:48.387189Z"
+}
