@@ -34,5 +34,5 @@ Three surfaces stating overlapping rules invites wording drift — echo the epic
 - [ ] No edited passage contains ticket/epic ids or backward-facing phrasing
 
 ## Done summary
-
+Added negative comment/doc-bloat pressure to the close cycle and scouts: close-planner culls comment-only remedies unless the comment states a non-obvious constraint; quality-auditor gained a Comment/doc bloat finding category with named findings and a protected-comment guard; docs-gap-scout permits prune/delete gap entries and flags bloated CLAUDE.md.
 ## Evidence
