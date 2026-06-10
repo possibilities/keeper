@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T14:58:42.058026Z",
+  "depends_on": [
+    "fn-770-armed-aware-per-root-dispatch-mutex.1"
+  ],
+  "epic": "fn-770-armed-aware-per-root-dispatch-mutex",
+  "id": "fn-770-armed-aware-per-root-dispatch-mutex.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "board readiness armed-agreement",
+  "updated_at": "2026-06-10T14:58:42.058026Z"
+}
