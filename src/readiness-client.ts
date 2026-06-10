@@ -102,6 +102,7 @@
  *     SIGINT-prints stay per-script).
  */
 
+import { computeEligibleEpics } from "./armed-closure";
 import { getCollection } from "./collections";
 import {
   encodeFrame,
@@ -161,6 +162,15 @@ const DEAD_LETTERS_PAGE_LIMIT = 0;
 // stagger). Page limit 0 streams them all; readiness needs every row to hold
 // the right launch-window mutex slots.
 const PENDING_DISPATCHES_PAGE_LIMIT = 0;
+// fn-770 — the autopilot `mode` singleton (`autopilot_state`, schema v62) and
+// the per-epic armed PRESENCE set (`armed_epics`). Both feed the board/CLI
+// readiness pass's armed-mode eligibility so the displayed per-root winner
+// matches what the reconciler actually dispatches. `autopilot_state` is a
+// singleton (one row); `armed_epics` is bounded by the human's armed selection.
+// Page limit 0 streams every row — readiness needs the complete armed set to
+// compute the transitive-upstream closure.
+const AUTOPILOT_STATE_PAGE_LIMIT = 0;
+const ARMED_EPICS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -1559,6 +1569,8 @@ export function subscribeReadiness(
   const gitSubId = `${idPrefix}-git`;
   const deadLettersSubId = `${idPrefix}-dead-letters`;
   const pendingDispatchesSubId = `${idPrefix}-pending-dispatches`;
+  const autopilotStateSubId = `${idPrefix}-autopilot-state`;
+  const armedEpicsSubId = `${idPrefix}-armed-epics`;
   const epics = makeState("epics", epicsSubId, "epic_id", {
     type: "query",
     collection: "epics",
@@ -1647,6 +1659,32 @@ export function subscribeReadiness(
       limit: PENDING_DISPATCHES_PAGE_LIMIT,
     },
   );
+  // fn-770: the `autopilot_state` singleton carries the `mode` enum (`'yolo'` |
+  // `'armed'`) and `armed_epics` is the per-epic armed PRESENCE set. Together
+  // they let the board/CLI readiness pass mirror the reconciler's armed-mode
+  // eligibility (`computeEligibleEpics`) so the displayed per-root winner agrees
+  // with what the daemon dispatches — closing the board≠dispatch divergence the
+  // server-side fix (task .1) leaves on the read path. Mirrors
+  // `loadReconcileSnapshot` (autopilot-worker.ts): a MISSING / malformed `mode`
+  // defaults to `'yolo'` (the work-everything baseline, matching the column's
+  // `DEFAULT 'yolo'`), in which case no eligibility filtering happens at all.
+  const autopilotState = makeState(
+    "autopilot_state",
+    autopilotStateSubId,
+    "id",
+    {
+      type: "query",
+      collection: "autopilot_state",
+      id: autopilotStateSubId,
+      limit: AUTOPILOT_STATE_PAGE_LIMIT,
+    },
+  );
+  const armedEpics = makeState("armed_epics", armedEpicsSubId, "epic_id", {
+    type: "query",
+    collection: "armed_epics",
+    id: armedEpicsSubId,
+    limit: ARMED_EPICS_PAGE_LIMIT,
+  });
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1654,6 +1692,8 @@ export function subscribeReadiness(
     gitStatus,
     deadLetters,
     pendingDispatches,
+    autopilotState,
+    armedEpics,
   ];
 
   function emitSnapshotIfReady(): void {
@@ -1667,7 +1707,18 @@ export function subscribeReadiness(
       // flip the `dispatch-pending` occupancy on the pre-paint blank state.
       // An empty `pending_dispatches` still produces a `result` frame with
       // `rows: []`, so this clears in the common (no in-flight launch) case.
-      !pendingDispatches.gotResult
+      !pendingDispatches.gotResult ||
+      // fn-770: gate on the two armed-mode collections too — a partial snapshot
+      // must not paint a frame with no `mode`/armed data, which would briefly
+      // show the WRONG per-root winner (the legacy single-pass picks the
+      // earliest-sorted ready row) until the armed state arrives. The
+      // `autopilot_state` singleton always produces a `result` (its row exists
+      // post-migrate / defaults `'yolo'`); an empty `armed_epics` still
+      // produces a `result` frame with `rows: []` so this clears in the common
+      // (nothing-armed) case — the `dead_letters` / `pending_dispatches`
+      // precedent.
+      !autopilotState.gotResult ||
+      !armedEpics.gotResult
     ) {
       return;
     }
@@ -1733,6 +1784,36 @@ export function subscribeReadiness(
     const pendingDispatchesTyped = projectPendingDispatches(
       projectRows<Record<string, unknown>>(pendingDispatches),
     );
+    // fn-770: mirror the reconciler's `loadReconcileSnapshot` mode/armed read
+    // (autopilot-worker.ts) so the board's per-root winner matches what the
+    // daemon dispatches in `armed` mode. PROJECTION-PULL only — there's one
+    // source of truth (the wire projection), no cache. A missing / malformed
+    // `mode` scalar defaults to `'yolo'` (the work-everything baseline matching
+    // the column's `DEFAULT 'yolo'`).
+    const modeRaw = (
+      autopilotState.byId.get(autopilotState.order[0] ?? "") as
+        | { mode?: unknown }
+        | undefined
+    )?.mode;
+    const mode: "yolo" | "armed" = modeRaw === "armed" ? "armed" : "yolo";
+    // In `armed` mode, compute the eligible set (armed ∪ transitive upstream
+    // dep-closure) via the SAME `computeEligibleEpics` BFS the reconciler runs,
+    // seeded from the `armed_epics` presence rows. In `yolo` mode leave it
+    // `undefined` so `computeReadiness` takes the byte-identical legacy
+    // single-pass (no eligibility filtering) — matching the reconciler, which
+    // only threads the set through in `armed` mode.
+    let eligibleEpicIds: Set<string> | undefined;
+    if (mode === "armed") {
+      const armedIds = new Set<string>();
+      for (const id of armedEpics.order) {
+        armedIds.add(id);
+      }
+      const epicById = new Map<string, Epic>();
+      for (const epic of epicsTyped) {
+        epicById.set(epic.epic_id, epic);
+      }
+      eligibleEpicIds = computeEligibleEpics(armedIds, epicById);
+    }
     const readiness = computeReadiness(
       epicsTyped,
       jobsTyped,
@@ -1749,6 +1830,10 @@ export function subscribeReadiness(
       Math.floor(Date.now() / 1000),
       // fn-721: the launch-window occupancy set.
       pendingDispatchesTyped,
+      // fn-770: armed-mode eligibility (armed ∪ transitive upstreams) in
+      // `armed` mode, `undefined` in `yolo` (legacy single-pass). Makes the
+      // board's per-root tiebreak agree with the reconciler's dispatch.
+      eligibleEpicIds,
     );
     // `dead_letters` is a flat row stream — typed projection from
     // `state.rows` so the wire diff (each `result` re-snapshots `rows`)

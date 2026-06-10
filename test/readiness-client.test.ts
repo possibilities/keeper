@@ -181,6 +181,23 @@ function emptyResult(collection: string, id: string, rev = 1): ServerFrame {
   };
 }
 
+/** A `result` for any collection carrying explicit rows. */
+function rowsResult(
+  collection: string,
+  id: string,
+  rows: Record<string, unknown>[],
+  rev = 1,
+): ServerFrame {
+  return {
+    type: "result",
+    id,
+    collection,
+    rev,
+    total: rows.length,
+    rows,
+  };
+}
+
 function errorFrame(
   code: string,
   message: string,
@@ -201,7 +218,7 @@ function errorFrame(
 //     collections produce a result.
 // ---------------------------------------------------------------------------
 
-test("subscribeReadiness: first-paint gate withholds onSnapshot until all six collections have a result", () => {
+test("subscribeReadiness: first-paint gate withholds onSnapshot until all eight collections have a result", () => {
   const { factory, socketRef } = makeMockConnect();
   const snapshots: ReadinessClientSnapshot[] = [];
   const handle = subscribeReadiness({
@@ -216,17 +233,20 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all six co
     throw new Error("mock socket never installed");
   }
 
-  // Six initial queries fired on open — fn-626 widened the readiness
+  // Eight initial queries fired on open — fn-626 widened the readiness
   // composition with `git_status`; fn-643.5 added `dead_letters`; fn-721
-  // added `pending_dispatches` (the launch-window occupancy feed). fn-637's
-  // resolver-only completed-epics subscription was deleted by fn-637.4
-  // (predicate 9 and the board pill now read `epic.resolved_epic_deps` off
-  // the projection).
+  // added `pending_dispatches` (the launch-window occupancy feed); fn-770
+  // added `autopilot_state` + `armed_epics` (the armed-mode eligibility
+  // feeds). fn-637's resolver-only completed-epics subscription was deleted
+  // by fn-637.4 (predicate 9 and the board pill now read
+  // `epic.resolved_epic_deps` off the projection).
   const initial = sock.takeOutbound();
-  expect(initial).toHaveLength(6);
+  expect(initial).toHaveLength(8);
   expect(
     initial.map((f) => (f as { collection: string }).collection).sort(),
   ).toEqual([
+    "armed_epics",
+    "autopilot_state",
     "dead_letters",
     "epics",
     "git",
@@ -256,17 +276,28 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all six co
   expect(snapshots).toHaveLength(0);
 
   // Add `dead_letters` (empty result — the happy steady state): still
-  // missing `pending_dispatches`.
+  // missing `pending_dispatches`, `autopilot_state`, `armed_epics`.
   sock.deliver([emptyResult("dead_letters", "test-paintgate-dead-letters")]);
   expect(snapshots).toHaveLength(0);
 
-  // Add `pending_dispatches` (empty result — the common no-in-flight-launch
-  // case): gate clears, snapshot fires exactly once. The empty result is
-  // what clears the gate (the dead_letters precedent — an empty
-  // steady-state collection still produces a `result` frame).
+  // Add `pending_dispatches` (empty result): still missing the two fn-770
+  // armed-mode collections.
   sock.deliver([
     emptyResult("pending_dispatches", "test-paintgate-pending-dispatches"),
   ]);
+  expect(snapshots).toHaveLength(0);
+
+  // Add `autopilot_state` (empty result): still missing `armed_epics`.
+  sock.deliver([
+    emptyResult("autopilot_state", "test-paintgate-autopilot-state"),
+  ]);
+  expect(snapshots).toHaveLength(0);
+
+  // Add `armed_epics` (empty result — the common nothing-armed steady state):
+  // gate clears, snapshot fires exactly once. The empty result is what clears
+  // the gate (the dead_letters / pending_dispatches precedent — an empty
+  // steady-state collection still produces a `result` frame).
+  sock.deliver([emptyResult("armed_epics", "test-paintgate-armed-epics")]);
   expect(snapshots).toHaveLength(1);
   expect(snapshots[0]?.epics).toEqual([]);
   expect(snapshots[0]?.jobs.size).toBe(0);
@@ -299,10 +330,11 @@ test("subscribeReadiness: refetch fired while queryInFlight is coalesced into on
     throw new Error("mock socket never installed");
   }
 
-  // Discard the six initial queries (fn-626 added `git`; fn-637.4 deleted
+  // Discard the eight initial queries (fn-626 added `git`; fn-637.4 deleted
   // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`;
-  // fn-721 added `pending_dispatches`).
-  expect(sock.takeOutbound()).toHaveLength(6);
+  // fn-721 added `pending_dispatches`; fn-770 added `autopilot_state` +
+  // `armed_epics`).
+  expect(sock.takeOutbound()).toHaveLength(8);
 
   // BEFORE the `epics` result resolves the in-flight query, deliver TWO
   // `meta` nudges for `epics` — both should fold into one pending
@@ -366,6 +398,8 @@ test("subscribeReadiness: dispose() is idempotent — second call is a no-op", (
     emptyResult("git", "test-dispose-git"),
     emptyResult("dead_letters", "test-dispose-dead-letters"),
     emptyResult("pending_dispatches", "test-dispose-pending-dispatches"),
+    emptyResult("autopilot_state", "test-dispose-autopilot-state"),
+    emptyResult("armed_epics", "test-dispose-armed-epics"),
   ]);
   expect(snapshots).toHaveLength(1);
 
@@ -421,6 +455,8 @@ test("subscribeReadiness: dispose() terminate()s the socket (fn-750.3 leak fix)"
     emptyResult("git", "test-term-git"),
     emptyResult("dead_letters", "test-term-dead-letters"),
     emptyResult("pending_dispatches", "test-term-pending-dispatches"),
+    emptyResult("autopilot_state", "test-term-autopilot-state"),
+    emptyResult("armed_epics", "test-term-armed-epics"),
   ]);
 
   expect(sock.terminated ?? 0).toBe(0);
@@ -453,6 +489,8 @@ test("subscribeReadiness: a post-paint disconnect terminate()s the dropped socke
     emptyResult("git", "test-term2-git"),
     emptyResult("dead_letters", "test-term2-dead-letters"),
     emptyResult("pending_dispatches", "test-term2-pending-dispatches"),
+    emptyResult("autopilot_state", "test-term2-autopilot-state"),
+    emptyResult("armed_epics", "test-term2-armed-epics"),
   ]);
   expect(sock1.terminated ?? 0).toBe(0);
 
@@ -514,10 +552,11 @@ test("subscribeReadiness: terminal error frame (no prior result) invokes onFatal
       throw new Error("mock socket never installed");
     }
 
-    // Burn the six initial queries (fn-626 added `git`; fn-637.4 deleted
+    // Burn the eight initial queries (fn-626 added `git`; fn-637.4 deleted
     // the completed-epics resolver-only sub; fn-643.5 added `dead_letters`;
-    // fn-721 added `pending_dispatches`).
-    expect(sock.takeOutbound()).toHaveLength(6);
+    // fn-721 added `pending_dispatches`; fn-770 added `autopilot_state` +
+    // `armed_epics`).
+    expect(sock.takeOutbound()).toHaveLength(8);
     // The helper installed its steady-poll `setInterval` in `open`; the
     // spy must have observed it.
     expect(pending.size).toBe(1);
@@ -1113,11 +1152,14 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
 
     const slowAt1s = lifecycle.filter((e) => e.event === "query_slow_flight");
-    // Six collections all in flight, all crossed 1 s — six emits (fn-626
+    // Eight collections all in flight, all crossed 1 s — eight emits (fn-626
     // added `git`; fn-637.4 deleted the completed-epics resolver-only sub;
-    // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`).
-    expect(slowAt1s).toHaveLength(6);
+    // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`;
+    // fn-770 added `autopilot_state` + `armed_epics`).
+    expect(slowAt1s).toHaveLength(8);
     expect(slowAt1s.map((e) => e.detail?.collection).sort()).toEqual([
+      "armed_epics",
+      "autopilot_state",
       "dead_letters",
       "epics",
       "git",
@@ -1131,7 +1173,7 @@ test("subscribeReadiness: Path B (1–5 s) — slow-flight latches once, timeout
     harness.pollHandler()();
     expect(
       lifecycle.filter((e) => e.event === "query_slow_flight"),
-    ).toHaveLength(6);
+    ).toHaveLength(8);
 
     // t=5001 ms: timeout fires. Single-flight `reconnecting` guard means
     // exactly one `query_timeout` event for the FIRST stuck state.
@@ -1255,10 +1297,11 @@ test("subscribeReadiness: Path C — reconnect clears slow-flight state, fresh w
     const slowCountAfter = lifecycle.filter(
       (e) => e.event === "query_slow_flight",
     ).length;
-    // Six collections in the new window, six fresh emits (fn-626 added
+    // Eight collections in the new window, eight fresh emits (fn-626 added
     // `git`; fn-637.4 deleted the completed-epics resolver-only sub;
-    // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`).
-    expect(slowCountAfter - slowCountBefore).toBe(6);
+    // fn-643.5 added `dead_letters`; fn-721 added `pending_dispatches`;
+    // fn-770 added `autopilot_state` + `armed_epics`).
+    expect(slowCountAfter - slowCountBefore).toBe(8);
 
     handle.dispose();
   } finally {
@@ -1407,9 +1450,9 @@ test("subscribeReadiness: id-first routing — patch{id} triggers a refetch on t
     throw new Error("mock socket never installed");
   }
 
-  // Resolve the six initial queries so subsequent in-flight tracking
+  // Resolve the eight initial queries so subsequent in-flight tracking
   // is clean — refetch coalesce is exercised here, not first-paint.
-  expect(sock.takeOutbound()).toHaveLength(6);
+  expect(sock.takeOutbound()).toHaveLength(8);
   sock.deliver([
     emptyResult("epics", "test-idroute-epics"),
     emptyResult("jobs", "test-idroute-jobs"),
@@ -1417,6 +1460,8 @@ test("subscribeReadiness: id-first routing — patch{id} triggers a refetch on t
     emptyResult("git", "test-idroute-git"),
     emptyResult("dead_letters", "test-idroute-dead-letters"),
     emptyResult("pending_dispatches", "test-idroute-pending-dispatches"),
+    emptyResult("autopilot_state", "test-idroute-autopilot-state"),
+    emptyResult("armed_epics", "test-idroute-armed-epics"),
   ]);
   sock.takeOutbound();
 
@@ -1448,7 +1493,7 @@ test("subscribeReadiness: legacy server compat — patch with no id falls back t
     throw new Error("mock socket never installed");
   }
 
-  expect(sock.takeOutbound()).toHaveLength(6);
+  expect(sock.takeOutbound()).toHaveLength(8);
   sock.deliver([
     emptyResult("epics", "test-legacy-epics"),
     emptyResult("jobs", "test-legacy-jobs"),
@@ -1456,6 +1501,8 @@ test("subscribeReadiness: legacy server compat — patch with no id falls back t
     emptyResult("git", "test-legacy-git"),
     emptyResult("dead_letters", "test-legacy-dead-letters"),
     emptyResult("pending_dispatches", "test-legacy-pending-dispatches"),
+    emptyResult("autopilot_state", "test-legacy-autopilot-state"),
+    emptyResult("armed_epics", "test-legacy-armed-epics"),
   ]);
   sock.takeOutbound();
 
@@ -1539,9 +1586,15 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
     throw new Error("mock socket #1 never installed");
   }
   const initial1 = sock1.takeOutbound();
-  expect(initial1).toHaveLength(6);
+  expect(initial1).toHaveLength(8);
   const initialIds1 = initial1.map((f) => (f as { id: string }).id).sort();
+  // fn-770: the reconnect re-primes the two new armed-mode subscriptions
+  // (`autopilot_state` + `armed_epics`) with the SAME stable subIds — they're
+  // constants in subscribeReadiness, built once into the `states[]` list and
+  // re-issued verbatim on every reconnect.
   expect(initialIds1).toEqual([
+    "test-reconnect-armed-epics",
+    "test-reconnect-autopilot-state",
     "test-reconnect-dead-letters",
     "test-reconnect-epics",
     "test-reconnect-git",
@@ -1561,7 +1614,7 @@ test("subscribeReadiness: reconnect re-issues queries with the same stable subId
     throw new Error("mock socket #2 never installed");
   }
   const initial2 = sock2.takeOutbound();
-  expect(initial2).toHaveLength(6);
+  expect(initial2).toHaveLength(8);
   const initialIds2 = initial2.map((f) => (f as { id: string }).id).sort();
   // EXACT same subIds — they're constants in subscribeReadiness, and the
   // states[] list is built once at the top of the helper and reused
@@ -1870,6 +1923,172 @@ test("subscribeCollection: onRows hands back a fresh array copy per render", () 
     job_id: "j1",
     state: "working",
     last_event_id: 10,
+  });
+
+  handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// fn-770: armed-mode eligibility — the board/CLI readiness view agrees with
+// the reconciler. The client subscribes to `autopilot_state` + `armed_epics`,
+// computes the eligible set (mirroring `loadReconcileSnapshot`, default
+// `'yolo'`), and threads it into `computeReadiness` so the displayed per-root
+// winner matches what the daemon dispatches. The pure two-pass mutex logic is
+// covered in `test/readiness.test.ts`; these tests prove the CLIENT plumbing —
+// wire rows → eligible set → `computeReadiness` param — closes the
+// board≠dispatch divergence the server-side fix (task .1) leaves on the read
+// path.
+// ---------------------------------------------------------------------------
+
+/**
+ * A wire `epics` row carrying ONE ready task on `project_dir`. Mirrors the
+ * `makeEpic`/`makeTask` defaults in `test/readiness.test.ts` (status open,
+ * worker_phase open, runtime todo, no deps/jobs) so the pure readiness pass
+ * yields a `ready` task — the substrate for the per-root tiebreak.
+ */
+function readyEpicRow(
+  epicId: string,
+  epicNumber: number,
+  sortPath: string,
+  projectDir: string,
+): Record<string, unknown> {
+  return {
+    epic_id: epicId,
+    epic_number: epicNumber,
+    title: "epic",
+    project_dir: projectDir,
+    status: "open",
+    last_event_id: 0,
+    updated_at: 0,
+    depends_on_epics: [],
+    tasks: [
+      {
+        task_id: `${epicId}.1`,
+        epic_id: epicId,
+        task_number: 1,
+        title: "task",
+        target_repo: null,
+        tier: null,
+        worker_phase: "open",
+        runtime_status: "todo",
+        depends_on: [],
+        jobs: [],
+      },
+    ],
+    jobs: [],
+    job_links: [],
+    created_by_closer_of: null,
+    sort_path: sortPath,
+    queue_jump: 0,
+    resolved_epic_deps: null,
+    last_validated_at: "2026-05-24T00:00:00Z",
+  };
+}
+
+// Two open epics sharing `/repo`; fn-1 sorts first (would win the legacy
+// single-pass per-root slot), fn-2 sorts second.
+function sharedRootEpicRows(): Record<string, unknown>[] {
+  return [
+    readyEpicRow("fn-1-foo", 1, "000001", "/repo"),
+    readyEpicRow("fn-2-bar", 2, "000002", "/repo"),
+  ];
+}
+
+test("subscribeReadiness: armed mode — the eligible epic wins the shared-root slot the board displays (matches the reconciler)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-armed",
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  sock.takeOutbound();
+  // Deliver the full first-paint frame: the shared-root pair, an
+  // `autopilot_state` row in `armed` mode, and an `armed_epics` row arming
+  // ONLY fn-2 (the later-sorted epic). Empty results for the other four
+  // collections clear the gate.
+  sock.deliver([
+    rowsResult("epics", "test-armed-epics", sharedRootEpicRows()),
+    emptyResult("jobs", "test-armed-jobs"),
+    emptyResult("subagent_invocations", "test-armed-subagent-invocations"),
+    emptyResult("git", "test-armed-git"),
+    emptyResult("dead_letters", "test-armed-dead-letters"),
+    emptyResult("pending_dispatches", "test-armed-pending-dispatches"),
+    rowsResult("autopilot_state", "test-armed-autopilot-state", [
+      { id: 1, mode: "armed", last_event_id: 5 },
+    ]),
+    rowsResult("armed_epics", "test-armed-armed-epics", [
+      { epic_id: "fn-2-bar", last_event_id: 6 },
+    ]),
+  ]);
+
+  expect(snapshots).toHaveLength(1);
+  const readiness = snapshots[0]?.readiness;
+  if (!readiness) {
+    throw new Error("no readiness snapshot");
+  }
+  // The eligible (armed) fn-2 wins the per-root slot; the earlier-sorted
+  // ineligible fn-1 is demoted to `single-task-per-root`. This is the same
+  // winner the reconciler dispatches — board≠dispatch divergence closed.
+  expect(readiness.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+  expect(readiness.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "single-task-per-root" },
+  });
+
+  handle.dispose();
+});
+
+test("subscribeReadiness: empty autopilot_state defaults to yolo — no eligibility filtering (earliest-sorted ready wins)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-yolo",
+    onSnapshot: (snap) => snapshots.push(snap),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+
+  sock.takeOutbound();
+  // Same shared-root pair, but `autopilot_state` is EMPTY (no row) → the
+  // client defaults `mode` to `'yolo'` and passes `undefined` (no eligible
+  // set), so `computeReadiness` takes the legacy single-pass. `armed_epics`
+  // arms fn-2 — but in yolo that's IGNORED (eligibility isn't consulted), so
+  // the earlier-sorted fn-1 still wins, byte-for-byte the pre-fn-770 board.
+  sock.deliver([
+    rowsResult("epics", "test-yolo-epics", sharedRootEpicRows()),
+    emptyResult("jobs", "test-yolo-jobs"),
+    emptyResult("subagent_invocations", "test-yolo-subagent-invocations"),
+    emptyResult("git", "test-yolo-git"),
+    emptyResult("dead_letters", "test-yolo-dead-letters"),
+    emptyResult("pending_dispatches", "test-yolo-pending-dispatches"),
+    emptyResult("autopilot_state", "test-yolo-autopilot-state"),
+    rowsResult("armed_epics", "test-yolo-armed-epics", [
+      { epic_id: "fn-2-bar", last_event_id: 6 },
+    ]),
+  ]);
+
+  expect(snapshots).toHaveLength(1);
+  const readiness = snapshots[0]?.readiness;
+  if (!readiness) {
+    throw new Error("no readiness snapshot");
+  }
+  // yolo single-pass: the earliest-sorted ready row (fn-1) claims `/repo`,
+  // fn-2 is demoted — arming is not consulted.
+  expect(readiness.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(readiness.perTask.get("fn-2-bar.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "single-task-per-root" },
   });
 
   handle.dispose();
