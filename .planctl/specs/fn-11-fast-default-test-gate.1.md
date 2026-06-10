@@ -63,5 +63,5 @@ one-liner from the epic investigation works).
 - [ ] No changes under planctl/
 
 ## Done summary
-
+Built the subprocess-free fast test gate: autouse conftest stubs (PLANCTL_ACTOR, brief render-spec, .planctl/ dirty-probe disk walk, empty roots discovery, sketch-refs, bare .git/ skeleton) with per-marker opt-outs, plus --run-slow + a skip-by-default collection hook that buckets real_git/integration/wire/real_promptctl tests as visible skips. New tests/test_stub_contracts.py pins the render-spec and dirty-probe stubs against the real binaries under --run-slow. Proof slice (test_set_snippets_bundles) spawns zero subprocesses; the broader-suite triage is task 2.
 ## Evidence
