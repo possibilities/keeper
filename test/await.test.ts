@@ -123,6 +123,11 @@ function resultFrame(
   };
 }
 
+/** An `error` frame — used by fn-775 to inject a `max_connections` cap reject. */
+function errorFrame(code: string, message: string, rev = 0): ServerFrame {
+  return { type: "error", code, message, rev };
+}
+
 /**
  * Deliver a single readiness "all-eight-empty" frame batch under the
  * given idPrefix so the helper's first-paint gate clears. fn-721 added
@@ -1389,6 +1394,85 @@ test("epic complete: present-then-drop + re-query MISS → deleted exit 4", asyn
   const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
   expect(failed).toBeDefined();
   expect(failed).toContain("reason=deleted");
+});
+
+// ---------------------------------------------------------------------------
+// fn-775 — a cap reject DURING the scope-exempt re-query never commits
+// `deleted`. The one-shot rides the retryable cap-reject path under a bounded
+// give-up; when the cap persists it resolves INDETERMINATE → no exit 4, the
+// slot stays armed, and the next steady-poll re-triggers the re-query.
+// ---------------------------------------------------------------------------
+
+test("epic complete: present-then-drop + re-query CAP-REJECT → indeterminate (no deleted, no exit 4)", async () => {
+  const { factory, socketRef, socketsAll } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+  // Inject the clock the re-query one-shot's bounded give-up measures against.
+  let clock = 0;
+  h.deps.now = () => clock;
+
+  await runAndCatch(singleArgs("complete", "fn-1-foo", "epic"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // Establish presence so the drop is a present-then-absent transition.
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({}));
+  expect(h.stdout[0]).toContain("armed");
+
+  // Drop the epic off the board → fires the deleted-disambiguation re-query.
+  sock.deliver([resultFrame("epics", `${idPrefix}-epics`, [], 2)]);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  const reSock = socketsAll.sockets[1];
+  if (!reSock) {
+    throw new Error("re-query socket not opened");
+  }
+  reSock.takeOutbound();
+
+  // The re-query is CAP-REJECTED (server full): error frame then close. This
+  // must NOT fire the one-shot's onFatal as terminal — it rides the reconnect
+  // path. Advance the clock past the bounded re-query deadline, then bounce so
+  // the one-shot's loop-top give-up fires → onFatal({code:"unreachable"}) →
+  // resolves INDETERMINATE.
+  reSock.deliver([errorFrame("max_connections", "server full", 0)]);
+  clock = 7000; // > REQUERY_GIVE_UP_MS (6000)
+  reSock.closeFromServer();
+  await new Promise<void>((r) => setTimeout(r, 0));
+  await Promise.resolve();
+  await Promise.resolve();
+
+  // NO `deleted` committed: exit code stays null (still armed), no failed line.
+  expect(h.exitCode).toBeNull();
+  const failed = h.stdout.find((l) => l.includes("[keeper-await] failed"));
+  expect(failed).toBeUndefined();
+
+  // A later steady-poll re-triggers the re-query; this time it HITS (the epic
+  // really did complete). The verdict resolves → `met`, exit 0. Proves the
+  // indeterminate verdict only deferred, never wedged.
+  sock.deliver([resultFrame("epics", `${idPrefix}-epics`, [], 3)]);
+  await Promise.resolve();
+  await Promise.resolve();
+  const reSock2 = socketsAll.sockets[2];
+  if (!reSock2) {
+    throw new Error("second re-query socket not opened");
+  }
+  reSock2.takeOutbound();
+  reSock2.deliver([
+    resultFrame("epics", `await-requery-${process.pid}-epics`, [
+      makeEpicRow({}),
+    ]),
+  ]);
+  await Promise.resolve();
+  await Promise.resolve();
+
+  expect(h.exitCode).toBe(0);
+  const met = h.stdout.find((l) => l.includes("[keeper-await] met"));
+  expect(met).toBeDefined();
 });
 
 // ---------------------------------------------------------------------------

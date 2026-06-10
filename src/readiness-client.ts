@@ -15,7 +15,9 @@
  *   frame (and on coalesced refetch results). No `computeReadiness` handoff;
  *   the caller renders whatever shape it wants from raw rows. Terminal-error
  *   semantics: an `error` frame BEFORE the first `result` is unrecoverable
- *   (the query is malformed); after at least one `result`, errors are
+ *   ONLY when its `code` is NOT in `TRANSIENT_SERVER_CODES` (the query is
+ *   malformed); a transient code (e.g. `max_connections`, fn-775) rides the
+ *   reconnect loop even pre-paint. After at least one `result`, errors are
  *   transient and the next refetch can recover.
  * - `subscribeReadiness({ ... })` — five-collection composition used by the
  *   full-readiness consumers (`scripts/board.ts`, `scripts/autopilot.ts`).
@@ -174,6 +176,27 @@ const ARMED_EPICS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
+// fn-775: cap-reject (capacity-transient) backoff base. A `max_connections`
+// reject is NOT a socket-level connect failure — the connection was ACCEPTED,
+// then the server served an error frame and closed. Reconnecting immediately
+// worsens the exact contended resource (the daemon's connection cap), and a
+// whole await fleet rejected in the same incident retries in lockstep — so cap
+// rejects ride a LONGER base with FULL jitter (`random(0, capped_window)`),
+// distinct from the deterministic 250ms→5s socket-level ladder. Both stay under
+// the shared `MAX_BACKOFF_MS` ceiling.
+const TRANSIENT_BACKOFF_BASE_MS = 2500;
+/**
+ * fn-775: server error codes that are CAPACITY-TRANSIENT, not query-terminal.
+ * A `max_connections` reject is the daemon saying "full right now," which the
+ * existing capped-backoff reconnect loop recovers from — it is NOT a malformed
+ * query a reconnect can't fix. An error frame whose `code` is in this set is
+ * routed to teardown + reconnect (never `isTerminal` / `onFatal`), preserving
+ * the fn-757 reconnect-forever contract. Exported as a NAMED allowlist so the
+ * retryable contract is documented in one place and the terminal path stays
+ * narrow (only codes ABSENT from this set are unrecoverable pre-paint). Lives in
+ * the client (not the CLI) because `subscribeMulti` owns the reconnect loop.
+ */
+export const TRANSIENT_SERVER_CODES = new Set<string>(["max_connections"]);
 /**
  * Slow-flight + hard-deadline thresholds for an in-flight `query`. The
  * steady-poll loop (`pollAll`, fires every `POLL_MS`) walks every state
@@ -743,6 +766,19 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
 
   let currentSock: ReadinessSocket | null = null;
   let attempt = 0;
+  // fn-775: latched true on the first `result` of the CURRENT connection
+  // window; gates the `attempt = 0` backoff reset so it keys off PROOF OF
+  // SERVICE (served), not socket `open` (accepted). Reset on every teardown so
+  // each fresh connection re-arms it. The fn-757 reconnect-forever contract is
+  // unaffected — this only governs the backoff DELAY, never whether to retry.
+  let servedThisConnection = false;
+  // fn-775: latched when the live connection was torn down by a
+  // capacity-transient server reject (a `TRANSIENT_SERVER_CODES` error frame —
+  // the daemon ACCEPTED then served "full"). The close-driven reconnect reads
+  // this to back off under the LONGER cap-reject regime instead of the
+  // immediate close-path retry; cleared as the first act of the next reconnect
+  // (so a socket-level reject after a cap reject reverts to the 250ms ladder).
+  let pendingTransientReject = false;
   let shuttingDown = false;
   /**
    * Single-flight guard for `triggerReconnect`. Two simultaneously-stuck
@@ -1067,6 +1103,19 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         everPainted = true;
         clearGiveUp();
       }
+      // fn-775: reset the backoff counter on SERVED (first `result` of THIS
+      // connection window), NOT on socket `open` (accepted). An
+      // accept-then-cap-reject server defeats an open-keyed reset — the counter
+      // would pin at 0 and re-dispatch with no growing backoff. Keying off
+      // proof-of-service (the first result; `servedThisConnection` latches it,
+      // reset on every teardown) makes each accept-then-reject cycle grow the
+      // delay. Independent of `giveUpPolicy` so the board/TUI (no policy)
+      // resets too; the legitimate daemon-bounce fast-reconnect still resets
+      // here on its first post-reconnect result.
+      if (!servedThisConnection) {
+        servedThisConnection = true;
+        attempt = 0;
+      }
       onResult(state);
       if (state.refetchDirty) {
         state.refetchDirty = false;
@@ -1123,6 +1172,18 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         message: frame.message,
       };
       emit("error", detail);
+      // fn-775: a CAPACITY-TRANSIENT reject (`max_connections`, the daemon at
+      // its connection cap) is NOT terminal — a reconnect, once a slot frees,
+      // recovers. The server serves the error frame then `socket.end()`s, so we
+      // do NOT call `teardownConnection` / `onFatal` here: the close handler
+      // owns teardown + the close-driven reconnect (avoiding a double
+      // teardown), and we latch `pendingTransientReject` so that reconnect
+      // backs off under the longer cap-reject regime instead of hammering the
+      // already-contended cap. Bypasses `isTerminal` entirely — even pre-paint.
+      if (frame.code !== undefined && TRANSIENT_SERVER_CODES.has(frame.code)) {
+        pendingTransientReject = true;
+        return;
+      }
       // A bad_frame / unknown_collection on our own query is terminal — a
       // reconnect can't fix a malformed query. Terminal predicate per
       // helper: for a single collection, true iff `!gotResult`; for the
@@ -1190,6 +1251,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       destroySocket(currentSock);
     }
     currentSock = null;
+    // fn-775: re-arm the served latch so the NEXT connection's first result
+    // resets the backoff counter (and an accept-then-reject window, which tears
+    // down WITHOUT ever serving, leaves it false → no spurious reset).
+    servedThisConnection = false;
     for (const s of states) {
       s.order.length = 0;
       s.byId.clear();
@@ -1211,7 +1276,10 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     const buffer = new LineBuffer();
     await connect(sockPath, {
       open(sock) {
-        attempt = 0;
+        // fn-775: do NOT reset `attempt` here. Socket `open` means ACCEPTED,
+        // not SERVED — an accept-then-cap-reject server would pin the backoff
+        // at 0 and re-dispatch with no growing delay. The reset moved to the
+        // first `result` (`servedThisConnection`), keyed on proof of service.
         reconnecting = false;
         currentSock = sock;
         emit("connected", { sock: sockPath });
@@ -1281,6 +1349,52 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     });
   }
 
+  /**
+   * fn-775: compute the next backoff delay. Two regimes, both capped at
+   * `MAX_BACKOFF_MS`:
+   *   - socket-level connect reject (`transient=false`): the deterministic
+   *     250ms→5s doubling ladder (`INITIAL_BACKOFF_MS * 2^(attempt-1)`).
+   *   - capacity-transient cap reject (`transient=true`): a LONGER base
+   *     (`TRANSIENT_BACKOFF_BASE_MS`) with FULL jitter —
+   *     `random(0, min(MAX_BACKOFF_MS, base * 2^(attempt-1)))`. Full jitter
+   *     de-correlates a fleet of awaits rejected in the same incident so they
+   *     don't retry in lockstep and re-saturate the cap.
+   * Caller bumps `attempt` first so `attempt` is >= 1 here.
+   */
+  function computeBackoffDelay(transient: boolean): number {
+    if (transient) {
+      const window = Math.min(
+        TRANSIENT_BACKOFF_BASE_MS * 2 ** (attempt - 1),
+        MAX_BACKOFF_MS,
+      );
+      return Math.floor(Math.random() * window);
+    }
+    return Math.min(INITIAL_BACKOFF_MS * 2 ** (attempt - 1), MAX_BACKOFF_MS);
+  }
+
+  /**
+   * Bump `attempt`, emit one `waiting` lifecycle event, and sleep the computed
+   * backoff. Shared by the synchronous-reject catch path (socket-level) and the
+   * close-driven cap-reject path (transient). Uses a directly-cancellable
+   * timeout so `dispose()` during backoff doesn't leak the timer.
+   */
+  async function backoffSleep(
+    reason: string,
+    transient: boolean,
+  ): Promise<void> {
+    attempt += 1;
+    const delay = computeBackoffDelay(transient);
+    emit("waiting", { attempt, retry_in_ms: delay, reason });
+    await new Promise<void>((resolve) => {
+      sleepResolve = resolve;
+      reconnectTimer = setTimeout(() => {
+        reconnectTimer = null;
+        sleepResolve = null;
+        resolve();
+      }, delay);
+    });
+  }
+
   async function connectWithRetry(): Promise<void> {
     emit("connecting", { sock: sockPath });
     while (!shuttingDown) {
@@ -1292,6 +1406,26 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       if (shuttingDown) {
         return;
       }
+      // fn-775: the close-driven reconnect after a CAP REJECT (`socket.end()`
+      // followed the error frame) lands here. Back off under the longer
+      // cap-reject regime BEFORE re-attempting — an immediate retry hammers the
+      // already-contended connection cap. Clear the latch first so a subsequent
+      // SOCKET-level reject reverts to the 250ms ladder. The give-up deadline
+      // (checked above + on the next iteration after the sleep advances the
+      // clock) still bounds a never-painted await wedged at the cap.
+      if (pendingTransientReject) {
+        pendingTransientReject = false;
+        await backoffSleep("max_connections", true);
+        // Re-check shutdown/give-up after the (possibly long) sleep before
+        // attempting the connection.
+        if (shuttingDown) {
+          return;
+        }
+        checkGiveUp();
+        if (shuttingDown) {
+          return;
+        }
+      }
       try {
         await connectOnce();
         return;
@@ -1299,27 +1433,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         if (shuttingDown) {
           return;
         }
-        attempt += 1;
-        const delay = Math.min(
-          INITIAL_BACKOFF_MS * 2 ** (attempt - 1),
-          MAX_BACKOFF_MS,
-        );
-        emit("waiting", {
-          attempt,
-          retry_in_ms: delay,
-          reason: (err as Error).message,
-        });
-        // Use a directly-cancellable timeout so `dispose()` during backoff
-        // doesn't leak the timer. `Bun.sleep` returns a Promise we can't
-        // resolve from outside.
-        await new Promise<void>((resolve) => {
-          sleepResolve = resolve;
-          reconnectTimer = setTimeout(() => {
-            reconnectTimer = null;
-            sleepResolve = null;
-            resolve();
-          }, delay);
-        });
+        await backoffSleep((err as Error).message, false);
       }
     }
   }

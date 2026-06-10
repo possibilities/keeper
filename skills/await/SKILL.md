@@ -137,7 +137,7 @@ Refuse to wire Monitor in any of these cases — the event will never fire:
 - **Already complete** (for `condition=complete`):
   - Task: `task.runtime_status == "done"` (fn-756 — completion is the
     worker-done signal alone; no approval gate).
-  - Epic: `epic.status == "closed"`.
+  - Epic: `epic.status == "done"`.
   Tell the user the target has already popped off the board — there's
   nothing to await — and offer to just run the follow-up now.
 
@@ -226,7 +226,7 @@ Reasons + exit codes:
 | `failed reason=not-found …` | 1 | Planctl id absent at startup (pre-check missed it). | Tell the user, do NOT run the follow-up. |
 | `failed reason=no-git-root …` | 1 | A `git-clean` / `agents-idle` condition was requested but the cwd isn't inside a git worktree. | Tell the user; the wait can't be evaluated. Do NOT run the follow-up. |
 | `failed reason=no-match …` | 1 | A `monitor-running` selector matched no running monitor in this session at arm time (likely armed the same turn the monitor launched, or the selector is wrong). | Tell the user nothing matched; suggest re-arming after the monitor shows in `keeper jobs`, or fixing the selector. Do NOT run the follow-up. |
-| `failed reason=connect …` | 1 | A terminal query-shape error keeperd rejected (a malformed/unrecoverable query). | Tell the user the query was rejected; the wait can't proceed. |
+| `failed reason=connect …` | 1 | A terminal query-SHAPE error keeperd rejected — a malformed/unrecoverable query (e.g. `bad_frame` / `unknown_collection`). NOT a capacity condition: a `max_connections` cap reject is transient and rides the reconnect loop (it never surfaces here). | Tell the user the query was rejected; the wait can't proceed. |
 | `failed reason=unreachable …` | 1 | **Only with `--connect-timeout`.** keeperd stayed unreachable past that opt-in deadline (down / mid-bounce / half-up — never painted a first snapshot). Distinct from `connect`. Carries `advice=`. A plain await (no flag) NEVER emits this — it reconnects forever. | Tell the user the daemon is down. To block THROUGH the bounce, drop `--connect-timeout` (a plain await waits forever), or `keeper await server-up` first then re-arm once it's back. Do NOT run the follow-up. |
 | `failed reason=deleted …` | 4 | Planctl target was on board, vanished, re-query miss. | Tell the user the target was deleted; do NOT run the follow-up. |
 | `failed reason=timeout …` | 3 | Monitor wall-clock deadline hit. | Tell the user it timed out; ask whether to extend or move on. |

@@ -46,8 +46,9 @@
  *     supplied board-scoped inputs. The command tracks prior-presence
  *     across its subscribe stream and, on a present-then-absent
  *     transition, runs a scope-exempt re-query against the daemon to
- *     disambiguate: re-query hit AND `(epic.approval='approved' AND
- *     epic.status='closed')` (or the task equivalent) → completed; miss
+ *     disambiguate: re-query hit AND the target dropped off the
+ *     default-visible board (a planctl epic terminalizes as
+ *     `status=='done'` — there is no `closed` status) → completed; miss
  *     → `deleted`. This module exposes a `priorPresence` input so the
  *     command can express that decision through the pure surface
  *     without the module doing I/O.
@@ -412,9 +413,9 @@ export interface AwaitInputs {
  *       priorPresence === true  → `met` if (condition='complete' AND
  *                                   reQueryHit), else `deleted`
  *       (rationale: an epic "popping off the board" because it transitioned
- *       to `approval='approved'` + `status='closed'` is the spec's positive
- *       completion signal; the command's scope-exempt re-query
- *       disambiguates that from a real deletion.)
+ *       to `status=='done'` (the terminal planctl status — there is no
+ *       `closed`) is the spec's positive completion signal; the command's
+ *       scope-exempt re-query disambiguates that from a real deletion.)
  *
  *   - Target present in `inputs.epics`:
  *       condition='complete'  → read the raw field:

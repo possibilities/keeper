@@ -56,6 +56,7 @@ import {
   type SocketHandlers,
   subscribeCollection,
   subscribeReadiness,
+  TRANSIENT_SERVER_CODES,
 } from "../src/readiness-client";
 
 // ---------------------------------------------------------------------------
@@ -2092,4 +2093,442 @@ test("subscribeReadiness: empty autopilot_state defaults to yolo — no eligibil
   });
 
   handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
+// fn-775 — cap-reject (`max_connections`) is RETRYABLE, not terminal.
+//
+// A `max_connections` error frame is a CAPACITY-TRANSIENT reject: keeperd
+// ACCEPTS the connection, serves the error frame, then `socket.end()`s. The
+// pre-fix terminal gate (`!gotResult` pre-paint) classified this as a
+// malformed-query terminal and fired `onFatal` (rendered `reason=connect`).
+// The fix: route a `TRANSIENT_SERVER_CODES` code to teardown + capped-backoff
+// reconnect, never `onFatal`. The reset is keyed off SERVED (first result),
+// not ACCEPTED (open), so an accept-then-cap-reject cycle GROWS the backoff.
+// ---------------------------------------------------------------------------
+
+/**
+ * A multi-connect factory: each `connect()` mints a fresh `MockSocket`, fires
+ * `open` synchronously, and records the socket in `sockets`. Mirrors
+ * `makeMockConnect` but keeps EVERY socket (one per reconnect) so the
+ * cap-reject reconnect chain is inspectable. `connectCount` tracks attempts.
+ */
+function makeMultiConnect(): {
+  factory: ConnectFactory;
+  sockets: MockSocket[];
+  connectCount: () => number;
+} {
+  const sockets: MockSocket[] = [];
+  let count = 0;
+  const factory: ConnectFactory = async (_path, handlers) => {
+    count += 1;
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const sock: MockSocket = {
+      outbound: [],
+      ended: false,
+      terminated: 0,
+      handlers,
+      write(data: string): void {
+        sock.outbound.push(data);
+      },
+      end(): void {
+        sock.ended = true;
+        resolveDone?.();
+        resolveDone = null;
+      },
+      terminate(): void {
+        sock.terminated = (sock.terminated ?? 0) + 1;
+        sock.ended = true;
+        resolveDone?.();
+        resolveDone = null;
+      },
+      deliver(frames: ServerFrame[]): void {
+        const payload = frames.map(encodeFrame).join("");
+        sock.handlers.data(sock, Buffer.from(payload, "utf8"));
+      },
+      closeFromServer(): void {
+        sock.handlers.close();
+        resolveDone?.();
+        resolveDone = null;
+      },
+      takeOutbound(): unknown[] {
+        const parsed = sock.outbound.map((line) => {
+          const trimmed = line.endsWith("\n") ? line.slice(0, -1) : line;
+          return JSON.parse(trimmed);
+        });
+        sock.outbound.length = 0;
+        return parsed;
+      },
+    };
+    sockets.push(sock);
+    handlers.open(sock);
+    await done;
+    return sock;
+  };
+  return { factory, sockets, connectCount: () => count };
+}
+
+test("fn-775: TRANSIENT_SERVER_CODES contains max_connections (the retryable allowlist)", () => {
+  // The named allowlist documents the retryable contract in one place. A
+  // capacity reject is in it; a malformed-query code is NOT.
+  expect(TRANSIENT_SERVER_CODES.has("max_connections")).toBe(true);
+  expect(TRANSIENT_SERVER_CODES.has("bad_frame")).toBe(false);
+  expect(TRANSIENT_SERVER_CODES.has("unknown_collection")).toBe(false);
+});
+
+test("fn-775: pre-paint max_connections frame → reconnect, never onFatal (no reason=connect)", async () => {
+  // Mirrors the connect-rejections-are-not-terminal contract (the
+  // capped-backoff test's `onFatal must not fire`) for a CAP reject delivered
+  // as a pre-paint error frame. The server serves the frame then closes; the
+  // close-driven reconnect must re-enter, and `onFatal` must never fire.
+  // Stub Math.random → 0 so the cap-reject full-jitter backoff resolves to a
+  // 0ms delay; the reconnect then fires on the next timer tick deterministically
+  // (no multi-second wait on the real 2500ms base).
+  const realRandom = Math.random;
+  Math.random = () => 0;
+  try {
+    const { factory, sockets, connectCount } = makeMultiConnect();
+    let fatalCalls = 0;
+    const lifecycle: { event: string; detail?: Record<string, unknown> }[] = [];
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-cap-reject",
+      onSnapshot: () => {
+        throw new Error("onSnapshot must not fire — no result ever delivered");
+      },
+      onLifecycle: (event, detail) => lifecycle.push({ event, detail }),
+      onFatal: () => {
+        fatalCalls += 1;
+      },
+      connect: factory,
+    });
+
+    const sock1 = sockets[0];
+    if (!sock1) {
+      throw new Error("mock socket #1 never installed");
+    }
+    expect(sock1.takeOutbound()).toHaveLength(8);
+
+    // Deliver the cap reject BEFORE any collection produced a result, then the
+    // server `socket.end()`s — simulate that with `closeFromServer()`.
+    sock1.deliver([errorFrame("max_connections", "server full", 0)]);
+    // The transient branch did NOT consult isTerminal / onFatal.
+    expect(fatalCalls).toBe(0);
+    sock1.closeFromServer();
+
+    // Drain the close-driven reconnect: it schedules ONE cap-reject backoff
+    // sleep (0ms here), then re-attempts. Flush the timer + the connect.
+    await new Promise<void>((resolve) => setTimeout(resolve, 25));
+
+    // A fresh connection was opened — the reconnect-forever contract held.
+    expect(connectCount()).toBeGreaterThanOrEqual(2);
+    // onFatal never fired (no `reason=connect` would be rendered downstream).
+    expect(fatalCalls).toBe(0);
+    // The lifecycle saw the error (always surfaced) AND a `waiting` backoff.
+    expect(lifecycle.filter((e) => e.event === "error")).toHaveLength(1);
+    expect(
+      lifecycle.filter((e) => e.event === "waiting").length,
+    ).toBeGreaterThanOrEqual(1);
+
+    handle.dispose();
+  } finally {
+    Math.random = realRandom;
+  }
+});
+
+test("fn-775: accept-then-cap-reject cycles GROW the backoff (no 250ms pin) and stay under the cap", async () => {
+  // The reset moved from `open` to first `result`. An accept-then-cap-reject
+  // server never serves a result, so `attempt` must climb across cycles —
+  // the cap-reject regime (base 2500ms, full jitter) grows then caps at
+  // MAX_BACKOFF_MS. Stub Math.random to 0.5 so each delay is a deterministic
+  // half of its window: floor(0.5 * min(2500*2^(n-1), 5000)) →
+  // 1250, 2500, 2500, … (window 2500, 5000, 5000-capped). The growth from
+  // 1250→2500 proves no 250ms / no-backoff pin; the cap proves the ceiling.
+  const observed: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  const realRandom = Math.random;
+  Math.random = () => 0.5;
+  globalThis.setTimeout = ((
+    handler: Parameters<typeof realSetTimeout>[0],
+    timeout?: number,
+    ...rest: unknown[]
+  ) => {
+    if (typeof timeout === "number" && timeout > 0) {
+      observed.push(timeout);
+      queueMicrotask(() => {
+        (handler as () => void)();
+      });
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }
+    return realSetTimeout(handler as () => void, timeout, ...rest);
+  }) as typeof setTimeout;
+
+  try {
+    // A factory that, on EVERY open, synchronously delivers a cap reject and
+    // then closes — an accept-then-reject server. After a few cycles we stop
+    // delivering (hand back a never-resolving open) so the loop idles.
+    const cycles = 4;
+    let opened = 0;
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const factory: ConnectFactory = async (_path, handlers) => {
+      opened += 1;
+      const thisOpen = opened;
+      let resolveSock: (() => void) | null = null;
+      const sockDone = new Promise<void>((resolve) => {
+        resolveSock = resolve;
+      });
+      const sock: MockSocket = {
+        outbound: [],
+        ended: false,
+        handlers,
+        write() {
+          /* swallow */
+        },
+        end() {
+          sock.ended = true;
+          resolveSock?.();
+          resolveSock = null;
+        },
+        deliver(frames: ServerFrame[]): void {
+          const payload = frames.map(encodeFrame).join("");
+          sock.handlers.data(sock, Buffer.from(payload, "utf8"));
+        },
+        closeFromServer(): void {
+          sock.handlers.close();
+          resolveSock?.();
+          resolveSock = null;
+        },
+        takeOutbound(): unknown[] {
+          return [];
+        },
+      };
+      handlers.open(sock);
+      if (thisOpen <= cycles) {
+        // accept-then-reject: serve the cap frame, then close.
+        sock.deliver([errorFrame("max_connections", "full", 0)]);
+        sock.closeFromServer();
+      } else {
+        // Signal the test and idle.
+        resolveDone?.();
+        resolveDone = null;
+      }
+      await sockDone;
+      return sock;
+    };
+
+    let fatalCalls = 0;
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix: "test-cap-grow",
+      onSnapshot: () => {
+        throw new Error("no result is ever served");
+      },
+      onFatal: () => {
+        fatalCalls += 1;
+      },
+      connect: factory,
+    });
+
+    await done;
+    // Let the final idle open settle.
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+    // onFatal never fired — every cycle was a retryable cap reject.
+    expect(fatalCalls).toBe(0);
+    // One backoff sleep per cap-reject cycle.
+    expect(observed.length).toBe(cycles);
+    // Deterministic (Math.random=0.5) growing-then-capped sequence:
+    //   window = min(2500 * 2^(attempt-1), 5000); delay = floor(0.5*window)
+    //   attempt 1 → 1250, 2 → 2500, 3 → 2500 (capped), 4 → 2500 (capped)
+    expect(observed).toEqual([1250, 2500, 2500, 2500]);
+    // The first delay is far above the 250ms socket-level base — proof the
+    // cap-reject regime (longer base) is in effect, not the socket ladder and
+    // not a no-backoff close-path retry.
+    expect(observed[0]).toBeGreaterThan(250);
+    // Every delay stays under the shared ceiling.
+    for (const d of observed) {
+      expect(d).toBeLessThanOrEqual(5000);
+    }
+
+    handle.dispose();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    Math.random = realRandom;
+  }
+});
+
+test("fn-775: a malformed-query error frame still terminates (onFatal), cap path is narrow", () => {
+  // The narrow-terminal companion: a NON-transient pre-paint error frame
+  // (`unknown_collection`) is STILL terminal → `onFatal` fires exactly once.
+  // The transient allowlist did not widen the recoverable path.
+  const { factory, socketRef } = makeMockConnect();
+  const fatals: FatalError[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-malformed-still-terminal",
+    onSnapshot: () => {
+      throw new Error("onSnapshot must not fire on a pre-handshake error");
+    },
+    onFatal: (err) => fatals.push(err),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  expect(sock.takeOutbound()).toHaveLength(8);
+
+  sock.deliver([errorFrame("unknown_collection", "no such collection", 0)]);
+
+  expect(fatals).toHaveLength(1);
+  expect(fatals[0]?.code).toBe("unknown_collection");
+  // The malformed-query branch tore the socket down (terminal path).
+  expect(sock.ended).toBe(true);
+
+  handle.dispose();
+});
+
+test("fn-775: attempt resets on first RESULT (served), not on socket open (accepted)", async () => {
+  // After a cap-reject grows `attempt`, a SERVED first result must reset it
+  // so the legitimate daemon-bounce fast-reconnect isn't penalized. Drive:
+  // open → cap reject (attempt→1, backoff) → reconnect → open → SERVE all
+  // eight collections (attempt resets) → close → reconnect. If the reset
+  // keyed off `open` it would already be 0 after the first reconnect's open;
+  // we prove it's the RESULT by checking the backoff after a SECOND cap reject
+  // restarts from the base, not from a stale higher attempt.
+  const observed: number[] = [];
+  const realSetTimeout = globalThis.setTimeout;
+  const realRandom = Math.random;
+  Math.random = () => 0.5;
+  globalThis.setTimeout = ((
+    handler: Parameters<typeof realSetTimeout>[0],
+    timeout?: number,
+    ...rest: unknown[]
+  ) => {
+    if (typeof timeout === "number" && timeout > 0) {
+      observed.push(timeout);
+      queueMicrotask(() => {
+        (handler as () => void)();
+      });
+      return 0 as unknown as ReturnType<typeof setTimeout>;
+    }
+    return realSetTimeout(handler as () => void, timeout, ...rest);
+  }) as typeof setTimeout;
+
+  try {
+    const ids = [
+      "epics",
+      "jobs",
+      "subagent-invocations",
+      "git",
+      "dead-letters",
+      "pending-dispatches",
+      "autopilot-state",
+      "armed-epics",
+    ];
+    const collections = [
+      "epics",
+      "jobs",
+      "subagent_invocations",
+      "git",
+      "dead_letters",
+      "pending_dispatches",
+      "autopilot_state",
+      "armed_epics",
+    ];
+    const idPrefix = "test-cap-served-reset";
+    // Script per open: 1 = cap reject, 2 = serve-all-then-close,
+    // 3 = cap reject (attempt should restart from base if reset happened),
+    // 4+ = idle.
+    let opened = 0;
+    let resolveDone: (() => void) | null = null;
+    const done = new Promise<void>((resolve) => {
+      resolveDone = resolve;
+    });
+    const factory: ConnectFactory = async (_path, handlers) => {
+      opened += 1;
+      const thisOpen = opened;
+      let resolveSock: (() => void) | null = null;
+      const sockDone = new Promise<void>((resolve) => {
+        resolveSock = resolve;
+      });
+      const sock: MockSocket = {
+        outbound: [],
+        ended: false,
+        handlers,
+        write() {
+          /* swallow */
+        },
+        end() {
+          sock.ended = true;
+          resolveSock?.();
+          resolveSock = null;
+        },
+        deliver(frames: ServerFrame[]): void {
+          const payload = frames.map(encodeFrame).join("");
+          sock.handlers.data(sock, Buffer.from(payload, "utf8"));
+        },
+        closeFromServer(): void {
+          sock.handlers.close();
+          resolveSock?.();
+          resolveSock = null;
+        },
+        takeOutbound(): unknown[] {
+          return [];
+        },
+      };
+      handlers.open(sock);
+      if (thisOpen === 1 || thisOpen === 3) {
+        sock.deliver([errorFrame("max_connections", "full", 0)]);
+        sock.closeFromServer();
+      } else if (thisOpen === 2) {
+        // Serve every collection → first-paint → attempt resets to 0.
+        sock.deliver(
+          ids.map((id, k) =>
+            emptyResult(collections[k] as string, `${idPrefix}-${id}`),
+          ),
+        );
+        // Then drop so the loop reconnects into open #3.
+        sock.closeFromServer();
+      } else {
+        resolveDone?.();
+        resolveDone = null;
+      }
+      await sockDone;
+      return sock;
+    };
+
+    const handle = subscribeReadiness({
+      sockPath: "/tmp/keeper-mock.sock",
+      idPrefix,
+      onSnapshot: () => {
+        /* first-paint fires here; we only care about backoff reset */
+      },
+      connect: factory,
+    });
+
+    await done;
+    await new Promise<void>((resolve) => queueMicrotask(resolve));
+
+    // Two cap rejects → two backoff sleeps (opens #1 and #3). The serve at
+    // open #2 produced NO backoff (no reject) and reset attempt. So BOTH
+    // sleeps must be the attempt-1 base delay (1250 with Math.random=0.5).
+    // If the reset had keyed off `open`, the post-serve cap reject's attempt
+    // would still be 1 too — but the discriminating failure is the OTHER
+    // direction: WITHOUT any served reset (open-keyed only would NOT reset on
+    // the non-painting cap cycles), the second sleep would be the attempt-2
+    // delay (2500). Observing 1250 twice proves the served result reset it.
+    expect(observed).toEqual([1250, 1250]);
+
+    handle.dispose();
+  } finally {
+    globalThis.setTimeout = realSetTimeout;
+    Math.random = realRandom;
+  }
 });

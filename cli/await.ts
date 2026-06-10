@@ -244,6 +244,30 @@ export interface ParsedArgs {
   sock: string;
 }
 
+/**
+ * fn-775: the bounded give-up deadline for a scope-exempt re-query one-shot.
+ * The re-query rides the same retryable-cap-reject path as the main
+ * subscriptions (a `max_connections` reject reconnects rather than firing
+ * `onFatal`), but a one-shot CANNOT reconnect-forever — it must resolve so
+ * `evaluate()` can proceed. So it carries a short give-up deadline: if a cap
+ * reject keeps it unpainted past this window, the give-up driver fires
+ * `onFatal({code:"unreachable"})` and the one-shot resolves INDETERMINATE
+ * (never `deleted`). The next steady-poll absent-transition re-triggers the
+ * re-query, so a transient cap squeeze defers rather than committing a false
+ * deletion. Modest (a few capped backoffs' worth) so a genuinely-down daemon
+ * doesn't stall the verdict for long.
+ */
+const REQUERY_GIVE_UP_MS = 6000;
+
+/**
+ * fn-775: scope-exempt re-query verdict. `hit`/`miss` are confirmed
+ * present/absent; `indeterminate` means a `max_connections` cap reject kept
+ * the one-shot unpainted past its bounded deadline — the verifier could not
+ * confirm deletion, so the caller defers (stays armed) rather than committing
+ * a false `deleted`.
+ */
+type ReQueryOutcome = "hit" | "miss" | "indeterminate";
+
 /** Conditions that take exactly one planctl id positional. */
 const PLANCTL_CONDITIONS: ReadonlySet<string> = new Set([
   "complete",
@@ -1029,11 +1053,20 @@ export async function runAwait(
   // `result` lands. The helper provides its own first-paint gate; the
   // dispose inside `onRows` is safe because the helper's dispose is
   // idempotent.
-  const reQueryHit = async (epicIdToFetch: string): Promise<boolean> => {
-    return await new Promise<boolean>((resolve) => {
+  //
+  // fn-775: returns a TRI-STATE. `hit`/`miss` are the confirmed
+  // present/absent verdicts; `indeterminate` means the re-query could not
+  // confirm either — a `max_connections` cap reject kept it unpainted past
+  // `REQUERY_GIVE_UP_MS` (the give-up driver fires `onFatal({code:
+  // "unreachable"})`). An indeterminate verdict must NEVER commit `deleted` —
+  // the caller stays armed and defers to the next steady-poll re-trigger.
+  // A genuine malformed-query fatal still resolves `miss` (the prior `false`
+  // behavior — a query-shape error means the row really isn't fetchable here).
+  const reQueryHit = async (epicIdToFetch: string): Promise<ReQueryOutcome> => {
+    return await new Promise<ReQueryOutcome>((resolve) => {
       let resolved = false;
       let oneShotHandle: ReadinessClientHandle | null = null;
-      const finish = (hit: boolean): void => {
+      const finish = (outcome: ReQueryOutcome): void => {
         if (resolved) {
           return;
         }
@@ -1045,7 +1078,7 @@ export async function runAwait(
             // idempotent
           }
         }
-        resolve(hit);
+        resolve(outcome);
       };
       try {
         oneShotHandle = subscribeCollection({
@@ -1061,13 +1094,19 @@ export async function runAwait(
             // the epic survives. The caller (in onSnapshot) hands us
             // the appropriate `epicIdToFetch` and inspects the result
             // before deciding met-vs-deleted.
-            finish(rows.length > 0 && rows[0] !== undefined);
+            finish(rows.length > 0 && rows[0] !== undefined ? "hit" : "miss");
           },
-          onFatal: () => finish(false),
+          // fn-775: an `unreachable` fatal is the cap-reject give-up — resolve
+          // indeterminate (never `deleted`). Any other fatal is a genuine
+          // query-shape terminal → `miss` (the prior behavior).
+          onFatal: (err) =>
+            finish(err.code === "unreachable" ? "indeterminate" : "miss"),
+          giveUpPolicy: { deadlineMs: REQUERY_GIVE_UP_MS },
+          ...(deps.now === undefined ? {} : { now: deps.now }),
           ...(deps.connect === undefined ? {} : { connect: deps.connect }),
         });
       } catch {
-        finish(false);
+        finish("miss");
       }
     });
   };
@@ -1078,16 +1117,16 @@ export async function runAwait(
    * the same one-shot re-query and also walks the returned epic's
    * `tasks[]` array.
    */
-  const reQueryHitTask = async (taskId: string): Promise<boolean> => {
+  const reQueryHitTask = async (taskId: string): Promise<ReQueryOutcome> => {
     const dot = taskId.lastIndexOf(".");
     if (dot <= 0) {
-      return false;
+      return "miss";
     }
     const epicId = taskId.slice(0, dot);
-    return await new Promise<boolean>((resolve) => {
+    return await new Promise<ReQueryOutcome>((resolve) => {
       let resolved = false;
       let oneShotHandle: ReadinessClientHandle | null = null;
-      const finish = (hit: boolean): void => {
+      const finish = (outcome: ReQueryOutcome): void => {
         if (resolved) {
           return;
         }
@@ -1099,7 +1138,7 @@ export async function runAwait(
             // idempotent
           }
         }
-        resolve(hit);
+        resolve(outcome);
       };
       try {
         oneShotHandle = subscribeCollection({
@@ -1111,12 +1150,12 @@ export async function runAwait(
           onRows: (rows) => {
             const row = rows[0];
             if (row === undefined) {
-              finish(false);
+              finish("miss");
               return;
             }
             const tasksRaw = (row as { tasks?: unknown }).tasks;
             if (!Array.isArray(tasksRaw)) {
-              finish(false);
+              finish("miss");
               return;
             }
             for (const t of tasksRaw) {
@@ -1125,17 +1164,22 @@ export async function runAwait(
                 typeof t === "object" &&
                 (t as { task_id?: unknown }).task_id === taskId
               ) {
-                finish(true);
+                finish("hit");
                 return;
               }
             }
-            finish(false);
+            finish("miss");
           },
-          onFatal: () => finish(false),
+          // fn-775: cap-reject give-up → indeterminate (never `deleted`); any
+          // other fatal → `miss` (prior behavior). See `reQueryHit`.
+          onFatal: (err) =>
+            finish(err.code === "unreachable" ? "indeterminate" : "miss"),
+          giveUpPolicy: { deadlineMs: REQUERY_GIVE_UP_MS },
+          ...(deps.now === undefined ? {} : { now: deps.now }),
           ...(deps.connect === undefined ? {} : { connect: deps.connect }),
         });
       } catch {
-        finish(false);
+        finish("miss");
       }
     });
   };
@@ -1199,7 +1243,7 @@ export async function runAwait(
    * delivering the re-query result and asserting). Returns the raw hit
    * promise; the caller folds it into `evaluateAwaitCondition`.
    */
-  const reQueryForSlot = (slot: PlanctlSlotState): Promise<boolean> =>
+  const reQueryForSlot = (slot: PlanctlSlotState): Promise<ReQueryOutcome> =>
     slot.target.kind === "task"
       ? reQueryHitTask(slot.target.id)
       : reQueryHit(slot.target.id);
@@ -1387,21 +1431,40 @@ export async function runAwait(
         if (slot === undefined || slot.kind !== "planctl") {
           continue;
         }
-        let hit = false;
+        let outcome: ReQueryOutcome = "miss";
         try {
-          hit = await reQueryForSlot(slot);
+          outcome = await reQueryForSlot(slot);
         } catch {
-          hit = false;
+          outcome = "miss";
         }
         if (state.terminating) {
           return;
+        }
+        // fn-775: INDETERMINATE — the re-query couldn't confirm deletion (a
+        // `max_connections` cap reject exhausted its bounded retry). Do NOT
+        // commit `deleted`: hold the slot at its prior verdict (met if already
+        // latched, else waiting), stay armed, and let the next steady-poll
+        // absent-transition re-trigger the re-query once the cap frees. A
+        // verifier that can't check defers — it never converts "couldn't
+        // check" into a terminal `deleted`.
+        if (outcome === "indeterminate") {
+          const held: AwaitState = slot.met
+            ? { kind: "met" }
+            : {
+                kind: "waiting",
+                detail: "re-query indeterminate (cap reject)",
+              };
+          slot.lastEval = held;
+          logProgress(slot, held);
+          evals[i] = held;
+          continue;
         }
         const result = evaluateAwaitCondition(
           {
             epics: snap.epics as readonly Epic[],
             snapshot: snap.readiness,
             priorPresence: slot.everSeen,
-            reQueryHit: hit,
+            reQueryHit: outcome === "hit",
           },
           slot.target,
         );
