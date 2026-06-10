@@ -62,7 +62,7 @@ from contextlib import redirect_stdout
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 
 class CloseOutcome(str, Enum):
@@ -137,7 +137,7 @@ def _context_for_root(project_root: Path):
     )
 
 
-def _resolve_project(epic_id: str, project: str | None):
+def _resolve_project(project: str | None):
     """Resolve the owning project for *epic_id* (``--project`` or cwd-walk).
 
     Mirrors ``run_close_preflight``'s resolution: ``--project`` is an absolute
@@ -367,7 +367,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912 — single saga
         _emit_finalize_error("BAD_EPIC_ID", f"Invalid epic ID: {epic_id}")
 
     # 2. resolve project + load the epic.
-    ctx = _resolve_project(epic_id, project)
+    ctx = _resolve_project(project)
     epic_path = ctx.data_dir / "epics" / f"{epic_id}.json"
     if not epic_path.exists():
         _emit_finalize_error(
@@ -409,8 +409,8 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912 — single saga
 
     # 5. re-derive commit_set_hash FRESH; mismatch vs the verdict's stamp →
     #    STALE_ARTIFACTS (a commit landed after the audit). Refuse, never delete.
-    task_ids = [
-        t.get("id")
+    task_ids: list[str] = [
+        cast(str, t.get("id"))
         for t in sorted(
             load_tasks_for_epic(ctx, epic_id),
             key=lambda t: task_sort_key(t.get("id", "")),

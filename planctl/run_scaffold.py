@@ -1268,7 +1268,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         # ``data_dir/specs/<eid>.md`` — so we have NOT written any spec
         # file yet, and the integrity gate is the last point before the
         # first ``atomic_write*`` call.
-        integ_errors, _integ_warnings = check_epic_tree_in_memory(
+        integ_errors, _ = check_epic_tree_in_memory(
             epic_id,
             epic_def,
             in_mem_task_defs,

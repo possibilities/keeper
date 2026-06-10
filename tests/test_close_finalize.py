@@ -41,7 +41,7 @@ from .conftest import seed_epic
 # ---------------------------------------------------------------------------
 
 
-def _empty_set_hash(repo: Path) -> str:
+def _empty_set_hash() -> str:
     """The commit_set_hash finalize re-derives for an epic with no source commits.
 
     The seeded tasks carry no `Task:` trailer commits, so `find_commit_groups`
@@ -158,7 +158,7 @@ def test_closed_clean_empty_decisions(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Clean close", n_tasks=2)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(repo, epic_id, commit_set_hash=h, decisions=[])
 
@@ -175,7 +175,7 @@ def test_closed_clean_all_culled(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="All culled", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(
         repo,
@@ -196,7 +196,7 @@ def test_closed_clean_idempotent_rerun(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Clean idempotent", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(repo, epic_id, commit_set_hash=h, decisions=[])
 
@@ -217,7 +217,7 @@ def test_fatal_halt_does_not_close(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Fatal", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(
         repo,
@@ -246,7 +246,7 @@ def test_closed_with_followup_scaffolds_and_closes(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Needs followup", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(
         repo,
@@ -289,7 +289,7 @@ def test_preexisting_dependent_without_stamp_ignored(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Has innocent dependent", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(
         repo,
@@ -340,7 +340,7 @@ def test_closed_with_followup_idempotent_rerun(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Followup idempotent", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(
         repo,
@@ -370,7 +370,7 @@ def test_crash_resume_adopts_scaffolded_followup(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Crash resume", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     _seed_verdict(
         repo,
@@ -407,7 +407,7 @@ def test_partial_followup_stops_without_close(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Partial", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     # Two distinct kept ordinals → expected 2 follow-up tasks.
     _seed_verdict(
@@ -449,7 +449,7 @@ def test_stale_artifacts_refusal(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="Stale", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    fresh = _empty_set_hash(repo)
+    fresh = _empty_set_hash()
     _seed_brief(repo, epic_id, fresh)
     # Verdict stamped with a DIFFERENT hash → a commit landed after the audit.
     _seed_verdict(repo, epic_id, commit_set_hash="deadbeef" * 8, decisions=[])
@@ -469,7 +469,7 @@ def test_missing_verdict_fails_closed(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="No verdict", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    _seed_brief(repo, epic_id, _empty_set_hash(repo))
+    _seed_brief(repo, epic_id, _empty_set_hash())
     # No verdict.json written.
 
     r = _finalize(epic_id)
@@ -483,7 +483,7 @@ def test_missing_followup_fails_closed(planctl_git_repo):
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="No followup yaml", n_tasks=1)
     _mark_all_done(repo, task_ids)
-    h = _empty_set_hash(repo)
+    h = _empty_set_hash()
     _seed_brief(repo, epic_id, h)
     # Surviving decision but NO followup.yaml on disk → fail closed.
     _seed_verdict(
