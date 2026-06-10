@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T20:09:24.894447Z",
+  "depends_on": [],
+  "epic": "fn-777-slim-keeper-board-help-text",
+  "id": "fn-777-slim-keeper-board-help-text.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Restructure board help output",
+  "updated_at": "2026-06-10T20:09:24.894447Z"
+}
