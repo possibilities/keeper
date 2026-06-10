@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-768-strip-stale-approval-prose-from-keeper",
   "bundles": [],
+  "closer_done_at": "2026-06-10T03:04:49.258725Z",
   "created_at": "2026-06-10T01:53:14.166888Z",
   "depends_on_epics": [],
   "id": "fn-768-strip-stale-approval-prose-from-keeper",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Strip stale approval prose from keeper docs",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T02:07:09.135414Z"
+  "updated_at": "2026-06-10T03:04:49.258725Z"
 }
