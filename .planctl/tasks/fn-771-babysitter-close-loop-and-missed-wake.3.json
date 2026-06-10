@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T15:48:08.332265Z",
+  "depends_on": [
+    "fn-771-babysitter-close-loop-and-missed-wake.1",
+    "fn-771-babysitter-close-loop-and-missed-wake.2"
+  ],
+  "epic": "fn-771-babysitter-close-loop-and-missed-wake",
+  "id": "fn-771-babysitter-close-loop-and-missed-wake.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Recalibrate missed-wake sitter gate",
+  "updated_at": "2026-06-10T15:48:08.332265Z"
+}

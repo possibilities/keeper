@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T15:48:08.332265Z",
+  "depends_on": [],
+  "epic": "fn-771-babysitter-close-loop-and-missed-wake",
+  "id": "fn-771-babysitter-close-loop-and-missed-wake.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Close-loop detector in performance sitter",
+  "updated_at": "2026-06-10T15:48:08.332265Z"
+}
