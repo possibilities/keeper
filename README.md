@@ -857,9 +857,13 @@ collapses to plain stream output. Run any of them with
     RPC appends an `EpicArmed{epic_id, armed}` event (folded into the
     `armed_epics` presence table: `armed:true` → row present, `armed:false`
     → row deleted), same APPEND-ONLY/no-relay contract as `mode`. The
-    `epic_id` is appended UNCONDITIONALLY — no existence check — to dodge the
-    fold-lag race where a freshly-planned epic isn't yet in the `epics`
-    projection. In armed mode the banner shows `· N armed` (or `· nothing
+    `epic_id` is appended without an existence check to dodge the fold-lag
+    race where a freshly-planned epic isn't yet in the `epics` projection,
+    with ONE carve-out (fn-774): arming (`armed:true`) an epic already folded
+    to `status='done'` is REJECTED main-side — a completed epic can't be
+    (re)armed, and a `done` epic is definitionally folded so the fold-lag
+    tolerance is intact (`disarm` and a not-yet-folded arm both still append).
+    In armed mode the banner shows `· N armed` (or `· nothing
     armed` distinctly when the set is empty), and the `--- armed ---` section
     lists the explicitly-armed epic ids.
 

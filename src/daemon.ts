@@ -2173,14 +2173,39 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         // APPEND-ONLY — same NO-relay contract as the set-autopilot-mode
         // handler above: the reconciler re-reads the armed set from the
         // projection each cycle. The wire `epic_id` is a non-empty token
-        // (validated handler-side); main appends it UNCONDITIONALLY — no
-        // existence check — to dodge the fold-lag race where a freshly-planned
-        // epic isn't yet in the `epics` projection. The `$session_id` carries
-        // the epic id so a re-fold can correlate the event to its row without
-        // re-parsing the data blob.
+        // (validated handler-side); main appends it for the fold-lag race
+        // where a freshly-planned epic isn't yet in the `epics` projection.
+        // The `$session_id` carries the epic id so a re-fold can correlate the
+        // event to its row without re-parsing the data blob.
+        //
+        // fn-774 task .2 — ONE carve-out from the otherwise-unconditional
+        // append: an `armed:true` request against an epic that is PRESENT in
+        // the `epics` projection AND `status='done'` is REJECTED here, before
+        // the append, so the arm-after-done ordering hole the fold-prune alone
+        // can't reach is closed. The two untouched cases preserve fold-lag
+        // tolerance: `armed:false` (disarm) ALWAYS succeeds — you must be able
+        // to clear a stuck row — and an ABSENT `epics` row (not-yet-folded)
+        // is STILL allowed, because a `done` epic is definitionally folded, so
+        // this guard never rejects a legitimately-racing arm. The status read
+        // uses main's writer `db` (the worker-side handler is contractually
+        // forbidden a DB connection).
         const id = msg.id;
         let reply: SetEpicArmedResultMessage;
         try {
+          if (msg.armed) {
+            const epicRow = db
+              .query("SELECT status FROM epics WHERE epic_id = ?")
+              .get(msg.epic_id) as { status: string } | null;
+            if (epicRow && epicRow.status === "done") {
+              sw.postMessage({
+                type: "set-epic-armed-result",
+                id,
+                ok: false,
+                error: `cannot arm \`${msg.epic_id}\`: epic is already done`,
+              });
+              return;
+            }
+          }
           stmts.insertEvent.run({
             $ts: Date.now() / 1000,
             $session_id: msg.epic_id,

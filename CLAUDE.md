@@ -98,7 +98,14 @@ shape because a consumer reads it.
   write `jobs`/`epics`/etc directly. The fn-751 pair is APPEND-ONLY (no
   main→worker relay, unlike `set_autopilot_paused`): the level-triggered
   reconciler re-reads mode + armed from the projection each cycle, woken by the
-  fold's `data_version` bump. **`armed_epics` has a SECOND writer (fn-774):**
+  fold's `data_version` bump. **fn-774 task .2 adds ONE arm-time rejection** to
+  the otherwise-unconditional `set_epic_armed` append: an `armed:true` request
+  against an epic PRESENT in the `epics` projection AND `status='done'` is
+  refused main-side (writer-DB status read in `daemon.ts`) BEFORE the append —
+  closing the arm-after-done hole the fold-prune alone can't reach. `armed:false`
+  (disarm) and a not-yet-folded epic still append unconditionally, so the
+  fold-lag tolerance (and a `done` epic is definitionally folded) is intact.
+  **`armed_epics` has a SECOND writer (fn-774):**
   the `EpicSnapshot` fold prunes the row when an epic folds to `status='done'`
   (`epicIsCompleted`) — a completed epic can't stay armed. That's a fold-side
   lifecycle delete (NOT an RPC write), so the "RPC may write ONLY five surfaces"
@@ -239,7 +246,11 @@ upstream. The per-epic armed flag is a PRESENCE table (`armed_epics`): row prese
 = armed. Both are written via the `set_autopilot_mode` / `set_epic_armed` RPCs
 (synthetic `AutopilotMode` / `EpicArmed` events) and READ FROM THE PROJECTION each
 reconcile cycle — no relay, no `ReconcileState` cache — so they survive restart
-for free. **fn-774: the `EpicSnapshot` fold is a SECOND `armed_epics` writer** —
+for free. **fn-774 task .2:** `set_epic_armed` rejects an `armed:true` request
+against an epic already folded to `status='done'` (writer-DB status read in
+`daemon.ts`, before the append) — the arm-after-done guard the fold-prune can't
+reach; `disarm` and a not-yet-folded arm stay unconditional.
+**fn-774: the `EpicSnapshot` fold is a SECOND `armed_epics` writer** —
 when an epic folds to `status='done'` (`epicIsCompleted`) the fold prunes its
 `armed_epics` row, so a completed-while-armed epic drops off the armed set
 (reconcile closure + the `[armed]` board pill) instead of lingering. The prune

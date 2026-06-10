@@ -292,12 +292,18 @@ function validateSetEpicArmedParams(params: unknown): SetEpicArmedParams {
  * writable connection and pumps a wake (no relay — same level-triggered
  * re-read contract as {@link setAutopilotModeHandler}).
  *
- * NO existence validation on `epic_id`: the event is appended unconditionally
- * to avoid the fold-lag race where a freshly-planned epic isn't yet in the
- * `epics` projection but the human wants to arm it now. The reconciler reads
- * the armed set against the live projection each cycle, so an arm for an epic
- * that never materializes is a harmless no-op (it pulls in nothing). Returns
- * `{ ok: true, epic_id, armed }` once main has appended. Fn-751 task .3.
+ * NO existence validation on `epic_id`: the event is appended (almost)
+ * unconditionally to avoid the fold-lag race where a freshly-planned epic
+ * isn't yet in the `epics` projection but the human wants to arm it now. The
+ * reconciler reads the armed set against the live projection each cycle, so an
+ * arm for an epic that never materializes is a harmless no-op (it pulls in
+ * nothing). The SOLE rejection (fn-774 task .2, enforced main-side where the
+ * writer DB lives): an `armed:true` request against an epic that is PRESENT
+ * and `status='done'` is refused — a completed epic can't be (re)armed, and a
+ * `done` epic is definitionally folded so the fold-lag tolerance above is
+ * untouched (`armed:false` and a not-yet-folded epic both still append).
+ * Returns `{ ok: true, epic_id, armed }` once main has appended. Fn-751 task
+ * .3.
  */
 export async function setEpicArmedHandler(
   params: unknown,

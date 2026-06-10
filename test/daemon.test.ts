@@ -2830,6 +2830,108 @@ test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence 
   );
 }, 30_000);
 
+test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded arm and done-disarm", async () => {
+  await withInProcessDaemon(
+    async ({ dbPath, sockPath }) => {
+      // Seed two epics through the LIVE fold pipeline (the wake-worker drains
+      // these synthetic EpicSnapshots into the `epics` projection): one `done`,
+      // one `open`. A writer connection mints the events; the daemon folds.
+      const writer = openDb(dbPath);
+      insertPlanSnapshot(writer.stmts, "EpicSnapshot", "fn-90-done", 1, {
+        epic_number: 90,
+        title: "Already done",
+        project_dir: "/Users/mike/code/keeper",
+        status: "done",
+      });
+      insertPlanSnapshot(writer.stmts, "EpicSnapshot", "fn-91-open", 2, {
+        epic_number: 91,
+        title: "Still open",
+        project_dir: "/Users/mike/code/keeper",
+        status: "open",
+      });
+      writer.db.close();
+
+      const reader = openDb(dbPath, { readonly: true }).db;
+      // Wait for BOTH epic rows to fold so the guard's status read is stable.
+      const folded = await retryUntil(() => {
+        const done = reader
+          .query("SELECT status FROM epics WHERE epic_id = ?")
+          .get("fn-90-done") as { status: string } | null;
+        const open = reader
+          .query("SELECT status FROM epics WHERE epic_id = ?")
+          .get("fn-91-open") as { status: string } | null;
+        return done?.status === "done" && open?.status === "open" ? true : null;
+      }, 10_000);
+      expect(folded).toBe(true);
+
+      // 1) arm a `done` epic → rejected (rpc_failed), no EpicArmed appended,
+      //    `armed_epics` stays empty for it.
+      const armDone = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "arm-done",
+        method: "set_epic_armed",
+        params: { epic_id: "fn-90-done", armed: true },
+      });
+      expect(armDone.type).toBe("error");
+      expect((armDone as { code: string }).code).toBe("rpc_failed");
+      expect((armDone as { message: string }).message).toContain(
+        "already done",
+      );
+      expect(
+        reader
+          .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
+          .get("fn-90-done"),
+      ).toBeNull();
+
+      // 2) arm an `open` epic → still appends + arms (unchanged behavior).
+      const armOpen = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "arm-open",
+        method: "set_epic_armed",
+        params: { epic_id: "fn-91-open", armed: true },
+      });
+      expect(armOpen.type).toBe("rpc_result");
+      const openArmed = await retryUntil(() => {
+        const row = reader
+          .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
+          .get("fn-91-open") as { epic_id: string } | null;
+        return row ?? null;
+      }, 10_000);
+      expect(openArmed).not.toBeNull();
+
+      // 3) arm a not-yet-folded epic (no `epics` row) → still allowed
+      //    (fold-lag tolerance: an absent row is NOT a `done` row).
+      const armUnfolded = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "arm-unfolded",
+        method: "set_epic_armed",
+        params: { epic_id: "fn-999-never-planned", armed: true },
+      });
+      expect(armUnfolded.type).toBe("rpc_result");
+      const unfoldedArmed = await retryUntil(() => {
+        const row = reader
+          .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
+          .get("fn-999-never-planned") as { epic_id: string } | null;
+        return row ?? null;
+      }, 10_000);
+      expect(unfoldedArmed).not.toBeNull();
+
+      // 4) disarm a `done` epic → ALWAYS allowed (the guard gates only
+      //    `armed:true`; a disarm must clear a stuck row regardless of status).
+      const disarmDone = await rpcRoundTrip(sockPath, {
+        type: "rpc",
+        id: "disarm-done",
+        method: "set_epic_armed",
+        params: { epic_id: "fn-90-done", armed: false },
+      });
+      expect(disarmDone.type).toBe("rpc_result");
+
+      reader.close();
+    },
+    { workers: ["wake", "server"] },
+  );
+}, 30_000);
+
 // ---------------------------------------------------------------------------
 // fn-749 task .1 — worker-set selector
 // ---------------------------------------------------------------------------
