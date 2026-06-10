@@ -58,5 +58,5 @@ gates green at the chosen config.
 - [ ] Any pruning names each removed test and the value lost
 
 ## Done summary
-
+Fast gate runs serially (dropped -n auto from addopts): for a near-subprocess-free suite, xdist worker bring-up dominates and serial is the measured-fastest stable shape (serial ties -n 2, beats -n auto under load). Spawns down ~9x to 249 (239 git/7 python/3 planctl) from the cited 2,299. Fast gate green 576 passed/174 skipped; full --run-slow green 748 passed/2 skipped. No restamp-matrix pruning: gap to <5s is load-induced (clean -n auto baseline was 20s at load 14), not test-count, and pruning would drop coverage for no measurable gain.
 ## Evidence
