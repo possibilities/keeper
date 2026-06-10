@@ -34,5 +34,5 @@ Per verb: happy path persists + envelope shape; reject paths (bad JSON, schema v
 - [ ] `uv run pytest tests/test_audit_submit.py tests/test_verdict_submit.py tests/test_followup_submit.py -q` green
 
 ## Done summary
-
+Added audit/verdict/followup submit verbs: three nested commit-free submit verbs persist close-phase artifacts under audits/<epic_id>/ stamped with the brief's commit_set_hash; verdict schema + cross-field validation with a minimal machine-readable reject envelope; followup submit validates via a factored scaffold dry-run (no mint, no session-id gate) and cross-checks task count against the verdict's distinct kept/merged ordinals.
 ## Evidence
