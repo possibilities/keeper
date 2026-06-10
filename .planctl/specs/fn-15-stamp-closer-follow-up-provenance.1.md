@@ -84,5 +84,5 @@ Gate: `uv run pytest tests/ -q` green.
 - [ ] README.md, CLAUDE.md, and planctl-bug-history.md updated per the epic Docs gaps
 
 ## Done summary
-
+Replaced the close-follow-up discovery heuristic (depends_on_epics scan) with positive provenance: run_scaffold stamps created_by_close_of onto the minted follow-up epic and _find_followup_epic matches only on that stamp, so a human-planned dependent is never falsely adopted. Count gate unchanged; docs updated.
 ## Evidence
