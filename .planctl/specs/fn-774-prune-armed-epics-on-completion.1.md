@@ -58,5 +58,5 @@ schema v62 narrative block. No schema bump.
 - [ ] no schema bump (no `SCHEMA_VERSION` / `SUPPORTED_SCHEMA_VERSIONS` change)
 
 ## Done summary
-
+EpicSnapshot fold now prunes the armed_epics row when an epic folds to status='done', making it a second writer of armed_epics alongside foldEpicArmed. Placed outside the ON-CONFLICT carve-out (mirrors the epic_tombstones clear) so it fires on every done snapshot and re-fold reproduces zero rows. No schema bump; docs updated.
 ## Evidence
