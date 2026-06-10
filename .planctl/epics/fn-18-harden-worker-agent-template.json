@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-18-harden-worker-agent-template",
   "bundles": [],
+  "closer_done_at": "2026-06-10T18:31:40.132915Z",
   "created_at": "2026-06-10T18:24:09.631307Z",
   "depends_on_epics": [],
   "id": "fn-18-harden-worker-agent-template",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/planctl",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Harden worker agent template",
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-10T18:24:09.631307Z"
+  "updated_at": "2026-06-10T18:31:40.132915Z"
 }
