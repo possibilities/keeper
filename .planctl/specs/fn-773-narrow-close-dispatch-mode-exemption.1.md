@@ -45,5 +45,5 @@ mode-exempt unconditionally.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Narrowed the armed-mode close-dispatch exemption: added isEpicInFlight (live close/work job or surface) and gated close-row dispatch in armed mode on eligible-closure OR in-flight, so cold close-candidates are suppressed while disarmed-mid-flight epics still finish. yolo, completion-reap, and the fn-770 mutex layer are unchanged.
 ## Evidence
