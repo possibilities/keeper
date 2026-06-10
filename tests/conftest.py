@@ -693,7 +693,7 @@ def _isolated_roots_default(request, monkeypatch):
     developer's other projects into discovery). This autouse fixture forces
     empty discovery for every test.
 
-    Opt out with ``@pytest.mark.real_roots`` (slow bucket) when a test drives
+    Opt out with ``@pytest.mark.real_roots`` (fast-path marker) when a test drives
     real multi-project resolution — those tests must point discovery at a
     *controlled tmp root* (their own ``CONFIG_PATH`` / ``roots`` fixture), never
     the real ``~/code`` default.
