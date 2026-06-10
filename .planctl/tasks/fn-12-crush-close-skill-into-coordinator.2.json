@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T03:06:56.932451Z",
+  "depends_on": [
+    "fn-12-crush-close-skill-into-coordinator.1"
+  ],
+  "epic": "fn-12-crush-close-skill-into-coordinator",
+  "id": "fn-12-crush-close-skill-into-coordinator.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "Audit verdict and followup submit verbs",
+  "updated_at": "2026-06-10T03:06:56.932451Z"
+}

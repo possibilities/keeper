@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T03:06:56.932451Z",
+  "depends_on": [
+    "fn-12-crush-close-skill-into-coordinator.3",
+    "fn-12-crush-close-skill-into-coordinator.4"
+  ],
+  "epic": "fn-12-crush-close-skill-into-coordinator",
+  "id": "fn-12-crush-close-skill-into-coordinator.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "high",
+  "title": "Close skill rewrite and docs sweep",
+  "updated_at": "2026-06-10T03:06:56.932451Z"
+}
