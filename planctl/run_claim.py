@@ -1,9 +1,7 @@
 """planctl claim - Assert invariants, claim a task, and return the worker briefing.
 
-Renamed from ``planctl start`` (fn-542 task .2). Where ``start`` only flipped
-``todo → in_progress`` and emitted a thin status envelope, ``claim`` collapses
-the orchestrator's hand-fired sequence (validate / show / cat / start) into one
-call:
+``claim`` collapses the orchestrator's hand-fired sequence (validate / show /
+cat / claim) into one call, flipping ``todo → in_progress``:
 
 1. **Assert** every precondition BEFORE any mutation — project resolves, id is
    well-formed, task exists, target_repo resolves, status/deps gate passes.
@@ -23,7 +21,7 @@ call:
    the prose; ``claim`` mutates only the gitignored ``.planctl/state/``, so no
    commit lands.
 
-Resolution is cwd-agnostic (fn-542 task .3): the owning project is found via
+Resolution is cwd-agnostic: the owning project is found via
 roots discovery (scan the configured ``roots`` for the project whose
 ``.planctl/tasks/<task_id>.json`` exists), with a ``--project <path>`` override
 that bypasses discovery. There is no ``WRONG_DIRECTORY`` / ``cd`` notion — claim
@@ -130,7 +128,7 @@ def _is_claimable(ctx, task_id: str) -> bool:
 
 
 def _resolve_project_for_task(task_id: str, project: str | None):
-    """Resolve the owning project for *task_id*, cwd-agnostically (fn-542 task .3).
+    """Resolve the owning project for *task_id*, cwd-agnostically.
 
     Resolution order:
 

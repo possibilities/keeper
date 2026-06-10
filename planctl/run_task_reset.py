@@ -96,7 +96,7 @@ def run(args: SimpleNamespace) -> int:
             reset_single_task(dep_tid)
             cascade_reset.append(dep_tid)
 
-    # fn-587 task .4: re-stamp last_validated_at on the parent epic after the
+    # Re-stamp last_validated_at on the parent epic after the
     # structural write lands. The shared helper validates the post-mutation
     # tree and either returns a fresh stamp or emits a failure envelope.
     from planctl.validation_restamp import restamp_epic_or_fail
@@ -108,7 +108,7 @@ def run(args: SimpleNamespace) -> int:
     epic_def["last_validated_at"] = new_stamp
     atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of pre-existing
+    # Route through the central seam. Rewrite of pre-existing
     # tracked files (atomic_write rename-atomic) → no unwind.
     emit(
         {"task_id": task_id, "status": "todo", "cascade_reset": cascade_reset},

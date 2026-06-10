@@ -264,12 +264,9 @@ def get_actor() -> str:
 def now_iso() -> str:
     """Current UTC timestamp in ISO 8601 format with microsecond precision.
 
-    fn-587 task .1: upgraded from second-precision (``%Y-%m-%dT%H:%M:%SZ``)
-    to microsecond-precision (``%Y-%m-%dT%H:%M:%S.%fZ``). The microsecond
-    upgrade was originally load-bearing for a keeper-side stamp-disarm check
-    (since deleted with the rest of that surface, fn-604); the precision is
-    retained so external observers can disambiguate structural verbs that
-    re-stamp ``last_validated_at`` within the same wall-clock second.
+    Microsecond precision (``%Y-%m-%dT%H:%M:%S.%fZ``) lets external observers
+    disambiguate structural verbs that re-stamp ``last_validated_at`` within
+    the same wall-clock second.
 
     Lexicographic sort still works (microseconds widen the time field, they
     don't change ordering); ``datetime.fromisoformat`` parses both the new

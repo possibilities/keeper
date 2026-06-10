@@ -1,18 +1,15 @@
-"""Planctl-owned subprocess helper for `promptctl inline-sketch-refs` (fn-628).
+"""Planctl-owned subprocess helper for `promptctl inline-sketch-refs`.
 
-Replaces the prior ``from promptctl.api import inline_sketch_refs,
-SketchResolutionError`` coupling on planctl's 4 write paths (``scaffold``,
-``refine-apply``, ``epic set-bundles``, ``task set-bundles``). Calls the
-promptctl CLI verb as a literal ``["promptctl", ...]`` subprocess so planctl
-carries zero in-repo Python dependency on any arthack package and stays
-extraction-ready.
+Used by planctl's 4 write paths (``scaffold``, ``refine-apply``,
+``epic set-bundles``, ``task set-bundles``). Calls the promptctl CLI verb as a
+literal ``["promptctl", ...]`` subprocess so planctl carries zero in-repo
+Python dependency on any arthack package and stays extraction-ready.
 
 Two distinct error modes (fail-visibly, no fallback):
 
 * :class:`SketchRefError` — a single sketch ref failed to resolve. Carries
-  ``ref`` + ``reason`` (two-attr contract identical to the old
-  ``SketchResolutionError`` so callers' existing ``ref_invalid`` error
-  envelopes stay byte-identical).
+  ``ref`` + ``reason`` (two-attr contract that keeps callers' ``ref_invalid``
+  error envelopes byte-identical).
 * :class:`SketchToolingError` — the verb itself failed to run (OSError on
   spawn, non-zero exit, timeout, non-JSON stdout). Carries an optional
   ``stderr`` excerpt for the diagnostic envelope. Callers should fail the
@@ -112,8 +109,7 @@ def inline_sketch_refs_batch(
     the verb returns a list of matching slots in input order. ``project_root``
     is passed explicitly to the verb via ``--project-root`` AND used as the
     subprocess cwd, so resolution always anchors on the authoring project
-    even when planctl runs from a subdir or sibling repo (the fn-608
-    anchor trap).
+    even when planctl runs from a subdir or sibling repo (the anchor trap).
 
     Returns a per-slot list of :class:`_OkSlot` or :class:`SketchRefError`.
     Raises :class:`SketchToolingError` when the verb itself fails (spawn,

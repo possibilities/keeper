@@ -1,6 +1,6 @@
 """Close-phase audit artifact subtree: paths, hash, commit-free atomic writer.
 
-The fn-12 crush rebuilds ``/plan:close`` as a content-blind coordinator: every
+``/plan:close`` is a content-blind coordinator: every
 pipeline artifact (audit brief, audit report, verdict, follow-up plan) persists
 as a file under gitignored ``<primary_repo>/.planctl/state/audits/<epic_id>/``,
 validated at emission by the submit verbs. This module owns that subtree —

@@ -29,7 +29,7 @@ def run(args: SimpleNamespace) -> int:
     epic_def["updated_at"] = now_iso()
     atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of a
+    # Route through the central seam. Rewrite of a
     # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     emit(
         {"epic_id": epic_id, "title": title},

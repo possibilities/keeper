@@ -30,12 +30,12 @@ What is NOT vendored (intentionally):
 - ``format_table`` / ``DescribedArgument`` / ``package_description`` /
   ``strip_trailing_emojis`` / ``format_time_since`` — unused by planctl.
 
-The byte-identity contract for ``--format``/``--help-json`` output (epic
-``fn-614`` acceptance) hinges on copying every helper called by ``format_output``
-and ``FormattedGroup`` — including private ones (``_json_default``,
-``_help_json_callback``, ``_build_command_schema``, ``_click_type_name``,
-``_format_option_callback``, ``_FORMAT_OPTION``, ``_generate_subcommand_listing``)
-— so the rendered text matches the pre-severance behavior verbatim.
+The byte-identity contract for ``--format``/``--help-json`` output hinges on
+copying every helper called by ``format_output`` and ``FormattedGroup`` —
+including private ones (``_json_default``, ``_help_json_callback``,
+``_build_command_schema``, ``_click_type_name``, ``_format_option_callback``,
+``_FORMAT_OPTION``, ``_generate_subcommand_listing``) — so the rendered text
+matches ``cli_common``'s behavior verbatim.
 """
 
 from __future__ import annotations

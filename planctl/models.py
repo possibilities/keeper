@@ -31,7 +31,7 @@ def worker_agent_for_tier(tier: str | None) -> str | None:
     """Map a task tier to the ``plan`` plugin's worker-agent name.
 
     Returns ``f"plan:worker-{tier}"`` for a ``TASK_TIERS`` member, ``None`` when
-    ``tier is None`` (legacy pre-fn-594 records that never carried a tier), and
+    ``tier is None`` (records that never carried a tier), and
     raises ``ValueError`` for a non-null string that is not a ``TASK_TIERS``
     member (corrupt-on-disk guard). The ``None`` return is load-bearing: the
     ``/plan:work`` skill branches on it to surface a clean typed stop rather
@@ -46,28 +46,14 @@ def worker_agent_for_tier(tier: str | None) -> str | None:
 
 def normalize_epic(data: dict) -> dict:
     """Apply defaults for optional epic fields."""
-    # fn-463: defensive strip of the retired ``draft`` field. The concept was
-    # removed in fn-451; the on-disk migration ran in fn-463. The pop stays
-    # here so any future load of a not-yet-rewritten file (e.g. a fresh git
-    # checkout that hasn't run the scrub) cannot reintroduce the dead key.
-    # Silent on purpose — no log, no warn.
-    data.pop("draft", None)
-    # fn-502: ``audited_into`` was a forward pointer from a closed epic
-    # to the follow-up created by /plan:audit, written by ``epic close
-    # --audited-into``.  The flag has been deleted; the audit skill now
-    # threads the follow-up id through ``commit-plan after-audit
-    # --followup <eid>`` directly.  Mirrors the ``draft`` pop above — any
-    # future load of a pre-fn-502 file gets the dead key scrubbed on the
-    # next write so it cannot reintroduce itself.  Silent — no log, no warn.
-    data.pop("audited_into", None)
-    # fn-559: ``auditor_done_at`` was the fn-521 audit-gate stamp written by
-    # the standalone ``/plan:audit`` flow (``epic auditor-done`` / close
-    # ``--no-audit-required``).  The auditor concept was torn down — the audit
+    # Defensive strip of dead keys: ``draft``, ``audited_into``, and
+    # ``auditor_done_at`` are not part of the epic schema. The pops keep any
+    # on-disk file that still carries one from reintroducing it on the next
+    # write — the dead key is scrubbed silently (no log, no warn). The audit
     # now runs INLINE inside ``/plan:close`` before the irreversible close
-    # mutation, so there is no separate auditor stamp.  Mirrors the ``draft`` /
-    # ``audited_into`` pops above: any future load of a pre-fn-559 file gets the
-    # dead key scrubbed on the next write so it cannot reintroduce itself.
-    # Build-forward — no migration, no SCHEMA_VERSION bump.  Silent.
+    # mutation, so there is no separate auditor stamp.
+    data.pop("draft", None)
+    data.pop("audited_into", None)
     data.pop("auditor_done_at", None)
     if "branch_name" not in data:
         data["branch_name"] = None
@@ -97,16 +83,16 @@ def normalize_epic(data: dict) -> dict:
     # close time.
     if "close_reason" not in data:
         data["close_reason"] = None
-    # fn-513: snippet-substrate metadata. Additive list fields, no
-    # SCHEMA_VERSION bump (matches repo precedent for additive list defaults
-    # — e.g. depends_on_epics, touched_repos). Order matters in the lists
-    # (first-occurrence preservation per the runtime-substrate design);
-    # promptctl render-spec handles dedup at union time.
+    # Snippet-substrate metadata. Additive list fields, no SCHEMA_VERSION bump
+    # (matches the additive list defaults — e.g. depends_on_epics,
+    # touched_repos). Order matters in the lists (first-occurrence preservation
+    # per the runtime-substrate design); promptctl render-spec handles dedup at
+    # union time.
     if "snippets" not in data:
         data["snippets"] = []
     if "bundles" not in data:
         data["bundles"] = []
-    # fn-595: queue_jump signals to keeper that this epic should sort above all
+    # queue_jump signals to keeper that this epic should sort above all
     # other root epics on the board (via a `!`-prefixed sort_path).
     # The signal is server-derived from a scaffold YAML opt-in (`queue_jump:
     # true`) or the `epic queue-jump` verb (`/plan:next`) — the
@@ -116,7 +102,7 @@ def normalize_epic(data: dict) -> dict:
     # bundles) — no SCHEMA_VERSION bump.
     if "queue_jump" not in data:
         data["queue_jump"] = False
-    # fn-15: positive close provenance. When a /plan:close saga scaffolds a
+    # Positive close provenance. When a /plan:close saga scaffolds a
     # follow-up epic for surviving audit findings, the scaffold step stamps the
     # source epic id here. ``close-finalize._find_followup_epic`` discovers the
     # follow-up by exact equality on this stamp — never by ``depends_on_epics``
@@ -124,7 +110,7 @@ def normalize_epic(data: dict) -> dict:
     # depend on the source. The field is immutable after mint; an open epic
     # without the stamp is never adopted (no dep-edge fallback). Missing field
     # defaults to None; mirrors the additive precedents (queue_jump, close_reason)
-    # — no SCHEMA_VERSION bump, no backfill of pre-fix closer-minted follow-ups.
+    # — no SCHEMA_VERSION bump.
     if "created_by_close_of" not in data:
         data["created_by_close_of"] = None
     return data
@@ -146,18 +132,17 @@ def normalize_task(data: dict) -> dict:
     # null load fine; the field defaults to None.
     if "worker_done_at" not in data:
         data["worker_done_at"] = None
-    # Worker reasoning-tier persistence (fn-405). LOAD-TIME default only —
-    # this None default is purely the legacy-on-disk read path for records
-    # written before fn-594 made `tier` required at mint time. The YAML
-    # input verbs (`scaffold`, `refine-apply`) now reject missing `tier:`
+    # Worker reasoning-tier persistence. LOAD-TIME default only — this None
+    # default is the on-disk read path for records that carry no `tier`. The
+    # YAML input verbs (`scaffold`, `refine-apply`) reject missing `tier:`
     # upstream with `tier_invalid`, so freshly-minted records always carry
-    # a TASK_TIERS member. Pre-fn-594 records with null `tier` still load
-    # so `show` / `claim` / `resolve-task` can surface them; the worker
-    # launcher fails loud on null at run time and the human remediates
-    # via `/plan:plan <epic_id>` refine (build-forward).
+    # a TASK_TIERS member. Records with null `tier` still load so `show` /
+    # `claim` / `resolve-task` can surface them; the worker launcher fails
+    # loud on null at run time and the human remediates via
+    # `/plan:plan <epic_id>` refine.
     if "tier" not in data:
         data["tier"] = None
-    # fn-513: snippet-substrate metadata. Additive list fields, no
+    # Snippet-substrate metadata. Additive list fields, no
     # SCHEMA_VERSION bump (mirrors normalize_epic above). Order matters
     # in the lists (first-occurrence preservation per the runtime-substrate
     # design); promptctl render-spec handles dedup at union time.

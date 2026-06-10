@@ -1,4 +1,4 @@
-"""planctl multi-project discovery (fn-542).
+"""planctl multi-project discovery.
 
 Pure filesystem scan: given the configured ``roots`` (parent directories), walk
 each root's **immediate children** and return those that contain a ``.planctl/``
@@ -20,7 +20,7 @@ from planctl.config import load_roots
 
 @dataclass(frozen=True)
 class ResolveResult:
-    """Outcome of ``resolve_epic_globally`` (fn-600).
+    """Outcome of ``resolve_epic_globally``.
 
     Cwd-then-global epic-id resolution distinguishes the three observable
     outcomes callers need to branch on without re-parsing or re-scanning:
@@ -32,9 +32,9 @@ class ResolveResult:
       input). ``owners`` is empty.
     - **Not found**: id matches no project's on-disk epic. ``project_path``,
       ``epic_path``, and ``resolved_id`` are all ``None``. ``owners`` is empty.
-    - **Ambiguous**: id appears in two or more projects (legacy dup state —
-      ``_check_global_name_unique`` post-fix prevents new ones, but historical
-      collisions may exist). ``project_path``, ``epic_path``, and
+    - **Ambiguous**: id appears in two or more projects (a dup state —
+      ``_check_global_name_unique`` prevents new ones, though pre-existing
+      collisions may remain). ``project_path``, ``epic_path``, and
       ``resolved_id`` are ``None``; ``owners`` lists every project carrying the
       id. Callers surface a ``dep_ambiguous_id`` error envelope.
 
@@ -43,7 +43,7 @@ class ResolveResult:
     semantics; that's for human-readable error messages in dup-detection
     paths only.
 
-    Number-only inputs (fn-600 follow-up): a bare ``fn-N`` (no slug) resolves
+    Number-only inputs: a bare ``fn-N`` (no slug) resolves
     by exact epic-integer equality via :func:`planctl.ids.parse_id` — never
     string-prefix matching, so ``fn-1`` never matches ``fn-10``. The resolver
     returns the matched epic's FULL slug id in ``resolved_id`` so the
@@ -222,7 +222,7 @@ def find_projects_with_task(
 
     Scans the configured (or given) ``roots`` via :func:`discover_projects`, then
     filters to those holding the named task definition on disk. Used by ``claim``
-    to resolve a task's owning project cwd-agnostically (fn-542 task .3).
+    to resolve a task's owning project cwd-agnostically.
 
     Returns absolute, deduplicated, sorted project roots (inherits the ordering
     guarantees of :func:`discover_projects`). Empty list when no project holds

@@ -97,9 +97,8 @@ def emit(
         # envelope ``success: true`` on stdout is the authoritative signal that
         # the ``.planctl/`` commit landed. On any hard commit failure, emit a
         # structured failure envelope to stdout and exit 1 — the success
-        # envelope is NOT printed. Replaced the seven-seam ``planctl
-        # commit-plan`` model (fn-488) — every mutating verb now owns its
-        # own commit at the verb boundary.
+        # envelope is NOT printed. Every mutating verb owns its own commit
+        # at the verb boundary.
         from planctl.commit import CommitFailed as _CommitFailed
         from planctl.commit import auto_commit_from_invocation as _auto_commit
 

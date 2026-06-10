@@ -209,7 +209,7 @@ planctl epic close EPIC_ID                      # Close when all tasks done
 planctl epic invalidate EPIC_ID                 # Clear validation marker (force re-validate)
 ```
 
-#### Scaffold a whole epic tree from one YAML (fn-544)
+#### Scaffold a whole epic tree from one YAML
 
 `planctl scaffold --file <plan.yaml>` materializes an epic + N tasks + cross-task
 deps + per-task specs in one transactional call (assert-all -> mutate -> emit).
@@ -409,7 +409,7 @@ YAML schema (top-level mapping):
                                   # (the ref is dropped from `bundles`) so the
                                   # epic stays portable across projects; an
                                   # unresolvable sketch fails as `ref_invalid`
-                                  # in the assert phase (fn-610).
+                                  # in the assert phase.
     queue_jump: <bool>            # optional, default false. A scaffold YAML
                                   # opt-in sets true at mint; can also be flipped post-hoc
                                   # on an existing epic via `planctl epic
@@ -421,8 +421,8 @@ YAML schema (top-level mapping):
       ...
   tasks:                    # required, ordered list (>=1 entry)
     - title: <str>          # required, non-empty
-      tier: <band>          # required, one of medium|high|xhigh|max
-                            # (fn-594). Missing field is `tier_invalid`.
+      tier: <band>          # required, one of medium|high|xhigh|max.
+                            # Missing field is `tier_invalid`.
       deps: [<int>, ...]    # optional, 1-based ordinals into this list
       snippets: []          # optional
       bundles: []           # optional
@@ -458,30 +458,29 @@ Failure envelope (no writes land):
   {"success": false,
    "error": {"code": "<code>", "message": "<msg>", "details": [<per-entry>]}}
 
-Codes: `missing_session_id` (fn-630: `CLAUDE_CODE_SESSION_ID` unset — scaffold
+Codes: `missing_session_id` (`CLAUDE_CODE_SESSION_ID` unset — scaffold
 cannot build its commit envelope, so it refuses up front rather than writing
 a tree it could not commit), `bad_yaml` (parse/shape/type — includes
 non-string `target_repo` / non-string `tier`), `spec_invalid` (task spec
 malformed), `ref_invalid` (snippet/bundle regex, or a `sketch/<name>` ref
-failed to resolve at write time against the cwd-derived project root — fn-610),
+failed to resolve at write time against the cwd-derived project root),
 `dep_invalid` (out-of-range/self ordinal), `dep_cycle`,
 `epic_dep_invalid` (declared epic.depends_on_epics id malformed / nonexistent /
 duplicated), `repo_invalid` (per-task `target_repo` is relative, empty after
 strip, or carries an unresolvable `~`), `tier_invalid` (per-task `tier` is
 missing or not one of medium|high|xhigh|max), `id_collision` (backstop),
-`duplicate_epic` (fn-623: a sibling epic with the same slug already exists
+`duplicate_epic` (a sibling epic with the same slug already exists
 in this project; pass `--allow-duplicate` to mint anyway — details carry
 the existing id + status).
 
-Atomicity (fn-623 + fn-630): a scaffold that fails on ANY pre-commit path —
+Atomicity: a scaffold that fails on ANY pre-commit path —
 YAML shape, spec validity, dep cycle, integrity gate, the `missing_session_id`
 guard, or a raise while building the commit envelope — leaves
-`scan_max_epic_id` unchanged and zero orphan files on disk. fn-623 moved the
-integrity gate to an in-memory content pass (`check_epic_tree_in_memory`
-accepts `epic_spec_content=`) so no spec lands before the gate passes; fn-630
-closed the gap the original fix left open by (a) validating `CLAUDE_CODE_SESSION_ID`
-before the first write and (b) unwinding the written tree if
-`build_planctl_invocation` raises after it. The lone carve-out is a hard
+`scan_max_epic_id` unchanged and zero orphan files on disk. The
+integrity gate is an in-memory content pass (`check_epic_tree_in_memory`
+accepts `epic_spec_content=`) so no spec lands before the gate passes;
+`CLAUDE_CODE_SESSION_ID` is validated before the first write and the written
+tree is unwound if `build_planctl_invocation` raises after it. The lone carve-out is a hard
 commit failure AT the `emit()` boundary (`commit_failed`): the structural
 writes have already landed and stay on disk uncommitted per the §10
 no-rollback policy — the next mutating verb's auto-commit sweeps them.
@@ -512,14 +511,14 @@ on an EXISTING epic) goes through `refine-apply`.
     default=False,
     help=(
         "Mint a distinct fn-N even when an epic with the same slug already "
-        "exists in this project (fn-623 escape hatch). Without this flag, "
+        "exists in this project (escape hatch). Without this flag, "
         "a same-slug scaffold hard-errors with `duplicate_epic` and names "
         "the existing id + status in the failure envelope."
     ),
 )
 @agent_help_option(_SCAFFOLD_AGENT_HELP)
 def scaffold_cmd(file, allow_duplicate):
-    """Materialize a whole epic tree from one YAML in a single transactional call (fn-544)."""
+    """Materialize a whole epic tree from one YAML in a single transactional call."""
     result = _lazy_import("planctl.run_scaffold")(
         file=file, allow_duplicate=allow_duplicate
     )
@@ -580,7 +579,7 @@ a git repo; `details.broken_repos` lists them).
     default=None,
     help=(
         "Absolute path to the planctl project (bypasses cwd-walk). "
-        "Mirrors `claim`'s --project flag (fn-589 task .1, item 4). "
+        "Mirrors `claim`'s --project flag. "
         "Relative paths raise UsageError; unset falls back to the existing "
         "resolve_project() cwd-walk."
     ),
@@ -652,10 +651,10 @@ Codes: `BAD_EPIC_ID`, `EPIC_NOT_FOUND`.
 )
 @agent_help_option(_REFINE_CONTEXT_AGENT_HELP)
 def refine_context_cmd(epic_id, invalidate):
-    """Refine-state fetch: emit {title, branch, last_validated_at, epic_spec_md, tasks[]} for /plan:plan (fn-565).
+    """Refine-state fetch: emit {title, branch, last_validated_at, epic_spec_md, tasks[]} for /plan:plan.
 
     Read-only by default; with --invalidate also clears last_validated_at
-    in the same call (single envelope + single commit, fn-589 task .1).
+    in the same call (single envelope + single commit).
     """
     return _lazy_import("planctl.run_refine_context")(
         epic_id=epic_id, invalidate=invalidate
@@ -682,8 +681,8 @@ Delta YAML shape (all four sections optional; supply at least one):
       ...
   add_tasks:                # optional list of brand-new tasks
     - title: <str>
-      tier: <band>          # required, one of medium|high|xhigh|max
-                            # (fn-594). Missing field is `tier_invalid` —
+      tier: <band>          # required, one of medium|high|xhigh|max.
+                            # Missing field is `tier_invalid` —
                             # same enforcement as scaffold.
       spec: |               # four-section validated
         ## Description
@@ -692,8 +691,8 @@ Delta YAML shape (all four sections optional; supply at least one):
       snippets: [...]       # optional
       bundles: [...]        # optional. `sketch/<name>` refs are inlined into
                             # `snippets` at write time against the cwd-derived
-                            # authoring project root and dropped from `bundles`
-                            # (fn-610); an unresolvable sketch fails as
+                            # authoring project root and dropped from `bundles`;
+                            # an unresolvable sketch fails as
                             # `ref_invalid` in the assert phase. Applies to
                             # epic.bundles rewrites as well.
       target_repo: <path>   # optional, absolute path (~ expanded). One task
@@ -750,7 +749,7 @@ is per-file rename, not tree-level), same posture as scaffold.
 )
 @agent_help_option(_REFINE_APPLY_AGENT_HELP)
 def refine_apply_cmd(epic_id, file):
-    """Apply a refine delta (adds + spec-rewrites + dep-rewires + epic-spec) to an existing epic in one transactional call (fn-565)."""
+    """Apply a refine delta (adds + spec-rewrites + dep-rewires + epic-spec) to an existing epic in one transactional call."""
     result = _lazy_import("planctl.run_refine_apply")(epic_id=epic_id, file=file)
     if result:
         sys.exit(result)
@@ -1195,7 +1194,7 @@ not a planctl project.
 )
 @agent_help_option(_EPIC_RM_AGENT_HELP)
 def epic_rm_cmd(epic_id, force, dry_run, project):
-    """Remove an epic and all its artifacts (sanctioned delete verb, fn-623)."""
+    """Remove an epic and all its artifacts (sanctioned delete verb)."""
     return _lazy_import("planctl.run_epic_rm")(
         epic_id=epic_id,
         force=force,
@@ -1269,8 +1268,8 @@ Failure envelope (no writes land, default mode only):
 
 Codes: `bad_id`, `dep_ambiguous_id`, `epic_not_found`, `dep_done`, `dep_cycle`.
 
-fn-600: dep existence is resolved cwd-then-global, so a dep id that lives in
-a sibling project (under a configured root) wires cleanly. Legacy dup state
+Dep existence is resolved cwd-then-global, so a dep id that lives in
+a sibling project (under a configured root) wires cleanly. A dup state
 where the same id appears in two projects surfaces as `dep_ambiguous_id`
 listing every owning project path — never a silent last-walked pick.
 """
@@ -1296,7 +1295,7 @@ def epic_add_deps_cmd(epic_id, dep_ids, skip_invalid):
     """Batch-wire N epic-level dependency edges (idempotent per edge).
 
     With --skip-invalid, per-edge errors land as SKIPPED_* statuses in the
-    results array and exit stays 0 (fn-589 task .1, item 9).
+    results array and exit stays 0.
     """
     return _lazy_import("planctl.run_epic_add_deps")(
         epic_id=epic_id, dep_ids=list(dep_ids), skip_invalid=skip_invalid
@@ -1369,7 +1368,7 @@ def epic_set_snippets_cmd(epic_id, snippets):
         "`sketch/<name>` refs are resolved at write time against the "
         "cwd-derived authoring project root and inlined into `snippets` "
         "(dropped from the persisted bundle list) so the record stays "
-        "portable; an unresolvable sketch fails as `ref_invalid` (fn-610). "
+        "portable; an unresolvable sketch fails as `ref_invalid`. "
         "Empty string or omitted clears the list."
     ),
 )
@@ -1439,7 +1438,7 @@ def task_set_snippets_cmd(task_id, snippets):
         "`sketch/<name>` refs are resolved at write time against the "
         "cwd-derived authoring project root and inlined into `snippets` "
         "(dropped from the persisted bundle list) so the record stays "
-        "portable; an unresolvable sketch fails as `ref_invalid` (fn-610). "
+        "portable; an unresolvable sketch fails as `ref_invalid`. "
         "Empty string or omitted clears the list."
     ),
 )
@@ -1479,7 +1478,7 @@ def task_set_target_repo_cmd(task_id, path):
     help="Worker reasoning tier (used by /plan:work cold-resume to skip the heuristic)",
 )
 def task_set_tier_cmd(task_id, tier):
-    """Persist the worker reasoning tier on a task (fn-405)."""
+    """Persist the worker reasoning tier on a task."""
     return _lazy_import("planctl.run_task_set_tier")(task_id=task_id, tier=tier)
 
 
@@ -1516,7 +1515,7 @@ omission) when the task never had a tier persisted — the skill cold-path
 branches on `tier is None` to fall through to the spec-content heuristic.
 Surfacing tier here lets the cold-resume path read it from the resume envelope
 directly instead of shelling `planctl show <task_id> --format json | jq` for
-the same field — one round trip per cold spawn, fn-589 task .1 item 5.
+the same field — one round trip per cold spawn.
 
 `status` mirrors the same runtime field the cold path was about to re-read; a
 fresh value off this envelope is the deterministic input for the
@@ -1542,7 +1541,7 @@ def worker_resume_cmd(task_id):
     return _lazy_import("planctl.run_worker_resume")(task_id=task_id)
 
 
-# --- Close-phase submit subgroups (fn-12) ---
+# --- Close-phase submit subgroups ---
 #
 # The content-blind /plan:close pipeline persists every artifact (audit report,
 # verdict, follow-up plan) under gitignored state/audits/<epic_id>/ via these

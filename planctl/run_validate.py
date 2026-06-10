@@ -4,11 +4,11 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
-# fn-587 task .3: ``_validate_repo_path`` is the canonical helper now exported
-# from ``planctl.integrity``.  Keep a re-export here for back-compat with
-# verbs (``run_epic_set_primary_repo`` / ``run_epic_set_touched_repos``) that
-# already ``from planctl.run_validate import _validate_repo_path``.  Inline
-# users below also resolve through this name.
+# ``_validate_repo_path`` is the canonical helper exported from
+# ``planctl.integrity``.  This re-export lets verbs
+# (``run_epic_set_primary_repo`` / ``run_epic_set_touched_repos``) import it as
+# ``from planctl.run_validate import _validate_repo_path``.  Inline users below
+# also resolve through this name.
 from planctl.integrity import _validate_repo_path
 
 __all__ = ("_validate_repo_path",)
@@ -84,9 +84,9 @@ def run(args: SimpleNamespace) -> int:
 
     epic_ids_to_check: list[str] = [epic_id] if epic_id else sorted(all_epic_ids)
 
-    # fn-587 task .3: per-epic structural integrity now lives in
-    # ``planctl.integrity.validate_epic_integrity_with_warnings`` — same call
-    # site, same error list shape, shared with scaffold's fresh-mint check.
+    # Per-epic structural integrity lives in
+    # ``planctl.integrity.validate_epic_integrity_with_warnings`` — same error
+    # list shape, shared with scaffold's fresh-mint check.
     for eid in epic_ids_to_check:
         ep_errors, ep_warnings = validate_epic_integrity_with_warnings(eid, data_dir)
         errors.extend(ep_errors)

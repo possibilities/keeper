@@ -46,7 +46,7 @@ def run(args: SimpleNamespace) -> int:
     # value, just persisted above).  Filter to direct children only — `epic_id.M`
     # shape, no nested ids.
     #
-    # fn-587 task .4: ``last_validated_at`` is re-stamped (not cleared) after the
+    # ``last_validated_at`` is re-stamped (not cleared) after the
     # post-mutation integrity check passes.  The touched_repos recompute lands
     # first (so the integrity check sees the final tree), then the helper runs,
     # then the epic JSON is written once with both the recomputed touched_repos
@@ -83,7 +83,7 @@ def run(args: SimpleNamespace) -> int:
         atomic_write_json(epic_path, epic_def)
         primary_repo = epic_def.get("primary_repo")
 
-    # fn-629 task .3: route through the central seam. Rewrite of pre-existing
+    # Route through the central seam. Rewrite of pre-existing
     # tracked files (atomic_write rename-atomic) → no unwind.
     emit(
         {"task_id": task_id, "target_repo": resolved},

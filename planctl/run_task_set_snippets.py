@@ -1,4 +1,4 @@
-"""planctl task set-snippets — replace the snippet-id list on a task (fn-513).
+"""planctl task set-snippets — replace the snippet-id list on a task.
 
 Replace-only semantics (mirrors ``set-deps`` / ``set-touched-repos``): the
 ``--snippets`` value fully replaces ``task.snippets``.  ``--snippets ""`` (or
@@ -62,7 +62,7 @@ def run(args: SimpleNamespace) -> int:
     task_def["updated_at"] = now_iso()
     atomic_write_json(task_path, task_def)
 
-    # fn-587 task .4: re-stamp validation marker on the parent epic after the
+    # Re-stamp validation marker on the parent epic after the
     # structural write lands.  Replacing the snippet list is a structural spec-
     # metadata change (mirrors set-deps); the shared helper validates the
     # post-mutation tree and either returns a fresh stamp or emits a failure
@@ -78,7 +78,7 @@ def run(args: SimpleNamespace) -> int:
         epic_def["last_validated_at"] = new_stamp
         atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of pre-existing
+    # Route through the central seam. Rewrite of pre-existing
     # tracked files (atomic_write rename-atomic) → no unwind.
     emit(
         {"task_id": task_id, "snippets": snippets},

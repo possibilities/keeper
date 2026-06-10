@@ -142,7 +142,7 @@ def run(args: SimpleNamespace) -> int:
     task_def["worker_done_at"] = now
     atomic_write_json(task_path, task_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of pre-existing
+    # Route through the central seam. Rewrite of pre-existing
     # tracked files (atomic_write rename-atomic) → no unwind.
     emit(
         {"task_id": task_id, "status": "done", "evidence": evidence},

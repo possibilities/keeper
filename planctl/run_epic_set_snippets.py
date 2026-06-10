@@ -1,4 +1,4 @@
-"""planctl epic set-snippets — replace the snippet-id list on an epic (fn-513).
+"""planctl epic set-snippets — replace the snippet-id list on an epic.
 
 Replace-only semantics (mirrors ``set-touched-repos``): the ``--snippets``
 value fully replaces ``epic.snippets``.  ``--snippets ""`` (or ``--snippets``
@@ -60,7 +60,7 @@ def run(args: SimpleNamespace) -> int:
     epic_def["updated_at"] = now_iso()
     atomic_write_json(epic_path, epic_def)
 
-    # fn-587 task .4: re-stamp last_validated_at after the structural write.
+    # Re-stamp last_validated_at after the structural write.
     # The shared helper validates the post-mutation tree and either returns
     # a fresh stamp or emits a structured failure envelope.
     from planctl.validation_restamp import restamp_epic_or_fail
@@ -71,7 +71,7 @@ def run(args: SimpleNamespace) -> int:
     atomic_write_json(epic_path, epic_def)
 
     primary_repo: str | None = epic_def.get("primary_repo")
-    # fn-629 task .3: route through the central seam. Rewrite of a
+    # Route through the central seam. Rewrite of a
     # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     emit(
         {"epic_id": epic_id, "snippets": snippets},

@@ -107,7 +107,7 @@ def run(args: SimpleNamespace) -> int:
     if spec_file:
         spec_content = Path(spec_file).read_text(encoding="utf-8")
 
-    # fn-629 task .2: track every write so the central seam at output.emit()
+    # Track every write so the central seam at output.emit()
     # can unwind on a pre-commit failure. epic create writes two files
     # (epic JSON + epic spec) — both are fresh-mint paths, so unwinding on
     # a downstream failure leaves zero orphan files. Allocated INSIDE the

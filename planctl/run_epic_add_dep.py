@@ -1,9 +1,9 @@
 """planctl epic add-dep - Add an epic-level dependency.
 
-fn-600: epic-level dep existence is resolved cwd-then-global via
+Epic-level dep existence is resolved cwd-then-global via
 ``discovery.resolve_epic_globally`` so a dep id that lives in a sibling
 project (epic A in project X depended on by epic B in project Y) wires
-cleanly. Legacy dup state where the same id appears in two projects
+cleanly. A dup state where the same id appears in two projects
 surfaces as an ``Epic exists in multiple projects`` error rather than a
 silent last-walked pick.
 """
@@ -37,10 +37,10 @@ def run(args: SimpleNamespace) -> int:
     if epic_id == dep_id:
         emit_error(f"Epic cannot depend on itself: {epic_id}")
 
-    # fn-600: dep existence is resolved globally so cross-project deps wire.
+    # Dep existence is resolved globally so cross-project deps wire.
     # ``resolve_epic_globally`` is cwd-then-global, so the local-dep hot path
     # still short-circuits without scanning sibling projects. Ambiguous-id
-    # (legacy dup state) surfaces as a hard error here — no silent pick.
+    # (dup state) surfaces as a hard error here — no silent pick.
     dep_resolution = resolve_epic_globally(dep_id)
     if dep_resolution.ambiguous:
         owners = ", ".join(str(p) for p in dep_resolution.owners)
@@ -50,7 +50,7 @@ def run(args: SimpleNamespace) -> int:
     if not dep_resolution.resolved:
         emit_error(f"Epic not found: {dep_id}")
 
-    # fn-20: normalize a number-only ``fn-N`` input to the resolved FULL slug
+    # Normalize a number-only ``fn-N`` input to the resolved FULL slug
     # id before persisting / deduping, so the on-disk edge stays canonical.
     assert dep_resolution.resolved_id is not None
     full_dep_id = dep_resolution.resolved_id
@@ -67,14 +67,13 @@ def run(args: SimpleNamespace) -> int:
     epic_def["updated_at"] = now_iso()
     atomic_write_json(epic_path, epic_def)
 
-    # fn-587 task .4: re-stamp last_validated_at after the structural write.
-    # fn-588 task .1: the shared helper now walks the project-wide epic-dep
-    # graph for cycles in addition to its existing task-graph cycle check, so
-    # this single-edge verb (which does NO pre-write cycle assertion of its
-    # own — unlike add-deps and refine-apply) catches a freshly-introduced
-    # A -> B -> A cycle via the post-write integrity gate.  Helper either
-    # returns a fresh stamp or emits a failure envelope.
-    # fn-590 task .1: roll the dep write back if the post-write integrity
+    # Re-stamp last_validated_at after the structural write.
+    # The shared helper walks the project-wide epic-dep graph for cycles in
+    # addition to its task-graph cycle check, so this single-edge verb (which
+    # does NO pre-write cycle assertion of its own — unlike add-deps and
+    # refine-apply) catches a freshly-introduced A -> B -> A cycle via the
+    # post-write integrity gate.  Helper either returns a fresh stamp or emits
+    # a failure envelope. Roll the dep write back if the post-write integrity
     # gate raises (e.g. cycle), so a rejected dep leaves disk untouched.
     from planctl.validation_restamp import restamp_epic_or_fail
 
@@ -87,7 +86,7 @@ def run(args: SimpleNamespace) -> int:
     epic_def["last_validated_at"] = new_stamp
     atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of a
+    # Route through the central seam. Rewrite of a
     # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     emit(
         {"epic_id": epic_id, "depends_on_epics": deps},

@@ -161,7 +161,7 @@ def run(args: SimpleNamespace) -> int:
         for t in merged_tasks
     ]
 
-    # fn-589 task .1 (item 8): conditionally-mutating ``--invalidate`` path.
+    # Conditionally-mutating ``--invalidate`` path.
     # Mirrors ``validate --epic``'s precedent — when the flag asks us to
     # mutate, write first, then emit via ``output.emit`` so a single envelope
     # + single auto-commit lands.  Without the flag (the common case) the
@@ -201,7 +201,7 @@ def run(args: SimpleNamespace) -> int:
         raw_epic["updated_at"] = now_iso()
         atomic_write_json(epic_path, raw_epic)
 
-        # fn-629 task .3: route through the central seam at output.emit().
+        # Route through the central seam at output.emit().
         # Rewrite of a pre-existing tracked file (atomic_write rename-atomic)
         # → no unwind. The previous direct ``build_planctl_invocation`` call
         # lived outside the seam's try-block, so a missing CLAUDE_CODE_SESSION_ID

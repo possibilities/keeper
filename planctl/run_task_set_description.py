@@ -60,7 +60,7 @@ def run(args: SimpleNamespace) -> int:
     task_def["updated_at"] = now_iso()
     atomic_write_json(task_path, task_def)
 
-    # fn-587 task .4: re-stamp last_validated_at on the parent epic after the
+    # Re-stamp last_validated_at on the parent epic after the
     # structural write lands.  The shared helper re-runs validate_epic_integrity
     # against the post-mutation tree and either returns a fresh stamp or emits
     # a structured failure envelope and exits non-zero.
@@ -74,7 +74,7 @@ def run(args: SimpleNamespace) -> int:
     epic_def["last_validated_at"] = new_stamp
     atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of pre-existing
+    # Route through the central seam. Rewrite of pre-existing
     # tracked files (atomic_write rename-atomic) → no unwind.
     emit(
         {"task_id": task_id, "section": "Description"},

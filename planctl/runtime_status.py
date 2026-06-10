@@ -25,7 +25,7 @@ def _expected_worker_cwd(task: dict[str, Any], epic: dict[str, Any], proj: str) 
     """Return the expected cwd for a worker dispatched for *task* in *epic*.
 
     Three-level fallback: task.target_repo → epic.primary_repo → proj.
-    Handles legacy pre-fn-364 records where primary_repo may be null.
+    Handles records where primary_repo may be null.
     """
     return task.get("target_repo") or epic.get("primary_repo") or proj
 
@@ -155,7 +155,7 @@ def _dep_epics_runtime_complete(
     defensive default — missing id must return False explicitly).
     Short-circuits on first incomplete dep.
 
-    Resolution order (fn-600 task .2 — cross-project epic deps):
+    Resolution order (cross-project epic deps):
 
     1. Same-project lookup via ``dep_epic_lookup[(proj, dep_id)]`` — wins
        when an epic with the same id exists in the same project.

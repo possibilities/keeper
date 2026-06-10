@@ -1,4 +1,4 @@
-"""planctl resolve-task — read-only routing lookup (fn-593 task .1).
+"""planctl resolve-task — read-only routing lookup.
 
 A read-only sibling of ``claim`` that returns the subset of fields a
 dispatcher needs to route a ``/plan:work <task_id>`` invocation to the right
@@ -22,13 +22,10 @@ rather than treating absence as a default. ``status`` is the merged runtime
 status (definition + ``.planctl/state/``) so callers see the live value, not
 the on-disk-only definition value.
 
-**Caller status:** the original consumer was the ``arthack-claude.py``
-launcher, which shelled this verb on every ``/plan:work <task_id>`` launch.
-That coupling was decoupled (fn-602): keeper now reads ``task.tier``
-from its own projected Task data and dispatches model/effort/name/plugin-dir
-directly, so the launcher no longer calls planctl at startup. The verb is
-retained as a public CLI surface for future routing consumers; today it has
-no in-tree caller.
+**Caller status:** keeper reads ``task.tier`` from its own projected Task data
+and dispatches model/effort/name/plugin-dir directly, so dispatch does not call
+planctl at startup. The verb is a public CLI surface for routing consumers; it
+has no in-tree caller.
 """
 
 from __future__ import annotations

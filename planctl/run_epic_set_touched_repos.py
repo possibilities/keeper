@@ -57,7 +57,7 @@ def run(args: SimpleNamespace) -> int:
     epic_def["updated_at"] = now_iso()
     atomic_write_json(epic_path, epic_def)
 
-    # fn-587 task .4: re-stamp last_validated_at after the structural write.
+    # Re-stamp last_validated_at after the structural write.
     # Note: the warn-and-write path above is unchanged — this verb still emits
     # warnings + writes for any bad paths — but the post-write integrity check
     # will then fail and the helper emits a structured failure envelope.  The
@@ -70,7 +70,7 @@ def run(args: SimpleNamespace) -> int:
     atomic_write_json(epic_path, epic_def)
 
     primary_repo: str | None = epic_def.get("primary_repo")
-    # fn-629 task .3: route through the central seam. Rewrite of a
+    # Route through the central seam. Rewrite of a
     # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     emit(
         {"epic_id": epic_id, "touched_repos": touched_repos, "warnings": warnings},

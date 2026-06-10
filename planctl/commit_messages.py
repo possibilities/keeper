@@ -35,7 +35,7 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     "create": lambda t, d: _subject("create", t, d),
     "refine": lambda t, d: _subject("refine", t, d),
     "close": lambda t, d: _subject("close", t, d),
-    # fn-623: sanctioned delete verb — unlinks every artifact (epic JSON,
+    # Sanctioned delete verb — unlinks every artifact (epic JSON,
     # task JSONs, epic + task spec markdowns, state, locks) and rides one
     # commit covering the whole pathspec. Companion to `close` (which only
     # stamps `closer_done_at`); not in VALIDATION_RESTAMP_VERBS because the
@@ -43,25 +43,25 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     "rm": lambda t, d: _subject("rm", t, d),
     "publish": lambda t, d: _subject("publish", t, d),
     "add-dep": lambda t, d: _subject("add-dep", t, d),
-    # fn-565: batch epic-dep wirer — distinct key from single-edge `add-dep`.
+    # Batch epic-dep wirer — distinct key from single-edge `add-dep`.
     "add-deps": lambda t, d: _subject("add-deps", t, d),
     "rm-dep": lambda t, d: _subject("rm-dep", t, d),
     "set-branch": lambda t, d: _subject("set-branch", t, d),
     "set-title": lambda t, d: _subject("set-title", t, d),
     # Task verbs
-    # fn-565 removed `task-create` / `set-spec` / `set-deps` (and the `dep-add`
-    # dep verb below) — the create/rewrite paths ride `scaffold` / `refine-apply`.
+    # There is no `task-create` / `set-spec` / `set-deps` (nor a `dep-add` dep
+    # verb) — the create/rewrite paths ride `scaffold` / `refine-apply`.
     "set-description": lambda t, d: _subject("set-description", t, d),
     "set-acceptance": lambda t, d: _subject("set-acceptance", t, d),
     "reset": lambda t, d: _subject("reset", t, d),
     "claim": lambda t, d: _subject("claim", t, d),
     "block": lambda t, d: _subject("block", t, d),
     "done": lambda t, d: _subject("done", t, d),
-    # Multi-repo structural verbs (fn-364)
+    # Multi-repo structural verbs
     "set-primary-repo": lambda t, d: _subject("set-primary-repo", t, d),
     "set-touched-repos": lambda t, d: _subject("set-touched-repos", t, d),
     "set-target-repo": lambda t, d: _subject("set-target-repo", t, d),
-    # Spec-metadata setters (fn-513) — shared verb name across the task
+    # Spec-metadata setters — shared verb name across the task
     # and epic surfaces; both join VALIDATION_RESTAMP_VERBS.
     "set-snippets": lambda t, d: _subject("set-snippets", t, d),
     "set-bundles": lambda t, d: _subject("set-bundles", t, d),
@@ -69,17 +69,17 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     "validate": lambda t, d: _subject("validate", t, d),
     # Invalidate verb (explicit clear; primary job is the clear, not a side-effect)
     "invalidate": lambda t, d: _subject("invalidate", t, d),
-    # Queue-jump verb (fn-1) — priority-flag verb, not structural: flips
+    # Queue-jump verb — priority-flag verb, not structural: flips
     # queue_jump=true post-hoc on an existing epic so keeper sorts it to the
     # front of the board. NOT in VALIDATION_RESTAMP_VERBS (same stance as
     # invalidate/task-set-tier).
     "queue-jump": lambda t, d: _subject("queue-jump", t, d),
-    # Project bootstrap (fn-2) — the one mutating verb that builds its own
+    # Project bootstrap — the one mutating verb that builds its own
     # invocation payload directly (explicit fixed file list), without the
     # touched-paths log or CLAUDE_CODE_SESSION_ID. NOT in
     # VALIDATION_RESTAMP_VERBS — it mints no epic. Target is the project name.
     "init": lambda t, d: _subject("init", t, d),
-    # Whole-tree epic scaffold (fn-544) — materializes an epic + N tasks
+    # Whole-tree epic scaffold — materializes an epic + N tasks
     # + cross-task deps + specs from one YAML in a single transactional
     # call. Target is the freshly-allocated epic id; the per-task writes
     # ride into the same touched-paths session so one envelope/commit
@@ -87,18 +87,18 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     # only ever mints a fresh epic whose last_validated_at already
     # defaults to None via normalize_epic.
     "scaffold": lambda t, d: _subject("scaffold", t, d),
-    # Whole-tree refine delta (fn-565) — applies adds + spec-rewrites +
+    # Whole-tree refine delta — applies adds + spec-rewrites +
     # dep-rewires + epic-spec rewrite to an EXISTING epic in one transactional
     # call. Target is the epic id. Unlike `scaffold`, refine-apply rewrites an
     # existing tree, so it IS in VALIDATION_RESTAMP_VERBS (re-clears the marker).
     "refine-apply": lambda t, d: _subject("refine-apply", t, d),
-    # refine-context --invalidate (fn-589 task .1, item 8) — conditionally
+    # refine-context --invalidate — conditionally
     # mutating sibling of refine-context's read-only fetch path. Mirrors
     # validate --epic's precedent: when --invalidate is set, the runner
     # writes last_validated_at = None and lands a single commit; without the
     # flag the fetch is read-only and this entry is never reached.
     "refine-context": lambda t, d: _subject("refine-context", t, d),
-    # Worker reasoning-tier persistence (fn-405) — runtime detail, not in
+    # Worker reasoning-tier persistence — runtime detail, not in
     # VALIDATION_RESTAMP_VERBS.
     "task-set-tier": lambda t, d: _subject("task-set-tier", t, d),
 }

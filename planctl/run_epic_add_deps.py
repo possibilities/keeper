@@ -1,4 +1,4 @@
-"""planctl epic add-deps - Batch-wire N epic-level dependency edges (fn-565).
+"""planctl epic add-deps - Batch-wire N epic-level dependency edges.
 
 The batch equivalent of ``epic add-dep``. Wires multiple ``epic -> dep`` edges in
 one call so ``/plan:plan`` Phase 7 (and the R5b additive replay) can collapse the
@@ -18,8 +18,8 @@ stdout, exits non-zero, and writes NOTHING. Codes (stable priority order
 ``dep_cycle``):
 
 - ``bad_id`` — a dep id is malformed (fails ``is_epic_id``) or self-referential
-- ``dep_ambiguous_id`` (fn-600) — a dep id resolves to two or more projects
-  (legacy dup state). Details list every owning project path.
+- ``dep_ambiguous_id`` — a dep id resolves to two or more projects
+  (dup state). Details list every owning project path.
 - ``epic_not_found`` — the target epic, or a dep epic, does not exist on disk
   in any discovered project
 - ``dep_done`` — a dep epic is ``done`` (cannot depend on a closed epic)
@@ -104,14 +104,14 @@ def run(args: SimpleNamespace) -> int:
     ambiguous_errors: list[str] = []
     not_found_errors: list[str] = []
     done_errors: list[str] = []
-    # fn-589 task .1 (item 9): when --skip-invalid is set, per-edge classifier
+    # When --skip-invalid is set, per-edge classifier
     # errors route into the per-edge results array as SKIPPED_* statuses
     # instead of short-circuiting the call.  Keyed by dep_id; values are one
     # of "SKIPPED_BAD_ID" / "SKIPPED_NOT_FOUND" / "SKIPPED_AMBIGUOUS" /
     # "SKIPPED_DONE".  The target-epic-not-found case still fails loud — no
     # place to wire any edge if the parent doesn't exist.
     skipped_by_id: dict[str, str] = {}
-    # fn-20: normalize a number-only ``fn-N`` input to the resolved FULL slug
+    # Normalize a number-only ``fn-N`` input to the resolved FULL slug
     # id so the persisted ``depends_on_epics`` edge stays canonical (the
     # readiness gate keys by full id). Keyed by the raw input dep_id; a slug
     # input maps to itself.
@@ -137,8 +137,8 @@ def run(args: SimpleNamespace) -> int:
                 continue
             bad_id_errors.append(f"epic cannot depend on itself: {dep_id}")
             continue
-        # fn-600: resolve cwd-then-global so cross-project deps wire.
-        # Ambiguous (legacy dup) is a distinct error class from not-found.
+        # Resolve cwd-then-global so cross-project deps wire.
+        # Ambiguous (dup) is a distinct error class from not-found.
         dep_resolution = resolve_epic_globally(dep_id)
         if dep_resolution.ambiguous:
             if skip_invalid:
@@ -166,7 +166,7 @@ def run(args: SimpleNamespace) -> int:
             done_errors.append(f"dep epic is done (cannot depend on it): {dep_id}")
 
     # Stable priority order so a single envelope surfaces the dominant class;
-    # other-class errors still appear in details.  fn-600: ``dep_ambiguous_id``
+    # other-class errors still appear in details.  ``dep_ambiguous_id``
     # slots in between ``bad_id`` and ``epic_not_found`` — a malformed id is
     # the most basic shape failure, ambiguity is a graph-level error class
     # (the id exists, but the resolver refuses to silently pick a winner),
@@ -203,8 +203,7 @@ def run(args: SimpleNamespace) -> int:
     # ------------------------------------------------------------------
     # Compute the post-wire dep list (idempotent: dup → ALREADY_PRESENT, no-op).
     # Walk dep_ids in original order so the results array reflects the call
-    # ordering, splicing in any SKIPPED_* entries the assert-all loop diverted
-    # (fn-589 task .1, item 9).
+    # ordering, splicing in any SKIPPED_* entries the assert-all loop diverted.
     # ------------------------------------------------------------------
     epic_def = load_json(epic_path)
     deps: list[str] = list(epic_def.get("depends_on_epics", []))
@@ -219,7 +218,7 @@ def run(args: SimpleNamespace) -> int:
         if dep_id in skipped_by_id:
             results.append({"dep_id": dep_id, "status": skipped_by_id[dep_id]})
             continue
-        # fn-20: persist + dedup against the FULL slug id (a number-only input
+        # Persist + dedup against the FULL slug id (a number-only input
         # normalizes here), so the on-disk edge is canonical and an already-
         # wired slug edge is recognized when re-supplied as a bare number.
         full_id = normalized_by_id.get(dep_id, dep_id)
@@ -231,7 +230,7 @@ def run(args: SimpleNamespace) -> int:
         results.append({"dep_id": full_id, "status": "WIRED"})
 
     # ------------------------------------------------------------------
-    # Cycle detection on the post-wire epic-dep graph. fn-600: walks every
+    # Cycle detection on the post-wire epic-dep graph. Walks every
     # discovered project's epics so a cross-project A -> B -> A cycle
     # surfaces here, not just same-project cycles. Build the graph from every
     # epic's current depends_on_epics, then overlay the target epic's new dep
@@ -244,7 +243,7 @@ def run(args: SimpleNamespace) -> int:
         from planctl.discovery import discover_projects
 
         graph: dict[str, dict] = {}
-        # fn-601: guard discover_projects() — mirrors integrity.py:479-482 and
+        # Guard discover_projects() — mirrors integrity.py and
         # validation_restamp.py:153-156. If discovery raises (misconfigured
         # roots, permission error), degrade to "no global projects" so the
         # local backstop walk below still runs and add-dep completes.
@@ -286,12 +285,12 @@ def run(args: SimpleNamespace) -> int:
         epic_def["updated_at"] = now_iso()
         atomic_write_json(epic_path, epic_def)
 
-        # fn-587 task .4: re-stamp last_validated_at after the structural
+        # Re-stamp last_validated_at after the structural
         # write.  add-deps has already run its own pre-write assert-all
         # (id-shape / existence / done-target / cycle), so the post-write
         # integrity check here is the belt-and-suspenders pattern shared with
-        # the single-edge add-dep verb.  fn-588 task .1: the shared helper
-        # now walks the project-wide epic-dep graph for cycles, so the
+        # the single-edge add-dep verb.  The shared helper walks the
+        # project-wide epic-dep graph for cycles, so the
         # post-write gate has its own cycle detection (independent of the
         # pre-write assert above) and a cycle landed by any other path would
         # also surface here.
@@ -302,7 +301,7 @@ def run(args: SimpleNamespace) -> int:
         epic_def["last_validated_at"] = new_stamp
         atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of a
+    # Route through the central seam. Rewrite of a
     # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     # The pure-no-op call (every edge ALREADY_PRESENT, ``new_edges == 0``)
     # still routes through the seam; ``auto_commit_from_invocation`` no-ops

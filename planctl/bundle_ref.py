@@ -1,4 +1,4 @@
-"""Shared bundle-ref validation regex (fn-513).
+"""Shared bundle-ref validation regex.
 
 A bundle ref names a curated context source in the runtime-snippet-substrate.
 Two namespaces dispatch: ``bundle/<name>`` (promptctl bundle) and

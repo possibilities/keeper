@@ -1,4 +1,4 @@
-"""planctl scaffold - Materialize a whole epic tree in one transactional call (fn-544).
+"""planctl scaffold - Materialize a whole epic tree in one transactional call.
 
 Reads a single YAML describing an epic and its ordered task list (deps as
 1-based ordinals = the ``.M`` suffix), validates everything upfront collecting
@@ -10,20 +10,20 @@ Execution order is strict **assert-all → mutate → emit**. Scope guard: scaff
 writes a *declared* ``epic.depends_on_epics`` list but does NOT auto-discover
 epic-level deps and does NOT run ``validate`` — those remain separate skill
 steps. The git commit lands automatically via ``output.emit()``'s per-verb
-auto-commit (fn-587), driven by the single ``planctl_invocation`` envelope.
+auto-commit, driven by the single ``planctl_invocation`` envelope.
 
 Failure shape: on any PRE-commit failure (validation, integrity gate, the
 ``missing_session_id`` guard, or a raise while building the commit envelope),
 emits a structured ``{success:false, error:{code, message, details:[<per-entry>]}}``
 envelope on stdout, exits non-zero, and leaves ZERO filesystem mutation —
 ``scan_max_epic_id`` is unchanged and no ``specs/fn-N-*.md`` orphan remains
-(fn-630 extended the fn-623 atomicity invariant across the write + envelope
-phases). The lone carve-out is a hard commit failure AT the ``emit()`` boundary,
+(the atomicity invariant holds across the write + envelope phases).
+The lone carve-out is a hard commit failure AT the ``emit()`` boundary,
 which prints ``commit_failed`` and leaves the written tree on disk uncommitted
 per the §10 no-rollback policy (the next mutating verb's auto-commit sweeps it).
 Codes:
 
-- ``missing_session_id`` — ``CLAUDE_CODE_SESSION_ID`` is unset (fn-630): scaffold
+- ``missing_session_id`` — ``CLAUDE_CODE_SESSION_ID`` is unset: scaffold
   cannot build its commit envelope, so it refuses up front rather than writing a
   tree it could not commit
 - ``bad_yaml`` — parse/shape/type failure
@@ -32,7 +32,7 @@ Codes:
 - ``dep_cycle`` — the resolved in-memory graph has a cycle
 - ``ref_invalid`` — snippet/bundle regex rejected a ref, or a ``sketch/<name>``
   ref failed to resolve at write time against the cwd-derived project root
-  (fn-610 inlines resolvable sketches into the persisted ``snippets`` list so
+  (resolvable sketches inline into the persisted ``snippets`` list so
   worker-time ``render-spec`` never sees an unresolvable cross-project ref)
 - ``epic_dep_invalid`` — a declared ``epic.depends_on_epics`` id is malformed,
   nonexistent, or duplicated
@@ -42,8 +42,8 @@ Codes:
 - ``tier_invalid`` — per-task ``tier`` is missing, or its value is not one of
   ``TASK_TIERS`` (``medium | high | xhigh | max``). Type errors on the field
   surface as ``bad_yaml`` instead. The field is REQUIRED on every task entry
-  (fn-594) — a missing ``tier:`` is bucketed under ``tier_invalid`` alongside
-  unknown-value rejections; build-forward, no back-compat null default.
+  — a missing ``tier:`` is bucketed under ``tier_invalid`` alongside
+  unknown-value rejections; no null default.
 - ``id_collision`` — backstop: the just-allocated epic or task path already exists
 - ``duplicate_epic`` — a sibling epic with the same slug already exists in this
   project. Pass ``--allow-duplicate`` to mint a distinct ``fn-N`` with the same
@@ -477,14 +477,14 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     from planctl.store import atomic_write, atomic_write_json, load_json, now_iso
 
     file_arg: str = args.file
-    # fn-623 dup guard escape hatch: when set, scaffold mints a distinct fn-N
+    # Dup guard escape hatch: when set, scaffold mints a distinct fn-N
     # even when a sibling epic with the same slug already exists. Defaults to
     # False so the common-case planner mistake (re-scaffolding the same idea
     # with the same title) hard-errors with ``duplicate_epic`` and the human
     # has to opt in explicitly. Threaded from cli.scaffold_cmd via SimpleNamespace.
     allow_duplicate: bool = getattr(args, "allow_duplicate", False)
 
-    # fn-15: internal-only close-provenance stamp. When the /plan:close saga's
+    # Internal-only close-provenance stamp. When the /plan:close saga's
     # scaffold step (run_close_finalize._scaffold_followup) mints a follow-up
     # epic, it threads the source epic id here so the minted epic JSON carries
     # ``created_by_close_of: <source>`` — the positive provenance signal
@@ -494,14 +494,12 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # spoof provenance. None when absent (plain scaffold) → no stamp written.
     created_by_close_of: str | None = getattr(args, "created_by_close_of", None)
 
-    # fn-630 (a): fail closed on a missing CLAUDE_CODE_SESSION_ID BEFORE any write.
+    # Fail closed on a missing CLAUDE_CODE_SESSION_ID BEFORE any write.
     # build_planctl_invocation (Phase 5) is the SOLE consumer of this env var and
-    # runs AFTER the full epic tree is already on disk. A missing session id used
-    # to let scaffold write the complete tree, then raise at the commit boundary,
-    # orphaning an UNCOMMITTED epic — exactly the orphan-epic class fn-623 set out
-    # to kill, via a path its atomicity fix never covered (it stopped at the
-    # _epic_id_lock boundary and never extended over Phase 5). Hoisting the check
-    # here keeps the assert-all -> mutate -> emit contract honest: no resolvable
+    # runs AFTER the full epic tree is on disk. Without the early guard a missing
+    # session id would let scaffold write the complete tree, then raise at the
+    # commit boundary, orphaning an UNCOMMITTED epic. Hoisting the check here
+    # keeps the assert-all -> mutate -> emit contract honest: no resolvable
     # session id => zero filesystem mutation. build_planctl_invocation re-checks
     # this and stays the authoritative raise; this is the early fail-closed guard.
     if not os.environ.get("CLAUDE_CODE_SESSION_ID"):
@@ -637,7 +635,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                 f"epic: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
             )
 
-    # fn-595: queue_jump is optional and bool-only. Bucket type errors under
+    # queue_jump is optional and bool-only. Bucket type errors under
     # `bad_yaml` (alongside `branch` / `spec` / `snippets` / `bundles`); the
     # missing-key path defaults to False so /plan:defer YAML omitting the key
     # entirely is the canonical "no queue jump" shape. Missing on legacy YAML
@@ -683,7 +681,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # None ⇒ omitted → defaults to primary_repo at mutate time.
     # str ⇒ already canonicalised (expand_path) absolute path.
     task_target_repos: list[str | None] = []
-    # Each entry is a validated TASK_TIERS member (str). fn-594: tier is
+    # Each entry is a validated TASK_TIERS member (str). Tier is
     # REQUIRED on every task entry — missing or unknown values are bucketed
     # under `tier_invalid` upstream. Placeholder ""s land here only on entries
     # that already failed an earlier check (shape error / non-string), in which
@@ -808,7 +806,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                     )
                     task_target_repos.append(None)
 
-        # Required per-task `tier` (fn-593, hardened by fn-594). Missing field
+        # Required per-task `tier`. Missing field
         # and unknown-value both surface as `tier_invalid` — single bucket,
         # matches the `dep_invalid` / `spec_invalid` per-category pattern.
         # Type errors (non-string) remain shape failures (`bad_yaml`). Tier is
@@ -857,14 +855,14 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # Lazy epic-dep existence check: only touch disk when deps are declared,
     # keeping the no-deps common path pure-in-memory. Type/shape/dup errors
     # accumulated above are joined here so one envelope surfaces them all.
-    # fn-600: resolve cwd-then-global so a declared cross-project dep
+    # Resolve cwd-then-global so a declared cross-project dep
     # resolves cleanly (the cwd hot path catches the common local case, the
-    # global step catches the cross-project case). Ambiguous-id (legacy dup
+    # global step catches the cross-project case). Ambiguous-id (dup
     # state) surfaces as ``dep_ambiguous_id`` listing every owning project.
     if depends_on_epics and not epic_dep_errors:
         from planctl.discovery import resolve_epic_globally
 
-        # fn-20: normalize each declared dep to its resolved FULL slug id so a
+        # Normalize each declared dep to its resolved FULL slug id so a
         # number-only ``fn-N`` declaration persists canonically. Only rebind
         # when every dep resolves cleanly (no ambiguous / not-found error).
         normalized_deps: list[str] = []
@@ -928,7 +926,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             tier_errors,
         )
 
-    # --- fn-610 / fn-628: inline `sketch/` refs at write time ----------
+    # --- Inline `sketch/` refs at write time ----------
     # Resolve every `sketch/<name>` ref against the cwd-derived project
     # (where /sketch saved the sketch). Inlined ids fold into the
     # record's `snippets`; the sketch ref is dropped from `bundles` so
@@ -994,7 +992,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             )
             # Preserve the original (bundles, snippets) so collect-all
             # surfaces every error in one envelope without earlier slots
-            # poisoning later resolution decisions (matches fn-610 behavior).
+            # poisoning later resolution decisions (matches sketch-ref behavior).
             resolved_task_bundles_list.append(list(task_bundles_list[i - 1]))
             resolved_task_snippets_list.append(list(task_snippets_list[i - 1]))
         else:
@@ -1033,13 +1031,13 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # ------------------------------------------------------------------
     # Phase 3: allocate ids under the global flock; backstop existence
     # ------------------------------------------------------------------
-    # `ctx` was resolved above for sketch anchoring (fn-610); reuse it.
+    # `ctx` was resolved above for sketch anchoring; reuse it.
     data_dir = ctx.data_dir
     primary_repo = str(ctx.project_path)
 
     with _epic_id_lock():
         # ----------------------------------------------------------------
-        # fn-623 dup guard: reject a same-slug sibling epic up front so
+        # Dup guard: reject a same-slug sibling epic up front so
         # the planner-mistake "re-scaffold the same idea with the same
         # title" surfaces as a typed error instead of silently allocating
         # a second fn-N with the same slug. Runs BEFORE id allocation /
@@ -1137,7 +1135,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         # --------------------------------------------------------------
         # Phase 4: assemble in-memory tree → integrity check → write
         # --------------------------------------------------------------
-        # fn-587 task .3: build the full in-memory tree first so the shared
+        # Build the full in-memory tree first so the shared
         # ``check_epic_tree_in_memory`` helper can re-verify structural
         # integrity BEFORE any ``atomic_write_json`` lands a partial tree.
         # The check is belt-and-suspenders over scaffold's own Phase-2 YAML
@@ -1145,7 +1143,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         # (primary_repo ``.git/`` + samefile, touched_repos ``.git/``) that
         # scaffold's incremental shape pass deliberately skips.
         #
-        # fn-623 atomicity fix: NO spec file is written to its final path
+        # NO spec file is written to its final path
         # before the integrity gate passes. The helper accepts the epic
         # spec content in-memory via ``epic_spec_content=``; task spec
         # content already flows through as a dict. Result: a scaffold
@@ -1171,7 +1169,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             "touched_repos": touched_repos,
             "snippets": list(epic_snippets),
             "bundles": list(epic_bundles),
-            # fn-595: queue_jump rides the JSON for consistency, but the
+            # queue_jump rides the JSON for consistency, but the
             # authoritative source for keeper's projection is the
             # planctl_invocation envelope (see invocation.py
             # build_planctl_invocation + the EpicSnapshot UPDATE-omit carve-out).
@@ -1182,7 +1180,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             "updated_at": now,
         }
 
-        # fn-15: when the close saga supplies the source epic id, stamp positive
+        # When the close saga supplies the source epic id, stamp positive
         # provenance onto the minted follow-up. The key rides the same
         # ``epic_def`` dict — and therefore the same single ``atomic_write_json``
         # below — so a crash leaves either no follow-up file or a complete
@@ -1205,8 +1203,8 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                 "priority": None,
                 "depends_on": depends_on,
                 "target_repo": resolved_task_target_repos[i - 1],
-                # fn-593: planner-chosen tier rides the scaffold YAML through
-                # to the persisted task_def. fn-594 made the field required at
+                # Planner-chosen tier rides the scaffold YAML through
+                # to the persisted task_def. The field is required at
                 # mint time — every value reaching here is a validated
                 # TASK_TIERS member (the missing / unknown / non-string paths
                 # accumulated envelope-failing errors above and never made it
@@ -1237,7 +1235,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         existing_epic_ids.add(epic_id)
         existing_epic_deps[epic_id] = list(epic_def.get("depends_on_epics", []))
 
-        # fn-600: extend the existence + cycle universe across every
+        # Extend the existence + cycle universe across every
         # discovered project so a cross-project dep declared in the YAML
         # passes the integrity helper's existence check (the local
         # ``existing_epic_ids`` won't carry the sibling-project dep id), and
@@ -1265,14 +1263,13 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
 
         from planctl.integrity import check_epic_tree_in_memory
 
-        # fn-589 task .1 (item 1): the inline integrity gate now asserts
-        # filesystem-repo validity (primary_repo / touched_repos / per-task
-        # target_repo paths point at real ``.git/``-bearing dirs) so the
-        # trailing ``planctl validate --epic`` the skill used to fire after
-        # scaffold is no longer needed.  The fresh-mint tree references local
-        # paths (resolved on the minting host), so the check is safe here.
+        # The inline integrity gate asserts filesystem-repo validity
+        # (primary_repo / touched_repos / per-task target_repo paths point at
+        # real ``.git/``-bearing dirs) so no trailing ``planctl validate
+        # --epic`` is needed after scaffold.  The fresh-mint tree references
+        # local paths (resolved on the minting host), so the check is safe here.
         #
-        # fn-623: ``epic_spec_content=epic_spec`` lets the helper assert
+        # ``epic_spec_content=epic_spec`` lets the helper assert
         # epic-spec presence from RAM instead of from
         # ``data_dir/specs/<eid>.md`` — so we have NOT written any spec
         # file yet, and the integrity gate is the last point before the
@@ -1291,7 +1288,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         )
 
         if integ_errors:
-            # fn-623: nothing was written before the gate — no rollback to
+            # Nothing was written before the gate — no rollback to
             # do. ``scan_max_epic_id`` is unchanged (no ``epics/`` or
             # ``specs/`` file landed for this epic_id) and the verb is a
             # pure no-op on disk.
@@ -1380,7 +1377,7 @@ def main() -> int:  # pragma: no cover — module-level helper (rare manual call
         action="store_true",
         help=(
             "Mint a distinct fn-N even when an epic with the same slug "
-            "already exists in this project (fn-623 escape hatch)."
+            "already exists in this project (escape hatch)."
         ),
     )
     ns = parser.parse_args()

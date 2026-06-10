@@ -60,7 +60,7 @@ def run(args: SimpleNamespace) -> int:
     task_def["updated_at"] = now_iso()
     atomic_write_json(task_path, task_def)
 
-    # fn-587 task .4: re-stamp last_validated_at on the parent epic after the
+    # Re-stamp last_validated_at on the parent epic after the
     # structural write lands. The shared helper validates the post-mutation
     # tree and either returns a fresh stamp or emits a failure envelope.
     from planctl.validation_restamp import restamp_epic_or_fail
@@ -73,7 +73,7 @@ def run(args: SimpleNamespace) -> int:
     epic_def["last_validated_at"] = new_stamp
     atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. All three writes
+    # Route through the central seam. All three writes
     # (spec markdown + task JSON + epic JSON) are rewrites of pre-existing
     # tracked files (atomic_write rename-atomic) → no unwind.
     emit(

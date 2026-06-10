@@ -1,6 +1,6 @@
 """planctl close-finalize - encode the close saga in Python from observable state.
 
-The fn-12 crush rebuilds ``/plan:close`` as a content-blind coordinator.
+``/plan:close`` is a content-blind coordinator.
 ``close-finalize <epic_id>`` is the saga step: it derives its position purely
 from observable state (the persisted audit artifacts + the epic's own status) —
 there is NO saga-state file. It runs every reversible check FIRST and performs
@@ -317,7 +317,7 @@ def _scaffold_followup(ctx, followup_yaml_path: Path, source_epic_id: str) -> st
     ``SCAFFOLD_FAILED``. Scaffold owns its own ``.planctl/`` commit via
     ``emit()``; finalize never commits the follow-up tree itself.
 
-    fn-15: the SimpleNamespace carries ``created_by_close_of=source_epic_id``,
+    The SimpleNamespace carries ``created_by_close_of=source_epic_id``,
     the internal-only provenance arg scaffold reads via ``getattr``. The minted
     follow-up epic JSON therefore stamps ``created_by_close_of: <source>`` in the
     same atomic write as the rest of the epic — the positive signal
@@ -455,7 +455,9 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912 — single saga
         try:
             verdict = json.loads(vp.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError) as exc:
-            _emit_finalize_error("VERDICT_CORRUPT", f"could not read verdict {vp}: {exc}")
+            _emit_finalize_error(
+                "VERDICT_CORRUPT", f"could not read verdict {vp}: {exc}"
+            )
 
     # 5. re-derive commit_set_hash FRESH; mismatch vs the verdict's stamp →
     #    STALE_ARTIFACTS (a commit landed after the audit). Refuse, never delete.

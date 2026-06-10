@@ -63,7 +63,7 @@ def run(args: SimpleNamespace) -> int:
 
     # Stamp → None transition: write marker and route through the central seam.
     # Rewrite of a pre-existing tracked file (atomic_write rename-atomic) → no
-    # unwind (fn-629 task .3).
+    # unwind (routed through the central seam).
     epic_def["last_validated_at"] = None
     epic_def["updated_at"] = now_iso()
     atomic_write_json(epic_path, epic_def)

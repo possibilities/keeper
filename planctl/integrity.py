@@ -1,4 +1,4 @@
-"""Shared per-epic structural-integrity check (fn-587 task .3).
+"""Shared per-epic structural-integrity check.
 
 Factored out of ``run_validate.py``'s ``--epic`` block so scaffold (fresh-mint)
 and refine-apply (rewrite) can run the same check before stamping
@@ -135,18 +135,17 @@ def _check_epic_tree(  # noqa: PLR0912, PLR0915 — single linear check matches 
         in the global map but NOT in *all_epic_ids* surfaces no error (this
         is the cross-project happy path); a dep id absent from BOTH still
         errors as before. When None, only *all_epic_ids* participates, so
-        single-project test fixtures stay bit-identical (fn-600).
+        single-project test fixtures stay bit-identical.
     epic_spec_content:
         Optional in-memory epic spec markdown. When provided, the on-disk
         spec-file existence check at ``data_dir/specs/<eid>.md`` is skipped
         — the caller has the content in memory and is asserting it is
-        present. Used by scaffold's pre-write integrity gate (fn-623) so
+        present. Used by scaffold's pre-write integrity gate so
         no spec file lands on disk before integrity passes; the invariant
         "scaffold that fails the integrity gate leaves zero orphaned
         ``specs/fn-N-*.md``" then holds without rollback bookkeeping. When
-        None (the default), the on-disk check fires as before — bit-
-        identical to pre-fn-623 behavior for ``validate --epic`` and any
-        legacy in-memory caller that materialises the spec on disk first.
+        None (the default), the on-disk check fires for ``validate --epic``
+        and any in-memory caller that materialises the spec on disk first.
     """
     from planctl.deps import detect_cycles
     from planctl.ids import epic_id_from_task, is_epic_id, is_task_id
@@ -177,12 +176,11 @@ def _check_epic_tree(  # noqa: PLR0912, PLR0915 — single linear check matches 
             errors.append(f"Epic {eid}: spec file missing at specs/{eid}.md")
 
     # --- Epic-level depends_on_epics --------------------------------------
-    # fn-600: cross-project deps resolve via the optional ``all_global_epic_ids``
+    # Cross-project deps resolve via the optional ``all_global_epic_ids``
     # map. A dep id present in the project-local set OR the cross-project
     # global map is "exists"; absent from both is a hard error. When the
-    # global map is None (legacy single-repo path / older fixtures), the
-    # check falls back to the project-local set only — bit-identical to the
-    # pre-fn-600 behavior for callers that don't opt in.
+    # global map is None (single-repo path / older fixtures), the
+    # check falls back to the project-local set only.
     for dep_eid in epic_data.get("depends_on_epics", []):
         if dep_eid == eid:
             errors.append(f"Epic {eid}: self-referential dependency")
@@ -369,19 +367,19 @@ def check_epic_tree_in_memory(
     field surfaces before any ``atomic_write_json`` lands the tree.  When
     None, the epic-dep cycle check is skipped.
 
-    ``all_global_epic_ids`` (fn-600) is the cross-project ``{epic_id:
+    ``all_global_epic_ids`` is the cross-project ``{epic_id:
     project_path}`` index — scaffold passes ``scan_epic_ids_global`` output
     so a declared cross-project dep resolves cleanly through the existence
     check.  When None, only the project-local *all_epic_ids* participates
-    (single-repo fallback, bit-identical to pre-fn-600 behaviour).
+    (single-repo fallback).
 
-    ``epic_spec_content`` (fn-623) lets the caller assert the epic spec is
+    ``epic_spec_content`` lets the caller assert the epic spec is
     present by passing its in-memory markdown instead of writing a temp
     file to ``data_dir/specs/<eid>.md`` before the check. Scaffold's
     pre-write integrity gate sets this so NO spec file lands on disk
-    before integrity passes — closing the orphan-spec leak that advanced
-    ``scan_max_epic_id`` on non-clean exits. When None, the on-disk check
-    fires as before (bit-identical to pre-fn-623 callers).
+    before integrity passes — closing the orphan-spec leak that would
+    advance ``scan_max_epic_id`` on non-clean exits. When None, the on-disk
+    check fires.
     """
     return _check_epic_tree(
         eid,
@@ -462,7 +460,7 @@ def validate_epic_integrity_with_warnings(
     # edge case).
     all_epic_deps[epic_id] = list(epic_data.get("depends_on_epics", []))
 
-    # fn-600: extend the existence + cycle universe across every discovered
+    # Extend the existence + cycle universe across every discovered
     # project so a cross-project dep resolves cleanly (existence check) and
     # a cross-project A -> B -> A cycle surfaces here (cycle check). Fail-
     # soft on discovery: an unconfigured / empty ``roots`` yields an empty

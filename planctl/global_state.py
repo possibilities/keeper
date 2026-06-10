@@ -115,8 +115,8 @@ def _compute_workable_tasks(
       their natural epic-grouped order (tasks first within each epic, close
       item appended after).  Used by renderers that need the original flat list.
     - ``blocked_epics`` — dict keyed ``<project>::<epic_id>`` → inner dict
-      ``{"blocked_pending": [...], "blocked_dangling": [...]}`` (fn-600
-      task .2).  ``blocked_pending`` carries dep ids that resolved (same-
+      ``{"blocked_pending": [...], "blocked_dangling": [...]}``.
+      ``blocked_pending`` carries dep ids that resolved (same-
       project or cross-project via the ``by_id`` overlay) but whose dep epic
       is not yet runtime-complete.  ``blocked_dangling`` carries dep ids that
       resolved nowhere.  Only epics with at least one unmet dep appear.
@@ -126,8 +126,8 @@ def _compute_workable_tasks(
     # gate can call derive_task_runtime_status without a second scan.  Iterate
     # ALL bundles (open + done) so cross-epic deps within the same project and
     # deps into closed epics resolve.
-    # fn-600 task .2: dep_epic_by_id maps epic_id → (owner_proj, epic_dict,
-    # tasks_list) — the cross-project fallback overlay.
+    # dep_epic_by_id maps epic_id → (owner_proj, epic_dict, tasks_list) — the
+    # cross-project fallback overlay.
     epic_status: dict[tuple[str, str], str] = {}
     task_lookup: dict[tuple[str, str], tuple[dict[str, Any], dict[str, Any]]] = {}
     dep_epic_lookup: dict[
@@ -194,9 +194,9 @@ def _compute_workable_tasks(
             # Epic is blocked — skip workable/close-ready derivation.
             continue
 
-        # fn-337 task .3: cross-epic dep gate tightened — a dep epic is
-        # satisfied only when derive_epic_runtime_status == "complete".
-        # fn-600 task .2: dep_epic_by_id supplies the cross-project fallback.
+        # Cross-epic dep gate: a dep epic is satisfied only when
+        # derive_epic_runtime_status == "complete".
+        # dep_epic_by_id supplies the cross-project fallback.
         if not _dep_epics_runtime_complete(
             epic_deps, proj, dep_epic_lookup, dep_epic_by_id
         ):
@@ -204,7 +204,7 @@ def _compute_workable_tasks(
 
         tasks = b.get("tasks") or []
 
-        # fn-313: dep gate tightened — a depends_on entry is satisfied only when
+        # Dep gate: a depends_on entry is satisfied only when
         # derive_task_runtime_status(dep_task, dep_epic, proj) == "complete".
         # A dep id with no task_lookup resolution is treated as not-complete
         # (hidden).

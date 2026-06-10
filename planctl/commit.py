@@ -3,15 +3,14 @@
 Every mutating planctl verb's stdout envelope carries a ``planctl_invocation``
 payload (see ``planctl.invocation.build_planctl_invocation``).  The runner-side
 ``emit()`` calls :func:`auto_commit_from_invocation` to land the corresponding
-``chore(planctl): <op> <target>`` commit inline.  Replaces the deleted
-seven-seam ``planctl commit-plan`` model (fn-488 → fn-587).
+``chore(planctl): <op> <target>`` commit inline.
 
 This module exposes one public entry point — :func:`auto_commit_from_invocation`.
 There is no flock: each commit is pathspec-scoped to its own exact files
 (``git commit -F - -- <files>``), so concurrent same-repo verbs never
 cross-contaminate, and a bounded full-jitter retry handles the two git lock
 domains (``index.lock`` for staging, ref-lock for the commit) by re-running
-add+commit from the current HEAD each attempt (fn-640).
+add+commit from the current HEAD each attempt.
 """
 
 from __future__ import annotations
@@ -243,7 +242,7 @@ def _build_message_with_trailers(
                                         from ``CLAUDE_CODE_SESSION_ID``). Lets the
                                         keeper derive the creator/refiner edge
                                         from the durable commit instead of the
-                                        fragile stdout-envelope scrape (fn-695).
+                                        fragile stdout-envelope scrape.
                                         OMITTED — never stamped empty — when
                                         ``session_id`` is absent (manual CLI /
                                         non-interactive); the commit still
@@ -338,7 +337,7 @@ def auto_commit_from_invocation(payload: dict[str, Any]) -> str | None:
 
     op = payload.get("op", "")
     target = payload.get("target") or ""
-    # fn-695: the committing session id (CLAUDE_CODE_SESSION_ID), carried on the
+    # The committing session id (CLAUDE_CODE_SESSION_ID), carried on the
     # envelope by build_planctl_invocation. Fail-open — when absent (older
     # envelope shapes / manual non-interactive calls) the Session-Id trailer is
     # simply omitted and the commit still lands.

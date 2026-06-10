@@ -1,6 +1,6 @@
 """planctl close-preflight - read-only close-readiness fetch + brief write.
 
-The fn-12 crush rebuilds ``/plan:close`` as a content-blind coordinator:
+``/plan:close`` is a content-blind coordinator:
 ``close-preflight`` is the pre-pipeline brief handoff (the symmetric bookend to
 ``claim``'s worker brief). It assembles the audit brief — source commit groups,
 the ordinal-ordered task list with status + done summaries, and the canonical

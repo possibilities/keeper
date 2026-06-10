@@ -1,4 +1,4 @@
-"""planctl refine-apply - Apply a refine delta to an EXISTING epic tree (fn-565).
+"""planctl refine-apply - Apply a refine delta to an EXISTING epic tree.
 
 Refine's mutating equivalent of ``scaffold``, but over an epic that already
 exists. Reads a single YAML *delta* describing four kinds of change and applies
@@ -45,8 +45,8 @@ envelope on stdout and exits non-zero, having written nothing. Codes:
 - ``tier_invalid`` — per-``add_tasks`` entry ``tier`` is missing, or its value
   is not one of ``TASK_TIERS`` (``medium | high | xhigh | max``). Type errors
   on the field surface as ``bad_yaml`` instead. The field is REQUIRED on every
-  new task entry (fn-594) — mirrors scaffold's enforcement; build-forward, no
-  back-compat null default. ``rewrite_specs`` and ``rewire_deps`` do not mint
+  new task entry — mirrors scaffold's enforcement; no null default.
+  ``rewrite_specs`` and ``rewire_deps`` do not mint
   new tasks and do not need tier validation.
 - ``id_collision`` — backstop: a just-allocated new-task path already exists
 
@@ -277,7 +277,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # None ⇒ omitted → defaults to epic.primary_repo at mutate time.
     # str ⇒ already canonicalised (expand_path) absolute path.
     new_target_repos: list[str | None] = []
-    # fn-594: tier is REQUIRED on every add_tasks entry — mirrors scaffold's
+    # Tier is REQUIRED on every add_tasks entry — mirrors scaffold's
     # enforcement. Each entry is a validated TASK_TIERS member; placeholder
     # ""s land here only on entries that already failed an earlier check
     # (shape error / non-string / missing / unknown), in which case the verb
@@ -401,7 +401,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                     )
                     new_target_repos.append(None)
 
-        # Required per-task `tier` (fn-594) — mirrors scaffold's three-class
+        # Required per-task `tier` — mirrors scaffold's three-class
         # triage. Missing field and unknown value both surface as
         # `tier_invalid`; type errors (non-string) remain shape failures
         # (`bad_yaml`). Build-forward: no back-compat null default for new
@@ -510,7 +510,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             tier_errors,
         )
 
-    # --- fn-610 / fn-628: inline `sketch/` refs at write time ----------
+    # --- Inline `sketch/` refs at write time ----------
     # Resolve every `sketch/<name>` ref in each add_tasks entry against
     # the cwd-derived project (where /sketch saved the sketch). Inlined
     # ids fold into the entry's `snippets`; the sketch ref is dropped
@@ -721,7 +721,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
 
         # Epic JSON: bump updated_at (the new last_validated_at stamp lands
         # after Phase 4 via restamp_epic_or_fail); optionally rewrite epic
-        # spec md.  fn-587 task .4: ``last_validated_at`` is re-stamped (not
+        # spec md.  ``last_validated_at`` is re-stamped (not
         # cleared) on the post-write integrity check pass.  refine-apply's
         # own pre-write assert-all already covers cycle / target / dep
         # validity, so the helper's re-check is a defensive backstop that
@@ -782,7 +782,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                     "priority": None,
                     "depends_on": resolved_new_deps[i - 1],
                     "target_repo": resolved_new_target_repos[i - 1],
-                    # fn-594: tier rides the refine-apply YAML through to the
+                    # Tier rides the refine-apply YAML through to the
                     # persisted task_def, mirroring scaffold. Every value
                     # reaching here is a validated TASK_TIERS member; the
                     # missing / unknown / non-string paths emitted envelope-
@@ -827,7 +827,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             # orphan task JSON / spec on disk. Existing files we updated
             # mid-write are NOT in ``written_paths`` — atomic_write is
             # rename-based, so a half-update leaves the previous valid bytes
-            # in place. Mirror the fn-630 scaffold pattern. Re-raise so the
+            # in place. Mirror the scaffold pattern. Re-raise so the
             # CLI layer surfaces the failure.
             import contextlib as _ctx
 
@@ -837,7 +837,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             raise
 
     # ------------------------------------------------------------------
-    # Phase 4.5: post-write re-stamp of last_validated_at (fn-587 task .4).
+    # Phase 4.5: post-write re-stamp of last_validated_at.
     # ------------------------------------------------------------------
     # refine-apply's pre-write assert-all is comprehensive (cycle / target /
     # dep / collision), but the symmetric VALIDATION_RESTAMP_VERBS contract
@@ -845,13 +845,13 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # structured failure envelope.
     from planctl.validation_restamp import restamp_epic_or_fail
 
-    # fn-589 task .1 (item 2): assert filesystem-repo validity at refine-apply
-    # time so the trailing ``planctl validate --epic`` the skill used to fire
-    # is no longer needed.  refine-apply targets an EXISTING epic on the same
+    # Assert filesystem-repo validity at refine-apply time so no trailing
+    # ``planctl validate --epic`` is needed.
+    # refine-apply targets an EXISTING epic on the same
     # host as the worker spawn, so the resolved paths are local-and-final —
     # safe to enforce here (scaffold's fresh-mint gate already opts in via
     # ``check_epic_tree_in_memory(..., check_filesystem_repos=True)``).
-    # fn-629 task .2: the marker-restamp atomic_write_json runs OUTSIDE the
+    # The marker-restamp atomic_write_json runs OUTSIDE the
     # _epic_id_lock — the lock guards id allocation only and is deliberately
     # disjoint from the commit lock (no nesting). The re-stamp writes the
     # existing epic_path (already on disk), so a raise here leaves the

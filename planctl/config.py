@@ -1,10 +1,8 @@
-"""planctl config loader — the narrow ``roots:`` surface (fn-542).
+"""planctl config loader — the narrow ``roots:`` surface.
 
-Introduces ``~/.config/planctl/config.yaml`` carrying a single key, ``roots:``
-(a list of parent directories planctl scans for sibling planctl projects). This
-is a clean-slate config — the old watch-config surface (``config_schema.py`` /
-``helpers.py`` / ``run_config_show.py``) was deleted in fn-421 and is NOT being
-revived; only ``roots:`` lives here.
+``~/.config/planctl/config.yaml`` carries a single key, ``roots:``
+(a list of parent directories planctl scans for sibling planctl projects).
+Only ``roots:`` lives here; there is no broader config surface.
 
 Absent file → default ``roots: [~/code]``. Each root is ``expanduser``'d and
 ``resolve``'d to an absolute path. Malformed YAML / wrong-typed ``roots:`` falls
@@ -18,7 +16,7 @@ from pathlib import Path
 
 # The single narrow config file. ``XDG_CONFIG_HOME`` is intentionally NOT
 # consulted — planctl config lives at the conventional ``~/.config/planctl/``
-# path verbatim (mirrors the fn-421-deleted surface's location).
+# path verbatim.
 CONFIG_PATH = Path("~/.config/planctl/config.yaml").expanduser()
 
 # Default roots when the config file is absent or unusable.

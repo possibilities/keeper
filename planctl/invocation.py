@@ -71,7 +71,7 @@ def build_planctl_invocation(
         Populated from ``epic.primary_repo`` for verbs targeting an epic/task;
         defaults to ``None`` (falls back to ``repo_root`` in the envelope).
     queue_jump:
-        fn-595: whether the epic requested a priority jump. Two sources set
+        Whether the epic requested a priority jump. Two sources set
         True: a ``scaffold`` whose epic YAML opts in (``queue_jump: true``),
         and the ``epic queue-jump`` verb (``/plan:next``) flipping an existing
         epic. The field is server-derived from the epic record — keeperd lifts
@@ -128,7 +128,7 @@ def build_planctl_invocation(
         "repo_root": str(repo_root),
         "state_repo": state_repo,
         "queue_jump": queue_jump,
-        # fn-695: the resolved committing session id, threaded into the
+        # The resolved committing session id, threaded into the
         # `chore(planctl)` commit's `Session-Id` trailer by
         # `auto_commit_from_invocation`. Same opaque v4 UUID the keeper hook
         # uses (job_id === session_id). Always populated here — the resolve

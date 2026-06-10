@@ -66,7 +66,7 @@ def run(args: SimpleNamespace) -> int:
         epic_def["close_reason"] = close_reason
     atomic_write_json(epic_path, epic_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of a
+    # Route through the central seam. Rewrite of a
     # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     emit(
         {

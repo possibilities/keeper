@@ -1,4 +1,4 @@
-"""planctl task set-tier — persist the worker reasoning tier on a task (fn-405).
+"""planctl task set-tier — persist the worker reasoning tier on a task.
 
 Sets ``tier`` on the task-definition JSON to one of
 ``medium | high | xhigh | max``. Used by `/plan:work` Phase 3c after the
@@ -45,7 +45,7 @@ def run(args: SimpleNamespace) -> int:
     task_def["updated_at"] = now
     atomic_write_json(task_path, task_def)
 
-    # fn-629 task .3: route through the central seam. Rewrite of a
+    # Route through the central seam. Rewrite of a
     # pre-existing tracked file (atomic_write rename-atomic) → no unwind.
     emit(
         {

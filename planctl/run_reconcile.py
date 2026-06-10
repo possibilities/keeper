@@ -1,9 +1,9 @@
-"""planctl reconcile — read-only post-worker verdict (fn-6 task .1).
+"""planctl reconcile — read-only post-worker verdict.
 
 The keystone of the content-blind ``/plan:work`` orchestrator's post-worker
 phase: ONE read-only call that collapses ``planctl show`` + source-commit
 forensics + HEAD-visibility + epic tally into a single typed verdict the
-orchestrator switches on mechanically. The symmetric bookend to fn-5's
+orchestrator switches on mechanically. The symmetric bookend to ``claim``'s
 pre-worker brief handoff.
 
 The verdict is computed entirely from planctl-native data — there is NO keeper

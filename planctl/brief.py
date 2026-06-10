@@ -1,4 +1,4 @@
-"""Out-of-band worker brief: shared assembler + atomic writer (fn-5 task .1).
+"""Out-of-band worker brief: shared assembler + atomic writer.
 
 The ``/plan:work`` orchestrator is content-blind — it never reasons over the
 epic spec or task spec; it only string-substitutes them into the worker spawn.

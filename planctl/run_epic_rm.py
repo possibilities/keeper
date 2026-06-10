@@ -1,4 +1,4 @@
-"""planctl epic rm — remove an epic and all its artifacts (fn-623 task .1).
+"""planctl epic rm — remove an epic and all its artifacts.
 
 Companion to `epic close`: where close stamps `closer_done_at` and leaves the
 epic on the board as a completed row, `rm` is the sanctioned delete verb —
