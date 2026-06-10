@@ -57,5 +57,5 @@ suite at commit time.
 - [ ] full bun test green
 
 ## Done summary
-
+Retired approval-era checks (dup-approve/approval-review) + prose from sitter, agent, charter; retuned MISSED_WAKE_DELTA 5->1 and fold-latency 5s->2s for the ~0-rescue era; made autopilot-stall armed-mode-aware; inlined isPidAlive to drop the heavy src/server-worker import; added test/babysitter-build.test.ts import-pin that goes red on the fn-756 broken-re-export class.
 ## Evidence
