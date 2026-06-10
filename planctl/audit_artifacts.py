@@ -38,6 +38,7 @@ AUDIT_SCHEMA_VERSION = 1
 #: artifact this task writes; the submit verbs (later tasks) write the rest.
 BRIEF_BASENAME = "brief.json"
 REPORT_BASENAME = "report.md"
+REPORT_META_BASENAME = "report.meta.json"
 VERDICT_BASENAME = "verdict.json"
 FOLLOWUP_BASENAME = "followup.yaml"
 
@@ -89,6 +90,11 @@ def brief_path(primary_repo: str | Path, epic_id: str) -> Path:
 def report_path(primary_repo: str | Path, epic_id: str) -> Path:
     """Absolute path to ``audits/<epic_id>/report.md`` (dir created lazily)."""
     return audit_dir(primary_repo, epic_id) / REPORT_BASENAME
+
+
+def report_meta_path(primary_repo: str | Path, epic_id: str) -> Path:
+    """Absolute path to ``audits/<epic_id>/report.meta.json`` (dir created lazily)."""
+    return audit_dir(primary_repo, epic_id) / REPORT_META_BASENAME
 
 
 def verdict_path(primary_repo: str | Path, epic_id: str) -> Path:
@@ -201,6 +207,7 @@ __all__ = (
     "AUDIT_SCHEMA_VERSION",
     "BRIEF_BASENAME",
     "REPORT_BASENAME",
+    "REPORT_META_BASENAME",
     "VERDICT_BASENAME",
     "FOLLOWUP_BASENAME",
     "ArtifactSchemaTooNewError",
@@ -208,6 +215,7 @@ __all__ = (
     "audit_dir",
     "brief_path",
     "report_path",
+    "report_meta_path",
     "verdict_path",
     "followup_path",
     "compute_commit_set_hash",

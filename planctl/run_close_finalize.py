@@ -256,6 +256,56 @@ def _close_epic(ctx, epic_id: str) -> None:
         os.chdir(prev_cwd)
 
 
+def _synthesize_verdict_if_zero_findings(
+    vp: Path, primary_repo: str, epic_id: str
+) -> dict:
+    """Return a synthetic empty verdict when the audit found 0 findings.
+
+    When the auditor reports 0 findings the close-planner is intentionally
+    skipped, so no verdict.json is written. Synthesize an in-memory empty
+    verdict from the report.meta.json sidecar — it carries commit_set_hash
+    (the staleness check needs it) plus the findings count (the ``==0`` guard
+    is the safety: a non-zero-findings audit with no verdict means the planner
+    crashed, not that it was skipped, so the ``>0`` branch still fails closed).
+
+    Fails with VERDICT_MISSING when there is no report.meta.json (audit never
+    ran) or when meta.findings > 0 (planner should have run but didn't).
+    """
+    from planctl.audit_artifacts import report_meta_path
+
+    mp = report_meta_path(primary_repo, epic_id)
+    if not mp.exists():
+        _emit_finalize_error(
+            "VERDICT_MISSING",
+            f"no verdict for {epic_id} at {vp}; run `planctl verdict submit` "
+            "(via /plan:close) before close-finalize",
+            details={"expected": str(vp)},
+        )
+    try:
+        meta = json.loads(mp.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        _emit_finalize_error(
+            "VERDICT_MISSING",
+            f"no verdict for {epic_id} at {vp}; report.meta.json unreadable: {exc}",
+            details={"expected": str(vp)},
+        )
+    audit_findings: int = meta.get("findings", -1)
+    if audit_findings != 0:
+        _emit_finalize_error(
+            "VERDICT_MISSING",
+            f"no verdict for {epic_id} at {vp}; audit reported {audit_findings} "
+            "finding(s) but no verdict was submitted — run `planctl verdict submit` "
+            "(via /plan:close) before close-finalize",
+            details={"expected": str(vp), "audit_findings": audit_findings},
+        )
+    return {
+        "fatal": False,
+        "fatal_reason": "",
+        "decisions": [],
+        "commit_set_hash": meta.get("commit_set_hash"),
+    }
+
+
 def _scaffold_followup(ctx, followup_yaml_path: Path, source_epic_id: str) -> str:
     """Mint the follow-up tree via the REAL scaffold, returning the new epic id.
 
@@ -394,18 +444,18 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912 — single saga
         return _emit_outcome(CloseOutcome.CLOSED_CLEAN, epic_id, ctx)
 
     # 4. read the persisted verdict — the saga cannot proceed without it.
+    #    When the audit found 0 findings the close-planner was intentionally
+    #    skipped; _synthesize_verdict_if_zero_findings derives an empty verdict
+    #    from report.meta.json (findings==0 guard keeps it safe: a >0-findings
+    #    audit with no verdict means the planner crashed → still fails closed).
     vp = verdict_path(primary_repo, epic_id)
     if not vp.exists():
-        _emit_finalize_error(
-            "VERDICT_MISSING",
-            f"no verdict for {epic_id} at {vp}; run `planctl verdict submit` "
-            "(via /plan:close) before close-finalize",
-            details={"expected": str(vp)},
-        )
-    try:
-        verdict = json.loads(vp.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        _emit_finalize_error("VERDICT_CORRUPT", f"could not read verdict {vp}: {exc}")
+        verdict = _synthesize_verdict_if_zero_findings(vp, primary_repo, epic_id)
+    else:
+        try:
+            verdict = json.loads(vp.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as exc:
+            _emit_finalize_error("VERDICT_CORRUPT", f"could not read verdict {vp}: {exc}")
 
     # 5. re-derive commit_set_hash FRESH; mismatch vs the verdict's stamp →
     #    STALE_ARTIFACTS (a commit landed after the audit). Refuse, never delete.

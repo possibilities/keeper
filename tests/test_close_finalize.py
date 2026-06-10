@@ -26,8 +26,10 @@ from pathlib import Path
 
 from click.testing import CliRunner
 from planctl.audit_artifacts import (
+    AUDIT_SCHEMA_VERSION,
     compute_commit_set_hash,
     followup_path,
+    report_meta_path,
     verdict_path,
     write_artifact,
     write_brief_artifact,
@@ -115,6 +117,22 @@ def _seed_verdict(
     }
     write_artifact(
         verdict_path(repo, epic_id), json.dumps(record, indent=2, sort_keys=True) + "\n"
+    )
+
+
+def _seed_report_meta(
+    repo: Path, epic_id: str, commit_set_hash: str, findings: int, risk: str = "Low"
+) -> None:
+    meta = {
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "epic_id": epic_id,
+        "commit_set_hash": commit_set_hash,
+        "findings": findings,
+        "risk": risk,
+    }
+    write_artifact(
+        report_meta_path(repo, epic_id),
+        json.dumps(meta, indent=2, sort_keys=True) + "\n",
     )
 
 
@@ -465,17 +483,53 @@ def test_stale_artifacts_refusal(planctl_git_repo):
     assert _epic_status(repo, epic_id) == "open"
 
 
-def test_missing_verdict_fails_closed(planctl_git_repo):
+def test_missing_verdict_no_meta_fails_closed(planctl_git_repo):
+    """No verdict.json AND no report.meta.json → VERDICT_MISSING (audit never ran)."""
     repo = planctl_git_repo
     epic_id, task_ids = seed_epic(repo, title="No verdict", n_tasks=1)
     _mark_all_done(repo, task_ids)
     _seed_brief(repo, epic_id, _empty_set_hash())
-    # No verdict.json written.
+    # No verdict.json, no report.meta.json.
 
     r = _finalize(epic_id)
     assert r.exit_code == 1, r.output
     env = _envelope(r.output)
     assert env["error"]["code"] == "VERDICT_MISSING"
+    assert _epic_status(repo, epic_id) == "open"
+
+
+def test_zero_findings_no_verdict_closes_clean(planctl_git_repo):
+    """No verdict.json but meta.findings==0 → synthesize empty verdict → closed_clean."""
+    repo = planctl_git_repo
+    epic_id, task_ids = seed_epic(repo, title="Zero findings skip", n_tasks=1)
+    _mark_all_done(repo, task_ids)
+    h = _empty_set_hash()
+    _seed_brief(repo, epic_id, h)
+    _seed_report_meta(repo, epic_id, h, findings=0)
+    # No verdict.json written — the close-planner was intentionally skipped.
+
+    r = _finalize(epic_id)
+    assert r.exit_code == 0, r.output
+    env = _envelope(r.output)
+    assert env["outcome"] == "closed_clean"
+    assert _epic_status(repo, epic_id) == "done"
+
+
+def test_nonzero_findings_no_verdict_fails_closed(planctl_git_repo):
+    """No verdict.json but meta.findings>0 → planner crashed → VERDICT_MISSING."""
+    repo = planctl_git_repo
+    epic_id, task_ids = seed_epic(repo, title="Planner crashed", n_tasks=1)
+    _mark_all_done(repo, task_ids)
+    h = _empty_set_hash()
+    _seed_brief(repo, epic_id, h)
+    _seed_report_meta(repo, epic_id, h, findings=2, risk="Medium")
+    # No verdict.json — audit found findings but the planner never ran.
+
+    r = _finalize(epic_id)
+    assert r.exit_code == 1, r.output
+    env = _envelope(r.output)
+    assert env["error"]["code"] == "VERDICT_MISSING"
+    assert env["error"]["details"]["audit_findings"] == 2
     assert _epic_status(repo, epic_id) == "open"
 
 

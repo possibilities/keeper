@@ -36,7 +36,7 @@ planctl close-preflight "$ARGUMENTS"
 **On success**, pin these envelope fields — process facts only, no prose:
 
 - `primary_repo` — planctl state repo; passed to the close-planner and to `close-finalize --project`.
-- `brief_ref` — close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`). Both agents read it themselves; the closer never opens it. It carries the task list, done summaries, commit groups, and pre-rendered snippet context out-of-band.
+- `brief_ref` — close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`). Both agents read it themselves; the closer never opens it. It carries the task list, done summaries, and commit groups out-of-band.
 - `commit_set_hash` — canonical pin of the source commit set; the closer does not act on it (the submit verbs stamp it; `close-finalize` re-checks it for staleness).
 - `epic_id` — the parent epic id (echo of the validated input).
 
@@ -46,7 +46,7 @@ Capture the `[instructions]` tail (anything after the epic id in `$ARGUMENTS`) v
 
 ## Phase 2 — Audit (spawn quality-auditor blind)
 
-Spawn the quality-auditor with a config-only prompt — `EPIC_ID` and `BRIEF_REF`, nothing else. The auditor reads the brief itself (commit groups, snippet context, done summaries) and persists its report via `audit submit`; the closer never inlines audit prose.
+Spawn the quality-auditor with a config-only prompt — `EPIC_ID` and `BRIEF_REF`, nothing else. The auditor reads the brief itself (commit groups, done summaries) and persists its report via `audit submit`; the closer never inlines audit prose.
 
 ```
 Task(
