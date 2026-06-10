@@ -70,4 +70,5 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 | Lint | `uv run ruff check .` |
 | Format | `uv run ruff format .` |
 | Type check | `uv run ty check` |
-| Test | `uv run pytest tests/` |
+| Test (fast gate) | `uv run pytest tests/` — near-subprocess-free fast bucket; slow-bucket tests (`real_git`/`integration`/`wire`/`real_promptctl`) skip-by-default, visible as skips |
+| Test (full suite) | `uv run pytest tests/ --run-slow` — runs everything incl. the slow bucket (real git/promptctl/wire machinery) |

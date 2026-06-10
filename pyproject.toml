@@ -16,15 +16,18 @@ requires = ["hatchling"]
 build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
-# fn-638: -n auto parallelises across CPU cores (881 tests, ~3x speedup);
-# --timeout=30 lifts the prior 3s wall that was sub-budget for tests doing
-# real `scaffold` work (git init + `promptctl inline-sketch-refs` subprocess
-# + multiple commit subprocesses under flock). 30s still catches genuine
-# hangs without flagging routine subprocess-heavy paths under xdist load.
-# --strict-markers turns a typo'd or unregistered @pytest.mark into a
-# collection error, so every marker must be registered (see
-# tests/conftest.py::pytest_configure) — guards the `real_git` / `integration`
-# split against silent no-op misspellings.
+# The default run is the fast gate: autouse stubs in tests/conftest.py close
+# every subprocess seam (git config / status / commit, `promptctl render-spec`
+# / `inline-sketch-refs`, the ~/code discovery scan), so unmarked tests spawn
+# near-zero subprocesses. Slow-bucket tests (markers `real_git` / `integration`
+# / `wire` / `real_promptctl`) are skipped-by-default and re-enabled with
+# `--run-slow` (a pytest_collection_modifyitems hook adds pytest.mark.skip so
+# they stay VISIBLE as skips, never silently deselected via an addopts `-m`).
+# -n auto parallelises across CPU cores; --timeout=30 catches genuine hangs
+# (slow-bucket tests still do real `scaffold` git/subprocess work under
+# `--run-slow`). --strict-markers turns a typo'd or unregistered @pytest.mark
+# into a collection error, so every marker must be registered (see
+# tests/conftest.py::pytest_configure).
 addopts = "--import-mode=importlib --timeout=30 -n auto --strict-markers"
 testpaths = ["tests"]
 

@@ -25,6 +25,13 @@ import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
+# Claim resolves a task's owning project through real ``roots`` discovery
+# (``_roots_at_tmp_project`` below points it at a controlled tmp root, never the
+# real ``~/code``). Opt the whole module out of the autouse empty-discovery
+# isolation so that real resolution runs. ``real_roots`` is a fast-path marker —
+# these tests stay in the fast gate.
+pytestmark = pytest.mark.real_roots
+
 
 @pytest.fixture(autouse=True)
 def _roots_at_tmp_project(tmp_path, monkeypatch):
