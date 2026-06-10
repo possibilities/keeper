@@ -531,38 +531,46 @@ def scaffold_cmd(file, allow_duplicate):
 _CLOSE_PREFLIGHT_AGENT_HELP = """\
 planctl close-preflight <epic_id>
 
-Read-only close-readiness fetch for the /plan:close skill. Collapses the
-Phase 0a/2 hand-fired sequence (`show` for primary_repo, `tasks` for the
-readiness confirm, the `set -eo pipefail` COMMIT_GROUPS bash pipeline, and the
-`promptctl render-spec` snippet fetch) into one verb returning a single
-envelope. Resolution is cwd-based via `resolve_project` — /plan:close already
-`cd`s to primary_repo in Phase 0a, so no epic-keyed discovery is needed.
+Close-phase brief handoff for the /plan:close coordinator — the symmetric
+bookend to `claim`'s worker brief. Assembles the audit brief (snippet context,
+source commit groups, the ordinal-ordered task list with status + done
+summaries, the canonical commit_set_hash) and persists it commit-free under
+gitignored `<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`, then
+returns a content-blind envelope carrying only the handle + the hash. Resolution
+is cwd-based via `resolve_project` (or `--project <abs>`).
+
+The id argument names the PARENT EPIC. Close operates only on a fully-done epic:
+a not-all-done epic is a typed `TASKS_NOT_DONE` error, never a `false` data
+field. A task-shaped id is rejected with a pointer to the parent epic.
 
 Returned envelope (success, exit 0):
 
   {"success": true,
    "primary_repo": "<abs-path>",
    "tasks": [{"id", "title", "status"}, ...],
-   "all_done": <bool>,         # every task status == "done"
-   "commit_groups": [{"repo", "shas": [...]}, ...],
-   "snippet_context": "<promptctl render-spec output>",
+   "all_done": true,           # always true on success (else TASKS_NOT_DONE)
+   "brief_ref": "<abs-path>",  # the written audits/<epic_id>/brief.json
+   "commit_set_hash": "<hex>", # pins the source commit set for close-finalize
    "planctl_invocation": {...}}   # read-only invocation line (decorator-emitted)
 
-`commit_groups` is assembled in-process by a native `git log --grep` +
-`git interpret-trailers --parse` trailer scan over the epic's resolved repo set
-(`planctl.commit_lookup`), grouped by repo in first-seen order. It FAILS LOUD
-only when every repo in the scan set is missing or not a git repo; a clean miss
-yields `commit_groups: []`. `snippet_context` shells `promptctl render-spec
-<epic_id> --format human` with cwd=primary_repo; empty stdout → "".
+The envelope carries NO prose: `snippet_context` and `commit_groups` live ONLY
+in the brief file, which the quality-auditor reads itself. The brief write is
+atomic + commit-free (runtime-state-only, like `claim`), so this verb draws no
+`.planctl/` commit. The brief is assembled fully BEFORE any write — a render
+failure strands nothing on disk. `commit_groups` is a native `git log --grep` +
+`git interpret-trailers --parse` trailer scan grouped by repo in first-seen
+order; a clean miss yields `commit_groups: []` inside the brief.
 
 Failure envelope (no mutation; exit 1):
 
   {"success": false,
    "error": {"code": "<code>", "message": "<msg>", "details": {...}}}
 
-Codes: `BAD_EPIC_ID`, `EPIC_NOT_FOUND`, `COMMIT_LOOKUP_FAILED` (every repo in
-the scan set missing or not a git repo; `details.broken_repos` lists them),
-`SNIPPET_RENDER_FAILED` (render-spec non-zero exit).
+Codes: `BAD_EPIC_ID` (garbage id, or a task-shaped id naming its parent epic in
+`details`), `EPIC_NOT_FOUND`, `TASKS_NOT_DONE` (`details.not_done` lists the
+non-done ids), `COMMIT_LOOKUP_FAILED` (every repo in the scan set missing or not
+a git repo; `details.broken_repos` lists them), `SNIPPET_RENDER_FAILED`
+(render-spec non-zero exit).
 """
 
 
@@ -580,7 +588,7 @@ the scan set missing or not a git repo; `details.broken_repos` lists them),
 )
 @agent_help_option(_CLOSE_PREFLIGHT_AGENT_HELP)
 def close_preflight_cmd(epic_id, project):
-    """Read-only close-readiness fetch: emit {primary_repo, tasks, all_done, commit_groups, snippet_context} for /plan:close (fn-565)."""
+    """Close-phase brief handoff: write audits/<epic_id>/brief.json and emit {primary_repo, tasks, all_done, brief_ref, commit_set_hash} for /plan:close."""
     return _lazy_import("planctl.run_close_preflight")(epic_id=epic_id, project=project)
 
 

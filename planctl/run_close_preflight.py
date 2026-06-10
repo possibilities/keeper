@@ -1,35 +1,38 @@
-"""planctl close-preflight - read-only close-readiness fetch for /plan:close.
+"""planctl close-preflight - read-only close-readiness fetch + brief write.
 
-Collapses the /plan:close Phase 0a/2 hand-fired sequence (``show`` for
-primary_repo, ``tasks`` for the readiness confirm, the ``set -eo pipefail``
-``COMMIT_GROUPS`` bash pipeline, and the ``promptctl render-spec`` snippet
-fetch) into a single read-only verb that returns one envelope:
+The fn-12 crush rebuilds ``/plan:close`` as a content-blind coordinator:
+``close-preflight`` is the pre-pipeline brief handoff (the symmetric bookend to
+``claim``'s worker brief). It assembles the audit brief — snippet context,
+source commit groups, the ordinal-ordered task list with status + done
+summaries, and the canonical ``commit_set_hash`` — and persists it commit-free
+under gitignored ``<primary_repo>/.planctl/state/audits/<epic_id>/brief.json``,
+then returns a content-blind envelope:
 
     {
       "primary_repo": <abs-path>,
       "tasks": [{"id", "title", "status"}, ...],
-      "all_done": <bool>,         # every task status == "done"
-      "commit_groups": [{"repo", "shas": [...]}, ...],
-      "snippet_context": <str>,   # promptctl render-spec <epic_id> --format human
+      "all_done": true,            # always true on success (see below)
+      "brief_ref": <abs-path>,     # the written brief.json
+      "commit_set_hash": <hex>,    # pins the source commit set
     }
 
-Resolution is cwd-based via ``resolve_project`` — ``/plan:close`` already
-``cd``s to ``primary_repo`` in Phase 0a, so no epic-keyed discovery is needed.
+The envelope carries NO prose fields — ``snippet_context`` and ``commit_groups``
+live ONLY in the brief file, which the quality-auditor reads itself. The closer's
+context holds only the handle + the hash.
 
-``commit_groups`` is assembled in-process by :mod:`planctl.commit_lookup` — a
-native ``git log --grep`` + ``git interpret-trailers --parse`` scan over the
-epic's resolved repo set, with zero subprocess to any external CLI. It fails
-loud (``COMMIT_LOOKUP_FAILED``) only when every repo in the scan set is missing
-or not a git repo; a clean miss is a normal empty ``commit_groups``. The snippet
-render is a read-only ``promptctl render-spec`` shell-out; any non-zero exit
-emits a typed ``{success:false, error:{code,message,details}}`` envelope (claim's
-single-fetch error shape) and exits 1.
+``all_done`` is always ``true`` on the success path: a not-all-done epic is a
+typed ``TASKS_NOT_DONE`` error (close operates only on a fully-done epic), not a
+``false`` data field. The id argument names the PARENT EPIC — a task-shaped id is
+rejected with a message pointing at the parent epic; garbage is ``BAD_EPIC_ID``.
 
-This is a **read-only** verb: it mutates nothing and rides the
-``InvocationTrackedGroup`` auto-readonly invocation line (NOT in
-``_NO_TRACK_COMMANDS``), same as ``detect`` / ``status`` / ``gravity``. On the
-error path it sets the invocation sentinel so the decorator does not double-emit
-after the terminal error envelope.
+The brief is assembled fully BEFORE any write (the ``promptctl render-spec``
+snippet fetch runs first); a render failure strands nothing on disk. The brief
+writer is commit-free (``audit_artifacts.write_brief_artifact``), so this verb
+mutates only gitignored ``state/`` and draws no ``.planctl/`` commit — it rides
+the ``InvocationTrackedGroup`` auto-readonly invocation line (NOT in
+``_NO_TRACK_COMMANDS``), same as ``claim``. On the error path it sets the
+invocation sentinel so the decorator does not double-emit after the terminal
+error envelope.
 """
 
 from __future__ import annotations
@@ -90,8 +93,8 @@ def _render_snippet_context(epic_id: str, primary_repo: str) -> str:
     """Shell ``promptctl render-spec <epic_id> --format human`` with cwd=primary_repo.
 
     Empty stdout on exit 0 → ``""`` (the epic has no curated substrate set);
-    non-zero exit → ``SNIPPET_RENDER_FAILED`` (no mutation). Reuses the
-    ``run_claim._render_snippet_context`` pattern. No ``--session-id`` — the
+    non-zero exit → ``SNIPPET_RENDER_FAILED`` (no mutation, nothing written —
+    this runs BEFORE the brief assemble-then-write). No ``--session-id`` — the
     dedup-against-seen-set is a worker-render concern, not the close fetch.
     """
     try:
@@ -151,8 +154,7 @@ def _context_for_root(project_root: Path):
     """Build a ProjectContext from a project root dir (the ``.planctl/`` parent).
 
     Mirrors ``run_claim._context_for_root`` — kept local so the read-only
-    ``run_close_preflight`` module stays self-contained. fn-589 task .1
-    (item 4): used by the ``--project`` override path.
+    ``run_close_preflight`` module stays self-contained.
     """
     from planctl.project import ProjectContext
 
@@ -165,24 +167,52 @@ def _context_for_root(project_root: Path):
     )
 
 
+def _done_summary(data_dir: Path, task_id: str) -> str:
+    """Read a task's ``## Done summary`` section from its spec markdown.
+
+    The done summary is patched into ``specs/<task_id>.md`` by ``planctl done``
+    (it is NOT a runtime-state field), so the brief reads it straight from the
+    spec. A missing spec or empty section yields ``""`` — the brief tolerates a
+    summary-less task.
+    """
+    from planctl.specs import get_task_section
+
+    spec_path = data_dir / "specs" / f"{task_id}.md"
+    if not spec_path.exists():
+        return ""
+    return get_task_section(spec_path.read_text(encoding="utf-8"), "## Done summary")
+
+
 def run(args: SimpleNamespace) -> int:
     import click
 
     from planctl.api import load_epic, load_tasks_for_epic, task_sort_key
-    from planctl.ids import is_epic_id
+    from planctl.audit_artifacts import (
+        AUDIT_SCHEMA_VERSION,
+        compute_commit_set_hash,
+        write_brief_artifact,
+    )
+    from planctl.ids import is_epic_id, is_task_id
     from planctl.output import emit
     from planctl.project import resolve_project
 
     epic_id: str = args.epic_id
     project: str | None = getattr(args, "project", None)
 
+    # Three-way id branch: epic-shape proceeds; a task-shape id names the parent
+    # epic in the error (close operates on epics, not tasks); garbage is bad.
     if not is_epic_id(epic_id):
+        if is_task_id(epic_id):
+            parent = epic_id.rsplit(".", 1)[0]
+            _emit_preflight_error(
+                "BAD_EPIC_ID",
+                (f"close operates on epics, not tasks — parent epic is {parent}"),
+                details={"task_id": epic_id, "parent_epic": parent},
+            )
         _emit_preflight_error("BAD_EPIC_ID", f"Invalid epic ID: {epic_id}")
 
-    # fn-589 task .1 (item 4): mirror claim's --project shape.  Absolute paths
-    # only — relative paths raise UsageError (cwd-dependent semantics under a
-    # flag whose whole point is cwd-independence is a footgun).  Unset → fall
-    # through to existing resolve_project() cwd-walk.
+    # --project <abs_path> bypasses the cwd-walk (mirrors claim).  Absolute paths
+    # only — relative paths raise UsageError.  Unset → resolve_project() cwd-walk.
     if project is not None:
         project_path_obj = Path(project).expanduser()
         if not project_path_obj.is_absolute():
@@ -228,20 +258,57 @@ def run(args: SimpleNamespace) -> int:
     ]
     all_done = bool(tasks) and all(t["status"] == "done" for t in tasks)
 
+    # Close operates only on a fully-done epic. Not-all-done is a typed error,
+    # NOT a `false` data field — the caller never sees a partial brief.
+    if not all_done:
+        not_done = [t["id"] for t in tasks if t["status"] != "done"]
+        _emit_preflight_error(
+            "TASKS_NOT_DONE",
+            (
+                f"epic {epic_id} is not ready to close — "
+                f"{len(not_done)} task(s) not done"
+            ),
+            details={"not_done": not_done},
+        )
+
     # commit_groups via the in-process native trailer scan; snippet_context via
-    # a read-only promptctl shell-out. Both fail loud (no mutation) on error.
+    # a read-only promptctl shell-out. Both fail loud (no mutation, nothing
+    # written) on error — render runs BEFORE the brief assemble-then-write.
     commit_groups = _commit_groups(
         [t["id"] for t in tasks if t["id"]], primary_repo, touched_repos
     )
     snippet_context = _render_snippet_context(epic_id, primary_repo)
+    commit_set_hash = compute_commit_set_hash(commit_groups)
+
+    # Assemble the full brief, then write it atomically + commit-free. The brief
+    # carries the prose (snippet_context, commit_groups) + the ordinal task list
+    # with done summaries; the envelope below carries only the handle + hash.
+    brief = {
+        "schema_version": AUDIT_SCHEMA_VERSION,
+        "epic_id": epic_id,
+        "primary_repo": primary_repo,
+        "commit_set_hash": commit_set_hash,
+        "commit_groups": commit_groups,
+        "snippet_context": snippet_context,
+        "tasks": [
+            {
+                "id": t["id"],
+                "title": t["title"],
+                "status": t["status"],
+                "done_summary": _done_summary(ctx.data_dir, t["id"]) if t["id"] else "",
+            }
+            for t in tasks
+        ],
+    }
+    brief_ref = str(write_brief_artifact(primary_repo, epic_id, brief))
 
     emit(
         {
             "primary_repo": primary_repo,
             "tasks": tasks,
-            "all_done": all_done,
-            "commit_groups": commit_groups,
-            "snippet_context": snippet_context,
+            "all_done": True,
+            "brief_ref": brief_ref,
+            "commit_set_hash": commit_set_hash,
         }
     )
     return 0
