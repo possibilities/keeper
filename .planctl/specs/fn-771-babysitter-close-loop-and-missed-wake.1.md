@@ -53,5 +53,5 @@ describe("detectCloseLoop") with synthetic JobRow/epic-status arrays: 4 close jo
 - [ ] Replaying the fn-12 incident shape (8 close jobs, epic open) through the detector yields one critical finding keyed on the plan_ref
 
 ## Done summary
-
+Added detectCloseLoop: a state-based critical detector that fires when >=4 close-verb jobs accumulate against one still-open epic within 24h (the slow close-loop sibling of dup-dispatch's rate arm). Widened the jobs SELECT + JobRow with plan_verb, added a keyed epics read so done epics self-clear, and documented the new close-loop category in performance.md and README.
 ## Evidence
