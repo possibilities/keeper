@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-765-maintenance-off-fold-thread",
   "bundles": [],
+  "closer_done_at": "2026-06-10T01:00:57.655357Z",
   "created_at": "2026-06-10T00:13:25.968442Z",
   "depends_on_epics": [],
   "id": "fn-765-maintenance-off-fold-thread",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Maintenance off fold thread",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T00:13:25.968442Z"
+  "updated_at": "2026-06-10T01:00:57.655357Z"
 }
