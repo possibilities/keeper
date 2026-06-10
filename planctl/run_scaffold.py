@@ -864,6 +864,10 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     if depends_on_epics and not epic_dep_errors:
         from planctl.discovery import resolve_epic_globally
 
+        # fn-20: normalize each declared dep to its resolved FULL slug id so a
+        # number-only ``fn-N`` declaration persists canonically. Only rebind
+        # when every dep resolves cleanly (no ambiguous / not-found error).
+        normalized_deps: list[str] = []
         for dep_id in depends_on_epics:
             dep_resolution = resolve_epic_globally(dep_id)
             if dep_resolution.ambiguous:
@@ -876,6 +880,11 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                 epic_dep_errors.append(
                     f"epic: depends_on_epics id {dep_id!r} does not exist"
                 )
+            else:
+                assert dep_resolution.resolved_id is not None
+                normalized_deps.append(dep_resolution.resolved_id)
+        if not epic_dep_errors:
+            depends_on_epics = normalized_deps
 
     if spec_errors:
         return _emit_failure(

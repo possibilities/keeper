@@ -50,13 +50,18 @@ def run(args: SimpleNamespace) -> int:
     if not dep_resolution.resolved:
         emit_error(f"Epic not found: {dep_id}")
 
+    # fn-20: normalize a number-only ``fn-N`` input to the resolved FULL slug
+    # id before persisting / deduping, so the on-disk edge stays canonical.
+    assert dep_resolution.resolved_id is not None
+    full_dep_id = dep_resolution.resolved_id
+
     pre_write_epic_def = load_json(epic_path)
     deps = list(pre_write_epic_def.get("depends_on_epics", []))
 
-    if dep_id in deps:
-        emit_error(f"Dependency already exists: {epic_id} -> {dep_id}")
+    if full_dep_id in deps:
+        emit_error(f"Dependency already exists: {epic_id} -> {full_dep_id}")
 
-    deps.append(dep_id)
+    deps.append(full_dep_id)
     epic_def = dict(pre_write_epic_def)
     epic_def["depends_on_epics"] = deps
     epic_def["updated_at"] = now_iso()

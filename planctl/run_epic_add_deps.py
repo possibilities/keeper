@@ -111,6 +111,11 @@ def run(args: SimpleNamespace) -> int:
     # "SKIPPED_DONE".  The target-epic-not-found case still fails loud — no
     # place to wire any edge if the parent doesn't exist.
     skipped_by_id: dict[str, str] = {}
+    # fn-20: normalize a number-only ``fn-N`` input to the resolved FULL slug
+    # id so the persisted ``depends_on_epics`` edge stays canonical (the
+    # readiness gate keys by full id). Keyed by the raw input dep_id; a slug
+    # input maps to itself.
+    normalized_by_id: dict[str, str] = {}
 
     if not epic_path.exists():
         not_found_errors.append(f"epic not found: {epic_id}")
@@ -151,6 +156,8 @@ def run(args: SimpleNamespace) -> int:
             not_found_errors.append(f"dep epic not found: {dep_id}")
             continue
         assert dep_resolution.epic_path is not None
+        assert dep_resolution.resolved_id is not None
+        normalized_by_id[dep_id] = dep_resolution.resolved_id
         dep_def = load_json(dep_resolution.epic_path)
         if dep_def.get("status") == "done":
             if skip_invalid:
@@ -212,12 +219,16 @@ def run(args: SimpleNamespace) -> int:
         if dep_id in skipped_by_id:
             results.append({"dep_id": dep_id, "status": skipped_by_id[dep_id]})
             continue
-        if dep_id in deps:
-            results.append({"dep_id": dep_id, "status": "ALREADY_PRESENT"})
+        # fn-20: persist + dedup against the FULL slug id (a number-only input
+        # normalizes here), so the on-disk edge is canonical and an already-
+        # wired slug edge is recognized when re-supplied as a bare number.
+        full_id = normalized_by_id.get(dep_id, dep_id)
+        if full_id in deps:
+            results.append({"dep_id": full_id, "status": "ALREADY_PRESENT"})
             continue
-        deps.append(dep_id)
+        deps.append(full_id)
         new_edges += 1
-        results.append({"dep_id": dep_id, "status": "WIRED"})
+        results.append({"dep_id": full_id, "status": "WIRED"})
 
     # ------------------------------------------------------------------
     # Cycle detection on the post-wire epic-dep graph. fn-600: walks every

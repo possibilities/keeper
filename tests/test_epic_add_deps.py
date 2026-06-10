@@ -244,3 +244,75 @@ def test_add_deps_default_fail_loud_unchanged(project):
     assert payload["error"]["code"] == "epic_not_found"
     # No partial write.
     assert _read_epic_json(project, epic_id)["depends_on_epics"] == []
+
+
+# ---------------------------------------------------------------------------
+# fn-20: number-only `fn-N` dep input normalizes to the full slug on write
+# ---------------------------------------------------------------------------
+
+
+def test_add_deps_number_only_wires_and_persists_full_slug(project):
+    """`add-deps <epic> fn-N` wires the unique number match; persists full slug."""
+    from planctl.ids import parse_id
+
+    epic_id = _create_epic("Target epic")
+    dep_full = _create_epic("Dep one")
+    dep_num, _ = parse_id(dep_full)
+    number_only = f"fn-{dep_num}"
+    assert number_only != dep_full  # the input really is the bare number
+
+    r = _invoke(["epic", "add-deps", epic_id, number_only])
+    assert r.exit_code == 0, r.output
+    payload = _parse_envelope(r.output)
+    assert payload["success"] is True
+
+    # The persisted edge is the FULL slug id, never the bare number.
+    assert payload["depends_on_epics"] == [dep_full]
+    assert _read_epic_json(project, epic_id)["depends_on_epics"] == [dep_full]
+    # The per-edge result reports the normalized id.
+    statuses = {r["dep_id"]: r["status"] for r in payload["results"]}
+    assert statuses == {dep_full: "WIRED"}
+
+
+def test_add_deps_number_only_already_present_via_full_slug(project):
+    """A bare-number re-wire of an already-wired slug edge is ALREADY_PRESENT."""
+    from planctl.ids import parse_id
+
+    epic_id = _create_epic("Target epic")
+    dep_full = _create_epic("Dep one")
+    dep_num, _ = parse_id(dep_full)
+
+    # First wire via full slug.
+    r1 = _invoke(["epic", "add-deps", epic_id, dep_full])
+    assert r1.exit_code == 0, r1.output
+
+    # Re-supply the same edge as a bare number — must dedup against full slug.
+    r2 = _invoke(["epic", "add-deps", epic_id, f"fn-{dep_num}"])
+    assert r2.exit_code == 0, r2.output
+    payload = _parse_envelope(r2.output)
+    statuses = {r["dep_id"]: r["status"] for r in payload["results"]}
+    assert statuses == {dep_full: "ALREADY_PRESENT"}
+    assert _read_epic_json(project, epic_id)["depends_on_epics"] == [dep_full]
+
+
+def test_add_deps_number_only_prefix_trap_fn1_not_fn10(project):
+    """`fn-1` must not match `fn-10` — integer equality, never string prefix."""
+    from planctl.ids import parse_id
+
+    # Mint epics until both a number-1 and a number-10 epic exist so the
+    # prefix trap is real. epic create allocates sequential numbers; create
+    # ten so fn-10 exists alongside fn-1.
+    created: dict[int, str] = {}
+    while not ({1, 10} <= created.keys()):
+        full = _create_epic(f"Filler {len(created)}")
+        n, _ = parse_id(full)
+        created[n] = full
+
+    epic_id = _create_epic("Target epic")
+
+    # Wiring `fn-1` must resolve to the fn-1 epic, NOT the fn-10 epic.
+    r = _invoke(["epic", "add-deps", epic_id, "fn-1"])
+    assert r.exit_code == 0, r.output
+    payload = _parse_envelope(r.output)
+    assert payload["depends_on_epics"] == [created[1]]
+    assert created[1] != created[10]

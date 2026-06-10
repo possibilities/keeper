@@ -258,6 +258,94 @@ def test_resolve_epic_globally_single_repo_fallback(
 
 
 # ---------------------------------------------------------------------------
+# fn-20: number-only `fn-N` resolution (integer equality, normalize-on-write)
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_epic_globally_number_only_cwd(two_projects, monkeypatch):
+    """A bare `fn-N` resolves the cwd-local epic and returns its full slug id."""
+    from planctl.discovery import resolve_epic_globally
+    from planctl.ids import parse_id
+
+    _root, _proj_a, proj_b = two_projects
+    epic_b = _seed_epic_in(proj_b, monkeypatch, title="Local B epic")
+    num, _ = parse_id(epic_b)
+
+    res = resolve_epic_globally(f"fn-{num}")
+    assert res.resolved
+    assert res.resolved_id == epic_b
+    assert res.project_path is not None
+    assert res.project_path.resolve() == proj_b.resolve()
+
+
+def test_resolve_epic_globally_number_only_cross_project(two_projects, monkeypatch):
+    """A bare `fn-N` resolves a sibling-project epic via the global step."""
+    from planctl.discovery import resolve_epic_globally
+    from planctl.ids import parse_id
+
+    _root, proj_a, proj_b = two_projects
+    epic_a = _seed_epic_in(proj_a, monkeypatch, title="A epic")
+    num, _ = parse_id(epic_a)
+
+    monkeypatch.chdir(proj_b)
+    res = resolve_epic_globally(f"fn-{num}")
+    assert res.resolved
+    assert res.resolved_id == epic_a
+    assert res.project_path is not None
+    assert res.project_path.resolve() == proj_a.resolve()
+
+
+def test_add_deps_number_only_cross_project_collision_ambiguous(
+    three_projects, monkeypatch
+):
+    """Same epic-number in two projects routes a bare `fn-N` to the ambiguous channel."""
+    from planctl.ids import parse_id
+
+    _root, proj_a, proj_b, proj_c = three_projects
+
+    # Target epic lives in neutral project C and gets number 1 (per-project
+    # numbering starts at 1). The colliding number must therefore be one C
+    # does NOT carry — seed A and B up to a shared number >= 2.
+    epic_c = _seed_epic_in(proj_c, monkeypatch, title="C target")
+    num_c, _ = parse_id(epic_c)
+    collide_num = num_c + 1
+
+    # Seed A and B until each carries an epic with `collide_num`, so a bare
+    # `fn-<collide_num>` resolves to two projects (and not to cwd's C). Each
+    # mint needs a unique slug (scaffold rejects same-slug siblings).
+    n = 0
+    while True:
+        epic_a = _seed_epic_in(proj_a, monkeypatch, title=f"A epic {n}")
+        n += 1
+        if parse_id(epic_a)[0] == collide_num:
+            break
+    while True:
+        epic_b = _seed_epic_in(proj_b, monkeypatch, title=f"B epic {n}")
+        n += 1
+        if parse_id(epic_b)[0] == collide_num:
+            break
+    num_a = collide_num
+
+    monkeypatch.chdir(proj_c)
+    # Fail-loud: the bare number is ambiguous across A and B → dep_ambiguous_id.
+    r = _invoke(["epic", "add-deps", epic_c, f"fn-{num_a}"])
+    assert r.exit_code != 0, r.output
+    payload = _parse_envelope(r.output)
+    assert payload["success"] is False
+    assert payload["error"]["code"] == "dep_ambiguous_id"
+    # No silent pick: nothing wired on C's epic.
+    assert _read_epic_json(proj_c, epic_c)["depends_on_epics"] == []
+
+    # --skip-invalid routes the same collision into SKIPPED_AMBIGUOUS.
+    r2 = _invoke(["epic", "add-deps", epic_c, f"fn-{num_a}", "--skip-invalid"])
+    assert r2.exit_code == 0, r2.output
+    payload2 = _parse_envelope(r2.output)
+    statuses = {x["dep_id"]: x["status"] for x in payload2["results"]}
+    assert statuses == {f"fn-{num_a}": "SKIPPED_AMBIGUOUS"}
+    assert _read_epic_json(proj_c, epic_c)["depends_on_epics"] == []
+
+
+# ---------------------------------------------------------------------------
 # epic add-dep cross-project happy path + error envelopes
 # ---------------------------------------------------------------------------
 
