@@ -64,5 +64,5 @@ contract; the 30s tick is cleared. `bun run test:full` mandatory.
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Added snapshot mode to keeper usage: non-TTY/--snapshot prints one composed (usage+jobs) frame plus a byte-shape-identical keeper-meta: trailer (script:usage) and exits, reusing src/snapshot.ts; --watch forces live, --timeout overrides the wait, 30s tick never armed in snapshot mode.
 ## Evidence
