@@ -56,5 +56,5 @@ note. Then update README.md's `keeper autopilot` CLI subsection: arming a
 - [ ] README.md `keeper autopilot` CLI subsection notes arming a `done` epic is rejected
 
 ## Done summary
-
+Added a daemon-side guard in set-epic-armed-request that rejects an armed:true request against a present, status='done' epic (writer-DB status read), closing the arm-after-done hole the fold-prune can't reach; disarm and not-yet-folded arms still append unconditionally. Amended both docstrings + README + CLAUDE.md and added a four-case daemon test.
 ## Evidence
