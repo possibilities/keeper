@@ -42,5 +42,5 @@ reference still resolves in a running daemon.
 - [ ] full planctl suite green
 
 ## Done summary
-
+Deleted the gitignored work-plugins/ tree (per-tier rendered agents + manifests + sidecars; nothing tracked) and repointed the cosmetic stub-envelope path in test_generated_guard_hook.py to the agents/worker-high.md shape. Re-render produces no work-plugins/ output; full planctl suite green.
 ## Evidence
