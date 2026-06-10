@@ -1,112 +1,18 @@
 /**
  * Keeper reducer. Folds events into the `jobs` projection.
  *
- * The core invariant is exactly-once-per-event: every fold of an event into
- * `jobs` and the matching advance of `reducer_state.last_event_id` happen in
- * the SAME `BEGIN IMMEDIATE` transaction. A crash mid-fold rolls back BOTH the
- * projection write and the cursor advance, so the boot drain simply re-folds
- * the event and converges. This is the textbook "update projection + advance
- * cursor atomically" pattern.
+ * Exactly-once-per-event: every fold of an event into `jobs` and the matching
+ * advance of `reducer_state.last_event_id` happen in the SAME `BEGIN IMMEDIATE`
+ * transaction, so a crash mid-fold rolls back BOTH and the boot drain re-folds
+ * and converges. The invariant `job_id === session_id` (one session per job)
+ * holds throughout.
  *
- * The state machine is a heavily stripped descendant of hooks-tracker.py's
- * `_maintain_job_state`. All prise / harness / lineage / name-scraping logic is
- * intentionally dropped — keeper v1 holds the simplifying invariant that
- * `job_id === session_id` (one session per job).
- *
- *   event.hook_event   | jobs action
- *   -------------------|------------------------------------------------------
- *   SessionStart        | INSERT a new job row; seed title from spawn_name
- *                       |   ('spawn' source) when present. On a duplicate
- *                       |   (resume) RE-OPEN a terminal row: 'ended' or
- *                       |   'killed' -> 'stopped' + refresh pid + start_time;
- *                       |   a non-terminal row's state is left as-is.
- *   UserPromptSubmit    | state -> 'working'  (also re-opens 'ended' or 'killed')
- *                       |   AND clears (last_api_error_at, last_api_error_kind)
- *                       |   to (NULL, NULL) together — a fresh prompt means
- *                       |   the human picked up after the quota reset /
- *                       |   re-auth / retry, so the "this stoppage was
- *                       |   api-error-caused" annotation no longer applies.
- *                       |   EXCEPT when the prompt is Claude Code's
- *                       |   `<task-notification>…<status>killed</status>`
- *                       |   shutdown-housekeeping envelope — those are no-ops
- *                       |   for the lifecycle write (the title rule still
- *                       |   runs). See `isKilledTaskNotification` in
- *                       |   `src/derivers.ts` for the modest-scope rationale.
- *   Stop                | state -> 'stopped'  (skipped on 'ended' or 'killed',
- *                       |   AND skipped while any subagent_invocations row for
- *                       |   this job is status='running' — the parent's Stop
- *                       |   hook fires when it yields to a Task tool's sub-
- *                       |   agent, but the session is conceptually still
- *                       |   working until the sub returns AND any post-sub
- *                       |   follow-up finishes on a subsequent real Stop.
- *                       |   Without this guard the embedded JobLinkEntry.state
- *                       |   flashes to 'stopped' mid-sub-agent, which clears
- *                       |   readiness predicate 5 prematurely and lets
- *                       |   predicate 7 fire job-pending at every SubagentStop
- *                       |   — autopilot's approval notify then dup-fires.)
- *   SessionEnd          | state -> 'ended'    (skipped on 'killed' — the kill
- *                       |   signal carries proven-dead evidence and outranks)
- *   Killed              | state -> 'killed'   (synthetic; folds iff persisted
- *                       |   (pid, start_time) matches the event payload, OR
- *                       |   the persisted start_time is NULL — legacy loose
- *                       |   match. Race-recovered mismatches are no-ops.)
- *   RateLimited/ApiError| state -> 'stopped' AND (last_api_error_at,
- *                       |   last_api_error_kind) -> (event.ts, kind) — both
- *                       |   columns paired in a single UPDATE. The state flip
- *                       |   is suppressed (via a CASE) while any
- *                       |   subagent_invocations row for this job is
- *                       |   status='running' — same rationale as Stop; the
- *                       |   parent isn't actively making API calls while it
- *                       |   waits on a sub-agent, but if an error annotation
- *                       |   lands during that window the projection should
- *                       |   record it WITHOUT misreporting the session as
- *                       |   stopped. The (last_api_error_at, last_api_error_kind)
- *                       |   pair stamps unconditionally so the annotation
- *                       |   reading stays honest. (Synthetic;
- *                       |   skipped on 'ended' or 'killed' — same terminal
- *                       |   guard as Stop. Minted by main from a transcript
- *                       |   -worker `api-error` message when Claude Code
- *                       |   writes its `isApiErrorMessage: true` synthetic
- *                       |   assistant turn to the transcript.) The legacy
- *                       |   `RateLimited` event_type folds to
- *                       |   `kind="rate_limit"` for byte-identical re-fold of
- *                       |   the pre-v24 event log; the new `ApiError`
- *                       |   event_type reads `data.kind` validated against
- *                       |   the `ApiErrorKind` allow-list (unknown values
- *                       |   fold to `"unknown"`). The lifecycle column
- *                       |   tracks "is the session running" honestly — the
- *                       |   API request failed at the boundary, no work is
- *                       |   happening — and the (last_api_error_at,
- *                       |   last_api_error_kind) pair carries the separate
- *                       |   "*why* it's stopped" annotation that survives
- *                       |   Stop/SessionEnd/Killed and only clears on the
- *                       |   next UserPromptSubmit revival.
- *   <any with title>    | title -> data.session_title by precedence (the
- *                       |   source is 'transcript' for a TranscriptTitle event,
- *                       |   else 'payload'; write iff it outranks/ties+changes)
- *   <everything else>   | no jobs write; cursor still advances
- *
- * `ended` is the resting state AFTER a SessionEnd, NOT a permanent trap. A
- * genuinely-ended session can only come back by re-attaching — a fresh
- * `claude --resume` process fires SessionStart (source=resume) — or by submitting
- * a prompt straight away (a UserPromptSubmit with no SessionStart, e.g. after a
- * spurious mid-session SessionEnd); BOTH re-open the job. `killed` is the
- * sibling terminal state reached via a synthetic `Killed` event — emitted by
- * the boot seed sweep (`src/seed-sweep.ts`) and the live exit-watcher worker
- * (`src/exit-watcher.ts`) when a `(pid, start_time)` pair is proven dead from
- * outside the hook stream. Both terminal states are revivable on the same
- * SessionStart / UserPromptSubmit re-open paths; only a stray `Stop` on a
- * still-terminal job stays a no-op. The `Killed` event folds normally — it is
- * a deterministic function of its payload + the persisted (pid, start_time),
- * with no liveness re-probe inside the fold (re-probing would break re-fold
- * determinism — the producer is the ONLY place that probes liveness).
- *
- * Title provenance/precedence: NULL=0, 'spawn'=1, 'payload'=2, 'transcript'=3.
- * A higher source wins; a lower one never clobbers a higher one (see
- * {@link TITLE_PRIORITY}). The synthetic `TranscriptTitle` event (inserted by
- * keeperd's main thread, title carried in `data.session_title`) folds at
- * priority 3 — it triggers no lifecycle write (the `default` branch ignores it)
- * and flows only through the title rule.
+ * Terminal states: `ended` (from SessionEnd) and `killed` (synthetic `Killed`,
+ * emitted by the seed sweep / exit-watcher from outside the hook stream when a
+ * `(pid, start_time)` pair is proven dead) are both revivable — SessionStart
+ * (source=resume) or a bare UserPromptSubmit re-opens them. A stray `Stop` on a
+ * still-terminal job is a no-op. The `Killed` fold never re-probes liveness
+ * (re-probing would break re-fold determinism — only the producer probes).
  */
 
 import type { Database, SQLQueryBindings } from "bun:sqlite";
@@ -157,20 +63,12 @@ import { API_ERROR_KINDS } from "./types";
 
 /**
  * Default batch size for {@link drain}. Each event folds in its OWN
- * `BEGIN IMMEDIATE` transaction, so the batch size never extends a single
- * writer-lock hold — but it does bound how many transactions `drain()` runs
- * back-to-back before returning to {@link drainToCompletion}, which is the only
- * loop boundary at which a contending hook INSERT reliably wins the writer
- * lock. fn-744 .1 attributed the live-scale 5.4s-fold tail to a batch landing
- * during a `GitSnapshot`/`Commit` burst: those folds re-fan git-status /
- * planctl-links across the ~870-epic projection (p95 ~141ms, max ~338ms each),
- * and 200 of them run uninterrupted inside one `drain()` call. Shrinking the
- * batch to 50 gives a contending hook ~4x more frequent writer windows (one per
- * `drain()` boundary) WITHOUT changing throughput — the caller loops until
- * `drain()` returns 0 — or per-event fold semantics, or re-fold determinism
- * (the batch size is not an input to any projection write). The boot drain's
- * post-COMMIT pacing (`DrainOptions.paceMs`) is the complementary intra-batch
- * lever; this knob governs steady state.
+ * `BEGIN IMMEDIATE` transaction; the batch only bounds how many transactions
+ * run back-to-back before returning to {@link drainToCompletion}, the loop
+ * boundary at which a contending hook INSERT reliably wins the writer lock.
+ * Small batch = more frequent writer windows for contending hooks without
+ * changing throughput (the caller loops until `drain()` returns 0) or re-fold
+ * determinism (the batch size is not an input to any projection write).
  */
 export const DEFAULT_BATCH_SIZE = 50;
 
@@ -189,70 +87,34 @@ export interface ApplyEventOptions {
 const ENDED = "ended";
 
 /**
- * Terminal-but-revivable job state. Reached by a synthetic `Killed` event
- * (emitted by the boot seed sweep + the live exit-watcher when a `(pid,
- * start_time)` pair is proven dead). Unlike {@link ENDED} — which comes from
- * the SessionEnd hook — `killed` indicates we proved the process is gone from
- * the OUTSIDE: pid no longer exists, or recycled into a different process.
- *
- * Revival: SessionStart and UserPromptSubmit re-open a killed row (the producer
- * can probe a live new process for that session); every other hook event
- * IGNORES a killed row (the row stays killed). See the Stop / SessionEnd
- * guards below.
+ * Terminal-but-revivable job state, reached by a synthetic `Killed` event:
+ * the process is proven gone from the OUTSIDE (pid no longer exists, or
+ * recycled). SessionStart and UserPromptSubmit re-open a killed row; every
+ * other hook event leaves it killed.
  */
 const KILLED = "killed";
 
 /**
- * Recency bound (unix-SECONDS) for the Stop fold's sub-agent guard. A one-shot
- * orphan sub-agent that never emits `SubagentStop` (sub crashed, hook timed
- * out, hook write lost to the "hook always exits 0" contract) would otherwise
- * pin its parent job at `state='working'` forever — the Stop guard's
- * `subRunning` query would keep finding the surviving running row, swallow
- * every subsequent Stop, and hold the per-root/per-epic autopilot mutex open
- * until a human closes the window. Until now `sweepRunningSubagentsToUnknown`
- * was the sole orphan resolver and ran ONLY on SessionEnd/Killed.
+ * Recency bound (unix-SECONDS) for the Stop fold's sub-agent guard. Without it,
+ * a one-shot orphan sub-agent that never emits `SubagentStop` would pin its
+ * parent at `state='working'` forever (the guard keeps finding the surviving
+ * running row) and hold the autopilot mutex open. If the newest surviving
+ * `running` sub-agent's `ts` is older than this many seconds relative to the
+ * Stop event's `ts`, the guard releases and the Stop fold writes `stopped`.
  *
- * The bound: if the newest surviving `running` sub-agent's `ts` (the same row
- * the existing max-`turn_seq` collapse query already returns) is older than
- * this many seconds relative to the Stop event's `ts`, the guard releases —
- * the Stop fold writes `state='stopped'` and re-fans the embedded plan
- * entries normally (`syncIfPlanRef` / `syncJobLinksOnJobWrite`).
- *
- * Both `events.ts` and `subagent_invocations.ts` are REAL unix-SECONDS
- * (`db.ts:399-413`, and the `(event.ts - row.ts) * 1000` ms convention at
- * `applySubagentInvocations`). The age comparison is in seconds — multiplying
- * by 1000 would be a 1000x bug.
- *
- * Pure function of the event log: the comparison is `event.ts - row.ts`
- * against a compile-time constant — no `Date.now()`, no config, no
- * `meta`-row source. Re-fold determinism holds (CLAUDE.md "Producer-only
- * liveness probing": fold-time comparisons against an event's own `ts` are
- * safe; OS-clock reads inside the fold are banned).
- *
- * Tradeoffs of the chosen value:
- *
- * - Too large → a real stuck sub-agent holds the mutex longer than necessary
- *   before autopilot can redispatch.
- * - Too small → a legitimately slow in-flight sub-agent flashes `stopped`
- *   prematurely; readiness predicate 5 clears for a tick and predicate 7
- *   spuriously fires `job-pending` (autopilot's approval-notify can dup).
- *
- * 120s sits well above the p99 sub-agent latency observed in keeper's own
- * traces while keeping the wedge window short enough that an orphaned worker
- * doesn't sit "working" for a full Claude Code session window.
+ * UNIT TRAP: both `events.ts` and `subagent_invocations.ts` are unix-SECONDS;
+ * the comparison `event.ts - row.ts` is in seconds — multiplying by 1000 is a
+ * 1000x bug. Pure (compile-time constant, no clock/config/meta read), so
+ * re-fold determinism holds. Tradeoff: too large pins a stuck sub-agent's mutex
+ * longer; too small flashes a slow in-flight sub-agent to `stopped` and clears
+ * readiness predicate 5 for a tick.
  */
 const MAX_STOP_YIELD_GAP_SEC = 120;
 
 /**
- * Validate an event's `data.kind` against the {@link ApiErrorKind} union.
- * Anything not in the canonical allow-list — including missing /
- * non-string / unrecognized values like the SDK's own `"unknown"` —
- * folds to `"unknown"`. Pure (no side effects, no throws); the fold
- * arm calls it inside the open `BEGIN IMMEDIATE` transaction.
- *
- * Used by the dual-case `ApiError` arm: legacy `RateLimited` events
- * skip this and force `kind = "rate_limit"` directly; new `ApiError`
- * events route their `data.kind` through here.
+ * Validate an event's `data.kind` against the {@link ApiErrorKind} union;
+ * anything not in the allow-list folds to `"unknown"`. Pure (no throws); the
+ * fold arm calls it inside the open transaction.
  */
 function validateApiErrorKind(raw: unknown): ApiErrorKind {
   if (typeof raw !== "string") {
@@ -264,11 +126,9 @@ function validateApiErrorKind(raw: unknown): ApiErrorKind {
 }
 
 /**
- * Parse the `kind` out of an event's `data` blob for the dual-case
- * `RateLimited` / `ApiError` fold arm. Safe-parse: a malformed blob
- * folds to `"unknown"` (never throws inside the fold transaction).
- * The legacy `RateLimited` event_type forces `"rate_limit"` upstream
- * — this helper is only called on the `ApiError` arm.
+ * Parse the `kind` out of an event's `data` blob for the `ApiError` fold arm.
+ * Safe-parse: a malformed blob folds to `"unknown"` (never throws inside the
+ * fold transaction).
  */
 function extractApiErrorKind(event: Event): ApiErrorKind {
   try {
@@ -280,28 +140,19 @@ function extractApiErrorKind(event: Event): ApiErrorKind {
 }
 
 /**
- * Canonical `InputRequestKind` allow-list — string literals so the
- * runtime validation `validateInputRequestKind` can `.has` against a
- * Set. The values mirror {@link import("./types").InputRequestKind}
- * exactly; if the type widens or narrows the set MUST be updated in
- * lockstep. The fallback for an unrecognized value is the only union
- * member (`"ask_user_question"`) — unlike `ApiErrorKind` there is no
- * reserved `"unknown"` bucket, because the transcript matcher only
- * fires `input-request` messages for kinds it has explicitly mapped
- * (no upstream allow-list to bypass).
+ * Canonical `InputRequestKind` allow-list. Mirrors
+ * {@link import("./types").InputRequestKind} exactly; if the type widens or
+ * narrows the set MUST be updated in lockstep.
  */
 const INPUT_REQUEST_KINDS: ReadonlySet<InputRequestKind> = new Set([
   "ask_user_question",
 ]);
 
 /**
- * Validate an event's `data.kind` against the {@link InputRequestKind}
- * union. Anything not in the canonical allow-list — including missing /
- * non-string / unrecognized values — folds to `"ask_user_question"`,
- * the single-member union's only value. Pure (no side effects, no
- * throws); the fold arm calls it inside the open `BEGIN IMMEDIATE`
- * transaction. Mirrors {@link validateApiErrorKind}'s shape minus the
- * reserved `"unknown"` fallback.
+ * Validate an event's `data.kind` against the {@link InputRequestKind} union;
+ * anything not in the allow-list folds to `"ask_user_question"` (the
+ * single-member union's only value). Pure (no throws); the fold arm calls it
+ * inside the open transaction.
  */
 function validateInputRequestKind(raw: unknown): InputRequestKind {
   if (typeof raw !== "string") {
@@ -313,10 +164,9 @@ function validateInputRequestKind(raw: unknown): InputRequestKind {
 }
 
 /**
- * Parse the `kind` out of an event's `data` blob for the `InputRequest`
- * fold arm. Safe-parse: a malformed blob folds to `"ask_user_question"`
- * (never throws inside the fold transaction). Mirrors
- * {@link extractApiErrorKind} step-for-step.
+ * Parse the `kind` out of an event's `data` blob for the `InputRequest` fold
+ * arm. Safe-parse: a malformed blob folds to `"ask_user_question"` (never
+ * throws inside the fold transaction).
  */
 function extractInputRequestKind(event: Event): InputRequestKind {
   try {
@@ -328,22 +178,9 @@ function extractInputRequestKind(event: Event): InputRequestKind {
 }
 
 /**
- * Canonical `PermissionPromptKind` allow-list (schema v52, fn-686) —
- * the 2-member union backing the `Notification:permission_prompt` /
- * `Notification:elicitation_dialog` fold. The values mirror
- * {@link import("./types").PermissionPromptKind} exactly; if the type
- * widens or narrows the set MUST be updated in lockstep.
- *
- * Map (driven by `Event.event_type`, set by
- * `plugin/hooks/events-writer.ts`'s `notification_type` passthrough):
- *   `permission_prompt` → `"permission"`
- *   `elicitation_dialog` → `"elicitation"`
- *
- * Strict gate: anything else — `idle_prompt`, `auth_success`, unknown,
- * empty — is a no-op (never stamps). The map lives in
- * {@link permissionPromptKindFromEventType}; this set is the type-side
- * mirror used by re-fold-safe validation in
- * {@link validatePermissionPromptKind}.
+ * Canonical `PermissionPromptKind` allow-list. Mirrors
+ * {@link import("./types").PermissionPromptKind} exactly; if the type widens or
+ * narrows the set MUST be updated in lockstep.
  */
 const PERMISSION_PROMPT_KINDS: ReadonlySet<PermissionPromptKind> = new Set([
   "permission",
@@ -351,16 +188,10 @@ const PERMISSION_PROMPT_KINDS: ReadonlySet<PermissionPromptKind> = new Set([
 ]);
 
 /**
- * Map a `Notification` event's `event_type` (= the hook payload's
- * `notification_type` passthrough) onto its canonical
- * {@link PermissionPromptKind}, or `null` if the value is outside the
- * 2-member allow-list. STRICT gate — `idle_prompt`, `auth_success`,
- * unknown strings, and empty/non-string values all return `null` so
- * the reducer arm short-circuits without stamping.
- *
- * Pure (no side effects, no throws); the fold arm calls it inside the
- * open `BEGIN IMMEDIATE` transaction. Re-fold determinism is preserved:
- * the input is a frozen `events` column, not env / wallclock / fs.
+ * Map a `Notification` event's `event_type` onto its canonical
+ * {@link PermissionPromptKind}, or `null` for anything outside the allow-list
+ * (a strict gate — the arm short-circuits without stamping). Pure (no throws);
+ * the fold arm calls it inside the open transaction.
  */
 function permissionPromptKindFromEventType(
   eventType: unknown,
@@ -378,15 +209,9 @@ function permissionPromptKindFromEventType(
 }
 
 /**
- * Validate a candidate {@link PermissionPromptKind} value against the
- * canonical allow-list. Returns the validated value or `null` (NEVER
- * throws). Mirrors {@link validateInputRequestKind}'s shape minus the
- * single-member fallback — here a miss is a true no-op rather than a
- * fallback-to-only-member coercion, because the upstream map already
- * filtered the legal set via {@link permissionPromptKindFromEventType}.
- * Defensive: kept as a separate helper so a future code path that
- * carries a raw kind string (e.g. an RPC, a re-derive) routes through
- * the same allow-list check.
+ * Validate a candidate {@link PermissionPromptKind} against the allow-list;
+ * returns the validated value or `null` (NEVER throws). A separate helper so a
+ * future path carrying a raw kind string routes through the same check.
  */
 function validatePermissionPromptKind(
   raw: unknown,
@@ -400,16 +225,10 @@ function validatePermissionPromptKind(
 }
 
 /**
- * Title-source precedence. A higher number wins. NULL `title_source` (the
- * zero-event reading, no title written yet) maps to priority 0 via
+ * Title-source precedence; a higher number wins. NULL maps to 0 via
  * {@link sourcePriority}. The reducer writes a new title iff the incoming
- * source outranks the persisted one (`p > pp`) OR ties it with a changed value
- * (`p === pp && value changed`) — so a lower-priority source NEVER clobbers a
- * higher one, and an equal-priority re-fold is a value-only last-write-wins.
- *
- * The transcript-supplement source slots in as `3` with no precedence-write
- * rewrite — {@link titleSourceForEvent} maps a `TranscriptTitle` event to it
- * and the same write block promotes the title.
+ * source outranks the persisted one, OR ties it with a changed value — a
+ * lower-priority source NEVER clobbers a higher one.
  */
 const TITLE_PRIORITY: Record<string, number> = {
   spawn: 1,
@@ -423,14 +242,9 @@ function sourcePriority(source: string | null): number {
 }
 
 /**
- * Extract the top-level `session_title` from an event's `data` blob. try/catch
- * around `JSON.parse(event.data)`, skip-and-log via `console.error` on a
- * malformed blob (the cursor still advances upstream so one bad row never
- * wedges the reducer). `session_title` is NOT lifted to an events column — the
- * raw blob is its only carrier.
- *
- * Run event-agnostically like the mode rule (not gated to UserPromptSubmit); in
- * practice only UserPromptSubmit carries it. Returns the title only when it is a
+ * Extract the top-level `session_title` from an event's `data` blob.
+ * Skip-and-log on a malformed blob (the cursor still advances upstream so one
+ * bad row never wedges the reducer). Returns the title only when it is a
  * non-empty string, else `null`.
  */
 function extractSessionTitle(event: Event): string | null {
@@ -442,8 +256,6 @@ function extractSessionTitle(event: Event): string | null {
         return title;
       }
     } catch (err) {
-      // Malformed JSON: skip-and-log. The cursor still advances upstream so the
-      // reducer never wedges on one bad row.
       console.error(
         `keeper reducer: failed to parse data blob for event id=${event.id} session=${event.session_id}: ${err}`,
       );
@@ -453,30 +265,18 @@ function extractSessionTitle(event: Event): string | null {
 }
 
 /**
- * Resolve the title-source for an event carrying a `session_title`. A synthetic
- * `TranscriptTitle` event (inserted by keeperd's main thread when the watcher
- * sees a `custom-title` line) folds at the priority-3 `'transcript'` source;
- * every other title-bearing event (in practice `UserPromptSubmit`) is the
- * priority-2 `'payload'` source. Both reuse {@link extractSessionTitle} — the
- * synthetic event carries its title in the same `data.session_title` field, so
- * no second extractor exists.
+ * Resolve the title-source for an event carrying a `session_title`: a synthetic
+ * `TranscriptTitle` event folds at the priority-3 `'transcript'` source; every
+ * other title-bearing event is the priority-2 `'payload'` source.
  */
 function titleSourceForEvent(event: Event): string {
   return event.hook_event === "TranscriptTitle" ? "transcript" : "payload";
 }
 
 /**
- * Extract the top-level `prompt` from an event's `data` blob — meaningful
- * only on `UserPromptSubmit` events. Guarded-parse mirroring
- * {@link extractSessionTitle}: try/catch around `JSON.parse(event.data)`,
- * skip-and-log on a malformed blob, never throw (the cursor still advances
- * upstream so one bad row never wedges the reducer). Returns the prompt only
- * when it is a non-empty string, else `null`.
- *
- * Used by the `UserPromptSubmit` lifecycle branch to detect Claude Code's
- * `<task-notification>…<status>killed</status>` shutdown-housekeeping
- * envelope via {@link isKilledTaskNotification} — see
- * `src/derivers.ts` for the regex shape + modesty rationale.
+ * Extract the top-level `prompt` from an event's `data` blob — meaningful only
+ * on `UserPromptSubmit` events. Skip-and-log on a malformed blob, never throw.
+ * Returns the prompt only when it is a non-empty string, else `null`.
  */
 function extractPrompt(event: Event): string | null {
   if (event.data && event.data.length > 0) {
@@ -497,11 +297,8 @@ function extractPrompt(event: Event): string | null {
 
 /**
  * Extract the top-level `transcript_path` from a SessionStart event's `data`
- * blob. Guarded-parse mirroring {@link extractSessionTitle}: try/catch around
- * `JSON.parse(event.data)`, skip-and-log on a malformed blob, never throw (the
- * cursor still advances upstream). Returns the path only when it is a non-empty
- * absolute string, else `null` — so the SessionStart seed leaves
- * `jobs.transcript_path` NULL when the payload omits or malforms it.
+ * blob. Skip-and-log on a malformed blob, never throw. Returns the path only
+ * when it is a non-empty absolute string, else `null`.
  */
 function extractTranscriptPath(event: Event): string | null {
   if (event.data && event.data.length > 0) {
@@ -512,8 +309,6 @@ function extractTranscriptPath(event: Event): string | null {
         return path;
       }
     } catch (err) {
-      // Malformed JSON: skip-and-log. The cursor still advances upstream so the
-      // reducer never wedges on one bad row.
       console.error(
         `keeper reducer: failed to parse data blob for event id=${event.id} session=${event.session_id}: ${err}`,
       );
@@ -524,23 +319,17 @@ function extractTranscriptPath(event: Event): string | null {
 
 /**
  * Shape of a synthetic `Killed` event's payload — the `(pid, start_time)`
- * recycle-safe identity the producer (boot seed sweep / live exit-watcher)
- * proved dead. The reducer compares this verbatim against the persisted
- * `(jobs.pid, jobs.start_time)` to decide whether the row should fold to
- * `killed` (match) or stay put (mismatch / stale).
+ * recycle-safe identity the producer proved dead. The reducer compares this
+ * verbatim against the persisted `(jobs.pid, jobs.start_time)` to decide
+ * whether the row folds to `killed` (match) or stays put (mismatch / stale).
  */
 interface KilledPayload {
   /**
-   * The proven-dead process pid, OR `null` for a PIDLESS REAP (fn-743). A
-   * pidless Killed reaps a `stopped` row whose persisted `pid IS NULL` — an
-   * unwatchable row (the exit-watcher's old `pid IS NOT NULL` filter never
-   * armed it, the seed sweep never probed it) that would otherwise live
-   * forever. The pidless arm carries NO liveness claim: a NULL-pid stopped
-   * row is terminal by construction (we can never prove it alive and never
-   * watch it), so the producer reaps it directly. The Killed fold only honors
-   * a pidless reap against a row whose persisted pid is ALSO NULL, so a
-   * pidless event can never knock out a row that carries a real (watchable)
-   * pid.
+   * The proven-dead process pid, OR `null` for a PIDLESS REAP of a `stopped`
+   * row whose persisted `pid IS NULL` (unwatchable, terminal by construction).
+   * The Killed fold honors a pidless reap only against a row whose persisted
+   * pid is ALSO NULL, so a pidless event can never knock out a row carrying a
+   * real watchable pid.
    */
   pid: number | null;
   start_time: string | null;
@@ -548,19 +337,15 @@ interface KilledPayload {
 
 /**
  * Extract the `(pid, start_time)` payload from a synthetic `Killed` event's
- * `data` blob. Guarded-parse mirroring {@link extractSessionTitle}: try/catch
- * around `JSON.parse(event.data)`, skip-and-log on a malformed blob, never
- * throw — the cursor still advances upstream, and the Killed fold falls through
- * as a safe no-op when this returns null.
+ * `data` blob. Skip-and-log on a malformed blob, never throw — the Killed fold
+ * falls through as a safe no-op when this returns null.
  *
- * `pid` is either a finite number (the proven-dead pid — strict/loose match
- * against the persisted `(pid, start_time)`) OR explicit `null` for a PIDLESS
- * REAP of a NULL-pid `stopped` row (fn-743). Any OTHER shape (missing pid,
- * non-finite, non-number-non-null) is malformed → null (the fold no-ops). The
- * pidless arm is opt-in via a literal JSON `null`, so a malformed blob can
- * never accidentally trigger a reap. `start_time` is optional / nullable — the
- * producer may emit a Killed for a row whose stored start_time is NULL (legacy
- * / loose pid-only match handled by the Killed fold).
+ * `pid` is either a finite number (the proven-dead pid) OR explicit `null` for
+ * a PIDLESS REAP of a NULL-pid `stopped` row. Any OTHER shape is malformed →
+ * null. The pidless arm is opt-in via a literal JSON `null`, so a malformed
+ * blob can never accidentally trigger a reap. `start_time` is optional /
+ * nullable (the producer may emit a Killed for a row whose stored start_time
+ * is NULL).
  */
 function extractKilledPayload(event: Event): KilledPayload | null {
   if (event.data == null || event.data.length === 0) {
@@ -572,9 +357,8 @@ function extractKilledPayload(event: Event): KilledPayload | null {
       start_time?: unknown;
     };
     const pid = parsed.pid;
-    // Accept a finite number (normal proven-dead reap) OR an explicit literal
-    // `null` (fn-743 pidless reap). `undefined` / non-number-non-null are
-    // malformed → no-op.
+    // Accept a finite number (proven-dead reap) OR an explicit literal `null`
+    // (pidless reap). Anything else is malformed → no-op.
     if (pid !== null && (typeof pid !== "number" || !Number.isFinite(pid))) {
       return null;
     }
@@ -582,8 +366,6 @@ function extractKilledPayload(event: Event): KilledPayload | null {
       typeof parsed.start_time === "string" ? parsed.start_time : null;
     return { pid: pid as number | null, start_time: startTime };
   } catch (err) {
-    // Malformed JSON: skip-and-log. The cursor still advances upstream so the
-    // reducer never wedges on one bad row.
     console.error(
       `keeper reducer: failed to parse Killed payload blob for event id=${event.id} session=${event.session_id}: ${err}`,
     );
@@ -592,16 +374,12 @@ function extractKilledPayload(event: Event): KilledPayload | null {
 }
 
 /**
- * Shape of a folded plan snapshot, extracted from a synthetic
- * `EpicSnapshot` / `TaskSnapshot` event's `data` blob. The producer (the plan
- * worker → main) pre-computes every field — number parsing, status derivation,
- * the `project_dir` / `target_repo` mapping — so the reducer folds whatever the
- * blob carries verbatim (a pure function of the persisted event). Unknown /
- * absent fields surface as `null` so the upsert writes the zero-event reading.
- *
- * The fields are a union of the epic + task projection columns minus the pk
- * (which rides in `event.session_id`, the generic entity-key overload); a given
- * event only populates the subset its kind cares about.
+ * Shape of a folded plan snapshot, extracted from a synthetic `EpicSnapshot` /
+ * `TaskSnapshot` event's `data` blob. The producer pre-computes every field, so
+ * the reducer folds the blob verbatim (a pure function of the persisted event).
+ * Unknown / absent fields surface as `null`. The fields are a union of the epic
+ * + task projection columns minus the pk (which rides in `event.session_id`); a
+ * given event populates only the subset its kind cares about.
  */
 interface PlanSnapshot {
   epic_number?: number | null;
@@ -610,35 +388,25 @@ interface PlanSnapshot {
   project_dir?: string | null;
   target_repo?: string | null;
   /**
-   * Planctl-native effort tier on TaskSnapshot blobs (fn-602): the top-level
-   * `tier` field on the task-def file (planctl's `medium | high | xhigh | max`
-   * vocabulary). Stored opaque — the reducer never branches on the value, so
-   * a future tier widening rides through with no code change. Absent on pre-
-   * fn-602 blobs; the reducer reads defensively (`snapshot.tier ?? null`) so
-   * an older blob folds to a null tier deterministically — same graceful-
-   * degradation precedent as `worker_phase`/`runtime_status`. Rides FREE in
-   * the embedded-tasks JSON; no schema column, no SCHEMA_VERSION bump.
+   * Planctl-native effort tier on TaskSnapshot blobs. Stored opaque (the
+   * reducer never branches on the value). Read defensively
+   * (`snapshot.tier ?? null`) so an older blob folds to a null tier. Rides
+   * free in the embedded-tasks JSON; no schema column.
    */
   tier?: string | null;
   epic_id?: string | null;
   status?: string | null;
   /**
-   * Derived worker-phase binary on TaskSnapshot blobs (schema v19): the same
-   * compressed signal the field used to carry under the legacy `status`
-   * column on the embedded task element (`worker_done_at` present → `"done"`,
-   * else `"open"`). Renamed from `status` to free up `runtime_status` (below)
-   * for the planctl-native enum. A pre-v19 TaskSnapshot blob carries
-   * `status` instead; the reducer reads `worker_phase ?? status` for
-   * re-fold determinism across the version boundary.
+   * Derived worker-phase binary on TaskSnapshot blobs (`worker_done_at` present
+   * → `"done"`, else `"open"`). A pre-rename blob carries `status` instead; the
+   * reducer reads `worker_phase ?? status` for re-fold determinism across the
+   * version boundary.
    */
   worker_phase?: string | null;
   /**
-   * Planctl-native runtime status on TaskSnapshot blobs (schema v19): the
-   * top-level `status` field of `.planctl/state/tasks/<task_id>.state.json`
-   * (`"todo" | "in_progress" | "done" | "blocked"`). Absent on pre-v19 blobs;
-   * the reducer reads defensively (`runtime_status ?? "todo"` — planctl's
-   * `merge_task_state` convention) so an older blob still folds
-   * deterministically.
+   * Planctl-native runtime status (`"todo" | "in_progress" | "done" |
+   * "blocked"`). Read defensively (`runtime_status ?? "todo"`) so an older blob
+   * still folds deterministically.
    */
   runtime_status?: string | null;
   /** Epic-level deps (EpicSnapshot blob) — the planctl `depends_on_epics` ids. */
@@ -646,34 +414,24 @@ interface PlanSnapshot {
   /** Task-level deps (TaskSnapshot blob) — the planctl `depends_on` task ids. */
   depends_on?: string[] | null;
   /**
-   * Planctl-native `last_validated_at` (EpicSnapshot blob — epic-level only).
-   * Plain ISO-8601 string when present; absent / NULL folds to `null` so a
-   * blob from an older daemon build (or an unvalidated epic file) reproduces
-   * the same row across re-fold. Schema column is nullable TEXT — no default.
+   * Planctl-native `last_validated_at` (EpicSnapshot blob, epic-level only).
+   * Absent / NULL folds to `null` so an older blob reproduces the same row
+   * across re-fold.
    */
   last_validated_at?: string | null;
 }
 
 /**
  * Extract the full plan snapshot from a synthetic `EpicSnapshot` /
- * `TaskSnapshot` event's `data` blob. Guarded-parse mirroring
- * {@link extractSessionTitle} / {@link extractTranscriptPath}: try/catch around
- * `JSON.parse(event.data)`, skip-and-log on a malformed blob, never throw — the
- * cursor still advances upstream, so one bad snapshot row never wedges the
- * reducer. Returns `null` on a missing/malformed blob (the caller then makes the
+ * `TaskSnapshot` event's `data` blob. Skip-and-log on a malformed blob, never
+ * throw. Returns `null` on a missing/malformed blob (the caller then makes the
  * fold a no-op for that event).
- *
- * Every field is taken verbatim from the blob — the producer pre-computes
- * number parsing + status derivation, so the reducer stays a pure function of
- * the persisted event and a from-scratch re-fold is byte-identical.
  */
 function extractPlanSnapshot(event: Event): PlanSnapshot | null {
   if (event.data && event.data.length > 0) {
     try {
       return JSON.parse(event.data) as PlanSnapshot;
     } catch (err) {
-      // Malformed JSON: skip-and-log. The cursor still advances upstream so the
-      // reducer never wedges on one bad row.
       console.error(
         `keeper reducer: failed to parse plan snapshot blob for event id=${event.id} entity=${event.session_id}: ${err}`,
       );
@@ -682,40 +440,13 @@ function extractPlanSnapshot(event: Event): PlanSnapshot | null {
   return null;
 }
 
-/**
- * Apply the plan-side projection for one synthetic `EpicSnapshot` /
- * `TaskSnapshot` event. Runs INSIDE the open transaction opened by
- * {@link applyEvent}; performs zero cursor work.
- *
- * The entity id rides in `event.session_id` (the generic entity-key overload —
- * always non-NULL, guaranteed by the producer), the full snapshot rides in the
- * `data` JSON blob. Each kind upserts its projection table with
- * `INSERT … ON CONFLICT(<pk>) DO UPDATE` so a re-arrived snapshot is idempotent
- * last-write-wins. `last_event_id = event.id` on every fold — the monotonic
- * per-row `version` column the read-surface diff fires on (jobs uses the same);
- * `updated_at = event.ts`.
- *
- * Plans are state-on-disk full snapshots, so unlike jobs there is no
- * accumulating lifecycle — every column is overwritten from the blob each fold.
- * A missing/malformed blob is a no-op (extract returned null); the cursor still
- * advances upstream.
- */
-/** Zero-pad an integer to width 6 for schema-v29 `sort_path` keys. */
+/** Zero-pad an integer to width 6 for `sort_path` keys. */
 const zeroPad6 = (n: number): string => String(n).padStart(6, "0");
 
 /**
- * Schema v53 (fn-688) — predicate: is `epicId` an actively-tombstoned epic?
- *
- * Read against the `epic_tombstones` projection inside the open `BEGIN
- * IMMEDIATE` transaction (a read off the same writable connection — every
- * shell-INSERT site invoking this is already inside the fold's
- * transaction via `applyEvent`). Returns `true` when an `EpicDeleted`
- * has been folded for this id WITHOUT a subsequent `EpicSnapshot`
- * clearing it; `false` for never-deleted or already-revived epics.
- *
- * Centralized so every shell-INSERT site uses the same gate — no
- * silently-divergent open-coded shape, no risk of a new shell site
- * skipping the check.
+ * Predicate: is `epicId` an actively-tombstoned epic? `true` when an
+ * `EpicDeleted` has been folded for this id WITHOUT a subsequent `EpicSnapshot`
+ * clearing it. Centralized so every shell-INSERT site uses the same gate.
  */
 function isEpicTombstoned(db: Database, epicId: string): boolean {
   const row = db
@@ -725,35 +456,12 @@ function isEpicTombstoned(db: Database, epicId: string): boolean {
 }
 
 /**
- * Schema v53 (fn-688) — shared epic-shell-INSERT helper. Routes ALL four
- * shell-INSERT sites (`projectPlanRow` TaskSnapshot arm, both
- * `syncJobIntoEpic` arms, `syncPlanctlLinks`) through one tombstone-
- * checking choke-point.
- *
- * The full-scalar `EpicSnapshot` INSERT is NOT a shell site and does
- * NOT call this helper — it is the CLEAR site (its arm deletes the
- * tombstone unconditionally, then upserts the row scalars from the
- * snapshot blob).
- *
- * Each shell site supplies its own SQL (the column lists differ across
- * sites — `projectPlanRow` writes `tasks`; `syncJobIntoEpic` writes
- * `jobs` or `tasks` + `jobs`; `syncPlanctlLinks` writes `job_links` +
- * the schema-v29/v30 closer columns). The helper's only job is the
- * tombstone gate: when an `EpicDeleted` has been folded for this id
- * without a subsequent `EpicSnapshot` clearing it, the shell-INSERT
- * is suppressed and a `console.error` notes the suppression for
- * operator audit. The legitimate before-arrival shell for never-
- * deleted epics still lands (tombstone absent → INSERT proceeds).
- *
- * Runs INSIDE the open `BEGIN IMMEDIATE` transaction (the caller is
- * inside a reducer fold). Never throws — a SQL error inside the run
- * propagates the same way every other `db.run` in the reducer would,
- * and the tombstone gate is a pure read so it cannot fail in a way
- * the unguarded path wouldn't.
- *
- * The `sql` parameter and `params` array are passed verbatim to
- * `db.run` — slot the helper at the exact `INSERT INTO epics ...`
- * statement each caller would otherwise have called inline.
+ * Shared epic-shell-INSERT helper routing every shell-INSERT site through one
+ * tombstone-checking choke-point. The full-scalar `EpicSnapshot` INSERT is NOT
+ * a shell site — it is the CLEAR site. When an `EpicDeleted` has been folded
+ * for this id without a subsequent `EpicSnapshot` clearing it, the shell-INSERT
+ * is suppressed (a `console.error` notes it); otherwise the `sql` + `params`
+ * are passed verbatim to `db.run`.
  */
 function insertEpicShellIfNotTombstoned(
   db: Database,
@@ -762,11 +470,8 @@ function insertEpicShellIfNotTombstoned(
   params: SQLQueryBindings[],
 ): void {
   if (isEpicTombstoned(db, epicId)) {
-    // The deleted-epic resurrection path the v53 tombstone guard
-    // closes (fn-688). A pre-fn-688 build would have shell-INSERTed
-    // here and surfaced as a headerless ghost row on `keeper board`;
-    // we skip and note. Cursor still advances upstream — never throw
-    // inside the fold.
+    // Suppress the shell-INSERT: it would resurrect the deleted epic as a
+    // headerless ghost row on `keeper board`. Never throw inside the fold.
     console.error(
       `keeper reducer: shell-INSERT for epic ${epicId} suppressed (epic is tombstoned — would resurrect as scalar-NULL ghost row)`,
     );
@@ -784,44 +489,21 @@ function projectPlanRow(db: Database, event: Event): void {
   const entityId = event.session_id;
 
   if (event.hook_event === "EpicSnapshot") {
-    // Schema v53 (fn-688): CLEAR the tombstone for this epic_id BEFORE
-    // the upsert lands. A re-creating EpicSnapshot is the signal that
-    // the deletion has been reverted (the planctl file is back); the
-    // upsert below then lands the fresh row, and subsequent shell-
-    // INSERT sites (`projectPlanRow` TaskSnapshot arm, both
-    // `syncJobIntoEpic` arms, `syncPlanctlLinks`, all routed through
-    // `insertEpicShellIfNotTombstoned`) see an absent tombstone +
-    // proceed normally. The clear runs UNCONDITIONALLY (not gated on
-    // the ON-CONFLICT scalar-change carve-out below) — it MUST be a
-    // pure function of `event.hook_event === "EpicSnapshot"` so that
-    // a cursor=0 re-fold produces byte-identical `epic_tombstones`
-    // rows (CLAUDE.md "re-fold determinism"). Placing it INSIDE the
-    // carve-out would mean an unchanged-scalars re-emit would NOT
-    // clear the tombstone, breaking re-fold determinism on the
-    // delete→recreate interleaving. Idempotent: the DELETE is a no-op
-    // when no tombstone exists (every never-deleted epic's snapshot
-    // takes this path harmlessly).
+    // CLEAR the tombstone for this epic_id BEFORE the upsert: a re-creating
+    // EpicSnapshot signals the deletion was reverted. Runs UNCONDITIONALLY (a
+    // pure function of `hook_event === "EpicSnapshot"`, NOT gated on the
+    // ON-CONFLICT carve-out below) so a cursor=0 re-fold produces byte-
+    // identical `epic_tombstones` rows. Idempotent: a no-op when no tombstone
+    // exists.
     db.run("DELETE FROM epic_tombstones WHERE epic_id = ?", [entityId]);
 
     // The ON CONFLICT update lists ONLY scalar columns and NEVER `tasks` /
     // `jobs` / `job_links` / `created_by_closer_of` / `sort_path` /
-    // `queue_jump` / `resolved_epic_deps`: an epic snapshot carries no
-    // task, job, job-link, closer-derivation, queue-jump, OR dep-
-    // resolution data, and a shell row inserted by a task-before-epic
-    // TaskSnapshot, a job-before-epic `syncJobIntoEpic`, or a
-    // planctl-event-before-epic `syncPlanctlLinks` already holds those
-    // columns (the planctl-event shell stamps `job_links` real and leaves
-    // the schema-v29 closer columns + the schema-v30 queue-jump column at
-    // NULL / '' / 0 for the next `syncPlanctlLinks` call to compute). The
-    // schema-v34 (fn-637) `resolved_epic_deps` column is computed AFTER
-    // this INSERT/UPDATE by `syncEpicDepsForward` against the post-write
-    // row; INSERT defaults it to NULL (the schema column default) and the
-    // ON CONFLICT carve-out preserves the just-computed projection
-    // across the next snapshot fold. Without the carve-out, any
-    // file-watcher → EpicSnapshot re-fold would wipe the creator/refiner
-    // provenance projection (schema v14) AND the closer-creator link +
-    // materialized-path sort key (schema v29) AND the priority-jump flag
-    // (schema v30) AND the resolved-deps projection (schema v34).
+    // `queue_jump` / `resolved_epic_deps`: an epic snapshot carries none of
+    // that data, and a shell row inserted by a task/job/planctl-event before
+    // the epic already holds those columns. Without the carve-out, an
+    // EpicSnapshot re-fold would wipe the provenance, closer-link, sort-path,
+    // queue-jump, and resolved-deps projections.
     db.run(
       `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, depends_on_epics, last_validated_at, last_event_id, updated_at, created_by_closer_of, sort_path, queue_jump)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, '', 0)
@@ -840,32 +522,21 @@ function projectPlanRow(db: Database, event: Event): void {
         snapshot.title ?? null,
         snapshot.project_dir ?? null,
         snapshot.status ?? null,
-        // Stored as a JSON-TEXT array column; decoded back to an array at the
-        // read boundary. A missing list folds to the empty array (schema default).
+        // Stored as a JSON-TEXT array column; a missing list folds to `[]`.
         JSON.stringify(snapshot.depends_on_epics ?? []),
-        // Nullable TEXT — no DEFAULT; a missing / NULL blob value (older
-        // daemon build, or an unvalidated epic file) folds to NULL so the
-        // pre-v16 zero-event reading is preserved across re-fold.
+        // A missing / NULL blob value folds to NULL.
         snapshot.last_validated_at ?? null,
         event.id,
         ts,
       ],
     );
-    // Schema v29: if `sort_path` is still '' (no `syncPlanctlLinks` has run
-    // yet) but `epic_number` is now known, derive the sort_path so that child
-    // epics can inherit a non-empty parent path. This is the "parent's
-    // EpicSnapshot triggers cascade re-stamp" behaviour — an EpicSnapshot for
-    // a root epic unblocks the chain without requiring a planctl event.
-    //
-    // Schema v30: also read `queue_jump` off the existing row (the ON
-    // CONFLICT carve-out above preserves it across snapshot folds) and
-    // prepend `!` to the path for ROOT epics whose `queue_jump = 1`. A
-    // non-root queue-jumped epic inherits its parent's path verbatim — the
-    // root parent's `!`-prefix propagates through the `parentPath` string
-    // concat for free (no double-prefix risk). The `!` (ASCII 33) sorts
-    // strictly below the digits (ASCII 48-57) under SQLite BINARY collation,
-    // so a queue-jumped root lifts above every non-queued root in the
-    // dashctl board's default ORDER BY.
+    // If `sort_path` is still '' but `epic_number` is now known, derive it so
+    // child epics can inherit a non-empty parent path (an EpicSnapshot for a
+    // root epic unblocks the chain without a planctl event). Prepend `!` for
+    // ROOT epics whose `queue_jump = 1`: `!` (ASCII 33) sorts strictly below
+    // the digits under SQLite BINARY collation, lifting a queue-jumped root
+    // above non-queued roots. A non-root queue-jumped epic inherits its
+    // parent's path, so the root's `!`-prefix propagates for free.
     const spRow = db
       .query(
         "SELECT epic_number, created_by_closer_of, sort_path, queue_jump FROM epics WHERE epic_id = ?",
@@ -909,25 +580,12 @@ function projectPlanRow(db: Database, event: Event): void {
       }
     }
 
-    // Schema v34 (fn-637): forward stamp + reverse fan-out for
-    // `resolved_epic_deps` + `epic_dep_edges`. Built ONCE per EpicSnapshot
-    // — the all-epics index assembled here is shared across the forward
-    // pass (the consumer is THIS epic; its edges + projection rebuild
-    // from scratch) and the reverse pass (every consumer whose
-    // `depends_on_epics` token IN (this.epic_id, 'fn-' || this.epic_number)
-    // — they re-resolve against the same index so a state flip on the
-    // upstream propagates in lockstep).
-    //
-    // Read-in-fold is allowed (the autocommit ban is on DB watchers,
-    // not query reads). The all-epics scan is ~1k rows on the steady-
-    // state DB; the per-event cost is dominated by the per-consumer
-    // re-stamps in the reverse pass.
-    //
-    // Order: forward FIRST, reverse SECOND. The reverse pass reads the
-    // consumer's `epics` row and re-resolves against the upstream's
-    // post-write state; running it AFTER the forward pass keeps the
-    // upstream's own row settled before downstream consumers re-stamp
-    // against it.
+    // Forward stamp + reverse fan-out for `resolved_epic_deps` +
+    // `epic_dep_edges`. The all-epics index is built ONCE and shared across
+    // both passes. Order is load-bearing: forward FIRST settles THIS epic's
+    // own row, reverse SECOND re-resolves every downstream consumer (whose
+    // `depends_on_epics` token matches this epic's full or bare id) against
+    // that settled state, so an upstream state flip propagates in lockstep.
     {
       const index = buildEpicIndex(db);
       syncEpicDepsForward(
@@ -938,11 +596,9 @@ function projectPlanRow(db: Database, event: Event): void {
         index.epicById,
         index.epicsByNumber,
       );
-      // Read the upstream's epic_number off the just-settled row (the
-      // forward pass may have stamped sort_path / resolved_epic_deps but
-      // didn't touch epic_number itself — the EpicSnapshot's INSERT/UPDATE
-      // did). A NULL epic_number means the reverse lookup skips the
-      // bare-id (`fn-N`) branch but still considers the full id.
+      // Read the upstream's epic_number off the just-settled row. A NULL
+      // epic_number makes the reverse lookup skip the bare-id branch but still
+      // consider the full id.
       const upstreamRow = db
         .query("SELECT epic_number FROM epics WHERE epic_id = ?")
         .get(entityId) as { epic_number: number | null } | null;
@@ -957,24 +613,14 @@ function projectPlanRow(db: Database, event: Event): void {
       );
     }
 
-    // fn-774: PRUNE the `armed_epics` row when this epic folds to completion.
-    // An epic that has left the board (`status='done'` — the canonical
-    // `epicIsCompleted` predicate, `epic-deps.ts`) can't still be armed; the
-    // reconcile closure + the `[armed]` board pill must drop it. This makes
-    // the EpicSnapshot fold a SECOND writer of `armed_epics` alongside
-    // `foldEpicArmed` (the EpicArmed-event writer) — the disarm-on-completion
-    // half of the presence table's lifecycle. Like the line-804
+    // PRUNE the `armed_epics` row when this epic folds to completion — a `done`
+    // epic can't stay armed. Makes the EpicSnapshot fold a SECOND writer of
+    // `armed_epics` alongside the EpicArmed-event writer. Like the
     // `epic_tombstones` clear above, this DELETE sits OUTSIDE the ON-CONFLICT
-    // scalar-change carve-out so it fires on EVERY `done` snapshot including
-    // unchanged-scalar re-emits: a pure function of
-    // (`hook_event === "EpicSnapshot"` ∧ `snapshot.status === "done"`), so a
-    // cursor=0 re-fold reproduces byte-identical `armed_epics` rows
-    // (CLAUDE.md "re-fold determinism"). Placing it inside the carve-out would
-    // skip the prune on an unchanged-scalar re-emit and break determinism on
-    // the arm-after-done interleaving. STRICT `=== "done"` (not truthiness) so
-    // a null/missing status no-ops rather than throwing. Idempotent bare
-    // `db.run`: a no-op DELETE on a never-armed epic (the common case — most
-    // done epics were never armed) and harmless on a repeat `done` snapshot.
+    // carve-out so it fires on EVERY `done` snapshot (a pure function of
+    // `hook_event === "EpicSnapshot"` ∧ `status === "done"`), keeping a
+    // cursor=0 re-fold byte-identical. STRICT `=== "done"` so a null/missing
+    // status no-ops rather than throwing. Idempotent.
     if (snapshot.status === "done") {
       db.run("DELETE FROM armed_epics WHERE epic_id = ?", [entityId]);
     }
@@ -992,17 +638,12 @@ function projectPlanRow(db: Database, event: Event): void {
     }
 
     // The element shape stored in the array — field-for-field the served Task.
-    // `depends_on` is last (matches the Task interface order) so a re-folded
-    // element serializes byte-identically; a missing list folds to []. The
-    // embedded `jobs` sub-array is preserved from the OLD element below (a
-    // plan-file snapshot carries no job data — see the RMW preservation step
-    // before push), or defaults to `[]` for a first-sight task.
     // The SLOT ORDER of the keys below is load-bearing: `seedFromDb` in
     // `plan-worker.ts` reconstructs `PlanTaskMessage` from this persisted
-    // element shape, and the change-gate fingerprint is a `JSON.stringify`
-    // byte-compare. Any rename or reorder MUST be mirrored on
-    // `PlanTaskMessage` + `buildTaskMessage` + `seedFromDb`, or every task
-    // re-emits a synthetic snapshot on every daemon boot.
+    // element shape and the change-gate fingerprint is a `JSON.stringify`
+    // byte-compare. Any rename or reorder MUST be mirrored on `PlanTaskMessage`
+    // + `buildTaskMessage` + `seedFromDb`, or every task re-emits a synthetic
+    // snapshot on every daemon boot.
     const element: {
       task_id: string;
       epic_id: string;
@@ -1020,27 +661,16 @@ function projectPlanRow(db: Database, event: Event): void {
       task_number: snapshot.task_number ?? null,
       title: snapshot.title ?? null,
       target_repo: snapshot.target_repo ?? null,
-      // Planctl-native effort tier (fn-602): rides FREE in the embedded JSON
-      // — no schema column, no SCHEMA_VERSION bump. Pre-fn-602 TaskSnapshot
-      // blobs lack the field and fold to `null` (graceful-degradation
-      // precedent shared with `worker_phase` / `runtime_status`); a later
-      // planctl re-emit of the task fills it. The slot lives after
-      // `target_repo` to match `PlanTaskMessage` / `seedFromDb` / the
-      // `TaskElement` shell in `syncJobIntoEpic` — the change-gate
-      // `JSON.stringify` byte-compare relies on consistent slot order
-      // across all four sites (see CLAUDE.md "SLOT ORDER is load-bearing").
+      // The slot order across `target_repo` / `tier` / `worker_phase` etc. must
+      // match `PlanTaskMessage` / `seedFromDb` / the `TaskElement` shell in
+      // `syncJobIntoEpic` — the change-gate `JSON.stringify` byte-compare
+      // relies on consistent slot order across all four sites.
       tier: snapshot.tier ?? null,
-      // Renamed from the legacy `status` column on the embedded element
-      // (schema v19). A pre-v19 TaskSnapshot blob carries `status` instead of
-      // `worker_phase`; read whichever is present so a re-fold reproduces
-      // the same value across the version boundary.
+      // A pre-rename blob carries `status` instead of `worker_phase`; read
+      // whichever is present so a re-fold reproduces the same value.
       worker_phase: snapshot.worker_phase ?? snapshot.status ?? null,
-      // Planctl-native runtime status (`todo|in_progress|done|blocked`),
-      // ingested from `.planctl/state/tasks/<task_id>.state.json` and pre-
-      // coerced by the plan-worker. Absent on pre-v19 blobs / never-observed
-      // state files → folds to `"todo"` per planctl's `merge_task_state`
-      // convention (a fresh clone with no `state/` tree reads every task as
-      // `todo`).
+      // Absent on older blobs / never-observed state files → folds to `"todo"`
+      // per planctl's `merge_task_state` convention.
       runtime_status: snapshot.runtime_status ?? "todo",
       depends_on: snapshot.depends_on ?? [],
       jobs: [],
@@ -1065,11 +695,9 @@ function projectPlanRow(db: Database, event: Event): void {
       }
     }
 
-    // Preserve the OLD element's `jobs` sub-array before re-placing. Plan-file
-    // snapshots carry zero job info — they MUST NOT clobber live state. Without
-    // this read-then-attach, every plan-file edit would drop the
-    // job-association list. A first-sight task (no OLD element) keeps the
-    // default `[]` set on `element` above.
+    // Preserve the OLD element's `jobs` sub-array before re-placing: plan-file
+    // snapshots carry zero job info and MUST NOT clobber live state. A
+    // first-sight task keeps the default `[]`.
     const oldElement = tasks.find((t) => t.task_id === entityId);
     if (oldElement != null && Array.isArray(oldElement.jobs)) {
       element.jobs = oldElement.jobs;
@@ -1099,15 +727,11 @@ function projectPlanRow(db: Database, event: Event): void {
         [tasksJson, event.id, ts, epicId],
       );
     } else {
-      // No epic row yet — insert a SHELL (epic_id set, scalar columns NULL,
-      // the array carrying this one task). A later EpicSnapshot fills the
-      // scalars without clobbering `tasks` (its ON CONFLICT omits the column).
-      // Schema v53 (fn-688): routed through the shared tombstone-checking
-      // helper — a deleted epic's `EpicDeleted` mints a tombstone row,
-      // so a TaskSnapshot whose `epic_id` matches the dead epic
-      // suppresses this shell rather than resurrecting it as a NULL-
-      // scalar ghost. The legitimate task-before-epic shell for a
-      // never-deleted epic still lands (no tombstone present).
+      // No epic row yet — insert a SHELL (epic_id set, scalars NULL, the array
+      // carrying this one task). A later EpicSnapshot fills the scalars without
+      // clobbering `tasks`. Routed through the tombstone-checking helper so a
+      // TaskSnapshot for a deleted epic suppresses the shell rather than
+      // resurrecting it as a NULL-scalar ghost.
       insertEpicShellIfNotTombstoned(
         db,
         epicId,
@@ -1121,75 +745,47 @@ function projectPlanRow(db: Database, event: Event): void {
 
 /**
  * Apply a plan-side RETRACTION for one synthetic `EpicDeleted` / `TaskDeleted`
- * tombstone event. Runs INSIDE the open transaction opened by
- * {@link applyEvent}; performs zero cursor work.
+ * tombstone event. Tombstones are the only replay-deterministic way to fold a
+ * delete (a file vanishing off disk leaves no event), so the producer emits an
+ * explicit tombstone riding the same synthetic-event pipeline as the snapshots.
  *
- * Tombstones are the only replay-deterministic way to fold a delete: a file
- * vanishing off disk leaves no event, so the producer emits an explicit
- * tombstone that rides the same synthetic-event pipeline as the snapshots. A
- * re-fold from scratch replays the create→delete sequence and reproduces the
- * same retracted state.
- *
- * - `EpicDeleted`: `DELETE FROM epics WHERE epic_id = ?` — the embedded `tasks`
- *   array vanishes with the row. The entity id rides in `event.session_id`.
+ * - `EpicDeleted`: `DELETE FROM epics WHERE epic_id = ?` (the embedded `tasks`
+ *   array vanishes with the row); entity id in `event.session_id`.
  * - `TaskDeleted`: a read-modify-write on the PARENT epic's embedded array —
- *   splice out the element by `task_id` (the task pk in `event.session_id`),
- *   re-sort, write back, bump `last_event_id`/`updated_at` so the retraction
- *   `patch`es. The parent key rides in the `data` blob's `epic_id`.
+ *   splice out the element by `task_id`, re-sort, write back; parent key in the
+ *   `data` blob's `epic_id`.
  *
- * Both folds are idempotent no-ops on a missing target (epic / element already
- * gone, or — for a task — a null `epic_id` we can't place against), and never
- * throw inside the transaction (a throw rolls back the cursor and wedges the
- * reducer); a malformed stored array folds to `[]`.
+ * Both folds are idempotent no-ops on a missing target and never throw inside
+ * the transaction; a malformed stored array folds to `[]`.
  */
 function retractPlanRow(db: Database, event: Event): void {
   const entityId = event.session_id;
 
   if (event.hook_event === "EpicDeleted") {
-    // Schema v34 (fn-637): capture the upstream's epic_number BEFORE the
-    // DELETE so the reverse fan-out can re-stamp downstream consumers
-    // that depended on the bare-id form (`fn-N`) — the row is about to
-    // vanish, taking `epic_number` with it. Idempotent: a missing epic
-    // reads `null`, falls through, and the DELETE is a no-op match.
+    // Capture the upstream's epic_number BEFORE the DELETE so the reverse
+    // fan-out can re-stamp consumers that depended on the bare-id form — the
+    // row is about to vanish, taking `epic_number` with it.
     const pre = db
       .query("SELECT epic_number FROM epics WHERE epic_id = ?")
       .get(entityId) as { epic_number: number | null } | null;
     db.run("DELETE FROM epics WHERE epic_id = ?", [entityId]);
-    // Also drop the upstream's OWN edges row — the consumer→token
-    // index for THIS epic as a consumer is gone with the row, so its
-    // back-references should not linger. Forward-only: re-fold from
-    // scratch replays the create→delete sequence and reproduces the
-    // same retracted state. Idempotent: zero matches on a never-existed
-    // / already-retracted edge.
+    // Drop the upstream's OWN edges row — its consumer→token index is gone with
+    // the row.
     db.run("DELETE FROM epic_dep_edges WHERE consumer_id = ?", [entityId]);
-    // Schema v53 (fn-688): MINT a tombstone for this epic_id so every
-    // subsequent epic-shell-INSERT site (the four routed through
-    // `insertEpicShellIfNotTombstoned`) skips the resurrection. This
-    // is the entire ghost-row fix in three lines: without the mint, a
-    // later job-side fold (a terminal `approve`/`SessionEnd` whose
-    // `plan_ref` still points at the now-gone epic) would find
-    // `epicRow == null` and shell-INSERT the row back with NULL
-    // scalars — rendering as a decapitated block at the top of
-    // `keeper board`. Mint UNCONDITIONALLY (independent of whether
-    // `pre` was null — a delete-before-snapshot or double-delete still
-    // produces a tombstone). `ON CONFLICT(epic_id) DO NOTHING`
-    // preserves the FIRST observed delete's event id, matching
-    // `foldDispatchFailed`'s "first observation" semantic. The mint
-    // rides the SAME `BEGIN IMMEDIATE` as the DELETE + cursor bump —
-    // a crash mid-fold rolls back ALL three writes (CLAUDE.md
-    // "cursor + projection advance in the same transaction").
-    // `event.id`, NEVER `Date.now()` — re-fold determinism.
+    // MINT a tombstone so every subsequent shell-INSERT site skips the
+    // resurrection (without it, a later job-side fold whose `plan_ref` still
+    // points at the gone epic would shell-INSERT it back as a NULL-scalar
+    // ghost). Mint UNCONDITIONALLY. `ON CONFLICT DO NOTHING` preserves the
+    // FIRST observed delete's event id. Rides the SAME transaction as the
+    // DELETE + cursor bump; `event.id`, never wall-clock — re-fold determinism.
     db.run(
       "INSERT INTO epic_tombstones (epic_id, deleted_at_event_id) VALUES (?, ?) ON CONFLICT(epic_id) DO NOTHING",
       [entityId, event.id],
     );
     // Reverse fan-out — re-stamp every downstream consumer whose
-    // `depends_on_epics` carried this epic's full id or bare id. The
-    // resolver re-runs against the post-DELETE `epics` table: a
-    // matching upstream now misses and the consumer's matching entry
-    // flips to `dangling`. Order matters: DELETE FIRST so the resolver
-    // observes the missing row; reverse fan-out SECOND. Built ONCE per
-    // EpicDeleted — same shape as the EpicSnapshot path.
+    // `depends_on_epics` carried this epic's full or bare id; a matching
+    // upstream now misses and the entry flips to `dangling`. DELETE FIRST so
+    // the resolver observes the missing row; fan-out SECOND.
     if (pre != null) {
       const index = buildEpicIndex(db);
       syncEpicDepsReverse(
@@ -1206,9 +802,8 @@ function retractPlanRow(db: Database, event: Event): void {
   }
 
   // TaskDeleted: splice the element out of the parent epic's `tasks` array. The
-  // parent key is the blob's `epic_id` (the file is gone, so the producer
-  // recovered it from the change-gate). A null/absent epic_id can't be placed —
-  // no-op, cursor still advances upstream.
+  // parent key is the blob's `epic_id`. A null/absent epic_id can't be placed —
+  // no-op.
   const snapshot = extractPlanSnapshot(event);
   const epicId = snapshot?.epic_id ?? null;
   if (epicId == null) {
@@ -1243,8 +838,8 @@ function retractPlanRow(db: Database, event: Event): void {
     return;
   }
 
-  // Re-sort by the SAME (task_number, task_id) key the snapshot fold + migration
-  // backfill use, so the spliced array stays deterministically ordered.
+  // Re-sort by the same (task_number, task_id) key the snapshot fold uses so
+  // the spliced array stays deterministically ordered.
   next.sort((a, b) => {
     const an = a.task_number;
     const bn = b.task_number;
@@ -1262,12 +857,10 @@ function retractPlanRow(db: Database, event: Event): void {
 }
 
 /**
- * Reducer-local view of one entry in the producer's `dirty_files[]` array.
- * Field-for-field a {@link import("./git-worker").GitDirtyFile} with every
- * field defensively re-typed as the safe-fold fallback (the producer is a
- * separate process, so the reducer cannot trust shape — every parse path
- * has to fold to a safe value rather than throw inside the BEGIN IMMEDIATE
- * transaction).
+ * Reducer-local view of one entry in the producer's `dirty_files[]` array, with
+ * every field defensively re-typed as the safe-fold fallback (the producer is a
+ * separate process, so the reducer never trusts shape — every parse path folds
+ * to a safe value rather than throw inside the transaction).
  */
 interface ReducerDirtyFile {
   path: string;
@@ -1275,16 +868,10 @@ interface ReducerDirtyFile {
   orig_path: string | null;
   mtime_ms: number | null;
   /**
-   * Schema v44 / fn-664: filter-correct worktree blob oid (`git hash-object
-   * --stdin-paths` per file at producer time), staged blob oid (porcelain v2
-   * `hI`), and worktree file mode (porcelain v2 `mW`). All three are
-   * frozen-into-payload pure facts — no fold-time git probe, re-fold
-   * deterministic. Each parses to `null` independently when (a) the producer
-   * couldn't compute it, (b) the event pre-dates v44 and the field is
-   * absent, or (c) the per-file shape is malformed. Task .1 stamps
-   * `worktree_oid` into `file_attributions` (additive UPSERT column) but
-   * does NOT yet read it for discharge; task .2 of the epic switches
-   * `foldCommit` to gate on `committed_oid == worktree_oid`.
+   * Worktree blob oid, staged blob oid, and worktree file mode — frozen-into-
+   * payload pure facts (no fold-time git probe, re-fold deterministic). Each
+   * parses to `null` independently when the producer couldn't compute it, the
+   * event pre-dates the field, or the per-file shape is malformed.
    */
   worktree_oid: string | null;
   index_oid: string | null;
@@ -1292,17 +879,13 @@ interface ReducerDirtyFile {
 }
 
 /**
- * Reducer-local view of the v31 file-centric `GitSnapshot` payload. The
- * producer narrowed to `{project_dir, branch, head_oid, upstream, ahead,
- * behind, dirty_files[]}` in fn-633.5; this task (.6) derives every other
- * facet — per-(session, file) attribution rows, per-job dirty rollup,
- * project-broadcast orphan/unattributed counts, and the rendered
- * `dirty_files[].attributions[]` JSON — inside `BEGIN IMMEDIATE` against
- * the persisted event log + `file_attributions` table. No more
- * `orphaned_files` or `jobs[]` lifted from the event blob (the
- * transitional shape was removed at this task; historical events stored
- * against the wide shape still parse — extra keys are ignored — but their
- * `orphaned_files` / `jobs[]` are never read).
+ * Reducer-local view of the file-centric `GitSnapshot` payload
+ * (`{project_dir, branch, head_oid, upstream, ahead, behind, dirty_files[]}`).
+ * The reducer derives every other facet — per-(session, file) attribution rows,
+ * per-job dirty rollup, project-broadcast orphan/unattributed counts, and the
+ * rendered `dirty_files[].attributions[]` JSON — inside the transaction against
+ * the persisted event log + `file_attributions` table. Historical events stored
+ * against the older wide shape still parse (extra keys ignored).
  */
 interface ParsedGitSnapshot {
   project_dir: string;
@@ -1337,9 +920,8 @@ function extractGitSnapshot(event: Event): ParsedGitSnapshot | null {
   ) {
     return null;
   }
-  // Per-file defensive parse: every field guarded against shape mismatch.
-  // A bad file folds to `null` (skipped); a bad mtime folds to `null` (the
-  // file simply gets no inferred-attribution chance in pass 2). Never
+  // Per-file defensive parse: a bad file folds to `null` (skipped); a bad
+  // mtime folds to `null` (no inferred-attribution chance in pass 2). Never
   // throws — the fold tx is sacred.
   const dirtyFiles: ReducerDirtyFile[] = [];
   if (Array.isArray(parsed.dirty_files)) {
@@ -1356,14 +938,11 @@ function extractGitSnapshot(event: Event): ParsedGitSnapshot | null {
         typeof f.mtime_ms === "number" && Number.isFinite(f.mtime_ms)
           ? f.mtime_ms
           : null;
-      // v44 / fn-664: three new per-file content axes. All `string|null`
-      // with the defensive parse: a non-string folds to `null` so a
-      // malformed payload never wedges the fold tx. Validation of
-      // worktree_oid / index_oid against GIT_OID_RE shape isn't done here
+      // Three per-file content axes, all `string|null` with the defensive
+      // parse: a non-string folds to `null`. Oid shape isn't validated here
       // (the producer is the trusted writer); a bad oid round-trips into
-      // file_attributions as-is and the task .2 discharge gate will
-      // reject the comparison, falling back to timestamp discharge —
-      // identical safe-side behavior to today's pre-v44 fold.
+      // file_attributions as-is and the discharge gate rejects the comparison,
+      // falling back to timestamp discharge.
       const worktreeOid =
         typeof f.worktree_oid === "string" && f.worktree_oid.length > 0
           ? f.worktree_oid
@@ -1406,10 +985,9 @@ function extractGitSnapshot(event: Event): ParsedGitSnapshot | null {
  * so a session that has discharged its claim on a file is omitted from the
  * file's attribution list — which IS the readiness signal a client renders.
  *
- * `title` / `state` are nullable because the `jobs` row may not yet exist
- * for an attribution (a Write tool fold ran before SessionStart, possible
- * during a re-fold-from-cursor=0 if event ordering differs from the boot-
- * drain — defensive shape, defaults `state="stopped"` if the join misses).
+ * `title` / `state` are nullable because the `jobs` row may not yet exist for
+ * an attribution (a Write tool fold ran before SessionStart); defaults
+ * `state="stopped"` if the join misses.
  */
 interface RenderedAttribution {
   session_id: string;
@@ -1421,40 +999,25 @@ interface RenderedAttribution {
 }
 
 /**
- * Project the latest `(session_id, file_path)` mutation evidence the
- * persisted event log carries for a given dirty file. Three match modes
- * are layered, all feeding the same `file_attributions` UPSERT in
- * pass 1:
+ * Project the latest `(session_id, file_path)` mutation evidence the persisted
+ * event log carries for a given dirty file. Three match modes feed the same
+ * `file_attributions` UPSERT in pass 1:
  *
- *   - tool mutations (exact): PostToolUse on `tool_name ∈ {Write, Edit,
- *     MultiEdit, NotebookEdit}` whose `tool_input.file_path` matches the
- *     dirty file's `path` or its `orig_path` (rename case);
+ *   - tool mutations (exact): PostToolUse Write/Edit/MultiEdit/NotebookEdit
+ *     whose `tool_input.file_path` matches the dirty file's `path` / `orig_path`;
  *   - bash mutations (exact): PostToolUse:Bash events whose
- *     `bash_mutation_targets` JSON array contains the dirty file's `path`
- *     or `orig_path` — SQL-side via `json_each WHERE j.value = ?`. Covers
- *     plain modifications by `git-tree-mutate` / `fs-*` deriver kinds
- *     stamping concrete file paths.
- *   - bash mutations (prefix + fnmatch) for `git-rm` / `git-mv` events:
- *     these targets MAY name directories (recursive `git rm -r dir/`) or
- *     globs (`'*.ts'`) — modes SQL can't probe — AND the dirty files
- *     they touch carry `mtime_ms=null` (deleted-tree), so the inferred
- *     pass-2 path is unavailable. We pull candidate rows narrowed by the
- *     partial index on `bash_mutation_kind IN ('git-rm', 'git-mv')` into
- *     JS and run three checks per stored token: exact, directory-prefix
- *     (`file === token || file.startsWith(token + '/')`), and a hand-
- *     rolled fnmatch (`*`→`[^/]*`, `?`→`[^/]`, anchored, no `**`/nested
- *     quantifiers). The `__TREE__` sentinel is excluded explicitly so a
- *     tree-mutate event can't match real files. Cached compiled RegExp.
+ *     `bash_mutation_targets` array contains the path — SQL-side `json_each`;
+ *   - bash mutations (prefix + fnmatch) for `git-rm` / `git-mv`: targets may
+ *     name directories or globs (which SQL can't probe) AND the deleted files
+ *     carry `mtime_ms=null` (no pass-2 inference), so candidate rows move to JS
+ *     for exact / directory-prefix / fnmatch via `bashTargetMatches`. The
+ *     `__TREE__` sentinel is excluded so a tree-mutate can't match real files.
  *
- * The function returns one row per session, carrying the LATEST `ts` it
- * saw and the source/op identifying that row. The reducer's pass-1 upsert
- * folds these into `file_attributions` using the "newest wins" rule (the
- * UPSERT's WHERE clause gates the UPDATE on `excluded.last_mutation_at >
- * file_attributions.last_mutation_at`).
- *
- * Pure: no liveness probe, no FS read, no wall-clock. Every fact lives
- * in the `events` table so a from-scratch re-fold reproduces the same
- * row set byte-identically.
+ * Returns one row per session, carrying the LATEST `ts` it saw and the
+ * source/op identifying that row; the pass-1 upsert folds these into
+ * `file_attributions` newest-wins. Pure: no liveness probe, no FS read, no
+ * wall-clock — every fact lives in the `events` table so a from-scratch re-fold
+ * reproduces the same row set byte-identically.
  */
 interface SessionMutation {
   session_id: string;
@@ -1614,75 +1177,24 @@ function findExplicitAttributions(
 
   const perSession = new Map<string, SessionMutation>();
 
-  // Tool-mutation scan: PostToolUse rows on the four mutation tool names
-  // whose `data.tool_input.file_path` equals one of the candidate paths.
-  // `json_extract` walks the stored JSON in place — no full parse from
-  // SQL's perspective, and the `tool_name` filter narrows the index-seek
-  // before the JSON probe. The reducer's BEGIN IMMEDIATE bounds this scan
-  // to the writer lock window — kept narrow by the per-file iteration.
+  // Tool-mutation scan: PostToolUse rows on the four mutation tool names whose
+  // `data.tool_input.file_path` equals a candidate path. Split into two
+  // complementary arms (NOT a plain `COALESCE(events.data, event_blobs.data)`)
+  // so the common inline case keeps its expression index: COALESCE-ing the
+  // `json_extract` predicate would defeat `idx_events_tool_attr` and regress
+  // this to a multi-second full scan of every PostToolUse row.
   //
-  // fn-717.2 cold-blob relocation — the TWO-ARM resolution. Read-contract
-  // inventory of EVERY fold-path read of the blob VALUE (`events.data`), and
-  // why each is relocation-safe (every cold blob must resolve byte-identically
-  // on a from-scratch re-fold of a compacted DB):
-  //   - This two-arm mutation-discharge scan (here, ARM A `events.data` +
-  //     ARM B `event_blobs.data`): the deliberate, index-preserving exception.
-  //     It is NOT a plain `COALESCE(events.data, event_blobs.data)` because
-  //     COALESCE-ing the `json_extract` predicate would defeat the expression
-  //     index `idx_events_tool_attr` (defined ON
-  //     `json_extract(data, '$.tool_input.file_path')`) and regress this from a
-  //     sub-ms covering SEEK to a multi-second full scan of every PostToolUse
-  //     row. The two arms partition the rows (ARM B's `e.data IS NULL` guard)
-  //     and together equal the COALESCE'd scan — see the per-arm notes below.
-  //   - The drain SELECT (`drain`, ~8361): plain
-  //     `COALESCE(events.data, event_blobs.data) AS data`.
-  //   - The two Commit-trailer reads (`loadCommitTrailerInvocations` ~5689,
-  //     `loadCommitTrailerClassifications` ~5761): plain COALESCE; the WHERE
-  //     `json_extract` probes are uncovered by any index, so COALESCE-ing them
-  //     breaks no index.
-  //   - The two subagent bridge reads (`findBridgePreToolUse`,
-  //     `findPendingPreToolUseForStart` in src/subagent-invocations.ts): fixed
-  //     in fn-764 to COALESCE the SELECT projection over a LEFT JOIN while
-  //     keeping the WHERE on indexed scalars (tool_use_id; session_id/
-  //     tool_name/hook_event) the relocator never nulls.
-  //   - Scalar-only fold reads (e.g. the bash-mutation scan ~1721, which reads
-  //     the generated `bash_mutation_targets`/`bash_mutation_kind` columns, and
-  //     every `SELECT id/ts/session_id/...` that never touches `data`): no blob
-  //     value read, so relocation cannot affect them.
-  //   - Migration/compaction-internal reads are EXEMPT, not fold-path: the
-  //     db.ts reads (4278/4687/5161/5400/5919) run inside `migrate()`, before
-  //     any relocation pass; the compaction.ts reads (209/216/288) are the
-  //     relocator itself, and `countAbsentBlobs` deliberately avoids
-  //     materializing blobs.
-  //
-  // The subtlety task .1 deferred and .2 had to solve: a relocated mutation
-  // blob is STILL needed here on a FROM-SCRATCH RE-FOLD. The discharging Commit
-  // replays AFTER the GitSnapshot, so at GitSnapshot-fold time a mutation whose
-  // attribution is CURRENTLY discharged is momentarily LIVE again and this scan
-  // must see its `tool_input.file_path`. "Currently discharged ⇒ safe to
-  // relocate" is therefore FALSE for the re-fold path — so the relocator does
-  // NOT try to keep matchable blobs inline by predicate. Instead we split the
-  // scan into two complementary arms that together equal the COALESCE'd scan
-  // while keeping the index on the common case:
-  //   ARM A — `events.data` (indexed SEEK): every INLINE blob (new events +
-  //           not-yet-relocated cold blobs). A relocated row has `data IS
-  //           NULL`, so `json_extract(NULL,…)` is NULL and ARM A misses it.
-  //   ARM B — `event_blobs.data` joined back to `events` where `e.data IS
-  //           NULL`: every RELOCATED blob. Scans only the (small) side table.
-  // The `e.data IS NULL` guard makes the two arms partition the rows (no
-  // double-count). So relocation is lossless for this scan regardless of
-  // discharge state, and re-fold stays byte-identical.
+  // A relocated mutation blob is STILL needed here on a from-scratch re-fold:
+  // the discharging Commit replays AFTER the GitSnapshot, so at GitSnapshot-fold
+  // time a currently-discharged mutation is momentarily live and this scan must
+  // see its file_path. "Currently discharged ⇒ safe to drop" is therefore
+  // FALSE; the two arms partition the rows (ARM B's `e.data IS NULL` guard) and
+  // together equal the COALESCE'd scan, lossless regardless of discharge state.
   for (const candidatePath of paths) {
-    // ARM A (inline, indexed): the hot path. Filters `events.data` directly so
-    // the expression index `idx_events_tool_attr` turns this into a sub-ms
-    // covering SEEK. Covers every blob still inline on `events.data` — i.e.
-    // every NEW event (the hook always writes `data` inline) plus every cold
-    // blob the compaction relocator (fn-717.2) has NOT moved. A relocated row
-    // has `events.data IS NULL`, so `json_extract(NULL, ...)` is NULL and this
-    // arm correctly MISSES it (handled by ARM B). This is why the predicate
-    // STAYS on `events.data` and is NOT COALESCE'd: COALESCE-ing it would
-    // defeat `idx_events_tool_attr` and regress this to a multi-second full
-    // scan of every PostToolUse row.
+    // ARM A (inline, indexed): filters `events.data` directly so
+    // `idx_events_tool_attr` makes this a sub-ms covering SEEK. Covers every
+    // inline blob; a relocated row has `data IS NULL` so this arm misses it
+    // (handled by ARM B).
     const toolRows = db
       .prepare(
         `SELECT id, ts, session_id, tool_name
@@ -1697,32 +1209,15 @@ function findExplicitAttributions(
       session_id: string;
       tool_name: string;
     }>;
-    // ARM B (relocated): the fn-717.2 correctness arm. On a from-scratch
-    // re-fold the discharging Commit is replayed AFTER the GitSnapshot, so at
-    // GitSnapshot-fold time a mutation whose attribution is CURRENTLY
-    // discharged is momentarily LIVE again and THIS scan must still see its
-    // `tool_input.file_path`. The relocator therefore cannot rely on "currently
-    // discharged ⇒ never needed here"; instead, a relocated mutation blob stays
-    // matchable via its `event_blobs` copy. This arm reads
-    // `event_blobs.data` for rows whose hot column was NULLed, joining back to
-    // `events` for the `hook_event`/`tool_name`/`ts`/`session_id` facts. It
-    // scans only the (small) `event_blobs` side table — the cold tail — not the
-    // full `events` table, and the `events.data IS NULL` guard makes ARM A and
-    // ARM B partition the rows (no double-count). Together they are exactly the
-    // COALESCE'd scan, but split so the common inline case keeps the index.
-    //
-    // The `CASE WHEN json_valid(b.data) THEN json_extract(...) END` form (NOT a
-    // bare `json_extract`) does double duty: (1) it MATCHES the expression
-    // index `idx_event_blobs_tool_attr` (`src/db.ts`, same guarded expression)
-    // so this becomes a sub-ms SEEK instead of a full JSON-parse scan of the
-    // entire ~1.3 GB side table per dirty file per GitSnapshot fold — the
-    // fn-717.2 omission that wedged the reducer (a 137-dirty-file GitSnapshot
-    // ran ~137 full scans and never folded); and (2) a bare `json_extract` over
-    // a malformed relocated blob THROWS "malformed JSON" at query time — the
-    // reducer tolerates malformed `data`, so the guard skips it (yields NULL,
-    // never matches) instead of crashing the fold. A malformed blob has no
-    // parseable file_path so it can never be a real attribution — skipping is
-    // re-fold-deterministic.
+    // ARM B (relocated): reads `event_blobs.data` for rows whose hot column was
+    // NULLed, joining back to `events` for the scalar facts; scans only the
+    // small side table. The `CASE WHEN json_valid(b.data) THEN json_extract(...)
+    // END` form (NOT a bare `json_extract`) does double duty: it MATCHES the
+    // expression index `idx_event_blobs_tool_attr` (so this is a SEEK, not a
+    // full JSON-parse scan of the side table per dirty file per fold), AND it
+    // skips a malformed relocated blob (yields NULL) instead of throwing
+    // "malformed JSON" and crashing the fold. A malformed blob has no parseable
+    // file_path, so skipping is re-fold-deterministic.
     const relocatedRows = db
       .prepare(
         `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
@@ -1757,12 +1252,9 @@ function findExplicitAttributions(
     }
   }
 
-  // Bash-mutation scan: PostToolUse:Bash events whose stored
-  // `bash_mutation_targets` JSON array contains the candidate path.
-  // The partial index `WHERE bash_mutation_kind IS NOT NULL` narrows the
-  // scan to the sparse mutation subset before the JSON probe. Use
-  // `json_each` to expand the array — SQLite's JSON1 module evaluates
-  // this lazily, so a non-matching row exits the join after one probe.
+  // Bash-mutation scan: PostToolUse:Bash events whose `bash_mutation_targets`
+  // array contains the candidate path. The partial index narrows the scan to
+  // the sparse mutation subset before the `json_each` probe.
   for (const candidatePath of paths) {
     const bashRows = db
       .prepare(
@@ -1783,10 +1275,8 @@ function findExplicitAttributions(
     for (const row of bashRows) {
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
-      // Bash wins ties via "last write wins on the same ts" — keep
-      // deterministic ordering by also breaking ties on event id (a
-      // later row in the same ts has a higher id under the events
-      // INTEGER PRIMARY KEY AUTOINCREMENT).
+      // Break ties on event id (a later row in the same ts has a higher id) so
+      // the ordering stays deterministic.
       if (
         existing == null ||
         row.ts > existing.last_mutation_at ||
@@ -1804,22 +1294,11 @@ function findExplicitAttributions(
     }
   }
 
-  // Deletion-attribution scan (git-rm / git-mv): SQL above probes only
-  // exact `j.value = ?` matches. `git-rm`/`git-mv` events legitimately
-  // store directory tokens (`git rm -r dir/` → `/repo/dir`) and glob
-  // tokens (`git rm '*.ts'` → `/repo/*.ts`) that an exact probe will
-  // never hit; the dirty files they touch carry `mtime_ms=null` (the
-  // file is gone), so the inferred pass-2 path also doesn't fire. Pull
-  // candidate rows narrowed by the kind filter into JS and apply
-  // exact / directory-prefix / fnmatch via `bashTargetMatches`. The
-  // SQL→JS boundary moves here for these kinds only: pure (no FS,
+  // Deletion-attribution scan (git-rm / git-mv): these events store directory
+  // and glob tokens an exact SQL probe never hits, and the deleted files carry
+  // `mtime_ms=null` (no pass-2 inference). Pull candidate rows into JS and apply
+  // exact / directory-prefix / fnmatch via `bashTargetMatches` — pure (no FS,
   // no wall-clock), so re-fold determinism holds.
-  //
-  // The query enumerates every `git-rm` / `git-mv` event once; for each
-  // we walk its `bash_mutation_targets` JSON in JS and probe every
-  // candidate path. A typical session emits a handful of these per
-  // snapshot at most, so the JS-side cost is negligible compared to
-  // the SQL-side `json_each` pass.
   const deletionRows = db
     .prepare(
       `SELECT id, ts, session_id, bash_mutation_kind AS kind,
@@ -1884,30 +1363,19 @@ function findExplicitAttributions(
 /**
  * Project inferred attributions for a dirty file by time-bracketing its
  * `mtime_ms` against `(PreToolUse:Bash, PostToolUse:Bash)` intervals in
- * sessions whose `cwd` is inside `project_dir`. Used when pass 1 finds NO
- * explicit attributions (tool or bash) for the file — a last-resort honest
- * inference: "some bash invocation in this project's window may have
- * touched this file".
+ * sessions whose `cwd` is inside `project_dir`. Used as a last resort when pass
+ * 1 finds NO explicit attributions for the file.
  *
- * The window is `(pre.ts, post.ts]` — `pre` is the PreToolUse:Bash, `post`
- * is the matched PostToolUse:Bash with the same `tool_use_id`. The match
- * uses the `(session_id, tool_use_id)` pair (every Bash invocation gets a
- * fresh `tool_use_id`, schema v17), so concurrent bash invocations don't
- * cross-bracket.
+ * The window is `(pre.ts, post.ts]`, matched on the `(session_id, tool_use_id)`
+ * pair so concurrent bash invocations don't cross-bracket. `cwd` containment
+ * accepts a session whose `cwd` equals or is a subdirectory of `project_dir`;
+ * conservative by design (a sub-tree session stays unbracketed — the "stay
+ * honest" failure mode).
  *
- * `cwd` containment: we accept a session whose `cwd` is either equal to
- * `project_dir` or a subdirectory of it. `project_dir + '/'` prefix-match
- * with a guard against `project_dir` being root (`/`) or having a trailing
- * slash already. This is conservative: a session running in a sub-tree of
- * the worktree's parent (e.g. a monorepo) won't be bracketed against the
- * sub-tree's snapshot — that's the desired "stay honest" failure mode.
- *
- * Returns one entry per session whose bracket enclosed the mtime; if
- * multiple brackets in the same session enclose, we keep the LATEST
- * matching post.ts (the most recent plausible bash window). The pass-2
- * upsert uses `last_mutation_at = file.mtime_ms / 1000` (NOT the
- * bracket's post.ts) — re-fold determinism rides on the frozen-in-payload
- * mtime, not the floating event timestamps.
+ * Returns one entry per session whose bracket enclosed the mtime (keeping the
+ * LATEST matching post.ts). The pass-2 upsert uses
+ * `last_mutation_at = file.mtime_ms / 1000`, NOT the bracket's post.ts, so
+ * re-fold determinism rides on the frozen-in-payload mtime.
  */
 interface InferredAttribution {
   session_id: string;
@@ -1929,38 +1397,20 @@ interface BashWindow {
 /**
  * Compute every bash window in `projectDir`'s sessions that could bracket SOME
  * dirty-file mtime in `[minMtimeSec, maxMtimeSec]`. HOISTED out of the per-file
- * loop: the old `findInferredAttributions` ran this `(session_id,
- * tool_use_id)` self-join — a ~2.5s grind over 32k `PreToolUse:Bash` rows — once
- * PER orphan file, so an orphan-heavy `GitSnapshot` took tens of seconds and
- * held the `BEGIN IMMEDIATE` write lock long enough to starve hook INSERTs into
- * dead-letters. Now it runs ONCE per fold, bounded to the dirty mtime span
- * (`post.ts >= minMtimeSec AND pre.ts < maxMtimeSec`): a window outside that
- * span cannot bracket any of this snapshot's files, and dirty files are recently
- * modified, so the bound shrinks the scan to a tiny recent slice.
- *
- * The cwd containment (`post.cwd = projectDir OR post.cwd LIKE projectDir/%`)
- * and the partial-index-served `(session_id, tool_use_id)` join are unchanged
- * from the old per-file query. Pure read of the immutable event log; the exact
- * per-file bracket is applied in {@link inferFromWindows}, so re-fold
- * determinism is byte-identical to the pre-hoist behavior.
+ * loop and run ONCE per fold: the `(session_id, tool_use_id)` self-join is
+ * expensive, and running it per orphan file once held the write lock long
+ * enough to starve hook INSERTs. The mtime-span bound shrinks the scan to a
+ * recent slice. Pure read of the immutable event log; the exact per-file
+ * bracket is applied in {@link inferFromWindows}, so re-fold determinism holds.
  */
 /**
  * Lower-bound slack (seconds) on the `pre.ts` range scan in
- * {@link computeRepoBashWindows}. A bracket is a single `(PreToolUse:Bash,
- * PostToolUse:Bash)` pair = ONE bash command, hard-capped by the Bash tool's
- * 600s timeout; the longest window ever observed on the live log is ~240s. So
- * any window straddling a file mtime `M` has `pre.ts >= M - 600`. We use 3600
- * (1h) as a defensive cap — far above the 600s ceiling, robust to clock skew /
- * hook latency / a future timeout bump, yet still bounding the `pre` scan to a
- * tight time range instead of ALL history.
- *
- * Why this matters: `pre.ts < maxMtimeSec` alone is NON-selective (files are
- * usually modified ~now, so it matches the whole log). Without a lower bound
- * the self-join scanned all ~38k PreToolUse:Bash events every fold — index-
- * covering but huge, ballooning to 6-22s under concurrent load and starving
- * hook INSERTs. The lower bound makes it a bounded range scan (measured 20x
- * fewer candidate windows, byte-identical inferred result). Loss-free: it only
- * prunes windows LONGER than the cap, which cannot exist under the tool
+ * {@link computeRepoBashWindows}. A bracket is one bash command, hard-capped by
+ * the Bash tool's 600s timeout, so any window straddling a file mtime `M` has
+ * `pre.ts >= M - 600`; 3600 is a defensive cap above that ceiling. Without a
+ * lower bound the self-join scanned the whole `PreToolUse:Bash` history every
+ * fold (`pre.ts < maxMtimeSec` alone is non-selective). Loss-free: it only
+ * prunes windows longer than the cap, which cannot exist under the tool
  * timeout. Constant ⇒ re-fold deterministic.
  */
 const MAX_BASH_WINDOW_SEC = 3600;
@@ -2015,8 +1465,7 @@ function computeRepoBashWindows(
 /**
  * Apply the exact per-file bracket `(pre.ts, post.ts]` to the precomputed
  * {@link computeRepoBashWindows} set: a window matches iff `pre_ts < mtimeSec
- * <= post_ts`. Take-latest per session by `last_event_id` — byte-identical to
- * the old per-file query's in-JS aggregation, so re-fold determinism holds.
+ * <= post_ts`. Take-latest per session by `last_event_id`.
  */
 function inferFromWindows(
   windows: readonly BashWindow[],
@@ -2039,70 +1488,33 @@ function inferFromWindows(
 /**
  * Fold one synthetic git snapshot. The reducer never re-runs git; it only
  * persists the observed payload from the event log, keeping re-fold
- * deterministic even though the original producer observed mutable
- * filesystem state.
+ * deterministic even though the producer observed mutable filesystem state.
+ * Five integrated passes inside the same transaction opened by `applyEvent`:
  *
- * Schema-v31 attribution rewrite (fn-633.6): five integrated passes inside
- * the same `BEGIN IMMEDIATE` transaction opened by `applyEvent`:
+ *   1. Explicit attribution upsert (tool + bash mutations referencing the dirty
+ *      file's path), newest-wins per session, tie-break on event id.
+ *   2. Inferred attribution for a dirty file with no explicit attribution:
+ *      bracket its mtime against `(PreToolUse:Bash, PostToolUse:Bash)` windows;
+ *      `last_mutation_at = mtime_ms / 1000` (frozen-in-payload, so re-fold
+ *      deterministic).
+ *   3. Render `attributions[]` per file from `file_attributions LEFT JOIN jobs`
+ *      under the discharge filter `last_mutation_at > COALESCE(last_commit_at, 0)`.
+ *   4. Per-job rollups (`git_dirty_count`, `git_unattributed_to_live_count`
+ *      driving readiness predicate 6.5, `git_orphan_count`), fanned into
+ *      `epics.jobs[]` / `epics.tasks[].jobs[]` via `syncIfPlanRef`.
+ *   5. Symmetric retract on `GitRootDropped` (in `retractGitStatus`).
  *
- *   1. Explicit attribution upsert. For each dirty file, scan the event
- *      log for tool mutations (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`
- *      against the file's `path` or `orig_path`) and bash mutations
- *      (`bash_mutation_targets` array contains the path). Per session,
- *      take the latest event ts and upsert into `file_attributions` with
- *      `source ∈ {'tool', 'bash'}`. Newest-wins per session, deterministic
- *      tie-break on event id.
- *
- *   2. Inferred attribution. For each dirty file with `mtime_ms != null`
- *      AND NO explicit attribution from pass 1, find `(PreToolUse:Bash,
- *      PostToolUse:Bash)` brackets in any session whose cwd is inside
- *      `project_dir` and whose interval contains the file's mtime. Upsert
- *      with `source='inferred'`, `op='inferred'`, `last_mutation_at =
- *      mtime_ms / 1000`. Re-fold deterministic because mtimes are
- *      frozen in the payload.
- *
- *   3. Render `attributions[]` per file. Join `file_attributions` LEFT
- *      JOIN `jobs` under the discharge filter `last_mutation_at >
- *      COALESCE(last_commit_at, 0)`, materialize `{session_id, title,
- *      state, last_touch_at, op, source}` per active attribution into the
- *      `git_status.dirty_files[].attributions[]` JSON.
- *
- *   4. Per-job rollups. For every session referenced by an active
- *      attribution under this project_dir:
- *      - `git_dirty_count` = count of files in this snapshot's dirty set
- *        the session is still on the hook for;
- *      - `git_unattributed_to_live_count` = project-wide count of dirty
- *        files whose attribution set contains no LIVE session (state ∈
- *        {'working', 'stopped'}); legacy "orphan" semantic, drives
- *        readiness predicate 6.5;
- *      - `git_orphan_count` = project-wide count of dirty files with
- *        ZERO active attributions (strict-mystery semantic).
- *      Fan into `epics.jobs[]` + `epics.tasks[].jobs[]` via the existing
- *      `syncIfPlanRef` helper.
- *
- *   5. Symmetric retract (in `retractGitStatus`): on `GitRootDropped`,
- *      DELETE `file_attributions` for `project_dir` and zero
- *      `git_dirty_count` / `git_unattributed_to_live_count` /
- *      `git_orphan_count` on every session that was on-the-hook.
- *
- * Multi-attribution overcount: a file attributed to sessions A and B
- * counts toward BOTH A's and B's `git_dirty_count`. That's intentional —
- * co-authorship is the honest semantic. Aggregate consumers (board.ts)
- * must NOT sum these as if they were disjoint.
- *
- * The from-scratch re-fold sees every historical `GitSnapshot` event in
- * order and re-derives the same counts byte-identically; every fact lives
- * in the persisted event log (the frozen-in-payload mtimes preserve
- * inferred-attribution determinism). The `INSERT OR IGNORE`-then-`UPDATE`
- * pattern for the per-job rollup is intentional: a snapshot referencing
- * a job whose `SessionStart` hasn't folded yet leaves the row absent and
- * the UPDATE matches zero rows. The next snapshot after SessionStart
- * lands the counts.
+ * Multi-attribution overcount is intentional: a file attributed to sessions A
+ * and B counts toward BOTH `git_dirty_count`s (co-authorship is the honest
+ * semantic) — aggregate consumers must NOT sum these as disjoint. The
+ * `INSERT OR IGNORE`-then-`UPDATE` per-job rollup tolerates a snapshot
+ * referencing a job whose `SessionStart` hasn't folded yet (the UPDATE matches
+ * zero rows; the next snapshot lands the counts).
  */
 /**
  * Threshold above which a GitSnapshot fold emits a per-pass `[gitfold-breakdown]`
- * line. Set high enough that normal folds stay silent — we only care about the
- * multi-second outliers that hold the write lock and starve hook INSERTs.
+ * line — high enough that normal folds stay silent; only the multi-second
+ * outliers that hold the write lock and starve hook INSERTs matter.
  */
 const GIT_FOLD_BREAKDOWN_MS = 1000;
 
@@ -2115,37 +1527,20 @@ function projectGitStatus(db: Database, event: Event): void {
   const eventId = event.id;
   const projectDir = snapshot.project_dir;
 
-  // Per-pass timing — emitted (below) ONLY when the whole fold is slow, so a
-  // [fold-slow] GitSnapshot line is always accompanied by a breakdown that
-  // localizes the cost to a specific pass. Timing is never persisted, so it
-  // has no bearing on re-fold determinism.
+  // Per-pass timing — emitted (below) ONLY when the whole fold is slow. Never
+  // persisted, so it has no bearing on re-fold determinism.
   const _gfT0 = performance.now();
 
-  // PASS 1 — Explicit attribution upsert. For each dirty file, scan the
-  // event log for tool/bash mutations whose payload references the file
-  // path (or its rename's orig_path). Per session, take the LATEST
-  // matching event (newest-wins via the UPSERT's WHERE clause).
+  // PASS 1 — Explicit attribution upsert. For each dirty file, scan the event
+  // log for tool/bash mutations referencing the path (or its rename's
+  // orig_path); newest-wins via the UPSERT's WHERE clause.
   //
-  // v44 / fn-664: the per-file `worktree_oid` is added to the INSERT
-  // VALUES so a brand-new row carries it from the start; the existing
-  // UPDATE WHERE remains gated on "newer mutation wins" (no
-  // discharge-behavior change). For pre-existing rows whose mutation
-  // didn't advance, a follow-up `refreshWorktreeOidStmt` UPDATE stamps
-  // the latest snapshot's `worktree_oid` onto every attribution row for
-  // this `file_path` — the oid is a PER-FILE fact (the file's worktree
-  // bytes are what they are, regardless of who attributes to it), so
-  // every row for the same `(project_dir, file_path)` must hold the
-  // SAME oid in this snapshot. The split keeps the existing newer-wins
-  // semantics for the mutation columns byte-identical while making the
-  // worktree_oid the freshest-per-snapshot value the discharge gate
-  // (in `foldCommit`) reads.
-  //
-  // v45 / fn-664.2: `worktree_mode` rides alongside `worktree_oid` on
-  // the same INSERT VALUES and refresh UPDATE — the mode is also a
-  // per-file snapshot fact, so the same "every row converges on the
-  // freshest snapshot value" invariant holds. The discharge gate pairs
-  // the mode against the commit's `committed_mode` so a chmod-only
-  // dirty file does not wrongly discharge.
+  // `worktree_oid` + `worktree_mode` ride the INSERT VALUES so a new row carries
+  // them from the start, and a follow-up `refreshWorktreeOidStmt` stamps the
+  // latest snapshot's values onto every row for this `file_path`: both are
+  // PER-FILE facts, so every row for the same `(project_dir, file_path)` must
+  // converge on the freshest snapshot value the discharge gate (in `foldCommit`)
+  // reads. The mutation columns keep newer-wins semantics unchanged.
   const upsertStmt = db.prepare(
     `INSERT INTO file_attributions
        (project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid, worktree_mode)
@@ -2158,13 +1553,10 @@ function projectGitStatus(db: Database, event: Event): void {
          updated_at = excluded.updated_at
        WHERE excluded.last_mutation_at > file_attributions.last_mutation_at`,
   );
-  // v44 / fn-664 + v45 / fn-664.2: stamp the latest snapshot's
-  // `worktree_oid` AND `worktree_mode` onto every file_attributions row
-  // for this file. Runs AFTER the upsert so a brand-new row (just
-  // INSERTed) and a stale row (UPDATE WHERE was false) both converge
-  // on the snapshot's freshest content axes. Both columns written in
-  // ONE statement so a transient mid-statement crash can't leave the
-  // pair desynced.
+  // Stamp the latest snapshot's `worktree_oid` AND `worktree_mode` onto every
+  // file_attributions row for this file, AFTER the upsert, so a new row and a
+  // stale row both converge on the freshest content axes. Both columns in ONE
+  // statement so a mid-statement crash can't desync the pair.
   const refreshWorktreeOidStmt = db.prepare(
     `UPDATE file_attributions
         SET worktree_oid = ?, worktree_mode = ?
@@ -2198,24 +1590,18 @@ function projectGitStatus(db: Database, event: Event): void {
   const _gfT1 = performance.now();
 
   // PASS 2 — Inferred attribution. Files with no UNDISCHARGED explicit
-  // attribution from any session (and a non-null mtime) get bracketed
-  // against PreToolUse/PostToolUse Bash intervals. The matching
-  // session(s) get an `inferred`-source upsert with `last_mutation_at =
-  // file.mtime_ms / 1000`. The mtime is frozen in the payload, so re-fold
-  // deterministic.
+  // attribution (and a non-null mtime) get bracketed against Bash intervals;
+  // the matching session(s) get an `inferred`-source upsert with
+  // `last_mutation_at = file.mtime_ms / 1000` (frozen-in-payload, so re-fold
+  // deterministic).
   //
-  // The skip guard probes for an explicit (`tool`/`bash`) row that is
-  // still ACTIVE under the discharge rule (`last_mutation_at >
-  // COALESCE(last_commit_at, 0)`) — NOT merely the presence of any
-  // explicit row. A file whose every explicit attribution has been
-  // discharged by a commit, then re-dirtied by a bash step (formatter,
-  // codegen) that left no `Write`/`Edit` and no recognized
-  // `bash_mutation`, has zero active explicit attributions — so inference
-  // MUST run, or the file falls to `<orphan>` even though a bracketing
-  // Bash window in the producing session is available. Probing the table
-  // (just written in pass 1) rather than an in-memory "any explicit ever"
-  // set is what makes the discharge interaction correct; it stays a pure
-  // function of the event log within this `BEGIN IMMEDIATE`.
+  // The skip guard probes for an explicit row still ACTIVE under the discharge
+  // rule — NOT merely the presence of any explicit row. A file whose explicit
+  // attributions were all discharged by a commit, then re-dirtied by a bash
+  // step that left no recognized mutation, has zero active explicit
+  // attributions, so inference MUST run or the file falls to `<orphan>`.
+  // Probing the table (just written in pass 1) is what makes the discharge
+  // interaction correct.
   const activeExplicitStmt = db.prepare(
     `SELECT 1 FROM file_attributions
       WHERE project_dir = ?
@@ -2249,11 +1635,9 @@ function projectGitStatus(db: Database, event: Event): void {
       const mtimeSec = (file.mtime_ms as number) / 1000;
       const inferred = inferFromWindows(bashWindows, mtimeSec);
       for (const m of inferred) {
-        // v44 / fn-664 + v45 / fn-664.2: same UPSERT shape as pass 1 —
-        // `worktree_oid` AND `worktree_mode` are per-file snapshot facts;
-        // they ride on the INSERT VALUES of a brand-new inferred row, and
-        // the post-loop refresh UPDATE keeps every existing row aligned
-        // to the freshest snapshot pair.
+        // Same UPSERT shape as pass 1 — `worktree_oid` / `worktree_mode` ride
+        // the INSERT VALUES and the post-loop refresh keeps existing rows
+        // aligned to the freshest snapshot pair.
         upsertStmt.run(
           projectDir,
           m.session_id,
@@ -2278,18 +1662,11 @@ function projectGitStatus(db: Database, event: Event): void {
 
   const _gfT2 = performance.now();
 
-  // PASS 3 — Render per-file `attributions[]`. Join `file_attributions`
-  // against `jobs` (LEFT JOIN — a missing jobs row reads defaults), apply
-  // the discharge filter, and embed the materialized view inside each
-  // dirty file's `attributions[]`. The WHERE clause `last_mutation_at >
-  // COALESCE(last_commit_at, 0)` is THE discharge rule: a session that
-  // has committed past its last mutation drops out of the file's
-  // attribution list.
-  //
-  // Sorted ASC on `(session_id)` — total-order tiebreaker is non-
-  // negotiable for byte-identical re-fold. Without the deterministic
-  // sort, two re-folds could produce different JSON orderings under
-  // the same input.
+  // PASS 3 — Render per-file `attributions[]`. `file_attributions LEFT JOIN
+  // jobs` under the discharge rule `last_mutation_at > COALESCE(last_commit_at,
+  // 0)` (a session that committed past its last mutation drops out), embedded
+  // into each dirty file's `attributions[]`. Sorted ASC on `session_id` — the
+  // total-order tiebreaker is non-negotiable for byte-identical re-fold.
   const attribStmt = db.prepare(
     `SELECT fa.session_id AS session_id,
             fa.last_mutation_at AS last_touch_at,
@@ -2320,8 +1697,8 @@ function projectGitStatus(db: Database, event: Event): void {
     const attributions: RenderedAttribution[] = rows.map((r) => ({
       session_id: r.session_id,
       title: r.title,
-      // Default `state="stopped"` matches the schema default + the zero
-      // -event projection (jobs row absent ↔ session never observed).
+      // Default `state="stopped"` matches the zero-event projection (jobs row
+      // absent ↔ session never observed).
       state: r.state ?? "stopped",
       last_touch_at: r.last_touch_at,
       op: r.op,
@@ -2339,21 +1716,16 @@ function projectGitStatus(db: Database, event: Event): void {
 
   const _gfT3 = performance.now();
 
-  // PASS 4 — Per-job rollups.
-  //
-  // (a) `git_orphan_count`: project-wide count of dirty files with ZERO
-  //     active attributions — the strict-mystery semantic.
-  // (b) `git_unattributed_to_live_count`: project-wide count of dirty
-  //     files whose attribution set contains NO live session
-  //     (state ∈ {'working', 'stopped'}). The legacy v28 "orphan" name
-  //     under the new vocabulary; drives readiness predicate 6.5.
-  // (c) `git_dirty_count`: per-session count of files in the current
-  //     snapshot the session is on the hook for (active attribution,
-  //     undischarged).
-  //
-  // The two project-wide counts are broadcast onto every enumerated
-  // session — every session with at least one active attribution under
-  // this project_dir. The per-session count is, well, per-session.
+  // PASS 4 — Per-job rollups:
+  //   (a) `git_orphan_count`: project-wide count of dirty files with ZERO
+  //       active attributions.
+  //   (b) `git_unattributed_to_live_count`: project-wide count of dirty files
+  //       whose attribution set has NO live session (working/stopped); drives
+  //       readiness predicate 6.5.
+  //   (c) `git_dirty_count`: per-session count of files the session is on the
+  //       hook for (active, undischarged attribution).
+  // The project-wide counts broadcast onto every session with an active
+  // attribution under this project_dir.
   let orphanCount = 0;
   let unattributedToLiveCount = 0;
   const sessionDirtyCount = new Map<string, number>(); // session_id → git_dirty_count
@@ -2376,14 +1748,11 @@ function projectGitStatus(db: Database, event: Event): void {
     if (!hasLive) unattributedToLiveCount++;
   }
 
-  // Enumerate every session that previously had a count stamped for
-  // this project, even if it has no active attribution now. Their
-  // counts must zero out symmetrically — otherwise a session that
-  // committed all its files would keep a stale git_dirty_count.
-  // The canonical pre-write enumeration: the persisted `git_status.jobs`
-  // JSON from the prior snapshot (the projection's own canonical
-  // attribution). A first-ever snapshot reads `[]`; thereafter every
-  // prior fan-out session shows up here.
+  // Enumerate every session that previously had a count stamped for this
+  // project so their counts zero out symmetrically — otherwise a session that
+  // committed all its files keeps a stale git_dirty_count. The canonical
+  // pre-write enumeration is the prior snapshot's persisted `git_status.jobs`
+  // JSON (a first-ever snapshot reads `[]`).
   const priorRow = db
     .prepare("SELECT jobs FROM git_status WHERE project_dir = ?")
     .get(projectDir) as { jobs: string | null } | null;
@@ -2402,26 +1771,16 @@ function projectGitStatus(db: Database, event: Event): void {
         }
       }
     } catch {
-      // malformed prior JSON folds to empty set; safe-fold per "never
-      // throw" invariant.
+      // malformed prior JSON folds to empty set; never throw inside the fold.
     }
   }
-  // fn-679: bound pass-4 fan-out to event-relevant sessions —
-  // `sessionDirtyCount.keys()` (currently-dirty attributed set, built
-  // above from this snapshot's dirty_files) ∪ `priorSessions` (the
-  // zero-out-transition set parsed from prior git_status.jobs).
-  // Drops the legacy `allActiveSessions` enumeration that dumped every
-  // undischarged session under project_dir into the loop (288 in
-  // production, inflated by fn-666's non-discharging planctl
-  // attributions, driving 4-7s folds → SQLITE_BUSY hook drops).
-  // Safe because the fn-656.1 push guard guarantees any nonzero
-  // per-session git_dirty_count was persisted into git_status.jobs in
-  // a prior snapshot → is in priorSessions on the next snapshot → no
-  // stale-count strand. The per-job project-wide counters
-  // (git_orphan_count / git_unattributed_to_live_count) narrow to the
-  // bounded set — informational-only columns (readiness reads
-  // git_status scalars, not the per-job columns; see readiness.ts
-  // ~:612-616), so the narrowed broadcast is cosmetic.
+  // Bound pass-4 fan-out to event-relevant sessions: `sessionDirtyCount.keys()`
+  // (currently-dirty attributed) ∪ `priorSessions` (the zero-out-transition set
+  // from prior git_status.jobs). Safe because any nonzero per-session
+  // git_dirty_count was persisted into git_status.jobs in a prior snapshot →
+  // is in priorSessions on the next → no stale-count strand. The project-wide
+  // counters narrow to the bounded set, which is cosmetic (readiness reads
+  // git_status scalars, not the per-job columns).
   const sessionsToFanOut = new Set<string>();
   for (const s of sessionDirtyCount.keys()) sessionsToFanOut.add(s);
   for (const s of priorSessions) sessionsToFanOut.add(s);
@@ -2438,15 +1797,12 @@ function projectGitStatus(db: Database, event: Event): void {
             updated_at = ?
       WHERE job_id = ?`,
   );
-  // Deterministic iteration order — Set iteration in V8/JSC is
-  // insertion-order, but we sort explicitly to keep re-fold byte-
-  // identical irrespective of insertion-order vagaries across
-  // different drains.
+  // Sort explicitly so re-fold stays byte-identical irrespective of
+  // insertion-order vagaries across drains.
   const sortedSessions = Array.from(sessionsToFanOut).sort();
-  // Build the canonical attribution JSON for the post-PASS-5
-  // git_status.jobs slot. Format mirrors the legacy v28 shape
-  // `{job_id, dirty: <count>}` so a downstream retract walks the
-  // same structure (retractGitStatus reads `job_id` only).
+  // Canonical attribution JSON for the git_status.jobs slot, shape
+  // `{job_id, dirty}` so a downstream retract walks the same structure
+  // (retractGitStatus reads `job_id` only).
   const projectionJobs: Array<{ job_id: string; dirty: number }> = [];
   const _gfT4 = performance.now();
   for (const sessionId of sortedSessions) {
@@ -2459,23 +1815,17 @@ function projectGitStatus(db: Database, event: Event): void {
       eventTs,
       sessionId,
     );
-    // Re-fan into embedded jobs[] — `syncIfPlanRef` reads back the
-    // post-write row + routes via `plan_ref`. A session whose UPDATE
-    // matched zero rows (no SessionStart yet) returns null from the
-    // SELECT and the helper exits without a write.
+    // Re-fan into embedded jobs[] — `syncIfPlanRef` reads back the post-write
+    // row and routes via `plan_ref`. A session whose UPDATE matched zero rows
+    // (no SessionStart yet) returns null and the helper exits without a write.
     syncIfPlanRef(db, sessionId, eventId, eventTs);
-    // fn-656.1: persist ONLY currently-dirty sessions into
-    // git_status.jobs. The UPDATE + syncIfPlanRef above STILL fire for
-    // every session in sortedSessions (including ones that just
-    // transitioned to dirty == 0 via priorSessions), so a session
-    // leaving the dirty set gets its clearing UPDATE + embedded epic
-    // jobs[] clear exactly once — on the transition snapshot — and
-    // then drops from the persisted JSON. Without this guard the set
-    // ratchets: every session that has ever been dirty is re-persisted
-    // forever (it becomes the next snapshot's priorSessions and re-
-    // enters sortedSessions). Steady-state fan-out collapses to the
-    // currently-dirty set; the pure dependency on sessionDirtyCount
-    // keeps the decision a fold-deterministic function of the event.
+    // Persist ONLY currently-dirty sessions into git_status.jobs. The UPDATE +
+    // syncIfPlanRef above STILL fire for every session in sortedSessions, so a
+    // session leaving the dirty set gets its clearing UPDATE + embedded jobs[]
+    // clear exactly once (on the transition snapshot) then drops from the JSON.
+    // Without this guard the set ratchets: every ever-dirty session re-persists
+    // forever (it becomes the next snapshot's priorSessions). The pure
+    // dependency on sessionDirtyCount keeps the decision fold-deterministic.
     if (dirtyForSession > 0) {
       projectionJobs.push({ job_id: sessionId, dirty: dirtyForSession });
     }
@@ -2483,23 +1833,13 @@ function projectGitStatus(db: Database, event: Event): void {
 
   const _gfT5 = performance.now();
 
-  // git_status write — after pass 1-4 have populated file_attributions
-  // and per-job rollups. The rendered `dirty_files[].attributions[]`
-  // JSON is the materialized view the client reads. `orphaned_files` /
-  // `jobs` carry the project-broadcast counts in the same on-disk shape
-  // the legacy v28 producer used (`orphaned_files.length` == orphan
-  // count for backward-compatible reads); the new strict-mystery
-  // semantic flows through the dedicated `dirty_count` /
-  // `orphaned_count` columns. The `jobs` JSON enumerates the
-  // canonical attribution set the retract walks — same shape the v28
-  // producer wrote.
-  //
-  // `orphaned_files` shape: we don't ship a per-file orphan list (the
-  // new strict-mystery semantic is "files with no attribution at all",
-  // which IS just `dirty_files where attributions.length == 0`).
-  // Storing the per-file list would duplicate that. Instead we store
-  // an empty array and let the `orphaned_count` column carry the
-  // scalar — the same approach the producer took post-fn-633.5.
+  // git_status write — after passes 1-4 populated file_attributions and the
+  // per-job rollups. The rendered `dirty_files[].attributions[]` JSON is the
+  // materialized view the client reads; `dirty_count` / `orphaned_count` carry
+  // the scalars; `jobs` enumerates the canonical attribution set the retract
+  // walks. `orphaned_files` ships empty — the strict-mystery orphan set is just
+  // `dirty_files where attributions.length == 0`, so a per-file list would
+  // duplicate the `orphaned_count` scalar.
   db.run(
     `INSERT INTO git_status (
        project_dir, branch, head_oid, upstream, ahead, behind,
@@ -2555,44 +1895,32 @@ function projectGitStatus(db: Database, event: Event): void {
 }
 
 /**
- * Fold one synthetic `GitRootDropped` tombstone. The git-worker posts this
- * from `unsubscribeRoot()` when a watched worktree no longer satisfies the
- * watch gate on reconcile (no `.planctl/` AND clean-and-pushed past the
- * cooling dwell, epic fn-690); without it, `projectGitStatus`'s
- * UPSERT-only path would leak the final pre-drop snapshot row forever.
+ * Fold one synthetic `GitRootDropped` tombstone. The git-worker posts this when
+ * a watched worktree no longer satisfies the watch gate; without it,
+ * `projectGitStatus`'s UPSERT-only path would leak the final pre-drop snapshot
+ * row forever.
  *
  * The primary key (`project_dir`) rides in `event.session_id`. An empty /
- * missing pk is a safe no-op — the invariant says fold must never throw
- * inside the cursor-advance transaction. DELETE is idempotent: re-folding
- * over a row that's already gone matches zero rows, not an error.
+ * missing pk is a safe no-op — fold must never throw inside the cursor-advance
+ * transaction. DELETE is idempotent.
  *
- * Schema-v28 symmetric clear (widened in v31): before the DELETE, read the
- * soon-to-be-dropped row's persisted `git_status.jobs` JSON to enumerate the
- * job_ids the last fan-out stamped, then zero each one's `git_dirty_count`
- * / `git_unattributed_to_live_count` / `git_orphan_count` and re-emit the
- * `syncJobIntoEpic` fan-out so the embedded arrays clear in lockstep.
- * Canonical attribution: the SAME `jobs[]` enumeration that the write side
- * fanned over is the enumeration the clear walks — symmetric write/clear
- * keeps an unrelated project's jobs (running in another worktree)
- * untouched. All inside the open transaction.
- *
- * Schema-v31 widening (fn-633.6): the retract also DELETEs every
- * `file_attributions` row for this `project_dir`. The attribution table is
- * a pure projection of the event log under the new attribution rewrite, so
- * dropping the worktree drops the per-(session, file) rows it owned. A
- * re-fold over the persisted events re-creates the same rows — and the
- * subsequent retract (re-folded too) re-deletes them — preserving the
- * "byte-identical re-fold" invariant across the snapshot + retract pair.
+ * Symmetric clear: before the DELETE, read the row's persisted `git_status.jobs`
+ * JSON to enumerate the job_ids the last fan-out stamped, zero each one's
+ * `git_dirty_count` / `git_unattributed_to_live_count` / `git_orphan_count`, and
+ * re-emit the `syncJobIntoEpic` fan-out so the embedded arrays clear in lockstep
+ * — walking the SAME `jobs[]` the write side fanned over keeps an unrelated
+ * project's jobs untouched. The retract also DELETEs every `file_attributions`
+ * row for this `project_dir`; a re-fold re-creates and re-deletes them across
+ * the snapshot + retract pair, preserving byte-identical re-fold.
  */
 function retractGitStatus(db: Database, event: Event): void {
   const projectDir = event.session_id;
   if (projectDir == null || projectDir.length === 0) {
     return;
   }
-  // Pre-DELETE: read the row's stored `jobs` JSON to enumerate the job_ids
-  // the last fan-out stamped (canonical attribution). A missing row / empty
-  // / malformed JSON folds to `[]` — no-op, matches the "fold must never
-  // throw" invariant.
+  // Pre-DELETE: read the stored `jobs` JSON to enumerate the job_ids the last
+  // fan-out stamped. A missing / empty / malformed value folds to `[]` — never
+  // throw inside the fold.
   const row = db
     .query("SELECT jobs FROM git_status WHERE project_dir = ?")
     .get(projectDir) as { jobs: string | null } | null;
@@ -2618,87 +1946,41 @@ function retractGitStatus(db: Database, event: Event): void {
       syncIfPlanRef(db, jobId, event.id, event.ts);
     }
   }
-  // Schema-v31: also drop every file_attributions row for this project_dir
-  // — symmetric with the projectGitStatus pass-1/2 upserts. The
-  // attribution table is a pure projection of the event log, so a retract
-  // walks it the same way.
+  // Also drop every file_attributions row for this project_dir — symmetric with
+  // the projectGitStatus pass-1/2 upserts.
   db.run("DELETE FROM file_attributions WHERE project_dir = ?", [projectDir]);
   db.run("DELETE FROM git_status WHERE project_dir = ?", [projectDir]);
 }
 
 /**
- * Fold one synthetic `Commit` event. The git-worker emits one of these per
- * commit in a HEAD-oid delta (see {@link
- * import("./git-worker").enumerateCommitsInDelta}); main lifts the message
- * into the synthetic event row this arm reads.
+ * Fold one synthetic `Commit` event. The git-worker emits one per commit in a
+ * HEAD-oid delta; main lifts the message into the synthetic event row this arm
+ * reads.
  *
- * Discharge semantic (schema v45 / fn-664.2 — content-aware):
- *   - `committer_session_id` non-null → UPDATE the matching
- *     `file_attributions` row for `(project_dir, committer_session_id,
- *     file_path)`, setting `last_commit_at = committed_at_ms / 1000`. Per
- *     -session discharge: only the committing session clears its claim.
- *   - `committer_session_id` null → UPDATE every `file_attributions` row
- *     for `(project_dir, file_path)` regardless of session — a human / CI
- *     commit (no `Session-Id:` trailer, or malformed value) globally
- *     discharges every session's attribution claim for the named files.
+ * Discharge target: `committer_session_id` non-null discharges only the
+ * committing session's `(project_dir, session_id, file_path)` row; null (a
+ * human / CI commit with no `Session-Id:` trailer) discharges every session's
+ * claim on the named files.
  *
- * Content-aware gate (the fn-664.2 fix): for each file the commit would
- * discharge, compare the commit's payload `blob_oid` + `committed_mode`
- * against the file's CURRENT `worktree_oid` + `worktree_mode` stored on
- * the `file_attributions` row (written by the latest GitSnapshot fold —
- * see `projectGitStatus`).
+ * Content-aware gate: for each file, compare the commit's `blob_oid` +
+ * `committed_mode` against the file's `worktree_oid` + `worktree_mode` on the
+ * `file_attributions` row (written by the latest GitSnapshot fold).
+ *   - All four non-null AND both pairs match → STAMP `last_commit_at` (the
+ *     commit captured the worktree; the session is off-the-hook).
+ *   - All four non-null AND either pair mismatches → DO NOTHING (the worktree
+ *     diverged; the session stays on-the-hook — the stage→re-edit→commit case).
+ *   - ANY axis NULL → UNCONDITIONAL timestamp discharge. This is the path
+ *     pre-content-gate events traversed, so a cursor=0 re-fold over NULL-oid /
+ *     NULL-mode history reproduces byte-identical projections. The gate only
+ *     kicks in when both sides carry non-null evidence, leaving historical
+ *     re-folds untouched.
  *
- *   - All four axes non-null AND the (oid, mode) pairs match → STAMP
- *     `last_commit_at` (the legacy discharge path — the commit truly
- *     captured the worktree, so the session is off-the-hook).
- *   - All four axes non-null AND either pair MISMATCHES → DO NOTHING
- *     (the worktree diverged from the committed bytes/mode; the session
- *     is still on-the-hook for the still-dirty file, and a re-edit is
- *     ALREADY accounted for via `last_mutation_at`). This is the
- *     stage→re-edit→commit case the epic exists to fix; without this
- *     branch the file falls to `<orphan>` even though the editing session
- *     should retain attribution.
- *   - ANY of the four axes IS NULL → fall back to today's UNCONDITIONAL
- *     timestamp discharge (the SAME code path pre-v45 events traversed,
- *     so a cursor=0 re-fold over NULL-oid / NULL-mode history reproduces
- *     byte-identical projections). The null sources: pre-v44 producer
- *     events (`worktree_oid` / `committed_*` absent), pre-v45 producer
- *     events (`committed_mode` / `worktree_mode` absent), the producer's
- *     per-file `hash-object` / `diff-tree` parse miss, racy-clean rows
- *     (the GitSnapshot fold ran without observing this file), inferred /
- *     untracked entries that never carried a meaningful committed
- *     baseline. The fall-back is the safer side per the epic's "Best
- *     practices": "Treat NULL worktree_oid (racy-clean / lstat miss /
- *     inferred / untracked) as 'cannot confirm → keep attribution
- *     active'" was the intent — but for re-fold determinism against
- *     historical events we MUST converge on the EXISTING semantic, which
- *     was unconditional discharge. The pre-existing semantics
- *     unconditionally discharge; the new gate only KICKS IN when both
- *     sides have non-null evidence, so historical re-folds are
- *     untouched.
- *
- * The UPDATE matches zero rows when no session has yet recorded a mutation
- * on the file (file_attributions rows are created by the mutation-event
- * fold, not here). That's intentional — a discharge can't resurrect a
- * non-existent attribution. The cursor still advances per the fold-tx
- * invariant.
- *
- * Producer-only liveness: this arm reads ONLY the payload fields and the
- * already-folded `file_attributions` row (event-derived). No `git log`
- * re-shell, no FS probe, no env read — every fact it touches lives in
- * the event log, so a from-scratch re-fold reproduces the same
- * `file_attributions.last_commit_at` byte-deterministically. The
- * worktree_oid / worktree_mode read-back is on the IN-TX projection
- * (post-pass-1 of any prior GitSnapshot fold), so re-fold determinism
- * holds.
- *
- * Runs inside the same `BEGIN IMMEDIATE` transaction as the cursor
- * advance (via {@link applyEvent}); a throw anywhere here rolls back
- * both writes. The defensive {@link import("./derivers").extractCommit}
- * parser returns `null` on every shape-mismatch path so a malformed
- * payload folds to a safe no-op; the cursor still advances. The
- * four discharge READ predicates downstream (`projectGitStatus`
- * passes 2/3/4) are byte-identical — only the WRITE site here changes.
+ * The UPDATE matches zero rows when no session has recorded a mutation on the
+ * file (a discharge can't resurrect a non-existent attribution). Producer-only
+ * liveness: reads ONLY payload fields and the already-folded (in-tx)
+ * `file_attributions` row — no `git log` re-shell, no FS probe — so a
+ * from-scratch re-fold reproduces `last_commit_at` deterministically. A
+ * malformed payload folds to a safe no-op via {@link extractCommit}.
  */
 function foldCommit(db: Database, event: Event): void {
   const commit = extractCommit(event);
@@ -2724,20 +2006,13 @@ function foldCommit(db: Database, event: Event): void {
   const eventTs = event.ts;
   const eventId = event.id;
 
-  // Helper: decide whether the content-aware gate should suppress
-  // discharge for this `(project_dir, file_path)` against the commit's
-  // payload entry. Returns `true` if the commit's `(blob_oid,
-  // committed_mode)` pair both DIFFER from the file's current
-  // `(worktree_oid, worktree_mode)` stored on `file_attributions` — i.e.
-  // the worktree diverged from the committed bytes/mode, so the session
-  // stays on-the-hook. Returns `false` (DISCHARGE) when (a) any of the
-  // four axes is NULL (legacy timestamp fall-back — same path historical
-  // events take, re-fold determinism), or (b) all four are non-null AND
-  // the (oid, mode) pairs MATCH (the commit captured the worktree).
-  //
-  // The read targets the post-pass-1 `file_attributions` projection —
-  // pure event-derived, in-tx with this fold. Re-fold determinism
-  // preserved.
+  // Helper: should the content-aware gate suppress discharge for this
+  // `(project_dir, file_path)`? Returns `true` (KEEP attribution) when both
+  // (oid, mode) pairs differ from the file's stored worktree values (the
+  // worktree diverged). Returns `false` (DISCHARGE) when any axis is NULL
+  // (legacy timestamp fall-back — re-fold determinism over historical events)
+  // or all four are non-null and both pairs match. The read targets the
+  // in-tx, event-derived `file_attributions` projection.
   const worktreeProbeStmt = db.prepare(
     `SELECT worktree_oid, worktree_mode FROM file_attributions
       WHERE project_dir = ? AND file_path = ? LIMIT 1`,
@@ -2749,46 +2024,36 @@ function foldCommit(db: Database, event: Event): void {
     committedMode: string | null,
   ): boolean {
     if (committedOid === null || committedMode === null) {
-      // Pre-v44/v45 event, producer parse miss, or deletion — fall back
-      // to today's unconditional timestamp discharge. Identical to
-      // pre-fn-664.2 behavior.
+      // No content evidence — unconditional timestamp discharge.
       return false;
     }
-    // The worktree_oid / worktree_mode is a per-file fact — any
-    // attribution row for `(project_dir, file_path)` carries the SAME
-    // pair (the GitSnapshot refresh UPDATE writes both columns onto
-    // every row for the file). LIMIT 1 is safe.
+    // worktree_oid / worktree_mode is a per-file fact — every attribution row
+    // for `(project_dir, file_path)` carries the SAME pair, so LIMIT 1 is safe.
     const row = worktreeProbeStmt.get(projectDir, filePath) as
       | { worktree_oid: string | null; worktree_mode: string | null }
       | null
       | undefined;
     if (row == null) {
-      // No attribution row exists yet — nothing to gate; the
-      // discharging UPDATE will match zero rows below either way. Fall
-      // through to the legacy path (zero-row UPDATE is a safe no-op).
+      // No attribution row yet — the discharging UPDATE matches zero rows
+      // anyway; fall through (safe no-op).
       return false;
     }
     if (row.worktree_oid === null || row.worktree_mode === null) {
-      // No GitSnapshot has yet folded a content-aware payload for this
-      // file (pre-v44/v45 events, or never observed dirty). Fall back to
-      // today's unconditional timestamp discharge — re-fold determinism
-      // over historical events.
+      // No content-aware GitSnapshot folded yet for this file — fall back to
+      // unconditional timestamp discharge (re-fold determinism).
       return false;
     }
-    // All four axes non-null: gate on EQUALITY. Suppress discharge only
-    // when EITHER pair MISMATCHES (the worktree diverged from the
-    // committed bytes/mode — the session stays on-the-hook). When BOTH
-    // pairs MATCH, fall through to discharge (the commit truly captured
-    // the worktree).
+    // All four axes non-null: suppress discharge only when either pair
+    // MISMATCHES (the worktree diverged); when both MATCH, discharge.
     return (
       row.worktree_oid !== committedOid || row.worktree_mode !== committedMode
     );
   }
 
   if (commit.committer_session_id !== null) {
-    // Per-session discharge: only the committing session clears its claim
-    // on each named file. Other sessions that also touched these files
-    // (multi-attribution) stay on-the-hook until they commit too.
+    // Per-session discharge: only the committing session clears its claim. Other
+    // sessions that touched these files (multi-attribution) stay on-the-hook
+    // until they commit too.
     const stmt = db.prepare(
       `UPDATE file_attributions
           SET last_commit_at = ?, last_event_id = ?, updated_at = ?
@@ -2796,13 +2061,9 @@ function foldCommit(db: Database, event: Event): void {
           AND session_id = ?
           AND file_path = ?`,
     );
-    // v45 / fn-664.2: content-aware gate. The extractCommit defensive
-    // parser already guarded the entry shape; we re-check `path` here
-    // for safety inside the fold tx (mirrors the prior per-string
-    // defensive check). When the gate suppresses, we skip the UPDATE
-    // entirely — `last_mutation_at` is unchanged, the row stays in
-    // the dirty/attributed bucket via the (mutation > commit)
-    // inequality the four discharge read predicates use.
+    // Content-aware gate. When it suppresses, skip the UPDATE entirely —
+    // `last_mutation_at` is unchanged, so the row stays attributed via the
+    // (mutation > commit) discharge inequality.
     for (const entry of commit.files) {
       const filePath = entry.path;
       if (typeof filePath !== "string" || filePath.length === 0) continue;
@@ -2825,39 +2086,14 @@ function foldCommit(db: Database, event: Event): void {
         filePath,
       );
     }
-    // v49 / fn-670 (T2): task→committing-session link write. Gated on
-    // BOTH `committer_session_id != null` (the enclosing per-session
-    // arm) AND `task_ids.length > 0` — either-empty short-circuits to
-    // a no-op (the link semantic is "the committing session
-    // demonstrably finished work for THIS task"; without both a
-    // session and at least one task id, there's nothing honest to
-    // stamp). Multi-task commits stamp ALL named tasks symmetrically
-    // (a jobctl commit may close more than one task in one message,
-    // and the union-of-all `task_ids` was frozen at producer time —
-    // {@link parseTaskTrailers}).
-    //
-    // Pure function of the Commit payload + the existing epics rows;
-    // no wall-clock, no env, no fs, no liveness probe. The per-task
-    // RMW (parse, find element, stamp `last_commit_for_task_at`,
-    // bump `last_event_id`/`updated_at`, re-sort via
-    // {@link sortEmbeddedJobs}, write back) preserves the
-    // byte-identical re-fold invariant — sortEmbeddedJobs is the same
-    // deterministic key {@link syncJobIntoEpic} uses.
-    //
-    // Commit-before-claim ordering: when no embedded job element yet
-    // exists for `committer_session_id` under a named task (the
-    // Commit fold lands before SessionStart's `syncJobIntoEpic` for
-    // this session), the link is dropped at this site rather than
-    // shelling a job element foldCommit doesn't otherwise own.
-    // Justified two ways: (a) a real worker's SessionStart precedes
-    // its own commit by definition (the session must exist to spawn
-    // a `git commit` invocation), so the order on the live wire is
-    // claim-then-commit; and (b) a cursor=0 re-fold replays events
-    // strictly in id order — the SessionStart row, having a lower
-    // id, folds first, so the embedded job element is present by
-    // the time this fold lands. The drop-on-miss path is reachable
-    // only on a hand-crafted event sequence (test injection,
-    // human-edited DB) and stays deterministic.
+    // Task→committing-session link write, gated on `task_ids.length > 0` (the
+    // enclosing arm already requires a non-null session). Multi-task commits
+    // stamp ALL named tasks symmetrically. Pure function of the payload + the
+    // existing epics rows. On a commit-before-claim miss (no embedded job
+    // element for this session yet) the link is dropped rather than shelling a
+    // job element foldCommit doesn't own — a real worker's SessionStart (lower
+    // event id) always folds first, so the miss is reachable only on a
+    // hand-crafted event sequence and stays deterministic.
     if (commit.task_ids.length > 0) {
       foldCommitTaskLinks(db, {
         committerSessionId: commit.committer_session_id,
@@ -2867,24 +2103,13 @@ function foldCommit(db: Database, event: Event): void {
         eventTs,
       });
     }
-    // Epic fn-695 (T3): durable commit-derived creator/refiner edge. When
-    // this commit carried a `Planctl-Op` + epic-shaped `Planctl-Target` +
-    // `Session-Id` (all frozen on the payload by task .2), TRIGGER the
-    // committing session's edge rebuild — `syncPlanctlLinks` re-derives
-    // `jobs.epic_links` + the touched epic's `epics.job_links` from the
-    // UNION of the legacy stdout scrape AND this commit-trailer fact. We
-    // TRIGGER (never write the edge cells from this arm directly) so the
-    // single-writer invariant holds: `syncPlanctlLinks` stays the sole
-    // writer of those two projection cells, mirroring the planctl-event
-    // and `/plan:plan`-opener trigger seam in `projectJobsRow`.
-    //
-    // Gate: all three commit-trailer axes non-null AND the target parses
-    // to an epic. The `committer_session_id != null` half is the enclosing
-    // arm; we add the `planctl_op` / `planctl_target` (epic-shaped) checks
-    // here. A non-planctl commit (source / human commit) has NULL
-    // `planctl_op` and falls through to a no-op — re-fold determinism over
-    // the historical log holds (every pre-fn-695 `Commit` event lacks the
-    // payload fields → `extractCommit` defaults them null → no trigger).
+    // Durable commit-derived creator/refiner edge. When the commit carried a
+    // `Planctl-Op` + epic-shaped `Planctl-Target` + `Session-Id`, TRIGGER the
+    // session's edge rebuild — `syncPlanctlLinks` re-derives `jobs.epic_links` +
+    // the epic's `epics.job_links` from the union of the stdout scrape and this
+    // commit-trailer fact. We TRIGGER (never write the edge cells directly) so
+    // `syncPlanctlLinks` stays the sole writer. A non-planctl commit has NULL
+    // `planctl_op` and no-ops, preserving re-fold determinism over the log.
     if (
       commit.planctl_op != null &&
       commit.planctl_target != null &&
@@ -2894,23 +2119,17 @@ function foldCommit(db: Database, event: Event): void {
     }
     return;
   }
-  // Global discharge: no trailer or malformed trailer → no honest way to
-  // pin the discharge to a specific session, so we clear EVERY session's
-  // attribution row for the named files. Matches the spec's "global
-  // discharge (null committer_session_id) updates every session's
-  // attribution row for the named files" rule.
+  // Global discharge: no trailer (or malformed) → no honest way to pin the
+  // discharge to a session, so clear EVERY session's attribution row for the
+  // named files.
   const globalStmt = db.prepare(
     `UPDATE file_attributions
         SET last_commit_at = ?, last_event_id = ?, updated_at = ?
       WHERE project_dir = ?
         AND file_path = ?`,
   );
-  // v45 / fn-664.2: same content-aware gate as the per-session arm
-  // above. The oid/mode read is per-file (a property of the worktree,
-  // not the session), so the same `shouldSkipDischarge` probe gates
-  // both the per-session and global discharge paths symmetrically — a
-  // chmod-only dirty file under a human/CI commit is NOT discharged
-  // either, for the same reason a session-commit doesn't discharge it.
+  // Same content-aware gate as the per-session arm: the oid/mode read is
+  // per-file, so a chmod-only dirty file is not discharged here either.
   for (const entry of commit.files) {
     const filePath = entry.path;
     if (typeof filePath !== "string" || filePath.length === 0) continue;
@@ -2935,47 +2154,16 @@ function foldCommit(db: Database, event: Event): void {
 }
 
 /**
- * Schema v49 / fn-670 (T2): stamp the per-(task, job) task→committing-
- * session link on the embedded job element under each named task. Called
- * from {@link foldCommit}'s per-session arm when BOTH
- * `committer_session_id != null` AND `task_ids.length > 0`. Pure function
- * of the inputs + the existing `epics` rows; runs INSIDE the open
- * `BEGIN IMMEDIATE` transaction opened by {@link applyEvent}. NEVER
- * throws (a parse failure inside a JSON-TEXT cell folds to "skip this
- * task" via guarded JSON.parse + Array.isArray; the cursor still
- * advances).
- *
- * For each `task_id` in the payload:
- *   1. Resolve the parent `epic_id` via {@link parsePlanRef} — a
- *      malformed id drops at entry granularity (extractCommit already
- *      gated on {@link TASK_TRAILER_RE} so this is a defensive belt
- *      inside the fold tx, not a typical path).
- *   2. SELECT the epic's `tasks` JSON-TEXT cell; absent epic row →
- *      skip (commit-before-snapshot ordering — the snapshot will land
- *      later and `syncJobIntoEpic`'s carve-out preserves whatever the
- *      link is at that moment; on a re-fold from cursor=0 the
- *      snapshot row precedes this commit row in id order so the
- *      ordering inverts — re-fold determinism still holds because the
- *      link is set by THIS fold, not by `syncJobIntoEpic`).
- *   3. Parse the array, find the task element by id; not found →
- *      skip (the task is not yet known to this epic — same ordering
- *      defense as above).
- *   4. Find the embedded job element whose `job_id ===
- *      committerSessionId` under the task's `jobs[]` sub-array; not
- *      found → skip (commit-before-claim path, documented above the
- *      call site).
- *   5. Stamp `last_commit_for_task_at = lastCommitForTaskAt`, bump
- *      `last_event_id = eventId` + `updated_at = eventTs`, re-sort
- *      via {@link sortEmbeddedJobs} (NEVER append — re-fold
- *      determinism), re-serialise the tasks array, UPDATE the epic
- *      row's `tasks` + `last_event_id` + `updated_at`.
- *
- * The re-sort is deterministic — `sortEmbeddedJobs` keys on
- * `(created_at desc, job_id asc)` which a same-task stamp does not
- * change (we're updating an existing element in place), but the sort
- * stays for safety: a future field rename or sort-key change must
- * stay consistent with `syncJobIntoEpic`'s write site, and re-running
- * the same sort is byte-deterministic.
+ * Stamp the per-(task, job) task→committing-session link on the embedded job
+ * element under each named task. Called from {@link foldCommit}'s per-session
+ * arm. Pure function of the inputs + the existing `epics` rows; NEVER throws (a
+ * parse failure folds to "skip this task"). For each `task_id`: resolve the
+ * parent epic, find the task element, find the embedded job element for
+ * `committerSessionId`, stamp `last_commit_for_task_at`, re-sort via
+ * {@link sortEmbeddedJobs} (NEVER append — re-fold determinism), write back. A
+ * missing epic / task / job element skips deterministically (the link is set by
+ * THIS fold, not `syncJobIntoEpic`, so the snapshot-vs-commit ordering inverting
+ * on re-fold doesn't change the result).
  */
 function foldCommitTaskLinks(
   db: Database,
@@ -2989,22 +2177,17 @@ function foldCommitTaskLinks(
 ): void {
   const { committerSessionId, taskIds, lastCommitForTaskAt, eventId, eventTs } =
     opts;
-  // Minimal shape of an `epics.tasks[]` element this helper reads/writes.
-  // Mirrors the local `TaskElement` interface inside `syncJobIntoEpic` but
-  // narrowed to the fields we touch — the OPAQUE pass-through of the
-  // other fields lives in `unknownFields` so a re-serialise round-trips
-  // byte-identical bytes (the JSON-TEXT cell is opaque to keeper-py and
-  // every other reader, but the round-trip must preserve unknowns for
-  // byte-identical re-fold).
+  // Minimal shape of an `epics.tasks[]` element this helper reads/writes,
+  // narrowed to the fields we touch; the index signature carries unknown fields
+  // opaquely so a re-serialise round-trips byte-identical for re-fold.
   interface TaskElementJson {
     task_id: string;
     jobs?: EmbeddedJobElement[];
     [key: string]: unknown;
   }
   for (const taskId of taskIds) {
-    // Defensive: extractCommit already gated on TASK_TRAILER_RE, but
-    // re-parse here so the helper is robust against future callers and
-    // the parse step extracts the parent epic_id in one go.
+    // Re-parse to extract the parent epic_id and stay robust against future
+    // callers (extractCommit already gated on TASK_TRAILER_RE).
     const parsed = parsePlanRef(taskId);
     if (parsed == null || parsed.kind !== "task") {
       continue;
@@ -3027,29 +2210,24 @@ function foldCommitTaskLinks(
       }
       tasksArr = parsedTasks as TaskElementJson[];
     } catch {
-      // Malformed JSON cell — skip this task, never throw inside the
-      // fold tx (CLAUDE.md re-fold invariant).
+      // Malformed JSON cell — skip this task, never throw inside the fold.
       continue;
     }
     const taskIdx = tasksArr.findIndex((t) => t.task_id === parsed.task_id);
     if (taskIdx < 0) {
-      continue; // task not yet known to this epic — skip, cursor advances.
+      continue; // task not yet known to this epic — skip.
     }
     const oldTask = tasksArr[taskIdx];
     const oldJobs =
       oldTask != null && Array.isArray(oldTask.jobs) ? oldTask.jobs : [];
     const jobIdx = oldJobs.findIndex((j) => j.job_id === committerSessionId);
     if (jobIdx < 0) {
-      // Commit-before-claim path — no embedded job element exists yet
-      // for the committing session under this task. Lose the link
-      // deterministically (documented above the call site). Cursor
-      // still advances.
+      // Commit-before-claim path — no embedded job element yet for this
+      // session under this task; lose the link deterministically.
       continue;
     }
-    // RMW: stamp last_commit_for_task_at + bump axes on the matched job
-    // element, then re-sort and write the tasks array back. The job's
-    // `created_at` is unchanged so the sort key is stable, but we sort
-    // anyway for consistency with `syncJobIntoEpic`'s write site.
+    // RMW: stamp last_commit_for_task_at + bump axes on the matched element,
+    // re-sort (for consistency with `syncJobIntoEpic`'s write site), write back.
     const oldJob = oldJobs[jobIdx];
     const newJob: EmbeddedJobElement = {
       ...oldJob,
@@ -3060,10 +2238,8 @@ function foldCommitTaskLinks(
     const newJobs = oldJobs.slice();
     newJobs[jobIdx] = newJob;
     sortEmbeddedJobs(newJobs);
-    // OLD-element carve-out spread: preserve EVERY other scalar field on
-    // the task element (worker_phase, runtime_status, tier, depends_on,
-    // …) so a Commit fold does NOT clobber plan-snapshot-derived state.
-    // Mirrors `syncJobIntoEpic`'s task-side carve-out.
+    // Carve-out spread: preserve every other scalar field on the task element
+    // so a Commit fold does NOT clobber plan-snapshot-derived state.
     const newTask: TaskElementJson = { ...oldTask, jobs: newJobs };
     const newTasksArr = tasksArr.slice();
     newTasksArr[taskIdx] = newTask;
@@ -3076,35 +2252,21 @@ function foldCommitTaskLinks(
 }
 
 /**
- * Schema v59 / fn-719 (task 1): stamp the provenance-filtered
- * `has_live_worker_monitor` occupancy fact onto THIS session's embedded
- * job element under its bound task.
+ * Stamp the provenance-filtered `has_live_worker_monitor` occupancy fact onto
+ * THIS session's embedded job element under its bound task.
  *
- * Why a dedicated write site (not just the `buildEmbeddedJob` derive):
- * the Stop fold's `jobs.monitors` UPDATE is the ONLY seam that refreshes
- * the monitor set, and it is HOISTED ABOVE the sub-agent guard — so a
- * mid-Task-yield Stop refreshes `jobs.monitors` but SKIPS the
- * `state='stopped'` UPDATE and its `syncIfPlanRef` fan-out. Without this
- * explicit stamp, the embedded job's occupancy fact would go stale exactly
- * in the guard-swallow case (a worker yielded to a sub-agent with a live
- * suite still backgrounded — the fn-715.2 incident shape). So we mirror
- * {@link foldCommitTaskLinks}: read the session's `plan_ref`, resolve its
- * task element, RMW the embedded job by `job_id`, stamping the boolean +
- * the `last_event_id`/`updated_at` (the lease anchor task 2 reads). The
- * `buildEmbeddedJob` carve-out then PRESERVES this value across later
- * job-tick re-syncs.
+ * A dedicated write site is needed because the Stop fold's `jobs.monitors`
+ * UPDATE is HOISTED ABOVE the sub-agent guard: a mid-Task-yield Stop refreshes
+ * `jobs.monitors` but SKIPS the `state='stopped'` UPDATE and its
+ * `syncIfPlanRef` fan-out, so without this explicit stamp the embedded
+ * occupancy fact would go stale in the guard-swallow case. Mirrors
+ * {@link foldCommitTaskLinks}: RMW the embedded job by `job_id`, stamping the
+ * boolean + `last_event_id`/`updated_at`.
  *
- * Re-fold deterministic: the boolean is a pure function of `nextMonitors`
- * (itself a pure function of the event log up to `eventId`), and every RMW
- * input is event-derived. NEVER throws inside the open transaction — a
+ * Re-fold deterministic (every RMW input is event-derived). NEVER throws — a
  * malformed `tasks` cell / missing task / commit-before-claim job is a
- * deterministic skip, cursor still advances. `hasLiveWorkerMonitor`
- * already folds a malformed `monitors` string to `false`.
- *
- * Only fires for verb `work` (`plan_ref` parses to `{kind: "task"}`) — a
- * planner / closer session (`{kind: "epic"}`) holds no working tree, so
- * its embedded job carries no monitor-occupancy fact (left at the
- * carve-out's `false` default).
+ * deterministic skip. Only fires for verb `work` (`plan_ref` is `{kind:
+ * "task"}`); a planner / closer session holds no working tree.
  */
 function stampEmbeddedMonitorFact(
   db: Database,
@@ -3146,28 +2308,25 @@ function stampEmbeddedMonitorFact(
     }
     tasksArr = parsedTasks as TaskElementJson[];
   } catch {
-    return; // malformed JSON cell — skip, never throw inside the fold tx.
+    return; // malformed JSON cell — skip, never throw inside the fold.
   }
   const taskIdx = tasksArr.findIndex((t) => t.task_id === parsed.task_id);
   if (taskIdx < 0) {
-    return; // task not yet known — skip, cursor advances.
+    return; // task not yet known — skip.
   }
   const oldTask = tasksArr[taskIdx];
   const oldJobs =
     oldTask != null && Array.isArray(oldTask.jobs) ? oldTask.jobs : [];
   const jobIdx = oldJobs.findIndex((j) => j.job_id === jobId);
   if (jobIdx < 0) {
-    // No embedded job element yet (the session's own SessionStart fan-out
-    // hasn't landed it under this task) — the carve-out will pick up the
-    // fresh `false` default when it does. Lose the stamp deterministically.
+    // No embedded job element yet — the carve-out picks up the fresh `false`
+    // default when SessionStart lands it. Lose the stamp deterministically.
     return;
   }
   const oldJob = oldJobs[jobIdx];
-  // No-op short-circuit: if the value is unchanged AND nothing else needs a
-  // stamp bump, skip the write so a Stop that didn't change occupancy stays
-  // byte-stable. The monitors UPDATE already bumped the jobs-row stamp; the
-  // embedded element is what we're keeping honest here. (We still write when
-  // the boolean changed.) `?? false` handles the pre-v59 absent-field case.
+  // No-op short-circuit: skip the write when the boolean is unchanged so a Stop
+  // that didn't change occupancy stays byte-stable. `?? false` handles the
+  // absent-field case.
   if ((oldJob.has_live_worker_monitor ?? false) === hasLiveWorkerMonitor) {
     return;
   }
@@ -3191,16 +2350,12 @@ function stampEmbeddedMonitorFact(
 }
 
 /**
- * Schema v59 / fn-719 (task 1): the terminal-clear counterpart to
- * {@link stampEmbeddedMonitorFact}. A SessionEnd / Killed write clears
- * `jobs.monitors` to `'[]'` and runs `syncIfPlanRef`, but the
- * `buildEmbeddedJob` carve-out PRESERVES whatever `has_live_worker_monitor`
- * the prior embedded element held — so a job that stopped with a live
- * worker monitor would carry a stale `true` into its terminal element. This
- * forces the fact to `false` (the no-op short-circuit in the stamp helper
- * keeps an already-`false` element byte-stable). Reads the session's
- * `plan_ref` from the now-terminal jobs row; deterministic no-op for a
- * non-work session.
+ * Terminal-clear counterpart to {@link stampEmbeddedMonitorFact}. A SessionEnd /
+ * Killed write clears `jobs.monitors`, but the carve-out PRESERVES whatever
+ * `has_live_worker_monitor` the prior embedded element held — so a job that
+ * stopped with a live monitor would carry a stale `true` into its terminal
+ * element. This forces the fact to `false`. Deterministic no-op for a non-work
+ * session.
  */
 function clearEmbeddedMonitorFactOnTerminal(
   db: Database,
@@ -3222,12 +2377,11 @@ function clearEmbeddedMonitorFactOnTerminal(
 
 /**
  * Pre-flattened agentuse usage snapshot. The usage-worker carries every
- * projection-meaningful field in the synthetic `UsageSnapshot` event's
- * `data` blob; the reducer never re-reads the on-disk file. **Freshness
- * fields are explicitly absent** — `fetched_at` / `next_fetch_at` /
- * `last_successful_fetch_at` / `last_skipped_fetch_at` are filtered at the
- * producer (see `src/usage-worker.ts` `buildUsageMessage`); including any
- * here would force a synthetic event on every ~90s fetch cycle.
+ * projection-meaningful field in the synthetic `UsageSnapshot` event's `data`
+ * blob; the reducer never re-reads the on-disk file. Freshness fields
+ * (`fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
+ * `last_skipped_fetch_at`) are filtered at the producer — including any here
+ * would force a synthetic event on every fetch cycle.
  */
 interface UsageSnapshotPayload {
   target: string | null;
@@ -3238,25 +2392,23 @@ interface UsageSnapshotPayload {
   week_resets_at: string | null;
   sonnet_week_percent: number | null;
   sonnet_week_resets_at: string | null;
-  // fn-645: envelope freshness / plan / stale-error axes.
+  // Envelope freshness / plan / stale-error axes.
   status: string | null;
   /**
    * Coerced from the producer's bool|null to 1/0/null at extract time so the
-   * UPSERT binding matches the SQLite column type (INTEGER, nullable). The
-   * producer's wire shape stays boolean (see `UsageSnapshotMessage`).
+   * UPSERT binding matches the nullable INTEGER column. The wire shape stays
+   * boolean.
    */
   subscription_active: 1 | 0 | null;
   error_type: string | null;
   error_message: string | null;
   error_at: string | null;
   /**
-   * fn-651: rate-limit lift instant — ISO-8601 string carrying the soonest
-   * `resets_at` among windows at >=100% used (agentuse computes it). Null
-   * when the profile is not over any limit. Mirrors `session_resets_at` —
-   * stored opaque as TEXT; the renderer parses it. Folds into
-   * `usage.rate_limit_lifts_at` on the percentage path; the rate-limit
-   * fan-out's UPDATE carves it out so a RateLimited fold cannot clobber a
-   * lift time.
+   * Rate-limit lift instant — ISO-8601 string carrying the soonest `resets_at`
+   * among windows at >=100% used; null when the profile is under every limit.
+   * Stored opaque as TEXT. Folds into `usage.rate_limit_lifts_at` on the
+   * percentage path; the rate-limit fan-out's UPDATE carves it out so a
+   * RateLimited fold cannot clobber a lift time.
    */
   lift_at: string | null;
 }
@@ -3269,8 +2421,7 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
     const parsed = JSON.parse(event.data) as Partial<
       Omit<UsageSnapshotPayload, "subscription_active">
     > & { subscription_active?: unknown };
-    // fn-645: bool|null → 1/0/null. Non-booleans (including missing) fold to
-    // null per the "safe value" invariant.
+    // bool|null → 1/0/null; non-booleans (including missing) fold to null.
     const subRaw = parsed.subscription_active;
     const subscriptionActive: 1 | 0 | null =
       subRaw === true ? 1 : subRaw === false ? 0 : null;
@@ -3315,9 +2466,8 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
       error_message:
         typeof parsed.error_message === "string" ? parsed.error_message : null,
       error_at: typeof parsed.error_at === "string" ? parsed.error_at : null,
-      // fn-651: rate-limit lift instant — null-safe string parse mirroring
-      // `session_resets_at`. Pre-v41 events on disk that predate `lift_at`
-      // fold to null safely.
+      // Rate-limit lift instant — null-safe string parse; older events that
+      // predate `lift_at` fold to null safely.
       lift_at: typeof parsed.lift_at === "string" ? parsed.lift_at : null,
     };
   } catch (err) {
@@ -3336,22 +2486,17 @@ function extractUsageSnapshot(event: Event): UsageSnapshotPayload | null {
  * payload fields ride in `event.data` (decoded by
  * {@link extractUsageSnapshot}).
  *
- * Bumps `last_event_id` + `updated_at` on every write so the descriptor's
- * diff-tick fires patches. Re-fold determinism: the reducer NEVER re-reads
- * the on-disk file — the persisted event log is the sole source of truth.
+ * Bumps `last_event_id` + `updated_at` on every write. Re-fold deterministic:
+ * the reducer NEVER re-reads the on-disk file.
  *
- * **Schema v35 (fn-642): reverse fan-out (UsageSnapshot ← profiles).** The
- * colocated `last_rate_limit_at` + `last_rate_limit_session_id` columns are
- * carved OUT of the `ON CONFLICT(id) DO UPDATE SET` clause (mirroring the
- * `EpicSnapshot` carve-out for `tasks` / `jobs` / `job_links` / etc.) — a
- * `UsageSnapshot` re-fold must NOT clobber the rate-limit annotation a
- * prior `RateLimited` fan-out wrote. After the UPSERT, a SELECT against
- * the matching `profiles` row (joined on `profile_name = usage.id`) pulls
- * the current rate-limit state and stamps it onto the row. NULL-safe: if
- * no matching `profiles` row exists (e.g. a usage id with no SessionStart-
- * seeded profile yet), the columns stay NULL — a later `RateLimited` will
- * fan them in via the forward path. The `profile_name != ''` guard keeps
- * the `''` sentinel (default `~/.claude`) out of the join.
+ * Reverse fan-out (UsageSnapshot ← profiles): the colocated
+ * `last_rate_limit_at` + `last_rate_limit_session_id` columns are carved OUT of
+ * the `ON CONFLICT DO UPDATE` clause so a `UsageSnapshot` re-fold can't clobber
+ * the rate-limit annotation a prior `RateLimited` fan-out wrote. After the
+ * UPSERT, a SELECT against the matching `profiles` row (joined on `profile_name
+ * = usage.id`) stamps the current rate-limit state. NULL-safe when no profile
+ * row exists; the `profile_name != ''` guard keeps the `''` sentinel out of the
+ * join.
  */
 function projectUsageRow(db: Database, event: Event): void {
   const id = event.session_id;
@@ -3362,24 +2507,12 @@ function projectUsageRow(db: Database, event: Event): void {
   if (snapshot == null) {
     return;
   }
-  // fn-651: freshness stamp gate. `last_usage_fold_at` is the event `ts`
-  // ONLY on a SUCCESSFUL usage fold (status `"active"` or any per-window
-  // usage present) — NOT on idle/stale snapshots, NEVER on the rate-limit
-  // fan-out (which carves both new columns out of its UPDATE). The
-  // renderer compares this against the wall clock to warn when ingestion
-  // has wedged; an idle/stale fold must NOT bump it or the warning loses
-  // its meaning. Determinism boundary: the value is the event ts, never
-  // `Date.now()` — a fold-time wall-clock read would break re-fold
-  // determinism (CLAUDE.md "byte-identical re-fold").
-  //
-  // "Successful usage" is defined as: status === "active" OR any of the
-  // three per-window percents is non-null (a row carrying real quota
-  // numbers from a recent scrape). Idle / stale snapshots typically carry
-  // status === "idle" / "stale" with NULL percents — these preserve the
-  // prior `last_usage_fold_at` via the carve-out spread in the UPSERT
-  // clause below, so a wedged ingestion path's last-good stamp does not
-  // get overwritten by a later idle/stale envelope that DID make it
-  // through.
+  // Freshness stamp gate. `last_usage_fold_at` is the event `ts` ONLY on a
+  // SUCCESSFUL usage fold (status `"active"` or any per-window percent present)
+  // — NOT on idle/stale snapshots, which preserve the prior stamp via the
+  // COALESCE carve-out below so a wedged-ingestion warning keeps its meaning.
+  // The value is the event ts, never `Date.now()` — a wall-clock read would
+  // break re-fold determinism.
   const hasUsagePercents =
     snapshot.session_percent != null ||
     snapshot.week_percent != null ||
@@ -3445,35 +2578,13 @@ function projectUsageRow(db: Database, event: Event): void {
       event.ts,
     ],
   );
-  // Schema v35 (fn-642), corrected at v42 (fn-662): reverse fan-out. Pull
-  // the current rate-limit annotation from the matching `profiles` row and
-  // stamp it onto the just-UPSERTed usage row. The join key is
-  // `profiles.profile_name = profileNameForUsageId(usage.id)` — v42's
-  // shared directional mapping translates agentuse's `"default"` usage id
-  // to keeper's `''` default-profile sentinel at the join boundary, so a
-  // `default` UsageSnapshot reads the `''` profile row's annotation. Every
-  // other usage id passes through unchanged. NULL-safe: a missing/quiet
-  // profile row leaves the columns NULL (`SELECT ... LIMIT 1` returns null
-  // → both bindings are NULL → the UPDATE writes NULLs, which is the
-  // correct zero-event shape). A later `RateLimited` will populate them
-  // via the forward fan-out.
-  //
-  // The pre-v42 `WHERE profile_name != ''` guard is gone: the reverse
-  // direction is one-way (`'default'` → `''`, never `''` → `''`), so a
-  // pathological literal `usage.id=''` would resolve to
-  // `profile_name=''` ONLY if the helper mapped it that way — it does
-  // not. And `projectUsageRow` rejects an empty `event.session_id` at
-  // the early guard above, so the SELECT can never see `id===''` in
-  // steady state. The cross-contamination the original guard prevented
-  // is now structurally impossible by the mapping direction.
-  //
-  // Pure function of the fold inputs + the in-transaction `profiles` row —
-  // no `Date.now`/env/OS reads. Re-fold determinism: events fold in id
-  // order, so a re-fold sees the same `profiles` state at the same point in
-  // the stream and stamps the same values. The `last_event_id` bump is
-  // already covered by the UPSERT above; the reverse fan-out's UPDATE does
-  // not need to re-bump because the row's `last_event_id` already advanced
-  // for this same event.
+  // Reverse fan-out: pull the current rate-limit annotation from the matching
+  // `profiles` row and stamp it onto the just-UPSERTed usage row. The join key
+  // `profileNameForUsageId(usage.id)` translates agentuse's `"default"` id to
+  // keeper's `''` default-profile sentinel. NULL-safe: a missing profile row
+  // leaves the columns NULL (the zero-event shape); a later `RateLimited`
+  // populates them via the forward fan-out. Pure function of the fold inputs +
+  // the in-transaction `profiles` row — re-fold deterministic.
   const profileRow = db
     .query(
       `SELECT last_rate_limit_at, last_rate_limit_session_id
@@ -3498,15 +2609,12 @@ function projectUsageRow(db: Database, event: Event): void {
 }
 
 /**
- * Fold one synthetic `UsageDeleted` tombstone. The usage-worker posts this
- * when an `<id>.json` file disappears (or the boot-reconciliation sweep
- * retracts a projection ghost); without it, {@link projectUsageRow}'s
+ * Fold one synthetic `UsageDeleted` tombstone. The usage-worker posts this when
+ * an `<id>.json` file disappears; without it, {@link projectUsageRow}'s
  * UPSERT-only path would leak the final pre-delete snapshot row forever.
  *
- * The primary key (`id`) rides in `event.session_id`. An empty / missing pk
- * is a safe no-op — the invariant says fold must never throw inside the
- * cursor-advance transaction. DELETE is idempotent: re-folding over a row
- * that's already gone matches zero rows, not an error.
+ * The primary key (`id`) rides in `event.session_id`. An empty / missing pk is a
+ * safe no-op — fold must never throw. DELETE is idempotent.
  */
 function retractUsageRow(db: Database, event: Event): void {
   const id = event.session_id;
@@ -3517,19 +2625,14 @@ function retractUsageRow(db: Database, event: Event): void {
 }
 
 /**
- * Pre-flattened `DispatchFailed` synthetic event payload (fn-661). The
- * server-side autopilot reconciler mints this event when a dispatch attempt
- * for the `(verb, id)` pair fails (today: a confirm-poll timeout, but the
- * `reason` field is free-form so future failure shapes ride the same arm
- * without a schema change).
+ * Pre-flattened `DispatchFailed` synthetic event payload. The autopilot
+ * reconciler mints this when a dispatch attempt for `(verb, id)` fails; the
+ * free-form `reason` lets future failure shapes ride the same arm.
  *
- * The reconciler stamps `ts` at reconcile time — NOT the same as the
- * synthetic event's `event.ts` (which is the producer-side mint clock).
- * Carrying it in the payload is what keeps the fold pure: a re-fold of the
- * stored event reproduces the same `dispatch_failures.ts` column value
- * regardless of when the re-fold happens. The reducer NEVER reads
- * `Date.now()` and NEVER re-probes liveness here — both would break re-fold
- * determinism (see the `Killed` arm and CLAUDE.md "byte-identical re-fold").
+ * `ts` is the reconcile-time stamp carried in the payload (NOT `event.ts`),
+ * which keeps the fold pure: a re-fold reproduces the same
+ * `dispatch_failures.ts` regardless of when it happens. The reducer NEVER reads
+ * `Date.now()` and NEVER re-probes liveness here.
  */
 interface DispatchFailedPayload {
   verb: string;
@@ -3540,12 +2643,10 @@ interface DispatchFailedPayload {
 }
 
 /**
- * Pre-flattened `DispatchCleared` synthetic event payload (fn-661). The
- * reconciler mints this event when a human `retry_dispatch` RPC fires
- * against the `(verb, id)` pair — the only legal way for a sticky failure
- * row to leave `dispatch_failures` (no direct DELETE: every clear must
- * round-trip through the event log so a from-scratch re-fold reproduces
- * the post-clear empty-table state).
+ * Pre-flattened `DispatchCleared` synthetic event payload. The reconciler mints
+ * this on a human `retry_dispatch` RPC — the only legal way for a sticky failure
+ * row to leave `dispatch_failures` (every clear round-trips through the event
+ * log so a re-fold reproduces the post-clear state).
  */
 interface DispatchClearedPayload {
   verb: string;
@@ -3553,16 +2654,9 @@ interface DispatchClearedPayload {
 }
 
 /**
- * Parse a `DispatchFailed` event payload. Returns null on any structural
- * miss — the surrounding {@link foldDispatchFailed} folds null to a safe
- * no-op (cursor still advances). NEVER throws: per CLAUDE.md "a malformed
- * `data` blob skips/folds to a safe value", a throw inside the fold rolls
- * back the cursor and wedges the reducer.
- *
- * Strict typing: `verb` / `id` / `reason` MUST be non-empty strings;
- * `dir` is nullable (null on payloads that omit it, accepts a string
- * otherwise); `ts` MUST be a finite number (the reconciler's reconcile-
- * time stamp). Any miss → null → safe no-op.
+ * Parse a `DispatchFailed` event payload. Returns null on any structural miss
+ * ({@link foldDispatchFailed} folds null to a safe no-op); NEVER throws. Strict:
+ * `verb` / `id` / `reason` non-empty strings, `dir` nullable, `ts` finite.
  */
 function extractDispatchFailedPayload(
   event: Event,
@@ -3633,28 +2727,12 @@ function extractDispatchClearedPayload(
 }
 
 /**
- * Fold one synthetic `DispatchFailed` event (fn-661). UPSERT on
- * `(verb, id)` — the first failure for the pair INSERTs a new row stamped
- * `created_at = payload.ts`; subsequent failures (a reconciler that retries
- * itself without a human clear in between would be a bug, but a stale
- * re-fire IS possible across keeperd restarts) UPDATE the row's mutable
- * fields and PRESERVE `created_at` so the viewer's "sticky since" view
- * stays honest.
- *
- * The fold is a pure function of the event payload + the persisted row:
- * - `verb` / `id` / `reason` / `dir` / `ts` / `created_at` come from the
- *   immutable event payload (`ts` is the reconciler's reconcile-time
- *   stamp, frozen in by the producer — see {@link DispatchFailedPayload}).
- * - `last_event_id` is `event.id`.
- * - `updated_at` is `event.ts` (the synthetic event's own mint clock — the
- *   table's last-touched discipline mirrors every other projection).
- *
- * No `Date.now()`, no liveness re-probe, no `jobs` SELECT inside the fold
- * — all three would break re-fold determinism. Runs INSIDE the open
- * `BEGIN IMMEDIATE` transaction opened by {@link applyEvent}; performs
- * zero cursor work (the surrounding `applyEvent` advances the cursor).
- *
- * Malformed/missing payload → safe no-op; the cursor still advances.
+ * Fold one synthetic `DispatchFailed` event. UPSERT on `(verb, id)`: the first
+ * failure INSERTs a row stamped `created_at = payload.ts`; subsequent failures
+ * UPDATE the mutable fields and PRESERVE `created_at` so the "sticky since" view
+ * stays honest. Pure function of the payload + the persisted row — no
+ * `Date.now()`, no liveness re-probe, no `jobs` SELECT. Malformed/missing
+ * payload → safe no-op.
  */
 function foldDispatchFailed(db: Database, event: Event): void {
   const payload = extractDispatchFailedPayload(event);
@@ -3684,15 +2762,10 @@ function foldDispatchFailed(db: Database, event: Event): void {
       event.ts,
     ],
   );
-  // fn-678 (schema v50): a `DispatchFailed` for `(verb, id)` also discharges
-  // any in-flight `pending_dispatches` row for the same pair. The outbox
-  // ordering (mint `Dispatched` BEFORE `launch()`) means a launch failure
-  // leaves both rows: this arm is what reconciles them in the same fold
-  // transaction. Idempotent DELETE — no-op when no pending row exists (the
-  // common case: a confirm-poll timeout that beat the producer to minting
-  // `DispatchExpired`, or a re-fold over a log carrying `DispatchFailed`
-  // events that pre-date this epic). Pure fold: no `Date.now`, no env, no
-  // `jobs` SELECT — re-fold determinism holds.
+  // A `DispatchFailed` also discharges any in-flight `pending_dispatches` row
+  // for the same pair: the outbox ordering (mint `Dispatched` BEFORE `launch()`)
+  // means a launch failure leaves both rows, and this arm reconciles them in the
+  // same fold. Idempotent DELETE — no-op when no pending row exists.
   db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
     payload.verb,
     payload.id,
@@ -3700,17 +2773,9 @@ function foldDispatchFailed(db: Database, event: Event): void {
 }
 
 /**
- * Fold one synthetic `DispatchCleared` event (fn-661). DELETE on
- * `(verb, id)` — idempotent (re-folding over a `(verb, id)` that's already
- * gone matches zero rows, not an error). This is the ONLY legal clear
- * path: any direct DELETE against `dispatch_failures` outside the fold
- * arm would break the from-scratch re-fold determinism invariant (the
- * event log is the sole source of truth).
- *
- * Runs INSIDE the open `BEGIN IMMEDIATE` transaction opened by
- * {@link applyEvent}; performs zero cursor work.
- *
- * Malformed/missing payload → safe no-op; the cursor still advances.
+ * Fold one synthetic `DispatchCleared` event. Idempotent DELETE on `(verb, id)`
+ * — the ONLY legal clear path (a direct DELETE outside the fold arm would break
+ * re-fold determinism). Malformed/missing payload → safe no-op.
  */
 function foldDispatchCleared(db: Database, event: Event): void {
   const payload = extractDispatchClearedPayload(event);
@@ -3724,20 +2789,15 @@ function foldDispatchCleared(db: Database, event: Event): void {
 }
 
 /**
- * Pre-flattened `Dispatched` synthetic event payload (fn-678, schema v50).
- * The autopilot reconciler mints this BEFORE invoking `ExecBackend.launch()`
- * — outbox-ordered intent so a crash between mint and launch leaves a
- * phantom pending row that the producer-side TTL sweep clears via
- * `DispatchExpired` (strictly preferable to double-dispatch in the
- * launch→SessionStart blind window the fn-674 live tab probe used to
- * cover).
+ * Pre-flattened `Dispatched` synthetic event payload. The reconciler mints this
+ * BEFORE invoking `ExecBackend.launch()` — outbox-ordered intent, so a crash
+ * between mint and launch leaves a phantom pending row the producer-side TTL
+ * sweep clears via `DispatchExpired` (preferable to double-dispatch in the
+ * launch→SessionStart blind window).
  *
- * `ts` is the producer-side wall-clock at the mint moment — NOT
- * `event.ts` (the synthetic event's own clock); carrying it in the payload
- * is what keeps the fold pure. The reducer NEVER reads `Date.now()` here;
- * a re-fold reproduces `pending_dispatches.dispatched_at` byte-identically
- * regardless of when the re-fold happens. The TTL sweep in main compares
- * this value against `Date.now()` IN MAIN (never inside the fold).
+ * `ts` is the producer-side mint-moment wall-clock carried in the payload (NOT
+ * `event.ts`), which keeps the fold pure: the reducer NEVER reads `Date.now()`
+ * here. The TTL sweep compares this against `Date.now()` IN MAIN.
  */
 interface DispatchedPayload {
   verb: string;
@@ -3747,16 +2807,10 @@ interface DispatchedPayload {
 }
 
 /**
- * Pre-flattened `DispatchExpired` synthetic event payload (fn-678,
- * schema v50). The producer-side TTL sweep (task .3 of this epic) mints
- * this on the 60s heartbeat for any `pending_dispatches` row whose
- * `dispatched_at` is older than the 120s ceiling — discharges the phantom
- * launch-window slot without forcing a redispatch decision (a real worker
- * that booted will still bind via discharge-on-bind; a worker that never
- * spawned needs the slot freed before the autopilot can try again).
- *
- * Strictly `(verb, id)` — the clear arm is keyed-by-pk only. Mirrors
- * `DispatchClearedPayload`'s minimal shape.
+ * Pre-flattened `DispatchExpired` synthetic event payload. The producer-side TTL
+ * sweep mints this for any `pending_dispatches` row past the ceiling —
+ * discharges the phantom launch-window slot without forcing a redispatch
+ * decision. Strictly `(verb, id)`, keyed-by-pk only.
  */
 interface DispatchExpiredPayload {
   verb: string;
@@ -3765,15 +2819,8 @@ interface DispatchExpiredPayload {
 
 /**
  * Parse a `Dispatched` event payload. Returns null on any structural miss
- * — the surrounding {@link foldDispatched} folds null to a safe no-op
- * (cursor still advances). NEVER throws: per CLAUDE.md "a malformed `data`
- * blob folds to a safe value"; a throw inside the fold would roll back the
- * cursor and wedge the reducer.
- *
- * Strict typing mirroring {@link extractDispatchFailedPayload}: `verb` /
- * `id` MUST be non-empty strings; `dir` is nullable (null on payloads that
- * omit it, accepts a string otherwise); `ts` MUST be a finite number (the
- * reconciler's mint-time stamp). Any miss → null → safe no-op.
+ * ({@link foldDispatched} folds null to a safe no-op); NEVER throws. Strict:
+ * `verb` / `id` non-empty strings, `dir` nullable, `ts` finite.
  */
 function extractDispatchedPayload(event: Event): DispatchedPayload | null {
   if (event.data == null || event.data.length === 0) {
@@ -3833,27 +2880,12 @@ function extractDispatchExpiredPayload(
 }
 
 /**
- * Fold one synthetic `Dispatched` event (fn-678, schema v50). UPSERT on
- * `(verb, id)` — the reconciler mints a fresh `Dispatched` per launch
- * attempt, so a re-dispatch after a prior `DispatchExpired` / failure
- * lands here without a unique-constraint violation. An UPSERT collision
- * (same `(verb, id)` minted twice without an intervening discharge — a
- * bug in the reconciler, but possible across keeperd restarts) refreshes
- * `dispatched_at` / `dir` / `last_event_id` to the latest event's values
- * so the TTL sweep is keyed off the most recent attempt.
- *
- * The fold is a pure function of the event payload + the persisted row:
- * - `verb` / `id` / `dir` / `dispatched_at` come from the immutable event
- *   payload (`dispatched_at` is the producer's mint-time stamp, frozen in
- *   by main — see {@link DispatchedPayload}).
- * - `last_event_id` is `event.id`.
- *
- * No `Date.now()`, no liveness re-probe, no `jobs` SELECT inside the fold
- * — all three would break re-fold determinism. Runs INSIDE the open
- * `BEGIN IMMEDIATE` transaction opened by {@link applyEvent}; performs
- * zero cursor work.
- *
- * Malformed/missing payload → safe no-op; the cursor still advances.
+ * Fold one synthetic `Dispatched` event. UPSERT on `(verb, id)` — a re-dispatch
+ * after a prior `DispatchExpired` / failure lands here without a unique-
+ * constraint violation, refreshing `dispatched_at` / `dir` / `last_event_id` to
+ * the latest attempt so the TTL sweep keys off it. Pure function of the payload
+ * + the persisted row — no `Date.now()`, no liveness re-probe, no `jobs` SELECT.
+ * Malformed/missing payload → safe no-op.
  */
 function foldDispatched(db: Database, event: Event): void {
   const payload = extractDispatchedPayload(event);
@@ -3873,17 +2905,10 @@ function foldDispatched(db: Database, event: Event): void {
 }
 
 /**
- * Fold one synthetic `DispatchExpired` event (fn-678, schema v50). DELETE
- * on `(verb, id)` — idempotent (re-folding over a `(verb, id)` that's
- * already gone matches zero rows, not an error). MUST NOT throw on a
- * missing row: a boot-drain race where `SessionStart` already discharged
- * the row before the TTL sweep's `DispatchExpired` lands would otherwise
- * wedge the reducer.
- *
- * Runs INSIDE the open `BEGIN IMMEDIATE` transaction opened by
- * {@link applyEvent}; performs zero cursor work.
- *
- * Malformed/missing payload → safe no-op; the cursor still advances.
+ * Fold one synthetic `DispatchExpired` event. Idempotent DELETE on `(verb, id)`
+ * — MUST NOT throw on a missing row (a boot-drain race where `SessionStart`
+ * already discharged the row before the sweep's `DispatchExpired` lands would
+ * otherwise wedge the reducer). Malformed/missing payload → safe no-op.
  */
 function foldDispatchExpired(db: Database, event: Event): void {
   const payload = extractDispatchExpiredPayload(event);
@@ -3897,42 +2922,23 @@ function foldDispatchExpired(db: Database, event: Event): void {
 }
 
 /**
- * Pre-flattened `AutopilotPaused` synthetic event payload (fn-667). Carries
- * the single boolean knob the autopilot worker reads (and the viewer
- * banner reflects). Pause/play round-trips through the
- * `set_autopilot_paused` RPC → server-worker bridge → main, which appends
- * one `AutopilotPaused` event onto the writable connection; the reducer
- * folds it into the singleton `autopilot_state.paused` column inside the
- * same `BEGIN IMMEDIATE` cursor-advance transaction.
- *
- * The fold reads NOTHING outside the event payload + the persisted row —
- * no `Date.now()` (uses `event.ts` for created_at / updated_at), no env,
- * no `jobs` SELECT — so a from-scratch re-fold reproduces the row byte-
- * deterministically. Mirrors {@link DispatchFailedPayload}'s pure-fold
- * shape.
- *
- * Why a typed value-carrying event over a generic `SettingChanged{key,value}`:
- * each future autopilot knob (concurrency caps, per-repo gates, stagger)
- * gets its own value-carrying event so per-knob invariants stay co-located
- * and validatable (planetgeek event-versioning playbook; epic spec).
+ * Pre-flattened `AutopilotPaused` synthetic event payload — the single boolean
+ * knob the autopilot worker reads. Pause/play round-trips through the
+ * `set_autopilot_paused` RPC → main, which appends one `AutopilotPaused` event;
+ * the reducer folds it into the singleton `autopilot_state.paused` column. The
+ * fold reads NOTHING outside the payload + the persisted row (uses `event.ts`
+ * for timestamps), so re-fold is byte-deterministic. Each autopilot knob gets
+ * its own value-carrying event so per-knob invariants stay co-located.
  */
 interface AutopilotPausedPayload {
   paused: boolean;
 }
 
 /**
- * Parse an `AutopilotPaused` event payload. Returns null on any structural
- * miss — {@link foldAutopilotPaused} folds null to a safe no-op (cursor
- * still advances). NEVER throws: per CLAUDE.md "a malformed `data` blob
- * skips/folds to a safe value", a throw inside the fold rolls back the
- * cursor and wedges the reducer.
- *
- * Strict typing: `paused` MUST be a literal boolean. We do NOT coerce
- * `0`/`1`, `"true"`/`"false"`, or `null`/`undefined` — the only legal
- * producers are main's `set_autopilot_paused` bridge (steady-state) and
- * the daemon's boot-append (boot re-arm), both of which emit a literal
- * `true`/`false`. Any other shape signals a corrupted producer and folds
- * to a safe no-op rather than a guessed value.
+ * Parse an `AutopilotPaused` event payload. Returns null on any structural miss
+ * ({@link foldAutopilotPaused} folds null to a safe no-op); NEVER throws.
+ * Strict: `paused` MUST be a literal boolean — no coercion of `0`/`1` /
+ * `"true"` / null, so a corrupted producer folds to a safe no-op.
  */
 function extractAutopilotPausedPayload(
   event: Event,
@@ -3955,26 +2961,11 @@ function extractAutopilotPausedPayload(
 }
 
 /**
- * Fold one synthetic `AutopilotPaused` event (fn-667). UPSERT on the
- * singleton `id = 1` — the first event INSERTs the row stamped
- * `created_at = event.ts`; subsequent events UPDATE `paused` /
- * `last_event_id` / `updated_at` and PRESERVE `created_at` (mirrors
- * {@link foldDispatchFailed}'s sticky-first-observation semantic).
- *
- * Pure function of the event payload + the persisted row:
- * - `paused` from the immutable event payload.
- * - `last_event_id` from `event.id`.
- * - `created_at` / `updated_at` from `event.ts` (the synthetic event's
- *   producer-side mint clock — for the boot-append, this is the boot
- *   instant; for a steady-state pause/play, this is the RPC service
- *   instant).
- *
- * No `Date.now()`, no env read, no `jobs` SELECT — all would break re-fold
- * determinism. Runs INSIDE the open `BEGIN IMMEDIATE` transaction opened
- * by {@link applyEvent}; performs zero cursor work (the surrounding
- * `applyEvent` advances the cursor).
- *
- * Malformed/missing payload → safe no-op; the cursor still advances.
+ * Fold one synthetic `AutopilotPaused` event. UPSERT on the singleton `id = 1`:
+ * the first event INSERTs the row stamped `created_at = event.ts`; subsequent
+ * events UPDATE `paused` and PRESERVE `created_at`. Pure function of the payload
+ * + the persisted row (uses `event.ts` for timestamps) — no `Date.now()`, no
+ * env read, no `jobs` SELECT. Malformed/missing payload → safe no-op.
  */
 function foldAutopilotPaused(db: Database, event: Event): void {
   const payload = extractAutopilotPausedPayload(event);
@@ -4054,24 +3045,13 @@ function extractAutopilotCapSetPayload(
 }
 
 /**
- * Fold one synthetic `AutopilotCapSet` event (fn-725). UPSERT on the singleton
- * `id = 1`, setting ONLY `max_concurrent_jobs` and PRESERVING `paused` on
- * conflict — symmetric to {@link foldAutopilotPaused}'s preservation of
- * `max_concurrent_jobs`. The two arms share `id = 1`, so each MUST preserve
- * the other's column or a toggle clobbers the sibling.
- *
- * The INSERT path (first-ever event on a fresh row) needs a `paused` value
- * (NOT NULL column) — bind `1` (paused), matching the boot-append ORDERING:
- * the daemon appends `AutopilotPaused{paused:true}` BEFORE `AutopilotCapSet`,
- * so the cap arm always hits the CONFLICT branch in practice and the INSERT
- * default is only a defensive fallback for a log that somehow carries a cap
- * event before any pause event (re-fold over such a log still converges:
- * paused boots true, matching autopilot's "boots paused" contract).
- *
- * Pure function of the event payload + persisted row — no `Date.now()`, no
- * env read, no `resolveConfig()`. Runs INSIDE the open `BEGIN IMMEDIATE`
- * transaction; performs zero cursor work. Malformed payload → unlimited
- * (NULL), never a throw — the cursor still advances.
+ * Fold one synthetic `AutopilotCapSet` event. UPSERT on the singleton `id = 1`,
+ * setting ONLY `max_concurrent_jobs` and PRESERVING `paused` on conflict — the
+ * arms share `id = 1`, so each MUST preserve the others' columns or a toggle
+ * clobbers a sibling. The INSERT path binds `paused = 1` (boots-paused
+ * contract), a defensive fallback since the boot-append orders `AutopilotPaused`
+ * first. Pure function of the payload + persisted row — no `Date.now()`, no env
+ * read. Malformed payload → unlimited (NULL), never a throw.
  */
 function foldAutopilotCapSet(db: Database, event: Event): void {
   const payload = extractAutopilotCapSetPayload(event);
@@ -4094,31 +3074,20 @@ function foldAutopilotCapSet(db: Database, event: Event): void {
 }
 
 /**
- * `AutopilotMode` synthetic-event payload (fn-751) — the explicit autopilot
- * mode enum that rides the SAME singleton `autopilot_state` row as `paused`
- * and `max_concurrent_jobs`. `yolo` (the backward-compatible default) works
- * every ready epic; `armed` works ONLY explicitly-armed epics plus their
- * transitive upstream dep-closure.
- *
- * `mode`: a literal `"yolo" | "armed"` enum. Like {@link AutopilotPausedPayload}
- * (and unlike the null-tolerant cap), a typed value-carrying event rather than
- * a generic `SettingChanged{key,value}` so the per-knob enum invariant stays
- * co-located and validatable.
+ * `AutopilotMode` synthetic-event payload — the explicit mode enum that rides
+ * the SAME singleton `autopilot_state` row as `paused` and `max_concurrent_jobs`.
+ * `yolo` (the default) works every ready epic; `armed` works ONLY armed epics
+ * plus their transitive upstream dep-closure.
  */
 interface AutopilotModePayload {
   mode: "yolo" | "armed";
 }
 
 /**
- * Parse an `AutopilotMode` event payload. Returns null on any structural miss
- * OR an unknown enum value — {@link foldAutopilotMode} folds null to a safe
- * no-op (cursor still advances; `mode` unchanged). STRICT, mirroring
- * {@link extractAutopilotPausedPayload}: `mode` MUST be exactly `"yolo"` or
- * `"armed"`. We do NOT coerce or guess — the only legal producers are main's
- * `set_autopilot_mode` bridge and the daemon's boot-append, both of which emit
- * a literal enum member. Any other shape signals a corrupted producer and
- * folds to a safe no-op rather than a guessed mode. NEVER throws (a throw
- * inside the fold rolls back the cursor and wedges the reducer).
+ * Parse an `AutopilotMode` event payload. Returns null on any structural miss OR
+ * an unknown enum value ({@link foldAutopilotMode} folds null to a safe no-op);
+ * NEVER throws. STRICT: `mode` MUST be exactly `"yolo"` or `"armed"` — no
+ * coercion, so a corrupted producer folds to a safe no-op.
  */
 function extractAutopilotModePayload(
   event: Event,
@@ -4141,25 +3110,13 @@ function extractAutopilotModePayload(
 }
 
 /**
- * Fold one synthetic `AutopilotMode` event (fn-751). UPSERT on the singleton
- * `id = 1`, setting ONLY `mode` and PRESERVING `paused` + `max_concurrent_jobs`
- * on conflict — the three arms ({@link foldAutopilotPaused},
- * {@link foldAutopilotCapSet}, this) share `id = 1`, so each MUST preserve the
- * others' columns or a write clobbers a sibling.
- *
- * The INSERT path (first-ever event on a fresh row) binds defaults for the
- * other NOT NULL columns — `paused = 1` (autopilot's boots-paused contract,
- * matching {@link foldAutopilotCapSet}'s INSERT default) and leaves
- * `max_concurrent_jobs` to its column default (NULL = unlimited). In practice
- * the daemon's boot-append orders `AutopilotPaused` FIRST, so this arm always
- * hits the CONFLICT branch; the INSERT defaults are a defensive fallback for a
- * log whose first autopilot_state event is a mode set (re-fold over such a log
- * still converges: paused boots true).
- *
- * Pure function of the event payload + persisted row — no `Date.now()`, no env
- * read. Runs INSIDE the open `BEGIN IMMEDIATE` transaction; performs zero
- * cursor work. Malformed/unknown-enum payload → safe no-op (mode unchanged),
- * never a throw — the cursor still advances.
+ * Fold one synthetic `AutopilotMode` event. UPSERT on the singleton `id = 1`,
+ * setting ONLY `mode` and PRESERVING `paused` + `max_concurrent_jobs` on
+ * conflict — the arms share `id = 1`, so each MUST preserve the others' columns.
+ * The INSERT path binds `paused = 1` (boots-paused contract), a defensive
+ * fallback since the boot-append orders `AutopilotPaused` first. Pure function
+ * of the payload + persisted row — no `Date.now()`, no env read.
+ * Malformed/unknown-enum payload → safe no-op, never a throw.
  */
 function foldAutopilotMode(db: Database, event: Event): void {
   const payload = extractAutopilotModePayload(event);
@@ -4183,14 +3140,9 @@ function foldAutopilotMode(db: Database, event: Event): void {
 }
 
 /**
- * `EpicArmed` synthetic-event payload (fn-751) — the per-epic armed flag that
- * folds into the `armed_epics` PRESENCE table (its OWN `event_type`, since
- * `armed_epics` is a separate per-row table from the `autopilot_state`
- * singleton). `armed:true` arms the epic (row PRESENT); `armed:false` disarms
- * it (row ABSENT).
- *
- * `epic_id`: a non-empty string. `armed`: a literal boolean (strict, mirroring
- * the paused extractor — no coercion).
+ * `EpicArmed` synthetic-event payload — the per-epic armed flag that folds into
+ * the `armed_epics` PRESENCE table. `armed:true` arms the epic (row PRESENT);
+ * `armed:false` disarms it (row ABSENT).
  */
 interface EpicArmedPayload {
   epic_id: string;
@@ -4226,23 +3178,12 @@ function extractEpicArmedPayload(event: Event): EpicArmedPayload | null {
 }
 
 /**
- * Fold one synthetic `EpicArmed` event (fn-751). `armed_epics` is a PRESENCE
- * table: a row's presence means the epic is armed, its absence means it is not.
- * `armed:true` → INSERT OR REPLACE the row (stamped `last_event_id` /
- * `created_at` / `updated_at` from the event); `armed:false` → DELETE the row.
- *
- * INSERT OR REPLACE (not UPSERT-preserving-created_at) is deliberate: a disarm
- * DELETEs the row, so a subsequent re-arm has no prior `created_at` to preserve
- * — the row's "since" is correctly the most-recent arm. A re-arm of an
- * already-armed epic (no intervening disarm) re-stamps `created_at` to the
- * latest arm event; this is re-fold-deterministic (a from-scratch re-drain
- * reproduces the same final stamp) and the table is a presence flag, not an
- * audit log, so the re-stamp is semantically fine.
- *
- * Pure function of the event payload — no `Date.now()`, no env read. Runs
- * INSIDE the open `BEGIN IMMEDIATE` transaction; performs zero cursor work.
- * Malformed payload → safe no-op (no row change), never a throw — the cursor
- * still advances.
+ * Fold one synthetic `EpicArmed` event into the `armed_epics` PRESENCE table.
+ * `armed:true` → INSERT OR REPLACE the row; `armed:false` → DELETE it. INSERT OR
+ * REPLACE (not UPSERT-preserving-created_at) is deliberate: a disarm DELETEs the
+ * row, so a re-arm's "since" is correctly the most-recent arm — re-fold-
+ * deterministic for a presence flag (not an audit log). Pure function of the
+ * payload — no `Date.now()`, no env read. Malformed payload → safe no-op.
  */
 function foldEpicArmed(db: Database, event: Event): void {
   const payload = extractEpicArmedPayload(event);
@@ -4271,17 +3212,12 @@ function foldEpicArmed(db: Database, event: Event): void {
  *
  * Closes the lifecycle gap for orphaned subagents whose parent session died
  * before the matching SubagentStop landed: a `running` row whose job is now
- * `'ended'` or `'killed'` will never close on its own, so we flip its status
- * to the indeterminate-outcome sentinel `'unknown'`. `duration_ms` stays
- * NULL — the row truly has no known close time. The terminal-status guard in
- * {@link projectSubagentInvocationsRow}'s SubagentStop / PostToolUse arms
- * carves out `'unknown'`, so a late close after the sweep cannot revive the
- * row to `'ok'`.
- *
- * Bulk UPDATE (not a per-row loop) so the sweep is a single SQL statement and
- * never throws inside the open transaction (CLAUDE.md fold invariant — a
- * throw rolls back the cursor and wedges the reducer). Matches zero rows in
- * the common case where every subagent already closed cleanly.
+ * `'ended'` / `'killed'` will never close on its own, so flip its status to the
+ * indeterminate sentinel `'unknown'` (`duration_ms` stays NULL). The
+ * terminal-status guard in the SubagentStop / PostToolUse arms carves out
+ * `'unknown'`, so a late close can't revive the row to `'ok'`. Bulk UPDATE (one
+ * statement, never throws); matches zero rows when every subagent closed
+ * cleanly.
  */
 function sweepRunningSubagentsToUnknown(
   db: Database,
@@ -4299,52 +3235,29 @@ function sweepRunningSubagentsToUnknown(
 }
 
 /**
- * Apply the `subagent_invocations` projection for one event. Runs INSIDE the
- * open transaction opened by {@link applyEvent}; performs zero cursor work.
+ * Apply the `subagent_invocations` projection for one event. Four event shapes
+ * feed it:
  *
- * Wires the parser-port from `src/subagent-invocations.ts` into the per-event
- * reducer. Four event shapes feed this projection:
+ * - `SubagentStart` opens a new turn-N row for `(job_id, agent_id)` with
+ *   `status='running'`, `subagent_type` seeded from `event.agent_type`.
+ * - `SubagentStop` closes the latest open turn — `duration_ms = round((event.ts
+ *   - row.ts) * 1000)` (events.ts is REAL seconds), `status='ok'` unless already
+ *   terminal. Gates on `duration_ms IS NULL` ALONE — never also on
+ *   `status='running'`, because PostToolUse:Agent legitimately flips status to
+ *   `'ok'` BEFORE SubagentStop lands for Task calls (Anthropic-confirmed).
+ * - `PostToolUse` (`tool_name='Agent'`) resolves the `(session_id, tool_use_id)`
+ *   bridge to an `agent_id`, folds PreToolUse metadata onto the turn-0 row
+ *   (PreToolUse-wins precedence), then marks earlier-spawned same-`(job_id,
+ *   subagent_type)` `running` rows `'superseded'` (narrow `row.ts <
+ *   currentRow.ts` gate quarantines the parallel-same-type false-positive).
+ * - `PostToolUseFailure` (`tool_name='Agent'`) resolves the bridge `agent_id`
+ *   from the indexed column (the failure path carries no `tool_response.agentId`)
+ *   and UPDATEs a matching turn-0 row to `'failed'` — no terminal guard, the
+ *   failure signal always wins. Orphan failures are a safe no-op.
  *
- * - `SubagentStart` opens a new turn-N row for the `(job_id, agent_id)` pair
- *   with `status='running'`, `duration_ms=NULL`, `subagent_type` seeded from
- *   `event.agent_type` (NULL when absent — PreToolUse-wins precedence applies
- *   later on the PostToolUse:Agent fold).
- * - `SubagentStop` closes the latest open turn for the pair — UPDATE sets
- *   `duration_ms = round((event.ts - row.ts) * 1000)` (events.ts is REAL
- *   seconds, duration_ms is integer ms — matches Python's `int(float(ts_raw)
- *   * 1000)` convention). Sets `status='ok'` unless already terminal
- *   (`failed` / `unknown` / `superseded`). Gates on `duration_ms IS NULL`
- *   ALONE — never also on `status='running'`; PostToolUse:Agent legitimately
- *   flips status to `'ok'` BEFORE SubagentStop lands for Task calls
- *   (Anthropic-confirmed; fn-480).
- * - `PostToolUse` with `tool_name='Agent'` resolves the `(session_id,
- *   tool_use_id)` bridge to an `agent_id` via {@link resolveBridgeAgentId},
- *   then folds PreToolUse metadata (description, prompt_chars, subagent_type)
- *   onto the turn-0 row via the PreToolUse-wins precedence rule (a non-empty
- *   PreToolUse `subagent_type` overwrites the SubagentStart seed; an empty
- *   value leaves the seed in place). Once `subagent_type` is authoritative,
- *   scans for OTHER same-`(job_id, subagent_type)` rows still `status='running'`
- *   with a strictly earlier spawn ts and marks them `status='superseded'`
- *   in the same transaction (the v1 supersession rule — narrow gate on
- *   `row.ts < currentRow.ts` keeps the known-limitation false-positive of
- *   genuine parallel same-type spawns documented but quarantined).
- * - `PostToolUseFailure` with `tool_name='Agent'` resolves the bridge
- *   `agent_id` from the indexed `subagent_agent_id` column (the failure
- *   path carries no `tool_response.agentId`, so the column is the only
- *   reliable signal). When a matching turn-0 row exists, UPDATEs its
- *   status to `'failed'`. No terminal-status guard — the failure signal is
- *   the most authoritative lifecycle outcome we can observe and always
- *   wins. Orphan failures (no matching row) are a safe no-op.
- *
- * Outside this function: SessionEnd and Killed lifecycle events sweep open
- * `status='running'` rows for the job to `status='unknown'` via
- * {@link sweepRunningSubagentsToUnknown}, fired from {@link projectJobsRow}
- * on the proven write path inside the same `BEGIN IMMEDIATE` transaction.
- *
- * **Never throws inside the transaction** — a throw rolls back the cursor
- * and wedges the reducer. Every arm guards lookups and returns silently on
- * the safe-default branch (orphan stops, malformed data, missing bridge, no
- * turn-0 row, etc.). The cursor still advances upstream.
+ * SessionEnd / Killed sweep open `running` rows to `'unknown'` via
+ * {@link sweepRunningSubagentsToUnknown} elsewhere. NEVER throws — every arm
+ * returns silently on the safe-default branch.
  */
 function projectSubagentInvocationsRow(db: Database, event: Event): void {
   const ts = event.ts;
@@ -4645,8 +3558,7 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
  * The shape of an `EmbeddedJob` element stored inside an `epics.jobs` array
  * (epic-level: verbs `plan` / `close`) or a task element's nested `jobs`
  * sub-array (task-level: verb `work`). Mirrors {@link import("./types").EmbeddedJob}
- * field-for-field — the wire boundary decodes the JSON-TEXT column into a
- * real array via the same field order so this serializes byte-identically.
+ * field-for-field so this serializes byte-identically.
  */
 interface EmbeddedJobElement {
   job_id: string;
@@ -4660,77 +3572,40 @@ interface EmbeddedJobElement {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
-  // Schema v52 / fn-686: paired permission-prompt / elicitation
-  // annotation. NULL on every entry that has never hit a
-  // `Notification:permission_prompt` / `Notification:elicitation_dialog`
-  // (the common case). Paired-NULL with `last_permission_prompt_kind`;
-  // see {@link import("./types").JobLinkEntry}'s paired-NULL invariant.
+  // Paired-NULL with `last_permission_prompt_kind` (move both together — write
+  // both or clear both).
   last_permission_prompt_at: number | null;
   last_permission_prompt_kind: string | null;
-  // Schema v28: per-job dirty-file count. INTEGER NOT NULL DEFAULT 0 on the
-  // underlying `jobs` row, so the read-side mirror is plain `number` (never
-  // null). Drives the readiness pipeline's `git-uncommitted` predicate via
-  // the embedded array on the parent task / epic element.
+  // Drives the readiness pipeline's `git-uncommitted` predicate.
   git_dirty_count: number;
-  // Schema v31: renamed from the legacy v28 `git_orphan_count`. Same
-  // numeric value, same fold, same zero-event reading; the rename carries
-  // through every embedded array via `buildEmbeddedJob`. Drives the
-  // readiness pipeline's `git-orphans` predicate after fn-633.6 flips the
-  // consumer.
+  // Drives the readiness pipeline's `git-orphans` predicate.
   git_unattributed_to_live_count: number;
-  // Schema v31: NEW column for the strict-mystery semantic (files with no
-  // attribution from any session). Reads 0 on every entry until the
-  // reducer fold rewrite in fn-633.6 lands. INTEGER NOT NULL DEFAULT 0.
+  // Strict-mystery semantic: files with no attribution from any session.
   git_orphan_count: number;
   /**
-   * Schema v49 / fn-670 (T2): the per-(task, job) task→committing-session
-   * link. Stamped by {@link foldCommit} on the embedded job element whose
-   * `job_id == committer_session_id` under the task element matching each
-   * id in the `Commit` payload's `task_ids[]`. Producer-time frozen
-   * `committed_at_ms / 1000` (mirroring the existing discharge timestamp
-   * conversion). `null` on every job that has not yet committed for this
-   * task (the common steady-state read) AND on every pre-v49 stored
-   * element (re-fold determinism — re-fold over the historical event log
-   * leaves the field absent → JSON-decode reads `undefined` → coerced to
-   * `null` by {@link buildEmbeddedJob}'s preservation slot).
+   * Per-(task, job) task→committing-session link, stamped by {@link foldCommit}
+   * on the embedded element whose `job_id == committer_session_id`. `null` on
+   * every job that hasn't committed for this task and on every older stored
+   * element. Lives on the JSON-TEXT `jobs` cell; no real column.
    *
-   * Lives on the JSON-TEXT `jobs` cell on `epics` (kind === "task" path
-   * inside the parent epic's `tasks[].jobs[]`); NO new real column. The
-   * v48→v49 bump is whitelist-only.
-   *
-   * **Clobber guard:** this field is a Commit-event fact, NOT a jobs-row
-   * fact, so {@link buildEmbeddedJob} reads it BACK from the prior
-   * embedded element (the OLD-element carve-out spread pattern) — a
-   * later job-tick re-sync via {@link syncJobIntoEpic} MUST preserve it.
-   * The consumer (planctl `pick_target_job`) prefers the job with the
-   * freshest commit-for-this-task, falling back to freshest-claim when
-   * no job committed.
+   * CLOBBER GUARD: a Commit-event fact, NOT a jobs-row fact, so
+   * {@link buildEmbeddedJob} reads it BACK from the prior embedded element (the
+   * OLD-element carve-out) — a later job-tick re-sync MUST preserve it.
    */
   last_commit_for_task_at?: number | null;
   /**
-   * Schema v59 / fn-719 (task 1): the provenance-filtered live-worker-
-   * monitor occupancy fact for THIS session, derived from `jobs.monitors`
-   * by {@link hasLiveWorkerMonitor} (`true` iff a `monitor`/`bash-bg`
-   * entry is present — `ambient` watchers never count). Readiness (task 2)
-   * reads it off the embedded job to hold the per-epic / per-root mutex
-   * while a work session's backgrounded suite is still running, so the
-   * closer/approve cannot dispatch into a not-actually-idle session.
+   * Provenance-filtered live-worker-monitor occupancy fact for THIS session,
+   * derived from `jobs.monitors` by {@link hasLiveWorkerMonitor}. Readiness
+   * reads it to hold the per-epic / per-root mutex while a work session's
+   * backgrounded suite is still running. Lives FREE on the JSON-TEXT `jobs`
+   * cell; no real column.
    *
-   * Lives FREE on the JSON-TEXT `jobs` cell on `epics` (the `kind ===
-   * "task"` path inside `tasks[].jobs[]`); NO new real column. The v58→v59
-   * bump is whitelist-only (mirrors the v48→v49 / fn-670 T2 template).
-   *
-   * **Stop-event fact, NOT a jobs-row field.** It's stamped at the Stop
-   * fold's monitors-write site (the only seam that refreshes
-   * `jobs.monitors`), and the monitors-only write does NOT always run
-   * {@link syncJobIntoEpic} (the sub-agent-guard-swallow path skips the
-   * state UPDATE + its `syncIfPlanRef`). So {@link buildEmbeddedJob} lifts
-   * the field forward off the PRIOR embedded element (the OLD-element
-   * carve-out — exactly like `last_commit_for_task_at`): a later job-tick
-   * re-sync MUST preserve it rather than clobber it with a stale default.
-   * Optional + nullish-coalesced to `false` so a pre-v59 stored element
-   * (decoded from JSON-TEXT, field absent → `undefined`) round-trips
-   * byte-deterministically across a re-fold.
+   * CLOBBER GUARD: a Stop-event fact, NOT a jobs-row field — stamped at the
+   * Stop fold's monitors-write site, which doesn't always run
+   * {@link syncJobIntoEpic} (the sub-agent-guard-swallow path skips it). So
+   * {@link buildEmbeddedJob} lifts it forward off the PRIOR embedded element
+   * (like `last_commit_for_task_at`). Optional + coalesced to `false` so an
+   * older stored element round-trips deterministically.
    */
   has_live_worker_monitor?: boolean;
 }
@@ -4738,12 +3613,8 @@ interface EmbeddedJobElement {
 /**
  * The shape of the post-write `jobs` row {@link syncJobIntoEpic} reads back to
  * build the embedded element. Mirrors the relevant subset of {@link import("./types").Job}.
- *
- * Schema-v28: `git_dirty_count` + `git_orphan_count` are required on this
- * input shape so TypeScript surfaces any caller of `syncJobIntoEpic` (via
- * the `syncIfPlanRef` SELECT path) that forgets to project them out of
- * `jobs`. The defaults are `0` on a never-snapshotted row, but the type is
- * `number` (not `number | null`) because the column is `NOT NULL DEFAULT 0`.
+ * The git count fields are required (not nullable) so TypeScript surfaces any
+ * caller that forgets to project them out of `jobs`.
  */
 interface JobsRowForSync {
   job_id: string;
@@ -4758,11 +3629,8 @@ interface JobsRowForSync {
   last_api_error_kind: string | null;
   last_input_request_at: number | null;
   last_input_request_kind: string | null;
-  // Schema v52 / fn-686: paired permission-prompt / elicitation
-  // annotation. Required on this input shape so TypeScript surfaces any
-  // caller of `syncJobIntoEpic` (via the `syncIfPlanRef` SELECT path)
-  // that forgets to project them out of `jobs`. NULL on every never-
-  // prompted row (the steady-state zero-event reading).
+  // Paired-NULL with `last_permission_prompt_kind`; required on this input
+  // shape so a caller that forgets to project them is surfaced by TypeScript.
   last_permission_prompt_at: number | null;
   last_permission_prompt_kind: string | null;
   git_dirty_count: number;
@@ -4814,39 +3682,21 @@ function sortEmbeddedJobs(jobs: EmbeddedJobElement[]): void {
 }
 
 /**
- * Build an {@link EmbeddedJobElement} from a post-write `jobs` row. The
- * `plan_verb` field is non-null by construction — the caller short-circuits
- * via `parsePlanRef` before invoking this on a row whose `plan_verb` is null
- * (a job carrying `plan_ref` always carries `plan_verb`, set-once at
- * SessionStart together).
- *
- * Schema v49 / fn-670 (T2): `last_commit_for_task_at` is a Commit-event
- * fact, NOT a jobs-row fact — it lives on the embedded element solely
- * via {@link foldCommit}'s write site. To prevent a later job-tick
- * re-sync from clobbering it, the caller passes the PRIOR embedded
- * element (the OLD-element carve-out — the same pattern
- * {@link syncJobIntoEpic}'s task-side spread uses for `worker_phase` /
- * `runtime_status` / `tier`) and this builder lifts the field forward
- * deterministically. A missing prior (first-sight job, never-committed
- * job) yields `null`; an undefined-on-prior (pre-v49 stored element)
- * also coerces to `null`. Re-fold determinism holds: the lift is a pure
- * function of the prior element + the jobs row.
+ * Build an {@link EmbeddedJobElement} from a post-write `jobs` row. `plan_verb`
+ * is non-null by construction (the caller short-circuits via `parsePlanRef`).
+ * `last_commit_for_task_at` / `has_live_worker_monitor` are event-facts lifted
+ * forward from the PRIOR embedded element (the OLD-element carve-out) so a
+ * later job-tick re-sync doesn't clobber them — a pure function of the prior +
+ * the jobs row, byte-deterministic.
  */
 function buildEmbeddedJob(
   row: JobsRowForSync,
   prior?: EmbeddedJobElement | undefined,
 ): EmbeddedJobElement {
-  // v49 / fn-670: preserve the Commit-event fact across a jobs-row
-  // re-sync. `prior == null` (first-sight under this task / epic) →
-  // null. `prior?.last_commit_for_task_at` may be `undefined` on a
-  // pre-v49 stored element decoded from JSON-TEXT; nullish-coalesce to
-  // `null` so the field round-trips byte-deterministically.
+  // Preserve the event-facts across a jobs-row re-sync; coalesce the older
+  // stored element's absent field to the zero-event default for a
+  // byte-deterministic round-trip.
   const lastCommitForTaskAt = prior?.last_commit_for_task_at ?? null;
-  // v59 / fn-719 (task 1): preserve the Stop-event monitor-occupancy fact
-  // across a jobs-row re-sync — same carve-out as `last_commit_for_task_at`.
-  // `prior == null` (first-sight) → false; `prior?.has_live_worker_monitor`
-  // may be `undefined` on a pre-v59 stored element decoded from JSON-TEXT,
-  // so nullish-coalesce to `false` for byte-deterministic round-trip.
   const hasLiveWorkerMonitor = prior?.has_live_worker_monitor ?? false;
   return {
     job_id: row.job_id,
@@ -4872,31 +3722,19 @@ function buildEmbeddedJob(
 
 /**
  * Fan a `jobs` row write into the correct embedded array on the `epics`
- * projection. Runs INSIDE the open transaction opened by {@link applyEvent};
- * performs zero cursor work.
+ * projection.
  *
- * - `plan_ref == null` → no-op (this isn't a planctl-spawned session).
- * - `plan_ref` parses to `{kind: 'epic', epic_id}` (verbs `plan` / `close`) →
- *   read-modify-write the parent epic's `epics.jobs` array.
- * - `plan_ref` parses to `{kind: 'task', epic_id, task_id}` (verb `work`) →
- *   read-modify-write the corresponding task element's nested `jobs`
+ * - `plan_ref == null` or shape mismatch → no-op.
+ * - `{kind: 'epic'}` (verbs `plan` / `close`) → RMW the parent epic's
+ *   `epics.jobs` array.
+ * - `{kind: 'task'}` (verb `work`) → RMW the task element's nested `jobs`
  *   sub-array inside the parent epic's `tasks`.
- * - `plan_ref` shape mismatch → null parse → no-op, cursor still advances.
  *
- * Shell-row pattern: when the parent epic (or for task-level, the parent
- * task element) does not yet exist, insert a shell row / shell task element
- * carrying just the one new entry. Subsequent `EpicSnapshot` / `TaskSnapshot`
- * folds preserve the embedded `jobs` arrays — the EpicSnapshot ON CONFLICT
- * carve-out omits `jobs`, and the TaskSnapshot RMW reads the OLD element's
- * `jobs` before re-placing.
- *
- * Every write bumps the epic's `last_event_id` to `eventId` so the per-row
- * diff fires (the read surface emits a `patch` on the epic, regardless of
- * which nested array changed). The sort `(created_at desc, job_id asc)` is
- * applied on every write — never append — for byte-identical re-fold.
- *
- * NEVER throws inside the open transaction. A malformed stored array folds
- * to `[]`; an absent epic row folds to a fresh shell.
+ * Shell-row pattern: when the parent epic / task element doesn't yet exist,
+ * insert a shell carrying just the one entry; later snapshot folds preserve the
+ * embedded `jobs` arrays. The sort `(created_at desc, job_id asc)` is applied on
+ * every write — never append — for byte-identical re-fold. NEVER throws; a
+ * malformed stored array folds to `[]`.
  */
 function syncJobIntoEpic(
   db: Database,
@@ -4917,13 +3755,9 @@ function syncJobIntoEpic(
       .query("SELECT jobs FROM epics WHERE epic_id = ?")
       .get(parsed.epic_id) as { jobs: string | null } | null;
     const existing = parseEmbeddedJobs(epicRow?.jobs);
-    // v49 / fn-670 (T2): pass the PRIOR embedded element (if any) into
-    // buildEmbeddedJob so the Commit-event-fed `last_commit_for_task_at`
-    // field survives this re-sync. For kind === "epic" (verbs plan /
-    // close) the field is conceptually irrelevant (closer/planner
-    // sessions are not task-bound), but the carve-out preserves any
-    // existing value byte-deterministically — re-fold determinism is
-    // the invariant, not a per-verb pretty-printing.
+    // Pass the PRIOR embedded element into buildEmbeddedJob so its event-facts
+    // survive this re-sync byte-deterministically (irrelevant for plan/close
+    // verbs, but re-fold determinism is the invariant).
     const priorEpicSide = existing.find((j) => j.job_id === jobsRow.job_id);
     const element = buildEmbeddedJob(jobsRow, priorEpicSide);
     const next = existing.filter((j) => j.job_id !== element.job_id);
@@ -4936,16 +3770,11 @@ function syncJobIntoEpic(
         [jobsJson, eventId, ts, parsed.epic_id],
       );
     } else {
-      // No epic row yet — insert a shell row carrying just this new jobs
-      // entry. A later EpicSnapshot fills the scalars without clobbering
-      // `jobs` (its ON CONFLICT omits the column). Mirror the
-      // shell-row INSERT pattern from `projectPlanRow`.
-      // Schema v53 (fn-688): routed through the shared tombstone-checking
-      // helper — this is the canonical "job-before-epic" vector for the
-      // ghost-row bug (a terminal `approve`/`SessionEnd` whose
-      // `plan_ref` still names the deleted epic). Suppressed when the
-      // epic is tombstoned; never-deleted epics still get their legit
-      // before-arrival shell.
+      // No epic row yet — insert a shell row carrying just this jobs entry. A
+      // later EpicSnapshot fills the scalars without clobbering `jobs`. Routed
+      // through the tombstone-checking helper — the canonical "job-before-epic"
+      // ghost-row vector (a terminal write whose `plan_ref` still names a
+      // deleted epic); suppressed when tombstoned.
       insertEpicShellIfNotTombstoned(
         db,
         parsed.epic_id,
@@ -4963,12 +3792,10 @@ function syncJobIntoEpic(
     .query("SELECT tasks FROM epics WHERE epic_id = ?")
     .get(parsed.epic_id) as { tasks: string | null } | null;
 
-  // The full task element shape we read+write. The plan-fold's element
-  // already carries all these fields; a shell task element initialises the
-  // scalar columns to NULL / the planctl `"todo"` default. The SLOT ORDER
-  // MUST match `projectPlanRow`'s embedded `element` shape AND
-  // `seedFromDb`'s reconstruction in `plan-worker.ts` (the change-gate
-  // `JSON.stringify` byte-compare is the parity check; see schema v19 note).
+  // The full task element shape we read+write. The SLOT ORDER MUST match
+  // `projectPlanRow`'s embedded `element` shape AND `seedFromDb`'s
+  // reconstruction in `plan-worker.ts` (the change-gate `JSON.stringify`
+  // byte-compare is the parity check).
   interface TaskElement {
     task_id: string;
     epic_id: string | null;
@@ -4976,12 +3803,9 @@ function syncJobIntoEpic(
     title: string | null;
     target_repo: string | null;
     /**
-     * Planctl-native effort tier (fn-602). Optional on the type because pre-
-     * fn-602 stored elements lack the key; the OLD-element carve-out spread
-     * below preserves whatever value (or absence) was already there. A shell
-     * element from this fan-out initialises `tier: null` (matches the zero-
-     * event projection) — a later plan-snapshot fold fills it without
-     * clobbering jobs via the same spread-carve-out as the other scalars.
+     * Planctl-native effort tier. Optional because older stored elements lack
+     * the key; the OLD-element carve-out spread below preserves whatever was
+     * there. A shell element initialises `tier: null`.
      */
     tier?: string | null;
     worker_phase: string | null;
@@ -5002,32 +3826,26 @@ function syncJobIntoEpic(
     }
   }
 
-  // Find-or-shell the task element. A first-sight task element shells with
-  // scalar columns NULL — a later TaskSnapshot fills them without clobbering
-  // the `jobs` sub-array (the RMW preserves the OLD element's `jobs`).
+  // Find-or-shell the task element. A first-sight shell has scalar columns NULL
+  // — a later TaskSnapshot fills them without clobbering the `jobs` sub-array.
   const oldTask = tasksArr.find((t) => t.task_id === parsed.task_id);
   const oldJobs =
     oldTask != null && Array.isArray(oldTask.jobs) ? oldTask.jobs : [];
-  // v49 / fn-670 (T2): pass the PRIOR embedded element (if any, matched
-  // by job_id under this task) into buildEmbeddedJob so a job-tick
-  // re-sync preserves the Commit-event-fed `last_commit_for_task_at`.
-  // This is THE task-level clobber guard — without it, every jobs-row
-  // write would zero the link the consumer (`pick_target_job`) relies
-  // on. NOT bumped to the latest-jobs-row-derived value because the
-  // link is a per-(task, job) commit FACT, not a derivable jobs-row
-  // axis.
+  // Pass the PRIOR embedded element into buildEmbeddedJob so a job-tick re-sync
+  // preserves the Commit-event link `last_commit_for_task_at` — THE task-level
+  // clobber guard; without it every jobs-row write would zero the link
+  // `pick_target_job` relies on.
   const priorTaskSide = oldJobs.find((j) => j.job_id === jobsRow.job_id);
   const element = buildEmbeddedJob(jobsRow, priorTaskSide);
   const nextTaskJobs = oldJobs.filter((j) => j.job_id !== element.job_id);
   nextTaskJobs.push(element);
   sortEmbeddedJobs(nextTaskJobs);
 
-  // OLD-element carve-out: when an OLD task element exists, preserve ALL of
-  // its scalar fields (including the new `worker_phase` + `runtime_status`)
-  // by spreading and re-attaching only the freshly-merged `jobs` sub-array.
-  // The spread is the carve-out — a jobs-write fan-out MUST NOT clobber the
-  // plan-snapshot-derived fields, or every job tick would stomp the task-
-  // status pills with stale snapshot values (CLAUDE.md §Acceptance bullet).
+  // OLD-element carve-out: when an OLD task element exists, preserve ALL its
+  // scalar fields by spreading and re-attaching only the merged `jobs`
+  // sub-array — a jobs-write fan-out MUST NOT clobber the plan-snapshot-derived
+  // fields, or every job tick would stomp the task-status pills with stale
+  // snapshot values.
   const newTaskElement: TaskElement =
     oldTask != null
       ? { ...oldTask, jobs: nextTaskJobs }
@@ -5037,23 +3855,17 @@ function syncJobIntoEpic(
           task_number: null,
           title: null,
           target_repo: null,
-          // Planctl-native effort tier (fn-602): shell elements know
-          // nothing about it — a later plan-snapshot fold fills it via the
-          // OLD-element carve-out spread above (`{...oldTask, jobs: ...}`)
-          // without clobbering the new `jobs` sub-array.
           tier: null,
           worker_phase: null,
-          // A shell task element (no plan-snapshot folded yet) gets the
-          // planctl `"todo"` default, matching the zero-event projection
-          // and `merge_task_state` convention.
+          // Shell element gets the planctl `"todo"` default (zero-event
+          // projection / `merge_task_state` convention).
           runtime_status: "todo",
           depends_on: [],
           jobs: nextTaskJobs,
         };
 
-  // Replace-or-insert the task element by task_id, then re-sort by
-  // (task_number, task_id) — the SAME deterministic key the plan fold +
-  // migration backfill use.
+  // Replace-or-insert by task_id, then re-sort by the same (task_number,
+  // task_id) key the plan fold uses.
   const nextTasks: TaskElement[] = tasksArr.filter(
     (t) => t.task_id !== parsed.task_id,
   );
@@ -5096,32 +3908,17 @@ function syncJobIntoEpic(
 
 /**
  * Read the post-write `jobs` row and fan into:
+ *   (1) the embedded `epics.jobs` / task `jobs` sub-arrays via
+ *       {@link syncJobIntoEpic} — gated on `plan_ref != null`.
+ *   (2) every linked epic's `epics.job_links` entries via
+ *       {@link syncJobLinksOnJobWrite} — gated on `epic_links != '[]'`,
+ *       INDEPENDENT of `plan_ref` (a manual session can still carry a
+ *       creator/refiner edge from `planctl epic-create`).
  *
- * (1) the embedded `epics.jobs` / task `jobs` sub-arrays via
- *     {@link syncJobIntoEpic} — gated on `plan_ref != null` (the
- *     `EmbeddedJob` slot is keyed off the session's spawn-name verb).
- * (2) every linked epic's `epics.job_links` enriched entries via
- *     {@link syncJobLinksOnJobWrite} — gated on `epic_links != '[]'`
- *     (the link projection is keyed off the session's planctl-CLI
- *     footprint, which is INDEPENDENT of `plan_ref`: an arthack-driven
- *     manual session with `plan_ref = null` can still carry a creator
- *     or refiner edge from `planctl epic-create` etc.).
- *
- * The SELECT lives here (not at each call site) so the fan-out reads
- * the LATEST state-machine state — e.g. a SessionEnd handler's UPDATE
- * flips `state` to `ended` first, then this SELECT picks up the new
- * state and BOTH fan-outs see the updated `state` value in lockstep.
- *
- * Runs INSIDE the open transaction opened by {@link applyEvent}. The
- * caller MUST gate on "an UPDATE/INSERT actually wrote" before invoking
- * — the Killed-mismatch path (no write happened) must NOT fire either
- * fan-out. See the per-call-site comments in {@link projectJobsRow}.
- *
- * The two fan-outs have DISJOINT gates (`plan_ref` vs `epic_links`) but
- * SHARE the trigger condition ("a jobs row was just written that may
- * have changed display fields"), so co-locating their wiring here keeps
- * every call site one line and ensures neither fan-out is silently
- * forgotten when a new jobs-write branch lands.
+ * The SELECT lives here (not at each call site) so both fan-outs read the
+ * LATEST state-machine state in lockstep. The caller MUST gate on "an
+ * UPDATE/INSERT actually wrote" — the Killed-mismatch path must NOT fire either
+ * fan-out.
  */
 function syncIfPlanRef(
   db: Database,
@@ -5140,12 +3937,10 @@ function syncIfPlanRef(
   if (row.plan_ref != null) {
     syncJobIntoEpic(db, row, eventId, ts);
   }
-  // Independent gate: `syncJobLinksOnJobWrite` reads `jobs.epic_links`
-  // and short-circuits on `'[]'` itself, so it's cheap to always call —
-  // and gating it on `plan_ref != null` here would silently miss
-  // creator/refiner sessions whose spawn name didn't parse as
-  // `{plan|work|close|approve}::<ref>` (e.g. arthack manual sessions running
-  // `planctl epic-create` outside the planctl spawn whitelist).
+  // Always call: `syncJobLinksOnJobWrite` short-circuits on `'[]'` itself, and
+  // gating on `plan_ref != null` would miss creator/refiner sessions whose
+  // spawn name didn't parse as a planctl verb (e.g. a manual `planctl
+  // epic-create`).
   syncJobLinksOnJobWrite(db, jobId, eventId, ts);
 }
 
@@ -5173,15 +3968,9 @@ function parseEmbeddedLinks<T extends EpicLink | JobLink>(
 }
 
 /**
- * Deterministic sort for an embedded `epic_links` array (used on
- * `jobs.epic_links`). Total-order ASC on the full `(kind, target)` tuple —
- * mirrors the classifier's final sort. The classifier already sorts its
- * output, but the fold also re-applies here so any future read-side mutation
- * stays deterministic. Parallel to {@link sortEmbeddedJobs}.
- *
- * Why total-order: a single-field sort would leave equal-`kind` ties (two
- * creators, two refiners) in implementation-defined order, breaking the
- * byte-identical re-fold invariant.
+ * Deterministic sort for an embedded `epic_links` array. Total-order ASC on the
+ * full `(kind, target)` tuple — a single-field sort would leave equal-`kind`
+ * ties in implementation-defined order, breaking byte-identical re-fold.
  */
 function sortEpicLinks(links: EpicLink[]): void {
   links.sort((a, b) => {
@@ -5194,15 +3983,9 @@ function sortEpicLinks(links: EpicLink[]): void {
 }
 
 /**
- * Deterministic sort for an embedded `job_links` array (used on
- * `epics.job_links`). Total-order ASC on the full `(kind, job_id)` tuple —
- * mirrors the classifier's final sort. Parallel to {@link sortEpicLinks}.
- *
- * Accepts any object with `{kind, job_id}` so both the thin classifier
- * shape ({@link JobLink}) and the enriched projection shape
- * ({@link JobLinkEntry}) sort through the same code path — re-fold
- * determinism is a function of the SORT order alone, not the carried
- * fields, so a single sort with one widened parameter is correct.
+ * Deterministic sort for an embedded `job_links` array. Total-order ASC on the
+ * full `(kind, job_id)` tuple. Accepts any `{kind, job_id}` so both the thin
+ * classifier shape and the enriched projection shape sort through the same path.
  */
 function sortJobLinks(
   links: { kind: "creator" | "refiner"; job_id: string }[],
@@ -5217,37 +4000,16 @@ function sortJobLinks(
 }
 
 /**
- * Enrich a thin classifier-output `JobLink` (`{kind, job_id}`) into the
- * widened `JobLinkEntry` projection shape carried on `epics.job_links`
- * — adding `(title, state, last_api_error_at, last_api_error_kind)` read
- * directly off the post-write `jobs` row.
+ * Enrich a thin classifier-output `JobLink` (`{kind, job_id}`) into the widened
+ * `JobLinkEntry` shape carried on `epics.job_links`, adding the display +
+ * annotation fields off the post-write `jobs` row. Shared between
+ * `syncPlanctlLinks` and `syncJobLinksOnJobWrite` so both produce identical JSON.
  *
- * Shared between the live reducer fan-out (`syncPlanctlLinks`) and the
- * jobs-write fan-out (`syncJobLinksOnJobWrite`). SAME code path, SAME
- * defaults — different code paths producing the same JSON is the
- * classic silent re-fold-determinism break this helper exists to
- * prevent.
- *
- * **Defaults on a missing `jobs` row.** Returns
- * `{kind, job_id, title: null, state: "stopped", last_api_error_at: null,
- * last_api_error_kind: null}` — the zero-event projection reading. The
- * two api-error columns are emitted as explicit JSON nulls (NOT
- * omitted): omitting keys vs. emitting nulls produces different
- * `JSON.stringify` bytes and would break the byte-identical re-fold
- * contract. This matches the scenario where the classifier emitted an
- * edge for a session whose backing `jobs` row was never inserted (orphan
- * planctl invocation: no SessionStart), and preserves re-fold
- * determinism (a from-scratch re-fold sees the same missing row at the
- * same enrichment point and writes the same defaults).
- *
- * **Key order is locked.** Both branches emit
- * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind}`
- * in that exact order; the wire encoding is `JSON.stringify`, which
- * preserves insertion order, so any drift between branches would
- * produce different bytes for the same logical entry — a silent
- * re-fold-determinism break.
- *
- * NEVER throws inside the open BEGIN IMMEDIATE transaction.
+ * On a missing `jobs` row, returns the zero-event defaults with the api-error
+ * columns as explicit JSON nulls (NOT omitted) — omitting keys vs. emitting
+ * nulls produces different `JSON.stringify` bytes. KEY ORDER IS LOCKED for the
+ * same reason: any drift between branches breaks byte-identical re-fold. NEVER
+ * throws inside the transaction.
  */
 function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
   const row = db
@@ -5293,48 +4055,19 @@ function enrichJobLink(db: Database, classifierEntry: JobLink): JobLinkEntry {
 }
 
 /**
- * Reverse fan-out from a jobs-write that may have changed `title` /
- * `state` / `last_api_error_at` / `last_api_error_kind` on a session
- * whose planctl-CLI footprint has already produced epic-link edges. For
- * each epic that references this `jobId` via the symmetric
- * `jobs.epic_links` array, re-stamp the matching entry on that epic's
- * `job_links` with fresh enrichment (`enrichJobLink`), preserving every
- * OTHER entry on that epic verbatim.
+ * Reverse fan-out from a jobs-write that may have changed display / annotation
+ * fields on a session whose planctl footprint already produced epic-link edges.
+ * For each epic referencing this `jobId` via the symmetric `jobs.epic_links`
+ * array, re-stamp the matching `epics.job_links` entry with fresh enrichment,
+ * preserving every OTHER entry verbatim (the OLD-element carve-out — without it
+ * a jobs-write would clobber every cross-session edge).
  *
- * Mirrors {@link syncJobIntoEpic}'s step-for-step structure. Runs INSIDE
- * the open transaction opened by {@link applyEvent}; performs zero cursor
- * work.
- *
- * **Gate (epic_links !== '[]').** The fan-out has its OWN gate — it is
- * NOT piggybacking on `plan_ref`. A creator / refiner session may have
- * `plan_ref = null` (an arthack-driven manual session running
- * `planctl epic-create` outside a `work::` / `plan::` / `close::` spawn),
- * so gating on `plan_ref` would silently miss its epic re-stamps. The
- * gate reads `jobs.epic_links` directly and short-circuits when the cell
- * is `'[]'` (no edges to fan into, so no epic to re-stamp).
- *
- * **Reverse lookup via the symmetric array (no `json_each` scan).**
- * Single-row PK SELECT + small JSON parse of `jobs.epic_links` to know
- * which epics to touch. We deliberately do NOT scan `epics.job_links`
- * with `json_each`: that's an unindexed TVF (full table scan + virtual-
- * row expansion), and the symmetric `jobs.epic_links` array already
- * carries the reverse lookup at PK cost.
- *
- * **Shell-insert pattern.** When a targeted epic row does not yet exist
- * (the classifier emitted an edge, but no EpicSnapshot has folded for
- * that epic yet) the helper INSERTs a shell row carrying just this one
- * enriched entry. Mirrors the same pattern in {@link syncPlanctlLinks}'s
- * touched-epic loop and {@link syncJobIntoEpic}'s epic-shell branch.
- *
- * **OLD-element carve-out.** Entries for OTHER `job_id`s on the same
- * epic are preserved verbatim (filter + push pattern); only the entry
- * matching `jobId` is re-stamped with fresh enrichment. Without this
- * carve-out a jobs-write would clobber every cross-session edge on every
- * touched epic.
- *
- * NEVER throws inside the open transaction. A malformed stored
- * `jobs.epic_links` blob folds to `[]` via {@link parseEmbeddedLinks};
- * a malformed `epics.job_links` blob does the same.
+ * Has its OWN gate (`epic_links !== '[]'`), NOT piggybacking on `plan_ref` (a
+ * creator/refiner session may have `plan_ref = null`). The reverse lookup walks
+ * the symmetric `jobs.epic_links` array (a PK read) rather than a `json_each`
+ * scan of `epics.job_links` (an unindexed TVF). When a targeted epic row
+ * doesn't exist yet, shell-insert it. NEVER throws; a malformed blob folds to
+ * `[]`.
  */
 function syncJobLinksOnJobWrite(
   db: Database,
@@ -5348,10 +4081,9 @@ function syncJobLinksOnJobWrite(
   if (jobRow == null) {
     return; // no backing jobs row — orphan, nothing to fan from.
   }
-  // Gate: `'[]'` short-circuit. The byte-compare is intentional — the
-  // schema default + the reducer's empty-array write both produce
-  // `'[]'` exactly, so this is a cheap pre-parse skip for the common
-  // case (a session with no planctl footprint).
+  // `'[]'` short-circuit: a cheap pre-parse skip for the common case (a session
+  // with no planctl footprint); the schema default and the reducer's empty
+  // write both produce `'[]'` exactly.
   if (jobRow.epic_links === null || jobRow.epic_links === "[]") {
     return;
   }
@@ -5360,14 +4092,10 @@ function syncJobLinksOnJobWrite(
     return; // malformed/empty after parse — nothing to fan into.
   }
 
-  // Build the freshly-enriched entry once — every targeted epic re-stamps
-  // the SAME entry shape (the entry IS the post-write jobs row's
-  // projection through `enrichJobLink`).
+  // Build the enriched entry once (amortizes the SELECT across every touched
+  // epic). `kind` here is a placeholder — the per-epic loop re-stamps with the
+  // kind from the existing entry it replaces.
   const enriched = enrichJobLink(db, { kind: "creator", job_id: jobId });
-  // Note: `kind` above is a placeholder — the per-epic loop below knows
-  // the kind from the existing entry it's replacing, so we never use the
-  // placeholder kind. We construct the enriched payload here to amortize
-  // the SELECT across every touched epic.
 
   for (const epicLink of epicLinks) {
     const epicId = epicLink.target;
@@ -5378,26 +4106,15 @@ function syncJobLinksOnJobWrite(
       epicRow != null
         ? parseEmbeddedLinks<JobLinkEntry>(epicRow.job_links)
         : [];
-    // OLD-element carve-out: drop the entry for THIS job_id, preserve
-    // every other entry verbatim. Find the OLD entry's `kind` so the
-    // re-stamp lands with the same classifier-derived kind (the
-    // classifier — not the jobs-write — is the source of truth for
-    // creator vs. refiner; this helper only refreshes the display
-    // fields).
+    // OLD-element carve-out: drop the entry for THIS job_id, preserve every
+    // other verbatim. Re-stamp with the OLD entry's `kind` (the classifier, not
+    // the jobs-write, owns creator vs. refiner; this helper only refreshes
+    // display fields).
     const oldEntry = existing.find((e) => e.job_id === jobId);
     if (oldEntry == null) {
-      // Unreachable in a healthy projection. Invariant: `jobs.epic_links`
-      // and `epics.job_links` are atomically co-written by
-      // `syncPlanctlLinks` in the same `BEGIN IMMEDIATE` transaction as
-      // the event fold, so every `(session, epic)` edge present in
-      // `jobs.epic_links` has a matching reverse entry in
-      // `epics.job_links`. No other helper de-syncs them — the OLD-element
-      // carve-out in `syncPlanctlLinks` preserves other entries verbatim,
-      // the EpicSnapshot ON CONFLICT carve-out preserves `job_links`, and
-      // EpicDeleted drops the epic row entirely (the shell-insert branch
-      // below rebuilds it). There is NO async catch-up loop; we keep this
-      // `continue` purely as defense-in-depth so a corrupt-blob projection
-      // can't wedge the reverse fan-out mid-transaction.
+      // Unreachable in a healthy projection (`jobs.epic_links` and
+      // `epics.job_links` are atomically co-written); defense-in-depth so a
+      // corrupt blob can't wedge the fan-out.
       continue;
     }
     const next = existing.filter((e) => e.job_id !== jobId);
@@ -5413,16 +4130,11 @@ function syncJobLinksOnJobWrite(
         [jobLinksJson, eventId, ts, epicId],
       );
     } else {
-      // No epic row yet — shell-insert. Mirrors the shell-insert in
-      // `syncPlanctlLinks`'s touched-epic loop; the EpicSnapshot ON
-      // CONFLICT carve-out preserves `job_links` /
-      // `created_by_closer_of` / `sort_path` / `queue_jump` so a later
-      // snapshot fold cannot wipe the enriched payload OR the
-      // schema-v29 closer columns OR the schema-v30 queue-jump flag.
-      // All three new columns default to `NULL` / `''` / `0` (the
-      // schema zero-event reading); the next `syncPlanctlLinks` call
-      // computes the real values. `queue_jump` is omitted from the
-      // column list so SQLite fills `INTEGER NOT NULL DEFAULT 0`.
+      // No epic row yet — shell-insert. The EpicSnapshot ON CONFLICT carve-out
+      // preserves `job_links` / `created_by_closer_of` / `sort_path` /
+      // `queue_jump`, so a later snapshot can't wipe the enriched payload; the
+      // next `syncPlanctlLinks` computes the closer columns. `queue_jump` is
+      // omitted so SQLite fills its `NOT NULL DEFAULT 0`.
       db.run(
         `INSERT INTO epics (
            epic_id, epic_number, title, project_dir, status,
@@ -5436,15 +4148,10 @@ function syncJobLinksOnJobWrite(
 }
 
 /**
- * Schema v46 / fn-666: extract the envelope's `state_repo` (the absolute
- * path of the repo planctl wrote `.planctl/{epics,tasks,specs}/...` into)
- * from the stored event payload. Pure parse — no `Date.now`/env/OS reads,
- * no probe; a malformed payload, missing envelope, or non-string `state_repo`
- * folds to `null` (the mint is a no-op then). The producer (planctl) writes
- * `state_repo` on EVERY planctl envelope (both `planctl init` carve-out and
- * every mutating verb), so a non-null `planctl_op` SHOULD always carry one;
- * the defensive null fall-back keeps the fold tx sacred per the CLAUDE.md
- * "safe value on malformed payload" invariant.
+ * Extract the envelope's `state_repo` (the absolute path planctl wrote
+ * `.planctl/...` into) from the stored event payload. Pure parse; a malformed
+ * payload / missing envelope / non-string `state_repo` folds to `null` (the
+ * mint is a no-op then), keeping the fold tx sacred.
  */
 function extractPlanctlStateRepo(event: Event): string | null {
   if (event.data == null || event.data.length === 0) {
@@ -5459,13 +4166,9 @@ function extractPlanctlStateRepo(event: Event): string | null {
   if (typeof parsed !== "object" || parsed === null) {
     return null;
   }
-  // Two equivalent envelope shapes exist in the wild:
-  //   1. `{tool_response:{stdout:"{...planctl_invocation:{state_repo,...}}"}}`
-  //      — the canonical PostToolUse:Bash hook payload. We dive through
-  //      `tool_response.stdout` (a JSON-string) → the envelope.
-  //   2. Synthetic / test events may inline `planctl_invocation` at the top
-  //      level (the test reducer harness does this) — we accept that shape
-  //      too for symmetry.
+  // Two equivalent envelope shapes: (1) the canonical PostToolUse:Bash hook
+  // payload `{tool_response:{stdout:"{...planctl_invocation...}"}}`, and (2) a
+  // top-level inlined `planctl_invocation` (synthetic / test events).
   const obj = parsed as Record<string, unknown>;
   // Path 1: hook payload — dive through tool_response.stdout.
   const toolResponse = obj.tool_response;
@@ -5505,59 +4208,20 @@ function extractPlanctlStateRepo(event: Event): string | null {
 }
 
 /**
- * Schema v46 / fn-666: mint one `source='planctl'` `file_attributions` row
- * per path in the event's `planctl_files` array, keyed under the envelope's
- * `state_repo` (the repo planctl wrote the `.planctl/` tree into) +
- * `event.session_id` + the repo-relative path. Runs INSIDE the open
- * transaction opened by {@link applyEvent}; performs zero cursor work.
+ * Mint one `source='planctl'` `file_attributions` row per path in the event's
+ * `planctl_files` array, keyed under the envelope's `state_repo` +
+ * `event.session_id` + the repo-relative path. Without it, `.planctl/...` files
+ * (written by the planctl CLI, not a Claude Write/Edit or recognized bash
+ * mutation) would appear as strict-mystery orphans on the next `GitSnapshot`.
  *
- * **Why this exists.** `.planctl/{epics,tasks}/*.json` and
- * `.planctl/specs/*.md` are written by the planctl CLI, NOT by a Claude
- * Write/Edit or recognized bash mutation — so without this mint they would
- * appear as strict-mystery orphans on the next `GitSnapshot` fold (no
- * attribution row → pass-4 `orphan_count` increments). The envelope's
- * `files` array names exactly what the op wrote; we lift it via
- * `extractPlanctlInvocation` at hook time (stored in
- * `events.planctl_files`) and mint here at fold time.
- *
- * **Tuple invariant.** The `(project_dir, file_path)` tuple MUST match the
- * `(GitSnapshot.project_dir, dirty_files[].path)` tuple downstream so
- * pass-3 render and `foldCommit` discharge work without divergence:
- *   - `project_dir = state_repo` (absolute, no trailing slash — planctl
- *     emits the canonical path already).
- *   - `file_path = <repo-relative>` (the envelope's `files[]` strings).
- *     Skip absolute paths and paths with `..` traversal — defensive, but
- *     planctl's `files[]` is always repo-relative in practice.
- *
- * **Re-fold determinism.** All inputs are pure event-derived:
- *   - `event.session_id`, `event.ts`, `event.id` — frozen at insert time;
- *   - `event.planctl_files` — backfilled from the stored envelope via the
- *     SHARED `extractPlanctlInvocation` deriver, so a from-scratch re-fold
- *     reproduces the same JSON-encoded array byte-identically;
- *   - `state_repo` — read from the stored envelope blob; pure parse.
- *
- * **Upsert shape.** Mirrors pass-1's `(file_attributions)` UPSERT:
- *   - `last_mutation_at = event.ts` (newest-wins per `(project_dir,
- *     session_id, file_path)`);
- *   - `op = event.planctl_op` (the verb — `scaffold`, `done`, `approve`, …);
- *   - `source = 'planctl'`;
- *   - `worktree_oid` / `worktree_mode` left NULL — they're per-file
- *     snapshot facts written by the GitSnapshot fold's pass-1 / pass-2
- *     refresh, not the planctl mint. A subsequent GitSnapshot will stamp
- *     them via the `refreshWorktreeOidStmt` UPDATE, so the discharge
- *     gate behaves identically to today's pre-mint behavior for these
- *     rows.
- *
- * **No-op when:**
- * - `event.planctl_op == null` (caller-gated; defensive double-check via the
- *   `length > 0` branch below).
- * - `event.planctl_files == null` or JSON-parses to a non-array (the
- *   deriver's null-on-miss contract, plus defensive re-check here).
- * - `state_repo` can't be lifted from the event's payload (malformed
- *   envelope or pre-fn-666 historical row whose envelope predates the
- *   field). The mint silently skips; the cursor still advances.
- *
- * NEVER throws inside the open transaction.
+ * The `(project_dir, file_path)` tuple MUST match the
+ * `(GitSnapshot.project_dir, dirty_files[].path)` tuple downstream:
+ * `project_dir = state_repo` (canonical absolute path), `file_path =
+ * <repo-relative>`. `worktree_oid` / `worktree_mode` ride NULL — the next
+ * GitSnapshot's `refreshWorktreeOidStmt` stamps them. All inputs are pure
+ * event-derived, so re-fold is byte-identical. No-op (cursor still advances)
+ * when `planctl_op` / `planctl_files` are absent or `state_repo` can't be
+ * lifted. NEVER throws.
  */
 function mintPlanctlFileAttributions(db: Database, event: Event): void {
   if (event.planctl_op == null || event.planctl_files == null) {
@@ -5576,13 +4240,9 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
   if (stateRepo === null) {
     return;
   }
-  // Same UPSERT shape as projectGitStatus pass-1 (mirrors the
-  // `(project_dir, session_id, file_path)` PK + newest-wins-on-mutation
-  // semantics). `worktree_oid` / `worktree_mode` ride NULL — the next
-  // GitSnapshot's `refreshWorktreeOidStmt` will stamp them. The UPDATE
-  // gate `excluded.last_mutation_at > file_attributions.last_mutation_at`
-  // ensures a stale planctl event (e.g., during re-fold ordering)
-  // never overwrites a newer attribution.
+  // Same UPSERT shape as projectGitStatus pass-1. `worktree_oid` /
+  // `worktree_mode` ride NULL (stamped by the next GitSnapshot). The newest-wins
+  // UPDATE gate keeps a stale planctl event from overwriting a newer attribution.
   const upsertStmt = db.prepare(
     `INSERT INTO file_attributions
        (project_dir, session_id, file_path, last_mutation_at,
@@ -5599,12 +4259,10 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
   );
   for (const rawPath of files) {
     if (typeof rawPath !== "string" || rawPath.length === 0) continue;
-    // Skip absolute paths (planctl emits relative; an absolute path would
-    // never match the `dirty_files[].path` tuple downstream and would
-    // strand as an orphan attribution forever).
+    // Skip absolute paths (planctl emits relative; an absolute path would never
+    // match the `dirty_files[].path` tuple and strand as an orphan).
     if (rawPath.startsWith("/")) continue;
-    // Skip paths with `..` traversal — defensive; planctl never emits
-    // these but a corrupt envelope might.
+    // Skip `..` traversal — defensive against a corrupt envelope.
     if (rawPath.includes("..")) continue;
     upsertStmt.run(
       stateRepo,
@@ -5620,118 +4278,52 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
 
 /**
  * Fan a planctl-CLI invocation (or a `/plan:plan` window opener) into the
- * `jobs.epic_links` + per-touched-epic `epics.job_links` projections. Runs
- * INSIDE the open transaction opened by {@link applyEvent}; performs zero
- * cursor work. Parallel to {@link syncJobIntoEpic} — the triggers are
- * disjoint (jobs-write trigger vs. planctl-event trigger) so the two fan-out
- * helpers do NOT share code.
+ * `jobs.epic_links` + per-touched-epic `epics.job_links` projections. Parallel
+ * to {@link syncJobIntoEpic} but with a disjoint trigger, so the two helpers do
+ * NOT share code. Re-derives from scratch on every triggering event
+ * (full-replace, never delta-merge) for byte-identical re-fold:
  *
- * Procedure (re-derive from scratch on every triggering event — full-replace,
- * never delta-merge, per CLAUDE.md "byte-identical re-fold"):
+ *   1. Load every planctl invocation for `sessionId` — the UNION of the legacy
+ *      `events.planctl_op` stdout-scrape rows and durable commit-trailer facts
+ *      ({@link loadCommitTrailerInvocations}). The classifier dedups, so a
+ *      scrape and a commit for the same op collapse to one edge; a scaffold
+ *      whose scrape yielded NULL still produces a creator edge via the commit
+ *      channel. Also load every `/plan:plan` opener (`PreToolUse +
+ *      skill_name='plan:plan'` only — `slash_command` rows would double-fire).
+ *   2-6. Compute windows + `epic_links`, read the pre-state, UPDATE the jobs
+ *      row.
+ *   7. For each epic in the pre+post union, re-derive `job_links` over the FULL
+ *      per-epic namespace; shell-insert a missing epic row.
  *
- * 1. Load every planctl invocation row for `sessionId` — the UNION (epic
- *    fn-695, T3) of (a) the legacy `events.planctl_op` stdout-scrape rows
- *    (the partial composite index `(session_id, id) WHERE planctl_op IS NOT
- *    NULL` makes this cheap) and (b) durable commit-trailer facts derived
- *    from `Commit` events whose payload `committer_session_id === sessionId`
- *    AND carries a non-null `planctl_op` + `planctl_target` (frozen on the
- *    payload by task .2; see {@link loadCommitTrailerInvocations}). The two
- *    sources are merged into one `ClassifierInvocation[]` and classified by
- *    the SAME `deriveEpicLinks` / `deriveJobLinks` predicate — the
- *    classifier dedups by `(kind, target)` / `(kind, job_id)`, so a scrape
- *    AND a commit for the same op collapse to one edge. A scaffold whose
- *    stdout scrape yielded NULL `planctl_op` (any pipe / `grep` / output
- *    truncation — the fn-635-class bug) still produces a creator edge via
- *    the commit channel. Also load every `/plan:plan` opener event for the
- *    session (locked gate: `PreToolUse + skill_name='plan:plan'` only —
- *    `slash_command` rows would double-fire on slash-typed invocations).
- * 2. Compute half-open `/plan:plan` windows via {@link computePlanWindows}.
- * 3. Compute the new `epic_links` via {@link deriveEpicLinks}.
- * 4. Read the pre-state `jobs.epic_links` for the session.
- * 5. Compute the pre + post epic-id union — every target that appears in
- *    EITHER pre or post `epic_links` (a removed edge still needs its epic's
- *    `job_links` re-derived to drop the now-stale entry).
- * 6. UPDATE the jobs row's `epic_links` + `last_event_id` + `updated_at`.
- * 7. For each epic id in the pre+post union, re-derive `job_links` via
- *    {@link deriveJobLinks} over the FULL per-epic invocation/window
- *    namespace (every session, not just this one). UPDATE the epic row;
- *    shell-insert a missing epic row mirroring {@link syncJobIntoEpic}'s
- *    pattern so a from-scratch re-fold reproduces every row.
- *
- * **Cost profile.** A session with N planctl events triggers N fan-outs, and
- * each fan-out scans every session's planctl invocations for the per-epic
- * `deriveJobLinks` pass. The partial composite index
- * `idx_events_planctl_session` (db.ts schema v14) bounds the per-session scan
- * to its own slice. Worst case: 200 planctl events × 5 touched epics × full
- * per-epic-namespace scan. Acceptable for the current scale; if it becomes
- * hot a future optimization could cache per-session invocations within the
- * fold transaction.
- *
- * **No-op when:**
- * - The jobs row for `sessionId` does not exist (no SessionStart yet —
- *   skip; the jobs UPDATE matches zero rows and the per-epic re-derive is
- *   pointless without a backing job row).
- *
- * NEVER throws inside the open transaction. A malformed stored array folds
- * to `[]` via {@link parseEmbeddedLinks}; an absent epic row folds to a
- * fresh shell.
+ * No-op when the jobs row for `sessionId` doesn't exist (no SessionStart yet).
+ * NEVER throws; a malformed stored array folds to `[]`.
  */
 
 /**
- * Epic fn-695 (T3): load the durable commit-trailer facts for one session
- * as synthetic {@link ClassifierInvocation}s, ready to UNION with the
- * legacy stdout-scrape rows inside {@link syncPlanctlLinks}.
+ * Load the durable commit-trailer facts for one session as synthetic
+ * {@link ClassifierInvocation}s, to UNION with the stdout-scrape rows inside
+ * {@link syncPlanctlLinks}. Synthetic `Commit` events carry the trailer facts
+ * ONLY in the `data` blob, so this scans `Commit` rows and filters in SQL via
+ * `json_extract` on `committer_session_id` + `planctl_op`, re-parsing survivors
+ * through {@link extractCommit} (no re-normalize — the producer already
+ * normalized `planctl_op`). Each maps to one `ClassifierInvocation` with `ts =
+ * committed_at_ms / 1000` (so it falls inside the open-ended final `/plan:plan`
+ * window), `epic_id` via the same target→epic split the scrape deriver uses,
+ * and `subject_present = true` (a trailer only rides a mutating chore commit).
  *
- * Synthetic `Commit` events are written by main with `events.session_id`
- * set to the repo path (NOT the committing session) and every sparse
- * `planctl_*` column NULL — the trailer facts live ONLY in the `data`
- * blob (see {@link import("./derivers").extractCommit}). So we scan the
- * `Commit` rows (served by `idx_events_hook_event`) and filter in SQL via
- * `json_extract` on the blob's `committer_session_id` + `planctl_op`,
- * then re-parse each surviving row through {@link extractCommit} for the
- * already-validated, already-normalized fields (the producer normalized
- * `planctl_op` via {@link normalizePlanctlOp} at git-worker time — we do
- * NOT re-normalize here, mirroring the scrape path which DOES re-normalize
- * the raw sparse column).
- *
- * Each surviving commit maps to one `ClassifierInvocation`:
- *   - `ts`         = `committed_at_ms / 1000` (REAL unix seconds, matching
- *                    `events.ts` units the windows compare against). The
- *                    commit lands AFTER the scaffold op but inside the SAME
- *                    open-ended final `/plan:plan` window (upper bound is
- *                    {@link import("./plan-classifier").MAX_TS_SENTINEL}),
- *                    so the classifier still classes it inside the window.
- *   - `op`         = `planctl_op` (already normalized).
- *   - `target`     = `planctl_target` (validated ref).
- *   - `epic_id`    = `parsePlanRef(target)?.epic_id ?? null` — the SAME
- *                    target→epic split the scrape deriver
- *                    ({@link import("./derivers").extractPlanctlInvocation})
- *                    uses, so a task-form target folds up to its parent epic
- *                    byte-identically.
- *   - `subject_present` = `true` — a `Planctl-Op`/`Planctl-Target` trailer
- *                    only rides a MUTATING planctl chore commit (read-only
- *                    verbs write nothing and so produce no `chore(planctl)`
- *                    commit), so the readonly gate is always open here.
- *
- * Ordered by event `id` ASC for a stable classifier window-advance.
- * Pure-ish read (no wallclock / env / fs); a malformed blob is skipped by
- * `extractCommit` returning `null`, never throws — re-fold determinism and
- * the fold-tx-never-throws invariant both hold. Pre-fn-695 `Commit` events
- * have NULL `planctl_op` in the blob, so the `json_extract` filter excludes
- * them → the union is a no-op over the historical log.
+ * Ordered by event `id` ASC for a stable window-advance. Pure read; a malformed
+ * blob is skipped by `extractCommit`, never throws. Older `Commit` events with
+ * NULL `planctl_op` are excluded by the filter, so the union is a no-op over
+ * the historical log.
  */
 function loadCommitTrailerInvocations(
   db: Database,
   sessionId: string,
 ): ClassifierInvocation[] {
-  // fn-717.1: the `Commit` blob VALUE AND the two `json_extract` filters
-  // resolve via `COALESCE(events.data, event_blobs.data)`, so a Commit blob
-  // the compaction relocator (task .2) MOVEs into `event_blobs` still
-  // matches the filter and re-parses byte-identically. The LEFT JOIN is
-  // empty in .1, so this is byte-identical to the pre-v57 `events`-only
-  // form. No expression index covers these Commit `json_extract` probes
-  // (`idx_events_tool_attr` is a PostToolUse partial index), so COALESCE-ing
-  // the WHERE breaks no index here.
+  // The blob VALUE and the `json_extract` filters resolve via
+  // `COALESCE(events.data, event_blobs.data)`, so a relocated Commit blob still
+  // matches and re-parses byte-identically. No expression index covers these
+  // Commit `json_extract` probes, so COALESCE-ing the WHERE breaks no index.
   const rows = db
     .query(
       `SELECT COALESCE(events.data, event_blobs.data) AS data
@@ -5749,12 +4341,9 @@ function loadCommitTrailerInvocations(
     if (commit == null) {
       continue;
     }
-    // The SQL `json_extract` filter already excluded NULL `planctl_op`; the
-    // re-parse here re-asserts the validated shape (op non-empty, target a
-    // valid plan ref). A commit whose target failed `parsePlanRef`
-    // validation in `extractCommit` lands `planctl_target = null` and is
-    // dropped — the scrape path's `epic_id` would have been null too, so
-    // the classifier produces no edge either way (parity preserved).
+    // Re-assert the validated shape (op non-empty, target a valid plan ref). A
+    // commit whose target failed validation drops — the scrape path's `epic_id`
+    // would have been null too, so the classifier yields no edge either way.
     if (commit.planctl_op == null || commit.planctl_target == null) {
       continue;
     }
@@ -5770,26 +4359,13 @@ function loadCommitTrailerInvocations(
 }
 
 /**
- * Epic fn-695 (T3): find every distinct `committer_session_id` whose
- * commit-trailer facts touch ANY of `epicIds` — the commit-channel
- * counterpart to {@link syncPlanctlLinks}'s scrape-side session sweep
- * (the `idx_events_planctl_epic` / `idx_events_planctl_target` UNION).
- * Without this, a session that ONLY ever produced commit-trailer edges
- * (its stdout scrape NULLed out) would be invisible to the per-epic
- * `deriveJobLinks` rebuild, and the epic's `job_links` would miss its
- * commit-only creator/refiner.
- *
- * A commit "touches" an epic when EITHER the trailer's target parses to
- * that epic (`parsePlanRef(planctl_target)?.epic_id ∈ epicIds`) OR the
- * raw target string equals the epic id (the creator-edge target form).
- * We scan `Commit` rows in SQL (filtered to non-null `planctl_op`), then
- * apply the `parsePlanRef` membership test in TS so the epic-folding rule
- * stays byte-identical to {@link loadCommitTrailerInvocations}. Returns a
+ * Find every distinct `committer_session_id` whose commit-trailer facts touch
+ * ANY of `epicIds` — the commit-channel counterpart to {@link syncPlanctlLinks}'s
+ * scrape-side session sweep. Without it, a session that ONLY ever produced
+ * commit-trailer edges would be invisible to the per-epic `deriveJobLinks`
+ * rebuild. A commit "touches" an epic when the trailer's target parses to that
+ * epic OR the raw target equals the epic id. Pure read; never throws. Returns a
  * deduped Set of session ids.
- *
- * Pure read; never throws (malformed blob → `extractCommit` null → skip).
- * Pre-fn-695 events have NULL `planctl_op` → excluded → no commit-channel
- * session added → union no-op over the historical log.
  */
 function loadCommitTrailerSessionsForEpics(
   db: Database,
@@ -5799,11 +4375,9 @@ function loadCommitTrailerSessionsForEpics(
   if (epicIds.size === 0) {
     return sessions;
   }
-  // fn-717.1: same COALESCE(events.data, event_blobs.data) resolution as
-  // loadCommitTrailerInvocations — the Commit blob VALUE and both
-  // `json_extract` filters read through the empty-in-.1 LEFT JOIN so a
-  // relocated Commit blob (task .2) stays matchable + re-parsable, and this
-  // is byte-identical to the pre-v57 form while `event_blobs` is empty.
+  // Same COALESCE(events.data, event_blobs.data) resolution as
+  // loadCommitTrailerInvocations — a relocated Commit blob stays matchable and
+  // re-parsable.
   const rows = db
     .query(
       `SELECT COALESCE(events.data, event_blobs.data) AS data
@@ -5844,18 +4418,17 @@ function syncPlanctlLinks(
   eventId: number,
   ts: number,
 ): void {
-  // The session's backing jobs row must exist for an epic_links UPDATE to
-  // land. A planctl invocation in a session with no SessionStart is an
-  // orphan; we skip the jobs-side write but still re-derive every touched
-  // epic's job_links (cross-session classifier output) so symmetry holds.
+  // The backing jobs row must exist for an epic_links UPDATE to land. A planctl
+  // invocation in a session with no SessionStart is an orphan; skip the
+  // jobs-side write but still re-derive every touched epic's job_links so
+  // symmetry holds.
   const jobsRow = db
     .query("SELECT epic_links FROM jobs WHERE job_id = ?")
     .get(sessionId) as { epic_links: string | null } | null;
 
-  // Load this session's planctl invocations (ASC by event id — stable
-  // ordering for the classifier's per-window pointer advance). The partial
-  // composite index `idx_events_planctl_session (session_id, id) WHERE
-  // planctl_op IS NOT NULL` serves this with no full-table scan.
+  // Load this session's planctl invocations (ASC by event id for stable
+  // window-pointer advance); the partial composite index serves this without a
+  // full-table scan.
   const invRows = db
     .query(
       `SELECT ts, planctl_op, planctl_target, planctl_epic_id,
@@ -5878,18 +4451,14 @@ function syncPlanctlLinks(
     epic_id: r.planctl_epic_id,
     subject_present: r.planctl_subject_present === 1,
   }));
-  // Epic fn-695 (T3): UNION the durable commit-trailer facts for this
-  // session. The classifier dedups by `(kind, target)` and defensively
-  // re-sorts by `ts` ASC, so a plain concat is safe — a scrape AND a
-  // commit for the same scaffold collapse to ONE creator edge; a
-  // scrape-NULL scaffold's commit fact alone still mints the edge.
+  // UNION the durable commit-trailer facts — the classifier dedups, so a scrape
+  // and a commit for the same scaffold collapse to one creator edge, and a
+  // scrape-NULL scaffold's commit fact alone still mints it.
   invocations.push(...loadCommitTrailerInvocations(db, sessionId));
 
-  // Load this session's `/plan:plan` openers. Locked gate: PreToolUse-on-Skill
-  // with skill_name='plan:plan' only. Slash-command UserPromptSubmit rows are
-  // NOT openers — they'd double-fire on slash-typed invocations (the same
-  // /plan:plan call appears as both a slash_command UserPromptSubmit and a
-  // PreToolUse:Skill event).
+  // Load this session's `/plan:plan` openers. Locked gate: `PreToolUse +
+  // skill_name='plan:plan'` only — a slash-command UserPromptSubmit would
+  // double-fire on the same call.
   const openerRows = db
     .query(
       `SELECT ts
@@ -5903,8 +4472,7 @@ function syncPlanctlLinks(
   const windows = computePlanWindows(openerRows.map((r) => r.ts));
 
   // Compute the new epic_links from scratch (full-replace, never delta-merge —
-  // re-fold determinism requires that re-folding the same events produces the
-  // same JSON; delta-merge would double on re-fold).
+  // delta-merge would double on re-fold).
   const newEpicLinks = deriveEpicLinks(invocations, windows);
   sortEpicLinks(newEpicLinks);
 
@@ -5934,26 +4502,14 @@ function syncPlanctlLinks(
     return;
   }
 
-  // Build the per-epic re-derive inputs: every session that has touched any of
-  // the affected epics, with its full planctl invocations + windows. The
-  // classifier's `deriveJobLinks` expects ReadOnly maps keyed by job_id.
-  //
-  // Step 1: find every distinct session_id that has at least one planctl
-  // invocation touching any of `touchedEpics` (epic id appearing as either
-  // planctl_epic_id or planctl_target). We then load each such session's FULL
-  // invocation list — not just the touching ones — because the classifier
-  // needs the full per-session ordering for its window advance.
+  // Step 1: find every distinct session_id with at least one planctl invocation
+  // touching any of `touchedEpics` (epic id as planctl_epic_id or
+  // planctl_target). UNION (not OR) so the planner uses BOTH partial indexes —
+  // SQLite picks one index per cross-column OR, but a UNION's branches each
+  // SEARCH their own index. The session_id set is identical to the OR form, so
+  // re-fold determinism holds.
   const targetList = [...touchedEpics];
   const placeholders = targetList.map(() => "?").join(",");
-  // UNION (not OR) so the planner uses BOTH partial indexes — SQLite picks
-  // ONE index per cross-column OR, but a UNION decomposes into a COMPOUND
-  // QUERY whose left branch SEARCHes `idx_events_planctl_epic` and right
-  // branch SEARCHes `idx_events_planctl_target` (Tier 2 fn-628; see
-  // `CREATE_EVENTS_PLANCTL_INDEXES` in src/db.ts). UNION dedups via temp
-  // B-tree — identical session_id set to the prior `SELECT DISTINCT ...
-  // OR ...` form, so re-fold determinism is preserved (the downstream
-  // `syncPlanctlLinks` derivation consumes the session_id set the same
-  // way regardless of which form produced it).
   const sessionRows = db
     .query(
       `SELECT session_id
@@ -5967,20 +4523,15 @@ function syncPlanctlLinks(
           AND planctl_target IN (${placeholders})`,
     )
     .all(...targetList, ...targetList) as { session_id: string }[];
-  // The current session might have touched an epic in pre-state that NO
-  // invocation now references (a refiner edge dropped because of suppression
-  // ordering) — make sure it's in the sweep too so its now-stale job_links
-  // entry gets pulled.
+  // Add the current session too, in case it touched a pre-state epic that no
+  // invocation now references (a dropped refiner edge) so its now-stale
+  // job_links entry gets pulled.
   const sessionIds = new Set<string>(sessionRows.map((r) => r.session_id));
   sessionIds.add(sessionId);
-  // Epic fn-695 (T3): the scrape-side sweep above only sees sessions whose
-  // SPARSE `planctl_epic_id` / `planctl_target` columns are populated.
-  // A session that produced ONLY commit-trailer edges (its stdout scrape
-  // NULLed out) is invisible there — its `Commit` events carry NULL sparse
-  // columns. Add every commit-channel session touching a touched epic so
-  // the per-epic `deriveJobLinks` rebuild below sees its commit-only
-  // creator/refiner. Each such session's FULL invocation list (scrape +
-  // commit) is loaded below, identical to a scrape-channel session.
+  // The scrape-side sweep only sees sessions with populated sparse columns; add
+  // every commit-channel session (whose `Commit` events carry NULL sparse
+  // columns) touching a touched epic so the per-epic rebuild sees its
+  // commit-only creator/refiner.
   for (const sid of loadCommitTrailerSessionsForEpics(db, touchedEpics)) {
     sessionIds.add(sid);
   }
@@ -6010,17 +4561,11 @@ function syncPlanctlLinks(
       epic_id: r.planctl_epic_id,
       subject_present: r.planctl_subject_present === 1,
     }));
-    // Epic fn-695 (T3): UNION this session's commit-trailer facts into its
-    // per-session invocation list so the per-epic `deriveJobLinks` rebuild
-    // classifies BOTH channels symmetrically with the epic_links pass
-    // above. Concat is safe — the classifier dedups + re-sorts by ts.
+    // UNION this session's commit-trailer facts so the per-epic rebuild
+    // classifies BOTH channels symmetrically. Concat is safe — the classifier
+    // dedups + re-sorts by ts.
     sidInvocations.push(...loadCommitTrailerInvocations(db, sid));
     invocationsBySession.set(sid, sidInvocations);
-    // Schema v30: queue_jump is NOT part of the ClassifierInvocation shape
-    // (the classifier doesn't need it — it's a per-epic flag, not a per-
-    // invocation classification signal). We read it below per-touched-epic
-    // off the events sparse column directly, gated by the same
-    // `planctl_op IS NOT NULL` partial index.
     const sidOpenerRows = db
       .query(
         `SELECT ts
@@ -6037,41 +4582,30 @@ function syncPlanctlLinks(
     );
   }
 
-  // Step 2: re-derive job_links for each touched epic and UPDATE the epic row.
-  // Shell-insert a missing epic row — mirrors syncJobIntoEpic's pattern. A
-  // later EpicSnapshot fills the scalars without clobbering job_links (the
-  // EpicSnapshot ON CONFLICT omits the column — see projectPlanRow).
-  //
-  // Schema v29: per-epic, also derive `created_by_closer_of` (the raw closer
-  // → child link) and `sort_path` (the materialized-path sort key). After
-  // each touched epic's UPDATE, transitively re-stamp every descendant's
-  // `sort_path` whose closer-chain leads back to this epic. The cascade
-  // runs inside the same BEGIN IMMEDIATE so a from-scratch re-fold
-  // reproduces byte-identical projection.
+  // Step 2: re-derive job_links for each touched epic and UPDATE the epic row
+  // (shell-insert a missing one). Per-epic, also derive `created_by_closer_of`
+  // (the closer→child link) and `sort_path` (the materialized-path sort key),
+  // then transitively re-stamp every descendant's `sort_path` whose
+  // closer-chain leads back to this epic — inside the same transaction for
+  // byte-identical re-fold.
   for (const epicId of touchedEpics) {
     const newJobLinks = deriveJobLinks(
       invocationsBySession,
       windowsBySession,
       epicId,
     );
-    // Enrich each thin classifier entry into the widened JobLinkEntry
-    // shape (schema v24): SELECT the linked `jobs` row inside the open
-    // transaction and stamp `(title, state, last_api_error_at,
-    // last_api_error_kind)`. The enrichment helper is the SAME one used
-    // by the jobs-write fan-out (`syncJobLinksOnJobWrite`) — re-fold
-    // determinism requires a single source of truth for "what's the
-    // projection shape on disk".
+    // Enrich each thin classifier entry into the widened JobLinkEntry shape via
+    // the SAME helper the jobs-write fan-out uses — a single source of truth for
+    // the on-disk projection shape is required for re-fold determinism.
     const enriched: JobLinkEntry[] = newJobLinks.map((e) =>
       enrichJobLink(db, e),
     );
     sortJobLinks(enriched);
     const jobLinksJson = JSON.stringify(enriched);
 
-    // Schema v29: derive `created_by_closer_of` from the just-computed
-    // creator entries. Filter the creator job_ids down to those whose
-    // backing `jobs` row carries `plan_verb='close' AND plan_ref IS NOT
-    // NULL`; tie-break on lowest `job_id` ASC (deterministic, identical
-    // across re-folds). If none match → NULL.
+    // Derive `created_by_closer_of` from the creator entries whose backing
+    // `jobs` row is `plan_verb='close' AND plan_ref IS NOT NULL`; tie-break on
+    // lowest `job_id` ASC. None → NULL.
     let createdByCloserOf: string | null = null;
     const creatorJobIds = enriched
       .filter((e) => e.kind === "creator")
@@ -6096,53 +4630,23 @@ function syncPlanctlLinks(
       }
     }
 
-    // Derive `sort_path` from the resolved `created_by_closer_of` and this
-    // epic's own `epic_number`. Three branches:
-    //   - `created_by_closer_of == null` → `zeroPad6(epic_number)`.
-    //   - Parent's `sort_path` resolves to a non-empty value →
-    //     `<parent.sort_path>.<zeroPad6(epic_number)>`.
-    //   - Parent row missing OR parent's `sort_path === ''` (transient
-    //     shell, or recursive overflow earlier in chain) → fall back to
-    //     `zeroPad6(epic_number)` (placeholder; later parent re-projection
-    //     triggers cascade re-stamp).
-    //   - Overflow guard: `epic_number >= 1_000_000` → `sort_path = ''` +
-    //     console.error note. Never throws (the safe-fold honors the
-    //     "reducer never throws inside BEGIN IMMEDIATE" invariant).
-    //
-    // `epic_number` is read off the touched epic row, NOT from the in-
-    // flight snapshot — `syncPlanctlLinks` may run on an EpicSnapshot,
-    // a planctl-event, or a /plan:plan opener, only the first of which
-    // even carries an `epic_number`. A shell row (planctl event before
-    // the EpicSnapshot lands) has `epic_number = NULL`; the derivation
-    // safely-folds to `zeroPad6(0)` = `"000000"` in that case so the
-    // re-fold determinism holds. The very next EpicSnapshot triggers a
-    // fresh `syncPlanctlLinks` round (via the planctl-event fold), which
-    // will recompute with the now-known `epic_number` and cascade if it
-    // changed.
+    // Derive `sort_path` from `created_by_closer_of` and this epic's
+    // `epic_number`: root → `zeroPad6(epic_number)`; non-root → inherit parent's
+    // path; missing/placeholder parent → fall back to root-level (the cascade
+    // re-stamps when the parent resolves); `epic_number >= 1_000_000` → `''` +
+    // note (never throws). `epic_number` is read off the touched row, so a shell
+    // row (planctl event before the EpicSnapshot) has NULL → folds to
+    // `"000000"`; the next EpicSnapshot recomputes against the known number.
     const ownRow = db
       .query("SELECT epic_number FROM epics WHERE epic_id = ?")
       .get(epicId) as { epic_number: number | null } | null;
     const ownNumber = ownRow?.epic_number ?? 0;
 
-    // Schema v30: derive `queue_jump` for this epic. Scan THIS epic's
-    // session events for any planctl_invocation envelope that carried
-    // `queue_jump: true` (today: the `/plan:queue` scaffold path). The
-    // signal is sticky-true: any single envelope flipping it to `1`
-    // locks the epic into queued state for the lifetime of the
-    // projection. There is no `/plan:unqueue` path — removing a queued
-    // epic requires deleting the epic outright. A re-fold replays the
-    // same envelopes in the same order, so the EXISTS branch is
-    // byte-deterministic.
-    //
-    // The scan keys off `planctl_epic_id = <this epicId>` (the parsed-
-    // out epic side of `planctl_target`). The Tier 2 (fn-628.2)
-    // `idx_events_planctl_epic ON events(planctl_epic_id, session_id, id)
-    // WHERE planctl_op IS NOT NULL` partial composite index serves this
-    // equality cheaply — EQP shows `SEARCH events USING INDEX
-    // idx_events_planctl_epic (planctl_epic_id=?)`. The schema-v14
-    // `(session_id, id) WHERE planctl_op IS NOT NULL` index is
-    // session-leading and cannot serve a `planctl_epic_id = ?` lookup
-    // on its own.
+    // Derive `queue_jump`: scan this epic's events for any planctl envelope that
+    // carried `queue_jump: true`. Sticky-true — any single flip locks the epic
+    // queued for the projection's lifetime (no `/plan:unqueue`); a re-fold
+    // replays the same envelopes, so EXISTS is byte-deterministic. Keyed off
+    // `planctl_epic_id`, served by the dedicated partial composite index.
     const queueJumpRow = db
       .query(
         `SELECT EXISTS(
@@ -6165,11 +4669,9 @@ function syncPlanctlLinks(
       );
       sortPath = "";
     } else if (createdByCloserOf == null) {
-      // Root epic. Schema v30: prepend `!` when queue_jump=1 so this
-      // epic sorts strictly above every non-queued root under SQLite
-      // BINARY collation (`!` = ASCII 33 < digits 48-57). Multiple
-      // queue-jumped roots sort FIFO by epic_number under the shared
-      // `!` prefix — no tiebreaker math.
+      // Root: prepend `!` when queue_jump=1 so this epic sorts strictly above
+      // non-queued roots under SQLite BINARY collation (`!` = ASCII 33 <
+      // digits). Multiple queue-jumped roots sort FIFO under the shared prefix.
       sortPath =
         queueJump === 1 ? `!${zeroPad6(ownNumber)}` : zeroPad6(ownNumber);
     } else {
@@ -6178,19 +4680,12 @@ function syncPlanctlLinks(
         .get(createdByCloserOf) as { sort_path: string | null } | null;
       const parentPath = parentRow?.sort_path ?? "";
       if (parentPath === "") {
-        // Parent missing / placeholder — fall back to root-level position.
-        // The cascade re-stamps when the parent later resolves.
-        // Schema v30: a non-root queue-jumped epic in placeholder state
-        // does NOT get the `!`-prefix; once the parent resolves the
-        // cascade re-stamps with the inherited prefix from `parentPath`.
+        // Parent missing / placeholder — fall back to root-level; the cascade
+        // re-stamps (with any inherited `!`-prefix) when the parent resolves.
         sortPath = zeroPad6(ownNumber);
       } else {
-        // Non-root: inherit parent's path verbatim. If the parent (root
-        // or transitive ancestor) carries the `!`-prefix, it propagates
-        // through this string concat for free — no separate child-flag
-        // plumbing. A non-root queue-jumped epic still projects
-        // `queue_jump = 1` for symmetry (the row knows its own state)
-        // but does NOT prepend a second `!`.
+        // Non-root: inherit the parent's path verbatim — a parent `!`-prefix
+        // propagates through the concat for free.
         sortPath = `${parentPath}.${zeroPad6(ownNumber)}`;
       }
     }
@@ -6199,8 +4694,6 @@ function syncPlanctlLinks(
       .query("SELECT epic_id FROM epics WHERE epic_id = ?")
       .get(epicId) as { epic_id: string } | null;
     if (epicExists != null) {
-      // Extend the existing UPDATE to also set the schema-v29 columns
-      // AND the schema-v30 `queue_jump` column in the same statement.
       db.run(
         "UPDATE epics SET job_links = ?, created_by_closer_of = ?, sort_path = ?, queue_jump = ?, last_event_id = ?, updated_at = ? WHERE epic_id = ?",
         [
@@ -6214,23 +4707,11 @@ function syncPlanctlLinks(
         ],
       );
     } else {
-      // Shell-insert: no epic row yet. Scalars default to NULL / "[]"
-      // matching the schema's zero-event reading. A later EpicSnapshot
-      // fills the scalars; the ON CONFLICT carve-out preserves
-      // job_links / jobs / tasks / created_by_closer_of / sort_path /
-      // queue_jump. The schema-v29 + v30 columns are stamped with the
-      // JUST-DERIVED values (typically `created_by_closer_of` is real
-      // but `sort_path` is the placeholder `zeroPad6(0) = "000000"` since
-      // no `epic_number` is known yet — the next `syncPlanctlLinks`
-      // call, post-EpicSnapshot, recomputes against the now-visible
-      // `epic_number`; the `queue_jump` value is locked-in true on
-      // first observation since the scan reads it from the immutable
-      // event log).
-      // Schema v53 (fn-688): routed through the shared tombstone-checking
-      // helper — the fourth and final epic-shell-INSERT vector. A
-      // planctl-event-before-epic shell for a deleted epic is
-      // suppressed; never-deleted epics still get their job_links +
-      // closer-link projections initialised on first sight.
+      // Shell-insert: no epic row yet. The just-derived closer/sort/queue
+      // columns are stamped (sort_path typically the `"000000"` placeholder
+      // until an EpicSnapshot supplies `epic_number`); the ON CONFLICT carve-out
+      // preserves them. Routed through the tombstone-checking helper — a
+      // planctl-event-before-epic shell for a deleted epic is suppressed.
       insertEpicShellIfNotTombstoned(
         db,
         epicId,
@@ -6251,38 +4732,22 @@ function syncPlanctlLinks(
       );
     }
 
-    // Transitive cascade: every epic whose `created_by_closer_of` equals
-    // this just-updated epic's id must have its `sort_path` recomputed
-    // against the new parent value. Recurse to fixed point inside the
-    // open transaction. Cycle guard: a `visited` set + depth cap of 50.
-    // By construction `created_by_closer_of` is immutable once set (one
-    // closer-creator per epic, set on creation), so cycles can't form;
-    // the guard is defense-in-depth — a malformed historical state, an
-    // unexpected pathological event sequence, or a future invariant
-    // violation cannot wedge the reducer.
+    // Transitive cascade: re-stamp `sort_path` on every descendant whose
+    // `created_by_closer_of` is this epic. Cycles can't form
+    // (`created_by_closer_of` is immutable once set); the cycle guard is
+    // defense-in-depth.
     cascadeSortPath(db, epicId, eventId, ts);
   }
 }
 
 /**
- * Schema v29: re-stamp `sort_path` on every transitive descendant of
- * `rootEpicId` (every epic with `created_by_closer_of = rootEpicId`, and
- * recursively their descendants). Runs INSIDE the open BEGIN IMMEDIATE
- * transaction opened by {@link applyEvent}; performs zero cursor work.
- *
- * The cascade is BFS over an in-memory queue with a `visited: Set<string>`
- * cycle guard and a depth cap at 50. By construction cycles can't form —
- * `created_by_closer_of` is immutable once set, one closer-creator per
- * epic — so the guard is defense-in-depth: a malformed historical state
- * or unexpected pathological event sequence cannot wedge the reducer.
- * Both bails (cycle hit / depth overrun) `console.error` a note and
- * return; never throws.
- *
- * Each descendant's `sort_path` is recomputed as `<parent.sort_path>.<
- * zeroPad6(descendant.epic_number)>` (or `zeroPad6(descendant.epic_number)`
- * if parent's `sort_path === ''` — the placeholder case). Same overflow
- * guard as in {@link syncPlanctlLinks}: `epic_number >= 1_000_000` folds
- * to `sort_path = ''` and notes.
+ * Re-stamp `sort_path` on every transitive descendant of `rootEpicId`. BFS over
+ * an in-memory queue with a `visited` cycle guard + depth cap of 50 — cycles
+ * can't form (`created_by_closer_of` is immutable once set), so the guard is
+ * defense-in-depth; both bails note and return, never throws. Each descendant's
+ * path is `<parent.sort_path>.<zeroPad6(epic_number)>` (or just
+ * `zeroPad6(epic_number)` when the parent's path is the `''` placeholder); same
+ * `epic_number >= 1_000_000 → ''` overflow guard as {@link syncPlanctlLinks}.
  *
  * Schema v30: the `!`-prefix queue-jump signal propagates through the
  * `parentPath` string concat for free. If the root epic carries
@@ -6368,13 +4833,9 @@ function cascadeSortPath(
 }
 
 /**
- * Schema v34 (fn-637): row shape lifted from `epics` for the fold-time
- * resolver's all-epics index. Carries the minimal subset
- * `resolveEpicDep` reads off an {@link Epic}: `epic_id`, `epic_number`,
- * `project_dir`, `status`. Everything else (`tasks`,
- * `jobs`, `job_links`, `depends_on_epics`, etc.) is irrelevant to
- * resolution and excluded from the SELECT to keep the in-fold scan
- * narrow.
+ * Row shape lifted from `epics` for the fold-time resolver's all-epics index —
+ * the minimal subset `resolveEpicDep` reads (`epic_id`, `epic_number`,
+ * `project_dir`, `status`); everything else is excluded to keep the scan narrow.
  */
 interface EpicLite {
   epic_id: string;
@@ -6384,15 +4845,10 @@ interface EpicLite {
 }
 
 /**
- * Reducer-local minimal {@link Epic}-shaped record assembled from an
- * {@link EpicLite} row, satisfying the {@link Epic} surface the shared
- * {@link resolveEpicDep} resolver reads. The fields the resolver does
- * NOT touch (`tasks`, `jobs`, `job_links`, etc.) are stamped with
- * zero-event defaults so a type-narrow consumer that walks them yields
- * the same shape as a real {@link Epic} (defense-in-depth — the
- * resolver only reads the five fields above, but the helper builds the
- * full surface so future widening of the resolver doesn't silently miss
- * fields). The resolver only reads the four fields lifted from `EpicLite`.
+ * Assemble a minimal {@link Epic}-shaped record from an {@link EpicLite} row.
+ * The fields the resolver doesn't touch are stamped with zero-event defaults so
+ * the full surface is present (defense-in-depth against a future resolver
+ * widening).
  */
 function epicLiteToEpic(row: EpicLite): Epic {
   return {
@@ -6416,24 +4872,12 @@ function epicLiteToEpic(row: EpicLite): Epic {
 }
 
 /**
- * Schema v34 (fn-637): build the in-fold all-epics index the shared
- * {@link resolveEpicDep} resolver reads against. Returns `(epicById,
- * epicsByNumber)` keyed off the live `epics` table. Runs INSIDE the
- * open transaction opened by {@link applyEvent}; performs zero cursor
- * work.
- *
- * Read-in-fold is allowed (the autocommit ban in CLAUDE.md is on DB
- * watchers, not query reads). The SELECT is narrow — four columns —
- * and the table sits at ~1k rows in the steady state, so the scan is
- * cheap. Per-call cost dominates the fold; if it becomes hot a future
- * optimization could cache the index inside `applyEvent` and reuse it
- * across the forward + reverse passes, but the current shape keeps
- * each helper composable.
- *
- * Determinism: every column read is persisted from the immutable event
- * log; nothing here reads wall-clock, env, or OS state. A from-scratch
- * re-fold rebuilds the same index at the same event, so the per-event
- * derivation of `resolved_epic_deps` is byte-identical across re-folds.
+ * Build the in-fold all-epics index the shared {@link resolveEpicDep} resolver
+ * reads against. Returns `(epicById, epicsByNumber)` keyed off the live `epics`
+ * table. Read-in-fold is allowed (the watcher ban doesn't cover query reads).
+ * Every column is event-persisted — no wall-clock / env / OS read — so a re-fold
+ * rebuilds the same index and the per-event `resolved_epic_deps` derivation is
+ * byte-identical.
  */
 function buildEpicIndex(db: Database): {
   epicById: Map<string, Epic>;
@@ -6459,11 +4903,8 @@ function buildEpicIndex(db: Database): {
       }
     }
   }
-  // Stable order inside each `epicsByNumber` bucket so the resolver's
-  // ambiguity tie-break (and downstream re-fold byte-identity) does not
-  // depend on SQLite's result ordering. ORDER BY at the SELECT layer
-  // would lift the cost into the planner; sorting the small bucket in
-  // memory is cheaper and identical in semantics.
+  // Stable order inside each bucket so the resolver's ambiguity tie-break (and
+  // re-fold byte-identity) doesn't depend on SQLite's result ordering.
   for (const bucket of epicsByNumber.values()) {
     bucket.sort((a, b) =>
       a.epic_id < b.epic_id ? -1 : a.epic_id > b.epic_id ? 1 : 0,
@@ -6473,53 +4914,20 @@ function buildEpicIndex(db: Database): {
 }
 
 /**
- * Schema v34 (fn-637): the shared enrich helper — mirror of
- * {@link enrichJobLink}. Given a raw `depTok` from the consumer's
- * `depends_on_epics` and the in-fold all-epics index, runs the shared
- * fold-safe {@link resolveEpicDep} resolver and projects the minimal-
- * subset tri-state entry onto the wire shape carried in
- * `epics.resolved_epic_deps`. Shared by the forward stamp, the
- * reverse fan-out, and the EpicDeleted path: SAME code path, SAME
- * defaults — re-fold determinism requires a single source of truth
- * for "what's the projection shape on disk".
+ * Shared enrich helper (mirror of {@link enrichJobLink}). Runs the fold-safe
+ * {@link resolveEpicDep} resolver and projects the tri-state entry onto the wire
+ * shape carried in `epics.resolved_epic_deps`. Shared by the forward stamp, the
+ * reverse fan-out, and the EpicDeleted path — one source of truth for the
+ * on-disk projection shape.
  *
- * **Tri-state mapping** (locked):
- * - `dangling` — resolver returned `{kind: "dangling"}`.
- * - `satisfied` — resolver returned `{kind: "found"}` AND
- *   `epicIsCompleted(upstream)` (status='done' — the same terminal
- *   predicate `evaluateCloseRow` reads).
- * - `blocked-incomplete` — resolver returned `{kind: "found"}` but the
- *   upstream is not completed (any other `status`).
- *
- * **Locked key order.** The minimal-subset shape emits keys in the
- * exact order `{dep_token, resolved_epic_id, epic_number,
- * project_basename, cross_project, state}`; the wire encoding is
- * `JSON.stringify`, which preserves insertion order, so any drift
- * between this helper's branches would produce different bytes for the
- * same logical entry — a silent re-fold-determinism break. Both
- * branches (dangling vs. found) emit the same six keys with explicit
- * `null` for the four "no resolution" fields in the dangling branch
- * (NOT omitted) so the byte shape stays uniform.
- *
- * **Cross-project flag.** Computed off the consumer's `project_dir`
- * basename vs. the upstream's. The same `projectBasename` helper the
- * readiness side uses (`./epic-deps`) keeps the boundary semantics
- * (POSIX-only, strip-trailing-slash) consistent across re-folds.
- * `cross_project` is `true` IFF the resolved upstream's basename is a
- * non-empty string AND differs from the consumer's non-empty basename;
- * dangling and "no project_dir on either side" both fold to `false`.
- *
- * **No wall-clock, no diagnostics surface.** The resolver injects `now`
- * for the `ambiguous-dep-resolution` diagnostic timestamp. The fold-
- * time call passes the event's own `ts` (an ISO-8601 string derived
- * deterministically — see `eventTsToIso`) so a re-fold reproduces the
- * same diagnostic. The diagnostics sink itself is a fresh empty array
- * the helper drops on the floor — the fold writes only the projection
- * row, never the side-band JSONL log (that's a `scripts/board.ts` /
- * `scripts/autopilot.ts` concern reading the readiness snapshot's
- * `diagnostics` field at frame-emit time).
- *
- * NEVER throws inside the open BEGIN IMMEDIATE transaction.
+ * Tri-state: `dangling` (no upstream), `satisfied` (`{kind: "found"}` AND
+ * `epicIsCompleted`), `blocked-incomplete` (found but not done). KEY ORDER IS
+ * LOCKED — both branches emit the same six keys (dangling fills the resolution
+ * fields with explicit `null`, NOT omitted) so the byte shape stays uniform.
+ * `cross_project` is true IFF the upstream basename is non-empty and differs
+ * from the consumer's. The resolver's `now` is the event's own `ts`
+ * (deterministic); the diagnostics sink is dropped on the floor (observational,
+ * surfaced on the readiness side). NEVER throws.
  */
 function enrichEpicDep(
   depTok: string,
@@ -6528,11 +4936,8 @@ function enrichEpicDep(
   epicsByNumber: Map<number, Epic[]>,
   nowIso: string,
 ): ResolvedEpicDep {
-  // No-op diagnostics sink: a fresh empty array the helper drops on
-  // the floor. Diagnostics are observational (side-band JSONL log read
-  // at frame emit), not projection state; emitting them at fold time
-  // would require an I/O path inside the transaction. The readiness
-  // side surfaces the same diagnostic on its live resolve pass.
+  // No-op diagnostics sink: observational, not projection state, so the fold
+  // drops it (the readiness side surfaces the same diagnostic).
   const diagnostics: ResolutionDiagnostic[] = [];
   const resolved = resolveEpicDep(
     depTok,
@@ -6553,11 +4958,8 @@ function enrichEpicDep(
     };
   }
   const upstream = resolved.epic;
-  // Cross-project is a boolean on the wire (NOT the readiness-side
-  // string-or-null shape) — the projection carries the basename
-  // separately so a consumer that wants to render the prefix has
-  // both fields. `resolved.cross_project` is `string | null` from the
-  // resolver; reduce to boolean here.
+  // Cross-project is a boolean on the wire (the basename rides separately);
+  // reduce the resolver's `string | null` to boolean.
   const crossProject = resolved.cross_project !== null;
   return {
     dep_token: depTok,
@@ -6570,76 +4972,39 @@ function enrichEpicDep(
 }
 
 /**
- * Schema v34 (fn-637): unix-seconds → ISO-8601 string for the resolver's
- * `now` parameter. Deterministic — `Date(unix*1000).toISOString()` is a
- * pure function of the unix-second integer carried on the event row, so
- * a from-scratch re-fold reproduces the same diagnostic ts byte-for-
- * byte (and `enrichEpicDep` drops the diagnostic on the floor anyway,
- * but the determinism contract holds end-to-end).
- *
- * Why we don't just pass the unix-seconds number through: the resolver's
- * `now` slot is typed as a string for the readiness side's
- * `new Date().toISOString()` precedent. Keeping the signature shape
- * stable across the readiness wrapper + the fold-time caller avoids
- * a `now: string | number` widening and the discriminated-union noise
- * that would ride with it.
+ * Unix-seconds → ISO-8601 string for the resolver's `now` parameter.
+ * Deterministic (a pure function of the event's unix-second integer), so a
+ * re-fold reproduces the same diagnostic ts. The resolver's `now` slot is typed
+ * as a string for the readiness side's precedent; keeping it stable avoids a
+ * `now: string | number` widening.
  */
 function eventTsToIso(ts: number): string {
   return new Date(ts * 1000).toISOString();
 }
 
 /**
- * Schema v34 (fn-637): deterministic sort for an embedded
- * `resolved_epic_deps` array. **Source order** — entries are written
- * in the same order they appear in the consumer's `depends_on_epics`
- * array (NOT sorted by `dep_token`). This matches the readiness side's
- * iteration order, so a renderer reading `resolved_epic_deps` sees the
- * deps in the same order it'd see them off `depends_on_epics`.
- *
- * The sort itself is a no-op — included as a named function for symmetry
- * with {@link sortEpicLinks} / {@link sortJobLinks} and a single hook
- * point if a future ORDER BY rule lands. Re-fold determinism holds
- * because `depends_on_epics` is the source array (persisted in the
- * event blob, byte-stable across re-folds), and the helper just walks
- * it in order.
+ * Source-order hook for an embedded `resolved_epic_deps` array: entries are
+ * written in `depends_on_epics` order (matching the readiness side), so the
+ * sort itself is a no-op — a named symmetry point with {@link sortEpicLinks} /
+ * {@link sortJobLinks} for a future ORDER BY rule.
  */
 function preserveSourceOrder(_arr: ResolvedEpicDep[]): void {
   // Intentional no-op — see docstring.
 }
 
 /**
- * Schema v34 (fn-637): the forward fold. Rebuild `epic_dep_edges` rows
- * for consumer `epicId` from scratch, then stamp the enriched
- * `resolved_epic_deps` array on the consumer's `epics` row.
+ * The forward fold: rebuild `epic_dep_edges` for consumer `epicId` from scratch,
+ * then stamp the enriched `resolved_epic_deps` array on the consumer's row.
+ * Called from the EpicSnapshot arm AFTER the consumer's row + sort_path settle
+ * but BEFORE the reverse fan-out.
  *
- * Runs INSIDE the open transaction opened by {@link applyEvent}; performs
- * zero cursor work. Called from the {@link projectPlanRow} EpicSnapshot
- * arm AFTER the INSERT/UPDATE of the consumer's row, AFTER the
- * sort_path derivation, but BEFORE the reverse fan-out (the reverse
- * pass reads `epics` for upstream rows that may have moved into / out
- * of the dep-resolution scope on this fold, and the forward pass has
- * already settled the consumer's row).
- *
- * **Full-recompute, never delta-merge.** Mirrors {@link syncPlanctlLinks}.
- * A delta-merge would double-add edges on re-fold. The forward pass
- * deletes every existing `epic_dep_edges` row for this consumer and
- * inserts one per `dep_token` in the consumer's `depends_on_epics`.
- *
- * **Raw-token edges.** Each `epic_dep_edges` row carries the raw token
- * from `depends_on_epics` verbatim — NOT the resolved id. Raw-token
- * keying makes ambiguity flips (a new same-number epic appears) and
- * dangling deps (no upstream resolves) re-stamp natively on a later
- * upstream snapshot: the reverse fan-out looks up consumers via
- * `dep_token IN (A.epic_id, 'fn-' || A.epic_number)`, and the raw
- * token is what the consumer originally typed.
- *
- * **De-duplicates within the consumer.** Two identical `depends_on_epics`
- * tokens collapse to ONE `epic_dep_edges` row (the table's `PRIMARY
- * KEY (consumer_id, dep_token)`) but BOTH render in `resolved_epic_deps`
- * — the projection mirrors the source array exactly. The de-dup at
- * the edges level is the schema constraint speaking, not a semantic
- * rule; the `INSERT OR IGNORE` shape preserves it without throwing
- * inside the transaction.
+ * Full-recompute, never delta-merge (a delta-merge would double-add on re-fold):
+ * DELETE every existing edge for this consumer, INSERT one per `dep_token`. Each
+ * edge carries the RAW token verbatim (not the resolved id) so ambiguity flips
+ * and dangling deps re-stamp natively on a later upstream snapshot — the reverse
+ * fan-out looks consumers up by `dep_token IN (A.epic_id, 'fn-' ||
+ * A.epic_number)`. Duplicate tokens collapse to one edge (the table PK) but BOTH
+ * render in `resolved_epic_deps` via `INSERT OR IGNORE`.
  *
  * NEVER throws inside the open transaction. A malformed
  * `depends_on_epics` blob is already filtered out by `projectPlanRow`'s
@@ -6654,9 +5019,8 @@ function syncEpicDepsForward(
   epicById: Map<string, Epic>,
   epicsByNumber: Map<number, Epic[]>,
 ): void {
-  // Read the consumer's row, including the just-written
-  // `depends_on_epics`. This is the post-write read — the consumer's
-  // INSERT/UPDATE has already landed in this transaction.
+  // Post-write read of the consumer's row (its INSERT/UPDATE already landed
+  // this transaction), including the just-written `depends_on_epics`.
   const consumerRow = db
     .query(
       `SELECT epic_id, epic_number, project_dir, status,
@@ -6685,10 +5049,8 @@ function syncEpicDepsForward(
     }
   }
 
-  // Full-recompute: wipe the consumer's existing edges, then insert
-  // fresh ones from `depTokens`. `INSERT OR IGNORE` collapses
-  // duplicate tokens onto a single edge row (the table's composite PK
-  // enforces it), without throwing.
+  // Full-recompute: wipe the consumer's edges, then insert fresh ones from
+  // `depTokens`. `INSERT OR IGNORE` collapses duplicate tokens onto one edge.
   db.run("DELETE FROM epic_dep_edges WHERE consumer_id = ?", [epicId]);
   for (const tok of depTokens) {
     db.run(
@@ -6697,15 +5059,10 @@ function syncEpicDepsForward(
     );
   }
 
-  // Build the enriched array. Source order — see
-  // `preserveSourceOrder`'s docstring.
   const consumerEpic = epicLiteToEpic(consumerRow);
-  // Make sure the consumer's own row is visible to the resolver — it
-  // may have been freshly INSERTed into `epics` this fold and the index
-  // was assembled BEFORE that INSERT landed on disk (we read the index
-  // mid-projectPlanRow, after the upstream INSERT but the caller assembles
-  // it before). Defense-in-depth: stamp the consumer back into the index
-  // so a self-referential dep resolves the same way it would on a re-fold.
+  // Make sure the consumer's own row is visible to the resolver — the index
+  // may have been assembled before this fold's INSERT landed. Stamping it back
+  // keeps a self-referential dep resolving the same way on a re-fold.
   if (!epicById.has(epicId)) {
     epicById.set(epicId, consumerEpic);
     if (consumerEpic.epic_number != null) {
@@ -6733,48 +5090,18 @@ function syncEpicDepsForward(
 }
 
 /**
- * Schema v34 (fn-637): the reverse fan-out. After upstream `epicId`'s
- * row was written (EpicSnapshot) or deleted (EpicDeleted), find every
- * downstream consumer whose `depends_on_epics` carries a token that
- * could match this upstream and re-stamp their `resolved_epic_deps`.
+ * The reverse fan-out. After upstream `epicId`'s row was written or deleted,
+ * find every downstream consumer whose `depends_on_epics` could match it and
+ * re-stamp their `resolved_epic_deps`. Depth-1 only — the acyclic invariant +
+ * depth-1 bound the per-event write fan-out to "the consumers of this one epic".
  *
- * Runs INSIDE the open transaction opened by {@link applyEvent}; performs
- * zero cursor work. Depth-1 only — the fan-out never recurses, even if
- * a re-stamped consumer's projection changes downstream. The acyclic
- * `depends_on_epics` invariant + depth-1 fan-out together bound the
- * write fan-out per event to "the consumers of this one epic".
- *
- * **Matching tokens** (raw-token, NOT resolved-id). Looks up consumers
- * via `dep_token IN (<full_id>, 'fn-' || <epic_number>)`. Both forms
- * are considered: a consumer typed the full id `fn-100-foo` or the
- * bare id `fn-100`. The bare-id branch catches ambiguity flips —
- * before, `fn-100` resolved to nothing (no candidate); now, with a
- * new `fn-100-bar` epic in play, it resolves to one (or two, which
- * the resolver then re-disambiguates).
- *
- * **Skip the upstream itself.** A consumer that depends on itself (a
- * pathological state) is filtered out via `consumer_id != ?`. Without
- * this, the reverse pass would re-stamp the upstream's OWN
- * `resolved_epic_deps` based on its post-write state — already done
- * by the forward pass on this same fold. Avoiding the double-stamp
- * keeps the fold-time write count tight.
- *
- * **Deterministic ORDER BY consumer_id ASC.** Re-fold determinism
- * requires the per-consumer re-stamps to land in a stable order,
- * since each re-stamp UPDATEs the consumer row and bumps its
- * `last_event_id` / `updated_at`; SQLite's result order is otherwise
- * implementation-defined.
- *
- * **`isDelete=true` branch** (EpicDeleted). Same query, same loop, same
- * re-stamp. The upstream's row was already DELETEd by `retractPlanRow`,
- * so when the resolver looks it up by full id it misses; bare-id lookups
- * also miss because the deleted row has fallen out of `epicsByNumber`.
- * Both flip the consumer's matching entry to `dangling`. The branch is
- * unified with the snapshot path because the resolver consults the LIVE
- * `epics` table via `buildEpicIndex` — once the upstream row is gone,
- * the resolution outcome flips naturally.
- *
- * NEVER throws inside the open transaction.
+ * Looks consumers up by RAW token `dep_token IN (<full_id>, 'fn-' ||
+ * <epic_number>)` (both forms — the bare-id branch catches ambiguity flips).
+ * Skips the upstream itself (`consumer_id != ?`) since the forward pass already
+ * stamped it. ORDER BY consumer_id ASC for stable re-stamp order (each bumps
+ * `last_event_id`). The EpicDeleted path is unified — the resolver consults the
+ * LIVE `epics` table, so once the upstream row is gone the matching entry flips
+ * to `dangling` naturally. NEVER throws.
  */
 function syncEpicDepsReverse(
   db: Database,
@@ -6785,11 +5112,9 @@ function syncEpicDepsReverse(
   epicById: Map<string, Epic>,
   epicsByNumber: Map<number, Epic[]>,
 ): void {
-  // Reverse adjacency lookup keyed off the raw token. Both the full id
-  // (`fn-100-foo`) and the bare id (`fn-100`) are considered — a
-  // consumer typed one or the other. Bare-id is materialized only when
-  // `epicNumber != null`; an epic with no `epic_number` (a transient
-  // shell, theoretically) projects no bare-id back-edge.
+  // Reverse adjacency lookup by raw token — both the full id and the bare id
+  // are considered. Bare-id only when `epicNumber != null` (a shell with no
+  // number projects no bare-id back-edge).
   let consumerRows: { consumer_id: string }[];
   if (epicNumber != null) {
     consumerRows = db
@@ -6879,68 +5204,37 @@ function projectJobsRow(db: Database, event: Event): void {
 
   switch (event.hook_event) {
     case "SessionStart":
-      // FIRST sight of a session: the INSERT seeds the row. The schema default
-      // gives state='stopped' — the zero-event reading. Seed the title from the
-      // scraped spawn name (priority-1 'spawn' source) so the row reads a
-      // non-NULL title from the very first event; a NULL spawn_name leaves title
-      // NULL / title_source NULL (priority 0), with Tier 0 (the payload title
-      // rule below) still seeding at the first UserPromptSubmit. The seed also
-      // captures `transcript_path` from the payload (guarded parse, NULL when
-      // absent/malformed) — a display/debug column, not a title.
+      // FIRST sight of a session: the INSERT seeds the row (schema default
+      // state='stopped'). Seed the title from the scraped spawn name (priority-1
+      // 'spawn' source); a NULL spawn_name leaves title NULL with the payload
+      // title rule still seeding at the first UserPromptSubmit. Also captures
+      // `transcript_path` (guarded parse).
       //
-      // A DUPLICATE SessionStart is a RESUME: a genuinely-ended session can only
-      // be reopened by a fresh `claude --resume` process, which fires
-      // SessionStart (source=resume) — even a no-interaction resume — so this is
-      // keeper's re-open signal. ON CONFLICT re-opens a TERMINAL row (CASE:
-      // 'ended' OR 'killed' -> 'stopped'; a mid-session compact/clear
-      // SessionStart on a working/stopped row leaves its state untouched, so it
-      // never knocks a live job backwards) and refreshes BOTH pid and
-      // start_time (a resume is a new OS process — fresh recycle-safe identity).
-      // The COALESCE on start_time preserves the persisted value when the
-      // incoming event has none (legacy / hook capture failure).
-      // title/title_source are NOT touched — they stay precedence-owned, so a
-      // resume never re-seeds the priority-1 spawn name over a higher source;
-      // created_at / cwd / transcript_path are set-once identity and stay put.
+      // A DUPLICATE SessionStart is a RESUME (a fresh `claude --resume`). ON
+      // CONFLICT re-opens a TERMINAL row (CASE: 'ended'/'killed' → 'stopped'; a
+      // working/stopped row is left untouched, so a live job is never knocked
+      // backwards) and refreshes pid + start_time (a resume is a new OS
+      // process). title/title_source/created_at/cwd/transcript_path are NOT
+      // touched — precedence-owned / set-once identity.
       {
-        // Derive `plan_verb`/`plan_ref` from the SessionStart spawn name via
-        // the same pure parser the v9→v10 migration backfill uses (single
-        // source of truth). NULL on every spawn name that doesn't match the
-        // strict `{plan|work|close|approve}::<ref>` whitelist — re-fold
-        // deterministic.
-        //
-        // Set-once identity on RESUME: the ON CONFLICT branch leaves both
-        // columns untouched. A duplicate SessionStart on a non-`{plan,work,
-        // close,approve}::` spawn (or a switch from one verb to another
-        // mid-session) never overwrites the seeded pair — mirrors the
-        // title/title_source precedence rule, where a resume never re-seeds
-        // the priority-1 'spawn' name over a higher source.
+        // Derive `plan_verb`/`plan_ref` from the spawn name via the shared pure
+        // parser; NULL on any name outside the `{plan|work|close|approve}::<ref>`
+        // whitelist. Set-once on RESUME (ON CONFLICT leaves both untouched).
         const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
           event.spawn_name,
         );
-        // fn-678 (schema v50): discharge-on-bind gating. Read the jobs row
-        // BEFORE the UPSERT to detect spawn-INSERT (no prior row) versus
-        // resume ON CONFLICT (a row already exists). The discharge of any
-        // matching `pending_dispatches` row fires ONLY on the spawn-INSERT
-        // branch — a RESUME must NOT discharge a legitimately re-pending
-        // dispatch (the autopilot may have minted a fresh `Dispatched` for
-        // the same `(verb, id)` after the original session ended; a resume
-        // arriving in the same `(plan_verb, plan_ref)` namespace would
-        // otherwise wrongly free a real in-flight slot). The pre-INSERT
-        // SELECT is pure (reads only the persisted row), so re-fold
-        // determinism holds.
+        // Discharge-on-bind gating: read the jobs row BEFORE the UPSERT to
+        // distinguish spawn-INSERT (no prior row) from resume ON CONFLICT. The
+        // pending-dispatch discharge fires ONLY on spawn-INSERT — a RESUME must
+        // NOT discharge a legitimately re-pending dispatch. The pre-INSERT SELECT
+        // is pure, so re-fold determinism holds.
         const priorJob = db
           .query("SELECT 1 AS one FROM jobs WHERE job_id = ?")
           .get(jobId) as { one: number } | null;
         const isSpawnInsert = priorJob == null;
-        // Schema v40 (fn-652): seed `name_history` with `["<spawn_name>"]`
-        // on the spawn INSERT when `spawn_name != null`, else `'[]'` (the
-        // schema default, also written explicitly for symmetry). RESUME is
-        // a no-touch: the ON CONFLICT branch must leave `name_history`
-        // alone — mirrors `title` / `title_source` (precedence-owned, a
-        // resume never re-seeds the priority-1 spawn name over a higher
-        // source). The title precedence-write block below the switch is
-        // the only path that appends a new entry; the spawn seed is set-
-        // once identity per session, so re-fold determinism holds.
+        // Seed `name_history` with `["<spawn_name>"]` on the spawn INSERT (else
+        // `'[]'`). RESUME is a no-touch (no `name_history` clause in the UPDATE
+        // SET); the title precedence-write block is the only path that appends.
         const spawnNameHistory =
           event.spawn_name != null ? JSON.stringify([event.spawn_name]) : "[]";
         db.run(
@@ -6996,56 +5290,29 @@ function projectJobsRow(db: Database, event: Event): void {
             plan_verb,
             plan_ref,
             event.config_dir,
-            // Schema v36: derive the profile name from the same helper the
-            // `profiles` seed below uses. NULL config_dir → NULL profile_name
-            // (NOT the `''`-collapse profiles applies) so the column tracks
-            // `jobs.config_dir`'s own nullability under the resume COALESCE.
+            // NULL config_dir → NULL profile_name (NOT the `''`-collapse the
+            // profiles seed applies) so the column tracks `jobs.config_dir`'s
+            // own nullability under the resume COALESCE.
             event.config_dir == null ? null : projectBasename(event.config_dir),
-            // Schema v40 (fn-652): see comment above. ON CONFLICT leaves
-            // jobs.name_history untouched (no `name_history = ...` clause
-            // in the UPDATE SET), so RESUME never re-seeds.
             spawnNameHistory,
           ],
         );
-        // Schema v33 (fn-639): seed a visible `profiles` row for this
-        // session's `config_dir` bucket. `INSERT OR IGNORE` so a resume into
-        // a profile that already has a row is a no-op, and a duplicate
-        // SessionStart on the same profile never re-stamps `last_event_id`
-        // (the first seed wins). `COALESCE(?,'')` collapses a NULL
-        // `events.config_dir` (default `~/.claude` — no `CLAUDE_CONFIG_DIR`
-        // env) into the empty-string sentinel, matching the rate-limit
-        // fan-out's identical expression so a NULL-config session's later
-        // rate limit lands on the exact `''` row it seeded here.
-        // `last_rate_limit_*` stay NULL — populated only by the rate-limit
-        // arm below. Pure function of the event (no `Date.now`/env/OS state).
-        //
-        // Schema v35 (fn-642): also seed `profile_name` from the SAME
-        // `projectBasename` derivation the v34→v35 migrate backfill uses
-        // (byte-identical so a re-fold post-migrate converges). The `''`
-        // sentinel's basename is `""`; the `profile_name != ''` guard on
-        // both sides of the usage<->profiles join keeps it from cross-
-        // contaminating a `''`-id usage row. `INSERT OR IGNORE` means a
-        // pre-existing row keeps the first seed's `profile_name`, but the
-        // helper is a pure function of `config_dir` so a duplicate
-        // SessionStart on the same `config_dir` would derive the same value
-        // anyway — re-fold determinism holds.
+        // Seed a visible `profiles` row for this session's `config_dir` bucket.
+        // `INSERT OR IGNORE` so the first seed wins. `COALESCE(?,'')` collapses a
+        // NULL config_dir into the `''` sentinel, matching the rate-limit
+        // fan-out's expression so a NULL-config session's later rate limit lands
+        // on the row it seeded here. `profile_name` is seeded from the same
+        // `projectBasename` the migrate backfill uses; the `profile_name != ''`
+        // guard on the usage<->profiles join keeps the `''` sentinel from
+        // cross-contaminating. Pure function of the event.
         db.run(
           `INSERT OR IGNORE INTO profiles (config_dir, profile_name, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?, ?)`,
           [event.config_dir, projectBasename(event.config_dir), event.id, ts],
         );
-        // fn-678 (schema v50): discharge-on-bind. Fires ONLY on the
-        // spawn-INSERT branch (set-once stamp of `plan_verb`/`plan_ref`),
-        // NEVER on the resume ON CONFLICT branch. A successful bind of a
-        // session to a `(plan_verb, plan_ref)` pair means the autopilot's
-        // `Dispatched` intent has materialized into a real keeper job — the
-        // launch-window slot is no longer in-flight, the row is reaped.
-        // Idempotent DELETE: no-op when no pending row exists (the row
-        // already cleared via `DispatchFailed` / `DispatchExpired`, or
-        // this session bound to a `(verb, id)` no autopilot ever
-        // dispatched — a human-launched session whose spawn name happens
-        // to match the verb whitelist). Pure fold: reads only the
-        // payload-derived `plan_verb`/`plan_ref` and `isSpawnInsert` from
-        // the in-fold pre-SELECT, re-fold deterministic.
+        // Discharge-on-bind: fires ONLY on spawn-INSERT, NEVER on resume. A
+        // successful bind means the autopilot's `Dispatched` intent materialized
+        // into a real job, so the launch-window slot is reaped. Idempotent DELETE
+        // (no-op when no pending row). Pure fold.
         if (isSpawnInsert && plan_verb != null && plan_ref != null) {
           db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
             plan_verb,
@@ -7079,60 +5346,27 @@ function projectJobsRow(db: Database, event: Event): void {
         break;
       }
       // A prompt means the session is ALIVE — set 'working' unconditionally (no
-      // terminal guard). This is also a re-open path: a session can resume
-      // straight into a prompt with no SessionStart hook, and a spurious
-      // mid-session SessionEnd(reason=other) is sometimes followed immediately by
-      // a prompt in the SAME live process. Either way the job must leave 'ended'
-      // or 'killed' — both are revivable on a fresh prompt (the producer can
-      // probe the live new process). The un-end lives in the fold, not a
-      // liveness overlay — see the header.
+      // terminal guard). Also a re-open path: a session can resume straight into
+      // a prompt with no SessionStart, and a spurious mid-session SessionEnd is
+      // sometimes followed by a prompt in the SAME process. Either way the job
+      // leaves 'ended'/'killed'.
       //
-      // Pid is COALESCE-refreshed so a re-open updates to the live process's pid
-      // (mirrors SessionStart's resume path). UserPromptSubmit events never
-      // carry start_time (only SessionStart scrapes it), so we cannot refresh
-      // it here.
+      // Pid is COALESCE-refreshed; UserPromptSubmit carries no start_time. When
+      // the event's pid DIFFERS from the persisted pid, the resume landed in a
+      // different process, so the persisted start_time now describes a recycled
+      // process — clearing it to NULL keeps the `(pid, start_time)` recycle-safe
+      // identity honest (otherwise the next seed sweep would fire a Killed
+      // carrying the stale start_time and fold the live row to 'killed'). NULL
+      // activates the loose pid-only match in both producers and the Killed
+      // fold; the next SessionStart refreshes it. The CASE is pure over
+      // (event.pid, row.pid).
       //
-      // BUT: when the event's pid differs from the persisted pid, the resume
-      // landed in a DIFFERENT live process, and the persisted start_time now
-      // describes a dead/recycled process. Leaving it stuck breaks the
-      // recycle-safe identity invariant — `(pid, start_time)` must always
-      // describe the same live process — and the next boot's seed sweep would
-      // see `pid alive + osStart != stored start_time`, fire a synthetic Killed
-      // payload carrying the STORED stale start_time, and the reducer's strict
-      // (pid, start_time) match would fold the live row to 'killed' (the bug
-      // chain documented in fn-579-fix-stale-start-time-on-ups-resume.1).
-      //
-      // Clearing start_time to NULL on pid change activates the legacy-loose
-      // branches in both producers (`seed-sweep.ts`: "pid alive + no stored
-      // start_time → cannot prove recycle. Leave alone.") and the reducer's
-      // own Killed fold (loose pid-only match). The next SessionStart will
-      // refresh start_time to the new live value. When the event omits pid
-      // (legacy hook) or pid matches, behavior is unchanged.
-      //
-      // The CASE is a pure function of (event.pid, row.pid) — re-fold safe.
-      // Also clears `last_api_error_at` AND `last_api_error_kind` to NULL
-      // together on every revival: a fresh prompt means the human picked
-      // up after the quota reset / re-auth / retry, so the "this stoppage
-      // was api-error-caused" annotation no longer applies. The clear is
-      // unconditional (cheap, no-op when already NULL), pure (a from-
-      // scratch re-fold sees the same write), and paired (both columns
-      // move together — no code path may clear one without the other,
-      // see {@link import("./types").JobLinkEntry}'s paired-NULL
-      // invariant).
-      //
-      // Schema v25 extends the same paired-clear to
-      // `last_input_request_at` + `last_input_request_kind`: a fresh
-      // prompt means the human answered the pending `AskUserQuestion`
-      // (or whatever interactive built-in tool was blocking), so the
-      // "this stoppage was input-request-caused" annotation no longer
-      // applies either. Unconditional (cheap, no-op when already NULL)
-      // and paired with its sibling column.
-      // Schema v52 / fn-686 extends the same paired-clear to
-      // `last_permission_prompt_at` + `last_permission_prompt_kind`: a
-      // fresh prompt means the human answered the pending permission
-      // dialog or elicitation request (or moved on entirely), so the
-      // annotation no longer applies. Unconditional (cheap, no-op when
-      // already NULL) and paired with its sibling column.
+      // Clears the api-error / input-request / permission-prompt annotation
+      // pairs to NULL together: a fresh prompt means the human picked up after
+      // the quota reset / answered the question / dismissed the dialog, so the
+      // "why it stopped" annotations no longer apply. Each is unconditional
+      // (no-op when already NULL) and paired (both columns of a pair move
+      // together).
       db.run(
         `UPDATE jobs SET state = 'working',
                          last_api_error_at = NULL,
@@ -7155,17 +5389,11 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     case "Stop": {
-      // Schema v52 / fn-686: session-level backstop clear for the
-      // permission-prompt / elicitation pair. Hoisted ABOVE the
-      // sub-agent guard for the same reason as the v51 monitors
-      // snapshot-replace below: even a guard-swallowed Stop (parent
-      // yielded to a Task sub-agent) means the dialog is no longer
-      // the live worker's concern — the worker cannot have reached
-      // Stop while the dialog was still up. Gated-on-IS-NOT-NULL so
-      // the overwhelming majority of Stops (no prior permission
-      // prompt) are a zero-cost no-op, matching the v25 Pre/PostToolUse
-      // gated-clear shape. Paired-NULL: both columns clear together.
-      // `changes > 0` gates the embedded re-fan.
+      // Session-level backstop clear for the permission-prompt / elicitation
+      // pair, hoisted ABOVE the sub-agent guard: even a guard-swallowed Stop
+      // means the dialog is no longer the live worker's concern. Gated-on-IS-NOT
+      // -NULL so the common no-prior-prompt case is a zero-cost no-op. Paired
+      // -NULL; `changes > 0` gates the re-fan.
       const stopClearRes = db.run(
         `UPDATE jobs SET last_permission_prompt_at = NULL,
                          last_permission_prompt_kind = NULL,
@@ -7177,43 +5405,20 @@ function projectJobsRow(db: Database, event: Event): void {
       if (stopClearRes.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
-      // Schema v51 (fn-682): live monitors snapshot-replace. Hoisted
-      // ABOVE the sub-agent guard so a guard-swallowed Stop (the
-      // parent yielded to a Task tool sub-agent and is conceptually
-      // still working) STILL refreshes `jobs.monitors` from this
-      // Stop's `data.background_tasks` snapshot. The snapshot is
-      // authoritative — Claude Code re-emits the FULL live set on
-      // every Stop — and a dead background shell that just dropped
-      // from the snapshot must not linger because the parent's
-      // lifecycle write happened to be suppressed.
-      //
-      // Pure function of (this event's payload, the immutable event
-      // log up to event.id - 1, the persisted row). Empty / missing
-      // / malformed `background_tasks` → `'[]'` (drop-when-dead, the
-      // snapshot paradox). Three-way provenance — `monitor` /
-      // `bash-bg` / `ambient` — resolved by `computeMonitors`'s
-      // index-backed scan against `idx_events_background_task_id`.
-      // Re-fold determinism: every input is event-derived; no
-      // wallclock / env / fs / DB-liveness probe.
-      //
-      // The UPDATE writes ONLY `monitors` and `last_event_id` /
-      // `updated_at` — NOT `state`. State flips are owned by the
-      // lifecycle UPDATE below (and gated by the sub-agent guard). A
-      // monitors-only write must NOT touch state because a sub-agent
-      // is potentially mid-flight; an unconditional state flip here
-      // would re-open the predicate-5 / predicate-7 dup-fire window
-      // the sub-agent guard exists to close. The matches=0 case (no
-      // jobs row for this session yet) is a clean no-op — same
-      // signal as the lifecycle UPDATE below for an unknown session.
+      // Live monitors snapshot-replace, hoisted ABOVE the sub-agent guard so a
+      // guard-swallowed Stop STILL refreshes `jobs.monitors` from this Stop's
+      // `data.background_tasks` snapshot (authoritative — Claude Code re-emits
+      // the FULL live set every Stop, so a just-dead shell must not linger).
+      // Empty/malformed → `'[]'` (drop-when-dead). Writes ONLY `monitors` /
+      // stamps, NOT `state`: an unconditional state flip here would re-open the
+      // predicate-5/7 dup-fire window the sub-agent guard closes. Pure over
+      // event-derived inputs.
       let stopData: unknown = null;
       try {
         stopData = JSON.parse(event.data);
       } catch {
-        // Malformed data blob — `extractBackgroundTasks(null)` returns
-        // [], so `computeMonitors` returns '[]' (the snapshot paradox:
-        // an unreadable Stop is treated as "no live monitors"). Cursor
-        // still advances per the CLAUDE.md "safe value on malformed
-        // payload" invariant.
+        // Malformed blob → `computeMonitors` returns '[]' (an unreadable Stop is
+        // treated as "no live monitors"); cursor still advances.
         stopData = null;
       }
       const nextMonitors = computeMonitors(
@@ -7222,35 +5427,21 @@ function projectJobsRow(db: Database, event: Event): void {
         event.id,
         stopData,
       );
-      // Gated by the same terminal guard as the state UPDATE below: a
-      // stray Stop on an already-terminal row (ENDED / KILLED) must
-      // not re-touch `last_event_id` / `updated_at` — the terminal
-      // write already cleared `monitors` to '[]', and a second write
-      // would bump the event-id stamp on a row whose lifecycle is
-      // closed (regression-tested by "Stop on a killed row is a
-      // no-op (terminal guard)"). The hoist above the SUB-AGENT guard
-      // is what matters for fn-682's snapshot-refresh contract — a
-      // sub-agent-yielded Stop on a STILL-LIVE row reaches here and
-      // refreshes monitors. A terminal row has no live monitors by
-      // definition; the no-op is correct.
+      // Gated by the same terminal guard as the state UPDATE below: a stray Stop
+      // on an already-terminal row must not re-touch the stamps (a terminal row
+      // has no live monitors). The hoist above the SUB-AGENT guard is what lets
+      // a sub-agent-yielded Stop on a still-live row refresh monitors.
       const monitorsRes = db.run(
         `UPDATE jobs SET monitors = ?, last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [nextMonitors, event.id, ts, jobId],
       );
-      // Schema v59 / fn-719 (task 1): stamp the provenance-filtered
-      // `has_live_worker_monitor` occupancy fact onto this session's
-      // embedded job element. Gated on `changes > 0` so a guarded no-op on
-      // a terminal row does NOT re-fan a stale stamp — the terminal write
-      // already cleared `monitors='[]'`, which yields `false`. Stamped HERE
-      // (not via `syncIfPlanRef`) because the monitors-only write is
-      // hoisted ABOVE the sub-agent guard: a mid-Task-yield Stop refreshes
-      // `jobs.monitors` but skips the `state='stopped'` UPDATE and its
-      // `syncIfPlanRef` fan-out, so without this explicit stamp the
-      // embedded occupancy fact would go stale exactly in the
-      // guard-swallow case (the fn-715.2 incident shape). The helper reads
-      // the session's `plan_ref` to resolve the bound task and is a
-      // deterministic no-op for non-work sessions / missing task elements.
+      // Stamp the `has_live_worker_monitor` occupancy fact onto the embedded
+      // job element. Gated on `changes > 0` so a guarded terminal-row no-op
+      // doesn't re-fan a stale stamp. Stamped HERE (not via `syncIfPlanRef`)
+      // because the monitors-only write is hoisted above the sub-agent guard and
+      // skips the `syncIfPlanRef` fan-out, so the fact would otherwise go stale
+      // in the guard-swallow case.
       if (monitorsRes.changes > 0) {
         const planRow = db
           .query("SELECT plan_ref FROM jobs WHERE job_id = ?")
@@ -7263,49 +5454,24 @@ function projectJobsRow(db: Database, event: Event): void {
           eventTs: ts,
         });
       }
-      // Keeps the terminal guard: a stray Stop landing on a still-terminal job
-      // (no intervening re-open) must not resurrect it. The guard now covers
-      // BOTH terminal states — 'ended' (from SessionEnd) and 'killed' (from a
-      // synthetic Killed event). After a real re-open (SessionStart or
-      // UserPromptSubmit) the row is no longer terminal, so a normal post-resume
-      // Stop applies here as usual.
+      // Terminal guard: a stray Stop on a still-terminal job (no intervening
+      // re-open) must not resurrect it; covers both 'ended' and 'killed'.
       //
-      // Sub-agent guard: when Claude Code's parent agent dispatches a Task
-      // tool, it emits Stop and yields to the sub-agent (sub-agent events
-      // share the parent session_id; the parent's hook stream genuinely sees
-      // a Stop). Conceptually the session is still working until the sub-
-      // agent returns AND any post-sub follow-up emits a subsequent real Stop.
-      // Honoring the mid-yield Stop drops state to 'stopped' while a sub is
-      // running, which clears readiness predicate 5 prematurely — predicate 7
-      // then fires `job-pending` the moment SubagentStop lands (if approval is
-      // already pending), and autopilot's approval-notify dup-fires when the
-      // parent resumes and Stops a second time. Skip the state flip while any
-      // subagent_invocations row for this job is still status='running'.
+      // Sub-agent guard: when the parent dispatches a Task tool it emits Stop and
+      // yields to the sub-agent (which shares the parent session_id), but the
+      // session is conceptually still working. Honoring the mid-yield Stop would
+      // clear readiness predicate 5 prematurely and dup-fire predicate 7's
+      // approval-notify. So skip the state flip while any subagent_invocations
+      // row is still `running`. Same-name collapse: a `running` row is ignored if
+      // a LATER same-`(job_id, subagent_type)` row exists — "same name, higher
+      // turn_seq" means the older row is an orphan whose SubagentStop never
+      // landed; this matches the client's `collapseSubagentsByName`.
+      // `subagent_type IS …` is null-safe equality. Pure over the event log.
       //
-      // Same-name collapse: a `running` row is ignored by the guard if a
-      // LATER same-`(job_id, subagent_type)` row exists in the projection.
-      // Operating assumption: Claude Code does not spawn parallel same-name
-      // sub-agents in one parent session, so "same name with a higher
-      // turn_seq" means "the older row is an orphan whose `SubagentStop`
-      // never landed" — exactly the fn-593.3 case. The guard then matches
-      // the client-side `collapseSubagentsByName` rule, so server `jobs.state`
-      // and client predicate 6 unwedge together. `subagent_type IS …` is
-      // null-safe equality (matches null-to-null but not null-to-non-null),
-      // mirroring the client key derivation that treats `subagent_type ??
-      // ""` as the group key.
-      //
-      // Re-fold determinism: subagent_invocations reflects every SubagentStart
-      // / SubagentStop folded with id < event.id (sequential fold), so the
-      // running-check is a pure function of the event log up to this point.
-      //
-      // Recency bound (fn-638.1): anchor the staleness check on the SURVIVING
-      // running row (max `turn_seq` per same-name group) — measured against
-      // the newest running `ts`, never a demoted orphan. Return that `ts` from
-      // the same query so the JS-side comparison reads the exact row the
-      // collapse rule already chose to honor. ORDER BY ts DESC ensures
-      // multiple concurrent in-flight sub-agents pick the newest start (a
-      // single slow-but-real sub keeps the guard armed; we only release once
-      // even the freshest survivor crosses the bound).
+      // Recency bound: anchor the staleness check on the SURVIVING running row
+      // (max `turn_seq` per name group), measured against its `ts` — ORDER BY ts
+      // DESC so multiple in-flight subs pick the newest start (the guard only
+      // releases once even the freshest survivor crosses the bound).
       const subRunning = db
         .query(
           `SELECT s1.ts AS ts FROM subagent_invocations s1
@@ -7322,13 +5488,9 @@ function projectJobsRow(db: Database, event: Event): void {
         )
         .get(jobId) as { ts: number | null } | null;
       if (subRunning != null) {
-        // Edge cases (CLAUDE.md "never throw inside the fold"):
-        // - NULL `ts` on a legacy/malformed running row → conservatively
-        //   treat as not-stuck (keep swallowing) to avoid a premature
-        //   release on a row whose age we cannot honestly compute.
-        // - Negative / zero `age` (clock skew, same-second events,
-        //   re-fold replays) → keep swallowing; the bound only releases
-        //   once `age` STRICTLY exceeds `MAX_STOP_YIELD_GAP_SEC`.
+        // Keep swallowing on a NULL/non-positive `ts` (age uncomputable) or a
+        // non-positive age (clock skew / same-second); the bound only releases
+        // once age STRICTLY exceeds `MAX_STOP_YIELD_GAP_SEC`.
         const rowTs = subRunning.ts;
         if (rowTs == null || rowTs <= 0) {
           break;
@@ -7337,23 +5499,16 @@ function projectJobsRow(db: Database, event: Event): void {
         if (age <= MAX_STOP_YIELD_GAP_SEC) {
           break;
         }
-        // Fall through: the newest surviving running sub-agent is older
-        // than the bound — treat as an orphan whose `SubagentStop` never
-        // landed, release the Stop gate. The UPDATE below writes
-        // `state='stopped'` and the standard `syncIfPlanRef` fan-out runs
-        // (which in turn re-stamps every linked epic via
-        // `syncJobLinksOnJobWrite`, so the state flip propagates to the
-        // `epics.job_links` projection symmetrically with the normal
-        // mid-sub-completed Stop path).
+        // Fall through: the newest surviving sub-agent is older than the bound —
+        // an orphan whose SubagentStop never landed; release the Stop gate.
       }
       const res = db.run(
         `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
-      // Sync only when the UPDATE actually wrote — a guarded no-op on a
-      // still-terminal row must NOT re-fan the embedded entry (it would
-      // re-write a stale-but-unchanged element with the new event_id).
+      // Sync only when the UPDATE actually wrote — a guarded no-op must NOT
+      // re-fan a stale-but-unchanged element with the new event_id.
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
@@ -7361,56 +5516,35 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     case "SessionEnd": {
-      // Lands on any non-terminal row. The terminal guard keeps it idempotent
-      // on 'ended' AND prevents a late SessionEnd from clobbering a 'killed'
-      // row (the killed signal is more informative because it carries the
-      // proven-dead `(pid, start_time)` evidence; an ended-after-killed write
-      // would mask it). Matches zero rows for a terminal event with no prior
-      // SessionStart — a correct no-op.
+      // The terminal guard keeps this idempotent on 'ended' AND prevents a late
+      // SessionEnd from clobbering a 'killed' row (the killed signal carries
+      // proven-dead evidence and outranks). Clears `monitors='[]'` in the same
+      // UPDATE (terminal jobs have no live monitors). Matches zero rows for a
+      // terminal event with no prior SessionStart — a correct no-op.
       const res = db.run(
         `UPDATE jobs SET state = 'ended', monitors = '[]', last_event_id = ?, updated_at = ?
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [event.id, ts, jobId],
       );
-      // Schema v51 (fn-682): clear `monitors` to `'[]'` as part of the
-      // terminal write — a terminal job has no live monitors by
-      // definition. Carried inside the same UPDATE (rather than a
-      // second statement) so the cursor=0 re-fold reproduces a
-      // byte-identical row write order. Gated by the same terminal
-      // guard as `state`: a stray SessionEnd on an already-terminal
-      // row must NOT clobber `monitors` (the prior terminal write
-      // already cleared it; a second clobber would still write '[]'
-      // but with a stale `last_event_id` — the guard keeps the
-      // matches=0 no-op honest).
       if (res.changes > 0) {
         sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);
         syncIfPlanRef(db, jobId, event.id, ts);
-        // Schema v59 / fn-719 (task 1): force the embedded occupancy fact
-        // to `false` on the terminal write. The `monitors='[]'` clear above
-        // makes the fact-source false, but `syncIfPlanRef`'s
-        // `buildEmbeddedJob` carve-out PRESERVES the prior value forward —
-        // so without this explicit clear, a job that stopped with a live
-        // worker monitor would carry a stale `true` into its terminal
-        // element. `stampEmbeddedMonitorFact` no-ops when already false.
+        // Force the embedded occupancy fact to `false`: the `monitors='[]'`
+        // clear makes the source false, but `buildEmbeddedJob`'s carve-out
+        // would otherwise PRESERVE a stale `true` into the terminal element.
         clearEmbeddedMonitorFactOnTerminal(db, jobId, event.id, ts);
       }
       break;
     }
 
     case "Killed":
-      // Synthetic event emitted by the boot seed sweep + the live exit-watcher
-      // when a `(pid, start_time)` pair is proven dead (the bare pid is unsafe
-      // on macOS where recycle is common). The producer pre-computes the
-      // `(pid, start_time)` payload — the reducer NEVER re-probes liveness
-      // here (a re-probe inside the fold would break re-fold determinism).
-      //
-      // Match rule (Q7): fold to 'killed' iff the persisted (pid, start_time)
-      // matches the event's payload, OR the persisted start_time is NULL
-      // (legacy row — loose match on pid alone). On mismatch / missing pid /
-      // missing target row, short-circuit as a stale event — the cursor still
-      // advances (the surrounding applyEvent commits the update), no row write,
-      // no throw. NEVER throw inside the open BEGIN IMMEDIATE transaction (a
-      // throw rolls back the cursor and wedges the reducer).
+      // Synthetic event from the seed sweep / exit-watcher when a `(pid,
+      // start_time)` pair is proven dead. The producer pre-computes the payload;
+      // the reducer NEVER re-probes liveness (a re-probe would break re-fold
+      // determinism). Fold to 'killed' iff the persisted (pid, start_time)
+      // matches, OR the persisted start_time is NULL (legacy loose pid-only
+      // match). On mismatch / missing pid / missing row, short-circuit as stale
+      // — no row write, no throw.
       {
         const payload = extractKilledPayload(event);
         if (payload == null) {
@@ -7426,19 +5560,12 @@ function projectJobsRow(db: Database, event: Event): void {
         if (row == null) {
           break; // no jobs row for this session — safe no-op.
         }
-        // fn-743 pidless reap: a Killed event carrying `pid: null` reaps a
-        // `stopped`/`working` row whose persisted pid is ALSO NULL — an
-        // unwatchable row the exit-watcher could never arm and the seed sweep
-        // could never probe. Guarded both ways: the payload pid must be NULL
-        // AND the row pid must be NULL. A pidless event therefore NEVER folds
-        // a row that carries a real (watchable) pid — that row is the live
-        // exit-watcher's / seed-sweep's job, matched on the strict
-        // (pid, start_time) identity below. No liveness claim is made here: a
-        // NULL-pid row is terminal by construction. The pidless arm carries
-        // its OWN terminal-state guard (the strict arm relies on the
-        // (pid, start_time) identity instead, and re-emitting a strict Killed
-        // on an already-killed row re-writes byte-identically on re-fold — a
-        // guard there would change re-fold output, so it's pidless-only).
+        // Pidless reap: a Killed carrying `pid: null` reaps a non-terminal row
+        // whose persisted pid is ALSO NULL (unwatchable, terminal by
+        // construction). Guarded both ways, so a pidless event never folds a row
+        // with a real pid (that's the strict arm's job). The pidless arm carries
+        // its OWN terminal guard; the strict arm relies on the (pid, start_time)
+        // identity instead (a terminal guard there would change re-fold output).
         if (payload.pid == null) {
           if (row.pid != null) {
             break; // pidless reap must not touch a row that has a real pid.
@@ -7463,69 +5590,30 @@ function projectJobsRow(db: Database, event: Event): void {
              WHERE job_id = ?`,
           [event.id, ts, jobId],
         );
-        // Schema v51 (fn-682): clear `monitors` to `'[]'` on the
-        // proven-kill write — same terminal-cleanup contract as the
-        // SessionEnd arm. Carried inside the same UPDATE so the
-        // re-fold reproduces a byte-identical row write order.
-        // Sweep fires ONLY on the proven write path, mirroring sync. The
-        // earlier `break` arms (malformed payload, missing row, stale
-        // mismatch) MUST NOT sweep — no lifecycle write happened, so a
-        // sweep would be a spurious mid-life mutation of running subagent
-        // rows whose parent session is still healthy.
+        // Sweep + sync + clear fire ONLY here, on the proven write path. The
+        // earlier `break` arms (malformed / missing / stale) MUST NOT — no
+        // lifecycle write happened, so any of them would be a spurious mutation.
         sweepRunningSubagentsToUnknown(db, jobId, event.id, ts);
-        // Sync fires ONLY here, on the proven write path. The earlier
-        // `break` arms (malformed payload, missing row, stale mismatch) MUST
-        // NOT sync — no write happened, the embedded entry would otherwise
-        // re-write with a stale-but-unchanged element keyed to this event id.
         syncIfPlanRef(db, jobId, event.id, ts);
-        // Schema v59 / fn-719 (task 1): force the embedded occupancy fact to
-        // `false` on the proven-kill terminal write — same carve-out-override
-        // reasoning as the SessionEnd arm above.
         clearEmbeddedMonitorFactOnTerminal(db, jobId, event.id, ts);
       }
       break;
 
     case "RateLimited":
     case "ApiError": {
-      // Dual-case fold (schema v24). Both labels route through the same
-      // handler so the historical event log re-folds byte-deterministically:
-      //
-      //   - `RateLimited` is the legacy synthetic event_type (forever — the
-      //     event log is immutable per CLAUDE.md "hook/main is sole writer"
-      //     + "append-only"). Forces `kind = "rate_limit"` so the projection
-      //     reads identically to a fresh-mint `ApiError(kind="rate_limit")`.
-      //   - `ApiError` is the schema-v24 mint — main writes it from the
-      //     transcript-worker `api-error` message (task .2) carrying the
-      //     openclaude `SDKAssistantMessageError.type`. The event's
-      //     `data.kind` routes through `validateApiErrorKind` (anything not
-      //     in the canonical allow-list — including the SDK's own
-      //     `"unknown"` — folds to `"unknown"`).
-      //
-      // Both arms write `last_api_error_at` + `last_api_error_kind`
-      // together in a single compound UPDATE — paired-NULL invariant
-      // (CLAUDE.md "schema defaults match zero-event projection"); no code
-      // path may stamp one without the other. The board pill pair is
-      // byte-identical under a from-scratch re-fold.
-      //
-      // Same terminal guard as Stop: a stray ApiError on an already-
-      // terminal row must NOT resurrect it (and must not stamp the
-      // annotation onto a row whose lifecycle is already `ended` / `killed`
-      // for unrelated reasons — the api-error signal is by definition
-      // mid-life). The terminal guard is preserved verbatim from the
-      // pre-v24 `RateLimited` arm.
+      // Dual-case fold so the historical log re-folds byte-deterministically:
+      // legacy `RateLimited` forces `kind = "rate_limit"`; `ApiError` routes
+      // `data.kind` through `validateApiErrorKind` (non-allow-list → "unknown").
+      // Both write the `(last_api_error_at, last_api_error_kind)` pair together
+      // (paired-NULL). Same terminal guard as Stop.
       const kind: ApiErrorKind =
         event.hook_event === "RateLimited"
           ? "rate_limit"
           : extractApiErrorKind(event);
       // Sub-agent guard (mirrors Stop): suppress the state flip while any
-      // subagent_invocations row for this job is status='running'. The
-      // parent isn't actively making API calls while it waits on a sub-
-      // agent, but an api-error annotation may still land in that window
-      // (synthetic minting from the transcript-worker is independent of
-      // sub-agent lifecycle). Stamp the (last_api_error_at, last_api_error_kind)
-      // pair unconditionally — that's the honest annotation reading — while
-      // keeping state at its pre-event value via CASE. Pure function of the
-      // event log up to event.id (sequential fold of SubagentStart/Stop).
+      // subagent row is `running` (the parent isn't making API calls while it
+      // waits on a sub), but stamp the annotation pair UNCONDITIONALLY — that's
+      // the honest reading — via the CASE keeping state at its pre-event value.
       const res = db.run(
         `UPDATE jobs SET state = CASE
                            WHEN EXISTS (
@@ -7542,34 +5630,17 @@ function projectJobsRow(db: Database, event: Event): void {
            WHERE job_id = ? AND state NOT IN ('${ENDED}','${KILLED}')`,
         [ts, kind, event.id, ts, jobId],
       );
-      // Sync only when the UPDATE actually wrote — a guarded no-op on a
-      // still-terminal row must NOT re-fan the embedded entry (it would
-      // re-write a stale-but-unchanged element with the new event_id).
+      // Sync only when the UPDATE wrote — a guarded no-op must NOT re-fan a
+      // stale-but-unchanged element with the new event_id.
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
-      // Schema v33 (fn-639): profile-level rate-limit fan-out. Gated on
-      // the already-resolved `kind === "rate_limit"` local above — covers
-      // both the legacy `RateLimited` event_type (forced to "rate_limit")
-      // and the v24 `ApiError` mint whose `extractApiErrorKind` returned
-      // "rate_limit". Other `ApiErrorKind` values (`authentication_failed`,
-      // `server_error`, etc.) are out of scope per fn-639 — only `rate_limit`
-      // stamps the profile row.
-      //
-      // Read the session's `config_dir` from `jobs` in-transaction (the
-      // `syncIfPlanRef` read-then-write precedent at ~:2714-2738). Null-
-      // guarded: if the jobs row is absent (a rate_limit landing before
-      // SessionStart on a brand-new session — unusual but legal), skip the
-      // fan-out; the cursor still advances. The UPSERT runs INDEPENDENTLY
-      // of the jobs UPDATE guard above — a rate_limit on a terminal jobs
-      // row still attributes to the profile (the profile-level signal is
-      // honest regardless of the per-session terminal guard).
-      //
-      // UPSERT shape: last-write-wins on `last_rate_limit_at`. Events fold
-      // in id order, so a later event always carries a strictly-greater
-      // (ts, id) pair — no `max()` guard needed. `COALESCE(?,'')` matches
-      // the SessionStart seed's identical expression so a NULL-config
-      // session's rate limit lands on the exact `''` row it seeded.
+      // Profile-level rate-limit fan-out, gated on `kind === "rate_limit"` (other
+      // ApiErrorKind values are out of scope). Reads `config_dir` in-transaction;
+      // null-guarded (a rate_limit before SessionStart skips). Runs INDEPENDENTLY
+      // of the jobs UPDATE guard — a rate_limit on a terminal row still
+      // attributes to the profile. Last-write-wins (events fold id-ordered);
+      // `COALESCE(?,'')` matches the SessionStart seed's sentinel.
       if (kind === "rate_limit") {
         const profileRow = db
           .query("SELECT config_dir FROM jobs WHERE job_id = ?")
@@ -7592,55 +5663,20 @@ function projectJobsRow(db: Database, event: Event): void {
               ts,
             ],
           );
-          // Schema v35 (fn-642): forward fan-out — colocate the rate-limit
-          // annotation on the matching `usage` row so a single `usage`
-          // subscribe carries both quota numbers and rate-limit state. The
-          // join key is `usage.id = profiles.profile_name` (the on-disk
-          // profile-directory basename agentuse and keeper agreed on).
+          // Forward fan-out: colocate the rate-limit annotation on the matching
+          // `usage` row (join key `usage.id = profiles.profile_name`). Pure
+          // UPDATE, never UPSERT — a rate_limit must not mint a phantom `usage`
+          // row for a profile agentuse isn't tracking; a missing row matches
+          // zero, and a later `UsageSnapshot` pulls the annotation back via the
+          // reverse fan-out. `usageIdForProfileName` maps the `''` sentinel to
+          // agentuse's `"default"` id so a default-account rate limit colocates
+          // on `usage.default`. The `last_event_id` bump is load-bearing (it
+          // drives the wire diff). Pure function of the fold inputs.
           //
-          // Pure UPDATE — never UPSERT: a rate_limit must not mint a
-          // phantom `usage` row for a profile agentuse isn't tracking
-          // (the `usage` set is the canonical "tracked profiles" surface
-          // and is the responsibility of the usage-worker alone). If no
-          // matching `usage` row exists, the UPDATE matches zero rows
-          // and we move on; a later `UsageSnapshot` for the same id will
-          // pull the rate-limit annotation back via the reverse fan-out
-          // (the `projectUsageRow` post-UPSERT SELECT).
-          //
-          // Schema v42 (fn-662) mapping: `usageIdForProfileName` translates
-          // the `''` default-profile sentinel (default `~/.claude`, basename
-          // `""`) to agentuse's `"default"` usage id at the join boundary,
-          // so a default-account rate limit colocates on `usage.default`
-          // instead of stranding on the unjoinable `''` profile row. Every
-          // other profile name passes through unchanged — a named profile
-          // still binds to `WHERE id = <profile_name>`. A pathological
-          // literal `usage.id=''` is NOT cross-contaminated: an empty
-          // `event.session_id` is rejected by `projectUsageRow`'s early
-          // empty-string guard up the call stack, so no `usage.id=''` row
-          // ever exists in steady state — and the mapping is one-way (`''`
-          // forward → `'default'`), never `''` → `''`.
-          //
-          // The `last_event_id` bump is load-bearing — the descriptor's
-          // version column drives the wire diff; without the bump the
-          // subscribe wouldn't fire and the UI would stay stale.
-          //
-          // Pure function of the fold inputs (`event.ts`, `event.id`,
-          // `jobId`, in-transaction `jobs.config_dir`) — no
-          // `Date.now`/env/OS reads.
-          //
-          // **Schema v41 (fn-651) carve-out (symmetric to v35).** This
-          // UPDATE writes ONLY the rate-limit columns + the descriptor
-          // bookkeeping (`last_event_id`, `updated_at`); it MUST NOT
-          // touch `rate_limit_lifts_at` or `last_usage_fold_at`. Those
-          // columns ride the percentage path (`projectUsageRow` — the
-          // UsageSnapshot fold), so a rate-limit fold cannot clobber a
-          // lift time or a freshness stamp the percentage path wrote.
-          // Symmetric to the v35 reverse carve-out where the percentage
-          // path's UPSERT excludes the rate-limit columns: each fold
-          // owns the columns it can speak to honestly. Adding either
-          // column to this UPDATE would break the two-paths discipline
-          // and let a stale rate-limit event clobber a fresh percentage
-          // fold's freshness stamp.
+          // CARVE-OUT: writes ONLY the rate-limit columns + bookkeeping; MUST NOT
+          // touch `rate_limit_lifts_at` / `last_usage_fold_at` (those ride the
+          // percentage path), so a rate-limit fold can't clobber a lift time or
+          // freshness stamp the UsageSnapshot fold wrote.
           const profileName = projectBasename(profileRow.config_dir);
           const usageId = usageIdForProfileName(profileName);
           db.run(
@@ -7658,43 +5694,15 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     case "InputRequest": {
-      // Synthetic event (schema v25) minted by main from a transcript-worker
-      // `input-request` message — Claude Code used a built-in interactive
-      // tool that fires no hook of its own (initially `AskUserQuestion`).
-      // The session is blocked on a human answer that has not yet arrived,
-      // so the lifecycle column flips to `'stopped'` AND the pair
-      // `(last_input_request_at, last_input_request_kind)` stamps to the
-      // event ts + the matched {@link import("./types").InputRequestKind}.
-      //
-      // Clone of the v24 `RateLimited`/`ApiError` arm in structural shape:
-      // one compound UPDATE that writes the lifecycle column + the
-      // annotation pair together (paired-NULL invariant — CLAUDE.md
-      // "schema defaults match zero-event projection"; no code path may
-      // stamp one column of the pair without the other). Same terminal
-      // guard as Stop / ApiError: a stray InputRequest on an already-
-      // terminal row must NOT resurrect it (and must not stamp the
-      // annotation onto a row whose lifecycle is already `ended` /
-      // `killed` for unrelated reasons — the input-request signal is by
-      // definition mid-life).
-      //
-      // `extractInputRequestKind` reads `data.kind` and routes through
-      // {@link validateInputRequestKind} (anything not in the canonical
-      // allow-list folds to `"ask_user_question"` — the single-member
-      // union's only value, mirroring fn-616's `ApiError` "unknown"
-      // fallback shape but without a reserved `"unknown"` member, since
-      // the transcript matcher only mints messages for kinds it has
-      // explicitly mapped).
-      //
-      // **Why a synthetic event, not a hook event?** `AskUserQuestion`
-      // fires no Pre/PostToolUse hook of its own (verified empirically
-      // against two real AskUserQuestion sessions). The transcript-worker
-      // matcher (lands in task .2) is the only place we can detect the
-      // tool use; main mints the `InputRequest` synthetic carrying the
-      // session id + matched kind, and this arm folds it identically to
-      // the api-error arm shape. The clear paths (`UserPromptSubmit` /
-      // `SessionStart` unconditional; `PreToolUse` / `PostToolUse` gated)
-      // run from the regular hook events — see those arms for the
-      // "closest answered signal" rationale.
+      // Synthetic event minted by main from a transcript-worker `input-request`
+      // message — Claude Code used a built-in interactive tool (e.g.
+      // `AskUserQuestion`) that fires no hook of its own. The session is blocked
+      // on a human answer, so flip `state` to `'stopped'` AND stamp the
+      // `(last_input_request_at, last_input_request_kind)` pair. Structural clone
+      // of the ApiError arm: one compound UPDATE (paired-NULL), same terminal
+      // guard. `extractInputRequestKind` folds a non-allow-list kind to
+      // `"ask_user_question"` (the single-member union's only value). The clear
+      // paths run from the regular hook events.
       const kind = extractInputRequestKind(event);
       const res = db.run(
         `UPDATE jobs SET state = 'stopped',
@@ -7716,29 +5724,11 @@ function projectJobsRow(db: Database, event: Event): void {
 
     case "PreToolUse":
     case "PostToolUse": {
-      // Hot-path clear (~50+ fires per turn). `AskUserQuestion` fires no
-      // Pre/PostToolUse hook of its own, so the closest "answered" signal
-      // is the next tool the agent uses — once any other tool fires, the
-      // human has answered the question and the session is no longer
-      // blocked, so we zero the input-request pair.
-      //
-      // Gated on `last_input_request_at IS NOT NULL` so the unconditional
-      // `UPDATE jobs SET ... WHERE job_id = ?` only fires when there is
-      // actually something to clear — without the gate, every tool call
-      // in every session would no-op-write the pair to NULL (already
-      // NULL), churning `last_event_id` / `updated_at` and re-fanning
-      // every embedded array. The gate keeps the cost at zero for the
-      // overwhelming majority of tool calls (no prior input-request) and
-      // pays only when the pair actually needs clearing.
-      //
-      // Paired clear (CLAUDE.md "schema defaults match zero-event
-      // projection"): both columns NULL together — no code path may
-      // clear one without the other.
-      //
-      // Sync gated on the UPDATE actually firing (changes > 0): a no-op
-      // clear must NOT re-fan the embedded entry. The gate is a SELECT-
-      // free predicate that re-runs at WHERE time, so the UPDATE's
-      // `changes > 0` is the authoritative signal.
+      // Hot-path clear: `AskUserQuestion` fires no Pre/PostToolUse hook of its
+      // own, so the next tool the agent uses is the closest "answered" signal —
+      // zero the input-request pair. Gated on `IS NOT NULL` so the common
+      // already-NULL case is a zero-cost no-op (no stamp churn / re-fan).
+      // Paired clear; sync gated on `changes > 0`.
       const res = db.run(
         `UPDATE jobs SET last_input_request_at = NULL,
                          last_input_request_kind = NULL,
@@ -7750,21 +5740,11 @@ function projectJobsRow(db: Database, event: Event): void {
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
       }
-      // Schema v52 / fn-686: identically-shaped hot-path clear for the
-      // `(last_permission_prompt_at, last_permission_prompt_kind)` pair.
-      // `PostToolUse` is the highest-fidelity clear signal in the
-      // permission-dialog flow — the dialog logically cannot close while
-      // a tool is mid-fire — and clearing on `PreToolUse` too closes the
-      // narrow window where the human approved at the dialog and the
-      // worker fires its next tool before keeper sees a PostToolUse
-      // (anthropics/claude-code#19628 — no "permission dialog dismissed"
-      // hook exists, clearing must be inferred from the next downstream
-      // event).
-      //
-      // Same gate-on-IS-NOT-NULL discipline as the input-request clear
-      // above: no-op when the pair is already NULL (the overwhelming
-      // majority of tool calls). Same paired-NULL invariant: both
-      // columns clear together. Same `changes > 0` sync gate.
+      // Identically-shaped hot-path clear for the permission-prompt pair. No
+      // "permission dialog dismissed" hook exists, so the clear is inferred from
+      // the next downstream tool (both Pre and Post, to close the narrow window
+      // where the worker fires its next tool before keeper sees a PostToolUse).
+      // Same gate / paired-NULL / `changes > 0` discipline as above.
       const resPP = db.run(
         `UPDATE jobs SET last_permission_prompt_at = NULL,
                          last_permission_prompt_kind = NULL,
@@ -7780,54 +5760,21 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     case "Notification": {
-      // Schema v52 (fn-686): hook-event-driven fold of
-      // `Notification:permission_prompt` (Claude Code's tool-permission
-      // dialog) and `Notification:elicitation_dialog` (MCP server
-      // requesting input mid-tool-call). One structural divergence from
-      // the v25 `InputRequest` arm: the source is a REAL hook event
-      // whose `event_type` (= `notification_type` passthrough, set by
-      // `plugin/hooks/events-writer.ts:581-582`) carries the
-      // discriminator. NOT a synthetic mint — no `src/daemon.ts` write
-      // path adds it.
-      //
-      // STRICT gate. Only the two whitelisted `event_type` values stamp
-      // — `idle_prompt`, `auth_success`, unknown, and empty values
-      // short-circuit via `permissionPromptKindFromEventType` returning
-      // `null`. The arm still falls through to the post-switch
-      // planctl fan-out + title precedence rule (those live OUTSIDE
-      // the switch), so a non-stamping Notification is identical to
-      // the pre-v52 default-arm no-op.
-      //
-      // **The stamp does NOT flip `state`.** Diverges from the
-      // InputRequest arm, which flips to `'stopped'`. The pill is the
-      // whole point: layer `[awaiting:permission]` /
-      // `[awaiting:elicitation]` on top of the live `[working]` state
-      // so the human sees the worker is parked on a dialog without
-      // losing the structural reading that the worker is still
-      // mid-turn from keeper's POV (no Stop fired). Consequently the
-      // clear arms only zero the pair — no state restore.
-      //
-      // Terminal-row guard cloned verbatim from the v25 InputRequest
-      // arm: a stray `permission_prompt` on an already-terminal row
-      // must NOT mid-life-stamp it (no resurrection, no annotation
-      // on `'ended'` / `'killed'`).
-      //
-      // Re-fold determinism: stamp value is `event.ts` only (no
-      // wallclock / env / fs). A cursor=0 re-fold over historical
-      // `permission_prompt` rows reproduces deterministic stamps; the
-      // five clear arms on subsequent events sweep them up the same
-      // way a steady-state install would.
+      // Hook-event-driven fold of `Notification:permission_prompt` (the
+      // tool-permission dialog) and `:elicitation_dialog` (an MCP input
+      // request). The discriminator rides `event.event_type`. STRICT gate: only
+      // the two whitelisted values stamp; everything else short-circuits via
+      // `permissionPromptKindFromEventType` returning null (the post-switch
+      // fan-outs still fire). The stamp does NOT flip `state` — the pill layers
+      // `[awaiting:…]` on top of the live state without firing a Stop.
+      // Terminal-row guard cloned from the InputRequest arm. Stamp value is
+      // `event.ts` only — re-fold deterministic.
       const kind = permissionPromptKindFromEventType(event.event_type);
       if (kind === null) {
-        // `idle_prompt` / `auth_success` / unknown / empty — strict
-        // gate: no jobs-write. The post-switch fan-outs (planctl,
-        // title precedence, backend-exec coords) still fire below.
         break;
       }
-      // Defensive double-check that the upstream map's return is
-      // still in the canonical allow-list — keeps a future
-      // refactor that adds a new map entry but forgets to widen the
-      // type from drifting silently.
+      // Defensive double-check the kind is still in the allow-list, so a future
+      // map entry that forgets to widen the type can't drift silently.
       const validated = validatePermissionPromptKind(kind);
       if (validated === null) {
         break;
@@ -7850,57 +5797,23 @@ function projectJobsRow(db: Database, event: Event): void {
     }
 
     default:
-      // PostToolUseFailure and any unknown forward-compat event: no
-      // lifecycle write. Cursor still advances upstream. (No terminal
-      // guard needed — these branches never write the state column.)
-      // The `Pre/PostToolUse[Failure]` rows ALSO feed
-      // `projectSubagentInvocationsRow` (via the per-event dispatch in
-      // `applyEvent`); the no-op here is specifically the *jobs*
-      // projection. SubagentStart / SubagentStop, formerly listed here
-      // as no-ops, are dispatched out of `applyEvent` to
-      // `projectSubagentInvocationsRow` — they still never touch `jobs`
-      // (no lifecycle column writes), so the `jobs` arm stays a no-op
-      // for them.
-      //
-      // Schema v25 lifts `PreToolUse` and `PostToolUse` out of this
-      // default arm into their own gated-clear case (above) — but only
-      // for the `last_input_request_*` paired clear. Schema v52 / fn-686
-      // lifts `Notification` out as well (was previously listed here as
-      // a no-op) into its own `case "Notification"` arm that branches on
-      // `event_type` and stamps `(last_permission_prompt_at,
-      // last_permission_prompt_kind)` for the two whitelisted subtypes.
-      // The post-switch planctl fan-out + title precedence rule still
-      // fire for those events because they live OUTSIDE the switch.
+      // PostToolUseFailure and any unknown forward-compat event: no jobs
+      // lifecycle write (no terminal guard needed — these never write `state`).
+      // Pre/PostToolUse[Failure] + Subagent* rows also feed
+      // `projectSubagentInvocationsRow` via the `applyEvent` dispatch; the no-op
+      // here is specifically the *jobs* projection.
       break;
   }
 
-  // Backend-exec coordinates (fn-668 / schema v48): latest-non-NULL-
-  // wins COALESCE fold from `events.backend_exec_{type,session_id,
-  // pane_id}` onto `jobs.backend_exec_{type,session_id,pane_id}`.
-  // Fires on EVERY event_type (not SessionStart-gated like `config_dir`)
-  // — the hook stamps the three columns on every hook event as pure
-  // env reads (see `backendExecCoordsFromEnv` in
-  // `plugin/hooks/events-writer.ts`), so a session that opens panes
-  // mid-life or moves between panes lands the freshest coords on the
-  // next event without waiting for a resume.
-  //
-  // Gated on `event.backend_exec_type != null`: the all-NULL shape
-  // (every event outside a zellij pane) is a fast no-op, avoiding a
-  // wasteful UPDATE on every non-multiplexer event. A partial capture
-  // (type set, one sub-var NULL) still fires the COALESCE so the
-  // non-NULL fields advance and the NULL field preserves whatever was
-  // previously stamped — never clobbers a prior captured value.
-  //
-  // Re-fold determinism: the fold reads only `event.backend_exec_*`
-  // (frozen onto the row at hook time) and the persisted `jobs` cell
-  // (COALESCE inside SQL). NO env reads, NO wall-clock, NO process
-  // probes — so a cursor=0 re-fold reproduces byte-identical rows.
-  // Job-row precondition: the SessionStart arm above must have
-  // INSERTed the `jobs` row before this UPDATE can land, which holds
-  // by construction since SessionStart fires first per session and is
-  // the only mint path. An UPDATE against a missing row is a no-op
-  // (zero rows affected); the next event after the SessionStart will
-  // catch up the coords.
+  // Backend-exec coordinates: latest-non-NULL-wins COALESCE fold from
+  // `events.backend_exec_*` onto `jobs.backend_exec_*`. Fires on EVERY event
+  // (the hook stamps the columns on every hook event as pure env reads), so a
+  // session that opens / moves panes mid-life lands the freshest coords on the
+  // next event. Gated on `backend_exec_type != null` (the all-NULL non-pane
+  // case is a fast no-op); a partial capture still COALESCEs so a NULL field
+  // preserves the prior value. Reads only `event.backend_exec_*` + the
+  // persisted cell — re-fold deterministic. An UPDATE against a missing jobs
+  // row is a no-op (SessionStart, the only mint, fires first per session).
   if (event.backend_exec_type != null) {
     db.run(
       `UPDATE jobs SET
@@ -7955,33 +5868,19 @@ function projectJobsRow(db: Database, event: Event): void {
     syncPlanctlLinks(db, jobId, event.id, ts);
   }
 
-  // Schema v46 / fn-666: planctl-written tracked files get a
-  // `source='planctl'` `file_attributions` row per path the envelope's
-  // `files` array names. Gated on `event.planctl_op != null` (only planctl
-  // events carry a non-null `planctl_files`) + the deriver's defensive
-  // `length > 0` guard re-asserted here. Without this mint the
-  // `.planctl/{epics,tasks}/*.json` and `.planctl/specs/*.md` files
-  // appeared as strict-mystery orphans the instant they flashed dirty
-  // (the 559-orphan spike documented in fn-666's epic spec).
+  // Planctl-written tracked files get a `source='planctl'` attribution row per
+  // path the envelope's `files` array names — without this mint they appear as
+  // strict-mystery orphans the instant they flash dirty.
   if (event.planctl_op != null && event.planctl_files != null) {
     mintPlanctlFileAttributions(db, event);
   }
 
-  // Title precedence rule: a `session_title` in the data blob folds into
-  // `jobs.title`, layered on top of any lifecycle write above. The source is
-  // resolved per-event by titleSourceForEvent — 'transcript' (priority 3) for a
-  // synthetic TranscriptTitle event, else 'payload' (priority 2). Runs on ANY
-  // event and has no `state != 'ended'` guard (no title-bearing events arrive
-  // post-SessionEnd anyway). Tier 1's 'spawn' source (priority 1) is seeded on
-  // the SessionStart insert above, not here; this rule generalizes the write so
-  // a higher-priority source promotes the title and a lower one never clobbers
-  // it.
-  //
-  // Re-fold determinism: the write compares the incoming `(title, source)`
-  // against the PERSISTED `(title, title_source)` read in-txn, never an
-  // accumulator. We write iff the incoming priority outranks the persisted one,
-  // or ties it with a changed value — so a rebuild-from-scratch is identical
-  // (pure function of persisted state). No row → no-op.
+  // Title precedence rule: a `session_title` folds into `jobs.title`, source
+  // resolved per-event ('transcript' priority 3 / 'payload' priority 2). Runs on
+  // ANY event. Compares the incoming `(title, source)` against the PERSISTED
+  // pair in-txn (never an accumulator), writing iff the incoming priority
+  // outranks or ties+changes — so a higher source promotes and a lower never
+  // clobbers, re-fold deterministic. No row → no-op.
   const title = extractSessionTitle(event);
   if (title != null) {
     const source = titleSourceForEvent(event);
@@ -7998,16 +5897,9 @@ function projectJobsRow(db: Database, event: Event): void {
     if (row != null) {
       const pp = sourcePriority(row.title_source);
       if (p > pp || (p === pp && row.title !== title)) {
-        // Schema v40 (fn-652): append the promoted title to the persisted
-        // `name_history` JSON array iff it isn't already the last element
-        // (dedupe-against-tail). Cap at the most-recent 20 by slicing the
-        // tail. Pure function of the persisted cell + the incoming title —
-        // no `Date.now`/env reads, no event-arrival ordering — so a from-
-        // scratch re-fold reproduces byte-identical history. Defensive
-        // parse: a malformed array folds to `[]` per the CLAUDE.md "safe
-        // value on malformed payload" invariant (the column is NOT NULL
-        // DEFAULT '[]' so a healthy reducer never writes anything else,
-        // but the JSON.parse boundary is the right place to harden).
+        // Append the promoted title to `name_history` (dedupe-against-tail,
+        // capped); pure function of the cell + the incoming title, so re-fold
+        // is byte-identical.
         const nextHistory = appendNameHistory(row.name_history, title);
         db.run(
           "UPDATE jobs SET title = ?, title_source = ?, name_history = ?, last_event_id = ?, updated_at = ? WHERE job_id = ?",
