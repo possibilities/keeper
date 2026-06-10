@@ -60,5 +60,5 @@ backstop-telemetry: builder emits change_to_rescue_ms when given, null when abse
 - [ ] bun run test:full green
 
 ## Done summary
-
+Producer side of missed-wake recalibration: git-heartbeat derives true change-to-rescue latency (now - oldest discharged commit, dirty-only/cold-boot/negative -> null) threaded through buildMissedWakeRecord's optional change_to_rescue_ms; computeStats surfaces it per-sample with mixed-version ndjson reading absent as null; a rescued root is flagged for re-subscribe via the existing level-triggered reconcile (no direct resubscribe, no respawn, no DB write).
 ## Evidence

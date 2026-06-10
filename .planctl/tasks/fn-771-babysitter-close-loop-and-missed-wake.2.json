@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Git-worker change-latency emit and re-arm",
-  "updated_at": "2026-06-10T15:48:08.332265Z"
+  "updated_at": "2026-06-10T17:34:44.042479Z",
+  "worker_done_at": "2026-06-10T17:34:44.042479Z"
 }
