@@ -27,7 +27,11 @@
  * directly with fake `launch` / `findJob` / `now` / `sleep`.
  */
 
+import type { Database } from "bun:sqlite";
 import { expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { computeEligibleEpics } from "../src/armed-closure";
 import {
   buildLaunchArgv,
@@ -39,6 +43,7 @@ import {
   type DispatchedAck,
   type DispatchedPayload,
   type DispatchFailedPayload,
+  DONE_EPICS_REAP_LIMIT,
   FINALIZER_GUARD_S,
   type FoundJob,
   isCompletionReapCandidate,
@@ -49,6 +54,7 @@ import {
   isReapCandidate,
   type LaunchResult,
   type LiveDispatch,
+  loadReconcileSnapshot,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
@@ -62,6 +68,7 @@ import {
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
 } from "../src/daemon";
+import { openDb } from "../src/db";
 import type { ZellijPane } from "../src/exec-backend";
 import {
   computeReadiness,
@@ -2412,6 +2419,150 @@ test("reconcile: a non-completed task id is NOT in completedRowIds", () => {
   const snap = makeSnapshot({ epics: [epic] });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.completedRowIds.has("fn-1-foo.1")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-764 — done epics reach completedRowIds through the REAL
+// loadReconcileSnapshot query path.
+//
+// The fn-727 close-row completion reap was structurally UNREACHABLE: the
+// snapshot's epics read carries no wire filter, so the descriptor's
+// `default_visible = 1` defaultClause (post-fn-756: `status='open'`) hid a DONE
+// epic at the exact flip `evaluateCloseRow`'s `status==='done'` arm needs. These
+// tests drive the REAL query path against a seeded sandbox DB (the
+// test/collections.test.ts shape — `openDb` + INSERT INTO epics +
+// `loadReconcileSnapshot` from the live worker), NOT a hand-rolled snapshot.
+// ---------------------------------------------------------------------------
+
+/**
+ * Seed one `epics` row directly (mirrors test/collections.test.ts `seedEpic`):
+ * only the schema-required columns are populated; `sort_path` defaults to the
+ * zero-padded epic_number so the default `sort_path ASC` order is stable.
+ */
+function seedEpicRow(
+  db: Database,
+  epic_id: string,
+  opts: {
+    epic_number: number;
+    status: string;
+    updated_at?: number;
+    last_validated_at?: string | null;
+  },
+): void {
+  db.query(
+    `INSERT INTO epics (epic_id, epic_number, title, project_dir, status, last_event_id, updated_at, tasks, depends_on_epics, jobs, job_links, sort_path, created_by_closer_of, last_validated_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    epic_id,
+    opts.epic_number,
+    `epic ${epic_id}`,
+    "/repo",
+    opts.status,
+    0,
+    opts.updated_at ?? 1,
+    "[]",
+    "[]",
+    "[]",
+    "[]",
+    String(opts.epic_number).padStart(6, "0"),
+    null,
+    opts.last_validated_at ?? "2026-05-24T00:00:00Z",
+  );
+}
+
+/** Run `body` against a fresh sandbox DB, always closing + removing the tmpdir. */
+async function withSeededDb(
+  body: (db: Database) => Promise<void> | void,
+): Promise<void> {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-autopilot-reap-test-"));
+  const dbPath = join(dir, "keeper.db");
+  // Migrate the schema, then reopen writable for the test body.
+  openDb(dbPath).db.close();
+  const { db } = openDb(dbPath, { readonly: false });
+  try {
+    await body(db);
+  } finally {
+    db.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcileSnapshot path", async () => {
+  await withSeededDb(async (db) => {
+    // A done epic: the default open scope would normally hide it, but the
+    // bounded done-epics merge pulls it back into the snapshot.
+    seedEpicRow(db, "fn-9-done", { epic_number: 9, status: "done" });
+    const snap = await loadReconcileSnapshot(db);
+    // The done epic landed in the merged epics list.
+    expect(snap.epics.map((e) => e.epic_id)).toContain("fn-9-done");
+    // Driven through the REAL reconcile: its close-row `{tag:"completed"}`
+    // verdict puts the epic id in completedRowIds — the reap candidate set.
+    const decision = reconcile(snap, makeState(), 0);
+    expect(decision.completedRowIds.has("fn-9-done")).toBe(true);
+  });
+});
+
+test("fn-764: done epics in the snapshot yield ZERO dispatches and no mutex occupancy", async () => {
+  await withSeededDb(async (db) => {
+    // A pile of done epics — every one must produce ONLY a completed close-row
+    // verdict. None may dispatch (a launch) or occupy a root-mutex slot. If any
+    // dispatch verdict perturbs, this is the FALLBACK trigger named in the spec.
+    for (let i = 1; i <= 5; i++) {
+      seedEpicRow(db, `fn-${i}-done`, { epic_number: i, status: "done" });
+    }
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.epics.length).toBe(5);
+    const decision = reconcile(snap, makeState(), 0);
+    // Zero launches: done epics never dispatch.
+    expect(decision.launches).toEqual([]);
+    // Every done epic id is a completed close-row (the only verdict they yield).
+    for (let i = 1; i <= 5; i++) {
+      expect(decision.completedRowIds.has(`fn-${i}-done`)).toBe(true);
+    }
+  });
+});
+
+test("fn-764: the done-epics read is BOUNDED — exactly DONE_EPICS_REAP_LIMIT, most-recently-updated", async () => {
+  await withSeededDb(async (db) => {
+    // Seed strictly MORE done epics than the limit, with monotonically rising
+    // updated_at so the sort order is unambiguous. The merge must carry exactly
+    // the limit, and exactly the most-recently-updated ones (fn-748 anti-pattern
+    // guard: never O(all done history)).
+    const total = DONE_EPICS_REAP_LIMIT + 8;
+    for (let i = 1; i <= total; i++) {
+      seedEpicRow(db, `fn-${i}-done`, {
+        epic_number: i,
+        status: "done",
+        updated_at: i, // higher i = more recently updated
+      });
+    }
+    const snap = await loadReconcileSnapshot(db);
+    // Bounded: exactly the window, never the full done set.
+    expect(snap.epics.length).toBe(DONE_EPICS_REAP_LIMIT);
+    // The carried set is the most-recently-updated tail (updated_at desc).
+    const carried = new Set(snap.epics.map((e) => e.epic_id));
+    for (let i = total; i > total - DONE_EPICS_REAP_LIMIT; i--) {
+      expect(carried.has(`fn-${i}-done`)).toBe(true);
+    }
+    // The oldest are dropped (e.g. fn-1, fn-8 are below the cutoff).
+    expect(carried.has("fn-1-done")).toBe(false);
+    expect(carried.has(`fn-${total - DONE_EPICS_REAP_LIMIT}-done`)).toBe(false);
+  });
+});
+
+test("fn-764: open epics still resolve and dedup against the done merge (open wins)", async () => {
+  await withSeededDb(async (db) => {
+    // An open epic resolves via the default scope; a done epic via the merge.
+    // Both appear exactly once; the open one is unperturbed by the merge.
+    seedEpicRow(db, "fn-1-open", { epic_number: 1, status: "open" });
+    seedEpicRow(db, "fn-2-done", { epic_number: 2, status: "done" });
+    const snap = await loadReconcileSnapshot(db);
+    const ids = snap.epics.map((e) => e.epic_id);
+    expect(ids).toContain("fn-1-open");
+    expect(ids).toContain("fn-2-done");
+    // No duplicate of either id.
+    expect(ids.length).toBe(new Set(ids).size);
+  });
 });
 
 // ---------------------------------------------------------------------------

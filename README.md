@@ -331,11 +331,11 @@ Keeper has no `install` verb. Wire it up manually:
      outside the cap) so a pending-approval backlog can't deadlock its own
      approvers — total live workers can reach `cap + live approvers`.
    - `autoclose_windows` — whether the autopilot reaps a row's zellij
-     surfaces when it reaches **approved completion**. Default `true`. When a
-     task reaches `{tag:"completed"}` (worker done + approved + idle) the
-     reconciler closes its `work::<id>` AND `approve::<id>` panes together; an
-     approved-completed epic close-row closes `close::<id>` AND `approve::<id>`.
-     Pending, rejected, and just-worker-ended (unapproved) windows stay open
+     surfaces when it reaches **completion**. Default `true`. When a task
+     reaches `{tag:"completed"}` (fn-756: worker done + idle — the approval
+     enum no longer gates) the reconciler closes its `work::<id>` pane; a
+     completed epic close-row closes `close::<id>` (fn-756: no `approve::<id>`
+     pane to pair). Pending and just-worker-ended-incomplete windows stay open
      for inspection. Set `false` to keep every window open (the reap pass
      becomes a no-op and skips the `list-panes` probe). Restart-to-apply — a
      flip lags until the next daemon restart, like every keeper config key.
@@ -2093,13 +2093,21 @@ and never throws (no-self-heal). A **distinct** completion reap (fn-727,
 config-gated on `autoclose_windows`, default `true`) shares the SAME
 `reapSurfaces` close path but gates on the OPPOSITE signal: each reconcile
 cycle, when a row reaches the durable `{tag:"completed"}` readiness verdict
-(worker done + approved + idle), the worker closes every live surface sharing
-that row's id — a completed task reaps `work::<id>` AND `approve::<id>`; a
-completed close-row reaps `close::<id>` AND `approve::<id>`. Unlike the pause
-reap it deliberately does NOT gate on `is_exited` (the approver pane is live at
-the instant of approval — the verdict, not pane liveness, is the sole
-authorization); pending / rejected / worker-ended-unapproved windows never
-reach `{tag:"completed"}` and stay open. The completed-row-id set rides out of
+(fn-756: worker done for a task, `status='done'` for an epic, + idle — the
+approval enum no longer gates), the worker closes every live surface sharing
+that row's id — a completed task reaps `work::<id>`; a completed close-row
+reaps `close::<id>` (fn-756: no `approve::<id>` surface to pair — the approve
+verb is gone). For the close-row verdict to be observed at all, the reconcile
+snapshot must still carry the just-done epic: the default epics read scopes to
+`status='open'`, so fn-764 MERGES in a SECOND bounded read
+(`filter:{status:"done"}`, sorted `updated_at` DESC, limited to a small window
+— never O(all done history), the fn-748 anti-pattern) so a freshly-done epic is
+observed at least once post-flip; `reapSurfaces` is idempotent, so
+re-observation within the window is a safe no-op. Unlike the pause reap it
+deliberately does NOT gate on `is_exited` (the worker pane may be live at the
+instant of completion — the verdict, not pane liveness, is the sole
+authorization); pending / worker-ended-incomplete windows never reach
+`{tag:"completed"}` and stay open. The completed-row-id set rides out of
 `reconcile`'s single `computeReadiness` pass (no second pass), the reap
 re-probes `list-panes` every cycle (survives a daemon restart — no reliance on
 cold-boot `liveDispatches`), and the whole pass is try/caught (no-self-heal).

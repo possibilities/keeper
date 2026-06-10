@@ -225,6 +225,34 @@ export const FINALIZER_GUARD_S = REDISPATCH_COOLDOWN_S;
 const FINALIZER_VERBS: ReadonlySet<Verb> = new Set<Verb>(["close"]);
 
 /**
+ * fn-764 — the bounded recently-done epics window merged into the reconcile
+ * snapshot so the fn-727 close-row COMPLETION reap is reachable.
+ *
+ * THE BUG IT FIXES: `loadReconcileSnapshot`'s epics read carries NO wire filter,
+ * so the descriptor's `default_visible = 1` defaultClause applies — and after
+ * fn-756 (schema v63) `default_visible` is `status='open'`, so a DONE epic falls
+ * off the snapshot at the exact flip `evaluateCloseRow`'s `status==='done'` arm
+ * needs to emit a `{tag:"completed"}` close-row verdict. The completed id never
+ * reaches `completedRowIds`, the `close::<id>` pane is never reaped on the
+ * completion path, and the pause-edge launch-window reap silently covered for it.
+ *
+ * THE FIX: a SECOND epics read with an explicit `filter:{status:"done"}` (which
+ * drops the defaultClause — see `resolveFilter`), sorted `updated_at` DESC and
+ * LIMITed to this window, merged (dedup by `epic_id`, open rows win) into
+ * `snapshot.epics`. The bound keeps the snapshot O(limit), never O(all done
+ * epics) — the fn-748 all-history anti-pattern.
+ *
+ * WHY 32: the window must comfortably exceed the worst-case (fold-lag +
+ * reconcile cadence) so a freshly-done epic is observed at least once
+ * post-flip; `reapSurfaces` is idempotent (a re-observation within the window
+ * re-reaps an already-gone pane as a best-effort no-op), so over-observing is
+ * free and only UNDER-observing leaks. 32 is the k8s TTL-after-finished
+ * "bounded recently-completed window" sizing — generous headroom over a handful
+ * of epics completing per cadence, still a tiny constant page.
+ */
+export const DONE_EPICS_REAP_LIMIT = 32;
+
+/**
  * fn-742 — `true` IFF the epic-level finalizer for `epicId` is `close` (the
  * sole finalizer verb after fn-756). A close-row verdict mapping to `null`
  * (running / blocked-on-other / completed) is not a finalizer and is never
@@ -1813,9 +1841,20 @@ type IncomingMessage =
  * (board / viewer) sees byte-for-byte — no second decode path to drift.
  *
  * Each collection is read with NO wire filter, so each descriptor's
- * DEFAULT scope applies (epics: open-OR-not-approved; jobs: live-only
- * `working`/`stopped`) — exactly the live work set the reconciler acts on.
- * `limit: 0` is the "all rows" sentinel.
+ * DEFAULT scope applies (epics: `status='open'` via the `default_visible = 1`
+ * defaultClause; jobs: live-only `working`/`stopped`) — exactly the live work
+ * set the reconciler acts on. `limit: 0` is the "all rows" sentinel.
+ *
+ * fn-764 — ONE deliberate exception: a SECOND epics read with an explicit
+ * `filter:{status:"done"}` (which drops the defaultClause), sorted `updated_at`
+ * DESC and LIMITed to {@link DONE_EPICS_REAP_LIMIT}, is MERGED into the epics
+ * list (dedup by `epic_id`, the open-scope row winning on collision). Without
+ * it a done epic falls off the snapshot before the fn-727 close-row COMPLETION
+ * reap can observe its `{tag:"completed"}` verdict — the reap was structurally
+ * unreachable. The bound keeps the merge O(limit), never O(all done history)
+ * (the fn-748 anti-pattern). The merged done rows produce ONLY `completed`
+ * verdicts (`evaluateCloseRow`'s `status==='done'` arm), so no dispatch arm or
+ * mutex occupancy is perturbed (test-pinned).
  *
  * Mirrors the readiness client's assembly (`src/readiness-client.ts`):
  *  - sub-agents are collapsed same-name → most-recent before readiness
@@ -1829,7 +1868,7 @@ type IncomingMessage =
  *    (cleared failures are deleted from the projection, so every row present
  *    is an open failure).
  */
-async function loadReconcileSnapshot(
+export async function loadReconcileSnapshot(
   db: Parameters<typeof runQuery>[0],
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
@@ -1843,7 +1882,45 @@ async function loadReconcileSnapshot(
     return res.type === "result" ? (res.rows as Record<string, unknown>[]) : [];
   };
 
-  const epics = read("epics") as unknown as Epic[];
+  // The default-scope (open) epics — the live work set the reconciler dispatches
+  // against. fn-764: MERGE in a bounded recently-DONE window so the close-row
+  // completion reap is reachable (see `DONE_EPICS_REAP_LIMIT`). The done read
+  // carries an explicit `filter:{status:"done"}` (drops the `default_visible = 1`
+  // defaultClause), sorts `updated_at` DESC, and LIMITs to the window — O(limit),
+  // never O(all done history). Dedup keys on `epic_id` with the OPEN row winning:
+  // an epic can't be both open and done, so a collision is only a fold-lag/race
+  // transient, and preferring the live-scope row keeps dispatch arms reading the
+  // freshest open view. Done rows feed ONLY the completed close-row verdict.
+  const openEpics = read("epics") as unknown as Epic[];
+  const doneFrame = {
+    type: "query" as const,
+    collection: "epics",
+    id: "autopilot-epics-done",
+    filter: { status: "done" },
+    sort: { column: "updated_at", dir: "desc" as const },
+    limit: DONE_EPICS_REAP_LIMIT,
+  };
+  const doneRes = runQuery(db, 0, doneFrame);
+  const doneEpics =
+    doneRes.type === "result"
+      ? (doneRes.rows as unknown as Epic[])
+      : ([] as Epic[]);
+  const seenEpicIds = new Set<string>();
+  const epics: Epic[] = [];
+  for (const epic of openEpics) {
+    if (seenEpicIds.has(epic.epic_id)) {
+      continue;
+    }
+    seenEpicIds.add(epic.epic_id);
+    epics.push(epic);
+  }
+  for (const epic of doneEpics) {
+    if (seenEpicIds.has(epic.epic_id)) {
+      continue;
+    }
+    seenEpicIds.add(epic.epic_id);
+    epics.push(epic);
+  }
 
   const jobs = new Map<string, Job>();
   for (const row of read("jobs") as unknown as Job[]) {

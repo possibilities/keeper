@@ -211,15 +211,22 @@ list-panes -a -j  →  collectPanesFromListJson  →  for each pane:
 
 2. **Completion reap (fn-727, `isCompletionReapCandidate`).** Closes a
    row's surfaces when it reaches the durable `{tag:"completed"}` readiness
-   verdict. The predicate passes "the pane's `(work|approve|close)::<id>`
-   key's `<id>` is in this cycle's approved-completion set" — so one
-   completed id reaps its name-located PAIR (`work::<id>` + `approve::<id>`,
-   or `close::<id>` + `approve::<id>`). It deliberately does NOT gate on
-   `is_exited`: the approver pane is LIVE at the instant of approval, so an
-   `is_exited` gate would never reap it. The durable verdict is the SOLE
-   authorization; the name match only LOCATES the panes. (Safe because an
-   approved-completed row cannot have a concurrent live worker for the same
-   id — a re-dispatch would flip the row off `completed`.)
+   verdict (fn-756: worker done for a task, `status='done'` for an epic —
+   the approval enum no longer gates). The predicate passes "the pane's
+   `(work|close)::<id>` key's `<id>` is in this cycle's completion set" — so
+   a completed task reaps `work::<id>` and a completed close-row reaps
+   `close::<id>` (fn-756: there is NO `approve::<id>` surface to pair — the
+   approve verb is gone). For an epic close-row to be observed here, the
+   reconcile snapshot must still carry the just-done epic: the default epics
+   read scopes to `status='open'`, so fn-764 merges in a bounded
+   `filter:{status:"done"}` read (`updated_at` DESC, small limit) so a
+   freshly-done epic appears at least once post-flip — the bound keeps it
+   O(limit), never O(all done history). It deliberately does NOT gate on
+   `is_exited`: the worker pane may be LIVE at the instant of completion, so
+   an `is_exited` gate would spare it; the durable verdict is the SOLE
+   authorization and the name match only LOCATES the pane. Repeated
+   observation within the bounded window is safe — `reapSurfaces` is
+   idempotent (a re-close of an already-gone pane is a best-effort no-op).
 
 Both contracts share the same `list-panes` lag caveat: the predicate, not
 pane liveness, authorizes the close. The completion predicate substitutes

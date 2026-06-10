@@ -268,15 +268,23 @@ via `state`, never mutates). **Supersedes the approve-only, reducer-side
 fn-734** — generalized to all verbs, dispatch-side, in-memory.
 
 **Completion reap (`autoclose_windows`, default `true`, fn-727).** When a row
-reaches the `{tag:"completed"}` verdict (worker done + approved + idle), the
+reaches the `{tag:"completed"}` verdict (fn-756: worker done for a task,
+`status='done'` for an epic, + idle — the approval enum no longer gates), the
 reconcile cycle closes its zellij surfaces via `ExecBackend.reapSurfaces`
 (pane-close on the surviving live-probe path — NOT the retired `closeByTabId`
-tab-coord mechanism): a completed task reaps `work::<id>` + `approve::<id>`, a
-completed close-row reaps `close::<id>` + `approve::<id>`; pending / rejected /
-worker-ended-unapproved windows stay open. Deliberately does NOT gate on
-`is_exited` (the approver is live at approval). See `src/autopilot-worker.ts`
-(`isCompletionReapCandidate`, `reapCompletionSurfaces`) + `src/exec-backend.ts`
-(`reapSurfaces`).
+tab-coord mechanism): a completed task reaps `work::<id>`, a completed close-row
+reaps `close::<id>` (fn-756: no `approve::<id>` surface to pair — the approve
+verb is gone); pending / worker-ended-incomplete windows stay open.
+**fn-764:** the close-row verdict is only observable if the snapshot still
+carries the just-done epic — the default epics read scopes to `status='open'`,
+so `loadReconcileSnapshot` MERGES in a SECOND bounded done-epics read
+(`filter:{status:"done"}`, `updated_at` DESC, limit `DONE_EPICS_REAP_LIMIT`) so
+a freshly-done epic is observed at least once post-flip; the bound keeps it
+O(limit), never O(all done history) (the fn-748 anti-pattern), and `reapSurfaces`
+is idempotent so re-observation within the window is a safe no-op. Deliberately
+does NOT gate on `is_exited` (the worker pane may be live at completion). See
+`src/autopilot-worker.ts` (`isCompletionReapCandidate`, `reapCompletionSurfaces`,
+`loadReconcileSnapshot`) + `src/exec-backend.ts` (`reapSurfaces`).
 
 ## Out of scope
 
