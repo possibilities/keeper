@@ -51,5 +51,5 @@ ONE list-panes; after the floor elapses, the next cycle probes again.
 - [ ] full bun test green
 
 ## Done summary
-
+Bounded zellij subprocess awaits in runCapture (SpawnFn.kill() + 5s kill-timeout race; wedged op degrades to null, never wedges the reconciler) and floored the completion-reap list-panes probe to MIN_REAP_INTERVAL_S=15 via a worker-scoped lastReapAt stamp. Both behaviors test-pinned.
 ## Evidence
