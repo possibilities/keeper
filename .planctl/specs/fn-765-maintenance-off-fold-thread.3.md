@@ -50,5 +50,5 @@ hook_event consumers go in the task Evidence.
 - [ ] full bun test green; no schema bump
 
 ## Done summary
-
+Dropped three dead events indexes (event_type, tool_name grep-verified consumer-less; hook_tool EXPLAIN-verified dead — bashwin covering indexes serve the self-join), keeping idx_events_hook_event (EXPLAIN: only index that SEARCHes the Commit trailer scans without a temp-b-tree regression). Bounded the every-boot ANALYZE with PRAGMA analysis_limit=400 (events table is 624k+ rows). server-worker writer now opens migrate:false (main is sole migrator). No schema bump; index/stat choices never change fold output.
 ## Evidence
