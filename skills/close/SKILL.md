@@ -50,7 +50,7 @@ Spawn the quality-auditor with a config-only prompt — `EPIC_ID` and `BRIEF_REF
 
 ```
 Task(
-    subagent_type="quality-auditor",
+    subagent_type="plan:quality-auditor",
     description="Audit <epic_id>",
     prompt="""EPIC_ID: <epic_id>
 BRIEF_REF: <brief_ref>"""
@@ -75,7 +75,7 @@ Only when `findings>0` (or the auditor line was unparseable). Spawn the close-pl
 
 ```
 Task(
-    subagent_type="close-planner",
+    subagent_type="plan:close-planner",
     description="Plan follow-up for <epic_id>",
     prompt="""EPIC_ID: <epic_id>
 PRIMARY_REPO: <primary_repo>
@@ -113,7 +113,7 @@ Wait for the planner to finish, then re-parse its one-line return (fatal / non-f
 
 ```
 Task(
-    subagent_type="close-planner",
+    subagent_type="plan:close-planner",
     description="Resume plan for <epic_id>",
     prompt="""EPIC_ID: <epic_id>
 PRIMARY_REPO: <primary_repo>

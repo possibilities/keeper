@@ -288,6 +288,16 @@ def test_close_skill_spawns_are_blind_no_model_kwarg():
         "close/SKILL.md must spawn BOTH the quality-auditor and the "
         f"close-planner; found spawns for {sorted(spawned)}."
     )
+    # Keeper launches /plan:close against the globally-loaded `plan` plugin
+    # with no --plugin-dir, so both agents resolve ONLY under their namespaced
+    # ids. A bare `subagent_type="quality-auditor"` wedges autopilot in a
+    # re-dispatch loop (fn-12 regression). Mirror work's `plan:worker-<tier>`.
+    for kind in ("quality-auditor", "close-planner"):
+        assert f'subagent_type="plan:{kind}"' in text, (
+            f"close/SKILL.md must spawn `{kind}` under its namespaced id "
+            f'`plan:{kind}` — bare `subagent_type="{kind}"` does not resolve '
+            "when keeper launches /plan:close against the global plan plugin."
+        )
     for block in blocks:
         assert "model=" not in block, (
             "close/SKILL.md Task(...) spawn carries a `model=` kwarg — the "
