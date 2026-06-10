@@ -945,7 +945,7 @@ export function detectFoldLatency(events: EventRow[]): Finding[] {
 // ---------------------------------------------------------------------------
 
 /** backstop-baseline.json schema version — bump to invalidate on shape change. */
-export const BACKSTOP_BASELINE_VERSION = 2;
+export const BACKSTOP_BASELINE_VERSION = 3;
 
 /**
  * One persisted per-(backstop,class) snapshot. Two jobs:
