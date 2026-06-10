@@ -1897,7 +1897,7 @@ export interface KeeperDb {
  *   shared OS page cache — negligible per-connection cost, so the short-lived
  *   hook benefits too without committing heap.
  */
-function applyPragmas(
+export function applyPragmas(
   db: Database,
   busyTimeoutMs = 5000,
   cacheSizeKb?: number,
@@ -6248,7 +6248,7 @@ function migrate(db: Database): void {
  * the bundle too — `selectWorldRev` is read-only and `insertEvent` simply goes
  * unused. The reducer folds with inline SQL, so it binds nothing from here.
  */
-function prepareStmts(db: Database): Stmts {
+export function prepareStmts(db: Database): Stmts {
   return {
     // Named bindings (`$col`) instead of positional `?` — adding a column now
     // means touching THIS statement and the CREATE TABLE definition, with every

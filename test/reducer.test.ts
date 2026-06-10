@@ -13,21 +13,23 @@
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { openDb } from "../src/db";
 import { applyEvent, DEFAULT_BATCH_SIZE, drain } from "../src/reducer";
 import { seedKilledSweep } from "../src/seed-sweep";
 import type { Event } from "../src/types";
+import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
 
 beforeEach(() => {
-  // fn-722.3: each test opens a fresh in-memory writer connection. The
-  // refold-determinism tests (~:337, ~:2229) rewind the cursor + DELETE the
-  // projection tables + re-drain on this SAME connection, so the byte-identical
-  // re-fold still holds in memory. No body-level test opens a second
-  // connection that would need to see this DB's rows, so :memory: is safe and
-  // drops the per-test on-disk WAL setup cost.
-  db = openDb(":memory:").db;
+  // fn-769: each test clones the per-process migrated `:memory:` template
+  // (`freshMemDb` — `Database.deserialize` ~0.2ms vs the ~28ms full migration
+  // ladder `openDb(":memory:")` paid here before; 28.9s → 6.5s for this file).
+  // The clone is an ordinary private writable connection, so the
+  // refold-determinism tests (~:337, ~:2229) that rewind the cursor + DELETE the
+  // projection tables + re-drain on this SAME connection still hold byte-for-byte
+  // in memory. No body-level test opens a second connection that would need to
+  // see this DB's rows.
+  db = freshMemDb().db;
 });
 
 afterEach(() => {
