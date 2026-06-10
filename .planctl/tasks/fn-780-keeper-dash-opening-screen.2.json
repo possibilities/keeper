@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T21:37:34.908245Z",
+  "depends_on": [
+    "fn-780-keeper-dash-opening-screen.1"
+  ],
+  "epic": "fn-780-keeper-dash-opening-screen",
+  "id": "fn-780-keeper-dash-opening-screen.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Dash OpenTUI app and CLI wiring",
+  "updated_at": "2026-06-10T21:37:34.908245Z"
+}

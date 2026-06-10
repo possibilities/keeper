@@ -1,0 +1,17 @@
+{
+  "branch_name": "fn-780-keeper-dash-opening-screen",
+  "bundles": [],
+  "created_at": "2026-06-10T21:37:34.908245Z",
+  "depends_on_epics": [],
+  "id": "fn-780-keeper-dash-opening-screen",
+  "last_validated_at": "2026-06-10T21:37:34.986055Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Keeper dash opening screen",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-10T21:37:34.908245Z"
+}
