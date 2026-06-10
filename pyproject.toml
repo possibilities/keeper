@@ -25,12 +25,17 @@ build-backend = "hatchling.build"
 # pytest.mark.skip so they stay VISIBLE as skips, never silently deselected via
 # an addopts `-m`). The `real_roots` marker is fast-path (NOT slow-bucket): it
 # only opts a test off the empty-discovery isolation onto a controlled tmp root.
-# -n auto parallelises across CPU cores; --timeout=30 catches genuine hangs
-# (slow-bucket tests still do real `scaffold` git/subprocess work under
-# `--run-slow`). --strict-markers turns a typo'd or unregistered @pytest.mark
-# into a collection error, so every marker must be registered (see
-# tests/conftest.py::pytest_configure).
-addopts = "--import-mode=importlib --timeout=30 -n auto --strict-markers"
+# The fast gate runs serially (no `-n`): with the suite spawning near-zero
+# subprocesses it is CPU-light, so xdist worker bring-up (2-5s per worker under
+# load) and per-worker session-fixture duplication cost more than they save —
+# measured serial ties the fastest small `-n` and beats `-n auto` outright on a
+# loaded dev machine. --timeout=30 catches genuine hangs (slow-bucket tests
+# still do real `scaffold` git/subprocess work under `--run-slow`; pass `-n` on
+# the command line to parallelise those). --strict-markers turns a typo'd or
+# unregistered @pytest.mark into a collection error, so every marker must be
+# registered (see tests/conftest.py::pytest_configure). Pass `-n` on the
+# command line to parallelise a run when desired.
+addopts = "--import-mode=importlib --timeout=30 --strict-markers"
 testpaths = ["tests"]
 
 [tool.ty.src]
