@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T22:25:58.511839Z",
+  "depends_on": [
+    "fn-781-keeper-builds-buildbot-surface.1"
+  ],
+  "epic": "fn-781-keeper-builds-buildbot-surface",
+  "id": "fn-781-keeper-builds-buildbot-surface.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Builds worker and daemon wiring",
+  "updated_at": "2026-06-10T22:25:58.511839Z"
+}

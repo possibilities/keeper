@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T22:25:58.511839Z",
+  "depends_on": [
+    "fn-781-keeper-builds-buildbot-surface.1"
+  ],
+  "epic": "fn-781-keeper-builds-buildbot-surface",
+  "id": "fn-781-keeper-builds-buildbot-surface.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Builds TUI subcommand",
+  "updated_at": "2026-06-10T22:25:58.511839Z"
+}
