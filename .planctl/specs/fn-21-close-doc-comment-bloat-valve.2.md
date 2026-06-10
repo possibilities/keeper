@@ -30,5 +30,5 @@ No automated test covers plan/SKILL.md prose; verify by re-reading the two revis
 - [ ] Neither revised passage contains backward-facing phrasing
 
 ## Done summary
-
+Revised plan/SKILL.md 5e and 5g in place: 5e now forbids ticket/epic ids in gotcha-derived spec constraints and bars default doc-update acceptance items; 5g Docs gaps supports prune/delete-shaped entries with the 'tracking surface' clause kept to one occurrence. Net line growth 0, no new headings, no backward-facing prose.
 ## Evidence
