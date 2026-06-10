@@ -92,14 +92,7 @@ import {
   type BackstopRecord,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
-import {
-  BACKUP_CATCHUP_DELAY_MS,
-  BACKUP_INTERVAL_MS,
-  backupDb,
-  isCatchUpDue,
-  liveBackupPage,
-  resolveBackupDir,
-} from "./backup";
+import { type BackupResult, liveBackupPage } from "./backup";
 import { compactColdBlobs, countAbsentBlobs } from "./compaction";
 import {
   openDb,
@@ -128,11 +121,13 @@ import type {
   GitWorkerData,
   GitWorkerMessage,
 } from "./git-worker";
-import {
-  INTEGRITY_PROBE_INTERVAL_MS,
-  liveIntegrityProbeDeps,
-  runIntegrityProbe,
-} from "./integrity-probe";
+import { livePage } from "./integrity-probe";
+import type {
+  BackupResultMessage,
+  MaintenanceLogMessage,
+  MaintenancePageMessage,
+  MaintenanceWorkerData,
+} from "./maintenance-worker";
 import type {
   PlanctlCommitChangedMessage,
   PlanWorkerData,
@@ -1389,7 +1384,7 @@ export function prewarmWatcherAddon(
 }
 
 /**
- * fn-749 — the eleven worker threads {@link startDaemon} spawns, each addressable
+ * fn-749 — the worker threads {@link startDaemon} spawns, each addressable
  * by a stable name so a test can boot a SUBSET. The names map 1:1 to the
  * `new Worker(...)` sites in {@link startDaemon}:
  *
@@ -1407,6 +1402,7 @@ export function prewarmWatcherAddon(
  *  - `deadLetter`    — `dead-letter-worker.ts`; dead-letter dir watcher.
  *  - `eventsIngest`  — `events-ingest-worker.ts`; events-log NDJSON watch-hint.
  *  - `autopilot`     — `autopilot-worker.ts`; dispatch reconciler.
+ *  - `maintenance`   — `maintenance-worker.ts`; backup + integrity-probe timers.
  *  - `restore`       — `restore-worker.ts`; restore.json snapshot writer.
  */
 export type WorkerName =
@@ -1420,14 +1416,16 @@ export type WorkerName =
   | "deadLetter"
   | "eventsIngest"
   | "autopilot"
+  | "maintenance"
   | "restore";
 
 /**
- * fn-749 — the full eleven-worker set, in spawn order. This IS the production
- * boot: {@link runDaemon} passes no `workers` selector, so {@link startDaemon}
- * defaults to this list and spawns the identical eleven workers (zero behavior
- * change). The set is the source of truth for the "production boot spawns all
- * eleven" regression test.
+ * fn-749 — the full worker set, in spawn order. This IS the production boot:
+ * {@link runDaemon} passes no `workers` selector, so {@link startDaemon} defaults
+ * to this list and spawns the identical workers (zero behavior change). The set
+ * is the source of truth for the "production boot spawns all workers" regression
+ * test. fn-765 added `maintenance` (the twelfth) — the backup + integrity-probe
+ * timers, moved off main's fold thread.
  */
 export const ALL_WORKERS: readonly WorkerName[] = [
   "wake",
@@ -1440,6 +1438,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "deadLetter",
   "eventsIngest",
   "autopilot",
+  "maintenance",
   "restore",
 ] as const;
 
@@ -1525,7 +1524,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.title = "keeperd";
   // fn-749 — resolve the worker-set selector. Omitted → the full ALL_WORKERS
   // set (production parity: runDaemon passes no selector, so this spawns the
-  // identical eleven workers). A test passes a minimal subset; `want(name)`
+  // identical worker set). A test passes a minimal subset; `want(name)`
   // gates each `new Worker(...)` site below. The fold REDUCER runs on MAIN (the
   // `drainToCompletion` pump) regardless of the selector — it is never a worker.
   const selectedWorkers = new Set<WorkerName>(opts.workers ?? ALL_WORKERS);
@@ -3705,11 +3704,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // cannot create it, so a positive count means a bug elsewhere. NOT
       // fatal: we log and keep running (losing visibility on one blob must not
       // wedge the daemon), but it is logged at every pass until resolved.
-      const absent = countAbsentBlobs(db);
-      if (absent > 0) {
-        console.error(
-          `[keeperd] compaction BUG: ${absent} event(s) have a blob in NEITHER events.data NOR event_blobs — data loss, NOT legitimate compaction`,
-        );
+      //
+      // fn-765 — gate the scan on `relocated > 0`, mirroring the PASSIVE
+      // checkpoint guard below. A pass that moved zero blobs cannot have CREATED
+      // an absent-in-both row, so the full-table `countAbsentBlobs` read (a scan
+      // on every idle heartbeat, the common case once the cold backlog drains)
+      // is wasted work — skip it when nothing was relocated.
+      if (relocated > 0) {
+        const absent = countAbsentBlobs(db);
+        if (absent > 0) {
+          console.error(
+            `[keeperd] compaction BUG: ${absent} event(s) have a blob in NEITHER events.data NOR event_blobs — data loss, NOT legitimate compaction`,
+          );
+        }
       }
     } catch (err) {
       // A compaction failure is pure space-reclamation loss, never a
@@ -3776,103 +3783,52 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }, WAL_CHECKPOINT_INTERVAL_MS);
 
-  // fn-746 .1 — periodic SQLite integrity probe. Proactively catches the
-  // 2026-06-07 "database disk image is malformed" class on the ~2 GB DB, which
-  // previously surfaced only when a query happened to hit a bad page. Runs a
-  // bounded `PRAGMA quick_check` on a DEDICATED short-lived READ-ONLY connection
-  // (opened + closed per probe inside `liveQuickCheck`) — read-only never takes
-  // the writer lock, so the probe can NEVER starve the daemon's sole writer or a
-  // concurrent hook INSERT. Producer-side health check: reads no projection,
-  // writes nothing, mints no synthetic event, never inside a fold — re-fold
-  // determinism and the sole-writer rules are untouched. Its only side effect is
-  // an out-of-band Telegram page (the "Keeper" topic) on failure; a healthy
-  // probe is silent. Never-throws out (the probe runner degrades internally),
-  // matching the compaction / checkpoint timers. Stored so shutdown can clear it
-  // (an outstanding timer pins a ref on the main loop). The cadence is slack
-  // (15 min) so the bounded structural sweep is steady-state negligible.
-  const integrityProbeDeps = liveIntegrityProbeDeps(dbPath);
-  const integrityProbeTimer = setInterval(() => {
-    if (shuttingDown) return;
-    runIntegrityProbe(integrityProbeDeps);
-  }, INTEGRITY_PROBE_INTERVAL_MS);
+  // fn-765 — the heavy SQLite maintenance schedules (the fn-746 .1 integrity
+  // probe + .2 verified backup + fn-753 boot catch-up) NO LONGER run on main's
+  // fold thread. They are SYNCHRONOUS bun:sqlite ops (`PRAGMA quick_check`,
+  // `VACUUM INTO` on a ~2 GB DB), so a `setInterval` hosting them stalled main's
+  // event loop for their full duration, blocking folds + the events-log ingest
+  // and feeding the fold-lag class the 2026-06-09 review fixes. They now run on
+  // the dedicated `maintenance-worker` (spawned below at the worker-spawn site),
+  // which calls the SAME `backupDb` / `runIntegrityProbe` bodies against their
+  // SAME dedicated short-lived read-only connections. The side effects stay on
+  // main, driven by relayed outcomes: a backup-result message runs the
+  // success-log / failure-log+page branch (`handleBackupResult` below); the
+  // probe relays its log + page lines (`maintenance-log` / `maintenance-page`),
+  // routed through the page sink here. Compaction + the WAL-checkpoint timers
+  // above STAY on main — they write via the writer connection (sole-writer rule).
 
-  // fn-746 .2 — periodic verified backup/snapshot (the RECOVERY half of the
-  // epic, complementing the .1 DETECTION probe). `backupDb` runs `VACUUM INTO`
-  // on a DEDICATED short-lived READ-ONLY source connection, so it never takes
-  // the writer lock or starves a concurrent hook INSERT — the copy holds only a
-  // read transaction on the live DB. The freelist-compacted snapshot is the
-  // SIZE-RECLAIMED image (fn-746.1 found the live ~1.9 GB file is freelist-poor
-  // because online VACUUM is deliberately deferred — restoring the snapshot is
-  // the offline VACUUM), and every snapshot is verified with `integrity_check`
-  // before it counts (a snapshot that fails verification is deleted, not kept).
-  // Producer-side: writes ONLY the snapshot file (a sibling of the DB under the
-  // state dir), never the live DB, mints no synthetic event, touches no
-  // projection/reducer — re-fold determinism + sole-writer rules untouched.
-  // Never-throws out, matching the compaction / checkpoint / probe timers; a
-  // backup FAILURE logs AND pages (recovery is degraded), a success is silent.
-  // Stored so shutdown can clear it (an outstanding timer pins a ref on the
-  // main loop, and a backup must not fire mid-teardown). 24h cadence — backup
-  // is a heavy op and a daily verified snapshot is the right recovery floor.
-  const backupPage = liveBackupPage();
-  // The single backup callback — shared by BOTH the regular 24h interval and
-  // the fn-753 boot-time catch-up one-shot below. Never-throws out, logs on
-  // failure, pages on failure (recovery is degraded); a success is silent.
-  function runBackupPass(): void {
-    if (shuttingDown) return;
-    try {
-      const result = backupDb(dbPath);
-      if (result.verified && result.snapshotPath !== null) {
-        const mb = (result.bytes / (1024 * 1024)).toFixed(1);
-        console.error(
-          `[keeperd] backup: verified snapshot (${mb} MB) ${result.snapshotPath}${
-            result.pruned.length > 0
-              ? ` (pruned ${result.pruned.length} old)`
-              : ""
-          }`,
-        );
-      } else {
-        const detail = result.error ?? "unknown error";
-        console.error(`[keeperd] backup FAILED: ${detail}`);
-        try {
-          backupPage(
-            `🔴 keeperd backup FAILED — no fresh verified snapshot, recovery is degraded.\n${detail}`,
-          );
-        } catch {
-          // Page is best-effort; a notifier failure must not crash the heartbeat.
-        }
-      }
-    } catch (err) {
-      // A backup is pure recovery-floor maintenance, never a correctness issue
-      // (it only reads the source + writes a sidecar file). Log non-fatally and
-      // let the next heartbeat retry — same crash policy as the probe timer.
+  // Shared botctl/Telegram page sink for relayed maintenance pages — the SAME
+  // "Keeper" topic the probe/backup used inline before the move. Best-effort:
+  // `livePage` swallows a notifier failure so a relayed page can never crash main.
+  const maintenancePage = livePage();
+  const backupFailurePage = liveBackupPage();
+
+  // Run main's existing success-log / failure-log+page branch from a relayed
+  // `BackupResult`. Byte-identical to the inline `runBackupPass` body that lived
+  // here before fn-765 — only the `backupDb` call (which now runs worker-side)
+  // is gone; the formatting + logging + paging is unchanged.
+  function handleBackupResult(result: BackupResult): void {
+    if (result.verified && result.snapshotPath !== null) {
+      const mb = (result.bytes / (1024 * 1024)).toFixed(1);
       console.error(
-        `[keeperd] backup pass threw (non-fatal): ${
-          err instanceof Error ? err.message : String(err)
+        `[keeperd] backup: verified snapshot (${mb} MB) ${result.snapshotPath}${
+          result.pruned.length > 0
+            ? ` (pruned ${result.pruned.length} old)`
+            : ""
         }`,
       );
+    } else {
+      const detail = result.error ?? "unknown error";
+      console.error(`[keeperd] backup FAILED: ${detail}`);
+      try {
+        backupFailurePage(
+          `🔴 keeperd backup FAILED — no fresh verified snapshot, recovery is degraded.\n${detail}`,
+        );
+      } catch {
+        // Page is best-effort; a notifier failure must not crash main.
+      }
     }
-  }
-  const backupTimer = setInterval(runBackupPass, BACKUP_INTERVAL_MS);
-
-  // fn-753 — boot-time catch-up. The regular `setInterval` resets on every
-  // daemon boot, so a keeperd that restarts more often than `BACKUP_INTERVAL_MS`
-  // (the LaunchAgent crash-recovery path) would silently never reach its first
-  // fire — the automatic backup floor never lands. If the newest snapshot is
-  // overdue (or none exists), schedule a one-shot that runs the SAME backup
-  // callback after a short startup delay, before the regular interval begins.
-  // Shares the full never-throw / log-on-failure / page-on-failure contract by
-  // construction (it calls the identical `runBackupPass`). The check is pure
-  // (`isCatchUpDue` parses the newest snapshot's `YYYYMMDDTHHMMSS` stamp; no
-  // mtime trust); a fresh snapshot ⇒ no timer scheduled and regular behavior is
-  // unchanged. Stored so shutdown can clear it before it fires within the delay
-  // window (an outstanding timer pins a ref on the main loop, and a backup must
-  // not fire mid-teardown).
-  let backupCatchUpTimer: ReturnType<typeof setTimeout> | null = null;
-  if (isCatchUpDue(resolveBackupDir(dbPath), Date.now())) {
-    backupCatchUpTimer = setTimeout(() => {
-      backupCatchUpTimer = null;
-      runBackupPass();
-    }, BACKUP_CATCHUP_DELAY_MS);
   }
 
   // fn-749: crash-handler guard — wired only when the worker was selected.
@@ -3911,6 +3867,67 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // pulse re-writes); only an unhandled throw out of the watch loop
   // escalates to `onerror`/`close` → fatalExit. Consistent with the other
   // workers' crash policy.
+  // fn-765 — the maintenance worker: the dedicated thread hosting the heavy
+  // SQLite maintenance schedules (24h verified backup, 15-min integrity probe,
+  // fn-753 boot catch-up) that used to run on main's fold thread. bun:sqlite is
+  // synchronous, so those ops (a ~2 GB `VACUUM INTO`, a bounded `quick_check`)
+  // stalled main's event loop for their full duration; off-thread they stop
+  // blocking folds + ingest. The worker calls the SAME `backupDb` /
+  // `runIntegrityProbe` bodies (each opens + closes its own short-lived RO
+  // connection internally) and RELAYS outcomes up — main keeps the existing
+  // logging + paging side effects via the handlers below.
+  // fn-749: gated on the selector — `null` when unselected.
+  const maintenanceWorker = want("maintenance")
+    ? new Worker(new URL("./maintenance-worker.ts", import.meta.url).href, {
+        workerData: { dbPath } satisfies MaintenanceWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (maintenanceWorker) {
+    const mw = maintenanceWorker;
+    // Worker → main: relayed maintenance outcomes. A backup-result drives main's
+    // existing success-log / failure-log+page branch; a maintenance-log line is
+    // `console.error`d (the probe's log sink); a maintenance-page is routed to
+    // the botctl/Telegram page sink (the probe's page sink). Every handler is
+    // non-throwing — a relay never crashes main.
+    mw.onmessage = (
+      ev: MessageEvent<
+        | BackupResultMessage
+        | MaintenanceLogMessage
+        | MaintenancePageMessage
+        | undefined
+      >,
+    ): void => {
+      const msg = ev.data;
+      if (!msg) return;
+      if (msg.kind === "backup-result") {
+        handleBackupResult(msg.result);
+      } else if (msg.kind === "maintenance-log") {
+        console.error(msg.message);
+      } else if (msg.kind === "maintenance-page") {
+        try {
+          maintenancePage(msg.message);
+        } catch {
+          // Page is best-effort; a notifier failure must not crash main.
+        }
+      }
+    };
+
+    // Same crash policy as the other workers: any thread failure → fatalExit →
+    // exit 1 → launchd restart. NEVER respawn in-process.
+    mw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] maintenance worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    // A worker `process.exit(1)` fires `close`, not `onerror`. `!shuttingDown`
+    // makes it inert on clean shutdown (the worker exits 0 after clearing its
+    // own timers).
+    mw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
   // fn-749: gated on the selector — `null` when unselected.
   const restoreWorker = want("restore")
     ? new Worker(new URL("./restore-worker.ts", import.meta.url).href, {
@@ -4003,30 +4020,16 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // fn-744 .2 — clear the steady-state checkpoint heartbeat so a PASSIVE
     // checkpoint can't fire into the writer connection mid-teardown.
     clearInterval(walCheckpointTimer);
-    // fn-746 .1 — clear the integrity probe heartbeat. The probe uses its own
-    // short-lived read-only connection (never the writer), so this is purely
-    // timer hygiene — an outstanding timer would pin a ref on the main loop and
-    // hang teardown at the shutdown deadline.
-    clearInterval(integrityProbeTimer);
-    // fn-746 .2 — clear the backup heartbeat. The backup reads via its own
-    // short-lived read-only source connection (never the writer) and writes
-    // only a sidecar snapshot file, so this is timer hygiene — an outstanding
-    // timer would pin a ref on the main loop and hang teardown.
-    clearInterval(backupTimer);
-    // fn-753 — clear the boot-time catch-up one-shot if it hasn't fired yet
-    // (the daemon stopped within the startup-delay window). Same timer hygiene
-    // as the backup interval: an outstanding timeout would pin a ref on the
-    // main loop and could fire a heavy backup mid-teardown.
-    if (backupCatchUpTimer !== null) {
-      clearTimeout(backupCatchUpTimer);
-      backupCatchUpTimer = null;
-    }
+    // fn-765 — the integrity-probe + backup + catch-up timers moved to the
+    // maintenance worker; main no longer holds those `setInterval`/`setTimeout`
+    // handles. The worker clears its own timers in its shutdown handler when main
+    // posts `{type:"shutdown"}` below, then exits clean.
 
     // fn-749: the set of workers actually spawned this boot (filter out the
     // `null`s for any unselected worker). Teardown iterates THIS list, so a
     // minimal-set boot posts shutdown to / awaits close on / terminates only
-    // the workers it spawned. In the production all-eleven boot this is the
-    // identical eleven, in spawn order.
+    // the workers it spawned. In the production full boot this is the identical
+    // ALL_WORKERS set, in spawn order.
     const spawnedWorkers: Worker[] = [
       worker,
       serverWorker,
@@ -4038,11 +4041,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       deadLetterWorker,
       eventsIngestWorker,
       autopilotWorkerInstance,
+      maintenanceWorker,
       restoreWorker,
     ].filter((w): w is Worker => w !== null);
 
+    // fn-765 — wrap each shutdown post in per-worker try/catch. A worker that
+    // already exited (crashed, or terminated by a prior teardown) makes
+    // `postMessage` throw `InvalidStateError: Worker has been terminated`; an
+    // unguarded throw here would reject `stop()` and hang the whole teardown
+    // until launchd's SIGKILL deadline. We still want to post to every OTHER
+    // live worker, so swallow per-worker and continue — a dead worker needs no
+    // shutdown signal anyway (its `close` already resolved its exit wait below).
     for (const w of spawnedWorkers) {
-      w.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+      try {
+        w.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
+      } catch {
+        // Worker already gone; nothing to signal. Keep posting to the rest.
+      }
     }
 
     // Bun surfaces worker exit via the "close" event. Await every spawned

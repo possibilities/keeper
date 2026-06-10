@@ -2397,6 +2397,17 @@ the now ~2 GB DB) is a catastrophe if it's unrecoverable. Three layers guard it
    the writer lock or starves a concurrent hook INSERT — it is safe while the
    daemon is up.
 
+Both the integrity probe and the backup (plus the `fn-753` boot-time catch-up
+backup) run on a dedicated **maintenance worker thread** (`src/maintenance-worker.ts`,
+epic `fn-765`), NOT on main's fold thread. bun:sqlite is synchronous, so a
+`VACUUM INTO` on the ~2 GB DB or a bounded `quick_check` would otherwise stall
+main's event loop for its full duration — blocking folds and the events-log
+ingest and feeding fold lag. The worker calls the same `backupDb` /
+`runIntegrityProbe` bodies against their own short-lived read-only connections
+and relays the outcome to main, which keeps the logging + paging side effects.
+Compaction stays on main (it writes via the writer connection, the sole-writer
+rule).
+
 Take a snapshot by hand at any time (safe while keeperd is running):
 
 ```sh

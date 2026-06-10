@@ -2846,6 +2846,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "dead-letter-worker.ts": "deadLetter",
   "events-ingest-worker.ts": "eventsIngest",
   "autopilot-worker.ts": "autopilot",
+  "maintenance-worker.ts": "maintenance",
   "restore-worker.ts": "restore",
 };
 
@@ -2921,13 +2922,14 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL eleven workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL twelve workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
-  // must spawn exactly ALL_WORKERS, in order.
+  // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance` (the
+  // twelfth) — the backup + integrity-probe timers, moved off main's fold thread.
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(11);
+  expect(spawned).toHaveLength(12);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -2941,6 +2943,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL eleven work
     "deadLetter",
     "eventsIngest",
     "autopilot",
+    "maintenance",
     "restore",
   ]);
 });
