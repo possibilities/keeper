@@ -47,5 +47,5 @@ commit it in the planctl repo separately from the keeper doc commit.)
 - [ ] AGENTS.md still resolves as a symlink to CLAUDE.md (not replaced by a regular file).
 
 ## Done summary
-
+Stripped all live approval prose orphaned by the fn-756 strip. keeper README.md + CLAUDE.md now grep -ci approval == 0: dropped the set_{task,epic}_approval RPCs, the approval field/pill/PERMANENT-ladder, the keeper approve client, and the RPC six-surfaces list (renumbered to five). Corrected default_visible prose + sqlite examples to status='open' (v63), spawn grammar to {plan|work|close}, and the cap/completion-reap/dep-satisfied/planctl-op lists. planctl CLAUDE.md:62 dropped approve/render-approve-context/task ack/epic ack/approval-fields/acks.db. Two historical-lineage mentions kept (incident name 'infinite-re-approve class', predecessor 'approve-only fn-734'). AGENTS.md still a symlink to CLAUDE.md.
 ## Evidence
