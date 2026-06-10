@@ -229,6 +229,13 @@ paths or any slow-tier file** — the default fast run does NOT cover those, and
 the slow tier breaking silently is the dominant failure mode until the follow-up
 local-CI epic lands. When in doubt, run `test:full`.
 
+**Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses
+`retryUntil` (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep` as a
+deadline race. `retryUntil(predicate, timeoutMs, cadenceMs)` polls until the
+predicate returns truthy or the deadline elapses — free on the happy path, spent
+only on a real hang — so a fixed sleep can't silently resolve under host
+contention and flake the suite.
+
 ## Autopilot
 
 The server-side reconciler dispatches workers against ready plan work. It **boots

@@ -550,7 +550,10 @@ Keeper has no `install` verb. Wire it up manually:
    `serialize()`s it once, and deserializes a per-test clone (~0.2ms) instead of
    re-running the 63-version `migrate()` ladder on every `openDb(":memory:")`,
    which is what made the default `bun test` fast (the slow process-level files
-   are tiered behind `bun run test:full`; see CLAUDE.md `## Test isolation`). The restore worker (epic fn-677, two-tier
+   are tiered behind `bun run test:full`; see CLAUDE.md `## Test isolation`). A
+   third helper, `retryUntil` (`test/helpers/retry-until.ts`), polls until an
+   async worker/daemon condition holds and is the canonical replacement for a
+   fixed `Bun.sleep` deadline race. The restore worker (epic fn-677, two-tier
    rework fn-702) writes `~/.local/state/keeper/restore.json` (the
    Chrome-style "restore previous session" snapshot — agents + zellij
    metadata for `scripts/restore-agents.ts` to replay against) as a
