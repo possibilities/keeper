@@ -55,5 +55,5 @@ filtering). This file is process/lifecycle-shaped → covered by `test:full`.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Subscribed the readiness client to autopilot_state + armed_epics, widened the first-paint gate to both, and threaded the computeEligibleEpics set (default yolo when autopilot_state is empty) into computeReadiness so the board/CLI per-root winner matches the reconciler's dispatch in armed mode.
 ## Evidence
