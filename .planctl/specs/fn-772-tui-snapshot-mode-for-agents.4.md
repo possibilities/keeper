@@ -50,5 +50,5 @@ accurate. No new code.
       no redundant `--snapshot`, no hang-inducing `--watch`.
 
 ## Done summary
-
+Documented the shipped fn-772 viewer snapshot mode across README architecture (three-way TTY gate + per-subcommand non-TTY clauses + keeper-meta examples), keeper.ts USAGE, CLAUDE.md (sidecar/sandboxEnv + slow-tier note), and await SKILL.md (bare keeper jobs is one-shot in agents; no --watch). Docs-only.
 ## Evidence
