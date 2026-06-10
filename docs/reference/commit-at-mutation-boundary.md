@@ -1,7 +1,7 @@
 # Commit at the Mutation Boundary
 
 **Status:** Authoritative
-**Applies to:** planctl CLI v1 (fn-587 and later)
+**Applies to:** planctl CLI v1
 
 This memo is the single source of truth for planctl's commit contract. All
 other docs that describe commit behavior defer to this file.
@@ -127,6 +127,13 @@ routing happens inside `auto_commit_from_invocation` — the destination
 is resolved from `state_repo`, not from the cwd of the agent that fired
 the verb.
 
+**`warnings: [str]`** is an optional advisory field that rides
+`set-primary-repo` / `set-touched-repos` envelopes, carrying the
+non-blocking `_validate_repo_path` results. The write still succeeds with
+exit 0 even when warnings fire — warn-and-write is intentional.
+`set-target-repo` does NOT carry this field, and `scaffold` carries no
+advisory.
+
 ### Verb classification
 
 `output.emit()` owns the build→commit path for every mutating verb routed
@@ -164,12 +171,12 @@ in a non-git dir, takes the read-only `emit()` path and lands no commit.
 |---|---|---|---|
 | Mutating, single-field (`done`, `epic close`, `epic invalidate`, `epic add-dep`/`add-deps`/`rm-dep`, every `epic set-*` / `task set-*`, `task reset`, ...) | non-null `subject`, populated `files` | yes (inline) | every write is a rewrite of a pre-existing tracked file via atomic_write rename-atomic; prior valid contents stay in place |
 | Mutating, whole-tree (`scaffold`, `refine-apply`, `epic create`) | non-null `subject`, `files` covers the full epic+tasks+specs+deps tree | yes (inline, one commit) | the LOCAL write-phase block unwinds a mid-write crash; a pre-commit raise from the seam leaves the fully-written tree on disk (§10), invisible to the autopilot via the keeper HEAD-gate |
-| Mutating, whole-tree delete (`epic rm`, fn-623) | non-null `subject`, `files` lists every unlinked path (epic JSON, every task JSON, epic + task specs, runtime state, locks) — paths are recorded BEFORE the unlink so the `touched ∩ dirty` pathspec captures the deletions | yes (inline, one commit) | the verb is a delete — a pre-commit raise leaves the deletes in place (§10), nothing to re-create |
+| Mutating, whole-tree delete (`epic rm`) | non-null `subject`, `files` lists every unlinked path (epic JSON, every task JSON, epic + task specs, runtime state, locks) — paths are recorded BEFORE the unlink so the `touched ∩ dirty` pathspec captures the deletions | yes (inline, one commit) | the verb is a delete — a pre-commit raise leaves the deletes in place (§10), nothing to re-create |
 | Mutating, self-built payload (`init`) | non-null `subject`, `files` is the explicit bootstrap set it created; NO `session_id` key (no `Session-Id:` trailer) | yes (inline, via `emit(planctl_invocation=...)`), only when something was written AND inside a git work tree | the writes are fresh files; a pre-commit raise leaves them on disk (§10), and an idempotent re-run is the read-only `emit()` path |
 | Runtime-state-only (`claim`, `block`, `approve`, `close-preflight`, `audit submit`, `verdict submit`, `followup submit`) | `subject=null`, `files=null` | none (gitignored state) | n/a — `claim` writes the worker brief to `state/briefs/<task_id>.json` and the close-phase verbs write under `state/audits/<epic_id>/` (`brief.json`, `report.md`, `verdict.json`, `followup.yaml`); all are gitignored, so these writes land no commit. The submit verbs validate at emission with typed reject envelopes; `close-preflight` is the close-phase bookend to `claim` (returns `{primary_repo, brief_ref, commit_set_hash, tasks, all_done}`) |
 | Read-only (`show`, `cat`, `list`, ...) | `subject=null`, `files=null` (via decorator) | none | n/a |
-| Read-only, git-reading (`reconcile`, fn-6) | `subject=null`, `files=null` (via decorator) | none | n/a — reads git (`git log` trailer parse against `target_repo`/`epic.touched_repos`, `git cat-file` against `state_repo`) to compute the typed verdict, but never writes or commits; any git subprocess failure fails closed to a `tooling_error` verdict, never a silent state mutation |
-| Saga orchestrator (`close-finalize`, fn-12) | `subject=null`, `files=null` (readonly footer) | none directly | n/a — `close-finalize` draws NO `.planctl/` commit of its own: the irreversible `epic close` and (when survivors exist) `scaffold` each landed their own commit inline when invoked. The terminal envelope rides the read-only invocation footer (same shape as `reconcile` / `resolve-task`) carrying `{outcome, epic_id, finalized_at, new_epic_id?, fatal_reason?, expected_tasks?, actual_tasks?}`. It encodes the saga from observable state — stale-check on `commit_set_hash`, fatal-halt, reversible scaffold BEFORE the irreversible close — and is idempotent on re-run; typed errors `EPIC_NOT_FOUND | STALE_ARTIFACTS | VERDICT_MISSING | VERDICT_CORRUPT | FOLLOWUP_MISSING | SCAFFOLD_FAILED` |
+| Read-only, git-reading (`reconcile`) | `subject=null`, `files=null` (via decorator) | none | n/a — reads git (`git log` trailer parse against `target_repo`/`epic.touched_repos`, `git cat-file` against `state_repo`) to compute the typed verdict, but never writes or commits; any git subprocess failure fails closed to a `tooling_error` verdict, never a silent state mutation |
+| Saga orchestrator (`close-finalize`) | `subject=null`, `files=null` (readonly footer) | none directly | n/a — `close-finalize` draws NO `.planctl/` commit of its own: the irreversible `epic close` and (when survivors exist) `scaffold` each landed their own commit inline when invoked. The terminal envelope rides the read-only invocation footer (same shape as `reconcile` / `resolve-task`) carrying `{outcome, epic_id, finalized_at, new_epic_id?, fatal_reason?, expected_tasks?, actual_tasks?}`. It encodes the saga from observable state — stale-check on `commit_set_hash`, fatal-halt, reversible scaffold BEFORE the irreversible close — and is idempotent on re-run; typed errors `EPIC_NOT_FOUND | STALE_ARTIFACTS | VERDICT_MISSING | VERDICT_CORRUPT | FOLLOWUP_MISSING | SCAFFOLD_FAILED` |
 | `validate --epic <id>` (first-ever valid) | non-null `subject`, single file | yes (manual `auto_commit_from_invocation` call from the validate runner, which bypasses `emit()` to preserve its `{valid, errors, warnings}` envelope shape) | bypass — documented out-of-scope per §13's `validate --epic` row, see the asymmetry note below |
 | `refine-context --invalidate` (conditionally-mutating) | non-null `subject`, single file | yes (inline) | envelope shape is `emit()`-compatible; the single-field rewrite is a rename-atomic over a pre-existing tracked file, so prior valid contents stay in place |
 
@@ -186,7 +193,7 @@ into the `epics` projection) gates snapshot emission on a synchronous
 `git cat-file -e HEAD:<relpath>` check — until the file is in HEAD, no
 `EpicSnapshot`/`TaskSnapshot` is emitted and the autopilot cannot
 dispatch against it. This HEAD-gate is the single guard that closes the
-fn-627 duplicate-dispatch window: an uncommitted epic tree on disk (a tree
+duplicate-dispatch window: an uncommitted epic tree on disk (a tree
 that persisted past a hard `commit_failed`, or a fresh in-flight pre-commit
 tree) is simply never observed. planctl carries no complementary
 seam unwind or orphan reaper — an untracked tree is harmless because it
@@ -421,9 +428,8 @@ retry; the human resolves any cross-host `non_fast_forward`.
 
 Ack stamps fire from contexts that do not always commit cleanly (direct
 CLI). Storing them off the tracked JSON keeps the auto-commit path
-silent on ack — `files=[]` → no-op — and eliminates a whole class of
-rescue commits that the pre-fn-488 hook model produced. No commit needs
-to cover acks because acks are not in git.
+silent on ack — `files=[]` → no-op — so no rescue commits are needed for
+ack stamps. No commit needs to cover acks because acks are not in git.
 
 ### Consumer derivation
 
@@ -546,7 +552,7 @@ An uncommitted epic tree that persists past a hard `commit_failed` is
 **harmless**: keeper's plan-worker observation gate (§3) gates snapshot
 emission on `git cat-file -e HEAD:<relpath>`, so the autopilot never
 observes — and never dispatches against — a tree that is not yet in HEAD.
-That HEAD-gate is the SOLE guard against the fn-627 duplicate-dispatch
+That HEAD-gate is the SOLE guard against the duplicate-dispatch
 window; planctl carries no seam unwind or orphan reaper. The
 next mutating verb whose `touched ∩ dirty` intersects the dirty file
 sweeps it into a commit.
@@ -679,18 +685,18 @@ Per-test `tmp_path` + `git init` + `commit.gpgsign=false` +
 | Concurrent-sweep race | Verb A commits the files; Verb B re-confirms clean files and returns `None` (no empty commit); pathspec-scoped commits never cross-contaminate |
 | `done` verb | `chore(planctl): done <task_id>` commit lands in one verb call |
 | `task ack` | Writes `acks.db` only; no commit; envelope carries `subject=null`/`files=null` |
-| `approve` (runtime-state-only, fn-732) | Writes the gitignored sidecar (`state/{tasks,epics}/<id>.state.json`) only; no commit; envelope carries `subject=null`/`files=null`. Mirrors `claim`/`block` |
+| `approve` (runtime-state-only) | Writes the gitignored sidecar (`state/{tasks,epics}/<id>.state.json`) only; no commit; envelope carries `subject=null`/`files=null`. Mirrors `claim`/`block` |
 | `scaffold` whole-tree | One commit covers epic + tasks + specs + deps; envelope `files` lists every written path |
-| `scaffold` integrity-gate failure (fn-623) | `scan_max_epic_id` unchanged; zero orphan `specs/fn-N-*.md` on disk (in-memory `epic_spec_content=` pass means no spec lands before the gate); failure envelope only, no commit |
-| Seam pre-commit persistence (fn-640) | Multi-file mint verb raises AFTER the write phase (invocation-build raise or simulated `git` failure); the fully-written tree PERSISTS on disk (no seam unwind); the failure envelope lands; `_epic_id_lock` releases before the git commit runs (no nesting regression) |
+| `scaffold` integrity-gate failure | `scan_max_epic_id` unchanged; zero orphan `specs/fn-N-*.md` on disk (in-memory `epic_spec_content=` pass means no spec lands before the gate); failure envelope only, no commit |
+| Seam pre-commit persistence | Multi-file mint verb raises AFTER the write phase (invocation-build raise or simulated `git` failure); the fully-written tree PERSISTS on disk (no seam unwind); the failure envelope lands; `_epic_id_lock` releases before the git commit runs (no nesting regression) |
 | Local write-phase unwind | A MID-WRITE crash inside the mint verb's write loop (e.g. disk-full on the 2nd of N task writes) unwinds the partial FRESH-MINT tree via the verb's LOCAL try/except; the commit-failure window is NOT covered by this block |
-| Keeper observation gate (fn-629 task .1, sole pre-commit guard) | An uncommitted `.planctl/epics/<id>.json` on disk does NOT produce an `EpicSnapshot` snapshot — the file lands in keeper's plan-worker `pending` set; once the file is committed (HEAD-resolvable via `git cat-file -e HEAD:<relpath>`), the next git-worker pulse drains pending and the snapshot emits. Autopilot cannot dispatch against an uncommitted epic |
+| Keeper observation gate (sole pre-commit guard) | An uncommitted `.planctl/epics/<id>.json` on disk does NOT produce an `EpicSnapshot` snapshot — the file lands in keeper's plan-worker `pending` set; once the file is committed (HEAD-resolvable via `git cat-file -e HEAD:<relpath>`), the next git-worker pulse drains pending and the snapshot emits. Autopilot cannot dispatch against an uncommitted epic |
 | `epic rm` whole-tree delete | One `chore(planctl): rm <epic_id>` commit covers every unlinked path; touched paths recorded BEFORE unlink so `touched ∩ dirty` captures the deletions; `--dry-run` emits the same envelope shape minus `planctl_invocation` and lands no commit |
 | `validate --epic` first-stamp | Manual `auto_commit_from_invocation` call from the runner lands the marker commit; bypasses `emit()` to preserve the `{valid, errors, warnings}` envelope shape |
-| `close-preflight` (runtime-state-only, fn-12) | Writes `state/audits/<epic_id>/brief.json` (gitignored, atomic, commit-free); envelope `{primary_repo, brief_ref, commit_set_hash, tasks, all_done}` carries `subject=null`/`files=null`; `all_done:false` is a typed `TASKS_NOT_DONE` error, not a success; a task id passed where an epic is required is a typed reject; `commit_set_hash` is deterministic (sorted SHAs → sorted-key JSON → SHA-256, schema version included, no timestamps) |
-| `audit` / `verdict` / `followup submit` (runtime-state-only, fn-12) | Each persists its artifact under `state/audits/<epic_id>/` (gitignored, commit-free) and validates at emission: typed reject envelopes with a machine-readable error list (loc/type/msg) + a minimal schema fragment, never the full schema; `yaml.safe_load` + a 1 MiB stdin byte cap on every submit; envelope carries `subject=null`/`files=null`; `followup submit` cross-checks the plan's task count against the verdict's expected cluster count (`TASK_COUNT_MISMATCH`) |
-| `close-finalize` (saga orchestrator, fn-12) | Per-outcome coverage across the four `CloseOutcome` members (`closed_clean` / `closed_with_followup` / `fatal_halt` / `partial_followup`); an exhaustiveness test asserting every outcome has a close-skill handler (the skill consistency test pins the total switch); idempotent re-run from observable state (a closed epic, an existing follow-up) never double-creates; refuses on `commit_set_hash` mismatch (`STALE_ARTIFACTS`) without deleting; ports the partial-follow-up completeness invariant (`expected_tasks` vs `actual_tasks` → `partial_followup`); readonly invocation footer (`subject=null`/`files=null`, no commit of its own — `epic close` / `scaffold` already landed theirs) |
-| `reconcile` (read-only, fn-6) | Per-verdict coverage across all seven values; an exhaustiveness test asserting every verdict has an orchestrator handler; trailer-authentic source detection (no prose false-match, no `fn-N.1`↔`fn-N.10` substring collision); unborn-branch guard (`git cat-file` against an empty/orphan `state_repo` is a distinct signal, not `not_found`/`tooling_error`); fail-closed `tooling_error` on any git subprocess failure; readonly invocation footer (`subject=null`/`files=null`, no commit, never calls a mutating verb or `validate --epic`) |
+| `close-preflight` (runtime-state-only) | Writes `state/audits/<epic_id>/brief.json` (gitignored, atomic, commit-free); envelope `{primary_repo, brief_ref, commit_set_hash, tasks, all_done}` carries `subject=null`/`files=null`; `all_done:false` is a typed `TASKS_NOT_DONE` error, not a success; a task id passed where an epic is required is a typed reject; `commit_set_hash` is deterministic (sorted SHAs → sorted-key JSON → SHA-256, schema version included, no timestamps) |
+| `audit` / `verdict` / `followup submit` (runtime-state-only) | Each persists its artifact under `state/audits/<epic_id>/` (gitignored, commit-free) and validates at emission: typed reject envelopes with a machine-readable error list (loc/type/msg) + a minimal schema fragment, never the full schema; `yaml.safe_load` + a 1 MiB stdin byte cap on every submit; envelope carries `subject=null`/`files=null`; `followup submit` cross-checks the plan's task count against the verdict's expected cluster count (`TASK_COUNT_MISMATCH`) |
+| `close-finalize` (saga orchestrator) | Per-outcome coverage across the four `CloseOutcome` members (`closed_clean` / `closed_with_followup` / `fatal_halt` / `partial_followup`); an exhaustiveness test asserting every outcome has a close-skill handler (the skill consistency test pins the total switch); idempotent re-run from observable state (a closed epic, an existing follow-up) never double-creates; refuses on `commit_set_hash` mismatch (`STALE_ARTIFACTS`) without deleting; ports the partial-follow-up completeness invariant (`expected_tasks` vs `actual_tasks` → `partial_followup`); readonly invocation footer (`subject=null`/`files=null`, no commit of its own — `epic close` / `scaffold` already landed theirs) |
+| `reconcile` (read-only) | Per-verdict coverage across all seven values; an exhaustiveness test asserting every verdict has an orchestrator handler; trailer-authentic source detection (no prose false-match, no `fn-N.1`↔`fn-N.10` substring collision); unborn-branch guard (`git cat-file` against an empty/orphan `state_repo` is a distinct signal, not `not_found`/`tooling_error`); fail-closed `tooling_error` on any git subprocess failure; readonly invocation footer (`subject=null`/`files=null`, no commit, never calls a mutating verb or `validate --epic`) |
 
 See `apps/planctl/tests/test_commit.py` for the auto-commit suite.
 
@@ -748,9 +754,9 @@ same shape as §10: `git add .planctl/epics/<id>.json && git commit -m
 `git checkout -- .planctl/epics/<id>.json` to discard the stamp and
 let a fresh `validate --epic` re-attempt.
 
-This asymmetry is by design for this epic — fn-588 explicitly scopes
-out rolling back the epic JSON write on commit failure. A future
-change can revisit if the recovery surprise proves load-bearing.
+This asymmetry is by design — rolling back the epic JSON write on commit
+failure is deliberately out of scope. A future change can revisit if the
+recovery surprise proves load-bearing.
 
 **Seam coverage.** The migration that routed every single-field mutating
 verb through the `output.emit()` seam (`verb=…` form) explicitly
@@ -773,28 +779,15 @@ raise — the invocation-build + commit lives inside the verb boundary.
 
 ---
 
-## Migration Note
+## No `commit-plan` Step
 
-Three eras: pre-fn-31 commits were hand-rolled in each advice skill
-with ad-hoc `git add .planctl/ && git commit` blocks. fn-31 → fn-488
-landed commits via the hookctl `planctl-mutation` PostToolUse hook —
-one commit per verb. fn-488 → fn-587 lifted commits into an explicit
-seven-seam `planctl commit-plan <seam> <id>` verb fired at the boundary
-of each `/plan:*` skill — one commit per skill, but `.planctl/` state
-leaked whenever a mutating verb fired outside a skill. fn-587 collapses
-the seam table into per-verb auto-commit at `output.emit()` — one
-commit per verb, no skill cooperation required, no leak surface.
-
-If your muscle memory has patterns like:
+The commit lands inline the moment a mutating verb fires — there is no
+trailing commit step to run. There is no `planctl commit-plan` verb and no
+skill-seam table. Run the verb alone:
 
 ```bash
 planctl epic close fn-7-add-auth
-planctl commit-plan after-close fn-7-add-auth
 ```
 
-Stop. Run `planctl epic close fn-7-add-auth`; the commit lands inline.
-Skill templates have been updated to drop the trailing `commit-plan`
-step.
-
-See `git log -- apps/planctl/planctl/run_commit_plan.py` for the
-seam-era detail.
+The `chore(planctl): close fn-7-add-auth` commit lands as a side effect.
+Any `planctl commit-plan ...` line after a mutating verb is dead — drop it.
