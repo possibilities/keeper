@@ -33,5 +33,5 @@ Fixtures: comment-removed file passes; single-token code change fails; deleted b
 - [ ] `bun test` green; `keeper commit-work` lands it
 
 ## Done summary
-
+Added scripts/assert-comment-only.ts: a bun verifier gating every scrub task via TS-scanner token equality + transpile-output equality + protected-pattern guard against the HEAD blob (raw-text, so plugin/ paths are covered). Fixture tests prove string/regex/template false-positives pass and all three failure modes fail; package.json gains an assert-comment-only script. Net new code (foundation task, no scrub yet): +0 deleted lines, +0 chars.
 ## Evidence
