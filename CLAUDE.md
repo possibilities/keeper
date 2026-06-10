@@ -216,9 +216,11 @@ paused** and is level-triggered on `PRAGMA data_version`. An unpaused autopilot
 that "does nothing" is almost always a readiness gate firing correctly — the gates
 live in `src/readiness.ts` (`computeReadiness`) and decide which verdicts occupy
 the per-epic / per-root mutex. Common gates: won't dispatch against an uncommitted
-epic, into a dirty repo, during the launch→SessionStart blind window, or against a
-taskless epic. To inspect, read `src/readiness.ts` and `src/autopilot-worker.ts`;
-the `[paused]` banner in `keeper autopilot` is authoritative.
+epic, into a dirty repo, during the launch→SessionStart blind window, against a
+taskless epic, or — in `armed` mode — when an ineligible epic loses the per-root
+mutex tiebreak to an eligible sibling (fn-770). To inspect, read `src/readiness.ts`
+and `src/autopilot-worker.ts`; the `[paused]` banner in `keeper autopilot` is
+authoritative.
 
 **Mode (`yolo` | `armed`, fn-751, schema v62).** An explicit autopilot mode enum
 on the `autopilot_state` singleton's `mode` column (defaults `'yolo'` on a
@@ -233,7 +235,16 @@ upstream. The per-epic armed flag is a PRESENCE table (`armed_epics`): row prese
 (synthetic `AutopilotMode` / `EpicArmed` events) and READ FROM THE PROJECTION each
 reconcile cycle — no relay, no `ReconcileState` cache — so they survive restart
 for free. The mode check is a SUPPRESSION ARM inside reconcile (a desired-state
-verdict, not a readiness pre-filter — `readiness.ts` is untouched); the `close`
+verdict). fn-770 also threads the per-cycle eligible Set into `readiness.ts`'s
+per-root mutex: its discretionary pass-2 ready-tiebreak is now eligibility-aware,
+so an armed (eligible) epic wins a free root over an earlier-sorted unarmed
+sibling instead of deadlocking (the ineligible sibling captured the slot, then
+the reconcile gate suppressed the eligible epic's `work`). The mutex param is a
+trailing-optional `eligibleEpicIds?: Set<string>` — ABSENT in yolo (no BFS,
+byte-identical legacy single-pass), PROVIDED (even empty) in armed; pass-1
+physical occupancy stays eligibility-blind, and close rows stay always-eligible.
+The reconcile gate at `autopilot-worker.ts` is RETAINED (a pass-2b ineligible
+task can still win a contender-free root). The `close`
 finalizer + completion-reap are mode-EXEMPT, so disarming mid-flight
 never orphans a live worker or leaks zellij surfaces. The human controls it via
 `keeper autopilot mode <yolo|armed>` / `arm <epic>` / `disarm <epic>`; the

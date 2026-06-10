@@ -1079,6 +1079,38 @@ export function reconcile(
 ): ReconcileDecision {
   const launches: PlannedLaunch[] = [];
 
+  // fn-751 — the armed-mode eligibility set. In `armed` mode `work` is
+  // dispatched ONLY for explicitly-armed epics PLUS their transitive upstream
+  // dep-closure; everything else is suppressed. Compute it ONCE per cycle here
+  // (recomputed every cycle — caching would reintroduce staleness when the DAG
+  // shifts) by expanding `snapshot.armedIds` over the reversed dep edges, and
+  // reuse the SAME value at BOTH the per-root mutex (fn-770, via
+  // `computeReadiness` below) AND the per-row gate further down — never two
+  // computations.
+  //
+  // fn-770: GUARDED by `armedMode` and computed ABOVE `computeReadiness` so:
+  //   - yolo pays NO BFS — `eligible` is `undefined`, which selects the
+  //     legacy single-pass mutex (byte-identical to pre-fn-770) and makes the
+  //     per-row gate a no-op (`armedMode === false`);
+  //   - armed mode threads the eligible Set into the mutex so an armed epic
+  //     wins a free root over an earlier-sorted unarmed sibling (the deadlock
+  //     fix), and reuses it at the gate so an ineligible task that still wins a
+  //     contender-free root via pass-2b is suppressed before launch.
+  // An empty set (armed-but-nothing-armed) is still PROVIDED (not `undefined`),
+  // so the two-pass mutex suppresses every task row.
+  //
+  // WORK-ONLY: the gate gates `work` launches alone. `approve` / `close`
+  // finalizers and completion-reap stay mode-exempt (mirroring how `approve`
+  // is already budget-exempt) so disarming an epic mid-flight still finishes
+  // and reaps cleanly rather than orphaning a live worker or leaking surfaces.
+  const armedMode = snapshot.mode === "armed";
+  const eligible: Set<string> | undefined = armedMode
+    ? computeEligibleEpics(
+        snapshot.armedIds,
+        new Map(snapshot.epics.map((e) => [e.epic_id, e])),
+      )
+    : undefined;
+
   // Use `Number.NEGATIVE_INFINITY` for the sub-agent staleness `now`
   // when the caller didn't bother (matches `computeReadiness`'s default
   // — keeps the staleness branch inert if undefined).
@@ -1093,6 +1125,10 @@ export function reconcile(
     // demoted while a dispatch is in flight. The same-key `liveTabKeys`
     // dedup arms below are orthogonal and stay untouched.
     snapshot.pendingDispatches,
+    // fn-770: the armed-mode eligible set (`undefined` in yolo) — drives the
+    // per-root mutex's discretionary pass-2 eligible-priority tiebreak so an
+    // armed epic claims a free root over an earlier-sorted unarmed sibling.
+    eligible,
   );
 
   // fn-727: harvest the completion set from the ONE readiness pass above
@@ -1144,27 +1180,6 @@ export function reconcile(
   let budget =
     cap === null ? Number.POSITIVE_INFINITY : Math.max(0, cap - occupied);
 
-  // fn-751 — the armed-mode eligibility gate. In `armed` mode `work` is
-  // dispatched ONLY for explicitly-armed epics PLUS their transitive upstream
-  // dep-closure; everything else is suppressed. Compute the eligible set ONCE
-  // per cycle here (recomputed every cycle — caching would reintroduce
-  // staleness when the DAG shifts) by expanding `snapshot.armedIds` over the
-  // reversed dep edges. In `yolo` mode the arm is a no-op and we skip the
-  // closure entirely. `armedMode` gates the per-row checks below; `eligible`
-  // is consulted only when it is true.
-  //
-  // WORK-ONLY: the arm gates `work` launches alone. `approve` / `close`
-  // finalizers and completion-reap stay mode-exempt (mirroring how `approve`
-  // is already budget-exempt) so disarming an epic mid-flight still finishes
-  // and reaps cleanly rather than orphaning a live worker or leaking surfaces.
-  const armedMode = snapshot.mode === "armed";
-  const eligible: Set<string> = armedMode
-    ? computeEligibleEpics(
-        snapshot.armedIds,
-        new Map(snapshot.epics.map((e) => [e.epic_id, e])),
-      )
-    : new Set<string>();
-
   // Walk every row. For each (kind, id), compute the wanted verb and
   // record whichever launches survive suppression.
   for (const epic of snapshot.epics) {
@@ -1185,7 +1200,14 @@ export function reconcile(
       // budget gate so a non-eligible epic never consumes `max_concurrent_jobs`
       // budget. A task verdict only ever maps to `work` (fn-756), so this gate
       // covers every task launch. No-op in `yolo` mode (`armedMode === false`).
-      if (armedMode && verb === "work" && !eligible.has(epic.epic_id)) {
+      //
+      // fn-770: RETAINED after the per-root mutex became eligibility-aware. The
+      // mutex's pass-2b can still surface an ineligible task as `ready` when it
+      // wins a root that had NO eligible contender; this gate is the only thing
+      // that stops that ineligible winner from launching. `eligible` is the
+      // SAME set passed into `computeReadiness` above (defined whenever
+      // `armedMode`, `undefined` only in yolo where this arm short-circuits).
+      if (armedMode && verb === "work" && !eligible?.has(epic.epic_id)) {
         continue;
       }
       if (state.inFlight.has(key)) {

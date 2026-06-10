@@ -2783,6 +2783,76 @@ test("reconcile armed: close fires for a disarmed-but-in-flight epic", () => {
   expect(closePlan?.id).toBe("fn-5-disarmed");
 });
 
+test("fn-770: armed epic on a SHARED root beats an earlier-sorted unarmed sibling and dispatches", () => {
+  // THE DEADLOCK FIX. Two open epics share `/repo`; the earlier-sorted (lower
+  // sort_path) `fn-1-unarmed` is NOT armed, `fn-2-armed` is. Pre-fn-770 the
+  // armed-blind per-root mutex awarded `/repo` to fn-1 (first ready in sort
+  // order), the armed gate then suppressed fn-1's launch (ineligible) AND fn-2
+  // was already mutex-demoted → net deadlock, fn-2 never dispatched. With the
+  // eligible-priority pass-2, fn-2 (eligible) wins `/repo`, fn-1 is demoted,
+  // and exactly one `work` launches for fn-2.
+  const unarmed = makeEpic({
+    epic_id: "fn-1-unarmed",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-1-unarmed.1", epic_id: "fn-1-unarmed" })],
+  });
+  const armed = makeEpic({
+    epic_id: "fn-2-armed",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-2-armed.1", epic_id: "fn-2-armed" })],
+  });
+  const snap = makeSnapshot({
+    epics: [unarmed, armed],
+    mode: "armed",
+    armedIds: new Set(["fn-2-armed"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workIds = decision.launches
+    .filter((p) => p.verb === "work")
+    .map((p) => p.id);
+  // Exactly the armed epic launches — no double-dispatch, no unarmed launch.
+  expect(workIds).toEqual(["fn-2-armed.1"]);
+});
+
+test("fn-770: yolo on a shared root is unchanged — earlier-sorted wins the single slot", () => {
+  // Same shared-root fixture in yolo mode: `eligible` is `undefined`, so the
+  // legacy single-pass mutex runs and the earlier-sorted fn-1 wins `/repo`.
+  // fn-2 is mutex-demoted. Exactly one `work` launches, for fn-1 — byte-for-
+  // byte pre-fn-770 yolo behaviour (no eligibility reorder).
+  const first = makeEpic({
+    epic_id: "fn-1-unarmed",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-1-unarmed.1", epic_id: "fn-1-unarmed" })],
+  });
+  const second = makeEpic({
+    epic_id: "fn-2-armed",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    resolved_epic_deps: [],
+    tasks: [makeTask({ task_id: "fn-2-armed.1", epic_id: "fn-2-armed" })],
+  });
+  const snap = makeSnapshot({
+    epics: [first, second],
+    mode: "yolo",
+    armedIds: new Set(),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const workIds = decision.launches
+    .filter((p) => p.verb === "work")
+    .map((p) => p.id);
+  expect(workIds).toEqual(["fn-1-unarmed.1"]);
+});
+
 test("reconcile yolo: dispatch is unchanged (mode arm is a no-op)", () => {
   // Identical fixture to the armed test, but mode=yolo (default). Even though
   // nothing is armed, EVERY ready task is worked — byte-for-byte pre-fn-751.

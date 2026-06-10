@@ -477,6 +477,20 @@ export function computeReadiness(
   // Default `[]` so the pre-fn-721 "no launch-window occupancy" semantics
   // hold for callers that don't subscribe to `pending_dispatches`.
   pendingDispatches: PendingDispatch[] = [],
+  // fn-770: autopilot `armed`-mode eligibility, threaded verbatim into the
+  // per-root mutex's discretionary pass-2 ready-tiebreak (see
+  // `applySingleTaskPerRootMutex`). ABSENT (`undefined`) — what every
+  // yolo-mode / test / simulator caller gets by omitting it — preserves the
+  // byte-identical legacy single-pass. PROVIDED (even EMPTY) selects the
+  // eligible-priority two-pass: an armed (eligible) epic wins a free root over
+  // an earlier-sorted unarmed sibling, fixing the armed-mode deadlock where an
+  // ineligible epic captured the root slot and the reconcile gate then
+  // suppressed the eligible epic's `work` launch. The caller (the reconciler)
+  // computes the closure once per cycle via `computeEligibleEpics` and passes
+  // the SAME set here and to its own armed gate; readiness stays an import
+  // LEAF and never derives the closure itself. Appended LAST so the existing
+  // default-reliant call sites stay valid.
+  eligibleEpicIds?: Set<string>,
 ): ReadinessSnapshot {
   // fn-721: index the pending dispatches by their canonical `verb::id` key
   // (the SAME `${verb}::${id}` shape `dispatchKey` builds in autopilot, but
@@ -602,6 +616,7 @@ export function computeReadiness(
     perCloseRow,
     subRunningByJobId,
     fallbackRoots,
+    eligibleEpicIds,
   );
 
   // Epic header rollup.
@@ -1453,6 +1468,21 @@ export function applySingleTaskPerRootMutex(
   // Default empty so callers that don't model launch-window occupancy (tests,
   // the simulator) keep the pre-fn-721 behaviour.
   fallbackRoots: Set<string> = new Set(),
+  // fn-770: autopilot `armed`-mode eligibility for the discretionary pass-2
+  // ready-tiebreak. ABSENT (`undefined`) selects the legacy single-pass —
+  // byte-identical to pre-fn-770 and what every yolo-mode / test / simulator
+  // caller gets, since they omit it. PROVIDED (even an EMPTY set) selects the
+  // two-pass eligible-priority split below: pass-2a awards a free root to an
+  // eligible epic's ready task BEFORE any ineligible sibling can claim it,
+  // pass-2b lets ineligible rows take only the leftover roots. The
+  // discriminator is `!== undefined`, NEVER `.size === 0` — an empty set means
+  // "armed but nothing armed", which must suppress every TASK row (none is
+  // eligible), not silently fall back to yolo. Injected by the caller (the
+  // reconciler runs `computeEligibleEpics` once per cycle); readiness stays an
+  // import LEAF and never derives the closure itself. Close rows are
+  // eligibility-BLIND (always-eligible / mode-exempt) so a finalizer is never
+  // starved by the mutex layer; pass-1 physical occupancy is untouched.
+  eligibleEpicIds?: Set<string>,
 ): void {
   // Seed the root-fallback occupants first — a pending dispatch with no
   // matching snapshot row still holds its `dir` root.
@@ -1511,40 +1541,96 @@ export function applySingleTaskPerRootMutex(
     }
   }
 
-  // Pass 2: walk ready rows in iteration order. First ready row per root
-  // wins the (still-unclaimed) slot; subsequent ready rows are demoted.
-  for (const epic of epicsArr) {
-    const projectDir = stringOrNull(epic.project_dir);
+  // Demote a ready task to `single-task-per-root` (extracted so the legacy
+  // single-pass and the fn-770 two-pass share one mutation site).
+  const demoteTask = (taskId: string): void => {
+    perTask.set(taskId, {
+      tag: "blocked",
+      reason: { kind: "single-task-per-root" },
+    });
+  };
 
-    for (const task of epic.tasks) {
-      const verdict = perTask.get(task.task_id);
-      if (verdict === undefined || verdict.tag !== "ready") {
-        continue;
-      }
-      const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
-      if (!occupiedRoots.has(root)) {
-        occupiedRoots.add(root);
-        continue;
-      }
-      perTask.set(task.task_id, {
+  // Settle one ready TASK row against `occupiedRoots`: claim the (still-free)
+  // root or demote. Shared by every pass-2 walk.
+  const settleTask = (task: Task, projectDir: string | null): void => {
+    const verdict = perTask.get(task.task_id);
+    if (verdict === undefined || verdict.tag !== "ready") {
+      return;
+    }
+    const root = effectiveRoot(stringOrNull(task.target_repo), projectDir);
+    if (!occupiedRoots.has(root)) {
+      occupiedRoots.add(root);
+      return;
+    }
+    demoteTask(task.task_id);
+  };
+
+  // Settle the synthetic CLOSE row against `occupiedRoots`. Close uses the
+  // epic's project_dir directly (no per-row `target_repo`) and is
+  // eligibility-BLIND — a finalizer is never starved by the mutex layer.
+  const settleCloseRow = (epic: Epic, projectDir: string | null): void => {
+    const closeVerdict = perCloseRow.get(epic.epic_id);
+    if (closeVerdict === undefined || closeVerdict.tag !== "ready") {
+      return;
+    }
+    const root = effectiveRoot(null, projectDir);
+    if (!occupiedRoots.has(root)) {
+      occupiedRoots.add(root);
+    } else {
+      perCloseRow.set(epic.epic_id, {
         tag: "blocked",
         reason: { kind: "single-task-per-root" },
       });
     }
+  };
 
-    // Close row uses the epic's project_dir directly (no per-row
-    // `target_repo` on a synthetic close).
-    const closeVerdict = perCloseRow.get(epic.epic_id);
-    if (closeVerdict !== undefined && closeVerdict.tag === "ready") {
-      const root = effectiveRoot(null, projectDir);
-      if (!occupiedRoots.has(root)) {
-        occupiedRoots.add(root);
-      } else {
-        perCloseRow.set(epic.epic_id, {
-          tag: "blocked",
-          reason: { kind: "single-task-per-root" },
-        });
+  if (eligibleEpicIds === undefined) {
+    // Pass 2 (legacy single-pass — yolo / tests / simulator): walk ready rows
+    // in iteration order. First ready row per root wins the (still-unclaimed)
+    // slot; subsequent ready rows are demoted. Byte-identical to pre-fn-770.
+    for (const epic of epicsArr) {
+      const projectDir = stringOrNull(epic.project_dir);
+      for (const task of epic.tasks) {
+        settleTask(task, projectDir);
       }
+      settleCloseRow(epic, projectDir);
+    }
+    return;
+  }
+
+  // fn-770: Pass 2 — eligible-priority two-pass (armed mode). Pass-1's
+  // `occupiedRoots` seed (live workers + `fallbackRoots`) is shared by both
+  // sub-passes exactly as in the single-pass; only the discretionary ready
+  // tiebreak becomes eligibility-aware. Physical occupancy is never
+  // eligibility-conditional (pass-1 above is untouched), so an eligible task
+  // never preempts a live worker — even an unarmed one.
+  //
+  // Pass-2a (priority): walk epics in iteration order. For each ELIGIBLE epic,
+  // settle its ready TASK rows so they claim free roots before any ineligible
+  // sibling. ALWAYS settle the ready CLOSE row here regardless of epic
+  // eligibility — close is mode-exempt (always-eligible), so a finalizer beats
+  // a same-root eligible task only when it sorts first, never loses to mode.
+  for (const epic of epicsArr) {
+    const projectDir = stringOrNull(epic.project_dir);
+    if (eligibleEpicIds.has(epic.epic_id)) {
+      for (const task of epic.tasks) {
+        settleTask(task, projectDir);
+      }
+    }
+    settleCloseRow(epic, projectDir);
+  }
+
+  // Pass-2b (residual): walk epics again; for INELIGIBLE epics settle their
+  // ready TASK rows — they claim a root only if it's STILL unclaimed after
+  // every eligible task + every close row took theirs, else demote. Close rows
+  // are already settled in 2a; eligible epics' tasks are already settled in 2a.
+  for (const epic of epicsArr) {
+    if (eligibleEpicIds.has(epic.epic_id)) {
+      continue;
+    }
+    const projectDir = stringOrNull(epic.project_dir);
+    for (const task of epic.tasks) {
+      settleTask(task, projectDir);
     }
   }
 }
@@ -1556,7 +1642,9 @@ export function applySingleTaskPerRootMutex(
  * per-root slot (the safe behavior — at most one rootless row gets
  * `ready`, the rest block).
  *
- * MUST mirror `scripts/autopilot.ts:206-210` predicate exactly:
+ * MUST mirror the reconciler's per-row root resolver in
+ * `src/autopilot-worker.ts` (the `task.target_repo != null && ... !== ""`
+ * branch near the dispatch walk) exactly:
  *
  *     t.target_repo != null && seg(t.target_repo) !== "" ? seg(t.target_repo) : projectDir
  */

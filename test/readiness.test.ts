@@ -534,6 +534,272 @@ test("fn-719: live worker monitor in epic A occupies the root, demotes a same-ro
   );
 });
 
+// ---------------------------------------------------------------------------
+// fn-770: armed-aware per-root mutex (eligible-priority pass-2)
+// ---------------------------------------------------------------------------
+//
+// The per-root mutex's discretionary pass-2 ready-tiebreak became
+// eligibility-aware: when `computeReadiness` (or `applySingleTaskPerRootMutex`
+// directly) is handed an `eligibleEpicIds` Set, an ELIGIBLE epic's ready task
+// claims a free root BEFORE any earlier-sorted INELIGIBLE sibling can. ABSENT
+// (`undefined`) the legacy single-pass holds (yolo byte-identical). Close rows
+// stay eligibility-blind (always-eligible / mode-exempt). Pass-1 physical
+// occupancy is never eligibility-conditional.
+
+// Thread an explicit eligible set through `computeReadiness` (yolo passes
+// `undefined`, armed passes a Set). All the prior `pendingDispatches`-default
+// callers stay valid; this just exercises the trailing fn-770 param.
+function runWithEligible(epics: Epic[], eligible: Set<string> | undefined) {
+  return computeReadiness(
+    epics,
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    eligible,
+  );
+}
+
+// Two open epics sharing `/repo`; the lower-sort one (`fn-1`) sorts first.
+// Both have a single ready task. Helper keeps the eight cases terse.
+function sharedRootPair() {
+  const t1 = makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    tasks: [t1],
+  });
+  const t2 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  return { epic1, epic2, t1, t2 };
+}
+
+test("fn-770 (a): eligible ready beats an earlier-sorted ineligible ready on a shared root", () => {
+  // THE DEADLOCK REPRO. fn-1 (lower sort_path, ready, INELIGIBLE) would win the
+  // single per-root slot under the legacy single-pass; the armed gate would
+  // then suppress fn-2's `work` launch → net deadlock. With fn-2 eligible, the
+  // two-pass pass-2a awards `/repo` to fn-2 FIRST; fn-1 is demoted.
+  const { epic1, epic2, t1, t2 } = sharedRootPair();
+  const snap = runWithEligible([epic1, epic2], new Set(["fn-2-bar"]));
+  expect(snap.perTask.get(t2.task_id)).toEqual({ tag: "ready" });
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-770 (b): eligible-vs-eligible → first in iteration order wins, loser demoted", () => {
+  // Both epics eligible → pass-2a walks iteration order; the first-walked
+  // (fn-1) claims `/repo`, fn-2 is demoted. Deterministic, sort-order tiebreak.
+  const { epic1, epic2, t1, t2 } = sharedRootPair();
+  const snap = runWithEligible(
+    [epic1, epic2],
+    new Set(["fn-1-foo", "fn-2-bar"]),
+  );
+  expect(snap.perTask.get(t1.task_id)).toEqual({ tag: "ready" });
+  expect(snap.perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test('fn-770 (c): `""` rootless bucket — ineligible never wins over an eligible row', () => {
+  // Both rows are rootless (project_dir null, no target_repo) → both collapse
+  // into the `""` bucket. fn-1 sorts first but is ineligible; the eligible fn-2
+  // must still take the single rootless slot, fn-1 demoted.
+  const t1 = makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: null,
+    tasks: [t1],
+  });
+  const t2 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: null,
+    tasks: [t2],
+  });
+  const snap = runWithEligible([epic1, epic2], new Set(["fn-2-bar"]));
+  expect(snap.perTask.get(t2.task_id)).toEqual({ tag: "ready" });
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-770 (d): `undefined` param → byte-identical legacy single-pass (yolo regression guard)", () => {
+  // No eligible set → single-pass. fn-1 sorts first and wins; fn-2 demoted —
+  // exactly the pre-fn-770 behavior. Asserted against the SAME `run` helper
+  // (which omits the param) to prove identity.
+  const { epic1, epic2, t1, t2 } = sharedRootPair();
+  const explicitUndefined = runWithEligible([epic1, epic2], undefined);
+  expect(explicitUndefined.perTask.get(t1.task_id)).toEqual({ tag: "ready" });
+  expect(explicitUndefined.perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+  // And identical to the default-param `run` (no trailing arg at all): an
+  // explicit `undefined` must produce the same per-task map as omitting it.
+  const legacy = run([epic1, epic2]);
+  expect(explicitUndefined.perTask.get(t1.task_id)).toEqual(
+    legacy.perTask.get(t1.task_id),
+  );
+  expect(explicitUndefined.perTask.get(t2.task_id)).toEqual(
+    legacy.perTask.get(t2.task_id),
+  );
+});
+
+test("fn-770 (e): empty-set param → two-pass, every task row suppressed (armed-nothing-armed)", () => {
+  // An EMPTY set is PROVIDED (not `undefined`), so the two-pass runs but NO
+  // epic is eligible: pass-2a settles no task, pass-2b sees both as ineligible.
+  // fn-1 (first iteration) claims `/repo`, fn-2 demoted — but neither is
+  // eligible, so the reconcile gate suppresses BOTH launches. The mutex here
+  // just must NOT silently behave like yolo (i.e. must still run two-pass);
+  // the observable mutex effect is the same single-slot collapse. Crucially it
+  // must NOT branch on `.size === 0`.
+  const { epic1, epic2, t1, t2 } = sharedRootPair();
+  const snap = runWithEligible([epic1, epic2], new Set());
+  // Both task rows settle (one wins the slot in 2b, one demoted) — neither is
+  // promoted past what the single-pass would do, and no throw on empty set.
+  const v1 = snap.perTask.get(t1.task_id);
+  const v2 = snap.perTask.get(t2.task_id);
+  expect(v1).toEqual({ tag: "ready" });
+  expect(v2).toEqual(blocked({ kind: "single-task-per-root" }));
+});
+
+test("fn-770 (f): pass-1 live occupant demotes an eligible ready row (no preemption)", () => {
+  // fn-1 has a LIVE worker monitor → `monitor-running`, a pass-1 root occupant
+  // claiming `/repo` UNCONDITIONALLY (eligibility-blind). fn-2's task is
+  // eligible+ready but the root is already physically held → demoted. An
+  // eligible task NEVER preempts a live worker, even an unarmed one.
+  const t1 = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    worker_phase: "done",
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "worker-1",
+        state: "stopped",
+        has_live_worker_monitor: true,
+      }),
+    ],
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    tasks: [t1],
+  });
+  const t2 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  const snap = runWithEligible([epic1, epic2], new Set(["fn-2-bar"]));
+  expect(snap.perTask.get(t1.task_id)).toEqual(
+    running({ kind: "monitor-running" }),
+  );
+  expect(snap.perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-770 (g): ineligible `fallbackRoots` entry demotes an eligible sibling", () => {
+  // Direct-mutex call: `/repo` is held by a launch-window `fallbackRoots`
+  // entry (a pending dispatch with no matching row). Pass-1 seeds it into
+  // `occupiedRoots` before any pass-2 walk, so even an eligible fn-2 ready task
+  // is demoted — the launch-window occupancy is physical, eligibility-blind.
+  const { epic1, epic2, t1, t2 } = sharedRootPair();
+  const perTask = new Map<string, Verdict>([
+    [t1.task_id, { tag: "ready" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>();
+  applySingleTaskPerRootMutex(
+    [epic1, epic2],
+    perTask,
+    perCloseRow,
+    new Map(),
+    new Set(["/repo"]),
+    new Set(["fn-2-bar"]),
+  );
+  expect(perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+  expect(perTask.get(t1.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-770 (h): ready close row on a free root wins via pass-2a even when its epic is unarmed", () => {
+  // The close row is mode-exempt (always-eligible): pass-2a settles it
+  // regardless of `eligibleEpicIds.has(epic_id)`. Here fn-1 is UNARMED and done
+  // with a ready close row on `/repo`; an eligible fn-2 ready TASK shares the
+  // root. Iteration order settles fn-1's close FIRST (pass-2a walks epics in
+  // order, close-row settled per-epic), claiming `/repo`; fn-2's task is then
+  // demoted. The close is never starved by an eligible task.
+  const closeTask = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    status: "open",
+    tasks: [closeTask],
+  });
+  const t2 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  // Direct mutex call to pin the close-vs-task ordering deterministically.
+  const perTask = new Map<string, Verdict>([
+    [closeTask.task_id, { tag: "completed" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", { tag: "ready" }],
+    // fn-2's close is not ready (epic still has open work) — any non-ready
+    // verdict; it must stay untouched by the mutex.
+    ["fn-2-bar", blocked({ kind: "dep-on-task", upstream: "fn-2-bar.1" })],
+  ]);
+  applySingleTaskPerRootMutex(
+    [epic1, epic2],
+    perTask,
+    perCloseRow,
+    new Map(),
+    new Set(),
+    new Set(["fn-2-bar"]),
+  );
+  // fn-1's close row claimed `/repo` in pass-2a (mode-exempt); fn-2's task
+  // demoted in pass-2a (eligible-task walk after the close settle).
+  expect(perCloseRow.get("fn-1-foo")).toEqual({ tag: "ready" });
+  expect(perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
 test("fn-719: live worker monitor past soft TTL (within hard ceiling) → running:monitor-stale, still occupies", () => {
   // updated_at=1000, now=1700 → age=700 > MONITOR_STALENESS_SEC(600), and
   // 700 < MONITOR_RELEASE_SEC(1800). Surfaces `monitor-stale` for human

@@ -1649,7 +1649,27 @@ armed flag: `EpicArmed{epic_id,armed}` synthetic events fold via
 `foldEpicArmed` — `armed:true` → `INSERT OR REPLACE` the row, `armed:false` →
 `DELETE` the row (a row's presence means armed). The reconcile worker reads
 both `mode` and the armed set from the projection snapshot every cycle (no
-relay, no in-memory cache) so the state survives restart for free. Both folds
+relay, no in-memory cache) so the state survives restart for free. The mode
+suppression lives in two places: a per-row `work`-gate in `reconcile()`, AND
+(fn-770) the per-root mutex inside `computeReadiness`. The reconcile worker
+computes the eligible-epic closure (`computeEligibleEpics`) ONCE per cycle —
+only when `mode === 'armed'` (yolo pays no BFS) — and passes the SAME Set to
+both `computeReadiness` (a new trailing-optional `eligibleEpicIds?:
+Set<string>`, threaded into `applySingleTaskPerRootMutex`) and the `work`-gate.
+The mutex's discretionary pass-2 ready-tiebreak became eligibility-aware: an
+ELIGIBLE epic's ready task claims a free root BEFORE an earlier-sorted INELIGIBLE
+sibling can, fixing the armed-mode deadlock where an unarmed epic captured the
+single per-root slot in sort order and the `work`-gate then suppressed the armed
+epic that lost the mutex (net: the armed epic never dispatched). The param is
+ABSENT (`undefined`) in yolo — byte-identical legacy single-pass — and PROVIDED
+(even empty: armed-but-nothing-armed) in armed mode; the discriminator is
+`!== undefined`, never `.size === 0`. Pass-1 physical occupancy (live workers +
+launch-window fallback roots) stays eligibility-blind so an eligible task never
+preempts a live worker, and close rows stay always-eligible (mode-exempt) so a
+finalizer is never starved by the mutex. The `work`-gate is RETAINED — a pass-2b
+ineligible task can still win a root with no eligible contender and surface
+`ready`, and the gate is the only thing that stops that ineligible winner from
+launching. Both folds
 are re-fold-deterministic (no `Date.now`, no env reads — `created_at` /
 `updated_at` both derive from `event.ts`; a malformed / unknown-enum payload
 folds to a safe no-op with the cursor still advancing), and both projection
