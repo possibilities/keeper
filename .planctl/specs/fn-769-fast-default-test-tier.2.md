@@ -36,5 +36,5 @@ Each adopted file green solo and in the full `--parallel` run. Expect solo impro
 - [ ] `bun run lint` and `bun run typecheck` pass
 
 ## Done summary
-
+Adopted the fn-769 template-DB clone helper across 13 fast-tier unit suites (freshMemDb for single-connection, freshDbFile for shared-path multi-connection), and fixed freshDbFile to establish WAL on disk so readonly re-openers can attach. Solo wins: server-worker 6.4s->~3.8s, collections 2.5s->~0.9s, restore-worker 6.4s->0.5s, rpc-handlers 4.8s->0.3s; all green under full bun run test (2773/0), lint+typecheck clean.
 ## Evidence
