@@ -199,7 +199,7 @@ export interface Finding {
  * way that should re-fire a previously-seen condition. Folded into every
  * fingerprint so a semantics change invalidates the .2 seen-state cleanly.
  */
-export const FINGERPRINT_VERSION = 1;
+export const FINGERPRINT_VERSION = 2;
 
 /**
  * Stable fingerprint = hash of (category, resourceId, version). Deliberately
@@ -356,18 +356,31 @@ export const CLOSE_LOOP_MIN_COUNT = 4;
 
 // --- backstop-degraded (fn-733) ---
 /**
- * backstop-degraded: a `backstop-rescue` whose `staleness_ms` is this high
- * means a fast path was dropped and the slow heartbeat re-converged THIS far
- * behind — the operator-visible 30–60s+ stall class. `null` staleness (cold
- * boot) is skipped, never flagged.
- *
- * fn-766 re-tune note: the roadmap work (fn-759/762/764/765) collapsed rescue
- * rates to ~0, so a rescue at all is now the rare signal. 30s stays the bar for
- * the "operator-visible stall" class — well under the historical 143108ms
- * pending-dispatch-sweep incident — but at today's rates ANY armed staleness is
- * worth a look; treat a recurrence as a regression of the core fix.
+ * backstop-degraded staleness — RETAINED FOR EVIDENCE ONLY (fn-771). The
+ * `staleness_ms` of a rescue is `now − last_fast_path_at`: it measures IDLENESS
+ * since the last fast path, NOT change-to-rescue latency, so it inflates with
+ * quiet minutes (the 2026-06-10 incident: a 2s-old commit rescued after 27 idle
+ * minutes reported staleness_ms=1611292 and paged a false critical). The
+ * staleness number is no longer a CLASSIFICATION gate — the latency bands below
+ * are — but it stays in the finding evidence so a before/after shakeout can
+ * compare the two signals.  Lag = observation_ts − event_ts, never
+ * now − last_observation (Google Chronicle timestamp discipline).
  */
 export const STALENESS_ALARM = 30_000;
+/**
+ * backstop-degraded latency (fn-771) — the change-to-rescue latency bands that
+ * REPLACE the idle-inflated `staleness_ms` gate. `change_to_rescue_ms` is the
+ * TRUE freshness signal: `now − committed_at_ms` for the change the heartbeat
+ * actually discharged (worst-case / oldest commit when several land in one
+ * rescue). A rescue with `change_to_rescue_ms` null (a dirty-tree-only or
+ * cold-boot rescue, OR an old-format line predating the field) or below WARN is
+ * HEALTHY — an idle-then-instant-rescue is normal FSEvents delivery; absence of
+ * events is a LIVENESS question owned by the dead-man watchdog, not a freshness
+ * detector (gate freshness checks on "an event actually arrived"). At/above WARN
+ * is a warning; at/above CRIT is critical.
+ */
+export const MISSED_WAKE_LATENCY_WARN_MS = 10_000;
+export const MISSED_WAKE_LATENCY_CRIT_MS = 60_000;
 /**
  * backstop-degraded: a per-(backstop,class) `rescues_total` DELTA over this bar
  * vs the stored baseline means a fast path is silently dropping wake-ups.
@@ -1060,7 +1073,7 @@ export function detectFoldLatency(events: EventRow[]): Finding[] {
 // ---------------------------------------------------------------------------
 
 /** backstop-baseline.json schema version — bump to invalidate on shape change. */
-export const BACKSTOP_BASELINE_VERSION = 3;
+export const BACKSTOP_BASELINE_VERSION = 4;
 
 /**
  * One persisted per-(backstop,class) snapshot. Two jobs:
@@ -1262,27 +1275,48 @@ export function detectBackstopTelemetry(input: {
     // (re-seed silently this tick, fire nothing).
     const base = identityMatches ? input.prior.buckets[bucket] : undefined;
 
-    // (a) rescue-staleness — INCREMENTAL via a per-bucket `ts` watermark. Among
-    // this bucket's rescues with a finite `ts >` the prior watermark, take the
-    // worst non-null staleness; arm only if `>= STALENESS_ALARM`. A null-
-    // staleness (cold-boot) rescue ADVANCES the watermark (its `ts` was seen)
-    // but never ARMS the alarm. On a fresh/reseeded bucket (no prior entry — a
-    // 1→2 version reseed, corrupt-file reseed, or identity change) the cursor
-    // starts at -Infinity so EVERY rescue is "new" by ts — but we MUST fire
-    // nothing and only SEED the watermark, else the first post-deploy tick re-
-    // pages all history. So: arm only when a prior entry existed for this
+    // (a) rescue-LATENCY (fn-771) — INCREMENTAL via a per-bucket `ts` watermark.
+    // Among this bucket's rescues with a finite `ts >` the prior watermark, take
+    // the worst non-null `change_to_rescue_ms` (the TRUE freshness signal) and
+    // classify it into warning/critical bands; the idle-inflated `staleness_ms`
+    // is NO LONGER a classification gate (the 2026-06-10 false-critical: a 2s-old
+    // commit rescued after 27 idle minutes reported staleness_ms=1611292). A
+    // rescue whose latency is null — a dirty-tree-only / cold-boot rescue, OR an
+    // old-format line that predates the field — is HEALTHY (an idle-then-instant
+    // rescue is normal FSEvents delivery; liveness is the dead-man watchdog's
+    // job, never a freshness gate). Per-record: mixed-version ndjson is the
+    // steady state, so each sample classifies on its OWN latency.
+    //
+    // The watermark still advances over ALL rescues this tick (incl. null-
+    // latency ones — their `ts` was seen). On a fresh/reseeded bucket (no prior
+    // entry — a version reseed, corrupt-file reseed, or identity change) the
+    // cursor starts at -Infinity so EVERY rescue is "new" by ts — but we MUST
+    // fire nothing and only SEED the watermark, else the first post-deploy tick
+    // re-pages all history. So: arm only when a prior entry existed for this
     // bucket (cf. how missed-wake seeds silently on first observation).
+    //
+    // The worst-staleness is still windowed alongside — NOT to classify, only to
+    // carry into the finding evidence for a before/after shakeout comparison.
     const priorWatermark =
       base?.rescue_watermark_ts ?? Number.NEGATIVE_INFINITY;
     let maxTsThisTick = Number.NEGATIVE_INFINITY;
+    let windowedMaxLatency: number | null = null;
     let windowedMaxStaleness: number | null = null;
     for (const s of row.samples) {
       if (!Number.isFinite(s.ts)) continue;
-      // Advance the watermark over ALL rescues this tick (incl. null-staleness).
+      // Advance the watermark over ALL rescues this tick (incl. null-latency).
       if (s.ts > maxTsThisTick) maxTsThisTick = s.ts;
-      // Window the staleness alarm to genuinely-new rescues (exclusive cursor).
+      if (s.ts <= priorWatermark) continue; // exclusive cursor — only new rescues
+      // Worst-case (oldest-commit) latency drives classification.
       if (
-        s.ts > priorWatermark &&
+        s.change_to_rescue_ms !== null &&
+        (windowedMaxLatency === null ||
+          s.change_to_rescue_ms > windowedMaxLatency)
+      ) {
+        windowedMaxLatency = s.change_to_rescue_ms;
+      }
+      // Worst staleness rides along for evidence only (never classifies).
+      if (
         s.staleness_ms !== null &&
         (windowedMaxStaleness === null || s.staleness_ms > windowedMaxStaleness)
       ) {
@@ -1300,19 +1334,22 @@ export function detectBackstopTelemetry(input: {
     const nextWatermark = Number.isFinite(carried) ? carried : 0;
 
     // Fire only on a bucket that already had a baseline (so a fresh/reseeded
-    // bucket seeds the watermark silently) AND a windowed staleness over bar.
+    // bucket seeds the watermark silently) AND a windowed latency at/over WARN.
     if (
       base !== undefined &&
-      windowedMaxStaleness !== null &&
-      windowedMaxStaleness >= STALENESS_ALARM
+      windowedMaxLatency !== null &&
+      windowedMaxLatency >= MISSED_WAKE_LATENCY_WARN_MS
     ) {
+      const isCritical = windowedMaxLatency >= MISSED_WAKE_LATENCY_CRIT_MS;
       findings.push({
         key: `backstop-staleness:${bucket}`,
         fingerprint: fingerprint("backstop-degraded", `staleness ${bucket}`),
-        severity: "critical",
+        severity: isCritical ? "critical" : "warning",
         category: "backstop-degraded",
-        title: `Backstop rescue stale ${Math.round(windowedMaxStaleness / 1000)}s`,
-        detail: `${row.backstop}/${row.class} rescued ${Math.round(windowedMaxStaleness / 1000)}s behind (staleness_ms=${windowedMaxStaleness} ≥ ${STALENESS_ALARM}) — ${
+        title: `Backstop rescue ${Math.round(windowedMaxLatency / 1000)}s behind`,
+        detail: `${row.backstop}/${row.class} rescued a change ${Math.round(windowedMaxLatency / 1000)}s after it landed (change_to_rescue_ms=${windowedMaxLatency} ≥ ${
+          isCritical ? MISSED_WAKE_LATENCY_CRIT_MS : MISSED_WAKE_LATENCY_WARN_MS
+        }) — ${
           row.class === "timeout"
             ? "exceeded its dispatch/confirm/sweep timeout"
             : "a fast path dropped a wake-up"
@@ -1320,8 +1357,12 @@ export function detectBackstopTelemetry(input: {
         evidence: {
           backstop: row.backstop,
           class: row.class,
+          changeToRescueMs: windowedMaxLatency,
+          warnThresholdMs: MISSED_WAKE_LATENCY_WARN_MS,
+          critThresholdMs: MISSED_WAKE_LATENCY_CRIT_MS,
+          // Raw idleness-since-last-fast-path, retained for the shakeout
+          // before/after comparison only — NOT a classification input.
           stalenessMs: windowedMaxStaleness,
-          thresholdMs: STALENESS_ALARM,
         },
       });
     }

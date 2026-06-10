@@ -99,11 +99,20 @@ concise human callout. Do NOT try to re-confirm it against the DB.
   carries `mode` + `armedCount`.
 - **stuck-job** — a non-terminal job whose worker pid is dead and that's old
   enough to not be a launch race.
-- **backstop-degraded** — a change-propagation backstop rescued late
-  (`staleness` over the bar) or its `rescues_total` rose since the baseline. At
-  the post-roadmap ~0-rescue baseline, ANY rescue is a real signal — a fast wake
-  path dropped and the slow heartbeat re-converged behind. `evidence` carries the
-  backstop/class + the staleness or delta.
+- **backstop-degraded** — a change-propagation backstop rescued a change LATE, or
+  its `rescues_total` rose since the baseline. The late-rescue arm classifies on
+  `change_to_rescue_ms` — the TRUE change-to-rescue latency (`now − committed_at`
+  for the change the heartbeat discharged), NOT the idle-inflated `staleness_ms`
+  (which is `now − last_fast_path_at` and balloons with quiet minutes — the
+  2026-06-10 false-critical: a 2s-old commit rescued after 27 idle minutes
+  reported staleness_ms=1611292). Latency null (a dirty-tree/cold-boot rescue or
+  an old-format pre-fn-771 line) or < 10s → HEALTHY (an idle-then-instant rescue
+  is normal FSEvents delivery; absence of events is a LIVENESS question owned by
+  the dead-man watchdog, not this freshness detector). ≥ 10s → warning; ≥ 60s →
+  critical. `evidence` carries the backstop/class, `changeToRescueMs` (the
+  classification input), the warn/crit thresholds, and the raw `stalenessMs`
+  (retained for before/after shakeout comparison ONLY — never classifies) or the
+  counter delta.
 - **fold-latency** — a planctl op took longer than the realtime bar to reach the
   projection (the realtime wake path likely dropped and the change fell to the
   reconcile heartbeat). `evidence` carries the op, entity id, and `latencySecs`.

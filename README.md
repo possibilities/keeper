@@ -530,9 +530,10 @@ Keeper has no `install` verb. Wire it up manually:
    feeds a projection — so a write failure is best-effort/swallowed.
    `scripts/backstop-stats.ts` aggregates it into per-(backstop,class)
    rescue count, rescue RATE (rescues ÷ total fires, from the rollup
-   denominator), staleness p50/p95/p99, and per-rescue `{ts, staleness_ms}`
-   samples (which the performance sitter windows by a `ts` watermark so an old resolved
-   rescue never re-pages). Spawn-tests MUST override this
+   denominator), staleness p50/p95/p99, and per-rescue
+   `{ts, staleness_ms, change_to_rescue_ms}` samples (which the performance sitter
+   windows by a `ts` watermark — classifying on `change_to_rescue_ms`, the true
+   latency — so an old resolved rescue never re-pages). Spawn-tests MUST override this
    path too (alongside `KEEPER_DB` / `KEEPER_DROP_LOG` /
    `KEEPER_DEAD_LETTER_DIR` / `KEEPER_RESTORE_FILE`) so the suite never
    writes the user's real state dir — build the sandboxed env via the shared
@@ -2225,13 +2226,21 @@ wedge, dead-letter growth, stuck jobs, backstop self-telemetry degradation, and
 event→projection fold latency), and escalates only genuinely-new signatures to a
 headless `babysitters:performance` agent (loaded via `--plugin-dir`) — it never writes the DB, mints no synthetic events, and performs
 no RPC. Its second read-only input is keeper's own `backstop.ndjson` self-
-telemetry (the missed-wake `rescues_total` counter + rescue staleness); it is
-consumed the same no-write/no-RPC way as `keeper.db`. Both backstop signals are
-INCREMENTAL: the missed-wake delta keys off `rescues_total` (the bad-outcome
-counter, not total wake-ups), and the staleness alarm fires only on a rescue
+telemetry (the missed-wake `rescues_total` counter + per-rescue
+`change_to_rescue_ms` latency); it is consumed the same no-write/no-RPC way as
+`keeper.db`. Both backstop signals are INCREMENTAL: the missed-wake delta keys
+off `rescues_total` (the bad-outcome counter, not total wake-ups), and the
+late-rescue alarm classifies on `change_to_rescue_ms` — the TRUE change-to-rescue
+latency (observation_ts − event_ts: `now − committed_at` for the change the
+heartbeat discharged) — NOT the idle-inflated `staleness_ms` (`now −
+last_fast_path_at`, which balloons with quiet minutes; the 2026-06-10
+false-critical paged 1611s for a 2s-old commit rescued after 27 idle minutes).
+Latency < 10s (or null — a dirty-tree/cold-boot rescue or an old-format line) is
+HEALTHY; ≥ 10s warns, ≥ 60s pages critical. The alarm fires only on a rescue
 whose `ts` exceeds a per-bucket high-watermark cursor persisted in the
 `backstop-baseline.json` sidecar — so one old resolved rescue never re-pages
-every cooldown window. On escalation the agent writes a self-
+every cooldown window. (Pure-idleness liveness — "no event has arrived at all" —
+is the dead-man watchdog's job below, NOT a freshness gate here.) On escalation the agent writes a self-
 contained, injection-safe investigation prompt per paged finding under
 `~/.local/state/babysitters/performance/followups/` (plus a stable `latest.md`)
 and the Telegram page (the `Keeper` topic) points at that file, so closing the

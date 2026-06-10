@@ -956,8 +956,15 @@ describe("detectBackstopTelemetry", () => {
     cls: string;
     staleness_ms: number | null;
     ts?: number;
+    /**
+     * fn-771 change-to-rescue latency. `undefined` (default) OMITS the field
+     * entirely — the old-format line that predates fn-771; classification reads
+     * it as `null` (healthy). Pass an explicit `null` for a dirty-only/cold-boot
+     * rescue, or a number to drive the latency bands.
+     */
+    change_to_rescue_ms?: number | null;
   }): string {
-    return JSON.stringify({
+    const rec: Record<string, unknown> = {
       ts: over.ts ?? 1780868400000,
       kind: "backstop-rescue",
       class: over.cls,
@@ -967,7 +974,11 @@ describe("detectBackstopTelemetry", () => {
       rescued: true,
       staleness_ms: over.staleness_ms,
       last_fast_path_at: over.cls === "timeout" ? null : 1780868200000,
-    });
+    };
+    if (over.change_to_rescue_ms !== undefined) {
+      rec.change_to_rescue_ms = over.change_to_rescue_ms;
+    }
+    return JSON.stringify(rec);
   }
 
   function rollupLine(over: {
@@ -1003,32 +1014,32 @@ describe("detectBackstopTelemetry", () => {
     };
   }
 
-  test("today's incident: pending-dispatch-sweep rescue at staleness=143108 fires", () => {
-    const text = `${rescueLine({
-      backstop: "pending-dispatch-sweep",
-      cls: "timeout",
-      staleness_ms: 143108,
-    })}\n`;
-    const { findings } = detectBackstopTelemetry({
-      text,
-      prior: priorWith("pending-dispatch-sweep timeout"),
-      identity: ID,
-    });
-    const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
-    expect(stale).toBeDefined();
-    expect(stale?.category).toBe("backstop-degraded");
-    expect(stale?.severity).toBe("critical");
-    expect(stale?.evidence.stalenessMs).toBe(143108);
-    // timeout-class renders elapsed-timeout wording — NOT dropped-fast-path.
-    expect(stale?.detail).toContain("timeout");
-    expect(stale?.detail).not.toContain("fast path");
-  });
-
-  test("missed-wake-class staleness renders dropped-fast-path wording", () => {
+  test("fn-771 incident replay: staleness=1611292 but latency=2000 → NO finding", () => {
+    // The 2026-06-10 false-critical: a 2s-old commit rescued after 27 idle
+    // minutes. staleness_ms is idle-inflated (1611292) but the TRUE change-to-
+    // rescue latency is 2000ms — below WARN, so healthy, no page.
     const text = `${rescueLine({
       backstop: "plan-heartbeat",
       cls: "missed-wake",
-      staleness_ms: 143108,
+      staleness_ms: 1_611_292,
+      change_to_rescue_ms: 2_000,
+    })}\n`;
+    const { findings } = detectBackstopTelemetry({
+      text,
+      prior: priorWith("plan-heartbeat missed-wake"),
+      identity: ID,
+    });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-staleness:")),
+    ).toHaveLength(0);
+  });
+
+  test("latency ≥ CRIT fires critical with staleness retained in evidence only", () => {
+    const text = `${rescueLine({
+      backstop: "plan-heartbeat",
+      cls: "missed-wake",
+      staleness_ms: 1_611_292,
+      change_to_rescue_ms: 90_000,
     })}\n`;
     const { findings } = detectBackstopTelemetry({
       text,
@@ -1037,14 +1048,57 @@ describe("detectBackstopTelemetry", () => {
     });
     const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
     expect(stale).toBeDefined();
+    expect(stale?.category).toBe("backstop-degraded");
+    expect(stale?.severity).toBe("critical");
+    expect(stale?.evidence.changeToRescueMs).toBe(90_000);
+    // Raw idleness retained as evidence ONLY — never the classification input.
+    expect(stale?.evidence.stalenessMs).toBe(1_611_292);
     expect(stale?.detail).toContain("fast path dropped a wake-up");
   });
 
-  test("skips a null-staleness rescue (cold boot) — no finding", () => {
+  test("latency in the WARN band (15s) fires warning, not critical", () => {
     const text = `${rescueLine({
       backstop: "plan-heartbeat",
       cls: "missed-wake",
-      staleness_ms: null,
+      staleness_ms: 143_108,
+      change_to_rescue_ms: 15_000,
+    })}\n`;
+    const { findings } = detectBackstopTelemetry({
+      text,
+      prior: priorWith("plan-heartbeat missed-wake"),
+      identity: ID,
+    });
+    const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
+    expect(stale).toBeDefined();
+    expect(stale?.severity).toBe("warning");
+    expect(stale?.evidence.changeToRescueMs).toBe(15_000);
+  });
+
+  test("an old-format line without change_to_rescue_ms classifies healthy", () => {
+    // The mixed-version steady state: a pre-fn-771 line carries no latency
+    // field. Even at a sky-high staleness it must NOT fire (no classification
+    // fallback to the idle-inflated staleness_ms).
+    const text = `${rescueLine({
+      backstop: "pending-dispatch-sweep",
+      cls: "timeout",
+      staleness_ms: 143_108,
+    })}\n`;
+    const { findings } = detectBackstopTelemetry({
+      text,
+      prior: priorWith("pending-dispatch-sweep timeout"),
+      identity: ID,
+    });
+    expect(
+      findings.filter((f) => f.key.startsWith("backstop-staleness:")),
+    ).toHaveLength(0);
+  });
+
+  test("an explicit null latency (dirty-tree/cold-boot rescue) classifies healthy", () => {
+    const text = `${rescueLine({
+      backstop: "plan-heartbeat",
+      cls: "missed-wake",
+      staleness_ms: 143_108,
+      change_to_rescue_ms: null,
     })}\n`;
     const { findings } = detectBackstopTelemetry({
       text,
@@ -1224,12 +1278,12 @@ describe("detectBackstopTelemetry", () => {
         },
       },
     };
-    // The log rotated → new inode. A big jump (rescues AND a high-staleness
+    // The log rotated → new inode. A big jump (rescues AND a high-latency
     // rescue) would normally fire, but the identity changed → invalidate →
-    // re-seed silently this tick (no delta fire, no staleness fire).
+    // re-seed silently this tick (no delta fire, no latency fire).
     const text =
       `${rollupLine({ ...bucket, fires_total: 99, rescues_total: 40 })}\n` +
-      `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868900000 })}\n`;
+      `${rescueLine({ ...bucket, staleness_ms: 143108, change_to_rescue_ms: 90000, ts: 1780868900000 })}\n`;
     const { findings, next } = detectBackstopTelemetry({
       text,
       prior,
@@ -1247,12 +1301,12 @@ describe("detectBackstopTelemetry", () => {
     );
   });
 
-  test("version 1→2 / empty baseline: first tick fires nothing and seeds the watermark", () => {
-    const bucket = { backstop: "pending-dispatch-sweep", cls: "timeout" };
-    // A high-staleness rescue against a fresh (reseeded) baseline must fire
-    // NOTHING — the first post-1→2 tick re-paging all history is the regression
-    // this whole epic prevents. Instead the watermark seeds to max(ts).
-    const text = `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868700000 })}\n`;
+  test("version reseed / empty baseline: first tick fires nothing and seeds the watermark", () => {
+    const bucket = { backstop: "plan-heartbeat", cls: "missed-wake" };
+    // A high-LATENCY rescue against a fresh (reseeded) baseline must fire
+    // NOTHING — the first post-version-bump tick re-paging all history is the
+    // regression this whole arm prevents. Instead the watermark seeds to max(ts).
+    const text = `${rescueLine({ ...bucket, staleness_ms: 143108, change_to_rescue_ms: 90000, ts: 1780868700000 })}\n`;
     const { findings, next } = detectBackstopTelemetry({
       text,
       prior: emptyBackstopBaseline(),
@@ -1261,16 +1315,16 @@ describe("detectBackstopTelemetry", () => {
     expect(
       findings.filter((f) => f.key.startsWith("backstop-staleness:")),
     ).toHaveLength(0);
-    expect(
-      next.buckets["pending-dispatch-sweep timeout"].rescue_watermark_ts,
-    ).toBe(1780868700000);
+    expect(next.buckets["plan-heartbeat missed-wake"].rescue_watermark_ts).toBe(
+      1780868700000,
+    );
   });
 
-  test("old stale rescue (ts ≤ watermark) does NOT fire across two ticks", () => {
-    const bucket = { backstop: "pending-dispatch-sweep", cls: "timeout" };
-    // Tick 1: a high-staleness rescue arrives against a fresh baseline → seeds
+  test("old high-latency rescue (ts ≤ watermark) does NOT fire across two ticks", () => {
+    const bucket = { backstop: "plan-heartbeat", cls: "missed-wake" };
+    // Tick 1: a high-latency rescue arrives against a fresh baseline → seeds
     // the watermark, fires nothing.
-    const t1 = `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868700000 })}\n`;
+    const t1 = `${rescueLine({ ...bucket, staleness_ms: 143108, change_to_rescue_ms: 90000, ts: 1780868700000 })}\n`;
     const first = detectBackstopTelemetry({
       text: t1,
       prior: emptyBackstopBaseline(),
@@ -1284,7 +1338,7 @@ describe("detectBackstopTelemetry", () => {
     // clean rollup → still no staleness finding (the exclusive cursor windows
     // it out).
     const t2 =
-      `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868700000 })}\n` +
+      `${rescueLine({ ...bucket, staleness_ms: 143108, change_to_rescue_ms: 90000, ts: 1780868700000 })}\n` +
       `${rollupLine({ ...bucket, fires_total: 5, rescues_total: 1 })}\n`;
     const second = detectBackstopTelemetry({
       text: t2,
@@ -1296,26 +1350,26 @@ describe("detectBackstopTelemetry", () => {
     ).toHaveLength(0);
   });
 
-  test("a genuinely-new rescue (ts > watermark) over threshold fires the WINDOWED staleness", () => {
-    const bucket = { backstop: "pending-dispatch-sweep", cls: "timeout" };
-    // Prior watermark already past an OLD low-staleness rescue; a NEW rescue
-    // (ts > watermark) with high staleness must fire with the windowed (new)
-    // staleness in evidence — NOT an all-history max.
+  test("a genuinely-new rescue (ts > watermark) over the latency bar fires the WINDOWED latency", () => {
+    const bucket = { backstop: "plan-heartbeat", cls: "missed-wake" };
+    // Prior watermark already past an OLD high-latency rescue; a NEW rescue
+    // (ts > watermark) with high latency must fire with the windowed (new)
+    // latency in evidence — NOT an all-history max.
     const prior: BackstopBaseline = {
       version: BACKSTOP_BASELINE_VERSION,
       dev: ID.dev,
       ino: ID.ino,
       buckets: {
-        "pending-dispatch-sweep timeout": {
+        "plan-heartbeat missed-wake": {
           rescue_watermark_ts: 1780868500000,
         },
       },
     };
     const text =
-      // old, below-threshold rescue at/under the watermark → ignored.
-      `${rescueLine({ ...bucket, staleness_ms: 200000, ts: 1780868500000 })}\n` +
-      // new rescue over threshold → fires with THIS staleness.
-      `${rescueLine({ ...bucket, staleness_ms: 143108, ts: 1780868600000 })}\n`;
+      // old, big-latency rescue at/under the watermark → ignored entirely.
+      `${rescueLine({ ...bucket, staleness_ms: 1, change_to_rescue_ms: 200000, ts: 1780868500000 })}\n` +
+      // new rescue over the CRIT bar → fires with THIS latency.
+      `${rescueLine({ ...bucket, staleness_ms: 1, change_to_rescue_ms: 90000, ts: 1780868600000 })}\n`;
     const { findings, next } = detectBackstopTelemetry({
       text,
       prior,
@@ -1323,15 +1377,15 @@ describe("detectBackstopTelemetry", () => {
     });
     const stale = findings.find((f) => f.key.startsWith("backstop-staleness:"));
     expect(stale).toBeDefined();
-    // Windowed staleness = the new rescue's 143108 — NOT the old 200000.
-    expect(stale?.evidence.stalenessMs).toBe(143108);
+    // Windowed latency = the new rescue's 90000 — NOT the old 200000.
+    expect(stale?.evidence.changeToRescueMs).toBe(90000);
     // Watermark advances to the newest ts seen.
-    expect(
-      next.buckets["pending-dispatch-sweep timeout"].rescue_watermark_ts,
-    ).toBe(1780868600000);
+    expect(next.buckets["plan-heartbeat missed-wake"].rescue_watermark_ts).toBe(
+      1780868600000,
+    );
   });
 
-  test("a null-staleness rescue advances the watermark but does not arm the alarm", () => {
+  test("a null-latency rescue advances the watermark but does not arm the alarm", () => {
     const bucket = { backstop: "plan-heartbeat", cls: "missed-wake" };
     const prior: BackstopBaseline = {
       version: BACKSTOP_BASELINE_VERSION,
@@ -1341,9 +1395,9 @@ describe("detectBackstopTelemetry", () => {
         "plan-heartbeat missed-wake": { rescue_watermark_ts: 1780868500000 },
       },
     };
-    // A NEW (ts > watermark) rescue but with null staleness (cold boot) → no
+    // A NEW (ts > watermark) rescue but with null latency (cold boot) → no
     // fire, yet the watermark advances to its ts.
-    const text = `${rescueLine({ ...bucket, staleness_ms: null, ts: 1780868600000 })}\n`;
+    const text = `${rescueLine({ ...bucket, staleness_ms: null, change_to_rescue_ms: null, ts: 1780868600000 })}\n`;
     const { findings, next } = detectBackstopTelemetry({
       text,
       prior,
@@ -1401,11 +1455,12 @@ describe("detectBackstopTelemetry", () => {
   });
 
   test("fingerprint is stable across ticks for the same bucket+signal", () => {
-    const prior = priorWith("pending-dispatch-sweep timeout");
+    const prior = priorWith("plan-heartbeat missed-wake");
     const text = `${rescueLine({
-      backstop: "pending-dispatch-sweep",
-      cls: "timeout",
+      backstop: "plan-heartbeat",
+      cls: "missed-wake",
       staleness_ms: 143108,
+      change_to_rescue_ms: 90000,
     })}\n`;
     const a = detectBackstopTelemetry({
       text,
@@ -1678,19 +1733,19 @@ describe("scan (DB layer)", () => {
     expect(fl?.evidence.latencySecs).toBe(10);
   });
 
-  test("backstop ingest: a NEW high-staleness rescue surfaces through scan via injected deps", async () => {
+  test("backstop ingest: a NEW high-latency rescue surfaces through scan via injected deps", async () => {
     freshDbFile(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
     const baselinePath = resolveBackstopBaselinePath();
     // Pre-seed a baseline that has already observed this bucket with a watermark
     // below the rescue ts, so the rescue is genuinely-NEW and arms the alarm
-    // (a fresh baseline would fire nothing — the R5 reseed rule).
+    // (a fresh baseline would fire nothing — the reseed rule).
     saveBackstopBaseline(baselinePath, {
       version: BACKSTOP_BASELINE_VERSION,
       dev: 1,
       ino: 100,
       buckets: {
-        "pending-dispatch-sweep timeout": { rescue_watermark_ts: 0 },
+        "plan-heartbeat missed-wake": { rescue_watermark_ts: 0 },
       },
     });
     const deps: ScanDeps = {
@@ -1699,13 +1754,16 @@ describe("scan (DB layer)", () => {
         text: `${JSON.stringify({
           ts: 1780868400000,
           kind: "backstop-rescue",
-          class: "timeout",
-          backstop: "pending-dispatch-sweep",
+          class: "missed-wake",
+          backstop: "plan-heartbeat",
           worker: "main",
-          fast_path: null,
+          fast_path: "data_version_poll",
           rescued: true,
-          staleness_ms: 143108,
-          last_fast_path_at: null,
+          // Idle-inflated staleness (evidence only) alongside a TRUE latency
+          // over the CRIT bar — fn-771 classifies on the latter.
+          staleness_ms: 1_611_292,
+          change_to_rescue_ms: 90_000,
+          last_fast_path_at: 1780868200000,
         })}\n`,
         identity: { dev: 1, ino: 100 },
       }),
@@ -1717,7 +1775,10 @@ describe("scan (DB layer)", () => {
     const findings = await scan(dbPath, 3600, deps);
     const bs = findings.find((f) => f.category === "backstop-degraded");
     expect(bs).toBeDefined();
-    expect(bs?.evidence.stalenessMs).toBe(143108);
+    expect(bs?.severity).toBe("critical");
+    expect(bs?.evidence.changeToRescueMs).toBe(90_000);
+    // Raw idleness retained as evidence only.
+    expect(bs?.evidence.stalenessMs).toBe(1_611_292);
   });
 
   test("backstop ingest is OFF when readBackstop is absent (older caller)", async () => {
