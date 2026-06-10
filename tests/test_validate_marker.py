@@ -27,13 +27,12 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 
 from click.testing import CliRunner  # type: ignore[import-untyped]
 from planctl.cli import cli
 from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
 
-from .conftest import run_cli
+from .conftest import _write_git_skeleton, run_cli
 
 
 def _parse_json_stream(text: str) -> list[dict]:
@@ -58,10 +57,12 @@ def _create_project(tmp_path, monkeypatch):
     """Init a planctl project in tmp_path and return the path."""
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-validate-marker-fixture")
     monkeypatch.chdir(tmp_path)
-    # git init so the `claim` verb's `promptctl render-spec` shell-out resolves
-    # its project root (.git walk) to this project, not a parent repo. Epics
-    # here null out primary_repo, so claim falls back to this git root.
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
+    # A bare ``.git/`` skeleton so repo detection resolves this project root
+    # (integrity.py needs only that ``.git/`` exists); these tests assert on the
+    # ``last_validated_at`` marker on disk, not git history, and the fast bucket
+    # no-ops every real git verb — so the skeleton suffices with zero ``git
+    # init`` subprocess.
+    _write_git_skeleton(tmp_path)
     runner = CliRunner()
     result = runner.invoke(cli, ["init"])
     assert result.exit_code == 0, result.output
@@ -547,14 +548,15 @@ def test_all_restamp_verbs_covered():
 
 
 def _init_git_repo(path) -> None:
-    """Run git init in path so _validate_repo_path accepts it."""
-    result = subprocess.run(
-        ["git", "init"],
-        cwd=str(path),
-        capture_output=True,
-        text=True,
-    )
-    assert result.returncode == 0, f"git init failed: {result.stderr}"
+    """Write a bare ``.git/`` skeleton so _validate_repo_path accepts the path.
+
+    The set-*-repo verbs validate only that the path points at a ``.git/``-bearing
+    dir; a hand-written skeleton satisfies that with zero ``git init`` subprocess
+    (the fast bucket no-ops every real git verb).
+    """
+    from pathlib import Path
+
+    _write_git_skeleton(Path(path))
 
 
 def _create_epic_with_primary_repo(project_path, repo_path: str) -> str:

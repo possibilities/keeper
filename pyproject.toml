@@ -20,9 +20,11 @@ build-backend = "hatchling.build"
 # every subprocess seam (git config / status / commit, `promptctl render-spec`
 # / `inline-sketch-refs`, the ~/code discovery scan), so unmarked tests spawn
 # near-zero subprocesses. Slow-bucket tests (markers `real_git` / `integration`
-# / `wire` / `real_promptctl`) are skipped-by-default and re-enabled with
-# `--run-slow` (a pytest_collection_modifyitems hook adds pytest.mark.skip so
-# they stay VISIBLE as skips, never silently deselected via an addopts `-m`).
+# / `wire` / `real_promptctl` / `real_sketch`) are skipped-by-default and
+# re-enabled with `--run-slow` (a pytest_collection_modifyitems hook adds
+# pytest.mark.skip so they stay VISIBLE as skips, never silently deselected via
+# an addopts `-m`). The `real_roots` marker is fast-path (NOT slow-bucket): it
+# only opts a test off the empty-discovery isolation onto a controlled tmp root.
 # -n auto parallelises across CPU cores; --timeout=30 catches genuine hangs
 # (slow-bucket tests still do real `scaffold` git/subprocess work under
 # `--run-slow`). --strict-markers turns a typo'd or unregistered @pytest.mark

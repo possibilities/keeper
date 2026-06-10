@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 from planctl.config import load_roots
@@ -243,8 +244,15 @@ def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
     assert n_a == 1 and n_b == 1, f"Expected fn-1 in both, got {id_a}, {id_b}"
 
 
+@pytest.mark.real_roots
 def test_create_rejects_global_name_collision(tmp_path, monkeypatch):
-    """When two projects would mint the same full epic id, the second fails."""
+    """When two projects would mint the same full epic id, the second fails.
+
+    The collision check needs the real cross-project discovery scan (against the
+    tmp ``CONFIG_PATH`` root below) to see ``proj_a``'s epic from ``proj_b`` — so
+    ``real_roots`` opts out of the autouse empty-discovery isolation. Sibling
+    per-project-numbering tests don't depend on discovery and stay isolated.
+    """
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-roots-discovery-fixture")
 
     root = tmp_path / "code"

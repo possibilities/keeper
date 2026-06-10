@@ -7,7 +7,8 @@ outcomes (CLAIMED / ALREADY_MINE / CLAIMED_BY_OTHER), ``--force`` takeover
 and the no-audit-row-on-failure invariant.
 
 Strategy: drive the real verb in-process via CliRunner against the
-``planctl_git_repo`` fixture (git init + planctl init, chdir'd). ``PLANCTL_ACTOR``
+``project`` fixture (bare ``.git/`` skeleton + planctl init, chdir'd).
+``PLANCTL_ACTOR``
 env var pins identity so multi-actor CAS outcomes are deterministic. The
 ``render-spec`` shell-out resolves to an empty render (the seeded tasks carry
 no snippets) → the on-disk brief's ``snippet_context == ""`` on the happy path;
@@ -38,7 +39,7 @@ def _roots_at_tmp_project(tmp_path, monkeypatch):
     """Point planctl roots discovery at an isolated root holding only ``tmp_path``.
 
     Claim is cwd-agnostic (fn-542 task .3): it resolves the owning project via
-    ``roots`` discovery, not the cwd. The ``planctl_git_repo`` / ``tmp_path``
+    ``roots`` discovery, not the cwd. The ``project`` / ``tmp_path``
     project must therefore be discoverable as an immediate child of a configured
     root. We can't relocate that project, so the root is a fresh per-test dir
     holding a single symlink (named after ``tmp_path``) back to the project.
@@ -100,7 +101,7 @@ def _make_epic_with_task(actor: str = "alice@example.com") -> tuple[str, str]:
     """Scaffold an epic + task, return (epic_id, task_id).
 
     fn-565: minted via `scaffold` (the incremental `task create` verb is gone).
-    The CliRunner cwd is the active project (planctl_git_repo fixture chdir'd).
+    The CliRunner cwd is the active project (project fixture chdir'd).
     """
     from pathlib import Path
 
@@ -120,7 +121,7 @@ def _has_invocation_line(output: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
-def test_claim_happy_path_envelope(planctl_git_repo):
+def test_claim_happy_path_envelope(project):
     from pathlib import Path
 
     epic_id, task_id = _make_epic_with_task()
@@ -180,7 +181,7 @@ def test_claim_happy_path_envelope(planctl_git_repo):
     assert payload["planctl_invocation"]["files"] is None
 
 
-def test_claim_null_tier_emits_null_worker_agent(planctl_git_repo):
+def test_claim_null_tier_emits_null_worker_agent(project):
     """A pre-fn-594 legacy task with persisted tier=null claims fine and emits
     worker_agent=null (not plan:worker-None). Claimability is claim's contract,
     not tier validity; the fail-loud on null moves to the skill spawn site.
@@ -188,7 +189,7 @@ def test_claim_null_tier_emits_null_worker_agent(planctl_git_repo):
     _epic_id, task_id = _make_epic_with_task()
 
     # Hand-null to simulate a pre-fn-594 legacy on-disk record.
-    task_path = planctl_git_repo / ".planctl" / "tasks" / f"{task_id}.json"
+    task_path = project / ".planctl" / "tasks" / f"{task_id}.json"
     task_def = json.loads(task_path.read_text(encoding="utf-8"))
     task_def["tier"] = None
     task_path.write_text(json.dumps(task_def), encoding="utf-8")
@@ -201,8 +202,14 @@ def test_claim_null_tier_emits_null_worker_agent(planctl_git_repo):
     assert payload["worker_agent"] is None
 
 
+@pytest.mark.real_git
 def test_claim_brief_file_is_gitignored(planctl_git_repo):
-    """The brief lands under gitignored state/ — git never sees it as tracked."""
+    """The brief lands under gitignored state/ — git never sees it as tracked.
+
+    Asserts via real ``git status`` / ``git check-ignore`` against the
+    ``.planctl/.gitignore`` rule, so it needs a real ``planctl_git_repo`` —
+    ``real_git`` (slow bucket).
+    """
     from pathlib import Path
 
     _epic_id, task_id = _make_epic_with_task()
@@ -230,7 +237,7 @@ def test_claim_brief_file_is_gitignored(planctl_git_repo):
     assert ignored.returncode == 0, "brief path should be gitignored"
 
 
-def test_claim_already_mine_regenerates_brief(planctl_git_repo):
+def test_claim_already_mine_regenerates_brief(project):
     """An ALREADY_MINE re-claim re-writes the brief (repair-on-reclaim)."""
     from pathlib import Path
 
@@ -258,7 +265,7 @@ def test_claim_already_mine_regenerates_brief(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def test_claim_bad_task_id(planctl_git_repo):
+def test_claim_bad_task_id(project):
     r = _invoke(["claim", "not-a-task-id"])
     assert r.exit_code == 1, r.output
     payload = _first_line_json(r.output)
@@ -267,7 +274,7 @@ def test_claim_bad_task_id(planctl_git_repo):
     assert not _has_invocation_line(r.output)
 
 
-def test_claim_task_not_found(planctl_git_repo):
+def test_claim_task_not_found(project):
     r = _invoke(["claim", "fn-999-nonexistent.1"])
     assert r.exit_code == 1, r.output
     payload = _first_line_json(r.output)
@@ -286,7 +293,7 @@ def test_claim_not_a_project(tmp_path):
     assert not _has_invocation_line(r.output)
 
 
-def test_claim_task_done(planctl_git_repo):
+def test_claim_task_done(project):
     _epic_id, task_id = _make_epic_with_task()
     _invoke(["claim", task_id, "--force"])
     r = _invoke(["done", task_id, "--summary", "ok", "--force"])
@@ -299,7 +306,7 @@ def test_claim_task_done(planctl_git_repo):
     assert not _has_invocation_line(r.output)
 
 
-def test_claim_task_done_force_does_not_override(planctl_git_repo):
+def test_claim_task_done_force_does_not_override(project):
     """--force must NEVER override TASK_DONE."""
     _epic_id, task_id = _make_epic_with_task()
     _invoke(["claim", task_id, "--force"])
@@ -311,7 +318,7 @@ def test_claim_task_done_force_does_not_override(planctl_git_repo):
     assert payload["error"]["code"] == "TASK_DONE"
 
 
-def test_claim_task_blocked(planctl_git_repo):
+def test_claim_task_blocked(project):
     _epic_id, task_id = _make_epic_with_task()
     r = _invoke(["block", task_id, "--reason", "waiting"])
     assert r.exit_code == 0, r.output
@@ -323,7 +330,7 @@ def test_claim_task_blocked(planctl_git_repo):
     assert not _has_invocation_line(r.output)
 
 
-def test_claim_blocked_bypassed_by_force(planctl_git_repo):
+def test_claim_blocked_bypassed_by_force(project):
     _epic_id, task_id = _make_epic_with_task()
     _invoke(["block", task_id, "--reason", "waiting"])
 
@@ -333,7 +340,7 @@ def test_claim_blocked_bypassed_by_force(planctl_git_repo):
     assert payload["task_state"]["status"] == "in_progress"
 
 
-def test_claim_deps_unmet(planctl_git_repo):
+def test_claim_deps_unmet(project):
     from pathlib import Path
 
     from .conftest import seed_epic
@@ -354,7 +361,7 @@ def test_claim_deps_unmet(planctl_git_repo):
     assert not _has_invocation_line(r.output)
 
 
-def test_claim_deps_unmet_bypassed_by_force(planctl_git_repo):
+def test_claim_deps_unmet_bypassed_by_force(project):
     from pathlib import Path
 
     from .conftest import seed_epic
@@ -374,7 +381,7 @@ def test_claim_deps_unmet_bypassed_by_force(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def test_claim_already_mine_idempotent(planctl_git_repo):
+def test_claim_already_mine_idempotent(project):
     env = {"PLANCTL_ACTOR": "alice@example.com"}
     _epic_id, task_id = _make_epic_with_task()
 
@@ -393,7 +400,7 @@ def test_claim_already_mine_idempotent(planctl_git_repo):
     assert second["task_state"]["claimed_at"] == first_claimed_at
 
 
-def test_claim_by_other_errors(planctl_git_repo):
+def test_claim_by_other_errors(project):
     _epic_id, task_id = _make_epic_with_task()
     r = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
     assert r.exit_code == 0, r.output
@@ -407,7 +414,7 @@ def test_claim_by_other_errors(planctl_git_repo):
     assert not _has_invocation_line(r.output)
 
 
-def test_claim_force_takeover(planctl_git_repo):
+def test_claim_force_takeover(project):
     _epic_id, task_id = _make_epic_with_task()
     _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
 
@@ -425,7 +432,7 @@ def test_claim_force_takeover(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def test_claim_snippet_render_failed(planctl_git_repo, monkeypatch):
+def test_claim_snippet_render_failed(project, monkeypatch):
     from pathlib import Path
 
     _epic_id, task_id = _make_epic_with_task()
@@ -451,9 +458,7 @@ def test_claim_snippet_render_failed(planctl_git_repo, monkeypatch):
 
     # The brief is assembled BEFORE the CAS: a render failure aborts before any
     # brief file is written.
-    brief_path = (
-        Path(planctl_git_repo) / ".planctl" / "state" / "briefs" / f"{task_id}.json"
-    )
+    brief_path = Path(project) / ".planctl" / "state" / "briefs" / f"{task_id}.json"
     assert not brief_path.exists()
 
     # Render failure aborts BEFORE the CAS: the task is still todo, so a
@@ -466,7 +471,7 @@ def test_claim_snippet_render_failed(planctl_git_repo, monkeypatch):
     assert payload2["task_state"]["outcome"] == "CLAIMED"
 
 
-def test_claim_brief_write_failed_leaves_in_progress(planctl_git_repo, monkeypatch):
+def test_claim_brief_write_failed_leaves_in_progress(project, monkeypatch):
     """A brief-write failure surfaces BRIEF_WRITE_FAILED but leaves task in_progress.
 
     The brief write happens AFTER save_runtime inside the lock; a failure there
@@ -492,9 +497,7 @@ def test_claim_brief_write_failed_leaves_in_progress(planctl_git_repo, monkeypat
 
     # save_runtime already landed inside the lock before the write failed — the
     # state write is NOT unwound. No brief file exists yet.
-    brief_path = (
-        Path(planctl_git_repo) / ".planctl" / "state" / "briefs" / f"{task_id}.json"
-    )
+    brief_path = Path(project) / ".planctl" / "state" / "briefs" / f"{task_id}.json"
     assert not brief_path.exists()
 
     # Re-claim with the real writer: ALREADY_MINE confirms the task stayed
@@ -514,20 +517,15 @@ def test_claim_brief_write_failed_leaves_in_progress(planctl_git_repo, monkeypat
 
 
 def _git_init(repo) -> None:
-    """git init + an initial commit so the dir is a clean repo.
+    """Write a bare ``.git/`` skeleton so repo detection passes — no subprocess.
 
-    Committer identity, ``commit.gpgsign=false`` and ``core.hooksPath=/dev/null``
-    ride the session-scoped ``GIT_CONFIG_GLOBAL`` set by ``_git_global_config``,
-    so no per-repo ``git config`` is needed here.
+    ``claim`` writes only gitignored runtime state (no commit), so the owning
+    project needs only that ``.git/`` *exists* (integrity.py). The shared
+    ``_write_git_skeleton`` seam stands one up with zero ``git init`` spawn.
     """
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    (repo / "README.md").write_text("# repo\n")
-    subprocess.run(
-        ["git", "add", "README.md"], cwd=repo, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "init"], cwd=repo, check=True, capture_output=True
-    )
+    from .conftest import _write_git_skeleton
+
+    _write_git_skeleton(repo)
 
 
 # Pin the session id so each mutating verb's session-id resolution short-circuits

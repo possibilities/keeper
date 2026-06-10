@@ -26,6 +26,16 @@ import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
+# reconcile's verdict is computed from real ``Task:``-trailer commits (parsed
+# via ``git log``), HEAD-visibility (``git cat-file``), and an epic-progress
+# tally over the ``planctl_git_repo`` fixture's real history — the real git IS
+# the subject, so this whole file is ``real_git`` (slow bucket: no
+# autocommit/dirty-probe stubs, real ``git init`` + commits). It also drives
+# roots discovery against the ``_roots_at_tmp_project`` CONFIG_PATH below, which
+# must win over the autouse empty-discovery isolation — ``real_roots`` opts onto
+# that controlled tmp root.
+pytestmark = [pytest.mark.real_git, pytest.mark.real_roots]
+
 
 @pytest.fixture(autouse=True)
 def _roots_at_tmp_project(tmp_path, monkeypatch):
@@ -209,10 +219,17 @@ def test_reconcile_state_uncommitted_stamp_not_in_head(planctl_git_repo):
     done, but the `done` stamp+commit never landed → state_uncommitted.
     """
     _, task_id = _make_epic_with_task()
-    # Commit the task JSON to HEAD with worker_done_at still null (pre-`done`).
+    # Under real_git, scaffold's auto-commit already landed the task JSON in HEAD
+    # carrying worker_done_at=null (the pre-`done` shape this verdict models).
+    # Stage+commit defensively so the precondition holds even if nothing new is
+    # pending (``--allow-empty`` makes the redundant commit a no-op, never an
+    # error).
     rel = f".planctl/tasks/{task_id}.json"
     _git(["add", rel], planctl_git_repo)
-    _git(["commit", "-m", "chore(planctl): seed task json"], planctl_git_repo)
+    _git(
+        ["commit", "--allow-empty", "-m", "chore(planctl): seed task json"],
+        planctl_git_repo,
+    )
     _set_runtime(planctl_git_repo, task_id, {"status": "done"})
 
     code, obj, output = _invoke(["reconcile", task_id])
@@ -596,8 +613,11 @@ def test_reconcile_lands_no_commit(planctl_git_repo):
     head_after = _git(["rev-parse", "HEAD"], planctl_git_repo)
     assert head_before == head_after, "reconcile must not land a commit"
 
+    # No `chore(planctl): reconcile ...` verb-commit subject in recent history.
+    # Match the verb-commit prefix, not the bare word — the seeded epic's own
+    # slug (``fn-1-reconcile-epic``) legitimately contains "reconcile".
     log = _git(["log", "-5", "--pretty=%s"], planctl_git_repo)
-    assert "reconcile" not in log
+    assert "chore(planctl): reconcile" not in log
 
 
 def test_reconcile_envelope_carries_readonly_invocation(planctl_git_repo):

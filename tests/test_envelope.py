@@ -26,6 +26,13 @@ from planctl.cli import cli
 
 from .conftest import _git_log_count
 
+# This file pins the commit-at-mutation-boundary envelope: it stages real files
+# to drive the touched∩dirty intersection that populates ``files`` / ``subject``
+# and counts real commits landed by each mutating verb's auto-commit. The real
+# git status+add+commit cycle IS the subject, so the whole file is ``real_git``
+# (slow bucket: no autocommit/dirty-probe stubs, real ``git init`` + commits).
+pytestmark = pytest.mark.real_git
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------

@@ -193,6 +193,7 @@ class TestCommitGroups:
         env = _envelope(r.output)
         assert env["commit_groups"] == []
 
+    @pytest.mark.real_git
     def test_groups_real_commits_in_primary_repo(self, project, monkeypatch):
         """Native scan finds both tasks' real Task:-trailer commits in primary_repo.
 
@@ -210,6 +211,7 @@ class TestCommitGroups:
         primary = str(project.resolve())
         assert env["commit_groups"] == [{"repo": primary, "shas": [sha0, sha1]}]
 
+    @pytest.mark.real_git
     def test_prose_false_match_is_dropped(self, project, monkeypatch):
         """A prose `Task:` mention the -F grep catches is dropped by the post-filter."""
         epic_id, task_ids = _make_epic(project, statuses=["done"])
@@ -225,6 +227,7 @@ class TestCommitGroups:
         env = _envelope(r.output)
         assert env["commit_groups"] == []
 
+    @pytest.mark.real_git
     def test_all_repos_broken_is_fail_loud(
         self, project, monkeypatch, tmp_path_factory
     ):
@@ -394,6 +397,7 @@ def _git_repo(path):
     return str(path.resolve())
 
 
+@pytest.mark.real_git
 class TestCommitLookup:
     def test_clean_miss_returns_empty(self, tmp_path):
         repo = _git_repo(tmp_path / "r")

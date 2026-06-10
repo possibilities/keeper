@@ -26,14 +26,21 @@ Test matrix:
 from __future__ import annotations
 
 import json
-import subprocess
 from pathlib import Path
 
 import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
-from .conftest import seed_epic
+from .conftest import _write_git_skeleton, seed_epic
+
+# Every test here exercises cross-project epic resolution: the dep resolver and
+# scaffold collision checks must run the REAL discovery scan against the
+# ``two_projects`` / ``three_projects`` CONFIG_PATH tmp root (never the real
+# ~/code). ``real_roots`` opts the whole file out of the autouse
+# empty-discovery isolation onto that controlled root. Fast-path marker (NOT
+# slow bucket): the fast gate runs these against the local tmp tree.
+pytestmark = pytest.mark.real_roots
 
 # ---------------------------------------------------------------------------
 # Multi-project fixture: two planctl projects under one shared root.
@@ -41,22 +48,15 @@ from .conftest import seed_epic
 
 
 def _git_init(proj: Path) -> None:
-    """Initialise a hermetic git repo so scaffold's filesystem check passes.
+    """Write a bare ``.git/`` skeleton so scaffold's filesystem check passes.
 
-    Committer identity / gpgsign / hooksPath ride GIT_CONFIG_GLOBAL (set by the
-    session-scoped _git_global_config fixture) — no per-repo config needed.
+    These tests assert on cross-project epic resolution, not on git history —
+    repo detection needs only that ``.git/`` *exists* (integrity.py) and the
+    fast bucket no-ops every real git verb (auto-commit, dirty-probe), so a
+    hand-written skeleton is enough with zero ``git init`` subprocess. The
+    same seam the ``project`` / ``multi_repo_project`` fixtures use.
     """
-    subprocess.run(["git", "init"], cwd=proj, check=True, capture_output=True)
-    (proj / "README.md").write_text("# Test repo\n")
-    subprocess.run(
-        ["git", "add", "README.md"], cwd=proj, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "chore: initial commit"],
-        cwd=proj,
-        check=True,
-        capture_output=True,
-    )
+    _write_git_skeleton(proj)
 
 
 def _planctl_init(proj: Path) -> None:

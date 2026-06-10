@@ -31,10 +31,10 @@ marker (the ``_mock_autocommit`` template — autouse + early-return on a marker
   real git.
 
 The slow bucket (markers ``real_git`` / ``integration`` / ``wire`` /
-``real_promptctl``) is skip-by-default and re-enabled with ``--run-slow`` via
-the ``pytest_collection_modifyitems`` hook (skip, never deselect). The stubs'
-fidelity against the real binaries is pinned by ``wire``-marked contract tests
-in ``tests/test_stub_contracts.py``.
+``real_promptctl`` / ``real_sketch``) is skip-by-default and re-enabled with
+``--run-slow`` via the ``pytest_collection_modifyitems`` hook (skip, never
+deselect). The stubs' fidelity against the real binaries is pinned by
+``wire``-marked contract tests in ``tests/test_stub_contracts.py``.
 """
 
 from __future__ import annotations
@@ -90,7 +90,13 @@ def pytest_configure(config):
 #: the spawn-bearing fast-path seams (real git, real promptctl, the live wire)
 #: that the fast gate stubs out — so a slow-bucket test is exactly a test that
 #: needs a real subprocess the fast suite refuses to spawn.
-_SLOW_BUCKET_MARKERS = ("real_git", "integration", "wire", "real_promptctl")
+_SLOW_BUCKET_MARKERS = (
+    "real_git",
+    "integration",
+    "wire",
+    "real_promptctl",
+    "real_sketch",
+)
 
 
 def pytest_addoption(parser):

@@ -385,8 +385,14 @@ def _write_sketch(repo, name: str, snippet_ids: list[str]) -> None:
 
 
 @pytest.mark.integration
+@pytest.mark.real_sketch
 def test_scaffold_inlines_sketch_refs_into_snippets(planctl_git_repo):
-    """Same-project sketch inlining: ids fold into snippets, sketch ref dropped."""
+    """Same-project sketch inlining: ids fold into snippets, sketch ref dropped.
+
+    Asserts the REAL ``promptctl inline-sketch-refs`` folds the sketch file's
+    ``snippet_ids`` into the persisted record — the autouse stub only echoes
+    group snippets, so ``real_sketch`` opts onto the live binary.
+    """
     _write_sketch(planctl_git_repo, "draft-epic", ["epic-snip-1", "epic-snip-2"])
     _write_sketch(planctl_git_repo, "draft-task", ["task-snip-1"])
 
@@ -429,8 +435,14 @@ tasks:
 
 
 @pytest.mark.integration
+@pytest.mark.real_sketch
 def test_scaffold_missing_sketch_emits_ref_invalid(planctl_git_repo):
-    """Unresolvable sketch -> ref_invalid envelope, no writes land."""
+    """Unresolvable sketch -> ref_invalid envelope, no writes land.
+
+    The missing-sketch failure mode is detected by the REAL
+    ``promptctl inline-sketch-refs``; the autouse stub silently drops the ref,
+    so ``real_sketch`` opts onto the live binary.
+    """
     yaml = f"""\
 epic:
   title: missing sketch

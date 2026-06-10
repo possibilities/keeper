@@ -31,6 +31,14 @@ import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
+# find-task-commit parses real ``Task:``-trailer commits via ``git log`` — the
+# real commits ARE the subject under test, so ``real_git`` (slow bucket: real
+# git history, no autocommit/dirty-probe stubs). It also drives roots discovery
+# against the ``_roots_at_tmp_project`` CONFIG_PATH below, which must win over
+# the autouse empty-discovery isolation — ``real_roots`` opts onto that
+# controlled tmp root.
+pytestmark = [pytest.mark.real_git, pytest.mark.real_roots]
+
 
 @pytest.fixture(autouse=True)
 def _roots_at_tmp_project(tmp_path, monkeypatch):

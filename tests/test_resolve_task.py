@@ -23,6 +23,13 @@ import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
+# resolve-task is read-only and spawns no real git, but every test drives roots
+# discovery against the ``_roots_at_tmp_project`` CONFIG_PATH below. That tmp
+# root must win over the autouse ``_isolated_roots_default`` (which forces empty
+# discovery) — ``real_roots`` opts out onto the controlled tmp root, never the
+# real ~/code. Fast-path marker (NOT slow bucket): the fast gate runs these.
+pytestmark = pytest.mark.real_roots
+
 
 @pytest.fixture(autouse=True)
 def _roots_at_tmp_project(tmp_path, monkeypatch):
@@ -84,7 +91,7 @@ def _make_epic_with_task():
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_task_happy_path_with_tier(planctl_git_repo):
+def test_resolve_task_happy_path_with_tier(project):
     """resolve-task returns the full routing envelope on a known, tier-set task."""
     epic_id, task_id = _make_epic_with_task()
 
@@ -106,7 +113,7 @@ def test_resolve_task_happy_path_with_tier(planctl_git_repo):
     assert obj.get("project_path", "").startswith("/")
 
 
-def test_resolve_task_tier_in_vocab(planctl_git_repo):
+def test_resolve_task_tier_in_vocab(project):
     """The returned `tier` is one of medium|high|xhigh|max|null."""
     from planctl.models import TASK_TIERS
 
@@ -125,7 +132,7 @@ def test_resolve_task_tier_in_vocab(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_task_null_tier(planctl_git_repo):
+def test_resolve_task_null_tier(project):
     """A pre-fn-594 legacy task with persisted tier=null surfaces as JSON null
     (not omitted) so the launcher / skill consumer can branch on it.
 
@@ -136,7 +143,7 @@ def test_resolve_task_null_tier(planctl_git_repo):
     _, task_id = _make_epic_with_task()
 
     # Hand-null to simulate a pre-fn-594 legacy on-disk record.
-    task_path = planctl_git_repo / ".planctl" / "tasks" / f"{task_id}.json"
+    task_path = project / ".planctl" / "tasks" / f"{task_id}.json"
     task_def = json.loads(task_path.read_text(encoding="utf-8"))
     task_def["tier"] = None
     task_path.write_text(json.dumps(task_def), encoding="utf-8")
@@ -159,7 +166,7 @@ def test_resolve_task_null_tier(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_task_bad_id(planctl_git_repo):
+def test_resolve_task_bad_id(project):
     """A malformed task id returns BAD_TASK_ID, exit 1."""
     code, obj, output = _invoke(["resolve-task", "not-a-task-id"])
     assert code != 0, output
@@ -173,7 +180,7 @@ def test_resolve_task_bad_id(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_task_not_found(planctl_git_repo):
+def test_resolve_task_not_found(project):
     """A well-formed id with no matching project returns TASK_NOT_FOUND."""
     code, obj, output = _invoke(["resolve-task", "fn-9999-no-task.1"])
     assert code != 0, output
@@ -281,7 +288,7 @@ def test_resolve_task_project_disambiguates(tmp_path, monkeypatch):
     assert obj.get("project_path") == str(proj_b)
 
 
-def test_resolve_task_project_not_a_project(planctl_git_repo, tmp_path):
+def test_resolve_task_project_not_a_project(project, tmp_path):
     """--project <path> with no .planctl/ returns NOT_A_PROJECT."""
     not_a_proj = tmp_path / "not-a-planctl-proj"
     not_a_proj.mkdir()
@@ -299,8 +306,13 @@ def test_resolve_task_project_not_a_project(planctl_git_repo, tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_git
 def test_resolve_task_lands_no_commit(planctl_git_repo):
-    """resolve-task is read-only — no `chore(planctl): resolve-task` commit lands."""
+    """resolve-task is read-only — no `chore(planctl): resolve-task` commit lands.
+
+    Asserts against a real HEAD / ``git log`` (no commit subject lands), so it
+    needs the real ``planctl_git_repo`` history — ``real_git`` (slow bucket).
+    """
     _, task_id = _make_epic_with_task()
 
     head_before = subprocess.run(
@@ -344,7 +356,7 @@ def test_resolve_task_lands_no_commit(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_task_envelope_carries_readonly_invocation(planctl_git_repo):
+def test_resolve_task_envelope_carries_readonly_invocation(project):
     """The envelope's planctl_invocation has op=resolve-task and NULL files/subject."""
     _, task_id = _make_epic_with_task()
 

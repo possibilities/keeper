@@ -29,7 +29,7 @@ import pytest
 from click.testing import CliRunner
 from planctl.cli import cli
 
-from .conftest import parse_cli_output, seed_epic
+from .conftest import _write_git_skeleton, parse_cli_output, seed_epic
 
 _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-epic-rm-fixture"}
 
@@ -302,22 +302,15 @@ def test_rm_traversal_guard_rejects_bad_id(planctl_git_repo, monkeypatch):
 
 
 def _bootstrap_project(repo: Path) -> None:
-    """Initialize a project as a planctl repo (git init + planctl init +
-    baseline commit so commits aren't blocked by a missing parent ref).
+    """Initialize a project as a planctl repo (bare ``.git/`` skeleton + init).
+
+    The two ``two_projects`` tests that use this fixture are fast-path
+    (``real_roots``): they assert on cross-project resolution and on-disk
+    deletion, not git history, and the fast bucket no-ops every real git verb.
+    Repo detection needs only that ``.git/`` exists (integrity.py), so a
+    hand-written skeleton stands one up with zero ``git init`` subprocess.
     """
-    subprocess.run(["git", "init"], cwd=repo, check=True, capture_output=True)
-    # Committer identity / gpgsign / hooksPath ride GIT_CONFIG_GLOBAL (set by
-    # the session-scoped _git_global_config fixture) — no per-repo config here.
-    (repo / "README.md").write_text("# Test repo\n")
-    subprocess.run(
-        ["git", "add", "README.md"], cwd=repo, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "chore: initial"],
-        cwd=repo,
-        check=True,
-        capture_output=True,
-    )
+    _write_git_skeleton(repo)
     runner = CliRunner()
     result = runner.invoke(cli, ["init"], env={**_ENV, "PWD": str(repo)})
     assert result.exit_code == 0, result.output
@@ -390,8 +383,15 @@ def two_projects(tmp_path, monkeypatch):
     return parent, proj_a, proj_b, epic_a
 
 
+@pytest.mark.real_roots
 def test_rm_ambiguous_id_errors_with_owners(two_projects, monkeypatch):
-    """An id that exists in two projects hard-errors listing both owners."""
+    """An id that exists in two projects hard-errors listing both owners.
+
+    The ambiguous-resolution path needs the real cross-project discovery scan
+    (against the ``two_projects`` CONFIG_PATH tmp root) to see BOTH owners — so
+    ``real_roots`` opts out of the autouse empty-discovery isolation. The
+    ``--project`` sibling test resolves directly and needs no scan.
+    """
     parent, proj_a, proj_b, dup_id = two_projects
     # Run from OUTSIDE either project so cwd short-circuit doesn't pick one.
     outside = parent.parent

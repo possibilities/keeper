@@ -29,7 +29,6 @@ Test matrix per write path:
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -37,6 +36,8 @@ import pytest
 import yaml
 from click.testing import CliRunner
 from planctl.cli import cli
+
+from .conftest import _write_git_skeleton
 
 # ---------------------------------------------------------------------------
 # Multi-project fixture (mirrors the two_projects fixture in
@@ -46,22 +47,15 @@ from planctl.cli import cli
 
 
 def _git_init(proj: Path) -> None:
-    """Initialise a hermetic git repo so scaffold's filesystem check passes.
+    """Write a bare ``.git/`` skeleton so scaffold's filesystem check passes.
 
-    Committer identity / gpgsign / hooksPath ride GIT_CONFIG_GLOBAL (set by the
-    session-scoped _git_global_config fixture) — no per-repo config needed.
+    Repo detection needs only that ``.git/`` *exists* (integrity.py); the fast
+    bucket no-ops every real git verb, so a hand-written skeleton is enough with
+    zero ``git init`` subprocess. The ``real_sketch`` tests that spawn the real
+    ``promptctl inline-sketch-refs`` are slow-bucket (skipped on the fast gate);
+    the fast-path empty-sketch tests only need ``.git/`` present.
     """
-    subprocess.run(["git", "init"], cwd=proj, check=True, capture_output=True)
-    (proj / "README.md").write_text("# Test repo\n")
-    subprocess.run(
-        ["git", "add", "README.md"], cwd=proj, check=True, capture_output=True
-    )
-    subprocess.run(
-        ["git", "commit", "-m", "chore: initial commit"],
-        cwd=proj,
-        check=True,
-        capture_output=True,
-    )
+    _write_git_skeleton(proj)
 
 
 def _planctl_init() -> None:
@@ -186,6 +180,7 @@ def _read_json(path: Path) -> dict:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_sketch
 def test_scaffold_resolves_sketch_against_cwd_project(two_projects):
     """Sketch in cwd's project (B) resolves; ids inline; ref dropped."""
     _root, _proj_a, proj_b = two_projects
@@ -223,6 +218,7 @@ tasks:
     assert task_def["bundles"] == []
 
 
+@pytest.mark.real_sketch
 def test_scaffold_sketch_in_foreign_project_unresolvable(two_projects):
     """Sketch in project A (not cwd) → ref_invalid; no writes land.
 
@@ -321,6 +317,7 @@ tasks:
     return _parse_envelope(r.output)["epic_id"]
 
 
+@pytest.mark.real_sketch
 def test_refine_apply_inlines_sketch_against_cwd(two_projects):
     """add_tasks entry's sketch ref folds into its persisted snippets."""
     _root, _proj_a, proj_b = two_projects
@@ -349,6 +346,7 @@ add_tasks:
     assert all(not b.startswith("sketch/") for b in task_def["bundles"])
 
 
+@pytest.mark.real_sketch
 def test_refine_apply_unresolvable_sketch_fails_loud(two_projects):
     """Sketch in A only → ref_invalid; tree on disk unchanged."""
     _root, proj_a, proj_b = two_projects
@@ -410,6 +408,7 @@ add_tasks:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_sketch
 def test_epic_set_bundles_inlines_sketch(two_projects):
     """Sketch in cwd project resolves; ids fold into epic.snippets."""
     _root, _proj_a, proj_b = two_projects
@@ -432,6 +431,7 @@ def test_epic_set_bundles_inlines_sketch(two_projects):
     assert epic_def["snippets"] == ["e1", "e2"]
 
 
+@pytest.mark.real_sketch
 def test_epic_set_bundles_missing_sketch_fails_no_write(two_projects):
     """Unresolvable sketch → non-zero exit; bundles unchanged on disk."""
     _root, _proj_a, proj_b = two_projects
@@ -472,6 +472,7 @@ def test_epic_set_bundles_empty_sketch_drops_ref(two_projects):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_sketch
 def test_task_set_bundles_inlines_sketch(two_projects):
     """Sketch resolves; ids fold into task.snippets; sketch dropped."""
     _root, _proj_a, proj_b = two_projects
@@ -494,6 +495,7 @@ def test_task_set_bundles_inlines_sketch(two_projects):
     assert task_def["snippets"] == ["t1", "t2"]
 
 
+@pytest.mark.real_sketch
 def test_task_set_bundles_missing_sketch_fails_no_write(two_projects):
     """Missing sketch → non-zero exit; on-disk task untouched."""
     _root, _proj_a, proj_b = two_projects
@@ -536,6 +538,7 @@ def test_task_set_bundles_empty_sketch_drops_ref(two_projects):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.real_sketch
 def test_scaffold_collect_all_reports_every_bad_sketch_ref(two_projects):
     """Epic + multiple add_tasks all carrying bad sketch refs surface every
     offending ref in the error details list — not just the first.
