@@ -125,7 +125,7 @@ def test_pre_hook_marked_file_emits_deny(tmp_path: Path) -> None:
     }
     bin_dir = _make_stub_promptctl(tmp_path, envelope)
 
-    target = tmp_path / "work-plugins" / "high" / "agents" / "worker.md"
+    target = tmp_path / "agents" / "worker-high.md"
     target.parent.mkdir(parents=True)
     target.write_text("doesn't matter — stub doesn't read it\n")
 
