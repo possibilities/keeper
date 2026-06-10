@@ -2,7 +2,7 @@
 
 Coverage:
 - Cycle introduction via the post-write integrity gate is rejected and the
-  dep write is rolled back on disk (fn-590 task .1 fix + .2 regression).
+  dep write is rolled back on disk.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def _read_epic_json(project_path, epic_id) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# fn-590 task .2: post-write cycle gate rejects + rolls back the dep write
+# post-write cycle gate rejects + rolls back the dep write
 # ---------------------------------------------------------------------------
 
 
@@ -68,6 +68,5 @@ def test_add_dep_cycle_rejected_and_rolled_back(planctl_git_repo):
         "epic-dep cycle detected" in d for d in err.get("details", [])
     )
 
-    # fn-590 task .1 rollback: B's dep list must be untouched on disk after
-    # the rejected write.
+    # Rollback: B's dep list must be untouched on disk after the rejected write.
     assert _read_epic_json(planctl_git_repo, b)["depends_on_epics"] == []

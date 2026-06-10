@@ -1,4 +1,4 @@
-"""Tests for ``planctl.integrity`` and ``planctl.run_validate`` (fn-587 task .3).
+"""Tests for ``planctl.integrity`` and ``planctl.run_validate``.
 
 Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
 tests set it explicitly.
@@ -362,7 +362,7 @@ def test_check_epic_tree_pure_fn_signature(tmp_path):
 
 
 # ---------------------------------------------------------------------------
-# fn-588 task .1: epic-dep cycle detection across the project-wide graph.
+# epic-dep cycle detection across the project-wide graph.
 # ---------------------------------------------------------------------------
 
 

@@ -1,7 +1,7 @@
 """Tests for planctl.global_state — plan-state-only derivation.
 
-The fn-614 collapse removed the ``jobs`` parameter and every join with
-running-job data.  ``derive_global_state`` now reads plan-state alone —
+``derive_global_state`` takes no ``jobs`` parameter and performs no join with
+running-job data.  It reads plan-state alone —
 ``in_progress`` rows surface from ``task.status == "in_progress"``,
 ``workable``/``close_ready`` from plan-state alone, and the dep gate
 delegates to ``derive_*_runtime_status`` (plan-state).
@@ -456,7 +456,7 @@ class TestDeriveGlobalStateBlockedEpics:
 
 
 # ---------------------------------------------------------------------------
-# derive_global_state — cross-project deps (fn-600)
+# derive_global_state — cross-project deps
 # ---------------------------------------------------------------------------
 
 
@@ -687,7 +687,7 @@ class TestDeriveGlobalStateMalformedKeys:
 
 
 # ---------------------------------------------------------------------------
-# Multi-repo passthrough (fn-364)
+# Multi-repo passthrough
 # ---------------------------------------------------------------------------
 
 

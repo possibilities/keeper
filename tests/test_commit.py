@@ -1,5 +1,4 @@
-"""Tests for :mod:`planctl.commit` — the per-verb auto-commit primitives
-introduced by fn-587 task .1.
+"""Tests for :mod:`planctl.commit` — the per-verb auto-commit primitives.
 
 Coverage matrix:
 
@@ -198,7 +197,7 @@ def test_auto_commit_happy_path_returns_sha_and_commits(planctl_git_repo):
 
 
 # ---------------------------------------------------------------------------
-# fn-695: Session-Id trailer
+# Session-Id trailer
 # ---------------------------------------------------------------------------
 
 
@@ -403,8 +402,8 @@ def test_auto_commit_raises_commit_failed_on_git_commit_error(
 
     # Force git commit to fail by wedging an unsigned-commit requirement
     # against a config that won't allow it.  Simpler: monkeypatch
-    # `_git_commit` in the commit module to raise.  Signature now carries the
-    # pathspec-scoping `files` arg (fn-640).
+    # `_git_commit` in the commit module to raise.  Signature carries the
+    # pathspec-scoping `files` arg.
     def _boom(*_) -> str:
         raise CommitFailed("git_commit", "synthesized failure")
 
@@ -426,7 +425,7 @@ def test_auto_commit_raises_commit_failed_on_git_commit_error(
 
 
 # ---------------------------------------------------------------------------
-# Sequential commits + lock-domain retry (fn-640: no flock; bounded retry
+# Sequential commits + lock-domain retry (no flock; bounded retry
 # over git's own index.lock / ref-lock domains).
 # ---------------------------------------------------------------------------
 

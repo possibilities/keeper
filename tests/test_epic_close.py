@@ -1,12 +1,11 @@
-"""Tests for planctl epic close (fn-559 — audit-required flag torn down).
+"""Tests for planctl epic close.
 
 Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
 tests set it explicitly.
 
-`epic close` stamps `closer_done_at` only. The fn-521 `--audit-required` /
-`--no-audit-required` flag and the parity `auditor_done_at` stamp were removed
-when the standalone auditor concept was torn down (the audit now runs inline
-inside `/plan:close` before the close mutation).
+`epic close` stamps `closer_done_at` only. There is no `--audit-required` /
+`--no-audit-required` flag and no parity `auditor_done_at` stamp — the audit
+runs inline inside `/plan:close` before the close mutation.
 """
 
 from __future__ import annotations
@@ -64,7 +63,7 @@ def test_close_stamps_only_closer_done_at(tmp_path, monkeypatch):
 
 
 def test_close_rejects_removed_audit_required_flag(tmp_path, monkeypatch):
-    """The fn-521 --audit-required / --no-audit-required flag is gone (fn-559)."""
+    """The --audit-required / --no-audit-required flag is gone."""
     _create_project(tmp_path, monkeypatch)
     code, obj, output = _invoke(["epic", "create", "--title", "Flag gone"])
     assert code == 0, output

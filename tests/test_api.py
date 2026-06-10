@@ -1,6 +1,6 @@
 """Tests for planctl.api: load_epic and load_tasks_for_epic raising contract.
 
-Also covers the fn-488 task .8 cross-CLI re-export surface — the sibling
+Also covers the cross-CLI re-export surface — the sibling
 External CLIs must reach these helpers via ``planctl.api`` per the
 cli-boundaries lint, so the public re-exports get a smoke test apiece.
 """
@@ -129,7 +129,7 @@ class TestLoadTasksForEpic:
 
 
 # ---------------------------------------------------------------------------
-# fn-488 task .8: cross-CLI re-export surface
+# cross-CLI re-export surface
 # ---------------------------------------------------------------------------
 
 

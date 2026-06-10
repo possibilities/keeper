@@ -1,4 +1,4 @@
-"""Tests for `planctl followup submit <epic_id>` (fn-12 task .2).
+"""Tests for `planctl followup submit <epic_id>`.
 
 The followup-submit verb validates the close-planner's follow-up plan YAML via
 scaffold's DRY-RUN semantics — the assert-all half of scaffold's flow, reusing

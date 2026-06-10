@@ -1,12 +1,9 @@
-"""fn-502 regression: every checked-in epic JSON must be clean of ``audited_into``.
+"""Regression: every checked-in epic JSON must be clean of ``audited_into``.
 
 The dead ``audited_into`` key was a forward pointer from a closed epic
-into its follow-up. It was retired in fn-502 in favor of an explicit
-follow-up argument on the audit-commit path (the seam-based ``commit-plan
-after-audit`` verb was itself later deleted in fn-587 when per-verb
-auto-commit landed). ``normalize_epic`` now pops the key defensively on
-every load — this test guards against the field re-entering the tracked
-tree via a manual edit or a stale tool that still writes the key.
+into its follow-up; it is retired. ``normalize_epic`` pops the key
+defensively on every load — this test guards against the field re-entering
+the tracked tree via a manual edit or a stale tool that still writes the key.
 """
 
 from __future__ import annotations

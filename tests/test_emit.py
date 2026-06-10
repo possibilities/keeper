@@ -1,4 +1,4 @@
-"""Tests for ``planctl.output.emit`` per-verb auto-commit (fn-587 task .2).
+"""Tests for ``planctl.output.emit`` per-verb auto-commit.
 
 Covers the audit → commit → print reordering inside ``emit()``: every
 mutating verb's success envelope on stdout is now an authoritative signal
@@ -81,7 +81,7 @@ def _seed_epic(project_path: Path) -> tuple[str, str]:
     Returns (epic_id, task_id).  Subsequent verb tests run against a clean
     worktree so any dirty state is attributable to the verb under test.
 
-    fn-587 task .3: scaffold now stamps ``last_validated_at`` on the fresh
+    scaffold stamps ``last_validated_at`` on the fresh
     epic JSON.  The validate-marker subpath tests below expect a never-
     stamped epic (so ``validate --epic`` triggers the None → timestamp
     transition that lands a fresh commit).  Null out the marker after the

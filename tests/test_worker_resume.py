@@ -23,9 +23,8 @@ from planctl.cli import cli
 def project(tmp_path, monkeypatch):
     """Create a throwaway planctl project and chdir to it.
 
-    fn-589 task .1 (item 2): scaffold + refine-apply now run filesystem-repo
-    integrity at mint time, so the project root must be a real git repo for
-    seed_epic to succeed.
+    scaffold + refine-apply run filesystem-repo integrity at mint time, so the
+    project root must be a real git repo for seed_epic to succeed.
     """
     import subprocess
 
@@ -283,10 +282,9 @@ def test_worker_resume_tier_set_rides_envelope(project: Path, monkeypatch):
 def test_worker_resume_tier_null_emits_raw_note(project: Path, monkeypatch):
     """A null persisted tier surfaces a raw "tier is None" note + explicit JSON null.
 
-    fn-594: the cold-resume heuristic note branch was deleted (build-forward —
-    scaffold / refine-apply now reject missing tier at mint time). Legacy
-    on-disk null-tier records still load; the envelope carries an explicit JSON
-    null so the skill consumer can branch on it.
+    scaffold / refine-apply reject missing tier at mint time. Legacy on-disk
+    null-tier records still load; the envelope carries an explicit JSON null so
+    the skill consumer can branch on it.
     """
     import planctl.run_worker_resume as m
 

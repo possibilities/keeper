@@ -9,20 +9,19 @@ def test_cli_help():
 
 
 def test_cli_help_no_scout_or_interview_subcommands():
-    """Guard against re-introduction of removed CLI surfaces (fn-279, fn-285)."""
+    """Guard against re-introduction of removed CLI surfaces."""
     result = CliRunner().invoke(cli, ["--help"])
     assert result.exit_code == 0
-    # These subcommand groups were deleted in fn-279 and must not come back.
+    # These subcommand groups are removed and must not come back.
     assert "scout" not in result.output.lower()
     assert "interview" not in result.output.lower()
 
 
 def test_cli_help_no_config_subcommand():
-    """Guard against re-introduction of the removed `config` subgroup (fn-421).
+    """Guard against re-introduction of the removed `config` subgroup.
 
-    The entire watch config surface (`config_schema.py`, `helpers.py`,
-    `run_config_show.py`, `~/.config/planctl/config.yaml`) was deleted when
-    keeper dispatch collapsed to a single hardcoded shared in-flight slot.
+    There is no watch config surface — keeper dispatch uses a single hardcoded
+    shared in-flight slot.
     """
     result = CliRunner().invoke(cli, ["--help"])
     assert result.exit_code == 0
@@ -46,7 +45,7 @@ def test_cli_help_no_config_subcommand():
 
 
 def test_cli_config_show_errors_as_unknown_command():
-    """`planctl config show` must error — the subgroup is gone (fn-421)."""
+    """`planctl config show` must error — the subgroup is gone."""
     result = CliRunner().invoke(cli, ["config", "show"])
     # click returns non-zero (typically 2) on unknown commands.
     assert result.exit_code != 0

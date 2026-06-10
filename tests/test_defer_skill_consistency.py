@@ -10,7 +10,7 @@ This module pins the invariants that keep it healthy:
    `/plan:next`, never here.
 4. **References `planctl scaffold`** — the only mutating verb the skill invokes.
 5. **Every `planctl <verb>` in a fenced bash block resolves via `CliRunner`** —
-   the verb-existence guard that bit fn-339.
+   the verb-existence guard.
 """
 
 from __future__ import annotations
@@ -170,7 +170,7 @@ def test_defer_planctl_verbs_have_help(verb_parts: tuple[str, ...]):
     """Every `planctl <verb>` referenced in a fenced bash block of the defer
     skill must respond to `--help` with exit code 0.
 
-    Mirrors the fn-339 / fn-341 guard from `test_work_skill_consistency`.
+    Mirrors the verb-existence guard from `test_work_skill_consistency`.
     """
     result = CliRunner().invoke(cli, [*verb_parts, "--help"])
     assert result.exit_code == 0, (

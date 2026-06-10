@@ -1,4 +1,4 @@
-"""Tests for the fn-565 `planctl refine-apply` verb.
+"""Tests for the `planctl refine-apply` verb.
 
 Coverage:
 - Add a task to an existing epic.
@@ -236,8 +236,8 @@ add_tasks:
 
 
 def test_refine_apply_restamps_validation_marker(planctl_git_repo):
-    """fn-587 task .4: refine-apply re-stamps last_validated_at with a
-    strictly-newer timestamp (instead of clearing to None)."""
+    """refine-apply re-stamps last_validated_at with a strictly-newer
+    timestamp (instead of clearing to None)."""
     epic_id = _seed_two_task_epic(planctl_git_repo)
     _stamp_marker(planctl_git_repo, epic_id)
     pre_stamp = _read_epic(planctl_git_repo, epic_id)["last_validated_at"]
@@ -337,8 +337,8 @@ def test_refine_apply_empty_delta_rejected(planctl_git_repo):
 
 
 # ---------------------------------------------------------------------------
-# Per-task target_repo (fn-585): deterministic replacement for the deleted
-# gravity heuristic. Mirrors the scaffold test shapes for add_tasks; also
+# Per-task target_repo: deterministic, shape-only. Mirrors the scaffold test
+# shapes for add_tasks; also
 # covers the recompute-on-every-invocation contract for `epic.touched_repos`.
 # ---------------------------------------------------------------------------
 
@@ -481,9 +481,8 @@ add_tasks:
 
 
 def test_refine_apply_recompute_rejects_stale_target_repo(planctl_git_repo):
-    """fn-589 task .1 (item 2): refine-apply now asserts filesystem-repo
-    validity at write time (the trailing ``validate --epic`` the skill used to
-    fire is no longer needed).  A pre-existing stale ``target_repo`` on disk
+    """refine-apply asserts filesystem-repo validity at write time (no
+    trailing ``validate --epic`` is needed).  A pre-existing stale ``target_repo`` on disk
     surfaces as an ``integrity_failed`` envelope rather than round-tripping
     silently into ``touched_repos`` — the structural writes already landed at
     that point (refine-apply's per-file atomic_write semantics) but the
@@ -554,8 +553,8 @@ add_tasks:
 def test_refine_apply_target_repo_tilde_expansion(planctl_git_repo, monkeypatch):
     """~ expansion: persisted target_repo is the canonicalised absolute path.
 
-    fn-589 task .1 (item 2): refine-apply now asserts filesystem-repo validity
-    at write time, so the tilde must resolve to a real ``.git/``-bearing dir.
+    refine-apply asserts filesystem-repo validity at write time, so the
+    tilde must resolve to a real ``.git/``-bearing dir.
     Point ``HOME`` at the (git-init'd) test repo so ``~`` expands to a valid
     git root.
     """
@@ -585,7 +584,7 @@ add_tasks:
 
 
 # ---------------------------------------------------------------------------
-# fn-589 task .1 (item 1): stdin support via `--file -`
+# stdin support via `--file -`
 # ---------------------------------------------------------------------------
 
 
@@ -611,7 +610,7 @@ add_tasks:
 
 
 # ---------------------------------------------------------------------------
-# Per-task tier (fn-594): refine-apply mirrors scaffold's tier enforcement on
+# Per-task tier: refine-apply mirrors scaffold's tier enforcement on
 # add_tasks entries. Field is REQUIRED on every new task; missing field and
 # unknown value both surface as tier_invalid; non-string is bad_yaml. Build-
 # forward — no back-compat null default. `rewrite_specs` / `rewire_deps` do
@@ -749,9 +748,9 @@ add_tasks:
 
 
 # ---------------------------------------------------------------------------
-# fn-640: refine-apply commit-boundary behavior after the fn-629 seam unwind
-# was deleted. A pre-COMMIT failure (invocation-build raise, git error) now
-# leaves the freshly-minted task/spec tree ON DISK (§10 no-rollback) — the
+# refine-apply commit-boundary behavior. A pre-COMMIT failure (invocation-build
+# raise, git error) leaves the freshly-minted task/spec tree ON DISK
+# (§10 no-rollback) — the
 # keeper HEAD-gate is the sole guard that keeps an uncommitted tree invisible
 # to the autopilot. The local write-phase try/except blocks still unwind a
 # MID-WRITE crash, so these tests target the commit-failure window specifically
@@ -761,8 +760,8 @@ add_tasks:
 
 def test_refine_apply_missing_session_id_persists_writes(planctl_git_repo, monkeypatch):
     """CLAUDE_CODE_SESSION_ID unset → invocation-build raises in emit()
-    AFTER the write phase already completed (fn-640). With the seam unwind gone, the
-    freshly-minted task JSON / spec now PERSIST on disk (no automatic unwind).
+    AFTER the write phase already completed. There is no seam unwind, so the
+    freshly-minted task JSON / spec PERSIST on disk.
     """
     epic_id = _seed_two_task_epic(planctl_git_repo)
 
@@ -797,7 +796,7 @@ add_tasks:
 def test_refine_apply_invocation_raise_persists_written_tree(
     planctl_git_repo, monkeypatch
 ):
-    """fn-640: a raise from build_planctl_invocation (after the write phase
+    """A raise from build_planctl_invocation (after the write phase
     completed, pre-commit) leaves the freshly-written tree on disk — no
     seam-level unwind. The local write-phase block only unwinds a MID-WRITE
     crash, which is not this window.
@@ -834,7 +833,7 @@ add_tasks:
 def test_refine_apply_commit_failure_persists_written_tree(
     planctl_git_repo, monkeypatch
 ):
-    """fn-640: a CommitFailed from auto_commit_from_invocation yields the
+    """A CommitFailed from auto_commit_from_invocation yields the
     structured ``commit_failed`` envelope (success envelope NEVER printed) and
     leaves the freshly-written add_tasks files ON DISK (§10 no-rollback). The
     deleted seam unwind no longer scrubs the pre-commit window.
@@ -876,11 +875,10 @@ add_tasks:
 
 @pytest.mark.real_git
 def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypatch):
-    """fn-629 task .2 acceptance (fn-640 retune): the ``_epic_id_lock``
-    (id-allocation, sub-millisecond) is RELEASED before the auto-commit's git
-    commit runs. Nesting would balloon the id-lock hold time across a git
-    commit and bottleneck concurrent scaffolds in sibling projects. Since
-    fn-640 deleted the commit flock, we spy the surviving commit seam
+    """The ``_epic_id_lock`` (id-allocation, sub-millisecond) is RELEASED
+    before the auto-commit's git commit runs. Nesting would balloon the
+    id-lock hold time across a git commit and bottleneck concurrent scaffolds
+    in sibling projects. There is no commit flock, so we spy the commit seam
     (``_git_commit``) instead of the lock-acquire.
     """
     import contextlib as _ctxlib

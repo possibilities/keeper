@@ -1,4 +1,4 @@
-"""Tests for planctl epic queue-jump — the board-priority flip verb (fn-1).
+"""Tests for planctl epic queue-jump — the board-priority flip verb.
 
 queue-jump flips queue_jump=true on an existing epic and rides queue_jump=True
 on the planctl_invocation envelope so keeper folds the priority signal and

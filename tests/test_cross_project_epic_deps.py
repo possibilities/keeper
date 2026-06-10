@@ -1,4 +1,4 @@
-"""Tests for fn-600 cross-project epic-level dependencies.
+"""Tests for cross-project epic-level dependencies.
 
 Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
 tests set it explicitly.
@@ -258,7 +258,7 @@ def test_resolve_epic_globally_single_repo_fallback(
 
 
 # ---------------------------------------------------------------------------
-# fn-20: number-only `fn-N` resolution (integer equality, normalize-on-write)
+# number-only `fn-N` resolution (integer equality, normalize-on-write)
 # ---------------------------------------------------------------------------
 
 
@@ -641,7 +641,7 @@ def test_cross_project_cycle_rejected_and_rolled_back(two_projects, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# fn-601: guarded discover_projects() in the cycle-detection block
+# guarded discover_projects() in the cycle-detection block
 # ---------------------------------------------------------------------------
 
 

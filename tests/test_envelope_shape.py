@@ -1,4 +1,4 @@
-"""Tests for the planctl_invocation envelope (fn-64-rework-planctl-commit-behavior.1).
+"""Tests for the planctl_invocation envelope.
 
 Verifies:
 
@@ -219,8 +219,7 @@ def test_subject_with_detail_formatting():
 def test_orphan_originating_epic_key_is_inert(planctl_git_repo):
     """Old-schema epics with orphan originating_epic key on disk load cleanly.
 
-    Asserts (post fn-604 sunset of the plug-shape `_open_bundles_sorted`
-    side-assert):
+    Asserts:
 
     - planctl show succeeds
     - show envelope JSON does not contain originating_epic

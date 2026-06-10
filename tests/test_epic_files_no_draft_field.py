@@ -1,9 +1,8 @@
-"""fn-463 regression: every checked-in epic JSON must be clean of ``draft``.
+"""Regression: every checked-in epic JSON must be clean of ``draft``.
 
-The dead ``draft`` key was retired in fn-451 and scrubbed from disk in
-fn-463. ``normalize_epic`` now pops the key defensively on every load —
-this test guards against the field re-entering the tracked tree via a
-manual edit or a stale tool that still writes the key.
+The dead ``draft`` key is retired. ``normalize_epic`` pops the key
+defensively on every load — this test guards against the field re-entering
+the tracked tree via a manual edit or a stale tool that still writes the key.
 """
 
 from __future__ import annotations

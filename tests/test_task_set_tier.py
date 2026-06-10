@@ -1,4 +1,4 @@
-"""Tests for planctl task set-tier — worker reasoning tier persistence (fn-405).
+"""Tests for planctl task set-tier — worker reasoning tier persistence.
 
 Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
 tests set it explicitly.
@@ -27,7 +27,7 @@ _ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-task-set-tier-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
-    """Init a planctl project under a fresh git repo (fn-589 task .1, item 2)."""
+    """Init a planctl project under a fresh git repo."""
     import subprocess
 
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-task-set-tier-fixture")
@@ -122,15 +122,14 @@ def test_normalize_task_preserves_existing_tier():
 def test_set_tier_writes_medium(tmp_path, monkeypatch):
     """planctl task set-tier --tier medium writes `tier=medium` on the task JSON.
 
-    fn-594: scaffold now requires tier at mint time and the conftest helper
-    writes `tier: medium` by default. Hand-null the persisted task_def to
-    simulate a pre-fn-594 legacy record, then verify set-tier overwrites
-    null → medium (the original test intent).
+    scaffold requires tier at mint time and the conftest helper writes
+    `tier: medium` by default. Hand-null the persisted task_def to simulate a
+    legacy record, then verify set-tier overwrites null → medium.
     """
     _create_project(tmp_path, monkeypatch)
     _, task_id = _make_epic_with_task()
 
-    # Hand-null the task to simulate a legacy (pre-fn-594) on-disk record.
+    # Hand-null the task to simulate a legacy on-disk record.
     task_path = tmp_path / ".planctl" / "tasks" / f"{task_id}.json"
     task_def = json.loads(task_path.read_text(encoding="utf-8"))
     task_def["tier"] = None
@@ -200,20 +199,20 @@ def test_warm_write_cold_read_round_trip(tmp_path, monkeypatch):
 
 
 def test_tier_null_triggers_heuristic_fallback(tmp_path, monkeypatch):
-    """A pre-fn-594 legacy task with persisted tier=null still surfaces null
+    """A legacy task with persisted tier=null still surfaces null
     via `planctl show` so /plan:work's cold-resume can branch on the missing
     tier signal.
 
-    fn-594: scaffold now requires tier at mint time, so the only path to a
-    null-tier on-disk record is a pre-fn-594 legacy task. Hand-null the
-    persisted task_def to recreate that state, then confirm `show` returns
+    scaffold requires tier at mint time, so the only path to a null-tier
+    on-disk record is a legacy task. Hand-null the persisted task_def to
+    recreate that state, then confirm `show` returns
     `tier: null` cleanly (the runtime contract keeper and skill
     consumers branch on).
     """
     _create_project(tmp_path, monkeypatch)
     _, task_id = _make_epic_with_task()
 
-    # Hand-null to simulate a pre-fn-594 legacy on-disk record.
+    # Hand-null to simulate a legacy on-disk record.
     task_path = tmp_path / ".planctl" / "tasks" / f"{task_id}.json"
     task_def = json.loads(task_path.read_text(encoding="utf-8"))
     task_def["tier"] = None

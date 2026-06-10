@@ -1,4 +1,4 @@
-"""Tests for the `planctl close-preflight <epic_id>` verb (fn-12 rewrite).
+"""Tests for the `planctl close-preflight <epic_id>` verb.
 
 The verb is the close-phase brief handoff (the symmetric bookend to `claim`'s
 worker brief): it assembles the audit brief — source commit groups, the
@@ -422,7 +422,7 @@ class TestProjectFlag:
 
 # ---------------------------------------------------------------------------
 # Direct unit coverage for planctl.commit_lookup.find_commit_groups — the
-# verb-agnostic seam fn-6's run_reconcile imports. Exercises the trailer
+# verb-agnostic seam run_reconcile imports. Exercises the trailer
 # post-filter, is_task_id gate, multi-valued keys, SHA dedup, and the
 # touched_repos tri-state against real git repos (hermetic via the autouse
 # git config).

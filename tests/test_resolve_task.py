@@ -1,4 +1,4 @@
-"""Tests for planctl resolve-task — read-only routing lookup (fn-593 task .1).
+"""Tests for planctl resolve-task — read-only routing lookup.
 
 Cases:
 - Happy path: tier set, full envelope returned with all routing fields.
@@ -133,16 +133,16 @@ def test_resolve_task_tier_in_vocab(project):
 
 
 def test_resolve_task_null_tier(project):
-    """A pre-fn-594 legacy task with persisted tier=null surfaces as JSON null
+    """A legacy task with persisted tier=null surfaces as JSON null
     (not omitted) so the launcher / skill consumer can branch on it.
 
-    fn-594: scaffold now requires tier at mint time so fresh tasks ship with
-    a concrete value. Hand-null the persisted task_def to simulate a legacy
-    on-disk record and verify resolve-task still surfaces the null cleanly.
+    scaffold requires tier at mint time so fresh tasks ship with a concrete
+    value. Hand-null the persisted task_def to simulate a legacy on-disk
+    record and verify resolve-task still surfaces the null cleanly.
     """
     _, task_id = _make_epic_with_task()
 
-    # Hand-null to simulate a pre-fn-594 legacy on-disk record.
+    # Hand-null to simulate a legacy on-disk record.
     task_path = project / ".planctl" / "tasks" / f"{task_id}.json"
     task_def = json.loads(task_path.read_text(encoding="utf-8"))
     task_def["tier"] = None

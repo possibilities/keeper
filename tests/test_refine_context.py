@@ -1,4 +1,4 @@
-"""Tests for the read-only `planctl refine-context <epic_id>` verb (fn-565).
+"""Tests for the read-only `planctl refine-context <epic_id>` verb.
 
 The verb wraps the /plan:plan Phase R2 fetch behind one envelope:
 ``{epic_id, title, branch, last_validated_at, epic_spec_md,
@@ -104,8 +104,8 @@ class TestEpicRoute:
         assert env["epic_id"] == epic_id
         assert env["title"] == "Demo epic"
         assert env["branch"] == "demo-branch"
-        # fn-587 task .3: scaffold now stamps last_validated_at on the fresh
-        # epic (in-memory integrity check passed → microsecond ISO timestamp).
+        # scaffold stamps last_validated_at on the fresh epic
+        # (in-memory integrity check passed → microsecond ISO timestamp).
         assert env["last_validated_at"] is not None
         assert env["last_validated_at"].endswith("Z")
         assert "." in env["last_validated_at"]
@@ -221,7 +221,7 @@ def test_run_directly_no_click_context(project):
 
 
 # ---------------------------------------------------------------------------
-# fn-589 task .1 (item 8): --invalidate (conditionally-mutating)
+# --invalidate (conditionally-mutating)
 # ---------------------------------------------------------------------------
 
 

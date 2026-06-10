@@ -1,4 +1,4 @@
-"""Tests for `planctl.audit_artifacts` — the close-phase artifact subtree (fn-12).
+"""Tests for `planctl.audit_artifacts` — the close-phase artifact subtree.
 
 The module owns the gitignored `audits/<epic_id>/` subtree: path helpers,
 `AUDIT_SCHEMA_VERSION`, the canonical order-independent `compute_commit_set_hash`,

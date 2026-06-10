@@ -1,4 +1,4 @@
-"""Tests for the fn-544 `planctl scaffold` verb.
+"""Tests for the `planctl scaffold` verb.
 
 Coverage:
 - Happy path: epic + 2 tasks + one dep produces exactly ONE planctl_invocation
@@ -10,7 +10,7 @@ Coverage:
 - Failure shapes: bad_yaml (non-mapping), spec_invalid (malformed task spec),
   dep_invalid (out-of-range ordinal), dep_cycle. Each writes nothing.
 
-Test tiering (fn-4 proof slice): every test that drives the real ``scaffold``
+Test tiering: every test that drives the real ``scaffold``
 verb is marked ``integration`` — scaffold's mint-time integrity gate runs with
 ``check_filesystem_repos=True`` (run_scaffold.py:899-910), so it needs a real
 ``.git/`` and cannot run on a git-free ``seed_state`` tree. The only tests left
@@ -247,7 +247,7 @@ tasks:
     )
     assert epic_def["snippets"] == ["snip-a", "snip-b"]
     assert epic_def["bundles"] == ["bundle/dev-env", "bundle/snippeting-main"]
-    # fn-587 task .3: Fresh epic from scaffold ships pre-stamped (the in-memory
+    # Fresh epic from scaffold ships pre-stamped (the in-memory
     # integrity check ran clean, so we mint with last_validated_at = now_iso()).
     # Prior behaviour was None-on-write + normalize_epic filling on load.
     stamped = epic_def.get("last_validated_at")
@@ -295,7 +295,7 @@ def test_scaffold_no_substrate_emits_no_advisory(planctl_git_repo):
 
 
 # ---------------------------------------------------------------------------
-# fn-610: scaffold inlines `sketch/` refs at write time (same-project happy path).
+# scaffold inlines `sketch/` refs at write time (same-project happy path).
 # Cross-project coverage lives in test_cross_project_sketch_inline.py.
 # ---------------------------------------------------------------------------
 
@@ -437,7 +437,7 @@ tasks:
 
 
 # ---------------------------------------------------------------------------
-# Epic-level depends_on_epics (fn-556)
+# Epic-level depends_on_epics
 # ---------------------------------------------------------------------------
 
 
@@ -445,9 +445,8 @@ def _seed_epic(repo, title: str = "seed epic") -> str:
     """Scaffold a one-task epic and return its allocated epic_id.
 
     ``title`` is taken as-is — callers that need multiple sibling epics
-    pass distinct titles to dodge fn-623's dup-guard (same-slug scaffolds
-    now hard-error with ``duplicate_epic`` unless ``--allow-duplicate``
-    is set).
+    pass distinct titles to dodge the dup-guard (same-slug scaffolds
+    hard-error with ``duplicate_epic`` unless ``--allow-duplicate`` is set).
     """
     yaml = f"""\
 epic:
@@ -855,7 +854,7 @@ def test_scaffold_registered_in_verb_templates():
 def test_scaffold_not_in_validation_restamp_verbs():
     """Scaffold mints a fresh epic and stamps last_validated_at itself; adding
     it to VALIDATION_RESTAMP_VERBS is redundant.  Defend against accidental
-    inclusion (fn-587 task .4 renamed the tuple from VALIDATION_CLEAR_VERBS)."""
+    inclusion."""
     try:
         from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
     except ImportError:
@@ -866,19 +865,19 @@ def test_scaffold_not_in_validation_restamp_verbs():
 
 
 # ---------------------------------------------------------------------------
-# Per-task target_repo (fn-585): deterministic replacement for the deleted
-# gravity heuristic. Schema is shape-only — no filesystem checks at scaffold
-# time so epic JSON stays portable across hosts (artbird auto-deploy).
+# Per-task target_repo: deterministic, schema shape-only — no filesystem
+# checks at scaffold time so epic JSON stays portable across hosts (artbird
+# auto-deploy).
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
 def test_scaffold_default_target_repo_unchanged(planctl_git_repo):
     """Default-omit on every task: each task's target_repo == primary_repo and
-    touched_repos == [primary_repo] (single-element, unchanged from pre-fn-585).
+    touched_repos == [primary_repo] (single-element).
 
     Also asserts the success envelope's `repo_distribution` field rolls up
-    every task under the primary repo (fn-613)."""
+    every task under the primary repo."""
     yaml_path = _write_yaml(planctl_git_repo, _two_task_yaml())
     r = _invoke(["scaffold", "--file", yaml_path])
     assert r.exit_code == 0, r.output
@@ -887,7 +886,7 @@ def test_scaffold_default_target_repo_unchanged(planctl_git_repo):
     epic_id = payload["epic_id"]
     primary = str(planctl_git_repo.resolve())
 
-    # fn-613: top-level repo_distribution rides the success envelope.
+    # top-level repo_distribution rides the success envelope.
     assert payload["repo_distribution"] == {primary: 2}
 
     epic_def = json.loads(
@@ -939,7 +938,7 @@ tasks:
     primary_resolved = str(primary_other.resolve())
     touched_resolved = str(touched_other.resolve())
 
-    # fn-613: per-repo split lands in the success envelope with sorted keys.
+    # per-repo split lands in the success envelope with sorted keys.
     expected_dist = {primary_resolved: 1, touched_resolved: 1}
     assert payload["repo_distribution"] == expected_dist
     # Determinism: keys must be sorted (lex order).
@@ -1024,8 +1023,8 @@ tasks:
 def test_scaffold_target_repo_tilde_expansion(planctl_git_repo, monkeypatch):
     """~ expansion: persisted target_repo must be the canonicalised absolute path.
 
-    fn-589 task .1 (item 2): scaffold now asserts filesystem-repo validity at
-    mint time, so the tilde must resolve to a real ``.git/``-bearing dir.
+    scaffold asserts filesystem-repo validity at mint time, so the tilde must
+    resolve to a real ``.git/``-bearing dir.
     Point ``HOME`` at the (git-init'd) test repo so ``~`` expands to a valid
     git root.
     """
@@ -1150,7 +1149,7 @@ tasks:
 
 
 # ---------------------------------------------------------------------------
-# fn-587 task .3: scaffold runs the shared integrity check at mint time and
+# scaffold runs the shared integrity check at mint time and
 # stamps last_validated_at on the fresh epic.  The auto-commit at emit() lands
 # the whole tree in one commit covering epic JSON + epic spec + every task
 # JSON + every task spec.
@@ -1273,18 +1272,18 @@ def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypat
 
 
 # ---------------------------------------------------------------------------
-# scaffold commit-boundary behavior. (a) the env guard still fails closed on a
-# missing CLAUDE_CODE_SESSION_ID BEFORE any write, so zero files land — this guard
-# is independent of the seam and survives fn-640. (b) post-fn-640 the seam
-# unwind is gone: a build_planctl_invocation raise AFTER the write phase
-# completed leaves the fully-written tree ON DISK (§10 no-rollback); the keeper
+# scaffold commit-boundary behavior. (a) the env guard fails closed on a
+# missing CLAUDE_CODE_SESSION_ID BEFORE any write, so zero files land — this
+# guard is independent of the seam. (b) there is no seam unwind: a
+# build_planctl_invocation raise AFTER the write phase completed leaves the
+# fully-written tree ON DISK (§10 no-rollback); the keeper
 # HEAD-gate keeps an uncommitted epic invisible to the autopilot.
 # ---------------------------------------------------------------------------
 
 
 @pytest.mark.integration
 def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatch):
-    """A missing CLAUDE_CODE_SESSION_ID fails closed BEFORE any write (fn-630 a).
+    """A missing CLAUDE_CODE_SESSION_ID fails closed BEFORE any write.
 
     Proves the orphan-epic incident can't recur via the env path: the verb
     refuses up front with ``missing_session_id``, ``scan_max_epic_id`` does not
@@ -1332,8 +1331,8 @@ def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatc
 
 @pytest.mark.integration
 def test_scaffold_invocation_raise_persists_written_tree(planctl_git_repo, monkeypatch):
-    """fn-640: a raise in build_planctl_invocation (after the tree is on disk,
-    pre-commit) leaves every written file ON DISK — the seam unwind is gone.
+    """A raise in build_planctl_invocation (after the tree is on disk,
+    pre-commit) leaves every written file ON DISK — there is no seam unwind.
 
     The local write-phase try/except only unwinds a MID-WRITE crash; an
     invocation-build raise fires after the write phase completed, so the full
@@ -1368,7 +1367,7 @@ def test_scaffold_invocation_raise_persists_written_tree(planctl_git_repo, monke
 
 
 # ---------------------------------------------------------------------------
-# fn-589 task .1 (item 1): stdin support via `--file -`
+# stdin support via `--file -`
 # ---------------------------------------------------------------------------
 
 
@@ -1405,7 +1404,7 @@ def test_scaffold_stdin_byte_cap_enforced(planctl_git_repo):
 
 
 # ---------------------------------------------------------------------------
-# Per-task tier (fn-593, hardened by fn-594): planner-chosen reasoning tier
+# Per-task tier: planner-chosen reasoning tier
 # rides the scaffold YAML through to the persisted task_def. Field is
 # REQUIRED on every task entry; valid values are TASK_TIERS = (medium | high
 # | xhigh | max). Missing field and unknown value both surface as
@@ -1453,7 +1452,7 @@ tasks:
 
 @pytest.mark.integration
 def test_scaffold_missing_tier_field_rejected(planctl_git_repo):
-    """fn-594: omitted `tier:` on a task entry → tier_invalid, no writes land.
+    """Omitted `tier:` on a task entry → tier_invalid, no writes land.
 
     Replaces the prior back-compat test that accepted missing as null —
     scaffold now hard-errors at mint time so keeper's null-tier
@@ -1641,7 +1640,7 @@ tasks:
 
 
 # ---------------------------------------------------------------------------
-# fn-595: epic.queue_jump rides the planctl_invocation envelope
+# epic.queue_jump rides the planctl_invocation envelope
 # ---------------------------------------------------------------------------
 
 
@@ -1754,13 +1753,12 @@ def test_scaffold_queue_jump_non_bool_is_bad_yaml(planctl_git_repo):
 
 
 # ---------------------------------------------------------------------------
-# fn-623: scaffold atomicity + dup guard. The pre-fn-623 code pre-wrote the
-# epic spec (and every task spec) to its final path so the integrity check
-# could read it; a non-clean exit between that pre-write and the rollback
-# orphaned a `specs/fn-N-*.md`, which `scan_max_epic_id` then counted and
-# silently advanced the next mint. The fix passes the epic spec to the
-# integrity helper in-memory (`epic_spec_content=`), defers every disk
-# write until after the gate, and adds a same-slug dup-guard before id
+# scaffold atomicity + dup guard. Pre-writing the epic spec (and every task
+# spec) to its final path for the integrity check would orphan a
+# `specs/fn-N-*.md` on a non-clean exit, which `scan_max_epic_id` would then
+# count and silently advance the next mint. Instead scaffold passes the epic
+# spec to the integrity helper in-memory (`epic_spec_content=`), defers every
+# disk write until after the gate, and adds a same-slug dup-guard before id
 # allocation so a re-scaffold of the same idea hard-errors with
 # `duplicate_epic` instead of silently allocating a parallel fn-N.
 # ---------------------------------------------------------------------------
@@ -1773,12 +1771,11 @@ def test_scaffold_integrity_failure_leaves_scan_max_unchanged(
     """Acceptance: a scaffold that fails the integrity gate leaves
     ``scan_max_epic_id`` unchanged AND zero orphaned ``specs/fn-N-*.md``.
 
-    This is the fn-623 regression test — before the fix, scaffold pre-wrote
-    the epic spec to its final path so the integrity helper could read it,
-    and even though the rollback at integrity-failure time unlinked the
-    spec, any non-clean exit between the pre-write and the rollback (or
-    just the rollback racing with another reader) could orphan the file.
-    The leak then advanced ``scan_max_epic_id`` on the next mint.
+    Regression guard: pre-writing the epic spec to its final path for the
+    integrity helper risks orphaning the file on any non-clean exit between
+    the pre-write and the rollback (or the rollback racing with another
+    reader), which would advance ``scan_max_epic_id`` on the next mint.
+    scaffold avoids the pre-write entirely.
     """
     from planctl.ids import scan_max_epic_id
 
@@ -1836,8 +1833,8 @@ def test_scaffold_integrity_failure_writes_no_spec_files_at_all(
     planctl_git_repo, monkeypatch
 ):
     """Belt-and-suspenders: when integrity fails, neither the epic spec nor
-    any task spec lands on disk — the pre-fn-623 rollback path is gone, and
-    if it were ever invoked the test would still pass (no files to unlink).
+    any task spec lands on disk — there is no rollback path, and if one were
+    ever invoked the test would still pass (no files to unlink).
     """
     import planctl.integrity as _integ
 
@@ -1947,7 +1944,7 @@ def test_scaffold_dup_slug_unrelated_slug_unaffected(planctl_git_repo):
 
 @pytest.mark.integration
 def test_scaffold_dup_slug_suffix_false_positive_regression(planctl_git_repo):
-    """fn-624 regression: the dup-guard glob ``fn-*-{slug}.json`` false-matched
+    """Regression: the dup-guard glob ``fn-*-{slug}.json`` false-matched
     any epic whose slug *ends* with ``-{slug}`` (e.g. existing ``foo-bar``
     siblings poisoned a fresh ``bar`` scaffold via fnmatch suffix semantics).
     The ``re.fullmatch`` post-filter pins exact-slug equivalence so only true

@@ -74,20 +74,20 @@ def test_normalize_epic_preserves_existing_primary_repo():
 
 
 # ---------------------------------------------------------------------------
-# fn-559: auditor_done_at teardown — normalize no longer writes the field and
-# silently pops it from legacy records (build-forward, mirrors ``draft``).
+# auditor_done_at teardown — normalize does not write the field and
+# silently pops it from legacy records (mirrors ``draft``).
 # ---------------------------------------------------------------------------
 
 
 def test_normalize_epic_does_not_add_auditor_done_at():
-    """fn-559: normalize_epic no longer defaults the dead auditor_done_at field."""
+    """normalize_epic does not default the dead auditor_done_at field."""
     data = {"id": "fn-1-test", "title": "Test", "status": "open"}
     normalize_epic(data)
     assert "auditor_done_at" not in data
 
 
 def test_normalize_epic_strips_legacy_auditor_done_at():
-    """fn-559: a legacy record carrying auditor_done_at loads clean (popped)."""
+    """A legacy record carrying auditor_done_at loads clean (popped)."""
     data = {
         "id": "fn-1-test",
         "title": "Test",
@@ -102,7 +102,7 @@ def test_normalize_epic_strips_legacy_auditor_done_at():
 
 
 def test_normalize_epic_strips_draft_field():
-    """fn-463: normalize_epic silently pops the retired ``draft`` key."""
+    """normalize_epic silently pops the retired ``draft`` key."""
     data = {"id": "fn-x", "draft": True, "status": "open"}
     normalize_epic(data)
     assert "draft" not in data
@@ -124,7 +124,7 @@ def test_normalize_task_preserves_existing_target_repo():
 
 
 # ---------------------------------------------------------------------------
-# fn-513: snippet-substrate metadata — additive list fields on epic + task
+# snippet-substrate metadata — additive list fields on epic + task
 # ---------------------------------------------------------------------------
 
 
@@ -277,8 +277,8 @@ def test_epic_create_accepts_primary_repo_flag(project):
 def test_scaffold_task_sets_target_repo_from_epic(project):
     """A scaffolded task's target_repo defaults to epic.primary_repo.
 
-    fn-565: scaffold is the create-path (the incremental `task create` verb is
-    gone). The task JSON carries target_repo == the cwd-derived primary_repo.
+    scaffold is the create-path (there is no incremental `task create` verb).
+    The task JSON carries target_repo == the cwd-derived primary_repo.
     """
     from .conftest import seed_epic
 

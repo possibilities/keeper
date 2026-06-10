@@ -211,7 +211,7 @@ def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
     """Two project dirs under one root; each project gets its own monotonic fn-N.
 
     With per-project numbering, project A's first epic is fn-1 and project B's
-    first epic is ALSO fn-1 — discovery no longer participates in the number.
+    first epic is ALSO fn-1 — discovery does not participate in the number.
     """
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-roots-discovery-fixture")
 

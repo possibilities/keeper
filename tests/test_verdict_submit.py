@@ -1,4 +1,4 @@
-"""Tests for `planctl verdict submit <epic_id>` (fn-12 task .2).
+"""Tests for `planctl verdict submit <epic_id>`.
 
 The verdict-submit verb validates the close-planner's verdict JSON at emission —
 structural (`VERDICT_SCHEMA`, additionalProperties:false on every node) THEN the

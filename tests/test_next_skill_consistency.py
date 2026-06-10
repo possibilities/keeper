@@ -10,7 +10,7 @@ healthy:
 3. **References `planctl epic queue-jump`** in a fenced bash block — the only
    mutating verb the skill invokes.
 4. **Every `planctl <verb>` in a fenced bash block resolves via `CliRunner`** —
-   the verb-existence guard that bit fn-339 (notably `epic queue-jump`).
+   the verb-existence guard (notably `epic queue-jump`).
 """
 
 from __future__ import annotations
@@ -168,7 +168,7 @@ def test_next_planctl_verbs_have_help(verb_parts: tuple[str, ...]):
     """Every `planctl <verb>` referenced in a fenced bash block of the next
     skill must respond to `--help` with exit code 0.
 
-    Mirrors the fn-339 / fn-341 guard from `test_work_skill_consistency`.
+    Mirrors the verb-existence guard from `test_work_skill_consistency`.
     """
     result = CliRunner().invoke(cli, [*verb_parts, "--help"])
     assert result.exit_code == 0, (

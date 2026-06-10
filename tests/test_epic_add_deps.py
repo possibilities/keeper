@@ -1,4 +1,4 @@
-"""Tests for the fn-565 `planctl epic add-deps` batch verb.
+"""Tests for the `planctl epic add-deps` batch verb.
 
 Coverage:
 - Multi-edge wire: N edges land in one call, one planctl_invocation envelope.
@@ -180,7 +180,7 @@ def test_add_deps_cycle_rejected(project):
 
 
 # ---------------------------------------------------------------------------
-# fn-589 task .1 (item 9): --skip-invalid routes per-edge errors into results
+# --skip-invalid routes per-edge errors into results
 # ---------------------------------------------------------------------------
 
 
@@ -247,7 +247,7 @@ def test_add_deps_default_fail_loud_unchanged(project):
 
 
 # ---------------------------------------------------------------------------
-# fn-20: number-only `fn-N` dep input normalizes to the full slug on write
+# number-only `fn-N` dep input normalizes to the full slug on write
 # ---------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""Tests for ``planctl claim`` (fn-542 task .2; brief-file handoff fn-5 task .1).
+"""Tests for ``planctl claim``.
 
 Locks the enriched claim verb: typed error envelopes for every precondition,
 the brief-handle happy-path envelope (``brief_ref``, no inline prose), CAS
@@ -35,7 +35,7 @@ pytestmark = pytest.mark.real_roots
 def _roots_at_tmp_project(tmp_path, monkeypatch):
     """Point planctl roots discovery at an isolated root holding only ``tmp_path``.
 
-    Claim is cwd-agnostic (fn-542 task .3): it resolves the owning project via
+    Claim is cwd-agnostic: it resolves the owning project via
     ``roots`` discovery, not the cwd. The ``project`` / ``tmp_path``
     project must therefore be discoverable as an immediate child of a configured
     root. We can't relocate that project, so the root is a fresh per-test dir
@@ -97,7 +97,7 @@ def _first_line_json(output: str) -> dict:
 def _make_epic_with_task(actor: str = "alice@example.com") -> tuple[str, str]:
     """Scaffold an epic + task, return (epic_id, task_id).
 
-    fn-565: minted via `scaffold` (the incremental `task create` verb is gone).
+    Minted via `scaffold` (there is no incremental `task create` verb).
     The CliRunner cwd is the active project (project fixture chdir'd).
     """
     from pathlib import Path
@@ -179,13 +179,13 @@ def test_claim_happy_path_envelope(project):
 
 
 def test_claim_null_tier_emits_null_worker_agent(project):
-    """A pre-fn-594 legacy task with persisted tier=null claims fine and emits
+    """A legacy task with persisted tier=null claims fine and emits
     worker_agent=null (not plan:worker-None). Claimability is claim's contract,
     not tier validity; the fail-loud on null moves to the skill spawn site.
     """
     _epic_id, task_id = _make_epic_with_task()
 
-    # Hand-null to simulate a pre-fn-594 legacy on-disk record.
+    # Hand-null to simulate a legacy on-disk record.
     task_path = project / ".planctl" / "tasks" / f"{task_id}.json"
     task_def = json.loads(task_path.read_text(encoding="utf-8"))
     task_def["tier"] = None
@@ -470,7 +470,7 @@ def test_claim_brief_write_failed_leaves_in_progress(project, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Cwd-agnostic project resolution (fn-542 task .3)
+# Cwd-agnostic project resolution
 # ---------------------------------------------------------------------------
 
 

@@ -4,10 +4,10 @@ re-stamp-on-mutation behavior (VALIDATION_RESTAMP_VERBS).
 Mutating verbs resolve the session id from CLAUDE_CODE_SESSION_ID; these
 tests set it explicitly.
 
-fn-587 task .4: the 14 structural verbs in VALIDATION_RESTAMP_VERBS now
-RE-STAMP ``last_validated_at`` to a fresh ``now_iso()`` value on success
-(strict timestamp newer-than the pre-mutation stamp) instead of clearing it
-to ``None``.  ``epic invalidate`` is the ONLY surviving null path.
+The 14 structural verbs in VALIDATION_RESTAMP_VERBS RE-STAMP
+``last_validated_at`` to a fresh ``now_iso()`` value on success (strict
+timestamp newer-than the pre-mutation stamp) instead of clearing it to
+``None``.  ``epic invalidate`` is the ONLY null path.
 
 Cases:
 - validate --epic <id> on never-validated, structurally valid epic:
@@ -278,10 +278,10 @@ def _assert_marker_restamped(
 ) -> None:
     """Assert the verb left ``last_validated_at`` strictly NEWER than pre_stamp.
 
-    fn-587 task .4: the 14 ``VALIDATION_RESTAMP_VERBS`` re-stamp the marker
-    to ``now_iso()`` on success instead of clearing to None.  ``now_iso()``
-    is microsecond-precision (fn-587 task .1) so the post-write stamp is
-    guaranteed strictly greater than any reasonable pre-write seed.
+    The 14 ``VALIDATION_RESTAMP_VERBS`` re-stamp the marker to ``now_iso()``
+    on success instead of clearing to None.  ``now_iso()`` is
+    microsecond-precision so the post-write stamp is guaranteed strictly
+    greater than any reasonable pre-write seed.
     """
     epic_data = _read_epic_json(project_path, epic_id)
     new_stamp = epic_data.get("last_validated_at")
@@ -297,7 +297,7 @@ def _assert_marker_restamped(
 def _setup_epic_and_task(tmp_path, monkeypatch):
     """Init a project, scaffold an epic + task, return (project_path, epic_id, task_id).
 
-    fn-565: minted via `scaffold` (the incremental `task create` verb is gone).
+    Minted via `scaffold` (there is no incremental `task create` verb).
     The epic's multi-repo fields are nulled afterward so `validate` treats it as
     a legacy epic (the tmp dir is not a git repo), matching `_create_epic`.
     """
@@ -318,9 +318,8 @@ def _setup_epic_and_task(tmp_path, monkeypatch):
 def test_restamp_on_refine_apply_adds_task(tmp_path, monkeypatch):
     """refine-apply add_tasks (new task on an existing epic) re-stamps the marker.
 
-    fn-565: this replaces the removed `task-create` / `set-spec` marker-clear
-    coverage — adding a task and rewriting its spec both ride refine-apply now,
-    which IS in VALIDATION_RESTAMP_VERBS.
+    Adding a task and rewriting its spec both ride refine-apply, which IS in
+    VALIDATION_RESTAMP_VERBS.
     """
     from .conftest import add_task
 
@@ -370,8 +369,7 @@ def test_restamp_on_set_acceptance(tmp_path, monkeypatch):
 def test_restamp_on_refine_apply_rewires_deps(tmp_path, monkeypatch):
     """refine-apply rewire_deps (full dep-list replace) re-stamps the marker.
 
-    fn-565: replaces the removed `set-deps` marker-clear coverage — dep rewrites
-    on an existing epic ride refine-apply now.
+    Dep rewrites on an existing epic ride refine-apply.
     """
     project_path, epic_id, task_id = _setup_epic_and_task(tmp_path, monkeypatch)
     _stamp_marker(project_path, epic_id)
@@ -512,22 +510,21 @@ def test_all_restamp_verbs_covered():
         "set-acceptance",
         "reset",
         "add-dep",
-        # Batch epic-dep wirer added in fn-565.
+        # Batch epic-dep wirer.
         "add-deps",
         "rm-dep",
-        # fn-565 removed the incremental verbs (task-create / set-spec /
-        # set-deps / dep-add / set-plan) — their structural-restamp coverage now
-        # rides scaffold (mint; NOT in the tuple) and refine-apply (rewrite; IS
-        # in the tuple, listed below).
-        # Multi-repo structural verbs added in fn-364.
+        # There are no incremental verbs (task-create / set-spec / set-deps /
+        # dep-add / set-plan) — structural-restamp coverage rides scaffold
+        # (mint; NOT in the tuple) and refine-apply (rewrite; IS in the tuple,
+        # listed below).
+        # Multi-repo structural verbs.
         "set-primary-repo",
         "set-touched-repos",
         "set-target-repo",
-        # Spec-metadata setters added in fn-513 (shared name across
-        # task + epic surfaces).
+        # Spec-metadata setters (shared name across task + epic surfaces).
         "set-snippets",
         "set-bundles",
-        # Whole-tree refine delta added in fn-565 (rewrites an existing tree).
+        # Whole-tree refine delta (rewrites an existing tree).
         "refine-apply",
     }
     assert set(VALIDATION_RESTAMP_VERBS) == expected, (
@@ -588,11 +585,11 @@ def _create_epic_with_primary_repo(project_path, repo_path: str) -> str:
 def test_restamp_on_set_primary_repo(tmp_path, monkeypatch):
     """epic set-primary-repo re-stamps last_validated_at.
 
-    fn-587 task .4: the post-write integrity check requires
+    The post-write integrity check requires
     ``primary_repo == data_dir.parent`` (samefile), so the epic's primary_repo
     is pinned to the project_path (which IS the git repo via _create_project's
-    git init).  Earlier coverage cleared the marker without an integrity check;
-    the new contract re-validates the post-mutation tree before re-stamping.
+    git init).  The contract re-validates the post-mutation tree before
+    re-stamping.
     """
     project_path = _create_project(tmp_path, monkeypatch)
 
@@ -638,8 +635,8 @@ def test_restamp_on_set_target_repo(tmp_path, monkeypatch):
 
     project_path = _create_project(tmp_path, monkeypatch)
 
-    # fn-565: mint epic + child task via scaffold (the incremental `task create`
-    # verb is gone), then patch primary_repo onto the epic so set-target-repo's
+    # Mint epic + child task via scaffold (there is no incremental `task create`
+    # verb), then patch primary_repo onto the epic so set-target-repo's
     # repo validation has a real .git/ dir to resolve against.  primary_repo
     # MUST be the project path (samefile rule in the post-write integrity check).
     epic_id, task_ids = seed_epic(
@@ -667,7 +664,7 @@ def test_restamp_on_set_target_repo(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------------------
 # set-target-repo recomputes epic.touched_repos from the union of all tasks'
-# target_repo values (fn-585: auto-roll invariant).
+# target_repo values (auto-roll invariant).
 # ---------------------------------------------------------------------------
 
 
@@ -677,11 +674,10 @@ def _seed_multi_task_epic_with_repos(
     """Scaffold an epic with N tasks, pin primary_repo to ``project_path``, and
     write per-task ``target_repo`` values directly into each task JSON.
 
-    fn-587 task .4: ``primary_repo`` MUST be the project path (samefile rule in
-    the post-write integrity check).  The legacy ``repo_a_path`` parameter is
-    retained for call-site compatibility but ignored — it was previously used
-    as both ``primary_repo`` and a target-repo seed; the rollup invariant only
-    cares about the ``task_repos`` list.
+    ``primary_repo`` MUST be the project path (samefile rule in the post-write
+    integrity check).  The ``repo_a_path`` parameter is retained for call-site
+    compatibility but ignored — the rollup invariant only cares about the
+    ``task_repos`` list.
 
     Returns ``(epic_id, task_ids)``.  Each task_repos[i] is written to
     task_ids[i]'s ``target_repo`` so the union seed reflects ``task_repos``.
@@ -1057,8 +1053,8 @@ def test_done_does_not_clear_marker(tmp_path, monkeypatch):
     """planctl done does NOT clear last_validated_at (it's not a structural mutation)."""
     project_path, epic_id, task_id = _setup_epic_and_task(tmp_path, monkeypatch)
 
-    # claim is required before done. --project bypasses roots discovery
-    # (fn-542 task .3): claim is cwd-agnostic and resolves the project via roots.
+    # claim is required before done. --project bypasses roots discovery:
+    # claim is cwd-agnostic and resolves the project via roots.
     claim_result = _run_planctl(
         ["claim", task_id, "--project", str(project_path)], cwd=str(project_path)
     )

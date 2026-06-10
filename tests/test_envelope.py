@@ -1,4 +1,4 @@
-"""Tests for planctl mutating-verb envelope shape (fn-64-rework-planctl-commit-behavior.3).
+"""Tests for planctl mutating-verb envelope shape.
 
 The CLI no longer commits — the hookctl planctl-mutation hook is the sole commit
 actor.  These tests verify:
@@ -92,7 +92,7 @@ def test_done_emits_planctl_mutation(planctl_git_repo):
 
     _epic_id, task_ids = seed_epic(planctl_git_repo, title="E", n_tasks=1)
     task_id = task_ids[0]
-    # --project bypasses roots discovery (fn-542 task .3): claim is cwd-agnostic.
+    # --project bypasses roots discovery: claim is cwd-agnostic.
     _invoke(["claim", task_id, "--force", "--project", str(planctl_git_repo)])
 
     r = _invoke(["done", task_id, "--summary", "done", "--force"])
@@ -138,7 +138,7 @@ def test_claim_emits_planctl_invocation_readonly(planctl_git_repo):
     _epic_id, task_ids = seed_epic(planctl_git_repo, title="Runtime test", n_tasks=1)
     task_id = task_ids[0]
 
-    # --project bypasses roots discovery (fn-542 task .3): claim is cwd-agnostic.
+    # --project bypasses roots discovery: claim is cwd-agnostic.
     r = _invoke(["claim", task_id, "--force", "--project", str(planctl_git_repo)])
     assert r.exit_code == 0, r.output
     payload = _parse_envelope(r.output)
@@ -231,7 +231,7 @@ def test_session_id_none_raises(planctl_git_repo, monkeypatch):
 
 
 def test_build_invocation_carries_session_id(planctl_git_repo, monkeypatch):
-    """fn-695: the envelope carries session_id == CLAUDE_CODE_SESSION_ID verbatim.
+    """The envelope carries session_id == CLAUDE_CODE_SESSION_ID verbatim.
 
     The auto-commit reads this off the payload to stamp the Session-Id trailer;
     it must be the same opaque uuid the launcher exported, not a fresh one.

@@ -1,7 +1,6 @@
 """Unit tests for apps/planctl/planctl/repo_inference.py.
 
-Tests cover the surviving primitives after fn-585 deleted the gravity
-heuristic:
+Tests cover the repo-inference primitives:
 
 - ``find_repo_root``: longest-match deepest-``.git`` semantic, subdir case,
   no-git-anywhere case

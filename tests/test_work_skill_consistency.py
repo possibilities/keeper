@@ -1,13 +1,12 @@
 """Consistency checks between `work.md.tmpl` and the `planctl` CLI surface.
 
-This module guards the `/plan:work` skill template against two regressions
-that bit fn-339 and prompted the fn-341 followup:
+This module guards the `/plan:work` skill template against two regressions:
 
 1. **Verb existence** — every `planctl <verb>` invocation referenced inside a
    fenced bash block of `work.md.tmpl` must resolve to a real CLI command.
-   The fn-339 close had to repair a `planctl task block --category` call
-   inline; a parametrized `--help` smoke test would have caught it the moment
-   the template was authored.
+   A stale verb (e.g. a `planctl task block --category` call) slips past
+   review; a parametrized `--help` smoke test catches it the moment the
+   template is authored.
 
 2. **agentId regex** — Phase 3c of `work.md.tmpl` extracts the worker's
    `agentId:` from the Task tool result string with
@@ -154,17 +153,17 @@ def test_agentid_regex_requires_search_not_match():
 
 
 # ---------------------------------------------------------------------------
-# Group C — Tier-routed worker agents in the `plan` plugin (fn-10)
+# Group C — Tier-routed worker agents in the `plan` plugin
 # ---------------------------------------------------------------------------
 #
-# fn-10 inverts fn-593: the four worker agents move BACK into the planctl
-# `plan` plugin's own `agents/` directory, this time one file per tier
-# (`agents/worker-<tier>.md`), each addressable `plan:worker-<tier>`. The
-# `template/agents/worker.md.tmpl` drops its cross-boundary `render_to:`
-# (and `manifest_description:`) directive; promptctl's default agents branch
-# then emits `agents/<stem>-<variant>.md` per variant directly into the
-# always-loaded plugin's `agents/`. Keeper no longer passes `--plugin-dir`;
-# `claim` maps the task tier to a `worker_agent` name the skill spawns.
+# The four worker agents live in the planctl `plan` plugin's own `agents/`
+# directory, one file per tier (`agents/worker-<tier>.md`), each addressable
+# `plan:worker-<tier>`. The `template/agents/worker.md.tmpl` carries no
+# cross-boundary `render_to:` (or `manifest_description:`) directive;
+# promptctl's default agents branch emits `agents/<stem>-<variant>.md` per
+# variant directly into the always-loaded plugin's `agents/`. Keeper passes no
+# `--plugin-dir`; `claim` maps the task tier to a `worker_agent` name the skill
+# spawns.
 #
 # This group pins the new shape:
 #   - The per-tier `agents/worker-{medium,high,xhigh,max}.md` files MUST exist
@@ -209,11 +208,10 @@ def _read_frontmatter(path: Path) -> dict[str, str]:
 
 @pytest.mark.parametrize("tier", _TIERS)
 def test_tier_suffixed_worker_agent_rendered_in_plan_plugin(tier: str):
-    """fn-10 moved the worker agents back into the `plan` plugin's own
-    `agents/` directory, one file per tier (`agents/worker-<tier>.md`).
-    Dropping `render_to:` from `template/agents/worker.md.tmpl` makes
-    promptctl's default agents branch emit `agents/<stem>-<variant>.md` per
-    variant directly here.
+    """The worker agents live in the `plan` plugin's own `agents/` directory,
+    one file per tier (`agents/worker-<tier>.md`). With no `render_to:` on
+    `template/agents/worker.md.tmpl`, promptctl's default agents branch emits
+    `agents/<stem>-<variant>.md` per variant directly here.
 
     If this fails with "file not rendered," run
     `promptctl render-plugin-templates --project-root <planctl_root>` to
@@ -223,7 +221,7 @@ def test_tier_suffixed_worker_agent_rendered_in_plan_plugin(tier: str):
     assert path.exists(), (
         f"{path} not rendered — run "
         f"`promptctl render-plugin-templates --project-root <planctl_root>`. "
-        f"fn-10 emits the per-tier worker agents into the `plan` plugin's "
+        f"the per-tier worker agents render into the `plan` plugin's "
         f"`agents/` dir; the template must NOT carry a `render_to:` directive."
     )
     fm = _read_frontmatter(path)
@@ -248,17 +246,15 @@ def test_tier_suffixed_worker_agent_rendered_in_plan_plugin(tier: str):
 #           no `--plugin-dir`, no `model=` kwarg
 # ---------------------------------------------------------------------------
 #
-# fn-10 inverts fn-593: tier routing rides the emitted `worker_agent` name
-# (`plan:worker-<tier>`) on the claim / `worker resume` envelope, and the
-# four worker agents live in the always-loaded `plan` plugin. The skill is a
-# pure pass-through — both spawn sites set
-# `subagent_type="<worker_agent>"` (the envelope field, rendered as
-# `plan:worker-<tier>` in the template's substitution prose). Keeper no longer
-# pushes `--plugin-dir`, so the bare `work:worker` literal is gone everywhere.
+# Tier routing rides the emitted `worker_agent` name (`plan:worker-<tier>`) on
+# the claim / `worker resume` envelope, and the four worker agents live in the
+# always-loaded `plan` plugin. The skill is a pure pass-through — both spawn
+# sites set `subagent_type="<worker_agent>"` (the envelope field, rendered as
+# `plan:worker-<tier>` in the template's substitution prose). Keeper pushes no
+# `--plugin-dir`, so there is no bare `work:worker` literal anywhere.
 #
-# This group's polarity flipped vs the fn-593 shape: it now REQUIRES the
-# envelope-driven `plan:worker-<tier>` substitution and FORBIDS any bare
-# `work:worker` literal or `--plugin-dir` reference.
+# This group REQUIRES the envelope-driven `plan:worker-<tier>` substitution and
+# FORBIDS any bare `work:worker` literal or `--plugin-dir` reference.
 
 
 def _extract_task_call_blocks(text: str, subagent_needle: str) -> list[str]:
@@ -310,9 +306,8 @@ def test_work_skill_spawns_envelope_worker_agent_no_bare_literal():
     `worker_agent` — `subagent_type="<worker_agent>"` — never the bare
     `work:worker` literal and never an adjacent `model=` kwarg.
 
-    fn-10 moved tier routing onto the emitted `worker_agent`
-    (`plan:worker-<tier>`); the skill is a pure pass-through and keeper no
-    longer pushes `--plugin-dir`.
+    Tier routing rides the emitted `worker_agent` (`plan:worker-<tier>`); the
+    skill is a pure pass-through and keeper pushes no `--plugin-dir`.
     """
     tmpl = _TMPL_PATH.read_text()
     # The envelope-driven spawn substitution must appear at both sites.
@@ -320,19 +315,19 @@ def test_work_skill_spawns_envelope_worker_agent_no_bare_literal():
     assert len(spawn_blocks) >= 2, (
         "work.md.tmpl must carry an envelope-driven "
         '`subagent_type="<worker_agent>"` spawn at BOTH the warm (Phase 2a) '
-        "and cold-resume (Phase 2b) sites — fn-10 makes the skill a "
+        "and cold-resume (Phase 2b) sites — the skill is a "
         f"pass-through. Found {len(spawn_blocks)} such block(s)."
     )
-    # The bare `work:worker` literal must be gone everywhere — fn-10 retired it.
+    # The bare `work:worker` literal must not appear anywhere.
     assert "work:worker" not in tmpl, (
         "work.md.tmpl still references the bare `work:worker` literal — "
-        "fn-10 retired it. The skill spawns the envelope's `worker_agent` "
+        "it must not. The skill spawns the envelope's `worker_agent` "
         "(`plan:worker-<tier>`); the always-loaded `plan` plugin owns all "
         "four worker agents."
     )
     # Keeper drops `--plugin-dir`, so the skill must not mention it either.
     assert "plugin-dir" not in tmpl, (
-        "work.md.tmpl references `--plugin-dir` — fn-10 dropped the "
+        "work.md.tmpl references `--plugin-dir` — there is no "
         "launch-flag coupling; tier routing rides the emitted `worker_agent`."
     )
     # The skill must explain the substitution resolves to `plan:worker-<tier>`.
@@ -366,14 +361,13 @@ def test_work_skill_spawns_envelope_worker_agent_no_bare_literal():
 
 
 # ---------------------------------------------------------------------------
-# Group E — Input-shape contract (fn-474)
+# Group E — Input-shape contract
 # ---------------------------------------------------------------------------
 #
-# `/plan:work` accepts exactly one input shape: `fn-N-slug.M` (task id). The
-# fn-474 strip removed the dedicated bare-epic rejection branch and the
-# `/plan:plan` carve that contrasted task-input against epic-input. This
-# group pins the post-strip contract so the rejected shape can't creep back
-# via well-meaning future edits.
+# `/plan:work` accepts exactly one input shape: `fn-N-slug.M` (task id). There
+# is no dedicated bare-epic rejection branch and no `/plan:plan` carve that
+# contrasts task-input against epic-input. This group pins the contract so the
+# rejected shape can't creep back via well-meaning future edits.
 
 
 _WHEN_TO_INVOKE_RE: re.Pattern[str] = re.compile(
@@ -391,10 +385,9 @@ def test_when_to_invoke_names_only_task_shape():
     shape — `fn-N-slug.M` — and must not advertise a bare epic id (`fn-N-slug`
     not followed by `.M`) as an accepted alternative.
 
-    Pre-fn-474 prose used to mention bare epic ids as a *rejected* alternative
-    under "v0 accepts one input shape only"; fn-474 dropped that framing.
-    Any future edit that re-introduces a bare-epic discussion (accepted or
-    rejected) in this section is a contract drift.
+    The section names no bare-epic alternative (accepted or rejected). Any
+    future edit that re-introduces a bare-epic discussion in this section is a
+    contract drift.
     """
     tmpl = _TMPL_PATH.read_text()
     m = _WHEN_TO_INVOKE_RE.search(tmpl)
@@ -410,28 +403,28 @@ def test_when_to_invoke_names_only_task_shape():
     leftover = section.replace("fn-N-slug.M", "")
     assert _BARE_EPIC_PATTERN_LITERAL not in leftover, (
         "`## When to invoke` mentions a bare epic id shape (`fn-N-slug`) "
-        "outside the accepted `fn-N-slug.M` form. The fn-474 strip removed "
-        "epic-id framing from this section; do not re-introduce it. Section:"
+        "outside the accepted `fn-N-slug.M` form. There is no "
+        "epic-id framing in this section; do not re-introduce it. Section:"
         f"\n{section}"
     )
 
 
 def test_bare_epic_id_pattern_only_in_rejection_clause():
     """The bare-epic regex pattern (`^fn-\\d+(-[a-z0-9-]+)?$`) must not
-    appear anywhere in the template. fn-474 removed the dedicated bare-epic
-    rejection branch in Phase 1; the single catch-all rejection covers it
-    along with every other malformed input.
+    appear anywhere in the template. There is no dedicated bare-epic rejection
+    branch in Phase 1; the single catch-all rejection covers it along with
+    every other malformed input.
 
     Pinning the absence of this regex literal prevents a future edit from
     re-introducing a parallel bare-epic-only rejection branch (which would
     necessarily contrast with task-input and revive the stripped framing).
     """
     tmpl = _TMPL_PATH.read_text()
-    # The exact regex literal the pre-strip template used.
+    # The bare-epic regex literal that must not appear.
     bare_epic_regex = r"^fn-\d+(-[a-z0-9-]+)?$"
     assert bare_epic_regex not in tmpl, (
         "work.md.tmpl re-introduces the bare-epic regex literal "
-        f"(`{bare_epic_regex}`) — the fn-474 strip removed this dedicated "
+        f"(`{bare_epic_regex}`) — there is no dedicated bare-epic "
         "rejection branch; a single catch-all rejection covers bare epic ids "
         "along with every other malformed input."
     )

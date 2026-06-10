@@ -374,7 +374,7 @@ class TestDepEpicsRuntimeCompleteOnClose:
 
 
 class TestDepEpicsCrossProjectFallback:
-    """fn-600 task .2: dep_epic_by_id supplies the cross-project fallback."""
+    """dep_epic_by_id supplies the cross-project fallback."""
 
     def test_cross_project_resolved_done_returns_true(self):
         dep_epic = _make_epic("fn-1-dep", status="done")

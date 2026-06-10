@@ -1,4 +1,4 @@
-"""Tests for `planctl.sketch_refs.inline_sketch_refs_batch` (fn-628).
+"""Tests for `planctl.sketch_refs.inline_sketch_refs_batch`.
 
 The helper shells `promptctl inline-sketch-refs`, parses the per-slot JSON
 array, and maps each slot to either a `_OkSlot` or a `SketchRefError`.
@@ -394,7 +394,7 @@ def test_malformed_success_envelope_raises_tooling_error(
 
 
 def test_no_promptctl_or_cli_common_imports_remain_in_planctl() -> None:
-    """Locks the fn-628 acceptance criterion in code.
+    """Locks the no-promptctl/no-cli_common-import criterion in code.
 
     `grep -rn "from promptctl\\|from cli_common" apps/planctl/planctl` must
     return nothing. Anyone re-introducing an import has to update this test

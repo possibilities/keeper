@@ -1,4 +1,4 @@
-"""Tests for the fn-513 spec-metadata setter verbs.
+"""Tests for the spec-metadata setter verbs.
 
 Verbs under test:
 - planctl task set-snippets <task_id> --snippets a,b,c
@@ -222,7 +222,7 @@ def test_task_set_snippets_emits_invocation(tmp_path):
 def test_task_set_bundles_success(tmp_path):
     _, (task_id,) = _seed(tmp_path)
 
-    # fn-610: ``sketch/`` refs now resolve at write time and inline their
+    # ``sketch/`` refs resolve at write time and inline their
     # snippet ids into the persisted ``snippets``; the ref is dropped from
     # ``bundles``. Test only the ``bundle/`` passthrough here (which hits the
     # sketch-free fast path and needs no ``mock_sketch_refs``); the
@@ -284,8 +284,8 @@ def test_task_set_bundles_rejects_path_traversal(tmp_path):
         "bundle/a/b/c",
         "/abs/path",
         "bundle/UPPER",
-        # fn-654: the legacy "arc" namespace is retired — refs that once
-        # matched it are now rejected outright (guards against re-add).
+        # The legacy "arc" namespace is retired — such refs are rejected
+        # outright (guards against re-add).
         "arc/foo/bar",
         "arc/snippeting/main",
     ]:

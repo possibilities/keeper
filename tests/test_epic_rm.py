@@ -1,4 +1,4 @@
-"""Tests for `planctl epic rm` (fn-623 task .1).
+"""Tests for `planctl epic rm`.
 
 Companion to test_epic_close.py: where `close` only stamps `closer_done_at`,
 `rm` physically unlinks every artifact and auto-commits the deletions.
@@ -493,10 +493,8 @@ def test_rm_registered_in_verb_templates():
 
 def test_rm_missing_session_id_routes_through_seam(planctl_git_repo, monkeypatch):
     """CLAUDE_CODE_SESSION_ID unset → invocation-build raises from
-    inside the seam (fn-629 task .2). The rm verb has nothing to unwind (delete-only), but the
-    raise surfaces and the verb fails — the previous direct
-    build_planctl_invocation call had the same behavior, but it ran outside
-    the seam. Generalised consistency check.
+    inside the seam. The rm verb has nothing to unwind (delete-only), but the
+    raise surfaces and the verb fails. Generalised consistency check.
     """
     monkeypatch.chdir(planctl_git_repo)
     epic_id, _ = seed_epic(planctl_git_repo, n_tasks=1)
@@ -514,7 +512,7 @@ def test_rm_missing_session_id_routes_through_seam(planctl_git_repo, monkeypatch
 
 
 def test_rm_commit_failure_emits_structured_envelope(planctl_git_repo, monkeypatch):
-    """fn-629 task .2: a CommitFailed from auto_commit_from_invocation
+    """A CommitFailed from auto_commit_from_invocation
     yields the structured ``commit_failed`` envelope (NOT a success envelope),
     matching the existing emit() failure contract. The deletes already
     happened on disk pre-commit — §10 no-rollback applies (no re-create).
@@ -542,9 +540,8 @@ def test_rm_commit_failure_emits_structured_envelope(planctl_git_repo, monkeypat
 
 @pytest.mark.real_git
 def test_rm_no_lock_nesting(planctl_git_repo, monkeypatch):
-    """fn-629 task .2 acceptance (fn-640 retune): epic rm doesn't take the
-    ``_epic_id_lock`` at all (it's a delete verb, no id allocation). Since
-    fn-640 deleted the commit flock, we spy the surviving commit seam
+    """epic rm doesn't take the ``_epic_id_lock`` at all (it's a delete verb,
+    no id allocation). There is no commit flock, so we spy the commit seam
     (``_git_commit``) to prove the auto-commit fires and no spurious id-lock
     acquisition leaks into the rm path.
     """

@@ -1,17 +1,16 @@
-"""Tests for fn-610 cross-project sketch inlining at planctl write time.
+"""Tests for cross-project sketch inlining at planctl write time.
 
-The bug being fixed: ``sketch/<name>`` bundle refs used to resolve at
-render-spec time against the worker's cwd project, but sketches are
-authored in a different project's gitignored ``.promptctl/sketches/`` —
-so an epic created in project B from a sketch authored in project A
-carried a ref no worker could resolve, and ``render-spec`` hard-killed
-the worker at startup.
+Sketches are authored in a project's gitignored ``.promptctl/sketches/``.
+A ``sketch/<name>`` bundle ref must inline at planctl write time, not resolve
+at render-spec time against the worker's cwd project — otherwise an epic
+created in project B from a sketch authored in project A carries a ref no
+worker can resolve, and ``render-spec`` hard-kills the worker at startup.
 
 This test file proves the four planctl write paths
 (``scaffold`` / ``refine-apply`` / ``epic set-bundles`` /
 ``task set-bundles``) inline ``sketch/<name>`` refs at write time
 against the cwd-derived project (where ``/sketch`` saved the sketch) —
-NOT the epic's ``primary_repo`` (the fn-608 trap). After write the
+NOT the epic's ``primary_repo`` (the cross-project trap). After write the
 persisted record carries the inlined ids in ``snippets`` and zero
 residual ``sketch/`` refs in ``bundles``, so worker-time
 ``render-spec`` never re-resolves them.
@@ -71,7 +70,7 @@ def two_projects(tmp_path, monkeypatch):
     Yields ``(root, proj_a, proj_b)`` where both are git-initialised
     planctl projects. The cwd lands in project B so we can author a
     sketch in A and write the planctl record from B — exercising the
-    cross-project anchor that fn-610 fixes.
+    cross-project anchor that write-time inlining handles.
     """
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-cross-sketch-fixture")
 
@@ -163,14 +162,14 @@ def _read_json(path: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# CRITICAL: cwd is project B, sketch lives in project A. The fn-608 trap was
+# CRITICAL: cwd is project B, sketch lives in project A. The trap is
 # anchoring on the epic's primary_repo (B) instead of the cwd where /sketch
 # saved the sketch (B's own cwd at sketch time — here we model the workflow
 # where the human authored the sketch in A then chdir'd to B). Test the
 # write-from-B path uses B's cwd as the anchor; for that, the sketch must
 # live in B (project_path == cwd). The cross-project shape this guards is
 # the wrong shape: sketch in A, scaffold from B with B's cwd. The correct
-# fn-610 anchor is B (cwd), so the sketch in A is unresolvable — which is
+# anchor is B (cwd), so the sketch in A is unresolvable — which is
 # the failure mode the resolver must detect. Both shapes are tested below.
 # ---------------------------------------------------------------------------
 
@@ -222,7 +221,7 @@ tasks:
 def test_scaffold_sketch_in_foreign_project_unresolvable(two_projects):
     """Sketch in project A (not cwd) → ref_invalid; no writes land.
 
-    This is the fn-608 failure mode rewritten as a write-time gate:
+    This is the cross-project failure mode expressed as a write-time gate:
     anchoring on cwd (B) means an A-only sketch is unresolvable, and we
     fail loud at write rather than silently persisting a poisoned ref.
     """
@@ -534,7 +533,7 @@ def test_task_set_bundles_empty_sketch_drops_ref(two_projects):
 
 
 # ---------------------------------------------------------------------------
-# fn-616 audit follow-ups: collect-all error aggregation + bypass invariant
+# Audit follow-ups: collect-all error aggregation + bypass invariant
 # ---------------------------------------------------------------------------
 
 

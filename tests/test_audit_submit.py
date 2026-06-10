@@ -1,4 +1,4 @@
-"""Tests for `planctl audit submit <epic_id>` (fn-12 task .2).
+"""Tests for `planctl audit submit <epic_id>`.
 
 The audit-submit verb persists the content-blind quality-auditor's report
 markdown commit-free under `audits/<epic_id>/report.md` (plus a `report.meta.json`

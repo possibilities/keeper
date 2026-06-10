@@ -54,7 +54,7 @@ def test_snippet_id_re_accepts_kebab_case(snippet_id: str) -> None:
 # ---------------------------------------------------------------------------
 # BUNDLE_REF_RE shape — the two valid namespaces are ``bundle/`` and
 # ``sketch/``.  Any other namespace prefix (including the legacy ``arc``
-# namespace, fn-654) is rejected outright; the rejection cases below guard
+# namespace) is rejected outright; the rejection cases below guard
 # against an accidental re-add.
 # ---------------------------------------------------------------------------
 
@@ -62,7 +62,7 @@ def test_snippet_id_re_accepts_kebab_case(snippet_id: str) -> None:
 @pytest.mark.parametrize(
     "ref",
     [
-        # fn-654: the legacy "arc" namespace is no longer valid. Guards re-add.
+        # The legacy "arc" namespace is not valid. Guards re-add.
         "arc/foo/bar",
         "arc/snippeting/main",
         "arc/foo/../etc",

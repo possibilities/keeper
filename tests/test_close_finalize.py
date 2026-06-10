@@ -1,4 +1,4 @@
-"""Tests for `planctl close-finalize <epic_id>` (fn-12 task .3).
+"""Tests for `planctl close-finalize <epic_id>`.
 
 `close-finalize` encodes the /plan:close saga in Python, deriving its position
 purely from observable state (the persisted audit artifacts + the epic's own
@@ -288,18 +288,19 @@ def test_closed_with_followup_scaffolds_and_closes(planctl_git_repo):
         )
     )
     assert epic_id in new_def.get("depends_on_epics", [])
-    # fn-15: the minted follow-up carries the positive close-provenance stamp,
+    # The minted follow-up carries the positive close-provenance stamp,
     # written in the same atomic write as the rest of the epic.
     assert new_def.get("created_by_close_of") == epic_id
 
 
 def test_preexisting_dependent_without_stamp_ignored(planctl_git_repo):
-    """fn-13 regression: an unrelated open dependent (dep edge, no stamp, wrong
+    """Regression: an unrelated open dependent (dep edge, no stamp, wrong
     task count) is NOT adopted as the audit follow-up.
 
-    The fn-12/fn-13 incident: ``_find_followup_epic`` matched any open epic whose
-    ``depends_on_epics`` contained the source, falsely adopting human-planned
-    dependents and wedging the close in perpetual ``partial_followup``. With
+    Without positive provenance, ``_find_followup_epic`` would match any open
+    epic whose ``depends_on_epics`` contained the source, falsely adopting
+    human-planned dependents and wedging the close in perpetual
+    ``partial_followup``. With
     positive provenance, an open dependent lacking the ``created_by_close_of``
     stamp is invisible — finalize ignores it, scaffolds the REAL follow-up, and
     closes the source ``closed_with_followup`` with the freshly-minted id.

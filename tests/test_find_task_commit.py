@@ -1,4 +1,4 @@
-"""Tests for the read-only `planctl find-task-commit <task_id>` verb (fn-9 task .1).
+"""Tests for the read-only `planctl find-task-commit <task_id>` verb.
 
 The verb wraps the shared `planctl.commit_lookup.find_commit_groups` native
 trailer scan and emits the flat, keeper-compatible envelope the worker's

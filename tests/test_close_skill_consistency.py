@@ -3,11 +3,11 @@
 `skills/close/SKILL.md` is tracked source — a thin, content-blind coordinator
 for the epic-close phase (it is NOT template-generated; do not look for a
 `close.md.tmpl`). This module mirrors `test_work_skill_consistency.py` to guard
-the skill against the regressions that bit fn-339 / fn-341 and to pin the
+the skill against verb-drift and stale-agentId regressions and to pin the
 coordinator's load-bearing process contracts:
 
 1. **Verb existence** — every `planctl <verb>` invocation inside a fenced bash
-   block must resolve to a real CLI command (the fn-339 guard). The close skill
+   block must resolve to a real CLI command (the verb-existence guard). The close skill
    uses `--file -` heredoc verbs (`audit submit` / `verdict submit` /
    `followup submit`); the extractor pulls only the verb path and the test
    invokes `<verb> --help`, so the heredoc body is never executed.
@@ -112,7 +112,7 @@ def test_close_skill_name_is_bare_close():
 
 
 # ---------------------------------------------------------------------------
-# Group A — Verb existence (fn-339 guard)
+# Group A — Verb existence guard
 # ---------------------------------------------------------------------------
 
 
@@ -180,7 +180,7 @@ def test_extracted_verbs_nonempty():
 def test_close_skill_planctl_verbs_have_help(verb_parts: tuple[str, ...]):
     """Every `planctl <verb>` referenced in a fenced bash block of the close
     skill must respond to `--help` with exit code 0 — i.e. it exists in the
-    CLI surface. Mirrors the fn-339 / fn-341 guard.
+    CLI surface. Mirrors the verb-existence / agentId-regex guard.
 
     ``--help`` short-circuits the command body, so the heredoc-fed `--file -`
     submit verbs are validated for existence without ever reading stdin.
@@ -291,7 +291,7 @@ def test_close_skill_spawns_are_blind_no_model_kwarg():
     # Keeper launches /plan:close against the globally-loaded `plan` plugin
     # with no --plugin-dir, so both agents resolve ONLY under their namespaced
     # ids. A bare `subagent_type="quality-auditor"` wedges autopilot in a
-    # re-dispatch loop (fn-12 regression). Mirror work's `plan:worker-<tier>`.
+    # re-dispatch loop. Mirror work's `plan:worker-<tier>`.
     for kind in ("quality-auditor", "close-planner"):
         assert f'subagent_type="plan:{kind}"' in text, (
             f"close/SKILL.md must spawn `{kind}` under its namespaced id "
@@ -312,7 +312,7 @@ def test_close_skill_spawns_are_blind_no_model_kwarg():
 
 def test_close_skill_switch_is_total_over_close_outcome():
     """The skill's finalize switch must name every CloseOutcome member, and the
-    set must equal the live `CloseOutcome` enum (total switch — the fn-12 task-3
+    set must equal the live `CloseOutcome` enum (total switch — the
     exhaustiveness contract). If an outcome is added to the enum, this test
     fails until the skill grows the matching arm.
     """

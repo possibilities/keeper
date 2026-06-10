@@ -289,8 +289,8 @@ def project(request, tmp_path, monkeypatch):
     finds a non-None value (planctl mutating verbs fail closed when the env
     is unset — there is no fallback).
 
-    fn-587 task .3: ``scaffold`` (used by many tests via ``seed_epic``) now
-    runs the shared integrity check at mint time, which asserts the resolved
+    ``scaffold`` (used by many tests via ``seed_epic``) runs the shared
+    integrity check at mint time, which asserts the resolved
     ``primary_repo`` / ``touched_repos`` / per-task ``target_repo`` paths point
     at real ``.git/``-bearing directories. Repo detection needs only that
     ``.git/`` *exists*, and the fast bucket no-ops every real git verb, so this
@@ -491,8 +491,8 @@ def _first_json_payload(output: str) -> dict:
 def _task_spec(marker: str = "seed") -> str:
     """A minimal four-section task spec carrying a marker in its Description.
 
-    Used by the scaffold-based seed helpers below — `task create` was removed
-    in fn-565, so tests mint epics + tasks transactionally via `scaffold`.
+    Used by the scaffold-based seed helpers below — there is no incremental
+    `task create` verb, so tests mint epics + tasks transactionally via `scaffold`.
     """
     return (
         f"## Description\n{marker}\n\n## Acceptance\n- [ ] x\n\n"
@@ -521,7 +521,7 @@ def _scaffold_plan_yaml(
         )
         deps = task_deps.get(i)
         dep_line = f"    deps: {deps}\n" if deps else ""
-        # fn-594: tier is required on every task entry in scaffold YAML.
+        # tier is required on every task entry in scaffold YAML.
         # Tests don't exercise per-tier routing, so a deliberate "medium"
         # default suffices.
         blocks.append(
@@ -547,10 +547,9 @@ def seed_epic(
 ) -> tuple[str, list[str]]:
     """Scaffold an epic + N tasks via the CLI, returning ``(epic_id, task_ids)``.
 
-    The single transactional `scaffold` call replaces the per-verb
-    `epic create` -> `task create` -> `set-deps` fixture loop the removed
-    incremental verbs used to drive (fn-565). ``task_ids`` are the ordered
-    ``<epic_id>.M`` ids scaffold allocated.
+    A single transactional `scaffold` call mints the whole epic + task tree
+    (there are no incremental `epic create` / `task create` / `set-deps`
+    verbs). ``task_ids`` are the ordered ``<epic_id>.M`` ids scaffold allocated.
     """
     yaml = _scaffold_plan_yaml(
         title=title, n_tasks=n_tasks, branch=branch, task_deps=task_deps
@@ -818,12 +817,12 @@ def add_task(
 ) -> str:
     """Add one task to an existing epic via `refine-apply`, returning its id.
 
-    fn-565: the incremental `task create` verb is gone — `refine-apply`'s
+    There is no incremental `task create` verb — `refine-apply`'s
     `add_tasks:` is the surface for growing an existing epic in tests.
     """
     spec_lines = "\n".join("      " + ln for ln in _task_spec("added").splitlines())
     deps_line = f"    deps: {deps}\n" if deps else ""
-    # fn-594: tier is required on every add_tasks entry in refine-apply YAML.
+    # tier is required on every add_tasks entry in refine-apply YAML.
     delta = (
         f"add_tasks:\n  - title: {title}\n{deps_line}"
         f"    tier: medium\n    spec: |\n{spec_lines}\n"
@@ -918,10 +917,8 @@ def _git_files_in_head(repo: Path) -> list[str]:
 
 
 # ---------------------------------------------------------------------------
-# fn-587 task .1: salvaged from the (now-deleted) tests/test_commit_plan.py.
-# Down-stream tests in test_commit.py + the migrated auto-commit tests use
-# these via the conftest import path.  Names kept verbatim from the original
-# call sites so the salvage was a literal rename, not a behavioural rewrite.
+# Shared commit-helper fixtures. test_commit.py + the auto-commit tests use
+# these via the conftest import path.
 # ---------------------------------------------------------------------------
 
 

@@ -1,4 +1,4 @@
-"""Tests for planctl reconcile — read-only post-worker verdict (fn-6 task .1).
+"""Tests for planctl reconcile — read-only post-worker verdict.
 
 Coverage:
 - One case per verdict (seed the matching state + git history):
