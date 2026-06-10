@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Audit artifacts module and preflight rewrite",
-  "updated_at": "2026-06-10T03:06:56.932451Z"
+  "updated_at": "2026-06-10T05:11:27.409767Z",
+  "worker_done_at": "2026-06-10T05:11:27.409767Z"
 }

@@ -34,5 +34,5 @@ test_audit_artifacts: hash determinism/order-independence, schema-version field 
 - [ ] `uv run pytest tests/test_audit_artifacts.py tests/test_close_preflight.py -q` green
 
 ## Done summary
-
+Added planctl/audit_artifacts.py (path helpers, AUDIT_SCHEMA_VERSION, order-independent compute_commit_set_hash, commit-free atomic writer) and rewrote close-preflight to assemble+persist audits/<epic>/brief.json, returning a content-blind {brief_ref, commit_set_hash, primary_repo, all_done, tasks} envelope with TASKS_NOT_DONE + parent-epic id branching. Full test coverage in tests/test_audit_artifacts.py and rewritten tests/test_close_preflight.py.
 ## Evidence
