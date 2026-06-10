@@ -1,10 +1,8 @@
 """Close-phase verdict schema + reject-envelope builder for the submit verbs.
 
-The fn-12 crush replaces the old 8-field ``Finding`` schema (four tier arrays,
-``skills/close/classifier/schema.json``) with one small in-package verdict
-schema the close-planner emits and ``planctl verdict submit`` validates at
-emission. The verdict is the structured record of what the audit decided per
-finding:
+The close-planner emits this verdict and ``planctl verdict submit`` validates
+it at emission. The verdict is the structured record of what the audit decided
+per finding:
 
     {
       "fatal": bool,

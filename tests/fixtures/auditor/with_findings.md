@@ -14,7 +14,7 @@ None.
 
 ## Consider
 
-**missing-test-coverage** — `apps/planctl/planctl/models.py` — normalize_epic has no test for the case where the input dict has unknown keys. A test covering this edge case would increase confidence.
+**broaden-key-filter** — `apps/planctl/planctl/models.py:88` — normalize_epic silently drops unknown input keys; raise on unexpected keys (or log them) so typos in epic JSON surface instead of vanishing.
 
 ## Test Gaps
 

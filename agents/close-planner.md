@@ -105,6 +105,7 @@ Invariants the verb enforces at emission — hold to them so you don't waste a s
 - `fatal: true` requires a non-empty `fatal_reason`; `fatal: false` pairs with `fatal_reason: ""`.
 - The set of distinct non-null `task` ordinals = the number of follow-up tasks you author in Phase 5. The follow-up submit cross-checks this — keep them aligned.
 - Use ASCII structural punctuation inside the JSON (`,` `:` `"`). Em dashes inside string values are fine.
+- Emit the JSON pretty-printed (indent=2 multi-line), matching the example block above exactly — one key per line, nested objects indented. The submit verb parses the indented shape identically.
 
 Pipe it via a quoted heredoc:
 
