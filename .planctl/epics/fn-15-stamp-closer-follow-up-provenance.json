@@ -1,0 +1,17 @@
+{
+  "branch_name": "fn-15-stamp-closer-follow-up-provenance",
+  "bundles": [],
+  "created_at": "2026-06-10T14:04:07.611789Z",
+  "depends_on_epics": [],
+  "id": "fn-15-stamp-closer-follow-up-provenance",
+  "last_validated_at": "2026-06-10T14:04:07.729659Z",
+  "primary_repo": "/Users/mike/code/planctl",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Stamp closer follow-up provenance",
+  "touched_repos": [
+    "/Users/mike/code/planctl"
+  ],
+  "updated_at": "2026-06-10T14:04:07.611789Z"
+}
