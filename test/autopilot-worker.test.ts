@@ -46,6 +46,7 @@ import {
   FINALIZER_GUARD_S,
   type FoundJob,
   isCompletionReapCandidate,
+  isEpicInFlight,
   isFinalizerGuarded,
   isFinalizerVerb,
   isInCooldown,
@@ -2758,9 +2759,12 @@ test("reconcile armed: non-eligible epic does NOT decrement budget", () => {
   expect(workIds).toEqual(["fn-2-b.1"]);
 });
 
-test("reconcile armed: close fires for a disarmed-but-in-flight epic", () => {
+test("fn-773 armed: close fires for a disarmed-but-in-flight epic (live work surface)", () => {
   // All tasks completed + epic not yet done → close-row is ready and maps to
-  // `close`, a mode-exempt finalizer. A non-eligible epic still gets closed.
+  // `close`. The epic is NOT armed (not eligible), but it is IN-FLIGHT: a live
+  // `work::<task>` surface (the just-finished worker's tab) is still in the
+  // session. `isEpicInFlight` sees that signal, so the close still fires — a
+  // disarmed-mid-flight epic finishes cleanly.
   const completedTask = makeTask({
     task_id: "fn-5-disarmed.1",
     epic_id: "fn-5-disarmed",
@@ -2776,11 +2780,139 @@ test("reconcile armed: close fires for a disarmed-but-in-flight epic", () => {
     epics: [epic],
     mode: "armed",
     armedIds: new Set(), // not eligible
+    // The just-completed task worker's surface is still live → in-flight.
+    liveTabKeys: new Set(["work::fn-5-disarmed.1"]),
   });
   const decision = reconcile(snap, makeState(), 0);
   const closePlan = decision.launches.find((p) => p.verb === "close");
   expect(closePlan).not.toBeUndefined();
   expect(closePlan?.id).toBe("fn-5-disarmed");
+});
+
+test("fn-773 armed: close fires for a disarmed-but-in-flight epic (occupying work job)", () => {
+  // Same disarmed close-ready epic, in-flight via an OCCUPYING `work::<task>`
+  // job (the worker reached `working`/`stopped` but its tab probe is empty).
+  // The job-signal arm of `isEpicInFlight` keeps the close firing.
+  const completedTask = makeTask({
+    task_id: "fn-5-disarmed.1",
+    epic_id: "fn-5-disarmed",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic = makeEpic({
+    epic_id: "fn-5-disarmed",
+    resolved_epic_deps: [],
+    tasks: [completedTask],
+  });
+  const snap = makeSnapshot({
+    epics: [epic],
+    mode: "armed",
+    armedIds: new Set(),
+    jobs: new Map([
+      [
+        "j-work",
+        makeJob({
+          job_id: "j-work",
+          state: "working",
+          plan_verb: "work",
+          plan_ref: "fn-5-disarmed.1",
+        }),
+      ],
+    ]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const closePlan = decision.launches.find((p) => p.verb === "close");
+  expect(closePlan).not.toBeUndefined();
+  expect(closePlan?.id).toBe("fn-5-disarmed");
+});
+
+test("fn-773 armed: close fires for an epic in the armed dep-closure", () => {
+  // The epic itself is armed (in `eligible`) even with NO live job/surface —
+  // the closure-membership arm authorizes its close. Proves the eligible-set
+  // signal is independent of the in-flight signals.
+  const epic = readyCloseEpic("fn-5-armed", "/repo");
+  const snap = makeSnapshot({
+    epics: [epic],
+    mode: "armed",
+    armedIds: new Set(["fn-5-armed"]),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const closePlan = decision.launches.find((p) => p.verb === "close");
+  expect(closePlan?.id).toBe("fn-5-armed");
+});
+
+test("fn-773 armed: a cold close-candidate (never armed, no live job/surface) is suppressed", () => {
+  // THE FIX. A close-ready epic that autopilot never touched — not armed, not
+  // in any armed epic's dep-closure, no occupying job, no live surface — must
+  // NOT get a `close::` dispatch in armed mode (pre-fn-773 the unconditional
+  // close exemption burned repeated closers on exactly this row).
+  const epic = readyCloseEpic("fn-12-cold", "/repo");
+  const snap = makeSnapshot({
+    epics: [epic],
+    mode: "armed",
+    armedIds: new Set(), // never armed, no closure membership
+    // No jobs, no liveTabKeys → cold.
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.find((p) => p.verb === "close")).toBeUndefined();
+});
+
+test("fn-773 yolo: a cold close-candidate still closes (gate is armed-only)", () => {
+  // Byte-for-byte yolo: `eligible` is `undefined`, `armedMode === false`, so
+  // the fn-773 arm short-circuits and the same cold epic closes as before.
+  const epic = readyCloseEpic("fn-12-cold", "/repo");
+  const snap = makeSnapshot({
+    epics: [epic],
+    mode: "yolo",
+    armedIds: new Set(),
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  const closePlan = decision.launches.find((p) => p.verb === "close");
+  expect(closePlan?.id).toBe("fn-12-cold");
+});
+
+test("fn-773 isEpicInFlight: each in-flight signal flips it true; a cold epic is false", () => {
+  const epic = readyCloseEpic("fn-1-foo", "/repo"); // single task fn-1-foo.1
+  const noJobs = new Map<string, Job>();
+  const noTabs = new Set<string>();
+
+  // Cold — no signal.
+  expect(isEpicInFlight(epic, noJobs, noTabs)).toBe(false);
+
+  // Occupying close job.
+  const closeJob = new Map([
+    [
+      "j-c",
+      makeJob({ state: "working", plan_verb: "close", plan_ref: "fn-1-foo" }),
+    ],
+  ]);
+  expect(isEpicInFlight(epic, closeJob, noTabs)).toBe(true);
+
+  // Occupying work job on a task.
+  const workJob = new Map([
+    [
+      "j-w",
+      makeJob({
+        state: "stopped",
+        plan_verb: "work",
+        plan_ref: "fn-1-foo.1",
+      }),
+    ],
+  ]);
+  expect(isEpicInFlight(epic, workJob, noTabs)).toBe(true);
+
+  // Live close surface.
+  expect(isEpicInFlight(epic, noJobs, new Set(["close::fn-1-foo"]))).toBe(true);
+
+  // Live work surface on a task.
+  expect(isEpicInFlight(epic, noJobs, new Set(["work::fn-1-foo.1"]))).toBe(
+    true,
+  );
+
+  // A job/surface for a DIFFERENT epic's task does not flip it.
+  expect(isEpicInFlight(epic, noJobs, new Set(["work::fn-2-bar.1"]))).toBe(
+    false,
+  );
 });
 
 test("fn-770: armed epic on a SHARED root beats an earlier-sorted unarmed sibling and dispatches", () => {

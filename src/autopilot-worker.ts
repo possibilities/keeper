@@ -1050,6 +1050,50 @@ export function isOccupyingJob(
 }
 
 /**
+ * fn-773 — is an epic IN-FLIGHT, i.e. did autopilot already touch it (a live
+ * worker, a live surface) so its `close` finalizer must still run even after a
+ * mid-flight disarm?
+ *
+ * `true` IFF ANY of the close-row's in-flight signals holds:
+ *   - an OCCUPYING `close::<epic>` job (the closer is already running), or an
+ *     occupying `work::<task>` job on ANY of the epic's tasks (a task worker is
+ *     mid-flight and will leave a close-ready row behind);
+ *   - a live `close::<epic>` surface OR a live `work::<task>` surface in
+ *     `liveTabKeys` (the launch → SessionStart blind window — a worker is
+ *     occupying the slot before its jobs row binds).
+ *
+ * This is the disarmed-mid-flight finish signal, ORTHOGONAL to armed
+ * dep-closure membership (`eligible.has(epic_id)`, checked separately at the
+ * close-dispatch gate). A COLD candidate — an epic autopilot never launched a
+ * worker into and that isn't in the armed closure — has none of these and is
+ * suppressed in `armed` mode.
+ *
+ * Pure — reads the passed `jobs` / `liveTabKeys` snapshot fields only, never
+ * the backend, wall-clock, or filesystem.
+ */
+export function isEpicInFlight(
+  epic: Epic,
+  jobs: Map<string, Job>,
+  liveTabKeys: Set<DispatchKey>,
+): boolean {
+  if (
+    isOccupyingJob(jobs, "close", epic.epic_id) ||
+    liveTabKeys.has(dispatchKey("close", epic.epic_id))
+  ) {
+    return true;
+  }
+  for (const task of epic.tasks) {
+    if (
+      isOccupyingJob(jobs, "work", task.task_id) ||
+      liveTabKeys.has(dispatchKey("work", task.task_id))
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * The pure reconcile decision. Walks every epic / task / close-row,
  * computes the verb each verdict wants, and emits a `PlannedLaunch`
  * IFF none of the five suppression rules fires:
@@ -1099,10 +1143,16 @@ export function reconcile(
   // An empty set (armed-but-nothing-armed) is still PROVIDED (not `undefined`),
   // so the two-pass mutex suppresses every task row.
   //
-  // WORK-ONLY: the gate gates `work` launches alone. `approve` / `close`
-  // finalizers and completion-reap stay mode-exempt (mirroring how `approve`
-  // is already budget-exempt) so disarming an epic mid-flight still finishes
-  // and reaps cleanly rather than orphaning a live worker or leaking surfaces.
+  // WORK-GATE + NARROWED CLOSE-GATE: this `eligible` set gates `work` launches
+  // (the per-row arm below) AND — fn-773 — narrows `close` launches. Completion
+  // -reap and the fn-770 per-root mutex layer stay fully mode-exempt. A `close`
+  // dispatch in armed mode is eligible iff the epic is in the closure
+  // (`eligible.has`) OR in-flight (`isEpicInFlight` — a live close/work job or
+  // surface), so a disarmed-MID-FLIGHT epic still finishes and reaps cleanly
+  // rather than orphaning a live worker or leaking surfaces, while a COLD
+  // close-candidate autopilot never touched and never armed is suppressed
+  // instead of burning repeated closers (the pre-fn-773 unconditional close
+  // exemption did the latter).
   const armedMode = snapshot.mode === "armed";
   const eligible: Set<string> | undefined = armedMode
     ? computeEligibleEpics(
@@ -1292,6 +1342,25 @@ export function reconcile(
         !(
           isFinalizerVerb(closeVerb) &&
           isFinalizerGuarded(state.finalizerGuard, epicId, now)
+        ) &&
+        // fn-773 — narrowed armed-mode close gate. In `armed` mode a close
+        // dispatch is eligible ONLY for an epic that is in-flight or chosen:
+        // a member of the armed dep-closure (`eligible.has(epicId)`) OR
+        // in-flight by any of its close-row signals (`isEpicInFlight` — a live
+        // close/work job or a live close/work surface). A COLD candidate
+        // autopilot never touched and never armed is suppressed, so an unarmed
+        // close-ready sibling no longer burns repeated closers (2026-06-10:
+        // unarmed planctl fn-12). A disarmed-MID-FLIGHT epic still finishes
+        // because one of those signals still holds. No-op in `yolo`
+        // (`armedMode === false`). Placed ABOVE the budget gate so a suppressed
+        // close never consumes `max_concurrent_jobs` budget (mirrors the
+        // work-gate's above-budget placement). The fn-770 per-root mutex layer
+        // and the completion-reap path stay mode-EXEMPT — this is the ONLY
+        // close-dispatch narrowing.
+        !(
+          armedMode &&
+          !eligible?.has(epicId) &&
+          !isEpicInFlight(epic, snapshot.jobs, snapshot.liveTabKeys)
         ) &&
         // fn-725 cap — the close-row push shares the SAME decrementing
         // budget as the task push above, so a closer can't blow the cap.

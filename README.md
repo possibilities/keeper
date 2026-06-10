@@ -1666,11 +1666,19 @@ ABSENT (`undefined`) in yolo — byte-identical legacy single-pass — and PROVI
 (even empty: armed-but-nothing-armed) in armed mode; the discriminator is
 `!== undefined`, never `.size === 0`. Pass-1 physical occupancy (live workers +
 launch-window fallback roots) stays eligibility-blind so an eligible task never
-preempts a live worker, and close rows stay always-eligible (mode-exempt) so a
-finalizer is never starved by the mutex. The `work`-gate is RETAINED — a pass-2b
-ineligible task can still win a root with no eligible contender and surface
-`ready`, and the gate is the only thing that stops that ineligible winner from
-launching. Both folds
+preempts a live worker, and close rows stay always-eligible IN THE MUTEX
+(mode-exempt) so a finalizer is never starved by the per-root tiebreak. The
+`work`-gate is RETAINED — a pass-2b ineligible task can still win a root with no
+eligible contender and surface `ready`, and the gate is the only thing that
+stops that ineligible winner from launching. fn-773 ADDS a narrowed
+armed-mode CLOSE-DISPATCH gate at the same reconcile site (the mutex layer above
+stays untouched): in armed mode a `close::` launch fires iff the epic is in the
+armed dep-closure (`eligible.has`) OR in-flight (`isEpicInFlight`: a live
+`close::<epic>`/`work::<task>` job or surface), so a disarmed-MID-FLIGHT epic
+still finishes, closes, and reaps while a COLD close-candidate autopilot never
+touched and never armed is suppressed instead of burning repeated closers
+(2026-06-10: an unarmed epic burned closers while only a sibling was armed).
+Completion-reap stays fully mode-exempt. Both folds
 are re-fold-deterministic (no `Date.now`, no env reads — `created_at` /
 `updated_at` both derive from `event.ts`; a malformed / unknown-enum payload
 folds to a safe no-op with the cursor still advancing), and both projection

@@ -244,9 +244,14 @@ trailing-optional `eligibleEpicIds?: Set<string>` — ABSENT in yolo (no BFS,
 byte-identical legacy single-pass), PROVIDED (even empty) in armed; pass-1
 physical occupancy stays eligibility-blind, and close rows stay always-eligible.
 The reconcile gate at `autopilot-worker.ts` is RETAINED (a pass-2b ineligible
-task can still win a contender-free root). The `close`
-finalizer + completion-reap are mode-EXEMPT, so disarming mid-flight
-never orphans a live worker or leaks zellij surfaces. The human controls it via
+task can still win a contender-free root). Completion-reap and the fn-770
+per-root mutex layer stay fully mode-EXEMPT; **fn-773 narrowed the `close`
+DISPATCH exemption** — in armed mode a `close::` launch fires iff the epic is
+in the armed dep-closure (`eligible.has`) OR in-flight (`isEpicInFlight`: a live
+`close::<epic>`/`work::<task>` job or surface), so a disarmed-MID-FLIGHT epic
+still finishes, closes, and reaps cleanly while a COLD close-candidate autopilot
+never touched and never armed is suppressed instead of burning repeated closers
+(2026-06-10: unarmed planctl fn-12). The human controls it via
 `keeper autopilot mode <yolo|armed>` / `arm <epic>` / `disarm <epic>`; the
 `keeper autopilot` banner shows `[playing] · <mode> · N armed` (empty-armed-in-
 armed-mode renders distinctly as `· nothing armed`).
