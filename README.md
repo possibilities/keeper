@@ -447,7 +447,8 @@ Keeper has no `install` verb. Wire it up manually:
    `launchctl print gui/$(id -u)/arthack.keeperd.logrotate`.
 
 8. **Install the babysitter scanner** (optional) so keeper's recurring failure
-   classes — autopilot stalls, duplicate dispatches, reducer wedge,
+   classes — autopilot stalls, duplicate dispatches, **slow close-loops** (≥4
+   close jobs piling up against one still-open epic), reducer wedge,
    dead-letter growth, **backstop self-telemetry degradation** (a missed-wake
    rescue or rising missed-wake counters), and **event→projection fold latency**
    over the realtime bar — page you automatically instead of being noticed after

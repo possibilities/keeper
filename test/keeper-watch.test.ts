@@ -39,6 +39,7 @@ import {
   countDeadLetters,
   detectAutopilotStall,
   detectBackstopTelemetry,
+  detectCloseLoop,
   detectDaemonDown,
   detectDbGrowth,
   detectDeadLetterGrowth,
@@ -389,6 +390,7 @@ describe("detectStuckJobs", () => {
           created_at: now - 600,
           title: "t",
           plan_ref: null,
+          plan_verb: null,
         },
       ],
       nowSecs: now,
@@ -409,6 +411,7 @@ describe("detectStuckJobs", () => {
             created_at: now - 600,
             title: null,
             plan_ref: null,
+            plan_verb: null,
           },
         ],
         nowSecs: now,
@@ -428,6 +431,7 @@ describe("detectStuckJobs", () => {
             created_at: now - 10,
             title: null,
             plan_ref: null,
+            plan_verb: null,
           },
         ],
         nowSecs: now,
@@ -447,6 +451,7 @@ describe("detectStuckJobs", () => {
             created_at: now - 600,
             title: null,
             plan_ref: null,
+            plan_verb: null,
           },
         ],
         nowSecs: now,
@@ -468,6 +473,7 @@ describe("detectDuplicateLiveWorkers", () => {
     pid: 1,
     created_at: 0,
     title: null,
+    plan_verb: null,
     ...over,
   });
 
@@ -528,6 +534,204 @@ describe("detectDuplicateLiveWorkers", () => {
     expect(findings.map((f) => f.evidence.planRef)).toEqual([
       "fn-a.1",
       "fn-b.1",
+    ]);
+  });
+});
+
+describe("detectCloseLoop", () => {
+  const now = 10_000_000;
+  // A close-verb job; defaults are in-window + the close verb.
+  const closeJob = (
+    over: Partial<JobRow> & { job_id: string; plan_ref: string | null },
+  ): JobRow => ({
+    state: "ended",
+    pid: null,
+    created_at: now - 60,
+    title: null,
+    plan_verb: "close",
+    ...over,
+  });
+
+  test("4 close jobs in-window against an OPEN epic → one critical finding", () => {
+    const findings = detectCloseLoop({
+      jobs: [
+        closeJob({ job_id: "c1", plan_ref: "fn-12-x" }),
+        closeJob({ job_id: "c2", plan_ref: "fn-12-x", state: "killed" }),
+        closeJob({ job_id: "c3", plan_ref: "fn-12-x" }),
+        closeJob({ job_id: "c4", plan_ref: "fn-12-x", state: "working" }),
+      ],
+      epicStatus: new Map([["fn-12-x", "open"]]),
+      nowSecs: now,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].severity).toBe("critical");
+    expect(findings[0].category).toBe("close-loop");
+    expect(findings[0].key).toBe("close-loop:fn-12-x");
+    expect(findings[0].evidence.planRef).toBe("fn-12-x");
+    expect(findings[0].evidence.closeJobCount).toBe(4);
+    // Offenders carry job_id + state, sorted oldest-first (stable created_at).
+    expect(findings[0].evidence.offenders).toEqual([
+      { job_id: "c1", state: "ended" },
+      { job_id: "c2", state: "killed" },
+      { job_id: "c3", state: "ended" },
+      { job_id: "c4", state: "working" },
+    ]);
+  });
+
+  test("replays the fn-12 incident shape (8 close jobs, epic open) → one finding", () => {
+    const jobs: JobRow[] = [];
+    for (let i = 0; i < 8; i++) {
+      jobs.push(
+        closeJob({
+          job_id: `close-${i}`,
+          plan_ref: "fn-12-crush-close-skill-into-coordinator",
+          // Spread across ~6h — every dispatch falls OUTSIDE the 15-min
+          // dup-dispatch rate window, the structural blind spot this arm covers.
+          created_at: now - i * 45 * 60,
+          state: i < 4 ? "ended" : "killed",
+        }),
+      );
+    }
+    const findings = detectCloseLoop({
+      jobs,
+      epicStatus: new Map([
+        ["fn-12-crush-close-skill-into-coordinator", "open"],
+      ]),
+      nowSecs: now,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].evidence.closeJobCount).toBe(8);
+    expect(findings[0].key).toBe(
+      "close-loop:fn-12-crush-close-skill-into-coordinator",
+    );
+  });
+
+  test("3 close jobs (below N=4) → no finding", () => {
+    expect(
+      detectCloseLoop({
+        jobs: [
+          closeJob({ job_id: "c1", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c2", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c3", plan_ref: "fn-12-x" }),
+        ],
+        epicStatus: new Map([["fn-12-x", "open"]]),
+        nowSecs: now,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("4 close jobs but the epic flipped DONE → no finding (self-clears)", () => {
+    expect(
+      detectCloseLoop({
+        jobs: [
+          closeJob({ job_id: "c1", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c2", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c3", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c4", plan_ref: "fn-12-x" }),
+        ],
+        epicStatus: new Map([["fn-12-x", "done"]]),
+        nowSecs: now,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("4 close jobs spread BEYOND the 24h window → no finding", () => {
+    expect(
+      detectCloseLoop({
+        jobs: [
+          // Two recent, two well past 24h → only 2 in-window, below N.
+          closeJob({ job_id: "c1", plan_ref: "fn-12-x", created_at: now - 60 }),
+          closeJob({
+            job_id: "c2",
+            plan_ref: "fn-12-x",
+            created_at: now - 120,
+          }),
+          closeJob({
+            job_id: "c3",
+            plan_ref: "fn-12-x",
+            created_at: now - 25 * 60 * 60,
+          }),
+          closeJob({
+            job_id: "c4",
+            plan_ref: "fn-12-x",
+            created_at: now - 26 * 60 * 60,
+          }),
+        ],
+        epicStatus: new Map([["fn-12-x", "open"]]),
+        nowSecs: now,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("missing epic-status row → degrade, no finding", () => {
+    expect(
+      detectCloseLoop({
+        jobs: [
+          closeJob({ job_id: "c1", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c2", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c3", plan_ref: "fn-12-x" }),
+          closeJob({ job_id: "c4", plan_ref: "fn-12-x" }),
+        ],
+        // No entry for fn-12-x → the keyed read found no row → degrade.
+        epicStatus: new Map(),
+        nowSecs: now,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("task-form and null plan_refs are skipped", () => {
+    expect(
+      detectCloseLoop({
+        jobs: [
+          // task-form ref (a close verb is always epic-form; skip a malformed one)
+          closeJob({ job_id: "t1", plan_ref: "fn-12-x.2" }),
+          closeJob({ job_id: "t2", plan_ref: "fn-12-x.2" }),
+          closeJob({ job_id: "t3", plan_ref: "fn-12-x.2" }),
+          closeJob({ job_id: "t4", plan_ref: "fn-12-x.2" }),
+          closeJob({ job_id: "n1", plan_ref: null }),
+          closeJob({ job_id: "n2", plan_ref: null }),
+          closeJob({ job_id: "n3", plan_ref: null }),
+          closeJob({ job_id: "n4", plan_ref: null }),
+        ],
+        epicStatus: new Map([["fn-12-x", "open"]]),
+        nowSecs: now,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("non-close verbs do not count toward the loop", () => {
+    expect(
+      detectCloseLoop({
+        jobs: [
+          // 4 WORK jobs against the epic-form ref → not close, no finding.
+          closeJob({ job_id: "w1", plan_ref: "fn-12-x", plan_verb: "work" }),
+          closeJob({ job_id: "w2", plan_ref: "fn-12-x", plan_verb: "work" }),
+          closeJob({ job_id: "w3", plan_ref: "fn-12-x", plan_verb: "work" }),
+          closeJob({ job_id: "w4", plan_ref: "fn-12-x", plan_verb: "work" }),
+        ],
+        epicStatus: new Map([["fn-12-x", "open"]]),
+        nowSecs: now,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("one finding per offending plan_ref, deterministic order", () => {
+    const jobs = ["fn-9-bbb", "fn-8-aaa"].flatMap((ref) =>
+      [0, 1, 2, 3].map((i) =>
+        closeJob({ job_id: `${ref}-${i}`, plan_ref: ref }),
+      ),
+    );
+    const findings = detectCloseLoop({
+      jobs,
+      epicStatus: new Map([
+        ["fn-8-aaa", "open"],
+        ["fn-9-bbb", "open"],
+      ]),
+      nowSecs: now,
+    });
+    expect(findings.map((f) => f.evidence.planRef)).toEqual([
+      "fn-8-aaa",
+      "fn-9-bbb",
     ]);
   });
 });

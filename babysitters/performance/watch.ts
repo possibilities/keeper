@@ -168,7 +168,13 @@ export type Category =
   | "poison-arrivals"
   | "events-log-backlog"
   | "db-growth"
-  | "keeperd-cpu";
+  | "keeperd-cpu"
+  // fn-771 task 1 — the STATE-based sibling of the rate-window dup-dispatch arm.
+  // A slow close-loop (the 2026-06-10 fn-12 incident: 8 close workers
+  // accumulated over ~6h against a still-open epic, spaced past the 15-min
+  // dup-dispatch window so the rate arm never saw them) pages critical on the
+  // cumulative count of close dispatches against one still-open epic.
+  | "close-loop";
 
 /**
  * One detected condition. `key` is a human-stable per-condition id; the
@@ -251,6 +257,13 @@ export interface JobRow {
    * session). The `idx_jobs_plan_ref` partial index serves the grouping scan.
    */
   plan_ref: string | null;
+  /**
+   * The autopilot VERB that minted this job (`'work'` | `'close'`; fn-771).
+   * `detectCloseLoop` filters on `'close'` to count accumulating close
+   * dispatches against one epic. `null` for a non-autopilot / ambient session
+   * job, or on a pre-fn-684 DB whose `jobs.plan_verb` column is absent.
+   */
+  plan_verb: string | null;
 }
 
 /** The single `autopilot_state` row (id=1). */
@@ -319,6 +332,27 @@ export const WAL_CEILING_BYTES = 1024 * 1024 * 1024;
  * one new external input — a single `ps -o %cpu` fork per tick, read-only.
  */
 export const KEEPERD_CPU_THRESHOLD_PCT = 25;
+
+// --- close-loop (fn-771 task 1) ---
+/**
+ * close-loop: the cumulative count of `close`-verb jobs minted against one
+ * still-open epic within this window. The STATE-based sibling of
+ * `detectDupDispatch`'s rate arm (DUP_DISPATCH_WINDOW_SECS, 15 min): a slow
+ * close-loop spaces its re-dispatches FAR past 15 min (the fn-12 incident
+ * accumulated 8 close workers over ~6h — each fresh dispatch fell outside the
+ * rate window, so the rate arm was structurally blind to it), so the count is
+ * tallied over a full DAY. Mirrors the Kubernetes CrashLoopBackOff dual-arm
+ * stance: a rate window catches fast loops, a cumulative state counter catches
+ * slow ones spaced by cooldowns — keep BOTH arms.
+ */
+export const CLOSE_LOOP_WINDOW_SECS = 24 * 60 * 60;
+/**
+ * close-loop: fire critical when ≥ this many `close` jobs land against one open
+ * epic in the window. A healthy close lands in 1–2 dispatches (the finalizer
+ * runs once; a single pending-dispatch-sweep retry is normal), so N=4 sits well
+ * clear of the legit band while still tripping far below the fn-12 incident's 8.
+ */
+export const CLOSE_LOOP_MIN_COUNT = 4;
 
 // --- backstop-degraded (fn-733) ---
 /**
@@ -709,6 +743,87 @@ export function detectDuplicateLiveWorkers(input: {
       title: `${pids.length} live workers on ${ref}`,
       detail: `${pids.length} live workers back plan_ref ${ref} (pids ${pids.join(", ")}) — the re-fire signature (two workers racing one worktree)`,
       evidence: { planRef: ref, livePids: pids, liveCount: pids.length },
+    });
+  }
+  return findings;
+}
+
+/**
+ * close-loop (fn-771 task 1, CRITICAL): the STATE-based sibling of the
+ * rate-window `detectDupDispatch` arm. Structurally modeled on
+ * `detectDuplicateLiveWorkers` (group by plan_ref, fire critical immediately,
+ * fingerprint on plan_ref — NOT held / delta-gated). Where dup-dispatch counts
+ * re-dispatch EVENTS in a 15-min rate window (and so is structurally blind to a
+ * loop whose re-dispatches are spaced by cooldowns past that window), this
+ * counts `close`-verb JOBS rows accumulated against one still-OPEN epic over a
+ * full day — the 2026-06-10 fn-12 signature (8 close workers over ~6h, the epic
+ * never flipped done). The two arms are complementary (k8s CrashLoopBackOff
+ * dual-arm: rate catches fast loops, cumulative state catches slow ones), not a
+ * replacement — this is the missing state arm.
+ *
+ * Inputs are read from the LIVE projections (`jobs.plan_verb='close'` rows +
+ * per-epic `status`), so the detector is stateless and the epic-open condition
+ * SELF-CLEARS the finding the moment the epic flips done (a done epic yields no
+ * finding, so the seen-state drops it without a version bump). We count jobs by
+ * row (a pre-launch abort spawns no `jobs` row, so a never-launched dispatch
+ * contributes no harm signal — by design).
+ *
+ * Predicate per epic-form `plan_ref` (parsePlanRef null / task-form → skipped):
+ * count its close jobs with `created_at >= nowSecs − CLOSE_LOOP_WINDOW_SECS`;
+ * fire when count ≥ CLOSE_LOOP_MIN_COUNT AND `epicStatus[plan_ref] === 'open'`.
+ * A MISSING status entry (the epic row wasn't in the keyed read) DEGRADES — no
+ * finding — rather than guessing. The fingerprint keys on the `plan_ref` only
+ * (no count) so it stays stable across ticks while the loop persists; the count
+ * + offending job_ids/states live in evidence/detail. One finding per offending
+ * plan_ref, deterministic order (plan_ref ascending).
+ */
+export function detectCloseLoop(input: {
+  jobs: JobRow[];
+  /** plan_ref (epic-form) → epic `status`; absent key → degrade (no finding). */
+  epicStatus: Map<string, string>;
+  nowSecs: number;
+}): Finding[] {
+  const sinceTs = input.nowSecs - CLOSE_LOOP_WINDOW_SECS;
+  // Group in-window close jobs by their epic-form plan_ref.
+  const byEpic = new Map<string, JobRow[]>();
+  for (const j of input.jobs) {
+    if (j.plan_verb !== "close") continue;
+    if (j.created_at < sinceTs) continue;
+    const parsed = parsePlanRef(j.plan_ref);
+    // A close verb is always epic-form; a null / task-form ref is malformed for
+    // a close job → skip (degrade-don't-throw).
+    if (parsed === null || parsed.kind !== "epic") continue;
+    const ref = parsed.epic_id;
+    const list = byEpic.get(ref) ?? [];
+    list.push(j);
+    byEpic.set(ref, list);
+  }
+
+  const findings: Finding[] = [];
+  for (const ref of [...byEpic.keys()].sort()) {
+    // biome-ignore lint/style/noNonNullAssertion: ref came from the map
+    const rows = byEpic.get(ref)!;
+    if (rows.length < CLOSE_LOOP_MIN_COUNT) continue;
+    // Epic-status correlation: missing entry → degrade (no finding); only an
+    // explicitly OPEN epic trips. A done epic self-clears the finding.
+    if (input.epicStatus.get(ref) !== "open") continue;
+    const offenders = rows
+      .slice()
+      .sort((a, b) => a.created_at - b.created_at)
+      .map((j) => ({ job_id: j.job_id, state: j.state }));
+    findings.push({
+      key: `close-loop:${ref}`,
+      fingerprint: fingerprint("close-loop", ref),
+      severity: "critical",
+      category: "close-loop",
+      title: `${rows.length} close jobs on still-open ${ref}`,
+      detail: `${rows.length} close-verb jobs minted against still-open epic ${ref} within ${Math.round(CLOSE_LOOP_WINDOW_SECS / 3600)}h — a slow close-loop (the epic never flipped done; offenders ${offenders.map((o) => `${o.job_id}[${o.state}]`).join(", ")})`,
+      evidence: {
+        planRef: ref,
+        closeJobCount: rows.length,
+        windowSecs: CLOSE_LOOP_WINDOW_SECS,
+        offenders,
+      },
     });
   }
   return findings;
@@ -1379,8 +1494,36 @@ export async function scan(
       .all() as DispatchFailureRow[];
 
     const jobs = db
-      .query("SELECT job_id, state, pid, created_at, title, plan_ref FROM jobs")
+      .query(
+        "SELECT job_id, state, pid, created_at, title, plan_ref, plan_verb FROM jobs",
+      )
       .all() as JobRow[];
+
+    // close-loop (fn-771): a KEYED epics read for the epic-form plan_refs that
+    // have close jobs — queried BY ID so a done epic's row is still visible
+    // (the existing :1404 scalar open-count read scopes to status='open' and
+    // can't see a freshly-done epic). A missing row → no map entry → the
+    // detector degrades (no finding). The set is bounded by distinct close-job
+    // epics, so the IN-list stays small; skip the read entirely when none.
+    const closeLoopEpicIds = new Set<string>();
+    for (const j of jobs) {
+      if (j.plan_verb !== "close") continue;
+      const parsed = parsePlanRef(j.plan_ref);
+      if (parsed !== null && parsed.kind === "epic") {
+        closeLoopEpicIds.add(parsed.epic_id);
+      }
+    }
+    const closeLoopEpicStatus = new Map<string, string>();
+    if (closeLoopEpicIds.size > 0) {
+      const ids = [...closeLoopEpicIds];
+      const placeholders = ids.map(() => "?").join(", ");
+      const rows = db
+        .query(
+          `SELECT epic_id, status FROM epics WHERE epic_id IN (${placeholders})`,
+        )
+        .all(...ids) as { epic_id: string; status: string }[];
+      for (const r of rows) closeLoopEpicStatus.set(r.epic_id, r.status);
+    }
 
     const autopilot = db
       .query(
@@ -1471,6 +1614,13 @@ export async function scan(
       // fn-766 task 2: the LOAD-BEARING re-fire tripwire — >1 live worker on one
       // plan_ref. Reads jobs + the already-injected isAlive (no new input).
       ...detectDuplicateLiveWorkers({ jobs, isAlive: deps.isAlive }),
+      // fn-771 task 1: the STATE-based close-loop arm — ≥N close jobs against
+      // one still-open epic over a day. Pairs with dup-dispatch's rate arm.
+      ...detectCloseLoop({
+        jobs,
+        epicStatus: closeLoopEpicStatus,
+        nowSecs,
+      }),
       // fn-766 task 2: poison-parked dead-letter count (delta-gated downstream).
       ...detectPoisonArrivals({ count: poisonCount }),
     ];
@@ -1901,6 +2051,9 @@ export function saveSeenState(path: string, state: SeenState): void {
  * class) are held; `poison-arrivals` is delta-gated like `dead-letter-growth`.
  * `duplicate-live-workers` is deliberately NOT here — two live workers on one
  * plan_ref pages IMMEDIATELY (it's the load-bearing re-fire tripwire).
+ * `close-loop` (fn-771) is likewise NOT here — an accumulating close-loop
+ * against a still-open epic pages immediately, and its still-open predicate
+ * self-clears the finding the moment the epic flips done.
  */
 const HELD_TICK_CATEGORIES = new Set<Category>([
   "reducer-wedge",

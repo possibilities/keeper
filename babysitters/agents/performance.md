@@ -52,7 +52,8 @@ The file is `{ "success": true, "findings": [ Finding, … ] }`. Each `Finding`:
                  "reducer-wedge" | "dead-letter-growth" | "autopilot-stall" |
                  "stuck-job" | "backstop-degraded" | "fold-latency" |
                  "duplicate-live-workers" | "poison-arrivals" |
-                 "events-log-backlog" | "db-growth" | "keeperd-cpu",
+                 "events-log-backlog" | "db-growth" | "keeperd-cpu" |
+                 "close-loop",
   "title":       "<short label>",
   "detail":      "<human one-liner>",
   "evidence":    { …category-specific… }
@@ -113,6 +114,18 @@ concise human callout. Do NOT try to re-confirm it against the DB.
   counts); when it's present alongside a `dup-dispatch` finding, THIS is the real
   problem. Real ~always: name the plan_ref + pids and page promptly. Gather: which
   jobs hold those pids (`jobs.plan_ref`), are both genuinely live (`ps`)?
+- **close-loop** — CRITICAL, the STATE-based sibling of `dup-dispatch`: ≥4
+  `close`-verb jobs accumulated against ONE still-OPEN epic within 24h (the
+  2026-06-10 fn-12 class — 8 close workers over ~6h while the epic never flipped
+  done). Where `dup-dispatch` watches a 15-min rate window (and so is blind to a
+  loop whose re-dispatches are spaced by cooldowns past it), this counts the
+  cumulative close-job total against an open epic — so it catches the SLOW loop.
+  `evidence` carries `planRef`, `closeJobCount`, and the offending `offenders`
+  (job_id + state). The still-open predicate self-clears once the epic flips
+  done, so a finding means the epic was open at scan time. Real ~always: name the
+  epic + close-job count and page promptly. Gather: why isn't the close
+  finalizing (the close-row verdict / repeated pending-dispatch-sweep rescues),
+  is the epic genuinely still open (`planctl show <epic>`)?
 - **poison-arrivals** — the count of `dead_letters` rows with `status='poison'`
   rose vs the baseline (the fn-762 events-ingest poison surface — a line the
   events-log ingester could not parse and quarantined). Points at malformed hook
