@@ -317,10 +317,13 @@ class CleanGroup(click.Group):
         if commands:
             rows = []
             for subcommand, cmd in commands:
-                help_text = cmd.help or ""
-                # Take first paragraph, collapse whitespace
-                first_para = help_text.split("\n\n")[0]
-                help_line = " ".join(first_para.split())
+                if cmd.short_help:
+                    help_line = " ".join(cmd.short_help.split())
+                else:
+                    # No explicit short_help: take the docstring's first
+                    # paragraph, collapse whitespace (no truncation).
+                    first_para = (cmd.help or "").split("\n\n")[0]
+                    help_line = " ".join(first_para.split())
                 rows.append((subcommand, help_line))
 
             if rows:

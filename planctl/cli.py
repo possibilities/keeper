@@ -362,7 +362,7 @@ def init_cmd():
     return _lazy_import("planctl.run_init")()
 
 
-@cli.command("detect")
+@cli.command("detect", short_help="Check if cwd belongs to a planctl project.")
 def detect_cmd():
     """Check if the current directory belongs to a planctl project."""
     return _lazy_import("planctl.run_detect")()
@@ -493,7 +493,7 @@ on an EXISTING epic) goes through `refine-apply`.
 """
 
 
-@cli.command("scaffold")
+@cli.command("scaffold", short_help="Materialize a whole epic tree from one YAML.")
 @click.option(
     "--file",
     "file",
@@ -572,7 +572,9 @@ a git repo; `details.broken_repos` lists them).
 """
 
 
-@cli.command("close-preflight")
+@cli.command(
+    "close-preflight", short_help="Write the /plan:close brief and emit the handoff."
+)
 @click.argument("epic_id")
 @click.option(
     "--project",
@@ -635,7 +637,9 @@ Codes: `BAD_EPIC_ID`, `EPIC_NOT_FOUND`.
 """
 
 
-@cli.command("refine-context")
+@cli.command(
+    "refine-context", short_help="Fetch refine-state for /plan:plan (read-only)."
+)
 @click.argument("epic_id")
 @click.option(
     "--invalidate",
@@ -735,7 +739,9 @@ is per-file rename, not tree-level), same posture as scaffold.
 """
 
 
-@cli.command("refine-apply")
+@cli.command(
+    "refine-apply", short_help="Apply a refine delta to an existing epic tree."
+)
 @click.argument("epic_id")
 @click.option(
     "--file",
@@ -763,7 +769,7 @@ def state_path_cmd(task_id):
     return _lazy_import("planctl.run_state_path")(task_id=task_id)
 
 
-@cli.command("claim")
+@cli.command("claim", short_help="Claim a task and return the worker briefing.")
 @click.argument("task_id")
 @click.option("--force", is_flag=True, help="Skip dependency and assignee checks")
 @click.option("--note", default=None, help="Claim note")
@@ -788,7 +794,7 @@ def claim_cmd(task_id, force, note, project):
     )
 
 
-@cli.command("resolve-task")
+@cli.command("resolve-task", short_help="Routing lookup to launch /plan:work.")
 @click.argument("task_id")
 @click.option(
     "--project",
@@ -849,7 +855,7 @@ scan set missing or not a git repo; `details.broken_repos` lists them).
 """
 
 
-@cli.command("find-task-commit")
+@cli.command("find-task-commit", short_help="Look up a task's source commits.")
 @click.argument("task_id")
 @click.option(
     "--project",
@@ -875,7 +881,7 @@ def find_task_commit_cmd(task_id, project):
     )
 
 
-@cli.command("reconcile")
+@cli.command("reconcile", short_help="Post-worker verdict for /plan:work (read-only).")
 @click.argument("task_id")
 @click.option(
     "--project",
@@ -955,7 +961,7 @@ Codes: `BAD_EPIC_ID` (garbage, or a task-shaped id naming its parent epic),
 """
 
 
-@cli.command("close-finalize")
+@cli.command("close-finalize", short_help="Run the /plan:close saga to its outcome.")
 @click.argument("epic_id")
 @click.option(
     "--project",
@@ -1039,7 +1045,7 @@ def cat_cmd(id):
     return _lazy_import("planctl.run_cat")(id=id)
 
 
-@cli.command("gist")
+@cli.command("gist", short_help="Create a multifile gist for an epic.")
 @click.argument("epic_id")
 @click.option("--public", is_flag=True, help="Make the gist public (default: secret)")
 @click.option("--no-open", is_flag=True, help="Don't open the gist in a browser")
