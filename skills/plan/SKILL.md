@@ -427,7 +427,7 @@ Template (STANDARD — add/remove H3s per 3b):
 
 SHORT: only `### Approach` and `### Investigation targets`. DEEP: also `### Detailed phases`, `### Alternatives`, `### Non-functional targets`, `### Rollout`. `### Design context` is optional at every depth — frontend tasks when DESIGN.md is present.
 
-**Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
+**Investigation targets come primarily from the pinned `repo-scout` report** — its `Related Code` / `Reusable Code` / `Test Patterns` are your source for file:line refs. Augment with targeted `Read`/`Glob` only when the scout missed something. `Project Conventions` feed Approach (e.g. "import from `<cli>.api`, not subprocess"); `Design System` feeds `### Design context`; `Gotchas` become Approach warnings or Acceptance callouts — state each constraint in present tense, never citing a ticket/epic id, and never emit a doc-update acceptance item (`[ ] docstring updated`, `[ ] CLAUDE.md bullet added`) unless the doc change is the task's deliverable or the doc carries a rule an agent would otherwise get wrong; comment/docstring hygiene is the worker's standing discipline, not a per-spec checkbox. **Verify any `[INFERRED]` path with `Read`/`Glob` before listing it; if you can't verify, omit rather than fabricate.** `docs-gap-scout` findings do **not** feed task Investigation targets — they feed the epic `## Docs gaps` (5g), unless a specific doc is itself a critical read for the task. Gap-analyst `Nice-to-Clarify` items may surface as `Open question: <q>` notes in Approach; `Priority Questions` land in the epic Acceptance (5g), not here.
 
 **Tier** — write the band from 5d as `tier:`. **Required on every task** — scaffold errors `tier_invalid` if missing or unknown. Say the choice in one line per task (*"task 3 is contract-touching — xhigh"*) so the human can redirect.
 
@@ -467,7 +467,7 @@ Task that proves the approach: `<task_id>`. If it fails: <recovery plan in 1 sen
 
 ## Docs gaps
 
-- **<doc path>**: <one-line note on what needs updating, from docs-gap-scout's Likely Updates Needed>
+- **<doc path>**: <one-line note from docs-gap-scout's Likely Updates Needed — update-, prune-, or delete-shaped, e.g. `prune <what> — content now redundant`>
 
 ## Best practices
 
@@ -477,7 +477,7 @@ Task that proves the approach: `<task_id>`. If it fails: <recovery plan in 1 sen
 Omission rules (advisory shape — scaffold validates only task specs, not the epic spec):
 - **SHORT**: omit `## Early proof point`, `## References`, `## Docs gaps`.
 - **DEEP**: also append `## Alternatives` (considered and rejected), `## Architecture` (embedded mermaid when the data model/architecture changes), `## Rollout` (rollout + rollback plan).
-- Omit `## Docs gaps` if docs-gap-scout returned no `### Likely Updates Needed`; else one bullet per entry (a tracking surface, not an acceptance gate).
+- Omit `## Docs gaps` if docs-gap-scout returned no `### Likely Updates Needed`; else one bullet per entry — update- or prune/delete-shaped, a tracking surface, not an acceptance gate.
 - Omit `## Best practices` if practice-scout returned no signal; else one bullet per distinct non-obvious practice (advisory, not a gate).
 
 ### 5h. Build the plan YAML and call scaffold once
