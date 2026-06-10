@@ -698,7 +698,9 @@ export function collectPanesFromListJson(payload: unknown): ZellijPane[] {
  * along with the verb, so an `approve::` pane is never minted (and a stale
  * one from before the deploy is left for the human, not name-matched). The
  * id run stops at the first whitespace / quote so the surrounding shell
- * argv (`… --name work::id --plugin-dir …`) peels cleanly.
+ * argv (`… --name work::id '/plan:work …'`) peels cleanly — the match never
+ * depended on any flag following `--name`, so dropping `--plugin-dir`
+ * (fn-10) leaves the peel unchanged.
  */
 const DISPATCH_KEY_RE = /(work|close)::([^\s'"]+)/;
 

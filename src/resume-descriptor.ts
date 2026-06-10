@@ -12,10 +12,11 @@
  * subscribes to the full epics projection in one shot) builds an
  * `epicsById: Map<string, Epic>` up front and calls
  * {@link tierForJobFromEpics} with it. Both paths end up at the same tier
- * string the autopilot dispatch baked into the worker's `--plugin-dir` flag.
+ * string — the tier keeper still reads for the board/projection (fn-10
+ * inverted tier routing: the worker is spawned as `plan:worker-<tier>` from
+ * the emitted `worker_agent`, not selected via a `--plugin-dir` flag).
  */
 
-import { workPluginDir } from "./autopilot-worker";
 import type { Epic, Job, Task } from "./types";
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
@@ -36,10 +37,18 @@ export function resumeTarget(job: Job): string {
 
 /**
  * Build the resume shell command for a job. Mirrors `buildWorkerCommand`'s
- * `cd`-prefix + `--plugin-dir` shape, but the payload is `--resume "<target>"`
- * instead of `--name ... '/plan:<verb> ...'`. A null/empty `cwd` drops the
- * `cd` prefix (same degenerate-path rule as `buildWorkerCommand`); a null
- * tier drops the `--plugin-dir`.
+ * `cd`-prefix shape, but the payload is `--resume "<target>"` instead of
+ * `--name ... '/plan:<verb> ...'`. A null/empty `cwd` drops the `cd` prefix
+ * (same degenerate-path rule as `buildWorkerCommand`).
+ *
+ * fn-10 inverted tier routing: the resume command no longer carries a
+ * `--plugin-dir` tier-plugin flag. `claude --resume` re-attaches to an
+ * existing session whose plugin set is already pinned, and the `plan` plugin
+ * is always loaded, so the tier is irrelevant to re-attachment. The `tier`
+ * argument is still THREADED through the resume-descriptor chain (resolved via
+ * {@link tierForJobFromEpics}) so keeper's board/projection `task.tier` reads
+ * stay intact and the three resume-command producers agree by construction;
+ * it just no longer shapes the emitted argv.
  *
  * `target` is the job's latest session NAME when it has one, else its session
  * id (see {@link resumeTarget}). `claude --resume [value]` resolves an exact
@@ -51,15 +60,10 @@ export function resumeTarget(job: Job): string {
 export function buildResumeCommand(
   cwd: string,
   target: string,
-  tier: string | null,
+  _tier: string | null,
 ): string {
   const cdPrefix = cwd === "" ? "" : `cd ${cwd} && `;
-  const flags: string[] = [];
-  if (tier != null && tier !== "") {
-    flags.push("--plugin-dir", workPluginDir(tier));
-  }
-  flags.push("--resume", `"${target}"`);
-  return `${cdPrefix}claude ${flags.join(" ")}`;
+  return `${cdPrefix}claude --resume "${target}"`;
 }
 
 /**
@@ -67,8 +71,7 @@ export function buildResumeCommand(
  * The job's `plan_ref` is the task id (`<epic-slug>.<N>`); strip the suffix
  * for the epic id, look up the epic in the map, find the matching task, return
  * `task.tier`. Returns `null` for any job that isn't a `work` job, has no
- * parseable task ref, or whose epic/task isn't in the map / has no tier —
- * those render without a `--plugin-dir`.
+ * parseable task ref, or whose epic/task isn't in the map / has no tier.
  *
  * Pure: no I/O, no fetch. `scripts/resume.ts` keeps its lazy per-epic UDS
  * fetch loop and calls this helper once it has the epic; the restore worker

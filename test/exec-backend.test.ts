@@ -1410,14 +1410,18 @@ test("collectPanesFromListJson: object-of-arrays shape lifts tab name from key, 
 test("dispatchKeyForPane: lifts verb::id from terminal_command (fn-711 unnamed tab)", () => {
   // Post-fn-711 the TAB is unnamed (`Tab #N`); the verb::id lives only in
   // the `claude --name verb::id` arg inside terminal_command.
+  // fn-10: the spawned command no longer carries `--plugin-dir`; the verb::id
+  // still peels cleanly off the `--name` arg (the match never depended on the
+  // flag following it).
   const pane: ZellijPane = {
     id: "3",
     tab_name: "Tab #4",
     exited: false,
     terminal_command:
-      "/bin/zsh -l -i -c cd /repo && claude --model sonnet --name work::fn-724-x.2 --plugin-dir /p '/plan:work fn-724-x.2'",
+      "/bin/zsh -l -i -c cd /repo && claude --model sonnet --effort max --name work::fn-724-x.2 '/plan:work fn-724-x.2'",
   };
   expect(dispatchKeyForPane(pane)).toBe("work::fn-724-x.2");
+  expect(pane.terminal_command).not.toContain("--plugin-dir");
 });
 
 test("dispatchKeyForPane: tab_name takes precedence; work/close verbs match; none → null", () => {

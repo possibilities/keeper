@@ -298,7 +298,7 @@ async function main(): Promise<void> {
     }
     const dir = taskCdDir(task, projectDir);
     lines.push(
-      buildWorkerCommand("work", id, dir, task.tier),
+      buildWorkerCommand("work", id, dir),
       buildWorkerCommand("approve", id, dir),
     );
   } else {

@@ -61,13 +61,16 @@ test("buildResumeCommand drops cd prefix on an empty cwd", () => {
   expect(cmd).toBe('claude --resume "sess-abc"');
 });
 
-test("buildResumeCommand inserts --plugin-dir for a non-null tier", () => {
+test("buildResumeCommand never inserts --plugin-dir, even for a non-null tier (fn-10)", () => {
+  // fn-10 inverted tier routing: `claude --resume` re-attaches to an existing
+  // session whose plugin set is already pinned, so the resume command no
+  // longer carries a `--plugin-dir` tier-plugin flag. The tier is still
+  // threaded through the signature (board/projection read) but never shapes
+  // the argv.
   const cmd = buildResumeCommand("/repo", "fn-1.1", "mint");
-  // The plugin path comes from workPluginDir; we don't pin the prefix
-  // (ARTHACK_ROOT is env-dependent), but we assert the flag shape.
-  expect(cmd.startsWith("cd /repo && claude --plugin-dir ")).toBe(true);
-  expect(cmd.includes("work-plugins/mint")).toBe(true);
-  expect(cmd.endsWith(' --resume "fn-1.1"')).toBe(true);
+  expect(cmd).toBe('cd /repo && claude --resume "fn-1.1"');
+  expect(cmd).not.toContain("--plugin-dir");
+  expect(cmd).not.toContain("work-plugins");
 });
 
 test("buildResumeCommand omits --plugin-dir on an empty tier string", () => {

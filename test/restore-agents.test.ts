@@ -214,7 +214,11 @@ test("buildResumeLaunchArgv drops cd prefix when cwd is null", () => {
   expect(argv[4].startsWith(`claude --resume "x"`)).toBe(true);
 });
 
-test("buildResumeLaunchArgv includes --plugin-dir when tier is set", () => {
+test("buildResumeLaunchArgv never includes --plugin-dir, even when tier is set (fn-10)", () => {
+  // fn-10 inverted tier routing: the resume command re-attaches to an
+  // existing session and no longer carries a tier-plugin flag. The agent's
+  // `tier` is still threaded through (board/projection read) but never shapes
+  // the spawned argv.
   const argv = buildResumeLaunchArgv(
     "/bin/zsh",
     fakeAgent({
@@ -224,7 +228,8 @@ test("buildResumeLaunchArgv includes --plugin-dir when tier is set", () => {
       tier: "mint",
     }),
   );
-  expect(argv[4]).toContain("--plugin-dir");
+  expect(argv[4]).not.toContain("--plugin-dir");
+  expect(argv[4]).not.toContain("work-plugins");
 });
 
 // ---------------------------------------------------------------------------

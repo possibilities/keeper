@@ -118,7 +118,6 @@
  * invariant.
  */
 
-import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -329,111 +328,19 @@ export const ARTHACK_ROOT: string = ((): string => {
 })();
 
 /**
- * `~/code/planctl` root for the `--plugin-dir <root>/work-plugins/<tier>`
- * flag. Env-overridable via `PLANCTL_ROOT` (for tests and a future
- * non-default workspace). `~` is expanded eagerly at module load so the
- * assembled string carries an absolute path the launcher's cwd doesn't
- * break. Mirrors the `ARTHACK_ROOT` IIFE shape — planctl moved out of
- * `apps/planctl/` into a standalone sibling repo (epic fn-635), so the
- * tier plugin tree now lives under planctl's own root with no `claude/`
- * segment.
- */
-export const PLANCTL_ROOT: string = ((): string => {
-  const raw = process.env.PLANCTL_ROOT;
-  const v = raw != null && raw !== "" ? raw : "~/code/planctl";
-  if (v === "~" || v.startsWith("~/")) {
-    return v === "~" ? homedir() : join(homedir(), v.slice(2));
-  }
-  return v;
-})();
-
-/**
- * The tier work-plugins directory autopilot launches a `work` worker under:
- * `${PLANCTL_ROOT}/work-plugins/<tier>`. Factored out so both the
- * dispatch command ({@link buildWorkerCommand}) and the resume-command
- * renderer (`scripts/resume.ts`) build the identical path from one formula.
- * Pure — exported for the resume script and tests.
- */
-export function workPluginDir(tier: string): string {
-  return `${PLANCTL_ROOT}/work-plugins/${tier}`;
-}
-
-/** Result of validating a tier's work-plugin manifest before launch. */
-export type WorkPluginCheck = { ok: true } | { ok: false; reason: string };
-
-/**
- * Validate that the tier's work-plugin manifest exists and registers the
- * plugin under the name `work` BEFORE the autopilot launches a worker
- * against `workPluginDir(tier)`.
- *
- * The per-tier `.claude-plugin/plugin.json` is a GENERATED + gitignored
- * artifact (planctl fn-637 — rendered from `agent-templates/worker*.tmpl`
- * by `promptctl render-plugin-templates`, wired through
- * `scripts/install.sh`). When that file is absent, `claude --plugin-dir
- * <root>/work-plugins/<tier>` falls back to the DIRECTORY BASENAME as the
- * plugin name (e.g. `high`), so the agent registers as `high:worker`.
- * `/plan:work` hardcodes `Task(subagent_type="work:worker")`, which then
- * fails with `Agent type 'work:worker' not found` AFTER the worker has
- * burned a ~30s cold boot. Validating here turns that silent token-burn
- * into a visible sticky `DispatchFailed` carrying a remediation hint —
- * the autopilot never launches a doomed worker.
- *
- * Producer-side fs read — lives in the impure dispatch path
- * (`runReconcileCycle`), NEVER a fold. Pure of wall-clock/env. Exported
- * for tests.
- */
-export function checkWorkPluginManifest(tier: string): WorkPluginCheck {
-  const manifestPath = join(
-    workPluginDir(tier),
-    ".claude-plugin",
-    "plugin.json",
-  );
-  let raw: string;
-  try {
-    raw = readFileSync(manifestPath, "utf8");
-  } catch {
-    return {
-      ok: false,
-      reason:
-        `work-plugin manifest missing for tier '${tier}' at ${manifestPath} — ` +
-        `regenerate with 'promptctl render-plugin-templates --project-root ${PLANCTL_ROOT}' ` +
-        `(or rerun scripts/install.sh); without it claude --plugin-dir falls back to ` +
-        `the dir basename and '/plan:work' cannot resolve 'work:worker'`,
-    };
-  }
-  let name: unknown;
-  try {
-    name = (JSON.parse(raw) as { name?: unknown }).name;
-  } catch (err) {
-    return {
-      ok: false,
-      reason: `work-plugin manifest at ${manifestPath} is not valid JSON: ${
-        err instanceof Error ? err.message : String(err)
-      }`,
-    };
-  }
-  if (name !== "work") {
-    return {
-      ok: false,
-      reason:
-        `work-plugin manifest at ${manifestPath} has name='${String(name)}' ` +
-        `(expected 'work') — '/plan:work' would resolve '${String(name)}:worker', ` +
-        `not 'work:worker'`,
-    };
-  }
-  return { ok: true };
-}
-
-/**
- * Build the `claude` worker shell command for a `(verb, id, cwd, tier)`
+ * Build the `claude` worker shell command for a `(verb, id, cwd)`
  * combination — mirrors `buildWorkerCommand` in `cli/autopilot.ts:502`
- * byte-for-byte (same flag ordering, same tier `--plugin-dir` rule, same
- * `--name verb::id` correlator). Lives here rather than re-exported from
- * the cli module to keep this worker's Worker-boundary import graph
- * narrow (the cli file pulls in clipboard/live-shell/etc.). The two
- * implementations are pinned together by `test/autopilot-worker.test.ts`
- * which asserts the exact same argv shape against the cli's frozen
- * snapshot.
+ * byte-for-byte (same flag ordering, same `--name verb::id` correlator).
+ * Lives here rather than re-exported from the cli module to keep this
+ * worker's Worker-boundary import graph narrow (the cli file pulls in
+ * clipboard/live-shell/etc.). The two implementations are pinned together
+ * by `test/autopilot-worker.test.ts` which asserts the exact same argv
+ * shape against the cli's frozen snapshot.
+ *
+ * fn-10 inverted tier routing: the worker no longer selects a tier-plugin
+ * via `--plugin-dir`. The `plan` plugin is always loaded and `/plan:work`
+ * spawns the emitted `worker_agent` (`plan:worker-<tier>`), so the
+ * launcher carries no tier flag.
  *
  * Pure — exported for tests.
  */
@@ -441,7 +348,6 @@ export function buildWorkerCommand(
   verb: Verb,
   id: string,
   projectDir: string,
-  tier?: string | null,
 ): string {
   const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
   const flags: string[] = [];
@@ -449,9 +355,6 @@ export function buildWorkerCommand(
   // surviving verbs (`work`/`close`) launch at max effort.
   flags.push("--model", "sonnet", "--effort", "max");
   flags.push("--name", `${verb}::${id}`);
-  if (verb === "work" && tier != null && tier !== "") {
-    flags.push("--plugin-dir", workPluginDir(tier));
-  }
   return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;
 }
 
@@ -890,15 +793,6 @@ export interface ConfirmRunningDeps {
    * treats an early resolve as "shutdown — stop polling".
    */
   sleep(ms: number, signal: AbortSignal): Promise<void>;
-  /**
-   * Validate the tier's work-plugin manifest before a `work` launch.
-   * Optional: when absent the guard is a no-op (tests that don't exercise
-   * the manifest path skip wiring it). The live worker always injects the
-   * real {@link checkWorkPluginManifest}. A `{ok:false, reason}` result
-   * blocks the launch with a sticky `DispatchFailed` rather than spawning
-   * a worker that registers under the wrong plugin name and dies.
-   */
-  checkWorkPlugin?(tier: string): WorkPluginCheck;
   /**
    * Report the autopilot `confirmRunning` ceiling backstop fire (epic
    * fn-720, `timeout` class). Called exactly once per confirm: on a
@@ -1344,7 +1238,7 @@ export function reconcile(
         id: taskId,
         key,
         cwd,
-        workerCommand: buildWorkerCommand(verb, taskId, cwd, task.tier),
+        workerCommand: buildWorkerCommand(verb, taskId, cwd),
         tier: verb === "work" ? task.tier : null,
       });
       budget--;
@@ -1600,25 +1494,12 @@ export async function runReconcileCycle(
       // call could double-queue. Skip to keep one-at-a-time honest.
       continue;
     }
-    // Pre-launch work-plugin manifest guard. A `work` launch points
-    // `claude --plugin-dir` at workPluginDir(tier); if that tier's
-    // generated `.claude-plugin/plugin.json` is missing/misnamed, claude
-    // falls back to the dir basename as the plugin name and `/plan:work`
-    // can't resolve `work:worker` — the worker dies after a cold boot.
-    // Block with a visible sticky DispatchFailed instead of burning it.
-    if (plan.verb === "work" && plan.tier != null && plan.tier !== "") {
-      const check = deps.checkWorkPlugin?.(plan.tier) ?? { ok: true };
-      if (!check.ok) {
-        deps.emitDispatchFailed({
-          verb: plan.verb,
-          id: plan.id,
-          reason: check.reason,
-          dir: plan.cwd === "" ? null : plan.cwd,
-          ts: deps.now(),
-        });
-        continue;
-      }
-    }
+    // fn-10: the per-tier work-plugin manifest pre-flight guard is gone —
+    // the `plan` plugin is always loaded and `/plan:work` spawns the emitted
+    // `worker_agent` (`plan:worker-<tier>`), so there is no `--plugin-dir`
+    // tier-plugin to validate. The planctl check-generated guard on
+    // `agents/worker-<tier>.md` now turns a missing tier agent into a visible
+    // failure upstream.
     state.inFlight.add(plan.key);
     // fn-735 — STAMP the cooldown at the SAME point as `inFlight.add`,
     // BEFORE the confirm await, so it covers BOTH the `ok` AND the
@@ -2323,7 +2204,6 @@ function main(): void {
     },
     now: () => Math.floor(Date.now() / 1000),
     sleep: (ms, signal) => abortableSleep(ms, signal),
-    checkWorkPlugin: (tier) => checkWorkPluginManifest(tier),
     recordTimeoutBackstop,
   };
 
