@@ -290,23 +290,17 @@ async function main(): Promise<void> {
 
   const lines: string[] = [];
   if (taskMatch) {
-    // Task scope: work + approve, cd'd to the task's effective repo.
+    // Task scope: work, cd'd to the task's effective repo.
     const tasks = Array.isArray(epic.tasks) ? epic.tasks : [];
     const task = tasks.find((t) => seg(t.task_id) === id);
     if (task === undefined) {
       die(`task '${id}' not found in epic '${epicId}'`);
     }
     const dir = taskCdDir(task, projectDir);
-    lines.push(
-      buildWorkerCommand("work", id, dir),
-      buildWorkerCommand("approve", id, dir),
-    );
+    lines.push(buildWorkerCommand("work", id, dir));
   } else {
-    // Epic scope: close + approve, cd'd to the epic's project_dir.
-    lines.push(
-      buildWorkerCommand("close", epicId, projectDir),
-      buildWorkerCommand("approve", epicId, projectDir),
-    );
+    // Epic scope: close, cd'd to the epic's project_dir.
+    lines.push(buildWorkerCommand("close", epicId, projectDir));
   }
 
   process.stdout.write(`${lines.join("\n")}\n`);
