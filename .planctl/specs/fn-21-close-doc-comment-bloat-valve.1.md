@@ -34,5 +34,5 @@ A partial re-render leaves sidecar sha256s stale and the check-generated guard w
 - [ ] No bullet in the new block contains a ticket/epic id or backward-facing phrasing
 
 ## Done summary
-
+Added the canonical 5-bullet Doc & comment discipline block before ## Rules in template/agents/worker.md.tmpl, re-rendered all four worker agents + sidecars (idempotent), consolidated the CLAUDE.md/AGENTS.md doc-style block to cross-reference it without net line growth, and added a template-prose test.
 ## Evidence
