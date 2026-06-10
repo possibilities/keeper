@@ -1,14 +1,12 @@
 ---
-name: worker
-description: Implement a single planctl task. Spawned by `plan:work` with fresh context; loads the task + epic spec, implements, commits, and calls `planctl done`. Do not invoke directly — use `/plan:work` instead.
+name: worker-{{ current_variant }}
+description: Internal task-execution worker — spawned programmatically by `/plan:work` via the emitted `worker_agent` name, never invoked from user requests. Do not invoke directly — use `/plan:work` instead.
 model: opus
 effort: "{{ current_variant }}"
 disallowedTools: Task
 maxTurns: 100
 color: "#3B82F6"
 variants: [medium, high, xhigh, max]
-render_to: work-plugins/{{ current_variant }}
-manifest_description: "planctl worker agent at claude opus {{ current_variant }} effort — loaded conditionally by arthack-claude routing for /plan:work"
 ---
 
 # Task Implementation Worker

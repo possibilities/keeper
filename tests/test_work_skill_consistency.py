@@ -154,36 +154,30 @@ def test_agentid_regex_requires_search_not_match():
 
 
 # ---------------------------------------------------------------------------
-# Group C — Tier-routed worker plugins (fn-593)
+# Group C — Tier-routed worker agents in the `plan` plugin (fn-10)
 # ---------------------------------------------------------------------------
 #
-# fn-593 moved the worker agent files OUT of planctl's own `agents/` and INTO
-# per-tier plugins under `claude/work-plugins/<tier>/agents/worker.md`. Keeper
-# reads `task.tier` from its own projected Task data and adds
-# `--plugin-dir claude/work-plugins/<tier>` so exactly one tier-plugin
-# loads per session. The spawning skill (`work.md.tmpl`) targets the bare
-# literal `subagent_type="work:worker"` — the tier suffix is gone from the
-# spawn site (it now lives in keeper's `--plugin-dir` choice).
+# fn-10 inverts fn-593: the four worker agents move BACK into the planctl
+# `plan` plugin's own `agents/` directory, this time one file per tier
+# (`agents/worker-<tier>.md`), each addressable `plan:worker-<tier>`. The
+# `template/agents/worker.md.tmpl` drops its cross-boundary `render_to:`
+# (and `manifest_description:`) directive; promptctl's default agents branch
+# then emits `agents/<stem>-<variant>.md` per variant directly into the
+# always-loaded plugin's `agents/`. Keeper no longer passes `--plugin-dir`;
+# `claim` maps the task tier to a `worker_agent` name the skill spawns.
 #
 # This group pins the new shape:
-#   - The OLD `apps/planctl/agents/worker-{medium,high,xhigh,max}.md` files
-#     MUST NOT exist on disk — they were deleted in fn-593 task .6 and the
-#     agent-template fan-out now emits directly into
-#     `claude/work-plugins/<tier>/agents/worker.md`.
-#   - The NEW `claude/work-plugins/<tier>/agents/worker.md` files MUST exist
-#     for every claude tier, set `model: opus`, and declare the
-#     matching `effort:`.
+#   - The per-tier `agents/worker-{medium,high,xhigh,max}.md` files MUST exist
+#     for every tier, name themselves `worker-<tier>`, set `model: opus`, and
+#     declare the matching `effort:` — gitignored + sidecar-guarded exactly
+#     like `agents/practice-scout.md`.
+#
+# Run `promptctl render-plugin-templates --project-root <planctl_root>` before
+# this suite so the generated agents are on disk.
 
 _PLANCTL_AGENTS_DIR: Path = Path(__file__).resolve().parents[1] / "agents"
-_WORK_PLUGINS_DIR: Path = Path(__file__).resolve().parents[1] / "work-plugins"
 
 _TIERS: tuple[str, ...] = ("medium", "high", "xhigh", "max")
-_DELETED_AGENT_BASENAMES: tuple[str, ...] = (
-    "worker-medium.md",
-    "worker-high.md",
-    "worker-xhigh.md",
-    "worker-max.md",
-)
 
 
 def _read_frontmatter(path: Path) -> dict[str, str]:
@@ -213,41 +207,31 @@ def _read_frontmatter(path: Path) -> dict[str, str]:
     return fm
 
 
-@pytest.mark.parametrize("basename", _DELETED_AGENT_BASENAMES)
-def test_old_tier_suffixed_agent_files_removed(basename: str):
-    """fn-593 deleted the tier-suffixed worker agents from planctl's own
-    `agents/`. The agent-template fan-out now writes directly into
-    `claude/work-plugins/<tier>/agents/worker.md`, so these files no longer
-    get regenerated. Any file matching `worker-*.md` reappearing in this
-    directory means the fan-out's `render_to:` directive regressed (or a
-    stale rendered file was checked in).
-    """
-    path = _PLANCTL_AGENTS_DIR / basename
-    assert not path.exists(), (
-        f"{path} still exists — fn-593 deleted the tier-suffixed worker "
-        f"agents from planctl's plugin. The fan-out now emits to "
-        f"`claude/work-plugins/<tier>/agents/worker.md` via the template's "
-        f"`render_to:` frontmatter. Delete this file and check that "
-        f"`template/agents/worker.md.tmpl` still carries "
-        f"the cross-boundary `render_to:` directive."
-    )
-
-
 @pytest.mark.parametrize("tier", _TIERS)
-def test_work_plugin_worker_agent_rendered_and_pinned(tier: str):
-    """Each `claude/work-plugins/<tier>/agents/worker.md` exists, names
-    itself `worker`, sets `model: opus`, and declares the matching effort.
+def test_tier_suffixed_worker_agent_rendered_in_plan_plugin(tier: str):
+    """fn-10 moved the worker agents back into the `plan` plugin's own
+    `agents/` directory, one file per tier (`agents/worker-<tier>.md`).
+    Dropping `render_to:` from `template/agents/worker.md.tmpl` makes
+    promptctl's default agents branch emit `agents/<stem>-<variant>.md` per
+    variant directly here.
 
-    If this fails with "file not rendered," run `scripts/install.sh` to
+    If this fails with "file not rendered," run
+    `promptctl render-plugin-templates --project-root <planctl_root>` to
     regenerate from `template/agents/worker.md.tmpl`.
     """
-    path = _WORK_PLUGINS_DIR / tier / "agents" / "worker.md"
-    assert path.exists(), f"{path} not rendered — run scripts/install.sh"
+    path = _PLANCTL_AGENTS_DIR / f"worker-{tier}.md"
+    assert path.exists(), (
+        f"{path} not rendered — run "
+        f"`promptctl render-plugin-templates --project-root <planctl_root>`. "
+        f"fn-10 emits the per-tier worker agents into the `plan` plugin's "
+        f"`agents/` dir; the template must NOT carry a `render_to:` directive."
+    )
     fm = _read_frontmatter(path)
-    assert fm.get("name") == "worker", (
-        f"{path}: frontmatter name={fm.get('name')!r}, expected 'worker' "
-        f"(the agent is addressed as `work:worker` — scope from the plugin "
-        f"name, not the agent name)"
+    assert fm.get("name") == f"worker-{tier}", (
+        f"{path}: frontmatter name={fm.get('name')!r}, expected "
+        f"'worker-{tier}' — the agent is addressed `plan:worker-{tier}`, so "
+        f"the `name:` field must carry the tier suffix and the rendered "
+        f"filename must match it."
     )
     assert fm.get("model") == "opus", (
         f"{path}: frontmatter model={fm.get('model')!r}, expected the bare "
@@ -260,20 +244,21 @@ def test_work_plugin_worker_agent_rendered_and_pinned(tier: str):
 
 
 # ---------------------------------------------------------------------------
-# Group D — Spawn shape: bare `work:worker`, no tier suffix, no model= kwarg
+# Group D — Spawn shape: envelope-driven `plan:worker-<tier>`, no `work:worker`,
+#           no `--plugin-dir`, no `model=` kwarg
 # ---------------------------------------------------------------------------
 #
-# fn-593 moved tier routing OUT of the skill (was: Phase 2a's runtime
-# 4-band heuristic + `subagent_type="plan:worker-<tier>"`) and INTO the
-# planner + keeper (now: `/plan:plan` picks tier at decomposition time;
-# keeper reads it from its own projected Task data and loads
-# `claude/work-plugins/<tier>/`). The skill spawns the bare literal
-# `Task(subagent_type="work:worker")` because exactly one tier-plugin is
-# in scope per session.
+# fn-10 inverts fn-593: tier routing rides the emitted `worker_agent` name
+# (`plan:worker-<tier>`) on the claim / `worker resume` envelope, and the
+# four worker agents live in the always-loaded `plan` plugin. The skill is a
+# pure pass-through — both spawn sites set
+# `subagent_type="<worker_agent>"` (the envelope field, rendered as
+# `plan:worker-<tier>` in the template's substitution prose). Keeper no longer
+# pushes `--plugin-dir`, so the bare `work:worker` literal is gone everywhere.
 #
-# This group's polarity flipped vs the pre-fn-593 shape: it now REQUIRES
-# the bare `work:worker` literal and FORBIDS any `plan:worker-<tier>`
-# references at the spawn site.
+# This group's polarity flipped vs the fn-593 shape: it now REQUIRES the
+# envelope-driven `plan:worker-<tier>` substitution and FORBIDS any bare
+# `work:worker` literal or `--plugin-dir` reference.
 
 
 def _extract_task_call_blocks(text: str, subagent_needle: str) -> list[str]:
@@ -320,61 +305,60 @@ def _extract_task_call_blocks(text: str, subagent_needle: str) -> list[str]:
     return blocks
 
 
-def test_work_skill_uses_bare_work_worker_no_model_kwarg():
-    """Phase 2a of `work.md.tmpl` must spawn the worker via
-    `subagent_type="work:worker"` as a bare literal — no f-string, no
-    tier suffix, no `model=` kwarg adjacent to the Task call.
+def test_work_skill_spawns_envelope_worker_agent_no_bare_literal():
+    """Both spawn sites of `work.md.tmpl` must pass through the envelope's
+    `worker_agent` — `subagent_type="<worker_agent>"` — never the bare
+    `work:worker` literal and never an adjacent `model=` kwarg.
 
-    fn-593 moved tier routing into keeper's `--plugin-dir` choice,
-    so the skill's spawn target is fully tier-agnostic.
+    fn-10 moved tier routing onto the emitted `worker_agent`
+    (`plan:worker-<tier>`); the skill is a pure pass-through and keeper no
+    longer pushes `--plugin-dir`.
     """
     tmpl = _TMPL_PATH.read_text()
-    # The bare-literal spawn target must appear at least once.
-    assert 'subagent_type="work:worker"' in tmpl, (
-        'work.md.tmpl Phase 2a does not spawn `subagent_type="work:worker"` — '
-        "fn-593 requires the bare literal; tier routing now lives in "
-        "keeper's `--plugin-dir` choice."
+    # The envelope-driven spawn substitution must appear at both sites.
+    spawn_blocks = _extract_task_call_blocks(tmpl, "<worker_agent>")
+    assert len(spawn_blocks) >= 2, (
+        "work.md.tmpl must carry an envelope-driven "
+        '`subagent_type="<worker_agent>"` spawn at BOTH the warm (Phase 2a) '
+        "and cold-resume (Phase 2b) sites — fn-10 makes the skill a "
+        f"pass-through. Found {len(spawn_blocks)} such block(s)."
     )
-    # The OLD tier-suffixed shapes must not appear at the spawn site.
-    # Allow them inside fenced prose only if they're clearly historical
-    # (we check no Task(...) block carries the old shape, below).
-    assert 'subagent_type="plan:worker-<tier>"' not in tmpl, (
-        "work.md.tmpl re-introduces the old tier-suffixed literal "
-        '`subagent_type="plan:worker-<tier>"` — fn-593 retired this shape. '
-        "The spawn target is `work:worker`; tier lives on keeper's "
-        "`--plugin-dir`."
+    # The bare `work:worker` literal must be gone everywhere — fn-10 retired it.
+    assert "work:worker" not in tmpl, (
+        "work.md.tmpl still references the bare `work:worker` literal — "
+        "fn-10 retired it. The skill spawns the envelope's `worker_agent` "
+        "(`plan:worker-<tier>`); the always-loaded `plan` plugin owns all "
+        "four worker agents."
     )
+    # Keeper drops `--plugin-dir`, so the skill must not mention it either.
+    assert "plugin-dir" not in tmpl, (
+        "work.md.tmpl references `--plugin-dir` — fn-10 dropped the "
+        "launch-flag coupling; tier routing rides the emitted `worker_agent`."
+    )
+    # The skill must explain the substitution resolves to `plan:worker-<tier>`.
+    assert "plan:worker-<tier>" in tmpl, (
+        "work.md.tmpl does not name the `plan:worker-<tier>` agent shape — "
+        "the substitution prose must state that the envelope's `worker_agent` "
+        "resolves to `plan:worker-<tier>` in the always-loaded `plan` plugin."
+    )
+    # No old runtime tier-mapping f-string at the spawn site.
     assert 'subagent_type=f"plan:worker-{tier}"' not in tmpl, (
-        "work.md.tmpl re-introduces the old tier-suffixed f-string "
-        '`subagent_type=f"plan:worker-{tier}"` — fn-593 retired this shape.'
-    )
-    # No Task(...) call may reference the old `plan:worker-` namespace.
-    legacy_blocks = _extract_task_call_blocks(tmpl, "plan:worker-")
-    assert len(legacy_blocks) == 0, (
-        "work.md.tmpl has Task(...) calls still spawning `plan:worker-<tier>` "
-        "subagents — fn-593 retired this shape. Offending blocks:\n"
-        + "\n---\n".join(legacy_blocks)
+        "work.md.tmpl re-introduces a runtime tier-mapping f-string "
+        '`subagent_type=f"plan:worker-{tier}"` — the skill never maps the '
+        "tier itself; it spawns the envelope's `worker_agent` verbatim."
     )
     # The `planctl task set-tier` persist call must not appear as a LIVE
-    # bash invocation — fn-593 moved tier persistence to `planctl scaffold`
-    # (decomposition time, written into the task JSON directly). Historical
-    # mentions in guardrail prose (e.g. "no `task set-tier` write") are OK;
-    # only the executable invocation form is forbidden.
+    # bash invocation — tier persistence happens at scaffold time, written
+    # into the task JSON directly. Historical mentions in guardrail prose
+    # are OK; only the executable invocation form is forbidden.
     assert "planctl task set-tier" not in tmpl, (
-        "work.md.tmpl still invokes `planctl task set-tier` — fn-593 "
-        "moved tier persistence to scaffold time. The skill no longer "
-        "writes tier at runtime."
+        "work.md.tmpl still invokes `planctl task set-tier` — tier "
+        "persistence happens at scaffold time. The skill no longer writes "
+        "tier at runtime."
     )
-    # `model=` must not appear inside any Task(...) call that spawns the
-    # `work:worker` subagent. Prose like "do not pass `model=` on the
-    # spawn" is intentionally outside the captured block.
-    worker_blocks = _extract_task_call_blocks(tmpl, "work:worker")
-    assert len(worker_blocks) > 0, (
-        "no Task(...) blocks spawning `work:worker` found in "
-        "work.md.tmpl — the no-model-kwarg invariant cannot be checked "
-        "without at least one spawn block to inspect"
-    )
-    for block in worker_blocks:
+    # `model=` must not appear inside any Task(...) spawn block. Prose like
+    # "do not pass `model=` on the spawn" is intentionally outside the block.
+    for block in spawn_blocks:
         assert "model=" not in block, (
             f"work.md.tmpl Task(...) call carries `model=` kwarg — "
             f"the agent file owns the model. Block:\n{block}"
