@@ -599,12 +599,31 @@ subscribe clients share helpers in `src/readiness-client.ts` —
 autopilot) and `subscribeCollection` owns the single-collection
 lifecycle (git, usage); both feed `computeReadiness` / row-list
 callbacks (the pure verdict pipeline lives in `src/readiness.ts` as
-library code, not a runnable script). The subscribe clients render an
-alt-screen TUI when stdout AND stdin are both TTYs, with per-frame
-state/diff sidecars and keyboard navigation (←/h/k prev frame, →/l/j
-next, g oldest, G/End/Esc return to live, q/Ctrl-C quit) — when stdout
-or stdin isn't a TTY (piped, redirected, or under CI) the TUI gate
-collapses to plain stream output. Run any of them with
+library code, not a runnable script). All five viewers (`board`, `jobs`,
+`git`, `autopilot`, `usage`) resolve their output mode through a
+three-way TTY gate (fn-772, shared `src/snapshot.ts` / `src/view-shell.ts`
+seam): (1) **TTY stdout** → today's alt-screen live TUI, byte-for-byte
+unchanged, with per-frame state/diff sidecars and keyboard navigation
+(←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
+q/Ctrl-C quit); (2) **non-TTY stdout** (piped, redirected, or under CI) →
+**snapshot mode**: the viewer waits deterministically for the current
+fully-folded frame (a stream-readiness latch holds multi-stream views
+until every subscribed stream delivers its first frame), prints that
+frame as plain text plus a metadata block ending in one single-line,
+machine-parseable `keeper-meta: {…}` JSON record (the LAST line of
+stdout in every mode), then EXITS — no spinner spam, no unbounded
+stream, no hung tool call; (3) **`--watch`** → force the live subscribe
+stream even when piped (today's old non-TTY passthrough, never exits).
+The trigger precedence is flag (`--snapshot` / `--watch`) > env
+(`CI` / `TERM=dumb` force snapshot even under a pty) >
+`process.stdout.isTTY !== true`. Exit codes: `0` a frame was emitted
+(an empty-but-healthy projection counts), `1` no frame before the
+`--timeout <s>` (~2s default) escape (`keeper-meta.status` distinguishes
+`timeout` vs `daemon-unreachable`; the `keeper-meta:` line with
+`frame:null` still lands on stdout, the human diagnostic on stderr),
+`2` CLI misuse (`--snapshot`+`--watch`, or a bad `--timeout`). This is a
+pure client-side change — no schema bump, no `api.py` whitelist, no
+event-log/reducer/hook touch. Run any of them with
 `keeper <subcommand> --help`, or `keeper` for top-level help.
 
 - `board.ts` — epics-only "board" UI over the `epics`,
@@ -742,11 +761,14 @@ collapses to plain stream output. Run any of them with
   remain inspectable. The keymap is `←/h/k` previous frame, `→/l/j`
   next, `g` jump to oldest, `G`/`End`/`Esc` snap to live, `c` copies
   the current frame + sidecar paths to the clipboard, `q`/`Ctrl-C`
-  quit; under non-TTY (piped, redirected, CI) the TUI gate collapses
-  to plain stream output.
+  quit; under non-TTY (piped, redirected, CI) the TUI gate resolves to
+  snapshot mode (fn-772) — board is a 2-stream view, so the latch holds
+  until both streams fold before printing one frame + `keeper-meta:` and
+  exiting (`--watch` forces the old live passthrough).
 
   ```sh
   keeper board            # epics-only board, default scope
+  keeper board | tail -1  # one-shot snapshot; last line is parseable keeper-meta JSON
   ```
 
 - `jobs.ts` — live jobs-list sibling of `board.ts` (fn-658). Renders the
@@ -803,12 +825,14 @@ collapses to plain stream output. Run any of them with
   (fn-708 J7). The section sits BETWEEN the backend-coords pill and
   the sub-agent lines inside the collapse-controlled region; an empty
   / missing / malformed `monitors` blob produces no Monitors lines
-  and never crashes the render. Same sidecar / TUI / non-TTY
-  contract as board — including the SIGHUP / parent-death / TTY-loss
-  self-exit (fn-723), so an orphaned jobs viewer exits within ~2s.
+  and never crashes the render. Same sidecar / TUI / non-TTY snapshot
+  (fn-772) / `--watch` contract as board (jobs is single-stream, so its
+  latch is just the first frame) — including the SIGHUP / parent-death /
+  TTY-loss self-exit (fn-723), so an orphaned jobs viewer exits within ~2s.
 
   ```sh
-  keeper jobs             # live jobs list, default scope
+  keeper jobs             # live jobs list (TTY); non-TTY → one snapshot + exit
+  keeper jobs | tail -1   # last line is the parseable keeper-meta JSON record
   ```
 
 - `autopilot.ts` — thin viewer + control surface over the server-side
@@ -868,14 +892,20 @@ collapses to plain stream output. Run any of them with
     lists the explicitly-armed epic ids.
 
   Alt-screen TUI when stdout is a TTY; keymap `←/h/k` / `→/l/j` / `g` /
-  `G/Esc` / `space` pause / `c` copy / `q` quit. SIGINT tears down the
-  renderer (alt-screen exit, raw mode off) then disposes the subscribe
-  helper — as do SIGHUP, parent-death (a ~2s `ppid === 1` poll), and
-  controlling-TTY loss (stdin EOF), so an orphaned viewer self-exits
-  within ~2s (fn-723).
+  `G/Esc` / `space` pause / `c` copy / `q` quit. Non-TTY stdout → snapshot
+  mode (fn-772): autopilot is the widest view (4 streams — readiness,
+  `dispatch_failures`, `autopilot_state`, `armed_epics`), so the latch
+  holds until ALL FOUR fold before printing one composite frame +
+  `keeper-meta:` and exiting; `--watch` forces the live passthrough. SIGINT
+  tears down the renderer (alt-screen exit, raw mode off) then disposes the
+  subscribe helper — as do SIGHUP, parent-death (a ~2s `ppid === 1` poll),
+  and controlling-TTY loss (stdin EOF), so an orphaned viewer self-exits
+  within ~2s (fn-723). The four control verbs (`play`/`pause`/`mode`/`arm`/
+  `disarm`/`retry`) are unaffected — the snapshot gate is viewer-only.
 
   ```sh
   keeper autopilot                       # viewer: current / failed / armed + mode banner
+  keeper autopilot | tail -1             # non-TTY → one snapshot + parseable keeper-meta JSON
   keeper autopilot play                  # un-pause the reconciler
   keeper autopilot pause                 # pause the reconciler (default at boot)
   keeper autopilot mode armed            # work only armed epics + their upstream closure
@@ -906,7 +936,9 @@ collapses to plain stream output. Run any of them with
   `/tmp` sidecar files (JSON state, frame text, unified diff vs.
   previous) + alt-screen TUI when stdout/stdin are both TTYs (ring-
   buffered frame history, keymap `←/h/k`/`→/l/j`/`g`/`G`/`Esc`/`q`;
-  under non-TTY the TUI gate collapses to plain stream output).
+  under non-TTY the TUI gate resolves to snapshot mode — fn-772's early
+  proof point: single-stream `git`, so the latch is the first frame; one
+  frame + `keeper-meta:` then exit 0, `--watch` forces live passthrough).
   `--project-dir <path>` filters to one worktree root. SIGINT tears
   down the renderer (alt-screen exit, raw mode off) then disposes the
   subscribe helper and exits 0 — as do SIGHUP, parent-death (a ~2s
@@ -914,8 +946,10 @@ collapses to plain stream output. Run any of them with
   orphaned viewer self-exits within ~2s (fn-723).
 
   ```sh
-  keeper git                          # all worktrees
+  keeper git                          # all worktrees (TTY); non-TTY → one snapshot + exit 0
   keeper git --project-dir /path/to   # one worktree only
+  keeper git --snapshot | tail -1     # forced one-shot from a TTY; last line is keeper-meta JSON
+  keeper git --watch | head           # forced live stream even when piped (never exits)
   ```
 
 - `usage.ts` — single-collection subscribe client (schema v35 / fn-642
@@ -951,11 +985,16 @@ collapses to plain stream output. Run any of them with
   `ppid === 1` poll), and controlling-TTY loss (stdin EOF), so an
   orphaned usage viewer self-exits within ~2s (fn-723); usage wires the
   shared `armViewerExitTriggers` despite keeping its own raw SIGINT
-  teardown.
+  teardown. Non-TTY stdout → snapshot mode (fn-772): single-stream, so the
+  latch is the first frame; usage is the open-coded outlier (own
+  frameCount / emitFrame / sidecar / exit path) but reuses the SHARED
+  `keeper-meta:` trailer helper so the record shape never drifts from the
+  other four. `--watch` forces the live passthrough.
 
   ```sh
-  keeper usage                # all profiles
+  keeper usage                # all profiles (TTY); non-TTY → one snapshot + exit
   keeper usage --sock /tmp/x  # socket override
+  keeper usage | tail -1      # last line is the parseable keeper-meta JSON record
   ```
 
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions

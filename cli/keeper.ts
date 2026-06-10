@@ -42,11 +42,11 @@ Usage:
   keeper <subcommand> [options]
 
 Subcommands:
-  board               Epics board
-  jobs                Live jobs list (with dead-letter banner + 'r' replay key)
-  git                 Live git status frames
-  usage               Live usage frames
-  autopilot           Dispatch log viewer
+  board               Epics board (TTY: live TUI; non-TTY: one snapshot + exit)
+  jobs                Jobs list w/ dead-letter banner + 'r' replay (TTY: live; non-TTY: snapshot)
+  git                 Git status frames (TTY: live TUI; non-TTY: one snapshot + exit)
+  usage               Usage frames (TTY: live TUI; non-TTY: one snapshot + exit)
+  autopilot           Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)
   await               Block until a planctl/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
   session-state       Current session git context + on-hook files (JSON)
@@ -55,6 +55,13 @@ Subcommands:
 Flags:
   --help, -h     Show this help
   --version, -V  Show keeper version
+
+The five viewer subcommands (board/jobs/git/usage/autopilot) auto-detect a
+non-TTY stdout (piped, redirected, CI) and emit ONE current frame followed by
+a machine-parseable \`keeper-meta:\` JSON line, then exit — instead of streaming
+forever. Override per subcommand with \`--snapshot\` (force one-shot on a TTY),
+\`--watch\` (force the live stream even when piped — never exits), or
+\`--timeout <s>\` (snapshot wait, ~2s default).
 
 Run \`keeper <subcommand> --help\` for subcommand-specific options.
 `;

@@ -113,6 +113,16 @@ the monitor — NOT the same turn you launch it (that race trips the
 refusal). If you just launched the background task this turn, let it
 appear in a `keeper jobs` snapshot first, then wire the await.
 
+> **Reading `keeper jobs` from an agent.** A bare `keeper jobs` already
+> behaves as a one-shot snapshot read in an agent (non-TTY stdout, fn-772):
+> it prints the current frame plus a final `keeper-meta:` JSON line and
+> exits, so you can run it directly (e.g. `keeper jobs | tail -1` for just
+> the parseable record). Do NOT append `--snapshot` — it's redundant here.
+> NEVER append `--watch`: that forces the live stream and HANGS the tool
+> call forever. (The "snapshot" the bullets above refer to is the daemon's
+> Stop-time monitor-list capture — a separate concept from this output
+> mode, but the bare command is the right way to observe it.)
+
 For each planctl segment, verify the id exists and is awaitable before
 wiring Monitor. `planctl show` is read-only and fast.
 
