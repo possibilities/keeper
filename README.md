@@ -537,7 +537,16 @@ Keeper has no `install` verb. Wire it up manually:
    writes the user's real state dir — build the sandboxed env via the shared
    `sandboxEnv(...)` in `test/helpers/sandbox-env.ts` rather than restating the
    path list at each spawn site (it sets the state paths LAST so a caller can't
-   strand one, and optionally adds the sixth `KEEPER_ZELLIJ_EVENTS_DIR`). The restore worker (epic fn-677, two-tier
+   strand one, and optionally adds the sixth `KEEPER_ZELLIJ_EVENTS_DIR`). The
+   suite carries TWO complementary test helpers (fn-769): `sandboxEnv` isolates
+   the state paths for any test that launches a real subprocess (hook / daemon /
+   CLI), while the template-DB helper in `test/helpers/template-db.ts`
+   (`freshDb()` / `freshDbFile()`) serves pure in-process unit tests that only
+   need a migrated schema — it migrates one `:memory:` DB per file-process,
+   `serialize()`s it once, and deserializes a per-test clone (~0.2ms) instead of
+   re-running the 63-version `migrate()` ladder on every `openDb(":memory:")`,
+   which is what made the default `bun test` fast (the slow process-level files
+   are tiered behind `bun run test:full`; see CLAUDE.md `## Test isolation`). The restore worker (epic fn-677, two-tier
    rework fn-702) writes `~/.local/state/keeper/restore.json` (the
    Chrome-style "restore previous session" snapshot — agents + zellij
    metadata for `scripts/restore-agents.ts` to replay against) as a

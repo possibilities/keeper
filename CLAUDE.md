@@ -185,6 +185,30 @@ applies the state paths LAST (after any caller `extra`/undefined-clear) so a
 caller can't re-strand one: pass `includeZellij: true` to add the sixth
 `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684) for hook-spawn tests.
 
+**Two test helpers, two jobs (fn-769).** `sandboxEnv` is for process-spawn
+isolation — any test that launches the real hook/daemon/CLI subprocess. The
+template-DB helper in `test/helpers/template-db.ts` (`freshDb()` /
+`freshDbFile()`) is for pure IN-PROCESS unit tests that just need a migrated
+schema: it migrates ONE `:memory:` DB per file-process, `serialize()`s it once,
+and hands each test a `Database.deserialize` clone (~0.2ms) instead of re-running
+the 63-version `migrate()` ladder per `openDb(":memory:")` (~27-40ms × ~1,200
+calls ≈ the suite's dominant cost). Reach for `freshDb()` in reducer/projection
+unit tests; keep a real `openDb` only when the test EXERCISES migration itself
+(`db.test.ts`) or owns a subprocess. The helper hard-throws on a schema-version
+mismatch, so a stale template fails loudly rather than handing tests a sub-current
+schema.
+
+**Two tiers (fn-769).** The default `bun test` runs the FAST tier only —
+`--path-ignore-patterns` prunes the ~25 process-level integration files (daemon
+boot, hook subprocess spawn, git plumbing, the real `db.test.ts` migration
+ladder) and chains the serial-safe opentui files, targeting <5s wall on the
+10-core dev machine. `bun run test:full` runs EVERY file exactly once (fast +
+slow + opentui, no double-run) and is the real gate: **`test:full` is mandatory
+before landing any change that touches daemon / worker / db / hook / git process
+paths or any slow-tier file** — the default fast run does NOT cover those, and
+the slow tier breaking silently is the dominant failure mode until the follow-up
+local-CI epic lands. When in doubt, run `test:full`.
+
 ## Autopilot
 
 The server-side reconciler dispatches workers against ready plan work. It **boots
