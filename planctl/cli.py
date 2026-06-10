@@ -902,6 +902,78 @@ def reconcile_cmd(task_id, project):
     return _lazy_import("planctl.run_reconcile")(task_id=task_id, project=project)
 
 
+_CLOSE_FINALIZE_AGENT_HELP = """\
+planctl close-finalize <epic_id>
+
+Encodes the /plan:close saga in Python, deriving its position purely from
+observable state (the persisted audit artifacts + the epic's own status) — there
+is NO saga-state file. Every reversible check runs FIRST; the irreversible
+`epic close` mutation runs LAST, so a crash mid-saga always leaves the source
+epic OPEN and the verb re-runnable.
+
+Saga order:
+
+  1. Epic already `done` → return the prior terminal outcome idempotently (a
+     follow-up wired + complete → `closed_with_followup`; else `closed_clean`).
+     `epic close` is NEVER called twice.
+  2. Re-derive `commit_set_hash` FRESH; a mismatch vs the persisted verdict's
+     stamped hash → `STALE_ARTIFACTS` (a commit landed after the audit; refuse,
+     never delete — a /plan:close re-run overwrites the artifacts).
+  3. verdict.json missing → `VERDICT_MISSING`; `fatal: true` → outcome
+     `fatal_halt` (no close; epic stays open).
+  4. Zero surviving decisions (all culled or empty) → `epic close` →
+     `closed_clean`.
+  5. Else the kept/merged findings need a follow-up. `expected` = distinct
+     non-null kept/merged ordinals. A wired+complete follow-up → adopt, skip
+     scaffold, close → `closed_with_followup`. Wired+partial (a crashed
+     mid-scaffold run) → `partial_followup` (stop; no scaffold, no close).
+     Absent → scaffold from the persisted followup.yaml (missing →
+     `FOLLOWUP_MISSING`), then close → `closed_with_followup`.
+
+Returned envelope (success, exit 0):
+
+  {"success": true,
+   "outcome": "closed_clean|closed_with_followup|fatal_halt|partial_followup",
+   "epic_id": "<id>",
+   "finalized_at": "<iso>",
+   "new_epic_id": "<id>",      # closed_with_followup / partial_followup only
+   "fatal_reason": "<str>",    # fatal_halt only
+   "expected_tasks": <int>,    # partial_followup only
+   "actual_tasks": <int>,      # partial_followup only
+   "planctl_invocation": {...}}   # read-only invocation footer
+
+finalize draws no `.planctl/` commit of its own — `epic close` and `scaffold`
+land their own commits; finalize orchestrates them and reports the typed
+outcome. Resolution is cwd-based via `resolve_project` (or `--project <abs>`).
+
+Failure envelope (no mutation; exit 1):
+
+  {"success": false,
+   "error": {"code": "<code>", "message": "<msg>", "details": {...}}}
+
+Codes: `BAD_EPIC_ID` (garbage, or a task-shaped id naming its parent epic),
+`NOT_A_PROJECT`, `EPIC_NOT_FOUND`, `STALE_ARTIFACTS`, `VERDICT_MISSING`,
+`VERDICT_CORRUPT`, `FOLLOWUP_MISSING`, `SCAFFOLD_FAILED`, `COMMIT_LOOKUP_FAILED`.
+"""
+
+
+@cli.command("close-finalize")
+@click.argument("epic_id")
+@click.option(
+    "--project",
+    default=None,
+    help=(
+        "Absolute path to the planctl project (bypasses cwd-walk). "
+        "Mirrors `close-preflight`'s --project flag. Relative paths raise "
+        "UsageError; unset falls back to the resolve_project() cwd-walk."
+    ),
+)
+@agent_help_option(_CLOSE_FINALIZE_AGENT_HELP)
+def close_finalize_cmd(epic_id, project):
+    """Encode the /plan:close saga: stale-check, fatal-halt, clean/follow-up close — typed outcome from observable state."""
+    return _lazy_import("planctl.run_close_finalize")(epic_id=epic_id, project=project)
+
+
 @cli.command("done")
 @click.argument("task_id")
 @click.option("--summary", default=None, help="Completion summary text")
@@ -1238,50 +1310,6 @@ def epic_add_deps_cmd(epic_id, dep_ids, skip_invalid):
 def epic_rm_dep_cmd(epic_id, dep_id):
     """Remove an epic-level dependency."""
     return _lazy_import("planctl.run_epic_rm_dep")(epic_id=epic_id, dep_id=dep_id)
-
-
-_EPIC_FOLLOWUP_OF_AGENT_HELP = """\
-planctl epic followup-of <source_epic_id>
-
-Read-only follow-up lookup for the /plan:close skill (fn-589 task .1, item 7).
-Collapses Phase 7's hand-fired `epics --status open` + per-row JSON walk into
-one verb returning a single envelope.  Scans open epics for the one whose
-`depends_on_epics` contains <source_epic_id>; returns the first hit in
-alphabetic (sorted) filename order — deterministic across filesystems.
-
-Returned envelope (success, exit 0):
-
-  Found:    {"success": true,
-             "found": true,
-             "epic_id": "<follow-up epic id>",
-             "actual_tasks": <int>,
-             "depends_on_epics": [<source>, ...],
-             "status": "<open|closed|done>",
-             "planctl_invocation": {...}}    # readonly invocation line
-  Absent:   {"success": true,
-             "found": false,
-             "planctl_invocation": {...}}
-
-The verb does NOT compute "completeness" — the caller compares
-`actual_tasks` against its in-memory expected count.
-
-Failure envelope (no mutation; exit 1):
-
-  {"success": false,
-   "error": {"code": "<code>", "message": "<msg>", "details": {...}}}
-
-Codes: `BAD_EPIC_ID`.  A missing source epic is NOT an error — the verb
-still returns `{found: false}` because no follow-up can wire to a dep that
-doesn't exist on disk, so the answer to "is there a follow-up?" is no.
-"""
-
-
-@epic_group.command("followup-of")
-@click.argument("source_epic_id")
-@agent_help_option(_EPIC_FOLLOWUP_OF_AGENT_HELP)
-def epic_followup_of_cmd(source_epic_id):
-    """Find a single open epic that depends on <source_epic_id> (fn-589 task .1, item 7)."""
-    return _lazy_import("planctl.run_epic_followup_of")(source_epic_id=source_epic_id)
 
 
 @epic_group.command("set-primary-repo")
