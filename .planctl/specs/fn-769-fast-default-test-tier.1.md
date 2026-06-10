@@ -38,5 +38,5 @@ Add a small `test/template-db.test.ts` self-test: a fresh clone has `PRAGMA fore
 - [ ] Full suite still green (`bun run test`)
 
 ## Done summary
-
+Added test/helpers/template-db.ts (freshMemDb/freshDbFile) that migrates one :memory: DB per process and deserializes a private clone per test, with a stale-template schema_version guard; exported applyPragmas + prepareStmts from db.ts and swapped reducer.test.ts to freshMemDb (28.9s -> 1.9s solo). New self-test pins clone invariants; lint/typecheck/full suite green.
 ## Evidence
