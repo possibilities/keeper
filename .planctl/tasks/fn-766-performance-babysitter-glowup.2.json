@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T01:03:51.161618Z",
+  "depends_on": [
+    "fn-766-performance-babysitter-glowup.1"
+  ],
+  "epic": "fn-766-performance-babysitter-glowup",
+  "id": "fn-766-performance-babysitter-glowup.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "New watches for new landscape",
+  "updated_at": "2026-06-10T01:03:51.161618Z"
+}
