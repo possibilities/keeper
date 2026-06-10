@@ -689,3 +689,232 @@ test("disarm() clears the ppid poll interval", () => {
   disarm();
   expect(intervals.cleared.length).toBe(clearedBefore + 1);
 });
+
+// ---------------------------------------------------------------------------
+// fn-772: snapshot mode. A non-TTY / `--snapshot` run captures the first
+// ready composite, prints it + a `keeper-meta:` trailer, disposes the
+// subscription, and exits — no live shell, no connecting spinner. We drive
+// it with the injectable `snapshotIo` (captured stdout/stderr sinks, a
+// fake `exit` recorder, a captured latch timer) so neither `process.exit`
+// nor a real 2s timer escapes into the runner.
+// ---------------------------------------------------------------------------
+
+interface SnapshotHarness {
+  stdout: string[];
+  stderr: string[];
+  exits: number[];
+  disposed: number;
+  fireTimeout: () => void;
+  timeoutCleared: number;
+  io: import("../src/view-shell").SnapshotIo;
+}
+
+function makeSnapshotHarness(): SnapshotHarness {
+  const stdout: string[] = [];
+  const stderr: string[] = [];
+  const exits: number[] = [];
+  let timeoutCb: (() => void) | null = null;
+  let timeoutCleared = 0;
+  const h: SnapshotHarness = {
+    stdout,
+    stderr,
+    exits,
+    disposed: 0,
+    fireTimeout(): void {
+      timeoutCb?.();
+    },
+    get timeoutCleared() {
+      return timeoutCleared;
+    },
+    io: {
+      stdoutWrite: (s) => stdout.push(s),
+      stderrWrite: (s) => stderr.push(s),
+      exit: ((code: number): never => {
+        exits.push(code);
+        // Throw to stop execution exactly where `process.exit` would — the
+        // caller's `runSnapshot` returns void, so a thrower mirrors the
+        // never-return contract under bun:test.
+        throw new Error(`__SNAPSHOT_EXIT_${code}__`);
+      }) as (code: number) => never,
+      nowIso: () => "2026-06-10T00:00:00.000Z",
+      setTimeoutFn: (cb) => {
+        timeoutCb = cb;
+        return 1;
+      },
+      clearTimeoutFn: () => {
+        timeoutCleared += 1;
+      },
+    },
+  };
+  return h;
+}
+
+function parseSnapshotTrailer(joined: string): Record<string, unknown> {
+  const lines = joined.split("\n").filter((l) => l.length > 0);
+  const last = lines.at(-1);
+  if (last === undefined) throw new Error("no stdout");
+  expect(last.startsWith("keeper-meta: ")).toBe(true);
+  return JSON.parse(last.slice("keeper-meta: ".length)) as Record<
+    string,
+    unknown
+  >;
+}
+
+test("snapshot: first ready composite prints frame + keeper-meta: line, exits 0", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+  });
+
+  // A lifecycle event in snapshot mode must NOT arm the connecting spinner.
+  view.emitLifecycle("connecting", {});
+  expect(intervals.callbacks).toHaveLength(0);
+
+  // The single stream's first frame.
+  view.emit({ body: ["worktree a", "worktree b"] });
+
+  // runSnapshot resolves synchronously (latch satisfied) — the exit
+  // thrower fires from inside it.
+  expect(() =>
+    view?.runSnapshot(() => {
+      h.disposed += 1;
+    }),
+  ).toThrow("__SNAPSHOT_EXIT_0__");
+
+  expect(h.exits).toEqual([0]);
+  expect(h.disposed).toBe(1);
+  // Still no spinner interval armed across the whole run.
+  expect(intervals.callbacks).toHaveLength(0);
+
+  const joined = h.stdout.join("");
+  expect(joined).toContain("worktree a");
+  expect(joined).toContain("worktree b");
+  const trailer = parseSnapshotTrailer(joined);
+  expect(trailer.status).toBe("ok");
+  expect(trailer.frame).toBe(1);
+  expect(trailer.truncated).toBe(false);
+  expect(trailer.schema_version).toBe(1);
+  expect(typeof trailer.state).toBe("string");
+});
+
+test("snapshot: empty-but-healthy projection still emits a frame and exits 0", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+  });
+  view.emitLifecycle("connected", {});
+  // An empty collection still delivers a first `onRows([])` → emit with an
+  // empty/placeholder body. Healthy daemon, zero rows → a real frame.
+  view.emit({ body: ["no changes"] });
+  expect(() =>
+    view?.runSnapshot(() => {
+      h.disposed += 1;
+    }),
+  ).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+  const trailer = parseSnapshotTrailer(h.stdout.join(""));
+  expect(trailer.status).toBe("ok");
+  expect(trailer.frame).toBe(1);
+});
+
+test("snapshot: timeout with 0 streams reported → frame:null on stdout, diagnostic on stderr, exit 1", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+  });
+  // No `connected`, no `emit` — fire the timeout. daemon-unreachable.
+  view.runSnapshot(() => {
+    h.disposed += 1;
+  });
+  expect(() => h.fireTimeout()).toThrow("__SNAPSHOT_EXIT_1__");
+
+  expect(h.exits).toEqual([1]);
+  expect(h.disposed).toBe(1);
+  // stderr carries the human diagnostic; stdout still carries a parseable
+  // keeper-meta: line with frame:null.
+  expect(h.stderr.join("")).toContain("no frame");
+  const trailer = parseSnapshotTrailer(h.stdout.join(""));
+  expect(trailer.frame).toBeNull();
+  expect(trailer.status).toBe("daemon-unreachable");
+  expect(trailer.truncated).toBe(true);
+});
+
+test("snapshot: connected-then-timeout (no frame) reports status:timeout", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+  });
+  view.emitLifecycle("connected", {});
+  view.runSnapshot(() => {
+    h.disposed += 1;
+  });
+  expect(() => h.fireTimeout()).toThrow("__SNAPSHOT_EXIT_1__");
+  expect(h.exits).toEqual([1]);
+  const trailer = parseSnapshotTrailer(h.stdout.join(""));
+  expect(trailer.status).toBe("timeout");
+  expect(trailer.frame).toBeNull();
+});
+
+test("snapshot: timeout-degrade with a partial composite emits truncated:true, exit 0", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    // 2 streams — only one will report before the timeout.
+    mode: "snapshot",
+    streamCount: 2,
+    snapshotIo: h.io,
+  });
+  view.emitLifecycle("connected", {});
+  view.emit({ body: ["partial composite"] }); // 1 of 2 streams
+  view.runSnapshot(() => {
+    h.disposed += 1;
+  });
+  // Latch not satisfied (2 needed, 1 reported) → still pending; fire timeout.
+  expect(() => h.fireTimeout()).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+  const joined = h.stdout.join("");
+  expect(joined).toContain("partial composite");
+  const trailer = parseSnapshotTrailer(joined);
+  expect(trailer.status).toBe("ok");
+  expect(trailer.truncated).toBe(true);
+  expect(trailer.frame).toBe(1);
+});
+
+test("snapshot: a frame racing the timeout resolves exactly once (no double-exit)", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 1,
+    snapshotIo: h.io,
+  });
+  view.emit({ body: ["row"] });
+  // Latch satisfied synchronously on runSnapshot → exit 0.
+  expect(() =>
+    view?.runSnapshot(() => {
+      h.disposed += 1;
+    }),
+  ).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+  // A late timeout fire after settle is a no-op — no second exit.
+  h.fireTimeout();
+  expect(h.exits).toEqual([0]);
+});

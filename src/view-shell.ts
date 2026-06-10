@@ -60,6 +60,17 @@ import {
   createRefoldProgressPoller,
   type RefoldProgressPoller,
 } from "./refold-progress";
+import {
+  createSnapshotLatch,
+  DEFAULT_SNAPSHOT_TIMEOUT_MS,
+  formatNoFrameOutput,
+  formatSnapshotOutput,
+  SNAPSHOT_SCHEMA_VERSION,
+  type SnapshotLatchOutcome,
+  type SnapshotMeta,
+  type SnapshotStatus,
+  type SnapshotTimerHandle,
+} from "./snapshot";
 
 /**
  * Selection-highlight protocol. A `renderBody` may prefix exactly one of
@@ -226,6 +237,54 @@ export interface ViewShellOptions<TSnap> {
    * and `installSigintHandler`'s teardown.
    */
   refoldProgressPoller?: RefoldProgressPoller;
+  /**
+   * Run mode (fn-772). `"live"` (default) is today's subscribe-driven TUI
+   * stream — no behavior delta. `"snapshot"` waits for the first ready
+   * composite frame, prints it + a `keeper-meta:` trailer, and exits. The
+   * caller computes this via `resolveSnapshotMode` (flag > env > isTTY) and
+   * drives `runSnapshot` instead of `installSigintHandler`.
+   */
+  mode?: "live" | "snapshot";
+  /**
+   * Snapshot mode only: how many subscribed streams must each deliver a
+   * first frame before the composite is trustworthy (1 for a single-stream
+   * view, 2 for board, 4 for autopilot). The readiness client's own
+   * first-paint gate already withholds the first `emit` until every stream
+   * has produced a `result`, so each `view.emit` reports once; the latch
+   * holds the snapshot until `streamCount` reports land or the timeout
+   * fires. Defaults to 1.
+   */
+  streamCount?: number;
+  /**
+   * Snapshot mode only: the wait before the non-deterministic timeout
+   * escape fires (ms). Defaults to {@link DEFAULT_SNAPSHOT_TIMEOUT_MS}.
+   */
+  timeoutMs?: number;
+  /**
+   * Snapshot mode only: injectable IO + clock for tests. Production omits
+   * it (the real `process` stdout/stderr/exit + global timers). Tests pass
+   * a fake `exit` (a thrower, like `test/keeper-cli.test.ts`) and capture
+   * sinks so `process.exit` doesn't actually fire under `bun:test`, and a
+   * captured `setTimeoutFn` so the timeout escape can be driven
+   * synchronously.
+   */
+  snapshotIo?: SnapshotIo;
+}
+
+/** Injectable IO + clock for the snapshot path (tests only; prod omits). */
+export interface SnapshotIo {
+  /** stdout sink (default `process.stdout.write`). */
+  stdoutWrite?: (s: string) => void;
+  /** stderr sink (default `process.stderr.write`). */
+  stderrWrite?: (s: string) => void;
+  /** Process exit (default `process.exit`; tests inject a thrower). */
+  exit?: (code: number) => never;
+  /** Clock for the trailer `ts` (default `() => new Date().toISOString()`). */
+  nowIso?: () => string;
+  /** Timer set for the latch (default global `setTimeout`). */
+  setTimeoutFn?: (cb: () => void, ms: number) => SnapshotTimerHandle;
+  /** Timer clear for the latch (default global `clearTimeout`). */
+  clearTimeoutFn?: (handle: SnapshotTimerHandle) => void;
 }
 
 export interface ViewShell<TSnap> {
@@ -281,6 +340,24 @@ export interface ViewShell<TSnap> {
    * sidecar paths, exit 0. Idempotent — safe to call once.
    */
   installSigintHandler: (onDispose: () => void) => void;
+  /**
+   * Snapshot-mode driver (fn-772) — the snapshot analog of
+   * `installSigintHandler`. The caller wires its subscription(s) (whose
+   * `onRows`/`onSnapshot` call `view.emit`), then calls this with the
+   * subscription teardown. It arms the stream-readiness latch:
+   *
+   *   - The first ready composite (latch satisfied) → write sidecars once,
+   *     print the frame + `keeper-meta:` block to stdout, dispose the
+   *     handle(s), exit 0.
+   *   - Timeout with ≥1 stream reported → emit the partial composite with
+   *     `truncated:true`, exit 0.
+   *   - Timeout with 0 streams reported → no-frame: diagnostic on stderr,
+   *     `keeper-meta:` (frame:null) on stdout, exit 1.
+   *
+   * Only meaningful when `mode === "snapshot"`. A single `settled` flag
+   * guards the frame-vs-timeout race so the snapshot resolves once.
+   */
+  runSnapshot: (onDispose: () => void) => void;
   /** Last frame text emitted (lead + body), for `handleCopyKey` callers. */
   getLastFrameText: () => string | null;
   /** Current frame index (1-based; 0 before the first emit). */
@@ -292,6 +369,9 @@ export function createViewShell<TSnap>(
 ): ViewShell<TSnap> {
   const { script, renderBody, persistentBannerPill } = opts;
   const title = opts.title ?? script;
+  const mode = opts.mode ?? "live";
+  const isSnapshot = mode === "snapshot";
+  const timeoutMs = opts.timeoutMs ?? DEFAULT_SNAPSHOT_TIMEOUT_MS;
 
   // Sidecar paths — keyed on `<script>.<pid>` exactly as the pre-factory
   // siblings emitted. Bit-for-bit shape preservation: any consumer that
@@ -325,6 +405,24 @@ export function createViewShell<TSnap>(
   let lastBody: string | null = null;
   let lastFrameText: string | null = null;
   let frameCount = 0;
+
+  // Snapshot-mode holding slot (fn-772). In snapshot mode `emit` does NOT
+  // paint or write sidecars — it captures the latest rendered composite
+  // here and reports the latch once. `runSnapshot` reads the captured
+  // composite when the latch resolves, writes the sidecars ONE time, prints
+  // the frame + trailer, and exits. `null` until the first `emit`.
+  let snapshotCapture: { bodyLines: string[]; stateJson: unknown } | null =
+    null;
+  let latchReported = false;
+  // Track whether the subscription ever reported `connected` so the no-frame
+  // path can distinguish `timeout` (connected, daemon serving, but no frame
+  // before the deadline) from `daemon-unreachable` (never connected).
+  let sawConnected = false;
+  // Wired by `runSnapshot` to the latch's `reportStream`. A no-op until then
+  // so an `emit` that races ahead of `runSnapshot` (shouldn't happen — the
+  // caller wires subscriptions then calls `runSnapshot` synchronously) is
+  // still captured into `snapshotCapture`; `runSnapshot` replays the report.
+  let reportLatch: () => void = () => {};
 
   // Connecting-indicator spinner state. A single `setInterval` (~125ms)
   // animates the braille dots and re-polls the re-fold poller until the
@@ -468,7 +566,14 @@ export function createViewShell<TSnap>(
   }
 
   const liveShell: LiveShell = createLiveShell({
-    enabled: true,
+    // Snapshot mode never paints a live frame: pass `enabled: false` so no
+    // OpenTUI renderer is constructed and the shell is a clean no-op (its
+    // `pushFrame`/`refreshLive`/`dispose` are inert). The snapshot path
+    // short-circuits before any `pushFrame` anyway, but a disabled shell is
+    // the belt-and-suspenders guarantee that the connecting-spinner overlay
+    // (`refreshLive`) and the passthrough frame write can never reach
+    // stdout and corrupt the single-frame snapshot output.
+    enabled: !isSnapshot,
     title,
     captureKeys: opts.captureKeys,
     onUnhandledKey: (key) => {
@@ -566,6 +671,20 @@ export function createViewShell<TSnap>(
 
   function emit(snap: TSnap): boolean {
     const { bodyLines, stateJson } = renderBody(snap);
+    // Snapshot mode: capture the latest composite + report the latch on the
+    // FIRST emit (the readiness client's first-paint gate guarantees every
+    // stream has folded before this fires). No live paint, no per-emit
+    // sidecar write — `runSnapshot` writes the sidecar once at resolution.
+    // We always capture (so a later emit before the latch resolves keeps
+    // the freshest composite) but report only once.
+    if (isSnapshot) {
+      snapshotCapture = { bodyLines, stateJson };
+      if (!latchReported) {
+        latchReported = true;
+        reportLatch();
+      }
+      return true;
+    }
     // The byte-compare body KEEPS the selection prefix so moving the
     // selection (which only changes which line carries the prefix)
     // invalidates the cache and repaints.
@@ -620,6 +739,11 @@ export function createViewShell<TSnap>(
     if (event === "disconnected") {
       lastBody = null;
     }
+    // Snapshot mode: latch whether we ever reached `connected` so the
+    // no-frame trailer reports `timeout` vs `daemon-unreachable` honestly.
+    if (event === "connected") {
+      sawConnected = true;
+    }
     // Connecting indicator: arm a single ~125ms `setInterval` until the
     // first real frame paints, so the spinner animates smoothly during a
     // multi-minute boot re-fold (the subscribe socket isn't bound during
@@ -630,8 +754,11 @@ export function createViewShell<TSnap>(
     // line. The `frameCount === 0` gate means a transient disconnect
     // after data is on screen keeps the last good frame rather than
     // flicking back to "connecting". Self-stops on first frame; also
-    // cleared from the SIGINT teardown.
-    if (frameCount === 0 && event !== "connected") {
+    // cleared from the SIGINT teardown. NEVER armed in snapshot mode — the
+    // spinner's `refreshLive` overlay would write `connecting…` lines to
+    // stdout and corrupt the single-frame snapshot output (the open-coded
+    // passthrough that snapshot mode replaces had exactly this spam bug).
+    if (!isSnapshot && frameCount === 0 && event !== "connected") {
       armConnectingSpinner();
     }
   }
@@ -681,6 +808,126 @@ export function createViewShell<TSnap>(
     armViewerExitTriggers(exitCleanly);
   }
 
+  function runSnapshot(onDispose: () => void): void {
+    const io = opts.snapshotIo ?? {};
+    const stdoutWrite =
+      io.stdoutWrite ?? ((s: string) => void process.stdout.write(s));
+    const stderrWrite =
+      io.stderrWrite ?? ((s: string) => void process.stderr.write(s));
+    const exit = io.exit ?? ((code: number) => process.exit(code));
+    const nowIso = io.nowIso ?? (() => new Date().toISOString());
+
+    // Single `settled` guard so a frame racing the timeout can't
+    // double-print / double-exit.
+    let settled = false;
+
+    function buildMeta(input: {
+      status: SnapshotStatus;
+      truncated: boolean;
+      frame: number | null;
+      state: string | null;
+      frameTxt: string | null;
+    }): SnapshotMeta {
+      return {
+        schema_version: SNAPSHOT_SCHEMA_VERSION,
+        script,
+        pid,
+        status: input.status,
+        frame: input.frame,
+        frame_count: input.frame === null ? 0 : 1,
+        truncated: input.truncated,
+        state: input.state,
+        frame_txt: input.frameTxt,
+        lifecycle: lifecycleSidecar,
+        meta: metaSidecar,
+        ts: nowIso(),
+      };
+    }
+
+    function finish(outcome: SnapshotLatchOutcome): void {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      latch.cancel();
+
+      const haveFrame = snapshotCapture !== null;
+      if (haveFrame && snapshotCapture !== null) {
+        // A frame was captured (ready, or timeout-degrade with ≥1 stream).
+        // Bump frameCount to 1 so the sidecar filenames are frame-1 and the
+        // trailer's `frame` matches, then write the sidecars ONCE.
+        const { bodyLines, stateJson } = snapshotCapture;
+        const truncated = outcome.kind === "timeout";
+        frameCount = 1;
+        const frameText = sidecarFrameText(bodyLines);
+        const stateSidecar = `/tmp/keeper-${script}.${pid}.state.${frameCount}.json`;
+        const frameSidecar = `/tmp/keeper-${script}.${pid}.frame.${frameCount}.txt`;
+        writeSidecars(stateJson, frameText);
+        const meta = buildMeta({
+          status: "ok",
+          truncated,
+          frame: frameCount,
+          state: stateSidecar,
+          frameTxt: frameSidecar,
+        });
+        // The printed frame text drops the sidecar's `---` lead — the lead
+        // is a sidecar/diff artifact, not part of the human/agent frame.
+        const printedFrame = bodyLines
+          .map((l) => stripSelectionPrefix(l).text)
+          .join("\n");
+        stdoutWrite(formatSnapshotOutput({ frameText: printedFrame, meta }));
+        liveShell.dispose();
+        onDispose();
+        exit(0);
+        return;
+      }
+
+      // No frame before the deadline. `daemon-unreachable` iff we never
+      // saw a `connected` lifecycle; otherwise the daemon was serving but
+      // didn't deliver a frame in time → `timeout`.
+      const status: SnapshotStatus = sawConnected
+        ? "timeout"
+        : "daemon-unreachable";
+      const meta = buildMeta({
+        status,
+        truncated: true,
+        frame: null,
+        state: null,
+        frameTxt: null,
+      });
+      const diagnostic =
+        status === "daemon-unreachable"
+          ? `keeper ${script}: no frame before ${timeoutMs}ms timeout (daemon unreachable)`
+          : `keeper ${script}: no frame before ${timeoutMs}ms timeout (daemon connected but did not deliver a frame)`;
+      const { stdout, stderr } = formatNoFrameOutput({ meta, diagnostic });
+      stderrWrite(stderr);
+      stdoutWrite(stdout);
+      liveShell.dispose();
+      onDispose();
+      exit(1);
+    }
+
+    const latch = createSnapshotLatch({
+      streamCount: opts.streamCount ?? 1,
+      timeoutMs,
+      onResolve: finish,
+      ...(io.setTimeoutFn === undefined
+        ? {}
+        : { setTimeoutFn: io.setTimeoutFn }),
+      ...(io.clearTimeoutFn === undefined
+        ? {}
+        : { clearTimeoutFn: io.clearTimeoutFn }),
+    });
+    // Wire the latch into `emit` (which captured composites pre-runSnapshot
+    // would have buffered into `snapshotCapture` already). If the first emit
+    // already landed before `runSnapshot` (synchronous open path), report
+    // now so a single-stream view doesn't wait out the full timeout.
+    reportLatch = () => latch.reportStream();
+    if (latchReported) {
+      latch.reportStream();
+    }
+  }
+
   return {
     liveShell,
     noteLine,
@@ -692,6 +939,7 @@ export function createViewShell<TSnap>(
     lifecycleSidecar,
     colorEnabled,
     installSigintHandler,
+    runSnapshot,
     getLastFrameText: () => lastFrameText,
     getFrameCount: () => frameCount,
   };
