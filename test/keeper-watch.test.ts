@@ -3,7 +3,7 @@
  * fn-729 task .1).
  *
  * Two layers:
- *  1. The PURE detectors (`detectDupApprove`, `detectDupDispatch`, …) — fed
+ *  1. The PURE detectors (`detectDupDispatch`, `detectAutopilotStall`, …) — fed
  *     hand-built row arrays, asserted against the expected `Finding[]`. No DB.
  *  2. The DB layer (`scan`) — seeds a sandbox `keeper.db` in a tmpdir
  *     (`mkdtempSync` + `openDb` writer + raw INSERTs), points `KEEPER_DB` at it,
@@ -15,8 +15,9 @@
  * spreads `process.env` (which would strand the others at production defaults
  * and pollute the real feed).
  *
- * The fn-728 dup-approve fixture (one `planctl_target` approved by 3 distinct
- * sessions within ~2 min) is a named test — the epic's early proof point.
+ * fn-766 retired the approval-era checks (`detectDupApprove` /
+ * `detectApprovalReview`) along with keeper's approval mechanism (fn-756), so
+ * the dup-dispatch end-to-end test is the epic's standing dispatch-class proof.
  */
 
 import type { Database } from "bun:sqlite";
@@ -36,13 +37,11 @@ import {
   type BackstopBaseline,
   COOLDOWN_SECS,
   countDeadLetters,
-  detectApprovalReview,
   detectAutopilotStall,
   detectBackstopTelemetry,
   detectDaemonDown,
   detectDeadLetterGrowth,
   detectDispatchFailures,
-  detectDupApprove,
   detectDupDispatch,
   detectFoldLatency,
   detectReducerWedge,
@@ -184,117 +183,12 @@ function quietDeps(nowSecs: number): ScanDeps {
 
 describe("fingerprint", () => {
   test("is stable for the same (category, resourceId) and excludes free-text", () => {
-    const a = fingerprint("dup-approve", "fn-1-foo.2");
-    const b = fingerprint("dup-approve", "fn-1-foo.2");
+    const a = fingerprint("dup-dispatch", "fn-1-foo.2");
+    const b = fingerprint("dup-dispatch", "fn-1-foo.2");
     expect(a).toBe(b);
     // A different resource id (or category) yields a different fingerprint.
-    expect(fingerprint("dup-approve", "fn-1-foo.3")).not.toBe(a);
-    expect(fingerprint("dup-dispatch", "fn-1-foo.2")).not.toBe(a);
-  });
-});
-
-describe("detectDupApprove", () => {
-  test("fn-728 fixture: 3 sessions / one target / ~2 min is detected", () => {
-    const target = "fn-728-exempt-approve-launches-from.2";
-    const base = 1_000_000;
-    const events = [
-      ev({
-        id: 1,
-        ts: base,
-        session_id: "sess-a",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-      ev({
-        id: 2,
-        ts: base + 60,
-        session_id: "sess-b",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-      ev({
-        id: 3,
-        ts: base + 120,
-        session_id: "sess-c",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-    ];
-    const findings = detectDupApprove(events);
-    expect(findings).toHaveLength(1);
-    const f = findings[0];
-    expect(f.category).toBe("dup-approve");
-    expect(f.key).toBe(`dup-approve:${target}`);
-    expect(f.fingerprint).toBe(fingerprint("dup-approve", target));
-    expect(f.severity).toBe("warning");
-    expect(f.evidence.sessionCount).toBe(3);
-    expect(f.evidence.sessions).toEqual(["sess-a", "sess-b", "sess-c"]);
-  });
-
-  test("does not fire on a single re-approval by the same session", () => {
-    const target = "fn-9-foo.1";
-    const base = 2_000_000;
-    const events = [
-      ev({
-        id: 1,
-        ts: base,
-        session_id: "sess-a",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-      ev({
-        id: 2,
-        ts: base + 30,
-        session_id: "sess-a",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-    ];
-    expect(detectDupApprove(events)).toHaveLength(0);
-  });
-
-  test("does not fire when two sessions approve outside the window", () => {
-    const target = "fn-9-foo.1";
-    const base = 3_000_000;
-    const events = [
-      ev({
-        id: 1,
-        ts: base,
-        session_id: "sess-a",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-      // 20 min later — beyond the 15-min dup-approve window.
-      ev({
-        id: 2,
-        ts: base + 20 * 60,
-        session_id: "sess-b",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-    ];
-    expect(detectDupApprove(events)).toHaveLength(0);
-  });
-
-  test("ignores non-approve ops and null targets", () => {
-    const base = 4_000_000;
-    const events = [
-      ev({
-        id: 1,
-        ts: base,
-        session_id: "a",
-        planctl_op: "claim",
-        planctl_target: "fn-9-foo.1",
-      }),
-      ev({
-        id: 2,
-        ts: base + 10,
-        session_id: "b",
-        planctl_op: "approve",
-        planctl_target: null,
-      }),
-    ];
-    expect(detectDupApprove(events)).toHaveLength(0);
+    expect(fingerprint("dup-dispatch", "fn-1-foo.3")).not.toBe(a);
+    expect(fingerprint("stuck-job", "fn-1-foo.2")).not.toBe(a);
   });
 });
 
@@ -399,12 +293,14 @@ describe("detectDeadLetterGrowth", () => {
 });
 
 describe("detectAutopilotStall", () => {
-  test("fires only when unpaused + ready work + no recent dispatch", () => {
+  test("fires only when unpaused + ready work + no recent dispatch (yolo mode)", () => {
     expect(
       detectAutopilotStall({
         paused: false,
         readyWorkExists: true,
         recentDispatch: false,
+        mode: "yolo",
+        armedCount: 0,
       }),
     ).toHaveLength(1);
   });
@@ -415,6 +311,8 @@ describe("detectAutopilotStall", () => {
         paused: true,
         readyWorkExists: true,
         recentDispatch: false,
+        mode: "yolo",
+        armedCount: 0,
       }),
     ).toHaveLength(0);
   });
@@ -425,6 +323,8 @@ describe("detectAutopilotStall", () => {
         paused: false,
         readyWorkExists: false,
         recentDispatch: false,
+        mode: "yolo",
+        armedCount: 0,
       }),
     ).toHaveLength(0);
     expect(
@@ -432,8 +332,41 @@ describe("detectAutopilotStall", () => {
         paused: false,
         readyWorkExists: true,
         recentDispatch: true,
+        mode: "yolo",
+        armedCount: 0,
       }),
     ).toHaveLength(0);
+  });
+
+  test("armed mode with NOTHING armed is legitimately idle — does NOT fire (fn-766)", () => {
+    // The fn-766 false-page fix: unpaused + ready epics + no dispatch but mode
+    // 'armed' with zero armed epics is the autopilot correctly idling (nothing
+    // is in its allowed set), not a stall.
+    expect(
+      detectAutopilotStall({
+        paused: false,
+        readyWorkExists: true,
+        recentDispatch: false,
+        mode: "armed",
+        armedCount: 0,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("armed mode WITH armed epics still fires (conservative; can't compute dep-closure)", () => {
+    // The sitter can't cheaply compute the transitive dep-closure that decides
+    // true readiness, so a non-empty armed set in armed mode is NOT suppressed —
+    // it stays a held-across-ticks warning for the human to triage.
+    const findings = detectAutopilotStall({
+      paused: false,
+      readyWorkExists: true,
+      recentDispatch: false,
+      mode: "armed",
+      armedCount: 2,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].evidence.mode).toBe("armed");
+    expect(findings[0].evidence.armedCount).toBe(2);
   });
 });
 
@@ -509,90 +442,6 @@ describe("detectStuckJobs", () => {
         isAlive: () => false,
       }),
     ).toHaveLength(0);
-  });
-});
-
-describe("detectApprovalReview", () => {
-  test("one info item per target::session", () => {
-    const base = 11_000_000;
-    const findings = detectApprovalReview([
-      ev({
-        id: 1,
-        ts: base,
-        session_id: "a",
-        planctl_op: "approve",
-        planctl_target: "fn-3-x.1",
-      }),
-      // same target+session again → deduped
-      ev({
-        id: 2,
-        ts: base + 5,
-        session_id: "a",
-        planctl_op: "approve",
-        planctl_target: "fn-3-x.1",
-      }),
-      ev({
-        id: 3,
-        ts: base + 5,
-        session_id: "b",
-        planctl_op: "approve",
-        planctl_target: "fn-3-x.1",
-      }),
-    ]);
-    expect(findings).toHaveLength(2);
-    expect(findings.every((f) => f.severity === "info")).toBe(true);
-  });
-
-  test("single-session approval is NOT tagged multipleApprovers (merit-unknown path)", () => {
-    // One target, one approving session, thin evidence — the scanner surfaces
-    // it merit-BLIND (info), and tags multipleApprovers:false so the agent
-    // treats it as merit-unknown, not duplicate-approver. (fn-738)
-    const base = 12_000_000;
-    const findings = detectApprovalReview([
-      ev({
-        id: 1,
-        ts: base,
-        session_id: "solo",
-        planctl_op: "approve",
-        planctl_target: "fn-7-thin.1",
-      }),
-    ]);
-    expect(findings).toHaveLength(1);
-    const f = findings[0];
-    expect(f.severity).toBe("info"); // scanner stays merit-blind
-    expect(f.evidence.multipleApprovers).toBe(false);
-  });
-
-  test("multi-session target tags every review item multipleApprovers:true (duplicate-approver signal)", () => {
-    // Same target approved by 2 distinct sessions in-window → the dup-approve
-    // signal is reused as a merit-BLIND evidence tag on EACH per-op review item,
-    // so the agent can split "work merited but duplicate approver" from
-    // "merit unknown". The scanner itself renders no merit judgment. (fn-738)
-    const target = "fn-732-cross-repo.2";
-    const base = 13_000_000;
-    const findings = detectApprovalReview([
-      ev({
-        id: 1,
-        ts: base,
-        session_id: "sess-a",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-      ev({
-        id: 2,
-        ts: base + 30,
-        session_id: "sess-b",
-        planctl_op: "approve",
-        planctl_target: target,
-      }),
-    ]);
-    expect(findings).toHaveLength(2);
-    expect(findings.every((f) => f.category === "approval-review")).toBe(true);
-    expect(findings.every((f) => f.severity === "info")).toBe(true); // still merit-blind
-    expect(findings.every((f) => f.evidence.target === target)).toBe(true);
-    expect(findings.every((f) => f.evidence.multipleApprovers === true)).toBe(
-      true,
-    );
   });
 });
 
@@ -1253,52 +1102,46 @@ describe("scan (DB layer)", () => {
     }
   });
 
-  test("detects the fn-728 dup-approve signature end-to-end", async () => {
+  test("detects a dup-dispatch signature end-to-end", async () => {
     const writer = openDb(dbPath);
     const now = Math.floor(Date.now() / 1000);
-    const target = "fn-728-exempt-approve-launches-from.2";
-    for (const [i, sess] of ["sess-a", "sess-b", "sess-c"].entries()) {
+    const dispatchKey = "work::fn-700-x.2";
+    // The same verb::id dispatched twice within the window.
+    for (const i of [0, 1]) {
       insertEvent(writer.db, {
         ts: now - 300 + i * 60,
-        session_id: sess,
-        hook_event: "PreToolUse",
-        event_type: "planctl",
-        planctl_op: "approve",
-        planctl_target: target,
+        session_id: "main",
+        hook_event: "Dispatched",
+        event_type: "lifecycle",
+        data: JSON.stringify({ verb: "work", id: "fn-700-x.2", dir: "/r" }),
       });
     }
     writer.db.close();
 
     const findings = await scan(dbPath, 3600, quietDeps(now));
-    const dup = findings.find((f) => f.category === "dup-approve");
+    const dup = findings.find((f) => f.category === "dup-dispatch");
     expect(dup).toBeDefined();
-    expect(dup?.key).toBe(`dup-approve:${target}`);
-    expect(dup?.evidence.sessionCount).toBe(3);
-
-    // The same approve ops are ALSO surfaced as approval-review items (3 sessions).
-    expect(
-      findings.filter((f) => f.category === "approval-review"),
-    ).toHaveLength(3);
+    expect(dup?.key).toBe(`dup-dispatch:${dispatchKey}`);
+    expect(dup?.evidence.count).toBe(2);
   });
 
-  test("bounds the event window — old approves outside the window are ignored", async () => {
+  test("bounds the event window — old dispatches outside the window are ignored", async () => {
     const writer = openDb(dbPath);
     const now = Math.floor(Date.now() / 1000);
-    const target = "fn-99-old.1";
-    // Two sessions, but 2 hours ago — outside the 1h scan window.
-    for (const [i, sess] of ["a", "b"].entries()) {
+    // Two dispatches of one verb::id, but 2 hours ago — outside the 1h window.
+    for (const i of [0, 1]) {
       insertEvent(writer.db, {
         ts: now - 7200 + i * 30,
-        session_id: sess,
-        hook_event: "PreToolUse",
-        planctl_op: "approve",
-        planctl_target: target,
+        session_id: "main",
+        hook_event: "Dispatched",
+        event_type: "lifecycle",
+        data: JSON.stringify({ verb: "work", id: "fn-99-old.1", dir: "/r" }),
       });
     }
     writer.db.close();
 
     const findings = await scan(dbPath, 3600, quietDeps(now));
-    expect(findings.filter((f) => f.category === "dup-approve")).toHaveLength(
+    expect(findings.filter((f) => f.category === "dup-dispatch")).toHaveLength(
       0,
     );
   });
