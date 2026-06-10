@@ -109,6 +109,13 @@ export type SpawnFn = (
   exited: Promise<number>;
   stdout: ReadableStream | null;
   stderr: ReadableStream | null;
+  /**
+   * Force-terminate the child. Surfaced from `Bun.spawn`'s `Subprocess`
+   * so `runCapture` can race `exited` against a kill-timeout and reap the
+   * process instead of awaiting it forever — a wedged `zellij action`
+   * would otherwise freeze the reconciler with no fatalExit (fn-765).
+   */
+  kill: (signal?: number) => void;
 };
 
 /**
@@ -219,6 +226,17 @@ const ANSI_CSI_RE = new RegExp(
 );
 
 /**
+ * Upper bound on a single `runCapture` zellij-subprocess await (fn-765).
+ * On expiry the child is force-killed and the op degrades to `null`. ~5s
+ * is generous for any `zellij action` / `list-*` / `attach -b` we issue;
+ * the value's only job is to keep a wedged zellij server from freezing the
+ * reconciler forever (no fatalExit covers that path). Unit: MILLISECONDS
+ * (raw `setTimeout` delay) — distinct from the unit-seconds autopilot
+ * cooldowns; never compared against those.
+ */
+const RUN_CAPTURE_TIMEOUT_MS = 5000;
+
+/**
  * Default backend name. Zellij is the only backend; the literal is
  * retained as an exported const so the lockstep `db.ts` site and tests
  * have one source of truth.
@@ -244,6 +262,12 @@ export interface ZellijBackendDeps {
   readonly noteLine: (line: string) => void;
   readonly session?: string;
   readonly spawn?: SpawnFn;
+  /**
+   * Override the `runCapture` kill-timeout (fn-765). Defaults to
+   * `RUN_CAPTURE_TIMEOUT_MS` (5s) in production; tests shrink it to pin
+   * the timeout-kill-degrade path without a real 5s wait.
+   */
+  readonly captureTimeoutMs?: number;
 }
 
 /**
@@ -834,6 +858,7 @@ function looksLikeSessionGone(stderr: string): boolean {
 export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
   const spawn = deps.spawn ?? defaultSpawn;
   const session = deps.session ?? DEFAULT_ZELLIJ_SESSION;
+  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
   let sessionReady: Promise<void> | null = null;
 
   async function runCapture(
@@ -847,12 +872,43 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         stdin: "ignore",
         ...(env != null ? { env } : {}),
       });
-      const [exitCode, stdout, stderr] = await Promise.all([
-        proc.exited,
+      // Bound the await (fn-765): a wedged `zellij action` (server hang,
+      // stuck IPC) would otherwise freeze `proc.exited` forever, and with
+      // it the reconciler — no fatalExit, no recovery. Race the capture
+      // against a kill-timeout: on expiry, force-kill the child and degrade
+      // to `null`, the same envelope ENOENT already returns. Callers
+      // (launch :880, reapSurfaces :968-971) branch on `null` and the
+      // `{ok:false}` envelope, so this never throws past a never-throw
+      // contract; the op retries next cycle. ~5s is generous for any
+      // `zellij action` — a genuinely-slow-but-alive op degrading to
+      // `{ok:false}` is acceptable, a wedged reconciler is not.
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = Symbol("timed-out");
+      const timeout = new Promise<typeof timedOut>((resolve) => {
+        timer = setTimeout(() => resolve(timedOut), captureTimeoutMs);
+      });
+      const race = await Promise.race([proc.exited, timeout]);
+      if (timer != null) {
+        clearTimeout(timer);
+      }
+      if (race === timedOut) {
+        try {
+          proc.kill();
+        } catch {
+          // Kill best-effort — already-dead child / no-op backend stub.
+        }
+        deps.noteLine(
+          `# warn: zellij subprocess exceeded ${captureTimeoutMs}ms; killed and degrading to null (${args.join(" ")})`,
+        );
+        return null;
+      }
+      // `race` is the exit code; streams have already resolved (or will
+      // immediately, the child exited). Read them now.
+      const [stdout, stderr] = await Promise.all([
         streamToText(proc.stdout),
         streamToText(proc.stderr),
       ]);
-      return { exitCode, stdout, stderr };
+      return { exitCode: race, stdout, stderr };
     } catch {
       // ENOENT (zellij not installed) lands here.
       return null;

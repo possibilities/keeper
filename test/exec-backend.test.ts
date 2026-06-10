@@ -75,6 +75,7 @@ function makeSpawnStub(
       exited: Promise.resolve(exitCode),
       stdout: new Response(stdoutText).body,
       stderr: new Response(stderrText).body,
+      kill: () => {},
     };
   };
 }
@@ -234,6 +235,7 @@ test("createZellijBackend.launch: session already listed → new-tab; returns { 
       exited: Promise.resolve(0),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions")
       return reply("autopilot [Created 5s ago]\n");
@@ -283,6 +285,56 @@ test("createZellijBackend.launch: session already listed → new-tab; returns { 
   expect(calls.some((c) => c[4] === "list-panes")).toBe(false);
 });
 
+test("createZellijBackend.launch: a never-resolving new-tab is killed at the timeout and degrades to { ok: false } (fn-765)", async () => {
+  // A wedged `zellij action` (server hang) would freeze proc.exited
+  // forever — and the reconciler with it, no fatalExit. runCapture must
+  // race a kill-timeout: on expiry it kills the child and returns null,
+  // which launch folds into the sticky { ok: false } envelope. We shrink
+  // the timeout via captureTimeoutMs so the test doesn't wait the real 5s.
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  let newTabKilled = false;
+  const spawn: SpawnFn = (cmd, _options) => {
+    calls.push([...cmd]);
+    // list-sessions resolves immediately (session is live); the new-tab
+    // never resolves, modelling a hung zellij IPC.
+    if (cmd[1] === "list-sessions") {
+      return {
+        exited: Promise.resolve(0),
+        stdout: new Response("autopilot\n").body,
+        stderr: new Response("").body,
+        kill: () => {},
+      };
+    }
+    return {
+      // Never resolves — the wedge.
+      exited: new Promise<number>(() => {}),
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+      kill: () => {
+        newTabKilled = true;
+      },
+    };
+  };
+  const backend = createZellijBackend({
+    noteLine: (s) => notes.push(s),
+    session: "autopilot",
+    spawn,
+    captureTimeoutMs: 20,
+  });
+  const res = await backend.launch(
+    ["/bin/zsh", "-c", "echo hi"],
+    "work::fn-1-x.1",
+    "/tmp/proj",
+  );
+  // runCapture timed out → null → the ENOENT-shaped { ok: false } envelope.
+  expect(res.ok).toBe(false);
+  // The hung child was force-killed (no leaked zombie).
+  expect(newTabKilled).toBe(true);
+  // A timeout warn was emitted for observability.
+  expect(notes.some((n) => n.includes("exceeded 20ms"))).toBe(true);
+});
+
 test("createZellijBackend.launch: non-zero new-tab exit → { ok: false, error }", async () => {
   const notes: string[] = [];
   const spawn: SpawnFn = (cmd, _options) => {
@@ -290,6 +342,7 @@ test("createZellijBackend.launch: non-zero new-tab exit → { ok: false, error }
       exited: Promise.resolve(exitCode),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") return reply("autopilot\n");
     if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("", 1);
@@ -326,6 +379,7 @@ test("createZellijBackend.launch: stale memo — session dies, new-tab fails 'no
       exited: Promise.resolve(exitCode),
       stdout: new Response(stdout).body,
       stderr: new Response(stderr).body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") {
       return reply(alive ? "autopilot\n" : "dash\n");
@@ -392,6 +446,7 @@ test("createZellijBackend.launch: ENOENT (binary missing) → { ok: false, error
       exited: Promise.resolve(0),
       stdout: new Response("autopilot\n").body,
       stderr: new Response("").body,
+      kill: () => {},
     };
   };
   const backend = createZellijBackend({
@@ -422,6 +477,7 @@ test("createZellijBackend.launch: session missing → attach -b --forget, then p
         exited: Promise.resolve(0),
         stdout: new Response(body).body,
         stderr: new Response("").body,
+        kill: () => {},
       };
     }
     if (cmd[1] === "attach" && cmd[2] === "-b") {
@@ -429,6 +485,7 @@ test("createZellijBackend.launch: session missing → attach -b --forget, then p
         exited: Promise.resolve(0),
         stdout: new Response("").body,
         stderr: new Response("").body,
+        kill: () => {},
       };
     }
     if (cmd[1] === "--session" && cmd[4] === "list-tabs") {
@@ -437,6 +494,7 @@ test("createZellijBackend.launch: session missing → attach -b --forget, then p
         exited: Promise.resolve(0),
         stdout: new Response("TAB_ID  POSITION  NAME\n0  0  Tab #1\n").body,
         stderr: new Response("").body,
+        kill: () => {},
       };
     }
     if (cmd[1] === "--session" && cmd[4] === "new-tab") {
@@ -444,12 +502,14 @@ test("createZellijBackend.launch: session missing → attach -b --forget, then p
         exited: Promise.resolve(0),
         stdout: new Response("12\n").body,
         stderr: new Response("").body,
+        kill: () => {},
       };
     }
     return {
       exited: Promise.resolve(0),
       stdout: new Response("").body,
       stderr: new Response("").body,
+      kill: () => {},
     };
   };
   const backend = createZellijBackend({
@@ -502,6 +562,7 @@ test("createZellijBackend.launch: session-mint attach -b --forget carries color 
         exited: Promise.resolve(0),
         stdout: new Response(body).body,
         stderr: new Response("").body,
+        kill: () => {},
       };
     }
     if (cmd[1] === "attach" && cmd[2] === "-b") {
@@ -512,6 +573,7 @@ test("createZellijBackend.launch: session-mint attach -b --forget carries color 
       exited: Promise.resolve(0),
       stdout: new Response("").body,
       stderr: new Response("").body,
+      kill: () => {},
     };
   };
   const backend = createZellijBackend({
@@ -550,12 +612,14 @@ test("createZellijBackend: control commands (list-sessions/new-tab) carry NO env
         exited: Promise.resolve(0),
         stdout: new Response(listCalls === 1 ? "" : "autopilot\n").body,
         stderr: new Response("").body,
+        kill: () => {},
       };
     }
     return {
       exited: Promise.resolve(0),
       stdout: new Response("").body,
       stderr: new Response("").body,
+      kill: () => {},
     };
   };
   const backend = createZellijBackend({
@@ -585,6 +649,7 @@ test("createZellijBackend.launch: session listed but EXITED → attach -b --forg
       exited: Promise.resolve(0),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") {
       listCalls++;
@@ -676,6 +741,7 @@ test("createZellijBackend.launch: fresh mint KEEPS the default Tab #1 as a keepa
       exited: Promise.resolve(0),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") {
       listCalls++;
@@ -971,6 +1037,7 @@ test("ExecBackend.ensureLaunched: pre-existing live session → new-tab (no atta
       exited: Promise.resolve(0),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") return reply("other-session\n");
     if (cmd[1] === "--session" && cmd[4] === "new-tab") return reply("");
@@ -1014,6 +1081,7 @@ test("ExecBackend.ensureLaunched: absent session → attach -b --forget, poll, n
       exited: Promise.resolve(0),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") {
       listCalls++;
@@ -1077,6 +1145,7 @@ test("ExecBackend.ensureLaunched: session-gone new-tab stderr → re-ensure + re
       exited: Promise.resolve(exitCode),
       stdout: new Response(stdout).body,
       stderr: new Response(stderr).body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") {
       listCalls++;
@@ -1174,6 +1243,7 @@ test("ExecBackend.ensureLaunched: non-zero new-tab exit (not session-gone) → {
       exited: Promise.resolve(exitCode),
       stdout: new Response(stdout).body,
       stderr: new Response(stderr).body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") return reply("restored\n");
     if (cmd[1] === "--session" && cmd[4] === "new-tab") {
@@ -1220,6 +1290,7 @@ test("ExecBackend.ensureLaunched: shares no state with managed-session memo (sep
       exited: Promise.resolve(0),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") {
       listCalls++;
@@ -1287,6 +1358,7 @@ test("ExecBackend.ensureLaunched: empty `name` string still omits --name (defens
       exited: Promise.resolve(0),
       stdout: new Response(stdout).body,
       stderr: new Response("").body,
+      kill: () => {},
     });
     if (cmd[1] === "list-sessions") return reply("restored\n");
     return reply("");
@@ -1400,6 +1472,7 @@ function makeReapSpawnStub(
       exited: Promise.resolve(exitCode),
       stdout: new Response(stdout).body,
       stderr: new Response(stderr).body,
+      kill: () => {},
     });
     if (cmd[4] === "list-panes") {
       return reply(listPanesJson, opts.listExit ?? 0);

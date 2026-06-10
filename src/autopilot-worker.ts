@@ -199,6 +199,21 @@ export type DispatchKey = string;
 export const REDISPATCH_COOLDOWN_S = 200;
 
 /**
+ * Floor between completion-reap `list-panes` probes (fn-765). Post-fn-764,
+ * `completedRowIds` is non-empty on nearly every reconcile pulse (the
+ * done-epics merge keeps freshly-done rows visible), so an unfloored reap
+ * spawned `zellij list-panes -a -j` every cycle. A single-timestamp floor
+ * (the simple variant of the fn-735 stamp/sweep pattern) collapses a burst
+ * of pulses into one probe per window. Reap semantics are otherwise
+ * unchanged: the helper is idempotent, and the fn-764 done-window keeps
+ * rows visible long enough that a floored probe still fires within it.
+ *
+ * UNIT: SECONDS (matches `deps.now()` = `Math.floor(Date.now()/1000)`).
+ * NEVER mix with the ms-valued `*_TTL_MS` constants.
+ */
+export const MIN_REAP_INTERVAL_S = 15;
+
+/**
  * fn-742 — the in-process per-epic FINALIZER guard window, in SECONDS.
  *
  * Originally closed the fn-740 close↔approve race: for a single epic the
@@ -461,6 +476,18 @@ export function isInCooldown(
 ): boolean {
   const stampedAt = cooldown.get(key);
   return stampedAt !== undefined && now - stampedAt < REDISPATCH_COOLDOWN_S;
+}
+
+/**
+ * fn-765 — has the completion-reap floor elapsed? True when `now` is at
+ * least `MIN_REAP_INTERVAL_S` past `lastReapAt` (the last fired probe's
+ * unix-seconds stamp), so the next `list-panes` probe is allowed. Boots
+ * eligible: callers seed `lastReapAt` at `-Infinity` so the first cycle
+ * always probes. The single-timestamp variant of `isInCooldown` — same
+ * unit-SECONDS contract; never compared against `*_TTL_MS`.
+ */
+export function reapFloorElapsed(lastReapAt: number, now: number): boolean {
+  return now - lastReapAt >= MIN_REAP_INTERVAL_S;
 }
 
 /**
@@ -2046,6 +2073,13 @@ function main(): void {
   // (that struct is the pure-`reconcile` input; the reap is a side-effect
   // the cycle drives).
   const autocloseWindows = data.autocloseWindows ?? true;
+  // fn-765 — completion-reap probe floor. Single mutable unix-seconds
+  // stamp (the simple variant of the fn-735 cooldown): `reapCompletionSurfaces`
+  // skips its `list-panes` spawn until `MIN_REAP_INTERVAL_S` has elapsed
+  // since the last fired probe. Worker-scoped (a side-effect timer, NOT a
+  // `reconcile` input) for the same reason `autocloseWindows` is. Boots at
+  // `-Infinity` so the first eligible cycle always probes.
+  let lastReapAt = Number.NEGATIVE_INFINITY;
   // `liveDispatches` tracks the in-flight surfaces this reconciler still
   // owns confirm/reap work for (keyed `${verb}::${id}`). Boots EMPTY: a
   // cold restart re-derives "already running" from the durable `jobs`
@@ -2379,6 +2413,16 @@ function main(): void {
     if (!autocloseWindows || completedRowIds.size === 0) {
       return;
     }
+    // fn-765 — floor the probe: skip the `list-panes` spawn until the
+    // min interval has elapsed since the last fired probe. Stamp BEFORE
+    // the async spawn so a burst of pulses inside one cycle's microtask
+    // queue still collapses to a single probe. Reap stays idempotent and
+    // the fn-764 done-window outlasts this floor, so nothing is missed.
+    const nowS = deps.now();
+    if (!reapFloorElapsed(lastReapAt, nowS)) {
+      return;
+    }
+    lastReapAt = nowS;
     void (async (): Promise<void> => {
       try {
         const result = await backend.reapSurfaces((pane) =>

@@ -55,9 +55,11 @@ import {
   type LaunchResult,
   type LiveDispatch,
   loadReconcileSnapshot,
+  MIN_REAP_INTERVAL_S,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
+  reapFloorElapsed,
   reconcile,
   runReconcileCycle,
   sweepFinalizerGuard,
@@ -764,6 +766,22 @@ test("fn-735 isInCooldown: unit-seconds predicate edge cases", () => {
   expect(isInCooldown(cooldown, "work::x", 1000 + REDISPATCH_COOLDOWN_S)).toBe(
     false,
   );
+});
+
+test("fn-765 reapFloorElapsed: unit-seconds floor; first probe always eligible, back-to-back cycles collapse to one", () => {
+  // Boots eligible: the closure seeds lastReapAt at -Infinity so the first
+  // cycle always probes.
+  expect(reapFloorElapsed(Number.NEGATIVE_INFINITY, 1000)).toBe(true);
+  // Simulate the closure: stamp at the fired probe, then a back-to-back
+  // cycle (same second) is floored OUT — one list-panes for the burst.
+  const firedAt = 1000;
+  expect(reapFloorElapsed(firedAt, firedAt)).toBe(false);
+  // One second before the floor elapses → still floored.
+  expect(reapFloorElapsed(firedAt, firedAt + MIN_REAP_INTERVAL_S - 1)).toBe(
+    false,
+  );
+  // Exactly at the floor → eligible again (the next cycle probes).
+  expect(reapFloorElapsed(firedAt, firedAt + MIN_REAP_INTERVAL_S)).toBe(true);
 });
 
 test("fn-762 cooldown is STRICTLY GREATER than TTL + sweep (unit-seconds; the headroom rationale)", () => {
