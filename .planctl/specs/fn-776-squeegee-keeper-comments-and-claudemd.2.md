@@ -27,5 +27,5 @@ Pre-scrub `bun run test:full` baseline; post-scrub zero new failures; verifier +
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Scrubbed bloat comments from src/reducer.ts: -2108 lines, -128615 chars. Removed fn-NNN provenance refs, schema-version origin stories, and code-mirroring narration; preserved sacred floor (re-fold determinism, exactly-once transaction, never-throw, syncEpicDepsForward order, ON CONFLICT carve-outs, paired-NULL) in compressed future-facing form. Verifier + typecheck + biome + fast tests green, zero new failures.
 ## Evidence
