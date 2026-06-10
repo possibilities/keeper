@@ -55,5 +55,5 @@ guidance each (what evidence to gather, when a finding is real vs benign).
 - [ ] sitter remains read-only; full bun test green
 
 ## Done summary
-
+Added the five fn-766 watches the post-roadmap signal landscape proved missing: duplicate-live-workers (CRITICAL, page-immediately — >1 live pid per plan_ref, the load-bearing re-fire tripwire), poison-arrivals (delta-gated) plus an events-ingest-poison backstop carve-out firing on delta>=1, events-log-backlog and keeperd-cpu (both held 3 ticks), and db-growth (WAL ceiling). All pure read-only — no DB writes, no RPC, no synthetic events; agent prompt schema + triage guidance updated; 22 new tests green.
 ## Evidence
