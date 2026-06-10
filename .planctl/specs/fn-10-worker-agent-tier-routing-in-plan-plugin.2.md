@@ -74,5 +74,5 @@ suite + ruff + ty green.
 - [ ] Group C/D tests inverted and green; full planctl suite + ruff + ty green
 
 ## Done summary
-
+Worker template drops render_to/manifest_description and emits agents/worker-<tier>.md per variant (plan:worker-<tier>) in the always-loaded plan plugin; /plan:work spawns the envelope's worker_agent at both spawn sites with a null-tier typed stop; .gitignore and Group C/D tests inverted accordingly.
 ## Evidence
