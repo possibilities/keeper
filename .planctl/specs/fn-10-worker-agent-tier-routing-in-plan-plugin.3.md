@@ -46,5 +46,5 @@ references in `src/` except doc-comments (those are rewritten in task 5).
 - [ ] four keeper test files inverted to assert `--plugin-dir` absence; `bun test` green
 
 ## Done summary
-
+Dropped the --plugin-dir work-plugins/<tier> push from keeper's worker launch (buildWorkerCommand) and resume (buildResumeCommand) paths; deleted workPluginDir, checkWorkPluginManifest, the pre-launch manifest guard + WorkPluginCheck dep, and the dead PLANCTL_ROOT export. All task.tier reads (board/projection/resume via tierForJobFromEpics) preserved; four test files inverted to assert --plugin-dir absence. tsc + biome clean, keeper suite green (parallel-only integration flake is pre-existing, unrelated).
 ## Evidence
