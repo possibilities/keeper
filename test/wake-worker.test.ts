@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
 import { watchLoop } from "../src/wake-worker";
+import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -128,20 +129,18 @@ test("spawned Worker shuts down cleanly on shutdown message", async () => {
     },
   );
 
-  const exited = new Promise<void>((resolve) => {
-    // Bun exposes worker exit via the "close" event.
-    worker.addEventListener("close", () => resolve());
+  let closed = false;
+  // Bun exposes worker exit via the "close" event.
+  worker.addEventListener("close", () => {
+    closed = true;
   });
 
   // Let it boot and open its read-only connection.
   await Bun.sleep(60);
   worker.postMessage({ type: "shutdown" });
 
-  // Race the clean-exit signal against a timeout so a hang fails loudly.
-  const result = await Promise.race([
-    exited.then(() => "exited" as const),
-    Bun.sleep(2000).then(() => "timeout" as const),
-  ]);
-
-  expect(result).toBe("exited");
+  // Poll the clean-exit flag with a generous ceiling so a hang fails loudly
+  // (free on the happy path) instead of racing a fixed deadline under load.
+  const ok = await retryUntil(() => closed || null, 20_000);
+  expect(ok).toBe(true);
 });

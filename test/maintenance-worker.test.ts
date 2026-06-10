@@ -26,6 +26,7 @@ import { join } from "node:path";
 import { openDb } from "../src/db";
 import type { MaintenanceMessage } from "../src/maintenance-worker";
 import { runBackupPass, runProbePass } from "../src/maintenance-worker";
+import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -172,19 +173,19 @@ test("spawned worker fires a boot catch-up backup and shuts down cleanly", async
     { workerData: { dbPath } } as WorkerOptions & { workerData: unknown },
   );
 
-  const exited = new Promise<void>((resolve) => {
-    worker.addEventListener("close", () => resolve());
+  let closed = false;
+  worker.addEventListener("close", () => {
+    closed = true;
   });
 
   // Let it boot, wire its timers, and evaluate the catch-up one-shot.
   await Bun.sleep(80);
   worker.postMessage({ type: "shutdown" });
 
-  const result = await Promise.race([
-    exited.then(() => "exited" as const),
-    Bun.sleep(2000).then(() => "timeout" as const),
-  ]);
-  expect(result).toBe("exited");
+  // Poll the clean-exit flag (generous ceiling, free on the happy path) so a
+  // hang fails loudly instead of racing a fixed deadline under load.
+  const ok = await retryUntil(() => closed || null, 20_000);
+  expect(ok).toBe(true);
 });
 
 test("plain import on the main thread is inert (isMainThread guard)", async () => {

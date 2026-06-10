@@ -2237,23 +2237,23 @@ test("autopilot worker spawns with paused=true workerData and shuts down cleanly
     } as WorkerOptions & { workerData: unknown },
   );
 
-  const exited = new Promise<void>((resolve) => {
-    worker.addEventListener("close", () => resolve());
+  let closed = false;
+  worker.addEventListener("close", () => {
+    closed = true;
   });
 
-  // Give the worker time to construct its own readonly conn, attach
-  // its `parentPort.on("message", …)` listener, and enter the
-  // `watchLoop` poll. 100ms is generous; the worker's bootstrap is
-  // synchronous JS after `openDb`.
-  await Bun.sleep(100);
-
-  worker.postMessage({ type: "shutdown" });
-
-  const result = await Promise.race([
-    exited.then(() => "exited" as const),
-    Bun.sleep(2000).then(() => "timeout" as const),
-  ]);
-  expect(result).toBe("exited");
+  // Autopilot emits no `ready` signal, so the boot window (RO conn +
+  // `parentPort.on("message")` listener + `watchLoop` poll) can race a
+  // one-shot shutdown. Re-emit the idempotent `shutdown` each tick until the
+  // close lands; guard on the flag so we never post to an already-closed
+  // worker. The poll absorbs boot latency — no blind boot sleep needed.
+  const ok = await retryUntil(() => {
+    if (!closed) {
+      worker.postMessage({ type: "shutdown" });
+    }
+    return closed || null;
+  }, 20_000);
+  expect(ok).toBe(true);
 }, 30_000);
 
 test("autopilot worker accepts {type:'set-paused', paused} commands without crashing the loop", async () => {
@@ -2272,31 +2272,30 @@ test("autopilot worker accepts {type:'set-paused', paused} commands without cras
     } as WorkerOptions & { workerData: unknown },
   );
 
-  const exited = new Promise<void>((resolve) => {
-    worker.addEventListener("close", () => resolve());
+  let closed = false;
+  worker.addEventListener("close", () => {
+    closed = true;
   });
-
-  // Bootstrap window.
-  await Bun.sleep(100);
 
   // Flip paused both directions. The worker's loop is a no-op today
   // (the reconcile glue is a sibling task), but the message handler
   // MUST accept these without throwing — that's the boot-pause +
-  // play/pause contract this task wires up.
+  // play/pause contract this task wires up. parent→worker messages are
+  // queued, so these land in order even before the worker's listener is
+  // attached; no boot sleep needed.
   worker.postMessage({ type: "set-paused", paused: false });
-  await Bun.sleep(50);
   worker.postMessage({ type: "set-paused", paused: true });
-  await Bun.sleep(50);
   worker.postMessage({ type: "set-paused", paused: false });
-  await Bun.sleep(50);
 
-  worker.postMessage({ type: "shutdown" });
-
-  const result = await Promise.race([
-    exited.then(() => "exited" as const),
-    Bun.sleep(2000).then(() => "timeout" as const),
-  ]);
-  expect(result).toBe("exited");
+  // Autopilot emits no `ready` signal — re-emit the idempotent shutdown each
+  // tick (guarded on the flag) so a boot-race can't drop the one-shot trigger.
+  const ok = await retryUntil(() => {
+    if (!closed) {
+      worker.postMessage({ type: "shutdown" });
+    }
+    return closed || null;
+  }, 20_000);
+  expect(ok).toBe(true);
 }, 30_000);
 
 // ---------------------------------------------------------------------------

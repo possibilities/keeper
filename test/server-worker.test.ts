@@ -74,6 +74,7 @@ import {
   type Writable,
   writeFrames,
 } from "../src/server-worker";
+import { retryUntil } from "./helpers/retry-until";
 import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -1345,8 +1346,9 @@ test("spawned Worker shuts down cleanly and removes the socket file", async () =
     } as WorkerOptions & { workerData: unknown },
   );
 
-  const exited = new Promise<void>((resolve) => {
-    worker.addEventListener("close", () => resolve());
+  let closed = false;
+  worker.addEventListener("close", () => {
+    closed = true;
   });
 
   // Wait for the `ready` signal so we know the socket is bound.
@@ -1361,11 +1363,10 @@ test("spawned Worker shuts down cleanly and removes the socket file", async () =
 
   worker.postMessage({ type: "shutdown" });
 
-  const result = await Promise.race([
-    exited.then(() => "exited" as const),
-    Bun.sleep(2000).then(() => "timeout" as const),
-  ]);
-  expect(result).toBe("exited");
+  // Flag-only poll: the `{kind:"ready"}` gate above guarantees the worker is
+  // listening, so the shutdown trigger can't be missed — no re-emit needed.
+  const ok = await retryUntil(() => closed || null, 20_000);
+  expect(ok).toBe(true);
   expect(existsSync(sockPath)).toBe(false);
   expect(existsSync(lockPath)).toBe(false);
 });
@@ -1482,24 +1483,6 @@ function advanceJob(db: Database, job_id: string, last_event_id: number): void {
 /** Set the world rev so emitted frames carry a known `rev`. */
 function setWorldRev(db: Database, rev: number): void {
   db.query("UPDATE reducer_state SET last_event_id = ? WHERE id = 1").run(rev);
-}
-
-async function retryUntil<T>(
-  predicate: () => T | null | undefined,
-  timeoutMs = 2000,
-  cadenceMs = 25,
-): Promise<T | null> {
-  const deadline = Date.now() + timeoutMs;
-  for (;;) {
-    const value = predicate();
-    if (value) {
-      return value;
-    }
-    if (Date.now() >= deadline) {
-      return null;
-    }
-    await Bun.sleep(cadenceMs);
-  }
 }
 
 test("diffTick pushes one patch when a watched row advances; rev is stamped", () => {

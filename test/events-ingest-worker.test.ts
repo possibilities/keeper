@@ -39,6 +39,7 @@ import {
 import { openDb } from "../src/db";
 import type { EventLogRecord } from "../src/dead-letter";
 import { serializeEventLogRecord } from "../src/dead-letter";
+import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -835,35 +836,38 @@ test("fn-742 e2e: events-ingest worker posts a live hint when an NDJSON file is 
   );
 
   let hinted = false;
-  const gotHint = new Promise<void>((resolve) => {
-    worker.addEventListener("message", (ev: MessageEvent) => {
-      const msg = ev.data as { kind?: string } | undefined;
-      if (msg && msg.kind === "events-log-changed") {
-        hinted = true;
-        resolve();
-      }
-    });
+  worker.addEventListener("message", (ev: MessageEvent) => {
+    const msg = ev.data as { kind?: string } | undefined;
+    if (msg && msg.kind === "events-log-changed") {
+      hinted = true;
+    }
   });
 
-  // Let the worker import @parcel/watcher and subscribe before we mutate.
-  await Bun.sleep(400);
-
-  writeFileSync(
-    join(eventsLogDir, `${LIVE_PID}.ndjson`),
-    serializeEventLogRecord(makeRecord("e2e-live")),
-  );
-
-  // Bounded wait: a watcher miss fails loud (hinted stays false) rather than hang.
-  await Promise.race([gotHint, Bun.sleep(5000)]);
+  // The worker imports @parcel/watcher and subscribes asynchronously; under
+  // load that can outlast a single blind write. Re-write the SAME path/content
+  // each tick (ingest is offset-idempotent / exactly-once) so a subscription
+  // that wasn't live at the first write still catches a later one. Bounded:
+  // a real watcher miss fails loud (hinted stays false) rather than hangs.
+  const ok = await retryUntil(() => {
+    if (!hinted) {
+      writeFileSync(
+        join(eventsLogDir, `${LIVE_PID}.ndjson`),
+        serializeEventLogRecord(makeRecord("e2e-live")),
+      );
+    }
+    return hinted || null;
+  }, 20_000);
 
   // Clean shutdown of the watcher subscription, then ensure the thread exits.
-  const closed = new Promise<void>((resolve) => {
-    worker.addEventListener("close", () => resolve());
+  let closed = false;
+  worker.addEventListener("close", () => {
+    closed = true;
   });
   worker.postMessage({ type: "shutdown" });
-  await Promise.race([closed, Bun.sleep(2000)]);
+  await retryUntil(() => closed || null, 20_000);
   worker.terminate();
 
+  expect(ok).toBe(true);
   expect(hinted).toBe(true);
 });
 

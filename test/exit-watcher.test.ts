@@ -26,6 +26,7 @@ import type {
   ExitWatcher,
   WaitResult,
 } from "../src/exit-watcher-ffi";
+import { retryUntil } from "./helpers/retry-until";
 
 let tmpDir: string;
 let dbPath: string;
@@ -208,21 +209,19 @@ test.if(ffiSupported)(
       },
     );
 
-    const exited = new Promise<void>((resolve) => {
-      worker.addEventListener("close", () => resolve());
+    let closed = false;
+    worker.addEventListener("close", () => {
+      closed = true;
     });
 
     // Let it boot, open its RO connection, and construct the ExitWatcher.
     await Bun.sleep(120);
     worker.postMessage({ type: "shutdown" });
 
-    // Race the clean-exit signal against a timeout so a hang fails loudly.
-    const result = await Promise.race([
-      exited.then(() => "exited" as const),
-      Bun.sleep(2500).then(() => "timeout" as const),
-    ]);
-
-    expect(result).toBe("exited");
+    // Poll the clean-exit flag with a generous ceiling so a hang fails loudly
+    // (free on the happy path) instead of racing a fixed deadline under load.
+    const ok = await retryUntil(() => closed || null, 20_000);
+    expect(ok).toBe(true);
   },
 );
 
@@ -247,6 +246,11 @@ test.if(ffiSupported)(
         workerData: unknown;
       },
     );
+
+    let closed = false;
+    worker.addEventListener("close", () => {
+      closed = true;
+    });
 
     const exitMsg = await new Promise<unknown>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -275,13 +279,9 @@ test.if(ffiSupported)(
     expect(msg.startTime).toBe("darwin:victim");
 
     await child.exited;
-    // Give the worker a beat to honor shutdown (already messaged above).
-    await Promise.race([
-      new Promise<void>((res) => {
-        worker.addEventListener("close", () => res());
-      }),
-      Bun.sleep(2000),
-    ]);
+    // Poll the close flag (shutdown already messaged above) with a generous
+    // ceiling instead of a fixed cleanup sleep.
+    await retryUntil(() => closed || null, 20_000);
   },
 );
 
