@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Evict ghost connections reliably",
-  "updated_at": "2026-06-10T01:50:39.901018Z"
+  "updated_at": "2026-06-10T02:50:38.932792Z",
+  "worker_done_at": "2026-06-10T02:50:38.932792Z"
 }
