@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-766-performance-babysitter-glowup",
   "bundles": [],
+  "closer_done_at": "2026-06-10T01:59:40.805272Z",
   "created_at": "2026-06-10T01:03:51.161618Z",
   "depends_on_epics": [],
   "id": "fn-766-performance-babysitter-glowup",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Performance babysitter glowup",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T01:03:51.161618Z"
+  "updated_at": "2026-06-10T01:59:40.805272Z"
 }
