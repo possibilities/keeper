@@ -484,6 +484,16 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # has to opt in explicitly. Threaded from cli.scaffold_cmd via SimpleNamespace.
     allow_duplicate: bool = getattr(args, "allow_duplicate", False)
 
+    # fn-15: internal-only close-provenance stamp. When the /plan:close saga's
+    # scaffold step (run_close_finalize._scaffold_followup) mints a follow-up
+    # epic, it threads the source epic id here so the minted epic JSON carries
+    # ``created_by_close_of: <source>`` — the positive provenance signal
+    # close-finalize._find_followup_epic discovers on. Read defensively (same
+    # pattern as allow_duplicate): the CLI scaffold_cmd supplies NO flag and the
+    # followup.yaml schema knows NOTHING of it, so a hand-authored plan can never
+    # spoof provenance. None when absent (plain scaffold) → no stamp written.
+    created_by_close_of: str | None = getattr(args, "created_by_close_of", None)
+
     # fn-630 (a): fail closed on a missing CLAUDE_CODE_SESSION_ID BEFORE any write.
     # build_planctl_invocation (Phase 5) is the SOLE consumer of this env var and
     # runs AFTER the full epic tree is already on disk. A missing session id used
@@ -1162,6 +1172,15 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             "created_at": now,
             "updated_at": now,
         }
+
+        # fn-15: when the close saga supplies the source epic id, stamp positive
+        # provenance onto the minted follow-up. The key rides the same
+        # ``epic_def`` dict — and therefore the same single ``atomic_write_json``
+        # below — so a crash leaves either no follow-up file or a complete
+        # stamped one; there is no stampless-epic window. Only stamped when the
+        # internal arg is supplied; plain ``planctl scaffold`` leaves it absent.
+        if created_by_close_of is not None:
+            epic_def["created_by_close_of"] = created_by_close_of
 
         # Assemble task defs in memory keyed by task_id for the integrity check.
         in_mem_task_defs: dict[str, dict] = {}

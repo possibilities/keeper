@@ -116,6 +116,17 @@ def normalize_epic(data: dict) -> dict:
     # bundles) — no SCHEMA_VERSION bump.
     if "queue_jump" not in data:
         data["queue_jump"] = False
+    # fn-15: positive close provenance. When a /plan:close saga scaffolds a
+    # follow-up epic for surviving audit findings, the scaffold step stamps the
+    # source epic id here. ``close-finalize._find_followup_epic`` discovers the
+    # follow-up by exact equality on this stamp — never by ``depends_on_epics``
+    # membership, which falsely matches human-planned epics that legitimately
+    # depend on the source. The field is immutable after mint; an open epic
+    # without the stamp is never adopted (no dep-edge fallback). Missing field
+    # defaults to None; mirrors the additive precedents (queue_jump, close_reason)
+    # — no SCHEMA_VERSION bump, no backfill of pre-fix closer-minted follow-ups.
+    if "created_by_close_of" not in data:
+        data["created_by_close_of"] = None
     return data
 
 

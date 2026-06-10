@@ -270,6 +270,70 @@ def test_closed_with_followup_scaffolds_and_closes(planctl_git_repo):
         )
     )
     assert epic_id in new_def.get("depends_on_epics", [])
+    # fn-15: the minted follow-up carries the positive close-provenance stamp,
+    # written in the same atomic write as the rest of the epic.
+    assert new_def.get("created_by_close_of") == epic_id
+
+
+def test_preexisting_dependent_without_stamp_ignored(planctl_git_repo):
+    """fn-13 regression: an unrelated open dependent (dep edge, no stamp, wrong
+    task count) is NOT adopted as the audit follow-up.
+
+    The fn-12/fn-13 incident: ``_find_followup_epic`` matched any open epic whose
+    ``depends_on_epics`` contained the source, falsely adopting human-planned
+    dependents and wedging the close in perpetual ``partial_followup``. With
+    positive provenance, an open dependent lacking the ``created_by_close_of``
+    stamp is invisible — finalize ignores it, scaffolds the REAL follow-up, and
+    closes the source ``closed_with_followup`` with the freshly-minted id.
+    """
+    repo = planctl_git_repo
+    epic_id, task_ids = seed_epic(repo, title="Has innocent dependent", n_tasks=1)
+    _mark_all_done(repo, task_ids)
+    h = _empty_set_hash(repo)
+    _seed_brief(repo, epic_id, h)
+    _seed_verdict(
+        repo,
+        epic_id,
+        commit_set_hash=h,
+        decisions=[{"fid": "f1", "action": "kept", "task": 1, "rationale": "real"}],
+    )
+    _seed_followup_yaml(repo, epic_id, epic_id, n_tasks=1)
+    # An unrelated human-planned epic that legitimately depends on the source —
+    # open, NO close-provenance stamp, and a DIFFERENT task count than expected
+    # (would have wedged the count gate at partial_followup under the old
+    # dep-edge heuristic).
+    innocent_id, _ = seed_epic(repo, title="Innocent dependent", n_tasks=3)
+    inn_path = repo / ".planctl" / "epics" / f"{innocent_id}.json"
+    inn_def = json.loads(inn_path.read_text(encoding="utf-8"))
+    inn_def["depends_on_epics"] = [epic_id]
+    inn_path.write_text(json.dumps(inn_def), encoding="utf-8")
+
+    r = _finalize(epic_id)
+    assert r.exit_code == 0, r.output
+    env = _envelope(r.output)
+    # The innocent dependent is ignored; a fresh follow-up is scaffolded.
+    assert env["outcome"] == "closed_with_followup"
+    new_epic_id = env["new_epic_id"]
+    assert new_epic_id not in (epic_id, innocent_id)
+    assert _epic_status(repo, epic_id) == "done"
+    new_def = json.loads(
+        (repo / ".planctl" / "epics" / f"{new_epic_id}.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert new_def.get("created_by_close_of") == epic_id
+
+
+def test_plain_scaffold_does_not_stamp_provenance(planctl_git_repo):
+    """A plain ``planctl scaffold`` (no internal arg) mints epics without the
+    provenance field stamped to a source id — only the close saga stamps it."""
+    repo = planctl_git_repo
+    epic_id, _ = seed_epic(repo, title="Hand authored", n_tasks=1)
+    epic_def = json.loads(
+        (repo / ".planctl" / "epics" / f"{epic_id}.json").read_text(encoding="utf-8")
+    )
+    # Absent or None are both acceptable; what matters is it is not a source id.
+    assert epic_def.get("created_by_close_of") is None
 
 
 def test_closed_with_followup_idempotent_rerun(planctl_git_repo):
@@ -314,12 +378,14 @@ def test_crash_resume_adopts_scaffolded_followup(planctl_git_repo):
         commit_set_hash=h,
         decisions=[{"fid": "f1", "action": "kept", "task": 1, "rationale": "real"}],
     )
-    # Pre-create the follow-up (the crashed run's scaffold landed) wiring back to
-    # the source with exactly 1 task = the expected cluster count.
+    # Pre-create the follow-up (the crashed run's scaffold landed) carrying the
+    # close-provenance stamp + exactly 1 task = the expected cluster count. The
+    # dep edge is incidental; discovery keys on ``created_by_close_of``.
     follow_id, _ = seed_epic(repo, title=f"Follow-up of {epic_id}", n_tasks=1)
     follow_path = repo / ".planctl" / "epics" / f"{follow_id}.json"
     follow_def = json.loads(follow_path.read_text(encoding="utf-8"))
     follow_def["depends_on_epics"] = [epic_id]
+    follow_def["created_by_close_of"] = epic_id
     follow_path.write_text(json.dumps(follow_def), encoding="utf-8")
     # A stale followup.yaml is also on disk; the adopt path must NOT re-scaffold.
     _seed_followup_yaml(repo, epic_id, epic_id, n_tasks=1)
@@ -353,11 +419,14 @@ def test_partial_followup_stops_without_close(planctl_git_repo):
             {"fid": "f2", "action": "kept", "task": 2, "rationale": "b"},
         ],
     )
-    # A wired follow-up with only 1 task (under-provisioned → partial).
+    # A closer-scaffolded follow-up with only 1 task (under-provisioned →
+    # partial). Stamped with the close provenance; the count gate, not the
+    # stamp, drives the partial verdict.
     follow_id, _ = seed_epic(repo, title=f"Partial follow {epic_id}", n_tasks=1)
     fp = repo / ".planctl" / "epics" / f"{follow_id}.json"
     fd = json.loads(fp.read_text(encoding="utf-8"))
     fd["depends_on_epics"] = [epic_id]
+    fd["created_by_close_of"] = epic_id
     fp.write_text(json.dumps(fd), encoding="utf-8")
 
     r = _finalize(epic_id)

@@ -181,14 +181,22 @@ def _expected_cluster_ordinals(verdict: dict) -> set[int]:
 
 
 def _find_followup_epic(data_dir: Path, source_epic_id: str) -> dict | None:
-    """Return the first open epic whose ``depends_on_epics`` contains the source.
+    """Return the open epic the close saga itself scaffolded for *source_epic_id*.
 
-    The ``epic followup-of`` guard, ported in-process (the standalone verb is
-    retired). First-seen wins via ``sorted(glob())`` (alphabetic filename order,
+    Discovery rides positive provenance: the matching epic is the one whose
+    ``created_by_close_of`` stamp equals *source_epic_id* — written into the
+    minted follow-up JSON by the saga's own scaffold step. ``depends_on_epics``
+    membership is never consulted, so a human-planned epic that legitimately
+    depends on the source is invisible here; absence of the stamp means "not
+    mine" with no heuristic fallback. The stamp is immutable after mint.
+
+    First-seen wins via ``sorted(glob())`` (alphabetic filename order,
     deterministic across filesystems). Returns ``{"epic_id", "actual_tasks",
     "depends_on_epics", "status"}`` for the hit, or ``None`` when no open epic
-    wires to the source. ``actual_tasks`` is the count of task JSONs on disk for
-    the follow-up.
+    carries the stamp. ``actual_tasks`` is the count of task JSONs on disk for
+    the follow-up; ``depends_on_epics`` is incidental (carried for callers, not
+    a match input). The raw ``load_json_safe`` read does no type coercion, so a
+    malformed stamp safely fails equality and is skipped.
     """
     from planctl.store import load_json_safe
 
@@ -205,10 +213,10 @@ def _find_followup_epic(data_dir: Path, source_epic_id: str) -> dict | None:
             continue
         if ep_def.get("status") != "open":
             continue
-        depends_on_epics = list(ep_def.get("depends_on_epics", []))
-        if source_epic_id not in depends_on_epics:
+        if ep_def.get("created_by_close_of") != source_epic_id:
             continue
 
+        depends_on_epics = list(ep_def.get("depends_on_epics", []))
         candidate_id = ep_def.get("id", ep_file.stem)
         actual_tasks = 0
         if tasks_dir.exists():
@@ -248,7 +256,7 @@ def _close_epic(ctx, epic_id: str) -> None:
         os.chdir(prev_cwd)
 
 
-def _scaffold_followup(ctx, followup_yaml_path: Path) -> str:
+def _scaffold_followup(ctx, followup_yaml_path: Path, source_epic_id: str) -> str:
     """Mint the follow-up tree via the REAL scaffold, returning the new epic id.
 
     Calls ``run_scaffold.run`` in-process with cwd set to the project path
@@ -258,6 +266,12 @@ def _scaffold_followup(ctx, followup_yaml_path: Path) -> str:
     refuse with ``missing_session_id`` BEFORE any write, surfaced here as
     ``SCAFFOLD_FAILED``. Scaffold owns its own ``.planctl/`` commit via
     ``emit()``; finalize never commits the follow-up tree itself.
+
+    fn-15: the SimpleNamespace carries ``created_by_close_of=source_epic_id``,
+    the internal-only provenance arg scaffold reads via ``getattr``. The minted
+    follow-up epic JSON therefore stamps ``created_by_close_of: <source>`` in the
+    same atomic write as the rest of the epic — the positive signal
+    ``_find_followup_epic`` discovers on. No CLI flag, no followup.yaml key.
 
     A non-zero scaffold exit (any dry-run / mint failure code) surfaces as a
     typed ``SCAFFOLD_FAILED`` carrying scaffold's own error envelope — finalize
@@ -274,7 +288,11 @@ def _scaffold_followup(ctx, followup_yaml_path: Path) -> str:
         os.chdir(ctx.project_path)
         with redirect_stdout(buf):
             rc = run_scaffold(
-                SimpleNamespace(file=str(followup_yaml_path), allow_duplicate=False)
+                SimpleNamespace(
+                    file=str(followup_yaml_path),
+                    allow_duplicate=False,
+                    created_by_close_of=source_epic_id,
+                )
             )
     finally:
         os.chdir(prev_cwd)
@@ -476,7 +494,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912 — single saga
             "`planctl followup submit` (via /plan:close) before close-finalize",
             details={"expected": str(fp), "expected_tasks": expected_count},
         )
-    new_epic_id = _scaffold_followup(ctx, fp)
+    new_epic_id = _scaffold_followup(ctx, fp, epic_id)
     _close_epic(ctx, epic_id)
     return _emit_outcome(
         CloseOutcome.CLOSED_WITH_FOLLOWUP,

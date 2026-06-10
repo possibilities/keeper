@@ -348,6 +348,45 @@ Docs: `apps/planctl/skills/approve/SKILL.md` Rule 1 wording flipped (`user/assis
 
 ---
 
+## Closer follow-up discovery matched any dependent epic instead of its own scaffolded follow-up
+
+**Date recorded:** 2026-06-10
+**Epic:** `fn-15-stamp-closer-follow-up-provenance`
+
+### Symptom
+A `/plan:close` run wedged in perpetual `partial_followup`: keeper autopilot re-dispatched `close::<source>` forever (the fn-12/fn-13 incident, 2026-06-10). `close-finalize` adopted an unrelated, human-planned epic — one that legitimately declared `depends_on_epics: [<source>]` for real work-ordering reasons — as the audit follow-up. Its task count did not match the expected surviving-cluster count, so the completeness gate parked the close at `partial_followup` and the source epic never closed. An exact count match would have been worse: the closer would have silently adopted the unrelated epic as the follow-up and closed the source `closed_with_followup`, falsely tying the two epics together.
+
+### Root Cause
+`_find_followup_epic` discovered "the follow-up a prior crashed close run scaffolded" by scanning for the first open epic whose `depends_on_epics` contained the source id. That structural heuristic — adoption by label inference rather than positive ownership — cannot distinguish the closer's own scaffolded follow-up from any human-planned epic that depends on the source. Both carry the same dep edge; the dep edge is a real dependency, not a provenance signal. (Pattern analog: Kubernetes label-selector adoption vs. `ownerReferences` — the former is the documented false-adoption failure class.)
+
+### Fix
+Positive provenance. The close saga's scaffold step now stamps `created_by_close_of: <source_epic_id>` onto the minted follow-up epic JSON, and discovery matches ONLY on that stamp:
+
+- **`run_scaffold.run`** reads an internal-only `getattr(args, "created_by_close_of", None)` arg (mirrors the `allow_duplicate` defensive pattern) and, when set, adds the key to the in-memory `epic_def` dict before the integrity gate — the stamp rides the same single `atomic_write_json` as the epic, so a crash leaves either no follow-up file or a complete stamped one (no stampless-epic window). The CLI `scaffold_cmd` gains NO flag and the `followup.yaml` schema learns nothing, so a hand-authored plan cannot spoof provenance.
+- **`run_close_finalize._scaffold_followup`** threads `created_by_close_of=<source>` into scaffold's `SimpleNamespace`.
+- **`run_close_finalize._find_followup_epic`** keeps `sorted(glob())` first-seen determinism and the `actual_tasks` count but flips its predicate to exactly `ep_def.get("created_by_close_of") == source_epic_id` — the `depends_on_epics` membership test is dropped entirely, not even retained as a sanity check. Both call sites (idempotent replay; adopt/partial) inherit the new behavior. The `actual_tasks == expected` count gate is unchanged: a stamped under-provisioned follow-up is still `partial_followup`.
+- **`normalize_epic`** defaults the additive field to `None` (no SCHEMA_VERSION bump, matching the `queue_jump` / `close_reason` precedents). There is no backfill — pre-fix closer-minted follow-ups stay unstamped, since backfilling via dep-edge inference would re-execute the removed heuristic.
+
+Docs: README `/plan:close` source-link sentence rewritten (discovery rides `created_by_close_of`; the dep edge remains a real dependency but is not the provenance signal); CLAUDE.md `close-finalize` contract sentence added.
+
+### Files
+- `planctl/run_scaffold.py`
+- `planctl/run_close_finalize.py`
+- `planctl/models.py`
+- `tests/test_close_finalize.py`
+- `README.md`
+- `CLAUDE.md`
+- `docs/reference/planctl-bug-history.md`
+
+### Verification
+- `test_preexisting_dependent_without_stamp_ignored` — the fn-13 regression: a source epic with surviving findings plus an unrelated open dependent (dep edge, NO stamp, different task count) finalizes by ignoring the dependent, scaffolding the real follow-up, and closing the source `closed_with_followup` with the freshly-minted id.
+- `test_closed_with_followup_scaffolds_and_closes` extended to assert the minted follow-up carries `created_by_close_of == source`.
+- `test_plain_scaffold_does_not_stamp_provenance` pins that a plain `planctl scaffold` (no internal arg) leaves the field unstamped (None).
+- `test_crash_resume_adopts_scaffolded_followup` and `test_partial_followup_stops_without_close` updated to stamp their pre-created follow-ups (modeling the closer's own crashed scaffold); the count gate stays the partial driver.
+- `uv run pytest tests/test_close_finalize.py -q` and `uv run pytest tests/ -q` — green.
+
+---
+
 ## Notes
 
 - These fixes were implemented without changing core CLI surface area.
