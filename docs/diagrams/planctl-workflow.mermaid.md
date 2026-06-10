@@ -49,7 +49,7 @@ flowchart TB
             direction TB
             start["planctl claim\n(assert + claim +\nwrite brief file, return brief_ref)"]
 
-            subgraph worker_box["Spawn `work:worker` (tier from task metadata; keeper loaded matching `claude/work-plugins/<tier>/` pre-boot)"]
+            subgraph worker_box["Spawn `plan:worker-<tier>` (the envelope's `worker_agent`; tier from task metadata)"]
                 direction TB
                 reanchor["Re-anchor\n(read spec + epic + git)"]
                 investigation_check{"Investigation\ntargets?"}
