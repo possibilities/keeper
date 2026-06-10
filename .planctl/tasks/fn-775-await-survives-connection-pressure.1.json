@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T19:04:39.507573Z",
+  "depends_on": [],
+  "epic": "fn-775-await-survives-connection-pressure",
+  "id": "fn-775-await-survives-connection-pressure.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Retryable cap rejects in client",
+  "updated_at": "2026-06-10T19:04:39.507573Z"
+}
