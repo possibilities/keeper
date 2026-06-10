@@ -34,5 +34,5 @@ Truth-table tests per outcome arm; idempotent re-run after each terminal; crash-
 - [ ] `uv run pytest tests/test_close_finalize.py -q` green; exhaustiveness test wired
 
 ## Done summary
-
+Add close-finalize: a Python saga verb deriving its position from observable state (idempotent re-run, STALE_ARTIFACTS refusal, fatal_halt, clean/follow-up close with crash-resume adopt + partial-followup stop). CloseOutcome(str,Enum) with an exhaustiveness test; ported the followup-of completeness guard in-process and retired the standalone epic followup-of verb (CLI + module + tests).
 ## Evidence
