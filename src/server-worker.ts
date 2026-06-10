@@ -385,6 +385,30 @@ export const MAX_CONNECTIONS = 64;
  */
 export const STUCK_PENDING_TTL_MS = 30_000;
 
+/**
+ * Ceiling (ms) a connection with ZERO subscriptions and no inbound frame may
+ * sit idle before the idle sweep evicts it (fn-767). This is the belt-and-
+ * braces arm for the leak class the EPIPE-evict and stuck-pending TTL both
+ * miss: a one-shot query-only client (an autopilot worker's `keeper` CLI probe)
+ * that connects, queries, and dies in a way the kernel never promptly reports —
+ * SIGKILL mid-frame, a half-open socket — fires NEITHER the Bun `close` handler
+ * (no FIN observed) NOR `error` (no EPIPE), and never receives a server write to
+ * backpressure on (`pending === null`, so the stuck-pending TTL is inert) nor to
+ * EPIPE-evict on (zero subs → never in a diff fanout). It would sit in `conns`
+ * forever; bursty CLI churn (~2.5 conns/min) fills the cap in ~40 min, then
+ * every new probe is rejected (the 2026-06-09 incident: 83 rejections, kernel
+ * holding only 15 real sockets).
+ *
+ * STRICTLY a zero-sub sweep: a SUBSCRIBED connection — even a quiet receive-only
+ * board during a DB-quiet period — is NEVER idle-reaped (the fn-723 no-ping-pong
+ * descope stands; a legit viewer holds exactly one long-lived sub). `lastActivityAt`
+ * is stamped at `open` and on every inbound `data` chunk, so a client mid-handshake
+ * or actively querying is never swept. 5 min is far beyond any one-shot probe's
+ * connect→query→read→exit round-trip (sub-second on a local UDS) yet bounds a
+ * silently-dead subscriptionless socket's lifetime to one sweep window.
+ */
+export const IDLE_CONN_TTL_MS = 5 * 60_000;
+
 // ---------------------------------------------------------------------------
 // DEBUG: timing instrumentation
 // ---------------------------------------------------------------------------
@@ -806,6 +830,17 @@ export interface ConnState {
    * when a write stashes a tail; cleared the instant `pending` drains to null.
    */
   pendingSince: number | null;
+  /**
+   * Epoch-ms of the LAST inbound activity on this connection (fn-767): stamped
+   * at `open` and refreshed on every inbound `data` chunk. The zero-sub idle
+   * sweep compares this against {@link IDLE_CONN_TTL_MS} to evict a one-shot
+   * query-only client that connected, queried, and then silently died (a death
+   * the kernel never reports as a `close`/`error`, so the EPIPE-evict and
+   * stuck-pending TTL both miss it). A SUBSCRIBED connection is exempt from the
+   * sweep regardless of this clock — a quiet board is legitimately silent — so
+   * this drives eviction ONLY for connections carrying zero subscriptions.
+   */
+  lastActivityAt: number;
   /** DEBUG: per-connection sequence id for `[srv-ts]` log correlation. */
   id?: number;
 }
@@ -816,6 +851,7 @@ function newConnState(): ConnState {
     subs: new Map(),
     pending: null,
     pendingSince: null,
+    lastActivityAt: Date.now(),
   };
 }
 
@@ -1980,6 +2016,76 @@ function reapStuckPending(list: Writable[]): void {
 }
 
 /**
+ * Idle-sweep eviction (fn-767). Evicts a connection carrying ZERO subscriptions
+ * whose last inbound activity (`lastActivityAt`, stamped at open + every `data`
+ * chunk) is older than {@link IDLE_CONN_TTL_MS}. This is the belt-and-braces arm
+ * for the leak the EPIPE-evict and stuck-pending TTL both miss: a one-shot
+ * query-only client that connected, queried, and then died in a way the kernel
+ * never reports as a `close`/`error` (SIGKILL mid-frame, half-open socket) —
+ * it has no subs (never in a diff fanout to EPIPE-evict on) and `pending === null`
+ * (never backpressured, so the stuck-pending TTL is inert), so it would linger
+ * in `conns` forever.
+ *
+ * SUBSCRIPTION-EXEMPT BY CONSTRUCTION: any conn with a non-empty `subs` map is
+ * skipped regardless of how quiet it is (the fn-723 no-ping-pong descope stands
+ * — a legit board holds one long-lived sub and is allowed to sit silent during a
+ * DB-quiet period). So this is NOT a general idle timer; it bounds ONLY the
+ * lifetime of a subscriptionless socket the kernel never reported as dead.
+ *
+ * Eviction is `sock.end()`; the Bun `close` handler then `conns.delete`s
+ * (idempotent). Wrapped per-conn in try/catch so one `end()` throw can't abort
+ * the reap of the others — and, like `reapStuckPending`, the whole sweep runs
+ * inside `diffTick`'s no-self-heal call sites (`pollLoop`/`handleKick`), so a
+ * throw never reaches the daemon. Loud log because a swept conn is abnormal (it
+ * carries tonight's diagnosis: the next occurrence is attributable from stderr).
+ */
+function reapIdleConns(list: Writable[]): void {
+  const now = Date.now();
+  for (const sock of list) {
+    // Subscribed conns are exempt — a quiet board is legitimately silent.
+    if (sock.data.subs.size > 0) {
+      continue;
+    }
+    if (now - sock.data.lastActivityAt < IDLE_CONN_TTL_MS) {
+      continue;
+    }
+    console.error(
+      `[server-worker] reaping idle zero-sub conn ${sock.data.id ?? -1} ` +
+        `(idle ${now - sock.data.lastActivityAt}ms > ${IDLE_CONN_TTL_MS}ms ceiling, ` +
+        `no subscriptions)`,
+    );
+    try {
+      sock.end?.();
+    } catch (err) {
+      // No-self-heal: a failed end() must not abort the reap of sibling conns.
+      console.error(
+        `[server-worker] idle-conn end() failed for conn ${sock.data.id ?? -1}:`,
+        err,
+      );
+    }
+  }
+}
+
+/**
+ * Run both connection-hygiene reapers over the live conn set (fn-767): the
+ * stuck-pending TTL (a dead-but-backpressured socket the diff fanout skips) and
+ * the zero-sub idle sweep (a silently-dead one-shot probe the kernel never
+ * reported). Called on EVERY `pollLoop` tick — NOT only on `data_version`-
+ * changed ticks — because the leak class fills the conns set during DB-quiet
+ * windows (bursty one-shot CLI probes against an idle daemon), exactly when
+ * `data_version` is frozen and `diffTick` would otherwise never fire. Also
+ * called from inside `diffTick` so the `handleKick` path reaps too. Eviction is
+ * idempotent (`conns.delete` on the Bun `close` handler), so the double call is
+ * a safe no-op. Each arm is per-conn try/catch'd internally; this wrapper is
+ * itself driven only from `pollLoop`/`handleKick`, both no-self-heal sites that
+ * swallow a throw, so a reap failure never reaches the daemon.
+ */
+export function reapConns(list: Writable[]): void {
+  reapStuckPending(list);
+  reapIdleConns(list);
+}
+
+/**
  * Compute the union of watched ids across a set of subscriptions (all of which
  * share one collection). The poll loop does ONE shared `selectVersionsByIds`
  * version-probe per collection group per tick — cheap (`pk, version` only,
@@ -2053,14 +2159,13 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     return;
   }
 
-  // fn-723 task .2 — stuck-pending reaper. A conn skipped below for backpressure
-  // never gets another write to EPIPE on, so a dead-but-backpressured socket
-  // would linger forever; evict any whose outbound buffer has been stuck past
-  // the ceiling. `sock.end()` triggers the Bun `close` handler → `conns.delete`.
-  // The cheap `pendingSince === null` guard means a live, quiet, receive-only
-  // subscriber (no backpressure) is never touched. NOT an idle timer. `Date.now`
-  // is fine here — the server-worker is the serve path, never a fold.
-  reapStuckPending(list);
+  // fn-723 task .2 / fn-767 — connection-hygiene reapers. These run BEFORE the
+  // `byCollection.size === 0` early return so a zero-sub conn is still swept.
+  // Both also run on every poll tick via `reapConns` (fn-767 — `pollLoop`
+  // hoists them out of the changed-tick gate); the calls here additionally
+  // cover the `handleKick` path. Eviction is idempotent (`conns.delete` on the
+  // Bun `close` handler), so a double-fire is a safe no-op.
+  reapConns(list);
 
   // Build the flat list of (sock, subId, sub) triples across all conns and
   // group by `sub.collection`. A conn with an empty `subs` map (no live
@@ -2372,6 +2477,19 @@ export async function pollLoop(
     if (isShutdown()) {
       break;
     }
+    // fn-767 — run the connection-hygiene reapers on EVERY tick, not only on a
+    // `data_version`-changed tick below. The ghost-conn leak class (bursty
+    // one-shot CLI probes that die silently) fills `conns` during DB-quiet
+    // windows — exactly when `data_version` is frozen and the `diffTick` arm
+    // never fires. Hoisting the reap here closes the deferred fn-723 review gap
+    // (the stuck-pending TTL was gated on changed ticks) and drives the new
+    // zero-sub idle sweep. Wrapped no-self-heal: a reap throw must log+continue,
+    // never escape the poll loop (which would crash the worker + bounce launchd).
+    try {
+      reapConns([...getConns()]);
+    } catch (err) {
+      console.error("[server-worker] poll-loop reapConns failed:", err);
+    }
     const cur = (query.get() as { data_version: number }).data_version;
     if (cur !== last) {
       last = cur;
@@ -2516,6 +2634,11 @@ export function startServer(
         const id = socket.data.id ?? -1;
         if (TRACE) srvTs(`conn ${id} data chunk=${chunk.length}`);
         const t0 = Date.now();
+        // fn-767 — refresh the idle-sweep clock on every inbound frame so an
+        // actively-querying or mid-handshake conn is never idle-reaped. The
+        // sweep (reapIdleConns) only touches ZERO-sub conns past the TTL; a
+        // one-shot probe that dies silently stops bumping this and ages out.
+        socket.data.lastActivityAt = t0;
         handleData(db, socket, chunk, writerDb, bridge, memo);
         const dur = Date.now() - t0;
         if (dur >= 5) {

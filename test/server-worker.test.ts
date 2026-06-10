@@ -50,6 +50,7 @@ import {
   diffTick,
   dispatchLine,
   handleKick,
+  IDLE_CONN_TTL_MS,
   isPidAlive,
   LockHeldError,
   MAX_CONNECTIONS,
@@ -60,6 +61,7 @@ import {
   type ReplayBridge,
   type ResultMemo,
   RPC_REGISTRY,
+  reapConns,
   registerAsyncRpc,
   registerRpc,
   resolveFilter,
@@ -135,6 +137,7 @@ function dispatchInit(): ConnState {
     subs: new Map(),
     pending: null,
     pendingSince: null,
+    lastActivityAt: Date.now(),
   };
 }
 
@@ -1705,6 +1708,228 @@ test("diffTick stuck-pending TTL leaves a quiet receive-only conn alone", () => 
 
   expect(sock.ended).toBe(false);
   expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-767 — zero-sub idle sweep + every-tick reap.
+//
+// The ghost-conn leak class: a one-shot query-only client connects, queries,
+// and dies in a way the kernel never reports (SIGKILL mid-frame, half-open) —
+// firing NEITHER close NOR error. With zero subs it's never in a diff fanout
+// (no EPIPE-evict) and `pending === null` (the stuck-pending TTL is inert), so
+// it lingers in `conns` forever. The idle sweep evicts a zero-sub conn past
+// IDLE_CONN_TTL_MS; a subscribed conn is ALWAYS exempt; and the reapers now run
+// on every poll tick, not only `data_version`-changed ticks.
+// ---------------------------------------------------------------------------
+
+test("diffTick idle-sweep evicts a zero-sub conn idle past the TTL", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+
+  // A one-shot client that connected + queried long ago and then died silently:
+  // zero subscriptions, no backpressure (pending === null), last activity aged
+  // well past the ceiling (the "fake clock advance"). This is the leak class.
+  expect(sock.data.subs.size).toBe(0);
+  sock.data.lastActivityAt = Date.now() - (IDLE_CONN_TTL_MS + 1);
+
+  diffTick(db, conns); // a DB-quiet tick (no subs, nothing to diff)
+
+  expect(sock.ended).toBe(true);
+  expect(conns.has(sock)).toBe(false);
+  db.close();
+});
+
+test("diffTick idle-sweep does NOT evict a fresh zero-sub conn (mid-handshake)", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+
+  // Zero subs but just connected (lastActivityAt = now, set by dispatchInit) —
+  // a client still mid-handshake / about to query. Never swept.
+  expect(sock.data.subs.size).toBe(0);
+  expect(Date.now() - sock.data.lastActivityAt).toBeLessThan(IDLE_CONN_TTL_MS);
+
+  diffTick(db, conns);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("idle-sweep NEVER evicts a subscribed conn, however long it has been quiet", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // A legit board: one long-lived sub, silent during a long DB-quiet period.
+  // Its lastActivityAt is ancient (no inbound frames since the subscribe), but
+  // the sub-count exemption keeps it alive regardless (the fn-723 no-ping-pong
+  // descope stands).
+  expect(sock.data.subs.size).toBe(1);
+  sock.data.lastActivityAt = Date.now() - IDLE_CONN_TTL_MS * 100;
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("reapConns runs both arms: stuck-pending AND idle zero-sub eviction", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const conns = new Set<Writable>();
+
+  // Arm 1: a backpressured-too-long conn (stuck-pending TTL).
+  const stuck = fakeSock(conns);
+  conns.add(stuck);
+  stuck.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
+  stuck.data.pendingSince = Date.now() - (STUCK_PENDING_TTL_MS + 1);
+
+  // Arm 2: an idle zero-sub conn (idle sweep).
+  const idle = fakeSock(conns);
+  conns.add(idle);
+  idle.data.lastActivityAt = Date.now() - (IDLE_CONN_TTL_MS + 1);
+
+  reapConns([...conns]);
+
+  expect(stuck.ended).toBe(true);
+  expect(idle.ended).toBe(true);
+  expect(conns.size).toBe(0);
+  db.close();
+});
+
+test("an idle-sweep end() throw is swallowed (no-self-heal) and siblings still reap", () => {
+  const { db } = openDb(dbPath, { readonly: false });
+  const conns = new Set<Writable>();
+
+  // First conn's end() throws; the second must still be reaped.
+  const boomer = fakeSock(conns);
+  conns.add(boomer);
+  boomer.data.lastActivityAt = Date.now() - (IDLE_CONN_TTL_MS + 1);
+  boomer.end = () => {
+    throw new Error("boom");
+  };
+
+  const sibling = fakeSock(conns);
+  conns.add(sibling);
+  sibling.data.lastActivityAt = Date.now() - (IDLE_CONN_TTL_MS + 1);
+
+  expect(() => reapConns([...conns])).not.toThrow();
+  // The sibling was reaped despite the boomer's throw.
+  expect(sibling.ended).toBe(true);
+  expect(conns.has(sibling)).toBe(false);
+  db.close();
+});
+
+test("pollLoop reaps idle zero-sub conns on a DB-quiet tick (no data_version change)", async () => {
+  // The deferred fn-723 gap, now closed: the reapers must run on EVERY tick,
+  // not only `data_version`-changed ticks. A two-connection real DB so the
+  // pollLoop's PRAGMA data_version read sees a frozen counter (no writes), then
+  // assert the idle zero-sub conn is evicted anyway.
+  const { db } = openDb(dbPath, { readonly: true });
+  const conns = new Set<Writable>();
+  const idle = fakeSock(conns);
+  conns.add(idle);
+  idle.data.lastActivityAt = Date.now() - (IDLE_CONN_TTL_MS + 1);
+
+  let stop = false;
+  const loop = pollLoop(
+    db,
+    () => conns,
+    () => stop,
+    25,
+  );
+  // No DB write happens — data_version stays frozen. The reaper must still fire.
+  const reaped = await retryUntil(() =>
+    idle.ended && !conns.has(idle) ? true : null,
+  );
+  stop = true;
+  await loop;
+
+  expect(reaped).toBe(true);
+  db.close();
+});
+
+test("hard-killed client (SIGKILL, no FIN) is idle-swept from conns", async () => {
+  // The hard-death class the kernel never reports as a close: a child process
+  // connects, then is SIGKILLed mid-life. On some paths Bun observes the FIN
+  // and fires `close` (evicting immediately); on others (half-open) it does
+  // not. Either way the idle sweep is the backstop — force the conn's clock
+  // past the ceiling and assert a poll tick evicts it. Drives a REAL server +
+  // real client socket so the open/close handler wiring is exercised end-to-end.
+  const { db } = openDb(dbPath, { readonly: true });
+  const server = startServer(db, sockPath, lockPath);
+
+  const client = await Bun.connect({
+    unix: sockPath,
+    socket: { data() {}, error() {} },
+  });
+  // Wait for the server to register the conn.
+  const seen = await retryUntil(() =>
+    server.conns.size === 1 ? [...server.conns][0] : null,
+  );
+  if (!seen) {
+    throw new Error("server never registered the client connection");
+  }
+
+  // Simulate the silent-death window: the client is gone but the kernel hasn't
+  // reported it (no subs, no activity). Age the server-side conn's clock past
+  // the ceiling and tear the client down hard.
+  seen.data.lastActivityAt = Date.now() - (IDLE_CONN_TTL_MS + 1);
+  client.terminate();
+
+  // The next poll tick's reapConns evicts the aged zero-sub conn.
+  const drained = await retryUntil(() =>
+    server.conns.size === 0 ? true : null,
+  );
+  expect(drained).toBe(true);
+
+  server.stop();
+  db.close();
+});
+
+test("overlapping one-shot query churn returns conns to baseline (never approaches cap)", async () => {
+  // The incident shape: N overlapping (not sequential) one-shot clients connect,
+  // query, and exit. Clean exits fire the Bun `close` handler → conns.delete, so
+  // the set must return to baseline (0) and never approach MAX_CONNECTIONS — even
+  // with the churn concurrent. Real server + real clients end-to-end.
+  const { db } = openDb(dbPath, { readonly: true });
+  const server = startServer(db, sockPath, lockPath);
+
+  const N = 30; // well under the 64 cap; overlapping, not staggered
+  let peak = 0;
+  const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
+  for (let i = 0; i < N; i++) {
+    clients.push(
+      await Bun.connect({
+        unix: sockPath,
+        socket: { data() {}, error() {} },
+      }),
+    );
+    peak = Math.max(peak, server.conns.size);
+  }
+  // All N admitted concurrently — never rejected, never near the cap.
+  await retryUntil(() => (server.conns.size === N ? true : null));
+  expect(server.conns.size).toBe(N);
+  expect(peak).toBeLessThan(MAX_CONNECTIONS);
+
+  // Every client exits cleanly (FIN): the close handler must drain conns to 0.
+  for (const c of clients) {
+    c.end();
+  }
+  const baseline = await retryUntil(() =>
+    server.conns.size === 0 ? true : null,
+  );
+  expect(baseline).toBe(true);
+
+  server.stop();
   db.close();
 });
 
