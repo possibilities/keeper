@@ -114,5 +114,5 @@ one rendered agents/worker-medium.md to confirm tier-agnostic prose.
 - [ ] `uv run pytest tests/` passes
 
 ## Done summary
-
+Hardened the worker agent template: bounded Phase 3 test phase (targeted-then-one-full-pass, two-full-run cap, foreground-only, test-disabling ban), cheapened predecessor pickup (commit diff + task-targeted tests), added envelope-vs-git trust rule, banned planctl done --help / post-done planctl show, made the keeper session-state self-check mandatory, capped the return summary, and echoed every new rule in the Rules block. Mirrored one-liners into the work-skill template and commit-at-mutation-boundary.md; re-rendered the four worker agents.
 ## Evidence

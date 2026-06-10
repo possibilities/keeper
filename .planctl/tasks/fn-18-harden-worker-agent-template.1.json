@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Bound and harden worker template",
-  "updated_at": "2026-06-10T18:24:09.631307Z"
+  "updated_at": "2026-06-10T18:28:45.854040Z",
+  "worker_done_at": "2026-06-10T18:28:45.854040Z"
 }
