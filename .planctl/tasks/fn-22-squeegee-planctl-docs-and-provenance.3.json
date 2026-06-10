@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Scrub test fixture provenance",
-  "updated_at": "2026-06-10T20:04:00.074099Z"
+  "updated_at": "2026-06-10T21:50:03.728785Z",
+  "worker_done_at": "2026-06-10T21:50:03.728785Z"
 }

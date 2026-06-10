@@ -28,5 +28,5 @@ Over-trimming a regression-guard name severs the test-to-bug-history link the re
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Scrubbed pure-provenance fn-NNN ids from test module docstrings, fixture comments, and assertion messages across 45 test files; restated as present-tense facts. Kept fixture data ids, format-example ids, and bug-history-anchored guard names. Full slow suite green (795 passed, 2 skipped); collected count unchanged at 797. ~336 lines / ~24k chars removed.
 ## Evidence
