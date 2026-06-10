@@ -1,107 +1,60 @@
 /**
- * Shared subscribe client + readiness handoff for the five keeper collections
- * (`epics`, `jobs`, `subagent_invocations`, `git`, `dead_letters`) PLUS a
- * generic single-collection subscribe helper. One imperative API: callers
- * pass a snapshot/rows callback and get back a `dispose()` handle. The
- * helpers own the connection lifecycle (capped-backoff reconnect,
- * post-disconnect re-handshake, per-collection coalesce, steady-poll
- * backstop) plus the relevant first-paint gate and the per-frame projection;
- * callers do rendering and side effects on top.
+ * Shared subscribe client + readiness handoff for the keeper collections, plus
+ * a generic single-collection subscribe helper. One imperative API: callers
+ * pass a snapshot/rows callback and get back a `dispose()` handle. The helpers
+ * own the connection lifecycle (capped-backoff reconnect, per-collection
+ * coalesce, steady-poll backstop) plus the first-paint gate and the per-frame
+ * projection; callers do rendering on top.
  *
- * Two public entry points
- * -----------------------
- * - `subscribeCollection({ ... })` — single-collection subscribe used by
- *   sidecar UIs like `scripts/git.ts`. Fires `onRows(rows)` once per `result`
- *   frame (and on coalesced refetch results). No `computeReadiness` handoff;
- *   the caller renders whatever shape it wants from raw rows. Terminal-error
- *   semantics: an `error` frame BEFORE the first `result` is unrecoverable
- *   ONLY when its `code` is NOT in `TRANSIENT_SERVER_CODES` (the query is
- *   malformed); a transient code (e.g. `max_connections`, fn-775) rides the
- *   reconnect loop even pre-paint. After at least one `result`, errors are
- *   transient and the next refetch can recover.
- * - `subscribeReadiness({ ... })` — five-collection composition used by the
- *   full-readiness consumers (`scripts/board.ts`, `scripts/autopilot.ts`).
- *   All five (`epics` + `jobs` + `subagent_invocations` + `git` +
- *   `dead_letters`) ride a single connection; the all-five-strict
+ * Two public entry points:
+ * - `subscribeCollection({ ... })` — single-collection subscribe (sidecar UIs
+ *   like `scripts/git.ts`). Fires `onRows(rows)` once per `result` frame, no
+ *   `computeReadiness` handoff. Terminal-error semantics: a pre-paint `error`
+ *   is unrecoverable ONLY when its `code` is NOT in `TRANSIENT_SERVER_CODES`
+ *   (a malformed query); a transient code rides the reconnect loop even
+ *   pre-paint. Post-paint, errors are transient.
+ * - `subscribeReadiness({ ... })` — multi-collection composition (board,
+ *   autopilot). All collections ride a single connection; the all-strict
  *   first-paint gate withholds `onSnapshot` until each has produced a
- *   `result`, then `computeReadiness` runs and the composed snapshot fires.
- *   The `dead_letters` collection rides the descriptor's default
- *   `filter: { status: "waiting" }` scope so the wire stream tracks only the
- *   unrecovered backlog — the board's persistent warn-count and
- *   readiness consumers see "things to fix right now," not the audit trail
- *   of already-recovered rows.
+ *   `result`, then `computeReadiness` runs. `dead_letters` rides its
+ *   `filter: { status: "waiting" }` scope so the stream tracks only the
+ *   unrecovered backlog.
  *
  * Both helpers share one internal driver (`subscribeMulti`) that owns the
  * socket, the reconnect-with-backoff loop, the line buffer, the per-collection
- * `queryInFlight` / `refetchDirty` coalescer, the steady-poll backstop, and
- * the terminal-error gate. The public helpers compose the driver with the
- * right number of collections + the right "all paint" predicate.
+ * coalescer, the steady-poll backstop, and the terminal-error gate.
  *
- * Why callback + dispose, not async iterator. Async generators bring two
- * pitfalls for this workload: (a) cancellation requires consumers to call
- * `.return()` correctly, which is easy to miss on SIGINT; (b) recursive
- * `yield*` for reconnect creates per-reconnect frames on the stack. All
- * consumers want imperative push semantics — a callback fires when a new
- * snapshot is ready, and `dispose()` is the only way out.
- *
- * Why `state.rows` (not `byId.values()`) for `subagent_invocations`. The
- * descriptor exposes `job_id` as the wire pk even though the SQL composite
- * identity is `(job_id, agent_id, turn_seq)`. Two re-entrant sub-agents
- * sharing one `job_id` must BOTH reach `computeReadiness` so predicate 6
- * (`own-progress-sub`) doesn't false-negative. `byId` collapses them
- * last-write-wins; `rows` carries the full wire-order stream. This is the
- * load-bearing invariant covered by `test/board.test.ts`'s regression.
- * (fn-697.2 narrowed the wire frame to the safe-7 columns — `agent_id` is no
- * longer projected — but every row is still streamed; the all-rows-not-byId
- * invariant is unaffected by the column narrow.)
+ * Why `state.rows` (not `byId.values()`) for `subagent_invocations`: the
+ * descriptor exposes `job_id` as the wire pk though the SQL identity is
+ * composite `(job_id, agent_id, turn_seq)`. Two re-entrant sub-agents sharing
+ * one `job_id` must BOTH reach `computeReadiness` so predicate 6 doesn't
+ * false-negative; `byId` collapses them last-write-wins, `rows` carries the
+ * full wire-order stream. Covered by `test/board.test.ts`'s regression.
  *
  * Lifecycle contract:
- *   - First-paint gate. `subscribeReadiness` withholds `onSnapshot` until
- *     epics + jobs + subagent_invocations + git + dead_letters have EACH
- *     produced their first `result`; `subscribeCollection` withholds
- *     `onRows` until its single collection has produced its first `result`.
- *     A partial snapshot would compute readiness against a wrong-state
- *     input. The empty steady state of `dead_letters` (zero waiting rows,
- *     the happy case) still produces a `result` frame with `rows: []` so
- *     the gate clears — the descriptor's `defaultFilter: { status:
- *     "waiting" }` scope means "no dropped events to recover," not "no
- *     subscription."
- *   - Capped-backoff reconnect: 250 ms → 5000 ms doubling per attempt;
- *     resets on a successful connection. By DEFAULT this is reconnect-
- *     forever (the board/TUI contract). An opt-in per-caller `giveUpPolicy`
- *     (fn-750.1) bounds the CONTINUOUS-UNPAINTED window instead: when no
- *     first `result` lands within `deadlineMs` (anchor armed at subscribe
- *     start, cleared on first paint, re-armed on a post-paint drop), the
- *     driver tears down and fires `onFatal({ code: "unreachable" })` once.
- *     Bounds both never-connected and was-connected-then-lost; `keeper
- *     await` opts in, the board does not.
- *   - Steady-poll backstop (500 ms) refetches each subscribed collection
- *     every tick, coalesced per collection via `queryInFlight` /
- *     `refetchDirty`.
- *   - On teardown (disconnect or `dispose`): reset `state.rows`,
- *     `state.byId`, `state.order`, AND `gotResult = false` for every
- *     collection. The `gotResult` reset is what board.ts has and
- *     autopilot.ts's previous standalone code was missing — centralized
- *     here so both consumers inherit the correct behavior. fn-750.3: a
- *     client-initiated teardown also HARD-destroys the held socket
- *     (`destroySocket` → `Bun.Socket.terminate()`, NOT `end()`) so the
- *     native read/write buffer + libuv handle are freed IMMEDIATELY rather
- *     than pinned until a (possibly half-up / never-arriving) peer FIN.
- *     A graceful `end()` against a wedged daemon left ~1.4–2.2 KB of native
- *     memory — invisible to the JS heap, surviving full GC — leaking per
- *     reconnect; on a flapping daemon that compounds to the observed ~2GB
- *     `keeper await` runaway. `scripts/subscribe-bounce-soak.ts` is the
- *     repro + flat-RSS evidence gate.
- *   - `dispose()` is idempotent: pre-first-paint bails clean (no callback
- *     fires); during reconnect backoff cancels the pending timer and marks
- *     `shuttingDown`; called twice is a no-op.
- *   - `onSnapshot` / `onRows` exceptions are NOT swallowed — they propagate
- *     up to the caller's I/O frame. Matches keeper's "no in-process
- *     self-heal" stance and matches today's `emitFrameIfChanged`, which has
- *     no try/catch.
- *   - SIGINT remains the CALLER's concern; the helper exposes `dispose()`
- *     and the caller wires its own signal handler (so each script's
- *     SIGINT-prints stay per-script).
+ *   - First-paint gate withholds the callback until every subscribed
+ *     collection has produced its first `result` — a partial snapshot would
+ *     compute readiness against a wrong-state input. An empty
+ *     `dead_letters`/`pending_dispatches`/`armed_epics` still produces a
+ *     `result` with `rows: []` so the gate clears.
+ *   - Capped-backoff reconnect: 250 ms → 5000 ms doubling, reset on a served
+ *     connection. By DEFAULT reconnect-forever (the board/TUI contract). An
+ *     opt-in `giveUpPolicy` bounds the CONTINUOUS-UNPAINTED window: when no
+ *     first `result` lands within `deadlineMs` the driver tears down and fires
+ *     `onFatal({ code: "unreachable" })` once.
+ *   - Steady-poll backstop (500 ms) refetches each collection, coalesced.
+ *   - On teardown (disconnect or `dispose`): reset every collection's `rows` /
+ *     `byId` / `order` / `gotResult`, and HARD-destroy the held socket
+ *     (`destroySocket` → `terminate()`, NOT `end()`) so the native buffers +
+ *     libuv handle are freed IMMEDIATELY rather than pinned until a (possibly
+ *     never-arriving) peer FIN. A graceful `end()` against a wedged daemon
+ *     leaks ~1.4–2.2 KB of native memory per reconnect (invisible to the JS
+ *     heap, surviving GC) → the observed ~2GB `keeper await` runaway.
+ *     `scripts/subscribe-bounce-soak.ts` is the flat-RSS evidence gate.
+ *   - `dispose()` is idempotent.
+ *   - `onSnapshot` / `onRows` exceptions are NOT swallowed — they propagate to
+ *     the caller (the "no in-process self-heal" stance).
+ *   - SIGINT remains the CALLER's concern.
  */
 
 import { computeEligibleEpics } from "./armed-closure";
@@ -131,84 +84,47 @@ import type {
 // Tuning constants — same values the prior board.ts standalone code used.
 // ---------------------------------------------------------------------------
 
-// Full set — the board's default jobs scope is LIVE-only (working + stopped;
-// the descriptor's `defaultFilter` hides `ended`/`killed`), so the streamed
-// set is bounded by concurrently-live sessions, not the full job history.
-// Page limit 0 streams them all; without it the `created_at DESC` sort drops
-// the oldest-created live session off the bottom once more than the cap are
-// live at once (e.g. a long-lived session buried under newer ones).
+// Page limit 0 = full filtered set, no LIMIT cap. Every readiness collection
+// uses it: the default jobs scope is LIVE-only and the rest are intrinsically
+// bounded (one row per worktree / armed epic / in-flight launch), and
+// readiness needs every row to compute the right counts / mutex slots /
+// armed-closure. A `created_at DESC` cap would silently drop the oldest live
+// session; a sub-agent page would break the ×N count/stuck math and fight the
+// `job_id` wire-pk diff.
 const JOBS_PAGE_LIMIT = 0;
 const EPICS_PAGE_LIMIT = 0;
-// Full set — page limit 0 streams every per-job sub-agent row (NOT
-// latest-per-job), which the renderer's ×N count / N-stuck annotation and
-// superseded-orphan detection plus predicate-6 all require. fn-697.2 narrowed
-// the descriptor's COLUMNS to the safe-7 (halving per-frame serialize cost)
-// but kept ALL rows — column projection, not a row filter/page (paging would
-// fight the `job_id` wire-pk / `byId` diff; a latest-per-job aggregate would
-// break the count/stuck math).
 const SUBAGENT_INVOCATIONS_PAGE_LIMIT = 0;
-// Full set — one row per planctl-backed git worktree; the watched set is
-// scoped to project roots that have produced events, which is bounded by the
-// human's actual repo collection.
 const GIT_PAGE_LIMIT = 0;
-// Full set — `dead_letters` rides the descriptor's
-// `defaultFilter: { status: "waiting" }` so the wire stream is just the
-// unrecovered backlog (typically zero rows; bursts are bounded by how many
-// hook-INSERT failures the daemon has imported but not yet replayed). Page
-// limit 0 streams them all — there is no scroll affordance and the
-// renderer needs the full native count to surface as a warn pill.
 const DEAD_LETTERS_PAGE_LIMIT = 0;
-// Full set (fn-721) — one row per launched-but-not-yet-bound worker
-// (`pending_dispatches`, schema v50). The in-flight set is bounded by the
-// concurrent launch-window count (typically 0–1 under the one-at-a-time
-// stagger). Page limit 0 streams them all; readiness needs every row to hold
-// the right launch-window mutex slots.
 const PENDING_DISPATCHES_PAGE_LIMIT = 0;
-// fn-770 — the autopilot `mode` singleton (`autopilot_state`, schema v62) and
-// the per-epic armed PRESENCE set (`armed_epics`). Both feed the board/CLI
-// readiness pass's armed-mode eligibility so the displayed per-root winner
-// matches what the reconciler actually dispatches. `autopilot_state` is a
-// singleton (one row); `armed_epics` is bounded by the human's armed selection.
-// Page limit 0 streams every row — readiness needs the complete armed set to
-// compute the transitive-upstream closure.
 const AUTOPILOT_STATE_PAGE_LIMIT = 0;
 const ARMED_EPICS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
-// fn-775: cap-reject (capacity-transient) backoff base. A `max_connections`
-// reject is NOT a socket-level connect failure — the connection was ACCEPTED,
-// then the server served an error frame and closed. Reconnecting immediately
-// worsens the exact contended resource (the daemon's connection cap), and a
-// whole await fleet rejected in the same incident retries in lockstep — so cap
-// rejects ride a LONGER base with FULL jitter (`random(0, capped_window)`),
-// distinct from the deterministic 250ms→5s socket-level ladder. Both stay under
-// the shared `MAX_BACKOFF_MS` ceiling.
+// Cap-reject (capacity-transient) backoff base. A `max_connections` reject was
+// ACCEPTED then served an error and closed, so an immediate retry worsens the
+// contended cap and a whole await fleet retries in lockstep — cap rejects ride
+// this LONGER base with FULL jitter (`random(0, capped_window)`), distinct from
+// the deterministic 250ms→5s socket-level ladder. Both stay under
+// `MAX_BACKOFF_MS`.
 const TRANSIENT_BACKOFF_BASE_MS = 2500;
 /**
- * fn-775: server error codes that are CAPACITY-TRANSIENT, not query-terminal.
- * A `max_connections` reject is the daemon saying "full right now," which the
- * existing capped-backoff reconnect loop recovers from — it is NOT a malformed
- * query a reconnect can't fix. An error frame whose `code` is in this set is
- * routed to teardown + reconnect (never `isTerminal` / `onFatal`), preserving
- * the fn-757 reconnect-forever contract. Exported as a NAMED allowlist so the
- * retryable contract is documented in one place and the terminal path stays
- * narrow (only codes ABSENT from this set are unrecoverable pre-paint). Lives in
- * the client (not the CLI) because `subscribeMulti` owns the reconnect loop.
+ * Server error codes that are CAPACITY-TRANSIENT, not query-terminal. A
+ * `max_connections` reject is "full right now," which the reconnect loop
+ * recovers from — NOT a malformed query. An error frame whose `code` is in this
+ * set is routed to teardown + reconnect (never `onFatal`), even pre-paint. A
+ * NAMED allowlist so the terminal path stays narrow (only ABSENT codes are
+ * unrecoverable pre-paint).
  */
 export const TRANSIENT_SERVER_CODES = new Set<string>(["max_connections"]);
 /**
- * Slow-flight + hard-deadline thresholds for an in-flight `query`. The
- * steady-poll loop (`pollAll`, fires every `POLL_MS`) walks every state
- * and compares `Date.now() - queryInFlightSince` against these. At
- * `SLOW_FLIGHT_MS` the helper emits a single `query_slow_flight`
- * lifecycle event (latched by `lastSlowFlightAt` so it fires once per
- * stuck window, not every poll). At `QUERY_TIMEOUT_MS` the helper
- * concludes the connection is wedged, emits `query_timeout`, tears the
- * socket down, and lets the existing `connectWithRetry` machinery
- * reconnect from scratch. `Date.now()` here is correct: thresholds are
- * wall-clock, sub-ms precision is irrelevant, and in-process state has
- * no need to survive a restart (`teardownConnection` clears it).
+ * Slow-flight + hard-deadline thresholds for an in-flight `query`. `pollAll`
+ * compares `Date.now() - queryInFlightSince` against these: at `SLOW_FLIGHT_MS`
+ * it emits one `query_slow_flight` (latched so it fires once per stuck window);
+ * at `QUERY_TIMEOUT_MS` it concludes the connection is wedged, emits
+ * `query_timeout`, and tears down so `connectWithRetry` reconnects. `Date.now()`
+ * is correct here — wall-clock thresholds, in-process state cleared on teardown.
  */
 const SLOW_FLIGHT_MS = 1000;
 const QUERY_TIMEOUT_MS = 5000;
@@ -219,14 +135,10 @@ const QUERY_TIMEOUT_MS = 5000;
 
 /**
  * Snapshot delivered to `onSnapshot` once per emit. `subagentInvocations` is
- * the FLAT `SubagentInvocation[]` projected from `state.rows`, NOT
- * `byId.values()` — see module docstring for the predicate-6 reasoning.
- * `jobs` is a `Map<job_id, Job>` because board's renderer indexes by id for
- * the per-epic `job_links` lookup; autopilot can ignore the map and read
- * only `epics` if it wants to. `deadLetters` is the unrecovered backlog
- * (descriptor `defaultFilter: { status: "waiting" }` scope); a renderer
- * surfaces `deadLetters.length` as the warn-count pill and a `0`-length
- * array drops the pill cleanly.
+ * the FLAT `SubagentInvocation[]` projected from `state.rows` (see module
+ * docstring for the predicate-6 reasoning). `jobs` is a `Map<job_id, Job>` for
+ * the board's per-epic `job_links` lookup. `deadLetters` is the unrecovered
+ * backlog; a renderer surfaces its `.length` as the warn-count pill.
  */
 export interface ReadinessClientSnapshot {
   readonly epics: Epic[];
@@ -234,24 +146,19 @@ export interface ReadinessClientSnapshot {
   readonly subagentInvocations: SubagentInvocation[];
   readonly gitStatus: GitStatus[];
   readonly deadLetters: DeadLetter[];
-  // fn-721: the open `pending_dispatches` rows projected into the plain
-  // `PendingDispatch[]` shape (the 6th subscribed collection). Fed into
-  // `computeReadiness` so the board/CLI path agrees with the autopilot
-  // reconciler on the `dispatch-pending` occupant. Rides on the snapshot so a
-  // renderer can surface the in-flight launch list if it wants; `readiness`
-  // already reflects the occupancy.
+  // The open `pending_dispatches` rows fed into `computeReadiness` so the
+  // board/CLI path agrees with the reconciler on the `dispatch-pending`
+  // occupant; rides on the snapshot for a renderer that wants the in-flight
+  // launch list.
   readonly pendingDispatches: PendingDispatch[];
   readonly readiness: ReadinessSnapshot;
 }
 
 /**
  * Fatal-error payload handed to `onFatal` when a terminal `error` frame
- * arrives BEFORE any collection has produced its first `result` (i.e. the
- * query itself is malformed — `bad_frame` / `unknown_collection`). `rev`
- * is the wire-level world-rev when known (the protocol may omit it on
- * pre-handshake errors). The shape is what `onLifecycle` already receives
- * for the same frame; `onFatal` exists so callers can act on the
- * terminal condition instead of just observing it.
+ * arrives BEFORE any collection has painted (a malformed query — `bad_frame` /
+ * `unknown_collection`). `rev` is the wire-level world-rev when known. Same
+ * shape `onLifecycle` receives; `onFatal` lets callers act on it.
  */
 export interface FatalError {
   readonly code: string;
@@ -260,55 +167,39 @@ export interface FatalError {
 }
 
 /**
- * Opt-in bounded give-up policy (fn-750.1). When set, the driver bounds how
- * long it will spin reconnecting without ever PAINTING (producing a first
- * `result`). The deadline is a CONTINUOUS-UNPAINTED wall-clock budget, not an
- * attempt count: `attempt` resets to 0 on every socket `open`, so a flapping
- * connection that accepts-then-drops forever would never trip an attempt
- * cap. The unpainted anchor is armed at subscribe start, CLEARED on first
- * paint (the first `result` frame — NOT socket `open`, so a half-up daemon
- * that accepts the connection but never serves still gives up), and RE-ARMED
- * on any drop after a paint (so the post-bounce window is fresh). When
- * `now() - anchor >= deadlineMs`, the driver tears the connection down and
- * fires `onFatal({ code: "unreachable", ... })` exactly once — same
- * teardown-before-`onFatal` ordering as the terminal-query-shape error path.
- *
- * Default (no policy) is reconnect-forever — the board TUI and every other
- * current caller is untouched (zero edits). `keeper await` opts in.
- *
- * Bounds BOTH the never-connected case (anchor armed at start, never cleared)
- * and the was-connected-then-lost case (re-armed on a post-paint drop).
+ * Opt-in bounded give-up policy. When set, the driver bounds how long it will
+ * spin reconnecting without ever PAINTING. The deadline is a
+ * CONTINUOUS-UNPAINTED wall-clock budget, NOT an attempt count (`attempt`
+ * resets on every socket `open`, so a flapping accept-then-drop never trips an
+ * attempt cap). The anchor is armed at subscribe start, CLEARED on first paint
+ * (the first `result`, NOT socket `open`, so a half-up daemon that accepts but
+ * never serves still gives up), and RE-ARMED on any post-paint drop. When
+ * `now() - anchor >= deadlineMs` the driver tears down and fires
+ * `onFatal({ code: "unreachable" })` once. Default (no policy) is
+ * reconnect-forever. Bounds BOTH never-connected and was-connected-then-lost.
  */
 export interface GiveUpPolicy {
   /**
-   * Continuous-unpainted wall-clock budget in milliseconds. Measured against
-   * the injected `now()` clock (see `MultiOptions.now`), so the fake-timer
-   * test harness can drive the deadline without advancing real wall-clock.
+   * Continuous-unpainted budget in ms, measured against the injected `now()`
+   * clock so the fake-timer harness can drive the deadline without advancing
+   * real wall-clock.
    */
   readonly deadlineMs: number;
 }
 
 /**
- * Minimal socket shape the helper drives. Matches the surface area of
- * `Bun.Socket` that the driver touches — `write` to push frames, `end` to
- * half-close (graceful FIN), `terminate` to HARD-close. Surfaced as a named
- * type so the test-injection `connect` factory can return a mock without
- * depending on `bun:types`.
+ * Minimal socket shape the helper drives — `write` to push frames, `end` to
+ * half-close (graceful FIN), `terminate` to HARD-close. A named type so the
+ * test-injection `connect` factory can return a mock without `bun:types`.
  *
- * `terminate` is the fn-750.3 leak fix. On EVERY client-initiated teardown the
- * driver must `terminate()` the socket, NOT `end()` it. `end()` is a graceful
- * FIN: against a HALF-UP or dead daemon that never closes its side, the socket
- * lingers and its native read/write buffer + libuv socket handle — invisible to
- * the JS heap, so they NEVER raise heap pressure and never trigger a GC — stay
- * PINNED and survive a full `Bun.gc(true)`. One leaks per reconnect; a flapping
- * daemon over hours accumulates millions → the observed ~2GB `keeper await`
- * runaway. `terminate()` forcibly frees the native resources immediately,
- * peer-cooperation-free. (Measured: ~1.4–2.2 KB pinned per `end()`/dropped
- * socket, ~0 per `terminate()`d socket — `scripts/subscribe-bounce-soak.ts`.)
+ * On EVERY client-initiated teardown the driver must `terminate()`, NOT
+ * `end()`: a graceful FIN against a half-up/dead daemon that never closes its
+ * side leaves the native read/write buffer + libuv handle PINNED (invisible to
+ * the JS heap, surviving GC), leaking per reconnect → the ~2GB `keeper await`
+ * runaway. `terminate()` frees them immediately, peer-cooperation-free.
  *
- * Optional so the in-memory mock socket (tests) needn't implement it; the
- * driver feature-detects (`sock.terminate?.()`) and the production
- * `Bun.connect` socket always provides it.
+ * Optional so the in-memory mock needn't implement it; the driver
+ * feature-detects (`sock.terminate?.()`) and `Bun.connect` always provides it.
  */
 export interface ReadinessSocket {
   write(data: string): void;
@@ -345,16 +236,11 @@ export interface ReadinessClientHandle {
 }
 
 /**
- * Lifecycle-event callback shape — same for both public helpers. The
- * driver emits `connecting` / `connected` / `disconnected` / `waiting` /
- * `error` / `query_slow_flight` / `query_timeout` events with a small
- * detail payload (`sock`, `attempt`, `retry_in_ms`, `reason`, `code`,
- * `rev`, `message`, `collection`, `query_id`, `age_ms` — fields per
- * event). `query_slow_flight` fires once at `SLOW_FLIGHT_MS` per stuck
- * in-flight window (latched by `lastSlowFlightAt` so it doesn't repeat
- * every poll); `query_timeout` fires at `QUERY_TIMEOUT_MS` immediately
- * before the helper tears the socket down and the reconnect loop kicks
- * back in. Both carry `{collection, query_id, sock, age_ms}`.
+ * Lifecycle-event callback shape. The driver emits `connecting` / `connected`
+ * / `disconnected` / `waiting` / `error` / `query_slow_flight` /
+ * `query_timeout` with a small detail payload (fields per event).
+ * `query_slow_flight` fires once per stuck in-flight window; `query_timeout`
+ * fires just before the socket teardown + reconnect.
  */
 export type LifecycleCallback = (
   event: string,
@@ -362,10 +248,8 @@ export type LifecycleCallback = (
 ) => void;
 
 /**
- * Default-bound `onFatal`: restores the pre-extraction `process.exit(1)`
- * behavior (`scripts/board.ts:870`, commit `212be34^`). Callers that want
- * different semantics (tests, in-process consumers, sidecar scripts that
- * want a softer exit) pass their own.
+ * Default-bound `onFatal`: `process.exit(1)`. Callers wanting different
+ * semantics (tests, in-process consumers, softer-exit sidecars) pass their own.
  */
 function defaultOnFatal(_err: FatalError): void {
   process.exit(1);
@@ -405,39 +289,29 @@ function defaultConnect(
 // ---------------------------------------------------------------------------
 
 /**
- * Per-collection page + coalescing state. INTERNAL to this module — the
- * helper deliberately does NOT export `CollectionState` because the public
- * API surface should not leak the internal shape (callers consume the
- * projected snapshot/rows, not the raw `byId` / `order` machinery).
+ * Per-collection page + coalescing state. INTERNAL — NOT exported (callers
+ * consume the projected snapshot/rows, not the raw `byId` / `order` machinery).
  *
- * `rows` carries the full wire-order stream from the most recent `result`
- * frame. `byId` keys on the wire pk (`epic_id` / `job_id` / `project_dir`)
- * and collapses duplicates last-write-wins. For collections whose SQL
- * identity matches the wire pk (`epics`, `jobs`, `git`) the two views are
- * equivalent; for `subagent_invocations` they diverge — see the module
- * docstring.
+ * `rows` carries the full wire-order stream from the most recent `result`;
+ * `byId` keys on the wire pk and collapses duplicates last-write-wins. The two
+ * views are equivalent except for `subagent_invocations` (see module docstring).
  */
 interface CollectionState {
   readonly collection: string;
   readonly subId: string;
   readonly pk: string;
   /**
-   * The descriptor's monotonic per-row version column name (`last_event_id`
-   * for most collections; `dl_written_at` for `dead_letters`). Read off each
-   * patched/result row to drive the per-`(collection, pk)` version guard in
-   * the direct-merge path. Empty string when the collection is unknown — the
-   * guard then degrades to "always accept" (no column to compare), which is
-   * inert for `subscribeReadiness` since it never direct-merges.
+   * The descriptor's monotonic per-row version column (`last_event_id`, or
+   * `dl_written_at` for `dead_letters`), driving the direct-merge version
+   * guard. Empty string for an unknown collection — the guard then degrades to
+   * "always accept" (inert for `subscribeReadiness`, which never direct-merges).
    */
   readonly version: string;
   /**
-   * When true, a `patch` frame merges its `frame.row` directly into this
-   * state and fires `onResult` — no refetch round-trip (Lever A1, fn-694.1).
-   * Set ONLY by `subscribeCollection` (the sidecar helper); left false for
-   * `subscribeReadiness` (the board, whose re-entrant-rows merge is
-   * deliberately out of scope and stays on `scheduleRefetchFor`). `meta`
-   * frames always refetch regardless — a membership change can't be
-   * reconstructed from one row.
+   * When true, a `patch` merges its `frame.row` directly and fires `onResult`,
+   * no refetch round-trip. Set ONLY by `subscribeCollection`; left false for
+   * `subscribeReadiness` (stays on `scheduleRefetchFor`). `meta` frames always
+   * refetch — a membership change can't be reconstructed from one row.
    */
   readonly directMergePatch: boolean;
   readonly query: QueryFrame;
@@ -445,36 +319,25 @@ interface CollectionState {
   byId: Map<string, Record<string, unknown>>;
   rows: unknown[];
   /**
-   * Per-`(collection, pk-value)` last-seen version cursor for the direct-
-   * merge guard. Keyed by the row's pk VALUE (collection is fixed per state,
-   * so this satisfies the per-`(collection, pk)` requirement); value is the
-   * row's `version`-column value at the time it was last rendered. A `patch`
-   * whose row version isn't strictly greater than the stored cursor is
-   * dropped (belt-and-suspenders against reconnect-replay / out-of-order
-   * delivery; the server already gates and UDS is in-order). Seeded from the
-   * `result` frame's rows and cleared on teardown alongside `byId`/`order`.
+   * Per-pk-value last-seen version cursor for the direct-merge guard. A `patch`
+   * whose version isn't strictly greater than the stored cursor is dropped
+   * (belt-and-suspenders against reconnect-replay / out-of-order delivery).
+   * Seeded from the `result` rows, cleared on teardown.
    */
   lastSeenVersion: Map<string, number>;
   gotResult: boolean;
   queryInFlight: boolean;
   refetchDirty: boolean;
   /**
-   * `Date.now()` wall-clock stamp when `queryInFlight` last transitioned
-   * to `true` (initial open-handler send + every `scheduleRefetchFor`
-   * send). `null` whenever no query is in flight — `handleFrame`'s
-   * `result` branch clears it back to `null` alongside `queryInFlight`,
-   * and `teardownConnection` clears it on every disconnect so a
-   * post-reconnect re-stamp is honest. Read by `pollAll` to compute the
-   * stuck-window age against `SLOW_FLIGHT_MS` / `QUERY_TIMEOUT_MS`.
+   * `Date.now()` stamp when `queryInFlight` last went `true`; `null` when no
+   * query is in flight (cleared on `result` and teardown). Read by `pollAll`
+   * to compute the stuck-window age against `SLOW_FLIGHT_MS` / `QUERY_TIMEOUT_MS`.
    */
   queryInFlightSince: number | null;
   /**
-   * Single-fire latch for `query_slow_flight`. `null` means "no
-   * slow-flight emitted yet for the current stuck window"; a non-null
-   * `Date.now()` stamp means "already emitted once, suppress further
-   * emissions until the state clears." Cleared whenever
-   * `queryInFlightSince` is cleared (`result`, teardown), so a
-   * subsequent stuck window gets exactly one emit again.
+   * Single-fire latch for `query_slow_flight`: non-null means "already emitted
+   * once for the current stuck window, suppress until it clears." Cleared
+   * whenever `queryInFlightSince` is cleared.
    */
   lastSlowFlightAt: number | null;
 }
@@ -506,43 +369,31 @@ function makeState(
 }
 
 /**
- * Pure helper — project a collection state into the typed row stream the
- * readiness pipeline expects. Uses `state.rows` (not `byId.values()`) so
- * collections with a composite SQL identity but a single-column wire pk
- * (today: `subagent_invocations`, pk `job_id`, identity
- * `(job_id, agent_id, turn_seq)`) deliver every received row, not just
- * the last-write-wins one per pk value. Exported for the regression test
- * in `test/board.test.ts`.
+ * Project a collection state into the typed row stream readiness expects. Uses
+ * `state.rows` (not `byId.values()`) so a collection with a composite SQL
+ * identity but a single-column wire pk (`subagent_invocations`) delivers every
+ * received row, not just the last-write-wins one. Exported for the regression
+ * test in `test/board.test.ts`.
  */
 export function projectRows<T>(state: { rows: readonly unknown[] }): T[] {
-  // The descriptors guarantee the row shape matches the typed projection
-  // (the server-side `decodeRow` materialises it); this cast is the same
-  // shape-trust the readiness handoff already makes. The input type is
-  // intentionally permissive (`readonly unknown[]`) so the regression
-  // test can hand in a `{ rows: T[] }` literal without an upcast to
-  // `Record<string, unknown>[]`.
+  // The descriptors guarantee the row shape matches the typed projection; the
+  // permissive input type lets the regression test hand in a `{ rows: T[] }`
+  // literal without an upcast.
   return state.rows as unknown as T[];
 }
 
 /**
- * Project raw `git_status` rows into the
- * `Map<project_dir, {dirty_count, unattributed_to_live_count}>` shape
- * `computeReadiness` consumes. `unattributed_to_live_count` is computed
- * client-side by walking each row's `dirty_files[].attributions[]` and
- * counting files with NO attribution in a live (`working`/`stopped`)
- * state — the mirror of the reducer's PASS-4 fan-out, redone from the
- * same materialized JSON the reducer wrote so both numbers reconcile.
+ * Project raw `git_status` rows into the `Map<project_dir, {dirty_count,
+ * unattributed_to_live_count}>` shape `computeReadiness` consumes.
+ * `unattributed_to_live_count` is computed client-side by walking each row's
+ * `dirty_files[].attributions[]` and counting files with NO attribution in a
+ * live (`working`/`stopped`) state — the mirror of the reducer's PASS-4 fan-out,
+ * redone from the same materialized JSON so both numbers reconcile. Defensive
+ * parsing throughout (malformed rows fall through to no-attribution).
  *
- * Defensive parsing throughout: every nested field is `unknown` at the
- * wire boundary, so each access is guarded (no-attribution rows count,
- * malformed rows fall through to no-attribution by design — mirrors the
- * reducer's "fold must never throw" safe-value discipline).
- *
- * Exported so the server-side autopilot reconciler worker
- * (`src/autopilot-worker.ts`) builds its `ReconcileSnapshot.gitStatusByProjectDir`
- * from the IDENTICAL math the live readiness client uses — the snapshot
- * the reconciler folds must match the wire snapshot byte-for-byte, so
- * this logic lives in exactly one place.
+ * Exported so the autopilot reconciler builds its snapshot from the IDENTICAL
+ * math — the reconciler's snapshot must match the wire snapshot byte-for-byte,
+ * so this lives in one place.
  */
 export function projectGitStatusByProjectDir(
   rows: GitStatus[],
@@ -584,21 +435,15 @@ export function projectGitStatusByProjectDir(
 }
 
 /**
- * Project the wire `pending_dispatches` rows (schema v50, fn-678) into the
- * plain {@link PendingDispatch}[] shape `computeReadiness` consumes for the
- * fn-721 `dispatch-pending` occupant. The SOLE builder of this shape —
- * imported by BOTH consumers (the autopilot reconciler's
- * `loadReconcileSnapshot` in `src/autopilot-worker.ts` AND the board/CLI path
- * `subscribeReadiness` below) so the two readiness paths never diverge on the
- * launch-window occupancy set. Mirrors {@link projectGitStatusByProjectDir}'s
- * one-place-only discipline.
+ * Project the wire `pending_dispatches` rows into the plain
+ * {@link PendingDispatch}[] shape `computeReadiness` consumes for the
+ * `dispatch-pending` occupant. The SOLE builder — imported by BOTH consumers
+ * (the reconciler's `loadReconcileSnapshot` and `subscribeReadiness`) so the
+ * two paths never diverge.
  *
- * Defensive parsing at the wire boundary: `verb` / `id` are required strings
- * (a row missing either can't form a `verb::id` key, so it's dropped — it
- * could never match a row anyway). `dir` is nullable on the column; a
- * non-string value normalises to `null` (the root-fallback degrades safely on
- * a null `dir`, contributing no root occupant). Same "malformed rows fall
- * through to a safe value" discipline as the git projection.
+ * Defensive parsing: `verb` / `id` are required strings (a row missing either
+ * can't form a `verb::id` key, so it's dropped); a non-string `dir` normalises
+ * to `null` (the root-fallback degrades safely).
  */
 export function projectPendingDispatches(
   rows: Record<string, unknown>[],
@@ -617,39 +462,26 @@ export function projectPendingDispatches(
 }
 
 /**
- * Client-side collapse of `subagent_invocations` by `(job_id,
- * subagent_type)`. For each group, the row with the highest
- * `turn_seq` wins; the count of folded rows AND the count of stuck
- * orphans ride alongside so renderers can stamp a `(×N)` multiplier
- * and an `N stuck` indicator (board), and readiness can pretend
- * each named sub-agent is one logical agent (predicate 6 stops
- * false-blocking on orphaned `running` rows whose matching
+ * Client-side collapse of `subagent_invocations` by `(job_id, subagent_type)`.
+ * For each group the highest-`turn_seq` row wins; the folded count AND the
+ * stuck-orphan count ride alongside for the board's `(×N)` / `N stuck`
+ * annotation, and readiness treats each named sub-agent as one logical agent
+ * (so predicate 6 stops false-blocking on orphaned `running` rows whose
  * `SubagentStop` never landed).
  *
- * "Stuck" definition: a row inside a group is stuck iff it is NOT
- * the surviving (max-`turn_seq`) row AND its `status === 'running'`.
- * A single-row group is never stuck; a running surviving row is
- * "currently running," not stuck. Counted inline so we never need
- * to retain the non-surviving rows themselves.
+ * "Stuck": a row is stuck iff it is NOT the surviving row AND its `status ===
+ * 'running'`. Counted inline so the non-surviving rows needn't be retained.
  *
- * Operating assumption: Claude Code does NOT spawn parallel sub-
- * agents of the same `subagent_type` within one parent session.
- * Under that assumption, "same name in one job" means "serial re-
- * invocation," and collapsing to the most-recent is the correct
- * logical view. If that ever ceases to hold we'd see parallel
- * `running` rows of the same type collapse to a single status —
- * worth revisiting the assumption then, but at the cost of one
- * masked-orphan recurrence, not a wedged projection.
+ * OPERATING ASSUMPTION: Claude Code does NOT spawn parallel sub-agents of the
+ * same `subagent_type` within one parent session, so "same name in one job"
+ * means serial re-invocation and collapsing to the most-recent is the correct
+ * logical view. If that ceases to hold, parallel `running` rows of one type
+ * collapse to a single status — one masked-orphan recurrence, not a wedged
+ * projection.
  *
- * Returns groups in first-seen order (by the first row of each
- * `(job_id, subagent_type)` group as it appears in the input
- * stream), so a renderer that wants to preserve event-stream order
- * gets it for free. Within each group the SURVIVING row is the
- * highest-`turn_seq` row (not necessarily the first-seen).
- *
- * Pure function of its input; exported so the board renderer
- * (`scripts/board.ts:subagentLinesFor`) and the test suite can call
- * it directly without standing up the subscribe loop.
+ * Returns groups in first-seen order; the SURVIVING row per group is the
+ * highest-`turn_seq` (not necessarily first-seen). Pure; exported so the board
+ * renderer and tests can call it without the subscribe loop.
  */
 export interface SubagentGroup {
   readonly row: SubagentInvocation;
@@ -694,17 +526,12 @@ export function collapseSubagentsByName(
 }
 
 /**
- * Internal options passed to `subscribeMulti`. The two public helpers shape
- * their differing semantics through this surface:
- *
- *   - `states` describes the per-collection page + coalescer machinery.
- *   - `onResult(state)` fires when a collection's `result` lands. The
- *     helper has already updated `state.rows` / `state.byId` / `state.order`
- *     by then.
- *   - `isTerminal(states)` returns true iff a pre-paint `error` should be
- *     treated as a fatal query-shape error (multi: ALL collections lack
- *     `gotResult` — five for `subscribeReadiness`; single: the one
- *     collection lacks `gotResult`).
+ * Internal options passed to `subscribeMulti`:
+ *   - `states` — the per-collection page + coalescer machinery.
+ *   - `onResult(state)` — fires when a collection's `result` lands (`state` is
+ *     already updated).
+ *   - `isTerminal(states)` — true iff a pre-paint `error` is a fatal
+ *     query-shape error (every collection lacks `gotResult`).
  */
 interface MultiOptions {
   readonly sockPath: string;
@@ -714,29 +541,20 @@ interface MultiOptions {
   readonly onLifecycle?: LifecycleCallback;
   readonly onFatal: (err: FatalError) => void;
   readonly connect: ConnectFactory;
-  /**
-   * Opt-in bounded give-up (fn-750.1). Absent → reconnect-forever (the
-   * board/TUI default, zero-touch). Forwarded verbatim by both public
-   * helpers.
-   */
+  /** Opt-in bounded give-up. Absent → reconnect-forever. */
   readonly giveUpPolicy?: GiveUpPolicy;
   /**
-   * Injectable monotonic-ish clock (unix ms), default `Date.now`. The
-   * give-up deadline is measured against THIS, not `Date.now()` directly,
-   * so the fake-timer test harness — which fast-forwards `setTimeout`
-   * synchronously WITHOUT advancing `Date.now()` — can drive the deadline
-   * deterministically. Production callers omit it.
+   * Injectable clock (unix ms), default `Date.now`. The give-up deadline is
+   * measured against THIS so the fake-timer harness can drive it without
+   * advancing real wall-clock. Production callers omit it.
    */
   readonly now?: () => number;
 }
 
 /**
  * Core driver: owns the socket, the reconnect-with-backoff loop, the line
- * buffer, the per-collection `queryInFlight` / `refetchDirty` coalescer,
- * the steady-poll backstop, the disconnect teardown, and the terminal-error
- * gate. Both public helpers (`subscribeCollection`, `subscribeReadiness`)
- * compose this with the right number of collections + the right "is the
- * error terminal?" predicate.
+ * buffer, the per-collection coalescer, the steady-poll backstop, the
+ * teardown, and the terminal-error gate. Both public helpers compose it.
  */
 function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   const {
@@ -751,67 +569,54 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   } = opts;
   const now = opts.now ?? Date.now;
   const byCollection = new Map(states.map((s) => [s.collection, s]));
-  // Parallel id-keyed index for multi-sub-aware routing. The server (post
-  // fn-632.1) echoes each query's `id` on its `result`/`patch`/`meta`
-  // frames, so a connection carrying N concurrent subs can route each
-  // server frame back to the originating state without disambiguating by
-  // collection alone (two subs on the same collection with different
-  // filters are now possible). `subId` is a stable constant per state for
-  // the helper's lifetime (`${idPrefix}-<collection>` in
-  // `subscribeReadiness`, immutable across reconnect), so the map is
-  // built once and never rebuilt — matches the immutability contract on
-  // `states` itself. Legacy servers that don't echo `id` on patch/meta
-  // fall through to `byCollection` — strictly additive on the wire.
+  // Parallel id-keyed index for multi-sub-aware routing: the server echoes each
+  // query's `id` on its frames, so a connection carrying N concurrent subs
+  // routes each frame back to its originating state without disambiguating by
+  // collection alone. `subId` is a stable constant per state, so this map is
+  // built once. Legacy servers that don't echo `id` fall through to
+  // `byCollection`.
   const bySubId = new Map(states.map((s) => [s.subId, s]));
 
   let currentSock: ReadinessSocket | null = null;
   let attempt = 0;
-  // fn-775: latched true on the first `result` of the CURRENT connection
-  // window; gates the `attempt = 0` backoff reset so it keys off PROOF OF
-  // SERVICE (served), not socket `open` (accepted). Reset on every teardown so
-  // each fresh connection re-arms it. The fn-757 reconnect-forever contract is
-  // unaffected — this only governs the backoff DELAY, never whether to retry.
+  // Latched on the first `result` of the CURRENT connection window; gates the
+  // `attempt = 0` backoff reset so it keys off PROOF OF SERVICE (served), not
+  // socket `open` (accepted) — an accept-then-cap-reject server would otherwise
+  // pin the backoff at 0. Reset on every teardown.
   let servedThisConnection = false;
-  // fn-775: latched when the live connection was torn down by a
-  // capacity-transient server reject (a `TRANSIENT_SERVER_CODES` error frame —
-  // the daemon ACCEPTED then served "full"). The close-driven reconnect reads
-  // this to back off under the LONGER cap-reject regime instead of the
-  // immediate close-path retry; cleared as the first act of the next reconnect
-  // (so a socket-level reject after a cap reject reverts to the 250ms ladder).
+  // Latched when the live connection was torn down by a capacity-transient
+  // server reject (the daemon ACCEPTED then served "full"). The close-driven
+  // reconnect reads it to back off under the LONGER cap-reject regime; cleared
+  // as the first act of the next reconnect (so a later socket-level reject
+  // reverts to the 250ms ladder).
   let pendingTransientReject = false;
   let shuttingDown = false;
   /**
-   * Single-flight guard for `triggerReconnect`. Two simultaneously-stuck
-   * collections crossing `QUERY_TIMEOUT_MS` on the same poll tick must
-   * produce ONE reconnect, not two — otherwise the second tear-down
-   * would race the first reconnect attempt. Cleared in the `connectOnce`
-   * open handler (alongside `attempt = 0`) and in the `close` handler so
-   * a graceful close from the server also clears the latch.
+   * Single-flight guard for `triggerReconnect`: two simultaneously-stuck
+   * collections crossing `QUERY_TIMEOUT_MS` on the same poll tick must produce
+   * ONE reconnect, else the second teardown races the first reconnect. Cleared
+   * in the `connectOnce` open handler and the `close` handler.
    */
   let reconnecting = false;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  // Resolves on the pending `await Bun.sleep(...)` so `dispose()` during
-  // backoff doesn't leak the timer. Use `setTimeout` directly (not
-  // `Bun.sleep`) so we can `clearTimeout` from `dispose()`.
+  // Resolves the pending backoff sleep so `dispose()` doesn't leak its timer
+  // (a raw `setTimeout`, not `Bun.sleep`, so `dispose()` can `clearTimeout` it).
   let sleepResolve: (() => void) | null = null;
-  // ---- fn-750.1 bounded give-up state ----
-  // The continuous-unpainted wall-clock anchor (unix ms via the injected
-  // `now()` clock). `null` = currently painted (or no policy). Armed at
-  // subscribe start, CLEARED on first paint, RE-ARMED on a post-paint drop.
+  // ---- bounded give-up state ----
+  // The continuous-unpainted anchor (unix ms via the injected `now()` clock).
+  // `null` = currently painted (or no policy). Armed at subscribe start,
+  // CLEARED on first paint, RE-ARMED on a post-paint drop.
   let unpaintedAnchor: number | null = null;
-  // Whether ANY collection has ever produced a `result`. Distinguishes the
-  // never-connected case (don't re-arm the anchor on a drop we never
-  // painted from — it's already armed and counting) from the
-  // was-connected-then-lost case (re-arm: the post-bounce window is fresh).
+  // Whether ANY collection has ever painted. Distinguishes the never-connected
+  // case (don't re-arm — the anchor is already counting) from the
+  // was-connected-then-lost case (re-arm for a fresh post-bounce window).
   let everPainted = false;
-  // A wall-clock timer that backstops the loop-top deadline check: a
-  // half-up daemon that accepts the connection and holds it open WITHOUT
-  // ever serving never closes the socket, so `connectOnce` never returns
-  // and the `connectWithRetry` loop never re-iterates to run its
-  // synchronous deadline check. This timer fires `fireGiveUp` independently.
-  // Cancelled in `dispose()` and re-armed (never accumulated) on each
-  // anchor (re-)arm.
+  // A timer backstopping the loop-top deadline check: a half-up daemon that
+  // accepts the connection but never serves never closes the socket, so
+  // `connectOnce` never returns and the loop never re-runs its synchronous
+  // check. This timer fires `checkGiveUp` independently. Cancelled in
+  // `dispose()` and re-armed (never accumulated) on each anchor (re-)arm.
   let giveUpTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
@@ -844,18 +649,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   /**
-   * Check whether the continuous-unpainted deadline has elapsed and, if so,
-   * give up. Measured against the injected `now()` clock so the fake-timer
-   * harness can drive it without real wall-clock advancing.
-   *
-   * Called from two sites: (1) the top of every `connectWithRetry` backoff
-   * iteration (the deterministic path — the synchronous reject loop), and
-   * (2) the backstop timer's callback (the half-up-daemon path). The
-   * backstop timer is self-correcting under the fast-forward harness: if it
-   * fires before the `now()`-measured deadline is actually reached (the
-   * harness runs `setTimeout` synchronously without advancing `Date.now()`
-   * / the injected clock), it RE-ARMS instead of firing — the deadline is
-   * owned by `now()`, not the timer's nominal delay.
+   * Give up iff the continuous-unpainted deadline has elapsed, measured against
+   * the injected `now()`. Called from the top of every `connectWithRetry`
+   * backoff iteration (deterministic) and the backstop timer (half-up-daemon
+   * path). Self-correcting under the fast-forward harness: a timer that fires
+   * before the `now()`-measured deadline RE-ARMS off the residual budget — the
+   * deadline is owned by `now()`, not the timer's nominal delay.
    */
   function checkGiveUp(): void {
     if (!giveUpPolicy || shuttingDown || unpaintedAnchor === null) {
@@ -875,11 +674,9 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       }
       return;
     }
-    // Deadline reached. Replicate the terminal-error ordering: mark
-    // shutting-down, tear the connection down, THEN hand off to `onFatal`
-    // (so a custom `onFatal` observes the helper fully shut down, and
-    // exceptions propagate — same no-self-heal contract). `code` is the
-    // free-string `FatalError.code` (no new union member).
+    // Deadline reached. Tear down BEFORE `onFatal` (so a custom handler
+    // observes the helper fully shut down and exceptions propagate — the
+    // no-self-heal contract).
     shuttingDown = true;
     unpaintedAnchor = null;
     teardownConnection();
@@ -902,23 +699,20 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       return;
     }
     state.queryInFlight = true;
-    // Stamp the in-flight-since clock on every fresh send and reset the
-    // slow-flight latch so the next stuck window gets exactly one emit
-    // again. Cleared symmetrically in `handleFrame`'s `result` branch.
+    // Stamp the in-flight-since clock and reset the slow-flight latch so the
+    // next stuck window gets exactly one emit. Cleared symmetrically in the
+    // `result` branch.
     state.queryInFlightSince = Date.now();
     state.lastSlowFlightAt = null;
     currentSock.write(encodeFrame(state.query));
   }
 
   /**
-   * Tear down the live connection in response to a hard query timeout.
-   * Emits `query_timeout` for the first state that crossed the deadline,
-   * calls `teardownConnection()` to release the steady-poll interval and
-   * reset every per-state field, then half-closes the socket. The
-   * existing `close` handler in `connectOnce` invokes `connectWithRetry`
-   * on the resulting close event, so reconnect is automatic — no new
-   * plumbing. Guarded by `reconnecting` so two stuck collections
-   * crossing the threshold on the same poll produce one reconnect.
+   * Tear down the live connection on a hard query timeout. Emits
+   * `query_timeout` for the state that crossed the deadline, then
+   * `teardownConnection()`; the `close` handler drives the reconnect, so no new
+   * plumbing. Guarded by `reconnecting` so two stuck collections crossing the
+   * threshold on the same poll produce one reconnect.
    */
   function triggerReconnect(state: CollectionState): void {
     if (reconnecting || shuttingDown) {
@@ -935,28 +729,17 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       sock: sockPath,
       age_ms: ageMs,
     });
-    // `teardownConnection()` now HARD-destroys the held `currentSock`
-    // (fn-750.3 `destroySocket` → `terminate()`) before nulling it, so the
-    // socket is forcibly closed here — no separate `end()` needed (and
-    // `terminate()` releases the native buffers that a graceful `end()` left
-    // pinned against a wedged peer, which is the leak this path drove). The
-    // resulting `close` callback still fires, so `connectWithRetry` re-runs.
+    // `teardownConnection()` HARD-destroys the held socket (`terminate()`), so
+    // it's forcibly closed here; the resulting `close` callback fires, so
+    // `connectWithRetry` re-runs.
     teardownConnection();
   }
 
   function pollAll(): void {
-    // The poll loop is now SLOW-FLIGHT DETECTION ONLY (fn-622's Tier 1
-    // diagnostic). It walks every state, compares
-    // `Date.now() - queryInFlightSince` against `SLOW_FLIGHT_MS` /
-    // `QUERY_TIMEOUT_MS`, and either emits a one-shot
-    // `query_slow_flight` lifecycle event or triggers a reconnect via
-    // the single-flight `reconnecting` latch. NO REFETCH IS SCHEDULED
-    // HERE — the prior steady-poll second pass (which fired a refetch
-    // on every state every `POLL_MS`) was a workaround for the F3
-    // single-sub server bug that the multi-sub refactor (fn-632.1)
-    // closes. Post-Task-A, real-time `patch`/`meta` frames drive
-    // freshness via `scheduleRefetchFor` in `handleFrame`; pollAll is
-    // pure diagnosis.
+    // SLOW-FLIGHT DETECTION ONLY: walk every state, compare `Date.now() -
+    // queryInFlightSince` against the thresholds, and emit a one-shot
+    // `query_slow_flight` or trigger a reconnect. No refetch is scheduled here —
+    // real-time `patch`/`meta` frames drive freshness via `scheduleRefetchFor`.
     const now = Date.now();
     for (const s of states) {
       if (!s.queryInFlight || s.queryInFlightSince === null) {
@@ -998,16 +781,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   /**
-   * Merge a `patch` frame's full row into `state` in place, mirroring the
-   * `result` branch's upsert shape (upsert `byId`, append to `order` if new,
-   * replace the matching `rows` entry / append if new), then re-arm the
-   * per-pk version cursor. Returns true iff the merge happened and `onResult`
-   * should fire; false when the patch is dropped — missing pk, or its version
-   * is not strictly newer than the last-seen cursor for that pk (the
-   * per-`(collection, pk)` version guard against reconnect-replay / out-of-
-   * order delivery). Page membership is respected: a patch for a pk NOT in
-   * the current page is dropped (the server only watches in-page ids, so this
-   * is defensive — never blind-append an off-page row).
+   * Merge a `patch` frame's row into `state` in place (upsert `byId`, replace
+   * the matching `rows` entry, re-arm the per-pk version cursor). Returns true
+   * iff the merge happened. Dropped when: pk missing; the pk isn't already
+   * tracked (off-page — a genuine membership change arrives as `meta`); or its
+   * version isn't strictly newer than the last-seen cursor (the version guard
+   * against reconnect-replay / out-of-order delivery).
    */
   function mergePatchRow(
     state: CollectionState,
@@ -1018,17 +797,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       return false;
     }
     const id = String(pkVal);
-    // Membership guard: the server only emits patches for ids in the active
-    // page, so an id we don't already track is off-page noise — drop it
-    // rather than blind-append (a blind append would surface a row outside
-    // the page/sort/limit). A genuine membership change arrives as `meta`.
+    // Membership guard: an id we don't already track is off-page noise — drop
+    // it rather than blind-append (a `meta` carries a genuine membership change).
     if (!state.byId.has(id)) {
       return false;
     }
-    // Version guard, keyed per-pk: drop a patch whose version isn't strictly
-    // newer than what we last rendered for this pk. When the column is
-    // absent/non-numeric (`rowVersion` → null) the guard is inert (accept),
-    // matching the pre-guard behavior for versionless rows.
+    // Version guard, per-pk. Inert (accept) when the column is absent/non-numeric.
     const v = rowVersion(state, row);
     if (v !== null) {
       const last = state.lastSeenVersion.get(id);
@@ -1037,9 +811,8 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       }
     }
     state.byId.set(id, row);
-    // Replace the matching `rows` entry in wire/page order (what `onRows`
-    // reads). The id is in `order` by the membership guard above, so the
-    // index lookup always hits.
+    // Replace the matching `rows` entry in wire/page order. The id is in
+    // `order` by the membership guard above, so the lookup always hits.
     const idx = state.order.indexOf(id);
     if (idx !== -1) {
       state.rows[idx] = row;
@@ -1052,66 +825,50 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
 
   function handleFrame(frame: ServerFrame): void {
     if (frame.type === "result") {
-      // Id-first routing: prefer the echoed sub `id` (multi-sub-aware
-      // server, fn-632.1+), fall back to `collection` (legacy server
-      // that doesn't echo `id`). The result frame has always carried
-      // `id?: string` in the wire protocol, but legacy single-sub
-      // servers omitted it on `patch`/`meta`; doing the lookup uniformly
-      // here keeps result/patch/meta consistent. A bare `collection`
-      // lookup would still work for the helper (one sub per collection
-      // by construction), but the consistency is load-bearing for any
-      // future consumer that registers multiple subs on the same
-      // collection.
+      // Id-first routing: prefer the echoed sub `id`, fall back to `collection`
+      // (a legacy server that doesn't echo `id`). Doing this uniformly here
+      // keeps result/patch/meta consistent for a future consumer that registers
+      // multiple subs on one collection.
       const state =
         (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
         byCollection.get(frame.collection);
       if (!state) {
-        // A `result` for a sub we don't track — defensive; should
-        // never happen on a connection we opened ourselves.
+        // A `result` for a sub we don't track — defensive.
         return;
       }
       state.queryInFlight = false;
-      // Clear the slow-flight + timeout machinery now that we have a
-      // result. The next `scheduleRefetchFor` re-stamps both.
+      // Clear the slow-flight + timeout machinery; the next refetch re-stamps.
       state.queryInFlightSince = null;
       state.lastSlowFlightAt = null;
       state.order.length = 0;
       state.byId.clear();
       state.lastSeenVersion.clear();
-      // Re-snapshot `rows` from this frame — see module docstring on why
-      // the readiness handoff reads from here.
+      // Re-snapshot `rows` from this frame — see module docstring.
       state.rows = frame.rows.slice();
       for (const row of frame.rows) {
         const id = String(row[state.pk]);
         state.order.push(id);
         state.byId.set(id, row);
         // Re-arm the per-pk version cursor from the authoritative page so a
-        // subsequent direct-merge `patch` is compared against the version
-        // this `result` rendered (a stale/equal-version patch is dropped).
+        // subsequent direct-merge `patch` is compared against this version.
         const v = rowVersion(state, row);
         if (v !== null) {
           state.lastSeenVersion.set(id, v);
         }
       }
       state.gotResult = true;
-      // fn-750.1: FIRST PAINT clears the give-up anchor. Keyed off the
-      // first `result` frame (this is the only `gotResult = false → true`
-      // transition site), NOT socket `open` — a half-up daemon that
-      // accepts the connection but never serves a `result` must still give
-      // up. `everPainted` latches so a later drop re-arms a FRESH window.
+      // FIRST PAINT clears the give-up anchor. Keyed off the first `result`
+      // (the only `gotResult` false→true site), NOT socket `open` — a half-up
+      // daemon that accepts but never serves must still give up. `everPainted`
+      // latches so a later drop re-arms a FRESH window.
       if (unpaintedAnchor !== null) {
         everPainted = true;
         clearGiveUp();
       }
-      // fn-775: reset the backoff counter on SERVED (first `result` of THIS
-      // connection window), NOT on socket `open` (accepted). An
-      // accept-then-cap-reject server defeats an open-keyed reset — the counter
-      // would pin at 0 and re-dispatch with no growing backoff. Keying off
-      // proof-of-service (the first result; `servedThisConnection` latches it,
-      // reset on every teardown) makes each accept-then-reject cycle grow the
-      // delay. Independent of `giveUpPolicy` so the board/TUI (no policy)
-      // resets too; the legitimate daemon-bounce fast-reconnect still resets
-      // here on its first post-reconnect result.
+      // Reset the backoff counter on SERVED (first `result`), NOT socket `open`
+      // (accepted) — an accept-then-cap-reject server would otherwise pin it at
+      // 0 with no growing backoff. The legitimate daemon-bounce fast-reconnect
+      // still resets here on its first post-reconnect result.
       if (!servedThisConnection) {
         servedThisConnection = true;
         attempt = 0;
@@ -1122,43 +879,31 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         scheduleRefetchFor(state);
       }
     } else if (frame.type === "patch") {
-      // Id-first routing, same fallback chain as `result`. A new server
-      // (fn-632.1+) echoes `id` on every patch on behalf of a sub with a
-      // non-null id; a legacy server emits neither, and the collection
-      // lookup is the only routable signal.
+      // Id-first routing, same fallback chain as `result`.
       const state =
         (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
         byCollection.get(frame.collection);
       if (!state) {
         return;
       }
-      // Lever A1 (fn-694.1): direct-merge the pushed row instead of a
-      // refetch round-trip — but ONLY for the sidecar helper
-      // (`subscribeCollection` sets `directMergePatch`), and ONLY once the
-      // initial page is seeded (`gotResult`). A patch that arrives before
-      // the first `result` — e.g. mid-reconnect, with `byId`/`order`/
-      // `lastSeenVersion` all reset by teardown — has no page to merge
-      // into; falling through to `scheduleRefetchFor` re-pages it cleanly.
-      // The board (`subscribeReadiness`) leaves `directMergePatch` false
-      // and stays on the refetch path (deliberately out of scope).
+      // Direct-merge the pushed row instead of a refetch — but ONLY for the
+      // sidecar helper (`directMergePatch`) and ONLY once the page is seeded
+      // (`gotResult`). A patch before the first `result` (e.g. mid-reconnect,
+      // state reset by teardown) has no page to merge into; falling through to
+      // `scheduleRefetchFor` re-pages it. The board stays on the refetch path.
       if (state.directMergePatch && state.gotResult) {
         if (
           mergePatchRow(state, (frame as { row: Record<string, unknown> }).row)
         ) {
           onResult(state);
         }
-        // A dropped patch (stale/equal version, or missing pk) is a no-op
-        // — the server already pushed the freshest row, so there is
-        // nothing to re-query; the steady-poll backstop covers any genuine
-        // lost-wakeup.
+        // A dropped patch is a no-op — the server pushed the freshest row, and
+        // the steady-poll backstop covers any genuine lost-wakeup.
         return;
       }
       scheduleRefetchFor(state);
     } else if (frame.type === "meta") {
-      // A `meta` is a membership-change nudge and is UNMERGEABLE from one
-      // row (a row entered or left the filtered set), so it always
-      // refetches — for both helpers. Id-first routing, same fallback
-      // chain as `result`/`patch`.
+      // A membership-change nudge — UNMERGEABLE from one row, so always refetch.
       const state =
         (frame.id !== undefined ? bySubId.get(frame.id) : undefined) ??
         byCollection.get(frame.collection);
@@ -1172,41 +917,25 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         message: frame.message,
       };
       emit("error", detail);
-      // fn-775: a CAPACITY-TRANSIENT reject (`max_connections`, the daemon at
-      // its connection cap) is NOT terminal — a reconnect, once a slot frees,
-      // recovers. The server serves the error frame then `socket.end()`s, so we
-      // do NOT call `teardownConnection` / `onFatal` here: the close handler
-      // owns teardown + the close-driven reconnect (avoiding a double
-      // teardown), and we latch `pendingTransientReject` so that reconnect
-      // backs off under the longer cap-reject regime instead of hammering the
-      // already-contended cap. Bypasses `isTerminal` entirely — even pre-paint.
+      // A CAPACITY-TRANSIENT reject (`max_connections`) is NOT terminal — a
+      // reconnect once a slot frees recovers. The server serves the frame then
+      // `end()`s, so the close handler owns teardown + reconnect; we just latch
+      // `pendingTransientReject` so that reconnect backs off under the longer
+      // cap-reject regime. Bypasses `isTerminal` even pre-paint.
       if (frame.code !== undefined && TRANSIENT_SERVER_CODES.has(frame.code)) {
         pendingTransientReject = true;
         return;
       }
       // A bad_frame / unknown_collection on our own query is terminal — a
-      // reconnect can't fix a malformed query. Terminal predicate per
-      // helper: for a single collection, true iff `!gotResult`; for the
-      // readiness composition, true iff NO collection has a first result.
-      // Otherwise the error is likely transient and the next refetch will
-      // recover.
+      // reconnect can't fix a malformed query. Else it's likely transient.
       if (isTerminal(states)) {
         shuttingDown = true;
-        // Release the steady-poll interval, HARD-destroy the socket
-        // (`teardownConnection` → `destroySocket` → `terminate()`, fn-750.3 —
-        // no separate `end()` needed), and reset per-collection state before
-        // handing the terminal error to the caller. The default `onFatal` is
-        // `process.exit(1)` so the leak is invisible there, but a custom
-        // `onFatal` that returns (tests, in-process consumers) would otherwise
-        // leave a live `setInterval` + an undestroyed socket holding the event
-        // loop open indefinitely.
+        // Tear down (releases the poll interval + HARD-destroys the socket)
+        // BEFORE `onFatal`, so a custom handler that returns doesn't leave a
+        // live `setInterval` + undestroyed socket holding the event loop open.
         teardownConnection();
-        // Hand the terminal error off to the caller (default:
-        // `process.exit(1)`) AFTER tearing the connection down, so a
-        // custom `onFatal` that throws or schedules work observes the
-        // helper in its fully-shut-down state. `onFatal` exceptions
-        // propagate — same no-self-heal contract as `onSnapshot` /
-        // `onRows`.
+        // Hand off AFTER teardown so a custom `onFatal` observes the
+        // fully-shut-down helper; its exceptions propagate (no self-heal).
         onFatal({
           code: frame.code,
           rev: frame.rev,
@@ -1217,12 +946,11 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   /**
-   * fn-750.3: HARD-destroy a socket on a client-initiated teardown. The leak
-   * fix — `terminate()` (not `end()`) forcibly frees the native read/write
-   * buffer + libuv handle immediately, so a half-up/dead daemon that never
-   * closes its side can't pin them across reconnects (the ~2GB runaway). Falls
-   * back to `end()` for any socket without `terminate` (the in-memory test
-   * mock), and is fully guarded — a teardown must never throw.
+   * HARD-destroy a socket on a client-initiated teardown — `terminate()` (not
+   * `end()`) frees the native buffers + libuv handle immediately, so a half-up/
+   * dead daemon that never closes its side can't pin them across reconnects.
+   * Falls back to `end()` for a socket without `terminate` (the test mock), and
+   * is fully guarded — a teardown must never throw.
    */
   function destroySocket(sock: ReadinessSocket): void {
     try {
@@ -1241,19 +969,16 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       clearInterval(pollTimer);
       pollTimer = null;
     }
-    // fn-750.3: destroy the live socket BEFORE dropping the reference. Pre-fix
-    // this only nulled `currentSock`, leaving an `end()`-or-undestroyed socket
-    // whose native buffers leaked on a flapping daemon. `currentSock` is the
-    // peer-closed socket on the `close`-handler path (already releasing) and
-    // the still-open socket on the give-up/`checkGiveUp` path (the one that
-    // genuinely leaks without this) — destroying both is safe and idempotent.
+    // Destroy the live socket BEFORE dropping the reference (else the native
+    // buffers leak on a flapping daemon). Safe and idempotent on both the
+    // peer-closed `close`-handler path and the still-open give-up path.
     if (currentSock !== null) {
       destroySocket(currentSock);
     }
     currentSock = null;
-    // fn-775: re-arm the served latch so the NEXT connection's first result
-    // resets the backoff counter (and an accept-then-reject window, which tears
-    // down WITHOUT ever serving, leaves it false → no spurious reset).
+    // Re-arm the served latch so the NEXT connection's first result resets the
+    // backoff counter; an accept-then-reject window (torn down WITHOUT serving)
+    // leaves it false → no spurious reset.
     servedThisConnection = false;
     for (const s of states) {
       s.order.length = 0;
@@ -1263,10 +988,8 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
       s.queryInFlight = false;
       s.refetchDirty = false;
       s.gotResult = false;
-      // Reset the slow-flight + timeout machinery so the
-      // post-reconnect re-stamp is honest and a survived
-      // `lastSlowFlightAt` from the old window can't suppress the
-      // first emit of the new window.
+      // Reset the slow-flight + timeout machinery so a survived
+      // `lastSlowFlightAt` can't suppress the first emit of the new window.
       s.queryInFlightSince = null;
       s.lastSlowFlightAt = null;
     }
@@ -1276,18 +999,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     const buffer = new LineBuffer();
     await connect(sockPath, {
       open(sock) {
-        // fn-775: do NOT reset `attempt` here. Socket `open` means ACCEPTED,
-        // not SERVED — an accept-then-cap-reject server would pin the backoff
-        // at 0 and re-dispatch with no growing delay. The reset moved to the
-        // first `result` (`servedThisConnection`), keyed on proof of service.
+        // Do NOT reset `attempt` here — socket `open` means ACCEPTED, not
+        // SERVED. The reset is keyed on the first `result` (`servedThisConnection`).
         reconnecting = false;
         currentSock = sock;
         emit("connected", { sock: sockPath });
-        // Send every subscribed query up front. Each collection's
-        // `queryInFlight` tracks its own send so the poll/refetch
-        // coalescer stays sane. Stamp `queryInFlightSince` on each
-        // send and reset `lastSlowFlightAt` so the post-reconnect
-        // window starts clean.
+        // Send every subscribed query up front, stamping `queryInFlightSince`
+        // and resetting `lastSlowFlightAt` so the post-reconnect window is clean.
         const now = Date.now();
         for (const s of states) {
           s.queryInFlight = true;
@@ -1302,12 +1020,9 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         try {
           lines = buffer.push(chunk.toString("utf8"));
         } catch (err) {
-          // A protocol-frame parse failure is fatal for this connection
-          // but not for the caller's process — surface via lifecycle
-          // and tear down. The reconnect loop will try again. fn-750.3:
-          // HARD-destroy (not `end()`) so the native socket buffers are freed
-          // immediately even if the peer is wedged; the `close` callback still
-          // fires and drives the reconnect.
+          // A protocol-frame parse failure is fatal for this connection but not
+          // the caller's process — surface via lifecycle and HARD-destroy; the
+          // `close` callback drives the reconnect.
           emit("error", { message: (err as Error).message });
           destroySocket(sock);
           return;
@@ -1323,20 +1038,15 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         if (shuttingDown) {
           return;
         }
-        // Clear the single-flight latch so a fresh `connectWithRetry`
-        // cycle (whether it follows a graceful close or our own
-        // `triggerReconnect` tear-down) can advance to `open` and reset
-        // the latch on its own — and so a future timeout-triggered
-        // reconnect after this cycle isn't permanently suppressed.
+        // Clear the single-flight latch so a fresh `connectWithRetry` cycle can
+        // advance to `open`, and a future timeout-triggered reconnect isn't
+        // permanently suppressed.
         reconnecting = false;
         teardownConnection();
-        // fn-750.1: re-arm the give-up anchor on a POST-PAINT drop so the
-        // post-bounce window is fresh (bounds the was-connected-then-lost
-        // case). A drop BEFORE any paint leaves the start-armed anchor
-        // running — re-arming there would reset its clock and let an
-        // accept-then-drop flap dodge give-up forever. Only re-arm when the
-        // anchor is currently cleared (we were painted); a still-armed
-        // anchor keeps counting from where it started.
+        // Re-arm the give-up anchor on a POST-PAINT drop for a fresh post-bounce
+        // window. A drop BEFORE any paint leaves the start-armed anchor running
+        // (re-arming there would let an accept-then-drop flap dodge give-up
+        // forever), so only re-arm when the anchor is cleared (we were painted).
         if (everPainted && unpaintedAnchor === null) {
           armGiveUp();
         }
@@ -1350,16 +1060,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   /**
-   * fn-775: compute the next backoff delay. Two regimes, both capped at
-   * `MAX_BACKOFF_MS`:
-   *   - socket-level connect reject (`transient=false`): the deterministic
-   *     250ms→5s doubling ladder (`INITIAL_BACKOFF_MS * 2^(attempt-1)`).
-   *   - capacity-transient cap reject (`transient=true`): a LONGER base
-   *     (`TRANSIENT_BACKOFF_BASE_MS`) with FULL jitter —
-   *     `random(0, min(MAX_BACKOFF_MS, base * 2^(attempt-1)))`. Full jitter
-   *     de-correlates a fleet of awaits rejected in the same incident so they
-   *     don't retry in lockstep and re-saturate the cap.
-   * Caller bumps `attempt` first so `attempt` is >= 1 here.
+   * Compute the next backoff delay, both regimes capped at `MAX_BACKOFF_MS`:
+   *   - socket-level reject (`transient=false`): the deterministic 250ms→5s
+   *     doubling ladder.
+   *   - capacity-transient cap reject (`transient=true`): a LONGER base with
+   *     FULL jitter, de-correlating a fleet of awaits rejected in the same
+   *     incident so they don't re-saturate the cap in lockstep.
+   * Caller bumps `attempt` first so `attempt >= 1` here.
    */
   function computeBackoffDelay(transient: boolean): number {
     if (transient) {
@@ -1398,21 +1105,17 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   async function connectWithRetry(): Promise<void> {
     emit("connecting", { sock: sockPath });
     while (!shuttingDown) {
-      // fn-750.1: check the continuous-unpainted deadline at the top of
-      // every backoff iteration — the deterministic give-up path for the
-      // synchronous reject loop (the half-up-daemon path rides the backstop
-      // timer instead). `checkGiveUp` may set `shuttingDown`; bail if so.
+      // Check the continuous-unpainted deadline at the top of every iteration —
+      // the deterministic give-up path (the half-up-daemon path rides the
+      // backstop timer). `checkGiveUp` may set `shuttingDown`.
       checkGiveUp();
       if (shuttingDown) {
         return;
       }
-      // fn-775: the close-driven reconnect after a CAP REJECT (`socket.end()`
-      // followed the error frame) lands here. Back off under the longer
-      // cap-reject regime BEFORE re-attempting — an immediate retry hammers the
-      // already-contended connection cap. Clear the latch first so a subsequent
-      // SOCKET-level reject reverts to the 250ms ladder. The give-up deadline
-      // (checked above + on the next iteration after the sleep advances the
-      // clock) still bounds a never-painted await wedged at the cap.
+      // The close-driven reconnect after a CAP REJECT lands here. Back off under
+      // the longer cap-reject regime BEFORE re-attempting (an immediate retry
+      // hammers the contended cap); clear the latch first so a later
+      // SOCKET-level reject reverts to the 250ms ladder.
       if (pendingTransientReject) {
         pendingTransientReject = false;
         await backoffSleep("max_connections", true);
@@ -1438,11 +1141,9 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     }
   }
 
-  // fn-750.1: arm the give-up anchor from subscribe start so the
-  // never-connected case is bounded from the very first attempt (the anchor
-  // clears on first paint; if no paint ever lands, the deadline trips). No-op
-  // without a policy. Armed BEFORE the loop boots so the first iteration's
-  // top-of-loop `checkGiveUp` sees a live anchor.
+  // Arm the give-up anchor from subscribe start so the never-connected case is
+  // bounded from the first attempt. Armed BEFORE the loop boots so the first
+  // iteration's `checkGiveUp` sees a live anchor.
   armGiveUp();
 
   // Boot the reconnect loop. Caller does not await — they consume snapshots
@@ -1461,9 +1162,8 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         clearInterval(pollTimer);
         pollTimer = null;
       }
-      // fn-750.1: cancel the give-up backstop timer so `dispose()` leaves no
-      // live timer holding the event loop open (the no-timer-accumulation
-      // contract — same as `pollTimer` / `reconnectTimer` above).
+      // Cancel the give-up backstop timer so `dispose()` leaves no live timer
+      // holding the event loop open.
       if (giveUpTimer !== null) {
         clearTimeout(giveUpTimer);
         giveUpTimer = null;
@@ -1485,9 +1185,8 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
         } catch {
           // socket already gone — the unsubscribe is best-effort
         }
-        // fn-750.3: HARD-destroy (not `end()`) so `dispose()` against a dead /
-        // half-up daemon frees the native socket buffers immediately instead of
-        // leaving them pinned in FIN_WAIT — the same leak the reconnect path hit.
+        // HARD-destroy so `dispose()` against a dead/half-up daemon frees the
+        // native socket buffers immediately instead of pinning them in FIN_WAIT.
         destroySocket(currentSock);
       }
       currentSock = null;
@@ -1501,36 +1200,13 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
 
 /**
  * Single-collection subscribe options. `idPrefix` is suffixed with the
- * collection name to form the subscription id (e.g. `git-frames`); the
- * server doesn't enforce uniqueness across connections, the prefix is
- * purely a debug-log discriminator.
- *
- * `filter` / `sort` / `limit` are forwarded verbatim to the underlying
- * `QueryFrame`. `limit: 0` is the explicit "no limit" sentinel (matches
- * the protocol's `limit: 0` semantics — full filtered set, no LIMIT cap
- * server-side); omit to use the server default of 100. The caller is
- * responsible for choosing a limit appropriate to the watched-set size.
- *
- * `onRows(rows)` fires once per `result` frame after the per-collection
- * first-paint gate clears. `rows` is the wire-order array straight from
- * the result frame (a fresh slice — the caller can mutate without
- * disturbing the helper's state). On reconnect the gate re-closes and
- * `onRows` is silent until the post-reconnect first `result` lands.
- *
- * `onLifecycle` observes `connecting` / `connected` / `disconnected` /
- * `waiting` / `error` events.
- *
- * `onFatal` is called when a terminal `error` frame arrives BEFORE the
- * single collection has produced a first `result` — the query itself is
- * unrecoverable and a reconnect cannot fix it. When omitted, the helper
- * defaults to `process.exit(1)`. The terminal error is also surfaced via
- * `onLifecycle` with the same payload immediately before `onFatal` fires.
- *
- * `connect` is the socket factory used to open a connection — exposed
- * only for test injection. Defaults to a thin wrapper around
- * `Bun.connect({ unix, socket })`; production callers should never set
- * this. Tests use it to substitute an in-memory mock that records
- * outbound frames and delivers inbound frames synchronously.
+ * collection name to form the subscription id; purely a debug-log
+ * discriminator. `filter` / `sort` / `limit` are forwarded verbatim;
+ * `limit: 0` is the "no limit" sentinel (omit for the server default of 100).
+ * `onRows(rows)` fires once per `result` after the first-paint gate clears,
+ * with a fresh slice the caller may mutate; silent across a reconnect until the
+ * post-reconnect `result`. `onFatal` fires on a terminal pre-paint `error`
+ * (default `process.exit(1)`). `connect` is exposed only for test injection.
  */
 export interface SubscribeCollectionOptions {
   readonly sockPath: string;
@@ -1543,11 +1219,7 @@ export interface SubscribeCollectionOptions {
   readonly onLifecycle?: LifecycleCallback;
   readonly onFatal?: (err: FatalError) => void;
   readonly connect?: ConnectFactory;
-  /**
-   * Opt-in bounded give-up (fn-750.1). Absent → reconnect-forever (the
-   * sidecar/TUI default, zero-touch). When set, a continuous-unpainted
-   * window exceeding `deadlineMs` fires `onFatal({ code: "unreachable" })`.
-   */
+  /** Opt-in bounded give-up. Absent → reconnect-forever. */
   readonly giveUpPolicy?: GiveUpPolicy;
   /** Injectable clock for the give-up deadline (default `Date.now`). */
   readonly now?: () => number;
@@ -1555,16 +1227,9 @@ export interface SubscribeCollectionOptions {
 
 /**
  * Open a subscription to a single collection and invoke `onRows` once per
- * `result` frame. Returns a handle whose `dispose()` tears down the
- * connection, cancels any pending reconnect timer, and releases the
- * steady-poll interval.
- *
- * This helper is the building block sidecar UIs (e.g. `scripts/git.ts`)
- * use instead of hand-rolling their own `Bun.connect` loop. It shares the
- * full lifecycle contract with `subscribeReadiness` — capped-backoff
- * reconnect, per-collection coalesce, steady-poll backstop, idempotent
- * dispose, no in-process self-heal — so all subscribe consumers behave
- * identically on the wire.
+ * `result`. The building block sidecar UIs use instead of hand-rolling their
+ * own `Bun.connect` loop; shares the full lifecycle contract with
+ * `subscribeReadiness` so all consumers behave identically on the wire.
  */
 export function subscribeCollection(
   opts: SubscribeCollectionOptions,
@@ -1580,15 +1245,11 @@ export function subscribeCollection(
     ...(opts.sort === undefined ? {} : { sort: opts.sort }),
     ...(opts.filter === undefined ? {} : { filter: opts.filter }),
   };
-  // Thread the descriptor's REAL pk + version column so the direct-merge
-  // path keys correctly (Lever A1, fn-694.1). Pre-fn-694 this passed pk=""
-  // because the helper never read `byId`/`order` from outside — but the
-  // direct-merge `patch` path now upserts into `byId`/`order`/`rows` by pk,
-  // and the version guard compares the `version` column, so both must be the
-  // descriptor's actual columns. An unknown collection (no descriptor) keeps
-  // pk="" / version="" — `getCollection` returns undefined; the merge then
-  // no-ops on a missing pk and the version guard is inert, so an unknown
-  // collection still rides the refetch path harmlessly.
+  // Thread the descriptor's REAL pk + version column so the direct-merge path
+  // keys correctly — it upserts into `byId`/`order`/`rows` by pk and the
+  // version guard compares the `version` column. An unknown collection keeps
+  // pk="" / version="": the merge no-ops on a missing pk and the version guard
+  // is inert, so it still rides the refetch path harmlessly.
   const descriptor = getCollection(opts.collection);
   const state = makeState(opts.collection, subId, descriptor?.pk ?? "", query, {
     version: descriptor?.version ?? "",
@@ -1598,11 +1259,8 @@ export function subscribeCollection(
     sockPath: opts.sockPath,
     states: [state],
     onResult(s) {
-      // Hand back a FRESH array copy of the current rows. On a `result`
-      // frame `s.rows` is already a fresh `frame.rows.slice()`, but the
-      // direct-merge `patch` path mutates `s.rows` in place, so a copy-out
-      // here is load-bearing — consumers retain the slice (see the
-      // `onRows(s.rows)` handoff contract), and handing back the live array
+      // Hand back a FRESH copy. The direct-merge `patch` path mutates `s.rows`
+      // in place, so a copy-out is load-bearing — handing back the live array
       // would let a later patch mutate a slice the caller still holds.
       opts.onRows((s.rows as Record<string, unknown>[]).slice());
     },
@@ -1624,26 +1282,10 @@ export function subscribeCollection(
 // ---------------------------------------------------------------------------
 
 /**
- * Subscribe options. `idPrefix` is appended with the collection name so
- * subscription IDs become `<prefix>-epics` / `<prefix>-jobs` /
- * `<prefix>-subagent-invocations` / `<prefix>-git` /
- * `<prefix>-dead-letters`. The server doesn't enforce uniqueness across
- * connections; the prefix is purely a debug-log discriminator.
- *
- * `onFatal` is called when a terminal `error` frame arrives BEFORE any
- * collection has produced a first `result` — the query itself is
- * unrecoverable and a reconnect cannot fix it. When omitted, the helper
- * defaults to `process.exit(1)` (matching the pre-extraction behavior at
- * `scripts/board.ts:870`, commit `212be34^`). Callers that want
- * non-process-exit semantics (e.g. tests, in-process consumers) pass a
- * custom `onFatal`. The terminal error is also surfaced via `onLifecycle`
- * with the same payload immediately before `onFatal` fires.
- *
- * `connect` is the socket factory used to open a connection — exposed
- * only for test injection. Defaults to a thin wrapper around
- * `Bun.connect({ unix, socket })`; production callers should never set
- * this. Tests use it to substitute an in-memory mock that records
- * outbound frames and delivers inbound frames synchronously.
+ * Subscribe options. `idPrefix` forms each subscription id (`<prefix>-epics`
+ * etc.), a debug-log discriminator. `onFatal` fires on a terminal pre-paint
+ * `error` (default `process.exit(1)`; pass a custom one for tests / in-process
+ * consumers). `connect` is exposed only for test injection.
  */
 export interface SubscribeOptions {
   readonly sockPath: string;
@@ -1652,23 +1294,16 @@ export interface SubscribeOptions {
   readonly onLifecycle?: LifecycleCallback;
   readonly onFatal?: (err: FatalError) => void;
   readonly connect?: ConnectFactory;
-  /**
-   * Opt-in bounded give-up (fn-750.1). Absent → reconnect-forever (the
-   * board/TUI default, zero-touch — `cli/board.ts` needs no edit). When
-   * set, a continuous-unpainted window exceeding `deadlineMs` fires
-   * `onFatal({ code: "unreachable" })`.
-   */
+  /** Opt-in bounded give-up. Absent → reconnect-forever. */
   readonly giveUpPolicy?: GiveUpPolicy;
   /** Injectable clock for the give-up deadline (default `Date.now`). */
   readonly now?: () => number;
 }
 
 /**
- * Open a subscription to all five readiness collections on a single
- * connection and invoke `onSnapshot` once per emit (after the all-five
- * gate clears). Returns a handle whose `dispose()` tears down the
- * connection, cancels any pending reconnect timer, and releases the
- * steady-poll interval.
+ * Open a subscription to all readiness collections on a single connection and
+ * invoke `onSnapshot` once per emit (after the all-strict gate clears). The
+ * `dispose()` handle tears down the connection and releases all timers.
  */
 export function subscribeReadiness(
   opts: SubscribeOptions,
@@ -1697,15 +1332,10 @@ export function subscribeReadiness(
     id: jobsSubId,
     limit: JOBS_PAGE_LIMIT,
   });
-  // The `subagent_invocations` descriptor exposes `job_id` as the wire pk
-  // even though the SQL identity is composite `(job_id, agent_id,
-  // turn_seq)` — see `src/collections.ts:SUBAGENT_INVOCATIONS_DESCRIPTOR`.
-  // `byId` collapses re-entrant sub-agents in one session (multiple rows
-  // sharing one `job_id`) to last-write-wins, so the readiness handoff
-  // reads from `state.rows` instead — every received invocation reaches
-  // `computeReadiness` so predicate 6 (`own-progress-sub`) sees every
-  // `running` sub. Page limit 0 streams the full default scope — same
-  // scope-is-board reasoning as epics.
+  // `subagent_invocations` exposes `job_id` as the wire pk though its SQL
+  // identity is composite, so `byId` collapses re-entrant sub-agents in one
+  // session last-write-wins; the readiness handoff reads from `state.rows`
+  // instead so predicate 6 sees every `running` sub.
   const subagentInvocations = makeState(
     "subagent_invocations",
     subsSubId,
@@ -1717,51 +1347,32 @@ export function subscribeReadiness(
       limit: SUBAGENT_INVOCATIONS_PAGE_LIMIT,
     },
   );
-  // The `git` collection feeds predicate 6.5 (git-uncommitted / git-orphans)
-  // — one row per planctl-backed git worktree, keyed by `project_dir`.
-  // Schema-v21 froze per-job `git_dirty_count`/`git_orphan_count` columns
-  // on terminal worker transition, so reading those at evaluate time
-  // produced false `git-orphans` blocks against a since-clean tree. The
-  // live `git_status` row is the honest source of truth; we project it
-  // into a `Map<project_dir, {dirty_count, unattributed_to_live_count}>`
-  // and pass it into `computeReadiness` below. The
-  // `unattributed_to_live_count` field carries the schema-v31 legacy
-  // "orphan" semantic (renamed for honesty under `git_unattributed_to_live_count`);
-  // see the projection block below for the column-name-vs-reason-kind
-  // divergence rationale. First-paint gate widened to include this
-  // collection so a partial snapshot can't flip the pill on the pre-paint
-  // blank state.
+  // The `git` collection — one row per planctl-backed git worktree, keyed by
+  // `project_dir`. RETAINED-BUT-UNREAD by readiness (the sole consumer was the
+  // deleted predicate 6.5), but still projected onto the snapshot for renderers.
+  // The live `git_status` row is the honest source of truth (per-job dirty
+  // counts freeze on terminal worker transition).
   const gitStatus = makeState("git", gitSubId, "project_dir", {
     type: "query",
     collection: "git",
     id: gitSubId,
     limit: GIT_PAGE_LIMIT,
   });
-  // The `dead_letters` collection feeds the board's persistent warn-count
-  // pill (waiting rows the daemon imported from per-pid NDJSON files when
-  // the hook's `events` INSERT exhausted retry — see fn-643). Default
-  // page rides the descriptor's `defaultFilter: { status: "waiting" }`
-  // server-side scope so the wire stream is just the unrecovered backlog;
-  // recovered rows still exist (the row is the audit trail joining
-  // `dl_id` to the appended `replayed_event_id`) but fall off the default
-  // page. First-paint gate widened to this collection — an empty steady
-  // state (zero waiting, the happy case) still produces a `result` frame
-  // with `rows: []` so the gate clears.
+  // `dead_letters` feeds the board's persistent warn-count pill. Rides the
+  // descriptor's `defaultFilter: { status: "waiting" }` scope so the stream is
+  // just the unrecovered backlog. An empty steady state still produces a
+  // `result` with `rows: []` so the first-paint gate clears.
   const deadLetters = makeState("dead_letters", deadLettersSubId, "dl_id", {
     type: "query",
     collection: "dead_letters",
     id: deadLettersSubId,
     limit: DEAD_LETTERS_PAGE_LIMIT,
   });
-  // fn-721: the `pending_dispatches` collection — the 6th subscribed
-  // collection. Feeds the `dispatch-pending` occupant (a launched-but-not-yet-
-  // bound worker holds its mutex slot). The wire pk is `verb` (the descriptor's
-  // composite-pk workaround — `id` rides in `columns`/`filters`), but readiness
-  // reads from `state.rows` via `projectRows`, so every row reaches the
-  // projection regardless of the single-column wire pk collapsing on `verb`.
-  // First-paint gate widened to this collection — an empty steady state (zero
-  // in-flight launches, the common case) still produces a `result` frame with
-  // `rows: []` so the gate clears (the `dead_letters` precedent).
+  // `pending_dispatches` feeds the `dispatch-pending` occupant. The wire pk is
+  // `verb` (the descriptor's composite-pk workaround), but readiness reads from
+  // `state.rows` via `projectRows`, so every row reaches the projection despite
+  // the single-column wire pk collapsing on `verb`. An empty steady state still
+  // produces a `result` with `rows: []`.
   const pendingDispatches = makeState(
     "pending_dispatches",
     pendingDispatchesSubId,
@@ -1773,15 +1384,11 @@ export function subscribeReadiness(
       limit: PENDING_DISPATCHES_PAGE_LIMIT,
     },
   );
-  // fn-770: the `autopilot_state` singleton carries the `mode` enum (`'yolo'` |
-  // `'armed'`) and `armed_epics` is the per-epic armed PRESENCE set. Together
-  // they let the board/CLI readiness pass mirror the reconciler's armed-mode
-  // eligibility (`computeEligibleEpics`) so the displayed per-root winner agrees
-  // with what the daemon dispatches — closing the board≠dispatch divergence the
-  // server-side fix (task .1) leaves on the read path. Mirrors
-  // `loadReconcileSnapshot` (autopilot-worker.ts): a MISSING / malformed `mode`
-  // defaults to `'yolo'` (the work-everything baseline, matching the column's
-  // `DEFAULT 'yolo'`), in which case no eligibility filtering happens at all.
+  // `autopilot_state` carries the `mode` enum and `armed_epics` is the per-epic
+  // armed PRESENCE set; together they let the board/CLI readiness pass mirror
+  // the reconciler's armed-mode eligibility so the displayed per-root winner
+  // agrees with what the daemon dispatches. A missing/malformed `mode` defaults
+  // to `'yolo'` (no eligibility filtering).
   const autopilotState = makeState(
     "autopilot_state",
     autopilotStateSubId,
@@ -1817,28 +1424,18 @@ export function subscribeReadiness(
       !subagentInvocations.gotResult ||
       !gitStatus.gotResult ||
       !deadLetters.gotResult ||
-      // fn-721: gate on the 6th collection too — a partial snapshot must not
-      // flip the `dispatch-pending` occupancy on the pre-paint blank state.
-      // An empty `pending_dispatches` still produces a `result` frame with
-      // `rows: []`, so this clears in the common (no in-flight launch) case.
+      // Gate on every collection — a partial snapshot must not flip the
+      // `dispatch-pending` occupancy or paint the WRONG armed-mode per-root
+      // winner on the pre-paint blank state. Empty `pending_dispatches` /
+      // `armed_epics` still produce a `result` with `rows: []`.
       !pendingDispatches.gotResult ||
-      // fn-770: gate on the two armed-mode collections too — a partial snapshot
-      // must not paint a frame with no `mode`/armed data, which would briefly
-      // show the WRONG per-root winner (the legacy single-pass picks the
-      // earliest-sorted ready row) until the armed state arrives. The
-      // `autopilot_state` singleton always produces a `result` (its row exists
-      // post-migrate / defaults `'yolo'`); an empty `armed_epics` still
-      // produces a `result` frame with `rows: []` so this clears in the common
-      // (nothing-armed) case — the `dead_letters` / `pending_dispatches`
-      // precedent.
       !autopilotState.gotResult ||
       !armedEpics.gotResult
     ) {
       return;
     }
     // Cast: the wire delivers each row as `Record<string, unknown>`; the
-    // descriptors guarantee the shape matches the typed projection
-    // (decoded by `decodeRow` on the server side).
+    // descriptors guarantee the shape matches the typed projection.
     const epicsTyped = epics.order.map(
       (id) => (epics.byId.get(id) ?? { [epics.pk]: id }) as unknown as Epic,
     );
@@ -1848,62 +1445,32 @@ export function subscribeReadiness(
     }
     // Read from `state.rows` (not `byId.values()`) — see module docstring.
     const subsTyped = projectRows<SubagentInvocation>(subagentInvocations);
-    // Collapse same-name sub-agents to most-recent before readiness sees
-    // them — same operating assumption + rationale as `collapseSubagentsByName`'s
-    // docstring (no parallel like-named sub-agents in practice, so
-    // orphaned `running` rows whose matching `SubagentStop` never
-    // landed shouldn't false-block predicate 6). The full uncollapsed
-    // slice still rides on the snapshot for the audit trail; only the
-    // readiness handoff sees the collapsed view.
+    // Collapse same-name sub-agents to most-recent before readiness sees them
+    // (the `collapseSubagentsByName` operating assumption: no parallel
+    // like-named sub-agents, so orphaned `running` rows don't false-block
+    // predicate 6). The uncollapsed slice still rides on the snapshot.
     const subsForReadiness = collapseSubagentsByName(subsTyped).map(
       (g) => g.row,
     );
-    // Project the `git_status` rows into the
-    // `{dirty_count, unattributed_to_live_count}` shape `computeReadiness`
-    // consumes. The `dirty_count` is the direct column read; the
-    // `unattributed_to_live_count` is the schema-v31 legacy v28 "orphan"
-    // semantic (renamed for honesty — "dirty files no LIVE session is on
-    // the hook for") and feeds readiness predicate 6.5's `git-orphans`
-    // block reason. Note the deliberate column-name-vs-reason-kind
-    // divergence: the readiness reason kind is STILL `git-orphans`
-    // (preserved for backward compatibility with autopilot's literal
-    // string comparisons in `scripts/autopilot.ts:230,238,449`); only the
-    // underlying column the count is sourced from gets the more honest
-    // name. See `gitStatusByProjectDir`'s doc on `computeReadiness` for
-    // the rationale.
-    //
-    // The `git_status.orphaned_count` column on the wire carries the NEW
-    // schema-v31 strict-mystery semantic (files with ZERO active
-    // attribution from any tracked session — same value as
-    // `jobs.git_orphan_count`); it is INFORMATIONAL ONLY at v31 and is
-    // NOT projected into the readiness map. To recover the legacy
-    // unattributed-to-live count for readiness, we compute it
-    // client-side from the per-file `attributions[]` materialized view
-    // on `git_status.dirty_files`: a dirty file counts toward
-    // `unattributed_to_live_count` when its `attributions[]` contains no
-    // entry with `state IN ('working', 'stopped')`. The mirror of the
-    // reducer's PASS-4 fan-out computation (`src/reducer.ts:1442-1463`),
-    // redone here from the same materialized JSON the reducer wrote so
-    // both numbers reconcile.
+    // Project the `git_status` rows into the `{dirty_count,
+    // unattributed_to_live_count}` shape (RETAINED-BUT-UNREAD by readiness now
+    // that predicate 6.5 is deleted, but still consistent for any consumer).
+    // `unattributed_to_live_count` is computed client-side from the per-file
+    // `attributions[]` materialized view (a dirty file counts when no
+    // attribution is in a `working`/`stopped` state) — the mirror of the
+    // reducer's PASS-4 fan-out, so both numbers reconcile.
     const gitTyped = projectRows<GitStatus>(gitStatus);
     const gitStatusByProjectDir = projectGitStatusByProjectDir(gitTyped);
-    // fn-721: project the `pending_dispatches` rows into the plain
-    // `PendingDispatch[]` shape via the SOLE shared helper (the SAME one the
-    // autopilot reconciler's `loadReconcileSnapshot` uses) so the board/CLI
-    // readiness pass and the autopilot reconciler agree byte-for-byte on the
-    // `dispatch-pending` occupancy set. Read from `state.rows` (not
-    // `byId.values()`) — the descriptor's wire pk is the composite-workaround
-    // `verb`, so `byId` would collapse same-`verb` rows; every in-flight
-    // dispatch must reach the projection.
+    // Project the `pending_dispatches` rows via the SOLE shared helper (the SAME
+    // one the reconciler uses) so the two readiness paths agree byte-for-byte.
+    // Read from `state.rows` — the wire pk is the composite-workaround `verb`,
+    // so `byId` would collapse same-`verb` rows.
     const pendingDispatchesTyped = projectPendingDispatches(
       projectRows<Record<string, unknown>>(pendingDispatches),
     );
-    // fn-770: mirror the reconciler's `loadReconcileSnapshot` mode/armed read
-    // (autopilot-worker.ts) so the board's per-root winner matches what the
-    // daemon dispatches in `armed` mode. PROJECTION-PULL only — there's one
-    // source of truth (the wire projection), no cache. A missing / malformed
-    // `mode` scalar defaults to `'yolo'` (the work-everything baseline matching
-    // the column's `DEFAULT 'yolo'`).
+    // Mirror the reconciler's mode/armed read so the board's per-root winner
+    // matches what the daemon dispatches in `armed` mode. PROJECTION-PULL only,
+    // no cache; a missing/malformed `mode` defaults to `'yolo'`.
     const modeRaw = (
       autopilotState.byId.get(autopilotState.order[0] ?? "") as
         | { mode?: unknown }
@@ -1911,11 +1478,9 @@ export function subscribeReadiness(
     )?.mode;
     const mode: "yolo" | "armed" = modeRaw === "armed" ? "armed" : "yolo";
     // In `armed` mode, compute the eligible set (armed ∪ transitive upstream
-    // dep-closure) via the SAME `computeEligibleEpics` BFS the reconciler runs,
-    // seeded from the `armed_epics` presence rows. In `yolo` mode leave it
-    // `undefined` so `computeReadiness` takes the byte-identical legacy
-    // single-pass (no eligibility filtering) — matching the reconciler, which
-    // only threads the set through in `armed` mode.
+    // closure) via the SAME `computeEligibleEpics` the reconciler runs. In
+    // `yolo` mode leave it `undefined` so `computeReadiness` takes the legacy
+    // single-pass — matching the reconciler.
     let eligibleEpicIds: Set<string> | undefined;
     if (mode === "armed") {
       const armedIds = new Set<string>();
@@ -1933,32 +1498,18 @@ export function subscribeReadiness(
       jobsTyped,
       subsForReadiness,
       gitStatusByProjectDir,
-      // fn-638.4: caller-injected reference timestamp (unix seconds) for
-      // the `sub-agent-stale` `RunningReason` variant. The pure readiness
-      // pass never reads `Date.now()`; the live client supplies it here,
-      // per snapshot, so a still-`running` sub-agent past
-      // `SUBAGENT_STALENESS_SEC` renders as `sub-agent-stale` instead of
-      // `sub-agent-running`. See `computeReadiness`'s `now` parameter doc
-      // for the full rationale (mirrors fn-637.1's injected-`now`
-      // resolver pattern in `epic-deps.ts`).
+      // Caller-injected reference timestamp for the `sub-agent-stale` /
+      // `monitor-stale` variants — the pure pass never reads `Date.now()`.
       Math.floor(Date.now() / 1000),
-      // fn-721: the launch-window occupancy set.
+      // The launch-window occupancy set.
       pendingDispatchesTyped,
-      // fn-770: armed-mode eligibility (armed ∪ transitive upstreams) in
-      // `armed` mode, `undefined` in `yolo` (legacy single-pass). Makes the
-      // board's per-root tiebreak agree with the reconciler's dispatch.
+      // Armed-mode eligibility in `armed` mode, `undefined` in `yolo`. Makes
+      // the board's per-root tiebreak agree with the reconciler's dispatch.
       eligibleEpicIds,
     );
-    // `dead_letters` is a flat row stream — typed projection from
-    // `state.rows` so the wire diff (each `result` re-snapshots `rows`)
-    // is the source of truth. Renderers consume `deadLetters.length` for
-    // the warn-count pill; the `dl_id` + `hook_event` + `session_id`
-    // fields ride along so a future detail view (or a tooltip) can
-    // surface "what dropped" without a separate sub.
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
-    // Exceptions from `onSnapshot` propagate. This matches keeper's
-    // "no in-process self-heal" stance and the prior board.ts code path,
-    // which had no try/catch around its emit either.
+    // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
+    // stance).
     onSnapshot({
       epics: epicsTyped,
       jobs: jobsTyped,
