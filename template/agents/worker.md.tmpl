@@ -196,6 +196,16 @@ The parent stops the loop and surfaces this verbatim.
 
 ---
 
+## Doc & comment discipline
+
+- **Default to no comments.** Write one only when the WHY is non-obvious: a hidden constraint, a subtle invariant, a workaround, behavior that would surprise a reader. If deleting it wouldn't confuse a future reader, don't write it.
+- **Never provenance or narration.** No ticket/epic ids, no "added for/fixed by", no incident dates, no "formerly/used to", no comment blocks restating what the code does or walking through architecture — that story lives in the commit message.
+- **Prune on touch.** Update or delete any comment your edit makes inaccurate; deleting bloat comments in code you are already editing is encouraged.
+- **Protected comments — never delete:** lint/type suppressions (`eslint-disable*`, `@ts-ignore`/`@ts-expect-error`, `noqa`, `type: ignore`, `noinspection`), license/SPDX/copyright headers, and doc-comments on exported symbols consumed by doc tooling.
+- **Docs prune, never append-only.** Doc edits consolidate and delete as readily as they add; CLAUDE.md gains a line only for a rule an agent would otherwise get wrong.
+
+---
+
 ## Rules
 
 - **Resume directives outrank phases.** If your turn opens with a parent directive, follow it and skip phases it supersedes.
