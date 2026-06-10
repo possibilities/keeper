@@ -27,6 +27,23 @@ TASK_STATUSES = ["todo", "in_progress", "blocked", "done"]
 TASK_TIERS = ("medium", "high", "xhigh", "max")
 
 
+def worker_agent_for_tier(tier: str | None) -> str | None:
+    """Map a task tier to the ``plan`` plugin's worker-agent name.
+
+    Returns ``f"plan:worker-{tier}"`` for a ``TASK_TIERS`` member, ``None`` when
+    ``tier is None`` (legacy pre-fn-594 records that never carried a tier), and
+    raises ``ValueError`` for a non-null string that is not a ``TASK_TIERS``
+    member (corrupt-on-disk guard). The ``None`` return is load-bearing: the
+    ``/plan:work`` skill branches on it to surface a clean typed stop rather
+    than spawning a ``plan:worker-None`` agent.
+    """
+    if tier is None:
+        return None
+    if tier not in TASK_TIERS:
+        raise ValueError(f"unknown tier {tier!r}; expected one of {TASK_TIERS} or None")
+    return f"plan:worker-{tier}"
+
+
 def normalize_epic(data: dict) -> dict:
     """Apply defaults for optional epic fields."""
     # fn-463: defensive strip of the retired ``draft`` field. The concept was

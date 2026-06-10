@@ -288,8 +288,10 @@ def test_worker_resume_tier_set_rides_envelope(project: Path, monkeypatch):
         "nudge",
         "target_repo",
         "primary_repo",
+        "worker_agent",
     }
     assert payload["tier"] == "high"
+    assert payload["worker_agent"] == "plan:worker-high"
 
 
 def test_worker_resume_tier_null_emits_raw_note(project: Path, monkeypatch):
@@ -322,6 +324,7 @@ def test_worker_resume_tier_null_emits_raw_note(project: Path, monkeypatch):
     payload = json.loads(result.output)
     assert "tier" in payload
     assert payload["tier"] is None
+    assert payload["worker_agent"] is None
 
 
 def test_worker_resume_blocked_warns_leaves_alone(project: Path, monkeypatch):

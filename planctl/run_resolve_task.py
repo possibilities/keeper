@@ -134,7 +134,7 @@ def _resolve_project_for_task(task_id: str, project: str | None):
 def run(args: SimpleNamespace) -> int:
     from planctl.ids import epic_id_from_task, is_task_id
     from planctl.invocation import build_planctl_invocation_readonly
-    from planctl.models import merge_task_state, normalize_task
+    from planctl.models import merge_task_state, normalize_task, worker_agent_for_tier
     from planctl.output import emit
     from planctl.runtime_status import _expected_worker_cwd
     from planctl.store import LocalFileStateStore, load_json
@@ -184,6 +184,7 @@ def run(args: SimpleNamespace) -> int:
             "target_repo": target_repo,
             "primary_repo": primary_repo,
             "tier": tier,
+            "worker_agent": worker_agent_for_tier(tier),
             "status": status,
         },
         planctl_invocation=pc,

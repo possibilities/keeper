@@ -74,7 +74,7 @@ def run(args: SimpleNamespace) -> int:
 
     from planctl.brief import BriefRenderError, assemble_brief, write_brief
     from planctl.ids import is_task_id
-    from planctl.models import merge_task_state
+    from planctl.models import merge_task_state, worker_agent_for_tier
     from planctl.output import emit, emit_error
     from planctl.project import resolve_project
     from planctl.runtime_status import _expected_worker_cwd
@@ -187,6 +187,7 @@ def run(args: SimpleNamespace) -> int:
             "task_id": task_id,
             "status": status,
             "tier": tier,
+            "worker_agent": worker_agent_for_tier(tier),
             "brief_ref": brief_ref,
             "nudge": nudge,
             "target_repo": target_repo,

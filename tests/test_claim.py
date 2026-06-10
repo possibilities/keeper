@@ -129,6 +129,8 @@ def test_claim_happy_path_envelope(planctl_git_repo):
     assert payload["target_repo"]  # resolved, non-empty
     assert payload["primary_repo"]
     assert "tier" in payload  # may be None when unset
+    # Tier routing: seeded tasks are tier "medium" → plan:worker-medium.
+    assert payload["worker_agent"] == "plan:worker-medium"
     assert payload["task_state"]["status"] == "in_progress"
     assert payload["task_state"]["assignee"] == "alice@example.com"
     assert payload["task_state"]["outcome"] == "CLAIMED"
@@ -169,6 +171,27 @@ def test_claim_happy_path_envelope(planctl_git_repo):
     assert payload["planctl_invocation"]["op"] == "claim"
     assert payload["planctl_invocation"]["subject"] is None
     assert payload["planctl_invocation"]["files"] is None
+
+
+def test_claim_null_tier_emits_null_worker_agent(planctl_git_repo):
+    """A pre-fn-594 legacy task with persisted tier=null claims fine and emits
+    worker_agent=null (not plan:worker-None). Claimability is claim's contract,
+    not tier validity; the fail-loud on null moves to the skill spawn site.
+    """
+    _epic_id, task_id = _make_epic_with_task()
+
+    # Hand-null to simulate a pre-fn-594 legacy on-disk record.
+    task_path = planctl_git_repo / ".planctl" / "tasks" / f"{task_id}.json"
+    task_def = json.loads(task_path.read_text(encoding="utf-8"))
+    task_def["tier"] = None
+    task_path.write_text(json.dumps(task_def), encoding="utf-8")
+
+    r = _invoke(["claim", task_id], env={"PLANCTL_ACTOR": "alice@example.com"})
+    assert r.exit_code == 0, r.output
+    payload = _first_line_json(r.output)
+    assert payload["success"] is True
+    assert payload["tier"] is None
+    assert payload["worker_agent"] is None
 
 
 def test_claim_brief_file_is_gitignored(planctl_git_repo):

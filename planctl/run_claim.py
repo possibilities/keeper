@@ -189,7 +189,7 @@ def run(args: SimpleNamespace) -> int:
     from planctl.brief import BriefRenderError, assemble_brief, write_brief
     from planctl.ids import epic_id_from_task, is_task_id
     from planctl.invocation import build_planctl_invocation_readonly
-    from planctl.models import merge_task_state
+    from planctl.models import merge_task_state, worker_agent_for_tier
     from planctl.output import emit
     from planctl.runtime_status import _expected_worker_cwd
     from planctl.store import (
@@ -395,6 +395,7 @@ def run(args: SimpleNamespace) -> int:
             "target_repo": target_repo,
             "primary_repo": primary_repo,
             "tier": tier,
+            "worker_agent": worker_agent_for_tier(tier),
             "task_state": task_state,
             "epic_state": epic_state,
             "brief_ref": brief_ref,

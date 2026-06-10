@@ -98,6 +98,7 @@ def test_resolve_task_happy_path_with_tier(planctl_git_repo):
     assert obj.get("task_id") == task_id
     assert obj.get("epic_id") == epic_id
     assert obj.get("tier") == "high"
+    assert obj.get("worker_agent") == "plan:worker-high"
     assert obj.get("status") in {"todo", "in_progress"}
     # target_repo / primary_repo / project_path are absolute paths.
     assert obj.get("target_repo", "").startswith("/")
@@ -147,6 +148,9 @@ def test_resolve_task_null_tier(planctl_git_repo):
     assert obj["tier"] is None, (
         "legacy null-tier task should report tier=null so a consumer "
         "branches on 'tier is None' rather than treating absence as a default"
+    )
+    assert obj.get("worker_agent") is None, (
+        "null-tier task must report worker_agent=null, not plan:worker-None"
     )
 
 

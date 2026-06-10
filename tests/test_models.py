@@ -13,14 +13,36 @@ import os
 
 from click.testing import CliRunner
 from planctl.cli import cli
+import pytest
 from planctl.models import (
+    TASK_TIERS,
     merge_epic_state,
     merge_task_state,
     normalize_epic,
     normalize_task,
+    worker_agent_for_tier,
 )
 
 from .conftest import run_cli
+
+# ---------------------------------------------------------------------------
+# worker_agent_for_tier — tier → plan plugin agent name
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("tier", TASK_TIERS)
+def test_worker_agent_for_tier_valid(tier):
+    assert worker_agent_for_tier(tier) == f"plan:worker-{tier}"
+
+
+def test_worker_agent_for_tier_none_returns_none():
+    assert worker_agent_for_tier(None) is None
+
+
+def test_worker_agent_for_tier_invalid_raises():
+    with pytest.raises(ValueError):
+        worker_agent_for_tier("bogus")
+
 
 # ---------------------------------------------------------------------------
 # normalize_epic / normalize_task — null tolerance on legacy records
