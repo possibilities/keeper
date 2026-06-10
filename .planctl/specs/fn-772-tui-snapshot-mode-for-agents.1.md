@@ -109,5 +109,5 @@ error; latch ready-vs-timeout-vs-degrade; trailer JSON validity). Run
 - [ ] Humans: TTY `keeper git` unchanged. `bun run test:full` passes.
 
 ## Done summary
-
+Added src/snapshot.ts (resolveSnapshotMode precedence, stream-readiness latch, keeper-meta: trailer/no-frame formatters), wired the snapshot branch into createViewShell, and proved it end-to-end on cli/git: non-TTY stdout auto-detects snapshot and prints one frame + a parseable keeper-meta: last line then exits 0, --snapshot/--watch force the mode, both flags or a bad --timeout exit 2, and a dead-sock timeout exits 1 with status daemon-unreachable / frame:null.
 ## Evidence
