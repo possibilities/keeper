@@ -58,6 +58,7 @@ import os
 import re
 import sys
 from collections import Counter
+from dataclasses import dataclass, field
 from pathlib import Path
 from types import SimpleNamespace
 from typing import TypeGuard
@@ -101,6 +102,366 @@ def _is_list_of_int(v: object) -> bool:
     return isinstance(v, list) and all(
         isinstance(x, int) and not isinstance(x, bool) for x in v
     )
+
+
+@dataclass
+class ScaffoldValidation:
+    """Result of :func:`validate_scaffold_yaml` — the dry-run validation verdict.
+
+    On success (``ok`` True): ``n_tasks`` carries the task count; ``code`` /
+    ``message`` / ``details`` are unset. On failure: ``ok`` is False and the
+    triplet describes the dominant error class in scaffold's exact priority
+    order, with ``details`` listing every accumulated error across classes.
+    """
+
+    ok: bool
+    n_tasks: int = 0
+    code: str = ""
+    message: str = ""
+    details: list[str] = field(default_factory=list)
+
+
+def validate_scaffold_yaml(
+    raw_bytes: bytes, *, file_label: str, check_epic_deps: bool = True
+) -> ScaffoldValidation:
+    """Run scaffold's read-cap + Phase-1 parse + Phase-2 validation, no mutation.
+
+    This is the validate half of scaffold's ``assert-all → mutate → emit`` flow,
+    factored so a CALLER that wants scaffold's structural verdict WITHOUT minting
+    anything (``followup submit``'s dry-run) shares the exact leaf checkers
+    (:func:`_is_str`, :func:`_is_list_of_str`, :func:`_is_list_of_int`,
+    ``ensure_valid_task_spec``, ``detect_cycles``, the snippet/bundle/tier
+    validators) and the exact failure-code priority order scaffold itself uses.
+
+    It does NOT allocate ids, does NOT inline ``sketch/`` refs (a mint-time
+    subprocess), and does NOT run the filesystem integrity gate (``.git/``
+    presence) — those are mint-only steps. ``check_epic_deps`` controls the lazy
+    ``resolve_epic_globally`` existence pass for declared ``depends_on_epics``.
+
+    Returns a :class:`ScaffoldValidation`; the caller maps a failure verdict onto
+    its own envelope. Scaffold's own ``run()`` keeps its inline flow (it threads
+    the parsed forward-data into the mutate phase, which this verdict does not
+    carry), so the two stay behavior-identical via a divergence test rather than
+    a shared parsed-data return.
+    """
+    from planctl.bundle_ref import BUNDLE_REF_RE, SNIPPET_ID_RE
+    from planctl.deps import detect_cycles
+    from planctl.ids import is_epic_id
+    from planctl.models import TASK_TIERS
+    from planctl.specs import ensure_valid_task_spec
+
+    if len(raw_bytes) > _MAX_YAML_BYTES:
+        return ScaffoldValidation(
+            ok=False,
+            code="bad_yaml",
+            message=f"YAML exceeds {_MAX_YAML_BYTES} bytes (got {len(raw_bytes)})",
+            details=[f"file: {file_label}"],
+        )
+
+    try:
+        import yaml
+    except ImportError as exc:  # pragma: no cover — pyyaml is a direct dependency
+        return ScaffoldValidation(
+            ok=False, code="bad_yaml", message=f"pyyaml not available: {exc}"
+        )
+
+    try:
+        doc = yaml.safe_load(raw_bytes.decode("utf-8"))
+    except yaml.YAMLError as exc:
+        return ScaffoldValidation(
+            ok=False,
+            code="bad_yaml",
+            message=f"YAML parse error: {exc}",
+            details=[f"file: {file_label}"],
+        )
+    except UnicodeDecodeError as exc:
+        return ScaffoldValidation(
+            ok=False,
+            code="bad_yaml",
+            message=f"YAML is not valid UTF-8: {exc}",
+            details=[f"file: {file_label}"],
+        )
+
+    errors: list[str] = []
+    if not isinstance(doc, dict):
+        return ScaffoldValidation(
+            ok=False,
+            code="bad_yaml",
+            message="Top-level YAML must be a mapping with `epic:` and `tasks:` keys",
+            details=[f"got: {type(doc).__name__}"],
+        )
+
+    epic_node = doc.get("epic")
+    tasks_node = doc.get("tasks")
+    if not isinstance(epic_node, dict):
+        errors.append("epic: must be a mapping")
+        epic_node = {}
+    if not isinstance(tasks_node, list):
+        errors.append("tasks: must be a list")
+        tasks_node = []
+    if errors:
+        return ScaffoldValidation(
+            ok=False,
+            code="bad_yaml",
+            message="Invalid scaffold YAML shape",
+            details=errors,
+        )
+
+    # --- Epic-level validation (mirrors scaffold run() Phase 2) -------------
+    epic_title = epic_node.get("title")
+    if not _is_str(epic_title) or not epic_title.strip():
+        errors.append("epic: `title` must be a non-empty string")
+
+    epic_branch = epic_node.get("branch")
+    if epic_branch is not None and not _is_str(epic_branch):
+        errors.append("epic: `branch` must be a string when present")
+
+    epic_spec = epic_node.get("spec", "")
+    if not _is_str(epic_spec):
+        errors.append("epic: `spec` must be a string (use a `|` block scalar)")
+
+    epic_snippets = epic_node.get("snippets", [])
+    if not _is_list_of_str(epic_snippets):
+        errors.append("epic: `snippets` must be a list of strings")
+        epic_snippets = []
+    for snip in epic_snippets:
+        if not SNIPPET_ID_RE.match(snip):
+            errors.append(
+                f"epic: snippet id {snip!r} does not match {SNIPPET_ID_RE.pattern}"
+            )
+
+    epic_bundles = epic_node.get("bundles", [])
+    if not _is_list_of_str(epic_bundles):
+        errors.append("epic: `bundles` must be a list of strings")
+        epic_bundles = []
+    for ref in epic_bundles:
+        if not BUNDLE_REF_RE.match(ref):
+            errors.append(
+                f"epic: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
+            )
+
+    epic_queue_jump = epic_node.get("queue_jump", False)
+    if not isinstance(epic_queue_jump, bool):
+        errors.append("epic: `queue_jump` must be a boolean (true|false) when present")
+
+    epic_dep_errors: list[str] = []
+    depends_on_epics = epic_node.get("depends_on_epics", [])
+    if not _is_list_of_str(depends_on_epics):
+        epic_dep_errors.append("epic: `depends_on_epics` must be a list of strings")
+        depends_on_epics = []
+    else:
+        seen_deps: set[str] = set()
+        for dep_id in depends_on_epics:
+            if not is_epic_id(dep_id):
+                epic_dep_errors.append(
+                    f"epic: depends_on_epics id {dep_id!r} is not a valid epic id"
+                )
+            if dep_id in seen_deps:
+                epic_dep_errors.append(
+                    f"epic: depends_on_epics id {dep_id!r} is duplicated"
+                )
+            seen_deps.add(dep_id)
+
+    # --- Task-level validation --------------------------------------------
+    n_tasks = len(tasks_node)
+    if n_tasks == 0:
+        errors.append("tasks: must contain at least one entry")
+
+    task_deps_list: list[list[int]] = []
+    spec_errors: list[str] = []
+    dep_errors: list[str] = []
+    ref_errors: list[str] = []
+    repo_errors: list[str] = []
+    tier_errors: list[str] = []
+
+    for i, entry in enumerate(tasks_node, start=1):
+        prefix = f"task #{i}"
+        if not isinstance(entry, dict):
+            errors.append(f"{prefix}: must be a mapping")
+            task_deps_list.append([])
+            continue
+
+        title = entry.get("title")
+        if not _is_str(title) or not title.strip():
+            errors.append(f"{prefix}: `title` must be a non-empty string")
+
+        spec = entry.get("spec")
+        if not _is_str(spec) or not spec.strip():
+            spec_errors.append(f"{prefix}: `spec` must be a non-empty string")
+        else:
+            try:
+                ensure_valid_task_spec(spec)
+            except ValueError as exc:
+                spec_errors.append(f"{prefix}: spec invalid: {exc}")
+
+        snippets = entry.get("snippets", [])
+        if not _is_list_of_str(snippets):
+            ref_errors.append(f"{prefix}: `snippets` must be a list of strings")
+        else:
+            for snip in snippets:
+                if not SNIPPET_ID_RE.match(snip):
+                    ref_errors.append(
+                        f"{prefix}: snippet id {snip!r} does not match {SNIPPET_ID_RE.pattern}"
+                    )
+
+        bundles = entry.get("bundles", [])
+        if not _is_list_of_str(bundles):
+            ref_errors.append(f"{prefix}: `bundles` must be a list of strings")
+        else:
+            for ref in bundles:
+                if not BUNDLE_REF_RE.match(ref):
+                    ref_errors.append(
+                        f"{prefix}: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
+                    )
+
+        deps = entry.get("deps", [])
+        if not _is_list_of_int(deps):
+            dep_errors.append(
+                f"{prefix}: `deps` must be a list of 1-based ordinal integers"
+            )
+            deps = []
+        else:
+            for ord_val in deps:
+                if ord_val < 1 or ord_val > n_tasks:
+                    dep_errors.append(
+                        f"{prefix}: dep ordinal {ord_val} out of range (must be 1..{n_tasks})"
+                    )
+                elif ord_val == i:
+                    dep_errors.append(
+                        f"{prefix}: dep ordinal {ord_val} is self-referential"
+                    )
+        task_deps_list.append(list(deps))
+
+        target_repo_raw = entry.get("target_repo")
+        if target_repo_raw is not None:
+            if not _is_str(target_repo_raw):
+                errors.append(f"{prefix}: `target_repo` must be a string when present")
+            else:
+                stripped = target_repo_raw.strip()
+                if not stripped:
+                    repo_errors.append(
+                        f"{prefix}: `target_repo` must be non-empty after strip"
+                    )
+                elif not (stripped.startswith("/") or stripped.startswith("~")):
+                    repo_errors.append(
+                        f"{prefix}: `target_repo` {target_repo_raw!r} must be an "
+                        "absolute path (starts with / or ~)"
+                    )
+
+        tier_raw = entry.get("tier")
+        if tier_raw is None:
+            tier_errors.append(
+                f"{prefix}: `tier` is required (missing) — must be one of "
+                f"{', '.join(TASK_TIERS)}"
+            )
+        elif not _is_str(tier_raw):
+            errors.append(f"{prefix}: `tier` must be a string")
+        elif tier_raw not in TASK_TIERS:
+            tier_errors.append(
+                f"{prefix}: `tier` {tier_raw!r} is not one of {', '.join(TASK_TIERS)}"
+            )
+
+    # Failure-code priority order — identical to scaffold's run().
+    if errors:
+        all_errors = (
+            errors
+            + ref_errors
+            + spec_errors
+            + dep_errors
+            + epic_dep_errors
+            + repo_errors
+            + tier_errors
+        )
+        return ScaffoldValidation(
+            ok=False,
+            code="bad_yaml",
+            message="Invalid scaffold YAML shape",
+            details=all_errors,
+        )
+
+    if check_epic_deps and depends_on_epics and not epic_dep_errors:
+        from planctl.discovery import resolve_epic_globally
+
+        for dep_id in depends_on_epics:
+            dep_resolution = resolve_epic_globally(dep_id)
+            if dep_resolution.ambiguous:
+                owners = ", ".join(str(p) for p in dep_resolution.owners)
+                epic_dep_errors.append(
+                    f"epic: depends_on_epics id {dep_id!r} resolves to "
+                    f"multiple projects: {owners}"
+                )
+            elif not dep_resolution.resolved:
+                epic_dep_errors.append(
+                    f"epic: depends_on_epics id {dep_id!r} does not exist"
+                )
+
+    if spec_errors:
+        return ScaffoldValidation(
+            ok=False,
+            code="spec_invalid",
+            message="One or more task specs failed validation",
+            details=spec_errors
+            + ref_errors
+            + dep_errors
+            + epic_dep_errors
+            + repo_errors
+            + tier_errors,
+        )
+    if ref_errors:
+        return ScaffoldValidation(
+            ok=False,
+            code="ref_invalid",
+            message="One or more snippet/bundle refs are invalid",
+            details=ref_errors
+            + dep_errors
+            + epic_dep_errors
+            + repo_errors
+            + tier_errors,
+        )
+    if dep_errors:
+        return ScaffoldValidation(
+            ok=False,
+            code="dep_invalid",
+            message="One or more task dependencies are invalid",
+            details=dep_errors + epic_dep_errors + repo_errors + tier_errors,
+        )
+    if epic_dep_errors:
+        return ScaffoldValidation(
+            ok=False,
+            code="epic_dep_invalid",
+            message="One or more epic-level dependencies are invalid",
+            details=epic_dep_errors + repo_errors + tier_errors,
+        )
+    if repo_errors:
+        return ScaffoldValidation(
+            ok=False,
+            code="repo_invalid",
+            message="One or more task `target_repo` values are invalid",
+            details=repo_errors + tier_errors,
+        )
+    if tier_errors:
+        return ScaffoldValidation(
+            ok=False,
+            code="tier_invalid",
+            message="One or more task `tier` values are invalid",
+            details=tier_errors,
+        )
+
+    # --- Cycle detection on the in-memory ordinal graph -------------------
+    graph: dict[str, dict] = {
+        str(i): {"depends_on": [str(d) for d in task_deps_list[i - 1]]}
+        for i in range(1, n_tasks + 1)
+    }
+    cycle = detect_cycles(graph)
+    if cycle:
+        return ScaffoldValidation(
+            ok=False,
+            code="dep_cycle",
+            message="Task dependency graph contains a cycle",
+            details=[f"cycle: {' -> '.join(cycle)}"],
+        )
+
+    return ScaffoldValidation(ok=True, n_tasks=n_tasks)
 
 
 def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — single transactional flow

@@ -1515,6 +1515,143 @@ def worker_resume_cmd(task_id):
     return _lazy_import("planctl.run_worker_resume")(task_id=task_id)
 
 
+# --- Close-phase submit subgroups (fn-12) ---
+#
+# The content-blind /plan:close pipeline persists every artifact (audit report,
+# verdict, follow-up plan) under gitignored state/audits/<epic_id>/ via these
+# three submit verbs. All are runtime-state-only (commit-free, like `claim` /
+# `close-preflight`): they read the on-disk brief that `close-preflight` wrote,
+# stamp its `commit_set_hash`, validate the payload at emission, and persist.
+# Each is a nested `<noun> submit` group modeled on `epic`/`task`/`worker`.
+
+_SUBMIT_FILE_HELP = (
+    "Read the payload from this path, or `-` for stdin (the canonical form; "
+    "1 MiB byte cap, TTY rejected)."
+)
+
+_AUDIT_SUBMIT_AGENT_HELP = """\
+planctl audit submit <epic_id> --file - --findings <N> --risk <Low|Medium|High>
+
+Persist the content-blind quality-auditor's report markdown for <epic_id>'s
+close pipeline. Reads the report from stdin (1 MiB cap), stamps it with the
+brief's commit_set_hash + schema_version, and writes it commit-free under
+gitignored audits/<epic_id>/report.md plus a report.meta.json sidecar (version,
+hash, findings count, risk). Echoes report_ref + findings + risk in the
+envelope. Last-writer-wins. Run `planctl close-preflight <epic_id>` first to
+mint the brief.
+
+Codes: BAD_EPIC_ID, NOT_A_PROJECT, BRIEF_MISSING, BRIEF_CORRUPT, NO_STDIN,
+PAYLOAD_TOO_LARGE, BAD_ENCODING, BAD_RISK.
+"""
+
+_VERDICT_SUBMIT_AGENT_HELP = """\
+planctl verdict submit <epic_id> --file -
+
+Validate + persist the close-planner's verdict JSON for <epic_id>:
+{fatal, fatal_reason, decisions:[{fid, action, task, rationale}]}. Validates
+structurally (additionalProperties:false on every node) THEN cross-field
+(merged-into targets reference a real fid; culled⇒task null; kept/merged⇒non-null
+ordinal; fatal:true⇒non-empty reason). A reject returns the typed, minimal
+envelope (top-3 errors + the schema fragment for the first failing path only).
+On success stamps the brief's commit_set_hash and writes commit-free under
+audits/<epic_id>/verdict.json. Last-writer-wins.
+
+Codes: BAD_EPIC_ID, NOT_A_PROJECT, BRIEF_MISSING, BRIEF_CORRUPT, NO_STDIN,
+PAYLOAD_TOO_LARGE, BAD_ENCODING, BAD_JSON, VERDICT_INVALID.
+"""
+
+_FOLLOWUP_SUBMIT_AGENT_HELP = """\
+planctl followup submit <epic_id> --file -
+
+Validate + persist the close-planner's follow-up plan YAML for <epic_id>. Runs
+scaffold's DRY-RUN validation (the assert-all half — same leaf checkers + code
+priority, no mint, no CLAUDE_CODE_SESSION_ID gate) then cross-checks the YAML
+task count against the persisted verdict's distinct non-null kept/merged
+ordinals. On success writes commit-free under audits/<epic_id>/followup.yaml.
+Submit the verdict first (the cross-check needs it). Last-writer-wins.
+
+Codes: BAD_EPIC_ID, NOT_A_PROJECT, BRIEF_MISSING, BRIEF_CORRUPT, NO_STDIN,
+PAYLOAD_TOO_LARGE, BAD_ENCODING, VERDICT_MISSING, the scaffold dry-run codes
+(bad_yaml/spec_invalid/ref_invalid/dep_invalid/epic_dep_invalid/repo_invalid/
+tier_invalid/dep_cycle), TASK_COUNT_MISMATCH.
+"""
+
+
+@cli.group("audit", cls=FormattedGroup)
+def audit_group():
+    """Close-phase audit-artifact submit verbs."""
+    pass
+
+
+@audit_group.command("submit")
+@click.argument("epic_id")
+@click.option("--file", "file", required=True, type=str, help=_SUBMIT_FILE_HELP)
+@click.option(
+    "--findings", type=int, default=0, help="Number of findings in the report."
+)
+@click.option(
+    "--risk",
+    type=click.Choice(["Low", "Medium", "High"]),
+    required=True,
+    help="Overall risk label for the audit.",
+)
+@click.option(
+    "--project",
+    default=None,
+    help="Absolute path to the planctl project (bypasses cwd-walk).",
+)
+@agent_help_option(_AUDIT_SUBMIT_AGENT_HELP)
+def audit_submit_cmd(epic_id, file, findings, risk, project):
+    """Persist the quality-auditor's report markdown (commit-free)."""
+    return _lazy_import("planctl.run_audit_submit")(
+        epic_id=epic_id, file=file, findings=findings, risk=risk, project=project
+    )
+
+
+@cli.group("verdict", cls=FormattedGroup)
+def verdict_group():
+    """Close-phase verdict submit verb."""
+    pass
+
+
+@verdict_group.command("submit")
+@click.argument("epic_id")
+@click.option("--file", "file", required=True, type=str, help=_SUBMIT_FILE_HELP)
+@click.option(
+    "--project",
+    default=None,
+    help="Absolute path to the planctl project (bypasses cwd-walk).",
+)
+@agent_help_option(_VERDICT_SUBMIT_AGENT_HELP)
+def verdict_submit_cmd(epic_id, file, project):
+    """Validate + persist the close-planner's verdict JSON (commit-free)."""
+    return _lazy_import("planctl.run_verdict_submit")(
+        epic_id=epic_id, file=file, project=project
+    )
+
+
+@cli.group("followup", cls=FormattedGroup)
+def followup_group():
+    """Close-phase follow-up-plan submit verb."""
+    pass
+
+
+@followup_group.command("submit")
+@click.argument("epic_id")
+@click.option("--file", "file", required=True, type=str, help=_SUBMIT_FILE_HELP)
+@click.option(
+    "--project",
+    default=None,
+    help="Absolute path to the planctl project (bypasses cwd-walk).",
+)
+@agent_help_option(_FOLLOWUP_SUBMIT_AGENT_HELP)
+def followup_submit_cmd(epic_id, file, project):
+    """Validate + persist the close-planner's follow-up plan YAML (commit-free)."""
+    return _lazy_import("planctl.run_followup_submit")(
+        epic_id=epic_id, file=file, project=project
+    )
+
+
 def main() -> int:
     """Main entry point."""
     from planctl._util import run_cli
