@@ -61,5 +61,5 @@ No Python tests cover prose; verify via the epic Quick commands greps plus
 - [ ] No tombstone phrasing introduced anywhere
 
 ## Done summary
-
+Removed the snippet-substrate prompt surface from all plan/close/defer skills, worker + work templates, and the repo-scout/gap-analyst/quality-auditor/close-planner agents plus the workflow diagram, and fixed every Task(subagent_type=...) example to plan:-scoped names. CLI verbs, bundle_ref.py, sketch_refs.py, and persisted snippets/bundles fields are untouched and stay dormant; brief schema_version stays 1.
 ## Evidence
