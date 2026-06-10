@@ -43,5 +43,5 @@ references remain. No code tests; doc-only.
 - [ ] `CLAUDE_CODE_SUBAGENT_MODEL` flatten-all-tiers note added to CLAUDE.md
 
 ## Done summary
-
+Rewrote worker-routing docs (CLAUDE.md, README, SKILL.md, mermaid diagram) to the present-tense plan:worker-<tier> / worker_agent / no-plugin-dir world; added the CLAUDE_CODE_SUBAGENT_MODEL flatten-all-tiers note.
 ## Evidence
