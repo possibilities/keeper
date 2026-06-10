@@ -50,7 +50,9 @@ The file is `{ "success": true, "findings": [ Finding, … ] }`. Each `Finding`:
   "severity":    "info" | "warning" | "critical",
   "category":    "dup-dispatch" | "dispatch-failure" | "daemon-down" |
                  "reducer-wedge" | "dead-letter-growth" | "autopilot-stall" |
-                 "stuck-job" | "backstop-degraded" | "fold-latency",
+                 "stuck-job" | "backstop-degraded" | "fold-latency" |
+                 "duplicate-live-workers" | "poison-arrivals" |
+                 "events-log-backlog" | "db-growth" | "keeperd-cpu",
   "title":       "<short label>",
   "detail":      "<human one-liner>",
   "evidence":    { …category-specific… }
@@ -104,6 +106,31 @@ concise human callout. Do NOT try to re-confirm it against the DB.
 - **fold-latency** — a planctl op took longer than the realtime bar to reach the
   projection (the realtime wake path likely dropped and the change fell to the
   reconcile heartbeat). `evidence` carries the op, entity id, and `latencySecs`.
+- **duplicate-live-workers** — CRITICAL, the LOAD-BEARING re-fire tripwire: >1
+  LIVE worker pid backs one `plan_ref` (the 2026-06-09 triple-dispatch class —
+  two workers racing one worktree). `evidence` carries `planRef` + `livePids`.
+  This is the authoritative re-fire signal (it checks live pids, NOT event
+  counts); when it's present alongside a `dup-dispatch` finding, THIS is the real
+  problem. Real ~always: name the plan_ref + pids and page promptly. Gather: which
+  jobs hold those pids (`jobs.plan_ref`), are both genuinely live (`ps`)?
+- **poison-arrivals** — the count of `dead_letters` rows with `status='poison'`
+  rose vs the baseline (the fn-762 events-ingest poison surface — a line the
+  events-log ingester could not parse and quarantined). Points at malformed hook
+  NDJSON or a parser skew. `evidence` carries `count`. Real when the count keeps
+  climbing; a one-shot parked line is benign (the ingester advanced past it).
+- **events-log-backlog** — a per-pid events-log file is larger on disk than the
+  daemon's stored ingest offset (held across ticks — a few un-flushed lines is
+  normal, a PERSISTENT lag is a wedged ingester). `evidence` carries `path`,
+  `size`, `offset`, `lagBytes`. Real when it persists + grows; benign if it's a
+  one-tick in-flight append that catches up.
+- **db-growth** — info: the keeper.db `-wal` exceeds a generous (1 GiB) ceiling,
+  so WAL checkpointing likely stalled and the file is growing unbounded.
+  `evidence` carries `dbBytes`/`walBytes`. Slow-burn footprint signal, not an
+  outage — note it; only urgent if the WAL keeps climbing tick over tick.
+- **keeperd-cpu** — keeperd %CPU is sustained over the bar across ticks (held)
+  — the fn-748 144%-CPU busy-loop class (a `data_version` fan-out or a hot poll).
+  `evidence` carries `cpuPct`. Real when sustained; a brief fold-burst spike is
+  normal (the held gate already filters those out before you see it).
 
 ### Cross-repo prompt pointers
 

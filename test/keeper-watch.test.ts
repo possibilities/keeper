@@ -40,10 +40,15 @@ import {
   detectAutopilotStall,
   detectBackstopTelemetry,
   detectDaemonDown,
+  detectDbGrowth,
   detectDeadLetterGrowth,
   detectDispatchFailures,
   detectDupDispatch,
+  detectDuplicateLiveWorkers,
+  detectEventsLogBacklog,
   detectFoldLatency,
+  detectKeeperdCpu,
+  detectPoisonArrivals,
   detectReducerWedge,
   detectStuckJobs,
   type EventRow,
@@ -54,6 +59,7 @@ import {
   fingerprint,
   foldSeenState,
   HELD_TICKS_THRESHOLD,
+  type JobRow,
   loadBackstopBaseline,
   loadSeenState,
   MAX_SPAWN_RETRIES,
@@ -381,6 +387,7 @@ describe("detectStuckJobs", () => {
           pid: 4242,
           created_at: now - 600,
           title: "t",
+          plan_ref: null,
         },
       ],
       nowSecs: now,
@@ -400,6 +407,7 @@ describe("detectStuckJobs", () => {
             pid: 4242,
             created_at: now - 600,
             title: null,
+            plan_ref: null,
           },
         ],
         nowSecs: now,
@@ -418,6 +426,7 @@ describe("detectStuckJobs", () => {
             pid: 4242,
             created_at: now - 10,
             title: null,
+            plan_ref: null,
           },
         ],
         nowSecs: now,
@@ -436,12 +445,167 @@ describe("detectStuckJobs", () => {
             pid: 4242,
             created_at: now - 600,
             title: null,
+            plan_ref: null,
           },
         ],
         nowSecs: now,
         isAlive: () => false,
       }),
     ).toHaveLength(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// fn-766 task 2 — the watches the post-roadmap signal landscape proved missing.
+// ---------------------------------------------------------------------------
+
+describe("detectDuplicateLiveWorkers", () => {
+  const job = (
+    over: Partial<JobRow> & { job_id: string; plan_ref: string | null },
+  ): JobRow => ({
+    state: "working",
+    pid: 1,
+    created_at: 0,
+    title: null,
+    ...over,
+  });
+
+  test("fires CRITICAL on >1 live worker against one plan_ref", () => {
+    const findings = detectDuplicateLiveWorkers({
+      jobs: [
+        job({ job_id: "j1", pid: 100, plan_ref: "fn-700-x.2" }),
+        job({ job_id: "j2", pid: 200, plan_ref: "fn-700-x.2" }),
+      ],
+      isAlive: () => true,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].severity).toBe("critical");
+    expect(findings[0].category).toBe("duplicate-live-workers");
+    expect(findings[0].key).toBe("duplicate-live-workers:fn-700-x.2");
+    expect(findings[0].evidence.liveCount).toBe(2);
+    expect(findings[0].evidence.livePids).toEqual([100, 200]);
+  });
+
+  test("does NOT fire when only one of the pair is live", () => {
+    expect(
+      detectDuplicateLiveWorkers({
+        jobs: [
+          job({ job_id: "j1", pid: 100, plan_ref: "fn-700-x.2" }),
+          job({ job_id: "j2", pid: 200, plan_ref: "fn-700-x.2" }),
+        ],
+        // pid 200 is dead → only one live worker, no re-fire.
+        isAlive: (pid) => pid === 100,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("ignores null plan_ref, terminal state, and null pid", () => {
+    expect(
+      detectDuplicateLiveWorkers({
+        jobs: [
+          job({ job_id: "j1", pid: 100, plan_ref: null }),
+          job({ job_id: "j2", pid: 200, plan_ref: null }),
+          job({ job_id: "j3", pid: 300, plan_ref: "fn-1.1", state: "ended" }),
+          job({ job_id: "j4", pid: 400, plan_ref: "fn-1.1", state: "killed" }),
+          job({ job_id: "j5", pid: null, plan_ref: "fn-1.1" }),
+        ],
+        isAlive: () => true,
+      }),
+    ).toHaveLength(0);
+  });
+
+  test("one finding per offending plan_ref, deterministic order", () => {
+    const findings = detectDuplicateLiveWorkers({
+      jobs: [
+        job({ job_id: "b1", pid: 1, plan_ref: "fn-b.1" }),
+        job({ job_id: "b2", pid: 2, plan_ref: "fn-b.1" }),
+        job({ job_id: "a1", pid: 3, plan_ref: "fn-a.1" }),
+        job({ job_id: "a2", pid: 4, plan_ref: "fn-a.1" }),
+      ],
+      isAlive: () => true,
+    });
+    expect(findings.map((f) => f.evidence.planRef)).toEqual([
+      "fn-a.1",
+      "fn-b.1",
+    ]);
+  });
+});
+
+describe("detectPoisonArrivals", () => {
+  test("fires warning on a positive poison count", () => {
+    const findings = detectPoisonArrivals({ count: 3 });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].severity).toBe("warning");
+    expect(findings[0].category).toBe("poison-arrivals");
+    expect(findings[0].evidence.count).toBe(3);
+  });
+
+  test("zero count is healthy → no finding", () => {
+    expect(detectPoisonArrivals({ count: 0 })).toHaveLength(0);
+  });
+});
+
+describe("detectEventsLogBacklog", () => {
+  test("fires warning when size exceeds offset beyond the slack", () => {
+    const findings = detectEventsLogBacklog({
+      files: [
+        { path: "/e/1.ndjson", size: 64 * 1024 + 1, offset: 0 },
+        { path: "/e/2.ndjson", size: 100, offset: 100 }, // caught up
+        { path: "/e/3.ndjson", size: 50, offset: 60 }, // truncated/rotated
+      ],
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].category).toBe("events-log-backlog");
+    expect(findings[0].key).toBe("events-log-backlog:/e/1.ndjson");
+    expect(findings[0].evidence.lagBytes).toBe(64 * 1024 + 1);
+  });
+
+  test("a small in-flight append within the slack does NOT fire", () => {
+    expect(
+      detectEventsLogBacklog({
+        files: [{ path: "/e/1.ndjson", size: 1000, offset: 0 }],
+      }),
+    ).toHaveLength(0);
+  });
+});
+
+describe("detectDbGrowth", () => {
+  test("fires info when WAL exceeds the ceiling", () => {
+    const findings = detectDbGrowth({
+      dbBytes: 1000,
+      walBytes: 1024 * 1024 * 1024 + 1,
+    });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].severity).toBe("info");
+    expect(findings[0].category).toBe("db-growth");
+  });
+
+  test("a healthy WAL under the ceiling does NOT fire", () => {
+    expect(
+      detectDbGrowth({ dbBytes: 1000, walBytes: 5 * 1024 * 1024 }),
+    ).toHaveLength(0);
+  });
+
+  test("an absent WAL (null) is healthy", () => {
+    expect(detectDbGrowth({ dbBytes: 1000, walBytes: null })).toHaveLength(0);
+  });
+});
+
+describe("detectKeeperdCpu", () => {
+  test("fires warning when CPU exceeds the bar", () => {
+    const findings = detectKeeperdCpu({ cpuPct: 144 });
+    expect(findings).toHaveLength(1);
+    expect(findings[0].severity).toBe("warning");
+    expect(findings[0].category).toBe("keeperd-cpu");
+    expect(findings[0].evidence.cpuPct).toBe(144);
+  });
+
+  test("CPU under the bar does NOT fire", () => {
+    expect(detectKeeperdCpu({ cpuPct: 5 })).toHaveLength(0);
+  });
+
+  test("null CPU (no keeperd / probe failure) is healthy here", () => {
+    expect(detectKeeperdCpu({ cpuPct: null })).toHaveLength(0);
   });
 });
 
@@ -715,7 +879,7 @@ describe("detectBackstopTelemetry", () => {
     expect(seed.next.dev).toBe(ID.dev);
     expect(seed.next.ino).toBe(ID.ino);
 
-    // Tick 2: rescues_total jumped by 8 (> MISSED_WAKE_DELTA=5) → fires; the
+    // Tick 2: rescues_total jumped by 8 (> MISSED_WAKE_DELTA=1) → fires; the
     // delta keys off rescues_total, NOT fires_total.
     const t2 = `${rollupLine({ ...bucket, fires_total: 30, rescues_total: 12 })}\n`;
     const second = detectBackstopTelemetry({
@@ -773,12 +937,42 @@ describe("detectBackstopTelemetry", () => {
         },
       },
     };
-    // rescues_total +1 → ≤ MISSED_WAKE_DELTA(5) → quiet.
+    // rescues_total +1 → not > MISSED_WAKE_DELTA(1) (generic EXCLUSIVE bar) → quiet.
     const text = `${rollupLine({ ...bucket, fires_total: 13, rescues_total: 5 })}\n`;
     const { findings } = detectBackstopTelemetry({ text, prior, identity: ID });
     expect(
       findings.filter((f) => f.key.startsWith("backstop-missed-wake:")),
     ).toHaveLength(0);
+  });
+
+  test("events-ingest-poison carve-out: a delta of 1 FIRES (inclusive >=1 bar)", () => {
+    // A +1 rescues_total delta is QUIET for a generic backstop (the prior test),
+    // but the events-ingest-poison backstop pages on the FIRST delta — a poison
+    // line is a hard ingest fault, not a timing miss (fn-766 per-name carve-out).
+    const bucket = { backstop: "events-ingest-poison", cls: "missed-wake" };
+    const prior: BackstopBaseline = {
+      version: BACKSTOP_BASELINE_VERSION,
+      dev: ID.dev,
+      ino: ID.ino,
+      buckets: {
+        "events-ingest-poison missed-wake": {
+          fires_total: 3,
+          rescues_total: 4,
+          rescue_watermark_ts: 0,
+        },
+      },
+    };
+    // rescues_total 4→5 = delta 1 → fires only because of the poison carve-out.
+    const text = `${rollupLine({ ...bucket, fires_total: 4, rescues_total: 5 })}\n`;
+    const { findings } = detectBackstopTelemetry({ text, prior, identity: ID });
+    const delta = findings.find((f) =>
+      f.key.startsWith("backstop-missed-wake:"),
+    );
+    expect(delta).toBeDefined();
+    expect(delta?.severity).toBe("warning");
+    expect(delta?.evidence.delta).toBe(1);
+    expect(delta?.evidence.threshold).toBe(1);
+    expect(delta?.detail).toContain("poison");
   });
 
   test("counter RESET (current rescues < baseline) reads as a reset, NOT a regression", () => {
@@ -1146,6 +1340,90 @@ describe("scan (DB layer)", () => {
     );
   });
 
+  test("seeds a duplicate-live-worker pair and pages it critical end-to-end", async () => {
+    const writer = openDb(dbPath);
+    const now = Math.floor(Date.now() / 1000);
+    // Two non-terminal jobs bound to the SAME plan_ref, both with a pid the
+    // injected isAlive reports live → the re-fire signature.
+    for (const [jid, pid] of [
+      ["j-dup-a", 111111],
+      ["j-dup-b", 222222],
+    ] as const) {
+      writer.db
+        .query(
+          `INSERT INTO jobs (job_id, created_at, pid, state, updated_at, plan_ref)
+             VALUES (?, ?, ?, 'working', ?, 'fn-700-x.2')`,
+        )
+        .run(jid, now, pid, now);
+    }
+    writer.db.close();
+
+    // isAlive reports BOTH pids live (the seeded pair).
+    const deps: ScanDeps = {
+      ...quietDeps(now),
+      isAlive: (pid) => pid === 111111 || pid === 222222,
+    };
+    const findings = await scan(dbPath, 3600, deps);
+    const dup = findings.find((f) => f.category === "duplicate-live-workers");
+    expect(dup).toBeDefined();
+    expect(dup?.severity).toBe("critical");
+    expect(dup?.key).toBe("duplicate-live-workers:fn-700-x.2");
+    expect(dup?.evidence.liveCount).toBe(2);
+  });
+
+  test("counts poison-parked dead_letters and surfaces poison-arrivals", async () => {
+    const writer = openDb(dbPath);
+    const now = Math.floor(Date.now() / 1000);
+    for (const [dlId, status] of [
+      ["dl-1", "poison"],
+      ["dl-2", "poison"],
+      ["dl-3", "waiting"], // not poison — excluded from the count
+    ] as const) {
+      writer.db
+        .query(
+          `INSERT INTO dead_letters
+             (dl_id, session_id, hook_event, ts, dl_written_at, bindings, status)
+             VALUES (?, 's', 'PostToolUse', ?, ?, '{}', ?)`,
+        )
+        .run(dlId, now, now, status);
+    }
+    writer.db.close();
+
+    const findings = await scan(dbPath, 3600, quietDeps(now));
+    const poison = findings.find((f) => f.category === "poison-arrivals");
+    expect(poison).toBeDefined();
+    expect(poison?.evidence.count).toBe(2);
+  });
+
+  test("db-growth / events-log-backlog / keeperd-cpu stay OFF for a quiet caller", async () => {
+    openDb(dbPath).db.close();
+    const now = Math.floor(Date.now() / 1000);
+    // quietDeps wires none of the new optional probes → none of the three fire.
+    const findings = await scan(dbPath, 3600, quietDeps(now));
+    for (const cat of ["db-growth", "events-log-backlog", "keeperd-cpu"]) {
+      expect(findings.filter((f) => f.category === cat)).toHaveLength(0);
+    }
+  });
+
+  test("wires the injected db-growth / events-log-backlog / keeperd-cpu probes", async () => {
+    openDb(dbPath).db.close();
+    const now = Math.floor(Date.now() / 1000);
+    const deps: ScanDeps = {
+      ...quietDeps(now),
+      dbSizes: () => ({ dbBytes: 1000, walBytes: 1024 * 1024 * 1024 + 1 }),
+      eventsLogFiles: () => [
+        { path: "/e/9.ndjson", size: 1024 * 1024, offset: 0 },
+      ],
+      keeperdCpu: () => 144,
+    };
+    const findings = await scan(dbPath, 3600, deps);
+    expect(findings.some((f) => f.category === "db-growth")).toBe(true);
+    expect(findings.some((f) => f.category === "events-log-backlog")).toBe(
+      true,
+    );
+    expect(findings.some((f) => f.category === "keeperd-cpu")).toBe(true);
+  });
+
   test("surfaces daemon-down via injected probes without a live daemon", async () => {
     openDb(dbPath).db.close();
     const now = Math.floor(Date.now() / 1000);
@@ -1416,6 +1694,74 @@ describe("applyHeldGate", () => {
 
   test("non-held categories pass through unchanged", () => {
     const f = mkFinding({ key: "dispatch-failure:x" });
+    expect(applyHeldGate([f], emptySeenState()).gated).toHaveLength(1);
+  });
+
+  test("fn-766 held categories (events-log-backlog / keeperd-cpu) need the held threshold", () => {
+    for (const category of ["events-log-backlog", "keeperd-cpu"] as const) {
+      const f = mkFinding({
+        key: category,
+        category,
+        fingerprint: fingerprint(category, "x"),
+      });
+      // First sighting → suppressed (accrues a tick).
+      expect(applyHeldGate([f], emptySeenState()).gated).toHaveLength(0);
+      const prior: SeenState = {
+        version: 1,
+        baselined: true,
+        fingerprints: {
+          [f.fingerprint]: {
+            first_seen: 0,
+            last_seen: 0,
+            notification_count: 0,
+            last_notified_at: null,
+            held_ticks: HELD_TICKS_THRESHOLD - 1,
+            spawn_failures: 0,
+            count: null,
+          },
+        },
+      };
+      expect(applyHeldGate([f], prior).gated).toHaveLength(1);
+    }
+  });
+
+  test("fn-766 poison-arrivals is delta-gated like dead-letter-growth", () => {
+    const poison = (count: number): Finding =>
+      mkFinding({
+        key: "poison-arrivals",
+        category: "poison-arrivals",
+        fingerprint: fingerprint("poison-arrivals", "dead-letters-poison"),
+        evidence: { count },
+      });
+    // Cold (no baseline) → seed, don't escalate.
+    expect(applyHeldGate([poison(2)], emptySeenState()).gated).toHaveLength(0);
+    const baseline: SeenState = {
+      version: 1,
+      baselined: true,
+      fingerprints: {
+        [poison(0).fingerprint]: {
+          first_seen: 0,
+          last_seen: 0,
+          notification_count: 0,
+          last_notified_at: null,
+          held_ticks: 0,
+          spawn_failures: 0,
+          count: 2,
+        },
+      },
+    };
+    expect(applyHeldGate([poison(2)], baseline).gated).toHaveLength(0); // flat
+    expect(applyHeldGate([poison(5)], baseline).gated).toHaveLength(1); // rose
+  });
+
+  test("fn-766 duplicate-live-workers is NOT held — it pages immediately", () => {
+    const f = mkFinding({
+      key: "duplicate-live-workers:fn-700-x.2",
+      category: "duplicate-live-workers",
+      severity: "critical",
+      fingerprint: fingerprint("duplicate-live-workers", "fn-700-x.2"),
+    });
+    // First sighting clears the gate (the load-bearing re-fire tripwire).
     expect(applyHeldGate([f], emptySeenState()).gated).toHaveLength(1);
   });
 });

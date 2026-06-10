@@ -9,7 +9,10 @@
  * dispatches, dead-letter / fold-latency / backstop degradation, and stuck
  * jobs. (fn-766 retired the approval-era checks — fn-756 deleted the approve
  * verb and its window, so dup-approve / approval-review no longer have a
- * mechanism to watch.) This binary is the deterministic DETECTION CORE: it
+ * mechanism to watch — and added the watches the post-roadmap signal landscape
+ * proved missing: duplicate-live-workers per plan_ref [the LOAD-BEARING re-fire
+ * tripwire], poison-arrivals, events-log-backlog, db-growth, keeperd-cpu.) This
+ * binary is the deterministic DETECTION CORE: it
  * opens `keeper.db` READ-ONLY, scans a
  * recent window of the event log + the projection tables, and emits a stable
  * `Finding[]`. It NEVER writes `keeper.db`, mints no synthetic events, and
@@ -88,6 +91,7 @@ import {
   resolveBackstopLogPath,
   resolveDbPath,
   resolveDeadLetterDir,
+  resolveEventsLogDir,
   resolveSockPath,
 } from "../../src/db";
 import { parsePlanRef } from "../../src/derivers";
@@ -152,7 +156,19 @@ export type Category =
   // fn-733: backstop-self-telemetry ingest (a degrading rescue or a rising
   // missed-wake counter) + event→projection fold latency over the realtime bar.
   | "backstop-degraded"
-  | "fold-latency";
+  | "fold-latency"
+  // fn-766 task 2 — the watches the post-roadmap signal landscape proved
+  // missing. `duplicate-live-workers` is the LOAD-BEARING re-fire tripwire
+  // (>1 live pid on one plan_ref — the 2026-06-09 triple-dispatch class that a
+  // hand-rolled tripwire, not the sitter, caught); `poison-arrivals` watches the
+  // fn-762 dead-letter poison-parking surface; `events-log-backlog` watches the
+  // fn-736 NDJSON→events ingest for a wedge; `db-growth` watches the keeper.db /
+  // WAL footprint; `keeperd-cpu` watches the fn-748 144%-CPU regression class.
+  | "duplicate-live-workers"
+  | "poison-arrivals"
+  | "events-log-backlog"
+  | "db-growth"
+  | "keeperd-cpu";
 
 /**
  * One detected condition. `key` is a human-stable per-condition id; the
@@ -228,6 +244,13 @@ export interface JobRow {
   pid: number | null;
   created_at: number;
   title: string | null;
+  /**
+   * The plan entity this job is bound to (`epic_id` for a plan/close-verb job,
+   * `task_id` for a work-verb job) — the re-fire correlation key
+   * `detectDuplicateLiveWorkers` groups on. `null` for a non-plan job (ambient
+   * session). The `idx_jobs_plan_ref` partial index serves the grouping scan.
+   */
+  plan_ref: string | null;
 }
 
 /** The single `autopilot_state` row (id=1). */
@@ -271,6 +294,32 @@ export const STUCK_JOB_MIN_AGE_SECS = 5 * 60;
 /** Non-terminal job states a live worker should be backing. */
 export const NON_TERMINAL_JOB_STATES = new Set(["working", "stopped"]);
 
+// --- fn-766 task 2: the watches the incident proved missing ---
+/**
+ * events-log-backlog: a per-pid `<pid>.ndjson` events-log file whose on-disk
+ * size exceeds the daemon's stored ingest `offset` by MORE than this many bytes
+ * has un-ingested tail — a transient lag of a few unflushed lines is normal, so
+ * a small slack avoids paging on a healthy in-flight append. Held across ticks
+ * (a genuinely-wedged ingester stays behind; a transient append catches up).
+ */
+export const EVENTS_LOG_BACKLOG_SLACK_BYTES = 64 * 1024;
+/**
+ * db-growth: the keeper.db WAL is checkpointed routinely, so a WAL this large
+ * means checkpointing has stalled (the DB is effectively unbounded-growing) —
+ * the operator-visible disk-footprint class. A generous 1 GiB ceiling: the
+ * healthy WAL is single-digit MB, so this only fires on a genuine wedge, never
+ * normal churn. info-severity (a slow-burn footprint signal, not an outage).
+ */
+export const WAL_CEILING_BYTES = 1024 * 1024 * 1024;
+/**
+ * keeperd-cpu: sustained keeperd %CPU over this bar is the fn-748 144%-CPU
+ * regression class (the git-worker's `data_version` fan-out pegged the daemon
+ * under multi-agent load). 25% held ≥`HELD_TICKS_THRESHOLD` ticks: a brief spike
+ * during a fold burst is normal, sustained 25%+ is a busy-loop. The probe is the
+ * one new external input — a single `ps -o %cpu` fork per tick, read-only.
+ */
+export const KEEPERD_CPU_THRESHOLD_PCT = 25;
+
 // --- backstop-degraded (fn-733) ---
 /**
  * backstop-degraded: a `backstop-rescue` whose `staleness_ms` is this high
@@ -299,6 +348,17 @@ export const STALENESS_ALARM = 30_000;
  * (`delta = current`, no fire), so a restart never false-pages.
  */
 export const MISSED_WAKE_DELTA = 1;
+/**
+ * Per-name carve-out (fn-766 task 2): the `events-ingest-poison` backstop
+ * (fn-762 — a poison NDJSON line the events-log ingester quarantined) pages on
+ * the FIRST rescue delta, not the generic `MISSED_WAKE_DELTA` (>1) bar. A poison
+ * line is a hard ingest fault (malformed hook NDJSON / a parser skew), not a
+ * timing miss, so even one is worth a look — paired with the `poison-arrivals`
+ * dead-letter-count watch. The fire is INCLUSIVE (`delta >= this`), unlike the
+ * generic missed-wake's EXCLUSIVE (`delta > MISSED_WAKE_DELTA`) bar.
+ */
+export const POISON_BACKSTOP_NAME = "events-ingest-poison";
+export const POISON_BACKSTOP_MIN_DELTA = 1;
 
 // --- fold-latency (fn-733) ---
 /**
@@ -594,6 +654,185 @@ export function detectStuckJobs(input: {
     });
   }
   return findings;
+}
+
+/**
+ * duplicate-live-workers (fn-766 task 2, CRITICAL): the LOAD-BEARING re-fire
+ * tripwire. GROUP non-terminal `jobs` by `plan_ref` (non-null), count rows whose
+ * `pid` passes the injected `isAlive`, and fire when >1 LIVE worker backs one
+ * plan_ref — the 2026-06-09 triple-dispatch signature that a hand-rolled
+ * tripwire, not the sitter, caught. This SUPERSEDES `dup-dispatch` (an
+ * event-count heuristic that legitimately reads 2 after an `aborted-prelaunch`
+ * cooldown clear) as the authoritative detector: it checks LIVE pids, not event
+ * history, so it can't false-fire on a re-dispatch that never produced two live
+ * workers.
+ *
+ * The `isAlive` probe is INJECTED (cf. `detectStuckJobs`) so the detector is
+ * pure and testable; the scanner is an external observer, so probing liveness
+ * here is fine (it is NOT a fold). Pages IMMEDIATELY (not held-across-ticks): two
+ * live workers on one plan_ref is never a transient blip worth waiting out — by
+ * the time a second tick confirms it, both have been racing the same worktree.
+ *
+ * The resource id is the `plan_ref` (singleton per group) so the fingerprint is
+ * stable across ticks while the pair persists; pids/counts are evidence only.
+ * One finding per offending plan_ref, deterministic order (plan_ref ascending).
+ */
+export function detectDuplicateLiveWorkers(input: {
+  jobs: JobRow[];
+  isAlive: (pid: number) => boolean;
+}): Finding[] {
+  // Group live pids by plan_ref over the non-terminal, plan-bound jobs.
+  const livePidsByRef = new Map<string, number[]>();
+  for (const j of input.jobs) {
+    if (!NON_TERMINAL_JOB_STATES.has(j.state)) continue;
+    if (j.plan_ref === null) continue;
+    if (j.pid === null) continue;
+    if (!input.isAlive(j.pid)) continue;
+    const list = livePidsByRef.get(j.plan_ref) ?? [];
+    list.push(j.pid);
+    livePidsByRef.set(j.plan_ref, list);
+  }
+
+  const findings: Finding[] = [];
+  for (const ref of [...livePidsByRef.keys()].sort()) {
+    // biome-ignore lint/style/noNonNullAssertion: ref came from the map
+    const pids = livePidsByRef
+      .get(ref)!
+      .slice()
+      .sort((a, b) => a - b);
+    if (pids.length <= 1) continue;
+    findings.push({
+      key: `duplicate-live-workers:${ref}`,
+      fingerprint: fingerprint("duplicate-live-workers", ref),
+      severity: "critical",
+      category: "duplicate-live-workers",
+      title: `${pids.length} live workers on ${ref}`,
+      detail: `${pids.length} live workers back plan_ref ${ref} (pids ${pids.join(", ")}) — the re-fire signature (two workers racing one worktree)`,
+      evidence: { planRef: ref, livePids: pids, liveCount: pids.length },
+    });
+  }
+  return findings;
+}
+
+/**
+ * poison-arrivals (fn-766 task 2, warning): the count of `dead_letters` rows with
+ * `status='poison'` (the fn-762 events-ingest poison-parking surface). A poison
+ * line is one the events-log ingester could not parse and quarantined; a RISING
+ * count means the hook is emitting malformed NDJSON or the ingester's parser
+ * skewed. Like `detectDeadLetterGrowth` this emits a finding carrying the current
+ * count; the POSITIVE-DELTA gate (page only when the count rose vs the stored
+ * baseline) lands in {@link applyHeldGate} (it needs the seen-state baseline the
+ * pure detector can't hold). A zero count is healthy → no finding.
+ *
+ * Fingerprint keyed on the singleton surface so the count never enters it.
+ */
+export function detectPoisonArrivals(input: { count: number }): Finding[] {
+  if (input.count <= 0) return [];
+  return [
+    {
+      key: "poison-arrivals",
+      fingerprint: fingerprint("poison-arrivals", "dead-letters-poison"),
+      severity: "warning",
+      category: "poison-arrivals",
+      title: `${input.count} poison-parked dead-letter(s)`,
+      detail: `${input.count} dead_letters row(s) with status='poison' — the events-log ingester quarantined unparseable line(s)`,
+      evidence: { count: input.count },
+    },
+  ];
+}
+
+/**
+ * events-log-backlog (fn-766 task 2, warning): the daemon's NDJSON→events
+ * ingester tails each per-pid `<pid>.ndjson` file from a stored byte `offset`
+ * (`event_ingest_offsets`). A file whose on-disk `size` exceeds its stored
+ * `offset` by more than `EVENTS_LOG_BACKLOG_SLACK_BYTES` has un-ingested tail —
+ * a wedged / backlogged ingester. The `(path, size, offset)` tuples are computed
+ * by the DB layer (join `event_ingest_offsets` against `statSync` of each file)
+ * and PASSED IN so this detector stays pure.
+ *
+ * Held across ticks (see {@link HELD_TICK_CATEGORIES}): a few un-flushed lines
+ * mid-append is normal slack; only a backlog that PERSISTS is a wedge. One
+ * finding per backlogged path, deterministic order (path ascending).
+ */
+export function detectEventsLogBacklog(input: {
+  files: { path: string; size: number; offset: number }[];
+}): Finding[] {
+  const findings: Finding[] = [];
+  for (const f of input.files
+    .slice()
+    .sort((a, b) => a.path.localeCompare(b.path))) {
+    const lag = f.size - f.offset;
+    if (lag <= EVENTS_LOG_BACKLOG_SLACK_BYTES) continue;
+    findings.push({
+      key: `events-log-backlog:${f.path}`,
+      fingerprint: fingerprint("events-log-backlog", f.path),
+      severity: "warning",
+      category: "events-log-backlog",
+      title: `Events-log ingest behind by ${lag}B`,
+      detail: `${f.path} is ${f.size}B on disk but the ingest offset is ${f.offset}B (${lag}B un-ingested, > ${EVENTS_LOG_BACKLOG_SLACK_BYTES}B slack) — the ingester may be wedged`,
+      evidence: { path: f.path, size: f.size, offset: f.offset, lagBytes: lag },
+    });
+  }
+  return findings;
+}
+
+/**
+ * db-growth (fn-766 task 2, info): the keeper.db WAL is checkpointed routinely,
+ * so a WAL over `WAL_CEILING_BYTES` means checkpointing stalled and the file is
+ * growing unbounded — the operator-visible disk-footprint class. The byte sizes
+ * are PASSED IN (the DB layer `statSync`s `dbPath` + `dbPath-wal`) so this
+ * detector stays pure. info-severity — a slow-burn footprint signal, not an
+ * outage. Fingerprint keyed on the singleton DB so the byte counts never enter
+ * it. (A `null` WAL size — the file is absent — is healthy: no finding.)
+ */
+export function detectDbGrowth(input: {
+  dbBytes: number;
+  walBytes: number | null;
+}): Finding[] {
+  if (input.walBytes === null || input.walBytes <= WAL_CEILING_BYTES) return [];
+  return [
+    {
+      key: "db-growth",
+      fingerprint: fingerprint("db-growth", "keeper-db"),
+      severity: "info",
+      category: "db-growth",
+      title: `WAL ${Math.round(input.walBytes / (1024 * 1024))}MB`,
+      detail: `keeper.db WAL is ${input.walBytes}B (> ${WAL_CEILING_BYTES}B ceiling) — checkpointing may have stalled (DB ${input.dbBytes}B)`,
+      evidence: {
+        dbBytes: input.dbBytes,
+        walBytes: input.walBytes,
+        ceilingBytes: WAL_CEILING_BYTES,
+      },
+    },
+  ];
+}
+
+/**
+ * keeperd-cpu (fn-766 task 2, warning, held 3 ticks): sustained keeperd %CPU
+ * over `KEEPERD_CPU_THRESHOLD_PCT` is the fn-748 144%-CPU regression class. The
+ * sampled %CPU is PASSED IN (the DB layer `ps -o %cpu`s the pgrep'd pid) so this
+ * detector stays pure; `null` (no keeperd / probe failure) is healthy here
+ * (daemon-down is a separate detector). Held across ticks: a brief fold-burst
+ * spike is normal, sustained 25%+ is a busy-loop. Singleton fingerprint.
+ */
+export function detectKeeperdCpu(input: { cpuPct: number | null }): Finding[] {
+  if (input.cpuPct === null || input.cpuPct <= KEEPERD_CPU_THRESHOLD_PCT) {
+    return [];
+  }
+  return [
+    {
+      key: "keeperd-cpu",
+      fingerprint: fingerprint("keeperd-cpu", "keeperd"),
+      severity: "warning",
+      category: "keeperd-cpu",
+      title: `keeperd CPU ${Math.round(input.cpuPct)}%`,
+      detail: `keeperd is at ${input.cpuPct}% CPU (> ${KEEPERD_CPU_THRESHOLD_PCT}% bar) — the fn-748 busy-loop class (a data_version fan-out or hot poll)`,
+      evidence: {
+        cpuPct: input.cpuPct,
+        thresholdPct: KEEPERD_CPU_THRESHOLD_PCT,
+      },
+    },
+  ];
 }
 
 // ---------------------------------------------------------------------------
@@ -997,9 +1236,20 @@ export function detectBackstopTelemetry(input: {
         const delta = isReset
           ? row.rescues_total
           : row.rescues_total - baseRescues;
+        // Per-name carve-out (fn-766): the events-ingest-poison backstop pages
+        // on the FIRST rescue delta (INCLUSIVE `>= POISON_BACKSTOP_MIN_DELTA`) —
+        // a poison line is a hard ingest fault, not a timing miss; the generic
+        // missed-wake fires on the EXCLUSIVE `> MISSED_WAKE_DELTA` bar.
+        const isPoison = row.backstop === POISON_BACKSTOP_NAME;
+        const effectiveThreshold = isPoison
+          ? POISON_BACKSTOP_MIN_DELTA
+          : MISSED_WAKE_DELTA;
+        const overBar = isPoison
+          ? delta >= effectiveThreshold
+          : delta > effectiveThreshold;
         // A reset (current < baseline) re-seeds and does NOT fire even if
         // current is large — that's a restart, not a regression.
-        if (!isReset && delta > MISSED_WAKE_DELTA) {
+        if (!isReset && overBar) {
           findings.push({
             key: `backstop-missed-wake:${bucket}`,
             fingerprint: fingerprint(
@@ -1008,12 +1258,16 @@ export function detectBackstopTelemetry(input: {
             ),
             severity: "warning",
             category: "backstop-degraded",
-            title: `Backstop ${bucket} rescued ${delta}x since baseline`,
-            detail: `${row.backstop}/${row.class} rescues_total rose by ${delta} (${baseRescues}→${row.rescues_total}, > ${MISSED_WAKE_DELTA}) — ${
-              row.class === "timeout"
-                ? "a dispatch/confirm/sweep timeout keeps elapsing"
-                : "a fast path is dropping wake-ups"
-            }`,
+            title: isPoison
+              ? `Events-ingest poison rescued ${delta}x since baseline`
+              : `Backstop ${bucket} rescued ${delta}x since baseline`,
+            detail: isPoison
+              ? `${row.backstop}/${row.class} rescues_total rose by ${delta} (${baseRescues}→${row.rescues_total}, ≥ ${effectiveThreshold}) — the events-log ingester quarantined a poison NDJSON line (malformed hook output or a parser skew)`
+              : `${row.backstop}/${row.class} rescues_total rose by ${delta} (${baseRescues}→${row.rescues_total}, > ${effectiveThreshold}) — ${
+                  row.class === "timeout"
+                    ? "a dispatch/confirm/sweep timeout keeps elapsing"
+                    : "a fast path is dropping wake-ups"
+                }`,
             evidence: {
               backstop: row.backstop,
               class: row.class,
@@ -1022,7 +1276,7 @@ export function detectBackstopTelemetry(input: {
               currentRescues: row.rescues_total,
               baselineFires: base?.fires_total ?? null,
               currentFires: row.fires_total,
-              threshold: MISSED_WAKE_DELTA,
+              threshold: effectiveThreshold,
             },
           });
         }
@@ -1075,6 +1329,27 @@ export interface ScanDeps {
     load: () => BackstopBaseline;
     save: (next: BackstopBaseline) => void;
   };
+  /**
+   * fn-766 task 2 — disk footprint of the keeper.db + its `-wal` sidecar (the
+   * `db-growth` watch). Injected impurity (a `statSync` of each file); a missing
+   * WAL resolves `walBytes: null` (healthy). `undefined` keeps the watch OFF
+   * (older callers stay inert).
+   */
+  dbSizes?: () => { dbBytes: number; walBytes: number | null };
+  /**
+   * fn-766 task 2 — per-pid events-log files joined to their stored ingest
+   * offset (the `events-log-backlog` watch). The DB layer reads
+   * `event_ingest_offsets` and `statSync`s each file; this lifts that out so the
+   * pure detector sees only `(path, size, offset)`. `undefined` keeps it OFF.
+   */
+  eventsLogFiles?: () => { path: string; size: number; offset: number }[];
+  /**
+   * fn-766 task 2 — sampled keeperd %CPU (the `keeperd-cpu` watch). The one new
+   * external input: a single `ps -o %cpu` fork per tick against the pgrep'd pid.
+   * `null` (no keeperd / probe failure) is healthy here. `undefined` keeps the
+   * watch OFF (older callers stay inert).
+   */
+  keeperdCpu?: () => number | null;
 }
 
 /** Run all the detectors over a bounded read-only scan of the live DB. */
@@ -1104,7 +1379,7 @@ export async function scan(
       .all() as DispatchFailureRow[];
 
     const jobs = db
-      .query("SELECT job_id, state, pid, created_at, title FROM jobs")
+      .query("SELECT job_id, state, pid, created_at, title, plan_ref FROM jobs")
       .all() as JobRow[];
 
     const autopilot = db
@@ -1161,6 +1436,19 @@ export async function scan(
     const socketReachable = await deps.socketReachable();
     const keeperdAlive = deps.keeperdAlive();
 
+    // poison-arrivals (fn-766): the count of dead_letters parked with
+    // status='poison' (the fn-762 events-ingest poison surface). Degrade-don't-
+    // throw: a pre-fn-643 DB without the `status` column → treat as 0.
+    let poisonCount = 0;
+    try {
+      const poisonRow = db
+        .query("SELECT COUNT(*) AS n FROM dead_letters WHERE status = 'poison'")
+        .get() as { n: number };
+      poisonCount = poisonRow.n;
+    } catch {
+      poisonCount = 0;
+    }
+
     const findings: Finding[] = [
       ...detectDupDispatch(events),
       ...detectDispatchFailures(dispatchFailures),
@@ -1180,7 +1468,27 @@ export async function scan(
       ...detectStuckJobs({ jobs, nowSecs, isAlive: deps.isAlive }),
       // fold-latency: pure over the event window (op→first-matching snapshot).
       ...detectFoldLatency(events),
+      // fn-766 task 2: the LOAD-BEARING re-fire tripwire — >1 live worker on one
+      // plan_ref. Reads jobs + the already-injected isAlive (no new input).
+      ...detectDuplicateLiveWorkers({ jobs, isAlive: deps.isAlive }),
+      // fn-766 task 2: poison-parked dead-letter count (delta-gated downstream).
+      ...detectPoisonArrivals({ count: poisonCount }),
     ];
+
+    // fn-766 task 2 — the three watches needing an injected external probe. Each
+    // stays OFF for a caller that didn't wire it (older callers / quiet tests),
+    // mirroring the readBackstop pattern; never throws if the probe is present.
+    if (deps.dbSizes !== undefined) {
+      findings.push(...detectDbGrowth(deps.dbSizes()));
+    }
+    if (deps.eventsLogFiles !== undefined) {
+      findings.push(
+        ...detectEventsLogBacklog({ files: deps.eventsLogFiles() }),
+      );
+    }
+    if (deps.keeperdCpu !== undefined) {
+      findings.push(...detectKeeperdCpu({ cpuPct: deps.keeperdCpu() }));
+    }
 
     // backstop-degraded: ingest keeper's OWN backstop self-telemetry. The read
     // + the baseline persistence are injected (so the detector stays pure); a
@@ -1309,9 +1617,102 @@ export function readBackstopLog(path: string): {
   }
 }
 
+/**
+ * fn-766 task 2 — sampled keeperd %CPU for the `keeperd-cpu` watch. Two
+ * best-effort forks: `pgrep -f src/daemon.ts` for the pid, then `ps -o %cpu= -p
+ * <pid>` for its instantaneous CPU. Any miss / non-numeric / spawn failure
+ * resolves `null` (healthy — daemon-down is a separate detector). The one new
+ * external input the epic flagged; read-only, no DB touch.
+ */
+export function probeKeeperdCpu(): number | null {
+  try {
+    const pg = Bun.spawnSync(["pgrep", "-f", "src/daemon.ts"], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (pg.exitCode !== 0) return null;
+    const pid = pg.stdout.toString().trim().split(/\s+/)[0];
+    if (pid === undefined || pid.length === 0) return null;
+    const ps = Bun.spawnSync(["ps", "-o", "%cpu=", "-p", pid], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (ps.exitCode !== 0) return null;
+    const cpu = Number(ps.stdout.toString().trim());
+    return Number.isFinite(cpu) ? cpu : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * fn-766 task 2 — keeper.db + `-wal` byte sizes for the `db-growth` watch.
+ * `statSync` of each file; an absent WAL resolves `walBytes: null` (healthy). A
+ * stat failure on the DB itself resolves `dbBytes: 0` (degrade-don't-throw).
+ */
+export function readDbSizes(dbPath: string): {
+  dbBytes: number;
+  walBytes: number | null;
+} {
+  let dbBytes = 0;
+  try {
+    dbBytes = statSync(dbPath).size;
+  } catch {
+    dbBytes = 0;
+  }
+  let walBytes: number | null = null;
+  try {
+    walBytes = statSync(`${dbPath}-wal`).size;
+  } catch {
+    walBytes = null;
+  }
+  return { dbBytes, walBytes };
+}
+
+/**
+ * fn-766 task 2 — the per-pid events-log files joined to their stored ingest
+ * offset, for the `events-log-backlog` watch. Opens its OWN read-only connection
+ * (the same external-observer posture as the main scan; never writes) to read
+ * `event_ingest_offsets`, then `statSync`s each `<events-log-dir>/<path>`. A row
+ * whose file is absent / unreadable is skipped (degrade-don't-throw); the whole
+ * probe resolves `[]` on any failure so the watch stays inert rather than
+ * crashing the tick. The stored `path` is the basename the daemon recorded.
+ */
+export function readEventsLogFiles(
+  dbPath: string,
+  eventsLogDir: string,
+): { path: string; size: number; offset: number }[] {
+  let rows: { path: string; offset: number }[] = [];
+  try {
+    const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
+    try {
+      rows = db
+        .query("SELECT path, offset FROM event_ingest_offsets")
+        .all() as { path: string; offset: number }[];
+    } finally {
+      db.close();
+    }
+  } catch {
+    return [];
+  }
+  const out: { path: string; size: number; offset: number }[] = [];
+  for (const r of rows) {
+    // The stored `path` may be a basename or an absolute path; resolve both.
+    const full = r.path.startsWith("/") ? r.path : join(eventsLogDir, r.path);
+    try {
+      const size = statSync(full).size;
+      out.push({ path: full, size, offset: r.offset });
+    } catch {
+      // File gone / unreadable — the ingester rotated it; nothing to backlog.
+    }
+  }
+  return out;
+}
+
 /** Production {@link ScanDeps} wiring the live probes. */
 export function liveDeps(): ScanDeps {
   const backstopBaselinePath = resolveBackstopBaselinePath();
+  const dbPath = resolveDbPath();
   return {
     isAlive: isPidAlive,
     socketReachable: () => probeSocket(resolveSockPath()),
@@ -1323,6 +1724,9 @@ export function liveDeps(): ScanDeps {
       load: () => loadBackstopBaseline(backstopBaselinePath),
       save: (next) => saveBackstopBaseline(backstopBaselinePath, next),
     },
+    dbSizes: () => readDbSizes(dbPath),
+    eventsLogFiles: () => readEventsLogFiles(dbPath, resolveEventsLogDir()),
+    keeperdCpu: probeKeeperdCpu,
   };
 }
 
@@ -1486,13 +1890,33 @@ export function saveSeenState(path: string, state: SeenState): void {
 
 /**
  * Categories whose escalation is gated on persistence/delta rather than on a
- * single present scan. reducer-wedge / autopilot-stall require the condition
- * to have held ≥`HELD_TICKS_THRESHOLD` consecutive ticks; dead-letter-growth
- * requires a POSITIVE delta vs the stored baseline count.
+ * single present scan. reducer-wedge / autopilot-stall / events-log-backlog /
+ * keeperd-cpu require the condition to have held ≥`HELD_TICKS_THRESHOLD`
+ * consecutive ticks; dead-letter-growth / poison-arrivals require a POSITIVE
+ * delta vs the stored baseline count.
+ *
+ * fn-766 task 2 additions: `events-log-backlog` (a few un-flushed bytes mid-
+ * append is normal — only a PERSISTENT backlog is a wedge) and `keeperd-cpu` (a
+ * brief fold-burst spike is normal — only SUSTAINED 25%+ is the fn-748 busy-loop
+ * class) are held; `poison-arrivals` is delta-gated like `dead-letter-growth`.
+ * `duplicate-live-workers` is deliberately NOT here — two live workers on one
+ * plan_ref pages IMMEDIATELY (it's the load-bearing re-fire tripwire).
  */
 const HELD_TICK_CATEGORIES = new Set<Category>([
   "reducer-wedge",
   "autopilot-stall",
+  "events-log-backlog",
+  "keeperd-cpu",
+]);
+
+/**
+ * Categories whose escalation requires a POSITIVE delta vs the stored baseline
+ * `count` (seeds silently on first observation, fires when the count rises).
+ * Both watch a monotonically-meaningful count surface.
+ */
+const DELTA_GATE_CATEGORIES = new Set<Category>([
+  "dead-letter-growth",
+  "poison-arrivals",
 ]);
 
 /**
@@ -1525,7 +1949,7 @@ export function applyHeldGate(
       if (held >= HELD_TICKS_THRESHOLD) gated.push(f);
       continue;
     }
-    if (f.category === "dead-letter-growth") {
+    if (DELTA_GATE_CATEGORIES.has(f.category)) {
       const current = Number(f.evidence.count ?? 0);
       counts.set(f.fingerprint, current);
       const baseline = prior.fingerprints[f.fingerprint]?.count;
