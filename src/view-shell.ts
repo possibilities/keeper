@@ -358,6 +358,24 @@ export interface ViewShell<TSnap> {
    * guards the frame-vs-timeout race so the snapshot resolves once.
    */
   runSnapshot: (onDispose: () => void) => void;
+  /**
+   * Multi-stream snapshot readiness report (fn-772). `view.emit` auto-reports
+   * the FIRST stream to the latch (covers single-stream views like git/jobs
+   * with zero extra wiring). A multi-stream view (board=2, autopilot=4)
+   * subscribes ADDITIONAL streams whose first data callback must each report
+   * once so the latch holds the snapshot until the WHOLE composite is folded
+   * — not just the readiness stream. The caller wires this into each
+   * secondary stream's first `onRows`/`onSnapshot` (one report per secondary
+   * stream: `streamCount - 1` reports total, since `emit` covers the first).
+   *
+   * Per-stream once-ness is the caller's concern (mirrors the latch's
+   * `reportStream` contract): a secondary stream that fires its data callback
+   * repeatedly before the latch settles must gate itself so it reports exactly
+   * once. A report after the latch settled is a safe no-op. Inert in live
+   * mode (no latch armed) — safe to call unconditionally from the shared
+   * subscription wiring.
+   */
+  reportSnapshotStream: () => void;
   /** Last frame text emitted (lead + body), for `handleCopyKey` callers. */
   getLastFrameText: () => string | null;
   /** Current frame index (1-based; 0 before the first emit). */
@@ -414,6 +432,14 @@ export function createViewShell<TSnap>(
   let snapshotCapture: { bodyLines: string[]; stateJson: unknown } | null =
     null;
   let latchReported = false;
+  // fn-772: explicit per-stream reports (`reportSnapshotStream`) made by a
+  // multi-stream view's SECONDARY streams. `emit` auto-reports the first
+  // stream; each additional stream reports once here. Buffered until
+  // `runSnapshot` arms `reportLatch` (a secondary `onRows` may fire before
+  // `runSnapshot` runs), then replayed — same shape as `latchReported`'s
+  // replay. Inert in live mode (`isSnapshot` false → never armed → buffer
+  // unused).
+  let pendingExtraReports = 0;
   // Track whether the subscription ever reported `connected` so the no-frame
   // path can distinguish `timeout` (connected, daemon serving, but no frame
   // before the deadline) from `daemon-unreachable` (never connected).
@@ -422,7 +448,10 @@ export function createViewShell<TSnap>(
   // so an `emit` that races ahead of `runSnapshot` (shouldn't happen — the
   // caller wires subscriptions then calls `runSnapshot` synchronously) is
   // still captured into `snapshotCapture`; `runSnapshot` replays the report.
-  let reportLatch: () => void = () => {};
+  // The named sentinel lets `reportSnapshotStream` detect the not-yet-armed
+  // state (identity compare) and buffer a secondary report for replay.
+  const noopReportLatch = (): void => {};
+  let reportLatch: () => void = noopReportLatch;
 
   // Connecting-indicator spinner state. A single `setInterval` (~125ms)
   // animates the braille dots and re-polls the re-fold poller until the
@@ -926,6 +955,29 @@ export function createViewShell<TSnap>(
     if (latchReported) {
       latch.reportStream();
     }
+    // fn-772: replay any secondary-stream reports that landed before the
+    // latch was armed (a multi-stream view's `onRows` racing `runSnapshot`).
+    for (let i = 0; i < pendingExtraReports; i += 1) {
+      latch.reportStream();
+    }
+    pendingExtraReports = 0;
+  }
+
+  // fn-772: a multi-stream view's SECONDARY stream reports its first frame
+  // here. `emit` covers the first stream's report; each additional stream
+  // calls this once so the latch holds until the WHOLE composite is folded.
+  // Inert in live mode. Buffered until `runSnapshot` arms the latch, then
+  // replayed (mirrors the `latchReported` replay for the primary stream).
+  function reportSnapshotStream(): void {
+    if (!isSnapshot) {
+      return;
+    }
+    if (reportLatch === noopReportLatch) {
+      // Latch not armed yet — buffer and replay in `runSnapshot`.
+      pendingExtraReports += 1;
+      return;
+    }
+    reportLatch();
   }
 
   return {
@@ -940,6 +992,7 @@ export function createViewShell<TSnap>(
     colorEnabled,
     installSigintHandler,
     runSnapshot,
+    reportSnapshotStream,
     getLastFrameText: () => lastFrameText,
     getFrameCount: () => frameCount,
   };

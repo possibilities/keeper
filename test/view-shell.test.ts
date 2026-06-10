@@ -918,3 +918,137 @@ test("snapshot: a frame racing the timeout resolves exactly once (no double-exit
   h.fireTimeout();
   expect(h.exits).toEqual([0]);
 });
+
+// ---------------------------------------------------------------------------
+// fn-772 (task .2): multi-stream `reportSnapshotStream` — the latch holds the
+// snapshot until EVERY subscribed stream reports its first frame. `view.emit`
+// auto-reports the FIRST stream (covers single-stream git/jobs); a
+// multi-stream view (board=2, autopilot=4) wires each ADDITIONAL stream's
+// first data callback into `reportSnapshotStream` so the captured composite
+// is fully folded, not ordering-luck. These drive the latch synchronously via
+// the injected timer harness, mirroring the single-stream cases above.
+// ---------------------------------------------------------------------------
+
+test("snapshot multi-stream: latch holds until BOTH streams report (board, streamCount 2)", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 2,
+    snapshotIo: h.io,
+  });
+  // Stream 1 (readiness): the first emit auto-reports.
+  view.emit({ body: ["epic block", "[armed]"] });
+  view.runSnapshot(() => {
+    h.disposed += 1;
+  });
+  // Only 1 of 2 reported — NOT settled yet (no exit, timer still live).
+  expect(h.exits).toEqual([]);
+  expect(h.timeoutCleared).toBe(0);
+  // Stream 2 (armed_epics): the explicit report satisfies the latch → exit 0,
+  // ready (truncated:false), and the timer is cleared.
+  expect(() => view?.reportSnapshotStream()).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+  expect(h.disposed).toBe(1);
+  // The timer is cleared on the ready path (idempotent — the latch's own
+  // resolve + runSnapshot's finish both clear it; at least once).
+  expect(h.timeoutCleared).toBeGreaterThanOrEqual(1);
+  const joined = h.stdout.join("");
+  // The `[armed]` pill is deterministically present (the latch held for it).
+  expect(joined).toContain("[armed]");
+  const trailer = parseSnapshotTrailer(joined);
+  expect(trailer.status).toBe("ok");
+  expect(trailer.truncated).toBe(false);
+  expect(trailer.frame).toBe(1);
+});
+
+test("snapshot multi-stream: a secondary report BEFORE runSnapshot is buffered + replayed", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 2,
+    snapshotIo: h.io,
+  });
+  // Both streams report BEFORE runSnapshot arms the latch — the primary via
+  // `emit`'s auto-report buffer (`latchReported`) and the secondary via the
+  // `pendingExtraReports` buffer. runSnapshot must replay BOTH so the snapshot
+  // resolves synchronously without waiting out the timeout.
+  view.emit({ body: ["composite row"] });
+  view.reportSnapshotStream();
+  expect(() =>
+    view?.runSnapshot(() => {
+      h.disposed += 1;
+    }),
+  ).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+  const trailer = parseSnapshotTrailer(h.stdout.join(""));
+  expect(trailer.truncated).toBe(false);
+  expect(trailer.status).toBe("ok");
+});
+
+test("snapshot multi-stream: all four streams report (autopilot, streamCount 4)", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 4,
+    snapshotIo: h.io,
+  });
+  // Stream 1 (readiness) auto-reports via emit; the other three report
+  // explicitly. The latch must hold until ALL FOUR land.
+  view.emit({ body: ["folded mode + armed + failed"] });
+  view.runSnapshot(() => {
+    h.disposed += 1;
+  });
+  expect(h.exits).toEqual([]); // 1/4
+  view.reportSnapshotStream(); // dispatch_failures → 2/4
+  expect(h.exits).toEqual([]);
+  view.reportSnapshotStream(); // autopilot_state → 3/4
+  expect(h.exits).toEqual([]);
+  // armed_epics → 4/4 → satisfied, exit 0.
+  expect(() => view?.reportSnapshotStream()).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+  const trailer = parseSnapshotTrailer(h.stdout.join(""));
+  expect(trailer.status).toBe("ok");
+  expect(trailer.truncated).toBe(false);
+});
+
+test("snapshot multi-stream: partial composite on timeout marks truncated:true (streamCount 4, 2 reported)", () => {
+  const h = makeSnapshotHarness();
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "snapshot",
+    streamCount: 4,
+    snapshotIo: h.io,
+  });
+  view.emit({ body: ["partial 1/4"] }); // stream 1 (auto)
+  view.runSnapshot(() => {
+    h.disposed += 1;
+  });
+  view.reportSnapshotStream(); // 2/4 — still short of 4
+  expect(h.exits).toEqual([]);
+  // The timeout fires with a partial composite (≥1 reported) → exit 0,
+  // truncated:true (a degrade, not a no-frame).
+  expect(() => h.fireTimeout()).toThrow("__SNAPSHOT_EXIT_0__");
+  expect(h.exits).toEqual([0]);
+  const trailer = parseSnapshotTrailer(h.stdout.join(""));
+  expect(trailer.status).toBe("ok");
+  expect(trailer.truncated).toBe(true);
+  expect(trailer.frame).toBe(1);
+});
+
+test("snapshot: reportSnapshotStream is inert in live mode (no latch armed)", () => {
+  // In live mode no latch is armed; `reportSnapshotStream` must be a safe
+  // no-op so the shared subscription wiring can call it unconditionally.
+  view = createViewShell<{ body: string[] }>({
+    script: sidecarBase,
+    renderBody,
+    mode: "live",
+  });
+  expect(() => view?.reportSnapshotStream()).not.toThrow();
+});

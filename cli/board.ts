@@ -109,6 +109,7 @@ import {
   subscribeReadiness,
 } from "../src/readiness-client";
 import { appendDiagnostic } from "../src/readiness-diagnostics";
+import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import type {
   Epic,
   JobLinkEntry,
@@ -137,10 +138,17 @@ export {
 
 const HELP = `keeper board — epics-only UI over the keeper subscribe server
 
-Usage: keeper board [--sock <path>]
+Usage: keeper board [--sock <path>] [--snapshot | --watch] [--timeout <s>]
 
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
+  --snapshot       Force one-shot snapshot mode (print one frame + a
+                   machine-parseable keeper-meta: line, then exit) even on a TTY
+  --watch          Force the live subscribe stream even when piped
+  --timeout <s>    Snapshot wait before the timeout escape (default ~2s)
   --help           Show this help
+
+By default, stdout that is NOT a TTY (piped into an agent) auto-detects
+snapshot mode; a TTY gets the live TUI. \`CI\` / \`TERM=dumb\` force snapshot.
 
 Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
@@ -570,6 +578,11 @@ export async function main(argv: string[]): Promise<void> {
     args: argv,
     options: {
       sock: { type: "string" },
+      snapshot: { type: "boolean", default: false },
+      watch: { type: "boolean", default: false },
+      // parseArgs has no number type — capture as a string and validate
+      // manually below (exit 2 on a non-positive / non-numeric value).
+      timeout: { type: "string" },
       help: { type: "boolean", default: false },
     },
     allowPositionals: false,
@@ -578,6 +591,38 @@ export async function main(argv: string[]): Promise<void> {
   if (values.help) {
     process.stdout.write(HELP);
     process.exit(0);
+  }
+
+  // Resolve the run mode (flag > CI/TERM=dumb > stdout.isTTY !== true).
+  // Both `--snapshot` and `--watch` → typed misuse error → exit 2.
+  let mode: "snapshot" | "watch";
+  try {
+    mode = resolveSnapshotMode({
+      snapshotFlag: values.snapshot ?? false,
+      watchFlag: values.watch ?? false,
+      stdoutIsTTY: process.stdout.isTTY,
+      env: process.env,
+    });
+  } catch (err) {
+    if (err instanceof SnapshotCliMisuseError) {
+      process.stderr.write(`keeper board: ${err.message}\n`);
+      process.exit(2);
+    }
+    throw err;
+  }
+
+  // Validate `--timeout` (seconds) only when snapshotting — a bad value is
+  // CLI misuse (exit 2). Watch mode ignores it.
+  let timeoutMs: number | undefined;
+  if (values.timeout !== undefined) {
+    const secs = Number(values.timeout);
+    if (!Number.isFinite(secs) || secs <= 0) {
+      process.stderr.write(
+        `keeper board: --timeout must be a positive number of seconds (got '${values.timeout}')\n`,
+      );
+      process.exit(2);
+    }
+    timeoutMs = Math.round(secs * 1000);
   }
 
   const sockPath = values.sock ?? resolveSockPath();
@@ -862,6 +907,15 @@ export async function main(argv: string[]): Promise<void> {
   const view = createViewShell<ReadinessClientSnapshot>({
     script: "board",
     title: "board",
+    // fn-772 snapshot branch: board folds TWO streams — the readiness
+    // composite (`subscribeReadiness`) + the `armed_epics` presence table
+    // — so `streamCount: 2`. The latch holds the snapshot until BOTH
+    // report (readiness via the auto-report in `view.emit`, armed_epics via
+    // the explicit `reportSnapshotStream` below), so the `[armed]` pills are
+    // deterministically present rather than ordering-luck.
+    mode: mode === "snapshot" ? "snapshot" : "live",
+    streamCount: 2,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     renderBody: (snap) => {
       // Per-frame `job_id → invocations` index — re-entrant sub-agents
       // within one session sit on the same bucket, ordered by
@@ -920,6 +974,12 @@ export async function main(argv: string[]): Promise<void> {
   // edge we rebuild `armedSet` in place (clear + re-add) and re-emit the last
   // snapshot so the `[armed]` header pill repaints live. Re-subscribes cleanly
   // on socket drop via the shared reconnect contract.
+  // fn-772: report the `armed_epics` stream to the snapshot latch exactly
+  // once (its first `onRows`). The latch counts raw reports, so this one-shot
+  // guard keeps a re-fired armed edge from over-reporting; combined with the
+  // readiness stream's auto-report in `view.emit`, the latch's `streamCount:
+  // 2` is satisfied only when BOTH streams have folded. Inert in live mode.
+  let armedStreamReported = false;
   const armedHandle = subscribeCollection({
     sockPath,
     idPrefix: "board",
@@ -932,6 +992,10 @@ export async function main(argv: string[]): Promise<void> {
           armedSet.add(id);
         }
       }
+      if (!armedStreamReported) {
+        armedStreamReported = true;
+        view.reportSnapshotStream();
+      }
       if (lastSnap !== null) {
         emitFrame(lastSnap);
       }
@@ -939,10 +1003,17 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
-  view.installSigintHandler(() => {
-    handle.dispose();
-    armedHandle.dispose();
-  });
+  if (mode === "snapshot") {
+    view.runSnapshot(() => {
+      handle.dispose();
+      armedHandle.dispose();
+    });
+  } else {
+    view.installSigintHandler(() => {
+      handle.dispose();
+      armedHandle.dispose();
+    });
+  }
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the

@@ -15,6 +15,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   backendCoordsSeg,
   monitorLinesFor,
@@ -1085,4 +1086,85 @@ test("renderJobsBody: empty / missing monitors blob renders no Monitors section"
       ["--- ada ---", `(x) ambient ${pill("working")}`, "  [p11]"].join("\n"),
     );
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-772 (task .2): snapshot-mode CLI wiring (real `keeper jobs` subprocess).
+// jobs is a SINGLE-stream view (`subscribeReadiness` → one `view.emit`), so
+// `streamCount: 1`. We pipe stdout (→ `process.stdout.isTTY === undefined`)
+// so the auto-detect resolves snapshot without `--snapshot`, and point
+// `--sock` at a dead path so the latch's `--timeout` bounds the run with no
+// daemon. Mirrors test/git.test.ts's subprocess harness.
+// ---------------------------------------------------------------------------
+
+const JOBS_KEEPER_CLI = join(import.meta.dir, "..", "cli", "keeper.ts");
+const JOBS_DEAD_SOCK = "/tmp/keeper-jobs-snapshot-test-nonexistent.sock";
+
+interface JobsRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+async function runJobs(args: string[]): Promise<JobsRun> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    CI: undefined,
+    TERM: "xterm",
+  };
+  const proc = Bun.spawn(["bun", JOBS_KEEPER_CLI, "jobs", ...args], {
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
+function parseJobsTrailer(stdout: string): Record<string, unknown> {
+  const lines = stdout.split("\n").filter((l) => l.length > 0);
+  const last = lines.at(-1);
+  if (last === undefined) throw new Error(`no stdout lines: ${stdout}`);
+  expect(last.startsWith("keeper-meta: ")).toBe(true);
+  const json = last.slice("keeper-meta: ".length);
+  expect(json).not.toContain("\n");
+  return JSON.parse(json) as Record<string, unknown>;
+}
+
+test("jobs --snapshot: both flags → stderr error, exit 2", async () => {
+  const res = await runJobs(["--snapshot", "--watch"]);
+  expect(res.code).toBe(2);
+  expect(res.stderr).toContain("--snapshot and --watch are mutually exclusive");
+  expect(res.stdout).not.toContain("keeper-meta:");
+});
+
+test("jobs --snapshot: bad --timeout → exit 2", async () => {
+  const res = await runJobs(["--snapshot", "--timeout", "notanumber"]);
+  expect(res.code).toBe(2);
+  expect(res.stderr).toContain("--timeout must be a positive number");
+});
+
+test("jobs: piped non-TTY auto-detects snapshot; dead sock → exit 1, daemon-unreachable, frame:null on stdout", async () => {
+  const res = await runJobs(["--sock", JOBS_DEAD_SOCK, "--timeout", "1"]);
+  expect(res.code).toBe(1);
+  expect(res.stderr).toContain("no frame");
+  const trailer = parseJobsTrailer(res.stdout);
+  expect(trailer.schema_version).toBe(1);
+  expect(trailer.script).toBe("jobs");
+  expect(trailer.status).toBe("daemon-unreachable");
+  expect(trailer.frame).toBeNull();
+  expect(trailer.frame_count).toBe(0);
+  expect(trailer.truncated).toBe(true);
+});
+
+test("jobs --help: documents --snapshot / --watch / --timeout", async () => {
+  const res = await runJobs(["--help"]);
+  expect(res.code).toBe(0);
+  expect(res.stdout).toContain("--snapshot");
+  expect(res.stdout).toContain("--watch");
+  expect(res.stdout).toContain("--timeout");
 });

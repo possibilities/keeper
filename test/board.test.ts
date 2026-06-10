@@ -28,6 +28,7 @@
  */
 
 import { expect, test } from "bun:test";
+import { join } from "node:path";
 import {
   colorizePillsInLine,
   epicNumFromIdOrBare,
@@ -1705,4 +1706,85 @@ test("subagentLinesFor: keeps running / failed / unknown / superseded", () => {
   expect(subagentLinesFor(subFixture("superseded"), "j", "  ")).toEqual([
     `  scout: d ${pill("superseded")}`,
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-772 (task .2): snapshot-mode CLI wiring (real `keeper board` subprocess).
+// board folds TWO streams (readiness + armed_epics), so `streamCount: 2`. The
+// subprocess here exercises the CLI seam — flag validation, the auto-detect
+// piped-stdout trigger, and the dead-sock no-frame exit path. The multi-stream
+// latch determinism (the `[armed]` pill held until both streams report) is
+// covered in-process in test/view-shell.test.ts. Mirrors test/git.test.ts.
+// ---------------------------------------------------------------------------
+
+const BOARD_KEEPER_CLI = join(import.meta.dir, "..", "cli", "keeper.ts");
+const BOARD_DEAD_SOCK = "/tmp/keeper-board-snapshot-test-nonexistent.sock";
+
+interface BoardRun {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+async function runBoard(args: string[]): Promise<BoardRun> {
+  const env: Record<string, string | undefined> = {
+    ...process.env,
+    CI: undefined,
+    TERM: "xterm",
+  };
+  const proc = Bun.spawn(["bun", BOARD_KEEPER_CLI, "board", ...args], {
+    env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr, code] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  return { code, stdout, stderr };
+}
+
+function parseBoardTrailer(stdout: string): Record<string, unknown> {
+  const lines = stdout.split("\n").filter((l) => l.length > 0);
+  const last = lines.at(-1);
+  if (last === undefined) throw new Error(`no stdout lines: ${stdout}`);
+  expect(last.startsWith("keeper-meta: ")).toBe(true);
+  const json = last.slice("keeper-meta: ".length);
+  expect(json).not.toContain("\n");
+  return JSON.parse(json) as Record<string, unknown>;
+}
+
+test("board --snapshot: both flags → stderr error, exit 2", async () => {
+  const res = await runBoard(["--snapshot", "--watch"]);
+  expect(res.code).toBe(2);
+  expect(res.stderr).toContain("--snapshot and --watch are mutually exclusive");
+  expect(res.stdout).not.toContain("keeper-meta:");
+});
+
+test("board --snapshot: bad --timeout → exit 2", async () => {
+  const res = await runBoard(["--snapshot", "--timeout", "notanumber"]);
+  expect(res.code).toBe(2);
+  expect(res.stderr).toContain("--timeout must be a positive number");
+});
+
+test("board: piped non-TTY auto-detects snapshot; dead sock → exit 1, daemon-unreachable, frame:null on stdout", async () => {
+  const res = await runBoard(["--sock", BOARD_DEAD_SOCK, "--timeout", "1"]);
+  expect(res.code).toBe(1);
+  expect(res.stderr).toContain("no frame");
+  const trailer = parseBoardTrailer(res.stdout);
+  expect(trailer.schema_version).toBe(1);
+  expect(trailer.script).toBe("board");
+  expect(trailer.status).toBe("daemon-unreachable");
+  expect(trailer.frame).toBeNull();
+  expect(trailer.frame_count).toBe(0);
+  expect(trailer.truncated).toBe(true);
+});
+
+test("board --help: documents --snapshot / --watch / --timeout", async () => {
+  const res = await runBoard(["--help"]);
+  expect(res.code).toBe(0);
+  expect(res.stdout).toContain("--snapshot");
+  expect(res.stdout).toContain("--watch");
+  expect(res.stdout).toContain("--timeout");
 });

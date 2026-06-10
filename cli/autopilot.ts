@@ -90,13 +90,18 @@ import {
   subscribeCollection,
   subscribeReadiness,
 } from "../src/readiness-client";
+import {
+  resolveSnapshotMode,
+  SnapshotCliMisuseError,
+  type SnapshotMode,
+} from "../src/snapshot";
 import type { Task } from "../src/types";
 import { createViewShell } from "../src/view-shell";
 
 const HELP = `keeper autopilot — thin viewer + control surface for the server-side autopilot reconciler
 
 Usage:
-  keeper autopilot [--sock <path>]
+  keeper autopilot [--sock <path>] [--snapshot | --watch] [--timeout <s>]
   keeper autopilot pause [--sock <path>]
   keeper autopilot play  [--sock <path>]
   keeper autopilot mode <yolo|armed> [--sock <path>]
@@ -121,7 +126,15 @@ Subcommands:
 
 Options:
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
+  --snapshot     (viewer only) Force one-shot snapshot mode (print one frame +
+                 a machine-parseable keeper-meta: line, then exit) even on a TTY
+  --watch        (viewer only) Force the live subscribe stream even when piped
+  --timeout <s>  (viewer only) Snapshot wait before the timeout escape (~2s)
   --help         Show this help
+
+By default the viewer's stdout that is NOT a TTY (piped into an agent)
+auto-detects snapshot mode; a TTY gets the live alt-screen viewer. \`CI\` /
+\`TERM=dumb\` force snapshot.
 
 The viewer is read-only — every dispatch, dedup, confirm, settle, and reap
 decision happens in keeperd's autopilot worker thread. Use pause / play
@@ -745,7 +758,11 @@ export function autopilotBannerLabel(state: {
   return `${pill} · ${state.mode}${armedSeg} · max ${cap}`;
 }
 
-async function runViewer(sockPath: string): Promise<void> {
+async function runViewer(
+  sockPath: string,
+  mode: SnapshotMode = "watch",
+  timeoutMs?: number,
+): Promise<void> {
   const state: ViewerState = {
     snap: null,
     failed: [],
@@ -771,6 +788,17 @@ async function runViewer(sockPath: string): Promise<void> {
   const view = createViewShell<ViewerState>({
     script: "autopilot",
     title: "autopilot",
+    // fn-772 snapshot branch: autopilot folds FOUR streams — readiness,
+    // dispatch_failures, autopilot_state (paused/mode/cap), and armed_epics
+    // — so `streamCount: 4`. The latch holds the snapshot until ALL FOUR
+    // report (readiness via the auto-report in `view.emit`, the other three
+    // via `reportSnapshotStream` below), so the captured frame reflects the
+    // FOLDED mode/armed/failed state rather than the seed values. ALL FOUR
+    // handles are disposed before exit (mirrors installSigintHandler's
+    // teardown fan-out).
+    mode: mode === "snapshot" ? "snapshot" : "live",
+    streamCount: 4,
+    ...(timeoutMs === undefined ? {} : { timeoutMs }),
     // fn-751: the banner derives mode + armed-count from the live `state`
     // (the armed count is the explicit-armed list length).
     persistentBannerPill: () =>
@@ -829,6 +857,19 @@ async function runViewer(sockPath: string): Promise<void> {
   // restore pattern.
   view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
 
+  // fn-772: per-secondary-stream one-shot snapshot-latch reports. The
+  // readiness stream auto-reports via `view.emit` (the first emit); the
+  // three `subscribeCollection` streams each report their FIRST `onRows`
+  // exactly once so `streamCount: 4` is satisfied only when ALL FOUR have
+  // folded. The guards keep a re-fired collection edge from over-reporting.
+  // CRITICAL: report on the FIRST `onRows` regardless of row contents — an
+  // empty `result` (e.g. `autopilot_state` before the singleton folds) is
+  // still that stream's first frame, so the latch must count it or the
+  // snapshot hangs until timeout. Inert in live mode.
+  let failuresStreamReported = false;
+  let pausedStreamReported = false;
+  let armedStreamReported = false;
+
   const readinessHandle = subscribeReadiness({
     sockPath,
     idPrefix: "autopilot",
@@ -845,6 +886,10 @@ async function runViewer(sockPath: string): Promise<void> {
     collection: "dispatch_failures",
     onRows: (rows) => {
       state.failed = projectFailedRows(rows);
+      if (!failuresStreamReported) {
+        failuresStreamReported = true;
+        view.reportSnapshotStream();
+      }
       view.emit(state);
     },
     onLifecycle: view.emitLifecycle,
@@ -863,6 +908,15 @@ async function runViewer(sockPath: string): Promise<void> {
     idPrefix: "autopilot",
     collection: "autopilot_state",
     onRows: (rows) => {
+      // fn-772: report this stream's first frame to the snapshot latch
+      // BEFORE the empty-rows early-return — an empty `result` is still the
+      // `autopilot_state` stream's first delivered frame, so the latch must
+      // count it or a freshly-booted daemon (singleton not yet folded)
+      // hangs the snapshot until timeout. Once per stream.
+      if (!pausedStreamReported) {
+        pausedStreamReported = true;
+        view.reportSnapshotStream();
+      }
       const paused = projectAutopilotPaused(rows);
       if (paused === null) {
         // Singleton hasn't folded yet (sub-ms boot race) — empty row set.
@@ -897,18 +951,32 @@ async function runViewer(sockPath: string): Promise<void> {
     collection: "armed_epics",
     onRows: (rows) => {
       state.armedEpics = projectArmedEpics(rows);
+      if (!armedStreamReported) {
+        armedStreamReported = true;
+        view.reportSnapshotStream();
+      }
       view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
       view.emit(state);
     },
     onLifecycle: view.emitLifecycle,
   });
 
-  view.installSigintHandler(() => {
+  // fn-772: dispose ALL FOUR subscription handles before exit — wiring only
+  // the primary leaks the other three sockets (Bun's "socket closed with
+  // buffered data" warning). The same fan-out feeds both the live SIGINT
+  // teardown and the snapshot exit path.
+  const disposeAll = (): void => {
     readinessHandle.dispose();
     failuresHandle.dispose();
     pausedHandle.dispose();
     armedHandle.dispose();
-  });
+  };
+
+  if (mode === "snapshot") {
+    view.runSnapshot(disposeAll);
+  } else {
+    view.installSigintHandler(disposeAll);
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -920,6 +988,11 @@ export async function main(argv: string[]): Promise<void> {
     args: argv,
     options: {
       sock: { type: "string" },
+      snapshot: { type: "boolean", default: false },
+      watch: { type: "boolean", default: false },
+      // parseArgs has no number type — capture as a string and validate
+      // manually below (exit 2 on a non-positive / non-numeric value).
+      timeout: { type: "string" },
       help: { type: "boolean", default: false },
     },
     allowPositionals: true,
@@ -934,7 +1007,38 @@ export async function main(argv: string[]): Promise<void> {
   const [subcommand, ...rest] = parsed.positionals;
 
   if (subcommand === undefined) {
-    await runViewer(sockPath);
+    // Viewer path only — the snapshot flags gate the viewer's run mode.
+    // Resolve mode (flag > CI/TERM=dumb > stdout.isTTY !== true); both
+    // `--snapshot` and `--watch` → typed misuse error → exit 2.
+    let mode: SnapshotMode;
+    try {
+      mode = resolveSnapshotMode({
+        snapshotFlag: parsed.values.snapshot ?? false,
+        watchFlag: parsed.values.watch ?? false,
+        stdoutIsTTY: process.stdout.isTTY,
+        env: process.env,
+      });
+    } catch (err) {
+      if (err instanceof SnapshotCliMisuseError) {
+        process.stderr.write(`keeper autopilot: ${err.message}\n`);
+        process.exit(2);
+      }
+      throw err;
+    }
+    // Validate `--timeout` (seconds) only when snapshotting — a bad value is
+    // CLI misuse (exit 2). Watch mode ignores it.
+    let timeoutMs: number | undefined;
+    if (parsed.values.timeout !== undefined) {
+      const secs = Number(parsed.values.timeout);
+      if (!Number.isFinite(secs) || secs <= 0) {
+        process.stderr.write(
+          `keeper autopilot: --timeout must be a positive number of seconds (got '${parsed.values.timeout}')\n`,
+        );
+        process.exit(2);
+      }
+      timeoutMs = Math.round(secs * 1000);
+    }
+    await runViewer(sockPath, mode, timeoutMs);
     return;
   }
 
