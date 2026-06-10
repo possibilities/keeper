@@ -1,0 +1,17 @@
+{
+  "branch_name": "fn-774-prune-armed-epics-on-completion",
+  "bundles": [],
+  "created_at": "2026-06-10T18:36:31.860251Z",
+  "depends_on_epics": [],
+  "id": "fn-774-prune-armed-epics-on-completion",
+  "last_validated_at": "2026-06-10T18:36:32.123506Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Prune armed epics on completion",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-10T18:36:31.860251Z"
+}
