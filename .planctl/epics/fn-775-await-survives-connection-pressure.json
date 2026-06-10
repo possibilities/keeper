@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-775-await-survives-connection-pressure",
   "bundles": [],
+  "closer_done_at": "2026-06-10T20:02:29.046801Z",
   "created_at": "2026-06-10T19:04:39.507573Z",
   "depends_on_epics": [],
   "id": "fn-775-await-survives-connection-pressure",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Await survives connection pressure",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T19:04:39.507573Z"
+  "updated_at": "2026-06-10T20:02:29.046801Z"
 }
