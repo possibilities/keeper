@@ -1,31 +1,33 @@
 ## Description
 
 **Size:** S
-**Files:** cli/usage.ts (and the board help wiring in cli/board.ts if help text lives there)
+**Files:** cli/board.ts
 
 ### Approach
 
-Read how `keeper board --help` text is assembled (cli/usage.ts). Split the wall into: a compact default help (usage line, one line per flag, 2-3 examples) and the long-form reference (move to --agent-help output or point at README's board section if it already covers it — delete duplication rather than relocating it). Follow the repo doc/comment discipline: present-tense, no ticket ids. Keep flag semantics text accurate to current behavior.
+The board HELP block lives in cli/board.ts (each subcommand parses --help itself; cli/usage.ts is the separate `keeper usage` command — not in scope). Slim the 179-line wall to the commit-work house style: usage line, one line per flag/keybinding group, 2-3 examples, <= ~40 lines. The long-form rendering reference duplicates README's board section — delete the duplication and point at README; move anything agent-essential and non-duplicated behind an --agent-help branch only if it genuinely cannot live in README. Present-tense, no ticket ids.
 
 ### Investigation targets
 
 **Required** (read before coding):
-- cli/usage.ts — current help assembly
+- cli/board.ts — current HELP block
 - README.md board section — what the long-form already duplicates
+- cli/commit-work.ts — house-style reference
+- test/ — grep for board help/usage string assertions before editing
 
 ### Risks
 
-Help text may be asserted in tests (grep test/ for usage strings before editing).
+Help text may be asserted in tests (grep first).
 
 ### Test notes
 
-`bun test` green; `bun run test:full` if any non-help code path touched; eyeball `keeper board --help` output.
+`bun test` green; eyeball `keeper board --help`.
 
 ## Acceptance
 
-- [ ] Default `keeper board --help` <= ~40 lines, accurate
-- [ ] Long-form content reachable or deleted-as-duplicate; no orphaned references
-- [ ] Tests green
+- [ ] `keeper board --help` <= ~40 lines, accurate
+- [ ] Long-form content deleted-as-duplicate or reachable via README/agent-help; no orphaned references
+- [ ] Tests green; Done summary reports lines/chars deleted
 
 ## Done summary
 
