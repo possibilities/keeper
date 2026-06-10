@@ -28,5 +28,5 @@ tests/test_*skill_consistency* and others may assert verb presence in help — g
 - [ ] Done summary reports lines/chars deleted
 
 ## Done summary
-
+Collapsed planctl --help from 51 to 38 lines (2725 to 1949 chars) — every verb now on one line. Taught CleanGroup.format_commands to honor short_help, then added short_help kwargs to the 11 verbs whose docstring-derived line wrapped (claim, close-finalize, close-preflight, detect, find-task-commit, gist, reconcile, refine-apply, refine-context, resolve-task, scaffold). Docstrings untouched; all 29 verbs listed exactly once, none hidden.
 ## Evidence
