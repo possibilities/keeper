@@ -27,5 +27,5 @@ Three revise-in-place corrections, present-tense prose only:
 - [ ] Prose is present-tense; no tombstones
 
 ## Done summary
-
+Verified the three revise-in-place doc corrections (SKILL.md epic pre-check status==done, reason=connect query-shape-only row, await-conditions.ts JSDoc status==done predicate) are present in the tree; no 'closed' status literal remains, prose is present-tense. await.test.ts green (80 pass).
 ## Evidence

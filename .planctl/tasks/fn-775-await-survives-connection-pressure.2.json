@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Correct await status literals",
-  "updated_at": "2026-06-10T19:04:39.507573Z"
+  "updated_at": "2026-06-10T19:58:55.030146Z",
+  "worker_done_at": "2026-06-10T19:58:55.030146Z"
 }
