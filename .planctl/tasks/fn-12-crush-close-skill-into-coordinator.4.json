@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Rewrite auditor add close-planner agent",
-  "updated_at": "2026-06-10T03:06:56.932451Z"
+  "updated_at": "2026-06-10T07:54:05.986993Z",
+  "worker_done_at": "2026-06-10T07:54:05.986993Z"
 }

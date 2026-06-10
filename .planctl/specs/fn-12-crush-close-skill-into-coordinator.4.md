@@ -33,5 +33,5 @@ Suite must stay green post-deletion (`uv run pytest tests/ -q`). Agent files: gr
 - [ ] No version-pinned model ids in either agent file
 
 ## Done summary
-
+Rewrote quality-auditor content-blind (reads BRIEF_REF, persists via audit submit, one-line return) and added the close-planner agent (vet/cull/merge, cluster+title, verdict+followup submit with 3-retry self-correction, four-rung escape-hatch ladder, QUESTION protocol). Deleted classifier agent + skill subtree + schema test + fixtures and the stale wire-format test; suite green, no version-pinned model ids in either agent file.
 ## Evidence
