@@ -480,7 +480,7 @@ three places under this contract, each mapping to a verdict:
   `planctl done`; the state commit lands inline as the verb fires.
 - **Drop after `planctl done` (both commits in place):** task `done`,
   the `.planctl/` state commit visible in HEAD → verdict `done`. Parent
-  loses only the worker's free-text return summary and continues to the
+  loses only the worker's capped return summary and continues to the
   report phase.
 
 A fourth incompleteness rides the same primitive:

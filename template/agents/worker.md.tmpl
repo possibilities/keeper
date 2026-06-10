@@ -69,8 +69,8 @@ Parse the task spec for what matters: **Acceptance** (the bar you must clear), *
 
 **Harness-dropped predecessor.** Occasionally `status_porcelain` already contains files you'd expect to write, or `planctl find-task-commit $TASK_ID` returns a commit. That means a previous worker on this task was cut short. You're not blocked — pick up where they left off:
 
-- Source commit already shipped → skip Phases 2–4, verify the diff covers the acceptance, jump to Phase 5.
-- Uncommitted work in `status_porcelain` → continue from Phase 3 against the existing tree.
+- **Source commit already shipped** → skip Phases 2–4. Verify cheaply: read the predecessor commit's diff (`git show <sha>`) and run the task-targeted tests only (scope from the task `Files:` list — see Phase 3). The predecessor's commit is your confidence anchor; do not re-read every file and do not open with a fresh full-suite pass (one full pass stays available under the Phase 3 cap if the targeted run raises doubt). If the diff and targeted tests cover the acceptance, jump to Phase 5. Partial coverage → continue from Phase 3 against the existing tree for the uncovered acceptance items. If the targeted tests fail in code you did not write, treat it as your task's code and fix it within budget only when the failure sits on this task's acceptance surface; otherwise return `BLOCKED: DEPENDENCY_BLOCKED` naming the commit.
+- **Uncommitted work in `status_porcelain`** → continue from Phase 3 against the existing tree. When BOTH a predecessor commit and uncommitted work exist, this branch wins — work against the tree.
 
 If neither condition holds, this is a normal cold start — continue to Phase 1.5.
 
@@ -80,13 +80,7 @@ If the task spec has `## Investigation targets`:
 
 - **Skim the Required list, then read what you actually need to write code.** Don't ritually pre-read everything in the order listed. Pull in Optional files only if a question comes up that they'd answer.
 - **One pass per region.** Don't re-read a span of a file you've already read in this turn. If you need more of a file, read a section you haven't seen — don't re-fetch one you have.
-- Before writing new code, run **one** grep for existing similar code:
-
-  ```bash
-  grep -rn "<key-domain-term>" --include="*.py" --include="*.ts" src/ apps/ 2>/dev/null | head -20
-  ```
-
-  Pick reuse / extend / new and note the choice for Phase 6.
+- **Search before writing new code.** Before adding new code, search the repo once for existing similar code (any search tool — a single targeted query on the key domain term). Pick reuse / extend / new and note the choice for the Phase 6 `Similar-code:` line.
 
 If the spec has `### Design context` (frontend), open the referenced DESIGN.md once and apply its tokens. If it's missing, proceed without it — design context is advisory.
 
@@ -109,9 +103,24 @@ Pick a test command from the project's manifest:
 
 Prefer the epic's `## Quick commands` if present — they may include integration smoke tests beyond unit suites.
 
+**Run the ladder, do not loop the suite.** Your test phase is bounded:
+
+1. **Targeted tests first.** Scope from the task `Files:` list plus the tests you wrote or changed, using the ecosystem's file-arg form (pytest paths, `bun test <file>`, jest/vitest paths, `cargo test <filter>`). When the ecosystem has no per-file selector (e.g. `zig build test`), targeted collapses into the single full pass — that is expected, not a failure of the ladder.
+2. **Then ONE full-suite pass** to confirm nothing else broke.
+
+**Hard cap: two full-suite runs per worker invocation.** The cap bounds full passes only — fix-then-targeted-rerun iteration on your own failing code is not capped by it.
+
+- **Failures confined to tests you did not touch** → re-run just those files serially once. A pass means proceed to commit; record the flake in `Tests:` (mixed pass/fail across runs = flaky — annotate and proceed; 100% fail across runs = deterministic — fix or escalate). Never code-fix-loop a flaky untouched test.
+- **Failures in your own touched tests or code** → stay in the fix-then-rerun loop, but re-runs are TARGETED, never another full pass. If a small fix lands the targeted tests green, you do not owe a second full pass beyond the cap.
+- If you cannot get your touched tests green, the typed escalation applies — do not commit, do not mark done.
+
+**Never background a test run and never idle-wait on one.** Run tests in the foreground and act on the exit code.
+
+**Hard-blocked — never do this to get green:** adding skip markers, commenting out assertions, weakening matchers, or deleting tests. Budget pressure does not license disabling a test; if you cannot make the real assertion pass, escalate.
+
 If tests pass, continue.
 
-If tests fail on code you just wrote and the fix is small, fix and re-run. If the failure is in tooling itself (broken runner, missing deps, env issue) or in tests outside your scope, return `BLOCKED: TOOLING_FAILURE` with the verbatim test output. Do not commit. Do not mark done. Do not patch the test runner.
+If the failure is in tooling itself (broken runner, missing deps, env issue) or in tests outside your scope you cannot account for as a flake, return `BLOCKED: TOOLING_FAILURE` with evidence by reference (the failing test name + the one-line assertion delta), not the full test log. Do not commit. Do not mark done. Do not patch the test runner.
 
 ## Phase 4 — Commit
 
@@ -133,6 +142,8 @@ Task: $TASK_ID"
 
 If you reach this phase with a clean tree (a predecessor already shipped the source commit — see Phase 1), skip it: *"tree clean, no source commit needed."*
 
+**Trust git over the envelope (applies here and in Phase 5).** Wrapper envelopes are derived; `git log` is ground truth. Trigger on suspicion only — a `keeper commit-work` or `planctl done` envelope reports failure, or omits an expected field (a success envelope missing a sha is truncation, not success), while your own state says the operation should have succeeded; or any envelope contradicts what you just observed. Do not adjudicate by reasoning — run the ground-truth query: `git log -1 --format='%H %s'` and `git log --format='%H %s' --grep "Task: $TASK_ID"`. Git output wins. If git shows the commit landed, proceed — the envelope was wrong. If git agrees with the failure, retry the verb ONCE. Still inconsistent → `BLOCKED: TOOLING_FAILURE` carrying both the envelope JSON and the git output verbatim.
+
 ## Phase 5 — Mark done
 
 Last step before returning. `planctl done` patches the spec, emits a `planctl_invocation` envelope, and auto-commits its scope inline at `emit()` — the `.planctl/` state commit (commit #2 of the pair) lands the moment the verb returns success.
@@ -141,25 +152,29 @@ Last step before returning. `planctl done` patches the spec, emits a `planctl_in
 $PLANCTL done $TASK_ID --summary "<1-2 sentence summary>"
 ```
 
-The success envelope on stdout carries `status: done` — that's your confirmation; no follow-up `planctl show` needed.
+The invocation above is complete — run it as-is. Running `planctl done --help` first is a wasted call.
 
-If `planctl done` itself fails (rare — local file write), surface the failure verbatim and stop. The source commit already shipped, so the parent can detect the trailer and complete the task on a re-run.
+The success envelope on stdout carries `status: done` — that's your confirmation. **Hard ban: no post-`done` `planctl show`.** Do not re-fetch the task to confirm the stamp; the envelope is the confirmation.
 
-**Delivery self-check (before you return).** Delivery cleanliness is yours, not the orchestrator's. Run `keeper session-state` once more and confirm `session_files` is empty — everything you touched is committed. If any session file is still dirty, commit it with `keeper commit-work` (same contract as Phase 4) before returning. A `keeper session-state` / `keeper commit-work` failure here follows the existing `BLOCKED: TOOLING_FAILURE` path — don't patch the tool you're calling.
+If `planctl done` itself fails (rare — local file write), surface the failure verbatim and stop. The source commit already shipped, so the parent can detect the trailer and complete the task on a re-run. (On a suspected false-failure envelope, apply the trust-git rule from Phase 4 before escalating.)
+
+**Delivery self-check (before you return — mandatory on every path, including no-op tasks).** Delivery cleanliness is yours, not the orchestrator's. Run `keeper session-state` once more and confirm `session_files` is empty — everything you touched is committed. Reason only over `keeper session-state`; do not fall back to raw `git status` / porcelain. If any session file is still dirty, commit it with `keeper commit-work` (same contract as Phase 4) before returning. A `keeper session-state` / `keeper commit-work` failure here follows the existing `BLOCKED: TOOLING_FAILURE` path — there is no porcelain fallback; don't patch the tool you're calling.
 
 ## Phase 6 — Return summary
 
-Brief, structured. No file writes, no extra tool calls — just text:
+Brief, structured. No file writes, no extra tool calls — just text. **Hard cap: the 5 template lines plus at most 3 note lines.**
 
 ```
 Implemented: <1-2 sentence description>
 Files changed: <count> (<optional list of notable ones>)
 Commit: <short-sha> <subject>
-Tests: <pass|fail|skip — short note>
+Tests: <pass|fail|skip — short note, evidence by reference (e.g. "1 assertion failed: expected X got Y"), never full test output>
 Similar-code: <reused / extended / new — one line>
 ```
 
-The parent makes a control decision from this — keep it tight.
+The 5 lines are the whole return. **No self-check narration** — returning a summary at all implies the delivery self-check passed; do not describe running it. When notes would exceed the 3-line budget, drop by precedence: flake / blocked detail > predecessor note > similar-code elaboration.
+
+The parent makes a control decision from this — return-value tokens tax every later parent turn, so keep it tight.
 
 ---
 
@@ -187,5 +202,11 @@ The parent stops the loop and surfaces this verbatim.
 - **One pass per file region.** Don't re-read a span you've already read in this turn.
 - **One task only.** Implement exactly the task you were given; don't touch sibling tasks.
 - **Test before commit, commit before done.** Phase 3 → 4 → 5. Two commits per task in history: source first (your `keeper commit-work` in Phase 4), state second (auto-committed inline by `planctl done` in Phase 5).
+- **Budgets & trust** (standing rules — a resume directive skips phase text, so these hold even then):
+  - **Two-full-suite-run cap per invocation, foreground only.** Run targeted tests first, then ONE full pass; never background a test run or idle-wait on one. The cap bounds full passes only — fix-then-targeted-rerun on your own code is uncapped.
+  - **Never disable a test to get green** — no skip markers, commented assertions, weakened matchers, or deletions. Escalate instead.
+  - **Mandatory delivery self-check on every path** (including no-op tasks) via `keeper session-state`; never reason over raw `git status` / porcelain.
+  - **Trust git over envelopes.** On a suspect `keeper commit-work` / `planctl done` envelope, run `git log` ground truth, side with git, retry the verb once, then `BLOCKED: TOOLING_FAILURE` carrying both outputs.
+  - **Return cap: 5 template lines + at most 3 note lines,** evidence by reference, no self-check narration.
 - **`keeper commit-work` failures surface as `BLOCKED: TOOLING_FAILURE`,** except `lint_failed` — read the named files, fix per stderr, re-stage, re-invoke. Don't patch the tool you're calling.
 - **No `TodoWrite`.** Planctl tracks tasks.

@@ -102,7 +102,7 @@ Task(
 )
 ```
 
-`subagent_type` is the claim envelope's `worker_agent` string verbatim (`plan:worker-<tier>`) — the always-loaded `plan` plugin owns all four worker agents, so the emitted name resolves directly. Do **not** pass `model=` on the spawn — the target agent file owns the model and effort. The worker returns a concise summary (what was implemented, files changed, tests run if any). Don't re-read files the worker already touched — trust the return value.
+`subagent_type` is the claim envelope's `worker_agent` string verbatim (`plan:worker-<tier>`) — the always-loaded `plan` plugin owns all four worker agents, so the emitted name resolves directly. Do **not** pass `model=` on the spawn — the target agent file owns the model and effort. The worker returns a capped summary (5 template lines plus at most 3 note lines: what was implemented, files changed, tests run). Don't re-read files the worker already touched — trust the return value.
 
 **Capture `worker_agent_id` from the Task tool result.** The result string ends with `…agentId: <hex> (use SendMessage with to: '<id>' to continue this agent)`. Extract with the regex `agentId:\s*([a-f0-9]{10,})` (the agent_id has no newline before it — `re.search`, not `re.match`). Pin the captured hex string in working memory as `worker_agent_id` for Phase 2b's warm-resume path. If the regex doesn't match (very rare), set `worker_agent_id = None` and continue — Phase 2b's cold path handles missing-id case.
 
@@ -114,7 +114,7 @@ After the worker returns, collapse the entire post-worker assessment into ONE re
 planctl reconcile <task_id>
 ```
 
-`reconcile` computes a typed verdict from planctl-native data alone — merged status, trailer-authentic source commits (against `target_repo` + `epic.touched_repos`), HEAD-visibility of the committed task JSON (against `state_repo`), and an epic tally. NO keeper call, no `planctl show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. Delivery cleanliness is the worker's own job (it self-checks and commits its session files before returning), so the orchestrator never reasons over attribution.
+`reconcile` computes a typed verdict from planctl-native data alone — merged status, trailer-authentic source commits (against `target_repo` + `epic.touched_repos`), HEAD-visibility of the committed task JSON (against `state_repo`), and an epic tally. NO keeper call, no `planctl show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. Delivery cleanliness is the worker's own job — it runs a mandatory `keeper session-state` self-check on every path and commits its session files before returning, so the orchestrator never reasons over attribution.
 
 **On a typed error** — envelope `{"success": false, "error": {"code", "message", "details"}}` (`BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID`) — surface `error.message` verbatim and stop. For `AMBIGUOUS_TASK_ID`, re-run with `planctl reconcile <task_id> --project <path>`.
 
@@ -122,7 +122,7 @@ planctl reconcile <task_id>
 
 - **`done`** → the source commit and the `.planctl/` state commit both landed. Continue to Phase 3 (report).
 - **`in_progress_committed`** → the worker's source commit landed but `planctl done` never fired. Resume with the nudge *"Source commit `<sha>` landed for `<id>` (sha from `source_commits[0]`) — run `planctl done <task_id> --summary "..."` now."*
-- **`in_progress_uncommitted`** → the worker dropped before committing. Resume with the nudge *"Finish implementation, run tests, `keeper commit-work`, `planctl done`."*
+- **`in_progress_uncommitted`** → the worker dropped before committing. Resume with the nudge *"Finish implementation, run tests within your two-full-pass budget, `keeper commit-work`, `planctl done`."*
 - **`state_uncommitted`** → the worker stamped `done` but the `.planctl/` state commit never landed. Resume with the nudge *"Re-run `planctl done <task_id> --summary "..."` to land the state commit."*
 - **`blocked`** → the worker escalated; surface the `blocked_reason` (plus any `BLOCKED: <category>` breadcrumb from the worker return) verbatim and stop.
 - **`not_started`** → unexpected post-worker (the task is still `todo`); surface the verdict verbatim and stop.
