@@ -43,5 +43,5 @@ the baseline file shows version 3.
 - [ ] one observed post-reset tick: no pages on a healthy system (Evidence)
 
 ## Done summary
-
+Bumped BACKSTOP_BASELINE_VERSION 2→3 (commit e109f3f) so the next tick reseeds every backstop baseline to the post-glowup world; archived the 334-file followups corpus to followups-archive/2026-06-09/ (never deleted), reset seen.json, and appended one bulk-archive ledger row. Verified one post-reset tick: baseline file reseeded to version 3 (6 buckets), seen.json rebuilt baselined with 3 fingerprints, heartbeat advanced, and a healthy system paged nothing (no findings page file, followups empty).
 ## Evidence
