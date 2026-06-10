@@ -89,28 +89,19 @@ shape because a consumer reads it.
 ## Writes are tightly scoped — DO NOT widen them
 
 - **No general write path into the reducer.** The socket carries `query` (read)
-  and `rpc` (mutate). RPC may write ONLY six surfaces, each of which round-trips
-  through a synthetic event so a re-fold sees it: (1) the `approval` field, written
-  to the gitignored runtime sidecar `.planctl/state/{epics,tasks}/<id>.state.json`
-  (fn-732 — NOT the committed def), (2) `replay_dead_letter`, (3) `retry_dispatch`,
-  (4) `set_autopilot_paused`, (5) `set_autopilot_mode` (fn-751 — appends an
-  `AutopilotMode` event onto the `autopilot_state` singleton's `mode` column),
-  (6) `set_epic_armed` (fn-751 — appends an `EpicArmed` event onto the
-  `armed_epics` presence table). RPC handlers MUST NOT write `jobs`/`epics`/etc
-  directly. The fn-751 pair is APPEND-ONLY (no main→worker relay, unlike
-  `set_autopilot_paused`): the level-triggered reconciler re-reads mode + armed
-  from the projection each cycle, woken by the fold's `data_version` bump.
-- **Plans are READ-ONLY except `approval`.** The plan worker folds
-  `.planctl/{epics,tasks}` snapshots into `epics`; the only writable field is
-  `approval`. fn-732 moved `approval` out of the committed def into the gitignored
-  runtime sidecar (`.planctl/state/{epics,tasks}/<id>.state.json`) so keeper folds
-  it GATE-FREE (no commit on the critical path — eliminating the approve-fold lag).
-  The fold resolves approval via a PERMANENT ladder — **sidecar → committed def →
-  `pending`** — so approval stays resolvable on a keeper that predates a sidecar,
-  and the parallel-change deploy order (reader-first) is non-fragile. NEVER gate
-  away the def-fallback; it's the safety net the whole epic depends on. The
-  `set_{task,epic}_approval` RPC writes the sidecar (create-if-absent; task RMW
-  preserves the sidecar's status/claim fields; traversal-guarded).
+  and `rpc` (mutate). RPC may write ONLY five surfaces, each of which round-trips
+  through a synthetic event so a re-fold sees it: (1) `replay_dead_letter`,
+  (2) `retry_dispatch`, (3) `set_autopilot_paused`, (4) `set_autopilot_mode`
+  (fn-751 — appends an `AutopilotMode` event onto the `autopilot_state`
+  singleton's `mode` column), (5) `set_epic_armed` (fn-751 — appends an
+  `EpicArmed` event onto the `armed_epics` presence table). RPC handlers MUST NOT
+  write `jobs`/`epics`/etc directly. The fn-751 pair is APPEND-ONLY (no
+  main→worker relay, unlike `set_autopilot_paused`): the level-triggered
+  reconciler re-reads mode + armed from the projection each cycle, woken by the
+  fold's `data_version` bump.
+- **Plans are READ-ONLY.** The plan worker folds `.planctl/{epics,tasks}`
+  snapshots into `epics`; every field is read-only end to end, the same fence as
+  `jobs`. No RPC writes a plan field.
 - **Sole-writer rules.** The hook writes ONLY per-pid NDJSON files — the
   events-log feed (happy path, fn-736) + per-pid dead-letters (append-failure
   fallback). It NEVER touches the DB. The daemon's events-log ingester is the
@@ -218,18 +209,15 @@ upstream. The per-epic armed flag is a PRESENCE table (`armed_epics`): row prese
 (synthetic `AutopilotMode` / `EpicArmed` events) and READ FROM THE PROJECTION each
 reconcile cycle — no relay, no `ReconcileState` cache — so they survive restart
 for free. The mode check is a SUPPRESSION ARM inside reconcile (a desired-state
-verdict, not a readiness pre-filter — `readiness.ts` is untouched); `approve` /
-`close` finalizers + completion-reap are mode-EXEMPT, so disarming mid-flight
+verdict, not a readiness pre-filter — `readiness.ts` is untouched); the `close`
+finalizer + completion-reap are mode-EXEMPT, so disarming mid-flight
 never orphans a live worker or leaks zellij surfaces. The human controls it via
 `keeper autopilot mode <yolo|armed>` / `arm <epic>` / `disarm <epic>`; the
 `keeper autopilot` banner shows `[playing] · <mode> · N armed` (empty-armed-in-
 armed-mode renders distinctly as `· nothing armed`).
 
-**Global cap (`max_concurrent_jobs`)** counts root-occupants (planner-exempt,
-and now approve-exempt) before per-epic dispatch; the budget governs only
-`work`/`close` launches. `approve`-verb launches are exempt at both launch
-sites — they skip the budget gate and never decrement it — so a backlog of
-pending-approval rows can't deadlock the very approvers that would drain it.
+**Global cap (`max_concurrent_jobs`)** counts root-occupants (planner-exempt)
+before per-epic dispatch; the budget governs only `work`/`close` launches.
 
 **Re-dispatch cooldown (`REDISPATCH_COOLDOWN_S` = 200, fn-735/fn-762).** The
 fold-lag-immune suppression arm — and the suppression source of truth. Every
@@ -242,7 +230,7 @@ class). The cooldown is an in-memory `Map<verb::id, unix-seconds>` on
 `UIDTrackingControllerExpectations`): `runReconcileCycle` STAMPS the key at
 dispatch BEFORE the confirm await (covers both `ok` and the slow-cold-boot
 `indoubt`), `reconcile` READS it (gate at BOTH dispatch sites, above the fn-728
-budget gate and NOT approve-exempt — covers work/close/approve), suppressing
+budget gate — covers work/close), suppressing
 re-dispatch for the window. fn-762 set the window to 200s, STRICTLY GREATER
 than `PENDING_DISPATCH_TTL_MS / 1000` (120) + the `PENDING_DISPATCH_SWEEP`
 granularity (60): the 2026-06-09 incident triple-dispatched one worktree
@@ -268,13 +256,12 @@ via `state`, never mutates). **Supersedes the approve-only, reducer-side
 fn-734** — generalized to all verbs, dispatch-side, in-memory.
 
 **Completion reap (`autoclose_windows`, default `true`, fn-727).** When a row
-reaches the `{tag:"completed"}` verdict (fn-756: worker done for a task,
-`status='done'` for an epic, + idle — the approval enum no longer gates), the
-reconcile cycle closes its zellij surfaces via `ExecBackend.reapSurfaces`
-(pane-close on the surviving live-probe path — NOT the retired `closeByTabId`
-tab-coord mechanism): a completed task reaps `work::<id>`, a completed close-row
-reaps `close::<id>` (fn-756: no `approve::<id>` surface to pair — the approve
-verb is gone); pending / worker-ended-incomplete windows stay open.
+reaches the `{tag:"completed"}` verdict (worker done for a task, `status='done'`
+for an epic, + idle), the reconcile cycle closes its zellij surfaces via
+`ExecBackend.reapSurfaces` (pane-close on the surviving live-probe path — NOT the
+retired `closeByTabId` tab-coord mechanism): a completed task reaps `work::<id>`,
+a completed close-row reaps `close::<id>`; pending / worker-ended-incomplete
+windows stay open.
 **fn-764:** the close-row verdict is only observable if the snapshot still
 carries the just-done epic — the default epics read scopes to `status='open'`,
 so `loadReconcileSnapshot` MERGES in a SECOND bounded done-epics read

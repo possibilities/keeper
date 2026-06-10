@@ -113,11 +113,7 @@ a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
 page that doubles as a live subscription. Seven collections register today —
 `jobs` (the first and default), `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
-collection; both the epic and each embedded task carry an `approval` field
-valued `"approved" | "rejected" | "pending"`, surfaced as a pill in the
-epics client — folded GATE-FREE from the gitignored runtime sidecar
-`.planctl/state/{epics,tasks}/<id>.state.json` with a permanent fallback to the
-committed def, fn-732), `subagent_invocations` (the per-job timeline of Task-tool
+collection), `subagent_invocations` (the per-job timeline of Task-tool
 subagent calls — one row per `PreToolUse:Agent` paired with its later
 `PostToolUse:Agent` via `events.tool_use_id`, carrying lifecycle status
 `running | ok | failed | unknown | superseded` and a populated `duration_ms`
@@ -178,18 +174,7 @@ read-only connection, polling `data_version` like the reducer-wake worker.
 **Mutation is a separate, scoped path:** the same socket carries `rpc` request
 frames that dispatch to registered server-side handlers, which write *external
 resources* through a dedicated writer owned by the server-worker. The concrete
-RPCs are `set_task_approval` and `set_epic_approval` (each writes
-the `approval` field to the GITIGNORED runtime sidecar
-`.planctl/state/{epics,tasks}/<id>.state.json` — fn-732, NOT the committed def —
-create-if-absent + RMW preserving the sidecar's status/claim fields, via atomic
-temp+rename under a per-file single-flight lock; the change is observed by
-`@parcel/watcher` and round-trips through the plan worker as an `EpicSnapshot` /
-`TaskSnapshot` event, so the reducer's `epics` projection and the `events` log
-keep their canonical-owner writers and re-fold determinism extends to approval.
-The fold resolves approval via a PERMANENT ladder — sidecar → committed def →
-`pending` — so keeper folds approval GATE-FREE (no commit on the critical path,
-killing the approve-fold lag) while staying resolvable on a keeper that predates
-any sidecar) and `replay_dead_letter` (the scoped
+RPCs are `replay_dead_letter` (the scoped
 synthetic-event-write recovery verb added by schema v37 / fn-643: the
 server-worker bridges the call to main via the in-process message bus,
 and main picks the oldest `waiting` row from `dead_letters`, appends a
@@ -209,14 +194,13 @@ control pair — `set_autopilot_mode` (`AutopilotMode` → the `autopilot_state`
 singleton's `yolo`/`armed` mode column) and `set_epic_armed` (`EpicArmed` → the
 `armed_epics` presence table). The fn-751 pair is APPEND-ONLY (no main→worker
 relay): the level-triggered reconciler re-reads mode + armed from the projection
-each cycle, woken by the fold's `data_version` bump. RPC handlers MAY write
-`.planctl` files and — via the scoped main-bridge — append real events
-to the log AND flip the `dead_letters` audit row in one transaction;
-never reducer projections directly (see [CLAUDE.md](./CLAUDE.md)'s DO
-NOT list). Example clients ship under the unified `keeper` CLI
-(`keeper board`, `keeper jobs`, `keeper autopilot`, `keeper git`,
-`keeper usage`, `keeper await`, plus the single-shot `keeper approve`
-RPC client); see [Example clients](#example-clients) for usage.
+each cycle, woken by the fold's `data_version` bump. RPC handlers — via the
+scoped main-bridge — append real events to the log AND flip the `dead_letters`
+audit row in one transaction; never reducer projections directly (see
+[CLAUDE.md](./CLAUDE.md)'s DO NOT list). Example clients ship under the unified
+`keeper` CLI (`keeper board`, `keeper jobs`, `keeper autopilot`, `keeper git`,
+`keeper usage`, `keeper await`); see [Example clients](#example-clients) for
+usage.
 
 ## What keeper is NOT
 
@@ -228,16 +212,11 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   canonical writer each (the hook for hook events; main for synthetic
   events). The socket DOES carry `rpc` frames, but RPC handlers write only a
   tightly-scoped set of external surfaces — never the reducer's projections
-  directly. The `approval` field lands in the GITIGNORED runtime sidecar
-  `.planctl/state/{epics,tasks}/<id>.state.json` (fn-732, NOT the committed def;
-  via `set_task_approval` / `set_epic_approval`, create-if-absent + RMW, atomic
-  temp+rename, server-worker-owned single-flight); the change round-trips through
-  the plan-worker file watcher, so the reducer remains the sole writer of `epics`.
-  The other write verbs (`replay_dead_letter`, `retry_dispatch`, and the fn-751
-  autopilot pair `set_autopilot_mode` / `set_epic_armed`) APPEND a synthetic event
-  through the scoped main-bridge so the reducer — still the sole projection
-  writer — folds it on the next drain. Consumers may still read any of it directly
-  from SQLite.
+  directly. The write verbs (`replay_dead_letter`, `retry_dispatch`, and the
+  fn-751 autopilot pair `set_autopilot_mode` / `set_epic_armed`) APPEND a
+  synthetic event through the scoped main-bridge so the reducer — still the sole
+  projection writer — folds it on the next drain. Consumers may still read any of
+  it directly from SQLite.
 - **No live membership stream** — `meta.total` signals that the filtered set's
   size or membership *changed*, but it does NOT deliver the new members. Frozen
   membership stands: the live page never reflows. `meta` is a count/staleness
@@ -266,13 +245,8 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   JSON array (a fourth, read-only producer worker watches the configured
   roots' `.planctl/{epics,tasks}` trees; jobs fan in from the reducer's own
   jobs-side writes whenever a SessionStart spawn name parses as
-  `{plan|work|close|approve}::<ref>`). The socket carries plan mutations *scoped to
-  the `approval` field only* — the `set_task_approval` / `set_epic_approval`
-  RPCs write `approval` into the gitignored runtime sidecar
-  `.planctl/state/{epics,tasks}/<id>.state.json` (fn-732, NOT the committed def)
-  via atomic temp+rename, and the plan worker round-trips the change back as a
-  snapshot event. Every other field of every `.planctl` file remains read-only
-  end to end, same fence as `jobs`.
+  `{plan|work|close}::<ref>`). The socket carries no plan mutations: every field
+  of every `.planctl` file is read-only end to end, the same fence as `jobs`.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
 - **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —
@@ -327,15 +301,12 @@ Keeper has no `install` verb. Wire it up manually:
    - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
      jobs. A positive integer enforces the cap; omit or set non-positive
      (the default) to leave it unlimited. The cap bounds only `work`/`close`
-     launches; `approve`-verb launches are exempt from the budget (counted
-     outside the cap) so a pending-approval backlog can't deadlock its own
-     approvers — total live workers can reach `cap + live approvers`.
+     launches.
    - `autoclose_windows` — whether the autopilot reaps a row's zellij
      surfaces when it reaches **completion**. Default `true`. When a task
-     reaches `{tag:"completed"}` (fn-756: worker done + idle — the approval
-     enum no longer gates) the reconciler closes its `work::<id>` pane; a
-     completed epic close-row closes `close::<id>` (fn-756: no `approve::<id>`
-     pane to pair). Pending and just-worker-ended-incomplete windows stay open
+     reaches `{tag:"completed"}` (worker done + idle) the reconciler closes its
+     `work::<id>` pane; a completed epic close-row closes `close::<id>`. Pending
+     and just-worker-ended-incomplete windows stay open
      for inspection. Set `false` to keep every window open (the reap pass
      becomes a no-op and skips the `list-panes` probe). Restart-to-apply — a
      flip lags until the next daemon restart, like every keeper config key.
@@ -476,7 +447,7 @@ Keeper has no `install` verb. Wire it up manually:
    `launchctl print gui/$(id -u)/arthack.keeperd.logrotate`.
 
 8. **Install the babysitter scanner** (optional) so keeper's recurring failure
-   classes — autopilot stalls, duplicate dispatches / approvals, reducer wedge,
+   classes — autopilot stalls, duplicate dispatches, reducer wedge,
    dead-letter growth, **backstop self-telemetry degradation** (a missed-wake
    rescue or rising missed-wake counters), and **event→projection fold latency**
    over the realtime bar — page you automatically instead of being noticed after
@@ -586,7 +557,7 @@ Keeper has no `install` verb. Wire it up manually:
    Example clients ship under the unified `keeper` CLI — `keeper board` /
    `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage`
    (subscribe; the readiness clients go through
-   `src/readiness-client.ts`) and `keeper approve` (RPC) — see
+   `src/readiness-client.ts`) — see
    [Example clients](#example-clients).
 
 ## Example clients
@@ -609,9 +580,7 @@ epic/task going `complete` or `unblocked`, the cwd's repo going
 `server-up` (reconnect-forever; the escape hatch for a slow cold boot),
 the caller's own background
 monitor finishing via `monitor-running <selector>`, or any AND-combination
-like `keeper await git-clean and agents-idle`); `keeper approve` is the
-RPC client (single-shot `rpc` →
-`rpc_result`, no subscription). The
+like `keeper await git-clean and agents-idle`). The
 subscribe clients share helpers in `src/readiness-client.ts` —
 `subscribeReadiness` owns the three-collection lifecycle (board +
 autopilot) and `subscribeCollection` owns the single-collection
@@ -631,8 +600,8 @@ collapses to plain stream output. Run any of them with
   epic block). Subscribes through the shared `subscribeReadiness`
   helper and emits one epics-only frame per change, led by `---`. Uses
   server-default scope: epics are scoped via the descriptor's
-  `defaultClause` — schema v32 (fn-634) materializes the predicate
-  "open OR not-yet-approved" as the VIRTUAL generated column
+  `defaultClause` — schema v63 (fn-756) materializes the predicate
+  `status='open'` as the VIRTUAL generated column
   `default_visible` and serves it from the partial index
   `idx_epics_default_visible WHERE default_visible = 1` as a covering
   SEARCH — `subagent_invocations` full per-job timeline, `jobs` live
@@ -641,8 +610,8 @@ collapses to plain stream output. Run any of them with
   to `keeper jobs` in fn-658 — see the `jobs.ts` bullet below. Both the
   board and `keeper jobs` follow the OMIT-DEFAULT pill convention
   (fn-708): a pill renders only at its non-resting value, so the
-  ABSENCE of a pill encodes the field's one default — `no [approval]`
-  ⇒ `pending`, `no runtime pill` ⇒ `todo`, `no [worker-done]` ⇒ `open`,
+  ABSENCE of a pill encodes the field's one default —
+  `no runtime pill` ⇒ `todo`, `no [worker-done]` ⇒ `open`,
   `no [validated]` ⇒ `unvalidated`, `no [state]` ⇒ `stopped`, `no
   subagent pill` ⇒ `ok`. The convention is documented in each view's
   `--help` (`keeper board --help` / `keeper jobs --help`). Each
@@ -663,21 +632,18 @@ collapses to plain stream output. Run any of them with
   closer session, i.e. `epics.created_by_closer_of != null`; its
   presence is also what slots the row directly below its parent under
   the default `sort_path ASC` ordering)
-  (with omit-default `[<runtime>]? [worker-done]? [<approval>]?
-  [ready|completed|blocked:<reason>]` pills — the three native fields
+  (with omit-default `[<runtime>]? [worker-done]?
+  [ready|completed|blocked:<reason>]` pills — the two native fields
   consolidated per fn-708: the planctl runtime enum elides its `todo`
   default, renders `in_progress` / `done` verbatim, and relabels
   `blocked` → `[rt:blocked]` so it never collides with the verdict
   `[blocked:*]` family; the derived worker-phase binary never renders
   `open` and surfaces its `done` survivor as the LABELED `[worker-done]`
   (never bare `[done]`, and only when the verdict doesn't already pin it
-  — i.e. not `completed`/`job-pending`/`git-uncommitted`/`git-orphans`);
-  and approval elides `pending`, dropping `[rejected]`/`[approved]`
-  when the adjacent verdict already names it (`blocked:job-rejected` /
-  `completed`)) and a final "Quality audit and close" line for the epic
+  — i.e. not `completed`/`job-pending`/`git-uncommitted`/`git-orphans`))
+  and a final "Quality audit and close" line for the epic
   itself (its `[status]` pill is dropped — the board filter pins it to
-  `open` — and its approval follows the same omit-default + verdict-aware
-  suppression, so the close row usually collapses to just the title plus
+  `open` — so the close row usually collapses to just the title plus
   its `[id] <verdict>` reference line). Sub-agent invocations nest one
   indent level under their owning job row as `{type}: {desc} [<status>]?`,
   stamping the raw projection enum verbatim BUT following omit-default —
@@ -747,7 +713,7 @@ collapses to plain stream output. Run any of them with
   the same family as bare `[blocked]`). Pills NOT in `PILL_COLORS` render
   uncolored on purpose — the eye picks `unknown` and the role labels
   (`planner|worker|closer|creator|refiner`) out by absence of color (the
-  former resting defaults `pending` / `todo` / `unvalidated` / `open`
+  former resting defaults `todo` / `unvalidated` / `open`
   no longer render at all under fn-708's omit-default rule, so they need
   no colorizer carve-out).
   The byte-compare emit gate keeps the stream quiet when row churn
@@ -913,7 +879,7 @@ collapses to plain stream output. Run any of them with
   session's Bash intervals, `planctl` = lifted from a planctl-CLI
   invocation envelope's `files[]` — so `.planctl/{epics,tasks}/*.json`
   and `.planctl/specs/*.md` attribute to the session that ran
-  `planctl scaffold/done/approve/...`); a single file can carry multiple
+  `planctl scaffold/done/...`); a single file can carry multiple
   attribution rows when several live sessions edited it without an
   intervening commit, and the strict `orphan_files` bucket is rendered
   as a separate trailing block for dirty files with zero attribution). Uses `subscribeCollection` from `src/readiness-client.ts`
@@ -1031,20 +997,6 @@ collapses to plain stream output. Run any of them with
   keeper await monitor-running cmd:bun run dev             # my dev server done
   keeper await git-clean and agents-idle                   # both, ANDed
   keeper await complete fn-1-foo --connect-timeout 30s     # opt-in give-up
-  ```
-
-- `approve.ts` — the RPC client. Single-shot: opens a `Bun.connect`, sends
-  one `rpc` frame for `set_task_approval` or `set_epic_approval`, awaits the
-  `rpc_result` (or `error`), and exits. No subscription, no reconnect loop.
-  Approval is a first-class planctl field, so the three valid values are
-  `approved`, `rejected`, and `pending` — there is no `clear` (set to
-  `pending` instead). The CLI infers epic vs. task from the id's shape
-  (trailing `.N` marks a task).
-
-  ```sh
-  keeper approve <epic_id>                   # approved (default)
-  keeper approve <epic_id> pending           # reset to pending
-  keeper approve <epic_id>.<task_n> rejected # reject one task
   ```
 
 The next four subcommands are keeper's git-coordination verbs (epic
@@ -1269,7 +1221,7 @@ drained by the same gated `recheckPending()` from FOUR triggers. As of fn-705
 the plan producer is realtime end to end, mirroring the eighth-worker
 (autopilot) model: it polls `PRAGMA data_version` on its own read-only
 connection (`PLAN_DB_POLL_MS`, 100ms — the cadence the sibling producers
-share) so every keeper DB write, the close→approve fold included, drives a
+share) so every keeper DB write, the close fold included, drives a
 single-flight gated rescan that drains `pending` + re-ingests changed
 `.planctl` files in ~50ms — the realtime complement to the best-effort
 FSEvents subscription, closing the up-to-60s fold lag the heartbeat used to
@@ -1340,8 +1292,8 @@ when set on a root epic, `cascadeSortPath` stamps a `!`-prefixed
 `sort_path` so queue-jumped epics sort above all other root epics in the
 default `sort_path ASC` page. Both are reducer-derived inside
 `syncPlanctlLinks` from the existing `job_links` + `jobs.plan_verb` /
-`plan_ref` substrate; an `EpicSnapshot` carve-out preserves them across an
-approval-RPC round-trip (alongside `tasks` / `jobs` / `job_links`). The
+`plan_ref` substrate; an `EpicSnapshot` carve-out preserves them across a
+file-content re-observation (alongside `tasks` / `jobs` / `job_links`). The
 `EPICS_DESCRIPTOR.defaultSort` flips from `epic_number asc` to
 `sort_path asc`, so a closer-created child epic slots directly below its
 parent in the default page; `sort_path` overflows to `''` at the documented
@@ -1421,7 +1373,7 @@ on miss / non-array / empty / oversized), and the reducer's
 `file_attributions` row per path under `project_dir = state_repo` (the
 absolute repo path, extracted in-fold from the stored envelope) +
 `event.session_id` + the repo-relative path + `event.ts` + the verb
-(`scaffold` / `done` / `approve` / …) as `op`. The
+(`scaffold` / `done` / …) as `op`. The
 `file_attributions.source` CHECK widens to include `'planctl'` via a
 row-preserving table rebuild; pass-2's inferred-guard widens to
 `source IN ('tool','bash','planctl')` so a planctl file does NOT also
@@ -1497,10 +1449,10 @@ the bounded set only — informational-only columns (readiness reads
 `git_status` scalars + per-file `dirty_files[].attributions[]`, not
 the per-job columns), so the narrowed broadcast is a cosmetic shrink.
 `GitRootDropped` retracts symmetrically. As of
-schema v32 (fn-634), `epics` adds `default_visible` as a VIRTUAL
-generated column SQLite computes from
-`CASE WHEN status='open' OR approval!='approved' THEN 1 ELSE 0 END`,
-materializing the descriptor's cross-column default scope as a single
+schema v32 (fn-634, narrowed at v63/fn-756), `epics` adds
+`default_visible` as a VIRTUAL generated column SQLite computes from
+`CASE WHEN status='open' THEN 1 ELSE 0 END`,
+materializing the descriptor's default scope as a single
 0/1 derived value; a partial composite index
 `idx_epics_default_visible ON epics(default_visible, sort_path, epic_id)
 WHERE default_visible = 1` serves the default no-wire-filter query as
@@ -1539,13 +1491,13 @@ consumer whose raw tokens could match the just-written upstream (via
 `SELECT consumer_id FROM epic_dep_edges WHERE dep_token IN (B.epic_id,
 "fn-" || B.epic_number)` — the indexed reverse lookup, never a
 `json_each` scan) and re-stamps each one's `resolved_epic_deps` from
-scratch. End-to-end: completing (done+approved) an upstream re-stamps
+scratch. End-to-end: completing (done) an upstream re-stamps
 every downstream consumer's entries to `satisfied` in the SAME fold,
 and a bare-id ambiguity disambiguates as soon as a new same-number
 epic lands. The readiness/board READ surface is fully projection-driven
 — predicate 9 in `src/readiness.ts` and the board summary pill in
 `scripts/board.ts` consume `epic.resolved_epic_deps` directly (the
-prior fn-637 stopgap that streamed completed (done+approved) epics over
+prior fn-637 stopgap that streamed completed (done) epics over
 a resolver-only subscription so the live readiness pass could see them
 is gone — `subscribeReadiness` is back to four collections, predicate 9
 no longer calls `resolveEpicDep`, and the `BlockReason` surface
@@ -1554,8 +1506,7 @@ autopilot consumes — `dep-on-epic` with `cross_project`,
 shape). The `EpicSnapshot` ON CONFLICT carve-out widens to include
 `resolved_epic_deps` alongside `tasks` / `jobs` / `job_links` /
 `created_by_closer_of` / `sort_path` / `queue_jump` so a file-content
-re-observation (e.g. an approval-RPC round-trip) can't wipe the
-projection-derived dep resolution.
+re-observation can't wipe the projection-derived dep resolution.
 As of schema v35 (fn-642, corrected at v42/fn-662), the `usage`
 projection colocates the Claude rate-limit annotation:
 `last_rate_limit_at` + `last_rate_limit_session_id` are populated
@@ -1882,11 +1833,11 @@ and cleared on the next `UserPromptSubmit` / `SessionStart` revival
 (`PreToolUse` / `PostToolUse` also clear `last_input_request_*`,
 gated on the column-is-not-NULL hot-path predicate — these arms fire
 50+ times per turn so the gate keeps the UPDATE cold when nothing is
-awaiting). Each epic also embeds its plan/close/approve-verb (epic-form)
+awaiting). Each epic also embeds its plan/close-verb (epic-form)
 jobs as a `jobs` JSON array, and each task element embeds its own
-work/approve-verb (task-form) jobs as a nested `jobs` sub-array — fanned in
+work-verb (task-form) jobs as a nested `jobs` sub-array — fanned in
 from the reducer's jobs-side writes whenever a SessionStart spawn name
-parses as `{plan|work|close|approve}::<ref>`
+parses as `{plan|work|close}::<ref>`
 (the `syncJobIntoEpic` helper), so the single `epics` collection serves epic
 + tasks + associated sessions in one subscribe. As of schema v14 a second
 fan-out rides alongside: every `planctl_op != NULL` event AND (epic fn-695,
@@ -2018,8 +1969,8 @@ cooldown is an in-memory `Map<verb::id, unix-seconds>` on `ReconcileState`
 `UIDTrackingControllerExpectations`): `runReconcileCycle` STAMPS the key at
 dispatch — BEFORE the confirm await, so it covers BOTH the `ok` and the slow-
 cold-boot `indoubt` outcomes (the headline bug) — and `reconcile` reads it (a
-read-only gate at BOTH dispatch sites, above the fn-728 budget gate and NOT
-approve-exempt, so it covers work/close/approve alike) to suppress re-dispatch
+read-only gate at BOTH dispatch sites, above the fn-728 budget gate, so it
+covers work/close alike) to suppress re-dispatch
 for `REDISPATCH_COOLDOWN_S`. fn-762 set that window to 200s, STRICTLY GREATER
 than `PENDING_DISPATCH_TTL_MS / 1000` (120) + the `PENDING_DISPATCH_SWEEP`
 granularity (60): the 2026-06-09 incident triple-dispatched one worktree
@@ -2093,11 +2044,10 @@ and never throws (no-self-heal). A **distinct** completion reap (fn-727,
 config-gated on `autoclose_windows`, default `true`) shares the SAME
 `reapSurfaces` close path but gates on the OPPOSITE signal: each reconcile
 cycle, when a row reaches the durable `{tag:"completed"}` readiness verdict
-(fn-756: worker done for a task, `status='done'` for an epic, + idle — the
-approval enum no longer gates), the worker closes every live surface sharing
+(worker done for a task, `status='done'` for an epic, + idle), the worker
+closes every live surface sharing
 that row's id — a completed task reaps `work::<id>`; a completed close-row
-reaps `close::<id>` (fn-756: no `approve::<id>` surface to pair — the approve
-verb is gone). For the close-row verdict to be observed at all, the reconcile
+reaps `close::<id>`. For the close-row verdict to be observed at all, the reconcile
 snapshot must still carry the just-done epic: the default epics read scopes to
 `status='open'`, so fn-764 MERGES in a SECOND bounded read
 (`filter:{status:"done"}`, sorted `updated_at` DESC, limited to a small window
@@ -2221,7 +2171,7 @@ without paying its cost today.
 
 The unified `keeper` CLI is a single dispatcher entrypoint (`cli/keeper.ts`,
 the package.json `bin`) that fans into every subcommand — `board`,
-`autopilot`, `git`, `usage`, `await`, `approve` — so all example clients
+`autopilot`, `git`, `usage`, `await` — so all example clients
 ship as one binary instead of N standalone scripts.
 
 The babysitters live under `babysitters/` — a self-contained Claude-Code plugin
@@ -2232,7 +2182,7 @@ home with one sitter per concern (today: `performance`; planned: `git-orphans`,
 (`babysitters/performance/watch.ts`, its OWN binary — NOT a `keeper`
 subcommand) is an out-of-process read-only scanner: run every 5 minutes under
 launchd, it opens `keeper.db` read-only, deterministically detects the recurring
-failure classes (autopilot stalls, duplicate dispatches / approvals, reducer
+failure classes (autopilot stalls, duplicate dispatches, reducer
 wedge, dead-letter growth, stuck jobs, backstop self-telemetry degradation, and
 event→projection fold latency), and escalates only genuinely-new signatures to a
 headless `babysitters:performance` agent (loaded via `--plugin-dir`) — it never writes the DB, mints no synthetic events, and performs
@@ -2333,9 +2283,9 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 # Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots. As of schema v29 the natural sort is `sort_path ASC` (matches the `EPICS_DESCRIPTOR` default), which slots closer-created children directly below their parent — an unfiltered query uses idx_epics_sort_path; the default-scope query (`WHERE default_visible = 1`, schema v32) uses the partial composite idx_epics_default_visible:
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT epic_id, epic_number, sort_path, created_by_closer_of, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
-# Default-scope epics — what the board sees by default: every open OR not-yet-approved epic. Schema v32 (fn-634) materializes the predicate as the VIRTUAL generated column `default_visible` and a partial composite index `idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1` serves it as a covering SEARCH (no SCAN, no temp B-tree). The literal `= 1` is load-bearing for the partial-index match:
+# Default-scope epics — what the board sees by default: every open epic. Schema v32 (fn-634, narrowed at v63/fn-756) materializes the predicate `status='open'` as the VIRTUAL generated column `default_visible` and a partial composite index `idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1` serves it as a covering SEARCH (no SCAN, no temp B-tree). The literal `= 1` is load-bearing for the partial-index match:
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT epic_id, epic_number, sort_path, title, status, approval FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
+  'SELECT epic_id, epic_number, sort_path, title, status FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
 # Tasks live inside epics.tasks now — unnest with json_each to list them per epic. Schema v19 surfaces BOTH the planctl-native runtime status (`runtime_status`: todo|in_progress|done|blocked, ingested from `.planctl/state/tasks/<task_id>.state.json`) AND the derived worker-phase binary (`worker_phase`: open|done, derived from `worker_done_at`) — outer ORDER BY uses the idx_epics_sort_path index:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.runtime_status') AS runtime_status, json_extract(t.value, '\$.worker_phase') AS worker_phase FROM epics e, json_each(e.tasks) t ORDER BY e.sort_path ASC, task_number ASC LIMIT 10"
