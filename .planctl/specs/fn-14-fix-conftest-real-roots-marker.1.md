@@ -18,5 +18,5 @@ Fix: change `(slow bucket)` to `(fast-path marker)` at line 749.
 - [ ] Verify no other instances of `real_roots` in conftest carry the slow-bucket label
 
 ## Done summary
-
+Fixed _isolated_roots_default docstring at conftest.py to label @pytest.mark.real_roots as a fast-path marker instead of slow bucket; real_roots is absent from _SLOW_BUCKET_MARKERS and is the autouse empty-discovery isolation opt-out.
 ## Evidence
