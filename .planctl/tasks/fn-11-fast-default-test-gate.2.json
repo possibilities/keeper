@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Triage suite into fast and slow buckets",
-  "updated_at": "2026-06-10T03:04:29.082226Z"
+  "updated_at": "2026-06-10T04:11:04.802793Z",
+  "worker_done_at": "2026-06-10T04:11:04.802793Z"
 }

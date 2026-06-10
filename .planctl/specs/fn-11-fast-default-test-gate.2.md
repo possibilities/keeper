@@ -63,5 +63,5 @@ subprocess spy over the full fast gate: target is near-zero spawns
 - [ ] Per-test triage applied where whole-file marking is wrong (test_validate, test_validate_marker at minimum)
 
 ## Done summary
-
+Triaged the full test suite into fast and slow buckets: git/wire-essential tests marked into the skip-by-default slow bucket, cross-project/roots tests opted onto controlled tmp-root fixtures. Both gates green: fast (576 passed, 174 skipped) and --run-slow (748 passed). Docs updated in CLAUDE.md and pyproject.toml.
 ## Evidence
