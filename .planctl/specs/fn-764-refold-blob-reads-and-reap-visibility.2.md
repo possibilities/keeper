@@ -72,5 +72,5 @@ updated ones.
 - [ ] full bun test green; readiness.ts untouched; no schema bump
 
 ## Done summary
-
+loadReconcileSnapshot merges a bounded done-epics window (filter:{status:done}, updated_at DESC, limit 32) into the snapshot so the fn-727 close-row completion reap is reachable post-fn-756; real-DB tests prove a done epic reaches completedRowIds with zero dispatches and the read stays O(limit). Stale approve::<id> reap prose corrected in CLAUDE.md/README/exec-backend.md. No schema bump.
 ## Evidence
