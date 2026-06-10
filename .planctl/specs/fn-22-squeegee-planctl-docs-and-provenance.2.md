@@ -30,5 +30,5 @@ cli.py docstrings feed --help; a restructured paragraph silently changes user-fa
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Scrubbed fn-NNN provenance ids from planctl/*.py docstrings and comments, restating each as present-tense fact. Kept data fn-refs (format/fixture/matching examples) and the load-bearing verb-name string values in commit_messages.py / validation_restamp.py byte-identical. Full slow suite + ruff + format + ty green; --help output unchanged for every touched Click verb.
 ## Evidence

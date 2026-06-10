@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Scrub source provenance refs",
-  "updated_at": "2026-06-10T20:04:00.074099Z"
+  "updated_at": "2026-06-10T21:15:16.129079Z",
+  "worker_done_at": "2026-06-10T21:15:16.129079Z"
 }
