@@ -76,5 +76,5 @@
 - [ ] CLAUDE.md reads present-tense with all substrate clauses pruned
 
 ## Done summary
-
+Quieted the snippet-substrate render surface: assemble_brief and close-preflight no longer shell promptctl render-spec (snippet_context stays present-and-empty, schema v1), scaffold drops the no-substrate advisory, and substrate prose is pruned from CLAUDE.md and docstrings. Dormant verbs, sketch_refs, bundle_ref, and persisted snippets/bundles fields left fully intact.
 ## Evidence
