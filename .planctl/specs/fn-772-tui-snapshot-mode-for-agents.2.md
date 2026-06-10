@@ -71,5 +71,5 @@ test:full` is mandatory (these spawn CLI subprocess paths in the slow tier).
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Fanned snapshot mode out to jobs (1 stream), board (2), and autopilot (4): each parses --snapshot/--watch/--timeout, resolves mode via resolveSnapshotMode, documents flags in HELP, and disposes all subscription handles before exit. Added view-shell reportSnapshotStream so multi-stream views hold the latch until every stream folds (deterministic composite, not ordering-luck).
 ## Evidence
