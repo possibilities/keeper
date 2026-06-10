@@ -93,23 +93,24 @@ flowchart TB
     subgraph close_skill["Close Skill"]
         direction TB
 
-        spawn_auditor["Spawn quality-auditor\n(opus, trailer-derived commits)"]
-        spawn_classifier["Spawn classifier subagent\n(sonnet, no-tools)\nemits <VERDICT_JSON>"]
-        parse_verdict["Parse + validate\n<VERDICT_JSON>\nagainst schema.json"]
+        close_preflight["planctl close-preflight\n(brief.json; commit_set_hash)"]
+        spawn_auditor["Spawn quality-auditor blind\n(reads brief; audit submit\n-> report.md; returns findings=N)"]
+        findings_check{"findings > 0?"}
+        spawn_planner["Spawn close-planner blind\n(vet/cull/merge;\nverdict submit + followup submit)"]
+        close_finalize["planctl close-finalize\n(saga: stale-check ->\nfatal-halt ->\nscaffold -> epic close)"]
+        outcome{"CloseOutcome"}
 
-        fatal_check{"fatal?"}
-        parse_fail{"parse /\nschema fail?"}
+        epic_close["closed_clean / closed_with_followup\n(epic close stamps closer_done_at;\naudit ran inline)"]
+        halt_needs_work["fatal_halt / partial_followup\n(do NOT close;\nno status stamp)"]
 
-        epic_close["planctl epic close\n(stamps closer_done_at;\nfn-559: audit ran inline)"]
-        halt_needs_work["halt\n(do NOT close;\nno status stamp)"]
-
-        spawn_auditor --> spawn_classifier
-        spawn_classifier --> parse_verdict
-        parse_verdict --> parse_fail
-        parse_fail -- "yes" --> halt_needs_work
-        parse_fail -- "no" --> fatal_check
-        fatal_check -- "yes" --> halt_needs_work
-        fatal_check -- "no" --> epic_close
+        close_preflight --> spawn_auditor
+        spawn_auditor --> findings_check
+        findings_check -- "no" --> close_finalize
+        findings_check -- "yes" --> spawn_planner
+        spawn_planner --> close_finalize
+        close_finalize --> outcome
+        outcome -- "closed_*" --> epic_close
+        outcome -- "fatal_halt / partial" --> halt_needs_work
     end
 
     %% ===== ACK GATE (fn-386; fn-559) =====
@@ -182,13 +183,13 @@ flowchart TB
     %% ===== CROSS-SKILL CONNECTIONS =====
     user -. "/plan:plan" .-> plan_init
     user -. "/plan:work" .-> resolve_input
-    user -. "/plan:close" .-> spawn_auditor
+    user -. "/plan:close" .-> close_preflight
     user -. "planctl epic ack <epic_id>" .-> epic_ack
     user -. "/plan:approve <id>" .-> approve_render
     user -. "/plan:deps" .-> read_epics
 
     offer -. "user proceeds to work" .-> resolve_input
-    %% fn-559: close stamps closer_done_at; epic flips straight to pending_approval
+    %% close stamps closer_done_at; epic flips straight to pending_approval
     epic_close -. "closer_done_at stamped\n(ack gate armed)" .-> epic_ack
 
     %% ===== SKILL-TO-CLI CONNECTIONS =====
