@@ -194,7 +194,9 @@ control pair — `set_autopilot_mode` (`AutopilotMode` → the `autopilot_state`
 singleton's `yolo`/`armed` mode column) and `set_epic_armed` (`EpicArmed` → the
 `armed_epics` presence table). The fn-751 pair is APPEND-ONLY (no main→worker
 relay): the level-triggered reconciler re-reads mode + armed from the projection
-each cycle, woken by the fold's `data_version` bump. RPC handlers — via the
+each cycle, woken by the fold's `data_version` bump. fn-774 gives `armed_epics`
+a SECOND writer — a fold-side prune (NOT an RPC) that deletes the row when an
+epic folds to `status='done'`, so a completed epic can't stay armed. RPC handlers — via the
 scoped main-bridge — append real events to the log AND flip the `dead_letters`
 audit row in one transaction; never reducer projections directly (see
 [CLAUDE.md](./CLAUDE.md)'s DO NOT list). Example clients ship under the unified
@@ -1649,7 +1651,13 @@ preserve `mode`). A new `armed_epics` PRESENCE table (`epic_id TEXT PRIMARY
 KEY`, plus `last_event_id` / `created_at` / `updated_at`) carries the per-epic
 armed flag: `EpicArmed{epic_id,armed}` synthetic events fold via
 `foldEpicArmed` — `armed:true` → `INSERT OR REPLACE` the row, `armed:false` →
-`DELETE` the row (a row's presence means armed). The reconcile worker reads
+`DELETE` the row (a row's presence means armed). fn-774 adds a SECOND writer of
+this table: the `EpicSnapshot` fold prunes the row when an epic folds to
+`status='done'` (`epicIsCompleted`) — a completed epic drops off the armed set
+(reconcile closure + `[armed]` board pill) rather than lingering. The prune sits
+OUTSIDE the EpicSnapshot ON-CONFLICT scalar-change carve-out (mirroring the
+`epic_tombstones` clear) so it fires on every `done` snapshot and a from-scratch
+re-fold leaves zero rows for any epic that ever completed. The reconcile worker reads
 both `mode` and the armed set from the projection snapshot every cycle (no
 relay, no in-memory cache) so the state survives restart for free. The mode
 suppression lives in two places: a per-row `work`-gate in `reconcile()`, AND

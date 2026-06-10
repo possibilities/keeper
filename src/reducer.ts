@@ -956,6 +956,28 @@ function projectPlanRow(db: Database, event: Event): void {
         index.epicsByNumber,
       );
     }
+
+    // fn-774: PRUNE the `armed_epics` row when this epic folds to completion.
+    // An epic that has left the board (`status='done'` — the canonical
+    // `epicIsCompleted` predicate, `epic-deps.ts`) can't still be armed; the
+    // reconcile closure + the `[armed]` board pill must drop it. This makes
+    // the EpicSnapshot fold a SECOND writer of `armed_epics` alongside
+    // `foldEpicArmed` (the EpicArmed-event writer) — the disarm-on-completion
+    // half of the presence table's lifecycle. Like the line-804
+    // `epic_tombstones` clear above, this DELETE sits OUTSIDE the ON-CONFLICT
+    // scalar-change carve-out so it fires on EVERY `done` snapshot including
+    // unchanged-scalar re-emits: a pure function of
+    // (`hook_event === "EpicSnapshot"` ∧ `snapshot.status === "done"`), so a
+    // cursor=0 re-fold reproduces byte-identical `armed_epics` rows
+    // (CLAUDE.md "re-fold determinism"). Placing it inside the carve-out would
+    // skip the prune on an unchanged-scalar re-emit and break determinism on
+    // the arm-after-done interleaving. STRICT `=== "done"` (not truthiness) so
+    // a null/missing status no-ops rather than throwing. Idempotent bare
+    // `db.run`: a no-op DELETE on a never-armed epic (the common case — most
+    // done epics were never armed) and harmless on a repeat `done` snapshot.
+    if (snapshot.status === "done") {
+      db.run("DELETE FROM armed_epics WHERE epic_id = ?", [entityId]);
+    }
   } else {
     // TaskSnapshot: a read-modify-write on the PARENT epic's embedded `tasks`
     // array. The parent key is `snapshot.epic_id` (NOT event.session_id, which

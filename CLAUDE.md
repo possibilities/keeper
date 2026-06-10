@@ -98,7 +98,12 @@ shape because a consumer reads it.
   write `jobs`/`epics`/etc directly. The fn-751 pair is APPEND-ONLY (no
   main→worker relay, unlike `set_autopilot_paused`): the level-triggered
   reconciler re-reads mode + armed from the projection each cycle, woken by the
-  fold's `data_version` bump.
+  fold's `data_version` bump. **`armed_epics` has a SECOND writer (fn-774):**
+  the `EpicSnapshot` fold prunes the row when an epic folds to `status='done'`
+  (`epicIsCompleted`) — a completed epic can't stay armed. That's a fold-side
+  lifecycle delete (NOT an RPC write), so the "RPC may write ONLY five surfaces"
+  fence is unbroken; `foldEpicArmed` (the EpicArmed-event writer) and the
+  EpicSnapshot completion-prune are the two writers of the table.
 - **Plans are READ-ONLY.** The plan worker folds `.planctl/{epics,tasks}`
   snapshots into `epics`; every field is read-only end to end, the same fence as
   `jobs`. No RPC writes a plan field.
@@ -234,7 +239,13 @@ upstream. The per-epic armed flag is a PRESENCE table (`armed_epics`): row prese
 = armed. Both are written via the `set_autopilot_mode` / `set_epic_armed` RPCs
 (synthetic `AutopilotMode` / `EpicArmed` events) and READ FROM THE PROJECTION each
 reconcile cycle — no relay, no `ReconcileState` cache — so they survive restart
-for free. The mode check is a SUPPRESSION ARM inside reconcile (a desired-state
+for free. **fn-774: the `EpicSnapshot` fold is a SECOND `armed_epics` writer** —
+when an epic folds to `status='done'` (`epicIsCompleted`) the fold prunes its
+`armed_epics` row, so a completed-while-armed epic drops off the armed set
+(reconcile closure + the `[armed]` board pill) instead of lingering. The prune
+sits OUTSIDE the EpicSnapshot ON-CONFLICT scalar-change carve-out (mirroring the
+`epic_tombstones` clear) so it fires on every `done` snapshot — re-fold
+deterministic by construction. The mode check is a SUPPRESSION ARM inside reconcile (a desired-state
 verdict). fn-770 also threads the per-cycle eligible Set into `readiness.ts`'s
 per-root mutex: its discretionary pass-2 ready-tiebreak is now eligibility-aware,
 so an armed (eligible) epic wins a free root over an earlier-sorted unarmed

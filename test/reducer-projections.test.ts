@@ -2036,6 +2036,107 @@ test("from-scratch re-fold reproduces autopilot_state + armed_epics byte-identic
   expect(armedAfter).toEqual(armedBefore);
 });
 
+test("EpicSnapshot done prunes the armed_epics row (fn-774)", () => {
+  // Arm an epic, then fold a `{status:'done'}` EpicSnapshot for it — the
+  // completion prune deletes the presence row. Keyed on event.session_id
+  // (= the epic_id in this fold), so the right row drops.
+  epicArmedEvent("fn-20-arm-then-done", true);
+  drainAll();
+  expect(getArmedEpics().map((r) => r.epic_id)).toEqual([
+    "fn-20-arm-then-done",
+  ]);
+  const doneId = epicSnapshotEvent("fn-20-arm-then-done", {
+    epic_number: 20,
+    title: "arm then done",
+    status: "done",
+  });
+  drainAll();
+  expect(getArmedEpics().length).toBe(0); // pruned on completion
+  expect(getCursor()).toBe(doneId); // cursor advanced
+});
+
+test("EpicSnapshot done on a never-armed epic is a harmless no-op (fn-774)", () => {
+  // The common case: most done epics were never armed. The DELETE matches no
+  // row, never throws, and the cursor still advances.
+  const doneId = epicSnapshotEvent("fn-21-never-armed", {
+    epic_number: 21,
+    title: "never armed",
+    status: "done",
+  });
+  expect(drainAll()).toBe(1);
+  expect(getArmedEpics().length).toBe(0);
+  expect(getCursor()).toBe(doneId);
+});
+
+test("EpicSnapshot with a non-done status leaves an armed row intact (fn-774)", () => {
+  // The prune is gated STRICTLY on status === 'done'; an open/null status
+  // EpicSnapshot for an armed epic must NOT touch its presence row.
+  epicArmedEvent("fn-22-still-open", true);
+  // status:'open' — not done.
+  epicSnapshotEvent("fn-22-still-open", {
+    epic_number: 22,
+    title: "still open",
+    status: "open",
+  });
+  // missing status — null, must not throw and must not prune.
+  epicSnapshotEvent("fn-22-still-open", {
+    epic_number: 22,
+    title: "still open, no status",
+  });
+  drainAll();
+  expect(getArmedEpics().map((r) => r.epic_id)).toEqual(["fn-22-still-open"]);
+});
+
+test("a repeat done EpicSnapshot for an already-pruned epic is a harmless no-op (fn-774)", () => {
+  epicArmedEvent("fn-23-double-done", true);
+  epicSnapshotEvent("fn-23-double-done", {
+    epic_number: 23,
+    title: "double done",
+    status: "done",
+  });
+  drainAll();
+  expect(getArmedEpics().length).toBe(0);
+  // A SECOND done snapshot — the row is already gone; the DELETE no-ops.
+  const secondDoneId = epicSnapshotEvent("fn-23-double-done", {
+    epic_number: 23,
+    title: "double done",
+    status: "done",
+  });
+  drainAll();
+  expect(getArmedEpics().length).toBe(0);
+  expect(getCursor()).toBe(secondDoneId);
+});
+
+test("from-scratch re-fold over [EpicArmed X true, EpicSnapshot X done] leaves zero armed_epics rows (fn-774)", () => {
+  // The determinism acceptance bar: an epic that ever folded to `done`
+  // reproduces ZERO armed_epics rows on a cursor=0 re-fold. Wipe the
+  // armed_epics + epics + epic_tombstones projections, rewind, re-drain →
+  // byte-identical (empty) armed set.
+  epicArmedEvent("fn-24-replay", true);
+  epicArmedEvent("fn-25-stays-armed", true); // never completes — survives replay
+  epicSnapshotEvent("fn-24-replay", {
+    epic_number: 24,
+    title: "replay",
+    status: "done",
+  });
+  drainAll();
+  const armedBefore = db
+    .query("SELECT * FROM armed_epics ORDER BY epic_id ASC")
+    .all();
+  expect(getArmedEpics().map((r) => r.epic_id)).toEqual(["fn-25-stays-armed"]);
+  // Rewind + wipe the touched projections + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM armed_epics");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM epic_tombstones");
+  drainAll();
+  const armedAfter = db
+    .query("SELECT * FROM armed_epics ORDER BY epic_id ASC")
+    .all();
+  expect(armedAfter).toEqual(armedBefore); // byte-identical
+  expect(getArmedEpics().map((r) => r.epic_id)).toEqual(["fn-25-stays-armed"]);
+});
+
 // ---------------------------------------------------------------------------
 // Schema v46 / fn-666 — planctl-file attribution mint
 // ---------------------------------------------------------------------------
