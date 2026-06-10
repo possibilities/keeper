@@ -30,5 +30,5 @@ Deleting a Commit-behavior fact that is NOT in the memo loses a real contract de
 - [ ] Done summary reports lines and chars deleted (CLAUDE.md char count before/after)
 
 ## Done summary
-
+Collapsed CLAUDE.md Commit-behavior + Skills-and-agents sections to trip-wire pointers (24402->6240 chars, -18162), created docs/reference/skills-and-agents.md, and scrubbed all 27 provenance fn-refs from commit-at-mutation-boundary.md (folding the set-repo warnings field in first). AGENTS.md symlink intact; full slow suite + ruff + ty green.
 ## Evidence
