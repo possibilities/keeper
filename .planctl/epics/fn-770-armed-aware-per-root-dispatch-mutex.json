@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-770-armed-aware-per-root-dispatch-mutex",
   "bundles": [],
+  "closer_done_at": "2026-06-10T15:37:34.993231Z",
   "created_at": "2026-06-10T14:58:42.058026Z",
   "depends_on_epics": [],
   "id": "fn-770-armed-aware-per-root-dispatch-mutex",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "armed-aware per-root dispatch mutex",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T14:58:42.058026Z"
+  "updated_at": "2026-06-10T15:37:34.993231Z"
 }
