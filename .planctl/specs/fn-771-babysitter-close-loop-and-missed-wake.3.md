@@ -48,5 +48,5 @@ Cases: latency 2_000 + staleness 1_611_292 → no finding (the incident); 15_000
 - [ ] performance.md + README prose revised in place; bun test keeper-watch suite green
 
 ## Done summary
-
+Replaced the idle-inflated staleness_ms gate in the backstop-degraded late-rescue detector with change_to_rescue_ms warn(10s)/crit(60s) bands; null/old-format/dirty-tree rescues classify healthy, raw staleness_ms retained in evidence only. Bumped FINGERPRINT_VERSION and BACKSTOP_BASELINE_VERSION together; revised performance.md + README prose.
 ## Evidence
