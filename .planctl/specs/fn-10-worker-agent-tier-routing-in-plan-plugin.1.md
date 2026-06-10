@@ -50,5 +50,5 @@ and `null` for a null-tier task.
 - [ ] helper + three-verb envelope tests pass; `worker_agent` is NOT added to the brief
 
 ## Done summary
-
+Added worker_agent_for_tier helper beside TASK_TIERS in models.py (tier -> plan:worker-<tier>, None for null-tier, ValueError on bogus). claim, resolve-task, and worker resume now emit worker_agent alongside tier; helper + three-verb envelope tests cover valid/null/invalid paths.
 ## Evidence
