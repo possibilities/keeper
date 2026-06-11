@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-11T21:08:33.035944Z",
   "created_at": "2026-06-11T19:20:23.175253Z",
   "depends_on_epics": [],
   "id": "fn-787-fix-reducer-slow-folds",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix reducer slow folds",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-11T19:40:25.403225Z"
+  "updated_at": "2026-06-11T21:08:33.035944Z"
 }
