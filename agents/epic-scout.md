@@ -36,7 +36,7 @@ epics = obj["epics"]
 
 Filter client-side to `status: "open"` epics only. Skip epics with `status: "done"`. If a `Target epic to exclude: <id>` line is present in the brief, also remove that epic from the candidate list before proceeding.
 
-**Cross-project pool (fn-600).** The candidate set is the **cross-project pool** of open epics across every project under the configured `roots`, not just the cwd project's epics. `epic.depends_on_epics` resolves bare `fn-N` ids cwd-first-then-global (see `apps/planctl/docs/reference/cross-project-epic-deps.md`), so any open epic in any discovered project is a valid dependency / overlap / reverse-dependency candidate for the new plan. When the human runs planctl with no `roots` configured, the pool collapses to the cwd project alone — single-repo workflows behave as before.
+**Cross-project pool (fn-600).** The candidate set is the **cross-project pool** of open epics across every project under the configured `roots`, not just the cwd project's epics. `epic.depends_on_epics` resolves bare `fn-N` ids cwd-first-then-global, so any open epic in any discovered project is a valid dependency / overlap / reverse-dependency candidate for the new plan. When the human runs planctl with no `roots` configured, the pool collapses to the cwd project alone — single-repo workflows behave as before.
 
 ### 2. For each open epic, read its spec
 

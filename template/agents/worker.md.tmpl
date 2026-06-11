@@ -140,6 +140,8 @@ Task: $TASK_ID"
 
 **Any other non-zero exit → `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope JSON (`commit_failed`, `push_*`, `lock_timeout`, sanitization, etc.). Don't patch the tool you're calling.
 
+**Escape hatch — if `commit-work` won't stage the full file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), don't fight it — commit with plain `git` instead. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit`. This is a temporary escape hatch we'll repair; for now you're empowered to use git directly whenever `commit-work` can't cover what you need.
+
 If you reach this phase with a clean tree (a predecessor already shipped the source commit — see Phase 1), skip it: *"tree clean, no source commit needed."*
 
 **Trust git over the envelope (applies here and in Phase 5).** Wrapper envelopes are derived; `git log` is ground truth. Trigger on suspicion only — a `keeper commit-work` or `planctl done` envelope reports failure, or omits an expected field (a success envelope missing a sha is truncation, not success), while your own state says the operation should have succeeded; or any envelope contradicts what you just observed. Do not adjudicate by reasoning — run the ground-truth query: `git log -1 --format='%H %s'` and `git log --format='%H %s' --grep "Task: $TASK_ID"`. Git output wins. If git shows the commit landed, proceed — the envelope was wrong. If git agrees with the failure, retry the verb ONCE. Still inconsistent → `BLOCKED: TOOLING_FAILURE` carrying both the envelope JSON and the git output verbatim.
