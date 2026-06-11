@@ -103,9 +103,15 @@ and inserts a short OS-level yield AFTER each fold's COMMIT — a bounded
 event-count budget (~500 events × 5 ms ≈ 2.5 s) so the bounce window stays
 small under a normal backlog, and a from-scratch re-fold catches up to head
 without paying the per-event sleep for minutes. The end-of-boot WAL checkpoint
-is `PASSIVE` (writer-skipping), never `TRUNCATE` (writer-blocking), so a
-concurrent hook INSERT landing during the bounce window is never starved into
-a dead-letter while the checkpoint completes.
+is `TRUNCATE`: it runs before any worker thread spawns, so main's writer is the
+only connection attached and there is nothing to block on. Emptying the WAL means
+every worker's first `openDb` reads the main file with no WAL frames to scan and
+no `-shm` recovery path to walk — closing a boot-race failure surface under load.
+(If an external read-only attachment is present, `wal_checkpoint` returns a busy
+status row rather than throwing, degrading to a `busy_timeout`-bounded PASSIVE
+pause; boot proceeds.) Steady-state checkpoints stay `PASSIVE` (writer-skipping),
+never `TRUNCATE`: live workers and the reaper run concurrently there, and PASSIVE
+skips them without blocking.
 
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names

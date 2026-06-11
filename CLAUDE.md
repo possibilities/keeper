@@ -86,6 +86,15 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
 
 - **`isMainThread` guard** — a plain import of the module is inert.
 - **Own `openDb` connection** (read-only for readers); never share main's.
+- **`prepareStmts:false` on connections that use no prepared statements** — every
+  worker destructures `{db}` only (main is the sole `stmts` consumer), so preparing
+  statements at open is wasted cost and a needless schema-dependence at the raciest
+  moment of boot.
+- **Bounded initial-open retry for the transient boot class** — `openDb` retries the
+  raciest boot-open failures (a fresh `Database` per attempt, sync backoff, bounded
+  count) and still fails loud after exhaustion. This is boot robustness, not
+  self-heal — `no such table` is retryable ONLY at initial open on a known-migrated
+  path; everywhere else it is fatal.
 - **Typed messages** — `{ kind }` worker→main, `{ type }` main→worker.
 - **Supervisor-owned lifecycle** — main spawns after migrate+boot-drain and is the
   only one that terminates (`shutdown` → await close → terminate). A worker owning an

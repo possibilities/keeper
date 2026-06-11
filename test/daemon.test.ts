@@ -218,14 +218,12 @@ test("withBootDrainCheckpointTuning still folds the boot backlog to completion",
   ).last_event_id;
   expect(cursor).toBe(3);
 
-  // The trailing PASSIVE checkpoint flushed every COMMITted frame from the
-  // WAL into the main DB. A subsequent PASSIVE returns `log == checkpointed`
-  // — every frame in the WAL file has been moved into the main DB — and
-  // `busy == 0` (no concurrent writer blocked us). Unlike TRUNCATE,
-  // PASSIVE does not reclaim the WAL file itself; the file shrinks on a
-  // later autocheckpoint pass once steady state resumes. The point of the
-  // PASSIVE choice is that the checkpoint NEVER waits on a concurrent hook
-  // writer, so the bounce window closes cleanly.
+  // The trailing TRUNCATE checkpoint flushed every COMMITted frame from the
+  // WAL into the main DB AND reclaimed the WAL file. A subsequent PASSIVE
+  // therefore sees an empty WAL: `log == 0`, `checkpointed == 0` (nothing left
+  // to move), and `busy == 0` (no concurrent writer blocked us — at boot main's
+  // writer is the only attached connection). The `checkpointed == log` invariant
+  // (here 0 == 0) holds because every frame was already flushed.
   const checkpoint = db.query("PRAGMA wal_checkpoint(PASSIVE)").get() as {
     busy: number;
     log: number;
@@ -290,8 +288,9 @@ test("boot drain spanning multiple batches catches up every event", () => {
 //     (a known-wide-gap drain consistently yields the lock; a known-tight
 //     loop consistently starves a short-`busy_timeout` writer)
 //   - the large-backlog wedge guard (the budget caps total paced latency)
-//   - `withBootDrainCheckpointTuning`'s end-of-boot checkpoint switched from
-//     TRUNCATE (writer-blocking) to PASSIVE (writer-skipping)
+//   - `withBootDrainCheckpointTuning`'s end-of-boot checkpoint is TRUNCATE
+//     (empties the WAL — boot runs before any worker spawns, so nothing to
+//     block on; every worker's first open then sees no WAL/-shm recovery path)
 
 test("drain post-COMMIT pacing invokes the injected sleep exactly once per folded event", () => {
   const { db } = openDb(dbPath);
@@ -943,31 +942,26 @@ test("usage-mint crash regression: a real insertEvent.run starved past busy_time
   expect(isTransientBusyError(thrown)).toBe(true);
 }, 120_000);
 
-test("withBootDrainCheckpointTuning ends the boot with a PASSIVE checkpoint (writer-skipping, not TRUNCATE)", () => {
-  // The end-of-boot checkpoint runs in the `finally` AFTER the drain body.
-  // TRUNCATE waits for any concurrent writers AND for any read-transaction
-  // old enough to need pre-WAL pages — under concurrent hook INSERTs
-  // landing during the bounce window, TRUNCATE absorbs a full hook
-  // `busy_timeout` (1.2s) of writer-lock-blocked latency and starves a
-  // second hook into dead-letters. PASSIVE skips writers — it
-  // checkpoints what it can without blocking.
+test("withBootDrainCheckpointTuning ends the boot with a TRUNCATE checkpoint (empties the WAL)", () => {
+  // The end-of-boot checkpoint runs in the `finally` AFTER the drain body. It
+  // is TRUNCATE, not PASSIVE: this wrapper runs at boot BEFORE any worker
+  // thread spawns, so main's writer is the only connection attached and there
+  // is nothing to wait on. TRUNCATE empties the WAL file so every worker's
+  // first `openDb` reads the main file with no WAL frames to scan and no `-shm`
+  // recovery path to walk — closing a boot-race failure surface under load.
   //
   // Probe the choice via the WAL file's observable post-state. After the
   // wrapper exits:
-  //   - PASSIVE leaves `log > 0` (WAL file still carries the now-
-  //     checkpointed frames; file is not reclaimed)
-  //   - TRUNCATE leaves `log == 0` (file reclaimed)
-  // A pre-existing test ("withBootDrainCheckpointTuning still folds the
-  // boot backlog to completion") already verifies the wrapper folds events
-  // AND that ALL frames in the WAL have been checkpointed
-  // (`checkpointed == log`). This test pins the SPECIFIC checkpoint mode by
-  // asserting `log > 0` after — the regression signal if a future tweak
-  // switches the trailing checkpoint back to TRUNCATE.
+  //   - TRUNCATE leaves `log == 0` (WAL file reclaimed)
+  //   - PASSIVE leaves `log > 0` (frames flushed but the file is not reclaimed)
+  // This test pins the SPECIFIC checkpoint mode by asserting `log == 0` after —
+  // the regression signal if a future tweak switches the trailing checkpoint
+  // back to PASSIVE.
   const { db } = openDb(dbPath);
 
-  // Seed enough events that the WAL has measurable frame count after
-  // checkpoint (a too-small WAL would also yield log=0 after PASSIVE
-  // because there was nothing to flush).
+  // Seed enough events that PASSIVE would leave a measurable WAL frame count —
+  // so the `log == 0` assertion below is meaningful (a too-small WAL would also
+  // yield log=0 under PASSIVE, masking a regression).
   for (let i = 1; i <= 20; i += 1) {
     seedEvent(db, `sess-${i}`, "SessionStart", i);
     seedEvent(db, `sess-${i}`, "Stop", i + 1000);
@@ -977,21 +971,17 @@ test("withBootDrainCheckpointTuning ends the boot with a PASSIVE checkpoint (wri
     drainToCompletion(db);
   });
 
-  // Probe the post-state. PASSIVE leaves frames in the WAL file (the
-  // strictly-better tradeoff for the bounce window: a slightly larger WAL
-  // vs starving a concurrent hook into a dead-letter). A regression to
-  // TRUNCATE would leave `log == 0` here.
+  // Probe the post-state. TRUNCATE reclaimed the WAL file, so a follow-up
+  // checkpoint sees an empty WAL: `log == 0`. A regression to PASSIVE would
+  // leave `log > 0` here.
   const probe = db.query("PRAGMA wal_checkpoint(PASSIVE)").get() as {
     busy: number;
     log: number;
     checkpointed: number;
   };
-  // The wrapper's own PASSIVE already moved every frame into the main DB
-  // and zero new ones landed since, so this re-PASSIVE shows
-  // `checkpointed == log` (all flushed) AND `log > 0` (file not reclaimed).
   expect(probe.busy).toBe(0);
-  expect(probe.checkpointed).toBe(probe.log);
-  expect(probe.log).toBeGreaterThan(0);
+  expect(probe.log).toBe(0);
+  expect(probe.checkpointed).toBe(0);
 
   db.close();
 });

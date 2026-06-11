@@ -293,15 +293,23 @@ export function buildPendingDispatchSweepRecords(
  * absorbs a synchronous checkpoint while holding the write lock, and concurrent
  * hook INSERTs exhaust their `busy_timeout` and dead-letter. With auto-checkpoint
  * off, every fold COMMIT is a pure WAL append so the write lock releases promptly
- * and hook INSERTs interleave; a single `wal_checkpoint(PASSIVE)` in the
- * `finally` flushes frames back. The `finally` guarantees we never leave the
- * long-running writer with checkpointing disabled even if a drain throws.
+ * and hook INSERTs interleave; a single `wal_checkpoint(TRUNCATE)` in the
+ * `finally` flushes frames back and empties the WAL file. The `finally`
+ * guarantees we never leave the long-running writer with checkpointing disabled
+ * even if a drain throws.
  *
- * PASSIVE not TRUNCATE: TRUNCATE waits for concurrent writers and old readers,
- * absorbing a full hook `busy_timeout` of writer-lock latency and starving a
- * hook into a dead-letter. PASSIVE skips writers — it checkpoints what it can
- * without blocking. The WAL is not reclaimed on this pass but shrinks naturally
- * once steady-state auto-checkpoints resume.
+ * TRUNCATE here, PASSIVE in steady state: this call site runs at boot BEFORE any
+ * worker thread spawns (the `new Worker(...)` sites are all later in `start`), so
+ * the only connection attached to the DB is main's own writer — TRUNCATE has no
+ * concurrent writer or reader to wait on. Emptying the WAL means every worker's
+ * first `openDb` reads the main file with no WAL frames to scan and no `-shm`
+ * recovery path to walk, removing a raciest-moment failure surface at boot. If an
+ * external read-only attachment is present (keeper-py, the performance sitter,
+ * dashctl), `PRAGMA wal_checkpoint` returns a busy-status ROW rather than throwing,
+ * so the worst case degrades to a `busy_timeout`-bounded pause with PASSIVE
+ * semantics and boot still proceeds. Steady-state checkpoints stay PASSIVE — the
+ * hook no longer writes the DB (since fn-736) but live workers and the reaper run
+ * concurrently there, and PASSIVE skips them without blocking.
  */
 export function withBootDrainCheckpointTuning(
   db: Database,
@@ -311,7 +319,7 @@ export function withBootDrainCheckpointTuning(
   try {
     body();
   } finally {
-    db.run("PRAGMA wal_checkpoint(PASSIVE)");
+    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
     db.run(`PRAGMA wal_autocheckpoint = ${WAL_AUTOCHECKPOINT_PAGES}`);
   }
 }
