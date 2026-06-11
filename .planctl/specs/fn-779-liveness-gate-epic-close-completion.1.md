@@ -55,5 +55,5 @@ Fast tier (default bun test). Close-row twins of the task-path liveness tests, b
 - [ ] bun test passes
 
 ## Done summary
-
+Gated close-row completion behind close-scope liveness (working close job / running sub-agent / live monitor) in evaluateCloseRow predicate 1, and made predicate 9's satisfied dep-on-epic branch liveness-aware via a new order-independent epicHasLiveCloseScopeWork pooler. epicIsCompleted stays status-only by invariant.
 ## Evidence
