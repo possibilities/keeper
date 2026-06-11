@@ -249,6 +249,12 @@ from pathlib import Path
 # into ``working``, the recency key for the unified ``keeper dash`` AGENTS
 # timeline). keeper-py reads no ``active_since`` column (the TUI subscribes over
 # the socket), so no reader logic changes — only the version whitelist gains 65.
+#
+# v66 (fn-787 task .2) is also whitelist-only: it adds the session-anchored
+# partial index ``idx_events_pretooluse_agent_session`` so the SubagentStart
+# fold's pending-PreToolUse bridge seeks one session instead of every PreToolUse
+# row. An index touches no column, so no reader logic changes — only the version
+# whitelist gains 66.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -286,6 +292,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         63,
         64,
         65,
+        66,
     }
 )
 

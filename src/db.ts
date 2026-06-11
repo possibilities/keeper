@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 65;
+export const SCHEMA_VERSION = 66;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -457,6 +457,25 @@ const CREATE_V17_INDEXES = [
  */
 const CREATE_V51_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_background_task_id ON events(session_id, background_task_id, id, tool_name) WHERE background_task_id IS NOT NULL",
+];
+
+/**
+ * Session-anchored partial index for the SubagentStart fold's pending-PreToolUse
+ * bridge (`findPendingPreToolUseForStart` / `findBridgePreToolUse` in
+ * `subagent-invocations.ts`). Without it the planner seeks the table-wide
+ * `idx_events_hook_event (hook_event=?)` — every PreToolUse row in the DB per
+ * SubagentStart — and folds the WHERE/ORDER cost onto main's writer lock.
+ *
+ * Leading `session_id` is the seek key; `id` next gives the `ORDER BY e.id ASC`
+ * total order for free (no temp B-tree); trailing `tool_use_id` covers the
+ * `tool_use_id IS NOT NULL` filter and the NOT-EXISTS anti-join correlation. The
+ * `WHERE hook_event='PreToolUse' AND tool_name='Agent'` partial predicate keeps
+ * the index tiny (the PreToolUse:Agent slice, not the full table), so the
+ * planner prefers it decisively once stats land — the v65→v66 step runs
+ * `ANALYZE events` after the CREATE so the migrating DB picks it up immediately.
+ */
+const CREATE_V66_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_pretooluse_agent_session ON events(session_id, id, tool_use_id) WHERE hook_event = 'PreToolUse' AND tool_name = 'Agent'",
 ];
 
 /**
@@ -3282,6 +3301,25 @@ function migrate(db: Database): void {
       // in `keeper/api.py` in the SAME commit, or every keeper-py read fails
       // host-wide; test/schema-version.test.ts enforces this).
       addColumnIfMissing(db, "jobs", "active_since", "REAL");
+
+      // v65→v66: add the session-anchored partial index for the SubagentStart
+      // fold's pending-PreToolUse bridge. Without it the fold seeks the
+      // table-wide idx_events_hook_event (every PreToolUse row per SubagentStart),
+      // holding main's BEGIN IMMEDIATE writer lock for seconds. CREATE runs
+      // unconditionally (idempotent IF NOT EXISTS) so it lands once per DB; the
+      // version-guarded ANALYZE refreshes events stats so the planner prefers the
+      // new partial index immediately (without it the planner's no-stats heuristic
+      // keeps the old plan). CREATE INDEX measured at ~1.7s + ANALYZE ~1.5s on a
+      // 2.65GB live-DB copy — bounded, boot won't appear hung. No projection
+      // touched, so no rewind: an index changes the plan, never the result set
+      // (md5-verified result-equivalence), so re-fold stays byte-identical.
+      for (const sql of CREATE_V66_INDEXES) {
+        db.run(sql);
+      }
+      if (preMigrateStoredVersion < 66) {
+        db.run("PRAGMA analysis_limit = 400");
+        db.run("ANALYZE events");
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -1921,9 +1921,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // test pins (a) no `approval` column, (b) the rewritten expression, and
   // (c) fresh-vs-migrated table_xinfo byte-parity (re-fold determinism guard).
   // Version guard tracks the live SCHEMA_VERSION (v64 adds the `builds` table,
-  // fn-781; v65 adds `jobs.active_since`, fn-784); the v62→v63 epics-shape
-  // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(65);
+  // fn-781; v65 adds `jobs.active_since`, fn-784; v66 adds the
+  // `idx_events_pretooluse_agent_session` partial index, fn-787); the v62→v63
+  // epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(66);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
