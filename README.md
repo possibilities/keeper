@@ -1132,6 +1132,15 @@ commits only that session's attributed files. The other three are read-only.
   keeper commit-work "test(scope): msg"       # stage → lint → commit → push
   ```
 
+  **Escape hatch — if `commit-work` won't stage the full file set, drop to
+  git directly.** `commit-work` scopes to session-touched files; if it leaves
+  out a file you need in the commit (or stages the wrong set), don't fight it
+  — commit with plain `git` instead. Stage only the files you're committing,
+  by explicit path (`git add <path> …` — never `git add -A` / `git add .`),
+  then `git commit`. This is a temporary escape hatch we'll repair; for now
+  you're empowered to use git directly whenever `commit-work` can't cover what
+  you need.
+
 - `session-state.ts` — emit the current session's git context (branch, head
   sha, porcelain status, recent log) plus its on-hook dirty file list as a
   pretty JSON envelope. Purely informational — no lock, no commit; a DB
@@ -1377,8 +1386,7 @@ re-fold determinism is intact. Every drain trigger re-runs the in-HEAD probe
 and a still-uncommitted path stays in `pending` (no fn-627 regression — the
 fn-629 gate is preserved exactly, only the realtime drain triggers are new).
 A freshly-committed path emits its snapshot and leaves the set, with no
-permanent strand. The gate trusts planctl's commit-at-the-seam contract
-(`~/code/planctl/docs/reference/commit-at-mutation-boundary.md` §3): every
+permanent strand. The gate trusts planctl's commit-at-the-seam contract: every
 mutating verb's `output.emit()` owns the write→commit transaction inline, so
 the file is in HEAD by the time the envelope `success: true` lands on stdout. As of schema v14, the `epics` projection adds
 `last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes

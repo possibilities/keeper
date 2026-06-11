@@ -57,6 +57,10 @@ Options:
   --max-files <n>      Abort when the post-filter file count exceeds <n>
                        (default 500; pass 0 to disable)
   --help, -h           Show this help
+
+Escape hatch: if commit-work won't stage every file you need to commit, use
+plain git — \`git add <explicit paths>\` (never -A / .) then \`git commit\`.
+Temporary; you're empowered to bypass for now.
 `;
 
 // Trailer patterns forbidden in a multi-line commit message body. Forged
