@@ -47,6 +47,7 @@ import {
   buildRestoreTier,
   parsePersistedRestore,
   probeTmuxPanes,
+  RESTORE_SCHEMA_VERSION,
   type RestoreDescriptor,
   type RestoreTier,
   readPersistedRestore,
@@ -242,6 +243,54 @@ test("buildRestoreDescriptor groups agents by backend_exec_session_id", () => {
   expect(out.sessions.sy.agents.map((a) => a.job_id)).toEqual(["b"]);
 });
 
+test("buildRestoreTier stamps each bucket's backend from backend_exec_type (v3)", () => {
+  const jobs: Job[] = [
+    fakeJob({
+      job_id: "z",
+      backend_exec_session_id: "zsess",
+      backend_exec_type: "zellij",
+    }),
+    fakeJob({
+      job_id: "t",
+      backend_exec_session_id: "tsess",
+      backend_exec_type: "tmux",
+    }),
+  ];
+  const out = buildRestoreTier(jobs, new Map(), 1000);
+  expect(out.sessions.zsess.backend).toBe("zellij");
+  expect(out.sessions.tsess.backend).toBe("tmux");
+});
+
+test("buildRestoreTier defaults a NULL backend_exec_type bucket to zellij", () => {
+  const jobs: Job[] = [
+    fakeJob({
+      job_id: "a",
+      backend_exec_session_id: "s1",
+      backend_exec_type: null,
+    }),
+  ];
+  const out = buildRestoreTier(jobs, new Map(), 1000);
+  expect(out.sessions.s1.backend).toBe("zellij");
+});
+
+test("buildRestoreTier throws when a session bucket mixes backends", () => {
+  const jobs: Job[] = [
+    fakeJob({
+      job_id: "a",
+      backend_exec_session_id: "s1",
+      backend_exec_type: "zellij",
+    }),
+    fakeJob({
+      job_id: "b",
+      backend_exec_session_id: "s1",
+      backend_exec_type: "tmux",
+    }),
+  ];
+  expect(() => buildRestoreTier(jobs, new Map(), 1000)).toThrow(
+    /mixes exec backends/,
+  );
+});
+
 test("buildRestoreDescriptor sorts agents within a session bucket by job_id", () => {
   // Insert in REVERSE order to prove the sort happens.
   const jobs: Job[] = [
@@ -333,7 +382,11 @@ function descFor(
   current: RestoreTier,
   last: RestoreTier | null = null,
 ): RestoreDescriptor {
-  return { schema_version: 2, last_session: last, current };
+  return {
+    schema_version: RESTORE_SCHEMA_VERSION,
+    last_session: last,
+    current,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -384,7 +437,7 @@ test("serializeForHash changes when last_session flips even if current is byte-s
 // serializeForWrite — disk shape keeps per-tier captured_at, ends with \n
 // ---------------------------------------------------------------------------
 
-test("serializeForWrite keeps per-tier captured_at, schema v2, ends with \\n", () => {
+test("serializeForWrite keeps per-tier captured_at, schema v3, ends with \\n", () => {
   const out = serializeForWrite(descFor(buildRestoreTier([], new Map(), 1234)));
   expect(out.endsWith("\n")).toBe(true);
   const parsed = JSON.parse(out) as {
@@ -392,7 +445,7 @@ test("serializeForWrite keeps per-tier captured_at, schema v2, ends with \\n", (
     current: { captured_at: number };
     last_session: unknown;
   };
-  expect(parsed.schema_version).toBe(2);
+  expect(parsed.schema_version).toBe(RESTORE_SCHEMA_VERSION);
   expect(parsed.current.captured_at).toBe(1234);
   expect(parsed.last_session).toBeNull();
 });
@@ -411,7 +464,7 @@ test("restorePulse writes the two-tier file on first call", () => {
   restorePulse(db, restorePath, state, () => 1000);
   expect(existsSync(restorePath)).toBe(true);
   const parsed = readFile(restorePath);
-  expect(parsed.schema_version).toBe(2);
+  expect(parsed.schema_version).toBe(RESTORE_SCHEMA_VERSION);
   expect(tierKeys(parsed.current)).toEqual({ s1: ["a"] });
   // No collapse edge yet, no persisted file → last_session stays null.
   expect(parsed.last_session).toBeNull();
@@ -789,6 +842,7 @@ function fakeJob(opts: {
   title?: string | null;
   plan_verb?: string | null;
   plan_ref?: string | null;
+  backend_exec_type?: string | null;
   backend_exec_session_id?: string | null;
 }): Job {
   return {
@@ -798,6 +852,7 @@ function fakeJob(opts: {
     title: opts.title ?? null,
     plan_verb: opts.plan_verb ?? null,
     plan_ref: opts.plan_ref ?? null,
+    backend_exec_type: opts.backend_exec_type ?? null,
     backend_exec_session_id: opts.backend_exec_session_id ?? null,
   } as unknown as Job;
 }

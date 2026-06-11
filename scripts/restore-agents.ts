@@ -3,15 +3,18 @@
  * restore-agents — Chrome-style "restore previous session" for keeper-managed
  * Claude Code agents (epic fn-677, T4). Reads the side-file
  * `~/.local/state/keeper/restore.json` that the restore-worker (T3) maintains
- * as a **two-tier descriptor** (epic fn-702, schema v2):
- * `{ schema_version: 2, last_session, current }`. `last_session` is the FROZEN
+ * as a **two-tier descriptor** (epic fn-702, schema v2; per-bucket `backend`
+ * tags added v3 / epic fn-789):
+ * `{ schema_version, last_session, current }`. `last_session` is the FROZEN
  * restore source (written only at boot-promote + the `>0→0` collapse edge);
  * `current` is the continuous live mirror. This util resolves the restore
  * source by precedence — `last_session ‖ current ‖` (v1) legacy top-level
  * `sessions` — so a reboot that reseeds a smaller live set still offers the
  * full pre-crash set from the frozen `last_session`. It then replays each
- * surviving agent back into its original zellij session via
- * `ExecBackend.ensureLaunched` (T2) using the resume command
+ * surviving agent back into its original backend session via
+ * `ExecBackend.ensureLaunched` (T2) — routing each bucket through the backend
+ * its `backend` tag names (`zellij` / `tmux`, schema v3 / epic fn-789; a
+ * v2/legacy bucket without a tag reads as zellij) — using the resume command
  * `scripts/resume.ts` and the worker already agree on (`buildResumeCommand` /
  * `resumeTarget`, T1 — the shared `src/resume-descriptor` substrate that makes
  * the three resume-command producers byte-identical).
@@ -32,7 +35,7 @@
  * Usage:
  *   bun scripts/restore-agents.ts [--session <name>] [--apply] [--sock <path>]
  *
- *   --session <name>  Restore only agents from this zellij session. Default:
+ *   --session <name>  Restore only agents from this backend session. Default:
  *                     all sessions in the file.
  *   --apply           Actually relaunch via `ensureLaunched`. Default is
  *                     DRY-RUN — print what would be restored, touch nothing.
@@ -50,7 +53,11 @@
 
 import { parseArgs } from "node:util";
 import { resolveRestorePath, resolveSockPath } from "../src/db";
-import { createZellijBackend } from "../src/exec-backend";
+import {
+  DEFAULT_EXEC_BACKEND,
+  type ExecBackend,
+  resolveExecBackend,
+} from "../src/exec-backend";
 import {
   type ClientFrame,
   encodeFrame,
@@ -75,16 +82,19 @@ const HELP = `restore-agents — replay surviving Claude Code agents from restor
 
 Usage: bun scripts/restore-agents.ts [--session <name>] [--apply] [--sock <path>]
 
-  --session <name>  Restore only agents from this zellij session (default: all)
+  --session <name>  Restore only agents from this backend session (default: all)
   --apply           Actually relaunch via ensureLaunched (default: DRY-RUN)
   --sock <path>     Socket path override ($KEEPER_SOCK / default otherwise)
   --help            Show this help
 
 Reads ~/.local/state/keeper/restore.json (override: $KEEPER_RESTORE_FILE) and
 relaunches each agent NOT currently live via 'claude --resume' wrapped in the
-same shell-prologue scripts/resume.ts emits. Always validates against live
-jobs at restore time (working+stopped); a daemon-down probe degrades to an
-empty skip-set so the disaster-recovery path restores everything.
+same shell-prologue scripts/resume.ts emits. Each session bucket routes through
+the exec backend its 'backend' tag names (zellij / tmux); an unknown or absent
+tag without a default reads as zellij, and an unrecognized backend is skipped
+with a note rather than launched into the wrong multiplexer. Always validates
+against live jobs at restore time (working+stopped); a daemon-down probe
+degrades to an empty skip-set so the disaster-recovery path restores everything.
 
 A malformed/absent restore.json prints a clear message and exits 0
 (nothing to restore). A future-version schema_version refuses to act and
@@ -115,6 +125,12 @@ interface ParsedArgs {
 type AgentOutcome =
   | { kind: "would-restore"; agent: RestoreAgent; session: string }
   | { kind: "skipped-live"; agent: RestoreAgent; session: string }
+  | {
+      kind: "skipped-backend";
+      agent: RestoreAgent;
+      session: string;
+      backend: string;
+    }
   | { kind: "restored"; agent: RestoreAgent; session: string }
   | {
       kind: "failed";
@@ -124,6 +140,21 @@ type AgentOutcome =
     };
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
+
+/**
+ * The exec backends this util knows how to route a restore into. A bucket whose
+ * `backend` tag is outside this set (a NULL-coerced-to-default still lands in
+ * it — that's `zellij`) is SKIPPED with a stderr note rather than launched into
+ * the wrong multiplexer (epic fn-789). `resolveExecBackend` itself silently
+ * routes unknown → zellij, so the known-set gate must live HERE, ahead of it.
+ */
+const KNOWN_EXEC_BACKENDS = new Set<string>([DEFAULT_EXEC_BACKEND, "tmux"]);
+
+/** The backend a bucket runs under — its `backend` tag, NULL coerced to the
+ *  zellij default (v2/legacy buckets carry no tag). */
+function bucketBackend(bucket: RestoreSession): string {
+  return bucket.backend ?? DEFAULT_EXEC_BACKEND;
+}
 
 function die(message: string): never {
   process.stderr.write(`restore-agents: ${message}\n`);
@@ -366,6 +397,12 @@ export function buildLiveJobIdSet(jobs: Job[]): Set<string> {
  *
  * `kind: "would-restore"` is the pre-action verdict; the caller upgrades it
  * to `"restored"` / `"failed"` on the `--apply` path.
+ *
+ * A bucket whose `backend` tag is outside {@link KNOWN_EXEC_BACKENDS} yields
+ * `"skipped-backend"` for every agent (epic fn-789): the util can't launch into
+ * a multiplexer it doesn't know, and silently defaulting to zellij would drop
+ * the agent into the wrong terminal. A NULL/absent tag is the zellij default
+ * (v2/legacy) and routes normally.
  */
 export function planRestore(
   sessions: Record<string, RestoreSession>,
@@ -382,7 +419,18 @@ export function planRestore(
     if (!bucket) {
       continue;
     }
+    const backend = bucketBackend(bucket);
+    const knownBackend = KNOWN_EXEC_BACKENDS.has(backend);
     for (const agent of bucket.agents) {
+      if (!knownBackend) {
+        out.push({
+          kind: "skipped-backend",
+          agent,
+          session: sessionName,
+          backend,
+        });
+        continue;
+      }
       if (liveSkipSet.has(agent.job_id)) {
         out.push({ kind: "skipped-live", agent, session: sessionName });
         continue;
@@ -438,8 +486,9 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
 
 /**
  * The `ensureLaunched` shape the action loop uses. Real binding in `main()`
- * wires `createZellijBackend(...).ensureLaunched`; tests inject a capturing
- * fake so `--apply` can be asserted without spawning real zellij.
+ * routes each bucket through `resolveExecBackend({ backendType }).ensureLaunched`
+ * (the backend its `backend` tag names); tests inject a capturing fake so
+ * `--apply` can be asserted without spawning a real multiplexer.
  */
 type EnsureLaunchedFn = (
   session: string,
@@ -513,6 +562,7 @@ export function renderOutcomes(
   const stanzas: string[] = [];
   let restored = 0;
   let skippedLive = 0;
+  let skippedBackend = 0;
   let failed = 0;
   let wouldRestore = 0;
 
@@ -530,6 +580,11 @@ export function renderOutcomes(
     } else if (o.kind === "skipped-live") {
       skippedLive++;
       stanzas.push(`# (${o.session}) skipping ${label} — already live`);
+    } else if (o.kind === "skipped-backend") {
+      skippedBackend++;
+      stanzas.push(
+        `# (${o.session}) skipping ${label} — unknown backend '${o.backend}'`,
+      );
     } else if (o.kind === "restored") {
       restored++;
       stanzas.push(`# (${o.session}) restored ${label}\n${cmd}`);
@@ -544,9 +599,11 @@ export function renderOutcomes(
   // this into a stanza. Reading process.env was avoided in the pure path.
   void shell;
 
+  const backendNote =
+    skippedBackend > 0 ? ` skipped-backend=${skippedBackend}` : "";
   const summary = apply
-    ? `# summary: restored=${restored} skipped-live=${skippedLive} failed=${failed}`
-    : `# summary: would-restore=${wouldRestore} skipped-live=${skippedLive}`;
+    ? `# summary: restored=${restored} skipped-live=${skippedLive}${backendNote} failed=${failed}`
+    : `# summary: would-restore=${wouldRestore} skipped-live=${skippedLive}${backendNote}`;
 
   return stanzas.length > 0
     ? `${stanzas.join("\n\n")}\n\n${summary}\n`
@@ -704,13 +761,43 @@ async function main(): Promise<void> {
     }
   }
 
-  const backend = createZellijBackend({
-    noteLine: (line: string) => {
-      process.stderr.write(`${line}\n`);
-    },
-  });
-  const ensureLaunched: EnsureLaunchedFn = (session, argv, cwd) =>
-    backend.ensureLaunched(session, argv, cwd);
+  // Route each bucket through the exec backend its `backend` tag names. Resolve
+  // ONE backend instance per backend type (memoized) and look it up by the
+  // session's tag at launch time — `planRestore` already filtered unknown
+  // backends to `skipped-backend`, so every session reaching `ensureLaunched`
+  // here resolves to a known backend.
+  const noteLine = (line: string): void => {
+    process.stderr.write(`${line}\n`);
+  };
+  const backendByType = new Map<string, ExecBackend>();
+  const backendForType = (backendType: string): ExecBackend => {
+    let b = backendByType.get(backendType);
+    if (b == null) {
+      b = resolveExecBackend({ backendType, noteLine });
+      backendByType.set(backendType, b);
+    }
+    return b;
+  };
+  // Session-name → backend type, lifted off the resolved restore source.
+  const backendBySession = new Map<string, string>();
+  for (const [name, bucket] of Object.entries(loaded.sessions)) {
+    backendBySession.set(name, bucket.backend ?? DEFAULT_EXEC_BACKEND);
+  }
+  const ensureLaunched: EnsureLaunchedFn = (session, argv, cwd) => {
+    const backendType = backendBySession.get(session) ?? DEFAULT_EXEC_BACKEND;
+    return backendForType(backendType).ensureLaunched(session, argv, cwd);
+  };
+
+  // Note each skipped-backend bucket to stderr so an operator sees why an agent
+  // was left unrestored, not silently dropped.
+  for (const o of plan) {
+    if (o.kind === "skipped-backend") {
+      noteLine(
+        `restore-agents: skipping session '${o.session}' — unknown exec ` +
+          `backend '${o.backend}'; not launching into the wrong multiplexer`,
+      );
+    }
+  }
 
   const outcomes = await applyRestore(plan, ensureLaunched, shell);
   process.stdout.write(renderOutcomes(outcomes, shell, true));

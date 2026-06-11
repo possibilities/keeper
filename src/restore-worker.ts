@@ -13,9 +13,10 @@
  * — same shape `serializePlanctlJson` produces), hashes the serialized bytes,
  * and rewrites `~/.local/state/keeper/restore.json` via `atomicWriteFile`.
  *
- * **Two-tier model (epic fn-702, schema v2).** The file carries
- * `{ schema_version: 2, last_session, current }` where each tier is a
- * `{ captured_at, sessions }` snapshot:
+ * **Two-tier model (epic fn-702, schema v2; backend tags added v3 / fn-789).**
+ * The file carries `{ schema_version, last_session, current }` where each tier
+ * is a `{ captured_at, sessions }` snapshot and each session bucket carries a
+ * `backend` tag (v3):
  *  - `current` — the continuous live mirror. Rewritten on every content
  *    change (MAY be empty: the fn-689 last-non-empty empty-skip floor is
  *    RETIRED). NOT the restore source.
@@ -86,6 +87,7 @@ import {
   serializePlanctlJson,
   sortObjectKeys,
 } from "./db";
+import { DEFAULT_EXEC_BACKEND } from "./exec-backend";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import { runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
@@ -174,8 +176,17 @@ const TMUX_PROBE_TIMEOUT_MS = 5000;
  * "future" and refuses, so the v2 writer and the v2 reader MUST ship in the
  * same commit. No DB `SCHEMA_VERSION` bump and no `keeper/api.py` change: the
  * restore file is a non-projection side-file with its own version.
+ *
+ * **v3 (epic fn-789): per-bucket backend type.** Each session bucket gains a
+ * `backend` field stamped from its jobs' `backend_exec_type`, so the
+ * restore-agents util can route each bucket through the matching exec backend
+ * (zellij / tmux) instead of hardcoding zellij. Same coupling rule as v2: the
+ * v3 writer and the v3 reader ship in one commit, and the bump is ONLY on the
+ * side-file's own `RESTORE_SCHEMA_VERSION` — the DB `SCHEMA_VERSION` and
+ * `keeper/api.py` do NOT move. A v2/legacy bucket without `backend` reads as
+ * `zellij`.
  */
-export const RESTORE_SCHEMA_VERSION = 2;
+export const RESTORE_SCHEMA_VERSION = 3;
 
 /**
  * Per-agent record under a session bucket. One per live (`working` / `stopped`)
@@ -209,9 +220,17 @@ export interface RestoreAgent {
  * One session bucket in the restore descriptor. Agents are sorted by
  * `job_id` for stable serialization (so the hash gate doesn't false-positive
  * on a row-order shuffle from the underlying SELECT).
+ *
+ * `backend` (schema v3, epic fn-789) is the exec-backend tag the bucketed jobs
+ * ran under — `'zellij'` / `'tmux'` — so `scripts/restore-agents.ts` routes the
+ * bucket through the matching backend instead of hardcoding zellij. A session
+ * name is backend-unique in practice; a mixed bucket is an invariant violation
+ * the producer asserts on rather than engineers around. OPTIONAL on the wire: a
+ * v2/legacy bucket without `backend` reads as `zellij`.
  */
 export interface RestoreSession {
   agents: RestoreAgent[];
+  backend?: string;
 }
 
 /**
@@ -308,10 +327,22 @@ export function buildRestoreTier(
       plan_verb: job.plan_verb,
       plan_ref: job.plan_ref,
     };
+    // Backend tag for the bucket (schema v3): the job's `backend_exec_type`,
+    // defaulting to `zellij` when NULL (the pre-tmux default). A session name
+    // is backend-unique in practice, so the first job's backend defines the
+    // bucket; a later job under the same session with a DIFFERENT backend is an
+    // invariant violation — assert rather than silently last-write-wins.
+    const backend = job.backend_exec_type ?? DEFAULT_EXEC_BACKEND;
     let bucket = sessions[sessionId];
     if (!bucket) {
-      bucket = { agents: [] };
+      bucket = { agents: [], backend };
       sessions[sessionId] = bucket;
+    } else if (bucket.backend !== backend) {
+      throw new Error(
+        `restore bucket "${sessionId}" mixes exec backends ` +
+          `(${bucket.backend} vs ${backend}); session names must be ` +
+          `backend-unique`,
+      );
     }
     bucket.agents.push(agent);
   }
@@ -697,8 +728,8 @@ function tmuxSnapshotPulse(
  *    FREEZE: `lastSession = epochHighWater`, reset `epochHighWater = null`.
  *    If the freeze write throws, `epochHighWater` is NOT reset, so the freeze
  *    retries on the next empty pulse.
- *  - Always assemble `{ schema_version: 2, last_session, current }` and write
- *    on a whole-file hash change.
+ *  - Always assemble `{ schema_version: RESTORE_SCHEMA_VERSION, last_session,
+ *    current }` and write on a whole-file hash change.
  *
  * Exported for unit reach: tests drive this directly against a seeded writer
  * DB (re-opened read-only for the pulse).

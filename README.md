@@ -53,11 +53,16 @@ envelope planctl writes on every mutating call — and (schema v48 / fn-668)
 three terminal-multiplexer backend-exec coordinates
 (`events.backend_exec_type`, `events.backend_exec_session_id`,
 `events.backend_exec_pane_id`) captured by the hook on EVERY event as pure
-synchronous `process.env` reads (`ZELLIJ` / `ZELLIJ_SESSION_NAME` /
-`ZELLIJ_PANE_ID`; no fork, no fs, no PPID-walk), folded onto
+synchronous `process.env` reads (no fork, no fs, no PPID-walk), folded onto
 `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
-`COALESCE`. Generic `backend_exec_*` naming lets a future
-tmux/wezterm backend slot in without a schema change. Consumers can find
+`COALESCE`. Two backends are recognized: zellij — checked FIRST via the
+`ZELLIJ` sentinel (`ZELLIJ_SESSION_NAME` / `ZELLIJ_PANE_ID`); and tmux —
+checked SECOND via `TMUX` (`KEEPER_TMUX_SESSION` for the session name, which a
+keeper-managed launch injects via `-e`, and `TMUX_PANE` for the pane). A
+human-created tmux session carries no `KEEPER_TMUX_SESSION`, so its session
+name lands via the restore-worker's pane-snapshot poller (epic fn-789). The
+generic `backend_exec_*` naming keeps a further backend slotting in without a
+schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
 lifecycle, every session's profile attribution, every planctl-CLI
 mutation, AND the terminal location each live session lives in cheaply
@@ -312,23 +317,16 @@ Keeper has no `install` verb. Wire it up manually:
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
-   - `zellij_session` — the zellij session name keeperd's server-side
-     autopilot reconciler lazily ensures (and reuses) for every tab it spawns.
-     Default: `autopilot`. Each dispatch opens as a new tab inside that shared
-     background session.
+   - `exec_backend` — the terminal multiplexer keeperd's server-side autopilot
+     reconciler dispatches workers into: `zellij` (default) or `tmux`. An
+     unknown value warns and falls back to `zellij`. The managed-session name
+     is hardcoded (`autopilot`), NOT configurable; each dispatch opens a new
+     window inside that shared background session. keeper never closes a window
+     — windows stay open for inspection.
    - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
      jobs. A positive integer enforces the cap; omit or set non-positive
      (the default) to leave it unlimited. The cap bounds only `work`/`close`
      launches.
-   - `autoclose_windows` — whether the autopilot reaps a row's zellij
-     surfaces when it reaches **completion**. Default `true`. When a task
-     reaches `{tag:"completed"}` (worker done + idle) the reconciler closes its
-     `work::<id>` pane; a completed epic close-row (done AND closer idle) closes
-     `close::<id>`. Pending
-     and just-worker-ended-incomplete windows stay open
-     for inspection. Set `false` to keep every window open (the reap pass
-     becomes a no-op and skips the `list-panes` probe). Restart-to-apply — a
-     flip lags until the next daemon restart, like every keeper config key.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -337,9 +335,8 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/code
      - ~/src
    claude_projects_root: ~/.claude/projects
-   zellij_session: autopilot
+   exec_backend: zellij
    max_concurrent_jobs: 3
-   autoclose_windows: true
    YAML
    ```
 
@@ -349,8 +346,7 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `zellij_session: autopilot`, `autoclose_windows: true`). Unknown config keys
-   are silently ignored.
+   `exec_backend: zellij`). Unknown config keys are silently ignored.
 
 4. **Load the keeper plugin via the arthack launcher** (`--plugin-dir`). The
    repo root carries `.claude-plugin/plugin.json` (canonical manifest) and
@@ -560,9 +556,9 @@ Keeper has no `install` verb. Wire it up manually:
    async worker/daemon condition holds and is the canonical replacement for a
    fixed `Bun.sleep` deadline race. The restore worker (epic fn-677, two-tier
    rework fn-702) writes `~/.local/state/keeper/restore.json` (the
-   Chrome-style "restore previous session" snapshot — agents + zellij
-   metadata for `scripts/restore-agents.ts` to replay against) as a
-   **two-tier descriptor** `{schema_version: 2, last_session, current}`:
+   Chrome-style "restore previous session" snapshot — agents + per-bucket
+   backend metadata for `scripts/restore-agents.ts` to replay against) as a
+   **two-tier descriptor** `{schema_version, last_session, current}`:
    `current` is the continuous live mirror (may be empty — there is no
    empty-skip floor), and `last_session` is the FROZEN restore
    source written only at boot-promote and the `>0→0` collapse edge, so a
@@ -1699,18 +1695,21 @@ nothing for it) and `N` drops by one. The schema bump is v36→v37; fn-642
 work.
 As of schema v48 (fn-668), each Claude session's terminal-multiplexer
 backend-exec coordinates are materialized as first-class columns on the
-`events` row and (folded onto) the `jobs` projection. The hook reads
-three pure synchronous `process.env` values on EVERY event —
-`ZELLIJ` → `backend_exec_type` (currently the only recognized backend),
-`ZELLIJ_SESSION_NAME` → `backend_exec_session_id`,
-`ZELLIJ_PANE_ID` → `backend_exec_pane_id` (raw, e.g. `"11"`; no
-fork, no fs, no PPID-walk; absent env ⇒ NULL coords, never bogus
-`type='zellij'`) — and the reducer's `applyEvent` arm folds the three
-onto `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins
-via `COALESCE`, so a re-fold from cursor=0 reproduces byte-identical
-rows. Generic `backend_exec_*` naming lets a
-future tmux/wezterm backend slot in without a schema change — only the
-hook's env-name table changes. The three live `jobs.backend_exec_*` columns
+`events` row and (folded onto) the `jobs` projection. The hook reads pure
+synchronous `process.env` values on EVERY event, recognizing two backends:
+zellij (checked FIRST via the `ZELLIJ` sentinel) → `backend_exec_type='zellij'`,
+`ZELLIJ_SESSION_NAME` → `backend_exec_session_id`, `ZELLIJ_PANE_ID` →
+`backend_exec_pane_id`; and tmux (checked SECOND via `TMUX`) →
+`backend_exec_type='tmux'`, `KEEPER_TMUX_SESSION` → `backend_exec_session_id`
+(present only on keeper-managed launches, injected via `-e`; a human-created
+tmux session gets it filled later by the restore-worker pane poller, epic
+fn-789), `TMUX_PANE` → `backend_exec_pane_id` (raw; no fork, no fs, no
+PPID-walk; absent env ⇒ NULL coords, never a bogus `type`) — and the reducer's
+`applyEvent` arm folds the three onto
+`jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
+`COALESCE`, so a re-fold from cursor=0 reproduces byte-identical rows. The
+generic `backend_exec_*` naming keeps a further backend slotting in with only
+the hook's env-name table changing. The three live `jobs.backend_exec_*` columns
 (`type`, `session_id`, `pane_id`) are display-only on
 `JOBS_DESCRIPTOR` (like `profile_name` — read by the renderer, never
 a `sortable` / `filters` / `jsonColumns` key); the shared
@@ -2209,14 +2208,16 @@ and flips on the `set_autopilot_paused` RPC, which appends an
 on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live behind the
 `ExecBackend` (`src/exec-backend.ts`) — `launch`, `focusPane`, and
-`reapSurfaces` (fn-724). `ensureLaunched` (session-agnostic) get-or-creates the
-target session with its own per-call mint + orphan reap and launches an
-unnamed tab — `restore-agents.ts` is the consumer. Zellij is the only
-backend; each reconciler dispatch opens as a new tab in the
-lazily-created `zellij_session`. The session is FRESH-MINTED on every
-keeper-initiated `attach -b --forget` (fn-675) — `--forget` deletes any
-saved/serialized session before connecting, so a stale/EXITED corpse is
-rebuilt from scratch rather than resurrected from a degraded
+`ensureLaunched`; there is no `reapSurfaces` (keeper never closes a window).
+`ensureLaunched` (session-agnostic) get-or-creates the
+target session with its own per-call mint and launches an
+unnamed window — `restore-agents.ts` is the consumer. The backend is chosen
+by the `exec_backend` config key (`zellij` default / `tmux`) via
+`resolveExecBackend`; each reconciler dispatch opens as a new window in the
+hardcoded managed session (`autopilot`). The zellij backend FRESH-MINTS the
+session on every keeper-initiated `attach -b --forget` (fn-675) — `--forget`
+deletes any saved/serialized session before connecting, so a stale/EXITED
+corpse is rebuilt from scratch rather than resurrected from a degraded
 `session-layout.kdl` cache (the bar-less-mint failure mode that motivated
 the change). `--forget` is a harmless no-op when no saved session exists,
 and `ensureSession` short-circuits before the attach when the target is
@@ -2231,36 +2232,21 @@ merely late, so NO `DispatchFailed` is minted (the prior `confirm_timeout`
 write-off that produced ghost workers is gone), the `pending_dispatches` row
 is KEPT, `inFlight` releases, and the 120s TTL sweep
 (`PENDING_DISPATCH_TTL_MS > ceilingMs (60s)`, an invariant pinned by a test)
-emits `DispatchExpired` only if the bind truly never lands. On `set-paused`
-(boot-pause via the same relay), the worker reaps stale launch-window zellij
-surfaces — `ExecBackend.reapSurfaces` intersects `list-panes -a -j` with the
-OPEN `pending_dispatches` rows (a discharged row = live worker = never reaped)
-and never throws (no-self-heal). A **distinct** completion reap (fn-727,
-config-gated on `autoclose_windows`, default `true`) shares the SAME
-`reapSurfaces` close path but gates on the OPPOSITE signal: each reconcile
-cycle, when a row reaches the durable `{tag:"completed"}` readiness verdict
-(task worker done AND idle; epic `status='done'` AND its closer idle — no
-working close job, running sub-agent, or live monitor), the worker
-closes every live surface sharing
-that row's id — a completed task reaps `work::<id>`; a completed close-row
-reaps `close::<id>`. The reap carries no liveness gate of its own: the durable
-verdict is the SOLE authorization, and the close-row's liveness gating lives in
-`src/readiness.ts`, not reap-side. For the close-row verdict to be observed at
-all, the reconcile
-snapshot must still carry the just-done epic through its whole done→idle
-wind-down: the default epics read scopes to
-`status='open'`, so fn-764 MERGES in a SECOND bounded read
-(`filter:{status:"done"}`, sorted `updated_at` DESC, limited to a small window
-— never O(all done history), the fn-748 anti-pattern) so a freshly-done epic
-stays observed across the wind-down; `reapSurfaces` is idempotent, so
-re-observation within the window is a safe no-op. Pending /
-worker-ended-incomplete windows never reach
-`{tag:"completed"}` and stay open. The completed-row-id set rides out of
-`reconcile`'s single `computeReadiness` pass (no second pass), the reap
-re-probes `list-panes` every cycle (survives a daemon restart — no reliance on
-cold-boot `liveDispatches`), and the whole pass is try/caught (no-self-heal).
-This whole hardening is producer-side only: no reducer arm, column, or
-`SCHEMA_VERSION` change (stays 59).
+emits `DispatchExpired` only if the bind truly never lands.
+
+keeper NEVER closes a window. There is no launch-window reap and no completion
+reap — every dispatched window (pending, live, completed, or
+worker-ended-incomplete) stays open for inspection until the human closes it.
+The pause-ghost and completion reaps, and the `autoclose_windows` config key,
+were deleted outright in epic fn-789 — `reapSurfaces` no longer exists on
+`ExecBackend`, and the pending-dispatch row discharges on `SessionStart` or the
+120s TTL sweep (above), never via a `list-panes` close path. The close-row
+readiness verdict still rides the fn-764 wind-down read: the default epics read
+scopes to `status='open'`, so a SECOND bounded read (`filter:{status:"done"}`,
+sorted `updated_at` DESC, limited to a small window — never O(all done history),
+the fn-748 anti-pattern) keeps a freshly-done epic observed through its
+done→idle wind-down for the close-row's liveness gate in `src/readiness.ts`.
+
 There is NO auto-retry — a failed dispatch is sticky and visible in `keeper
 autopilot`'s `--- failed ---` section until the human runs `keeper autopilot
 retry <verb::id>`, which routes through the server-worker's `retry_dispatch`
@@ -2276,9 +2262,10 @@ connection, polls `PRAGMA data_version` via the shared `watchLoop`
 primitive, and on every change reads the `jobs` + `epics` projections
 through the same `runQuery` read seam the autopilot worker uses. It builds
 a stable `{captured_at, sessions}` TIER of the live (`working` / `stopped`)
-jobs grouped by zellij `backend_exec_session_id` and rewrites
+jobs grouped by `backend_exec_session_id` — each bucket tagged with the
+`backend` it ran under (`zellij` / `tmux`, schema v3) — and rewrites
 `~/.local/state/keeper/restore.json` via `atomicWriteFile` as a **two-tier
-descriptor** — `{schema_version: 2, last_session, current}`, the browser
+descriptor** — `{schema_version, last_session, current}`, the browser
 "restore previous session" model (Chrome "Current Session" / "Last
 Session"):
 
@@ -2308,17 +2295,20 @@ smaller live set still offers the full pre-crash set from the frozen
 the event log — so the worker sidesteps the event-sourcing invariants
 entirely (no DB `SCHEMA_VERSION` bump, no reducer arm, no `keeper/api.py`
 whitelist change; only the side-file's own `RESTORE_SCHEMA_VERSION` bumps
-1→2). The worker carries no `onmessage` handler — it never posts to main,
-never writes the DB. Write failures are swallowed to stderr (next pulse
+2→3 for the per-bucket `backend` tag). The worker carries no `onmessage`
+handler — it never posts to main, never writes the DB. Write failures are swallowed to stderr (next pulse
 retries); only an unhandled throw out of the watch loop escalates to
 `onerror`/`close` → fatalExit. The `scripts/restore-agents.ts` util is the
 sole reader; it resolves the restore source `last_session ‖ current ‖`
 (v1) legacy `sessions`, and its `--apply` mode relaunches the surviving
 agents via the exact `claude --resume` shape `scripts/resume.ts` emits,
-deduplicated against jobs still live in the projection. The schema bump is
-the load-bearing coupling: the moment the worker writes
-`schema_version: 2`, the OLD reader treats it as "future" and refuses, so
-the v2 writer and v2 reader ship in the same commit.
+deduplicated against jobs still live in the projection. Each bucket routes
+through the exec backend its `backend` tag names (a v2/legacy bucket without
+a tag reads as zellij; an unknown backend is skipped with a stderr note,
+never launched into the wrong multiplexer). The schema bump is the
+load-bearing coupling: the moment the worker writes a new
+`RESTORE_SCHEMA_VERSION`, the OLD reader treats it as "future" and refuses,
+so the bumped writer and reader ship in the same commit.
 
 The ten workers are fully independent; main supervises all ten
 lifecycles but routes none of their traffic, and any worker's `error`

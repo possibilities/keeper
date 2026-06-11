@@ -47,13 +47,15 @@ afterEach(() => {
 // classifySchemaVersion — future-refuse / safe-default gate
 // ---------------------------------------------------------------------------
 
-test("classifySchemaVersion returns ok for the current version (v2)", () => {
-  expect(classifySchemaVersion(2)).toBe("ok");
+test("classifySchemaVersion returns ok for the current version (v3)", () => {
+  expect(classifySchemaVersion(3)).toBe("ok");
 });
 
-test("classifySchemaVersion returns ok for an older version (v1)", () => {
-  // v1 is <= RESTORE_SCHEMA_VERSION (now 2), so it falls through, not future.
+test("classifySchemaVersion returns ok for older versions (v1, v2)", () => {
+  // v1/v2 are <= RESTORE_SCHEMA_VERSION (now 3), so they fall through, not
+  // future. A v2 file (no per-bucket backend) reads as zellij downstream.
   expect(classifySchemaVersion(1)).toBe("ok");
+  expect(classifySchemaVersion(2)).toBe("ok");
 });
 
 test("classifySchemaVersion treats missing schema_version as 0 (ok, safe default)", () => {
@@ -67,7 +69,7 @@ test("classifySchemaVersion treats non-numeric schema_version as 0 (ok)", () => 
 });
 
 test("classifySchemaVersion refuses a future version", () => {
-  expect(classifySchemaVersion(3)).toBe("future");
+  expect(classifySchemaVersion(4)).toBe("future");
   expect(classifySchemaVersion(999)).toBe("future");
 });
 
@@ -130,6 +132,20 @@ function fakeSessions(
   return out;
 }
 
+/**
+ * Like {@link fakeSessions} but stamps each bucket's `backend` tag (schema v3),
+ * so the backend-routing / unknown-skip paths can be exercised.
+ */
+function fakeSessionsWithBackend(
+  sessions: Record<string, { agents: RestoreAgent[]; backend: string }>,
+): Record<string, RestoreSession> {
+  const out: Record<string, RestoreSession> = {};
+  for (const [name, { agents, backend }] of Object.entries(sessions)) {
+    out[name] = { agents, backend };
+  }
+  return out;
+}
+
 test("planRestore marks every agent would-restore when the skip-set is empty", () => {
   const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" }), fakeAgent({ job_id: "b" })],
@@ -179,6 +195,49 @@ test("planRestore visits sessions in alpha-sorted order", () => {
     "alpha",
     "mid",
     "zeta",
+  ]);
+});
+
+test("planRestore reads a v2/legacy bucket (no backend tag) as zellij — would-restore", () => {
+  // fakeSessions builds buckets without a `backend` field — the v2/legacy
+  // shape. They must route normally (default zellij), not skip.
+  const desc = fakeSessions({
+    autopilot: [fakeAgent({ job_id: "a" })],
+  });
+  const plan = planRestore(desc, null, new Set());
+  expect(plan.map((p) => p.kind)).toEqual(["would-restore"]);
+});
+
+test("planRestore routes a known tmux bucket as would-restore", () => {
+  const desc = fakeSessionsWithBackend({
+    autopilot: { agents: [fakeAgent({ job_id: "a" })], backend: "tmux" },
+  });
+  const plan = planRestore(desc, null, new Set());
+  expect(plan.map((p) => p.kind)).toEqual(["would-restore"]);
+});
+
+test("planRestore skips an unknown-backend bucket with skipped-backend", () => {
+  const desc = fakeSessionsWithBackend({
+    weird: { agents: [fakeAgent({ job_id: "a" })], backend: "wezterm" },
+  });
+  const plan = planRestore(desc, null, new Set());
+  expect(plan).toHaveLength(1);
+  expect(plan[0].kind).toBe("skipped-backend");
+  expect((plan[0] as { backend: string }).backend).toBe("wezterm");
+});
+
+test("planRestore mixes per-bucket backend routing — zellij/tmux restore, unknown skips", () => {
+  const desc = fakeSessionsWithBackend({
+    z: { agents: [fakeAgent({ job_id: "z1" })], backend: "zellij" },
+    t: { agents: [fakeAgent({ job_id: "t1" })], backend: "tmux" },
+    x: { agents: [fakeAgent({ job_id: "x1" })], backend: "kitty" },
+  });
+  const plan = planRestore(desc, null, new Set());
+  // Alpha order: t, x, z.
+  expect(plan.map((p) => [p.session, p.kind])).toEqual([
+    ["t", "would-restore"],
+    ["x", "skipped-backend"],
+    ["z", "would-restore"],
   ]);
 });
 
@@ -357,6 +416,16 @@ test("renderOutcomes apply summary names restored / skipped-live / failed", asyn
   expect(rendered).toContain("FAILED z");
 });
 
+test("renderOutcomes reports skipped-backend in the summary and a per-agent note", () => {
+  const desc = fakeSessionsWithBackend({
+    weird: { agents: [fakeAgent({ job_id: "a" })], backend: "wezterm" },
+  });
+  const plan = planRestore(desc, null, new Set());
+  const out = renderOutcomes(plan, "/bin/zsh", false);
+  expect(out).toContain("skipped-backend=1");
+  expect(out).toContain("unknown backend 'wezterm'");
+});
+
 test("renderOutcomes labels use the resolved title, not the session id", () => {
   const desc = fakeSessions({
     autopilot: [
@@ -401,15 +470,15 @@ test("loadRestoreFile returns parse-error when top-level isn't an object", async
   expect(res.kind).toBe("parse-error");
 });
 
-test("loadRestoreFile returns future when schema_version is from the future (v3)", async () => {
+test("loadRestoreFile returns future when schema_version is from the future (v4)", async () => {
   writeFileSync(
     restorePath,
-    JSON.stringify({ schema_version: 3, current: { sessions: {} } }),
+    JSON.stringify({ schema_version: 4, current: { sessions: {} } }),
     "utf8",
   );
   const res = await loadRestoreFile(restorePath);
   expect(res.kind).toBe("future");
-  expect((res as { version: number }).version).toBe(3);
+  expect((res as { version: number }).version).toBe(4);
 });
 
 function okSessions(
@@ -483,4 +552,46 @@ test("loadRestoreFile resolves to {} when every tier is empty", async () => {
     "utf8",
   );
   expect(okSessions(await loadRestoreFile(restorePath))).toEqual({});
+});
+
+test("loadRestoreFile v3: preserves each bucket's backend tag", async () => {
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 3,
+      last_session: {
+        captured_at: 100,
+        sessions: {
+          ztab: { backend: "zellij", agents: [fakeAgent({ job_id: "z" })] },
+          ttab: { backend: "tmux", agents: [fakeAgent({ job_id: "t" })] },
+        },
+      },
+      current: null,
+    }),
+    "utf8",
+  );
+  const sessions = okSessions(await loadRestoreFile(restorePath));
+  expect(sessions.ztab.backend).toBe("zellij");
+  expect(sessions.ttab.backend).toBe("tmux");
+});
+
+test("loadRestoreFile v2: a legacy bucket carries no backend tag (reads as zellij downstream)", async () => {
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 2,
+      last_session: {
+        captured_at: 100,
+        sessions: { autopilot: { agents: [fakeAgent({ job_id: "a" })] } },
+      },
+      current: null,
+    }),
+    "utf8",
+  );
+  const sessions = okSessions(await loadRestoreFile(restorePath));
+  expect(sessions.autopilot.backend).toBeUndefined();
+  // planRestore treats the undefined tag as the zellij default → would-restore.
+  expect(planRestore(sessions, null, new Set()).map((p) => p.kind)).toEqual([
+    "would-restore",
+  ]);
 });
