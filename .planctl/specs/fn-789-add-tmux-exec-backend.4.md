@@ -63,5 +63,5 @@ via a capturing fake; unknown-backend bucket skips). Docs changes need no tests.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+restore.json bumped to schema v3: each session bucket carries a backend tag (default zellij), restore-agents routes per-bucket via resolveExecBackend and skips unknown backends with a note; v2/legacy files read as zellij. README + docs/exec-backend.md de-zellijified (exec_backend config, tmux -f /dev/null hook coords, reap/autoclose prose removed). Full suite green; tmux sandbox smoke verified remain-on-exit + KEEPER_TMUX_SESSION coord.
 ## Evidence
