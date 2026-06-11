@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-783-cover-keeper-dash-process-shell-teardown",
+  "bundles": [],
+  "created_at": "2026-06-11T04:04:30.213665Z",
+  "created_by_close_of": "fn-780-keeper-dash-opening-screen",
+  "depends_on_epics": [
+    "fn-780-keeper-dash-opening-screen"
+  ],
+  "id": "fn-783-cover-keeper-dash-process-shell-teardown",
+  "last_validated_at": "2026-06-11T04:04:30.370606Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Cover keeper dash process-shell teardown",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-11T04:04:30.213665Z"
+}
