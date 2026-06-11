@@ -154,6 +154,21 @@ test("JSX trailing comment is scrubbable under the JSX variant", () => {
   expect(result.ok).toBe(true);
 });
 
+test("module-scope generic arrow passes the transpile witness (not JSX)", () => {
+  // An extensionless transpile fileName parses `<T>() =>` as JSX and diverges
+  // spuriously; with a `.ts` fileName the generic arrow parses as TS. This
+  // fixture false-positived on the transpile witness before the fileName fix.
+  const head = [
+    "export const asArray = <T>(x: T): T[] => [x]; // wrap",
+    "",
+  ].join("\n");
+  const working = ["export const asArray = <T>(x: T): T[] => [x];", ""].join(
+    "\n",
+  );
+  const result = checkCommentOnly(head, working, false);
+  expect(result.ok).toBe(true);
+});
+
 test("deleted-line and deleted-char counts report the scrub size", () => {
   const head = "// one\n// two\nconst x = 1;\n";
   const working = "const x = 1;\n";

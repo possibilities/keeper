@@ -168,11 +168,16 @@ export function checkCommentOnly(
     };
   }
 
-  // (2) transpile-output equality
+  // (2) transpile-output equality. The fileName picks the language variant: an
+  // extensionless default makes the compiler parse a module-scope generic arrow
+  // (`<T>() => ...`) as JSX and diverge spuriously, so key it on JSX-ness.
+  const fileName = jsx ? "f.tsx" : "f.ts";
   const headJs = ts.transpileModule(head, {
+    fileName,
     compilerOptions: TRANSPILE_OPTIONS,
   }).outputText;
   const workJs = ts.transpileModule(working, {
+    fileName,
     compilerOptions: TRANSPILE_OPTIONS,
   }).outputText;
   if (headJs !== workJs) {
