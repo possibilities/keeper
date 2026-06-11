@@ -77,5 +77,5 @@ block (`:461-479`) and add:
 - [ ] README `dash.ts` bullet, schema narrative, and `## Inspect` comment updated; `bun run test:full` green.
 
 ## Done summary
-
+Reworked dash AGENTS into a unified COALESCE(active_since, created_at) DESC timeline showing all non-terminal jobs with per-job rolled-up board glyphs (working/sub-agent/monitor/idle), via a new exported readiness rollup helper reusing the board predicates + shared hasLiveWorkerMonitor deriver. Docs + tests updated.
 ## Evidence
