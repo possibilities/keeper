@@ -2661,10 +2661,18 @@ function main(): void {
   //     the reader's poll sees its commits (a same-connection write doesn't bump
   //     the counter). Goes through `applyPragmas` so RPC writes block politely
   //     instead of erroring `SQLITE_BUSY`.
-  const { db } = openDb(data.dbPath, { readonly: true });
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
   // Main is the sole migrator and has already converged the schema, so
   // `migrate: false` skips re-running the (idempotent) ladder on every spawn.
-  const { db: writerDb } = openDb(data.dbPath, { migrate: false });
+  const { db: writerDb } = openDb(data.dbPath, {
+    migrate: false,
+    prepareStmts: false,
+    bootRetry: true,
+  });
 
   // Install every concrete RPC handler. The registries only fill inside a real
   // worker spawn (the `isMainThread` guard skips `main()` on a plain import).

@@ -461,7 +461,11 @@ function main(): void {
       ? data.pollMs
       : DEFAULT_POLL_MS;
 
-  const { db } = openDb(data.dbPath, { readonly: true });
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
   const port = parentPort;
   const scanner = new BuildsScanner((msg) => {
     port.postMessage(msg);

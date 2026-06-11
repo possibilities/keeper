@@ -808,7 +808,11 @@ function main(): void {
   }
 
   const watchRoot = resolveWatchRoot(data.watchRoot);
-  const { db } = openDb(data.dbPath, { readonly: true });
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
 
   const port = parentPort;
   const stream = new TranscriptLineStream(

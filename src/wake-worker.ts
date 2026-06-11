@@ -114,7 +114,11 @@ function main(): void {
     process.exit(1);
   }
 
-  const { db } = openDb(data.dbPath, { readonly: true });
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
   let shutdown = false;
 
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {

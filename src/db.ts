@@ -1012,6 +1012,25 @@ export interface OpenDbOptions {
    * column-adaptive INSERT instead.
    */
   prepareStmts?: boolean;
+  /**
+   * Bounded retry of the WHOLE open span on a transient BOOT-class error
+   * ({@link isTransientBootOpenError}), with a FRESH {@link Database} per
+   * attempt. Workers pass `true`: ~9 threads construct a `Database` on the
+   * just-migrated file at once, exercising bun:sqlite's known concurrent-open
+   * race (#29277) and the WAL/shm recovery path. Defaults `false` — main never
+   * sets it (a failure there is real). NOT in-process self-heal: bounded,
+   * initial-open-only, transient-class-only, still fails loud after exhaustion.
+   * `true` uses the defaults; pass `{ attempts, baseMs }` to override.
+   */
+  bootRetry?: boolean | { attempts?: number; baseMs?: number };
+  /**
+   * TEST-ONLY seam. Fires at the START of every open-span attempt with the
+   * 1-based attempt number, BEFORE the Database is constructed. The only
+   * deterministic way to exercise the `bootRetry` transient-then-success path
+   * (a test creates the schema on attempt 2, turning a "no such table" failure
+   * into a success) and to count attempts. Never set in production.
+   */
+  _beforeAttempt?: (attempt: number) => void;
 }
 
 export interface KeeperDb {
@@ -3329,10 +3348,63 @@ export function selectWorldRev(stmts: Stmts): number {
 }
 
 /**
- * Open a keeper DB connection. Writers migrate + auto-create the parent dir;
- * readers (`readonly: true`) skip migration and fail loudly on a missing file.
+ * Classify an error caught anywhere in the open span (new Database →
+ * applyPragmas → migrate-if-writer → prepareStmts) as the transient BOOT class
+ * that {@link openDb}'s `bootRetry` retries. This classifier is PRIVATE to the
+ * open-span retry and MUST NOT be used elsewhere: "no such table" is retryable
+ * ONLY at initial open on a known-migrated path; in a fold or a live query it
+ * is fatal. Deliberately NOT `daemon.ts:isTransientBusyError` — that fence's
+ * CORRUPT-is-fatal contract must stand and is scoped to the steady-state busy
+ * retry, not boot.
+ *
+ * The retryable boot classes:
+ *   - SQLITE_BUSY / SQLITE_LOCKED — concurrent writer/recovery contention.
+ *   - "no such table" / "no such column" surfaced while preparing statements —
+ *     a worker raced main's just-committed migration; a fresh open sees it.
+ *   - SQLITE_CANTOPEN — bun:sqlite's concurrent dlopen/dlsym open race
+ *     (oven-sh/bun#29277); a fresh Database construction clears it.
  */
-export function openDb(path: string, options: OpenDbOptions = {}): KeeperDb {
+export function isTransientBootOpenError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) {
+    return false;
+  }
+  const code = (err as { code?: unknown }).code;
+  if (
+    code === "SQLITE_BUSY" ||
+    code === "SQLITE_LOCKED" ||
+    code === "SQLITE_CANTOPEN"
+  ) {
+    return true;
+  }
+  const errno = (err as { errno?: unknown }).errno;
+  if (errno === 5 || errno === 6) {
+    return true;
+  }
+  const message = (err as { message?: unknown }).message;
+  if (typeof message === "string") {
+    return (
+      message.includes("no such table") || message.includes("no such column")
+    );
+  }
+  return false;
+}
+
+/** `bootRetry` defaults: 4 attempts, 50ms base, exponential + jitter, 1s cap. */
+const BOOT_RETRY_DEFAULT_ATTEMPTS = 4;
+const BOOT_RETRY_DEFAULT_BASE_MS = 50;
+const BOOT_RETRY_CAP_MS = 1000;
+
+/**
+ * Run the full open span ONCE: construct a fresh Database, apply pragmas,
+ * migrate (writers only), and build the statement bundle. The span is a single
+ * unit so a transient failure anywhere within it re-runs from a clean handle.
+ */
+function openDbSpan(
+  path: string,
+  options: OpenDbOptions,
+  attempt: number,
+): KeeperDb {
+  options._beforeAttempt?.(attempt);
   const readonly = options.readonly ?? false;
 
   if (!readonly) {
@@ -3342,21 +3414,73 @@ export function openDb(path: string, options: OpenDbOptions = {}): KeeperDb {
     }
   }
 
-  const db = new Database(
-    path,
-    readonly ? { readonly: true } : { create: true },
-  );
-  applyPragmas(db, options.busyTimeoutMs ?? 5000, options.cacheSizeKb);
+  let db: Database | undefined;
+  try {
+    db = new Database(path, readonly ? { readonly: true } : { create: true });
+    applyPragmas(db, options.busyTimeoutMs ?? 5000, options.cacheSizeKb);
 
-  if ((options.migrate ?? true) && !readonly) {
-    migrate(db);
+    if ((options.migrate ?? true) && !readonly) {
+      migrate(db);
+    }
+
+    // Hook carve-out: `prepareStmts: false` returns a throwing stub because the
+    // static `insertEvent` would throw "no such column" on a schema-skewed live
+    // DB before `openDb` returns. The hook builds a column-adaptive INSERT.
+    const stmts = (options.prepareStmts ?? true) ? prepareStmts(db) : noStmts();
+    return { db, stmts };
+  } catch (err) {
+    // Close the partially-constructed handle best-effort before re-throwing: a
+    // Database that survived a native race is suspect, and the bootRetry driver
+    // constructs a fresh one. Never reuse this handle.
+    try {
+      db?.close();
+    } catch {
+      // best-effort; the original error is what matters
+    }
+    throw err;
+  }
+}
+
+/**
+ * Open a keeper DB connection. Writers migrate + auto-create the parent dir;
+ * readers (`readonly: true`) skip migration and fail loudly on a missing file.
+ *
+ * `bootRetry` wraps the open span in a bounded retry of the transient BOOT
+ * class ({@link isTransientBootOpenError}) for the racy worker-spawn window: a
+ * FRESH Database is constructed per attempt (a handle that survived a native
+ * race is suspect — never reuse it), with synchronous exponential backoff +
+ * jitter between attempts. This is boot ROBUSTNESS, NOT in-process self-heal:
+ * it is bounded, initial-open-only, transient-class-only, and after exhaustion
+ * it RETHROWS so the worker's existing fail-loud path (exit 1 → fatalExit →
+ * LaunchAgent restart) is preserved. Worker main()s are synchronous, so the
+ * backoff is `Bun.sleepSync`, never an un-awaited promise.
+ */
+export function openDb(path: string, options: OpenDbOptions = {}): KeeperDb {
+  const bootRetry = options.bootRetry ?? false;
+  if (!bootRetry) {
+    return openDbSpan(path, options, 1);
   }
 
-  // Hook carve-out: `prepareStmts: false` returns a throwing stub because the
-  // static `insertEvent` would throw "no such column" on a schema-skewed live
-  // DB before `openDb` returns. The hook builds a column-adaptive INSERT instead.
-  const stmts = (options.prepareStmts ?? true) ? prepareStmts(db) : noStmts();
-  return { db, stmts };
+  const cfg = bootRetry === true ? {} : bootRetry;
+  const attempts = cfg.attempts ?? BOOT_RETRY_DEFAULT_ATTEMPTS;
+  const baseMs = cfg.baseMs ?? BOOT_RETRY_DEFAULT_BASE_MS;
+
+  for (let attempt = 1; ; attempt++) {
+    try {
+      // Re-run the WHOLE span with caller options preserved VERBATIM (the writer
+      // open keeps `migrate: false`; the reader keeps `readonly: true`); only
+      // `bootRetry` itself is consumed by the driver.
+      return openDbSpan(path, options, attempt);
+    } catch (err) {
+      if (attempt >= attempts || !isTransientBootOpenError(err)) {
+        throw err;
+      }
+      // Exponential backoff with full jitter, capped. Synchronous because the
+      // worker main() that calls this is synchronous.
+      const window = Math.min(baseMs * 2 ** (attempt - 1), BOOT_RETRY_CAP_MS);
+      Bun.sleepSync(Math.floor(Math.random() * window));
+    }
+  }
 }
 
 /**

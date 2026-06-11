@@ -13,6 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { JOBS_DESCRIPTOR, selectByIds } from "../src/collections";
 import {
+  isTransientBootOpenError,
   MAX_IN_PARAMS,
   openDb,
   resolveClaudeProjectsRoot,
@@ -388,6 +389,145 @@ test("migrate: false against a stale schema fails on a column-binding error (hoo
   // missing column reference during prepareStmts' INSERT prepare.
   expect(message).not.toMatch(/no such table/i);
   expect(message).toMatch(/no such column|has no column/i);
+});
+
+// ===========================================================================
+// fn-785 — worker open boot-race hardening: prepareStmts:false + bootRetry.
+// ===========================================================================
+
+test("prepareStmts:false opens a usable connection but stmts access throws the stub", () => {
+  // The 12 worker open sites pass prepareStmts:false because they destructure
+  // {db} only and never touch stmts; this is the first LIVE production caller
+  // class. The connection must work for queries while ANY stmts access fails
+  // loud (a worker reading stmts would be a programming error).
+  const writer = openDb(dbPath);
+  writer.db.close();
+
+  const { db, stmts } = openDb(dbPath, {
+    readonly: true,
+    prepareStmts: false,
+  });
+  try {
+    // Connection is fully usable for ad-hoc queries.
+    const row = db
+      .prepare("SELECT last_event_id FROM reducer_state WHERE id = 1")
+      .get() as { last_event_id: number };
+    expect(row.last_event_id).toBe(0);
+
+    // Both prepared statements are throwing stubs.
+    expect(() => stmts.insertEvent).toThrow(/statement bundle is unavailable/);
+    expect(() => stmts.selectWorldRev).toThrow(
+      /statement bundle is unavailable/,
+    );
+  } finally {
+    db.close();
+  }
+});
+
+test("isTransientBootOpenError classifies the boot class, not arbitrary errors", () => {
+  // The boot classifier is PRIVATE to openDb's retry but exported for a direct
+  // unit test of the class boundary. Retryable: BUSY/LOCKED/CANTOPEN by code,
+  // 5/6 by errno, "no such table"/"no such column" by message.
+  expect(isTransientBootOpenError({ code: "SQLITE_BUSY" })).toBe(true);
+  expect(isTransientBootOpenError({ code: "SQLITE_LOCKED" })).toBe(true);
+  expect(isTransientBootOpenError({ code: "SQLITE_CANTOPEN" })).toBe(true);
+  expect(isTransientBootOpenError({ errno: 5 })).toBe(true);
+  expect(isTransientBootOpenError({ errno: 6 })).toBe(true);
+  expect(isTransientBootOpenError(new Error("no such table: events"))).toBe(
+    true,
+  );
+  expect(
+    isTransientBootOpenError(new Error("no such column: planctl_files")),
+  ).toBe(true);
+
+  // NOT retryable: corruption, foreign-key, generic errors, non-objects.
+  expect(isTransientBootOpenError({ code: "SQLITE_CORRUPT" })).toBe(false);
+  expect(isTransientBootOpenError(new Error("disk I/O error"))).toBe(false);
+  expect(isTransientBootOpenError(null)).toBe(false);
+  expect(isTransientBootOpenError("no such table")).toBe(false);
+});
+
+test("bootRetry recovers a transient boot failure on a later attempt", () => {
+  // Reproduces the worker-spawn race deterministically: a writer open against a
+  // fresh empty DB with migrate:false + prepareStmts:true throws "no such
+  // table: events" while the schema is absent. The _beforeAttempt seam migrates
+  // the DB on attempt 2, so the SAME open span succeeds on retry.
+  const freshDbPath = join(tmpDir, "boot-retry-recover.db");
+  const seenAttempts: number[] = [];
+
+  const { db } = openDb(freshDbPath, {
+    migrate: false,
+    bootRetry: { attempts: 4, baseMs: 1 },
+    _beforeAttempt: (n) => {
+      seenAttempts.push(n);
+      if (n === 2) {
+        // Converge the schema out-of-band so attempt 2's prepareStmts succeeds.
+        openDb(freshDbPath).db.close();
+      }
+    },
+  });
+  try {
+    // Attempt 1 failed (no schema), attempt 2 succeeded (schema present).
+    expect(seenAttempts).toEqual([1, 2]);
+    const row = db
+      .prepare("SELECT last_event_id FROM reducer_state WHERE id = 1")
+      .get() as { last_event_id: number };
+    expect(row.last_event_id).toBe(0);
+  } finally {
+    db.close();
+  }
+});
+
+test("bootRetry rethrows the transient error after exhausting attempts", () => {
+  // The fail-loud contract: bounded retry, then RETHROW so the worker's
+  // exit-1 → fatalExit → LaunchAgent path engages. The schema is never created,
+  // so every attempt throws "no such table"; after N attempts it propagates.
+  const freshDbPath = join(tmpDir, "boot-retry-exhaust.db");
+  const seenAttempts: number[] = [];
+
+  let error: unknown = null;
+  try {
+    openDb(freshDbPath, {
+      migrate: false,
+      bootRetry: { attempts: 3, baseMs: 1 },
+      _beforeAttempt: (n) => seenAttempts.push(n),
+    });
+  } catch (err) {
+    error = err;
+  }
+  expect(error).not.toBeNull();
+  expect(String((error as Error).message)).toMatch(/no such table/i);
+  // Exactly N attempts, no more.
+  expect(seenAttempts).toEqual([1, 2, 3]);
+});
+
+test("bootRetry preserves caller options verbatim across attempts", () => {
+  // Per-attempt the driver re-runs the WHOLE span with the SAME options — the
+  // server-worker's writer open (migrate:false) must keep migrate:false on
+  // every retry. A readonly+prepareStmts:false caller must stay readonly with a
+  // stub stmts bundle after a transient retry.
+  const freshDbPath = join(tmpDir, "boot-retry-options.db");
+
+  const { db, stmts } = openDb(freshDbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: { attempts: 4, baseMs: 1 },
+    _beforeAttempt: (n) => {
+      // The readonly open fails on attempt 1 (no file/schema); create the DB on
+      // attempt 2 so the readonly retry succeeds against a real file.
+      if (n === 2) openDb(freshDbPath).db.close();
+    },
+  });
+  try {
+    // readonly honored: a write fails at the SQLite layer.
+    expect(() =>
+      db.query("INSERT INTO meta (key, value) VALUES ('x','y')").run(),
+    ).toThrow();
+    // prepareStmts:false honored: stub still in place after the retry.
+    expect(() => stmts.insertEvent).toThrow(/statement bundle is unavailable/);
+  } finally {
+    db.close();
+  }
 });
 
 test("reducer_state row (1, 0, ts) is seeded on first open", () => {

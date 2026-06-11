@@ -2636,7 +2636,11 @@ function main(): void {
     process.exit(1);
   }
 
-  const { db } = openDb(data.dbPath, { readonly: true });
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
   const port = parentPort;
 
   // Shared shutdown flag — read by every timer/callback so a queued tick can't

@@ -642,7 +642,11 @@ function main(): void {
     process.exit(1);
   }
 
-  const { db } = openDb(data.dbPath, { readonly: true });
+  const { db } = openDb(data.dbPath, {
+    readonly: true,
+    prepareStmts: false,
+    bootRetry: true,
+  });
   const restorePath = resolveRestorePath();
   const state: PulseState = {
     lastHash: null,
