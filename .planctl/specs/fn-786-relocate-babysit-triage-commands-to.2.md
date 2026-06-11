@@ -45,5 +45,5 @@ else moved.
 - [ ] Committed via `keeper commit-work` from `~/code/arthack`
 
 ## Done summary
-
+Deleted the two arthack babysit command templates and re-rendered, pruning the orphaned command outputs/sidecars and the snippet used-in entry. Cross-repo grep confirms no live old-name references remain (archival specs untouched).
 ## Evidence

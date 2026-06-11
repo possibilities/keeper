@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "Remove arthack templates + re-render to prune artifacts",
-  "updated_at": "2026-06-11T12:57:09.134042Z"
+  "updated_at": "2026-06-11T17:54:20.119489Z",
+  "worker_done_at": "2026-06-11T17:54:20.119489Z"
 }
