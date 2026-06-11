@@ -52,5 +52,5 @@ keeper tree is already dirty with unrelated files; never `git add -A`.
 - [ ] Committed via `keeper commit-work` from `~/code/keeper`
 
 ## Done summary
-
+Landed keeper commands/babysit-init.md + commands/babysit-triage.md (renamed from arthack's babysit-new/babysit), rewrote in-body self-refs init-before-triage, dropped the dangling [[commit-hygiene-flags]] wikilink, and updated FINDINGS-LEDGER.md + agents/performance.md to the new names.
 ## Evidence
