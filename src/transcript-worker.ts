@@ -25,7 +25,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
-import type { AsyncSubscription } from "@parcel/watcher";
+import type { AsyncSubscription, Event as WatcherEvent } from "@parcel/watcher";
 import {
   BackstopCounters,
   type BackstopMessage,
@@ -787,6 +787,77 @@ export function scanJobsForTitles(
   return emittedAny;
 }
 
+/** The re-arm window: the new subscription must survive one full heartbeat
+ * interval before a fresh rescue is treated as a genuine re-mute. Mirrors
+ * {@link HEARTBEAT_MS} (declared inside `main`) so a still-mute replacement
+ * can't churn the stream every heartbeat. Exported for the decision-helper test. */
+export const TRANSCRIPT_REARM_FLAP_GUARD_MS = 60_000;
+
+/**
+ * Inputs the heartbeat collects when deciding whether to re-arm the single
+ * transcript subscription. Pure data — no handles, no I/O.
+ */
+export interface TranscriptResubscribeInputs {
+  /** The heartbeat's `scanJobsForTitles` returned true (the watcher went mute
+   * and the slow backstop just re-folded a missed title). */
+  rescued: boolean;
+  /** The worker is tearing down — never start a replace mid-shutdown. */
+  shuttingDown: boolean;
+  /** The native watcher is disabled (in-process tier) — there is no live
+   * subscription to replace. */
+  nativeWatcherDisabled: boolean;
+  /** `existsSync(watchRoot)` — a deleted-and-recreated root is a new inode
+   * FSEvents won't re-attach to, so a missing root DEFERS the re-arm. */
+  rootExists: boolean;
+  /** When the current subscription was last (re)armed, or `null` if it was
+   * never re-armed this run (the boot subscribe leaves no stamp). */
+  reArmedAtMs: number | null;
+  /** The heartbeat's wall-clock (the caller's single `Date.now()`). */
+  nowMs: number;
+  /** The flap-guard window length (normally {@link TRANSCRIPT_REARM_FLAP_GUARD_MS}). */
+  flapGuardMs: number;
+}
+
+/**
+ * Mute-subscription re-arm decision for the transcript worker. The transcript
+ * worker has ONE static subscription and NO reconcile loop, so the heartbeat
+ * drives the replace directly — this helper is the pure verdict that gates it.
+ *
+ * Returns:
+ *   - `"skip"`  — nothing to do: no rescue, shutting down, native watcher
+ *     disabled, OR still inside the flap-guard window after a recent re-arm
+ *     (a still-mute replacement must not churn the stream every heartbeat).
+ *   - `"defer"` — a rescue warrants a re-arm but the watch root is missing;
+ *     retry on the next heartbeat once the dir exists again (never error).
+ *   - `"replace"` — rescue, healthy flap guard, root present: tear down the
+ *     mute subscription and re-subscribe sequentially with identical options.
+ *
+ * PURE — boolean/clock arithmetic, no I/O and no mutation of its input; the
+ * caller owns the `unsubscribe()`/`subscribe()` and the flap-guard stamp.
+ * Exported for unit reach (the {@link decidePlanResubscribe} sibling model).
+ */
+export function decideTranscriptResubscribe(
+  inputs: TranscriptResubscribeInputs,
+): "replace" | "defer" | "skip" {
+  const {
+    rescued,
+    shuttingDown,
+    nativeWatcherDisabled,
+    rootExists,
+    reArmedAtMs,
+    nowMs,
+    flapGuardMs,
+  } = inputs;
+  // No rescue, or no live subscription to replace, or mid-shutdown → nothing.
+  if (!rescued || shuttingDown || nativeWatcherDisabled) return "skip";
+  // Flap guard: a re-arm within the last interval means the replacement has not
+  // yet survived a full heartbeat — suppress so a still-mute stream can't churn.
+  if (reArmedAtMs !== null && nowMs - reArmedAtMs < flapGuardMs) return "skip";
+  // A vanished root is a new-inode hazard — defer until it exists again.
+  if (!rootExists) return "defer";
+  return "replace";
+}
+
 /**
  * Worker entrypoint. Opens its own read-only connection, seeds the change-gate,
  * subscribes to the watch root, routes each change event into the line stream,
@@ -854,6 +925,23 @@ function main(): void {
 
   let subscription: AsyncSubscription | null = null;
   let shuttingDown = false;
+  // Monotonic subscribe generation. Bumped on every (re)subscribe; the watcher
+  // callback captures its generation and no-ops if it has been superseded — a
+  // batch can fire AFTER `unsubscribe()` resolves (the parcel/watcher #190
+  // stale-callback window), so without this a stale callback could touch
+  // torn-down state or double-fire a re-arm.
+  let subGeneration = 0;
+  // When the live subscription was last re-armed (null = boot subscribe, never
+  // re-armed). The flap guard reads it so a still-mute replacement can't churn
+  // the stream every heartbeat.
+  let reArmedAtMs: number | null = null;
+  // A re-arm is in flight (sequential unsubscribe→subscribe). The heartbeat
+  // single-flights against it so two heartbeats can't overlap a replace.
+  let rearming = false;
+  // The heartbeat's re-arm trigger, installed once the subscribe machinery is
+  // built below (the heartbeat closure is created first but only ever fires
+  // after `main` returns). Null until then / when the native watcher is off.
+  let reArmFromHeartbeat: (() => Promise<void>) | null = null;
 
   // `lastFastPathAt` is stamped at every confirmed fast-path fire (the live
   // `onChange` tail driven by a real FSEvents batch); the heartbeat reads it to
@@ -947,6 +1035,29 @@ function main(): void {
           }),
         } satisfies BackstopMessage);
       }
+      // fn-788 mute-subscription re-arm. A heartbeat rescue means the live
+      // FSEvents stream went mute (the slow backstop just re-folded a missed
+      // title). Decide via the pure helper whether to replace it now, defer (a
+      // missing root retries next heartbeat), or skip (no rescue / shutting down
+      // / native watcher off / inside the flap-guard window). The replace itself
+      // is async + sequential; the heartbeat fires it and moves on (the `reArm`
+      // closure single-flights against an in-flight replace).
+      const verdict = decideTranscriptResubscribe({
+        rescued,
+        shuttingDown,
+        nativeWatcherDisabled: data.disableNativeWatcher === true,
+        rootExists: existsSync(watchRoot),
+        reArmedAtMs,
+        nowMs: Date.now(),
+        flapGuardMs: HEARTBEAT_MS,
+      });
+      if (verdict === "defer") {
+        console.error(
+          `[transcript-worker] re-arm deferred: watch root ${watchRoot} does not exist`,
+        );
+      } else if (verdict === "replace" && reArmFromHeartbeat !== null) {
+        void reArmFromHeartbeat();
+      }
     } catch (err) {
       console.error(
         `[transcript-worker] heartbeat scan failed: ${stringifyErr(err)}`,
@@ -980,6 +1091,10 @@ function main(): void {
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {
     if (msg && msg.type === "shutdown") {
       shuttingDown = true;
+      // Supersede any live subscription generation so a batch that fires during
+      // teardown (the #190 stale-callback window) no-ops, and so an in-flight
+      // re-arm's fresh subscribe self-releases instead of resurrecting the watch.
+      subGeneration++;
       // Clear any armed re-scan timer FIRST (before unsubscribe / db close) so a
       // pending drop-recovery scan can't fire against a closing connection. The
       // heartbeat timer carries the same constraint (its body runs scanJobsForTitles).
@@ -1019,72 +1134,174 @@ function main(): void {
     return;
   }
 
+  // The watcher batch callback, parameterized by the subscribe generation that
+  // owns it. A batch can fire AFTER `unsubscribe()` resolves (parcel/watcher
+  // #190), so a callback whose generation has been superseded by a re-arm
+  // no-ops — it must never touch torn-down state or re-fire the recovery.
+  const makeBatchHandler =
+    (generation: number) => (err: Error | null, events: WatcherEvent[]) => {
+      if (subGeneration !== generation) return;
+      if (err) {
+        // Always leave a breadcrumb: the drop discriminator couples to
+        // @parcel/watcher's message text, so a wording change must stay
+        // observable in the logs.
+        console.error(
+          `[transcript-worker] watcher error: ${stringifyErr(err)}`,
+        );
+        // A recoverable FSEvents drop may never re-fire (the live tail is
+        // EOF-anchored), so schedule a debounced re-scan. A non-drop err just
+        // swallow-and-logs.
+        if (isDropError(err)) {
+          rescan.schedule();
+        }
+        return;
+      }
+      // Bump on the raw event batch (pre-filter) so the heartbeat log
+      // distinguishes a healthy-but-quiet watcher from a silent-dead one.
+      eventsReceived += events.length;
+      lastEventAt = Date.now();
+      // A confirmed FSEvents batch IS the fast path for transcript titles —
+      // stamp `last_fast_path_at` so a later heartbeat measures staleness
+      // against it.
+      lastFastPathAt = Date.now();
+      for (const ev of events) {
+        // Treat every event as "go look"; a delete just drops tracking. The
+        // `.jsonl` check is the sole correctness gate (a directory is also
+        // rejected later by statSync's `isFile()` guard).
+        //
+        // No `ignore` glob is passed to subscribe: negated extglobs trip
+        // parcel-bundler/watcher #174 and correlated with the silent-watcher
+        // stall. Re-introduce only as positive `**/<noisy-dir>/**` globs.
+        if (!ev.path.endsWith(".jsonl")) {
+          continue;
+        }
+        if (ev.type === "delete") {
+          stream.unregister(ev.path);
+          continue;
+        }
+        stream.onChange(ev.path);
+      }
+    };
+
+  // Subscribe ONE generation. Bumps the generation FIRST (so any in-flight
+  // callback from the prior subscription is already superseded), then resolves
+  // the addon module + subscribes with the IDENTICAL options as boot
+  // (deliberately NO ignore globs — #174). Returns the live subscription, or
+  // `null` on a subscribe failure (the re-arm path tolerates that; the boot
+  // path treats a null as fatal). Never calls process.exit — that decision
+  // belongs to the caller.
+  const subscribeWatcher = async (
+    watcher: typeof import("@parcel/watcher"),
+  ): Promise<AsyncSubscription | null> => {
+    const generation = ++subGeneration;
+    try {
+      const sub = await watcher.subscribe(
+        watchRoot,
+        makeBatchHandler(generation),
+      );
+      if (shuttingDown || subGeneration !== generation) {
+        // Shutdown or a newer subscribe raced this resolution — release it.
+        void sub.unsubscribe();
+        return null;
+      }
+      return sub;
+    } catch (err) {
+      console.error(
+        `[transcript-worker] failed to subscribe to ${watchRoot}: ${stringifyErr(err)}`,
+      );
+      return null;
+    }
+  };
+
+  // Re-arm the single mute subscription, driven directly from the heartbeat
+  // (the transcript worker has no reconcile loop — the heartbeat IS the
+  // subscription-replace seam). SEQUENTIAL teardown is the cardinal rule:
+  // `await unsubscribe()` MUST complete before `subscribe()` on the same tree —
+  // overlapping live FSEvents streams on one tree is the machine-wide
+  // fseventsd-exhaustion vector (parcel/watcher #190). Re-subscribe failure is
+  // NON-fatal: log and leave unwatched until the next heartbeat re-fires
+  // (explicitly diverging from the boot subscribe's fatal exit — re-arm is
+  // recovery, not boot). The `stream` and its byte offsets are UNTOUCHED; only
+  // the `subscription` variable is swapped, so no re-anchoring / phantom re-fold.
+  const reArm = async (): Promise<void> => {
+    if (rearming) return;
+    rearming = true;
+    try {
+      console.error(
+        `[transcript-worker] re-arm: replacing mute watcher for ${watchRoot}`,
+      );
+      const watcher = await import("@parcel/watcher");
+      if (shuttingDown) return;
+      // Tear down the old stream FIRST (best-effort, like shutdown's), then
+      // re-subscribe. `subscribeWatcher` bumps the generation, so a stale batch
+      // from `old` is already inert.
+      const old = subscription;
+      subscription = null;
+      if (old) {
+        try {
+          await old.unsubscribe();
+        } catch {
+          // best-effort — a failed unsubscribe on a mute stream is expected.
+        }
+      }
+      if (shuttingDown) return;
+      const fresh = await subscribeWatcher(watcher);
+      if (fresh === null) {
+        // Non-fatal: stay unwatched, leave no flap-guard stamp so the next
+        // heartbeat rescue re-fires immediately.
+        return;
+      }
+      subscription = fresh;
+      // Flap guard: stamp only on a successful re-subscribe so a still-mute
+      // replacement is suppressed for one heartbeat interval (don't churn).
+      reArmedAtMs = Date.now();
+      // Full rescan after the fresh subscribe (APFS coalescing collapses bursts,
+      // so back-fill can't be reconstructed) — the change-gate suppresses
+      // unchanged titles, so this re-emits only what actually changed.
+      try {
+        scanJobsForTitles(db, stream);
+      } catch (err) {
+        console.error(
+          `[transcript-worker] re-arm rescan failed: ${stringifyErr(err)}`,
+        );
+      }
+    } catch (err) {
+      // Any unexpected failure on the recovery path is non-fatal — log and let
+      // the next heartbeat re-fire. NEVER process.exit here.
+      console.error(`[transcript-worker] re-arm failed: ${stringifyErr(err)}`);
+    } finally {
+      rearming = false;
+    }
+  };
+  reArmFromHeartbeat = reArm;
+
   // Watcher seam: skip the native addon dlopen entirely in the in-process tier;
   // stay alive for the shutdown handshake.
   if (data.disableNativeWatcher) {
     return;
   }
 
-  // `subscribe` is the only unrecoverable surface — a rejection exits non-zero →
-  // daemon fatalExit → launchd restart. Per-file read errors and torn lines are
-  // handled INSIDE the stream (skip-and-log), never here.
+  // `subscribe` is the only unrecoverable BOOT surface — a failure exits
+  // non-zero → daemon fatalExit → launchd restart. The re-arm path above is the
+  // sanctioned recovery seam and is explicitly non-fatal.
   import("@parcel/watcher")
-    .then((watcher) =>
-      watcher.subscribe(watchRoot, (err, events) => {
-        if (err) {
-          // Always leave a breadcrumb: the drop discriminator couples to
-          // @parcel/watcher's message text, so a wording change must stay
-          // observable in the logs.
-          console.error(
-            `[transcript-worker] watcher error: ${stringifyErr(err)}`,
-          );
-          // A recoverable FSEvents drop may never re-fire (the live tail is
-          // EOF-anchored), so schedule a debounced re-scan. A non-drop err just
-          // swallow-and-logs.
-          if (isDropError(err)) {
-            rescan.schedule();
-          }
-          return;
-        }
-        // Bump on the raw event batch (pre-filter) so the heartbeat log
-        // distinguishes a healthy-but-quiet watcher from a silent-dead one.
-        eventsReceived += events.length;
-        lastEventAt = Date.now();
-        // A confirmed FSEvents batch IS the fast path for transcript titles —
-        // stamp `last_fast_path_at` so a later heartbeat measures staleness
-        // against it.
-        lastFastPathAt = Date.now();
-        for (const ev of events) {
-          // Treat every event as "go look"; a delete just drops tracking. The
-          // `.jsonl` check is the sole correctness gate (a directory is also
-          // rejected later by statSync's `isFile()` guard).
-          //
-          // No `ignore` glob is passed to subscribe: negated extglobs trip
-          // parcel-bundler/watcher #174 and correlated with the silent-watcher
-          // stall. Re-introduce only as positive `**/<noisy-dir>/**` globs.
-          if (!ev.path.endsWith(".jsonl")) {
-            continue;
-          }
-          if (ev.type === "delete") {
-            stream.unregister(ev.path);
-            continue;
-          }
-          stream.onChange(ev.path);
-        }
-      }),
-    )
+    .then((watcher) => subscribeWatcher(watcher))
     .then((sub) => {
-      if (shuttingDown) {
-        // Shutdown raced the subscribe resolution — release immediately.
-        void sub.unsubscribe();
-        return;
+      if (sub === null) {
+        if (shuttingDown) return;
+        // A boot subscribe that yielded no live subscription (not a shutdown
+        // race) is unrecoverable — exit for the LaunchAgent to restart.
+        console.error(
+          `[transcript-worker] boot subscribe to ${watchRoot} produced no subscription`,
+        );
+        closeDb();
+        process.exit(1);
       }
       subscription = sub;
       // Startup current-title fold: after seedFromDb AND after the subscription
       // is live, scan each live job's transcript for its current `custom-title`.
       // Runs synchronously before any async watcher callback fires, so there's no
-      // race with the live tail. Wrapped so a scan failure never trips the
-      // subscribe `.catch` → fatalExit.
+      // race with the live tail. Wrapped so a scan failure never trips fatalExit.
       try {
         scanJobsForTitles(db, stream);
       } catch (err) {

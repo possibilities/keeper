@@ -36,10 +36,12 @@ import {
   buildMissedWakeRecord,
 } from "../src/backstop-telemetry";
 import {
+  decideTranscriptResubscribe,
   matchApiError,
   matchAskUserQuestion,
   scanJobsForTitles,
   seedFromDb,
+  TRANSCRIPT_REARM_FLAP_GUARD_MS,
   TranscriptLineStream,
 } from "../src/transcript-worker";
 import type { ApiErrorKind, InputRequestKind } from "../src/types";
@@ -1393,4 +1395,98 @@ test("fn-720 transcript-heartbeat: cold-boot heartbeat (no fast path yet) report
   const rec = msgs[0]?.record as BackstopRecord;
   expect(rec.staleness_ms).toBeNull();
   expect(rec.last_fast_path_at).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// fn-788 mute-subscription re-arm — the PURE decision helper. The transcript
+// worker has ONE static subscription and NO reconcile loop, so the heartbeat
+// drives the replace directly; `decideTranscriptResubscribe` is the verdict
+// that gates it. These cover the decision surface only — no live-watcher tests
+// (the sequential teardown / generation guard / flap window are exercised by
+// the slow-tier worker integration). The parity model is plan-worker's
+// `decidePlanResubscribe`.
+// ---------------------------------------------------------------------------
+
+const REARM_BASE = {
+  rescued: true,
+  shuttingDown: false,
+  nativeWatcherDisabled: false,
+  rootExists: true,
+  reArmedAtMs: null as number | null,
+  nowMs: 1_000_000,
+  flapGuardMs: TRANSCRIPT_REARM_FLAP_GUARD_MS,
+};
+
+test("decideTranscriptResubscribe: rescue + healthy guard + present root -> replace", () => {
+  expect(decideTranscriptResubscribe({ ...REARM_BASE })).toBe("replace");
+});
+
+test("decideTranscriptResubscribe: no rescue -> skip (a healthy/quiet watcher is never re-armed)", () => {
+  expect(decideTranscriptResubscribe({ ...REARM_BASE, rescued: false })).toBe(
+    "skip",
+  );
+});
+
+test("decideTranscriptResubscribe: shutting down -> skip (never start a replace mid-teardown)", () => {
+  expect(
+    decideTranscriptResubscribe({ ...REARM_BASE, shuttingDown: true }),
+  ).toBe("skip");
+});
+
+test("decideTranscriptResubscribe: native watcher disabled -> skip (no live subscription to replace)", () => {
+  expect(
+    decideTranscriptResubscribe({ ...REARM_BASE, nativeWatcherDisabled: true }),
+  ).toBe("skip");
+});
+
+test("decideTranscriptResubscribe: rescue during the unexpired flap-guard window -> skip", () => {
+  // Re-armed half a window ago — the replacement has not yet survived a full
+  // heartbeat interval, so a fresh rescue must NOT churn the stream again.
+  const armedHalfWindowAgo =
+    REARM_BASE.nowMs - TRANSCRIPT_REARM_FLAP_GUARD_MS / 2;
+  expect(
+    decideTranscriptResubscribe({
+      ...REARM_BASE,
+      reArmedAtMs: armedHalfWindowAgo,
+    }),
+  ).toBe("skip");
+});
+
+test("decideTranscriptResubscribe: rescue after the flap-guard window lapses -> replace (genuine re-mute)", () => {
+  // Re-armed a full window ago — the replacement survived an interval, so a new
+  // rescue is a real re-mute and re-arms again.
+  const armedAFullWindowAgo =
+    REARM_BASE.nowMs - TRANSCRIPT_REARM_FLAP_GUARD_MS - 1;
+  expect(
+    decideTranscriptResubscribe({
+      ...REARM_BASE,
+      reArmedAtMs: armedAFullWindowAgo,
+    }),
+  ).toBe("replace");
+});
+
+test("decideTranscriptResubscribe: missing watch root -> defer (retry next heartbeat, never error)", () => {
+  expect(
+    decideTranscriptResubscribe({ ...REARM_BASE, rootExists: false }),
+  ).toBe("defer");
+});
+
+test("decideTranscriptResubscribe: skip gates outrank defer (no rescue + missing root -> skip)", () => {
+  // The skip conditions are evaluated before the root-stat — a no-rescue tick
+  // over a missing root is a plain no-op, not a deferral.
+  expect(
+    decideTranscriptResubscribe({
+      ...REARM_BASE,
+      rescued: false,
+      rootExists: false,
+    }),
+  ).toBe("skip");
+  // Flap-guard skip likewise outranks defer.
+  expect(
+    decideTranscriptResubscribe({
+      ...REARM_BASE,
+      rootExists: false,
+      reArmedAtMs: REARM_BASE.nowMs,
+    }),
+  ).toBe("skip");
 });

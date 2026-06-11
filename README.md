@@ -269,12 +269,17 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   *recoverable* FSEvents dropped-events signal on the external watchers (the
   producer workers' "...must be re-scanned" error): the affected worker schedules
   a debounced, single-flight re-scan of its existing change-gated boot-scan path,
-  recovering the missed change without re-subscribing — the live subscription
-  stays up. (2) A *silently-mute* subscription (one that stops delivering
-  entirely): the heartbeat backstop flags the affected root and the next
-  reconcile replaces ONLY that root's subscription — `await unsubscribe()` then a
-  fresh `subscribe()` with identical options, sequential and bounded, preserving
-  the change-gate so no phantom re-folds emit. Both are data recovery, not
+  recovering the missed change without re-subscribing on THIS path — the live
+  subscription stays up. (2) A *silently-mute* subscription (one that stops
+  delivering entirely): the heartbeat backstop replaces it — `await
+  unsubscribe()` then a fresh `subscribe()` with identical options, sequential
+  and bounded, generation-guarded so a stale in-flight callback no-ops, and
+  flap-guarded so a still-mute replacement can't churn. The plan worker has many
+  roots, so it flags the affected root(s) and the next reconcile replaces ONLY
+  those subscriptions; the transcript worker has one static subscription and no
+  reconcile loop, so the heartbeat drives the single replace directly. Either
+  way the change-gate / byte offsets survive, so no phantom re-folds emit. Both
+  are data recovery, not
   process self-heal — no worker is respawned; every other unrecoverable error
   still exits non-zero for the LaunchAgent to restart.
 
@@ -2042,6 +2047,20 @@ then a fresh `subscribe()` with identical options, sequential and bounded per
 cycle, keyed per root so a healthy root is never re-armed. The replace touches
 only the watcher stream; the PlanScanner change-gate survives, so no phantom
 re-folds emit.
+
+The transcript worker self-recovers from a *silently-mute* subscription the
+same way, scaled to its single static watch: it has no reconcile loop, so a
+heartbeat rescue (the slow `scanJobsForTitles` backstop re-folded a title the
+live tail missed) drives the replace directly — `await unsubscribe()` then a
+fresh `subscribe()` with the identical options, sequential and non-fatal (a
+re-subscribe failure leaves the tree unwatched until the next heartbeat
+re-fires, never exits). A monotonic generation guard makes a stale in-flight
+callback (the parcel/watcher #190 window) inert, a missing watch root defers
+the re-arm to the next heartbeat instead of erroring, and a one-heartbeat flap
+guard suppresses a re-arm while a fresh replacement is still proving itself.
+The replace swaps only the `subscription` variable; the line stream's byte
+offsets are untouched, so the post-re-arm rescan re-anchors nothing and emits
+no phantom titles.
 
 A **fifth** Worker thread is the usage producer: it watches the agentuse
 daemon's flat leaf state directory (`~/.local/state/agentuse/`, one
