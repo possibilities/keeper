@@ -74,5 +74,5 @@ test:full` mandatory.
 - [ ] CLAUDE.md fence + types.ts JSDoc updated; `bun run test:full` green
 
 ## Done summary
-
+Added createTmuxBackend (pure argv builders + has/mint/new-window with chained remain-on-exit, id-based focus) and a backendType switch in resolveExecBackend; wired the autopilot worker, the hook's tmux sentinel arm (zellij wins nested, KEEPER_TMUX_SESSION gates the session stamp), and per-row focus routing on the jobs board. CLAUDE.md fence + types.ts JSDoc updated; full suite green.
 ## Evidence
