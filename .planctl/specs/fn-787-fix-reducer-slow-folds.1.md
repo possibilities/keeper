@@ -60,5 +60,5 @@ change). No new test surface needed beyond the suite staying green.
 - [ ] keeperd restarted on the new build and an initial breakdown aggregate recorded in Evidence naming the dominant statement/arm per event type
 
 ## Done summary
-
+Added per-arm slow-fold breakdown instrumentation: split pass1's four scans (toolArmA/B, bash, deletion — prepare vs execute + row counts) onto the existing [gitfold-breakdown] line, and added [subagentfold-breakdown], [commitfold-breakdown], [ptufold-breakdown] tags, each threshold-gated by a doc-commented *_BREAKDOWN_MS constant. Pure performance.now()/console.error instrumentation; refold determinism untouched (497 reducer/refold tests pass unchanged).
 ## Evidence
