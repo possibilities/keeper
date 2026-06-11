@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T19:39:05.359025Z",
+  "depends_on": [],
+  "epic": "fn-789-add-tmux-exec-backend",
+  "id": "fn-789-add-tmux-exec-backend.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Delete window reaps and config seam",
+  "updated_at": "2026-06-11T19:39:05.359025Z"
+}

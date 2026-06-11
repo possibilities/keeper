@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T19:39:05.359025Z",
+  "depends_on": [
+    "fn-789-add-tmux-exec-backend.2"
+  ],
+  "epic": "fn-789-add-tmux-exec-backend",
+  "id": "fn-789-add-tmux-exec-backend.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Pane-name snapshot poller and fold",
+  "updated_at": "2026-06-11T19:39:05.359025Z"
+}
