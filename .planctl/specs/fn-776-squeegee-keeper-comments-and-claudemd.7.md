@@ -27,5 +27,5 @@ Per recipe; test:full mandatory (hook subprocess tests live in the slow tier).
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Comment-only scrub of cli/board.ts, cli/autopilot.ts, cli/usage.ts, plugin/hooks/events-writer.ts: -691 lines / -44677 chars. Floor items 4-5 (exit-0, no-db.ts cold-start) kept; biome-ignore at events-writer.ts:654 untouched. Verifier+biome+typecheck+test:full green (autopilot passes the authoritative token arm + correctly-fileName'd transpile; the verifier's no-fileName transpile arm mis-parses its module-scope generic arrow as JSX, a pre-existing HEAD quirk).
 ## Evidence
