@@ -52,9 +52,9 @@ def derive_task_runtime_status(
         return "untouched"
 
     Work auto-completes the instant the worker finishes: a ``done`` task is
-    ``complete`` directly off ``status``. ``worker_done_at`` still rides the
-    tracked task JSON (keeper's completion signal), but the deriver no longer
-    gates on it.
+    ``complete`` directly off ``status``. The deriver gates on ``status``
+    alone; ``worker_done_at`` rides the tracked task JSON as keeper's
+    completion signal and is informational here.
 
     Args:
         task: Task dict from the plans bundle (must have ``status``).
@@ -67,8 +67,9 @@ def derive_task_runtime_status(
         ``"complete"`` for done tasks, ``"untouched"`` for everything else
         (todo, in_progress, blocked).
     """
-    # epic / proj retained in the signature for call-shape parity with the
-    # per-bundle iteration loops in global_state.py — they're no longer read.
+    # epic / proj are retained in the signature for call-shape parity with the
+    # per-bundle iteration loops in global_state.py; the collapsed predicate
+    # reads neither.
     del epic, proj
     status = task.get("status", "")
     if status == "done":
@@ -133,9 +134,9 @@ def derive_closer_runtime_status(
 ) -> Literal["running", "wrapped"] | None:
     """Closer-only runtime status — always None in the plan-state-only model.
 
-    Retained for call-shape parity with the prior signature.  Closer jobs
-    no longer participate in the readiness gate; the planctl deriver has
-    no view into running processes.
+    Retained for call-shape parity.  Closer jobs do not participate in the
+    readiness gate; the planctl deriver has no view into running processes,
+    so readiness derives from board state alone.
     """
     del epic, proj
     return None

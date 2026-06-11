@@ -85,8 +85,9 @@ def restamp_epic_or_fail(
     ``touched_repos`` / per-task ``target_repo`` paths resolve to real
     ``.git/``-bearing dirs.  Default False preserves the warn-and-write
     semantics for the set-*-repo verbs (a path may be staged for a move that
-    hasn't landed yet).  ``refine-apply`` opts in so the trailing
-    ``planctl validate --epic`` the skill used to fire is no longer needed.
+    hasn't landed yet).  ``refine-apply`` opts in so its post-write integrity
+    check covers the filesystem-repo validation inline, without a separate
+    ``planctl validate --epic`` pass.
     """
     from planctl.integrity import _check_epic_tree
     from planctl.project import resolve_project

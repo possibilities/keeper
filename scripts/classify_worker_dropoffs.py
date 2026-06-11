@@ -137,9 +137,7 @@ def scan_parent_session(path: Path) -> list[Spawn]:
                 if c.get("name") != "Agent":
                     continue
                 inp = c.get("input") or {}
-                if (
-                    inp.get("subagent_type") != "plan:worker"
-                ):  # build-forward: renamed from planctl:worker; legacy session coverage requires checking out a pre-rename commit
+                if inp.get("subagent_type") != "plan:worker":
                     continue
                 prompt = inp.get("prompt") or ""
                 m = TASK_ID_RE.search(prompt)
@@ -427,9 +425,7 @@ def discover_sessions(recent_days: int = 12) -> list[Path]:
             with p.open("rb") as f:
                 # Quick scan, up to a few MB
                 blob = f.read(8 * 1024 * 1024)
-                if (
-                    b'"subagent_type":"plan:worker"' not in blob
-                ):  # build-forward: renamed from planctl:worker; legacy session coverage requires checking out a pre-rename commit
+                if b'"subagent_type":"plan:worker"' not in blob:
                     continue
         except Exception:
             continue
