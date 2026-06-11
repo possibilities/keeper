@@ -2581,6 +2581,8 @@ function seedEpicRow(
     status: string;
     updated_at?: number;
     last_validated_at?: string | null;
+    /** Epic-level (close-scope) embedded jobs, JSON-serialized. */
+    jobs?: EmbeddedJob[];
   },
 ): void {
   db.query(
@@ -2596,7 +2598,7 @@ function seedEpicRow(
     opts.updated_at ?? 1,
     "[]",
     "[]",
-    "[]",
+    JSON.stringify(opts.jobs ?? []),
     "[]",
     String(opts.epic_number).padStart(6, "0"),
     null,
@@ -2633,6 +2635,56 @@ test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcile
     // verdict puts the epic id in completedRowIds — the reap candidate set.
     const decision = reconcile(snap, makeState(), 0);
     expect(decision.completedRowIds.has("fn-9-done")).toBe(true);
+  });
+});
+
+test("fn-779: a done epic with LIVE close-scope work never enters completedRowIds, so the completion reap is suppressed for close::<id>", async () => {
+  await withSeededDb(async (db) => {
+    // A done epic whose closer is still winding down — an epic-level (close-verb)
+    // job is `working`. evaluateCloseRow's predicate 1 holds the verdict off
+    // `completed` (it falls through to running:*), so the id is absent from
+    // completedRowIds and isCompletionReapCandidate can never authorize the reap.
+    seedEpicRow(db, "fn-9-done", {
+      epic_number: 9,
+      status: "done",
+      jobs: [{ job_id: "j-close", state: "working" } as unknown as EmbeddedJob],
+    });
+    const snap = await loadReconcileSnapshot(db);
+    expect(snap.epics.map((e) => e.epic_id)).toContain("fn-9-done");
+    const decision = reconcile(snap, makeState(), 0);
+    // Done-but-live: NOT a completed row → no reap.
+    expect(decision.completedRowIds.has("fn-9-done")).toBe(false);
+    // The reap gate inherits the suppression: an exited close::<id> pane is NOT
+    // a candidate because the id never reached the completed set.
+    expect(
+      isCompletionReapCandidate(
+        decision.completedRowIds,
+        pane({ id: "1", tab_name: "close::fn-9-done", exited: true }),
+      ),
+    ).toBe(false);
+  });
+});
+
+test("fn-779: the SAME done epic, once its closer is idle, enters completedRowIds and the reap fires for close::<id>", async () => {
+  await withSeededDb(async (db) => {
+    // Identical epic, but the close job is no longer `working` (closer idle) —
+    // the only difference from the suppressed case above. Predicate 1 now emits
+    // `{tag:"completed"}`, so the id reaches completedRowIds and the exited
+    // close::<id> pane becomes a reap candidate.
+    seedEpicRow(db, "fn-9-done", {
+      epic_number: 9,
+      status: "done",
+      jobs: [{ job_id: "j-close", state: "done" } as unknown as EmbeddedJob],
+    });
+    const snap = await loadReconcileSnapshot(db);
+    const decision = reconcile(snap, makeState(), 0);
+    expect(decision.completedRowIds.has("fn-9-done")).toBe(true);
+    expect(
+      isCompletionReapCandidate(
+        decision.completedRowIds,
+        pane({ id: "1", tab_name: "close::fn-9-done", exited: true }),
+      ),
+    ).toBe(true);
   });
 });
 

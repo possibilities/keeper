@@ -125,14 +125,16 @@ const FINALIZER_VERBS: ReadonlySet<Verb> = new Set<Verb>(["close"]);
 /**
  * The bounded recently-done epics window merged into the reconcile snapshot so
  * the close-row COMPLETION reap is reachable. The default epics read scopes to
- * `status='open'`, so a DONE epic would fall off the snapshot at the exact flip
- * the close-row's `status==='done'` arm needs to emit `{tag:"completed"}` — the
- * completed id would never reach `completedRowIds`. A SECOND read with an
+ * `status='open'`, so a DONE epic would fall off the snapshot before its
+ * close-row's done arm emits `{tag:"completed"}` — that arm now gates on
+ * close-scope liveness, so the epic must stay observable through the whole
+ * done→idle wind-down, not just the instant it flips done. A SECOND read with an
  * explicit `filter:{status:"done"}`, sorted `updated_at` DESC and LIMITed to
  * this window, is merged in (dedup by `epic_id`, open rows win). The bound keeps
- * the snapshot O(limit), never O(all done history). Over-observing is free (the
- * reap is idempotent); only UNDER-observing leaks, so the window has headroom
- * over (fold-lag + reconcile cadence).
+ * the snapshot O(limit), never O(all done history). The limit is generous versus
+ * a closer's wind-down. Over-observing is free (the reap is idempotent); only
+ * UNDER-observing leaks, so the window has headroom over (fold-lag + reconcile
+ * cadence + closer wind-down).
  */
 export const DONE_EPICS_REAP_LIMIT = 32;
 

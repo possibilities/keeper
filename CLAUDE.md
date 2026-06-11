@@ -122,6 +122,8 @@ The server-side reconciler dispatches workers against ready plan work. It **boot
 paused** and is level-triggered on `PRAGMA data_version`. An unpaused autopilot that
 "does nothing" is almost always a readiness gate firing correctly — the gates live in
 `src/readiness.ts` (`computeReadiness`) and the `[paused]` banner is authoritative.
+Close-row completion is liveness-gated in `src/readiness.ts` (done AND closer idle),
+not reap-side; the completion reap inherits done-AND-idle from that verdict.
 For modes, caps, the cooldown, and completion-reap, read `src/autopilot-worker.ts`,
 `src/readiness.ts`, and README.
 

@@ -307,7 +307,8 @@ Keeper has no `install` verb. Wire it up manually:
    - `autoclose_windows` — whether the autopilot reaps a row's zellij
      surfaces when it reaches **completion**. Default `true`. When a task
      reaches `{tag:"completed"}` (worker done + idle) the reconciler closes its
-     `work::<id>` pane; a completed epic close-row closes `close::<id>`. Pending
+     `work::<id>` pane; a completed epic close-row (done AND closer idle) closes
+     `close::<id>`. Pending
      and just-worker-ended-incomplete windows stay open
      for inspection. Set `false` to keep every window open (the reap pass
      becomes a no-op and skips the `list-panes` probe). Restart-to-apply — a
@@ -695,7 +696,8 @@ event-log/reducer/hook touch. Run any of them with
   line so the human reads the cause without scanning the upstream rows.
   The `BlockReason` vocabulary splits epic-dep failures into two cousins:
   `dep-on-epic <id>` (amber / warn — the upstream IS in the snapshot
-  but its close verdict isn't `completed`) and `dep-on-epic-dangling
+  but its close verdict isn't `completed`; for an in-snapshot upstream
+  this clears only once it is done AND its closer idle) and `dep-on-epic-dangling
   <id>` (red / error — the upstream id failed to resolve at all,
   meaning either a full-id miss, a bare `fn-N` miss, or an ambiguous
   bare-id with no same-project disambiguator). The dangling case
@@ -2137,19 +2139,22 @@ and never throws (no-self-heal). A **distinct** completion reap (fn-727,
 config-gated on `autoclose_windows`, default `true`) shares the SAME
 `reapSurfaces` close path but gates on the OPPOSITE signal: each reconcile
 cycle, when a row reaches the durable `{tag:"completed"}` readiness verdict
-(worker done for a task, `status='done'` for an epic, + idle), the worker
+(task worker done AND idle; epic `status='done'` AND its closer idle — no
+working close job, running sub-agent, or live monitor), the worker
 closes every live surface sharing
 that row's id — a completed task reaps `work::<id>`; a completed close-row
-reaps `close::<id>`. For the close-row verdict to be observed at all, the reconcile
-snapshot must still carry the just-done epic: the default epics read scopes to
+reaps `close::<id>`. The reap carries no liveness gate of its own: the durable
+verdict is the SOLE authorization, and the close-row's liveness gating lives in
+`src/readiness.ts`, not reap-side. For the close-row verdict to be observed at
+all, the reconcile
+snapshot must still carry the just-done epic through its whole done→idle
+wind-down: the default epics read scopes to
 `status='open'`, so fn-764 MERGES in a SECOND bounded read
 (`filter:{status:"done"}`, sorted `updated_at` DESC, limited to a small window
-— never O(all done history), the fn-748 anti-pattern) so a freshly-done epic is
-observed at least once post-flip; `reapSurfaces` is idempotent, so
-re-observation within the window is a safe no-op. Unlike the pause reap it
-deliberately does NOT gate on `is_exited` (the worker pane may be live at the
-instant of completion — the verdict, not pane liveness, is the sole
-authorization); pending / worker-ended-incomplete windows never reach
+— never O(all done history), the fn-748 anti-pattern) so a freshly-done epic
+stays observed across the wind-down; `reapSurfaces` is idempotent, so
+re-observation within the window is a safe no-op. Pending /
+worker-ended-incomplete windows never reach
 `{tag:"completed"}` and stay open. The completed-row-id set rides out of
 `reconcile`'s single `computeReadiness` pass (no second pass), the reap
 re-probes `list-panes` every cycle (survives a daemon restart — no reliance on
