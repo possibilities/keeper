@@ -32,5 +32,5 @@ Boot out the live agent first (`launchctl bootout gui/$(id -u)/arthack.promptctl
 - [ ] Root CLAUDE.md, claude/CLAUDE.md, and system/CLAUDE.md carry no bundle-health references; no backward-facing prose introduced
 
 ## Done summary
-
+Booted out and git-rm'd the bundle-health-snapshot LaunchAgent (processctl reconciled the orphan symlink) and pruned bundle-health references from root, claude, and system CLAUDE.md. Agent and symlink confirmed absent.
 ## Evidence
