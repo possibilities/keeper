@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Fix UsageDeleted crash loop",
-  "updated_at": "2026-06-10T23:05:48.387189Z"
+  "updated_at": "2026-06-11T03:06:35.537651Z",
+  "worker_done_at": "2026-06-11T03:06:35.537651Z"
 }
