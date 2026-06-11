@@ -87,5 +87,5 @@ package.json:16 `--path-ignore-patterns`; extend the import-pin. Run
 - [ ] Both plists ship; README gains the builds install step and drops the stale "future sitters" aside
 
 ## Done summary
-
+Shipped the builds CI-failure collector sitter: read-only buildbot state.sqlite scanner (immutable=1 open for WAL safety) + collector agent that writes one followup per red onset with no findings-path page, sibling dead-man watchdog, two plists, README install + architecture sections, and a two-layer test suite. Validated live against the real buildbot DB (3 currently-red builders surfaced correctly).
 ## Evidence
