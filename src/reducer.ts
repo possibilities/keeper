@@ -1151,10 +1151,53 @@ function bashTargetMatches(token: string, candidatePath: string): boolean {
   return false;
 }
 
+/**
+ * Per-arm timing + cardinality accumulator threaded through the per-file loop
+ * of {@link projectGitStatus} so the four scans inside
+ * {@link findExplicitAttributions} (the dominant pass1 cost on the live DB)
+ * become individually attributable on the `[gitfold-breakdown]` line. Wall-time
+ * is split into prepare (statement compile) vs execute (.all) per arm to
+ * convict statement recompilation — the suspected hotspot, since each arm
+ * re-`prepare`s per file per snapshot. Pure instrumentation: never read into a
+ * projection write, so re-fold determinism is untouched.
+ */
+interface ExplicitAttribAccumulator {
+  toolArmAPrepMs: number;
+  toolArmAExecMs: number;
+  toolArmARows: number;
+  toolArmBPrepMs: number;
+  toolArmBExecMs: number;
+  toolArmBRows: number;
+  bashScanPrepMs: number;
+  bashScanExecMs: number;
+  bashScanRows: number;
+  deletionScanPrepMs: number;
+  deletionScanExecMs: number;
+  deletionScanRows: number;
+}
+
+function newExplicitAttribAccumulator(): ExplicitAttribAccumulator {
+  return {
+    toolArmAPrepMs: 0,
+    toolArmAExecMs: 0,
+    toolArmARows: 0,
+    toolArmBPrepMs: 0,
+    toolArmBExecMs: 0,
+    toolArmBRows: 0,
+    bashScanPrepMs: 0,
+    bashScanExecMs: 0,
+    bashScanRows: 0,
+    deletionScanPrepMs: 0,
+    deletionScanExecMs: 0,
+    deletionScanRows: 0,
+  };
+}
+
 function findExplicitAttributions(
   db: Database,
   projectDir: string,
   file: ReducerDirtyFile,
+  acc?: ExplicitAttribAccumulator,
 ): SessionMutation[] {
   // Build the candidate path list as ABSOLUTE paths anchored on
   // `projectDir`. The derivers store mutation targets absolutely
@@ -1196,20 +1239,26 @@ function findExplicitAttributions(
     // `idx_events_tool_attr` makes this a sub-ms covering SEEK. Covers every
     // inline blob; a relocated row has `data IS NULL` so this arm misses it
     // (handled by ARM B).
-    const toolRows = db
-      .prepare(
-        `SELECT id, ts, session_id, tool_name
+    const _armAP0 = acc != null ? performance.now() : 0;
+    const toolStmt = db.prepare(
+      `SELECT id, ts, session_id, tool_name
            FROM events
           WHERE hook_event = 'PostToolUse'
             AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
             AND json_extract(data, '$.tool_input.file_path') = ?`,
-      )
-      .all(candidatePath) as Array<{
+    );
+    const _armAP1 = acc != null ? performance.now() : 0;
+    const toolRows = toolStmt.all(candidatePath) as Array<{
       id: number;
       ts: number;
       session_id: string;
       tool_name: string;
     }>;
+    if (acc != null) {
+      acc.toolArmAPrepMs += _armAP1 - _armAP0;
+      acc.toolArmAExecMs += performance.now() - _armAP1;
+      acc.toolArmARows += toolRows.length;
+    }
     // ARM B (relocated): reads `event_blobs.data` for rows whose hot column was
     // NULLed, joining back to `events` for the scalar facts; scans only the
     // small side table. The `CASE WHEN json_valid(b.data) THEN json_extract(...)
@@ -1219,9 +1268,9 @@ function findExplicitAttributions(
     // skips a malformed relocated blob (yields NULL) instead of throwing
     // "malformed JSON" and crashing the fold. A malformed blob has no parseable
     // file_path, so skipping is re-fold-deterministic.
-    const relocatedRows = db
-      .prepare(
-        `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
+    const _armBP0 = acc != null ? performance.now() : 0;
+    const relocatedStmt = db.prepare(
+      `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
                 e.tool_name AS tool_name
            FROM event_blobs b
            JOIN events e ON e.id = b.event_id
@@ -1231,13 +1280,19 @@ function findExplicitAttributions(
             AND CASE WHEN json_valid(b.data)
                      THEN json_extract(b.data, '$.tool_input.file_path')
                 END = ?`,
-      )
-      .all(candidatePath) as Array<{
+    );
+    const _armBP1 = acc != null ? performance.now() : 0;
+    const relocatedRows = relocatedStmt.all(candidatePath) as Array<{
       id: number;
       ts: number;
       session_id: string;
       tool_name: string;
     }>;
+    if (acc != null) {
+      acc.toolArmBPrepMs += _armBP1 - _armBP0;
+      acc.toolArmBExecMs += performance.now() - _armBP1;
+      acc.toolArmBRows += relocatedRows.length;
+    }
     for (const row of [...toolRows, ...relocatedRows]) {
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
@@ -1257,22 +1312,28 @@ function findExplicitAttributions(
   // array contains the candidate path. The partial index narrows the scan to
   // the sparse mutation subset before the `json_each` probe.
   for (const candidatePath of paths) {
-    const bashRows = db
-      .prepare(
-        `SELECT e.id, e.ts, e.session_id, e.bash_mutation_kind AS kind
+    const _bashP0 = acc != null ? performance.now() : 0;
+    const bashStmt = db.prepare(
+      `SELECT e.id, e.ts, e.session_id, e.bash_mutation_kind AS kind
            FROM events e
           WHERE e.bash_mutation_kind IS NOT NULL
             AND EXISTS (
               SELECT 1 FROM json_each(e.bash_mutation_targets) j
                WHERE j.value = ?
             )`,
-      )
-      .all(candidatePath) as Array<{
+    );
+    const _bashP1 = acc != null ? performance.now() : 0;
+    const bashRows = bashStmt.all(candidatePath) as Array<{
       id: number;
       ts: number;
       session_id: string;
       kind: string;
     }>;
+    if (acc != null) {
+      acc.bashScanPrepMs += _bashP1 - _bashP0;
+      acc.bashScanExecMs += performance.now() - _bashP1;
+      acc.bashScanRows += bashRows.length;
+    }
     for (const row of bashRows) {
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
@@ -1300,20 +1361,26 @@ function findExplicitAttributions(
   // `mtime_ms=null` (no pass-2 inference). Pull candidate rows into JS and apply
   // exact / directory-prefix / fnmatch via `bashTargetMatches` — pure (no FS,
   // no wall-clock), so re-fold determinism holds.
-  const deletionRows = db
-    .prepare(
-      `SELECT id, ts, session_id, bash_mutation_kind AS kind,
+  const _delP0 = acc != null ? performance.now() : 0;
+  const deletionStmt = db.prepare(
+    `SELECT id, ts, session_id, bash_mutation_kind AS kind,
               bash_mutation_targets AS targets
          FROM events
         WHERE bash_mutation_kind IN ('git-rm', 'git-mv')`,
-    )
-    .all() as Array<{
+  );
+  const _delP1 = acc != null ? performance.now() : 0;
+  const deletionRows = deletionStmt.all() as Array<{
     id: number;
     ts: number;
     session_id: string;
     kind: string;
     targets: string | null;
   }>;
+  if (acc != null) {
+    acc.deletionScanPrepMs += _delP1 - _delP0;
+    acc.deletionScanExecMs += performance.now() - _delP1;
+    acc.deletionScanRows += deletionRows.length;
+  }
   for (const row of deletionRows) {
     if (row.session_id == null || row.session_id.length === 0) continue;
     if (row.targets == null || row.targets.length === 0) continue;
@@ -1564,8 +1631,12 @@ function projectGitStatus(db: Database, event: Event): void {
       WHERE project_dir = ?
         AND file_path = ?`,
   );
+  // Per-arm pass1 accumulator — only allocated/threaded so the eventual
+  // breakdown line (emitted below only above threshold) can attribute pass1 to
+  // a specific scan + its prepare-vs-execute split. Pure instrumentation.
+  const _pass1Acc = newExplicitAttribAccumulator();
   for (const file of snapshot.dirty_files) {
-    const explicit = findExplicitAttributions(db, projectDir, file);
+    const explicit = findExplicitAttributions(db, projectDir, file, _pass1Acc);
     for (const m of explicit) {
       upsertStmt.run(
         projectDir,
@@ -1890,7 +1961,21 @@ function projectGitStatus(db: Database, event: Event): void {
         `pass3_render=${(_gfT3 - _gfT2).toFixed(0)}ms ` +
         `pass4_rollup=${(_gfT4 - _gfT3).toFixed(0)}ms ` +
         `fanout=${(_gfT5 - _gfT4).toFixed(0)}ms ` +
-        `write=${(performance.now() - _gfT5).toFixed(0)}ms`,
+        `write=${(performance.now() - _gfT5).toFixed(0)}ms ` +
+        // pass1 per-arm split (prep=statement compile, exec=.all, rows=matched).
+        // Summed across the per-file loop, so prep≫exec convicts recompilation.
+        `p1_toolA_prep=${_pass1Acc.toolArmAPrepMs.toFixed(0)}ms ` +
+        `p1_toolA_exec=${_pass1Acc.toolArmAExecMs.toFixed(0)}ms ` +
+        `p1_toolA_rows=${_pass1Acc.toolArmARows} ` +
+        `p1_toolB_prep=${_pass1Acc.toolArmBPrepMs.toFixed(0)}ms ` +
+        `p1_toolB_exec=${_pass1Acc.toolArmBExecMs.toFixed(0)}ms ` +
+        `p1_toolB_rows=${_pass1Acc.toolArmBRows} ` +
+        `p1_bash_prep=${_pass1Acc.bashScanPrepMs.toFixed(0)}ms ` +
+        `p1_bash_exec=${_pass1Acc.bashScanExecMs.toFixed(0)}ms ` +
+        `p1_bash_rows=${_pass1Acc.bashScanRows} ` +
+        `p1_del_prep=${_pass1Acc.deletionScanPrepMs.toFixed(0)}ms ` +
+        `p1_del_exec=${_pass1Acc.deletionScanExecMs.toFixed(0)}ms ` +
+        `p1_del_rows=${_pass1Acc.deletionScanRows}`,
     );
   }
 }
@@ -1983,6 +2068,16 @@ function retractGitStatus(db: Database, event: Event): void {
  * from-scratch re-fold reproduces `last_commit_at` deterministically. A
  * malformed payload folds to a safe no-op via {@link extractCommit}.
  */
+/**
+ * Threshold above which a Commit fold emits a `[commitfold-breakdown]` line
+ * splitting the per-file discharge loop vs {@link foldCommitTaskLinks} vs the
+ * {@link syncPlanctlLinks} fan-out (the commit-trailer edge rebuild — the
+ * O(children) JSON RMW). Commit averages 2.5s on the live DB; the split
+ * convicts which sub-step holds the write lock. Gated so steady folds stay
+ * silent. Pure instrumentation — never read into a projection write.
+ */
+const COMMIT_FOLD_BREAKDOWN_MS = 1000;
+
 function foldCommit(db: Database, event: Event): void {
   const commit = extractCommit(event);
   if (commit == null) {
@@ -2052,6 +2147,9 @@ function foldCommit(db: Database, event: Event): void {
   }
 
   if (commit.committer_session_id !== null) {
+    // Per-arm timing — emitted (below) ONLY when the whole fold is slow. Never
+    // persisted, so no bearing on re-fold determinism.
+    const _cfT0 = performance.now();
     // Per-session discharge: only the committing session clears its claim. Other
     // sessions that touched these files (multi-attribution) stay on-the-hook
     // until they commit too.
@@ -2087,6 +2185,7 @@ function foldCommit(db: Database, event: Event): void {
         filePath,
       );
     }
+    const _cfT1 = performance.now();
     // Task→committing-session link write, gated on `task_ids.length > 0` (the
     // enclosing arm already requires a non-null session). Multi-task commits
     // stamp ALL named tasks symmetrically. Pure function of the payload + the
@@ -2111,6 +2210,7 @@ function foldCommit(db: Database, event: Event): void {
     // commit-trailer fact. We TRIGGER (never write the edge cells directly) so
     // `syncPlanctlLinks` stays the sole writer. A non-planctl commit has NULL
     // `planctl_op` and no-ops, preserving re-fold determinism over the log.
+    const _cfT2 = performance.now();
     if (
       commit.planctl_op != null &&
       commit.planctl_target != null &&
@@ -2118,11 +2218,25 @@ function foldCommit(db: Database, event: Event): void {
     ) {
       syncPlanctlLinks(db, commit.committer_session_id, eventId, eventTs);
     }
+    // Slow-fold breakdown — localizes a [fold-slow] Commit (per-session arm) to
+    // a sub-step. nfiles/ntasks give the fan-out cardinality. Only emitted above
+    // threshold so steady folds stay silent. Pure side-effect.
+    const _cfTotal = performance.now() - _cfT0;
+    if (_cfTotal >= COMMIT_FOLD_BREAKDOWN_MS) {
+      console.error(
+        `[commitfold-breakdown] id=${eventId} arm=session total=${_cfTotal.toFixed(0)}ms ` +
+          `nfiles=${commit.files.length} ntasks=${commit.task_ids.length} ` +
+          `discharge_loop=${(_cfT1 - _cfT0).toFixed(0)}ms ` +
+          `task_links=${(_cfT2 - _cfT1).toFixed(0)}ms ` +
+          `planctl_fanout=${(performance.now() - _cfT2).toFixed(0)}ms`,
+      );
+    }
     return;
   }
   // Global discharge: no trailer (or malformed) → no honest way to pin the
   // discharge to a session, so clear EVERY session's attribution row for the
   // named files.
+  const _cfgT0 = performance.now();
   const globalStmt = db.prepare(
     `UPDATE file_attributions
         SET last_commit_at = ?, last_event_id = ?, updated_at = ?
@@ -2150,6 +2264,16 @@ function foldCommit(db: Database, event: Event): void {
       eventTs,
       commit.project_dir,
       filePath,
+    );
+  }
+  // Global arm has only the discharge loop (no task-links / fanout). Same gate.
+  const _cfgTotal = performance.now() - _cfgT0;
+  if (_cfgTotal >= COMMIT_FOLD_BREAKDOWN_MS) {
+    console.error(
+      `[commitfold-breakdown] id=${eventId} arm=global total=${_cfgTotal.toFixed(0)}ms ` +
+        `nfiles=${commit.files.length} ntasks=${commit.task_ids.length} ` +
+        `discharge_loop=${_cfgTotal.toFixed(0)}ms ` +
+        `task_links=0ms planctl_fanout=0ms`,
     );
   }
 }
@@ -3431,6 +3555,16 @@ function sweepRunningSubagentsToUnknown(
  * {@link sweepRunningSubagentsToUnknown} elsewhere. NEVER throws — every arm
  * returns silently on the safe-default branch.
  */
+/**
+ * Threshold above which a SubagentStart fold emits a `[subagentfold-breakdown]`
+ * line splitting `extractTurnSeq` vs `findPendingPreToolUseForStart` (the FIFO
+ * bridge probe, which parses candidate PreToolUse blobs) vs the row INSERT.
+ * SubagentStart averages 2.6s / maxes 27.6s on the live DB; the split convicts
+ * which probe holds the write lock. Gated so steady folds stay silent. Pure
+ * instrumentation — never read into a projection write.
+ */
+const SUBAGENT_FOLD_BREAKDOWN_MS = 1000;
+
 function projectSubagentInvocationsRow(db: Database, event: Event): void {
   const ts = event.ts;
   const jobId = event.session_id;
@@ -3443,7 +3577,9 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
       if (agentId == null || agentId.length === 0) {
         return;
       }
+      const _saT0 = performance.now();
       const turnSeq = extractTurnSeq(db, jobId, agentId);
+      const _saT1 = performance.now();
       const seedType =
         typeof event.agent_type === "string" && event.agent_type.length > 0
           ? event.agent_type
@@ -3458,6 +3594,7 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
       // unbound PreToolUse row qualifies — leaves the historical SubagentStart
       // defaults (NULL / NULL / 0) in place.
       const pendingPre = findPendingPreToolUseForStart(db, jobId, seedType);
+      const _saT2 = performance.now();
       const seedToolUseId = pendingPre?.tool_use_id ?? null;
       const seedDescription = pendingPre?.description ?? null;
       const seedPromptChars = pendingPre?.prompt_chars ?? 0;
@@ -3485,6 +3622,18 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
           ts,
         ],
       );
+      // Slow-fold breakdown — localizes a [fold-slow] SubagentStart to the
+      // dominant probe. Only emitted above threshold so steady folds stay
+      // silent. Pure side-effect: not read into any projection write.
+      const _saTotal = performance.now() - _saT0;
+      if (_saTotal >= SUBAGENT_FOLD_BREAKDOWN_MS) {
+        console.error(
+          `[subagentfold-breakdown] id=${event.id} total=${_saTotal.toFixed(0)}ms ` +
+            `extractTurnSeq=${(_saT1 - _saT0).toFixed(0)}ms ` +
+            `findPendingPre=${(_saT2 - _saT1).toFixed(0)}ms ` +
+            `insert=${(performance.now() - _saT2).toFixed(0)}ms`,
+        );
+      }
       return;
     }
 
@@ -4092,18 +4241,33 @@ function syncJobIntoEpic(
  * UPDATE/INSERT actually wrote" — the Killed-mismatch path must NOT fire either
  * fan-out.
  */
+/**
+ * When non-null, {@link syncIfPlanRef} adds its own wall-time (ms) to this
+ * accumulator. Armed ONLY around the PostToolUse dispatch in {@link applyEvent}
+ * so the `[ptufold-breakdown]` line can split the syncIfPlanRef fan-out out of
+ * the jobs-arm total without threading a param through all 15 call sites. Pure
+ * instrumentation: the value is never read into a projection write, never
+ * influences a branch — re-fold determinism is untouched. A fold is
+ * single-threaded, so the module-scoped accumulator can't interleave.
+ */
+let _syncIfPlanRefAccumMs: number | null = null;
+
 function syncIfPlanRef(
   db: Database,
   jobId: string,
   eventId: number,
   ts: number,
 ): void {
+  const _siprT0 = _syncIfPlanRefAccumMs != null ? performance.now() : 0;
   const row = db
     .query(
       "SELECT job_id, plan_verb, plan_ref, state, title, created_at, updated_at, last_event_id, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_permission_prompt_at, last_permission_prompt_kind, git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
     )
     .get(jobId) as JobsRowForSync | null;
   if (row == null) {
+    if (_syncIfPlanRefAccumMs != null) {
+      _syncIfPlanRefAccumMs += performance.now() - _siprT0;
+    }
     return;
   }
   if (row.plan_ref != null) {
@@ -4114,6 +4278,9 @@ function syncIfPlanRef(
   // spawn name didn't parse as a planctl verb (e.g. a manual `planctl
   // epic-create`).
   syncJobLinksOnJobWrite(db, jobId, eventId, ts);
+  if (_syncIfPlanRefAccumMs != null) {
+    _syncIfPlanRefAccumMs += performance.now() - _siprT0;
+  }
 }
 
 /**
@@ -6303,6 +6470,32 @@ export function applyEvent(
       // empty arm: the final `else` runs projectJobsRow, so deleting this
       // arm would route historical BackendExecSnapshot events into the jobs
       // projection and break re-fold determinism.
+    } else if (event.hook_event === "PostToolUse") {
+      // PostToolUse fans to BOTH projections plus syncIfPlanRef (inside
+      // projectJobsRow); the 781ms avg is otherwise unattributable. Arm the
+      // module-scoped syncIfPlanRef accumulator so its fan-out splits out of
+      // the jobs-arm total. Pure instrumentation — no projection write reads it.
+      _syncIfPlanRefAccumMs = 0;
+      const _ptuT0 = performance.now();
+      projectJobsRow(db, event);
+      const _ptuT1 = performance.now();
+      // The `subagent_invocations` projection rides the same transaction +
+      // cursor advance — exactly-once-per-event holds across both projections.
+      projectSubagentInvocationsRow(db, event);
+      const _ptuT2 = performance.now();
+      const _ptuSyncMs = _syncIfPlanRefAccumMs;
+      _syncIfPlanRefAccumMs = null;
+      const _ptuTotal = _ptuT2 - _ptuT0;
+      if (_ptuTotal >= PTU_FOLD_BREAKDOWN_MS) {
+        // jobs_arm includes its own syncIfPlanRef cost; sync_fanout breaks it
+        // out so jobs_arm−sync_fanout is the pure state-machine write.
+        console.error(
+          `[ptufold-breakdown] id=${event.id} total=${_ptuTotal.toFixed(0)}ms ` +
+            `jobs_arm=${(_ptuT1 - _ptuT0).toFixed(0)}ms ` +
+            `subagent_arm=${(_ptuT2 - _ptuT1).toFixed(0)}ms ` +
+            `sync_fanout=${_ptuSyncMs.toFixed(0)}ms`,
+        );
+      }
     } else {
       projectJobsRow(db, event);
       // The `subagent_invocations` projection rides the same transaction +
@@ -6343,6 +6536,15 @@ export function applyEvent(
  * is guarded inside {@link extractPermissionMode} (skip-and-log), so one
  * malformed row never halts the reducer.
  */
+/**
+ * Threshold above which a PostToolUse fold emits a `[ptufold-breakdown]` line
+ * splitting the jobs-arm vs the subagent-arm vs the syncIfPlanRef fan-out.
+ * PostToolUse averages 781ms on the live DB — below the 1s mark the other
+ * breakdowns use, so this gate is lower to catch the representative slow
+ * PostToolUse fold. Gated so steady folds stay silent. Pure instrumentation.
+ */
+const PTU_FOLD_BREAKDOWN_MS = 500;
+
 /**
  * A single-event fold over this many ms logs a `[fold-slow]` diagnostic line.
  * A slow fold holds the `BEGIN IMMEDIATE` write lock that long, starving
