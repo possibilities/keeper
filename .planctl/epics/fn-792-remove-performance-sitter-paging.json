@@ -2,9 +2,11 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-06-11T22:24:23.039322Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-791-build-helptailing-babysitter-producer"
+  ],
   "id": "fn-792-remove-performance-sitter-paging",
-  "last_validated_at": "2026-06-11T22:24:23.283615Z",
+  "last_validated_at": "2026-06-11T22:24:32.537936Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -13,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-11T22:24:23.039322Z"
+  "updated_at": "2026-06-11T22:24:32.365348Z"
 }
