@@ -80,186 +80,32 @@ export {
   sendReplayDeadLetterRpc,
 } from "../src/board-render";
 
-const HELP = `keeper board — epics-only UI over the keeper subscribe server
+const HELP = `keeper board [--sock <path>] [--snapshot | --watch] [--timeout <s>]
 
-Usage: keeper board [--sock <path>] [--snapshot | --watch] [--timeout <s>]
+Epics-only UI over the keeper subscribe server: one block per open epic
+(header, task lines, nested job + sub-agent rows, close row), led by '---'.
+Piped/non-TTY auto-detects snapshot mode; a TTY gets the live TUI.
 
+Options:
   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --snapshot       Force one-shot snapshot mode (print one frame + a
-                   machine-parseable keeper-meta: line, then exit) even on a TTY
+  --snapshot       Force one-shot snapshot mode (one frame + a parseable
+                   keeper-meta: line, then exit) even on a TTY
   --watch          Force the live subscribe stream even when piped
   --timeout <s>    Snapshot wait before the timeout escape (default ~2s)
   --help           Show this help
 
-By default, stdout that is NOT a TTY (piped into an agent) auto-detects
-snapshot mode; a TTY gets the live TUI. \`CI\` / \`TERM=dumb\` force snapshot.
+TUI keys: ←/h/k prev frame · →/l/j next · g oldest · G/End/Esc live ·
+  c copy frame+sidecar paths · q/Ctrl-C quit.
 
-Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
-  ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  c copy current frame + sidecar paths to clipboard,
-  q/Ctrl-C quit.
-  Per-frame sidecars are indexed; lifecycle + warn output
-  is appended to /tmp/keeper-board.<pid>.lifecycle.txt. Session paths
-  print on exit.
+Examples:
+  keeper board            # live board, default scope
+  keeper board | tail -1  # one-shot snapshot; last line is parseable JSON
+  keeper board --watch    # force the live stream even when piped
 
-The bottom jobs list and the dead-letter banner (with the 'r' replay
-key) live in 'keeper jobs' (fn-658.3 split them out of board).
-
-Renders one block per epic; the frame is just the '---' lead when no
-epics match the default scope.
-
-Pills follow the SHOW-DEFAULTS + ICON convention (fn-713 follow-on; reverses
-the earlier fn-708 omit-default). Every fixed-slot enum renders an explicit
-pill at its current value, defaults included — [pending], [todo], [open],
-[unvalidated], [stopped], [ok] all show. Each themed pill carries a Nerd Font
-glyph inside the brackets, ahead of a '::' delimiter:
-  [<icon>::<text>]   e.g.  [<icon>::ready]   [<icon>::blocked:dep-on-task fn-2]
-The glyph is the source of truth; color (applied to the text half) is an
-orthogonal reinforcement. Non-state pills — dep refs [#2] / [name#3] — stay
-plain (no glyph). The icon set is the 'fa-classic' theme in src/icon-theme.ts;
-swap ACTIVE_THEME there to reskin. Presence-based pills ([failed:*],
-[awaiting:*], [task-repo:*], [slotted-after-closer], the role pill) still
-appear only when their condition holds.
-
-Each epic block opens with a header line of the form:
-
-  ({dir}) {epic_number} {title} [name#dep,name#dep] [validated]? [slotted-after-closer]? [<readiness>]
-
-The [validated] pill appears ONLY when the epic is validated; its absence
-encodes 'unvalidated' (flip with 'planctl validate --epic <id>'). A
-[blocked:<reason>] readiness pill drops to its own indented line beneath the
-header instead of stamping at the end; ready/completed/running stay inline.
-
-The {epic_number} {title} label falls back to {epic_id} when BOTH are null —
-a pre-EpicSnapshot stub row (a keeper epic and its tasks fold as two separate
-transactions; between them the epic exists with zero tasks and a still-null
-number/title). The fallback keeps the header legible and identifiable instead
-of collapsing to a blank '({dir})  [unvalidated]' line; such a taskless epic's
-close row reads [blocked:epic-no-tasks] (fn-700) until its first task folds.
-The row is never hidden ("show it blocked, don't hide").
-
-The cross-epic dependency pills carry the dep's project-name prefix
-(e.g. [arthack#633]) so deps that cross topics/projects read unambiguously;
-the bare task-dep pills below stay [#n] (same-epic, no prefix needed).
-
-The optional [slotted-after-closer] pill (schema v29) appears only on epics
-whose projection carries a non-null created_by_closer_of — i.e. epics minted
-by another epic's closer session. Its presence is also what slots the epic
-directly below its parent in the default sort (sort_path ASC).
-
-followed (when the epic carries job_links) by one indented creator/refiner
-line per linked session —
-'{title} [creator|refiner] [state]? [failed:<kind>]?' where the [state] pill
-follows omit-default (no pill ≡ 'stopped'; only live states stamp one), with an optional
-[awaiting:<kind>] pill dropped onto its own indented continuation line
-beneath the row
-(title falls back to {job_id} when the embedded title is null; the
-[failed:<kind>] pill appears when the session's last Claude API request
-failed at a terminal HTTP boundary and the human hasn't picked up since —
-the six rendered kinds are rate_limit | authentication_failed |
-billing_error | server_error | invalid_request | unknown, and anything
-outside the allow-list folds to 'unknown'; the recoverable
-max_output_tokens kind is excluded by design; the [awaiting:<kind>] pill
-appears when the session is stopped on an interactive built-in tool that
-fires no hook of its own — currently just AskUserQuestion, rendered as
-[awaiting:ask_user_question] in warn/yellow via the awaiting:* prefix
-fallback, future-extensible to any other built-in interactive tool that
-surfaces a question without a hook; the [state]/[failed:<kind>] pills
-stay inline while [awaiting:<kind>] drops to its own continuation line
-below the row). Schema v25 denormalized title / state /
-last_api_error_at / last_api_error_kind / last_input_request_at /
-last_input_request_kind off the linked jobs row at the reducer's write
-boundary, so the same line shape renders for live, terminal, and
-off-page sessions — no live-jobs join, no off-page fallback branch — then the task lines
-(one per embedded task,
-'{n}. {title} [#dep,#dep] [<runtime>]? [worker-done]? [<approval>]?').
-The three native fields follow omit-default + de-ambiguation (fn-708):
-  - runtime_status: 'todo' elides (default); 'in_progress' / 'done' render
-    verbatim; 'blocked' renders as '[rt:blocked]' so the manual planctl block
-    flag never collides with the verdict '[blocked:*]' family.
-  - worker_phase: 'open' never renders; the 'done' survivor renders as the
-    LABELED '[worker-done]' (never bare '[done]', which would collide with
-    runtime 'done') and only when the verdict does not already pin done
-    (i.e. not 'completed' / 'job-pending' / 'git-uncommitted' / 'git-orphans').
-  - approval: 'pending' elides (default); '[rejected]' is dropped when the
-    verdict is already '[blocked:job-rejected]' and '[approved]' when the
-    verdict is '[completed]' (the word is already on screen).
-The block ends with a "Quality audit and close" line for the epic itself —
-its '[status]' pill is dropped (the board filter pins it to '[open]') and
-its approval pill follows the same omit-default + verdict-aware suppression,
-so it usually collapses to just the title + the '[id] <verdict>' line.
-
-Sub-agent invocations nest under their owning job row as one indented
-line each — '{subagent_type}{annotations}: {description} [<status>]?' —
-where <status> is the raw projection enum and follows omit-default (fn-708):
-'ok' (and a null/empty status) renders NO pill (absence ≡ ok); the
-non-resting states 'running|failed|unknown|superseded' render verbatim.
-'superseded' is rendered (no hiding) so the audit trail of re-entrant
-attempts stays visible.
-
-Same-name invocations within one job COLLAPSE on the client to a single
-line representing the most recent (max turn_seq) row; the {annotations}
-block is a parenthesized comma-joined annotation that appears only when
-there's something to say: '(×N)' when the group folded N rows, and/or
-'(N stuck)' when one or more non-surviving rows are still status='running'
-(orphans whose matching SubagentStop never landed). The same collapse
-applies to the readiness handoff (predicate 6 sees one logical agent
-per (job_id, subagent_type) pair) so an orphaned 'running' row no longer
-false-blocks downstream rows. The full uncollapsed audit trail is still
-in sqlite — only the client view collapses.
-
-The [<readiness>] pill is one of [ready], [completed], or
-[blocked:<reason>] — a pure-function verdict computed by src/readiness.ts
-from the (epics, jobs, subagent_invocations) snapshot. One blocked reason is
-close-row-specific: [blocked:epic-no-tasks] (fn-700) fires on the "Quality
-audit and close" row of an epic with ZERO tasks (the partial-projection
-window between the EpicSnapshot and TaskSnapshot folds) so the autopilot
-never dispatches a closer against an epic with no work. For tasks and the
-close row a [ready] / [completed] / [running:<kind>] pill stamps inline on
-the indented "[<id>]" reference line beneath the header; a [blocked:<reason>]
-pill instead drops to its OWN line directly beneath the id line (so the
-full reason — including any "dep-on-task <upstream>" id — reads without
-wrapping). The epic header (which has no id line) follows the same split:
-ready/completed/running stamp at the end of the header itself, while a
-[blocked:<reason>] pill drops to its own indented line beneath it.
-
-When a task's target_repo diverges from its epic's project_dir, the id
-line carries one extra trailing pill '[task-repo:<basename>]' (yellow /
-warn bucket via the colorizer's 'task-repo:*' prefix fallback) so the
-unusual cross-repo routing surfaces visibly next to the verdict that
-references it (the same divergence drives which root the per-root mutex
-locks; see effectiveRoot in src/readiness.ts). The close row has no
-per-row target_repo override, so the divergence pill never appears on
-the "Quality audit and close" line. The per-root mutex still keys the
-close row to the epic's project_dir, but the pass-1 claim is SCOPED
-(fn-655, narrowed by fn-663): the close row only locks project_dir when
-at least one epic-level non-planner running source is live (an
-epic-level close-verb job or an epic-level sub-agent). Planners are
-root-exempt — a planner-running close row does NOT claim project_dir
-(the planner still blocks its own epic via the per-EPIC mutex, but a
-sibling epic's ready task on the same root may dispatch concurrently).
-A close row whose running state is purely inherited from a task-level
-worker in a different target_repo also does NOT claim project_dir —
-the contributing task already holds its own correct root via its
-target_repo. See applySingleTaskPerRootMutex in src/readiness.ts for
-the full rule.
-
-The first frame waits until ALL FIVE readiness collections have landed their
-first result, so first paint is never half-empty AND the readiness pill is
-never computed against a partial snapshot. An empty epics collection renders
-as NOTHING (no placeholder text); the frame is just the '---' lead. The page
-is refetched on every change signal and on a steady poll; a new frame prints
-only when the rendered output changes. All five subscriptions ride one
-connection; an epics-only change refetches only epics.
-Every emitted frame is mirrored to three indexed /tmp sidecar files
-(state JSON + frame text + unified diff vs. the previous emit); a session
-meta file at /tmp/keeper-board.<pid>.meta.txt accumulates the index.
-Connection-lifecycle events are appended to the lifecycle sidecar.
-Session sidecar paths print on exit (Ctrl-C).
-
-This view uses the SERVER defaults for the epics collection
-(open + not-yet-approved). For explicit per-collection filters write a small
-custom subscribe client against src/protocol.ts.
+Pill conventions (show-defaults + Nerd Font icons), readiness verdicts,
+per-frame /tmp sidecars, and the rendering reference live in README.md's
+'keeper board' section. The bottom jobs list and dead-letter banner moved
+to 'keeper jobs'.
 `;
 
 /**
