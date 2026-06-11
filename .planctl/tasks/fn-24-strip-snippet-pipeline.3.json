@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "Strip promptctl pipeline verbs",
-  "updated_at": "2026-06-11T14:06:56.038286Z"
+  "updated_at": "2026-06-11T15:30:09.344393Z",
+  "worker_done_at": "2026-06-11T15:30:09.344393Z"
 }

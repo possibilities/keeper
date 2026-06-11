@@ -34,5 +34,5 @@ DELETE: test_render_spec.py, test_bundle_health.py, test_bundle_health_snapshot.
 - [ ] promptctl test suite, py:lint, py:typecheck green
 
 ## Done summary
-
+Deleted render_spec, bundle_health, bundle_health_snapshot, inline_sketch_refs pipeline modules + their cli/api surface, tests; fixed generator return-type and tracker_db access diagnostics in test_render_dedup_disabled.py
 ## Evidence
