@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-780-keeper-dash-opening-screen",
   "bundles": [],
+  "closer_done_at": "2026-06-11T04:04:30.802504Z",
   "created_at": "2026-06-10T21:37:34.908245Z",
   "depends_on_epics": [
     "fn-778-subscribed-ghost-eviction-and-dup-close"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Keeper dash opening screen",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T21:37:49.520214Z"
+  "updated_at": "2026-06-11T04:04:30.802504Z"
 }
