@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-777-slim-keeper-board-help-text",
   "bundles": [],
+  "closer_done_at": "2026-06-11T02:29:50.262883Z",
   "created_at": "2026-06-10T20:09:24.894447Z",
   "depends_on_epics": [
     "fn-776-squeegee-keeper-comments-and-claudemd"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Slim keeper board help text",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T21:19:47.873897Z"
+  "updated_at": "2026-06-11T02:29:50.262883Z"
 }
