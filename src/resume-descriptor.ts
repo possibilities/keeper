@@ -63,7 +63,7 @@ export function buildResumeCommand(
   _tier: string | null,
 ): string {
   const cdPrefix = cwd === "" ? "" : `cd ${cwd} && `;
-  return `${cdPrefix}claude --resume "${target}"`;
+  return `${cdPrefix}claude --resume "${target}" --arthack-no-confirm`;
 }
 
 /**

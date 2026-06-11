@@ -251,11 +251,13 @@ export const ARTHACK_ROOT: string = ((): string => {
 })();
 
 /**
- * Build the `claude` worker shell command for a `(verb, id, cwd)`, mirroring
- * `buildWorkerCommand` in `cli/autopilot.ts` byte-for-byte (pinned by
- * `test/autopilot-worker.test.ts`). Lives here rather than re-exported to keep
- * this worker's import graph narrow. The launcher carries no tier flag — the
- * `plan` plugin is always loaded and `/plan:work` spawns the tier worker_agent.
+ * Build the `claude` worker shell command for a `(verb, id, cwd)`, pinned
+ * byte-for-byte by `test/autopilot-worker.test.ts`. Lives here rather than
+ * re-exported to keep this worker's import graph narrow. The launcher carries
+ * no tier flag — the `plan` plugin is always loaded and `/plan:work` spawns the
+ * tier worker_agent. `--arthack-no-confirm` is an arthack-launcher flag (parsed
+ * and stripped before the real claude binary) that suppresses the cwd
+ * confirmation prompt so automated dispatch never hangs on a keystroke.
  * Pure — exported for tests.
  */
 export function buildWorkerCommand(
@@ -267,6 +269,8 @@ export function buildWorkerCommand(
   const flags: string[] = [];
   // Both verbs launch at max effort.
   flags.push("--model", "sonnet", "--effort", "max");
+  flags.push("--arthack-no-confirm");
+  // `--name <key>` adjacency is load-bearing for reap/classify parsing.
   flags.push("--name", `${verb}::${id}`);
   return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;
 }

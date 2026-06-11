@@ -125,7 +125,9 @@ are all per-call.
 
 `launch` returns no surface ref, no pane id — by design. The reconciler
 correlates a dispatch back to keeperd through the **`--name verb::id`**
-baked into `argv` (`claude … --name work::fn-1-x.1 …`):
+baked into `argv` (`claude … --arthack-no-confirm --name work::fn-1-x.1 …`;
+the `--arthack-no-confirm` arthack-launcher flag is stripped before the real
+claude binary and suppresses its cwd confirmation so dispatch never hangs):
 
 ```
 launch(argv with --name work::fn-1-x.1)
@@ -248,6 +250,8 @@ tests assert them in isolation and the runtime composes them:
 
 | Helper | Purpose |
 |---|---|
+| `buildWorkerCommand(verb, id, dir)` | dispatch `claude` shell command (`--arthack-no-confirm` then `--name verb::id`) |
+| `buildResumeCommand(cwd, target, tier)` | resume `claude --resume "<target>" --arthack-no-confirm` |
 | `buildZellijNewTabArgs(session, dir, argv, name?)` | `action new-tab` argv (omits `--name` when empty) |
 | `buildZellijCloseTabArgs(session, windowId)` | `action close-tab-by-id` — orphan default-tab reap |
 | `buildZellijClosePaneArgs(session, paneId)` | `action close-pane -p` — surface reap |
