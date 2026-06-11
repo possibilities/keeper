@@ -1613,6 +1613,134 @@ test("GitSnapshot deletion-attribution: plain modification still attributes via 
   expect(row?.op).toBe("git-tree-mutate");
 });
 
+test("fn-787 re-fold determinism: hoisted pass-1 scans (tool + bash-exact + git-rm/git-mv) re-fold byte-identical", () => {
+  // The pass-1 explicit-attribution scans (tool ARM A/B, bash exact-match,
+  // git-rm/git-mv deletion) are hoisted ONCE per snapshot and matched per file
+  // in JS. The hoist reorders evaluation relative to the old per-file scans, so
+  // the newest-wins `(ts, id)` tie-break must still produce byte-identical
+  // `file_attributions` rows. Drive every arm across multiple files + sessions
+  // (including a same-file tie between two sessions and a git-mv rename probing
+  // both candidate paths), then re-fold from cursor=0 and assert byte-equality.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-t" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-t" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-u" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-u" });
+  // Tool arm: two sessions write the SAME file at distinct ts → newest-wins.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: "sess-t",
+    cwd: "/repo",
+    ts: 100,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/shared.ts" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Edit",
+    session_id: "sess-u",
+    cwd: "/repo",
+    ts: 200,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/src/shared.ts" } }),
+  });
+  // Bash exact-match arm.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-t",
+    cwd: "/repo",
+    ts: 150,
+    bash_mutation_kind: "fs-remove",
+    bash_mutation_targets: JSON.stringify(["/repo/gen/out.ts"]),
+    data: JSON.stringify({ tool_input: { command: "rm gen/out.ts" } }),
+  });
+  // git-rm directory-prefix arm.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-u",
+    cwd: "/repo",
+    ts: 160,
+    bash_mutation_kind: "git-rm",
+    bash_mutation_targets: JSON.stringify(["/repo/legacy"]),
+    data: JSON.stringify({ tool_input: { command: "git rm -r legacy" } }),
+  });
+  // git-mv rename arm — probes both path and orig_path.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-t",
+    cwd: "/repo",
+    ts: 170,
+    bash_mutation_kind: "git-mv",
+    bash_mutation_targets: JSON.stringify(["/repo/old.ts", "/repo/new.ts"]),
+    data: JSON.stringify({ tool_input: { command: "git mv old.ts new.ts" } }),
+  });
+  insertEvent({
+    hook_event: "GitSnapshot",
+    session_id: "/repo",
+    cwd: "/repo",
+    data: JSON.stringify({
+      project_dir: "/repo",
+      branch: "main",
+      head_oid: "abc",
+      upstream: null,
+      ahead: null,
+      behind: null,
+      dirty_files: [
+        { path: "src/shared.ts", xy: " M", mtime_ms: null },
+        { path: "gen/out.ts", xy: " D", mtime_ms: null },
+        { path: "legacy/a.ts", xy: " D", mtime_ms: null },
+        { path: "legacy/sub/b.ts", xy: " D", mtime_ms: null },
+        { path: "new.ts", orig_path: "old.ts", xy: "R ", mtime_ms: null },
+        // Orphan negative control — no mutation references it.
+        { path: "untracked.ts", xy: " D", mtime_ms: null },
+      ],
+    }),
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  const cursor1 = getCursor();
+  const fileAttrib1 = db
+    .query(
+      "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+    )
+    .all();
+  const gitStatus1 = db
+    .query("SELECT * FROM git_status ORDER BY project_dir")
+    .all();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  // The shared file resolves to the newest writer (sess-u @ ts=200).
+  expect(
+    getAttribution("/repo", "sess-u", "src/shared.ts")?.last_mutation_at,
+  ).toBe(200);
+
+  // Re-fold from cursor=0: drop the projections, rewind, re-drain.
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(
+      db
+        .query(
+          "SELECT * FROM file_attributions ORDER BY project_dir, session_id, file_path",
+        )
+        .all(),
+    ),
+  ).toBe(JSON.stringify(fileAttrib1));
+  expect(
+    JSON.stringify(
+      db.query("SELECT * FROM git_status ORDER BY project_dir").all(),
+    ),
+  ).toBe(JSON.stringify(gitStatus1));
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+});
+
 test("GitSnapshot multi-attribution: two sessions touch the same file → both rows in attributions[]", () => {
   // Sess-a writes src/a.ts, then sess-b also writes src/a.ts. The
   // snapshot's per-file attributions[] embeds BOTH sessions.

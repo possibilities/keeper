@@ -569,6 +569,14 @@ Keeper has no `install` verb. Wire it up manually:
    always logged). The plist's `EnvironmentVariables` block carries
    `KEEPER_TRACE_SERVER=0`; flip to `1` then
    `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable.
+   `KEEPER_TRACE_SERVER` governs the server worker only; reducer fold latency
+   has its own always-on, threshold-gated diagnostics that need no flag. A fold
+   over `SLOW_FOLD_LOG_MS` logs one `[fold-slow]` line, and the slow event types
+   each emit a per-pass `[*-breakdown]` line above their own
+   `*_FOLD_BREAKDOWN_MS` gate: `[gitfold-breakdown]` (GitSnapshot per-pass +
+   pass-1 per-arm split), `[commitfold-breakdown]`, `[subagentfold-breakdown]`,
+   and `[ptufold-breakdown]`. Steady folds stay silent, so a quiet
+   `server.stderr` is the fold-latency all-clear.
 
    Example clients ship under the unified `keeper` CLI — `keeper board` /
    `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage` /
@@ -1550,11 +1558,16 @@ including ones leaving the dirty set via `priorSessions` — so a session
 zeroes out exactly once on the transition snapshot before dropping
 from the persisted JSON. The push guard collapses the persisted set
 from a monotonically ratcheting one to the currently-dirty set, and
-the fn-679 bound collapses the ITERATED set from the entire
+the fn-679 bound collapses the ITERATED pass-4 set from the entire
 undischarged set under `project_dir` (dominated by non-discharging
 planctl attributions, 288 in production) to the same event-relevant
-union — pulling 4-7s GitSnapshot folds well under the 1.5s hook
-budget. Re-fold determinism is preserved: both the persisted set and
+union. The dominant GitSnapshot cost is pass 1 (explicit attribution),
+not pass 4: its tool-mutation arms, bash exact-match scan, and
+git-rm/git-mv deletion scan run inside a per-dirty-file loop, so fn-787
+hoists the two snapshot-invariant scans (bash + deletion) and the two
+tool prepared statements ONCE per snapshot — mirroring the pass-2
+`computeRepoBashWindows` hoist — and matches each file in JS, keeping
+steady-state folds under the realtime bar. Re-fold determinism is preserved: both the persisted set and
 the bound read only event-derived state (this snapshot's
 `dirty_files`, `file_attributions` populated by passes 1-3, and the
 prior `git_status.jobs` blob). Per-job project-wide counters
@@ -2395,12 +2408,14 @@ projection ONLY, never a WHERE/filter column — the relocator never touches the
 indexed scalars folds filter on (`tool_use_id`, `session_id`, `tool_name`,
 `hook_event`, generated `bash_mutation_*` columns), and wrapping them would
 defeat their indexes. The one documented exception is the tool-mutation
-attribution scan in `reducer.ts` (`computeFileAttribution`), whose
+attribution scan in `reducer.ts` (`findExplicitAttributions`), whose
 `json_extract` predicate is covered by the `idx_events_tool_attr` /
 `idx_event_blobs_tool_attr` expression indexes; it splits into two
 index-preserving arms (inline `events.data` SEEK + relocated `event_blobs.data`
 join, partitioned by `events.data IS NULL`) that together equal the COALESCE'd
-scan without regressing to a full table scan. Migration-internal reads
+scan without regressing to a full table scan. Both arms are prepared ONCE per
+snapshot (the pass-1 hoist) and SEEK per dirty file — bun:sqlite does not cache
+`prepare()`, so per-file recompilation was pure overhead. Migration-internal reads
 (`migrate()`) and the relocator's own reads (`compaction.ts`) run off the
 fold path and are exempt. The authoritative per-site enumeration lives in the
 comment above that two-arm scan in `src/reducer.ts`.

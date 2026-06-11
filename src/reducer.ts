@@ -15,7 +15,7 @@
  * (re-probing would break re-fold determinism — only the producer probes).
  */
 
-import type { Database, SQLQueryBindings } from "bun:sqlite";
+import type { Database, SQLQueryBindings, Statement } from "bun:sqlite";
 import {
   extractBackgroundTasks,
   extractCommit,
@@ -1001,18 +1001,23 @@ interface RenderedAttribution {
 
 /**
  * Project the latest `(session_id, file_path)` mutation evidence the persisted
- * event log carries for a given dirty file. Three match modes feed the same
- * `file_attributions` UPSERT in pass 1:
+ * event log carries for a given dirty file, reading the per-snapshot
+ * {@link ExplicitAttribHoist} (built once before the pass-1 loop). Three match
+ * modes feed the same `file_attributions` UPSERT in pass 1:
  *
  *   - tool mutations (exact): PostToolUse Write/Edit/MultiEdit/NotebookEdit
- *     whose `tool_input.file_path` matches the dirty file's `path` / `orig_path`;
+ *     whose `tool_input.file_path` matches the dirty file's `path` / `orig_path`
+ *     — a SEEK on the once-prepared `toolStmt` / `relocatedStmt`;
  *   - bash mutations (exact): PostToolUse:Bash events whose
- *     `bash_mutation_targets` array contains the path — SQL-side `json_each`;
+ *     `bash_mutation_targets` array contains the path — an O(1) lookup into the
+ *     once-built `bashByToken` index (the old SQL-side `json_each` probe,
+ *     materialized per token);
  *   - bash mutations (prefix + fnmatch) for `git-rm` / `git-mv`: targets may
  *     name directories or globs (which SQL can't probe) AND the deleted files
- *     carry `mtime_ms=null` (no pass-2 inference), so candidate rows move to JS
- *     for exact / directory-prefix / fnmatch via `bashTargetMatches`. The
- *     `__TREE__` sentinel is excluded so a tree-mutate can't match real files.
+ *     carry `mtime_ms=null` (no pass-2 inference), so the once-parsed
+ *     `deletionRows` are matched in JS via `bashTargetMatches` for exact /
+ *     directory-prefix / fnmatch. The `__TREE__` sentinel is excluded (by
+ *     `bashTargetMatches`) so a tree-mutate can't match real files.
  *
  * Returns one row per session, carrying the LATEST `ts` it saw and the
  * source/op identifying that row; the pass-1 upsert folds these into
@@ -1152,22 +1157,24 @@ function bashTargetMatches(token: string, candidatePath: string): boolean {
 }
 
 /**
- * Per-arm timing + cardinality accumulator threaded through the per-file loop
- * of {@link projectGitStatus} so the four scans inside
- * {@link findExplicitAttributions} (the dominant pass1 cost on the live DB)
- * become individually attributable on the `[gitfold-breakdown]` line. Wall-time
- * is split into prepare (statement compile) vs execute (.all) per arm to
- * convict statement recompilation — the suspected hotspot, since each arm
- * re-`prepare`s per file per snapshot. Pure instrumentation: never read into a
+ * Per-arm timing + cardinality accumulator for pass 1 of {@link projectGitStatus},
+ * surfaced on the `[gitfold-breakdown]` line. The two tool arms are prepared once
+ * (in {@link buildExplicitAttribHoist}) and SEEK per dirty file, so only their
+ * summed `.all()` execute time + matched-row count are tracked. The bash and
+ * git-rm/git-mv deletion scans run ONCE per snapshot (also in the hoist); their
+ * prepare/execute split is the once-per-snapshot scan cost, after which each file
+ * matches via an O(1) JS lookup. Pure instrumentation: never read into a
  * projection write, so re-fold determinism is untouched.
  */
 interface ExplicitAttribAccumulator {
-  toolArmAPrepMs: number;
+  // Tool arms A/B are prepared ONCE per snapshot (the hoist) and seek per file,
+  // so only the per-file `.all()` execute time + matched-row count are tracked.
   toolArmAExecMs: number;
   toolArmARows: number;
-  toolArmBPrepMs: number;
   toolArmBExecMs: number;
   toolArmBRows: number;
+  // Bash + deletion scans run ONCE per snapshot (the hoist); prep=compile,
+  // exec=.all+materialize, rows=scanned. A per-file `.get` lookup is O(1) JS.
   bashScanPrepMs: number;
   bashScanExecMs: number;
   bashScanRows: number;
@@ -1178,10 +1185,8 @@ interface ExplicitAttribAccumulator {
 
 function newExplicitAttribAccumulator(): ExplicitAttribAccumulator {
   return {
-    toolArmAPrepMs: 0,
     toolArmAExecMs: 0,
     toolArmARows: 0,
-    toolArmBPrepMs: 0,
     toolArmBExecMs: 0,
     toolArmBRows: 0,
     bashScanPrepMs: 0,
@@ -1193,10 +1198,180 @@ function newExplicitAttribAccumulator(): ExplicitAttribAccumulator {
   };
 }
 
-function findExplicitAttributions(
+/**
+ * Per-snapshot scans + prepared statements hoisted ONCE out of the per-file
+ * loop of {@link projectGitStatus}, mirroring the {@link computeRepoBashWindows}
+ * prior art. The pass-1 cost was dominated by the per-file loop re-running two
+ * snapshot-invariant scans (the bash `json_each` exact-match scan over the 1.1k
+ * mutation rows and the git-rm/git-mv deletion scan, both identical for every
+ * dirty file) and re-`prepare`ing the two tool statements per file — bun:sqlite
+ * does not cache `prepare()`. Hoisting collapses the bash scan to a once-built
+ * exact-match index and the deletion scan to a once-parsed row list, and shares
+ * one prepared statement pair across the loop. The matched-row set per file is
+ * byte-identical to the per-file scans, so re-fold determinism is untouched.
+ */
+interface BashMutationRow {
+  id: number;
+  ts: number;
+  session_id: string;
+  kind: string;
+}
+
+interface DeletionMutationRow {
+  id: number;
+  ts: number;
+  session_id: string;
+  kind: string;
+  tokens: string[];
+}
+
+interface ExplicitAttribHoist {
+  // Prepared once, reused across every dirty file (and both candidate paths).
+  toolStmt: Statement;
+  relocatedStmt: Statement;
+  // The bash exact-match scan, materialized once as `target token → rows`. The
+  // SQL probe was `json_each(targets) WHERE value = ?` (exact equality), so a
+  // per-token bucket reproduces the same matched set via an O(1) JS lookup.
+  bashByToken: Map<string, BashMutationRow[]>;
+  // The git-rm/git-mv rows, pulled and JSON-parsed ONCE; matched per file in JS
+  // via `bashTargetMatches` (exact / dir-prefix / fnmatch) exactly as before.
+  deletionRows: DeletionMutationRow[];
+}
+
+/**
+ * Build the per-snapshot {@link ExplicitAttribHoist} once before the pass-1
+ * loop. The two scans here ran once per dirty file before; now they run once
+ * per snapshot. `acc` carries the prepare-vs-execute timing split for the
+ * `[gitfold-breakdown]` line (pure instrumentation).
+ */
+function buildExplicitAttribHoist(
   db: Database,
+  acc?: ExplicitAttribAccumulator,
+): ExplicitAttribHoist {
+  const toolStmt = db.prepare(
+    `SELECT id, ts, session_id, tool_name
+         FROM events
+        WHERE hook_event = 'PostToolUse'
+          AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+          AND json_extract(data, '$.tool_input.file_path') = ?`,
+  );
+  const relocatedStmt = db.prepare(
+    `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
+              e.tool_name AS tool_name
+         FROM event_blobs b
+         JOIN events e ON e.id = b.event_id
+        WHERE e.data IS NULL
+          AND e.hook_event = 'PostToolUse'
+          AND e.tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+          AND CASE WHEN json_valid(b.data)
+                   THEN json_extract(b.data, '$.tool_input.file_path')
+              END = ?`,
+  );
+
+  // Bash exact-match scan — pull the sparse mutation subset ONCE and bucket each
+  // row under every target token it carries (the SQL `json_each ... = ?` probe
+  // was per-file per-token exact equality, so a per-token bucket is equivalent).
+  const _bashP0 = acc != null ? performance.now() : 0;
+  const bashStmt = db.prepare(
+    `SELECT e.id, e.ts, e.session_id, e.bash_mutation_kind AS kind,
+            e.bash_mutation_targets AS targets
+       FROM events e
+      WHERE e.bash_mutation_kind IS NOT NULL`,
+  );
+  const _bashP1 = acc != null ? performance.now() : 0;
+  const bashScanRows = bashStmt.all() as Array<{
+    id: number;
+    ts: number;
+    session_id: string;
+    kind: string;
+    targets: string | null;
+  }>;
+  const bashByToken = new Map<string, BashMutationRow[]>();
+  for (const row of bashScanRows) {
+    if (row.targets == null || row.targets.length === 0) continue;
+    let tokens: unknown;
+    try {
+      tokens = JSON.parse(row.targets);
+    } catch {
+      // Malformed JSON folds to "no targets" — safe-fold per the reducer's
+      // "never throw" invariant.
+      continue;
+    }
+    if (!Array.isArray(tokens)) continue;
+    const slim: BashMutationRow = {
+      id: row.id,
+      ts: row.ts,
+      session_id: row.session_id,
+      kind: row.kind,
+    };
+    for (const tok of tokens) {
+      if (typeof tok !== "string") continue;
+      let bucket = bashByToken.get(tok);
+      if (bucket == null) {
+        bucket = [];
+        bashByToken.set(tok, bucket);
+      }
+      bucket.push(slim);
+    }
+  }
+  if (acc != null) {
+    acc.bashScanPrepMs += _bashP1 - _bashP0;
+    acc.bashScanExecMs += performance.now() - _bashP1;
+    acc.bashScanRows += bashScanRows.length;
+  }
+
+  // git-rm / git-mv deletion scan — pull + JSON-parse the targets ONCE; per file
+  // the directory-prefix / fnmatch match still runs in JS via bashTargetMatches.
+  const _delP0 = acc != null ? performance.now() : 0;
+  const deletionStmt = db.prepare(
+    `SELECT id, ts, session_id, bash_mutation_kind AS kind,
+            bash_mutation_targets AS targets
+       FROM events
+      WHERE bash_mutation_kind IN ('git-rm', 'git-mv')`,
+  );
+  const _delP1 = acc != null ? performance.now() : 0;
+  const deletionScanRows = deletionStmt.all() as Array<{
+    id: number;
+    ts: number;
+    session_id: string;
+    kind: string;
+    targets: string | null;
+  }>;
+  const deletionRows: DeletionMutationRow[] = [];
+  for (const row of deletionScanRows) {
+    if (row.session_id == null || row.session_id.length === 0) continue;
+    if (row.targets == null || row.targets.length === 0) continue;
+    let tokens: unknown;
+    try {
+      tokens = JSON.parse(row.targets);
+    } catch {
+      // Malformed JSON folds to "no match" — safe-fold.
+      continue;
+    }
+    if (!Array.isArray(tokens)) continue;
+    const strTokens = tokens.filter((t): t is string => typeof t === "string");
+    if (strTokens.length === 0) continue;
+    deletionRows.push({
+      id: row.id,
+      ts: row.ts,
+      session_id: row.session_id,
+      kind: row.kind,
+      tokens: strTokens,
+    });
+  }
+  if (acc != null) {
+    acc.deletionScanPrepMs += _delP1 - _delP0;
+    acc.deletionScanExecMs += performance.now() - _delP1;
+    acc.deletionScanRows += deletionScanRows.length;
+  }
+
+  return { toolStmt, relocatedStmt, bashByToken, deletionRows };
+}
+
+function findExplicitAttributions(
   projectDir: string,
   file: ReducerDirtyFile,
+  hoist: ExplicitAttribHoist,
   acc?: ExplicitAttribAccumulator,
 ): SessionMutation[] {
   // Build the candidate path list as ABSOLUTE paths anchored on
@@ -1238,25 +1413,18 @@ function findExplicitAttributions(
     // ARM A (inline, indexed): filters `events.data` directly so
     // `idx_events_tool_attr` makes this a sub-ms covering SEEK. Covers every
     // inline blob; a relocated row has `data IS NULL` so this arm misses it
-    // (handled by ARM B).
+    // (handled by ARM B). The statement is prepared ONCE per snapshot (in
+    // `buildExplicitAttribHoist`) and reused — bun:sqlite does not cache
+    // `prepare()`, so per-file recompilation was pure overhead.
     const _armAP0 = acc != null ? performance.now() : 0;
-    const toolStmt = db.prepare(
-      `SELECT id, ts, session_id, tool_name
-           FROM events
-          WHERE hook_event = 'PostToolUse'
-            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-            AND json_extract(data, '$.tool_input.file_path') = ?`,
-    );
-    const _armAP1 = acc != null ? performance.now() : 0;
-    const toolRows = toolStmt.all(candidatePath) as Array<{
+    const toolRows = hoist.toolStmt.all(candidatePath) as Array<{
       id: number;
       ts: number;
       session_id: string;
       tool_name: string;
     }>;
     if (acc != null) {
-      acc.toolArmAPrepMs += _armAP1 - _armAP0;
-      acc.toolArmAExecMs += performance.now() - _armAP1;
+      acc.toolArmAExecMs += performance.now() - _armAP0;
       acc.toolArmARows += toolRows.length;
     }
     // ARM B (relocated): reads `event_blobs.data` for rows whose hot column was
@@ -1267,30 +1435,17 @@ function findExplicitAttributions(
     // full JSON-parse scan of the side table per dirty file per fold), AND it
     // skips a malformed relocated blob (yields NULL) instead of throwing
     // "malformed JSON" and crashing the fold. A malformed blob has no parseable
-    // file_path, so skipping is re-fold-deterministic.
+    // file_path, so skipping is re-fold-deterministic. Prepared once per snapshot
+    // and reused (see ARM A); the per-file SEEK stays on the covering index.
     const _armBP0 = acc != null ? performance.now() : 0;
-    const relocatedStmt = db.prepare(
-      `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
-                e.tool_name AS tool_name
-           FROM event_blobs b
-           JOIN events e ON e.id = b.event_id
-          WHERE e.data IS NULL
-            AND e.hook_event = 'PostToolUse'
-            AND e.tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-            AND CASE WHEN json_valid(b.data)
-                     THEN json_extract(b.data, '$.tool_input.file_path')
-                END = ?`,
-    );
-    const _armBP1 = acc != null ? performance.now() : 0;
-    const relocatedRows = relocatedStmt.all(candidatePath) as Array<{
+    const relocatedRows = hoist.relocatedStmt.all(candidatePath) as Array<{
       id: number;
       ts: number;
       session_id: string;
       tool_name: string;
     }>;
     if (acc != null) {
-      acc.toolArmBPrepMs += _armBP1 - _armBP0;
-      acc.toolArmBExecMs += performance.now() - _armBP1;
+      acc.toolArmBExecMs += performance.now() - _armBP0;
       acc.toolArmBRows += relocatedRows.length;
     }
     for (const row of [...toolRows, ...relocatedRows]) {
@@ -1309,31 +1464,14 @@ function findExplicitAttributions(
   }
 
   // Bash-mutation scan: PostToolUse:Bash events whose `bash_mutation_targets`
-  // array contains the candidate path. The partial index narrows the scan to
-  // the sparse mutation subset before the `json_each` probe.
+  // array contains the candidate path (exact equality). The per-snapshot
+  // `bashByToken` index (built once in `buildExplicitAttribHoist`) reproduces
+  // the old per-file `json_each ... = ?` probe via an O(1) JS lookup. The
+  // newest-wins `(ts, id)` tie-break below is order-independent, so iterating
+  // the bucket in scan order stays re-fold deterministic.
   for (const candidatePath of paths) {
-    const _bashP0 = acc != null ? performance.now() : 0;
-    const bashStmt = db.prepare(
-      `SELECT e.id, e.ts, e.session_id, e.bash_mutation_kind AS kind
-           FROM events e
-          WHERE e.bash_mutation_kind IS NOT NULL
-            AND EXISTS (
-              SELECT 1 FROM json_each(e.bash_mutation_targets) j
-               WHERE j.value = ?
-            )`,
-    );
-    const _bashP1 = acc != null ? performance.now() : 0;
-    const bashRows = bashStmt.all(candidatePath) as Array<{
-      id: number;
-      ts: number;
-      session_id: string;
-      kind: string;
-    }>;
-    if (acc != null) {
-      acc.bashScanPrepMs += _bashP1 - _bashP0;
-      acc.bashScanExecMs += performance.now() - _bashP1;
-      acc.bashScanRows += bashRows.length;
-    }
+    const bashRows = hoist.bashByToken.get(candidatePath);
+    if (bashRows == null) continue;
     for (const row of bashRows) {
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
@@ -1358,44 +1496,13 @@ function findExplicitAttributions(
 
   // Deletion-attribution scan (git-rm / git-mv): these events store directory
   // and glob tokens an exact SQL probe never hits, and the deleted files carry
-  // `mtime_ms=null` (no pass-2 inference). Pull candidate rows into JS and apply
-  // exact / directory-prefix / fnmatch via `bashTargetMatches` — pure (no FS,
-  // no wall-clock), so re-fold determinism holds.
-  const _delP0 = acc != null ? performance.now() : 0;
-  const deletionStmt = db.prepare(
-    `SELECT id, ts, session_id, bash_mutation_kind AS kind,
-              bash_mutation_targets AS targets
-         FROM events
-        WHERE bash_mutation_kind IN ('git-rm', 'git-mv')`,
-  );
-  const _delP1 = acc != null ? performance.now() : 0;
-  const deletionRows = deletionStmt.all() as Array<{
-    id: number;
-    ts: number;
-    session_id: string;
-    kind: string;
-    targets: string | null;
-  }>;
-  if (acc != null) {
-    acc.deletionScanPrepMs += _delP1 - _delP0;
-    acc.deletionScanExecMs += performance.now() - _delP1;
-    acc.deletionScanRows += deletionRows.length;
-  }
-  for (const row of deletionRows) {
-    if (row.session_id == null || row.session_id.length === 0) continue;
-    if (row.targets == null || row.targets.length === 0) continue;
-    let tokens: unknown;
-    try {
-      tokens = JSON.parse(row.targets);
-    } catch {
-      // Malformed JSON folds to "no match" — safe-fold per the reducer's
-      // "never throw" invariant.
-      continue;
-    }
-    if (!Array.isArray(tokens)) continue;
+  // `mtime_ms=null` (no pass-2 inference). The candidate rows are pulled +
+  // JSON-parsed ONCE per snapshot (`hoist.deletionRows`); the exact /
+  // directory-prefix / fnmatch match via `bashTargetMatches` still runs per file
+  // in JS — pure (no FS, no wall-clock), so re-fold determinism holds.
+  for (const row of hoist.deletionRows) {
     let matched = false;
-    for (const rawToken of tokens) {
-      if (typeof rawToken !== "string") continue;
+    for (const rawToken of row.tokens) {
       let hit = false;
       for (const candidatePath of paths) {
         if (bashTargetMatches(rawToken, candidatePath)) {
@@ -1635,8 +1742,18 @@ function projectGitStatus(db: Database, event: Event): void {
   // breakdown line (emitted below only above threshold) can attribute pass1 to
   // a specific scan + its prepare-vs-execute split. Pure instrumentation.
   const _pass1Acc = newExplicitAttribAccumulator();
+  // Hoist the two snapshot-invariant scans (bash exact-match + git-rm/git-mv
+  // deletion) and the two tool prepared statements ONCE before the per-file
+  // loop, mirroring `computeRepoBashWindows`. The matched-row set per file is
+  // identical to the old per-file scans, so re-fold determinism is untouched.
+  const _explicitHoist = buildExplicitAttribHoist(db, _pass1Acc);
   for (const file of snapshot.dirty_files) {
-    const explicit = findExplicitAttributions(db, projectDir, file, _pass1Acc);
+    const explicit = findExplicitAttributions(
+      projectDir,
+      file,
+      _explicitHoist,
+      _pass1Acc,
+    );
     for (const m of explicit) {
       upsertStmt.run(
         projectDir,
@@ -1962,12 +2079,12 @@ function projectGitStatus(db: Database, event: Event): void {
         `pass4_rollup=${(_gfT4 - _gfT3).toFixed(0)}ms ` +
         `fanout=${(_gfT5 - _gfT4).toFixed(0)}ms ` +
         `write=${(performance.now() - _gfT5).toFixed(0)}ms ` +
-        // pass1 per-arm split (prep=statement compile, exec=.all, rows=matched).
-        // Summed across the per-file loop, so prep≫exec convicts recompilation.
-        `p1_toolA_prep=${_pass1Acc.toolArmAPrepMs.toFixed(0)}ms ` +
+        // pass1 per-arm split. Tool arms A/B are prepared once (the hoist) and
+        // SEEK per file, so only their summed `.all()` exec + matched rows show.
+        // Bash + deletion are once-per-snapshot scans (prep=compile, exec=.all),
+        // matched per file via an O(1) lookup that no longer touches SQLite.
         `p1_toolA_exec=${_pass1Acc.toolArmAExecMs.toFixed(0)}ms ` +
         `p1_toolA_rows=${_pass1Acc.toolArmARows} ` +
-        `p1_toolB_prep=${_pass1Acc.toolArmBPrepMs.toFixed(0)}ms ` +
         `p1_toolB_exec=${_pass1Acc.toolArmBExecMs.toFixed(0)}ms ` +
         `p1_toolB_rows=${_pass1Acc.toolArmBRows} ` +
         `p1_bash_prep=${_pass1Acc.bashScanPrepMs.toFixed(0)}ms ` +
