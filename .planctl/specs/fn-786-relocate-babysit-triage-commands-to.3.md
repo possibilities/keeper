@@ -38,5 +38,5 @@ the arthack removal (task .2), so it can run in parallel with it after .1.
 - [ ] Committed + pushed in the `~/docs` git repo (only the three files staged)
 
 ## Done summary
-
+Renamed all live ~/docs references to the new keeper command names: /babysit-triage in performance README.md + charter.md, and the inventory's babysit-new row relocated to keeper:babysit-init plus a new keeper:babysit-triage row. Historical roadmap note left untouched.
 ## Evidence
