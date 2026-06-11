@@ -185,7 +185,7 @@ def restamp_epic_or_fail(
     except Exception:  # pragma: no cover — resolve_project rarely fails post-init
         state_store = None
 
-    core_errors, _warnings = _check_epic_tree(
+    core_errors, _ = _check_epic_tree(
         epic_id,
         epic_data,
         task_defs,

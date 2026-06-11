@@ -245,7 +245,7 @@ def enrich_from_subagent(sp: Spawn) -> None:
     last_ts = None
     total_output_tokens = 0
     phase6_summary_seen = False
-    for _ln, d in iter_jsonl(sub_file):
+    for _, d in iter_jsonl(sub_file):
         t = d.get("type")
         ts = parse_ts(d.get("timestamp"))
         if ts and t in ("assistant", "user"):
@@ -386,7 +386,7 @@ def compute_concurrency(spawns: list[Spawn]) -> None:
     by_sess: dict[str, list[Spawn]] = defaultdict(list)
     for sp in spawns:
         by_sess[sp.parent_session].append(sp)
-    for _sess, group in by_sess.items():
+    for group in by_sess.values():
         for a in group:
             wa = window(a)
             if wa is None:
