@@ -29,5 +29,5 @@ await's exit-code semantics are consumed by the await skill — the slim help mu
 - [ ] Tests green; Done summary reports lines/chars deleted
 
 ## Done summary
-
+Slimmed keeper jobs --help 87->31 lines (4496->1492 chars) and await --help 82->39 lines (4672->1874 chars) to the commit-work house style; deep render/pill/sidecar detail stays in the cli/jobs.ts module header and await's reason glossary + reconnect semantics in skills/await/SKILL.md. Tests green.
 ## Evidence
