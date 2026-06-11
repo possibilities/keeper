@@ -217,6 +217,23 @@ def _mock_dirty_probe(request, monkeypatch):
     monkeypatch.setattr(_invocation, "_dirty_planctl_paths", _disk_walk_planctl_paths)
 
 
+@pytest.fixture(autouse=True)
+def _isolated_session_markers(tmp_path_factory, monkeypatch):
+    """Redirect the session-marker dir to a throwaway tmp dir for every test.
+
+    The success paths of claim / worker resume / done / block / close-preflight
+    / close-finalize write or clear a marker at
+    ``~/.local/state/planctl/sessions/`` (``session_markers``). Without this
+    redirect the suite would pollute the developer's real home. Narrowly stubs
+    the dir resolver — never touches ``HOME`` — so no other home-derived path
+    moves. Marker-layer tests that need their own dir simply re-monkeypatch it.
+    """
+    import planctl.session_markers as _markers
+
+    sessions_dir = tmp_path_factory.mktemp("sessions")
+    monkeypatch.setattr(_markers, "_sessions_dir", lambda: sessions_dir)
+
+
 @pytest.fixture(scope="session", autouse=True)
 def _git_global_config(tmp_path_factory):
     """Hoist the per-repo git config out of every fixture into one global file.

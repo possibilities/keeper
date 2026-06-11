@@ -59,6 +59,12 @@ def run(args: SimpleNamespace) -> int:
         }
         state_store.save_runtime(task_id, new_state)
 
+    # Clear this session's work marker (guard contract) — only if it names this
+    # task. Success-path only, fail-open.
+    from planctl.session_markers import clear_work_marker
+
+    clear_work_marker(task_id)
+
     pc = build_planctl_invocation_readonly("block", task_id, repo_root=ctx.project_path)
     emit(
         {"task_id": task_id, "status": "blocked", "blocked_reason": reason_text},

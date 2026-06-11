@@ -269,6 +269,12 @@ def run(args: SimpleNamespace) -> int:
     }
     brief_ref = str(write_brief_artifact(primary_repo, epic_id, brief))
 
+    # Mark this session as closing the epic (guard contract). Success path only
+    # — the typed-error paths above exit before reaching here. Fail-open.
+    from planctl.session_markers import write_close_marker
+
+    write_close_marker(epic_id)
+
     emit(
         {
             "primary_repo": primary_repo,

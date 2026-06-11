@@ -575,7 +575,13 @@ def _emit_outcome(
     """
     from planctl.invocation import build_planctl_invocation_readonly
     from planctl.output import emit
+    from planctl.session_markers import clear_close_marker
     from planctl.store import now_iso
+
+    # Clear this session's close marker (guard contract) on every terminal
+    # CloseOutcome — this is the single chokepoint all four members route
+    # through. Only clears if the marker names this epic; fail-open.
+    clear_close_marker(epic_id)
 
     data: dict[str, Any] = {
         "outcome": outcome.value,

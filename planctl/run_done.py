@@ -142,6 +142,13 @@ def run(args: SimpleNamespace) -> int:
     task_def["worker_done_at"] = now
     atomic_write_json(task_path, task_def)
 
+    # Clear this session's work marker (guard contract) — only if it names this
+    # task; a marker for a different task is left intact. Success-path only,
+    # fail-open.
+    from planctl.session_markers import clear_work_marker
+
+    clear_work_marker(task_id)
+
     # Route through the central seam. Rewrite of pre-existing
     # tracked files (atomic_write rename-atomic) → no unwind.
     emit(

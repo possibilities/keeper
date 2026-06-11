@@ -179,6 +179,13 @@ def run(args: SimpleNamespace) -> int:
         err=True,
     )
 
+    # Re-mark this session as working the task (guard contract). Success-path
+    # only — typed-error paths above (emit_error) exit before reaching here.
+    # Fail-open: no-op when CLAUDE_CODE_SESSION_ID is unset.
+    from planctl.session_markers import write_work_marker
+
+    write_work_marker(task_id)
+
     emit(
         {
             "task_id": task_id,

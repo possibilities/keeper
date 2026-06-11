@@ -376,6 +376,13 @@ def run(args: SimpleNamespace) -> int:
         "touched_repos": epic_def.get("touched_repos", []),
     }
 
+    # Mark this session as actively working the task (guard contract). Strictly
+    # on the success path, after the CAS commit point — never on a typed-error
+    # path (a marker for an unclaimed task would lock out commits). Fail-open.
+    from planctl.session_markers import write_work_marker
+
+    write_work_marker(task_id)
+
     pc = build_planctl_invocation_readonly("claim", task_id, repo_root=ctx.project_path)
     emit(
         {
