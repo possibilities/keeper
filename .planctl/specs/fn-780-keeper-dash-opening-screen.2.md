@@ -107,5 +107,5 @@ landing gate.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Shipped the keeper dash materializer (src/dash/app.ts) + TTY-only process shell (cli/dash.ts) + forked exit triggers (src/dash/exit-triggers.ts): attachDashApp diffs role-tagged view-model rows into a stable Map<rowKey,TextRenderable> over a focused ScrollBox; createDashApp wires three subscriptions, a 30s elapsed interval, and one idempotent destroy-before-exit teardown across every exit path. Wired the dash subcommand into cli/keeper.ts, added the createTestRenderer frame test to the test:opentui chain + fast-tier ignore lists, and documented it in README.
 ## Evidence
