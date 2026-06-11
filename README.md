@@ -1143,9 +1143,9 @@ commits only that session's attributed files. The other three are read-only.
   out a file you need in the commit (or stages the wrong set), don't fight it
   — commit with plain `git` instead. Stage only the files you're committing,
   by explicit path (`git add <path> …` — never `git add -A` / `git add .`),
-  then `git commit`. This is a temporary escape hatch we'll repair; for now
-  you're empowered to use git directly whenever `commit-work` can't cover what
-  you need.
+  then `git commit` and `git push`. This is a temporary escape hatch we'll
+  repair; for now you're empowered to use git directly whenever `commit-work`
+  can't cover what you need.
 
 - `session-state.ts` — emit the current session's git context (branch, head
   sha, porcelain status, recent log) plus its on-hook dirty file list as a
