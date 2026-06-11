@@ -69,5 +69,5 @@ Evidence proving steady-state folds under the 2s bar.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Hoisted GitSnapshot pass-1 explicit-attribution scans out of the per-file loop: the bash exact-match scan, the git-rm/git-mv deletion scan, and the two tool prepared statements now run once per snapshot (matched per file in JS), mirroring computeRepoBashWindows. Live 2.65GB DB 615-file fold: pass-1 dropped ~5.3s -> ~2.2s. Added an fn-787 refold-determinism test covering tool + bash-exact + git-rm/git-mv arms; full suite green.
 ## Evidence
