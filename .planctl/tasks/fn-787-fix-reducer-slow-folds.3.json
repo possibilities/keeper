@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T19:20:23.175253Z",
+  "depends_on": [
+    "fn-787-fix-reducer-slow-folds.1"
+  ],
+  "epic": "fn-787-fix-reducer-slow-folds",
+  "id": "fn-787-fix-reducer-slow-folds.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Fix dominant fold hotspots",
+  "updated_at": "2026-06-11T19:20:23.175253Z"
+}
