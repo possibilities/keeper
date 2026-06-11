@@ -2528,14 +2528,15 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // max_concurrent_jobs cap snapshot), to 61 via fn-736 task .1 (the
   // `event_ingest_offsets` NDJSON→events ingest cursor), to 62 via fn-751
   // task .1 (the autopilot `mode` column + the `armed_epics` presence table),
-  // and to 63 via fn-756 task .2 (drop `epics.approval` + rewrite
-  // `default_visible`), each of which bumped SCHEMA_VERSION AND added its
-  // version to `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the CLAUDE.md
-  // same-commit invariant. This pin tracks the LIVE schema version: the guard it
-  // provides is "an accidental reducer/schema change must surface as a failing
-  // whitelist + this pin", which still holds — bump both together when the
-  // schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(63);
+  // to 63 via fn-756 task .2 (drop `epics.approval` + rewrite
+  // `default_visible`), and to 64 via fn-781 task .1 (the `builds` buildbot
+  // dashboard projection table), each of which bumped SCHEMA_VERSION AND added
+  // its version to `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the
+  // CLAUDE.md same-commit invariant. This pin tracks the LIVE schema version:
+  // the guard it provides is "an accidental reducer/schema change must surface
+  // as a failing whitelist + this pin", which still holds — bump both together
+  // when the schema genuinely moves.
+  expect(SCHEMA_VERSION).toBe(64);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
@@ -3114,6 +3115,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "exit-watcher.ts": "exit",
   "git-worker.ts": "git",
   "usage-worker.ts": "usage",
+  "builds-worker.ts": "builds",
   "dead-letter-worker.ts": "deadLetter",
   "events-ingest-worker.ts": "eventsIngest",
   "autopilot-worker.ts": "autopilot",
@@ -3162,8 +3164,14 @@ function spawnedWorkerNames(opts?: {
   // process.env directly). Restore exactly afterward — no `await` between set
   // and restore, so it stays parallel-safe.
   const sockPath = join(tmpDir, "keeperd.sock");
+  // The builds worker spawn is gated on a configured `buildbot_url`. Pin a temp
+  // config carrying it so this boot is deterministic regardless of the live
+  // `~/.config/keeper/config.yaml` — `builds` is in ALL_WORKERS and must spawn.
+  const configPath = join(tmpDir, "keeper-config.yaml");
+  writeFileSync(configPath, "buildbot_url: http://localhost:8010\n");
   const sandbox: Record<string, string> = {
     KEEPER_DB: dbPath,
+    KEEPER_CONFIG: configPath,
     KEEPER_DEAD_LETTER_DIR: join(tmpDir, "dead-letters"),
     KEEPER_EVENTS_LOG: join(tmpDir, "events-log"),
     KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
@@ -3193,14 +3201,15 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL twelve workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL thirteen workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
-  // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance` (the
-  // twelfth) — the backup + integrity-probe timers, moved off main's fold thread.
+  // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
+  // added `builds` (the first outbound-HTTP worker, gated on a configured
+  // `buildbot_url` — `spawnedWorkerNames` pins one so the boot is deterministic).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(12);
+  expect(spawned).toHaveLength(13);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -3211,6 +3220,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL twelve work
     "exit",
     "git",
     "usage",
+    "builds",
     "deadLetter",
     "eventsIngest",
     "autopilot",

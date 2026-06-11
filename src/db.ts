@@ -91,6 +91,10 @@ export interface KeeperConfig {
   roots: string[];
   claudeProjectsRoot?: string;
   agentuseRoot?: string;
+  // Buildbot master base URL (e.g. `http://localhost:8010`) for the `keeper
+  // builds` dashboard's poller. Independent best-effort key with NO default:
+  // absent/empty/garbage → undefined → the builds worker is not spawned.
+  buildbotUrl?: string;
   zellijSession?: string;
   autocloseWindows?: boolean;
   // `null` (default) is unlimited; only a POSITIVE INTEGER overrides.
@@ -128,6 +132,9 @@ export function resolveConfig(): KeeperConfig {
   let roots: string[] = [...DEFAULT_PLAN_ROOTS];
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
   let agentuseRoot: string = DEFAULT_AGENTUSE_ROOT;
+  // No default — absent leaves `buildbotUrl` undefined so the builds worker
+  // never spawns.
+  let buildbotUrl: string | undefined;
   let zellijSession: string = DEFAULT_ZELLIJ_SESSION;
   let autocloseWindows: boolean = DEFAULT_AUTOCLOSE_WINDOWS;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
@@ -162,6 +169,12 @@ export function resolveConfig(): KeeperConfig {
       const aur = (raw as { agentuse_root?: unknown }).agentuse_root;
       if (typeof aur === "string" && aur.length > 0) {
         agentuseRoot = aur;
+      }
+      // Independent best-effort key — non-empty string only; garbage/absent
+      // leaves `buildbotUrl` undefined and the builds worker un-spawned.
+      const bbu = (raw as { buildbot_url?: unknown }).buildbot_url;
+      if (typeof bbu === "string" && bbu.length > 0) {
+        buildbotUrl = bbu;
       }
       const zs = (raw as { zellij_session?: unknown }).zellij_session;
       if (typeof zs === "string" && zs.length > 0) {
@@ -208,11 +221,23 @@ export function resolveConfig(): KeeperConfig {
     roots,
     claudeProjectsRoot,
     agentuseRoot,
+    buildbotUrl,
     zellijSession,
     autocloseWindows,
     maxConcurrentJobs,
     accountAliases,
   };
+}
+
+/**
+ * Resolve the buildbot master base URL for the `keeper builds` poller, or null
+ * when it is unconfigured. Independent best-effort key with NO default — the
+ * builds worker spawn is gated on a non-null return here. No tilde-expansion or
+ * existence check (it's a URL, validated by the poller degrading to silent
+ * staleness on any fetch failure).
+ */
+export function resolveBuildbotUrl(): string | null {
+  return resolveConfig().buildbotUrl ?? null;
 }
 
 /**
