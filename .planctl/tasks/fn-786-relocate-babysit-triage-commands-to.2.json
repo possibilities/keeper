@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T12:57:09.134042Z",
+  "depends_on": [
+    "fn-786-relocate-babysit-triage-commands-to.1"
+  ],
+  "epic": "fn-786-relocate-babysit-triage-commands-to",
+  "id": "fn-786-relocate-babysit-triage-commands-to.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "high",
+  "title": "Remove arthack templates + re-render to prune artifacts",
+  "updated_at": "2026-06-11T12:57:09.134042Z"
+}

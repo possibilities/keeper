@@ -1,0 +1,19 @@
+{
+  "branch_name": "fn-786-relocate-babysit-triage-commands-to",
+  "bundles": [],
+  "created_at": "2026-06-11T12:57:09.134042Z",
+  "depends_on_epics": [],
+  "id": "fn-786-relocate-babysit-triage-commands-to",
+  "last_validated_at": "2026-06-11T12:57:09.444105Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Relocate babysit triage commands to keeper",
+  "touched_repos": [
+    "/Users/mike/code/arthack",
+    "/Users/mike/code/keeper",
+    "/Users/mike/docs"
+  ],
+  "updated_at": "2026-06-11T12:57:09.134042Z"
+}

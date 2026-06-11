@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T12:57:09.134042Z",
+  "depends_on": [],
+  "epic": "fn-786-relocate-babysit-triage-commands-to",
+  "id": "fn-786-relocate-babysit-triage-commands-to.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Add renamed keeper command files + update keeper docs",
+  "updated_at": "2026-06-11T12:57:09.134042Z"
+}
