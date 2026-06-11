@@ -1,53 +1,36 @@
 /**
- * Server worker. Runs as keeperd's SECOND Bun Worker thread (the first is the
- * wake worker). It owns the read surface: a UDS listener that speaks the NDJSON
- * protocol from `src/protocol.ts`, its OWN read-only DB connection, and the
- * `<state-dir>/keeperd.lock` ownership lock.
+ * Server worker. Runs as keeperd's read-surface Worker thread: a UDS listener
+ * speaking the NDJSON protocol from `src/protocol.ts`, its OWN read-only DB
+ * connection, and the `<state-dir>/keeperd.lock` ownership lock.
  *
- * Task `.2` shipped the transport + lifecycle + dispatch shell up to a one-shot
- * `query → result`. Task `.3` added the realtime layer: an independent
- * `data_version` poll (`pollLoop`) that turns committed `jobs` changes into
- * per-entity `patch` pushes via a state-based diff (`diffTick`) keyed on each
- * connection's `lastSent` map + watched-set (seeded from the same read that
- * produced the `result` page). A third beat layers on top: each tick also runs
- * a per-filter `countAndToken` and emits a `meta` frame when a subscription's
- * filtered-set `total` or membership token moved (a row entered/left the set) —
- * a count/staleness signal, NOT a live membership stream (the page stays frozen).
+ * Three beats layer over the one-shot `query → result`: an independent
+ * `data_version` poll (`pollLoop`) turns committed changes into per-entity
+ * `patch` pushes via a state-based diff (`diffTick`) keyed on each connection's
+ * `lastSent` + watched-set; each tick also runs a per-filter `countAndToken` and
+ * emits a `meta` frame when a subscription's `total` or membership token moves
+ * (a count/staleness signal, NOT a live membership stream — the page stays
+ * frozen).
  *
- * The RPC layer landed alongside: an `rpc` request frame routes through the
- * process-global `RPC_REGISTRY` and runs the handler against a dedicated WRITER
- * connection (opened next to the existing reader in `main()`). Concrete
- * handlers live in `src/rpc-handlers.ts` and are installed once per worker
- * spawn by `main()` calling `installRpcHandlers()`. The registry carries the
- * dead-letter replay handler plus the autopilot control-plane async handlers
- * (`set_autopilot_paused` / `set_autopilot_mode` / `set_epic_armed` /
- * `retry_dispatch`); each round-trips a mutation through a synthetic event via
- * the worker→main bridge. (fn-756 retired the `set_task_approval` /
- * `set_epic_approval` handlers with the rest of the approval surface.) The
- * two-connection split is load-bearing: the reader's `data_version` poll
- * only sees writes from OTHER connections, so any SQL-mutating RPC writer must
- * be distinct from the poll reader.
+ * An `rpc` frame routes through the process-global `RPC_REGISTRY` and runs the
+ * handler against a dedicated WRITER connection. The two-connection split is
+ * load-bearing: the reader's `data_version` poll only sees writes from OTHER
+ * connections, so any SQL-mutating RPC writer MUST be distinct from the poll
+ * reader.
  *
- * Conventions mirror `src/wake-worker.ts`:
- * - `isMainThread`-guarded body — a plain `import` from a test is inert.
- * - Own read-only `openDb(path, { readonly: true })` PLUS a writer-mode
- *   `openDb(path)` (handles are thread-affine and not structured-cloneable;
- *   the parent hands us only the path string via `workerData`). Both go
- *   through `applyPragmas` and both release in the shutdown handler.
- * - Typed message protocol: `{ kind: ... }` worker→main, `{ type: "shutdown" }`
- *   main→worker. Exit `0` clean / `1` crash. NO in-process self-heal — any
- *   unrecoverable error is `process.exit(1)` and the LaunchAgent restarts.
+ * Conventions: `isMainThread`-guarded body; own read-only + writer-mode `openDb`
+ * (handles are thread-affine; the parent hands only the path string), both
+ * released in shutdown. Typed messages `{ kind }` worker→main, `{ type }`
+ * main→worker. NO in-process self-heal — any unrecoverable error is
+ * `process.exit(1)` and the LaunchAgent restarts.
  *
- * Why a lock file and not the socket file for ownership: AF_UNIX has no
- * `SO_REUSEADDR`, so a crash leaves a stale socket → `Bun.listen` `EADDRINUSE`.
- * We acquire the lock (pid + liveness check) BEFORE the unlink-then-bind, so two
- * instances can never race the path: a live pid refuses to boot (launchd backs
- * off); a dead pid is stale and we steal it (unlink lock + socket, take over).
+ * Lock file, not socket file, for ownership: AF_UNIX has no `SO_REUSEADDR`, so a
+ * crash leaves a stale socket → `EADDRINUSE`. We acquire the lock (pid +
+ * liveness) BEFORE the unlink-then-bind, so two instances never race the path: a
+ * live pid refuses to boot, a dead pid is stale and we steal it.
  *
- * Why the worker releases the socket in its OWN shutdown handler: the socket is
- * bound to the PROCESS, not the Worker thread. `worker.terminate()` from the
- * daemon does NOT release it — so the worker must `listener.stop(true)` +
- * unlink socket + unlink lock here, or the socket leaks into the next boot.
+ * The worker releases the socket in its OWN shutdown handler: the socket is
+ * bound to the PROCESS, not the thread, so `worker.terminate()` does NOT release
+ * it — without this the socket leaks into the next boot.
  */
 
 import type { Database } from "bun:sqlite";
@@ -119,41 +102,29 @@ export interface ShutdownMessage {
 }
 
 /**
- * Edge-triggered fast-path wake (fn-694 lever B). Main posts this AFTER
- * `drainToCompletion` returns (post-COMMIT) so the server-worker runs
- * `diffTick` immediately instead of waiting for its next ~50ms poll tick —
- * collapsing the second of the two serial `data_version` polls in the
- * hook→fold→patch pipeline. The level-triggered `pollLoop` is retained as
- * the stall-recovery backstop (lost-wakeup races, missed kicks); the kick is
- * purely additive and idempotent (diffTick is version-gated, so a kick+poll
- * double-fire is a harmless no-op). Posted strictly after the commit so the
- * worker never reads a pre-commit `data_version`.
+ * Edge-triggered fast-path wake. Main posts this post-COMMIT so the server-worker
+ * runs `diffTick` immediately instead of waiting for its next poll tick. The
+ * level-triggered `pollLoop` is retained as the stall-recovery backstop; the
+ * kick is purely additive and idempotent (diffTick is version-gated). Posted
+ * strictly after the commit so the worker never reads a pre-commit
+ * `data_version`.
  */
 export interface KickMessage {
   type: "kick";
 }
 
 /**
- * Worker→main request bridge for the {@link replayDeadLetterHandler} RPC
- * (fn-643 task .4). The async-RPC dispatch path posts this message with a
- * correlation `id` and awaits the matching {@link ReplayResultMessage} reply
- * from main. The kind is intentionally specific (not a generic "rpc-request")
- * — adding a second async RPC later means adding a second message kind, not
- * widening this one, so each main-thread handler stays narrowly typed.
+ * Worker→main request bridge for the dead-letter replay RPC. The async-RPC
+ * dispatch path posts this with a correlation `id` and awaits the matching
+ * {@link ReplayResultMessage}. A specific kind (not a generic "rpc-request") so
+ * each main-thread handler stays narrowly typed.
  *
- * Why route through main rather than have the worker write the events log
- * directly: the CLAUDE.md invariant "main is the sole writer of the events
- * log" is the determinism boundary — every projection-driving fact lives in
- * the immutable event log via main's writable connection. The replay path
- * appends a real (not synthetic) event built from the dead-letter row's
- * stored bindings; that write MUST land on main so the from-scratch re-fold
- * sees a single linear append history with no holes.
- *
- * No payload beyond `id` — the actual work (pick row, build event, INSERT,
- * flip status) is a closed transaction main runs from scratch on receipt.
- * Each request handles exactly ONE oldest-first record; a no-waiting-rows
- * outcome flows back via {@link ReplayResultMessage}'s `recovered_dl_id:
- * null` shape (an ok ack, not an error).
+ * Routed through main because main is the sole writer of the events log (the
+ * determinism boundary): the replay appends a real event built from the
+ * dead-letter row's bindings, and that write MUST land on main so the re-fold
+ * sees one linear append history with no holes. Each request handles exactly
+ * ONE oldest-first record; a no-waiting-rows outcome returns `recovered_dl_id:
+ * null` (an ok ack, not an error).
  */
 export interface ReplayRequestMessage {
   kind: "replay-request";
@@ -161,22 +132,12 @@ export interface ReplayRequestMessage {
 }
 
 /**
- * Main→worker reply paired with a {@link ReplayRequestMessage}. The async-RPC
- * dispatcher resolves the awaiting promise on receipt; the `id` correlates it
- * back to the original request.
- *
- * Shape rationale (mirroring `ok` / `value` on `RpcResultFrame` vs `error` /
- * `message` on `ErrorFrame`):
- * - `ok: true, recovered_dl_id: string` — main flipped one waiting row to
- *   recovered and appended the corresponding `events` row. The dl_id of
- *   the recovered row is included so the worker can frame it as the RPC's
- *   return value (visible at the board / CLI client).
- * - `ok: true, recovered_dl_id: null` — there were zero `waiting` rows;
- *   main did nothing. The board's keypress gracefully no-ops on an empty
- *   backlog rather than surfacing an error.
- * - `ok: false, error: string` — main's recovery transaction itself
- *   crashed (a programming bug or a DB-level failure). The worker frames
- *   this as an `rpc_failed` ErrorFrame carrying `error`.
+ * Main→worker reply paired with a {@link ReplayRequestMessage}; `id` correlates
+ * it to the request.
+ * - `ok:true, recovered_dl_id: string` — one waiting row flipped to recovered.
+ * - `ok:true, recovered_dl_id: null` — zero waiting rows; a clean no-op ack.
+ * - `ok:false, error` — main's recovery transaction crashed; framed as
+ *   `rpc_failed`.
  */
 export interface ReplayResultMessage {
   type: "replay-result";
@@ -187,18 +148,11 @@ export interface ReplayResultMessage {
 }
 
 /**
- * Worker→main request bridge for the `set_autopilot_paused` RPC (fn-661
- * task .4). The async-RPC handler posts this message with a correlation
- * `id` and a `paused` boolean, then awaits the matching
- * {@link SetAutopilotPausedResultMessage} reply. Main flips its in-memory
- * `paused` flag (the safety default — boots-paused, never persisted, see
- * `src/daemon.ts` shutdown comments) AND relays a `{ type: "set-paused",
- * paused }` command to the autopilot worker, then replies success.
- *
- * Why route through main: the `paused` flag is single-source-of-truth on
- * main (the autopilot worker is told via the existing main→worker
- * command channel). The server-worker has no direct line to the
- * autopilot worker — every cross-worker message hops through main.
+ * Worker→main request bridge for `set_autopilot_paused`. Main flips its
+ * in-memory `paused` flag (boots-paused, never persisted) AND relays a
+ * `set-paused` command to the autopilot worker. Routed through main because the
+ * flag is single-source-of-truth there and the server-worker has no direct line
+ * to the autopilot worker.
  */
 export interface SetAutopilotPausedRequestMessage {
   kind: "set-autopilot-paused-request";
@@ -215,30 +169,19 @@ export interface SetAutopilotPausedResultMessage {
 }
 
 /**
- * Worker→main request bridge for the `retry_dispatch` RPC (fn-661 task
- * .4). The async-RPC handler validates the wire `id` shape (the
- * canonical `${verb}::${id}` `DispatchKey`), splits it into the `verb` /
- * `id` pair, posts this message, and awaits the matching
- * {@link RetryDispatchResultMessage} reply. Main appends a
- * `DispatchCleared` synthetic event onto the writable connection so the
- * reducer folds the failure row OUT of `dispatch_failures` (the only
- * legal clear path — direct DELETEs would break re-fold determinism).
- *
- * Wire shape is the SPLIT pair, not the composite key, so main's mint
- * site stays a pure forward: insert with `verb` / `id` exactly as
- * received. Validation is the handler's job (verb is one of
- * `work` / `close`; id is a non-empty token).
+ * Worker→main request bridge for `retry_dispatch`. Main appends a
+ * `DispatchCleared` synthetic event so the reducer folds the failure row OUT of
+ * `dispatch_failures` (the only legal clear path — a direct DELETE would break
+ * re-fold determinism). The wire shape is the SPLIT `verb` / `id` pair, not the
+ * composite key, so main's mint site stays a pure forward.
  */
 export interface RetryDispatchRequestMessage {
   kind: "retry-dispatch-request";
   id: string;
   /** The dispatch verb half of the failed `${verb}::${id}` key. */
   verb: "work" | "close";
-  /**
-   * The planctl id (epic id for `close`; task id for `work`).
-   * Validated by the handler to be a non-empty string; main treats it as
-   * an opaque token to mint into the `DispatchCleared` event payload.
-   */
+  /** The planctl id (epic id for `close`; task id for `work`). Handler-validated
+   *  non-empty; main treats it as an opaque token. */
   dispatch_id: string;
 }
 
@@ -251,18 +194,12 @@ export interface RetryDispatchResultMessage {
 }
 
 /**
- * Worker→main request bridge for the `set_autopilot_mode` RPC (fn-751 task
- * .3). The async-RPC handler validates the `mode: 'yolo'|'armed'` enum, posts
- * this message, and awaits the matching {@link SetAutopilotModeResultMessage}
- * reply. Main APPENDS an `AutopilotMode` synthetic event onto the writable
- * connection (folded into the `autopilot_state` singleton's `mode` column) and
- * pumps a wake.
- *
- * Deliberately UNLIKE {@link SetAutopilotPausedRequestMessage}: main does NOT
- * relay to the autopilot worker. The reconciler is level-triggered and re-reads
- * `mode` from the projection every cycle — the fold's `data_version` bump wakes
- * it. Mode is durable user intent (persisted), not a safety reset, so there is
- * no in-memory main-side flag and no boot re-arm.
+ * Worker→main request bridge for `set_autopilot_mode`. Main APPENDS an
+ * `AutopilotMode` synthetic event (folded into `autopilot_state.mode`) and pumps
+ * a wake. UNLIKE {@link SetAutopilotPausedRequestMessage}, NO relay to the
+ * autopilot worker: the reconciler re-reads `mode` from the projection each
+ * cycle. Mode is durable user intent, not a safety reset, so no in-memory flag
+ * and no boot re-arm.
  */
 export interface SetAutopilotModeRequestMessage {
   kind: "set-autopilot-mode-request";
@@ -279,12 +216,10 @@ export interface SetAutopilotModeResultMessage {
 }
 
 /**
- * Worker→main request bridge for the `set_epic_armed` RPC (fn-751 task .3).
- * The async-RPC handler validates the `{ epic_id, armed }` shape, posts this
- * message, and awaits the matching {@link SetEpicArmedResultMessage} reply.
- * Main APPENDS an `EpicArmed` synthetic event onto the writable connection
- * (folded into the `armed_epics` PRESENCE table) and pumps a wake — same
- * APPEND-ONLY / no-relay contract as {@link SetAutopilotModeRequestMessage}.
+ * Worker→main request bridge for `set_epic_armed`. Main APPENDS an `EpicArmed`
+ * synthetic event (folded into the `armed_epics` PRESENCE table) and pumps a
+ * wake — same APPEND-ONLY / no-relay contract as
+ * {@link SetAutopilotModeRequestMessage}.
  */
 export interface SetEpicArmedRequestMessage {
   kind: "set-epic-armed-request";
@@ -311,42 +246,32 @@ const MIN_POLL_MS = 25;
 
 /**
  * Minimum interval (ms) between `meta` membership-nudge emissions PER
- * subscription (fn-697 lever 1). The meta pass fans a `meta{total,token}` frame
- * to every board subscriber whenever the filtered-set total/membership token
- * moves — which is on essentially every fold. Each nudge drives a full client
- * refetch of the (large) subagent_invocations set, and the server answers all
- * ~21 subscribers serially on its single event loop, so a fold burst becomes a
- * 382-538ms refetch storm (diagnosed in fn-694.3 under KEEPER_TRACE_SERVER).
+ * subscription. A `meta{total,token}` move fires on essentially every fold and
+ * drives a full client refetch, fanned serially to every subscriber — a fold
+ * burst becomes a refetch storm without this throttle.
  *
- * This throttle COALESCES the meta EMISSION: within `META_MIN_INTERVAL_MS` of
- * the last emit on a sub, a fresh total/token move is deferred — but the
- * membership baseline (`lastTotal`/`lastToken`) and the emit clock
- * (`lastMetaEmittedAt`) advance ONLY on an actual emit, so the delta persists
- * and the next eligible `diffTick` (a kick or the `pollLoop` convergence tick)
- * emits the LATEST state. No lost-final-update; the `pollLoop` is the
- * convergence safety net. The throttle gates ONLY the meta pass — `patch`
- * frames (the correctness-critical cell stream) are NEVER delayed.
+ * The throttle COALESCES the EMISSION: a move within the window is deferred, but
+ * the membership baseline and the emit clock advance ONLY on an actual emit, so
+ * the delta persists and the next eligible `diffTick` emits the latest state (no
+ * lost final update; `pollLoop` is the convergence safety net). Gates ONLY the
+ * meta pass — `patch` frames (the correctness-critical cell stream) are NEVER
+ * delayed.
  */
 export const META_MIN_INTERVAL_MS = 150;
 
 /**
- * Hard upper bound on how long the async-RPC bridge waits for a
- * `replay-result` reply from main before rejecting (fn-643 task .4). A
- * healthy main answers in well under a millisecond on local UDS — even a
- * mid-drain main releases the writer lock between batches, so a single
- * replay round-trip slots in cleanly. 5s is generous enough to absorb a
- * brief drain stall under contention but tight enough that a wedged main
- * surfaces as a typed `rpc_failed` error frame on the board rather than
- * hanging the keypress.
+ * Hard upper bound on how long the async-RPC bridge waits for a `replay-result`
+ * reply from main before rejecting. Generous enough to absorb a brief drain
+ * stall but tight enough that a wedged main surfaces as a typed `rpc_failed`
+ * frame rather than hanging the keypress.
  */
 const REPLAY_DEADLINE_MS = 5000;
 
 /**
- * Bound on how long `shutdown()` waits for the realtime poll loop to observe
- * `stopping` and exit before it closes the DB connection (fn-722 task .6). The
- * loop checks `stopping` once per `pollMs` tick (floored at `MIN_POLL_MS`), so
- * one cadence plus slack is ample; the cap guarantees a wedged loop can't block
- * teardown forever (we exit the process right after the close regardless).
+ * Bound on how long `shutdown()` waits for the poll loop to observe `stopping`
+ * and exit before closing the DB. One cadence plus slack; the cap guarantees a
+ * wedged loop can't block teardown forever (we exit right after the close
+ * regardless).
  */
 const POLL_DRAIN_DEADLINE_MS = 500;
 
@@ -356,56 +281,37 @@ export const DEFAULT_LIMIT = 100;
 export const MAX_LIMIT = 500;
 
 /**
- * Hard upper bound on concurrent subscriber connections (fn-723 task .2). The
- * single-threaded worker diffs every projection change against ALL live conns
- * serially, so a leak of headless orphan viewers (the 2026-06-06 incident: 64
- * procs / 96 conns) saturates the fan-out. At the cap a NEW connection is
- * REJECTED with a `max_connections` error frame then closed — reject-new, NOT
- * LRU-evict: the oldest conn is the legit long-lived board, and evicting it to
- * admit a newcomer would punish the wrong party. Hitting the cap is logged
- * loudly (un-gated) because it means the reaper regressed — a healthy daemon
- * never gets close. 64 is comfortably above the realistic live-viewer count
- * (a handful per active session) yet bounds the worst-case fan-out cost.
+ * Hard upper bound on concurrent subscriber connections. The single-threaded
+ * worker diffs every projection change against ALL live conns serially, so a
+ * leak of orphan viewers saturates the fan-out. At the cap a NEW connection is
+ * REJECTED with a `max_connections` frame then closed — reject-new, NOT
+ * LRU-evict: the oldest conn is the legit long-lived board. Hitting the cap is
+ * logged loudly (un-gated) — it means the reaper regressed.
  */
 export const MAX_CONNECTIONS = 64;
 
 /**
  * Ceiling (ms) a connection's outbound write may stay BACKPRESSURED before the
- * conn is reaped (fn-723 task .2). `diffTick` SKIPS a conn whose `pending`
- * write buffer is non-empty (slow/dead consumer), so a dead-but-backpressured
- * socket never gets another write to EPIPE on — it would linger forever. When
- * `pending` has been continuously set longer than this ceiling the conn is
- * evicted (`sock.end()` → Bun `close` handler removes it from `conns`).
- *
- * This is explicitly NOT a write-side idle timer: a quiet receive-only
- * subscriber (a board during a DB-quiet period) has `pending === null` and is
- * never touched. The TTL fires ONLY on a genuinely STUCK write buffer, which a
- * live consumer drains in milliseconds. 30s is orders of magnitude beyond any
- * legitimate drain latency on a local UDS yet bounds a wedged socket's lifetime.
+ * conn is reaped. `diffTick` SKIPS a conn with a non-empty `pending` buffer, so
+ * a dead-but-backpressured socket never gets another write to EPIPE on and would
+ * linger forever. NOT a write-side idle timer: a quiet receive-only subscriber
+ * has `pending === null` and is never touched. Fires ONLY on a genuinely STUCK
+ * buffer, which a live consumer drains in milliseconds.
  */
 export const STUCK_PENDING_TTL_MS = 30_000;
 
 /**
- * Ceiling (ms) a connection with ZERO subscriptions and no inbound frame may
- * sit idle before the idle sweep evicts it (fn-767). This is the belt-and-
- * braces arm for the leak class the EPIPE-evict and stuck-pending TTL both
- * miss: a one-shot query-only client (an autopilot worker's `keeper` CLI probe)
- * that connects, queries, and dies in a way the kernel never promptly reports —
- * SIGKILL mid-frame, a half-open socket — fires NEITHER the Bun `close` handler
- * (no FIN observed) NOR `error` (no EPIPE), and never receives a server write to
- * backpressure on (`pending === null`, so the stuck-pending TTL is inert) nor to
- * EPIPE-evict on (zero subs → never in a diff fanout). It would sit in `conns`
- * forever; bursty CLI churn (~2.5 conns/min) fills the cap in ~40 min, then
- * every new probe is rejected (the 2026-06-09 incident: 83 rejections, kernel
- * holding only 15 real sockets).
+ * Ceiling (ms) a connection with ZERO subscriptions may sit idle before the idle
+ * sweep evicts it — the belt-and-braces arm for a leak the EPIPE-evict and
+ * stuck-pending TTL both miss: a one-shot query-only client that dies in a way
+ * the kernel never reports (SIGKILL mid-frame, half-open socket) fires neither
+ * the `close` handler nor `error`, never backpressures (so the stuck-pending TTL
+ * is inert), and never enters a diff fanout (zero subs) — so it would sit in
+ * `conns` forever, and bursty CLI churn fills the cap.
  *
- * STRICTLY a zero-sub sweep: a SUBSCRIBED connection — even a quiet receive-only
- * board during a DB-quiet period — is NEVER idle-reaped (the fn-723 no-ping-pong
- * descope stands; a legit viewer holds exactly one long-lived sub). `lastActivityAt`
- * is stamped at `open` and on every inbound `data` chunk, so a client mid-handshake
- * or actively querying is never swept. 5 min is far beyond any one-shot probe's
- * connect→query→read→exit round-trip (sub-second on a local UDS) yet bounds a
- * silently-dead subscriptionless socket's lifetime to one sweep window.
+ * STRICTLY a zero-sub sweep: a SUBSCRIBED connection (even a quiet board) is
+ * NEVER idle-reaped. `lastActivityAt` is stamped at `open` and on every inbound
+ * chunk, so a client mid-handshake or querying is never swept.
  */
 export const IDLE_CONN_TTL_MS = 5 * 60_000;
 
@@ -413,19 +319,14 @@ export const IDLE_CONN_TTL_MS = 5 * 60_000;
 // DEBUG: timing instrumentation
 // ---------------------------------------------------------------------------
 //
-// Diagnostic-only logs for chasing the "epics frame takes 5s sometimes" bug.
-// Every line is `[srv-ts] T=<epochMs> <event>` so a client log emitting the
-// same wall-clock can be diffed against it. Connection lifecycle and
-// per-call dispatch/tick timings are gated by `KEEPER_TRACE_SERVER=1` AT
-// THE CALL SITE — not inside `srvTs` — because the caller's template-literal
-// `msg` argument allocates before any in-function gate would fire. Read the
-// env var exactly once at module load into a `const`; V8/JSC elides the
-// `if (TRACE)` branch in steady-state when off. The rare `[server-worker]`
-// error class stays UN-gated.
+// Diagnostic logs `[srv-ts] T=<epochMs> <event>`, gated by `KEEPER_TRACE_SERVER`
+// AT THE CALL SITE (not inside `srvTs` — the template-literal `msg` allocates
+// before any in-function gate). Read once at module load so V8/JSC elides the
+// `if (TRACE)` branch when off. The rare `[server-worker]` error class is
+// UN-gated.
 const TRACE = process.env.KEEPER_TRACE_SERVER === "1";
-// Per-frame byte threshold for `writeFrames` instrumentation: only emit a
-// stage line when the encoded buffer is at least this large. Read once at
-// module load; a non-numeric env value (`NaN`) falls back to the default.
+// Per-frame byte threshold for `writeFrames` instrumentation; a non-numeric env
+// value falls back to the default.
 const TRACE_FRAME_BYTES_DEFAULT = 4096;
 const TRACE_FRAME_BYTES = (() => {
   const raw = process.env.KEEPER_TRACE_FRAME_BYTES;
@@ -441,16 +342,12 @@ function srvTs(msg: string): void {
 }
 
 /**
- * Format a stage-timing line for the `[srv-ts]` log. Funnels both `runQuery`
- * and `diffTick` outputs through ONE call so the awk-parseable shape stays
- * locked across call sites:
+ * Format a stage-timing line for the `[srv-ts]` log, funneling `runQuery` and
+ * `diffTick` through ONE call so the awk-parseable shape stays locked:
  *
  *   op=<name> col=<col> [rows=<N>] [bytes=<B>] <stage1>=<ms> ... total=<ms>
  *
- * Stage values are pre-computed `.toFixed(2)` ms deltas; the caller passes the
- * already-formatted strings so this helper does no math (and so a `TRACE=0`
- * caller never reaches it — the guard is at the call site). The `total` is
- * appended last, always, as the spec locks.
+ * Stage values are pre-formatted by the caller; `total` is always appended last.
  */
 function formatStages(args: {
   op: string;
@@ -487,15 +384,12 @@ function formatStages(args: {
  *   fingerprint last reflected to this subscription (seeded from the same read
  *   that produced the `result`'s `total`); the diff emits a `meta` frame only
  *   when either moves.
- * - `lastMetaEmittedAt` is the wall-clock (ms) of the last `meta` EMISSION on
- *   this sub (fn-697 lever 1). The meta pass throttles to one emit per
- *   `META_MIN_INTERVAL_MS`: a total/token move within that window is deferred,
- *   and `lastTotal`/`lastToken`/`lastMetaEmittedAt` advance ONLY on an actual
- *   emit — so the membership delta persists and the next eligible tick (kick or
- *   `pollLoop` convergence tick) emits the latest state. Lives on `SubState`
- *   (not `diffTick`-local) because BOTH `handleKick` and `pollLoop` drive
- *   `diffTick`; a local clock would split the throttle window across the two
- *   wake paths. Seeded to `0` so the first move on a fresh sub always emits.
+ * - `lastMetaEmittedAt` is the wall-clock (ms) of the last `meta` emission. The
+ *   meta pass throttles to one emit per `META_MIN_INTERVAL_MS`; the baseline +
+ *   this clock advance ONLY on an actual emit. Lives on `SubState` (not
+ *   `diffTick`-local) because BOTH `handleKick` and `pollLoop` drive `diffTick`
+ *   — a local clock would split the throttle window. Seeded to `0` so the first
+ *   move always emits.
  */
 export interface SubState {
   collection: string;
@@ -1214,14 +1108,10 @@ export function runQuery(
 }
 
 /**
- * Resolve a wire `limit` to the page size used by `runQuery`:
- *   - `undefined` / non-finite / negative → `DEFAULT_LIMIT` (the historical
- *     default for clients that omit the field).
- *   - `0` → `0`, the explicit "no limit" sentinel; the SELECT runs without
- *     a row cap and the result carries the full filtered set. Watch out:
- *     diffTick's watched-set fan-out scales linearly with page size, so the
- *     client opts in deliberately.
- *   - positive → clamped at `MAX_LIMIT`.
+ * Resolve a wire `limit` to a page size: `undefined`/non-finite/negative →
+ * `DEFAULT_LIMIT`; `0` → the explicit "no limit" sentinel (diffTick's fan-out
+ * scales with page size, so the client opts in deliberately); positive → clamped
+ * at `MAX_LIMIT`.
  */
 function clampLimit(limit: number | undefined): number {
   if (typeof limit !== "number" || !Number.isFinite(limit) || limit < 0) {
@@ -1238,46 +1128,28 @@ function clampLimit(limit: number | undefined): number {
 // ---------------------------------------------------------------------------
 
 /**
- * Handler signature for a registered RPC. Invoked with the server-worker's
- * WRITER connection (so a handler may mutate sidecar tables) and the request
- * frame's `params` (opaque object; handlers MUST validate shape and throw a
- * `BadParamsError` on mismatch). The return value is framed as
- * `rpc_result.value` — shape is per-handler, opaque to the dispatch shell.
- *
- * Contract: a handler MAY throw. The dispatcher catches and frames the throw
- * as an `error` frame with code `rpc_failed` (or `bad_params` for the typed
- * `BadParamsError`). It MUST NOT call `db.close()` and MUST NOT keep
+ * Handler signature for a sync RPC. Invoked with the WRITER connection and the
+ * frame's `params` (opaque — handlers MUST validate and throw `BadParamsError`
+ * on mismatch); the return is framed as `rpc_result.value`. A handler MAY throw
+ * (framed `rpc_failed` / `bad_params`); it MUST NOT call `db.close()` or keep
  * connection state across invocations.
  */
 export type RpcHandler = (db: Database, params: unknown) => unknown;
 
 /**
- * Bridge a worker-side async RPC handler uses to round-trip work through
- * main. Today the only async RPC is `replay_dead_letter` (fn-643 task .4)
- * and the only bridge call is {@link ReplayBridge.replay}; future async RPCs
- * would add their own method to this interface (or a sibling one). The
- * shape is intentionally narrow — the bridge is the SOLE seam between the
- * worker thread and main's writer connection, and the type names every
- * supported operation.
- *
- * Per the CLAUDE.md invariant "main is the sole writer of the events log",
- * every async-RPC handler that needs to append events MUST route through a
- * bridge call rather than its own DB write. The bridge implementation lives
- * in `main()`: it posts a {@link ReplayRequestMessage} (or sibling) to the
- * parent port and awaits the matching {@link ReplayResultMessage} reply,
- * honoring a deadline so a wedged main never hangs the keypress on the
- * board.
+ * The seam a worker-side async RPC handler uses to round-trip work through main.
+ * Per the "main is the sole writer of the events log" invariant, every async
+ * handler that appends events MUST route through a bridge call rather than its
+ * own DB write. The implementation lives in `main()`: it posts a request message
+ * and awaits the matching reply under a deadline so a wedged main never hangs the
+ * keypress.
  */
 export interface ReplayBridge {
   /**
-   * Ask main to recover one oldest waiting dead-letter row. Resolves with
-   * `{ok:true, recovered_dl_id}` on success (`recovered_dl_id: null` is a
-   * clean no-op ack when the table has zero waiting rows) and `{ok:false,
-   * error}` if main's recovery transaction crashed. Rejects with a thrown
-   * Error only on timeout or a transport-level failure — the typed
-   * `{ok:false,error}` shape covers the "main responded with a failure"
-   * case so handlers can frame `rpc_failed` without distinguishing
-   * timeout vs error.
+   * Recover one oldest waiting dead-letter row. `{ok:true, recovered_dl_id}` on
+   * success (`recovered_dl_id: null` is a clean no-op ack on zero waiting rows);
+   * `{ok:false, error}` if main's transaction crashed. Rejects only on timeout /
+   * transport failure.
    */
   replay(): Promise<{
     ok: boolean;
@@ -1285,33 +1157,19 @@ export interface ReplayBridge {
     error?: string;
   }>;
   /**
-   * Ask main to flip the in-memory `paused` flag AND relay a
-   * `{ type: "set-paused", paused }` command to the autopilot worker.
-   * Resolves `{ok:true}` once main has both updated its flag and posted
-   * the relay (synchronous on the main thread). `{ok:false, error}`
-   * surfaces if main isn't currently running an autopilot worker (boot
-   * race; should never happen post-boot). Rejects on bridge timeout —
-   * same shape as {@link ReplayBridge.replay}.
-   *
-   * Fn-661 task .4. The flag is in-memory only on main and NEVER
-   * persisted; the rollout invariant is "first run after deploy
-   * dispatches nothing until the human plays".
+   * Flip the in-memory `paused` flag AND relay a `set-paused` command to the
+   * autopilot worker. `{ok:false, error}` if main isn't running an autopilot
+   * worker. The flag is in-memory only and NEVER persisted (boots-paused).
    */
   setAutopilotPaused(paused: boolean): Promise<{
     ok: boolean;
     error?: string;
   }>;
   /**
-   * Ask main to append a `DispatchCleared` synthetic event onto the
-   * writable connection — the only legal way to clear a sticky failure
-   * row out of `dispatch_failures`. Resolves `{ok:true}` once main has
-   * inserted the event and pumped a wake (so the reducer's fold lands
-   * in bounded time). Rejects on bridge timeout.
-   *
-   * The split `verb` + `dispatch_id` pair lands on the wire (not the
-   * composite `${verb}::${id}` key) so the handler does its splitting
-   * validation once and main treats the parts as opaque tokens. Fn-661
-   * task .4.
+   * Append a `DispatchCleared` synthetic event — the only legal way to clear a
+   * sticky failure row out of `dispatch_failures`. The split `verb` +
+   * `dispatch_id` pair lands on the wire (not the composite key) so main treats
+   * the parts as opaque tokens.
    */
   retryDispatch(
     verb: "work" | "close",
@@ -1321,23 +1179,18 @@ export interface ReplayBridge {
     error?: string;
   }>;
   /**
-   * Ask main to APPEND an `AutopilotMode` synthetic event onto the writable
-   * connection (folded into the `autopilot_state` singleton's `mode` column)
-   * and pump a wake. Resolves `{ok:true}` once main has inserted the event.
-   * Rejects on bridge timeout. NO relay to the autopilot worker — the
-   * reconciler re-reads mode from the projection each cycle. Fn-751 task .3.
+   * APPEND an `AutopilotMode` synthetic event (folded into `autopilot_state.mode`)
+   * and pump a wake. NO relay — the reconciler re-reads mode from the projection
+   * each cycle.
    */
   setAutopilotMode(mode: "yolo" | "armed"): Promise<{
     ok: boolean;
     error?: string;
   }>;
   /**
-   * Ask main to APPEND an `EpicArmed` synthetic event onto the writable
-   * connection (folded into the `armed_epics` PRESENCE table) and pump a wake.
-   * Resolves `{ok:true}` once main has inserted the event. Rejects on bridge
-   * timeout. APPEND-ONLY (no relay), no existence validation on `epic_id` —
-   * the handler appends unconditionally to dodge the fold-lag race. Fn-751
-   * task .3.
+   * APPEND an `EpicArmed` synthetic event (folded into the `armed_epics` PRESENCE
+   * table) and pump a wake. APPEND-ONLY (no relay), no existence validation on
+   * `epic_id` — appends unconditionally to dodge the fold-lag race.
    */
   setEpicArmed(
     epic_id: string,
@@ -1451,20 +1304,10 @@ export function registerAsyncRpc(
 // ---------------------------------------------------------------------------
 
 /**
- * Optional plumbing the dispatch shell forwards to an async RPC handler.
- * `bridge` is the worker→main round-trip surface the handler may call;
- * `onAsyncResult` is the callback the dispatcher fires when the handler's
- * promise resolves (or rejects) — the caller (`handleData`) wires this to
- * `writeFrames` so the eventual frame lands on the connection. Both are
- * required together: providing one without the other is a misconfigured
- * caller (an async-RPC frame would either resolve with no place to write
- * its frame, or have nowhere to route the bridge call).
- *
- * Sync-RPC paths and non-RPC frames ignore both fields, so a test calling
- * `dispatchLine` without `asyncCtx` keeps the same drive-it-synchronously
- * contract as before — `asyncCtx === undefined` simply makes async-RPC
- * frames return `unknown_method` (since the async registry is unreachable
- * from a caller that didn't opt in).
+ * Plumbing the dispatch shell forwards to an async RPC handler. `bridge` is the
+ * worker→main round-trip surface; `onAsyncResult` writes the eventual frame back
+ * on the connection. Both required together. A caller omitting `asyncCtx` keeps
+ * the sync-only contract — async-RPC frames return `unknown_method`.
  */
 export interface DispatchAsyncCtx {
   bridge: ReplayBridge;
@@ -1472,35 +1315,20 @@ export interface DispatchAsyncCtx {
 }
 
 /**
- * Parse and dispatch ONE NDJSON line against the connection state. Returns the
- * server frames to send back (zero or more). NEVER throws on bad input — a
- * malformed/unknown/over-vocabulary frame yields an `error` frame and the
- * connection stays open. Each line is parsed in its own try/catch by the
- * caller too, but we keep the contract here so the unit layer can call this
- * directly.
+ * Parse and dispatch ONE NDJSON line. Returns the server frames to send back.
+ * NEVER throws on bad input — a malformed/unknown frame yields an `error` frame
+ * and the connection stays open.
  *
- * RPC dispatch: an `rpc` frame routes through `RPC_REGISTRY` (sync) OR
- * `ASYNC_RPC_REGISTRY` (async). The dispatcher runs the SYNC handler under
- * the WRITER `db` connection (passed via `writerDb` when present; falls back
- * to the reader `db` only for read-only test wiring) and frames the result
- * inline. The ASYNC handler runs via the {@link DispatchAsyncCtx} bridge —
- * the dispatcher returns `[]` immediately, then the handler's resolved
- * frame lands via `asyncCtx.onAsyncResult` when the worker→main round-trip
- * completes. Every RPC failure path returns / fires an `error` frame, never
- * throws — `unknown_method` on missing handler, `bad_params` on a typed
- * `BadParamsError` throw, `rpc_failed` on any other throw or async
- * rejection.
+ * RPC dispatch: an `rpc` frame routes through `RPC_REGISTRY` (sync, run under the
+ * WRITER connection) OR `ASYNC_RPC_REGISTRY` (async, via the
+ * {@link DispatchAsyncCtx} bridge — returns `[]` immediately, the resolved frame
+ * lands via `onAsyncResult`). Every failure path returns an `error` frame:
+ * `unknown_method`, `bad_params` (typed throw), `rpc_failed` (any other throw /
+ * rejection). An async frame without `asyncCtx` returns `unknown_method`.
  *
- * An async-RPC frame arriving without `asyncCtx` returns `unknown_method`
- * (the dispatcher cannot route it to the async registry without the
- * bridge); this keeps the legacy sync-only test surface unchanged.
- *
- * fn-698: when a {@link ResultMemo} is threaded in (the worker passes the
- * per-server-instance memo; direct-dispatch callers omit it), an identical
- * `query` at the same `worldRev` is served from the memo as a single
- * {@link PreSerialized} result line. The overload reflects this: WITHOUT a
- * memo the return is the plain `ServerFrame[]` (no pre-serialized element can
- * appear), so the legacy direct-dispatch test surface narrows unchanged.
+ * When a {@link ResultMemo} is threaded in, an identical `query` at the same
+ * `worldRev` is served as a single {@link PreSerialized} line; the overload
+ * narrows the no-memo return to plain `ServerFrame[]`.
  */
 export function dispatchLine(
   db: Database,
@@ -1824,12 +1652,9 @@ function readWorldRev(db: Database): number {
 export interface Writable {
   write(data: Uint8Array, byteOffset?: number, byteLength?: number): number;
   /**
-   * Close the connection (fn-723 task .2 reaper path). Declared optional
-   * because the minimal write surface a test `fakeSock` provides may omit it;
-   * the real Bun socket always has `.end()` at runtime even though its TS
-   * `Writable`-cast view only declares `write` — the same type-vs-runtime
-   * bridge `startServer`'s `as unknown as Writable` cast already relies on.
-   * Eviction calls `sock.end()`; the Bun `close` handler then `conns.delete`s.
+   * Close the connection (reaper path). Optional because a test `fakeSock` may
+   * omit it; the real Bun socket always has `.end()` at runtime. Eviction calls
+   * `sock.end()`; the Bun `close` handler then `conns.delete`s.
    */
   end?(): void;
   data: ConnState;
@@ -1839,24 +1664,17 @@ const encoder = new TextEncoder();
 
 /**
  * Encode one dispatch element to its NDJSON line. A {@link PreSerialized}
- * sentinel (fn-698) is written VERBATIM — its `__line` is already a complete
- * NDJSON line, byte-identical to `encodeFrame` of the same ResultFrame, so it
- * skips the re-stringify. Every other frame routes through `encodeFrame`. Used
- * at BOTH `writeFrames` encode sites (fresh + backpressure pending-append) so
- * a re-encode never re-stringifies a large cached rows blob.
+ * sentinel is written VERBATIM (its `__line` is already a complete line) so a
+ * re-encode never re-stringifies a large cached rows blob; every other frame
+ * routes through `encodeFrame`.
  */
 function encodeFrameOrLine(f: ServerFrame | PreSerialized): string {
   return isPreSerialized(f) ? f.__line : encodeFrame(f);
 }
 
 /**
- * Best-effort collection label for the `op=writeFrames` trace line. Most
- * server-emit batches carry one collection across all frames (a `runQuery`
- * result, a per-collection patch fanout, a meta emit); for frames that don't
- * carry one (e.g. an `error` frame minted without a known collection, or an
- * `rpc_result`) the label degrades to `"?"`. Pure read of the encoded
- * frames — no socket access, so it stays safe regardless of which sub the
- * batch belongs to.
+ * Best-effort collection label for the `op=writeFrames` trace line; degrades to
+ * `"?"` for frames that don't carry a collection. Pure read of the frames.
  */
 function firstFrameCollection(frames: (ServerFrame | PreSerialized)[]): string {
   const first = frames[0] as { collection?: unknown } | undefined;
@@ -1898,17 +1716,9 @@ export function writeFrames(
     offset = 0;
   }
 
-  // Stage-trace large frame batches BEFORE flush so the bytes/frames recorded
-  // match the encoded buffer exactly (flush may stash a tail on backpressure
-  // but the byte count we're profiling is the encoded payload, not what hit
-  // the wire). Threshold-gated on `KEEPER_TRACE_FRAME_BYTES` (default 4096)
-  // to avoid logging every small patch frame. The collection label is derived
-  // from the first frame's `collection` (most server-emit batches share a
-  // collection across frames); falls back to "?" for frames that don't carry
-  // one (e.g. some error frames). The TRACE env gate short-circuits FIRST so
-  // a TRACE=0 daemon never reaches the buf.length comparison; the source-
-  // level lint accepts this compound `if (TRACE && ...)` shape alongside the
-  // existing bare `if (TRACE)` form.
+  // Stage-trace large frame batches BEFORE flush so the recorded byte count is
+  // the encoded payload, not what hit the wire after a backpressure stash.
+  // Threshold-gated; the TRACE env gate short-circuits first.
   if (TRACE && buf.length >= TRACE_FRAME_BYTES)
     srvTs(
       `op=writeFrames col=${firstFrameCollection(frames)} bytes=${buf.length} frames=${frames.length}`,
@@ -1977,20 +1787,11 @@ function readWorldRevOnce(db: Database): number {
 }
 
 /**
- * Evict connections whose outbound write has been BACKPRESSURED past
- * {@link STUCK_PENDING_TTL_MS} (fn-723 task .2). `diffTick` skips a conn with a
- * non-empty `pending` buffer, so a dead-but-backpressured socket never receives
- * another write to EPIPE on and would otherwise linger in `conns` forever,
- * costing a serial diff every tick. The guard fires ONLY on a genuinely stuck
- * buffer (`pendingSince !== null` AND aged past the ceiling) — a quiet
- * receive-only subscriber has `pending === null` and is never touched, so this
- * is NOT a write-side idle timer.
- *
- * Eviction is `sock.end()`; the Bun `close` handler then removes the conn from
- * `conns` (idempotent). Wrapped per-conn in try/catch so a single `end()` throw
- * can't abort the reap of the others (and, since the whole reaper runs inside
- * `diffTick`'s no-self-heal call sites — `pollLoop`/`handleKick` — a throw never
- * reaches the daemon). Cap-hit-style loud log because a stuck conn is abnormal.
+ * Evict connections backpressured past {@link STUCK_PENDING_TTL_MS}. Fires ONLY
+ * on a genuinely stuck buffer (`pendingSince` aged past the ceiling) — a quiet
+ * receive-only subscriber has `pending === null` and is never touched.
+ * Eviction is `sock.end()` (the Bun `close` handler then `conns.delete`s,
+ * idempotent), per-conn try/catch'd so one throw can't abort the rest.
  */
 function reapStuckPending(list: Writable[]): void {
   const now = Date.now();
@@ -2016,28 +1817,12 @@ function reapStuckPending(list: Writable[]): void {
 }
 
 /**
- * Idle-sweep eviction (fn-767). Evicts a connection carrying ZERO subscriptions
- * whose last inbound activity (`lastActivityAt`, stamped at open + every `data`
- * chunk) is older than {@link IDLE_CONN_TTL_MS}. This is the belt-and-braces arm
- * for the leak the EPIPE-evict and stuck-pending TTL both miss: a one-shot
- * query-only client that connected, queried, and then died in a way the kernel
- * never reports as a `close`/`error` (SIGKILL mid-frame, half-open socket) —
- * it has no subs (never in a diff fanout to EPIPE-evict on) and `pending === null`
- * (never backpressured, so the stuck-pending TTL is inert), so it would linger
- * in `conns` forever.
- *
- * SUBSCRIPTION-EXEMPT BY CONSTRUCTION: any conn with a non-empty `subs` map is
- * skipped regardless of how quiet it is (the fn-723 no-ping-pong descope stands
- * — a legit board holds one long-lived sub and is allowed to sit silent during a
- * DB-quiet period). So this is NOT a general idle timer; it bounds ONLY the
- * lifetime of a subscriptionless socket the kernel never reported as dead.
- *
- * Eviction is `sock.end()`; the Bun `close` handler then `conns.delete`s
- * (idempotent). Wrapped per-conn in try/catch so one `end()` throw can't abort
- * the reap of the others — and, like `reapStuckPending`, the whole sweep runs
- * inside `diffTick`'s no-self-heal call sites (`pollLoop`/`handleKick`), so a
- * throw never reaches the daemon. Loud log because a swept conn is abnormal (it
- * carries tonight's diagnosis: the next occurrence is attributable from stderr).
+ * Evict a connection carrying ZERO subscriptions whose last inbound activity is
+ * older than {@link IDLE_CONN_TTL_MS} — the leak the EPIPE-evict and
+ * stuck-pending TTL both miss (a one-shot probe that dies silently). SUBSCRIPTION-
+ * EXEMPT BY CONSTRUCTION: a conn with a non-empty `subs` map is never swept (a
+ * legit board may sit silent during a DB-quiet period). Eviction + per-conn
+ * try/catch as in `reapStuckPending`.
  */
 function reapIdleConns(list: Writable[]): void {
   const now = Date.now();
@@ -2067,18 +1852,11 @@ function reapIdleConns(list: Writable[]): void {
 }
 
 /**
- * Run both connection-hygiene reapers over the live conn set (fn-767): the
- * stuck-pending TTL (a dead-but-backpressured socket the diff fanout skips) and
- * the zero-sub idle sweep (a silently-dead one-shot probe the kernel never
- * reported). Called on EVERY `pollLoop` tick — NOT only on `data_version`-
- * changed ticks — because the leak class fills the conns set during DB-quiet
- * windows (bursty one-shot CLI probes against an idle daemon), exactly when
- * `data_version` is frozen and `diffTick` would otherwise never fire. Also
- * called from inside `diffTick` so the `handleKick` path reaps too. Eviction is
- * idempotent (`conns.delete` on the Bun `close` handler), so the double call is
- * a safe no-op. Each arm is per-conn try/catch'd internally; this wrapper is
- * itself driven only from `pollLoop`/`handleKick`, both no-self-heal sites that
- * swallow a throw, so a reap failure never reaches the daemon.
+ * Run both connection-hygiene reapers over the live conn set. Called on EVERY
+ * `pollLoop` tick (NOT only changed ticks) because the leak class fills `conns`
+ * during DB-quiet windows, exactly when `data_version` is frozen and `diffTick`
+ * never fires; also called from inside `diffTick` for the `handleKick` path.
+ * Eviction is idempotent, so the double call is a safe no-op.
  */
 export function reapConns(list: Writable[]): void {
   reapStuckPending(list);
@@ -2086,16 +1864,10 @@ export function reapConns(list: Writable[]): void {
 }
 
 /**
- * Compute the union of watched ids across a set of subscriptions (all of which
- * share one collection). The poll loop does ONE shared `selectVersionsByIds`
- * version-probe per collection group per tick — cheap (`pk, version` only,
- * no JSON decode) — and only on a non-empty `changedIds` set does it follow
- * with ONE shared `selectByIds` to fetch full rows. N subscriptions watching
- * overlapping pages cost one probe + at most one full-row read, not N.
- *
- * Multi-sub: takes `SubState`s directly (one sub per element, multiple subs
- * may live on a single socket), since the (collection, sub) binding is made
- * by the caller's grouping before this is called.
+ * Union of watched ids across a set of subscriptions sharing one collection, so
+ * N overlapping pages cost one version-probe + at most one full-row read, not N.
+ * Takes `SubState`s directly — the (collection, sub) binding is made by the
+ * caller's grouping.
  */
 function unionWatched(subs: Iterable<SubState>): string[] {
   const union = new Set<string>();
@@ -2108,50 +1880,23 @@ function unionWatched(subs: Iterable<SubState>): string[] {
 }
 
 /**
- * Run ONE realtime tick across all connections.
+ * Run ONE realtime tick across all connections. Per collection-group: probe
+ * `(pk, version)` for the union of watched ids, build `changedIds`, fetch FULL
+ * rows only when non-empty, and emit a `patch` per id whose version advanced
+ * past the sub's `lastSent`. A SECOND pass groups subs by filter signature, runs
+ * ONE `countAndToken` per signature, and emits a `meta` when a sub's `total` or
+ * `token` moved (the count signal — NOT a membership stream; the frozen page's
+ * changed rows are never sent). The world rev stamped on every patch is the
+ * GLOBAL reducer cursor — distinct from the per-row `version` column.
  *
- * 1. Read world rev once → the GLOBAL reducer cursor stamped on every `patch`
- *    emitted this tick. Distinct from the per-row `version` column the diff
- *    fires on (for jobs both happen to be `last_event_id`; do not conflate).
- * 2. Iterate the union `(sock, subId, sub)` across every connection's `subs`
- *    map (a conn with no subs contributes nothing). Group by `sub.collection`.
- * 3. Per group: read the union of watched ids across all SUBS in the group,
- *    then VERSION-PROBE the full set via `selectVersionsByIds` — cheap
- *    (`pk, version` only, no JSON decode). Compare each sub's `lastSent[id]`
- *    against the probed version across ALL subs (no pending skip in this
- *    loop) to build `changedIds`.
- * 4. If `changedIds` is non-empty, fetch the FULL rows for just those ids via
- *    `selectByIds([...changedIds])` and index by the descriptor's pk. If
- *    `changedIds` is empty, skip the second SELECT entirely (idle tick).
- * 5. For each non-pending sock-sub pair, for each watched id: push a
- *    `patch{collection, rev, row, [id]}` ONLY when `row[descriptor.version] >
- *    sub.lastSent[id]`, then bump `sub.lastSent`. The patch carries `id` when
- *    `subId !== null` (multi-sub routing); legacy anonymous subs (subId
- *    null) emit without `id`, transparent to old clients. No patch when
- *    equal — the diff is state-based, so multiple folds between ticks
- *    collapse to one push (coalescing, no event queue).
- * 6. SECOND pass — membership staleness. Group the live `(sock, sub)` pairs
- *    by filter signature `[collection, clause, params]`, run ONE
- *    `countAndToken` per distinct signature (mirroring the one-`selectByIds`
- *    -per-collection sharing above), and fan `{total, token}` out: emit a
- *    `meta` frame to each sub whose `total` or `token` moved since its last
- *    (carrying `id` when `subId !== null`), then advance the sub's
- *    `lastTotal`/`lastToken`. This is the count signal — NOT a membership
- *    stream; the changed rows are never sent (frozen page).
+ * The diff is state-based: multiple folds between ticks collapse to one push.
+ * Backpressure is SOCKET-LEVEL — a conn with a pending write is SKIPPED for the
+ * tick (all its subs together) without advancing any baseline, so the next tick
+ * re-reflects current state and nothing is lost.
  *
- * Backpressure (socket-level): a connection with a pending (backpressured)
- * write is SKIPPED for the tick — ALL subs on that socket together, since the
- * outbound buffer is the shared resource being protected. Neither
- * `sub.lastSent` (patch pass) nor `sub.lastTotal`/`sub.lastToken` (meta pass)
- * advance for any sub on a skipped socket, so the next tick re-reflects
- * current state and nothing is lost.
- *
- * Reads the collection table only (never `events`). The self-correcting race —
- * a poll landing after a hook `events` INSERT but before the reducer folds —
- * sees no projection change; the fold is itself a commit that re-bumps
- * `data_version`, so the next poll catches it.
- *
- * Exported so the loop can be driven directly in tests without a real socket.
+ * Reads the collection table only (never `events`). A poll landing after a hook
+ * `events` INSERT but before the fold sees no projection change; the fold is
+ * itself a commit that re-bumps `data_version`, so the next poll catches it.
  */
 export function diffTick(db: Database, conns: Iterable<Writable>): void {
   const list = [...conns];
@@ -2159,12 +1904,9 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     return;
   }
 
-  // fn-723 task .2 / fn-767 — connection-hygiene reapers. These run BEFORE the
-  // `byCollection.size === 0` early return so a zero-sub conn is still swept.
-  // Both also run on every poll tick via `reapConns` (fn-767 — `pollLoop`
-  // hoists them out of the changed-tick gate); the calls here additionally
-  // cover the `handleKick` path. Eviction is idempotent (`conns.delete` on the
-  // Bun `close` handler), so a double-fire is a safe no-op.
+  // Connection-hygiene reapers run BEFORE the `byCollection.size === 0` early
+  // return so a zero-sub conn is still swept. Also run every poll tick via
+  // `reapConns`; the call here covers the `handleKick` path. Idempotent.
   reapConns(list);
 
   // Build the flat list of (sock, subId, sub) triples across all conns and
@@ -2187,12 +1929,8 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
     return;
   }
 
-  // Staged timing — same ternary-gated `performance.now()` discipline as
-  // `runQuery`. Per-collection-group sub-stages accumulate into the running
-  // totals (`_acc*`) so the emitted line is one tick's total cost, not one
-  // collection's. Stages map verbatim to the source-code call sites; decode
-  // is bundled inside `selectByIds` per src/collections.ts and is not broken
-  // out separately. Stage names are also used in the threshold gate below.
+  // Staged timing — ternary-gated `performance.now()` as in `runQuery`.
+  // Per-group sub-stages accumulate into `_acc*` so the line is one tick's total.
   const _tStart = TRACE ? performance.now() : 0;
 
   const rev = readWorldRevOnce(db);
@@ -2210,55 +1948,40 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       continue;
     }
     const _g0 = TRACE ? performance.now() : 0;
-    // unionWatched takes SubStates directly (not Writables) — the (collection,
-    // sub) binding is already made by the grouping above.
     const ids = unionWatched(group.map((t) => t.sub));
     const _g1 = TRACE ? performance.now() : 0;
     if (TRACE) _accUnion += _g1 - _g0;
     if (ids.length === 0) {
       continue;
     }
-    // Stage 2 — version probe. Read only `(pk, version)` for every watched id
-    // (no row body, no JSON-decode). This is the dominant-cost fix vs the old
-    // shape: ~682 epics × 4 JSON-array columns × every tick of `JSON.parse`
-    // collapses to one cheap projection. Per-sub comparison below builds
-    // `changedIds` and only on a non-empty set do we fetch full rows.
+    // Version probe — read only `(pk, version)` (no row body, no JSON-decode).
+    // The per-sub comparison below builds `changedIds`; only on a non-empty set
+    // do we fetch full rows.
     const versions = selectVersionsByIdsChunked(db, descriptor, ids);
     const _g2 = TRACE ? performance.now() : 0;
     if (TRACE) _accProbe += _g2 - _g1;
 
-    // Stage 3 — compute the set of ids that advanced for ANY sub in the
-    // group. Iterates ALL subs (no `pending` skip in this loop): the skip
-    // belongs only in the fanout below where `lastSent` actually advances.
-    // Skipping pending socks here would deprive a sole backpressured watcher
-    // of the eventual fetch — still eventually-consistent (next tick re-probes
-    // since `lastSent` didn't advance), but adds a tick of drain latency.
-    // Matching today's union-fetch behavior keeps the algorithm shape minimal
-    // and the latency profile identical.
+    // Ids that advanced for ANY sub in the group. Iterates ALL subs (no
+    // `pending` skip here — the skip belongs in the fanout below where
+    // `lastSent` advances; skipping here would add a tick of drain latency for a
+    // sole backpressured watcher).
     const changedIds = new Set<string>();
     for (const { sub } of group) {
       for (const id of sub.watched) {
         const v = versions.get(id);
         const last = sub.lastSent.get(id) ?? -1;
-        // `v === undefined` mirrors today's `!row` guard: a row vanished
-        // (never happens in v1, but defensive). `v === null` mirrors the
-        // existing `version !== null` guard.
+        // `v === undefined` guards a vanished row (defensive); `v === null`
+        // guards a null version.
         if (v !== undefined && v !== null && v > last) {
           changedIds.add(id);
         }
       }
     }
 
-    // Stage 4 — conditional full-row fetch + per-sub fanout. If nothing
-    // changed, skip the second SELECT entirely. The meta second-pass runs
-    // unconditionally below (it's structurally independent).
-    //
-    // Read-snapshot drift: the probe and this fetch are TWO autocommit
-    // queries — a writer commit can land between them, in which case the
-    // second query returns the post-commit shape. Same race class as today's
-    // `readWorldRev` + `selectByIds` sequence; the patch frame carries the
-    // latest row and the world-rev may be one behind. Self-correcting on the
-    // next tick.
+    // Conditional full-row fetch + per-sub fanout (skipped when nothing
+    // changed). Read-snapshot drift: the probe and this fetch are two autocommit
+    // queries, so a writer commit between them returns the post-commit shape —
+    // self-correcting on the next tick.
     if (changedIds.size > 0) {
       const rows = selectByIdsChunked(db, descriptor, [...changedIds]);
       const _g3 = TRACE ? performance.now() : 0;
@@ -2270,13 +1993,9 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       }
 
       for (const { sock, subId, sub } of group) {
-        // Slow consumer: a still-pending write means this socket is
-        // backpressured. Skip it (don't advance any sub's lastSent on this
-        // sock); the next tick re-diffs. The skip is SOCKET-LEVEL —
-        // backpressure protects the conn's outbound buffer, which all subs
-        // on the conn share. The skip lives ONLY here — building
-        // `changedIds` above iterates all subs so the fetch shape mirrors
-        // today's behavior.
+        // Backpressured socket: skip (don't advance any sub's lastSent); the
+        // next tick re-diffs. SOCKET-LEVEL — all subs on the conn share its
+        // outbound buffer.
         if (sock.data.pending) {
           continue;
         }
@@ -2284,9 +2003,7 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
         for (const id of sub.watched) {
           const row = byId.get(id);
           if (!row) {
-            // This sub's id wasn't in `changedIds` (or the row vanished —
-            // defensive, rows are never deleted in v1): nothing to diff,
-            // leave lastSent untouched.
+            // Not in `changedIds` (or vanished — defensive): leave lastSent.
             continue;
           }
           const version = row[descriptor.version] as number | null;
@@ -2314,13 +2031,10 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
   }
   const _tAfterPatch = TRACE ? performance.now() : 0;
 
-  // Second pass: membership-staleness `meta`. Group every live `(sock, sub)`
-  // pair by filter signature so two pairs paging/sorting the same filter
-  // share ONE countAndToken; signature folds in the bound params (so
-  // state=working vs state=stopped don't share) and excludes sort/limit/
-  // offset (so different pages of one filter do share). Pairs from different
-  // socks AND from different subs on the same sock both share when their
-  // filters match.
+  // Second pass: membership-staleness `meta`. Group live `(sock, sub)` pairs by
+  // filter signature so pairs sharing a filter share ONE countAndToken; the
+  // signature folds in bound params but excludes sort/limit/offset (different
+  // pages of one filter share).
   const byFilter = new Map<
     string,
     {
@@ -2358,19 +2072,16 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
       where.params,
     );
     for (const { sock, subId, sub } of pairs) {
-      // Backpressure: skip a pending sock WITHOUT advancing this sub's
-      // baseline, so the signal re-fires next tick (mirrors the patch pass).
-      // Socket-level skip: all subs on this conn are affected together.
+      // Backpressure: skip a pending sock WITHOUT advancing the baseline, so the
+      // signal re-fires next tick (mirrors the patch pass).
       if (sock.data.pending) {
         continue;
       }
       if (total !== sub.lastTotal || token !== sub.lastToken) {
-        // Coalesce the meta EMISSION (fn-697 lever 1): a fresh membership move
-        // within `META_MIN_INTERVAL_MS` of this sub's last emit is DEFERRED so
-        // a fold burst collapses into fewer client-refetch rounds. `Date.now()`
-        // is fine here — the server-worker is the read/serve path, never a fold
-        // (no re-fold determinism concern). The patch pass above stays
-        // immediate; only this meta pass is gated.
+        // Coalesce the meta emission: a move within `META_MIN_INTERVAL_MS` of
+        // this sub's last emit is deferred so a fold burst collapses into fewer
+        // refetch rounds. `Date.now()` is fine — this is the serve path, never a
+        // fold. The patch pass stays immediate; only meta is gated.
         if (Date.now() - sub.lastMetaEmittedAt >= META_MIN_INTERVAL_MS) {
           writeFrames(sock, [
             {
@@ -2381,12 +2092,10 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
               total,
             },
           ]);
-          // CONVERGENCE INVARIANT: advance the baseline AND the emit clock
-          // ONLY on an actual emit. A throttled-away (deferred) move leaves
-          // `lastTotal`/`lastToken` stale on purpose, so the delta persists and
-          // the next eligible diffTick (a kick or the pollLoop convergence
-          // tick) re-detects it and emits the LATEST state — no lost-final-
-          // update.
+          // CONVERGENCE INVARIANT: advance the baseline + emit clock ONLY on an
+          // actual emit, so a throttled-away move leaves the baseline stale on
+          // purpose and the next eligible diffTick re-detects + emits the latest
+          // state (no lost final update).
           sub.lastTotal = total;
           sub.lastToken = token;
           sub.lastMetaEmittedAt = Date.now();
@@ -2398,17 +2107,10 @@ export function diffTick(db: Database, conns: Iterable<Writable>): void {
   }
   const _tEnd = TRACE ? performance.now() : 0;
 
-  // Per-tick gating: only emit when any stage > 5ms OR total > 10ms, mirroring
-  // the existing `pollLoop` sleep-overrun pattern. Without this gate, a 50 ms
-  // poll at rest produces ~1200 lines/minute with tracing on, drowning the
-  // signal we're trying to study. Threshold knob (`KEEPER_TRACE_TICK_MS`) is
-  // a future tuning point if even this gate floods under contention. The col
-  // value is "*" because diffTick spans every collection-group this tick;
-  // per-group breakdown would require N lines per tick — out of scope.
-  //
-  // The TRACE env gate is the outer short-circuit (`if (TRACE && ...)`) so a
-  // TRACE=0 daemon does ZERO stage-delta arithmetic — every `t*` constant is
-  // `0` from the ternaries above and we never enter this branch.
+  // Per-tick gating: emit only when any stage > 5ms OR total > 10ms, or a 50ms
+  // poll at rest floods the log. `col` is "*" because the tick spans every
+  // group. The TRACE env gate short-circuits first so a TRACE=0 daemon does zero
+  // stage arithmetic.
   const _readWorldRevMs = TRACE ? _tAfterRev - _tStart : 0;
   const _metaCountMs = TRACE ? _tEnd - _tAfterPatch : 0;
   const _totalMs = TRACE ? _tEnd - _tStart : 0;
@@ -2467,8 +2169,7 @@ export async function pollLoop(
     await Bun.sleep(interval);
     const _sleepActual = Date.now() - _sleepStart;
     if (_sleepActual > interval + 100) {
-      // The event loop didn't wake us on time — something held it. Likely the
-      // smoking gun for the "epics frame takes 5s" bug.
+      // The event loop didn't wake us on time — something held it.
       if (TRACE)
         srvTs(
           `poll-loop sleep overrun: requested=${interval}ms actual=${_sleepActual}ms`,
@@ -2477,14 +2178,10 @@ export async function pollLoop(
     if (isShutdown()) {
       break;
     }
-    // fn-767 — run the connection-hygiene reapers on EVERY tick, not only on a
-    // `data_version`-changed tick below. The ghost-conn leak class (bursty
-    // one-shot CLI probes that die silently) fills `conns` during DB-quiet
-    // windows — exactly when `data_version` is frozen and the `diffTick` arm
-    // never fires. Hoisting the reap here closes the deferred fn-723 review gap
-    // (the stuck-pending TTL was gated on changed ticks) and drives the new
-    // zero-sub idle sweep. Wrapped no-self-heal: a reap throw must log+continue,
-    // never escape the poll loop (which would crash the worker + bounce launchd).
+    // Run the connection-hygiene reapers on EVERY tick, not only changed ticks:
+    // the ghost-conn leak fills `conns` during DB-quiet windows, when
+    // `data_version` is frozen and the `diffTick` arm never fires. No-self-heal:
+    // a reap throw must log+continue, never escape the poll loop.
     try {
       reapConns([...getConns()]);
     } catch (err) {
@@ -2504,23 +2201,17 @@ export async function pollLoop(
 }
 
 /**
- * Run one `diffTick` in response to main's post-fold `{type:"kick"}` message
- * (fn-694 lever B), wrapped so a throw can NEVER escape the worker's message
- * handler. The handler is in the no-self-heal path: an uncaught throw there
- * crashes the worker, exits the daemon, and bounces launchd — so this
- * swallows any diffTick failure to stderr and continues. The kick does NOT
- * advance `pollLoop`'s local `last`, so the next poll re-diffs harmlessly
- * (diffTick is state-based, version-gated, and idempotent — a kick+poll
- * double-fire emits nothing the second time). Exported so tests can drive the
- * kick branch directly against the `fakeSock`/`watch` harness without a real
- * Worker spawn.
+ * Run one `diffTick` in response to main's post-fold `{type:"kick"}` message,
+ * wrapped so a throw can NEVER escape the message handler (no-self-heal path).
+ * The kick does NOT advance `pollLoop`'s `last`, so the next poll re-diffs
+ * harmlessly (diffTick is state-based and idempotent).
  */
 export function handleKick(db: Database, conns: Iterable<Writable>): void {
   try {
     diffTick(db, conns);
   } catch (err) {
-    // No-self-heal path: log + continue, never propagate. A crashed diffTick
-    // must not take down the worker (and with it, the daemon).
+    // No-self-heal: log + continue. A crashed diffTick must not take down the
+    // worker (and with it, the daemon).
     console.error("[server-worker] kick diffTick failed:", err);
   }
 }
@@ -2546,28 +2237,18 @@ export interface RunningServer {
 }
 
 /**
- * Acquire the lock, unlink any stale socket, bind the UDS, and wire the NDJSON
- * dispatch handlers. Returns a `RunningServer`. The caller owns calling
- * `stop()` on shutdown (the worker `main` and tests both do).
+ * Acquire the lock, unlink any stale socket, bind the UDS, and wire the dispatch
+ * handlers. Returns a `RunningServer`; the caller owns `stop()` on shutdown.
  *
- * Two DB connections cross in here: `db` is the read-only reader (powers
- * `query` / `result` / `patch` / `meta` and `data_version` polling — MUST
- * stay autocommit per the pollLoop contract). `writerDb` is the writer-mode
- * connection RPC handlers write through; the reader's `data_version` poll
- * sees the writer's commits because the two are distinct connections (a same-
- * connection write does not bump `data_version`). The lifetime of both
- * connections belongs to the caller (`main()` opens and closes them); this
- * function only forwards `writerDb` into the dispatch path.
+ * Two DB connections: `db` is the read-only reader (powers query/patch/meta and
+ * `data_version` polling — MUST stay autocommit). `writerDb` is the writer-mode
+ * connection RPC handlers write through; the reader's poll sees the writer's
+ * commits because they are DISTINCT connections (a same-connection write does
+ * not bump `data_version`). Both lifetimes belong to the caller.
  *
- * `bridge` is the worker→main round-trip surface (fn-643 task .4). When
- * present, an `rpc` frame for a method registered in `ASYNC_RPC_REGISTRY`
- * routes through the async dispatch path: the handler awaits a main-thread
- * action via the bridge, and the resulting frame is written back to the
- * connection when the round-trip completes. When absent, async-RPC methods
- * surface as `unknown_method` — the sync test surface stays self-contained.
- *
- * Throws `LockHeldError` if a live instance owns the lock — the caller exits
- * non-zero.
+ * `bridge` is the worker→main round-trip surface; when absent, async-RPC methods
+ * surface as `unknown_method`. Throws `LockHeldError` if a live instance owns
+ * the lock.
  */
 export function startServer(
   db: Database,
@@ -2587,27 +2268,21 @@ export function startServer(
   // Writable so diffTick/writeFrames compose).
   const conns = new Set<Writable>();
 
-  // Per-server-instance result memo (fn-698): N connections issuing an
-  // identical query at the same worldRev share ONE runQuery + ONE serialize and
-  // fan out per-conn pre-serialized result lines. Owned here (not module-global)
-  // so a second server instance in-process never cross-contaminates; threaded
-  // into handleData → dispatchLine on every inbound chunk.
+  // Per-server-instance result memo: N identical queries at one worldRev share
+  // ONE runQuery + ONE serialize. Owned here (not module-global) so a second
+  // in-process server instance never cross-contaminates.
   const memo = newResultMemo();
 
   const listener = Bun.listen<ConnState>({
     unix: sockPath,
     socket: {
       open(socket) {
-        // fn-723 task .2 — max-connection cap. Wrapped in the no-self-heal
-        // try/catch (mirrors handleKick): a throw in the accept path must
-        // log+continue, never crash the worker and bounce the daemon.
+        // No-self-heal try/catch: a throw in the accept path must log+continue.
         try {
           socket.data = newConnState();
           socket.data.id = ++__nextConnId;
           // Reject-new at the cap (NOT LRU-evict — the oldest conn is the legit
-          // long-lived board). Send a `max_connections` error frame then close.
-          // Logged loudly (un-gated): hitting the cap means the reaper regressed
-          // — a healthy daemon never approaches it.
+          // board). Logged loudly: hitting the cap means the reaper regressed.
           if (conns.size >= MAX_CONNECTIONS) {
             console.error(
               `[server-worker] max_connections cap (${MAX_CONNECTIONS}) hit — ` +
@@ -2634,10 +2309,9 @@ export function startServer(
         const id = socket.data.id ?? -1;
         if (TRACE) srvTs(`conn ${id} data chunk=${chunk.length}`);
         const t0 = Date.now();
-        // fn-767 — refresh the idle-sweep clock on every inbound frame so an
-        // actively-querying or mid-handshake conn is never idle-reaped. The
-        // sweep (reapIdleConns) only touches ZERO-sub conns past the TTL; a
-        // one-shot probe that dies silently stops bumping this and ages out.
+        // Refresh the idle-sweep clock on every inbound frame so an actively-
+        // querying conn is never idle-reaped; a silently-dead probe stops
+        // bumping this and ages out.
         socket.data.lastActivityAt = t0;
         handleData(db, socket, chunk, writerDb, bridge, memo);
         const dur = Date.now() - t0;
@@ -2658,11 +2332,9 @@ export function startServer(
         socket.data.pendingSince = null;
       },
       error(socket, err) {
-        // EPIPE/ECONNRESET are the NORMAL shape of a peer (a viewer) going away
-        // — a dead conn the reaper/close path already handles. Logging them as
-        // errors floods the daemon log with non-signal during a viewer-churn
-        // burst (the fn-723 incident class). Demote to TRACE; log anything else
-        // (a genuinely unexpected socket fault) loudly.
+        // EPIPE/ECONNRESET are the NORMAL shape of a peer going away (handled by
+        // the close path); demote to TRACE so a viewer-churn burst doesn't flood
+        // the log. Anything else is a genuine fault — log loudly.
         const code = (err as { code?: unknown } | null)?.code;
         if (code === "EPIPE" || code === "ECONNRESET") {
           if (TRACE) srvTs(`conn ${socket.data?.id ?? -1} peer-gone (${code})`);
@@ -2819,52 +2491,33 @@ function main(): void {
   const lockPath = data.lockPath ?? `${sockPath}.lock`;
 
   // Two connections per worker:
-  //   - `db` (read-only): backs `query` / `result` / `patch` / `meta` and the
-  //     `data_version` poll loop. MUST stay autocommit — a `BEGIN` here freezes
-  //     `data_version` for the connection and the poll goes blind.
-  //   - `writerDb` (writer mode): the RPC handler write surface. Distinct
-  //     connection so the reader's `data_version` poll sees the writer's
-  //     commits (a same-connection write does not bump the counter). Goes
-  //     through `applyPragmas` like every keeper open (`busy_timeout=5000`
-  //     etc), so RPC writes block politely on hook + reducer + planctl-files
-  //     writers instead of erroring `SQLITE_BUSY`.
+  //   - `db` (read-only): backs query/patch/meta + the `data_version` poll. MUST
+  //     stay autocommit — a `BEGIN` freezes `data_version` and the poll goes
+  //     blind.
+  //   - `writerDb` (writer mode): the RPC write surface. DISTINCT connection so
+  //     the reader's poll sees its commits (a same-connection write doesn't bump
+  //     the counter). Goes through `applyPragmas` so RPC writes block politely
+  //     instead of erroring `SQLITE_BUSY`.
   const { db } = openDb(data.dbPath, { readonly: true });
-  // fn-765.3: main is the sole migrator (CLAUDE.md "Migrations") — it has
-  // already converged the schema before spawning this worker. Pass
-  // `migrate: false` so the server-worker's writer connection skips re-running
-  // the full migration ladder on every spawn (pure redundant work; the DDL is
-  // all `IF NOT EXISTS` / version-guarded, so it was a no-op cost, not a
-  // correctness issue).
+  // Main is the sole migrator and has already converged the schema, so
+  // `migrate: false` skips re-running the (idempotent) ladder on every spawn.
   const { db: writerDb } = openDb(data.dbPath, { migrate: false });
 
-  // Install every concrete RPC handler into `RPC_REGISTRY` /
-  // `ASYNC_RPC_REGISTRY`. Side-effect import: a plain `import` of
-  // `src/server-worker.ts` from main/test code is inert (the `isMainThread`
-  // guard skips `main()`), so the registries only fill inside a real worker
-  // spawn. Concrete handlers live in `src/rpc-handlers.ts`; this is the
-  // single install point.
+  // Install every concrete RPC handler. The registries only fill inside a real
+  // worker spawn (the `isMainThread` guard skips `main()` on a plain import).
   installRpcHandlers();
 
-  // Worker→main async-RPC bridge state (fn-643 task .4; extended for
-  // fn-661 task .4 with the autopilot pause/retry pair). Outgoing
-  // request messages ({@link ReplayRequestMessage} /
-  // {@link SetAutopilotPausedRequestMessage} /
-  // {@link RetryDispatchRequestMessage}) await their matching result
-  // reply by correlation id. Resolves the awaiting promise with the
-  // typed `{ok, …}` shape; a timeout rejects with a thrown Error. The
-  // bridge implementation is the SOLE place this worker thread exchanges
+  // Worker→main async-RPC bridge state. Outgoing request messages await their
+  // matching result reply by correlation id, resolving with the typed `{ok, …}`
+  // shape; a timeout rejects. The bridge is the SOLE place this thread exchanges
   // messages with main outside the shutdown / ready protocol.
   type ReplayResolution = {
     ok: boolean;
     recovered_dl_id?: string | null;
     error?: string;
   };
-  /**
-   * Reply shape the two fn-661 bridge calls resolve with — same `{ok,
-   * error?}` two-field union as the replay bridge minus the
-   * dead-letter-specific `recovered_dl_id`. Kept as a single internal
-   * type so both pending-map entries share one resolve signature.
-   */
+  /** Reply shape for the non-replay bridge calls — the replay `{ok, error?}`
+   *  union minus the dead-letter-specific `recovered_dl_id`. */
   type SimpleResolution = {
     ok: boolean;
     error?: string;
@@ -2877,13 +2530,8 @@ function main(): void {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  /**
-   * Pending `set_autopilot_paused` requests, correlated by id. Distinct
-   * map from `pendingReplays` so a stale `replay-result` carrying a
-   * `set-autopilot-paused-request` id can't wrong-resolve the awaiting
-   * promise (the message-kind discrimination on the inbound handler
-   * already separates the two; the separate map is defense-in-depth).
-   */
+  /** Pending `set_autopilot_paused` requests, correlated by id. A distinct map
+   *  per bridge so a stale reply can't wrong-resolve another's promise. */
   const pendingSetPaused = new Map<
     string,
     {
@@ -2901,7 +2549,7 @@ function main(): void {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  /** Pending `set_autopilot_mode` requests, correlated by id (fn-751 task .3). */
+  /** Pending `set_autopilot_mode` requests, correlated by id. */
   const pendingSetMode = new Map<
     string,
     {
@@ -2910,7 +2558,7 @@ function main(): void {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
-  /** Pending `set_epic_armed` requests, correlated by id (fn-751 task .3). */
+  /** Pending `set_epic_armed` requests, correlated by id. */
   const pendingSetArmed = new Map<
     string,
     {
@@ -3053,11 +2701,9 @@ function main(): void {
 
   let stopping = false;
   /**
-   * Resolves once the realtime `pollLoop` has fully exited. `shutdown()` awaits
-   * this BEFORE closing `db`, so an in-flight poll tick (its `query.get()` /
-   * `diffTick` both read `db`) can never race the close — the
-   * "Cannot use a closed database" leak fn-722 task .6 targets. The pollLoop's
-   * `.then` below settles it on loop exit; the `Bun.sleep` fallback bounds the
+   * Resolves once `pollLoop` has fully exited. `shutdown()` awaits this BEFORE
+   * closing `db`, so an in-flight poll tick (which reads `db`) can never race the
+   * close ("Cannot use a closed database"). The `Bun.sleep` fallback bounds the
    * wait so a wedged loop can't block teardown forever.
    */
   let resolvePollDone: (() => void) | null = null;
@@ -3067,12 +2713,10 @@ function main(): void {
 
   const shutdown = async (): Promise<void> => {
     stopping = true; // resolves the poll loop on its next iteration check
-    // Stop accepting + evict conns FIRST so any final diffTick has nothing to
-    // fan out to, then WAIT for the poll loop to observe `stopping` and exit
-    // before closing the connection it reads from. Without this await, the
-    // synchronous `db.close()` below raced a resumed `Bun.sleep` continuation
-    // inside `pollLoop` (its post-sleep `query.get()` reads `db`), throwing
-    // "Cannot use a closed database" out of the worker.
+    // Stop accepting + evict conns FIRST so a final diffTick has nothing to fan
+    // out to, then WAIT for the poll loop to exit before closing the connection
+    // it reads from — without the await, `db.close()` races a resumed pollLoop
+    // tick's `query.get()` ("Cannot use a closed database").
     server.stop();
     await Promise.race([pollDone, Bun.sleep(POLL_DRAIN_DEADLINE_MS)]);
     try {
@@ -3102,21 +2746,16 @@ function main(): void {
         | undefined,
     ) => {
       if (!msg) return;
-      // Discriminate by message kind — every inbound shape carries a
-      // distinct `type` so a stale reply for one bridge can't
-      // wrong-resolve another bridge's awaiting promise.
+      // Discriminate by `type` so a stale reply for one bridge can't
+      // wrong-resolve another's awaiting promise.
       if ((msg as ShutdownMessage).type === "shutdown") {
-        // `shutdown` is async (it awaits the poll loop draining before closing
-        // the DB); fire-and-forget — it ends in `process.exit(0)`.
+        // `shutdown` is async; fire-and-forget — it ends in `process.exit(0)`.
         void shutdown();
         return;
       }
       if ((msg as KickMessage).type === "kick") {
-        // fn-694 lever B fast path: main folded an event and kicked us so we
-        // run diffTick now instead of waiting for the next poll tick. The
-        // try/catch lives in `handleKick` — this handler must never throw
-        // (no-self-heal path). `server.conns` is the same iterable the
-        // backstop pollLoop reads.
+        // Fast path: main folded + kicked so we diffTick now. The try/catch is in
+        // `handleKick` — this handler must never throw (no-self-heal path).
         handleKick(db, server.conns);
         return;
       }
@@ -3124,10 +2763,8 @@ function main(): void {
         const r = msg as ReplayResultMessage;
         const entry = pendingReplays.get(r.id);
         if (!entry) {
-          // Stale reply (correlation id we already timed out / never sent
-          // — should never happen; main only posts in response to our
-          // posts). Silent drop is the right call: there's no awaiting
-          // promise to surface the discrepancy to anyway.
+          // Stale reply (already timed out / never sent). Silent drop — no
+          // awaiting promise to surface it to.
           return;
         }
         pendingReplays.delete(r.id);
@@ -3186,11 +2823,10 @@ function main(): void {
     },
   );
 
-  // Realtime layer: poll data_version and fan committed jobs changes out as
-  // per-entity patches. Runs on the worker's own read-only connection (the same
-  // one serving queries — both are autocommit reads, safe to share). A crash in
-  // the loop is unrecoverable: no self-heal, exit non-zero → LaunchAgent
-  // restart.
+  // Realtime layer: poll data_version and fan committed changes out as
+  // per-entity patches, on the worker's own read-only connection (shared with
+  // query serving — both autocommit reads). A loop crash is unrecoverable: exit
+  // non-zero → LaunchAgent restart.
   pollLoop(
     db,
     () => server.conns,
@@ -3198,9 +2834,8 @@ function main(): void {
     data.pollMs,
   )
     .then(() => {
-      // Clean loop exit (observed `stopping`). Signal `shutdown()` that the
-      // poll connection is idle so it can safely close `db` (fn-722 task .6
-      // closed-db-leak ordering).
+      // Clean loop exit. Signal `shutdown()` that the poll connection is idle so
+      // it can safely close `db`.
       resolvePollDone?.();
     })
     .catch((err) => {

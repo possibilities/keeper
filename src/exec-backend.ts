@@ -1,96 +1,24 @@
 /**
- * `ExecBackend` — narrow interface for the autopilot reconciler's
- * terminal-surface spawn mechanics, plus session-agnostic pane ops used
- * by the `keeper jobs` CLI and the restore-agents replay. Two consumer
- * paths share the single port so the zellij surface has one seam (and
- * tests can inject a fake `spawn`).
+ * `ExecBackend` — terminal-surface spawn port for the autopilot reconciler,
+ * plus session-agnostic pane ops for the `keeper jobs` CLI and restore-agents
+ * replay. A factory with no top-level side effects; tests inject a fake `spawn`
+ * to assert argv without launching real processes.
  *
- * Why a factory (no top-level side effects). The module mirrors
- * `src/live-shell.ts`: import-clean, interface first, `Default*` consts,
- * `create*({deps})` factories. Production callers construct the backend
- * once in the reconciler worker; tests inject a fake `spawn` so argv
- * construction is asserted without launching real processes.
+ * Two op categories share one factory + one set of zellij subprocess plumbing:
+ *   - Session-bound lifecycle (`launch`) drives ONE managed session baked in at
+ *     construction; session-ensure is memoized once and re-minted on a
+ *     session-gone `new-tab`. Launch-window dedup is served by the durable
+ *     `pending_dispatches` projection.
+ *   - Session-agnostic (`focusPane`, `ensureLaunched`) take the target session
+ *     per call. `focusPane` runs NO session-ensure; `ensureLaunched` runs its
+ *     OWN per-call get-or-create sharing no memo with the managed path.
  *
- * Two op categories
- * -----------------
- * The backend port carries two intentionally distinct op categories
- * sharing one factory + one set of zellij subprocess plumbing:
- *
- * 1. **Session-bound lifecycle ops** — `launch`. Drives the autopilot
- *    reconciler against ONE managed zellij session (passed to
- *    `createZellijBackend({ session })`); session-ensure is memoized
- *    once per backend instance and re-minted on a session-gone
- *    `new-tab` failure. The reconciler's contract is "I own this session
- *    and put agent panes into it"; the session id is baked into the
- *    backend at construction so the call sites read clean. Launch-window
- *    dedup is served by the durable `pending_dispatches` projection; the
- *    tab name is a purely cosmetic label no control path reads back.
- * 2. **Session-agnostic ops** — `focusPane(session, paneId)`,
- *    `ensureLaunched(session, argv, cwd, name?)`. These take the target
- *    session PER CALL and operate on (or get-or-create) arbitrary
- *    external sessions — `keeper jobs`'s `v` key focuses the pane the
- *    human's selected job lives in, and the restore-agents util
- *    relaunches each surviving agent back into its original session.
- *    `focusPane` runs NO session-ensure (degrades to `{ ok: false }`
- *    against a missing session); `ensureLaunched` runs its OWN per-call
- *    get-or-create that mirrors the managed session's `attach -b
- *    --forget` + poll logic but shares no memo or orphan-reap state with
- *    it. Construction may omit `session` (it defaults to
- *    `DEFAULT_ZELLIJ_SESSION`) when the consumer only touches this
- *    category — the field is required for the lifecycle ops alone.
- *
- * Public surface
- * --------------
- * - `ExecBackend.launch(argv, name, cwd) -> { ok, error? }` — spawn an
- *   agent in a zellij tab named `name` at `cwd`. Returns a plain
- *   success/failure envelope; no pane id is captured or returned. The
- *   reconciler correlates back to keeperd via the `--name` baked into
- *   `argv` (the `claude --name verb::id`) → SessionStart hook event →
- *   `jobs` projection. Zellij is stateless from autopilot's side; the
- *   only durable spawn signal is the projection edge. The `name` is a
- *   freely-mutable cosmetic label — no control path reads it back.
- * - `ExecBackend.focusPane(session, paneId) -> { ok, error? }` —
- *   session-agnostic. Runs `zellij --session <session> action
- *   focus-pane-id <paneId>`; on success zellij focuses the pane AND
- *   switches to its tab in one shot. Returns the same `LaunchResult`
- *   envelope as `launch` — ENOENT / non-zero exit collapse to
- *   `{ ok: false, error }`, never throws back.
- * - `ExecBackend.ensureLaunched(session, argv, cwd, name?) -> { ok,
- *   error? }` — session-agnostic. Get-or-creates the target `session`
- *   (probe `list-sessions` → `attach -b --forget` + poll only when
- *   absent / EXITED) and launches `argv` in a new tab at `cwd` inside
- *   it. `name` is optional and unset on the restore path (no `--name`
- *   on the tab). Returns the same `LaunchResult` envelope as `launch`;
- *   ENOENT / non-zero exit collapse to `{ ok: false, error }`, never
- *   throws. Shares NO state with the managed `session` memo or its
- *   `pendingOrphanTabId` — per-call orphan reap, per-call session-gone
- *   single-retry. Drives the `restore-agents.ts` util's replay path.
- * - `createZellijBackend({ noteLine, session?, spawn? })` — lazy
- *   session-ensure (memoized once) + `action new-tab --cwd <abs>
- *   --name <name> -- <argv>` for `launch`; session-agnostic ops bypass
- *   the ensure entirely. When the ensure step MINTS the session (vs.
- *   attaching to a listed one), it captures the empty default `Tab #1`
- *   id and the first launch reaps it via `action close-tab-by-id` —
- *   the same builder the orphan default-tab reap inside `launch` /
- *   `ensureLaunched` uses. `session` defaults to `DEFAULT_ZELLIJ_SESSION`
- *   so a consumer touching only `focusPane` constructs with just
- *   `{ noteLine }`.
- * - `resolveExecBackend(deps)` — factory; always returns a zellij
- *   backend. Kept as a thin seam so call sites and tests do not need a
- *   structural rewrite.
- *
- * ENOENT handling (zellij binary not installed): `launch` resolves
- * `{ ok: false, error }` and surfaces the missing-binary line via
- * `noteLine`. The reconciler treats a non-`ok` launch as a sticky
- * `DispatchFailed` per the epic design.
+ * The reconciler correlates a launch back to keeperd via the `--name verb::id`
+ * baked into `argv` → SessionStart hook event → `jobs` projection, never via a
+ * surface ref; zellij is stateless from autopilot's side.
  */
 
-/**
- * Minimal spawn function alias — Bun.spawn-shaped subset the backend
- * needs. Threaded through `deps.spawn` so tests can inject a fake that
- * captures the constructed argv without running a real process.
- * Production defaults to `Bun.spawn`.
- */
+/** Bun.spawn-shaped subset the backend needs; injectable for tests. */
 export type SpawnFn = (
   cmd: string[],
   options: {
@@ -98,10 +26,9 @@ export type SpawnFn = (
     stderr: "pipe" | "ignore";
     stdin: "ignore";
     /**
-     * Optional child env. Omitted on every control command (Bun inherits
-     * `process.env`); set ONLY on the session-mint `attach -b` spawn so
-     * the zellij server — and every pane it later launches — boots with a
-     * color-capable `TERM`/`COLORTERM`. See `ensureSession`.
+     * Set ONLY on the session-mint `attach -b` spawn so the zellij server —
+     * and every pane it later launches — boots with a color-capable
+     * `TERM`/`COLORTERM`. Omitted elsewhere (Bun inherits `process.env`).
      */
     env?: Record<string, string>;
   },
@@ -110,82 +37,32 @@ export type SpawnFn = (
   stdout: ReadableStream | null;
   stderr: ReadableStream | null;
   /**
-   * Force-terminate the child. Surfaced from `Bun.spawn`'s `Subprocess`
-   * so `runCapture` can race `exited` against a kill-timeout and reap the
-   * process instead of awaiting it forever — a wedged `zellij action`
-   * would otherwise freeze the reconciler with no fatalExit (fn-765).
+   * Force-terminate the child so `runCapture` can race `exited` against a
+   * kill-timeout — a wedged `zellij action` would otherwise freeze the
+   * reconciler with no fatalExit covering it.
    */
   kill: (signal?: number) => void;
 };
 
-/**
- * Result envelope from `launch`. `ok: true` means the new-tab spawn
- * exited 0; `ok: false` carries a short `error` description for the
- * reconciler to fold into a `DispatchFailed` event. No pane id, no
- * surface ref — the reconciler correlates via the `--name` baked into
- * `argv` and the resulting `SessionStart` hook event.
- */
+/** `ok: false` carries a short `error` the reconciler folds into a
+ *  `DispatchFailed` event. */
 export type LaunchResult = { ok: true } | { ok: false; error: string };
 
-/**
- * Backend interface — two op categories sharing one port:
- *
- * Session-bound lifecycle op (`launch`) drives the autopilot reconciler
- * against the managed zellij session passed to
- * `createZellijBackend({ session })`. The session is memoized once per
- * backend; agent-pane dispatch goes through this surface. Launch-window
- * dedup is served by the durable `pending_dispatches` projection.
- *
- * Session-agnostic ops (`focusPane`, `ensureLaunched`) take the target
- * session per call. `focusPane` operates on an already-live external
- * session (no session-ensure; missing session → `{ ok: false }`).
- * `ensureLaunched` runs its OWN per-call get-or-create that mirrors
- * the managed ensure path but shares no memo with it, then launches
- * an unnamed tab — driving the restore-agents replay. Used by the
- * `keeper jobs` `v` focus key and `restore-agents.ts`.
- */
 export interface ExecBackend {
-  /** Session-bound lifecycle. Spawn a terminal surface running `argv`
-   *  at `cwd` in a new (unnamed) tab inside the backend's managed
-   *  session. Returns `{ ok: true }` on exit code 0; `{ ok: false,
-   *  error }` on spawn ENOENT or non-zero exit. No pane id is captured
-   *  — the reconciler correlates the dispatch via the `--name verb::id`
-   *  baked into `argv` plus the resulting `SessionStart` hook event in
-   *  the `jobs` projection, not via a surface ref. The `name` arg is
-   *  not forwarded to the zellij tab label (epic fn-711) — it feeds the
+  /** Session-bound. Spawn `argv` at `cwd` in a new unnamed tab in the managed
+   *  session. The `name` arg is NOT forwarded to the tab label — it feeds the
    *  warn/log lines and is the autopilot dedup key only. */
   launch(argv: string[], name: string, cwd: string): Promise<LaunchResult>;
-  /** Session-agnostic. Focus the pane `paneId` inside the external
-   *  `session` via `zellij --session <session> action focus-pane-id
-   *  <paneId>`. Zellij switches the focused pane AND the active tab in
-   *  one shot. Returns `{ ok: true }` on exit 0; `{ ok: false, error }`
-   *  on ENOENT (zellij missing) or non-zero exit (session gone, pane
-   *  unknown). NEVER throws — same envelope shape as `launch` so the
-   *  caller can `await` and pattern-match on `ok`. No session-ensure
-   *  runs; the consumer (`keeper jobs` `v` key) is operating on a
-   *  pane that already exists in some live session. */
+  /** Session-agnostic. Focus `paneId` in an already-live external `session`
+   *  (zellij switches focused pane AND active tab in one shot). No
+   *  session-ensure runs; a missing session → `{ ok: false }`. NEVER throws. */
   focusPane(session: string, paneId: string): Promise<LaunchResult>;
-  /** Session-agnostic. Get-or-create the target `session` (mint via
-   *  `attach -b --forget` + `list-sessions` poll only when absent /
-   *  EXITED — already-live sessions are NEVER `--forget`'d) and launch
-   *  `argv` in a new tab at `cwd` inside it. The tab is unnamed —
-   *  `buildZellijNewTabArgs` omits `--name` when `name` is empty /
-   *  absent, mirroring the restore use case (Chrome-style restore-
-   *  previous-session emits no `verb::id` tab name). Returns the same
-   *  `LaunchResult` envelope as `launch` — exit 0 → `{ ok: true }`;
-   *  ENOENT / non-zero exit → `{ ok: false, error }`; NEVER throws.
-   *
-   *  Shares NO state with the construction-time `session` memo or its
-   *  `pendingOrphanTabId`: this op runs against an arbitrary external
-   *  session per call (the restore-agents util replays into the
-   *  session each agent originally lived in). The mint path is its
-   *  own — the orphan default `Tab #1` is reaped per-call after the
-   *  agent tab lands (only when this op minted the session; an
-   *  already-live session has no orphan to reap). A session-gone
-   *  new-tab stderr (`Session '<n>' not found` / `no active session`)
-   *  triggers a one-shot re-ensure + retry, mirroring `launch`'s
-   *  resilience for the case where the target session died between
-   *  the ensure probe and the new-tab spawn. */
+  /** Session-agnostic. Get-or-create `session` (mint via `attach -b --forget`
+   *  + poll only when absent / EXITED — already-live sessions are NEVER
+   *  `--forget`'d) and launch `argv` in a new tab. The tab is unnamed when
+   *  `name` is empty / absent (the restore path). Shares NO memo with the
+   *  managed `session` — per-call get-or-create + per-call session-gone single
+   *  retry. NEVER throws. */
   ensureLaunched(
     session: string,
     argv: string[],
@@ -193,32 +70,23 @@ export interface ExecBackend {
     name?: string,
   ): Promise<LaunchResult>;
   /**
-   * Session-bound. Enumerate every terminal pane in the managed session
-   * (`list-panes -a -j`) and `close-pane -p` each pane the `predicate`
-   * selects. Drives the fn-724 pause/boot-pause reap: cancel launch-window
-   * zellij surfaces so a pre-pause dispatch intent (zellij execs the new
-   * tab seconds-to-minutes late) cannot escape the pause boundary as a
-   * ghost worker.
+   * Session-bound. `close-pane -p` each pane the `predicate` selects. Drives
+   * the pause/boot-pause reap so a pre-pause dispatch intent (zellij execs the
+   * new tab seconds-to-minutes late) cannot escape the pause as a ghost worker.
    *
-   * The `predicate` is the caller's safety gate — the autopilot worker
-   * passes "verb-prefixed name AND an OPEN `pending_dispatches` row",
-   * NEVER name-alone (a discharged row = a live worker, which must never
-   * be reaped; list-panes lags zellij reality). NEVER throws: a
-   * null/unparseable list-panes snapshot no-ops (`skippedNoSnapshot`),
-   * and a per-pane close failure logs via `noteLine` + continues to the
-   * next candidate. Returns a {@link ReapResult} count envelope.
+   * The `predicate` is the caller's safety gate — it MUST intersect an OPEN
+   * `pending_dispatches` row, NEVER name-alone (a discharged row = a live
+   * worker that must never be reaped; list-panes lags zellij reality). NEVER
+   * throws: a null/unparseable snapshot no-ops (`skippedNoSnapshot`); a
+   * per-pane close failure logs + continues.
    */
   reapSurfaces(predicate: (pane: ZellijPane) => boolean): Promise<ReapResult>;
 }
 
 /**
- * ANSI CSI sequence matcher used by `zellijSessionListed` /
- * `firstTabIdFromListTabs` to strip color codes from zellij's text
- * output (the JSON path doesn't need it). Built via `new RegExp` so
- * the source literal does not contain a control character (biome's
- * `noControlCharactersInRegex` rule). The pattern matches an ESC
- * (0x1B) followed by `[`, a possibly-empty run of digits and
- * semicolons, and a trailing letter terminator.
+ * ANSI CSI matcher stripping color codes from zellij's text output. Built via
+ * `new RegExp` so the source literal carries no control character (biome's
+ * `noControlCharactersInRegex`).
  */
 const ANSI_CSI_RE = new RegExp(
   `${String.fromCharCode(27)}\\[[0-9;]*[A-Za-z]`,
@@ -226,64 +94,44 @@ const ANSI_CSI_RE = new RegExp(
 );
 
 /**
- * Upper bound on a single `runCapture` zellij-subprocess await (fn-765).
- * On expiry the child is force-killed and the op degrades to `null`. ~5s
- * is generous for any `zellij action` / `list-*` / `attach -b` we issue;
- * the value's only job is to keep a wedged zellij server from freezing the
- * reconciler forever (no fatalExit covers that path). Unit: MILLISECONDS
- * (raw `setTimeout` delay) — distinct from the unit-seconds autopilot
- * cooldowns; never compared against those.
+ * Upper bound on a single `runCapture` zellij-subprocess await. On expiry the
+ * child is force-killed and the op degrades to `null`, keeping a wedged zellij
+ * server from freezing the reconciler forever (no fatalExit covers that path).
+ * Unit: MILLISECONDS — never compared against the unit-seconds autopilot
+ * cooldowns.
  */
 const RUN_CAPTURE_TIMEOUT_MS = 5000;
 
-/**
- * Default backend name. Zellij is the only backend; the literal is
- * retained as an exported const so the lockstep `db.ts` site and tests
- * have one source of truth.
- */
+/** Zellij is the only backend; exported as the one source of truth for the
+ *  lockstep `db.ts` site and tests. */
 export const DEFAULT_EXEC_BACKEND = "zellij" as const;
 
-/**
- * Default zellij session name when `zellij_session` is absent or
- * non-string. Matches the README + the epic-spec config example.
- */
+/** Default session when `zellij_session` is absent or non-string. */
 export const DEFAULT_ZELLIJ_SESSION = "autopilot" as const;
 
 /**
- * Zellij backend dependencies. `session` is the managed session name
- * for the session-bound lifecycle op (`launch`); it
- * defaults to `DEFAULT_ZELLIJ_SESSION` so a consumer touching only the
- * session-agnostic ops (`focusPane`) can construct
- * with just `{ noteLine }` — those ops take their target session per
- * call and never read this field. `noteLine` is the lifecycle sidecar
- * sink; `spawn` defaults to `Bun.spawn` and is injectable for tests.
+ * `session` is the managed session for `launch`; it defaults to
+ * `DEFAULT_ZELLIJ_SESSION` so a consumer touching only the session-agnostic
+ * ops can construct with just `{ noteLine }`. `spawn` is injectable for tests.
  */
 export interface ZellijBackendDeps {
   readonly noteLine: (line: string) => void;
   readonly session?: string;
   readonly spawn?: SpawnFn;
-  /**
-   * Override the `runCapture` kill-timeout (fn-765). Defaults to
-   * `RUN_CAPTURE_TIMEOUT_MS` (5s) in production; tests shrink it to pin
-   * the timeout-kill-degrade path without a real 5s wait.
-   */
+  /** Override the `runCapture` kill-timeout; tests shrink it to pin the
+   *  timeout-kill-degrade path without a real 5s wait. */
   readonly captureTimeoutMs?: number;
 }
 
-/**
- * Resolver dependencies. Matches the zellij dep bag minus the required
- * `session` (the resolver fills in `DEFAULT_ZELLIJ_SESSION` when absent).
- */
+/** Zellij dep bag minus the required `session` (the resolver fills in
+ *  `DEFAULT_ZELLIJ_SESSION` when absent). */
 export interface ResolveExecBackendDeps {
   readonly noteLine: (line: string) => void;
   readonly session?: string;
   readonly spawn?: SpawnFn;
 }
 
-/**
- * Read a `ReadableStream` (Bun's spawn stdout/stderr shape) into a
- * string. Returns `""` on null/empty.
- */
+/** Read a `ReadableStream` into a string. Returns `""` on null/empty. */
 async function streamToText(s: ReadableStream | null): Promise<string> {
   if (s == null) {
     return "";
@@ -291,27 +139,17 @@ async function streamToText(s: ReadableStream | null): Promise<string> {
   return new Response(s).text();
 }
 
-/**
- * Default spawn — production's `Bun.spawn`. Kept behind a const so
- * tests can swap it without globals.
- */
 const defaultSpawn: SpawnFn = (cmd, options) =>
   Bun.spawn(cmd, options) as ReturnType<SpawnFn>;
 
 /**
  * Build the zellij `action new-tab` argv. Pure — exported for tests.
  *
- * `argv` is the worker command line as a discrete array (e.g.
- * `[shell, "-l", "-i", "-c", body]`); we pass it after `--` so zellij
- * execs it directly with no shell layer — the OS argv boundary is the
- * safe quoting seam (no injection surface). `dir` MUST be absolute —
- * zellij's `--cwd` does not expand `~`/`$HOME` (issue #2288).
- *
- * `name`, when non-empty, labels the new tab via `--name`. Omitted
- * entirely when empty / absent so zellij assigns its default `Tab #N`.
- * The managed `launch` and restore `ensureLaunched` paths both launch
- * unnamed (epic fn-711); the param is retained for the builder's own
- * unit tests covering both branches.
+ * `argv` is passed after `--` so zellij execs it directly with no shell layer —
+ * the OS argv boundary is the safe quoting seam. `dir` MUST be absolute —
+ * zellij's `--cwd` does not expand `~`/`$HOME` (issue #2288). `name`, when
+ * non-empty, labels the tab via `--name`; omitted otherwise so zellij assigns
+ * its default `Tab #N`.
  */
 export function buildZellijNewTabArgs(
   session: string,
@@ -333,15 +171,7 @@ export function buildZellijNewTabArgs(
   ];
 }
 
-/**
- * Build the zellij `action close-tab-by-id` argv. Pure — exported for
- * tests.
- *
- * Sole caller: the fresh-mint orphan default-tab reap inside
- * `ensureSession` / `ensureSessionFor` — the launch site deliberately
- * closes the known-empty default `Tab #1` zellij creates when a session
- * is first minted, so there's no risk of nuking a shared tab.
- */
+/** Build the zellij `action close-tab-by-id` argv. Pure — exported for tests. */
 export function buildZellijCloseTabArgs(
   session: string,
   windowId: string,
@@ -357,13 +187,10 @@ export function buildZellijCloseTabArgs(
 }
 
 /**
- * Build the zellij `action close-pane -p <paneId>` argv. Pure —
- * exported for tests. Drives the auto-close path: a pane-scoped close
- * leaves any sibling tiled panes intact (zellij auto-closes a tab only
- * when it has zero selectable tiled panes left, per
- * `zellij-server/src/screen.rs:2518-2523`). The reconciler dedup
- * invariant guarantees one agent pane per named tab, so the close
- * always lands the tab too.
+ * Build the zellij `action close-pane -p <paneId>` argv. Pure — exported for
+ * tests. Pane-scoped (not tab-scoped): zellij auto-closes a tab only when it
+ * has zero selectable tiled panes left; the reconciler dedup invariant
+ * guarantees one agent pane per tab, so the close always lands the tab too.
  */
 export function buildZellijClosePaneArgs(
   session: string,
@@ -372,32 +199,21 @@ export function buildZellijClosePaneArgs(
   return ["zellij", "--session", session, "action", "close-pane", "-p", paneId];
 }
 
-/**
- * Build the zellij `list-sessions` argv. Pure — exported for tests.
- */
+/** Build the zellij `list-sessions` argv. Pure — exported for tests. */
 export function buildZellijListSessionsArgs(): string[] {
   return ["zellij", "list-sessions"];
 }
 
-/**
- * Build the zellij `action list-tabs` argv. Pure — exported for tests.
- * Used once per freshly-minted session to capture the default tab's id
- * (the empty `Tab #1` zellij creates) so the first agent launch can
- * reap it — leaving a single named agent tab instead of an orphaned
- * default beside it.
- */
+/** Build the zellij `action list-tabs` argv. Pure — exported for tests. */
 export function buildZellijListTabsArgs(session: string): string[] {
   return ["zellij", "--session", session, "action", "list-tabs"];
 }
 
 /**
- * Parse `action list-tabs` output and return the first tab's stable id.
- * The output is a header row (`TAB_ID  POSITION  NAME`) followed by one
- * whitespace-delimited data row per tab; we skip the header and peel the
- * first column off the first data row. Returns `null` on empty/unparsable
- * output so the caller degrades to "leave the default tab" rather than
- * closing the wrong id. ANSI-stripped for the same colorblindness as
- * `zellijSessionListed`.
+ * Parse `action list-tabs` output (header row `TAB_ID  POSITION  NAME` then one
+ * data row per tab) and return the first tab's stable id. Returns `null` on
+ * empty/unparsable output so the caller leaves the default tab rather than
+ * closing the wrong id. ANSI-stripped.
  */
 export function firstTabIdFromListTabs(text: string): string | null {
   for (const raw of text.split("\n")) {
@@ -414,26 +230,19 @@ export function firstTabIdFromListTabs(text: string): string | null {
 }
 
 /**
- * Build the zellij `action list-panes -a -j` argv. Pure — exported for
- * tests. `-a` means "all panes across all tabs" (without `-a`,
- * `list-panes` defaults to the active tab only). `-j` is JSON output:
- * each pane object carries at minimum `id`, `tab_id`, `tab_name`,
- * `terminal_command`, `exited` — `findPaneById` filters by `id` to
- * lift the tab triple from the payload.
+ * Build the zellij `action list-panes -a -j` argv. Pure — exported for tests.
+ * `-a` is all panes across all tabs (the default is the active tab only); `-j`
+ * is JSON output.
  */
 export function buildZellijListPanesAllJsonArgs(session: string): string[] {
   return ["zellij", "--session", session, "action", "list-panes", "-a", "-j"];
 }
 
 /**
- * Build the zellij `action focus-pane-id <paneId>` argv. Pure —
- * exported for tests. `paneId` is the bare numeric pane id stored as a
- * string (lifted from `ZELLIJ_PANE_ID` by the hook); zellij 0.44.3
- * accepts it verbatim as the argv tail. The session is targeted via
- * `--session <session>`, the same selector used by `list-panes`. On
- * success zellij focuses the pane AND switches to its tab in one shot;
- * the caller (`ExecBackend.focusPane`) inspects the exit code and
- * surfaces `{ ok }` accordingly.
+ * Build the zellij `action focus-pane-id <paneId>` argv. Pure — exported for
+ * tests. `paneId` is the bare numeric id (lifted from `ZELLIJ_PANE_ID`); zellij
+ * accepts it verbatim. On success zellij focuses the pane AND switches to its
+ * tab in one shot.
  */
 export function buildZellijFocusPaneArgs(
   session: string,
@@ -443,13 +252,10 @@ export function buildZellijFocusPaneArgs(
 }
 
 /**
- * Pane record parsed from `list-panes -a -j` output. The full zellij
- * schema is wider (≈30 fields); we only model what
- * `findPaneById` actually reads. `id` is the pane id we filter
- * by (the env-stamped `ZELLIJ_PANE_ID`); `tab_id`, `tab_name`, and
- * `tab_position` are the tab triple lifted onto the jobs row.
- * Other fields kept here for forensic use by callers / tests that
- * want to log them but are otherwise unread by this module.
+ * Pane record parsed from `list-panes -a -j` output — the subset
+ * `findPaneById` reads out of zellij's wider (~30-field) schema. `id` is the
+ * filter key (the env-stamped `ZELLIJ_PANE_ID`); the `tab_*` triple is lifted
+ * onto the jobs row.
  */
 export interface ZellijPane {
   readonly id: string;
@@ -460,15 +266,8 @@ export interface ZellijPane {
   readonly exited?: boolean;
 }
 
-/**
- * Result envelope shared by `list-panes -a -j` finders. Pure type —
- * exported for tests + the `findPaneById` consumer.
- *
- *   - `{ found: "single", pane }` — exactly one match.
- *   - `{ found: "none" }` — zero matches.
- *   - `{ found: "multiple", count }` — more than one match (shouldn't
- *     happen for a unique-id finder; caller decides how to react).
- */
+/** Result envelope shared by `list-panes -a -j` finders. Pure — exported for
+ *  tests + the `findPaneById` consumer. */
 export type FindPaneResult =
   | { found: "single"; pane: ZellijPane }
   | { found: "none" }
@@ -476,8 +275,7 @@ export type FindPaneResult =
 
 /**
  * Parse the JSON stdout of `list-panes -a -j`. Returns `null` on
- * empty/unparseable input — the caller treats `null` as "couldn't
- * read the snapshot, leave it alone" and no-ops the close.
+ * empty/unparseable input — the caller no-ops the close rather than guessing.
  */
 export function parseListPanesJson(text: string): unknown {
   const trimmed = text.trim();
@@ -492,15 +290,9 @@ export function parseListPanesJson(text: string): unknown {
 }
 
 /**
- * Backend env-var metadata for a given backend type. Single source of
- * truth for the env-var NAMES the hook reads on every event (T3) — by
- * funnelling the literals through this seam, the hook stays
- * backend-agnostic and a future tmux/wezterm backend slots in without
- * the hook learning new keys.
- *
- * Defaults to `DEFAULT_EXEC_BACKEND`. For `"zellij"`, returns the
- * official `ZELLIJ_SESSION_NAME` / `ZELLIJ_PANE_ID` env vars zellij
- * stamps into every pane's environment.
+ * Single source of truth for the env-var NAMES the hook reads on every event,
+ * keeping the hook backend-agnostic so a future tmux/wezterm backend slots in
+ * without the hook learning new keys.
  */
 export interface ExecBackendEnvMeta {
   readonly backendType: string;
@@ -517,10 +309,9 @@ export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
       paneIdEnvVar: "ZELLIJ_PANE_ID",
     };
   }
-  // Future backend types slot in here. For now we still return the
-  // backendType verbatim so the caller can log the unknown name; the
-  // env-var fields fall back to the zellij defaults rather than empty
-  // strings, which would silently null out every hook event.
+  // Unknown backend: return its name verbatim for logging but fall back to the
+  // zellij env-var defaults — empty strings would silently null out every hook
+  // event.
   return {
     backendType: t,
     sessionIdEnvVar: "ZELLIJ_SESSION_NAME",
@@ -530,20 +321,12 @@ export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
 
 /**
  * Find a pane whose `id` matches `paneId` in a parsed `list-panes -a -j`
- * payload. Pure — exported for tests. Returns the shared
- * `FindPaneResult` none/single/multiple envelope.
+ * payload. Pure — exported for tests.
  *
- * Identity is the load-bearing concern here: zellij ships `id` as a
- * bare number (e.g. `11`), but the value stored on the events / job row
- * comes from the `ZELLIJ_PANE_ID` env var which is always a string
- * (`"11"`). We normalize both sides to string for comparison so the
- * join lands. Skips `is_plugin === true` panes — the daemon worker
- * only cares about terminal panes (plugin panes carry their own ids in
- * an unrelated namespace and would never appear in `ZELLIJ_PANE_ID`).
- *
- * Multiple matches "shouldn't happen" — pane ids are unique within a
- * zellij session — but we surface the count so the caller can log it
- * rather than guess.
+ * Identity is load-bearing: zellij ships `id` as a bare number but the stored
+ * value comes from `ZELLIJ_PANE_ID` (always a string), so both sides normalize
+ * to string for the join. Skips `is_plugin` panes (their ids live in an
+ * unrelated namespace and never appear in `ZELLIJ_PANE_ID`).
  */
 export function findPaneById(payload: unknown, paneId: string): FindPaneResult {
   const target = String(paneId);
@@ -573,9 +356,8 @@ export function findPaneById(payload: unknown, paneId: string): FindPaneResult {
       typeof rec.tab_name === "string" ? rec.tab_name : undefined;
     const tab_name = tabNameField ?? tabNameHint ?? "";
     matches.push({
-      // Preserve the raw id shape (string-coerced) — this finder is
-      // for env-pane-id matching, not for `close-pane -p`, so we don't
-      // re-normalize to the `terminal_<n>` form.
+      // Preserve the raw (string-coerced) id — this finder is for env-pane-id
+      // matching, not `close-pane -p`, so no `terminal_<n>` normalization.
       id: idStr,
       tab_name,
       tab_id: typeof rec.tab_id === "number" ? rec.tab_id : undefined,
@@ -621,18 +403,11 @@ export function findPaneById(payload: unknown, paneId: string): FindPaneResult {
 }
 
 /**
- * Walk a parsed `list-panes -a -j` payload and return EVERY terminal
- * pane (plugin panes skipped — they carry ids in an unrelated namespace
- * and never name a worker surface). Pure — exported for tests + the
- * `reapSurfaces` predicate path (fn-724).
- *
- * Shares the exact array / object-of-arrays traversal `findPaneById`
- * uses (zellij's JSON is `[pane, …]` in 0.44.3 but the legacy
- * `{tab: [pane, …]}` shape is tolerated, lifting the tab name from the
- * key as a fallback). The pane `id` is string-coerced but NOT
- * `terminal_`-prefixed — that normalization is the close site's job
- * (`closePaneIdForReap`), since `findPaneById`'s env-pane-id match wants
- * the bare form while `close-pane -p` wants the prefixed form.
+ * Walk a parsed `list-panes -a -j` payload and return EVERY terminal pane
+ * (plugin panes skipped). Pure — exported for tests + the `reapSurfaces` path.
+ * Tolerates both the `[pane, …]` and legacy `{tab: [pane, …]}` shapes (lifting
+ * the tab name from the key). The `id` is string-coerced but NOT
+ * `terminal_`-prefixed — that's the close site's job (`closePaneIdForReap`).
  */
 export function collectPanesFromListJson(payload: unknown): ZellijPane[] {
   const matches: ZellijPane[] = [];
@@ -693,30 +468,20 @@ export function collectPanesFromListJson(payload: unknown): ZellijPane[] {
 
 /**
  * Verb-prefixed dispatch-key matcher: `work::<id>` / `close::<id>` — the
- * `--name` the reconciler bakes into the worker argv (`claude … --name
- * work::fn-1-x.1 …`) and the autopilot dedup key. fn-756 dropped `approve`
- * along with the verb, so an `approve::` pane is never minted (and a stale
- * one from before the deploy is left for the human, not name-matched). The
- * id run stops at the first whitespace / quote so the surrounding shell
- * argv (`… --name work::id '/plan:work …'`) peels cleanly — the match never
- * depended on any flag following `--name`, so dropping `--plugin-dir`
- * (fn-10) leaves the peel unchanged.
+ * `--name` the reconciler bakes into the worker argv and the autopilot dedup
+ * key. The id run stops at the first whitespace / quote so the surrounding
+ * shell argv peels cleanly.
  */
 const DISPATCH_KEY_RE = /(work|close)::([^\s'"]+)/;
 
 /**
- * Lift the `verb::id` dispatch key off a pane, or `null` when none is
- * present. Pure — exported for tests. fn-724 reap candidate matcher.
- *
- * Post-fn-711 the zellij TAB is unnamed (`Tab #N`) — the `verb::id`
- * lives ONLY in the pane's `terminal_command` (the `claude --name
- * verb::id` arg). We scan `tab_name` FIRST (so a future named-tab launch
- * path still matches) then fall back to `terminal_command`, returning
- * the first `(work|close)::<id>` token found. The match is the
- * reap CANDIDATE filter only — the safety gate is the caller's open-
- * `pending_dispatches` intersect, never the name alone (list-panes lags
- * zellij reality, so a name match on a live worker MUST NOT authorize a
- * close).
+ * Lift the `verb::id` dispatch key off a pane, or `null` when absent. Pure —
+ * exported for tests. The tab is unnamed, so the key lives in
+ * `terminal_command`; we scan `tab_name` FIRST (so a future named-tab path
+ * still matches) then fall back to it. This is the reap CANDIDATE filter only
+ * — the safety gate is the caller's open-`pending_dispatches` intersect, never
+ * the name alone (list-panes lags zellij reality, so a name match on a live
+ * worker MUST NOT authorize a close).
  */
 export function dispatchKeyForPane(pane: ZellijPane): string | null {
   const fromTab = pane.tab_name.match(DISPATCH_KEY_RE);
@@ -734,26 +499,21 @@ export function dispatchKeyForPane(pane: ZellijPane): string | null {
 }
 
 /**
- * Normalize a `list-panes -a -j` pane `id` (a bare number in zellij
- * 0.44.3, e.g. `"3"`) to the `close-pane -p` selector form
- * (`terminal_<n>`). Idempotent — an already-prefixed id (`terminal_5`)
- * passes through unchanged. Pure — exported for tests. `findPaneById`
- * deliberately keeps the bare form (env-pane-id matching); the reap path
- * is the one consumer that needs the prefixed close selector.
+ * Normalize a bare pane `id` (e.g. `"3"`) to the `close-pane -p` selector form
+ * (`terminal_<n>`). Idempotent. Pure — exported for tests. `findPaneById` keeps
+ * the bare form; the reap path is the one consumer needing the prefixed
+ * selector.
  */
 export function closePaneIdForReap(id: string): string {
   return /^terminal_/.test(id) ? id : `terminal_${id}`;
 }
 
 /**
- * Outcome envelope from {@link ExecBackend.reapSurfaces}. `examined` is
- * the count of terminal panes the list-panes snapshot returned;
- * `reaped` / `failed` partition the panes the predicate selected by the
- * close-pane exit. `skippedNoSnapshot` is `true` when list-panes
- * returned null/unparseable (binary missing, empty output) — the whole
- * reap no-ops rather than guessing. NEVER carries an error: every
- * failure mode degrades into a count + a `noteLine`, so the caller can
- * `await` it inside its no-self-heal try/catch without a throw escaping.
+ * Outcome envelope from {@link ExecBackend.reapSurfaces}. `reaped` / `failed`
+ * partition the predicate-selected panes by close-pane exit.
+ * `skippedNoSnapshot` is `true` when list-panes returned null/unparseable —
+ * the whole reap no-ops rather than guessing. NEVER carries an error: every
+ * failure mode degrades to a count + a `noteLine`.
  */
 export interface ReapResult {
   readonly examined: number;
@@ -762,11 +522,8 @@ export interface ReapResult {
   readonly skippedNoSnapshot: boolean;
 }
 
-/**
- * Resolved tab coordinates for a known (session, paneId). Retained as a
- * pure type exported for the `list-panes -a -j` finder tests (the live
- * tab-resolver consumer was retired with the zellij feed in fn-710).
- */
+/** Resolved tab coordinates for a known (session, paneId). Pure type exported
+ *  for the `list-panes -a -j` finder tests. */
 export interface ResolvedTabCoords {
   readonly tab_id: number | null;
   readonly tab_name: string;
@@ -774,51 +531,34 @@ export interface ResolvedTabCoords {
 }
 
 /**
- * Build the zellij `attach -b --forget <session>` argv. Pure —
- * exported for tests. `-b` creates a detached background session if
- * absent; `--forget` deletes any saved (serialized) session before
- * connecting, so a stale/EXITED corpse is fresh-rebuilt rather than
- * resurrected from a degraded `session-layout.kdl` cache (the
- * root-cause fix for fn-675's bar-less mint). `--forget` is a
- * harmless no-op when no saved session exists, and `ensureSession`
- * short-circuits before this argv when the target is already LIVE —
- * so `--forget` never runs against a live session. We follow with a
- * poll loop in the runtime to beat the #3733 race (`action new-tab`
- * against a not-yet-ready server can no-op).
+ * Build the zellij `attach -b --forget <session>` argv. Pure — exported for
+ * tests. `-b` creates a detached background session if absent; `--forget`
+ * deletes any saved/serialized session first so a stale/EXITED corpse is
+ * fresh-rebuilt rather than resurrected from a degraded `session-layout.kdl`
+ * cache (which produced a bar-less mint). `ensureSession` short-circuits before
+ * this when the target is already LIVE, so `--forget` never runs against a live
+ * session. A poll loop follows in the runtime to beat the #3733 race (`action
+ * new-tab` against a not-yet-ready server can no-op).
  */
 export function buildZellijAttachBgArgs(session: string): string[] {
   return ["zellij", "attach", "-b", "--forget", session];
 }
 
 /**
- * Internal: parse zellij `list-sessions` output and decide whether
- * `session` is already listed AND LIVE. zellij prints one session per
- * line, usually annotated like `autopilot [Created 5s ago]`; we
- * substring-match on the bare name as the first whitespace-delimited
- * token. Robust to ANSI escape codes.
- *
- * A line carrying zellij's EXITED marker (`autopilot [Created 3h ago]
- * (EXITED - attach to resurrect)`) is a CORPSE, not a live server —
- * `action new-tab` against it exits non-zero ("There is no active
- * session!"). We treat such a line as NOT listed so `ensureSession`
- * routes to `attach -b --forget`, which FORGETS the saved session
- * and mints a fresh one (rather than resurrecting the degraded
- * `session-layout.kdl` cache, which produced fn-675's bar-less mint).
+ * Internal: does `list-sessions` output show `session` listed AND LIVE? The
+ * bare name is the first whitespace token. A line carrying zellij's EXITED
+ * marker is a CORPSE (`action new-tab` against it exits non-zero), treated as
+ * NOT listed so `ensureSession` routes to `attach -b --forget` and mints fresh
+ * rather than resurrecting the degraded `session-layout.kdl` cache.
  */
 function zellijSessionListed(text: string, session: string): boolean {
   const lines = text.split("\n");
   for (const raw of lines) {
-    // Strip ANSI CSI sequences (color codes like ESC + `[1m`) so the
-    // name match is colorblind. The regex is built via `new RegExp`
-    // so the source literal does not contain a control character —
-    // biome's lint forbids inline `\x1b` in a regex literal.
     const stripped = raw.replace(ANSI_CSI_RE, "");
     const trimmed = stripped.trim();
     if (trimmed.length === 0) {
       continue;
     }
-    // First whitespace token is the bare session name. ANSI is already
-    // stripped, so the EXITED brand surfaces as a bare `EXITED` token.
     const firstTok = trimmed.split(/\s+/)[0];
     if (firstTok === session && !/\bEXITED\b/.test(trimmed)) {
       return true;
@@ -833,13 +573,10 @@ function delay(ms: number): Promise<void> {
 }
 
 /**
- * Internal: does this `new-tab` stderr mean the target session is gone
- * (rather than some other failure)? zellij prints `Session '<name>' not
- * found. The following sessions are active:` when the session vanished,
- * and `There is no active session!` against an EXITED corpse. Either
- * signature means "re-mint and retry" — any other non-zero exit is a
- * real launch failure we surface as-is. ANSI-tolerant via case-
- * insensitive substring match.
+ * Internal: does this `new-tab` stderr mean the target session is gone? zellij
+ * prints `Session '<name>' not found` when it vanished and `There is no active
+ * session!` against an EXITED corpse — either means re-mint and retry; any
+ * other non-zero exit is a real launch failure surfaced as-is.
  */
 function looksLikeSessionGone(stderr: string): boolean {
   return /not found/i.test(stderr) || /no active session/i.test(stderr);
@@ -847,15 +584,12 @@ function looksLikeSessionGone(stderr: string): boolean {
 
 /**
  * Zellij backend factory. Lazily ensures the session ONCE (memoized
- * `Promise<void>` shared across every `launch` call), then runs
- * `action new-tab --cwd <abs> --name <name> -- <argv>` for launches
- * and `action close-tab-by-id <tabId>` for reaps. No yabai (zellij
- * owns its own layout).
+ * `Promise<void>` shared across every `launch`).
  *
- * #3733 mitigation: after `attach -b <session>` returns, the server is
- * not necessarily ready for actions — the first `new-tab` can no-op
- * silently. We poll `list-sessions` until `session` appears (~50ms
- * interval, ~5s cap) before allowing the first `new-tab` through.
+ * #3733 mitigation: after `attach -b` returns the server is not necessarily
+ * ready for actions — the first `new-tab` can no-op silently. Poll
+ * `list-sessions` until `session` appears (~50ms, ~5s cap) before the first
+ * `new-tab`.
  */
 export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
   const spawn = deps.spawn ?? defaultSpawn;
@@ -874,16 +608,11 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         stdin: "ignore",
         ...(env != null ? { env } : {}),
       });
-      // Bound the await (fn-765): a wedged `zellij action` (server hang,
-      // stuck IPC) would otherwise freeze `proc.exited` forever, and with
-      // it the reconciler — no fatalExit, no recovery. Race the capture
-      // against a kill-timeout: on expiry, force-kill the child and degrade
-      // to `null`, the same envelope ENOENT already returns. Callers
-      // (launch :880, reapSurfaces :968-971) branch on `null` and the
-      // `{ok:false}` envelope, so this never throws past a never-throw
-      // contract; the op retries next cycle. ~5s is generous for any
-      // `zellij action` — a genuinely-slow-but-alive op degrading to
-      // `{ok:false}` is acceptable, a wedged reconciler is not.
+      // Bound the await: a wedged `zellij action` would otherwise freeze
+      // `proc.exited` — and the reconciler — forever with no fatalExit. Race
+      // against a kill-timeout; on expiry force-kill the child and degrade to
+      // `null` (the envelope ENOENT already returns), and the op retries next
+      // cycle.
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timedOut = Symbol("timed-out");
       const timeout = new Promise<typeof timedOut>((resolve) => {
@@ -897,15 +626,13 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         try {
           proc.kill();
         } catch {
-          // Kill best-effort — already-dead child / no-op backend stub.
+          // Best-effort — already-dead child / no-op backend stub.
         }
         deps.noteLine(
           `# warn: zellij subprocess exceeded ${captureTimeoutMs}ms; killed and degrading to null (${args.join(" ")})`,
         );
         return null;
       }
-      // `race` is the exit code; streams have already resolved (or will
-      // immediately, the child exited). Read them now.
       const [stdout, stderr] = await Promise.all([
         streamToText(proc.stdout),
         streamToText(proc.stderr),
@@ -918,22 +645,16 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
   }
 
   /**
-   * Session-parameterized get-or-create. Shared between the managed
-   * `ensureSession` memo (called with the construction `session`) and
-   * the per-call `ensureLaunched` path (called with the caller's
-   * target session). list-sessions probe, `attach -b --forget` mint
-   * when absent/EXITED, color-capable env on the mint spawn, ~50ms poll
-   * up to 5s. A freshly-minted session KEEPS its empty default `Tab #1`
-   * as a permanent keepalive ANCHOR — it is NOT reaped — so the fn-727
-   * completion-reap (which only matches `(work|close)::<id>`
-   * dispatch-key panes) can never empty the session to zero tabs and
-   * collapse it into a re-mint loop. NEVER throws — every failure mode
-   * (binary missing, mint timeout) degrades to a noteLine warn, and the
-   * caller proceeds with the new-tab spawn (which then fails honestly if
-   * the session truly never came up).
+   * Session-parameterized get-or-create, shared between the managed
+   * `ensureSession` memo and the per-call `ensureLaunched` path: list-sessions
+   * probe → `attach -b --forget` mint when absent/EXITED → poll. A freshly-
+   * minted session KEEPS its empty default `Tab #1` as a permanent keepalive
+   * ANCHOR — never reaped — so the completion-reap (which only matches
+   * dispatch-key panes) can never empty the session to zero tabs and collapse
+   * it into a re-mint loop. NEVER throws — every failure mode degrades to a
+   * noteLine warn and the caller proceeds with the new-tab spawn.
    */
   async function ensureSessionFor(targetSession: string): Promise<void> {
-    // Probe first — a session already listed is the steady state.
     const listed = await runCapture(buildZellijListSessionsArgs());
     if (listed == null) {
       deps.noteLine(
@@ -945,21 +666,13 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       // Pre-existing live session — never `--forget` it; nothing minted.
       return;
     }
-    // Not listed (absent OR EXITED corpse) — fire
-    // `attach -b --forget <session>` to FORGET any saved/serialized
-    // session and mint a fresh detached background session, then
-    // poll `list-sessions` until it appears. `--forget` defeats the
-    // bar-less resurrection from a degraded `session-layout.kdl`
-    // cache (fn-675); it is a harmless no-op when nothing is saved.
-    //
-    // The zellij server inherits THIS spawn's env, and every pane it
-    // later launches inherits the server's. keeperd runs as a
-    // LaunchAgent whose env is stripped to `PATH` (no `TERM`/
-    // `COLORTERM`), so a session minted here would render every worker
-    // pane colorblind. Carry color-capable defaults — preserving a real
-    // terminal's values on the off chance one exists (tests, a future
-    // non-LaunchAgent run) — so the autopilot worker's `claude` TUI
-    // shows color. Spread `process.env` first to keep `PATH` et al.
+    // Not listed (absent OR EXITED corpse) — `attach -b --forget` to mint a
+    // fresh detached session, then poll until it appears. The zellij server
+    // inherits THIS spawn's env, and every pane it later launches inherits the
+    // server's; keeperd runs as a LaunchAgent with env stripped to `PATH`, so a
+    // session minted here would render every worker pane colorblind. Carry
+    // color-capable defaults (preserving a real terminal's values when one
+    // exists). Spread `process.env` first to keep `PATH` et al.
     await runCapture(buildZellijAttachBgArgs(targetSession), {
       ...(process.env as Record<string, string>),
       TERM: process.env.TERM ?? "xterm-256color",
@@ -969,12 +682,8 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
     while (Date.now() < deadline) {
       const probe = await runCapture(buildZellijListSessionsArgs());
       if (probe != null && zellijSessionListed(probe.stdout, targetSession)) {
-        // Freshly minted and live. zellij leaves an empty default
-        // `Tab #1`; we KEEP it as the session's keepalive ANCHOR rather
-        // than reaping it. It carries no dispatch key, so the fn-727
-        // completion-reap never touches it, and its presence stops the
-        // session collapsing to zero tabs when every agent tab is
-        // completion-reaped. (Reaping it was the re-mint-loop bug.)
+        // Freshly minted and live. zellij's empty default `Tab #1` is KEPT as
+        // the keepalive anchor — see above.
         return;
       }
       await delay(50);
@@ -1002,15 +711,11 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       await ensureSession();
       const args = buildZellijNewTabArgs(session, cwd, argv);
       let res = await runCapture(args);
-      // The memoized session can die out from under us — zellij exits a
-      // session when its last tab closes, and a reboot/kill drops it too.
-      // A stale `sessionReady` memo would then wedge EVERY future dispatch
-      // ("Session '<name>' not found") until the daemon restarts. On a
-      // session-gone new-tab failure, invalidate the memo, re-ensure
-      // (which re-mints via `attach -b --forget` + poll, re-capturing
-      // any orphan default tab), and retry the new-tab exactly once.
-      // The success
-      // path keeps the memo untouched (one list-sessions per worker life).
+      // The memoized session can die out from under us (last tab closed,
+      // reboot, kill); a stale `sessionReady` memo would then wedge EVERY
+      // future dispatch until restart. On a session-gone new-tab failure,
+      // invalidate the memo, re-ensure, and retry exactly once. The success
+      // path keeps the memo untouched.
       if (
         res != null &&
         res.exitCode !== 0 &&
@@ -1036,20 +741,14 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         deps.noteLine(`# warn: ${error}`);
         return { ok: false, error };
       }
-      // The fresh-mint default `Tab #1` is intentionally NOT reaped — it
-      // is the session's keepalive anchor (see `ensureSessionFor`).
-      // Reaping it let the fn-727 completion-reap empty the session to
-      // zero tabs and collapse it into a re-mint loop.
       return { ok: true };
     },
     async focusPane(
       targetSession: string,
       paneId: string,
     ): Promise<LaunchResult> {
-      // Session-agnostic — operates on already-live external sessions.
-      // No `ensureSession` call: a missing session degrades to a
-      // non-zero exit and we surface `{ ok: false, error }` rather than
-      // minting a session we'd never use again.
+      // Session-agnostic, no `ensureSession`: a missing session degrades to a
+      // non-zero exit → `{ ok: false }` rather than minting one we'd never use.
       const args = buildZellijFocusPaneArgs(targetSession, paneId);
       const res = await runCapture(args);
       if (res == null) {
@@ -1070,20 +769,13 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
       cwd: string,
       name?: string,
     ): Promise<LaunchResult> {
-      // Session-agnostic get-or-create + launch. Mirrors `launch`'s
-      // shape (ensure → new-tab → session-gone single retry) but
-      // parameterized by `targetSession` and with no `sessionReady`
-      // memo. The fresh-mint default `Tab #1` is kept as the session's
-      // keepalive anchor (see `ensureSessionFor`), never reaped.
+      // Session-agnostic get-or-create + launch, mirroring `launch`'s shape but
+      // parameterized by `targetSession` with no `sessionReady` memo.
       await ensureSessionFor(targetSession);
       const args = buildZellijNewTabArgs(targetSession, cwd, argv, name);
       let res = await runCapture(args);
-      // Session can die between ensure and new-tab (an OS reboot, a
-      // last-tab close, a manual kill). One-shot re-ensure + retry on
-      // the matching stderr signatures. The re-ensure is a fresh
-      // probe → mint cycle (no memo to invalidate), and any orphan
-      // captured on the retry mint REPLACES the original — that's the
-      // tab we then reap below. Any other non-zero exit is a real
+      // Session can die between ensure and new-tab; one-shot re-ensure + retry
+      // on the matching stderr signatures. Any other non-zero exit is a real
       // launch failure surfaced as-is.
       if (
         res != null &&
@@ -1111,27 +803,21 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         deps.noteLine(`# warn: ${error}`);
         return { ok: false, error };
       }
-      // The fresh-mint default `Tab #1` is intentionally NOT reaped — it
-      // is the session's keepalive anchor (see `ensureSessionFor`),
-      // matching the managed `launch` path.
       return { ok: true };
     },
     async reapSurfaces(
       predicate: (pane: ZellijPane) => boolean,
     ): Promise<ReapResult> {
-      // No `ensureSession` — a reap against a session that doesn't exist
-      // has nothing to close (the ghost surfaces we'd reap can only exist
-      // in a live session). list-panes against a gone session returns a
-      // null/non-zero capture → skippedNoSnapshot, a clean no-op.
+      // No `ensureSession` — a reap against a gone session has nothing to
+      // close; list-panes returns a null/non-zero capture → skippedNoSnapshot.
       const listed = await runCapture(buildZellijListPanesAllJsonArgs(session));
       if (listed == null || listed.exitCode !== 0) {
         return { examined: 0, reaped: 0, failed: 0, skippedNoSnapshot: true };
       }
       const parsed = parseListPanesJson(listed.stdout);
       if (parsed == null) {
-        // Empty / unparseable snapshot — leave every pane alone rather
-        // than guess (list-panes lags zellij reality; a bad parse could
-        // strand a live worker if we acted on it).
+        // Empty / unparseable — leave every pane alone (acting on a bad parse
+        // could strand a live worker; list-panes lags zellij reality).
         return { examined: 0, reaped: 0, failed: 0, skippedNoSnapshot: true };
       }
       const panes = collectPanesFromListJson(parsed);
@@ -1141,12 +827,9 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
         if (!predicate(pane)) {
           continue;
         }
-        // One predicate-selected surface → one `close-pane -p
-        // terminal_<id>`. Closing the pane drops its tab too (the
-        // reconciler dedup invariant keeps one agent pane per tab, so a
-        // pane-scoped close lands the tab). Per-pane failures log +
-        // continue so one stuck close never strands the rest — the reap
-        // is best-effort cleanup, not a transaction.
+        // One predicate-selected surface → one `close-pane -p`. Per-pane
+        // failures log + continue so one stuck close never strands the rest —
+        // best-effort cleanup, not a transaction.
         const closeId = closePaneIdForReap(pane.id);
         const res = await runCapture(
           buildZellijClosePaneArgs(session, closeId),
@@ -1177,11 +860,8 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
   };
 }
 
-/**
- * Resolve the exec backend. Zellij is the only backend; the function
- * is retained as a thin seam so the reconciler call site (and future
- * alternative backends) keep one stable entry point.
- */
+/** Resolve the exec backend (always zellij). A thin seam so the reconciler call
+ *  site and future backends keep one stable entry point. */
 export function resolveExecBackend(deps: ResolveExecBackendDeps): ExecBackend {
   return createZellijBackend({
     noteLine: deps.noteLine,
