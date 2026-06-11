@@ -17,6 +17,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
+  BUILDS_DESCRIPTOR,
   DEAD_LETTERS_DESCRIPTOR,
   EPICS_DESCRIPTOR,
   GIT_DESCRIPTOR,
@@ -306,6 +307,49 @@ test("getCollection resolves the pending_dispatches collection (schema v50, fn-6
   // (an unconstrained pane shows the live launch window).
   expect(PENDING_DISPATCHES_DESCRIPTOR.defaultFilter).toBeUndefined();
   expect(PENDING_DISPATCHES_DESCRIPTOR.defaultClause).toBeUndefined();
+});
+
+test("getCollection resolves the builds collection (schema v64, fn-781)", () => {
+  // Schema v64 (epic fn-781 task .1): the `keeper builds` buildbot dashboard
+  // surface. One row per registered builder keyed by builder NAME (`project`),
+  // produced by synthetic `BuildSnapshot` / `BuildDeleted` events.
+  expect(getCollection("builds")).toBe(BUILDS_DESCRIPTOR);
+  expect(BUILDS_DESCRIPTOR.table).toBe("builds");
+  expect(BUILDS_DESCRIPTOR.pk).toBe("project");
+  expect(BUILDS_DESCRIPTOR.version).toBe("last_event_id");
+  // Filter: pk only — the per-builder read narrows on the builder name.
+  expect(BUILDS_DESCRIPTOR.filters.project).toBe("project");
+  // Default sort is stable by pk so the dashboard renders alphabetically.
+  expect(BUILDS_DESCRIPTOR.defaultSort).toEqual({
+    column: "project",
+    dir: "asc",
+  });
+  // No JSON-decoded columns — every persisted field is a scalar.
+  expect(BUILDS_DESCRIPTOR.jsonColumns.size).toBe(0);
+  // Columns include every persisted field byte-for-byte against CREATE_BUILDS.
+  for (const col of [
+    "project",
+    "builder_id",
+    "build_number",
+    "complete",
+    "results",
+    "state_string",
+    "started_at",
+    "complete_at",
+    "last_event_id",
+    "updated_at",
+  ]) {
+    expect(BUILDS_DESCRIPTOR.columns).toContain(col);
+  }
+  // Sortable allowlist covers the human-relevant columns.
+  expect(BUILDS_DESCRIPTOR.sortable.has("project")).toBe(true);
+  expect(BUILDS_DESCRIPTOR.sortable.has("build_number")).toBe(true);
+  expect(BUILDS_DESCRIPTOR.sortable.has("results")).toBe(true);
+  expect(BUILDS_DESCRIPTOR.sortable.has("last_event_id")).toBe(true);
+  expect(BUILDS_DESCRIPTOR.sortable.has("updated_at")).toBe(true);
+  // No defaultFilter / defaultClause — every builder row is interesting.
+  expect(BUILDS_DESCRIPTOR.defaultFilter).toBeUndefined();
+  expect(BUILDS_DESCRIPTOR.defaultClause).toBeUndefined();
 });
 
 test("runQuery pages an empty pending_dispatches collection on a fresh DB (schema v50, fn-678)", () => {

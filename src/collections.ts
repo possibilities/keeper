@@ -522,6 +522,43 @@ export const PENDING_DISPATCHES_DESCRIPTOR: CollectionDescriptor = {
   jsonColumns: new Set(),
 };
 
+/**
+ * The `builds` descriptor — one row per registered buildbot builder, keyed by
+ * builder NAME (`project`). A reducer projection produced by synthetic
+ * `BuildSnapshot` / `BuildDeleted` events; the `keeper builds` dashboard
+ * subscribes over the socket. All scalar columns (no JSON). `version:
+ * 'last_event_id'` so the diff fires on every fold; default sort is stable by
+ * pk so the dashboard renders builders alphabetically.
+ */
+export const BUILDS_DESCRIPTOR: CollectionDescriptor = {
+  name: "builds",
+  table: "builds",
+  columns: [
+    "project",
+    "builder_id",
+    "build_number",
+    "complete",
+    "results",
+    "state_string",
+    "started_at",
+    "complete_at",
+    "last_event_id",
+    "updated_at",
+  ],
+  pk: "project",
+  version: "last_event_id",
+  sortable: new Set([
+    "project",
+    "build_number",
+    "results",
+    "last_event_id",
+    "updated_at",
+  ]),
+  defaultSort: { column: "project", dir: "asc" },
+  filters: { project: "project" },
+  jsonColumns: new Set(),
+};
+
 /** The registry, keyed by wire-facing collection name. */
 export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [JOBS_DESCRIPTOR.name, JOBS_DESCRIPTOR],
@@ -535,6 +572,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [AUTOPILOT_STATE_DESCRIPTOR.name, AUTOPILOT_STATE_DESCRIPTOR],
   [PENDING_DISPATCHES_DESCRIPTOR.name, PENDING_DISPATCHES_DESCRIPTOR],
   [ARMED_EPICS_DESCRIPTOR.name, ARMED_EPICS_DESCRIPTOR],
+  [BUILDS_DESCRIPTOR.name, BUILDS_DESCRIPTOR],
 ]);
 
 /** Resolve a collection name to its descriptor, or `undefined` if unknown. */

@@ -237,6 +237,12 @@ from pathlib import Path
 # worker/closer-done alone with no approval gate. keeper-py reads neither the
 # column nor the predicate, so no reader logic changes — only the version
 # whitelist gains 63.
+#
+# v64 (fn-781 task .1) is also whitelist-only: it adds a new empty ``builds``
+# reducer projection table (the ``keeper builds`` buildbot dashboard surface,
+# fed by synthetic ``BuildSnapshot`` / ``BuildDeleted`` events). keeper-py reads
+# no ``builds`` column (the TUI subscribes over the socket), so no reader logic
+# changes — only the version whitelist gains 64.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -272,6 +278,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         61,
         62,
         63,
+        64,
     }
 )
 

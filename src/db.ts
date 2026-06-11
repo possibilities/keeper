@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 63;
+export const SCHEMA_VERSION = 64;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -834,6 +834,36 @@ CREATE TABLE IF NOT EXISTS armed_epics (
 `;
 
 /**
+ * `builds` projection table — one row per registered buildbot builder, the
+ * `keeper builds` dashboard surface. Keyed by builder NAME (`project`), stable
+ * across master DB rebuilds where the numeric `builder_id` is not. Produced by
+ * synthetic `BuildSnapshot` (UPSERT) / `BuildDeleted` (tombstone DELETE) events
+ * the builds-worker mints from the buildbot REST API. A reducer projection
+ * (re-fold deterministic, in the rewind-and-redrain DELETE list); starts empty
+ * on a fresh DB — no backfill, the live poll repopulates it.
+ *
+ * `results` is NULL while a build is running (`complete:false`); `complete_at`
+ * is NULL until the build finishes. `state_string` is projected for display but
+ * EXCLUDED from the worker change-gate so a running→finished transition emits
+ * exactly two events (start, finish). `updated_at` is the event `ts`, never a
+ * wall-clock read (re-fold determinism).
+ */
+const CREATE_BUILDS = `
+CREATE TABLE IF NOT EXISTS builds (
+    project TEXT PRIMARY KEY,
+    builder_id INTEGER,
+    build_number INTEGER,
+    complete INTEGER,
+    results INTEGER,
+    state_string TEXT,
+    started_at REAL,
+    complete_at REAL,
+    last_event_id INTEGER,
+    updated_at REAL NOT NULL DEFAULT 0
+)
+`;
+
+/**
  * `event_ingest_offsets` — the NDJSON→events ingest cursor, one row per per-pid
  * `<pid>.ndjson` file. The offset advance commits in the SAME `BEGIN IMMEDIATE`
  * as the `events` INSERT — that atomic pairing is exactly-once across watcher
@@ -1365,6 +1395,7 @@ function migrate(db: Database): void {
       db.run(CREATE_DISPATCH_FAILURES);
       db.run(CREATE_AUTOPILOT_STATE);
       db.run(CREATE_ARMED_EPICS);
+      db.run(CREATE_BUILDS);
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_EPIC_TOMBSTONES);
@@ -2729,6 +2760,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM pending_dispatches");
         db.run("DELETE FROM armed_epics");
+        db.run("DELETE FROM builds");
       }
 
       // v42→v43: comment-only no-op — `dispatch_failures` is created above and
@@ -3187,6 +3219,13 @@ function migrate(db: Database): void {
           );
         }
       }
+
+      // v63→v64: add the empty `builds` projection table (the `keeper builds`
+      // buildbot dashboard surface). A reducer projection, in the
+      // rewind-and-redrain DELETE list; created unconditionally above so it
+      // exists before any earlier-version rewind that wipes it. No backfill —
+      // the live builds-worker poll repopulates it from the buildbot REST API.
+      db.run(CREATE_BUILDS);
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
