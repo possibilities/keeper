@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T14:06:56.038286Z",
+  "depends_on": [],
+  "epic": "fn-24-strip-snippet-pipeline",
+  "id": "fn-24-strip-snippet-pipeline.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "medium",
+  "title": "Tear down bundle-health LaunchAgent",
+  "updated_at": "2026-06-11T14:06:56.038286Z"
+}
