@@ -35,5 +35,5 @@ isn't built). Commit to the ~/docs repo.
 - [ ] Committed to the ~/docs repo
 
 ## Done summary
-
+Replaced charter.md ## Sitter facts with the shipped producer's real category list (test/lint/typecheck-failure, build-exception), key scheme (<category>:<sanitized-step>:<builder>), sanitization, and followups path from agents/builds.md; pruned producer-not-built caveats from charter Sitter facts and README. Goals/End-state/Heuristics untouched.
 ## Evidence
