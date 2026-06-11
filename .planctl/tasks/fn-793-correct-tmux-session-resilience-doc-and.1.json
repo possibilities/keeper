@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T23:08:17.586349Z",
+  "depends_on": [],
+  "epic": "fn-793-correct-tmux-session-resilience-doc-and",
+  "id": "fn-793-correct-tmux-session-resilience-doc-and.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Fix tmux retry doc, pin non-retry",
+  "updated_at": "2026-06-11T23:08:17.586349Z"
+}
