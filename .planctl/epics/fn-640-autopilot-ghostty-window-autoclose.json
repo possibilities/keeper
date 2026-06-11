@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-640-autopilot-ghostty-window-autoclose",
+  "branch_name": "main",
   "bundles": [
     "sketch/autopilot-ghostty-window-autoclose"
   ],

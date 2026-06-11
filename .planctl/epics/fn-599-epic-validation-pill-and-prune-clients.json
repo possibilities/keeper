@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-599-epic-validation-pill-and-prune-clients",
+  "branch_name": "main",
   "bundles": [
     "sketch/epics-validation-pill-and-prune-clients"
   ],

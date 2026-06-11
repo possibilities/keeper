@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-600-subagent-invocations-from-events",
+  "branch_name": "main",
   "bundles": [
     "sketch/keeper-subagent-invocations"
   ],

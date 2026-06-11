@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-623-autopilot-completed-on-disappearance",
+  "branch_name": "main",
   "bundles": [
     "sketch/autopilot-completed-on-disappearance"
   ],

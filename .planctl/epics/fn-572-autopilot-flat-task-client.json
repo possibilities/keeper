@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-572-autopilot-flat-task-client",
+  "branch_name": "main",
   "bundles": [
     "sketch/autopilot-flat-task-list"
   ],

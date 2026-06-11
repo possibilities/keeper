@@ -1,7 +1,7 @@
 {
   "approval": "approved",
   "auditor_done_at": "2026-05-20T00:10:21Z",
-  "branch_name": "fn-1-keeper-reducer-v1",
+  "branch_name": "main",
   "bundles": [
     "sketch/keeper-reducer-v1"
   ],

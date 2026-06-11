@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-611-live-tui-mode-for-scripts",
+  "branch_name": "main",
   "bundles": [
     "sketch/scripts-live-tui"
   ],

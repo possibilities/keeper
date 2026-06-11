@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-606-envelope-driven-planctl-op-deriver",
+  "branch_name": "main",
   "bundles": [
     "sketch/planctl-envelope-driven-creator-refiner"
   ],

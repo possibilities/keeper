@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-608-shared-readiness-client-and-autopilot",
+  "branch_name": "main",
   "bundles": [
     "sketch/central-readiness-autopilot-ready-block"
   ],

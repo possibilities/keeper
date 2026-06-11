@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-633-git-per-session-file-attribution",
+  "branch_name": "main",
   "bundles": [
     "sketch/git-surface-rewrite-per-session-attribution"
   ],

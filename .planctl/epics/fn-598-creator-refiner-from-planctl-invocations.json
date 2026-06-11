@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-598-creator-refiner-from-planctl-invocations",
+  "branch_name": "main",
   "bundles": [
     "sketch/keeper-creator-refiner-from-planctl-mutations"
   ],

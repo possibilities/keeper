@@ -1,6 +1,6 @@
 {
   "approval": "approved",
-  "branch_name": "fn-558-keeper-plans-read-surface",
+  "branch_name": "main",
   "bundles": [
     "sketch/planctl-plans-read-surface"
   ],
