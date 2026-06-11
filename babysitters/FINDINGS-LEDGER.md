@@ -1,8 +1,9 @@
 # Babysitter findings-triage contract — the durable ledger
 
 The canonical reference for the per-sitter findings-triage workflow (epic
-`fn-755`). The two arthack commands `/babysit-new <slug>` and `/babysit <slug>`
-implement what this file specifies; the producer side (the sitter that writes
+`fn-755`). The two keeper commands `/babysit-init <slug>` and `/babysit-triage <slug>`
+(shipped under `~/code/keeper/commands/`) implement what this file specifies; the
+producer side (the sitter that writes
 followup files) is documented in `babysitters/agents/<slug>.md`. The schema
 decisions here are authoritative — readers and writers across the epic conform to
 this contract, not to each other.
@@ -42,14 +43,14 @@ machine bookkeeping a `keeper.db` re-fold must never observe.
 ~/docs/babysitters/<slug>/
   charter.md        # goals + evolving understanding + learned heuristics (see below)
   processed.jsonl   # one verdict row per triaged finding (see below)
-  rounds/<ts>.md    # one round write-up per /babysit invocation (<unix-ts>.md)
+  rounds/<ts>.md    # one round write-up per /babysit-triage invocation (<unix-ts>.md)
   README.md         # what this dir is, how the two commands use it
 ```
 
 - `rounds/<ts>.md` — a per-round narrative log (what was triaged, what was routed,
-  cluster summaries). `<ts>` is the `/babysit` invocation's `date +%s`. Append-only
+  cluster summaries). `<ts>` is the `/babysit-triage` invocation's `date +%s`. Append-only
   by convention; one file per round so history is never rewritten.
-- The whole home is created idempotently by `/babysit-new <slug>` and is safe to
+- The whole home is created idempotently by `/babysit-init <slug>` and is safe to
   re-run.
 
 ## `charter.md` — sections
