@@ -56,7 +56,7 @@ def normalize_epic(data: dict) -> dict:
     data.pop("audited_into", None)
     data.pop("auditor_done_at", None)
     if "branch_name" not in data:
-        data["branch_name"] = None
+        data["branch_name"] = "main"
     if "depends_on_epics" not in data:
         data["depends_on_epics"] = []
     if "last_validated_at" not in data:

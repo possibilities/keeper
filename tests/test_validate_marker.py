@@ -521,9 +521,6 @@ def test_all_restamp_verbs_covered():
         "set-primary-repo",
         "set-touched-repos",
         "set-target-repo",
-        # Spec-metadata setters (shared name across task + epic surfaces).
-        "set-snippets",
-        "set-bundles",
         # Whole-tree refine delta (rewrites an existing tree).
         "refine-apply",
     }

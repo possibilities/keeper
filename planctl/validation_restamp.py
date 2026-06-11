@@ -39,11 +39,6 @@ VALIDATION_RESTAMP_VERBS: tuple[str, ...] = (
     "set-primary-repo",
     "set-touched-repos",
     "set-target-repo",
-    # Spec-metadata setters — replacing the snippet/bundle list is a
-    # structural spec change. Shared verb name across the
-    # task and epic surfaces; both re-stamp the marker.
-    "set-snippets",
-    "set-bundles",
     # refine-apply rewrites specs/deps on an EXISTING epic tree (adds,
     # spec-rewrites, dep-rewires, epic-spec rewrite) — a structural change that
     # must re-stamp the marker. This is the core asymmetry with `scaffold`,
@@ -61,7 +56,7 @@ def restamp_epic_or_fail(
 ) -> str:
     """Re-validate the epic on disk and return a fresh stamp, or abort.
 
-    Used by the 14 ``VALIDATION_RESTAMP_VERBS`` runners AFTER they have written
+    Used by the 10 ``VALIDATION_RESTAMP_VERBS`` runners AFTER they have written
     their structural change to disk.  Re-runs the shared per-epic integrity
     check (``planctl.integrity.validate_epic_integrity``) against the post-
     mutation tree.  On a clean result, returns ``now_iso()`` — the caller
@@ -80,7 +75,7 @@ def restamp_epic_or_fail(
     Why post-write rather than pre-write: most callers already mutate task
     JSONs / spec files / epic.touched_repos before they touch
     ``last_validated_at``.  Validating the in-memory plan before write would
-    require each verb to assemble a tree snapshot — symmetric across 14
+    require each verb to assemble a tree snapshot — symmetric across 10
     runners but invasive.  The post-write check is simpler and the worst
     case (writes landed, marker stays stale) is benign: dispatch-observer
     fires soft-disarm, ``epic invalidate`` clears explicitly if desired.

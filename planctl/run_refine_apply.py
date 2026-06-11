@@ -106,7 +106,6 @@ def _is_list_of_str(v: object) -> bool:
 
 
 def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — single transactional flow
-    from planctl.bundle_ref import BUNDLE_REF_RE, SNIPPET_ID_RE
     from planctl.deps import detect_cycles
     from planctl.ids import is_epic_id, is_task_id, scan_max_task_id
     from planctl.models import TASK_TIERS
@@ -286,7 +285,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     new_tiers: list[str] = []
 
     spec_errors: list[str] = []
-    ref_errors: list[str] = []
     dep_errors: list[str] = []
     repo_errors: list[str] = []
     tier_errors: list[str] = []
@@ -321,29 +319,11 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                 spec_errors.append(f"{prefix}: spec invalid: {exc}")
         new_specs.append(spec)
 
-        snippets = entry.get("snippets", [])
-        if not _is_list_of_str(snippets):
-            ref_errors.append(f"{prefix}: `snippets` must be a list of strings")
-            snippets = []
-        else:
-            for snip in snippets:
-                if not SNIPPET_ID_RE.match(snip):
-                    ref_errors.append(
-                        f"{prefix}: snippet id {snip!r} does not match {SNIPPET_ID_RE.pattern}"
-                    )
-        new_snippets_list.append(list(snippets))
-
-        bundles = entry.get("bundles", [])
-        if not _is_list_of_str(bundles):
-            ref_errors.append(f"{prefix}: `bundles` must be a list of strings")
-            bundles = []
-        else:
-            for ref in bundles:
-                if not BUNDLE_REF_RE.match(ref):
-                    ref_errors.append(
-                        f"{prefix}: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
-                    )
-        new_bundles_list.append(list(bundles))
+        # Dormant-seam pass-through: `snippets`/`bundles` persist verbatim into
+        # the new task record, unvalidated — whatever the planner writes is what
+        # lands. No regex gate, no resolution.
+        new_snippets_list.append(entry.get("snippets", []))
+        new_bundles_list.append(entry.get("bundles", []))
 
         deps = entry.get("deps", [])
         if not isinstance(deps, list):
@@ -489,13 +469,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         return _emit_failure(
             "spec_invalid",
             "One or more task specs failed validation",
-            spec_errors + ref_errors + repo_errors + tier_errors,
-        )
-    if ref_errors:
-        return _emit_failure(
-            "ref_invalid",
-            "One or more snippet/bundle refs are invalid",
-            ref_errors + repo_errors + tier_errors,
+            spec_errors + repo_errors + tier_errors,
         )
     if repo_errors:
         return _emit_failure(
@@ -509,78 +483,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             "One or more add_tasks `tier` values are invalid",
             tier_errors,
         )
-
-    # --- Inline `sketch/` refs at write time ----------
-    # Resolve every `sketch/<name>` ref in each add_tasks entry against
-    # the cwd-derived project (where /sketch saved the sketch). Inlined
-    # ids fold into the entry's `snippets`; the sketch ref is dropped
-    # from `bundles` so worker-time `render-spec` never re-resolves it.
-    # The resolver runs in a subprocess (`promptctl inline-sketch-refs`)
-    # — see `planctl/sketch_refs.py` — so planctl carries zero in-repo
-    # Python dependency on promptctl. ONE subprocess call covers every
-    # add_tasks entry; per-slot ref errors map back by ordinal.
-    # `rewrite_specs` / `rewire_deps` carry no bundles fields, and the
-    # `epic.spec` rewrite is markdown-only — neither path needs the
-    # resolver. Collect-all under `ref_invalid` so one envelope surfaces
-    # every offending entry. Tooling failure (spawn/non-zero/timeout/
-    # non-JSON) fails the whole step visibly — distinct from
-    # `ref_invalid`, no fallback.
-    from planctl.sketch_refs import (
-        SketchRefError,
-        SketchToolingError,
-        _OkSlot,
-        inline_sketch_refs_batch,
-    )
-
-    sketch_anchor = ctx.project_path
-
-    sketch_groups: list[dict[str, list[str]]] = [
-        {
-            "bundles": list(new_bundles_list[i - 1]),
-            "snippets": list(new_snippets_list[i - 1]),
-        }
-        for i in range(1, n_new + 1)
-    ]
-
-    if sketch_groups:
-        try:
-            sketch_slots = inline_sketch_refs_batch(
-                sketch_groups, project_root=sketch_anchor
-            )
-        except SketchToolingError as exc:
-            return _emit_failure(
-                "sketch_tooling_failed",
-                "`promptctl inline-sketch-refs` failed to run",
-                [str(exc), exc.stderr] if exc.stderr else [str(exc)],
-            )
-    else:
-        sketch_slots = []
-
-    sketch_errors: list[str] = []
-    resolved_new_bundles_list: list[list[str]] = []
-    resolved_new_snippets_list: list[list[str]] = []
-    for i in range(1, n_new + 1):
-        slot = sketch_slots[i - 1]
-        if isinstance(slot, SketchRefError):
-            sketch_errors.append(
-                f"add_tasks #{i}: sketch ref {slot.ref!r} {slot.reason}"
-            )
-            resolved_new_bundles_list.append(list(new_bundles_list[i - 1]))
-            resolved_new_snippets_list.append(list(new_snippets_list[i - 1]))
-        else:
-            assert isinstance(slot, _OkSlot)
-            resolved_new_bundles_list.append(slot.remaining_bundles)
-            resolved_new_snippets_list.append(slot.merged_snippets)
-
-    if sketch_errors:
-        return _emit_failure(
-            "ref_invalid",
-            "One or more sketch refs failed to resolve",
-            sketch_errors,
-        )
-
-    new_bundles_list = resolved_new_bundles_list
-    new_snippets_list = resolved_new_snippets_list
 
     # ------------------------------------------------------------------
     # Phase 3: allocate new-task ids under the global flock, then resolve

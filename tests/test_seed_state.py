@@ -11,8 +11,6 @@ first.
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from .conftest import seed_state
 from planctl.models import (
     SCHEMA_VERSION,
@@ -110,18 +108,3 @@ def test_isolated_roots_stubs_discovery(isolated_roots):
     from planctl.discovery import discover_projects
 
     assert discover_projects() == []
-
-
-def test_mock_sketch_refs_fakes_spawn(mock_sketch_refs):
-    """``mock_sketch_refs`` intercepts the inline-sketch-refs spawn."""
-    from planctl.sketch_refs import SketchRefError, inline_sketch_refs_batch
-
-    slots = inline_sketch_refs_batch(
-        [{"bundles": ["sketch/x", "bundle/y"], "snippets": ["snippet/a"]}],
-        project_root=Path("/tmp/whatever"),
-    )
-    assert len(mock_sketch_refs) == 1  # spawn happened
-    # The sketch/ ref was dropped; bundle/ ref + snippet survived.
-    assert not isinstance(slots[0], SketchRefError)
-    assert slots[0].remaining_bundles == ["bundle/y"]
-    assert slots[0].merged_snippets == ["snippet/a"]

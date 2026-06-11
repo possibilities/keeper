@@ -226,18 +226,14 @@ YAML schema at a glance:
 ```yaml
 epic:
   title: "Feature title"
-  branch: optional-branch-name        # defaults to epic_id
+  branch: optional-branch-name        # defaults to main
   depends_on_epics: [fn-1-foo, ...]    # optional, existing epic ids
-  snippets: [snippet-id-1, ...]        # optional, kebab-case ids
-  bundles: [bundle/name, sketch/name]  # optional, (bundle|sketch)/<name>[/<name>]
   spec: |
     ## Overview
     ...
 tasks:
   - title: "First task"
     deps: []                           # 1-based ordinals into this list
-    snippets: []
-    bundles: []
     spec: |
       ## Description
       ...
@@ -391,25 +387,20 @@ Materialize a whole epic tree (epic + N tasks + per-task specs + cross-task
 deps) in one transactional call. `--file` accepts `-` to read the YAML from
 stdin (rejected on a TTY; same 1 MiB byte cap as a file path). Strict
 assert-all -> mutate -> emit: every
-check (YAML shape/type, per-task ensure_valid_task_spec, snippet/bundle
-regex, 1-based ordinal range + self-ref, detect_cycles) runs BEFORE any
+check (YAML shape/type, per-task ensure_valid_task_spec, 1-based ordinal range
++ self-ref, detect_cycles) runs BEFORE any
 write; failures emit a structured envelope and write nothing.
 
 YAML schema (top-level mapping):
 
   epic:
     title: <str>                  # required, non-empty
-    branch: <str>                 # optional, defaults to epic_id
+    branch: <str>                 # optional, defaults to main
     depends_on_epics: [<eid>, ...]# optional, existing epic ids (validated upfront)
-    snippets: [<id>, ...]         # optional, kebab-case ids
-    bundles: [<ref>, ...]         # optional, (bundle|sketch)/<name>[/<name>].
-                                  # `sketch/<name>` refs are resolved at write
-                                  # time against the cwd-derived authoring
-                                  # project root and inlined into `snippets`
-                                  # (the ref is dropped from `bundles`) so the
-                                  # epic stays portable across projects; an
-                                  # unresolvable sketch fails as `ref_invalid`
-                                  # in the assert phase.
+    snippets: [<id>, ...]         # optional, dormant — persisted verbatim,
+                                  # unvalidated (see normalize_epic)
+    bundles: [<ref>, ...]         # optional, dormant — persisted verbatim,
+                                  # unvalidated
     queue_jump: <bool>            # optional, default false. A scaffold YAML
                                   # opt-in sets true at mint; can also be flipped post-hoc
                                   # on an existing epic via `planctl epic
@@ -424,8 +415,8 @@ YAML schema (top-level mapping):
       tier: <band>          # required, one of medium|high|xhigh|max.
                             # Missing field is `tier_invalid`.
       deps: [<int>, ...]    # optional, 1-based ordinals into this list
-      snippets: []          # optional
-      bundles: []           # optional
+      snippets: []          # optional, dormant — persisted verbatim, unvalidated
+      bundles: []           # optional, dormant — persisted verbatim, unvalidated
       target_repo: <path>   # optional, absolute path (~ expanded). One task
                             # = one repo (see /plan:plan Phase 6e). Omit to
                             # default to primary_repo. epic.touched_repos is
@@ -462,8 +453,7 @@ Codes: `missing_session_id` (`CLAUDE_CODE_SESSION_ID` unset — scaffold
 cannot build its commit envelope, so it refuses up front rather than writing
 a tree it could not commit), `bad_yaml` (parse/shape/type — includes
 non-string `target_repo` / non-string `tier`), `spec_invalid` (task spec
-malformed), `ref_invalid` (snippet/bundle regex, or a `sketch/<name>` ref
-failed to resolve at write time against the cwd-derived project root),
+malformed),
 `dep_invalid` (out-of-range/self ordinal), `dep_cycle`,
 `epic_dep_invalid` (declared epic.depends_on_epics id malformed / nonexistent /
 duplicated), `repo_invalid` (per-task `target_repo` is relative, empty after
@@ -692,13 +682,8 @@ Delta YAML shape (all four sections optional; supply at least one):
         ## Description
         ...
       deps: [fn-7.1, 2]     # mix existing task ids (str) + 1-based new-ordinal (int)
-      snippets: [...]       # optional
-      bundles: [...]        # optional. `sketch/<name>` refs are inlined into
-                            # `snippets` at write time against the cwd-derived
-                            # authoring project root and dropped from `bundles`;
-                            # an unresolvable sketch fails as
-                            # `ref_invalid` in the assert phase. Applies to
-                            # epic.bundles rewrites as well.
+      snippets: [...]       # optional, dormant — persisted verbatim, unvalidated
+      bundles: [...]        # optional, dormant — persisted verbatim, unvalidated
       target_repo: <path>   # optional, absolute path (~ expanded). One task
                             # = one repo (see /plan:plan Phase 6e). Omit to
                             # default to epic.primary_repo. epic.touched_repos
@@ -716,13 +701,13 @@ No hard task deletion (planctl's graph is append-only). "Retire" a task via a
 `rewrite_specs` entry marking it obsolete + a separate `task reset`.
 
 Assert-all -> mutate -> emit: every check (YAML shape, epic existence, per-spec
-four-section validation, snippet/bundle regex, target-task existence,
+four-section validation, target-task existence,
 post-delta dep existence + new-ordinal range + self-ref, `detect_cycles` on the
 POST-delta graph, new-task id collision) runs upfront and collects ALL errors in
 one pass BEFORE any write; on failure it emits a structured
 `{success:false, error:{code, message, details:[per-entry]}}` envelope (codes
 `bad_yaml` — includes non-string `add_tasks[].target_repo` / non-string
-`add_tasks[].tier`, `epic_not_found`, `spec_invalid`, `ref_invalid`,
+`add_tasks[].tier`, `epic_not_found`, `spec_invalid`,
 `target_invalid`, `dep_invalid`, `dep_cycle`, `repo_invalid` — add_tasks
 `target_repo` is relative, empty after strip, or carries an unresolvable `~`,
 `tier_invalid` — add_tasks `tier` is missing or not one of
@@ -1346,45 +1331,6 @@ def epic_set_touched_repos_cmd(epic_id, paths):
     )
 
 
-@epic_group.command("set-snippets")
-@click.argument("epic_id")
-@click.option(
-    "--snippets",
-    default="",
-    help=(
-        "Comma-separated snippet ids (replaces existing list). "
-        "Empty string or omitted clears the list."
-    ),
-)
-def epic_set_snippets_cmd(epic_id, snippets):
-    """Replace the snippet-id list on an epic (spec metadata)."""
-    return _lazy_import("planctl.run_epic_set_snippets")(
-        epic_id=epic_id, snippets=snippets
-    )
-
-
-@epic_group.command("set-bundles")
-@click.argument("epic_id")
-@click.option(
-    "--bundles",
-    default="",
-    help=(
-        "Comma-separated bundle refs (replaces existing list). "
-        "Each ref: (bundle|sketch)/<name>[/<name>]. "
-        "`sketch/<name>` refs are resolved at write time against the "
-        "cwd-derived authoring project root and inlined into `snippets` "
-        "(dropped from the persisted bundle list) so the record stays "
-        "portable; an unresolvable sketch fails as `ref_invalid`. "
-        "Empty string or omitted clears the list."
-    ),
-)
-def epic_set_bundles_cmd(epic_id, bundles):
-    """Replace the bundle-ref list on an epic (spec metadata)."""
-    return _lazy_import("planctl.run_epic_set_bundles")(
-        epic_id=epic_id, bundles=bundles
-    )
-
-
 # --- Task subgroup ---
 
 
@@ -1413,45 +1359,6 @@ def task_set_acceptance_cmd(task_id, file, message):
     """Set or replace the Acceptance section of a task spec."""
     return _lazy_import("planctl.run_task_set_acceptance")(
         task_id=task_id, file=file, message=message
-    )
-
-
-@task_group.command("set-snippets")
-@click.argument("task_id")
-@click.option(
-    "--snippets",
-    default="",
-    help=(
-        "Comma-separated snippet ids (replaces existing list). "
-        "Empty string or omitted clears the list."
-    ),
-)
-def task_set_snippets_cmd(task_id, snippets):
-    """Replace the snippet-id list on a task (spec metadata)."""
-    return _lazy_import("planctl.run_task_set_snippets")(
-        task_id=task_id, snippets=snippets
-    )
-
-
-@task_group.command("set-bundles")
-@click.argument("task_id")
-@click.option(
-    "--bundles",
-    default="",
-    help=(
-        "Comma-separated bundle refs (replaces existing list). "
-        "Each ref: (bundle|sketch)/<name>[/<name>]. "
-        "`sketch/<name>` refs are resolved at write time against the "
-        "cwd-derived authoring project root and inlined into `snippets` "
-        "(dropped from the persisted bundle list) so the record stays "
-        "portable; an unresolvable sketch fails as `ref_invalid`. "
-        "Empty string or omitted clears the list."
-    ),
-)
-def task_set_bundles_cmd(task_id, bundles):
-    """Replace the bundle-ref list on a task (spec metadata)."""
-    return _lazy_import("planctl.run_task_set_bundles")(
-        task_id=task_id, bundles=bundles
     )
 
 

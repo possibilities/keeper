@@ -4,9 +4,8 @@ Beyond the git-backed ``scaffold`` seeds (``seed_epic`` / ``add_task``), this
 module ships ``seed_state`` — a git-free, CLI-free builder that writes a full
 ``.planctl/`` tree through the same ``normalize_epic`` / ``normalize_task`` +
 ``atomic_write_json`` seams the read path runs, so a seeded tree carries zero
-schema drift. Three fixtures support it: ``isolated_roots`` stubs project
-discovery to ``[]`` so re-stamping verbs skip the real ``~/code`` scan,
-``mock_sketch_refs`` fakes the ``promptctl inline-sketch-refs`` spawn, and
+schema drift. Two fixtures support it: ``isolated_roots`` stubs project
+discovery to ``[]`` so re-stamping verbs skip the real ``~/code`` scan, and
 ``fixed_clock`` pins ``now_iso()`` for deterministic timestamp assertions.
 
 Fast gate (default ``uv run pytest tests/``)
@@ -22,14 +21,12 @@ marker (the ``_mock_autocommit`` template — autouse + early-return on a marker
   ``real_git``).
 * ``_isolated_roots_default`` — forces empty discovery so no test scans the
   real ``~/code`` (opt out: ``real_roots``, against a controlled tmp root).
-* ``_mock_sketch_refs_default`` — fakes the ``inline-sketch-refs`` spawn (opt
-  out: ``real_sketch``).
 * ``project`` / ``multi_repo_project`` write a bare ``.git/`` skeleton instead
   of spawning ``git init`` (opt out: ``real_git``). ``planctl_git_repo`` keeps
   real git.
 
-The slow bucket (markers ``real_git`` / ``integration`` / ``wire`` /
-``real_sketch``) is skip-by-default and re-enabled with
+The slow bucket (markers ``real_git`` / ``integration`` / ``wire``) is
+skip-by-default and re-enabled with
 ``--run-slow`` via the ``pytest_collection_modifyitems`` hook (skip, never
 deselect). The stubs' fidelity against the real binaries is pinned by
 ``wire``-marked contract tests in ``tests/test_stub_contracts.py``.
@@ -70,24 +67,17 @@ def pytest_configure(config):
         "drive real multi-project roots resolution (against a controlled tmp "
         "root, never the real ~/code). Fast-path marker — NOT slow-bucket.",
     )
-    config.addinivalue_line(
-        "markers",
-        "real_sketch: opt out of the autouse sketch-refs stub and spawn the "
-        "real ``promptctl inline-sketch-refs``. Slow bucket: skipped unless "
-        "--run-slow.",
-    )
 
 
 #: Markers that put a test in the skip-by-default slow bucket. Any test
 #: carrying one of these is skipped unless ``--run-slow`` is passed. They name
-#: the spawn-bearing fast-path seams (real git, real sketch, the live wire)
+#: the spawn-bearing fast-path seams (real git, the live wire)
 #: that the fast gate stubs out — so a slow-bucket test is exactly a test that
 #: needs a real subprocess the fast suite refuses to spawn.
 _SLOW_BUCKET_MARKERS = (
     "real_git",
     "integration",
     "wire",
-    "real_sketch",
 )
 
 
@@ -700,95 +690,6 @@ def _isolated_roots_default(request, monkeypatch):
     if request.node.get_closest_marker("real_roots"):
         return
     _patch_isolated_roots(monkeypatch)
-
-
-class _FakeProc:
-    """Mimic the bits of ``CompletedProcess`` that callers read."""
-
-    def __init__(self, *, returncode: int, stdout: str, stderr: str = "") -> None:
-        self.returncode = returncode
-        self.stdout = stdout
-        self.stderr = stderr
-
-
-def _patch_sketch_refs(monkeypatch) -> list[dict]:
-    """Patch the ``promptctl inline-sketch-refs`` spawn; return the ``calls`` log.
-
-    ``planctl.sketch_refs`` does ``import subprocess`` at module scope, so
-    ``planctl.sketch_refs.subprocess`` IS the global module — patching its
-    ``run`` clobbers ``subprocess.run`` process-wide. The fake therefore
-    delegates every NON-``inline-sketch-refs`` command back to the real
-    ``subprocess.run`` (captured before the patch) so git/other spawns in the
-    same test are untouched. Only the ``["promptctl", "inline-sketch-refs", ...]``
-    argv is faked, returning the per-group success-slot JSON array the verb
-    expects (``remaining_bundles`` with every ``sketch/`` ref dropped,
-    ``merged_snippets`` echoing the group's snippets unchanged — no real
-    inlining). The returned ``calls`` list records each faked invocation for
-    opt-in assertions.
-    """
-    import planctl.sketch_refs as _sketch_refs
-
-    calls: list[dict] = []
-    real_run = _sketch_refs.subprocess.run
-
-    def _fake_run(argv, *args, **kwargs):
-        if list(argv[:2]) != ["promptctl", "inline-sketch-refs"]:
-            return real_run(argv, *args, **kwargs)
-        calls.append({"argv": argv, "kwargs": kwargs})
-        groups = json.loads(kwargs["input"]) if kwargs.get("input") else []
-        slots = [
-            {
-                "remaining_bundles": [
-                    ref
-                    for ref in group.get("bundles", [])
-                    if not ref.startswith("sketch/")
-                ],
-                "merged_snippets": list(group.get("snippets", [])),
-            }
-            for group in groups
-        ]
-        return _FakeProc(returncode=0, stdout=json.dumps(slots))
-
-    monkeypatch.setattr(_sketch_refs.subprocess, "run", _fake_run)
-    return calls
-
-
-@pytest.fixture
-def mock_sketch_refs(monkeypatch):
-    """Fake the ``promptctl inline-sketch-refs`` spawn in ``planctl.sketch_refs``.
-
-    Lifts the ``_FakeProc`` / subprocess-patch pattern from
-    ``tests/test_sketch_refs_helper.py``. Replaces
-    ``planctl.sketch_refs.subprocess.run`` with a fake returning a real-shaped
-    ``CompletedProcess``-like object: its stdout is the per-group success-slot
-    JSON array the verb expects (``remaining_bundles`` with every ``sketch/``
-    ref dropped, ``merged_snippets`` echoing the group's snippets unchanged —
-    no real inlining). Only tests that drive ``sketch/`` refs need this:
-    ``bundle/`` refs short-circuit before any spawn.
-
-    Importable opt-in name kept for existing call sites that assert on the
-    returned ``calls`` log; the autouse ``_mock_sketch_refs_default`` applies the
-    same patch by default.
-    """
-    return _patch_sketch_refs(monkeypatch)
-
-
-@pytest.fixture(autouse=True)
-def _mock_sketch_refs_default(request, monkeypatch):
-    """Fake the ``inline-sketch-refs`` spawn by default so no fast-path test spawns it.
-
-    Every bundle-writing verb (``scaffold`` / ``refine-apply`` / ``set-bundles``)
-    shells ``promptctl inline-sketch-refs``. The fast bucket stubs it; the fake
-    is behaviour-neutral for the common ``bundle/``-only and bundle-free cases
-    (no ``sketch/`` refs to inline) and faithful for ``sketch/`` refs (drops the
-    ref, echoes snippets).
-
-    Opt out with ``@pytest.mark.real_sketch`` (slow bucket) to spawn the real
-    binary — for tests pinning the real inline-sketch-refs wire.
-    """
-    if request.node.get_closest_marker("real_sketch"):
-        return
-    _patch_sketch_refs(monkeypatch)
 
 
 @pytest.fixture

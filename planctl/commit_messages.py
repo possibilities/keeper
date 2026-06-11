@@ -61,10 +61,6 @@ VERB_TEMPLATES: dict[str, Callable[[str, str | None], str]] = {
     "set-primary-repo": lambda t, d: _subject("set-primary-repo", t, d),
     "set-touched-repos": lambda t, d: _subject("set-touched-repos", t, d),
     "set-target-repo": lambda t, d: _subject("set-target-repo", t, d),
-    # Spec-metadata setters — shared verb name across the task
-    # and epic surfaces; both join VALIDATION_RESTAMP_VERBS.
-    "set-snippets": lambda t, d: _subject("set-snippets", t, d),
-    "set-bundles": lambda t, d: _subject("set-bundles", t, d),
     # Validate verb (mutating only when --epic is given and marker transitions None → ts)
     "validate": lambda t, d: _subject("validate", t, d),
     # Invalidate verb (explicit clear; primary job is the clear, not a side-effect)

@@ -184,6 +184,41 @@ def test_normalize_task_preserves_existing_bundles():
     assert data["bundles"] == ["bundle/snippeting-main", "sketch/foo"]
 
 
+def test_dormant_lists_survive_normalize_and_json_round_trip():
+    """A record with non-empty snippets/bundles survives normalize + JSON reload.
+
+    The dormant seam's go-forward contract: planctl persists whatever the
+    planner writes into these list fields verbatim, with no validation or
+    transformation, across a full serialize/reload cycle.
+    """
+    epic = {
+        "id": "fn-1-dormant",
+        "title": "Dormant",
+        "status": "open",
+        "snippets": ["snip-a", "snip-b"],
+        "bundles": ["bundle/dev-env", "sketch/anything"],
+    }
+    task = {
+        "id": "fn-1-dormant.1",
+        "epic": "fn-1-dormant",
+        "title": "Task",
+        "snippets": ["task-snip"],
+        "bundles": ["bundle/dev-env"],
+    }
+    normalize_epic(epic)
+    normalize_task(task)
+
+    epic_reloaded = json.loads(json.dumps(epic))
+    task_reloaded = json.loads(json.dumps(task))
+    normalize_epic(epic_reloaded)
+    normalize_task(task_reloaded)
+
+    assert epic_reloaded["snippets"] == ["snip-a", "snip-b"]
+    assert epic_reloaded["bundles"] == ["bundle/dev-env", "sketch/anything"]
+    assert task_reloaded["snippets"] == ["task-snip"]
+    assert task_reloaded["bundles"] == ["bundle/dev-env"]
+
+
 # ---------------------------------------------------------------------------
 # merge_task_state / merge_epic_state — runtime overlay, no approval field.
 # ---------------------------------------------------------------------------

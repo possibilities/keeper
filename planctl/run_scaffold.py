@@ -30,10 +30,6 @@ Codes:
 - ``spec_invalid`` — a task spec failed ``ensure_valid_task_spec``
 - ``dep_invalid`` — out-of-range or self-referential ordinal
 - ``dep_cycle`` — the resolved in-memory graph has a cycle
-- ``ref_invalid`` — snippet/bundle regex rejected a ref, or a ``sketch/<name>``
-  ref failed to resolve at write time against the cwd-derived project root
-  (resolvable sketches inline into the persisted ``snippets`` list so
-  worker-time ``render-spec`` never sees an unresolvable cross-project ref)
 - ``epic_dep_invalid`` — a declared ``epic.depends_on_epics`` id is malformed,
   nonexistent, or duplicated
 - ``repo_invalid`` — per-task ``target_repo`` is relative, empty after strip,
@@ -130,13 +126,13 @@ def validate_scaffold_yaml(
     factored so a CALLER that wants scaffold's structural verdict WITHOUT minting
     anything (``followup submit``'s dry-run) shares the exact leaf checkers
     (:func:`_is_str`, :func:`_is_list_of_str`, :func:`_is_list_of_int`,
-    ``ensure_valid_task_spec``, ``detect_cycles``, the snippet/bundle/tier
-    validators) and the exact failure-code priority order scaffold itself uses.
+    ``ensure_valid_task_spec``, ``detect_cycles``, the tier validator) and the
+    exact failure-code priority order scaffold itself uses.
 
-    It does NOT allocate ids, does NOT inline ``sketch/`` refs (a mint-time
-    subprocess), and does NOT run the filesystem integrity gate (``.git/``
-    presence) — those are mint-only steps. ``check_epic_deps`` controls the lazy
-    ``resolve_epic_globally`` existence pass for declared ``depends_on_epics``.
+    It does NOT allocate ids and does NOT run the filesystem integrity gate
+    (``.git/`` presence) — those are mint-only steps. ``check_epic_deps``
+    controls the lazy ``resolve_epic_globally`` existence pass for declared
+    ``depends_on_epics``.
 
     Returns a :class:`ScaffoldValidation`; the caller maps a failure verdict onto
     its own envelope. Scaffold's own ``run()`` keeps its inline flow (it threads
@@ -144,7 +140,6 @@ def validate_scaffold_yaml(
     carry), so the two stay behavior-identical via a divergence test rather than
     a shared parsed-data return.
     """
-    from planctl.bundle_ref import BUNDLE_REF_RE, SNIPPET_ID_RE
     from planctl.deps import detect_cycles
     from planctl.ids import is_epic_id
     from planctl.models import TASK_TIERS
@@ -220,26 +215,6 @@ def validate_scaffold_yaml(
     if not _is_str(epic_spec):
         errors.append("epic: `spec` must be a string (use a `|` block scalar)")
 
-    epic_snippets = epic_node.get("snippets", [])
-    if not _is_list_of_str(epic_snippets):
-        errors.append("epic: `snippets` must be a list of strings")
-        epic_snippets = []
-    for snip in epic_snippets:
-        if not SNIPPET_ID_RE.match(snip):
-            errors.append(
-                f"epic: snippet id {snip!r} does not match {SNIPPET_ID_RE.pattern}"
-            )
-
-    epic_bundles = epic_node.get("bundles", [])
-    if not _is_list_of_str(epic_bundles):
-        errors.append("epic: `bundles` must be a list of strings")
-        epic_bundles = []
-    for ref in epic_bundles:
-        if not BUNDLE_REF_RE.match(ref):
-            errors.append(
-                f"epic: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
-            )
-
     epic_queue_jump = epic_node.get("queue_jump", False)
     if not isinstance(epic_queue_jump, bool):
         errors.append("epic: `queue_jump` must be a boolean (true|false) when present")
@@ -270,7 +245,6 @@ def validate_scaffold_yaml(
     task_deps_list: list[list[int]] = []
     spec_errors: list[str] = []
     dep_errors: list[str] = []
-    ref_errors: list[str] = []
     repo_errors: list[str] = []
     tier_errors: list[str] = []
 
@@ -293,26 +267,6 @@ def validate_scaffold_yaml(
                 ensure_valid_task_spec(spec)
             except ValueError as exc:
                 spec_errors.append(f"{prefix}: spec invalid: {exc}")
-
-        snippets = entry.get("snippets", [])
-        if not _is_list_of_str(snippets):
-            ref_errors.append(f"{prefix}: `snippets` must be a list of strings")
-        else:
-            for snip in snippets:
-                if not SNIPPET_ID_RE.match(snip):
-                    ref_errors.append(
-                        f"{prefix}: snippet id {snip!r} does not match {SNIPPET_ID_RE.pattern}"
-                    )
-
-        bundles = entry.get("bundles", [])
-        if not _is_list_of_str(bundles):
-            ref_errors.append(f"{prefix}: `bundles` must be a list of strings")
-        else:
-            for ref in bundles:
-                if not BUNDLE_REF_RE.match(ref):
-                    ref_errors.append(
-                        f"{prefix}: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
-                    )
 
         deps = entry.get("deps", [])
         if not _is_list_of_int(deps):
@@ -365,7 +319,6 @@ def validate_scaffold_yaml(
     if errors:
         all_errors = (
             errors
-            + ref_errors
             + spec_errors
             + dep_errors
             + epic_dep_errors
@@ -401,18 +354,6 @@ def validate_scaffold_yaml(
             code="spec_invalid",
             message="One or more task specs failed validation",
             details=spec_errors
-            + ref_errors
-            + dep_errors
-            + epic_dep_errors
-            + repo_errors
-            + tier_errors,
-        )
-    if ref_errors:
-        return ScaffoldValidation(
-            ok=False,
-            code="ref_invalid",
-            message="One or more snippet/bundle refs are invalid",
-            details=ref_errors
             + dep_errors
             + epic_dep_errors
             + repo_errors
@@ -465,7 +406,6 @@ def validate_scaffold_yaml(
 
 
 def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — single transactional flow
-    from planctl.bundle_ref import BUNDLE_REF_RE, SNIPPET_ID_RE
     from planctl.deps import detect_cycles
     from planctl.ids import generate_suffix, is_epic_id, scan_max_epic_id, slugify
     from planctl.models import TASK_TIERS
@@ -615,28 +555,14 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     if not _is_str(epic_spec):
         errors.append("epic: `spec` must be a string (use a `|` block scalar)")
 
+    # Dormant-seam pass-through: `snippets`/`bundles` persist verbatim into the
+    # epic record, unvalidated — whatever the planner writes is what lands. No
+    # regex gate, no resolution.
     epic_snippets = epic_node.get("snippets", [])
-    if not _is_list_of_str(epic_snippets):
-        errors.append("epic: `snippets` must be a list of strings")
-        epic_snippets = []
-    for snip in epic_snippets:
-        if not SNIPPET_ID_RE.match(snip):
-            errors.append(
-                f"epic: snippet id {snip!r} does not match {SNIPPET_ID_RE.pattern}"
-            )
-
     epic_bundles = epic_node.get("bundles", [])
-    if not _is_list_of_str(epic_bundles):
-        errors.append("epic: `bundles` must be a list of strings")
-        epic_bundles = []
-    for ref in epic_bundles:
-        if not BUNDLE_REF_RE.match(ref):
-            errors.append(
-                f"epic: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
-            )
 
     # queue_jump is optional and bool-only. Bucket type errors under
-    # `bad_yaml` (alongside `branch` / `spec` / `snippets` / `bundles`); the
+    # `bad_yaml` (alongside `branch` / `spec`); the
     # missing-key path defaults to False so /plan:defer YAML omitting the key
     # entirely is the canonical "no queue jump" shape. Missing on legacy YAML
     # is normal — only an explicit non-bool value is an error.
@@ -691,7 +617,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
 
     spec_errors: list[str] = []
     dep_errors: list[str] = []
-    ref_errors: list[str] = []
     repo_errors: list[str] = []
     tier_errors: list[str] = []
 
@@ -727,29 +652,11 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
                 spec_errors.append(f"{prefix}: spec invalid: {exc}")
         task_specs.append(spec)
 
-        snippets = entry.get("snippets", [])
-        if not _is_list_of_str(snippets):
-            ref_errors.append(f"{prefix}: `snippets` must be a list of strings")
-            snippets = []
-        else:
-            for snip in snippets:
-                if not SNIPPET_ID_RE.match(snip):
-                    ref_errors.append(
-                        f"{prefix}: snippet id {snip!r} does not match {SNIPPET_ID_RE.pattern}"
-                    )
-        task_snippets_list.append(list(snippets))
-
-        bundles = entry.get("bundles", [])
-        if not _is_list_of_str(bundles):
-            ref_errors.append(f"{prefix}: `bundles` must be a list of strings")
-            bundles = []
-        else:
-            for ref in bundles:
-                if not BUNDLE_REF_RE.match(ref):
-                    ref_errors.append(
-                        f"{prefix}: bundle ref {ref!r} does not match {BUNDLE_REF_RE.pattern}"
-                    )
-        task_bundles_list.append(list(bundles))
+        # Dormant-seam pass-through: `snippets`/`bundles` persist verbatim into
+        # the task record, unvalidated — whatever the planner writes is what
+        # lands. No regex gate, no resolution.
+        task_snippets_list.append(entry.get("snippets", []))
+        task_bundles_list.append(entry.get("bundles", []))
 
         deps = entry.get("deps", [])
         if not _is_list_of_int(deps):
@@ -835,13 +742,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # Decide failure codes in a stable priority order so a single envelope
     # surfaces the dominant class. Other-class errors still appear in details.
     all_errors = (
-        errors
-        + ref_errors
-        + spec_errors
-        + dep_errors
-        + epic_dep_errors
-        + repo_errors
-        + tier_errors
+        errors + spec_errors + dep_errors + epic_dep_errors + repo_errors + tier_errors
     )
     if errors:
         # Shape/type errors short-circuit (`bad_yaml`) — graph integrity below
@@ -888,18 +789,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         return _emit_failure(
             "spec_invalid",
             "One or more task specs failed validation",
-            spec_errors
-            + ref_errors
-            + dep_errors
-            + epic_dep_errors
-            + repo_errors
-            + tier_errors,
-        )
-    if ref_errors:
-        return _emit_failure(
-            "ref_invalid",
-            "One or more snippet/bundle refs are invalid",
-            ref_errors + dep_errors + epic_dep_errors + repo_errors + tier_errors,
+            spec_errors + dep_errors + epic_dep_errors + repo_errors + tier_errors,
         )
     if dep_errors:
         return _emit_failure(
@@ -926,91 +816,9 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
             tier_errors,
         )
 
-    # --- Inline `sketch/` refs at write time ----------
-    # Resolve every `sketch/<name>` ref against the cwd-derived project
-    # (where /sketch saved the sketch). Inlined ids fold into the
-    # record's `snippets`; the sketch ref is dropped from `bundles` so
-    # worker-time `render-spec` never re-resolves it. The resolver runs
-    # in a subprocess (`promptctl inline-sketch-refs`) — see
-    # `planctl/sketch_refs.py` — so planctl carries zero in-repo Python
-    # dependency on promptctl. ONE subprocess call covers the epic +
-    # every task; per-slot ref errors map back by ordinal. Tooling
-    # failure (spawn/non-zero/timeout/non-JSON) fails the whole step
-    # visibly — distinct from `ref_invalid`, no fallback.
-    from planctl.sketch_refs import (
-        SketchRefError,
-        SketchToolingError,
-        _OkSlot,
-        inline_sketch_refs_batch,
-    )
-
+    # Resolve the owning project before the persistence phase consumes its
+    # data_dir / project_path below.
     ctx = resolve_project()
-    sketch_anchor = ctx.project_path
-
-    # Batch shape: slot 0 = epic; slots 1..n_tasks = tasks 1..n_tasks.
-    sketch_groups: list[dict[str, list[str]]] = [
-        {"bundles": list(epic_bundles), "snippets": list(epic_snippets)}
-    ]
-    for i in range(1, n_tasks + 1):
-        sketch_groups.append(
-            {
-                "bundles": list(task_bundles_list[i - 1]),
-                "snippets": list(task_snippets_list[i - 1]),
-            }
-        )
-
-    try:
-        sketch_slots = inline_sketch_refs_batch(
-            sketch_groups, project_root=sketch_anchor
-        )
-    except SketchToolingError as exc:
-        return _emit_failure(
-            "sketch_tooling_failed",
-            "`promptctl inline-sketch-refs` failed to run",
-            [str(exc), exc.stderr] if exc.stderr else [str(exc)],
-        )
-
-    sketch_errors: list[str] = []
-
-    epic_slot = sketch_slots[0]
-    if isinstance(epic_slot, SketchRefError):
-        sketch_errors.append(f"epic: sketch ref {epic_slot.ref!r} {epic_slot.reason}")
-        resolved_epic_bundles = list(epic_bundles)
-        resolved_epic_snippets = list(epic_snippets)
-    else:
-        assert isinstance(epic_slot, _OkSlot)
-        resolved_epic_bundles = epic_slot.remaining_bundles
-        resolved_epic_snippets = epic_slot.merged_snippets
-
-    resolved_task_bundles_list: list[list[str]] = []
-    resolved_task_snippets_list: list[list[str]] = []
-    for i in range(1, n_tasks + 1):
-        task_slot = sketch_slots[i]
-        if isinstance(task_slot, SketchRefError):
-            sketch_errors.append(
-                f"task #{i}: sketch ref {task_slot.ref!r} {task_slot.reason}"
-            )
-            # Preserve the original (bundles, snippets) so collect-all
-            # surfaces every error in one envelope without earlier slots
-            # poisoning later resolution decisions (matches sketch-ref behavior).
-            resolved_task_bundles_list.append(list(task_bundles_list[i - 1]))
-            resolved_task_snippets_list.append(list(task_snippets_list[i - 1]))
-        else:
-            assert isinstance(task_slot, _OkSlot)
-            resolved_task_bundles_list.append(task_slot.remaining_bundles)
-            resolved_task_snippets_list.append(task_slot.merged_snippets)
-
-    if sketch_errors:
-        return _emit_failure(
-            "ref_invalid",
-            "One or more sketch refs failed to resolve",
-            sketch_errors,
-        )
-
-    epic_bundles = resolved_epic_bundles
-    epic_snippets = resolved_epic_snippets
-    task_bundles_list = resolved_task_bundles_list
-    task_snippets_list = resolved_task_snippets_list
 
     # --- Cycle detection on the full in-memory graph ------------------
     # Ordinals are valid (1..N, no self-ref) at this point. Build the graph
@@ -1031,7 +839,6 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
     # ------------------------------------------------------------------
     # Phase 3: allocate ids under the global flock; backstop existence
     # ------------------------------------------------------------------
-    # `ctx` was resolved above for sketch anchoring; reuse it.
     data_dir = ctx.data_dir
     primary_repo = str(ctx.project_path)
 
