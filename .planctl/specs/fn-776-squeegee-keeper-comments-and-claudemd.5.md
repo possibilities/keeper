@@ -27,5 +27,5 @@ Per recipe; test:full mandatory.
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Scrubbed bloat comments from daemon.ts, plan-worker.ts, git-worker.ts, transcript-worker.ts — deleted ~2111 comment lines / ~138.5k chars of provenance ids, incident narration, and code-restating narration. Kept load-bearing constraints (LaunchAgent-only crash recovery + no in-process respawn; external-trees-only watcher carve-out). Verifier-proven comment-only on all four; biome + typecheck + test:full green, zero new failures; biome-ignore directive intact.
 ## Evidence
