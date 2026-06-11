@@ -1,43 +1,22 @@
 /**
- * Transcript worker. keeperd's THIRD Bun Worker thread (after wake + server).
- * It is the first thing in keeper that makes the DAEMON an event *producer*:
- * it watches the Claude Code transcript tree (`~/.claude/projects`) with
- * `@parcel/watcher` (keeper's first runtime dep — a native FSEvents-backed
- * addon), forward-tails each session's JSONL for the `custom-title` line, and
- * posts `{kind:"transcript-title", sessionId, title}` to the parent. The parent
- * (and only the parent) turns that message into a synthetic `TranscriptTitle`
- * `events` row, which the reducer folds at the priority-3 `'transcript'` title
- * source. The worker never writes — it opens a READ-ONLY connection (for the
- * restart-seed) and only posts messages, keeping main the sole `jobs`-writer.
+ * Transcript worker. Watches the Claude Code transcript tree
+ * (`~/.claude/projects`) with `@parcel/watcher`, forward-tails each session's
+ * JSONL for the `custom-title` line, and posts `transcript-title` to the parent;
+ * the parent is the sole minter of the synthetic `TranscriptTitle` event. The
+ * worker opens a READ-ONLY connection (for the restart-seed) and only posts
+ * messages, keeping main the sole `jobs`-writer.
  *
- * Why a native file watcher here when keeper's DO-NOT bans `fs.watch`/FSEvents
- * for its OWN SQLite DB: the ban is narrowed, NOT removed. `PRAGMA data_version`
- * polling stays mandatory for the keeper DB (WAL writes never touch the main
- * file; same-process writes are dropped). But the transcripts are EXTERNAL
- * append-only files written by another process — a kernel watcher is the right
- * primitive there. We still treat every event as "something changed, go look",
- * never as the data: each notification triggers an `fstat` + tail from the
- * stored offset, mirroring jobctl's `TranscriptLineStream`.
+ * The keeper-DB watcher ban is narrowed, not removed: transcripts are EXTERNAL
+ * append-only files written by another process, the carve-out where a kernel
+ * watcher is the right primitive. Every event is "something changed, go look",
+ * never the data — each notification triggers an `fstat` + tail from the stored
+ * offset.
  *
- * Conventions mirror `src/wake-worker.ts` / `src/server-worker.ts`:
- * - `isMainThread`-guarded body — a plain `import` from a test is inert; the
- *   pure line-stream core is exported and drivable with no Worker or watcher.
- * - Own read-only `openDb(path, { readonly: true })` (handles are thread-affine
- *   and not structured-cloneable; the parent hands us only path strings via
- *   `workerData`).
- * - Typed message protocol: `{ kind: ... }` worker→main, `{ type: "shutdown" }`
- *   main→worker. Exit `0` clean / `1` crash. NO in-process self-heal — only a
- *   genuine unrecoverable failure exits non-zero (→ daemon `fatalExit` →
- *   launchd restart, keeper's single recovery path).
- * - Subsystem-style teardown (like server-worker's socket): the `@parcel/watcher`
- *   subscription is an external resource the worker owns and `unsubscribe()`s in
- *   its `{type:"shutdown"}` handler.
- *
- * Internal guards (skip-and-log, never escalate): a missing
- * `~/.claude/projects` root (tolerate late appearance), per-file read errors,
- * and torn/malformed JSONL lines all log to stderr and continue. Only an
- * unrecoverable failure (the subscribe call itself rejecting, the addon failing
- * to load) exits non-zero.
+ * The subscription is an external resource the worker owns and MUST
+ * `unsubscribe()` in its own `{type:"shutdown"}` handler. NO in-process
+ * self-heal: only a genuine unrecoverable failure exits non-zero (→ daemon
+ * `fatalExit` → launchd restart, keeper's single recovery path); internal guards
+ * (missing root, per-file read errors, torn JSONL) skip-and-log and continue.
  */
 
 import type { Database } from "bun:sqlite";
@@ -72,12 +51,10 @@ export interface TranscriptWorkerData {
    */
   watchRoot?: string;
   /**
-   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
-   * `@parcel/watcher` — it skips the live FSEvents subscribe + the startup
-   * current-title fold and stays alive only for the shutdown handshake. The
-   * in-process daemon harness sets this so the parallel slow-test tier never
-   * dlopens the NAPI addon in a worker thread. Transcript titles are not
-   * exercised by the in-process fold-pipeline tier.
+   * When `true`, the worker NEVER `import()`s `@parcel/watcher` — it skips the
+   * live FSEvents subscribe + the startup current-title fold and stays alive
+   * only for the shutdown handshake. The in-process daemon harness sets this so
+   * the slow-test tier never dlopens the NAPI addon in a worker thread.
    */
   disableNativeWatcher?: boolean;
 }
@@ -91,26 +68,12 @@ export interface TranscriptTitleMessage {
 
 /**
  * Message posted to the parent on each fresh `isApiErrorMessage:true`
- * synthetic-assistant turn observed in a session's transcript (schema v24).
- * Claude Code writes this entry whenever the API request fails at a
- * terminal HTTP boundary — no real model turn fires, no hook event lands,
- * but the JSONL gains a marker line carrying `isApiErrorMessage: true` and
- * a bare-string `error` field naming the failure mode (`rate_limit` /
- * `authentication_failed` / `billing_error` / `server_error` /
- * `invalid_request`; anything else folds to `"unknown"`). Main mints a
- * synthetic `ApiError` event from this message; the reducer's dual-case
- * `RateLimited` / `ApiError` arm flips `jobs.state` to `'stopped'` AND
- * stamps `jobs.last_api_error_at` + `jobs.last_api_error_kind` to the
- * event ts + the matched kind in a single compound UPDATE (see
- * `src/reducer.ts`).
- *
- * `text` carries Claude Code's own user-facing wording — for `rate_limit`
- * typically `"You've hit your session limit · resets 3:20am (America/New_York)"`,
- * for `authentication_failed` typically
- * `"Please run /login · API Error: 401 Invalid authentication credentials"`
- * — preserved verbatim for downstream display. The worker doesn't parse
- * the reset clock or the status code; the full string rides as-is so a
- * future renderer can surface it.
+ * synthetic-assistant turn observed in a session's transcript. Claude Code
+ * writes this entry whenever the API request fails at a terminal HTTP boundary —
+ * no real model turn fires, no hook event lands. Main mints a synthetic
+ * `ApiError` event from this message. `text` carries Claude Code's own
+ * user-facing wording, preserved verbatim for downstream display (the worker
+ * parses neither the reset clock nor the status code).
  */
 export interface ApiErrorMessage {
   kind: "api-error";
@@ -122,23 +85,10 @@ export interface ApiErrorMessage {
 
 /**
  * Message posted to the parent on each fresh assistant turn whose
- * `message.content[]` includes a built-in interactive tool that fires
- * no Pre/PostToolUse hook of its own (schema v25). Initially scoped to
- * `AskUserQuestion`; future-extensible to `ExitPlanMode` and any other
- * interactive built-in. Main mints a synthetic `InputRequest` event
- * from this message; the reducer's `InputRequest` arm flips
- * `jobs.state` to `'stopped'` AND stamps
- * `jobs.last_input_request_at` + `jobs.last_input_request_kind` to the
- * event ts + the matched kind in a single compound UPDATE (see
- * `src/reducer.ts`).
- *
- * The matcher (lands in task .2 of fn-617) walks the `message.content[]`
- * array looking for `{type:"tool_use", name:"AskUserQuestion"}`. Once
- * the human answers, the reducer clears the pair via `UserPromptSubmit`
- * (typed reply) / `SessionStart` (resume) unconditionally, OR via
- * `PreToolUse` / `PostToolUse` gated on `last_input_request_at IS NOT
- * NULL` (the next tool the agent fires is the closest "answered"
- * signal AskUserQuestion gives us).
+ * `message.content[]` includes a built-in interactive tool that fires no
+ * Pre/PostToolUse hook of its own. Scoped to `AskUserQuestion`;
+ * future-extensible to any other interactive built-in. Main mints a synthetic
+ * `InputRequest` event from this message.
  */
 export interface InputRequestMessage {
   kind: "input-request";
@@ -174,9 +124,7 @@ interface CustomTitleLine {
 
 /**
  * Match a parsed JSONL object against the `custom-title` shape:
- * `{type:"custom-title", customTitle:<string>, sessionId:<string>}`
- * (`customTitle` is camelCase, verified against real transcripts; the line
- * carries `sessionId` so the worker routes by it directly). Returns the
+ * `{type:"custom-title", customTitle:<string>, sessionId:<string>}`. Returns the
  * extracted `{sessionId, title}` or `null` for any other line.
  */
 function matchCustomTitle(parsed: unknown): CustomTitleLine | null {
@@ -213,8 +161,7 @@ interface ApiErrorLine {
 /**
  * Match a parsed JSONL object against the `isApiErrorMessage` synthetic-
  * assistant shape that Claude Code emits when an API request fails at a
- * terminal HTTP boundary. Required gate fields (verified against real
- * captured `rate_limit` and `authentication_failed` envelopes):
+ * terminal HTTP boundary. Required gate fields:
  *
  *   { type: "assistant",
  *     error: <bare-string-kind> | { type: <bare-string-kind> },
@@ -223,28 +170,12 @@ interface ApiErrorLine {
  *     message: { content: [{type:"text", text:<status wording>}] } }
  *
  * Strict gate — only the canonical isApiErrorMessage envelope matches; any
- * other assistant turn (real or synthetic) returns `null`. Two negative
- * gates are explicit at the call-site filter (see `dispatchLine`) and
- * implicit here:
- *
- *   - `SDKAPIRetryMessage` (`{type:"system", subtype:"api_retry"}`) — a
- *     transient retry notification, session still live. Bounces here on
- *     `type !== "assistant"`.
- *   - `SDKRateLimitEvent` (the quota-notification envelope, a distinct
- *     shape with no `isApiErrorMessage` field) — bounces here on
- *     `isApiErrorMessage !== true`.
- *
- * Kind dispatch reads `error.type ?? error` so both wire shapes are
- * accepted (real captured 401: `"error":"authentication_failed"` bare
- * string; openclaude's TS declares `error.type` structured). The matched
- * kind must appear in {@link API_ERROR_KINDS} — anything else
- * (including the SDK's own `"unknown"` string, `"max_output_tokens"`, an
- * unrecognized literal, a non-string `error`, or a missing field) falls
- * through to {@link ApiErrorKind} `"unknown"`.
- *
- * `text` falls back to the empty string when the content shape is missing
- * (still emits — the synthetic event is the load-bearing signal, the text
- * is display-only).
+ * other assistant turn (real or synthetic) returns `null`. Kind dispatch
+ * reads `error.type ?? error` so both wire shapes (bare-string and structured)
+ * are accepted; a kind outside {@link API_ERROR_KINDS} falls through to
+ * `"unknown"`. `text` falls back to the empty string when the content shape is
+ * missing — the synthetic event is the load-bearing signal, the text is
+ * display-only.
  */
 export function matchApiError(parsed: unknown): ApiErrorLine | null {
   if (!parsed || typeof parsed !== "object") {
@@ -266,8 +197,7 @@ export function matchApiError(parsed: unknown): ApiErrorLine | null {
   if (typeof obj.sessionId !== "string" || obj.sessionId.length === 0) {
     return null;
   }
-  // Accept both wire shapes: bare-string `error` (the real captured 401
-  // shape) and structured `error.type` (openclaude's TS declaration).
+  // Accept both wire shapes: bare-string `error` and structured `error.type`.
   let rawKind: unknown = obj.error;
   if (rawKind && typeof rawKind === "object") {
     rawKind = (rawKind as { type?: unknown }).type;
@@ -293,10 +223,9 @@ export function matchApiError(parsed: unknown): ApiErrorLine | null {
 /**
  * A parsed assistant turn carrying a built-in interactive tool that fires no
  * Pre/PostToolUse hook of its own: session + matched {@link InputRequestKind}.
- * Initially scoped to `AskUserQuestion`; future-extensible via the discriminator
- * (e.g. `ExitPlanMode`) without a new message kind. No display text — the
- * `[awaiting:<kind>]` pill is the load-bearing signal, the question text rides
- * downstream via the transcript itself.
+ * Scoped to `AskUserQuestion`; future-extensible via the discriminator without a
+ * new message kind. No display text — the `[awaiting:<kind>]` pill is the
+ * load-bearing signal.
  */
 interface InputRequestLine {
   sessionId: string;
@@ -305,26 +234,16 @@ interface InputRequestLine {
 
 /**
  * Match a parsed JSONL object against the "assistant turn including a built-in
- * interactive tool that surfaces a question with no hook" shape. Today the
- * only such tool is `AskUserQuestion`; future matchers slot into the same
- * helper by widening the discriminator branch.
+ * interactive tool that surfaces a question with no hook" shape. Strict gates:
  *
- * Strict gates (mirroring `matchApiError`'s field-by-field gating):
- *
- *   - `parsed.type === "assistant"` — synthetic non-assistant rows bounce
- *     (a `custom-title` line or a rate-limit synthetic with the literal word
- *     "AskUserQuestion" embedded in text never reaches this point thanks to
- *     the `dispatchLine` pre-filter, but the gate is defense in depth).
+ *   - `parsed.type === "assistant"`.
  *   - `parsed.sessionId` is a non-empty string.
  *   - `parsed.message.content` is an array AND at least one element satisfies
  *     `{type:"tool_use", name:"AskUserQuestion"}`.
  *
- * **Walk the array — never index `content[0]`.** Rate-limit's matcher reads
- * `content[0]` because the synthetic envelope carries a single text block;
- * real assistant turns interleave text + N tool_uses, and the
- * `AskUserQuestion` tool_use is often NOT the first element (verified
- * against captured corpora — a leading text block precedes the tool_use in
- * most turns).
+ * **Walk the array — never index `content[0]`.** Real assistant turns interleave
+ * text + N tool_uses, and the `AskUserQuestion` tool_use is often NOT the first
+ * element.
  *
  * Returns the matched `{sessionId, requestKind}` or `null` for any other line.
  */
@@ -366,10 +285,10 @@ export function matchAskUserQuestion(parsed: unknown): InputRequestLine | null {
 /**
  * Per-path forward-tail state: the byte offset we've consumed up to, a
  * persistent UTF-8 decoder (so a multi-byte char split across a read-chunk
- * boundary never decodes to U+FFFD — undici #5035, a real corruption bug), and
- * the unterminated tail of the last read (prepended to the next read's first
- * line). Keyed by PATH, not inode: a session fork is a new file with a new
- * session-id filename, so a new path correctly starts at offset 0.
+ * boundary never decodes to U+FFFD), and the unterminated tail of the last read
+ * (prepended to the next read's first line). Keyed by PATH, not inode: a session
+ * fork is a new file with a new session-id filename, so a new path correctly
+ * starts at offset 0.
  */
 interface PathState {
   offset: number;
@@ -379,48 +298,38 @@ interface PathState {
 
 /**
  * Pure, exported forward-tail line stream — the deterministic core, drivable in
- * tests with no Worker or watcher. Ports jobctl's `TranscriptLineStream`
- * (`run_run_server.py:6605`):
+ * tests with no Worker or watcher.
  *
- * - `register(path)` anchors the path's offset to current EOF (we only care
- *   about lines appended AFTER we start watching; the restart-seed below feeds
+ * - `register(path)` anchors the path's offset to current EOF (only lines
+ *   appended AFTER we start watching matter; the restart-seed feeds
  *   `lastEmitted` so the first post-anchor title still emits iff it changed).
- * - `onChange(path)` reads bounded (~64 KiB) chunks from the stored offset to
- *   EOF, decodes through the per-file `StringDecoder`, splits on `\n`, prepends
- *   the buffered partial, and dispatches only `\n`-terminated lines. A truncation
- *   (`size < offset`) resets offset to 0 and clears the buffer + decoder. A
- *   malformed line is JSON-parse-skipped-and-logged. A matched `custom-title` is
- *   emitted via `onTitle(sessionId, title)` ONLY when the title differs from the
- *   last emitted title for that session (change-only emit).
+ * - `onChange(path)` reads bounded chunks from the stored offset to EOF, decodes
+ *   through the per-file `StringDecoder`, and dispatches only `\n`-terminated
+ *   lines. A truncation (`size < offset`) resets offset to 0 and clears the
+ *   buffer + decoder. A matched `custom-title` emits via `onTitle` ONLY when the
+ *   title differs from the last emitted title for that session (change-only).
  *
  * `lastEmitted` is the in-memory change-gate, keyed by sessionId. The
- * restart-seed (server-side: seed from `jobs.title` when `title_source ===
- * 'transcript'`) is applied by the caller via `seedLastEmitted` before the
- * first `onChange`, so a daemon restart doesn't re-emit a title already folded.
+ * restart-seed is applied via `seedLastEmitted` before the first `onChange`, so
+ * a daemon restart doesn't re-emit a title already folded.
  */
 export class TranscriptLineStream {
   private readonly pathState = new Map<string, PathState>();
   private readonly lastEmitted = new Map<string, string>();
   /**
-   * fn-759: per-path {size, mtimeMs} stat memo gating `scanFile`'s full re-read.
-   * The 60s heartbeat (and the FSEvents-drop rescan) walks every
-   * `jobs.transcript_path` row and re-read ~733 MB/min of unchanged transcripts
-   * end-to-end; this memo skips a file whose size AND mtimeMs are byte-identical
-   * to the last successful scan, returning the no-emit/rescued=false path.
+   * Per-path {size, mtimeMs} stat memo gating `scanFile`'s full re-read: skips a
+   * file whose size AND mtimeMs are byte-identical to the last successful scan,
+   * returning the no-emit/rescued=false path.
    *
-   * Deliberately SEPARATE from `pathState` (the live-tail offset memo) — scanFile
-   * stays transient w.r.t. the live tail (:482-486); this memo is the ONLY new
-   * state it writes. Written ONLY after a successful stat AND a successful full
-   * scan, so a transient EACCES/EIO never poisons a path into permanent
-   * suppression. ENOENT clears the entry (a re-appeared file always re-scans).
+   * Written ONLY after a successful stat AND a successful full scan, so a
+   * transient EACCES/EIO never poisons a path into permanent suppression. ENOENT
+   * clears the entry (a re-appeared file always re-scans).
    *
-   * mtimeMs is Bun's sub-second float (APFS stores ns); gating on whole seconds
-   * would false-skip a same-second append, so we compare the float verbatim and
-   * gate on size first. In-memory only — no sidecar, no persistence: an empty
-   * memo on restart just costs one full re-scan (safe). Bounded by
-   * `jobs.transcript_path` cardinality, no eviction. Append-only assumption:
-   * transcripts only grow; a same-size in-place rewrite would defeat
-   * size+mtimeMs — acceptable because no writer does that.
+   * mtimeMs is a sub-second float; gating on whole seconds would false-skip a
+   * same-second append, so compare the float verbatim and gate on size first.
+   * In-memory only — an empty memo on restart just costs one full re-scan.
+   * Append-only assumption: a same-size in-place rewrite would defeat
+   * size+mtimeMs, but no writer does that.
    */
   private readonly scanStatMemo = new Map<
     string,
@@ -430,21 +339,10 @@ export class TranscriptLineStream {
   /**
    * Live forward-tail driver. `onTitle` is called for each NEW (changed)
    * `custom-title` line — change-gated by `lastEmitted`. `log` is the
-   * stderr-logger seam tests override. `onApiError` is called for each
-   * fresh `isApiErrorMessage:true` synthetic-assistant line carrying the
-   * matched {@link ApiErrorKind} — NOT change-gated (the daemon-side
-   * reducer fold is idempotent, so a defensive same-line re-emit is
-   * harmless; the worker stays simple). In practice the forward-only tail
-   * anchors each path at EOF on first sight, so a line is read at most
-   * once per worker lifetime regardless.
-   *
-   * Param order is `(onTitle, log, onApiError, onInputRequest)` — `log`
-   * stays in the historical second slot so existing 2-arg test calls keep
-   * working; `onApiError` is the optional third slot and `onInputRequest`
-   * is the optional fourth (the convention is "new callbacks tack onto
-   * the end"). Defaulting every optional callback to a no-op lets a
-   * unit-test stub only the slot it cares about without rewiring the
-   * full surface.
+   * stderr-logger seam tests override. `onApiError` and `onInputRequest` are
+   * NOT change-gated (the daemon-side reducer fold is idempotent, so a
+   * same-line re-emit is harmless). Defaulting every optional callback to a
+   * no-op lets a unit test stub only the slot it cares about.
    */
   constructor(
     private readonly onTitle: (sessionId: string, title: string) => void,
@@ -499,28 +397,20 @@ export class TranscriptLineStream {
   /**
    * One-shot boot scan of an EXISTING file from offset 0 to a once-snapshotted
    * size, emitting ONLY the current (last) `custom-title` per session found in
-   * the file. This is the startup current-title fold: a `custom-title` set while
-   * the daemon was down was never streamed by the live tail (which anchors each
-   * file at EOF on first sight), so without this scan a rename-while-down is
-   * permanently missed until the title changes again.
+   * the file. The startup current-title fold: a `custom-title` set while the
+   * daemon was down was never streamed by the live tail (which anchors each file
+   * at EOF on first sight), so without this scan a rename-while-down is missed
+   * until the title changes again.
    *
-   * Unlike `register`/`onChange`, the scan does NOT touch `pathState` — it uses a
-   * transient decoder + partial buffer local to this call. So the live watcher's
-   * EOF-anchoring on first sight of the same path is unaffected, and bytes
-   * appended after the snapshot are picked up by the normal live tail. The shared
-   * `lastEmitted` change-gate dedups across the scan and the live tail.
+   * Does NOT touch `pathState` — it uses a transient decoder + partial buffer
+   * local to this call, so the live watcher's EOF-anchoring is unaffected and the
+   * shared `lastEmitted` change-gate dedups across the scan and the live tail.
+   * Accumulates matches per session and emits only the final one, so intermediate
+   * historical renames don't churn the event log. Per-file errors skip-and-log.
    *
-   * Reuses the bounded-chunk read / `StringDecoder` / partial-line / malformed-skip
-   * machinery (`consume` → `dispatchLine`), but ACCUMULATES matches per session
-   * and emits only the final one — so intermediate historical renames don't churn
-   * the event log. A title already folded (seeded into `lastEmitted` by
-   * `seedFromDb`) is suppressed by the change-gate. Per-file errors skip-and-log;
-   * the scan never throws.
-   *
-   * Returns `true` iff this scan emitted at least one (changed) title through
-   * `onTitle` (fn-720) — the `rescued` signal {@link scanJobsForTitles} ORs
-   * across every scanned file so the heartbeat / FSEvents-drop backstop can
-   * report whether the slow scan actually rescued a title the live tail missed.
+   * Returns `true` iff this scan emitted at least one (changed) title — the
+   * `rescued` signal {@link scanJobsForTitles} ORs across every scanned file so
+   * the backstop can report whether the slow scan rescued a missed title.
    */
   scanFile(path: string): boolean {
     let size: number;
@@ -533,20 +423,17 @@ export class TranscriptLineStream {
       size = st.size;
       mtimeMs = st.mtimeMs;
     } catch (err) {
-      // ENOENT is the EXPECTED case, not an error: `scanJobsForTitles` walks
-      // every `jobs.transcript_path` row — thousands of historical sessions
-      // across every profile — and most of those transcript files are long
-      // gone. Logging each one buried the real signal under ~200k lines and
-      // grew `server.stderr` to 75MB+ per boot. A vanished transcript simply
-      // has no title to fold; skip it silently. Other stat failures (EACCES,
-      // EIO, …) are genuinely unexpected and still surface.
+      // ENOENT is the EXPECTED case: `scanJobsForTitles` walks every
+      // `jobs.transcript_path` row and most of those files are long gone, so a
+      // vanished transcript skips silently (logging each one buried the real
+      // signal). Other stat failures (EACCES, EIO, …) still surface.
       if ((err as NodeJS.ErrnoException)?.code !== "ENOENT") {
         this.log(
           `[transcript-worker] boot scan stat failed for ${path}: ${stringifyErr(err)}`,
         );
       } else {
-        // fn-759: drop a memo entry for a vanished path so an un-vanished file
-        // (same path, fresh inode) is always re-scanned — never cache "gone".
+        // Drop a memo entry for a vanished path so an un-vanished file (same
+        // path, fresh inode) is always re-scanned — never cache "gone".
         this.scanStatMemo.delete(path);
       }
       return false;
@@ -555,11 +442,9 @@ export class TranscriptLineStream {
       return false;
     }
 
-    // fn-759: change-gate the full re-read on size+mtimeMs. A grown file (or a
-    // same-size mtime bump) re-scans; a truncation/rotation (`size < memo.size`)
-    // re-scans from 0 (the read loop below already starts at offset 0). Only a
-    // byte-identical {size, mtimeMs} skips — flowing into the no-emit/
-    // rescued=false return, identical to a scan that matched no new title.
+    // Change-gate the full re-read on size+mtimeMs: only a byte-identical
+    // {size, mtimeMs} skips (no-emit/rescued=false); a grown or rotated file
+    // re-scans from offset 0.
     const memo = this.scanStatMemo.get(path);
     if (memo && size === memo.size && mtimeMs === memo.mtimeMs) {
       return false;
@@ -579,8 +464,6 @@ export class TranscriptLineStream {
     // anchors this path at EOF on its first watcher sighting.
     const decoder = new StringDecoder("utf8");
     let partial = "";
-    // Accumulate the LAST title per session seen in this file; emit once at the
-    // end so intermediate renames don't each fire an event.
     const lastPerSession = new Map<string, string>();
 
     const handleLine = (line: string): void => {
@@ -640,17 +523,13 @@ export class TranscriptLineStream {
       }
     }
 
-    // fn-759: the full scan completed without a read error (any readSync failure
-    // above `return false`s BEFORE here, leaving the memo absent/stale so the
-    // next healthy tick re-scans). Record the snapshot we just consumed so an
-    // unchanged file is skipped next tick. Written from the pre-read stat
-    // (`size`/`mtimeMs`), so a mid-read append lands a smaller-than-current
-    // memo and is conservatively caught next tick.
+    // The full scan completed without a read error (any readSync failure above
+    // `return false`s before here). Record the snapshot from the PRE-READ stat,
+    // so a mid-read append lands a smaller-than-current memo and is
+    // conservatively caught next tick.
     this.scanStatMemo.set(path, { size, mtimeMs });
 
-    // Emit the current title per session through the shared change-gate: a title
-    // already folded (seeded by seedFromDb) is suppressed; a changed one emits
-    // once and advances the gate so the live tail won't re-emit it.
+    // Emit the current title per session through the shared change-gate.
     let emitted = false;
     for (const [sessionId, title] of lastPerSession) {
       const prev = this.lastEmitted.get(sessionId);
@@ -700,9 +579,8 @@ export class TranscriptLineStream {
       return;
     }
 
-    // Truncation guard: a shrunk file (rotated/rewritten) resets the tail. Path
-    // keying makes this rare (Claude Code doesn't rewrite in place), but stay
-    // defensive — reset offset to 0, clear the partial buffer + decoder.
+    // Truncation guard: a shrunk file (rotated/rewritten) resets the tail —
+    // offset to 0, clear the partial buffer + decoder.
     if (size < state.offset) {
       this.log(
         `[transcript-worker] ${path} truncated (size ${size} < offset ${state.offset}); resetting`,
@@ -727,9 +605,8 @@ export class TranscriptLineStream {
     }
 
     try {
-      // fd discipline: open→read-to-EOF→close per change event; don't hold an fd
-      // across the deep live tree. Read in bounded chunks so a huge append never
-      // balloons memory.
+      // open→read-to-EOF→close per change event; read in bounded chunks so a
+      // huge append never balloons memory.
       const buf = Buffer.allocUnsafe(READ_CHUNK_BYTES);
       while (state.offset < size) {
         const want = Math.min(READ_CHUNK_BYTES, size - state.offset);
@@ -786,31 +663,20 @@ export class TranscriptLineStream {
     if (line.trim().length === 0) {
       return;
     }
-    // Cheap pre-filter: skip the JSON.parse for lines that can't be either
-    // a title, an isApiErrorMessage synthetic, OR an AskUserQuestion
-    // tool_use. The three needle-substrings are empirically disjoint (see
-    // the "disjointness corpus" test), so a single `includes` per shape
-    // stays branch-cheap. Most transcript lines (assistant text turns,
-    // tool_result attachments, other tool_use turns) miss all three and
-    // bail before JSON.parse.
+    // Cheap pre-filter: skip the JSON.parse for lines that can't be a title, an
+    // isApiErrorMessage synthetic, OR an AskUserQuestion tool_use. The three
+    // needle-substrings are disjoint (see the "disjointness corpus" test).
     //
-    // The api-error needle is `"isApiErrorMessage":true` rather than any
-    // per-kind error string — it's the one flag every terminal-failure
-    // envelope guarantees AND it skips both negative-gate frames (the
-    // `SDKAPIRetryMessage` system row has no such field; the
+    // The api-error needle is `"isApiErrorMessage":true` — the one flag every
+    // terminal-failure envelope guarantees, and it skips both negative-gate
+    // frames (the `SDKAPIRetryMessage` system row lacks the field; the
     // `SDKRateLimitEvent` quota notification has a distinct envelope).
     //
-    // The input-request needle is `"name":"AskUserQuestion"` rather than
-    // the bare token `AskUserQuestion` — the bare token could appear in
-    // a `custom-title` describing the prior turn ("Renamed: handling
-    // AskUserQuestion") or in a rate-limit error message rendering of
-    // the prior tool_use envelope verbatim. Anchoring on the `"name":`
-    // prefix pins the substring to the `tool_use` schema's `name` field.
-    //
-    // Bun's `JSON.stringify` doesn't insert whitespace, and Claude Code's
-    // own writer doesn't either (verified against captured transcript
-    // lines from 2026-05; if that ever changes, widen to `"name"` and
-    // accept the slight per-line cost).
+    // The input-request needle is `"name":"AskUserQuestion"` (not the bare
+    // token, which could appear inside a `custom-title` or an error message
+    // rendering the prior tool_use): the `"name":` prefix pins the substring to
+    // the `tool_use` schema's `name` field. Relies on the writers emitting no
+    // whitespace in JSON; if that changes, widen to `"name"`.
     const isTitle = line.includes("custom-title");
     const isApiError = !isTitle && line.includes('"isApiErrorMessage":true');
     const isInputRequest =
@@ -841,12 +707,8 @@ export class TranscriptLineStream {
       return;
     }
     if (isApiError) {
-      // isApiErrorMessage synthetic: no change-gate. The forward-only tail
-      // reads each line at most once per worker lifetime, and the reducer
-      // fold is idempotent (state + last_api_error_at + last_api_error_kind
-      // stamped from the event payload), so a duplicate emit (boot scan +
-      // live tail double-fire would be the only way) folds to the same row
-      // state.
+      // No change-gate: the reducer fold is idempotent, so a duplicate emit
+      // folds to the same row state.
       const match = matchApiError(parsed);
       if (!match) {
         return;
@@ -854,15 +716,9 @@ export class TranscriptLineStream {
       this.onApiError(match.sessionId, match.text, match.kind);
       return;
     }
-    // AskUserQuestion (or any future built-in interactive tool with no
-    // hook): no change-gate, mirroring the isApiErrorMessage rationale
-    // verbatim. The reducer's `InputRequest` arm is idempotent — the
-    // `(at, kind)` pair + the terminal-guarded `state -> 'stopped'`
-    // flip fold to the same row state under a duplicate emit. There is
-    // no boot-scan path for this signal (the `[awaiting:*]` pill marks
-    // a LIVE state; replaying it from a historical transcript scan
-    // would show stale blocks for sessions that were long since
-    // answered).
+    // No change-gate (idempotent fold). No boot-scan path for this signal: the
+    // `[awaiting:*]` pill marks a LIVE state, so replaying it from a historical
+    // scan would show stale blocks for already-answered sessions.
     const match = matchAskUserQuestion(parsed);
     if (!match) {
       return;
@@ -877,14 +733,10 @@ function stringifyErr(err: unknown): string {
 
 /**
  * Seed the line stream's change-gate from the keeper DB: for each job whose
- * `title_source === 'transcript'`, the persisted `jobs.title` IS the last
+ * `title_source === 'transcript'`, the persisted `jobs.title` is the last
  * transcript title that won, so re-emitting it on restart would be redundant.
- * Seed those (and only those) so the first post-restart `custom-title` line
- * emits iff the title actually changed while the daemon was down. Jobs at a
- * lower title source are left unset so their first transcript title emits.
- *
- * Read-only — uses the worker's own read-only connection. Exported for the
- * worker `main` (and unit reach).
+ * Jobs at a lower title source are left unset so their first transcript title
+ * emits. Read-only.
  */
 export function seedFromDb(db: Database, stream: TranscriptLineStream): void {
   const rows = db
@@ -899,28 +751,19 @@ export function seedFromDb(db: Database, stream: TranscriptLineStream): void {
 
 /**
  * Boot scan: fold the CURRENT `custom-title` for each live job, scoped via
- * `jobs.transcript_path` (schema v5 — the absolute path to that session's
- * transcript JSONL). A `custom-title` set while the daemon was down was never
- * streamed by the live tail (which anchors each file at EOF on first sight), so
- * this one-shot scan after `seedFromDb` + subscribe is what makes a
- * rename-while-down survive a daemon restart.
+ * `jobs.transcript_path`. Makes a rename-while-down survive a daemon restart,
+ * which the EOF-anchored live tail would otherwise miss.
  *
- * Scoping to `jobs.transcript_path` (NOT a recursive enumeration of the watch
- * root) is deliberate: a transcript title only folds onto an EXISTING `jobs` row
- * (boot drain already created them before this worker spawns), and this scopes to
- * exactly the per-session files that matter — skipping the thousands of dead
- * historical transcripts under the deeply-nested watch tree, and reading the real
- * file even in multi-profile setups where it lives outside the single configured
- * watch root. Jobs with a NULL `transcript_path` (old pre-v5 rows) can't be
- * scanned — acceptable. Must run AFTER `seedFromDb` so an already-folded title is
- * suppressed by the change-gate (no duplicate event on restart). Per-file errors
- * skip-and-log inside `scanFile`; this is non-fatal.
+ * Scoping to `jobs.transcript_path` (NOT a recursive walk of the watch root) is
+ * deliberate: a title only folds onto an EXISTING `jobs` row, and this scopes to
+ * exactly the per-session files that matter — skipping thousands of dead
+ * historical transcripts, and reading the real file even when it lives outside
+ * the configured watch root (multi-profile). Must run AFTER `seedFromDb` so an
+ * already-folded title is suppressed by the change-gate. Read-only; per-file
+ * errors skip-and-log inside `scanFile`.
  *
- * Returns `true` iff at least one scanned file emitted a (changed) title
- * (fn-720) — the `rescued` boolean the heartbeat / FSEvents-drop backstop folds
- * into one uniform `missed-wake` record. Boot / live callers ignore the return.
- *
- * Read-only — uses the worker's own read-only connection. Exported for unit reach.
+ * Returns `true` iff at least one scanned file emitted a (changed) title — the
+ * `rescued` boolean the backstop folds into one `missed-wake` record.
  */
 export function scanJobsForTitles(
   db: Database,
@@ -1008,14 +851,11 @@ function main(): void {
   let subscription: AsyncSubscription | null = null;
   let shuttingDown = false;
 
-  // ── fn-720 backstop telemetry ──────────────────────────────────────────────
-  // `lastFastPathAt` is stamped at every confirmed FAST-path fire (the live
-  // `onChange` tail driven by a real FSEvents batch); the 60s heartbeat (the
-  // slow backstop) reads it to compute staleness. `null` until the first fast
-  // path fires — the cold-boot sentinel that keeps a giant false staleness off
-  // the histogram. The counters accumulate fires/rescues per (backstop,class)
-  // for the denominator; a periodic + on-shutdown rollup flushes them up to main
-  // (the SOLE sidecar writer).
+  // `lastFastPathAt` is stamped at every confirmed fast-path fire (the live
+  // `onChange` tail driven by a real FSEvents batch); the heartbeat reads it to
+  // compute staleness. `null` until the first fast path fires — the cold-boot
+  // sentinel that keeps a false staleness off the histogram. The counters
+  // accumulate fires/rescues per (backstop,class) for the denominator.
   let lastFastPathAt: number | null = null;
   const backstopCounters = new BackstopCounters();
   let rollupTimer: ReturnType<typeof setInterval> | null = null;
@@ -1031,18 +871,15 @@ function main(): void {
   // Drop-recovery scheduler (single root): a recoverable FSEvents drop schedules
   // a debounced, single-flight re-scan via the change-gated boot-scan primitive
   // (scanJobsForTitles, which routes through scanFile's TRANSIENT decoder — NEVER
-  // onChange, which would advance/re-anchor byte offsets and lose the very change
-  // we're recovering). The warm in-memory change-gate (lastEmitted) suppresses
-  // re-emits for unchanged titles, so recovery is idempotent. Cleared in shutdown
-  // before unsubscribe; the scan re-checks shuttingDown.
+  // onChange, which would advance/re-anchor byte offsets and lose the change
+  // we're recovering). The warm in-memory change-gate suppresses re-emits, so
+  // recovery is idempotent. Cleared in shutdown before unsubscribe.
   const rescan = new RescanScheduler(() => {
     if (shuttingDown) {
       return;
     }
-    // fn-720: this is the FSEvents-drop backstop — fold the emitted-boolean into
-    // one `rescan-drop` missed-wake record (rescued = the change-gated scan
-    // recovered a title the dropped FSEvents change would otherwise have lost).
-    // The shutdown guard above gates both the scan and the telemetry emit.
+    // The FSEvents-drop backstop — fold the emitted-boolean into one
+    // `rescan-drop` missed-wake record.
     const rescued = scanJobsForTitles(db, stream);
     backstopCounters.bump("rescan-drop", "missed-wake", rescued);
     if (rescued) {
@@ -1060,29 +897,20 @@ function main(): void {
     }
   });
 
-  // Heartbeat / silent-watcher recovery. Observed (May 2026, daemon pid 83205):
-  // after a sibling-worker segfault history, the @parcel/watcher subscribe
-  // Promise resolved (boot scan ran) but the per-event callback never fired
-  // again — no `update`, no `watcher error`, just 4+ hours of silence while
-  // sessions actively renamed via `/title`. Three sessions stayed pinned to
-  // their stale payload-source title because the priority-3 transcript signal
-  // never reached the reducer. Root cause not isolated (suspect:
-  // parcel-bundler/watcher #174-style negated-glob handling, or Bun
-  // worker_threads N-API callback bridge dying after a sibling crash).
-  //
+  // Heartbeat / silent-watcher recovery. The @parcel/watcher subscribe can
+  // resolve but then go mute — the per-event callback never fires again — while
+  // sessions actively rename, stranding the priority-3 transcript signal.
   // Two-pronged backstop:
-  //   1. `eventsReceived` counter logged every HEARTBEAT_MS so a future stall
-  //      is visible from `tail -f server.stderr` instead of requiring DB
-  //      forensics.
-  //   2. Every HEARTBEAT_MS, unconditionally re-run scanJobsForTitles. The
-  //      scan is change-gated by `lastEmitted`, so a healthy watcher's already
-  //      emitted titles are suppressed; a silent watcher's missed renames are
-  //      caught within one tick. This is the same primitive the FSEvents-drop
-  //      path uses, so the contract (TRANSIENT decoder, never `onChange`) is
-  //      preserved.
+  //   1. `eventsReceived` counter logged every HEARTBEAT_MS so a stall is
+  //      visible from the logs instead of requiring DB forensics.
+  //   2. Every HEARTBEAT_MS, unconditionally re-run scanJobsForTitles. The scan
+  //      is change-gated by `lastEmitted`, so a healthy watcher's titles are
+  //      suppressed; a silent watcher's missed renames are caught within one
+  //      tick. Same primitive as the FSEvents-drop path (TRANSIENT decoder,
+  //      never `onChange`).
   const HEARTBEAT_MS = 60_000;
-  // fn-720: cadence at which the worker flushes its backstop counters as rollup
-  // records — the denominator survives a crash without a line per no-op fire.
+  // Cadence at which the worker flushes its backstop counters as rollup records
+  // — the denominator survives a crash without a line per no-op fire.
   const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
   let eventsReceived = 0;
   let lastEventAt = 0;
@@ -1097,10 +925,9 @@ function main(): void {
       `[transcript-worker] heartbeat events_received=${eventsReceived} last_event_at=${lastSeen}`,
     );
     try {
-      // fn-720: this IS the slow backstop — fold the emitted-boolean into one
-      // uniform `transcript-heartbeat` missed-wake record. A `true` means the
-      // watcher went mute and the heartbeat re-folded a title the live tail
-      // missed. The shutdown guard above gates the telemetry emit too.
+      // The slow backstop — fold the emitted-boolean into one
+      // `transcript-heartbeat` missed-wake record (`true` = the watcher went
+      // mute and the heartbeat re-folded a missed title).
       const rescued = scanJobsForTitles(db, stream);
       backstopCounters.bump("transcript-heartbeat", "missed-wake", rescued);
       if (rescued) {
@@ -1123,9 +950,8 @@ function main(): void {
     }
   }, HEARTBEAT_MS);
 
-  // fn-720: periodic backstop-rollup flush — checkpoint the denominator so it
-  // survives a crash without a line per no-op heartbeat. Cleared + final-flushed
-  // in the shutdown handler.
+  // Periodic backstop-rollup flush — checkpoint the denominator so it survives a
+  // crash. Cleared + final-flushed in the shutdown handler.
   rollupTimer = setInterval(() => {
     if (shuttingDown) {
       return;
@@ -1155,9 +981,8 @@ function main(): void {
       // heartbeat timer carries the same constraint (its body runs scanJobsForTitles).
       rescan.cancel();
       clearInterval(heartbeatTimer);
-      // fn-720: cancel the periodic rollup flush, then flush ONE final rollup so
-      // the denominator survives a clean stop. postMessage is synchronous; main
-      // is still reading (it sends `shutdown` and awaits `close`).
+      // Cancel the periodic rollup flush, then flush ONE final rollup so the
+      // denominator survives a clean stop.
       if (rollupTimer != null) {
         clearInterval(rollupTimer);
         rollupTimer = null;
@@ -1180,76 +1005,59 @@ function main(): void {
     }
   });
 
-  // The watch root may not exist yet on a fresh machine. @parcel/watcher's
-  // `subscribe` REQUIRES an existing dir, so tolerate absence: skip-and-log and
-  // exit clean only on explicit shutdown. (A future late-appearance retry could
-  // poll for the dir; for now a missing root simply means no titles until the
-  // daemon restarts after the dir exists — acceptable per the task's guards.)
+  // @parcel/watcher's `subscribe` REQUIRES an existing dir, so a missing watch
+  // root skips-and-logs and stays alive for the shutdown handshake (not a crash;
+  // no titles until the daemon restarts after the dir exists).
   if (!existsSync(watchRoot)) {
     console.error(
       `[transcript-worker] watch root ${watchRoot} does not exist; not watching`,
     );
-    // Stay alive (don't exit non-zero — a missing root is not a crash) so the
-    // shutdown handshake still works. The parentPort listener keeps the event
-    // loop alive.
     return;
   }
 
-  // fn-747 watcher seam: skip the native addon dlopen entirely in the
-  // in-process tier. Transcript titles are not exercised by the in-process
-  // fold-pipeline tier, so this worker just stays alive (the parentPort listener
-  // keeps the event loop running) for the shutdown handshake.
+  // Watcher seam: skip the native addon dlopen entirely in the in-process tier;
+  // stay alive for the shutdown handshake.
   if (data.disableNativeWatcher) {
     return;
   }
 
-  // `subscribe` is the only unrecoverable surface — a rejection (addon load
-  // failure, EPERM on the root) exits non-zero → daemon fatalExit → launchd
-  // restart. Per-file read errors and torn lines are handled INSIDE the stream
-  // (skip-and-log), never here.
+  // `subscribe` is the only unrecoverable surface — a rejection exits non-zero →
+  // daemon fatalExit → launchd restart. Per-file read errors and torn lines are
+  // handled INSIDE the stream (skip-and-log), never here.
   import("@parcel/watcher")
     .then((watcher) =>
       watcher.subscribe(watchRoot, (err, events) => {
         if (err) {
-          // Always leave a breadcrumb so a future @parcel/watcher wording
-          // change (the drop discriminator couples to its message text) is
+          // Always leave a breadcrumb: the drop discriminator couples to
+          // @parcel/watcher's message text, so a wording change must stay
           // observable in the logs.
           console.error(
             `[transcript-worker] watcher error: ${stringifyErr(err)}`,
           );
-          // A recoverable FSEvents drop ("...must be re-scanned"): the lost
-          // title change may never re-fire (the live tail is EOF-anchored), so
-          // schedule a debounced re-scan. A non-drop err keeps today's
-          // swallow-and-log (additive only — no fatal/escalation change).
+          // A recoverable FSEvents drop may never re-fire (the live tail is
+          // EOF-anchored), so schedule a debounced re-scan. A non-drop err just
+          // swallow-and-logs.
           if (isDropError(err)) {
             rescan.schedule();
           }
           return;
         }
-        // Bump the heartbeat counter so the periodic log distinguishes a
-        // healthy-but-quiet watcher from a silent-dead one. Bumped on the
-        // raw event batch (pre-filter) so we observe the FSEvents firehose,
-        // not just our matched-file slice.
+        // Bump on the raw event batch (pre-filter) so the heartbeat log
+        // distinguishes a healthy-but-quiet watcher from a silent-dead one.
         eventsReceived += events.length;
         lastEventAt = Date.now();
-        // fn-720: a confirmed FSEvents batch IS the fast path for transcript
-        // titles — stamp `last_fast_path_at` so a later heartbeat measures
-        // staleness against it (a working watcher keeps the heartbeat a
-        // perpetual no-op rescue).
+        // A confirmed FSEvents batch IS the fast path for transcript titles —
+        // stamp `last_fast_path_at` so a later heartbeat measures staleness
+        // against it.
         lastFastPathAt = Date.now();
         for (const ev of events) {
-          // Treat every event as "go look" — create/update both tail from the
-          // stored offset; a delete just drops tracking. The in-callback
-          // `.jsonl` check is the sole correctness gate: a directory change
-          // that reaches onChange is rejected by statSync's `isFile()` guard,
-          // so a directory falling through is harmless beyond a stat() call.
+          // Treat every event as "go look"; a delete just drops tracking. The
+          // `.jsonl` check is the sole correctness gate (a directory is also
+          // rejected later by statSync's `isFile()` guard).
           //
-          // No `ignore` glob is passed to subscribe — historically we used
-          // `{ ignore: ["**/*.!(jsonl)"] }` (a negated extglob), but plan-worker
-          // explicitly avoids that pattern style (parcel-bundler/watcher #174:
-          // parcel mishandles negated globs) and the May-2026 silent-watcher
-          // stall (see heartbeat comment) was strongly correlated with this
-          // option. Re-introduce only as positive `**/<noisy-dir>/**` globs.
+          // No `ignore` glob is passed to subscribe: negated extglobs trip
+          // parcel-bundler/watcher #174 and correlated with the silent-watcher
+          // stall. Re-introduce only as positive `**/<noisy-dir>/**` globs.
           if (!ev.path.endsWith(".jsonl")) {
             continue;
           }
@@ -1268,13 +1076,11 @@ function main(): void {
         return;
       }
       subscription = sub;
-      // Startup current-title fold: after seedFromDb (above) AND after the
-      // subscription is live, scan each live job's transcript file for its
-      // current `custom-title`. Runs synchronously to completion before any
-      // async watcher callback fires, so there is no race with the live tail and
-      // the change-gate dedups across both. Non-fatal — wrapped so a scan failure
-      // never trips the subscribe `.catch` → fatalExit (mirrors plan-worker's
-      // boot scan placement). The existsSync root guard above already gated us.
+      // Startup current-title fold: after seedFromDb AND after the subscription
+      // is live, scan each live job's transcript for its current `custom-title`.
+      // Runs synchronously before any async watcher callback fires, so there's no
+      // race with the live tail. Wrapped so a scan failure never trips the
+      // subscribe `.catch` → fatalExit.
       try {
         scanJobsForTitles(db, stream);
       } catch (err) {

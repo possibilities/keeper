@@ -2,45 +2,28 @@
  * Git status producer worker. Snapshots watched git worktrees and posts a
  * synthetic snapshot message when the rendered git view changes.
  *
- * **Watch gate (epic fn-690).** A worktree is watched iff it satisfies the
- * dynamic membership gate computed each reconcile:
- *   `.planctl present || working tree dirty || ahead of upstream > 0`.
- * Clean-and-pushed non-`.planctl` worktrees drop after a cooling dwell;
- * `.planctl`-backed worktrees stay watched even when clean (legacy
- * always-watched behavior) and incur no probe spawn (short-circuit). See
- * {@link discoverProjectRoots} for the gate, {@link shouldWatchRoot} for
- * the verdict helper, and {@link decideReconcileTransitions} for the
- * dwell-aware drop logic.
+ * Watch gate: a worktree is watched iff
+ *   `.planctl present || working tree dirty || ahead of upstream > 0`,
+ * recomputed each reconcile. Clean-and-pushed non-`.planctl` worktrees drop
+ * after a cooling dwell; `.planctl`-backed worktrees stay watched even when
+ * clean and incur no probe spawn (short-circuit).
  *
- * EVENT-DRIVEN, not polled: a snapshot fires only when one of four signals
- * arrives — (1) a `@parcel/watcher` event on the worktree (file content
- * changed), (2) a `@parcel/watcher` event on the git common-dir (commit,
- * checkout, branch-switch, fetch — operations that mutate refs/HEAD/index
- * without touching any worktree file, which the worktree subscription
- * intentionally never sees because it ignores `**\/.git/**`), (3) a
- * `PRAGMA data_version` bump on keeper's own DB (new jobs row → root-membership
- * may have changed → re-reconcile worktree subscriptions; the attribution
- * join itself runs in the reducer, not here), or (4) a 60s heartbeat
- * safety-net. Signal (3) drives membership reconcile ONLY — it carries no root
- * attribution, so it never fans a per-root snapshot out (that O(roots) fan-out
- * was the CPU-flood source removed in this epic); the per-root snapshots come
- * from the FSEvents signals (1)+(2) feeding a per-root `RescanScheduler`
- * (trailing-debounce + single-flight, so a flurry collapses into one `git
- * status` shell-out), with (4) as the slow drop backstop. The per-root
- * `lastByRoot` JSON dedupe absorbs no-op snapshots.
+ * EVENT-DRIVEN, not polled: a snapshot fires only on (1) a worktree FSEvents
+ * change, (2) a git-common-dir FSEvents change (commit/checkout/branch/fetch —
+ * ref/HEAD/index mutations the worktree sub ignores via `**\/.git/**`), (3) a
+ * `PRAGMA data_version` bump (membership reconcile ONLY — it carries no root
+ * attribution, so it must never fan a per-root snapshot out; that O(roots)
+ * fan-out was a CPU-flood source), or (4) a 60s heartbeat backstop. The FSEvents
+ * signals feed a per-root `RescanScheduler` (trailing-debounce + single-flight);
+ * the per-root `lastByRoot` dedupe absorbs no-op snapshots.
  *
- * `PRAGMA data_version` polling is the only sanctioned DB change primitive
- * per the CLAUDE.md DO-NOT — it's a sub-ms autocommit counter read, not a
- * shell-out, and it's already foundational to `wake-worker.ts`.
+ * Watchers on EXTERNAL trees (the worktree + git common-dir) are the sanctioned
+ * carve-out; keeper's OWN DB is observed only via `PRAGMA data_version` polling.
  *
- * This worker is an event PRODUCER only: it owns no writable DB connection and
- * never mutates projections. Main inserts a `GitSnapshot` event, and the
- * reducer folds that persisted payload into `git_status`. When a watched root
- * stops satisfying the watch gate on reconcile (no `.planctl/` AND clean-and-
- * pushed for ≥ the cooling dwell), the worker also
- * posts a `GitRootDropped` tombstone message from `unsubscribeRoot` — main
- * lifts it into a synthetic `GitRootDropped` event whose reducer fold DELETEs
- * the projection row, keeping `git_status` in sync with the worktree.
+ * PRODUCER only: owns no writable DB connection, never mutates projections. Main
+ * mints every event; the reducer folds the persisted payload into `git_status`.
+ * On a drop, the worker posts a `GitRootDropped` tombstone whose reducer fold
+ * DELETEs the projection row, keeping `git_status` in sync.
  */
 
 import type { Database } from "bun:sqlite";
@@ -66,26 +49,21 @@ import type { ShutdownMessage } from "./wake-worker";
 export interface GitWorkerData {
   dbPath: string;
   /**
-   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
-   * `@parcel/watcher` — it skips the live FSEvents subscribe + DB-poll/heartbeat
-   * reconcile (which exist only to manage watcher subscriptions) and stays alive
-   * only for the shutdown handshake. The in-process daemon harness sets this so
-   * the parallel slow-test tier never dlopens the NAPI addon in a worker thread.
-   * Git snapshots are not exercised by the in-process fold-pipeline tier.
+   * When `true`, the worker NEVER `import()`s `@parcel/watcher` — it skips the
+   * live FSEvents subscribe + DB-poll/heartbeat reconcile and stays alive only
+   * for the shutdown handshake. The in-process daemon harness sets this so the
+   * slow-test tier never dlopens the NAPI addon in a worker thread.
    */
   disableNativeWatcher?: boolean;
 }
 
 /**
- * fn-705 discovery nudge (main → git-worker). The plan-worker observed a
- * `.planctl` tree in a repo keeper has never seen a session in; main forwards
- * the repo root so the git-worker adds it to its discovery candidate set
- * IMMEDIATELY (the `.planctl` short-circuit in {@link shouldWatchRoot} then
- * subscribes it on the next reconcile) instead of waiting for the next full
- * `SELECT DISTINCT cwd` sweep. Without this, a brand-new repo's `.git` stays
- * unwatched until a session runs there — no GitSnapshot / attribution flows.
- * Idempotent: a re-nudge of an already-watched root is a no-op (the candidate
- * set is a Set + the reconcile is convergent).
+ * Discovery nudge (main → git-worker): the plan-worker observed a `.planctl`
+ * tree in a repo keeper has never seen a session in. Main forwards the repo root
+ * so the git-worker adds it to its discovery candidate set IMMEDIATELY (the
+ * `.planctl` short-circuit in {@link shouldWatchRoot} subscribes it next
+ * reconcile) instead of waiting for the next full `SELECT DISTINCT cwd` sweep.
+ * Idempotent: a re-nudge of an already-watched root is a no-op.
  */
 export interface AddDiscoveryRootMessage {
   type: "add-discovery-root";
@@ -104,60 +82,32 @@ export interface GitFileStatus {
   kind: "ordinary" | "renamed" | "unmerged" | "untracked";
   orig_path?: string;
   /**
-   * Schema v44 / fn-664: the porcelain-v2 `hI` (index blob oid) and `mW`
-   * (worktree mode) fields, lifted straight off the `1`/`2` record at parse
-   * time. `untracked` (`?`) and `unmerged` (`u`) records have no `hI`/`mW`
-   * fields in porcelain output and parse as `null`. The producer's
-   * {@link buildGitSnapshot} threads these into the {@link GitDirtyFile}
-   * payload alongside the (separately-computed) `worktree_oid`.
+   * The porcelain-v2 `hI` (index blob oid) and `mW` (worktree mode) fields,
+   * lifted off the `1`/`2` record. `untracked`/`unmerged` records carry neither
+   * and parse as `null`.
    */
   index_oid: string | null;
   worktree_mode: string | null;
 }
 
 /**
- * One dirty-file entry on the file-centric {@link GitSnapshotPayload} (schema
- * v31 / task fn-633.5). Field-for-field a {@link GitFileStatus} plus a
- * frozen-in-payload `mtime_ms` (filesystem modification time in unix-epoch
- * milliseconds, lifted via `fs.lstatSync(path).mtimeMs` so symlinks report
- * the link's own mtime — not the target's). `mtime_ms` is `null` when the
- * `lstat` failed (the file moved between `git status` enumeration and the
- * per-file `lstat`, the producer-side stat race documented in the task
- * spec's "Risks" section); the reducer reads `null` as "no inferred-
- * attribution possible for this file" and rolls forward without it.
- *
- * The producer no longer joins against the event log to compute per-job
- * touched-set / per-job dirty filter / project-wide orphan set — those
- * derivations move to the reducer (task fn-633.6) where they run inside
- * `BEGIN IMMEDIATE` against the persisted event log + `file_attributions`
- * table. The producer's contract narrows to "enumerate dirty files,
- * `lstat` each, embed mtime, post the payload".
- */
-/**
- * Schema v44 / epic fn-664 additive content axes. All three are pulled at
+ * One dirty-file entry on the file-centric {@link GitSnapshotPayload}. The three
+ * content axes (`worktree_oid`, `index_oid`, `worktree_mode`) are pulled at
  * producer time from one `git status --porcelain=v2` + one `git hash-object
- * --stdin-paths` shell-out per snapshot — frozen into the event payload so a
- * re-fold reproduces them byte-deterministically (no fold-time git probe).
+ * --stdin-paths` per snapshot — frozen into the payload so a re-fold reproduces
+ * them byte-deterministically (no fold-time git probe).
  *
- * - `worktree_oid`: the filter-correct git blob oid of this file's WORKTREE
- *   bytes — `git hash-object --stdin-paths` (single batched spawn per
- *   snapshot, NOT per-file), critically WITHOUT `--no-filters` so
- *   clean/CRLF smudge filters match the stored blob. Task .2 of the epic
- *   gates content-aware discharge on `committed_oid == worktree_oid`; a
- *   `null` here falls back to today's timestamp discharge (the producer
- *   couldn't hash this file — staged-deleted, untracked-symlink-to-nowhere,
- *   submodule, the `hash-object` exit signaled a per-path failure, etc.).
- * - `index_oid`: the porcelain-v2 `hI` field (free — already parsed off the
- *   `1`/`2` record). Captures the staged blob; lets task .2 distinguish
- *   "staged but unwritten" vs "staged + re-edited" (the orphan case the
- *   epic exists to fix). `null` for `untracked` / `unmerged` records that
- *   don't carry `hI`.
- * - `worktree_mode`: the porcelain-v2 `mW` field (also free). Records the
- *   worktree's file mode (`100644` / `100755` / `120000` for symlinks /
- *   `160000` for submodules / `000000` for staged-deleted). Task .2 uses
- *   this only to recognize the modes where a blob-oid equality test is
- *   meaningful (regular files + symlinks); other modes fall back to
- *   timestamp discharge.
+ * - `worktree_oid`: the filter-correct blob oid of this file's WORKTREE bytes
+ *   (`git hash-object --stdin-paths`, batched per snapshot; critically WITHOUT
+ *   `--no-filters` so clean/CRLF smudge filters match the stored blob). `null`
+ *   when the producer couldn't hash the file — falls back to timestamp discharge.
+ * - `index_oid` / `worktree_mode`: the porcelain `hI` / `mW` fields, used by the
+ *   reducer's content-aware discharge. `null` for `untracked`/`unmerged`.
+ *
+ * `mtime_ms` is the file's lstat mtime in unix-epoch ms (lstat, so a symlink
+ * reports its own mtime, not the target's); `null` on a stat race (the file
+ * moved between enumeration and lstat). The producer does NOT join the event log
+ * — per-job rollup, attribution, and orphan set are derived by the reducer.
  */
 export interface GitDirtyFile {
   path: string;
@@ -171,21 +121,15 @@ export interface GitDirtyFile {
 }
 
 /**
- * The file-centric `GitSnapshot` payload (schema v31 / task fn-633.5). Carries
- * the producer-observed `git status --porcelain=v2` parse — branch metadata,
- * HEAD oid, ahead/behind, and the dirty-file list with embedded `mtime_ms`
- * per file — and NOTHING else. Per-job rollup (`jobs[]`), per-file
- * attributions (`attributions[]`), and the project-wide orphan set
- * (`orphaned_files`) are derived by the reducer in `projectGitStatus`
- * (task fn-633.6) joining this payload against the persisted event log
- * and `file_attributions` table.
+ * The file-centric `GitSnapshot` payload: the producer-observed
+ * `git status --porcelain=v2` parse — branch metadata, HEAD oid, ahead/behind,
+ * and the dirty-file list with embedded `mtime_ms` per file — and NOTHING else.
  *
- * Why the producer doesn't compute attribution: a touched-set join over
- * the event log would have to happen at producer time, and the producer
- * runs without the writer lock — so two concurrent producers (real + a
- * future replay) would see different mid-fold projections. Moving the
- * join to the reducer's `BEGIN IMMEDIATE` makes attribution a pure
- * function of the persisted event log, restoring re-fold determinism.
+ * The producer must NOT compute attribution: a touched-set join over the event
+ * log would run at producer time WITHOUT the writer lock, so two producers (real
+ * + a future replay) would see different mid-fold projections. Attribution lives
+ * in the reducer's `BEGIN IMMEDIATE`, a pure function of the persisted event log
+ * — that's what keeps re-fold deterministic.
  */
 export interface GitSnapshotPayload {
   project_dir: string;
@@ -202,14 +146,12 @@ export interface GitSnapshotMessage extends GitSnapshotPayload {
 }
 
 /**
- * Tombstone message: a watched root has stopped satisfying the watch gate
- * ({@link shouldWatchRoot}) on reconcile — no `.planctl/` present AND the
- * worktree has been clean-and-pushed for ≥ {@link WATCH_DROP_DWELL_MS} (the
- * cooling-hysteresis dwell, epic fn-690). The worker is unsubscribing; main
- * lifts this into a synthetic `GitRootDropped` event whose reducer fold
- * DELETEs the corresponding `git_status` row — without it the projection
- * would leak the final pre-drop snapshot forever (the reducer's
- * `projectGitStatus` is UPSERT-only).
+ * Tombstone message: a watched root stopped satisfying the watch gate on
+ * reconcile (no `.planctl/` AND clean-and-pushed for ≥ {@link
+ * WATCH_DROP_DWELL_MS}). The worker is unsubscribing; main lifts this into a
+ * synthetic `GitRootDropped` event whose reducer fold DELETEs the `git_status`
+ * row — without it the UPSERT-only projection would leak the final pre-drop
+ * snapshot forever.
  */
 export interface GitRootDroppedMessage {
   kind: "git-root-dropped";
@@ -218,49 +160,26 @@ export interface GitRootDroppedMessage {
 
 /**
  * Per-commit message: a single commit landed in the HEAD-oid delta the worker
- * just observed. The worker enumerates the `<prev>..<new>` range and emits one
- * of these per commit (so an N-commit push lands N `Commit` events — each
- * carries its own trailer, file list, and parent oid). Main lifts every
- * message into a synthetic `Commit` event whose reducer fold
- * ({@link import("./reducer").foldCommit}) updates
+ * just observed. One per commit (an N-commit push lands N `Commit` events). Main
+ * lifts each into a synthetic `Commit` event whose reducer fold updates
  * `file_attributions.last_commit_at` for the named files — discharging the
- * attribution claim for the committer session, or globally clearing the
- * attribution for the named files when the trailer is absent / malformed
- * (the global-discharge fallback documented in the fn-633 epic spec).
+ * committer session's claim, or globally clearing it when the trailer is
+ * absent/malformed.
  *
- * `commit_oid` is the full SHA-1 (or SHA-256 on a future repo) of the commit
- * being attributed. `parent_oid` is the first-parent's full oid, or `null`
- * for the initial commit (no parent). `committed_at_ms` is unix-epoch
- * milliseconds, derived from git's `%ct` (committer date in unix seconds)
- * multiplied by 1000 — stamped into `file_attributions.last_commit_at` by
- * the reducer, so a from-scratch re-fold reproduces the same discharge
- * timestamp byte-deterministically (the reducer never re-shells git).
- *
- * `committer_session_id` is the validated session id pulled from the commit's
- * `Session-Id:` trailer via {@link
- * import("./derivers").parseSessionIdTrailer} (UUID-ish, take-last on
- * cherry-pick stacks). `null` when the trailer is absent, malformed, or
- * doesn't parse as a UUID — the reducer fold reads `null` as "global
- * discharge for this file set" (a human / CI commit clears every session's
- * attribution).
+ * `commit_oid` / `parent_oid` are full oids (`parent_oid` `null` on the initial
+ * commit). `committed_at_ms` is git's `%ct` × 1000, frozen so a re-fold
+ * reproduces the discharge timestamp (the reducer never re-shells git).
+ * `committer_session_id` is the validated `Session-Id:` trailer (`null` →
+ * global discharge).
  */
 /**
- * One file entry on the wire/payload of a {@link CommitMessage}. Schema v44
- * / fn-664: the producer's `diff-tree -r` parse pairs each committed path
- * with the new blob's oid (the bytes that just landed in HEAD for that
- * path). `blob_oid` is `null` for deletions (no blob to compare against),
- * for parse misses, and on producer fall-backs — the reducer treats
- * `null` as "cannot confirm content equality" and falls back to the
- * timestamp discharge rule.
- *
- * Schema v45 / fn-664.2: `committed_mode` joins the entry — the porcelain
- * `mI` field (`100644` / `100755` / `120000` / `160000`) lifted off the
- * same `diff-tree -r` record at parse time. The reducer's content-aware
- * discharge pairs `committed_mode` against the snapshot's `worktree_mode`
- * so a chmod-only dirty file (`committed_oid == worktree_oid`, modes
- * differ) is not wrongly discharged. Folds to `null` for deletions
- * (zero-mode sentinel) and for parse misses — null modes pair the same
- * way as null oids on the discharge gate (timestamp fall-back).
+ * One file entry on a {@link CommitMessage}. `blob_oid` is the new blob's oid
+ * from the `diff-tree -r` parse; `null` for deletions / parse misses / producer
+ * fall-backs (the reducer reads `null` as "cannot confirm content equality" and
+ * falls back to timestamp discharge). `committed_mode` is the porcelain `mI`
+ * field, paired by the reducer against the snapshot's `worktree_mode` so a
+ * chmod-only dirty file is not wrongly discharged; `null` symmetrically with
+ * `blob_oid`.
  */
 export interface CommitMessageFile {
   path: string;
@@ -276,28 +195,18 @@ export interface CommitMessage {
   files: CommitMessageFile[];
   committer_session_id: string | null;
   /**
-   * Epic fn-670 (T1): the validated, planctl-shaped `Task:` trailer
-   * values the producer collected from this commit's message via
-   * `%(trailers:key=Task,valueonly,unfold,separator=%x00)`. Multi-
-   * valued by design — `Task:` is collect-all, distinct from
-   * {@link committer_session_id} which is take-last canonical — so
-   * one `keeper commit-work` closing two tasks lights both entries.
-   * Empty `[]` on the common path (no `Task:` trailer present, or
-   * every collected value was malformed). Rides the {@link
-   * daemon.ts:onmessage} spread-serialize into the synthetic `Commit`
-   * event's `data` JSON; the reducer's T2 link fold reads it back
-   * via {@link extractCommit} (which defaults `[]` for pre-fn-670
-   * events — re-fold determinism).
+   * The validated, planctl-shaped `Task:` trailer values for this commit.
+   * Multi-valued (collect-all, unlike the take-last {@link
+   * committer_session_id}) so one `keeper commit-work` closing two tasks lights
+   * both. Empty `[]` when no valid `Task:` trailer is present. The reducer's link
+   * fold defaults `[]` for pre-existing events (re-fold determinism).
    */
   task_ids: string[];
   /**
-   * Epic fn-695: the normalized planctl op + validated target ref the
-   * producer lifted from this commit's `Planctl-Op:` / `Planctl-Target:`
-   * trailers (see {@link EnumeratedCommit}). Both `null` on a non-planctl
-   * commit. Ride the {@link daemon.ts:onmessage} commit-arm spread-
-   * serialize into the synthetic `Commit` event's `data` JSON; the
-   * reducer's edge fold reads them back via {@link extractCommit} (which
-   * defaults both to `null` for pre-fn-695 events — re-fold determinism).
+   * The normalized planctl op + validated target ref lifted from this commit's
+   * `Planctl-Op:` / `Planctl-Target:` trailers. Both `null` on a non-planctl
+   * commit. The reducer's edge fold defaults both to `null` for pre-existing
+   * events (re-fold determinism).
    */
   planctl_op: string | null;
   planctl_target: string | null;
@@ -305,27 +214,15 @@ export interface CommitMessage {
 }
 
 /**
- * Per-commit message announcing the `.planctl/**` paths that changed in
- * the just-observed commit (epic fn-681). Sibling to {@link CommitMessage}
- * — same trigger (a HEAD-oid delta), same `diff-tree -r` parse — but
- * dedicated to driving the plan-worker's commit-triggered ingest channel
- * instead of an `events`-row insert. Main forwards this verbatim to
- * plan-worker; the reducer never sees it (so re-fold determinism stays
- * intact — the planctl files are re-read from committed worktree state
- * on every ingest call, never from the message payload).
+ * Per-commit message announcing the `.planctl/**` paths that changed in the
+ * just-observed commit. Drives the plan-worker's commit-triggered ingest channel
+ * (not an `events`-row insert). Main forwards it verbatim to plan-worker; the
+ * reducer never sees it (re-fold determinism — the planctl files are re-read from
+ * committed worktree state on every ingest, never from this payload).
  *
- * The producer filters {@link EnumeratedCommitFile} to planctl-shaped
- * paths via {@link classifyPlanctlPath} so the worker receives a tight
- * list — no recipient-side re-classification. One message per commit
- * even when several arrive in a single push, so the worker can attribute
- * each path back to its commit if a future use case needs it; the common
- * path (one push, one commit) lands one message regardless.
- *
- * `project_dir` is the absolute committing-repo root the worker is
- * watching; plan-worker joins it with each {@link PlanctlChangedFile.path}
- * to recover the absolute path it stats + reads. {@link changes} is
- * non-empty by construction — the producer suppresses emission when no
- * planctl path moved in the delta.
+ * The producer filters to planctl-shaped paths so the worker needs no
+ * re-classification. One message per commit; {@link changes} is non-empty by
+ * construction (emission is suppressed when no planctl path moved).
  */
 export interface PlanctlChangedFile {
   /** Repo-relative path (forward-slash on POSIX). */
@@ -346,9 +243,8 @@ export type GitWorkerMessage =
   | GitRootDroppedMessage
   | CommitMessage
   | PlanctlCommitChangedMessage
-  // Epic fn-720: a backstop rescue/rollup record posted up to main (the SOLE
-  // sidecar writer). NOT folded into the event log — a pure consumer-side
-  // side-file. Routed straight to `handleBackstopMessage`.
+  // A backstop rescue/rollup record posted up to main (the sole sidecar writer).
+  // NOT folded into the event log — routed straight to `handleBackstopMessage`.
   | BackstopMessage;
 
 interface ParsedGitStatus {
@@ -360,110 +256,87 @@ interface ParsedGitStatus {
   files: GitFileStatus[];
 }
 
-/** `PRAGMA data_version` cadence — same shape as `wake-worker.ts`. */
+/** `PRAGMA data_version` cadence. */
 const DB_POLL_MS = 100;
-/** Silent-watcher backstop, same shape as `transcript-worker.ts`. */
+/** Silent-watcher backstop. */
 const HEARTBEAT_MS = 60_000;
 /**
- * Cadence (ms) at which the worker flushes its backstop counters as
- * {@link BackstopRollup} records (epic fn-720) — the denominator
- * (fires_total / rescues_total) `scripts/backstop-stats.ts` divides into the
- * rescue records for a true RATE. Slow (5 min); a clean shutdown also flushes
- * one final rollup so a quiescent daemon still records a complete denominator.
+ * Cadence at which the worker flushes its backstop counters as rollup records —
+ * the fires/rescues denominator for a true rate. A clean shutdown also flushes
+ * one final rollup so a quiescent daemon records a complete denominator.
  */
 const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
 /**
- * Per-root GitSnapshot emission ceiling (epic fn-716). Passed into every
- * {@link RescanScheduler} (the `maxWaitMs` ceiling added in task fn-716.1) so a
- * root under CONTINUOUS churn emits ≤1 GitSnapshot per this window — a trailing
- * debounce alone re-arms forever under sustained edits and never flushes, so
- * staleness is unbounded; the ceiling caps it. The trailing debounce
- * ({@link DEFAULT_DEBOUNCE_MS}, 500ms) still wins on a bursty-then-quiet edit
- * (the common case), this only bites when edits land faster than the debounce.
- * 1.5s sits inside the epic's "≤1 per ~1-2s" bar.
+ * Per-root GitSnapshot emission ceiling, passed as the {@link RescanScheduler}
+ * `maxWaitMs` so a root under CONTINUOUS churn emits ≤1 GitSnapshot per window
+ * — a trailing debounce alone re-arms forever under sustained edits and never
+ * flushes. The trailing debounce ({@link DEFAULT_DEBOUNCE_MS}) still wins on a
+ * bursty-then-quiet edit; this only bites when edits outpace the debounce.
  */
 const GIT_SNAPSHOT_MAX_WAIT_MS = 1500;
 const GIT_TIMEOUT_MS = 2000;
 /**
- * Per-root TTL on the watch-membership verdict ({@link probeWatchMembership})
- * for roots that ARE currently watched. Short, because a watched root is the
- * one most likely to flip — we want a recent `git status` for the dwell timer
- * and for early drops on a clean+pushed transition. Cheap to re-probe (the
- * candidate set is already tiny — the watched set is bounded).
+ * Per-root TTL on the watch-membership verdict for CURRENTLY-WATCHED roots.
+ * Short — a watched root is the one most likely to flip, and we want a recent
+ * `git status` for the dwell timer and early clean+pushed drops.
  */
 const WATCH_PROBE_TTL_HOT_MS = 5_000;
 /**
- * Per-root TTL on the watch-membership verdict for roots that are NOT
- * currently watched (cold candidates). Longer — a still-clean repo doesn't
- * need re-checking every reconcile cycle. The full-history sweep also runs at
- * a lower cadence, so a cold root is naturally re-probed less often.
+ * Per-root TTL for cold (candidate-but-unwatched) roots. Longer — a still-clean
+ * repo needn't be re-checked every cycle.
  */
 const WATCH_PROBE_TTL_COLD_MS = 90_000;
 /**
- * Cadence at which the candidate set widens to ALL `DISTINCT cwd` rows from
- * the jobs table (the slow sweep), instead of just the recent + watched set
- * (the fast sweep). Lets a stale unpushed-but-clean repo surface after a
- * keeper restart (empty watched-set memory). Throttled because the slow
- * sweep can probe N candidates synchronously and we want steady-state
+ * Cadence at which the candidate set widens to ALL `DISTINCT cwd` rows (the slow
+ * sweep) instead of just recent + watched (the fast sweep). Surfaces a stale
+ * unpushed-but-clean repo after a keeper restart; throttled to keep steady-state
  * spawns ≈ 0.
  */
 const FULL_SWEEP_INTERVAL_MS = 5 * 60_000;
 /**
  * Recent-job window for the fast-path candidate build: a `jobs` row is a
- * candidate if `state='working'` OR `updated_at` falls within this many
- * milliseconds of now. 2h covers human-paced multi-session days without
- * dredging up week-old idle sessions whose repos are long gone.
+ * candidate if `state='working'` OR `updated_at` is within this window. Covers
+ * human-paced multi-session days without dredging up week-old idle sessions.
  */
 const RECENT_JOB_WINDOW_MS = 2 * 60 * 60 * 1000;
 /**
- * Cooling dwell before a non-`.planctl` root that becomes clean-and-pushed
- * is dropped. Must be ≥ HEARTBEAT_MS + one snapshot/commit-enumeration
- * cycle so a post-commit `emitSnapshot` (HEAD-delta commit enumeration,
- * fn-670 `Task:` link + discharge) drains BEFORE the tombstone wipes the
- * file_attributions claim. 45s is one heartbeat (60s) reduced by the
- * worst-case snapshot debounce; in practice the next heartbeat covers it.
+ * Cooling dwell before a non-`.planctl` clean-and-pushed root is dropped. Must
+ * be ≥ HEARTBEAT_MS + one snapshot/commit-enumeration cycle so a post-commit
+ * `emitSnapshot` (HEAD-delta enumeration → `Task:` link + discharge) drains
+ * BEFORE the tombstone wipes the file_attributions claim.
  */
 const WATCH_DROP_DWELL_MS = 45_000;
 /**
- * Cap on new subscribes per reconcile cycle. Prevents the first full sweep
- * (or a re-discovery after a keeper restart) from instantly subscribing
- * hundreds of roots — which would balloon FSEvents streams into
- * `fseventsd` bad-state. Remaining joins land on subsequent cycles
- * (every DB-poll tick, every heartbeat).
+ * Cap on new subscribes per reconcile cycle: the first full sweep (or
+ * post-restart re-discovery) must not subscribe hundreds of roots at once, which
+ * would balloon FSEvents streams into `fseventsd` bad-state. Remaining joins land
+ * on subsequent cycles.
  */
 const MAX_SUBSCRIBES_PER_CYCLE = 16;
 /**
- * How long the worker's `git`-derived HEAD may CONTINUOUSLY disagree with the
- * fs-derived HEAD before the divergence watchdog escalates (`process.exit(1)`
- * → LaunchAgent restart). During the window every divergent snapshot is
- * SUPPRESSED — see {@link decideHeadDivergence} and the gate in `emitSnapshot`.
- * 90s rides out the sub-second window where a commit lands between `readStatus`
- * and the fs ref read (a healthy commit reconciles within one debounce), while
- * recovering a genuine wedge before agents lose trust in the surface. Measured
- * on the monotonic clock (`performance.now()`), never wall-time.
+ * How long the `git`-derived HEAD may CONTINUOUSLY disagree with the fs-derived
+ * HEAD before the divergence watchdog escalates (`process.exit(1)` → LaunchAgent
+ * restart). Divergent snapshots are SUPPRESSED during the window. Long enough to
+ * ride out the sub-second window where a commit lands between `readStatus` and
+ * the fs ref read, short enough to recover a genuine wedge before agents lose
+ * trust. Measured on the monotonic clock, never wall-time.
  */
 const HEAD_DIVERGENCE_GRACE_MS = 90_000;
 
 /**
- * Epic fn-705 (T2): retry cap for a failed `enumerateCommitsInDelta` in
- * `emitSnapshot`. The commit channel (fn-681 `planctl-commit-changed` + the
- * `Commit` discharge) MUST NOT silently drop a commit when enumeration throws
- * transiently — so on a throw the per-root HEAD-oid cache is held back, and
- * the next HEAD-oid observation re-enumerates the same range. To bound the
- * spin on a PERMANENTLY broken object (a corrupt pack, a missing loose
- * object), after this many consecutive failures the cache advances anyway
- * with a loud one-time alarm, accepting the lost commit rather than
- * re-enumerating the same poisoned range on every observation forever. The
- * 60s heartbeat backstop still recovers the projection in that pathological
- * case. See {@link decideHeadCacheAdvance}.
+ * Retry cap for a failed `enumerateCommitsInDelta` in `emitSnapshot`. The commit
+ * channel MUST NOT silently drop a commit on a transient enumeration throw — so
+ * the per-root HEAD-oid cache is held back and the next observation re-enumerates
+ * the same range. To bound the spin on a PERMANENTLY broken object, after this
+ * many consecutive failures the cache advances anyway with a loud one-time alarm;
+ * the heartbeat backstop still recovers the projection.
  */
 export const COMMIT_ENUM_MAX_RETRIES = 5;
 
 /**
- * Positive ignore globs for `@parcel/watcher`. Mirrors `plan-worker.ts`'s
- * `IGNORE_GLOBS` — the same noise (build outputs, vendored deps, package
- * caches) that floods FSEvents under a broad watch root. Duplicated rather
- * than shared because the two workers may diverge over time.
+ * Positive ignore globs for `@parcel/watcher` — build outputs, vendored deps,
+ * package caches that flood FSEvents under a broad watch root. Mirrors
+ * `plan-worker.ts`'s `IGNORE_GLOBS`, duplicated so the two workers may diverge.
  */
 const GIT_IGNORE_GLOBS = [
   "**/node_modules/**",
@@ -478,19 +351,12 @@ const GIT_IGNORE_GLOBS = [
 ];
 
 /**
- * Positive ignore globs for the sibling `@parcel/watcher` subscription on each
- * worktree's git common-dir. The point of that subscription is to fire on
- * commit/checkout/branch-switch/fetch — operations that mutate `HEAD`,
- * `index`, `refs/heads/**`, `refs/remotes/**`, or `packed-refs` without
- * touching any worktree file. Everything below is high-churn noise that
- * doesn't affect `git status` output: object packs (a single `git gc` emits
- * thousands of events under `objects/`), reflogs (every ref move appends to
- * `logs/`), user-installed hooks and git-lfs storage that we never read, and
- * transient `*.lock` files (`index.lock`, `HEAD.lock`, `refs/heads/foo.lock`)
- * created and removed on every git write. The 500ms scheduler debounce plus
- * the per-root JSON dedupe in `emitSnapshot` would absorb these as no-ops,
- * but pruning them at the watcher reduces the FSEvents pressure that itself
- * causes drop-recovery storms.
+ * Positive ignore globs for the sibling git-common-dir subscription, which fires
+ * on commit/checkout/branch-switch/fetch (HEAD / index / refs / packed-refs
+ * mutations). Everything below is high-churn noise that doesn't affect
+ * `git status`: object packs, reflogs, hooks, git-lfs storage, and transient
+ * `*.lock` files. The debounce + dedupe would absorb them as no-ops, but pruning
+ * at the watcher cuts the FSEvents pressure that causes drop-recovery storms.
  */
 const GIT_DIR_IGNORE_GLOBS = [
   "**/objects/**",
@@ -559,12 +425,9 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
 
     const parts = rec.split(" ");
     if (parts[0] === "1") {
-      // Porcelain v2 ordinary record:
-      //   `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`
-      // So `mW = parts[5]` and `hI = parts[7]` are the v44 / fn-664 free
-      // adds. Defensive `?? null` keeps a malformed shorter record from
-      // throwing; the consumer reads `null` as "no oid/mode available"
-      // and falls back to the timestamp discharge.
+      // Ordinary record `1 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <path>`:
+      // `mW = parts[5]`, `hI = parts[7]`. `?? null` keeps a malformed short
+      // record from throwing (consumer reads `null` as "no oid/mode").
       const xy = parts[1] ?? "??";
       const path = parts.slice(8).join(" ");
       if (path.length > 0) {
@@ -579,11 +442,9 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
         });
       }
     } else if (parts[0] === "2") {
-      // Porcelain v2 renamed/copied record:
-      //   `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score> <path>`
-      // Same offsets as record `1` for `mW` (parts[5]) and `hI` (parts[7]);
-      // the rename score sits at parts[8] and the new path starts at
-      // parts[9]. The orig path follows in the next NUL-separated record.
+      // Renamed/copied record `2 <XY> <sub> <mH> <mI> <mW> <hH> <hI> <X><score>
+      // <path>`: same `mW`/`hI` offsets as record `1`; score at parts[8], new
+      // path at parts[9], orig path in the next NUL-separated record.
       const xy = parts[1] ?? "??";
       const path = parts.slice(9).join(" ");
       const orig = records[++i] ?? "";
@@ -600,10 +461,8 @@ export function parsePorcelainV2(raw: string): ParsedGitStatus {
         });
       }
     } else if (parts[0] === "u") {
-      // Porcelain v2 unmerged records carry three oids and three modes
-      // (stages 1/2/3) — none of which map onto a single `index_oid`
-      // semantically. Leave both fields null; task .2 falls back to
-      // timestamp discharge for any unmerged path.
+      // Unmerged records carry three oids/modes (stages 1/2/3), none of which
+      // maps onto a single `index_oid` — leave both null (timestamp discharge).
       const xy = parts[1] ?? "UU";
       const path = parts.slice(10).join(" ");
       if (path.length > 0) {
@@ -642,10 +501,9 @@ function gitOutput(args: string[]): string | null {
   try {
     // `--no-optional-locks`: the daemon is a pure OBSERVER and must never take
     // `.git/index.lock`. A plain `git status` opportunistically refreshes the
-    // index stat-cache, which grabs the lock and races the watched session's
-    // own `git add` / commit — surfacing as a `fatal: Unable to create
-    // index.lock` "tooling error" in the agent, and (when our 2s timeout kills
-    // git mid-refresh) leaving a stale lock that wedges the repo until cleared.
+    // index stat-cache, grabbing the lock and racing the watched session's own
+    // `git add` / commit (a "fatal: Unable to create index.lock" in the agent,
+    // or a stale lock that wedges the repo when our timeout kills git mid-refresh).
     const res = Bun.spawnSync(["git", "--no-optional-locks", ...args], {
       stdout: "pipe",
       stderr: "ignore",
@@ -661,17 +519,10 @@ function gitOutput(args: string[]): string | null {
 }
 
 /**
- * Resolve a candidate path (typically a `cwd`) to its containing git
- * toplevel, or `null` if the path isn't inside a git worktree.
- *
- * Split out from the legacy `gitRootFor` (epic fn-690): cwd→toplevel
- * resolution is stable for a session's lifetime and is the dominant cost in
- * `discoverProjectRoots` (one `git rev-parse` shell-out per cwd, every
- * reconcile). The membership verdict — whether keeper should ACTUALLY watch
- * a resolved root — moves into {@link shouldWatchRoot}, which re-runs
- * dynamically per reconcile against a fresh probe. The cwd→toplevel cache
- * (in `discoverProjectRoots`) is permanent for the daemon's lifetime; the
- * membership verdict's cache (`watchProbeCache`) has a short TTL.
+ * Resolve a candidate path (typically a `cwd`) to its containing git toplevel,
+ * or `null` if the path isn't inside a git worktree. cwd→toplevel is stable for
+ * a session's lifetime, so its cache is permanent; the separate membership
+ * verdict ({@link shouldWatchRoot}) re-runs per reconcile against a fresh probe.
  */
 function resolveGitToplevel(path: string): string | null {
   const out = gitOutput(["-C", path, "rev-parse", "--show-toplevel"]);
@@ -681,24 +532,17 @@ function resolveGitToplevel(path: string): string | null {
 }
 
 /**
- * The dynamic per-reconcile watch-membership probe (epic fn-690). Returns
- * the just-observed (dirty, ahead) verdict for `root` so {@link
- * shouldWatchRoot} can decide whether the root qualifies for the watched
- * set. ONE combined `git status --porcelain=v2 --branch` spawn yields both
- * facts:
- *   - dirty = any non-`#` record present in the parse,
- *   - ahead = the `# branch.ab +N -M` count of local-commits-ahead-of-
- *     upstream (`0` when no `# branch.ab` line is present, e.g. no upstream
- *     configured / detached HEAD).
+ * The dynamic per-reconcile watch-membership probe. ONE combined
+ * `git status --porcelain=v2 --branch` spawn yields both facts {@link
+ * shouldWatchRoot} needs:
+ *   - dirty = any non-`#` record present,
+ *   - ahead = the `# branch.ab +N -M` count (`0` when absent).
  *
- * Critically uses `-unormal` (the default), NOT `-uall`: the full untracked
- * descent is the perf cliff that motivated the dynamic gate's bounded
- * candidate set. `-unormal` is sufficient for an is-dirty verdict.
+ * Uses `-unormal` (the default), NOT `-uall`: the full untracked descent is a
+ * perf cliff, and `-unormal` is sufficient for an is-dirty verdict.
  *
- * Returns `null` on timeout/error so the caller can decide what to do:
- * `shouldWatchRoot` fails OPEN for an already-watched root (retain it, the
- * caller should re-probe next cycle), but CLOSED for a cold candidate
- * (don't join on a broken probe).
+ * Returns `null` on timeout/error; `shouldWatchRoot` fails OPEN for an
+ * already-watched root, CLOSED for a cold candidate.
  */
 export function probeWatchMembership(
   root: string,
@@ -716,28 +560,20 @@ export function probeWatchMembership(
       }
       continue;
     }
-    // Any non-`#` record = a dirty entry (`1`/`2`/`u`/`?`). We don't need to
-    // count them; one is enough to flip the verdict.
+    // Any non-`#` record = a dirty entry; one is enough to flip the verdict.
     dirty = true;
   }
   return { dirty, ahead };
 }
 
 /**
- * Pure decision (epic fn-690): given a resolved git `root` and an optional
- * just-observed probe verdict, does keeper want to watch this root?
+ * Pure decision: does keeper want to watch this resolved git `root`?
  *
- *   - `.planctl/` present → ALWAYS watch. Short-circuit BEFORE looking at
- *     the probe, so a `.planctl` repo never incurs a probe spawn (this
- *     keeps the historical zero-cost cycle for plan-backed roots).
- *   - probe is `null` (timeout / error) → fail-open if `currentlyWatched`,
- *     fail-closed otherwise. Don't join on a broken probe; don't drop a
- *     watched root just because one probe stuttered.
- *   - probe is non-null → watch iff dirty OR ahead > 0.
- *
- * Pure & exported for unit-testable verdict-only fixture coverage. The
- * caller supplies the probe via {@link probeWatchMembership} so the test
- * surface stays decoupled from the spawnSync side-effect.
+ *   - `.planctl/` present → ALWAYS watch, short-circuit BEFORE the probe (a
+ *     `.planctl` repo never incurs a probe spawn).
+ *   - probe `null` (timeout/error) → fail-open if `currentlyWatched`, closed
+ *     otherwise (don't join on a broken probe; don't drop on a stutter).
+ *   - probe non-null → watch iff dirty OR ahead > 0.
  */
 export function shouldWatchRoot(
   root: string,
@@ -757,9 +593,7 @@ export function shouldWatchRoot(
  * `packed-refs`, `refs/remotes/*`) live. For a regular repo the two return
  * the same path. The worktree's own per-worktree `HEAD` and `index` sit
  * inside the common-dir at `worktrees/<name>/`, so this single subscription
- * covers both worktree-local and shared-ref mutations.
- *
- * git's default output is relative to `root`; we resolve to absolute so
+ * covers both worktree-local and shared-ref mutations. Resolved to absolute so
  * `@parcel/watcher.subscribe` gets a stable canonical path.
  */
 function gitCommonDirFor(root: string): string | null {
@@ -772,25 +606,20 @@ function gitCommonDirFor(root: string): string | null {
 
 /**
  * Resolve a worktree's current HEAD oid by reading the git ref files DIRECTLY
- * via `fs` — never shelling out to `git`. This is the {@link decideHeadDivergence}
- * wedge guard's independent ground truth (see `snapshotSuppressedByDivergence`).
+ * via `fs` — never shelling out to `git`. The {@link decideHeadDivergence} wedge
+ * guard's independent ground truth.
  *
- * *Why fs and not `git rev-parse`:* the failure mode this guards against is a
- * long-running worker whose `git` subprocess invocations silently return a
- * STALE view (observed in the wild — `readStatus` froze on an old HEAD for ~50
- * min while the repo advanced three commits, surfacing committed files as
- * phantom `<orphan>` dirty entries across every watched repo). A divergence
- * check that also shells `git` would read the same stale value and never fire.
- * `fs` reads stay correct in that wedged state — the same worker was still
- * `lstat`ing live mtimes throughout — so a direct ref read is the one source we
- * can trust to catch the wedge.
+ * *Why fs and not `git rev-parse`:* the guarded failure mode is a long-running
+ * worker whose `git` subprocess silently returns a STALE view (a frozen HEAD
+ * while the repo advances, surfacing committed files as phantom `<orphan>`
+ * entries). A divergence check that also shelled `git` would read the same stale
+ * value and never fire; `fs` reads stay correct in that wedged state.
  *
- * Handles the common cases: a regular repo (`<root>/.git/`), a linked worktree
- * (`<root>/.git` is a `gitdir:`-pointer file → per-worktree dir with a sibling
- * `commondir`), a symbolic `ref:` HEAD resolved against the loose ref then
- * `packed-refs`, and a detached HEAD (oid inline). Returns the 40/64-hex oid, or
- * `null` on any shape it can't resolve cheaply — the watchdog treats `null` as
- * "can't determine truth this cycle" and never escalates on it (fail-safe).
+ * Handles a regular repo, a linked worktree (`<root>/.git` is a `gitdir:` pointer
+ * → per-worktree dir with a sibling `commondir`), a symbolic `ref:` HEAD resolved
+ * against the loose ref then `packed-refs`, and a detached HEAD (inline oid).
+ * Returns the 40/64-hex oid, or `null` on any shape it can't resolve cheaply —
+ * the watchdog treats `null` as "can't determine truth" and never escalates.
  */
 export function resolveHeadOidViaFs(root: string): string | null {
   const isOid = (s: string): boolean => /^[0-9a-f]{40}$|^[0-9a-f]{64}$/.test(s);
@@ -847,24 +676,15 @@ export function resolveHeadOidViaFs(root: string): string | null {
 
 /**
  * Pure decision for the `emitSnapshot` HEAD-divergence gate (the wedge guard).
- * Split out from the worker closure so it is unit-testable and deterministic.
+ * `gitHead` is what `readStatus` reported; `fsHead` is the trusted ground truth
+ * ({@link resolveHeadOidViaFs}).
  *
- * The wedge: keeper's long-lived git-worker thread can start returning a STALE
- * `git status` view (frozen HEAD + dirty set) for many minutes while the same
- * process's `fs` reads stay fresh — a `Bun.spawnSync`/long-Worker boundary
- * defect we could not minimally reproduce, so we DETECT-AND-PREVENT rather than
- * cure. `gitHead` is what `readStatus` just reported; `fsHead` is
- * {@link resolveHeadOidViaFs} (the trusted ground truth).
- *
- * - Agreement, or `fsHead == null` (can't verify — fail OPEN, trust git), or a
- *   null `gitHead`: not divergent. `suppress=false`, `sinceMs=null` (reset the
- *   timer), `trip=false`.
- * - Divergence: `suppress=true` — the caller must NOT emit this snapshot,
- *   enumerate its commits, or advance any head cache (the payload is untrusted,
- *   a data-INTEGRITY failure, not just staleness). `sinceMs` is the monotonic
- *   start of the current divergence run (carried in from prior state, or
- *   `nowMs` on first divergence). `trip=true` once it has persisted ≥ `graceMs`
- *   — the caller then exits for a LaunchAgent restart, the only honest recovery.
+ * - Agreement, `fsHead == null` (can't verify — fail OPEN, trust git), or null
+ *   `gitHead`: not divergent. `suppress=false`, `sinceMs=null`, `trip=false`.
+ * - Divergence: `suppress=true` — the caller must NOT emit, enumerate commits,
+ *   or advance any head cache (a data-INTEGRITY failure, not mere staleness).
+ *   `sinceMs` is the monotonic start of the run; `trip=true` once it persists ≥
+ *   `graceMs`, when the caller exits for a LaunchAgent restart.
  */
 export interface HeadDivergenceDecision {
   suppress: boolean;
@@ -888,30 +708,19 @@ export function decideHeadDivergence(
 
 /**
  * Pure decision for whether `emitSnapshot` may advance the per-root HEAD-oid
- * cache (`lastHeadOidByRoot`) after attempting `enumerateCommitsInDelta` over
- * a HEAD-oid delta. Split out of the closure so the retry/backstop policy is
- * unit-testable (mirrors {@link decideHeadDivergence}).
+ * cache after attempting `enumerateCommitsInDelta`. A transient enumeration
+ * throw must NOT skip the failed range (that would permanently drop the commit's
+ * `planctl-commit-changed` + `Commit` discharge):
  *
- * Epic fn-705 (T2). The old `emitSnapshot` advanced the cache UNCONDITIONALLY
- * (even when enumeration threw), so a single transient enumeration failure
- * skipped the failed range forever: the commit's `planctl-commit-changed`
- * (and `Commit` discharge) was never re-emitted and the projection fell back
- * to FSEvents + the 60s heartbeat. The fix:
- *
- * - `enumOk === true` (enumeration succeeded — including the no-commits and
- *   no-planctl-changes cases): advance, reset the failure counter to 0.
- * - `enumOk === false` (enumeration threw) AND `priorFailures + 1 < maxRetries`:
- *   HOLD the cache (`advance=false`) so the next HEAD-oid observation
- *   re-enumerates the same range. Carry the bumped failure count.
- * - `enumOk === false` AND `priorFailures + 1 >= maxRetries`: a persistently
- *   broken range (corrupt object). Advance anyway (`advance=true`,
- *   `loudBackstop=true`) to break the re-enumeration spin, reset the counter,
- *   and let the caller emit a one-time loud alarm. The 60s heartbeat still
+ * - `enumOk === true`: advance, reset the failure counter.
+ * - `enumOk === false` AND `priorFailures + 1 < maxRetries`: HOLD the cache so
+ *   the next observation re-enumerates the range; carry the bumped count.
+ * - `enumOk === false` AND retries exhausted: a persistently broken range —
+ *   advance anyway (`loudBackstop=true`) to break the spin; the heartbeat
  *   recovers the projection.
  *
- * Note `advance` only gates the head-cache write; the divergence wedge gate is
- * upstream and `return`s before this is ever consulted, so a suppressed
- * snapshot likewise never advances the cache (and re-enumerates on clear).
+ * `advance` gates ONLY the head-cache write; the divergence gate is upstream and
+ * returns first, so a suppressed snapshot never advances the cache.
  */
 export interface HeadCacheAdvanceDecision {
   advance: boolean;
@@ -933,7 +742,7 @@ export function decideHeadCacheAdvance(
     return { advance: false, nextFailures: failures, loudBackstop: false };
   }
   // Retry budget exhausted — advance anyway (loud) to avoid a hot spin on a
-  // permanently poisoned range; the heartbeat backstop covers the lost commit.
+  // permanently poisoned range; the heartbeat covers the lost commit.
   return { advance: true, nextFailures: 0, loudBackstop: true };
 }
 
@@ -952,24 +761,12 @@ function readStatus(root: string): ParsedGitStatus | null {
 }
 
 /**
- * One file entry in an {@link EnumeratedCommit}. Schema v44 / fn-664: the
- * commit-time blob oid joins the path so the reducer's content-aware
- * discharge (task .2) can compare `committed_oid` against the snapshot's
- * `worktree_oid` per-file. The producer derives `blob_oid` from
- * `git diff-tree -r --no-commit-id <commit>` (the "new" oid in each
- * record); a malformed/missing oid folds to `null` so a single bad record
- * never wedges the whole commit message.
- *
- * Schema v45 / fn-664.2: `committed_mode` joins the entry — the porcelain
- * mode `mI` from the same `diff-tree` record (`100644` / `100755` /
- * `120000` for symlinks / `160000` for submodules / `000000` for the
- * deletion side). The reducer's content-aware discharge gate pairs
- * `committed_mode` against the snapshot's `worktree_mode` so a chmod-only
- * dirty file — `committed_oid == worktree_oid` but mode differs — is NOT
- * wrongly discharged (the blob bytes are equal but the file is still on
- * the hook for its mode change). Folds to `null` symmetrically with
- * `blob_oid` on any parse miss; the discharge gate treats null modes the
- * same as null oids (fall back to today's timestamp discharge).
+ * One file entry in an {@link EnumeratedCommit}. `blob_oid` is the new (committed)
+ * blob's oid from `git diff-tree -r`; `committed_mode` the porcelain `mI` mode
+ * from the same record. The reducer's content-aware discharge pairs both against
+ * the snapshot's `worktree_oid`/`worktree_mode` so a chmod-only dirty file is not
+ * wrongly discharged. Either folds to `null` on a parse miss (discharge gate
+ * falls back to timestamp).
  */
 interface EnumeratedCommitFile {
   path: string;
@@ -990,40 +787,27 @@ export interface EnumeratedCommit {
   committer_session_id: string | null;
   task_ids: string[];
   /**
-   * Epic fn-695: the normalized planctl op (`Planctl-Op:` trailer →
-   * {@link normalizePlanctlOp}) and the validated target ref
-   * (`Planctl-Target:` trailer → {@link parsePlanRef}). Both `null`
-   * when the commit carried no such trailer (every non-`chore(planctl)`
-   * commit) or the value was empty / malformed. Frozen here at producer
-   * time and read back unchanged by the reducer's edge fold — re-fold
-   * determinism (no fold-time git probe).
+   * The normalized planctl op (`Planctl-Op:` trailer → {@link normalizePlanctlOp})
+   * and validated target ref (`Planctl-Target:` → {@link parsePlanRef}). Both
+   * `null` on a non-planctl / malformed commit. Frozen at producer time, read
+   * back unchanged by the reducer's edge fold (re-fold determinism).
    */
   planctl_op: string | null;
   planctl_target: string | null;
   committed_at_ms: number;
 }
 
-/**
- * Anchored full-OID match — same shape as `derivers.ts` `GIT_OID_RE`.
- * Module-scope literal so V8/JSC tier up once at process start.
- */
+/** Anchored full-OID match — same shape as `derivers.ts` `GIT_OID_RE`. */
 const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
 
 /**
- * Is this repo-relative path one the plan-worker projects (epic fn-681)?
- * Matches the SAME shapes plan-worker's `classifyPlanPath` recognizes,
- * intentionally duplicated here so the two workers stay independent (no
- * cross-worker module import — the producer/consumer contract is the
- * message shape, not a shared classifier function). If this set ever
- * widens, BOTH classifiers must move in lockstep.
- *
- * Recognised shapes (forward-slash split — `git diff-tree` always emits
- * POSIX separators regardless of platform):
+ * Is this repo-relative path one the plan-worker projects? Matches the SAME
+ * shapes plan-worker's `classifyPlanPath` recognizes, duplicated so the two
+ * workers stay independent — if this set widens, BOTH classifiers must move in
+ * lockstep. Recognised shapes (forward-slash split):
  * - `.planctl/epics/<id>.json` (3-segment)
  * - `.planctl/tasks/<id>.json` (3-segment)
  * - `.planctl/state/tasks/<id>.state.json` (4-segment)
- *
- * Pure — does no I/O. Exported for unit reach.
  */
 export function isPlanctlChangedPath(path: string): boolean {
   if (!path.endsWith(".json")) return false;
@@ -1048,16 +832,9 @@ export function isPlanctlChangedPath(path: string): boolean {
 }
 
 /**
- * Filter a commit's enumerated file list to planctl-shaped paths and
- * pair each with its add/update-vs-delete tag (epic fn-681). Delete is
- * signalled by the producer's null sentinels on the {@link
- * EnumeratedCommitFile} record — `commitFiles` lifts a zero-oid /
- * zero-mode `diff-tree` line to `{blob_oid: null, committed_mode: null}`,
- * which is the producer's honest "the file was removed" marker. We treat
- * a null `blob_oid` as `"delete"` and every other shape as `"upsert"` —
- * matching the plan-worker's `onChange` / `onDelete` dispatch.
- *
- * Pure — does no I/O. Exported for unit reach.
+ * Filter a commit's enumerated file list to planctl-shaped paths, pairing each
+ * with an upsert/delete tag. A null `blob_oid` (the producer's zero-oid
+ * "removed" marker) is `"delete"`; everything else is `"upsert"`.
  */
 export function filterPlanctlChanges(
   files: EnumeratedCommitFile[],
@@ -1072,30 +849,18 @@ export function filterPlanctlChanges(
 
 /**
  * Shell-out + parse for one commit's file list via
- * `git -C <root> diff-tree -r --no-commit-id --no-renames -z <oid>`. Schema
- * v44 / epic fn-664: switched from `git log -1 <oid> --name-only` to
- * `diff-tree -r` so each record carries the new BLOB OID for the path
- * alongside the path itself — task .2 of the epic uses this to gate
- * content-aware discharge on `committed_oid == worktree_oid`.
+ * `git -C <root> diff-tree -r --no-commit-id --no-renames -z <oid>`, so each
+ * record carries the new BLOB OID alongside the path (the content-aware
+ * discharge gate's `committed_oid == worktree_oid` input).
  *
- * Output format (per the git docs, with `-z`):
- *   `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0` ... per file
- * — where `hI` here is the NEW blob's oid (the committed bytes for the
- * non-merge path). `-z` swaps the per-record `\n` terminator and the
- * intra-record TAB into NULs, keeping paths with spaces/newlines whole.
- * `--no-renames` is load-bearing — without it, renames emit two paths per
- * record and the alignment math here would have to special-case them; the
- * task spec also recommends `--no-renames` to keep the discharge surface
- * file-path-keyed (a rename is recorded as add+delete from the
- * attribution perspective, which is the honest semantic).
+ * Output (with `-z`): `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0` per file, where
+ * `hI` is the new blob's oid. `--no-renames` is load-bearing — without it renames
+ * emit two paths per record and the alignment math would have to special-case
+ * them; it also keeps the discharge surface file-path-keyed (a rename = add+delete).
  *
- * Returns the file list with each path paired against its validated
- * `blob_oid` (40-hex / 64-hex). Bad/missing oid → `null` for that one
- * entry without dropping the path (the discharge gate falls back to the
- * timestamp rule on a `null` oid; that's safer than silently omitting the
- * file from the commit's discharge set). Empty array on any non-zero exit
- * / parse miss (the producer-only invariant means a failed shell-out can't
- * wedge the worker; the next snapshot or commit will re-attempt).
+ * A bad/missing oid → `null` for that entry without dropping the path (discharge
+ * falls back to timestamp). Empty array on any non-zero exit / parse miss (a
+ * failed shell-out can't wedge the worker; the next snapshot re-attempts).
  */
 function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
   const out = gitOutput([
@@ -1109,30 +874,18 @@ function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
     oid,
   ]);
   if (out == null) return [];
-  // With `-z`, diff-tree's output is `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0`
-  // per file. Split on NUL and consume in pairs. Defensive: drop trailing
-  // empties (the last \0 produces an empty tail element) and ignore any
-  // record where the meta-line doesn't carry a recognizable shape.
+  // `:<mH> <mI> <hH> <hI> <STATUS>\0<path>\0` per file — split on NUL, consume
+  // in pairs (the trailing NUL yields an empty tail element).
   const fields = out.split("\0");
   const files: EnumeratedCommitFile[] = [];
   for (let i = 0; i + 1 < fields.length; i += 2) {
     const meta = fields[i] ?? "";
     const path = fields[i + 1] ?? "";
     if (path.length === 0) continue;
-    // diff-tree's `-r` meta line starts with `:` and uses single-space
-    // separators: `:<mH> <mI> <hH> <hI> <STATUS>`. After splitting on space,
-    // index 1 carries `mI` (the new/committed mode) and index 3 carries `hI`
-    // (the new/committed blob oid). For deletions git emits
-    // `hI = 0000...000` and `mI = 000000` — the all-zeros sentinels;
-    // validate the oid via PRODUCER_OID_RE and additionally reject the
-    // zero-oid (the file was deleted in this commit — there's nothing to
-    // compare worktree bytes against, so `null` is the honest signal). The
-    // mode side accepts any non-empty token shape (the reducer compares
-    // string-equality against the snapshot's `mW`, so the exact byte
-    // sequence matters more than a regex shape check); a leading
-    // all-zeros mode for a deletion folds to `null` symmetrically with
-    // the zero-oid sentinel — there is no honest worktree mode to
-    // compare against a deleted-in-commit path.
+    // After splitting the meta line on space, index 1 is `mI` (mode) and index 3
+    // is `hI` (blob oid). Deletions emit all-zeros sentinels for both → fold to
+    // `null` (no worktree bytes/mode to compare against). The mode accepts any
+    // non-empty token (the reducer string-compares it against `mW`).
     if (!meta.startsWith(":")) {
       files.push({ path, blob_oid: null, committed_mode: null });
       continue;
@@ -1154,46 +907,31 @@ function commitFiles(root: string, oid: string): EnumeratedCommitFile[] {
 }
 
 /**
- * Enumerate the commits in a `<prev>..<new>` HEAD-oid delta. Shells out to
- * `git -C <root> log <prev>..<new> --format='%H%x00%P%x00%ct%x00%(trailers:
- * key=Session-Id,valueonly,only,unfold)' --no-patch -z` and parses each
- * commit's four-field record. Falls back to single-commit emission against
- * `<new>` when `<prev>..<new>` is empty (force-push, rebase to a non-
- * descendant) or when `<prev>` is null (bootstrap-from-null, initial
- * commit). For each enumerated commit, a sibling
- * `git log -1 <oid> --name-only --first-parent` populates the file list.
+ * Enumerate the commits in a `<prev>..<new>` HEAD-oid delta via `git log -z`,
+ * parsing each commit's NUL-delimited field record. Falls back to single-commit
+ * emission against `<new>` when the range is empty (force-push / non-descendant)
+ * or `<prev>` is null (bootstrap / initial commit). A sibling per-commit
+ * `diff-tree` populates the file list.
  *
- * Returns the per-commit array in REVERSE chronological order (newest
- * first — git's default `log` ordering). The caller emits one
- * {@link CommitMessage} per element in iteration order; the reducer fold is
- * commutative on `last_commit_at` (a later commit at higher ts wins via
- * `MAX(existing, incoming)` semantics — or simply "always stamp" since
- * commits are inherently ordered by chronology and the producer emits them
- * in batch per delta), so iteration order doesn't affect the final
- * projection.
+ * Returns the per-commit array newest-first (git's default ordering); the
+ * reducer fold on `last_commit_at` is commutative, so iteration order doesn't
+ * affect the projection.
  */
 export function enumerateCommitsInDelta(
   root: string,
   prev: string | null,
   next: string,
 ): EnumeratedCommit[] {
-  // Epic fn-670 (T1): widen from 4 fields (OID, P, ct, Session-Id) to
-  // SIX (… + Job-Id + Task). Epic fn-695 widens to EIGHT (… + Planctl-Op
-  // + Planctl-Target). Session-Id / Job-Id / Planctl-Op / Planctl-Target
-  // all use `valueonly,only,unfold` (take-last single value per key);
-  // Task is `valueonly,unfold` with the DEFAULT `\n` separator — we want
-  // a human-newline-separated block of values inside that ONE field so
-  // the outer `%x00` field delimiter survives. Switching the Task
-  // separator to `%x00` would collide with the field boundary and
-  // realign the stride parser off-by-one. The parser below splits the
-  // Task field on `\n` (via {@link parseTaskTrailers}); `\0` is also
-  // accepted by that helper as a defensive belt-and-suspenders, but is
-  // not used on the live wire here.
+  // Session-Id / Job-Id / Planctl-Op / Planctl-Target use
+  // `valueonly,only,unfold` (take-last single value); Task uses
+  // `valueonly,unfold` with the DEFAULT `\n` separator — a newline-separated
+  // block inside ONE field so the outer `%x00` delimiter survives (a `%x00` Task
+  // separator would collide with the field boundary and realign the parser).
   //
-  // FIELD ORDER IS LOAD-BEARING: the stride loop below consumes fields in
-  // groups of EIGHT, in this exact order. Adding / reordering / dropping a
-  // `%x00` here MUST move the loop's stride (`i += 8`) + every `fields[i+N]`
-  // offset in lockstep, or every field realigns off-by-one for EVERY commit.
+  // FIELD ORDER IS LOAD-BEARING: the stride loop consumes fields in groups of
+  // EIGHT in this exact order. Adding / reordering / dropping a `%x00` MUST move
+  // the stride (`i += 8`) + every `fields[i+N]` offset in lockstep, or every
+  // field realigns off-by-one for EVERY commit.
   const format =
     "%H%x00%P%x00%ct%x00" +
     "%(trailers:key=Session-Id,valueonly,only,unfold)%x00" +
@@ -1214,12 +952,9 @@ export function enumerateCommitsInDelta(
     ]);
   }
   if (out == null || out.length === 0) {
-    // Fallback: force-push / non-descendant / bootstrap-from-null / initial
-    // commit. Emit a single-commit log against `<next>` only — this gives
-    // us at least the attribution for the HEAD commit (the producer's
-    // job is to be honest about what we observed; subsequent commits in
-    // a non-descendant ancestry are lost, but that's an acceptable
-    // edge per the task spec's "Risks" section).
+    // Fallback (force-push / non-descendant / bootstrap / initial commit): a
+    // single-commit log against `<next>` gives at least the HEAD commit's
+    // attribution; earlier non-descendant commits are an accepted loss.
     out = gitOutput([
       "-C",
       root,
@@ -1234,24 +969,16 @@ export function enumerateCommitsInDelta(
   if (out == null || out.length === 0) {
     return [];
   }
-  // Parse: with `-z`, git replaces the per-record `\n` terminator with `\0`
-  // — and the `%x00` separators inside the format string also emit literal
-  // NULs in-stream. With the fn-695 widening to EIGHT format fields per
-  // record (fn-670's six + Planctl-Op + Planctl-Target), the wire format
-  // for N commits is:
-  //   OID1\0P1\0CT1\0SESSION1\0JOBID1\0TASK1\0POP1\0PTARGET1\0OID2\0...
-  // — i.e. a flat sequence of 8N NUL-delimited fields with a trailing
-  // empty element after the final NUL. Split on `\0` and consume in
-  // groups of 8.
+  // With `-z` plus the `%x00` format separators, N commits emit a flat sequence
+  // of 8N NUL-delimited fields (OID, P, CT, Session, Job-Id, Task, Planctl-Op,
+  // Planctl-Target per commit) with a trailing empty element. Consume in 8s.
   const fields = out.split("\0");
   const commits: EnumeratedCommit[] = [];
   for (let i = 0; i + 7 < fields.length; i += 8) {
     const oid = (fields[i] ?? "").trim();
     if (oid.length === 0) continue;
     const parentsRaw = (fields[i + 1] ?? "").trim();
-    // `%P` emits parent oids space-separated. First-parent semantic:
-    // attribute against the FIRST parent only (matches `--first-parent`
-    // for the file-list call below).
+    // `%P` is space-separated; attribute against the FIRST parent only.
     const parentOid: string | null =
       parentsRaw.length === 0 ? null : (parentsRaw.split(" ")[0] ?? null);
     const ctRaw = fields[i + 2] ?? "";
@@ -1289,30 +1016,15 @@ export function enumerateCommitsInDelta(
 }
 
 /**
- * Epic fn-670 (T1): canonicalize a commit's session attribution by
- * merging the `Session-Id:` and `Job-Id:` trailer values. Both are
- * parsed via {@link parseSessionIdTrailer} (UUID-anchored take-last,
- * shared with the Session-Id-only path).
- *
- * Policy:
- *   - Session-Id WINS when both are valid and equal (canonical agreement).
- *   - Session-Id WINS when both are valid but DIFFER — and a one-shot
- *     stderr warning fires (a bug signal: `job_id === session_id` is a
- *     keeper invariant, see CLAUDE.md / planctl session-context). Never
- *     fatal; the producer-only liveness invariant + hook's exit-0
- *     contract forbid escalating from a trailer mismatch.
- *   - Job-Id wins when Session-Id is null (the path that REVIVES the
- *     dormant v45 per-session discharge arm — jobctl's `_append_job_id
- *     _trailer` stamps `Job-Id` on every `commit-work` source commit,
- *     so coalescing it into `committer_session_id` finally lets
- *     `foldCommit`'s per-session arm fire on those commits).
- *   - Both null → return null (global discharge, unchanged).
- *
- * Pure-ish: emits a single `console.error` warn line on the
- * both-differing branch. The whole producer side already writes
- * stderr on git failures, so this is the same surface. The reducer
- * NEVER reads/probes/computes here — the field is frozen in the
- * Commit event payload at producer time.
+ * Canonicalize a commit's session attribution by merging the `Session-Id:` and
+ * `Job-Id:` trailers (both parsed via {@link parseSessionIdTrailer} —
+ * UUID-anchored take-last). Policy:
+ *   - Session-Id WINS when both are valid (equal, or DIFFERING with a one-shot
+ *     stderr warning — `job_id === session_id` is a keeper invariant, so a
+ *     divergence is a non-fatal bug signal).
+ *   - Job-Id wins when Session-Id is null (jobctl stamps `Job-Id` on every
+ *     `commit-work` source commit).
+ *   - Both null → null (global discharge).
  */
 function coalesceCommitterSessionId(
   sessionTrailers: string,
@@ -1322,39 +1034,24 @@ function coalesceCommitterSessionId(
   const session = parseSessionIdTrailer(sessionTrailers);
   const jobId = parseSessionIdTrailer(jobIdTrailers);
   if (session !== null && jobId !== null && session !== jobId) {
-    // `job_id === session_id` is a keeper invariant — a divergence here
-    // is a bug signal worth surfacing. Stderr-only (LaunchAgent stdlog),
-    // never throws, never blocks. Include both values + commit OID so a
-    // forensic grep can locate the offending commit.
+    // `job_id === session_id` is a keeper invariant — a divergence is a bug
+    // signal. Stderr-only, never throws; include both values + OID for a grep.
     console.error(
       `[git-worker] commit ${commitOid}: Session-Id (${session}) and Job-Id (${jobId}) trailers DIFFER; Session-Id wins per take-last policy`,
     );
   }
-  // Session-Id preferred — its presence is the canonical signal
-  // (jobctl stamps Job-Id too, but a hand-written Session-Id wins).
-  // Fall through to Job-Id when Session-Id is absent / malformed —
-  // both pass the same UUID gate in parseSessionIdTrailer, so the
-  // coalesced value is always either a UUID-shaped string or null
-  // (never a bare value that could poison the UUID gate on the
-  // deriver side).
+  // Session-Id preferred; fall through to Job-Id when absent. Both pass the same
+  // UUID gate, so the result is always a UUID-shaped string or null.
   if (session !== null) return session;
   return jobId;
 }
 
 /**
- * Epic fn-695: lift the planctl operation from a commit's `Planctl-Op:`
- * trailer block and NORMALIZE it the same way the legacy stdout-scrape
- * path does — via {@link normalizePlanctlOp} (`epic-scaffold` →
- * `scaffold`, etc.) — so the reducer's `syncPlanctlLinks` union compares
- * the commit-derived op against the scrape-derived op on one normalized
- * vocabulary. Take-last on the unfolded value block (mirrors
- * {@link parseSessionIdTrailer}): the producer requests
- * `valueonly,only,unfold`, so the common case is a single line, but a
- * hand-edited stacked block resolves to the last non-empty line. Returns
- * `null` on empty / whitespace-only / non-string input (no `Planctl-Op:`
- * trailer — every non-`chore(planctl)` commit). Pure function of its
- * argument so re-fold determinism holds (the reducer never re-derives —
- * the normalized op is frozen in the Commit payload at producer time).
+ * Lift the planctl operation from a commit's `Planctl-Op:` trailer and
+ * NORMALIZE it via {@link normalizePlanctlOp} (same vocabulary as the legacy
+ * scrape path, so the reducer's `syncPlanctlLinks` union compares both on one
+ * vocabulary). Take-last on the unfolded block. Returns `null` on empty /
+ * non-string input (no such trailer).
  */
 function parsePlanctlOpTrailer(raw: string): string | null {
   if (typeof raw !== "string" || raw.length === 0) {
@@ -1370,17 +1067,12 @@ function parsePlanctlOpTrailer(raw: string): string | null {
 }
 
 /**
- * Epic fn-695: lift the planctl target ref from a commit's
- * `Planctl-Target:` trailer block and validate it against the SAME
- * epic-ref shape gate the legacy scrape path uses ({@link parsePlanRef}).
- * Take-last on the unfolded value block (mirrors
- * {@link parsePlanctlOpTrailer}); returns the raw validated ref string
- * (`fn-1-foo` or `fn-1-foo.3` — the edge fold folds a task-form ref up to
- * its parent epic downstream, exactly as `extractPlanctlInvocation` does).
- * Returns `null` on empty / whitespace-only / non-string input AND on a
- * value that {@link parsePlanRef} rejects (malformed ref) — so a garbage
- * trailer never poisons the edge fold. Pure function of its argument
- * (re-fold determinism — frozen in the Commit payload at producer time).
+ * Lift the planctl target ref from a commit's `Planctl-Target:` trailer and
+ * validate it against the SAME epic-ref shape gate the legacy scrape path uses
+ * ({@link parsePlanRef}). Take-last on the unfolded block; returns the raw
+ * validated ref (`fn-1-foo` or `fn-1-foo.3`). `null` on empty / non-string input
+ * AND on a value `parsePlanRef` rejects (so a garbage trailer never poisons the
+ * edge fold).
  */
 function parsePlanctlTargetTrailer(raw: string): string | null {
   if (typeof raw !== "string" || raw.length === 0) {
@@ -1396,17 +1088,12 @@ function parsePlanctlTargetTrailer(raw: string): string | null {
 }
 
 /**
- * One TTL-memoized watch-membership verdict per root (epic fn-690). Entries
- * live in the per-worker `watchProbeCache` Map; the hot tier
- * ({@link WATCH_PROBE_TTL_HOT_MS}, currently watched) refreshes on every
- * fast reconcile, the cold tier ({@link WATCH_PROBE_TTL_COLD_MS}, candidate
- * but unwatched) holds a longer-lived verdict so a quiescent untouched
- * repo doesn't re-probe every cycle. `expiry` is wall clock
- * (`Date.now()` ms).
- *
- * Pruning is lazy-on-read inside {@link discoverProjectRoots} so we never
- * walk the map on the hot 100ms tick. The map is bounded by the candidate
- * set size (one entry per resolved root in flight).
+ * One TTL-memoized watch-membership verdict per root. Hot tier ({@link
+ * WATCH_PROBE_TTL_HOT_MS}, currently watched) refreshes every fast reconcile;
+ * cold tier ({@link WATCH_PROBE_TTL_COLD_MS}, unwatched) holds longer so a
+ * quiescent repo doesn't re-probe every cycle. Pruned lazily inside {@link
+ * discoverProjectRoots} (never on the hot 100ms tick); bounded by the candidate
+ * set size.
  */
 interface WatchProbeCacheEntry {
   /** The last probe verdict (or `null` if the probe failed at expiry time). */
@@ -1416,27 +1103,18 @@ interface WatchProbeCacheEntry {
 }
 
 /**
- * State threaded into {@link discoverProjectRoots} by `reconcileRoots`.
- * Separated as an interface so the discovery function can be exercised
- * deterministically in tests against injectable Maps + an injected `now`
- * + an injected probe function (the live caller passes
- * {@link probeWatchMembership}).
+ * State threaded into {@link discoverProjectRoots} by `reconcileRoots`. An
+ * interface so discovery can be driven deterministically in tests with
+ * injectable Maps + `now` + probe.
  *
- * - `cwdRootCache` — cwd→toplevel memo, permanent for the daemon lifetime
- *   (cwd→toplevel is stable for a session). One entry per distinct
- *   candidate path.
+ * - `cwdRootCache` — cwd→toplevel memo, permanent for the daemon lifetime.
  * - `watchProbeCache` — per-root verdict TTL memo, hot/cold tiered.
- * - `currentlyWatched` — the live set of subscribed roots. Used both as a
- *   tier selector (hot vs cold TTL) AND as the monotonicity floor (the
- *   slow sweep only ADDS candidates; the fast path always re-probes every
- *   already-watched root).
- * - `nowMs` — wall clock (`Date.now()`). Injected for tests.
- * - `runFullSweep` — `true` when the candidate set should widen to ALL
- *   `DISTINCT cwd` rows (the slow sweep), `false` for the recent+watched
- *   fast path. The caller decides cadence via
- *   {@link FULL_SWEEP_INTERVAL_MS}.
- * - `probe` — the spawnSync-backed verdict probe. Injectable so tests can
- *   drive a fake.
+ * - `currentlyWatched` — live subscribed roots; both the tier selector and the
+ *   monotonicity floor (the slow sweep only ADDS; the fast path always re-probes
+ *   every already-watched root).
+ * - `nowMs` — wall clock, injected for tests.
+ * - `runFullSweep` — `true` to widen to ALL `DISTINCT cwd` rows.
+ * - `probe` — the spawnSync-backed verdict probe, injectable.
  */
 export interface DiscoveryContext {
   cwdRootCache: Map<string, string | null>;
@@ -1446,19 +1124,16 @@ export interface DiscoveryContext {
   runFullSweep: boolean;
   probe: (root: string) => { dirty: boolean; ahead: number } | null;
   /**
-   * fn-705 discovery-nudge roots forwarded from the plan-worker — folded into
-   * the candidate set unconditionally (see {@link buildDiscoveryCandidates}).
-   * Optional; omitted by tests that don't exercise the nudge.
+   * Discovery-nudge roots forwarded from the plan-worker, folded into the
+   * candidate set unconditionally. Optional; omitted by tests.
    */
   extraCandidates?: Set<string>;
 }
 
 /**
- * Build the candidate set for `discoverProjectRoots`. Pure & exported for
- * unit reach. The fast path probes only the recent + watched cwds; the
- * slow sweep widens to every `DISTINCT cwd` in the jobs table. Epic
- * `project_dir` and `task.target_repo` are always in the set — they're
- * cheap, bounded, and tied to plan-backed work.
+ * Build the candidate set for `discoverProjectRoots`. The fast path probes only
+ * recent + watched cwds; the slow sweep widens to every `DISTINCT cwd`. Epic
+ * `project_dir` and `task.target_repo` are always included (cheap, bounded).
  */
 export function buildDiscoveryCandidates(
   db: Database,
@@ -1467,19 +1142,17 @@ export function buildDiscoveryCandidates(
     runFullSweep: boolean;
     watched: Set<string>;
     /**
-     * fn-705 discovery-nudge roots: repo roots the plan-worker handed over
-     * (a `.planctl` tree in a repo with no seen-cwd job history). Always
-     * included so the `.planctl` short-circuit in {@link shouldWatchRoot}
-     * subscribes them on the next reconcile, without waiting for a session
-     * to populate `jobs.cwd`. Optional — pure tests omit it.
+     * Discovery-nudge roots (a `.planctl` tree in a repo with no seen-cwd job
+     * history). Always included so the `.planctl` short-circuit in {@link
+     * shouldWatchRoot} subscribes them without waiting for a session to populate
+     * `jobs.cwd`. Optional — pure tests omit it.
      */
     extraCandidates?: Set<string>;
   },
 ): Set<string> {
   const candidates = new Set<string>();
 
-  // fn-705: nudge roots are unconditional candidates (independent of the
-  // recent/full-sweep job-cwd partition — a never-seen repo has no job rows).
+  // Nudge roots are unconditional candidates (a never-seen repo has no job rows).
   if (options.extraCandidates !== undefined) {
     for (const root of options.extraCandidates) candidates.add(root);
   }
@@ -1508,21 +1181,15 @@ export function buildDiscoveryCandidates(
   }
 
   if (options.runFullSweep) {
-    // Slow path: every cwd a job has ever run from. Lets a stale unpushed-
-    // but-clean repo surface after a keeper restart (empty watched-set
-    // memory + empty cold cache).
+    // Slow path: every cwd a job has ever run from. Surfaces a stale unpushed-
+    // but-clean repo after a keeper restart.
     const rows = db
       .query("SELECT DISTINCT cwd FROM jobs WHERE cwd IS NOT NULL")
       .all() as { cwd: string }[];
     for (const row of rows) candidates.add(row.cwd);
   } else {
-    // Fast path: only working jobs + recently-updated jobs. The `state`
-    // and `updated_at` columns are projection-derived (fold-time), so a
-    // job that just touched a file at all is in this set. RECENT_JOB_
-    // WINDOW_MS keeps the human-paced multi-session day on the fast
-    // path without dredging up week-old idle sessions.
-    //
-    // `updated_at` is REAL unix seconds; the cutoff converts ms to s.
+    // Fast path: working + recently-updated jobs only. `updated_at` is REAL unix
+    // seconds; the cutoff converts ms to s.
     const cutoffSec = (options.nowMs - RECENT_JOB_WINDOW_MS) / 1000;
     const rows = db
       .query(
@@ -1534,41 +1201,25 @@ export function buildDiscoveryCandidates(
     for (const row of rows) candidates.add(row.cwd);
   }
 
-  // Monotonicity floor: every already-watched root is a candidate
-  // regardless of which sweep ran. Without this a fast-path skip would
-  // shrink `desired` below the watched set on the very next reconcile
-  // (the cwd that bootstrapped a watched root might not be in the recent
-  // window anymore) and spuriously unsubscribe a live attribution claim.
+  // Monotonicity floor: every already-watched root is a candidate regardless of
+  // sweep, or a fast-path skip would shrink `desired` below the watched set and
+  // spuriously unsubscribe a live attribution claim.
   for (const root of options.watched) candidates.add(root);
 
   return candidates;
 }
 
 /**
- * Pure cooling-hysteresis decision (epic fn-690). Given:
+ * Pure cooling-hysteresis decision. Given the currently-watched set, the
+ * moment-in-time `desiredNow` verdict, the per-root first-clean timestamp memo
+ * (`cleanSinceByRoot`, mutated in place), `nowMs`, and the dwell threshold:
  *
- * - `currentlyWatched` — the set of roots that are subscribed right now;
- * - `desiredNow` — the moment-in-time verdict set from
- *   {@link discoverProjectRoots};
- * - `cleanSinceByRoot` — per-root wall clock (`Date.now()`) at which the root first
- *   became clean-and-pushed (i.e. NOT in `desiredNow` while it WAS in
- *   `currentlyWatched`); cleared the moment a root re-qualifies. The
- *   caller mutates this Map in place across reconciles;
- * - `nowMs` — wall clock (`Date.now()`) now;
- * - `dwellMs` — the dwell threshold ({@link WATCH_DROP_DWELL_MS}).
+ * - `toAdd` — roots in `desiredNow` not yet watched.
+ * - `toDrop` — watched roots clean-and-pushed for ≥ `dwellMs`. A still-desired
+ *   root is never dropped.
  *
- * Returns:
- * - `toAdd` — roots to subscribe this cycle (in `desiredNow` and not in
- *   `currentlyWatched`).
- * - `toDrop` — roots to unsubscribe this cycle (have been clean-and-pushed
- *   for ≥ `dwellMs`; satisfies the cooling-hysteresis invariant). A
- *   `.planctl` (or otherwise still-desired) root is never in `toDrop`.
- *
- * Also mutates `cleanSinceByRoot`: stamps the first-clean ts when a
- * watched root falls out of `desiredNow`, clears it when the root
- * re-qualifies or has been dropped.
- *
- * Pure & exported for unit-testable hysteresis verification.
+ * Also mutates `cleanSinceByRoot`: stamps the first-clean ts when a watched root
+ * falls out of `desiredNow`, clears it on re-qualify or drop.
  */
 export function decideReconcileTransitions(
   currentlyWatched: Set<string>,
@@ -1612,25 +1263,16 @@ export function decideReconcileTransitions(
 }
 
 /**
- * fn-771: derive a missed-wake rescue's TRUE change-to-rescue latency from the
- * commit times the rescue discharged across all rescued roots. The honest
- * freshness signal — `now − committed_at_ms` — replaces the idle-inflating
- * `now − last_fast_path_at` staleness that paged a false critical (a 2s-old
- * commit caught after 27 quiet minutes reported staleness_ms ≈ 1.6M).
+ * Derive a missed-wake rescue's TRUE change-to-rescue latency (`now − oldest
+ * committed_at_ms`) from the commit times the rescue discharged — the honest
+ * freshness signal, vs the idle-inflating `now − last_fast_path_at`.
  *
- * - WORST CASE: when several commits discharge in one rescue tick, anchor on
- *   the OLDEST (smallest `committed_at_ms`) — it bounds the longest any
- *   delivered change waited unobserved.
- * - NO ANCHOR → `null`: a dirty-tree-only rescue (no commit discharged, so the
- *   array is empty) has no change to measure latency against. The caller only
- *   pushes POSITIVE `committed_at_ms` values (enumerateCommitsInDelta clamps an
- *   unparseable/non-positive commit time to 0, which would otherwise read as a
- *   ~epoch-sized false latency), so an empty array genuinely means no anchor.
- * - The negative-latency clamp (clock skew: `committed_at_ms > now`) is owned
- *   by {@link buildMissedWakeRecord}, which never emits a negative — this
- *   helper returns the raw signed difference so the clamp lives in one place.
- *
- * Pure & exported for unit reach (mirrors {@link decideReconcileTransitions}).
+ * - Anchor on the OLDEST commit (worst case — it bounds the longest any change
+ *   waited unobserved).
+ * - Empty array → `null`: a dirty-tree-only rescue has no commit to measure
+ *   against. The caller pushes only POSITIVE `committed_at_ms`.
+ * - Returns the raw signed difference; the negative-latency (clock-skew) clamp
+ *   lives in {@link buildMissedWakeRecord}.
  */
 export function deriveChangeToRescueMs(
   dischargedCommitAtMs: number[],
@@ -1642,27 +1284,18 @@ export function deriveChangeToRescueMs(
 }
 
 /**
- * Select `git_status` projection rows to tombstone because their worktree
- * vanished from disk. Such a row is unreachable by {@link
- * decideReconcileTransitions} (whose `toDrop` loop only walks
- * `currentlyWatched`): a missing directory fails discovery's cwd→toplevel
- * resolution, so the root is never re-added to `desired` and never enters the
- * watched set — leaving the row strandable forever once a daemon restart drops
- * it out of `currentlyWatched`. The producer emitting `GitRootDropped` off a
- * live `existsSync` probe is allowed by the event-sourcing invariants (the
- * probe runs in a producer, never inside a fold); the reducer's idempotent
- * DELETE fold reconciles the projection.
+ * Select `git_status` rows to tombstone because their worktree vanished from
+ * disk. Such a row is unreachable by {@link decideReconcileTransitions} (a
+ * missing dir fails cwd→toplevel resolution, so the root never re-enters the
+ * watched set), so it would strand forever after a daemon restart. The
+ * `existsSync` probe runs in the producer (never inside a fold), allowed by the
+ * event-sourcing invariants; the reducer's idempotent DELETE reconciles.
  *
- * Pure & exported for unit reach (mirrors {@link buildDiscoveryCandidates} /
- * {@link decideReconcileTransitions}). The `exists` probe is injected so the
- * caller owns the one fs read per row.
- *
- * - Skips `currentlyWatched` roots — a live root whose dir vanishes is dropped
- *   by the normal dwell path (it falls out of `desired`, dwells, then
- *   `unsubscribeRoot` tombstones it); emitting here too would double-fire.
- * - Mutates `alreadyTombstoned`: adds each newly-dropped root (so a row pending
- *   its DELETE round-trip isn't re-emitted on the next sweep) and clears any
- *   root whose dir has reappeared (so it can be tombstoned again later).
+ * The `exists` probe is injected so the caller owns the one fs read per row.
+ * - Skips `currentlyWatched` roots — the normal dwell path drops those;
+ *   emitting here too would double-fire.
+ * - Mutates `alreadyTombstoned`: adds each newly-dropped root (so it isn't
+ *   re-emitted before its DELETE round-trips), clears a reappeared dir.
  */
 export function selectVanishedRoots(
   projectDirs: string[],
@@ -1685,32 +1318,19 @@ export function selectVanishedRoots(
 }
 
 /**
- * The dynamic watch-membership discoverer (epic fn-690). Replaces the
- * `.planctl`-only `gitRootFor`-filtered set with a probe-driven verdict
- * tiered by hot/cold TTL. Returns the sorted set of roots that
- * {@link reconcileRoots} should ensure are subscribed.
+ * The dynamic watch-membership discoverer: a probe-driven verdict tiered by
+ * hot/cold TTL. Returns the sorted set of roots {@link reconcileRoots} should
+ * keep subscribed.
  *
- * Stages:
- *   1. Build the candidate cwds via {@link buildDiscoveryCandidates}
- *      (recent + watched fast path, or full-history slow sweep).
- *   2. Resolve each cwd → toplevel via the permanent
- *      `cwdRootCache`. Drops cwds that aren't inside a git worktree.
- *   3. For each resolved root, consult the per-root TTL memo
- *      (`watchProbeCache`). On miss / expiry, run {@link
- *      probeWatchMembership} ONCE and cache the verdict at the
- *      appropriate tier (hot if currently watched, cold otherwise).
- *      `.planctl` short-circuits in {@link shouldWatchRoot} BEFORE the
- *      probe even runs.
- *   4. Compose the verdict via {@link shouldWatchRoot} (which folds in
- *      `.planctl` short-circuit + fail-open-if-watched / fail-closed-
- *      otherwise on a null probe).
+ *   1. Build candidate cwds via {@link buildDiscoveryCandidates}.
+ *   2. Resolve each cwd → toplevel via the permanent `cwdRootCache`.
+ *   3. Per resolved root, consult the TTL memo; on miss/expiry run {@link
+ *      probeWatchMembership} ONCE and cache at the right tier. `.planctl`
+ *      short-circuits in {@link shouldWatchRoot} BEFORE the probe runs.
+ *   4. Compose the verdict via {@link shouldWatchRoot}.
  *
- * Returns the sorted list of roots keeper should watch. Cooling
- * hysteresis ({@link WATCH_DROP_DWELL_MS}) is applied by `reconcileRoots`
- * on the drop side — `discoverProjectRoots` is the moment-in-time
- * verdict, NOT the dwell-aware drop list. The reconcile then layers
- * `cleanSinceByRoot` on top to convert a clean+pushed candidate into a
- * delayed drop.
+ * This is the moment-in-time verdict only; the dwell-aware drop is layered on by
+ * `reconcileRoots` via `cleanSinceByRoot`.
  */
 export function discoverProjectRoots(
   db: Database,
@@ -1723,9 +1343,8 @@ export function discoverProjectRoots(
     extraCandidates: ctx.extraCandidates,
   });
 
-  // Stage 2: resolve cwd → toplevel via the permanent cache. Drops cwds
-  // that aren't inside a git worktree. `.planctl` and dirty checks happen
-  // against the resolved root, NOT the candidate cwd.
+  // Resolve cwd → toplevel via the permanent cache; drop cwds not in a git
+  // worktree. `.planctl` and dirty checks run against the resolved root.
   const resolvedRoots = new Set<string>();
   for (const candidate of candidates) {
     let root: string | null | undefined = ctx.cwdRootCache.get(candidate);
@@ -1736,9 +1355,7 @@ export function discoverProjectRoots(
     if (root != null) resolvedRoots.add(root);
   }
 
-  // Stage 3 + 4: per-root verdict TTL memo + probe + decide. Lazy-prune
-  // expired entries that aren't in the current candidate set so the map
-  // stays bounded by the live working set.
+  // Per-root verdict TTL memo + probe + decide.
   const desired = new Set<string>();
   for (const root of resolvedRoots) {
     const watched = ctx.currentlyWatched.has(root);
@@ -1748,12 +1365,9 @@ export function discoverProjectRoots(
     if (cached !== undefined && cached.expiry > ctx.nowMs) {
       probe = cached.verdict;
     } else {
-      // `.planctl` short-circuits inside shouldWatchRoot BEFORE the probe
-      // runs — but we need the probe verdict cached anyway for any future
-      // `.planctl` removal. Skip the probe for `.planctl` roots entirely;
-      // the verdict is `null` (unknown), shouldWatchRoot returns true on
-      // the `.planctl` check, and a future removal forces a re-probe via
-      // expiry.
+      // Skip the probe for `.planctl` roots — shouldWatchRoot short-circuits
+      // true on the `.planctl` check; cache a `null` verdict so a future
+      // `.planctl` removal forces a re-probe via expiry.
       if (existsSync(join(root, ".planctl"))) {
         probe = null;
         ctx.watchProbeCache.set(root, {
@@ -1773,9 +1387,8 @@ export function discoverProjectRoots(
     }
   }
 
-  // Lazy prune: drop expired entries that aren't even candidates anymore.
-  // Bounds map size against churn (a stale cwd no longer in any candidate
-  // set drops within one TTL window).
+  // Lazy prune: drop expired entries no longer in the candidate set, bounding
+  // the map against churn.
   for (const [root, entry] of ctx.watchProbeCache) {
     if (!resolvedRoots.has(root) && entry.expiry <= ctx.nowMs) {
       ctx.watchProbeCache.delete(root);
