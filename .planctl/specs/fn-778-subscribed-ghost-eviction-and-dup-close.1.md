@@ -52,5 +52,5 @@ client reconnect loop (rejections spaced, not hammered).
 - [ ] await/viewer reconnect backoff with jitter; full bun test green
 
 ## Done summary
-
+Closed the subscribed-ghost eviction hole: capture peer pid at accept via macOS getsockopt LOCAL_PEERPID and add a subscribed-only dead-peer arm to reapConns that evicts a conn whose peer process is gone (distinguishing dead-peer from quiet-viewer, degrading to the idle/stuck arms when the probe is unavailable). Raised the await/viewer cap-reject reconnect backoff to an exponential-with-full-jitter ~30s cap so a saturated-cap await fleet stops hammering. (Dup-close root-cause + boot-pause question are task .2's scope per the incident evidence.)
 ## Evidence
