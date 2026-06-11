@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Strip planctl pipeline machinery",
-  "updated_at": "2026-06-11T14:06:56.038286Z"
+  "updated_at": "2026-06-11T14:51:14.060742Z",
+  "worker_done_at": "2026-06-11T14:51:14.060742Z"
 }

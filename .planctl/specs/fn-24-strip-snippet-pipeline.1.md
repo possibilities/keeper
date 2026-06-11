@@ -39,5 +39,5 @@ DELETE: test_set_snippets_bundles.py, test_sketch_refs_helper.py, test_snippet_i
 - [ ] real_sketch marker, autouse sketch fixture, and all DELETE-list test files removed in the same commit; full suite green including --run-slow
 
 ## Done summary
-
+Stripped the snippet-substrate pipeline: deleted sketch_refs.py, bundle_ref.py, and the 4 set-snippets/set-bundles verbs; scaffold/refine-apply now persist snippets:/bundles: keys verbatim into records (dormant seam intact, no validation). Dropped the verbs from VALIDATION_RESTAMP_VERBS (14->10), removed the real_sketch marker + autouse fixture + dead tests in one commit, and added a round-trip test for non-empty dormant lists. Full suite green incl. --run-slow (709 passed).
 ## Evidence
