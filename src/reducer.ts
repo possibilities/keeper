@@ -2866,6 +2866,94 @@ function retractUsageRow(db: Database, event: Event): void {
   db.run("DELETE FROM usage WHERE id = ?", [id]);
 }
 
+/** One `(pane_id, session_name)` pair decoded from a `TmuxPaneSnapshot` event
+ *  payload. Both are validated non-empty strings; anything else is dropped. */
+interface TmuxPaneSnapshotPair {
+  pane_id: string;
+  session_name: string;
+}
+
+/**
+ * Null-safe decode of a `TmuxPaneSnapshot` event's `data` blob into the
+ * validated `(pane_id, session_name)` pairs. Returns `[]` on a missing / empty /
+ * malformed blob (the fold folds an empty list to a no-op); NEVER throws. Each
+ * entry is type-narrowed independently so a partial / garbage entry is dropped
+ * rather than poisoning the fill. Reads ONLY `event.data` — no probe, no env —
+ * keeping the fold a pure function of the event payload (re-fold determinism).
+ */
+function extractTmuxPaneSnapshot(event: Event): TmuxPaneSnapshotPair[] {
+  if (event.data == null || event.data.length === 0) {
+    return [];
+  }
+  let parsed: { pairs?: unknown };
+  try {
+    parsed = JSON.parse(event.data) as { pairs?: unknown };
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed.pairs)) {
+    return [];
+  }
+  const out: TmuxPaneSnapshotPair[] = [];
+  for (const raw of parsed.pairs) {
+    if (raw == null || typeof raw !== "object") {
+      continue;
+    }
+    const rec = raw as Record<string, unknown>;
+    const paneId = rec.pane_id;
+    const sessionName = rec.session_name;
+    if (
+      typeof paneId !== "string" ||
+      paneId === "" ||
+      typeof sessionName !== "string" ||
+      sessionName === ""
+    ) {
+      continue;
+    }
+    out.push({ pane_id: paneId, session_name: sessionName });
+  }
+  return out;
+}
+
+/**
+ * Fold one synthetic `TmuxPaneSnapshot` event (epic fn-789). The restore-worker
+ * self-gated + deduped a `tmux list-panes` probe and main minted this event
+ * carrying the live `(pane_id, session_name)` pairs. For each pair, FILL
+ * `backend_exec_session_id` on the matching tmux job whose session is still
+ * NULL — closing the human-session gap (incl. the first pane of a human-created
+ * session) for which no launch-time `KEEPER_TMUX_SESSION` env was injected.
+ *
+ * FILL-ONLY: the `backend_exec_session_id IS NULL` guard means a non-NULL value
+ * is NEVER overwritten. This preserves zellij-parity staleness semantics (the
+ * hook-fed COALESCE arm already owns live coords) AND makes the fold
+ * ORDER-INSENSITIVE: replaying the same event after the COALESCE arm filled the
+ * value is a no-op, so re-fold reproduces byte-identical rows regardless of
+ * event interleaving.
+ *
+ * Reads ONLY the event payload + the in-transaction `jobs` rows — no probe, no
+ * env, no wall-clock. An empty / malformed payload folds to a no-op with the
+ * cursor still advancing (never throws). An UPDATE matching zero rows (the pane
+ * id isn't a tracked tmux job, or it's already filled) is a correct no-op.
+ */
+function foldTmuxPaneSnapshot(db: Database, event: Event): void {
+  const pairs = extractTmuxPaneSnapshot(event);
+  if (pairs.length === 0) {
+    return;
+  }
+  for (const pair of pairs) {
+    db.run(
+      `UPDATE jobs SET
+         backend_exec_session_id = ?,
+         last_event_id = ?,
+         updated_at = ?
+       WHERE backend_exec_type = 'tmux'
+         AND backend_exec_pane_id = ?
+         AND backend_exec_session_id IS NULL`,
+      [pair.session_name, event.id, event.ts, pair.pane_id],
+    );
+  }
+}
+
 /**
  * Wire payload for a synthetic `BuildSnapshot` event — the projection-meaningful
  * fields of one buildbot builder's latest build. The pk (the builder NAME) does
@@ -6269,11 +6357,14 @@ function projectJobsRow(db: Database, event: Event): void {
   // `events.backend_exec_*` onto `jobs.backend_exec_*`. Fires on EVERY event
   // (the hook stamps the columns on every hook event as pure env reads), so a
   // session that opens / moves panes mid-life lands the freshest coords on the
-  // next event. Gated on `backend_exec_type != null` (the all-NULL non-pane
-  // case is a fast no-op); a partial capture still COALESCEs so a NULL field
-  // preserves the prior value. Reads only `event.backend_exec_*` + the
-  // persisted cell — re-fold deterministic. An UPDATE against a missing jobs
-  // row is a no-op (SessionStart, the only mint, fires first per session).
+  // next event. The ONE coordinate the hook cannot read is a tmux session name
+  // for a claude in a human-created session (no KEEPER_TMUX_SESSION env) — the
+  // `TmuxPaneSnapshot` fold arm fills that fill-only. Gated on
+  // `backend_exec_type != null` (the all-NULL non-pane case is a fast no-op); a
+  // partial capture still COALESCEs so a NULL field preserves the prior value.
+  // Reads only `event.backend_exec_*` + the persisted cell — re-fold
+  // deterministic. An UPDATE against a missing jobs row is a no-op (SessionStart,
+  // the only mint, fires first per session).
   if (event.backend_exec_type != null) {
     db.run(
       `UPDATE jobs SET
@@ -6587,6 +6678,12 @@ export function applyEvent(
       // empty arm: the final `else` runs projectJobsRow, so deleting this
       // arm would route historical BackendExecSnapshot events into the jobs
       // projection and break re-fold determinism.
+    } else if (event.hook_event === "TmuxPaneSnapshot") {
+      // epic fn-789 — fill-only session-name resolution for human-session tmux
+      // jobs the launch-time env injection couldn't cover. A NEW event name
+      // (NOT the retired BackendExecSnapshot above); the fold reads only the
+      // payload pairs and never overwrites a non-NULL session.
+      foldTmuxPaneSnapshot(db, event);
     } else if (event.hook_event === "PostToolUse") {
       // PostToolUse fans to BOTH projections plus syncIfPlanRef (inside
       // projectJobsRow); the 781ms avg is otherwise unattributable. Arm the

@@ -40,17 +40,26 @@
  *
  * The restore file is a derived side-file, NOT an event-log projection: it
  * sidesteps the event-sourcing invariants entirely (no schema bump, no
- * `keeper/api.py` whitelist change, no reducer arm). The worker is a PURE
- * CONSUMER — it never posts to main, never writes the DB, and never feeds the
- * event log. The `scripts/restore-agents.ts` util (T4) is the sole reader.
+ * `keeper/api.py` whitelist change, no restore-file reducer arm). The
+ * `scripts/restore-agents.ts` util (T4) is the sole reader of that file.
+ *
+ * **Tmux pane-snapshot poll arm (epic fn-789).** Riding the SAME data_version
+ * pulse, the worker self-gates on any live tmux job with a NULL
+ * `backend_exec_session_id` (a claude started in a human-created tmux session,
+ * incl. the first pane). When armed it spawns `tmux list-panes` and posts ONE
+ * `{kind:"tmux-pane-snapshot"}` message to main, which mints the sole
+ * `TmuxPaneSnapshot` synthetic event the reducer folds (fill-only). This is the
+ * worker's ONLY worker→main channel and its ONLY event-log contribution; the
+ * restore-file write path remains a pure consumer side-file. The poller is
+ * quiescent when no NULL-session tmux job is live; a producer-side dedup hash
+ * stops re-posting an unchanged topology.
  *
  * Worker contract (see CLAUDE.md "Worker contract"):
  *  - `isMainThread` guard — a plain import is inert.
  *  - Own read-only `openDb` connection — `applyPragmas` runs inside `openDb`
  *    so `busy_timeout` is set on this connection too.
- *  - Typed message protocol: nothing worker→main (the worker carries no
- *    message kind — it has nothing to post), `{type:"shutdown"}` main→worker.
- *    Exit 0 clean / 1 crash.
+ *  - Typed message protocol: `{kind:"tmux-pane-snapshot"}` worker→main (the
+ *    only post), `{type:"shutdown"}` main→worker. Exit 0 clean / 1 crash.
  *  - Subsystem-style teardown: the read-only DB connection is closed in the
  *    shutdown handler before `process.exit(0)`.
  *
@@ -101,6 +110,54 @@ export interface RestoreWorkerData {
 export interface ShutdownMessage {
   type: "shutdown";
 }
+
+/**
+ * One `(pane_id, session_name)` pair the tmux snapshot probe observed. Both are
+ * raw tmux strings: `pane_id` is the `%N` id (the durable handle the COALESCE
+ * fold stamped `jobs.backend_exec_pane_id` from `TMUX_PANE`), `session_name` the
+ * `#{session_name}` the reducer fills onto a NULL-session tmux job.
+ */
+export interface TmuxPanePair {
+  pane_id: string;
+  session_name: string;
+}
+
+/**
+ * Worker→main message: the live tmux pane topology, posted ONLY when a live
+ * tmux job carries a NULL `backend_exec_session_id` (the gate) AND the probed
+ * pairs differ from the last post (the dedup hash). Main — the sole synthetic
+ * event writer — mints ONE `TmuxPaneSnapshot` event carrying `pairs`; the
+ * reducer fills the session name onto each matching NULL-session tmux job
+ * (fill-only, never overwrite). NEVER reuses the retired `BackendExecSnapshot`
+ * name (its no-op fold arm must stay untouched for re-fold determinism).
+ */
+export interface TmuxPaneSnapshotMessage {
+  kind: "tmux-pane-snapshot";
+  pairs: TmuxPanePair[];
+}
+
+/**
+ * `Bun.spawnSync`-shaped subset the tmux pane probe needs; injectable so tests
+ * drive the gate / parse / dedup without a real tmux server. Mirrors the
+ * git-worker's `gitOutput` spawnSync shape: `success` + `exitCode` + a
+ * stdout `Buffer`.
+ */
+export type SpawnSyncFn = (cmd: string[]) => {
+  success: boolean;
+  exitCode: number | null;
+  stdout: Buffer;
+};
+
+const defaultSpawnSync: SpawnSyncFn = (cmd) =>
+  Bun.spawnSync(cmd, {
+    stdout: "pipe",
+    stderr: "ignore",
+    timeout: TMUX_PROBE_TIMEOUT_MS,
+  });
+
+/** Upper bound on the `tmux list-panes` probe. A wedged tmux server degrades to
+ *  "no pairs" (skip) rather than freezing the restore pulse. */
+const TMUX_PROBE_TIMEOUT_MS = 5000;
 
 /**
  * Schema version of the restore-snapshot side-file. INDEPENDENT of the DB
@@ -463,6 +520,160 @@ interface PulseState {
   epochHighWater: RestoreTier | null;
   lastSession: RestoreTier | null;
   bootPromoted: boolean;
+  /**
+   * Producer-side dedup for the tmux pane-snapshot post (mirrors `lastHash`).
+   * Hash of the last posted `pairs` set, so an unchanged tmux topology does NOT
+   * re-post every pulse while a pane the server can't resolve keeps a job NULL
+   * forever. `null` until the first post. Reset semantics: we only ever advance
+   * it on a post, so a transient "no pairs" pulse leaves it intact.
+   */
+  lastSnapshotHash: string | null;
+}
+
+/**
+ * True when at least one LIVE (`working`/`stopped`) tmux job carries a NULL
+ * `backend_exec_session_id` — the gate that arms the tmux pane probe. When
+ * false the poller is fully quiescent (no spawn, no post). Reads only the
+ * projection rows; pure.
+ */
+function hasUnresolvedTmuxJob(jobs: Job[]): boolean {
+  for (const job of jobs) {
+    if (job.state !== "working" && job.state !== "stopped") {
+      continue;
+    }
+    if (
+      job.backend_exec_type === "tmux" &&
+      job.backend_exec_session_id == null
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Spawn `tmux list-panes -a -F '#{pane_id}\t#{session_name}'` and parse the
+ * `(pane_id, session_name)` pairs. NEVER throws: an ENOENT (no tmux binary), a
+ * non-zero exit (no server / no panes), or a malformed line degrades to `[]`
+ * (skip silently — no server means nothing to resolve). Tab-delimited because a
+ * session name may contain spaces; a line missing the tab or either field is
+ * dropped. Pure relative to the injected `spawnSync`.
+ */
+export function probeTmuxPanes(spawnSync: SpawnSyncFn): TmuxPanePair[] {
+  let res: ReturnType<SpawnSyncFn>;
+  try {
+    res = spawnSync([
+      "tmux",
+      "list-panes",
+      "-a",
+      "-F",
+      "#{pane_id}\t#{session_name}",
+    ]);
+  } catch {
+    return [];
+  }
+  if (!res.success || res.exitCode !== 0) {
+    return [];
+  }
+  const text = res.stdout.toString();
+  const pairs: TmuxPanePair[] = [];
+  for (const line of text.split("\n")) {
+    if (line === "") {
+      continue;
+    }
+    const tab = line.indexOf("\t");
+    if (tab < 0) {
+      continue;
+    }
+    const paneId = line.slice(0, tab);
+    const sessionName = line.slice(tab + 1);
+    if (paneId === "" || sessionName === "") {
+      continue;
+    }
+    pairs.push({ pane_id: paneId, session_name: sessionName });
+  }
+  return pairs;
+}
+
+/**
+ * Filter the probed pairs to those that would actually FILL a live NULL-session
+ * tmux job (pane id matches AND session still NULL). Posting only fillable
+ * pairs keeps the event from spamming when the tmux topology carries panes
+ * keeper never launched. The reducer re-applies the same fill-only predicate, so
+ * this is a producer-side narrowing, not the authority.
+ */
+function fillablePairs(jobs: Job[], pairs: TmuxPanePair[]): TmuxPanePair[] {
+  const unresolved = new Set<string>();
+  for (const job of jobs) {
+    if (job.state !== "working" && job.state !== "stopped") {
+      continue;
+    }
+    if (
+      job.backend_exec_type === "tmux" &&
+      job.backend_exec_session_id == null &&
+      job.backend_exec_pane_id != null
+    ) {
+      unresolved.add(job.backend_exec_pane_id);
+    }
+  }
+  return pairs.filter((p) => unresolved.has(p.pane_id));
+}
+
+/**
+ * Stable hash of a pairs set for the producer-side dedup gate. Sorts by
+ * `(pane_id, session_name)` so SELECT / probe order doesn't churn the hash, then
+ * hashes the joined string. A `null` / empty set is the empty-string hash.
+ */
+function hashPairs(pairs: TmuxPanePair[]): string {
+  const sorted = [...pairs].sort((a, b) =>
+    a.pane_id < b.pane_id
+      ? -1
+      : a.pane_id > b.pane_id
+        ? 1
+        : a.session_name < b.session_name
+          ? -1
+          : a.session_name > b.session_name
+            ? 1
+            : 0,
+  );
+  return String(
+    Bun.hash(sorted.map((p) => `${p.pane_id}\t${p.session_name}`).join("\n")),
+  );
+}
+
+/**
+ * The tmux pane-snapshot poll arm, run at the END of each restore pulse. Gated
+ * three ways so the poller is quiescent in the common case:
+ *  1. GATE — at least one live tmux job with a NULL session (else return).
+ *  2. PROBE — `tmux list-panes`; ENOENT / no server degrades to no pairs.
+ *  3. FILL — keep only pairs that would actually fill a NULL-session live job;
+ *     if none would fill, mint NOTHING (the gate re-fires next pulse).
+ *  4. DEDUP — skip the post when the fillable set is byte-identical to the last
+ *     post, so an unresolvable pane doesn't re-post every pulse forever.
+ *
+ * On a post, advances `state.lastSnapshotHash`. PURE relative to its injected
+ * `spawnSync` + `post` — no I/O of its own beyond the probe, no env, no DB.
+ */
+function tmuxSnapshotPulse(
+  jobs: Job[],
+  state: PulseState,
+  spawnSync: SpawnSyncFn,
+  post: (msg: TmuxPaneSnapshotMessage) => void,
+): void {
+  if (!hasUnresolvedTmuxJob(jobs)) {
+    return;
+  }
+  const probed = probeTmuxPanes(spawnSync);
+  const pairs = fillablePairs(jobs, probed);
+  if (pairs.length === 0) {
+    return;
+  }
+  const hash = hashPairs(pairs);
+  if (state.lastSnapshotHash === hash) {
+    return;
+  }
+  post({ kind: "tmux-pane-snapshot", pairs });
+  state.lastSnapshotHash = hash;
 }
 
 /**
@@ -497,6 +708,13 @@ export function restorePulse(
   restorePath: string,
   state: PulseState,
   now: () => number = () => Date.now() / 1000,
+  snapshot?: {
+    /** Inject the tmux pane probe; omit to use {@link defaultSpawnSync}. */
+    spawnSync?: SpawnSyncFn;
+    /** Post a `TmuxPaneSnapshot` to main; omit to disable the poll arm entirely
+     *  (the pure-pulse test path — no parentPort). */
+    post?: (msg: TmuxPaneSnapshotMessage) => void;
+  },
 ): void {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -534,6 +752,19 @@ export function restorePulse(
   const epicsById = new Map<string, Epic>();
   for (const epic of epics) {
     epicsById.set(epic.epic_id, epic);
+  }
+
+  // Tmux pane-snapshot poll arm — runs on EVERY pulse (before the restore-file
+  // write's own dedup early-return), self-gated so it is quiescent unless a live
+  // tmux job carries a NULL session. Disabled entirely when no `post` is wired
+  // (the pure-pulse test path that never spawns a Worker).
+  if (snapshot?.post) {
+    tmuxSnapshotPulse(
+      jobs,
+      state,
+      snapshot.spawnSync ?? defaultSpawnSync,
+      snapshot.post,
+    );
   }
 
   const current = buildRestoreTier(jobs, epicsById, now());
@@ -654,8 +885,18 @@ function main(): void {
     epochHighWater: null,
     lastSession: null,
     bootPromoted: false,
+    lastSnapshotHash: null,
   };
   let shutdown = false;
+
+  // The tmux pane-snapshot post → main (the sole synthetic-event writer). The
+  // worker is otherwise a pure consumer; this is its ONLY worker→main channel.
+  const port = parentPort;
+  const snapshot = {
+    post: (msg: TmuxPaneSnapshotMessage): void => {
+      port.postMessage(msg);
+    },
+  };
 
   parentPort.on("message", (msg: ShutdownMessage | undefined) => {
     if (msg && msg.type === "shutdown") {
@@ -675,7 +916,7 @@ function main(): void {
   // worker writes a settled `restore.json` immediately rather than after
   // the first data_version change.
   try {
-    restorePulse(db, restorePath, state);
+    restorePulse(db, restorePath, state, undefined, snapshot);
   } catch (err) {
     // Defense-in-depth: restorePulse's internal try/catch already swallows
     // write errors, but a projection-read throw would escape here. Log +
@@ -691,7 +932,7 @@ function main(): void {
     db,
     () => {
       try {
-        restorePulse(db, restorePath, state);
+        restorePulse(db, restorePath, state, undefined, snapshot);
       } catch (err) {
         // Same defense-in-depth as the initial pulse.
         console.error(

@@ -46,12 +46,15 @@ import { resolveRestorePath } from "../src/db";
 import {
   buildRestoreTier,
   parsePersistedRestore,
+  probeTmuxPanes,
   type RestoreDescriptor,
   type RestoreTier,
   readPersistedRestore,
   restorePulse,
+  type SpawnSyncFn,
   serializeForHash,
   serializeForWrite,
+  type TmuxPaneSnapshotMessage,
 } from "../src/restore-worker";
 import type { Epic, Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
@@ -63,6 +66,7 @@ function freshState(): {
   epochHighWater: RestoreTier | null;
   lastSession: RestoreTier | null;
   bootPromoted: boolean;
+  lastSnapshotHash: string | null;
 } {
   return {
     lastHash: null,
@@ -70,7 +74,18 @@ function freshState(): {
     epochHighWater: null,
     lastSession: null,
     bootPromoted: false,
+    lastSnapshotHash: null,
   };
+}
+
+/** A `SpawnSyncFn` that returns the given tab-delimited `#{pane_id}\t#{session}`
+ *  lines as a successful `tmux list-panes` capture. */
+function stubTmuxPanes(lines: string[]): SpawnSyncFn {
+  return () => ({
+    success: true,
+    exitCode: 0,
+    stdout: Buffer.from(lines.join("\n")),
+  });
 }
 
 /** Read + parse the two-tier file off disk for assertions. */
@@ -125,14 +140,17 @@ function insertJob(opts: {
   title?: string | null;
   plan_verb?: string | null;
   plan_ref?: string | null;
+  backend_exec_type?: string | null;
   backend_exec_session_id?: string | null;
+  backend_exec_pane_id?: string | null;
 }): void {
   const state = opts.state ?? "working";
   db.run(
     `INSERT INTO jobs (
        job_id, created_at, state, last_event_id, updated_at,
-       cwd, title, plan_verb, plan_ref, backend_exec_session_id
-     ) VALUES (?, 1000, ?, 0, 1000, ?, ?, ?, ?, ?)`,
+       cwd, title, plan_verb, plan_ref,
+       backend_exec_type, backend_exec_session_id, backend_exec_pane_id
+     ) VALUES (?, 1000, ?, 0, 1000, ?, ?, ?, ?, ?, ?, ?)`,
     [
       opts.job_id,
       state,
@@ -140,7 +158,9 @@ function insertJob(opts: {
       opts.title ?? null,
       opts.plan_verb ?? null,
       opts.plan_ref ?? null,
+      opts.backend_exec_type ?? null,
       opts.backend_exec_session_id ?? null,
+      opts.backend_exec_pane_id ?? null,
     ],
   );
 }
@@ -804,3 +824,167 @@ function legacyAgent(job_id: string): {
     plan_ref: null,
   };
 }
+
+// ---------------------------------------------------------------------------
+// probeTmuxPanes — parse + degrade
+// ---------------------------------------------------------------------------
+
+test("probeTmuxPanes parses tab-delimited pane/session pairs", () => {
+  const pairs = probeTmuxPanes(
+    stubTmuxPanes(["%1\twork", "%2\tplay", "%3\twork"]),
+  );
+  expect(pairs).toEqual([
+    { pane_id: "%1", session_name: "work" },
+    { pane_id: "%2", session_name: "play" },
+    { pane_id: "%3", session_name: "work" },
+  ]);
+});
+
+test("probeTmuxPanes keeps session names containing spaces (tab split)", () => {
+  const pairs = probeTmuxPanes(stubTmuxPanes(["%1\tmy session name"]));
+  expect(pairs).toEqual([{ pane_id: "%1", session_name: "my session name" }]);
+});
+
+test("probeTmuxPanes drops malformed lines (no tab / empty field)", () => {
+  const pairs = probeTmuxPanes(
+    stubTmuxPanes(["%1\tok", "garbage-no-tab", "\tonlysession", "%4\t", ""]),
+  );
+  expect(pairs).toEqual([{ pane_id: "%1", session_name: "ok" }]);
+});
+
+test("probeTmuxPanes degrades to [] on a thrown spawn (ENOENT — no tmux binary)", () => {
+  const pairs = probeTmuxPanes(() => {
+    throw new Error("ENOENT");
+  });
+  expect(pairs).toEqual([]);
+});
+
+test("probeTmuxPanes degrades to [] on a non-zero exit (no server)", () => {
+  const pairs = probeTmuxPanes(() => ({
+    success: false,
+    exitCode: 1,
+    stdout: Buffer.from(""),
+  }));
+  expect(pairs).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// restorePulse — tmux pane-snapshot poll arm (gate / fill / dedup)
+// ---------------------------------------------------------------------------
+
+test("restorePulse posts a tmux-pane-snapshot when a live tmux job has a NULL session", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: null,
+  });
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\twork", "%9\tother"]),
+    post: (m) => posts.push(m),
+  });
+  expect(posts).toHaveLength(1);
+  // Only the pane matching the NULL-session live job is posted (fillable filter).
+  expect(posts[0].pairs).toEqual([{ pane_id: "%1", session_name: "work" }]);
+});
+
+test("restorePulse poll arm is quiescent when no NULL-session tmux job is live", () => {
+  // A tmux job that already has a session, and a non-tmux NULL-session job.
+  insertJob({
+    job_id: "filled",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  insertJob({
+    job_id: "zellij",
+    backend_exec_type: "zellij",
+    backend_exec_pane_id: "%2",
+    backend_exec_session_id: null,
+  });
+  let spawned = false;
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    spawnSync: () => {
+      spawned = true;
+      return { success: true, exitCode: 0, stdout: Buffer.from("%1\twork") };
+    },
+    post: (m) => posts.push(m),
+  });
+  expect(spawned).toBe(false); // gate false → no probe spawn
+  expect(posts).toHaveLength(0);
+});
+
+test("restorePulse mints nothing when no probed pair would fill a NULL-session job", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: null,
+  });
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  // The server only shows panes keeper never tracked — nothing fills %1.
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    spawnSync: stubTmuxPanes(["%7\tghost", "%8\tphantom"]),
+    post: (m) => posts.push(m),
+  });
+  expect(posts).toHaveLength(0);
+});
+
+test("restorePulse dedups: an unchanged topology does not re-post across pulses", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: null,
+  });
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  const state = freshState();
+  const snapshot = {
+    spawnSync: stubTmuxPanes(["%1\twork"]),
+    post: (m: TmuxPaneSnapshotMessage) => posts.push(m),
+  };
+  restorePulse(db, restorePath, state, () => 1000, snapshot);
+  restorePulse(db, restorePath, state, () => 2000, snapshot);
+  restorePulse(db, restorePath, state, () => 3000, snapshot);
+  // The job stays NULL in this DB (no reducer here to fill it), so the gate
+  // stays armed every pulse — but the dedup hash suppresses the repeat posts.
+  expect(posts).toHaveLength(1);
+});
+
+test("restorePulse re-posts when the resolvable topology changes", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: null,
+  });
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\twork"]),
+    post: (m) => posts.push(m),
+  });
+  // The pane moved to a different session — a genuine topology change.
+  restorePulse(db, restorePath, state, () => 2000, {
+    spawnSync: stubTmuxPanes(["%1\tmoved"]),
+    post: (m) => posts.push(m),
+  });
+  expect(posts).toHaveLength(2);
+  expect(posts[1].pairs).toEqual([{ pane_id: "%1", session_name: "moved" }]);
+});
+
+test("restorePulse poll arm is fully disabled when no post is wired (pure-pulse path)", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: null,
+  });
+  // No `snapshot` arg at all — the pure-pulse test path (no parentPort). The
+  // restore-file write still runs; the tmux probe arm is skipped entirely
+  // (no spawn, no post) even though the gate would otherwise be armed.
+  restorePulse(db, restorePath, freshState(), () => 1000);
+  expect(existsSync(restorePath)).toBe(true);
+});

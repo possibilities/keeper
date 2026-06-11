@@ -84,7 +84,10 @@ import {
   drain,
   serializeBuildSnapshot,
 } from "./reducer";
-import type { RestoreWorkerData } from "./restore-worker";
+import type {
+  RestoreWorkerData,
+  TmuxPaneSnapshotMessage,
+} from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
   KickMessage,
@@ -3238,12 +3241,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // The restore-snapshot worker — a pure CONSUMER: its own read-only connection,
-  // polls `data_version`, and rewrites `~/.local/state/keeper/restore.json` (a
-  // derived side-file, NOT a projection) only when the content hash differs. It
-  // carries no `onmessage` handler — never posts to main, never writes the DB.
-  // Write failures are swallowed to stderr; only an unhandled throw escalates to
-  // fatalExit.
+  // The restore-snapshot worker — its own read-only connection, polls
+  // `data_version`, and rewrites `~/.local/state/keeper/restore.json` (a derived
+  // side-file, NOT a projection) only when the content hash differs. Write
+  // failures are swallowed to stderr; only an unhandled throw escalates to
+  // fatalExit. Riding the same pulse, it self-gates a tmux pane-snapshot probe
+  // and posts `{kind:"tmux-pane-snapshot"}` (its ONLY worker→main channel) —
+  // `rw.onmessage` mints the `TmuxPaneSnapshot` synthetic event below.
   //
   // The maintenance worker hosts the heavy SQLite schedules (verified backup,
   // integrity probe, boot catch-up) OFF main's fold thread — synchronous
@@ -3308,6 +3312,54 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (restoreWorker) {
     const rw = restoreWorker;
+    // Worker → main: the tmux pane-snapshot post. Main is the SOLE synthetic-
+    // event writer — mint ONE `TmuxPaneSnapshot` row carrying the probed
+    // `(pane_id, session_name)` pairs in `data`; the reducer's fill-only fold
+    // stamps each matching NULL-session tmux job's session name. The restore
+    // file write path stays a pure consumer (no message). The worker self-gates
+    // + dedups, so a post here always carries pairs that would fill something.
+    rw.onmessage = (
+      ev: MessageEvent<TmuxPaneSnapshotMessage | undefined>,
+    ): void => {
+      const msg = ev.data;
+      if (!msg || msg.kind !== "tmux-pane-snapshot") return;
+      stmts.insertEvent.run({
+        $ts: Date.now() / 1000,
+        $session_id: null,
+        $pid: null,
+        $hook_event: "TmuxPaneSnapshot",
+        $event_type: "tmux_pane_snapshot",
+        $tool_name: null,
+        $matcher: null,
+        $cwd: null,
+        $permission_mode: null,
+        $agent_id: null,
+        $agent_type: null,
+        $stop_hook_active: null,
+        $data: JSON.stringify({ pairs: msg.pairs }),
+        $subagent_agent_id: null,
+        $spawn_name: null,
+        $start_time: null,
+        $slash_command: null,
+        $skill_name: null,
+        $planctl_op: null,
+        $planctl_target: null,
+        $planctl_epic_id: null,
+        $planctl_task_id: null,
+        $planctl_subject_present: null,
+        $config_dir: null,
+        $planctl_queue_jump: null,
+        $bash_mutation_kind: null,
+        $bash_mutation_targets: null,
+        $planctl_files: null,
+        $backend_exec_type: null,
+        $backend_exec_session_id: null,
+        $backend_exec_pane_id: null,
+      });
+      wakePending = true;
+      pumpWakes();
+    };
+
     rw.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] restore worker error:", err.message ?? err);
       if (!shuttingDown) fatalExit();
