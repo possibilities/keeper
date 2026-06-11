@@ -56,5 +56,5 @@ dictates. Boot-pause determinism test if that leg finds a bug.
 - [ ] fn-735/fn-742 suppression suites stay green; full bun test green
 
 ## Done summary
-
+Root-caused the dup-close as slow-cold-boot over-dispatch (fn-762 recurring at a longer tail): a close::<epic> worker booted 317s late, its pending_dispatches row TTL-expired at ~120s with no jobs row bound, and the cooldown (single indoubt re-stamp, cover-end dispatch+260s) lapsed 2s before the re-dispatch at dispatch+261s. Fix: refreshSuppressionForOpenPending re-anchors the cooldown + finalizer guard each cycle a key still has an open pending row, tracking the phantom's durable (TTL-bounded) lifetime. Boot-pause leg: no bug — every boot comes up paused; the observed unpaused-at-boot was a human play RPC ~2s after the boot re-arm. Pinned by a same-second reproduction test + open-pending refresh/bound tests; full suite green.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Root-cause same-second dup close",
-  "updated_at": "2026-06-10T20:53:20.268523Z"
+  "updated_at": "2026-06-11T02:56:40.040105Z",
+  "worker_done_at": "2026-06-11T02:56:40.040105Z"
 }
