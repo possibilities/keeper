@@ -1992,6 +1992,15 @@ const GIT_CHECK_TIMEOUT_MS = 1000;
 export const RECONCILE_HEARTBEAT_MS = 5_000;
 
 /**
+ * Per-cycle cap on mute-watcher re-arm tear-down + re-subscribe (the git-worker
+ * fn-771 precedent value). The configured-root set is small, so the cap is cheap
+ * insurance against a pathological flag explosion churning streams in one drain;
+ * any overflow stays flagged for the next drain. Exported for unit reach (the
+ * {@link decidePlanResubscribe} cap test asserts against it).
+ */
+export const MAX_SUBSCRIBES_PER_CYCLE = 16;
+
+/**
  * Cadence (ms) at which the worker flushes its in-memory backstop counters as
  * {@link BackstopRollup} records — the denominator
  * (fires_total / rescues_total) `scripts/backstop-stats.ts` divides into the
@@ -2370,13 +2379,22 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
  * Returns `true` iff at least one `.planctl` dir's scan emitted a snapshot
  * — the `rescued` boolean the backstop caller (heartbeat / FSEvents-
  * drop) folds into one uniform `missed-wake` record per fire. The `db-poll`
- * (fast-path) and boot callers ignore the return.
+ * (fast-path) and boot callers ignore the return. The boolean's meaning is
+ * unchanged across the fn-788 attribution add (the backstop record / counters
+ * keep their semantics byte-for-byte).
+ *
+ * `emittedRoots` (optional out-param) — when passed, every CONFIGURED root whose
+ * `.planctl` scan emitted is added to it (a discovered `<root>/<project>/.planctl`
+ * dir is attributed back to its configured root via
+ * {@link attributePlanctlDirToRoot}). The mute-watcher re-arm consumes this to
+ * flag exactly the implicated roots; all other callers omit it.
  */
 export function reconcilePlanctlDirs(
   roots: readonly string[],
   scanner: PlanScanner,
   triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
   onPlanctlDir?: (planctlDir: string) => void,
+  emittedRoots?: Set<string>,
 ): boolean {
   const dirs = discoverPlanctlDirs(roots);
   let emittedAny = false;
@@ -2386,6 +2404,10 @@ export function reconcilePlanctlDirs(
     }
     if (scanPlanctlDir(dir, scanner, triggerReason)) {
       emittedAny = true;
+      if (emittedRoots !== undefined) {
+        const root = attributePlanctlDirToRoot(dir, roots);
+        if (root !== null) emittedRoots.add(root);
+      }
     }
   }
   return emittedAny;
@@ -2617,6 +2639,54 @@ export function reflogWatchDiff(
     if (!desired.has(repo)) toDrop.add(repo);
   }
   return { toAdd, toDrop };
+}
+
+/**
+ * Attribute a discovered `<root>/<project>/.planctl` dir back to the configured
+ * root whose FSEvents subscription covers it — the mute-watcher re-arm operates
+ * on the broad CONFIGURED root (`data.roots`, the subscription key), not the
+ * nested per-project `.planctl` dir the heartbeat scan walks. Returns the
+ * LONGEST matching configured-root prefix (a nested configured root wins over a
+ * broader ancestor of it), or `null` when no configured root contains the dir
+ * (a path the heartbeat scan should never surface, but defended so a stray dir
+ * can't mis-attribute a re-arm onto an unrelated subscription).
+ *
+ * PURE — string-prefix arithmetic over the path, no I/O. Exported for unit reach.
+ */
+export function attributePlanctlDirToRoot(
+  planctlDir: string,
+  roots: readonly string[],
+): string | null {
+  let best: string | null = null;
+  for (const root of roots) {
+    const prefix = root.endsWith(sep) ? root : root + sep;
+    if (planctlDir === root || planctlDir.startsWith(prefix)) {
+      if (best === null || root.length > best.length) best = root;
+    }
+  }
+  return best;
+}
+
+/**
+ * Mute-watcher re-arm decision. Given the configured roots a heartbeat rescue
+ * implicated (their `.planctl` scan emitted a snapshot the FSEvents fast path
+ * missed) and a per-cycle cap, decide which roots to tear down + re-subscribe
+ * THIS drain. Bounded by `cap` (the precedent {@link MAX_SUBSCRIBES_PER_CYCLE});
+ * an overflow stays flagged for the next drain. Re-arming the FULL root set on
+ * any rescue is the stream-flap vector and is rejected — only the implicated
+ * roots are returned.
+ *
+ * PURE — set/order arithmetic, no I/O and no mutation of its inputs (the caller
+ * owns the one-shot flag clear + the `unsubscribe()`/`subscribe()` I/O). Returns
+ * a stable insertion-ordered slice so the drain is deterministic. Exported for
+ * unit reach (the {@link reflogWatchDiff} / {@link decideReconcileTransitions}
+ * model).
+ */
+export function decidePlanResubscribe(
+  pendingResubscribe: ReadonlySet<string>,
+  cap: number,
+): string[] {
+  return [...pendingResubscribe].slice(0, Math.max(0, cap));
 }
 
 /**
@@ -2919,11 +2989,43 @@ function main(): void {
     console.error(`[plan-worker] restart-seed failed: ${stringifyErr(err)}`);
   }
 
-  const subscriptions: AsyncSubscription[] = [];
-  // One drop-recovery scheduler per root (each subscribe callback closes over
-  // its own `root`). Cleared in shutdown BEFORE unsubscribe so a queued re-scan
-  // can't touch a closing DB.
-  const schedulers: RescanScheduler[] = [];
+  // Configured-root → its broad recursive FSEvents subscription. Keyed (vs a
+  // flat array) so the mute-watcher re-arm can map a rescued root to the exact
+  // subscription to tear down + replace. A root whose subscribe failed/raced
+  // shutdown simply never enters the map (it is then unwatched until the next
+  // heartbeat re-flags it).
+  const subscriptions = new Map<string, AsyncSubscription>();
+  // configured-root → its drop-recovery scheduler (each subscribe callback
+  // closes over its own `root`). Keyed so the re-arm reuses the existing
+  // scheduler for a root instead of leaking a second one. Cleared in shutdown
+  // BEFORE unsubscribe so a queued re-scan can't touch a closing DB.
+  const schedulers = new Map<string, RescanScheduler>();
+  // fn-788 mute-watcher re-arm. Configured roots whose broad FSEvents
+  // subscription went mute and was rescued by the heartbeat backstop (the scan
+  // emitted a snapshot the FSEvents fast path missed). Flagged here, drained by
+  // `drainResubscribe` on the next single-flight cycle: `await unsubscribe()`
+  // THEN a fresh `subscribe()` with the IDENTICAL options. The re-arm replaces
+  // ONLY the watcher stream — the PlanScanner change-gate / lastEmitted survives,
+  // so the post-re-arm scan re-emits nothing that didn't actually change (no
+  // phantom re-folds). One-shot per flag: a root that re-goes-mute is re-flagged
+  // by a later heartbeat. No worker respawn, no DB write, no synthetic event.
+  const pendingResubscribe = new Set<string>();
+  // configured-root → monotonic subscribe generation. Bumped on every
+  // (re)subscribe; the watcher callback captures its generation and no-ops if it
+  // no longer matches — the in-flight-callback guard against a torn-down stream's
+  // late batch touching state a re-arm already replaced.
+  const subGeneration = new Map<string, number>();
+  // Roots re-armed this cycle still inside their one-heartbeat flap-guard window
+  // → wall-clock (`Date.now()`) ms at which each was re-subscribed. A still-mute
+  // replacement that re-flags within the window is suppressed (don't churn the
+  // stream); the flag is honored again once the new subscription has survived one
+  // full heartbeat interval. Cleared as the window lapses.
+  const reArmedAtMs = new Map<string, number>();
+  // The `@parcel/watcher` module for the BROAD main-tree subscriptions, published
+  // once the addon resolves. Distinct ref from `reflogWatcherModule` (same
+  // module, but this one gates the main-tree re-arm trigger specifically). Null
+  // until the addon loads — the heartbeat re-arm null-guards on it.
+  let mainTreeWatcherModule: typeof import("@parcel/watcher") | null = null;
   // periodic reconcile backstop: a low-frequency heartbeat re-runs
   // `reconcilePlanctlDirs` across every configured root, so a brand-new
   // repo's first scaffold converges within one interval even if FSEvents
@@ -3033,9 +3135,10 @@ function main(): void {
       shuttingDown = true;
       // Clear every armed re-scan timer FIRST (before unsubscribe / db close) so
       // a pending drop-recovery scan can't fire against a closing connection.
-      for (const sched of schedulers.splice(0)) {
+      for (const sched of schedulers.values()) {
         sched.cancel();
       }
+      schedulers.clear();
       // cancel the periodic-reconcile heartbeat alongside the
       // drop-recovery schedulers so it can't tick against a closing DB
       // (mirrors the schedulers' BEFORE-unsubscribe ordering — the scan
@@ -3063,9 +3166,10 @@ function main(): void {
       }
       scanner.flushBackstopRollups();
       // Release every subscription (external resources), then the db, then exit
-      // clean. Mirrors transcript-worker's teardown but over an array.
+      // clean. Mirrors transcript-worker's teardown but over the keyed map.
       void (async () => {
-        for (const sub of subscriptions.splice(0)) {
+        for (const [root, sub] of [...subscriptions]) {
+          subscriptions.delete(root);
           try {
             await sub.unsubscribe();
           } catch {
@@ -3106,11 +3210,18 @@ function main(): void {
       // into one uniform `missed-wake` record (rescued = did the change-gated
       // scan deliver work the fast paths missed). The shutdown guard above
       // gates both the scan AND the telemetry emit.
+      //
+      // fn-788 per-root attribution: collect WHICH configured roots emitted so
+      // the mute-watcher re-arm flags exactly those (re-arming all roots on any
+      // rescue is the stream-flap vector — rejected). The aggregate `rescued`
+      // boolean keeps its semantics for `fireBackstop` (byte-compatible).
+      const emittedRoots = new Set<string>();
       const rescued = reconcilePlanctlDirs(
         data.roots,
         scanner,
         "heartbeat",
         nudgeFromPlanctlDir,
+        emittedRoots,
       );
       // per-wake-path attribution: classify whether the rescued repos
       // had a reflog watch armed. `absent` is the prime-suspect slow path — a
@@ -3125,6 +3236,36 @@ function main(): void {
         rescued,
         reflogWatchAttribution(),
       );
+      // fn-788 mute-watcher re-arm. A heartbeat rescue means a configured root's
+      // broad FSEvents stream missed a change — flag exactly the implicated
+      // root(s) and kick the drain (the re-arm is OWNED by the single-flight
+      // wake, never fired directly here — sequential teardown can't run inside a
+      // sync timer tick). The flap guard suppresses a re-flag inside the
+      // one-heartbeat window after a re-arm so a still-mute replacement doesn't
+      // churn the stream forever; the window is honored once it lapses (the new
+      // subscription survived a full interval, so a fresh rescue is a real
+      // re-mute). A healthy root never emits, so it is never flagged.
+      const nowMs = Date.now();
+      let flaggedAny = false;
+      for (const root of emittedRoots) {
+        const armedAt = reArmedAtMs.get(root);
+        if (armedAt !== undefined) {
+          if (nowMs - armedAt < RECONCILE_HEARTBEAT_MS) {
+            // Still inside the flap-guard window — suppress (don't re-churn).
+            continue;
+          }
+          // Window lapsed: the replacement survived a full interval, so this is
+          // a genuine re-mute. Clear the stamp and re-flag.
+          reArmedAtMs.delete(root);
+        }
+        pendingResubscribe.add(root);
+        flaggedAny = true;
+      }
+      // Drive the drain through the db-poll single-flight so a wake and the
+      // re-arm drain never race on the subscription map. `onWake` runs the
+      // resubscribe drain after its scan; nothing fires if the addon hasn't
+      // loaded yet (the drain null-guards `mainTreeWatcherModule`).
+      if (flaggedAny) onWake();
       // re-reconcile the reflog watches against the live union (pending
       // ∪ discovered planctl repos). `onPendingChange` only fires on a pending
       // mutation, so a brand-new `.planctl` repo that never accrues a pending
@@ -3188,6 +3329,15 @@ function main(): void {
       // label `db-poll` for per-wake-path attribution.
       scanner.markFastPath("db-poll");
       reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
+      // fn-788: after the scan, drive the mute-watcher re-arm drain. The scan
+      // above only READS the on-disk `.planctl` census — the drain is the sole
+      // mutator of the `subscriptions` map on the wake path, so running it here
+      // (inside the single-flight body, after the scan) is what makes a db-poll
+      // wake and the re-arm drain never race on that map. The drain is async
+      // (sequential unsubscribe→subscribe) and self-guards re-entrancy, so it is
+      // kicked fire-and-forget; a no-op when nothing is flagged or the addon
+      // hasn't loaded.
+      void kickResubscribeDrain();
     },
     () => shuttingDown,
     (err) =>
@@ -3278,12 +3428,268 @@ function main(): void {
     return;
   }
 
+  // The broad recursive FSEvents subscription for ONE configured root. Shared
+  // by the boot loop and the mute-watcher re-arm drain so BOTH paths use the
+  // IDENTICAL subscribe options (`{ ignore: IGNORE_GLOBS }`, positive globs
+  // only) and the IDENTICAL callback — the re-arm must not drift from boot or it
+  // would silently change the watched surface. Resolves to the live
+  // `AsyncSubscription` (registered in `subscriptions` by the caller) or null on
+  // a lost-race / subscribe failure. Reuses the root's existing drop-recovery
+  // scheduler when present (a re-arm keeps the same scheduler) and creates one
+  // on first subscribe (boot).
+  const subscribeRoot = async (
+    watcher: typeof import("@parcel/watcher"),
+    root: string,
+  ): Promise<AsyncSubscription | null> => {
+    // Per-root drop-recovery scheduler: a recoverable FSEvents drop schedules
+    // a debounced, single-flight re-scan of THIS root's `.planctl` dirs via
+    // the change-gated {@link reconcilePlanctlDirs} primitive — never an
+    // unsubscribe+re-subscribe (the live subscription stays alive; the
+    // drop-rescan recovers a lost batch without opening a no-watch gap — that
+    // is DISTINCT from the mute-watcher re-arm below, which replaces a
+    // subscription that stopped delivering entirely). The warm in-memory
+    // change-gate (PlanScanner.lastEmitted) suppresses re-emits for unchanged
+    // files, so recovery is idempotent. The scan re-checks shuttingDown so a
+    // queued scan can't touch a closing DB.
+    //
+    // scoped to `.planctl` dirs (O(#projects)), NOT the full
+    // recursive walk over the whole `~/code` tree the boot scan does.
+    // The commit path (`planctl-commit-changed`) + the boot sweep
+    // continue to handle deletions, so an additive shallow rescan is
+    // sufficient for the live drop-recovery window and dramatically
+    // cheaper than re-walking the entire root.
+    let rescan = schedulers.get(root);
+    if (rescan === undefined) {
+      rescan = new RescanScheduler(() => {
+        if (shuttingDown) {
+          return;
+        }
+        // tag as "fswatcher-drop" so a snapshot recovered here
+        // (one the dropped FSEvents change would otherwise have lost) logs
+        // a "did real work" line.
+        // this is the FSEvents-drop backstop — fold the emitted-
+        // boolean into one `rescan-drop` missed-wake record. The shutdown
+        // guard above gates both the scan and the telemetry emit.
+        const rescued = reconcilePlanctlDirs(
+          [root],
+          scanner,
+          "fswatcher-drop",
+          nudgeFromPlanctlDir,
+        );
+        // this drop-rescan is scoped to ONE `root`, so attribute the
+        // reflog watch for that root specifically — `present`/`absent` only
+        // when the root is actually pending (otherwise no per-repo notion).
+        const reflogWatch = scanner.pendingRepos().has(root)
+          ? reflogSubs.has(root)
+            ? "present"
+            : "absent"
+          : undefined;
+        scanner.fireBackstop("rescan-drop", "fsevents", rescued, reflogWatch);
+      });
+      schedulers.set(root, rescan);
+    }
+    // Active-generation guard: a batch can fire AFTER `unsubscribe()` resolves
+    // (the parcel/watcher #190 stale-callback window). Bumping the generation on
+    // every (re)subscribe and capturing it in the callback closure lets a
+    // torn-down stream's late batch detect it is stale and no-op, so it can't
+    // touch state a re-arm already replaced.
+    const generation = (subGeneration.get(root) ?? 0) + 1;
+    subGeneration.set(root, generation);
+    try {
+      const sub = await watcher.subscribe(
+        root,
+        (err, events) => {
+          // Stale-callback guard: a batch from a torn-down stream (or one that
+          // raced a re-arm) carries an older generation — drop it.
+          if (subGeneration.get(root) !== generation) return;
+          if (err) {
+            // Always leave a breadcrumb so a future @parcel/watcher wording
+            // change (the drop discriminator couples to its message text) is
+            // observable in the logs.
+            console.error(
+              `[plan-worker] watcher error for ${root}: ${stringifyErr(err)}`,
+            );
+            // A recoverable FSEvents drop ("...must be re-scanned"): the lost
+            // change may never re-fire, so schedule a debounced re-scan. A
+            // non-drop err keeps today's swallow-and-log (additive only — no
+            // change to fatal/escalation behavior).
+            if (isDropError(err)) {
+              rescan.schedule();
+            }
+            return;
+          }
+          // a confirmed FSEvents batch is THE fast path for plan
+          // files — stamp `last_fast_path_at` so a later heartbeat measures
+          // staleness against it (and a working watcher keeps the heartbeat
+          // a perpetual no-op rescue).
+          // label `fsevents` for per-wake-path attribution.
+          scanner.markFastPath("fsevents");
+          for (const ev of events) {
+            // The in-callback `.planctl/{epics,tasks}/*.json` filter (via
+            // classifyPlanPath, applied inside onChange) is what guarantees
+            // only real plan files reach the read path — the positive ignore
+            // globs are belt-and-suspenders perf, not the correctness gate.
+            // Route on path+existence, NOT event.type (planctl writes via
+            // atomic os.replace, so an update may surface as create/rename).
+            if (ev.type === "delete") {
+              scanner.onDelete(ev.path);
+              continue;
+            }
+            scanner.onChange(ev.path);
+          }
+        },
+        { ignore: IGNORE_GLOBS },
+      );
+      if (shuttingDown) {
+        // Shutdown raced the subscribe resolution — release immediately.
+        void sub.unsubscribe();
+        return null;
+      }
+      subscriptions.set(root, sub);
+      return sub;
+    } catch (err) {
+      // Per-root isolation: one root's subscribe failure must not kill the
+      // others. Log and continue (no process exit). A re-arm subscribe failure
+      // is non-fatal too — the root stays unwatched and the next heartbeat
+      // rescue re-flags it.
+      console.error(
+        `[plan-worker] failed to subscribe to ${root}: ${stringifyErr(err)}`,
+      );
+      return null;
+    }
+  };
+
+  // fn-788 mute-watcher re-arm drain. Replace each flagged root's broad FSEvents
+  // subscription with a fresh one, SEQUENTIALLY (`await unsubscribe()` MUST
+  // complete before `subscribe()` on the same tree — overlapping live FSEvents
+  // streams on one tree is the machine-wide fseventsd-exhaustion vector,
+  // parcel/watcher #190), bounded per cycle. Run UNDER the db-poll single-flight
+  // (`onWake` below) so a wake and a drain never race on the subscription map.
+  //
+  // Producer state survives: only the watcher subscription is replaced — the
+  // PlanScanner change-gate / lastEmitted is untouched, so the post-re-arm scan
+  // (the existing `reconcilePlanctlDirs`) re-emits nothing that didn't actually
+  // change (no phantom re-folds). The one-shot flag is cleared as it drains; a
+  // re-mute re-flags it on a later heartbeat.
+  const drainResubscribe = async (
+    watcher: typeof import("@parcel/watcher"),
+  ): Promise<void> => {
+    if (pendingResubscribe.size === 0) return;
+    const toRearm = decidePlanResubscribe(
+      pendingResubscribe,
+      MAX_SUBSCRIBES_PER_CYCLE,
+    );
+    for (const root of toRearm) {
+      pendingResubscribe.delete(root);
+      if (shuttingDown) return;
+      // stat() the root before re-subscribing: a deleted-and-recreated dir is a
+      // new inode FSEvents won't re-attach to, and a missing root must DEFER the
+      // re-arm (it never re-subscribes a vanished tree). Leave it unflagged —
+      // the next heartbeat rescue re-flags it once it exists again.
+      if (!existsSync(root)) {
+        console.error(
+          `[plan-worker] re-arm deferred: root ${root} does not exist`,
+        );
+        continue;
+      }
+      console.error(`[plan-worker] re-arm: replacing mute watcher for ${root}`);
+      // SEQUENTIAL teardown: bumping the generation (inside subscribeRoot) first
+      // is not enough — the old stream must be FULLY unsubscribed before the new
+      // subscribe. tear down THEN re-subscribe with the identical options.
+      const old = subscriptions.get(root);
+      if (old !== undefined) {
+        subscriptions.delete(root);
+        try {
+          await old.unsubscribe();
+        } catch {
+          // best-effort — a failed unsubscribe on a mute stream is expected.
+        }
+      }
+      if (shuttingDown) return;
+      // Re-subscribe failure is non-fatal (subscribeRoot logs + returns null);
+      // the root stays unwatched and the next heartbeat rescue re-flags it.
+      const fresh = await subscribeRoot(watcher, root);
+      // Flap guard: stamp the re-arm time only on a successful re-subscribe so a
+      // still-mute replacement that re-flags within one heartbeat interval is
+      // suppressed (don't churn the stream). A failed subscribe leaves no stamp,
+      // so the next rescue re-flags immediately.
+      if (fresh !== null) reArmedAtMs.set(root, Date.now());
+      // Full rescan after the fresh subscribe (APFS coalescing collapses bursts,
+      // so back-fill can't be reconstructed) — reuse the existing scoped scan
+      // path. The change-gate suppresses unchanged files, so this re-emits only
+      // what actually changed.
+      try {
+        reconcilePlanctlDirs([root], scanner, "fswatcher-drop", undefined);
+      } catch (err) {
+        console.error(
+          `[plan-worker] re-arm rescan failed for ${root}: ${stringifyErr(err)}`,
+        );
+      }
+    }
+    // Reflog re-arm: when a rescued root's reflog watch is present-but-mute, drop
+    // its `reflogSubs` entry so the existing `reconcileReflogWatches` re-derives
+    // it (reuse that loop — no second reflog re-arm path).
+    for (const root of toRearm) {
+      if (reflogSubs.has(root) && existsSync(root)) {
+        const sub = reflogSubs.get(root);
+        reflogSubs.delete(root);
+        if (sub !== undefined) {
+          try {
+            await sub.unsubscribe();
+          } catch {
+            // best-effort
+          }
+        }
+      }
+    }
+    reconcileReflogWatches();
+  };
+
+  // Re-entrancy + module guard for the drain. The drain is async (sequential
+  // unsubscribe→subscribe), so a wake arriving mid-drain must coalesce into one
+  // trailing re-run instead of overlapping live teardowns on the same tree.
+  // Null-guards `mainTreeWatcherModule` (the addon may not have loaded yet) and
+  // re-runs once if a flag landed while draining (cap overflow OR a fresh
+  // heartbeat rescue), mirroring the `makeSingleFlight` trailing-coalesce shape
+  // but in the async domain.
+  let draining = false;
+  let drainPending = false;
+  const kickResubscribeDrain = async (): Promise<void> => {
+    if (draining) {
+      drainPending = true;
+      return;
+    }
+    const watcher = mainTreeWatcherModule;
+    if (watcher === null || shuttingDown) return;
+    draining = true;
+    try {
+      do {
+        drainPending = false;
+        if (shuttingDown) return;
+        try {
+          await drainResubscribe(watcher);
+        } catch (err) {
+          console.error(
+            `[plan-worker] re-arm drain failed: ${stringifyErr(err)}`,
+          );
+        }
+        // Cap overflow leaves the remainder flagged — loop to drain it.
+        if (pendingResubscribe.size > 0) drainPending = true;
+      } while (drainPending && !shuttingDown);
+    } finally {
+      draining = false;
+    }
+  };
+
   void import("@parcel/watcher")
-    .then((watcher) => {
+    .then(async (watcher) => {
       // publish the module so `reconcileReflogWatches` can subscribe.
       // Set BEFORE the boot scans below so a pending path accrued during a
       // root's `scanRoot` immediately gets its `.git/logs/HEAD` watch.
       reflogWatcherModule = watcher;
+      // expose the module + drain to the heartbeat re-arm trigger (armed before
+      // the module resolved — it null-guards until this assignment lands).
+      mainTreeWatcherModule = watcher;
       // Catch-up: a pending path may have been gated in before the module was
       // ready (e.g. a `recheck-pending`/`kick` post raced the addon load).
       // The boot scans below each fire `onPendingChange` too, but this guards
@@ -3299,115 +3705,16 @@ function main(): void {
           noteBootScanDone();
           continue;
         }
-        // Per-root drop-recovery scheduler: a recoverable FSEvents drop schedules
-        // a debounced, single-flight re-scan of THIS root's `.planctl` dirs via
-        // the change-gated {@link reconcilePlanctlDirs} primitive — never an
-        // unsubscribe+re-subscribe (the subscription stays alive; re-subscribing
-        // would open a no-watch gap). The warm in-memory change-gate
-        // (PlanScanner.lastEmitted) suppresses re-emits for unchanged files, so
-        // recovery is idempotent. The scan re-checks shuttingDown so a queued
-        // scan can't touch a closing DB.
-        //
-        // scoped to `.planctl` dirs (O(#projects)), NOT the full
-        // recursive walk over the whole `~/code` tree the boot scan does.
-        // The commit path (`planctl-commit-changed`) + the boot sweep
-        // continue to handle deletions, so an additive shallow rescan is
-        // sufficient for the live drop-recovery window and dramatically
-        // cheaper than re-walking the entire root.
-        const rescan = new RescanScheduler(() => {
-          if (shuttingDown) {
-            return;
-          }
-          // tag as "fswatcher-drop" so a snapshot recovered here
-          // (one the dropped FSEvents change would otherwise have lost) logs
-          // a "did real work" line.
-          // this is the FSEvents-drop backstop — fold the emitted-
-          // boolean into one `rescan-drop` missed-wake record. The shutdown
-          // guard above gates both the scan and the telemetry emit.
-          const rescued = reconcilePlanctlDirs(
-            [root],
-            scanner,
-            "fswatcher-drop",
-            nudgeFromPlanctlDir,
-          );
-          // this drop-rescan is scoped to ONE `root`, so attribute the
-          // reflog watch for that root specifically — `present`/`absent` only
-          // when the root is actually pending (otherwise no per-repo notion).
-          const reflogWatch = scanner.pendingRepos().has(root)
-            ? reflogSubs.has(root)
-              ? "present"
-              : "absent"
-            : undefined;
-          scanner.fireBackstop("rescan-drop", "fsevents", rescued, reflogWatch);
-        });
-        schedulers.push(rescan);
-        watcher
-          .subscribe(
-            root,
-            (err, events) => {
-              if (err) {
-                // Always leave a breadcrumb so a future @parcel/watcher wording
-                // change (the drop discriminator couples to its message text) is
-                // observable in the logs.
-                console.error(
-                  `[plan-worker] watcher error for ${root}: ${stringifyErr(err)}`,
-                );
-                // A recoverable FSEvents drop ("...must be re-scanned"): the lost
-                // change may never re-fire, so schedule a debounced re-scan. A
-                // non-drop err keeps today's swallow-and-log (additive only — no
-                // change to fatal/escalation behavior).
-                if (isDropError(err)) {
-                  rescan.schedule();
-                }
-                return;
-              }
-              // a confirmed FSEvents batch is THE fast path for plan
-              // files — stamp `last_fast_path_at` so a later heartbeat measures
-              // staleness against it (and a working watcher keeps the heartbeat
-              // a perpetual no-op rescue).
-              // label `fsevents` for per-wake-path attribution.
-              scanner.markFastPath("fsevents");
-              for (const ev of events) {
-                // The in-callback `.planctl/{epics,tasks}/*.json` filter (via
-                // classifyPlanPath, applied inside onChange) is what guarantees
-                // only real plan files reach the read path — the positive ignore
-                // globs are belt-and-suspenders perf, not the correctness gate.
-                // Route on path+existence, NOT event.type (planctl writes via
-                // atomic os.replace, so an update may surface as create/rename).
-                if (ev.type === "delete") {
-                  scanner.onDelete(ev.path);
-                  continue;
-                }
-                scanner.onChange(ev.path);
-              }
-            },
-            { ignore: IGNORE_GLOBS },
-          )
-          .then((sub) => {
-            if (shuttingDown) {
-              // Shutdown raced the subscribe resolution — release immediately.
-              void sub.unsubscribe();
-              noteBootScanDone();
-              return;
-            }
-            subscriptions.push(sub);
-            // Boot scan: pick up files that pre-existed this daemon's start
-            // (or were changed while keeperd was down) without waiting for a
-            // watcher event. The change-gate suppresses unchanged files.
-            scanRoot(root, scanner);
-            // This root's census is now recorded; advance the sweep barrier.
-            noteBootScanDone();
-          })
-          .catch((err) => {
-            // Per-root isolation: one root's subscribe failure must not kill the
-            // others. Log and continue (no process exit).
-            console.error(
-              `[plan-worker] failed to subscribe to ${root}: ${stringifyErr(err)}`,
-            );
-            // A failed subscribe scanned nothing, but still advances the barrier
-            // so a single bad root can't stall the sweep for the others.
-            noteBootScanDone();
-          });
+        const sub = await subscribeRoot(watcher, root);
+        if (sub !== null) {
+          // Boot scan: pick up files that pre-existed this daemon's start
+          // (or were changed while keeperd was down) without waiting for a
+          // watcher event. The change-gate suppresses unchanged files.
+          scanRoot(root, scanner);
+        }
+        // This root's census is now recorded (or its subscribe failed/raced
+        // shutdown — either way it must not stall the barrier); advance it.
+        noteBootScanDone();
       }
     })
     .catch((err) => {

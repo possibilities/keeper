@@ -264,12 +264,17 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   `roots`) are the scoped exception: those files are written by another process,
   so the same-process-write blind spot does not apply.
 - **No caught-up barrier** and no in-process self-heal — a crash exits non-zero
-  and the LaunchAgent restarts the single, well-tested recovery path. The one
-  scoped exception is a *recoverable* FSEvents dropped-events signal on the
-  external watchers (the producer workers' "...must be re-scanned" error): rather
-  than escalate, the affected worker schedules a debounced, single-flight re-scan
-  of its existing change-gated boot-scan path, recovering the missed change
-  without a restart and without re-subscribing. That is data recovery, not
+  and the LaunchAgent restarts the single, well-tested recovery path. Two scoped
+  exceptions handle a watcher that misbehaves without escalating. (1) A
+  *recoverable* FSEvents dropped-events signal on the external watchers (the
+  producer workers' "...must be re-scanned" error): the affected worker schedules
+  a debounced, single-flight re-scan of its existing change-gated boot-scan path,
+  recovering the missed change without re-subscribing — the live subscription
+  stays up. (2) A *silently-mute* subscription (one that stops delivering
+  entirely): the heartbeat backstop flags the affected root and the next
+  reconcile replaces ONLY that root's subscription — `await unsubscribe()` then a
+  fresh `subscribe()` with identical options, sequential and bounded, preserving
+  the change-gate so no phantom re-folds emit. Both are data recovery, not
   process self-heal — no worker is respawned; every other unrecoverable error
   still exits non-zero for the LaunchAgent to restart.
 
@@ -2011,12 +2016,19 @@ from-scratch re-fold reproduces them byte-identically. File deletions are filesy
 a tombstone, and a boot-reconciliation sweep retracts anything deleted while
 the daemon was down. It is
 the second instance of the same producer archetype as the transcript worker:
-read-only / write-free, feeding the log only via main. Both producers also
-self-recover from a *dropped-events* FSEvents overrun: on the recoverable
-"...must be re-scanned" watcher error they schedule a debounced, single-flight
-re-scan of their existing change-gated boot-scan path (per affected root for the
-plan worker), recovering the missed change in-process without a daemon restart
-and without re-subscribing.
+read-only / write-free, feeding the log only via main. Both producers self-
+recover from a *dropped-events* FSEvents overrun (the recoverable "...must be
+re-scanned" watcher error) without a daemon restart: they schedule a debounced,
+single-flight re-scan of their existing change-gated boot-scan path (per
+affected root for the plan worker), recovering the missed change in-process —
+the live subscription stays up, no re-subscribe. The plan worker also self-
+recovers from a *silently-mute* subscription (one that stops delivering
+entirely): the heartbeat backstop flags exactly the affected root(s) and the
+next reconcile replaces ONLY that root's subscription — `await unsubscribe()`
+then a fresh `subscribe()` with identical options, sequential and bounded per
+cycle, keyed per root so a healthy root is never re-armed. The replace touches
+only the watcher stream; the PlanScanner change-gate survives, so no phantom
+re-folds emit.
 
 A **fifth** Worker thread is the usage producer: it watches the agentuse
 daemon's flat leaf state directory (`~/.local/state/agentuse/`, one

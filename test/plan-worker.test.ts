@@ -35,10 +35,12 @@ import type {
 import { buildMissedWakeRecord } from "../src/backstop-telemetry";
 import { openDb } from "../src/db";
 import {
+  attributePlanctlDirToRoot,
   buildEpicMessage,
   buildTaskMessage,
   classifyPlanPath,
   coerceRuntimeStatus,
+  decidePlanResubscribe,
   desiredReflogRepos,
   discoverPlanctlDirs,
   discoverPlanctlRepos,
@@ -48,6 +50,7 @@ import {
   isPathInHead,
   isPathInHeadBatch,
   isWithinRoots,
+  MAX_SUBSCRIBES_PER_CYCLE,
   makeSingleFlight,
   PLAN_DB_POLL_MS,
   type PlanMessage,
@@ -1433,6 +1436,146 @@ test("reflogWatchDiff: a removed .planctl repo lands in toDrop (drops its watch)
   const { toAdd, toDrop } = reflogWatchDiff(desired, live);
   expect([...toAdd]).toEqual([]);
   expect([...toDrop]).toEqual(["/r/removed"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-788 mute-watcher re-arm — the PURE decision helpers + the per-root
+// attribution out-param. The heartbeat flags exactly the rescued configured
+// root(s); the drain tears down + re-subscribes each sequentially with the
+// identical options, bounded by MAX_SUBSCRIBES_PER_CYCLE. These tests cover the
+// decision surface only — no live-watcher tests (the sequential teardown / flap
+// guard / generation guard are exercised by the slow-tier worker integration).
+// ---------------------------------------------------------------------------
+
+test("decidePlanResubscribe: an empty flag set yields no tear-downs", () => {
+  expect(
+    decidePlanResubscribe(new Set<string>(), MAX_SUBSCRIBES_PER_CYCLE),
+  ).toEqual([]);
+});
+
+test("decidePlanResubscribe: returns the flagged roots in insertion order (deterministic drain)", () => {
+  const flagged = new Set(["/code", "/work", "/other"]);
+  // Under the cap → every flagged root drains this cycle, in insertion order.
+  expect(decidePlanResubscribe(flagged, MAX_SUBSCRIBES_PER_CYCLE)).toEqual([
+    "/code",
+    "/work",
+    "/other",
+  ]);
+  // READ-only: the flag set is not mutated by the decision (the caller owns the
+  // one-shot clear as it drains).
+  expect([...flagged]).toEqual(["/code", "/work", "/other"]);
+});
+
+test("decidePlanResubscribe: caps at MAX per cycle; the overflow stays flagged for the next drain", () => {
+  // Flag one more than the cap — only the first `cap` drain this cycle.
+  const flagged = new Set(
+    Array.from({ length: MAX_SUBSCRIBES_PER_CYCLE + 3 }, (_, i) => `/r/${i}`),
+  );
+  const toRearm = decidePlanResubscribe(flagged, MAX_SUBSCRIBES_PER_CYCLE);
+  expect(toRearm.length).toBe(MAX_SUBSCRIBES_PER_CYCLE);
+  expect(toRearm[0]).toBe("/r/0");
+  expect(toRearm[MAX_SUBSCRIBES_PER_CYCLE - 1]).toBe(
+    `/r/${MAX_SUBSCRIBES_PER_CYCLE - 1}`,
+  );
+  // The overflow (`/r/16`, `/r/17`, `/r/18`) is NOT in this drain — it stays in
+  // the flag set for the next cycle (the caller deletes only what it drains).
+  expect(toRearm).not.toContain(`/r/${MAX_SUBSCRIBES_PER_CYCLE}`);
+});
+
+test("decidePlanResubscribe: a zero/negative cap drains nothing (defensive clamp)", () => {
+  const flagged = new Set(["/r/a", "/r/b"]);
+  expect(decidePlanResubscribe(flagged, 0)).toEqual([]);
+  expect(decidePlanResubscribe(flagged, -5)).toEqual([]);
+});
+
+test("attributePlanctlDirToRoot: a discovered .planctl dir maps back to its configured root", () => {
+  // The heartbeat scan surfaces <root>/<project>/.planctl; the re-arm operates
+  // on the broad CONFIGURED root (the subscription key), so the dir must
+  // attribute back to it.
+  expect(
+    attributePlanctlDirToRoot("/code/keeper/.planctl", ["/code", "/work"]),
+  ).toBe("/code");
+  expect(
+    attributePlanctlDirToRoot("/work/proj/.planctl", ["/code", "/work"]),
+  ).toBe("/work");
+});
+
+test("attributePlanctlDirToRoot: the LONGEST matching configured root wins (nested root over its ancestor)", () => {
+  // A configured nested root (`/code/keeper`) and a broad ancestor (`/code`)
+  // both contain the dir — the subscription that actually covers it is the
+  // nested one, so attribute to the longest prefix.
+  expect(
+    attributePlanctlDirToRoot("/code/keeper/sub/.planctl", [
+      "/code",
+      "/code/keeper",
+    ]),
+  ).toBe("/code/keeper");
+});
+
+test("attributePlanctlDirToRoot: a dir under no configured root attributes to null (no mis-attribution)", () => {
+  expect(
+    attributePlanctlDirToRoot("/elsewhere/proj/.planctl", ["/code", "/work"]),
+  ).toBeNull();
+  // A root that is a substring-but-not-path-prefix must NOT match (`/cod` is not
+  // a path ancestor of `/code/...`).
+  expect(attributePlanctlDirToRoot("/code/x/.planctl", ["/cod"])).toBeNull();
+});
+
+test("reconcilePlanctlDirs(emittedRoots): only the configured root whose scan emitted is reported; a quiescent root is not", () => {
+  // Two configured roots; only rootA has a fresh scaffold to emit. The
+  // attribution out-param must carry rootA ONLY — a healthy (quiescent) root is
+  // never flagged for a re-arm.
+  const rootA = mkdtempSync(join(tmpdir(), "keeper-plan-attrA-"));
+  const rootB = mkdtempSync(join(tmpdir(), "keeper-plan-attrB-"));
+  try {
+    mkdirSync(join(rootA, "p", ".planctl", "epics"), { recursive: true });
+    // rootB holds a `.planctl` tree too, but it is EMPTY (nothing to emit).
+    mkdirSync(join(rootB, "q", ".planctl", "epics"), { recursive: true });
+    writeFileSync(
+      join(rootA, "p", ".planctl", "epics", "fn-1-a.json"),
+      JSON.stringify({ id: "fn-1-a", title: "A", status: "open" }),
+    );
+
+    const emitted: PlanMessage[] = [];
+    const scanner = new PlanScanner(
+      (m) => emitted.push(m),
+      () => {},
+    );
+
+    const emittedRoots = new Set<string>();
+    const rescued = reconcilePlanctlDirs(
+      [rootA, rootB],
+      scanner,
+      "heartbeat",
+      undefined,
+      emittedRoots,
+    );
+    // Aggregate boolean unchanged (rootA emitted) — byte-compatible for the
+    // backstop record.
+    expect(rescued).toBe(true);
+    // Attribution: rootA implicated (its scan emitted), rootB NOT (quiescent).
+    expect([...emittedRoots]).toEqual([rootA]);
+
+    // No-phantom-re-fold: a SECOND reconcile over the unchanged tree (the
+    // post-re-arm full rescan) emits nothing — the PlanScanner change-gate is
+    // preserved across a (simulated) re-arm, so no plan re-emits.
+    const emitted2: PlanMessage[] = [];
+    const scanner2Roots = new Set<string>();
+    const before = emitted.length;
+    reconcilePlanctlDirs(
+      [rootA, rootB],
+      scanner,
+      "heartbeat",
+      undefined,
+      scanner2Roots,
+    );
+    expect(emitted.length).toBe(before); // change-gate suppressed the re-emit
+    expect([...scanner2Roots]).toEqual([]); // nothing emitted → nothing flagged
+    expect(emitted2).toEqual([]);
+  } finally {
+    rmSync(rootA, { recursive: true, force: true });
+    rmSync(rootB, { recursive: true, force: true });
+  }
 });
 
 test("reconcilePlanctlDirs: a new-repo first scaffold converges on one call (no FSEvents, no DB row)", () => {
