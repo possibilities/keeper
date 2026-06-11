@@ -2390,8 +2390,7 @@ test("autopilot worker spawns with paused=true workerData and shuts down cleanly
       workerData: {
         dbPath,
         paused: true,
-        autocloseWindows: false,
-        zellijSession: "autopilot-test",
+        execBackend: "zellij",
         pollMs: 25,
       },
     } as WorkerOptions & { workerData: unknown },
@@ -2425,8 +2424,7 @@ test("autopilot worker accepts {type:'set-paused', paused} commands without cras
       workerData: {
         dbPath,
         paused: true,
-        autocloseWindows: false,
-        zellijSession: "autopilot-test",
+        execBackend: "zellij",
         pollMs: 25,
       },
     } as WorkerOptions & { workerData: unknown },

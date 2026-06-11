@@ -80,8 +80,12 @@ const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 
 const DEFAULT_AGENTUSE_ROOT = "~/.local/state/agentuse";
 
-/** Mirrors `DEFAULT_ZELLIJ_SESSION` in `src/exec-backend.ts`. */
-const DEFAULT_ZELLIJ_SESSION = "autopilot";
+/** Mirrors `DEFAULT_EXEC_BACKEND` in `src/exec-backend.ts`. */
+const DEFAULT_EXEC_BACKEND = "zellij";
+
+/** Recognized `exec_backend` values; an unknown value warns and falls back to
+ *  `DEFAULT_EXEC_BACKEND`. */
+const VALID_EXEC_BACKENDS = new Set(["zellij", "tmux"]);
 
 /**
  * Parsed keeper daemon config. Keys are INDEPENDENT — a malformed/missing one
@@ -95,8 +99,9 @@ export interface KeeperConfig {
   // builds` dashboard's poller. Independent best-effort key with NO default:
   // absent/empty/garbage → undefined → the builds worker is not spawned.
   buildbotUrl?: string;
-  zellijSession?: string;
-  autocloseWindows?: boolean;
+  // Autopilot exec backend — `zellij` (default) or `tmux`. The managed-session
+  // name is hardcoded (`MANAGED_EXEC_SESSION`), not configurable.
+  execBackend?: string;
   // `null` (default) is unlimited; only a POSITIVE INTEGER overrides.
   // Enforced as a reconcile-level budget, not a readiness verdict.
   maxConcurrentJobs?: number | null;
@@ -104,8 +109,6 @@ export interface KeeperConfig {
   // never folded, never changes a row's identity.
   accountAliases: Record<string, string>;
 }
-
-export const DEFAULT_AUTOCLOSE_WINDOWS = true;
 
 /**
  * `null` = unlimited. `null` (not `Infinity`) at rest — `Infinity` serializes to
@@ -135,8 +138,7 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `buildbotUrl` undefined so the builds worker
   // never spawns.
   let buildbotUrl: string | undefined;
-  let zellijSession: string = DEFAULT_ZELLIJ_SESSION;
-  let autocloseWindows: boolean = DEFAULT_AUTOCLOSE_WINDOWS;
+  let execBackend: string = DEFAULT_EXEC_BACKEND;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   let accountAliases: Record<string, string> = {};
   try {
@@ -145,8 +147,7 @@ export function resolveConfig(): KeeperConfig {
         roots,
         claudeProjectsRoot,
         agentuseRoot,
-        zellijSession,
-        autocloseWindows,
+        execBackend,
         maxConcurrentJobs,
         accountAliases,
       };
@@ -176,13 +177,18 @@ export function resolveConfig(): KeeperConfig {
       if (typeof bbu === "string" && bbu.length > 0) {
         buildbotUrl = bbu;
       }
-      const zs = (raw as { zellij_session?: unknown }).zellij_session;
-      if (typeof zs === "string" && zs.length > 0) {
-        zellijSession = zs;
-      }
-      const acw = (raw as { autoclose_windows?: unknown }).autoclose_windows;
-      if (typeof acw === "boolean") {
-        autocloseWindows = acw;
+      // Independent best-effort key: a recognized value wins; an unknown
+      // non-empty value warns and falls back to the default (every key
+      // resolves independently). Absent / non-string → default silently.
+      const eb = (raw as { exec_backend?: unknown }).exec_backend;
+      if (typeof eb === "string" && eb.length > 0) {
+        if (VALID_EXEC_BACKENDS.has(eb)) {
+          execBackend = eb;
+        } else {
+          console.error(
+            `[keeper] config: unknown exec_backend "${eb}"; falling back to "${DEFAULT_EXEC_BACKEND}"`,
+          );
+        }
       }
       // Only a POSITIVE INTEGER overrides the unlimited (`null`) default.
       const mcj = (raw as { max_concurrent_jobs?: unknown })
@@ -211,8 +217,7 @@ export function resolveConfig(): KeeperConfig {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentuseRoot: DEFAULT_AGENTUSE_ROOT,
-      zellijSession: DEFAULT_ZELLIJ_SESSION,
-      autocloseWindows: DEFAULT_AUTOCLOSE_WINDOWS,
+      execBackend: DEFAULT_EXEC_BACKEND,
       maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
       accountAliases: {},
     };
@@ -222,8 +227,7 @@ export function resolveConfig(): KeeperConfig {
     claudeProjectsRoot,
     agentuseRoot,
     buildbotUrl,
-    zellijSession,
-    autocloseWindows,
+    execBackend,
     maxConcurrentJobs,
     accountAliases,
   };

@@ -2761,11 +2761,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: {
           dbPath,
           paused: autopilotPaused,
-          zellijSession: apConfig.zellijSession,
+          // Selected backend (zellij default; tmux opt-in), read on main and
+          // frozen into workerData. Restart-to-apply: a config flip lags until
+          // the next restart.
+          execBackend: apConfig.execBackend,
           maxConcurrentJobs: apConfig.maxConcurrentJobs,
-          // Completion-reap toggle, read on main and frozen into workerData.
-          // Restart-to-apply: a config flip lags until the next restart.
-          autocloseWindows: apConfig.autocloseWindows,
         } satisfies AutopilotWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;

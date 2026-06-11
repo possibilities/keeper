@@ -1,7 +1,7 @@
 /**
- * Tests for `resolveConfig` in `src/db.ts` — focused on the
- * `autoclose_windows` key (the autopilot window-reap kill switch) and its
- * independence from the sibling keys.
+ * Tests for `resolveConfig` in `src/db.ts` — focused on the `exec_backend`
+ * key (autopilot backend selector) and its independence from the sibling
+ * keys.
  *
  * Each test points `KEEPER_CONFIG` at a temp YAML file (the resolver's
  * documented test seam) and restores the prior env in afterEach. No
@@ -12,11 +12,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  DEFAULT_AUTOCLOSE_WINDOWS,
-  DEFAULT_MAX_CONCURRENT_JOBS,
-  resolveConfig,
-} from "../src/db";
+import { DEFAULT_MAX_CONCURRENT_JOBS, resolveConfig } from "../src/db";
 
 let dir: string;
 let prevEnv: string | undefined;
@@ -41,38 +37,43 @@ function writeConfig(yaml: string): void {
   process.env.KEEPER_CONFIG = path;
 }
 
-test("autocloseWindows defaults to true when the config file is absent", () => {
+test("execBackend defaults to zellij when the config file is absent", () => {
   process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().autocloseWindows).toBe(true);
-  expect(DEFAULT_AUTOCLOSE_WINDOWS).toBe(true);
+  expect(resolveConfig().execBackend).toBe("zellij");
 });
 
-test("autocloseWindows defaults to true when the key is absent", () => {
+test("execBackend defaults to zellij when the key is absent", () => {
   writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().autocloseWindows).toBe(true);
+  expect(resolveConfig().execBackend).toBe("zellij");
 });
 
-test("autoclose_windows: false disables the reap", () => {
-  writeConfig("autoclose_windows: false\n");
-  expect(resolveConfig().autocloseWindows).toBe(false);
+test("exec_backend: tmux selects the tmux backend", () => {
+  writeConfig("exec_backend: tmux\n");
+  expect(resolveConfig().execBackend).toBe("tmux");
 });
 
-test("autoclose_windows: true keeps the reap on", () => {
-  writeConfig("autoclose_windows: true\n");
-  expect(resolveConfig().autocloseWindows).toBe(true);
+test("exec_backend: zellij is accepted verbatim", () => {
+  writeConfig("exec_backend: zellij\n");
+  expect(resolveConfig().execBackend).toBe("zellij");
 });
 
-test("a non-boolean autoclose_windows falls back to the true default", () => {
-  // String "false" is NOT a boolean — must not disable the reap.
-  writeConfig('autoclose_windows: "false"\n');
-  expect(resolveConfig().autocloseWindows).toBe(true);
+test("an unknown exec_backend value warns and falls back to zellij", () => {
+  // `ghostty` is not a recognized backend — fall back to the default
+  // rather than threading an unhandled value into the worker.
+  writeConfig("exec_backend: ghostty\n");
+  expect(resolveConfig().execBackend).toBe("zellij");
 });
 
-test("autoclose_windows resolves independently of a malformed sibling key", () => {
-  // A junk `roots` (non-array) must not disturb the autoclose resolution.
-  writeConfig("roots: not-a-list\nautoclose_windows: false\n");
+test("a non-string exec_backend falls back to the zellij default", () => {
+  writeConfig("exec_backend: 42\n");
+  expect(resolveConfig().execBackend).toBe("zellij");
+});
+
+test("exec_backend resolves independently of a malformed sibling key", () => {
+  // A junk `roots` (non-array) must not disturb the exec_backend resolution.
+  writeConfig("roots: not-a-list\nexec_backend: tmux\n");
   const cfg = resolveConfig();
-  expect(cfg.autocloseWindows).toBe(false);
+  expect(cfg.execBackend).toBe("tmux");
   // roots fell back to its default (non-empty) — independence holds.
   expect(cfg.roots.length).toBeGreaterThan(0);
 });
@@ -123,12 +124,12 @@ test("max_concurrent_jobs: null → null (explicit null stays unlimited)", () =>
 });
 
 test("a malformed max_concurrent_jobs leaves a sibling key intact (independence)", () => {
-  // A junk cap value must not strand `zellij_session` at its default —
+  // A junk cap value must not strand `exec_backend` at its default —
   // the keys resolve independently from the same parsed document.
-  writeConfig('max_concurrent_jobs: "nope"\nzellij_session: my-session\n');
+  writeConfig('max_concurrent_jobs: "nope"\nexec_backend: tmux\n');
   const cfg = resolveConfig();
   expect(cfg.maxConcurrentJobs).toBe(null);
-  expect(cfg.zellijSession).toBe("my-session");
+  expect(cfg.execBackend).toBe("tmux");
 });
 
 // ---------------------------------------------------------------------------

@@ -45,11 +45,7 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { openDb } from "./db";
-import {
-  dispatchKeyForPane,
-  resolveExecBackend,
-  type ZellijPane,
-} from "./exec-backend";
+import { resolveExecBackend } from "./exec-backend";
 import {
   computeReadiness,
   isRootOccupant,
@@ -98,16 +94,6 @@ export type DispatchKey = string;
  * `*_TTL_MS` constants directly.
  */
 export const REDISPATCH_COOLDOWN_S = 200;
-
-/**
- * Floor between completion-reap `list-panes` probes. `completedRowIds` is
- * non-empty on nearly every pulse (the done-epics merge keeps freshly-done rows
- * visible), so an unfloored reap spawns `zellij list-panes` every cycle; a
- * single-timestamp floor collapses a burst into one probe per window. The reap
- * is idempotent and the done-window outlasts this floor, so nothing is missed.
- * UNIT: SECONDS.
- */
-export const MIN_REAP_INTERVAL_S = 15;
 
 /**
  * The in-process per-epic FINALIZER guard window, in SECONDS — keyed by EPIC ID,
@@ -295,15 +281,6 @@ export function isInCooldown(
 }
 
 /**
- * Has the completion-reap floor elapsed? True when `now` is at least
- * `MIN_REAP_INTERVAL_S` past `lastReapAt`. Boots eligible (callers seed
- * `-Infinity`). The single-timestamp variant of `isInCooldown`.
- */
-export function reapFloorElapsed(lastReapAt: number, now: number): boolean {
-  return now - lastReapAt >= MIN_REAP_INTERVAL_S;
-}
-
-/**
  * Prune cooldown entries older than the cooldown window. Run once per cycle so
  * the Map stays bounded. Mutates in place — called ONLY from `driveCycle`, never
  * inside the pure `reconcile`; the caller wraps it in try/catch (no self-heal).
@@ -317,76 +294,6 @@ export function sweepRedispatchCooldown(
       cooldown.delete(key);
     }
   }
-}
-
-/**
- * Pure reap-candidate predicate for the pause-window ghost. Exported so the
- * worker's pause handler and tests share the EXACT safety gate (the
- * highest-blast-radius decision here). A pane is a candidate IFF it carries a
- * `(work|close)::<id>` dispatch key AND that key is in `openPendingKeys` (the
- * open `pending_dispatches` set).
- *
- * SAFETY: a `pending_dispatches` row discharges on `SessionStart`, so a key
- * MISSING from `openPendingKeys` means a LIVE worker — never reaped. The name
- * match alone never authorizes a close (`list-panes` lags zellij reality).
- *
- * LIVE-VETO: a pane with `exited === false` is demonstrably live and is NEVER a
- * candidate, regardless of membership — this removes the fold-latency dependency
- * from the close decision (a hook freeze that stalls `SessionStart` would
- * otherwise leave keys undischarged and reap live workers). Treat ONLY explicit
- * `false` as live; `undefined` (zellij omits the field) MUST fall through so true
- * ghosts still reap.
- */
-export function isReapCandidate(
-  openPendingKeys: Set<DispatchKey>,
-  pane: ZellijPane,
-): boolean {
-  if (pane.exited === false) {
-    return false;
-  }
-  const key = dispatchKeyForPane(pane);
-  return key != null && openPendingKeys.has(key);
-}
-
-/**
- * Pure completion-reap predicate — a SIBLING of `isReapCandidate` gating on the
- * OPPOSITE set: it reaps the COMPLETED row's surface. A pane is a candidate IFF
- * its `(work|close)::<id>` dispatch key has its `<id>` in `completedRowIds` (the
- * task/epic ids whose verdict is `{tag:"completed"}` this cycle).
- *
- * SAFETY — DELIBERATE DIVERGENCE from the universal "match name AND
- * is_exited==true" rule: `exited` is INTENTIONALLY NOT gated as a precondition.
- * The reap fires the instant the worker exits, and its pane may still be live on
- * the cycle the verdict flips, so an `is_exited` gate could miss it. The durable
- * `{tag:"completed"}` verdict is the SOLE authorization; the name match only
- * LOCATES the pane (a completed row can't have a concurrent live worker for the
- * same id — a re-dispatch flips the row OFF `completed`). Do NOT "fix" this back.
- *
- * LIVE-VETO: still, an explicit `exited === false` blocks the reap (the inverse
- * polarity — `true` and `undefined` fall through to the `{tag:"completed"}`
- * authorization), defense-in-depth against a fold-latency edge where a live
- * worker's id transiently appears in `completedRowIds`. The reap is idempotent:
- * `reapSurfaces` treats an already-gone pane as a best-effort no-op, never a
- * throw, so a `data_version` double-fire can't crash the worker.
- */
-export function isCompletionReapCandidate(
-  completedRowIds: Set<string>,
-  pane: ZellijPane,
-): boolean {
-  if (pane.exited === false) {
-    return false;
-  }
-  const key = dispatchKeyForPane(pane);
-  if (key == null) {
-    return false;
-  }
-  // `<id>` is everything after the first `::` (ids never contain `::`).
-  const sep = key.indexOf("::");
-  if (sep < 0) {
-    return false;
-  }
-  const id = key.slice(sep + 2);
-  return completedRowIds.has(id);
 }
 
 /**
@@ -1300,22 +1207,17 @@ export interface AutopilotWorkerData {
   /** Poll cadence for the data_version wake loop (ms). */
   pollMs?: number;
   /**
-   * Zellij session name the in-worker `ExecBackend` ensures before its first
-   * `new-tab`. Threaded in from `resolveConfig()` so config I/O happens once on
-   * main and every worker receives the resolved value.
+   * Exec backend the in-worker reconciler dispatches into — `zellij` (default)
+   * or `tmux`. Threaded in from `resolveConfig()` so config I/O happens once on
+   * main and every worker receives the resolved value. The managed session name
+   * is the hardcoded `MANAGED_EXEC_SESSION`, not configurable.
    */
-  zellijSession?: string;
+  execBackend?: string;
   /**
    * Global root-occupant cap across ALL epics/roots. `null`/absent = unlimited.
    * Threaded in from `resolveConfig()`.
    */
   maxConcurrentJobs?: number | null;
-  /**
-   * Completion-reap toggle (default `true`): when on, the cycle reaps a completed
-   * row's zellij surface; `false` makes the reap a no-op AND skips the
-   * `list-panes` spawn. Restart-to-apply. Exposed so hermetic tests can override.
-   */
-  autocloseWindows?: boolean;
 }
 
 /** Main → worker: paused-flag flip. */
@@ -1562,14 +1464,6 @@ function main(): void {
     finalizerGuard: new Map(),
     maxConcurrentJobs: data.maxConcurrentJobs ?? null,
   };
-  // Completion-reap toggle (default `true`). Worker-scoped, NOT `ReconcileState`
-  // (that struct is the pure-`reconcile` input; the reap is a side-effect). The
-  // reap pass early-returns when false (no `list-panes` spawn).
-  const autocloseWindows = data.autocloseWindows ?? true;
-  // Completion-reap probe floor: `reapCompletionSurfaces` skips its `list-panes`
-  // spawn until `MIN_REAP_INTERVAL_S` past the last probe. Boots at `-Infinity`
-  // so the first eligible cycle always probes.
-  let lastReapAt = Number.NEGATIVE_INFINITY;
   // In-flight surfaces this reconciler owns confirm/reap work for. Boots EMPTY:
   // a cold restart re-derives "already running" from the durable `jobs`
   // projection (the occupying-job gate suppresses re-dispatch of survivors), so
@@ -1601,10 +1495,6 @@ function main(): void {
   // state. Without an explicit kick, a quiescent DB leaves ready work
   // undispatched. Assigned once `driveCycle` exists; a no-op until then.
   let requestCycle: () => void = () => {};
-  // Late-bound pause reap. Assigned once `backend` exists. On a `set-paused
-  // {paused:true}` the handler aborts in-flight confirms then fires this to
-  // close any launch-window ghost surface still parked in the session.
-  let reapLaunchWindowSurfaces: () => void = () => {};
 
   parentPort.on("message", (msg: IncomingMessage | undefined) => {
     if (!msg) return;
@@ -1642,13 +1532,12 @@ function main(): void {
         requestCycle();
       }
       // Pause edge (covers boot-pause too — the boot-append re-arm relays
-      // `set-paused {paused:true}` here). Abort every in-flight confirm, swap in
-      // a fresh pause-scoped controller for the next play cycle, then reap any
-      // launch-window ghost surface. Idempotent on a redundant pause re-issue.
+      // `set-paused {paused:true}` here). Abort every in-flight confirm and swap
+      // in a fresh pause-scoped controller for the next play cycle. Idempotent
+      // on a redundant pause re-issue.
       if (msg.paused) {
         cycleController.abort();
         cycleController = new AbortController();
-        reapLaunchWindowSurfaces();
       }
       return;
     }
@@ -1662,13 +1551,15 @@ function main(): void {
     }
   };
 
-  // The terminal-surface backend (zellij). `noteLine` funnels its warnings to
-  // stderr — the worker has no lifecycle sidecar.
+  // The terminal-surface backend (zellij today; `data.execBackend` selects the
+  // impl once task 2's switch lands). Dispatches into the hardcoded
+  // `MANAGED_EXEC_SESSION` — `resolveExecBackend` fills that default, so no
+  // session is threaded here. `noteLine` funnels its warnings to stderr — the
+  // worker has no lifecycle sidecar.
   const backend = resolveExecBackend({
     noteLine: (line: string) => {
       console.error(line);
     },
-    session: data.zellijSession,
   });
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
@@ -1781,87 +1672,6 @@ function main(): void {
     recordTimeoutBackstop,
   };
 
-  // Pause/boot-pause launch-window reap. Close zellij surfaces for a pre-pause
-  // dispatch intent (zellij execs the queued `new-tab` late) so it can't escape
-  // the pause as a ghost worker. SAFETY (highest blast radius): the predicate
-  // intersects the verb-prefixed pane name with the OPEN `pending_dispatches`
-  // set — a discharged row = a LIVE worker = NEVER reaped. The whole body is
-  // try/caught (a reap throw must NOT propagate; `reapSurfaces` is itself
-  // never-throw, this is the backstop for the query / predicate).
-  reapLaunchWindowSurfaces = (): void => {
-    void (async (): Promise<void> => {
-      try {
-        // Open-pending set: every present `pending_dispatches` row (SessionStart
-        // DELETEs on bind, so a present row is an OPEN, not-yet-bound dispatch).
-        const openKeys = new Set<DispatchKey>();
-        for (const row of db
-          .query("SELECT verb, id FROM pending_dispatches")
-          .all() as Array<{ verb: unknown; id: unknown }>) {
-          if (typeof row.verb === "string" && typeof row.id === "string") {
-            openKeys.add(dispatchKey(row.verb as Verb, row.id));
-          }
-        }
-        // Nothing pending → no ghost to reap; skip the list-panes spawn.
-        if (openKeys.size === 0) {
-          return;
-        }
-        // CANDIDATE = verb-prefixed name AND an OPEN pending row, via the shared
-        // pure `isReapCandidate` so the worker + tests pin the same gate.
-        const result = await backend.reapSurfaces((pane) =>
-          isReapCandidate(openKeys, pane),
-        );
-        if (result.reaped > 0 || result.failed > 0) {
-          console.error(
-            `[autopilot-worker] pause reap: examined=${result.examined} reaped=${result.reaped} failed=${result.failed}`,
-          );
-        }
-      } catch (err) {
-        console.error("[autopilot-worker] pause reap threw (non-fatal):", err);
-      }
-    })();
-  };
-
-  // Completion reap. Distinct from the pause/boot reap above: that one gates on
-  // the OPEN `pending_dispatches` intersect; THIS one gates on the durable
-  // completion verdict `reconcile` surfaced this cycle (`{tag:"completed"}`).
-  // Every live surface sharing the completed id is reaped. Built on the
-  // live-probe path (`reapSurfaces`), re-probing `list-panes` each cycle — it
-  // persists no pane ids and survives a restart (the verdict, not a cold-boot
-  // `liveDispatches`, drives it). SAFETY divergence (no `is_exited` gate)
-  // documented on `isCompletionReapCandidate`. Body try/caught (never-throw).
-  const reapCompletionSurfaces = (completedRowIds: Set<string>): void => {
-    // Flag off → no-op AND no spawn (restart-to-apply). Empty set → nothing.
-    if (!autocloseWindows || completedRowIds.size === 0) {
-      return;
-    }
-    // Floor the probe: skip the spawn until the min interval has elapsed. Stamp
-    // BEFORE the async spawn so a burst of pulses collapses to one probe. The
-    // reap is idempotent and the done-window outlasts this floor, so nothing is
-    // missed.
-    const nowS = deps.now();
-    if (!reapFloorElapsed(lastReapAt, nowS)) {
-      return;
-    }
-    lastReapAt = nowS;
-    void (async (): Promise<void> => {
-      try {
-        const result = await backend.reapSurfaces((pane) =>
-          isCompletionReapCandidate(completedRowIds, pane),
-        );
-        if (result.reaped > 0 || result.failed > 0) {
-          console.error(
-            `[autopilot-worker] completion reap: examined=${result.examined} reaped=${result.reaped} failed=${result.failed}`,
-          );
-        }
-      } catch (err) {
-        console.error(
-          "[autopilot-worker] completion reap threw (non-fatal):",
-          err,
-        );
-      }
-    })();
-  };
-
   // Single-flight reconcile drive. `watchLoop` fires this on every
   // `data_version` pulse; a wake while a cycle runs sets `wakePending` and the
   // running cycle loops once more after it finishes — coalescing a burst into one
@@ -1923,9 +1733,6 @@ function main(): void {
           );
         }
         const decision = reconcile(snapshot, state, deps.now());
-        // Fire the completion reap with THIS cycle's completion set.
-        // Fire-and-forget: it owns its try/catch and never throws past itself.
-        reapCompletionSurfaces(decision.completedRowIds);
         await runReconcileCycle(
           decision,
           state,

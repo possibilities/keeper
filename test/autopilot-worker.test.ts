@@ -46,21 +46,17 @@ import {
   DONE_EPICS_REAP_LIMIT,
   FINALIZER_GUARD_S,
   type FoundJob,
-  isCompletionReapCandidate,
   isEpicInFlight,
   isFinalizerGuarded,
   isFinalizerVerb,
   isInCooldown,
   isOccupyingJob,
-  isReapCandidate,
   type LaunchResult,
   type LiveDispatch,
   loadReconcileSnapshot,
-  MIN_REAP_INTERVAL_S,
   REDISPATCH_COOLDOWN_S,
   type ReconcileSnapshot,
   type ReconcileState,
-  reapFloorElapsed,
   reconcile,
   refreshSuppressionForOpenPending,
   runReconcileCycle,
@@ -73,7 +69,6 @@ import {
   PENDING_DISPATCH_TTL_MS,
 } from "../src/daemon";
 import { openDb } from "../src/db";
-import type { ZellijPane } from "../src/exec-backend";
 import {
   computeReadiness,
   type PendingDispatch,
@@ -782,22 +777,6 @@ test("fn-735 isInCooldown: unit-seconds predicate edge cases", () => {
   expect(isInCooldown(cooldown, "work::x", 1000 + REDISPATCH_COOLDOWN_S)).toBe(
     false,
   );
-});
-
-test("fn-765 reapFloorElapsed: unit-seconds floor; first probe always eligible, back-to-back cycles collapse to one", () => {
-  // Boots eligible: the closure seeds lastReapAt at -Infinity so the first
-  // cycle always probes.
-  expect(reapFloorElapsed(Number.NEGATIVE_INFINITY, 1000)).toBe(true);
-  // Simulate the closure: stamp at the fired probe, then a back-to-back
-  // cycle (same second) is floored OUT — one list-panes for the burst.
-  const firedAt = 1000;
-  expect(reapFloorElapsed(firedAt, firedAt)).toBe(false);
-  // One second before the floor elapses → still floored.
-  expect(reapFloorElapsed(firedAt, firedAt + MIN_REAP_INTERVAL_S - 1)).toBe(
-    false,
-  );
-  // Exactly at the floor → eligible again (the next cycle probes).
-  expect(reapFloorElapsed(firedAt, firedAt + MIN_REAP_INTERVAL_S)).toBe(true);
 });
 
 test("fn-762 cooldown is STRICTLY GREATER than TTL + sweep (unit-seconds; the headroom rationale)", () => {
@@ -2265,261 +2244,6 @@ test("buildLaunchArgv wraps the worker command in [shell, -l, -i, -c, body]", ()
 });
 
 // ---------------------------------------------------------------------------
-// fn-724 — isReapCandidate (pause/boot-pause launch-window reap safety gate)
-// ---------------------------------------------------------------------------
-
-function pane(overrides: Partial<ZellijPane> & { id: string }): ZellijPane {
-  return { tab_name: "Tab #1", ...overrides };
-}
-
-test("isReapCandidate: verb-prefixed name AND an OPEN pending row → reap", () => {
-  // work::A still has an open pending_dispatches row (launch-window ghost
-  // the autopilot intended pre-pause); its surface IS a reap candidate.
-  const open = new Set(["work::fn-724-x.2"]);
-  expect(
-    isReapCandidate(
-      open,
-      pane({
-        id: "3",
-        tab_name: "Tab #4",
-        terminal_command: "claude --name work::fn-724-x.2 '/plan:work ...'",
-      }),
-    ),
-  ).toBe(true);
-});
-
-test("isReapCandidate: LIVE worker (discharged row) is NEVER a candidate — safety pin", () => {
-  // SessionStart already discharged work::B's pending row (it bound a live
-  // worker), so work::B is NOT in the open set. Even though its pane is
-  // live in list-panes and carries a verb-prefixed name, it must NEVER be
-  // reaped. This is the highest-blast-radius guard in the epic.
-  const open = new Set(["work::A"]); // work::B discharged → live
-  const liveWorkerPane = pane({
-    id: "5",
-    tab_name: "Tab #5",
-    exited: false,
-    terminal_command: "claude --name work::B '/plan:work B'",
-  });
-  expect(isReapCandidate(open, liveWorkerPane)).toBe(false);
-  // The still-open sibling IS a candidate, proving the set membership —
-  // not pane state — is what gates the close.
-  expect(
-    isReapCandidate(
-      open,
-      pane({ id: "3", terminal_command: "claude --name work::A" }),
-    ),
-  ).toBe(true);
-});
-
-test("isReapCandidate: empty open set never reaps (nothing pending → no ghost)", () => {
-  const open = new Set<string>();
-  expect(
-    isReapCandidate(
-      open,
-      pane({ id: "3", terminal_command: "claude --name work::A" }),
-    ),
-  ).toBe(false);
-});
-
-test("isReapCandidate: pane with no verb-prefixed key (human tab) is never a candidate", () => {
-  // A non-worker pane carries no work::/close:: token — even with a non-empty
-  // open set it must never match.
-  const open = new Set(["work::A"]);
-  expect(
-    isReapCandidate(
-      open,
-      pane({ id: "9", tab_name: "Tab #9", terminal_command: "/bin/zsh -l -i" }),
-    ),
-  ).toBe(false);
-});
-
-test("isReapCandidate: work:: and close:: surfaces match when open", () => {
-  const open = new Set(["work::fn-1-foo.3", "close::fn-2-bar"]);
-  expect(
-    isReapCandidate(open, pane({ id: "1", tab_name: "work::fn-1-foo.3" })),
-  ).toBe(true);
-  expect(
-    isReapCandidate(
-      open,
-      pane({ id: "2", terminal_command: "claude --name close::fn-2-bar" }),
-    ),
-  ).toBe(true);
-});
-
-test("fn-756: an approve:: pane is no longer a dispatch key — never reaped by name", () => {
-  // The approve verb is gone; `DISPATCH_KEY_RE` no longer matches `approve::`,
-  // so a stale approve pane (left from before the deploy) yields a null key and
-  // is never name-matched for reap — the human cleans it up.
-  const open = new Set(["approve::fn-1-foo.3"]);
-  expect(
-    isReapCandidate(open, pane({ id: "1", tab_name: "approve::fn-1-foo.3" })),
-  ).toBe(false);
-});
-
-test("isReapCandidate: fn-741 live-veto — exited:false pane with an OPEN key is NOT reaped", () => {
-  // The 2026-06-08 regression: during the fn-736 hook freeze SessionStart
-  // never folded, so work::A's pending row never discharged — its key stays
-  // in the open set even though the worker is LIVE (exited:false). The
-  // fold-latency-immune veto spares it regardless of set membership.
-  const open = new Set(["work::fn-741-x.1"]);
-  expect(
-    isReapCandidate(
-      open,
-      pane({
-        id: "7",
-        exited: false,
-        terminal_command: "claude --name work::fn-741-x.1 '/plan:work ...'",
-      }),
-    ),
-  ).toBe(false);
-});
-
-test("isReapCandidate: fn-741 — exited true/undefined with an OPEN key still reap (no ghost regression)", () => {
-  // Only an explicit `false` vetoes. A true ghost AND an unknown-state pane
-  // (zellij omits the field) both still reap when their key is open — the
-  // launch-window ghost behavior is preserved.
-  const open = new Set(["work::fn-741-x.1"]);
-  expect(
-    isReapCandidate(
-      open,
-      pane({
-        id: "8",
-        exited: true,
-        terminal_command: "claude --name work::fn-741-x.1",
-      }),
-    ),
-  ).toBe(true);
-  expect(
-    isReapCandidate(
-      open,
-      pane({ id: "9", terminal_command: "claude --name work::fn-741-x.1" }), // exited undefined
-    ),
-  ).toBe(true);
-});
-
-// ---------------------------------------------------------------------------
-// fn-727 — isCompletionReapCandidate (completion reap gate)
-//
-// A SIBLING of isReapCandidate, NOT an overload: this one gates on the
-// completed-row-id SET (the `{tag:"completed"}` verdict), keying off the
-// `<id>` of a `(work|close)::<id>` pane name — fn-756: a completed task
-// authorizes reaping its `work::<id>` pane, a completed epic its `close::<id>`
-// pane (the `approve::<id>` surface no longer exists). Pane liveness is NOT the
-// authorization (the `{tag:"completed"}` verdict is), but fn-741 layers an
-// `exited === false` VETO: a demonstrably-live pane is spared even on a
-// completed id. `exited` true/undefined still reap.
-// ---------------------------------------------------------------------------
-
-test("isCompletionReapCandidate: a completed task id reaps work::<id>", () => {
-  const completed = new Set(["fn-1-foo.3"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "1", tab_name: "work::fn-1-foo.3" }),
-    ),
-  ).toBe(true);
-});
-
-test("isCompletionReapCandidate: a completed epic id reaps close::<id>", () => {
-  const completed = new Set(["fn-2-bar"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "1", tab_name: "close::fn-2-bar" }),
-    ),
-  ).toBe(true);
-});
-
-test("fn-756: a completed id does NOT reap an approve:: pane (no such key any more)", () => {
-  // A stale `approve::<id>` pane yields a null key (the verb is gone from the
-  // regex), so even a completed id never name-matches it.
-  const completed = new Set(["fn-1-foo.3"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({
-        id: "2",
-        tab_name: "Tab #2",
-        terminal_command:
-          "claude --name approve::fn-1-foo.3 '/plan:approve ...'",
-      }),
-    ),
-  ).toBe(false);
-});
-
-test("isCompletionReapCandidate: a NON-completed id is never a candidate (not-yet-completed/worker-ended stay open)", () => {
-  // The id is not in the completed set — its surface is NOT reaped, regardless
-  // of pane state. This is the not-yet-completed / worker-ended hold-open guard.
-  const completed = new Set(["fn-1-foo.3"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "5", tab_name: "work::fn-9-other.1" }),
-    ),
-  ).toBe(false);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "6", tab_name: "close::fn-9-other" }),
-    ),
-  ).toBe(false);
-});
-
-test("isCompletionReapCandidate: human ad-hoc tab (no dispatch key) is never a candidate", () => {
-  const completed = new Set(["fn-1-foo.3"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "9", tab_name: "Tab #9", terminal_command: "/bin/zsh -l -i" }),
-    ),
-  ).toBe(false);
-});
-
-test("isCompletionReapCandidate: empty completed set never reaps", () => {
-  const completed = new Set<string>();
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "3", tab_name: "work::fn-1-foo.3" }),
-    ),
-  ).toBe(false);
-});
-
-test("isCompletionReapCandidate: fn-741 live-veto — exited:false pane on a completed id is NOT reaped", () => {
-  // fn-741 defense-in-depth: a demonstrably-live pane (zellij reports
-  // exited:false) is spared even when its id is in the completed set. This
-  // does NOT reinstate the rejected `is_exited==true` rule (inverse
-  // polarity) — it blocks ONLY explicit liveness, sparing the pane one
-  // extra cycle until it exits.
-  const completed = new Set(["fn-1-foo.3"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "2", tab_name: "work::fn-1-foo.3", exited: false }),
-    ),
-  ).toBe(false);
-});
-
-test("isCompletionReapCandidate: exited true/undefined on a completed id still reap (no regression)", () => {
-  // Only an explicit `false` vetoes. An exited ghost and an unknown-state
-  // pane (zellij omits the field) both still reap on the completed verdict —
-  // a worker pane that has wound down reaps on a later list-panes.
-  const completed = new Set(["fn-1-foo.3"]);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "2", tab_name: "work::fn-1-foo.3", exited: true }),
-    ),
-  ).toBe(true);
-  expect(
-    isCompletionReapCandidate(
-      completed,
-      pane({ id: "3", tab_name: "work::fn-1-foo.3" }), // exited undefined
-    ),
-  ).toBe(true);
-});
-
-// ---------------------------------------------------------------------------
 // fn-727 — reconcile surfaces completedRowIds (no second computeReadiness)
 // ---------------------------------------------------------------------------
 
@@ -2638,12 +2362,12 @@ test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcile
   });
 });
 
-test("fn-779: a done epic with LIVE close-scope work never enters completedRowIds, so the completion reap is suppressed for close::<id>", async () => {
+test("fn-779: a done epic with LIVE close-scope work never enters completedRowIds (liveness-gated completion)", async () => {
   await withSeededDb(async (db) => {
     // A done epic whose closer is still winding down — an epic-level (close-verb)
     // job is `working`. evaluateCloseRow's predicate 1 holds the verdict off
     // `completed` (it falls through to running:*), so the id is absent from
-    // completedRowIds and isCompletionReapCandidate can never authorize the reap.
+    // completedRowIds.
     seedEpicRow(db, "fn-9-done", {
       epic_number: 9,
       status: "done",
@@ -2652,25 +2376,16 @@ test("fn-779: a done epic with LIVE close-scope work never enters completedRowId
     const snap = await loadReconcileSnapshot(db);
     expect(snap.epics.map((e) => e.epic_id)).toContain("fn-9-done");
     const decision = reconcile(snap, makeState(), 0);
-    // Done-but-live: NOT a completed row → no reap.
+    // Done-but-live: NOT a completed row.
     expect(decision.completedRowIds.has("fn-9-done")).toBe(false);
-    // The reap gate inherits the suppression: an exited close::<id> pane is NOT
-    // a candidate because the id never reached the completed set.
-    expect(
-      isCompletionReapCandidate(
-        decision.completedRowIds,
-        pane({ id: "1", tab_name: "close::fn-9-done", exited: true }),
-      ),
-    ).toBe(false);
   });
 });
 
-test("fn-779: the SAME done epic, once its closer is idle, enters completedRowIds and the reap fires for close::<id>", async () => {
+test("fn-779: the SAME done epic, once its closer is idle, enters completedRowIds", async () => {
   await withSeededDb(async (db) => {
     // Identical epic, but the close job is no longer `working` (closer idle) —
     // the only difference from the suppressed case above. Predicate 1 now emits
-    // `{tag:"completed"}`, so the id reaches completedRowIds and the exited
-    // close::<id> pane becomes a reap candidate.
+    // `{tag:"completed"}`, so the id reaches completedRowIds.
     seedEpicRow(db, "fn-9-done", {
       epic_number: 9,
       status: "done",
@@ -2679,12 +2394,6 @@ test("fn-779: the SAME done epic, once its closer is idle, enters completedRowId
     const snap = await loadReconcileSnapshot(db);
     const decision = reconcile(snap, makeState(), 0);
     expect(decision.completedRowIds.has("fn-9-done")).toBe(true);
-    expect(
-      isCompletionReapCandidate(
-        decision.completedRowIds,
-        pane({ id: "1", tab_name: "close::fn-9-done", exited: true }),
-      ),
-    ).toBe(true);
   });
 });
 
