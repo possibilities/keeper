@@ -1,0 +1,14 @@
+{
+  "name": "planctl-hooks",
+  "version": "0.0.0",
+  "description": "Bun TypeScript hook dispatchers enforcing the content-blind orchestrator contract for the planctl plugin",
+  "private": true,
+  "scripts": {
+    "lint": "biome check --no-errors-on-unmatched plugin/hooks test",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.2.0",
+    "@types/bun": "^1"
+  }
+}

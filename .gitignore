@@ -10,6 +10,9 @@ __pycache__/
 dist/
 build/
 
+# Bun / TypeScript hook toolchain (bun.lock is committed; node_modules is not)
+node_modules/
+
 # Planctl runtime state (ephemeral; see .planctl/state/ contract)
 .planctl/state/
 

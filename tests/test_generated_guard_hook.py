@@ -15,13 +15,19 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 import textwrap
 from pathlib import Path
 
+import pytest
+
 REPO_ROOT = Path(__file__).resolve().parent.parent
 PRE_HOOK = REPO_ROOT / "plugin" / "hooks" / "pre-hook.py"
 POST_HOOK = REPO_ROOT / "plugin" / "hooks" / "post-hook.py"
+COMMIT_GUARD = REPO_ROOT / "plugin" / "hooks" / "commit-guard.ts"
+SUBAGENT_STOP_GUARD = REPO_ROOT / "plugin" / "hooks" / "subagent-stop-guard.ts"
+STOP_GUARD = REPO_ROOT / "plugin" / "hooks" / "stop-guard.ts"
 
 
 def _make_stub_promptctl(tmp_path: Path, envelope: dict) -> Path:
@@ -103,6 +109,134 @@ def test_hook_scripts_are_executable() -> None:
     """
     assert os.access(PRE_HOOK, os.X_OK), f"{PRE_HOOK} not executable"
     assert os.access(POST_HOOK, os.X_OK), f"{POST_HOOK} not executable"
+
+
+# ---------------------------------------------------------------------------
+# orchestrator guard wiring — commit-guard / subagent-stop-guard / stop-guard
+# ---------------------------------------------------------------------------
+
+
+def _exec_form_cmd(entry: dict, basename: str) -> dict:
+    """Find the inner hook within ``entry`` whose exec-form args point at the
+    ``plugin/hooks/<basename>`` bun script. Asserts exec form along the way.
+    """
+    for inner in entry["hooks"]:
+        if inner.get("command") != "bun":
+            continue
+        args = inner.get("args", [])
+        if args and args[0].endswith(f"plugin/hooks/{basename}"):
+            assert inner["type"] == "command"
+            assert "${CLAUDE_PLUGIN_ROOT}" in args[0]
+            return inner
+    raise AssertionError(f"no exec-form bun entry for {basename} in {entry!r}")
+
+
+def test_hooks_json_registers_commit_guard() -> None:
+    """PreToolUse carries a Bash-matcher exec-form entry → commit-guard.ts,
+    alongside the untouched Write|Edit pre-hook entry.
+    """
+    hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())["hooks"]
+    pre = hooks["PreToolUse"]
+
+    write_edit = next(e for e in pre if e.get("matcher") == "Write|Edit")
+    assert write_edit["hooks"][0]["command"].endswith("plugin/hooks/pre-hook.py")
+
+    bash_entry = next(e for e in pre if e.get("matcher") == "Bash")
+    _exec_form_cmd(bash_entry, "commit-guard.ts")
+
+
+def test_hooks_json_registers_subagent_stop_guard() -> None:
+    """SubagentStop matches the four plan:worker-* agent types and execs the
+    subagent-stop-guard.ts dispatcher.
+    """
+    hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())["hooks"]
+    entry = hooks["SubagentStop"][0]
+    matcher = entry["matcher"]
+    for tier in ("medium", "high", "xhigh", "max"):
+        assert f"plan:worker-{tier}" in matcher
+    _exec_form_cmd(entry, "subagent-stop-guard.ts")
+
+
+def test_hooks_json_registers_stop_guard() -> None:
+    """Stop carries a matcher-less exec-form entry → stop-guard.ts."""
+    hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())["hooks"]
+    entry = hooks["Stop"][0]
+    assert "matcher" not in entry
+    _exec_form_cmd(entry, "stop-guard.ts")
+
+
+def test_hooks_json_post_read_entry_intact() -> None:
+    """The PostToolUse(Read) warn entry is untouched by the guard wiring."""
+    hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())["hooks"]
+    post = hooks["PostToolUse"][0]
+    assert post["matcher"] == "Read"
+    assert post["hooks"][0]["command"].endswith("plugin/hooks/post-hook.py")
+
+
+# ---------------------------------------------------------------------------
+# guard stubs — fail-open: read stdin, exit 0, no stdout (slow bucket: bun)
+# ---------------------------------------------------------------------------
+
+_GUARD_FIXTURES = {
+    COMMIT_GUARD: {
+        "hook_event_name": "PreToolUse",
+        "session_id": "smoke",
+        "tool_name": "Bash",
+        "tool_input": {"command": "git commit -m x"},
+    },
+    SUBAGENT_STOP_GUARD: {
+        "hook_event_name": "SubagentStop",
+        "session_id": "smoke",
+        "agent_id": "agent-1",
+        "agent_type": "plan:worker-high",
+    },
+    STOP_GUARD: {
+        "hook_event_name": "Stop",
+        "session_id": "smoke",
+        "stop_hook_active": False,
+    },
+}
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("guard", list(_GUARD_FIXTURES), ids=lambda p: p.name)
+def test_guard_stub_reads_stdin_and_exits_clean(guard: Path) -> None:
+    """Each dispatcher stub consumes its fixture stdin, exits 0, and writes
+    nothing to stdout — the fail-open baseline tasks 3-5 build on.
+    """
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("bun not on PATH")
+    result = subprocess.run(
+        [bun, str(guard)],
+        input=json.dumps(_GUARD_FIXTURES[guard]),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == "", result.stdout
+
+
+@pytest.mark.integration
+@pytest.mark.parametrize("guard", list(_GUARD_FIXTURES), ids=lambda p: p.name)
+def test_guard_stub_bypass_exits_clean(guard: Path) -> None:
+    """With PLANCTL_GUARD_BYPASS=1 the stub short-circuits before any I/O and
+    still exits 0 silently.
+    """
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("bun not on PATH")
+    result = subprocess.run(
+        [bun, str(guard)],
+        input=json.dumps(_GUARD_FIXTURES[guard]),
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env={**os.environ, "PLANCTL_GUARD_BYPASS": "1"},
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout == ""
 
 
 # ---------------------------------------------------------------------------
