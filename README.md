@@ -1769,8 +1769,8 @@ provenance `kind`; the provenance SELECT is UNCHANGED (it still reads only
 JSON-TEXT and keeper-py does not read it, so the v51 whitelist entry is
 unchanged. Snapshot-replace (NOT append): each Stop's snapshot IS
 the new value, an empty / missing snapshot is AUTHORITATIVE (drop-when-
-dead per the CLAUDE.md "snapshot paradox" — a dead monitor must never
-linger), and SessionEnd / Killed clear the column to `'[]'` as part of the
+dead — a dead monitor must never linger), and SessionEnd / Killed clear the
+column to `'[]'` as part of the
 terminal write. A from-scratch cursor=0 re-fold reproduces the column
 byte-identically. The expanded `keeper jobs` row renders the live set as
 a two-line per-entry block inside the same collapse-controlled region as

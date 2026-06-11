@@ -1,354 +1,129 @@
 keeper — event-sourced Claude Code control-data daemon (Bun + bun:sqlite).
 
 The hook plugin appends one per-pid NDJSON line per Claude Code hook invocation
-(fn-736 — lock-free, no SQLite open); the `keeperd` daemon's events-log ingester
-tails those files and lands each line as one `events` row, then folds those
-events into the `jobs`/`epics` projections and serves them read-only over a UDS
-subscribe socket. The `events` table stays the canonical fold source, so re-fold
-determinism is preserved by construction. System map, rationale, and incident
-history: `README.md` `## Architecture` and the `.planctl/` epic specs.
+(lock-free, no SQLite open); the `keeperd` daemon's events-log ingester lands each
+line as one `events` row, folds those events into the `jobs`/`epics` projections,
+and serves them read-only over a UDS subscribe socket. The `events` table is the
+canonical fold source, so re-fold determinism holds by construction. System map,
+rationale, and incident history: `README.md` `## Architecture` and `.planctl/` specs.
 
 ## Repo facts
 
 - **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate.
-- **The repo root is the Claude plugin**, loaded via `claude --plugin-dir
-  ~/code/keeper`. The HOOK plugin has exactly ONE manifest
-  (`./.claude-plugin/plugin.json`) and ONE `./hooks/hooks.json` — never duplicate
-  either, and never restore the retired `~/.claude/plugins/keeper` symlink
-  (double-registers the hook). **Carve-out:** `babysitters/.claude-plugin/plugin.json`
-  is a SECOND, deliberate plugin manifest — the agents-only `babysitters` plugin
-  (NO `hooks.json`), loaded out-of-process by each sitter's scanner via its own
-  `--plugin-dir <repo>/babysitters`. It does NOT double-register the hook (no
-  hooks.json) and `--plugin-dir` does not recurse, so the root hook-plugin load
-  never picks it up. The one-manifest rule is about the HOOK plugin; the
-  babysitters plugin is separate and allowed.
-
-## Design stance
-
-The server (event log, reducer, projections, schema, RPC surface) is the durable
-source of truth; clients are cheap to change. Schema bumps and column renames are
-routine — design for the ideal shape, don't bend the server to preserve a lossy
-shape because a consumer reads it.
+- **The repo root is the Claude plugin** (`claude --plugin-dir ~/code/keeper`). The
+  HOOK plugin has exactly ONE manifest (`./.claude-plugin/plugin.json`) and ONE
+  `./hooks/hooks.json` — never duplicate either, and never add a
+  `~/.claude/plugins/keeper` symlink (it double-registers the hook).
+- **Babysitters carve-out:** `babysitters/.claude-plugin/plugin.json` is a SECOND,
+  deliberate plugin manifest — the agents-only `babysitters` plugin (NO `hooks.json`,
+  so it never double-registers the hook), loaded via its own `--plugin-dir`.
 
 ## Event-sourcing invariants
 
-- **Cursor + projection advance in ONE `BEGIN IMMEDIATE` transaction.** Each fold
-  writes the projection AND bumps `reducer_state.last_event_id` together. Never
-  split them — that's the exactly-once-per-event guarantee.
-- **Re-fold determinism is sacred.** Nothing is written straight to the
-  projections; every fact lives in the immutable event log. A from-scratch
-  re-fold must reproduce byte-identical rows. So inside a fold: build derived
-  arrays from stable total-order sorts (never append), and NEVER read wall-clock
-  (`Date.now()`), env vars, the filesystem, or process liveness — use the event's
-  own `ts` for time. Hook-side derivers are pure functions of the payload.
-- **Never throw inside a fold.** A malformed `data` blob folds to a safe value and
-  the cursor still advances; a throw rolls back the cursor and wedges the reducer.
-- **Schema defaults match the zero-event projection**, so a re-fold from empty
-  reproduces the same rows.
-- **Only producers probe liveness** (boot seed sweep, exit-watcher). Folds never
-  probe.
+- **Cursor + projection advance in ONE `BEGIN IMMEDIATE` transaction** — the fold
+  writes the projection AND bumps `reducer_state.last_event_id` together. Splitting
+  them breaks the exactly-once-per-event guarantee.
+- **Re-fold determinism is sacred.** A from-scratch re-fold must reproduce
+  byte-identical rows. Inside a fold: build derived arrays from stable total-order
+  sorts (never append), and NEVER read wall-clock (`Date.now()`), env vars, the
+  filesystem, or process liveness — use the event's `ts`. Only producers probe it.
+- **Never throw inside a fold.** Malformed `data` folds to a safe value and the
+  cursor still advances; a throw rolls back the cursor and wedges the reducer. Schema
+  defaults match the zero-event projection, so an empty re-fold reproduces the rows.
 
 ## Hook rules
 
-- **Always exit 0.** A non-zero exit can fail-closed the human's session. The
-  hook's happy path is a per-pid NDJSON append (fn-736); on a HARD append failure
-  (ENOSPC/EACCES/EROFS, or ENOENT after one mkdir-race retry) it writes a per-pid
-  NDJSON dead-letter as the recovery fallback and still exits 0. Losing one row is
-  acceptable; wedging the agent is not.
-- **No third-party deps, and NO `bun:sqlite`/`src/db.ts`.** The hook NO LONGER
-  opens SQLite (fn-736 — dropping the ~11ms `db.ts` parse + ~7.5ms open/insert was
-  the perf win). Keep its imports to `node:fs`/`node:os`/`node:path`, the dep-free
-  `src/dead-letter.ts` serializers, and the pure `src/derivers.ts`/
-  `src/exec-backend.ts` helpers (cold start budget). A stray `db.ts` symbol
-  re-drags the 6.5k-line module and erases the win.
-- **The hook never opens the DB, so it never migrates or probes schema.** The
-  schema-skew degrade (intersect known `events` columns ∩ live shape, missing
-  column lands NULL) moved DAEMON-side: the events-log ingester does it
-  post-migrate, race-free. The hook just appends every known binding.
+- **Always exit 0.** A non-zero exit can fail-closed the human's session. On a HARD
+  append failure the hook writes a per-pid dead-letter and still exits 0 (losing one
+  row is acceptable; wedging the agent is not).
+- **No third-party deps, and NO `bun:sqlite`/`src/db.ts`.** The hook never opens
+  SQLite — a stray `db.ts` symbol re-drags the 6.5k-line module and erases the
+  cold-start win. Keep imports to `node:fs`/`node:os`/`node:path`, the dep-free
+  `src/dead-letter.ts` serializers, and the pure `src/derivers.ts`/`exec-backend.ts`
+  helpers. It never opens the DB, so it never migrates or probes schema.
 - **Scraping is scoped.** On `SessionStart` only: parent claude `--name`/`-n` +
-  `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event: `ZELLIJ*`
-  env reads (synchronous, no fork/fs). No other scraping, no env read in a fold.
+  `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event: `ZELLIJ*` env
+  reads (synchronous, no fork/fs). No other scraping, no env read in a fold.
 
 ## Migrations
 
 - **Forward-only** via `meta(schema_version)`; non-idempotent steps are
-  version-guarded. The **daemon is the sole migrator.**
-- **Runtime downgrade guard (fn-762.3).** `migrate()` throws BEFORE its
-  transaction opens when the stored `schema_version` is strictly greater than
-  the binary's `SCHEMA_VERSION` — naming both versions + the remediation — so an
-  old binary refuses to run (and never silently downgrades) a DB a newer keeperd
-  already migrated. The throw propagates uncaught out of `openDb` at boot: a hard
-  crash + LaunchAgent restart loop until the operator deploys the newer binary is
-  intended (no fatalExit wrapper, no read-only fallback). Fresh DB (version 0)
-  and same-version DB both pass.
+  version-guarded. The **daemon is the sole migrator.** Runtime downgrade guard:
+  `migrate()` throws BEFORE its transaction opens when the stored `schema_version`
+  exceeds the binary's `SCHEMA_VERSION`, so an old binary never downgrades a newer DB.
 - **When you bump `SCHEMA_VERSION`, add the version to `SUPPORTED_SCHEMA_VERSIONS`
-  in `keeper/api.py` in the SAME commit** — it's a hard whitelist; an unlisted
-  version fails every keeper-py read on the host. `test/schema-version.test.ts`
-  enforces this.
+  in `keeper/api.py` in the SAME commit** — a hard whitelist; an unlisted version
+  fails every keeper-py read. `test/schema-version.test.ts` enforces this.
 
 ## Writes are tightly scoped — DO NOT widen them
 
-- **No general write path into the reducer.** The socket carries `query` (read)
-  and `rpc` (mutate). RPC may write ONLY five surfaces, each of which round-trips
-  through a synthetic event so a re-fold sees it: (1) `replay_dead_letter`,
-  (2) `retry_dispatch`, (3) `set_autopilot_paused`, (4) `set_autopilot_mode`
-  (fn-751 — appends an `AutopilotMode` event onto the `autopilot_state`
-  singleton's `mode` column), (5) `set_epic_armed` (fn-751 — appends an
-  `EpicArmed` event onto the `armed_epics` presence table). RPC handlers MUST NOT
-  write `jobs`/`epics`/etc directly. The fn-751 pair is APPEND-ONLY (no
-  main→worker relay, unlike `set_autopilot_paused`): the level-triggered
-  reconciler re-reads mode + armed from the projection each cycle, woken by the
-  fold's `data_version` bump. **fn-774 task .2 adds ONE arm-time rejection** to
-  the otherwise-unconditional `set_epic_armed` append: an `armed:true` request
-  against an epic PRESENT in the `epics` projection AND `status='done'` is
-  refused main-side (writer-DB status read in `daemon.ts`) BEFORE the append —
-  closing the arm-after-done hole the fold-prune alone can't reach. `armed:false`
-  (disarm) and a not-yet-folded epic still append unconditionally, so the
-  fold-lag tolerance (and a `done` epic is definitionally folded) is intact.
-  **`armed_epics` has a SECOND writer (fn-774):**
-  the `EpicSnapshot` fold prunes the row when an epic folds to `status='done'`
-  (`epicIsCompleted`) — a completed epic can't stay armed. That's a fold-side
-  lifecycle delete (NOT an RPC write), so the "RPC may write ONLY five surfaces"
-  fence is unbroken; `foldEpicArmed` (the EpicArmed-event writer) and the
-  EpicSnapshot completion-prune are the two writers of the table.
-- **Plans are READ-ONLY.** The plan worker folds `.planctl/{epics,tasks}`
-  snapshots into `epics`; every field is read-only end to end, the same fence as
-  `jobs`. No RPC writes a plan field.
-- **Sole-writer rules.** The hook writes ONLY per-pid NDJSON files — the
-  events-log feed (happy path, fn-736) + per-pid dead-letters (append-failure
-  fallback). It NEVER touches the DB. The daemon's events-log ingester is the
-  sole writer of hook-sourced `events` rows (read each per-pid file from its
-  durable byte-offset → INSERT + offset advance in one `BEGIN IMMEDIATE`). Main
-  writes all synthetic events + the `dead_letters` sidecar + the replay path.
-  Workers feed the log only via main; they never write the DB themselves.
-- **The babysitters are pure read-only external scanners.** They live under
-  `babysitters/` — an agents-only Claude-Code plugin, one sitter per concern
-  (today: `performance`; planned: `git-orphans`, `dead-letters`). Each sitter
-  owns `babysitters/<slug>/` code, a `babysitters/agents/<slug>.md` triage agent
-  (addressed `babysitters:<slug>`, spawned with `--plugin-dir <repo>/babysitters`
-  so the keeper hook stays UNLOADED), and a PRIVATE state tree
-  `~/.local/state/babysitters/<slug>/` (resolved via the shared
-  `babysitters/lib/state.ts` `babysitterStateDir(slug)` — `BABYSITTER_STATE_DIR`
-  root override + slug; deliberately NOT a `KEEPER_*` path, so a keeper.db re-fold
-  never observes a sitter's bookkeeping). The performance sitter
-  (`babysitters/performance/watch.ts`) opens `keeper.db` read-only and only
-  observes — no event-log write, no synthetic events, no RPC. Its SECOND
-  read-only input is keeper's own `backstop.ndjson` self-telemetry (read via
-  `KEEPER_BACKSTOP_LOG` — keeper's, NOT a sitter path), consumed the same
-  no-write/no-RPC way. Its seen-state, the liveness `heartbeat.json` it stamps as
-  the last action on every completed tick, the `backstop-baseline.json` sidecar
-  (per-(backstop,class) `rescues_total` baseline + a rescue-`ts` high-watermark —
-  version-tagged; `BACKSTOP_BASELINE_VERSION` 1→2 silently reseeds every deployed
-  baseline, so a dev inspecting `~/.local/state/babysitters/performance/` should
-  expect a fresh file), and the escalation follow-up prompt files all live there,
-  outside the DB. Pages go to Telegram only (`botctl`, the `Keeper` topic) — no
-  desktop notifyctl. A SEPARATE launchd dead-man
-  (`babysitters/performance/watchdog.ts`) reads ONLY that heartbeat and pages on
-  staleness; it is standalone (no `keeper.db`, no keeperd, no scanner dependency)
-  so it still runs when the thing it watches has died.
+- **No general write path into the reducer.** The socket carries `query` (read) and
+  `rpc` (mutate). RPC may write ONLY five surfaces, each round-tripping through a
+  synthetic event so a re-fold sees it: `replay_dead_letter`, `retry_dispatch`,
+  `set_autopilot_paused`, `set_autopilot_mode`, `set_epic_armed`. RPC handlers MUST
+  NOT write `jobs`/`epics`/etc directly (folds still mutate their own projections).
+- **Plans are READ-ONLY.** The plan worker folds `.planctl/{epics,tasks}` snapshots
+  into `epics`; every field is read-only end to end. No RPC writes a plan field.
+- **Sole-writer rules.** The hook writes ONLY per-pid NDJSON files, never the DB. The
+  events-log ingester is the sole writer of hook-sourced `events` rows; main writes
+  all synthetic events + `dead_letters` + the replay path; workers feed via main.
+- **Babysitters are pure read-only external scanners** under `babysitters/`: each
+  opens `keeper.db` read-only and only observes (no event-log write, no synthetic
+  events, no RPC), keeping its bookkeeping outside any `KEEPER_*` path.
 
-## No kernel watchers on keeper's OWN DB
+## Process & DB-watch invariants
 
-`fs.watch`/FSEvents/kqueue drop same-process and WAL writes on macOS. Detect
-DB changes via `PRAGMA data_version` polling on a read-only connection (optionally
-woken faster by a same-process `postMessage({type:"kick"})` after a drain).
-`data_version` carries NO row/root attribution — it signals only "something
-committed" — so it drives O(1) MEMBERSHIP-RECONCILE wakes, never an O(roots)
-per-root fan-out. The git-worker learned this the hard way (fn-748): its
-`data_version` poll used to fan a `git status` snapshot out to EVERY subscribed
-root on every foreign write, pegging the daemon at ~144% CPU under multi-agent
-load. The snapshot arm is now FSEvents-triggered (per-root worktree +
-git-common-dir `@parcel/watcher` subs, plus the drop-triggered rescan) with the
-60s heartbeat as the single backstop; `data_version` only reconciles which roots
-to watch. Carve-outs are fine: `@parcel/watcher` on EXTERNAL trees (transcripts,
-`.planctl`, `.git/logs/HEAD`) and kqueue/pidfd on EXTERNAL process descriptors
-(exit-watcher).
-
-## No in-process self-heal
-
-Any unrecoverable error (including a worker's `error` event) calls `fatalExit` →
-`process.exit(1)`; the LaunchAgent restarts the single recovery path. Never
-respawn a worker in-process. **Carve-out:** closing a stale/EPIPE UDS client
-connection (the fn-723 reaper: EPIPE-evict, stuck-pending TTL, max-conn cap) is
-connection hygiene, not self-heal — it touches only the server-worker's `conns`
-Set + the socket, never respawns a worker, never writes the DB, never emits a
-synthetic event.
+- **No kernel watchers on keeper's OWN DB.** `fs.watch`/FSEvents/kqueue drop
+  same-process and WAL writes on macOS — detect DB changes via `PRAGMA data_version`
+  polling on a read-only connection only. Carve-out: `@parcel/watcher` on EXTERNAL
+  trees and kqueue/pidfd on EXTERNAL process descriptors are fine.
+- **No in-process self-heal.** Any unrecoverable error calls `fatalExit` →
+  `process.exit(1)`; the LaunchAgent restarts the single recovery path. Never respawn
+  a worker in-process. Carve-out: closing a stale/EPIPE UDS client connection is
+  connection hygiene, not self-heal.
 
 ## Worker contract
 
 - **`isMainThread` guard** — a plain import of the module is inert.
 - **Own `openDb` connection** (read-only for readers); never share main's.
-- **Typed messages** — `{ kind }` worker→main, `{ type }` main→worker. The UDS
-  client connection lifecycle (evict/cap, fn-723) is the server-worker's own
-  socket-handler concern — distinct from this `{type}`/`{kind}` worker↔main
-  message bus.
+- **Typed messages** — `{ kind }` worker→main, `{ type }` main→worker.
 - **Supervisor-owned lifecycle** — main spawns after migrate+boot-drain and is the
-  only one that terminates (`shutdown` → await close → terminate). A worker owning
-  an external resource MUST release it in its own shutdown handler.
+  only one that terminates (`shutdown` → await close → terminate). A worker owning an
+  external resource MUST release it in its own shutdown handler.
 
 ## Test isolation
 
 Every test that spawns the real hook MUST sandbox ALL FIVE state paths under the
 per-test tmpdir: `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`,
 `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`. Never `{ ...process.env, KEEPER_DB }`
-— it strands the others at production defaults and pollutes the real feed. Build
-the env via the shared `sandboxEnv(...)` in `test/helpers/sandbox-env.ts`, which
-applies the state paths LAST (after any caller `extra`/undefined-clear) so a
-caller can't re-strand one: pass `includeZellij: true` to add the sixth
-`KEEPER_ZELLIJ_EVENTS_DIR` (fn-684) for hook-spawn tests. **fn-772's
-viewer snapshot mode adds NO new sandboxEnv entry:** its frame/state/meta
-sidecars reuse the existing pid-isolated `/tmp/keeper-<sub>.<pid>.*` paths
-(no env-configurable output dir), so the state-path list stays at five
-(+Zellij). The snapshot unit tests (`test/view-shell.test.ts`) are
-in-process via an injectable `snapshotIo` sink — no subprocess, no env to
-sandbox — but that file is slow-tier (view/CLI process paths), so the
-existing **`test:full`-before-landing rule already covers it**; it needs
-no new slow-tier trigger category.
+— it strands the others at production defaults and pollutes the real feed. Build the
+env via the shared `sandboxEnv(...)` in `test/helpers/sandbox-env.ts`; pass
+`includeZellij: true` for the sixth `KEEPER_ZELLIJ_EVENTS_DIR` on hook-spawn tests.
 
-**Two test helpers, two jobs (fn-769).** `sandboxEnv` is for process-spawn
-isolation — any test that launches the real hook/daemon/CLI subprocess. The
-template-DB helper in `test/helpers/template-db.ts` (`freshDb()` /
-`freshDbFile()`) is for pure IN-PROCESS unit tests that just need a migrated
-schema: it migrates ONE `:memory:` DB per file-process, `serialize()`s it once,
-and hands each test a `Database.deserialize` clone (~0.2ms) instead of re-running
-the 63-version `migrate()` ladder per `openDb(":memory:")` (~27-40ms × ~1,200
-calls ≈ the suite's dominant cost). Reach for `freshDb()` in reducer/projection
-unit tests; keep a real `openDb` only when the test EXERCISES migration itself
-(`db.test.ts`) or owns a subprocess. The helper hard-throws on a schema-version
-mismatch, so a stale template fails loudly rather than handing tests a sub-current
-schema.
+**Two test helpers, two jobs.** `sandboxEnv` is for process-spawn isolation (any
+test launching the real hook/daemon/CLI subprocess). The template-DB helper in
+`test/helpers/template-db.ts` (`freshDb()` / `freshDbFile()`) is for pure IN-PROCESS
+unit tests needing a migrated schema — a fast `Database.deserialize` clone instead
+of re-running the full `migrate()` ladder. Keep a real `openDb` only when the test
+EXERCISES migration (`db.test.ts`) or owns a subprocess.
 
-**Two tiers (fn-769).** The default `bun test` runs the FAST tier only —
-`--path-ignore-patterns` prunes the ~25 process-level integration files (daemon
-boot, hook subprocess spawn, git plumbing, the real `db.test.ts` migration
-ladder) and chains the serial-safe opentui files, targeting <5s wall on the
-10-core dev machine. `bun run test:full` runs EVERY file exactly once (fast +
-slow + opentui, no double-run) and is the real gate: **`test:full` is mandatory
-before landing any change that touches daemon / worker / db / hook / git process
-paths or any slow-tier file** — the default fast run does NOT cover those, and
-the slow tier breaking silently is the dominant failure mode until the follow-up
-local-CI epic lands. When in doubt, run `test:full`.
+**Two tiers.** Default `bun test` runs the FAST tier only and skips process-level
+integration files. **`bun run test:full` is mandatory before landing any change
+touching daemon / worker / db / hook / git process paths or any slow-tier file** —
+the fast run does NOT cover those. When in doubt, run `test:full`.
 
 **Poll, don't sleep.** Any assertion waiting on async worker/daemon state uses
-`retryUntil` (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep` as a
-deadline race. `retryUntil(predicate, timeoutMs, cadenceMs)` polls until the
-predicate returns truthy or the deadline elapses — free on the happy path, spent
-only on a real hang — so a fixed sleep can't silently resolve under host
-contention and flake the suite.
+`retryUntil` (`test/helpers/retry-until.ts`), never a fixed `Bun.sleep` — a fixed
+sleep can silently resolve under host contention and flake the suite.
 
 ## Autopilot
 
 The server-side reconciler dispatches workers against ready plan work. It **boots
-paused** and is level-triggered on `PRAGMA data_version`. An unpaused autopilot
-that "does nothing" is almost always a readiness gate firing correctly — the gates
-live in `src/readiness.ts` (`computeReadiness`) and decide which verdicts occupy
-the per-epic / per-root mutex. Common gates: won't dispatch against an uncommitted
-epic, into a dirty repo, during the launch→SessionStart blind window, against a
-taskless epic, or — in `armed` mode — when an ineligible epic loses the per-root
-mutex tiebreak to an eligible sibling (fn-770). To inspect, read `src/readiness.ts`
-and `src/autopilot-worker.ts`; the `[paused]` banner in `keeper autopilot` is
-authoritative.
-
-**Mode (`yolo` | `armed`, fn-751, schema v62).** An explicit autopilot mode enum
-on the `autopilot_state` singleton's `mode` column (defaults `'yolo'` on a
-zero-event / pre-existing DB — the backward-compatible work-everything baseline).
-**yolo** works every ready epic until none remain (byte-for-byte today's
-behavior). **armed** works ONLY a human-chosen set of armed epics PLUS their
-transitive upstream dep-closure — arming an epic also pulls in the prerequisites
-it can't complete without (multi-source BFS over reversed `resolved_epic_deps`
-edges, cycle-safe), so it never deadlocks on an unarmed (possibly cross-project)
-upstream. The per-epic armed flag is a PRESENCE table (`armed_epics`): row present
-= armed. Both are written via the `set_autopilot_mode` / `set_epic_armed` RPCs
-(synthetic `AutopilotMode` / `EpicArmed` events) and READ FROM THE PROJECTION each
-reconcile cycle — no relay, no `ReconcileState` cache — so they survive restart
-for free. **fn-774 task .2:** `set_epic_armed` rejects an `armed:true` request
-against an epic already folded to `status='done'` (writer-DB status read in
-`daemon.ts`, before the append) — the arm-after-done guard the fold-prune can't
-reach; `disarm` and a not-yet-folded arm stay unconditional.
-**fn-774: the `EpicSnapshot` fold is a SECOND `armed_epics` writer** —
-when an epic folds to `status='done'` (`epicIsCompleted`) the fold prunes its
-`armed_epics` row, so a completed-while-armed epic drops off the armed set
-(reconcile closure + the `[armed]` board pill) instead of lingering. The prune
-sits OUTSIDE the EpicSnapshot ON-CONFLICT scalar-change carve-out (mirroring the
-`epic_tombstones` clear) so it fires on every `done` snapshot — re-fold
-deterministic by construction. The mode check is a SUPPRESSION ARM inside reconcile (a desired-state
-verdict). fn-770 also threads the per-cycle eligible Set into `readiness.ts`'s
-per-root mutex: its discretionary pass-2 ready-tiebreak is now eligibility-aware,
-so an armed (eligible) epic wins a free root over an earlier-sorted unarmed
-sibling instead of deadlocking (the ineligible sibling captured the slot, then
-the reconcile gate suppressed the eligible epic's `work`). The mutex param is a
-trailing-optional `eligibleEpicIds?: Set<string>` — ABSENT in yolo (no BFS,
-byte-identical legacy single-pass), PROVIDED (even empty) in armed; pass-1
-physical occupancy stays eligibility-blind, and close rows stay always-eligible.
-The reconcile gate at `autopilot-worker.ts` is RETAINED (a pass-2b ineligible
-task can still win a contender-free root). Completion-reap and the fn-770
-per-root mutex layer stay fully mode-EXEMPT; **fn-773 narrowed the `close`
-DISPATCH exemption** — in armed mode a `close::` launch fires iff the epic is
-in the armed dep-closure (`eligible.has`) OR in-flight (`isEpicInFlight`: a live
-`close::<epic>`/`work::<task>` job or surface), so a disarmed-MID-FLIGHT epic
-still finishes, closes, and reaps cleanly while a COLD close-candidate autopilot
-never touched and never armed is suppressed instead of burning repeated closers
-(2026-06-10: unarmed planctl fn-12). The human controls it via
-`keeper autopilot mode <yolo|armed>` / `arm <epic>` / `disarm <epic>`; the
-`keeper autopilot` banner shows `[playing] · <mode> · N armed` (empty-armed-in-
-armed-mode renders distinctly as `· nothing armed`).
-
-**Global cap (`max_concurrent_jobs`)** counts root-occupants (planner-exempt)
-before per-epic dispatch; the budget governs only `work`/`close` launches.
-
-**Re-dispatch cooldown (`REDISPATCH_COOLDOWN_S` = 200, fn-735/fn-762).** The
-fold-lag-immune suppression arm — and the suppression source of truth. Every
-other dedup arm (`failedKeys`, `isOccupyingJob`, `liveTabKeys`, the
-`dispatch-pending` occupant) reads a PROJECTION, so when the reducer lags
-15-60s+ behind reality all of them go blind to a just-fired dispatch and the
-same `verb::id` re-launches (the two-`close`-workers / infinite-re-approve
-class). The cooldown is an in-memory `Map<verb::id, unix-seconds>` on
-`ReconcileState` (optimistic-in-flight-set, cf. k8s
-`UIDTrackingControllerExpectations`): `runReconcileCycle` STAMPS the key at
-dispatch BEFORE the confirm await (covers both `ok` and the slow-cold-boot
-`indoubt`), `reconcile` READS it (gate at BOTH dispatch sites, above the fn-728
-budget gate — covers work/close), suppressing
-re-dispatch for the window. fn-762 set the window to 200s, STRICTLY GREATER
-than `PENDING_DISPATCH_TTL_MS / 1000` (120) + the `PENDING_DISPATCH_SWEEP`
-granularity (60): the 2026-06-09 incident triple-dispatched one worktree
-because the cooldown CO-EXPIRED with the 120s TTL while fold lag still outlived
-both — the window must outlast the WHOLE round-trip (pending row surviving a
-full TTL, then the sweep tick that clears the phantom). Ordering chain (all
-load-bearing): `ceilingMs (60s) < PENDING_DISPATCH_TTL_MS (120s) <
-REDISPATCH_COOLDOWN_S (200s)`. A definitive launch failure or a PRE-LAUNCH
-abort (`aborted-prelaunch` — ack reject / `{ok:false}` / shutdown racing the
-ack; nothing launched) CLEARS the entry (so `failedKeys` owns stickiness and
-`retry_dispatch` re-dispatches without waiting it out); `ok` / `indoubt` / a
-POST-LAUNCH abort (`aborted-postlaunch` — mid-poll shutdown after the launch
-fired, a ghost worker may exist) KEEP it. The `indoubt` outcome RE-STAMPS the
-entry ONCE at resolution (the dispatch-time stamp is up to `ceilingMs` stale by
-then; a single refresh restarts the window — never compounding across cycles,
-the perpetual-suppression trap). Each cycle prunes expired entries
-(`sweepRedispatchCooldown`, wrapped — no self-heal). UNIT TRAP: everything is
-unit-SECONDS (matching `reconcile`'s `now`); never mix with the ms-valued
-`*_TTL_MS` constants. In-memory ONLY — never the event log / projections /
-reducer / RPC surface; boots EMPTY on restart (safe — boots paused, first cycle
-rebuilds suppression from the live projection); `reconcile` stays pure (reads
-via `state`, never mutates). **Supersedes the approve-only, reducer-side
-fn-734** — generalized to all verbs, dispatch-side, in-memory.
-
-**Completion reap (`autoclose_windows`, default `true`, fn-727).** When a row
-reaches the `{tag:"completed"}` verdict (worker done for a task, `status='done'`
-for an epic, + idle), the reconcile cycle closes its zellij surfaces via
-`ExecBackend.reapSurfaces` (pane-close on the surviving live-probe path — NOT the
-retired `closeByTabId` tab-coord mechanism): a completed task reaps `work::<id>`,
-a completed close-row reaps `close::<id>`; pending / worker-ended-incomplete
-windows stay open.
-**fn-764:** the close-row verdict is only observable if the snapshot still
-carries the just-done epic — the default epics read scopes to `status='open'`,
-so `loadReconcileSnapshot` MERGES in a SECOND bounded done-epics read
-(`filter:{status:"done"}`, `updated_at` DESC, limit `DONE_EPICS_REAP_LIMIT`) so
-a freshly-done epic is observed at least once post-flip; the bound keeps it
-O(limit), never O(all done history) (the fn-748 anti-pattern), and `reapSurfaces`
-is idempotent so re-observation within the window is a safe no-op. Deliberately
-does NOT gate on `is_exited` (the worker pane may be live at completion). See
-`src/autopilot-worker.ts` (`isCompletionReapCandidate`, `reapCompletionSurfaces`,
-`loadReconcileSnapshot`) + `src/exec-backend.ts` (`reapSurfaces`).
+paused** and is level-triggered on `PRAGMA data_version`. An unpaused autopilot that
+"does nothing" is almost always a readiness gate firing correctly — the gates live in
+`src/readiness.ts` (`computeReadiness`) and the `[paused]` banner is authoritative.
+For modes, caps, the cooldown, and completion-reap, read `src/autopilot-worker.ts`,
+`src/readiness.ts`, and README.
 
 ## Out of scope
 
