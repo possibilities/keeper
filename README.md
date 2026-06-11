@@ -572,8 +572,8 @@ Keeper has no `install` verb. Wire it up manually:
    `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable.
 
    Example clients ship under the unified `keeper` CLI — `keeper board` /
-   `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage`
-   (subscribe; the readiness clients go through
+   `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage` /
+   `keeper dash` (subscribe; the readiness clients go through
    `src/readiness-client.ts`) — see
    [Example clients](#example-clients).
 
@@ -603,10 +603,12 @@ subscribe clients share helpers in `src/readiness-client.ts` —
 autopilot) and `subscribeCollection` owns the single-collection
 lifecycle (git, usage); both feed `computeReadiness` / row-list
 callbacks (the pure verdict pipeline lives in `src/readiness.ts` as
-library code, not a runnable script). All five viewers (`board`, `jobs`,
+library code, not a runnable script). All five snapshot-capable viewers (`board`, `jobs`,
 `git`, `autopilot`, `usage`) resolve their output mode through a
 three-way TTY gate (fn-772, shared `src/snapshot.ts` / `src/view-shell.ts`
-seam): (1) **TTY stdout** → today's alt-screen live TUI, byte-for-byte
+seam); `keeper dash` is a TTY-ONLY exception outside this gate (no snapshot
+mode — a non-TTY stdout exits 1, see the `dash.ts` bullet below): (1) **TTY
+stdout** → today's alt-screen live TUI, byte-for-byte
 unchanged, with per-frame state/diff sidecars and keyboard navigation
 (←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
 q/Ctrl-C quit); (2) **non-TTY stdout** (piped, redirected, or under CI) →
@@ -1000,6 +1002,45 @@ event-log/reducer/hook touch. Run any of them with
   keeper usage                # all profiles (TTY); non-TTY → one snapshot + exit
   keeper usage --sock /tmp/x  # socket override
   keeper usage | tail -1      # last line is the parseable keeper-meta JSON record
+  ```
+
+- `dash.ts` — v1 of the unified keeper TUI (fn-780): a minimal, read-only
+  OPENING SCREEN unifying the at-a-glance value of `keeper board` + `keeper
+  jobs` + `keeper autopilot` into one frame — a header strip (autopilot
+  play/pause + mode + armed-count, dead-letter count, connection marker), a
+  **PLAN** region (one row per open epic in server `sort_path` order: armed
+  marker, `epic_number title` label, the per-epic readiness verdict, and an
+  `N/M` completed-task count that counts ONLY `completed` perTask verdicts and
+  is hidden at zero tasks), and an **AGENTS** region (working sessions PLUS
+  stopped-but-needs-you, never dropping a needs-you row; sorted needs-you-first
+  then `created_at` ASC with a `job_id` tiebreak; label `title → plan_ref →
+  job_id`, trailing elapsed band replaced by `awaiting` / `failed` when the
+  session is blocked on a human). **Data sources:** the readiness collections
+  ride one `subscribeReadiness` connection; `autopilot_state` and `armed_epics`
+  ride their own `subscribeCollection` subs (the readiness conn subscribes them
+  internally but does NOT expose them on the snapshot, so the header needs the
+  two extra subs). **Frame shape:** a fresh `@opentui/core` app under `src/dash/`
+  — a pure view-model builder (`src/dash/view-model.ts`, OpenTUI-free, fast-tier
+  tested) plus a thin materializer (`src/dash/app.ts`) that diffs role-tagged
+  segment rows into a stable `Map<rowKey, TextRenderable>` (structural add/remove
+  only on a row-set change; `setContent` otherwise) and colors each segment via
+  `RGBA.fromIndex` so the hue tracks the terminal theme. Reactive render mode (no
+  `renderer.start()`); one coarse 30s interval refreshes the elapsed cells.
+  **TTY-only:** the gate fires in `cli/dash.ts` BEFORE any OpenTUI import — a
+  non-TTY stdout exits 1 with `keeper dash: requires a TTY` (no snapshot mode,
+  no `keeper-meta:` line). Reconnect-forever with the connection state shown
+  in-TUI (a pre-paint `connecting…` / `reconnecting…` line, then a header marker
+  with the body frozen at last-good once a snapshot has painted). Read-only end
+  to end — no RPC frame is written, no DB opened. q / Ctrl-C quit; j/k/arrows
+  scroll the focused ScrollBox; every exit path (q, Ctrl-C, SIGHUP, stdin-EOF,
+  the ~2s `ppid === 1` poll, onFatal, uncaughtException/unhandledRejection)
+  routes through one idempotent teardown that `renderer.destroy()`s BEFORE
+  exiting, so the terminal is never stranded in alt-screen/raw mode.
+
+  ```sh
+  keeper dash                 # live screen on a TTY (header + PLAN + AGENTS)
+  keeper dash --sock /tmp/x   # socket override
+  echo | keeper dash          # non-TTY → 'keeper dash: requires a TTY', exit 1
   ```
 
 - `await.ts` — the blocking wait-for-condition client (fn-647; conditions

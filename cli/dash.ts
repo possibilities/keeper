@@ -1,0 +1,71 @@
+#!/usr/bin/env bun
+/**
+ * `keeper dash` — v1 of the unified keeper TUI: a minimal, read-only opening
+ * screen (header strip + PLAN + AGENTS) that answers "what is going on
+ * plan/work/agent-wise" in one place, unifying the at-a-glance value of
+ * `keeper board` + `keeper jobs` + `keeper autopilot`.
+ *
+ * Unlike the five viewer subcommands, dash is TTY-ONLY — there is NO snapshot
+ * mode. The TTY gate fires here, BEFORE any `@opentui/core` import, so a piped
+ * invocation exits 1 with a one-line stderr message and never pays the
+ * native-loader cost. The renderer construction + data wiring lives in
+ * `src/dash/app.ts` (`createDashApp`); this file is just parseArgs +
+ * resolveSockPath + the gate.
+ *
+ * Read-only end to end: no RPC frame is written, no DB is opened.
+ *
+ *   keeper dash [--sock <path>]
+ *   keeper dash --help
+ */
+
+import { parseArgs } from "node:util";
+import { resolveSockPath } from "../src/db";
+
+const HELP = `keeper dash — read-only opening screen (header + PLAN + AGENTS)
+
+Usage:
+  keeper dash [--sock <path>]
+  keeper dash --help
+
+Options:
+  --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)
+  --help         Show this help
+
+dash is a live, TTY-ONLY screen — there is NO snapshot mode. A non-TTY stdout
+(piped, redirected, CI) exits 1 with 'keeper dash: requires a TTY'. The screen
+reconnects forever, showing connection state in-TUI; q / Ctrl-C quit. It is
+read-only — no dispatch, no control, no DB open.
+`;
+
+export async function main(argv: string[]): Promise<void> {
+  const parsed = parseArgs({
+    args: argv,
+    options: {
+      sock: { type: "string" },
+      help: { type: "boolean", default: false },
+    },
+    allowPositionals: false,
+  });
+
+  if (parsed.values.help) {
+    process.stdout.write(HELP);
+    process.exit(0);
+  }
+
+  const sockPath = parsed.values.sock ?? resolveSockPath();
+
+  // TTY gate — BEFORE any OpenTUI import. dash has no snapshot fallback, so a
+  // non-TTY stdout is a hard error, not a mode switch.
+  if (process.stdout.isTTY !== true) {
+    process.stderr.write("keeper dash: requires a TTY\n");
+    process.exit(1);
+  }
+
+  // Only now pull in the OpenTUI-backed app (its native loader is heavy and
+  // racy under --isolate; the gate above keeps the piped path off it).
+  const { createDashApp } = await import("../src/dash/app");
+  await createDashApp(sockPath);
+}
+
+// `import.meta.main` guard neutralized — `cli/keeper.ts` is the canonical entry
+// (its dispatcher prunes the subcommand token from argv before calling main).

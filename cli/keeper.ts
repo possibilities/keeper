@@ -29,6 +29,7 @@ export const SUBCOMMANDS = [
   "git",
   "usage",
   "autopilot",
+  "dash",
   "await",
   "commit-work",
   "session-state",
@@ -47,6 +48,7 @@ Subcommands:
   git                 Git status frames (TTY: live TUI; non-TTY: one snapshot + exit)
   usage               Usage frames (TTY: live TUI; non-TTY: one snapshot + exit)
   autopilot           Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)
+  dash                Read-only opening screen: header + PLAN + AGENTS (TTY-only)
   await               Block until a planctl/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
   session-state       Current session git context + on-hook files (JSON)
@@ -56,12 +58,14 @@ Flags:
   --help, -h     Show this help
   --version, -V  Show keeper version
 
-The five viewer subcommands (board/jobs/git/usage/autopilot) auto-detect a
-non-TTY stdout (piped, redirected, CI) and emit ONE current frame followed by
-a machine-parseable \`keeper-meta:\` JSON line, then exit — instead of streaming
-forever. Override per subcommand with \`--snapshot\` (force one-shot on a TTY),
-\`--watch\` (force the live stream even when piped — never exits), or
-\`--timeout <s>\` (snapshot wait, ~2s default).
+The five snapshot-capable viewer subcommands (board/jobs/git/usage/autopilot)
+auto-detect a non-TTY stdout (piped, redirected, CI) and emit ONE current frame
+followed by a machine-parseable \`keeper-meta:\` JSON line, then exit — instead of
+streaming forever. Override per subcommand with \`--snapshot\` (force one-shot on a
+TTY), \`--watch\` (force the live stream even when piped — never exits), or
+\`--timeout <s>\` (snapshot wait, ~2s default). \`dash\` is the exception: it is
+TTY-ONLY (no snapshot mode), so a non-TTY stdout exits 1 rather than printing a
+frame.
 
 Run \`keeper <subcommand> --help\` for subcommand-specific options.
 `;
@@ -136,6 +140,7 @@ export async function main(): Promise<void> {
     git: async (argv) => (await import("./git")).main(argv),
     usage: async (argv) => (await import("./usage")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
+    dash: async (argv) => (await import("./dash")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
     "session-state": async (argv) =>
