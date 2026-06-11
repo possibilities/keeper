@@ -51,5 +51,5 @@ renderers; the view-shell/CLI process path is slow-tier, so run
 - [ ] bun run test:full green
 
 ## Done summary
-
+Added 'keeper builds' TUI subcommand (cli/builds.ts) on the git.ts template: pure renderers mapping all 7 buildbot result codes + RUNNING to status glyph/label, build number, state string, and client-side age with a 3x-cadence staleness marker; registered in the dispatcher SUBCOMMANDS/USAGE/handler map. Renderer + dispatch tests added; bun run test:full green.
 ## Evidence

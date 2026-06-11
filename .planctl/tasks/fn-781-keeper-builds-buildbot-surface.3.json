@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Builds TUI subcommand",
-  "updated_at": "2026-06-10T22:25:58.511839Z"
+  "updated_at": "2026-06-11T04:40:39.553733Z",
+  "worker_done_at": "2026-06-11T04:40:39.553733Z"
 }
