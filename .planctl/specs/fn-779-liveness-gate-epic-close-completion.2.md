@@ -48,5 +48,5 @@ test/autopilot-worker.test.ts is slow-tier: bun run test:full is mandatory befor
 - [ ] bun run test:full passes
 
 ## Done summary
-
+Added slow-tier reconcile tests proving the close-row completion reap inherits done-AND-idle: a done epic with a live close-scope job stays out of completedRowIds (reap suppressed) and enters it once the closer is idle. Pruned stale status-only/is_exited close-completion rationale from README, docs/exec-backend.md, autopilot-worker comments, and added one forward CLAUDE.md line pointing close-row liveness gating at src/readiness.ts.
 ## Evidence
