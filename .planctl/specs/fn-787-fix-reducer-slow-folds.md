@@ -37,6 +37,7 @@ fix — do not fix blind.
 
 - Babysitter triage round that routed this: `~/docs/babysitters/performance/rounds/1781203504.md` (sketch/2026-06-11-keeper-wake-path-drops, fold-latency half). After this epic lands, re-stamp the routed ledger rows in `~/docs/babysitters/performance/processed.jsonl` with this epic's slug as `resolved_ref`.
 - Sibling-agent boundary (confirmed via chatctl with `tmux-session-id-design`): do NOT touch `src/exec-backend.ts`, `src/autopilot-worker.ts`, or `src/daemon.ts` spawn/ingest blocks — the tmux-backend rewrite owns them. `src/reducer.ts`, `src/subagent-invocations.ts` are free; `src/db.ts` is free for INDEX-only migration steps (their db.ts change is config-keys-only). BackendExecSnapshot event contract is unchanged.
+- `fn-789-add-tmux-exec-backend` (overlap, trivial): its task .3 ADDS one purely-additive `TmuxPaneSnapshot` else-if arm + a small fill-only fold fn to the reducer dispatch chain (the same region task .1 instruments). No restructuring of existing arms or queries. Whichever epic lands second rebases the dispatch chain trivially — expect the new arm, do not modify it, do not instrument it (it is new and not a measured hotspot).
 - BackendExecSnapshot fold is a NO-OP (`src/reducer.ts:6300-6305`, fn-684 retired it) — its 858 historical `[fold-slow]` lines predate retirement. Do not instrument or "fix" it.
 - Live DB: `~/.local/state/keeper/keeper.db` — 2.65GB total; `event_blobs` 2.0GB / `events` 262MB (671k rows); WAL small post-TRUNCATE-checkpoint.
 
