@@ -266,6 +266,32 @@ tasks:
     assert task_def["bundles"] == ["bundle/dev-env"]
 
 
+def test_scaffold_no_branch_defaults_to_main(planctl_git_repo):
+    """A scaffold with no epic `branch:` mints branch_name == "main"."""
+    yaml = f"""\
+epic:
+  title: no branch given
+  spec: |
+    ## Overview
+    yes.
+tasks:
+  - title: only task
+    deps: []
+    tier: medium
+    spec: |
+{_indent(_VALID_TASK_SPEC, 6)}
+"""
+    yaml_path = _write_yaml(planctl_git_repo, yaml)
+    r = _invoke(["scaffold", "--file", yaml_path])
+    assert r.exit_code == 0, r.output
+
+    epic_id = _parse_envelope(r.output)["epic_id"]
+    epic_def = json.loads(
+        (planctl_git_repo / ".planctl" / "epics" / f"{epic_id}.json").read_text()
+    )
+    assert epic_def["branch_name"] == "main"
+
+
 # ---------------------------------------------------------------------------
 # Scaffold never carries a no-substrate advisory: an empty-shell epic+tasks
 # (no snippet/bundle metadata anywhere) emits a clean success envelope with no

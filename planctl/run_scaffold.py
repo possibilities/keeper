@@ -898,7 +898,7 @@ def run(args: SimpleNamespace) -> int:  # noqa: PLR0911, PLR0912, PLR0915 — si
         epic_id = (
             f"fn-{epic_num}-{slug}" if slug else f"fn-{epic_num}-{generate_suffix()}"
         )
-        branch_name = epic_branch or epic_id
+        branch_name = epic_branch or "main"
 
         # Global-name uniqueness check across all discovered projects.
         foreign_owner = _check_global_name_unique(epic_id, ctx.project_path)

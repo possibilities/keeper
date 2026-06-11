@@ -86,8 +86,7 @@ def normalize_epic(data: dict) -> dict:
     # Snippet-substrate metadata. Additive list fields, no SCHEMA_VERSION bump
     # (matches the additive list defaults — e.g. depends_on_epics,
     # touched_repos). Order matters in the lists (first-occurrence preservation
-    # per the runtime-substrate design); promptctl render-spec handles dedup at
-    # union time.
+    # per the runtime-substrate design); lists are persisted verbatim.
     if "snippets" not in data:
         data["snippets"] = []
     if "bundles" not in data:
@@ -145,7 +144,7 @@ def normalize_task(data: dict) -> dict:
     # Snippet-substrate metadata. Additive list fields, no
     # SCHEMA_VERSION bump (mirrors normalize_epic above). Order matters
     # in the lists (first-occurrence preservation per the runtime-substrate
-    # design); promptctl render-spec handles dedup at union time.
+    # design); lists are persisted verbatim.
     if "snippets" not in data:
         data["snippets"] = []
     if "bundles" not in data:
