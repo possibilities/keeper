@@ -87,5 +87,5 @@ paths are slow-tier.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Mirrored the git-worker fn-771 re-arm into plan-worker: keyed main-tree subscriptions by configured root, per-root heartbeat attribution flags exactly the implicated root(s) (healthy roots never re-armed), and a bounded sequential drain replaces each mute stream (unsubscribe then subscribe with identical options) under the db-poll single-flight. PlanScanner change-gate survives so no phantom re-folds; generation-guarded callbacks, stat-before-resubscribe, non-fatal failure, and a one-heartbeat flap guard. Pure decidePlanResubscribe/attributePlanctlDirToRoot helpers unit-tested. Committed via plain git (escape hatch) since commit-work's project-wide biome check trips on pre-existing lint debt in cli/await.ts, cli/jobs.ts, test/subagent-invocations.test.ts (all unchanged by this task); my files are lint-clean. test:full green (3008 pass).
 ## Evidence
