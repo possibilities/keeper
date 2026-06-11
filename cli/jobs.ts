@@ -101,89 +101,33 @@ const HELP = `keeper jobs — live jobs list over the keeper subscribe server
 
 Usage: keeper jobs [--sock <path>] [--snapshot | --watch] [--timeout <s>]
 
-  --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
-  --snapshot       Force one-shot snapshot mode (print one frame + a
-                   machine-parseable keeper-meta: line, then exit) even on a TTY
+Flags:
+  --sock <path>    Socket path override (\$KEEPER_SOCK / default otherwise)
+  --snapshot       Force one-shot snapshot mode (one frame + keeper-meta: line)
   --watch          Force the live subscribe stream even when piped
   --timeout <s>    Snapshot wait before the timeout escape (default ~2s)
   --help           Show this help
 
-By default, stdout that is NOT a TTY (piped into an agent) auto-detects
-snapshot mode; a TTY gets the live TUI. \`CI\` / \`TERM=dumb\` force snapshot.
+A non-TTY stdout (piped into an agent) auto-detects snapshot; a TTY gets the
+live TUI. \`CI\` / \`TERM=dumb\` force snapshot.
 
-Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
-  ←/h/k prev frame, →/l/j next, g oldest, G/End/Esc return to live,
-  c copy current frame + sidecar paths to clipboard,
-  r replay one oldest waiting dead-letter (recovers a dropped hook event),
-  i enter insert mode, q/Ctrl-C quit.
-  Insert mode (job-local navigation): the whole UI indents two spaces,
-  EVERY job row gains a disclosure triangle, and the selected row is shown
-  by a full-width background highlight. j/k or ↓/↑ move the selection;
-  space expands / collapses the selected job's collapse-controlled lines
-  (backend-coords pill + any sub-agent lines); v focuses the selected
-  job's zellij pane (no-op on a job with no captured backend coords);
-  Esc leaves insert mode.
-  While in insert mode every other (global) key is inert — only Ctrl-C
-  still quits.
-  Per-frame sidecars are indexed; lifecycle + warn output is appended
-  to /tmp/keeper-jobs.<pid>.lifecycle.txt. Session paths print on exit.
+TUI keys (TTY only):
+  ←/h/k prev frame · →/l/j next · g oldest · G/End/Esc return to live
+  c copy frame + sidecar paths · r replay oldest waiting dead-letter
+  i insert mode · q/Ctrl-C quit
+  Insert mode (job-local nav): j/k or ↓/↑ select · space expand/collapse the
+  row's pane + sub-agent lines · v focus the job's zellij pane · Esc leaves.
+  Other keys are inert in insert mode (Ctrl-C still quits).
 
-Renders one row per live job, grouped into sections by
-backend_exec_session_id (zellij session), each introduced by an
-autopilot-style heading:
+Rows are grouped into \`--- <session> ---\` sections by backend_exec_session_id
+(null-session jobs under \`--- (no session) ---\`), one row per live job. A
+persistent [dead-letter:N] banner shows recoverable dropped hook events.
+Examples:
+  keeper jobs --snapshot       one frame, then exit (agent-friendly)
+  keeper jobs | tail -1        just the latest snapshot line
 
-  --- <session-a> ---
-  {jobs whose backend_exec_session_id == session-a}
-  --- <session-b> ---
-  {jobs whose backend_exec_session_id == session-b}
-  --- (no session) ---
-  {jobs with null backend_exec_session_id}
-
-Sessions render in first-seen wire order.
-
-Row shape:
-
-  ({basename(cwd)}) {title} [{role}]? [{state}]?{[failed:<kind>]}?
-    [awaiting:<kind>]?                     (always-visible continuation line)
-    [{tab} p{pane}]?                       (collapse-controlled, when expanded)
-    [{kind}] {command|description|id}      (per live monitor, v51)
-    {subagent_type}({annotations})?: {description} [{status}]?  (per sub-agent)
-
-Pills SHOW DEFAULTS and carry icons (fn-713 follow-on; reverses the earlier
-fn-708 omit-default). The [state] pill always renders — stopped (a session at
-rest) included, alongside working / ended / killed. A sub-agent line always
-renders its [status] pill, ok included. Each themed pill carries a Nerd Font
-glyph inside the brackets ahead of a '::' delimiter — [<icon>::<text>] (e.g.
-[<icon>::stopped], [<icon>::worker]); the backend-coords pill [p<pane>] stays
-plain. The icon set is the 'fa-classic' theme in src/icon-theme.ts.
-[failed:<kind>] stays inline and appears only on a real failure.
-
-The optional [awaiting:<kind>] pill drops to its own indented
-continuation line beneath the row so a long-running interactive stop
-reads without wrapping. Nested sub-agent lines collapse same-name
-invocations within one job to a single line representing the most-recent
-(max turn_seq) row; (×N) and 'N stuck' annotations surface the folded
-count and any non-surviving 'running' rows. Sub-agent lines are
-COLLAPSE-BY-DEFAULT — hidden until their job is expanded (space, in
-insert mode).
-
-A persistent [dead-letter:N] warn pill stamps in the banner whenever the
-daemon's dead_letters collection has waiting rows (events the hook
-tried to write and couldn't insert; recoverable via 'r'). The pill
-drops cleanly at N=0.
-
-The first frame waits until ALL FIVE readiness collections have landed
-their first result (the shared subscribeReadiness gate; jobs view
-ignores epics/git/readiness but the gate is non-negotiable for the
-shared helper). An empty section renders as NOTHING — neither its
-heading nor a placeholder — when its partition is empty. A new
-frame prints only when the rendered body changes; the dead-letter
-banner re-stamps on every snapshot regardless of body stability.
-
-Sidecars: three indexed files per emitted frame
-(/tmp/keeper-jobs.<pid>.state.<n>.json, .frame.<n>.txt, .diff.<n>.txt)
-plus a session meta file at /tmp/keeper-jobs.<pid>.meta.txt accumulating
-the index. Session paths print on exit.
+Render shape, pills, sidecars, and the readiness gate are documented in the
+cli/jobs.ts module header.
 `;
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));

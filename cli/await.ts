@@ -85,83 +85,40 @@ export const HELP = `keeper await — block until a planctl/git/job condition ho
 Usage:
   keeper await <condition> [<id>] [and <condition> [<id>]]... [flags]
 
-Conditions:
-  complete <id>   Task: worker_phase=done AND approval=approved.
-                  Epic:  epic has popped off the board's default-visible
-                         scope (approval=approved AND status=closed); a
-                         scope-exempt re-query disambiguates that from a
-                         hard delete.
-  unblocked <id>  Row is workable RIGHT NOW. Concurrency mutexes
-                  (single-task-per-epic, single-task-per-root) are
-                  carved OUT — they count as "workable". Every other
-                  blocker (deps, approval, validation, git, dangling
-                  -dep, rejection) still blocks.
-  git-clean       The cwd's git root has dirty_count=0 AND orphaned_count=0
-                  (no git_status row for the root counts as clean). Takes
-                  no id.
-  agents-idle     No OTHER session (job_id != CLAUDE_CODE_SESSION_ID) with
-                  state=working has a cwd inside the cwd's git root. Takes
-                  no id.
-  server-up       Block until keeperd is reachable and serving, then fire
-                  met on the first snapshot. Reconnects FOREVER (permanently
-                  give-up-exempt) so it survives a daemon bounce — the escape
-                  hatch for a slow cold boot. Takes no id, has no planctl
-                  pre-check, CANNOT be ANDed with another condition, and
-                  CANNOT be combined with --connect-timeout.
+Conditions (one per segment; join with the literal 'and' to wait for ALL):
+  complete <id>      task done+approved, or epic popped off the board
+  unblocked <id>     row is workable now (concurrency mutexes don't block)
+  git-clean          cwd's git root has no dirty/orphaned files (no id)
+  agents-idle        no OTHER working session inside the git root (no id)
+  server-up          keeperd is serving; fires on first snapshot. Reconnects
+                     forever; can't be ANDed or use --connect-timeout (no id)
   monitor-running <selector>
-                  Block until the matching background monitor in YOUR OWN
-                  session (job_id == CLAUDE_CODE_SESSION_ID) is no longer
-                  running. Selector forms (exact match, never substring):
-                    cmd:<command>   the FULL command/script string
-                    kind:<kind>     monitor | bash-bg | ambient
-                    <bare token>    shorthand for cmd:<token>
-                  Refuses at arm time (reason=no-match exit 1) if nothing in
-                  your session matches — arm it in a turn AFTER a Stop has
-                  snapshotted the monitor, not the same turn you launch it.
-
-Multiple conditions joined by the literal 'and' token block until ALL hold
-simultaneously (level-triggered, glitch-free). A planctl sub-condition going
-not-found / deleted / stuck short-circuits the whole wait with that reason.
+                     a background monitor in YOUR session is still running.
+                     Selector (exact match): cmd:<command>, kind:<monitor|
+                     bash-bg|ambient>, or a bare token (= cmd:<token>).
 
 Flags:
-  --timeout <dur>        Own condition deadline (e.g. 30s, 5m). Default:
-                         none. Emits failed reason=timeout exit 3. Use
-                         BELOW Monitor's kill timeout if combined.
-  --connect-timeout <dur>
-                         Bounded reach-the-server deadline (e.g. 30s).
-                         Default: none = reconnect forever. When set and
-                         > 0, an unpainted wait past the window fires
-                         failed reason=unreachable exit 1 (never-connected
-                         OR was-connected-then-lost). Set it <= --timeout;
-                         first to fire wins. Rejected with server-up.
-  --fail-on-stuck        Treat "stuck" verdicts (job-rejected,
-                         dep-on-epic-dangling) as terminal exit 5.
-                         Default: keep waiting.
-  --no-armed-line        Suppress the initial armed line. The terminal
-                         line still fires.
-  --require-transition   Default off. When set, a condition already
-                         true at arm time does NOT fire met; we wait
-                         for a real edge.
-  --json                 Emit armed / terminal lines as JSON objects
-                         instead of [keeper-await] key=value lines.
-  --sock <path>          Socket override ($KEEPER_SOCK / default).
-  --help                 Show this help.
-
-Reasons (failed lines):
-  not-found  planctl id absent at startup
-  no-match   monitor-running selector matched nothing
-  no-git-root  cwd isn't inside a git worktree
-  connect    a terminal (unrecoverable) query-shape error from keeperd
-  unreachable  keeperd stayed unreachable past --connect-timeout (only with
-               --connect-timeout; a plain await reconnects forever); wait
-               with 'keeper await server-up' then re-arm this command
-  deleted    planctl target was on board then vanished
-  timeout    --timeout / Monitor wall-clock deadline hit
-  stuck      job-rejected / dep-dangling (only under --fail-on-stuck)
+  --timeout <dur>        Own deadline (e.g. 30s, 5m) → reason=timeout exit 3
+  --connect-timeout <dur>  Bounded reach-server deadline → reason=unreachable
+                         exit 1. Default off = reconnect forever
+  --fail-on-stuck        Treat stuck verdicts as terminal exit 5 (else wait)
+  --no-armed-line        Suppress the initial armed line
+  --require-transition   A condition true at arm time waits for a real edge
+  --json                 Emit armed/terminal lines as JSON
+  --sock <path>          Socket override (\$KEEPER_SOCK / default)
+  --help                 Show this help
 
 Exit codes:
-  0 met   1 not-found/no-match/usage/connect/unreachable (unreachable only
-  with --connect-timeout)   3 timeout   4 deleted   5 stuck
+  0 met
+  1 not-found / no-match / no-git-root / usage / connect / unreachable
+  3 timeout    4 deleted    5 stuck (only under --fail-on-stuck)
+
+Examples:
+  keeper await complete fn-12-add-oauth.3
+  keeper await git-clean and agents-idle
+
+Reason glossary, reconnect/give-up semantics, and the agent workflow live in
+skills/await/SKILL.md.
 `;
 
 // ---------------------------------------------------------------------------
