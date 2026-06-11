@@ -91,5 +91,5 @@ BuildSnapshot rows; stop buildbot, confirm zero events and no crash.
 - [ ] bun run test:full green
 
 ## Done summary
-
+Added builds-worker.ts (keeper's first outbound-HTTP producer: setTimeout-after-completion poll loop against buildbot's REST API, per-fetch abort deadline + AbortSignal.any shutdown, name-keyed change-gate with state_string excluded, enumeration-gated tombstones, all transient errors contained inside the loop). Wired buildbot_url config key + resolveBuildbotUrl in db.ts and the conditional builds-worker spawn + BuildSnapshot/BuildDeleted minting in daemon.ts.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Builds worker and daemon wiring",
-  "updated_at": "2026-06-10T22:25:58.511839Z"
+  "updated_at": "2026-06-11T04:35:17.172809Z",
+  "worker_done_at": "2026-06-11T04:35:17.172809Z"
 }
