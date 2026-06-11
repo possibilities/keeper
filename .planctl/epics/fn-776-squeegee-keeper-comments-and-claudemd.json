@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-776-squeegee-keeper-comments-and-claudemd",
   "bundles": [],
+  "closer_done_at": "2026-06-11T02:18:22.429653Z",
   "created_at": "2026-06-10T19:56:30.555598Z",
   "depends_on_epics": [
     "fn-21-close-doc-comment-bloat-valve",
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Squeegee keeper comments and CLAUDE.md",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T19:56:30.555598Z"
+  "updated_at": "2026-06-11T02:18:22.429653Z"
 }
