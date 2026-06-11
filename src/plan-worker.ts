@@ -1,90 +1,59 @@
 /**
- * Plan worker. keeperd's FOURTH Bun Worker thread (after wake + server +
- * transcript), and its SECOND event *producer*: it watches each configured
- * project root for `.planctl/{epics,tasks}/*.json` files, reads + parses the
- * current file on each change, and posts typed snapshot messages
- * (`{kind:"plan-epic", …}` / `{kind:"plan-task", …}`) to the parent. The parent
- * (and only the parent) turns those messages into synthetic `EpicSnapshot` /
- * `TaskSnapshot` `events` rows, which the reducer folds into the `epics` /
- * `tasks` projections. The worker never writes the DB — it opens a READ-ONLY
- * connection (for the restart-seed) and only posts messages, keeping main the
- * sole writer.
+ * Plan worker — a Bun Worker thread and event *producer*: it watches each
+ * configured project root for `.planctl/{epics,tasks}/*.json` files, parses the
+ * current file on each change, and posts typed snapshot messages to the parent.
+ * Main (and only main) turns those into synthetic `EpicSnapshot` / `TaskSnapshot`
+ * events rows. The worker never writes the DB — a READ-ONLY connection (for the
+ * restart-seed) and posted messages only, keeping main the sole writer.
  *
- * This is the second instance of the producer-worker archetype (the first is
- * `src/transcript-worker.ts`); it clones that contract verbatim:
- * - `isMainThread`-guarded body — a plain `import` from a test is inert; the
- *   pure `PlanScanner` core is exported and drivable with no Worker or watcher.
- * - Own read-only `openDb(path, { readonly: true })` (handles are thread-affine
- *   and not structured-cloneable; the parent hands us only path strings via
- *   `workerData`).
- * - Typed message protocol: `{ kind: ... }` worker→main, `{ type: "shutdown" }`
- *   main→worker. Exit `0` clean / `1` crash. NO in-process self-heal — only a
- *   genuine unrecoverable failure exits non-zero.
- * - Subsystem-style teardown: each `@parcel/watcher` subscription is an external
- *   resource the worker owns and `unsubscribe()`s in its shutdown handler. The
- *   worker holds ONE subscription per root (an array), released all at once.
+ * Producer-worker archetype (cloned from `transcript-worker.ts`):
+ * - `isMainThread`-guarded body — a plain `import` is inert; the pure
+ *   `PlanScanner` core is exported and drivable with no Worker or watcher.
+ * - Own read-only `openDb(path, { readonly: true })`.
+ * - Typed protocol: `{ kind }` worker→main, `{ type: "shutdown" }` main→worker.
+ *   Exit `0` clean / `1` crash. NO in-process self-heal.
+ * - Each `@parcel/watcher` subscription is an external resource the worker owns
+ *   and `unsubscribe()`s in its shutdown handler.
  *
- * Why a native file watcher here when keeper's DO-NOT bans `fs.watch`/FSEvents
- * for its OWN SQLite DB: same carve-out as the transcript worker. The `.planctl`
- * trees are EXTERNAL files written by other processes (planctl), so the
- * same-process-write blind spot does not apply — the file watcher observes the
- * FOREIGN tree, not keeper's DB. Every watch event is treated as "something
- * changed, go look" — never as the data: each notification triggers an `fstat` +
- * size-bounded re-read + safe-parse from the current file (routed on
- * path+existence, not `event.type`, since planctl writes via atomic
- * `os.replace`, so an update may surface as create/rename). SEPARATELY (fn-705),
- * the worker ALSO runs a fast `PRAGMA data_version` poll — but that poll is on
- * keeper's OWN read-only connection, the SANCTIONED DB-change primitive (the
- * same one `wake-worker.ts` / `git-worker.ts` use), NOT the foreign tree. A DB
- * bump is purely a TRIGGER ("a fold landed; re-check") — the snapshot data still
- * comes only from a parsed `.planctl` file.
+ * The native file watcher is allowed here despite the ban on watching keeper's
+ * OWN DB: the `.planctl` trees are EXTERNAL files written by planctl, so the
+ * same-process-write blind spot does not apply. Every watch event is "go look",
+ * never the data: each fires an `fstat` + size-bounded re-read + safe-parse,
+ * routed on path+existence (planctl writes via atomic `os.replace`, so an update
+ * may surface as create/rename). The fast `PRAGMA data_version` poll runs on
+ * keeper's OWN read-only connection (the sanctioned DB-change primitive), purely
+ * as a TRIGGER — the snapshot data still comes only from a parsed `.planctl` file.
  *
- * Watching strategy (the keystone risk this task isolates): ONE recursive
- * `@parcel/watcher` subscribe per root, with aggressive POSITIVE ignore globs
- * (`node_modules`, `.git`, `dist`, … — see {@link IGNORE_GLOBS}) so a git/npm
- * storm under a broad root like `~/code` does not flood the callback. We do NOT
- * use the transcript worker's negation glob (the `!(jsonl)` exclude style) —
- * parcel breaks on negated patterns (parcel-bundler/watcher #174). The filter to
- * `.planctl/{epics,tasks}/*.json` is an IN-CALLBACK check, not a glob.
+ * Watching strategy: ONE recursive `@parcel/watcher` subscribe per root with
+ * POSITIVE ignore globs (see {@link IGNORE_GLOBS}) so a git/npm storm doesn't
+ * flood the callback. NOT a negation glob — parcel breaks on negated patterns
+ * (parcel-bundler/watcher #174). The `.planctl/{epics,tasks}/*.json` filter is
+ * an in-callback check.
  *
- * Internal guards (skip-and-log, never escalate): a missing root is tolerated
- * (skipped, the other roots keep watching), per-file read errors, oversize
- * files, and torn/malformed JSON all log to stderr and continue without
- * emitting. Only an unrecoverable failure (the `subscribe` call itself
- * rejecting, the addon failing to load) exits non-zero → daemon `fatalExit` →
- * launchd restart.
+ * Internal guards (skip-and-log, never escalate): a missing root, per-file read
+ * errors, oversize files, and torn/malformed JSON all log and continue without
+ * emitting. Only an unrecoverable failure (the `subscribe` rejecting, the addon
+ * failing to load) exits non-zero → daemon `fatalExit` → launchd restart.
  *
- * Boot reconciliation: a file deleted while the daemon was DOWN never fires a
- * live `onDelete`, so it would leave a permanent projection ghost. After every
- * root's boot scan has run (the {@link PlanScanner.markSeen} on-disk census is
- * complete), {@link PlanScanner.sweep} retracts any projection id with no
- * backing file — scoped strictly to configured roots (via the epic's
- * `project_dir`) and run AFTER snapshot emission so a moved/rewritten file is
- * re-emitted, not spuriously retracted. Each retraction rides the SAME task-2
- * tombstone path (`plan-epic-deleted` / `plan-task-deleted`) as a live delete —
- * no new event types.
+ * Boot reconciliation: a file deleted while the daemon was DOWN fires no live
+ * `onDelete`, leaving a projection ghost. After every root's boot scan,
+ * {@link PlanScanner.sweep} retracts any projection id with no backing file —
+ * scoped to configured roots, run AFTER emission so a moved/rewritten file is
+ * re-emitted, not retracted. Each retraction rides the SAME tombstone path as a
+ * live delete.
  *
- * Multi-layer ingest (epic fn-681 + fn-705): the authoritative path is the
- * commit-trigger (`planctl-commit-changed` from git-worker → re-ingest the
- * committed bytes, drop-proof and free of the mid-write partial-read race);
- * the fast `PRAGMA data_version` poll ({@link PLAN_DB_POLL_MS} cadence, fn-705)
- * — every keeper DB write (including the close→approve `Commit` fold that makes
- * a planctl file "ready") drives a gated {@link PlanScanner.recheckPending}
- * drain PLUS a change-gated {@link reconcilePlanctlDirs} re-scan, collapsing
- * close→emit to ~50ms for any repo keeper already watches; the periodic
- * reconcile heartbeat ({@link reconcilePlanctlDirs} on the
- * {@link RECONCILE_HEARTBEAT_MS} cadence — the should-never-fire paranoia
- * backstop for the brand-new-repo case the poll can't reach because no DB write
- * accompanies a first-ever scaffold) and the broad `@parcel/watcher` recursive
- * subscription (the best-effort sub-second live path, the only path for
- * uncommitted working-tree edits but the one exposed to FSEvents drops). The
- * drop-recovery `RescanScheduler` callback is `.planctl`-scoped via
- * {@link reconcilePlanctlDirs} so a drop on a broad root recovers in
- * O(#projects), not O(`~/code` tree). All layers are ADDITIVE re-ingest,
- * idempotent via the change-gate; deletions stay owned by the commit path +
- * boot sweep + live `onDelete`. The poll is a TRIGGER ONLY — it never writes
- * the DB nor bypasses the fn-629 in-HEAD gate (recheck + reconcile both stay
- * gated), preserving re-fold determinism and the fn-627 dup-dispatch guard.
+ * Multi-layer ingest: the authoritative path is the commit-trigger
+ * (`planctl-commit-changed` → re-ingest the committed bytes, drop-proof and free
+ * of the mid-write partial-read race); the fast `data_version` poll drives a
+ * gated {@link PlanScanner.recheckPending} drain plus a change-gated
+ * {@link reconcilePlanctlDirs} re-scan, collapsing close→emit for any repo
+ * keeper already watches; the periodic reconcile heartbeat is the paranoia
+ * backstop for the brand-new-repo case no DB write accompanies; and the broad
+ * `@parcel/watcher` subscription is the best-effort live path, the only one for
+ * uncommitted edits but exposed to FSEvents drops. All layers are ADDITIVE
+ * re-ingest, idempotent via the change-gate. The poll is a TRIGGER ONLY — it
+ * never writes the DB nor bypasses the in-HEAD gate, preserving re-fold
+ * determinism and the dup-dispatch guard.
  */
 
 import type { Database } from "bun:sqlite";
@@ -120,26 +89,20 @@ export interface PlanWorkerData {
    */
   roots: string[];
   /**
-   * Fast `data_version` poll cadence in ms (fn-705). Defaults to
+   * Fast `data_version` poll cadence in ms. Defaults to
    * {@link PLAN_DB_POLL_MS} when omitted; tests pass a small value to assert
    * realtime emission without a heartbeat-length wait. The live daemon leaves
    * it unset (the production cadence is the constant).
    */
   pollMs?: number;
   /**
-   * fn-747 watcher seam. When `true`, the worker NEVER `import()`s
-   * `@parcel/watcher` — it skips the live FSEvents subscribe + the reflog watches
-   * and instead runs a POLLING degrade: the boot scan per root (so the
-   * projection seeds + the ghost sweep fires) plus the fast `data_version` poll
-   * and the periodic `reconcilePlanctlDirs` heartbeat (both armed BEFORE the
-   * watcher block, so they carry the live `.planctl` fold pipeline at poll/
-   * heartbeat cadence instead of FSEvents cadence). The in-process daemon
-   * harness sets this so the parallel slow-test tier never dlopens the NAPI addon
-   * in a worker thread. `reflogWatcherModule` stays null and
-   * `reconcileReflogWatches` is already null-guarded, so the reflog fast path is
-   * simply absent (covered by the heartbeat). This is a real resilience path, not
-   * just test scaffolding — it is the degrade keeper would take if the addon ever
-   * failed to load.
+   * When `true`, the worker NEVER `import()`s `@parcel/watcher` — it skips the
+   * live FSEvents subscribe + the reflog watches and runs a POLLING degrade: the
+   * boot scan per root plus the fast `data_version` poll and the periodic
+   * `reconcilePlanctlDirs` heartbeat carry the live fold pipeline at poll/
+   * heartbeat cadence. The in-process daemon harness sets this so the slow-test
+   * tier never dlopens the NAPI addon. A real resilience path — the degrade
+   * keeper would take if the addon ever failed to load.
    */
   disableNativeWatcher?: boolean;
 }
@@ -180,20 +143,15 @@ export interface PlanTaskMessage {
   /** The task's `target_repo` — stored opaque, never used to drive FS reads. */
   targetRepo: string | null;
   /**
-   * Planctl-native effort tier (fn-602): the top-level `tier` field on the
-   * task-def file (planctl's `medium | high | xhigh | max` vocabulary).
-   * Stored opaque — keeper never branches on the value, so a future tier
-   * widening rides through with no code change. Null on absent/legacy files;
-   * a pre-fn-602 `TaskSnapshot` event blob lacks this field and folds to
-   * `null` deterministically (same graceful-degradation precedent as
-   * `worker_phase`/`runtime_status`).
+   * Planctl-native effort tier — the top-level `tier` field on the task-def file.
+   * Stored opaque — keeper never branches on the value, so a tier widening rides
+   * through with no code change. Null on absent/legacy files (folds to `null`
+   * deterministically).
    */
   tier: string | null;
   /**
    * Derived worker-phase binary: `worker_done_at` present → `"done"`, else
-   * `"open"`. Surfaces the same compressed signal the field used to carry
-   * under the legacy `status` name (renamed in schema v19 to make room for
-   * the planctl-native `runtime_status` enum below).
+   * `"open"`. Kept distinct from the planctl-native `runtime_status` enum below.
    */
   workerPhase: string;
   /**
@@ -242,22 +200,15 @@ export type PlanMessage =
   | PlanTaskDeletedMessage;
 
 /**
- * fn-705 discovery nudge. Posted by the plan-worker when it first observes a
- * `.planctl` tree in a repo, so main can hand the repo root to the git-worker's
- * discovery candidate set IMMEDIATELY (the git-worker's `.planctl`
- * short-circuit in `shouldWatchRoot` then subscribes it) instead of waiting for
- * the next full discovery sweep. Closes the attribution/GitSnapshot blind spot
- * for a repo keeper has never seen a session in: the git-worker discovers repos
- * from `jobs.cwd` seen-cwds, so a brand-new repo's `.git` is otherwise
- * unwatched until a session runs there.
+ * Discovery nudge. Posted by the plan-worker when it first observes a `.planctl`
+ * tree in a repo, so main hands the repo root to the git-worker's discovery
+ * candidate set IMMEDIATELY instead of waiting for the next full sweep. Closes
+ * the attribution blind spot for a repo keeper has never seen a session in.
  *
  * NOT a synthetic event and NOT routed through the scanner's `onSnapshot` (it
- * drives a producer worker, not a projection — re-fold determinism preserved).
- * Main forwards it to the git-worker verbatim as an
- * {@link AddDiscoveryRootMessage}; the forward tolerates a null git-worker ref
- * during the boot window (a dropped nudge is recovered by the next full
- * discovery sweep + the heartbeat floor). The worker de-dupes per root so a
- * busy `.planctl` tree posts one nudge per root, not one per file event.
+ * drives a producer worker, not a projection). Main forwards it to the
+ * git-worker verbatim; the forward tolerates a null git-worker ref during the
+ * boot window. The worker de-dupes per root.
  */
 export interface PlanDiscoveryNudgeMessage {
   kind: "nudge-discovery";
@@ -266,11 +217,9 @@ export interface PlanDiscoveryNudgeMessage {
 }
 
 /**
- * Every shape the plan-worker posts to main (snapshots + the fn-705 nudge +
- * the fn-720 backstop-telemetry channel). The `{kind:"backstop"}` record is
- * routed to main as the sole sidecar writer; the worker does not yet EMIT one
- * (that wiring — counters + `last_fast_path_at` stamping — lands in tasks
- * `.2`/`.3`), but main handles it from this union today.
+ * Every shape the plan-worker posts to main (snapshots + the discovery nudge +
+ * the backstop-telemetry channel). The `{kind:"backstop"}` record is routed to
+ * main as the sole sidecar writer.
  */
 export type PlanWorkerOutbound =
   | PlanMessage
@@ -283,48 +232,36 @@ export interface ShutdownMessage {
 }
 
 /**
- * Message the parent sends to drain the observation gate's pending set
- * (fn-629). Posted on every `GitSnapshot` events row main writes — that is
- * the "HEAD may have moved" cross-worker signal a plan-worker can't observe
- * on its own (a `git commit` does not change the file's content so the
- * `.planctl/*.json` FSEvent will not re-fire). The worker calls
- * {@link PlanScanner.recheckPending} on receipt; a freshly-committed epic
- * drains and emits its snapshot.
+ * Message the parent sends to drain the observation gate's pending set. Posted on
+ * every `GitSnapshot` events row main writes — the "HEAD may have moved"
+ * cross-worker signal a plan-worker can't observe on its own (a `git commit`
+ * leaves the file content unchanged, so the FSEvent won't re-fire). The worker
+ * calls {@link PlanScanner.recheckPending}; a freshly-committed epic drains and
+ * emits its snapshot.
  */
 export interface RecheckPendingMessage {
   type: "recheck-pending";
   /**
-   * Optional repo-root scope (fn-712). When set, the handler drains ONLY the
-   * pending paths whose {@link repoRootFromPlanctlPath} equals `repo` — main
-   * stamps it with the originating `GitSnapshot`/`Commit`'s `project_dir`, the
-   * single repo whose HEAD may have moved. Absent (the boot/heartbeat callers
-   * have none) → global drain over every {@link PlanScanner.pendingRepos}.
-   * Either way the drain probes each repo with ONE batched `git cat-file`
-   * instead of a per-path spawn, so a cross-repo pending set no longer starves
-   * the single-threaded message loop (the ~74s emission-lag fix).
+   * Optional repo-root scope. When set, drain ONLY the pending paths in `repo`
+   * (main stamps it with the originating snapshot's `project_dir`). Absent →
+   * global drain over every {@link PlanScanner.pendingRepos}. Either way the
+   * drain probes each repo with ONE batched `git cat-file` instead of a per-path
+   * spawn, so a cross-repo pending set no longer starves the message loop.
    */
   repo?: string;
 }
 
 /**
- * Edge-triggered fast-path kick (fn-701 task .2). Main posts this to drain the
- * observation gate's pending set out-of-band of a git pulse: a plan file left
- * dirty/uncommitted by a write would otherwise wait on the 60s heartbeat to be
- * re-probed. The handler runs the SAME GATED
- * {@link PlanScanner.recheckPending} the `recheck-pending` branch does — NOT a
- * bypass: an uncommitted file re-runs the fn-629 in-HEAD probe and stays in
- * pending, so it does NOT emit (re-opening the fn-627 duplicate-dispatch
- * incident is the regression this gate prevents). (fn-756: the original
- * `set_*_approval` RPC trigger is gone with the approval surface; the kick
- * shape stays for the generic post sites below.)
+ * Edge-triggered fast-path kick. Main posts this to drain the observation gate's
+ * pending set out-of-band of a git pulse, so a dirty plan file doesn't wait on
+ * the heartbeat. The handler runs the SAME GATED {@link PlanScanner.recheckPending}
+ * — NOT a bypass: an uncommitted file re-runs the in-HEAD probe and stays
+ * pending, so it does NOT emit (preventing the duplicate-dispatch regression).
  *
- * The shape is `{type:"kick"}` — byte-identical to the server-worker /
- * tab-namer `KickMessage` so main's existing `satisfies KickMessage` post
- * sites can target the plan-worker without a new wire shape. The fn-705 fast
- * `data_version` poll ({@link PLAN_DB_POLL_MS}) is now the level-triggered
- * lost-wakeup backstop for this kick (the kick is edge-triggered); the
- * lowered {@link RECONCILE_HEARTBEAT_MS} heartbeat is the should-never-fire
- * paranoia floor beneath that.
+ * The shape `{type:"kick"}` is byte-identical to the server-worker `KickMessage`
+ * so main's existing `satisfies KickMessage` post sites can target the
+ * plan-worker. The fast `data_version` poll is the level-triggered lost-wakeup
+ * backstop for this edge-triggered kick; the heartbeat is the paranoia floor.
  */
 export interface KickMessage {
   type: "kick";
@@ -356,7 +293,7 @@ export interface PlanctlCommitChange {
 
 /**
  * Message the parent sends when a commit landed in a keeper-tracked repo
- * carrying changed `.planctl/**` paths (epic fn-681). Authoritative ingest
+ * carrying changed `.planctl/**` paths. Authoritative ingest
  * trigger: the COMMITTED bytes are atomically written, so re-ingest from
  * the worktree is drop-proof and free of the mid-write partial-read race
  * the broader `~/code` FSEvents subscription is exposed to. The git-worker
@@ -398,7 +335,7 @@ const MAX_PLAN_FILE_BYTES = 1024 * 1024;
 
 /**
  * Per-key cooldown (ms) for the loud per-path backstop ALARM prose in
- * {@link PlanScanner.logBackstopEmit} (epic fn-720). A broken fast path makes
+ * {@link PlanScanner.logBackstopEmit}. A broken fast path makes
  * the 5s heartbeat rescue EVERY cycle, which would flood `server.stderr` with
  * the ALARM line; the rate-limiter caps it to ≤1 line per key per this window.
  * The NDJSON record + the in-memory counters are NEVER gated through this — a
@@ -409,7 +346,7 @@ const MAX_PLAN_FILE_BYTES = 1024 * 1024;
 const BACKSTOP_ALARM_COOLDOWN_MS = 60_000;
 
 /**
- * fn-737 per-wake-path attribution window (ms). When a missed-wake backstop
+ * per-wake-path attribution window (ms). When a missed-wake backstop
  * fires, {@link PlanScanner.recentFastPaths} reports which fast-path labels
  * stamped {@link PlanScanner.markFastPath} within this trailing window — the
  * evidence that disambiguates a heartbeat defaulting `fast_path:
@@ -480,9 +417,9 @@ type PlanKind = "epic" | "task" | "task-state" | "epic-state";
  * match the planctl `LocalFileStateStore` shape (see
  * `apps/planctl/planctl/store.py:151`); files there end in `.state.json` so a
  * stray `*.json` (non-state) under `.planctl/state/{tasks,epics}/` rejects.
- * The epic-state sidecar (`fn-732`) still classifies as `"epic-state"` so its
- * path is recognized, but fn-756 removed the only field keeper ingested from
- * it (`approval`) — no change/delete arm acts on an epic-state path anymore.
+ * The epic-state sidecar still classifies as `"epic-state"` so its path is
+ * recognized, but keeper no longer ingests any field from it — no change/delete
+ * arm acts on an epic-state path anymore.
  *
  * Pure — does no I/O. Exported for unit reach.
  */
@@ -518,8 +455,8 @@ export function classifyPlanPath(path: string): PlanKind | null {
       return "task-state";
     }
     // 4-segment tail: `.planctl/state/epics/<id>.state.json`. Same shape rules
-    // as task-state, different leaf dir (fn-732 epic runtime-state sidecar;
-    // fn-756 dropped the `approval` field keeper used to ingest from it).
+    // as task-state, different leaf dir (epic runtime-state sidecar; keeper
+    // ingests no field from it).
     if (segments[n - 2] === "epics") {
       return "epic-state";
     }
@@ -574,7 +511,7 @@ interface RawTask {
   title?: unknown;
   target_repo?: unknown;
   /**
-   * Planctl-native effort tier (fn-602): top-level field on the task-def file,
+   * Planctl-native effort tier: top-level field on the task-def file,
    * read by `planctl resolve-task` from `task_def.get("tier")`. Planctl's own
    * vocabulary is `medium | high | xhigh | max` (planctl `TASK_TIERS`), but
    * keeper stores the field opaque — never branches on the value — so any
@@ -591,8 +528,7 @@ interface RawTask {
  * file (`.planctl/state/tasks/<task_id>.state.json`) is written by planctl
  * `LocalFileStateStore` (`apps/planctl/planctl/store.py:151`) and carries
  * `assignee` / `claim_note` / `claimed_at` / `evidence` / `status` /
- * `updated_at`; keeper ingests only `status`. (fn-756 dropped the `approval`
- * field — keeper no longer reads it from this sidecar.)
+ * `updated_at`; keeper ingests only `status`.
  */
 interface RawTaskState {
   status?: unknown;
@@ -779,9 +715,8 @@ function parseStringArrayColumn(text: string | null): string[] {
  * `epics`/`tasks` projection so a daemon restart full-scan does not re-emit a
  * synthetic event per plan file every boot.
  *
- * Observation gate (fn-629 / epic fn-629-planctl-epic-mutation-atomicity): an
- * optional `isTracked(path) => boolean` predicate fed in at construction
- * suppresses emission for any epic/task file that is NOT yet in git HEAD
+ * Observation gate: an optional `isTracked(path) => boolean` predicate fed in at
+ * construction suppresses emission for any epic/task file that is NOT yet in HEAD
  * (untracked, or staged-but-not-committed). Suppressed paths land in the
  * {@link pending} set. The reducer continues to fold ONLY committed
  * snapshots, so the autopilot cannot dispatch against an uncommitted epic.
@@ -856,7 +791,7 @@ export class PlanScanner {
      * at `path` is in git HEAD (committed); `false` when untracked or
      * staged-but-not-committed. A `false` from {@link onChange} routes the
      * path into {@link pending} instead of emitting a snapshot — the
-     * fn-629 observation gate. Defaults to `() => true` (no gating) so the
+     * Observation gate. Defaults to `() => true` (no gating) so the
      * pure-core unit tests don't need a fake git tree; the live worker
      * passes a `git cat-file -e HEAD:<relpath>` closure.
      *
@@ -867,7 +802,7 @@ export class PlanScanner {
      */
     private readonly isTracked: (path: string) => boolean = () => true,
     /**
-     * Optional BATCHED git-tracked predicate (fn-712). Given a repo `root`
+     * Optional BATCHED git-tracked predicate. Given a repo `root`
      * and the repo-relative paths `rels` of every pending file in that repo,
      * returns a positional `boolean[]` (`result[i]` is "is `rels[i]` in
      * HEAD") in ONE `git cat-file --batch-check` spawn — the per-repo probe
@@ -880,7 +815,7 @@ export class PlanScanner {
      *
      * Fail-closed contract (inherited from {@link isPathInHead}): on any
      * anomaly the predicate returns ALL-`false`, so a parse slip never wrongly
-     * announces a path as in-HEAD (the fn-627 duplicate-dispatch guard). An
+     * announces a path as in-HEAD (the duplicate-dispatch guard). An
      * empty `rels` is a no-op (`[]`, no spawn).
      */
     private readonly isTrackedBatch: (
@@ -891,7 +826,7 @@ export class PlanScanner {
     /**
      * Optional observer fired AFTER any public mutation
      * ({@link onChange} / {@link onDelete} / {@link recheckPending}) that may
-     * have changed the {@link pending} set. The live worker (fn-705) uses it
+     * have changed the {@link pending} set. The live worker uses it
      * to reconcile its per-repo `.git/logs/HEAD` reflog watches against
      * {@link pendingRepos}: a commit in an OTHERWISE-UNWATCHED repo (one
      * keeper has never seen a session in, so the git-worker isn't watching
@@ -911,7 +846,7 @@ export class PlanScanner {
      */
     private readonly onPendingChange: () => void = () => {},
     /**
-     * Epic fn-720 backstop-telemetry sink. Posts a built `{kind:"backstop"}`
+     * backstop-telemetry sink. Posts a built `{kind:"backstop"}`
      * message UP to main (the SOLE sidecar writer) on every heartbeat /
      * FSEvents-drop fire — a rescue record when the change-gated scan actually
      * emitted, a periodic + on-shutdown rollup for the denominator. Defaults to
@@ -930,7 +865,7 @@ export class PlanScanner {
   ) {}
 
   /**
-   * Epic fn-720 backstop-telemetry state. `lastFastPathAt` is stamped at every
+   * backstop-telemetry state. `lastFastPathAt` is stamped at every
    * confirmed fast-path fire ({@link markFastPath} — live FSEvents `onChange`,
    * the `data_version` poll re-scan, the reflog-driven `recheckPending`); the
    * heartbeat / FSEvents-drop backstops read it to compute staleness. `null`
@@ -942,7 +877,7 @@ export class PlanScanner {
    */
   private lastFastPathAt: number | null = null;
   /**
-   * fn-737 per-wake-path attribution: the recent fast-path stamps, each
+   * per-wake-path attribution: the recent fast-path stamps, each
    * `{label, at}`, most-recent LAST (append order). {@link recentFastPaths}
    * filters this to the attribution window when a heartbeat fires, so a
    * missed-wake record can name WHICH fast path(s) recently delivered work —
@@ -964,7 +899,7 @@ export class PlanScanner {
    * on a heartbeat / FSEvents-drop fire (those are the BACKSTOPS that READ this
    * value to compute staleness). Pure in-memory; no I/O.
    *
-   * fn-737: `label` names which fast path stamped (e.g. `fsevents`, `db-poll`,
+   * `label` names which fast path stamped (e.g. `fsevents`, `db-poll`,
    * `reflog`); it's appended to {@link fastPathStamps} (pruned to the
    * attribution window) so a later backstop can attribute the miss. The label
    * defaults to a generic marker so legacy call sites stay valid; the live
@@ -986,7 +921,7 @@ export class PlanScanner {
   }
 
   /**
-   * fn-737: the fast-path labels that stamped within the attribution window
+   * the fast-path labels that stamped within the attribution window
    * ending at `now`, MOST-RECENT FIRST, de-duplicated (a path that fired twice
    * in the window appears once, at its latest position). Drives the
    * `recent_fast_paths` attribution on a missed-wake record. Returns `[]` when
@@ -1024,7 +959,7 @@ export class PlanScanner {
     fastPath: string,
     rescued: boolean,
     /**
-     * fn-737 per-wake-path attribution: whether a `.git/logs/HEAD` reflog watch
+     * Per-wake-path attribution: whether a `.git/logs/HEAD` reflog watch
      * was ARMED at fire time for the repo(s) this backstop covers. The worker
      * passes `present` when at least one currently-pending repo had a live
      * reflog subscription, `absent` when a pending repo had none (the prime-
@@ -1074,10 +1009,10 @@ export class PlanScanner {
   }
 
   /**
-   * The set of repo roots that currently own at least one path in the fn-629
+   * The set of repo roots that currently own at least one path in the
    * observation gate's {@link pending} set, derived via
    * {@link repoRootFromPlanctlPath} (pure path arithmetic). The live worker
-   * (fn-705) reconciles its `.git/logs/HEAD` reflog watches against this set:
+   * reconciles its `.git/logs/HEAD` reflog watches against this set:
    * a repo enters when it gains a first pending path and leaves when its last
    * pending path drains, keeping the watch lifecycle bounded. A path whose
    * repo root can't be derived (shape drift) is silently skipped — it simply
@@ -1097,7 +1032,7 @@ export class PlanScanner {
   /**
    * Add `path` to the observation gate's {@link pending} set and notify the
    * {@link onPendingChange} observer. Single choke point for every gate-fail
-   * stash so the fn-705 reflog-watch reconcile never misses a pending-set
+   * stash so the reflog-watch reconcile never misses a pending-set
    * transition.
    */
   private addPending(path: string): void {
@@ -1189,14 +1124,14 @@ export class PlanScanner {
       return;
     }
 
-    // fn-756: the `epic-state` sidecar arm is gone — epic state files carried
+    // the `epic-state` sidecar arm is gone — epic state files carried
     // ONLY the now-removed `approval` field, so a sidecar change/delete no
     // longer mutates any keeper-folded projection.
 
     const id = this.pathToId.get(path);
     if (id === undefined) {
-      // Never folded this path. If the path was held in the fn-629
-      // observation gate's pending set (uncommitted epic/task whose file
+      // Never folded this path. If the path was held in the observation
+      // gate's pending set (uncommitted epic/task whose file
       // got removed before it ever made HEAD — e.g. a planctl scaffold
       // unwind on commit_failed), drop it: there's nothing to retract
       // since the reducer never saw the entity. Either way, no tombstone.
@@ -1244,7 +1179,7 @@ export class PlanScanner {
    * will replay through the same path.
    *
    * Returns `true` iff a snapshot was emitted (mirrors {@link onChange}'s
-   * contract). The fn-629 def-file gate at `:904` STAYS in force here:
+   * contract). The def-file in-HEAD gate STAYS in force here:
    * task-state sidecars are gitignored and never appear in a commit's file
    * list, so the commit-driven bypass never reaches this method — the gate
    * is correct for every path that does.
@@ -1294,7 +1229,7 @@ export class PlanScanner {
     if (msg === null) {
       return false;
     }
-    // Observation gate (fn-629): same producer-side gate as {@link onChange}.
+    // Observation gate: same producer-side gate as {@link onChange}.
     // The sidecar state file fired this re-emit, but the def file is what
     // we project; if the def file isn't in HEAD yet, stash and wait for
     // the next git-worker pulse to drain it via {@link recheckPending}.
@@ -1324,14 +1259,14 @@ export class PlanScanner {
    * ({@link reconcilePlanctlDirs} via heartbeat / FSEvents-drop rescan) detect
    * that it delivered work a fast path missed and log a trigger-tagged line.
    *
-   * `triggeredByCommit` (default `false`): when `true`, the fn-629 `isTracked`
+   * `triggeredByCommit` (default `false`): when `true`, the `isTracked`
    * observation gate at the epic/task arm is BYPASSED — the
    * `planctl-commit-changed` signal already proves the path is in HEAD (the
    * git-worker enumerated it from a landed commit), so re-running the
    * fail-closed `git cat-file -e HEAD` probe is redundant and (on its 1s
    * timeout fail-closed window) is exactly what silently bounced a
    * just-committed file into {@link pending}, delaying its snapshot until the
-   * 60s heartbeat (fn-701). The live `@parcel/watcher` callback and
+   * 60s heartbeat. The live `@parcel/watcher` callback and
    * {@link recheckPending} pass `false` — those are the genuinely-uncertain
    * paths and stay gated.
    */
@@ -1415,7 +1350,7 @@ export class PlanScanner {
       return this.reemitTaskFromDef(defPath);
     }
 
-    // fn-756: the `epic-state` sidecar arm is gone — epic state files carried
+    // the `epic-state` sidecar arm is gone — epic state files carried
     // ONLY the now-removed `approval` field, so a sidecar change no longer
     // mutates any keeper-folded projection. The `classifyPlanPath` "epic-state"
     // kind still resolves (so the path is recognized, not mis-routed), but no
@@ -1444,7 +1379,7 @@ export class PlanScanner {
       return false;
     }
 
-    // fn-759: the cheap in-memory change-gate runs BEFORE the fn-629 in-HEAD
+    // the cheap in-memory change-gate runs BEFORE the in-HEAD
     // probe. For ~99% of scans (unchanged files re-read by the 5s heartbeat /
     // boot / drop-rescan) `lastEmitted` already holds the identical
     // serialization, so we suppress here and NEVER fork the `git cat-file -e`
@@ -1466,13 +1401,13 @@ export class PlanScanner {
       // `pathToId`. Without this set, a boot-seeded entity whose file is later
       // deleted would leave a permanent projection ghost (no tombstone). We do
       // NOT call deletePending here — fail-closed: an unchanged path cannot
-      // legitimately be pending, because the fn-629 gate means an uncommitted
+      // legitimately be pending, because the gate means an uncommitted
       // path never earned a `lastEmitted` entry to match against.
       this.pathToId.set(path, msg.id);
       return false; // change-gate: unchanged snapshot, suppress.
     }
 
-    // Observation gate (fn-629): for epic/task DEFINITION files, suppress
+    // Observation gate: for epic/task DEFINITION files, suppress
     // emission unless the file is in git HEAD. An uncommitted file goes to
     // {@link pending}; the worker drains the set on the next git-worker
     // snapshot pulse (commit/checkout/branch-switch may have moved HEAD,
@@ -1482,7 +1417,7 @@ export class PlanScanner {
     // above via the `task-state` arm). `isTracked` defaults to
     // `() => true`, so a gateless scanner emits unconditionally.
     //
-    // fn-701: a commit-driven ingest (`triggeredByCommit === true`) BYPASSES
+    // a commit-driven ingest (`triggeredByCommit === true`) BYPASSES
     // the gate entirely — the `planctl-commit-changed` signal already proves
     // the path is in HEAD (the git-worker enumerated it from a landed commit),
     // so re-running the fail-closed probe is redundant and (on its 1s
@@ -1498,7 +1433,7 @@ export class PlanScanner {
     // when the file finally lands in HEAD. A pending path is its own
     // index — see {@link pending} / {@link recheckPending} / {@link onDelete}.
     if (!triggeredByCommit && !this.isTracked(path)) {
-      // Make the silent bounce LOUD (fn-701): a heartbeat-only recovery from
+      // Make the silent bounce LOUD: a heartbeat-only recovery from
       // here is the signature of the fast path failing. This is the gated
       // FSEvents / recheckPending path — the commit path never reaches it.
       this.log(
@@ -1526,7 +1461,7 @@ export class PlanScanner {
    * freshly-committed epic would sit in pending forever (projection-absent,
    * never dispatched).
    *
-   * fn-712 — batched + scoped, the ~74s emission-lag fix. The OLD shape
+   * batched + scoped, the ~74s emission-lag fix. The OLD shape
    * `for (path of pending) onChange(path)` spawned one synchronous
    * `git cat-file` PER pending path across ALL repos on EVERY trigger; a
    * cross-repo pending set of ~1292 abandoned `.planctl` files turned each
@@ -1545,7 +1480,7 @@ export class PlanScanner {
    *   pending WITHOUT an `onChange` call (so it triggers no per-path spawn) —
    *   exactly the storm the old loop caused. The batch fails closed (all
    *   `false`) on any anomaly, so a parse slip leaves a path pending rather
-   *   than wrongly emitting it (the fn-627 dup-dispatch guard).
+   *   than wrongly emitting it (the dup-dispatch guard).
    *
    * `onChange` re-checks the per-path gate as a belt-and-suspenders, so even
    * if a batch+onChange disagreed (they can't on a stable HEAD) the per-path
@@ -1557,12 +1492,12 @@ export class PlanScanner {
     if (this.pending.size === 0) {
       return;
     }
-    // fn-720: a confirmed realtime drain (driven by the reflog watch, the
+    // a confirmed realtime drain (driven by the reflog watch, the
     // GitSnapshot/Commit `recheck-pending` post, or the approval kick) is a
     // FAST path — stamp `last_fast_path_at` so a later heartbeat measures
     // staleness against it. Stamped after the empty-check so a no-op recheck
     // (nothing pending) does NOT pretend a fast path delivered work.
-    // fn-737: label as `recheck-pending` so a later backstop's attribution can
+    // label as `recheck-pending` so a later backstop's attribution can
     // name this path; the reflog watch is the dominant driver of this drain for
     // the no-pending-repo-commit case the epic targets.
     this.markFastPath("recheck-pending");
@@ -1611,22 +1546,22 @@ export class PlanScanner {
 
   /**
    * Log that a TRIGGER-driven reconcile (the 60s heartbeat, an FSEvents-drop
-   * rescan, or the fn-705 `data_version` poll) delivered a snapshot. Routed
+   * rescan, or the `data_version` poll) delivered a snapshot. Routed
    * through the scanner's own `log` sink (the private field the callers can't
    * reach).
    *
    * Log SEMANTICS branch on whether the trigger is a FAST path or a BACKSTOP:
-   * - `"heartbeat"` is the SHOULD-NEVER-FIRE paranoia floor (fn-705). With the
+   * - `"heartbeat"` is the SHOULD-NEVER-FIRE paranoia floor. With the
    *   `data_version` poll + reflog watch landed, an emit here means EVERY fast
    *   path missed a change — a genuine ALARM that the realtime architecture is
    *   broken (or a `.planctl` file is genuinely abandoned-uncommitted), so it
    *   logs the loudest wording. It must NEVER fire in normal operation.
-   * - `"fswatcher-drop"` is the FSEvents-drop rescan backstop (fn-701) — an
+   * - `"fswatcher-drop"` is the FSEvents-drop rescan backstop — an
    *   emit means the kernel coalesced/dropped a watcher edge the poll/reflog
    *   fast paths then also missed; loud, but expected on a known macOS FSEvents
    *   overrun, not a realtime-architecture failure.
-   * - `"db-poll"` is itself a FAST path (fn-705 — every keeper DB write drives
-   *   it, including the close→approve fold), so an emit here is EXPECTED, not a
+   * - `"db-poll"` is itself a FAST path (every keeper DB write drives it,
+   *   including the close→approve fold), so an emit here is EXPECTED, not a
    *   missed-fast-path alarm. It logs a low-key "did real work" line WITHOUT
    *   the alarm wording so a poll-rescued emit is distinguishable from (and not
    *   confused with) a heartbeat-rescued one. (The `.git/logs/HEAD` reflog
@@ -1653,7 +1588,7 @@ export class PlanScanner {
       // Paranoia floor fired in normal operation: every realtime fast path
       // (data_version poll, reflog watch, FSEvents) missed this change. Loudest
       // wording so a grep on the alarm count surfaces a broken fast path.
-      // fn-720: rate-limit ONLY this stderr line (per backstop key) so a broken
+      // rate-limit ONLY this stderr line (per backstop key) so a broken
       // fast path rescuing every 5s heartbeat can't flood server.stderr — the
       // NDJSON record + counters route through `fireBackstop` and stay complete.
       if (this.alarmAllowed("plan-heartbeat")) {
@@ -1880,7 +1815,7 @@ function stringifyErr(err: unknown): string {
  * `.planctl` (the planctl-managed repo root in keeper's layout) or `null` if
  * `.planctl` isn't found in the ancestry. Pure path arithmetic.
  *
- * fn-629 observation gate: the live worker uses this to derive the repo
+ * observation gate: the live worker uses this to derive the repo
  * root to run `git cat-file -e HEAD:<relpath>` against without a per-path
  * shell-out (`git rev-parse --show-toplevel` per call would be a
  * 100ms-class per-file cost on a `~/code` storm). The planctl tree IS
@@ -1911,7 +1846,7 @@ export function repoRootFromPlanctlPath(path: string): string | null {
 }
 
 /**
- * fn-629 observation gate predicate: is `path` in git HEAD (committed)?
+ * observation gate predicate: is `path` in git HEAD (committed)?
  * Returns `false` for untracked paths AND for staged-but-not-committed
  * paths (the planctl commit-failed window the gate exists to close).
  *
@@ -1956,7 +1891,7 @@ export function isPathInHead(path: string): boolean {
 }
 
 /**
- * fn-712 batched sibling of {@link isPathInHead}: given a repo `root` and the
+ * Batched sibling of {@link isPathInHead}: given a repo `root` and the
  * repo-relative paths `rels`, returns a positional `boolean[]` (`result[i]` is
  * "is `rels[i]` in HEAD") in ONE `git cat-file --batch-check` spawn. The
  * scoped/batched {@link PlanScanner.recheckPending} drain uses it instead of
@@ -1973,7 +1908,7 @@ export function isPathInHead(path: string): boolean {
  * Fail-closed, byte-identical posture to {@link isPathInHead}'s `catch →
  * false`: on a non-zero exit, a timeout, a line-count mismatch, or a spawn
  * throw we return ALL-`false`. A parse slip that wrongly announced a path as
- * in-HEAD would re-open the fn-627 duplicate-dispatch harm, so any anomaly
+ * in-HEAD would re-open the duplicate-dispatch harm, so any anomaly
  * resolves to "not committed; the next pulse retries" rather than a guess.
  *
  * Empty `rels` is a no-op (`[]`, NO spawn) — an empty batch stdin yields a
@@ -2036,7 +1971,7 @@ const GIT_CHECK_TIMEOUT_MS = 1000;
 
 /**
  * Periodic reconcile cadence — the SHOULD-NEVER-FIRE paranoia backstop
- * (fn-705). With T1-T3 landed, three realtime triggers cover every case:
+ *. With T1-T3 landed, three realtime triggers cover every case:
  * the fast {@link PLAN_DB_POLL_MS} `data_version` poll (every keeper DB
  * write — the close→approve fold included — drives a gated rescan in
  * ~50ms), the per-repo `.git/logs/HEAD` reflog watch (a commit always
@@ -2057,7 +1992,7 @@ export const RECONCILE_HEARTBEAT_MS = 5_000;
 
 /**
  * Cadence (ms) at which the worker flushes its in-memory backstop counters as
- * {@link BackstopRollup} records (epic fn-720) — the denominator
+ * {@link BackstopRollup} records — the denominator
  * (fires_total / rescues_total) `scripts/backstop-stats.ts` divides into the
  * rescue records for a true RATE. Slow (5 min) because a rollup is a periodic
  * checkpoint, NOT a per-fire line; a clean shutdown also flushes one final
@@ -2067,7 +2002,7 @@ export const RECONCILE_HEARTBEAT_MS = 5_000;
 export const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
 
 /**
- * Fast `PRAGMA data_version` poll cadence (fn-705) — same value as
+ * Fast `PRAGMA data_version` poll cadence — same value as
  * `git-worker.ts` `DB_POLL_MS` / `wake-worker.ts` so all producer/reader
  * workers share one schedule. A bump means SOMETHING committed to keeper's DB
  * (a hook event, a fold, a `Commit` discharge); since the close→approve flow
@@ -2082,7 +2017,7 @@ export const BACKSTOP_ROLLUP_FLUSH_MS = 5 * 60_000;
 export const PLAN_DB_POLL_MS = 100;
 
 /**
- * Single-flight coalescing wrapper (fn-705) — the same `cycleRunning` /
+ * Single-flight coalescing wrapper — the same `cycleRunning` /
  * `wakePending` shape `src/autopilot-worker.ts` keeps for its reconcile drive.
  * Returns a trigger function: invoking it while the `work` body is mid-flight
  * sets a pending flag rather than re-entering, and the running cycle loops once
@@ -2092,7 +2027,7 @@ export const PLAN_DB_POLL_MS = 100;
  * The `work` body is synchronous here (the plan-worker's recheck + reconcile
  * are both sync), so the in-flight window only spans a re-entrant trigger
  * (`work` calling the returned trigger). That re-entrancy is exactly what the
- * fn-705 poll must coalesce — a `data_version` bump landing while the previous
+ * The poll must coalesce — a `data_version` bump landing while the previous
  * bump's scan runs — and it makes the contract pure-unit-testable without a
  * real timer (a test passes a `work` that re-triggers and asserts the trailing
  * single re-run).
@@ -2186,11 +2121,9 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  *
  * The `state/tasks/` pass runs FIRST so the per-task runtime-status cache is
  * primed before any definition file is read — otherwise the first snapshot
- * would reset runtime_status to "todo" for the whole boot window. (fn-756: the
- * task/epic approval caches and the `state/epics/` prime pass are gone — keeper
- * no longer ingests the `approval` field from either sidecar.)
+ * would reset runtime_status to "todo" for the whole boot window.
  *
- * The original rationale, for the runtime-status case: a state file existing at
+ * For the runtime-status case: a state file existing at
  * daemon boot (planctl's `LocalFileStateStore` writes `<id>.state.json` on
  * every status transition) would otherwise be ignored until the next live
  * write touched it, and the projection's `runtime_status` would silently
@@ -2205,8 +2138,8 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  * retracts on missing definition files; a sidecar's absence is the cache's
  * `"todo"` default, not a tombstone.
  *
- * `triggerReason` (fn-701, extended fn-705): when set (a trigger caller — the
- * 60s heartbeat, an FSEvents-drop rescan, or the fn-705 `data_version` poll), a
+ * `triggerReason`: when set (a trigger caller — the
+ * 60s heartbeat, an FSEvents-drop rescan, or the `data_version` poll), a
  * definition-file `onChange` that RETURNS `true` (it emitted a snapshot) logs a
  * trigger-tagged line via {@link PlanScanner.logBackstopEmit} (which keeps the
  * loud "a fast path missed it" alarm for the two BACKSTOP reasons only — a
@@ -2215,7 +2148,7 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  * emit is expected, not a noteworthy event.
  *
  * Returns `true` iff at least one definition-file `onChange` emitted a snapshot
- * during this scan (fn-720) — the `rescued` boolean the backstop caller folds
+ * during this scan — the `rescued` boolean the backstop caller folds
  * into one uniform `missed-wake` record per fire (the heartbeat / FSEvents-drop
  * backstop did real work a fast path missed). Boot / `db-poll` callers ignore
  * the return (boot isn't a backstop; `db-poll` IS a fast path, stamped
@@ -2226,7 +2159,7 @@ function scanPlanctlDir(
   scanner: PlanScanner,
   triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
 ): boolean {
-  // fn-720: track whether ANY definition-file onChange emitted this scan so the
+  // track whether ANY definition-file onChange emitted this scan so the
   // backstop caller can fold it into one `rescued` boolean per fire.
   let emittedAny = false;
   // Pass 1: prime `runtimeStatusCache` from `state/tasks/*.state.json`. A
@@ -2301,7 +2234,7 @@ function scanPlanctlDir(
     }
   }
 
-  // fn-756: the `state/epics/` prime pass is gone — epic sidecars carried ONLY
+  // the `state/epics/` prime pass is gone — epic sidecars carried ONLY
   // the now-removed `approval` field, so there is nothing keeper ingests from
   // them at boot.
 
@@ -2326,10 +2259,10 @@ function scanPlanctlDir(
         // failure from looking "absent".
         scanner.markSeen(full);
         // Boot/heartbeat/drop ingest is FSEvents-gated (`triggeredByCommit`
-        // stays false) — this is the genuinely-uncertain path the fn-629 gate
+        // stays false) — this is the genuinely-uncertain path the gate
         // exists for. When a backstop trigger drove this scan and `onChange`
         // actually emitted, surface it: a backstop delivering work means a
-        // fast path missed it (fn-701).
+        // fast path missed it.
         const emitted = scanner.onChange(full);
         if (emitted) {
           emittedAny = true;
@@ -2346,7 +2279,7 @@ function scanPlanctlDir(
 /**
  * Shallow discovery of `<root>/<project>/.planctl` dirs across the configured
  * roots — the cheap convergence backstop the periodic reconcile and on-drop
- * recovery share (epic fn-681).
+ * recovery share.
  *
  * One level deep ONLY: for each `root`, read its top-level entries and emit
  * `<root>/<entry>/.planctl` for every directory entry whose name isn't in
@@ -2400,7 +2333,7 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
  * ADDITIVE re-ingest of every `<root>/<project>/.planctl` dir discovered by
  * {@link discoverPlanctlDirs} via the change-gated {@link scanPlanctlDir}
  * primitive — the heartbeat backstop and on-drop recovery path (epic
- * fn-681).
+ *).
  *
  * "Additive" is the load-bearing word: this path NEVER calls
  * {@link PlanScanner.sweep}, so a transient read failure / mid-rewrite
@@ -2420,21 +2353,21 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
  * discipline as the boot scan); the loop never throws. Exported for unit
  * reach.
  *
- * `triggerReason` (fn-701, extended fn-705) tags the calling trigger —
+ * `triggerReason` tags the calling trigger —
  * `"heartbeat"` for the 60s reconcile, `"fswatcher-drop"` for an FSEvents-drop
- * rescan, `"db-poll"` for the fn-705 `data_version` poll — so an emission logs
+ * rescan, `"db-poll"` for the `data_version` poll — so an emission logs
  * a trigger-tagged "did real work" line (the BACKSTOP reasons carry the loud
  * "a fast path missed it" alarm; `db-poll` does not — it IS a fast path). Pass
  * `undefined` (boot / silent reconcile) to suppress the log.
  *
- * `onPlanctlDir` (fn-705) is invoked once per `.planctl` dir surfaced by this
+ * `onPlanctlDir` is invoked once per `.planctl` dir surfaced by this
  * sweep, BEFORE its scan — the live worker uses it to nudge git-worker
  * discovery for a newly-seen `.planctl` repo (de-duped worker-side). The walk
  * already paid for the directory enumeration, so this rides free; pure unit
  * tests omit it.
  *
  * Returns `true` iff at least one `.planctl` dir's scan emitted a snapshot
- * (fn-720) — the `rescued` boolean the backstop caller (heartbeat / FSEvents-
+ * — the `rescued` boolean the backstop caller (heartbeat / FSEvents-
  * drop) folds into one uniform `missed-wake` record per fire. The `db-poll`
  * (fast-path) and boot callers ignore the return.
  */
@@ -2532,7 +2465,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
       title: string | null;
       target_repo: string | null;
       /**
-       * Planctl-native effort tier (fn-602). Absent on pre-fn-602 stored
+       * Planctl-native effort tier. Absent on legacy stored
        * task elements; read defensively (`?? null`) so the reconstructed
        * `PlanTaskMessage.tier` matches `buildTaskMessage`'s output on a
        * fresh re-scan and the change-gate suppresses correctly across the
@@ -2568,7 +2501,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
         number: taskNumberFromId(t.task_id),
         title: t.title,
         targetRepo: t.target_repo,
-        // Planctl-native effort tier (fn-602). Pre-fn-602 stored elements
+        // Planctl-native effort tier. Pre-tier stored elements
         // lack the key — `?? null` matches `buildTaskMessage`'s
         // `asString(raw.tier)` on a tier-less task file so the change-gate
         // byte-compare suppresses on restart.
@@ -2600,7 +2533,7 @@ export function seedFromDb(db: Database, scanner: PlanScanner): void {
  * even with reflogs off). `null` when neither exists (degrade to the
  * heartbeat floor + T1's poll for any repo that produces a DB write).
  *
- * Pure `existsSync` ladder — no mutation, no DB read. fn-752: hoisted out of
+ * Pure `existsSync` ladder — no mutation, no DB read. Hoisted out of
  * the worker `main()` closure to module scope + exported so the reflog
  * watch-set wiring stays unit-tested after the live reflog tests are deleted.
  */
@@ -2613,7 +2546,7 @@ export function resolveReflogTarget(repoRoot: string): string | null {
 }
 
 /**
- * fn-737: the discovered planctl-repo set — every `<root>/<project>` that
+ * the discovered planctl-repo set — every `<root>/<project>` that
  * holds a `.planctl` tree under the configured roots, via the same
  * {@link discoverPlanctlDirs} walk the heartbeat reconcile uses (a shallow
  * readdir+stat per root, no DB read, no emission). Each `.planctl` dir's
@@ -2623,7 +2556,7 @@ export function resolveReflogTarget(repoRoot: string): string | null {
  * skip-and-log (so a transient read miss just yields a smaller set this cycle,
  * re-derived on the next reconcile).
  *
- * fn-752: hoisted out of the worker `main()` closure, parameterized on `roots`
+ * hoisted out of the worker `main()` closure, parameterized on `roots`
  * (was a closure over `data.roots`) + exported. Thin FS wrapper over the
  * already-exported {@link discoverPlanctlDirs} + `dirname` — no readdir/dirname
  * logic duplicated here.
@@ -2639,11 +2572,11 @@ export function discoverPlanctlRepos(roots: readonly string[]): Set<string> {
 /**
  * The repos that SHOULD hold a `.git/logs/HEAD` reflog watch: every repo that
  * currently owns a pending path UNION every repo that holds a `.planctl` tree
- * under the configured roots (fn-737 widening — the latter closes the
+ * under the configured roots (widening — the latter closes the
  * no-pending-repo commit tail).
  *
  * PURE set arithmetic over the two input sets — READ-only (returns a fresh
- * union; never mutates `pending` or `discovered`). fn-752: extracted from
+ * union; never mutates `pending` or `discovered`). Extracted from
  * `reconcileReflogWatches` so the desired-set derivation is unit-testable
  * without a Worker, a watcher, or a real `~/code` walk.
  */
@@ -2665,7 +2598,7 @@ export function desiredReflogRepos(
  * holding a `.planctl` tree any longer, e.g. a removed `.planctl` repo).
  *
  * PURE set arithmetic — READ-only (returns fresh sets; never mutates the live
- * `reflogSubs`/`reflogSubscribing` sets the worker owns). fn-752: extracted
+ * `reflogSubs`/`reflogSubscribing` sets the worker owns). Extracted
  * from `reconcileReflogWatches` so the add/drop derivation is unit-testable
  * in isolation; the `subscribe()`/`unsubscribe()` I/O + the mutation of the
  * worker's live sets stay in the closure that CALLS this helper.
@@ -2708,11 +2641,11 @@ function main(): void {
 
   // Shared shutdown flag — read by every timer/callback so a queued tick can't
   // touch a closing connection or post against a torn-down port. Declared up
-  // front so the scanner's fn-705 `onPendingChange` reflog reconcile (below)
+  // front so the scanner's `onPendingChange` reflog reconcile (below)
   // can close over it.
   let shuttingDown = false;
 
-  // ── fn-705 `.git/logs/HEAD` reflog watches ────────────────────────────────
+  // ── `.git/logs/HEAD` reflog watches ────────────────────────────────
   // The last non-realtime tail: a brand-new epic scaffolded+committed in a repo
   // keeper has never seen a session in. The plan-worker watches CONFIGURED
   // roots, so the new epic file appears via FSEvents (bounces to `pending`, not
@@ -2725,7 +2658,7 @@ function main(): void {
   // change-gated `scanPlanctlDir` re-scan (recover a committed `.planctl` change
   // that was never gated into pending).
   //
-  // fn-737 WIDENING. The pending-only watch set left the epic's confirmed slow
+  // Widening. The pending-only watch set left the epic's confirmed slow
   // path open: a commit in a repo that holds a `.planctl` tree but NO currently-
   // pending path (a steady-state planctl change — e.g. a `done`/`reset` that
   // edits then commits, or any `.planctl` mutation whose file-write FSEvent the
@@ -2741,7 +2674,7 @@ function main(): void {
   // already ignores `.git` so these per-repo `.git/logs` watches do NOT overlap
   // it (no fseventsd bad-state from overlapping subtree watches), and the
   // callback stays repo-SCOPED (`recheckPending(root)` + one `scanPlanctlDir` —
-  // no fn-712/fn-716 global-recheck storm). The poll stays trigger-only: the
+  // no global-recheck storm). The poll stays trigger-only: the
   // re-scan is change-gated, re-probes the in-HEAD gate, and writes no DB row.
   //
   // Lifecycle is bounded: a watch is ADDED when a repo gains a pending path OR
@@ -2763,12 +2696,12 @@ function main(): void {
   // The module-scope `resolveReflogTarget` (the `.git/logs/HEAD` -> `.git/HEAD`
   // -> null `existsSync` ladder) and `discoverPlanctlRepos(roots)` (the
   // `discoverPlanctlDirs` + `dirname` FS wrapper) are pure helpers this closure
-  // composes (fn-752 — hoisted to module scope + exported for unit reach).
+  // composes.
 
   // Bring the live reflog-watch set into agreement with the repos that should
   // hold a `.git/logs/HEAD` reflog watch: every repo that currently owns a
   // pending path UNION every repo that holds a `.planctl` tree under the
-  // configured roots (fn-737 widening — the latter closes the no-pending-repo
+  // configured roots (widening — the latter closes the no-pending-repo
   // commit tail). Idempotent + cheap (a no-op when the union hasn't changed).
   // Fired by the scanner's `onPendingChange` on every pending mutation, by the
   // heartbeat (so a brand-new `.planctl` repo arms its watch within one interval
@@ -2777,7 +2710,7 @@ function main(): void {
   const reconcileReflogWatches = (): void => {
     if (shuttingDown || reflogWatcherModule === null) return;
     const watcher = reflogWatcherModule;
-    // PURE desired-set derivation (fn-752): the union of currently-pending
+    // PURE desired-set derivation: the union of currently-pending
     // repos and every discovered `.planctl` repo under the configured roots.
     const desired = desiredReflogRepos(
       scanner.pendingRepos(),
@@ -2818,7 +2751,7 @@ function main(): void {
         .subscribe(watchDir, (err) => {
           // The event is a HINT — re-probe via the GATED `recheckPending`
           // (re-checks `isPathInHead`), NEVER a `triggeredByCommit` bypass
-          // (preserves fn-629 / the fn-627 dup-dispatch guard). Idempotent
+          // (preserves the in-HEAD gate / the dup-dispatch guard). Idempotent
           // under repeat fires. A watcher `err` (incl. a drop) is also treated
           // as "go look" — the same defensive re-check.
           if (shuttingDown) return;
@@ -2828,7 +2761,7 @@ function main(): void {
             );
           }
           try {
-            // fn-712: the reflog fire is repo-specific (this `root`'s
+            // the reflog fire is repo-specific (this `root`'s
             // `.git/logs/HEAD` moved), so scope the drain to it — ONE batched
             // probe over only this repo's pending paths.
             scanner.recheckPending(root);
@@ -2837,7 +2770,7 @@ function main(): void {
               `[plan-worker] reflog recheckPending failed for ${root}: ${stringifyErr(e)}`,
             );
           }
-          // fn-737: `recheckPending(root)` only drains paths ALREADY in the
+          // `recheckPending(root)` only drains paths ALREADY in the
           // pending gate. The widened-watch slow path is a commit in a repo with
           // NO pending path — the `.planctl` change was never gated in (its
           // file-write FSEvent was a no-op or coalesced), so a pending drain is
@@ -2847,7 +2780,7 @@ function main(): void {
           // file, and emits only changed-and-in-HEAD files (the change-gate
           // suppresses unchanged ones, so a spurious fire is an idempotent
           // no-op). Repo-SCOPED to this `root`'s `.planctl` only — no global
-          // re-discovery, no per-path git storm (fn-712/fn-716 guardrail). The
+          // re-discovery, no per-path git storm. The
           // re-scan never writes the DB (poll-is-trigger-only). Tagged
           // `fswatcher-drop` (this IS a watcher edge a fast path would otherwise
           // need the heartbeat to recover).
@@ -2863,7 +2796,7 @@ function main(): void {
           reflogSubscribing.delete(root);
           // Lost-the-race teardown: shutdown, or the repo left the desired union
           // (its pending set drained AND it no longer holds a `.planctl` tree)
-          // while we were subscribing — release immediately. fn-737: check the
+          // while we were subscribing — release immediately. check the
           // FULL desired union (pending ∪ discovered planctl repos), not just
           // `pendingRepos()`, or a freshly-discovered no-pending repo's watch
           // would be torn down the instant it resolved.
@@ -2885,7 +2818,7 @@ function main(): void {
     }
   };
 
-  // fn-737 per-wake-path attribution. Classify, at backstop-fire time, whether
+  // per-wake-path attribution. Classify, at backstop-fire time, whether
   // the currently-pending repos had a reflog watch armed. Returns `absent` when
   // AT LEAST ONE pending repo has NO live reflog subscription (the prime-suspect
   // slow path: a commit in a no-pending-repo never armed a watch, so the
@@ -2893,7 +2826,7 @@ function main(): void {
   // `present` when every pending repo had a watch (so a present-but-missed
   // FSEvents signal, not a coverage gap), and `undefined` when nothing is
   // pending (no per-repo notion to attribute). Pure read of the live watch set;
-  // producer-side only, never consulted in a fold. POST-fn-737-WIDENING: every
+  // producer-side only, never consulted in a fold. Post-widening: every
   // discovered planctl repo arms a watch, so `absent` should now be RARE — a
   // sustained run of `present` (or no rescue at all) is the evidence the
   // coverage gap closed.
@@ -2906,7 +2839,7 @@ function main(): void {
     return "present";
   };
 
-  // ── fn-705 discovery nudge ─────────────────────────────────────────────────
+  // ── discovery nudge ─────────────────────────────────────────────────
   // The git-worker discovers repos to watch from `jobs.cwd` seen-cwds, so a
   // repo keeper has never seen a session in is unwatched — no GitSnapshot /
   // attribution data flows. When the plan-worker first sees a `.planctl` tree
@@ -2933,12 +2866,12 @@ function main(): void {
     maybeNudgeDiscovery(dirname(planctlDir));
   };
 
-  // fn-629 observation gate: the live worker passes `isPathInHead` so an
+  // Observation gate: the live worker passes `isPathInHead` so an
   // uncommitted epic/task file lands in the scanner's pending set instead
   // of emitting a snapshot. Main drives the drain by posting
   // {@link RecheckPendingMessage} on every git-worker `GitSnapshot` pulse
   // (the cross-worker "HEAD may have moved" signal). The fourth ctor arg is the
-  // fn-705 `onPendingChange` observer — it reconciles the reflog watches AND
+  // The `onPendingChange` observer — it reconciles the reflog watches AND
   // nudges git-worker discovery for any repo that just gained a pending path
   // (a brand-new uncommitted epic is the load-bearing case for both).
   const scanner = new PlanScanner(
@@ -2947,7 +2880,7 @@ function main(): void {
     },
     (m) => console.error(m),
     isPathInHead,
-    // fn-712: the batched per-repo probe `recheckPending` uses to drain the
+    // the batched per-repo probe `recheckPending` uses to drain the
     // gate without a per-path git spawn (kills the ~74s storm). The per-path
     // `isPathInHead` above still governs the FSEvents `onChange` path.
     isPathInHeadBatch,
@@ -2967,7 +2900,7 @@ function main(): void {
         );
       }
     },
-    // fn-720: post built backstop records/rollups UP to main (the SOLE sidecar
+    // post built backstop records/rollups UP to main (the SOLE sidecar
     // writer). Default clock (Date.now) is fine for the live worker.
     (m) => port.postMessage(m),
   );
@@ -2986,24 +2919,24 @@ function main(): void {
   // its own `root`). Cleared in shutdown BEFORE unsubscribe so a queued re-scan
   // can't touch a closing DB.
   const schedulers: RescanScheduler[] = [];
-  // fn-681 periodic reconcile backstop: a low-frequency heartbeat re-runs
+  // periodic reconcile backstop: a low-frequency heartbeat re-runs
   // `reconcilePlanctlDirs` across every configured root, so a brand-new
   // repo's first scaffold converges within one interval even if FSEvents
   // dropped its burst AND git-worker isn't yet watching it (it only
   // starts watching a repo's `.git` once an epic row for it exists).
   // Cancelled in shutdown alongside the drop-recovery schedulers.
   let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
-  // fn-705 fast `data_version` poll timer — armed AFTER seedFromDb (below) so
+  // Fast `data_version` poll timer — armed AFTER seedFromDb (below) so
   // the seeded change-gate suppresses a first-bump re-emit storm; cleared in
   // shutdown alongside the heartbeat. Declared here so the shutdown handler
   // (registered before the timer is armed) can close over it.
   let dbPollTimer: ReturnType<typeof setInterval> | null = null;
-  // fn-720 periodic backstop-rollup flush timer — emits the denominator
+  // periodic backstop-rollup flush timer — emits the denominator
   // (fires_total / rescues_total per backstop) on a slow cadence so the metric
   // survives a crash/restart without a line per no-op fire. Cleared in shutdown
   // alongside the heartbeat, with one final flush.
   let rollupTimer: ReturnType<typeof setInterval> | null = null;
-  // (fn-705) `shuttingDown` is declared at the top of `main` so the reflog
+  // `shuttingDown` is declared at the top of `main` so the reflog
   // reconcile + nudge callbacks can close over it.
 
   const closeDb = (): void => {
@@ -3017,12 +2950,12 @@ function main(): void {
   parentPort.on("message", (msg: InboundMessage | undefined) => {
     if (!msg) return;
     if (msg.type === "recheck-pending") {
-      // fn-629: main observed a `GitSnapshot`/`Commit` events row land — HEAD
+      // main observed a `GitSnapshot`/`Commit` events row land — HEAD
       // may have advanced. Drain the observation gate's pending set so a
       // freshly-committed epic/task file emits its snapshot. Idempotent and
       // cheap when the set is empty.
       //
-      // fn-712: SCOPE to `msg.repo` — main stamps it with the originating
+      // SCOPE to `msg.repo` — main stamps it with the originating
       // snapshot's `project_dir`, the single repo whose HEAD moved — so we
       // re-probe only that repo's pending paths (ONE batched git call) instead
       // of every repo's. A cross-repo pending set no longer starves the loop.
@@ -3037,13 +2970,13 @@ function main(): void {
       return;
     }
     if (msg.type === "kick") {
-      // fn-701 task .2: a `set_*_approval` RPC write succeeded in the
+      // a `set_*_approval` RPC write succeeded in the
       // server-worker; main kicked us. The approval mutation left the plan
       // file dirty/uncommitted, so re-run the GATED observation-gate drain so
       // an approval that never commits still converges promptly instead of
       // waiting on the 60s heartbeat. SAME gated `recheckPending()` the
       // `recheck-pending` branch runs — NOT a bypass: an uncommitted approval
-      // re-runs the fn-629 in-HEAD probe and stays in pending (the fn-627
+      // re-runs the in-HEAD probe and stays in pending (the dup-dispatch guard
       // duplicate-dispatch guard). Idempotent and cheap when pending is empty.
       // Try/catch-wrapped — a throw here is in the no-self-heal path; log and
       // continue so a recheck failure can't crash the worker (and bounce the
@@ -3059,7 +2992,7 @@ function main(): void {
       return;
     }
     if (msg.type === "planctl-commit-changed") {
-      // fn-681: authoritative ingest trigger. The git-worker just observed
+      // authoritative ingest trigger. The git-worker just observed
       // a commit landing in `msg.repo` carrying changed `.planctl/**`
       // paths; re-ingest each from the COMMITTED worktree bytes via the
       // existing idempotent `onChange` / `onDelete` paths. Drop-proof
@@ -3076,7 +3009,7 @@ function main(): void {
           if (change.op === "delete") {
             scanner.onDelete(abs);
           } else {
-            // fn-701: commit-driven ingest — the git-worker enumerated this
+            // commit-driven ingest — the git-worker enumerated this
             // path from a landed commit, so it is provably in HEAD. Pass
             // `triggeredByCommit=true` to BYPASS the redundant fail-closed
             // `isTracked` probe whose 1s timeout silently bounced just-
@@ -3098,7 +3031,7 @@ function main(): void {
       for (const sched of schedulers.splice(0)) {
         sched.cancel();
       }
-      // fn-681: cancel the periodic-reconcile heartbeat alongside the
+      // cancel the periodic-reconcile heartbeat alongside the
       // drop-recovery schedulers so it can't tick against a closing DB
       // (mirrors the schedulers' BEFORE-unsubscribe ordering — the scan
       // re-checks `shuttingDown` belt-and-suspenders, but the clear is
@@ -3107,7 +3040,7 @@ function main(): void {
         clearInterval(heartbeatTimer);
         heartbeatTimer = null;
       }
-      // fn-705: cancel the fast `data_version` poll BEFORE unsubscribe + db
+      // cancel the fast `data_version` poll BEFORE unsubscribe + db
       // close so a queued tick can't read `data_version` / drive a reconcile
       // against a closing connection (a leaked interval strands
       // `bun test --isolate`). Same ordering as the heartbeat + schedulers.
@@ -3115,7 +3048,7 @@ function main(): void {
         clearInterval(dbPollTimer);
         dbPollTimer = null;
       }
-      // fn-720: cancel the periodic rollup flush, then flush ONE final rollup so
+      // cancel the periodic rollup flush, then flush ONE final rollup so
       // the denominator (fires_total / rescues_total per backstop) survives a
       // clean stop. postMessage is synchronous; main is still reading at this
       // point (it sends `shutdown` and awaits `close`).
@@ -3134,7 +3067,7 @@ function main(): void {
             // best-effort
           }
         }
-        // fn-705: release every `.git/logs/HEAD` reflog watch too (each is an
+        // release every `.git/logs/HEAD` reflog watch too (each is an
         // owned external resource — `terminate()` alone leaks it). Drain the
         // map so a racing reconcile can't re-add into a closing worker.
         for (const [root, sub] of [...reflogSubs]) {
@@ -3151,7 +3084,7 @@ function main(): void {
     }
   });
 
-  // fn-681 periodic reconcile backstop. Independent of the @parcel/watcher
+  // periodic reconcile backstop. Independent of the @parcel/watcher
   // subscription (so it still ticks if the addon load is delayed) and of
   // git-worker's commit signal (so it covers the brand-new-repo case where
   // no `.git` is yet watched). The scan re-checks `shuttingDown` belt-and-
@@ -3161,10 +3094,10 @@ function main(): void {
   heartbeatTimer = setInterval(() => {
     if (shuttingDown) return;
     try {
-      // fn-701: tag as "heartbeat" so an emission here (a snapshot the
+      // tag as "heartbeat" so an emission here (a snapshot the
       // commit/FSEvents fast path missed) logs a "did real work" line —
       // the signature of the fast path being broken.
-      // fn-720: this IS the slow backstop — fold the aggregate emitted-boolean
+      // this IS the slow backstop — fold the aggregate emitted-boolean
       // into one uniform `missed-wake` record (rescued = did the change-gated
       // scan deliver work the fast paths missed). The shutdown guard above
       // gates both the scan AND the telemetry emit.
@@ -3174,7 +3107,7 @@ function main(): void {
         "heartbeat",
         nudgeFromPlanctlDir,
       );
-      // fn-737 per-wake-path attribution: classify whether the rescued repos
+      // per-wake-path attribution: classify whether the rescued repos
       // had a reflog watch armed. `absent` is the prime-suspect slow path — a
       // commit in a no-pending repo (so no reflog watch, no DB write) is
       // invisible to every fast path until this heartbeat. `present` means a
@@ -3187,7 +3120,7 @@ function main(): void {
         rescued,
         reflogWatchAttribution(),
       );
-      // fn-737: re-reconcile the reflog watches against the live union (pending
+      // re-reconcile the reflog watches against the live union (pending
       // ∪ discovered planctl repos). `onPendingChange` only fires on a pending
       // mutation, so a brand-new `.planctl` repo that never accrues a pending
       // path (a foreign commit lands its files already-in-HEAD before any
@@ -3202,7 +3135,7 @@ function main(): void {
     }
   }, RECONCILE_HEARTBEAT_MS);
 
-  // fn-720: periodic backstop-rollup flush — checkpoint the denominator so it
+  // periodic backstop-rollup flush — checkpoint the denominator so it
   // survives a crash without a line per no-op fire. The shutdown handler clears
   // this and flushes one final rollup.
   rollupTimer = setInterval(() => {
@@ -3216,7 +3149,7 @@ function main(): void {
     }
   }, BACKSTOP_ROLLUP_FLUSH_MS);
 
-  // fn-705 fast `data_version` poll — the realtime trigger that collapses
+  // Fast `data_version` poll — the realtime trigger that collapses
   // close→emit to ~50ms. A bump means SOMETHING committed to keeper's DB; the
   // close→approve `Commit` fold that makes a planctl file "ready" IS such a
   // write, so polling the DB surfaces it without waiting on the 60s heartbeat.
@@ -3226,7 +3159,7 @@ function main(): void {
   // whose FSEvent was dropped — and was therefore NEVER gated into pending —
   // is still recovered). The poll NEVER writes the DB.
   //
-  // fn-712: the db-poll NO LONGER calls `recheckPending`. The old global
+  // the db-poll NO LONGER calls `recheckPending`. The old global
   // recheck spawned one synchronous `git cat-file` per pending path across all
   // repos on every DB bump — the per-path storm that starved the loop and let
   // the realtime bypass queue for ~74s. The pending drain is now covered by
@@ -3244,10 +3177,10 @@ function main(): void {
   // guard.
   const onWake = makeSingleFlight(
     () => {
-      // fn-720: the `data_version` poll IS a fast path — stamp `last_fast_path_at`
+      // the `data_version` poll IS a fast path — stamp `last_fast_path_at`
       // so a later heartbeat can compute staleness against it. NOT a missed-wake
       // record (a db-poll emit is a normal fast-path success, never a rescue).
-      // fn-737: label `db-poll` for per-wake-path attribution.
+      // label `db-poll` for per-wake-path attribution.
       scanner.markFastPath("db-poll");
       reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
     },
@@ -3307,7 +3240,7 @@ function main(): void {
     }
   };
 
-  // fn-747 watcher seam: skip the native addon dlopen in the in-process tier and
+  // watcher seam: skip the native addon dlopen in the in-process tier and
   // run a polling degrade instead. The boot scan per root still seeds the
   // projection and advances the ghost-sweep barrier; the `data_version` poll +
   // periodic heartbeat (armed above) carry the live `.planctl` fold pipeline at
@@ -3342,7 +3275,7 @@ function main(): void {
 
   void import("@parcel/watcher")
     .then((watcher) => {
-      // fn-705: publish the module so `reconcileReflogWatches` can subscribe.
+      // publish the module so `reconcileReflogWatches` can subscribe.
       // Set BEFORE the boot scans below so a pending path accrued during a
       // root's `scanRoot` immediately gets its `.git/logs/HEAD` watch.
       reflogWatcherModule = watcher;
@@ -3370,7 +3303,7 @@ function main(): void {
         // recovery is idempotent. The scan re-checks shuttingDown so a queued
         // scan can't touch a closing DB.
         //
-        // fn-681: scoped to `.planctl` dirs (O(#projects)), NOT the full
+        // scoped to `.planctl` dirs (O(#projects)), NOT the full
         // recursive walk over the whole `~/code` tree the boot scan does.
         // The commit path (`planctl-commit-changed`) + the boot sweep
         // continue to handle deletions, so an additive shallow rescan is
@@ -3380,10 +3313,10 @@ function main(): void {
           if (shuttingDown) {
             return;
           }
-          // fn-701: tag as "fswatcher-drop" so a snapshot recovered here
+          // tag as "fswatcher-drop" so a snapshot recovered here
           // (one the dropped FSEvents change would otherwise have lost) logs
           // a "did real work" line.
-          // fn-720: this is the FSEvents-drop backstop — fold the emitted-
+          // this is the FSEvents-drop backstop — fold the emitted-
           // boolean into one `rescan-drop` missed-wake record. The shutdown
           // guard above gates both the scan and the telemetry emit.
           const rescued = reconcilePlanctlDirs(
@@ -3392,7 +3325,7 @@ function main(): void {
             "fswatcher-drop",
             nudgeFromPlanctlDir,
           );
-          // fn-737: this drop-rescan is scoped to ONE `root`, so attribute the
+          // this drop-rescan is scoped to ONE `root`, so attribute the
           // reflog watch for that root specifically — `present`/`absent` only
           // when the root is actually pending (otherwise no per-repo notion).
           const reflogWatch = scanner.pendingRepos().has(root)
@@ -3423,11 +3356,11 @@ function main(): void {
                 }
                 return;
               }
-              // fn-720: a confirmed FSEvents batch is THE fast path for plan
+              // a confirmed FSEvents batch is THE fast path for plan
               // files — stamp `last_fast_path_at` so a later heartbeat measures
               // staleness against it (and a working watcher keeps the heartbeat
               // a perpetual no-op rescue).
-              // fn-737: label `fsevents` for per-wake-path attribution.
+              // label `fsevents` for per-wake-path attribution.
               scanner.markFastPath("fsevents");
               for (const ev of events) {
                 // The in-callback `.planctl/{epics,tasks}/*.json` filter (via

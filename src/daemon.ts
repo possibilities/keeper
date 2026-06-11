@@ -1,70 +1,12 @@
 /**
  * Keeper daemon — the long-running reducer process. Managed in production by a
- * LaunchAgent that re-runs `bun run src/daemon.ts` on any non-clean exit.
+ * LaunchAgent that re-runs it on any non-clean exit.
  *
- * Boot sequence (the locked design):
- *
- *   1. Open the writer connection (`openDb`). DDL + forward-only migration run
- *      inside `openDb`; the reducer_state cursor is seeded there too.
- *   2. Boot drain: `while (drain(db, BATCH) > 0) {}` — fold every unfolded event
- *      using the SAME code path as steady-state. After downtime this catches the
- *      projection up before the daemon goes live.
- *   3. Spawn TEN worker threads (all AFTER migrate + boot drain + seed sweep,
- *      so their read-only `openDb` connections never race a missing/un-migrated
- *      DB and the exit-watcher's data_version diff sees a settled projection):
- *      - the wake worker — opens its own read-only connection, polls
- *        `PRAGMA data_version`, and posts a contentless `{ kind: "wake" }`
- *        whenever another connection commits.
- *      - the server worker — owns the UDS read surface: its own read-only
- *        connection, the `keeperd.lock` ownership lock, an NDJSON listener, and
- *        its own `data_version` poll that fans `jobs` changes out as patches.
- *      - the transcript worker — watches the external transcript tree with
- *        `@parcel/watcher`, tails each session's JSONL for the `custom-title`
- *        line, and posts `{ kind: "transcript-title", sessionId, title }`. Main
- *        turns that into a synthetic `TranscriptTitle` events row (priority-3
- *        title) on its own writable connection — keeperd's first role as an
- *        event PRODUCER. Main stays the sole writer; the worker is read-only.
- *      - the plan worker — watches each project root's `.planctl/{epics,tasks}`
- *        trees with `@parcel/watcher` and posts `{ kind: "plan-epic" | "plan-task",
- *        … }` snapshot messages. Main turns each into a synthetic
- *        `EpicSnapshot` / `TaskSnapshot` events row on its writable connection —
- *        the second producer-worker instance. Main stays the sole writer; the
- *        worker is read-only.
- *      - the exit-watcher worker — owns a kqueue (macOS) / pidfd+epoll (Linux)
- *        fd via `bun:ffi`, polls `data_version` to keep its (jobs.pid) watch set
- *        in sync, and posts `{ kind: "exit", jobId, pid, startTime }` when a
- *        tracked pid exits or the post-register kill-0 probe finds it already
- *        dead. Main turns each into a synthetic `Killed` events row (after a
- *        strict `(pid, start_time)` match against the persisted row) on its
- *        writable connection — the third producer-worker instance. The kqueue/
- *        epoll fd is owned by the worker thread and released in its own
- *        shutdown handler.
- *      - the git worker — polls watched git worktrees (see git-worker.ts's
- *        dynamic membership gate: `.planctl present || dirty || ahead>0`) via
- *        `git status --porcelain=v2 -z`, mines file-tool events from the DB,
- *        and posts `{ kind: "git-snapshot", ... }`. Main turns each into a
- *        synthetic `GitSnapshot` events row — the fourth producer-worker
- *        instance.
- *   4. Steady state: every wake triggers a full drain loop. Wakes that arrive
- *      mid-drain coalesce into the next pass via a single "wake pending" flag —
- *      no event is missed (drain always re-reads from the cursor) and drain is
- *      never invoked re-entrantly. A `transcript-title` / `exit` message
- *      inserts the synthetic event then pumps a wake to fold it.
- *   5. SIGTERM: post `{ type: "shutdown" }` to ALL TEN workers, await their
- *      `close` events against a short deadline, terminate them, close the db,
- *      exit 0. This is the ONLY clean exit. The server worker releases its
- *      socket + lock, the transcript + plan + dead-letter workers unsubscribe
- *      their watchers, and the exit-watcher releases its
- *      kqueue/pidfd fd — all inside their own shutdown handlers (those
- *      resources are process/thread-owned, so `terminate()` alone would leak
- *      them).
- *
- * Crash policy (single recovery path): ANY unrecoverable error — either worker's
- * `error` event, an unhandled rejection, or a fold throw that escapes the
- * per-event guard — calls `process.exit(1)`. The LaunchAgent
- * `KeepAlive.SuccessfulExit = false` then restarts us. We deliberately keep ONE
- * well-tested recovery path rather than attempting in-process self-heal — no
- * in-process respawn of either worker.
+ * Crash policy (single recovery path): any unrecoverable error calls
+ * `process.exit(1)`; the LaunchAgent restarts us. ONE well-tested recovery path
+ * rather than in-process self-heal — never respawn a worker in-process. A worker
+ * owning an external resource releases it in its own shutdown handler;
+ * `terminate()` alone would leak it.
  */
 
 import type { Database } from "bun:sqlite";
@@ -173,34 +115,22 @@ const WORKER_SHUTDOWN_DEADLINE_MS = 2000;
 
 /**
  * Drain the projection to completion: loop `drain()` until it reports 0 newly
- * folded events. Shared by boot catch-up and every steady-state wake — the same
- * idempotent code path the design mandates. Each `drain()` call folds at most
- * `batchSize` events in their own transactions, so the writer lock is released
- * between batches and hook inserts are never starved.
+ * folded events. Each `drain()` call folds at most `batchSize` events in their
+ * own transactions, so the writer lock is released between batches and hook
+ * inserts are never starved.
  *
- * Pacing (boot only): the boot caller may pass `DrainOptions` to enable a
- * short OS-level sleep AFTER each fold's COMMIT, opening a contention window
- * for concurrent hook INSERTs to slip in instead of starving on the
- * boot-drain's tight `BEGIN IMMEDIATE` loop. The pacing budget
- * (`options.paceEvents`) is the TOTAL number of paced folds across all
- * `drain()` batches in this call — once the budget is spent, the remaining
- * batches run unpaced, so a large from-scratch re-fold catches up to head in
- * bounded time. Steady-state callers (every wake-loop drain) pass no
- * options and the function behaves exactly as before.
- *
- * Single drain code path: pacing is a stateless parameter on the SAME
- * `drain()` function steady state uses — no forked boot drain, per the
- * CLAUDE.md invariant.
+ * Pacing (boot only): the boot caller may pass `DrainOptions` to sleep after
+ * each fold's COMMIT, opening a contention window for concurrent hook INSERTs.
+ * `options.paceEvents` is the TOTAL paced-fold budget across all batches; once
+ * spent, the remainder runs unpaced so a large from-scratch re-fold catches up
+ * in bounded time. Pacing is a stateless parameter on the SAME `drain()` steady
+ * state uses — no forked boot drain.
  */
 export function drainToCompletion(
   db: Database,
   batchSize = DEFAULT_BATCH_SIZE,
   options: DrainOptions = {},
 ): void {
-  // Carry the pacing budget across batches: each `drain()` call decrements it
-  // by the number of events paced inside that batch (capped by the batch
-  // size). When the budget reaches 0 we stop passing pacing options so the
-  // tail of a large backlog runs full-speed.
   let remainingPaceEvents = options.paceEvents ?? 0;
   const paceMs = options.paceMs ?? 0;
   const sleep = options.sleep;
@@ -209,9 +139,6 @@ export function drainToCompletion(
       paceMs > 0 && (remainingPaceEvents > 0 || (options.paceEvents ?? 0) === 0)
         ? {
             paceMs,
-            // A bare `paceMs` with no `paceEvents` cap paces the whole batch;
-            // a budget caps it to at most `remainingPaceEvents` events this
-            // batch. The next iteration sees the post-decrement count.
             paceEvents:
               (options.paceEvents ?? 0) === 0
                 ? 0
@@ -222,7 +149,6 @@ export function drainToCompletion(
     const folded = drain(db, batchSize, batchOptions);
     if (folded === 0) return;
     if (remainingPaceEvents > 0) {
-      // The batch paced at most min(remainingPaceEvents, folded) events.
       remainingPaceEvents -= Math.min(remainingPaceEvents, folded);
     }
   }
@@ -230,155 +156,85 @@ export function drainToCompletion(
 
 /**
  * SQLite's default WAL auto-checkpoint threshold (pages). `applyPragmas` does
- * not set it, so the writer connection runs at this default in steady state.
- * Made explicit so {@link withBootDrainCheckpointTuning} can disable it for the
- * boot drain and restore the exact steady-state value afterward.
+ * not set it, so {@link withBootDrainCheckpointTuning} restores exactly this
+ * value after disabling it for the boot drain.
  */
 export const WAL_AUTOCHECKPOINT_PAGES = 1000;
 
 /**
- * Post-COMMIT sleep duration (ms) for the boot drain. A real OS sleep — the JS
- * thread is blocked via `Atomics.wait` — opens a writer-lock window after
- * every fold's COMMIT so a concurrent hook INSERT (separate process) lands in
- * the gap instead of starving on the boot drain's tight `BEGIN IMMEDIATE`
- * loop. WAL gives NO writer FIFO fairness, so without this gap a sleeping
- * hook's busy-handler retry routinely loses the race to the reducer's next
- * `BEGIN IMMEDIATE` (microseconds after COMMIT) and exhausts its 2.4s budget
- * → dead-letter. `setImmediate` / event-loop yields do NOT help — they don't
- * release the SQLite lock to a separate process.
- *
- * Sized as small-but-real: 5ms × `BOOT_DRAIN_PACE_EVENTS` = ~2.5s total paced
- * latency budget, well under the bounce window's existing patience. Each gap
- * is wider than the hook's 30ms retry sleep so a hook that catches a paced
- * gap completes its INSERT comfortably.
+ * Post-COMMIT sleep duration (ms) for the boot drain — a real OS sleep
+ * (`Atomics.wait`) opening a writer-lock window so a concurrent hook INSERT
+ * (separate process) lands in the gap. WAL gives NO writer FIFO fairness, so
+ * without the gap a sleeping hook's busy-handler retry loses the race to the
+ * reducer's next `BEGIN IMMEDIATE` and exhausts its budget → dead-letter.
+ * `setImmediate` / event-loop yields do NOT help — they don't release the
+ * SQLite lock to a separate process.
  */
 export const BOOT_DRAIN_PACE_MS = 5;
 
 /**
- * Pacing budget (event count) for the boot drain. After this many paced
- * folds, the remaining drain runs unpaced — guarantees a large from-scratch
- * re-fold (the schema-migration path that rewinds the cursor and replays the
- * ~150k-event log) catches up to head in bounded extra time
- * (`BOOT_DRAIN_PACE_MS × BOOT_DRAIN_PACE_EVENTS` ≈ 2.5s) instead of paying
- * `paceMs` per event for minutes. Normal bounce backlogs (since the last
- * daemon run, seconds of events ≈ a few hundred) fit comfortably inside the
- * budget — they get full coverage of the contention window. The bounce
- * window for which the pacing matters is the first few seconds; events past
- * that are folded with no concurrent hooks waiting on the writer.
+ * Pacing budget (event count) for the boot drain — after this many paced folds
+ * the remainder runs unpaced, bounding the extra latency a large from-scratch
+ * re-fold pays before catching up to head.
  */
 export const BOOT_DRAIN_PACE_EVENTS = 500;
 
 /**
- * TTL (ms) for an open `pending_dispatches` row before the producer-side
- * sweep mints a `DispatchExpired` discharge (fn-678, schema v50, task .3).
- *
- * Sized at 120s — strictly greater than the documented worker cold-start
- * P99 (24-33s for a `claude` boot with ~60 plugin dirs on the work tier)
- * with comfortable margin so a slow booting worker is NEVER re-dispatched
- * over while it's still initializing. A shorter TTL re-creates the fn-627
- * double-dispatch hazard the projection exists to eliminate; a phantom
- * row outliving its slot by a few minutes is strictly preferable to a
- * second worker landing on the same task.
- *
- * Compared against `Date.now()` IN MAIN by {@link sweepExpiredPendingDispatches}
- * — the fold reads only `event.ts` so a re-fold remains deterministic
- * (CLAUDE.md "all wallclock lives in the producer" invariant).
+ * TTL (ms) for an open `pending_dispatches` row before the producer-side sweep
+ * mints a `DispatchExpired` discharge. Sized strictly greater than worker
+ * cold-start P99 so a slow-booting worker is NEVER re-dispatched over while it
+ * initializes; a phantom row outliving its slot is strictly preferable to a
+ * second worker landing on the same task. Compared against `Date.now()` IN MAIN
+ * — the fold reads only `event.ts`, so re-fold stays deterministic.
  */
 export const PENDING_DISPATCH_TTL_MS = 120_000;
 
 /**
- * Heartbeat cadence (ms) for the producer-side `pending_dispatches` TTL
- * sweep (fn-678, schema v50, task .3). The sweep MUST ride a heartbeat,
- * not the level-triggered `data_version` wake: a crashed dispatch can
- * be the only pending row on a quiescent board, and a write-triggered
- * wake would never fire — the slot would stay held indefinitely.
- *
- * 60s matches the existing 60s heartbeat cadence the git-worker
- * documents in its header (`src/git-worker.ts:13`) and the task spec's
- * "60s heartbeat" reference.
+ * Heartbeat cadence (ms) for the producer-side `pending_dispatches` TTL sweep.
+ * MUST ride a heartbeat, not the level-triggered `data_version` wake: a crashed
+ * dispatch can be the only pending row on a quiescent board, where a
+ * write-triggered wake never fires and the slot would stay held indefinitely.
  */
 export const PENDING_DISPATCH_SWEEP_INTERVAL_MS = 60_000;
 
 /**
- * fn-742 — events-log live-ingest poll-is-truth fallback cadence. The
- * `@parcel/watcher` hint (events-ingest-worker) is the fast path; this periodic
- * scan is the safety net that guarantees every NDJSON line lands within one
- * interval even if a watcher event is dropped/coalesced or the worker never
- * subscribed. Single-digit seconds keeps it under the realtime fold bar
- * (`FOLD_LATENCY_REALTIME_THRESHOLD = 5s`) while staying near-free when the dir
- * is unchanged (a readdir + per-file stat; no INSERT until new bytes exist).
+ * Events-log live-ingest poll-is-truth fallback cadence. The `@parcel/watcher`
+ * hint is the fast path; this periodic scan is the safety net guaranteeing every
+ * NDJSON line lands within one interval even if a watcher event is
+ * dropped/coalesced or the worker never subscribed. Under the realtime fold bar,
+ * near-free when the dir is unchanged.
  */
 export const EVENTS_INGEST_FALLBACK_INTERVAL_MS = 3_000;
 
 /**
- * Heartbeat cadence (ms) for the producer-side cold-blob compaction pass
- * (fn-717.2). Runs on MAIN's writable connection, paced (a bounded number of
- * small transactions per pass), so it relocates the long cold tail of inline
- * `data` blobs into `event_blobs` over many passes without ever holding the
- * writer lock long enough to starve a concurrent hook INSERT.
- *
- * 300s (5min) is deliberately slacker than the 60s dispatch sweep: compaction
- * is pure space reclamation with no latency-sensitive consumer, the cold tail
- * is not time-critical, and a slacker cadence keeps the steady-state write
- * pressure (and the PASSIVE checkpoint that follows a pass) low. The first
- * post-deploy passes drain the historical ~1 GB backlog gradually; once
- * caught up, each pass relocates only the trickle that has newly gone cold.
+ * Heartbeat cadence (ms) for the producer-side cold-blob compaction pass. Runs
+ * on MAIN's writable connection, paced, so it relocates the cold tail of inline
+ * `data` blobs over many passes without ever holding the writer lock long enough
+ * to starve a concurrent hook INSERT. Slacker than the dispatch sweep: pure
+ * space reclamation with no latency-sensitive consumer.
  */
 export const COMPACTION_INTERVAL_MS = 300_000;
 
 /**
- * Steady-state WAL checkpoint cadence (ms) — fn-744 .2 serve-side lever.
- *
- * The writer connection runs at the default `wal_autocheckpoint = 1000` pages
- * ({@link WAL_AUTOCHECKPOINT_PAGES}), so under a quiescent-to-light write load
- * the WAL can sit large for a long time before a fold COMMIT happens to cross
- * the page threshold. fn-744 .1 attributed part of the under-load read-latency
- * degradation (slow board CONNECT serving the ~2MB snapshot, late UPDATEs) to a
- * large WAL: every read on the RO poller / serve connection has to walk the WAL
- * frame index in front of the main DB, and that index grows with WAL size. The
- * compaction pass already issues a PASSIVE checkpoint, but ONLY when it actually
- * relocated bytes — once the cold-blob backlog is drained, a steady fold stream
- * with no relocation never triggers it, so the WAL is left to the page-count
- * auto-checkpoint alone.
- *
- * This independent heartbeat issues a `wal_checkpoint(PASSIVE)` on cadence so
- * the WAL is flushed back into the main DB regardless of compaction activity,
- * keeping serve/poll read latency bounded. PASSIVE (never TRUNCATE) is
- * mandatory: TRUNCATE waits for any concurrent writer and would starve a
- * contending hook INSERT into a dead-letter (CLAUDE.md "No kernel watchers" /
- * the bounce-window rationale on {@link withBootDrainCheckpointTuning}); PASSIVE
- * checkpoints what it can without blocking a writer and returns immediately if
- * the writer lock is held. Runs on MAIN's writable connection.
- *
- * 30s is slacker than the realtime fold bar yet frequent enough that the WAL
- * never grows unbounded between the sparse page-threshold auto-checkpoints under
- * a bursty-then-idle write pattern. It is NOT a projection input and reads no
- * wall-clock that feeds a fold, so re-fold determinism is untouched.
+ * Steady-state WAL checkpoint cadence (ms). The writer runs at the default
+ * `wal_autocheckpoint` pages, so under light write load the WAL can sit large
+ * before a fold COMMIT crosses the page threshold, and every RO read has to walk
+ * the WAL frame index (which grows with WAL size). This heartbeat issues a
+ * `wal_checkpoint(PASSIVE)` on cadence to keep read latency bounded. PASSIVE
+ * (never TRUNCATE) is mandatory: TRUNCATE waits for a concurrent writer and would
+ * starve a contending hook INSERT into a dead-letter; PASSIVE returns immediately
+ * if the writer lock is held. Runs on MAIN's writable connection; reads no
+ * wall-clock that feeds a fold.
  */
 export const WAL_CHECKPOINT_INTERVAL_MS = 30_000;
 
 /**
- * Pure helper: select every `pending_dispatches` row aged past the TTL
- * that does NOT already have an open `dispatch_failures` row for the
- * same `(verb, id)`. Used by the producer-side TTL sweep in
- * {@link runDaemon} to know which rows to mint a `DispatchExpired` for
- * on each 60s heartbeat.
- *
- * Exported so the daemon test suite can drive the sweep deterministically
- * (seed `pending_dispatches`, advance the wall-clock argument, assert
- * the returned keys). Reads the projection on the passed connection —
- * production passes main's writable connection so the read is sequenced
- * inside the same writer that mints the synthetic events; tests can
- * pass a tmp-DB connection.
- *
- * The LEFT JOIN guard suppresses an expire-mint for a `(verb, id)` whose
- * `DispatchFailed` already discharged the pending row through the same
- * fold path — defensive, since the reducer's `foldDispatchFailed`
- * already DELETEs the matching pending row when present (fn-678,
- * task .2), but the guard protects a transient race where the
- * `DispatchFailed` event has been written but not yet folded into
- * `dispatch_failures` and `pending_dispatches` simultaneously. Belt
- * and braces.
+ * Select every `pending_dispatches` row aged past the TTL that does NOT already
+ * have an open `dispatch_failures` row for the same `(verb, id)`. The LEFT JOIN
+ * guard suppresses an expire-mint for a `(verb, id)` whose `DispatchFailed`
+ * already discharged the pending row, protecting the race where the
+ * `DispatchFailed` event is written but not yet folded. Reads the projection on
+ * the passed connection — production passes main's writable connection.
  */
 export function selectExpiredPendingDispatches(
   db: Database,
@@ -394,29 +250,16 @@ export function selectExpiredPendingDispatches(
     )
     .all() as { verb: string; id: string; dispatched_at: number }[];
   const cutoffMs = nowMs - PENDING_DISPATCH_TTL_MS;
-  // `dispatched_at` is unix-epoch SECONDS (matches the schema's REAL
-  // column and `event.ts` everywhere else in keeper). Compare in
-  // milliseconds for a clean TTL constant.
+  // `dispatched_at` is unix-epoch SECONDS; compare in ms.
   return rows.filter((r) => r.dispatched_at * 1000 < cutoffMs);
 }
 
 /**
- * Build the fn-720 `timeout`-class {@link BackstopRecord} for every
- * pending-dispatch row the TTL sweep expired. Each aged row is a
- * `rescued:true` rescue — the sweep ceiling reclaimed a `pending_dispatches`
- * slot the launch→SessionStart fast path never discharged — carrying
- * `staleness_ms = elapsed-since-dispatch` (`dispatched_at` is unix SECONDS;
- * the sidecar uses ms) and the `{verb,id}` triage detail. `backstop` is
- * `pending-dispatch-sweep`, `worker` is `main` (main is the SOLE sidecar
- * writer here — no Worker round-trip). The `timeout` class carries
- * `fast_path:null` / `last_fast_path_at:null` (no fast-path notion), keeping
- * it categorically distinct from the missed-wake heartbeats so the
- * aggregation script never mixes their staleness histograms.
- *
- * Pure — `nowMs` is injected (a producer wall-clock read, legal outside any
- * fold; tests pass a synthetic clock). The denominator (rescued:false for an
- * empty sweep) is a counter bump the caller does directly, not a record line,
- * so this returns `[]` for an empty `aged` set.
+ * Build the `timeout`-class {@link BackstopRecord} for every pending-dispatch
+ * row the TTL sweep expired. Each aged row is a `rescued:true` rescue carrying
+ * `staleness_ms` (`dispatched_at` is unix SECONDS; the sidecar uses ms) and the
+ * `{verb,id}` detail. `nowMs` is injected — a producer wall-clock read, legal
+ * outside any fold. Returns `[]` for an empty `aged` set.
  */
 export function buildPendingDispatchSweepRecords(
   aged: { verb: string; id: string; dispatched_at: number }[],
@@ -438,38 +281,20 @@ export function buildPendingDispatchSweepRecords(
  * Run the heavy boot drain with WAL auto-checkpointing DISABLED, then flush the
  * WAL once and restore the steady-state threshold.
  *
- * Why: a from-scratch re-fold (every schema migration rewinds
- * `reducer_state.last_event_id` and clears the projections) commits ~150k
- * one-event transactions back to back. At the default `wal_autocheckpoint=1000`
- * (~4MB) the WAL crosses that line constantly, and whichever commit trips it
- * absorbs a synchronous PASSIVE checkpoint — random writes + fsync into the
- * cold ~950MB main DB, stretching an ~11ms commit to seconds while it holds the
- * single write lock. Concurrent hook INSERTs then exhaust their 1.2s
- * `busy_timeout` (twice — `attempts=2`, `wait≈2.4s`) and dead-letter; this is
- * the dominant `insert:SQLITE_BUSY` drop class the hook-drop diagnostics
- * surfaced, and it recurs on EVERY restart that does a non-trivial drain, not
- * just one migration.
+ * A from-scratch re-fold commits ~150k one-event transactions back to back. At
+ * the default `wal_autocheckpoint` the commit that trips the page threshold
+ * absorbs a synchronous checkpoint while holding the write lock, and concurrent
+ * hook INSERTs exhaust their `busy_timeout` and dead-letter. With auto-checkpoint
+ * off, every fold COMMIT is a pure WAL append so the write lock releases promptly
+ * and hook INSERTs interleave; a single `wal_checkpoint(PASSIVE)` in the
+ * `finally` flushes frames back. The `finally` guarantees we never leave the
+ * long-running writer with checkpointing disabled even if a drain throws.
  *
- * With auto-checkpoint off, every fold COMMIT is a pure WAL append
- * (`synchronous=NORMAL` ⇒ commits don't fsync; only checkpoints do), so the
- * write lock is released promptly and hook INSERTs interleave instead of
- * starving. The WAL grows for the duration; a single `wal_checkpoint(PASSIVE)`
- * in the `finally` flushes COMMITted frames back into the main DB without
- * waiting on any writer, and we restore `wal_autocheckpoint` so steady state
- * is unchanged. The `finally` guarantees we never leave the long-running
- * writer with checkpointing disabled even if a drain throws.
- *
- * Why PASSIVE and not TRUNCATE: TRUNCATE waits for any concurrent writers AND
- * for any read transaction old enough to still need pre-WAL pages; under
- * concurrent hook INSERTs landing during the bounce window, a TRUNCATE here
- * absorbs a full hook `busy_timeout` (1.2s) of writer-lock-blocked latency and
- * starves a second hook into dead-letters. PASSIVE skips writers — it
- * checkpoints what it can without blocking — so the bounce window closes
- * cleanly even if a hook is mid-INSERT. The WAL file is not reclaimed on this
- * pass (TRUNCATE's only extra job), but it shrinks naturally on subsequent
- * auto-checkpoints once steady state resumes; the alternative — wedging a
- * concurrent hook into a drop — is strictly worse than carrying a slightly
- * larger WAL forward for a few minutes.
+ * PASSIVE not TRUNCATE: TRUNCATE waits for concurrent writers and old readers,
+ * absorbing a full hook `busy_timeout` of writer-lock latency and starving a
+ * hook into a dead-letter. PASSIVE skips writers — it checkpoints what it can
+ * without blocking. The WAL is not reclaimed on this pass but shrinks naturally
+ * once steady-state auto-checkpoints resume.
  */
 export function withBootDrainCheckpointTuning(
   db: Database,
@@ -485,39 +310,20 @@ export function withBootDrainCheckpointTuning(
 }
 
 /**
- * Hard cap on the per-pid dead-letter NDJSON file size before we read it. The
- * hook writes one record per dropped INSERT and never truncates / rotates, so
- * a single file could in principle grow unbounded under sustained drop storms.
- * 16 MiB is far above any realistic dead-letter accumulation between daemon
- * restarts (a thousand drops at ~1 KiB each fits in 1 MiB) and prevents a
- * pathological file from OOM'ing the import scan. An oversized file is
- * skip-and-logged — never throws — so one bad file doesn't wedge the rest of
- * the dir scan.
+ * Hard cap on the per-pid dead-letter NDJSON file size before we read it (the
+ * hook never truncates / rotates). An oversized file is skip-and-logged — never
+ * throws — so one pathological file doesn't OOM or wedge the dir scan.
  */
 const MAX_DEAD_LETTER_FILE_BYTES = 16 * 1024 * 1024;
 
 /**
  * Serialize a `UsageSnapshotMessage` into the JSON string that rides in the
  * synthetic `UsageSnapshot` event's `data` blob. The reducer
- * (`extractUsageSnapshot` in `src/reducer.ts`) decodes the same shape; every
- * projection-meaningful field MUST appear here or the corresponding `usage`
- * column folds to NULL forever.
- *
- * fn-651 task .1: this was previously an inline `JSON.stringify({...})` in
- * the worker handler that dropped the fn-645 envelope-freshness fields
- * (`status` / `subscription_active` / `error_type` / `error_message` /
- * `error_at`), so `mc1` (no subscription) never got redacted and the status
- * chip never rendered. Extracted into a pure function so the test surface
- * can pin the wire shape directly.
- *
- * NOT serialized: `kind` (event-tag discriminator, not a projection field)
- * and `id` (the agentuse profile id, which rides in `events.session_id`
- * via the synthetic-event pipeline's generic entity-key overload, not in
- * the data blob).
- *
- * Object-literal slot order here is documentation only — the reducer's
- * decoder is shape-tolerant. The load-bearing slot order lives in
- * `usage-worker.ts` `buildUsageMessage` for the change-gate.
+ * (`extractUsageSnapshot`) decodes the same shape; every projection-meaningful
+ * field MUST appear here or the corresponding `usage` column folds to NULL
+ * forever. NOT serialized: `kind` (event-tag discriminator) and `id` (rides in
+ * `events.session_id`, not the data blob). Slot order here is shape-tolerant;
+ * the load-bearing order lives in `usage-worker.ts` `buildUsageMessage`.
  */
 export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
   return JSON.stringify({
@@ -529,47 +335,30 @@ export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
     week_resets_at: msg.week_resets_at,
     sonnet_week_percent: msg.sonnet_week_percent,
     sonnet_week_resets_at: msg.sonnet_week_resets_at,
-    // fn-645 envelope freshness / plan / stale-error axes — forwarded so
-    // the reducer's UPSERT populates the columns instead of folding NULL.
+    // Envelope freshness / plan / stale-error axes — forwarded so the
+    // reducer's UPSERT populates the columns instead of folding NULL.
     status: msg.status,
     subscription_active: msg.subscription_active,
     error_type: msg.error_type,
     error_message: msg.error_message,
     error_at: msg.error_at,
-    // fn-651: rate-limit lift instant — top-level envelope field, folded
-    // into `usage.rate_limit_lifts_at` by `parseUsageSnapshot`. The
-    // companion `last_usage_fold_at` freshness stamp is NOT a serialized
-    // payload field; the reducer derives it from the event `ts` on a
-    // "successful usage" fold (CLAUDE.md determinism boundary — never
-    // a wall-clock read inside the fold).
+    // Rate-limit lift instant — folded into `usage.rate_limit_lifts_at`. The
+    // companion `last_usage_fold_at` freshness stamp is NOT serialized; the
+    // reducer derives it from the event `ts` (never a wall-clock read in a fold).
     lift_at: msg.lift_at,
   });
 }
 
 /**
  * Scan the dead-letter dir and import each NDJSON file's records into the
- * `dead_letters` operational table via `INSERT OR IGNORE` (keyed on `dl_id`).
- * This is a DIRECT operational-table write — NOT an event fold — called both
- * once at boot (in `runDaemon`'s boot sequence, after `seedKilledSweep`) and
- * live on every `{kind:"dead-letter-changed"}` message from the dead-letter
- * worker.
- *
- * Idempotency: `INSERT OR IGNORE` on the `dl_id` PRIMARY KEY means a re-scan
- * of an unchanged file inserts nothing new — the same NDJSON file can be
- * scanned a hundred times and the table converges on the same row set. This
- * makes the "watcher event = re-read everything" pattern safe.
- *
- * Per-file isolation: every recoverable error (missing dir, missing file
- * mid-scan, read error, oversized file, malformed line, INSERT throw) is
- * swallowed to stderr — the import path MUST NOT throw out of the scan, or a
- * single bad file would wedge boot AND the live message loop (both call this
- * function). Exported so the test surface can drive it directly without
- * spawning the worker.
+ * `dead_letters` operational table via `INSERT OR IGNORE` (keyed on `dl_id`) — a
+ * DIRECT operational-table write, NOT an event fold. The `INSERT OR IGNORE`
+ * makes re-scanning an unchanged file a no-op, so the "watcher event = re-read
+ * everything" pattern is safe. Every recoverable error is swallowed to stderr —
+ * the import path MUST NOT throw, or one bad file would wedge boot AND the live
+ * message loop (both call this).
  */
 export function scanDeadLetterDir(db: Database, dir: string): void {
-  // Missing-dir tolerance: a fresh machine has no dead-letters/ tree until
-  // the hook hits its first drop. Returning early is the documented
-  // graceful-degradation path; the worker's existsSync guard mirrors this.
   if (!existsSync(dir)) {
     return;
   }
@@ -586,11 +375,6 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
     return;
   }
 
-  // Prepare the insert statement once outside the loop (bun:sqlite's
-  // prepared-statement cache makes a fresh `db.run` near-equivalent, but
-  // hoisting it is the documented zero-cost form for hot-ish paths).
-  // `INSERT OR IGNORE` collapses a duplicate `dl_id` to a no-op; the
-  // primary-key conflict path is the idempotency guarantee.
   const insertStmt = db.prepare(
     `INSERT OR IGNORE INTO dead_letters
        (dl_id, session_id, hook_event, ts, dl_written_at, pid, bindings,
@@ -610,9 +394,7 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
     try {
       st = statSync(full);
     } catch (err) {
-      // Read-vs-delete race (the file vanished between readdir and stat):
-      // skip-and-log without throwing. The next watcher event will pick it
-      // up if it reappears.
+      // Read-vs-delete race: skip-and-log without throwing.
       console.error(
         `[keeperd] dead-letter scan stat failed for ${full}: ${
           err instanceof Error ? err.message : String(err)
@@ -642,11 +424,8 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
       continue;
     }
 
-    // NDJSON: one record per `\n`-delimited line. `parseDeadLetterLine`
-    // returns null for an empty / truncated / malformed line — skip those
-    // silently, the next valid line (or a later append) still imports. A
-    // crash-killed hook may leave a partial trailing line; that is the
-    // documented crash-safety contract on the producer side.
+    // `parseDeadLetterLine` returns null for an empty/truncated/malformed line
+    // (a crash-killed hook may leave a partial trailing line) — skip those.
     const lines = text.split("\n");
     for (const line of lines) {
       const record = parseDeadLetterLine(line);
@@ -665,10 +444,7 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
           full,
         );
       } catch (err) {
-        // A bad row (e.g. a forward-compat column we don't store on this
-        // schema, a constraint violation that's NOT the PK duplicate
-        // INSERT OR IGNORE swallows) must not wedge the rest of the scan
-        // OR the boot/live loop. Log and continue.
+        // A bad row must not wedge the rest of the scan or the boot/live loop.
         console.error(
           `[keeperd] dead-letter INSERT failed for ${record.dl_id} (${full}): ${
             err instanceof Error ? err.message : String(err)
@@ -680,28 +456,19 @@ export function scanDeadLetterDir(db: Database, dir: string): void {
 }
 
 /**
- * The FULL, CURRENT `events` table column list, in CREATE_EVENTS order — the
+ * The full, current `events` table column list, in CREATE_EVENTS order — the
  * canonical column→value contract BOTH the NDJSON ingester ({@link
  * scanEventsLogDir}) AND the dead-letter replay ({@link recoverOneDeadLetter})
- * bind against. Includes the v48 backend-exec coords and the v51
- * `background_task_id` that the now-deleted fn-643 dead-letter shape omitted
- * (fn-762 repointed replay here, so a recovered dead-letter binds the live
- * schema instead of silently dropping the newer columns). `id` is excluded —
- * it's `INTEGER PRIMARY KEY AUTOINCREMENT`, assigned by SQLite so the ingested
- * row lands at the tail of the log and folds at the end of the next drain pass.
+ * bind against. `id` is excluded — it's `INTEGER PRIMARY KEY AUTOINCREMENT`,
+ * assigned by SQLite so the ingested row lands at the tail of the log.
  *
  * MUST stay in sync with the CREATE_EVENTS literal AND the prepared
  * `insertEvent` statement in `src/db.ts` — adding an events column touches all
- * three. A fn-672-style LOCKSTEP test
- * (`test/events-ingest-worker.test.ts`) pins this list to a live migrated DB's
- * `events` columns so a new column added to `CREATE_EVENTS` without a matching
- * entry here fails loud instead of silently dropping from ingest + replay.
- * Exported for that test's direct reach.
- *
- * The ingester/replay bind only the INTERSECTION of this list and the record's
- * `bindings` keys (an unknown/forward-compat column from a newer hook is
- * DROPPED, never folded as a poison value — see the poison-line policy in
- * `scanEventsLogDir`).
+ * three. A LOCKSTEP test pins this list to a live migrated DB's `events`
+ * columns so a missing entry fails loud instead of silently dropping from
+ * ingest + replay. The ingester/replay bind only the INTERSECTION of this list
+ * and the record's `bindings` keys (an unknown column is DROPPED, never folded
+ * as poison).
  */
 export const INGEST_EVENTS_COLUMNS = [
   "ts",
@@ -740,15 +507,11 @@ export const INGEST_EVENTS_COLUMNS = [
 ] as const;
 
 /**
- * fn-762 — the optional telemetry sink {@link scanEventsLogDir} threads through
- * so a parked poison line emits an `events-ingest-poison` backstop record. Held
- * separately from `db` because the dead-letter parking needs only `db` (it is
- * unconditional), while the backstop emit is observational and may be absent
- * (e.g. a test that doesn't assert telemetry). The two fields mirror main's
- * sole-writer pending-dispatch-sweep emit: bump the in-memory `counters` (the
- * denominator) and append the NDJSON line at `backstopLogPath` (the rescue
- * record). Main is the sole sidecar writer, so `scanEventsLogDir` runs on the
- * main thread and writes the line directly (no Worker round-trip).
+ * Optional telemetry sink {@link scanEventsLogDir} threads through so a parked
+ * poison line emits an `events-ingest-poison` backstop record. Held separately
+ * from `db` because the dead-letter parking is unconditional while the backstop
+ * emit is observational and may be absent. Main is the sole sidecar writer, so
+ * `scanEventsLogDir` writes the line directly (no Worker round-trip).
  */
 export type EventsIngestContext = {
   counters: BackstopCounters;
@@ -756,95 +519,55 @@ export type EventsIngestContext = {
 };
 
 /**
- * Ingest the per-pid NDJSON events-log files (fn-736 task .1) — the lock-free
- * events path's analogue of {@link scanDeadLetterDir}. For each `<pid>.ndjson`
- * file, scan FROM ITS DURABLE BYTE-OFFSET, parse each COMPLETE line, and
- * `INSERT INTO events` WITH the offset advance in ONE `BEGIN IMMEDIATE` — the
- * sacred atomic-cursor invariant, applied to NDJSON→events. The fold
- * (`drain()`/`applyEvent()`) reads `events` UNCHANGED and picks up the new rows
- * on the next drain pass.
+ * Ingest the per-pid NDJSON events-log files — the lock-free events path's
+ * analogue of {@link scanDeadLetterDir}. For each `<pid>.ndjson` file, scan FROM
+ * ITS DURABLE BYTE-OFFSET, parse each COMPLETE line, and `INSERT INTO events`
+ * WITH the offset advance in ONE `BEGIN IMMEDIATE` — the atomic-cursor invariant
+ * applied to NDJSON→events. MUST run on `db` = main's WRITER connection.
  *
- * MUST run on `db` = main's WRITER connection (so the `events` INSERT bumps
- * `data_version` and the existing wake/server pollers fire for free — the only
- * other new trigger is the ingest worker's file-watch hint). Called once at
- * boot (BEFORE the boot drain) and on every `events-log-changed` worker message.
+ * EXACTLY-ONCE: the durable per-pid byte-offset (`event_ingest_offsets`, keyed
+ * on `(path, inode)`) committed atomically with the INSERT means a watcher
+ * re-fire or daemon restart re-scans from the offset and never double-inserts.
+ * Purely byte offsets, NO line-counting.
  *
- * EXACTLY-ONCE — the idempotency keystone (epic "Early proof point"). The
- * durable per-pid byte-offset (`event_ingest_offsets`, keyed on `(path,
- * inode)`) committed atomically with the INSERT means a watcher re-fire or a
- * daemon restart re-scans from the offset and never double-inserts a line it
- * already landed (the double-ingest test). NO line-counting — purely byte
- * offsets.
+ * STRICT TORN-TAIL: bytes after the file's last `\n` are uncommitted; the offset
+ * advances ONLY to the end of the last COMPLETE, parseable line. A killed-hook
+ * partial trailing line is NOT folded and NOT skipped past.
  *
- * STRICT TORN-TAIL — bytes after the file's last `\n` are uncommitted; the
- * offset advances ONLY to the end of the last COMPLETE, parseable line. A
- * killed-hook partial trailing line is NOT folded and NOT skipped past — a
- * later complete append re-reads the now-whole line.
+ * INODE / OFFSET SAFETY: keyed on `(path, inode)`, so a recycled pid reusing a
+ * filename gets a fresh row at offset 0. `stat().size < storedOffset` ⇒ the file
+ * was truncated/replaced ⇒ fall the offset to 0 and re-read from the top. Main
+ * ALWAYS re-reads from the durable offset, NEVER byte 0 unless size proves a reset.
  *
- * INODE / OFFSET SAFETY:
- * - Keyed on `(path, inode)`: a recycled pid re-creating the same filename gets
- *   a DIFFERENT inode ⇒ a fresh row ⇒ offset 0 (no stale carry-over).
- * - `stat().size < storedOffset` ⇒ the file was truncated/replaced (inode reuse
- *   on APFS, or a manual wipe) ⇒ fall the offset to 0 and re-read from the top.
- *   This is the drop-recovery correctness the epic risk flags: main ALWAYS
- *   re-reads from the durable offset, NEVER byte 0 unless the size proves a
- *   reset.
+ * POISON-LINE POLICY: a `parseEventLogLine` → null line inside the
+ * newline-terminated loop is BLANK (advance silently) or POISON (unparseable, a
+ * later append can't fix it). Park poison as a `dead_letters` row with
+ * `status='poison'` (replay's `WHERE status='waiting'` skips it) and a
+ * deterministic `dl_id`, INSERTed `ON CONFLICT DO NOTHING` in the SAME
+ * `BEGIN IMMEDIATE` as the events INSERTs + offset advance, then advance past it.
+ * After COMMIT, emit one backstop record per parked line (best-effort). The
+ * poison arm is reachable ONLY inside the newline loop; the trailing torn
+ * remainder is UNTOUCHED.
  *
- * POISON-LINE POLICY (fn-762): a `parseEventLogLine` → null line INSIDE the
- * newline-terminated loop is classified, in this order:
- *   - BLANK (trimmed-empty bytes): a legitimately empty line in the append log.
- *     ADVANCE past it silently — no dead-letter, no backstop.
- *   - POISON (garbage JSON, non-object, bad/nested/non-finite binding): the line
- *     is unparseable and a later append CANNOT fix it (it is `\n`-terminated and
- *     immutable). PARK it: build a `dead_letters` row with `status='poison'`
- *     (replay's `WHERE status='waiting'` skips it structurally) and a
- *     deterministic `dl_id` (`poison:<basename>:<inode>:<startOffset+lineStart>`),
- *     INSERTed `ON CONFLICT(dl_id) DO NOTHING` in the SAME `BEGIN IMMEDIATE` as
- *     the events INSERTs + offset advance, then ADVANCE past it and CONTINUE the
- *     loop — one scan drains a multi-poison file and ingests the valid lines
- *     after it. After COMMIT, emit one `events-ingest-poison` backstop record per
- *     parked line (best-effort; counters/NDJSON never rate-limited). Because
- *     every parked row value is constructible from data already in hand, the
- *     INSERT can never fail on a well-formed schema — so parking never wedges the
- *     offset worse than today.
- * The poison arm is reachable ONLY inside the newline loop; the trailing torn
- * remainder (bytes after the last `\n`, NO terminator) is UNTOUCHED — it stays
- * unconsumed exactly as before so a mid-write event is never dropped.
+ * A line that PARSES but whose INSERT THROWS rolls the WHOLE transaction back —
+ * the offset does NOT advance, so we never silently skip a real event (block +
+ * retry). The poison-park INSERT rides the same transaction, so a transient
+ * failure rolls both back together.
  *
- * A line that PARSES but whose `INSERT` THROWS (e.g. a forward-compat column from
- * a newer hook surviving the intersection filter, a constraint violation, or a
- * transient DB failure) is logged and the WHOLE transaction rolls back — the
- * offset does NOT advance past it, so we never silently skip a real event (block
- * + retry, never advance). The poison-park INSERT rides inside that same
- * transaction, so a transient DB failure rolls BOTH the events INSERTs and the
- * poison parking back together — identical block-and-retry semantics.
+ * PER-FILE CLEANUP: a file is deleted ONLY when its offset reached EOF AND its
+ * pid is no longer live — a live hook's file is never reaped from under it. NO
+ * size cap (a long session legitimately exceeds it — unlike dead-letter).
  *
- * PER-FILE CLEANUP: a file is deleted ONLY when its offset has reached EOF
- * (every byte ingested) AND its pid is no longer live (`pidAlive` false) — so a
- * still-writing live hook's file is never reaped out from under it, and a
- * fully-drained dead-pid file doesn't accumulate forever. NO 16 MiB size cap
- * (a long session legitimately exceeds it — unlike dead-letter).
- *
- * NEVER THROWS out of the scan: every recoverable error (missing dir, missing
- * file mid-scan, read error, malformed line, INSERT throw) is swallowed to
- * stderr — a single bad file must not wedge boot OR the live message loop.
- * Exported so the test surface can drive it directly without spawning the
- * worker.
- *
- * `ctx` (fn-762, optional) carries the backstop-telemetry sink so a parked
- * poison line emits an `events-ingest-poison` record. When absent (a test that
- * doesn't assert telemetry, or a hypothetical caller before the sidecar is
- * wired), poison lines are STILL parked in `dead_letters` and the offset STILL
- * advances — only the backstop record is skipped. The dead-letter parking
- * itself needs only `db`, so it is unconditional.
+ * NEVER THROWS out of the scan: every recoverable error is swallowed to stderr —
+ * a single bad file must not wedge boot OR the live message loop. When `ctx` is
+ * absent, poison lines are STILL parked and the offset STILL advances; only the
+ * backstop record is skipped.
  */
 export function scanEventsLogDir(
   db: Database,
   dir: string,
   ctx?: EventsIngestContext,
 ): void {
-  // Missing-dir tolerance: a fresh machine has no events-log/ tree, and in
-  // task .1 the hook still INSERTs so the dir stays absent. No-op.
   if (!existsSync(dir)) {
     return;
   }
@@ -936,14 +659,10 @@ export function scanEventsLogDir(
       const bytes = Buffer.from(text, "utf8");
       const unread = bytes.subarray(startOffset);
 
-      // Walk complete (`\n`-terminated) lines. The atomic INSERT + offset
-      // advance is per-COMMIT below; we accumulate the parsed records + the
-      // byte position just past the last complete line, then commit once.
       const records: ReturnType<typeof parseEventLogLine>[] = [];
-      // fn-762: poison lines parked in `dead_letters` (status='poison') inside
-      // the SAME transaction as the events INSERTs + offset advance. The loop
-      // CONTINUES past a poison line (no longer STOPs), so one scan drains a
-      // multi-poison file and ingests the valid lines after it.
+      // Poison lines parked in `dead_letters` (status='poison') inside the SAME
+      // transaction as the events INSERTs + offset advance. The loop CONTINUES
+      // past a poison line, so one scan drains a multi-poison file.
       const poison: {
         dlId: string;
         rawCapped: string;
@@ -958,30 +677,26 @@ export function scanEventsLogDir(
         const lineText = lineBytes.toString("utf8");
         const record = parseEventLogLine(lineText);
         if (record === null) {
-          // `parseEventLogLine` → null is EITHER a blank line OR poison.
-          // Classify INLINE (parseEventLogLine's signature is frozen — the hook
-          // imports it from src/dead-letter.ts, so we can't widen its return).
+          // `parseEventLogLine` → null is EITHER a blank line OR poison;
+          // classify inline (its signature is frozen — the hook imports it).
           if (lineText.trim().length === 0) {
-            // BLANK line (legitimately empty in the append log): advance past it
-            // silently — no dead-letter, no backstop. Fall through to the
-            // consume/advance below.
+            // BLANK line: advance past it silently.
           } else {
             // POISON: an unparseable `\n`-terminated line a later append cannot
-            // fix. Park it (deterministic dl_id keyed on the inode + absolute
-            // start offset → idempotent on any re-scan path) and CONTINUE.
+            // fix. Park it (deterministic dl_id keyed on inode + absolute start
+            // offset → idempotent on re-scan) and CONTINUE.
             const absStart = startOffset + lineStart;
             const absEnd = startOffset + nlIndex + 1; // past the consumed '\n'
             poison.push({
               dlId: `poison:${name}:${inode}:${absStart}`,
-              // Cap the captured raw at 64 KiB so a pathological line can't bloat
-              // the row; the dead_letters bindings blob is for triage, not replay.
+              // Cap captured raw at 64 KiB — the bindings blob is for triage.
               rawCapped: lineText.slice(0, 64 * 1024),
               startOffset: absStart,
               endOffset: absEnd,
             });
           }
-          // Both blank and poison ADVANCE past the line (unlike the old
-          // STOP-at-null behavior) so the offset never sticks on a non-event.
+          // Both blank and poison ADVANCE past the line so the offset never
+          // sticks on a non-event.
           consumed = nlIndex + 1;
           lineStart = nlIndex + 1;
           nlIndex = unread.indexOf(0x0a, lineStart);
@@ -993,20 +708,16 @@ export function scanEventsLogDir(
         lineStart = nlIndex + 1;
         nlIndex = unread.indexOf(0x0a, lineStart);
       }
-      // Any trailing bytes after the last `\n` are an uncommitted partial line
-      // (strict torn-tail) — `consumed` already excludes them, and the poison
-      // arm above is unreachable for it (it has no `\n` so the loop never visits
-      // it). A mid-write event is never dead-lettered or skipped.
+      // Trailing bytes after the last `\n` are an uncommitted partial line
+      // (strict torn-tail) — `consumed` excludes them; a mid-write event is
+      // never dead-lettered or skipped.
       newOffset = startOffset + consumed;
 
       if (records.length > 0 || poison.length > 0) {
         // Atomic: every events INSERT + every poison park + the offset advance
         // in ONE BEGIN IMMEDIATE. A throw rolls ALL back — the offset never
-        // advances past a line we failed to land/park (block + retry), and a
-        // re-scan retries from the unchanged offset. (Reached when there is at
-        // least one event to insert OR one poison to park; the all-blank case
-        // — records and poison both empty but `consumed > 0` — advances the
-        // offset in the `else if` branch below.)
+        // advances past a line we failed to land/park (block + retry). The
+        // all-blank case advances the offset in the `else if` branch below.
         db.run("BEGIN IMMEDIATE");
         try {
           for (const record of records) {
@@ -1016,19 +727,14 @@ export function scanEventsLogDir(
               Object.hasOwn(bindings, c),
             );
             if (presentCols.length === 0) {
-              // A record with no recognized events column is degenerate. Skip
-              // the INSERT but still let the offset advance past it (it carried
-              // no foldable event — unlike a poison column, this is a no-op
-              // line, safe to consume).
+              // No recognized events column: skip the INSERT but let the offset
+              // advance past it (a no-op line, safe to consume).
               continue;
             }
             const placeholders = presentCols.map(() => "?").join(", ");
             const values = presentCols.map((c) => {
               const v = bindings[c];
-              // SQLite storage classes are TEXT / INTEGER / REAL / NULL. The
-              // bindings map is constrained to string / number / boolean /
-              // null; booleans serialize as 0/1 (matches the hook's INSERT
-              // and `recoverOneDeadLetter`).
+              // Booleans serialize as 0/1 (matches the hook's INSERT).
               if (typeof v === "boolean") return v ? 1 : 0;
               return v as string | number | null;
             });
@@ -1036,15 +742,10 @@ export function scanEventsLogDir(
               `INSERT INTO events (${presentCols.join(", ")}) VALUES (${placeholders})`,
             ).run(...values);
           }
-          // fn-762: park every poison line as a `dead_letters` row with
-          // status='poison' (replay's `WHERE status='waiting'` skips it
-          // structurally). `ON CONFLICT(dl_id) DO NOTHING` makes it idempotent
-          // on any re-scan path (e.g. a crash before COMMIT re-presents the same
-          // line at the same offset → same dl_id → no duplicate). Every value is
-          // constructible from data in hand — `ts`/`dl_written_at` are scan
-          // wall-clock (dead_letters is an operational sidecar, never folded, so
-          // no determinism requirement) — so this INSERT can never fail on a
-          // well-formed schema and never wedges the offset worse than before.
+          // Park every poison line as a `dead_letters` row with status='poison'
+          // (replay's `WHERE status='waiting'` skips it). `ON CONFLICT DO NOTHING`
+          // makes it idempotent on re-scan. `ts`/`dl_written_at` are scan
+          // wall-clock — dead_letters is an operational sidecar, never folded.
           const nowSec = Date.now() / 1000;
           for (const p of poison) {
             db.prepare(
@@ -1069,12 +770,9 @@ export function scanEventsLogDir(
           }
           upsertOffsetStmt.run(full, inode, newOffset, Date.now() / 1000);
           db.run("COMMIT");
-          // fn-762: AFTER a durable COMMIT, emit one `events-ingest-poison`
-          // backstop record per parked line (the rescue numerator) when the
-          // telemetry sink is wired. Counters/NDJSON are NEVER rate-limited;
-          // emitting post-COMMIT keeps the metric honest (a rolled-back parse
-          // never counts). Best-effort — `appendBackstopRecord` swallows to
-          // stderr, and a throw here would NOT un-commit the durable park.
+          // After a durable COMMIT, emit one `events-ingest-poison` backstop
+          // record per parked line when the sink is wired. Post-COMMIT keeps the
+          // metric honest (a rolled-back parse never counts); best-effort.
           if (ctx !== undefined && poison.length > 0) {
             for (const p of poison) {
               ctx.counters.bump("events-ingest-poison", "timeout", true);
@@ -1101,9 +799,8 @@ export function scanEventsLogDir(
           } catch {
             // best-effort
           }
-          // The offset did NOT advance (rolled back) — a re-scan retries this
-          // file from the unchanged offset. Log and move to the next file; do
-          // NOT throw out of the scan.
+          // Offset did NOT advance (rolled back) — a re-scan retries from the
+          // unchanged offset. Log and move on; do NOT throw out of the scan.
           console.error(
             `[keeperd] events-log INSERT failed for ${full} (offset stays ${startOffset}): ${
               err instanceof Error ? err.message : String(err)
@@ -1128,15 +825,11 @@ export function scanEventsLogDir(
     }
 
     // Per-file cleanup: delete ONLY when fully drained (offset at EOF) AND the
-    // pid is no longer live. A live hook's still-growing file is never reaped;
-    // a fully-drained dead-pid file doesn't linger. `pidAlive` is a producer-
-    // side liveness probe (permitted — "Only producers probe liveness").
+    // pid is no longer live. `pidAlive` is a producer-side liveness probe.
     if (filePid !== null && newOffset >= size && !pidAlive(filePid)) {
       try {
         unlinkSync(full);
-        // Drop the offset row too so a future inode-reuse at this path starts
-        // clean (the `(path, inode)` key would already isolate it, but pruning
-        // keeps the table from accumulating dead rows).
+        // Drop the offset row too so the table doesn't accumulate dead rows.
         db.prepare(
           "DELETE FROM event_ingest_offsets WHERE path = ? AND inode = ?",
         ).run(full, inode);
@@ -1153,11 +846,9 @@ export function scanEventsLogDir(
 }
 
 /**
- * `process.kill(pid, 0)` — alive iff resolves or EPERM. ESRCH means the pid is
- * gone. Mirrors `src/exit-watcher-ffi.ts:pidAlive` / `server-worker.ts:
- * isPidAlive` deliberately (kept local — two lines — so the ingest scan needs
- * no cross-module import for one syscall). Producer-side probe, used ONLY for
- * the events-log file-cleanup gate — never inside a fold.
+ * `process.kill(pid, 0)` — alive iff it resolves or EPERM; ESRCH means gone.
+ * Producer-side probe, used ONLY for the events-log file-cleanup gate — never
+ * inside a fold.
  */
 function pidAlive(pid: number): boolean {
   try {
@@ -1170,55 +861,23 @@ function pidAlive(pid: number): boolean {
 }
 
 /**
- * Recover ONE oldest `waiting` dead-letter row (fn-643 task .4). Picks the
- * row with the smallest `(dl_written_at, dl_id)` tuple, rebuilds an
- * `events` INSERT from its stored `bindings`, and flips the row to
- * `recovered` (stamping `recovered_at` + `replayed_event_id`) — all in
- * ONE `BEGIN IMMEDIATE` transaction. Returns the recovered row's `dl_id`
- * on success, or `null` when the table had zero `waiting` rows.
+ * Recover ONE oldest `waiting` dead-letter row: pick the smallest
+ * `(dl_written_at, dl_id)`, rebuild an `events` INSERT from its stored
+ * `bindings`, and flip the row to `recovered` — all in ONE `BEGIN IMMEDIATE`.
+ * Returns the recovered `dl_id`, or `null` when no `waiting` rows remain.
  *
- * MUST run on main (the daemon's writer connection); the server-worker's
- * `replay_dead_letter` RPC routes through the worker→main bridge so this
- * write lands here, preserving the CLAUDE.md invariant "main is the sole
- * writer of the events log". The replayed event is a PLAIN REAL event
- * (carrying the original `pid`, `start_time`, `config_dir`, `data`,
- * etc.), NOT a synthetic mint — a from-scratch re-fold against the post-
- * recovery event log reproduces the projection byte-identically (the
- * reducer treats the replayed row exactly as it would have treated the
- * hook's original INSERT had it not failed). `dead_letters` itself is
- * never touched by a re-fold per the schema-v37 invariant.
+ * MUST run on main (the writer connection); the server-worker's
+ * `replay_dead_letter` RPC routes through the worker→main bridge so the write
+ * lands here. The replayed event is a PLAIN REAL event (original `pid`,
+ * `start_time`, `data`, etc.), NOT a synthetic mint — a from-scratch re-fold
+ * reproduces the projection byte-identically. The INSERT column list is
+ * `INGEST_EVENTS_COLUMNS ∩ keys(bindings)`; an unknown column is dropped.
  *
- * Transactional shape (`BEGIN IMMEDIATE`):
- * 1. SELECT the oldest waiting row (`ORDER BY dl_written_at, dl_id LIMIT 1`).
- * 2. If none, COMMIT and return null.
- * 3. Build the INSERT column list from `INGEST_EVENTS_COLUMNS ∩ keys(bindings)`
- *    — the LIVE events shape (fn-762; was the stale fn-643 `EVENTS_COLUMNS`).
- *    Forward-compat: a future-schema binding for an unknown column is dropped
- *    on replay (per the dead-letter docstring's contract).
- * 4. Run the INSERT, capture `lastInsertRowid` as `replayed_event_id`.
- * 5. UPDATE the `dead_letters` row: status='recovered', recovered_at=now,
- *    replayed_event_id=<captured>.
- * 6. COMMIT.
- *
- * A throw inside the transaction rolls back BOTH the INSERT and the
- * UPDATE — the row stays `waiting`, the events log stays untouched, and
- * the dispatcher surfaces `rpc_failed`. The next replay invocation re-
- * tries the same row.
- *
- * Idempotency under re-invocation: a successful recovery flips the row
- * to `recovered`; the same row will never be picked again (the
- * `WHERE status='waiting'` predicate filters it out). Two back-to-back
- * replays drain two rows oldest-first; a third on an empty backlog
- * returns null cleanly.
- *
- * Exported for direct test reach.
+ * A throw rolls back BOTH the INSERT and the UPDATE — the row stays `waiting`,
+ * the events log stays untouched, and the next replay retries it. A recovered
+ * row is never picked again (`WHERE status='waiting'` filters it out).
  */
 export function recoverOneDeadLetter(db: Database): string | null {
-  // bun:sqlite exposes `db.transaction(fn)` for an explicit BEGIN/COMMIT
-  // wrapper, BUT the inline `db.exec("BEGIN IMMEDIATE"); ... COMMIT/
-  // ROLLBACK` form is what the reducer uses (`src/reducer.ts:drain`) and
-  // it composes cleanly with the inline SQL here. Symmetry > API
-  // shape.
   db.run("BEGIN IMMEDIATE");
   let recoveredDlId: string | null = null;
   try {
@@ -1242,22 +901,12 @@ export function recoverOneDeadLetter(db: Database): string | null {
       db.run("COMMIT");
       return null;
     }
-    // Parse the stored bindings. A malformed JSON blob is a real bug
-    // (the import path validated structure on the way in), but a stored
-    // record from a future schema may carry keys we don't know how to
-    // bind — we drop those silently per the forward-compat contract.
-    // Throwing here would leak `rpc_failed` to the client AND leave the
-    // row in `waiting` for the next replay to retry. A schema-bug
-    // diagnostic above (logged) would be nice; for now we rely on the
-    // import path's parser to reject malformed blobs.
     let parsed: unknown;
     try {
       parsed = JSON.parse(row.bindings);
     } catch (err) {
-      // The bindings blob is unparseable. We can't replay the row; throw
-      // so the transaction rolls back and the row stays `waiting` for an
-      // operator to inspect. The error message names the dl_id so logs
-      // pinpoint the offending row.
+      // Unparseable bindings: throw so the transaction rolls back and the row
+      // stays `waiting` for an operator. The dl_id names the offending row.
       throw new Error(
         `replay: bindings JSON parse failed for dl_id ${row.dl_id}: ${
           err instanceof Error ? err.message : String(err)
@@ -1275,15 +924,9 @@ export function recoverOneDeadLetter(db: Database): string | null {
     }
     const bindings = parsed as Record<string, unknown>;
 
-    // Build the INSERT column list from the intersection of the events
-    // column set and the bindings keys. Unknown keys are dropped; missing
-    // known keys bind NULL via the `?? null` in the values mapper below.
-    // The column list is interpolated directly because INGEST_EVENTS_COLUMNS
-    // is a module constant (no wire text); values are bound positionally.
-    // fn-762: bind the LIVE column list (`INGEST_EVENTS_COLUMNS`), not the
-    // stale 29-col fn-643 `EVENTS_COLUMNS` (deleted) — a replayed row carrying
-    // a v48/v51 column (backend-exec coords, `background_task_id`) now lands
-    // it instead of permanently dropping it on recovery.
+    // INSERT column list = events columns ∩ bindings keys. Unknown keys are
+    // dropped. The list is interpolated directly (INGEST_EVENTS_COLUMNS is a
+    // module constant, no wire text); values are bound positionally.
     const presentCols = INGEST_EVENTS_COLUMNS.filter((c) =>
       Object.hasOwn(bindings, c),
     );
@@ -1295,10 +938,7 @@ export function recoverOneDeadLetter(db: Database): string | null {
     const placeholders = presentCols.map(() => "?").join(", ");
     const values = presentCols.map((c) => {
       const v = bindings[c];
-      // SQLite storage classes are TEXT / INTEGER / REAL / NULL /
-      // BLOB. The dead-letter `bindings` map is constrained to
-      // string / number / boolean / null (see
-      // `DeadLetterBindings`); booleans serialize as 0/1 here.
+      // Booleans serialize as 0/1.
       if (typeof v === "boolean") return v ? 1 : 0;
       return v as string | number | null;
     });
@@ -1329,50 +969,27 @@ export function recoverOneDeadLetter(db: Database): string | null {
 
 /**
  * Force the native `@parcel/watcher` N-API addon to dlopen ONCE on the main
- * thread before any watcher worker spawns (fn-701 task .3).
+ * thread before any watcher worker spawns. The daemon spawns several
+ * `@parcel/watcher`-loading workers back-to-back; if their FIRST dlopens race
+ * concurrently, Bun crashes them with `napi_register_module_v1 not found`. A
+ * synchronous `require("@parcel/watcher")` on main forces the first dlopen +
+ * registration to complete BEFORE the spawn block runs, so the worker dlopens no
+ * longer race a not-yet-registered module (each worker still gets its own
+ * `napi_env` — not a shared watcher).
  *
- * The bug: the daemon spawns five `@parcel/watcher`-loading workers (transcript,
- * plan, git, usage, dead-letter) back-to-back. Each does its own
- * `import("@parcel/watcher")` — and if those FIRST dlopens of the addon race
- * concurrently, Bun crashes the workers with `symbol 'napi_register_module_v1'
- * not found in native module` (residual Bun #15942 many-worker-spawn fragility;
- * Bun v1.3.5 already fixed the original main+worker double-load case). On the
- * daemon's actual bun (1.3.14) this was reproduced reliably under N≥16 concurrent
- * worker dlopens; it crash-loops the daemon at boot (every worker rejects → main
- * `fatalExit` → launchd restart → same race).
- *
- * The fix: a synchronous `require("@parcel/watcher")` on main. CJS `require` is
- * synchronous, so it forces the addon's first dlopen + `napi_register_module_v1`
- * to complete on main BEFORE the spawn block runs. Each worker still does its own
- * `import()` and gets its own `napi_env` (this is NOT a shared watcher — the
- * Worker contract's per-worker subscription ownership is untouched), but the
- * addon is already registered, so the worker dlopens no longer race a
- * not-yet-registered module. The repro check confirmed pre-warm ALONE eliminates
- * the failure (0 failures across 40+ runs at N=8/16/24), so NO spawn staggering
- * is needed — the workers may still spawn back-to-back.
- *
- * A GENUINE permanent load failure (missing `node_modules`, ABI mismatch, a
- * truly broken addon) is unrecoverable — there is no in-process self-heal. This
- * helper logs a LOUD boot assertion (bun version + clear context) so a recurrence
- * is diagnosable instead of a silent crash-loop, then RE-THROWS; the caller takes
- * the single recovery path (`process.exit(1)` → launchd restart). It is split out
- * (pure, injectable `loader` + `logError`) so a test can force the failure branch
- * and assert the loud assertion fires without a real broken addon.
- *
- * Exported for direct test reach.
+ * A genuine permanent load failure (missing `node_modules`, ABI mismatch) is
+ * unrecoverable — no in-process self-heal. This logs a LOUD boot assertion then
+ * RE-THROWS; the caller takes the single recovery path (`process.exit(1)` →
+ * launchd restart). Split out (injectable `loader` + `logError`) so a test can
+ * force the failure branch.
  */
 export function prewarmWatcherAddon(
   loader: () => unknown = () => require("@parcel/watcher"),
   logError: (msg: string) => void = (msg) => console.error(msg),
 ): void {
   try {
-    // Synchronous — forces the first dlopen to finish on main before any worker
-    // thread runs its own `import("@parcel/watcher")`.
     loader();
   } catch (err) {
-    // Loud boot assertion. Bun version + explicit context so a recurrence is a
-    // greppable signal, not a silent loop. The caller escalates to fatalExit;
-    // we do NOT downgrade a genuine missing-addon to a warning.
     logError(
       `[keeperd] FATAL: @parcel/watcher addon failed to load after pre-warm ` +
         `on bun ${Bun.version} — the daemon cannot watch filesystem trees and ` +
@@ -1384,26 +1001,9 @@ export function prewarmWatcherAddon(
 }
 
 /**
- * fn-749 — the worker threads {@link startDaemon} spawns, each addressable
- * by a stable name so a test can boot a SUBSET. The names map 1:1 to the
- * `new Worker(...)` sites in {@link startDaemon}:
- *
- *  - `wake`          — `wake-worker.ts`; polls `data_version` and pumps main's
- *                      reducer drain. In keeper's topology the REDUCER itself runs
- *                      on MAIN (`drainToCompletion`), woken by this worker — there
- *                      is no separate "reducer" worker. So any fold-driven test
- *                      needs `wake` (the pump) but NOT a dedicated reducer worker.
- *  - `server`        — `server-worker.ts`; owns the UDS read surface.
- *  - `transcript`    — `transcript-worker.ts`; watcher producer.
- *  - `plan`          — `plan-worker.ts`; `.planctl` watcher producer.
- *  - `exit`          — `exit-watcher.ts`; kqueue/pidfd process-exit watcher.
- *  - `git`           — `git-worker.ts`; git-status watcher producer.
- *  - `usage`         — `usage-worker.ts`; agentuse watcher producer.
- *  - `deadLetter`    — `dead-letter-worker.ts`; dead-letter dir watcher.
- *  - `eventsIngest`  — `events-ingest-worker.ts`; events-log NDJSON watch-hint.
- *  - `autopilot`     — `autopilot-worker.ts`; dispatch reconciler.
- *  - `maintenance`   — `maintenance-worker.ts`; backup + integrity-probe timers.
- *  - `restore`       — `restore-worker.ts`; restore.json snapshot writer.
+ * The worker threads {@link startDaemon} spawns, each addressable by a stable
+ * name so a test can boot a SUBSET. The REDUCER itself runs on MAIN
+ * (`drainToCompletion`), woken by the `wake` worker — there is no reducer worker.
  */
 export type WorkerName =
   | "wake"
@@ -1420,12 +1020,9 @@ export type WorkerName =
   | "restore";
 
 /**
- * fn-749 — the full worker set, in spawn order. This IS the production boot:
- * {@link runDaemon} passes no `workers` selector, so {@link startDaemon} defaults
- * to this list and spawns the identical workers (zero behavior change). The set
- * is the source of truth for the "production boot spawns all workers" regression
- * test. fn-765 added `maintenance` (the twelfth) — the backup + integrity-probe
- * timers, moved off main's fold thread.
+ * The full worker set, in spawn order — the production boot ({@link runDaemon}
+ * passes no `workers` selector, so {@link startDaemon} defaults here). Source of
+ * truth for the "production boot spawns all workers" regression test.
  */
 export const ALL_WORKERS: readonly WorkerName[] = [
   "wake",
@@ -1443,11 +1040,9 @@ export const ALL_WORKERS: readonly WorkerName[] = [
 ] as const;
 
 /**
- * fn-749 — the SIX watcher workers that dlopen `@parcel/watcher`. Used to decide
- * whether the main-thread pre-warm ({@link prewarmWatcherAddon}) is needed: with
- * `disableNativeWatcher` off, the pre-warm runs ONLY when at least one of these
- * is in the selected set (a `wake`+`server`-only boot loads no addon, so there is
- * no first-dlopen race to pre-warm).
+ * The watcher workers that dlopen `@parcel/watcher`. Decides whether the
+ * main-thread pre-warm ({@link prewarmWatcherAddon}) is needed: it runs ONLY when
+ * at least one of these is in the selected set.
  */
 const WATCHER_WORKERS: readonly WorkerName[] = [
   "transcript",
@@ -1459,45 +1054,31 @@ const WATCHER_WORKERS: readonly WorkerName[] = [
 ] as const;
 
 /**
- * fn-747 — options for {@link startDaemon}. The production
- * `import.meta.main → runDaemon()` boot passes none (every field falls to its
- * production default); the in-process test harness sets `disableNativeWatcher`.
+ * Options for {@link startDaemon}. The production `runDaemon()` boot passes none;
+ * the in-process test harness sets these.
  */
 export interface DaemonOptions {
   /**
-   * fn-747 watcher seam. When `true`, every watcher worker (plan / git /
-   * transcript / usage / dead-letter / events-ingest) skips its
-   * `import("@parcel/watcher")` and main skips the {@link prewarmWatcherAddon}
-   * pre-warm — so an in-process daemon runs the fold pipeline WITHOUT a
-   * worker-thread NAPI-addon dlopen (the SIGTRAP source under the parallel
-   * slow-test tier). The plan-worker degrades to its `data_version`-poll +
-   * heartbeat fold path; main's events-log fallback poll still ingests every
-   * NDJSON line. Production leaves it `false` — the live FSEvents fast paths and
-   * the pre-warm are unchanged.
+   * When `true`, every watcher worker skips its `import("@parcel/watcher")` and
+   * main skips the {@link prewarmWatcherAddon} pre-warm — so an in-process daemon
+   * runs the fold pipeline WITHOUT a worker-thread NAPI-addon dlopen (the SIGTRAP
+   * source under the parallel slow-test tier). The plan-worker degrades to its
+   * `data_version`-poll + heartbeat fold path; main's events-log fallback poll
+   * still ingests every NDJSON line.
    */
   disableNativeWatcher?: boolean;
   /**
-   * fn-749 worker-set selector. When supplied, {@link startDaemon} spawns ONLY
-   * the named workers; every unselected worker is never constructed (its
-   * `onmessage`/`onerror`/`close` handlers are never wired and its reference
-   * stays `null`). When OMITTED (the production default), the full
-   * {@link ALL_WORKERS} set spawns — so the `import.meta.main → runDaemon` boot
-   * is byte-for-byte unchanged. The in-process slow-test tier passes a minimal
-   * set (e.g. `["wake", "server"]` for a fold/UDS test) so no watcher worker
-   * dlopens the addon at all. Pick each set DELIBERATELY: a fold-driven test
-   * needs `wake` (main's reducer pump) + `server` (to serve), and a plan-fold
-   * test additionally needs `plan`.
+   * Worker-set selector. When supplied, {@link startDaemon} spawns ONLY the named
+   * workers; every unselected worker stays `null` with no handlers wired. OMITTED
+   * (production default) spawns the full {@link ALL_WORKERS} set.
    */
   workers?: readonly WorkerName[];
 }
 
 /**
- * fn-747 — the handle {@link startDaemon} returns. `stop()` runs the full
- * teardown LOGIC (set shutdown flag → post `{type:"shutdown"}` → race worker
- * `close` vs the deadline → terminate → `db.close()`) WITHOUT `process.exit`, so
- * a test can boot and tear down an in-process daemon many times in one process.
- * `sockPath` is the UDS path the server worker bound (resolved the same way the
- * worker resolves it), so the harness can `waitForDaemon(sockPath)`.
+ * The handle {@link startDaemon} returns. `stop()` runs the full teardown WITHOUT
+ * `process.exit`, so a test can boot and tear down an in-process daemon many
+ * times in one process. `sockPath` is the UDS path the server worker bound.
  */
 export interface DaemonHandle {
   /** Tear down all workers + db WITHOUT `process.exit`. Idempotent. */
@@ -1508,44 +1089,32 @@ export interface DaemonHandle {
 
 /**
  * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
- * same migrate → boot-drain → seed-sweep → worker-spawn sequence as the
- * production boot, but returns a handle whose `stop()` tears everything down
- * WITHOUT `process.exit` — so the in-process slow-test tier (fn-747) can boot a
- * real daemon, fold + query against it, and stop it cleanly, all in one process.
- *
- * The production entry point {@link runDaemon} is a thin wrapper: it calls
- * `startDaemon()` (no opts) and installs the SIGTERM/SIGINT → exit-0 handlers,
- * preserving the launchd `KeepAlive.SuccessfulExit=false` contract byte-for-byte
- * (a clean stop exits 0 → launchd does NOT restart; a crash takes `fatalExit` →
- * exit 1 → restart). `import.meta.main` still gates `runDaemon()` so a plain
- * import stays inert.
+ * same migrate → boot-drain → seed-sweep → worker-spawn sequence as production,
+ * but returns a handle whose `stop()` tears everything down WITHOUT
+ * `process.exit`. The production entry point {@link runDaemon} is a thin wrapper:
+ * `startDaemon()` (no opts) plus the SIGTERM/SIGINT → exit-0 handlers (a clean
+ * stop exits 0 → launchd does NOT restart; a crash takes `fatalExit` → exit 1 →
+ * restart).
  */
 export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   process.title = "keeperd";
-  // fn-749 — resolve the worker-set selector. Omitted → the full ALL_WORKERS
-  // set (production parity: runDaemon passes no selector, so this spawns the
-  // identical worker set). A test passes a minimal subset; `want(name)`
-  // gates each `new Worker(...)` site below. The fold REDUCER runs on MAIN (the
-  // `drainToCompletion` pump) regardless of the selector — it is never a worker.
+  // Worker-set selector; omitted → ALL_WORKERS. `want(name)` gates each
+  // `new Worker(...)` site below. The fold REDUCER runs on MAIN regardless.
   const selectedWorkers = new Set<WorkerName>(opts.workers ?? ALL_WORKERS);
   const want = (name: WorkerName): boolean => selectedWorkers.has(name);
-  // fn-747 — resolve the UDS path the same way the server worker does, so the
-  // returned handle exposes it for `waitForDaemon` (the server worker defaults to
-  // `resolveSockPath()` when `workerData.sockPath` is omitted, which it is).
+  // Resolve the UDS path the same way the server worker does, so the returned
+  // handle exposes it for `waitForDaemon`.
   const sockPath = resolveSockPath();
 
   const dbPath = resolveDbPath();
-  // 256MB page cache on the writer connection: folds run here under the
-  // BEGIN IMMEDIATE write lock, and the default ~8MB cache evicted hot
-  // attribution-index pages between folds — a fold revisiting cold pages on the
-  // ~850MB log paid seconds of I/O and starved concurrent hook INSERTs into
-  // dead-letters. Retaining the working set keeps folds fast (and the lock
-  // short). The short-lived hook deliberately keeps the small default.
+  // 256MB page cache on the writer connection: folds run here under the write
+  // lock, and the small default cache evicted hot attribution-index pages
+  // between folds, paying seconds of I/O on the large log and starving hook
+  // INSERTs. The short-lived hook keeps the small default.
   const { db, stmts } = openDb(dbPath, { cacheSizeKb: 262144 });
 
-  // Plan roots wired to the plan worker below (config → absolute, existing
-  // dirs). Resolved here, in the post-migration window, so the worker spawns
-  // with the same root set the rest of boot uses.
+  // Plan roots wired to the plan worker below. Resolved in the post-migration
+  // window so the worker spawns with the same root set the rest of boot uses.
   const planRoots = resolvePlanRoots();
 
   // Step 2 — boot drain + seed sweep, wrapped in boot-drain WAL tuning so the
@@ -1580,84 +1149,49 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     paceEvents: BOOT_DRAIN_PACE_EVENTS,
   };
 
-  // Step 1b — events-log boot ingest (fn-736 task .1). Land every per-pid
-  // NDJSON line the hook wrote during downtime as an `events` row BEFORE the
-  // boot drain below, so the drain folds those rows in this very boot pass
-  // (the ingester INSERTs at the tail of the log; the drain reads `id > cursor`
-  // and picks them up). MUST precede `drainToCompletion` — mirrors the boot
-  // ordering of the dead-letter scan, but here the write IS into `events`
-  // (the canonical fold source), not an operational sidecar. The scan reads
-  // each file from its DURABLE per-pid byte-offset (exactly-once), is
-  // idempotent under re-scan, and tolerates a missing/empty dir (in task .1
-  // the hook still INSERTs, so the dir is normally absent — a true no-op).
-  // DIRECT writer-connection write (on `db`, main's writer conn) so the INSERT
-  // bumps `data_version` and the downstream pollers wake for free.
-  // Backstop-telemetry sidecar (epic fn-720). Main is the SOLE writer — each
-  // backstop-emitting worker (wired in tasks .2/.3) maintains its own
-  // in-memory counters + `last_fast_path_at` and posts a built
-  // `{kind:"backstop"}` record/rollup up; `handleBackstopMessage` writes the
-  // single NDJSON line. The path is resolved once at boot; the writer opens
-  // for append per-call. `mainBackstopCounters` is held by main for any
-  // main-produced backstop (the pending-dispatch sweep; fn-762's events-ingest
-  // poison parking) and is flushed as an on-shutdown rollup so the denominator
-  // survives a clean stop. Declared BEFORE the boot events-log scan so that
-  // scan can thread the same sink into `scanEventsLogDir` (fn-762 — a poison
-  // line seen by the boot scan still emits a backstop record).
+  // Step 1b — events-log boot ingest. Land every per-pid NDJSON line the hook
+  // wrote during downtime as an `events` row BEFORE the boot drain, so the drain
+  // folds them this boot pass. MUST precede `drainToCompletion`. The scan reads
+  // each file from its DURABLE per-pid byte-offset (exactly-once), is idempotent
+  // under re-scan, and tolerates a missing/empty dir. DIRECT write on `db`
+  // (main's writer conn) so the INSERT bumps `data_version`.
+  //
+  // Backstop-telemetry sidecar: main is the SOLE writer. Each backstop-emitting
+  // worker posts a built `{kind:"backstop"}` record up; `handleBackstopMessage`
+  // writes the single NDJSON line. `mainBackstopCounters` covers any
+  // main-produced backstop and is flushed as an on-shutdown rollup so the
+  // denominator survives a clean stop. Declared BEFORE the boot events-log scan
+  // so that scan can thread the same sink into `scanEventsLogDir`.
   const backstopLogPath = resolveBackstopLogPath();
   const mainBackstopCounters = new BackstopCounters();
-  // Sole-writer entry point: write whatever record/rollup a worker posted up.
-  // Best-effort + swallow-to-stderr lives in `appendBackstopRecord`; this
-  // wrapper exists so the daemon's worker `onmessage` handlers (tasks .2/.3)
-  // route a `{kind:"backstop"}` message through one place.
   const handleBackstopMessage = (msg: BackstopMessage): void => {
     appendBackstopRecord(msg.record, backstopLogPath);
   };
-  // fn-762: the shared telemetry sink every `scanEventsLogDir` call site threads
-  // so a parked poison line emits an `events-ingest-poison` record (sole-writer:
-  // main writes the line directly; the events-ingest worker only posts a
-  // contentless "go look" hint, never a record).
+  // Shared telemetry sink every `scanEventsLogDir` call site threads so a parked
+  // poison line emits a record. Sole-writer: main writes the line directly; the
+  // events-ingest worker only posts a contentless "go look" hint.
   const eventsIngestCtx: EventsIngestContext = {
     counters: mainBackstopCounters,
     backstopLogPath,
   };
 
   const eventsLogDir = resolveEventsLogDir();
-  // fn-742: the events-ingest worker subscribes to this dir ONCE at spawn and
-  // goes inert with NO retry if it's absent (events-ingest-worker.ts: the
-  // `existsSync` skip-and-log). So a deploy that boots the daemon BEFORE the
-  // hook's first NDJSON append leaves the live ingest path permanently dead
-  // until the next restart — the 2026-06-08 incident: the daemon booted ~2s
-  // before the first append, the worker skipped subscribing, and ~35 min of
-  // hook events piled up undrained (recovered only by the next boot scan).
-  // `mkdir` the dir HERE, before the boot scan AND the worker spawn, so the
-  // worker always finds it and subscribes regardless of deploy ordering. The
-  // hook also mkdirs on append; this just guarantees existence at spawn time.
+  // The events-ingest worker subscribes ONCE at spawn and goes inert with NO
+  // retry if the dir is absent. `mkdir` it HERE — before the boot scan AND the
+  // worker spawn — so the worker always finds it regardless of deploy ordering,
+  // never leaving the live ingest path dead until the next restart.
   mkdirSync(eventsLogDir, { recursive: true });
   scanEventsLogDir(db, eventsLogDir, eventsIngestCtx);
 
   withBootDrainCheckpointTuning(db, () => {
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
     seedKilledSweep(db);
-    // fn-667 task .1: unconditional boot-append of an
-    // `AutopilotPaused{paused:true}` re-arm. The autopilot worker boots
-    // PAUSED in memory (safety default); this synthetic event preserves
-    // that safety guarantee in the durable `autopilot_state` projection
-    // so the viewer's banner reads `[paused]` honestly from boot, not
-    // from a hardcoded fallback. The trailing `drainToCompletion` folds
-    // the re-arm BEFORE `serverWorker` spawns below — so a viewer
-    // subscribing the instant the socket opens reads a real row (the
-    // boot re-arm), never an empty surface.
-    //
-    // Raw `db.run` INSERT (not `stmts.insertEvent.run`) mirrors
-    // `seedKilledSweep`'s `insertKilledEvent` pattern — the column list
-    // MUST stay in sync with the prepared-statement form in
-    // `prepareStmts`. A future events-column add touches both sites.
-    //
-    // Re-fold cost: ~1 event per daemon restart. Documented in CLAUDE.md
-    // ("Boot-event-every-start is a generic-ES anti-pattern — but
-    // keeper's re-fold ≠ replay") and in db.ts's v46→v47 stamp slot
-    // — accepted in exchange for re-fold determinism (no migration
-    // seed → `created_at` derived purely from the event log).
+    // Unconditional boot-append of an `AutopilotPaused{paused:true}` re-arm. The
+    // worker boots PAUSED in memory (safety default); this synthetic event
+    // preserves that in the durable `autopilot_state` projection so the viewer's
+    // banner reads `[paused]` honestly from boot. The trailing `drainToCompletion`
+    // folds it BEFORE `serverWorker` spawns. Raw `db.run` INSERT — the column list
+    // MUST stay in sync with the prepared form in `prepareStmts`.
     db.run(
       `INSERT INTO events (
          ts, session_id, pid, hook_event, event_type, tool_name, matcher,
@@ -1668,9 +1202,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
          bash_mutation_kind, bash_mutation_targets, planctl_files
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        Date.now() / 1000, // unix seconds as REAL — matches the hook + every other synthetic
-        "autopilot", // stable synthetic session_id (matches the RPC bridge mint above)
-        null, // pid — synthetic event has no process identity
+        Date.now() / 1000, // unix seconds as REAL
+        "autopilot", // stable synthetic session_id
+        null, // pid
         "AutopilotPaused",
         "autopilot_state", // synthetic event_type tag
         null, // tool_name
@@ -1680,7 +1214,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         null, // agent_id
         null, // agent_type
         null, // stop_hook_active
-        JSON.stringify({ paused: true }), // boot re-arm — always paused
+        JSON.stringify({ paused: true }), // boot re-arm
         null, // subagent_agent_id
         null, // spawn_name
         null, // start_time
@@ -1699,25 +1233,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         null, // planctl_files
       ],
     );
-    // fn-725 task .2: unconditional boot-append of an `AutopilotCapSet`
-    // re-arm carrying the global concurrency cap, minted AFTER the
-    // `AutopilotPaused` re-arm above (so the cap fold always hits the
-    // shared-singleton CONFLICT branch and preserves the just-folded
-    // `paused` flag) and BEFORE the trailing `drainToCompletion` +
-    // `serverWorker` spawn (so a viewer subscribing the instant the socket
-    // opens reads the cap, never an empty/stale surface).
-    //
-    // The cap value is read from config HERE, on main, and FROZEN into the
-    // event payload — `resolveConfig()` is NEVER called inside the fold
-    // (re-fold determinism: a cursor=0 re-drain reproduces the row
-    // byte-identically from the event's own frozen value). `null` =
-    // unlimited round-trips as JSON `null` → SQL NULL → wire null → `∞` in
-    // the viewer. Like `zellijSession` / the `AutopilotPaused` re-arm, the
-    // column LAGS config until the next daemon restart re-mints — the
-    // restart-to-apply contract every keeper config key shares.
-    //
-    // Raw `db.run` INSERT mirrors the `AutopilotPaused` re-arm above; the
-    // column list MUST stay in sync with `prepareStmts`' prepared form.
+    // Unconditional boot-append of an `AutopilotCapSet` re-arm carrying the
+    // global concurrency cap, minted AFTER the `AutopilotPaused` re-arm (so the
+    // cap fold hits the shared-singleton CONFLICT branch and preserves the
+    // just-folded `paused` flag) and BEFORE the trailing `drainToCompletion`. The
+    // cap value is read from config HERE, on main, and FROZEN into the payload —
+    // `resolveConfig()` is NEVER called inside the fold (re-fold determinism). The
+    // column LAGS config until the next restart re-mints. Raw `db.run` INSERT —
+    // column list MUST stay in sync with `prepareStmts`.
     db.run(
       `INSERT INTO events (
          ts, session_id, pid, hook_event, event_type, tool_name, matcher,
@@ -1728,7 +1251,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
          bash_mutation_kind, bash_mutation_targets, planctl_files
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       [
-        Date.now() / 1000, // unix seconds as REAL — matches the hook + every other synthetic
+        Date.now() / 1000, // unix seconds as REAL
         "autopilot", // stable synthetic session_id
         null, // pid
         "AutopilotCapSet",
@@ -1740,8 +1263,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         null, // agent_id
         null, // agent_type
         null, // stop_hook_active
-        // Config read on MAIN, frozen into the payload. `?? null` keeps the
-        // JSON value a literal `null` (= unlimited) when config omits the key.
+        // Config read on MAIN, frozen into the payload. `?? null` = unlimited.
         JSON.stringify({
           max_concurrent_jobs: resolveConfig().maxConcurrentJobs ?? null,
         }),
@@ -1766,62 +1288,43 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
   });
 
-  // Step 2b — dead-letter boot import (fn-643 task .3). Read every NDJSON
-  // file the hook wrote during downtime / since the last daemon run and
-  // INSERT OR IGNORE each parsed record into `dead_letters` as `waiting`.
-  // MUST run before the dead-letter worker spawns (and before the server
-  // worker starts serving): a board client subscribing the moment the
-  // socket comes up must see the full `waiting` backlog, not a partially
-  // imported one. The scan is idempotent (`INSERT OR IGNORE` on `dl_id`),
-  // so a re-scan is harmless. Missing dir is tolerated (fresh machine).
-  // This is a DIRECT operational-table write — NOT an event fold.
+  // Step 2b — dead-letter boot import. Read every NDJSON file the hook wrote
+  // during downtime and INSERT OR IGNORE each parsed record into `dead_letters`
+  // as `waiting`. MUST run before the dead-letter worker AND the server worker
+  // start serving so a board client sees the full backlog. Idempotent
+  // (`INSERT OR IGNORE` on `dl_id`); a DIRECT operational-table write, NOT a fold.
   const deadLetterDir = resolveDeadLetterDir();
   scanDeadLetterDir(db, deadLetterDir);
 
   // Coalescing flag: every wake sets it; the run loop resets it before each
   // drain pass. A wake arriving mid-drain leaves the flag set, so the loop runs
-  // one more pass. No event is ever missed because drain re-reads from the
-  // cursor on every pass.
+  // one more pass — no event is missed (drain re-reads from the cursor).
   let wakePending = false;
   let draining = false;
   let shuttingDown = false;
 
-  // Autopilot in-memory paused flag (fn-661 task .4). Boots PAUSED — the
-  // safety default per the epic rollout invariant "first run after deploy
-  // dispatches nothing until the human plays". Lives ONLY in main's
-  // memory (never persisted; never RPC-writable except via the
-  // `set_autopilot_paused` RPC below, which round-trips through the
-  // worker-→main bridge and back). The autopilot worker is told via
-  // the existing main→worker `{ type: "set-paused", paused }` channel.
+  // Autopilot in-memory paused flag. Boots PAUSED (safety default). Lives ONLY
+  // in main's memory — never persisted, never RPC-writable except via the
+  // `set_autopilot_paused` RPC. The worker is told via the main→worker
+  // `{ type: "set-paused", paused }` channel.
   let autopilotPaused = true;
-  // Forward reference filled in below when the autopilot worker spawns.
-  // The server-worker's bridge handlers (registered just below) capture
-  // this via closure so the relay can target the autopilot worker even
-  // though the worker reference is assigned later in this function. Until
-  // the worker is constructed (a narrow boot window between the bridge
-  // wire-up and the actual `new Worker(...)` call), bridge requests
-  // resolve `ok:false, error="autopilot worker not yet ready"` — a
-  // best-effort surface for the otherwise-impossible boot race.
+  // Forward references filled in when the workers spawn below; the bridge
+  // handlers capture these via closure. Until a worker is constructed, a bridge
+  // request resolves `ok:false` — a tolerated no-op for the boot-window race.
   let autopilotWorker: Worker | null = null;
-  // Forward reference to the git worker (constructed AFTER the plan worker),
-  // captured by the plan-worker `onmessage` handler's fn-705 discovery-nudge
-  // forward. The plan-worker posts a `nudge-discovery` the first time it sees a
-  // `.planctl` tree in a repo; main relays it to the git-worker as an
-  // `add-discovery-root` so the git-worker watches that repo's `.git`
-  // immediately. `null` until the git worker is constructed — a nudge during
-  // that boot window is a tolerated no-op (the next full discovery sweep
-  // recovers it), mirroring the `autopilotWorker` ordering tolerance.
+  // The plan-worker posts a `nudge-discovery` the first time it sees a `.planctl`
+  // tree; main relays it to the git-worker as an `add-discovery-root`. `null`
+  // until the git worker is constructed — a nudge during that window is a no-op
+  // (the next discovery sweep recovers it).
   let gitWorkerRef: Worker | null = null;
-  // fn-749 — forward declaration of the server worker. `pumpWakes` (defined
-  // just below) captures this via closure to `kick` the server after a drain;
-  // the actual `new Worker(...)` lands further down, gated on the selector. The
-  // `?.` in `pumpWakes` tolerates the null window (and a server-less boot).
+  // `pumpWakes` captures this via closure to `kick` the server after a drain; the
+  // `?.` tolerates the null window (and a server-less boot).
   let serverWorker: Worker | null = null;
 
   /**
-   * Process the wake signal. Re-entrancy guard (`draining`) ensures we never
-   * call drain recursively if a wake lands while we're already inside the loop;
-   * that wake just leaves `wakePending` set for the in-flight loop to pick up.
+   * Process the wake signal. The re-entrancy guard (`draining`) ensures we never
+   * drain recursively if a wake lands mid-loop; that wake just leaves
+   * `wakePending` set for the in-flight loop to pick up.
    */
   function pumpWakes(): void {
     if (draining) {
@@ -1838,60 +1341,37 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } finally {
       draining = false;
     }
-    // fn-694 lever B: kick the server-worker AFTER the drain loop returns
-    // (post-COMMIT) so it runs `diffTick` immediately instead of waiting for
-    // its next ~50ms poll tick — collapsing the second of the two serial
-    // `data_version` polls in the hook→fold→patch pipeline. Posted strictly
-    // after `drainToCompletion` so the worker never reads a pre-commit
-    // `data_version`. The worker's level-triggered `pollLoop` stays as the
-    // backstop for any lost-wakeup; the kick handler is idempotent (diffTick
-    // is version-gated). Skip on a no-op pump (re-entrant wake that folded
-    // nothing) and during shutdown.
+    // Kick the server-worker AFTER the drain loop returns (post-COMMIT) so it
+    // runs `diffTick` immediately instead of waiting for its next poll tick.
+    // Posted strictly after `drainToCompletion` so the worker never reads a
+    // pre-commit `data_version`; the worker's `pollLoop` is the lost-wakeup
+    // backstop and the kick is idempotent. Skip a no-op pump and shutdown.
     if (folded && !shuttingDown) {
-      // fn-749: null-guarded — a boot without the server worker has no UDS
-      // surface to kick; the fold still ran on main.
       serverWorker?.postMessage({ type: "kick" } satisfies KickMessage);
     }
   }
 
   // Step 2d — pre-warm the native @parcel/watcher addon ON MAIN before ANY
-  // worker spawns (fn-701 task .3). Five of the workers below
-  // (transcript / plan / git / usage / dead-letter) each run
-  // their own `import("@parcel/watcher")`; spawned back-to-back, their FIRST
-  // dlopens race and crash with `napi_register_module_v1 not found` (residual
-  // Bun #15942). A synchronous main-thread require forces a single serialized
-  // first dlopen so the addon is already registered when the workers import it
-  // — the repro check showed this ALONE fixes the race (no spawn staggering
-  // needed). A genuine permanent load failure logs the loud boot assertion
-  // inside the helper, then we take the single recovery path. See
-  // {@link prewarmWatcherAddon}.
-  // fn-747 watcher seam: when the watcher workers won't dlopen the addon at all
-  // (in-process tier), there is no first-dlopen race to pre-warm — and we MUST
-  // NOT load the addon on main either, or the in-process daemon dlopens it after
-  // all (defeating the SIGTRAP avoidance). Skip the pre-warm entirely in that
-  // mode.
-  // fn-749 — also skip the pre-warm when NO watcher worker is in the selected
-  // set: a `wake`+`server`-only boot loads no addon on any thread, so there is
-  // no first-dlopen race to serialize. (Production selects all six, so the
-  // pre-warm runs exactly as before.)
+  // worker spawns. See {@link prewarmWatcherAddon}. Skip it when the watcher
+  // workers won't dlopen the addon (in-process tier — loading it on main would
+  // defeat the SIGTRAP avoidance) or when NO watcher worker is selected (no
+  // first-dlopen race to serialize).
   const anyWatcherSelected = WATCHER_WORKERS.some((n) => want(n));
   if (!opts.disableNativeWatcher && anyWatcherSelected) {
     try {
       prewarmWatcherAddon();
     } catch {
-      // The loud assertion (bun version + context) already fired inside the
-      // helper. Escalate to the sole recovery path — exit non-zero so launchd
-      // restarts us. NO in-process self-heal.
+      // The loud assertion already fired inside the helper. Take the sole
+      // recovery path — exit non-zero so launchd restarts us. NO self-heal.
       fatalExit();
       return null as unknown as DaemonHandle;
     }
   }
 
-  // Step 3 — spawn the wake worker. Bun uses the web Worker API; `workerData`
-  // is a worker_threads option not in the DOM lib type, hence the cast.
-  // fn-749: gated on the selector. `null` when unselected — but a daemon
-  // without the wake worker never pumps main's reducer drain on a foreign-
-  // connection write, so a fold-driven test MUST include `wake`.
+  // Step 3 — spawn the wake worker. Bun uses the web Worker API; `workerData` is
+  // a worker_threads option not in the DOM lib type, hence the cast. A daemon
+  // without the wake worker never pumps main's reducer drain, so a fold-driven
+  // test MUST include `wake`.
   let worker: Worker | null = null;
   if (want("wake")) {
     worker = new Worker(new URL("./wake-worker.ts", import.meta.url).href, {
@@ -1906,25 +1386,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
     };
 
-    // Worker `error` event is NOT a message — it signals the worker thread
-    // itself failed. Per the single-recovery-path policy: crash → exit 1 →
-    // launchd restarts. Do NOT attempt to respawn the worker in-process. The
-    // `!shuttingDown` guard mirrors the `close` handler below (and every other
-    // worker's onerror): once shutdown() is underway a worker erroring
-    // mid-teardown is moot — the worker-exit race in shutdown() already
-    // backstops a wedge — so it must NOT clobber the clean `exit(0)`. Without
-    // it, a SIGTERM landing while a worker was mid-operation intermittently
-    // failed the integration suite (daemon exited 1, not 0) under parallel load.
+    // Worker `error` is NOT a message — the worker thread itself failed. Single
+    // recovery path: crash → exit 1 → launchd restarts; never respawn in-process.
+    // The `!shuttingDown` guard (mirrored on every worker's onerror) keeps a
+    // worker erroring mid-teardown from clobbering the clean `exit(0)`.
     worker.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] wake worker error:", err.message ?? err);
       if (!shuttingDown) fatalExit();
     };
 
-    // A worker `process.exit(1)` (e.g. its own fatalExit) fires `close`, NOT
-    // `onerror` — so the steady-state crash path needs its own listener, or a
-    // crashing worker leaves a zombie daemon and launchd is never notified. The
-    // `!shuttingDown` guard makes this a no-op on the clean path (shutdown()
-    // sets the flag before posting `{ type: "shutdown" }`), avoiding a double
+    // A worker `process.exit(1)` fires `close`, NOT `onerror` — so the crash path
+    // needs its own listener, or a crashing worker leaves a zombie daemon. The
+    // `!shuttingDown` guard makes this a no-op on the clean path, avoiding a double
     // exit.
     worker.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
@@ -1936,9 +1409,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // acquires the ownership lock, and runs its own `data_version` poll — fully
   // decoupled from the reducer. `dbPath` is the only required field; sock/lock
   // paths default to `resolveSockPath()` worker-side (KEEPER_SOCK honored there).
-  // fn-749: gated on the selector. `serverWorker` was forward-declared above
-  // (for `pumpWakes`'s kick); assign it here when selected. A boot without the
-  // server worker binds no UDS — a query/RPC test MUST include `server`.
+  // `serverWorker` was forward-declared above (for `pumpWakes`'s kick); assign
+  // it here when selected. A boot without the server worker binds no UDS — a
+  // query/RPC test MUST include `server`.
   if (want("server")) {
     serverWorker = new Worker(
       new URL("./server-worker.ts", import.meta.url).href,
@@ -1946,16 +1419,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: { dbPath, role: "server" } satisfies ServerWorkerData,
       } as WorkerOptions & { workerData: unknown },
     );
-    // fn-749: a non-null local so the bridge closures below don't have to
-    // re-narrow the nullable `serverWorker` field on every reply.
+    // A non-null local so the bridge closures don't re-narrow the nullable field.
     const sw = serverWorker;
 
-    // Server-worker → main bridge. Originally the `replay_dead_letter`
-    // round-trip (fn-643 task .4); extended for fn-661 task .4 with the
-    // autopilot pause/retry pair. Every inbound message carries a `kind`
-    // discriminator so a stale reply for one verb can't wrong-resolve
-    // another. The `{kind:"ready"}` signal is one-way (worker→main only)
-    // and matches no branch — silently dropped.
+    // Server-worker → main bridge. Every inbound message carries a `kind`
+    // discriminator so a stale reply for one verb can't wrong-resolve another.
+    // The `{kind:"ready"}` signal is one-way (worker→main) and matches no branch.
     sw.onmessage = (
       ev: MessageEvent<
         | ReplayRequestMessage
@@ -1981,17 +1450,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             recovered_dl_id: recoveredDlId,
           };
           if (recoveredDlId !== null) {
-            // We appended a real `events` row. Pump a wake so the reducer
-            // folds it (jobs / epics / etc.) without waiting for the wake
-            // worker's `data_version` poll — symmetry with the other
-            // synthetic-event mint sites in this file.
+            // Appended a real `events` row — pump a wake so the reducer folds it
+            // without waiting for the wake worker's `data_version` poll.
             wakePending = true;
             pumpWakes();
           }
         } catch (err) {
-          // The recovery transaction crashed (programming bug or a DB-level
-          // failure). Surface as a typed `ok:false` reply; the worker's
-          // dispatcher frames `rpc_failed` on the wire.
+          // Recovery transaction crashed — surface as a typed `ok:false` reply;
+          // the worker's dispatcher frames `rpc_failed` on the wire.
           reply = {
             type: "replay-result",
             id,
@@ -2003,30 +1469,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         return;
       }
       if (msg.kind === "set-autopilot-paused-request") {
-        // Fn-661 task .4 / fn-667 task .1. APPEND an `AutopilotPaused`
-        // synthetic event FIRST onto the writable connection so the reducer
-        // folds it into the `autopilot_state` singleton on the next drain
-        // (the viewer's banner-truth substrate). THEN — only on a successful
-        // insert — flip the in-memory `autopilotPaused` flag and relay a
-        // `{type:"set-paused"}` command to the autopilot worker. Order
-        // matters: the gate (worker dispatch decision) and the projection
-        // (viewer-visible state) MUST NOT diverge on a partial failure. If
-        // the insert throws, neither side flips and the RPC returns
-        // `ok:false` — the human's pause/play attempt is rejected loud
-        // rather than silently dropped half-way.
-        //
-        // Mirrors the retry-dispatch handler's mint pattern (same column
-        // list — keep them in sync on any future events-column add). The
-        // session_id is a stable synthetic constant (`"autopilot"`) so
-        // every AutopilotPaused row groups onto the same key — useful for
-        // event-log scans and matches the producer-side convention every
-        // other singleton-bound synthetic uses.
-        //
-        // Surfaces `ok:false` ONLY if the autopilot worker isn't constructed
-        // yet (a narrow boot race between this bridge wire-up and the worker
-        // spawn below) OR the insert throws (a writer-lock contention or DB
-        // failure). The worker is always present in steady state; the
-        // insert is one prepared-statement run, no scan.
+        // APPEND an `AutopilotPaused` synthetic event FIRST so the reducer folds
+        // it into the `autopilot_state` singleton, THEN — only on a successful
+        // insert — flip the in-memory `autopilotPaused` flag and relay
+        // `{type:"set-paused"}` to the worker. Order matters: the gate (dispatch
+        // decision) and the projection (viewer state) MUST NOT diverge on a
+        // partial failure. If the insert throws, neither flips and the RPC
+        // returns `ok:false`. Column list MUST stay in sync with the other
+        // synthetic mints. Surfaces `ok:false` only if the worker isn't yet
+        // constructed (boot race) or the insert throws.
         let reply: SetAutopilotPausedResultMessage;
         if (autopilotWorker === null) {
           reply = {
@@ -2072,9 +1523,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
             });
             wakePending = true;
             pumpWakes();
-            // Only AFTER the event is durably appended do we flip the
-            // in-memory gate + relay to the worker. A throw above leaves
-            // both untouched.
+            // Flip the in-memory gate + relay only AFTER the event is durably
+            // appended; a throw above leaves both untouched.
             autopilotPaused = msg.paused;
             autopilotWorker.postMessage({
               type: "set-paused",
@@ -2098,22 +1548,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         return;
       }
       if (msg.kind === "set-autopilot-mode-request") {
-        // Fn-751 task .3. APPEND an `AutopilotMode` synthetic event onto the
-        // writable connection so the reducer folds it into the
-        // `autopilot_state` singleton's `mode` column, then pump a wake.
-        //
-        // APPEND-ONLY — and DELIBERATELY no `postMessage` relay to the
-        // autopilot worker (unlike the set-autopilot-paused handler above):
-        // the reconciler is level-triggered and re-reads `mode` from the
-        // projection EVERY cycle, woken by the fold's `data_version` bump.
-        // Mode is durable user intent (persisted in the projection), not a
-        // safety reset like `paused`, so there is no in-memory main-side flag
-        // and no boot re-arm. DO NOT "fix" this back to a relay.
-        //
-        // Same ~30-column insertEvent shape as every other synthetic minted
-        // on main (`$session_id: "autopilot"` groups every autopilot_state row
-        // onto the same key; `$event_type: "autopilot_state"` matches the
-        // reducer's fold arm). The mode enum is already validated handler-side.
+        // APPEND an `AutopilotMode` synthetic event so the reducer folds it into
+        // the `autopilot_state` singleton's `mode` column, then pump a wake.
+        // APPEND-ONLY, and DELIBERATELY no relay to the worker: the reconciler is
+        // level-triggered and re-reads `mode` from the projection every cycle.
+        // Mode is durable user intent, not a safety reset like `paused`, so there
+        // is no in-memory flag and no boot re-arm. DO NOT "fix" this to a relay.
         const id = msg.id;
         let reply: SetAutopilotModeResultMessage;
         try {
@@ -2165,30 +1605,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         return;
       }
       if (msg.kind === "set-epic-armed-request") {
-        // Fn-751 task .3. APPEND an `EpicArmed` synthetic event onto the
-        // writable connection so the reducer folds it into the `armed_epics`
-        // PRESENCE table (`armed:true` → row INSERT, `armed:false` → row
-        // DELETE), then pump a wake.
+        // APPEND an `EpicArmed` synthetic event so the reducer folds it into the
+        // `armed_epics` PRESENCE table (`armed:true` → INSERT, `armed:false` →
+        // DELETE), then pump a wake. APPEND-ONLY, same NO-relay contract as
+        // set-autopilot-mode: the reconciler re-reads the armed set each cycle.
         //
-        // APPEND-ONLY — same NO-relay contract as the set-autopilot-mode
-        // handler above: the reconciler re-reads the armed set from the
-        // projection each cycle. The wire `epic_id` is a non-empty token
-        // (validated handler-side); main appends it for the fold-lag race
-        // where a freshly-planned epic isn't yet in the `epics` projection.
-        // The `$session_id` carries the epic id so a re-fold can correlate the
-        // event to its row without re-parsing the data blob.
-        //
-        // fn-774 task .2 — ONE carve-out from the otherwise-unconditional
-        // append: an `armed:true` request against an epic that is PRESENT in
-        // the `epics` projection AND `status='done'` is REJECTED here, before
-        // the append, so the arm-after-done ordering hole the fold-prune alone
-        // can't reach is closed. The two untouched cases preserve fold-lag
-        // tolerance: `armed:false` (disarm) ALWAYS succeeds — you must be able
-        // to clear a stuck row — and an ABSENT `epics` row (not-yet-folded)
-        // is STILL allowed, because a `done` epic is definitionally folded, so
-        // this guard never rejects a legitimately-racing arm. The status read
-        // uses main's writer `db` (the worker-side handler is contractually
-        // forbidden a DB connection).
+        // ONE carve-out: an `armed:true` request against an epic PRESENT in the
+        // `epics` projection AND `status='done'` is REJECTED before the append,
+        // closing the arm-after-done hole the fold-prune can't reach. `armed:false`
+        // (disarm) ALWAYS succeeds, and an ABSENT (not-yet-folded) epics row is
+        // STILL allowed — a `done` epic is definitionally folded, so this never
+        // rejects a legitimately-racing arm. The status read uses main's writer
+        // `db` (the worker-side handler is forbidden a DB connection).
         const id = msg.id;
         let reply: SetEpicArmedResultMessage;
         try {
@@ -2254,14 +1682,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         return;
       }
       if (msg.kind === "retry-dispatch-request") {
-        // Fn-661 task .4. Append a `DispatchCleared` synthetic event onto
-        // the writable connection so the reducer's fold arm DELETEs the
-        // matching `dispatch_failures` row on the next drain. Mirrors the
-        // git-worker mint pattern (insertEvent.run + wakePending=true +
-        // pumpWakes). The wire `verb` is already validated to be one of
-        // `work` / `close` / `approve`; the wire `dispatch_id` is a
-        // non-empty token (validated handler-side); main treats both as
-        // opaque payload tokens.
+        // Append a `DispatchCleared` synthetic event so the reducer's fold arm
+        // DELETEs the matching `dispatch_failures` row on the next drain. The
+        // wire `verb` / `dispatch_id` are validated handler-side; main treats
+        // both as opaque payload tokens.
         const id = msg.id;
         let reply: RetryDispatchResultMessage;
         try {
@@ -2271,11 +1695,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           });
           stmts.insertEvent.run({
             $ts: Date.now() / 1000,
-            // The dispatch key rides as the entity-key overload so a
-            // re-fold can correlate the event to its dispatch_failures
-            // row without re-parsing the data blob. Same convention as
-            // every other synthetic minted on main (the producer-side
-            // composite `${verb}::${id}` is unambiguous).
+            // The dispatch key rides as the entity-key overload so a re-fold can
+            // correlate the event to its dispatch_failures row without re-parsing
+            // the data blob. The composite `${verb}::${id}` is unambiguous.
             $session_id: `${msg.verb}::${msg.dispatch_id}`,
             $pid: null,
             $hook_event: "DispatchCleared",
@@ -2331,13 +1753,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     };
 
     // Same crash-via-`close` gap as the wake worker: a server-worker
-    // `process.exit(1)` fires `close`, not `onerror`. Without this the subscribe
-    // server could silently vanish while the reducer kept running. `!shuttingDown`
-    // makes it inert on the clean shutdown path.
+    // `process.exit(1)` fires `close`, not `onerror`. `!shuttingDown` makes it
+    // inert on the clean shutdown path.
     sw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (want("server"))`
+  } // end `if (want("server"))`
 
   // Spawn the transcript worker in the SAME post-migration window. It watches
   // the external transcript tree and posts a `transcript-title` message whenever
@@ -2351,8 +1772,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       "[keeperd] KEEPER_WATCH_ROOT is deprecated and ignored; set `claude_projects_root` in ~/.config/keeper/config.yaml instead",
     );
   }
-  // fn-749: gated on the selector — `null` when unselected, and the handler
-  // wiring below is guarded so it is never touched.
+  // Gated on the selector — `null` when unselected; the handler wiring below is
+  // guarded so it is never touched.
   const transcriptWorker = want("transcript")
     ? new Worker(new URL("./transcript-worker.ts", import.meta.url).href, {
         workerData: {
@@ -2363,18 +1784,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       } as WorkerOptions & { workerData: unknown })
     : null;
 
-  // fn-749: wire handlers only when the worker was selected (`tw` is the
-  // non-null narrowing of the nullable field).
+  // Wire handlers only when the worker was selected.
   if (transcriptWorker) {
     const tw = transcriptWorker;
     // Main stays the SOLE writer: a worker `transcript-title` message becomes a
-    // synthetic `TranscriptTitle` events row inserted on the existing WRITABLE
-    // connection, then a wake pump folds it (priority-3 'transcript' title). The
-    // insert is synchronous on the main thread and so cannot interleave with the
-    // synchronous drain inside pumpWakes. Bindings are named — see the comment on
-    // `stmts.insertEvent` in `src/db.ts` for why. The title rides in
-    // `data.session_title` (the same field the reducer's title rule reads);
-    // everything else is NULL (synthetic — never carries a process identity).
+    // synthetic `TranscriptTitle` events row on the WRITABLE connection, then a
+    // wake pump folds it. The title rides in `data.session_title` (the field the
+    // reducer's title rule reads); everything else is NULL (synthetic).
     tw.onmessage = (
       ev: MessageEvent<
         | TranscriptTitleMessage
@@ -2389,18 +1805,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         return;
       }
       if (msg.kind === "backstop") {
-        // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
-        // writer — append the line and return. NOT an event fold (a pure
-        // consumer-side side-file, never read by the reducer).
+        // A backstop rescue/rollup record. Main is the SOLE sidecar writer —
+        // append the line. NOT an event fold (never read by the reducer).
         handleBackstopMessage(msg);
         return;
       }
       if (msg.kind === "transcript-title") {
         stmts.insertEvent.run({
-          $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+          $ts: Date.now() / 1000, // unix seconds as REAL
           $session_id: msg.sessionId, // == job_id
           $pid: null,
-          $hook_event: "TranscriptTitle", // synthetic; reducer maps → 'transcript'
+          $hook_event: "TranscriptTitle", // reducer maps → 'transcript'
           $event_type: "transcript_title",
           $tool_name: null,
           $matcher: null,
@@ -2429,31 +1844,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $backend_exec_session_id: null,
           $backend_exec_pane_id: null,
         });
-        // Our own INSERT bumps data_version, so the wake worker would re-drain
-        // anyway — but pump directly so the title folds without a poll-cycle delay.
+        // Our own INSERT bumps data_version — pump directly so the title folds
+        // without a poll-cycle delay.
         wakePending = true;
         pumpWakes();
         return;
       }
       if (msg.kind === "api-error") {
-        // Synthetic `ApiError` event minted from the transcript-worker
-        // signal — Claude Code wrote its `isApiErrorMessage: true` synthetic
-        // assistant turn to the JSONL, naming the failure mode via a
-        // bare-string `error` field (`rate_limit` / `authentication_failed` /
-        // `billing_error` / `server_error` / `invalid_request`; anything
-        // else routed through the matcher's `"unknown"` fallback). The
-        // reducer's dual-case `RateLimited` / `ApiError` arm (schema v24)
-        // folds this row by flipping `jobs.state` to `'stopped'` AND
-        // stamping `(last_api_error_at, last_api_error_kind)` to the event
-        // ts + the matched kind in a single compound UPDATE
-        // (re-fold-deterministic). Everything other than `session_id` /
-        // `hook_event` / `event_type` / `data` is NULL — synthetics never
-        // carry a process identity. The matched kind rides in `data.kind`
-        // (read by the reducer's `extractApiErrorKind`); the display text
-        // rides alongside in `data.text` for downstream consumers. The
-        // pre-v24 `RateLimited` event_type is still folded by the same arm
-        // via the dual-case alias so the historical event log re-folds
-        // byte-deterministically — we never re-mint it.
+        // Synthetic `ApiError` event minted from the transcript-worker signal.
+        // The reducer's `ApiError` arm folds it by flipping `jobs.state` to
+        // 'stopped' AND stamping `(last_api_error_at, last_api_error_kind)` in
+        // one compound UPDATE. The matched kind rides in `data.kind`, the display
+        // text in `data.text`; everything else is NULL (synthetic).
         stmts.insertEvent.run({
           $ts: Date.now() / 1000,
           $session_id: msg.sessionId,
@@ -2493,23 +1895,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
       if (msg.kind === "input-request") {
         // Synthetic `InputRequest` event minted from the transcript-worker
-        // signal — Claude Code used a built-in interactive tool that fires
-        // no Pre/PostToolUse hook of its own (initially `AskUserQuestion`).
-        // The reducer's `InputRequest` arm (schema v25) folds this row by
-        // flipping `jobs.state` to `'stopped'` AND stamping
-        // `(last_input_request_at, last_input_request_kind)` to the event
-        // ts + the matched kind in a single compound UPDATE
-        // (re-fold-deterministic). Everything other than `session_id` /
-        // `hook_event` / `event_type` / `data` is NULL — synthetics never
-        // carry a process identity. The matched kind rides in `data.kind`
-        // (read by the reducer's `extractInputRequestKind`). Mirrors the
-        // `api-error` branch above structurally; the transcript matcher
-        // arrives in task .2 of fn-617 — until then no `InputRequest`
-        // event ever lands and this branch is unreachable in practice,
-        // but landing the mint + the reducer arm together preserves the
-        // re-fold determinism invariant (an event log emitted by a
-        // future task .2 must fold the same way under a re-fold from
-        // scratch on this code).
+        // signal — a built-in interactive tool that fires no Pre/PostToolUse hook
+        // of its own. The reducer's `InputRequest` arm folds it by flipping
+        // `jobs.state` to 'stopped' AND stamping `(last_input_request_at,
+        // last_input_request_kind)` in one compound UPDATE. The matched kind
+        // rides in `data.kind`; everything else is NULL (synthetic).
         stmts.insertEvent.run({
           $ts: Date.now() / 1000,
           $session_id: msg.sessionId,
@@ -2560,16 +1950,16 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     tw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (transcriptWorker)`
+  } // end `if (transcriptWorker)`
 
   // Spawn the plan worker in the SAME post-migration window. It watches each
   // configured project root's `.planctl/{epics,tasks}` trees and posts a
   // `plan-epic`/`plan-task` snapshot message on each change — the second
   // producer-worker instance. `roots` come from `resolvePlanRoots()` (config →
   // absolute, existing dirs); an empty list means there is nothing to watch.
-  // fn-749: gated on the selector. Cross-referenced by the git-worker handler
-  // (the fn-681 planctl-commit-changed forward) via `planWorker?.postMessage` —
-  // null-safe when unselected.
+  // Gated on the selector. Cross-referenced by the git-worker handler (the
+  // planctl-commit-changed forward) via `planWorker?.postMessage` — null-safe
+  // when unselected.
   const planWorker = want("plan")
     ? new Worker(new URL("./plan-worker.ts", import.meta.url).href, {
         workerData: {
@@ -2583,36 +1973,27 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   if (planWorker) {
     const pw = planWorker;
     // Main stays the SOLE writer: a `plan-epic`/`plan-task` snapshot message
-    // becomes a synthetic `EpicSnapshot`/`TaskSnapshot` events row inserted on the
-    // existing WRITABLE connection, then a wake pump folds it (snapshot upsert into
-    // the `epics`/`tasks` projection). The entity id rides in `session_id` (the
-    // generic entity-key overload the reducer reads); the full snapshot rides in
-    // `data` (the same field `extractPlanSnapshot` parses) with the producer's
-    // pre-computed fields mapped to the projection's column names. Mirrors the
-    // `transcript-title` branch exactly; bindings are named (see `stmts.insertEvent`
-    // in `src/db.ts`). Everything other than session_id/hook_event/event_type/data
-    // is NULL (synthetic — never carries a process identity).
+    // becomes a synthetic `EpicSnapshot`/`TaskSnapshot` events row on the WRITABLE
+    // connection, then a wake pump folds it (upsert into the `epics`/`tasks`
+    // projection). The entity id rides in `session_id`; the full snapshot in
+    // `data` (the field `extractPlanSnapshot` parses). Everything else is NULL.
     pw.onmessage = (ev: MessageEvent<PlanWorkerOutbound | undefined>): void => {
       const msg = ev.data;
       if (!msg) {
         return;
       }
       if (msg.kind === "backstop") {
-        // Epic fn-720: a worker posted a backstop rescue/rollup record up. Main
-        // is the SOLE sidecar writer — append the line and return. NOT an event
-        // fold; the sidecar is a pure consumer-side side-file. Workers do not
-        // yet EMIT this (counters + last_fast_path_at wiring lands in .2/.3),
-        // but main handles it today so the topology is proven end to end.
+        // Main is the SOLE sidecar writer — append the line. NOT an event fold
+        // (a pure consumer-side side-file, never read by the reducer).
         handleBackstopMessage(msg);
         return;
       }
       if (msg.kind === "nudge-discovery") {
-        // fn-705 discovery nudge: the plan-worker first saw a `.planctl` tree in
-        // `msg.root`. Forward to the git-worker so it folds the root into its
-        // discovery candidates and watches that repo's `.git` immediately
-        // (attribution/GitSnapshot data then flows). NOT written to the event log
-        // — it drives a producer worker, not a projection. The forward-ref
-        // null-guards the boot window before the git worker is constructed.
+        // Discovery nudge: the plan-worker first saw a `.planctl` tree in
+        // `msg.root`. Forward to the git-worker so it watches that repo's `.git`
+        // immediately. NOT written to the event log — it drives a producer
+        // worker. The forward-ref null-guards the boot window before the git
+        // worker is constructed.
         gitWorkerRef?.postMessage({
           type: "add-discovery-root",
           root: msg.root,
@@ -2638,20 +2019,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           task_number: msg.number,
           title: msg.title,
           target_repo: msg.targetRepo,
-          // Planctl-native effort tier (fn-602): rides FREE in the embedded-
-          // tasks JSON — no schema column, no migration. A pre-fn-602
-          // TaskSnapshot blob lacks this key and the reducer reads
-          // `snapshot.tier ?? null` (graceful-degradation precedent shared with
-          // `worker_phase`/`runtime_status`).
+          // Planctl-native effort tier — rides FREE in the embedded-tasks JSON
+          // (no schema column). An older blob lacks this key and the reducer
+          // reads `snapshot.tier ?? null` (graceful degradation).
           tier: msg.tier,
-          // Renamed from the legacy `status` field. The producer surfaces the
-          // derived worker-phase binary (`worker_done_at` present → "done", else
-          // "open") under its new name to free up `runtime_status` (sibling
-          // below) for planctl's native enum.
+          // Derived worker-phase binary (`worker_done_at` present → "done", else
+          // "open"), kept distinct from `runtime_status` (planctl's native enum).
           worker_phase: msg.workerPhase,
-          // Planctl-native runtime status (`todo|in_progress|done|blocked`)
-          // ingested from `.planctl/state/tasks/<task_id>.state.json`. Threads
-          // through the synthetic-event pipeline so a re-fold reproduces it.
+          // Planctl-native runtime status (`todo|in_progress|done|blocked`).
           runtime_status: msg.runtimeStatus,
           depends_on: msg.dependsOn,
         });
@@ -2719,7 +2094,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     pw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (planWorker)`
+  } // end `if (planWorker)`
 
   // Spawn the exit-watcher worker in the SAME post-migration window. It owns
   // a kqueue (macOS) / pidfd+epoll (Linux) fd via `bun:ffi`, polls
@@ -2728,7 +2103,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // the post-register kill-0 probe finds it already dead. Spawns AFTER seed
   // sweep + re-drain (above) so its initial candidate-set diff reads a
   // settled projection, not a half-folded one.
-  // fn-749: gated on the selector — `null` when unselected.
+  // Gated on the selector — `null` when unselected.
   const exitWorker = want("exit")
     ? new Worker(new URL("./exit-watcher.ts", import.meta.url).href, {
         workerData: { dbPath, pollMs: 50 } satisfies ExitWatcherWorkerData,
@@ -2737,18 +2112,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (exitWorker) {
     const ew = exitWorker;
-    // Main stays the SOLE writer: an `exit` message becomes a synthetic
-    // `Killed` events row inserted on the existing WRITABLE connection, then a
-    // wake pump folds it. The verifier here re-reads the persisted row and
-    // matches `(pid, start_time)` against the message's snapshot — STRICT when
-    // the row carries a stored start_time, LOOSE pid-only when the row has
-    // none (legacy / pre-schema-v9). A strict-mismatch is a race-recovered
-    // stale event (the row was re-opened with a fresh process between
-    // register and exit delivery, OR the producer races a SessionStart on the
-    // same row); we silently skip it. The reducer's Killed fold ALSO
-    // double-checks the match — this verifier is a producer-side optimization
-    // that keeps the event log tight (no Killed rows that the reducer would
-    // discard as stale).
+    // Main stays the SOLE writer: an `exit` message becomes a synthetic `Killed`
+    // events row on the WRITABLE connection, then a wake pump folds it. Before
+    // minting, re-read the persisted row and match `(pid, start_time)` against the
+    // message snapshot — strict when both carry a start_time, loose pid-only when
+    // either is NULL. A strict mismatch is a race-recovered stale event (the row
+    // was re-opened with a fresh process); skip it. The reducer's Killed fold also
+    // double-checks; this verifier just keeps the event log tight.
     ew.onmessage = (ev: MessageEvent<ExitMessage | undefined>): void => {
       const msg = ev.data;
       if (!msg || msg.kind !== "exit") {
@@ -2773,22 +2143,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         // anyway, but skip the event log churn.
         return;
       }
-      // fn-743 pidless reap: a `pid: null` message reaps a NULL-pid (unwatchable)
-      // row. Guarded both ways — the row's persisted pid must ALSO be NULL, or a
-      // resume re-armed it with a real pid between the diff-loop snapshot and
-      // this re-read (in which case the pid-bearing path / kernel watcher owns
-      // it). No (pid, start_time) identity check applies (there's no pid to
-      // match); the start_time rides into the payload for parity / debug only.
+      // Pidless reap: a `pid: null` message reaps a NULL-pid (unwatchable) row.
+      // Guarded both ways — the row's persisted pid must ALSO be NULL, or a resume
+      // re-armed it with a real pid since the snapshot (the kernel watcher then
+      // owns it).
       if (msg.pid == null) {
         if (row.pid != null) {
           // Re-armed with a real pid since the snapshot — let the watcher own it.
           return;
         }
       } else {
-        // Strict-match when both sides carry a start_time; loose pid-only match
-        // when EITHER side is NULL (the row is legacy / the message snapshot
-        // didn't carry one — Q7 loose-accept rule). A strict mismatch is the
-        // race-recovered case.
+        // Strict-match when both sides carry a start_time; loose pid-only when
+        // either is NULL. A strict mismatch is the race-recovered case.
         const pidMatches = row.pid != null && row.pid === msg.pid;
         if (!pidMatches) {
           return;
@@ -2803,10 +2169,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }
       }
       stmts.insertEvent.run({
-        $ts: Date.now() / 1000, // unix seconds as REAL, matching the hook
+        $ts: Date.now() / 1000, // unix seconds as REAL
         $session_id: msg.jobId, // == job_id
         $pid: null,
-        $hook_event: "Killed", // synthetic; reducer folds → 'killed'
+        $hook_event: "Killed", // reducer folds → 'killed'
         $event_type: "killed",
         $tool_name: null,
         $matcher: null,
@@ -2835,14 +2201,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
       });
-      // Our own INSERT bumps data_version, so the wake worker would re-drain
-      // anyway — but pump directly so the Killed fold lands without a poll-
-      // cycle delay.
+      // Our own INSERT bumps data_version — pump directly so the Killed fold
+      // lands without a poll-cycle delay.
       wakePending = true;
       pumpWakes();
     };
 
-    // Same crash policy as the other workers: any thread failure → fatalExit.
     ew.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] exit-watcher worker error:", err.message ?? err);
       if (!shuttingDown) fatalExit();
@@ -2853,14 +2217,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     ew.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (exitWorker)`
+  } // end `if (exitWorker)`
 
   // Spawn the git worker after the plan/job projections are caught up. It is
   // event-driven (file watcher + DB data_version wake + 60s heartbeat — see
   // `git-worker.ts` header) and posts a snapshot only when the rendered view
   // changes; main persists each one as a synthetic `GitSnapshot` event so the
   // reducer's `git_status` row is replayable.
-  // fn-749: gated on the selector — `null` when unselected.
+  // Gated on the selector — `null` when unselected.
   const gitWorker = want("git")
     ? new Worker(new URL("./git-worker.ts", import.meta.url).href, {
         workerData: {
@@ -2869,11 +2233,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         } satisfies GitWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;
-  // fn-705: publish the git-worker ref so the plan-worker `onmessage` handler's
-  // discovery-nudge forward (wired ABOVE) can post `add-discovery-root` to it.
-  // Any nudge posted before this line is a tolerated no-op (null-guarded). When
-  // the git worker is unselected (fn-749) the ref stays `null` and the nudge is
-  // a no-op via the existing `?.`.
+  // Publish the git-worker ref so the plan-worker's discovery-nudge forward
+  // (wired ABOVE) can post `add-discovery-root` to it. A nudge before this line
+  // (or when the git worker is unselected) is a no-op via the existing `?.`.
   gitWorkerRef = gitWorker;
 
   if (gitWorker) {
@@ -2882,25 +2244,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       const msg = ev.data;
       if (!msg) return;
       if (msg.kind === "backstop") {
-        // Epic fn-720: a backstop rescue/rollup record. Main is the SOLE sidecar
-        // writer — append the line and return. NOT an event fold (a pure
-        // consumer-side side-file, never read by the reducer).
+        // Main is the SOLE sidecar writer — append the line. NOT an event fold
+        // (a pure consumer-side side-file, never read by the reducer).
         handleBackstopMessage(msg);
         return;
       }
       if (msg.kind === "planctl-commit-changed") {
-        // Epic fn-681: authoritative commit-driven planctl ingest. The
-        // git-worker observed a commit in `msg.project_dir` carrying
-        // changed `.planctl/**` paths; forward the path list verbatim to
-        // plan-worker so it re-ingests each from the COMMITTED worktree
-        // bytes via the existing idempotent `onChange` / `onDelete`. NOT
-        // written to the `events` log — the reducer must stay a pure
-        // function of the immutable log, and this channel exists to drive
-        // a producer worker, not a projection. Duplicate fires from a
-        // live FSEvent are no-ops via plan-worker's change-gate.
-        // fn-749: null-safe — a git-only boot (no plan worker) has nothing to
-        // forward the planctl-commit hint to; the plan-worker change-gate would
-        // re-ingest from a live FSEvent anyway in a full boot.
+        // Authoritative commit-driven planctl ingest: the git-worker observed a
+        // commit carrying changed `.planctl/**` paths; forward them to plan-worker
+        // so it re-ingests each from the COMMITTED worktree bytes via its
+        // idempotent `onChange`/`onDelete`. NOT written to the event log — this
+        // channel drives a producer worker, not a projection. The `?.` is
+        // null-safe for a git-only boot (no plan worker).
         planWorker?.postMessage({
           type: "planctl-commit-changed",
           repo: msg.project_dir,
@@ -2965,22 +2320,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
       });
-      // fn-629 observation-gate drain: a `git-snapshot` or `commit` from
-      // the git-worker is the cross-worker "HEAD may have moved" signal a
-      // plan-worker cannot observe on its own (a `git commit` leaves the
-      // `.planctl/*.json` bytes identical, so FSEvents will not re-fire on
-      // the worktree path). Fire `recheck-pending` so the scanner re-runs
-      // its tracked-in-HEAD predicate over every path currently held in
-      // pending. Cheap (no-op when the set is empty); idempotent.
+      // A `git-snapshot` or `commit` is the cross-worker "HEAD may have moved"
+      // signal a plan-worker cannot observe on its own (a `git commit` leaves the
+      // `.planctl/*.json` bytes identical, so FSEvents won't re-fire). Fire
+      // `recheck-pending` so the scanner re-runs its tracked-in-HEAD predicate.
+      // Cheap (no-op when the set is empty); idempotent.
       if (msg.kind === "git-snapshot" || msg.kind === "commit") {
-        // fn-749: null-safe — see the planctl-commit-changed forward above.
         planWorker?.postMessage({
           type: "recheck-pending",
-          // fn-712: scope the drain to the single repo whose HEAD may have moved
-          // (this snapshot's `project_dir`), so the plan-worker re-probes only
-          // that repo's pending paths in ONE batched git call instead of every
-          // repo's per-path — the fix for the cross-repo per-path git storm that
-          // starved the worker for ~74s.
+          // Scope the drain to the single repo whose HEAD may have moved, so the
+          // plan-worker re-probes only that repo's pending paths in ONE batched
+          // git call instead of every repo's per-path.
           repo: msg.project_dir,
         } satisfies RecheckPendingMessage);
       }
@@ -2996,7 +2346,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     gw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (gitWorker)`
+  } // end `if (gitWorker)`
 
   // Spawn the usage worker in the SAME post-migration window. It watches the
   // agentuse daemon's flat leaf state dir (`~/.local/state/agentuse/`) and
@@ -3005,7 +2355,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // synthetic `UsageSnapshot`/`UsageDeleted` events row on its writable
   // connection. The watch root is resolved on main via `resolveUsageRoot()`
   // and tolerates absence (agentuse may not have run yet).
-  // fn-749: gated on the selector — `null` when unselected.
+  // Gated on the selector — `null` when unselected.
   const usageWorker = want("usage")
     ? new Worker(new URL("./usage-worker.ts", import.meta.url).href, {
         workerData: {
@@ -3019,12 +2369,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   if (usageWorker) {
     const uw = usageWorker;
     // Main stays the SOLE writer: a `usage-snapshot`/`usage-deleted` message
-    // becomes a synthetic `UsageSnapshot`/`UsageDeleted` events row inserted on
-    // the existing WRITABLE connection, then a wake pump folds it. The agentuse
-    // profile id rides in `session_id` (the generic entity-key overload the
-    // reducer reads); the flattened snapshot rides in `data` for snapshots, an
-    // empty string for tombstones. Everything other than session_id / hook_event /
-    // event_type / data is NULL (synthetic — never carries a process identity).
+    // becomes a synthetic events row on the WRITABLE connection, then a wake pump
+    // folds it. The agentuse profile id rides in `session_id`; the flattened
+    // snapshot in `data` (empty for tombstones). Everything else is NULL.
     uw.onmessage = (ev: MessageEvent<UsageMessage | undefined>): void => {
       const msg = ev.data;
       if (!msg) return;
@@ -3033,10 +2380,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (msg.kind === "usage-snapshot") {
         hookEvent = "UsageSnapshot";
         // Pre-flattened payload — the reducer never re-reads the on-disk file.
-        // Forwarded via the exported `serializeUsageSnapshot` so the wire
-        // shape is pinned by a direct test; fn-651 task .1 fixed the leak
-        // that dropped the fn-645 status / subscription_active / error_*
-        // fields (those columns folded to NULL forever before this).
+        // Forwarded via the exported `serializeUsageSnapshot` so the wire shape
+        // is pinned by a direct test.
         data = serializeUsageSnapshot(msg);
       } else if (msg.kind === "usage-deleted") {
         // Tombstone: the reducer DELETEs the `usage` row whose primary key is
@@ -3092,23 +2437,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     uw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (usageWorker)`
+  } // end `if (usageWorker)`
 
-  // Spawn the dead-letter worker (fn-643 task .3) in the SAME post-migration
-  // window — the eighth worker thread (and fifth file-watcher producer
-  // instance). It watches the dead-letters dir for changes and posts a
-  // contentless `{kind:"dead-letter-changed"}` message. The worker holds NO
-  // DB handle — main is the sole DB writer here, just as it is for the
-  // event log; on each worker message main re-runs `scanDeadLetterDir`
-  // (same primitive as the boot scan above), which INSERT OR IGNOREs each
-  // parsed record into the `dead_letters` operational table.
-  //
-  // The boot scan above already imported every pre-existing file; this
-  // live path covers files the hook writes AFTER the daemon comes up. The
-  // worker spawns AFTER the boot import so the table state is settled
-  // before any live notification arrives — there is no race where a
-  // live message could fire against a half-imported boot state.
-  // fn-749: gated on the selector — `null` when unselected.
+  // Watches the dead-letters dir and posts a contentless
+  // `{kind:"dead-letter-changed"}`. The worker holds NO DB handle — main is the
+  // sole writer; on each message main re-runs `scanDeadLetterDir` (the boot-scan
+  // primitive), which INSERT OR IGNOREs into `dead_letters`. Spawns AFTER the
+  // boot import so no live message races a half-imported state. Gated on the
+  // selector — `null` when unselected.
   const deadLetterWorker = want("deadLetter")
     ? new Worker(new URL("./dead-letter-worker.ts", import.meta.url).href, {
         workerData: {
@@ -3120,15 +2456,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (deadLetterWorker) {
     const dlw = deadLetterWorker;
-    // Main owns the actual `dead_letters` write: a worker `dead-letter-changed`
-    // message triggers a fresh `scanDeadLetterDir` against the on-disk dir
-    // (treating the watcher event as "go look", never as the data — the
-    // CLAUDE.md "safe value" pattern). The scan is idempotent (`INSERT OR
-    // IGNORE` on `dl_id`), so a burst of watcher events collapses harmlessly
-    // into the same converged row set. NO wake is pumped here — the write
-    // goes to the `dead_letters` table, NOT `events`, so there is no
-    // projection to fold; the server worker's data_version polling picks
-    // up the row change directly and the board re-renders.
+    // Main owns the write: a `dead-letter-changed` message triggers a fresh
+    // `scanDeadLetterDir` (the watcher event is "go look", never the data). The
+    // scan is idempotent, so a watcher-event burst converges harmlessly. NO wake
+    // is pumped — the write goes to `dead_letters`, NOT `events`, so there is no
+    // projection to fold; the server worker's data_version poll picks it up.
     dlw.onmessage = (
       ev: MessageEvent<DeadLetterChangedMessage | undefined>,
     ): void => {
@@ -3139,10 +2471,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       try {
         scanDeadLetterDir(db, deadLetterDir);
       } catch (err) {
-        // Defense-in-depth: scanDeadLetterDir's design contract is "never
-        // throw out of the scan", but an unexpected internal throw must
-        // NOT crash the daemon. Log and continue — the next watcher event
-        // will retry the import.
+        // Defense-in-depth: an unexpected internal throw must NOT crash the
+        // daemon. Log and continue — the next watcher event retries the import.
         console.error(
           `[keeperd] dead-letter live import threw (non-fatal): ${
             err instanceof Error ? err.message : String(err)
@@ -3157,35 +2487,21 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     };
 
-    // Same crash-via-`close` gap: a dead-letter-worker `process.exit(1)`
-    // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
-    // shutdown.
+    // Same crash-via-`close` gap: a `process.exit(1)` fires `close`, not
+    // `onerror`. `!shuttingDown` makes it inert on clean shutdown.
     dlw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (deadLetterWorker)`
+  } // end `if (deadLetterWorker)`
 
-  // Spawn the events-ingest worker (fn-736 task .1) in the SAME post-migration
-  // window — the lock-free events path's watch-hint thread, the architectural
-  // twin of the dead-letter worker. It watches the events-log dir for changes
-  // and posts a contentless `{kind:"events-log-changed"}` message. The worker
-  // holds NO DB handle — main is the sole DB writer; on each worker message
-  // main re-runs `scanEventsLogDir` (same primitive as the boot scan above),
-  // which lands each new NDJSON line as an `events` row (from the durable
-  // per-pid offset, exactly-once) and then pumps a wake so the reducer folds
-  // it.
-  //
-  // The boot scan above already ingested every pre-existing file; this live
-  // path covers files the hook writes AFTER the daemon comes up. The worker
-  // spawns AFTER the boot ingest so the offset state is settled before any
-  // live notification arrives (mirrors the dead-letter sequence). In task .1
-  // the hook still INSERTs, so the dir is normally absent and the worker
-  // skip-and-logs at spawn (tolerated) — the path lights up when task .2 flips
-  // the hook to NDJSON.
-  // fn-749: gated on the selector — `null` when unselected. Note the in-process
-  // fold/UDS tests inject events via DIRECT DB INSERT (bumping `data_version`),
-  // not via the events-log NDJSON path, so they do NOT need this worker — the
-  // wake worker catches the cross-connection write and main drains it.
+  // The lock-free events path's watch-hint thread, the twin of the dead-letter
+  // worker. Watches the events-log dir and posts a contentless
+  // `{kind:"events-log-changed"}`. The worker holds NO DB handle — main re-runs
+  // `scanEventsLogDir` on each message, landing each new NDJSON line as an
+  // `events` row (durable per-pid offset, exactly-once) then pumping a wake.
+  // Spawns AFTER the boot ingest so the offset state is settled. In-process
+  // fold/UDS tests inject events via DIRECT DB INSERT, not this path, so they do
+  // NOT need this worker. Gated on the selector — `null` when unselected.
   const eventsIngestWorker = want("eventsIngest")
     ? new Worker(new URL("./events-ingest-worker.ts", import.meta.url).href, {
         workerData: {
@@ -3197,17 +2513,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (eventsIngestWorker) {
     const eiw = eventsIngestWorker;
-    // Main owns the actual `events` write: an `events-log-changed` message
-    // triggers a fresh `scanEventsLogDir` against the on-disk dir (treating the
-    // watcher event as "go look", never as the data — the CLAUDE.md "safe value"
-    // pattern). The scan is exactly-once (durable per-pid byte-offset), so a
-    // burst of watcher events collapses harmlessly into the same converged row
-    // set. UNLIKE the dead-letter handler, a wake IS pumped here — the write goes
-    // to `events` (the canonical fold source), so the reducer must fold the new
-    // rows into the projections. The ingest INSERT already bumped `data_version`
-    // (the wake worker would catch it within a poll tick regardless), but pumping
-    // here collapses the latency the same way the git/usage synthetic-mint
-    // handlers do.
+    // Main owns the `events` write: an `events-log-changed` message triggers a
+    // fresh `scanEventsLogDir` (the watcher event is "go look", never the data).
+    // Exactly-once (durable per-pid byte-offset), so a watcher-event burst
+    // converges harmlessly. UNLIKE the dead-letter handler, a wake IS pumped —
+    // the write goes to `events` (the fold source), so the reducer must fold it.
     eiw.onmessage = (
       ev: MessageEvent<EventsLogChangedMessage | undefined>,
     ): void => {
@@ -3220,10 +2530,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         wakePending = true;
         pumpWakes();
       } catch (err) {
-        // Defense-in-depth: scanEventsLogDir's design contract is "never throw
-        // out of the scan", but an unexpected internal throw must NOT crash the
-        // daemon. Log and continue — the next watcher event will retry the
-        // ingest.
+        // Defense-in-depth: an unexpected internal throw must NOT crash the
+        // daemon. Log and continue — the next watcher event retries the ingest.
         console.error(
           `[keeperd] events-log live ingest threw (non-fatal): ${
             err instanceof Error ? err.message : String(err)
@@ -3241,39 +2549,25 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     };
 
-    // Same crash-via-`close` gap: an events-ingest-worker `process.exit(1)`
-    // fires `close`, not `onerror`. `!shuttingDown` makes it inert on clean
-    // shutdown.
+    // Same crash-via-`close` gap: a `process.exit(1)` fires `close`, not
+    // `onerror`. `!shuttingDown` makes it inert on clean shutdown.
     eiw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
-  } // fn-749: end `if (eventsIngestWorker)`
+  } // end `if (eventsIngestWorker)`
 
-  // Spawn the autopilot reconciler worker (fn-661 task .4) — the eighth
-  // worker thread. It runs the level-triggered dispatch reconcile loop
-  // server-side: data_version wake → desired-vs-observed verdict →
-  // launch via the ExecBackend → confirm via the worker's own read conn
-  // → DispatchFailed mint on ceiling (bridged through main, see the
-  // `onmessage` handler below). The pure decision logic (`reconcile`,
-  // `confirmRunning`, `runReconcileCycle`) lives in `src/autopilot-worker.ts`
-  // and is exercised directly by the test suite; this spawn is the
-  // structural glue that lights up the worker's main() body.
-  //
-  // Boots PAUSED: the autopilot worker initializes its in-memory
-  // `paused = true` from the supervisor's `paused: true` workerData
-  // (the safety default; see the `autopilotPaused` declaration above).
-  // The flag flips ONLY via the `set_autopilot_paused` RPC → bridge →
-  // main → `{type:"set-paused"}` relay above.
-  //
-  // Config (`zellijSession`, `maxConcurrentJobs`, `autocloseWindows`) is
-  // read here on main and threaded into workerData so the worker doesn't
-  // open `~/.config/keeper/config.yaml` itself — every config I/O lives on
-  // main, every worker receives the resolved values.
+  // The autopilot reconciler worker runs the level-triggered dispatch loop
+  // server-side: data_version wake → desired-vs-observed verdict → launch via the
+  // ExecBackend → confirm → mint on ceiling (bridged through main). The pure
+  // decision logic lives in `src/autopilot-worker.ts`; this spawn is the glue.
+  // Boots PAUSED (safety default) from the `paused: true` workerData; the flag
+  // flips ONLY via the `set_autopilot_paused` RPC → bridge → `{type:"set-paused"}`
+  // relay. Config is read here on main and threaded into workerData so the worker
+  // never opens config itself.
   const apConfig = resolveConfig();
-  // fn-749: gated on the selector — `null` when unselected. The server-worker
-  // bridge's `set_autopilot_paused` relay already null-guards via
-  // `autopilotWorker === null` (returns `ok:false, "autopilot worker not yet
-  // ready"`), so a server-only boot's pause RPC degrades gracefully.
+  // Gated on the selector — `null` when unselected. The server-worker bridge's
+  // `set_autopilot_paused` relay null-guards via `autopilotWorker === null`, so a
+  // server-only boot's pause RPC degrades gracefully.
   const autopilotWorkerInstance = want("autopilot")
     ? new Worker(new URL("./autopilot-worker.ts", import.meta.url).href, {
         workerData: {
@@ -3281,48 +2575,31 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           paused: autopilotPaused,
           zellijSession: apConfig.zellijSession,
           maxConcurrentJobs: apConfig.maxConcurrentJobs,
-          // fn-727 — completion-reap toggle, read on main and frozen into
-          // workerData (every config I/O lives on main). Restart-to-apply:
-          // a config flip lags until the next daemon restart re-spawns.
+          // Completion-reap toggle, read on main and frozen into workerData.
+          // Restart-to-apply: a config flip lags until the next restart.
           autocloseWindows: apConfig.autocloseWindows,
         } satisfies AutopilotWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;
-  // Wire the forward reference declared above so the server-worker's
-  // bridge handler (registered earlier) can target the autopilot worker
-  // via `autopilotWorker.postMessage({...})`. Assign BEFORE the
-  // onmessage / onerror / close handlers fire so the first bridge
-  // request never sees a `null` autopilot worker. (Stays `null` when the
-  // worker is unselected — the bridge null-guard covers that.)
+  // Wire the forward reference so the server-worker's bridge handler can target
+  // the autopilot worker. Assign BEFORE the handlers fire so the first bridge
+  // request never sees a `null` worker. (Stays `null` when unselected — the
+  // bridge null-guard covers that.)
   autopilotWorker = autopilotWorkerInstance;
 
-  // fn-749: the autopilot worker's main-side machinery (the `handleDispatch*`
-  // mint helpers + the 60s sweep / compaction / checkpoint timers below) is
-  // interleaved with this handler and partly shared with main's steady state,
-  // so rather than wrap the whole region we gate only the three direct
-  // worker-binding sites — the `onmessage`/`onerror`/`close` assignments here,
-  // each `if (autopilotWorkerInstance)`-guarded — and `?.` the one in-helper
-  // `postMessage` (the dispatched-ack reply). When the worker is unselected the
-  // helpers/timers still load but never fire against a live worker.
+  // The `handleDispatch*` mint helpers + the sweep/compaction/checkpoint timers
+  // below are interleaved with main's steady state, so rather than wrap the
+  // region we gate only the three direct worker-binding sites
+  // (`onmessage`/`onerror`/`close`) and `?.` the in-helper `postMessage`.
   if (autopilotWorkerInstance) {
     const aw = autopilotWorkerInstance;
-    // Worker → main: `DispatchFailed` / `Dispatched` / `DispatchExpired`
-    // mint requests. Mirrors the git-worker synthetic-event mint pattern
-    // (see `:1309-1376`): the worker posts a `{kind, payload}` message,
-    // main runs `stmts.insertEvent.run` on its writable connection, then
-    // sets `wakePending = true; pumpWakes()` so the reducer folds the row
-    // into `dispatch_failures` / `pending_dispatches` without waiting for
-    // the wake worker's `data_version` poll. Workers never write the DB;
-    // the producer-side `ts` rides in the payload (where the fold reads
-    // it) so re-fold determinism holds.
-    //
-    // The three mint paths share an identical column-binding shape — the
-    // only differences are `$hook_event` (`DispatchFailed` / `Dispatched`
-    // / `DispatchExpired`), `$event_type` (the projection tag the
-    // reducer matches on), and `$cwd` (carried from the payload `dir`
-    // when present; `null` for `DispatchExpired`, which is keyed by-pk
-    // only). NON-FATAL catch — a failed INSERT logs to stderr and
-    // continues; the next reconcile cycle re-attempts the dispatch.
+    // Worker → main: `DispatchFailed` / `Dispatched` / `DispatchExpired` mint
+    // requests. The worker posts a `{kind, payload}`; main runs
+    // `stmts.insertEvent.run` then pumps a wake so the reducer folds it into
+    // `dispatch_failures` / `pending_dispatches`. Workers never write the DB; the
+    // producer-side `ts` rides in the payload so re-fold determinism holds. The
+    // three paths differ only in `$hook_event`, `$event_type`, and `$cwd`.
+    // NON-FATAL catch — a failed INSERT logs and the next cycle re-attempts.
     aw.onmessage = (
       ev: MessageEvent<
         | DispatchFailedMessage
@@ -3335,34 +2612,29 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       const msg = ev.data;
       if (!msg) return;
       if (msg.kind === "backstop") {
-        // Epic fn-720: a `timeout`-class backstop rescue/rollup from the
-        // autopilot `confirmRunning` ceiling. Main is the SOLE sidecar writer —
-        // append the line and return. NOT an event fold (a pure consumer-side
-        // side-file, never read by the reducer).
+        // Main is the SOLE sidecar writer — append the line. NOT an event fold
+        // (a pure consumer-side side-file, never read by the reducer).
         handleBackstopMessage(msg);
         return;
       }
       if (msg.kind === "dispatch-failed") {
         handleDispatchFailedMint(msg.payload);
       } else if (msg.kind === "dispatched-request") {
-        // fn-724: durable mint-before-launch. Insert the `Dispatched` event,
-        // then reply `dispatched-ack{id, ok}` so the worker only `launch()`es
-        // AFTER the row is durable (closes the SessionStart-drains-before-
-        // Dispatched race that re-opened the fn-627 double-dispatch window).
+        // Durable mint-before-launch: insert the `Dispatched` event, then reply
+        // `dispatched-ack{id, ok}` so the worker only `launch()`es AFTER the row
+        // is durable (closes the double-dispatch window).
         handleDispatchedMint(msg);
       } else if (msg.kind === "dispatch-expired") {
         handleDispatchExpiredMint(msg.payload);
       }
     };
-  } // fn-749: end `if (autopilotWorkerInstance)` onmessage guard
+  } // end `if (autopilotWorkerInstance)` onmessage guard
 
   /**
-   * Mint a synthetic `DispatchFailed` event on the writable connection.
-   * The dispatch key (`${verb}::${id}`) rides as the entity-key
-   * overload on `session_id` so a re-fold can correlate the synthetic
-   * event to its `dispatch_failures` row without re-parsing the `data`
-   * blob. Same convention the retry-dispatch mint above uses. NON-FATAL
-   * on insert failure — the next reconcile wake re-attempts.
+   * Mint a synthetic `DispatchFailed` event. The dispatch key (`${verb}::${id}`)
+   * rides as the entity-key overload on `session_id` so a re-fold correlates it
+   * to its `dispatch_failures` row without re-parsing `data`. NON-FATAL on insert
+   * failure — the next reconcile wake re-attempts.
    */
   function handleDispatchFailedMint(
     payload: DispatchFailedMessage["payload"],
@@ -3405,11 +2677,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       wakePending = true;
       pumpWakes();
     } catch (err) {
-      // Defense-in-depth: an insert failure (DB-level) must NOT crash
-      // the daemon. Log + continue — the next reconcile wake will
-      // re-attempt the dispatch (the sticky failure state is bounded
-      // by an event in the log; a missed insert is just an extra retry
-      // round-trip, not a correctness hazard).
+      // Defense-in-depth: an insert failure must NOT crash the daemon. Log +
+      // continue — the next reconcile wake re-attempts (a missed insert is just
+      // an extra retry round-trip, not a correctness hazard).
       console.error(
         `[keeperd] DispatchFailed mint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -3419,25 +2689,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Mint a synthetic `Dispatched` event on the writable connection
-   * (fn-678, schema v50) AND reply a durable `dispatched-ack{id, ok}`
-   * (fn-724). The reducer's `Dispatched` fold UPSERTs a
-   * `pending_dispatches` row keyed `(verb, id)` carrying the
-   * producer-side `dispatched_at` lifted off the payload's `ts` —
-   * outbox-ordered intent so a crash between mint and `launch()`
-   * leaves a phantom row the TTL sweep clears.
+   * Mint a synthetic `Dispatched` event AND reply a durable `dispatched-ack{id,
+   * ok}`. The reducer's fold UPSERTs a `pending_dispatches` row keyed `(verb,
+   * id)` carrying the producer-side `dispatched_at` — outbox-ordered intent so a
+   * crash between mint and `launch()` leaves a phantom row the TTL sweep clears.
    *
-   * fn-724 — DURABLE before launch. The worker AWAITS this ack BEFORE
-   * `launch()`, so the reply MUST fire on every path: `ok:true` once the
-   * insert lands, `ok:false` when it throws. The worker launches only on
-   * `ok:true`; an `ok:false` (or an ack-timeout on the worker side) aborts
-   * the dispatch WITHOUT launching — strictly preferable to the
-   * fire-and-forget race that re-opened the fn-627 double-dispatch window
-   * (main draining a worker's `SessionStart` BEFORE the queued mint
-   * landed). NON-FATAL on insert failure: the worker's abort means the
-   * launch-window dedup arm opens up for that `(verb, id)` until the next
-   * reconcile cycle, which is preferable to wedging the daemon. Mirrors
-   * the `set-autopilot-paused` insert-then-reply ack pattern.
+   * DURABLE before launch: the worker AWAITS this ack BEFORE `launch()`, so the
+   * reply MUST fire on every path (`ok:true` once the insert lands, `ok:false`
+   * when it throws). The worker launches only on `ok:true`; an `ok:false` or
+   * ack-timeout aborts WITHOUT launching — strictly preferable to the
+   * fire-and-forget race that re-opened the double-dispatch window. NON-FATAL on
+   * insert failure.
    */
   function handleDispatchedMint(msg: DispatchedMessage): void {
     const { id, payload } = msg;
@@ -3477,10 +2739,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
       });
-      // fn-724: the ack promises INSERT durability ONLY — not the fold (which
-      // is idempotent on the next drain). The committed INSERT is the whole
-      // contract, so the moment `insertEvent.run` returns we have everything
-      // the `ok=true` ack asserts.
+      // The ack promises INSERT durability ONLY — not the fold (idempotent on the
+      // next drain). The committed INSERT is the whole contract.
       ok = true;
     } catch (err) {
       console.error(
@@ -3489,27 +2749,20 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }`,
       );
     }
-    // Reply on EVERY path — the worker is blocked awaiting this ack before
-    // it launches. A `false` reply tells the worker to abort the dispatch.
-    // fn-762: reply IMMEDIATELY after the (durable-or-failed) INSERT, BEFORE
-    // the reducer pump below. A pump is a potentially slow drain; the worker's
-    // launch must not wait on it, and the ack already reflects everything it
-    // promises (INSERT durability). Outbox ordering is UNCHANGED — the insert
-    // still precedes the launch (`confirmRunning` awaits this ack first); only
-    // the ack moves ahead of the drain.
-    // fn-749: `?.` — this helper lives at function scope (outside the
-    // onmessage guard); it only ever runs in response to a worker message, so
-    // the worker is non-null in practice, but the optional-chain keeps it
-    // null-safe for the type system on an unselected-autopilot boot.
+    // Reply on EVERY path — the worker is blocked awaiting this ack before it
+    // launches; a `false` reply tells it to abort. Reply IMMEDIATELY after the
+    // INSERT, BEFORE the (potentially slow) reducer pump: the launch must not
+    // wait on the drain, and the ack already reflects everything it promises.
+    // Outbox ordering is UNCHANGED — the insert still precedes the launch. The
+    // `?.` keeps it null-safe for the type system on an unselected-autopilot boot.
     autopilotWorkerInstance?.postMessage({
       type: "dispatched-ack",
       id,
       ok,
     } satisfies DispatchedAckMessage);
-    // fn-762: pump the reducer AFTER the ack, in its own guarded block. A
-    // pump throw here is logged (the existing non-fatal error path) but can
-    // neither flip the already-sent ack nor escape this handler. Only pump
-    // when the insert actually landed — a failed insert has nothing to fold.
+    // Pump the reducer AFTER the ack, in its own guarded block — a pump throw is
+    // logged but can neither flip the sent ack nor escape this handler. Only pump
+    // when the insert landed.
     if (ok) {
       try {
         wakePending = true;
@@ -3525,14 +2778,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   /**
-   * Mint a synthetic `DispatchExpired` event on the writable connection
-   * (fn-678, schema v50). The reducer's fold DELETEs the matching
-   * `pending_dispatches` row keyed `(verb, id)` — idempotent
-   * (re-folding over a missing row is a no-op). NON-FATAL on insert
-   * failure: the row stays put until the next heartbeat sweep mints
-   * again (the TTL comparison is keyed off the FROZEN
-   * `dispatched_at`, so a daemon restart never resets the clock —
-   * worst case is one extra TTL window before the row clears).
+   * Mint a synthetic `DispatchExpired` event. The reducer's fold DELETEs the
+   * matching `pending_dispatches` row keyed `(verb, id)` — idempotent. NON-FATAL
+   * on insert failure: the row stays put until the next heartbeat sweep mints
+   * again (the TTL is keyed off the FROZEN `dispatched_at`, so a restart never
+   * resets the clock).
    */
   function handleDispatchExpiredMint(
     payload: DispatchExpiredMessage["payload"],
@@ -3583,38 +2833,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // Producer-side TTL sweep for `pending_dispatches` (fn-678, schema
-  // v50, task .3). Mints a synthetic `DispatchExpired` event for every
-  // row whose `dispatched_at` is older than `PENDING_DISPATCH_TTL_MS`
-  // and that does NOT already have an open `dispatch_failures` row for
-  // the same `(verb, id)` — the LEFT JOIN guard prevents the
-  // already-failed dispatch from getting a redundant expire mint (the
-  // reducer's `DispatchFailed` fold arm already discharges the pending
-  // row through the same `DELETE FROM pending_dispatches` path).
-  //
-  // MUST ride the 60s HEARTBEAT timer, not the level-triggered
-  // `data_version` wake: a crashed dispatch can be the only pending
-  // row on an otherwise-quiescent board, and a write-triggered wake
-  // would never fire — the row would never expire and the slot would
-  // stay held indefinitely. All wallclock (`Date.now()`) lives HERE
-  // in the producer, never inside a fold (CLAUDE.md re-fold
-  // determinism invariant); the fold reads only `event.ts` and the
-  // FROZEN payload, so a re-fold reproduces `pending_dispatches`
-  // byte-identically regardless of when the re-fold happens.
-  //
-  // The sweep reads the projection on main's writable connection
-  // (rather than via a separate read-only handle) so the read is
-  // sequenced inside the same writer that mints the synthetic event
-  // — no read/mint race against the reducer's own UPSERT.
+  // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
+  // for every row aged past `PENDING_DISPATCH_TTL_MS` without an open
+  // `dispatch_failures` row for the same `(verb, id)` (the LEFT JOIN guard).
+  // MUST ride the heartbeat timer, not the level-triggered `data_version` wake: a
+  // crashed dispatch can be the only pending row on a quiescent board, where a
+  // write-triggered wake never fires. All wallclock lives HERE in the producer,
+  // never inside a fold; the fold reads only `event.ts` + the FROZEN payload. The
+  // sweep reads on main's writable connection so the read is sequenced inside the
+  // same writer that mints — no read/mint race against the reducer's UPSERT.
   function sweepExpiredPendingDispatches(): void {
     if (shuttingDown) return;
     let aged: { verb: string; id: string; dispatched_at: number }[];
     try {
       aged = selectExpiredPendingDispatches(db, Date.now());
     } catch (err) {
-      // The pending_dispatches / dispatch_failures tables exist from
-      // schema v50; a read failure here is unexpected. Log non-fatally
-      // and let the next heartbeat retry.
+      // A read failure here is unexpected. Log non-fatally; the next heartbeat
+      // retries.
       console.error(
         `[keeperd] pending_dispatches TTL sweep read threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -3623,27 +2858,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       return;
     }
     if (aged.length === 0) {
-      // fn-720: the sweep fired but found nothing to expire — the
-      // `rescued:false` denominator. Bump the counter only (no line); the
-      // periodic + on-shutdown rollup carries it. `pending-dispatch-sweep` is
-      // a `timeout`-class backstop (elapsed-since-dispatch, no fast-path
-      // notion).
+      // Nothing to expire — the `rescued:false` denominator. Bump the counter
+      // only (no line); the rollup carries it.
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", false);
       return;
     }
-    // fn-720: each expired row is a `rescued:true` timeout rescue — the TTL
-    // ceiling reclaimed a stuck `pending_dispatches` slot the
-    // launch→SessionStart fast path never discharged. Build the records ONCE
-    // off a single `Date.now()` so every row in this pass shares the sweep's
-    // wall-clock (the pure helper is unit-tested in daemon.test.ts). Strictly
-    // ADDITIVE — rides ALONGSIDE the `DispatchExpired` mint below without
-    // changing it. Main is the SOLE sidecar writer here, so the lines are
-    // written directly (no Worker round-trip).
+    // Each expired row is a `rescued:true` timeout rescue. Build the records ONCE
+    // off a single `Date.now()` so every row shares the sweep's wall-clock. Main
+    // is the SOLE sidecar writer, so the lines are written directly.
     const sweepRecords = buildPendingDispatchSweepRecords(aged, Date.now());
     for (const row of aged) {
-      // Mint the expire event. Failures inside the helper are logged
-      // and swallowed (non-fatal), so a per-row throw does not abort
-      // the sweep — every aged row gets its own shot.
+      // Per-row failures are logged and swallowed inside the helper, so a throw
+      // doesn't abort the sweep — every aged row gets its own shot.
       handleDispatchExpiredMint({ verb: row.verb as Verb, id: row.id });
       mainBackstopCounters.bump("pending-dispatch-sweep", "timeout", true);
     }
@@ -3658,28 +2884,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     pumpWakes();
   }
 
-  // Schedule the producer-side TTL sweep on the 60s heartbeat. Stored
-  // so the shutdown path can `clearInterval` it (otherwise the
-  // outstanding timer keeps a ref on the main loop and the daemon
-  // would hang at the shutdown deadline). The timer fires its
-  // callback ON THE MAIN THREAD against the writable connection —
-  // matching the synthetic-event mint sites the heartbeat targets.
+  // Schedule the producer-side TTL sweep on the heartbeat. Stored so shutdown can
+  // `clearInterval` it (an outstanding timer pins a ref on the main loop). Fires
+  // ON THE MAIN THREAD against the writable connection.
   const pendingDispatchSweepTimer = setInterval(() => {
     sweepExpiredPendingDispatches();
   }, PENDING_DISPATCH_SWEEP_INTERVAL_MS);
 
-  // fn-742 — poll-is-truth fallback for the events-log live ingest. The
-  // events-ingest worker's `@parcel/watcher` hint is the fast path, but a
-  // dropped/coalesced watcher event (or a worker that never subscribed) would
-  // otherwise leave hook events undrained until the next daemon restart's boot
-  // scan (the 2026-06-08 freeze). This periodic scan guarantees every NDJSON
-  // line lands within one interval no matter what — keeper's standard
-  // watcher-is-hint / poll-is-truth discipline (the plan-worker carries the
-  // same db-poll fallback alongside its FSEvents watch). Runs ON THE MAIN
-  // THREAD against the writer conn (single-writer discipline), is idempotent
-  // (durable per-pid byte-offset, so a redundant scan re-reads only the unread
-  // tail), and never-throws out (mirrors the live `onmessage` handler). Stored
-  // so the shutdown path can `clearInterval` it.
+  // Poll-is-truth fallback for the events-log live ingest. The watcher hint is
+  // the fast path, but a dropped/coalesced event (or a worker that never
+  // subscribed) would otherwise leave hook events undrained until the next boot
+  // scan. This periodic scan guarantees every NDJSON line lands within one
+  // interval. Runs ON THE MAIN THREAD against the writer conn, is idempotent
+  // (durable per-pid byte-offset), and never-throws. Stored so shutdown can clear.
   const eventsIngestFallbackTimer = setInterval(() => {
     if (shuttingDown) return;
     try {
@@ -3695,23 +2912,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }, EVENTS_INGEST_FALLBACK_INTERVAL_MS);
 
-  // Producer-side cold-blob compaction pass (fn-717.2). Relocates the cold
-  // tail of inline `events.data` blobs into the `event_blobs` side table and
-  // NULLs the hot column, paced (a bounded number of small transactions per
-  // pass) so the writer lock is never held long enough to starve a concurrent
-  // hook INSERT.
-  //
-  // Runs ON THE MAIN THREAD against the writable connection — the same
-  // single-writer discipline as the dispatch sweep above. `event_blobs` is a
-  // content-preserving sidecar of the immutable event log, NOT a reducer
-  // projection: this never folds an event, never writes inside the reducer's
-  // BEGIN IMMEDIATE cursor-advance transaction, and the relocated blob's VALUE
-  // is preserved (read back via `COALESCE(events.data, event_blobs.data)`), so
-  // a from-scratch re-fold stays byte-identical. The cold predicate
-  // (`src/compaction.ts`) is provably conservative — it never relocates a blob
-  // the file-attribution scan could still need (keeps the recent/undischarged
-  // window inline), so `idx_events_tool_attr` keeps covering the only rows
-  // that scan reads.
+  // Producer-side cold-blob compaction pass. Relocates the cold tail of inline
+  // `events.data` blobs into the `event_blobs` side table and NULLs the hot
+  // column, paced so the writer lock never starves a concurrent hook INSERT. Runs
+  // ON THE MAIN THREAD against the writable connection. `event_blobs` is a
+  // content-preserving sidecar, NOT a reducer projection: the relocated value is
+  // read back via `COALESCE(events.data, event_blobs.data)`, so a from-scratch
+  // re-fold stays byte-identical. The cold predicate (`src/compaction.ts`) never
+  // relocates a blob the file-attribution scan could still need.
   function runCompactionPass(): void {
     if (shuttingDown) return;
     let relocated = 0;
@@ -3723,18 +2931,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           `[keeperd] compaction: relocated ${relocated} cold blob(s) in ${result.batches} batch(es) (watermark id<=${result.coldWatermark}${result.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Absent-in-both-places is a genuine data-loss BUG (a relocated blob is
-      // in `event_blobs`; a blob in NEITHER place is not legitimate
-      // compaction). Surface it distinctly and loudly — the relocation path
-      // cannot create it, so a positive count means a bug elsewhere. NOT
-      // fatal: we log and keep running (losing visibility on one blob must not
-      // wedge the daemon), but it is logged at every pass until resolved.
-      //
-      // fn-765 — gate the scan on `relocated > 0`, mirroring the PASSIVE
-      // checkpoint guard below. A pass that moved zero blobs cannot have CREATED
-      // an absent-in-both row, so the full-table `countAbsentBlobs` read (a scan
-      // on every idle heartbeat, the common case once the cold backlog drains)
-      // is wasted work — skip it when nothing was relocated.
+      // Absent-in-both-places is a genuine data-loss BUG — the relocation path
+      // cannot create it, so a positive count means a bug elsewhere. Logged
+      // loudly but NOT fatal. Gate the full-table scan on `relocated > 0`: a pass
+      // that moved zero blobs can't have created an absent-in-both row, so the
+      // scan is wasted work on an idle heartbeat.
       if (relocated > 0) {
         const absent = countAbsentBlobs(db);
         if (absent > 0) {
@@ -3744,10 +2945,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         }
       }
     } catch (err) {
-      // A compaction failure is pure space-reclamation loss, never a
-      // correctness issue (the blob stays inline on a failed/rolled-back
-      // batch). Log non-fatally and let the next heartbeat retry — same crash
-      // policy as the dispatch sweep read above.
+      // A compaction failure is pure space-reclamation loss, never a correctness
+      // issue (the blob stays inline on a rolled-back batch). Log non-fatally.
       console.error(
         `[keeperd] compaction pass threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -3755,14 +2954,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       );
       return;
     }
-    // Reclaim WAL space OUTSIDE the per-batch transactions and only when a
-    // pass actually moved bytes. PASSIVE never waits on writers (TRUNCATE
-    // would, starving a contending hook — forbidden by CLAUDE.md); it
-    // checkpoints what it can without blocking, so the bytes the relocation
-    // freed in the WAL fold back into the main DB without holding the lock.
-    // The main-DB page reclamation (VACUUM) is deliberately left to a separate
-    // offline maintenance step — an online VACUUM rewrites the whole DB under
-    // the writer lock, the exact hot-path hold this epic avoids.
+    // Reclaim WAL space OUTSIDE the per-batch transactions and only when a pass
+    // moved bytes. PASSIVE never waits on writers (TRUNCATE would, starving a
+    // contending hook); it checkpoints what it can without blocking. Main-DB page
+    // reclamation (VACUUM) is left to a separate offline step.
     if (relocated > 0) {
       try {
         db.run("PRAGMA wal_checkpoint(PASSIVE)");
@@ -3776,30 +2971,23 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // Schedule the compaction pass on its own slack heartbeat. Stored so the
-  // shutdown path can `clearInterval` it (an outstanding timer keeps a ref on
-  // the main loop). Fires on the MAIN THREAD against the writable connection.
+  // Schedule the compaction pass on its own slack heartbeat. Stored so shutdown
+  // can `clearInterval` it. Fires on the MAIN THREAD against the writable conn.
   const compactionTimer = setInterval(() => {
     runCompactionPass();
   }, COMPACTION_INTERVAL_MS);
 
-  // fn-744 .2 — steady-state WAL checkpoint cadence. Independent of compaction
-  // (whose PASSIVE checkpoint only fires when it relocated bytes), this flushes
-  // the WAL back into the main DB on cadence so serve/poll read latency stays
-  // bounded even under a steady fold stream with no compaction activity. PASSIVE
-  // never waits on a writer — if a hook holds the writer lock this returns a
-  // no-op immediately, so it can never starve a concurrent INSERT. Fires on the
-  // MAIN THREAD against the writable connection; stored so shutdown can clear it
-  // (an outstanding timer pins a ref on the main loop, and a checkpoint must not
-  // fire into the writer connection mid-teardown).
+  // Steady-state WAL checkpoint cadence, independent of compaction (whose PASSIVE
+  // checkpoint only fires when it relocated bytes). Flushes the WAL back into the
+  // main DB on cadence so serve/poll read latency stays bounded under a steady
+  // fold stream. PASSIVE never waits on a writer — a no-op if a hook holds the
+  // lock. Fires on the MAIN THREAD; stored so shutdown can clear it.
   const walCheckpointTimer = setInterval(() => {
     try {
       db.run("PRAGMA wal_checkpoint(PASSIVE)");
     } catch (err) {
       // A checkpoint failure is pure space/latency reclamation loss, never a
-      // correctness issue (the WAL stays intact and the page-threshold
-      // auto-checkpoint remains the backstop). Log non-fatally — same crash
-      // policy as the compaction PASSIVE checkpoint above.
+      // correctness issue (the page-threshold auto-checkpoint is the backstop).
       console.error(
         `[keeperd] steady-state PASSIVE checkpoint threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
@@ -3808,31 +2996,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }, WAL_CHECKPOINT_INTERVAL_MS);
 
-  // fn-765 — the heavy SQLite maintenance schedules (the fn-746 .1 integrity
-  // probe + .2 verified backup + fn-753 boot catch-up) NO LONGER run on main's
-  // fold thread. They are SYNCHRONOUS bun:sqlite ops (`PRAGMA quick_check`,
-  // `VACUUM INTO` on a ~2 GB DB), so a `setInterval` hosting them stalled main's
-  // event loop for their full duration, blocking folds + the events-log ingest
-  // and feeding the fold-lag class the 2026-06-09 review fixes. They now run on
-  // the dedicated `maintenance-worker` (spawned below at the worker-spawn site),
-  // which calls the SAME `backupDb` / `runIntegrityProbe` bodies against their
-  // SAME dedicated short-lived read-only connections. The side effects stay on
-  // main, driven by relayed outcomes: a backup-result message runs the
-  // success-log / failure-log+page branch (`handleBackupResult` below); the
-  // probe relays its log + page lines (`maintenance-log` / `maintenance-page`),
-  // routed through the page sink here. Compaction + the WAL-checkpoint timers
-  // above STAY on main — they write via the writer connection (sole-writer rule).
+  // The heavy SQLite maintenance schedules (integrity probe, verified backup,
+  // boot catch-up) run on the dedicated `maintenance-worker`, NOT main's fold
+  // thread — they are SYNCHRONOUS bun:sqlite ops that would stall main's event
+  // loop for their full duration. The worker calls the same `backupDb` /
+  // `runIntegrityProbe` bodies against its own short-lived read-only connections;
+  // side effects stay on main, driven by relayed outcomes. Compaction + the
+  // WAL-checkpoint timers above STAY on main (sole-writer rule).
 
-  // Shared botctl/Telegram page sink for relayed maintenance pages — the SAME
-  // "Keeper" topic the probe/backup used inline before the move. Best-effort:
+  // Shared botctl/Telegram page sink for relayed maintenance pages. Best-effort:
   // `livePage` swallows a notifier failure so a relayed page can never crash main.
   const maintenancePage = livePage();
   const backupFailurePage = liveBackupPage();
 
-  // Run main's existing success-log / failure-log+page branch from a relayed
-  // `BackupResult`. Byte-identical to the inline `runBackupPass` body that lived
-  // here before fn-765 — only the `backupDb` call (which now runs worker-side)
-  // is gone; the formatting + logging + paging is unchanged.
+  // Run the success-log / failure-log+page branch from a relayed `BackupResult`.
+  // The `backupDb` call runs worker-side; this is the formatting + logging +
+  // paging only.
   function handleBackupResult(result: BackupResult): void {
     if (result.verified && result.snapshotPath !== null) {
       const mb = (result.bytes / (1024 * 1024)).toFixed(1);
@@ -3856,52 +3035,34 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // fn-749: crash-handler guard — wired only when the worker was selected.
+  // Crash-handler guard — wired only when the worker was selected.
   if (autopilotWorkerInstance) {
     const aw = autopilotWorkerInstance;
-    // Same crash policy as the other workers: any thread failure →
-    // fatalExit → exit 1 → launchd restart.
     aw.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] autopilot worker error:", err.message ?? err);
       if (!shuttingDown) fatalExit();
     };
 
-    // Same crash-via-`close` gap as every other worker: a
-    // `process.exit(1)` inside the autopilot worker fires `close`, not
-    // `onerror`. Without this the reconciler could silently vanish while
-    // the rest of keeperd kept running. `!shuttingDown` makes it inert
-    // on the clean shutdown path.
+    // Same crash-via-`close` gap: a `process.exit(1)` fires `close`, not
+    // `onerror`. `!shuttingDown` makes it inert on the clean shutdown path.
     aw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
   }
 
-  // Spawn the restore-snapshot worker (fn-677 task .3) — the tenth worker
-  // thread. A pure CONSUMER: it opens its own read-only connection, polls
-  // `PRAGMA data_version`, and on every change reads the `jobs` + `epics`
-  // projections via the shared `runQuery` seam, builds a stable descriptor
-  // of the live (`working`/`stopped`) jobs grouped by zellij
-  // `backend_exec_session_id`, and rewrites `~/.local/state/keeper/restore.json`
-  // via `atomicWriteFile` ONLY when the content hash differs. The file is
-  // a derived side-file (NOT a projection, NOT in the event log), so the
-  // worker carries no `onmessage` handler — it never posts to main, never
-  // writes the DB, and never feeds the event log. The `scripts/restore-agents.ts`
-  // util (T4) is the sole reader.
+  // The restore-snapshot worker — a pure CONSUMER: its own read-only connection,
+  // polls `data_version`, and rewrites `~/.local/state/keeper/restore.json` (a
+  // derived side-file, NOT a projection) only when the content hash differs. It
+  // carries no `onmessage` handler — never posts to main, never writes the DB.
+  // Write failures are swallowed to stderr; only an unhandled throw escalates to
+  // fatalExit.
   //
-  // Write failures inside the worker are SWALLOWED to stderr (the next
-  // pulse re-writes); only an unhandled throw out of the watch loop
-  // escalates to `onerror`/`close` → fatalExit. Consistent with the other
-  // workers' crash policy.
-  // fn-765 — the maintenance worker: the dedicated thread hosting the heavy
-  // SQLite maintenance schedules (24h verified backup, 15-min integrity probe,
-  // fn-753 boot catch-up) that used to run on main's fold thread. bun:sqlite is
-  // synchronous, so those ops (a ~2 GB `VACUUM INTO`, a bounded `quick_check`)
-  // stalled main's event loop for their full duration; off-thread they stop
-  // blocking folds + ingest. The worker calls the SAME `backupDb` /
-  // `runIntegrityProbe` bodies (each opens + closes its own short-lived RO
-  // connection internally) and RELAYS outcomes up — main keeps the existing
-  // logging + paging side effects via the handlers below.
-  // fn-749: gated on the selector — `null` when unselected.
+  // The maintenance worker hosts the heavy SQLite schedules (verified backup,
+  // integrity probe, boot catch-up) OFF main's fold thread — synchronous
+  // bun:sqlite ops would otherwise stall main's event loop. It calls the same
+  // `backupDb` / `runIntegrityProbe` bodies against its own short-lived RO
+  // connections and RELAYS outcomes up; main keeps the logging + paging side
+  // effects. Gated on the selector — `null` when unselected.
   const maintenanceWorker = want("maintenance")
     ? new Worker(new URL("./maintenance-worker.ts", import.meta.url).href, {
         workerData: { dbPath } satisfies MaintenanceWorkerData,
@@ -3938,22 +3099,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       }
     };
 
-    // Same crash policy as the other workers: any thread failure → fatalExit →
-    // exit 1 → launchd restart. NEVER respawn in-process.
     mw.onerror = (err: ErrorEvent): void => {
       console.error("[keeperd] maintenance worker error:", err.message ?? err);
       if (!shuttingDown) fatalExit();
     };
 
     // A worker `process.exit(1)` fires `close`, not `onerror`. `!shuttingDown`
-    // makes it inert on clean shutdown (the worker exits 0 after clearing its
-    // own timers).
+    // makes it inert on clean shutdown.
     mw.addEventListener("close", () => {
       if (!shuttingDown) fatalExit();
     });
   }
 
-  // fn-749: gated on the selector — `null` when unselected.
+  // Gated on the selector — `null` when unselected.
   const restoreWorker = want("restore")
     ? new Worker(new URL("./restore-worker.ts", import.meta.url).href, {
         workerData: { dbPath } satisfies RestoreWorkerData,
@@ -3983,19 +3141,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   // Unrecoverable async errors that escape every guard also take the single
-  // recovery path. (A fold throw inside drain bubbles here if it ever escapes
-  // the reducer's per-event handling.)
-  //
-  // BUT once shutdown() is underway these are moot teardown noise, not a
-  // steady-state crash: a relay `postMessage` racing a just-terminated target
-  // worker throws `InvalidStateError: Worker has been terminated`, and a
-  // worker's own `db.close()` racing its in-flight poll surfaces a rejection —
-  // both AFTER `shuttingDown` is set. Without the guard either one calls
-  // `fatalExit()` and clobbers the clean `exit(0)` with a 1, which (a) flakes
-  // the integration suite's `daemon.exited === 0` assertion and (b) in
-  // production tells launchd (`KeepAlive.SuccessfulExit=false`) to RESTART a
-  // daemon that stopped cleanly. The `!shuttingDown` guard mirrors every
-  // worker `onerror` / `close` handler above.
+  // recovery path. The `!shuttingDown` guard keeps teardown-race noise (a relay
+  // `postMessage` to a just-terminated worker, a worker `db.close()` racing its
+  // poll) from clobbering the clean `exit(0)` — both fire AFTER `shuttingDown` is
+  // set. Mirrors every worker `onerror` / `close` handler above.
   process.on("unhandledRejection", (reason) => {
     if (shuttingDown) return;
     console.error("[keeperd] unhandled rejection:", reason);
@@ -4007,54 +3156,36 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     fatalExit();
   });
 
-  // Step 5 — clean teardown. fn-747: this is the TEARDOWN LOGIC ONLY — it sets
-  // the shutdown flag FIRST (so the `!shuttingDown` guards on every worker
-  // `onerror`/`close` keep teardown noise from tripping `fatalExit`), posts
-  // `{type:"shutdown"}` to every worker, races their `close` against the shared
-  // deadline, terminates, and closes the db — WITHOUT `process.exit`. The
-  // production exit-0 contract lives in the {@link shutdown} wrapper below (the
-  // ONLY path that exits 0); the in-process test harness calls `stop` directly
-  // so it can boot+tear-down many daemons in one process. Idempotent (the
-  // `shuttingDown` early-return makes a second call a no-op).
+  // Step 5 — clean teardown. TEARDOWN LOGIC ONLY: set the shutdown flag FIRST (so
+  // the `!shuttingDown` guards keep teardown noise from tripping `fatalExit`),
+  // post `{type:"shutdown"}` to every worker, race their `close` against the
+  // deadline, terminate, and close the db — WITHOUT `process.exit`. The exit-0
+  // contract lives in the {@link shutdown} wrapper below (the ONLY path that
+  // exits 0). Idempotent.
   async function stop(): Promise<void> {
     if (shuttingDown) {
       return;
     }
     shuttingDown = true;
 
-    // Flush any main-produced backstop counters as on-shutdown rollup records
-    // (epic fn-720) so the rescue-RATE denominator survives a clean stop.
-    // Best-effort: `appendBackstopRecord` swallows to stderr, so a write
-    // failure here can never block teardown. Worker-side counters are flushed
-    // by the workers' own shutdown handlers (tasks .2/.3) before they post
-    // their final `{kind:"backstop"}` rollup up.
+    // Flush main-produced backstop counters as on-shutdown rollup records so the
+    // rescue-RATE denominator survives a clean stop. Best-effort. Worker-side
+    // counters are flushed by the workers' own shutdown handlers.
     for (const rollup of mainBackstopCounters.snapshot(Date.now())) {
       appendBackstopRecord(rollup, backstopLogPath);
     }
 
-    // Clear the producer-side TTL sweep timer FIRST so the heartbeat
-    // can't fire a mint into the writer connection mid-teardown.
-    // (`clearInterval` is a no-op if the timer already fired.)
+    // Clear every main-thread heartbeat so none can fire a write into the writer
+    // connection mid-teardown. (`clearInterval` is a no-op if already fired.) The
+    // integrity-probe + backup + catch-up timers live on the maintenance worker,
+    // which clears its own when main posts `{type:"shutdown"}` below.
     clearInterval(pendingDispatchSweepTimer);
-    // fn-742 — clear the events-log fallback scan timer so a poll can't fire
-    // a scan+INSERT into the writer connection mid-teardown.
     clearInterval(eventsIngestFallbackTimer);
-    // Likewise clear the compaction heartbeat — a relocation batch must not
-    // fire into the writer connection mid-teardown.
     clearInterval(compactionTimer);
-    // fn-744 .2 — clear the steady-state checkpoint heartbeat so a PASSIVE
-    // checkpoint can't fire into the writer connection mid-teardown.
     clearInterval(walCheckpointTimer);
-    // fn-765 — the integrity-probe + backup + catch-up timers moved to the
-    // maintenance worker; main no longer holds those `setInterval`/`setTimeout`
-    // handles. The worker clears its own timers in its shutdown handler when main
-    // posts `{type:"shutdown"}` below, then exits clean.
 
-    // fn-749: the set of workers actually spawned this boot (filter out the
-    // `null`s for any unselected worker). Teardown iterates THIS list, so a
-    // minimal-set boot posts shutdown to / awaits close on / terminates only
-    // the workers it spawned. In the production full boot this is the identical
-    // ALL_WORKERS set, in spawn order.
+    // The workers actually spawned this boot (filter out the `null`s). Teardown
+    // iterates THIS list, so a minimal-set boot signals only what it spawned.
     const spawnedWorkers: Worker[] = [
       worker,
       serverWorker,
@@ -4070,13 +3201,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       restoreWorker,
     ].filter((w): w is Worker => w !== null);
 
-    // fn-765 — wrap each shutdown post in per-worker try/catch. A worker that
-    // already exited (crashed, or terminated by a prior teardown) makes
-    // `postMessage` throw `InvalidStateError: Worker has been terminated`; an
-    // unguarded throw here would reject `stop()` and hang the whole teardown
-    // until launchd's SIGKILL deadline. We still want to post to every OTHER
-    // live worker, so swallow per-worker and continue — a dead worker needs no
-    // shutdown signal anyway (its `close` already resolved its exit wait below).
+    // Wrap each shutdown post per-worker: an already-exited worker makes
+    // `postMessage` throw `InvalidStateError`, and an unguarded throw would reject
+    // `stop()` and hang teardown until launchd's SIGKILL. Swallow per-worker and
+    // keep posting to the rest — a dead worker needs no signal.
     for (const w of spawnedWorkers) {
       try {
         w.postMessage({ type: "shutdown" } satisfies ShutdownMessage);
@@ -4086,15 +3214,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
 
     // Bun surfaces worker exit via the "close" event. Await every spawned
-    // worker's close (the server worker releases its socket + lock, the
-    // transcript + plan + usage + dead-letter workers
-    // unsubscribe their watchers, the exit-watcher releases its
-    // kqueue/pidfd fd, the autopilot worker aborts its in-flight
-    // confirm, and the restore worker closes its read-only DB connection
-    // in their own shutdown handlers — that teardown must land, or the
-    // socket / native watches / kernel fd leak into the next boot),
-    // raced against a single shared deadline so a wedged worker can't
-    // block our clean shutdown forever.
+    // worker's close — each releases its own external resource (socket + lock,
+    // watcher subscriptions, kernel fd) in its shutdown handler, or those leak
+    // into the next boot — raced against a single deadline so a wedged worker
+    // can't block our clean shutdown forever.
     const exited = (w: Worker): Promise<void> =>
       new Promise<void>((resolve) => {
         w.addEventListener("close", () => resolve());
@@ -4118,31 +3241,27 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     } catch {
       // best-effort
     }
-    // NO `process.exit` here — the production exit-0 contract lives in
-    // {@link shutdown} (the SIGTERM/SIGINT wrapper, installed only by
-    // `runDaemon`). An in-process harness caller gets a resolved promise once
-    // teardown lands and keeps running.
+    // NO `process.exit` here — the exit-0 contract lives in {@link shutdown}
+    // (installed only by `runDaemon`). An in-process harness caller gets a
+    // resolved promise and keeps running.
   }
 
-  // fn-747 — boot complete. Return the programmatic handle. The production
-  // `runDaemon` wrapper installs the SIGTERM/SIGINT → exit-0 handlers around
-  // this; an in-process caller drives `stop()` directly.
+  // Boot complete. Return the programmatic handle; `runDaemon` installs the
+  // SIGTERM/SIGINT → exit-0 handlers around this.
   return { stop, sockPath };
 }
 
 /**
- * Production daemon entry point. Boots via {@link startDaemon} (no opts — every
- * watcher worker dlopens the addon, the pre-warm runs, full FSEvents fast paths)
- * and installs the SIGTERM/SIGINT → clean-exit-0 handlers. This is the ONLY path
- * that calls `process.exit(0)`: under launchd `KeepAlive.SuccessfulExit=false` a
- * clean exit tells launchd NOT to restart, while a crash takes `fatalExit` →
- * exit 1 → restart. Byte-for-byte the pre-fn-747 contract.
+ * Production daemon entry point. Boots via {@link startDaemon} (no opts) and
+ * installs the SIGTERM/SIGINT → clean-exit-0 handlers. The ONLY path that calls
+ * `process.exit(0)`: under launchd `KeepAlive.SuccessfulExit=false` a clean exit
+ * tells launchd NOT to restart, while a crash takes `fatalExit` → exit 1 →
+ * restart.
  */
 function runDaemon(): void {
   const { stop } = startDaemon();
-  // The ONLY path that exits 0. `stop()` runs the full teardown LOGIC (idempotent
-  // via its own `shuttingDown` guard); we exit 0 once it resolves so launchd
-  // (SuccessfulExit=false) does NOT restart a daemon that stopped cleanly.
+  // The ONLY path that exits 0. `stop()` runs the full teardown (idempotent); we
+  // exit 0 once it resolves so launchd does NOT restart a clean stop.
   const shutdown = (): void => {
     void stop().then(() => {
       process.exit(0);
@@ -4152,10 +3271,9 @@ function runDaemon(): void {
   process.on("SIGINT", shutdown);
 }
 
-// Only boot the daemon when this file is the process entry point. A plain
-// `import` (e.g. a test driving `drainToCompletion` against a tmp DB) must NOT
-// spawn the worker or install signal handlers. Mirrors wake-worker's
-// `isMainThread` guard.
+// Only boot the daemon when this file is the process entry point — a plain
+// `import` (e.g. a test driving `drainToCompletion`) must NOT spawn workers or
+// install signal handlers.
 if (import.meta.main) {
   runDaemon();
 }
