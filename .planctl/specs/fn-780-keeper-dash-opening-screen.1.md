@@ -101,5 +101,5 @@ out of the slow tier — assert it stays true in review).
 - [ ] all tests run in the default fast tier and pass
 
 ## Done summary
-
+Added the pure, OpenTUI-free dash design layer: src/dash/theme.ts maps the six semantic roles to ANSI-indexed descriptors, and src/dash/view-model.ts's buildDashModel folds a readiness snapshot plus the autopilot side-streams into role-tagged segment rows (header/PLAN/AGENTS), forking the three autopilot projectors so src never imports cli. Fast-tier table-driven tests cover every settled semantic.
 ## Evidence
