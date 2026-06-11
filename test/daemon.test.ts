@@ -28,6 +28,7 @@ import {
   buildPendingDispatchSweepRecords,
   type DaemonHandle,
   drainToCompletion,
+  isTransientBusyError,
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
   prewarmWatcherAddon,
@@ -638,6 +639,71 @@ async function spawnContendingWriter(opts: {
   return JSON.parse(stdout.trim());
 }
 
+/**
+ * Mirror of {@link spawnContendingWriter}: a subprocess that GRABS the writer
+ * lock (`BEGIN IMMEDIATE`), signals ready, then HOLDS it via a synchronous
+ * in-transaction OS sleep for `holdMs` before committing. Lets the parent
+ * provoke a real `SQLITE_BUSY` on its OWN write (the inverse role split — here
+ * the child is the lock hold, the parent is the contender whose error we
+ * inspect). Resolves once the subprocess has committed and exited.
+ */
+async function spawnLockHolder(opts: {
+  dbPath: string;
+  holdMs: number;
+  readyMarkerPath: string;
+}): Promise<void> {
+  const script = `
+    import { Database } from "bun:sqlite";
+    import { writeFileSync } from "node:fs";
+
+    const dbPath = ${JSON.stringify(opts.dbPath)};
+    const readyMarker = ${JSON.stringify(opts.readyMarkerPath)};
+    const holdMs = ${opts.holdMs};
+
+    const db = new Database(dbPath);
+    db.run("PRAGMA busy_timeout = 5000");
+    db.run("PRAGMA journal_mode = WAL");
+    db.run("PRAGMA synchronous = NORMAL");
+
+    function sleepSyncMs(ms) {
+      const view = new Int32Array(new SharedArrayBuffer(4));
+      Atomics.wait(view, 0, 0, ms);
+    }
+
+    // Grab the writer lock at BEGIN IMMEDIATE, THEN signal ready (so the parent
+    // never sees "ready" before the lock is actually held), THEN hold it.
+    const heldTxn = db.transaction(() => {
+      db.run(
+        \`INSERT INTO events
+             (ts, session_id, pid, hook_event, event_type, data)
+           VALUES (?, 'holder', 88888, 'Hold', 'lifecycle', '{}')\`,
+        [Math.floor(Date.now() / 1000)],
+      );
+      writeFileSync(readyMarker, "ready");
+      sleepSyncMs(holdMs); // INSIDE BEGIN IMMEDIATE — lock held continuously
+    });
+    heldTxn.immediate();
+
+    process.exit(0);
+  `;
+  const proc = Bun.spawn({
+    cmd: ["bun", "--eval", script],
+    env: process.env,
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  const [stdout, stderr] = await Promise.all([
+    new Response(proc.stdout).text(),
+    new Response(proc.stderr).text(),
+    proc.exited,
+  ]);
+  if (proc.exitCode !== 0) {
+    throw new Error(
+      `lock holder child failed exit=${proc.exitCode} stdout=${stdout} stderr=${stderr}`,
+    );
+  }
+}
+
 test("starvation repro: a long-held writer lock (no yield) starves a concurrent writer past its busy_timeout", async () => {
   // Reproduces the production bounce-window starvation: a single writer
   // (keeperd's boot drain, the end-of-boot TRUNCATE checkpoint, or a slow
@@ -771,6 +837,110 @@ test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock c
   // cadence, the contender grabs the lock in the FIRST paced gap → ok.
   expect(result.ok).toBe(true);
   expect(result.err).toBeNull();
+}, 30_000);
+
+test("isTransientBusyError classifies writer-lock starvation as transient and everything else as fatal", () => {
+  // The discriminator the usage mint's drop-don't-crash hinges on. Transient =
+  // recoverable lock contention (re-emit / boot-sweep heals a dropped row);
+  // everything else, notably SQLITE_CORRUPT (the fn-746 malformed-image class),
+  // must stay fatal so the loud-and-fatalExit-and-relaunch contract holds.
+  // Both the string `code` (what bun stamps) AND the numeric `errno` fallback.
+  expect(isTransientBusyError({ code: "SQLITE_BUSY", errno: 5 })).toBe(true);
+  expect(isTransientBusyError({ code: "SQLITE_LOCKED", errno: 6 })).toBe(true);
+  expect(isTransientBusyError({ errno: 5 })).toBe(true); // code dropped → errno
+  expect(isTransientBusyError({ errno: 6 })).toBe(true);
+
+  // Fatal classes — must NOT be swallowed.
+  expect(isTransientBusyError({ code: "SQLITE_CORRUPT", errno: 11 })).toBe(
+    false,
+  );
+  expect(isTransientBusyError({ code: "SQLITE_CONSTRAINT", errno: 19 })).toBe(
+    false,
+  );
+  expect(isTransientBusyError(new Error("plain"))).toBe(false);
+  expect(isTransientBusyError("SQLITE_BUSY")).toBe(false); // a bare string
+  expect(isTransientBusyError(null)).toBe(false);
+  expect(isTransientBusyError(undefined)).toBe(false);
+});
+
+test("usage-mint crash regression: a real insertEvent.run starved past busy_timeout throws an error isTransientBusyError catches", async () => {
+  // Pins the 2026-06-10 crash (39 daemon restarts): the usage mint's synchronous
+  // `stmts.insertEvent.run` threw `SQLITE_BUSY` straight through `uw.onmessage`
+  // to `uncaughtException` → `fatalExit`. The tolerant mint now swallows EXACTLY
+  // this error. This drives a REAL `insertEvent.run` (the synthetic UsageDeleted
+  // shape — pk in session_id, empty data) into a writer lock held past its
+  // busy_timeout and asserts the thrown error is one `isTransientBusyError`
+  // classifies transient — proving the live bun error carries the `code` the
+  // drop-don't-crash path keys on, not just a hand-built object.
+  const { db, stmts } = openDb(dbPath, { busyTimeoutMs: 100 });
+
+  const readyMarkerPath = join(tmpDir, "lockholder-ready");
+
+  // Reuse the contending-writer harness as the LOCK HOLDER: it enters a
+  // BEGIN IMMEDIATE write and holds it ~500ms (5× our busy_timeout) while THIS
+  // process attempts the mint and loses the race.
+  const holderPromise = spawnLockHolder({
+    dbPath,
+    holdMs: 500,
+    readyMarkerPath,
+  });
+
+  const { existsSync } = require("node:fs") as typeof import("node:fs");
+  const readyDeadline = Date.now() + 2000;
+  while (!existsSync(readyMarkerPath)) {
+    if (Date.now() > readyDeadline) {
+      throw new Error("lock holder failed to signal ready within 2s");
+    }
+    await Bun.sleep(5);
+  }
+  // Holder is mid-transaction now; our 100ms busy_timeout will exhaust under it.
+
+  let thrown: unknown;
+  try {
+    stmts.insertEvent.run({
+      $ts: Date.now() / 1000,
+      $session_id: "agentuse-profile-pk", // the UsageDeleted pk shape
+      $pid: null,
+      $hook_event: "UsageDeleted",
+      $event_type: "usage_snapshot",
+      $tool_name: null,
+      $matcher: null,
+      $cwd: null,
+      $permission_mode: null,
+      $agent_id: null,
+      $agent_type: null,
+      $stop_hook_active: null,
+      $data: "",
+      $subagent_agent_id: null,
+      $spawn_name: null,
+      $start_time: null,
+      $slash_command: null,
+      $skill_name: null,
+      $planctl_op: null,
+      $planctl_target: null,
+      $planctl_epic_id: null,
+      $planctl_task_id: null,
+      $planctl_subject_present: null,
+      $config_dir: null,
+      $planctl_queue_jump: null,
+      $bash_mutation_kind: null,
+      $bash_mutation_targets: null,
+      $planctl_files: null,
+      $backend_exec_type: null,
+      $backend_exec_session_id: null,
+      $backend_exec_pane_id: null,
+    });
+  } catch (err) {
+    thrown = err;
+  }
+
+  await holderPromise;
+  db.close();
+
+  // The mint DID throw (lock starvation), and the discriminator catches it —
+  // so the tolerant mint drops-and-survives instead of crashing the daemon.
+  expect(thrown).toBeDefined();
+  expect(isTransientBusyError(thrown)).toBe(true);
 }, 30_000);
 
 test("withBootDrainCheckpointTuning ends the boot with a PASSIVE checkpoint (writer-skipping, not TRUNCATE)", () => {

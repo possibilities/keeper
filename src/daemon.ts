@@ -350,6 +350,30 @@ export function serializeUsageSnapshot(msg: UsageSnapshotMessage): string {
 }
 
 /**
+ * True for a TRANSIENT writer-lock starvation — a `bun:sqlite` `SQLiteError`
+ * whose `code` is `SQLITE_BUSY` (errno 5) or `SQLITE_LOCKED` (errno 6). These
+ * mean "the writer was contended past the connection `busy_timeout`," which
+ * clears on its own; they are categorically distinct from `SQLITE_CORRUPT`
+ * (errno 11, malformed image — the fn-746 class) and every other fault, which
+ * must stay fatal. Discriminates on `.code` (the stable string bun stamps,
+ * e.g. the 2026-06-10 crash trace's `code: "SQLITE_BUSY"`), falling back to the
+ * numeric `errno` so a future bun that drops the string is still caught.
+ *
+ * Pure + dependency-free so the mint-tolerance test can drive it directly.
+ */
+export function isTransientBusyError(err: unknown): boolean {
+  if (typeof err !== "object" || err === null) {
+    return false;
+  }
+  const code = (err as { code?: unknown }).code;
+  if (code === "SQLITE_BUSY" || code === "SQLITE_LOCKED") {
+    return true;
+  }
+  const errno = (err as { errno?: unknown }).errno;
+  return errno === 5 || errno === 6;
+}
+
+/**
  * Scan the dead-letter dir and import each NDJSON file's records into the
  * `dead_letters` operational table via `INSERT OR IGNORE` (keyed on `dl_id`) — a
  * DIRECT operational-table write, NOT an event fold. The `INSERT OR IGNORE`
@@ -1348,6 +1372,53 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // backstop and the kick is idempotent. Skip a no-op pump and shutdown.
     if (folded && !shuttingDown) {
       serverWorker?.postMessage({ type: "kick" } satisfies KickMessage);
+    }
+  }
+
+  /**
+   * Mint one synthetic usage `events` row, surviving a transient writer-lock
+   * starvation instead of crashing the daemon.
+   *
+   * The usage producer churns `<id>.json` create/delete events whenever the
+   * agentuse daemon rotates a profile, so its mint is the one most likely to
+   * land mid-checkpoint while a multi-GB WAL writer holds the lock past the
+   * connection `busy_timeout`. `insertEvent.run` is synchronous, so on that
+   * miss it throws `SQLITE_BUSY` straight up through `uw.onmessage` (no awaits,
+   * no catch) to `process.on("uncaughtException")` → `fatalExit` — turning a
+   * recoverable lock-contention blip into a full restart into the unpaused-boot
+   * dispatch window. The 2026-06-10 incident took 39 such restarts.
+   *
+   * A DROPPED usage mint is recoverable BY DESIGN, which is what makes
+   * drop-don't-crash safe HERE specifically (the other producer mints have no
+   * such re-emit and must NOT adopt this without their own recoverability
+   * argument): a snapshot re-emits on the file's next change-gated write, and a
+   * tombstone is re-retracted by the next boot scan's {@link UsageScanner.sweep}
+   * (it diffs the live projection against the on-disk census). So a transient
+   * `SQLITE_BUSY` is logged loudly and dropped; the daemon stays up.
+   *
+   * Every OTHER error — notably `SQLITE_CORRUPT` (the malformed-image / fn-746
+   * class) — still rethrows so the loud-and-`fatalExit`-and-relaunch contract
+   * holds for genuine corruption. This narrows the fatal surface to real faults
+   * without widening any write path.
+   *
+   * @returns `true` if the row landed, `false` if a transient busy dropped it.
+   */
+  function mintUsageEventTolerant(
+    params: Parameters<typeof stmts.insertEvent.run>[0],
+  ): boolean {
+    try {
+      stmts.insertEvent.run(params);
+      return true;
+    } catch (err) {
+      if (isTransientBusyError(err)) {
+        console.error(
+          "[keeperd] usage mint dropped a synthetic event on transient writer-lock " +
+            "contention (recoverable via re-emit / boot sweep); daemon stays up:",
+          err,
+        );
+        return false;
+      }
+      throw err;
     }
   }
 
@@ -2392,7 +2463,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       } else {
         return;
       }
-      stmts.insertEvent.run({
+      // Tolerant mint: a transient writer-lock miss is logged-and-dropped
+      // (recoverable via change-gated re-emit / boot sweep) instead of crashing
+      // the daemon into the unpaused-boot dispatch window; real corruption still
+      // throws on through to `fatalExit`. See {@link mintUsageEventTolerant}.
+      const minted = mintUsageEventTolerant({
         $ts: Date.now() / 1000,
         $session_id: msg.id, // the entity pk: agentuse profile id
         $pid: null,
@@ -2425,8 +2500,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $backend_exec_session_id: null,
         $backend_exec_pane_id: null,
       });
-      wakePending = true;
-      pumpWakes();
+      // Nothing landed on a dropped mint — skip the wake so we don't spin a
+      // no-op drain pass; the next re-emit / boot sweep carries the row.
+      if (minted) {
+        wakePending = true;
+        pumpWakes();
+      }
     };
 
     uw.onerror = (err: ErrorEvent): void => {
