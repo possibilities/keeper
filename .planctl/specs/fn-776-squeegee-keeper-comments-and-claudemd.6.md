@@ -27,5 +27,5 @@ Per recipe; test:full mandatory.
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Scrubbed bloat comments from autopilot-worker, server-worker, derivers, collections, exec-backend (comment-only, verifier-gated): -2190 lines / -133604 chars. Kept load-bearing constraints incl. UNIT TRAP (once) and the cooldown ordering chain; both derivers biome-ignores untouched.
 ## Evidence
