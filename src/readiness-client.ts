@@ -106,9 +106,15 @@ const MAX_BACKOFF_MS = 5000;
 // ACCEPTED then served an error and closed, so an immediate retry worsens the
 // contended cap and a whole await fleet retries in lockstep — cap rejects ride
 // this LONGER base with FULL jitter (`random(0, capped_window)`), distinct from
-// the deterministic 250ms→5s socket-level ladder. Both stay under
-// `MAX_BACKOFF_MS`.
+// the deterministic 250ms→5s socket-level ladder.
 const TRANSIENT_BACKOFF_BASE_MS = 2500;
+// Cap-reject backoff CEILING — distinct from (and far above) the socket-level
+// `MAX_BACKOFF_MS`. Under a saturated cap, ~24 concurrent awaits each retrying
+// every ≤5s burned ~20 conn-ids/min and re-saturated the cap in lockstep
+// (fn-778). A 30s ceiling on the EXPONENTIAL transient window (base 2500ms,
+// doubling, FULL jitter over `[0, window)`) bounds the steady-state reconnect
+// rate to ~2/min/client while the cap is full, instead of hammering it.
+const TRANSIENT_BACKOFF_CAP_MS = 30_000;
 /**
  * Server error codes that are CAPACITY-TRANSIENT, not query-terminal. A
  * `max_connections` reject is "full right now," which the reconnect loop
@@ -1060,19 +1066,22 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
   }
 
   /**
-   * Compute the next backoff delay, both regimes capped at `MAX_BACKOFF_MS`:
+   * Compute the next backoff delay:
    *   - socket-level reject (`transient=false`): the deterministic 250ms→5s
-   *     doubling ladder.
-   *   - capacity-transient cap reject (`transient=true`): a LONGER base with
-   *     FULL jitter, de-correlating a fleet of awaits rejected in the same
-   *     incident so they don't re-saturate the cap in lockstep.
+   *     doubling ladder, capped at `MAX_BACKOFF_MS`.
+   *   - capacity-transient cap reject (`transient=true`): a LONGER base
+   *     (`TRANSIENT_BACKOFF_BASE_MS`) doubling per attempt with FULL jitter
+   *     (`random(0, window)`), capped at the much-higher `TRANSIENT_BACKOFF_CAP_MS`
+   *     (~30s) — de-correlating a fleet of awaits rejected in the same incident
+   *     AND bounding their steady-state reconnect rate so they don't
+   *     re-saturate the cap in lockstep.
    * Caller bumps `attempt` first so `attempt >= 1` here.
    */
   function computeBackoffDelay(transient: boolean): number {
     if (transient) {
       const window = Math.min(
         TRANSIENT_BACKOFF_BASE_MS * 2 ** (attempt - 1),
-        MAX_BACKOFF_MS,
+        TRANSIENT_BACKOFF_CAP_MS,
       );
       return Math.floor(Math.random() * window);
     }

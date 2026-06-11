@@ -2239,14 +2239,14 @@ test("fn-775: pre-paint max_connections frame → reconnect, never onFatal (no r
   }
 });
 
-test("fn-775: accept-then-cap-reject cycles GROW the backoff (no 250ms pin) and stay under the cap", async () => {
+test("fn-775/fn-778: accept-then-cap-reject cycles GROW the backoff (no 250ms pin) up to the ~30s cap", async () => {
   // The reset moved from `open` to first `result`. An accept-then-cap-reject
   // server never serves a result, so `attempt` must climb across cycles —
   // the cap-reject regime (base 2500ms, full jitter) grows then caps at
-  // MAX_BACKOFF_MS. Stub Math.random to 0.5 so each delay is a deterministic
-  // half of its window: floor(0.5 * min(2500*2^(n-1), 5000)) →
-  // 1250, 2500, 2500, … (window 2500, 5000, 5000-capped). The growth from
-  // 1250→2500 proves no 250ms / no-backoff pin; the cap proves the ceiling.
+  // TRANSIENT_BACKOFF_CAP_MS (~30s, fn-778). Stub Math.random to 0.5 so each
+  // delay is a deterministic half of its window: floor(0.5 * min(2500*2^(n-1),
+  // 30000)) → 1250, 2500, 5000, 10000 (window 2500, 5000, 10000, 20000). The
+  // exponential growth proves no 250ms / no-backoff pin AND the new higher cap.
   const observed: number[] = [];
   const realSetTimeout = globalThis.setTimeout;
   const realRandom = Math.random;
@@ -2343,17 +2343,21 @@ test("fn-775: accept-then-cap-reject cycles GROW the backoff (no 250ms pin) and 
     expect(fatalCalls).toBe(0);
     // One backoff sleep per cap-reject cycle.
     expect(observed.length).toBe(cycles);
-    // Deterministic (Math.random=0.5) growing-then-capped sequence:
-    //   window = min(2500 * 2^(attempt-1), 5000); delay = floor(0.5*window)
-    //   attempt 1 → 1250, 2 → 2500, 3 → 2500 (capped), 4 → 2500 (capped)
-    expect(observed).toEqual([1250, 2500, 2500, 2500]);
+    // Deterministic (Math.random=0.5) exponentially-growing sequence under the
+    // ~30s transient cap:
+    //   window = min(2500 * 2^(attempt-1), 30000); delay = floor(0.5*window)
+    //   attempt 1 → 1250, 2 → 2500, 3 → 5000, 4 → 10000
+    expect(observed).toEqual([1250, 2500, 5000, 10000]);
     // The first delay is far above the 250ms socket-level base — proof the
     // cap-reject regime (longer base) is in effect, not the socket ladder and
     // not a no-backoff close-path retry.
     expect(observed[0]).toBeGreaterThan(250);
-    // Every delay stays under the shared ceiling.
+    // The growth exceeds the 5s socket-level ceiling — proof the transient
+    // regime rides its OWN higher cap, not the shared `MAX_BACKOFF_MS`.
+    expect(Math.max(...observed)).toBeGreaterThan(5000);
+    // Every delay stays under the transient ceiling.
     for (const d of observed) {
-      expect(d).toBeLessThanOrEqual(5000);
+      expect(d).toBeLessThanOrEqual(30000);
     }
 
     handle.dispose();

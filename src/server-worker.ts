@@ -735,6 +735,16 @@ export interface ConnState {
    * this drives eviction ONLY for connections carrying zero subscriptions.
    */
   lastActivityAt: number;
+  /**
+   * The peer process's pid, captured at `open` via `getsockopt`/`LOCAL_PEERPID`
+   * (macOS UDS). `null` when the probe is unavailable (non-darwin, load
+   * failure, or a `getsockopt` error). Drives the SUBSCRIBED-conn dead-peer
+   * sweep ({@link reapDeadPeers}): a subscribed conn whose peer pid is gone is
+   * evicted — closing the hole fn-767's subscribed-exempt idle sweep left. A
+   * `null` pid is NEVER reaped on liveness (the probe degrades to the existing
+   * idle + stuck-pending arms).
+   */
+  peerPid: number | null;
   /** DEBUG: per-connection sequence id for `[srv-ts]` log correlation. */
   id?: number;
 }
@@ -746,6 +756,7 @@ function newConnState(): ConnState {
     pending: null,
     pendingSince: null,
     lastActivityAt: Date.now(),
+    peerPid: null,
   };
 }
 
@@ -827,6 +838,105 @@ export function isPidAlive(pid: number): boolean {
       return true;
     }
     return false;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Peer-pid capture (macOS LOCAL_PEERPID) — subscribed-ghost eviction
+// ---------------------------------------------------------------------------
+//
+// fn-767's idle sweep DELIBERATELY exempts a subscribed conn (a quiet board is
+// legitimately silent — the fn-723 "a ponging orphan is indistinguishable from
+// a quiet viewer" descope). That left a hole: a SUBSCRIBED client whose peer
+// process is gone (SIGKILL / half-open, no FIN the kernel reports) lingers in
+// `conns` forever, costing a serial diff every tick and burning a cap slot.
+//
+// The peer-pid probe DISTINGUISHES dead-peer from quiet-viewer — exactly what
+// ping/pong could not. We capture the client's pid at accept time via
+// `getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID)` (macOS UDS), then `reapDeadPeers`
+// probes `isPidAlive(pid)` on subscribed conns; a dead peer evicts through the
+// existing `sock.end()` path. This is connection hygiene (the fn-723 carve-out),
+// matching the exit-watcher's producer-side liveness-probe precedent — NOT
+// in-process self-heal, and NEVER keyed on inactivity.
+//
+// pid-reuse caveat: a recycled pid passing kill(0) leaves a ghost one extra
+// lifetime — acceptable (the next death, or the idle/stuck arms, clears it).
+
+// macOS <sys/un.h>: SOL_LOCAL = 0, LOCAL_PEERPID = 0x002 (ABI-stable). The
+// option returns the connected peer's pid as a 4-byte int.
+const SOL_LOCAL = 0;
+const LOCAL_PEERPID = 0x002;
+
+/**
+ * Lazily-`dlopen`ed `getsockopt` handle (macOS only). `undefined` = not yet
+ * probed; `null` = unavailable on this platform / load failed (the probe then
+ * degrades to a no-op so the idle + stuck-pending arms still run). A plain
+ * module import never opens it — only the first `peerPidForFd` call does.
+ */
+let getsockoptLib:
+  | { getsockopt: (...args: number[]) => number }
+  | null
+  | undefined;
+
+function loadGetsockopt(): {
+  getsockopt: (...args: number[]) => number;
+} | null {
+  if (getsockoptLib !== undefined) {
+    return getsockoptLib;
+  }
+  // LOCAL_PEERPID is macOS-only; on any other platform leave the probe inert.
+  if (process.platform !== "darwin") {
+    getsockoptLib = null;
+    return null;
+  }
+  try {
+    // Deferred require so `bun:ffi` is touched only on the production path.
+    const { dlopen, FFIType, suffix } =
+      require("bun:ffi") as typeof import("bun:ffi");
+    const lib = dlopen(`libc.${suffix}`, {
+      getsockopt: {
+        args: [FFIType.i32, FFIType.i32, FFIType.i32, FFIType.ptr, FFIType.ptr],
+        returns: FFIType.i32,
+      },
+    });
+    getsockoptLib = lib.symbols as unknown as {
+      getsockopt: (...args: number[]) => number;
+    };
+  } catch (err) {
+    console.error("[server-worker] LOCAL_PEERPID getsockopt unavailable:", err);
+    getsockoptLib = null;
+  }
+  return getsockoptLib;
+}
+
+/**
+ * Read the connected peer's pid for socket `fd` via `getsockopt` /
+ * `LOCAL_PEERPID` (macOS). Returns `null` when the option is unavailable (non-
+ * darwin, load failure, or a `getsockopt` error) — the caller treats a `null`
+ * pid as "unknown, never reap on liveness", so a probe failure is benign.
+ */
+export function peerPidForFd(fd: number): number | null {
+  if (!Number.isInteger(fd) || fd < 0) {
+    return null;
+  }
+  const lib = loadGetsockopt();
+  if (lib === null) {
+    return null;
+  }
+  try {
+    const { ptr } = require("bun:ffi") as typeof import("bun:ffi");
+    const out = new Int32Array(1);
+    const len = new Uint32Array(1);
+    len[0] = 4;
+    const rc = lib.getsockopt(fd, SOL_LOCAL, LOCAL_PEERPID, ptr(out), ptr(len));
+    if (rc !== 0) {
+      return null;
+    }
+    const pid = out[0];
+    return pid > 0 ? pid : null;
+  } catch {
+    // A getsockopt throw (closed fd mid-probe) is benign — treat as unknown.
+    return null;
   }
 }
 
@@ -1852,7 +1962,52 @@ function reapIdleConns(list: Writable[]): void {
 }
 
 /**
- * Run both connection-hygiene reapers over the live conn set. Called on EVERY
+ * Evict a SUBSCRIBED connection whose peer process is gone — the hole fn-767's
+ * idle sweep left exempt (a subscribed conn is never idle-reaped, but a dead
+ * peer must still evict). Probes `isPidAlive(peerPid)` keyed on PROCESS
+ * LIVENESS, never on inactivity, so a quiet-but-alive viewer is never touched.
+ * Distinguishes dead-peer from quiet-viewer — exactly what the fn-723 ping/pong
+ * descope said ping could not.
+ *
+ * Scoped to SUBSCRIBED conns (`subs.size > 0`): a zero-sub conn is already
+ * covered by the idle sweep, and skipping it keeps the probe O(subscribers).
+ * A `null` peerPid (probe unavailable — non-darwin, or a getsockopt failure) is
+ * NEVER reaped here: the idle + stuck-pending arms remain the backstop. Per-conn
+ * try/catch as in the sibling reapers.
+ */
+function reapDeadPeers(list: Writable[]): void {
+  for (const sock of list) {
+    // Subscribed-only — the zero-sub case is the idle sweep's job.
+    if (sock.data.subs.size === 0) {
+      continue;
+    }
+    const pid = sock.data.peerPid;
+    // Unknown pid (null/undefined) → never reap on liveness (degrade to the
+    // other arms). `== null` catches a ConnState built without the field too.
+    if (pid == null) {
+      continue;
+    }
+    if (isPidAlive(pid)) {
+      continue;
+    }
+    console.error(
+      `[server-worker] reaping subscribed dead-peer conn ${sock.data.id ?? -1} ` +
+        `(peer pid ${pid} gone; ${sock.data.subs.size} sub(s))`,
+    );
+    try {
+      sock.end?.();
+    } catch (err) {
+      // No-self-heal: a failed end() must not abort the reap of sibling conns.
+      console.error(
+        `[server-worker] dead-peer end() failed for conn ${sock.data.id ?? -1}:`,
+        err,
+      );
+    }
+  }
+}
+
+/**
+ * Run the connection-hygiene reapers over the live conn set. Called on EVERY
  * `pollLoop` tick (NOT only changed ticks) because the leak class fills `conns`
  * during DB-quiet windows, exactly when `data_version` is frozen and `diffTick`
  * never fires; also called from inside `diffTick` for the `handleKick` path.
@@ -1861,6 +2016,7 @@ function reapIdleConns(list: Writable[]): void {
 export function reapConns(list: Writable[]): void {
   reapStuckPending(list);
   reapIdleConns(list);
+  reapDeadPeers(list);
 }
 
 /**
@@ -2299,6 +2455,13 @@ export function startServer(
             socket.end();
             return; // never added to `conns`
           }
+          // Capture the peer pid for the subscribed-ghost dead-peer sweep
+          // (macOS LOCAL_PEERPID; `null` on any other platform / probe failure,
+          // which degrades to the idle + stuck-pending arms). Best-effort —
+          // a probe failure must never block accepting the connection.
+          socket.data.peerPid = peerPidForFd(
+            (socket as unknown as { fd?: number }).fd ?? -1,
+          );
           conns.add(socket as unknown as Writable);
           if (TRACE) srvTs(`conn ${socket.data.id} open`);
         } catch (err) {

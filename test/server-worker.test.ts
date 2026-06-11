@@ -140,6 +140,7 @@ function dispatchInit(): ConnState {
     pending: null,
     pendingSince: null,
     lastActivityAt: Date.now(),
+    peerPid: null,
   };
 }
 
@@ -1767,6 +1768,212 @@ test("idle-sweep NEVER evicts a subscribed conn, however long it has been quiet"
 
   expect(sock.ended).toBe(false);
   expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// fn-778 — subscribed-ghost dead-peer eviction.
+//
+// fn-767's idle sweep DELIBERATELY exempts a subscribed conn (the fn-723
+// no-ping-pong descope). That left subscribed ghosts — a SUBSCRIBED client whose
+// peer process is gone (SIGKILL / half-open) — lingering forever. The dead-peer
+// arm probes the captured peer pid (macOS LOCAL_PEERPID) and evicts a subscribed
+// conn whose peer is gone, distinguishing dead-peer from quiet-viewer (which
+// ping/pong could not). Keyed on PROCESS LIVENESS, never inactivity.
+// ---------------------------------------------------------------------------
+
+/**
+ * A pid guaranteed dead: spawn a trivial child, await its exit, return its (now
+ * reaped) pid. `isPidAlive` reports it dead — the dead-peer ghost shape.
+ */
+async function deadPid(): Promise<number> {
+  const child = Bun.spawn(["true"]);
+  const pid = child.pid;
+  await child.exited;
+  return pid;
+}
+
+test("fn-778 dead-peer sweep evicts a SUBSCRIBED conn whose peer pid is gone", async () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // A subscribed conn (idle sweep exempt) whose peer process has exited — the
+  // ghost. Its lastActivityAt is fresh, so ONLY the dead-peer arm can evict it.
+  sock.data.peerPid = await deadPid();
+  expect(sock.data.subs.size).toBe(1);
+  expect(isPidAlive(sock.data.peerPid)).toBe(false);
+  sock.data.lastActivityAt = Date.now();
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(true);
+  expect(conns.has(sock)).toBe(false);
+  db.close();
+});
+
+test("fn-778 dead-peer sweep NEVER evicts a subscribed conn whose peer is alive (this process)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // A quiet-but-ALIVE subscribed viewer: peer pid is this very process (alive),
+  // last activity ancient. The liveness key (not inactivity) keeps it alive
+  // however long it stays silent — the fn-723 quiet-viewer guarantee.
+  sock.data.peerPid = process.pid;
+  sock.data.lastActivityAt = Date.now() - IDLE_CONN_TTL_MS * 100;
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("fn-778 dead-peer sweep is inert for a null peerPid (probe unavailable → degrade)", async () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+  watch(db, sock, { a: 5 });
+
+  // peerPid null (the non-darwin / probe-failure degrade): the dead-peer arm
+  // must NOT evict — the idle + stuck-pending arms remain the only backstop, and
+  // a subscribed conn with a fresh clock survives.
+  sock.data.peerPid = null;
+  sock.data.lastActivityAt = Date.now();
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("fn-778 dead-peer sweep does NOT touch a zero-sub conn (idle sweep owns that)", async () => {
+  // A zero-sub conn with a dead peer but a FRESH clock: the dead-peer arm is
+  // subscribed-only, and the idle sweep is fresh-clock-exempt — so neither fires
+  // and the conn survives this pass (the idle sweep ages it out later). This
+  // pins the scope boundary so the arms don't double-own the zero-sub case.
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  const conns = new Set<Writable>();
+  const sock = fakeSock(conns);
+  conns.add(sock);
+
+  expect(sock.data.subs.size).toBe(0);
+  sock.data.peerPid = await deadPid();
+  sock.data.lastActivityAt = Date.now();
+
+  reapConns([...conns]);
+
+  expect(sock.ended).toBe(false);
+  expect(conns.has(sock)).toBe(true);
+  db.close();
+});
+
+test("fn-778 a dead-peer end() throw is swallowed (no-self-heal) and siblings still reap", async () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  seedJob(db, "a", { last_event_id: 5 });
+  const conns = new Set<Writable>();
+
+  // First subscribed dead-peer conn's end() throws; the second must still reap.
+  const dead = await deadPid();
+  const boomer = fakeSock(conns);
+  conns.add(boomer);
+  watch(db, boomer, { a: 5 });
+  boomer.data.peerPid = dead;
+  boomer.end = () => {
+    throw new Error("boom");
+  };
+
+  const sibling = fakeSock(conns);
+  conns.add(sibling);
+  watch(db, sibling, { a: 5 });
+  sibling.data.peerPid = dead;
+
+  expect(() => reapConns([...conns])).not.toThrow();
+  expect(sibling.ended).toBe(true);
+  expect(conns.has(sibling)).toBe(false);
+  db.close();
+});
+
+test("fn-778 peerPidForFd returns the connected peer pid for a real UDS conn (macOS)", async () => {
+  // The capture primitive end-to-end: a real server reads the CLIENT's peer pid
+  // via LOCAL_PEERPID. Client + server share this process, so the captured pid
+  // IS process.pid. Skips where the probe is unavailable (non-darwin).
+  if (process.platform !== "darwin") {
+    return;
+  }
+  const { db } = openDb(dbPath, { readonly: true });
+  const server = startServer(db, sockPath, lockPath);
+  const client = await Bun.connect({
+    unix: sockPath,
+    socket: { data() {}, error() {} },
+  });
+
+  const captured = await retryUntil(() => {
+    if (server.conns.size !== 1) return null;
+    const pid = [...server.conns][0]?.data.peerPid;
+    return pid != null ? pid : null;
+  });
+  expect(captured).toBe(process.pid);
+
+  client.end();
+  server.stop();
+  db.close();
+});
+
+test("fn-778 a real SIGKILLed SUBSCRIBED client is dead-peer-swept within a reap pass", async () => {
+  // The headline shape: a SEPARATE child process subscribes (so it's idle-sweep
+  // exempt), then is SIGKILLed. The kernel may or may not report the FIN; either
+  // way the dead-peer probe (peer pid gone) evicts it within one reap pass —
+  // without the fresh-clock idle sweep ever firing. macOS-only (LOCAL_PEERPID).
+  if (process.platform !== "darwin") {
+    return;
+  }
+  const { db } = openDb(dbPath, { readonly: true });
+  const server = startServer(db, sockPath, lockPath);
+
+  // A child that connects, sends a `subscribe`-shaped query frame, then idles.
+  const child = Bun.spawn([
+    "bun",
+    "-e",
+    `await Bun.connect({unix:${JSON.stringify(sockPath)},socket:{open(s){s.write(${JSON.stringify(
+      `${JSON.stringify({ type: "query", collection: "jobs" })}\n`,
+    )});},data(){},error(){}}}); await new Promise(()=>{});`,
+  ]);
+
+  // Wait until the server has registered the conn AND it carries the child's
+  // peer pid AND it is subscribed (its query landed → subs.size > 0).
+  const conn = await retryUntil(() => {
+    if (server.conns.size !== 1) return null;
+    const c = [...server.conns][0];
+    return c && c.data.peerPid === child.pid && c.data.subs.size > 0 ? c : null;
+  });
+  if (!conn) {
+    child.kill("SIGKILL");
+    throw new Error("server never registered the subscribed child conn");
+  }
+  // Freeze the clock fresh so ONLY the dead-peer arm can evict (not idle sweep).
+  conn.data.lastActivityAt = Date.now();
+
+  // Hard-kill the child. Its pid goes dead; the next reap pass evicts the conn.
+  child.kill("SIGKILL");
+  await child.exited;
+
+  const drained = await retryUntil(() =>
+    server.conns.size === 0 ? true : null,
+  );
+  expect(drained).toBe(true);
+
+  server.stop();
   db.close();
 });
 
