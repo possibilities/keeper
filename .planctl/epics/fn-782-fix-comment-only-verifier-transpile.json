@@ -1,0 +1,20 @@
+{
+  "branch_name": "fn-782-fix-comment-only-verifier-transpile",
+  "bundles": [],
+  "created_at": "2026-06-11T02:18:21.891169Z",
+  "created_by_close_of": "fn-776-squeegee-keeper-comments-and-claudemd",
+  "depends_on_epics": [
+    "fn-776-squeegee-keeper-comments-and-claudemd"
+  ],
+  "id": "fn-782-fix-comment-only-verifier-transpile",
+  "last_validated_at": "2026-06-11T02:18:22.034126Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Fix comment-only verifier transpile witness",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-11T02:18:21.891169Z"
+}

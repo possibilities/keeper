@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T02:18:21.891169Z",
+  "depends_on": [],
+  "epic": "fn-782-fix-comment-only-verifier-transpile",
+  "id": "fn-782-fix-comment-only-verifier-transpile.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Fix transpile witness fileName",
+  "updated_at": "2026-06-11T02:18:21.891169Z"
+}
