@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-11T19:30:12.931235Z",
+  "depends_on_epics": [],
+  "id": "fn-788-watcher-re-arm-parity",
+  "last_validated_at": "2026-06-11T19:30:12.981912Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Watcher re-arm parity",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-11T19:30:12.931235Z"
+}
