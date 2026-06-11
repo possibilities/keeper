@@ -113,9 +113,10 @@ def test_read_marker_roundtrip(marker_dir):
     session_markers.write_work_marker("fn-9-x.1")
     rec = session_markers.read_marker(_SESSION)
     assert rec is not None and rec["task_id"] == "fn-9-x.1"
+    assert (marker_dir / f"{_SESSION}.json").exists()
 
 
-def test_read_marker_missing_returns_none(marker_dir):
+def test_read_marker_missing_returns_none():
     assert session_markers.read_marker("no-such-session") is None
 
 
@@ -172,7 +173,7 @@ def test_no_env_is_noop_for_every_helper(tmp_path, monkeypatch):
 def test_write_io_error_swallowed(marker_dir, monkeypatch):
     """A filesystem error during write never propagates out of the helper."""
 
-    def _boom(*a, **k):
+    def _boom(*_a, **_k):
         raise OSError("disk full")
 
     monkeypatch.setattr(session_markers.Path, "mkdir", _boom)
@@ -185,12 +186,13 @@ def test_clear_io_error_swallowed(marker_dir, monkeypatch):
     """A filesystem error during clear's unlink never propagates."""
     session_markers.write_work_marker("fn-9-x.1")
 
-    def _boom(self, *a, **k):
+    def _boom(_self, *_a, **_k):
         raise OSError("read-only fs")
 
     monkeypatch.setattr(session_markers.Path, "unlink", _boom)
     # Must not raise even though unlink fails.
     session_markers.clear_work_marker("fn-9-x.1")
+    assert (marker_dir / f"{_SESSION}.json").exists()
 
 
 # --------------------------------------------------------------------------
@@ -219,7 +221,7 @@ def _marker_present(d):
 @pytest.mark.real_roots
 def test_claim_success_writes_work_marker(tmp_path, monkeypatch, verb_marker_dir):
     """A successful claim writes a work marker naming the task."""
-    epic_id, task_ids = seed_state(tmp_path, epic_id="fn-1-marker", n_tasks=1)
+    _, task_ids = seed_state(tmp_path, epic_id="fn-1-marker", n_tasks=1)
     task_id = task_ids[0]
 
     # claim resolves the owning project via roots discovery, not cwd — point a
@@ -253,7 +255,7 @@ def test_worker_resume_success_writes_work_marker(
     """worker resume (success) writes the work marker."""
     import planctl.run_worker_resume as rwr
 
-    epic_id, task_ids = seed_state(tmp_path, epic_id="fn-2-marker", n_tasks=1)
+    _, task_ids = seed_state(tmp_path, epic_id="fn-2-marker", n_tasks=1)
     task_id = task_ids[0]
     monkeypatch.chdir(tmp_path)
 
@@ -267,7 +269,7 @@ def test_done_clears_matching_work_marker(tmp_path, monkeypatch, verb_marker_dir
     """done clears the work marker when it names the task being completed."""
     import planctl.run_done as rd
 
-    epic_id, task_ids = seed_state(tmp_path, epic_id="fn-3-marker", n_tasks=1)
+    _, task_ids = seed_state(tmp_path, epic_id="fn-3-marker", n_tasks=1)
     task_id = task_ids[0]
     monkeypatch.chdir(tmp_path)
 
@@ -297,7 +299,7 @@ def test_done_leaves_mismatched_marker(tmp_path, monkeypatch, verb_marker_dir):
     from planctl.project import resolve_project
     from planctl.store import LocalFileStateStore
 
-    epic_id, task_ids = seed_state(tmp_path, epic_id="fn-4-marker", n_tasks=2)
+    _, task_ids = seed_state(tmp_path, epic_id="fn-4-marker", n_tasks=2)
     monkeypatch.chdir(tmp_path)
 
     session_markers.write_work_marker(task_ids[1])  # marker names .2
@@ -320,7 +322,7 @@ def test_block_clears_matching_work_marker(tmp_path, monkeypatch, verb_marker_di
     from planctl.project import resolve_project
     from planctl.store import LocalFileStateStore
 
-    epic_id, task_ids = seed_state(tmp_path, epic_id="fn-5-marker", n_tasks=1)
+    _, task_ids = seed_state(tmp_path, epic_id="fn-5-marker", n_tasks=1)
     task_id = task_ids[0]
     monkeypatch.chdir(tmp_path)
 
@@ -358,7 +360,7 @@ def test_close_preflight_failure_writes_no_close_marker(
     ),
 )
 def test_close_finalize_clears_marker_on_every_outcome(
-    tmp_path, monkeypatch, verb_marker_dir, outcome
+    tmp_path, verb_marker_dir, outcome
 ):
     """_emit_outcome (the single chokepoint for all four CloseOutcomes) clears
     the close marker when it names the epic."""
@@ -379,7 +381,7 @@ def test_close_finalize_clears_marker_on_every_outcome(
 
 
 def test_close_finalize_leaves_mismatched_marker(
-    tmp_path, monkeypatch, verb_marker_dir
+    tmp_path, verb_marker_dir
 ):
     """A close marker naming a different epic survives close-finalize."""
     import io
