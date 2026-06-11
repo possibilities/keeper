@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-11T12:06:56.080734Z",
+  "depends_on": [
+    "fn-784-dash-stopped-job-activity-timeline.1"
+  ],
+  "epic": "fn-784-dash-stopped-job-activity-timeline",
+  "id": "fn-784-dash-stopped-job-activity-timeline.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "dash agents unified activity timeline",
+  "updated_at": "2026-06-11T12:06:56.080734Z"
+}

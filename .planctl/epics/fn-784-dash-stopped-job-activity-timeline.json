@@ -1,0 +1,17 @@
+{
+  "branch_name": "fn-784-dash-stopped-job-activity-timeline",
+  "bundles": [],
+  "created_at": "2026-06-11T12:06:56.080734Z",
+  "depends_on_epics": [],
+  "id": "fn-784-dash-stopped-job-activity-timeline",
+  "last_validated_at": "2026-06-11T12:06:56.286738Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "dash stopped-job activity timeline",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-11T12:06:56.080734Z"
+}
