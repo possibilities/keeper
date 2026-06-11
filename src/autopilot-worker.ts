@@ -1551,15 +1551,16 @@ function main(): void {
     }
   };
 
-  // The terminal-surface backend (zellij today; `data.execBackend` selects the
-  // impl once task 2's switch lands). Dispatches into the hardcoded
-  // `MANAGED_EXEC_SESSION` — `resolveExecBackend` fills that default, so no
-  // session is threaded here. `noteLine` funnels its warnings to stderr — the
-  // worker has no lifecycle sidecar.
+  // The terminal-surface backend — `data.execBackend` (resolved from config on
+  // main) selects the impl: `tmux` → tmux factory, default/unknown → zellij.
+  // Dispatches into the hardcoded `MANAGED_EXEC_SESSION` — `resolveExecBackend`
+  // fills that default, so no session is threaded here. `noteLine` funnels its
+  // warnings to stderr — the worker has no lifecycle sidecar.
   const backend = resolveExecBackend({
     noteLine: (line: string) => {
       console.error(line);
     },
+    backendType: data.execBackend,
   });
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";

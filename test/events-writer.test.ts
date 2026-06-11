@@ -1052,6 +1052,65 @@ test("backendExecCoordsFromEnv: pane id passes through as raw TEXT (no numeric c
   expect(typeof got.paneId).toBe("string");
 });
 
+test("backendExecCoordsFromEnv: TMUX sentinel + KEEPER_TMUX_SESSION stamps type='tmux', session, and pane", () => {
+  // Managed launch: keeper injects KEEPER_TMUX_SESSION via `-e`, so the
+  // session name stamps alongside type + pane.
+  expect(
+    backendExecCoordsFromEnv({
+      TMUX: "/tmp/tmux-501/default,12345,0",
+      TMUX_PANE: "%7",
+      KEEPER_TMUX_SESSION: "autopilot",
+    }),
+  ).toEqual({ type: "tmux", sessionId: "autopilot", paneId: "%7" });
+});
+
+test("backendExecCoordsFromEnv: TMUX sentinel without KEEPER_TMUX_SESSION → type + pane, NULL session", () => {
+  // Human-created tmux session carries no KEEPER_TMUX_SESSION — the session
+  // stays NULL (the snapshot poller fills it later) while type + pane stamp.
+  expect(
+    backendExecCoordsFromEnv({
+      TMUX: "/tmp/tmux-501/default,12345,0",
+      TMUX_PANE: "%3",
+    }),
+  ).toEqual({ type: "tmux", sessionId: null, paneId: "%3" });
+});
+
+test("backendExecCoordsFromEnv: empty TMUX sentinel collapses to all-NULL", () => {
+  // Empty-string sentinel is the absent shape — no tmux stamp.
+  expect(
+    backendExecCoordsFromEnv({
+      TMUX: "",
+      TMUX_PANE: "%3",
+      KEEPER_TMUX_SESSION: "autopilot",
+    }),
+  ).toEqual({ type: null, sessionId: null, paneId: null });
+});
+
+test("backendExecCoordsFromEnv: both ZELLIJ and TMUX present → zellij wins (nested pane)", () => {
+  // A Claude inside a zellij pane that itself runs under tmux reports the
+  // zellij surface — the one autopilot dispatched into.
+  expect(
+    backendExecCoordsFromEnv({
+      ZELLIJ: "0",
+      ZELLIJ_SESSION_NAME: "mike-main",
+      ZELLIJ_PANE_ID: "11",
+      TMUX: "/tmp/tmux-501/default,12345,0",
+      TMUX_PANE: "%7",
+      KEEPER_TMUX_SESSION: "autopilot",
+    }),
+  ).toEqual({ type: "zellij", sessionId: "mike-main", paneId: "11" });
+});
+
+test("backendExecCoordsFromEnv: tmux pane id passes through as raw TEXT", () => {
+  const got = backendExecCoordsFromEnv({
+    TMUX: "/tmp/tmux-501/default,12345,0",
+    TMUX_PANE: "%42",
+    KEEPER_TMUX_SESSION: "autopilot",
+  });
+  expect(got.paneId).toBe("%42");
+  expect(typeof got.paneId).toBe("string");
+});
+
 // ---------------------------------------------------------------------------
 // CLAUDE_CONFIG_DIR hook-process integration
 // ---------------------------------------------------------------------------

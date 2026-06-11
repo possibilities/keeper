@@ -233,12 +233,21 @@ export interface BackendExecCoords {
  * Called on EVERY hook event — a synchronous `process.env` read (no
  * fork/fs/PPID-walk), cheap enough for the cold-start budget on every fire.
  *
- * Sentinel gating: zellij stamps the bare `ZELLIJ` env var into every pane.
- * When `ZELLIJ` is absent/empty, return all-NULL — never stamp a bogus
- * `type='zellij'` for a session launched outside zellij. When present, stamp
- * `type = meta.backendType` and read the two named env vars; each sub-var
- * collapses absent/empty to NULL independently so the reducer's COALESCE arm
- * cannot be clobbered by a partial capture.
+ * Sentinel gating, in precedence order:
+ *  - zellij stamps the bare `ZELLIJ` env var into every pane; checked FIRST so
+ *    a Claude nested inside a zellij pane (which itself runs under tmux) reports
+ *    zellij coords, the surface autopilot actually dispatched into.
+ *  - tmux stamps `TMUX` + `TMUX_PANE` into every pane; checked SECOND. Type and
+ *    pane id always stamp under tmux; the session name stamps ONLY when
+ *    `KEEPER_TMUX_SESSION` is present (keeper-managed launches inject it via
+ *    `-e`). A human-created tmux session carries no `KEEPER_TMUX_SESSION`, so
+ *    the session stays NULL and the snapshot poller fills it later.
+ *  - neither sentinel → all-NULL; never stamp a bogus `type` for a session
+ *    launched outside a known multiplexer.
+ *
+ * Each sub-var collapses absent/empty to NULL independently so the reducer's
+ * COALESCE arm cannot be clobbered by a partial capture. The env-var NAMES are
+ * funneled through `execBackendEnvMeta(backendType)` so the hook learns no keys.
  *
  * Re-fold determinism: the captured values are frozen onto the events row at
  * hook time, so the fold NEVER re-reads env.
@@ -246,24 +255,37 @@ export interface BackendExecCoords {
 export function backendExecCoordsFromEnv(
   env: NodeJS.ProcessEnv,
 ): BackendExecCoords {
-  // Sentinel: zellij stamps `ZELLIJ` into every pane. An absent/empty
-  // value means this Claude session was NOT launched under zellij and
-  // every coord stays NULL — `type='zellij'` would be a lie.
-  const sentinel = env.ZELLIJ;
-  if (sentinel === undefined || sentinel === "") {
-    return { type: null, sessionId: null, paneId: null };
+  // zellij sentinel wins: a Claude nested in a zellij pane (possibly itself
+  // inside tmux) reports zellij — the surface autopilot dispatched into.
+  const zellijSentinel = env.ZELLIJ;
+  if (zellijSentinel !== undefined && zellijSentinel !== "") {
+    const meta = execBackendEnvMeta("zellij");
+    const rawSession = env[meta.sessionIdEnvVar];
+    const rawPane = env[meta.paneIdEnvVar];
+    return {
+      type: meta.backendType,
+      sessionId:
+        rawSession === undefined || rawSession === "" ? null : rawSession,
+      paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
+    };
   }
-  // Funnel the env-var names through `execBackendEnvMeta` so a future
-  // tmux/wezterm backend slots in without the hook learning new keys.
-  const meta = execBackendEnvMeta();
-  const rawSession = env[meta.sessionIdEnvVar];
-  const rawPane = env[meta.paneIdEnvVar];
-  return {
-    type: meta.backendType,
-    sessionId:
-      rawSession === undefined || rawSession === "" ? null : rawSession,
-    paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
-  };
+  // tmux sentinel: `TMUX` is set in every tmux pane. Stamp type + pane id; the
+  // session name stamps only when `KEEPER_TMUX_SESSION` is present (managed
+  // launches inject it) — human sessions stay NULL until the poller fills them.
+  const tmuxSentinel = env.TMUX;
+  if (tmuxSentinel !== undefined && tmuxSentinel !== "") {
+    const meta = execBackendEnvMeta("tmux");
+    const rawSession = env[meta.sessionIdEnvVar];
+    const rawPane = env[meta.paneIdEnvVar];
+    return {
+      type: meta.backendType,
+      sessionId:
+        rawSession === undefined || rawSession === "" ? null : rawSession,
+      paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
+    };
+  }
+  // Neither multiplexer — `type` would be a lie; every coord stays NULL.
+  return { type: null, sessionId: null, paneId: null };
 }
 
 /**

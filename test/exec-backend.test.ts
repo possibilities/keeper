@@ -18,12 +18,18 @@
 
 import { expect, test } from "bun:test";
 import {
+  buildTmuxHasSessionArgs,
+  buildTmuxNewSessionArgs,
+  buildTmuxNewWindowArgs,
+  buildTmuxSelectPaneArgs,
+  buildTmuxSelectWindowArgs,
   buildZellijAttachBgArgs,
   buildZellijCloseTabArgs,
   buildZellijFocusPaneArgs,
   buildZellijListSessionsArgs,
   buildZellijListTabsArgs,
   buildZellijNewTabArgs,
+  createTmuxBackend,
   createZellijBackend,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
@@ -1236,4 +1242,398 @@ test("ExecBackend.ensureLaunched: empty `name` string still omits --name (defens
   const newTab = calls.find((c) => c[1] === "--session" && c[4] === "new-tab");
   expect(newTab).toBeDefined();
   expect(newTab).not.toContain("--name");
+});
+
+// ===========================================================================
+// tmux backend
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// execBackendEnvMeta — tmux arm
+// ---------------------------------------------------------------------------
+
+test("execBackendEnvMeta: 'tmux' returns KEEPER_TMUX_SESSION / TMUX_PANE", () => {
+  const meta = execBackendEnvMeta("tmux");
+  expect(meta.backendType).toBe("tmux");
+  expect(meta.sessionIdEnvVar).toBe("KEEPER_TMUX_SESSION");
+  expect(meta.paneIdEnvVar).toBe("TMUX_PANE");
+});
+
+test("execBackendEnvMeta: unknown backend keeps its label but falls back to zellij env vars", () => {
+  const meta = execBackendEnvMeta("wezterm");
+  expect(meta.backendType).toBe("wezterm");
+  expect(meta.sessionIdEnvVar).toBe("ZELLIJ_SESSION_NAME");
+  expect(meta.paneIdEnvVar).toBe("ZELLIJ_PANE_ID");
+});
+
+// ---------------------------------------------------------------------------
+// Pure tmux argv builders
+// ---------------------------------------------------------------------------
+
+test("buildTmuxHasSessionArgs: `=`-prefixed exact-match target", () => {
+  expect(buildTmuxHasSessionArgs("autopilot")).toEqual([
+    "tmux",
+    "has-session",
+    "-t",
+    "=autopilot",
+  ]);
+});
+
+test("buildTmuxNewSessionArgs: detached mint injects KEEPER_TMUX_SESSION via -e", () => {
+  expect(buildTmuxNewSessionArgs("autopilot")).toEqual([
+    "tmux",
+    "new-session",
+    "-d",
+    "-s",
+    "autopilot",
+    "-e",
+    "KEEPER_TMUX_SESSION=autopilot",
+  ]);
+});
+
+test("buildTmuxNewWindowArgs: trailing-colon session target, -e injection, -P -F pane id, chained `;` set-option, no -n when unnamed", () => {
+  const got = buildTmuxNewWindowArgs("autopilot", "/Users/mike/code/keeper", [
+    "/bin/zsh",
+    "-l",
+    "-i",
+    "-c",
+    "echo hi",
+  ]);
+  expect(got).toEqual([
+    "tmux",
+    "new-window",
+    "-t",
+    "autopilot:",
+    "-c",
+    "/Users/mike/code/keeper",
+    "-e",
+    "KEEPER_TMUX_SESSION=autopilot",
+    "-P",
+    "-F",
+    "#{pane_id}",
+    "--",
+    "/bin/zsh",
+    "-l",
+    "-i",
+    "-c",
+    "echo hi",
+    ";",
+    "set-option",
+    "-p",
+    "remain-on-exit",
+    "on",
+  ]);
+  // The `;` is a SEPARATE argv element (tmux command separator), not a
+  // shell-joined string — the chained set-option holds the dead pane.
+  expect(got.filter((a) => a === ";")).toHaveLength(1);
+  // No window name when unnamed (managed-launch contract).
+  expect(got).not.toContain("-n");
+});
+
+test("buildTmuxNewWindowArgs: inserts -n <name> before -P when provided (restore seam)", () => {
+  const got = buildTmuxNewWindowArgs(
+    "restored",
+    "/abs",
+    ["sh"],
+    "work::fn-1-x.1",
+  );
+  const nameIdx = got.indexOf("-n");
+  const pIdx = got.indexOf("-P");
+  expect(nameIdx).toBeGreaterThan(-1);
+  expect(got[nameIdx + 1]).toBe("work::fn-1-x.1");
+  // -n lands before the -P -F print spec and the -- argv boundary.
+  expect(nameIdx).toBeLessThan(pIdx);
+});
+
+test("buildTmuxNewWindowArgs: omits -n for empty/absent name", () => {
+  expect(buildTmuxNewWindowArgs("s", "/abs", ["sh"], "")).not.toContain("-n");
+  expect(buildTmuxNewWindowArgs("s", "/abs", ["sh"])).not.toContain("-n");
+});
+
+test("buildTmuxSelectWindowArgs / buildTmuxSelectPaneArgs: id-based targets only", () => {
+  expect(buildTmuxSelectWindowArgs("%7")).toEqual([
+    "tmux",
+    "select-window",
+    "-t",
+    "%7",
+  ]);
+  expect(buildTmuxSelectPaneArgs("%7")).toEqual([
+    "tmux",
+    "select-pane",
+    "-t",
+    "%7",
+  ]);
+});
+
+// ---------------------------------------------------------------------------
+// createTmuxBackend.launch — get-or-create + chained new-window
+// ---------------------------------------------------------------------------
+
+test("createTmuxBackend.launch: live session (has-session exit 0) → new-window only, no mint, unnamed window", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 0 },
+      "tmux:new-window": { stdout: "%3\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const res = await backend.launch(
+    ["/bin/zsh", "-l", "-i", "-c", "echo hi"],
+    "work::fn-1-x.1",
+    "/abs/dir",
+  );
+  expect(res).toEqual({ ok: true });
+  // has-session probe fired against the managed session, then new-window.
+  expect(calls[0]).toEqual(buildTmuxHasSessionArgs(MANAGED_EXEC_SESSION));
+  const win = calls.find((c) => c[1] === "new-window");
+  expect(win?.[3]).toBe(`${MANAGED_EXEC_SESSION}:`);
+  // No mint — the live session was respected.
+  expect(calls.some((c) => c[1] === "new-session")).toBe(false);
+  // Managed window stays UNNAMED — `name` is the dedup key only.
+  expect(win).not.toContain("-n");
+});
+
+test("createTmuxBackend.launch: absent session (has-session non-zero) → new-session mint then new-window", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 1 },
+      "tmux:new-session": { exitCode: 0 },
+      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  expect(res).toEqual({ ok: true });
+  // Order: has-session (absent) → new-session mint → new-window.
+  expect(calls[0]?.[1]).toBe("has-session");
+  expect(calls[1]).toEqual(buildTmuxNewSessionArgs(MANAGED_EXEC_SESSION));
+  expect(calls[2]?.[1]).toBe("new-window");
+});
+
+test("createTmuxBackend.launch: new-session mint carries color env (TERM/COLORTERM); has-session/new-window do not", async () => {
+  const calls: string[][] = [];
+  const envByCall: Array<Record<string, string> | undefined> = [];
+  const spawn: SpawnFn = (cmd, options) => {
+    calls.push([...cmd]);
+    envByCall.push(options.env);
+    const exitCode = cmd[1] === "has-session" ? 1 : 0;
+    return {
+      exited: Promise.resolve(exitCode),
+      stdout: new Response(cmd[1] === "new-window" ? "%1\n" : "").body,
+      stderr: new Response("").body,
+      kill: () => {},
+    };
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  const mintIdx = calls.findIndex((c) => c[1] === "new-session");
+  expect(mintIdx).toBeGreaterThan(-1);
+  const mintEnv = envByCall[mintIdx];
+  expect(mintEnv?.TERM).toBeDefined();
+  expect(mintEnv?.COLORTERM).toBeDefined();
+  // Control commands carry NO env override (Bun inherits process.env).
+  const hasIdx = calls.findIndex((c) => c[1] === "has-session");
+  const winIdx = calls.findIndex((c) => c[1] === "new-window");
+  expect(envByCall[hasIdx]).toBeUndefined();
+  expect(envByCall[winIdx]).toBeUndefined();
+});
+
+test("createTmuxBackend.launch: non-zero new-window exit → { ok: false, error }", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 0 },
+      "tmux:new-window": { stderr: "no such session", exitCode: 1 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.error).toContain("exited non-zero");
+  }
+});
+
+test("createTmuxBackend.launch: ENOENT (binary missing) → { ok: false, error }, never throws", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.error).toContain("failed");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// createTmuxBackend.focusPane — id-based select-window then select-pane
+// ---------------------------------------------------------------------------
+
+test("createTmuxBackend.focusPane: exit 0 → select-window then select-pane against the pane id, { ok: true }", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:select-window": { exitCode: 0 },
+      "tmux:select-pane": { exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.focusPane("any-session", "%7");
+  expect(got).toEqual({ ok: true });
+  // Both ops target the server-global pane id, never the session name.
+  expect(calls[0]).toEqual(buildTmuxSelectWindowArgs("%7"));
+  expect(calls[1]).toEqual(buildTmuxSelectPaneArgs("%7"));
+});
+
+test("createTmuxBackend.focusPane: select-window non-zero → { ok: false }, select-pane never runs", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:select-window": { stderr: "can't find pane", exitCode: 1 },
+      "tmux:select-pane": { exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.focusPane("s", "%99");
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("exited 1");
+    expect(got.error).toContain("can't find pane");
+  }
+  // select-pane is gated on a successful select-window.
+  expect(calls.some((c) => c[1] === "select-pane")).toBe(false);
+});
+
+test("createTmuxBackend.focusPane: ENOENT throw → { ok: false }, never throws back", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.focusPane("s", "%1");
+  expect(got.ok).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// createTmuxBackend.ensureLaunched — per-call session, restore -n seam
+// ---------------------------------------------------------------------------
+
+test("createTmuxBackend.ensureLaunched: live per-call session → new-window with -e KEEPER_TMUX_SESSION=<target>, omits -n when absent", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 0 },
+      "tmux:new-window": { stdout: "%4\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({
+    noteLine: () => {},
+    session: "autopilot",
+    spawn,
+  });
+  const res = await backend.ensureLaunched("human-session", ["sh"], "/proj");
+  expect(res).toEqual({ ok: true });
+  // has-session probed the PER-CALL session, not the construction default.
+  expect(calls[0]).toEqual(buildTmuxHasSessionArgs("human-session"));
+  const win = calls.find((c) => c[1] === "new-window");
+  expect(win?.[3]).toBe("human-session:");
+  // -e carries the per-call session name for the hook's session stamp.
+  const eIdx = win?.indexOf("-e") ?? -1;
+  expect(win?.[eIdx + 1]).toBe("KEEPER_TMUX_SESSION=human-session");
+  // No mint (live), no -n (unnamed restore).
+  expect(calls.some((c) => c[1] === "new-session")).toBe(false);
+  expect(win).not.toContain("-n");
+});
+
+test("createTmuxBackend.ensureLaunched: absent per-call session mints then new-window with -n <name>", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 1 },
+      "tmux:new-session": { exitCode: 0 },
+      "tmux:new-window": { stdout: "%2\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const res = await backend.ensureLaunched(
+    "restored",
+    ["sh"],
+    "/abs",
+    "work::fn-9-y.2",
+  );
+  expect(res).toEqual({ ok: true });
+  // mint targets the per-call session.
+  expect(calls.find((c) => c[1] === "new-session")).toEqual(
+    buildTmuxNewSessionArgs("restored"),
+  );
+  const win = calls.find((c) => c[1] === "new-window");
+  const nameIdx = win?.indexOf("-n") ?? -1;
+  expect(nameIdx).toBeGreaterThan(-1);
+  expect(win?.[nameIdx + 1]).toBe("work::fn-9-y.2");
+});
+
+// ---------------------------------------------------------------------------
+// resolveExecBackend — backendType switch
+// ---------------------------------------------------------------------------
+
+test("resolveExecBackend: backendType 'tmux' routes through the tmux factory", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 0 },
+      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = resolveExecBackend({
+    noteLine: () => {},
+    backendType: "tmux",
+    spawn,
+  });
+  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  // A tmux backend issues `tmux has-session`, never a zellij command.
+  expect(calls[0]?.[0]).toBe("tmux");
+  expect(calls.some((c) => c[0] === "zellij")).toBe(false);
+});
+
+test("resolveExecBackend: absent backendType defaults to zellij", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:list-sessions": { stdout: `${MANAGED_EXEC_SESSION}\n` },
+      "zellij:--session": { exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = resolveExecBackend({ noteLine: () => {}, spawn });
+  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  expect(calls[0]?.[0]).toBe("zellij");
+  expect(calls.some((c) => c[0] === "tmux")).toBe(false);
+});
+
+test("resolveExecBackend: unknown backendType falls through to zellij", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "zellij:list-sessions": { stdout: `${MANAGED_EXEC_SESSION}\n` },
+      "zellij:--session": { exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = resolveExecBackend({
+    noteLine: () => {},
+    backendType: "wezterm",
+    spawn,
+  });
+  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  expect(calls[0]?.[0]).toBe("zellij");
 });

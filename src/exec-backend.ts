@@ -112,12 +112,16 @@ export interface ZellijBackendDeps {
   readonly captureTimeoutMs?: number;
 }
 
-/** Zellij dep bag minus the required `session` (the resolver fills in
- *  `MANAGED_EXEC_SESSION` when absent). */
+/** Resolver dep bag: `backendType` selects the impl (`tmux` → tmux factory,
+ *  anything else → zellij), and the resolver fills `MANAGED_EXEC_SESSION` for an
+ *  absent `session`. */
 export interface ResolveExecBackendDeps {
   readonly noteLine: (line: string) => void;
   readonly session?: string;
   readonly spawn?: SpawnFn;
+  /** Backend tag (`'zellij'` default / `'tmux'`); typically a config value or a
+   *  per-row `backend_exec_type`. Unknown values fall through to zellij. */
+  readonly backendType?: string;
 }
 
 /** Read a `ReadableStream` into a string. Returns `""` on null/empty. */
@@ -231,16 +235,20 @@ export interface ExecBackendEnvMeta {
 
 export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
   const t = backendType ?? DEFAULT_EXEC_BACKEND;
-  if (t === "zellij") {
+  if (t === "tmux") {
+    // tmux stamps `TMUX`/`TMUX_PANE` into every pane; managed launches add
+    // `KEEPER_TMUX_SESSION` via `-e` so the session name rides the same column
+    // as zellij's. Human-created sessions carry no `KEEPER_TMUX_SESSION`, so the
+    // hook stamps a NULL session (filled later by the snapshot poller).
     return {
       backendType: t,
-      sessionIdEnvVar: "ZELLIJ_SESSION_NAME",
-      paneIdEnvVar: "ZELLIJ_PANE_ID",
+      sessionIdEnvVar: "KEEPER_TMUX_SESSION",
+      paneIdEnvVar: "TMUX_PANE",
     };
   }
-  // Unknown backend: return its name verbatim for logging but fall back to the
-  // zellij env-var defaults — empty strings would silently null out every hook
-  // event.
+  // zellij (default) and any unknown backend fall through to the zellij env-var
+  // defaults — an unknown name keeps its label for logging, but empty strings
+  // would silently null out every hook event.
   return {
     backendType: t,
     sessionIdEnvVar: "ZELLIJ_SESSION_NAME",
@@ -526,9 +534,315 @@ export function createZellijBackend(deps: ZellijBackendDeps): ExecBackend {
   };
 }
 
-/** Resolve the exec backend (always zellij). A thin seam so the reconciler call
- *  site and future backends keep one stable entry point. */
+// ===========================================================================
+// tmux backend
+//
+// Mirrors the zellij factory shape — standalone pure argv builders + injectable
+// `spawn`, reusing `runCapture`/`SpawnFn`/`LaunchResult`/`streamToText`. The
+// design carries parity with zellij's three coords (type/session/pane) and
+// nothing more: NO control-mode client, NO new worker.
+//
+// Identity rules (community-verified against tmux 3.6b scratch `-L` servers):
+//   - target by PANE ID only (`%N` server-global durable handle); names
+//     glob-match unless `=`-prefixed and colons in names break target parsing.
+//   - argv arrays everywhere — no shell strings; the OS argv boundary is the
+//     safe quoting seam for worker argv and session/window names alike.
+//   - `-e KEEPER_TMUX_SESSION=...` for process-scoped env injection (never
+//     `set-environment`, which is readable by every attached client).
+//
+// Version floor: `new-session -e` requires tmux ≥3.2 (3.6b verified). Managed
+// windows stay UNNAMED — the unused `name` arg on `launch` is the seam for the
+// future window-naming system.
+//
+// Accepted residual race: a worker that exits BEFORE the chained
+// `set-option -p remain-on-exit on` lands loses its dead pane (the window
+// auto-closes). Sub-ms window, no mitigation — the `-P -F '#{pane_id}'` return
+// exists as the fallback hook if the chained form ever misbehaves.
+// ===========================================================================
+
+/** Build the tmux `has-session -t =<session>` probe argv. Pure — exported for
+ *  tests. The `=` prefix forces an EXACT match (tmux otherwise does an fnmatch
+ *  glob + prefix match, so `auto` would spuriously match `autopilot`). */
+export function buildTmuxHasSessionArgs(session: string): string[] {
+  return ["tmux", "has-session", "-t", `=${session}`];
+}
+
+/**
+ * Build the tmux `new-session -d -s <session> -e KEEPER_TMUX_SESSION=<session>`
+ * mint argv. Pure — exported for tests. `-d` detaches (no client attach);
+ * `-e KEEPER_TMUX_SESSION=...` is process-scoped so the session's panes inherit
+ * it for the hook's session-name stamp (NEVER `set-environment`, which is
+ * server-wide). Requires tmux ≥3.2 for `new-session -e`.
+ */
+export function buildTmuxNewSessionArgs(session: string): string[] {
+  return [
+    "tmux",
+    "new-session",
+    "-d",
+    "-s",
+    session,
+    "-e",
+    `KEEPER_TMUX_SESSION=${session}`,
+  ];
+}
+
+/**
+ * Build the tmux `new-window` launch argv, chaining `set-option -p
+ * remain-on-exit on` in ONE invocation via the literal `;` command-separator
+ * argv element (verified on 3.6b: the dead pane persists with `pane_dead=1` +
+ * `pane_dead_status`). Pure — exported for tests.
+ *
+ * Targets `<session>:` (trailing colon = the session's window list) so the new
+ * window lands in the managed session. `-c <cwd>` sets the working dir; the
+ * `-e KEEPER_TMUX_SESSION=<session>` injection re-stamps the session name on the
+ * new window's pane env (a window does NOT inherit the session-mint `-e`).
+ * `-P -F '#{pane_id}'` prints the new pane's id to stdout — the durable handle
+ * AND the fallback seam if the chained set-option ever needs a targeted retry.
+ * `argv` is passed after `--` so tmux execs it directly with no shell layer.
+ *
+ * `name`, when non-empty, labels the window via `-n` (the restore caller's seam
+ * — managed `launch` always passes empty so windows stay unnamed). Window names
+ * never carry `.`/`:` — colons break target parsing.
+ */
+export function buildTmuxNewWindowArgs(
+  session: string,
+  cwd: string,
+  argv: string[],
+  name?: string,
+): string[] {
+  return [
+    "tmux",
+    "new-window",
+    "-t",
+    `${session}:`,
+    "-c",
+    cwd,
+    "-e",
+    `KEEPER_TMUX_SESSION=${session}`,
+    ...(name != null && name !== "" ? ["-n", name] : []),
+    "-P",
+    "-F",
+    "#{pane_id}",
+    "--",
+    ...argv,
+    ";",
+    "set-option",
+    "-p",
+    "remain-on-exit",
+    "on",
+  ];
+}
+
+/**
+ * Build the tmux `select-window -t <paneId>` argv. Pure — exported for tests.
+ * Targeting by PANE id (server-global `%N`) brings its window forward; a paired
+ * `select-pane` then focuses the pane within it. NEVER name-based — colons in
+ * names break target parsing.
+ */
+export function buildTmuxSelectWindowArgs(paneId: string): string[] {
+  return ["tmux", "select-window", "-t", paneId];
+}
+
+/** Build the tmux `select-pane -t <paneId>` argv. Pure — exported for tests.
+ *  Runs after `select-window` to focus the pane within its now-current window. */
+export function buildTmuxSelectPaneArgs(paneId: string): string[] {
+  return ["tmux", "select-pane", "-t", paneId];
+}
+
+/** Resolver-filled dep bag for the tmux backend; same shape as
+ *  {@link ZellijBackendDeps} so the two factories are drop-in interchangeable
+ *  behind {@link resolveExecBackend}. */
+export interface TmuxBackendDeps {
+  readonly noteLine: (line: string) => void;
+  readonly session?: string;
+  readonly spawn?: SpawnFn;
+  readonly captureTimeoutMs?: number;
+}
+
+/**
+ * tmux backend factory. Each op runs a per-call get-or-create (`has-session`
+ * probe → `new-session` mint when absent) then a chained `new-window`; there is
+ * NO session-ensure memo — `has-session` is cheap and avoids a stale-memo wedge
+ * after a session dies. NEVER throws — every failure mode degrades to a
+ * `noteLine` warn + an `{ ok: false }` (or a best-effort focus no-op).
+ */
+export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
+  const spawn = deps.spawn ?? defaultSpawn;
+  const session = deps.session ?? MANAGED_EXEC_SESSION;
+  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
+
+  async function runCapture(
+    args: string[],
+    env?: Record<string, string>,
+  ): Promise<{ exitCode: number; stdout: string; stderr: string } | null> {
+    try {
+      const proc = spawn(args, {
+        stdout: "pipe",
+        stderr: "pipe",
+        stdin: "ignore",
+        ...(env != null ? { env } : {}),
+      });
+      // Bound the await: a wedged `tmux` subprocess would otherwise freeze
+      // `proc.exited` — and the reconciler — forever with no fatalExit. Race
+      // against a kill-timeout; on expiry force-kill the child and degrade to
+      // `null` (mirrors the zellij runCapture).
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const timedOut = Symbol("timed-out");
+      const timeout = new Promise<typeof timedOut>((resolve) => {
+        timer = setTimeout(() => resolve(timedOut), captureTimeoutMs);
+      });
+      const race = await Promise.race([proc.exited, timeout]);
+      if (timer != null) {
+        clearTimeout(timer);
+      }
+      if (race === timedOut) {
+        try {
+          proc.kill();
+        } catch {
+          // Best-effort — already-dead child / no-op backend stub.
+        }
+        deps.noteLine(
+          `# warn: tmux subprocess exceeded ${captureTimeoutMs}ms; killed and degrading to null (${args.join(" ")})`,
+        );
+        return null;
+      }
+      const [stdout, stderr] = await Promise.all([
+        streamToText(proc.stdout),
+        streamToText(proc.stderr),
+      ]);
+      return { exitCode: race, stdout, stderr };
+    } catch {
+      // ENOENT (tmux not installed) lands here.
+      return null;
+    }
+  }
+
+  /**
+   * Per-call get-or-create for `targetSession`: a `has-session -t =<session>`
+   * probe (exit 0 = live), and `new-session -d` mint when absent. The mint spawn
+   * carries color-capable `TERM`/`COLORTERM` defaults like the zellij mint —
+   * keeperd runs as a LaunchAgent with env stripped, so a server minted here
+   * would otherwise render every worker pane colorblind. NEVER throws; a probe
+   * `null` (ENOENT) skips the mint and the caller's `new-window` then fails
+   * loud with `{ ok: false }`.
+   */
+  async function ensureSessionFor(targetSession: string): Promise<void> {
+    const has = await runCapture(buildTmuxHasSessionArgs(targetSession));
+    if (has != null && has.exitCode === 0) {
+      // Already live — never re-mint.
+      return;
+    }
+    if (has == null) {
+      deps.noteLine(
+        `# warn: tmux has-session failed (binary missing?); subsequent launches will no-op`,
+      );
+      return;
+    }
+    await runCapture(buildTmuxNewSessionArgs(targetSession), {
+      ...(process.env as Record<string, string>),
+      TERM: process.env.TERM ?? "xterm-256color",
+      COLORTERM: process.env.COLORTERM ?? "truecolor",
+    });
+  }
+
+  async function launchInto(
+    targetSession: string,
+    argv: string[],
+    name: string,
+    cwd: string,
+    label: string,
+  ): Promise<LaunchResult> {
+    await ensureSessionFor(targetSession);
+    const args = buildTmuxNewWindowArgs(targetSession, cwd, argv, name);
+    const res = await runCapture(args);
+    if (res == null) {
+      const error = `tmux new-window for ${label} failed (ENOENT? binary missing)`;
+      deps.noteLine(`# warn: ${error}`);
+      return { ok: false, error };
+    }
+    if (res.stderr.length > 0) {
+      deps.noteLine(`# launch stderr (${label}): ${res.stderr.trim()}`);
+    }
+    if (res.exitCode !== 0) {
+      const error = `tmux new-window for ${label} exited non-zero (${res.exitCode})`;
+      deps.noteLine(`# warn: ${error}`);
+      return { ok: false, error };
+    }
+    return { ok: true };
+  }
+
+  return {
+    launch(argv: string[], name: string, cwd: string): Promise<LaunchResult> {
+      // Managed window stays UNNAMED — `name` feeds the log label + autopilot
+      // dedup key only, never the `-n` window label (the future naming system's
+      // seam). Dispatches into the construction-baked managed session.
+      return launchInto(session, argv, "", cwd, name);
+    },
+    async focusPane(
+      targetSession: string,
+      paneId: string,
+    ): Promise<LaunchResult> {
+      // Session-agnostic, no session-ensure: bring the pane's window forward
+      // then focus the pane. Both target the server-global pane id — colons in
+      // session/window names break name-based targets. A `select-window`
+      // failure (missing session/pane) → `{ ok: false }`; the `select-pane`
+      // only runs on a successful `select-window`.
+      const winRes = await runCapture(buildTmuxSelectWindowArgs(paneId));
+      if (winRes == null) {
+        const error = `tmux select-window for session=${targetSession} pane=${paneId} failed (ENOENT? binary missing)`;
+        return { ok: false, error };
+      }
+      if (winRes.exitCode !== 0) {
+        const stderrTrim = winRes.stderr.trim();
+        const detail = stderrTrim.length > 0 ? `: ${stderrTrim}` : "";
+        const error = `tmux select-window for session=${targetSession} pane=${paneId} exited ${winRes.exitCode}${detail}`;
+        return { ok: false, error };
+      }
+      const paneRes = await runCapture(buildTmuxSelectPaneArgs(paneId));
+      if (paneRes == null) {
+        const error = `tmux select-pane for session=${targetSession} pane=${paneId} failed (ENOENT? binary missing)`;
+        return { ok: false, error };
+      }
+      if (paneRes.exitCode !== 0) {
+        const stderrTrim = paneRes.stderr.trim();
+        const detail = stderrTrim.length > 0 ? `: ${stderrTrim}` : "";
+        const error = `tmux select-pane for session=${targetSession} pane=${paneId} exited ${paneRes.exitCode}${detail}`;
+        return { ok: false, error };
+      }
+      return { ok: true };
+    },
+    ensureLaunched(
+      targetSession: string,
+      argv: string[],
+      cwd: string,
+      name?: string,
+    ): Promise<LaunchResult> {
+      // Session-agnostic get-or-create + launch into the per-call session. The
+      // restore caller passes `name` to label the window; managed dispatch never
+      // reaches here. Empty/absent name leaves the window unnamed.
+      return launchInto(
+        targetSession,
+        argv,
+        name ?? "",
+        cwd,
+        `session=${targetSession}`,
+      );
+    },
+  };
+}
+
+/** Resolve the exec backend by type — `tmux` selects the tmux factory, every
+ *  other value (including the `zellij` default and unknown names) the zellij
+ *  factory. A thin seam so the reconciler call site and the jobs-board focus
+ *  path keep one stable entry point across backends. */
 export function resolveExecBackend(deps: ResolveExecBackendDeps): ExecBackend {
+  if (deps.backendType === "tmux") {
+    return createTmuxBackend({
+      noteLine: deps.noteLine,
+      session: deps.session ?? MANAGED_EXEC_SESSION,
+      spawn: deps.spawn,
+    });
+  }
   return createZellijBackend({
     noteLine: deps.noteLine,
     session: deps.session ?? MANAGED_EXEC_SESSION,

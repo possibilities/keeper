@@ -641,29 +641,20 @@ export async function main(argv: string[]): Promise<void> {
       });
   }
 
-  // `v` focuses the selected job's zellij pane via the session-agnostic
-  // `ExecBackend.focusPane(session, paneId)` op. Constructs the backend
-  // once for the lifetime of the view; `noteLine` funnels backend
-  // warnings to the same lifecycle sidecar `view.noteLine` writes to.
-  // The backend has no managed session of its own here — we only ever
-  // call `focusPane`, which takes the target session per call from the
-  // selected job's `backend_exec_session_id`.
-  const backend = resolveExecBackend({
-    noteLine: (line: string) => {
-      view.noteLine(line);
-    },
-  });
-
-  // `v` (insert mode only) — focus the selected job's zellij pane. Looks
-  // up the row by `job_id` (the same resolution `space` uses for
-  // expand-toggle), reads `backend_exec_session_id` /
-  // `backend_exec_pane_id`; either null → flash `[no zellij pane]` and
-  // exit. Otherwise stamp `[focusing…]` via setStatus (persistent until
-  // the RPC resolves — `flashStatus` would restore the banner too
-  // quickly), then await `backend.focusPane(session, pane)` and flash
-  // the result (`[focused]` / `[focus failed: <reason>]`). Single-flight
-  // guarded so a mashed key never stacks RPCs against zellij — shaped
-  // identically to `handleReplayKey`.
+  // `v` (insert mode only) — focus the selected job's backend pane via the
+  // session-agnostic `ExecBackend.focusPane(session, paneId)` op. Looks up the
+  // row by `job_id` (the same resolution `space` uses for expand-toggle), reads
+  // `backend_exec_type` / `backend_exec_session_id` / `backend_exec_pane_id`;
+  // any missing → flash `[no backend pane]` and exit. The backend is resolved
+  // PER ROW from `backend_exec_type` so a mixed zellij+tmux DB routes each focus
+  // to the matching impl; an unknown/NULL type falls through to zellij in
+  // `resolveExecBackend`, but a NULL session/pane skips before that. `noteLine`
+  // funnels backend warnings to the same lifecycle sidecar `view.noteLine`
+  // writes to. Otherwise stamp `[focusing…]` via setStatus (persistent until
+  // the RPC resolves — `flashStatus` would restore the banner too quickly),
+  // then await `backend.focusPane(session, pane)` and flash the result
+  // (`[focused]` / `[focus failed: <reason>]`). Single-flight guarded so a
+  // mashed key never stacks RPCs against the backend.
   let focusInFlight = false;
   function handleFocusKey(): void {
     if (focusInFlight) {
@@ -698,9 +689,21 @@ export async function main(argv: string[]): Promise<void> {
       typeof paneId !== "string" ||
       paneId === ""
     ) {
-      view.flashStatus("[no zellij pane]");
+      view.flashStatus("[no backend pane]");
       return;
     }
+    // Resolve per-row: a NULL/unknown `backend_exec_type` falls through to the
+    // zellij factory inside `resolveExecBackend`.
+    const backendType =
+      typeof row.backend_exec_type === "string"
+        ? row.backend_exec_type
+        : undefined;
+    const backend = resolveExecBackend({
+      noteLine: (line: string) => {
+        view.noteLine(line);
+      },
+      backendType,
+    });
     focusInFlight = true;
     view.liveShell.setStatus("[focusing…]");
     void backend
@@ -710,7 +713,7 @@ export async function main(argv: string[]): Promise<void> {
           if (result.ok) {
             view.flashStatus("[focused]");
           } else {
-            view.noteLine(`# warn: zellij focus-pane failed: ${result.error}`);
+            view.noteLine(`# warn: backend focus-pane failed: ${result.error}`);
             const oneLine = result.error.split("\n", 1)[0] ?? result.error;
             view.flashStatus(`[focus failed: ${oneLine}]`);
           }
@@ -718,7 +721,7 @@ export async function main(argv: string[]): Promise<void> {
         (err: Error) => {
           // Defense-in-depth — `focusPane` is documented never to throw,
           // but a future code path could. Treat the same as `ok: false`.
-          view.noteLine(`# warn: zellij focus-pane threw: ${err.message}`);
+          view.noteLine(`# warn: backend focus-pane threw: ${err.message}`);
           const oneLine = err.message.split("\n", 1)[0] ?? err.message;
           view.flashStatus(`[focus failed: ${oneLine}]`);
         },
