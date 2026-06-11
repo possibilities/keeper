@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Load repro validation and bun check",
-  "updated_at": "2026-06-11T12:44:18.495958Z"
+  "updated_at": "2026-06-11T17:18:21.353781Z",
+  "worker_done_at": "2026-06-11T17:18:21.353781Z"
 }

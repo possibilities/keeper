@@ -47,5 +47,5 @@ The deliverable IS the evidence: iteration counts, failure signatures seen (if a
 - [ ] bun run test:full green
 
 ## Done summary
-
+Added scripts/worker-open-boot-soak.ts: a manual (never-CI) full-worker-set in-process boot loop under induced CPU load. Patched/HEAD tree passed 50/50 clean boots; bun #29277 fix still unmerged (no bump). Unpatched-probe did not reproduce locally in 200 boots — reported honestly.
 ## Evidence
