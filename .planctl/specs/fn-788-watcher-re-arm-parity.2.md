@@ -74,5 +74,5 @@ skip. `bun run test:full` mandatory.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Transcript-worker now re-arms a silently-mute FSEvents subscription directly from its 60s heartbeat: a pure decideTranscriptResubscribe helper gates a sequential unsubscribe->subscribe replace (identical options, generation-guarded callbacks, stat-before-resubscribe defer, non-fatal failure, one-heartbeat flap guard), leaving the line stream's byte offsets untouched so no phantom re-folds. README scopes the dropped-events path and names the transcript recovery path in parallel with plan-worker.
 ## Evidence

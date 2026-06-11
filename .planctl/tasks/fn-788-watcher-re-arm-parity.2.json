@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Transcript-worker subscription replace",
-  "updated_at": "2026-06-11T19:30:12.931235Z"
+  "updated_at": "2026-06-11T21:19:30.149080Z",
+  "worker_done_at": "2026-06-11T21:19:30.149080Z"
 }
