@@ -40,5 +40,5 @@ Fast-bucket pytest: helper unit tests (write/clear/clear-if-mismatch/read/stale-
 - [ ] New tests live in the fast bucket; `uv run pytest tests/` passes
 
 ## Done summary
-
+Added planctl/session_markers.py owning the schema_version-1 session-marker contract (fail-open, IO-swallowed, 7-day stale-unlink) and wired success-path writes into claim/worker-resume/close-preflight plus clear-if-matches into done/block/close-finalize. New fast-bucket tests cover helpers and per-verb wiring.
 ## Evidence
