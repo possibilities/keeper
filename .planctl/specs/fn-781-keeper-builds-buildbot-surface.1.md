@@ -70,5 +70,5 @@ test/schema-version.test.ts must pass (proves the api.py pairing).
 - [ ] `DELETE FROM builds` present in the rewind-and-redrain wipe list
 
 ## Done summary
-
+Landed the builds server-side data contract: v64 builds projection table (pk builder name) paired with keeper/api.py SUPPORTED_SCHEMA_VERSIONS, the BuildSnapshot/BuildDeleted serializer+extractor payload pair, projectBuildsRow UPSERT / retractBuildsRow tombstone folds wired into applyEvent, and the BUILDS_DESCRIPTOR collection. Full suite green.
 ## Evidence
