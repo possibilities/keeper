@@ -1,86 +1,37 @@
 #!/usr/bin/env bun
 /**
  * keeper-board — an epics-only "UI" over the read-only NDJSON-over-UDS
- * subscribe server (`src/server-worker.ts`) that streams the epics +
- * subagent_invocations collections (plus jobs as a passive feed for the
- * nested per-task / per-link rendering) as one frame per change. Sibling
- * of `cli/jobs.ts`, which owns the bottom jobs list + the dead-letter
- * banner — those moved out of board in fn-658.3. `subagent_invocations`
- * rows feed the readiness pill AND nest as indented `[<status>]` lines
- * under the matching job row inside each epic block, stamping the raw
- * 5-value projection enum `running|ok|failed|unknown|superseded`
- * verbatim — `superseded` is promoted natively by the projection (task
- * fn-605.2). Same-name invocations within one job ADDITIONALLY collapse
- * on the client to a single line representing the most-recent (max
- * turn_seq) row via `collapseSubagentsByName` in
- * `src/readiness-client.ts` — a `(×N)` multiplier and an optional
- * `N stuck` orphan indicator surface the collapsed count and any
- * non-surviving `running` rows. The same collapse feeds readiness, so
- * an orphan `running` row whose matching `SubagentStop` never landed no
- * longer false-blocks predicate 6. Full uncollapsed audit trail stays
- * in sqlite.
- *
- * Frame shape:
- *
- *   {epics body}     ← one block per epic, see `renderEpicBlock` below
- *
- * Each epic block carries its own embedded creator/refiner link lines
- * (one per `job_links` entry) AND its work-verb jobs nested under the
- * matching task or close row — those are EPIC rendering, not the bottom
- * jobs list. The flat bottom jobs list and its `[dead-letter:N]` banner
- * live in `cli/jobs.ts`.
+ * subscribe server that streams the epics + subagent_invocations collections
+ * (plus jobs as a passive feed for nested per-task / per-link rendering) as one
+ * frame per change. Sibling of `cli/jobs.ts`, which owns the bottom jobs list +
+ * the dead-letter banner. `subagent_invocations` rows feed the readiness pill
+ * AND nest as indented `[<status>]` lines under the matching job row, stamping
+ * the raw projection enum `running|ok|failed|unknown|superseded` verbatim.
+ * Same-name invocations within one job collapse on the client to a single line
+ * (max turn_seq) via `collapseSubagentsByName`; the same collapse feeds
+ * readiness, so an orphan `running` row whose `SubagentStop` never landed no
+ * longer false-blocks predicate 6.
  *
  * Connection / poll / coalesce / first-paint lifecycle is owned by
- * `subscribeReadiness` in `src/readiness-client.ts`. The board is the
- * RENDERER: it owns the sidecar writes, the per-frame `job_id →
- * SubagentInvocation[]` index used to nest sub-agent lines under jobs,
- * the `lastBody` byte-compare that suppresses no-op frames, and the
- * stdout emit. The helper handles the all-five-strict first-paint
- * gate, the per-collection refetch coalesce, the capped-backoff
- * reconnect, the steady-poll backstop, and (load-bearing) reads
- * subagent_invocations through `state.rows` so re-entrant sub-agents
- * sharing one `job_id` all reach `computeReadiness`.
+ * `subscribeReadiness`. The board is the RENDERER: sidecar writes, the
+ * per-frame `job_id → SubagentInvocation[]` nesting index, the `lastBody`
+ * byte-compare that suppresses no-op frames, and the stdout emit. It reads
+ * subagent_invocations through `state.rows` so re-entrant sub-agents sharing
+ * one `job_id` all reach `computeReadiness`.
  *
- * Empty-section policy: an empty epics collection renders as NOTHING
- * (no placeholder text) — the frame is just the `---` lead.
+ * An empty epics collection renders as NOTHING — the frame is just the `---`
+ * lead. The view uses the SERVER defaults for the epics collection (`status =
+ * 'open' AND approval != 'approved'`); for explicit filters drop down to a
+ * custom subscribe client.
  *
- * Filters: this view uses the SERVER defaults for the epics collection —
- * `status = 'open' AND approval != 'approved'`. That's the common-case
- * "board" view; for explicit filters drop down to a custom subscribe client.
- *
- * Sidecar / SIGINT semantics: THREE indexed sidecar files per frame
- * (state JSON + frame text + per-frame unified diff against the previous
- * emit) plus a session meta file at /tmp/keeper-board.<pid>.meta.txt.
- * The diff is `diff -u prev current` via the system tool —
- * universally-readable unified-diff format; the first frame writes a
- * sentinel since there's no prior to diff. SIGINT calls the shell's
- * `dispose()` (restores the terminal), then the helper's `dispose()`
- * (drops every subscription via a bare `unsubscribe`), logs the session
- * sidecar paths, and exits.
+ * Embedded SGR codes (`colorizePillsInLine`'s output) are parsed into OpenTUI
+ * `StyledText` at paint time by `src/ansi-to-styled.ts`. Sidecars stay PLAIN
+ * (the colorizer runs only on `pushFrame` lines, not sidecar / stdout writes).
  *
  * Usage:
  *   keeper board [--sock <path>]
- *
- *   --sock <path>    Socket path override (else $KEEPER_SOCK, else the
- *                    ~/.local/state/keeper/keeperd.sock default).
+ *   --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise).
  *   --help           Show this help.
- *
- * fn-646.4 cutover: moved from `scripts/board.ts` to `cli/board.ts`.
- * The `main(argv: string[])` signature lets the `cli/keeper.ts`
- * dispatcher pass through subcommand argv directly; the `import.meta.main`
- * guard is neutralized — the dispatcher is the canonical entry. The
- * exported `colorizePillsInLine`, `projectRows`, `renderJobLinkLines`,
- * `renderEpicDepPills`, `renderDeadLetterPill`, `epicNumFromIdOrBare`,
- * `renderEpicDepPillsFromProjection`, and `sendReplayDeadLetterRpc`
- * survive the move so `test/board.test.ts` continues to assert against
- * them — `renderDeadLetterPill` + `sendReplayDeadLetterRpc` survive
- * as re-exports even though board no longer renders the banner (jobs
- * owns it). Embedded SGR codes (`colorizePillsInLine`'s output) are
- * parsed into OpenTUI `StyledText` at paint time by
- * `src/ansi-to-styled.ts` — the live shell calls the shim on any line
- * containing `\x1b`. Sidecars stay PLAIN (the colorizer is only run on
- * `pushFrame` lines, not on sidecar / stdout writes); the non-TTY plain
- * path emits uncolored.
  */
 
 import { basename, dirname, join } from "node:path";
@@ -118,17 +69,10 @@ import type {
 } from "../src/types";
 import { createViewShell } from "../src/view-shell";
 
-// ---------------------------------------------------------------------------
-// Re-export shims (fn-658.1)
-// ---------------------------------------------------------------------------
-//
-// `test/board.test.ts` and `scripts/drain-dead-letters.ts` already import
-// the symbols below directly from `../cli/board`. The fn-658.1 extraction
-// moved their definitions to `src/board-render.ts`; these shims keep the
-// existing import paths resolving without forcing a rename at every call
-// site. Mirrors the existing `export { projectRows } from
-// "../src/readiness-client"` precedent further down. New code should
-// import from `src/board-render` directly.
+// Re-export shims: `test/board.test.ts` and `scripts/drain-dead-letters.ts`
+// import these symbols from `../cli/board`, but their definitions live in
+// `src/board-render.ts`. New code should import from `src/board-render`
+// directly.
 export {
   colorizePillsInLine,
   type ReplayDeadLetterRpcResult,
@@ -319,31 +263,19 @@ custom subscribe client against src/protocol.ts.
 `;
 
 /**
- * Re-export `projectRows` from the helper so `test/board.test.ts` (and any
- * external consumers) can keep importing `projectRows` from the board entry.
- * The helper module is the canonical home; this re-export is a stability
- * shim. New code should import from `src/readiness-client` directly.
+ * Re-export `projectRows` so consumers can keep importing it from the board
+ * entry. The canonical home is `src/readiness-client`; import from there.
  */
 export { projectRows } from "../src/readiness-client";
 
 /**
  * Render the optional `[task-repo:<basename>]` pill segment when a task's
- * `target_repo` diverges from its epic's `project_dir`. Divergence is
- * unusual — a task whose worker runs in a sibling repo from where the
- * epic was authored. Visible as a yellow/warn pill via the
- * colorizer's `task-repo:*` prefix fallback so the eye picks the
- * divergent row out at a glance (this is the same predicate the
- * per-root mutex uses to decide which root claims a task — see
- * `effectiveRoot` in `src/readiness.ts`).
- *
- * The close row uses `epic.project_dir` directly with no per-row
- * `target_repo`, so divergence isn't representable there — the helper
- * is only called from the task arm of `renderEpicBlock`.
- *
- * Empty / null `target_repo` is the "no override" case (the task runs
- * in the epic's project_dir); we return `""` so the caller can append
- * unconditionally. Same null+empty fallthrough as `effectiveRoot`
- * so the pill never lies about which root the row actually occupies.
+ * `target_repo` diverges from its epic's `project_dir` — a task whose worker
+ * runs in a sibling repo. The same divergence drives which root the per-root
+ * mutex claims (see `effectiveRoot` in `src/readiness.ts`); the null+empty
+ * fallthrough matches it so the pill never lies about the row's root. Empty /
+ * null `target_repo` is the no-override case and returns `""` so the caller
+ * can append unconditionally.
  */
 function taskRepoPillSeg(taskRepo: unknown, epicProjectDir: unknown): string {
   if (taskRepo == null) {
@@ -361,12 +293,10 @@ function taskRepoPillSeg(taskRepo: unknown, epicProjectDir: unknown): string {
 }
 
 /**
- * Cross-epic dependency reference label — `<name>#<number>` (e.g.
- * `arthack#633`) extracted from a dep epic id like
- * `arthack-633-git-per-session-file-attribution`. The project-name prefix
- * disambiguates deps that cross topics/projects, so the header pill reads
- * `[arthack#633]` rather than the bare `[#633]`. Returns `null` when the id
- * doesn't match the `<name>-<number>-<slug>` shape (caller drops it).
+ * Cross-epic dependency reference label — `<name>#<number>` extracted from a
+ * dep epic id like `arthack-633-git-per-session-file-attribution`. The
+ * project-name prefix disambiguates deps that cross topics/projects. Returns
+ * `null` when the id doesn't match the `<name>-<number>-<slug>` shape.
  */
 function epicDepRefFromId(id: string): string | null {
   const m = /^([a-z]+)-(\d+)-/.exec(id);
@@ -376,15 +306,11 @@ function epicDepRefFromId(id: string): string | null {
 /**
  * Parallel to {@link epicDepRefFromId} for the bare-id form (`fn-N`, no
  * trailing slug). Returns the bare epic number when the id matches; else
- * `null`. The board's `[#N,#M]` summary pill on the epic header uses
- * this alongside `epicDepRefFromId` so both id shapes render correctly
- * — full ids carry the `<project>#<N>` cross-project prefix when present,
- * bare ids render as a bare `#N` (intra-project by definition of the
- * resolver's fn-N-then-cwd-then-global match path).
+ * `null`.
  */
 export function epicNumFromIdOrBare(id: string): number | null {
-  // Full id: `<name>-<num>-<slug>` — first numeric segment after the
-  // project prefix. Bare id: `fn-<num>` exact.
+  // Full id: `<name>-<num>-<slug>` — first numeric segment after the project
+  // prefix. Bare id: `fn-<num>` exact.
   const full = /^[a-z]+-(\d+)-/.exec(id);
   if (full !== null) {
     return Number.parseInt(full[1] ?? "", 10);
@@ -397,21 +323,11 @@ export function epicNumFromIdOrBare(id: string): number | null {
 }
 
 /**
- * fn-636: pill assembly for one epic's `depends_on_epics` list. Lifted out
- * of the `renderEpicBlock` closure so the three render shapes are directly
- * assertable from tests:
- *
- *   - dangling (resolver said `dangling`, id well-formed enough to extract
- *     a number) → `?#N`
- *   - intra-project (resolver returned `cross_project === null`) → `#N`
- *   - cross-project (resolver returned a non-null `cross_project`) →
- *     `<prefix>::#N`
- *
+ * Pill assembly for one epic's `depends_on_epics` list. Three render shapes:
+ * dangling → `?#N`, intra-project → `#N`, cross-project → `<prefix>::#N`.
  * Malformed dangling ids (no extractable number) and found-but-numberless
- * upstreams are dropped, matching the closure's behavior verbatim. The
- * caller still drives `resolveEpicDep` directly so the diagnostics sink
- * stays under its control; this helper only assembles the rendered refs
- * from the dep string + its resolution.
+ * upstreams are dropped. The caller drives `resolveEpicDep` directly so the
+ * diagnostics sink stays under its control; this only assembles the refs.
  */
 export function renderEpicDepPills(
   deps: ReadonlyArray<string>,
@@ -442,26 +358,12 @@ export function renderEpicDepPills(
 }
 
 /**
- * fn-637.4: projection-driven counterpart to {@link renderEpicDepPills}.
- * Reads the schema-v34 `resolved_epic_deps` array (the reducer's forward-
- * stamp output) and assembles the same three render shapes — `#N`,
- * `<project>::#N`, `?#N` — without invoking the resolver live. The board
- * pill and predicate 9 in `src/readiness.ts` consume the same projection,
- * so they cannot drift on what an entry resolves to.
- *
- * Per-entry render rules (identical surface to {@link renderEpicDepPills}):
- *   - `state === "dangling"` → `?#N` when `dep_token` parses to a number,
- *     dropped otherwise (the well-formed-but-numberless case maps to no
- *     pill, mirroring the legacy renderer).
- *   - `state === "satisfied" | "blocked-incomplete"` + `cross_project === false`
- *     → `#N` (intra-project; `epic_number` is non-null for resolved entries).
- *   - `state === "satisfied" | "blocked-incomplete"` + `cross_project === true`
- *     → `<project_basename>::#N` (cross-project prefix; basename is non-null
- *     for resolved entries).
- *
- * A resolved entry whose `epic_number` is somehow null (defensive: should
- * not happen given the reducer's invariants) is dropped, matching the
- * legacy behavior bit-for-bit.
+ * Projection-driven counterpart to {@link renderEpicDepPills}. Reads the
+ * `resolved_epic_deps` array (the reducer's forward-stamp output) and assembles
+ * the same three render shapes — `#N`, `<project>::#N`, `?#N` — without
+ * invoking the resolver live, so the board pill and predicate 9 in
+ * `src/readiness.ts` (same projection) cannot drift. A resolved entry whose
+ * `epic_number` is null is dropped.
  */
 export function renderEpicDepPillsFromProjection(
   deps: ReadonlyArray<ResolvedEpicDep>,
@@ -482,10 +384,9 @@ export function renderEpicDepPillsFromProjection(
     if (!dep.cross_project) {
       refs.push(`#${resolvedNum}`);
     } else {
-      // `cross_project === true` implies a non-null `project_basename` (the
-      // reducer's `enrichEpicDep` only sets the boolean when basenames
-      // differ — both non-empty by construction). Guard once and drop the
-      // pill on the impossible-null fallback to keep the renderer total.
+      // `cross_project === true` implies a non-null `project_basename`; guard
+      // once and drop the pill on the impossible-null fallback so the renderer
+      // stays total.
       const basename = dep.project_basename;
       if (basename === null) {
         continue;
@@ -503,33 +404,18 @@ function taskNumFromId(id: string): number | null {
 
 /**
  * Per-epic creator/refiner link lines, indented one level under the epic
- * header. Each {@link JobLinkEntry} carries eight embedded fields
- * `{kind, job_id, title, state, last_api_error_at, last_api_error_kind,
- * last_input_request_at, last_input_request_kind}` denormalized off the
- * linked `jobs` row at the reducer's write boundary (schema v25), so
- * the render reads every field straight off the projection — no
- * live-jobs join, no off-page fallback branch.
- *
- * The line shape is the same regardless of whether the linked session
- * is live, terminal, or off-page:
+ * header. Each {@link JobLinkEntry} is denormalized off the linked `jobs` row
+ * at the reducer's write boundary, so the render reads every field straight off
+ * the projection — no live-jobs join, no off-page fallback branch. The line
+ * shape is the same whether the linked session is live, terminal, or off-page:
  *
  *     {title ?? job_id} [{kind}] [{state}]{apiErrorPillSeg}
  *       [awaiting:<kind>]   ← only when present, own continuation line
  *
- * Title falls back to `job_id` when the embedded `title` is null —
- * preserves the line shape when title is genuinely unknown (e.g. a
- * shell-inserted epic whose linked session has no captured title yet)
- * without dropping the readable label entirely.
- *
- * `[state]` and `[failed:<kind>]?` stay inline on the row; the optional
- * `[awaiting:<kind>]` pill drops to its own indented continuation line
- * beneath the row so a long interactive stop reads without wrapping.
- *
- * Iteration order is the projection's own `(kind, job_id)` ASC sort
- * (set by `sortJobLinks` in `src/reducer.ts`).
- *
- * Module-level + exported so `test/board.test.ts` can assert the line
- * shape directly without standing up the full subscribe loop.
+ * Title falls back to `job_id` when the embedded `title` is null. `[state]` and
+ * `[failed:<kind>]?` stay inline; the optional `[awaiting:<kind>]` pill drops
+ * to its own continuation line so a long interactive stop reads without
+ * wrapping. Iteration order is the projection's own `(kind, job_id)` ASC sort.
  */
 export function renderJobLinkLines(jobLinks: unknown): string[] {
   if (!Array.isArray(jobLinks) || jobLinks.length === 0) {
@@ -538,21 +424,16 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
   const out: string[] = [];
   for (const link of jobLinks as JobLinkEntry[]) {
     const label = link.title ?? link.job_id;
-    // fn-708 (T1): the session lifecycle pill follows the omit-default rule —
-    // the resting `stopped` value renders NO pill (absence ≡ stopped); only
-    // the live states (`working`, etc.) stamp one. `pillOrEmpty` returns the
-    // leading space and the brackets, so it appends self-delimited.
+    // The lifecycle pill omits the default: the resting `stopped` value renders
+    // NO pill; only live states stamp one. `pillOrEmpty` self-delimits.
     const stateSeg = pillOrEmpty(link.state, "stopped");
     const awaiting = inputRequestPillSeg(
       link.last_input_request_at,
       link.last_input_request_kind,
     );
-    // Schema v52 / fn-686: permission-prompt / elicitation awaiting pill.
-    // Read off the SAME entry as the input-request awaiting pill above
-    // and dropped on its OWN indented continuation line below — both
-    // pills stack independently if a session somehow carries both
-    // (paired-NULL invariant means each pair fires on a distinct fold
-    // arm, but the render layer must not assume mutual exclusion).
+    // Permission-prompt / elicitation awaiting pill, read off the SAME entry
+    // and dropped on its OWN continuation line below. The render layer must not
+    // assume mutual exclusion with the input-request pill.
     const awaitingPP = permissionPromptPillSeg(
       link.last_permission_prompt_at,
       link.last_permission_prompt_kind,
@@ -560,9 +441,8 @@ export function renderJobLinkLines(jobLinks: unknown): string[] {
     out.push(
       `  ${label} ${pill(String(link.kind))}${stateSeg}${apiErrorPillSeg(link.last_api_error_at, link.last_api_error_kind)}`,
     );
-    // The [awaiting:<kind>] pill drops to its own continuation line (one
-    // indent level deeper) so a long-running interactive stop reads
-    // without wrapping; [state]/[failed:<kind>] stay inline above.
+    // The [awaiting:<kind>] pill drops to its own continuation line (one indent
+    // deeper); [state]/[failed:<kind>] stay inline above.
     if (awaiting !== "") {
       out.push(`    ${awaiting.trimStart()}`);
     }
@@ -626,33 +506,20 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   const sockPath = values.sock ?? resolveSockPath();
-  // fn-635: readiness diagnostics JSONL log. Siblings the sock + dispatch
-  // log in the same state directory (`~/.local/state/keeper/`). Two
-  // processes (board.ts + autopilot.ts) can append concurrently; POSIX
-  // O_APPEND under PIPE_BUF gives the atomicity guarantee, no flock.
+  // Readiness diagnostics JSONL log, a sibling of the sock in the state dir.
+  // Two processes (board + autopilot) can append concurrently; POSIX O_APPEND
+  // under PIPE_BUF gives the atomicity guarantee, no flock.
   const diagnosticsLogPath = join(
     dirname(sockPath),
     "readiness-diagnostics.jsonl",
   );
-  // fn-751: the live explicitly-armed epic-id set, fed by a parallel
-  // `armed_epics` presence-table subscription below (the readiness composite
-  // doesn't carry it). A row's presence means the epic is explicitly armed;
-  // `renderEpicBlock` reads this set to decide the `[armed]` header pill.
-  // Mutated in place (clear+re-add) on each `armed_epics` edge so the closure
-  // identity the renderer captured stays stable. v1 surfaces EXPLICIT-armed
-  // only — the dep-pulled-in closure is a documented future enhancement.
+  // The live explicitly-armed epic-id set, fed by a parallel `armed_epics`
+  // presence-table subscription below (the readiness composite doesn't carry
+  // it). `renderEpicBlock` reads this to decide the `[armed]` header pill.
+  // Mutated in place (clear+re-add) on each edge so the closure identity the
+  // renderer captured stays stable.
   const armedSet = new Set<string>();
   const seg = (v: unknown) => (v == null ? "" : String(v));
-
-  // --- epic rendering ---
-
-  // `subagentLinesFor` is a pure module function in `src/board-render.ts`
-  // (fn-658.1) — shared with the forthcoming `cli/jobs.ts` view. The
-  // closure version that previously lived here closed over `seg`; the
-  // moved version inlines the trivial `v == null ? "" : String(v)` for
-  // the one call site. `renderJobLinkLines` likewise lives at module
-  // scope (exported) so `test/board.test.ts` can assert the line shape
-  // without standing up the full subscribe loop.
 
   function renderJobLines(
     subagentIndex: Map<string, SubagentInvocation[]>,
@@ -668,16 +535,15 @@ export async function main(argv: string[]): Promise<void> {
         job.last_input_request_at,
         job.last_input_request_kind,
       );
-      // Schema v52 / fn-686: permission-prompt / elicitation awaiting
-      // pill on the embedded-job line. Same stacking discipline as the
-      // input-request pill above — independent continuation line.
+      // Permission-prompt / elicitation awaiting pill on the embedded-job line.
+      // Same stacking discipline as the input-request pill above — independent
+      // continuation line.
       const awaitingPP = permissionPromptPillSeg(
         job.last_permission_prompt_at,
         job.last_permission_prompt_kind,
       );
-      // fn-713 follow-on: the role pill is iconized; it is omitted only when
-      // there is no `plan_verb` (role is presence-based, no resting default).
-      // The lifecycle pill now SHOWS its value (`stopped` included).
+      // The role pill is presence-based — omitted only when there is no
+      // `plan_verb` (no resting default).
       const role = planVerbLabel(job.plan_verb);
       const roleSeg = role == null ? "" : ` ${pill(role)}`;
       out.push(
@@ -726,20 +592,10 @@ export async function main(argv: string[]): Promise<void> {
     const epicDeps = Array.isArray(row.depends_on_epics)
       ? row.depends_on_epics
       : [];
-    // fn-637.4: summary pill reads `row.resolved_epic_deps` — the schema-v34
-    // projection maintained by the reducer's forward-stamp + reverse fan-out.
-    // The board pill and predicate 9 share the same source of truth, so they
-    // cannot drift. Three render shapes (identical to the pre-cutover live
-    // resolver branches):
-    //   - `satisfied` / `blocked-incomplete` + `cross_project === false` →
-    //     `[#N]` intra-project
-    //   - `satisfied` / `blocked-incomplete` + `cross_project === true` →
-    //     `[<project_basename>::#N]` cross-project
-    //   - `dangling` → `[?#N]` when the raw `dep_token` parses to a
-    //     number, dropped when it doesn't.
-    // The fn-637 `completedEpics` merge / resolver-only subscription is gone
-    // — completed upstreams already resolved into `state === "satisfied"`
-    // entries at fold time when the consumer's row was last stamped.
+    // Summary pill reads `row.resolved_epic_deps` — the projection maintained
+    // by the reducer's forward-stamp + reverse fan-out, shared with predicate 9
+    // so they cannot drift. Three render shapes: intra-project `[#N]`,
+    // cross-project `[<basename>::#N]`, dangling `[?#N]`.
     const resolvedDeps = Array.isArray(row.resolved_epic_deps)
       ? (row.resolved_epic_deps as ResolvedEpicDep[])
       : [];
@@ -762,40 +618,23 @@ export async function main(argv: string[]): Promise<void> {
     }
     const epicDepsSeg =
       epicDepRefs.length === 0 ? "" : ` [${epicDepRefs.join(",")}]`;
-    // `epicIds` is no longer used for filtering (resolver path handles
-    // every dep shape including ambiguous bare-ids); kept in the
-    // signature for API stability while the helper is in flux. Silence
-    // the lint by reading once.
+    // `epicIds` is no longer used for filtering; kept in the signature for API
+    // stability. Read once to silence the lint.
     void epicIds;
     const epicId = seg(row.epic_id);
     const lines: string[] = [];
     const epicVerdict = verdictFromMap(snap.readiness.perEpic, epicId);
-    // Schema v29: `[slotted-after-closer]` pill — appears only when the
-    // epic was minted by another epic's closer session (the projection's
-    // `created_by_closer_of` is non-null). Placed after `[validated|
-    // unvalidated]` and before the readiness pill (mirrors the
-    // `epicDepsSeg` shape: empty string when absent, leading space when
-    // present so the join reads cleanly).
+    // `[slotted-after-closer]` pill — appears only when the epic was minted by
+    // another epic's closer session (`created_by_closer_of` non-null).
+    // Self-delimited (empty when absent, leading space when present).
     const slottedSeg =
       row.created_by_closer_of == null
         ? ""
         : ` ${pill("slotted-after-closer")}`;
-    // Same rule as the task/close rows: a [blocked:<reason>] verdict drops
-    // to its own line (two-space indent) beneath the header; ready/
-    // completed/running stay inline at the end of the header itself.
-    // fn-700.2: the `{epic_number} {title}` label falls back to `epic_id`
-    // when both are null (a pre-`EpicSnapshot` stub row), so the header is
-    // never the blank `(keeper)  [unvalidated]` line. The pure assembly
-    // lives in `epicHeaderLabel` (`src/board-render.ts`) for testability;
-    // `epicId` is the already-coalesced `seg(row.epic_id)` above.
-    // fn-708 (T1): `validatedPill` now omits the default — it emits
-    // ` [validated]` only when the epic is validated and `""` otherwise
-    // (absence ≡ unvalidated, per the omit-default convention). It returns its own
-    // leading space + brackets, so it appends self-delimited alongside the
-    // dep summary and the slotted-after-closer pill.
-    // fn-751: the `[armed]` pill (omit-default) appears only when this epic
-    // is in the live `armed_epics` presence set. Self-delimited (own leading
-    // space), so it appends cleanly after the slotted-after-closer segment.
+    // The `{epic_number} {title}` label falls back to `epic_id` when both are
+    // null (a pre-`EpicSnapshot` stub row), so the header is never blank.
+    // `validatedPill` and `armedPill` both omit their default and self-delimit,
+    // emitting their pill only at the non-resting value.
     const armedSeg = armedPill(armedSet.has(epicId));
     const epicHeader = `${dirSeg}${epicHeaderLabel(row.epic_number, row.title, epicId)}${epicDepsSeg}${validatedPill(row.last_validated_at)}${slottedSeg}${armedSeg}`;
     const epicHeaderLines =
@@ -814,26 +653,19 @@ export async function main(argv: string[]): Promise<void> {
         tnums.length === 0 ? "" : ` [${tnums.map((n) => `#${n}`).join(",")}]`;
       const taskId = seg(t.task_id);
       const taskVerdict = verdictFromMap(snap.readiness.perTask, taskId);
-      // A [blocked:<reason>] verdict drops to its own line beneath the
-      // [id] reference; ready/completed/running pills stay inline on the id
-      // line. The `[task-repo:<basename>]` divergence pill follows the
-      // verdict wherever it lands (it "surfaces next to the verdict that
-      // references it" — see `taskRepoPillSeg`).
+      // A [blocked:<reason>] verdict drops to its own line beneath the [id]
+      // reference; ready/completed/running stay inline. The
+      // `[task-repo:<basename>]` divergence pill follows the verdict wherever
+      // it lands (see `taskRepoPillSeg`).
       const taskPillSeg = `${iconizePills(formatPill(taskVerdict))}${taskRepoPillSeg(t.target_repo, row.project_dir)}`;
       const taskIdLines =
         taskVerdict.tag === "blocked"
           ? [`    [${taskId}]`, `    ${taskPillSeg}`]
           : [`    [${taskId}] ${taskPillSeg}`];
       lines.push(
-        // fn-708 (T1/T3): the runtime_status / worker_phase / approval triple
-        // is consolidated by `renderTaskPills` (`src/board-render.ts`). Each
-        // field renders ONLY at its non-resting value: `todo` runtime / `open`
-        // phase / `pending` approval all elide; `worker_phase=done` renders the
-        // labeled `[worker-done]` (never bare, only when the verdict doesn't
-        // pin it); `runtime_status=blocked` renders `[rt:blocked]`; and the
-        // approval pill is suppressed where the adjacent verdict already names
-        // it (`completed` / `blocked:job-rejected`). Absence ≡ the default per
-        // the omit-default convention (documented in `keeper board --help`).
+        // `renderTaskPills` consolidates the runtime_status / worker_phase /
+        // approval triple, each rendering ONLY at its non-resting value (see
+        // `keeper board --help` for the omit-default convention).
         `  ${seg(t.task_number)}. ${seg(t.title)}${taskDepsSeg}${renderTaskPills(t, taskVerdict)}`,
         ...taskIdLines,
         ...renderJobLines(subagentIndex, t.jobs),
@@ -847,12 +679,10 @@ export async function main(argv: string[]): Promise<void> {
         ? [`    [${epicId}]`, `    ${iconizePills(formatPill(closeVerdict))}`]
         : [`    [${epicId}] ${iconizePills(formatPill(closeVerdict))}`];
     lines.push(
-      // fn-708 (T2/T1/T3): the close-row `[status]` pill is dropped — the
-      // board filter pins it to `[open]`, so it carries zero bits (a custom-
-      // filtered view restores it; see the restore note in `renderClosePills`).
+      // The close-row `[status]` pill is dropped — the board filter pins it to
+      // `[open]` (a custom-filtered view restores it; see `renderClosePills`).
       // The approval pill follows the same omit-default + verdict-aware
-      // suppression as the task line, so the row usually collapses to just the
-      // title + its `[id] <verdict>` reference line below.
+      // suppression as the task line.
       `  X. Quality audit and close${renderClosePills(row, closeVerdict)}`,
       ...closeIdLines,
       ...renderJobLines(subagentIndex, row.jobs),
@@ -868,10 +698,6 @@ export async function main(argv: string[]): Promise<void> {
       return "";
     }
     const epicIds = new Set(snap.epics.map((e) => String(e.epic_id)));
-    // fn-637.4: the `epicById` + `epicsByNumber` resolver indexes and the
-    // completed-epics merge are gone. The summary pill reads each row's
-    // `resolved_epic_deps` projection directly (see `renderEpicBlock`), so
-    // the renderer doesn't need a cross-epic lookup index anymore.
     const epicsList = snap.epics as Epic[];
     return epicsList
       .map((e) =>
@@ -887,9 +713,8 @@ export async function main(argv: string[]): Promise<void> {
 
   /**
    * Epics-only frame body. Returns one element per output line so the
-   * live-shell can consume lines (per-line ANSI diff). The caller joins
-   * with `\n` for stdout / sidecar / byte-compare. The bottom jobs list
-   * lives in `cli/jobs.ts` (fn-658.3).
+   * live-shell can consume lines (per-line ANSI diff). The bottom jobs list
+   * lives in `cli/jobs.ts`.
    */
   function renderBody(
     snap: ReadinessClientSnapshot,
@@ -899,30 +724,22 @@ export async function main(argv: string[]): Promise<void> {
     return body === "" ? ["no epics"] : body.split("\n");
   }
 
-  // fn-660.1: lifecycle + sidecars + copy key + SIGINT moved into
-  // `createViewShell` — see `src/view-shell.ts`. Board's only sibling-
-  // specific bits are the renderer, the `subscribeReadiness` wiring,
-  // and the diagnostics drain (snap-side, never on the body-stable
-  // suppression path so every observed ambiguity gets recorded).
+  // Lifecycle + sidecars + copy key + SIGINT live in `createViewShell`. Board's
+  // only sibling-specific bits are the renderer, the `subscribeReadiness`
+  // wiring, and the diagnostics drain.
   const view = createViewShell<ReadinessClientSnapshot>({
     script: "board",
     title: "board",
-    // fn-772 snapshot branch: board folds TWO streams — the readiness
-    // composite (`subscribeReadiness`) + the `armed_epics` presence table
-    // — so `streamCount: 2`. The latch holds the snapshot until BOTH
-    // report (readiness via the auto-report in `view.emit`, armed_epics via
-    // the explicit `reportSnapshotStream` below), so the `[armed]` pills are
-    // deterministically present rather than ordering-luck.
+    // Board folds TWO streams — the readiness composite + the `armed_epics`
+    // presence table — so the snapshot latch holds until BOTH report (readiness
+    // via the auto-report in `view.emit`, armed_epics via the explicit
+    // `reportSnapshotStream` below).
     mode: mode === "snapshot" ? "snapshot" : "live",
     streamCount: 2,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
     renderBody: (snap) => {
-      // Per-frame `job_id → invocations` index — re-entrant sub-agents
-      // within one session sit on the same bucket, ordered by
-      // `turn_seq asc` so the nested list reads in invocation order.
-      // The projection promotes `superseded` natively (task fn-605.2),
-      // so no client-side marking pass is required — `subagentLinesFor`
-      // stamps the raw `[${status}]` enum verbatim.
+      // Per-frame `job_id → invocations` index — re-entrant sub-agents within
+      // one session share a bucket, ordered by `turn_seq asc`.
       const subagentIndex = new Map<string, SubagentInvocation[]>();
       for (const inv of snap.subagentInvocations) {
         const arr = subagentIndex.get(inv.job_id);
@@ -942,19 +759,17 @@ export async function main(argv: string[]): Promise<void> {
     },
   });
 
-  // fn-751: retain the last readiness snapshot so an `armed_epics` edge that
-  // lands between readiness frames can repaint the `[armed]` pill without
-  // waiting for the next readiness snapshot. Null until the first frame.
+  // Retain the last readiness snapshot so an `armed_epics` edge landing between
+  // readiness frames can repaint the `[armed]` pill immediately. Null until the
+  // first frame.
   let lastSnap: ReadinessClientSnapshot | null = null;
 
   function emitFrame(snap: ReadinessClientSnapshot): void {
     lastSnap = snap;
-    // fn-635: drain `snap.readiness.diagnostics` to the JSONL log
-    // before the render. The drain is per-snapshot, not per-emit (we
-    // want every observed ambiguity recorded even if the render is
-    // byte-stable and the view-shell's `lastBody` short-circuits).
-    // Best-effort append — `appendDiagnostic` swallows I/O errors so
-    // a transient FS hiccup doesn't wedge the frame loop.
+    // Drain diagnostics per-snapshot (not per-emit) so every observed ambiguity
+    // is recorded even when the render is byte-stable and the view-shell's
+    // `lastBody` short-circuits. Best-effort — `appendDiagnostic` swallows I/O
+    // errors so an FS hiccup doesn't wedge the frame loop.
     for (const d of snap.readiness.diagnostics) {
       appendDiagnostic(d, diagnosticsLogPath);
     }
@@ -968,17 +783,12 @@ export async function main(argv: string[]): Promise<void> {
     onLifecycle: view.emitLifecycle,
   });
 
-  // fn-751: a parallel `armed_epics` presence-table subscription. The
-  // readiness composite doesn't carry the armed set, so the board rides its
-  // own `subscribeCollection` (same pattern as `dispatch_failures`). On each
-  // edge we rebuild `armedSet` in place (clear + re-add) and re-emit the last
-  // snapshot so the `[armed]` header pill repaints live. Re-subscribes cleanly
-  // on socket drop via the shared reconnect contract.
-  // fn-772: report the `armed_epics` stream to the snapshot latch exactly
-  // once (its first `onRows`). The latch counts raw reports, so this one-shot
-  // guard keeps a re-fired armed edge from over-reporting; combined with the
-  // readiness stream's auto-report in `view.emit`, the latch's `streamCount:
-  // 2` is satisfied only when BOTH streams have folded. Inert in live mode.
+  // A parallel `armed_epics` presence-table subscription — the readiness
+  // composite doesn't carry the armed set. On each edge we rebuild `armedSet`
+  // in place (clear + re-add) and re-emit the last snapshot so the `[armed]`
+  // pill repaints live. Report to the snapshot latch exactly once (the
+  // one-shot guard keeps a re-fired edge from over-reporting); inert in live
+  // mode.
   let armedStreamReported = false;
   const armedHandle = subscribeCollection({
     sockPath,
@@ -1016,7 +826,6 @@ export async function main(argv: string[]): Promise<void> {
   }
 }
 
-// `import.meta.main` guard neutralized — `cli/keeper.ts` is the
-// canonical entry. Direct invocation via `bun cli/board.ts` would
-// bypass the dispatcher's arg-pruning; if you really need it, run
-// `bun cli/keeper.ts board <args>` instead.
+// `import.meta.main` guard neutralized — `cli/keeper.ts` is the canonical
+// entry; direct `bun cli/board.ts` invocation bypasses the dispatcher's
+// arg-pruning.

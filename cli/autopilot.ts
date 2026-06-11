@@ -1,71 +1,19 @@
 #!/usr/bin/env bun
 /**
  * `keeper autopilot` — thin viewer + control surface for the server-side
- * autopilot reconciler (fn-661).
+ * autopilot reconciler.
  *
- * The reconciler itself lives in `src/autopilot-worker.ts` as a daemon
- * worker thread; this CLI does NOT dispatch, dedup, suppress, settle,
- * confirm, reap, or persist anything. Its only jobs are:
+ * The reconciler itself lives in `src/autopilot-worker.ts`; this CLI does NOT
+ * dispatch, dedup, suppress, settle, confirm, reap, or persist anything. It
+ * renders the current / stopped / failed / dependencies sections plus a
+ * paused/playing banner, and offers control subcommands that each round-trip
+ * one RPC (same one-shot shape as `scripts/approve.ts`).
  *
- *   1. Render four sections of state, refreshed on every subscribe edge:
- *        --- current ---   live `working` `jobs` rows (the reconciler's
- *                          observed in-flight dispatches), ordered for scan
- *        --- stopped ---   `jobs` rows whose turn has ended (state
- *                          `stopped`) but whose session may still be alive
- *                          — the same working+stopped stream as `current`,
- *                          partitioned by state
- *        --- failed ---    rows from the `dispatch_failures` projection
- *                          (the only durable autopilot-owned state, fed by
- *                          the reducer's `DispatchFailed` fold arm)
- *        --- dependencies --- `renderDependencyGraph` — an ASCII DAG of the
- *                          open tasks keyed off `depends_on` (intra-epic)
- *                          and `depends_on_epics` (cross-epic). Reference
- *                          view, no dispatch behind it
- *      plus a `[paused]` / `[playing]` banner indicator.
- *
- *   2. Three control subcommands that round-trip a single RPC each:
- *        keeper autopilot pause          → set_autopilot_paused {paused:true}
- *        keeper autopilot play           → set_autopilot_paused {paused:false}
- *        keeper autopilot retry <key>    → retry_dispatch       {id:<key>}
- *      Where `<key>` is the canonical `${verb}::${id}` composite (e.g.
- *      `work::fn-619-foo.3`). Each subcommand opens a fresh `Bun.connect`,
- *      sends ONE `rpc` frame, awaits the matching `rpc_result` / `error`,
- *      and exits — same one-shot shape as `scripts/approve.ts`.
- *
- * Bare invocation (`keeper autopilot` with no subcommand) opens the
- * viewer. The viewer shares the `createViewShell` harness with `board` /
- * `jobs` / `git` — same alt-screen UX, same sidecar contract.
- *
- * Data plumbing:
- *  - The readiness collections (epics + jobs + subagent_invocations + git
- *    + dead_letters) ride one `subscribeReadiness` connection — same
- *    surface board.ts consumes, identical first-paint gating and
- *    capped-backoff reconnect contract.
- *  - The `dispatch_failures` collection rides its own `subscribeCollection`
- *    connection (server descriptor: `src/collections.ts`'s
- *    `DISPATCH_FAILURES_DESCRIPTOR`). Default-sort is `ts DESC`, so the
- *    freshest failure is on top.
- *  - The `autopilot_state` singleton (schema v47 / fn-667) rides its own
- *    `subscribeCollection` connection (descriptor:
- *    `AUTOPILOT_STATE_DESCRIPTOR`). One row at most (`id = 1`) carrying
- *    the durable paused/playing flag — the banner-truth substrate.
- *
- * Paused-state surfacing (schema v47 / fn-667):
- *  - The viewer subscribes the singleton `autopilot_state` projection
- *    alongside `dispatch_failures` and reflects the daemon's REAL
- *    paused/playing flag in the banner. The projection is fed by the
- *    reducer's `AutopilotPaused` fold arm — every pause/play RPC appends
- *    one synthetic event before flipping the in-memory worker gate, so
- *    the banner is byte-honest with the worker's dispatch decision.
- *  - The daemon boot-appends `AutopilotPaused{paused:true}` BEFORE the
- *    server worker spawns, so a viewer subscribing the instant the socket
- *    opens reads a real row (the boot re-arm), never an empty surface.
- *    The seed `paused: true` on first launch is only visible for the
- *    sub-ms window between viewer launch and the first subscribe edge.
- *
- * Sidecar / SIGINT semantics: identical to the other view-shell siblings —
- * three indexed sidecar files per frame (state JSON + frame text + per-
- * frame unified diff), plus the session meta + lifecycle sidecar.
+ * Data plumbing: the readiness collections ride one `subscribeReadiness`
+ * connection; `dispatch_failures`, the `autopilot_state` singleton (the
+ * banner-truth substrate), and `armed_epics` each ride their own
+ * `subscribeCollection`. The daemon boot-appends `AutopilotPaused{paused:true}`
+ * before the server worker spawns, so the viewer reads a real row immediately.
  *
  * Usage:
  *   keeper autopilot [--sock <path>]            # viewer
@@ -146,9 +94,8 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
 
 /**
  * Hard upper bound on how long a control subcommand waits for the
- * `rpc_result` / `error` frame after a successful connect. Matches the
- * sibling shape in `scripts/approve.ts` — 5s is generous; a healthy
- * daemon answers in sub-ms on local UDS.
+ * `rpc_result` / `error` frame after a successful connect. 5s is generous; a
+ * healthy daemon answers in sub-ms on local UDS.
  */
 const RESPONSE_TIMEOUT_MS = 5000;
 
@@ -177,8 +124,7 @@ function statusGlyph(v: Verdict | undefined): string {
 }
 
 /** Strip the owning-epic prefix from a task id so intra-epic ids render as
- * the short `.M` suffix; ids that don't belong to `epicId` pass through whole
- * (a cross-epic dep, should not happen for `depends_on` but rendered honestly). */
+ * the short `.M` suffix; ids not belonging to `epicId` pass through whole. */
 function shortTaskId(taskId: string, epicId: string): string {
   return epicId !== "" && taskId.startsWith(`${epicId}.`)
     ? taskId.slice(epicId.length)
@@ -233,10 +179,9 @@ export function renderDependencyGraph(snap: ReadinessClientSnapshot): string[] {
 // ---------------------------------------------------------------------------
 
 /**
- * One live dispatch row rendered under `--- current ---`. Sourced from
- * the `jobs` map in the readiness snapshot — every `working` /
- * `stopped` row whose `plan_verb` is one of the three dispatch verbs is
- * a current dispatch the reconciler launched.
+ * One live dispatch row rendered under `--- current ---`. Sourced from the
+ * `jobs` map in the readiness snapshot — every `working` / `stopped` row whose
+ * `plan_verb` is one of the dispatch verbs is a current dispatch.
  */
 export interface CurrentRow {
   verb: "work" | "close" | "approve";
@@ -244,11 +189,9 @@ export interface CurrentRow {
   /** Basename of `project_dir` — empty when none. */
   dir: string;
   /**
-   * Live job state — `working` (actively running) splits into the
-   * `--- current ---` section; `stopped` (turn ended, session may still
-   * be alive) splits into `--- stopped ---`. The readiness `jobs` stream
-   * is server-filtered to exactly these two states (`state NOT IN
-   * ("ended","killed")`), so this is total.
+   * Live job state. `working` splits into `--- current ---`; `stopped` (turn
+   * ended, session may still be alive) splits into `--- stopped ---`. The
+   * readiness `jobs` stream is server-filtered to exactly these two states.
    */
   state: "working" | "stopped";
   /** Sort key: created_at descending puts the freshest at the bottom. */
@@ -256,10 +199,8 @@ export interface CurrentRow {
 }
 
 /**
- * One row of `dispatch_failures` shipped to the viewer. The wire shape is
- * `Record<string, unknown>` (subscribeCollection's general output); this
- * is the typed projection we render against. The reducer guarantees the
- * column set per `DISPATCH_FAILURES_DESCRIPTOR`.
+ * One row of `dispatch_failures` shipped to the viewer — the typed projection
+ * we render against (the wire shape is the general `Record<string, unknown>`).
  */
 export interface FailedRow {
   verb: string;
@@ -299,9 +240,8 @@ export function buildCurrentRows(snap: ReadinessClientSnapshot): CurrentRow[] {
         typeof job.created_at === "number" ? job.created_at : Number(0),
     });
   }
-  // Sort ascending by created_at (oldest first) so the freshest dispatch
-  // is at the bottom — same scan-order convention the predicted /
-  // completed sections used in the legacy renderer.
+  // Sort ascending by created_at (oldest first) so the freshest dispatch is at
+  // the bottom.
   out.sort((a, b) => a.created_at - b.created_at);
   return out;
 }
@@ -328,13 +268,11 @@ export function projectFailedRows(
 }
 
 /**
- * Coerce a singleton `autopilot_state` wire row's `paused` column to the
- * banner-facing boolean. The column is stored as INTEGER (`1` paused,
- * `0` playing). Defensive: an empty row set (singleton hasn't folded
- * yet — sub-ms boot race) returns `null` so the caller leaves the
- * seed `state.paused` untouched; a non-0/1 value falls back to `true`
- * (safer side, matches the daemon's boot default). Pure — exported for
- * tests. fn-667.
+ * Coerce a singleton `autopilot_state` wire row's `paused` column (INTEGER:
+ * `1` paused, `0` playing) to the banner boolean. An empty row set (singleton
+ * not yet folded) returns `null` so the caller leaves the seed untouched; a
+ * non-0/1 value falls back to `true` (the safer side, matching the daemon's
+ * boot default). Pure — exported for tests.
  */
 export function projectAutopilotPaused(
   rows: Record<string, unknown>[],
@@ -350,15 +288,12 @@ export function projectAutopilotPaused(
 }
 
 /**
- * Coerce a singleton `autopilot_state` wire row's `max_concurrent_jobs`
- * column to the banner-facing cap. The column is a NULLABLE INTEGER (a
- * positive cap, or SQL NULL = unlimited). Sourced ENTIRELY over the socket —
- * the viewer NEVER reads config.yaml. Defensive across the full
- * absent → unlimited path: an empty row set (singleton hasn't folded yet —
- * sub-ms boot race), a NULL value (wire-decoded as JS `null`), a missing
- * column (pre-v60 wire shape), or any non-positive / non-integer value all
- * return `null` (= unlimited, rendered `∞`); only a positive integer returns
- * a numeric cap. Pure — exported for tests. fn-725.
+ * Coerce a singleton `autopilot_state` wire row's `max_concurrent_jobs` column
+ * (NULLABLE INTEGER: a positive cap, or NULL = unlimited) to the banner cap.
+ * Sourced ENTIRELY over the socket — the viewer NEVER reads config.yaml. The
+ * whole absent → unlimited path (empty row set, NULL, missing column, or any
+ * non-positive / non-integer value) returns `null` (rendered `∞`); only a
+ * positive integer returns a numeric cap. Pure — exported for tests.
  */
 export function projectMaxConcurrentJobs(
   rows: Record<string, unknown>[],
@@ -374,13 +309,11 @@ export function projectMaxConcurrentJobs(
 }
 
 /**
- * Coerce a singleton `autopilot_state` wire row's `mode` column to the
- * banner-facing enum. Stored as TEXT (`'yolo'` work-everything, `'armed'`
- * armed-set-only). Defensive: an empty row set (singleton hasn't folded yet —
- * sub-ms boot race) returns `null` so the caller leaves the seed untouched;
- * any value other than the two legal literals falls back to `'yolo'` (the
- * backward-compatible work-everything default, matching the column default).
- * Pure — exported for tests. fn-751 task .3.
+ * Coerce a singleton `autopilot_state` wire row's `mode` column (TEXT:
+ * `'yolo'` work-everything, `'armed'` armed-set-only) to the banner enum. An
+ * empty row set returns `null` so the caller leaves the seed untouched; any
+ * value other than the two legal literals falls back to `'yolo'` (the
+ * backward-compatible default). Pure — exported for tests.
  */
 export function projectAutopilotMode(
   rows: Record<string, unknown>[],
@@ -394,9 +327,8 @@ export function projectAutopilotMode(
 
 /**
  * Project the `armed_epics` wire rows to a sorted list of the explicitly-armed
- * epic ids. The descriptor sorts `created_at DESC` server-side; we re-sort by
- * `epic_id` ASC for a stable, deterministic armed-section render (the screen
- * lists ids, not arm order). Pure — exported for tests. fn-751 task .3.
+ * epic ids. Re-sorted by `epic_id` ASC for a stable, deterministic armed-
+ * section render. Pure — exported for tests.
  */
 export function projectArmedEpics(rows: Record<string, unknown>[]): string[] {
   const out: string[] = [];
@@ -421,24 +353,20 @@ export interface RenderInput {
   dependencies?: string[];
   failed: FailedRow[];
   paused: boolean;
-  /** fn-751: the explicitly-armed epic ids. The `--- armed ---` section
-   * lists them (v1 shows explicit-armed only). An empty array renders
-   * nothing — the "nothing armed in armed mode" callout lives on the banner,
-   * not the body. Optional — an absent field renders no section. */
+  /** The explicitly-armed epic ids listed by the `--- armed ---` section. An
+   * empty/absent array renders nothing — the "nothing armed" callout lives on
+   * the banner, not the body. */
   armed?: string[];
 }
 
 /**
- * Render the body lines for one viewer frame. Four sections, each
- * emitted only when non-empty, in priority order: current (live
- * `working` jobs), stopped (jobs whose turn ended but whose session may
- * still be alive), failed (sticky failures awaiting human retry), and
- * dependencies (the open-task DAG). The `current` and `stopped` sections both source
- * from `input.current` — `buildCurrentRows` projects the whole
- * working+stopped jobs stream and `renderBody` partitions by `state`. The
- * leading `[paused]` / `[playing]` indicator lives on the live-shell
- * banner row, not the body — same convention as board's persistent-pill
- * restoration.
+ * Render the body lines for one viewer frame. Each section is emitted only
+ * when non-empty, in priority order: current (live `working` jobs), stopped
+ * (turn ended, session may still be alive), failed (sticky failures awaiting
+ * retry), armed, and dependencies (the open-task DAG). `current` and `stopped`
+ * both source from `input.current` — `buildCurrentRows` projects the whole
+ * working+stopped stream and this partitions by `state`. The paused/playing
+ * indicator lives on the banner row, not the body.
  *
  * Pure — exported for tests.
  */
@@ -477,10 +405,8 @@ export function renderBody(input: RenderInput): string[] {
     }
   }
 
-  // fn-751: the explicitly-armed epics. v1 lists explicit-armed only; the
-  // dep-pulled-in/effective-set view is a documented future enhancement. The
-  // banner already signals mode + count (incl. the "nothing armed" callout),
-  // so an empty armed set renders no body section here.
+  // The banner already signals mode + count (incl. the "nothing armed"
+  // callout), so an empty armed set renders no body section here.
   const armed = input.armed ?? [];
   if (armed.length > 0) {
     out.push("--- armed ---");
@@ -531,7 +457,7 @@ export function buildRetryFrame(id: string, dispatchKey: string): ClientFrame {
 
 /**
  * Build a well-formed RPC client frame for `set_autopilot_mode`. Pure —
- * exported so tests can assert the wire shape. Fn-751 task .3.
+ * exported so tests can assert the wire shape.
  */
 export function buildSetModeFrame(
   id: string,
@@ -547,7 +473,7 @@ export function buildSetModeFrame(
 
 /**
  * Build a well-formed RPC client frame for `set_epic_armed`. Pure —
- * exported so tests can assert the wire shape. Fn-751 task .3.
+ * exported so tests can assert the wire shape.
  */
 export function buildSetArmedFrame(
   id: string,
@@ -563,12 +489,10 @@ export function buildSetArmedFrame(
 }
 
 /**
- * One round-trip on a fresh UDS connection — copy of the proven shape
- * from `scripts/approve.ts:roundTrip`. Opens, writes the frame, awaits
- * the server frame whose `id === matchId`, closes. Resolves with the
- * matching frame; rejects on connect-fail, transport error, malformed
- * frame, server close before reply, or `RESPONSE_TIMEOUT_MS` elapsing
- * post-connect.
+ * One round-trip on a fresh UDS connection. Opens, writes the frame, awaits
+ * the server frame whose `id === matchId`, closes. Resolves with the matching
+ * frame; rejects on connect-fail, transport error, malformed frame, server
+ * close before reply, or `RESPONSE_TIMEOUT_MS` elapsing post-connect.
  */
 async function roundTrip(
   sockPath: string,
@@ -709,34 +633,27 @@ interface ViewerState {
   snap: ReadinessClientSnapshot | null;
   failed: FailedRow[];
   paused: boolean;
-  // fn-725: the global autopilot concurrency cap, sourced over the socket
-  // from the `autopilot_state` singleton (NEVER config.yaml). `null` =
-  // unlimited (rendered `∞`). Seeded `null` and overwritten by the
-  // `autopilot_state` subscribe edge alongside `paused`.
+  // The global concurrency cap, sourced over the socket from the
+  // `autopilot_state` singleton (NEVER config.yaml). `null` = unlimited.
   maxConcurrentJobs: number | null;
-  // fn-751: the explicit autopilot mode, sourced over the socket from the
-  // `autopilot_state` singleton's `mode` column. Seeded `'yolo'` (the
-  // work-everything default) and overwritten by the `autopilot_state`
-  // subscribe edge alongside `paused`.
+  // The explicit autopilot mode, sourced from the `autopilot_state` singleton's
+  // `mode` column.
   mode: "yolo" | "armed";
-  // fn-751: the explicitly-armed epic ids, sourced over the socket from the
-  // `armed_epics` presence table. v1 shows EXPLICIT-armed only; the
-  // dep-pulled-in/effective-set view is a documented future enhancement.
+  // The explicitly-armed epic ids, sourced from the `armed_epics` presence
+  // table.
   armedEpics: string[];
 }
 
 /**
- * Render the persistent banner pill from viewer state: the play/pause pill,
- * the fn-751 mode suffix, the fn-725 concurrency-cap suffix, and (in `armed`
- * mode) the armed-epic count. `[playing] · yolo · max 3` in yolo mode;
- * `[playing] · armed · 2 armed · max ∞` with two armed epics. The
- * empty-armed-set-in-armed-mode case renders DISTINCTLY as
- * `[playing] · armed · nothing armed` so idle-by-design (armed mode with no
- * armed epics dispatches nothing) is never mistaken for a broken autopilot.
+ * Render the persistent banner pill: the play/pause pill, the mode suffix, the
+ * concurrency-cap suffix, and (in `armed` mode) the armed-epic count.
+ * `[playing] · yolo · max 3` in yolo mode; `[playing] · armed · 2 armed · max
+ * ∞` with two armed epics. The empty-armed-set-in-armed-mode case renders
+ * DISTINCTLY as `[playing] · armed · nothing armed` so idle-by-design is never
+ * mistaken for a broken autopilot.
  *
- * Pure — exported for tests. Mode + armed count are socket-sourced (via
- * `projectAutopilotMode` / `projectArmedEpics`); the cap via
- * `projectMaxConcurrentJobs`. The viewer never reads config.
+ * Pure — exported for tests. All values are socket-sourced; the viewer never
+ * reads config.
  */
 export function autopilotBannerLabel(state: {
   paused: boolean;
@@ -766,41 +683,28 @@ async function runViewer(
   const state: ViewerState = {
     snap: null,
     failed: [],
-    // fn-667: seed `true` matches the daemon's boots-paused safety default
-    // — the same value the boot-append re-arm folded into
-    // `autopilot_state.paused` before the server worker spawned. As soon
-    // as the `autopilot_state` subscribe below produces its first `result`
-    // frame, `state.paused` is overwritten with the real folded value
-    // (`row.paused === 1`), so this seed is only ever visible for the
-    // sub-ms window between viewer launch and the first subscribe edge.
+    // Seed `true` to match the daemon's boots-paused safety default; the first
+    // `autopilot_state` subscribe edge overwrites it with the folded value.
     paused: true,
-    // fn-725: seed `null` (= unlimited) — the safe default before the
-    // `autopilot_state` subscribe edge lands the real folded cap. Sourced
-    // ONLY over the socket; the viewer never reads config.yaml.
+    // Seed `null` (= unlimited) until the `autopilot_state` edge lands the cap.
     maxConcurrentJobs: null,
-    // fn-751: seed `'yolo'` (the work-everything default) until the
-    // `autopilot_state` subscribe edge lands the real folded mode.
+    // Seed `'yolo'` (the work-everything default) until the edge lands the mode.
     mode: "yolo",
-    // fn-751: seed empty until the `armed_epics` subscribe edge lands.
+    // Seed empty until the `armed_epics` subscribe edge lands.
     armedEpics: [],
   };
 
   const view = createViewShell<ViewerState>({
     script: "autopilot",
     title: "autopilot",
-    // fn-772 snapshot branch: autopilot folds FOUR streams — readiness,
-    // dispatch_failures, autopilot_state (paused/mode/cap), and armed_epics
-    // — so `streamCount: 4`. The latch holds the snapshot until ALL FOUR
-    // report (readiness via the auto-report in `view.emit`, the other three
-    // via `reportSnapshotStream` below), so the captured frame reflects the
-    // FOLDED mode/armed/failed state rather than the seed values. ALL FOUR
-    // handles are disposed before exit (mirrors installSigintHandler's
-    // teardown fan-out).
+    // Snapshot: autopilot folds FOUR streams — readiness, dispatch_failures,
+    // autopilot_state (paused/mode/cap), and armed_epics. The latch holds the
+    // snapshot until ALL FOUR report (readiness auto-reports via `view.emit`,
+    // the other three via `reportSnapshotStream` below) so the captured frame
+    // reflects the FOLDED state rather than the seed values.
     mode: mode === "snapshot" ? "snapshot" : "live",
     streamCount: 4,
     ...(timeoutMs === undefined ? {} : { timeoutMs }),
-    // fn-751: the banner derives mode + armed-count from the live `state`
-    // (the armed count is the explicit-armed list length).
     persistentBannerPill: () =>
       autopilotBannerLabel({
         paused: state.paused,
@@ -809,10 +713,7 @@ async function runViewer(
         armedCount: state.armedEpics.length,
       }),
     renderBody: (snap) => {
-      // The view-shell's TSnap is our own `ViewerState`; we ignore the
-      // arg (`snap === state` because we pass it through `view.emit`)
-      // and pull from the live `state` reference so a `failed` update
-      // that arrives between snapshots can still trigger a body change.
+      // The view-shell's TSnap is our own `ViewerState` (`snap === state`).
       const current = snap.snap === null ? [] : buildCurrentRows(snap.snap);
       const dependencies =
         snap.snap === null ? [] : renderDependencyGraph(snap.snap);
@@ -822,7 +723,6 @@ async function runViewer(
           dependencies,
           failed: snap.failed,
           paused: snap.paused,
-          // fn-751: the explicitly-armed epics (v1 lists explicit-armed only).
           armed: snap.armedEpics,
         }),
         stateJson: {
@@ -837,9 +737,6 @@ async function runViewer(
     },
   });
 
-  // fn-751: derive the banner state from the live `ViewerState` — mode +
-  // armed-count ride alongside paused + cap. The armed COUNT comes from the
-  // explicit-armed list length.
   const bannerState = (): {
     paused: boolean;
     maxConcurrentJobs: number | null;
@@ -853,19 +750,15 @@ async function runViewer(
   });
 
   // Seed the banner immediately so the human sees `[paused] · yolo · max ∞`
-  // before the first snapshot lands — same shape as board's persistent-pill
-  // restore pattern.
+  // before the first snapshot lands.
   view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
 
-  // fn-772: per-secondary-stream one-shot snapshot-latch reports. The
-  // readiness stream auto-reports via `view.emit` (the first emit); the
-  // three `subscribeCollection` streams each report their FIRST `onRows`
-  // exactly once so `streamCount: 4` is satisfied only when ALL FOUR have
-  // folded. The guards keep a re-fired collection edge from over-reporting.
-  // CRITICAL: report on the FIRST `onRows` regardless of row contents — an
-  // empty `result` (e.g. `autopilot_state` before the singleton folds) is
-  // still that stream's first frame, so the latch must count it or the
-  // snapshot hangs until timeout. Inert in live mode.
+  // Per-secondary-stream one-shot snapshot-latch reports. The readiness stream
+  // auto-reports via `view.emit`; the three `subscribeCollection` streams each
+  // report their FIRST `onRows` exactly once. CRITICAL: report on the first
+  // `onRows` regardless of row contents — an empty `result` is still that
+  // stream's first frame, so the latch must count it or the snapshot hangs
+  // until timeout. Inert in live mode.
   let failuresStreamReported = false;
   let pausedStreamReported = false;
   let armedStreamReported = false;
@@ -895,23 +788,18 @@ async function runViewer(
     onLifecycle: view.emitLifecycle,
   });
 
-  // fn-667: subscribe the singleton `autopilot_state` projection so the
-  // banner reflects the daemon's real paused/playing flag (pre-fn-667 the
-  // banner was hardcoded `true` because there was no read surface for the
-  // in-memory flag). The collection is keyed on `id = 1` (singleton); we
-  // expect at most one row. Defensive on empty/missing rows: if the row
-  // hasn't folded yet (sub-ms boot race) `rows` is empty and we leave
-  // the seed `state.paused` untouched. Re-subscribes cleanly on socket
-  // drop via the shared `subscribeCollection` reconnect contract.
+  // Subscribe the singleton `autopilot_state` projection so the banner reflects
+  // the daemon's real paused/playing flag. Keyed on `id = 1`; at most one row.
+  // If the row hasn't folded yet (sub-ms boot race) `rows` is empty and the
+  // seed `state.paused` is left untouched.
   const pausedHandle = subscribeCollection({
     sockPath,
     idPrefix: "autopilot",
     collection: "autopilot_state",
     onRows: (rows) => {
-      // fn-772: report this stream's first frame to the snapshot latch
-      // BEFORE the empty-rows early-return — an empty `result` is still the
-      // `autopilot_state` stream's first delivered frame, so the latch must
-      // count it or a freshly-booted daemon (singleton not yet folded)
+      // Report this stream's first frame to the snapshot latch BEFORE the
+      // empty-rows early-return — an empty `result` is still the stream's first
+      // delivered frame, so the latch must count it or a freshly-booted daemon
       // hangs the snapshot until timeout. Once per stream.
       if (!pausedStreamReported) {
         pausedStreamReported = true;
@@ -919,21 +807,14 @@ async function runViewer(
       }
       const paused = projectAutopilotPaused(rows);
       if (paused === null) {
-        // Singleton hasn't folded yet (sub-ms boot race) — empty row set.
-        // Leave the seed `state.paused` / `state.maxConcurrentJobs`
-        // untouched and wait for the next edge. (`projectMaxConcurrentJobs`
-        // would also return `null` here, so there is nothing real to fold.)
+        // Singleton not yet folded — leave the seeds untouched and wait.
         return;
       }
       state.paused = paused;
-      // fn-725: the cap rides the SAME singleton wire row as `paused` — fold
-      // it on every edge so a config-change-then-restart's re-minted cap and
-      // a live pause/play toggle both land on the banner. `null` = unlimited.
+      // The cap + mode ride the SAME singleton wire row as `paused` — fold them
+      // on every edge so a config-change-then-restart and a live toggle both
+      // land on the banner.
       state.maxConcurrentJobs = projectMaxConcurrentJobs(rows);
-      // fn-751: the mode rides the SAME singleton row — fold it on every edge.
-      // `projectAutopilotMode` returns `null` only on an empty row set (already
-      // handled by the `paused === null` early-return above), so here it always
-      // yields a concrete `'yolo' | 'armed'`.
       state.mode = projectAutopilotMode(rows) ?? "yolo";
       view.liveShell.setStatus(autopilotBannerLabel(bannerState()));
       view.emit(state);
@@ -941,10 +822,9 @@ async function runViewer(
     onLifecycle: view.emitLifecycle,
   });
 
-  // fn-751: subscribe the `armed_epics` presence table so the banner's
-  // armed-count + the `--- armed ---` section reflect the live folded set.
-  // A row's presence means the epic is explicitly armed. Re-subscribes cleanly
-  // on socket drop via the shared reconnect contract.
+  // Subscribe the `armed_epics` presence table so the banner's armed-count +
+  // the `--- armed ---` section reflect the live folded set. A row's presence
+  // means the epic is explicitly armed.
   const armedHandle = subscribeCollection({
     sockPath,
     idPrefix: "autopilot",
@@ -961,10 +841,9 @@ async function runViewer(
     onLifecycle: view.emitLifecycle,
   });
 
-  // fn-772: dispose ALL FOUR subscription handles before exit — wiring only
-  // the primary leaks the other three sockets (Bun's "socket closed with
-  // buffered data" warning). The same fan-out feeds both the live SIGINT
-  // teardown and the snapshot exit path.
+  // Dispose ALL FOUR subscription handles before exit — disposing only the
+  // primary leaks the other three sockets. The same fan-out feeds both the
+  // live SIGINT teardown and the snapshot exit path.
   const disposeAll = (): void => {
     readinessHandle.dispose();
     failuresHandle.dispose();
@@ -1073,9 +952,8 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   if (subcommand === "mode") {
-    // fn-751: `mode <yolo|armed>` → set_autopilot_mode. Validate the enum
-    // CLI-side so a typo dies with a clear message before the round-trip (the
-    // server also rejects, but a local guard is friendlier).
+    // Validate the enum CLI-side so a typo dies with a clear message before the
+    // round-trip (the server also rejects, but a local guard is friendlier).
     if (rest.length !== 1) {
       die(
         `'mode' takes exactly one positional <yolo|armed> (got ${rest.length}); pass --help for usage.`,
@@ -1091,8 +969,6 @@ export async function main(argv: string[]): Promise<void> {
   }
 
   if (subcommand === "arm" || subcommand === "disarm") {
-    // fn-751: `arm <epic-id>` / `disarm <epic-id>` → set_epic_armed with
-    // armed true/false.
     if (rest.length !== 1) {
       die(
         `'${subcommand}' takes exactly one positional <epic-id> (got ${rest.length}); pass --help for usage.`,
@@ -1117,5 +993,5 @@ export async function main(argv: string[]): Promise<void> {
 }
 
 // `import.meta.main` guard neutralized — `cli/keeper.ts` is the canonical
-// entry. Direct `bun cli/autopilot.ts` invocation would bypass the
-// dispatcher's arg-pruning.
+// entry; direct `bun cli/autopilot.ts` invocation bypasses the dispatcher's
+// arg-pruning.
