@@ -30,5 +30,5 @@ Over-trimming Test isolation breaks the README pointer and drops genuinely load-
 - [ ] Done summary reports lines and chars deleted
 
 ## Done summary
-
+Compressed CLAUDE.md from 355 to 130 lines (-225 lines, -15642 chars), deleting README-owned narratives and stripping all fn-NNN ids and incident dates while keeping load-bearing constraints present-tense. Fixed README's dangling 'snapshot paradox' cross-ref; AGENTS.md symlink intact, all CLAUDE.md cross-refs resolve.
 ## Evidence
