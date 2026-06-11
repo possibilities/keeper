@@ -58,5 +58,5 @@ Unit (db.test.ts or a new fast-tier file): transient-then-success open (mock/stu
 - [ ] WorkerSpy/ALL_WORKERS tests still pin 13; bun run test:full green
 
 ## Done summary
-
+Added openDb bootRetry knob (bounded transient-boot-class retry, fresh Database per attempt, sync backoff, rethrows after exhaustion) + isTransientBootOpenError classifier private to openDb; swept prepareStmts:false + bootRetry across all 12 worker openDb sites (main and events-ingest untouched). Added db.test.ts coverage; test:full green.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "OpenDb boot retry and stmts sweep",
-  "updated_at": "2026-06-11T12:44:18.495958Z"
+  "updated_at": "2026-06-11T14:25:21.194717Z",
+  "worker_done_at": "2026-06-11T14:25:21.194717Z"
 }
