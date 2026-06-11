@@ -85,5 +85,5 @@ deterministic `tsCounter`):
 - [ ] Reducer tests cover stamp / hold / re-stamp-on-restart / no-restamp-mid-run / suppression / re-fold determinism (incl. NULL→NULL); `bun run test:full` green.
 
 ## Done summary
-
+Added the folded jobs.active_since REAL column (schema v64→v65, no backfill) stamped on the rising edge into 'working' in the UserPromptSubmit arm, wired through the JOBS collections descriptor and the top-level Job type; keeper-py whitelist gains 65. Reducer tests cover stamp/hold/re-stamp-on-restart/no-restamp-mid-run/suppression/re-fold-determinism (incl. NULL→NULL).
 ## Evidence
