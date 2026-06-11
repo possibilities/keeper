@@ -30,5 +30,5 @@ Help text may be asserted in tests (grep first).
 - [ ] Tests green; Done summary reports lines/chars deleted
 
 ## Done summary
-
+Slimmed keeper board --help from 180 lines / 10968 chars to 26 lines / 1249 chars: kept usage, flags, TUI keys, and 3 examples; deleted the long-form rendering reference (already duplicated in README's 'keeper board' section) and replaced it with a README pointer. Deleted ~154 lines / ~9700 chars.
 ## Evidence
