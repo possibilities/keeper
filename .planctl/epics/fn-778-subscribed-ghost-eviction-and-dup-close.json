@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-778-subscribed-ghost-eviction-and-dup-close",
   "bundles": [],
+  "closer_done_at": "2026-06-11T03:10:05.562785Z",
   "created_at": "2026-06-10T20:53:20.268523Z",
   "depends_on_epics": [],
   "id": "fn-778-subscribed-ghost-eviction-and-dup-close",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": true,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Subscribed ghost eviction and dup close",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-10T23:05:48.387189Z"
+  "updated_at": "2026-06-11T03:10:05.562785Z"
 }
