@@ -1,9 +1,9 @@
 /**
  * Renderer unit tests for `cli/builds.ts` — the pure, exported row layout
  * the live shell and snapshot path both consume. One case per buildbot
- * result code (0-6) plus the synthetic RUNNING state and a stale row, so a
- * regression in the status mapping or the age/staleness affordance fails
- * here in the fast tier rather than only end-to-end.
+ * result code (0-6) plus the synthetic RUNNING state, so a regression in
+ * the status mapping or the age rendering fails here in the fast tier
+ * rather than only end-to-end.
  *
  * The view-shell / CLI process path (mode resolution, dispose-then-exit,
  * trailer shape) is shared with `cli/git.ts` and exercised slow-tier in
@@ -29,7 +29,7 @@ import {
 const NOW_MS = 1_700_000_000_000;
 const NOW_S = NOW_MS / 1000;
 
-/** A builds row a few seconds old (fresh — never stale). */
+/** A builds row a few seconds old. */
 function freshRow(overrides: Record<string, unknown>): Record<string, unknown> {
   return {
     project: "alpha",
@@ -86,10 +86,9 @@ test("renderRow: SUCCESS row carries project, build number, label, state, age", 
   expect(line).toContain("SUCCESS");
   expect(line).toContain("build successful");
   expect(line).toContain("5s");
-  expect(line).not.toContain("(stale)");
 });
 
-test("renderRow: RUNNING row renders distinctly and is not stale-by-status", () => {
+test("renderRow: RUNNING row renders distinctly", () => {
   const line = renderRow(
     freshRow({ results: null, complete: 0, state_string: "building" }),
     NOW_MS,
@@ -108,11 +107,9 @@ test("renderRow: each result code produces a distinct rendered line", () => {
   expect(new Set(lines).size).toBe(8);
 });
 
-test("renderRow: a row older than 3x the poll cadence is marked (stale)", () => {
-  // Poll cadence ~15s; 3x = 45s. 120s old → stale.
-  const stale = renderRow(freshRow({ updated_at: NOW_S - 120 }), NOW_MS);
-  expect(stale).toContain("(stale)");
-  expect(stale).toContain("2m");
+test("renderRow: an older row renders its age in minutes", () => {
+  const line = renderRow(freshRow({ updated_at: NOW_S - 120 }), NOW_MS);
+  expect(line).toContain("2m");
 });
 
 test("renderRow: a missing build number renders #? not a crash", () => {

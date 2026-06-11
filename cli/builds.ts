@@ -19,8 +19,7 @@
  * 2 FAILURE, 3 SKIPPED, 4 EXCEPTION, 5 RETRY, 6 CANCELLED). A NULL
  * `results` with `complete=0` is a RUNNING build — a documented state, not
  * an error. Age is derived client-side from `updated_at` (cosmetic render
- * concern, never folded); rows older than ~3x the poll cadence dim as a
- * silent-staleness affordance.
+ * concern, never folded).
  *
  * Connection lifecycle is owned by `subscribeCollection` in
  * `src/readiness-client.ts` (same reconnect / coalesce / dispose contract
@@ -35,15 +34,6 @@ import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
 import { createViewShell } from "../src/view-shell";
 
 const COLLECTION = "builds";
-
-/**
- * Poll cadence of the builds-worker, in seconds (~15s). Rows whose age
- * exceeds `STALE_MULTIPLIER` times this are marked stale — the worker
- * should have refreshed `updated_at` within a few cadences, so a row that
- * hasn't is a silent-staleness signal (buildbot unreachable, daemon down).
- */
-const POLL_CADENCE_S = 15;
-const STALE_MULTIPLIER = 3;
 
 const HELP = `keeper builds — live buildbot status frames over the keeper subscribe server
 
@@ -64,9 +54,7 @@ Rows show one registered buildbot builder: project name, a status glyph +
 label (SUCCESS / WARNINGS / FAILURE / SKIPPED / EXCEPTION / RETRY /
 CANCELLED / RUNNING), the latest build number, the build state string, and
 an age. RUNNING (\`results\` NULL, build in flight) is a normal state, not an
-error. A row that has not refreshed within ~${STALE_MULTIPLIER}x the poll
-cadence is marked \`(stale)\` — usually buildbot unreachable or the daemon
-down. An empty table means no builds yet — is \`buildbot_url\` configured?
+error. An empty table means no builds yet — is \`buildbot_url\` configured?
 `;
 
 /**
@@ -133,12 +121,11 @@ function seg(v: unknown): string {
 /**
  * Render one builds row into a single display line:
  *
- *   <glyph> <project>  #<build_number>  <LABEL>  <state_string>  <age>[ (stale)]
+ *   <glyph> <project>  #<build_number>  <LABEL>  <state_string>  <age>
  *
  * `now` is injected (the caller passes `Date.now()`) so the renderer stays
  * a pure function for unit tests — wall-clock age is a cosmetic render
- * concern, never folded. A row whose age exceeds `STALE_MULTIPLIER * the
- * poll cadence` gets a trailing `(stale)` marker.
+ * concern, never folded.
  */
 export function renderRow(row: Record<string, unknown>, now: number): string {
   const status = resolveStatus(row);
@@ -152,8 +139,6 @@ export function renderRow(row: Record<string, unknown>, now: number): string {
   // `event.ts`); `now` is a ms epoch, so scale before differencing.
   const ageMs = updatedAt > 0 ? now - updatedAt * 1000 : Number.NaN;
   const age = formatAge(ageMs);
-  const stale =
-    Number.isFinite(ageMs) && ageMs > STALE_MULTIPLIER * POLL_CADENCE_S * 1000;
 
   const parts = [
     status.glyph,
@@ -163,8 +148,7 @@ export function renderRow(row: Record<string, unknown>, now: number): string {
     stateString,
     age,
   ].filter((p) => p.length > 0);
-  const line = parts.join("  ");
-  return stale ? `${line}  (stale)` : line;
+  return parts.join("  ");
 }
 
 /**

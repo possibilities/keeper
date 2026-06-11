@@ -27,8 +27,8 @@
  * Bun/macOS, oven-sh/bun#7512) with `clearTimeout` in a `finally`, combined with
  * the worker's shutdown signal via `AbortSignal.any` so shutdown aborts an
  * in-flight request; the shutdown handler also clears the pending timer. Fixed
- * cadence, no backoff, no circuit breaker — the silent-staleness semantics mean
- * we keep polling indefinitely and the TUI renders age.
+ * cadence, no backoff, no circuit breaker — failures degrade silently, we keep
+ * polling indefinitely, and the TUI renders age.
  *
  * **Transient-error containment (the keystone safety property).** EVERY transient
  * failure — fetch rejection, non-2xx, non-JSON 200 body, a partial cycle — is
