@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Test dash shell teardown",
-  "updated_at": "2026-06-11T04:04:30.213665Z"
+  "updated_at": "2026-06-11T04:59:03.093124Z",
+  "worker_done_at": "2026-06-11T04:59:03.093124Z"
 }

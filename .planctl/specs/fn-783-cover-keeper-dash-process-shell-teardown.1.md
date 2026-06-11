@@ -28,5 +28,5 @@ exit/teardown theme.
 - [ ] New tests are wired into the correct tier per the repo's two-tier convention (and the `test:opentui` / fast-tier ignore lists if they touch the OpenTUI materializer).
 
 ## Done summary
-
+Added test/dash-shell.test.ts covering createDashApp teardown discipline (destroy-before-exit, idempotent tail, socket+trigger disposal, onFatal exit-1+stderr routing) via new injectable buildRenderer/connect/exit/onProcess seams, plus behavioral + byte-parity coverage of the dash armViewerExitTriggers fork. Wired into the test:opentui serial chain and fast-tier ignore lists.
 ## Evidence
