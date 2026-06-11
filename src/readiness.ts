@@ -339,9 +339,17 @@ export function computeReadiness(
   // by the reducer's forward-stamp + reverse fan-out), so the readiness pass
   // no longer resolves cross-epic deps live.
   const taskById = new Map<string, Task>();
+  // epic_id → Epic, so predicate 9's `satisfied` branch can probe the upstream's
+  // raw liveness (see `epicHasLiveCloseScopeWork`). A `satisfied` projection
+  // entry means the upstream is status-done, but its closer may still be winding
+  // down — the dependent must stay `blocked:dep-on-epic` until the upstream is
+  // also idle, so the lookup is by raw epic state, never the upstream's verdict
+  // (which may not be computed yet for a forward-referenced upstream).
+  const epicsById = new Map<string, Epic>();
   const epicsArr: Epic[] = [];
   for (const epic of epics) {
     epicsArr.push(epic);
+    epicsById.set(epic.epic_id, epic);
     for (const task of epic.tasks) {
       taskById.set(task.task_id, task);
     }
@@ -368,6 +376,7 @@ export function computeReadiness(
         subRunningByJobId,
         perTask,
         perCloseRow,
+        epicsById,
         gitStatusByProjectDir,
         now,
         pendingKeys,
@@ -445,6 +454,12 @@ function evaluateTask(
   // Unused: predicate 9 reads `epic.resolved_epic_deps` instead of resolving
   // live, so it no longer touches `perCloseRow`. Kept for call-site symmetry.
   _perCloseRow: Map<string, Verdict>,
+  // epic_id → Epic, so predicate 9's `satisfied` branch can probe the upstream's
+  // raw close-scope liveness via `epicHasLiveCloseScopeWork`. Read by RAW epic
+  // state, never the upstream's verdict — a forward-referenced upstream has no
+  // verdict computed yet, so gating on it would make the answer board-sort
+  // dependent.
+  epicsById: Map<string, Epic>,
   // Unused: the sole reader was the deleted predicate 6.5. Kept for call-site
   // symmetry with `computeReadiness`'s public surface.
   _gitStatusByProjectDir: Map<
@@ -583,12 +598,25 @@ function evaluateTask(
 
   // 9. dep-on-epic — task-side rollup of the parent epic's dep list, read off
   // `epic.resolved_epic_deps`. Each {@link ResolvedEpicDep}'s tri-state `state`:
-  //   - `satisfied` — upstream done; skip.
+  //   - `satisfied` — upstream status-done. Liveness-gated: a `satisfied`
+  //     stamp means the upstream's status flipped done, but its closer may
+  //     still be winding down. When the resolved upstream is IN-SNAPSHOT and
+  //     still has live close-scope work (`epicHasLiveCloseScopeWork`), the
+  //     dependent stays `blocked:dep-on-epic` with the same payload a
+  //     `blocked-incomplete` upstream produces — done-AND-idle is the bar.
+  //     EVERY satisfied entry is checked, not just the first. An ABSENT
+  //     upstream (cross-project, out-of-snapshot, or null `resolved_epic_id`)
+  //     keeps today's skip: only status settled it, no liveness to read.
   //   - `blocked-incomplete` — upstream resolved but NOT done. Emit
   //     `dep-on-epic` (amber) with the resolved upstream id + cross-project
   //     basename. Payload shape autopilot's consumer reads byte-for-byte.
   //   - `dangling` — no resolution. Emit `dep-on-epic-dangling` (red) with the
   //     raw `dep_token`.
+  //
+  // The reducer's `satisfied` stamp and `epic-deps.ts` resolution stay
+  // status-only by the folds-never-probe-liveness invariant; the liveness gate
+  // lives HERE, read-time, so a re-fold reproduces byte-identical projection
+  // rows.
   //
   // `null` short-circuits — a fresh-row "not yet computed" state. The reducer
   // stamps the column in the same fold as the EpicSnapshot write, so
@@ -596,6 +624,23 @@ function evaluateTask(
   if (epic.resolved_epic_deps !== null) {
     for (const dep of epic.resolved_epic_deps) {
       if (dep.state === "satisfied") {
+        const upstream =
+          dep.resolved_epic_id !== null
+            ? epicsById.get(dep.resolved_epic_id)
+            : undefined;
+        if (
+          upstream !== undefined &&
+          epicHasLiveCloseScopeWork(upstream, subRunningByJobId, now)
+        ) {
+          return {
+            tag: "blocked",
+            reason: {
+              kind: "dep-on-epic",
+              upstream: dep.resolved_epic_id ?? dep.dep_token,
+              cross_project: dep.cross_project ? dep.project_basename : null,
+            },
+          };
+        }
         continue;
       }
       if (dep.state === "dangling") {
@@ -683,9 +728,29 @@ function evaluateCloseRow(
     matchedPendingKeys.add(`close::${epic.epic_id}`);
   }
 
-  // 1. terminal-completed (close-row variant) — completes on
-  // `epic.status==="done"` alone.
-  if (epic.status === "done") {
+  // 1. terminal-completed (close-row variant). `epic.status==="done"` is the
+  // administrative signal (planctl stamped the epic done), which can race ahead
+  // of the closer agent and its sub-agents winding down. The three close-scope
+  // liveness clauses hold the verdict off `completed` until the closer is
+  // genuinely idle — a done-but-live close row falls through to predicate
+  // 5/6/6.6's `running:*`, so `isLiveWorkOccupant`/`isRootOccupant` keep the
+  // per-epic AND per-root mutexes held while the closer releases them, unblocks
+  // its dep-on-epic dependents, and lets the completion reap fire against a
+  // dead pane. The pooled CLOSE-scope booleans match predicates 5/6/6.6 exactly
+  // (epic-level close jobs + the completed-task backstop), so the guard and the
+  // fall-through agree on scope; the stale-split helpers stay out of this gate.
+  //
+  // Crash robustness: a never-idle closer rides the existing backstops — the
+  // exit-watcher `Killed` arm (main close job), the monitor release ceiling,
+  // and the sub-agent-stale pill + autopilot pause/manual replay. No TTL escape
+  // hatch here, deliberately: correctness over throughput, mirroring the task
+  // path.
+  if (
+    epic.status === "done" &&
+    !anyEmbeddedJobWorking(epic.jobs) &&
+    !closeRowHasRunningSubagent(epic, perTask, subRunningByJobId) &&
+    !closeRowMonitorOccupies(epic, perTask, now)
+  ) {
     return { tag: "completed" };
   }
 
@@ -762,9 +827,11 @@ function evaluateCloseRow(
     return { tag: "running", reason: { kind: "monitor-running" } };
   }
 
-  // 8/9. dep-on-task / dep-on-epic — not applicable to the close row (it has
-  // no direct deps; predicate 10 synthesizes task deps from the epic's tasks,
-  // and cross-epic deps cascade transitively through the tasks).
+  // 8/9. dep-on-task / dep-on-epic — not applicable to the close row: it has
+  // no direct deps, predicate 10 synthesizes task deps from the epic's tasks,
+  // and a downstream epic's dep-on-THIS-epic is enforced on the DOWNSTREAM's
+  // task path (evaluateTask predicate 9), where the live-aware gate reads this
+  // epic's raw close-scope liveness via `epicHasLiveCloseScopeWork`.
 
   // 9.5. epic-no-tasks — the epic has ZERO tasks, so predicate 10's loop is
   // vacuously true and the close row would fall through to `ready` and
@@ -1484,6 +1551,46 @@ function allCloseRowMonitorsAreStale(
     }
   }
   return true;
+}
+
+/**
+ * Order-independent close-scope liveness pooler for predicate 9's `satisfied`
+ * gate. Returns `true` iff the upstream — already status-done, so this is the
+ * closer winding down — still carries ANY live close-scope work: an
+ * epic-level OR task-level embedded job `working`, ANY running sub-agent under
+ * those jobs, or ANY live monitor lease (within the hard
+ * {@link MONITOR_RELEASE_SEC} ceiling).
+ *
+ * DELIBERATELY pools RAW epic state across `epic.jobs` AND every `task.jobs`
+ * unconditionally — NOT gated on `perTask` completed tags and NOT reading
+ * `perCloseRow`. A forward-referenced upstream (a consumer epic sorts earlier
+ * in `epicsArr`) has no verdicts computed yet; gating on them would make the
+ * answer depend on board sort order and silently fall back to satisfied for
+ * exactly that subset. For a done upstream, a live job ANYWHERE is wind-down
+ * and must hold the dependent.
+ */
+function epicHasLiveCloseScopeWork(
+  upstream: Epic,
+  subRunningByJobId: Map<string, SubagentInvocation[]>,
+  now: number,
+): boolean {
+  if (
+    anyEmbeddedJobWorking(upstream.jobs) ||
+    anyEmbeddedJobHasRunningSubagent(upstream.jobs, subRunningByJobId) ||
+    embeddedMonitorOccupies(upstream.jobs, now)
+  ) {
+    return true;
+  }
+  for (const task of upstream.tasks) {
+    if (
+      anyEmbeddedJobWorking(task.jobs) ||
+      anyEmbeddedJobHasRunningSubagent(task.jobs, subRunningByJobId) ||
+      embeddedMonitorOccupies(task.jobs, now)
+    ) {
+      return true;
+    }
+  }
+  return false;
 }
 
 // ---------------------------------------------------------------------------

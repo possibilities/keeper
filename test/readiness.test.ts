@@ -535,6 +535,357 @@ test("fn-719: live worker monitor in epic A occupies the root, demotes a same-ro
 });
 
 // ---------------------------------------------------------------------------
+// fn-779: close-row terminal-completed liveness gate. A `status:done` close row
+// only collapses to `completed` once its closer is idle — same three
+// close-scope clauses the task path uses (working epic-level close job, running
+// sub-agent, live monitor lease). A done-but-live close row falls through to
+// predicate 5/6/6.6's `running:*`, so it keeps occupying the per-epic AND
+// per-root mutexes while the closer winds down. Close-row twins of the fn-671 /
+// fn-719 task-path liveness tests, built with `plan_verb:"close"` epic-level
+// jobs and asserted via `snap.perCloseRow`.
+// ---------------------------------------------------------------------------
+
+test("fn-779 close-row: status:done + working close job → running:job-running (not completed)", () => {
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "job-running" }),
+  );
+});
+
+test("fn-779 close-row: status:done + stopped close job + running sub-agent → running:sub-agent-running", () => {
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+      }),
+    ],
+  });
+  const subs = [makeSub({ job_id: "closer-1", status: "running" })];
+  const snap = run([epic], new Map(), subs);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "sub-agent-running" }),
+  );
+});
+
+test("fn-779 close-row: status:done + stale running sub-agent → running:sub-agent-stale (runWithNow)", () => {
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+      }),
+    ],
+  });
+  const subs = [makeSub({ job_id: "closer-1", status: "running", ts: 1000 })];
+  // now=1200: age=200 > SUBAGENT_STALENESS_SEC=120 → stale, still occupying.
+  const snap = runWithNow([epic], subs, 1200);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "sub-agent-stale" }),
+  );
+});
+
+test("fn-779 close-row: status:done + live worker monitor → running:monitor-running (runWithNow)", () => {
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+        has_live_worker_monitor: true,
+        updated_at: 1000,
+      }),
+    ],
+  });
+  // now=1100: age=100 < MONITOR_STALENESS_SEC=600 → fresh, monitor-running.
+  const snap = runWithNow([epic], [], 1100);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
+    running({ kind: "monitor-running" }),
+  );
+});
+
+test("fn-779 close-row: status:done + idle closer → completed (clean collapse)", () => {
+  const epic = makeEpic({
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "stopped",
+      }),
+    ],
+  });
+  const snap = run([epic]);
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual({ tag: "completed" });
+});
+
+test("fn-779 close-row: status:done + working close job occupies the per-root mutex (demotes same-root sibling epic's ready task)", () => {
+  // The done-but-live close row is a `running` verdict → root occupant. A
+  // sibling epic's ready task on the same project_dir is demoted, proving the
+  // mutex stays held while the closer winds down.
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    project_dir: "/repo",
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-1",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const e2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" })],
+  });
+  const snap = run([e1, e2]);
+  expect(snap.perCloseRow.get("fn-1-foo")).toEqual(
+    running({ kind: "job-running" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+// ---------------------------------------------------------------------------
+// fn-779: predicate-9 `satisfied` liveness gate. A downstream task whose
+// `resolved_epic_deps` entry reads `satisfied` stays `blocked:dep-on-epic`
+// while the IN-SNAPSHOT upstream still has live close-scope work. Out-of-
+// snapshot / cross-project / null-resolution upstreams keep today's skip. The
+// helper pools RAW upstream state, so the answer is independent of where the
+// upstream sorts relative to the consumer in the input array.
+// ---------------------------------------------------------------------------
+
+test("fn-779 predicate 9: satisfied dep on an in-snapshot, live-closing upstream → blocked:dep-on-epic", () => {
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-2",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "keeper",
+        cross_project: false,
+        state: "satisfied",
+      }),
+    ],
+  });
+  const snap = run([upstream, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-epic", upstream: "fn-2-bar", cross_project: null }),
+  );
+});
+
+test("fn-779 predicate 9: satisfied dep on an in-snapshot, IDLE upstream → ready", () => {
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-2",
+        plan_verb: "close",
+        state: "stopped",
+      }),
+    ],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "keeper",
+        cross_project: false,
+        state: "satisfied",
+      }),
+    ],
+  });
+  const snap = run([upstream, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("fn-779 predicate 9: satisfied dep, live work on the upstream's TASK-level job → blocked:dep-on-epic (pools task scope)", () => {
+  // The closer's wind-down work landed as a task-level job (not epic-level).
+  // The helper pools `task.jobs` too, so the dependent still holds.
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    status: "done",
+    tasks: [
+      makeTask({
+        task_id: "fn-2-bar.1",
+        worker_phase: "done",
+        jobs: [makeEmbeddedJob({ job_id: "worker-2", state: "working" })],
+      }),
+    ],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "keeper",
+        cross_project: false,
+        state: "satisfied",
+      }),
+    ],
+  });
+  const snap = run([upstream, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-epic", upstream: "fn-2-bar", cross_project: null }),
+  );
+});
+
+test("fn-779 predicate 9: multiple satisfied deps, a LATER one is live → blocked (checks every entry)", () => {
+  const idle = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
+  });
+  const live = makeEpic({
+    epic_id: "fn-3-baz",
+    epic_number: 3,
+    sort_path: "000003",
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-3-baz.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-3",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar", "fn-3-baz"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "keeper",
+        cross_project: false,
+        state: "satisfied",
+      }),
+      makeResolvedDep({
+        dep_token: "fn-3-baz",
+        resolved_epic_id: "fn-3-baz",
+        epic_number: 3,
+        project_basename: "keeper",
+        cross_project: false,
+        state: "satisfied",
+      }),
+    ],
+  });
+  const snap = run([idle, live, consumer]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-epic", upstream: "fn-3-baz", cross_project: null }),
+  );
+});
+
+test("fn-779 predicate 9: forward-reference order (consumer BEFORE live upstream in the input array) → still blocked (order-independent)", () => {
+  // The consumer epic sorts FIRST in the input array, so when its task path
+  // runs the upstream's verdict isn't computed yet. The gate reads RAW upstream
+  // state, not a verdict, so the answer is identical regardless of order.
+  const upstream = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    status: "done",
+    tasks: [makeTask({ task_id: "fn-2-bar.1", worker_phase: "done" })],
+    jobs: [
+      makeEmbeddedJob({
+        job_id: "closer-2",
+        plan_verb: "close",
+        state: "working",
+      }),
+    ],
+  });
+  const consumer = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+    depends_on_epics: ["fn-2-bar"],
+    resolved_epic_deps: [
+      makeResolvedDep({
+        dep_token: "fn-2-bar",
+        resolved_epic_id: "fn-2-bar",
+        epic_number: 2,
+        project_basename: "keeper",
+        cross_project: false,
+        state: "satisfied",
+      }),
+    ],
+  });
+  // Consumer first — proves the gate doesn't depend on the upstream's verdict.
+  const snap = run([consumer, upstream]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dep-on-epic", upstream: "fn-2-bar", cross_project: null }),
+  );
+});
+
+// ---------------------------------------------------------------------------
 // fn-770: armed-aware per-root mutex (eligible-priority pass-2)
 // ---------------------------------------------------------------------------
 //

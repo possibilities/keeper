@@ -107,15 +107,20 @@ export function profileNameForUsageId(usageId: string): string {
 }
 
 /**
- * fn-637: dep-satisfaction predicate, identical to `evaluateCloseRow`'s
- * terminal-completed check. A resolved upstream that is completed satisfies
- * the dependency even when it has been pruned from the default-visible page
- * (`default_visible=0`) and supplied to the resolver only via the
- * completed-epics index. Kept as a single helper so the resolver and the
- * close-row never drift on what "done" means.
+ * Resolver-side dep-satisfaction predicate — STATUS-ONLY by the
+ * folds-never-probe-liveness invariant. A resolved upstream whose status is
+ * `"done"` satisfies the dependency for the reducer's `resolved_epic_deps`
+ * stamp, even when the upstream has been pruned from the default-visible page
+ * (`default_visible=0`) and reaches the resolver only via the completed-epics
+ * index.
  *
- * fn-756: collapsed to `status === "done"` alone — the approval enum no
- * longer gates completion, matching `evaluateCloseRow`'s predicate 1.
+ * This INTENTIONALLY diverges from `evaluateCloseRow`'s terminal-completed
+ * check: the resolver stamps `satisfied` on status alone, but a close row only
+ * renders `completed` once it is status-done AND idle. The readiness pass
+ * re-narrows a `satisfied` stamp at read time — predicate 9's
+ * `epicHasLiveCloseScopeWork` gate keeps a dependent blocked while the
+ * status-done upstream's closer is still winding down — so the fold stays pure
+ * and a re-fold reproduces byte-identical rows.
  */
 export function epicIsCompleted(epic: Epic): boolean {
   return epic.status === "done";
