@@ -5552,16 +5552,6 @@ function projectJobsRow(db: Database, event: Event): void {
                            WHEN ? IS NOT NULL AND ? != pid THEN NULL
                            ELSE start_time
                          END,
-                         -- Schema v65: stamp the unified-timeline recency key on
-                         -- the rising edge into 'working' only. SQLite evaluates
-                         -- a SET RHS against pre-update row values, so the state
-                         -- read here is the OLD state: the stamp re-fires on
-                         -- every stopped/terminal-to-working re-open (genuine
-                         -- restart) and HOLDS (explicit ELSE) when already
-                         -- 'working' — a 2nd prompt mid-run does NOT re-promote.
-                         -- Guard is state != 'working', NOT active_since IS NULL
-                         -- (the IS-NULL form stamps once forever and never
-                         -- re-promotes on restart).
                          active_since = CASE
                            WHEN state != 'working' THEN ?
                            ELSE active_since
