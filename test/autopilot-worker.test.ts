@@ -42,6 +42,7 @@ import {
   type DispatchedAck,
   type DispatchedPayload,
   type DispatchFailedPayload,
+  type DispatchKey,
   DONE_EPICS_REAP_LIMIT,
   FINALIZER_GUARD_S,
   type FoundJob,
@@ -61,6 +62,7 @@ import {
   type ReconcileState,
   reapFloorElapsed,
   reconcile,
+  refreshSuppressionForOpenPending,
   runReconcileCycle,
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
@@ -522,6 +524,25 @@ test("reconcile: paused state suppresses every launch (boots-paused safety)", ()
   const snap = makeSnapshot({ epics: [epic] });
   const state = makeState({ paused: true });
   const decision = reconcile(snap, state, 0);
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-778 boot-pause determinism: an absent workerData.paused boots PAUSED (the `?? true` default)", () => {
+  // The fn-778 boot-pause leg found NO bug: boot-pause is already deterministic.
+  // `main()` sets `state.paused = data.paused ?? true`, and daemon.ts hardcodes
+  // `autopilotPaused = true` + an unconditional `AutopilotPaused{paused:true}` boot
+  // re-arm — so EVERY boot comes up paused. (The 2026-06-10 "came up unpaused"
+  // observation was a human play RPC fired ~2s after the boot re-arm, not a boot
+  // default; see Evidence.) This pins the worker-side half: the `?? true` default
+  // must resolve `undefined`/absent to a PAUSED state that launches nothing, so a
+  // future refactor can't silently flip the boot default to unpaused.
+  // Model `main()`'s `state.paused = data.paused ?? true` against an absent field.
+  const data: { paused?: boolean } = {};
+  const paused = data.paused ?? true;
+  expect(paused).toBe(true);
+  const epic = makeEpic({ tasks: [makeTask({ task_id: "fn-1-foo.1" })] });
+  const snap = makeSnapshot({ epics: [epic] });
+  const decision = reconcile(snap, makeState({ paused }), 0);
   expect(decision.launches).toEqual([]);
 });
 
@@ -1226,6 +1247,161 @@ test("fn-742 runReconcileCycle: a definitive launch failure CLEARS the finalizer
   );
 
   expect(state.finalizerGuard.has("fn-1-foo")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// fn-778 — slow-cold-boot over-dispatch (the dup-close fix)
+//
+// Incident (2026-06-10, UTC): a `close::fn-608…` worker took 317s to emit its
+// first SessionStart (far-tail `claude` cold boot under conn-cap saturation). Its
+// `pending_dispatches` row TTL-expired at ~120s, no `jobs` row had bound, and the
+// cooldown (stamped at dispatch, re-stamped ONCE at the 60s indoubt ceiling →
+// cover-end dispatch+260s) lapsed 2s before the re-dispatch at dispatch+261s. The
+// fix re-anchors the cooldown + finalizer guard each cycle a key still has an OPEN
+// pending row, so suppression tracks the phantom's durable lifetime.
+// ---------------------------------------------------------------------------
+
+test("fn-778 refreshSuppressionForOpenPending: re-stamps the cooldown for an open key", () => {
+  // A key with an open pending row gets its cooldown refreshed to `now` — even
+  // when it was stamped long ago (about to expire under the sweep).
+  const cooldown = new Map<DispatchKey, number>([["work::fn-1-foo.1", 1000]]);
+  const guard = new Map<string, number>();
+  const openKeys = new Set<DispatchKey>(["work::fn-1-foo.1"]);
+  refreshSuppressionForOpenPending(cooldown, guard, openKeys, 5000);
+  expect(cooldown.get("work::fn-1-foo.1")).toBe(5000);
+  // A work key is NOT an epic finalizer — the guard stays empty.
+  expect(guard.size).toBe(0);
+});
+
+test("fn-778 refreshSuppressionForOpenPending: a close key ALSO re-anchors the per-epic finalizer guard", () => {
+  // The `close::<epic>` key (the headline dup-close surface) re-stamps BOTH the
+  // cooldown (keyed by the full key) and the finalizer guard (keyed by epic id).
+  const cooldown = new Map<DispatchKey, number>();
+  const guard = new Map<string, number>();
+  const openKeys = new Set<DispatchKey>(["close::fn-1-foo"]);
+  refreshSuppressionForOpenPending(cooldown, guard, openKeys, 7000);
+  expect(cooldown.get("close::fn-1-foo")).toBe(7000);
+  expect(guard.get("fn-1-foo")).toBe(7000);
+});
+
+test("fn-778 refreshSuppressionForOpenPending: a key with NO open pending row is left untouched", () => {
+  // Only keys present in `openKeys` are refreshed; a stale cooldown entry whose
+  // pending row already expired (DispatchExpired) is NOT re-anchored, so it ages
+  // out normally — this is what bounds the suppression (never perpetual).
+  const cooldown = new Map<DispatchKey, number>([
+    ["work::fn-1-foo.1", 1000],
+    ["close::fn-2-bar", 1000],
+  ]);
+  const guard = new Map<string, number>([["fn-2-bar", 1000]]);
+  // Only fn-1-foo.1 still has an open pending row.
+  const openKeys = new Set<DispatchKey>(["work::fn-1-foo.1"]);
+  refreshSuppressionForOpenPending(cooldown, guard, openKeys, 5000);
+  expect(cooldown.get("work::fn-1-foo.1")).toBe(5000); // refreshed
+  expect(cooldown.get("close::fn-2-bar")).toBe(1000); // untouched → ages out
+  expect(guard.get("fn-2-bar")).toBe(1000); // untouched
+});
+
+test("fn-778 refreshSuppressionForOpenPending: empty open set is a no-op (no throw)", () => {
+  const cooldown = new Map<DispatchKey, number>([["work::x", 1000]]);
+  const guard = new Map<string, number>([["fn-1-foo", 1000]]);
+  expect(() =>
+    refreshSuppressionForOpenPending(cooldown, guard, new Set(), 9999),
+  ).not.toThrow();
+  // Nothing open → nothing refreshed.
+  expect(cooldown.get("work::x")).toBe(1000);
+  expect(guard.get("fn-1-foo")).toBe(1000);
+});
+
+test("fn-778 slow-cold-boot reproduction: an open pending close row keeps the close suppressed PAST the original cooldown window (no dup-close)", () => {
+  // The exact incident shape, time-collapsed. A ready close row whose
+  // `close::<epic>` was dispatched at t0 and whose worker is still cold-booting:
+  // the `pending_dispatches` row stays OPEN across cycles. WITHOUT the refresh the
+  // cooldown would lapse at t0+COOLDOWN and the close would re-dispatch (the bug).
+  // WITH the refresh, each cycle re-anchors the stamp, so the close stays
+  // suppressed even at t0 + 2*COOLDOWN — exactly one launch ever fires.
+  const epic = readyCloseEpic("fn-608-squeegee", "/repo");
+  const t0 = 1000;
+  // State as it stood right after dispatch #1: cooldown + finalizer guard stamped.
+  const state = makeState({
+    redispatchCooldown: new Map([["close::fn-608-squeegee", t0]]),
+    finalizerGuard: new Map([["fn-608-squeegee", t0]]),
+  });
+  // The pending row is still OPEN (worker booting) — the loader would surface it
+  // in liveTabKeys. But to prove the COOLDOWN arm (not liveTabKeys) is what the
+  // refresh keeps alive, drive reconcile with liveTabKeys EMPTY after refreshing.
+  const openKeys = new Set<DispatchKey>(["close::fn-608-squeegee"]);
+
+  // Simulate cycles across the boot window: each cycle sweeps then refreshes while
+  // the pending row is open. Walk well past the original single-window expiry.
+  for (
+    let now = t0 + 10;
+    now <= t0 + 2 * REDISPATCH_COOLDOWN_S;
+    now += REDISPATCH_COOLDOWN_S - 5
+  ) {
+    sweepRedispatchCooldown(state.redispatchCooldown, now);
+    sweepFinalizerGuard(state.finalizerGuard, now);
+    refreshSuppressionForOpenPending(
+      state.redispatchCooldown,
+      state.finalizerGuard,
+      openKeys,
+      now,
+    );
+    // The close stays suppressed every cycle (cooldown + guard both re-anchored).
+    const snap = makeSnapshot({ epics: [epic] });
+    const decision = reconcile(snap, state, now);
+    expect(decision.launches.find((p) => p.verb === "close")).toBeUndefined();
+  }
+});
+
+test("fn-778 bound check: once the pending row CLOSES (DispatchExpired), the refreshed cooldown finally ages out and the close re-dispatches", () => {
+  // The other half of the contract: suppression is NOT perpetual. After the
+  // pending row is discharged (key drops out of openKeys), the next sweep prunes
+  // the now-stale stamp once COOLDOWN has elapsed since the LAST refresh, and the
+  // close becomes re-dispatchable — exactly the bounded behavior.
+  const epic = readyCloseEpic("fn-1-foo", "/repo");
+  const lastRefresh = 1000;
+  const state = makeState({
+    redispatchCooldown: new Map([["close::fn-1-foo", lastRefresh]]),
+    finalizerGuard: new Map([["fn-1-foo", lastRefresh]]),
+  });
+  // Pending row now CLOSED — nothing open to refresh.
+  const openKeys = new Set<DispatchKey>();
+  const now = lastRefresh + REDISPATCH_COOLDOWN_S; // exactly at expiry
+  sweepRedispatchCooldown(state.redispatchCooldown, now);
+  sweepFinalizerGuard(state.finalizerGuard, now);
+  refreshSuppressionForOpenPending(
+    state.redispatchCooldown,
+    state.finalizerGuard,
+    openKeys,
+    now,
+  );
+  expect(state.redispatchCooldown.has("close::fn-1-foo")).toBe(false);
+  expect(state.finalizerGuard.has("fn-1-foo")).toBe(false);
+  const snap = makeSnapshot({ epics: [epic] });
+  const decision = reconcile(snap, state, now);
+  expect(decision.launches.find((p) => p.verb === "close")?.key).toBe(
+    "close::fn-1-foo",
+  );
+});
+
+test("fn-778 same-second shape: two ready close verdicts racing → the fresh-cooldown one yields exactly one launch", () => {
+  // The spec's reproduction: two ready close rows in one snapshot. One epic's
+  // close was JUST dispatched (fresh cooldown) — it must NOT re-launch; the other
+  // is cold and launches. Proves the close-row site consults the (refreshed)
+  // cooldown so a same-second re-evaluation never double-fires the in-flight one.
+  const justDispatched = readyCloseEpic("fn-1-foo", "/repo");
+  const coldEpic = readyCloseEpic("fn-2-bar", "/repo2");
+  const now = 5000;
+  const state = makeState({
+    // fn-1-foo's close was refreshed THIS instant (open pending row) → suppressed.
+    redispatchCooldown: new Map([["close::fn-1-foo", now]]),
+    finalizerGuard: new Map([["fn-1-foo", now]]),
+  });
+  const snap = makeSnapshot({ epics: [justDispatched, coldEpic] });
+  const decision = reconcile(snap, state, now);
+  const closeLaunches = decision.launches.filter((p) => p.verb === "close");
+  // Exactly one close launch — the cold epic. The in-flight one is suppressed.
+  expect(closeLaunches.map((p) => p.key)).toEqual(["close::fn-2-bar"]);
 });
 
 // ---------------------------------------------------------------------------

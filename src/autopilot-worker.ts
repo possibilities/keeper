@@ -178,6 +178,62 @@ export function sweepFinalizerGuard(
 }
 
 /**
+ * Re-anchor the cooldown + per-epic finalizer guard to the DURABLE
+ * `pending_dispatches` lifetime — the fn-778 slow-cold-boot fix.
+ *
+ * The 2026-06-10 dup-close fired because a `close::<epic>` worker took 317s to
+ * emit its first SessionStart (a far-tail `claude` cold boot under conn-cap
+ * saturation). Its `pending_dispatches` row TTL-expired at ~120s (so `liveTabKeys`
+ * lost the key), no `jobs` row had landed yet, and the cooldown — stamped at
+ * dispatch and refreshed ONCE at the indoubt resolution (cover-end dispatch+260s)
+ * — lapsed 1s before the re-dispatch at dispatch+261s. Every suppression arm was
+ * legitimately clear; the single non-compounding indoubt re-stamp was the sole
+ * cover and it was too short for the tail. (See the Evidence in the fn-778.2 spec
+ * for the event-log timeline.)
+ *
+ * The fix: each cycle, while a key still has an OPEN `pending_dispatches` row
+ * (`openKeys`, sourced from `snapshot.liveTabKeys`), refresh its cooldown stamp to
+ * `now` (and the finalizer guard for a `close::<epic>` key). Suppression then
+ * tracks the phantom's ACTUAL durable lifetime instead of a fixed window measured
+ * from dispatch. The last refresh lands on the final cycle before the producer-side
+ * TTL sweep mints `DispatchExpired`, so cover extends `REDISPATCH_COOLDOWN_S` past
+ * that point — covering the observed tail with margin.
+ *
+ * This is NOT the perpetual-suppression trap: the re-stamp is gated on a DURABLE
+ * row the TTL sweep DETERMINISTICALLY discharges (bounded by
+ * `PENDING_DISPATCH_TTL_MS` + the sweep granularity). Once the row is gone the key
+ * drops out of `openKeys`, refreshing STOPS, and the final cooldown window runs
+ * out — total bounded suppression is TTL + sweep + cooldown, never unbounded.
+ *
+ * Mutates both Maps in place — called ONLY from `driveCycle` (the cycle glue),
+ * AFTER the sweeps and BEFORE the pure `reconcile` reads the Maps, never inside
+ * `reconcile`; the caller wraps it in try/catch (no self-heal). `now` is
+ * unix-SECONDS throughout, matching the cooldown/guard timestamps.
+ */
+export function refreshSuppressionForOpenPending(
+  cooldown: Map<DispatchKey, number>,
+  guard: Map<string, number>,
+  openKeys: Set<DispatchKey>,
+  now: number,
+): void {
+  for (const key of openKeys) {
+    cooldown.set(key, now);
+    // A `close::<epic>` key also re-anchors the per-epic finalizer guard (keyed by
+    // epic id — everything after the first `::`). Other verbs touch only the
+    // cooldown; `isFinalizerVerb` is the single source of truth for which verb is
+    // an epic finalizer.
+    const sep = key.indexOf("::");
+    if (sep < 0) {
+      continue;
+    }
+    const verb = key.slice(0, sep);
+    if (isFinalizerVerb(verb as Verb)) {
+      guard.set(key.slice(sep + 2), now);
+    }
+  }
+}
+
+/**
  * `~/code/arthack` root (kept for any non-plugin-dir callers and for tests
  * that pin the legacy variable). Env-overridable via `ARTHACK_ROOT`. `~`
  * is expanded eagerly at module load so the assembled string carries an
@@ -1115,7 +1171,13 @@ export async function confirmRunning(
   // ceiling < TTL: a sweep < ceiling would clear the row mid-confirm and re-open
   // the dispatch. TTL < cooldown: the cooldown must outlast the worst-case
   // round-trip (the row surviving a full TTL plus the sweep tick) so suppression
-  // never lapses while a phantom is in flight. Telemetry rides alongside: the
+  // never lapses while a phantom is in flight. fn-778 CORRECTION: this chain
+  // bounds the FOLD-LAG round-trip, but NOT an arbitrary `claude` cold-boot tail —
+  // the 2026-06-10 dup-close booted 317s late, so the fixed dispatch-anchored
+  // cooldown (cover-end dispatch+260s with one indoubt re-stamp) lapsed before the
+  // bind. `refreshSuppressionForOpenPending` now re-anchors the cooldown each cycle
+  // the `pending_dispatches` row is still OPEN, extending cover to the phantom's
+  // durable lifetime (still TTL-sweep-bounded). Telemetry rides alongside: the
   // ceiling RESCUED a stuck dispatch, so `rescued:true` with the elapsed
   // `stalenessMs`.
   deps.recordTimeoutBackstop?.({ rescued: true, stalenessMs: elapsedMs });
@@ -1827,6 +1889,26 @@ function main(): void {
         } catch (err) {
           console.error(
             "[autopilot-worker] finalizer-guard sweep threw (non-fatal):",
+            err,
+          );
+        }
+        // fn-778: re-anchor the cooldown + finalizer guard to any key still
+        // backed by an OPEN `pending_dispatches` row (`snapshot.liveTabKeys`), so
+        // suppression tracks a slow-cold-boot worker's DURABLE phantom lifetime
+        // instead of lapsing at the fixed dispatch-anchored window. AFTER the
+        // sweeps (a key about to expire is refreshed while its phantom is live)
+        // and BEFORE `reconcile` reads the Maps. Bounded by the TTL sweep that
+        // discharges the row — never perpetual. Wrapped (no self-heal).
+        try {
+          refreshSuppressionForOpenPending(
+            state.redispatchCooldown,
+            state.finalizerGuard,
+            snapshot.liveTabKeys,
+            deps.now(),
+          );
+        } catch (err) {
+          console.error(
+            "[autopilot-worker] suppression refresh threw (non-fatal):",
             err,
           );
         }
