@@ -42,5 +42,5 @@ bun test for lib.ts units (marker read contract incl. stale-unlink, bypass check
 - [ ] `uv run pytest tests/ --run-slow` and the fast bucket both pass
 
 ## Done summary
-
+Made the repo polyglot (package.json/biome.json/bun.lock) and shipped plugin/hooks/lib.ts plus three fail-open guard dispatcher stubs, wired exec-form into hooks.json (commit-guard PreToolUse/Bash, subagent-stop-guard SubagentStop, stop-guard Stop). bun test + biome lint green; Python wiring + slow-bucket subprocess tests green.
 ## Evidence
