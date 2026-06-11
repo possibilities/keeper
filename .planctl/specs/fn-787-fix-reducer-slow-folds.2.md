@@ -55,5 +55,5 @@ pending-PreToolUse assignment ordering.
 - [ ] `bun run test:full` green; refold-determinism byte-identical
 
 ## Done summary
-
+Added the v66 session-anchored partial index idx_events_pretooluse_agent_session so the SubagentStart fold's pending-PreToolUse bridge (findPendingPreToolUseForStart/findBridgePreToolUse) seeks one session instead of scanning every PreToolUse row; EQP on the live 2.65GB DB confirms idx_events_hook_event table-wide scan -> session-anchored seek with no temp B-tree. Bumped SCHEMA_VERSION 65->66 and SUPPORTED_SCHEMA_VERSIONS in the same commit, with ANALYZE events on migrate.
 ## Evidence

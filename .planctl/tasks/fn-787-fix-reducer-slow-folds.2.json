@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Fix SubagentStart pending-scan plan",
-  "updated_at": "2026-06-11T19:20:23.175253Z"
+  "updated_at": "2026-06-11T20:44:06.611874Z",
+  "worker_done_at": "2026-06-11T20:44:06.611874Z"
 }
