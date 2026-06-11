@@ -65,5 +65,5 @@ compilation, not by grep-shaped tests.
 - [ ] `bun run typecheck` and `bun run test:full` green
 
 ## Done summary
-
+Deleted both autopilot window reaps + autoclose_windows and ExecBackend.reapSurfaces (with all zellij close/list-panes helpers); keeper never closes a window. Added exec_backend config key (zellij|tmux, default zellij, unknown warns+falls-back), dropped zellij_session, renamed DEFAULT_ZELLIJ_SESSION->MANAGED_EXEC_SESSION, and threaded execBackend through autopilot workerData. findPaneById verified dead and deleted.
 ## Evidence
