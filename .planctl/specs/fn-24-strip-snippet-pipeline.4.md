@@ -34,5 +34,5 @@ In sketch.md.tmpl: delete Process step 3 (snippet-id accumulation) and renumber 
 - [ ] claude/arthack/CLAUDE.md reworded present-tense; no backward-facing prose
 
 ## Done summary
-
+Stripped snippet ceremony from sketch.md.tmpl (Process step 3, Snippets-in-bundle output, save-bundle/--bundle plan-sketch plumbing), deleted 4 orphan snippets + index entries + backlinks, re-pointed boundary-lint example to planctl->keeper, reworded /sketch plugin description. validate-bundles green; sketch.md/hack.md re-rendered.
 ## Evidence
