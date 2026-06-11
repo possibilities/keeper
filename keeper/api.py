@@ -243,6 +243,12 @@ from pathlib import Path
 # fed by synthetic ``BuildSnapshot`` / ``BuildDeleted`` events). keeper-py reads
 # no ``builds`` column (the TUI subscribes over the socket), so no reader logic
 # changes — only the version whitelist gains 64.
+#
+# v65 (fn-784 task .1) is also whitelist-only: it adds the folded
+# ``jobs.active_since`` REAL column (Unix-seconds stamped on the rising edge
+# into ``working``, the recency key for the unified ``keeper dash`` AGENTS
+# timeline). keeper-py reads no ``active_since`` column (the TUI subscribes over
+# the socket), so no reader logic changes — only the version whitelist gains 65.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -279,6 +285,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         62,
         63,
         64,
+        65,
     }
 )
 

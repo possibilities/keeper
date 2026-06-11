@@ -108,6 +108,7 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     last_input_request_kind: null,
     last_permission_prompt_at: null,
     last_permission_prompt_kind: null,
+    active_since: null,
     config_dir: null,
     git_dirty_count: 0,
     git_unattributed_to_live_count: 0,

@@ -2529,14 +2529,16 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `event_ingest_offsets` NDJSON→events ingest cursor), to 62 via fn-751
   // task .1 (the autopilot `mode` column + the `armed_epics` presence table),
   // to 63 via fn-756 task .2 (drop `epics.approval` + rewrite
-  // `default_visible`), and to 64 via fn-781 task .1 (the `builds` buildbot
-  // dashboard projection table), each of which bumped SCHEMA_VERSION AND added
-  // its version to `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the
-  // CLAUDE.md same-commit invariant. This pin tracks the LIVE schema version:
-  // the guard it provides is "an accidental reducer/schema change must surface
-  // as a failing whitelist + this pin", which still holds — bump both together
-  // when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(64);
+  // `default_visible`), to 64 via fn-781 task .1 (the `builds` buildbot
+  // dashboard projection table), and to 65 via fn-784 task .1 (the folded
+  // `jobs.active_since` recency column for the unified dash AGENTS timeline),
+  // each of which bumped SCHEMA_VERSION AND added its version to
+  // `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the CLAUDE.md
+  // same-commit invariant. This pin tracks the LIVE schema version: the guard
+  // it provides is "an accidental reducer/schema change must surface as a
+  // failing whitelist + this pin", which still holds — bump both together when
+  // the schema genuinely moves.
+  expect(SCHEMA_VERSION).toBe(65);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

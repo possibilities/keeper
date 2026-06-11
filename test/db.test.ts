@@ -1780,7 +1780,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // a pre-v63 DB converges to the SAME shape via the v62→v63 migration. This
   // test pins (a) no `approval` column, (b) the rewritten expression, and
   // (c) fresh-vs-migrated table_xinfo byte-parity (re-fold determinism guard).
-  expect(SCHEMA_VERSION).toBe(63);
+  // Version guard tracks the live SCHEMA_VERSION (v64 adds the `builds` table,
+  // fn-781; v65 adds `jobs.active_since`, fn-784); the v62→v63 epics-shape
+  // migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(65);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

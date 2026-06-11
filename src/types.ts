@@ -351,6 +351,18 @@ export interface Job {
    */
   last_permission_prompt_kind: string | null;
   /**
+   * Unix-seconds stamped by the reducer's `UserPromptSubmit` arm on the rising
+   * edge into `working` (a `state != 'working'` → working transition: a fresh
+   * prompt on a stopped row, or a re-open from `ended`/`killed`). HELD across
+   * mid-run churn (a 2nd prompt while already `working` does NOT re-stamp) and
+   * when a job goes stopped/terminal or resumes-but-idle. The recency key for
+   * the unified `keeper dash` AGENTS timeline (`COALESCE(active_since,
+   * created_at)` DESC). NULL on a brand-new SessionStart-only job that never
+   * prompted — the column DEFAULT (NULL) is the correct seed and it sorts by
+   * `created_at`. Never backfilled (that would conflate it with `updated_at`).
+   */
+  active_since: number | null;
+  /**
    * Projection of `Event.config_dir`. Latest-non-NULL-wins via COALESCE so a
    * resume SessionStart capturing NULL preserves the prior value.
    */

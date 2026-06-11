@@ -191,6 +191,7 @@ function getJob(jobId = "sess-a") {
     start_time: string | null;
     plan_verb: string | null;
     plan_ref: string | null;
+    active_since: number | null;
   } | null;
 }
 
@@ -429,6 +430,53 @@ test("fn-690 re-fold determinism: same event log → byte-identical projections 
   expect(
     JSON.stringify(db.query("SELECT * FROM epics ORDER BY epic_id").all()),
   ).toBe(JSON.stringify(epics1));
+});
+
+test("fn-784 re-fold determinism: active_since (stamped + restarted + NULL) re-folds byte-identical", () => {
+  // Two jobs prove both edges of the active_since fold survive a from-scratch
+  // re-fold: `sess-prompted` is driven through a stamp → Stop → genuine
+  // restart (a second rising edge re-stamps to a later ts), while `sess-idle`
+  // is a SessionStart-only job that never prompts (active_since stays NULL).
+  // The fold reads only `event.ts` and the pre-update `state`, never
+  // wall-clock — so the re-fold from cursor=0 MUST reproduce both the stamped
+  // REAL and the NULL byte-for-byte.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-prompted" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-prompted",
+    ts: 5000,
+  });
+  insertEvent({ hook_event: "Stop", session_id: "sess-prompted" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-prompted",
+    ts: 6000,
+  });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-idle" });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  // Sanity: the first fold landed the expected active_since values.
+  const prompted1 = db
+    .query("SELECT active_since FROM jobs WHERE job_id = 'sess-prompted'")
+    .get() as { active_since: number | null };
+  const idle1 = db
+    .query("SELECT active_since FROM jobs WHERE job_id = 'sess-idle'")
+    .get() as { active_since: number | null };
+  expect(prompted1.active_since).toBe(6000);
+  expect(idle1.active_since).toBeNull();
+
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  // Re-fold from cursor=0: drop the projection, rewind, re-drain.
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
 });
 
 // ---------------------------------------------------------------------------
@@ -5706,6 +5754,105 @@ test("UserPromptSubmit with a killed task-notification on a terminal row stays t
   });
   drainAll();
   expect(getJob()?.state).toBe("ended");
+});
+
+// ---------------------------------------------------------------------------
+// fn-784 — `active_since`: the unified-timeline recency key, stamped on the
+// rising edge into `working` and held otherwise.
+// ---------------------------------------------------------------------------
+
+test("active_since: stamped = the UserPromptSubmit ts on a first prompt (stopped → working)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.active_since).toBe(5000);
+});
+
+test("active_since: a brand-new SessionStart-only job that never prompted is NULL", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("stopped");
+  expect(job?.active_since).toBeNull();
+});
+
+test("active_since: HELD across Stop→stopped and subagent/monitor churn (no re-stamp)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  // Stop drops the row to 'stopped' but carries no active_since clause.
+  insertEvent({ hook_event: "Stop" });
+  // Sub-agent + monitor activity mid-life: none re-stamp active_since.
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Task",
+    subagent_agent_id: "sub-1",
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Monitor",
+    background_task_id: "mon-1",
+  });
+  drainAll();
+  expect(getJob()?.active_since).toBe(5000);
+});
+
+test("active_since: re-stamped on a genuine restart (stopped → UserPromptSubmit)", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({ hook_event: "Stop" });
+  // A fresh prompt after the stop re-promotes: the rising edge fires again.
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 6000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.active_since).toBe(6000);
+});
+
+test("active_since: re-stamped on a killed → UserPromptSubmit re-open", () => {
+  // SessionStart seeds pid 4242 / start_time NULL (the helper default), so the
+  // Killed loose pid-only match flips the row terminal; the next live prompt
+  // re-opens it from 'killed' and re-stamps the rising edge.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({
+    hook_event: "Killed",
+    data: JSON.stringify({ pid: 4242, start_time: null }),
+  });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 7000 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.active_since).toBe(7000);
+});
+
+test("active_since: NOT re-stamped by a 2nd UserPromptSubmit while already working", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  // A 2nd prompt mid-run (still 'working') must HOLD active_since — the
+  // explicit ELSE branch keeps the original rising-edge value.
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5500 });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("working");
+  expect(job?.active_since).toBe(5000);
+});
+
+test("active_since: NOT stamped when the killed-task-notification guard swallows the prompt", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "Stop" });
+  // The killed shutdown-housekeeping notification rides the UserPromptSubmit
+  // hook but `break`s before the lifecycle UPDATE — active_since stays NULL.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    data: JSON.stringify({ prompt: TASK_NOTIFICATION_KILLED }),
+    ts: 5000,
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.state).toBe("stopped");
+  expect(job?.active_since).toBeNull();
 });
 
 test("SessionEnd re-asserts ended idempotently", () => {

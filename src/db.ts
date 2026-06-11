@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 64;
+export const SCHEMA_VERSION = 65;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -552,7 +552,8 @@ CREATE TABLE IF NOT EXISTS jobs (
     backend_exec_pane_id TEXT,
     monitors TEXT NOT NULL DEFAULT '[]',
     last_permission_prompt_at REAL,
-    last_permission_prompt_kind TEXT
+    last_permission_prompt_kind TEXT,
+    active_since REAL
 )
 `;
 
@@ -3251,6 +3252,17 @@ function migrate(db: Database): void {
       // exists before any earlier-version rewind that wipes it. No backfill —
       // the live builds-worker poll repopulates it from the buildbot REST API.
       db.run(CREATE_BUILDS);
+
+      // v64→v65: add the folded `jobs.active_since` REAL column — Unix-seconds
+      // stamped on the rising edge into `working` (a stopped/terminal→working
+      // transition), the recency key for the unified dash AGENTS timeline. NULL
+      // default, NO backfill: `updated_at` is bumped on every event ("last
+      // touched"), not "run started", so backfilling from it would conflate the
+      // two and break re-fold determinism. Whitelist-only Python read (a
+      // SCHEMA_VERSION bump MUST add the version to `SUPPORTED_SCHEMA_VERSIONS`
+      // in `keeper/api.py` in the SAME commit, or every keeper-py read fails
+      // host-wide; test/schema-version.test.ts enforces this).
+      addColumnIfMissing(db, "jobs", "active_since", "REAL");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
