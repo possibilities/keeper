@@ -38,6 +38,7 @@ import type {
   TextRenderable as TextRenderableType,
 } from "@opentui/core";
 import {
+  type ConnectFactory,
   type ReadinessClientSnapshot,
   subscribeCollection,
   subscribeReadiness,
@@ -281,22 +282,42 @@ interface CurrentInputs {
   connection: ConnectionState;
 }
 
-/**
- * The production process shell. Dynamic-imports OpenTUI, builds the renderer +
- * paint layer, wires the data layer + teardown discipline, and runs reactive
- * mode. Returns a promise that resolves once setup is done (the process then
- * lives on the renderer's reactive repaint + the subscriptions until an exit
- * trigger fires). Read-only: no RPC frame is written, no DB opened.
- *
- * `armExitTriggers` is injected (defaults to the real forked triggers) so a
- * future test can assert the wiring without a live 2s interval.
- */
-export async function createDashApp(
-  sockPath: string,
-  armExitTriggers: (exitCleanly: () => void) => {
+/** The renderer + runtime ctors {@link createDashApp} threads into
+ * {@link attachDashApp}. The default factory dynamic-imports `@opentui/core`
+ * and builds the real alt-screen renderer; tests inject a `createTestRenderer`
+ * result so the whole process shell can be driven headless. */
+export interface DashRendererBundle {
+  readonly renderer: CliRenderer;
+  readonly runtime: DashAppRuntime;
+}
+
+/** Test-injection seams for {@link createDashApp}. Production passes none — the
+ * defaults reproduce the real renderer / forked triggers / `process` exit +
+ * stderr. Tests inject all of them so the teardown discipline (destroy before
+ * exit, idempotency, handle disposal, fatal exit-1 routing) is assertable
+ * without booting a real alt-screen renderer or calling the real
+ * `process.exit`. */
+export interface DashAppDeps {
+  /** Builds the renderer + runtime ctors. Default: real OpenTUI alt-screen. */
+  readonly buildRenderer?: () => Promise<DashRendererBundle>;
+  /** Exit-trigger arming. Default: the real forked viewer triggers. */
+  readonly armExitTriggers?: (exitCleanly: () => void) => {
     disarm: () => void;
-  } = defaultArmExitTriggers,
-): Promise<void> {
+  };
+  /** Socket connect for the three subscriptions. Default: the real UDS connect. */
+  readonly connect?: ConnectFactory;
+  /** Process exit. Default: `process.exit`. Tests inject a thrower. */
+  readonly exit?: (code: number) => void;
+  /** Fatal-path stderr sink. Default: `process.stderr.write`. */
+  readonly stderrWrite?: (s: string) => void;
+  /** Registrar for the `uncaughtException` / `unhandledRejection` fatal nets.
+   * Default: `process.on`. Tests inject a capturing registrar so the handlers
+   * never land on the real `process` (which would fire on unrelated test
+   * errors and leak listeners across files). */
+  readonly onProcess?: (event: string, handler: (arg: unknown) => void) => void;
+}
+
+async function defaultBuildRenderer(): Promise<DashRendererBundle> {
   const otui = await import("@opentui/core");
   const renderer = await otui.createCliRenderer({
     // q / Ctrl-C are the canonical exit route (handled in the key handler);
@@ -306,6 +327,49 @@ export async function createDashApp(
     autoFocus: false,
     screenMode: "alternate-screen",
   });
+  return {
+    renderer,
+    runtime: {
+      TextRenderable: otui.TextRenderable,
+      ScrollBoxRenderable: otui.ScrollBoxRenderable,
+      BoxRenderable: otui.BoxRenderable,
+      StyledText: otui.StyledText,
+      RGBA: otui.RGBA,
+      TextAttributes: otui.TextAttributes,
+    },
+  };
+}
+
+/**
+ * The production process shell. Builds the renderer + paint layer, wires the
+ * data layer + teardown discipline, and runs reactive mode. Returns a promise
+ * that resolves once setup is done (the process then lives on the renderer's
+ * reactive repaint + the subscriptions until an exit trigger fires). Read-only:
+ * no RPC frame is written, no DB opened.
+ *
+ * Every dep in {@link DashAppDeps} is injectable so a test can drive the whole
+ * shell headless (a `createTestRenderer` renderer, a stub trigger set, a fake
+ * connect, and a non-exiting `exit`/`stderrWrite`) and assert the teardown
+ * discipline without booting a real alt-screen renderer.
+ */
+export async function createDashApp(
+  sockPath: string,
+  deps: DashAppDeps = {},
+): Promise<void> {
+  const buildRenderer = deps.buildRenderer ?? defaultBuildRenderer;
+  const armExitTriggers = deps.armExitTriggers ?? defaultArmExitTriggers;
+  const exit = deps.exit ?? ((code: number) => process.exit(code));
+  const stderrWrite =
+    deps.stderrWrite ?? ((s: string) => void process.stderr.write(s));
+  const onProcess =
+    deps.onProcess ??
+    ((event: string, handler: (arg: unknown) => void) => {
+      process.on(event as "uncaughtException", handler);
+    });
+  const connectOpt =
+    deps.connect === undefined ? {} : { connect: deps.connect };
+
+  const { renderer, runtime } = await buildRenderer();
 
   const inputs: CurrentInputs = {
     snapshot: null,
@@ -314,18 +378,9 @@ export async function createDashApp(
     connection: "connecting",
   };
 
-  const app = attachDashApp(
-    renderer,
-    {
-      TextRenderable: otui.TextRenderable,
-      ScrollBoxRenderable: otui.ScrollBoxRenderable,
-      BoxRenderable: otui.BoxRenderable,
-      StyledText: otui.StyledText,
-      RGBA: otui.RGBA,
-      TextAttributes: otui.TextAttributes,
-    },
-    { onQuit: () => exitCleanly() },
-  );
+  const app = attachDashApp(renderer, runtime, {
+    onQuit: () => exitCleanly(),
+  });
 
   function paint(): void {
     app.render(
@@ -348,6 +403,7 @@ export async function createDashApp(
   const readinessHandle = subscribeReadiness({
     sockPath,
     idPrefix: "dash",
+    ...connectOpt,
     onSnapshot: (snap) => {
       inputs.snapshot = snap;
       inputs.connection = "live";
@@ -372,6 +428,7 @@ export async function createDashApp(
     sockPath,
     idPrefix: "dash",
     collection: "autopilot_state",
+    ...connectOpt,
     onRows: (rows) => {
       inputs.autopilotRows = rows;
       paint();
@@ -383,6 +440,7 @@ export async function createDashApp(
     sockPath,
     idPrefix: "dash",
     collection: "armed_epics",
+    ...connectOpt,
     onRows: (rows) => {
       inputs.armedRows = rows;
       paint();
@@ -423,7 +481,7 @@ export async function createDashApp(
       // best-effort
     }
     app.destroy();
-    process.exit(0);
+    exit(0);
   }
 
   // Forked viewer exit triggers (SIGHUP, stdin-EOF, ppid===1 poll).
@@ -432,10 +490,10 @@ export async function createDashApp(
   // Last-resort safety nets — OpenTUI hooks NEITHER, so an uncaught error would
   // strand the terminal in alt-screen/raw mode. Route both through the same
   // destroy-then-exit tail (then re-exit non-zero to preserve the failure).
-  process.on("uncaughtException", (err) => {
+  onProcess("uncaughtException", (err) => {
     onFatalError(err);
   });
-  process.on("unhandledRejection", (reason) => {
+  onProcess("unhandledRejection", (reason) => {
     onFatalError(reason);
   });
 
@@ -465,11 +523,11 @@ export async function createDashApp(
       app.destroy();
     }
     try {
-      process.stderr.write(`keeper dash: fatal — ${String(err)}\n`);
+      stderrWrite(`keeper dash: fatal — ${String(err)}\n`);
     } catch {
       // best-effort
     }
-    process.exit(1);
+    exit(1);
   }
 }
 
