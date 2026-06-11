@@ -48,5 +48,5 @@ daemon.test.ts: after an in-process daemon boots (harness), assert the -wal file
 - [ ] bun run test:full green
 
 ## Done summary
-
+Flipped the boot-drain finally checkpoint from PASSIVE to TRUNCATE (boot runs pre-worker-spawn so nothing to block on; empties the WAL so every worker's first open skips WAL-scan/-shm recovery). Steady-state checkpoints stay PASSIVE; README narrative + CLAUDE.md worker-contract bullets + checkpoint-mode test updated.
 ## Evidence
