@@ -206,7 +206,7 @@ failure, the ledger wins. Row schema (per the contract):
   fix is believed to have landed; for `routed`, when the routing target is expected
   to land. NEVER use `processed_at` as the resurface anchor.
 - `resolved_ref` is REQUIRED for `duplicate-of` (the superseding key) and `routed`
-  (the epic/sketch slug); else null.
+  (an `fn-N` epic slug or commit sha); else null.
 - `note` is REQUIRED non-empty for `wontfix`.
 - **The `routed` loophole:** every routed survivor MUST get a `routed` row with its
   `resolved_ref` THIS round. An unstamped routed survivor re-floods every round.
@@ -253,9 +253,29 @@ keeper commit-work "<type>(<scope>): <summary>
 In those cases, don't commit at all unless asked.
 
 
-- **Shape not yet committed / human will want to think** → invoke `/sketch` via the
-  Skill tool with the finding + proposed direction. `resolved_ref` = the sketch
-  slug.
+- **Shape not yet committed / human will want to think** → do NOT route or invoke
+  any Skill. Verdict the cluster `needs-work` (`resolved_ref: null`; suppressed,
+  stays recorded until a human re-verdicts). In the Step 8 round report, give the
+  finding its own entry carrying the proposed direction, the affected files, and ONE
+  escalation line for the human, sized against the rubric below: inline-shaped (1–2
+  files, no new contracts) → fix it in a normal session and re-verdict `fixed`;
+  bigger → `/plan:plan` it and re-verdict `routed` with the resulting `fn-N` slug.
+
+  **Size the escalation with the inline-vs-plan rubric.** Canonical source —
+  `promptctl render engineering/escalate-inline-or-plan`; the text below is baked
+  from that render:
+
+  > When a request reads as work to do, size it against this rubric before choosing how to act. The same clauses gate both the answer shape and where the work lands.
+  >
+  > - **Inline** when the change fits one or two files, introduces no schema / protocol / UX boundary change, the direction reads as a single coherent move, AND the human wants it done now. Answer with the short pre-work paragraph and execute on plain-text greenlight.
+  > - **`/plan:plan`** when the work spans multiple modules, adds a worker / RPC / migration / screen, introduces a new contract, or reads as ≥3 independently sequenceable moves. Decompose rather than commit.
+  > - **`/plan:defer`** when the work is inline-shaped (one cohesive task, no new contracts) BUT the human signaled "not now" / "later" / "follow up" / "queue this up" semantics. Capture it as a normal-sorted single-task epic; bump it to the front of the board later with `/plan:next` if the human wants it next.
+  >
+  > Tie-breakers:
+  >
+  > - Ambiguous between **inline** and **`/plan:plan`** → default to **`/plan:plan`**. Collapsing a plan back into one commit is cheaper than backing out of a premature commit.
+  > - Ambiguous between **inline** and **`/plan:defer`** → default to **`/plan:defer`**. Capturing it for later is cheaper than an unwanted commit landing now.
+
 - **Decomposable / multi-module / contract change** → invoke `/plan:plan` via the
   Skill tool. `resolved_ref` = the resulting `fn-N` epic slug.
 

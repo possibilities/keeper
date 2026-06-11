@@ -157,7 +157,7 @@ silently dropped.
 | `duplicate-of`     | same underlying issue as another finding. | `resolved_ref` = the superseding `key`; **inherits the target's resurface fate** |
 | `landed-elsewhere` | fixed by work outside this triage (another epic/commit already shipped it). | — |
 | `needs-work`       | confirmed real, not yet resolved — stays on the radar but is recorded so it isn't re-triaged from scratch. | — |
-| `routed`           | confirmed real; routed to tracked work (an `fn-N` epic or a `/sketch` slug). **Suppressed until that work lands.** | `resolved_ref` = the epic/sketch slug |
+| `routed`           | confirmed real; routed to tracked work (an `fn-N` epic slug or commit sha). **Suppressed until that work lands.** | `resolved_ref` = the `fn-N` epic slug or commit sha |
 
 Notes:
 
