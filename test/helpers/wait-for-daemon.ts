@@ -32,11 +32,14 @@ export async function waitForDaemon(
   // Generous ceiling: under the serial slow tier, a freshly-spawned daemon
   // boots alongside a prior test's still-tearing-down @parcel/watcher worker
   // threads, so first-bind latency spikes well past a single daemon's
-  // sub-100ms cold boot. This is a readiness GATE (proceed-when-ready), not a
-  // latency assertion — the headroom matches the per-test 30s timeout so a slow
-  // boot waits instead of flaking, while a genuinely wedged daemon still
-  // surfaces as a clean "socket not ready" throw rather than an opaque hang.
-  timeoutMs = 30_000,
+  // sub-100ms cold boot — and on a CI box shared with live autopilot workers,
+  // boot alone was observed eating 20s+ (the 2026-06-10 builds 53/54/63/65
+  // flakes). This is a readiness GATE (proceed-when-ready), not a latency
+  // assertion — the headroom matches the per-test 120s timeout on the
+  // daemon-boot tests so a starved boot waits instead of flaking, while a
+  // genuinely wedged daemon still surfaces as a clean "socket not ready"
+  // throw rather than an opaque hang.
+  timeoutMs = 120_000,
   cadenceMs = 25,
 ): Promise<void> {
   const deadline = Date.now() + timeoutMs;

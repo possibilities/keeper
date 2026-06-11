@@ -772,7 +772,7 @@ test("starvation repro: a long-held writer lock (no yield) starves a concurrent 
   // hook into a dead-letter.
   expect(result.ok).toBe(false);
   expect(result.err).toMatch(/(?:locked|busy|SQLITE_BUSY)/i);
-}, 30_000);
+}, 120_000);
 
 test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock cleanly to a concurrent writer", async () => {
   // The mirror of the starvation repro: instead of one long-held
@@ -837,7 +837,7 @@ test("starvation fix: pacing the writer (post-COMMIT OS sleep) yields the lock c
   // cadence, the contender grabs the lock in the FIRST paced gap → ok.
   expect(result.ok).toBe(true);
   expect(result.err).toBeNull();
-}, 30_000);
+}, 120_000);
 
 test("isTransientBusyError classifies writer-lock starvation as transient and everything else as fatal", () => {
   // The discriminator the usage mint's drop-don't-crash hinges on. Transient =
@@ -941,7 +941,7 @@ test("usage-mint crash regression: a real insertEvent.run starved past busy_time
   // so the tolerant mint drops-and-survives instead of crashing the daemon.
   expect(thrown).toBeDefined();
   expect(isTransientBusyError(thrown)).toBe(true);
-}, 30_000);
+}, 120_000);
 
 test("withBootDrainCheckpointTuning ends the boot with a PASSIVE checkpoint (writer-skipping, not TRUNCATE)", () => {
   // The end-of-boot checkpoint runs in the `finally` AFTER the drain body.
@@ -2422,9 +2422,9 @@ test("autopilot worker spawns with paused=true workerData and shuts down cleanly
       worker.postMessage({ type: "shutdown" });
     }
     return closed || null;
-  }, 20_000);
+  }, 60_000);
   expect(ok).toBe(true);
-}, 30_000);
+}, 120_000);
 
 test("autopilot worker accepts {type:'set-paused', paused} commands without crashing the loop", async () => {
   openDb(dbPath).db.close();
@@ -2464,9 +2464,9 @@ test("autopilot worker accepts {type:'set-paused', paused} commands without cras
       worker.postMessage({ type: "shutdown" });
     }
     return closed || null;
-  }, 20_000);
+  }, 60_000);
   expect(ok).toBe(true);
-}, 30_000);
+}, 120_000);
 
 // ---------------------------------------------------------------------------
 // fn-678 task .3 — pending_dispatches TTL sweep (producer-side, 60s heartbeat)
@@ -2798,7 +2798,7 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
         .query("SELECT job_id FROM jobs WHERE job_id = ?")
         .get(sessionId) as { job_id: string } | null;
       return row ?? null;
-    }, 10_000);
+    }, 30_000);
     reader.close();
     expect(projected).not.toBeNull();
 
@@ -2844,7 +2844,7 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
             f.rows.some((r) => r.job_id === sessionId),
         );
         return hit ?? null;
-      }, 10_000);
+      }, 30_000);
       expect(served).not.toBeNull();
     } finally {
       socket.end();
@@ -2853,7 +2853,13 @@ test("fn-747: in-process daemon folds an event and serves it over UDS, then stop
   // Reaching here means the harness's `stop()` tore down all workers + db
   // WITHOUT a `process.exit` (a `process.exit` would have killed the test
   // runner). Clean in-process boot → fold → query → stop, proven.
-}, 30_000);
+  //
+  // 120s ceiling (was 30s): on a CI box shared with live autopilot workers the
+  // full-set boot alone was observed eating 20s+ (2026-06-10 builds 53/54/63/65
+  // — timeouts at 30001/30009ms, milliseconds past the old line). A ceiling is
+  // free on the happy path; it only pays when the box is starved, where
+  // "slower green" is the correct outcome, not a red build.
+}, 120_000);
 
 // ---------------------------------------------------------------------------
 // fn-751 task .3 — set_autopilot_mode / set_epic_armed RPC round-trip
@@ -2891,7 +2897,7 @@ async function rpcRoundTrip(
           (f as { id?: string }).id === frame.id,
       );
       return hit ?? null;
-    }, 10_000);
+    }, 30_000);
     if (reply === null) {
       throw new Error(
         `no rpc_result/error frame for ${frame.method} (id ${frame.id}) within 10s`,
@@ -2926,13 +2932,13 @@ test("fn-751: set_autopilot_mode RPC round-trips and folds the autopilot_state s
           .query("SELECT mode FROM autopilot_state WHERE id = 1")
           .get() as { mode: string } | null;
         return row?.mode === "armed" ? row.mode : null;
-      }, 10_000);
+      }, 30_000);
       reader.close();
       expect(mode).toBe("armed");
     },
     { workers: ["wake", "server"] },
   );
-}, 30_000);
+}, 120_000);
 
 test("fn-751: set_autopilot_mode rejects an unknown enum value with a bad_params error (no fold)", async () => {
   await withInProcessDaemon(
@@ -2948,7 +2954,7 @@ test("fn-751: set_autopilot_mode rejects an unknown enum value with a bad_params
     },
     { workers: ["wake", "server"] },
   );
-}, 30_000);
+}, 120_000);
 
 test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence table (arm then disarm)", async () => {
   await withInProcessDaemon(
@@ -2973,7 +2979,7 @@ test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence 
           .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
           .get("fn-42-armed") as { epic_id: string } | null;
         return row ?? null;
-      }, 10_000);
+      }, 30_000);
       expect(armed).not.toBeNull();
 
       // Disarm: the presence row is DELETEd.
@@ -2992,13 +2998,13 @@ test("fn-751: set_epic_armed RPC round-trips and folds the armed_epics presence 
         // retryUntil treats a non-null return as "settled"; sentinel `true`
         // means "row is gone".
         return row === null ? true : null;
-      }, 10_000);
+      }, 30_000);
       reader.close();
       expect(gone).toBe(true);
     },
     { workers: ["wake", "server"] },
   );
-}, 30_000);
+}, 120_000);
 
 test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded arm and done-disarm", async () => {
   await withInProcessDaemon(
@@ -3031,7 +3037,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
           .query("SELECT status FROM epics WHERE epic_id = ?")
           .get("fn-91-open") as { status: string } | null;
         return done?.status === "done" && open?.status === "open" ? true : null;
-      }, 10_000);
+      }, 30_000);
       expect(folded).toBe(true);
 
       // 1) arm a `done` epic → rejected (rpc_failed), no EpicArmed appended,
@@ -3066,7 +3072,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
           .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
           .get("fn-91-open") as { epic_id: string } | null;
         return row ?? null;
-      }, 10_000);
+      }, 30_000);
       expect(openArmed).not.toBeNull();
 
       // 3) arm a not-yet-folded epic (no `epics` row) → still allowed
@@ -3083,7 +3089,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
           .query("SELECT epic_id FROM armed_epics WHERE epic_id = ?")
           .get("fn-999-never-planned") as { epic_id: string } | null;
         return row ?? null;
-      }, 10_000);
+      }, 30_000);
       expect(unfoldedArmed).not.toBeNull();
 
       // 4) disarm a `done` epic → ALWAYS allowed (the guard gates only
@@ -3100,7 +3106,7 @@ test("fn-774: set_epic_armed rejects arming a done epic, allows open / unfolded 
     },
     { workers: ["wake", "server"] },
   );
-}, 30_000);
+}, 120_000);
 
 // ---------------------------------------------------------------------------
 // fn-749 task .1 — worker-set selector
