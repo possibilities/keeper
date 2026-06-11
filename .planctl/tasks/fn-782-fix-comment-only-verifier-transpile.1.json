@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fix transpile witness fileName",
-  "updated_at": "2026-06-11T02:18:21.891169Z"
+  "updated_at": "2026-06-11T04:46:07.973674Z",
+  "worker_done_at": "2026-06-11T04:46:07.973674Z"
 }

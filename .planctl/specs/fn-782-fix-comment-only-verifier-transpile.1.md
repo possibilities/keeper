@@ -28,5 +28,5 @@ set and land as one commit.
 - [ ] biome + typecheck + the assert-comment-only test green.
 
 ## Done summary
-
+Threaded a JSX-keyed fileName into both transpileModule calls in the comment-only verifier so module-scope generic arrows parse as TS, not JSX. Added a generic-arrow fixture that false-positived the transpile witness before the fix.
 ## Evidence
