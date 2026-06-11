@@ -277,7 +277,37 @@ In those cases, don't commit at all unless asked.
   > - Ambiguous between **inline** and **`/plan:defer`** → default to **`/plan:defer`**. Capturing it for later is cheaper than an unwanted commit landing now.
 
 - **Decomposable / multi-module / contract change** → invoke `/plan:plan` via the
-  Skill tool. `resolved_ref` = the resulting `fn-N` epic slug.
+  Skill tool. `resolved_ref` = the resulting `fn-N` epic slug. One invocation per
+  root cause — see the right-sizing block below for how many epics a round writes
+  and in what order.
+
+**Right-size the round's routing — take all the space the survivors need.**
+Routing is not one-survivor-one-handoff: look at the surviving clusters TOGETHER,
+group them by root cause, and pick the smallest configuration that gets every
+survivor a correct `resolved_ref`. The full option space is yours:
+
+- **One root cause behind many clusters** → ONE epic. Stamp every member key
+  `routed` to the same slug — a family is one fix, not N epics.
+- **Several independent root causes** → several epics in the SAME round. Invoke
+  `/plan:plan` once per root cause, back to back; independent epics need no
+  sequencing, so write them all now and stamp each cluster to its own slug.
+- **A later epic depends on an earlier one's RESULTS** (diagnose-then-fix split
+  across epics; a fix that changes what the second problem even looks like) →
+  write the first epic, let autopilot build it, and block on its completion with
+  `keeper await complete <fn-N-slug>` (the `keeper:await` skill wires the
+  monitor). When the await releases, RE-VERIFY the still-pending clusters against
+  the new HEAD (Step 5 again, scoped to them) before planning the next epic — the
+  landed work may have fixed, reshaped, or invalidated them.
+- **Dependent but nothing forces it now** → don't await. Verdict the dependent
+  cluster `needs-work` and let the NEXT round plan it against the post-land HEAD;
+  the resurface/re-verify machinery exists precisely so a round can end.
+
+Sequencing has a real cost (the round blocks on a build), so prefer parallel epic
+writes whenever the work is genuinely independent, and prefer one epic whenever
+clusters share a root cause. Awaiting is the right call only when a later plan
+NEEDS the earlier result to be written well — not as a default posture. Announce
+the chosen configuration in one short sentence (N epics, which sequenced, which
+deferred) before the first `/plan:plan`, so the human can override.
 
 After routing, ensure each routed key's ledger row carries the final
 `resolved_ref` (re-stamp if the route produced a different ref than anticipated).
