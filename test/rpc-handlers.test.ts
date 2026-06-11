@@ -384,7 +384,7 @@ test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", 
 test("parseDispatchKey: rejects unknown verbs", () => {
   expect(() => parseDispatchKey("rm::fn-1-foo")).toThrow(BadParamsError);
   expect(() => parseDispatchKey("plan::fn-1-foo")).toThrow(BadParamsError);
-  // fn-756 removed the approve window; `approve` is no longer a dispatch verb.
+  // `approve` is not a dispatch verb (the dispatch verb set excludes it).
   expect(() => parseDispatchKey("approve::fn-1-foo")).toThrow(BadParamsError);
 });
 

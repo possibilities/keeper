@@ -25,14 +25,15 @@
  *
  * - watchLoop (data_version-driven, ~50ms): on every commit by any OTHER
  *   connection, re-query `jobs` for the candidate set (state IN
- *   ('working','stopped') — fn-743 dropped the old `AND pid IS NOT NULL`
- *   exclusion), diff against the locally-tracked set, and call
- *   `ExitWatcher.add(pid, jobIdToken)` for each new PID-BEARING row. An
- *   `alreadyDead` result (kqueue ESRCH or the post-register kill-0 probe)
- *   posts an exit message immediately — the live-exit window between "row
- *   appears" and "kernel arms" closes there. A NULL-pid row (unwatchable —
- *   the old exclusion made these live forever, the stuck-`stopped` incident)
- *   is reaped on sight via a PIDLESS exit message (no kernel registration).
+ *   ('working','stopped'), with NO pid filter), diff against the
+ *   locally-tracked set, and call `ExitWatcher.add(pid, jobIdToken)` for each
+ *   new PID-BEARING row. An `alreadyDead` result (kqueue ESRCH or the
+ *   post-register kill-0 probe) posts an exit message immediately — the
+ *   live-exit window between "row appears" and "kernel arms" closes there.
+ *   Invariant: the candidate set INCLUDES NULL-pid rows. A NULL-pid row is
+ *   unwatchable (the kernel watcher can never arm it); excluding it from the
+ *   candidate set strands the session in `stopped` forever. It is reaped on
+ *   sight via a PIDLESS exit message (no kernel registration).
  *   Rows leaving the candidate set (state moved to ended/killed, or pid
  *   cleared) are dropped from the local set; the kqueue/epoll registration is
  *   `EV_ONESHOT`/`EPOLLONESHOT` so we never need to issue EV_DELETE.
@@ -82,7 +83,7 @@ export interface ExitMessage {
   kind: "exit";
   jobId: string;
   /**
-   * The exited process pid, OR `null` for a PIDLESS REAP (fn-743) of a
+   * The exited process pid, OR `null` for a PIDLESS REAP of a
    * `stopped`/`working` row whose persisted pid is NULL — an unwatchable row
    * the kernel watcher can never arm. The diff loop posts the pidless variant
    * the instant it sees such a row (no kernel registration); main's verifier
@@ -117,7 +118,7 @@ interface TrackedEntry {
 
 interface CandidateRow {
   job_id: string;
-  /** NULL for the fn-743 pidless-reap rows (unwatchable, reaped on sight). */
+  /** NULL for the pidless-reap rows (unwatchable, reaped on sight). */
   pid: number | null;
   start_time: string | null;
 }
@@ -163,12 +164,12 @@ export async function diffLoop(
 ): Promise<void> {
   const interval = Math.max(MIN_POLL_MS, pollMs);
   const versionQuery = db.query("PRAGMA data_version");
-  // fn-743: candidate set now INCLUDES NULL-pid rows. The old
-  // `pid IS NOT NULL` exclusion was the root cause of the stuck-`stopped`
-  // incident — a NULL-pid row was never watched and never folded to terminal,
-  // so it lived forever. We surface it here and `diffTick` reaps it on sight
-  // via a pidless exit message (no kernel registration — there's no pid to
-  // arm). Watchable (pid-bearing) rows still arm the kernel watcher as before.
+  // Invariant: the candidate set INCLUDES NULL-pid rows (no `pid IS NOT NULL`
+  // filter). A NULL-pid row is never watched and never folds to terminal on
+  // its own, so excluding it strands the session in `stopped` forever. We
+  // surface it here and `diffTick` reaps it on sight via a pidless exit
+  // message (no kernel registration — there's no pid to arm). Watchable
+  // (pid-bearing) rows arm the kernel watcher.
   const candidatesQuery = db.query(
     `SELECT job_id, pid, start_time FROM jobs
        WHERE state IN ('working','stopped')`,

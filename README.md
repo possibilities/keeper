@@ -339,29 +339,17 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `zellij_session: autopilot`, `autoclose_windows: true`). Unknown keys are
-   silently ignored — a legacy
-   `exec_backend: ghostty` carried over from a pre-fn-654 config has no effect.
-
-   (The legacy `KEEPER_WATCH_ROOT` env var is retired; if still set, the daemon
-   logs a one-line deprecation warning and ignores it.)
+   `zellij_session: autopilot`, `autoclose_windows: true`). Unknown config keys
+   are silently ignored.
 
 4. **Load the keeper plugin via the arthack launcher** (`--plugin-dir`). The
    repo root carries `.claude-plugin/plugin.json` (canonical manifest) and
    `hooks/hooks.json` (events-writer command paths). The arthack launcher
    appends `--plugin-dir ~/code/keeper` for every profile, so a fresh
    session auto-loads the hook (and any future `skills/`) from this repo.
-   No symlink step.
-
-   **Migration from the retired `~/.claude/plugins/keeper` symlink:** if
-   you have one from a prior install, REMOVE IT before the next session —
-   otherwise the launcher load and the symlink double-register the hook
-   and every invocation writes two `events` rows. There is no runtime
-   dedup guard (keeper's "no in-process self-heal" stance).
-
-   ```sh
-   rm -f ~/.claude/plugins/keeper
-   ```
+   No symlink step. A `~/.claude/plugins/keeper` symlink double-registers the
+   hook (every invocation writes two `events` rows, with no runtime dedup
+   guard) — there must be none.
 
 5. **Symlink the LaunchAgent template** into `~/Library/LaunchAgents/`:
 
@@ -565,8 +553,8 @@ Keeper has no `install` verb. Wire it up manually:
    Chrome-style "restore previous session" snapshot — agents + zellij
    metadata for `scripts/restore-agents.ts` to replay against) as a
    **two-tier descriptor** `{schema_version: 2, last_session, current}`:
-   `current` is the continuous live mirror (may be empty — the fn-689
-   empty-skip floor is retired), and `last_session` is the FROZEN restore
+   `current` is the continuous live mirror (may be empty — there is no
+   empty-skip floor), and `last_session` is the FROZEN restore
    source written only at boot-promote and the `>0→0` collapse edge, so a
    reboot that reseeds a smaller set still offers the full pre-crash set
    from `last_session`. Overridable via `KEEPER_RESTORE_FILE` for tests. Set
@@ -815,8 +803,7 @@ event-log/reducer/hook touch. Run any of them with
   `--- <session> ---` heading). Plain text (no SGR baked in) so sidecars
   and non-TTY output stay clean; a missing pane drops the pill entirely,
   so rows with no backend coords show nothing at all (never `undefined`,
-  never a placeholder). The dead `backend_exec_tab_{id,name}` columns
-  that once fed a `<tab>` slot were dropped in fn-710 (T2). When the row is
+  never a placeholder). There is no `<tab>` slot. When the row is
   expanded in insert mode, a per-job Monitors section (schema v51 /
   fn-682, enriched fn-718) lists the live background shells the
   session is running, parsed off the `jobs.monitors` JSON-array
@@ -1114,7 +1101,7 @@ event-log/reducer/hook touch. Run any of them with
   ```
 
 The next four subcommands are keeper's git-coordination verbs (epic
-fn-715, the native TypeScript port of the retired Python `jobctl`). Unlike
+fn-715). Unlike
 every reader above, `commit-work` is the FIRST keeper subcommand that WRITES
 to git — it never touches the event log; it reads `file_attributions`
 through a fresh read-only `openDb({readonly:true})` connection and stages /
@@ -1707,10 +1694,9 @@ a `sortable` / `filters` / `jsonColumns` key); the shared
 `projectJobRow` + `renderJobsBody` helpers append an optional trailing
 `[p<pane>]` pane pill, gracefully showing nothing when the pane is
 absent. The pill surfaces identically on `keeper jobs` (CLI list mode)
-and the TUI (the view-shell's shared `renderBody` callback). Two further
-`jobs.backend_exec_tab_{id,name}` columns once carried a daemon-resolved
-`<tab>` slot; that feed was retired and the columns dropped in fn-710
-(schema v55), leaving only the three hook-fed coords above.
+and the TUI (the view-shell's shared `renderBody` callback). There is no
+`<tab>` slot: the three hook-fed coords above are the whole backend-coords
+surface.
 keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `48`
 (whitelist-only; keeper-py reads `jobs` / `git_status` / `meta`, not
 the `backend_exec_*` columns).
@@ -1907,21 +1893,20 @@ from the event's own `ts`; no `Dispatched` events in the pre-v50 log →
 empty table on historical replay). keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
 frozenset gains `50` (whitelist-only).
 
-fn-724 hardened the producer side of this lifecycle WITHOUT touching the
-reducer, schema, or `keeper/api.py` (`SCHEMA_VERSION` stays 59). The mint is
-now DURABLE-ack'd: `confirmRunning` AWAITS main's `Dispatched` insert
+The producer side of this lifecycle is hardened independently of the reducer,
+schema, and `keeper/api.py` (`SCHEMA_VERSION` stays 59). The mint is
+DURABLE-ack'd: `confirmRunning` AWAITS main's `Dispatched` insert
 (an id-correlated `dispatched-ack{id, ok}` reply, bounded by a
 `DISPATCHED_ACK_TIMEOUT_MS` floor) BEFORE calling `launch()`, so outbox
 ordering — intent committed before side-effect — is load-bearing rather than
 fire-and-forget; on `ok:false` or ack-timeout the worker aborts without
 launching (any phantom row clears via the TTL sweep), closing the
-SessionStart-drains-before-`dispatched` double-dispatch race. fn-762 moved the
-ack AHEAD of the reducer drain: main replies the moment `insertEvent.run`
+SessionStart-drains-before-`dispatched` double-dispatch race. The ack sits
+AHEAD of the reducer drain: main replies the moment `insertEvent.run`
 returns (the ack promises INSERT durability only — never the fold), THEN pumps
 the reducer in its own guarded block, so a slow or throwing pump can neither
-delay the worker's launch nor flip the already-sent ack. Outbox ordering is
-UNCHANGED — the insert still precedes the launch; only the ack moves ahead of
-the drain. The launch
+delay the worker's launch nor flip the already-sent ack. Outbox ordering holds
+— the insert precedes the launch; the ack sits ahead of the drain. The launch
 outcome is now three-way (`ConfirmOutcome`): a launch-failure
 (`launch.ok===false`) still mints `DispatchFailed`; a clean bind before the
 ceiling is `"ok"`; but a ceiling hit (60s) with `launch.ok===true` is
@@ -1939,19 +1924,19 @@ reconciler uses to dedup against `jobs`) carries the sticky failure record
 for the server-side reconciler. It is folded purely from the event log: a
 `DispatchFailed` synthetic event UPSERTs a row (`failed_at`, `reason`,
 `source` — `launch` / `precheck`); a `DispatchCleared`
-synthetic event DELETEs by the same key. (fn-724 retired `confirm_timeout` as
-a source: a confirm-poll ceiling hit with `launch.ok===true` is now the
-`"indoubt"` outcome that mints NO `DispatchFailed` — it keeps the
+synthetic event DELETEs by the same key. `confirm_timeout` is not a
+`DispatchFailed` source: a confirm-poll ceiling hit with `launch.ok===true` is
+the `"indoubt"` outcome that mints NO `DispatchFailed` — it keeps the
 `pending_dispatches` row and lets the TTL sweep emit `DispatchExpired` — so
 the only `DispatchFailed` sources are a hard `launch.ok===false` and a
-precheck refusal.) No auto-retry; the only way to
+precheck refusal. No auto-retry; the only way to
 clear a row is the `retry_dispatch` RPC (human-driven), which routes through
 the server-worker → main → `DispatchCleared` mint. A from-scratch re-fold
 reproduces the table byte-identically (no fold-time wall clock; the event's
-own `ts` lands in `failed_at`). The pre-fn-661 standalone `keeper autopilot`
-loop (with `isLiveSessionInRoot` / `zellij query-tab-names` dedup) is
-retired; the CLI collapses to a thin viewer + the `play` / `pause` / `retry`
-controls. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `42`
+own `ts` lands in `failed_at`). The `keeper autopilot` CLI is a thin viewer
+plus the `play` / `pause` / `retry` controls; the reconcile loop runs
+server-side in the daemon. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
+gains `42`
 (whitelist-only; keeper-py reads `jobs` / `git_status` / `meta`, not
 `dispatch_failures`).
 As of schema v41 (fn-651), the `usage` projection tells the truth about
@@ -2162,13 +2147,12 @@ stamp is up to `ceilingMs` stale by then; a single refresh restarts the
 window — never compounding across cycles, the perpetual-suppression trap). Each
 cycle prunes expired entries (`sweepRedispatchCooldown`, mirroring
 `server-worker.ts`'s `reapStuckPending`, wrapped so a sweep throw can't bounce
-the daemon). **This supersedes the approve-only, reducer-side fn-734** —
-fn-735 generalizes the same concept to all verbs, dispatch-side, in-memory.
+the daemon). **The cooldown covers all verbs, dispatch-side, in-memory.**
 The row discharges when `SessionStart` folds (reducer DELETE) or via a producer-side
 TTL sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s,
 `DispatchExpired`) — so both the launch → SessionStart blind window and the
 `dispatch-pending` occupancy self-clear without any live zellij probe (the
-`verb::id` tab name is now a cosmetic label only). SAFETY SEAM: the fn-721
+`verb::id` tab name is a cosmetic label only). SAFETY SEAM: the fn-721
 occupant closes the cross-cycle double-dispatch window; `confirmRunning`'s
 serial wait still covers the intra-cycle race and stays in place. The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's

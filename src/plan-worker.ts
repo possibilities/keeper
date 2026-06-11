@@ -244,9 +244,10 @@ export interface RecheckPendingMessage {
   /**
    * Optional repo-root scope. When set, drain ONLY the pending paths in `repo`
    * (main stamps it with the originating snapshot's `project_dir`). Absent →
-   * global drain over every {@link PlanScanner.pendingRepos}. Either way the
-   * drain probes each repo with ONE batched `git cat-file` instead of a per-path
-   * spawn, so a cross-repo pending set no longer starves the message loop.
+   * global drain over every {@link PlanScanner.pendingRepos}. Invariant: the
+   * drain probes each repo with ONE batched `git cat-file`, never a per-path
+   * spawn — a per-path spawn over a cross-repo pending set starves the message
+   * loop.
    */
   repo?: string;
 }
@@ -417,9 +418,9 @@ type PlanKind = "epic" | "task" | "task-state" | "epic-state";
  * match the planctl `LocalFileStateStore` shape (see
  * `apps/planctl/planctl/store.py:151`); files there end in `.state.json` so a
  * stray `*.json` (non-state) under `.planctl/state/{tasks,epics}/` rejects.
- * The epic-state sidecar still classifies as `"epic-state"` so its path is
- * recognized, but keeper no longer ingests any field from it — no change/delete
- * arm acts on an epic-state path anymore.
+ * The epic-state sidecar classifies as `"epic-state"` so its path is
+ * recognized, but keeper ingests no field from it — no change/delete arm acts
+ * on an epic-state path.
  *
  * Pure — does no I/O. Exported for unit reach.
  */
@@ -3163,11 +3164,11 @@ function main(): void {
   // whose FSEvent was dropped — and was therefore NEVER gated into pending —
   // is still recovered). The poll NEVER writes the DB.
   //
-  // the db-poll NO LONGER calls `recheckPending`. The old global
-  // recheck spawned one synchronous `git cat-file` per pending path across all
-  // repos on every DB bump — the per-path storm that starved the loop and let
-  // the realtime bypass queue for ~74s. The pending drain is now covered by
-  // the repo-SCOPED triggers (the `recheck-pending` post on every
+  // Invariant: the db-poll does NOT call `recheckPending`. A global recheck
+  // spawns one synchronous `git cat-file` per pending path across all repos on
+  // every DB bump — that per-path storm starves the loop and queues the
+  // realtime bypass for tens of seconds. The pending drain is instead covered
+  // by the repo-SCOPED triggers (the `recheck-pending` post on every
   // `GitSnapshot`/`Commit`, the per-repo reflog watch) plus the 5s heartbeat
   // floor, all batched-per-repo. The `reconcilePlanctlDirs` re-scan STAYS — it
   // is the FSEvents-drop recovery a recheck-only path cannot replace (a dropped

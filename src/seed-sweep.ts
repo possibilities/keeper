@@ -28,21 +28,21 @@
  *   (pid was recycled into a different process — the original is gone).
  * - pid ALIVE, stored start_time present, OS start_time matches → leave alone
  *   (still the same process).
- * - pid ALIVE, stored start_time NULL (legacy / pre-schema-v9 row) → leave
+ * - pid ALIVE, stored start_time NULL → leave
  *   alone (we cannot prove recycle without the (pid, start_time) two-field
  *   identity, and a bare pid match is unsafe on macOS where the pid space is
  *   small).
- * - pid NULL (fn-743): the row has NO process to probe and the exit-watcher's
- *   `pid IS NOT NULL` filter never armed it — so a NULL-pid `stopped`/`working`
- *   row would live forever (the 11-stuck-rows incident, 2026-06-08). Such a
- *   row is terminal BY CONSTRUCTION (unwatchable, unprovable-alive), so emit a
- *   PIDLESS Killed (`{pid:null}`) to reap it. The reducer's Killed fold honors
- *   a pidless reap ONLY against a row whose persisted pid is ALSO NULL, so this
- *   can never knock out a watchable row. NULL-pid origin: a SessionStart whose
- *   pid binding landed NULL (events-log ingester schema-skew degrade, a
- *   dead-letter replay that dropped the pid, or a legacy pre-pid-capture row) —
- *   unavoidable from the projection side, hence the reaper is the fallback the
- *   epic's "early proof point" anticipated.
+ * - pid NULL: the row has NO process to probe and is unwatchable (the
+ *   exit-watcher can never arm a NULL-pid row). Invariant: such a row is
+ *   terminal BY CONSTRUCTION (unwatchable, unprovable-alive); excluding it
+ *   from the candidate set strands the session in `stopped` forever, so we
+ *   emit a PIDLESS Killed (`{pid:null}`) to reap it. The reducer's Killed fold
+ *   honors a pidless reap ONLY against a row whose persisted pid is ALSO NULL,
+ *   so this can never knock out a watchable row. NULL-pid origin: a
+ *   SessionStart whose pid binding landed NULL (events-log ingester
+ *   schema-skew degrade, a dead-letter replay that dropped the pid, or a row
+ *   with no pid captured) — unavoidable from the projection side, hence the
+ *   reaper is the fallback.
  *
  * Determinism + safety invariants:
  * - **Producer-only liveness probing.** This module IS the producer (the boot
@@ -198,10 +198,10 @@ function insertKilledEvent(
  */
 export function seedKilledSweep(db: Database): void {
   // Candidate set: every non-terminal lifecycle row (Q7 scope), INCLUDING
-  // NULL-pid rows (fn-743). A NULL-pid row used to be excluded (`pid IS NOT
-  // NULL`) — that exclusion was the root cause of the stuck-`stopped` incident:
-  // an unwatchable, unprobeable row that lived forever. We now pull it in and
-  // reap it via a pidless Killed (the `row.pid == null` branch below).
+  // NULL-pid rows (no `pid IS NOT NULL` filter). Invariant: a NULL-pid row is
+  // unwatchable and unprobeable; excluding it strands the session in `stopped`
+  // forever. We pull it in and reap it via a pidless Killed (the
+  // `row.pid == null` branch below).
   const rows = db
     .query(
       `SELECT job_id, pid, start_time FROM jobs
@@ -216,11 +216,11 @@ export function seedKilledSweep(db: Database): void {
   for (const row of rows) {
     try {
       if (row.pid == null) {
-        // fn-743: NULL-pid non-terminal row. Nothing to probe — it can never
-        // be watched (exit-watcher armed only `pid IS NOT NULL`) and we can
-        // never prove it alive, so it's terminal by construction. Emit a
-        // pidless Killed; the reducer's pidless-reap arm folds it to 'killed'
-        // (guarded to NULL-pid rows only, so a watchable row is never touched).
+        // NULL-pid non-terminal row. Nothing to probe — it can never be
+        // watched and we can never prove it alive, so it's terminal by
+        // construction. Emit a pidless Killed; the reducer's pidless-reap arm
+        // folds it to 'killed' (guarded to NULL-pid rows only, so a watchable
+        // row is never touched).
         insertKilledEvent(db, row.job_id, null, row.start_time);
         continue;
       }

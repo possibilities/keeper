@@ -17,6 +17,9 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
 - **Babysitters carve-out:** `babysitters/.claude-plugin/plugin.json` is a SECOND,
   deliberate plugin manifest — the agents-only `babysitters` plugin (NO `hooks.json`,
   so it never double-registers the hook), loaded via its own `--plugin-dir`.
+- **Forward-facing advice only** in comments and docs: state current behavior and
+  invariants, not change history (which lives in the diff). Full rule:
+  `promptctl render code-comment-style`.
 
 ## Event-sourcing invariants
 

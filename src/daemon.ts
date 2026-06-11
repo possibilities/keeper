@@ -1855,11 +1855,6 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // (config `claude_projects_root` → absolute path, default `~/.claude/projects`)
   // and passed as the always-populated `workerData.watchRoot`, mirroring how the
   // plan worker receives `roots: resolvePlanRoots()`.
-  if (process.env.KEEPER_WATCH_ROOT) {
-    console.error(
-      "[keeperd] KEEPER_WATCH_ROOT is deprecated and ignored; set `claude_projects_root` in ~/.config/keeper/config.yaml instead",
-    );
-  }
   // Gated on the selector — `null` when unselected; the handler wiring below is
   // guarded so it is never touched.
   const transcriptWorker = want("transcript")

@@ -265,12 +265,10 @@ export function pillOrEmpty(value: unknown, dflt: string): string {
  * blocked case).
  *
  * Returns the leading `' '` so the caller appends unconditionally. Pure
- * function — supersedes the old `cli/board.ts` `validatedPill` that
- * always emitted a bracket (`[validated]` / `[unvalidated]`).
+ * function.
  */
 export function validatedPill(lastValidatedAt: unknown): string {
-  // fn-713 follow-on: SHOW both states (reverses fn-708 omit-default) —
-  // `[validated]` when validated, `[unvalidated]` otherwise.
+  // SHOW both states: `[validated]` when validated, `[unvalidated]` otherwise.
   return lastValidatedAt != null
     ? ` ${pill("validated")}`
     : ` ${pill("unvalidated")}`;
@@ -291,12 +289,10 @@ export function armedPill(isArmed: boolean): string {
 
 /**
  * Render the trailing pill segment for a board TASK LINE (epic fn-708) —
- * the consolidated successor to the old pair
- * `[${runtime_status}] [${worker_phase}]` closure in
- * `cli/board.ts:renderEpicBlock`. Pure `f(task, verdict)` — no readiness
- * recompute, no wall-clock, no env; `verdict` is already in scope at the
- * call site. (fn-756 dropped the third `[approval]` pill with the rest of
- * the approval surface.)
+ * the consolidated `[${runtime_status}] [${worker_phase}]` closure. Pure
+ * `f(task, verdict)` — no readiness recompute, no wall-clock, no env;
+ * `verdict` is already in scope at the call site. There is no `[approval]`
+ * pill: the approval surface does not exist.
  *
  * Two fields, each lossless-consolidated per `~/docs/pill-inventory.md`
  * Part 4:
@@ -338,9 +334,8 @@ export function renderTaskPills(
 
 /**
  * Render the trailing pill segment for a board CLOSE ROW (epic fn-708) —
- * the consolidated successor to the old `[${status}] [${approval}]` closure
- * in `cli/board.ts:renderEpicBlock`. Pure `f(epicRow, verdict)`. (fn-756
- * dropped the `[approval]` pill with the rest of the approval surface.)
+ * the consolidated `[${status}]` closure. Pure `f(epicRow, verdict)`. There
+ * is no `[approval]` pill: the approval surface does not exist.
  *
  *   - **close status (B15)** — the board filter is `status='open'`, so this
  *     pill is the constant `[open]` on the default view; it renders anyway so
@@ -352,11 +347,10 @@ export function renderClosePills(
   epicRow: Record<string, unknown>,
   _verdict: Verdict,
 ): string {
-  // fn-713 follow-on: SHOW the close-row status at its current value
-  // (reverses fn-708 omit-default + the T2 status drop). On the default board
+  // SHOW the close-row status at its current value. On the default board
   // filter `status` is the constant `open`; it renders anyway so every row
   // carries the full state. The `_verdict` arg is retained for call / test
-  // arity. (fn-756 dropped the approval pill.)
+  // arity. There is no approval pill.
   let out = "";
   const statusRaw = epicRow.status;
   const status =

@@ -1,12 +1,11 @@
 /**
- * Parity tests for the TS port of the retired `subagent_invocations.py` parser.
+ * Parity tests for the `src/subagent-invocations.ts` parser.
  *
  * Strategy:
  * 1. Load the golden fixture at `test/fixtures/subagent_invocation_cases.jsonl`.
- *    This is a FROZEN golden — its Python generator was retired (the TS port is
- *    the source of truth and has since diverged from the old parser, e.g. the
- *    FIFO description-at-SubagentStart behavior). Edit the JSONL by hand
- *    alongside deliberate behavior changes in `src/subagent-invocations.ts`.
+ *    This is a FROZEN golden with no generator — `src/subagent-invocations.ts`
+ *    is the source of truth. Edit the JSONL by hand alongside deliberate
+ *    behavior changes in `src/subagent-invocations.ts`.
  * 2. For each case, walk the events through a tiny per-event driver that
  *    mimics what task .3's reducer will do: SubagentStart inserts a row,
  *    SubagentStop closes the matching open row, PostToolUse:Agent folds

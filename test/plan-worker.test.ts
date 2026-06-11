@@ -155,8 +155,8 @@ test("taskIdFromStatePath / taskDefPathFromStatePath: pure path arithmetic", () 
 test("classifyPlanPath: .planctl/state/epics/*.state.json → epic-state (fn-732)", () => {
   // Positive: the planctl LocalFileStateStore shape for the epic runtime-state
   // sidecar — 4-segment tail under `state/epics/` with `.state.json` suffix.
-  // (fn-756: keeper no longer ingests any field from this sidecar, but the
-  // path still classifies so it is recognized, not mis-routed.)
+  // Keeper ingests no field from this sidecar, but the path classifies so it
+  // is recognized, not mis-routed.
   expect(classifyPlanPath("/a/b/.planctl/state/epics/fn-1-x.state.json")).toBe(
     "epic-state",
   );
@@ -773,8 +773,8 @@ test("seedFromDb reconstructs workerPhase + runtimeStatus field-identically (no 
   // compares diverge and every embedded task element re-emits a synthetic
   // TaskSnapshot on every daemon boot — silently. This test pins the
   // byte-identity invariant by direct serialization compare, exercising both
-  // the live-stored shape (v19: `worker_phase` + `runtime_status` keys) and
-  // the legacy shape (pre-v19: `status` only) to prove defensive parity.
+  // the live-stored shape (`worker_phase` + `runtime_status` keys) and the
+  // bare shape (`status` only) to prove defensive parity.
   const dbPath = join(tmpDir, "keeper.db");
   const { db } = openDb(dbPath);
   // Live v19 shape: embedded task carries BOTH new keys. A re-fold from the

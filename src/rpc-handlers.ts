@@ -21,9 +21,8 @@
  *   `retry_dispatch` — the autopilot control plane (each round-trips through a
  *   synthetic event via the worker→main bridge).
  *
- * (fn-756 removed the `set_task_approval` / `set_epic_approval` handlers along
- * with the rest of the approval surface — keeper completes work on
- * worker/closer-done alone.)
+ * There is no approval RPC surface (`set_task_approval` / `set_epic_approval`):
+ * keeper completes work on worker/closer-done alone.
  *
  * Contract a handler MUST honor:
  * - Validate `params` shape and throw `BadParamsError` on mismatch (the
