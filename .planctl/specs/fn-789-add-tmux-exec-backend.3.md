@@ -63,5 +63,5 @@ including a TmuxPaneSnapshot row — extend test/reducer-projections.test.ts.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Added a self-gating tmux pane-snapshot poll arm to the restore-worker: on the existing data_version pulse it probes tmux list-panes when a live tmux job has a NULL session, posts a TmuxPaneSnapshot event main mints, and the reducer fills the session name fill-only (never overwrites, order-insensitive re-fold). Dedup hash + gate keep it quiescent.
 ## Evidence
