@@ -31,5 +31,5 @@ grep SKILL.md for "--bundle", "save-bundle", "Snippets in bundle" returns nothin
 - [ ] No backward-facing prose introduced
 
 ## Done summary
-
+Stripped snippet-pipeline prose from the plan skill (Phase 1a wire-format strip and Phase 4 --bundle parenthetical deleted) and updated CLAUDE.md (set-verbs + scaffold flags appended to removed-verbs guardrail, real_sketch dropped from slow-bucket markers).
 ## Evidence
