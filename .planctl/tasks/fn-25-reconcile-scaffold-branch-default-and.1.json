@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "medium",
   "title": "Align branch default, trim dead comments",
-  "updated_at": "2026-06-11T17:50:44.232482Z"
+  "updated_at": "2026-06-11T17:56:06.533688Z",
+  "worker_done_at": "2026-06-11T17:56:06.533688Z"
 }

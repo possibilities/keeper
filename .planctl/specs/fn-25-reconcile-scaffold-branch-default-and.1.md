@@ -35,5 +35,5 @@ persisted verbatim, order-preserving).
 - [ ] `uv run pytest tests/ --run-slow` stays green.
 
 ## Done summary
-
+Standardized the scaffold-minted branch_name default on 'main' across run_scaffold.py, run_epic_create.py, normalize_epic, and the cli docstrings; pinned it with a no-branch scaffold test. Trimmed the deleted render-spec verb reference from the two models.py snippet/bundle normalize comments.
 ## Evidence
