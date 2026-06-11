@@ -231,6 +231,46 @@ export function extractBackgroundTasks(
 }
 
 /**
+ * Schema v59 (fn-719 task 1): the provenance-filtered occupancy fact
+ * derived from a `jobs.monitors` JSON-array value. `true` when ANY entry
+ * is a WORKER-LAUNCHED monitor (`kind in {monitor, bash-bg}`); `ambient`
+ * session-watchers (the plugin/harness-armed chatctl bus, a never-claimed
+ * background shell) NEVER count — they were not launched by the work
+ * session's own turn, so they must not occupy the autopilot mutex.
+ *
+ * Shared, so the reducer's embedded-fact stamp (Stop fold) and the `keeper
+ * dash` AGENTS rollup glyph derive the worker-monitor fact from the SAME
+ * bytes — the glyph cannot drift from the board pill. Pure function of the
+ * serialized monitors string `computeMonitors` produces: same input bytes
+ * always yield the same boolean, so the embedded-fact stamp stays re-fold
+ * deterministic. NEVER throws (a throw inside the reducer's open BEGIN
+ * IMMEDIATE rolls back the cursor; the dash read-side must never throw
+ * mid-frame): a malformed / non-array cell folds to `false`.
+ *
+ * `'[]'` (the drop-when-dead empty snapshot, the terminal-clear write on
+ * SessionEnd / Killed) yields `false` — so a terminal job auto-resolves
+ * the fact to `false` for free, riding the existing `monitors='[]'` clear.
+ */
+export function hasLiveWorkerMonitor(monitorsJson: string): boolean {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(monitorsJson);
+  } catch {
+    return false;
+  }
+  if (!Array.isArray(parsed)) {
+    return false;
+  }
+  return parsed.some(
+    (entry) =>
+      entry != null &&
+      typeof entry === "object" &&
+      (entry as { kind?: unknown }).kind !== "ambient" &&
+      typeof (entry as { kind?: unknown }).kind === "string",
+  );
+}
+
+/**
  * Anchored match for Claude Code's `<task-notification>…<status>killed</status>`
  * envelope, injected through `UserPromptSubmit` when a backgrounded task is
  * killed (most commonly during session shutdown). `^` anchors the opener so a

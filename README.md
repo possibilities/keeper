@@ -1011,11 +1011,17 @@ event-log/reducer/hook touch. Run any of them with
   **PLAN** region (one row per open epic in server `sort_path` order: armed
   marker, `epic_number title` label, the per-epic readiness verdict, and an
   `N/M` completed-task count that counts ONLY `completed` perTask verdicts and
-  is hidden at zero tasks), and an **AGENTS** region (working sessions PLUS
-  stopped-but-needs-you, never dropping a needs-you row; sorted needs-you-first
-  then `created_at` ASC with a `job_id` tiebreak; label `title → plan_ref →
-  job_id`, trailing elapsed band replaced by `awaiting` / `failed` when the
-  session is blocked on a human). **Data sources:** the readiness collections
+  is hidden at zero tasks), and an **AGENTS** region (EVERY non-terminal session
+  — working AND stopped — on one unified "most-recent-activity-started"
+  timeline; sorted `COALESCE(active_since, created_at)` DESC with a `job_id`
+  tiebreak, so a session rises the moment it starts a run and re-promotes to the
+  top on a genuine restart; needs-you no longer affects ordering. Each row's
+  leading glyph is the per-job rolled-up board icon
+  (working→sync, sub-agent→cogs/warn, monitor→eye/warn, idle→circleO), computed
+  uniformly for plan-linked and ad-hoc jobs via the shared readiness rollup;
+  label `title → plan_ref → job_id`, trailing elapsed band replaced by
+  `awaiting` / `failed` when the session is blocked on a human).
+  **Data sources:** the readiness collections
   ride one `subscribeReadiness` connection; `autopilot_state` and `armed_epics`
   ride their own `subscribeCollection` subs (the readiness conn subscribes them
   internally but does NOT expose them on the snapshot, so the header needs the
@@ -1787,6 +1793,17 @@ board flags armed epics with an `[armed]` pill (both subscribe the new
 `armed_epics` collection over the UDS socket). keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `62` (whitelist-only; keeper-py
 reads neither `autopilot_state` nor `armed_epics`).
+As of schema v65 (fn-784), the nullable `jobs.active_since REAL` column is the
+"most-recent-activity-started" recency key for the `keeper dash` AGENTS unified
+timeline (`COALESCE(active_since, created_at)` DESC). It is stamped to
+`event.ts` ONLY on the rising edge into `working` (the UserPromptSubmit arm's
+`state != 'working'` guard, NOT `active_since IS NULL`), so it re-promotes a
+job on a genuine stopped/terminal→working restart and HOLDS through mid-run
+churn (the explicit `ELSE active_since` branch). The migration adds the column
+NULL with NO backfill — backfilling from `updated_at` ("last touched") would
+conflate it with "run started" and is non-deterministic; a never-prompted job
+stays NULL and sorts by `created_at`. keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
+frozenset gains `65` (whitelist-only; keeper-py does not read `active_since`).
 As of schema v51 (fn-682), the new `jobs.monitors` JSON-array column is the
 live per-job view of the background shells a session is running — the
 plugin-armed chatctl bus, an agent-armed `keeper await`, a backgrounded
@@ -2384,9 +2401,9 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped together on ApiError / InputRequest folds and cleared on the next UPS/SessionStart revival — last_input_request_* also clear on PreToolUse/PostToolUse, gated):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; active_since (v65) is the dash AGENTS recency key, stamped to event.ts on the rising edge into 'working' (NULL on a never-prompted job); last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped together on ApiError / InputRequest folds and cleared on the next UPS/SessionStart revival — last_input_request_* also clear on PreToolUse/PostToolUse, gated):
 sqlite3 ~/.local/state/keeper/keeper.db \
-  'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
+  'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, active_since, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
 # Planctl-spawned jobs only — indexed via the partial `idx_jobs_plan_ref WHERE plan_ref IS NOT NULL` so this lands the index, not a scan:
 sqlite3 ~/.local/state/keeper/keeper.db \

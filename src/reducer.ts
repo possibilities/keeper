@@ -19,6 +19,7 @@ import type { Database, SQLQueryBindings } from "bun:sqlite";
 import {
   extractBackgroundTasks,
   extractCommit,
+  hasLiveWorkerMonitor,
   isKilledTaskNotification,
   type MonitorEntry,
   parsePlanRef,
@@ -6244,44 +6245,6 @@ function computeMonitors(
     description: t.description,
   }));
   return JSON.stringify(entries);
-}
-
-/**
- * Schema v59 (fn-719 task 1): the provenance-filtered occupancy fact
- * derived from a `jobs.monitors` JSON-array value. `true` when ANY entry
- * is a WORKER-LAUNCHED monitor (`kind in {monitor, bash-bg}`); `ambient`
- * session-watchers (the plugin/harness-armed chatctl bus, a never-claimed
- * background shell) NEVER count — they were not launched by the work
- * session's own turn, so they must not occupy the autopilot mutex.
- *
- * Pure function of the serialized monitors string `computeMonitors`
- * produces — same input bytes always yield the same boolean, so the
- * embedded-fact stamp at the Stop fold's monitors-write site is re-fold
- * deterministic. NEVER throws inside the open BEGIN IMMEDIATE transaction:
- * a malformed / non-array cell folds to `false` (no live worker monitor),
- * mirroring `computeMonitors`'s own `'[]'`-on-malformed contract.
- *
- * `'[]'` (the drop-when-dead empty snapshot, the terminal-clear write on
- * SessionEnd / Killed) yields `false` — so a terminal job auto-resolves
- * the fact to `false` for free, riding the existing `monitors='[]'` clear.
- */
-function hasLiveWorkerMonitor(monitorsJson: string): boolean {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(monitorsJson);
-  } catch {
-    return false;
-  }
-  if (!Array.isArray(parsed)) {
-    return false;
-  }
-  return parsed.some(
-    (entry) =>
-      entry != null &&
-      typeof entry === "object" &&
-      (entry as { kind?: unknown }).kind !== "ambient" &&
-      typeof (entry as { kind?: unknown }).kind === "string",
-  );
 }
 
 /**

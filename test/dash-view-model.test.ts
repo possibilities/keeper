@@ -5,8 +5,9 @@
  * tier). Asserts the SETTLED dash semantics: header permutations, PLAN rows
  * (server order, fallback label, verdict glyph+word incl. map-miss, N/M
  * completed-only with miss=not-done + zero-task hide, armed marker), AGENTS
- * rows (needs-you inclusion + never-drop with label coalescing, null-verb
- * glyph fallback, needs-you-first sort with created_at/job_id tiebreak,
+ * rows (all-non-terminal inclusion + never-drop with label coalescing, the
+ * unified COALESCE(active_since, created_at) DESC sort with job_id tiebreak +
+ * NULL fallback + needs-you-no-reorder, the per-job rollup glyph matrix,
  * elapsed bands, awaiting/failed annotation), connection states, and the
  * empty-state placeholders.
  */
@@ -26,7 +27,7 @@ import {
 import { FA_CLASSIC, glyphForToken } from "../src/icon-theme";
 import type { ReadinessSnapshot } from "../src/readiness";
 import type { ReadinessClientSnapshot } from "../src/readiness-client";
-import type { Epic, Job, Task } from "../src/types";
+import type { Epic, Job, SubagentInvocation, Task } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -101,6 +102,26 @@ function makeJob(overrides: Partial<Job> = {}): Job {
     backend_exec_session_id: null,
     backend_exec_pane_id: null,
     monitors: null,
+    ...overrides,
+  };
+}
+
+function makeSub(
+  overrides: Partial<SubagentInvocation> = {},
+): SubagentInvocation {
+  return {
+    job_id: "session-1",
+    agent_id: "a1",
+    turn_seq: 0,
+    ts: 0,
+    tool_use_id: null,
+    subagent_type: null,
+    description: null,
+    prompt_chars: 0,
+    status: "running",
+    duration_ms: null,
+    last_event_id: 0,
+    updated_at: 0,
     ...overrides,
   };
 }
@@ -392,7 +413,7 @@ test("plan: armed marker (accent) only when epic_id is in the armed set", () => 
 // AGENTS
 // ---------------------------------------------------------------------------
 
-test("agents: includes working jobs and stopped-but-needs-you; drops idle stopped", () => {
+test("agents: includes EVERY non-terminal job — working AND idle stopped", () => {
   const jobs = new Map<string, Job>([
     ["w", makeJob({ job_id: "w", state: "working" })],
     [
@@ -403,11 +424,12 @@ test("agents: includes working jobs and stopped-but-needs-you; drops idle stoppe
         last_input_request_at: 5,
       }),
     ],
-    // Idle stopped (no needs-you stamp) → excluded.
+    // Idle stopped (no needs-you stamp) is now INCLUDED on the unified timeline
+    // — the collections defaultFilter already excludes ended/killed.
     ["idle", makeJob({ job_id: "idle", state: "stopped" })],
   ]);
   const { agents } = build({ snapshot: makeSnap({ jobs }) });
-  expect(agents.map((a) => a.jobId).sort()).toEqual(["ny", "w"]);
+  expect(agents.map((a) => a.jobId).sort()).toEqual(["idle", "ny", "w"]);
 });
 
 test("agents: never drops a needs-you row; label coalesces title→plan_ref→job_id", () => {
@@ -447,44 +469,186 @@ test("agents: never drops a needs-you row; label coalesces title→plan_ref→jo
   expect(rowText(withRef.agents[0].segments)).toContain("fn-3-baz.2");
 });
 
-test("agents: null/unknown plan_verb falls back to the generic session glyph", () => {
-  const generic = glyphForToken("working", FA_CLASSIC) as string;
-  const jobs = new Map<string, Job>([
-    ["j", makeJob({ job_id: "j", state: "working", plan_verb: null })],
-  ]);
-  const { agents } = build({ snapshot: makeSnap({ jobs }) });
-  expect(rowText(agents[0].segments)).toContain(generic);
+test("agents: per-job rollup glyph matrix (sync/cogs/warn/eye/circleO + ambient→idle)", () => {
+  const SYNC = glyphForToken("running:job-running", FA_CLASSIC) as string;
+  const COGS = glyphForToken("running:sub-agent-running", FA_CLASSIC) as string;
+  const WARN = glyphForToken("running:sub-agent-stale", FA_CLASSIC) as string;
+  const EYE = glyphForToken("running:monitor-running", FA_CLASSIC) as string;
+  const CIRCLE_O = glyphForToken("stopped", FA_CLASSIC) as string;
+  // sub-agent-stale and monitor-stale share the warn triangle.
+  expect(glyphForToken("running:monitor-stale", FA_CLASSIC)).toBe(WARN);
+
+  const liveMon = JSON.stringify([{ id: "m1", kind: "monitor" }]);
+  const ambientMon = JSON.stringify([{ id: "a1", kind: "ambient" }]);
+
+  // job_id → [job overrides, running subagents for that job, expected glyph].
+  const cases: [Partial<Job>, SubagentInvocation[], string][] = [
+    // working → sync
+    [{ state: "working" }, [], SYNC],
+    // stopped + fresh subagent → cogs
+    [{ state: "stopped" }, [makeSub({ ts: 990 })], COGS],
+    // stopped + only stale subagents → warn
+    [{ state: "stopped" }, [makeSub({ ts: 0 })], WARN],
+    // stopped + live worker monitor, fresh updated_at → eye
+    [{ state: "stopped", monitors: liveMon, updated_at: 1000 }, [], EYE],
+    // stopped + live worker monitor, stale updated_at → warn
+    [{ state: "stopped", monitors: liveMon, updated_at: 0 }, [], WARN],
+    // stopped, idle → circleO
+    [{ state: "stopped" }, [], CIRCLE_O],
+    // ambient-only monitor → idle (NOT eye): ambient never occupies.
+    [{ state: "stopped", monitors: ambientMon }, [], CIRCLE_O],
+  ];
+
+  for (const [jobOverride, subs, expectedGlyph] of cases) {
+    const job = makeJob({ job_id: "j", ...jobOverride });
+    const subagentInvocations = subs.map((s) => ({ ...s, job_id: "j" }));
+    const { agents } = build({
+      snapshot: makeSnap({
+        jobs: new Map([["j", job]]),
+        subagentInvocations,
+      }),
+      nowSec: 1000,
+    });
+    // The leading glyph is the first segment's text (glyph + trailing space).
+    expect(agents[0].segments[0].text).toContain(expectedGlyph);
+  }
 });
 
-test("agents: needs-you first, then created_at ASC, then job_id ASC tiebreak", () => {
+test("agents: read-side never throws on malformed monitors JSON (folds to idle)", () => {
+  const CIRCLE_O = glyphForToken("stopped", FA_CLASSIC) as string;
   const jobs = new Map<string, Job>([
-    // working, created later
-    ["b", makeJob({ job_id: "b", state: "working", created_at: 20 })],
-    // working, created earlier
-    ["a", makeJob({ job_id: "a", state: "working", created_at: 10 })],
-    // needs-you, same created_at as its sibling → job_id tiebreak
+    ["j", makeJob({ job_id: "j", state: "stopped", monitors: "{not json" })],
+  ]);
+  const { agents } = build({ snapshot: makeSnap({ jobs }), nowSec: 1000 });
+  expect(agents[0].segments[0].text).toContain(CIRCLE_O);
+});
+
+test("agents: unified COALESCE(active_since, created_at) DESC sort, job_id ASC tiebreak", () => {
+  const jobs = new Map<string, Job>([
+    // stopped, recent active_since → outranks the older-active_since working job
     [
-      "ny2",
+      "stopped-recent",
       makeJob({
-        job_id: "ny2",
-        state: "working",
-        created_at: 5,
-        last_input_request_at: 1,
+        job_id: "stopped-recent",
+        state: "stopped",
+        active_since: 100,
       }),
     ],
+    // working, but older active_since
     [
-      "ny1",
+      "working-old",
+      makeJob({ job_id: "working-old", state: "working", active_since: 50 }),
+    ],
+    // two equal active_since → job_id ASC tiebreak (eq-a before eq-b)
+    ["eq-b", makeJob({ job_id: "eq-b", state: "stopped", active_since: 75 })],
+    ["eq-a", makeJob({ job_id: "eq-a", state: "stopped", active_since: 75 })],
+  ]);
+  const { agents } = build({ snapshot: makeSnap({ jobs }) });
+  // 100 > 75 (a before b) > 50 — needs-you / state no longer affect order.
+  expect(agents.map((a) => a.jobId)).toEqual([
+    "stopped-recent",
+    "eq-a",
+    "eq-b",
+    "working-old",
+  ]);
+});
+
+test("agents: NULL active_since falls back to created_at (never-prompted job)", () => {
+  const jobs = new Map<string, Job>([
+    // no active_since (never prompted) but newest created_at
+    [
+      "fresh",
       makeJob({
-        job_id: "ny1",
+        job_id: "fresh",
         state: "working",
+        active_since: null,
+        created_at: 90,
+      }),
+    ],
+    // active_since older than fresh's created_at fallback
+    [
+      "ran",
+      makeJob({
+        job_id: "ran",
+        state: "stopped",
+        active_since: 80,
+        created_at: 10,
+      }),
+    ],
+    // no active_since, oldest created_at
+    [
+      "old",
+      makeJob({
+        job_id: "old",
+        state: "stopped",
+        active_since: null,
         created_at: 5,
-        last_input_request_at: 1,
       }),
     ],
   ]);
   const { agents } = build({ snapshot: makeSnap({ jobs }) });
-  // needs-you group first (ny1 before ny2 on job_id), then working by created.
-  expect(agents.map((a) => a.jobId)).toEqual(["ny1", "ny2", "a", "b"]);
+  // keys: fresh=90, ran=80, old=5 → DESC.
+  expect(agents.map((a) => a.jobId)).toEqual(["fresh", "ran", "old"]);
+});
+
+test("agents: needs-you does NOT reorder; the awaiting annotation still renders", () => {
+  const jobs = new Map<string, Job>([
+    // needs-you but OLDER active_since → must NOT float to the top
+    [
+      "ny",
+      makeJob({
+        job_id: "ny",
+        state: "stopped",
+        active_since: 10,
+        last_input_request_at: 5,
+      }),
+    ],
+    // no needs-you, newer active_since → sorts first purely on recency
+    ["fresh", makeJob({ job_id: "fresh", state: "working", active_since: 50 })],
+  ]);
+  const { agents } = build({ snapshot: makeSnap({ jobs }) });
+  expect(agents.map((a) => a.jobId)).toEqual(["fresh", "ny"]);
+  // The needs-you row (now at index 1, not floated up) keeps its `awaiting`
+  // annotation — the signal is re-positioned, not lost.
+  const nyRow = agents[1];
+  expect(nyRow.jobId).toBe("ny");
+  expect(rowText(nyRow.segments)).toContain("awaiting");
+  expect(roleOf(nyRow.segments, "awaiting")).toBe("attention");
+});
+
+test("agents: a wire row delivers active_since as number | null, never undefined", () => {
+  // Guards against the collections-columns omission from task .1: a job whose
+  // active_since is explicitly null still sorts (by created_at), not via an
+  // undefined-coerced-to-0 key.
+  const jobs = new Map<string, Job>([
+    [
+      "a",
+      makeJob({
+        job_id: "a",
+        state: "stopped",
+        active_since: null,
+        created_at: 30,
+      }),
+    ],
+    [
+      "b",
+      makeJob({
+        job_id: "b",
+        state: "stopped",
+        active_since: 20,
+        created_at: 5,
+      }),
+    ],
+  ]);
+  for (const job of jobs.values()) {
+    // The wire type is number | null — assert the fixture honors it.
+    expect(
+      job.active_since === null || typeof job.active_since === "number",
+    ).toBe(true);
+  }
+  const { agents } = build({ snapshot: makeSnap({ jobs }) });
+  // a's created_at fallback (30) > b's active_since (20).
+  expect(agents.map((a) => a.jobId)).toEqual(["a", "b"]);
 });
 
 test("agents: elapsed bands floor to the largest unit, no 'ago'", () => {

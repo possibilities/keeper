@@ -19,9 +19,9 @@
  */
 
 import { FA_CLASSIC, glyphForToken } from "../icon-theme";
-import { formatPill, type Verdict } from "../readiness";
+import { formatPill, rolledUpJobVerdict, type Verdict } from "../readiness";
 import type { ReadinessClientSnapshot } from "../readiness-client";
-import type { Job } from "../types";
+import type { Job, SubagentInvocation } from "../types";
 import type { Role } from "./theme";
 
 // ---------------------------------------------------------------------------
@@ -320,40 +320,6 @@ function buildPlan(
 // AGENTS
 // ---------------------------------------------------------------------------
 
-/** A job is "needs you" when any of the three blocked-on-human stamps is set:
- * an input request, a permission prompt, or an API error. Never dropped. */
-function needsYou(job: Job): boolean {
-  return (
-    job.last_input_request_at != null ||
-    job.last_permission_prompt_at != null ||
-    job.last_api_error_at != null
-  );
-}
-
-/** The internal projection of one AGENTS row before segment assembly. */
-interface AgentEntry {
-  readonly job: Job;
-  readonly needsYou: boolean;
-}
-
-/**
- * The role glyph for a session, keyed on `plan_verb`: `work` → worker,
- * `close` → closer, `approve` → approved. A null / unknown verb falls back to
- * the generic `working` session glyph — the broadening over board's
- * `buildCurrentRows`, which DROPS null-verb rows (AGENTS must keep them).
- */
-function roleGlyph(planVerb: string | null): string {
-  const token =
-    planVerb === "work"
-      ? "worker"
-      : planVerb === "close"
-        ? "closer"
-        : planVerb === "approve"
-          ? "approved"
-          : "working";
-  return glyphOr(token, "•");
-}
-
 /**
  * The job's label, coalescing `title → plan_ref → job_id` so a needs-you row
  * is NEVER blank (and never dropped for a missing title/plan_ref).
@@ -389,47 +355,73 @@ function elapsedBand(deltaSec: number): string {
 }
 
 /**
- * Build the AGENTS region — working jobs PLUS stopped-but-needs-you. Sort:
- * needs-you first, then working; within each group `created_at` ASC with a
- * `job_id` ASC tiebreak. Each row: the role glyph (verb-keyed, generic
- * fallback), the coalesced label, and a trailing annotation — the elapsed band
+ * Build the AGENTS region — EVERY non-terminal job (working AND stopped) on one
+ * unified "most-recent-activity-started" timeline. The collections
+ * `defaultFilter` already excludes `ended`/`killed`, so every job in
+ * `snapshot.jobs` is included; needs-you no longer affects ordering (its
+ * annotation still renders, only re-positioned).
+ *
+ * Sort: `COALESCE(active_since, created_at)` DESC with a `job_id` ASC tiebreak
+ * — a job rises the moment it starts a run and descends as newer runs start
+ * above it, jumping back to the top on a genuine restart. A never-prompted job
+ * (`active_since` NULL) sorts by `created_at`. The null guard is explicit so a
+ * JS `null` never coerces to `0`.
+ *
+ * Each row's leading glyph is the per-job rolled-up board verdict
+ * ({@link rolledUpJobVerdict}: working→sync, sub-agent→cogs/warn,
+ * monitor→eye/warn, idle→circleO), computed uniformly for plan-linked and
+ * ad-hoc jobs and rendered via the same `verdictPill`/`roleForVerdict`
+ * machinery as the PLAN region. The trailing annotation — the elapsed band
  * (from `updated_at` vs `nowSec`) REPLACED by an `awaiting` (attention) /
- * `failed` (failed) annotation when one is present.
+ * `failed` (failed) annotation — is unchanged (annotation only, no sort effect).
  */
 function buildAgents(
   snapshot: ReadinessClientSnapshot,
   nowSec: number,
 ): AgentRow[] {
-  const entries: AgentEntry[] = [];
-  for (const job of snapshot.jobs.values()) {
-    const ny = needsYou(job);
-    // Include every `working` job and every needs-you job (any state).
-    if (job.state === "working" || ny) {
-      entries.push({ job, needsYou: ny });
+  // Running-subagent index, built the SAME way readiness does: filter to
+  // `status === "running"` (the only status that signals live motion).
+  const subRunningByJobId = new Map<string, SubagentInvocation[]>();
+  for (const inv of snapshot.subagentInvocations) {
+    if (inv.status !== "running") {
+      continue;
+    }
+    const arr = subRunningByJobId.get(inv.job_id);
+    if (arr === undefined) {
+      subRunningByJobId.set(inv.job_id, [inv]);
+    } else {
+      arr.push(inv);
     }
   }
 
-  // needs-you first; within a group created_at ASC, job_id ASC tiebreak.
-  entries.sort((a, b) => {
-    if (a.needsYou !== b.needsYou) {
-      return a.needsYou ? -1 : 1;
+  const jobs = Array.from(snapshot.jobs.values());
+
+  // Unified timeline: COALESCE(active_since, created_at) DESC, job_id ASC
+  // tiebreak. Guard the NULL explicitly so it falls back to created_at rather
+  // than coercing to 0.
+  jobs.sort((a, b) => {
+    const ka = a.active_since ?? a.created_at;
+    const kb = b.active_since ?? b.created_at;
+    if (ka !== kb) {
+      return kb - ka; // DESC
     }
-    const ca = a.job.created_at;
-    const cb = b.job.created_at;
-    if (ca !== cb) {
-      return ca - cb;
-    }
-    return a.job.job_id < b.job.job_id
-      ? -1
-      : a.job.job_id > b.job.job_id
-        ? 1
-        : 0;
+    return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
   });
 
   const rows: AgentRow[] = [];
-  for (const { job } of entries) {
+  for (const job of jobs) {
     const out: Segment[] = [];
-    out.push({ text: `${roleGlyph(job.plan_verb)} `, role: "motion" });
+
+    // Leading glyph: the per-job rolled-up verdict → pill glyph, colored by the
+    // verdict's role. An idle job (null verdict) renders the `stopped` glyph in
+    // the terminal/dim role.
+    const verdict = rolledUpJobVerdict(job, subRunningByJobId, nowSec);
+    if (verdict === null) {
+      out.push({ text: `${glyphOr("stopped", "○")} `, role: "terminal" });
+    } else {
+      const { glyph } = verdictPill(verdict);
+      out.push({ text: `${glyph} `, role: roleForVerdict(verdict) });
+    }
     out.push({ text: jobLabel(job), role: "accent" });
 
     // Trailing annotation: awaiting / failed REPLACE the elapsed band.

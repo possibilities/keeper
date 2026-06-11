@@ -42,6 +42,7 @@
  *   - else `[blocked:<first non-completed row's reason in traversal order>]`.
  */
 
+import { hasLiveWorkerMonitor } from "./derivers";
 import {
   type EpicDepResolution,
   resolveEpicDep as resolveEpicDepLeaf,
@@ -1427,6 +1428,85 @@ function embeddedMonitorOccupies(
     anyEmbeddedJobHasLiveMonitor(embedded) &&
     !allLiveMonitorsAreStale(embedded, now, MONITOR_RELEASE_SEC)
   );
+}
+
+/**
+ * The per-job rolled-up liveness verdict for the `keeper dash` AGENTS region —
+ * the SAME precedence the board pill applies, computed uniformly for a single
+ * top-level {@link Job} (plan-linked or ad-hoc). Returns `null` for an idle
+ * job (no live worker / sub-agent / monitor) so the caller renders the
+ * `stopped` glyph; otherwise a `running:*` {@link Verdict}.
+ *
+ * Precedence mirrors the board:
+ *   1. job `state === 'working'`            → `running:job-running`
+ *   2. else a running sub-agent on this job → `running:sub-agent-running`,
+ *      or `running:sub-agent-stale` once EVERY surviving running sub-agent is
+ *      past {@link SUBAGENT_STALENESS_SEC}.
+ *   3. else a live worker-launched monitor  → `running:monitor-running`,
+ *      or `running:monitor-stale` once it is past {@link MONITOR_STALENESS_SEC}.
+ *   4. else                                  → `null` (idle).
+ *
+ * The worker-monitor fact is derived from the job's raw `monitors` JSON via the
+ * shared {@link hasLiveWorkerMonitor} deriver (worker-launched `monitor`/
+ * `bash-bg` only; `ambient` excluded), the SAME bytes `buildEmbeddedJob` reads
+ * — so the AGENTS glyph cannot drift from the board pill. The single job is
+ * wrapped as a one-element embedded-like array so the existing module-private
+ * predicates' LOGIC is reused verbatim, not reimplemented.
+ *
+ * Read-side: NEVER throws — a malformed `monitors` cell folds to "no monitor"
+ * (the deriver's own contract), never an exception mid-frame.
+ *
+ * `now` is the frame's reference seconds (the dash's `nowSec`); the staleness
+ * splits read it, never `Date.now()`.
+ */
+export function rolledUpJobVerdict(
+  job: Job,
+  subRunningByJobId: Map<string, SubagentInvocation[]>,
+  now: number,
+): Verdict | null {
+  // 1. The job's own working state outranks everything — `running:job-running`.
+  if (anyEmbeddedJobWorking([job])) {
+    return { tag: "running", reason: { kind: "job-running" } };
+  }
+
+  // 2. A running sub-agent on this job — fresh vs. stale split.
+  const oneJob = [{ job_id: job.job_id }];
+  if (anyEmbeddedJobHasRunningSubagent(oneJob, subRunningByJobId)) {
+    const stale = allRunningSubagentsAreStale(
+      oneJob,
+      subRunningByJobId,
+      now,
+      SUBAGENT_STALENESS_SEC,
+    );
+    return {
+      tag: "running",
+      reason: { kind: stale ? "sub-agent-stale" : "sub-agent-running" },
+    };
+  }
+
+  // 3. A live worker-launched monitor — derived from raw `monitors` the SAME
+  // way `buildEmbeddedJob` stamps `has_live_worker_monitor`. Fresh vs. stale
+  // split on the job's `updated_at` lease.
+  const monitorJob = [
+    {
+      has_live_worker_monitor: hasLiveWorkerMonitor(job.monitors ?? "[]"),
+      updated_at: job.updated_at,
+    },
+  ];
+  if (anyEmbeddedJobHasLiveMonitor(monitorJob)) {
+    const stale = allLiveMonitorsAreStale(
+      monitorJob,
+      now,
+      MONITOR_STALENESS_SEC,
+    );
+    return {
+      tag: "running",
+      reason: { kind: stale ? "monitor-stale" : "monitor-running" },
+    };
+  }
+
+  // 4. Idle — no live worker / sub-agent / monitor.
+  return null;
 }
 
 /**
