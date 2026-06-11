@@ -29,6 +29,7 @@ export const SUBCOMMANDS = [
   "git",
   "usage",
   "autopilot",
+  "builds",
   "dash",
   "await",
   "commit-work",
@@ -48,6 +49,7 @@ Subcommands:
   git                 Git status frames (TTY: live TUI; non-TTY: one snapshot + exit)
   usage               Usage frames (TTY: live TUI; non-TTY: one snapshot + exit)
   autopilot           Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)
+  builds              Buildbot status dashboard (TTY: live TUI; non-TTY: one snapshot + exit)
   dash                Read-only opening screen: header + PLAN + AGENTS (TTY-only)
   await               Block until a planctl/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
@@ -58,7 +60,7 @@ Flags:
   --help, -h     Show this help
   --version, -V  Show keeper version
 
-The five snapshot-capable viewer subcommands (board/jobs/git/usage/autopilot)
+The six snapshot-capable viewer subcommands (board/jobs/git/usage/autopilot/builds)
 auto-detect a non-TTY stdout (piped, redirected, CI) and emit ONE current frame
 followed by a machine-parseable \`keeper-meta:\` JSON line, then exit — instead of
 streaming forever. Override per subcommand with \`--snapshot\` (force one-shot on a
@@ -140,6 +142,7 @@ export async function main(): Promise<void> {
     git: async (argv) => (await import("./git")).main(argv),
     usage: async (argv) => (await import("./usage")).main(argv),
     autopilot: async (argv) => (await import("./autopilot")).main(argv),
+    builds: async (argv) => (await import("./builds")).main(argv),
     dash: async (argv) => (await import("./dash")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
