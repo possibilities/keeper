@@ -40,12 +40,11 @@ self-contained investigation prompt per genuinely-new finding. It opens
 nothing under any `KEEPER_*` path — its only writes are its own bookkeeping under
 `~/.local/state/babysitters/performance/`.
 
-The human decision (2026-06-11): push alerting made sense fighting a live fire;
-the standing model is pull-based triage. Live-fire categories
+The standing model is pull-based triage, not push alerting. Live-fire categories
 (`reducer-wedge`, `duplicate-live-workers`, `autopilot-stall`) surface at the
 next triage run rather than in real time — an accepted trade.
 
-## No notification path, no watchdog (human, 2026-06-11)
+## No notification path, no watchdog
 
 - **NO notification path.** No agent spawn, no `botctl`/`notifyctl`, no paging,
   no ack file. Findings are discovered by RUNNING triage, not by pages — so the
@@ -120,9 +119,9 @@ Each `Finding`:
   its `rescues_total` rose since the baseline. The late-rescue arm classifies on
   `change_to_rescue_ms` — the TRUE change-to-rescue latency (`now − committed_at`
   for the change the heartbeat discharged), NOT the idle-inflated `staleness_ms`
-  (`now − last_fast_path_at`, which balloons with quiet minutes — the 2026-06-10
-  false-critical: a 2s-old commit rescued after 27 idle minutes reported
-  staleness_ms=1611292). Latency null (a dirty-tree/cold-boot rescue or an
+  (`now − last_fast_path_at`, which balloons with quiet minutes — an
+  idle-inflated value never reflects the true change-to-rescue latency, e.g. a
+  freshly-committed change rescued after a long idle stretch). Latency null (a dirty-tree/cold-boot rescue or an
   old-format pre-fn-771 line) or < 10s → HEALTHY; ≥ 10s → warning; ≥ 60s →
   critical. `evidence` carries the backstop/class, `changeToRescueMs` (the
   classification input), the warn/crit thresholds, and the raw `stalenessMs`
@@ -204,10 +203,12 @@ unchanged.
   untrusted fields neutralized so a field cannot break out of the fence. The
   Evidence-fence `key:`/`severity:`/`category:` lines are a human-readable echo of
   the canonical frontmatter.
-- **`latest.md`:** when a tick writes multiple findings, the scanner mirrors the
-  LEAD (highest-severity) finding's file to `latest.md` once, via tmp-then-rename
-  so a reader never sees a half-written file and `latest.md` stays a REGULAR file
-  (never a symlink). Triage may read mid-tick.
+- **`latest.md`:** the scanner rewrites `latest.md` on every followup write, so
+  when a tick writes multiple findings it ends up mirroring the LAST-written
+  finding (the write loop walks the gated-order selection with no severity sort).
+  Each rewrite goes via tmp-then-rename, so a reader never sees a half-written
+  file and `latest.md` stays a REGULAR file (never a symlink). Triage may read
+  mid-tick.
 
 ## Cross-repo prompt pointers
 
