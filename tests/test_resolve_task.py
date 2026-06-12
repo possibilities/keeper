@@ -20,7 +20,7 @@ import json
 import subprocess
 
 import pytest
-from .conftest import run_cli
+from .conftest import run_cli, set_roots
 
 # resolve-task is read-only and spawns no real git, but every test drives roots
 # discovery against the ``_roots_at_tmp_project`` CONFIG_PATH below. That tmp
@@ -31,20 +31,18 @@ pytestmark = pytest.mark.real_roots
 
 
 @pytest.fixture(autouse=True)
-def _roots_at_tmp_project(tmp_path, monkeypatch):
+def _roots_at_tmp_project(request, tmp_path, monkeypatch):
     """Point planctl roots discovery at an isolated root holding only ``tmp_path``.
 
     Same shape as ``tests/test_claim.py::_roots_at_tmp_project`` — without
     this autouse fixture, discovery scans the real ``~/code`` default and
     can't find the seeded ``fn-N`` task → spurious TASK_NOT_FOUND. Ambiguity
-    tests override CONFIG_PATH themselves; the later ``setattr`` wins.
+    tests call ``set_roots`` again themselves; the later call wins.
     """
     root = tmp_path / "_resolve_root"
     root.mkdir()
     (root / tmp_path.name).symlink_to(tmp_path, target_is_directory=True)
-    cfg = tmp_path / "_resolve_roots_config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
@@ -192,7 +190,7 @@ def test_resolve_task_not_found(project):
 # ---------------------------------------------------------------------------
 
 
-def _make_two_projects_with_same_task(tmp_path, monkeypatch):
+def _make_two_projects_with_same_task(request, tmp_path, monkeypatch):
     """Seed two sibling projects under a shared root, both holding the same task id.
 
     Overrides the autouse CONFIG_PATH to point at the two-project root so
@@ -247,17 +245,17 @@ def _make_two_projects_with_same_task(tmp_path, monkeypatch):
         proj_b / ".planctl" / "epics" / f"{epic_id}.json",
     )
 
-    # Point CONFIG_PATH at this root, overriding the autouse fixture.
-    cfg = tmp_path / "_ambiguous_roots_config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    # Point roots discovery at this root, overriding the autouse fixture.
+    set_roots(request, monkeypatch, [root])
 
     return proj_a, proj_b, task_id
 
 
-def test_resolve_task_ambiguous(tmp_path, monkeypatch):
+def test_resolve_task_ambiguous(request, tmp_path, monkeypatch):
     """Same task id in two projects under the configured roots → AMBIGUOUS_TASK_ID."""
-    proj_a, proj_b, task_id = _make_two_projects_with_same_task(tmp_path, monkeypatch)
+    proj_a, proj_b, task_id = _make_two_projects_with_same_task(
+        request, tmp_path, monkeypatch
+    )
 
     code, obj, output = _invoke(["resolve-task", task_id])
     assert code != 0, output
@@ -270,9 +268,11 @@ def test_resolve_task_ambiguous(tmp_path, monkeypatch):
     assert str(proj_b) in candidates
 
 
-def test_resolve_task_project_disambiguates(tmp_path, monkeypatch):
+def test_resolve_task_project_disambiguates(request, tmp_path, monkeypatch):
     """--project <path> bypasses discovery and resolves cleanly across a collision."""
-    proj_a, proj_b, task_id = _make_two_projects_with_same_task(tmp_path, monkeypatch)
+    proj_a, proj_b, task_id = _make_two_projects_with_same_task(
+        request, tmp_path, monkeypatch
+    )
 
     code, obj, output = _invoke(["resolve-task", task_id, "--project", str(proj_a)])
     assert code == 0, output

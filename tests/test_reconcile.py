@@ -23,34 +23,32 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from .conftest import run_cli
+from .conftest import run_cli, set_roots
 
 # reconcile's verdict is computed from real ``Task:``-trailer commits (parsed
 # via ``git log``), HEAD-visibility (``git cat-file``), and an epic-progress
 # tally over the ``planctl_git_repo`` fixture's real history — the real git IS
 # the subject, so this whole file is ``real_git`` (slow bucket: no
 # autocommit/dirty-probe stubs, real ``git init`` + commits). It also drives
-# roots discovery against the ``_roots_at_tmp_project`` CONFIG_PATH below, which
-# must win over the autouse empty-discovery isolation — ``real_roots`` opts onto
+# roots discovery against the ``_roots_at_tmp_project`` ``set_roots`` root
+# below, which must win over the autouse empty-discovery isolation — ``real_roots`` opts onto
 # that controlled tmp root.
 pytestmark = [pytest.mark.real_git, pytest.mark.real_roots]
 
 
 @pytest.fixture(autouse=True)
-def _roots_at_tmp_project(tmp_path, monkeypatch):
+def _roots_at_tmp_project(request, tmp_path, monkeypatch):
     """Point planctl roots discovery at an isolated root holding only ``tmp_path``.
 
     Same shape as ``tests/test_resolve_task.py::_roots_at_tmp_project`` — without
     this autouse fixture, discovery scans the real ``~/code`` default and can't
-    find the seeded ``fn-N`` task. Ambiguity tests override CONFIG_PATH
-    themselves; the later ``setattr`` wins.
+    find the seeded ``fn-N`` task. Ambiguity tests call ``set_roots`` again
+    themselves; the later call wins.
     """
     root = tmp_path / "_reconcile_root"
     root.mkdir()
     (root / tmp_path.name).symlink_to(tmp_path, target_is_directory=True)
-    cfg = tmp_path / "_reconcile_roots_config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:

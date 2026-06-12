@@ -29,7 +29,7 @@ import json
 from pathlib import Path
 
 import pytest
-from .conftest import _write_git_skeleton, run_cli, seed_epic
+from .conftest import _write_git_skeleton, run_cli, seed_epic, set_roots
 
 # Every test here exercises cross-project epic resolution: the dep resolver and
 # scaffold collision checks must run the REAL discovery scan against the
@@ -62,7 +62,7 @@ def _planctl_init(proj: Path) -> None:
 
 
 @pytest.fixture
-def two_projects(tmp_path, monkeypatch):
+def two_projects(request, tmp_path, monkeypatch):
     """Two planctl projects under one shared root; cwd starts in project B.
 
     Yields ``(root, proj_a, proj_b)`` where both are git-initialised planctl
@@ -80,9 +80,7 @@ def two_projects(tmp_path, monkeypatch):
     proj_a.mkdir()
     proj_b.mkdir()
 
-    cfg = tmp_path / "_xproject_roots.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
     # Stand up project A. `init` self-commits its bootstrap files inline, so
     # the baseline is clean once the verb returns — no manual commit needed.
@@ -101,7 +99,7 @@ def two_projects(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def three_projects(tmp_path, monkeypatch):
+def three_projects(request, tmp_path, monkeypatch):
     """Three planctl projects under one shared root; cwd starts in project C.
 
     Like ``two_projects`` but adds a third project C so ambiguous-id tests can
@@ -121,9 +119,7 @@ def three_projects(tmp_path, monkeypatch):
     for p in (proj_a, proj_b, proj_c):
         p.mkdir()
 
-    cfg = tmp_path / "_xproject3_roots.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
     for proj in (proj_a, proj_b, proj_c):
         monkeypatch.chdir(proj)
@@ -165,6 +161,7 @@ def _seed_epic_in(project_path: Path, monkeypatch, *, title: str) -> str:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only  # calls discovery.resolve_epic_globally in-process
 def test_resolve_epic_globally_cwd_hot_path(two_projects, monkeypatch):
     """An epic in cwd's own project resolves via the cwd short-circuit."""
     from planctl.discovery import resolve_epic_globally
@@ -180,6 +177,7 @@ def test_resolve_epic_globally_cwd_hot_path(two_projects, monkeypatch):
     assert res.owners == []
 
 
+@pytest.mark.python_only  # calls discovery.resolve_epic_globally in-process
 def test_resolve_epic_globally_cross_project(two_projects, monkeypatch):
     """An epic in a sibling project resolves via the global discovery step."""
     from planctl.discovery import resolve_epic_globally
@@ -196,6 +194,7 @@ def test_resolve_epic_globally_cross_project(two_projects, monkeypatch):
     assert res.epic_path == proj_a / ".planctl" / "epics" / f"{epic_a}.json"
 
 
+@pytest.mark.python_only  # calls discovery.resolve_epic_globally in-process
 def test_resolve_epic_globally_not_found(two_projects):
     """An id that exists nowhere yields a ResolveResult with both fields None."""
     from planctl.discovery import resolve_epic_globally
@@ -208,6 +207,7 @@ def test_resolve_epic_globally_not_found(two_projects):
     assert res.owners == []
 
 
+@pytest.mark.python_only  # calls discovery.resolve_epic_globally in-process
 def test_resolve_epic_globally_ambiguous(two_projects, monkeypatch):
     """Legacy dup state: same id in two projects → ambiguous, owners listed."""
     from planctl.discovery import resolve_epic_globally
@@ -232,6 +232,7 @@ def test_resolve_epic_globally_ambiguous(two_projects, monkeypatch):
     assert proj_b.resolve() in owners
 
 
+@pytest.mark.python_only  # calls discovery.resolve_epic_globally in-process
 def test_resolve_epic_globally_single_repo_fallback(
     planctl_git_repo, monkeypatch, tmp_path
 ):
@@ -257,6 +258,7 @@ def test_resolve_epic_globally_single_repo_fallback(
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only  # calls discovery.resolve_epic_globally in-process
 def test_resolve_epic_globally_number_only_cwd(two_projects, monkeypatch):
     """A bare `fn-N` resolves the cwd-local epic and returns its full slug id."""
     from planctl.discovery import resolve_epic_globally
@@ -273,6 +275,7 @@ def test_resolve_epic_globally_number_only_cwd(two_projects, monkeypatch):
     assert res.project_path.resolve() == proj_b.resolve()
 
 
+@pytest.mark.python_only  # calls discovery.resolve_epic_globally in-process
 def test_resolve_epic_globally_number_only_cross_project(two_projects, monkeypatch):
     """A bare `fn-N` resolves a sibling-project epic via the global step."""
     from planctl.discovery import resolve_epic_globally
@@ -640,6 +643,7 @@ def test_cross_project_cycle_rejected_and_rolled_back(two_projects, monkeypatch)
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only  # injects an in-process discover_projects failure
 def test_add_deps_discover_projects_raises_degrades_gracefully(
     two_projects, monkeypatch
 ):

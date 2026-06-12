@@ -26,6 +26,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+
+import pytest
 from pathlib import Path
 from unittest.mock import patch
 
@@ -288,6 +290,7 @@ def test_check_epic_tree_in_memory_emits_touched_repos_warning(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only
 def test_run_validate_calls_shared_integrity_helper(tmp_path, monkeypatch):
     """``run_validate.py:--epic`` must route through
     ``validate_epic_integrity_with_warnings`` — patch the helper at its source
@@ -319,6 +322,7 @@ def test_run_validate_calls_shared_integrity_helper(tmp_path, monkeypatch):
     assert called_data_dir == project_path / ".planctl"
 
 
+@pytest.mark.python_only
 def test_run_validate_no_epic_still_iterates_through_helper(tmp_path, monkeypatch):
     """Validate without ``--epic`` walks every epic on disk; each gets one
     call to the shared helper."""

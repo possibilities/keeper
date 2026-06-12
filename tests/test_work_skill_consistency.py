@@ -14,7 +14,7 @@ This module guards the `/plan:work` skill template against two regressions:
    content before `agentId`, so `re.match` (with its implicit `^`) silently
    returns `None`; this test pins the contract so any drift is loud.
 
-All CLI invocations use ``CliRunner`` (in-process) — no subprocess.
+All CLI invocations route through the shared ``run_cli`` invoker.
 """
 
 from __future__ import annotations
@@ -23,8 +23,8 @@ import re
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Group A — Verb existence
@@ -105,7 +105,7 @@ def test_work_tmpl_planctl_verbs_have_help(verb_parts: tuple[str, ...]):
     project-independent (no chdir to a planctl project required); Click's
     `--help` short-circuits the command body.
     """
-    result = CliRunner().invoke(cli, [*verb_parts, "--help"])
+    result = run_cli([*verb_parts, "--help"])
     assert result.exit_code == 0, (
         f"planctl {' '.join(verb_parts)} --help failed:\n{result.output}"
     )

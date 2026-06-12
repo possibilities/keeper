@@ -6,7 +6,8 @@ module ships ``seed_state`` — a git-free, CLI-free builder that writes a full
 ``atomic_write_json`` seams the read path runs, so a seeded tree carries zero
 schema drift. Two fixtures support it: ``isolated_roots`` stubs project
 discovery to ``[]`` so re-stamping verbs skip the real ``~/code`` scan, and
-``fixed_clock`` pins ``now_iso()`` for deterministic timestamp assertions.
+``fixed_clock`` pins the clock via ``PLANCTL_NOW`` for deterministic timestamp
+assertions in both engines.
 
 Fast gate (default ``uv run pytest tests/``)
 --------------------------------------------
@@ -38,6 +39,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 from pathlib import Path
 
 import pytest
@@ -84,6 +86,14 @@ def pytest_configure(config):
         "drive real multi-project roots resolution (against a controlled tmp "
         "root, never the real ~/code). Fast-path marker — NOT slow-bucket.",
     )
+    config.addinivalue_line(
+        "markers",
+        "python_only: the Python implementation's internals ARE the subject "
+        "(direct calls into planctl.* functions, asserts on in-process stub "
+        "state). Cannot cross the subprocess boundary, so skipped-VISIBLE under "
+        "conformance (PLANCTL_BIN set) — never silently deselected. The "
+        "documented python-only residue the Bun port re-expresses later.",
+    )
 
     binary = _planctl_bin()
     if binary is not None:
@@ -122,25 +132,42 @@ def pytest_addoption(parser):
         "--run-slow",
         action="store_true",
         default=False,
-        help="Run the slow bucket too (real git/promptctl/wire-marked tests). "
+        help="Run the slow bucket too (real git / wire-marked tests). "
         "Default runs only the near-subprocess-free fast gate.",
     )
 
 
 def pytest_collection_modifyitems(config, items):
-    """Skip the slow bucket by default; keep it visible (skip, never deselect).
+    """Two orthogonal skip-visible gates: the slow bucket and ``python_only``.
 
-    Adds a ``pytest.mark.skip`` to every test carrying a slow-bucket marker
-    unless ``--run-slow`` is passed. Skipping (not deselecting via ``-m``) keeps
-    the slow tests in the collected count as visible skips, so the default run
-    loudly reports what it is *not* running rather than silently dropping it.
+    Both add a ``pytest.mark.skip`` (never deselect via ``-m``) so the skipped
+    tests stay in the collected count as visible skips — the run loudly reports
+    what it is *not* running rather than silently dropping it.
+
+    * The slow bucket (``real_git`` / ``integration`` / ``wire``) is skipped
+      unless ``--run-slow``.
+    * ``python_only`` is skipped under conformance (``PLANCTL_BIN`` set): those
+      tests reach into Python internals that the subprocess engine cannot
+      observe, so they are skip-visible exactly when the slow bucket is *not* —
+      the inverse trigger. They run normally on the in-process default engine.
+
+    The two gates are independent: ``--run-slow`` re-enables the slow bucket but
+    never un-skips ``python_only`` under conformance, and vice versa.
     """
-    if config.getoption("--run-slow"):
-        return
-    skip_slow = pytest.mark.skip(reason="slow bucket — pass --run-slow to run")
-    for item in items:
-        if any(item.get_closest_marker(m) for m in _SLOW_BUCKET_MARKERS):
-            item.add_marker(skip_slow)
+    if not config.getoption("--run-slow"):
+        skip_slow = pytest.mark.skip(reason="slow bucket — pass --run-slow to run")
+        for item in items:
+            if any(item.get_closest_marker(m) for m in _SLOW_BUCKET_MARKERS):
+                item.add_marker(skip_slow)
+
+    if _conformance():
+        skip_py = pytest.mark.skip(
+            reason="python_only — Python internals are the subject, "
+            "cannot cross the conformance subprocess boundary"
+        )
+        for item in items:
+            if item.get_closest_marker("python_only"):
+                item.add_marker(skip_py)
 
 
 @pytest.fixture(autouse=True)
@@ -664,6 +691,51 @@ def run_cli(
     return _run_in_process_engine(args, cwd, env, input_text)
 
 
+def set_roots(request, monkeypatch, roots) -> None:
+    """Point planctl roots discovery at *roots* in an engine-agnostic way.
+
+    The roots config lives at ``~/.config/planctl/config.yaml`` (config.py),
+    a path ``planctl.config.CONFIG_PATH`` resolves once at import against
+    ``$HOME``. The two engines reach it differently:
+
+    * In-process (default): ``CONFIG_PATH`` is already expanded, so a later
+      ``$HOME`` change can't move it — patch the module attribute onto a tmp
+      config file directly.
+    * Conformance: the binary runs in its own subprocess under the per-worker
+      tmp HOME, so it reads ``<that HOME>/.config/planctl/config.yaml``. Write
+      the real file there and restore it on teardown (the conformance HOME is
+      session-shared across the worker's tests); the in-process ``CONFIG_PATH``
+      patch is moot for the subprocess, so skip it.
+
+    *roots* is a list of directories. Replaces the autouse empty-discovery
+    isolation, so callers carry ``@pytest.mark.real_roots`` (a fast-path
+    marker, not slow bucket). Takes ``request`` for the conformance teardown.
+    """
+    body = "roots:\n" + "".join(f"  - {Path(r)}\n" for r in roots)
+    if _conformance():
+        home = _ConformanceHome.home
+        assert home is not None, (
+            "set_roots called under conformance before _conformance_home ran"
+        )
+        cfg = home / ".config" / "planctl" / "config.yaml"
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        prior = cfg.read_text(encoding="utf-8") if cfg.is_file() else None
+        cfg.write_text(body, encoding="utf-8")
+
+        def _restore() -> None:
+            if prior is None:
+                cfg.unlink(missing_ok=True)
+            else:
+                cfg.write_text(prior, encoding="utf-8")
+
+        request.addfinalizer(_restore)
+        return
+
+    cfg = Path(tempfile.mkdtemp()) / "config.yaml"
+    cfg.write_text(body, encoding="utf-8")
+    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+
+
 def _first_json_payload(output: str) -> dict:
     """Return the first stdout line that parses as a JSON object.
 
@@ -901,17 +973,19 @@ def _isolated_roots_default(request, monkeypatch):
 
 @pytest.fixture
 def fixed_clock(monkeypatch):
-    """Pin ``now_iso()`` to a fixed microsecond-precision UTC timestamp.
+    """Pin the clock to a fixed microsecond-precision UTC timestamp via env.
 
-    Every caller resolves the seam via a function-scoped
-    ``from planctl.store import now_iso``, so the name is re-bound from
-    ``planctl.store`` on each call — patching ``planctl.store.now_iso`` is the
-    single correct target (a module-namespace patch would miss nothing because
-    nothing binds the symbol at module scope). The frozen value matches
-    ``now_iso()``'s exact ``%Y-%m-%dT%H:%M:%S.%fZ`` format. Returns the value.
+    Sets ``PLANCTL_NOW`` — the pinned cross-implementation clock contract
+    ``now_iso()`` already honors (store.py) — rather than monkeypatching the
+    function. The env override is engine-agnostic: it drives the in-process
+    ``now_iso()`` (which reads ``os.environ``) for both ``seed_state`` and the
+    default-engine CLI, and the conformance subprocess engine forwards
+    ``PLANCTL_NOW`` into the binary's env (see ``_subprocess_env``), so a
+    ``fixed_clock`` test pins identical stamps in both engines. The frozen value
+    matches ``now_iso()``'s exact ``%Y-%m-%dT%H:%M:%S.%fZ`` format. Returns it.
     """
     frozen = "2026-06-06T00:00:00.000000Z"
-    monkeypatch.setattr("planctl.store.now_iso", lambda: frozen)
+    monkeypatch.setenv("PLANCTL_NOW", frozen)
     return frozen
 
 

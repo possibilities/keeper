@@ -16,15 +16,11 @@ actor.  These tests verify:
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
-
-from .conftest import _git_log_count
+from .conftest import _git_log_count, run_cli
 
 # This file pins the commit-at-mutation-boundary envelope: it stages real files
 # to drive the touched∩dirty intersection that populates ``files`` / ``subject``
@@ -39,11 +35,7 @@ pytestmark = pytest.mark.real_git
 
 
 def _invoke(args: list[str], env: dict | None = None):
-    runner = CliRunner()
-    if env:
-        full_env = {**os.environ, **env}
-        return runner.invoke(cli, args, env=full_env)
-    return runner.invoke(cli, args)
+    return run_cli(args, env=env)
 
 
 def _commit_count(repo: Path) -> int:
@@ -115,11 +107,10 @@ def test_no_git_repo(tmp_path, monkeypatch):
     """In a directory without git, mutations succeed and still emit planctl_invocation."""
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-no-git")
-    runner = CliRunner()
-    r = runner.invoke(cli, ["init"])
+    r = run_cli(["init"])
     assert r.exit_code == 0, r.output
 
-    r = runner.invoke(cli, ["epic", "create", "--title", "No git"])
+    r = run_cli(["epic", "create", "--title", "No git"])
     assert r.exit_code == 0, r.output
     payload = _parse_envelope(r.output)
     assert payload["success"] is True

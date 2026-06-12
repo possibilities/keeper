@@ -21,7 +21,7 @@ from planctl.config import load_roots
 from planctl.discovery import discover_projects
 from planctl.ids import scan_epic_ids_global
 
-from .conftest import run_cli
+from .conftest import run_cli, set_roots
 
 _ENV = {"CLAUDE_CODE_SESSION_ID": "test-roots-discovery-fixture"}
 
@@ -207,7 +207,8 @@ def _extract_epic_id(output):
     raise AssertionError(f"No epic payload found in output:\n{output}")
 
 
-def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
+@pytest.mark.real_roots
+def test_creates_are_per_project_numbered(request, tmp_path, monkeypatch):
     """Two project dirs under one root; each project gets its own monotonic fn-N.
 
     With per-project numbering, project A's first epic is fn-1 and project B's
@@ -222,9 +223,7 @@ def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
     proj_a.mkdir()
     proj_b.mkdir()
 
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
     def _create(cwd, title):
         monkeypatch.chdir(cwd)
@@ -243,13 +242,14 @@ def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
 
 
 @pytest.mark.real_roots
-def test_create_rejects_global_name_collision(tmp_path, monkeypatch):
+def test_create_rejects_global_name_collision(request, tmp_path, monkeypatch):
     """When two projects would mint the same full epic id, the second fails.
 
     The collision check needs the real cross-project discovery scan (against the
-    tmp ``CONFIG_PATH`` root below) to see ``proj_a``'s epic from ``proj_b`` — so
-    ``real_roots`` opts out of the autouse empty-discovery isolation. Sibling
-    per-project-numbering tests don't depend on discovery and stay isolated.
+    ``set_roots`` tmp root below) to see ``proj_a``'s epic from ``proj_b`` — so
+    ``real_roots`` opts out of the autouse empty-discovery isolation. Per-project
+    numbering does not consult discovery, so the sibling test's result is
+    unaffected by the shared root.
     """
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-roots-discovery-fixture")
 
@@ -260,9 +260,7 @@ def test_create_rejects_global_name_collision(tmp_path, monkeypatch):
     proj_a.mkdir()
     proj_b.mkdir()
 
-    cfg = tmp_path / "config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
     monkeypatch.chdir(proj_a)
     assert run_cli(["init"], env=_ENV).exit_code == 0

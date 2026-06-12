@@ -15,8 +15,8 @@ import json
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 
 @pytest.fixture
@@ -31,14 +31,13 @@ def project(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
     return tmp_path
 
 
 def _invoke(args: list[str]):
-    return CliRunner(mix_stderr=False).invoke(cli, args)
+    return run_cli(args)
 
 
 def _make_task(project: Path) -> str:
@@ -64,7 +63,7 @@ def test_worker_resume_typed_envelope(project: Path, monkeypatch):
     result = _invoke(["worker", "resume", task_id])
 
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["success"] is True
 
     # Typed fields present.
@@ -89,10 +88,10 @@ def test_worker_resume_typed_envelope(project: Path, monkeypatch):
 
     # No narrative prose fields anywhere in the envelope.
     assert "prompt" not in payload
-    assert "planctl cat" not in result.output
-    assert "**Files:**" not in result.output
-    assert "Files changed:" not in result.output
-    assert "CONTEXT:" not in result.output
+    assert "planctl cat" not in result.stdout
+    assert "**Files:**" not in result.stdout
+    assert "Files changed:" not in result.stdout
+    assert "CONTEXT:" not in result.stdout
 
 
 def test_worker_resume_regenerates_brief_fresh(project: Path, monkeypatch):
@@ -152,6 +151,7 @@ def test_worker_resume_no_commit_lands(project: Path, monkeypatch):
     assert head_before == head_after
 
 
+@pytest.mark.python_only
 def test_worker_resume_source_commit_sha_in_nudge(project: Path, monkeypatch):
     """A discovered source commit sha rides the envelope + nudge."""
     import planctl.run_worker_resume as m
@@ -163,7 +163,7 @@ def test_worker_resume_source_commit_sha_in_nudge(project: Path, monkeypatch):
     result = _invoke(["worker", "resume", task_id])
 
     assert result.exit_code == 0, result.output
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["source_commit_sha"] == "abc1234"
     assert "source_commit=abc1234" in payload["nudge"]
 
@@ -171,7 +171,7 @@ def test_worker_resume_source_commit_sha_in_nudge(project: Path, monkeypatch):
 def test_worker_resume_unknown_task_id(project: Path):
     result = _invoke(["worker", "resume", "fn-99-ghost.9"])
     assert result.exit_code != 0
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["success"] is False
     assert "fn-99-ghost.9" in payload["error"]
 
@@ -179,7 +179,7 @@ def test_worker_resume_unknown_task_id(project: Path):
 def test_worker_resume_group_help():
     result = _invoke(["worker", "--help"])
     assert result.exit_code == 0
-    assert "resume" in result.output
+    assert "resume" in result.stdout
 
 
 def _set_status(project: Path, task_id: str, status: str) -> None:
@@ -219,7 +219,7 @@ def test_worker_resume_done_task_does_not_flip(project: Path, monkeypatch):
     state = json.loads(state_path.read_text(encoding="utf-8"))
     assert state["status"] == "done"
 
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert payload["status"] == "done"
 
 
@@ -255,7 +255,7 @@ def test_worker_resume_tier_set_rides_envelope(project: Path, monkeypatch):
     monkeypatch.setattr(m, "_find_source_commit_sha", lambda task_id: None)
 
     task_id = _make_task(project)
-    set_tier = CliRunner().invoke(cli, ["task", "set-tier", task_id, "--tier", "high"])
+    set_tier = run_cli(["task", "set-tier", task_id, "--tier", "high"])
     assert set_tier.exit_code == 0, set_tier.output
 
     result = _invoke(["worker", "resume", task_id])
@@ -263,7 +263,7 @@ def test_worker_resume_tier_set_rides_envelope(project: Path, monkeypatch):
     assert result.exit_code == 0, result.output
     stderr = result.stderr or ""
     assert f"Note: task {task_id} tier is 'high'" in stderr
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert set(payload.keys()) >= {
         "success",
         "task_id",
@@ -304,7 +304,7 @@ def test_worker_resume_tier_null_emits_raw_note(project: Path, monkeypatch):
     stderr = result.stderr or ""
     assert f"Note: task {task_id} tier is None" in stderr
     assert "cold-resume heuristic" not in stderr
-    payload = json.loads(result.output)
+    payload = json.loads(result.stdout)
     assert "tier" in payload
     assert payload["tier"] is None
     assert payload["worker_agent"] is None

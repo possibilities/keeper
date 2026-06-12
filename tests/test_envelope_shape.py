@@ -13,16 +13,12 @@ Verifies:
 from __future__ import annotations
 
 import json
-import os
 
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 
 def _invoke(args: list[str]):
-    runner = CliRunner()
-    full_env = {**os.environ}
-    return runner.invoke(cli, args, env=full_env)
+    return run_cli(args)
 
 
 # ---------------------------------------------------------------------------

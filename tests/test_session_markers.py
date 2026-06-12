@@ -217,8 +217,15 @@ def _marker_present(d):
 
 
 @pytest.mark.real_roots
+@pytest.mark.python_only
 def test_claim_success_writes_work_marker(tmp_path, monkeypatch, verb_marker_dir):
-    """A successful claim writes a work marker naming the task."""
+    """A successful claim writes a work marker naming the task.
+
+    python_only: the assertion observes the marker file at the in-process
+    ``_sessions_dir`` monkeypatch target. Under conformance the claim runs as a
+    subprocess that writes its marker to its own HOME, which the monkeypatch
+    cannot redirect — the marker-dir seam is the Python-internal subject.
+    """
     _, task_ids = seed_state(tmp_path, epic_id="fn-1-marker", n_tasks=1)
     task_id = task_ids[0]
 

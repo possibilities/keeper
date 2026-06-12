@@ -21,17 +21,19 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import (
+    _write_git_skeleton,
+    parse_cli_output,
+    run_cli,
+    seed_epic,
+    set_roots,
+)
 
-from .conftest import _write_git_skeleton, parse_cli_output, seed_epic
-
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-epic-rm-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-epic-rm-fixture"}
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
@@ -43,9 +45,7 @@ def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
     first-JSON-line scan for failure envelopes that don't shape as the
     standard payload.
     """
-    runner = CliRunner()
-    env = {**_ENV}
-    result = runner.invoke(cli, args, env=env)
+    result = run_cli(args, env=_ENV)
     obj: dict | None = None
     with contextlib.suppress(Exception):
         obj = parse_cli_output(result.output)
@@ -311,13 +311,12 @@ def _bootstrap_project(repo: Path) -> None:
     hand-written skeleton stands one up with zero ``git init`` subprocess.
     """
     _write_git_skeleton(repo)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"], env={**_ENV, "PWD": str(repo)})
+    result = run_cli(["init"], cwd=repo, env={**_ENV, "PWD": str(repo)})
     assert result.exit_code == 0, result.output
 
 
 @pytest.fixture
-def two_projects(tmp_path, monkeypatch):
+def two_projects(request, tmp_path, monkeypatch):
     """Two sibling planctl projects under a shared `roots` parent.
 
     Both get the SAME epic id forced onto disk (legacy dup state) so we
@@ -373,12 +372,10 @@ def two_projects(tmp_path, monkeypatch):
             epic_b_json.write_text(json.dumps(data, indent=2) + "\n")
 
     # Point planctl at the configured roots parent so discovery sees both
-    # projects. `load_roots` reads its config file path from
-    # `planctl.config.CONFIG_PATH`; monkeypatch it onto a temp YAML so the
-    # test never touches the real `~/.config/planctl/config.yaml`.
-    config_path = tmp_path / "planctl_config.yaml"
-    config_path.write_text(f"roots:\n  - {parent}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", config_path)
+    # projects, engine-agnostically: in-process patches CONFIG_PATH, conformance
+    # writes config.yaml under the subprocess HOME (never the real
+    # ``~/.config/planctl/config.yaml``).
+    set_roots(request, monkeypatch, [parent])
 
     return parent, proj_a, proj_b, epic_a
 
@@ -501,21 +498,25 @@ def test_rm_missing_session_id_routes_through_seam(planctl_git_repo, monkeypatch
     epic_json = planctl_git_repo / ".planctl" / "epics" / f"{epic_id}.json"
     assert epic_json.exists()
 
-    # Strip the env var so the seam's build_planctl_invocation raises.
-    # CliRunner.invoke env-dict overlays on os.environ, so we must delete
-    # the variable in the process env too.
+    # Strip the env var so the seam's build_planctl_invocation raises — drop it
+    # from the process env (the in-process engine reads os.environ) and from the
+    # invoker env dict below.
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
-    runner = CliRunner()
     stripped_env = {k: v for k, v in _ENV.items() if k != "CLAUDE_CODE_SESSION_ID"}
-    result = runner.invoke(cli, ["epic", "rm", epic_id], env=stripped_env)
+    result = run_cli(["epic", "rm", epic_id], env=stripped_env)
     assert result.exit_code != 0, result.output
 
 
+@pytest.mark.python_only
 def test_rm_commit_failure_emits_structured_envelope(planctl_git_repo, monkeypatch):
     """A CommitFailed from auto_commit_from_invocation
     yields the structured ``commit_failed`` envelope (NOT a success envelope),
     matching the existing emit() failure contract. The deletes already
     happened on disk pre-commit — §10 no-rollback applies (no re-create).
+
+    python_only: synthesizes the failure by monkeypatching
+    ``auto_commit_from_invocation`` to raise — an in-process fault injection the
+    conformance subprocess cannot observe.
     """
     from planctl import commit as commit_module
 

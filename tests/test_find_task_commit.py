@@ -28,32 +28,30 @@ import json
 import subprocess
 
 import pytest
-from .conftest import run_cli
+from .conftest import run_cli, set_roots
 
 # find-task-commit parses real ``Task:``-trailer commits via ``git log`` — the
 # real commits ARE the subject under test, so ``real_git`` (slow bucket: real
 # git history, no autocommit/dirty-probe stubs). It also drives roots discovery
-# against the ``_roots_at_tmp_project`` CONFIG_PATH below, which must win over
+# against the ``_roots_at_tmp_project`` ``set_roots`` root below, which must win over
 # the autouse empty-discovery isolation — ``real_roots`` opts onto that
 # controlled tmp root.
 pytestmark = [pytest.mark.real_git, pytest.mark.real_roots]
 
 
 @pytest.fixture(autouse=True)
-def _roots_at_tmp_project(tmp_path, monkeypatch):
+def _roots_at_tmp_project(request, tmp_path, monkeypatch):
     """Point planctl roots discovery at an isolated root holding only ``tmp_path``.
 
     Same shape as ``tests/test_resolve_task.py::_roots_at_tmp_project`` — without
     this autouse fixture, discovery scans the real ``~/code`` default and can't
     find the seeded ``fn-N`` task → spurious TASK_NOT_FOUND. The ambiguity /
-    --project tests override CONFIG_PATH themselves; the later ``setattr`` wins.
+    --project tests call ``set_roots`` again themselves; the later call wins.
     """
     root = tmp_path / "_ftc_root"
     root.mkdir()
     (root / tmp_path.name).symlink_to(tmp_path, target_is_directory=True)
-    cfg = tmp_path / "_ftc_roots_config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
@@ -274,11 +272,11 @@ def test_find_task_commit_not_found(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
-def _make_two_projects_with_same_task(tmp_path, monkeypatch):
+def _make_two_projects_with_same_task(request, tmp_path, monkeypatch):
     """Seed two sibling projects under a shared root, both holding the same task id.
 
     Mirrors ``tests/test_resolve_task.py::_make_two_projects_with_same_task``.
-    Overrides the autouse CONFIG_PATH so discovery surfaces both as candidates.
+    Overrides the autouse roots so discovery surfaces both as candidates.
     """
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     root = tmp_path / "_ambiguous_root"
@@ -325,16 +323,16 @@ def _make_two_projects_with_same_task(tmp_path, monkeypatch):
         proj_b / ".planctl" / "epics" / f"{epic_id}.json",
     )
 
-    cfg = tmp_path / "_ambiguous_roots_config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
     return proj_a, proj_b, task_id
 
 
-def test_find_task_commit_ambiguous(tmp_path, monkeypatch):
+def test_find_task_commit_ambiguous(request, tmp_path, monkeypatch):
     """Same task id in two projects under the roots → AMBIGUOUS_TASK_ID."""
-    proj_a, proj_b, task_id = _make_two_projects_with_same_task(tmp_path, monkeypatch)
+    proj_a, proj_b, task_id = _make_two_projects_with_same_task(
+        request, tmp_path, monkeypatch
+    )
 
     code, obj, output = _invoke(["find-task-commit", task_id])
     assert code != 0, output
@@ -346,7 +344,7 @@ def test_find_task_commit_ambiguous(tmp_path, monkeypatch):
     assert str(proj_b) in candidates
 
 
-def test_find_task_commit_project_disambiguates(tmp_path, monkeypatch):
+def test_find_task_commit_project_disambiguates(request, tmp_path, monkeypatch):
     """--project <path> bypasses the AMBIGUOUS_TASK_ID error and resolves cleanly.
 
     A bare `find-task-commit <task_id>` over the colliding pair raises
@@ -356,7 +354,9 @@ def test_find_task_commit_project_disambiguates(tmp_path, monkeypatch):
     `primary_repo`/`touched_repos`), so the trailer commit seeded into proj_a is
     found via either `--project`.
     """
-    proj_a, proj_b, task_id = _make_two_projects_with_same_task(tmp_path, monkeypatch)
+    proj_a, proj_b, task_id = _make_two_projects_with_same_task(
+        request, tmp_path, monkeypatch
+    )
     sha = _seed_commit(proj_a, task_id)
     expected = [{"sha": sha, "repo": str(proj_a.resolve())}]
 

@@ -18,8 +18,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -27,8 +26,7 @@ from planctl.cli import cli
 
 
 def _invoke(args: list[str]):
-    runner = CliRunner()
-    return runner.invoke(cli, args)
+    return run_cli(args)
 
 
 def _parse_envelope(output: str) -> dict:
@@ -550,6 +548,7 @@ add_tasks:
     assert not (planctl_git_repo / ".planctl" / "tasks" / f"{epic_id}.3.json").exists()
 
 
+@pytest.mark.python_only
 def test_refine_apply_target_repo_tilde_expansion(planctl_git_repo, monkeypatch):
     """~ expansion: persisted target_repo is the canonicalised absolute path.
 
@@ -599,8 +598,7 @@ add_tasks:
     spec: |
 {_indent(_VALID_TASK_SPEC, 6)}
 """
-    runner = CliRunner()
-    r = runner.invoke(cli, ["refine-apply", epic_id, "--file", "-"], input=delta)
+    r = run_cli(["refine-apply", epic_id, "--file", "-"], input_text=delta)
     assert r.exit_code == 0, r.output
     payload = _parse_envelope(r.output)
     assert payload["success"] is True
@@ -793,6 +791,7 @@ add_tasks:
     assert baseline_spec3.exists()
 
 
+@pytest.mark.python_only
 def test_refine_apply_invocation_raise_persists_written_tree(
     planctl_git_repo, monkeypatch
 ):
@@ -830,6 +829,7 @@ add_tasks:
     assert baseline_spec3.exists()
 
 
+@pytest.mark.python_only
 def test_refine_apply_commit_failure_persists_written_tree(
     planctl_git_repo, monkeypatch
 ):

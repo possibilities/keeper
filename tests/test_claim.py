@@ -20,7 +20,7 @@ import subprocess
 
 import pytest
 
-from .conftest import run_cli
+from .conftest import run_cli, set_roots
 
 # Claim resolves a task's owning project through real ``roots`` discovery
 # (``_roots_at_tmp_project`` below points it at a controlled tmp root, never the
@@ -31,7 +31,7 @@ pytestmark = pytest.mark.real_roots
 
 
 @pytest.fixture(autouse=True)
-def _roots_at_tmp_project(tmp_path, monkeypatch):
+def _roots_at_tmp_project(request, tmp_path, monkeypatch):
     """Point planctl roots discovery at an isolated root holding only ``tmp_path``.
 
     Claim is cwd-agnostic: it resolves the owning project via
@@ -51,9 +51,7 @@ def _roots_at_tmp_project(tmp_path, monkeypatch):
     root = tmp_path / "_claim_root"
     root.mkdir()
     (root / tmp_path.name).symlink_to(tmp_path, target_is_directory=True)
-    cfg = tmp_path / "_claim_roots_config.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+    set_roots(request, monkeypatch, [root])
 
 
 def _invoke(args: list[str], env: dict | None = None):
@@ -424,6 +422,7 @@ def test_claim_force_takeover(project):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only  # injects an in-process brief-writer failure
 def test_claim_brief_write_failed_leaves_in_progress(project, monkeypatch):
     """A brief-write failure surfaces BRIEF_WRITE_FAILED but leaves task in_progress.
 
@@ -504,19 +503,17 @@ def _init_project_with_task(monkeypatch, proj, *, actor="alice@example.com") -> 
     return task_ids[0]
 
 
-def _point_roots_at(monkeypatch, tmp_path, root) -> None:
-    cfg = tmp_path / "_resolution_roots.yaml"
-    cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
-    monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
+def _point_roots_at(request, monkeypatch, root) -> None:
+    set_roots(request, monkeypatch, [root])
 
 
-def test_claim_zero_arg_resolves_non_cwd_project(tmp_path, monkeypatch):
+def test_claim_zero_arg_resolves_non_cwd_project(request, tmp_path, monkeypatch):
     """Zero-arg claim resolves the owning project via roots, independent of cwd."""
     root = tmp_path / "code"
     root.mkdir()
     proj = root / "alpha"
     task_id = _init_project_with_task(monkeypatch, proj)
-    _point_roots_at(monkeypatch, tmp_path, root)
+    _point_roots_at(request, monkeypatch, root)
 
     # Run from an unrelated cwd — discovery, not cwd, locates the project.
     elsewhere = tmp_path / "elsewhere"
@@ -532,14 +529,14 @@ def test_claim_zero_arg_resolves_non_cwd_project(tmp_path, monkeypatch):
     assert str(proj.resolve()) in payload["target_repo"]
 
 
-def test_claim_project_override_bypasses_discovery(tmp_path, monkeypatch):
+def test_claim_project_override_bypasses_discovery(request, tmp_path, monkeypatch):
     """--project resolves a project directly, even when roots don't include it."""
     proj = tmp_path / "out-of-roots" / "alpha"
     task_id = _init_project_with_task(monkeypatch, proj)
     # Roots deliberately point somewhere that does NOT contain the project.
     empty_root = tmp_path / "empty-root"
     empty_root.mkdir()
-    _point_roots_at(monkeypatch, tmp_path, empty_root)
+    _point_roots_at(request, monkeypatch, empty_root)
     monkeypatch.chdir(empty_root)
 
     r = _invoke(
@@ -563,7 +560,7 @@ def test_claim_project_override_task_not_found(tmp_path, monkeypatch):
     assert not _has_invocation_line(r.output)
 
 
-def test_claim_ambiguous_task_id(tmp_path, monkeypatch):
+def test_claim_ambiguous_task_id(request, tmp_path, monkeypatch):
     """Same task id claimable in two projects under one root → AMBIGUOUS_TASK_ID."""
     root = tmp_path / "code"
     root.mkdir()
@@ -587,7 +584,7 @@ def test_claim_ambiguous_task_id(tmp_path, monkeypatch):
             dst.parent.mkdir(parents=True, exist_ok=True)
             dst.write_text(src.read_text(encoding="utf-8"), encoding="utf-8")
 
-    _point_roots_at(monkeypatch, tmp_path, root)
+    _point_roots_at(request, monkeypatch, root)
 
     r = _invoke(["claim", task_a], env=_RESOLUTION_ENV)
     assert r.exit_code == 1, r.output
@@ -606,7 +603,7 @@ def test_claim_ambiguous_task_id(tmp_path, monkeypatch):
     assert r2.exit_code == 0, r2.output
 
 
-def test_claim_ambiguous_resolved_by_claimable_filter(tmp_path, monkeypatch):
+def test_claim_ambiguous_resolved_by_claimable_filter(request, tmp_path, monkeypatch):
     """Same id in two projects, only one claimable (open epic) → resolves silently."""
     root = tmp_path / "code"
     root.mkdir()
@@ -633,7 +630,7 @@ def test_claim_ambiguous_resolved_by_claimable_filter(tmp_path, monkeypatch):
     epic_obj["status"] = "closed"
     beta_epic.write_text(json.dumps(epic_obj), encoding="utf-8")
 
-    _point_roots_at(monkeypatch, tmp_path, root)
+    _point_roots_at(request, monkeypatch, root)
 
     # Only alpha is claimable → resolves there without --project.
     r = _invoke(["claim", task_a], env=_RESOLUTION_ENV)

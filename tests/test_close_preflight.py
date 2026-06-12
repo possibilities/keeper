@@ -35,11 +35,11 @@ import subprocess
 from types import SimpleNamespace
 
 import pytest
-from click.testing import CliRunner
 from planctl import run_close_preflight
 from planctl.audit_artifacts import brief_path, compute_commit_set_hash
-from planctl.cli import cli
 from planctl.commit_lookup import AllReposBrokenError, find_commit_groups
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -60,7 +60,6 @@ def _make_epic(project, *, statuses):
     value leaves it `todo`. Uses the planctl CLI so the on-disk JSON shape
     matches production exactly.
     """
-    runner = CliRunner()
     tasks_yaml = "\n".join(
         f"  - title: task {i}\n    tier: medium\n    spec: |\n"
         + "\n".join("      " + ln for ln in _TASK_SPEC.splitlines())
@@ -74,7 +73,7 @@ def _make_epic(project, *, statuses):
     plan_path = project / "plan.yaml"
     plan_path.write_text(yaml, encoding="utf-8")
 
-    r = runner.invoke(cli, ["scaffold", "--file", str(plan_path)])
+    r = run_cli(["scaffold", "--file", str(plan_path)])
     assert r.exit_code == 0, r.output
     env = _envelope(r.output)
     epic_id = env["epic_id"]
@@ -84,9 +83,7 @@ def _make_epic(project, *, statuses):
         if status == "done":
             # `done --force` skips the in_progress precondition, so flip
             # todo→done in one call (avoids the full claim flow).
-            r = runner.invoke(
-                cli, ["done", tid, "--summary", f"summary for {tid}", "--force"]
-            )
+            r = run_cli(["done", tid, "--summary", f"summary for {tid}", "--force"])
             assert r.exit_code == 0, r.output
     return epic_id, task_ids
 
@@ -157,7 +154,7 @@ def _load_brief(project, epic_id) -> dict:
 class TestSuccessEnvelope:
     def test_envelope_is_content_blind(self, project, monkeypatch):
         epic_id, task_ids = _make_epic(project, statuses=["done", "done"])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         # all_done is always true on success.
@@ -174,7 +171,7 @@ class TestSuccessEnvelope:
 
     def test_envelope_hash_matches_brief(self, project, monkeypatch):
         epic_id, _ = _make_epic(project, statuses=["done"])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         brief = _load_brief(project, epic_id)
@@ -192,7 +189,7 @@ class TestSuccessEnvelope:
 class TestBriefShape:
     def test_brief_has_full_shape(self, project):
         epic_id, task_ids = _make_epic(project, statuses=["done", "done"])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         brief = _load_brief(project, epic_id)
         assert brief["schema_version"] == 1
@@ -222,7 +219,7 @@ class TestBriefShape:
             ).stdout.strip()
 
         before = _head()
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         assert _head() == before
         porcelain = subprocess.run(
@@ -243,7 +240,7 @@ class TestBriefShape:
 class TestTasksNotDone:
     def test_not_all_done_is_typed_error(self, project, monkeypatch):
         epic_id, task_ids = _make_epic(project, statuses=["done", "todo"])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
         assert env["success"] is False
@@ -253,7 +250,7 @@ class TestTasksNotDone:
     def test_not_done_writes_no_brief(self, project, monkeypatch):
         """A not-ready epic must NOT leave a stale brief on disk."""
         epic_id, _ = _make_epic(project, statuses=["todo"])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 1, r.output
         assert not brief_path(project, epic_id).exists()
 
@@ -266,7 +263,7 @@ class TestTasksNotDone:
 class TestCommitGroups:
     def test_empty_commit_set(self, project, monkeypatch):
         epic_id, _ = _make_epic(project, statuses=["done"])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         assert _load_brief(project, epic_id)["commit_groups"] == []
 
@@ -282,7 +279,7 @@ class TestCommitGroups:
         epic_id, task_ids = _make_epic(project, statuses=["done", "done"])
         sha0 = _seed_commit(project, task_ids[0])
         sha1 = _seed_commit(project, task_ids[1])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         brief = _load_brief(project, epic_id)
@@ -300,7 +297,7 @@ class TestCommitGroups:
             task_ids[0],
             body=f"chore: note\n\nfixes the Task: {task_ids[0]} issue in prose\n",
         )
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         assert _load_brief(project, epic_id)["commit_groups"] == []
 
@@ -328,7 +325,7 @@ class TestCommitGroups:
             return data
 
         monkeypatch.setattr(_api, "load_epic", _fake_load_epic)
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
         assert env["success"] is False
@@ -347,14 +344,14 @@ class TestCommitGroups:
 
 class TestGates:
     def test_bad_epic_id(self, project):
-        r = CliRunner().invoke(cli, ["close-preflight", "not-an-id"])
+        r = run_cli(["close-preflight", "not-an-id"])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
         assert env["error"]["code"] == "BAD_EPIC_ID"
 
     def test_task_id_names_parent_epic(self, project):
         """A task-shaped id is rejected with a pointer to the parent epic."""
-        r = CliRunner().invoke(cli, ["close-preflight", "fn-1-demo.2"])
+        r = run_cli(["close-preflight", "fn-1-demo.2"])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
         assert env["error"]["code"] == "BAD_EPIC_ID"
@@ -363,7 +360,7 @@ class TestGates:
         assert env["error"]["details"]["task_id"] == "fn-1-demo.2"
 
     def test_epic_not_found(self, project):
-        r = CliRunner().invoke(cli, ["close-preflight", "fn-99-missing"])
+        r = run_cli(["close-preflight", "fn-99-missing"])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
         assert env["error"]["code"] == "EPIC_NOT_FOUND"
@@ -394,9 +391,7 @@ class TestProjectFlag:
         outside.mkdir()
         os.chdir(outside)
 
-        r = CliRunner().invoke(
-            cli, ["close-preflight", epic_id, "--project", str(project)]
-        )
+        r = run_cli(["close-preflight", epic_id, "--project", str(project)])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         assert env["success"] is True
@@ -404,9 +399,7 @@ class TestProjectFlag:
 
     def test_project_relative_raises_usage_error(self, project):
         """Relative paths under `--project` raise a click UsageError (exit 2)."""
-        r = CliRunner().invoke(
-            cli, ["close-preflight", "fn-1-bogus", "--project", "relative/path"]
-        )
+        r = run_cli(["close-preflight", "fn-1-bogus", "--project", "relative/path"])
         # click UsageError exits with code 2 by default.
         assert r.exit_code == 2, r.output
         assert "absolute path" in r.output
@@ -414,7 +407,7 @@ class TestProjectFlag:
     def test_project_unset_falls_back_to_cwd_walk(self, project, monkeypatch):
         """Without `--project`, behavior is unchanged (cwd-walk via resolve_project)."""
         epic_id, _ = _make_epic(project, statuses=["done"])
-        r = CliRunner().invoke(cli, ["close-preflight", epic_id])
+        r = run_cli(["close-preflight", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         assert env["success"] is True

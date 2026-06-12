@@ -406,6 +406,7 @@ def test_post_hook_unmarked_file_passes_silently(tmp_path: Path) -> None:
     assert result.returncode == 0
     assert result.stdout == ""
 
+
 # ---------------------------------------------------------------------------
 # cross-language marker round-trip — Python _write_marker → TS readMarker
 # (slow bucket: real bun subprocess + real Python write path)

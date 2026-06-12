@@ -17,14 +17,16 @@ build-backend = "hatchling.build"
 
 [tool.pytest.ini_options]
 # The default run is the fast gate: autouse stubs in tests/conftest.py close
-# every subprocess seam (git config / status / commit, `promptctl render-spec`
-# / `inline-sketch-refs`, the ~/code discovery scan), so unmarked tests spawn
-# near-zero subprocesses. Slow-bucket tests (markers `real_git` / `integration`
-# / `wire` / `real_promptctl` / `real_sketch`) are skipped-by-default and
+# every subprocess seam (git config / status / commit, the ~/code discovery
+# scan), so unmarked tests spawn near-zero subprocesses. Slow-bucket tests
+# (markers `real_git` / `integration` / `wire`) are skipped-by-default and
 # re-enabled with `--run-slow` (a pytest_collection_modifyitems hook adds
 # pytest.mark.skip so they stay VISIBLE as skips, never silently deselected via
 # an addopts `-m`). The `real_roots` marker is fast-path (NOT slow-bucket): it
 # only opts a test off the empty-discovery isolation onto a controlled tmp root.
+# The `python_only` marker is skipped-VISIBLE under conformance (`PLANCTL_BIN`
+# set) — its subject is Python internals that cannot cross the subprocess
+# boundary.
 # The fast gate runs serially (no `-n`): with the suite spawning near-zero
 # subprocesses it is CPU-light, so xdist worker bring-up (2-5s per worker under
 # load) and per-worker session-fixture duplication cost more than they save —
