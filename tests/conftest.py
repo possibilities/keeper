@@ -36,12 +36,29 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 from planctl.cli import cli
+
+
+def _planctl_bin() -> str | None:
+    """The conformance-engine binary, or ``None`` for the in-process engine.
+
+    Conformance mode is active exactly when ``PLANCTL_BIN`` is set: the invoker
+    then runs every CLI call as a real ``subprocess.run([PLANCTL_BIN, ...])``
+    against an arbitrary planctl binary (the installed Python one in this epic,
+    a Bun binary in later program epics). Unset -> the default in-process
+    engine, zero behavior change.
+    """
+    return os.environ.get("PLANCTL_BIN") or None
+
+
+def _conformance() -> bool:
+    """Whether the subprocess (conformance) engine is active this session."""
+    return _planctl_bin() is not None
 
 
 def pytest_configure(config):
@@ -67,6 +84,16 @@ def pytest_configure(config):
         "drive real multi-project roots resolution (against a controlled tmp "
         "root, never the real ~/code). Fast-path marker — NOT slow-bucket.",
     )
+
+    binary = _planctl_bin()
+    if binary is not None:
+        resolved = shutil.which(binary) or binary
+        if not Path(resolved).is_file() or not os.access(resolved, os.X_OK):
+            raise pytest.UsageError(
+                f"PLANCTL_BIN={binary!r} is set but is not an executable file "
+                f"(resolved to {resolved!r}). Point it at a real planctl binary "
+                f"or unset it to run the in-process engine."
+            )
 
 
 #: Markers that put a test in the skip-by-default slow bucket. Any test
@@ -132,8 +159,12 @@ def _mock_autocommit(request, monkeypatch):
     in the harness: prod code carries no test-only branch. The stub mirrors the
     real return contract (``None`` for a no-op payload, a sentinel sha
     otherwise) so truthiness checks still behave.
+
+    Under conformance the CLI runs in its own subprocess, so this in-process
+    patch could never reach it; the stub early-returns so the parent stays
+    unpatched and the binary commits for real against the per-worker tmp HOME.
     """
-    if request.node.get_closest_marker("real_git"):
+    if _conformance() or request.node.get_closest_marker("real_git"):
         return
 
     import planctl.commit as _commit
@@ -208,8 +239,10 @@ def _mock_dirty_probe(request, monkeypatch):
     behaviour-neutral: only the genuinely-touched paths survive the intersection.
 
     Opt out with ``@pytest.mark.real_git`` (slow bucket) to spawn real git.
+    Under conformance the binary runs the real probe in its own subprocess, so
+    this in-process patch is moot — early-return and leave the parent unpatched.
     """
-    if request.node.get_closest_marker("real_git"):
+    if _conformance() or request.node.get_closest_marker("real_git"):
         return
 
     import planctl.invocation as _invocation
@@ -227,7 +260,15 @@ def _isolated_session_markers(tmp_path_factory, monkeypatch):
     redirect the suite would pollute the developer's real home. Narrowly stubs
     the dir resolver — never touches ``HOME`` — so no other home-derived path
     moves. Marker-layer tests that need their own dir simply re-monkeypatch it.
+
+    Under conformance the binary resolves the marker dir from ``HOME`` in its own
+    subprocess (the per-worker tmp HOME already isolates
+    ``~/.local/state/planctl/sessions``), so this in-process patch is moot —
+    early-return and leave the parent unpatched.
     """
+    if _conformance():
+        return
+
     import planctl.session_markers as _markers
 
     sessions_dir = tmp_path_factory.mktemp("sessions")
@@ -310,12 +351,11 @@ def project(request, tmp_path, monkeypatch):
     """
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
     monkeypatch.chdir(tmp_path)
-    if request.node.get_closest_marker("real_git"):
+    if _conformance() or request.node.get_closest_marker("real_git"):
         subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
     else:
         _write_git_skeleton(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"], cwd=tmp_path)
     assert result.exit_code == 0, result.output
     return tmp_path
 
@@ -356,8 +396,7 @@ def planctl_git_repo(tmp_path, monkeypatch):
     # Initialise planctl project. `init` self-commits its bootstrap files
     # inline (a `chore(planctl): init <name>` commit), so the repo baseline is
     # clean once the verb returns — no manual stage+commit needed here.
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"], cwd=tmp_path)
     assert result.exit_code == 0, result.output
 
     return tmp_path
@@ -388,7 +427,7 @@ def multi_repo_project(request, tmp_path, monkeypatch):
     primary.mkdir()
     touched.mkdir()
 
-    real_git = request.node.get_closest_marker("real_git")
+    real_git = _conformance() or request.node.get_closest_marker("real_git")
     for repo_dir in (primary, touched):
         if not real_git:
             _write_git_skeleton(repo_dir)
@@ -410,11 +449,17 @@ def multi_repo_project(request, tmp_path, monkeypatch):
 
 
 class _CliResult:
-    """``subprocess.CompletedProcess``-compatible shim for in-process CliRunner.
+    """``subprocess.CompletedProcess``-compatible result for both engines.
 
-    Exposes ``returncode`` / ``stdout`` / ``stderr`` so call sites that were
-    written against ``subprocess.run(["planctl", ...])`` keep their assertions
-    unchanged after switching to :func:`run_cli`.
+    Both the in-process and the subprocess engine return this. ``returncode`` /
+    ``stdout`` / ``stderr`` keep call sites written against
+    ``subprocess.run(["planctl", ...])`` working unchanged, and ``exit_code`` /
+    ``output`` mirror :class:`click.testing.Result`'s surface so the 124
+    ``CliRunner`` call sites can route through this seam in later tasks without
+    touching their assertions. ``output`` is ``stdout`` + ``stderr`` merged,
+    matching ``CliRunner``'s ``mix_stderr=True`` default; under the subprocess
+    engine the two separately-captured streams are concatenated, so a substring
+    assert survives but an interleaving-order-sensitive one may not.
     """
 
     def __init__(self, returncode: int, stdout: str, stderr: str) -> None:
@@ -422,24 +467,126 @@ class _CliResult:
         self.stdout = stdout
         self.stderr = stderr
 
+    @property
+    def exit_code(self) -> int:
+        return self.returncode
 
-def run_cli(
-    args,
-    *,
-    cwd=None,
-    env: dict | None = None,
-    input_text: str | None = None,
-) -> _CliResult:
-    """Invoke the planctl CLI in-process, mimicking
-    ``subprocess.run(["planctl", *args], cwd=cwd, env=env)``.
+    @property
+    def output(self) -> str:
+        return self.stdout + self.stderr
 
-    Replaces a real ``planctl`` subprocess — which boots a fresh Python
-    interpreter (~0.3s) — by driving ``cli.main(..., standalone_mode=False)``,
-    the exact entry the console script (``planctl._util.run_cli``) uses. That
-    faithfully reproduces the shell contract a ``CliRunner`` invocation does
-    not: a command callback's int return value becomes the exit code (e.g.
-    ``validate`` returning 1), and stdout/stderr are captured separately so
-    callers asserting on stderr (``WARN:`` lines) keep working.
+
+class _ConformanceHome:
+    """Holds the per-worker tmp HOME + empty global gitconfig for the subprocess
+    engine, so the module-level invoker can reach them without a fixture.
+
+    Set once per session by :func:`_conformance_home` (only under conformance);
+    every ``run_cli`` subprocess call reads it. Keyed nowhere by hand — xdist
+    gives each worker its own ``tmp_path_factory`` basetemp, so a session fixture
+    that mints under it is already per-worker, which is what keeps the epic-id
+    flock (``~/.local/state/planctl/epic-id.lock``, expanduser-resolved by the
+    fresh interpreter under this HOME) from serializing across workers.
+    """
+
+    home: Path | None = None
+    gitconfig: Path | None = None
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _conformance_home(tmp_path_factory):
+    """Mint the per-worker tmp HOME the subprocess engine isolates under.
+
+    No-op on the in-process path (the default fast gate spawns nothing). Under
+    conformance it creates one throwaway HOME and one empty global gitconfig per
+    worker and stashes them on :class:`_ConformanceHome`. The HOME covers every
+    expanduser-resolved surface a fresh planctl interpreter touches —
+    ``~/.config/planctl/config.yaml`` (absent -> roots default to ``~/code``,
+    which now resolves *under* this empty HOME -> empty discovery, isolated for
+    free), ``~/.local/state/planctl/sessions``, and the epic-id flock.
+    """
+    if not _conformance():
+        yield
+        return
+    base = tmp_path_factory.mktemp("conformance-home")
+    home = base / "home"
+    home.mkdir()
+    gitconfig = base / "gitconfig"
+    # An empty file (not /dev/null): git writes the test committer identity into
+    # it via the per-repo init, and /dev/null is not writable.
+    gitconfig.write_text(
+        "[user]\n\temail = test@example.com\n\tname = Test User\n"
+        "[commit]\n\tgpgsign = false\n[core]\n\thooksPath = /dev/null\n",
+        encoding="utf-8",
+    )
+    _ConformanceHome.home = home
+    _ConformanceHome.gitconfig = gitconfig
+    try:
+        yield
+    finally:
+        _ConformanceHome.home = None
+        _ConformanceHome.gitconfig = None
+
+
+def _subprocess_env(env: dict | None) -> dict[str, str]:
+    """Build the minimal explicit env for a conformance subprocess call.
+
+    Built from scratch — never ``os.environ.copy()`` — so no XDG path or
+    credential from the developer's shell leaks into the isolated planctl
+    process. Carries only HOME + XDG_* (under the per-worker tmp HOME),
+    GIT_CONFIG_GLOBAL -> the empty temp gitconfig, GIT_CONFIG_SYSTEM=/dev/null,
+    PATH, PLANCTL_ACTOR, the harness-intrinsic ``CLAUDE_CODE_SESSION_ID`` (which
+    the fixtures pre-set and every mutating verb requires to build its commit
+    envelope), and any ``PLANCTL_NOW`` clock override, then layers the per-call
+    test-supplied ``env`` last so a test can still override anything.
+    """
+    home = _ConformanceHome.home
+    gitconfig = _ConformanceHome.gitconfig
+    assert home is not None and gitconfig is not None, (
+        "conformance subprocess called before _conformance_home session fixture ran"
+    )
+    base: dict[str, str] = {
+        "HOME": str(home),
+        "XDG_CONFIG_HOME": str(home / ".config"),
+        "XDG_STATE_HOME": str(home / ".local" / "state"),
+        "XDG_DATA_HOME": str(home / ".local" / "share"),
+        "XDG_CACHE_HOME": str(home / ".cache"),
+        "GIT_CONFIG_GLOBAL": str(gitconfig),
+        "GIT_CONFIG_SYSTEM": "/dev/null",
+        "PATH": os.environ.get("PATH", ""),
+        "PLANCTL_ACTOR": os.environ.get("PLANCTL_ACTOR", "test@example.com"),
+    }
+    for forwarded in ("CLAUDE_CODE_SESSION_ID", "PLANCTL_NOW"):
+        if (val := os.environ.get(forwarded)) is not None:
+            base[forwarded] = val
+    if env:
+        base.update({k: str(v) for k, v in env.items()})
+    return base
+
+
+def _run_subprocess_engine(args, cwd, env, input_text) -> _CliResult:
+    """Conformance engine: run the CLI as a real ``PLANCTL_BIN`` subprocess."""
+    binary = _planctl_bin()
+    assert binary is not None, "subprocess engine requires PLANCTL_BIN"
+    proc = subprocess.run(
+        [binary, *args],
+        cwd=cwd,
+        env=_subprocess_env(env),
+        input=input_text,
+        capture_output=True,
+        text=True,
+    )
+    return _CliResult(proc.returncode, proc.stdout, proc.stderr)
+
+
+def _run_in_process_engine(args, cwd, env, input_text) -> _CliResult:
+    """Default engine: drive ``cli.main(..., standalone_mode=False)`` in-process.
+
+    Boots no fresh interpreter — replaces a real ``planctl`` subprocess (~0.3s)
+    by driving the exact entry the console script uses. Faithfully reproduces
+    the shell contract ``CliRunner`` does not: a command callback's int return
+    value becomes the exit code (e.g. ``validate`` returning 1), and
+    stdout/stderr are captured separately so callers asserting on stderr
+    (``WARN:`` lines) keep working.
     """
     import contextlib
     import io
@@ -475,6 +622,28 @@ def run_cli(
             else:
                 os.environ[key] = val
     return _CliResult(rc, out.getvalue(), err.getvalue())
+
+
+def run_cli(
+    args,
+    *,
+    cwd=None,
+    env: dict | None = None,
+    input_text: str | None = None,
+) -> _CliResult:
+    """The single invoker every test routes through, mimicking
+    ``subprocess.run(["planctl", *args], cwd=cwd, env=env)``.
+
+    Dispatches on the active engine: unset ``PLANCTL_BIN`` -> the in-process
+    engine (zero behavior change, no subprocess on the fast path); set ->
+    the subprocess engine against the real ``PLANCTL_BIN`` with a minimal
+    explicit env dict and the per-worker tmp HOME. Both return the same
+    :class:`_CliResult`.
+    """
+    cwd = str(cwd) if cwd is not None else None
+    if _conformance():
+        return _run_subprocess_engine(args, cwd, env, input_text)
+    return _run_in_process_engine(args, cwd, env, input_text)
 
 
 def _first_json_payload(output: str) -> dict:
@@ -563,9 +732,7 @@ def seed_epic(
     )
     plan_path = project_path / "_seed_plan.yaml"
     plan_path.write_text(yaml, encoding="utf-8")
-    runner = CliRunner()
-    full_env = {**os.environ, **env} if env else None
-    result = runner.invoke(cli, ["scaffold", "--file", str(plan_path)], env=full_env)
+    result = run_cli(["scaffold", "--file", str(plan_path)], cwd=project_path, env=env)
     assert result.exit_code == 0, result.output
     payload = _first_json_payload(result.output)
     return payload["epic_id"], payload["task_ids"]
@@ -703,8 +870,13 @@ def _isolated_roots_default(request, monkeypatch):
     real multi-project resolution — those tests must point discovery at a
     *controlled tmp root* (their own ``CONFIG_PATH`` / ``roots`` fixture), never
     the real ``~/code`` default.
+
+    Under conformance discovery is isolated for free: the per-worker tmp HOME has
+    no ``config.yaml``, so roots default to ``~/code`` which resolves under that
+    empty HOME -> empty scan. The in-process patch can't reach the subprocess
+    anyway, so early-return and leave the parent unpatched.
     """
-    if request.node.get_closest_marker("real_roots"):
+    if _conformance() or request.node.get_closest_marker("real_roots"):
         return
     _patch_isolated_roots(monkeypatch)
 
@@ -747,10 +919,10 @@ def add_task(
     )
     delta_path = project_path / "_seed_delta.yaml"
     delta_path.write_text(delta, encoding="utf-8")
-    runner = CliRunner()
-    full_env = {**os.environ, **env} if env else None
-    result = runner.invoke(
-        cli, ["refine-apply", epic_id, "--file", str(delta_path)], env=full_env
+    result = run_cli(
+        ["refine-apply", epic_id, "--file", str(delta_path)],
+        cwd=project_path,
+        env=env,
     )
     assert result.exit_code == 0, result.output
     payload = _first_json_payload(result.output)
