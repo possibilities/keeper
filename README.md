@@ -36,9 +36,11 @@ left state at `working`). Each clear is gated on its own
 column-is-not-NULL hot-path predicate, keeping the UPDATE cold on the 50+/turn
 tool path. The `killed` state is the sibling terminal state to
 `ended`: reached not from a SessionEnd hook but from synthetic `Killed` events
-emitted by the boot seed sweep and the live exit-watcher worker, which prove a
-session's `(pid, start_time)` is gone from the OUTSIDE (SIGKILL'd,
-terminal-pane-closed, machine reboot, hook crash). Both terminal states are
+from three producers — the boot seed sweep, the exit-watcher's kernel arm, and
+the exit-watcher's periodic dead-pid re-probe (the slow backstop for a kernel
+arm that missed or raced) — each of which proves a session's `(pid,
+start_time)` is gone from the OUTSIDE (SIGKILL'd, terminal-pane-closed, machine
+reboot, hook crash). Both terminal states are
 revivable — a fresh `claude --resume` re-opens either one to `stopped`.
 
 The event log also indexes nine sparse signals that surface across every
@@ -2113,6 +2115,23 @@ downtime (zombie rows already on disk), the exit-watcher covers steady state
 instance — read-only / write-free, feeding the log only via main — and its
 kqueue/pidfd fd is owned by the worker thread, released in its own shutdown
 handler.
+
+The exit-watcher carries a THIRD synthetic-`Killed` producer alongside the
+kernel arm: a periodic dead-pid **re-probe** (`reprobeLoop`, ~60s tick). The
+kernel arm (kqueue `EV_ONESHOT` / pidfd `EPOLLONESHOT`) occasionally misses or
+races, and the boot seed sweep runs once per boot — so a non-terminal row whose
+worker pid is verifiably dead could otherwise sit forever. On each slow tick the
+re-probe queries the candidate set, and for each pid-bearing row older than a
+launch-race age gate (`created_at >= 5 min`, mirroring the sitter's
+`STUCK_JOB_MIN_AGE_SECS`) runs the pure `selectDeadReprobeCandidates` predicate:
+`kill(pid,0)`-dead → reap; alive-but-recycled (`(pid, start_time)` start_time
+mismatch via `readOsStartTime`) → reap; probe failure / NULL start_time → leave
+alone (conservative, mirroring the seed sweep). It posts the SAME exit message
+the kernel arm posts — main's verifier and the reducer's `Killed` fold (terminal
+guard + `(pid, start_time)` match) are unchanged, so a resume between probe and
+fold is a safe no-op. The age gate keys on `created_at`, NOT `updated_at` (late
+git-count/title/monitor writes reset `updated_at` on a stopped row); each reap
+logs one forensic stderr line with `(jobId, pid, start_time, reason)`.
 
 A **seventh** Worker thread is the dead-letter watcher (schema v37, fn-643):
 it watches `~/.local/state/keeper/dead-letters/` with `@parcel/watcher` and

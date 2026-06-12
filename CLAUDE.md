@@ -131,7 +131,11 @@ paused** and is level-triggered on `PRAGMA data_version`. An unpaused autopilot 
 Close-row completion is liveness-gated in `src/readiness.ts` (done AND closer idle),
 not reap-side; the completion reap inherits done-AND-idle from that verdict.
 For modes, caps, the cooldown, and completion-reap, read `src/autopilot-worker.ts`,
-`src/readiness.ts`, and README.
+`src/readiness.ts`, and README. Two distinct reapers, do not conflate: the
+autopilot completion-reap closes done plan rows, while the exit-watcher's
+dead-pid re-probe (`reprobeLoop` in `src/exit-watcher.ts`, ~60s, age-gated on
+`created_at >= 5 min`) mints a synthetic `Killed` for a job whose worker pid is
+verifiably gone — the kernel-arm-miss backstop, not a tmux/window reaper.
 
 ## Out of scope
 

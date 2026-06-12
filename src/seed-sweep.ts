@@ -90,11 +90,14 @@ import { isPidAlive } from "./server-worker";
  * `splitArgsLstart`'s rationale; `args=` must trail so `-ww` un-truncates it).
  * The args column we ignore — we just need lstart, which is fixed-width 24.
  *
- * Linux: `/proc/<pid>/stat` field 22 (`starttime`). Sync read because the
- * sweep runs synchronously inside `runDaemon` before workers spawn — no event
- * loop interleaving to preserve.
+ * Linux: `/proc/<pid>/stat` field 22 (`starttime`). Sync read: at boot the
+ * sweep runs synchronously inside `runDaemon` before workers spawn, and the
+ * exit-watcher's periodic re-probe also calls it on a slow (~60s) tick where a
+ * 500ms-capped sync `ps` is cheaper than an async fork to manage. Exported so
+ * that re-probe (the steady-state sibling of this boot sweep) reuses the SAME
+ * platform-tagged format — the recycle compare stays a verbatim string match.
  */
-function readOsStartTime(pid: number): string | null {
+export function readOsStartTime(pid: number): string | null {
   try {
     if (process.platform === "darwin") {
       const result = Bun.spawnSync(

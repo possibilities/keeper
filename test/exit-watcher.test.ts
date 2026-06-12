@@ -20,7 +20,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
-import { diffLoop } from "../src/exit-watcher";
+import {
+  diffLoop,
+  type ReprobeRow,
+  reprobeLoop,
+  selectDeadReprobeCandidates,
+} from "../src/exit-watcher";
 import type {
   AddResult,
   ExitWatcher,
@@ -367,6 +372,222 @@ test("diffLoop+mock: every new candidate row triggers exactly one add()", async 
   // One add per unique pid, in arrival order.
   expect(addCalls.map((c) => c.pid).sort()).toEqual([7001, 7002]);
   watcher.close();
+  writer.close();
+  reader.close();
+});
+
+// ---------------------------------------------------------------------------
+// selectDeadReprobeCandidates — pure predicate, clause by clause
+// ---------------------------------------------------------------------------
+
+const NOW = 1_000_000; // arbitrary wall-clock seconds for the predicate tests.
+const OLD_ENOUGH = NOW - 5 * 60; // exactly at the age gate (eligible: >=).
+const TOO_FRESH = NOW - (5 * 60 - 1); // one second under the gate.
+
+/** Build a ReprobeRow with sane defaults; override per clause. */
+function rrow(over: Partial<ReprobeRow> = {}): ReprobeRow {
+  return {
+    job_id: "sess",
+    pid: 4242,
+    start_time: "darwin:start",
+    created_at: OLD_ENOUGH,
+    ...over,
+  };
+}
+
+const allDead = () => false;
+const allAlive = () => true;
+const neverProbe = (): string | null => {
+  throw new Error("readStartTime must not be called");
+};
+
+test("predicate: dead pid past the age gate folds with reason=dead", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ pid: 4242, start_time: "darwin:s" })],
+    NOW,
+    allDead,
+    neverProbe, // dead path must NOT consult readStartTime
+  );
+  expect(out).toEqual([
+    { jobId: "sess", pid: 4242, startTime: "darwin:s", reason: "dead" },
+  ]);
+});
+
+test("predicate: age gate is inclusive — created_at exactly at threshold is eligible", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ created_at: OLD_ENOUGH })],
+    NOW,
+    allDead,
+    neverProbe,
+  );
+  expect(out.map((c) => c.reason)).toEqual(["dead"]);
+});
+
+test("predicate: a row one second under the age gate is NOT reaped even if dead", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ created_at: TOO_FRESH })],
+    NOW,
+    allDead, // dead, but too fresh
+    neverProbe,
+  );
+  expect(out).toEqual([]);
+});
+
+test("predicate: alive pid with a recycled (mismatched) start_time folds with reason=recycled", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ pid: 50, start_time: "darwin:original" })],
+    NOW,
+    allAlive,
+    () => "darwin:DIFFERENT", // OS reports a different start_time → recycled
+  );
+  expect(out).toEqual([
+    {
+      jobId: "sess",
+      pid: 50,
+      startTime: "darwin:original", // STORED, not the live recycler's
+      reason: "recycled",
+    },
+  ]);
+});
+
+test("predicate: alive pid with a matching start_time is left alone", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ pid: 50, start_time: "darwin:same" })],
+    NOW,
+    allAlive,
+    () => "darwin:same",
+  );
+  expect(out).toEqual([]);
+});
+
+test("predicate: alive pid with NULL stored start_time is left alone (can't prove recycle)", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ pid: 50, start_time: null })],
+    NOW,
+    allAlive,
+    neverProbe, // start_time NULL → readStartTime never reached
+  );
+  expect(out).toEqual([]);
+});
+
+test("predicate: alive pid whose start_time probe fails (null) is left alone", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ pid: 50, start_time: "darwin:stored" })],
+    NOW,
+    allAlive,
+    () => null, // probe failure → conservative leave-alone
+  );
+  expect(out).toEqual([]);
+});
+
+test("predicate: NULL-pid rows are out of scope (the diff loop's pidless arm owns them)", () => {
+  const out = selectDeadReprobeCandidates(
+    [rrow({ pid: null })],
+    NOW,
+    allDead,
+    neverProbe,
+  );
+  expect(out).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// reprobeLoop — live-DB integration: a dead-pid stopped row mints an exit msg,
+// and a re-sweep of the now-killed row is a no-op
+// ---------------------------------------------------------------------------
+
+/** Seed a row with an explicit created_at (the age gate keys on it). */
+function seedJobsRowAt(
+  db: ReturnType<typeof openDb>["db"],
+  jobId: string,
+  pid: number | null,
+  startTime: string | null,
+  createdAt: number,
+  state = "stopped",
+): void {
+  db.run(
+    `INSERT INTO jobs (job_id, created_at, cwd, pid, state, last_event_id,
+                       updated_at, title, title_source, transcript_path, start_time)
+       VALUES (?, ?, NULL, ?, ?, 0, ?, NULL, NULL, NULL, ?)`,
+    [jobId, createdAt, pid, state, createdAt, startTime],
+  );
+}
+
+test("reprobeLoop posts an exit message for a dead-pid stopped row past the age gate", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+
+  const nowSecs = 2_000_000;
+  // Old enough (created well before the gate) + a pid we declare dead.
+  seedJobsRowAt(writer, "sess-dead", 8888, "darwin:victim", nowSecs - 3600);
+  // A fresh row with the same dead pid must NOT be reaped (age gate).
+  seedJobsRowAt(writer, "sess-fresh", 8889, "darwin:fresh", nowSecs - 10);
+
+  const posted: { jobId: string; pid: number | null }[] = [];
+  let shutdown = false;
+  const loop = reprobeLoop(
+    reader,
+    (msg) => posted.push({ jobId: msg.jobId, pid: msg.pid }),
+    () => shutdown,
+    {
+      intervalMs: 25,
+      nowSecs: () => nowSecs,
+      isAlive: (pid) => pid !== 8888 && pid !== 8889, // both dead
+      readStartTime: () => null,
+    },
+  );
+
+  // Wait for at least one tick to post the dead candidate.
+  const got = await retryUntil(
+    () => (posted.length > 0 ? posted : null),
+    5_000,
+  );
+  shutdown = true;
+  await loop;
+
+  expect(got).not.toBeNull();
+  expect(got?.map((p) => p.jobId)).toEqual(["sess-dead"]);
+  expect(got?.[0]?.pid).toBe(8888);
+
+  writer.close();
+  reader.close();
+});
+
+test("reprobeLoop: a re-sweep of a row that left the candidate set is a no-op", async () => {
+  const reader = openDb(dbPath, { readonly: true }).db;
+  const writer = openDb(dbPath).db;
+
+  const nowSecs = 2_000_000;
+  seedJobsRowAt(
+    writer,
+    "sess-killed",
+    7777,
+    "darwin:k",
+    nowSecs - 3600,
+    "killed",
+  );
+
+  const posted: string[] = [];
+  let shutdown = false;
+  const loop = reprobeLoop(
+    reader,
+    (msg) => posted.push(msg.jobId),
+    () => shutdown,
+    {
+      intervalMs: 25,
+      nowSecs: () => nowSecs,
+      isAlive: () => false, // would reap if it were a candidate
+      readStartTime: () => null,
+    },
+  );
+
+  // Give it several ticks — a 'killed' row is outside the candidate query, so
+  // nothing should ever be posted.
+  await Bun.sleep(120);
+  shutdown = true;
+  await loop;
+
+  expect(posted).toEqual([]);
+
   writer.close();
   reader.close();
 });

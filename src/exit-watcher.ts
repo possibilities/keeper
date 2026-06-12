@@ -59,6 +59,8 @@ import type { Database } from "bun:sqlite";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
 import { createExitWatcher, type ExitWatcher } from "./exit-watcher-ffi";
+import { readOsStartTime } from "./seed-sweep";
+import { isPidAlive } from "./server-worker";
 
 /** workerData payload — only the DB path and the optional poll cadence. */
 export interface ExitWatcherWorkerData {
@@ -108,6 +110,26 @@ const MIN_POLL_MS = 25;
  * unblocks within ~1s without relying on a wake() race.
  */
 const WAIT_TIMEOUT_MS = 1000;
+/**
+ * Periodic dead-pid re-probe cadence (ms). The kernel arm (kqueue
+ * `EV_ONESHOT` / pidfd `EPOLLONESHOT`) occasionally misses or races, and the
+ * boot `seedKilledSweep` runs once per boot — so a non-terminal row whose pid
+ * is verifiably dead can sit forever in steady state. This slow sweep is the
+ * backstop: re-probe liveness and mint a synthetic `Killed` for confirmed
+ * dead/recycled rows. Slow on purpose — the kernel arm is the fast path; this
+ * is the rare-miss safety net, so a coarse 60s tick keeps the syscall + `ps`
+ * cost negligible.
+ */
+const REPROBE_MS = 60_000;
+/**
+ * Launch-race age gate (seconds). A freshly-launched job whose pid we read
+ * before the SessionStart hook's `(pid, start_time)` fully settled must not be
+ * reaped — mirror the sitter's `STUCK_JOB_MIN_AGE_SECS` (5 min). The gate keys
+ * on `created_at` (NOT `updated_at`, which late git-count/title/monitor writes
+ * reset on a stopped row); the dead-pid conjunct carries correctness, the age
+ * gate only suppresses the launch-race false positive.
+ */
+const REPROBE_MIN_AGE_SECS = 5 * 60;
 
 /** Internal tracked-pid entry. udata = the i64 token we registered with. */
 interface TrackedEntry {
@@ -191,6 +213,190 @@ export async function diffLoop(
     if (cur !== last) {
       last = cur;
       onTick(candidatesQuery.all() as CandidateRow[]);
+    }
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Periodic dead-pid re-probe (the kernel-arm-miss backstop)
+// ---------------------------------------------------------------------------
+
+/** One candidate row for the re-probe predicate (age gate keys on `created_at`). */
+export interface ReprobeRow {
+  job_id: string;
+  /** NULL rows are out of scope here — the diff loop's pidless arm reaps them. */
+  pid: number | null;
+  start_time: string | null;
+  /** Unix seconds. The launch-race age gate keys on this, NOT `updated_at`. */
+  created_at: number;
+}
+
+/** A confirmed dead/recycled row plus why — carried into the stderr reap log. */
+export interface ReprobeCandidate {
+  jobId: string;
+  pid: number;
+  /** The STORED start_time (what the fold matches), NOT the live recycler's. */
+  startTime: string | null;
+  reason: "dead" | "recycled";
+}
+
+/**
+ * Pure predicate: from the candidate rows, the wall-clock `nowSecs`, and two
+ * injected probes, return the rows whose pid is verifiably dead or recycled and
+ * which are old enough to reap. Pure (no I/O of its own — the probes are
+ * injected) so tests drive it clause-by-clause.
+ *
+ * Mirrors `seedKilledSweep`'s Q7 conservatism, plus the launch-race age gate:
+ * - `created_at` younger than `REPROBE_MIN_AGE_SECS` → leave alone (a fresh row
+ *   whose pid we may have read before SessionStart settled). The gate is `>=`:
+ *   age EQUAL to the threshold is eligible.
+ * - NULL pid → out of scope (the diff loop's pidless arm owns those rows).
+ * - pid DEAD (`isAlive` false) → `reason: "dead"`, regardless of start_time.
+ * - pid ALIVE, stored start_time present, `readStartTime` returns non-null AND
+ *   differs → `reason: "recycled"` (pid reused by a different process).
+ * - pid ALIVE, stored start_time NULL → leave alone (can't prove recycle from a
+ *   bare pid on macOS's small pid space).
+ * - pid ALIVE, `readStartTime` returns null (probe failed) → leave alone
+ *   (can't distinguish recycled from same-process — conservative).
+ * - pid ALIVE, start_time matches → leave alone (same process, still running).
+ *
+ * `readStartTime` is consulted ONLY for an alive pid with a stored start_time —
+ * the dead path never forks `ps`.
+ */
+export function selectDeadReprobeCandidates(
+  rows: ReprobeRow[],
+  nowSecs: number,
+  isAlive: (pid: number) => boolean,
+  readStartTime: (pid: number) => string | null,
+): ReprobeCandidate[] {
+  const out: ReprobeCandidate[] = [];
+  for (const row of rows) {
+    if (row.pid == null) {
+      continue; // pidless rows are the diff loop's job, not ours.
+    }
+    if (nowSecs - row.created_at < REPROBE_MIN_AGE_SECS) {
+      continue; // launch-race age gate — too fresh to reap.
+    }
+    if (!isAlive(row.pid)) {
+      out.push({
+        jobId: row.job_id,
+        pid: row.pid,
+        startTime: row.start_time,
+        reason: "dead",
+      });
+      continue;
+    }
+    if (row.start_time == null) {
+      continue; // alive, no stored start_time → can't prove recycle.
+    }
+    const osStart = readStartTime(row.pid);
+    if (osStart == null) {
+      continue; // probe failed → conservative leave-alone.
+    }
+    if (osStart === row.start_time) {
+      continue; // same process, still alive.
+    }
+    out.push({
+      jobId: row.job_id,
+      pid: row.pid,
+      startTime: row.start_time,
+      reason: "recycled",
+    });
+  }
+  return out;
+}
+
+/**
+ * Run the periodic re-probe sweep against an already-open RO connection. On a
+ * slow (`REPROBE_MS`) tick, query the candidate set, run the pure predicate,
+ * and post the SAME `ExitMessage` shape the kernel arm posts for each confirmed
+ * dead/recycled row — main's existing onmessage handler (re-read, terminal
+ * guard, `(pid,start_time)` match, `insertEvent` + `pumpWakes`) mints the
+ * synthetic `Killed` unchanged. We never write the DB, never signal, never
+ * mint events here — message-to-main keeps the column list in one place.
+ *
+ * Exported so tests can drive the loop directly with injected probes and a
+ * real DB. Resolves once `isShutdown()` returns true.
+ */
+export async function reprobeLoop(
+  db: Database,
+  post: (msg: ExitMessage) => void,
+  isShutdown: () => boolean,
+  opts: {
+    intervalMs?: number;
+    nowSecs?: () => number;
+    isAlive?: (pid: number) => boolean;
+    readStartTime?: (pid: number) => string | null;
+  } = {},
+): Promise<void> {
+  const interval = opts.intervalMs ?? REPROBE_MS;
+  const nowSecs = opts.nowSecs ?? (() => Date.now() / 1000);
+  const isAlive = opts.isAlive ?? isPidAlive;
+  const readStartTime = opts.readStartTime ?? readOsStartTime;
+  // Same candidate scope as the diff loop, plus `created_at` for the age gate.
+  // The pidless arm of the diff loop handles NULL-pid rows; we filter to
+  // pid-bearing rows here (the predicate also skips NULL pids defensively).
+  const candidatesQuery = db.query(
+    `SELECT job_id, pid, start_time, created_at FROM jobs
+       WHERE state IN ('working','stopped') AND pid IS NOT NULL`,
+  );
+
+  while (!isShutdown()) {
+    // Sleep FIRST: the diff loop's boot tick + seed sweep already covered the
+    // rows present at spawn, so there's nothing for an immediate re-probe to
+    // catch that they didn't. Wake periodically to re-check shutdown so a
+    // shutdown mid-interval unblocks within one slice, not one full REPROBE_MS.
+    const slice = Math.min(interval, WAIT_TIMEOUT_MS);
+    let waited = 0;
+    while (waited < interval && !isShutdown()) {
+      await Bun.sleep(slice);
+      waited += slice;
+    }
+    if (isShutdown()) {
+      break;
+    }
+    let rows: ReprobeRow[];
+    try {
+      rows = candidatesQuery.all() as ReprobeRow[];
+    } catch (err) {
+      // A bad query (transient read race) must not wedge the sweep — log and
+      // retry on the next tick.
+      console.error("[exit-watcher] re-probe query failed:", err);
+      continue;
+    }
+    for (const row of rows) {
+      // Per-row try/catch: one bad probe (ps glitch, kill races) never aborts
+      // the sweep. Run the predicate one row at a time so a throw is isolated.
+      let cands: ReprobeCandidate[];
+      try {
+        cands = selectDeadReprobeCandidates(
+          [row],
+          nowSecs(),
+          isAlive,
+          readStartTime,
+        );
+      } catch (err) {
+        console.error(
+          `[exit-watcher] re-probe failed for job_id=${row.job_id} pid=${row.pid}:`,
+          err,
+        );
+        continue;
+      }
+      for (const c of cands) {
+        // Reaps are rare and forensic — one stderr line per reap with the full
+        // identity tuple. Main's verifier may still skip the mint (a resume
+        // between this probe and the fold flips the `(pid,start_time)` match),
+        // so this logs the PRODUCER's intent, not a guaranteed terminalization.
+        console.error(
+          `[exit-watcher] re-probe reap job_id=${c.jobId} pid=${c.pid} start_time=${c.startTime} reason=${c.reason}`,
+        );
+        post({
+          kind: "exit",
+          jobId: c.jobId,
+          pid: c.pid,
+          startTime: c.startTime,
+        });
+      }
     }
   }
 }
@@ -421,11 +627,24 @@ function main(): void {
     },
   );
   const wait = waitLoop();
+  // Re-probe loop — the kernel-arm-miss backstop. Slow (~60s) tick that mints
+  // a synthetic Killed for a non-terminal row whose pid is verifiably dead and
+  // past the launch-race age gate. Posts the SAME exit message the kernel arm
+  // posts, so main's onmessage handler folds it unchanged. A throw here is
+  // fatal like the other two loops.
+  const reprobe = reprobeLoop(
+    db,
+    (msg) => parentPort?.postMessage(msg),
+    () => shutdown,
+  ).catch((err) => {
+    console.error("[exit-watcher] re-probe loop crashed:", err);
+    throw err;
+  });
 
-  // Both loops must complete before we close the DB + FFI handle. If
-  // either throws, we treat the whole worker as fatal: close everything
-  // and exit non-zero so the daemon escalates.
-  Promise.all([diff, wait])
+  // All three loops must complete before we close the DB + FFI handle. If any
+  // throws, we treat the whole worker as fatal: close everything and exit
+  // non-zero so the daemon escalates.
+  Promise.all([diff, wait, reprobe])
     .then(() => {
       closeAll();
       process.exit(0);
