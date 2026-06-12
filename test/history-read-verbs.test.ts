@@ -170,6 +170,33 @@ describe("search-history", () => {
     expect(parsed.matches[0].prompt).toBe("refactor the gadget too");
     expect(parsed.matches[1].prompt).toBe("please refactor the widget");
   });
+
+  test("a literal-wildcard fragment matches only the literal row (escapeLike)", async () => {
+    const { db } = openDb(dbPath);
+    // Literal '%' in the prompt — the row the fragment '50%' must match.
+    seedEvent(db, {
+      ts: 100,
+      sessionId: "lit",
+      hookEvent: "UserPromptSubmit",
+      data: JSON.stringify({ prompt: "deploy 50% done" }),
+    });
+    // Would match '50%' ONLY if '%' were a LIKE wildcard (50<anything>done).
+    seedEvent(db, {
+      ts: 200,
+      sessionId: "wild",
+      hookEvent: "UserPromptSubmit",
+      data: JSON.stringify({ prompt: "deploy 5099 done" }),
+    });
+    db.close();
+
+    const res = await runVerb("search-history", ["50%"]);
+    expect(res.code).toBe(0);
+    const parsed = JSON.parse(res.stdout);
+    expect(parsed.success).toBe(true);
+    expect(
+      parsed.matches.map((m: { session_id: string }) => m.session_id),
+    ).toEqual(["lit"]);
+  });
 });
 
 describe("find-file-history", () => {
@@ -212,6 +239,51 @@ describe("find-file-history", () => {
     expect(parsed.matches[0].source).toBe("bash");
     expect(parsed.matches[0].last_mutation_at).toBe(300);
     expect(parsed.matches[1].session_id).toBe("s1");
+  });
+
+  test("a literal-wildcard fragment matches only the literal row (escapeLike)", async () => {
+    const { db } = openDb(dbPath);
+    // Literal '_' in the path — the row the fragment 'a_b' must match.
+    seedFileAttribution(db, {
+      projectDir: "/repo",
+      sessionId: "lit",
+      filePath: "src/a_b.ts",
+      lastMutationAt: 100,
+      op: "edit",
+      source: "tool",
+    });
+    // Would match 'a_b' ONLY if '_' were a single-char LIKE wildcard (a<x>b).
+    seedFileAttribution(db, {
+      projectDir: "/repo",
+      sessionId: "wild",
+      filePath: "src/axb.ts",
+      lastMutationAt: 200,
+      op: "edit",
+      source: "tool",
+    });
+    db.close();
+
+    const res = await runVerb("find-file-history", ["a_b"]);
+    expect(res.code).toBe(0);
+    const parsed = JSON.parse(res.stdout);
+    expect(parsed.success).toBe(true);
+    expect(
+      parsed.matches.map((m: { session_id: string }) => m.session_id),
+    ).toEqual(["lit"]);
+  });
+
+  test("a read failure emits { success: false, error }, not an empty result", async () => {
+    // Drop the table the verb reads so the LIKE scan throws inside the verb.
+    const { db } = openDb(dbPath);
+    db.run("DROP TABLE file_attributions");
+    db.close();
+
+    const res = await runVerb("find-file-history", ["widget"]);
+    expect(res.code).toBe(1);
+    const parsed = JSON.parse(res.stdout);
+    expect(parsed.success).toBe(false);
+    expect(typeof parsed.error).toBe("string");
+    expect(parsed.matches).toBeUndefined();
   });
 });
 
@@ -275,5 +347,19 @@ describe("show-session-events", () => {
     const res = await runVerb("show-session-events", []);
     expect(res.code).toBe(2);
     expect(res.stderr).toContain("--session-id is required");
+  });
+
+  test("a read failure emits { success: false, error }, not an empty result", async () => {
+    // Drop the table the verb reads so the spine scan throws inside the verb.
+    const { db } = openDb(dbPath);
+    db.run("DROP TABLE events");
+    db.close();
+
+    const res = await runVerb("show-session-events", ["--session-id", "s1"]);
+    expect(res.code).toBe(1);
+    const parsed = JSON.parse(res.stdout);
+    expect(parsed.success).toBe(false);
+    expect(typeof parsed.error).toBe("string");
+    expect(parsed.events).toBeUndefined();
   });
 });
