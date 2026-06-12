@@ -13,7 +13,7 @@ Data lives in `.planctl/` inside the project directory, under version control.
 
 - Python `>=3.11,<3.14` — the authoritative implementation
 - [`uv`](https://docs.astral.sh/uv/) recommended for running/installing
-- [Bun](https://bun.sh/) `1.3.14` — to build `planctl-bun`, a compiled TypeScript binary covering the read verbs (`state-path`, `detect`, `status`, `epics`) and the worker-loop writes (`init`, `claim`, `done`, `block`)
+- [Bun](https://bun.sh/) `1.3.14` — to build `planctl-bun`, a compiled TypeScript binary covering the read surface (`state-path`, `detect`, `status`, `epics`, `show`, `cat`, `list`, `ready`, `tasks`, `resolve-task`, `refine-context`, `validate`) and the worker-loop writes (`init`, `claim`, `done`, `block`)
 
 ## Install
 
@@ -31,7 +31,7 @@ uv tool install .
 planctl --help
 ```
 
-The Python CLI is the authoritative implementation; `planctl-bun` is an additive port — the read verbs plus the `init`/`claim`/`done`/`block` worker loop — that proves parity against the same conformance suite. To build it:
+The Python CLI is the authoritative implementation; `planctl-bun` is an additive port — the read surface plus the `init`/`claim`/`done`/`block` worker loop — that proves parity against the same conformance suite. To build it:
 
 ```bash
 bun install

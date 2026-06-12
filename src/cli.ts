@@ -22,13 +22,21 @@ import {
   type SubcommandSpec,
 } from "./subgroup.ts";
 import { runBlock } from "./verbs/block.ts";
+import { runCat } from "./verbs/cat.ts";
 import { runClaim } from "./verbs/claim.ts";
 import { runDetect } from "./verbs/detect.ts";
 import { runDone } from "./verbs/done.ts";
 import { runEpics } from "./verbs/epics.ts";
 import { runInit } from "./verbs/init.ts";
+import { runList } from "./verbs/list.ts";
+import { runReady } from "./verbs/ready.ts";
+import { runRefineContext } from "./verbs/refine_context.ts";
+import { runResolveTask } from "./verbs/resolve_task.ts";
+import { runShow } from "./verbs/show.ts";
 import { runStatePath } from "./verbs/state_path.ts";
 import { runStatus } from "./verbs/status.ts";
+import { runTasks } from "./verbs/tasks.ts";
+import { runValidate } from "./verbs/validate.ts";
 
 // Re-export the emit seam from its module so existing importers keep their
 // import site; the definitions live in src/emit.ts.
@@ -62,6 +70,11 @@ interface CommandSpec {
 const COMMANDS: CommandSpec[] = [
   { name: "block", shortHelp: "Mark a task as blocked.", implemented: true },
   {
+    name: "cat",
+    shortHelp: "Print the raw spec markdown for an epic or task.",
+    implemented: true,
+  },
+  {
     name: "claim",
     shortHelp: "Claim a task and return the worker briefing.",
     implemented: true,
@@ -80,6 +93,31 @@ const COMMANDS: CommandSpec[] = [
     implemented: true,
   },
   {
+    name: "list",
+    shortHelp: "List all epics and their tasks in a tree view.",
+    implemented: true,
+  },
+  {
+    name: "ready",
+    shortHelp: "List tasks that are ready to be worked on.",
+    implemented: true,
+  },
+  {
+    name: "refine-context",
+    shortHelp: "Fetch refine-state for /plan:plan (read-only).",
+    implemented: true,
+  },
+  {
+    name: "resolve-task",
+    shortHelp: "Routing lookup to launch /plan:work.",
+    implemented: true,
+  },
+  {
+    name: "show",
+    shortHelp: "Show detailed information about an epic or task.",
+    implemented: true,
+  },
+  {
     name: "state-path",
     shortHelp: "Print the resolved state directory path.",
     implemented: true,
@@ -90,6 +128,16 @@ const COMMANDS: CommandSpec[] = [
     implemented: true,
   },
   { name: "task", shortHelp: "Manage tasks.", implemented: true },
+  {
+    name: "tasks",
+    shortHelp: "List tasks with optional filtering.",
+    implemented: true,
+  },
+  {
+    name: "validate",
+    shortHelp: "Validate project data integrity.",
+    implemented: true,
+  },
 ];
 
 const DESCRIPTION =
@@ -306,11 +354,19 @@ function printHelp(): void {
  * raises the missing-project error envelope + exit 1 when no `.planctl/`
  * resolves (terminating before any trailer prints); a genuine non-exit failure
  * is swallowed so a tracing side-effect never breaks the CLI. */
-function emitTrailer(verb: string, format: OutputFormat | null): void {
+function emitTrailer(
+  verb: string,
+  format: OutputFormat | null,
+  target: string | null,
+): void {
   const ctx = resolveProject(format);
   try {
     const envelope = {
-      planctl_invocation: buildPlanctlInvocationReadonly(verb, ctx.projectPath),
+      planctl_invocation: buildPlanctlInvocationReadonly(
+        verb,
+        ctx.projectPath,
+        target,
+      ),
     };
     process.stdout.write(`${compactJson(envelope)}\n`);
   } catch {
@@ -329,6 +385,10 @@ function dispatch(parsed: ParsedArgs): number {
   if (spec === undefined) {
     noSuchCommand(command);
   }
+
+  // The generic readonly trailer's target: the verb's first positional id when
+  // it has one (show / refine-context), else null. The id-bearing cases set it.
+  let trailerTarget: string | null = null;
 
   switch (command) {
     case "state-path": {
@@ -382,6 +442,52 @@ function dispatch(parsed: ParsedArgs): number {
     case "task":
       dispatchGroup(TASK_GROUP, rest, format);
       return 0;
+    case "show": {
+      const id = readPositional(rest);
+      runShow(id, format);
+      trailerTarget = id.startsWith("fn-") ? id : null;
+      break;
+    }
+    case "cat":
+      // Format-free, no trailer: cat owns its stdout + exit code.
+      return runCat(readPositional(rest));
+    case "list":
+      runList(format);
+      break;
+    case "ready":
+      // --epic is an OPTION, not a positional, so the trailer target stays null.
+      runReady(readOption(rest, "--epic") ?? "", format);
+      break;
+    case "tasks":
+      runTasks({
+        epic: readOption(rest, "--epic"),
+        status: readOption(rest, "--status"),
+        format,
+      });
+      break;
+    case "resolve-task":
+      // Self-emits its readonly invocation (merged into the payload line) — the
+      // generic trailer never fires (didSelfEmit() guards it below).
+      runResolveTask({
+        taskId: readPositional(rest),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
+    case "refine-context": {
+      const id = readPositional(rest);
+      runRefineContext({
+        epicId: id,
+        invalidate: readFlag(rest, "--invalidate"),
+        format,
+      });
+      trailerTarget = id.startsWith("fn-") ? id : null;
+      break;
+    }
+    case "validate":
+      // Non-standard {valid,errors,warnings} envelope, no trailer: validate owns
+      // its stdout + exit code (and the --epic stamp line).
+      return runValidate(readOption(rest, "--epic"), format);
     default:
       noSuchCommand(command);
   }
@@ -390,7 +496,7 @@ function dispatch(parsed: ParsedArgs): number {
   // already printed its invocation-bearing envelope — the generic trailer must
   // not fire on top. didSelfEmit() is the runtime sentinel.
   if (!NO_TRACK_COMMANDS.has(command) && !didSelfEmit()) {
-    emitTrailer(command, format);
+    emitTrailer(command, format, trailerTarget);
   }
   return 0;
 }

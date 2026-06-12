@@ -19,6 +19,30 @@ export function compactJson(data: unknown): string {
   return JSON.stringify(data);
 }
 
+/** Python json.dumps() DEFAULT serialization: ", " / ": " separators,
+ * ensure_ascii=True (\uXXXX for every code unit >= 0x7f), dict order preserved.
+ * Used for validate --epic's second invocation line, which Python prints with
+ * json.dumps(obj) (no separators override) — distinct from the compact trailer. */
+export function pyDefaultJson(data: unknown): string {
+  return pyEnsureAscii(
+    JSON.stringify(data, null, 0).replace(
+      /("(?:[^"\\]|\\.)*")|,|:/g,
+      (m, str) => (str !== undefined ? str : m === "," ? ", " : ": "),
+    ),
+  );
+}
+
+/** \uXXXX-escape every code unit >= 0x7f, reproducing Python ensure_ascii=True. */
+function pyEnsureAscii(serialized: string): string {
+  let out = "";
+  for (let i = 0; i < serialized.length; i += 1) {
+    const code = serialized.charCodeAt(i);
+    out +=
+      code >= 0x7f ? `\\u${code.toString(16).padStart(4, "0")}` : serialized[i];
+  }
+  return out;
+}
+
 /**
  * YAML matching PyYAML's _LiteralDumper: block style, literal block scalars for
  * multiline strings, no key sorting, unicode preserved. js-yaml's noArrayIndent
