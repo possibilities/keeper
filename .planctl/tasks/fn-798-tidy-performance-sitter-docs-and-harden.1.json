@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T00:56:48.003050Z",
+  "depends_on": [],
+  "epic": "fn-798-tidy-performance-sitter-docs-and-harden",
+  "id": "fn-798-tidy-performance-sitter-docs-and-harden.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "fix performance-sitter doc drift",
+  "updated_at": "2026-06-12T00:56:48.003050Z"
+}
