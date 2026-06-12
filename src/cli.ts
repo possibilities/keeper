@@ -12,17 +12,19 @@
 // error envelope + exit 1 inline (the contract for detect's found-false tail).
 // The trailer is suppressed for the cat/validate contract verbs by name.
 
-import { autoCommitFromInvocation, CommitFailed } from "./commit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
-import {
-  buildPlanctlInvocation,
-  buildPlanctlInvocationReadonly,
-} from "./invocation.ts";
+import { buildPlanctlInvocationReadonly } from "./invocation.ts";
 import { resolveProject } from "./project.ts";
+import { runBlock } from "./verbs/block.ts";
+import { runClaim } from "./verbs/claim.ts";
 import { runDetect } from "./verbs/detect.ts";
 import { runEpics } from "./verbs/epics.ts";
 import { runStatePath } from "./verbs/state_path.ts";
 import { runStatus } from "./verbs/status.ts";
+
+// Re-export the emit seam from its module so existing importers keep their
+// import site; the definitions live in src/emit.ts.
+export { emitMutating, emitReadonly } from "./emit.ts";
 
 const PROG = "planctl";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
@@ -30,6 +32,11 @@ const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 // Verbs that own their stdout contract and must bypass the trailer (raw markdown
 // / non-standard envelopes). Mirrors cli.py _NO_TRACK_COMMANDS.
 const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
+
+// Verbs that emit their OWN envelope with the planctl_invocation embedded
+// (claim/block via emitReadonly; done/init via emitMutating) — the generic
+// trailer must never fire on top. Mirrors cli.py's INVOCATION_EMITTED_SENTINEL.
+const SELF_EMITTING_COMMANDS = new Set(["claim", "block"]);
 
 interface CommandSpec {
   name: string;
@@ -39,6 +46,12 @@ interface CommandSpec {
 
 // Registration order = help-listing order (alphabetical, matching click).
 const COMMANDS: CommandSpec[] = [
+  { name: "block", shortHelp: "Mark a task as blocked.", implemented: true },
+  {
+    name: "claim",
+    shortHelp: "Claim a task and return the worker briefing.",
+    implemented: true,
+  },
   {
     name: "detect",
     shortHelp: "Check if cwd belongs to a planctl project.",
@@ -178,71 +191,6 @@ function emitTrailer(verb: string, format: OutputFormat | null): void {
   }
 }
 
-/** The committing-seam emit path for mutating verbs — the port of
- * output.emit()'s mutating branch and the runner's commit ordering. Build the
- * planctl_invocation (a fail-closed session id or a bad touched-path throws,
- * surfacing verbatim), run the auto-commit BEFORE printing, then:
- *  - on a commit failure, print ONE compact line
- *    {"success":false,"error":"commit_failed","details":...,"planctl_invocation":...}
- *    and process.exit(1) — the success envelope is NEVER printed;
- *  - on success, embed the invocation under planctl_invocation and print ONE
- *    compact NDJSON line {"success":true, ...data, planctl_invocation}.
- * Mutating verbs never print the read-only trailer — this path replaces it. */
-export function emitMutating(
-  data: Record<string, unknown>,
-  opts: {
-    verb: string;
-    target: string;
-    detail?: string | null;
-    repoRoot: string;
-    primaryRepo?: string | null;
-    queueJump?: boolean;
-  },
-): void {
-  // Build the invocation FIRST — a fail-closed session id or a path-traversal
-  // touched-path throws here and surfaces verbatim (no commit attempted).
-  const invocation = buildPlanctlInvocation(
-    opts.verb,
-    opts.target,
-    opts.detail,
-    {
-      repoRoot: opts.repoRoot,
-      primaryRepo: opts.primaryRepo,
-      queueJump: opts.queueJump,
-    },
-  );
-
-  // Per-verb auto-commit BEFORE the success envelope prints, so an envelope
-  // success:true on stdout is the authoritative signal that the .planctl/ commit
-  // landed. On a hard failure, emit the compact failure envelope and exit 1.
-  try {
-    autoCommitFromInvocation(invocation);
-  } catch (exc) {
-    if (!(exc instanceof CommitFailed)) {
-      throw exc;
-    }
-    const failure = {
-      success: false,
-      error: "commit_failed",
-      details: {
-        error: exc.error,
-        message: exc.detail,
-        ...exc.extra,
-      },
-      planctl_invocation: invocation,
-    };
-    process.stdout.write(`${compactJson(failure)}\n`);
-    process.exit(1);
-  }
-
-  const envelope = {
-    success: true,
-    ...data,
-    planctl_invocation: invocation,
-  };
-  process.stdout.write(`${compactJson(envelope)}\n`);
-}
-
 function dispatch(parsed: ParsedArgs): number {
   const { command, format, rest } = parsed;
   if (command === null) {
@@ -270,11 +218,30 @@ function dispatch(parsed: ParsedArgs): number {
     case "epics":
       runEpics(format);
       break;
+    case "claim":
+      runClaim({
+        taskId: readPositional(rest),
+        force: readFlag(rest, "--force"),
+        note: readOption(rest, "--note"),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
+    case "block":
+      runBlock({
+        taskId: readPositional(rest),
+        reason: readOption(rest, "--reason"),
+        reasonFile: readOption(rest, "--reason-file"),
+        format,
+      });
+      break;
     default:
       noSuchCommand(command);
   }
 
-  if (!NO_TRACK_COMMANDS.has(command)) {
+  // claim/block emit their own envelope (with the readonly invocation embedded);
+  // the generic trailer must not fire on top of it.
+  if (!NO_TRACK_COMMANDS.has(command) && !SELF_EMITTING_COMMANDS.has(command)) {
     emitTrailer(command, format);
   }
   return 0;
@@ -292,6 +259,35 @@ function readOption(rest: string[], name: string): string | null {
     }
   }
   return null;
+}
+
+/** True iff the boolean flag `name` is present in the remaining args. */
+function readFlag(rest: string[], name: string): boolean {
+  return rest.includes(name);
+}
+
+/** The first positional (non-`--`-prefixed) arg, or "" when absent. A value
+ * immediately following a known value-taking option is skipped so it is not
+ * mistaken for the positional. */
+function readPositional(rest: string[]): string {
+  const valueTaking = new Set([
+    "--note",
+    "--project",
+    "--reason",
+    "--reason-file",
+  ]);
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i] as string;
+    if (arg.startsWith("--")) {
+      // `--name=value` is self-contained; `--name value` consumes the next arg.
+      if (!arg.includes("=") && valueTaking.has(arg)) {
+        i += 1;
+      }
+      continue;
+    }
+    return arg;
+  }
+  return "";
 }
 
 export function main(argv: string[]): number {

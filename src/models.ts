@@ -91,3 +91,23 @@ export function mergeTaskState(
   normalizeTask(merged);
   return merged;
 }
+
+/** Worker reasoning tiers — the canonical set workerAgentForTier maps. */
+export const TASK_TIERS = ["medium", "high", "xhigh", "max"] as const;
+
+/** Map a task tier to the `plan` plugin's worker-agent name. Mirrors
+ * worker_agent_for_tier: `plan:worker-<tier>` for a TASK_TIERS member, null
+ * when tier is null (records carrying no tier), and throws for a non-null
+ * string outside TASK_TIERS (corrupt-on-disk guard). The null return is
+ * load-bearing — /plan:work branches on it to stop cleanly. */
+export function workerAgentForTier(tier: string | null): string | null {
+  if (tier === null) {
+    return null;
+  }
+  if (!(TASK_TIERS as readonly string[]).includes(tier)) {
+    throw new Error(
+      `unknown tier ${JSON.stringify(tier)}; expected one of ${TASK_TIERS.join(", ")} or null`,
+    );
+  }
+  return `plan:worker-${tier}`;
+}

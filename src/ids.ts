@@ -18,3 +18,21 @@ export function parseId(idStr: string): [number | null, number | null] {
   const task = match[2] !== undefined ? Number.parseInt(match[2], 10) : null;
   return [epic, task];
 }
+
+/** True iff `s` is a task id (epic-num AND task-num both parse). Mirrors
+ * ids.is_task_id. */
+export function isTaskId(s: string): boolean {
+  const [epic, task] = parseId(s);
+  return epic !== null && task !== null;
+}
+
+/** Extract the epic id from a task id by stripping the final `.<task>` segment.
+ * Throws on a non-task id. Mirrors ids.epic_id_from_task. */
+export function epicIdFromTask(taskId: string): string {
+  const [epic, task] = parseId(taskId);
+  if (epic === null || task === null) {
+    throw new Error(`Invalid task ID: ${taskId}`);
+  }
+  const dot = taskId.lastIndexOf(".");
+  return taskId.slice(0, dot);
+}
