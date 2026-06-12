@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Conformance gate green and documented",
-  "updated_at": "2026-06-12T04:00:56.659159Z"
+  "updated_at": "2026-06-12T07:28:23.709169Z",
+  "worker_done_at": "2026-06-12T07:28:23.709169Z"
 }

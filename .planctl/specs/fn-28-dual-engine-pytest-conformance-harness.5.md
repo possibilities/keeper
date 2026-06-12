@@ -33,5 +33,5 @@ The acceptance run IS the test. Verify three invocations: default gate (green, f
 - [ ] No remaining unhandled test: every test is routed, converted, or visibly marked
 
 ## Done summary
-
+Drove PLANCTL_BIN conformance run green serially and with -n auto --dist loadscope (per-worker tmp HOME, no cross-worker flock); added a pytest_xdist_auto_num_workers cap (min(cpus,8)) so -n auto cannot fork-bomb, and landed the conformance row in the Running Things table.
 ## Evidence
