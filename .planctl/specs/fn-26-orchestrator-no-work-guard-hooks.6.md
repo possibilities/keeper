@@ -38,5 +38,5 @@ No code tests; verification is the rendered-output check plus a docs read-throug
 - [ ] `uv run pytest tests/` green
 
 ## Done summary
-
+Dropped Bash(keeper:*) and added disallowed-tools to work+close skill frontmatter; hardened Phase 2b verdict switch as resume-only; documented the three orchestrator hooks in README and AGENTS. Rendered work/SKILL.md verified carrying both frontmatter changes.
 ## Evidence

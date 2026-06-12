@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Disarm orchestrator skill surfaces",
-  "updated_at": "2026-06-11T23:22:24.562941Z"
+  "updated_at": "2026-06-12T00:33:26.328569Z",
+  "worker_done_at": "2026-06-12T00:33:26.328569Z"
 }
