@@ -33,5 +33,5 @@ Green three ways before done; commit-asserting tests carry real_git for the defa
 - [ ] Green in default engine and against Python; fast gate unchanged
 
 ## Done summary
-
+Added tests/test_restamp_verbs.py — the engine-agnostic conformance spec for the in-wave mutating verbs (setters, dep editors, short-circuit/conditionally-mutating verbs, restamp-failure fail-forward, add-dep cycle rollback), all seed_state-seeded and green in the default engine and against the Python binary.
 ## Evidence
