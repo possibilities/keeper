@@ -1,0 +1,235 @@
+// planctl-bun CLI dispatch — the read-only-subset entry point.
+//
+// Hand-rolled dispatch reproducing the click conventions the conformance harness
+// pins: top-level `--format json|yaml|human` plumbed to every verb (both
+// positions), `--help` on stdout (exit 0) with a Commands section, and an
+// unknown-command error on stderr (exit 2) shaped like click's "No such command".
+//
+// state-path is implemented end-to-end; the remaining read-only verbs of this
+// epic (detect/status/epics) are registered in help but land in later tasks —
+// invoking one exits non-zero with a clear not-available error (never a silent
+// success). After a read-only verb runs, the trailing planctl_invocation NDJSON
+// line is emitted (soft-fail: dropped when no project resolves), suppressed for
+// the cat/validate contract verbs by name.
+
+import { compactJson, type OutputFormat } from "./format.ts";
+import { buildPlanctlInvocationReadonly } from "./invocation.ts";
+import { findProjectRoot } from "./project.ts";
+import { runStatePath } from "./verbs/state_path.ts";
+
+const PROG = "planctl";
+const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
+
+// Verbs that own their stdout contract and must bypass the trailer (raw markdown
+// / non-standard envelopes). Mirrors cli.py _NO_TRACK_COMMANDS.
+const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
+
+interface CommandSpec {
+  name: string;
+  shortHelp: string;
+  implemented: boolean;
+}
+
+// Registration order = help-listing order (alphabetical, matching click).
+const COMMANDS: CommandSpec[] = [
+  {
+    name: "detect",
+    shortHelp: "Check if cwd belongs to a planctl project.",
+    implemented: false,
+  },
+  { name: "epics", shortHelp: "List all epics.", implemented: false },
+  {
+    name: "state-path",
+    shortHelp: "Print the resolved state directory path.",
+    implemented: true,
+  },
+  {
+    name: "status",
+    shortHelp: "Show overall project status.",
+    implemented: false,
+  },
+];
+
+const DESCRIPTION =
+  "File-based task tracking for structured development workflows.";
+
+interface ParsedArgs {
+  format: OutputFormat | null;
+  help: boolean;
+  command: string | null;
+  rest: string[];
+}
+
+/** Split argv into the top-level --format/--help and the command + its args.
+ * --format is accepted before OR after the command name. */
+function parseArgs(argv: string[]): ParsedArgs {
+  let format: OutputFormat | null = null;
+  let help = false;
+  let command: string | null = null;
+  const rest: string[] = [];
+
+  let i = 0;
+  while (i < argv.length) {
+    const arg = argv[i] as string;
+    if (command === null) {
+      if (arg === "--help") {
+        help = true;
+        i += 1;
+      } else if (arg === "--format") {
+        format = readFormat(argv[i + 1]);
+        i += 2;
+      } else if (arg.startsWith("--format=")) {
+        format = readFormat(arg.slice("--format=".length));
+        i += 1;
+      } else if (arg.startsWith("-")) {
+        unknownOption(arg);
+      } else {
+        command = arg;
+        i += 1;
+      }
+    } else {
+      // After the command name, still intercept the global --format/--help.
+      if (arg === "--format") {
+        format = readFormat(argv[i + 1]);
+        i += 2;
+      } else if (arg.startsWith("--format=")) {
+        format = readFormat(arg.slice("--format=".length));
+        i += 1;
+      } else if (arg === "--help") {
+        help = true;
+        i += 1;
+      } else {
+        rest.push(arg);
+        i += 1;
+      }
+    }
+  }
+
+  return { format, help, command, rest };
+}
+
+function readFormat(value: string | undefined): OutputFormat {
+  if (value === "json" || value === "yaml" || value === "human") {
+    return value;
+  }
+  usageError(
+    `Invalid value for '--format': '${value ?? ""}' is not one of 'json', 'yaml', 'human'.`,
+  );
+}
+
+function unknownOption(arg: string): never {
+  usageError(`No such option: ${arg}`);
+}
+
+/** click's no-such-command error: usage + try-help on stderr, exit 2. */
+function noSuchCommand(name: string): never {
+  process.stderr.write(`${USAGE}\n`);
+  process.stderr.write(`Try '${PROG} --help' for help.\n\n`);
+  process.stderr.write(`Error: No such command '${name}'.\n`);
+  process.exit(2);
+}
+
+function usageError(message: string): never {
+  process.stderr.write(`${USAGE}\n`);
+  process.stderr.write(`Try '${PROG} --help' for help.\n\n`);
+  process.stderr.write(`Error: ${message}\n`);
+  process.exit(2);
+}
+
+function printHelp(): void {
+  const lines: string[] = [];
+  lines.push(USAGE);
+  lines.push("");
+  lines.push(`  ${DESCRIPTION}`);
+  lines.push("");
+  lines.push("Options:");
+  lines.push("  --format [json|yaml|human]  Output format (default: json)");
+  lines.push("  --help                      Show this message and exit.");
+  lines.push("");
+  lines.push("Commands:");
+  const width = Math.max(...COMMANDS.map((c) => c.name.length));
+  for (const cmd of COMMANDS) {
+    lines.push(`  ${cmd.name.padEnd(width)}  ${cmd.shortHelp}`);
+  }
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
+/** Emit the trailing read-only planctl_invocation NDJSON line. Soft-fail:
+ * dropped silently when no project resolves (matches cli.py's try/except). */
+function emitTrailer(verb: string): void {
+  try {
+    const repoRoot = findProjectRoot();
+    const envelope = {
+      planctl_invocation: buildPlanctlInvocationReadonly(verb, repoRoot),
+    };
+    process.stdout.write(`${compactJson(envelope)}\n`);
+  } catch {
+    // Never fail the CLI over a tracing side-effect.
+  }
+}
+
+function notImplemented(name: string): never {
+  process.stderr.write(
+    `Error: '${name}' is not yet available in planctl-bun (read-only subset; ` +
+      "use the Python planctl binary).\n",
+  );
+  process.exit(2);
+}
+
+function dispatch(parsed: ParsedArgs): number {
+  const { command, format, rest } = parsed;
+  if (command === null) {
+    printHelp();
+    return 0;
+  }
+
+  const spec = COMMANDS.find((c) => c.name === command);
+  if (spec === undefined) {
+    noSuchCommand(command);
+  }
+  if (!spec.implemented) {
+    notImplemented(command);
+  }
+
+  switch (command) {
+    case "state-path": {
+      const taskId = readOption(rest, "--task");
+      runStatePath(format, taskId);
+      break;
+    }
+    default:
+      notImplemented(command);
+  }
+
+  if (!NO_TRACK_COMMANDS.has(command)) {
+    emitTrailer(command);
+  }
+  return 0;
+}
+
+/** Read a `--name value` / `--name=value` option from the remaining args. */
+function readOption(rest: string[], name: string): string | null {
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i] as string;
+    if (arg === name) {
+      return rest[i + 1] ?? null;
+    }
+    if (arg.startsWith(`${name}=`)) {
+      return arg.slice(name.length + 1);
+    }
+  }
+  return null;
+}
+
+export function main(argv: string[]): number {
+  const parsed = parseArgs(argv);
+  if (parsed.help) {
+    printHelp();
+    return 0;
+  }
+  return dispatch(parsed);
+}
+
+if (import.meta.main) {
+  process.exit(main(process.argv.slice(2)));
+}

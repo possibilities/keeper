@@ -4,11 +4,20 @@
   "description": "Bun TypeScript hook dispatchers enforcing the content-blind orchestrator contract for the planctl plugin",
   "private": true,
   "scripts": {
-    "lint": "biome check --no-errors-on-unmatched plugin/hooks test",
+    "build": "bun build --compile src/cli.ts --outfile dist/planctl-bun && chmod +x dist/planctl-bun",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "biome check --no-errors-on-unmatched plugin/hooks test src",
     "test": "bun test"
+  },
+  "dependencies": {
+    "js-yaml": "4.2.0"
   },
   "devDependencies": {
     "@biomejs/biome": "2.2.0",
-    "@types/bun": "^1"
+    "@types/bun": "^1",
+    "@types/js-yaml": "4.0.9"
+  },
+  "engines": {
+    "bun": "1.3.14"
   }
 }

@@ -1,0 +1,154 @@
+// Dispatch tests for src/cli.ts, exercised through the COMPILED binary
+// (dist/planctl-bun) via Bun.spawnSync — never `bun run`. The compiled artifact
+// is what the conformance gate runs, so quirks (virtual FS, env minimalism) are
+// covered here too. Run `bun run build` first; the suite hard-fails if the
+// binary is absent rather than silently passing.
+
+import { describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  realpathSync,
+  rmSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+const BIN = join(import.meta.dir, "..", "dist", "planctl-bun");
+
+if (!existsSync(BIN)) {
+  throw new Error(
+    `compiled binary missing at ${BIN}; run \`bun run build\` before \`bun test\``,
+  );
+}
+
+interface RunResult {
+  code: number;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run the compiled binary under a minimal env (HOME + PATH only) — the same
+ * env-minimalism the conformance harness imposes. */
+function run(args: string[], cwd: string): RunResult {
+  const proc = Bun.spawnSync([BIN, ...args], {
+    cwd,
+    env: { HOME: join(cwd, ".home"), PATH: process.env.PATH ?? "" },
+  });
+  return {
+    code: proc.exitCode,
+    stdout: proc.stdout.toString(),
+    stderr: proc.stderr.toString(),
+  };
+}
+
+function seedProject(): string {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "planctl-cli-test-")));
+  mkdirSync(join(root, ".planctl", "state"), { recursive: true });
+  return root;
+}
+
+describe("--help", () => {
+  test("exit 0 on stdout with a Commands section and the four verbs", () => {
+    const r = run(["--help"], tmpdir());
+    expect(r.code).toBe(0);
+    expect(r.stdout.toLowerCase()).toContain("planctl");
+    expect(r.stdout).toContain("Commands:");
+    for (const verb of ["state-path", "detect", "status", "epics"]) {
+      expect(r.stdout).toContain(verb);
+    }
+  });
+});
+
+describe("unknown command", () => {
+  test("exit 2 on stderr with click's no-such-command shape", () => {
+    const r = run(["frobnicate"], tmpdir());
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("Usage: planctl [OPTIONS] COMMAND [ARGS]...");
+    expect(r.stderr).toContain("Try 'planctl --help' for help.");
+    expect(r.stderr).toContain("Error: No such command 'frobnicate'.");
+  });
+});
+
+describe("state-path", () => {
+  test("json envelope + byte-exact read-only trailer", () => {
+    const root = seedProject();
+    try {
+      const r = run(["state-path"], root);
+      expect(r.code).toBe(0);
+      const lines = r.stdout.trimEnd().split("\n");
+      const trailer = lines[lines.length - 1] as string;
+      const primary = lines.slice(0, -1).join("\n");
+      expect(primary).toBe(
+        `{\n  "success": true,\n  "state_dir": "${root}/.planctl/state"\n}`,
+      );
+      expect(trailer).toBe(
+        '{"planctl_invocation":{"files":null,"op":"state-path","target":null,' +
+          '"subject":null,"touched_path_files":[],' +
+          `"repo_root":"${root}","state_repo":"${root}"}}`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("--task adds task_state_path", () => {
+    const root = seedProject();
+    try {
+      const r = run(["state-path", "--task", "fn-1-x.2"], root);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain(
+        `"task_state_path": "${root}/.planctl/state/tasks/fn-1-x.2.state.json"`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("--format yaml renders block style", () => {
+    const root = seedProject();
+    try {
+      const r = run(["--format", "yaml", "state-path"], root);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain(
+        `success: true\nstate_dir: ${root}/.planctl/state\n`,
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("missing project errors (exit 1, no trailer)", () => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), "planctl-cli-empty-")),
+    );
+    try {
+      const r = run(["state-path"], root);
+      expect(r.code).toBe(1);
+      expect(r.stdout).toBe(
+        '{\n  "success": false,\n' +
+          '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
+      );
+      expect(r.stdout).not.toContain("planctl_invocation");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("unimplemented read-only verbs", () => {
+  test.each(["detect", "status", "epics"])(
+    "%s exits non-zero with a clear not-available error (never silent success)",
+    (verb) => {
+      const root = seedProject();
+      try {
+        const r = run([verb], root);
+        expect(r.code).not.toBe(0);
+        expect(r.stderr).toContain("not yet available in planctl-bun");
+      } finally {
+        rmSync(root, { recursive: true, force: true });
+      }
+    },
+  );
+});

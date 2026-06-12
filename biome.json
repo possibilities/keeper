@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": true,
-    "includes": ["plugin/hooks/**/*.ts", "test/**/*.ts"]
+    "includes": ["plugin/hooks/**/*.ts", "test/**/*.ts", "src/**/*.ts"]
   },
   "formatter": {
     "enabled": true,
