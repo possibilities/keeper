@@ -61,5 +61,5 @@ degrade. No real tmux.
 - [ ] `bun test test/exec-backend.test.ts` passes
 
 ## Done summary
-
+Added killWindow(paneId) + buildTmuxKillWindowArgs to the tmux ExecBackend, mirroring renameWindow: %N pane-id target, never-throw envelope, quiet TOCTOU no-op. Updated docs/exec-backend.md op table and prose.
 ## Evidence
