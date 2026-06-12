@@ -29,5 +29,5 @@ Post-promote: `command -v planctl` resolves to the regular-file bun binary; the 
 - [ ] Runbook content landed (triggers, rollback, shell-cache note, rollback window)
 
 ## Done summary
-
+Promote script (bun run promote) swaps ~/.local/bin/planctl to the compiled bun binary: build-gated, copy-to-temp-in-dest + atomic mv over the symlink path entry, abort-safe. Rollback rehearsed before the swap; full soak cycle green against the swapped binary; runbook landed in CLAUDE.md.
 ## Evidence

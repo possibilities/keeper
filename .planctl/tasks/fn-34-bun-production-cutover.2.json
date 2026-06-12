@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Promote script cutover and soak",
-  "updated_at": "2026-06-12T17:51:50.671828Z"
+  "updated_at": "2026-06-12T18:03:15.035000Z",
+  "worker_done_at": "2026-06-12T18:03:15.035000Z"
 }
