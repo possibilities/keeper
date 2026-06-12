@@ -1472,7 +1472,7 @@ test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-titl
   // Session A creates the epic via the scrape channel. Session B refines it
   // via the commit channel ONLY (its scrape NULLed out). The commit-channel
   // session must appear in the per-epic job_links sweep (the
-  // loadCommitTrailerSessionsForEpics widening).
+  // commitTrailerSessionsForEpics widening).
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
   planctlEvent({
@@ -1590,6 +1590,162 @@ test("fn-695: from-scratch re-fold is byte-identical over a log with commit-trai
   ]);
 
   // Re-fold from cursor=0.
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM file_attributions");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+  expect(
+    JSON.stringify(db.query("SELECT * FROM epics ORDER BY epic_id").all()),
+  ).toBe(JSON.stringify(epics1));
+});
+
+// ---------------------------------------------------------------------------
+// fn-807.1: the commit-trailer channel now performs ONE scan per
+// syncPlanctlLinks call (loadAllCommitTrailerFacts) instead of the old ~2 +
+// one-per-swept-session blob scans, and no SQL json_extract rides the WHERE —
+// every survivor parses in JS via extractCommit (never throws). These cover
+// the two load-bearing equivalences: malformed Commit data folds to no-facts
+// without throwing, and a trailer-rich log (inline + relocated blobs + a
+// commit-only session + a malformed blob) re-folds byte-identically.
+// ---------------------------------------------------------------------------
+
+// A third valid UUID/OID for the commit-only session in the re-fold seed.
+const TEST_UUID_3 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const TEST_OID_3 = "abcdef0123456789abcdef0123456789abcdef01";
+
+/**
+ * Relocate a `Commit` event's `data` blob into the `event_blobs` side table
+ * and NULL the hot column — mirroring the compaction relocator. The
+ * loadAllCommitTrailerFacts COALESCE(events.data, event_blobs.data) must
+ * resolve the trailer facts from the side table identically.
+ */
+function relocateBlob(eventId: number): void {
+  db.run(
+    "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
+    [eventId],
+  );
+  db.run("UPDATE events SET data = NULL WHERE id = ?", [eventId]);
+}
+
+test("fn-807.1: a malformed Commit data blob folds to no trailer facts without throwing", () => {
+  // The never-throw-inside-a-fold invariant for the commit-trailer channel.
+  // The old json_extract in the WHERE could throw on malformed JSON BEFORE
+  // extractCommit's try/catch ran; the single-scan loader parses every row in
+  // JS, so a malformed blob is simply skipped.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  // A well-formed trailer scaffold that DOES mint an edge.
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-1-ok",
+    committedAtMs: 5_000_000,
+  });
+  // A malformed Commit blob (not valid JSON). extractCommit returns null →
+  // the loader skips it; the fold must not throw and the row mints nothing.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    data: "{not valid json",
+  });
+  expect(() => drainAll()).not.toThrow();
+  // The valid scaffold's creator edge is present; the malformed blob added no
+  // facts (only one epic_link, no spurious target).
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "creator", target: "fn-1-ok" },
+  ]);
+});
+
+test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (scrape + inline + relocated blob + commit-only session + malformed)", () => {
+  // The whole-task equivalence proof. Seed the full mix the single-scan loader
+  // must reproduce: a scrape-side planctl creator, a commit dedup of that same
+  // op, a relocated-to-event_blobs trailer Commit, a commit-only session whose
+  // scrape NULLed out, and one malformed Commit blob (a no-fact no-throw). The
+  // re-fold from cursor=0 must reproduce byte-identical jobs / epics.
+
+  // Session 1: scrape-side creator for fn-1-mix, plus a commit trailer for the
+  // SAME op — the channels dedup to one creator edge.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  planctlEvent({
+    sessionId: TEST_UUID,
+    op: "epic-scaffold",
+    target: "fn-1-mix",
+    epicId: "fn-1-mix",
+    subjectPresent: true,
+    ts: 2_000,
+  });
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-1-mix",
+    committedAtMs: 5_000_000,
+  });
+
+  // Session 2: refines fn-1-mix via a RELOCATED commit-trailer blob ONLY (its
+  // scrape NULLed out). The blob lives in event_blobs; the loader's COALESCE
+  // must still resolve it so the commit-only refiner surfaces.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
+  planPlanOpener(TEST_UUID_2, 3_000);
+  const relocatedId = commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID_2,
+    committerSessionId: TEST_UUID_2,
+    planctlOp: "set-title",
+    planctlTarget: "fn-1-mix",
+    committedAtMs: 6_000_000,
+  });
+  relocateBlob(relocatedId);
+
+  // Session 3: a commit-only creator for a DIFFERENT epic (no scrape rows at
+  // all) — proves a commit-only session still mints its own creator edge.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_3 });
+  planPlanOpener(TEST_UUID_3, 4_000);
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID_3,
+    committerSessionId: TEST_UUID_3,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-2-only",
+    committedAtMs: 7_000_000,
+  });
+
+  // A malformed Commit blob — a no-fact, no-throw row riding the same log.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    data: "}{garbage",
+  });
+
+  expect(drainAll()).toBeGreaterThan(0);
+
+  // Sanity: every channel's edge actually formed in the first fold.
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "creator", target: "fn-1-mix" },
+  ]);
+  expect(getEpicLinks(TEST_UUID_2)).toEqual([
+    { kind: "refiner", target: "fn-1-mix" },
+  ]);
+  expect(getEpicLinks(TEST_UUID_3)).toEqual([
+    { kind: "creator", target: "fn-2-only" },
+  ]);
+
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const epics1 = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+
+  // Re-fold from cursor=0 — the COALESCE-resolved relocated blob and the
+  // grouped single-scan facts must reproduce the projections byte-for-byte.
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
   db.run("DELETE FROM file_attributions");

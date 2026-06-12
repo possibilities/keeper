@@ -4829,7 +4829,7 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
  *
  *   1. Load every planctl invocation for `sessionId` — the UNION of the legacy
  *      `events.planctl_op` stdout-scrape rows and durable commit-trailer facts
- *      ({@link loadCommitTrailerInvocations}). The classifier dedups, so a
+ *      ({@link commitTrailerInvocationsFor}). The classifier dedups, so a
  *      scrape and a commit for the same op collapse to one edge; a scaffold
  *      whose scrape yielded NULL still produces a creator edge via the commit
  *      channel. Also load every `/plan:plan` opener (`PreToolUse +
@@ -4844,96 +4844,60 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
  */
 
 /**
- * Load the durable commit-trailer facts for one session as synthetic
- * {@link ClassifierInvocation}s, to UNION with the stdout-scrape rows inside
- * {@link syncPlanctlLinks}. Synthetic `Commit` events carry the trailer facts
- * ONLY in the `data` blob, so this scans `Commit` rows and filters in SQL via
- * `json_extract` on `committer_session_id` + `planctl_op`, re-parsing survivors
- * through {@link extractCommit} (no re-normalize — the producer already
- * normalized `planctl_op`). Each maps to one `ClassifierInvocation` with `ts =
- * committed_at_ms / 1000` (so it falls inside the open-ended final `/plan:plan`
- * window), `epic_id` via the same target→epic split the scrape deriver uses,
- * and `subject_present = true` (a trailer only rides a mutating chore commit).
+ * One in-memory grouping of every durable commit-trailer fact in the log,
+ * built by a SINGLE pass over the `Commit` events (replacing the old
+ * per-session + per-epic-sweep scans that re-walked every `Commit` blob once
+ * per swept session). {@link syncPlanctlLinks} loads this once per call and
+ * reuses it for the current session's facts, the cross-session sweep, and the
+ * per-epic rebuild.
  *
- * Ordered by event `id` ASC for a stable window-advance. Pure read; a malformed
- * blob is skipped by `extractCommit`, never throws. Older `Commit` events with
- * NULL `planctl_op` are excluded by the filter, so the union is a no-op over
- * the historical log.
+ * `factsBySession` maps `committer_session_id` → that session's commit-trailer
+ * {@link ClassifierInvocation}s in `events.id` ASC order (the same total order
+ * the old `ORDER BY events.id ASC` produced, so the classifier's ts-tie dedup
+ * sees an identical input sequence). A commit-only session (zero stdout-scrape
+ * rows) still appears, so its creator/refiner edge surfaces.
  */
-function loadCommitTrailerInvocations(
-  db: Database,
-  sessionId: string,
-): ClassifierInvocation[] {
-  // The blob VALUE and the `json_extract` filters resolve via
-  // `COALESCE(events.data, event_blobs.data)`, so a relocated Commit blob still
-  // matches and re-parses byte-identically. No expression index covers these
-  // Commit `json_extract` probes, so COALESCE-ing the WHERE breaks no index.
-  const rows = db
-    .query(
-      `SELECT COALESCE(events.data, event_blobs.data) AS data
-         FROM events
-         LEFT JOIN event_blobs ON event_blobs.event_id = events.id
-        WHERE hook_event = 'Commit'
-          AND json_extract(COALESCE(events.data, event_blobs.data), '$.committer_session_id') = ?
-          AND json_extract(COALESCE(events.data, event_blobs.data), '$.planctl_op') IS NOT NULL
-        ORDER BY events.id ASC`,
-    )
-    .all(sessionId) as { data: string }[];
-  const out: ClassifierInvocation[] = [];
-  for (const r of rows) {
-    const commit = extractCommit({ data: r.data });
-    if (commit == null) {
-      continue;
-    }
-    // Re-assert the validated shape (op non-empty, target a valid plan ref). A
-    // commit whose target failed validation drops — the scrape path's `epic_id`
-    // would have been null too, so the classifier yields no edge either way.
-    if (commit.planctl_op == null || commit.planctl_target == null) {
-      continue;
-    }
-    out.push({
-      ts: commit.committed_at_ms / 1000,
-      op: commit.planctl_op,
-      target: commit.planctl_target,
-      epic_id: parsePlanRef(commit.planctl_target)?.epic_id ?? null,
-      subject_present: true,
-    });
-  }
-  return out;
+interface CommitTrailerFacts {
+  factsBySession: Map<string, ClassifierInvocation[]>;
 }
 
 /**
- * Find every distinct `committer_session_id` whose commit-trailer facts touch
- * ANY of `epicIds` — the commit-channel counterpart to {@link syncPlanctlLinks}'s
- * scrape-side session sweep. Without it, a session that ONLY ever produced
- * commit-trailer edges would be invisible to the per-epic `deriveJobLinks`
- * rebuild. A commit "touches" an epic when the trailer's target parses to that
- * epic OR the raw target equals the epic id. Pure read; never throws. Returns a
- * deduped Set of session ids.
+ * Scan every `Commit` event ONCE and group its trailer facts by
+ * `committer_session_id`. No SQL `json_extract` filters the rows — the WHERE is
+ * a plain `hook_event = 'Commit'` and EVERY survivor parses through
+ * {@link extractCommit} in JS, which returns null on malformed data and never
+ * throws. This removes the malformed-JSON throw surface from the commit-trailer
+ * channel entirely (the old `json_extract` in the WHERE could throw on a
+ * malformed blob BEFORE `extractCommit`'s try/catch ever ran — a fold must
+ * never throw).
+ *
+ * Each survivor maps to one {@link ClassifierInvocation} with `ts =
+ * committed_at_ms / 1000` (so it falls inside the open-ended final `/plan:plan`
+ * window), `epic_id` via the same target→epic split the scrape deriver uses,
+ * and `subject_present = true` (a trailer only rides a mutating chore commit) —
+ * exactly as the per-session loader did. A `Commit` whose `planctl_op` /
+ * `planctl_target` / `committer_session_id` failed validation drops (the scrape
+ * path's `epic_id` would have been null too, so the classifier yields no edge
+ * either way). Pure read; never throws.
+ *
+ * The blob VALUE resolves via `COALESCE(events.data, event_blobs.data)`, so a
+ * relocated `Commit` blob still re-parses byte-identically.
  */
-function loadCommitTrailerSessionsForEpics(
-  db: Database,
-  epicIds: ReadonlySet<string>,
-): Set<string> {
-  const sessions = new Set<string>();
-  if (epicIds.size === 0) {
-    return sessions;
-  }
-  // Same COALESCE(events.data, event_blobs.data) resolution as
-  // loadCommitTrailerInvocations — a relocated Commit blob stays matchable and
-  // re-parsable.
+function loadAllCommitTrailerFacts(db: Database): CommitTrailerFacts {
   const rows = db
     .query(
       `SELECT COALESCE(events.data, event_blobs.data) AS data
          FROM events
          LEFT JOIN event_blobs ON event_blobs.event_id = events.id
         WHERE hook_event = 'Commit'
-          AND json_extract(COALESCE(events.data, event_blobs.data), '$.planctl_op') IS NOT NULL
-          AND json_extract(COALESCE(events.data, event_blobs.data), '$.committer_session_id') IS NOT NULL
         ORDER BY events.id ASC`,
     )
-    .all() as { data: string }[];
+    .all() as { data: string | null }[];
+  const factsBySession = new Map<string, ClassifierInvocation[]>();
   for (const r of rows) {
+    if (r.data == null) {
+      continue;
+    }
     const commit = extractCommit({ data: r.data });
     if (commit == null) {
       continue;
@@ -4945,12 +4909,62 @@ function loadCommitTrailerSessionsForEpics(
     ) {
       continue;
     }
-    const epicId = parsePlanRef(commit.planctl_target)?.epic_id ?? null;
-    if (
-      (epicId !== null && epicIds.has(epicId)) ||
-      epicIds.has(commit.planctl_target)
-    ) {
-      sessions.add(commit.committer_session_id);
+    const inv: ClassifierInvocation = {
+      ts: commit.committed_at_ms / 1000,
+      op: commit.planctl_op,
+      target: commit.planctl_target,
+      epic_id: parsePlanRef(commit.planctl_target)?.epic_id ?? null,
+      subject_present: true,
+    };
+    const sid = commit.committer_session_id;
+    const existing = factsBySession.get(sid);
+    if (existing != null) {
+      existing.push(inv);
+    } else {
+      factsBySession.set(sid, [inv]);
+    }
+  }
+  return { factsBySession };
+}
+
+/**
+ * One session's commit-trailer invocations from the pre-grouped
+ * {@link CommitTrailerFacts}. A commit-only session (no scrape-side rows) still
+ * returns its facts; a session with no commit trailers returns `[]`.
+ */
+function commitTrailerInvocationsFor(
+  facts: CommitTrailerFacts,
+  sessionId: string,
+): ClassifierInvocation[] {
+  return facts.factsBySession.get(sessionId) ?? [];
+}
+
+/**
+ * Every distinct `committer_session_id` whose commit-trailer facts touch ANY of
+ * `epicIds` — the commit-channel counterpart to {@link syncPlanctlLinks}'s
+ * scrape-side session sweep. Without it, a session that ONLY ever produced
+ * commit-trailer edges would be invisible to the per-epic `deriveJobLinks`
+ * rebuild. A commit "touches" an epic when the trailer's target parses to that
+ * epic OR the raw target equals the epic id — the SAME predicate the per-epic
+ * sweep used, now evaluated over the pre-grouped facts. Pure; never throws.
+ */
+function commitTrailerSessionsForEpics(
+  facts: CommitTrailerFacts,
+  epicIds: ReadonlySet<string>,
+): Set<string> {
+  const sessions = new Set<string>();
+  if (epicIds.size === 0) {
+    return sessions;
+  }
+  for (const [sid, invs] of facts.factsBySession) {
+    for (const inv of invs) {
+      if (
+        (inv.epic_id !== null && epicIds.has(inv.epic_id)) ||
+        (inv.target !== null && epicIds.has(inv.target))
+      ) {
+        sessions.add(sid);
+        break;
+      }
     }
   }
   return sessions;
@@ -4969,6 +4983,14 @@ function syncPlanctlLinks(
   const jobsRow = db
     .query("SELECT epic_links FROM jobs WHERE job_id = ?")
     .get(sessionId) as { epic_links: string | null } | null;
+
+  // Load EVERY commit-trailer fact in ONE pass and group by session. Reused
+  // for this session's facts, the cross-session sweep, and the per-epic
+  // rebuild below — so a `syncPlanctlLinks` call performs exactly one
+  // commit-trailer load instead of the old ~2 + one-per-swept-session scans.
+  // Loaded before the `touchedEpics.size === 0` gate because the current
+  // session's own facts (unioned just below) are needed before that return.
+  const commitFacts = loadAllCommitTrailerFacts(db);
 
   // Load this session's planctl invocations (ASC by event id for stable
   // window-pointer advance); the partial composite index serves this without a
@@ -4998,7 +5020,7 @@ function syncPlanctlLinks(
   // UNION the durable commit-trailer facts — the classifier dedups, so a scrape
   // and a commit for the same scaffold collapse to one creator edge, and a
   // scrape-NULL scaffold's commit fact alone still mints it.
-  invocations.push(...loadCommitTrailerInvocations(db, sessionId));
+  invocations.push(...commitTrailerInvocationsFor(commitFacts, sessionId));
 
   // Load this session's `/plan:plan` openers. Locked gate: `PreToolUse +
   // skill_name='plan:plan'` only — a slash-command UserPromptSubmit would
@@ -5076,7 +5098,7 @@ function syncPlanctlLinks(
   // every commit-channel session (whose `Commit` events carry NULL sparse
   // columns) touching a touched epic so the per-epic rebuild sees its
   // commit-only creator/refiner.
-  for (const sid of loadCommitTrailerSessionsForEpics(db, touchedEpics)) {
+  for (const sid of commitTrailerSessionsForEpics(commitFacts, touchedEpics)) {
     sessionIds.add(sid);
   }
 
@@ -5108,7 +5130,7 @@ function syncPlanctlLinks(
     // UNION this session's commit-trailer facts so the per-epic rebuild
     // classifies BOTH channels symmetrically. Concat is safe — the classifier
     // dedups + re-sorts by ts.
-    sidInvocations.push(...loadCommitTrailerInvocations(db, sid));
+    sidInvocations.push(...commitTrailerInvocationsFor(commitFacts, sid));
     invocationsBySession.set(sid, sidInvocations);
     const sidOpenerRows = db
       .query(

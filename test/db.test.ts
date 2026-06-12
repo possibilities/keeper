@@ -120,12 +120,13 @@ test("all expected indexes are present", () => {
 
 test("idx_events_hook_event serves the Commit trailer scan after the fn-765.3 drops", () => {
   // fn-765.3: idx_events_hook_tool (the (hook_event, tool_name) composite) was
-  // dropped. The `Commit` trailer self-joins (loadCommitTrailerInvocations and
-  // its sibling, reducer.ts) filter `WHERE hook_event = 'Commit'` and order by
-  // id — the surviving single-column idx_events_hook_event must still SEARCH
-  // them with no full-table SCAN. (EXPLAIN confirmed dropping hook_event too
-  // would fall the scan back onto the composite + a USE TEMP B-TREE FOR ORDER
-  // BY regression, which is why hook_event is kept.)
+  // dropped. The single-scan `Commit` trailer loader (loadAllCommitTrailerFacts,
+  // reducer.ts) filters `WHERE hook_event = 'Commit'` and orders by id — the
+  // surviving single-column idx_events_hook_event must still SEARCH it with no
+  // full-table SCAN. (EXPLAIN confirmed dropping hook_event too would fall the
+  // scan back onto the composite + a USE TEMP B-TREE FOR ORDER BY regression,
+  // which is why hook_event is kept.) No `json_extract` rides the WHERE anymore
+  // — every survivor parses in JS — so the index serves the bare scan directly.
   const { db } = openDb(":memory:");
   const plan = db
     .prepare(
@@ -134,11 +135,9 @@ test("idx_events_hook_event serves the Commit trailer scan after the fn-765.3 dr
            FROM events
            LEFT JOIN event_blobs ON event_blobs.event_id = events.id
           WHERE hook_event = 'Commit'
-            AND json_extract(COALESCE(events.data, event_blobs.data), '$.committer_session_id') = ?
-            AND json_extract(COALESCE(events.data, event_blobs.data), '$.planctl_op') IS NOT NULL
           ORDER BY events.id ASC`,
     )
-    .all("s") as { detail: string }[];
+    .all() as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
   expect(detail).toContain("idx_events_hook_event");
   expect(detail).not.toContain("SCAN events");
