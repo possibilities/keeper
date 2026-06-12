@@ -47,7 +47,7 @@
  * mints no synthetic event, and touches no reducer state — so re-fold
  * determinism, the cursor+projection single-transaction, and the sole-writer
  * rules are all untouched. Its only side effect is an out-of-band page
- * (botctl Telegram, the "Keeper" topic — the same sink the babysitter dead-man
+ * (botctl Telegram, the "Keeper" topic — the same sink the sitter dead-man
  * uses). Mirrors the never-throw posture of the compaction / checkpoint timers:
  * a probe hiccup (file gone mid-open, transient lock) logs and the next
  * heartbeat retries; it never wedges the daemon.
@@ -65,7 +65,7 @@ import { Database } from "bun:sqlite";
  */
 export const INTEGRITY_PROBE_INTERVAL_MS = 900_000;
 
-/** The Telegram topic every keeper page routes to (matches the babysitter). */
+/** The Telegram topic every keeper page routes to (matches the sitter). */
 export const KEEPER_TOPIC = "Keeper";
 
 /**
