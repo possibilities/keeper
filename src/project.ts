@@ -7,7 +7,7 @@
 // hard-errors through emitError when `.planctl/` is absent.
 
 import { existsSync, realpathSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 
 import { emitError, type OutputFormat } from "./format.ts";
 
@@ -65,6 +65,24 @@ export function resolveProject(format: OutputFormat | null): ProjectContext {
     stateDir: join(planctlDir, "state"),
     projectPath: projectRoot,
   };
+}
+
+/** Resolve a `--project` override to a validated project root for the read-only
+ * trailer, mirroring the per-verb --project branch: an absolute path whose
+ * `.planctl/` exists resolves to its realpath; anything else (unset, relative,
+ * or not a project) returns null so the caller falls back to cwd resolution.
+ * Trailer-only — it never errors, since the verb already validated the flag. */
+export function trailerProjectRoot(project: string | null): string | null {
+  if (project === null || !isAbsolute(project)) {
+    return null;
+  }
+  let root: string;
+  try {
+    root = realpathSync(project);
+  } catch {
+    root = project;
+  }
+  return existsSync(join(root, ".planctl")) ? root : null;
 }
 
 function basename(path: string): string {

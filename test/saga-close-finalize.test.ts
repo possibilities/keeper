@@ -1,0 +1,564 @@
+// Conformance spec for `planctl close-finalize <epic_id>` — the /plan:close saga
+// encoded as a verb, translated from tests/test_close_finalize.py, every node
+// mapped by a source-comment (translated | cited | drop-with-reason).
+//
+// close-finalize derives its position purely from observable state (the
+// persisted audit artifacts + the epic's own status). Every reversible check
+// runs FIRST; the irreversible epic close runs LAST, so a crash mid-saga leaves
+// the source epic OPEN and the verb re-runnable. The tests drive the real binary
+// in a withProject repo, seeding the audit artifacts through the SAME
+// src/audit_artifacts writers the verb reads (writeArtifact / writeBriefArtifact
+// / verdictPath / reportMetaPath / followupPath) so the on-disk shape carries
+// zero drift. The outcome-exhaustiveness node imports CLOSE_OUTCOMES from src;
+// the retired `epic followup-of` node asserts the unknown-subcommand error.
+
+import { describe, expect, test } from "bun:test";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
+
+import {
+  AUDIT_SCHEMA_VERSION,
+  computeCommitSetHash,
+  followupPath,
+  reportMetaPath,
+  verdictPath,
+  writeArtifact,
+  writeBriefArtifact,
+} from "../src/audit_artifacts.ts";
+import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
+import {
+  parseCliOutput,
+  runCli,
+  scaffoldEpic,
+  withProject,
+} from "./harness.ts";
+
+// The set of outcomes the /plan:close coordinator switches on (mirrors the saga).
+const CLOSE_SKILL_HANDLERS = new Set([
+  "closed_clean",
+  "closed_with_followup",
+  "fatal_halt",
+  "partial_followup",
+]);
+
+// The empty-set canonical hash the verb re-derives for an epic with no source
+// commits (seeded tasks carry no Task: trailers). Stamping it makes freshness pass.
+function emptySetHash(): string {
+  return computeCommitSetHash([]);
+}
+
+// Mark every task done via the runtime sidecar (epic close honors it). Port of
+// _mark_all_done.
+function markAllDone(root: string, taskIds: string[]): void {
+  for (const tid of taskIds) {
+    const p = join(root, ".planctl", "state", "tasks", `${tid}.state.json`);
+    writeFileSync(p, `${JSON.stringify({ status: "done" })}\n`, "utf-8");
+  }
+}
+
+function seedBrief(root: string, epicId: string, commitSetHash: string): void {
+  writeBriefArtifact(root, epicId, {
+    schema_version: 1,
+    epic_id: epicId,
+    primary_repo: root,
+    commit_set_hash: commitSetHash,
+    commit_groups: [],
+    snippet_context: "",
+    tasks: [],
+  });
+}
+
+function seedVerdict(
+  root: string,
+  epicId: string,
+  opts: {
+    commitSetHash: string;
+    fatal?: boolean;
+    fatalReason?: string;
+    decisions?: Array<Record<string, unknown>>;
+  },
+): void {
+  const record = {
+    schema_version: 1,
+    commit_set_hash: opts.commitSetHash,
+    fatal: opts.fatal ?? false,
+    fatal_reason: opts.fatalReason ?? "",
+    decisions: opts.decisions ?? [],
+  };
+  writeArtifact(
+    verdictPath(root, epicId),
+    `${JSON.stringify(record, null, 2)}\n`,
+  );
+}
+
+function seedReportMeta(
+  root: string,
+  epicId: string,
+  commitSetHash: string,
+  findings: number,
+  risk = "Low",
+): void {
+  const meta = {
+    schema_version: AUDIT_SCHEMA_VERSION,
+    epic_id: epicId,
+    commit_set_hash: commitSetHash,
+    findings,
+    risk,
+  };
+  writeArtifact(
+    reportMetaPath(root, epicId),
+    `${JSON.stringify(meta, null, 2)}\n`,
+  );
+}
+
+// Write a valid scaffold-plan followup.yaml wiring back to the source epic.
+function seedFollowupYaml(
+  root: string,
+  epicId: string,
+  sourceEpicId: string,
+  nTasks: number,
+): void {
+  const blocks: string[] = [];
+  for (let i = 1; i <= nTasks; i++) {
+    const spec =
+      "      ## Description\n      follow-up\n\n" +
+      "      ## Acceptance\n      - [ ] x\n\n" +
+      "      ## Done summary\n\n      ## Evidence\n";
+    blocks.push(
+      `  - title: Follow task ${i}\n    tier: medium\n    spec: |\n${spec}`,
+    );
+  }
+  const yaml =
+    `epic:\n  title: Follow-up of ${sourceEpicId}\n` +
+    `  depends_on_epics: [${sourceEpicId}]\n` +
+    "  spec: |\n    ## Overview\n    follow overview\n" +
+    `tasks:\n${blocks.join("\n")}\n`;
+  writeArtifact(followupPath(root, epicId), yaml);
+}
+
+function epicStatus(root: string, epicId: string): string {
+  return (
+    JSON.parse(
+      readFileSync(join(root, ".planctl", "epics", `${epicId}.json`), "utf-8"),
+    ) as Record<string, unknown>
+  ).status as string;
+}
+
+function finalize(
+  proj: { root: string; home: string },
+  epicId: string,
+): { code: number; env: Record<string, unknown> } {
+  const r = runCli(["close-finalize", epicId, "--project", proj.root], {
+    cwd: proj.root,
+    home: proj.home,
+  });
+  return { code: r.code, env: parseCliOutput(r.output) };
+}
+
+// Seed a done epic with brief+verdict; returns {epicId, taskIds}.
+function doneEpic(
+  proj: { root: string; home: string },
+  nTasks: number,
+  verdictOpts: Parameters<typeof seedVerdict>[2] | null,
+  title = "Demo",
+): { epicId: string; taskIds: string[]; hash: string } {
+  const { epicId, taskIds } = scaffoldEpic(
+    { root: proj.root, home: proj.home },
+    { title, nTasks },
+  );
+  markAllDone(proj.root, taskIds);
+  const hash = emptySetHash();
+  seedBrief(proj.root, epicId, hash);
+  if (verdictOpts) {
+    seedVerdict(proj.root, epicId, verdictOpts);
+  }
+  return { epicId, taskIds, hash };
+}
+
+// ---------------------------------------------------------------------------
+// Outcome: closed_clean.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize closed_clean", () => {
+  const getProj = withProject("planctl-cf-clean-");
+
+  test("empty decisions -> closed_clean, epic done", () => {
+    // test_close_finalize.py::test_closed_clean_empty_decisions
+    const proj = getProj();
+    const { epicId, taskIds, hash } = doneEpic(proj, 2, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+    void taskIds;
+    void hash;
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_clean");
+    expect(env.epic_id).toBe(epicId);
+    expect("new_epic_id" in env).toBe(false);
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("all decisions culled -> closed_clean", () => {
+    // test_close_finalize.py::test_closed_clean_all_culled
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, {
+      commitSetHash: emptySetHash(),
+      decisions: [
+        { fid: "f1", action: "culled", task: null, rationale: "noise" },
+      ],
+    });
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_clean");
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("idempotent re-run returns the SAME terminal outcome", () => {
+    // test_close_finalize.py::test_closed_clean_idempotent_rerun
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, {
+      commitSetHash: emptySetHash(),
+      decisions: [],
+    });
+    const first = finalize(proj, epicId);
+    expect(first.env.outcome).toBe("closed_clean");
+    const second = finalize(proj, epicId);
+    expect(second.env.outcome).toBe("closed_clean");
+    expect(second.env.epic_id).toBe(epicId);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Outcome: fatal_halt.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize fatal_halt", () => {
+  const getProj = withProject("planctl-cf-fatal-");
+
+  test("fatal verdict halts without closing", () => {
+    // test_close_finalize.py::test_fatal_halt_does_not_close
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, {
+      commitSetHash: emptySetHash(),
+      fatal: true,
+      fatalReason: "ships a data-loss bug",
+      decisions: [],
+    });
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("fatal_halt");
+    expect(env.fatal_reason).toBe("ships a data-loss bug");
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Outcome: closed_with_followup (scaffold + adopt paths).
+// ---------------------------------------------------------------------------
+
+describe("close-finalize closed_with_followup", () => {
+  const getProj = withProject("planctl-cf-followup-");
+
+  const KEPT_ONE = {
+    commitSetHash: emptySetHash(),
+    decisions: [{ fid: "f1", action: "kept", task: 1, rationale: "real" }],
+  };
+
+  test("scaffolds the follow-up + closes the source", () => {
+    // test_close_finalize.py::test_closed_with_followup_scaffolds_and_closes
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, KEPT_ONE, "Needs followup");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    expect(newEpicId).toBeTruthy();
+    expect(newEpicId).not.toBe(epicId);
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+    const newDef = JSON.parse(
+      readFileSync(
+        join(proj.root, ".planctl", "epics", `${newEpicId}.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    expect((newDef.depends_on_epics as string[]).includes(epicId)).toBe(true);
+    expect(newDef.created_by_close_of).toBe(epicId);
+  });
+
+  test("an unrelated open dependent (no stamp) is NOT adopted", () => {
+    // test_close_finalize.py::test_preexisting_dependent_without_stamp_ignored
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, KEPT_ONE, "Has innocent dependent");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+    // An unrelated human-planned dependent: open, NO close-provenance stamp,
+    // a different task count.
+    const { epicId: innocentId } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Innocent dependent", nTasks: 3 },
+    );
+    const innPath = join(proj.root, ".planctl", "epics", `${innocentId}.json`);
+    const innDef = JSON.parse(readFileSync(innPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    innDef.depends_on_epics = [epicId];
+    writeFileSync(innPath, JSON.stringify(innDef), "utf-8");
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    expect([epicId, innocentId].includes(newEpicId)).toBe(false);
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+    const newDef = JSON.parse(
+      readFileSync(
+        join(proj.root, ".planctl", "epics", `${newEpicId}.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    expect(newDef.created_by_close_of).toBe(epicId);
+  });
+
+  test("a plain scaffold never stamps close-provenance", () => {
+    // test_close_finalize.py::test_plain_scaffold_does_not_stamp_provenance
+    const proj = getProj();
+    const { epicId } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: "Hand authored", nTasks: 1 },
+    );
+    const def = JSON.parse(
+      readFileSync(
+        join(proj.root, ".planctl", "epics", `${epicId}.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    // Absent or null — what matters is it is not a source id.
+    expect(def.created_by_close_of ?? null).toBeNull();
+  });
+
+  test("idempotent re-run: same outcome + same new_epic_id, no second scaffold", () => {
+    // test_close_finalize.py::test_closed_with_followup_idempotent_rerun
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, KEPT_ONE, "Followup idempotent");
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+
+    const first = finalize(proj, epicId);
+    expect(first.env.outcome).toBe("closed_with_followup");
+    const newId = first.env.new_epic_id;
+    const second = finalize(proj, epicId);
+    expect(second.env.outcome).toBe("closed_with_followup");
+    expect(second.env.new_epic_id).toBe(newId);
+  });
+
+  test("crash-resume adopts a pre-scaffolded follow-up, no duplicate", () => {
+    // test_close_finalize.py::test_crash_resume_adopts_scaffolded_followup
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, KEPT_ONE, "Crash resume");
+    // Pre-create the follow-up (the crashed run's scaffold landed) with the
+    // close-provenance stamp + exactly 1 task = the expected cluster count.
+    const { epicId: followId } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: `Follow-up of ${epicId}`, nTasks: 1 },
+    );
+    const fPath = join(proj.root, ".planctl", "epics", `${followId}.json`);
+    const fDef = JSON.parse(readFileSync(fPath, "utf-8")) as Record<
+      string,
+      unknown
+    >;
+    fDef.depends_on_epics = [epicId];
+    fDef.created_by_close_of = epicId;
+    writeFileSync(fPath, JSON.stringify(fDef), "utf-8");
+    // A stale followup.yaml is also on disk; the adopt path must NOT re-scaffold.
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    expect(env.new_epic_id).toBe(followId);
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Outcome: partial_followup.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize partial_followup", () => {
+  const getProj = withProject("planctl-cf-partial-");
+
+  test("under-provisioned follow-up stops without close", () => {
+    // test_close_finalize.py::test_partial_followup_stops_without_close
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      {
+        commitSetHash: emptySetHash(),
+        // Two distinct kept ordinals → expected 2 follow-up tasks.
+        decisions: [
+          { fid: "f1", action: "kept", task: 1, rationale: "a" },
+          { fid: "f2", action: "kept", task: 2, rationale: "b" },
+        ],
+      },
+      "Partial",
+    );
+    // A closer-scaffolded follow-up with only 1 task (under-provisioned).
+    const { epicId: followId } = scaffoldEpic(
+      { root: proj.root, home: proj.home },
+      { title: `Partial follow ${epicId}`, nTasks: 1 },
+    );
+    const fp = join(proj.root, ".planctl", "epics", `${followId}.json`);
+    const fd = JSON.parse(readFileSync(fp, "utf-8")) as Record<string, unknown>;
+    fd.depends_on_epics = [epicId];
+    fd.created_by_close_of = epicId;
+    writeFileSync(fp, JSON.stringify(fd), "utf-8");
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("partial_followup");
+    expect(env.new_epic_id).toBe(followId);
+    expect(env.expected_tasks).toBe(2);
+    expect(env.actual_tasks).toBe(1);
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Refusals: stale hash, missing verdict, missing followup.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize refusals", () => {
+  const getProj = withProject("planctl-cf-refuse-");
+
+  test("stale verdict hash -> STALE_ARTIFACTS, refuse never delete", () => {
+    // test_close_finalize.py::test_stale_artifacts_refusal
+    const proj = getProj();
+    const fresh = emptySetHash();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      { commitSetHash: "deadbeef".repeat(8), decisions: [] },
+      "Stale",
+    );
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(1);
+    expect(env.success).toBe(false);
+    const error = env.error as Record<string, unknown>;
+    expect(error.code).toBe("STALE_ARTIFACTS");
+    expect((error.details as Record<string, unknown>).fresh_hash).toBe(fresh);
+    expect(require("node:fs").existsSync(verdictPath(proj.root, epicId))).toBe(
+      true,
+    );
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("no verdict + no report meta -> VERDICT_MISSING", () => {
+    // test_close_finalize.py::test_missing_verdict_no_meta_fails_closed
+    const proj = getProj();
+    const { epicId } = doneEpic(proj, 1, null, "No verdict");
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(1);
+    expect((env.error as Record<string, unknown>).code).toBe("VERDICT_MISSING");
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("no verdict, meta.findings==0 -> synthesize empty -> closed_clean", () => {
+    // test_close_finalize.py::test_zero_findings_no_verdict_closes_clean
+    const proj = getProj();
+    const { epicId, hash } = doneEpic(proj, 1, null, "Zero findings skip");
+    seedReportMeta(proj.root, epicId, hash, 0);
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_clean");
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+
+  test("no verdict, meta.findings>0 -> VERDICT_MISSING (planner crashed)", () => {
+    // test_close_finalize.py::test_nonzero_findings_no_verdict_fails_closed
+    const proj = getProj();
+    const { epicId, hash } = doneEpic(proj, 1, null, "Planner crashed");
+    seedReportMeta(proj.root, epicId, hash, 2, "Medium");
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(1);
+    const error = env.error as Record<string, unknown>;
+    expect(error.code).toBe("VERDICT_MISSING");
+    expect((error.details as Record<string, unknown>).audit_findings).toBe(2);
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("surviving decision but no followup.yaml -> FOLLOWUP_MISSING", () => {
+    // test_close_finalize.py::test_missing_followup_fails_closed
+    const proj = getProj();
+    const { epicId } = doneEpic(
+      proj,
+      1,
+      {
+        commitSetHash: emptySetHash(),
+        decisions: [{ fid: "f1", action: "kept", task: 1, rationale: "real" }],
+      },
+      "No followup yaml",
+    );
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(1);
+    const error = env.error as Record<string, unknown>;
+    expect(error.code).toBe("FOLLOWUP_MISSING");
+    expect((error.details as Record<string, unknown>).expected_tasks).toBe(1);
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Id validation + exhaustiveness + retired verb.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize gates + exhaustiveness + retired verb", () => {
+  const getProj = withProject("planctl-cf-gate-");
+
+  test("malformed id -> BAD_EPIC_ID", () => {
+    // test_close_finalize.py::test_bad_epic_id
+    const proj = getProj();
+    const { code, env } = finalize(proj, "not-an-id");
+    expect(code).toBe(1);
+    expect((env.error as Record<string, unknown>).code).toBe("BAD_EPIC_ID");
+  });
+
+  test("task-shaped id -> BAD_EPIC_ID pointing at the parent", () => {
+    // test_close_finalize.py::test_task_shaped_id_points_at_parent
+    const proj = getProj();
+    const { code, env } = finalize(proj, "fn-7-demo.3");
+    expect(code).toBe(1);
+    const error = env.error as Record<string, unknown>;
+    expect(error.code).toBe("BAD_EPIC_ID");
+    expect((error.details as Record<string, unknown>).parent_epic).toBe(
+      "fn-7-demo",
+    );
+  });
+
+  test("unknown epic -> EPIC_NOT_FOUND", () => {
+    // test_close_finalize.py::test_epic_not_found
+    const proj = getProj();
+    const { code, env } = finalize(proj, "fn-9999-missing");
+    expect(code).toBe(1);
+    expect((env.error as Record<string, unknown>).code).toBe("EPIC_NOT_FOUND");
+  });
+
+  test("every CloseOutcome member has a /plan:close handler and vice versa", () => {
+    // test_close_finalize.py::test_close_outcome_exhaustiveness
+    const members = new Set(Object.values(CLOSE_OUTCOMES));
+    expect(members).toEqual(CLOSE_SKILL_HANDLERS);
+  });
+
+  test("retired `epic followup-of` is gone (unknown subcommand)", () => {
+    // test_close_finalize.py::test_epic_followup_of_verb_is_gone
+    const proj = getProj();
+    const r = runCli(["epic", "followup-of", "fn-1-x"], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).not.toBe(0);
+    expect(r.output.toLowerCase().includes("no such command")).toBe(true);
+  });
+});

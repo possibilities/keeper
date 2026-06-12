@@ -15,7 +15,7 @@
 import { didSelfEmit } from "./emit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
 import { buildPlanctlInvocationReadonly } from "./invocation.ts";
-import { resolveProject } from "./project.ts";
+import { resolveProject, trailerProjectRoot } from "./project.ts";
 import { dispatchGroup, type GroupSpec, leafUsageError } from "./subgroup.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
@@ -784,13 +784,19 @@ function emitTrailer(
   verb: string,
   format: OutputFormat | null,
   target: string | null,
+  projectPathOverride: string | null = null,
 ): void {
-  const ctx = resolveProject(format);
+  // A read-only verb that resolved its project via --project (close-preflight)
+  // passes that already-validated root here, so the trailer never re-resolves
+  // from cwd — a cwd-outside-the-project invocation must not turn a clean
+  // success into a spurious missing-project error. Absent an override, the
+  // trailer re-resolves from cwd (the cwd-walk verbs' path).
+  const projectPath = projectPathOverride ?? resolveProject(format).projectPath;
   try {
     const envelope = {
       planctl_invocation: buildPlanctlInvocationReadonly(
         verb,
-        ctx.projectPath,
+        projectPath,
         target,
       ),
     };
@@ -815,6 +821,7 @@ function dispatch(parsed: ParsedArgs): number {
   // The generic readonly trailer's target: the verb's first positional id when
   // it has one (show / refine-context), else null. The id-bearing cases set it.
   let trailerTarget: string | null = null;
+  let trailerProjectPath: string | null = null;
 
   switch (command) {
     case "state-path": {
@@ -865,12 +872,12 @@ function dispatch(parsed: ParsedArgs): number {
       // self-emit), so the dispatcher fires the generic readonly trailer with
       // target=epicId. The error path exits 1 before the trailer.
       const id = readPositionalSkipping(rest, new Set(["--project"]));
-      runClosePreflight({
-        epicId: id,
-        project: readOption(rest, "--project"),
-        format,
-      });
+      const cpfProject = readOption(rest, "--project");
+      runClosePreflight({ epicId: id, project: cpfProject, format });
       trailerTarget = id.startsWith("fn-") ? id : null;
+      // The verb honored --project; the trailer must resolve through the same
+      // root, not the (possibly unrelated) cwd.
+      trailerProjectPath = trailerProjectRoot(cpfProject);
       break;
     }
     case "close-finalize":
@@ -1012,7 +1019,7 @@ function dispatch(parsed: ParsedArgs): number {
   // already printed its invocation-bearing envelope — the generic trailer must
   // not fire on top. didSelfEmit() is the runtime sentinel.
   if (!NO_TRACK_COMMANDS.has(command) && !didSelfEmit()) {
-    emitTrailer(command, format, trailerTarget);
+    emitTrailer(command, format, trailerTarget, trailerProjectPath);
   }
   return 0;
 }
