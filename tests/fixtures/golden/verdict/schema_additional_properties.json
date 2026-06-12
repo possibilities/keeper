@@ -1,0 +1,43 @@
+{
+  "envelope": {
+    "error": {
+      "code": "VERDICT_INVALID",
+      "details": {
+        "error_count": 1,
+        "errors": [
+          {
+            "loc": "<root>",
+            "msg": "Additional properties are not allowed ('bogus' was unexpected)",
+            "type": "additionalProperties"
+          }
+        ],
+        "schema_fragment": {
+          "properties": {
+            "decisions": {
+              "type": "array"
+            },
+            "fatal": {
+              "type": "boolean"
+            },
+            "fatal_reason": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "fatal",
+            "fatal_reason",
+            "decisions"
+          ]
+        }
+      },
+      "message": "verdict failed validation (1 error(s)); fix the listed paths and resubmit"
+    },
+    "success": false
+  },
+  "input": {
+    "bogus": 1,
+    "decisions": [],
+    "fatal": false,
+    "fatal_reason": ""
+  }
+}

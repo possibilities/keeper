@@ -1,0 +1,39 @@
+{
+  "envelope": {
+    "error": {
+      "code": "VERDICT_INVALID",
+      "details": {
+        "error_count": 1,
+        "errors": [
+          {
+            "loc": "decisions[0].task",
+            "msg": "a culled decision must have task: null",
+            "type": "culled_task_not_null"
+          }
+        ],
+        "schema_fragment": {
+          "task": {
+            "type": [
+              "integer",
+              "null"
+            ]
+          }
+        }
+      },
+      "message": "verdict failed validation (1 error(s)); fix the listed paths and resubmit"
+    },
+    "success": false
+  },
+  "input": {
+    "decisions": [
+      {
+        "action": "culled",
+        "fid": "f1",
+        "rationale": "r",
+        "task": 3
+      }
+    ],
+    "fatal": false,
+    "fatal_reason": ""
+  }
+}
