@@ -519,12 +519,18 @@ Keeper has no `install` verb. Wire it up manually:
    `launchctl kickstart -k gui/$UID/arthack.keeperd` to enable.
    `KEEPER_TRACE_SERVER` governs the server worker only; reducer fold latency
    has its own always-on, threshold-gated diagnostics that need no flag. A fold
-   over `SLOW_FOLD_LOG_MS` logs one `[fold-slow]` line, and the slow event types
-   each emit a per-pass `[*-breakdown]` line above their own
+   over `SLOW_FOLD_LOG_MS` logs one `[fold-slow]` line splitting `lock_wait_ms`
+   (BEGIN-IMMEDIATE contention) from `work_ms` (the projection work that held
+   the lock) — one read tells you whether a slow fold was starved or busy. The
+   slow event types each emit a per-pass `[*-breakdown]` line above their own
    `*_FOLD_BREAKDOWN_MS` gate: `[gitfold-breakdown]` (GitSnapshot per-pass +
    pass-1 per-arm split), `[commitfold-breakdown]`, `[subagentfold-breakdown]`,
-   and `[ptufold-breakdown]`. Steady folds stay silent, so a quiet
-   `server.stderr` is the fold-latency all-clear.
+   `[ptufold-breakdown]` (PostToolUse), and `[pretufold-breakdown]` (PreToolUse
+   — covers the `/plan:plan` opener fold). The commit / PostToolUse / PreToolUse
+   breakdowns carry `planctl_*` counters (calls, touched epics, swept sessions,
+   trailer-fact rows + load ms) that attribute the `syncPlanctlLinks` fan-out.
+   Steady folds stay silent, so a quiet `server.stderr` is the fold-latency
+   all-clear.
 
    Example clients ship under the unified `keeper` CLI — `keeper board` /
    `keeper jobs` / `keeper autopilot` / `keeper git` / `keeper usage` /

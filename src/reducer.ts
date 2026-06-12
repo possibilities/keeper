@@ -2357,6 +2357,16 @@ function foldCommit(db: Database, event: Event): void {
     // `syncPlanctlLinks` stays the sole writer. A non-planctl commit has NULL
     // `planctl_op` and no-ops, preserving re-fold determinism over the log.
     const _cfT2 = performance.now();
+    // Arm the syncPlanctlLinks fan-out accumulator so the breakdown line can
+    // carry the planctl cardinality (touched epics / swept sessions / trailer
+    // facts). Pure instrumentation; the value is read only by console.error.
+    _syncPlanctlLinksAccum = {
+      calls: 0,
+      touchedEpics: 0,
+      sweptSessions: 0,
+      factsRows: 0,
+      factsLoadMs: 0,
+    };
     if (
       commit.planctl_op != null &&
       commit.planctl_target != null &&
@@ -2364,9 +2374,12 @@ function foldCommit(db: Database, event: Event): void {
     ) {
       syncPlanctlLinks(db, commit.committer_session_id, eventId, eventTs);
     }
+    const _cfPlanctlAccum = _syncPlanctlLinksAccum;
+    _syncPlanctlLinksAccum = null;
     // Slow-fold breakdown — localizes a [fold-slow] Commit (per-session arm) to
-    // a sub-step. nfiles/ntasks give the fan-out cardinality. Only emitted above
-    // threshold so steady folds stay silent. Pure side-effect.
+    // a sub-step. nfiles/ntasks give the fan-out cardinality; the planctl_*
+    // counters split the trailer-fact load + sweep shape out of planctl_fanout.
+    // Only emitted above threshold so steady folds stay silent. Pure side-effect.
     const _cfTotal = performance.now() - _cfT0;
     if (_cfTotal >= COMMIT_FOLD_BREAKDOWN_MS) {
       console.error(
@@ -2374,7 +2387,8 @@ function foldCommit(db: Database, event: Event): void {
           `nfiles=${commit.files.length} ntasks=${commit.task_ids.length} ` +
           `discharge_loop=${(_cfT1 - _cfT0).toFixed(0)}ms ` +
           `task_links=${(_cfT2 - _cfT1).toFixed(0)}ms ` +
-          `planctl_fanout=${(performance.now() - _cfT2).toFixed(0)}ms`,
+          `planctl_fanout=${(performance.now() - _cfT2).toFixed(0)}ms ` +
+          formatSyncPlanctlFanout(_cfPlanctlAccum),
       );
     }
     return;
@@ -4486,6 +4500,44 @@ function syncJobIntoEpic(
  */
 let _syncIfPlanRefAccumMs: number | null = null;
 
+/**
+ * When non-null, {@link syncPlanctlLinks} accumulates its fan-out cardinality
+ * (touched epics, swept sessions) and the commit-trailer load cost into this
+ * object. Armed ONLY around the dispatch sites in {@link applyEvent} (the
+ * commit, PostToolUse, and PreToolUse breakdown arms) so the breakdown lines can
+ * carry the planctl fan-out shape without threading a param through the two fixed
+ * `syncPlanctlLinks` call sites. `calls` counts invocations so a fold that fires
+ * the fan-out more than once still reports a faithful total. Pure
+ * instrumentation: never read into a projection write, never influences a branch
+ * — re-fold determinism is untouched. A fold is single-threaded, so the
+ * module-scoped accumulator can't interleave.
+ */
+interface SyncPlanctlLinksAccum {
+  calls: number;
+  touchedEpics: number;
+  sweptSessions: number;
+  factsRows: number;
+  factsLoadMs: number;
+}
+let _syncPlanctlLinksAccum: SyncPlanctlLinksAccum | null = null;
+
+/**
+ * Render the armed {@link SyncPlanctlLinksAccum} as a single breakdown segment
+ * (the `planctl_fanout=` field shared across the commit / PostToolUse /
+ * PreToolUse breakdown lines). `calls=0` means the fold never reached
+ * `syncPlanctlLinks`, so the cardinality counters are all zero — still emitted
+ * verbatim so the absence is legible. Pure formatter; reads only the accumulator.
+ */
+function formatSyncPlanctlFanout(acc: SyncPlanctlLinksAccum): string {
+  return (
+    `planctl_calls=${acc.calls} ` +
+    `planctl_touched_epics=${acc.touchedEpics} ` +
+    `planctl_swept_sessions=${acc.sweptSessions} ` +
+    `planctl_facts_rows=${acc.factsRows} ` +
+    `planctl_facts_load_ms=${acc.factsLoadMs.toFixed(0)}`
+  );
+}
+
 function syncIfPlanRef(
   db: Database,
   jobId: string,
@@ -5007,7 +5059,17 @@ function syncPlanctlLinks(
   // commit-trailer load instead of the old ~2 + one-per-swept-session scans.
   // Loaded before the `touchedEpics.size === 0` gate because the current
   // session's own facts (unioned just below) are needed before that return.
+  const _splFactsT0 = _syncPlanctlLinksAccum != null ? performance.now() : 0;
   const commitFacts = loadAllCommitTrailerFacts(db);
+  if (_syncPlanctlLinksAccum != null) {
+    _syncPlanctlLinksAccum.calls += 1;
+    _syncPlanctlLinksAccum.factsLoadMs += performance.now() - _splFactsT0;
+    let _factsRows = 0;
+    for (const invs of commitFacts.factsBySession.values()) {
+      _factsRows += invs.length;
+    }
+    _syncPlanctlLinksAccum.factsRows += _factsRows;
+  }
 
   // Load this session's planctl invocations (ASC by event id for stable
   // window-pointer advance); the partial composite index serves this without a
@@ -5071,6 +5133,9 @@ function syncPlanctlLinks(
   for (const link of newEpicLinks) {
     touchedEpics.add(link.target);
   }
+  if (_syncPlanctlLinksAccum != null) {
+    _syncPlanctlLinksAccum.touchedEpics += touchedEpics.size;
+  }
 
   // UPDATE the jobs row's epic_links. Skip when the backing row does not
   // exist (orphan invocation — no SessionStart for this session_id yet).
@@ -5117,6 +5182,9 @@ function syncPlanctlLinks(
   // commit-only creator/refiner.
   for (const sid of commitTrailerSessionsForEpics(commitFacts, touchedEpics)) {
     sessionIds.add(sid);
+  }
+  if (_syncPlanctlLinksAccum != null) {
+    _syncPlanctlLinksAccum.sweptSessions += sessionIds.size;
   }
 
   const invocationsBySession = new Map<string, ClassifierInvocation[]>();
@@ -6662,12 +6730,33 @@ function computeMonitors(
  * `options.onBeforeCursorAdvance` is a test-only seam to simulate a crash
  * between the jobs write and the cursor advance.
  */
+/**
+ * Last fold's lock-wait vs work split, in ms. {@link applyEvent} stamps these
+ * each call so {@link drain}'s `[fold-slow]` line can attribute a slow fold to
+ * BEGIN-IMMEDIATE lock contention (`lock_wait_ms`) vs the projection work that
+ * actually held the lock (`work_ms`). The lock-wait is t1−t0 where t0 is taken
+ * just before `fold.immediate()` and t1 is the FIRST statement inside the
+ * transaction callback (post-BEGIN-IMMEDIATE, lock held); work is t2−t1 where
+ * t2 is taken after `fold.immediate()` returns (COMMIT done). Module-scoped
+ * because the transaction callback can't return a value to the caller; a fold
+ * is single-threaded so these can't interleave. Pure instrumentation — never
+ * read into a projection write.
+ */
+let _foldLockWaitMs = 0;
+let _foldWorkMs = 0;
+
 export function applyEvent(
   db: Database,
   event: Event,
   options: ApplyEventOptions = {},
 ): void {
+  // t0: just before BEGIN IMMEDIATE issues — the lock-wait window opens here.
+  const _foldT0 = performance.now();
+  let _foldT1 = _foldT0;
   const fold = db.transaction(() => {
+    // t1: first statement inside the callback — BEGIN IMMEDIATE has returned,
+    // so the writer lock is held; `_foldT1 − _foldT0` is the pure lock-wait.
+    _foldT1 = performance.now();
     // Route synthetic plan snapshots to the plans projection; every other event
     // (the hook lifecycle + title events) folds into jobs. Both share this one
     // BEGIN IMMEDIATE transaction + cursor advance — there is no second reducer.
@@ -6727,8 +6816,17 @@ export function applyEvent(
       // PostToolUse fans to BOTH projections plus syncIfPlanRef (inside
       // projectJobsRow); the 781ms avg is otherwise unattributable. Arm the
       // module-scoped syncIfPlanRef accumulator so its fan-out splits out of
-      // the jobs-arm total. Pure instrumentation — no projection write reads it.
+      // the jobs-arm total. The syncPlanctlLinks accumulator (armed alongside)
+      // adds the planctl fan-out cardinality. Pure instrumentation — no
+      // projection write reads either accumulator.
       _syncIfPlanRefAccumMs = 0;
+      _syncPlanctlLinksAccum = {
+        calls: 0,
+        touchedEpics: 0,
+        sweptSessions: 0,
+        factsRows: 0,
+        factsLoadMs: 0,
+      };
       const _ptuT0 = performance.now();
       projectJobsRow(db, event);
       const _ptuT1 = performance.now();
@@ -6738,19 +6836,42 @@ export function applyEvent(
       const _ptuT2 = performance.now();
       const _ptuSyncMs = _syncIfPlanRefAccumMs;
       _syncIfPlanRefAccumMs = null;
+      const _ptuPlanctlAccum = _syncPlanctlLinksAccum;
+      _syncPlanctlLinksAccum = null;
       const _ptuTotal = _ptuT2 - _ptuT0;
       if (_ptuTotal >= PTU_FOLD_BREAKDOWN_MS) {
         // jobs_arm includes its own syncIfPlanRef cost; sync_fanout breaks it
-        // out so jobs_arm−sync_fanout is the pure state-machine write.
+        // out so jobs_arm−sync_fanout is the pure state-machine write. The
+        // planctl_* counters localize the syncPlanctlLinks fan-out shape.
         console.error(
           `[ptufold-breakdown] id=${event.id} total=${_ptuTotal.toFixed(0)}ms ` +
             `jobs_arm=${(_ptuT1 - _ptuT0).toFixed(0)}ms ` +
             `subagent_arm=${(_ptuT2 - _ptuT1).toFixed(0)}ms ` +
-            `sync_fanout=${_ptuSyncMs.toFixed(0)}ms`,
+            `sync_fanout=${_ptuSyncMs.toFixed(0)}ms ` +
+            formatSyncPlanctlFanout(_ptuPlanctlAccum),
         );
       }
     } else {
+      // PreToolUse falls here with NO dedicated arm, yet a `/plan:plan` opener
+      // (PreToolUse + skill_name='plan:plan') fires the syncPlanctlLinks fan-out
+      // from inside projectJobsRow — the 437s incident fold was a PreToolUse and
+      // had zero attribution. Arm the fan-out accumulators on the PreToolUse path
+      // so a slow opener gets a breakdown line mirroring [ptufold-breakdown].
+      // Pure instrumentation — no projection write reads either accumulator.
+      const _ptuePre = event.hook_event === "PreToolUse";
+      if (_ptuePre) {
+        _syncIfPlanRefAccumMs = 0;
+        _syncPlanctlLinksAccum = {
+          calls: 0,
+          touchedEpics: 0,
+          sweptSessions: 0,
+          factsRows: 0,
+          factsLoadMs: 0,
+        };
+      }
+      const _ptueT0 = _ptuePre ? performance.now() : 0;
       projectJobsRow(db, event);
+      const _ptueT1 = _ptuePre ? performance.now() : 0;
       // The `subagent_invocations` projection rides the same transaction +
       // cursor advance — every triggering arm is folded inside this open
       // BEGIN IMMEDIATE so exactly-once-per-event holds across both
@@ -6758,6 +6879,26 @@ export function applyEvent(
       // PostToolUse (tool_name='Agent'), PostToolUseFailure
       // (tool_name='Agent'). Every other event is a fast in-fn no-op.
       projectSubagentInvocationsRow(db, event);
+      if (_ptuePre) {
+        const _ptueT2 = performance.now();
+        const _ptueSyncMs = _syncIfPlanRefAccumMs ?? 0;
+        _syncIfPlanRefAccumMs = null;
+        const _ptuePlanctlAccum = _syncPlanctlLinksAccum;
+        _syncPlanctlLinksAccum = null;
+        const _ptueTotal = _ptueT2 - _ptueT0;
+        if (_ptueTotal >= PTU_FOLD_BREAKDOWN_MS && _ptuePlanctlAccum != null) {
+          // Same shape as [ptufold-breakdown]; subagent_arm is ~0 on PreToolUse
+          // (never an Agent tool_use) but kept for line symmetry. planctl_* is
+          // the segment that would have convicted the 437s opener fold.
+          console.error(
+            `[pretufold-breakdown] id=${event.id} total=${_ptueTotal.toFixed(0)}ms ` +
+              `jobs_arm=${(_ptueT1 - _ptueT0).toFixed(0)}ms ` +
+              `subagent_arm=${(_ptueT2 - _ptueT1).toFixed(0)}ms ` +
+              `sync_fanout=${_ptueSyncMs.toFixed(0)}ms ` +
+              formatSyncPlanctlFanout(_ptuePlanctlAccum),
+          );
+        }
+      }
     }
     options.onBeforeCursorAdvance?.(event);
     db.run(
@@ -6773,6 +6914,13 @@ export function applyEvent(
   // running this as one atomic write transaction — DEFERRED breaks it under
   // contention. See {@link migrate} for the same shape.
   fold.immediate();
+  // t2: COMMIT done. Stamp the lock-wait/work split for `drain`'s [fold-slow]
+  // line. `_foldT1` defaults to `_foldT0`, so a transaction body that threw
+  // before its first statement reports zero lock-wait (the whole span is
+  // attributed to work) rather than a negative number — a throw rolls back and
+  // never reaches here anyway, so this is defense-in-depth.
+  _foldLockWaitMs = _foldT1 - _foldT0;
+  _foldWorkMs = performance.now() - _foldT1;
 }
 
 /**
@@ -6930,8 +7078,16 @@ export function drain(
       // correlatable with the hook drop-log. Pure side-effect: the projection
       // write inside `applyEvent` is unchanged, so re-fold determinism holds
       // (the wall-clock read is not an input to any projection).
+      //
+      // `lock_wait_ms` (BEGIN IMMEDIATE contention) vs `work_ms` (the fold body
+      // that held the lock) is stamped by `applyEvent`; their sum matches the
+      // old `dur` within scheduler noise (the `foldStart`/`foldMs` span here
+      // brackets the same call). This is the line that attributes a slow fold to
+      // contention vs work in one read.
       console.error(
-        `[fold-slow] id=${row.id} event=${row.hook_event ?? "?"} type=${row.event_type ?? "?"} dur=${Math.round(foldMs)}ms`,
+        `[fold-slow] id=${row.id} event=${row.hook_event ?? "?"} type=${row.event_type ?? "?"} ` +
+          `dur=${Math.round(foldMs)}ms lock_wait_ms=${Math.round(_foldLockWaitMs)} ` +
+          `work_ms=${Math.round(_foldWorkMs)}`,
       );
     }
     // Post-COMMIT yield. `applyEvent` has already returned — the transaction
