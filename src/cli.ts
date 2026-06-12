@@ -37,6 +37,7 @@ import { runEpics } from "./verbs/epics.ts";
 import { runInit } from "./verbs/init.ts";
 import { runList } from "./verbs/list.ts";
 import { runReady } from "./verbs/ready.ts";
+import { runRefineApply } from "./verbs/refine_apply.ts";
 import { runRefineContext } from "./verbs/refine_context.ts";
 import { runResolveTask } from "./verbs/resolve_task.ts";
 import { runScaffold } from "./verbs/scaffold.ts";
@@ -115,6 +116,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "ready",
     shortHelp: "List tasks that are ready to be worked on.",
+    implemented: true,
+  },
+  {
+    name: "refine-apply",
+    shortHelp: "Apply a refine delta to an existing epic tree.",
     implemented: true,
   },
   {
@@ -579,6 +585,17 @@ function dispatch(parsed: ParsedArgs): number {
     case "task":
       dispatchGroup(TASK_GROUP, rest, format);
       return 0;
+    case "refine-apply": {
+      // Self-emits (emitMutating on success / emitFailureEnvelope or the restamp
+      // gate's integrity_failed line on failure) and owns its exit code — return
+      // it directly, no generic trailer. The epic id is the positional; --file is
+      // value-taking, so the positional scan must skip its value.
+      const epicId = readPositionalSkipping(rest, new Set(["--file"]));
+      return runRefineApply({
+        epicId,
+        file: readOption(rest, "--file") ?? "",
+      });
+    }
     case "scaffold":
       // Self-emits (emitMutating on success / emitFailureEnvelope on failure)
       // and owns its exit code — return it directly, no generic trailer.
@@ -666,17 +683,12 @@ function readFlag(rest: string[], name: string): boolean {
 }
 
 /** The first positional (non-`--`-prefixed) arg, or "" when absent. A value
- * immediately following a known value-taking option is skipped so it is not
- * mistaken for the positional. */
-function readPositional(rest: string[]): string {
-  const valueTaking = new Set([
-    "--note",
-    "--project",
-    "--reason",
-    "--reason-file",
-    "--summary",
-    "--evidence",
-  ]);
+ * immediately following a value-taking option in `valueTaking` is skipped so it
+ * is not mistaken for the positional. */
+function readPositionalSkipping(
+  rest: string[],
+  valueTaking: Set<string>,
+): string {
   for (let i = 0; i < rest.length; i += 1) {
     const arg = rest[i] as string;
     if (arg.startsWith("--")) {
@@ -689,6 +701,21 @@ function readPositional(rest: string[]): string {
     return arg;
   }
   return "";
+}
+
+/** The first positional, skipping the standard value-taking options. */
+function readPositional(rest: string[]): string {
+  return readPositionalSkipping(
+    rest,
+    new Set([
+      "--note",
+      "--project",
+      "--reason",
+      "--reason-file",
+      "--summary",
+      "--evidence",
+    ]),
+  );
 }
 
 export function main(argv: string[]): number {

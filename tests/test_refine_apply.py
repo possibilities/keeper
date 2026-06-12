@@ -873,6 +873,7 @@ add_tasks:
     assert baseline_spec3.exists()
 
 
+@pytest.mark.python_only
 @pytest.mark.real_git
 def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypatch):
     """The ``_epic_id_lock`` (id-allocation, sub-millisecond) is RELEASED
@@ -880,6 +881,13 @@ def test_refine_apply_lock_disjoint_from_commit_lock(planctl_git_repo, monkeypat
     id-lock hold time across a git commit and bottleneck concurrent scaffolds
     in sibling projects. There is no commit flock, so we spy the commit seam
     (``_git_commit``) instead of the lock-acquire.
+
+    ``python_only``: the proof monkeypatches ``planctl`` module attributes
+    (``_epic_id_lock`` / ``_git_commit``) to record the event order. Those
+    instruments live in the in-process Python interpreter and a conformance
+    subprocess binary never sees them, so the event log stays empty there —
+    the lock/commit ordering is a Python-internals subject that cannot cross
+    the conformance boundary. ``real_git``: it needs a real git commit to spy.
     """
     import contextlib as _ctxlib
 

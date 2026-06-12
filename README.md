@@ -31,7 +31,7 @@ uv tool install .
 planctl --help
 ```
 
-The Python CLI is the authoritative implementation; `planctl-bun` is an additive port — the read surface, the `init`/`claim`/`done`/`block` worker loop, and the epic/task editing surface (setters, dep editors, short-circuiting verbs) — that proves parity against the same conformance suite. To build it:
+The Python CLI is the authoritative implementation; `planctl-bun` is an additive port — the read surface, the `init`/`claim`/`done`/`block` worker loop, the epic/task editing surface (setters, dep editors, short-circuiting verbs), and the creation surface (`scaffold`, `refine-apply`) — that proves parity against the same conformance suite. To build it:
 
 ```bash
 bun install
