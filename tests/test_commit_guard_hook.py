@@ -109,7 +109,7 @@ def _bash_payload(**overrides) -> dict:
 
 
 @pytest.fixture(autouse=True)
-def _require_bun() -> None:
+def require_bun() -> None:
     if shutil.which("bun") is None:
         pytest.skip("bun not on PATH")
 
