@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-12T01:25:00.460912Z",
   "created_at": "2026-06-12T00:03:53.246029Z",
   "created_by_close_of": "fn-790-add-builds-babysitter-producer",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Test builds watchdog decision surface",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-12T00:03:53.246029Z"
+  "updated_at": "2026-06-12T01:25:00.460912Z"
 }
