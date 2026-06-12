@@ -1,7 +1,7 @@
 // Bun race-harness worker: mint K epic ids under the shared global epic-id lock,
-// interleaving with concurrent Python + bun peers. Argv: <dataDir> <count>.
-// HOME is set by the harness so this resolves the SAME ~/.local/state lock path
-// Python's _epic_id_lock uses — the cross-engine interop the test proves.
+// interleaving with N concurrent bun peers. Argv: <dataDir> <count>.
+// HOME is set by the harness so every worker resolves the SAME ~/.local/state
+// epic-id lock path — the cross-process contention the test proves.
 
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";

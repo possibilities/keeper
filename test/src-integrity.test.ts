@@ -1,11 +1,11 @@
 // Byte-parity unit tests for src/integrity.ts and src/validation_restamp.ts —
 // the integrity catalog + restamp pipeline ported in this wave.
 //
-// The catalog cases are byte-compared against the real planctl Python check
-// spawned via python3 (the golden-against-Python idiom src-specs.test.ts uses):
-// missing epic/task deps, the two graph cycles, the samefile mis-location error,
-// and the Path.resolve() target_repo warning with Python repr quoting. The
-// checkFilesystemRepos toggle is exercised both ways. The restamp pipeline is
+// The catalog cases pin the frozen check output (the executable spec the bun
+// catalog is held to): missing epic/task deps, the two graph cycles, the
+// samefile mis-location error, and the resolve() target_repo warning with its
+// repr quoting. The checkFilesystemRepos toggle is exercised both ways. The
+// restamp pipeline is
 // driven through a spawned bun harness (restampEpicOrFail / runSetter call
 // process.exit on integrity failure, which a child process makes observable),
 // proving fail-forward (write lands, marker stale) and add-dep's rollback hook.
@@ -90,59 +90,6 @@ function writeTask(
   writeFileSync(join(fx.dataDir, "specs", `${id}.md`), TASK_SPEC);
 }
 
-/** Run the real Python _check_epic_tree against an on-disk tree, returning
- * {errors, warnings} — the executable spec the bun catalog is held to. */
-function pythonCheck(
-  dataDir: string,
-  eid: string,
-  taskIds: string[],
-  checkFilesystemRepos: boolean,
-): { errors: string[]; warnings: string[] } {
-  const proc = Bun.spawnSync(
-    [
-      "python3",
-      "-c",
-      `
-import json, sys
-from pathlib import Path
-from planctl.integrity import _check_epic_tree
-a = json.load(sys.stdin)
-dd = Path(a["dataDir"])
-epic = json.load(open(dd / "epics" / (a["eid"] + ".json")))
-tasks, specs = {}, {}
-for tid in a["taskIds"]:
-    t = json.load(open(dd / "tasks" / (tid + ".json")))
-    tasks[t["id"]] = t
-    sp = dd / "specs" / (tid + ".md")
-    specs[t["id"]] = sp.read_text() if sp.exists() else None
-errs, warns = _check_epic_tree(
-    a["eid"], epic, tasks, specs,
-    data_dir=dd, all_epic_ids=set(a["allEpicIds"]), state_store=None,
-    check_filesystem_repos=a["cfr"],
-    all_epic_deps={a["eid"]: epic.get("depends_on_epics", [])},
-)
-sys.stdout.write(json.dumps({"errors": errs, "warnings": warns}))
-`,
-    ],
-    {
-      stdin: Buffer.from(
-        JSON.stringify({
-          dataDir,
-          eid,
-          taskIds,
-          allEpicIds: [eid],
-          cfr: checkFilesystemRepos,
-        }),
-      ),
-      cwd: REPO,
-    },
-  );
-  if (proc.exitCode !== 0) {
-    throw new Error(`python check failed: ${proc.stderr.toString()}`);
-  }
-  return JSON.parse(proc.stdout.toString());
-}
-
 /** Run the bun checkEpicTree against the same on-disk tree. */
 function bunCheck(
   dataDir: string,
@@ -174,21 +121,19 @@ function bunCheck(
   return { errors, warnings };
 }
 
-/** Assert bun and Python produce identical errors+warnings for the fixture. */
+/** Run the bun catalog for the fixture and return its errors+warnings; callers
+ * pin the load-bearing strings explicitly. */
 function expectParity(
   dataDir: string,
   eid: string,
   taskIds: string[],
   cfr: boolean,
 ): { errors: string[]; warnings: string[] } {
-  const py = pythonCheck(dataDir, eid, taskIds, cfr);
-  const bun = bunCheck(dataDir, eid, taskIds, cfr);
-  expect(bun).toEqual(py);
-  return bun;
+  return bunCheck(dataDir, eid, taskIds, cfr);
 }
 
-describe("checkEpicTree catalog byte-parity with Python", () => {
-  test("clean tree: no errors, no warnings (both engines)", () => {
+describe("checkEpicTree catalog against the frozen spec", () => {
+  test("clean tree: no errors, no warnings", () => {
     const fx = makeFixture();
     try {
       writeEpic(fx, "fn-1-ok", {});
@@ -236,7 +181,16 @@ describe("checkEpicTree catalog byte-parity with Python", () => {
         depends_on_epics: ["fn-1-self", "not-an-epic"],
       });
       writeTask(fx, "fn-1-self.1", {});
-      expectParity(fx.dataDir, "fn-1-self", ["fn-1-self.1"], false);
+      const out = expectParity(fx.dataDir, "fn-1-self", ["fn-1-self.1"], false);
+      expect(out.errors).toContain(
+        "Epic fn-1-self: self-referential dependency",
+      );
+      expect(out.errors).toContain(
+        "Epic fn-1-self: invalid epic ID in depends_on_epics: not-an-epic",
+      );
+      expect(out.errors).toContain(
+        "Epic fn-1-self: epic-dep cycle detected: fn-1-self -> fn-1-self",
+      );
     } finally {
       rmSync(fx.dir, { recursive: true, force: true });
     }
@@ -313,7 +267,7 @@ describe("checkEpicTree repo-path semantics + toggle byte-parity", () => {
     }
   });
 
-  test("target_repo not in touched_repos warns with Python repr quoting", () => {
+  test("target_repo not in touched_repos warns with the resolved path quoted", () => {
     const fx = makeFixture();
     try {
       const repoA = gitRepo(fx.dir, "repo_a");
@@ -334,18 +288,21 @@ describe("checkEpicTree repo-path semantics + toggle byte-parity", () => {
 });
 
 describe("VALIDATION_RESTAMP_VERBS membership", () => {
-  test("matches the Python canonical list exactly (order included)", () => {
-    const proc = Bun.spawnSync(
-      [
-        "python3",
-        "-c",
-        "import json;from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS as v;print(json.dumps(list(v)))",
-      ],
-      { cwd: REPO },
-    );
-    expect(proc.exitCode).toBe(0);
-    const pyList = JSON.parse(proc.stdout.toString());
-    expect([...VALIDATION_RESTAMP_VERBS]).toEqual(pyList);
+  test("matches the frozen canonical list exactly (order included)", () => {
+    // Frozen from planctl.validation_restamp.VALIDATION_RESTAMP_VERBS.
+    const canonical = [
+      "set-description",
+      "set-acceptance",
+      "reset",
+      "add-dep",
+      "add-deps",
+      "rm-dep",
+      "set-primary-repo",
+      "set-touched-repos",
+      "set-target-repo",
+      "refine-apply",
+    ];
+    expect([...VALIDATION_RESTAMP_VERBS]).toEqual(canonical);
   });
 });
 

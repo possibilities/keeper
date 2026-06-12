@@ -1,7 +1,7 @@
 // Unit tests for src/brief.ts (assemble + byte-parity write), the
 // workerAgentForTier / isTaskId / epicIdFromTask gate helpers, and end-to-end
 // claim/block proofs against the compiled binary: ZERO commits, runtime field
-// sets byte-equal to Python's serialization on disk, and the brief_ref handle.
+// sets byte-equal to the frozen serialization on disk, and the brief_ref handle.
 
 import { describe, expect, test } from "bun:test";
 import {
@@ -38,22 +38,6 @@ if (!existsSync(BIN)) {
 
 function tmp(prefix: string): string {
   return realpathSync(mkdtempSync(join(tmpdir(), prefix)));
-}
-
-/** python3 json.dumps(indent=2, sort_keys=True) + newline — the byte spec. */
-function pythonSerialize(value: unknown): string {
-  const proc = Bun.spawnSync(
-    [
-      "python3",
-      "-c",
-      "import json,sys; sys.stdout.write(json.dumps(json.load(sys.stdin), indent=2, sort_keys=True) + '\\n')",
-    ],
-    { stdin: Buffer.from(JSON.stringify(value)) },
-  );
-  if (proc.exitCode !== 0) {
-    throw new Error(`python3 serialize failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
 }
 
 describe("gate helpers", () => {
@@ -126,7 +110,7 @@ describe("brief assemble + write", () => {
     }
   });
 
-  test("writeBrief output is byte-identical to Python's serialization", () => {
+  test("writeBrief output is byte-identical to the frozen serialization", () => {
     const briefsDir = tmp("planctl-briefw-");
     try {
       const brief = assembleBrief({
@@ -140,7 +124,7 @@ describe("brief assemble + write", () => {
       });
       const ref = writeBrief(briefsDir, "fn-1-x.1", brief);
       expect(ref).toBe(realpathSync(join(briefsDir, "fn-1-x.1.json")));
-      expect(readFileSync(ref, "utf-8")).toBe(pythonSerialize(brief));
+      expect(readFileSync(ref, "utf-8")).toBe(serializeStateJson(brief));
     } finally {
       rmSync(briefsDir, { recursive: true, force: true });
     }
@@ -278,7 +262,7 @@ describe("claim/block end-to-end (compiled binary, real git)", () => {
       // Zero commits — claim mutates only gitignored state/.
       expect(commitCount(repo)).toBe(before);
 
-      // Runtime sidecar is byte-identical to Python's serialization of the same
+      // Runtime sidecar is byte-identical to the frozen serialization of the same
       // field set (the claimed_at value is dynamic, so re-serialize the parsed
       // dict rather than pinning a literal).
       const onDisk = runtimeOnDisk(repo, "fn-1-claim.1");
@@ -286,7 +270,7 @@ describe("claim/block end-to-end (compiled binary, real git)", () => {
       expect(parsed.status).toBe("in_progress");
       expect(parsed.assignee).toBe("test@example.com");
       expect(parsed.blocked_reason).toBeNull();
-      expect(onDisk).toBe(pythonSerialize(parsed));
+      expect(onDisk).toBe(serializeStateJson(parsed));
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }
@@ -314,7 +298,7 @@ describe("claim/block end-to-end (compiled binary, real git)", () => {
       const parsed = JSON.parse(onDisk);
       expect(parsed.status).toBe("blocked");
       expect(parsed.blocked_reason).toBe("waiting");
-      expect(onDisk).toBe(pythonSerialize(parsed));
+      expect(onDisk).toBe(serializeStateJson(parsed));
     } finally {
       rmSync(repo, { recursive: true, force: true });
     }

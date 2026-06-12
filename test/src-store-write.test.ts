@@ -1,13 +1,11 @@
-// Unit tests for the write side of src/store.ts plus src/flock.ts — the spine
-// this epic adds: byte-stable atomic JSON writes, the touched-paths session log,
-// and flock(2) task locks that interop with Python's fcntl across engines.
+// Unit tests for the write side of src/store.ts plus src/flock.ts: byte-stable
+// atomic JSON writes, the touched-paths session log, and flock(2) task locks.
 //
-// The golden test spawns python3 to serialize a shared nested fixture with
-// json.dumps(indent=2, sort_keys=True) and byte-compares — the only proof that
-// the bun writer is byte-identical to Python (recursive sort + ensure_ascii +
-// trailing newline). The flock interop tests drive a real python3 peer holding
-// fcntl.flock, synchronized by marker files (never sleeps), asserting the lock
-// blocks in BOTH directions.
+// The golden test byte-compares the writer against a frozen json.dumps(indent=2,
+// sort_keys=True)+newline literal — the pinned serialization spec (recursive key
+// sort + non-ASCII escaped + trailing newline). The flock contention tests spawn
+// a second bun process holding the lock, synchronized by marker files (never
+// sleeps), asserting the lock blocks in BOTH directions.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -85,33 +83,19 @@ const GOLDEN_FIXTURE = {
   del_char: "x\x7fy",
 };
 
-/** Serialize `value` through python3's json.dumps(indent=2, sort_keys=True) +
- * newline — the executable spec the bun writer is held to. */
-function pythonSerialize(value: unknown): string {
-  const proc = Bun.spawnSync(
-    [
-      "python3",
-      "-c",
-      "import json,sys; sys.stdout.write(json.dumps(json.load(sys.stdin), indent=2, sort_keys=True) + '\\n')",
-    ],
-    { stdin: Buffer.from(JSON.stringify(value)) },
-  );
-  if (proc.exitCode !== 0) {
-    throw new Error(`python3 serialize failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
-}
-
-describe("serializeStateJson byte-parity with Python", () => {
+describe("serializeStateJson byte-parity with the frozen json.dumps spec", () => {
   test("golden nested fixture is byte-identical to json.dumps(indent=2, sort_keys=True)+newline", () => {
     const bun = serializeStateJson(GOLDEN_FIXTURE as Record<string, unknown>);
-    const py = pythonSerialize(GOLDEN_FIXTURE);
-    expect(bun).toBe(py);
+    expect(bun).toBe(
+      '{\n  "alpha": {\n    "deep": {\n      "x": {\n        "a": true,\n        "b": null\n      },\n      "y": 1\n    },\n    "nested_a": "unicode: caf\\u00e9 \\u2603 \\u00e9 \\u6f22\\u5b57 \\ud83d\\ude00",\n    "nested_z": [\n      3,\n      2,\n      1\n    ]\n  },\n  "bool_f": false,\n  "bool_t": true,\n  "control": "tab\\there\\nnewline\\r\\"quote\\"\\\\back",\n  "del_char": "x\\u007fy",\n  "key with spaces": "v",\n  "list_of_objs": [\n    {\n      "a": 2,\n      "c": 1\n    },\n    {\n      "m": 8,\n      "z": 9\n    }\n  ],\n  "nullval": null,\n  "numbers": {\n    "neg": -7,\n    "safe_int": 9007199254740991,\n    "small": 0\n  },\n  "zeta": "last",\n  "\\u00fcn\\u00efcode_key": "k"\n}\n',
+    );
   });
 
-  test("recursive sort: a nested out-of-order object matches Python", () => {
+  test("recursive sort: a nested out-of-order object matches the spec", () => {
     const data = { z: { d: 1, a: 2, m: { y: 1, b: 2 } }, a: 1 };
-    expect(serializeStateJson(data)).toBe(pythonSerialize(data));
+    expect(serializeStateJson(data)).toBe(
+      '{\n  "a": 1,\n  "z": {\n    "a": 2,\n    "d": 1,\n    "m": {\n      "b": 2,\n      "y": 1\n    }\n  }\n}\n',
+    );
   });
 
   test("ends with exactly one trailing newline", () => {
@@ -129,11 +113,13 @@ describe("serializeStateJson byte-parity with Python", () => {
 });
 
 describe("atomicWriteJson disk output", () => {
-  test("file on disk is byte-identical to Python's serialization", () => {
+  test("file on disk is byte-identical to the frozen serialization", () => {
     delete process.env.CLAUDE_CODE_SESSION_ID; // isolate write from touched-log
     const p = join(root, "out.json");
     atomicWriteJson(p, GOLDEN_FIXTURE as Record<string, unknown>);
-    expect(readFileSync(p, "utf-8")).toBe(pythonSerialize(GOLDEN_FIXTURE));
+    expect(readFileSync(p, "utf-8")).toBe(
+      '{\n  "alpha": {\n    "deep": {\n      "x": {\n        "a": true,\n        "b": null\n      },\n      "y": 1\n    },\n    "nested_a": "unicode: caf\\u00e9 \\u2603 \\u00e9 \\u6f22\\u5b57 \\ud83d\\ude00",\n    "nested_z": [\n      3,\n      2,\n      1\n    ]\n  },\n  "bool_f": false,\n  "bool_t": true,\n  "control": "tab\\there\\nnewline\\r\\"quote\\"\\\\back",\n  "del_char": "x\\u007fy",\n  "key with spaces": "v",\n  "list_of_objs": [\n    {\n      "a": 2,\n      "c": 1\n    },\n    {\n      "m": 8,\n      "z": 9\n    }\n  ],\n  "nullval": null,\n  "numbers": {\n    "neg": -7,\n    "safe_int": 9007199254740991,\n    "small": 0\n  },\n  "zeta": "last",\n  "\\u00fcn\\u00efcode_key": "k"\n}\n',
+    );
   });
 
   test("no .tmp files survive a successful write", () => {
@@ -229,7 +215,7 @@ describe("LocalFileStateStore.saveRuntime", () => {
     store.saveRuntime("fn-1-x.1", { status: "in_progress", assignee: "a" });
     const p = join(stateDir, "tasks", "fn-1-x.1.state.json");
     expect(readFileSync(p, "utf-8")).toBe(
-      pythonSerialize({ status: "in_progress", assignee: "a" }),
+      '{\n  "assignee": "a",\n  "status": "in_progress"\n}\n',
     );
     // Round-trips through the read side.
     expect(store.loadRuntime("fn-1-x.1")).toEqual({
@@ -282,33 +268,31 @@ function waitForFile(path: string, timeoutMs = 10000): void {
   }
 }
 
-describe("flock cross-engine interop with a python3 peer", () => {
-  // Direction 1: python3 holds the lock, bun's LOCK_NB must fail (EWOULDBLOCK).
-  test("python holds LOCK_EX => bun LOCK_NB blocks (FlockWouldBlock)", () => {
+const FLOCK_PEER = join(import.meta.dir, "fixtures", "flock_peer.ts");
+
+describe("flock cross-process contention with a second bun peer", () => {
+  // Direction 1: the peer process holds the lock, this process's LOCK_NB must
+  // fail (FlockWouldBlock). Synchronized by marker files — no sleeps.
+  test("peer holds LOCK_EX => LOCK_NB here blocks (FlockWouldBlock)", () => {
     const lockPath = join(root, "interop1.lock");
-    const heldMarker = join(root, "py.held");
+    const heldMarker = join(root, "peer.held");
     const releaseMarker = join(root, "release.now");
 
-    // Python: take LOCK_EX, write held marker, busy-wait for the release marker,
-    // then unlock. No sleeps — pure marker handshake.
-    const pyScript = `
-import fcntl, os, sys, time
-lock_path, held, release = sys.argv[1], sys.argv[2], sys.argv[3]
-f = open(lock_path, "w")
-fcntl.flock(f, fcntl.LOCK_EX)
-open(held, "w").close()
-while not os.path.exists(release):
-    time.sleep(0.005)
-fcntl.flock(f, fcntl.LOCK_UN)
-f.close()
-`;
     const peer = Bun.spawn(
-      ["python3", "-c", pyScript, lockPath, heldMarker, releaseMarker],
+      [
+        process.execPath,
+        "run",
+        FLOCK_PEER,
+        "hold",
+        lockPath,
+        heldMarker,
+        releaseMarker,
+      ],
       { stdout: "pipe", stderr: "pipe" },
     );
     try {
       waitForFile(heldMarker);
-      // Python holds it — bun's non-blocking acquire must report contention.
+      // Peer holds it — this process's non-blocking acquire must report contention.
       const fd = openSync(lockPath, "w");
       try {
         expect(() => flockOrThrow(fd, LOCK_EX | LOCK_NB)).toThrow(
@@ -323,30 +307,18 @@ f.close()
     }
   });
 
-  // Direction 2: bun holds the lock, python3's LOCK_NB must fail (errno
-  // EWOULDBLOCK). The peer exits non-zero only if it WRONGLY acquired the lock.
-  test("bun holds LOCK_EX => python LOCK_NB blocks (EWOULDBLOCK)", async () => {
+  // Direction 2: this process holds the lock, the peer's LOCK_NB must fail. The
+  // peer exits 42 on the expected block, 0 if it WRONGLY acquired the lock.
+  test("this process holds LOCK_EX => peer LOCK_NB blocks (exit 42)", async () => {
     const lockPath = join(root, "interop2.lock");
     const fd = openSync(lockPath, "w");
-    flockOrThrow(fd, LOCK_EX); // bun holds it for the whole peer run
+    flockOrThrow(fd, LOCK_EX); // held for the whole peer run
 
-    // Python tries a non-blocking acquire; exits 42 on the expected EWOULDBLOCK,
-    // 0 if it wrongly got the lock, 1 on any other errno.
-    const pyScript = `
-import fcntl, errno, sys
-f = open(sys.argv[1], "w")
-try:
-    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError as e:
-    sys.exit(42 if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN) else 1)
-else:
-    sys.exit(0)  # wrongly acquired
-`;
     try {
-      const peer = Bun.spawn(["python3", "-c", pyScript, lockPath], {
-        stdout: "pipe",
-        stderr: "pipe",
-      });
+      const peer = Bun.spawn(
+        [process.execPath, "run", FLOCK_PEER, "try-nb", lockPath],
+        { stdout: "pipe", stderr: "pipe" },
+      );
       const code = await peer.exited;
       expect(code).toBe(42);
     } finally {
@@ -357,7 +329,7 @@ else:
 });
 
 describe("LocalFileStateStore.withTaskLock", () => {
-  test("runs the body under a real flock and a python peer is blocked while held", async () => {
+  test("runs the body under a real flock and a peer process is blocked while held", async () => {
     delete process.env.CLAUDE_CODE_SESSION_ID;
     const stateDir = join(root, "state");
     const store = new LocalFileStateStore(stateDir);
@@ -365,30 +337,26 @@ describe("LocalFileStateStore.withTaskLock", () => {
 
     let observedBlocked = false;
     store.withTaskLock("fn-1-x.1", () => {
-      // While we hold it, a python LOCK_NB peer must fail to acquire.
-      const pyScript = `
-import fcntl, errno, sys
-f = open(sys.argv[1], "w")
-try:
-    fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-except OSError as e:
-    sys.exit(42 if e.errno in (errno.EWOULDBLOCK, errno.EAGAIN) else 1)
-sys.exit(0)
-`;
-      const peer = Bun.spawnSync(["python3", "-c", pyScript, lockPath]);
+      // While we hold it, a peer's non-blocking acquire must fail (exit 42).
+      const peer = Bun.spawnSync([
+        process.execPath,
+        "run",
+        FLOCK_PEER,
+        "try-nb",
+        lockPath,
+      ]);
       observedBlocked = peer.exitCode === 42;
     });
     expect(observedBlocked).toBe(true);
 
-    // After release, a python peer acquires cleanly (exit 0).
-    const pyAcquire = `
-import fcntl, sys
-f = open(sys.argv[1], "w")
-fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
-fcntl.flock(f, fcntl.LOCK_UN)
-sys.exit(0)
-`;
-    const after = Bun.spawnSync(["python3", "-c", pyAcquire, lockPath]);
+    // After release, a peer acquires cleanly (exit 0).
+    const after = Bun.spawnSync([
+      process.execPath,
+      "run",
+      FLOCK_PEER,
+      "acquire",
+      lockPath,
+    ]);
     expect(after.exitCode).toBe(0);
   });
 });

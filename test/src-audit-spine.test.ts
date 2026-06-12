@@ -2,12 +2,13 @@
 // port of planctl/audit_artifacts.py + submit_common.py + verdict_schema.py.
 //
 // Three load-bearing parity proofs:
-//   1. computeCommitSetHash byte-identical to compute_commit_set_hash: a python3
-//      peer imports the real module and hashes the SAME fixture; the digests
-//      must match (canonical order-independent SHA-256, schema_version folded).
+//   1. computeCommitSetHash byte-identical to the frozen serialization spec: the
+//      digests below were captured from compute_commit_set_hash and pinned as
+//      the executable spec (canonical order-independent SHA-256, schema_version
+//      folded); a drift in either direction breaks the byte-parity assertion.
 //   2. validateVerdict reproduces every golden VERDICT_INVALID envelope from
 //      test/fixtures/golden/verdict/ — the {loc,type,msg} parity table whose
-//      message text is the load-bearing surface (python-jsonschema's wording).
+//      message text is the load-bearing surface, pinned by the frozen corpus.
 //   3. writeArtifact is COMMIT-FREE and touched-log-free: it lands the file but
 //      records NOTHING under sessions/<sid>/touched (unlike store.atomicWrite),
 //      so the next mutating verb's auto-commit never sweeps an audit artifact.
@@ -48,30 +49,17 @@ import { validateVerdict } from "../src/verdict_schema.ts";
 
 const GOLDEN_DIR = join(import.meta.dir, "fixtures", "golden", "verdict");
 
-/** Hash `commitGroups` through a python3 peer that imports the REAL
- * planctl.audit_artifacts.compute_commit_set_hash — the executable spec the bun
- * hash is held to. Runs from the repo root so the package is importable. */
-function pythonCommitSetHash(commitGroups: CommitGroup[]): string {
-  const script =
-    "import json,sys; " +
-    "from planctl.audit_artifacts import compute_commit_set_hash; " +
-    "sys.stdout.write(compute_commit_set_hash(json.load(sys.stdin)))";
-  const proc = Bun.spawnSync(["uv", "run", "python3", "-c", script], {
-    cwd: join(import.meta.dir, ".."),
-    stdin: Buffer.from(JSON.stringify(commitGroups)),
-  });
-  if (proc.exitCode !== 0) {
-    throw new Error(`python3 hash failed: ${proc.stderr.toString()}`);
-  }
-  return proc.stdout.toString();
-}
-
-describe("computeCommitSetHash byte-parity with Python", () => {
-  const fixtures: { name: string; groups: CommitGroup[] }[] = [
-    { name: "empty set", groups: [] },
+describe("computeCommitSetHash byte-parity with the frozen hash spec", () => {
+  const fixtures: { name: string; groups: CommitGroup[]; hash: string }[] = [
+    {
+      name: "empty set",
+      groups: [],
+      hash: "1d9ebf5514067028b750fb8f1ec6dff67d94515b5224186200ee4331f6d2a029",
+    },
     {
       name: "single repo, single sha",
       groups: [{ repo: "/r/primary", shas: ["abc123"] }],
+      hash: "37d6b72141ae822db9cc23be33f360875f520d1c8982d1e6ccacfc43e1480b5f",
     },
     {
       name: "order-independent: unsorted shas + repos",
@@ -79,20 +67,23 @@ describe("computeCommitSetHash byte-parity with Python", () => {
         { repo: "/r/b", shas: ["ffee", "0011", "aa99"] },
         { repo: "/r/a", shas: ["dead", "beef"] },
       ],
+      hash: "e0dad6bdba0aefcd477dd4c31bed9221a813940362b71555e00e680b30781f99",
     },
     {
       name: "duplicate shas collapse",
       groups: [{ repo: "/r/x", shas: ["aa", "aa", "bb", "aa"] }],
+      hash: "7d2ad269901968b7f33aaebcee10295fc31dc0554882d3d8abd8725777c8eb0a",
     },
     {
       name: "null / missing shas → empty",
       groups: [{ repo: "/r/p", shas: null }, { repo: "/r/q" }],
+      hash: "270b913eee4ddb10097102bebe387df2744c7912e93f46c072005076d0c3ba42",
     },
   ];
 
-  for (const { name, groups } of fixtures) {
+  for (const { name, groups, hash } of fixtures) {
     test(name, () => {
-      expect(computeCommitSetHash(groups)).toBe(pythonCommitSetHash(groups));
+      expect(computeCommitSetHash(groups)).toBe(hash);
     });
   }
 
@@ -134,7 +125,7 @@ describe("validateVerdict vs the golden corpus", () => {
   });
 
   for (const file of goldens) {
-    test(`${file}: envelope matches python-jsonschema parity`, () => {
+    test(`${file}: envelope matches the frozen golden`, () => {
       const golden = JSON.parse(
         readFileSync(join(GOLDEN_DIR, file), "utf-8"),
       ) as { input: unknown; envelope: unknown };

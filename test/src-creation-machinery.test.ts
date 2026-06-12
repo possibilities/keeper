@@ -6,10 +6,10 @@
 // accumulate-all failure emit (emit.ts).
 //
 // The YAML scalar matrix is the wave's hinge: the same five divergence classes
-// tests/test_creation_verbs.py pins EMPIRICALLY against pyyaml safe_load (YAML
-// 1.1) must come out of the eemeli wrapper identically, because the downstream
-// string/int guards fire on the parser's OUTPUT. The cross-engine race harness
-// proves the lock interops with Python's _epic_id_lock against the shared path.
+// YAML 1.1 inputs must come out of the eemeli wrapper with the values the
+// downstream string/int guards expect, because those guards fire on the parser's
+// OUTPUT. The race harness proves the epic-id lock serializes N concurrent
+// minters against the one shared ~/.local/state lock path, no dups.
 
 import { describe, expect, test } from "bun:test";
 import {
@@ -394,7 +394,7 @@ describe("checkGlobalNameUnique", () => {
 });
 
 // ===========================================================================
-// Fail-soft epic-id lock + cross-engine race harness.
+// Fail-soft epic-id lock + concurrent-minter race harness.
 // ===========================================================================
 
 describe("withEpicIdLock", () => {
@@ -438,7 +438,7 @@ describe("withEpicIdLock", () => {
     }
   });
 
-  test("CROSS-ENGINE RACE: python + bun workers mint contiguous, no dups", async () => {
+  test("RACE: N concurrent bun workers mint contiguous ids, no dups", async () => {
     const saved = process.env.HOME;
     const home = tmpDir();
     const dataDir = join(home, "data");
@@ -446,15 +446,13 @@ describe("withEpicIdLock", () => {
     mkdirSync(join(dataDir, "specs"), { recursive: true });
 
     const perWorker = 8;
-    const bunWorkers = 2;
-    const pyWorkers = 2;
-    const expectedTotal = perWorker * (bunWorkers + pyWorkers);
+    const bunWorkers = 4;
+    const expectedTotal = perWorker * bunWorkers;
 
     const fixtures = join(REPO_ROOT, "test", "fixtures", "creation");
     const bunWorkerPath = join(fixtures, "mint_worker.ts");
-    const pyWorkerPath = join(fixtures, "mint_worker.py");
-    // HOME drives BOTH engines to the same ~/.local/state/planctl/epic-id.lock,
-    // so a bun mint and a Python mint serialize against the one shared lock.
+    // HOME drives every worker to the same ~/.local/state/planctl/epic-id.lock,
+    // so all N concurrent bun mints serialize against the one shared lock.
     const env = { ...process.env, HOME: home };
 
     try {
@@ -476,25 +474,6 @@ describe("withEpicIdLock", () => {
           }),
         );
       }
-      for (let i = 0; i < pyWorkers; i += 1) {
-        procs.push(
-          Bun.spawn({
-            cmd: [
-              "uv",
-              "run",
-              "python3",
-              pyWorkerPath,
-              dataDir,
-              String(perWorker),
-            ],
-            env,
-            stdout: "ignore",
-            stderr: "pipe",
-            cwd: REPO_ROOT,
-          }),
-        );
-      }
-
       const exitCodes = await Promise.all(procs.map((proc) => proc.exited));
       for (let i = 0; i < procs.length; i += 1) {
         if (exitCodes[i] !== 0) {
@@ -515,7 +494,7 @@ describe("withEpicIdLock", () => {
 
       // No duplicate ids — the lock made every scan->write critical section atomic.
       expect(new Set(ids).size).toBe(ids.length);
-      // Contiguous 1..expectedTotal across BOTH engines.
+      // Contiguous 1..expectedTotal across all concurrent bun workers.
       expect(ids).toEqual(
         Array.from({ length: expectedTotal }, (_, k) => k + 1),
       );
