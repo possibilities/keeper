@@ -38,5 +38,5 @@ Exit: `PLANCTL_BIN=$PWD/dist/planctl-bun uv run pytest tests/test_cli.py tests/t
 - [ ] No Python file touched; fast gate green
 
 ## Done summary
-
+Stood up the src/ TS tree on the existing Bun toolchain: emitter spine (json/yaml/compact-trailer byte-parity with the Python wire spec via js-yaml), project resolution (realpathSync-matched find_git_root), read-only invocation builder, and a hand-rolled CLI dispatch. state-path ships end-to-end through a bun build --compile binary (dist/planctl-bun); detect/status/epics are registered in help but stubbed to exit non-zero. Conformance gate (test_cli + state_path) green against the compiled binary serially and with -n; bun test/biome/tsc green; Python fast gate untouched.
 ## Evidence
