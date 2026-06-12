@@ -1,0 +1,84 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  LaunchAgent template for the babysitters HELPTAILING sitter's scanner
+  (babysitters/helptailing/watch.ts).
+
+  This is a TEMPLATE, not an installed agent: keeper ships no `install` verb.
+  See README.md "Install" for the manual symlink + `launchctl bootstrap` steps.
+
+  What it does: every HOUR, runs the read-only `watch.ts --tick` scanner over
+  keeper.db, counting `--agent-help` Bash invocations, comparing a frozen
+  pre-2026-06-11 baseline against the current epoch, and writing trend-digest +
+  rate-spike followup files DIRECTLY under
+  ~/.local/state/babysitters/helptailing/followups/ for genuinely-new findings.
+  It pages NOTHING and SPAWNS NO AGENT — the human works the collected corpus via
+  `/babysit-triage helptailing`. It is a PURE EXTERNAL OBSERVER: opens keeper.db
+  read-only, never writes it, mints no synthetic events, performs no RPC. Its OWN
+  binary, NOT a `keeper` subcommand.
+
+  Hourly (not 300s) because this is a TREND sitter, not a fire watch — a weekly
+  digest does not benefit from a 5-minute cadence.
+
+  Paths are hard-coded absolute because launchd does NOT source your shell rc,
+  so `bun` cannot be found by name. The values below assume:
+    - bun installed via Homebrew on Apple Silicon: /opt/homebrew/bin/bun
+      (Intel Macs: /usr/local/bin/bun — edit ProgramArguments + PATH below)
+    - the repo checked out at /Users/mike/code/keeper
+    - keeper.db under /Users/mike/.local/state/keeper
+    - sitter state + logs under /Users/mike/.local/state/babysitters/helptailing
+  Edit these for your own username / arch before bootstrapping.
+
+  PATH below includes /Users/mike/.local/bin for parity with the other sitter
+  plists; this sitter never shells out to `claude` or `botctl` (it spawns no agent
+  and never pages), so nothing on the findings path depends on it. There is NO
+  watchdog plist — a dead-man pager is pointless for a sitter that never pages.
+
+  Periodic via StartInterval (3600s), NOT KeepAlive — mixing the two defeats the
+  interval (KeepAlive would restart the one-shot scanner immediately). The
+  interval resets from process EXIT. RunAtLoad fires one immediate pass at
+  bootstrap; the scanner exits 0 cleanly if keeper.db is missing/locked, so an
+  early load is harmless.
+
+  Install:
+    ln -s "$PWD/plist/arthack.babysitter.helptailing.watch.plist" ~/Library/LaunchAgents/
+    launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.babysitter.helptailing.watch.plist
+
+  Uninstall:
+    launchctl bootout gui/$(id -u)/arthack.babysitter.helptailing.watch
+    rm ~/Library/LaunchAgents/arthack.babysitter.helptailing.watch.plist
+
+  Failures are observable via:
+    launchctl print gui/$(id -u)/arthack.babysitter.helptailing.watch
+    /Users/mike/.local/state/babysitters/helptailing/watch.stderr
+-->
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>arthack.babysitter.helptailing.watch</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/opt/homebrew/bin/bun</string>
+		<string>run</string>
+		<string>/Users/mike/code/keeper/babysitters/helptailing/watch.ts</string>
+		<string>--tick</string>
+	</array>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>PATH</key>
+		<string>/Users/mike/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+	</dict>
+	<key>StartInterval</key>
+	<integer>3600</integer>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>ProcessType</key>
+	<string>Background</string>
+	<key>WorkingDirectory</key>
+	<string>/Users/mike/code/keeper</string>
+	<key>StandardOutPath</key>
+	<string>/Users/mike/.local/state/babysitters/helptailing/watch.stdout</string>
+	<key>StandardErrorPath</key>
+	<string>/Users/mike/.local/state/babysitters/helptailing/watch.stderr</string>
+</dict>
+</plist>

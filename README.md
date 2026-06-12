@@ -535,6 +535,35 @@ Keeper has no `install` verb. Wire it up manually:
    with `launchctl kickstart gui/$(id -u)/arthack.babysitter.builds.watch`, or
    peek at a live scan with `bun run babysitters/builds/watch.ts --json`.
 
+   8d. **Install the `helptailing` sitter** — a THIRD babysitter, a read-only
+   TREND sitter that counts `--agent-help` Bash invocations in `keeper.db`,
+   compares a frozen pre-`2026-06-11` historical baseline against the current
+   epoch, and SILENTLY writes `trend-digest` + `rate-spike` followups under
+   `~/.local/state/babysitters/helptailing/followups/`. Like `builds` it pages
+   NOTHING — but it goes further: it spawns NO agent at all (the scanner writes
+   its own followups) and ships NO watchdog (a dead-man pager is pointless for a
+   sitter that never pages). The human works the corpus via
+   `/babysit-triage helptailing`:
+
+   ```sh
+   ln -s "$PWD/plist/arthack.babysitter.helptailing.watch.plist" ~/Library/LaunchAgents/
+   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.babysitter.helptailing.watch.plist
+   ```
+
+   `babysitters/helptailing/watch.ts --tick` runs HOURLY (`StartInterval 3600`,
+   not 300s — a trend sitter, not a fire watch): a read-only scan over `keeper.db`
+   (opened strictly read-only; a missing/locked DB degrades to a heartbeat-only
+   tick and exits 0). It seeds the frozen baseline sidecar once, recomputes the
+   epoch count each tick (never accumulated), and writes one followup per
+   genuinely-new finding. As the last action on every completed tick it stamps a
+   liveness `heartbeat.json` under `~/.local/state/babysitters/helptailing/` —
+   read by `/babysit-triage` for staleness, since there is no watchdog to page on
+   it. Inspect with
+   `launchctl print gui/$(id -u)/arthack.babysitter.helptailing.watch`, force a
+   tick with
+   `launchctl kickstart gui/$(id -u)/arthack.babysitter.helptailing.watch`, or
+   peek at a live scan with `bun run babysitters/helptailing/watch.ts --json`.
+
 9. **Verify** the agent is loaded and the projection is live:
 
    ```sh
@@ -1211,6 +1240,8 @@ launchctl bootout gui/$(id -u)/arthack.babysitter.performance.watch
 rm ~/Library/LaunchAgents/arthack.babysitter.performance.watch.plist
 launchctl bootout gui/$(id -u)/arthack.babysitter.performance.watchdog
 rm ~/Library/LaunchAgents/arthack.babysitter.performance.watchdog.plist
+launchctl bootout gui/$(id -u)/arthack.babysitter.helptailing.watch   # no watchdog — never pages
+rm ~/Library/LaunchAgents/arthack.babysitter.helptailing.watch.plist
 rm -rf ~/.local/state/babysitters   # sitter seen-state, heartbeat, logs, + follow-up prompts
 # Stop loading the plugin: remove `--plugin-dir ~/code/keeper` from
 # whatever entrypoint launches `claude` (e.g. the arthack launcher).
@@ -2394,10 +2425,16 @@ the package.json `bin`) that fans into every subcommand — `board`,
 ship as one binary instead of N standalone scripts.
 
 The babysitters live under `babysitters/` — a self-contained Claude-Code plugin
-home with one sitter per concern (today: `performance` and `builds`), each
-owning a `babysitters/<slug>/` code dir, a
-`babysitters/agents/<slug>.md` triage agent, and a private state tree under
-`~/.local/state/babysitters/<slug>/`. The performance sitter's scanner
+home with one sitter per concern (today: `performance`, `builds`, and
+`helptailing`), each owning a `babysitters/<slug>/` code dir, a
+`babysitters/agents/<slug>.md` triage agent (or, for `helptailing`, producer
+DOCUMENTATION — it spawns no agent), and a private state tree under
+`~/.local/state/babysitters/<slug>/`. The `helptailing` sitter is a read-only
+TREND sitter that counts `--agent-help` Bash invocations in `keeper.db`, compares
+a frozen pre-`2026-06-11` baseline against the current epoch, and writes
+`trend-digest` + `rate-spike` followups DIRECTLY (no agent spawn, no paging — the
+human works the corpus via `/babysit-triage helptailing`); it runs hourly and
+ships no watchdog (a dead-man pager is pointless for a sitter that never pages). The performance sitter's scanner
 (`babysitters/performance/watch.ts`, its OWN binary — NOT a `keeper`
 subcommand) is an out-of-process read-only scanner: run every 5 minutes under
 launchd, it opens `keeper.db` read-only, deterministically detects the recurring

@@ -11,6 +11,12 @@ this contract, not to each other.
 This is a CONTRACT doc, not running code. No module ships from this file. Tasks
 `.2`/`.3`/`.4` consume these schemas verbatim.
 
+Multiple sitters now implement this contract: `performance` (pages on
+genuinely-new findings via a headless agent), `builds` (silently collects a
+corpus via a headless agent — no paging), and `helptailing` (a TREND sitter whose
+scanner writes its own followups DIRECTLY — no agent spawn, no paging). The
+followup/`key`/ledger schema below is identical across all three.
+
 ## What the ledger tracks (and the denominator)
 
 A babysitter pages the human on genuinely-new findings and writes ONE
