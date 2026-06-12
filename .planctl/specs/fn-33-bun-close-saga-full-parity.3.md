@@ -29,5 +29,5 @@ PLANCTL_BIN=dist/planctl-bun against the three test files green (--run-slow for 
 - [ ] Both trailer techniques ported; 4-way round-trip proven; fail-closed verified
 
 ## Done summary
-
+Ported the git-reading quartet (commit_lookup, reconcile, find-task-commit, worker resume) to planctl-bun and wired them into the CLI. Both trailer techniques + the 4-way round-trip + fail-closed are unit-covered; the three conformance files are green against the compiled binary, with two subprocess-incompatible monkeypatch tests marked python_only.
 ## Evidence
