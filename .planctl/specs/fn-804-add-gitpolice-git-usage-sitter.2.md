@@ -85,5 +85,5 @@ seen.json.
 - [ ] bun test, lint, and the build-pin fence pass with gitpolice in scope
 
 ## Done summary
-
+Built gitpolice/watch.ts: a read-only census of raw git + keeper commit-work usage (exactly-once via an event-id cursor with append-then-advance ordering), write-class projection snapshots, raw-git-write + orphan-files findings through the shared seen-state/followup path, and the schema-skew gate. Wired lint/tsconfig/build-pin scope, moved the membership-pin test to test/schema-pin.test.ts, and shipped the plist + agents/gitpolice.md + README/CLAUDE/FINDINGS-LEDGER doc updates naming both sitters.
 ## Evidence
