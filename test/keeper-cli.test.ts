@@ -57,6 +57,9 @@ function makeHarness(): Harness {
       "commit-work": mkHandler("commit-work"),
       "session-state": mkHandler("session-state"),
       "show-session-files": mkHandler("show-session-files"),
+      "search-history": mkHandler("search-history"),
+      "find-file-history": mkHandler("find-file-history"),
+      "show-session-events": mkHandler("show-session-events"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),
@@ -178,6 +181,9 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("commit-work")).toBe(true);
     expect(isSubcommand("session-state")).toBe(true);
     expect(isSubcommand("show-session-files")).toBe(true);
+    expect(isSubcommand("search-history")).toBe(true);
+    expect(isSubcommand("find-file-history")).toBe(true);
+    expect(isSubcommand("show-session-events")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
   });

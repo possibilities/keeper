@@ -35,6 +35,9 @@ export const SUBCOMMANDS = [
   "commit-work",
   "session-state",
   "show-session-files",
+  "search-history",
+  "find-file-history",
+  "show-session-events",
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -55,6 +58,9 @@ Subcommands:
   commit-work         Stage session-attributed files, lint, commit, push
   session-state       Current session git context + on-hook files (JSON)
   show-session-files  Session's on-hook dirty files grouped by repo (JSON)
+  search-history      Search UserPromptSubmit history by LIKE term (JSON)
+  find-file-history   List file attributions matching a path fragment (JSON)
+  show-session-events Prompt/tool-call spine for one session (JSON)
 
 Flags:
   --help, -h     Show this help
@@ -150,6 +156,12 @@ export async function main(): Promise<void> {
       (await import("./session-state")).main(argv),
     "show-session-files": async (argv) =>
       (await import("./show-session-files")).main(argv),
+    "search-history": async (argv) =>
+      (await import("./search-history")).main(argv),
+    "find-file-history": async (argv) =>
+      (await import("./find-file-history")).main(argv),
+    "show-session-events": async (argv) =>
+      (await import("./show-session-events")).main(argv),
   };
 
   await dispatch(Bun.argv.slice(2), {
