@@ -216,25 +216,24 @@ export interface Event {
   planctl_files: string | null;
   /**
    * Terminal-multiplexer backend tag the hook captured via pure `process.env`
-   * reads. `'zellij'` when the `ZELLIJ` sentinel is set, `'tmux'` when `TMUX` is
-   * set (zellij wins when both — a Claude nested in a zellij pane under tmux);
-   * NULL outside any known multiplexer. Paired with
-   * {@link Event.backend_exec_session_id} / {@link Event.backend_exec_pane_id} —
-   * type + pane id stamp together; under tmux the session may be NULL on its own
-   * (human-created sessions carry no `KEEPER_TMUX_SESSION`).
+   * reads. `'tmux'` when the `TMUX` sentinel is set; NULL outside tmux. Paired
+   * with {@link Event.backend_exec_session_id} / {@link Event.backend_exec_pane_id} —
+   * type + pane id stamp together; the session may be NULL on its own
+   * (human-created sessions carry no `KEEPER_TMUX_SESSION`). Historical rows
+   * may carry other recorded tags verbatim — the fold copies the string as-is.
    */
   backend_exec_type: string | null;
   /**
-   * Backend session name. Zellij: the `ZELLIJ_SESSION_NAME` env value. Tmux: the
-   * `KEEPER_TMUX_SESSION` value keeper injects via `-e` on managed launches —
-   * NULL for a Claude in a human-created tmux session until the snapshot poller
-   * fills it. NULL when {@link Event.backend_exec_type} is NULL. Folded into
-   * `jobs.backend_exec_session_id` latest-non-NULL-wins via COALESCE.
+   * Backend session name: the `KEEPER_TMUX_SESSION` value keeper injects via
+   * `-e` on managed launches — NULL for a Claude in a human-created tmux session
+   * until the snapshot poller fills it. NULL when {@link Event.backend_exec_type}
+   * is NULL. Folded into `jobs.backend_exec_session_id` latest-non-NULL-wins via
+   * COALESCE.
    */
   backend_exec_session_id: string | null;
   /**
-   * Backend pane id (raw `ZELLIJ_PANE_ID` / `TMUX_PANE` env value; TEXT so the
-   * daemon's `list-panes` id matches via normalized equality). NULL when
+   * Backend pane id (raw `TMUX_PANE` env value; TEXT so the daemon's
+   * `list-panes` id matches via normalized equality). NULL when
    * {@link Event.backend_exec_type} is NULL. Folded into
    * `jobs.backend_exec_pane_id` latest-non-NULL-wins via COALESCE.
    */
@@ -392,19 +391,19 @@ export interface Job {
   git_orphan_count: number;
   /**
    * Backend tag projected from the latest event whose hook stamped it
-   * (`'zellij'` / `'tmux'`). Latest-non-NULL-wins via COALESCE. Paired with
+   * (`'tmux'`; historical rows may carry other recorded tags). Latest-non-NULL-wins via COALESCE. Paired with
    * {@link Job.backend_exec_session_id} / {@link Job.backend_exec_pane_id}.
    * Drives the per-row backend choice for the `keeper jobs` `v` focus key.
    * Surfaced via the shared board-render, never computed in the renderer.
    */
   backend_exec_type: string | null;
   /**
-   * Backend session name (`ZELLIJ_SESSION_NAME` / `KEEPER_TMUX_SESSION`). NULL
-   * paired with {@link Job.backend_exec_type}.
+   * Backend session name (`KEEPER_TMUX_SESSION`). NULL paired with
+   * {@link Job.backend_exec_type}.
    */
   backend_exec_session_id: string | null;
   /**
-   * Backend pane id (raw `ZELLIJ_PANE_ID` / `TMUX_PANE` TEXT). NULL paired with
+   * Backend pane id (raw `TMUX_PANE` TEXT). NULL paired with
    * {@link Job.backend_exec_type}. Surfaced as a `p<pane>` segment in the
    * `keeper jobs` coord pill.
    */

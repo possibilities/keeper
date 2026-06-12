@@ -55,14 +55,12 @@ three terminal-multiplexer backend-exec coordinates
 `events.backend_exec_pane_id`) captured by the hook on EVERY event as pure
 synchronous `process.env` reads (no fork, no fs, no PPID-walk), folded onto
 `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
-`COALESCE`. Two backends are recognized: zellij — checked FIRST via the
-`ZELLIJ` sentinel (`ZELLIJ_SESSION_NAME` / `ZELLIJ_PANE_ID`); and tmux —
-checked SECOND via `TMUX` (`KEEPER_TMUX_SESSION` for the session name, which a
-keeper-managed launch injects via `-e`, and `TMUX_PANE` for the pane). A
-human-created tmux session carries no `KEEPER_TMUX_SESSION`, so its session
-name lands via the restore-worker's pane-snapshot poller (epic fn-789). The
-generic `backend_exec_*` naming keeps a further backend slotting in without a
-schema change. Consumers can find
+`COALESCE`. The backend is tmux, read via `TMUX` (`KEEPER_TMUX_SESSION` for the
+session name, which a keeper-managed launch injects via `-e`, and `TMUX_PANE`
+for the pane). A human-created tmux session carries no `KEEPER_TMUX_SESSION`, so
+its session name lands via the restore-worker's pane-snapshot poller (epic
+fn-789). The generic `backend_exec_*` naming keeps a further backend slotting in
+without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
 lifecycle, every session's profile attribution, every planctl-CLI
 mutation, AND the terminal location each live session lives in cheaply
@@ -318,9 +316,9 @@ Keeper has no `install` verb. Wire it up manually:
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
    - `exec_backend` — the terminal multiplexer keeperd's server-side autopilot
-     reconciler dispatches workers into: `zellij` (default) or `tmux`. An
-     unknown value warns and falls back to `zellij`. The managed-session name
-     is hardcoded (`autopilot`), NOT configurable; each dispatch opens a new
+     reconciler dispatches workers into. `tmux` is the sole backend and the
+     default; any other value warns and falls back to `tmux`. The managed-session
+     name is hardcoded (`autopilot`), NOT configurable; each dispatch opens a new
      window inside that shared background session. keeper never closes a window
      — windows stay open for inspection.
    - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
@@ -335,7 +333,7 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/code
      - ~/src
    claude_projects_root: ~/.claude/projects
-   exec_backend: zellij
+   exec_backend: tmux
    max_concurrent_jobs: 3
    YAML
    ```
@@ -346,7 +344,7 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `exec_backend: zellij`). Unknown config keys are silently ignored.
+   `exec_backend: tmux`). Unknown config keys are silently ignored.
 
 4. **Load the keeper plugin via the arthack launcher** (`--plugin-dir`). The
    repo root carries `.claude-plugin/plugin.json` (canonical manifest) and
@@ -489,7 +487,7 @@ Keeper has no `install` verb. Wire it up manually:
    writes the user's real state dir — build the sandboxed env via the shared
    `sandboxEnv(...)` in `test/helpers/sandbox-env.ts` rather than restating the
    path list at each spawn site (it sets the state paths LAST so a caller can't
-   strand one, and optionally adds the sixth `KEEPER_ZELLIJ_EVENTS_DIR`). The
+   strand one). The
    suite carries TWO complementary test helpers (fn-769): `sandboxEnv` isolates
    the state paths for any test that launches a real subprocess (hook / daemon /
    CLI), while the template-DB helper in `test/helpers/template-db.ts`
@@ -1639,11 +1637,8 @@ work.
 As of schema v48 (fn-668), each Claude session's terminal-multiplexer
 backend-exec coordinates are materialized as first-class columns on the
 `events` row and (folded onto) the `jobs` projection. The hook reads pure
-synchronous `process.env` values on EVERY event, recognizing two backends:
-zellij (checked FIRST via the `ZELLIJ` sentinel) → `backend_exec_type='zellij'`,
-`ZELLIJ_SESSION_NAME` → `backend_exec_session_id`, `ZELLIJ_PANE_ID` →
-`backend_exec_pane_id`; and tmux (checked SECOND via `TMUX`) →
-`backend_exec_type='tmux'`, `KEEPER_TMUX_SESSION` → `backend_exec_session_id`
+synchronous `process.env` values on EVERY event for the tmux backend:
+`TMUX` → `backend_exec_type='tmux'`, `KEEPER_TMUX_SESSION` → `backend_exec_session_id`
 (present only on keeper-managed launches, injected via `-e`; a human-created
 tmux session gets it filled later by the restore-worker pane poller, epic
 fn-789), `TMUX_PANE` → `backend_exec_pane_id` (raw; no fork, no fs, no
@@ -1847,7 +1842,7 @@ keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `59`
 occupancy fact).
 As of schema v50 (fn-678), the new `pending_dispatches` projection table
 (keyed by `(verb, id)`) is the durable launch-window occupancy signal that
-replaced the fn-674 live zellij tab-name probe. A `Dispatched` synthetic
+replaced the fn-674 live tab-name probe. A `Dispatched` synthetic
 event UPSERTs a row (`dir`, `dispatched_at`, `last_event_id`); a
 `SessionStart` fold DELETEs by the same key (discharge-on-bind); a
 `DispatchExpired` synthetic event DELETEs the key when the TTL sweep fires.
@@ -1879,10 +1874,11 @@ ceiling is `"ok"`; but a ceiling hit (60s) with `launch.ok===true` is
 `DispatchFailed` is minted, the `pending_dispatches` row is KEPT, and the
 120s TTL sweep (`PENDING_DISPATCH_TTL_MS > ceilingMs`, an invariant pinned by
 a test) emits `DispatchExpired` only if the bind truly never lands. On
-`set-paused` (boot-pause included via the same relay), the worker reaps stale
-launch-window zellij surfaces by intersecting `list-panes -a -j` with OPEN
-`pending_dispatches` rows (`ExecBackend.reapSurfaces`) — a discharged row =
-live worker, never reaped — and the reap never throws (no-self-heal).
+`set-paused` (boot-pause included via the same relay), the worker reaped stale
+launch-window surfaces by intersecting `list-panes -a -j` with OPEN
+`pending_dispatches` rows — a discharged row = live worker, never reaped — and
+the reap never threw (no-self-heal). That reap (`ExecBackend.reapSurfaces`) was
+deleted in epic fn-789: keeper never closes a window.
 As of schema v42 (fn-661), the new `dispatch_failures` projection table
 (keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
 reconciler uses to dedup against `jobs`) carries the sticky failure record
@@ -2137,8 +2133,8 @@ the daemon). **The cooldown covers all verbs, dispatch-side, in-memory.**
 The row discharges when `SessionStart` folds (reducer DELETE) or via a producer-side
 TTL sweep on the heartbeat (`PENDING_DISPATCH_TTL_MS`, 120s,
 `DispatchExpired`) — so both the launch → SessionStart blind window and the
-`dispatch-pending` occupancy self-clear without any live zellij probe (the
-`verb::id` tab name is a cosmetic label only). SAFETY SEAM: the fn-721
+`dispatch-pending` occupancy self-clear without any live multiplexer probe (the
+`verb::id` window name is a cosmetic label only). SAFETY SEAM: the fn-721
 occupant closes the cross-cycle double-dispatch window; `confirmRunning`'s
 serial wait still covers the intra-cycle race and stays in place. The reconciler boots PAUSED (the in-memory
 worker gate is seeded `true` from `workerData.paused`, and the daemon's
@@ -2154,17 +2150,12 @@ on partial failure). The terminal-surface mechanics live behind the
 `ensureLaunched`; there is no `reapSurfaces` (keeper never closes a window).
 `ensureLaunched` (session-agnostic) get-or-creates the
 target session with its own per-call mint and launches an
-unnamed window — `restore-agents.ts` is the consumer. The backend is chosen
-by the `exec_backend` config key (`zellij` default / `tmux`) via
-`resolveExecBackend`; each reconciler dispatch opens as a new window in the
-hardcoded managed session (`autopilot`). The zellij backend FRESH-MINTS the
-session on every keeper-initiated `attach -b --forget` (fn-675) — `--forget`
-deletes any saved/serialized session before connecting, so a stale/EXITED
-corpse is rebuilt from scratch rather than resurrected from a degraded
-`session-layout.kdl` cache (the bar-less-mint failure mode that motivated
-the change). `--forget` is a harmless no-op when no saved session exists,
-and `ensureSession` short-circuits before the attach when the target is
-already LIVE — so it never runs against a live session. The confirm step
+unnamed window — `restore-agents.ts` is the consumer. tmux is the sole backend,
+resolved via `resolveExecBackend`; each reconciler dispatch opens as a new
+window in the hardcoded managed session (`autopilot`). Each op runs a cheap
+per-call `has-session` probe and mints via `new-session -d` only when the
+session is absent, so a stale/EXITED corpse is rebuilt rather than resurrected;
+a probe short-circuits before any mint when the target is already LIVE. The confirm step
 is now three-way (`ConfirmOutcome`, fn-724): a hard launch failure
 (`launch.ok===false`) posts a `DispatchFailedMessage` to main — which, again
 the sole writer, turns it into a synthetic `DispatchFailed` events row, pumps
@@ -2206,7 +2197,7 @@ primitive, and on every change reads the `jobs` + `epics` projections
 through the same `runQuery` read seam the autopilot worker uses. It builds
 a stable `{captured_at, sessions}` TIER of the live (`working` / `stopped`)
 jobs grouped by `backend_exec_session_id` — each bucket tagged with the
-`backend` it ran under (`zellij` / `tmux`, schema v3) — and rewrites
+`backend` it ran under (`tmux`, schema v3) — and rewrites
 `~/.local/state/keeper/restore.json` via `atomicWriteFile` as a **two-tier
 descriptor** — `{schema_version, last_session, current}`, the browser
 "restore previous session" model (Chrome "Current Session" / "Last
@@ -2245,10 +2236,9 @@ retries); only an unhandled throw out of the watch loop escalates to
 sole reader; it resolves the restore source `last_session ‖ current ‖`
 (v1) legacy `sessions`, and its `--apply` mode relaunches the surviving
 agents via the exact `claude --resume` shape `scripts/resume.ts` emits,
-deduplicated against jobs still live in the projection. Each bucket routes
-through the exec backend its `backend` tag names (a v2/legacy bucket without
-a tag reads as zellij; an unknown backend is skipped with a stderr note,
-never launched into the wrong multiplexer). The schema bump is the
+deduplicated against jobs still live in the projection. Each bucket relaunches through the sole tmux backend; any legacy `backend` tag
+(or an absent v2 tag) no longer selects a different multiplexer — every tag
+resolves to tmux. The schema bump is the
 load-bearing coupling: the moment the worker writes a new
 `RESTORE_SCHEMA_VERSION`, the OLD reader treats it as "future" and refuses,
 so the bumped writer and reader ship in the same commit.
