@@ -144,9 +144,11 @@ export function buildTputArgs(cap: string): string[] {
 }
 
 /**
- * `new-session -d -s dash -c <dir> -x <W> -y <H> -- <argv...>`. Detached, the
- * board pane's `zsh -ic` triple after `--`, explicitly sized so the detached
- * session does not boot at tmux's 80x24 default.
+ * `new-session -d -s dash -c <dir> -x <W> -y <H> -P -F '#{pane_id}' --
+ * <argv...>`. Detached, the board pane's `zsh -ic` triple after `--`,
+ * explicitly sized so the detached session does not boot at tmux's 80x24
+ * default. `-P -F '#{pane_id}'` prints the board pane's id so it can be
+ * re-focused after the splits.
  */
 export function buildDashNewSessionArgs(
   width: number,
@@ -164,19 +166,25 @@ export function buildDashNewSessionArgs(
     String(width),
     "-y",
     String(height),
+    "-P",
+    "-F",
+    "#{pane_id}",
     "--",
     ...dashPaneArgv("board"),
   ];
 }
 
-/** `set-option -w -t =dash main-pane-width '50%'`. */
+/** `set-option -w -t =dash: main-pane-width '50%'`. Window/pane targets need
+ *  the trailing `:` (exact session, current window) — a bare `=dash` resolves
+ *  only as a SESSION target; window-target commands reject it ("no such
+ *  window"). */
 export function buildSetMainPaneWidthArgs(): string[] {
   return [
     "tmux",
     "set-option",
     "-w",
     "-t",
-    `=${DASH_SESSION}`,
+    `=${DASH_SESSION}:`,
     "main-pane-width",
     "50%",
   ];
@@ -194,7 +202,7 @@ export function buildDashSplitArgs(sub: string): string[] {
     "split-window",
     "-d",
     "-t",
-    `=${DASH_SESSION}`,
+    `=${DASH_SESSION}:`,
     "-c",
     KEEPER_DIR,
     "-P",
@@ -208,7 +216,7 @@ export function buildDashSplitArgs(sub: string): string[] {
 /** `select-layout -t =dash main-vertical` — re-run after EVERY split so the
  *  next split always has room ("no space for new pane" otherwise). */
 export function buildSelectLayoutArgs(): string[] {
-  return ["tmux", "select-layout", "-t", `=${DASH_SESSION}`, "main-vertical"];
+  return ["tmux", "select-layout", "-t", `=${DASH_SESSION}:`, "main-vertical"];
 }
 
 /** `select-pane -t <paneId>` — focus the board pane by its captured id. */
@@ -522,6 +530,9 @@ export async function main(
 
     rebuildDash(spawn);
     ensureWorkSessions(spawn);
+    process.stdout.write(
+      `keeper setup-tmux: '${DASH_SESSION}' rebuilt, work sessions ensured — attach with: tmux attach -t ${DASH_SESSION}\n`,
+    );
   } catch (e) {
     if (e instanceof TmuxError) {
       process.stderr.write(`${e.message}\n`);

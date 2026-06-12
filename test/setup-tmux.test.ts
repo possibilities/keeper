@@ -90,7 +90,7 @@ describe("kill / has-session / list-sessions builders", () => {
 });
 
 describe("dash build plan", () => {
-  test("new-session is detached, sized via -x/-y, cwd set, board triple after --", () => {
+  test("new-session is detached, sized via -x/-y, cwd set, prints pane id, board triple after --", () => {
     expect(buildDashNewSessionArgs(200, 50)).toEqual([
       "tmux",
       "new-session",
@@ -103,6 +103,9 @@ describe("dash build plan", () => {
       "200",
       "-y",
       "50",
+      "-P",
+      "-F",
+      "#{pane_id}",
       "--",
       "zsh",
       "-ic",
@@ -110,13 +113,13 @@ describe("dash build plan", () => {
     ]);
   });
 
-  test("set-option main-pane-width 50% on =dash window", () => {
+  test("set-option main-pane-width 50% on =dash: window target", () => {
     expect(buildSetMainPaneWidthArgs()).toEqual([
       "tmux",
       "set-option",
       "-w",
       "-t",
-      "=dash",
+      "=dash:",
       "main-pane-width",
       "50%",
     ]);
@@ -128,7 +131,7 @@ describe("dash build plan", () => {
       "split-window",
       "-d",
       "-t",
-      "=dash",
+      "=dash:",
       "-c",
       KEEPER_DIR,
       "-P",
@@ -141,14 +144,27 @@ describe("dash build plan", () => {
     ]);
   });
 
-  test("select-layout is main-vertical on =dash", () => {
+  test("select-layout is main-vertical on =dash:", () => {
     expect(buildSelectLayoutArgs()).toEqual([
       "tmux",
       "select-layout",
       "-t",
-      "=dash",
+      "=dash:",
       "main-vertical",
     ]);
+  });
+
+  test("window/pane-target builders carry the trailing-colon target form", () => {
+    // A bare `=dash` resolves only as a SESSION target; these three commands
+    // take window/pane targets and need `=dash:` (exact session, current
+    // window) to resolve.
+    for (const argv of [
+      buildSetMainPaneWidthArgs(),
+      buildDashSplitArgs("jobs"),
+      buildSelectLayoutArgs(),
+    ]) {
+      expect(argv[argv.indexOf("-t") + 1]).toBe("=dash:");
+    }
   });
 
   test("select-pane targets a captured pane id (not positional)", () => {
