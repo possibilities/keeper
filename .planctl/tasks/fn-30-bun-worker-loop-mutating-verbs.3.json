@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T09:13:14.626060Z",
+  "depends_on": [
+    "fn-30-bun-worker-loop-mutating-verbs.2"
+  ],
+  "epic": "fn-30-bun-worker-loop-mutating-verbs",
+  "id": "fn-30-bun-worker-loop-mutating-verbs.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "Mutating invocation commit emit seam",
+  "updated_at": "2026-06-12T09:13:14.626060Z"
+}
