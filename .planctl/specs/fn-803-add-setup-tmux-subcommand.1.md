@@ -121,5 +121,5 @@ epic's Quick commands, run both inside and outside tmux.
 - [ ] Fast tier green; `bun run test:full` green (incl. updated keeper-cli dispatch test)
 
 ## Done summary
-
+Added 'keeper setup-tmux' (cli/setup-tmux.ts): rebuilds the dash session and ensures the autopilot/background/foreground work sessions via direct Bun.spawnSync, with a --kill-sessions busy-pane confirmation gate. Registered in the dispatcher; documented in README + docs/exec-backend.md.
 ## Evidence
