@@ -35,5 +35,5 @@ Over-marking erodes the conformance gate's coverage; under-marking blocks the gr
 - [ ] Default fast gate green throughout
 
 ## Done summary
-
+Completed the dual-engine audit: registered the python_only marker (skip-visible under conformance), made fixed_clock set PLANCTL_NOW (no now_iso monkeypatch remains), reconciled phantom markers, and converted every discovery-driving CONFIG_PATH site to the engine-agnostic set_roots seam — classifying the residual fault-injection/HOME-coupled tests as python_only. Default fast gate and full PLANCTL_BIN conformance suite both green.
 ## Evidence
