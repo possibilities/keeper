@@ -27,5 +27,5 @@ Fast gate + skill-consistency tests green; `bun run lint`/typecheck green; a doc
 - [ ] README + CLAUDE.md inverted, symlink intact, conformance rows truthful
 
 ## Done summary
-
+Deleted the four unreferenced scripts/ Python one-offs + pycache and rewrote the dangling test comment present-tense; inverted README + CLAUDE.md so the bun binary is the production runtime/install and the Python package is the dormant reference + rollback target, with conformance rows re-documented and a promote row added.
 ## Evidence
