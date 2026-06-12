@@ -25,5 +25,5 @@ With ~27 verbs meeting five test modules, expect a real long tail; the fix lives
 - [ ] Docs revised in place, mirrors in sync, gate rows truthful
 
 ## Done summary
-
+Verified all gates green: bun lint/typecheck/test, new modules vs Python, scoped gate vs compiled binary (serial + -n + --run-slow), Python fast gate, full Python conformance. Docs already in target state from prior commit — authority statement, gate rows (both new test modules), and README scope phrases truthful, present-tense, mirrors in sync via AGENTS.md symlink. No source changes required.
 ## Evidence
