@@ -550,6 +550,16 @@ export function attachLiveShellPaint(
     height: Math.max(0, renderer.height - 1),
     viewportCulling: true,
   });
+  // No scrollbar in any keeper TUI. The bar's `visible` SETTER pins
+  // `_manualVisibility = true`, permanently disabling auto show-on-overflow
+  // for the renderer's lifetime (survives resize). This is the ONLY sticky
+  // path: `scrollbarOptions: { visible: false }` at construction does NOT
+  // stick (the base Renderable ctor writes `_visible` directly, bypassing the
+  // setter, so the bar reappears on overflow), and the post-construction
+  // `scrollbarOptions` setter has the same bypass. Hiding the vertical bar
+  // reclaims its column, so `sb.viewport.width` can grow by 1 on overflow.
+  sb.verticalScrollBar.visible = false;
+  sb.horizontalScrollBar.visible = false;
   // fn-646.4: derive the shim runtime bag once — pulled out of the
   // `LiveShellPaintRuntime` (which carries the rest of the scene's
   // ctors) so the body assignment in `repaint()` reads symmetrically
