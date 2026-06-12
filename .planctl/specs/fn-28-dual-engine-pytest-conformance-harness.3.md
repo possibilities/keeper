@@ -31,5 +31,5 @@ Green default gate after each file batch is the loop invariant. Spot-check a few
 - [ ] Default `uv run pytest tests/` green and as fast as before the sweep
 
 ## Done summary
-
+Swept all inline CliRunner callsites across the test suite onto the unified run_cli invoker, with a guard test enforcing no direct CliRunner instantiation outside the sanctioned allowlist. Default fast gate green (592 passed, 195 skipped).
 ## Evidence

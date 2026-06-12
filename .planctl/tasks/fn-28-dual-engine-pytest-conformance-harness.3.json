@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Route all CliRunner callsites through seam",
-  "updated_at": "2026-06-12T04:00:56.659159Z"
+  "updated_at": "2026-06-12T04:43:20.429019Z",
+  "worker_done_at": "2026-06-12T04:43:20.429019Z"
 }
