@@ -97,5 +97,5 @@ landing (reducer path).
 - [ ] `bun run test:full` passes; no SCHEMA_VERSION bump; no new throw paths inside the fold
 
 ## Done summary
-
+Pre/PostToolUse fold now clears the api-error pair (new third hot-path clear) and un-stops both the api-error and input-request stopped rows back to working (state + active_since, gated on literal 'stopped'), so the board never shows a dead/failed worker that resumed. README clearing-contract consolidated.
 ## Evidence
