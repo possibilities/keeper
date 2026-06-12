@@ -119,5 +119,5 @@ assertions, never Bun.sleep.
 - [ ] README count, reaper paragraph, "never closes a window" revision, and WAL wording landed; `bun run test:full` passes
 
 ## Done summary
-
+Added the reaper-worker (keeperd's twelfth Worker): a pure external actuator that kills the tmux windows of autopilot-dispatched work/close jobs verifiably complete (managed session + stopped >60s + completed verdict + non-null pane/pid), with a fresh pre-kill predicate re-check, an in-memory cooldown, data_version + periodic-tick single-flight drive, no DB writes, and registration at all sites incl. the ALL_WORKERS pin. README worker count, never-closes-a-window passages, and the WAL aside revised.
 ## Evidence

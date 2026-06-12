@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Add reaper worker and daemon wiring",
-  "updated_at": "2026-06-12T02:13:28.851932Z"
+  "updated_at": "2026-06-12T03:12:50.248404Z",
+  "worker_done_at": "2026-06-12T03:12:50.248404Z"
 }
