@@ -23,8 +23,10 @@
 import { expect, test } from "bun:test";
 import {
   buildTmuxHasSessionArgs,
+  buildTmuxListPanesArgs,
   buildTmuxNewSessionArgs,
   buildTmuxNewWindowArgs,
+  buildTmuxRenameWindowArgs,
   buildTmuxSelectPaneArgs,
   buildTmuxSelectWindowArgs,
   createTmuxBackend,
@@ -198,6 +200,37 @@ test("buildTmuxSelectWindowArgs / buildTmuxSelectPaneArgs: id-based targets only
     "select-pane",
     "-t",
     "%7",
+  ]);
+});
+
+test("buildTmuxListPanesArgs: -a sweep, tab-delimited format with window_name last", () => {
+  expect(buildTmuxListPanesArgs()).toEqual([
+    "tmux",
+    "list-panes",
+    "-a",
+    "-F",
+    "#{pane_id}\t#{window_id}\t#{window_name}",
+  ]);
+});
+
+test("buildTmuxRenameWindowArgs: targets @N window id and carries `--` before the name", () => {
+  expect(buildTmuxRenameWindowArgs("@3", "fn-1-x.2")).toEqual([
+    "tmux",
+    "rename-window",
+    "-t",
+    "@3",
+    "--",
+    "fn-1-x.2",
+  ]);
+  // The `--` is load-bearing: a name starting with `-` must not be read as an
+  // option by tmux's own parser.
+  expect(buildTmuxRenameWindowArgs("@9", "-rf weird")).toEqual([
+    "tmux",
+    "rename-window",
+    "-t",
+    "@9",
+    "--",
+    "-rf weird",
   ]);
 });
 
@@ -491,6 +524,133 @@ test("createTmuxBackend.ensureLaunched: absent per-call session mints then new-w
   const nameIdx = win?.indexOf("-n") ?? -1;
   expect(nameIdx).toBeGreaterThan(-1);
   expect(win?.[nameIdx + 1]).toBe("work::fn-9-y.2");
+});
+
+// ---------------------------------------------------------------------------
+// createTmuxBackend.listPanes — server-wide sweep, tab-safe parse, null degrade
+// ---------------------------------------------------------------------------
+
+test("createTmuxBackend.listPanes: parses (paneId, windowId, windowName) from one -a sweep", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:list-panes": {
+        stdout: "%1\t@1\twork::fn-1-x.2\n%2\t@2\tplain shell\n",
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.listPanes();
+  expect(calls[0]).toEqual(buildTmuxListPanesArgs());
+  expect(got).toEqual([
+    { paneId: "%1", windowId: "@1", windowName: "work::fn-1-x.2" },
+    { paneId: "%2", windowId: "@2", windowName: "plain shell" },
+  ]);
+});
+
+test("createTmuxBackend.listPanes: a tab inside a window name stays in windowName (2-split limit)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:list-panes": {
+        // window name itself contains a tab, a colon, and unicode.
+        stdout: "%7\t@7\tweird:\tname \u00e9\n",
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.listPanes();
+  expect(got).toEqual([
+    { paneId: "%7", windowId: "@7", windowName: "weird:\tname \u00e9" },
+  ]);
+});
+
+test("createTmuxBackend.listPanes: drops malformed lines (missing tabs / empty ids), keeps the rest", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:list-panes": {
+        // line 1 has no tab; line 2 has one tab only; line 3 has empty pane id;
+        // line 4 is well-formed (and a name may be empty — that is valid).
+        stdout: "garbage\n%2\tonlyone\n\t@3\tname\n%4\t@4\t\n",
+        exitCode: 0,
+      },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.listPanes();
+  expect(got).toEqual([{ paneId: "%4", windowId: "@4", windowName: "" }]);
+});
+
+test("createTmuxBackend.listPanes: non-zero exit (no server) → null", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    { "tmux:list-panes": { stderr: "no server running", exitCode: 1 } },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  expect(await backend.listPanes()).toBeNull();
+});
+
+test("createTmuxBackend.listPanes: ENOENT (binary missing) → null, never throws", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  expect(await backend.listPanes()).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// createTmuxBackend.renameWindow — @N target, `--` guard, TOCTOU no-op, ENOENT
+// ---------------------------------------------------------------------------
+
+test("createTmuxBackend.renameWindow: exit 0 → { ok: true }, argv targets @N and carries `--`", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub({ "tmux:rename-window": { exitCode: 0 } }, calls);
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.renameWindow("@5", "fn-2-y.1");
+  expect(got).toEqual({ ok: true });
+  expect(calls[0]).toEqual(buildTmuxRenameWindowArgs("@5", "fn-2-y.1"));
+});
+
+test("createTmuxBackend.renameWindow: TOCTOU 'can't find window' non-zero → { ok: false }, silent (no noteLine)", async () => {
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:rename-window": {
+        stderr: "can't find window @5",
+        exitCode: 1,
+      },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({
+    noteLine: (l) => notes.push(l),
+    spawn,
+  });
+  const got = await backend.renameWindow("@5", "gone");
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("exited 1");
+    expect(got.error).toContain("can't find window");
+  }
+  // A self-healing race must not spam the sidecar.
+  expect(notes).toHaveLength(0);
+});
+
+test("createTmuxBackend.renameWindow: ENOENT (binary missing) → { ok: false }, never throws", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.renameWindow("@1", "x");
+  expect(got.ok).toBe(false);
 });
 
 test("createTmuxBackend: omitting session is allowed (session-agnostic-only consumer)", async () => {

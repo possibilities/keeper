@@ -51,6 +51,8 @@ factory:
 | `launch(argv, name, cwd)` | session-bound lifecycle | autopilot reconciler | baked in at construction |
 | `focusPane(session, paneId)` | session-agnostic | `keeper jobs` `v` key | per call |
 | `ensureLaunched(session, argv, cwd, name?)` | session-agnostic | `restore-agents.ts` replay | per call |
+| `listPanes()` | session-agnostic | renamer worker | per call (`-a`, whole server) |
+| `renameWindow(windowId, name)` | session-agnostic | renamer worker | per call |
 
 **Session-bound** ops drive the reconciler against the ONE managed
 session passed at construction. There is no ensure memo — each op runs a
@@ -113,6 +115,25 @@ Session-agnostic get-or-create + launch. Get-or-creates the target
 label). Shares NO state with the managed session; the mint is per-call.
 `restore-agents.ts` is the consumer, routing every restore bucket through
 this one backend regardless of the legacy `backend` tag the bucket carries.
+
+### `listPanes() → PaneInfo[] | null`
+
+Session-agnostic. One `tmux list-panes -a` sweep across every session on the
+server, parsed into `{ paneId, windowId, windowName }` rows. The format is
+tab-delimited with `window_name` **last** and the parse splits on only the
+first two tabs, so a tab inside an arbitrary window name cannot corrupt the
+pane/window fields; malformed lines are dropped. A degraded or missing tmux
+(non-zero exit / ENOENT) degrades to `null` — the renamer worker skips that
+cycle. The window-naming worker is the consumer.
+
+### `renameWindow(windowId, name) → LaunchResult`
+
+Session-agnostic. Renames window `windowId` (the server-global `@N` handle —
+never name-based) to `name` via `rename-window -t <id> -- <name>`. The `--` is
+load-bearing: window names are arbitrary user text and may start with `-`,
+which tmux's own parser would otherwise read as an option. A nonzero "can't
+find window" exit is an expected TOCTOU no-op (the window closed between sweep
+and rename) returned as `{ ok: false }` with no `noteLine` noise.
 
 ## How dispatch correlates back
 
@@ -187,6 +208,8 @@ in isolation and the runtime composes them:
 | `buildTmuxNewWindowArgs(session, dir, argv, name?)` | `new-window` argv (chained `set-option -p remain-on-exit on`, `-e KEEPER_TMUX_SESSION` re-injection, optional `-n <name>` label) |
 | `buildTmuxSelectWindowArgs(paneId)` | `select-window` by pane id — focus |
 | `buildTmuxSelectPaneArgs(paneId)` | `select-pane` by pane id — focus |
+| `buildTmuxListPanesArgs()` | `list-panes -a -F '#{pane_id}\t#{window_id}\t#{window_name}'` — server-wide pane sweep (tab-delimited, name last) |
+| `buildTmuxRenameWindowArgs(windowId, name)` | `rename-window -t <windowId> -- <name>` — `--`-guarded window rename by `@N` id |
 | `execBackendEnvMeta(backendType?)` | hook env-var names (`KEEPER_TMUX_SESSION` / `TMUX_PANE`) |
 
 ## Extending to a new backend
@@ -195,8 +218,8 @@ The seam for a second backend (wezterm, kitty, …) survives the
 single-backend collapse — three steps:
 
 1. Implement the `ExecBackend` interface (`launch`, `focusPane`,
-   `ensureLaunched`) over the new mechanism, exporting pure argv builders
-   for the tests.
+   `ensureLaunched`, `listPanes`, `renameWindow`) over the new mechanism,
+   exporting pure argv builders for the tests.
 2. Teach `execBackendEnvMeta(backendType)` the new backend's
    `backend_exec_type`, session-id, and pane-id env-var names. This is the
    single source of truth for the env vars the **hook** reads on every event

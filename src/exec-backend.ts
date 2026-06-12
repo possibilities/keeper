@@ -48,6 +48,15 @@ export type SpawnFn = (
  *  `DispatchFailed` event. */
 export type LaunchResult = { ok: true } | { ok: false; error: string };
 
+/** One row of a `list-panes -a` sweep: the server-global pane id, its window
+ *  id (`@N`), and the window's current name. The renamer worker keys windows by
+ *  `windowId` and compares `windowName` to decide whether a rename is owed. */
+export interface PaneInfo {
+  readonly paneId: string;
+  readonly windowId: string;
+  readonly windowName: string;
+}
+
 export interface ExecBackend {
   /** Session-bound. Spawn `argv` at `cwd` in a new unnamed window in the managed
    *  session. The `name` arg is NOT forwarded to the window label — it feeds the
@@ -67,6 +76,15 @@ export interface ExecBackend {
     cwd: string,
     name?: string,
   ): Promise<LaunchResult>;
+  /** Session-agnostic. Sweep every pane on the server (`list-panes -a`) into
+   *  `(paneId, windowId, windowName)` rows. `null` on a degraded/missing tmux —
+   *  callers skip the cycle. NEVER throws. */
+  listPanes(): Promise<PaneInfo[] | null>;
+  /** Session-agnostic. Rename window `windowId` (`@N`) to `name` via
+   *  `rename-window -t <id> -- <name>` (the `--` guards names starting with
+   *  `-`). A nonzero "can't find window" is an expected TOCTOU no-op returned as
+   *  `{ ok: false }` without noise. NEVER throws. */
+  renameWindow(windowId: string, name: string): Promise<LaunchResult>;
 }
 
 /**
@@ -140,8 +158,9 @@ export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
 //     `set-environment`, which is readable by every attached client).
 //
 // Version floor: `new-session -e` requires tmux ≥3.2 (3.6b verified). Managed
-// windows stay UNNAMED — the unused `name` arg on `launch` is the seam for the
-// future window-naming system.
+// windows are launched UNNAMED; the renamer worker (consuming `listPanes` /
+// `renameWindow`) labels them after the hosted Claude session's job title — the
+// `name` arg on `launch` stays a log/dedup key, never the `-n` label.
 //
 // Accepted residual race: a worker that exits BEFORE the chained
 // `set-option -p remain-on-exit on` lands loses its dead pane (the window
@@ -236,6 +255,38 @@ export function buildTmuxSelectWindowArgs(paneId: string): string[] {
  *  Runs after `select-window` to focus the pane within its now-current window. */
 export function buildTmuxSelectPaneArgs(paneId: string): string[] {
   return ["tmux", "select-pane", "-t", paneId];
+}
+
+/**
+ * Build the tmux `list-panes -a -F '#{pane_id}\t#{window_id}\t#{window_name}'`
+ * sweep argv. Pure — exported for tests. `-a` spans every session on the
+ * server. The format is TAB-delimited with `window_name` LAST so the renamer's
+ * 2-split parse keeps a tab inside an arbitrary window name from corrupting the
+ * pane/window fields (names are free user text — tabs, colons, unicode all
+ * survive).
+ */
+export function buildTmuxListPanesArgs(): string[] {
+  return [
+    "tmux",
+    "list-panes",
+    "-a",
+    "-F",
+    "#{pane_id}\t#{window_id}\t#{window_name}",
+  ];
+}
+
+/**
+ * Build the tmux `rename-window -t <windowId> -- <name>` argv. Pure — exported
+ * for tests. Targets by WINDOW id (`@N`, server-global durable handle) — never
+ * name-based, since colons in names break target parsing. The `--` is
+ * load-bearing: window names are arbitrary user text that may start with `-`,
+ * and tmux's own parser would otherwise read such a name as an option.
+ */
+export function buildTmuxRenameWindowArgs(
+  windowId: string,
+  name: string,
+): string[] {
+  return ["tmux", "rename-window", "-t", windowId, "--", name];
 }
 
 /** Resolver-filled dep bag for the tmux backend. `session` is the managed
@@ -431,6 +482,61 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
         cwd,
         `session=${targetSession}`,
       );
+    },
+    async listPanes(): Promise<PaneInfo[] | null> {
+      // One server-wide sweep; `null` (degraded/missing tmux) tells the caller
+      // to skip this cycle. Parse is tab-delimited with `window_name` LAST and
+      // a 2-split limit so a tab inside an arbitrary window name cannot bleed
+      // into the pane/window fields. Malformed lines are dropped silently — a
+      // partial sweep is still a usable snapshot.
+      const res = await runCapture(buildTmuxListPanesArgs());
+      if (res == null || res.exitCode !== 0) {
+        return null;
+      }
+      const panes: PaneInfo[] = [];
+      for (const line of res.stdout.split("\n")) {
+        if (line === "") {
+          continue;
+        }
+        const firstTab = line.indexOf("\t");
+        if (firstTab < 0) {
+          continue;
+        }
+        const secondTab = line.indexOf("\t", firstTab + 1);
+        if (secondTab < 0) {
+          continue;
+        }
+        const paneId = line.slice(0, firstTab);
+        const windowId = line.slice(firstTab + 1, secondTab);
+        const windowName = line.slice(secondTab + 1);
+        if (paneId === "" || windowId === "") {
+          continue;
+        }
+        panes.push({ paneId, windowId, windowName });
+      }
+      return panes;
+    },
+    async renameWindow(windowId: string, name: string): Promise<LaunchResult> {
+      // Fire-and-check like focusPane. A nonzero exit is the expected TOCTOU
+      // no-op (the window closed between sweep and rename) — returned as
+      // { ok: false } with no noteLine noise so a self-healing race never spams
+      // the sidecar.
+      const res = await runCapture(buildTmuxRenameWindowArgs(windowId, name));
+      if (res == null) {
+        return {
+          ok: false,
+          error: `tmux rename-window for ${windowId} failed (ENOENT? binary missing)`,
+        };
+      }
+      if (res.exitCode !== 0) {
+        const stderrTrim = res.stderr.trim();
+        const detail = stderrTrim.length > 0 ? `: ${stderrTrim}` : "";
+        return {
+          ok: false,
+          error: `tmux rename-window for ${windowId} exited ${res.exitCode}${detail}`,
+        };
+      }
+      return { ok: true };
     },
   };
 }
