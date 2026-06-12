@@ -49,6 +49,7 @@ import {
   type DispatchAsyncCtx,
   diffTick,
   dispatchLine,
+  freeConn,
   handleKick,
   IDLE_CONN_TTL_MS,
   isPidAlive,
@@ -2219,6 +2220,181 @@ test("max-conn cap rejects a new connection with an error frame + close; the old
   }
   server.stop();
   db.close();
+});
+
+test("cap-hit synchronously sweeps reapable idle conns, then accepts the new conn", async () => {
+  // The headline fn-807 change: at the cap, the open() handler sweeps reapable
+  // conns BEFORE rejecting. Fill to MAX_CONNECTIONS with real zero-sub clients,
+  // age every server-side conn's clock past the idle ceiling (idle-sweep
+  // candidates), then open one more. The sweep frees the aged conns
+  // synchronously and the (cap+1)th is ACCEPTED, never sent max_connections.
+  const { db } = openDb(dbPath, { readonly: true });
+  const server = startServer(db, sockPath, lockPath);
+
+  const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
+  for (let i = 0; i < MAX_CONNECTIONS; i++) {
+    clients.push(
+      await Bun.connect({
+        unix: sockPath,
+        socket: { data() {}, error() {} },
+      }),
+    );
+  }
+  await retryUntil(() => (server.conns.size === MAX_CONNECTIONS ? true : null));
+
+  // Age every server-side conn past the idle ceiling: all zero-sub, so the idle
+  // sweep is eligible to reap them. (They are otherwise alive — this is a
+  // synthetic age to drive the sweep deterministically.)
+  for (const c of server.conns) {
+    c.data.lastActivityAt = Date.now() - (IDLE_CONN_TTL_MS + 1);
+  }
+
+  // The (cap+1)th client must be accepted: the cap-hit sweep frees a slot
+  // synchronously and no max_connections frame is ever written to it.
+  const overflowFrames: Array<{ type?: string; code?: string }> = [];
+  const overflow = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      data(_s, chunk: Buffer) {
+        for (const line of chunk.toString("utf8").split("\n")) {
+          if (line.length > 0) {
+            overflowFrames.push(
+              JSON.parse(line) as { type?: string; code?: string },
+            );
+          }
+        }
+      },
+      error() {},
+    },
+  });
+
+  // The new conn registers (sweep recovered a slot) and the set never exceeds
+  // the cap. The aged conns are reaped synchronously, so the set drops to the
+  // single freshly-accepted conn. (Identity is server-side; assert by the
+  // sweep's net effect, not the client socket object.)
+  const settled = await retryUntil(() =>
+    server.conns.size >= 1 && server.conns.size <= MAX_CONNECTIONS
+      ? server.conns.size
+      : null,
+  );
+  expect(settled).not.toBeNull();
+  // Exactly one fresh conn survives: every aged conn was idle-reaped, the new
+  // one accepted.
+  const fresh = await retryUntil(() => (server.conns.size === 1 ? true : null));
+  expect(fresh).toBe(true);
+  // No rejection frame was delivered to the accepted conn.
+  expect(
+    overflowFrames.find((f) => f.code === "max_connections"),
+  ).toBeUndefined();
+
+  overflow.end();
+  for (const c of clients) {
+    c.end();
+  }
+  server.stop();
+  db.close();
+});
+
+test("cap-hit with all-healthy conns rejects; a live board subscriber is never evicted", async () => {
+  // The protection invariant: when NO conn is reapable (all fresh-clock, peer
+  // alive — and one is a SUBSCRIBED live board), the cap-hit sweep recovers
+  // nothing and the (cap+1)th is rejected with the existing envelope. The live
+  // subscriber survives the sweep untouched.
+  const { db } = openDb(dbPath, { readonly: true });
+  const server = startServer(db, sockPath, lockPath);
+
+  // The first client subscribes (sends a query frame → subs.size > 0): the live
+  // board that must never be evicted by the cap path.
+  const board = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      open(s) {
+        s.write(`${JSON.stringify({ type: "query", collection: "jobs" })}\n`);
+      },
+      data() {},
+      error() {},
+    },
+  });
+  // Fill the rest to exactly the cap with plain healthy conns.
+  const clients: Array<Awaited<ReturnType<typeof Bun.connect>>> = [];
+  for (let i = 0; i < MAX_CONNECTIONS - 1; i++) {
+    clients.push(
+      await Bun.connect({
+        unix: sockPath,
+        socket: { data() {}, error() {} },
+      }),
+    );
+  }
+
+  // Wait until full AND the board's subscription has landed (subs.size > 0).
+  const boardConn = await retryUntil(() => {
+    if (server.conns.size !== MAX_CONNECTIONS) return null;
+    for (const c of server.conns) {
+      if (c.data.subs.size > 0) return c;
+    }
+    return null;
+  });
+  expect(boardConn).not.toBeNull();
+
+  // Every conn is healthy (fresh clock, peer = this live process), so the sweep
+  // reaps nothing: the (cap+1)th is rejected with max_connections.
+  const rejectFrames: Array<{ type?: string; code?: string }> = [];
+  const overflow = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      data(_s, chunk: Buffer) {
+        for (const line of chunk.toString("utf8").split("\n")) {
+          if (line.length > 0) {
+            rejectFrames.push(
+              JSON.parse(line) as { type?: string; code?: string },
+            );
+          }
+        }
+      },
+      error() {},
+    },
+  });
+
+  const frame = await retryUntil(() =>
+    rejectFrames.find((f) => f.code === "max_connections"),
+  );
+  expect(frame?.type).toBe("error");
+  expect(frame?.code).toBe("max_connections");
+  // The live board subscriber survived the sweep, still subscribed.
+  expect(server.conns.has(boardConn as unknown as Writable)).toBe(true);
+  expect((boardConn as Writable).data.subs.size).toBeGreaterThan(0);
+  expect(server.conns.size).toBe(MAX_CONNECTIONS);
+
+  overflow.end();
+  board.end();
+  for (const c of clients) {
+    c.end();
+  }
+  server.stop();
+  db.close();
+});
+
+test("freeConn is idempotent: a second free (the deferred async close) is a no-op", () => {
+  // The cap-hit sweep frees a socket synchronously; the Bun `close` event then
+  // fires later and frees it AGAIN. The shared helper must make that second
+  // call harmless — delete on an absent member + clearing already-null state.
+  const conns = new Set<Writable>();
+  const sock = fakeSock();
+  sock.data.subs.set("s", {} as unknown as SubState);
+  sock.data.pending = { bytes: new Uint8Array([1]), offset: 0 };
+  sock.data.pendingSince = Date.now();
+  conns.add(sock);
+
+  freeConn(conns, sock);
+  expect(conns.has(sock)).toBe(false);
+  expect(sock.data.subs.size).toBe(0);
+  expect(sock.data.pending).toBeNull();
+  expect(sock.data.pendingSince).toBeNull();
+
+  // Second free (the deferred close) — no throw, state stays clean.
+  expect(() => freeConn(conns, sock)).not.toThrow();
+  expect(conns.has(sock)).toBe(false);
+  expect(sock.data.subs.size).toBe(0);
 });
 
 test("diffTick fans out only to connections watching the changed id", () => {

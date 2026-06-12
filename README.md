@@ -1250,10 +1250,16 @@ viewers (fn-723): a write that returns `< 0` (EPIPE/ECONNRESET on a diff
 write) evicts the connection from `conns`, and a connection whose pending
 write buffer stays stuck past a TTL is reaped too — the case `diffTick` can't
 EPIPE on because it skips backpressured conns. A `MAX_CONNECTIONS` cap (64)
-hard-bounds the set: at the cap a NEW connection is rejected with a
-`max_connections` error frame then closed (reject-new, not LRU-evict, so the
-oldest legit board survives), and hitting the cap logs loudly as a
-reaper-regression signal. There is NO ping/pong heartbeat — it was descoped
+hard-bounds the set: at the cap the open handler FIRST runs a synchronous
+reapable-conn sweep (the same stuck-pending / idle zero-sub / subscribed
+dead-peer classifications, freeing `conns` in place so the recheck sees a true
+size) and accepts the new connection if that recovered a slot; only a cap STILL
+held AFTER the sweep rejects with a `max_connections` error frame then closes it
+(reject-new, not LRU-evict — a live board subscriber is never evicted, the idle
+sweep exempts subscribed conns and dead-peer only evicts dead-pid ones). Every
+cap-hit logs a one-line conn-state census (pending / zero-sub / subscribed-live /
+subscribed-dead); the loud "reaper regressed" alarm now fires only on the
+cap-held-after-sweep reject — the genuine anomaly. There is NO ping/pong heartbeat — it was descoped
 (a faithfully-ponging orphan is indistinguishable from a quiet live viewer);
 the load-bearing fix for the orphan class is the client-side self-exit below.
 

@@ -1897,13 +1897,51 @@ function readWorldRevOnce(db: Database): number {
 }
 
 /**
+ * Release per-connection state and drop the socket from the live `conns` set
+ * SYNCHRONOUSLY. Idempotent: a second call (the later async Bun `close` event,
+ * or a double reap) is a harmless no-op — `Set.delete` on an absent member does
+ * nothing and the cleared `ConnState` fields are already null. Threaded into the
+ * reapers so a cap-hit sweep can recheck a TRUE `conns.size` before deciding to
+ * accept; the Bun `close` handler reuses it so the deferred close stays a no-op.
+ */
+export function freeConn(conns: Set<Writable>, sock: Writable): void {
+  conns.delete(sock);
+  sock.data.subs.clear();
+  sock.data.pending = null;
+  sock.data.pendingSince = null;
+}
+
+/**
+ * Evict one connection: synchronously free it from `conns` (when the set is in
+ * scope) THEN close the wire. The free runs first so the post-sweep `conns.size`
+ * recheck is true the instant this returns; `sock.end()` is wrapped so a throw
+ * can never abort the reap of sibling conns (no-self-heal). `conns` is optional —
+ * the `diffTick`/`handleKick` callers hold only an `Iterable` and rely on the
+ * async `close` handler to delete, exactly as before.
+ */
+function evictConn(sock: Writable, conns?: Set<Writable>): void {
+  if (conns) {
+    freeConn(conns, sock);
+  }
+  try {
+    sock.end?.();
+  } catch (err) {
+    // No-self-heal: a failed end() must not abort the reap of sibling conns.
+    console.error(
+      `[server-worker] evict end() failed for conn ${sock.data.id ?? -1}:`,
+      err,
+    );
+  }
+}
+
+/**
  * Evict connections backpressured past {@link STUCK_PENDING_TTL_MS}. Fires ONLY
  * on a genuinely stuck buffer (`pendingSince` aged past the ceiling) — a quiet
  * receive-only subscriber has `pending === null` and is never touched.
  * Eviction is `sock.end()` (the Bun `close` handler then `conns.delete`s,
  * idempotent), per-conn try/catch'd so one throw can't abort the rest.
  */
-function reapStuckPending(list: Writable[]): void {
+function reapStuckPending(list: Writable[], conns?: Set<Writable>): void {
   const now = Date.now();
   for (const sock of list) {
     const since = sock.data.pendingSince;
@@ -1914,15 +1952,7 @@ function reapStuckPending(list: Writable[]): void {
       `[server-worker] reaping stuck-pending conn ${sock.data.id ?? -1} ` +
         `(backpressured ${now - since}ms > ${STUCK_PENDING_TTL_MS}ms ceiling)`,
     );
-    try {
-      sock.end?.();
-    } catch (err) {
-      // No-self-heal: a failed end() must not abort the reap of sibling conns.
-      console.error(
-        `[server-worker] stuck-pending end() failed for conn ${sock.data.id ?? -1}:`,
-        err,
-      );
-    }
+    evictConn(sock, conns);
   }
 }
 
@@ -1934,7 +1964,7 @@ function reapStuckPending(list: Writable[]): void {
  * legit board may sit silent during a DB-quiet period). Eviction + per-conn
  * try/catch as in `reapStuckPending`.
  */
-function reapIdleConns(list: Writable[]): void {
+function reapIdleConns(list: Writable[], conns?: Set<Writable>): void {
   const now = Date.now();
   for (const sock of list) {
     // Subscribed conns are exempt — a quiet board is legitimately silent.
@@ -1949,15 +1979,7 @@ function reapIdleConns(list: Writable[]): void {
         `(idle ${now - sock.data.lastActivityAt}ms > ${IDLE_CONN_TTL_MS}ms ceiling, ` +
         `no subscriptions)`,
     );
-    try {
-      sock.end?.();
-    } catch (err) {
-      // No-self-heal: a failed end() must not abort the reap of sibling conns.
-      console.error(
-        `[server-worker] idle-conn end() failed for conn ${sock.data.id ?? -1}:`,
-        err,
-      );
-    }
+    evictConn(sock, conns);
   }
 }
 
@@ -1975,7 +1997,7 @@ function reapIdleConns(list: Writable[]): void {
  * NEVER reaped here: the idle + stuck-pending arms remain the backstop. Per-conn
  * try/catch as in the sibling reapers.
  */
-function reapDeadPeers(list: Writable[]): void {
+function reapDeadPeers(list: Writable[], conns?: Set<Writable>): void {
   for (const sock of list) {
     // Subscribed-only — the zero-sub case is the idle sweep's job.
     if (sock.data.subs.size === 0) {
@@ -1994,16 +2016,47 @@ function reapDeadPeers(list: Writable[]): void {
       `[server-worker] reaping subscribed dead-peer conn ${sock.data.id ?? -1} ` +
         `(peer pid ${pid} gone; ${sock.data.subs.size} sub(s))`,
     );
-    try {
-      sock.end?.();
-    } catch (err) {
-      // No-self-heal: a failed end() must not abort the reap of sibling conns.
-      console.error(
-        `[server-worker] dead-peer end() failed for conn ${sock.data.id ?? -1}:`,
-        err,
-      );
+    evictConn(sock, conns);
+  }
+}
+
+/**
+ * Log a one-line conn-state census on a cap-hit, classifying every live conn so
+ * the reason the sweep did or did not recover a slot is attributable from one
+ * log line (the diagnostic the 2026-06-12 stall lacked). Buckets mirror the
+ * reaper arms: `pending` (backpressured — stuck-pending candidate), `zero_sub`
+ * (idle-sweep candidate), `sub_live` (subscribed, peer alive — the protected
+ * board), `sub_dead` (subscribed, peer gone — dead-peer candidate), and
+ * `sub_unknown` (subscribed, peerPid null — never liveness-reaped). Pure read.
+ */
+function logCapCensus(conns: Set<Writable>): void {
+  let pending = 0;
+  let zeroSub = 0;
+  let subLive = 0;
+  let subDead = 0;
+  let subUnknown = 0;
+  for (const sock of conns) {
+    if (sock.data.pending !== null) {
+      pending++;
+    }
+    if (sock.data.subs.size === 0) {
+      zeroSub++;
+      continue;
+    }
+    const pid = sock.data.peerPid;
+    if (pid == null) {
+      subUnknown++;
+    } else if (isPidAlive(pid)) {
+      subLive++;
+    } else {
+      subDead++;
     }
   }
+  console.error(
+    `[server-worker] conn-cap census (${conns.size}/${MAX_CONNECTIONS}): ` +
+      `pending=${pending} zero_sub=${zeroSub} sub_live=${subLive} ` +
+      `sub_dead=${subDead} sub_unknown=${subUnknown}`,
+  );
 }
 
 /**
@@ -2012,11 +2065,16 @@ function reapDeadPeers(list: Writable[]): void {
  * during DB-quiet windows, exactly when `data_version` is frozen and `diffTick`
  * never fires; also called from inside `diffTick` for the `handleKick` path.
  * Eviction is idempotent, so the double call is a safe no-op.
+ *
+ * Pass `conns` to free reaped sockets SYNCHRONOUSLY (the cap-hit sweep needs a
+ * true post-sweep `conns.size`); omit it and eviction degrades to `sock.end()`
+ * alone, relying on the async Bun `close` handler to delete — the `diffTick` /
+ * `handleKick` callers that hold only an `Iterable` take this path.
  */
-export function reapConns(list: Writable[]): void {
-  reapStuckPending(list);
-  reapIdleConns(list);
-  reapDeadPeers(list);
+export function reapConns(list: Writable[], conns?: Set<Writable>): void {
+  reapStuckPending(list, conns);
+  reapIdleConns(list, conns);
+  reapDeadPeers(list, conns);
 }
 
 /**
@@ -2437,23 +2495,38 @@ export function startServer(
         try {
           socket.data = newConnState();
           socket.data.id = ++__nextConnId;
-          // Reject-new at the cap (NOT LRU-evict — the oldest conn is the legit
-          // board). Logged loudly: hitting the cap means the reaper regressed.
+          // At the cap, FIRST synchronously sweep reapable conns (stuck-pending /
+          // idle zero-sub / subscribed dead-peer) and accept if that frees a slot.
+          // NOT LRU-evict: the sweep reuses the existing reaper classifications
+          // unchanged, so a live board subscriber can never be evicted (idle sweep
+          // exempts subscribed conns; dead-peer only evicts dead-pid subscribers).
+          // The reapers free SYNCHRONOUSLY (the `conns` arg), so the recheck below
+          // sees a true `conns.size`. Only a cap STILL held after the sweep is the
+          // genuine anomaly — that is where the "reaper regressed" alarm now lives.
           if (conns.size >= MAX_CONNECTIONS) {
+            logCapCensus(conns);
+            reapConns([...conns], conns);
+            if (conns.size >= MAX_CONNECTIONS) {
+              console.error(
+                `[server-worker] max_connections cap (${MAX_CONNECTIONS}) held ` +
+                  `AFTER sweep — rejecting conn ${socket.data.id}; the reaper has ` +
+                  `regressed (no reapable conns among ${conns.size})`,
+              );
+              const w = socket as unknown as Writable;
+              writeFrames(w, [
+                errorFrame(
+                  db,
+                  "max_connections",
+                  `server at connection cap (${MAX_CONNECTIONS}); rejecting new connection`,
+                ),
+              ]);
+              socket.end();
+              return; // never added to `conns`
+            }
             console.error(
               `[server-worker] max_connections cap (${MAX_CONNECTIONS}) hit — ` +
-                `rejecting conn ${socket.data.id}; the reaper has regressed`,
+                `sweep recovered a slot (now ${conns.size}); accepting conn ${socket.data.id}`,
             );
-            const w = socket as unknown as Writable;
-            writeFrames(w, [
-              errorFrame(
-                db,
-                "max_connections",
-                `server at connection cap (${MAX_CONNECTIONS}); rejecting new connection`,
-              ),
-            ]);
-            socket.end();
-            return; // never added to `conns`
           }
           // Capture the peer pid for the subscribed-ghost dead-peer sweep
           // (macOS LOCAL_PEERPID; `null` on any other platform / probe failure,
@@ -2487,12 +2560,11 @@ export function startServer(
       },
       close(socket) {
         if (TRACE) srvTs(`conn ${socket.data.id ?? -1} close`);
-        // Drop the connection from the fan-out set, then release per-connection
-        // state; nothing process-global to release here.
-        conns.delete(socket as unknown as Writable);
-        socket.data.subs.clear();
-        socket.data.pending = null;
-        socket.data.pendingSince = null;
+        // Drop the connection from the fan-out set and release per-connection
+        // state via the shared idempotent helper. The cap-hit sweep may have
+        // already freed this socket synchronously; running it again here is a
+        // harmless no-op (the deferred Bun `close` event).
+        freeConn(conns, socket as unknown as Writable);
       },
       error(socket, err) {
         // EPIPE/ECONNRESET are the NORMAL shape of a peer going away (handled by
