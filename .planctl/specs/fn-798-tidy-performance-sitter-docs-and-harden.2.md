@@ -20,5 +20,5 @@ them as one test-coverage commit.
 - [ ] sanitizeKey has direct unit coverage for empty-after-sanitize, the >150-char cap, and NUL stripping.
 
 ## Done summary
-
+Added direct unit coverage for the followups writer's untrusted-input hardening: renderFollowup fence neutralization of triple-backticks in detail/evidence, and sanitizeKey edge cases (empty-after-sanitize, 150-char cap, NUL stripping).
 ## Evidence
