@@ -154,14 +154,25 @@ Pass `--format yaml` for YAML output or `--format human` for human-readable text
 
 ## Planning Skills
 
-Four slash commands handle epic creation, refinement, the post-epic-close phase, and tier-1/2/3 followup audit:
+These slash commands handle epic creation, refinement, single-task execution, the post-epic-close phase, and tier-1/2/3 followup audit:
 
 | Command | When to use |
 |---------|------------|
 | `/plan <request>` | Any new feature — spawns scouts, runs gap-analyst, full outer-loop quality pass. Use for anything non-trivial. |
+| `/plan:work <fn-N-slug.M>` | Drive a single claimed task to `done` by spawning the tier-matched `plan:worker-<tier>` subagent and switching on `planctl reconcile`'s typed verdict. A content-blind orchestrator under hook-enforced no-commit constraints: it never edits, lints, or commits — every non-`done` verdict routes back into the worker as a resume directive, and the plugin's PreToolUse commit hard-deny blocks any commit attempt from the main context (bypassable per-session with `PLANCTL_GUARD_BYPASS=1`). |
 | `/plan:defer <subject>` | The sole single-task scaffolder. Mainlines the actionable work in the conversation into a single-task epic at normal epic-number order — no priority jump — and stops on overrun rather than silently scaling up. Member of the `/plan:plan` family (not a job-launcher). Hand-written tracked skill. |
 | `/plan:next <epic_id>` | Flips board priority on an *existing* epic so it jumps to the front of the queue. Calls `planctl epic queue-jump`, which sets `queue_jump=true` and emits an envelope carrying `queue_jump: true` — keeperd folds it into the `epics.queue_jump` projection column and stamps a `!`-prefixed `sort_path` so the epic sorts above all other root epics on the board. Read-only short-circuit when already set. Does NOT scaffold. Hand-written tracked skill. |
 | `/plan:close <epic_id>` | After all tasks in an epic are done: a content-blind coordinator that runs `planctl close-preflight` → spawns `quality-auditor` blind (it persists its report via `audit submit`) → on findings, spawns `close-planner` blind (it vets/culls/merges and persists the verdict + follow-up plan via `verdict submit` / `followup submit`) → `planctl close-finalize` and a total switch over its four typed `CloseOutcome` members. Every pipeline artifact lives on disk under `<primary_repo>/.planctl/state/audits/<epic_id>/`; the closer holds refs, hashes, counts, and one-line agent returns only. The audit runs INLINE inside close before the irreversible close mutation — no `--audit-required` flag, no `auditor_done_at` stamp, no separate `/plan:audit` session. The planner's `fatal` flag is the only ship-block signal; `close-finalize` halts without closing on a fatal verdict (no status stamp — the absence of a close is the signal). `close-finalize` encodes the saga from observable state (stale-check, fatal-halt, reversible follow-up scaffold before the irreversible `epic close`) and is idempotent on re-run; the scaffold step stamps `epic.created_by_close_of: <source_eid>` onto the minted follow-up, and `close-finalize` discovers the follow-up by exact equality on that stamp — never by `depends_on_epics` membership. The follow-up still wires `depends_on_epics: [<source_eid>]` as a real dependency, but the dep edge is no longer the provenance signal, so a human-planned epic that legitimately depends on the source is never mistaken for the audit follow-up. Halts on a `QUESTION:` from the planner (warm/cold resume on the human's answer); under autopilot a `QUESTION:` behaves like `BLOCKED` — the chain stops and the epic stays open. |
+
+## Orchestrator hooks
+
+The plugin ships three bun hook dispatchers under `hooks/` that keep the `/plan:work` and `/plan:close` orchestrators content-blind — all implementation work stays inside the worker subagent:
+
+- **PreToolUse commit hard-deny** — denies `keeper commit-work` / `git commit` from the main context while the session's claimed task is in progress; worker-context commits (an `agent_id` is present) always pass.
+- **SubagentStop worker guard** — a worker stopping in a non-`done`, non-`BLOCKED:` state gets exactly one corrective round.
+- **Stop checklist guard** — a work-session Stop with a still-in-progress claimed task, or a close-session Stop where `close-finalize` never ran, blocks once with a resume checklist.
+
+Each guard verifies live state with a read-only `planctl` call before blocking and fails open on any internal error. Session state is one JSON marker per session at `~/.local/state/planctl/sessions/<session_id>.json`. Set `PLANCTL_GUARD_BYPASS=1` to disable all three guards.
 
 ## Help for Agents
 

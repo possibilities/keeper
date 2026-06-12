@@ -10,6 +10,7 @@ description: >-
   task in the epic is `done`.
 argument-hint: "<epic_id> [instructions]"
 allowed-tools: Bash(planctl:*), Read, Task, SendMessage
+disallowed-tools: Edit, Write, NotebookEdit, TodoWrite
 disable-model-invocation: true
 ---
 

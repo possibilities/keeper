@@ -10,7 +10,8 @@ description: >-
   review gates, no worktree. Use when the human says "work", "/work", or
   invokes the planctl work workflow on an existing `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
-allowed-tools: Bash(planctl:*), Bash(keeper:*), Read, Glob, Task, SendMessage
+allowed-tools: Bash(planctl:*), Read, Glob, Task, SendMessage
+disallowed-tools: Edit, Write, NotebookEdit, TodoWrite
 disable-model-invocation: true
 ---
 
@@ -118,7 +119,9 @@ planctl reconcile <task_id>
 
 **On a typed error** — envelope `{"success": false, "error": {"code", "message", "details"}}` (`BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID`) — surface `error.message` verbatim and stop. For `AMBIGUOUS_TASK_ID`, re-run with `planctl reconcile <task_id> --project <path>`.
 
-**On success**, read the envelope `{verdict, task_id, epic_id, status, source_commits, state_head_visible, epic_progress, assessed_at, blocked_reason}` and switch on `verdict`. The switch is total over all seven verdicts:
+**On success**, read the envelope `{verdict, task_id, epic_id, status, source_commits, state_head_visible, epic_progress, assessed_at, blocked_reason}` and switch on `verdict`. The switch is total over all seven verdicts.
+
+**Every non-`done` verdict is a resume directive, never a work order.** A dirty tree, failing lint, or a missing commit is the worker's to fix in the worker's context — you route the nudge back into the worker and never touch the tree yourself. The global commit-by-default convention does not apply to this skill: it never edits, so it never commits. The switch arms:
 
 - **`done`** → the source commit and the `.planctl/` state commit both landed. Continue to Phase 3 (report).
 - **`in_progress_committed`** → the worker's source commit landed but `planctl done` never fired. Resume with the nudge *"Source commit `<sha>` landed for `<id>` (sha from `source_commits[0]`) — run `planctl done <task_id> --summary "..."` now."*

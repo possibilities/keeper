@@ -24,7 +24,7 @@ Every mutating verb auto-commits its own `.planctl/` scope inline at `output.emi
 
 ## Skills and agents
 
-`plan:*` skills live under `skills/`; the four worker agents and the auditor/planner/scout agents live in `agents/`. Tier routing rides the emitted `worker_agent` name, the orchestrator is content-blind, and `/plan:close` runs the audit inline before the irreversible `epic close`.
+`plan:*` skills live under `skills/`; the four worker agents and the auditor/planner/scout agents live in `agents/`. Tier routing rides the emitted `worker_agent` name, the orchestrator is content-blind, and `/plan:close` runs the audit inline before the irreversible `epic close`. The plugin's `hooks/` layer enforces the content-blind orchestrator contract mechanically: a PreToolUse commit hard-deny, a SubagentStop worker guard, and a Stop checklist guard keep all implementation work inside the worker subagent.
 
 ## Removed verbs (do not re-add)
 
