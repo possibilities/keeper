@@ -474,7 +474,10 @@ async function confirm(): Promise<boolean> {
   }
 }
 
-export async function main(argv: string[]): Promise<void> {
+export async function main(
+  argv: string[],
+  spawn: SyncSpawnFn = defaultSpawn,
+): Promise<void> {
   const parsed = parseArgs({
     args: argv,
     options: {
@@ -488,8 +491,6 @@ export async function main(argv: string[]): Promise<void> {
     process.stdout.write(HELP);
     process.exit(0);
   }
-
-  const spawn = defaultSpawn;
 
   try {
     if (parsed.values["kill-sessions"]) {

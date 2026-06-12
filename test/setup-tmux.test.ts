@@ -12,6 +12,7 @@ import {
   buildWorkNewSessionArgs,
   dashPaneArgv,
   isBusyCommand,
+  main,
   parseBusyPanes,
   renderBusyTable,
   resolveDashSize,
@@ -347,5 +348,173 @@ describe("sweepBusyPanes", () => {
       calls,
     );
     expect(sweepBusyPanes(spawn)).toEqual([]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// main() --kill-sessions busy-pane gate — the safety-critical call ordering.
+// A regression that reorders busy -> TTY-gate -> killAllSessions silently
+// tears down the human's live tmux sessions, so the gate is pinned here:
+// both refuse branches must process.exit(1) having spawned NO kill argv.
+// ---------------------------------------------------------------------------
+
+/** A server-up stub: list-sessions exits 0 and list-panes reports one busy
+ *  (nvim) pane per swept session, so the gate engages. Everything else exits
+ *  0. Records every spawn into `calls`. */
+function makeKillGateStub(calls: string[][]): SyncSpawnFn {
+  return makeSpawnStub(
+    {
+      "tmux:list-sessions": { stdout: "dash: 1 windows", exitCode: 0 },
+      "tmux:list-panes": { stdout: "autopilot\t0\tnvim\tedit", exitCode: 0 },
+    },
+    calls,
+  );
+}
+
+const KILL_VERBS = new Set(["kill-session", "kill-server"]);
+const spawnedAnyKill = (calls: string[][]): boolean =>
+  calls.some((c) => c[0] === "tmux" && KILL_VERBS.has(c[1] ?? ""));
+
+describe("main() --kill-sessions busy-pane gate", () => {
+  test("non-TTY stdin with busy panes: exits 1, spawns no kill", async () => {
+    const calls: string[][] = [];
+    const spawn = makeKillGateStub(calls);
+
+    const savedStdinTTY = process.stdin.isTTY;
+    const savedStdoutTTY = process.stdout.isTTY;
+    const savedExit = process.exit;
+    const savedErr = process.stderr.write;
+    // Non-TTY stdin is the refuse trigger.
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: false,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdout, "isTTY", {
+      value: true,
+      configurable: true,
+    });
+    let exitCode: number | undefined;
+    // process.exit must not return — throw so execution stops at the gate.
+    process.exit = ((code?: number) => {
+      exitCode = code;
+      throw new Error(`__exit_${code}`);
+    }) as typeof process.exit;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+
+    try {
+      await main(["--kill-sessions"], spawn);
+      throw new Error("main() returned without exiting");
+    } catch (e) {
+      expect(String((e as Error).message)).toBe("__exit_1");
+    } finally {
+      Object.defineProperty(process.stdin, "isTTY", {
+        value: savedStdinTTY,
+        configurable: true,
+      });
+      Object.defineProperty(process.stdout, "isTTY", {
+        value: savedStdoutTTY,
+        configurable: true,
+      });
+      process.exit = savedExit;
+      process.stderr.write = savedErr;
+    }
+
+    expect(exitCode).toBe(1);
+    expect(spawnedAnyKill(calls)).toBe(false);
+  });
+
+  test("aborted (N) confirmation with busy panes: exits 1, kills nothing", async () => {
+    const calls: string[][] = [];
+    const spawn = makeKillGateStub(calls);
+
+    const savedStdin = process.stdin;
+    const savedStdinTTY = process.stdin.isTTY;
+    const savedStdoutTTY = process.stdout.isTTY;
+    const savedExit = process.exit;
+    const savedErr = process.stderr.write;
+    const savedOut = process.stdout.write;
+
+    // TTY on both ends clears the non-TTY refuse, routing into confirm(). A
+    // stdin that ends immediately (EOF) resolves confirm() to false via its
+    // readline "close" handler — an aborted prompt without a typed "y".
+    const { Readable } = await import("node:stream");
+    const fakeStdin = Readable.from([]) as unknown as typeof process.stdin;
+    Object.defineProperty(process, "stdin", {
+      value: fakeStdin,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: true,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdout, "isTTY", {
+      value: true,
+      configurable: true,
+    });
+    let exitCode: number | undefined;
+    process.exit = ((code?: number) => {
+      exitCode = code;
+      throw new Error(`__exit_${code}`);
+    }) as typeof process.exit;
+    process.stderr.write = (() => true) as typeof process.stderr.write;
+    process.stdout.write = (() => true) as typeof process.stdout.write;
+
+    try {
+      await main(["--kill-sessions"], spawn);
+      throw new Error("main() returned without exiting");
+    } catch (e) {
+      expect(String((e as Error).message)).toBe("__exit_1");
+    } finally {
+      Object.defineProperty(process, "stdin", {
+        value: savedStdin,
+        configurable: true,
+      });
+      Object.defineProperty(process.stdout, "isTTY", {
+        value: savedStdoutTTY,
+        configurable: true,
+      });
+      process.exit = savedExit;
+      process.stderr.write = savedErr;
+      process.stdout.write = savedOut;
+    }
+    void savedStdinTTY;
+
+    expect(exitCode).toBe(1);
+    expect(spawnedAnyKill(calls)).toBe(false);
+  });
+
+  test("empty busy sweep proceeds to setup without prompting", async () => {
+    const calls: string[][] = [];
+    // Server up, but every pane is an idle shell ⇒ no busy panes ⇒ no prompt.
+    const spawn = makeSpawnStub(
+      {
+        "tmux:list-sessions": { stdout: "dash: 1 windows", exitCode: 0 },
+        "tmux:list-panes": { stdout: "autopilot\t0\tzsh\tshell", exitCode: 0 },
+        // new-session captures a pane id; rebuildDash needs a non-empty one.
+        "tmux:new-session": { stdout: "%0", exitCode: 0 },
+        "tmux:split-window": { stdout: "%1", exitCode: 0 },
+      },
+      calls,
+    );
+
+    const savedOut = process.stdout.write;
+    const writes: string[] = [];
+    process.stdout.write = ((s: string | Uint8Array) => {
+      writes.push(String(s));
+      return true;
+    }) as typeof process.stdout.write;
+
+    try {
+      // Must NOT throw (no exit), must complete setup.
+      await main(["--kill-sessions"], spawn);
+    } finally {
+      process.stdout.write = savedOut;
+    }
+
+    // killAllSessions ran (busy gate passed without a prompt) so a kill argv
+    // is present — that is the proceed path, not a refuse.
+    expect(spawnedAnyKill(calls)).toBe(true);
+    // No busy table was ever rendered to stdout ⇒ no prompt was shown.
+    expect(writes.some((w) => w.includes("→"))).toBe(false);
   });
 });
