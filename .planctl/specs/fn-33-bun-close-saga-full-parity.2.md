@@ -29,5 +29,5 @@ bun test green incl. hash cross-engine parity and golden-vs-validator; lint/type
 - [ ] Validator matches every golden row incl. message text; cross-field rules exact
 
 ## Done summary
-
+Ported the bun close-saga audit/submit/verdict spine (audit_artifacts, submit_common, verdict_schema) with byte-parity commit-set hashing, a commit-free touched-log-free artifact writer, and hand-rolled python-jsonschema message parity. Added src-audit-spine.test.ts proving hash cross-engine parity, validator-vs-every-golden, and writer-never-touches-the-session-log.
 ## Evidence
