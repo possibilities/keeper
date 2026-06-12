@@ -40,10 +40,9 @@ import { join } from "node:path";
 
 const REPO_ROOT = join(import.meta.dir, "..");
 
-/** Each sitter's two standalone bun entrypoints (NOT keeper subcommands). */
+/** The sitter standalone bun entrypoints (NOT keeper subcommands). */
 const SITTER_ENTRYPOINTS = [
   "babysitters/performance/watch.ts",
-  "babysitters/performance/watchdog.ts",
   "babysitters/builds/watch.ts",
   "babysitters/builds/watchdog.ts",
   "babysitters/helptailing/watch.ts",

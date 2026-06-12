@@ -22,15 +22,15 @@
  *
  * Modes:
  *   - default        → human-readable findings table on stdout.
- *   - `--json`       → `{ success: true, findings: [...] }` (the agent's input
- *                      contract / JSON-envelope convention).
- *   - `--tick`       → the launchd entry (task .2): scan, diff vs persistent
- *                      seen-state, and on genuinely-NEW findings spawn the
- *                      headless babysitter agent. Silent (exit 0, no spawn)
- *                      when nothing is new. See the SEEN-STATE + TICK sections
- *                      below.
+ *   - `--json`       → `{ success: true, findings: [...] }` (the JSON-envelope
+ *                      convention; the human-readable / triage input contract).
+ *   - `--tick`       → the launchd entry: scan, diff vs persistent seen-state,
+ *                      and on genuinely-NEW findings WRITE a follow-up file per
+ *                      finding directly to the corpus `/babysit-triage` reads.
+ *                      No agent spawn, no page. Silent (exit 0, no write) when
+ *                      nothing is new. See the SEEN-STATE + TICK sections below.
  *
- * ## Seen-state + escalation posture (task .2)
+ * ## Seen-state + follow-up posture (pull model — fn-792)
  *
  * `--tick` dedups findings against a persistent seen-state file at
  * `~/.local/state/babysitters/performance/seen.json` — its OWN dir, NOT a `KEEPER_*`
@@ -39,10 +39,10 @@
  * `atomicWriteFile`); a missing or corrupt file loads as an empty baseline.
  *
  * Cold start / corrupt = SILENT BASELINE: seed every current finding as seen
- * and notify nothing (no spawn). Only a genuinely-new finding AFTER a valid
- * baseline escalates. A cooldown (~1h) suppresses re-notify storms, a TTL
- * prune drops entries unseen >24h, and a per-fingerprint retry cap stops a
- * permanently-failing spawn from re-attempting every tick forever.
+ * and write nothing. Only a genuinely-new finding AFTER a valid baseline writes
+ * a follow-up. A TTL prune drops entries unseen >24h; a still-present finding is
+ * suppressed (no rewrite of the same follow-up). A finding that re-fires after
+ * its seen-entry TTL gets a NEW follow-up file — the resurface rule working.
  *
  * The held-across-ticks signals finalize here using the seen-state history:
  * reducer-wedge fires only after the lag persists ≥N consecutive ticks,
@@ -80,7 +80,6 @@ import {
   mkdirSync,
   readdirSync,
   readFileSync,
-  rmSync,
   statSync,
 } from "node:fs";
 import { join } from "node:path";
@@ -95,6 +94,11 @@ import {
   resolveSockPath,
 } from "../../src/db";
 import { parsePlanRef } from "../../src/derivers";
+import {
+  type FollowupConfig,
+  type FollowupStamps,
+  writeFollowup,
+} from "../lib/followups";
 import { babysitterStateDir } from "../lib/state";
 
 /** This sitter's concern slug — namespaces its state dir + plugin agent. */
@@ -132,8 +136,8 @@ writes keeper.db. NOT a 'keeper' subcommand — its own binary.
 
 Options:
   --json               Emit { success: true, findings: [...] } instead of a table
-  --tick               launchd entry: scan, diff vs seen-state, escalate on new
-                       findings. Silent (exit 0, no spawn) when nothing is new.
+  --tick               launchd entry: scan, diff vs seen-state, write a follow-up
+                       per new finding. Silent (exit 0, no write) when nothing is new.
   --window-secs <n>    Event-log lookback window in seconds (default 3600)
   --help, -h           Show this help
 `;
@@ -1922,48 +1926,41 @@ export function liveDeps(): ScanDeps {
 }
 
 // ---------------------------------------------------------------------------
-// Seen-state (task .2) — persistent dedup substrate for `--tick`.
+// Seen-state — persistent dedup substrate for `--tick`.
 //
 // Lives at ~/.local/state/babysitters/performance/seen.json (its OWN dir, NOT a KEEPER_*
 // path — a keeper.db re-fold must never observe the monitor's bookkeeping).
-// Schema is keyed by fingerprint; each entry tracks the observation/notify
-// history that drives cooldown, TTL prune, retry cap, and the held-across-ticks
-// finalizers. Written atomically (tmp + rename, via the shared atomicWriteFile)
-// so a crash mid-write leaves the prior file intact; a corrupt/missing file
-// loads as an empty baseline.
+// Schema is keyed by fingerprint; each entry tracks the observation history that
+// drives the TTL prune and the held-across-ticks finalizers. Written atomically
+// (tmp + rename, via the shared atomicWriteFile) so a crash mid-write leaves the
+// prior file intact; a corrupt/missing file loads as an empty baseline.
 // ---------------------------------------------------------------------------
 
-/** seen.json schema version — bump on a breaking shape change to invalidate. */
-export const SEEN_STATE_VERSION = 1;
+/**
+ * seen.json schema version. fn-792 bumped 1→2 dropping the page-history fields
+ * (`notification_count`/`last_notified_at`/`spawn_failures`) when the sitter
+ * converged on the pull model — a one-time silent re-baseline on the production
+ * host is accepted (persistent findings re-fire next tick; previously-paged
+ * findings already have follow-ups). A version mismatch loads as empty.
+ */
+export const SEEN_STATE_VERSION = 2;
 
-/** Re-notify cooldown for a still-present finding: 1 hour. */
-export const COOLDOWN_SECS = 60 * 60;
 /** TTL: prune an entry not seen within this span (24h). */
 export const SEEN_TTL_SECS = 24 * 60 * 60;
-/** Per-fingerprint spawn-retry cap — halt re-attempts after this many fails. */
-export const MAX_SPAWN_RETRIES = 5;
 /** Held-across-ticks confirmation: a signal must persist this many ticks. */
 export const HELD_TICKS_THRESHOLD = 3;
-/** Hard agent-spawn timeout (default 240s < the 300s launchd interval). */
-export const AGENT_TIMEOUT_MS = 240_000;
-/** The PLAIN claude binary (NOT the arthack-claude.py keeper-hook wrapper). */
-export const PLAIN_CLAUDE_PATH = "/Users/mike/.local/bin/claude";
 
 /**
- * One fingerprint's observation history. `notification_count` /
- * `last_notified_at` drive cooldown; `held_ticks` drives the held-across-ticks
- * finalizers; `spawn_failures` drives the per-fingerprint retry cap; `count`
- * carries the per-category baseline (e.g. dead-letter count) for delta logic.
+ * One fingerprint's observation history. `first_seen`/`last_seen` drive the
+ * follow-up staleness stamps and the TTL prune; `held_ticks` drives the
+ * held-across-ticks finalizers; `count` carries the per-category baseline (e.g.
+ * dead-letter count) for delta logic.
  */
 export interface SeenEntry {
   first_seen: number;
   last_seen: number;
-  notification_count: number;
-  last_notified_at: number | null;
   /** Consecutive ticks this fingerprint has been present (held-across-ticks). */
   held_ticks: number;
-  /** Consecutive failed spawn attempts for this fingerprint (retry cap). */
-  spawn_failures: number;
   /** Category-specific baseline count (dead-letter delta etc.); null if N/A. */
   count: number | null;
 }
@@ -2002,11 +1999,17 @@ export function resolveSeenStatePath(): string {
  * Resolve the liveness-heartbeat file path — a sibling of seen.json under
  * `BABYSITTER_STATE_DIR` (default `~/.local/state/babysitters/performance/`).
  * Written as the LAST action on every completed tick path so a hung / crashed
- * tick never touches it; the standalone `watchdog` dead-man reads it and alarms when
- * it goes stale. Pure (no I/O); mirrors {@link resolveSeenStatePath}.
+ * tick never touches it; `/babysit-triage` reads its staleness as the sitter's
+ * liveness signal (the pull-model replacement for the retired watchdog). Pure
+ * (no I/O); mirrors {@link resolveSeenStatePath}.
  */
 export function resolveHeartbeatPath(): string {
   return join(babysitterStateDir(SLUG), "heartbeat.json");
+}
+
+/** The follow-ups corpus dir — one self-contained brief per NEW finding. */
+export function resolveFollowupsDir(): string {
+  return join(babysitterStateDir(SLUG), "followups");
 }
 
 /**
@@ -2014,7 +2017,8 @@ export function resolveHeartbeatPath(): string {
  * tick. Attests "the performance sitter ran a tick to completion," NOT "keeperd is
  * healthy" (daemon-down is a separate detector). DEGRADE-DON'T-THROW: a write
  * failure (missing dir, full disk) is swallowed — a wedged tick is worse than a
- * missed heartbeat (the watchdog's later staleness alarm catches a real death).
+ * missed heartbeat; `/babysit-triage` reads staleness here as the liveness
+ * signal, so a genuinely dead tick simply stops stamping.
  */
 export function writeHeartbeat(path: string, nowSecs: number): void {
   try {
@@ -2022,7 +2026,7 @@ export function writeHeartbeat(path: string, nowSecs: number): void {
     atomicWriteFile(path, `${JSON.stringify({ ts: nowSecs })}\n`);
   } catch {
     // Swallow: never wedge a tick on a heartbeat write. A genuinely dead tick
-    // stops stamping and the external watchdog pages on staleness.
+    // stops stamping and triage's staleness check surfaces the death.
   }
 }
 
@@ -2160,121 +2164,66 @@ export function applyHeldGate(
 }
 
 // ---------------------------------------------------------------------------
-// Dedup diff + cooldown — decide which findings are worth a spawn THIS tick.
+// Dedup diff — decide which gated findings are genuinely NEW this tick.
 // ---------------------------------------------------------------------------
 
-/** A finding paired with WHY it was selected (new vs cooldown-elapsed re-notify). */
-export interface SelectedFinding {
-  finding: Finding;
-  reason: "new" | "renotify";
-}
-
 /**
- * Compute the findings to deliver this tick from the gated findings + the prior
- * seen-state. A finding is selected when ANY of:
- *   - it's genuinely NEW (fingerprint absent from seen-state), OR
- *   - a prior spawn for it FAILED (spawn_failures > 0) and was never delivered
- *     (notification_count === 0) → RETRY immediately (not cooldown-gated; the
- *     human was never actually paged), OR
- *   - it's still present, was previously delivered, and the cooldown has
- *     elapsed since `last_notified_at` → re-notify.
- *
- * In every branch a fingerprint at/over `MAX_SPAWN_RETRIES` spawn_failures is
- * suppressed — a permanently-failing spawn must not re-attempt every tick
- * forever. Pure: no I/O.
+ * The gated findings genuinely NEW this tick: fingerprint absent from the prior
+ * seen-state. A still-present fingerprint is suppressed (no rewrite of the same
+ * follow-up); a fingerprint that re-fires after its TTL prune is absent again,
+ * so it re-selects and gets a fresh follow-up (the resurface rule). Pure: no I/O.
  */
-export function selectToNotify(
-  gated: Finding[],
-  prior: SeenState,
-  nowSecs: number,
-): SelectedFinding[] {
-  const selected: SelectedFinding[] = [];
-  for (const f of gated) {
-    const entry = prior.fingerprints[f.fingerprint];
-    if (entry === undefined) {
-      selected.push({ finding: f, reason: "new" });
-      continue;
-    }
-    if (entry.spawn_failures >= MAX_SPAWN_RETRIES) continue;
-    // A previously-failed-but-never-delivered finding retries straight away —
-    // cooldown is about not re-paging the human, and a failed spawn never paged.
-    if (entry.spawn_failures > 0 && entry.notification_count === 0) {
-      selected.push({ finding: f, reason: "renotify" });
-      continue;
-    }
-    const last = entry.last_notified_at;
-    if (last !== null && nowSecs - last >= COOLDOWN_SECS) {
-      selected.push({ finding: f, reason: "renotify" });
-    }
-  }
-  return selected;
+export function selectNew(gated: Finding[], prior: SeenState): Finding[] {
+  return gated.filter((f) => prior.fingerprints[f.fingerprint] === undefined);
 }
 
 /**
  * Fold a completed tick into a fresh seen-state. Always-pure rebuild from the
  * prior state + this tick's scan results (no in-place mutation):
  *   - every present fingerprint refreshes `last_seen` (+ first_seen on debut),
- *     held_ticks / count from the gate;
- *   - `delivered` fingerprints (agent acked) bump notification_count +
- *     last_notified_at and RESET spawn_failures (a delivered spawn succeeded);
- *   - `spawnFailed` fingerprints (handed to a spawn that failed) increment
- *     spawn_failures;
+ *     held_ticks / count from the gate — EXCEPT a genuinely-new fingerprint
+ *     whose follow-up write FAILED (`writeFailed`), which is dropped so it
+ *     re-selects and retries next tick (best-effort write contract);
  *   - entries whose fingerprint is NOT present this tick AND are older than the
  *     TTL are pruned.
  *
- * Pure: takes maps + arrays, returns the new state.
+ * Pure: takes maps + sets + arrays, returns the new state.
  */
 export function foldSeenState(input: {
   prior: SeenState;
   present: Finding[];
   heldTicks: Map<string, number>;
   counts: Map<string, number>;
-  delivered: Set<string>;
-  spawnFailed: Set<string>;
+  /** Genuinely-new fingerprints whose follow-up write FAILED — do not commit. */
+  writeFailed: Set<string>;
   nowSecs: number;
 }): SeenState {
-  const { prior, present, heldTicks, counts, delivered, spawnFailed, nowSecs } =
-    input;
+  const { prior, present, heldTicks, counts, writeFailed, nowSecs } = input;
   const next: Record<string, SeenEntry> = {};
-  const presentFps = new Set(present.map((f) => f.fingerprint));
+  const committedFps = new Set<string>();
 
   for (const f of present) {
+    // A genuinely-new finding (absent from prior) whose write failed is NOT
+    // committed: leaving it out makes it `selectNew` again next tick so the
+    // write retries. A previously-seen present finding always refreshes.
     const e = prior.fingerprints[f.fingerprint];
+    if (e === undefined && writeFailed.has(f.fingerprint)) continue;
     const heldFromGate = heldTicks.get(f.fingerprint);
     const countFromGate = counts.get(f.fingerprint);
     next[f.fingerprint] = {
       first_seen: e?.first_seen ?? nowSecs,
       last_seen: nowSecs,
-      notification_count: e?.notification_count ?? 0,
-      last_notified_at: e?.last_notified_at ?? null,
       held_ticks: heldFromGate ?? 0,
-      spawn_failures: e?.spawn_failures ?? 0,
       count: countFromGate ?? e?.count ?? null,
     };
+    committedFps.add(f.fingerprint);
   }
 
   // Carry forward not-present entries that are still within the TTL.
   for (const fp of Object.keys(prior.fingerprints)) {
-    if (presentFps.has(fp)) continue;
+    if (committedFps.has(fp)) continue;
     const e = prior.fingerprints[fp];
     if (nowSecs - e.last_seen <= SEEN_TTL_SECS) next[fp] = e;
-  }
-
-  // Apply delivery outcomes.
-  for (const fp of delivered) {
-    const e = next[fp];
-    if (e === undefined) continue;
-    next[fp] = {
-      ...e,
-      notification_count: e.notification_count + 1,
-      last_notified_at: nowSecs,
-      spawn_failures: 0,
-    };
-  }
-  for (const fp of spawnFailed) {
-    const e = next[fp];
-    if (e === undefined) continue;
-    next[fp] = { ...e, spawn_failures: e.spawn_failures + 1 };
   }
 
   // Any fold output is the result of a completed tick → the state is baselined
@@ -2283,134 +2232,83 @@ export function foldSeenState(input: {
 }
 
 // ---------------------------------------------------------------------------
-// Agent spawn — invoke the PLAIN claude binary headless, hard-timeout-killed.
+// Follow-up writer config — the pull-model replacement for the agent spawn.
+//
+// The scanner writes one self-contained brief per genuinely-NEW finding DIRECTLY
+// to the corpus `/babysit-triage` reads (the shared `babysitters/lib/followups`
+// writer), no agent spawn and no page. The body below is this sitter's fixed
+// human-authored instruction block — untrusted DB strings live ONLY inside the
+// fenced `## Evidence` block the lib renders.
 // ---------------------------------------------------------------------------
 
-/** Repo root — cwd for the spawned agent so its Bash runs against the repo. */
-const REPO_ROOT = "/Users/mike/code/keeper";
+/** This sitter's follow-up config: filename prefix + the investigation body. */
+const FOLLOWUP_CONFIG: FollowupConfig = {
+  slug: SLUG,
+  body: (nowIso) =>
+    `You are investigating a keeper finding the babysitter flagged at ${nowIso}.
+Analyze the evidence and propose a fix.
+
+Your task, in order:
+1. Confirm the impact is real (read keeper.db / the relevant projection read-only; do not mutate state).
+2. Locate the suspected root-cause file and region.
+3. Propose a concrete fix.`,
+};
+
+// ---------------------------------------------------------------------------
+// The `--tick` flow — scan, diff vs seen-state, write a follow-up per NEW finding.
+// ---------------------------------------------------------------------------
 
 /**
- * The babysitters plugin dir, loaded via `--plugin-dir` on the agent spawn so
- * the `babysitters:performance` triage agent resolves. Loading the plugin
- * explicitly (NOT via cwd project-agent resolution) keeps the keeper hook plugin
- * UNLOADED — the monitor never pollutes the board it watches.
+ * Inject the follow-up write so tests drive the write path (capture / force a
+ * failure) without touching the real corpus. Returns true on a committed write.
+ * Production binds the shared lib writer to this sitter's config + stamps.
  */
-const BABYSITTERS_PLUGIN_DIR = `${REPO_ROOT}/babysitters`;
+export type WriteFollowupFn = (input: {
+  finding: Finding;
+  nowSecs: number;
+  nowIso: string;
+  stamps: FollowupStamps;
+}) => boolean;
 
-/** The scoped plugin-agent id (`<plugin>:<slug>`) the spawn delegates to. */
-const TRIAGE_AGENT = `babysitters:${SLUG}`;
-
-/** Outcome of an agent spawn: exit code (null on timeout) + acked keys. */
-export interface SpawnResult {
-  /** Process exit code; null iff the hard timeout fired and we killed it. */
-  exitCode: number | null;
-  /** Fingerprints the agent acked as delivered; null if no ack file written. */
-  ackedFingerprints: string[] | null;
-}
-
-/** Injected so tests can capture argv without running a real claude. */
-export type SpawnAgentFn = (input: {
-  /** Frozen findings snapshot file the agent reads. */
-  findingsFile: string;
-  /** Ack file the agent writes delivered fingerprints to. */
-  ackFile: string;
-  /** Combined stdout/stderr log file under the watcher state dir. */
-  logFile: string;
-}) => Promise<SpawnResult>;
-
-/**
- * Production agent spawn (`Bun.spawn`). Invokes the verified PLAIN claude
- * binary (keeps keeper hooks UNLOADED so the monitor never pollutes the board
- * it watches) with `--plugin-dir <babysitters>` so the `babysitters:performance`
- * triage agent resolves, cwd = repo root (so the agent's Bash runs against the
- * repo), and `--permission-mode bypassPermissions`. A hard `AbortController`
- * timeout kills a hung agent before the launchd interval, and we `await
- * proc.exited` (no zombie, never `nohup &`). On exit 0 we read the ack file
- * (agent-written delivered fingerprints); a timeout/non-zero returns no ack.
- */
-export async function spawnAgentLive(input: {
-  findingsFile: string;
-  ackFile: string;
-  logFile: string;
-}): Promise<SpawnResult> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), AGENT_TIMEOUT_MS);
-  timer.unref?.();
-  const logSink = Bun.file(input.logFile);
-  const prompt =
-    `Immediately invoke the Agent tool with agent_type "${TRIAGE_AGENT}" to triage ` +
-    `the findings in ${input.findingsFile} and notify me of anything noteworthy. ` +
-    `Write the fingerprints you delivered (JSON array of strings) to ${input.ackFile}.`;
-  let exitCode: number | null = null;
-  try {
-    const proc = Bun.spawn(
-      [
-        PLAIN_CLAUDE_PATH,
-        "-p",
-        prompt,
-        "--plugin-dir",
-        BABYSITTERS_PLUGIN_DIR,
-        "--permission-mode",
-        "bypassPermissions",
-      ],
-      {
-        cwd: REPO_ROOT,
-        stdin: "ignore",
-        stdout: logSink,
-        stderr: logSink,
-        signal: controller.signal,
-      },
+/** The production follow-up write: the shared lib writer, this sitter's config. */
+export function liveWriteFollowup(followupsDir: string): WriteFollowupFn {
+  return ({ finding, nowSecs, nowIso, stamps }) =>
+    writeFollowup(
+      FOLLOWUP_CONFIG,
+      followupsDir,
+      finding,
+      nowSecs,
+      nowIso,
+      stamps,
     );
-    exitCode = await proc.exited;
-  } catch {
-    // abort / spawn failure → treat as a non-success (no zombie; awaited above).
-    exitCode = null;
-  } finally {
-    clearTimeout(timer);
-  }
-  let ackedFingerprints: string[] | null = null;
-  if (exitCode === 0 && existsSync(input.ackFile)) {
-    try {
-      const parsed = JSON.parse(readFileSync(input.ackFile, "utf8")) as unknown;
-      if (Array.isArray(parsed)) {
-        ackedFingerprints = parsed.filter(
-          (x): x is string => typeof x === "string",
-        );
-      }
-    } catch {
-      ackedFingerprints = null;
-    }
-  }
-  return { exitCode, ackedFingerprints };
 }
-
-// ---------------------------------------------------------------------------
-// The `--tick` flow — scan, diff vs seen-state, escalate on new findings.
-// ---------------------------------------------------------------------------
 
 /** Deps injected into {@link tick} so the whole flow is testable. */
 export interface TickDeps extends ScanDeps {
-  /** Spawn the headless agent (defaults to {@link spawnAgentLive}). */
-  spawnAgent: SpawnAgentFn;
+  /** Write one follow-up file (defaults to {@link liveWriteFollowup}). */
+  writeFollowup: WriteFollowupFn;
 }
 
-/** Production {@link TickDeps}: live probes + the real claude spawn. */
+/** Production {@link TickDeps}: live probes + the shared-lib follow-up writer. */
 export function liveTickDeps(): TickDeps {
-  return { ...liveDeps(), spawnAgent: spawnAgentLive };
+  return {
+    ...liveDeps(),
+    writeFollowup: liveWriteFollowup(resolveFollowupsDir()),
+  };
 }
 
 /**
  * One launchd tick: scan the live DB, apply the held-across-ticks gate, diff
- * vs persistent seen-state, and on genuinely-new (or cooldown-elapsed) findings
- * spawn the headless babysitter agent. Commits seen-state per the delivery
- * outcome:
- *   - cold start / corrupt seen.json → SILENT BASELINE (seed all, no spawn);
+ * vs persistent seen-state, and on genuinely-NEW findings WRITE one follow-up
+ * file each DIRECTLY to the corpus `/babysit-triage` reads — no agent spawn, no
+ * page. Commits seen-state per the outcome:
+ *   - cold start / corrupt seen.json → SILENT BASELINE (seed all, write none);
  *   - no new findings → exit silently, refresh seen-state only;
- *   - agent exit 0 + ack → commit the acked fingerprints as delivered;
- *   - agent exit 0 + no ack → commit ALL handed fingerprints (fallback);
- *   - timeout / non-zero → commit NONE delivered (count the spawn failure).
+ *   - new findings → write each (best-effort), commit only the written ones, fold.
  *
- * Returns a small result for the CLI + tests. Never throws on a corrupt file.
+ * Writes are BEST-EFFORT: a failed write logs, leaves that fingerprint
+ * uncommitted (so it retries next tick), and the tick still exits 0 — never
+ * throws, never wedges. Returns a small result for the CLI + tests.
  */
 export async function tick(
   dbPath: string,
@@ -2420,9 +2318,9 @@ export async function tick(
   heartbeatPath: string = resolveHeartbeatPath(),
 ): Promise<{
   baselined: boolean;
-  spawned: boolean;
+  wrote: boolean;
   selectedCount: number;
-  deliveredCount: number;
+  writtenCount: number;
 }> {
   const nowSecs = deps.nowSecs();
 
@@ -2434,13 +2332,13 @@ export async function tick(
   if (!existsSync(dbPath)) {
     // A missing-DB early return is still a COMPLETED tick (the sitter ran;
     // keeperd simply hasn't booted yet). Stamp the heartbeat as the last action
-    // so the watchdog doesn't false-alarm before first daemon boot.
+    // so triage's staleness check doesn't false-flag before first daemon boot.
     writeHeartbeat(heartbeatPath, nowSecs);
     return {
       baselined: false,
-      spawned: false,
+      wrote: false,
       selectedCount: 0,
-      deliveredCount: 0,
+      writtenCount: 0,
     };
   }
 
@@ -2450,11 +2348,11 @@ export async function tick(
   // Held-across-ticks / delta gate runs against the PRIOR state before we fold.
   const { gated, heldTicks, counts } = applyHeldGate(findings, prior);
 
-  // Cold start / corrupt → silent baseline: seed everything, notify nothing.
+  // Cold start / corrupt → silent baseline: seed everything, write nothing.
   // Keyed on `prior.baselined` (NOT finding count): a fresh / corrupt / missing
   // file loads `baselined:false`, so the first valid tick only establishes the
   // baseline — but a healthy zero-finding tick is already baselined, so the
-  // next genuine finding escalates instead of re-baselining.
+  // next genuine finding gets a follow-up instead of re-baselining.
   if (!prior.baselined) {
     saveSeenState(
       seenStatePath,
@@ -2463,21 +2361,15 @@ export async function tick(
         present: findings,
         heldTicks,
         counts,
-        delivered: new Set(),
-        spawnFailed: new Set(),
+        writeFailed: new Set(),
         nowSecs,
       }),
     );
     writeHeartbeat(heartbeatPath, nowSecs);
-    return {
-      baselined: true,
-      spawned: false,
-      selectedCount: 0,
-      deliveredCount: 0,
-    };
+    return { baselined: true, wrote: false, selectedCount: 0, writtenCount: 0 };
   }
 
-  const selected = selectToNotify(gated, prior, nowSecs);
+  const selected = selectNew(gated, prior);
   if (selected.length === 0) {
     // Nothing new — refresh seen-state (last_seen / held_ticks / TTL prune) and
     // exit silently.
@@ -2488,58 +2380,44 @@ export async function tick(
         present: findings,
         heldTicks,
         counts,
-        delivered: new Set(),
-        spawnFailed: new Set(),
+        writeFailed: new Set(),
         nowSecs,
       }),
     );
     writeHeartbeat(heartbeatPath, nowSecs);
     return {
       baselined: false,
-      spawned: false,
+      wrote: false,
       selectedCount: 0,
-      deliveredCount: 0,
+      writtenCount: 0,
     };
   }
 
-  // Freeze the selected findings to a temp JSON snapshot for the agent.
-  const stateDir = join(seenStatePath, "..");
-  mkdirSync(stateDir, { recursive: true });
-  const selectedFindings = selected.map((s) => s.finding);
-  const handedFingerprints = new Set(
-    selectedFindings.map((f) => f.fingerprint),
-  );
-  const uid = `${process.pid}.${crypto.randomUUID()}`;
-  const findingsFile = join(stateDir, `findings.${uid}.json`);
-  const ackFile = join(stateDir, `ack.${uid}.json`);
-  const logFile = join(stateDir, "agent.log");
-  atomicWriteFile(
-    findingsFile,
-    `${JSON.stringify({ success: true, findings: selectedFindings }, null, 2)}\n`,
-  );
-
-  let delivered = new Set<string>();
-  let spawnFailed = new Set<string>();
-  try {
-    const result = await deps.spawnAgent({ findingsFile, ackFile, logFile });
-    if (result.exitCode === 0) {
-      // Success: commit the acked fingerprints (fallback: no ack → all handed).
-      if (result.ackedFingerprints !== null) {
-        delivered = new Set(
-          result.ackedFingerprints.filter((fp) => handedFingerprints.has(fp)),
-        );
-      } else {
-        delivered = new Set(handedFingerprints);
-      }
-    } else {
-      // Timeout / non-zero: commit none delivered; count the failure so the
-      // per-fingerprint retry cap eventually halts a permanently-failing spawn.
-      spawnFailed = new Set(handedFingerprints);
-    }
-  } finally {
-    // Clean up the per-tick temp files; the agent.log is retained.
-    rmSync(findingsFile, { force: true });
-    rmSync(ackFile, { force: true });
+  // Write one follow-up per genuinely-new finding. The staleness stamps come
+  // from the seen-state on debut (first_seen === last_seen === now this tick).
+  // A failed write is BEST-EFFORT: it leaves the fingerprint uncommitted so the
+  // next tick re-selects + retries — never throws, never wedges the tick.
+  const nowIso = new Date(nowSecs * 1000).toISOString();
+  const firstSeenAt: Record<string, number> = {};
+  for (const f of selected) {
+    firstSeenAt[f.fingerprint] =
+      prior.fingerprints[f.fingerprint]?.first_seen ?? nowSecs;
+  }
+  const writeFailed = new Set<string>();
+  let writtenCount = 0;
+  for (const f of selected) {
+    const firstSeen = firstSeenAt[f.fingerprint];
+    const ok = deps.writeFollowup({
+      finding: f,
+      nowSecs,
+      nowIso,
+      stamps: {
+        first_seen_at: new Date(firstSeen * 1000).toISOString(),
+        last_seen_at: nowIso,
+      },
+    });
+    if (ok) writtenCount += 1;
+    else writeFailed.add(f.fingerprint);
   }
 
   saveSeenState(
@@ -2549,8 +2427,7 @@ export async function tick(
       present: findings,
       heldTicks,
       counts,
-      delivered,
-      spawnFailed,
+      writeFailed,
       nowSecs,
     }),
   );
@@ -2558,9 +2435,9 @@ export async function tick(
   writeHeartbeat(heartbeatPath, nowSecs);
   return {
     baselined: false,
-    spawned: true,
+    wrote: writtenCount > 0,
     selectedCount: selected.length,
-    deliveredCount: delivered.size,
+    writtenCount,
   };
 }
 
@@ -2664,10 +2541,10 @@ export async function main(argv: string[]): Promise<void> {
     return;
   }
   if (args.tick) {
-    // The launchd entry: scan → diff vs seen-state → escalate on new findings.
-    // Always exits 0; silent unless something genuinely new fires (the agent
-    // does the notifying, not the tick). Errors degrade to a baseline, never
-    // a non-zero that would let launchd retry-storm.
+    // The launchd entry: scan → diff vs seen-state → write a follow-up per new
+    // finding. Always exits 0; silent unless something genuinely new fires (the
+    // follow-up corpus is the durable record, read by /babysit-triage). Errors
+    // degrade to a baseline, never a non-zero that would let launchd retry-storm.
     await tick(
       resolveDbPath(),
       args.windowSecs,
