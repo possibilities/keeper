@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T19:50:30.394000Z",
+  "depends_on": [
+    "fn-35-bun-test-suite-and-python-retirement.1"
+  ],
+  "epic": "fn-35-bun-test-suite-and-python-retirement",
+  "id": "fn-35-bun-test-suite-and-python-retirement.7",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "high",
+  "title": "Translate saga lifecycle modules",
+  "updated_at": "2026-06-12T19:50:30.394000Z"
+}
