@@ -22,5 +22,5 @@ test_scaffold and test_validate_marker are the densest edge-case nests in the su
 - [ ] All listed modules translated/cited/dropped with reasons; both suites green incl. PLANCTL_RUN_SLOW=1
 
 ## Done summary
-
+Translated the creation-machinery half of the pytest suite onto the bun harness: scaffold (47, slow-gated), refine-apply (26), refine-context (9), validate-marker (26), epic-rm (10), creation-epic-ops (34: add-dep/add-deps/close/queue-jump/set-tier/set-*-repo warnings), validate/multi-repo/resolve-task (7 + citations) across 7 test files; every node mapped by a source-comment (translated | cited bun unit | python_only drop). bun test green fast + PLANCTL_RUN_SLOW=1. The saga lifecycle half is queued for follow-up.
 ## Evidence
