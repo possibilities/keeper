@@ -50,5 +50,5 @@ wiring); `bun run lint` green; `rg -il babysit` clean outside .planctl/.
 - [ ] `rg -il babysit` finds nothing outside .planctl/
 
 ## Done summary
-
+Removed the extracted babysitter tree from keeper: deleted babysitters/, 5 sitter tests, 2 babysit commands, and 4 sitter plists; un-wired package.json/tsconfig and pruned CLAUDE.md/README references to ~/code/sitter pointers. test:full and lint green; rg -il babysit clean outside .planctl/.
 ## Evidence
