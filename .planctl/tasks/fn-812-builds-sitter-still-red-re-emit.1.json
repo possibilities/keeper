@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T22:31:16.017000Z",
+  "depends_on": [],
+  "epic": "fn-812-builds-sitter-still-red-re-emit",
+  "id": "fn-812-builds-sitter-still-red-re-emit.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/sitter",
+  "tier": "high",
+  "title": "Still-red aging re-emit",
+  "updated_at": "2026-06-12T22:31:16.017000Z"
+}
