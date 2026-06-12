@@ -22,5 +22,5 @@ test in the same commit (shared file-touch on the close-preflight surface).
 - [ ] lint, typecheck, and `bun test` (fast + slow) green
 
 ## Done summary
-
+trailerProjectRoot now expands a tilde --project before its absolute check, mirroring the close-preflight verb, so a ~-form --project from a non-project cwd resolves through the project root with no spurious missing-project trailer error; regression test added in saga-close-preflight.test.ts.
 ## Evidence
