@@ -60,5 +60,5 @@ bun test + lint stay green (docs-only change otherwise).
 - [ ] charter.md Sitter facts verified against the producer doc (drift fixed in ~/docs or confirmed none)
 
 ## Done summary
-
+Verified and landed the gitpolice docs/plist deliverables: plist (plutil-clean), agents/gitpolice.md, README/CLAUDE.md/FINDINGS-LEDGER.md all name both sitters and point schema-pin at lib/. Completed the tree (lint scope + dup pin-test removal) and fixed the charter Sitter facts (NOT YET BUILT -> BUILT) as a separate ~/docs commit.
 ## Evidence
