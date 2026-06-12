@@ -68,5 +68,5 @@ consistency with the files that actually exist.
 - [ ] Surviving watch plist lints and carries no vestigial PATH entries
 
 ## Done summary
-
+Brought all docs and install surfaces to the page-free pull model: rewrote agents/performance.md as producer documentation, redefined the FINDINGS-LEDGER denominator + resurface anchor, collapsed README install/uninstall/architecture, deleted the watchdog plist, and stripped the vestigial ~/.local/bin PATH from the watch plist.
 ## Evidence
