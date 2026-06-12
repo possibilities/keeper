@@ -31,7 +31,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import type { FollowupStamps } from "../babysitters/lib/followups";
+import {
+  type FollowupConfig,
+  type FollowupFinding,
+  type FollowupStamps,
+  renderFollowup,
+  sanitizeKey,
+} from "../babysitters/lib/followups";
 import {
   applyHeldGate,
   BACKSTOP_BASELINE_VERSION,
@@ -2343,6 +2349,68 @@ describe("tick", () => {
     expect(body).toContain("## Evidence");
     // latest.md mirrors it (a regular file, never a symlink).
     expect(existsSync(join(followupsDir, "latest.md"))).toBe(true);
+  });
+});
+
+
+// ===========================================================================
+// followups writer untrusted-input hardening (F5 + F6): the fence
+// neutralization and sanitizeKey edge cases are the load-bearing path-safety
+// surface, pinned directly on the pure renderers (no disk, no tick).
+// ===========================================================================
+
+describe("renderFollowup fence neutralization (F5)", () => {
+  const config: FollowupConfig = {
+    slug: "performance",
+    body: () => "fixed instructions",
+  };
+  const baseFinding: FollowupFinding = {
+    key: "k1",
+    fingerprint: "fp1",
+    severity: "warn",
+    category: "test",
+    title: "t",
+    detail: "d",
+    evidence: {},
+  };
+
+  test("a triple-backtick in detail is neutralized so it cannot break the fence", () => {
+    const finding: FollowupFinding = {
+      ...baseFinding,
+      detail: "```js\nmalicious()\n```",
+    };
+    const body = renderFollowup(config, finding, "2026-01-01T00:00:00Z");
+    // The hostile detail must not contribute a literal ``` run.
+    expect(body).not.toContain("```js");
+    // Exactly two real fence markers survive — the opener and closer of the
+    // single Evidence block this writer emits.
+    expect(body.match(/```/g)).toHaveLength(2);
+    // The neutralized echo is still present (rewritten to the safe glyph).
+    expect(body).toContain("ʼʼʼjs");
+  });
+
+  test("a triple-backtick in an evidence value is neutralized", () => {
+    const finding: FollowupFinding = {
+      ...baseFinding,
+      evidence: { note: "```break```" },
+    };
+    const body = renderFollowup(config, finding, "2026-01-01T00:00:00Z");
+    expect(body.match(/```/g)).toHaveLength(2);
+    expect(body).toContain("ʼʼʼbreakʼʼʼ");
+  });
+});
+
+describe("sanitizeKey edge cases (F6)", () => {
+  test("a key that is all-illegal sanitizes to empty", () => {
+    expect(sanitizeKey("///...///")).toBe("");
+  });
+
+  test("caps the slug at 150 chars", () => {
+    expect(sanitizeKey("a".repeat(300))).toHaveLength(150);
+  });
+
+  test("strips NUL bytes before slugging", () => {
+    expect(sanitizeKey("ab\0cd")).toBe("abcd");
   });
 });
 
