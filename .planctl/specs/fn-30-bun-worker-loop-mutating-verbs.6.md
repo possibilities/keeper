@@ -27,5 +27,5 @@ The long tail of an eight-verb binary meeting four test modules; expect small di
 - [ ] Canonical gate invocation in the Running Things tables matches reality
 
 ## Done summary
-
+Capped the wave: ran the full gate matrix (bun serial + parallel, Python module set, fast gate, full conformance, bun lint/typecheck/test) all green. Verified docs (authority verb-list, dropped read-only qualifier, README) already current from prior tasks; added --run-slow to the canonical bun gate row so it actually exercises test_init.py's real_git commit tests.
 ## Evidence
