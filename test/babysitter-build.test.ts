@@ -46,6 +46,7 @@ const SITTER_ENTRYPOINTS = [
   "babysitters/performance/watchdog.ts",
   "babysitters/builds/watch.ts",
   "babysitters/builds/watchdog.ts",
+  "babysitters/helptailing/watch.ts",
 ] as const;
 
 describe("babysitter import-pin (fn-766)", () => {
