@@ -36,5 +36,5 @@ Exit: full tests/test_readonly_verbs.py green against dist/planctl-bun; bun test
 - [ ] biome/tsc/bun test green; no Python file touched
 
 ## Done summary
-
+Ported the store/models/ids spine (loadJsonSafe, read-never-creates runtime overlay, nowIso/getActor contracts, normalize/merge, parseId) and the detect/status/epics read-only verbs to planctl-bun; the full tests/test_readonly_verbs.py is green against the compiled binary, with bun:test units pinning nowIso/getActor and the schema_version 0/1 asymmetry preserved.
 ## Evidence

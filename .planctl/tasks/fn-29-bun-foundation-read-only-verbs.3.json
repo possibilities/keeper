@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Port detect status epics spine",
-  "updated_at": "2026-06-12T08:28:15.850721Z"
+  "updated_at": "2026-06-12T08:53:04.286615Z",
+  "worker_done_at": "2026-06-12T08:53:04.286615Z"
 }
