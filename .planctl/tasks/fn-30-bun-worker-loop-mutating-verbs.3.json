@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Mutating invocation commit emit seam",
-  "updated_at": "2026-06-12T09:13:14.626060Z"
+  "updated_at": "2026-06-12T09:32:21.905979Z",
+  "worker_done_at": "2026-06-12T09:32:21.905979Z"
 }

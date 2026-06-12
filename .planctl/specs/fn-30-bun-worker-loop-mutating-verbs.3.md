@@ -36,5 +36,5 @@ bun units green against real git incl. fresh-repo "unknown" prev-sha and content
 - [ ] tests/test_commit.py assertion set represented in bun units
 
 ## Done summary
-
+Ported the committing seam to planctl-bun: mutating buildPlanctlInvocation (fail-closed session id, touched∩dirty intersection with --untracked-files=all, wire field order, path-traversal rejection), src/commit.ts (autoCommitFromInvocation, em-dash subject builder, forensic trailers, bounded contention-retry classification), and the emitMutating path in cli.ts (commit-before-print, compact commit_failed envelope + exit 1, NDJSON success line). Bun units port tests/test_commit.py.
 ## Evidence
