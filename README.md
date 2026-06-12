@@ -2436,8 +2436,8 @@ missed-wake delta keys off `rescues_total` (the bad-outcome counter, not total
 wake-ups), and the late-rescue arm classifies on `change_to_rescue_ms` — the TRUE
 change-to-rescue latency (observation_ts − event_ts: `now − committed_at` for the
 change the heartbeat discharged) — NOT the idle-inflated `staleness_ms` (`now −
-last_fast_path_at`, which balloons with quiet minutes; the 2026-06-10
-false-critical reported 1611s for a 2s-old commit rescued after 27 idle minutes).
+last_fast_path_at`, which balloons with quiet minutes — an idle-inflated value
+never reflects the true change-to-rescue latency).
 Latency < 10s (or null — a dirty-tree/cold-boot rescue or an old-format line) is
 HEALTHY; ≥ 10s warns, ≥ 60s is critical. The alarm fires only on a rescue whose
 `ts` exceeds a per-bucket high-watermark cursor persisted in the
