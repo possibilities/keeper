@@ -16,7 +16,8 @@ import { didSelfEmit } from "./emit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
 import { buildPlanctlInvocationReadonly } from "./invocation.ts";
 import { resolveProject } from "./project.ts";
-import { dispatchGroup, type GroupSpec } from "./subgroup.ts";
+import { dispatchGroup, type GroupSpec, leafUsageError } from "./subgroup.ts";
+import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
 import { runCat } from "./verbs/cat.ts";
 import { runClaim } from "./verbs/claim.ts";
@@ -37,6 +38,7 @@ import {
 } from "./verbs/epic_short_circuit.ts";
 import { runEpics } from "./verbs/epics.ts";
 import { runFindTaskCommit } from "./verbs/find_task_commit.ts";
+import { runFollowupSubmit } from "./verbs/followup_submit.ts";
 import { runInit } from "./verbs/init.ts";
 import { runList } from "./verbs/list.ts";
 import { runReady } from "./verbs/ready.ts";
@@ -57,6 +59,7 @@ import { runTaskSetTargetRepo } from "./verbs/task_set_target_repo.ts";
 import { runTaskSetTier } from "./verbs/task_set_tier.ts";
 import { runTasks } from "./verbs/tasks.ts";
 import { runValidate } from "./verbs/validate.ts";
+import { runVerdictSubmit } from "./verbs/verdict_submit.ts";
 import { runWorkerResume } from "./verbs/worker_resume.ts";
 
 // Re-export the emit seam from its module so existing importers keep their
@@ -73,7 +76,14 @@ const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
 // Subgroups ("planctl <group> <sub>"). A subgroup owns its own --help and
 // subcommand dispatch, so post-command --help is routed to the group, not the
 // top-level help.
-const SUBGROUP_NAMES = new Set(["epic", "task", "worker"]);
+const SUBGROUP_NAMES = new Set([
+  "audit",
+  "epic",
+  "followup",
+  "task",
+  "verdict",
+  "worker",
+]);
 
 // Whether a verb already printed its own planctl_invocation-bearing envelope is
 // a RUNTIME fact (claim/block via emitReadonly, done via emitMutating always
@@ -89,6 +99,11 @@ interface CommandSpec {
 
 // Registration order = help-listing order (alphabetical, matching click).
 const COMMANDS: CommandSpec[] = [
+  {
+    name: "audit",
+    shortHelp: "Close-phase audit-artifact submit verbs.",
+    implemented: true,
+  },
   { name: "block", shortHelp: "Mark a task as blocked.", implemented: true },
   {
     name: "cat",
@@ -111,6 +126,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "find-task-commit",
     shortHelp: "Look up a task's source commits.",
+    implemented: true,
+  },
+  {
+    name: "followup",
+    shortHelp: "Close-phase follow-up-plan submit verb.",
     implemented: true,
   },
   {
@@ -177,6 +197,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "validate",
     shortHelp: "Validate project data integrity.",
+    implemented: true,
+  },
+  {
+    name: "verdict",
+    shortHelp: "Close-phase verdict submit verb.",
     implemented: true,
   },
   {
@@ -457,6 +482,133 @@ const WORKER_GROUP: GroupSpec = {
   ],
 };
 
+// Close-phase submit subgroups (audit/verdict/followup submit). Each uses
+// FormattedGroup semantics: the leaf emits {success:true,...} via formatOutput
+// (or the typed error envelope + exit 1) and NO trailing planctl_invocation line
+// fires (the group dispatch returns before emitTrailer). All three are
+// runtime-state-only — zero .planctl/ commits.
+const AUDIT_RISK_CHOICES = ["Low", "Medium", "High"];
+
+const AUDIT_GROUP: GroupSpec = {
+  name: "audit",
+  description: "Close-phase audit-artifact submit verbs.",
+  commands: [
+    {
+      name: "submit",
+      shortHelp: "Persist the quality-auditor's report markdown (commit-free).",
+      run: (rest, format) => {
+        const valueTaking = new Set([
+          "--file",
+          "--findings",
+          "--risk",
+          "--project",
+        ]);
+        const [epicId] = leafPositionals(rest, valueTaking);
+        const findingsRaw = leafOption(rest, "--findings");
+        // --file / --risk are click `required=True`; --risk is a click.Choice.
+        // click validates these at PARSE time (exit 2), before the verb body.
+        const fileArg = leafOption(rest, "--file");
+        if (fileArg === null) {
+          leafUsageError(
+            "audit",
+            "submit",
+            "EPIC_ID",
+            "Missing option '--file'.",
+          );
+        }
+        const riskArg = leafOption(rest, "--risk");
+        if (riskArg === null) {
+          leafUsageError(
+            "audit",
+            "submit",
+            "EPIC_ID",
+            "Missing option '--risk'. Choose from:\n\tLow,\n\tMedium,\n\tHigh",
+          );
+        }
+        if (!AUDIT_RISK_CHOICES.includes(riskArg)) {
+          leafUsageError(
+            "audit",
+            "submit",
+            "EPIC_ID",
+            `Invalid value for '--risk': '${riskArg}' is not one of ` +
+              "'Low', 'Medium', 'High'.",
+          );
+        }
+        runAuditSubmit({
+          epicId: epicId ?? "",
+          file: fileArg,
+          findings: findingsRaw === null ? 0 : Number.parseInt(findingsRaw, 10),
+          risk: riskArg,
+          project: leafOption(rest, "--project"),
+          format,
+        });
+      },
+    },
+  ],
+};
+
+const VERDICT_GROUP: GroupSpec = {
+  name: "verdict",
+  description: "Close-phase verdict submit verb.",
+  commands: [
+    {
+      name: "submit",
+      shortHelp:
+        "Validate + persist the close-planner's verdict JSON (commit-free).",
+      run: (rest, format) => {
+        const valueTaking = new Set(["--file", "--project"]);
+        const [epicId] = leafPositionals(rest, valueTaking);
+        const fileArg = leafOption(rest, "--file");
+        if (fileArg === null) {
+          leafUsageError(
+            "verdict",
+            "submit",
+            "EPIC_ID",
+            "Missing option '--file'.",
+          );
+        }
+        runVerdictSubmit({
+          epicId: epicId ?? "",
+          file: fileArg,
+          project: leafOption(rest, "--project"),
+          format,
+        });
+      },
+    },
+  ],
+};
+
+const FOLLOWUP_GROUP: GroupSpec = {
+  name: "followup",
+  description: "Close-phase follow-up-plan submit verb.",
+  commands: [
+    {
+      name: "submit",
+      shortHelp:
+        "Validate + persist the close-planner's follow-up plan YAML (commit-free).",
+      run: (rest, format) => {
+        const valueTaking = new Set(["--file", "--project"]);
+        const [epicId] = leafPositionals(rest, valueTaking);
+        const fileArg = leafOption(rest, "--file");
+        if (fileArg === null) {
+          leafUsageError(
+            "followup",
+            "submit",
+            "EPIC_ID",
+            "Missing option '--file'.",
+          );
+        }
+        runFollowupSubmit({
+          epicId: epicId ?? "",
+          file: fileArg,
+          project: leafOption(rest, "--project"),
+          format,
+        });
+      },
+    },
+  ],
+};
+
 interface ParsedArgs {
   format: OutputFormat | null;
   help: boolean;
@@ -722,6 +874,17 @@ function dispatch(parsed: ParsedArgs): number {
         format,
       });
       break;
+    case "audit":
+      // Subgroup: `submit` emits via format_output with NO planctl_invocation
+      // footer (FormattedGroup; the group dispatch returns before the trailer).
+      dispatchGroup(AUDIT_GROUP, rest, format);
+      return 0;
+    case "verdict":
+      dispatchGroup(VERDICT_GROUP, rest, format);
+      return 0;
+    case "followup":
+      dispatchGroup(FOLLOWUP_GROUP, rest, format);
+      return 0;
     case "worker":
       // Subgroup: dispatch the leaf (or group help). `resume` emits via
       // format_output with NO planctl_invocation footer (the group dispatch

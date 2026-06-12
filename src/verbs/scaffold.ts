@@ -43,7 +43,11 @@ import {
   loadJsonSafe,
   nowIso,
 } from "../store.ts";
-import { parseYamlInput, readYamlBytes } from "../yaml_input.ts";
+import {
+  MAX_YAML_BYTES,
+  parseYamlInput,
+  readYamlBytes,
+} from "../yaml_input.ts";
 
 interface ScaffoldArgs {
   file: string;
@@ -78,6 +82,324 @@ function isListOfInt(v: unknown): v is number[] {
  * form). Only strings reach the !r sites in scaffold's emitted details. */
 function pyReprStr(v: string): string {
   return `'${v}'`;
+}
+
+/** The dry-run validation verdict from validateScaffoldYaml — scaffold's
+ * structural verdict WITHOUT minting. On success `ok` is true and `nTasks`
+ * carries the task count; on failure `ok` is false and the
+ * code/message/details triplet describes the dominant error class in
+ * scaffold's exact priority order. Mirrors ScaffoldValidation. */
+export interface ScaffoldValidation {
+  ok: boolean;
+  nTasks: number;
+  code: string;
+  message: string;
+  details: string[];
+}
+
+function validationFailure(
+  code: string,
+  message: string,
+  details: string[],
+): ScaffoldValidation {
+  return { ok: false, nTasks: 0, code, message, details };
+}
+
+/** Run scaffold's read-cap + parse + Phase-2 validation, NO mutation — the
+ * validate half of scaffold's assert-all -> mutate -> emit flow, factored so a
+ * caller that wants scaffold's structural verdict WITHOUT minting anything
+ * (followup submit's dry-run) shares the exact leaf checkers (isStr,
+ * isListOfStr, isListOfInt, ensureValidTaskSpec, detectCycles, the tier
+ * validator) and the exact failure-code priority order scaffold itself uses.
+ *
+ * Does NOT allocate ids and does NOT run the filesystem integrity gate — those
+ * are mint-only steps. `checkEpicDeps` controls the lazy resolveEpicGlobally
+ * existence pass for declared depends_on_epics. Mirrors validate_scaffold_yaml;
+ * runScaffold keeps its own inline flow (it threads parsed forward-data into the
+ * mutate phase), the two kept behavior-identical by the divergence conformance
+ * tests rather than a shared parsed-data return. */
+export function validateScaffoldYaml(
+  rawBytes: Buffer,
+  fileLabel: string,
+  checkEpicDeps = true,
+): ScaffoldValidation {
+  if (rawBytes.length > MAX_YAML_BYTES) {
+    return validationFailure(
+      "bad_yaml",
+      `YAML exceeds ${MAX_YAML_BYTES} bytes (got ${rawBytes.length})`,
+      [`file: ${fileLabel}`],
+    );
+  }
+
+  let doc: unknown;
+  try {
+    doc = parseYamlInput(rawBytes, fileLabel);
+  } catch (exc) {
+    if (isYamlInputError(exc)) {
+      return validationFailure("bad_yaml", exc.message, exc.details);
+    }
+    throw exc;
+  }
+
+  const errors: string[] = [];
+  if (!isPlainObject(doc)) {
+    return validationFailure(
+      "bad_yaml",
+      "Top-level YAML must be a mapping with `epic:` and `tasks:` keys",
+      [`got: ${typeName(doc)}`],
+    );
+  }
+
+  let epicNode = doc.epic;
+  let tasksNode = doc.tasks;
+  if (!isPlainObject(epicNode)) {
+    errors.push("epic: must be a mapping");
+    epicNode = {};
+  }
+  if (!Array.isArray(tasksNode)) {
+    errors.push("tasks: must be a list");
+    tasksNode = [];
+  }
+  if (errors.length > 0) {
+    return validationFailure("bad_yaml", "Invalid scaffold YAML shape", errors);
+  }
+
+  const epic = epicNode as Record<string, unknown>;
+  const tasks = tasksNode as unknown[];
+
+  // --- Epic-level validation (mirrors runScaffold Phase 2) ----------------
+  const epicTitle = epic.title;
+  if (!isStr(epicTitle) || epicTitle.trim() === "") {
+    errors.push("epic: `title` must be a non-empty string");
+  }
+
+  const epicBranch = epic.branch;
+  if (epicBranch !== undefined && epicBranch !== null && !isStr(epicBranch)) {
+    errors.push("epic: `branch` must be a string when present");
+  }
+
+  const epicSpec = "spec" in epic ? epic.spec : "";
+  if (!isStr(epicSpec)) {
+    errors.push("epic: `spec` must be a string (use a `|` block scalar)");
+  }
+
+  let epicQueueJump = "queue_jump" in epic ? epic.queue_jump : false;
+  if (typeof epicQueueJump !== "boolean") {
+    errors.push(
+      "epic: `queue_jump` must be a boolean (true|false) when present",
+    );
+    epicQueueJump = false;
+  }
+
+  const epicDepErrors: string[] = [];
+  let dependsOnEpics: string[] = [];
+  const dependsOnRaw = "depends_on_epics" in epic ? epic.depends_on_epics : [];
+  if (!isListOfStr(dependsOnRaw)) {
+    epicDepErrors.push("epic: `depends_on_epics` must be a list of strings");
+    dependsOnEpics = [];
+  } else {
+    dependsOnEpics = dependsOnRaw;
+    const seenDeps = new Set<string>();
+    for (const depId of dependsOnEpics) {
+      if (!isEpicId(depId)) {
+        epicDepErrors.push(
+          `epic: depends_on_epics id ${pyReprStr(depId)} is not a valid epic id`,
+        );
+      }
+      if (seenDeps.has(depId)) {
+        epicDepErrors.push(
+          `epic: depends_on_epics id ${pyReprStr(depId)} is duplicated`,
+        );
+      }
+      seenDeps.add(depId);
+    }
+  }
+
+  // --- Task-level validation ----------------------------------------------
+  const nTasks = tasks.length;
+  if (nTasks === 0) {
+    errors.push("tasks: must contain at least one entry");
+  }
+
+  const taskDepsList: number[][] = [];
+  const specErrors: string[] = [];
+  const depErrors: string[] = [];
+  const repoErrors: string[] = [];
+  const tierErrors: string[] = [];
+
+  for (let idx = 0; idx < nTasks; idx += 1) {
+    const i = idx + 1;
+    const prefix = `task #${i}`;
+    const entry = tasks[idx];
+    if (!isPlainObject(entry)) {
+      errors.push(`${prefix}: must be a mapping`);
+      taskDepsList.push([]);
+      continue;
+    }
+
+    const title = entry.title;
+    if (!isStr(title) || title.trim() === "") {
+      errors.push(`${prefix}: \`title\` must be a non-empty string`);
+    }
+
+    const spec = entry.spec;
+    if (!isStr(spec) || spec.trim() === "") {
+      specErrors.push(`${prefix}: \`spec\` must be a non-empty string`);
+    } else {
+      try {
+        ensureValidTaskSpec(spec);
+      } catch (exc) {
+        specErrors.push(`${prefix}: spec invalid: ${errMessage(exc)}`);
+      }
+    }
+
+    let deps = "deps" in entry ? entry.deps : [];
+    if (!isListOfInt(deps)) {
+      depErrors.push(
+        `${prefix}: \`deps\` must be a list of 1-based ordinal integers`,
+      );
+      deps = [];
+    } else {
+      for (const ordVal of deps) {
+        if (ordVal < 1 || ordVal > nTasks) {
+          depErrors.push(
+            `${prefix}: dep ordinal ${ordVal} out of range (must be 1..${nTasks})`,
+          );
+        } else if (ordVal === i) {
+          depErrors.push(
+            `${prefix}: dep ordinal ${ordVal} is self-referential`,
+          );
+        }
+      }
+    }
+    taskDepsList.push(isListOfInt(deps) ? [...deps] : []);
+
+    const targetRepoRaw = "target_repo" in entry ? entry.target_repo : null;
+    if (targetRepoRaw !== null && targetRepoRaw !== undefined) {
+      if (!isStr(targetRepoRaw)) {
+        errors.push(`${prefix}: \`target_repo\` must be a string when present`);
+      } else {
+        const stripped = targetRepoRaw.trim();
+        if (stripped === "") {
+          repoErrors.push(
+            `${prefix}: \`target_repo\` must be non-empty after strip`,
+          );
+        } else if (!(stripped.startsWith("/") || stripped.startsWith("~"))) {
+          repoErrors.push(
+            `${prefix}: \`target_repo\` ${pyReprStr(targetRepoRaw)} must be an ` +
+              "absolute path (starts with / or ~)",
+          );
+        }
+      }
+    }
+
+    const tierRaw = "tier" in entry ? entry.tier : null;
+    if (tierRaw === null || tierRaw === undefined) {
+      tierErrors.push(
+        `${prefix}: \`tier\` is required (missing) — must be one of ` +
+          `${TASK_TIERS.join(", ")}`,
+      );
+    } else if (!isStr(tierRaw)) {
+      errors.push(`${prefix}: \`tier\` must be a string`);
+    } else if (!(TASK_TIERS as readonly string[]).includes(tierRaw)) {
+      tierErrors.push(
+        `${prefix}: \`tier\` ${pyReprStr(tierRaw)} is not one of ${TASK_TIERS.join(", ")}`,
+      );
+    }
+  }
+
+  // Failure-code priority order — identical to scaffold's run().
+  if (errors.length > 0) {
+    return validationFailure("bad_yaml", "Invalid scaffold YAML shape", [
+      ...errors,
+      ...specErrors,
+      ...depErrors,
+      ...epicDepErrors,
+      ...repoErrors,
+      ...tierErrors,
+    ]);
+  }
+
+  if (
+    checkEpicDeps &&
+    dependsOnEpics.length > 0 &&
+    epicDepErrors.length === 0
+  ) {
+    for (const depId of dependsOnEpics) {
+      const depResolution = resolveEpicGlobally(depId);
+      if (depResolution.ambiguous) {
+        const owners = depResolution.owners.join(", ");
+        epicDepErrors.push(
+          `epic: depends_on_epics id ${pyReprStr(depId)} resolves to ` +
+            `multiple projects: ${owners}`,
+        );
+      } else if (!depResolution.resolved) {
+        epicDepErrors.push(
+          `epic: depends_on_epics id ${pyReprStr(depId)} does not exist`,
+        );
+      }
+    }
+  }
+
+  if (specErrors.length > 0) {
+    return validationFailure(
+      "spec_invalid",
+      "One or more task specs failed validation",
+      [
+        ...specErrors,
+        ...depErrors,
+        ...epicDepErrors,
+        ...repoErrors,
+        ...tierErrors,
+      ],
+    );
+  }
+  if (depErrors.length > 0) {
+    return validationFailure(
+      "dep_invalid",
+      "One or more task dependencies are invalid",
+      [...depErrors, ...epicDepErrors, ...repoErrors, ...tierErrors],
+    );
+  }
+  if (epicDepErrors.length > 0) {
+    return validationFailure(
+      "epic_dep_invalid",
+      "One or more epic-level dependencies are invalid",
+      [...epicDepErrors, ...repoErrors, ...tierErrors],
+    );
+  }
+  if (repoErrors.length > 0) {
+    return validationFailure(
+      "repo_invalid",
+      "One or more task `target_repo` values are invalid",
+      [...repoErrors, ...tierErrors],
+    );
+  }
+  if (tierErrors.length > 0) {
+    return validationFailure(
+      "tier_invalid",
+      "One or more task `tier` values are invalid",
+      tierErrors,
+    );
+  }
+
+  // --- Cycle detection on the in-memory ordinal graph ---------------------
+  const graph: Record<string, { depends_on: string[] }> = {};
+  for (let i = 1; i <= nTasks; i += 1) {
+    graph[String(i)] = {
+      depends_on: (taskDepsList[i - 1] as number[]).map((d) => String(d)),
+    };
+  }
+  const cycle = detectCycles(graph);
+  if (cycle) {
+    return validationFailure(
+      "dep_cycle",
+      "Task dependency graph contains a cycle",
+      [`cycle: ${cycle.join(" -> ")}`],
+    );
+  }
+
+  return { ok: true, nTasks, code: "", message: "", details: [] };
 }
 
 export function runScaffold(args: ScaffoldArgs): number {

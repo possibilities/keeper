@@ -49,6 +49,23 @@ export function noSuchSubcommand(group: string, name: string): never {
   process.exit(2);
 }
 
+/** click's parameter usage error on a leaf subcommand (e.g. an out-of-Choice
+ * --risk): the leaf's own Usage line + try-help on stderr, then `Error:
+ * <message>`, exit 2. `argsHint` is the trailing usage tail (e.g. "EPIC_ID") so
+ * the line reads `Usage: planctl <group> <sub> [OPTIONS] <argsHint>`. */
+export function leafUsageError(
+  group: string,
+  sub: string,
+  argsHint: string,
+  message: string,
+): never {
+  const tail = argsHint ? ` ${argsHint}` : "";
+  process.stderr.write(`Usage: ${PROG} ${group} ${sub} [OPTIONS]${tail}\n`);
+  process.stderr.write(`Try '${PROG} ${group} ${sub} --help' for help.\n\n`);
+  process.stderr.write(`Error: ${message}\n`);
+  process.exit(2);
+}
+
 /** Wrap `text` to `width`, emitting the first line bare and every continuation
  * line prefixed with `indent` spaces — the layout click.HelpFormatter.write_dl
  * produces for a definition's help column. Greedy word wrap on single spaces
