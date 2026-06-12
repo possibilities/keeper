@@ -31,5 +31,5 @@ Green three ways: default engine, PLANCTL_BIN=python planctl, fast gate unchange
 - [ ] Verdict golden corpus covers every schema keyword + cross-field rule with exact Python message text
 
 ## Done summary
-
+Added tests/test_gist.py (first gist coverage: PATH-shim fake gh, success envelope, file set, --public, gh-failure; wire-marked, green both engines) and the verdict-reject golden corpus (one golden per schema keyword + cross-field rule with exact python-jsonschema message text) plus a regenerable generator and sync-guard test.
 ## Evidence
