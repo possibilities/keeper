@@ -39,6 +39,7 @@ import { runList } from "./verbs/list.ts";
 import { runReady } from "./verbs/ready.ts";
 import { runRefineContext } from "./verbs/refine_context.ts";
 import { runResolveTask } from "./verbs/resolve_task.ts";
+import { runScaffold } from "./verbs/scaffold.ts";
 import { runShow } from "./verbs/show.ts";
 import { runStatePath } from "./verbs/state_path.ts";
 import { runStatus } from "./verbs/status.ts";
@@ -124,6 +125,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "resolve-task",
     shortHelp: "Routing lookup to launch /plan:work.",
+    implemented: true,
+  },
+  {
+    name: "scaffold",
+    shortHelp: "Materialize a whole epic tree from one YAML.",
     implemented: true,
   },
   {
@@ -573,6 +579,14 @@ function dispatch(parsed: ParsedArgs): number {
     case "task":
       dispatchGroup(TASK_GROUP, rest, format);
       return 0;
+    case "scaffold":
+      // Self-emits (emitMutating on success / emitFailureEnvelope on failure)
+      // and owns its exit code — return it directly, no generic trailer.
+      return runScaffold({
+        file: readOption(rest, "--file") ?? "",
+        allowDuplicate: readFlag(rest, "--allow-duplicate"),
+        createdByCloseOf: null,
+      });
     case "show": {
       const id = readPositional(rest);
       runShow(id, format);

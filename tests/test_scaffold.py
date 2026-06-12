@@ -853,6 +853,7 @@ tasks:
     assert t3["target_repo"] == primary
 
 
+@pytest.mark.python_only
 @pytest.mark.integration
 def test_scaffold_target_repo_tilde_expansion(planctl_git_repo, monkeypatch):
     """~ expansion: persisted target_repo must be the canonicalised absolute path.
@@ -1037,6 +1038,7 @@ def test_scaffold_fresh_epic_emit_covers_one_commit(planctl_git_repo):
     )
 
 
+@pytest.mark.python_only
 @pytest.mark.integration
 def test_scaffold_integrity_failure_aborts_no_writes(planctl_git_repo, monkeypatch):
     """Acceptance (b): a structural integrity failure on the in-memory tree
@@ -1163,6 +1165,7 @@ def test_scaffold_missing_session_id_writes_nothing(planctl_git_repo, monkeypatc
     )
 
 
+@pytest.mark.python_only
 @pytest.mark.integration
 def test_scaffold_invocation_raise_persists_written_tree(planctl_git_repo, monkeypatch):
     """A raise in build_planctl_invocation (after the tree is on disk,
@@ -1596,6 +1599,7 @@ def test_scaffold_queue_jump_non_bool_is_bad_yaml(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only
 @pytest.mark.integration
 def test_scaffold_integrity_failure_leaves_scan_max_unchanged(
     planctl_git_repo, monkeypatch
@@ -1660,6 +1664,7 @@ def test_scaffold_integrity_failure_leaves_scan_max_unchanged(
     )
 
 
+@pytest.mark.python_only
 @pytest.mark.integration
 def test_scaffold_integrity_failure_writes_no_spec_files_at_all(
     planctl_git_repo, monkeypatch
