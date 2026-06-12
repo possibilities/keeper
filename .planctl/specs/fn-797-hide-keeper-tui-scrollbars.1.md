@@ -65,5 +65,5 @@ update it in the same commit.
 - [ ] `bun run test:opentui` passes, with any right-edge frame expectation updated in the same commit
 
 ## Done summary
-
+Hid both scrollbars in the live-shell and dash ScrollBox scenes via post-construction .visible=false (the sticky setter path), covering all keeper TUIs. test:opentui green (65 pass).
 ## Evidence
