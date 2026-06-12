@@ -1,0 +1,329 @@
+// Wiring + behavioral tests for the plugin's native generated-file guard hooks
+// (plugin/hooks/{pre,post}-hook.ts) and the hooks.json registration. Translated
+// from the generated-guard-hook pytest module: the guard-dispatcher fail-open
+// baseline is already covered by commit-guard / stop-guard / subagent-stop-guard
+// bun tests, so this file pins (1) the hooks.json co-location + matcher/exec-form
+// wiring, (2) the pre-hook deny / pass-through plumbing against a stubbed
+// promptctl, (3) the post-hook additionalContext plumbing, and (4) the work
+// marker write→read round-trip through the production writer + reader.
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import { readMarker } from "../plugin/hooks/lib.ts";
+import { writeWorkMarker } from "../src/session_markers.ts";
+
+const REPO = join(import.meta.dir, "..");
+const PRE_HOOK = join(REPO, "plugin", "hooks", "pre-hook.ts");
+const POST_HOOK = join(REPO, "plugin", "hooks", "post-hook.ts");
+
+function readHooks(): Record<string, Array<Record<string, unknown>>> {
+  const data = JSON.parse(
+    readFileSync(join(REPO, "hooks", "hooks.json"), "utf-8"),
+  ) as { hooks: Record<string, Array<Record<string, unknown>>> };
+  return data.hooks;
+}
+
+/** Find the inner exec-form bun entry in `entry` pointing at the named script. */
+function execFormCmd(
+  entry: Record<string, unknown>,
+  basename: string,
+): Record<string, unknown> {
+  const inners = entry.hooks as Array<Record<string, unknown>>;
+  for (const inner of inners) {
+    if (inner.command !== "bun") {
+      continue;
+    }
+    const args = (inner.args as string[]) ?? [];
+    if (args[0]?.endsWith(`plugin/hooks/${basename}`)) {
+      expect(inner.type).toBe("command");
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: asserting the literal ${CLAUDE_PLUGIN_ROOT} token in the JSON
+      expect(args[0]).toContain("${CLAUDE_PLUGIN_ROOT}");
+      return inner;
+    }
+  }
+  throw new Error(`no exec-form bun entry for ${basename}`);
+}
+
+// ---------------------------------------------------------------------------
+// hooks.json wiring
+// ---------------------------------------------------------------------------
+
+describe("hooks.json wiring", () => {
+  test("hooks.json + plugin manifest are co-located at the plugin root", () => {
+    expect(existsSync(join(REPO, "hooks", "hooks.json"))).toBe(true);
+    expect(existsSync(join(REPO, ".claude-plugin", "plugin.json"))).toBe(true);
+  });
+
+  test("registers PreToolUse(Write|Edit) → pre-hook and PostToolUse(Read) → post-hook", () => {
+    const hooks = readHooks();
+    expect("PreToolUse" in hooks).toBe(true);
+    expect("PostToolUse" in hooks).toBe(true);
+    const pre = hooks.PreToolUse.find((e) => e.matcher === "Write|Edit");
+    expect(pre).toBeDefined();
+    execFormCmd(pre as Record<string, unknown>, "pre-hook.ts");
+    const post = hooks.PostToolUse[0] as Record<string, unknown>;
+    expect(post.matcher).toBe("Read");
+    execFormCmd(post, "post-hook.ts");
+  });
+
+  test("both hook entry points carry the bun shebang", () => {
+    for (const hook of [PRE_HOOK, POST_HOOK]) {
+      expect(existsSync(hook)).toBe(true);
+      expect(readFileSync(hook, "utf-8").startsWith("#!/usr/bin/env bun")).toBe(
+        true,
+      );
+    }
+  });
+
+  test("registers the commit-guard under a Bash matcher", () => {
+    const hooks = readHooks();
+    const bashEntry = hooks.PreToolUse.find((e) => e.matcher === "Bash");
+    expect(bashEntry).toBeDefined();
+    execFormCmd(bashEntry as Record<string, unknown>, "commit-guard.ts");
+  });
+
+  test("registers the subagent-stop-guard for the four worker tiers", () => {
+    const hooks = readHooks();
+    const entry = hooks.SubagentStop[0] as Record<string, unknown>;
+    const matcher = entry.matcher as string;
+    for (const tier of ["medium", "high", "xhigh", "max"]) {
+      expect(matcher).toContain(`plan:worker-${tier}`);
+    }
+    execFormCmd(entry, "subagent-stop-guard.ts");
+  });
+
+  test("registers the stop-guard with no matcher", () => {
+    const hooks = readHooks();
+    const entry = hooks.Stop[0] as Record<string, unknown>;
+    expect("matcher" in entry).toBe(false);
+    execFormCmd(entry, "stop-guard.ts");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// pre-hook / post-hook behavior against a stubbed promptctl
+// ---------------------------------------------------------------------------
+
+let root: string;
+const savedPath = process.env.PATH;
+
+beforeEach(() => {
+  root = realpathSync(mkdtempSync(join(tmpdir(), "planctl-guard-hook-")));
+});
+
+afterEach(() => {
+  rmSync(root, { recursive: true, force: true });
+  process.env.PATH = savedPath;
+});
+
+/** Drop a bun-script `promptctl` on a fresh bin dir that echoes `envelope`. */
+function stubPromptctl(envelope: Record<string, unknown>): string {
+  const binDir = join(root, "stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const shim = join(binDir, "promptctl");
+  writeFileSync(
+    shim,
+    "#!/usr/bin/env bun\n" +
+      `process.stdout.write(${JSON.stringify(JSON.stringify(envelope))} + "\\n");\n`,
+  );
+  chmodSync(shim, 0o755);
+  return binDir;
+}
+
+/** Drop a bun-script `promptctl` that exits non-zero (broken-tool path). */
+function stubBrokenPromptctl(): string {
+  const binDir = join(root, "stub-bin");
+  mkdirSync(binDir, { recursive: true });
+  const shim = join(binDir, "promptctl");
+  writeFileSync(shim, "#!/usr/bin/env bun\nprocess.exit(99);\n");
+  chmodSync(shim, 0o755);
+  return binDir;
+}
+
+function runHook(
+  hook: string,
+  stdin: Record<string, unknown>,
+  binDir: string,
+): { code: number; stdout: string; stderr: string } {
+  const proc = Bun.spawnSync([process.execPath, hook], {
+    stdin: Buffer.from(JSON.stringify(stdin)),
+    env: { ...process.env, PATH: `${binDir}:${process.env.PATH ?? ""}` },
+  });
+  return {
+    code: proc.exitCode ?? -1,
+    stdout: Buffer.from(proc.stdout).toString("utf-8"),
+    stderr: Buffer.from(proc.stderr).toString("utf-8"),
+  };
+}
+
+describe("pre-hook (PreToolUse Write/Edit → deny)", () => {
+  test("a marked: true envelope emits permissionDecision: deny", () => {
+    const envelope = {
+      marked: true,
+      mode: "block",
+      source_template: "/path/to/template/agents/worker.md.tmpl",
+      message:
+        "BLOCKED: this is a generated file. Edit /path/to/template/agents/worker.md.tmpl instead.",
+    };
+    const binDir = stubPromptctl(envelope);
+    const target = join(root, "agents", "worker-high.md");
+    mkdirSync(join(root, "agents"), { recursive: true });
+    writeFileSync(target, "stub doesn't read it\n");
+
+    const r = runHook(
+      PRE_HOOK,
+      { tool_name: "Write", tool_input: { file_path: target } },
+      binDir,
+    );
+    expect(r.code).toBe(0);
+    const spec = (
+      JSON.parse(r.stdout) as Record<string, Record<string, string>>
+    ).hookSpecificOutput;
+    expect(spec.hookEventName).toBe("PreToolUse");
+    expect(spec.permissionDecision).toBe("deny");
+    expect(spec.permissionDecisionReason).toContain("BLOCKED");
+    expect(spec.permissionDecisionReason).toContain(
+      "/path/to/template/agents/worker.md.tmpl",
+    );
+  });
+
+  test("a marked: false envelope passes silently", () => {
+    const binDir = stubPromptctl({ marked: false });
+    const target = join(root, "plain.md");
+    writeFileSync(target, "plain body\n");
+    const r = runHook(
+      PRE_HOOK,
+      { tool_name: "Write", tool_input: { file_path: target } },
+      binDir,
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+
+  test("a missing file_path passes silently (no promptctl call)", () => {
+    const binDir = stubPromptctl({ marked: true, message: "irrelevant" });
+    const r = runHook(PRE_HOOK, { tool_name: "Write", tool_input: {} }, binDir);
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+
+  test("a broken promptctl (non-zero exit) fails open — passes silently", () => {
+    const binDir = stubBrokenPromptctl();
+    const target = join(root, "marked.md");
+    writeFileSync(target, "---\n_promptctl_path: foo.tmpl\n---\nbody\n");
+    const r = runHook(
+      PRE_HOOK,
+      { tool_name: "Write", tool_input: { file_path: target } },
+      binDir,
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+});
+
+describe("post-hook (PostToolUse Read → additionalContext)", () => {
+  test("a marked: true envelope emits additionalContext", () => {
+    const envelope = {
+      marked: true,
+      mode: "warn",
+      source_template: "/repo/template/agents/worker.md.tmpl",
+      message:
+        "Heads-up: this is a generated file. Source: /repo/template/agents/worker.md.tmpl.",
+    };
+    const binDir = stubPromptctl(envelope);
+    const target = join(root, "agents", "worker.md");
+    mkdirSync(join(root, "agents"), { recursive: true });
+    writeFileSync(target, "body\n");
+    const r = runHook(
+      POST_HOOK,
+      { tool_name: "Read", tool_input: { file_path: target } },
+      binDir,
+    );
+    expect(r.code).toBe(0);
+    const spec = (
+      JSON.parse(r.stdout) as Record<string, Record<string, string>>
+    ).hookSpecificOutput;
+    expect(spec.hookEventName).toBe("PostToolUse");
+    expect(spec.additionalContext).toContain("Heads-up");
+    expect(spec.additionalContext).toContain(
+      "/repo/template/agents/worker.md.tmpl",
+    );
+  });
+
+  test("a non-Read tool is a no-op", () => {
+    const binDir = stubPromptctl({ marked: true, message: "x" });
+    const r = runHook(
+      POST_HOOK,
+      { tool_name: "Bash", tool_input: { command: "ls" } },
+      binDir,
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+
+  test("a marked: false envelope injects nothing", () => {
+    const binDir = stubPromptctl({ marked: false });
+    const target = join(root, "plain.md");
+    writeFileSync(target, "plain\n");
+    const r = runHook(
+      POST_HOOK,
+      { tool_name: "Read", tool_input: { file_path: target } },
+      binDir,
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe("");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// work marker write→read round-trip through the production writer + reader
+// ---------------------------------------------------------------------------
+
+describe("work marker round-trip (writeWorkMarker → readMarker)", () => {
+  const savedHome = process.env.HOME;
+  const savedSid = process.env.CLAUDE_CODE_SESSION_ID;
+
+  afterEach(() => {
+    if (savedHome === undefined) {
+      delete process.env.HOME;
+    } else {
+      process.env.HOME = savedHome;
+    }
+    if (savedSid === undefined) {
+      delete process.env.CLAUDE_CODE_SESSION_ID;
+    } else {
+      process.env.CLAUDE_CODE_SESSION_ID = savedSid;
+    }
+  });
+
+  test("a written work marker reads back with its task identity intact", async () => {
+    const home = join(root, "home");
+    mkdirSync(home, { recursive: true });
+    const sessionId = "round-trip-session";
+    const taskId = "fn-99-some-epic.3";
+    process.env.HOME = home;
+    process.env.CLAUDE_CODE_SESSION_ID = sessionId;
+
+    writeWorkMarker(taskId);
+    const marker = await readMarker(sessionId);
+
+    expect(marker).not.toBeNull();
+    expect((marker as Record<string, unknown>).kind).toBe("work");
+    expect((marker as Record<string, unknown>).task_id).toBe(taskId);
+    // A work marker carries no epic_id.
+    expect("epic_id" in (marker as Record<string, unknown>)).toBe(false);
+    expect((marker as Record<string, unknown>).schema_version).toBe(1);
+  });
+});
