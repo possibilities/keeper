@@ -36,9 +36,11 @@ import {
   runEpicQueueJump,
 } from "./verbs/epic_short_circuit.ts";
 import { runEpics } from "./verbs/epics.ts";
+import { runFindTaskCommit } from "./verbs/find_task_commit.ts";
 import { runInit } from "./verbs/init.ts";
 import { runList } from "./verbs/list.ts";
 import { runReady } from "./verbs/ready.ts";
+import { runReconcile } from "./verbs/reconcile.ts";
 import { runRefineApply } from "./verbs/refine_apply.ts";
 import { runRefineContext } from "./verbs/refine_context.ts";
 import { runResolveTask } from "./verbs/resolve_task.ts";
@@ -55,6 +57,7 @@ import { runTaskSetTargetRepo } from "./verbs/task_set_target_repo.ts";
 import { runTaskSetTier } from "./verbs/task_set_tier.ts";
 import { runTasks } from "./verbs/tasks.ts";
 import { runValidate } from "./verbs/validate.ts";
+import { runWorkerResume } from "./verbs/worker_resume.ts";
 
 // Re-export the emit seam from its module so existing importers keep their
 // import site; the definitions live in src/emit.ts.
@@ -70,7 +73,7 @@ const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
 // Subgroups ("planctl <group> <sub>"). A subgroup owns its own --help and
 // subcommand dispatch, so post-command --help is routed to the group, not the
 // top-level help.
-const SUBGROUP_NAMES = new Set(["epic", "task"]);
+const SUBGROUP_NAMES = new Set(["epic", "task", "worker"]);
 
 // Whether a verb already printed its own planctl_invocation-bearing envelope is
 // a RUNTIME fact (claim/block via emitReadonly, done via emitMutating always
@@ -106,6 +109,11 @@ const COMMANDS: CommandSpec[] = [
   { name: "epic", shortHelp: "Manage epics.", implemented: true },
   { name: "epics", shortHelp: "List all epics.", implemented: true },
   {
+    name: "find-task-commit",
+    shortHelp: "Look up a task's source commits.",
+    implemented: true,
+  },
+  {
     name: "init",
     shortHelp: "Initialize a planctl project for the current directory.",
     implemented: true,
@@ -118,6 +126,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "ready",
     shortHelp: "List tasks that are ready to be worked on.",
+    implemented: true,
+  },
+  {
+    name: "reconcile",
+    shortHelp: "Post-worker verdict for /plan:work (read-only).",
     implemented: true,
   },
   {
@@ -164,6 +177,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "validate",
     shortHelp: "Validate project data integrity.",
+    implemented: true,
+  },
+  {
+    name: "worker",
+    shortHelp: "Worker resume helpers for dropped /plan:work invocations.",
     implemented: true,
   },
 ];
@@ -420,6 +438,25 @@ const TASK_GROUP: GroupSpec = {
   ],
 };
 
+// The `worker` subgroup — resume helpers for dropped /plan:work invocations.
+// `resume` is read-only (regenerates the brief under gitignored state/briefs/,
+// zero commits) and emits its envelope via format_output WITHOUT a readonly
+// trailer (the group dispatch returns before emitTrailer would fire).
+const WORKER_GROUP: GroupSpec = {
+  name: "worker",
+  description: "Worker resume helpers for dropped /plan:work invocations.",
+  commands: [
+    {
+      name: "resume",
+      shortHelp:
+        "Emit a ready-to-paste respawn prompt for a dropped in-progress task.",
+      run: (rest, format) => {
+        runWorkerResume({ taskId: readPositional(rest), format });
+      },
+    },
+  ],
+};
+
 interface ParsedArgs {
   format: OutputFormat | null;
   help: boolean;
@@ -667,6 +704,30 @@ function dispatch(parsed: ParsedArgs): number {
         format,
       });
       break;
+    case "find-task-commit":
+      // Self-emits its readonly invocation via emitReadonly — didSelfEmit()
+      // guards the generic trailer below.
+      runFindTaskCommit({
+        taskId: readPositional(rest),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
+    case "reconcile":
+      // Self-emits its readonly invocation via emitReadonly — didSelfEmit()
+      // guards the generic trailer below.
+      runReconcile({
+        taskId: readPositional(rest),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
+    case "worker":
+      // Subgroup: dispatch the leaf (or group help). `resume` emits via
+      // format_output with NO planctl_invocation footer (the group dispatch
+      // returns before the generic trailer fires).
+      dispatchGroup(WORKER_GROUP, rest, format);
+      return 0;
     case "refine-context": {
       const id = readPositional(rest);
       runRefineContext({

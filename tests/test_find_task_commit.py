@@ -203,10 +203,17 @@ def test_find_task_commit_prose_false_match_dropped(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only
 def test_find_task_commit_all_repos_broken(
     planctl_git_repo, monkeypatch, tmp_path_factory
 ):
     """Every repo in touched_repos missing/non-git → COMMIT_LOOKUP_FAILED, exit 1.
+
+    ``python_only``: monkeypatches ``planctl.store.load_json`` in the test process
+    to inject an all-broken ``touched_repos`` into the epic record — a patch that
+    cannot cross the conformance subprocess boundary. The bun port's
+    AllReposBrokenError → COMMIT_LOOKUP_FAILED mapping is unit-covered in
+    ``test/src-git-lookup.test.ts``.
 
     Patch `planctl.store.load_json` (the symbol `run()` re-imports at call time)
     so the epic record carries a `touched_repos` pointing only at a non-git dir,

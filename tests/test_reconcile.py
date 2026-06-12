@@ -297,8 +297,14 @@ def test_reconcile_done(planctl_git_repo):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only
 def test_reconcile_tooling_error_fail_closed(planctl_git_repo, monkeypatch):
-    """A git subprocess failure during state cat-file → tooling_error, never clean."""
+    """A git subprocess failure during state cat-file → tooling_error, never clean.
+
+    ``python_only``: monkeypatches ``run_reconcile._state_head_visible`` in the
+    test process to force the ``_GitError`` fail-closed branch — a patch that
+    cannot cross the conformance subprocess boundary. The bun port's fail-closed
+    contract is unit-covered directly in ``test/src-git-lookup.test.ts``."""
     import planctl.run_reconcile as m
 
     _, task_id = _make_epic_with_task()
