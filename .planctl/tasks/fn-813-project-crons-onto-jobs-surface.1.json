@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Fold crons into scheduled_tasks",
-  "updated_at": "2026-06-12T23:50:22.545000Z"
+  "updated_at": "2026-06-12T23:58:43.455000Z",
+  "worker_done_at": "2026-06-12T23:58:43.455000Z"
 }

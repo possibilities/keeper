@@ -76,5 +76,5 @@ test/collections.test.ts. `bun run test:full` mandatory (db/reducer paths).
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Added the scheduled_tasks side table (schema v68) folding CronCreate/CronDelete PostToolUse events into a (job_id, cron_id) projection: upsert resurrects, delete flips to deleted, malformed/missing-id payloads and PostToolUseFailure fold to no-ops with the cursor advancing. Registered the scheduled_tasks collection (wire pk job_id, versioned on last_event_id) and bumped api.py's whitelist to 68.
 ## Evidence
