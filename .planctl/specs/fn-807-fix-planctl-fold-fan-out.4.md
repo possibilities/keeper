@@ -36,5 +36,5 @@ Extend the integration test: (a) cap-hit with reapable stuck/idle conns → acce
 - [ ] bun run test:full green
 
 ## Done summary
-
+Cap-hit now runs a synchronous reapable-conn sweep (shared idempotent freeConn) and accepts if a slot frees; only a cap held after the sweep rejects with the existing max_connections envelope. Adds a cap-hit conn-state census line and moves the reaper-regression alarm to the after-sweep reject. A live board subscriber is never evicted (test-proven). README conn-cap paragraph revised in place.
 ## Evidence
