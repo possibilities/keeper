@@ -73,5 +73,5 @@ FIXTURE_SCHEMA_VERSION) intact.
 - [ ] SUPPORTED_SCHEMA_VERSIONS + detectSchemaSkew + readSchemaVersion live in lib/, imported by performance/watch.ts; all existing tests green; zero keeper imports (build-pin fence passes)
 
 ## Done summary
-
+Added lib/git-detect.ts (quote-aware tokenizer extended across all ;|& segments; detectInvocations classifies command-position git + keeper commit-work; redactCommand scrubs URL userinfo; degrades to [] never throws) and hoisted SUPPORTED_SCHEMA_VERSIONS + detectSchemaSkew + readSchemaVersion (plus the shared fingerprint substrate) into lib/schema-pin.ts so both sitters gate on one pin; performance/watch.ts re-exports them. All tests green, zero keeper imports.
 ## Evidence
