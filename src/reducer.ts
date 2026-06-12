@@ -2200,6 +2200,35 @@ function foldCommit(db: Database, event: Event): void {
   if (commit == null) {
     return;
   }
+  // Record the durable commit-trailer fact (the fn-807 projection) BEFORE the
+  // empty-files early-return: the commit-trailer loader / migration backfill key
+  // off the trailer facts ALONE (never the file list), so a planctl Commit that
+  // happened to carry zero files must still land its fact row for the two views
+  // to agree. The condition — committer_session_id + planctl_op + planctl_target
+  // all non-null — is exactly the loader/backfill keep condition (DELIBERATELY
+  // wider than the syncPlanctlLinks trigger gate below, which additionally
+  // requires `parsePlanRef(target).kind != null`). `INSERT OR IGNORE` keys on the
+  // `event_id` PK so a re-fold over the same `Commit` event is idempotent.
+  if (
+    commit.committer_session_id != null &&
+    commit.planctl_op != null &&
+    commit.planctl_target != null
+  ) {
+    db.run(
+      `INSERT OR IGNORE INTO commit_trailer_facts (
+         event_id, committer_session_id, planctl_op, planctl_target,
+         planctl_epic_id, committed_at_ms
+       ) VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        event.id,
+        commit.committer_session_id,
+        commit.planctl_op,
+        commit.planctl_target,
+        parsePlanRef(commit.planctl_target)?.epic_id ?? null,
+        commit.committed_at_ms,
+      ],
+    );
+  }
   if (commit.files.length === 0) {
     // A commit with no files (empty commit via `--allow-empty`, or a
     // commit whose file-list shell-out returned empty) has nothing to
@@ -4845,83 +4874,71 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
 
 /**
  * One in-memory grouping of every durable commit-trailer fact in the log,
- * built by a SINGLE pass over the `Commit` events (replacing the old
- * per-session + per-epic-sweep scans that re-walked every `Commit` blob once
- * per swept session). {@link syncPlanctlLinks} loads this once per call and
- * reuses it for the current session's facts, the cross-session sweep, and the
- * per-epic rebuild.
+ * built by a single indexed read of the `commit_trailer_facts` projection (the
+ * fn-807 table — zero `Commit`-blob scans, replacing the old per-session +
+ * per-epic-sweep scans that re-walked every `Commit` blob once per swept
+ * session). {@link syncPlanctlLinks} loads this once per call and reuses it for
+ * the current session's facts, the cross-session sweep, and the per-epic
+ * rebuild.
  *
  * `factsBySession` maps `committer_session_id` → that session's commit-trailer
- * {@link ClassifierInvocation}s in `events.id` ASC order (the same total order
- * the old `ORDER BY events.id ASC` produced, so the classifier's ts-tie dedup
- * sees an identical input sequence). A commit-only session (zero stdout-scrape
- * rows) still appears, so its creator/refiner edge surfaces.
+ * {@link ClassifierInvocation}s in `event_id` ASC order (the table's
+ * `ORDER BY event_id ASC` preserves the historical `events.id` total order, so
+ * the classifier's ts-tie dedup sees an identical input sequence). A commit-only
+ * session (zero stdout-scrape rows) still appears, so its creator/refiner edge
+ * surfaces.
  */
 interface CommitTrailerFacts {
   factsBySession: Map<string, ClassifierInvocation[]>;
 }
 
 /**
- * Scan every `Commit` event ONCE and group its trailer facts by
- * `committer_session_id`. No SQL `json_extract` filters the rows — the WHERE is
- * a plain `hook_event = 'Commit'` and EVERY survivor parses through
- * {@link extractCommit} in JS, which returns null on malformed data and never
- * throws. This removes the malformed-JSON throw surface from the commit-trailer
- * channel entirely (the old `json_extract` in the WHERE could throw on a
- * malformed blob BEFORE `extractCommit`'s try/catch ever ran — a fold must
- * never throw).
+ * Read the `commit_trailer_facts` projection (the fn-807 table) ONCE and group
+ * it by `committer_session_id`. The projection is the de-blobbed read path: each
+ * row was written by {@link foldCommit} (or backfilled at the v66→v67 migration)
+ * through the SAME extractCommit + parsePlanRef path, so there are ZERO
+ * `Commit`-blob scans here — the table replaces the old per-session blob sweep
+ * AND the single-scan loader that preceded it. No SQL `json_extract` rides any
+ * WHERE, so no malformed-blob throw surface exists on this path.
  *
- * Each survivor maps to one {@link ClassifierInvocation} with `ts =
- * committed_at_ms / 1000` (so it falls inside the open-ended final `/plan:plan`
- * window), `epic_id` via the same target→epic split the scrape deriver uses,
- * and `subject_present = true` (a trailer only rides a mutating chore commit) —
- * exactly as the per-session loader did. A `Commit` whose `planctl_op` /
- * `planctl_target` / `committer_session_id` failed validation drops (the scrape
- * path's `epic_id` would have been null too, so the classifier yields no edge
- * either way). Pure read; never throws.
- *
- * The blob VALUE resolves via `COALESCE(events.data, event_blobs.data)`, so a
- * relocated `Commit` blob still re-parses byte-identically.
+ * Each row maps to one {@link ClassifierInvocation} with `ts = committed_at_ms /
+ * 1000` (so it falls inside the open-ended final `/plan:plan` window),
+ * `epic_id` the stored `planctl_epic_id` (frozen at write time via the same
+ * target→epic split the scrape deriver uses), and `subject_present = true` (a
+ * trailer only rides a mutating chore commit). `ORDER BY event_id ASC` is the
+ * same total order the old `ORDER BY events.id ASC` produced, so the
+ * classifier's ts-tie dedup sees an identical input sequence. Pure read; never
+ * throws.
  */
 function loadAllCommitTrailerFacts(db: Database): CommitTrailerFacts {
   const rows = db
     .query(
-      `SELECT COALESCE(events.data, event_blobs.data) AS data
-         FROM events
-         LEFT JOIN event_blobs ON event_blobs.event_id = events.id
-        WHERE hook_event = 'Commit'
-        ORDER BY events.id ASC`,
+      `SELECT committer_session_id, planctl_op, planctl_target,
+              planctl_epic_id, committed_at_ms
+         FROM commit_trailer_facts
+        ORDER BY event_id ASC`,
     )
-    .all() as { data: string | null }[];
+    .all() as {
+    committer_session_id: string;
+    planctl_op: string;
+    planctl_target: string;
+    planctl_epic_id: string | null;
+    committed_at_ms: number;
+  }[];
   const factsBySession = new Map<string, ClassifierInvocation[]>();
   for (const r of rows) {
-    if (r.data == null) {
-      continue;
-    }
-    const commit = extractCommit({ data: r.data });
-    if (commit == null) {
-      continue;
-    }
-    if (
-      commit.committer_session_id == null ||
-      commit.planctl_op == null ||
-      commit.planctl_target == null
-    ) {
-      continue;
-    }
     const inv: ClassifierInvocation = {
-      ts: commit.committed_at_ms / 1000,
-      op: commit.planctl_op,
-      target: commit.planctl_target,
-      epic_id: parsePlanRef(commit.planctl_target)?.epic_id ?? null,
+      ts: r.committed_at_ms / 1000,
+      op: r.planctl_op,
+      target: r.planctl_target,
+      epic_id: r.planctl_epic_id,
       subject_present: true,
     };
-    const sid = commit.committer_session_id;
-    const existing = factsBySession.get(sid);
+    const existing = factsBySession.get(r.committer_session_id);
     if (existing != null) {
       existing.push(inv);
     } else {
-      factsBySession.set(sid, [inv]);
+      factsBySession.set(r.committer_session_id, [inv]);
     }
   }
   return { factsBySession };

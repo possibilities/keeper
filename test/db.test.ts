@@ -1921,9 +1921,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // (c) fresh-vs-migrated table_xinfo byte-parity (re-fold determinism guard).
   // Version guard tracks the live SCHEMA_VERSION (v64 adds the `builds` table,
   // fn-781; v65 adds `jobs.active_since`, fn-784; v66 adds the
-  // `idx_events_pretooluse_agent_session` partial index, fn-787); the v62→v63
-  // epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(66);
+  // `idx_events_pretooluse_agent_session` partial index, fn-787; v67 adds the
+  // `commit_trailer_facts` projection table, fn-807); the v62→v63 epics-shape
+  // migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(67);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -8145,5 +8146,252 @@ test("v54 DB migrates to v55: jobs.backend_exec_tab_{id,name} dropped; live coor
   ).map((c) => c.name);
   expect(jobCols2).not.toContain("backend_exec_tab_id");
   expect(jobCols2).not.toContain("backend_exec_tab_name");
+  db2.close();
+});
+
+// fn-807.2: the v66→v67 commit_trailer_facts projection-table backfill.
+const CTF_UUID = "01234567-89ab-cdef-0123-456789abcdef";
+const CTF_UUID_2 = "fedcba98-7654-3210-fedc-ba9876543210";
+const CTF_UUID_3 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+const CTF_OID = "0123456789abcdef0123456789abcdef01234567";
+const CTF_OID_2 = "fedcba9876543210fedcba9876543210fedcba98";
+const CTF_OID_3 = "abcdef0123456789abcdef0123456789abcdef01";
+
+test("v66 DB migrates to v67: commit_trailer_facts table + indexes + backfill (inline + relocated + malformed/non-planctl skipped); idempotent re-open (fn-807.2)", () => {
+  // Build a v66-shaped DB by hand: full current events shape + event_blobs +
+  // reducer_state + meta, stamped at schema_version=66. Seed historical Commit
+  // rows the v66→v67 backfill must walk through the SAME extractCommit +
+  // parsePlanRef JS path the live fold uses:
+  //   - inline planctl-trailer Commit (epic-form target)  → fact row
+  //   - inline planctl-trailer Commit (task-form target)  → fact row, epic folded
+  //   - RELOCATED planctl-trailer Commit (data in event_blobs, hot col NULL)
+  //                                                        → fact row (COALESCE)
+  //   - planctl-trailer Commit missing committer_session_id → SKIPPED
+  //   - malformed-JSON Commit                             → SKIPPED (no throw)
+  //   - non-planctl Commit (no trailer fields)            → SKIPPED
+  //   - a non-Commit event                                → never considered
+  const v66 = new Database(dbPath, { create: true });
+  v66.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts REAL NOT NULL,
+      session_id TEXT NOT NULL,
+      pid INTEGER,
+      hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      tool_name TEXT,
+      matcher TEXT,
+      cwd TEXT,
+      permission_mode TEXT,
+      agent_id TEXT,
+      agent_type TEXT,
+      stop_hook_active INTEGER,
+      data TEXT,
+      subagent_agent_id TEXT,
+      spawn_name TEXT,
+      start_time TEXT,
+      slash_command TEXT,
+      skill_name TEXT,
+      planctl_op TEXT,
+      planctl_target TEXT,
+      planctl_epic_id TEXT,
+      planctl_task_id TEXT,
+      planctl_subject_present INTEGER,
+      tool_use_id TEXT,
+      config_dir TEXT,
+      planctl_queue_jump INTEGER,
+      bash_mutation_kind TEXT,
+      bash_mutation_targets TEXT,
+      planctl_files TEXT,
+      backend_exec_type TEXT,
+      backend_exec_session_id TEXT,
+      backend_exec_pane_id TEXT,
+      background_task_id TEXT
+    )
+  `);
+  v66.run(
+    "CREATE TABLE event_blobs (event_id INTEGER PRIMARY KEY REFERENCES events(id), data TEXT NOT NULL)",
+  );
+  v66.run(
+    `CREATE TABLE reducer_state (
+       id INTEGER PRIMARY KEY CHECK (id = 1),
+       last_event_id INTEGER NOT NULL DEFAULT 0,
+       updated_at REAL NOT NULL
+     )`,
+  );
+  v66.run(
+    "INSERT INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, 0)",
+  );
+  v66.run("CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
+  v66.run("INSERT INTO meta (key, value) VALUES ('schema_version', '66')");
+
+  const commitData = (over: Record<string, unknown>): string =>
+    JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: CTF_OID,
+      parent_oid: null,
+      files: [
+        { path: ".planctl/epics/x.json", blob_oid: null, committed_mode: null },
+      ],
+      committer_session_id: CTF_UUID,
+      task_ids: [],
+      planctl_op: "scaffold",
+      planctl_target: "fn-1-inline",
+      committed_at_ms: 5_000_000,
+      ...over,
+    });
+
+  const insertCommit = v66.prepare(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (?, ?, 'Commit', 'commit', ?)",
+  );
+  // (1) inline epic-form trailer.
+  insertCommit.run(1, "/repo", commitData({}));
+  // (2) inline task-form trailer (epic_id must fold to fn-2-task).
+  insertCommit.run(
+    2,
+    "/repo",
+    commitData({
+      commit_oid: CTF_OID_2,
+      committer_session_id: CTF_UUID_2,
+      planctl_op: "set-title",
+      planctl_target: "fn-2-task.3",
+    }),
+  );
+  // (3) relocated trailer — seed the row, then move data to event_blobs.
+  const relocId = Number(
+    (
+      insertCommit.run(
+        3,
+        "/repo",
+        commitData({
+          commit_oid: CTF_OID_3,
+          committer_session_id: CTF_UUID_3,
+          planctl_op: "scaffold",
+          planctl_target: "fn-3-reloc",
+        }),
+      ) as { lastInsertRowid: number | bigint }
+    ).lastInsertRowid,
+  );
+  v66.run(
+    "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
+    [relocId],
+  );
+  v66.run("UPDATE events SET data = NULL WHERE id = ?", [relocId]);
+  // (4) planctl trailer but NULL committer_session_id → backfill skips.
+  insertCommit.run(
+    4,
+    "/repo",
+    commitData({
+      committer_session_id: null,
+      planctl_target: "fn-4-nosession",
+    }),
+  );
+  // (5) malformed JSON → extractCommit returns null → skip, never throws.
+  insertCommit.run(5, "/repo", "{not valid json");
+  // (6) non-planctl Commit (no trailer fields) → skip.
+  v66.run(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (6, '/repo', 'Commit', 'commit', ?)",
+    [
+      JSON.stringify({
+        project_dir: "/repo",
+        commit_oid: CTF_OID,
+        parent_oid: null,
+        files: [{ path: "src/a.ts", blob_oid: null, committed_mode: null }],
+      }),
+    ],
+  );
+  // (7) a non-Commit event — never considered by the backfill.
+  v66.run(
+    "INSERT INTO events (ts, session_id, hook_event, event_type, data) VALUES (7, 's', 'SessionStart', 'session_start', '{}')",
+  );
+  v66.close();
+
+  // Reopen via openDb — migrate() runs the v66→v67 CREATE + indexes + backfill.
+  const { db } = openDb(dbPath);
+  const ver = db
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver.value).toBe(String(SCHEMA_VERSION));
+
+  // Table present with the named columns.
+  const ctfCols = (
+    db.prepare("PRAGMA table_info(commit_trailer_facts)").all() as {
+      name: string;
+    }[]
+  ).map((c) => c.name);
+  expect(ctfCols).toEqual([
+    "event_id",
+    "committer_session_id",
+    "planctl_op",
+    "planctl_target",
+    "planctl_epic_id",
+    "committed_at_ms",
+  ]);
+
+  // Both composite indexes present.
+  const idxNames = new Set(
+    (
+      db
+        .prepare(
+          "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='commit_trailer_facts'",
+        )
+        .all() as { name: string }[]
+    ).map((i) => i.name),
+  );
+  expect(idxNames.has("idx_commit_trailer_facts_session")).toBe(true);
+  expect(idxNames.has("idx_commit_trailer_facts_epic")).toBe(true);
+
+  // Backfill: exactly the three valid trailers, malformed/non-planctl/no-session
+  // skipped. Task-form target folds to its epic; relocated blob resolved.
+  const facts = db
+    .prepare("SELECT * FROM commit_trailer_facts ORDER BY event_id ASC")
+    .all() as {
+    event_id: number;
+    committer_session_id: string;
+    planctl_op: string;
+    planctl_target: string;
+    planctl_epic_id: string | null;
+    committed_at_ms: number;
+  }[];
+  expect(facts).toEqual([
+    {
+      event_id: 1,
+      committer_session_id: CTF_UUID,
+      planctl_op: "scaffold",
+      planctl_target: "fn-1-inline",
+      planctl_epic_id: "fn-1-inline",
+      committed_at_ms: 5_000_000,
+    },
+    {
+      event_id: 2,
+      committer_session_id: CTF_UUID_2,
+      planctl_op: "set-title",
+      planctl_target: "fn-2-task.3",
+      planctl_epic_id: "fn-2-task",
+      committed_at_ms: 5_000_000,
+    },
+    {
+      event_id: 3,
+      committer_session_id: CTF_UUID_3,
+      planctl_op: "scaffold",
+      planctl_target: "fn-3-reloc",
+      planctl_epic_id: "fn-3-reloc",
+      committed_at_ms: 5_000_000,
+    },
+  ]);
+
+  // Second open is idempotent — the version-guarded backfill does not re-run
+  // (and INSERT OR IGNORE on the event_id PK would no-op anyway); the row set
+  // stays identical.
+  db.close();
+  const { db: db2 } = openDb(dbPath);
+  const ver2 = db2
+    .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+    .get() as { value: string };
+  expect(ver2.value).toBe(String(SCHEMA_VERSION));
+  const factsAfter = db2
+    .prepare("SELECT event_id FROM commit_trailer_facts ORDER BY event_id ASC")
+    .all() as { event_id: number }[];
+  expect(factsAfter.map((r) => r.event_id)).toEqual([1, 2, 3]);
   db2.close();
 });

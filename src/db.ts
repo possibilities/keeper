@@ -23,8 +23,10 @@ import { dirname, join } from "node:path";
 import {
   extractBackgroundTaskId,
   extractBashMutation,
+  extractCommit,
   extractPlanctlInvocation,
   extractSkillName,
+  parsePlanRef,
   planVerbRefFromSpawnName,
   slashCommandFromPrompt,
 } from "./derivers";
@@ -45,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 66;
+export const SCHEMA_VERSION = 67;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -913,6 +915,49 @@ CREATE TABLE IF NOT EXISTS builds (
 `;
 
 /**
+ * `commit_trailer_facts` projection table — one row per `Commit` event whose
+ * frozen payload carries a planctl trailer (`committer_session_id` +
+ * `planctl_op` + `planctl_target` all non-null). The commit-trailer channel of
+ * `syncPlanctlLinks` reads this `ORDER BY event_id ASC` instead of re-scanning
+ * every `Commit` blob per swept session (the fn-807 fold fan-out). `event_id` is
+ * the PK so the live fold's INSERT is idempotent under a re-fold; the two
+ * composite indexes serve the per-session load and the per-epic sweep.
+ *
+ * A reducer projection (re-fold deterministic): {@link foldCommit} INSERTs the
+ * row inside its own transaction whenever {@link extractCommit} yields the three
+ * non-null facts — the SAME condition the commit-trailer loader / migration
+ * backfill use, so live-fold and backfill rows are identical by construction. It
+ * derives from `Commit` events ALONE (no cursor rewind needed at v66→v67).
+ *
+ * `committed_at_ms` is stored in MILLISECONDS as named (git's `%ct` * 1000); the
+ * loader derives the classifier `ts = committed_at_ms / 1000`. `planctl_epic_id`
+ * is `parsePlanRef(planctl_target)?.epic_id ?? null` — a task-form target folds
+ * up to its epic, an epic-form target carries itself, an unparseable target
+ * (which never survives `extractCommit`'s `planctl_target` gate) would be null.
+ *
+ * FORWARD-FACING: this is a reducer projection but is NOT in any
+ * rewind-and-redrain DELETE list because it derives from `Commit` events alone
+ * (a from-scratch re-fold reproduces it identically). Any FUTURE
+ * rewind-and-redrain DELETE block that wipes link projections MUST add a
+ * `DELETE FROM commit_trailer_facts` so the re-fold rebuilds it from id 0.
+ */
+const CREATE_COMMIT_TRAILER_FACTS = `
+CREATE TABLE IF NOT EXISTS commit_trailer_facts (
+    event_id INTEGER PRIMARY KEY,
+    committer_session_id TEXT NOT NULL,
+    planctl_op TEXT NOT NULL,
+    planctl_target TEXT NOT NULL,
+    planctl_epic_id TEXT,
+    committed_at_ms INTEGER NOT NULL
+)
+`;
+
+const CREATE_COMMIT_TRAILER_FACTS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_commit_trailer_facts_session ON commit_trailer_facts(committer_session_id, event_id)",
+  "CREATE INDEX IF NOT EXISTS idx_commit_trailer_facts_epic ON commit_trailer_facts(planctl_epic_id, committer_session_id, event_id)",
+];
+
+/**
  * `event_ingest_offsets` — the NDJSON→events ingest cursor, one row per per-pid
  * `<pid>.ndjson` file. The offset advance commits in the SAME `BEGIN IMMEDIATE`
  * as the `events` INSERT — that atomic pairing is exactly-once across watcher
@@ -1464,6 +1509,10 @@ function migrate(db: Database): void {
       db.run(CREATE_AUTOPILOT_STATE);
       db.run(CREATE_ARMED_EPICS);
       db.run(CREATE_BUILDS);
+      db.run(CREATE_COMMIT_TRAILER_FACTS);
+      for (const sql of CREATE_COMMIT_TRAILER_FACTS_INDEXES) {
+        db.run(sql);
+      }
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_EPIC_TOMBSTONES);
@@ -3323,6 +3372,65 @@ function migrate(db: Database): void {
       if (preMigrateStoredVersion < 66) {
         db.run("PRAGMA analysis_limit = 400");
         db.run("ANALYZE events");
+      }
+
+      // v66→v67: add the `commit_trailer_facts` projection table so the
+      // commit-trailer channel of `syncPlanctlLinks` reads an indexed projection
+      // instead of re-scanning every `Commit` blob per swept session (the fn-807
+      // fold fan-out). CREATE + indexes run UNCONDITIONALLY (idempotent IF NOT
+      // EXISTS) so fresh and migrated DBs are schema-identical; the BACKFILL is
+      // version-guarded so it walks the historical `Commit` rows exactly once.
+      db.run(CREATE_COMMIT_TRAILER_FACTS);
+      for (const sql of CREATE_COMMIT_TRAILER_FACTS_INDEXES) {
+        db.run(sql);
+      }
+      if (preMigrateStoredVersion < 67) {
+        // Backfill via the SAME extractCommit + parsePlanRef JS path the live
+        // fold uses — NEVER a SQL `INSERT…SELECT json_extract`: a `Commit`
+        // carries NULL sparse `planctl_*` columns (the trailer facts live only
+        // in the JSON payload), and `parsePlanRef` cannot be replicated in SQL.
+        // `COALESCE(events.data, event_blobs.data)` resolves relocated cold
+        // blobs (src/compaction.ts) so they backfill too. The row condition —
+        // committer_session_id + planctl_op + planctl_target all non-null —
+        // equals the commit-trailer loader / live-fold INSERT condition exactly,
+        // so backfilled and re-folded rows are identical by construction. No
+        // cursor rewind: the projection derives from `Commit` events alone.
+        const commitRows = db
+          .prepare(
+            `SELECT events.id AS id,
+                    COALESCE(events.data, event_blobs.data) AS data
+               FROM events
+               LEFT JOIN event_blobs ON event_blobs.event_id = events.id
+              WHERE hook_event = 'Commit'
+              ORDER BY events.id ASC`,
+          )
+          .all() as { id: number; data: string | null }[];
+        const insertFact = db.prepare(
+          `INSERT OR IGNORE INTO commit_trailer_facts (
+             event_id, committer_session_id, planctl_op, planctl_target,
+             planctl_epic_id, committed_at_ms
+           ) VALUES (?, ?, ?, ?, ?, ?)`,
+        );
+        for (const row of commitRows) {
+          if (row.data == null) continue;
+          const commit = extractCommit({ data: row.data });
+          if (commit == null) continue;
+          if (
+            commit.committer_session_id == null ||
+            commit.planctl_op == null ||
+            commit.planctl_target == null
+          ) {
+            continue;
+          }
+          insertFact.run(
+            row.id,
+            commit.committer_session_id,
+            commit.planctl_op,
+            commit.planctl_target,
+            parsePlanRef(commit.planctl_target)?.epic_id ?? null,
+            commit.committed_at_ms,
+          );
+        }
       }
 
       db.prepare(

@@ -255,6 +255,12 @@ from pathlib import Path
 # fold's pending-PreToolUse bridge seeks one session instead of every PreToolUse
 # row. An index touches no column, so no reader logic changes — only the version
 # whitelist gains 66.
+#
+# v67 (fn-807 task .2) adds the ``commit_trailer_facts`` reducer projection so
+# the commit-trailer channel of ``syncPlanctlLinks`` reads an indexed table
+# instead of re-scanning every ``Commit`` blob per swept session. keeper-py reads
+# no ``commit_trailer_facts`` row (the TUI subscribes over the socket), so no
+# reader logic changes — only the version whitelist gains 67.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -293,6 +299,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         64,
         65,
         66,
+        67,
     }
 )
 

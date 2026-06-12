@@ -1521,7 +1521,12 @@ no-op over the historical log, and a re-fold reproduces byte-identical
 planctl on every `chore(planctl)` commit) onto the `Commit` payload, and
 `foldCommit` — when all three axes are non-null and the target parses —
 TRIGGERS the per-session creator/refiner edge rebuild by calling
-`syncPlanctlLinks(committer_session_id, …)`. `foldCommit` never writes
+`syncPlanctlLinks(committer_session_id, …)`. As of schema v67 (fn-807)
+`foldCommit` ALSO records each trailer-bearing `Commit` into the indexed
+`commit_trailer_facts` projection in the same transaction (the wider
+all-three-axes-non-null condition, NOT the narrower parse-the-target trigger
+gate); `syncPlanctlLinks` reads that projection ONCE per call rather than
+re-scanning every `Commit` blob per swept session. `foldCommit` never writes
 the `epic_links` / `job_links` cells itself: `syncPlanctlLinks` stays the
 SINGLE writer and re-derives the edge from the deduped UNION of the
 legacy stdout scrape AND this durable commit-trailer fact. The motivating
@@ -1807,6 +1812,19 @@ NULL with NO backfill — backfilling from `updated_at` ("last touched") would
 conflate it with "run started" and is non-deterministic; a never-prompted job
 stays NULL and sorts by `created_at`. keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
 frozenset gains `65` (whitelist-only; keeper-py does not read `active_since`).
+As of schema v67 (fn-807), the `commit_trailer_facts` reducer projection
+(`event_id` PK; `committer_session_id` / `planctl_op` / `planctl_target` /
+`planctl_epic_id` / `committed_at_ms`) is the de-blobbed read path for the
+commit-trailer channel of `syncPlanctlLinks`: `foldCommit` writes one row per
+trailer-bearing `Commit` in its own transaction, and the loader reads the table
+`ORDER BY event_id ASC` instead of re-scanning every `Commit` blob once per
+swept session. It derives from `Commit` events ALONE, so the v66→v67 migration
+backfills it (through the same `extractCommit` + `parsePlanRef` JS path the
+fold uses, `COALESCE`-ing relocated cold blobs) WITHOUT a cursor rewind, and a
+from-scratch re-fold reproduces it byte-identically. keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `67` (whitelist-only; keeper-py
+does not read the projection). Any future rewind-and-redrain that wipes the
+link projections MUST also `DELETE FROM commit_trailer_facts`.
 As of schema v51 (fn-682), the new `jobs.monitors` JSON-array column is the
 live per-job view of the background shells a session is running — the
 plugin-armed chatctl bus, an agent-armed `keeper await`, a backgrounded
@@ -2005,7 +2023,11 @@ the session's planctl-CLI footprint — the deduped UNION of the legacy
 stdout-scrape rows and the durable commit-trailer facts — classified against
 its `/plan:plan` windows (creator = `epic-create` OR `scaffold` mutation
 inside a window — scaffold is the canonical epic-create path on this
-codebase; refiner = any other epic-touching mutation inside a window).
+codebase; refiner = any other epic-touching mutation inside a window). The
+commit-trailer side reads the indexed `commit_trailer_facts` projection
+(schema v67, fn-807) ONCE per call — `foldCommit` writes one fact row per
+trailer-bearing `Commit` in its own transaction — instead of re-scanning every
+`Commit` blob once per swept session (the fold fan-out the projection retired).
 `syncPlanctlLinks` stays the SINGLE writer of both cells; `foldCommit` only
 triggers the rebuild, never writes the edge directly. The commit channel
 makes the edge survive any stdout pipe / `grep` / truncation that NULLs

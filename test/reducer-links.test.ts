@@ -1762,6 +1762,153 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
 });
 
 // ---------------------------------------------------------------------------
+// fn-807.2: foldCommit writes the durable fact into the commit_trailer_facts
+// projection table in its own transaction, and loadAllCommitTrailerFacts reads
+// the table (zero Commit-blob scans in the fold read path). The re-fold from
+// cursor=0 must reproduce the projection table — AND the link projections it
+// feeds — byte-identically.
+// ---------------------------------------------------------------------------
+
+/** Read the commit_trailer_facts projection ordered by event_id. */
+function getCommitTrailerFacts(): {
+  event_id: number;
+  committer_session_id: string;
+  planctl_op: string;
+  planctl_target: string;
+  planctl_epic_id: string | null;
+  committed_at_ms: number;
+}[] {
+  return db
+    .query("SELECT * FROM commit_trailer_facts ORDER BY event_id ASC")
+    .all() as {
+    event_id: number;
+    committer_session_id: string;
+    planctl_op: string;
+    planctl_target: string;
+    planctl_epic_id: string | null;
+    committed_at_ms: number;
+  }[];
+}
+
+test("fn-807.2: foldCommit writes a commit_trailer_facts row in the same transaction (task-form target folds to its epic)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  const evId = commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: "set-title",
+    planctlTarget: "fn-5-fact.2",
+    committedAtMs: 5_000_000,
+  });
+  drainAll();
+  // Exactly one fact row, keyed by the Commit event id, epic folded from the
+  // task-form target.
+  expect(getCommitTrailerFacts()).toEqual([
+    {
+      event_id: evId,
+      committer_session_id: TEST_UUID,
+      planctl_op: "set-title",
+      planctl_target: "fn-5-fact.2",
+      planctl_epic_id: "fn-5-fact",
+      committed_at_ms: 5_000_000,
+    },
+  ]);
+  // The link projection the table feeds still forms (refiner, since set-title is
+  // not a create op).
+  expect(getEpicLinks(TEST_UUID)).toEqual([
+    { kind: "refiner", target: "fn-5-fact" },
+  ]);
+});
+
+test("fn-807.2: a non-planctl / pre-feature Commit writes no fact row", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  // NULL op/target — the foldCommit fact-write condition is closed.
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: null,
+    planctlTarget: null,
+    committedAtMs: 5_000_000,
+  });
+  drainAll();
+  expect(getCommitTrailerFacts()).toEqual([]);
+});
+
+test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identically (inline + relocated + malformed + non-planctl in the log)", () => {
+  // Session 1: an inline planctl-trailer scaffold → one fact row + creator edge.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  planPlanOpener(TEST_UUID, 1_000);
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID,
+    committerSessionId: TEST_UUID,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-1-ctf",
+    committedAtMs: 5_000_000,
+  });
+  // Session 2: a RELOCATED planctl trailer (data in event_blobs) → fact via
+  // the loader's COALESCE; foldCommit reads the inline data at fold time, the
+  // re-fold reads the relocated blob — both must land the same fact row.
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
+  planPlanOpener(TEST_UUID_2, 3_000);
+  const relocId = commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID_2,
+    committerSessionId: TEST_UUID_2,
+    planctlOp: "set-title",
+    planctlTarget: "fn-1-ctf",
+    committedAtMs: 6_000_000,
+  });
+  relocateBlob(relocId);
+  // A malformed Commit blob → no fact, no throw.
+  insertEvent({
+    hook_event: "Commit",
+    session_id: "/repo",
+    data: "}{garbage",
+  });
+  // A non-planctl Commit → no fact.
+  commitTrailerEvent({
+    projectDir: "/repo",
+    commitOid: TEST_OID_3,
+    committerSessionId: TEST_UUID_3,
+    planctlOp: null,
+    planctlTarget: null,
+    committedAtMs: 7_000_000,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  const facts1 = getCommitTrailerFacts();
+  // Sanity: exactly the two valid trailers landed (the relocated row's blob
+  // was read inline at first fold).
+  expect(facts1.map((r) => r.planctl_target)).toEqual(["fn-1-ctf", "fn-1-ctf"]);
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const epics1 = db.query("SELECT * FROM epics ORDER BY epic_id").all();
+
+  // Re-fold from cursor=0 — wipe the projection table AND the link projections
+  // it feeds, then re-drain. The relocated blob now resolves via the loader's
+  // COALESCE; the fact table + link projections must reproduce byte-for-byte.
+  db.run("DELETE FROM commit_trailer_facts");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  db.run("DELETE FROM file_attributions");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(JSON.stringify(getCommitTrailerFacts())).toBe(JSON.stringify(facts1));
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+  expect(
+    JSON.stringify(db.query("SELECT * FROM epics ORDER BY epic_id").all()),
+  ).toBe(JSON.stringify(epics1));
+});
+
+// ---------------------------------------------------------------------------
 // Schema v29: syncPlanctlLinks computes `created_by_closer_of` + `sort_path`
 // + transitive cascade on the epics projection
 // ---------------------------------------------------------------------------

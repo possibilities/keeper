@@ -2520,15 +2520,17 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // `default_visible`), to 64 via fn-781 task .1 (the `builds` buildbot
   // dashboard projection table), to 65 via fn-784 task .1 (the folded
   // `jobs.active_since` recency column for the unified dash AGENTS timeline),
-  // and to 66 via fn-787 task .2 (the session-anchored partial index
+  // to 66 via fn-787 task .2 (the session-anchored partial index
   // `idx_events_pretooluse_agent_session` for the SubagentStart fold's
-  // pending-PreToolUse bridge), each of which bumped SCHEMA_VERSION AND added
-  // its version to `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the
+  // pending-PreToolUse bridge), and to 67 via fn-807 task .2 (the
+  // `commit_trailer_facts` projection table that de-blobs the commit-trailer
+  // channel of `syncPlanctlLinks`), each of which bumped SCHEMA_VERSION AND
+  // added its version to `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the
   // CLAUDE.md same-commit invariant. This pin tracks the LIVE schema version:
   // the guard it provides is "an accidental reducer/schema change must surface
   // as a failing whitelist + this pin", which still holds — bump both together
   // when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(66);
+  expect(SCHEMA_VERSION).toBe(67);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {
