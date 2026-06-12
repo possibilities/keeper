@@ -30,5 +30,5 @@ bun test green fast and with PLANCTL_RUN_SLOW=1; uv run pytest suite untouched a
 - [ ] bun test green (fast + slow); any red translation resolved by fixing src/, recorded in Evidence
 
 ## Done summary
-
+Translated the worker/saga lifecycle cluster (claim, close-preflight, close-finalize, reconcile, worker-resume, find-task-commit, commit — 135 inventory nodes) onto the harness as 7 new saga-*.test.ts files; every node carries its pytest source-comment classified translated|cited|drop-with-reason, sub-totals match the inventory. Fixed a real conformance gap: close-preflight's read-only trailer re-resolved the project from cwd instead of the --project root.
 ## Evidence
