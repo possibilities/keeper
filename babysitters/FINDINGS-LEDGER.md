@@ -11,30 +11,32 @@ this contract, not to each other.
 This is a CONTRACT doc, not running code. No module ships from this file. Tasks
 `.2`/`.3`/`.4` consume these schemas verbatim.
 
-Multiple sitters now implement this contract: `performance` (pages on
-genuinely-new findings via a headless agent), `builds` (silently collects a
-corpus via a headless agent — no paging), and `helptailing` (a TREND sitter whose
-scanner writes its own followups DIRECTLY — no agent spawn, no paging). The
+Multiple sitters now implement this contract: `performance` (a safety sitter
+whose scanner writes its own followups DIRECTLY — no agent spawn, no paging),
+`builds` (silently collects a corpus via a headless agent — no paging), and
+`helptailing` (a TREND sitter whose scanner writes its own followups DIRECTLY —
+no agent spawn, no paging). The
 followup/`key`/ledger schema below is identical across all three.
 
 ## What the ledger tracks (and the denominator)
 
-A babysitter pages the human on genuinely-new findings and writes ONE
-self-contained investigation prompt per PAGED finding under
+A babysitter escalates genuinely-new findings by writing ONE
+self-contained investigation prompt per ESCALATED finding under
 `~/.local/state/babysitters/<slug>/followups/*.md`. Those files accumulate forever
-(247 today for `performance`, no pruning) and nothing records which a human has
-actually processed — `seen.json` only tracks the notification cooldown.
+(no pruning) and nothing records which a human has actually processed —
+`seen.json` only tracks the per-fingerprint dedup + held-tick gates.
 
 The ledger closes that loop: one verdict row per finding the human has triaged.
 
-**Denominator = PAGED findings only.** The followup files are written ONLY for the
-findings the sitter actually paged about (the escalation subset), NOT every acked
-finding — a merited approval is acked-but-not-paged and gets no followup file
-(`babysitters/agents/performance.md` `## Write follow-up prompt file`). So the
-ledger's universe is exactly "findings serious enough to page a human", never the
-full ack set. Followup writes are BEST-EFFORT (a failed write drops that one
-followup and the sitter still exits clean), so the followup corpus is the floor of
-what was paged, not a guaranteed-complete record.
+**Denominator = findings the sitter escalated — wrote a followup file for.** The
+followup files are written ONLY for the findings the sitter escalated (the
+genuinely-new subset that cleared its dedup + held-tick gates), NOT every observed
+condition — a finding the sitter judged not worth surfacing gets no followup file
+(`babysitters/agents/performance.md` `## Followup file format`). So the ledger's
+universe is exactly "findings the sitter escalated", never the full observation
+set. Followup writes are BEST-EFFORT (a failed write drops that one followup,
+retries next tick, and the sitter still exits clean), so the followup corpus is
+the floor of what was escalated, not a guaranteed-complete record.
 
 ## Home layout — `~/docs/babysitters/<slug>/`
 
@@ -185,10 +187,11 @@ GREATER than the row's `resolved_at`. Don't bury a regression: a fix that broke
 again must come back.
 
 - **Occurrence ts = the followup filename's `<unix-ts>`** (`<slug>-<unix-ts>-<sha1_8>.md`,
-  or legacy `<slug>-<unix-ts>.md`). This is the PAGE time, the best stable signal
-  available. It is an APPROXIMATION — page time is later than detect time by the
-  sitter's ingestion lag — but for this sitter the lag is small and acceptable.
-  Record this assumption rather than chasing detect-time precision.
+  or legacy `<slug>-<unix-ts>.md`). This is the followup-written time, the best
+  stable signal available. It is an APPROXIMATION — the followup is written later
+  than detect time by the sitter's ingestion lag — but for this sitter the lag is
+  small and acceptable. Record this assumption rather than chasing detect-time
+  precision. (The filename ts semantics are unchanged; only the label.)
 - **Compare against the occurrence ts, NEVER the ledger-append ts** (`processed_at`).
   Comparing against `processed_at` would mask a regression that occurred between
   the fix and the verdict being recorded. The anchor is `resolved_at`; the probe is

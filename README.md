@@ -454,8 +454,8 @@ Keeper has no `install` verb. Wire it up manually:
    close jobs piling up against one still-open epic), reducer wedge,
    dead-letter growth, **backstop self-telemetry degradation** (a missed-wake
    rescue or rising missed-wake counters), and **event→projection fold latency**
-   over the realtime bar — page you automatically instead of being noticed after
-   the fact:
+   over the realtime bar — get caught and recorded as triage followups instead of
+   being noticed after the fact:
 
    ```sh
    ln -s "$PWD/plist/arthack.babysitter.performance.watch.plist" ~/Library/LaunchAgents/
@@ -465,52 +465,30 @@ Keeper has no `install` verb. Wire it up manually:
    This is a user-LaunchAgent that runs the **performance sitter**'s
    `babysitters/performance/watch.ts --tick` every 5 minutes (`StartInterval`,
    no `KeepAlive`): an out-of-process **read-only** scanner over `keeper.db` that
-   diffs findings against its own seen-state and escalates only genuinely-new
-   signatures via the headless `babysitters:performance` triage agent (loaded
-   with `--plugin-dir <repo>/babysitters`; it pages via `botctl` to the Telegram
-   `Keeper` topic — hence `~/.local/bin` on the plist's `PATH`). It never writes
-   the DB, mints no synthetic events, and performs no RPC. Edit the plist's
-   username / checkout path / arch first if they differ. Seen-state, logs, and
-   the escalation follow-up prompts (`followups/latest.md` + per-finding history)
-   live under `~/.local/state/babysitters/performance/`. Inspect with
+   diffs findings against its own seen-state and writes one injection-safe
+   followup file per genuinely-new signature DIRECTLY under
+   `~/.local/state/babysitters/performance/followups/`. It spawns no agent and
+   pages nobody — the human discovers findings by running
+   `/babysit-triage performance`. It never writes the DB, mints no synthetic
+   events, and performs no RPC. Edit the plist's username / checkout path / arch
+   first if they differ. Seen-state, logs, and the followups
+   (`followups/latest.md` + per-finding history) live under
+   `~/.local/state/babysitters/performance/`. Inspect with
    `launchctl print gui/$(id -u)/arthack.babysitter.performance.watch`, or force
    a tick with `launchctl kickstart gui/$(id -u)/arthack.babysitter.performance.watch`.
    As the last action on every completed tick the scanner stamps a liveness
-   `heartbeat.json` under `~/.local/state/babysitters/performance/` — the input
-   the watchdog in step 8b reads. (`babysitters/` is a self-contained plugin
-   home; a second sitter — `builds` — already lives beside it, installed in
-   step 8c.)
+   `heartbeat.json` under `~/.local/state/babysitters/performance/` — read by
+   `/babysit-triage` for staleness, since there is no watchdog to page on it.
+   (`babysitters/` is a self-contained plugin home; a second sitter — `builds` —
+   already lives beside it, installed in step 8b.)
 
-   8b. **Install the performance sitter's watchdog** ("who watches the watcher")
-   so the one failure class the sitter structurally cannot self-report — its own
-   crash / hang — still pages you:
-
-   ```sh
-   ln -s "$PWD/plist/arthack.babysitter.performance.watchdog.plist" ~/Library/LaunchAgents/
-   launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/arthack.babysitter.performance.watchdog.plist
-   ```
-
-   This is a SEPARATE user-LaunchAgent that runs the standalone
-   `babysitters/performance/watchdog.ts` every 10 minutes (`StartInterval 600`,
-   mirroring orphanwatch/dropwatch). It reads ONLY the sitter's `heartbeat.json`
-   and alarms (`botctl` Telegram, `Keeper` topic — no desktop notifyctl; hence
-   `~/.local/bin` on its `PATH`) when the heartbeat goes stale (older than 900s =
-   3× the sitter interval, floored for launchd jitter). It is deliberately
-   standalone: it never opens `keeper.db`, never talks to keeperd, and does NOT
-   depend on the sitter or keeperd being up (the exact case it exists to catch).
-   Silent first-run (no heartbeat yet ≠ dead); a once-daily all-clear so silence
-   never means the watchdog itself died. Logs under
-   `~/.local/state/babysitters/performance/watchdog.{stdout,stderr}`; inspect with
-   `launchctl print gui/$(id -u)/arthack.babysitter.performance.watchdog` or peek
-   at the live decision with
-   `bun run babysitters/performance/watchdog.ts --json`.
-
-   8c. **Install the `builds` sitter** — a SECOND babysitter that watches
+   8b. **Install the `builds` sitter** — a SECOND babysitter that watches
    buildbot CI for failing test/lint/typecheck steps across every registered
    builder and SILENTLY collects one self-contained followup per red onset under
-   `~/.local/state/babysitters/builds/followups/`. Unlike the performance sitter
-   it pages NOTHING on the findings path — the human works the collected corpus
-   offline via `/babysit-triage builds`:
+   `~/.local/state/babysitters/builds/followups/`. Like the performance sitter it
+   pages NOTHING on the findings path, but unlike it the `builds` collector is a
+   headless agent (the performance scanner writes its own followups) — the human
+   works the collected corpus offline via `/babysit-triage builds`:
 
    ```sh
    ln -s "$PWD/plist/arthack.babysitter.builds.watch.plist" ~/Library/LaunchAgents/
@@ -535,7 +513,7 @@ Keeper has no `install` verb. Wire it up manually:
    with `launchctl kickstart gui/$(id -u)/arthack.babysitter.builds.watch`, or
    peek at a live scan with `bun run babysitters/builds/watch.ts --json`.
 
-   8d. **Install the `helptailing` sitter** — a THIRD babysitter, a read-only
+   8c. **Install the `helptailing` sitter** — a THIRD babysitter, a read-only
    TREND sitter that counts `--agent-help` Bash invocations in `keeper.db`,
    compares a frozen pre-`2026-06-11` historical baseline against the current
    epoch, and SILENTLY writes `trend-digest` + `rate-spike` followups under
@@ -596,7 +574,7 @@ Keeper has no `install` verb. Wire it up manually:
    denominator), staleness p50/p95/p99, and per-rescue
    `{ts, staleness_ms, change_to_rescue_ms}` samples (which the performance sitter
    windows by a `ts` watermark — classifying on `change_to_rescue_ms`, the true
-   latency — so an old resolved rescue never re-pages). Spawn-tests MUST override this
+   latency — so an old resolved rescue never re-fires). Spawn-tests MUST override this
    path too (alongside `KEEPER_DB` / `KEEPER_DROP_LOG` /
    `KEEPER_DEAD_LETTER_DIR` / `KEEPER_RESTORE_FILE`) so the suite never
    writes the user's real state dir — build the sandboxed env via the shared
@@ -1233,13 +1211,15 @@ Reverse of install:
 ```sh
 launchctl bootout gui/$(id -u)/arthack.keeperd
 rm ~/Library/LaunchAgents/arthack.keeperd.plist
-# If installed: the rotation sidecar, the babysitter scanner, and its watchdog.
+# If installed: the rotation sidecar and the babysitter scanners.
 launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
-launchctl bootout gui/$(id -u)/arthack.babysitter.performance.watch
+launchctl bootout gui/$(id -u)/arthack.babysitter.performance.watch   # no watchdog — never pages
 rm ~/Library/LaunchAgents/arthack.babysitter.performance.watch.plist
-launchctl bootout gui/$(id -u)/arthack.babysitter.performance.watchdog
-rm ~/Library/LaunchAgents/arthack.babysitter.performance.watchdog.plist
+# One-time, only on installs that predate the performance sitter's page-free
+# convergence (its watchdog has since been retired):
+launchctl bootout gui/$(id -u)/arthack.babysitter.performance.watchdog 2>/dev/null
+rm -f ~/Library/LaunchAgents/arthack.babysitter.performance.watchdog.plist
 launchctl bootout gui/$(id -u)/arthack.babysitter.helptailing.watch   # no watchdog — never pages
 rm ~/Library/LaunchAgents/arthack.babysitter.helptailing.watch.plist
 rm -rf ~/.local/state/babysitters   # sitter seen-state, heartbeat, logs, + follow-up prompts
@@ -2427,8 +2407,10 @@ ship as one binary instead of N standalone scripts.
 The babysitters live under `babysitters/` — a self-contained Claude-Code plugin
 home with one sitter per concern (today: `performance`, `builds`, and
 `helptailing`), each owning a `babysitters/<slug>/` code dir, a
-`babysitters/agents/<slug>.md` triage agent (or, for `helptailing`, producer
-DOCUMENTATION — it spawns no agent), and a private state tree under
+`babysitters/agents/<slug>.md` doc — a headless triage/collector agent for
+`builds`, or producer DOCUMENTATION for `performance` and `helptailing` (whose
+scanners write their own followups and spawn no agent) — and a private state tree
+under
 `~/.local/state/babysitters/<slug>/`. The `helptailing` sitter is a read-only
 TREND sitter that counts `--agent-help` Bash invocations in `keeper.db`, compares
 a frozen pre-`2026-06-11` baseline against the current epoch, and writes
@@ -2440,38 +2422,29 @@ subcommand) is an out-of-process read-only scanner: run every 5 minutes under
 launchd, it opens `keeper.db` read-only, deterministically detects the recurring
 failure classes (autopilot stalls, duplicate dispatches, reducer
 wedge, dead-letter growth, stuck jobs, backstop self-telemetry degradation, and
-event→projection fold latency), and escalates only genuinely-new signatures to a
-headless `babysitters:performance` agent (loaded via `--plugin-dir`) — it never writes the DB, mints no synthetic events, and performs
-no RPC. Its second read-only input is keeper's own `backstop.ndjson` self-
-telemetry (the missed-wake `rescues_total` counter + per-rescue
-`change_to_rescue_ms` latency); it is consumed the same no-write/no-RPC way as
-`keeper.db`. Both backstop signals are INCREMENTAL: the missed-wake delta keys
-off `rescues_total` (the bad-outcome counter, not total wake-ups), and the
-late-rescue alarm classifies on `change_to_rescue_ms` — the TRUE change-to-rescue
-latency (observation_ts − event_ts: `now − committed_at` for the change the
-heartbeat discharged) — NOT the idle-inflated `staleness_ms` (`now −
+event→projection fold latency), and writes one injection-safe followup file per
+genuinely-new signature DIRECTLY under
+`~/.local/state/babysitters/performance/followups/` (plus a stable `latest.md`) —
+it spawns no agent, calls no `botctl`/`notifyctl`, mints no synthetic events,
+performs no RPC, and never writes the DB. The human discovers findings by running
+`/babysit-triage performance`; closing the loop is just handing a followup to a
+fresh agent (`claude < followups/latest.md`). Its second read-only input is
+keeper's own `backstop.ndjson` self-telemetry (the missed-wake `rescues_total`
+counter + per-rescue `change_to_rescue_ms` latency); it is consumed the same
+no-write/no-RPC way as `keeper.db`. Both backstop signals are INCREMENTAL: the
+missed-wake delta keys off `rescues_total` (the bad-outcome counter, not total
+wake-ups), and the late-rescue arm classifies on `change_to_rescue_ms` — the TRUE
+change-to-rescue latency (observation_ts − event_ts: `now − committed_at` for the
+change the heartbeat discharged) — NOT the idle-inflated `staleness_ms` (`now −
 last_fast_path_at`, which balloons with quiet minutes; the 2026-06-10
-false-critical paged 1611s for a 2s-old commit rescued after 27 idle minutes).
+false-critical reported 1611s for a 2s-old commit rescued after 27 idle minutes).
 Latency < 10s (or null — a dirty-tree/cold-boot rescue or an old-format line) is
-HEALTHY; ≥ 10s warns, ≥ 60s pages critical. The alarm fires only on a rescue
-whose `ts` exceeds a per-bucket high-watermark cursor persisted in the
-`backstop-baseline.json` sidecar — so one old resolved rescue never re-pages
-every cooldown window. (Pure-idleness liveness — "no event has arrived at all" —
-is the dead-man watchdog's job below, NOT a freshness gate here.) On escalation the agent writes a self-
-contained, injection-safe investigation prompt per paged finding under
-`~/.local/state/babysitters/performance/followups/` (plus a stable `latest.md`)
-and the Telegram page (the `Keeper` topic) points at that file, so closing the
-loop is just handing the prompt to a fresh agent (`claude < followups/latest.md`).
-
-Because a dead monitor never runs its own monitor, the sitter stamps a
-liveness `heartbeat.json` as the LAST action on every completed tick, and a
-SEPARATE launchd dead-man — `babysitters/performance/watchdog.ts` (also its own
-binary, `StartInterval 600`) — reads ONLY that heartbeat and pages (`botctl`
-Telegram, `Keeper` topic — no desktop notifyctl) when it goes stale (> 900s). The
-watchdog is deliberately standalone: it never opens `keeper.db`, never talks to
-keeperd, and does not depend on the sitter or keeperd being up — the exact case
-it exists to catch. Silent
-first-run, once-daily all-clear (so silence never means the watchdog died).
+HEALTHY; ≥ 10s warns, ≥ 60s is critical. The alarm fires only on a rescue whose
+`ts` exceeds a per-bucket high-watermark cursor persisted in the
+`backstop-baseline.json` sidecar — so one old resolved rescue never re-fires every
+window. As the LAST action on every completed tick the scanner stamps a liveness
+`heartbeat.json`, which `/babysit-triage` reads for staleness; there is no
+watchdog (a dead-man pager is pointless for a sitter that never pages).
 
 The `builds` sitter (`babysitters/builds/watch.ts`, its own binary) is the same
 shape with ONE structural difference: it pages NOTHING on the findings path. It

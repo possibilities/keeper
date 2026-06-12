@@ -8,11 +8,12 @@
   See README.md "Install" for the manual symlink + `launchctl bootstrap` steps.
 
   What it does: every 5 minutes, runs the read-only `watch.ts --tick` scanner
-  over `keeper.db`, diffs findings against its own seen-state, and escalates
-  genuinely-new failure signatures via the headless `babysitters:performance`
-  triage agent (loaded with `--plugin-dir <repo>/babysitters`). It is a PURE
-  EXTERNAL OBSERVER: opens the DB read-only, never writes it, mints no synthetic
-  events, performs no RPC. Its OWN binary, NOT a `keeper` subcommand.
+  over `keeper.db`, diffs findings against its own seen-state, and writes one
+  injection-safe followup file per genuinely-new failure signature under
+  `~/.local/state/babysitters/performance/followups/` (discovered via
+  `/babysit-triage performance`). It spawns no agent and pages nobody. It is a
+  PURE EXTERNAL OBSERVER: opens the DB read-only, never writes it, mints no
+  synthetic events, performs no RPC. Its OWN binary, NOT a `keeper` subcommand.
 
   Paths are hard-coded absolute because launchd does NOT source your shell rc,
   so `bun` cannot be found by name. The values below assume:
@@ -23,15 +24,10 @@
     - sitter seen-state + logs under /Users/mike/.local/state/babysitters/performance
   Edit these for your own username / arch before bootstrapping.
 
-  PATH below MUST include /Users/mike/.local/bin: the escalation path shells out
-  to `claude` (and the agent to `botctl`), which live there and would otherwise
-  be unfound (launchd inherits no login PATH).
-
   Periodic via StartInterval (300s), NOT KeepAlive — mixing the two defeats the
   interval (KeepAlive would restart the one-shot scanner immediately). The
   interval resets from process EXIT, so a hung tick would block all future
-  ticks; the scanner's hard agent-timeout is the load-bearing guard against
-  that. RunAtLoad fires one immediate pass at bootstrap; the scanner exits 0
+  ticks. RunAtLoad fires one immediate pass at bootstrap; the scanner exits 0
   cleanly if keeper.db is missing, so an early load is harmless.
 
   Install:
@@ -60,7 +56,7 @@
 	<key>EnvironmentVariables</key>
 	<dict>
 		<key>PATH</key>
-		<string>/Users/mike/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+		<string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
 	</dict>
 	<key>StartInterval</key>
 	<integer>300</integer>
