@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-12T09:00:06.763828Z",
   "created_at": "2026-06-12T08:28:15.850721Z",
   "depends_on_epics": [],
   "id": "fn-29-bun-foundation-read-only-verbs",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/planctl",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Bun foundation read-only verbs",
   "touched_repos": [
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-12T08:28:15.850721Z"
+  "updated_at": "2026-06-12T09:00:06.763828Z"
 }
