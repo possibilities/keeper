@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-12T22:54:28.211000Z",
   "created_at": "2026-06-12T22:31:16.017000Z",
   "depends_on_epics": [],
   "id": "fn-812-builds-sitter-still-red-re-emit",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Builds sitter still-red re-emit",
   "touched_repos": [
     "/Users/mike/code/sitter"
   ],
-  "updated_at": "2026-06-12T22:31:16.017000Z"
+  "updated_at": "2026-06-12T22:54:28.211000Z"
 }
