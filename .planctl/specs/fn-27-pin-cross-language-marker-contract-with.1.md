@@ -28,5 +28,5 @@ The test must fail if a field name or `kind` value diverges between
 - [ ] Lands in the slow bucket; `uv run pytest tests/ --run-slow` green.
 
 ## Done summary
-
+Added a slow-bucket end-to-end round-trip test: write_work_marker (Python success path) writes a marker, read back through the real TS readMarker via a bun subprocess, asserting kind/task_id survive. Fails on any field-name or kind divergence between _write_marker and the TS reader (verified via a local rename probe).
 ## Evidence
