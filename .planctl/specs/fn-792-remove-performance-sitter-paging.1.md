@@ -87,5 +87,5 @@ patterns as in keeper-watch.test.ts:137-186. `bun run test:full` mandatory.
 - [ ] babysitter-build.test.ts updated (entrypoints + surface pin); fast tier and `bun run test:full` green
 
 ## Done summary
-
+Converged the performance sitter on the page-free pull model: extracted a shared dep-free babysitters/lib/followups.ts writer, write one injection-safe followup per genuinely-new finding in-process (no spawn/botctl/notifyctl/ack), bumped SEEN_STATE_VERSION 1->2 dropping page-history fields with first_seen_at/last_seen_at stamps, and retired the watchdog (watch.ts heartbeat stays as the triage liveness signal).
 ## Evidence
