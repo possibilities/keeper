@@ -35,5 +35,5 @@ tests/test_worker_verbs.py claim/block selections green against dist/planctl-bun
 - [ ] Discovery subset honors config.yaml fail-soft semantics under tmp HOME
 
 ## Done summary
-
+Ported claim + block (the no-commit worker pair) to planctl-bun with the discovery/config/brief/session-marker subset they need; conformance claim/block tests green against dist/planctl-bun incl. real_git zero-commit proofs, runtime sidecars byte-equal to Python.
 ## Evidence
