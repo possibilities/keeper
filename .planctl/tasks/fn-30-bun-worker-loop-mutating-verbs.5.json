@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Port init and done verbs",
-  "updated_at": "2026-06-12T09:13:14.626060Z"
+  "updated_at": "2026-06-12T09:56:41.929489Z",
+  "worker_done_at": "2026-06-12T09:56:41.929489Z"
 }

@@ -35,5 +35,5 @@ tests/test_init.py green via dist/planctl-bun (real git, self-commit counts, sym
 - [ ] init in non-git dir: success envelope, exit 0, zero commits; idempotent re-run commits nothing
 
 ## Done summary
-
+Ported the committing worker pair to planctl-bun: init (bootstrap + advice files + literal self-commit inside a git work tree) and done (two-phase write — spec under lock, worker_done_at on the tracked JSON after — via new specs.ts byte-stable section patching). Scoped conformance gate (test_cli/readonly/init/worker_verbs) green against the compiled binary with --run-slow; docs updated for the worker-loop writes.
 ## Evidence
