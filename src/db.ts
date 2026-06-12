@@ -81,11 +81,11 @@ const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 const DEFAULT_AGENTUSE_ROOT = "~/.local/state/agentuse";
 
 /** Mirrors `DEFAULT_EXEC_BACKEND` in `src/exec-backend.ts`. */
-const DEFAULT_EXEC_BACKEND = "zellij";
+const DEFAULT_EXEC_BACKEND = "tmux";
 
 /** Recognized `exec_backend` values; an unknown value warns and falls back to
  *  `DEFAULT_EXEC_BACKEND`. */
-const VALID_EXEC_BACKENDS = new Set(["zellij", "tmux"]);
+const VALID_EXEC_BACKENDS = new Set(["tmux"]);
 
 /**
  * Parsed keeper daemon config. Keys are INDEPENDENT — a malformed/missing one
@@ -99,7 +99,7 @@ export interface KeeperConfig {
   // builds` dashboard's poller. Independent best-effort key with NO default:
   // absent/empty/garbage → undefined → the builds worker is not spawned.
   buildbotUrl?: string;
-  // Autopilot exec backend — `zellij` (default) or `tmux`. The managed-session
+  // Autopilot exec backend — `tmux` (the sole backend). The managed-session
   // name is hardcoded (`MANAGED_EXEC_SESSION`), not configurable.
   execBackend?: string;
   // `null` (default) is unlimited; only a POSITIVE INTEGER overrides.

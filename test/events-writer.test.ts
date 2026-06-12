@@ -994,10 +994,9 @@ test("configDirFromEnv: a bare '/' value passes through unchanged", () => {
 // backendExecCoordsFromEnv unit (schema v48 / fn-668 — every-event capture)
 // ---------------------------------------------------------------------------
 
-test("backendExecCoordsFromEnv: absent ZELLIJ sentinel returns all-NULL", () => {
-  // Outside a zellij pane (the typical case for any Claude session not
-  // launched under zellij) every coord stays NULL — never stamp a
-  // bogus `type='zellij'` per the task acceptance.
+test("backendExecCoordsFromEnv: no sentinel returns all-NULL", () => {
+  // Outside tmux (the typical case for any Claude session not launched under
+  // the multiplexer) every coord stays NULL — never stamp a bogus `type`.
   expect(backendExecCoordsFromEnv({})).toEqual({
     type: null,
     sessionId: null,
@@ -1005,26 +1004,28 @@ test("backendExecCoordsFromEnv: absent ZELLIJ sentinel returns all-NULL", () => 
   });
 });
 
-test("backendExecCoordsFromEnv: empty ZELLIJ sentinel collapses to all-NULL", () => {
+test("backendExecCoordsFromEnv: empty TMUX sentinel collapses to all-NULL", () => {
   // Empty-string env is the same shape as absent — both collapse so the
   // reducer's COALESCE arm can't be clobbered by an empty stamp.
   expect(
     backendExecCoordsFromEnv({
-      ZELLIJ: "",
-      ZELLIJ_SESSION_NAME: "mike-main",
-      ZELLIJ_PANE_ID: "7",
+      TMUX: "",
+      TMUX_PANE: "%7",
+      KEEPER_TMUX_SESSION: "autopilot",
     }),
   ).toEqual({ type: null, sessionId: null, paneId: null });
 });
 
-test("backendExecCoordsFromEnv: ZELLIJ sentinel set stamps type + both sub-vars verbatim", () => {
+test("backendExecCoordsFromEnv: ZELLIJ env without TMUX is ignored → all-NULL", () => {
+  // tmux is the sole backend: the bare `ZELLIJ` sentinel (and its sub-vars) is
+  // no longer read, so a Claude in a zellij-only pane stamps no coords.
   expect(
     backendExecCoordsFromEnv({
       ZELLIJ: "0",
       ZELLIJ_SESSION_NAME: "mike-main",
       ZELLIJ_PANE_ID: "11",
     }),
-  ).toEqual({ type: "zellij", sessionId: "mike-main", paneId: "11" });
+  ).toEqual({ type: null, sessionId: null, paneId: null });
 });
 
 test("backendExecCoordsFromEnv: empty sub-var collapses to NULL while sentinel + the other sub-var stay populated", () => {
@@ -1032,24 +1033,11 @@ test("backendExecCoordsFromEnv: empty sub-var collapses to NULL while sentinel +
   // COALESCE) but the NULL sub-var preserves the prior captured value.
   expect(
     backendExecCoordsFromEnv({
-      ZELLIJ: "0",
-      ZELLIJ_SESSION_NAME: "",
-      ZELLIJ_PANE_ID: "7",
+      TMUX: "/tmp/tmux-501/default,12345,0",
+      KEEPER_TMUX_SESSION: "",
+      TMUX_PANE: "%7",
     }),
-  ).toEqual({ type: "zellij", sessionId: null, paneId: "7" });
-});
-
-test("backendExecCoordsFromEnv: pane id passes through as raw TEXT (no numeric coercion)", () => {
-  // The T4 tab resolver joins on string-equality against `list-panes`'
-  // numeric `id`, but the env stamp is always TEXT — we preserve the
-  // raw env string verbatim so the join lands.
-  const got = backendExecCoordsFromEnv({
-    ZELLIJ: "0",
-    ZELLIJ_SESSION_NAME: "mike-main",
-    ZELLIJ_PANE_ID: "42",
-  });
-  expect(got.paneId).toBe("42");
-  expect(typeof got.paneId).toBe("string");
+  ).toEqual({ type: "tmux", sessionId: null, paneId: "%7" });
 });
 
 test("backendExecCoordsFromEnv: TMUX sentinel + KEEPER_TMUX_SESSION stamps type='tmux', session, and pane", () => {
@@ -1086,9 +1074,9 @@ test("backendExecCoordsFromEnv: empty TMUX sentinel collapses to all-NULL", () =
   ).toEqual({ type: null, sessionId: null, paneId: null });
 });
 
-test("backendExecCoordsFromEnv: both ZELLIJ and TMUX present → zellij wins (nested pane)", () => {
-  // A Claude inside a zellij pane that itself runs under tmux reports the
-  // zellij surface — the one autopilot dispatched into.
+test("backendExecCoordsFromEnv: TMUX governs even when stray ZELLIJ env is present", () => {
+  // tmux is the sole backend: a leftover `ZELLIJ` sentinel is ignored entirely,
+  // and the tmux coords are the ones stamped.
   expect(
     backendExecCoordsFromEnv({
       ZELLIJ: "0",
@@ -1098,7 +1086,7 @@ test("backendExecCoordsFromEnv: both ZELLIJ and TMUX present → zellij wins (ne
       TMUX_PANE: "%7",
       KEEPER_TMUX_SESSION: "autopilot",
     }),
-  ).toEqual({ type: "zellij", sessionId: "mike-main", paneId: "11" });
+  ).toEqual({ type: "tmux", sessionId: "autopilot", paneId: "%7" });
 });
 
 test("backendExecCoordsFromEnv: tmux pane id passes through as raw TEXT", () => {

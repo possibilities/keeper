@@ -144,7 +144,7 @@ test("projectJobRow: backend coords NEVER appear in the per-row output (collapse
     title: "live session",
     plan_verb: null,
     state: "working",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "ada",
     backend_exec_pane_id: "11",
     backend_exec_tab_id: "3",
@@ -163,7 +163,7 @@ test("projectJobRow: awaiting drops to its own continuation line; backend never 
     state: "stopped",
     last_input_request_at: 999,
     last_input_request_kind: "ask_user_question",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "ada",
     backend_exec_pane_id: "11",
     backend_exec_tab_name: "main",
@@ -206,7 +206,7 @@ test("projectJobRow: every state renders its pill, stopped (the default) include
 test("backendCoordsSeg: pane → '[p<pane>]'", () => {
   expect(
     backendCoordsSeg({
-      backend_exec_type: "zellij",
+      backend_exec_type: "tmux",
       backend_exec_session_id: "ada",
       backend_exec_pane_id: "11",
     }),
@@ -217,12 +217,12 @@ test("backendCoordsSeg: no `·`, no type, no session id in the pill output", () 
   // Belt-and-suspenders against the old shape. Confirm the pill
   // never carries the old free-text segments.
   const out = backendCoordsSeg({
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "ada",
     backend_exec_pane_id: "11",
   });
   expect(out).not.toContain("·");
-  expect(out).not.toContain("zellij");
+  expect(out).not.toContain("tmux");
   expect(out).not.toContain("ada");
 });
 
@@ -231,7 +231,7 @@ test("backendCoordsSeg: stray tab fields on the row are ignored (columns dropped
   // not crash or surface a tab slot even if a stale row somehow carries
   // the fields — the pill reads ONLY `backend_exec_pane_id`.
   const out = backendCoordsSeg({
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "ada",
     backend_exec_pane_id: "11",
     backend_exec_tab_id: "3",
@@ -245,7 +245,7 @@ test("backendCoordsSeg: stray tab fields on the row are ignored (columns dropped
 test("backendCoordsSeg: pane missing → '' (nothing worth showing)", () => {
   expect(
     backendCoordsSeg({
-      backend_exec_type: "zellij",
+      backend_exec_type: "tmux",
       backend_exec_session_id: "ada",
       backend_exec_pane_id: null,
     }),
@@ -254,10 +254,9 @@ test("backendCoordsSeg: pane missing → '' (nothing worth showing)", () => {
 
 test("backendCoordsSeg: absent backend_exec_type still composes a pill from pane", () => {
   // The shape is session-less AND type-less — the row is already
-  // grouped under its session heading by `renderJobsBody`, and the only
-  // backend keeper knows about is zellij. So a present pane still
-  // produces a pill even when `backend_exec_type` is null. (Old shape
-  // gated on type; this shape doesn't need to.)
+  // grouped under its session heading by `renderJobsBody`, so a present
+  // pane still produces a pill even when `backend_exec_type` is null. (Old
+  // shape gated on type; this shape doesn't need to.)
   expect(
     backendCoordsSeg({
       backend_exec_type: null,
@@ -274,7 +273,7 @@ test("backendCoordsSeg: pill is bracketed so colorizePillsInLine can route it", 
   // (Whether it actually tints depends on `PILL_COLORS` entries; the
   // shape contract is just that it's bracketed.)
   const pill = backendCoordsSeg({
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "ada",
     backend_exec_pane_id: "11",
   });

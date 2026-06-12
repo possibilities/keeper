@@ -5108,23 +5108,26 @@ test("resolveConfig: malformed YAML and missing roots key fall back to default",
 // fn-789: autopilot exec backend selector (`exec_backend`)
 // ---------------------------------------------------------------------------
 
-test("resolveConfig: exec_backend defaults to zellij, accepts tmux, warns+falls-back on unknown", () => {
+test("resolveConfig: exec_backend defaults to tmux, accepts tmux, warns+falls-back on unknown", () => {
   const original = process.env.KEEPER_CONFIG;
   try {
     const cfg = join(tmpDir, "config.yaml");
-    // Absent → zellij default.
+    // Absent → tmux default.
     writeFileSync(cfg, "roots:\n  - /tmp/x\n");
     process.env.KEEPER_CONFIG = cfg;
-    expect(resolveConfig().execBackend).toBe("zellij");
+    expect(resolveConfig().execBackend).toBe("tmux");
     // tmux → kept verbatim.
     writeFileSync(cfg, "exec_backend: tmux\n");
     expect(resolveConfig().execBackend).toBe("tmux");
-    // Unknown value → warn + fall back to zellij.
+    // Legacy zellij value → warn + fall back to tmux (no longer recognized).
+    writeFileSync(cfg, "exec_backend: zellij\n");
+    expect(resolveConfig().execBackend).toBe("tmux");
+    // Unknown value → warn + fall back to tmux.
     writeFileSync(cfg, "exec_backend: ghostty\n");
-    expect(resolveConfig().execBackend).toBe("zellij");
+    expect(resolveConfig().execBackend).toBe("tmux");
     // Non-string → default.
     writeFileSync(cfg, "exec_backend: 42\n");
-    expect(resolveConfig().execBackend).toBe("zellij");
+    expect(resolveConfig().execBackend).toBe("tmux");
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;
@@ -5156,7 +5159,7 @@ test("resolveConfig: catch-block defaults include exec_backend", () => {
     writeFileSync(cfg, "roots:\n  - [unbalanced\n: : :\n");
     process.env.KEEPER_CONFIG = cfg;
     const got = resolveConfig();
-    expect(got.execBackend).toBe("zellij");
+    expect(got.execBackend).toBe("tmux");
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;
@@ -8063,7 +8066,7 @@ test("v54 DB migrates to v55: jobs.backend_exec_tab_{id,name} dropped; live coor
        backend_exec_tab_id, backend_exec_tab_name
      ) VALUES (
        'sess-pre', 1, 1, 1, 'pre-v55',
-       'zellij', 'ada', '11', '3', 'main'
+       'tmux', 'ada', '11', '3', 'main'
      )`,
   );
   v54.close();
@@ -8101,7 +8104,7 @@ test("v54 DB migrates to v55: jobs.backend_exec_tab_{id,name} dropped; live coor
     backend_exec_pane_id: string | null;
   };
   expect(job.title).toBe("pre-v55");
-  expect(job.backend_exec_type).toBe("zellij");
+  expect(job.backend_exec_type).toBe("tmux");
   expect(job.backend_exec_session_id).toBe("ada");
   expect(job.backend_exec_pane_id).toBe("11");
 

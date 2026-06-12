@@ -118,8 +118,8 @@ function insertEvent(
     // event; planctl-mint tests pass this explicitly via overrides.
     planctl_files: overrides.planctl_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
-    // session/pane the parent Claude ran under). NULL on every non-zellij
-    // event; backend-exec-mint tests pass these explicitly via overrides.
+    // session/pane the parent Claude ran under). NULL on every event outside a
+    // managed multiplexer; backend-exec-mint tests pass these via overrides.
     backend_exec_type: overrides.backend_exec_type ?? null,
     backend_exec_session_id: overrides.backend_exec_session_id ?? null,
     backend_exec_pane_id: overrides.backend_exec_pane_id ?? null,
@@ -2600,14 +2600,14 @@ test("backend_exec_* folds latest-non-NULL onto jobs across all event types", ()
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-be",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
   insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: "sess-be",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
@@ -2616,7 +2616,7 @@ test("backend_exec_* folds latest-non-NULL onto jobs across all event types", ()
   insertEvent({
     hook_event: "PreToolUse",
     session_id: "sess-be",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "11",
   });
@@ -2625,7 +2625,7 @@ test("backend_exec_* folds latest-non-NULL onto jobs across all event types", ()
   insertEvent({
     hook_event: "Stop",
     session_id: "sess-be",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "11",
   });
@@ -2641,7 +2641,7 @@ test("backend_exec_* folds latest-non-NULL onto jobs across all event types", ()
     backend_exec_pane_id: string | null;
   } | null;
   expect(row).not.toBeNull();
-  expect(row?.backend_exec_type).toBe("zellij");
+  expect(row?.backend_exec_type).toBe("tmux");
   expect(row?.backend_exec_session_id).toBe("mike-main");
   expect(row?.backend_exec_pane_id).toBe("11");
 });
@@ -2650,11 +2650,11 @@ test("NULL-carrying backend_exec event does NOT clobber a prior non-null capture
   // SessionStart stamps coords; a subsequent event fires outside the
   // multiplexer (all-NULL coords) and the prior values must stick.
   // This is the load-bearing COALESCE property — a single bare PreToolUse
-  // outside zellij can't wipe the session's identity.
+  // outside the multiplexer can't wipe the session's identity.
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-stick",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
@@ -2669,7 +2669,7 @@ test("NULL-carrying backend_exec event does NOT clobber a prior non-null capture
     backend_exec_session_id: string | null;
     backend_exec_pane_id: string | null;
   } | null;
-  expect(seeded?.backend_exec_type).toBe("zellij");
+  expect(seeded?.backend_exec_type).toBe("tmux");
   expect(seeded?.backend_exec_session_id).toBe("mike-main");
   expect(seeded?.backend_exec_pane_id).toBe("7");
 
@@ -2693,7 +2693,7 @@ test("NULL-carrying backend_exec event does NOT clobber a prior non-null capture
     backend_exec_session_id: string | null;
     backend_exec_pane_id: string | null;
   } | null;
-  expect(after?.backend_exec_type).toBe("zellij");
+  expect(after?.backend_exec_type).toBe("tmux");
   expect(after?.backend_exec_session_id).toBe("mike-main");
   expect(after?.backend_exec_pane_id).toBe("7");
 });
@@ -2706,7 +2706,7 @@ test("partial backend_exec capture: COALESCE preserves the non-null field, advan
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-part",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
@@ -2715,7 +2715,7 @@ test("partial backend_exec capture: COALESCE preserves the non-null field, advan
   insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: "sess-part",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-other",
     backend_exec_pane_id: null,
   });
@@ -2730,7 +2730,7 @@ test("partial backend_exec capture: COALESCE preserves the non-null field, advan
     backend_exec_session_id: string | null;
     backend_exec_pane_id: string | null;
   } | null;
-  expect(row?.backend_exec_type).toBe("zellij");
+  expect(row?.backend_exec_type).toBe("tmux");
   expect(row?.backend_exec_session_id).toBe("mike-other");
   expect(row?.backend_exec_pane_id).toBe("7");
 });
@@ -2745,14 +2745,14 @@ test("backend_exec fold: cursor=0 re-fold reproduces byte-identical jobs rows", 
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-refold",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
   insertEvent({
     hook_event: "UserPromptSubmit",
     session_id: "sess-refold",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
@@ -2760,7 +2760,7 @@ test("backend_exec fold: cursor=0 re-fold reproduces byte-identical jobs rows", 
   insertEvent({
     hook_event: "PreToolUse",
     session_id: "sess-refold",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "11",
   });
@@ -2776,7 +2776,7 @@ test("backend_exec fold: cursor=0 re-fold reproduces byte-identical jobs rows", 
   insertEvent({
     hook_event: "Stop",
     session_id: "sess-refold",
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-other",
     backend_exec_pane_id: "11",
   });
@@ -2814,7 +2814,7 @@ test("config_dir fold unchanged: only SessionStart seeds it, subsequent events d
     // Non-SessionStart events always carry NULL config_dir per the
     // hook contract; assert the fold leaves the prior value alone.
     config_dir: null,
-    backend_exec_type: "zellij",
+    backend_exec_type: "tmux",
     backend_exec_session_id: "mike-main",
     backend_exec_pane_id: "7",
   });
@@ -2829,12 +2829,12 @@ test("config_dir fold unchanged: only SessionStart seeds it, subsequent events d
   // config_dir held through the every-event fold; backend_exec_type
   // landed via the new arm — proves the two fold paths are independent.
   expect(row?.config_dir).toBe("/tmp/profile-x");
-  expect(row?.backend_exec_type).toBe("zellij");
+  expect(row?.backend_exec_type).toBe("tmux");
 });
 
 // ---------------------------------------------------------------------------
 // Retired `BackendExecSnapshot` arm (fn-710). The synthetic-event TYPE and its
-// historical rows persist in the immutable log, but the zellij feed that
+// historical rows persist in the immutable log, but the producer feed that
 // produced them is gone and the dispatch arm is now an EXPLICIT empty no-op.
 // CRITICAL regression guard: the arm must NOT fall through to `projectJobsRow`
 // (the final `else`) — doing so would route a historical `BackendExecSnapshot`
@@ -2987,13 +2987,13 @@ test("TmuxPaneSnapshot never overwrites a non-NULL backend_exec_session_id", () 
   );
 });
 
-test("TmuxPaneSnapshot does not fill a zellij job or a pane-id mismatch", () => {
-  // A zellij job with a NULL session and a tmux job whose pane id no pair
+test("TmuxPaneSnapshot does not fill a non-tmux job or a pane-id mismatch", () => {
+  // A non-tmux job with a NULL session and a tmux job whose pane id no pair
   // matches: neither must be touched.
   insertEvent({
     hook_event: "SessionStart",
-    session_id: "sess-zellij",
-    backend_exec_type: "zellij",
+    session_id: "sess-non-tmux",
+    backend_exec_type: "other",
     backend_exec_session_id: null,
     backend_exec_pane_id: "%1",
   });
@@ -3006,12 +3006,12 @@ test("TmuxPaneSnapshot does not fill a zellij job or a pane-id mismatch", () => 
   });
   drainAll();
 
-  // Pair targets %1 — but %1 belongs to the ZELLIJ job (wrong type), and the
+  // Pair targets %1 — but %1 belongs to the NON-TMUX job (wrong type), and the
   // tmux job is on %9.
   tmuxPaneSnapshotEvent([{ pane_id: "%1", session_name: "human-work" }]);
   expect(drainAll()).toBe(1);
 
-  expect(getBackendCoords("sess-zellij")?.backend_exec_session_id).toBeNull();
+  expect(getBackendCoords("sess-non-tmux")?.backend_exec_session_id).toBeNull();
   expect(
     getBackendCoords("sess-tmux-other")?.backend_exec_session_id,
   ).toBeNull();

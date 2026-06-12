@@ -219,7 +219,7 @@ export function configDirFromEnv(env: NodeJS.ProcessEnv): string | null {
  * (not SessionStart-gated like {@link configDirFromEnv}). Each field is
  * an independent `string | null` so the reducer's COALESCE
  * latest-non-NULL-wins fold can layer them onto `jobs` cleanly: a hook
- * event firing inside a zellij pane but with one sub-var absent stamps
+ * event firing inside a tmux pane but with one sub-var absent stamps
  * that one as NULL and never clobbers a prior captured value.
  */
 export interface BackendExecCoords {
@@ -233,17 +233,14 @@ export interface BackendExecCoords {
  * Called on EVERY hook event — a synchronous `process.env` read (no
  * fork/fs/PPID-walk), cheap enough for the cold-start budget on every fire.
  *
- * Sentinel gating, in precedence order:
- *  - zellij stamps the bare `ZELLIJ` env var into every pane; checked FIRST so
- *    a Claude nested inside a zellij pane (which itself runs under tmux) reports
- *    zellij coords, the surface autopilot actually dispatched into.
- *  - tmux stamps `TMUX` + `TMUX_PANE` into every pane; checked SECOND. Type and
- *    pane id always stamp under tmux; the session name stamps ONLY when
- *    `KEEPER_TMUX_SESSION` is present (keeper-managed launches inject it via
- *    `-e`). A human-created tmux session carries no `KEEPER_TMUX_SESSION`, so
- *    the session stays NULL and the snapshot poller fills it later.
- *  - neither sentinel → all-NULL; never stamp a bogus `type` for a session
- *    launched outside a known multiplexer.
+ * Sentinel gating:
+ *  - tmux stamps `TMUX` + `TMUX_PANE` into every pane. Type and pane id always
+ *    stamp under tmux; the session name stamps ONLY when `KEEPER_TMUX_SESSION`
+ *    is present (keeper-managed launches inject it via `-e`). A human-created
+ *    tmux session carries no `KEEPER_TMUX_SESSION`, so the session stays NULL
+ *    and the snapshot poller fills it later.
+ *  - no sentinel → all-NULL; never stamp a bogus `type` for a session launched
+ *    outside the multiplexer.
  *
  * Each sub-var collapses absent/empty to NULL independently so the reducer's
  * COALESCE arm cannot be clobbered by a partial capture. The env-var NAMES are
@@ -255,20 +252,6 @@ export interface BackendExecCoords {
 export function backendExecCoordsFromEnv(
   env: NodeJS.ProcessEnv,
 ): BackendExecCoords {
-  // zellij sentinel wins: a Claude nested in a zellij pane (possibly itself
-  // inside tmux) reports zellij — the surface autopilot dispatched into.
-  const zellijSentinel = env.ZELLIJ;
-  if (zellijSentinel !== undefined && zellijSentinel !== "") {
-    const meta = execBackendEnvMeta("zellij");
-    const rawSession = env[meta.sessionIdEnvVar];
-    const rawPane = env[meta.paneIdEnvVar];
-    return {
-      type: meta.backendType,
-      sessionId:
-        rawSession === undefined || rawSession === "" ? null : rawSession,
-      paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
-    };
-  }
   // tmux sentinel: `TMUX` is set in every tmux pane. Stamp type + pane id; the
   // session name stamps only when `KEEPER_TMUX_SESSION` is present (managed
   // launches inject it) — human sessions stay NULL until the poller fills them.
@@ -284,7 +267,7 @@ export function backendExecCoordsFromEnv(
       paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
     };
   }
-  // Neither multiplexer — `type` would be a lie; every coord stays NULL.
+  // Not under tmux — `type` would be a lie; every coord stays NULL.
   return { type: null, sessionId: null, paneId: null };
 }
 
@@ -711,8 +694,8 @@ async function main(): Promise<void> {
   // Backend-exec coordinates: captured on EVERY hook event, not SessionStart-
   // gated. A pure synchronous `process.env` read (no fork/fs/PPID-walk), so it
   // stays inside the cold-start budget on every fire. Absent sentinel
-  // (`ZELLIJ` unset/empty) ⇒ all three NULL — never a bogus `type='zellij'` on
-  // a non-zellij session. See {@link backendExecCoordsFromEnv}.
+  // (`TMUX` unset/empty) ⇒ all three NULL — never a bogus `type` on a session
+  // launched outside tmux. See {@link backendExecCoordsFromEnv}.
   const backendExecCoords = backendExecCoordsFromEnv(process.env);
 
   // The launched background-task id on PostToolUse:Monitor

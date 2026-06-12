@@ -24,11 +24,11 @@
  *
  * What this tool deliberately does NOT do: it never writes a projection
  * directly (the RPC round-trips through the reducer, so a re-fold sees the
- * clear), never kills or resurrects the zellij worker session (a heavier,
+ * clear), never kills or resurrects the tmux worker session (a heavier,
  * riskier hammer the daemon's exec-backend already self-heals on session-gone),
  * and never auto-unpauses unless you ask (`--play`) — pause is a human safety
- * default. The two adjacent conditions it can't fix (a dirty target repo, an
- * EXITED zellij session) are surfaced as loud warnings so you fix them
+ * default. The two adjacent conditions it can't fix (a dirty target repo, a
+ * missing tmux session) are surfaced as loud warnings so you fix them
  * deliberately before the cleared dispatches just re-fail.
  *
  * Safe by default: a bare invocation only DIAGNOSES (read-only queries) and
@@ -43,7 +43,7 @@
  * Options:
  *   --apply                 Send retry_dispatch for every dispatch_failures row.
  *   --play                  If autopilot is paused, also send set_autopilot_paused{false}.
- *   --session-name <name>   zellij session to liveness-check (default: autopilot).
+ *   --session-name <name>   tmux session to liveness-check (default: autopilot).
  *   --sock <path>           Socket path override ($KEEPER_SOCK / default otherwise).
  *   --help                  Show this help.
  */
@@ -51,7 +51,10 @@
 import { parseArgs } from "node:util";
 import { buildRetryFrame, buildSetPausedFrame } from "../cli/autopilot";
 import { resolveSockPath } from "../src/db";
-import { DEFAULT_ZELLIJ_SESSION } from "../src/exec-backend";
+import {
+  buildTmuxHasSessionArgs,
+  MANAGED_EXEC_SESSION,
+} from "../src/exec-backend";
 import {
   type ClientFrame,
   encodeFrame,
@@ -70,7 +73,7 @@ Usage:
 Options:
   --apply                 Send retry_dispatch for every dispatch_failures row.
   --play                  If autopilot is paused, also send set_autopilot_paused{false}.
-  --session-name <name>   zellij session to liveness-check (default: ${DEFAULT_ZELLIJ_SESSION}).
+  --session-name <name>   tmux session to liveness-check (default: ${MANAGED_EXEC_SESSION}).
   --sock <path>           Socket path override ($KEEPER_SOCK / default otherwise).
   --help                  Show this help.
 
@@ -221,50 +224,27 @@ async function queryAll(sockPath: string, collection: string): Promise<Row[]> {
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 
-/** Strip ANSI CSI sequences from a line (zellij colors its session list). */
-function stripAnsi(s: string): string {
-  // biome-ignore lint/suspicious/noControlCharactersInRegex: matching real CSI bytes
-  return s.replace(/\x1b\[[0-9;]*m/g, "");
-}
-
-type SessionState = "live" | "exited" | "missing" | "unknown";
+type SessionState = "live" | "missing" | "unknown";
 
 /**
- * Liveness-check the zellij worker session by parsing `zellij list-sessions`.
- * An `EXITED - attach to resurrect` line is a CORPSE, not a live server — the
- * exec-backend treats it as not-listed and routes to `attach -b`. We surface it
- * as a warning either way. Returns `"unknown"` if the binary is missing or the
- * command errors (non-fatal — this tool's job is dispatch_failures, not infra).
+ * Liveness-check the tmux worker session via `tmux has-session -t =<name>`
+ * (exit 0 = live, non-zero = absent). The `=` prefix forces an EXACT match so
+ * `auto` never spuriously matches `autopilot`. Returns `"unknown"` if the binary
+ * is missing or the spawn errors (non-fatal — this tool's job is
+ * dispatch_failures, not infra).
  */
 async function probeSession(session: string): Promise<SessionState> {
   let proc: ReturnType<typeof Bun.spawn>;
   try {
-    proc = Bun.spawn(["zellij", "list-sessions"], {
+    proc = Bun.spawn(buildTmuxHasSessionArgs(session), {
       stdout: "pipe",
       stderr: "pipe",
     });
   } catch {
     return "unknown";
   }
-  const [stdout, exitCode] = await Promise.all([
-    new Response(proc.stdout as ReadableStream).text(),
-    proc.exited,
-  ]);
-  // zellij exits non-zero when there are zero sessions at all.
-  if (exitCode !== 0 && stdout.trim().length === 0) {
-    return "missing";
-  }
-  for (const raw of stdout.split("\n")) {
-    const line = stripAnsi(raw).trim();
-    if (line.length === 0) {
-      continue;
-    }
-    const firstTok = line.split(/\s+/)[0];
-    if (firstTok === session) {
-      return /\bEXITED\b/.test(line) ? "exited" : "live";
-    }
-  }
-  return "missing";
+  const exitCode = await proc.exited;
+  return exitCode === 0 ? "live" : "missing";
 }
 
 /** Human-readable age from a unix-seconds timestamp. */
@@ -285,7 +265,7 @@ async function main(): Promise<void> {
     options: {
       apply: { type: "boolean", default: false },
       play: { type: "boolean", default: false },
-      "session-name": { type: "string", default: DEFAULT_ZELLIJ_SESSION },
+      "session-name": { type: "string", default: MANAGED_EXEC_SESSION },
       sock: { type: "string" },
       help: { type: "boolean", default: false },
     },
@@ -298,7 +278,7 @@ async function main(): Promise<void> {
   }
 
   const sock = values.sock ?? resolveSockPath();
-  const sessionName = values["session-name"] ?? DEFAULT_ZELLIJ_SESSION;
+  const sessionName = values["session-name"] ?? MANAGED_EXEC_SESSION;
 
   // --- diagnose (read-only) -------------------------------------------------
   const [apRows, failRows, gitRows] = await Promise.all([
@@ -318,7 +298,7 @@ async function main(): Promise<void> {
   console.log(`  sticky failures:   ${failRows.length}`);
   console.log(`  dirty repos:       ${dirtyRoots.length}`);
   console.log(
-    `  zellij "${sessionName}":  ${sessionState}${sessionState === "exited" ? "  <-- CORPSE: dispatches will fail until resurrected" : ""}`,
+    `  tmux "${sessionName}":  ${sessionState}${sessionState === "missing" ? "  <-- absent: the daemon mints it on next dispatch" : ""}`,
   );
 
   if (dirtyRoots.length > 0) {
@@ -331,15 +311,15 @@ async function main(): Promise<void> {
       );
     }
   }
-  if (sessionState === "exited" || sessionState === "missing") {
+  if (sessionState === "missing") {
     console.log(
-      `\n[warn] zellij session "${sessionName}" is ${sessionState} — cleared dispatches may re-fail`,
+      `\n[warn] tmux session "${sessionName}" is absent — the daemon's exec-backend`,
     );
     console.log(
-      "         on launch. The daemon's exec-backend attempts self-heal (attach -b);",
+      "         mints it on the next dispatch (new-session -d), so this usually",
     );
     console.log(
-      `         if failures recur, resurrect it: zellij delete-session ${sessionName} --force`,
+      `         self-heals; if launches keep failing, inspect it: tmux has-session -t =${sessionName}`,
     );
   }
 

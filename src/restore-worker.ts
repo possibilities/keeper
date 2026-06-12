@@ -8,7 +8,7 @@
  * the wake worker and autopilot worker use), the worker reads the `jobs` +
  * `epics` projections off its own read-only connection via the shared
  * {@link runQuery} server-worker read seam, builds a pure
- * {@link buildRestoreTier} snapshot of the live jobs grouped by zellij
+ * {@link buildRestoreTier} snapshot of the live jobs grouped by
  * `backend_exec_session_id`, stable-serializes it (sorted keys, ASCII-escaped
  * — same shape `serializePlanctlJson` produces), hashes the serialized bytes,
  * and rewrites `~/.local/state/keeper/restore.json` via `atomicWriteFile`.
@@ -178,13 +178,10 @@ const TMUX_PROBE_TIMEOUT_MS = 5000;
  * restore file is a non-projection side-file with its own version.
  *
  * **v3 (epic fn-789): per-bucket backend type.** Each session bucket gains a
- * `backend` field stamped from its jobs' `backend_exec_type`, so the
- * restore-agents util can route each bucket through the matching exec backend
- * (zellij / tmux) instead of hardcoding zellij. Same coupling rule as v2: the
- * v3 writer and the v3 reader ship in one commit, and the bump is ONLY on the
- * side-file's own `RESTORE_SCHEMA_VERSION` — the DB `SCHEMA_VERSION` and
- * `keeper/api.py` do NOT move. A v2/legacy bucket without `backend` reads as
- * `zellij`.
+ * `backend` field stamped from its jobs' `backend_exec_type`. The bump landed
+ * with the side-file's own `RESTORE_SCHEMA_VERSION` only — the DB
+ * `SCHEMA_VERSION` and `keeper/api.py` do NOT move. A bucket without `backend`
+ * (a v2/legacy file) coerces to `DEFAULT_EXEC_BACKEND`.
  */
 export const RESTORE_SCHEMA_VERSION = 3;
 
@@ -222,11 +219,11 @@ export interface RestoreAgent {
  * on a row-order shuffle from the underlying SELECT).
  *
  * `backend` (schema v3, epic fn-789) is the exec-backend tag the bucketed jobs
- * ran under — `'zellij'` / `'tmux'` — so `scripts/restore-agents.ts` routes the
- * bucket through the matching backend instead of hardcoding zellij. A session
- * name is backend-unique in practice; a mixed bucket is an invariant violation
- * the producer asserts on rather than engineers around. OPTIONAL on the wire: a
- * v2/legacy bucket without `backend` reads as `zellij`.
+ * ran under, recorded so `scripts/restore-agents.ts` can route the bucket
+ * through the matching backend. A session name is backend-unique in practice; a
+ * mixed bucket is an invariant violation the producer asserts on rather than
+ * engineers around. OPTIONAL on the wire: a bucket without `backend` (a
+ * v2/legacy file) coerces to `DEFAULT_EXEC_BACKEND`.
  */
 export interface RestoreSession {
   agents: RestoreAgent[];
@@ -239,7 +236,7 @@ export interface RestoreSession {
  * timestamp of when it was taken. `captured_at` is INCLUDED in the serialized
  * file (informational — the util surfaces it in the dry-run header) but
  * EXCLUDED from the hashed shape (or every tick would churn the file). The
- * `sessions` field is an object keyed by zellij session name; alpha key sort
+ * `sessions` field is an object keyed by backend session name; alpha key sort
  * happens at serialize time via `sortObjectKeys`.
  */
 export interface RestoreTier {
@@ -328,7 +325,7 @@ export function buildRestoreTier(
       plan_ref: job.plan_ref,
     };
     // Backend tag for the bucket (schema v3): the job's `backend_exec_type`,
-    // defaulting to `zellij` when NULL (the pre-tmux default). A session name
+    // defaulting to `DEFAULT_EXEC_BACKEND` when NULL. A session name
     // is backend-unique in practice, so the first job's backend defines the
     // bucket; a later job under the same session with a DIFFERENT backend is an
     // invariant violation — assert rather than silently last-write-wins.
@@ -426,8 +423,8 @@ export function serializeForWrite(descriptor: RestoreDescriptor): string {
 
 /**
  * Coerce an arbitrary parsed value to a {@link RestoreTier}, or `null` on any
- * garbage / wrong shape. Mirrors {@link parseZellijWatermarks}'s defensive
- * coercion: never throws, always returns either a well-formed tier or `null`.
+ * garbage / wrong shape. Defensive coercion: never throws, always returns
+ * either a well-formed tier or `null`.
  * The agent records themselves are NOT deep-validated — the reader
  * (`scripts/restore-agents.ts`) only reads them, and a malformed agent is the
  * producer's invariant violation, not the boot-read's concern.
@@ -470,8 +467,7 @@ export interface PersistedRestore {
 
 /**
  * Parse the persisted `restore.json` text for boot-promote. SYNCHRONOUS,
- * never throws — mirrors {@link parseZellijWatermarks} + the daemon's boot
- * read at `src/daemon.ts:676-689`. Any garbage / non-object / wrong shape
+ * never throws — mirrors the daemon's boot read at `src/daemon.ts:676-689`. Any garbage / non-object / wrong shape
  * coerces each tier to `null`. Exported for unit reach.
  *
  * Reads three sources so boot-promote can apply the precedence chain:

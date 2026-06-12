@@ -869,7 +869,7 @@ test("fn-735 runReconcileCycle: a definitive launch failure CLEARS the cooldown 
   // entry is deleted so `failedKeys` owns stickiness and a human's
   // retry_dispatch re-dispatches without first waiting out the cooldown.
   const { deps, log } = makeFakeDeps({
-    launch: async () => ({ ok: false, error: "zellij ENOENT" }),
+    launch: async () => ({ ok: false, error: "tmux ENOENT" }),
   });
   const epic = makeEpic({
     epic_id: "fn-1-foo",
@@ -1208,7 +1208,7 @@ test("fn-742 runReconcileCycle: a definitive launch failure CLEARS the finalizer
   // On `launch.ok===false` the finalizer never ran, so the guard entry is
   // deleted — the re-dispatch (and retry_dispatch) need not wait it out.
   const { deps } = makeFakeDeps({
-    launch: async () => ({ ok: false, error: "zellij ENOENT" }),
+    launch: async () => ({ ok: false, error: "tmux ENOENT" }),
   });
   const epic = readyCloseEpic("fn-1-foo", "/repo");
   const snap = makeSnapshot({ epics: [epic] });
@@ -1774,7 +1774,7 @@ test("confirmRunning IN-DOUBT (fn-724): launch.ok + ceiling elapses, NO jobs row
   // fn-724 reclassifies the ceiling-hit-with-successful-launch case. The
   // launch SUCCEEDED (default fake launch returns {ok:true}) but the
   // SessionStart jobs row never landed inside the ceiling. The outcome is
-  // UNKNOWN, not failed (zellij execs `claude` cold 24-33s later — maybe
+  // UNKNOWN, not failed (the backend execs `claude` cold 24-33s later — maybe
   // past the ceiling), so confirmRunning returns "indoubt" and SUPPRESSES
   // the DispatchFailed emit. The `pending_dispatches` row (emitted + ack'd
   // before launch) is KEPT — the TTL sweep clears it if the bind never
@@ -1899,7 +1899,7 @@ test("confirmRunning aborted: no timeout-backstop record (shutdown is not a resc
 
 test("confirmRunning BAD: launch returns {ok:false} → failed immediately with surfaced reason", async () => {
   const { deps, log } = makeFakeDeps({
-    launch: async () => ({ ok: false, error: "zellij ENOENT" }),
+    launch: async () => ({ ok: false, error: "tmux ENOENT" }),
   });
   const ctrl = new AbortController();
   const outcome = await confirmRunning(
@@ -1912,7 +1912,7 @@ test("confirmRunning BAD: launch returns {ok:false} → failed immediately with 
   );
   expect(outcome).toBe("failed");
   expect(log.emissions.length).toBe(1);
-  expect(log.emissions[0]?.reason).toBe("zellij ENOENT");
+  expect(log.emissions[0]?.reason).toBe("tmux ENOENT");
   // No poll loop touched.
   expect(log.findJobCalls.length).toBe(0);
 });

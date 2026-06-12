@@ -37,14 +37,14 @@ function writeConfig(yaml: string): void {
   process.env.KEEPER_CONFIG = path;
 }
 
-test("execBackend defaults to zellij when the config file is absent", () => {
+test("execBackend defaults to tmux when the config file is absent", () => {
   process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().execBackend).toBe("zellij");
+  expect(resolveConfig().execBackend).toBe("tmux");
 });
 
-test("execBackend defaults to zellij when the key is absent", () => {
+test("execBackend defaults to tmux when the key is absent", () => {
   writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().execBackend).toBe("zellij");
+  expect(resolveConfig().execBackend).toBe("tmux");
 });
 
 test("exec_backend: tmux selects the tmux backend", () => {
@@ -52,21 +52,23 @@ test("exec_backend: tmux selects the tmux backend", () => {
   expect(resolveConfig().execBackend).toBe("tmux");
 });
 
-test("exec_backend: zellij is accepted verbatim", () => {
+test("exec_backend: an explicit zellij value warns and falls back to tmux", () => {
+  // `zellij` is no longer a recognized backend — it takes the unknown-value
+  // warn-and-fall-back path, now landing on tmux.
   writeConfig("exec_backend: zellij\n");
-  expect(resolveConfig().execBackend).toBe("zellij");
+  expect(resolveConfig().execBackend).toBe("tmux");
 });
 
-test("an unknown exec_backend value warns and falls back to zellij", () => {
+test("an unknown exec_backend value warns and falls back to tmux", () => {
   // `ghostty` is not a recognized backend — fall back to the default
   // rather than threading an unhandled value into the worker.
   writeConfig("exec_backend: ghostty\n");
-  expect(resolveConfig().execBackend).toBe("zellij");
+  expect(resolveConfig().execBackend).toBe("tmux");
 });
 
-test("a non-string exec_backend falls back to the zellij default", () => {
+test("a non-string exec_backend falls back to the tmux default", () => {
   writeConfig("exec_backend: 42\n");
-  expect(resolveConfig().execBackend).toBe("zellij");
+  expect(resolveConfig().execBackend).toBe("tmux");
 });
 
 test("exec_backend resolves independently of a malformed sibling key", () => {

@@ -8,7 +8,7 @@
  * `loadRestoreFile` parse / missing / future-schema branches.
  *
  * The util's `main()` exit path (Bun.argv parsing, real Bun.connect probe,
- * real zellij ensureLaunched) is NOT spawned — the same shape every other
+ * real tmux ensureLaunched) is NOT spawned — the same shape every other
  * one-shot CLI test in this repo uses. `KEEPER_RESTORE_FILE` is set per-test
  * for fs sandboxing per CLAUDE.md "test-isolation" rules.
  */
@@ -53,7 +53,7 @@ test("classifySchemaVersion returns ok for the current version (v3)", () => {
 
 test("classifySchemaVersion returns ok for older versions (v1, v2)", () => {
   // v1/v2 are <= RESTORE_SCHEMA_VERSION (now 3), so they fall through, not
-  // future. A v2 file (no per-bucket backend) reads as zellij downstream.
+  // future. A v2 file (no per-bucket backend) coerces to the default downstream.
   expect(classifySchemaVersion(1)).toBe("ok");
   expect(classifySchemaVersion(2)).toBe("ok");
 });
@@ -198,9 +198,9 @@ test("planRestore visits sessions in alpha-sorted order", () => {
   ]);
 });
 
-test("planRestore reads a v2/legacy bucket (no backend tag) as zellij — would-restore", () => {
+test("planRestore reads a v2/legacy bucket (no backend tag) as would-restore", () => {
   // fakeSessions builds buckets without a `backend` field — the v2/legacy
-  // shape. They must route normally (default zellij), not skip.
+  // shape. They route normally through the default backend, never skipped.
   const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" })],
   });
@@ -216,27 +216,27 @@ test("planRestore routes a known tmux bucket as would-restore", () => {
   expect(plan.map((p) => p.kind)).toEqual(["would-restore"]);
 });
 
-test("planRestore skips an unknown-backend bucket with skipped-backend", () => {
+test("planRestore would-restores an explicit-zellij bucket (relaunches in tmux)", () => {
+  // tmux is the sole backend: a legacy `zellij`-tagged bucket no longer skips —
+  // it would-restores and `resolveExecBackend` routes it to tmux at launch.
   const desc = fakeSessionsWithBackend({
-    weird: { agents: [fakeAgent({ job_id: "a" })], backend: "wezterm" },
+    z: { agents: [fakeAgent({ job_id: "z1" })], backend: "zellij" },
   });
   const plan = planRestore(desc, null, new Set());
-  expect(plan).toHaveLength(1);
-  expect(plan[0].kind).toBe("skipped-backend");
-  expect((plan[0] as { backend: string }).backend).toBe("wezterm");
+  expect(plan.map((p) => p.kind)).toEqual(["would-restore"]);
 });
 
-test("planRestore mixes per-bucket backend routing — zellij/tmux restore, unknown skips", () => {
+test("planRestore would-restores every bucket regardless of its backend tag", () => {
   const desc = fakeSessionsWithBackend({
     z: { agents: [fakeAgent({ job_id: "z1" })], backend: "zellij" },
     t: { agents: [fakeAgent({ job_id: "t1" })], backend: "tmux" },
     x: { agents: [fakeAgent({ job_id: "x1" })], backend: "kitty" },
   });
   const plan = planRestore(desc, null, new Set());
-  // Alpha order: t, x, z.
+  // Alpha order: t, x, z — all would-restore (no backend is skipped).
   expect(plan.map((p) => [p.session, p.kind])).toEqual([
     ["t", "would-restore"],
-    ["x", "skipped-backend"],
+    ["x", "would-restore"],
     ["z", "would-restore"],
   ]);
 });
@@ -328,7 +328,7 @@ test("applyRestore continues past a single agent's launch failure", async () => 
       // First call fails, second succeeds — capture which is which via the
       // call's argv body.
       if (_argv[4].includes(`"fail"`)) {
-        return { ok: false, error: "zellij ENOENT" };
+        return { ok: false, error: "tmux ENOENT" };
       }
       return { ok: true };
     },
@@ -336,7 +336,7 @@ test("applyRestore continues past a single agent's launch failure", async () => 
   );
   expect(out).toHaveLength(2);
   expect(out[0].kind).toBe("failed");
-  expect((out[0] as { error: string }).error).toBe("zellij ENOENT");
+  expect((out[0] as { error: string }).error).toBe("tmux ENOENT");
   expect(out[1].kind).toBe("restored");
 });
 
@@ -414,16 +414,6 @@ test("renderOutcomes apply summary names restored / skipped-live / failed", asyn
   expect(rendered).toContain("skipped-live=1");
   expect(rendered).toContain("failed=1");
   expect(rendered).toContain("FAILED z");
-});
-
-test("renderOutcomes reports skipped-backend in the summary and a per-agent note", () => {
-  const desc = fakeSessionsWithBackend({
-    weird: { agents: [fakeAgent({ job_id: "a" })], backend: "wezterm" },
-  });
-  const plan = planRestore(desc, null, new Set());
-  const out = renderOutcomes(plan, "/bin/zsh", false);
-  expect(out).toContain("skipped-backend=1");
-  expect(out).toContain("unknown backend 'wezterm'");
 });
 
 test("renderOutcomes labels use the resolved title, not the session id", () => {
@@ -562,7 +552,7 @@ test("loadRestoreFile v3: preserves each bucket's backend tag", async () => {
       last_session: {
         captured_at: 100,
         sessions: {
-          ztab: { backend: "zellij", agents: [fakeAgent({ job_id: "z" })] },
+          ztab: { backend: "legacy", agents: [fakeAgent({ job_id: "z" })] },
           ttab: { backend: "tmux", agents: [fakeAgent({ job_id: "t" })] },
         },
       },
@@ -571,11 +561,11 @@ test("loadRestoreFile v3: preserves each bucket's backend tag", async () => {
     "utf8",
   );
   const sessions = okSessions(await loadRestoreFile(restorePath));
-  expect(sessions.ztab.backend).toBe("zellij");
+  expect(sessions.ztab.backend).toBe("legacy");
   expect(sessions.ttab.backend).toBe("tmux");
 });
 
-test("loadRestoreFile v2: a legacy bucket carries no backend tag (reads as zellij downstream)", async () => {
+test("loadRestoreFile v2: a legacy bucket carries no backend tag (would-restore downstream)", async () => {
   writeFileSync(
     restorePath,
     JSON.stringify({
@@ -590,7 +580,7 @@ test("loadRestoreFile v2: a legacy bucket carries no backend tag (reads as zelli
   );
   const sessions = okSessions(await loadRestoreFile(restorePath));
   expect(sessions.autopilot.backend).toBeUndefined();
-  // planRestore treats the undefined tag as the zellij default → would-restore.
+  // planRestore would-restores the undefined-tag bucket (default backend).
   expect(planRestore(sessions, null, new Set()).map((p) => p.kind)).toEqual([
     "would-restore",
   ]);

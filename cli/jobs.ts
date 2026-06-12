@@ -4,7 +4,7 @@
  *
  * Sibling of `cli/board.ts` (epics-only) and `cli/git.ts` (git status).
  * Renders ONLY the bottom jobs list — one section per
- * `backend_exec_session_id` (zellij session) with nested sub-agent lines
+ * `backend_exec_session_id` (tmux session) with nested sub-agent lines
  * — plus the persistent `[dead-letter:N]` warn banner and the `r`
  * replay-dead-letter key.
  *
@@ -116,7 +116,7 @@ TUI keys (TTY only):
   c copy frame + sidecar paths · r replay oldest waiting dead-letter
   i insert mode · q/Ctrl-C quit
   Insert mode (job-local nav): j/k or ↓/↑ select · space expand/collapse the
-  row's pane + sub-agent lines · v focus the job's zellij pane · Esc leaves.
+  row's pane + sub-agent lines · v focus the job's tmux pane · Esc leaves.
   Other keys are inert in insert mode (Ctrl-C still quits).
 
 Rows are grouped into \`--- <session> ---\` sections by backend_exec_session_id
@@ -194,8 +194,8 @@ export function projectJobRow(row: Record<string, unknown>): string {
  * Compose the backend-coords PILL for one jobs row: `[p<pane>]`.
  *
  * Session-less and type-less by design — the row is already grouped under
- * its `--- <session> ---` heading (see `renderJobsBody`), and the only
- * backend keeper currently knows about is zellij, so the per-row pill
+ * its `--- <session> ---` heading (see `renderJobsBody`), and the row is
+ * already grouped by session, so the per-row pill
  * just identifies the pane within that session. Bracketed so
  * `colorizePillsInLine` tints it like the other status pills. (The tab
  * id/name slots were dropped in fn-710 T2 — their dead feed was reaped
@@ -646,8 +646,8 @@ export async function main(argv: string[]): Promise<void> {
   // row by `job_id` (the same resolution `space` uses for expand-toggle), reads
   // `backend_exec_type` / `backend_exec_session_id` / `backend_exec_pane_id`;
   // any missing → flash `[no backend pane]` and exit. The backend is resolved
-  // PER ROW from `backend_exec_type` so a mixed zellij+tmux DB routes each focus
-  // to the matching impl; an unknown/NULL type falls through to zellij in
+  // PER ROW from `backend_exec_type` (a historical DB may carry legacy tags);
+  // every type resolves to the tmux backend in
   // `resolveExecBackend`, but a NULL session/pane skips before that. `noteLine`
   // funnels backend warnings to the same lifecycle sidecar `view.noteLine`
   // writes to. Otherwise stamp `[focusing…]` via setStatus (persistent until
@@ -692,8 +692,8 @@ export async function main(argv: string[]): Promise<void> {
       view.flashStatus("[no backend pane]");
       return;
     }
-    // Resolve per-row: a NULL/unknown `backend_exec_type` falls through to the
-    // zellij factory inside `resolveExecBackend`.
+    // Resolve per-row: every `backend_exec_type` (NULL/unknown/legacy included)
+    // resolves to the tmux factory inside `resolveExecBackend`.
     const backendType =
       typeof row.backend_exec_type === "string"
         ? row.backend_exec_type
@@ -800,7 +800,7 @@ export async function main(argv: string[]): Promise<void> {
         break;
       }
       case "v":
-        // Focus the selected job's zellij pane via `ExecBackend.focusPane`.
+        // Focus the selected job's tmux pane via `ExecBackend.focusPane`.
         // No re-emit needed — the visual feedback is the banner flash from
         // `handleFocusKey` itself; the row list shape is unchanged.
         handleFocusKey();

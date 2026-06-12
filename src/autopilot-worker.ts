@@ -70,7 +70,7 @@ export type Verb = "work" | "close";
 
 /**
  * The dedup / in-flight key — exactly `${verb}::${id}`, matching the `--name`
- * baked into the worker argv (also the zellij tab name).
+ * baked into the worker argv (also the tmux window name).
  */
 export type DispatchKey = string;
 
@@ -360,7 +360,7 @@ export interface ReconcileSnapshot {
  * either success OR failure). NEVER persisted — the reconciler restarts
  * cold; the durable signal is the `jobs` projection itself PLUS the
  * fn-674 per-cycle `liveTabKeys` probe, which re-derives the launch →
- * SessionStart occupation against zellij on every wake so a daemon
+ * SessionStart occupation against the exec backend on every wake so a daemon
  * restart never double-dispatches a slot already claimed by a live
  * worker tab.
  */
@@ -451,7 +451,7 @@ export interface ReconcileDecision {
  * — no real worker spawn).
  */
 export interface ConfirmRunningDeps {
-  /** Spawn the worker argv in a zellij tab named `name`. */
+  /** Spawn the worker argv in a tmux window keyed by `name`. */
   launch(argv: string[], name: string, cwd: string): Promise<LaunchResult>;
   /**
    * Emit a synthetic `DispatchFailed` event onto the writable connection
@@ -599,7 +599,7 @@ export interface DispatchExpiredPayload {
  *  - `"failed"` — `launch()` returned `{ok:false}` (or threw); mints a STICKY
  *    `DispatchFailed` (cleared only by a human `retry_dispatch`).
  *  - `"indoubt"` — the launch SUCCEEDED but the ceiling elapsed with NO `jobs`
- *    row. UNKNOWN, not failed (zellij execs `claude` cold past the ceiling). NO
+ *    row. UNKNOWN, not failed (the backend execs `claude` cold past the ceiling). NO
  *    `DispatchFailed`; the `pending_dispatches` row is KEPT so the TTL sweep
  *    mints `DispatchExpired` if the bind never arrives.
  *  - `"aborted-prelaunch"` — an abort BEFORE `launch()` (ack `{ok:false}` /
@@ -649,7 +649,7 @@ export const DISPATCHED_ACK_TIMEOUT_MS = 10_000;
  * `<body>` is `<workerCommand> ; exec $SHELL -l -i`. The trailing exec
  * leaves a usable login+interactive shell after `claude` exits (vim
  * fallback for the rare auto-close miss). The argv shape is the safe
- * quoting seam at the OS argv boundary — zellij forwards it verbatim
+ * quoting seam at the OS argv boundary — tmux forwards it verbatim
  * after `--`.
  *
  * `shell` is injected (the worker resolves `process.env.SHELL` once
@@ -697,7 +697,7 @@ export function verbForVerdict(
  * Inspect a `jobs` map for an OCCUPYING row keyed by `(plan_verb, plan_ref)`
  * whose `state` is in the non-terminal partition `{working, stopped}` (the
  * schema default is `stopped`, so a SessionStart-INSERTed row not yet at
- * `working` already occupies). Reading the projection instead of probing zellij
+ * `working` already occupies). Reading the projection instead of probing the backend
  * makes the dedup structurally race-free across restart — a non-terminal row for
  * `(verb, id)` means a dispatch would land a SECOND worker on the same task.
  * Pure — returns on first match.
@@ -1048,7 +1048,7 @@ export async function confirmRunning(
   }
   // Poll loop — wait for the SessionStart jobs row. The `pending_dispatches` row
   // minted above keeps the `liveTabKeys` arm fired every cycle, so a slow-booting
-  // worker holds its slot without a live zellij probe.
+  // worker holds its slot without a live backend probe.
   const pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
   const ceilingMs = deps.ceilingMs ?? DEFAULT_CEILING_MS;
   let elapsedMs = 0;
@@ -1074,8 +1074,8 @@ export async function confirmRunning(
     }
   }
   // Ceiling elapsed with no jobs row. The launch SUCCEEDED (we're past the
-  // `launch.ok===false` guard), so the outcome is IN-DOUBT, not failed — zellij
-  // execs `claude` cold occasionally past the ceiling, so a SessionStart may
+  // `launch.ok===false` guard), so the outcome is IN-DOUBT, not failed — the
+  // backend execs `claude` cold occasionally past the ceiling, so a SessionStart may
   // still be coming, and a sticky `DispatchFailed` would wrongly write off a
   // ghost worker. So: SUPPRESS the emit and KEEP the `pending_dispatches` row —
   // it holds the slot, and the TTL sweep mints `DispatchExpired` if the bind
@@ -1207,8 +1207,8 @@ export interface AutopilotWorkerData {
   /** Poll cadence for the data_version wake loop (ms). */
   pollMs?: number;
   /**
-   * Exec backend the in-worker reconciler dispatches into — `zellij` (default)
-   * or `tmux`. Threaded in from `resolveConfig()` so config I/O happens once on
+   * Exec backend the in-worker reconciler dispatches into — `tmux` (the sole
+   * backend). Threaded in from `resolveConfig()` so config I/O happens once on
    * main and every worker receives the resolved value. The managed session name
    * is the hardcoded `MANAGED_EXEC_SESSION`, not configurable.
    */
@@ -1552,8 +1552,8 @@ function main(): void {
   };
 
   // The terminal-surface backend — `data.execBackend` (resolved from config on
-  // main) selects the impl: `tmux` → tmux factory, default/unknown → zellij.
-  // Dispatches into the hardcoded `MANAGED_EXEC_SESSION` — `resolveExecBackend`
+  // main) resolves to the tmux factory for every tag — tmux is the sole
+  // backend. Dispatches into the hardcoded `MANAGED_EXEC_SESSION` — `resolveExecBackend`
   // fills that default, so no session is threaded here. `noteLine` funnels its
   // warnings to stderr — the worker has no lifecycle sidecar.
   const backend = resolveExecBackend({

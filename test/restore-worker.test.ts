@@ -246,22 +246,23 @@ test("buildRestoreDescriptor groups agents by backend_exec_session_id", () => {
 test("buildRestoreTier stamps each bucket's backend from backend_exec_type (v3)", () => {
   const jobs: Job[] = [
     fakeJob({
-      job_id: "z",
-      backend_exec_session_id: "zsess",
-      backend_exec_type: "zellij",
-    }),
-    fakeJob({
       job_id: "t",
       backend_exec_session_id: "tsess",
       backend_exec_type: "tmux",
     }),
+    fakeJob({
+      job_id: "x",
+      backend_exec_session_id: "xsess",
+      backend_exec_type: "other",
+    }),
   ];
   const out = buildRestoreTier(jobs, new Map(), 1000);
-  expect(out.sessions.zsess.backend).toBe("zellij");
+  // The tag is copied verbatim — the producer stamps whatever the row carries.
   expect(out.sessions.tsess.backend).toBe("tmux");
+  expect(out.sessions.xsess.backend).toBe("other");
 });
 
-test("buildRestoreTier defaults a NULL backend_exec_type bucket to zellij", () => {
+test("buildRestoreTier defaults a NULL backend_exec_type bucket to tmux", () => {
   const jobs: Job[] = [
     fakeJob({
       job_id: "a",
@@ -270,7 +271,7 @@ test("buildRestoreTier defaults a NULL backend_exec_type bucket to zellij", () =
     }),
   ];
   const out = buildRestoreTier(jobs, new Map(), 1000);
-  expect(out.sessions.s1.backend).toBe("zellij");
+  expect(out.sessions.s1.backend).toBe("tmux");
 });
 
 test("buildRestoreTier throws when a session bucket mixes backends", () => {
@@ -278,12 +279,12 @@ test("buildRestoreTier throws when a session bucket mixes backends", () => {
     fakeJob({
       job_id: "a",
       backend_exec_session_id: "s1",
-      backend_exec_type: "zellij",
+      backend_exec_type: "tmux",
     }),
     fakeJob({
       job_id: "b",
       backend_exec_session_id: "s1",
-      backend_exec_type: "tmux",
+      backend_exec_type: "other",
     }),
   ];
   expect(() => buildRestoreTier(jobs, new Map(), 1000)).toThrow(
@@ -953,8 +954,8 @@ test("restorePulse poll arm is quiescent when no NULL-session tmux job is live",
     backend_exec_session_id: "work",
   });
   insertJob({
-    job_id: "zellij",
-    backend_exec_type: "zellij",
+    job_id: "non-tmux",
+    backend_exec_type: "other",
     backend_exec_pane_id: "%2",
     backend_exec_session_id: null,
   });
