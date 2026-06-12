@@ -9,7 +9,7 @@ healthy:
 2. **`name: next`** (the bare verb name, no `plan:` prefix).
 3. **References `planctl epic queue-jump`** in a fenced bash block — the only
    mutating verb the skill invokes.
-4. **Every `planctl <verb>` in a fenced bash block resolves via `CliRunner`** —
+4. **Every `planctl <verb>` in a fenced bash block resolves through the CLI** —
    the verb-existence guard (notably `epic queue-jump`).
 """
 
@@ -19,8 +19,8 @@ import re
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -170,7 +170,7 @@ def test_next_planctl_verbs_have_help(verb_parts: tuple[str, ...]):
 
     Mirrors the verb-existence guard from `test_work_skill_consistency`.
     """
-    result = CliRunner().invoke(cli, [*verb_parts, "--help"])
+    result = run_cli([*verb_parts, "--help"])
     assert result.exit_code == 0, (
         f"planctl {' '.join(verb_parts)} --help failed:\n{result.output}"
     )

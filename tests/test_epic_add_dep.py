@@ -9,13 +9,11 @@ from __future__ import annotations
 
 import json
 
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 
 def _invoke(args: list[str]):
-    runner = CliRunner()
-    return runner.invoke(cli, args)
+    return run_cli(args)
 
 
 def _parse_envelope(output: str) -> dict:

@@ -23,8 +23,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 # reconcile's verdict is computed from real ``Task:``-trailer commits (parsed
 # via ``git log``), HEAD-visibility (``git cat-file``), and an epic-progress
@@ -55,8 +54,7 @@ def _roots_at_tmp_project(tmp_path, monkeypatch):
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
-    runner = CliRunner()
-    result = runner.invoke(cli, args)
+    result = run_cli(args)
     obj = _first_envelope(result.output)
     return result.exit_code, obj, result.output
 
@@ -264,8 +262,8 @@ def _commit_task_json_with_done_stamp(project: Path, task_id: str) -> None:
     """Stamp worker_done_at on the tracked task JSON and git-commit it.
 
     Reproduces the on-HEAD state the real ``planctl done`` auto-commit lands:
-    the committed task JSON carries a truthy ``worker_done_at``. (The CliRunner
-    test path doesn't populate the session touched-paths log, so the verb's
+    the committed task JSON carries a truthy ``worker_done_at``. (The in-process
+    invoker path doesn't populate the session touched-paths log, so the verb's
     own auto-commit no-ops here — we land the equivalent commit by hand.)
     """
     from planctl.store import now_iso
@@ -623,8 +621,7 @@ def test_reconcile_lands_no_commit(planctl_git_repo):
 def test_reconcile_envelope_carries_readonly_invocation(planctl_git_repo):
     """The planctl_invocation footer has op=reconcile and NULL files/subject."""
     _, task_id = _make_epic_with_task()
-    runner = CliRunner()
-    result = runner.invoke(cli, ["reconcile", task_id])
+    result = run_cli(["reconcile", task_id])
     assert result.exit_code == 0, result.output
     footer = _invocation_footer(result.output)
     assert footer is not None, f"no planctl_invocation footer:\n{result.output}"
@@ -724,7 +721,6 @@ def test_reconcile_compute_verdict_truth_table():
 
 
 def test_reconcile_help_exits_zero():
-    runner = CliRunner()
-    result = runner.invoke(cli, ["reconcile", "--help"])
+    result = run_cli(["reconcile", "--help"])
     assert result.exit_code == 0, result.output
     assert "reconcile" in result.output.lower()

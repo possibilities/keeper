@@ -605,7 +605,14 @@ def _run_in_process_engine(args, cwd, env, input_text) -> _CliResult:
         cd = contextlib.chdir(cwd) if cwd is not None else contextlib.nullcontext()
         with cd, contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
             if input_text is not None:
-                sys.stdin = io.StringIO(input_text)
+                # Present a stdin that supports BOTH text ``.read()`` and binary
+                # ``.buffer.read()`` (scaffold / refine-apply / the submit verbs
+                # read stdin as bytes) plus ``.isatty()`` — a bare StringIO has no
+                # ``.buffer``. A TextIOWrapper over a BytesIO covers all three,
+                # matching what a real piped stdin (and CliRunner) provides.
+                sys.stdin = io.TextIOWrapper(
+                    io.BytesIO(input_text.encode("utf-8")), encoding="utf-8"
+                )
             try:
                 rv = cli.main(list(args), standalone_mode=False)
                 rc = rv if isinstance(rv, int) else 0
@@ -614,6 +621,17 @@ def _run_in_process_engine(args, cwd, env, input_text) -> _CliResult:
             except click.ClickException as exc:
                 exc.show()
                 rc = exc.exit_code
+            except Exception:
+                # Mirror the real ``planctl`` subprocess: an uncaught exception
+                # prints a traceback to stderr and exits 1 (Python's default).
+                # ``CliRunner(catch_exceptions=True)`` reports the same exit
+                # code, so swallowing-to-1 here keeps both engines' results
+                # identical for the verbs that fail by raising (e.g. the
+                # missing-session-id seam).
+                import traceback
+
+                traceback.print_exc()
+                rc = 1
     finally:
         sys.stdin = saved_stdin
         for key, val in saved_env.items():

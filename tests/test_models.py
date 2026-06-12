@@ -9,10 +9,7 @@ tests set it explicitly.
 from __future__ import annotations
 
 import json
-import os
 
-from click.testing import CliRunner
-from planctl.cli import cli
 import pytest
 from planctl.models import (
     TASK_TIERS,
@@ -269,7 +266,7 @@ def test_merge_epic_state_normalizes_without_approval():
 # Epic create — new-record field assignment
 # ---------------------------------------------------------------------------
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-models-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-models-fixture"}
 
 
 def _run_planctl(args: list[str], cwd: str):
@@ -442,8 +439,7 @@ def test_multi_repo_project_epic_create_with_touched_repos(
     monkeypatch.chdir(primary)
 
     # Init planctl in primary
-    runner = CliRunner()
-    r = runner.invoke(cli, ["init"])
+    r = run_cli(["init"])
     assert r.exit_code == 0, r.output
 
     result = _run_planctl(

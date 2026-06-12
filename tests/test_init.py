@@ -6,8 +6,7 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 from planctl.run_init import CLAUDE_MD_CONTENT
 
 # init's self-commit is the unit under test here, so it runs real git, opting
@@ -65,8 +64,7 @@ def test_init_is_idempotent_and_preserves_human_edits(
     claude_md.write_text(custom, encoding="utf-8")
 
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
 
     assert claude_md.read_text(encoding="utf-8") == custom
@@ -88,8 +86,7 @@ def test_init_backfills_existing_project(tmp_path: Path, monkeypatch) -> None:
     assert not (planctl_dir / "CLAUDE.md").exists()
     assert not (planctl_dir / "AGENTS.md").exists()
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
 
     assert (planctl_dir / "CLAUDE.md").read_text(encoding="utf-8") == CLAUDE_MD_CONTENT
@@ -120,8 +117,7 @@ def test_init_self_commits_without_session_id(tmp_path: Path, monkeypatch) -> No
     )
 
     before = _git_commit_count(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
 
     # Exactly one new commit, with the init subject and no Session-Id trailer.
@@ -168,12 +164,11 @@ def test_init_idempotent_rerun_creates_no_commit(tmp_path: Path, monkeypatch) ->
         capture_output=True,
     )
 
-    runner = CliRunner()
-    assert runner.invoke(cli, ["init"]).exit_code == 0
+    assert run_cli(["init"]).exit_code == 0
     after_first = _git_commit_count(tmp_path)
 
     # Re-run: nothing new to write, so no commit lands and the tree stays clean.
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
     assert _git_commit_count(tmp_path) == after_first
     status = subprocess.run(
@@ -193,8 +188,7 @@ def test_init_in_non_git_dir_writes_files_without_commit(
     monkeypatch.delenv("CLAUDE_CODE_SESSION_ID", raising=False)
     monkeypatch.chdir(tmp_path)
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
 
     planctl_dir = _planctl_dir(tmp_path)

@@ -29,10 +29,7 @@ import json
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
-
-from .conftest import _write_git_skeleton, seed_epic
+from .conftest import _write_git_skeleton, run_cli, seed_epic
 
 # Every test here exercises cross-project epic resolution: the dep resolver and
 # scaffold collision checks must run the REAL discovery scan against the
@@ -60,8 +57,7 @@ def _git_init(proj: Path) -> None:
 
 
 def _planctl_init(proj: Path) -> None:
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
 
 
@@ -141,8 +137,7 @@ def three_projects(tmp_path, monkeypatch):
 
 
 def _invoke(args: list[str]):
-    runner = CliRunner()
-    return runner.invoke(cli, args)
+    return run_cli(args)
 
 
 def _parse_envelope(output: str) -> dict:

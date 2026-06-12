@@ -22,11 +22,9 @@ import time
 from types import SimpleNamespace
 
 import pytest
-from click.testing import CliRunner
 from planctl import session_markers
-from planctl.cli import cli
 
-from .conftest import seed_state
+from .conftest import run_cli, seed_state
 
 _SESSION = "test-marker-session"
 
@@ -234,7 +232,7 @@ def test_claim_success_writes_work_marker(tmp_path, monkeypatch, verb_marker_dir
     monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
     monkeypatch.chdir(tmp_path)
 
-    result = CliRunner().invoke(cli, ["claim", task_id])
+    result = run_cli(["claim", task_id])
     assert result.exit_code == 0, result.output
     assert _marker_present(verb_marker_dir)
     assert _read_raw(verb_marker_dir)["task_id"] == task_id
@@ -244,7 +242,7 @@ def test_claim_success_writes_work_marker(tmp_path, monkeypatch, verb_marker_dir
 def test_claim_typed_error_writes_nothing(tmp_path, monkeypatch, verb_marker_dir):
     """A BAD_TASK_ID claim error path writes no marker."""
     monkeypatch.chdir(tmp_path)
-    result = CliRunner().invoke(cli, ["claim", "not-a-task-id"])
+    result = run_cli(["claim", "not-a-task-id"])
     assert result.exit_code != 0
     assert not _marker_present(verb_marker_dir)
 
@@ -380,9 +378,7 @@ def test_close_finalize_clears_marker_on_every_outcome(
     assert not _marker_present(verb_marker_dir)
 
 
-def test_close_finalize_leaves_mismatched_marker(
-    tmp_path, verb_marker_dir
-):
+def test_close_finalize_leaves_mismatched_marker(tmp_path, verb_marker_dir):
     """A close marker naming a different epic survives close-finalize."""
     import io
     from contextlib import redirect_stdout

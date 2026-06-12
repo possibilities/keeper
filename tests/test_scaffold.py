@@ -29,8 +29,7 @@ from __future__ import annotations
 import json
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,16 +43,15 @@ def _write_yaml(tmp_path, content: str) -> str:
 
 
 def _invoke(args: list[str]):
-    runner = CliRunner()
-    return runner.invoke(cli, args)
+    return run_cli(args)
 
 
 def _parse_envelope(output: str) -> dict:
     """Take the first JSON document on stdout. Scaffold emits compact NDJSON.
 
-    CliRunner can mix stderr noise (e.g. ``planctl.audit: emit failed`` when
-    realtime fan-out is no-op in test environments) into
-    ``r.output``; skip non-JSON lines.
+    The invoker can mix stderr noise (e.g. ``planctl.audit: emit failed`` when
+    realtime fan-out is no-op in test environments) into ``r.output``; skip
+    non-JSON lines.
     """
     for ln in output.strip().splitlines():
         stripped = ln.strip()
@@ -1211,8 +1209,7 @@ def test_scaffold_invocation_raise_persists_written_tree(planctl_git_repo, monke
 def test_scaffold_reads_yaml_from_stdin(planctl_git_repo):
     """`--file -` reads YAML from stdin; envelope is identical to file mode."""
     yaml = _two_task_yaml()
-    runner = CliRunner()
-    r = runner.invoke(cli, ["scaffold", "--file", "-"], input=yaml)
+    r = run_cli(["scaffold", "--file", "-"], input_text=yaml)
     assert r.exit_code == 0, r.output
 
     payload = _parse_envelope(r.output)
@@ -1230,8 +1227,7 @@ def test_scaffold_stdin_byte_cap_enforced(planctl_git_repo):
     # Build a YAML body that comfortably exceeds 1 MiB after the comment fluff.
     big_comment = "# " + ("x" * (1024 * 1024 + 100)) + "\n"
     yaml = big_comment + _two_task_yaml()
-    runner = CliRunner()
-    r = runner.invoke(cli, ["scaffold", "--file", "-"], input=yaml)
+    r = run_cli(["scaffold", "--file", "-"], input_text=yaml)
     assert r.exit_code != 0, r.output
     env = _parse_envelope(r.output)
     assert env["success"] is False

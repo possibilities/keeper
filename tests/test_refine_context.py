@@ -20,9 +20,9 @@ import json
 from types import SimpleNamespace
 
 import pytest
-from click.testing import CliRunner
 from planctl import run_refine_context
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -44,7 +44,6 @@ def _make_epic(project, *, n_tasks):
     distinguishable in assertions. ``n_tasks == 0`` scaffolds a one-task epic
     then is not used — empty-epic coverage uses the dedicated helper below.
     """
-    runner = CliRunner()
     tasks_yaml = "\n".join(
         f"  - title: task {i}\n    tier: medium\n    spec: |\n"
         + "\n".join("      " + ln for ln in _task_spec(f"marker-{i}").splitlines())
@@ -57,7 +56,7 @@ def _make_epic(project, *, n_tasks):
     plan_path = project / "plan.yaml"
     plan_path.write_text(yaml, encoding="utf-8")
 
-    r = runner.invoke(cli, ["scaffold", "--file", str(plan_path)])
+    r = run_cli(["scaffold", "--file", str(plan_path)])
     assert r.exit_code == 0, r.output
     env = _envelope(r.output)
     return env["epic_id"], env["task_ids"]
@@ -97,7 +96,7 @@ def _envelope(output: str) -> dict:
 class TestEpicRoute:
     def test_multi_task_returns_all_specs(self, project):
         epic_id, task_ids = _make_epic(project, n_tasks=3)
-        r = CliRunner().invoke(cli, ["refine-context", epic_id])
+        r = run_cli(["refine-context", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
 
@@ -123,7 +122,7 @@ class TestEpicRoute:
 
     def test_single_task_epic(self, project):
         epic_id, task_ids = _make_epic(project, n_tasks=1)
-        r = CliRunner().invoke(cli, ["refine-context", epic_id])
+        r = run_cli(["refine-context", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         assert len(env["tasks"]) == 1
@@ -143,7 +142,7 @@ class TestTaskRoute:
         derived_epic_id = task_ids[0].rsplit(".", 1)[0]
         assert derived_epic_id == epic_id
 
-        r = CliRunner().invoke(cli, ["refine-context", derived_epic_id])
+        r = run_cli(["refine-context", derived_epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         # Parent epic spec is carried; the captured task sits in `tasks`.
@@ -158,15 +157,13 @@ class TestTaskRoute:
 
 def test_empty_epic_yields_empty_tasks(project):
     """An epic with zero tasks returns tasks: [] cleanly."""
-    from planctl.cli import cli as _cli
 
-    runner = CliRunner()
     # Create an epic directly (no tasks) — scaffold requires >=1 task, so use
     # the incremental epic-create verb.
-    r = runner.invoke(_cli, ["epic", "create", "--title", "Bare epic"])
+    r = run_cli(["epic", "create", "--title", "Bare epic"])
     assert r.exit_code == 0, r.output
     epic_id = _envelope_loose(r.output)
-    r = runner.invoke(_cli, ["refine-context", epic_id])
+    r = run_cli(["refine-context", epic_id])
     assert r.exit_code == 0, r.output
     env = _envelope(r.output)
     assert env["tasks"] == []
@@ -201,13 +198,13 @@ def _envelope_loose(output: str) -> str:
 
 class TestGates:
     def test_bad_epic_id(self, project):
-        r = CliRunner().invoke(cli, ["refine-context", "not-an-id"])
+        r = run_cli(["refine-context", "not-an-id"])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
         assert env["error"]["code"] == "BAD_EPIC_ID"
 
     def test_epic_not_found(self, project):
-        r = CliRunner().invoke(cli, ["refine-context", "fn-99-missing"])
+        r = run_cli(["refine-context", "fn-99-missing"])
         assert r.exit_code == 1, r.output
         env = _envelope(r.output)
         assert env["error"]["code"] == "EPIC_NOT_FOUND"
@@ -247,7 +244,7 @@ class TestInvalidate:
             check=True,
         ).stdout.strip()
 
-        r = CliRunner().invoke(cli, ["refine-context", epic_id, "--invalidate"])
+        r = run_cli(["refine-context", epic_id, "--invalidate"])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         assert env["success"] is True
@@ -286,7 +283,7 @@ class TestInvalidate:
         epic_id, _ = _make_epic(project, n_tasks=1)
 
         # First invalidation clears the marker.
-        r1 = CliRunner().invoke(cli, ["refine-context", epic_id, "--invalidate"])
+        r1 = run_cli(["refine-context", epic_id, "--invalidate"])
         assert r1.exit_code == 0, r1.output
         head_after_first = subprocess.run(
             ["git", "rev-parse", "HEAD"],
@@ -297,7 +294,7 @@ class TestInvalidate:
         ).stdout.strip()
 
         # Second invalidation: short-circuit — no write, no commit.
-        r2 = CliRunner().invoke(cli, ["refine-context", epic_id, "--invalidate"])
+        r2 = run_cli(["refine-context", epic_id, "--invalidate"])
         assert r2.exit_code == 0, r2.output
         env = _envelope(r2.output)
         assert env["last_validated_at"] is None
@@ -318,7 +315,7 @@ class TestInvalidate:
         epic_path = project / ".planctl" / "epics" / f"{epic_id}.json"
         before = json.loads(epic_path.read_text(encoding="utf-8"))
 
-        r = CliRunner().invoke(cli, ["refine-context", epic_id])
+        r = run_cli(["refine-context", epic_id])
         assert r.exit_code == 0, r.output
         env = _envelope(r.output)
         assert env["last_validated_at"] == before["last_validated_at"]

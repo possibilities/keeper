@@ -21,7 +21,7 @@ coordinator's load-bearing process contracts:
    (version-pinned model ids, `<VERDICT_JSON>`, `classifier`, the hookctl
    session_naming path) survive.
 
-All CLI invocations use ``CliRunner`` (in-process) — no subprocess.
+All CLI invocations route through the shared ``run_cli`` invoker.
 """
 
 from __future__ import annotations
@@ -30,8 +30,8 @@ import re
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Paths
@@ -185,7 +185,7 @@ def test_close_skill_planctl_verbs_have_help(verb_parts: tuple[str, ...]):
     ``--help`` short-circuits the command body, so the heredoc-fed `--file -`
     submit verbs are validated for existence without ever reading stdin.
     """
-    result = CliRunner().invoke(cli, [*verb_parts, "--help"])
+    result = run_cli([*verb_parts, "--help"])
     assert result.exit_code == 0, (
         f"planctl {' '.join(verb_parts)} --help failed:\n{result.output}"
     )

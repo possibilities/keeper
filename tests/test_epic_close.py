@@ -12,26 +12,22 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-epic-close-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-epic-close-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-epic-close-fixture")
     monkeypatch.chdir(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"], env=_ENV)
+    result = run_cli(["init"], env=_ENV)
     assert result.exit_code == 0, result.output
     return tmp_path
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
-    runner = CliRunner()
-    result = runner.invoke(cli, args, env=_ENV)
+    result = run_cli(args, env=_ENV)
     obj = None
     for line in result.output.strip().splitlines():
         line = line.strip()
@@ -69,9 +65,8 @@ def test_close_rejects_removed_audit_required_flag(tmp_path, monkeypatch):
     assert code == 0, output
     epic_id = obj["epic"]["id"]
 
-    runner = CliRunner()
-    result = runner.invoke(
-        cli, ["epic", "close", epic_id, "--force", "--no-audit-required"], env=_ENV
+    result = run_cli(
+        ["epic", "close", epic_id, "--force", "--no-audit-required"], env=_ENV
     )
     # click rejects the unknown option with a usage error (exit 2).
     assert result.exit_code != 0
@@ -85,8 +80,7 @@ def test_close_envelope_carries_planctl_invocation(tmp_path, monkeypatch):
     _create_project(tmp_path, monkeypatch)
     code, obj, _ = _invoke(["epic", "create", "--title", "Envelope test"])
     epic_id = obj["epic"]["id"]
-    runner = CliRunner()
-    result = runner.invoke(cli, ["epic", "close", epic_id, "--force"], env=_ENV)
+    result = run_cli(["epic", "close", epic_id, "--force"], env=_ENV)
     assert result.exit_code == 0, result.output
     payload = json.loads(result.output.strip().splitlines()[-1])
     inv = payload.get("planctl_invocation") or {}

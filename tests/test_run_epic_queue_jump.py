@@ -19,14 +19,12 @@ Cases:
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-queue-jump-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-queue-jump-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
@@ -34,15 +32,13 @@ def _create_project(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-queue-jump-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"], env=_ENV)
+    result = run_cli(["init"], env=_ENV)
     assert result.exit_code == 0, result.output
     return tmp_path
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
-    runner = CliRunner()
-    result = runner.invoke(cli, args, env=_ENV)
+    result = run_cli(args, env=_ENV)
     obj = None
     for line in result.output.strip().splitlines():
         line = line.strip()

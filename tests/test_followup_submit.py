@@ -24,15 +24,15 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 from planctl.audit_artifacts import (
     brief_path,
     compute_commit_set_hash,
     verdict_path,
     write_artifact,
 )
-from planctl.cli import cli
 from planctl.run_scaffold import validate_scaffold_yaml
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -83,7 +83,7 @@ def source_epic(project) -> str:
     )
     plan = project / "src.yaml"
     plan.write_text(yaml_text)
-    r = CliRunner().invoke(cli, ["scaffold", "--file", str(plan)])
+    r = run_cli(["scaffold", "--file", str(plan)])
     assert r.exit_code == 0, r.output
     return json.loads(r.output.strip().splitlines()[0])["epic_id"]
 
@@ -143,9 +143,7 @@ def _followup_yaml(
 
 
 def _submit(project, epic_id: str, yaml_text: str):
-    return CliRunner().invoke(
-        cli, ["followup", "submit", epic_id, "--file", "-"], input=yaml_text
-    )
+    return run_cli(["followup", "submit", epic_id, "--file", "-"], input_text=yaml_text)
 
 
 # ---------------------------------------------------------------------------
@@ -317,7 +315,7 @@ def test_dryrun_validator_accepts_scaffold_valid_yaml(project):
     # And scaffold itself mints it cleanly (same leaf checkers).
     plan = project / "fu.yaml"
     plan.write_text(yaml_text)
-    r = CliRunner().invoke(cli, ["scaffold", "--file", str(plan)])
+    r = run_cli(["scaffold", "--file", str(plan)])
     assert r.exit_code == 0, r.output
 
 
@@ -335,7 +333,7 @@ def test_dryrun_validator_rejects_what_scaffold_rejects(project):
 
     plan = project / "bad.yaml"
     plan.write_text(yaml_text)
-    r = CliRunner().invoke(cli, ["scaffold", "--file", str(plan)])
+    r = run_cli(["scaffold", "--file", str(plan)])
     assert r.exit_code != 0
     assert (
         json.loads(r.output.strip().splitlines()[0])["error"]["code"] == "tier_invalid"

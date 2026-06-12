@@ -10,20 +10,14 @@ Contract pinned here:
 from __future__ import annotations
 
 import json
-import os
 
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
-_ENV = {
-    **os.environ,
-    "CLAUDE_CODE_SESSION_ID": "test-multi-repo-create-validate-fixture",
-}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-multi-repo-create-validate-fixture"}
 
 
 def _invoke(*args):
-    runner = CliRunner()
-    return runner.invoke(cli, list(args), env=_ENV)
+    return run_cli(list(args), env=_ENV)
 
 
 def test_epic_create_touched_repos_nonexistent_succeeds(tmp_path, monkeypatch):

@@ -10,15 +10,11 @@ Cases:
 from __future__ import annotations
 
 import json
-import os
 import subprocess
-
-from click.testing import CliRunner  # type: ignore[import-untyped]
-from planctl.cli import cli
 
 from .conftest import run_cli
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-set-primary-repo-warning-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-set-primary-repo-warning-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
@@ -27,17 +23,14 @@ def _create_project(tmp_path, monkeypatch):
         "CLAUDE_CODE_SESSION_ID", "test-set-primary-repo-warning-fixture"
     )
     monkeypatch.chdir(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
     return tmp_path
 
 
 def _create_epic() -> str:
     """Create an epic and return its ID."""
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
+    result = run_cli(
         ["epic", "create", "--title", "Warning test epic"],
         env=_ENV,
     )

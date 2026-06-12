@@ -28,8 +28,7 @@ import json
 import subprocess
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 # find-task-commit parses real ``Task:``-trailer commits via ``git log`` — the
 # real commits ARE the subject under test, so ``real_git`` (slow bucket: real
@@ -58,8 +57,7 @@ def _roots_at_tmp_project(tmp_path, monkeypatch):
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
-    runner = CliRunner()
-    result = runner.invoke(cli, args)
+    result = run_cli(args)
     obj = _first_envelope(result.output)
     return result.exit_code, obj, result.output
 
@@ -304,8 +302,7 @@ def _make_two_projects_with_same_task(tmp_path, monkeypatch):
             capture_output=True,
         )
         monkeypatch.chdir(proj)
-        runner = CliRunner()
-        result = runner.invoke(cli, ["init"])
+        result = run_cli(["init"])
         assert result.exit_code == 0, result.output
 
     from .conftest import seed_epic
@@ -443,8 +440,7 @@ def test_find_task_commit_envelope_carries_readonly_invocation(planctl_git_repo)
     _, task_ids = _make_epic_with_task()
     task_id = task_ids[0]
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["find-task-commit", task_id])
+    result = run_cli(["find-task-commit", task_id])
     assert result.exit_code == 0, result.output
 
     decoder = json.JSONDecoder()

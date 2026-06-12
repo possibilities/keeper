@@ -17,13 +17,13 @@ import json
 import os
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
 from planctl.config import load_roots
 from planctl.discovery import discover_projects
 from planctl.ids import scan_epic_ids_global
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-roots-discovery-fixture"}
+from .conftest import run_cli
+
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-roots-discovery-fixture"}
 
 
 # --------------------------------------------------------------------------
@@ -226,13 +226,11 @@ def test_creates_are_per_project_numbered(tmp_path, monkeypatch):
     cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
     monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
 
-    runner = CliRunner()
-
     def _create(cwd, title):
         monkeypatch.chdir(cwd)
-        init = runner.invoke(cli, ["init"], env=_ENV)
+        init = run_cli(["init"], env=_ENV)
         assert init.exit_code == 0, init.output
-        res = runner.invoke(cli, ["epic", "create", "--title", title], env=_ENV)
+        res = run_cli(["epic", "create", "--title", title], env=_ENV)
         assert res.exit_code == 0, res.output
         return _extract_epic_id(res.output)
 
@@ -266,17 +264,15 @@ def test_create_rejects_global_name_collision(tmp_path, monkeypatch):
     cfg.write_text(f"roots:\n  - {root}\n", encoding="utf-8")
     monkeypatch.setattr("planctl.config.CONFIG_PATH", cfg)
 
-    runner = CliRunner()
-
     monkeypatch.chdir(proj_a)
-    assert runner.invoke(cli, ["init"], env=_ENV).exit_code == 0
-    res_a = runner.invoke(cli, ["epic", "create", "--title", "Shared title"], env=_ENV)
+    assert run_cli(["init"], env=_ENV).exit_code == 0
+    res_a = run_cli(["epic", "create", "--title", "Shared title"], env=_ENV)
     assert res_a.exit_code == 0, res_a.output
     id_a = _extract_epic_id(res_a.output)
 
     monkeypatch.chdir(proj_b)
-    assert runner.invoke(cli, ["init"], env=_ENV).exit_code == 0
-    res_b = runner.invoke(cli, ["epic", "create", "--title", "Shared title"], env=_ENV)
+    assert run_cli(["init"], env=_ENV).exit_code == 0
+    res_b = run_cli(["epic", "create", "--title", "Shared title"], env=_ENV)
     assert res_b.exit_code != 0, (
         f"expected collision failure, got success with output:\n{res_b.output}"
     )

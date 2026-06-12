@@ -20,8 +20,7 @@ import json
 import subprocess
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 # resolve-task is read-only and spawns no real git, but every test drives roots
 # discovery against the ``_roots_at_tmp_project`` CONFIG_PATH below. That tmp
@@ -49,8 +48,7 @@ def _roots_at_tmp_project(tmp_path, monkeypatch):
 
 
 def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
-    runner = CliRunner()
-    result = runner.invoke(cli, args)
+    result = run_cli(args)
     obj = _first_envelope(result.output)
     return result.exit_code, obj, result.output
 
@@ -225,8 +223,7 @@ def _make_two_projects_with_same_task(tmp_path, monkeypatch):
             capture_output=True,
         )
         monkeypatch.chdir(proj)
-        runner = CliRunner()
-        result = runner.invoke(cli, ["init"])
+        result = run_cli(["init"])
         assert result.exit_code == 0, result.output
 
     from .conftest import seed_epic
@@ -360,8 +357,7 @@ def test_resolve_task_envelope_carries_readonly_invocation(project):
     """The envelope's planctl_invocation has op=resolve-task and NULL files/subject."""
     _, task_id = _make_epic_with_task()
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["resolve-task", task_id])
+    result = run_cli(["resolve-task", task_id])
     assert result.exit_code == 0
     assert "resolve-task" in result.output
 

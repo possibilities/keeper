@@ -26,20 +26,19 @@ Plus a coverage line for the validate-marker subpath that bypasses
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 from planctl import commit as commit_module
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 # This module asserts the emit()->commit seam lands real commits, so it opts
 # out of conftest's default auto-commit mock.
 pytestmark = pytest.mark.real_git
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-emit-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-emit-fixture"}
 
 
 def _make_planctl_git_project(tmp_path, monkeypatch) -> Path:
@@ -66,8 +65,7 @@ def _make_planctl_git_project(tmp_path, monkeypatch) -> Path:
         capture_output=True,
     )
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"], env=_ENV)
+    result = run_cli(["init"], env=_ENV)
     assert result.exit_code == 0, result.output
 
     # `init` self-commits its bootstrap files inline, so any subsequent verb
@@ -189,10 +187,7 @@ def test_emit_auto_commit_happy_path(tmp_path, monkeypatch):
 
     pre_count = _git_commit_count(project)
 
-    runner = CliRunner()
-    result = runner.invoke(
-        cli, ["epic", "set-title", epic_id, "--title", "Renamed"], env=_ENV
-    )
+    result = run_cli(["epic", "set-title", epic_id, "--title", "Renamed"], env=_ENV)
     assert result.exit_code == 0, result.output
 
     docs = _parse_envelopes(result.output)
@@ -247,12 +242,9 @@ def test_emit_commit_failure_emits_structured_envelope_and_exits_1(
 
     monkeypatch.setattr(commit_module, "auto_commit_from_invocation", _boom)
 
-    runner = CliRunner()
     # Use ``epic set-title`` — a single-field committing verb — to exercise the
     # commit failure path.
-    result = runner.invoke(
-        cli, ["epic", "set-title", epic_id, "--title", "Renamed"], env=_ENV
-    )
+    result = run_cli(["epic", "set-title", epic_id, "--title", "Renamed"], env=_ENV)
     # exit 1 on commit failure (the success envelope contract).
     assert result.exit_code == 1, (
         f"expected exit 1 on commit failure, got {result.exit_code}: {result.output!r}"
@@ -297,9 +289,7 @@ def test_emit_no_op_clean_tree_still_prints_success(tmp_path, monkeypatch):
 
     pre_count = _git_commit_count(project)
 
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
+    result = run_cli(
         ["claim", task_id, "--project", str(project)],
         env=_ENV,
     )
@@ -391,9 +381,9 @@ def test_validate_emit_bypass_commit_failure_aborts_invocation_line(
     project = _make_planctl_git_project(tmp_path, monkeypatch)
     epic_id, _ = _seed_epic(project)
 
-    # Patch the in-process commit helper so a direct CliRunner invocation
-    # forces the failure branch.  Subprocess invocation can't see the
-    # monkeypatch, so we drive validate through CliRunner here.
+    # Patch the in-process commit helper so the in-process invoker forces the
+    # failure branch. The conformance (subprocess) engine can't see this
+    # monkeypatch — this test is in-process-only.
     def _boom(payload):
         raise commit_module.CommitFailed(
             "git_commit", "synthesized validate-marker rejection"
@@ -401,8 +391,7 @@ def test_validate_emit_bypass_commit_failure_aborts_invocation_line(
 
     monkeypatch.setattr(commit_module, "auto_commit_from_invocation", _boom)
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["validate", "--epic", epic_id], env=_ENV)
+    result = run_cli(["validate", "--epic", epic_id], env=_ENV)
     assert result.exit_code == 1, (
         f"expected exit 1 on validate-marker commit failure, "
         f"got {result.exit_code}: {result.output!r}"
@@ -458,8 +447,7 @@ def test_emit_read_only_path_never_attempts_commit(tmp_path, monkeypatch):
 
     pre_count = _git_commit_count(project)
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["status"], env=_ENV)
+    result = run_cli(["status"], env=_ENV)
     assert result.exit_code == 0, result.output
 
     assert _git_commit_count(project) == pre_count

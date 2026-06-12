@@ -28,8 +28,6 @@ from __future__ import annotations
 import json
 import os
 
-from click.testing import CliRunner  # type: ignore[import-untyped]
-from planctl.cli import cli
 from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
 
 from .conftest import _write_git_skeleton, run_cli
@@ -63,8 +61,7 @@ def _create_project(tmp_path, monkeypatch):
     # no-ops every real git verb — so the skeleton suffices with zero ``git
     # init`` subprocess.
     _write_git_skeleton(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
     return tmp_path
 
@@ -76,10 +73,8 @@ def _create_epic(project_path) -> str:
     project directory is not a git repo (no .git/), so validate would reject
     the paths as invalid.  Legacy null-field epics skip multi-repo validation.
     """
-    runner = CliRunner()
-    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
-    result = runner.invoke(
-        cli,
+    env = {"CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
+    result = run_cli(
         ["epic", "create", "--title", "Validate marker test epic"],
         env=env,
     )
@@ -102,7 +97,7 @@ def _read_epic_json(project_path, epic_id) -> dict:
 
 
 def _run_validate(project_path, extra_args=()):
-    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
+    env = {"CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
     return run_cli(["validate", *extra_args], cwd=str(project_path), env=env)
 
 
@@ -250,7 +245,7 @@ def test_validate_all_never_writes_markers(tmp_path, monkeypatch):
 # last_validated_at to a strictly-newer timestamp
 # ---------------------------------------------------------------------------
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
 
 
 def _run_planctl(args: list[str], cwd: str, input_text: str | None = None):
@@ -559,10 +554,8 @@ def _create_epic_with_primary_repo(project_path, repo_path: str) -> str:
     Unlike _create_epic(), this does NOT null out the multi-repo fields —
     the set-*-repo verbs validate that primary_repo points at a real .git/ dir.
     """
-    runner = CliRunner()
-    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
-    result = runner.invoke(
-        cli,
+    env = {"CLAUDE_CODE_SESSION_ID": "test-validate-marker-fixture"}
+    result = run_cli(
         ["epic", "create", "--title", "Validate marker repo test epic"],
         env=env,
     )
@@ -856,8 +849,7 @@ def _create_project_in_git_repo(tmp_path, monkeypatch, subdir_name="project"):
     _init_git_repo(project_path)
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-validate-marker-fixture")
     monkeypatch.chdir(project_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
     return project_path
 

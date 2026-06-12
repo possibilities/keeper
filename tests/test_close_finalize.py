@@ -24,7 +24,6 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from click.testing import CliRunner
 from planctl.audit_artifacts import (
     AUDIT_SCHEMA_VERSION,
     compute_commit_set_hash,
@@ -34,9 +33,8 @@ from planctl.audit_artifacts import (
     write_artifact,
     write_brief_artifact,
 )
-from planctl.cli import cli
 
-from .conftest import seed_epic
+from .conftest import run_cli, seed_epic
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -158,7 +156,7 @@ def _seed_followup_yaml(repo: Path, epic_id: str, source_epic_id: str, n_tasks: 
 
 
 def _finalize(epic_id: str):
-    return CliRunner().invoke(cli, ["close-finalize", epic_id])
+    return run_cli(["close-finalize", epic_id])
 
 
 def _epic_status(repo: Path, epic_id: str) -> str:
@@ -615,6 +613,6 @@ def test_close_outcome_exhaustiveness():
 
 
 def test_epic_followup_of_verb_is_gone():
-    r = CliRunner().invoke(cli, ["epic", "followup-of", "fn-1-x"])
+    r = run_cli(["epic", "followup-of", "fn-1-x"])
     assert r.exit_code != 0
     assert "No such command" in r.output or "no such command" in r.output.lower()

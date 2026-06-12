@@ -6,7 +6,7 @@ outcomes (CLAIMED / ALREADY_MINE / CLAIMED_BY_OTHER), ``--force`` takeover
 (never over TASK_DONE), the out-of-band brief write, and the
 no-audit-row-on-failure invariant.
 
-Strategy: drive the real verb in-process via CliRunner against the
+Strategy: drive the real verb through the shared ``run_cli`` invoker against the
 ``project`` fixture (bare ``.git/`` skeleton + planctl init, chdir'd).
 ``PLANCTL_ACTOR``
 env var pins identity so multi-actor CAS outcomes are deterministic. The brief's
@@ -16,12 +16,11 @@ env var pins identity so multi-actor CAS outcomes are deterministic. The brief's
 from __future__ import annotations
 
 import json
-import os
 import subprocess
 
 import pytest
-from click.testing import CliRunner
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 # Claim resolves a task's owning project through real ``roots`` discovery
 # (``_roots_at_tmp_project`` below points it at a controlled tmp root, never the
@@ -58,11 +57,7 @@ def _roots_at_tmp_project(tmp_path, monkeypatch):
 
 
 def _invoke(args: list[str], env: dict | None = None):
-    runner = CliRunner()
-    if env:
-        full_env = {**os.environ, **env}
-        return runner.invoke(cli, args, env=full_env)
-    return runner.invoke(cli, args)
+    return run_cli(args, env=env)
 
 
 def _first_line_json(output: str) -> dict:
@@ -98,7 +93,7 @@ def _make_epic_with_task(actor: str = "alice@example.com") -> tuple[str, str]:
     """Scaffold an epic + task, return (epic_id, task_id).
 
     Minted via `scaffold` (there is no incremental `task create` verb).
-    The CliRunner cwd is the active project (project fixture chdir'd).
+    The active project is the invoker cwd (the project fixture chdir'd).
     """
     from pathlib import Path
 

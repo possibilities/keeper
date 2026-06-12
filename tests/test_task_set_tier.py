@@ -16,14 +16,13 @@ from __future__ import annotations
 
 import contextlib
 import json
-import os
 
-from click.testing import CliRunner
-from planctl.cli import cli
 from planctl.models import normalize_task
+
+from .conftest import run_cli
 from planctl.validation_restamp import VALIDATION_RESTAMP_VERBS
 
-_ENV = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-task-set-tier-fixture"}
+_ENV = {"CLAUDE_CODE_SESSION_ID": "test-task-set-tier-fixture"}
 
 
 def _create_project(tmp_path, monkeypatch):
@@ -33,8 +32,7 @@ def _create_project(tmp_path, monkeypatch):
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-task-set-tier-fixture")
     monkeypatch.chdir(tmp_path)
     subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"], env=_ENV)
+    result = run_cli(["init"], env=_ENV)
     assert result.exit_code == 0, result.output
     return tmp_path
 
@@ -48,8 +46,7 @@ def _invoke(args: list[str]) -> tuple[int, dict | None, str]:
     envelopes. Parse the FIRST `{...}` document in stdout that does not start
     with `{"planctl_invocation"` — works for both shapes.
     """
-    runner = CliRunner()
-    result = runner.invoke(cli, args, env=_ENV)
+    result = run_cli(args, env=_ENV)
     obj = _first_envelope(result.output)
     return result.exit_code, obj, result.output
 
@@ -294,9 +291,7 @@ def test_set_tier_envelope_carries_planctl_invocation(tmp_path, monkeypatch):
     """The CLI envelope includes a planctl_invocation payload with op=task-set-tier."""
     _create_project(tmp_path, monkeypatch)
     _, task_id = _make_epic_with_task()
-    runner = CliRunner()
-    result = runner.invoke(
-        cli,
+    result = run_cli(
         ["task", "set-tier", task_id, "--tier", "medium"],
         env=_ENV,
     )

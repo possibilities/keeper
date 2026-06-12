@@ -16,9 +16,6 @@ import json
 import os
 import subprocess
 
-from click.testing import CliRunner
-from planctl.cli import cli
-
 
 def _parse_json_stream(text: str) -> list[dict]:
     """Extract all JSON objects from a string that may contain pretty-printed
@@ -38,12 +35,17 @@ def _parse_json_stream(text: str) -> list[dict]:
 
 
 def _create_project(tmp_path, monkeypatch):
-    """Init a planctl project in tmp_path and return the path."""
+    """Init a planctl project in tmp_path and return the path.
+
+    Uses a real ``planctl`` subprocess (this whole module pins the binary's raw
+    stdout contract, so it stays subprocess-driven end to end).
+    """
     monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-no-track-fixture")
     monkeypatch.chdir(tmp_path)
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
-    assert result.exit_code == 0, result.output
+    env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-no-track-fixture"}
+    subprocess.run(
+        ["planctl", "init"], cwd=str(tmp_path), env=env, check=True, capture_output=True
+    )
     return tmp_path
 
 
@@ -54,15 +56,16 @@ def _create_epic(project_path) -> str:
     epic — the test project dir has no .git/ and new-style path validation would
     fail otherwise.
     """
-    runner = CliRunner()
     env = {**os.environ, "CLAUDE_CODE_SESSION_ID": "test-no-track-fixture"}
-    result = runner.invoke(
-        cli,
-        ["epic", "create", "--title", "No-track test epic"],
+    proc = subprocess.run(
+        ["planctl", "epic", "create", "--title", "No-track test epic"],
+        cwd=str(project_path),
         env=env,
+        check=True,
+        capture_output=True,
+        text=True,
     )
-    assert result.exit_code == 0, result.output
-    epic_id = json.loads(result.output.strip())["epic"]["id"]
+    epic_id = json.loads(proc.stdout.strip())["epic"]["id"]
 
     # Null out multi-repo fields so validate treats this as a legacy epic.
     epic_path = project_path / ".planctl" / "epics" / f"{epic_id}.json"

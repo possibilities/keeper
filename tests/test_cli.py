@@ -1,16 +1,15 @@
-from click.testing import CliRunner
-from planctl.cli import cli
+from .conftest import run_cli
 
 
 def test_cli_help():
-    result = CliRunner().invoke(cli, ["--help"])
+    result = run_cli(["--help"])
     assert result.exit_code == 0
     assert "planctl" in result.output.lower()
 
 
 def test_cli_help_no_scout_or_interview_subcommands():
     """Guard against re-introduction of removed CLI surfaces."""
-    result = CliRunner().invoke(cli, ["--help"])
+    result = run_cli(["--help"])
     assert result.exit_code == 0
     # These subcommand groups are removed and must not come back.
     assert "scout" not in result.output.lower()
@@ -23,7 +22,7 @@ def test_cli_help_no_config_subcommand():
     There is no watch config surface — keeper dispatch uses a single hardcoded
     shared in-flight slot.
     """
-    result = CliRunner().invoke(cli, ["--help"])
+    result = run_cli(["--help"])
     assert result.exit_code == 0
     # `config` must not appear as its own subcommand. Scope the assertion to
     # the subcommand-listing region (everything from `Commands:` onward) so a
@@ -46,6 +45,6 @@ def test_cli_help_no_config_subcommand():
 
 def test_cli_config_show_errors_as_unknown_command():
     """`planctl config show` must error — the subgroup is gone."""
-    result = CliRunner().invoke(cli, ["config", "show"])
+    result = run_cli(["config", "show"])
     # click returns non-zero (typically 2) on unknown commands.
     assert result.exit_code != 0

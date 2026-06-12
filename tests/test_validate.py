@@ -29,8 +29,7 @@ import subprocess
 from pathlib import Path
 from unittest.mock import patch
 
-from click.testing import CliRunner  # type: ignore[import-untyped]
-from planctl.cli import cli
+from .conftest import run_cli
 from planctl.integrity import (
     _check_epic_tree,
     check_epic_tree_in_memory,
@@ -64,8 +63,7 @@ def _seed(tmp_path, monkeypatch) -> tuple[Path, str, str]:
         ["git", "commit", "-m", "init"], cwd=tmp_path, check=True, capture_output=True
     )
 
-    runner = CliRunner()
-    result = runner.invoke(cli, ["init"])
+    result = run_cli(["init"])
     assert result.exit_code == 0, result.output
     # `init` self-commits the `.planctl/` tree inline (commit-at-mutation
     # boundary), so there is no separate manual commit to make here.
@@ -85,7 +83,7 @@ def _seed(tmp_path, monkeypatch) -> tuple[Path, str, str]:
     )
     plan_path = tmp_path / "plan.yaml"
     plan_path.write_text(plan)
-    result = runner.invoke(cli, ["scaffold", "--file", str(plan_path)])
+    result = run_cli(["scaffold", "--file", str(plan_path)])
     assert result.exit_code == 0, result.output
 
     # Mutating verbs emit a single compact NDJSON line — find the {success:true} line.
@@ -311,8 +309,7 @@ def test_run_validate_calls_shared_integrity_helper(tmp_path, monkeypatch):
     with patch(
         "planctl.integrity.validate_epic_integrity_with_warnings", side_effect=_spy
     ):
-        runner = CliRunner()
-        result = runner.invoke(cli, ["validate", "--epic", epic_id])
+        result = run_cli(["validate", "--epic", epic_id])
 
     assert result.exit_code == 0, result.output
     # Must have been called exactly once with the scaffolded epic id.
@@ -336,8 +333,7 @@ def test_run_validate_no_epic_still_iterates_through_helper(tmp_path, monkeypatc
     with patch(
         "planctl.integrity.validate_epic_integrity_with_warnings", side_effect=_spy
     ):
-        runner = CliRunner()
-        result = runner.invoke(cli, ["validate"])
+        result = run_cli(["validate"])
 
     assert result.exit_code == 0, result.output
     # The scaffolded epic_id appears in the call list — there's only one epic

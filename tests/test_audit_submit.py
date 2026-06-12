@@ -20,9 +20,9 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 from planctl.audit_artifacts import brief_path, compute_commit_set_hash, write_artifact
-from planctl.cli import cli
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -82,10 +82,9 @@ _EID = "fn-7-demo-epic"
 
 def test_happy_path_persists_report_and_meta(project):
     h = _seed_brief(project, _EID)
-    r = CliRunner().invoke(
-        cli,
+    r = run_cli(
         ["audit", "submit", _EID, "--file", "-", "--findings", "3", "--risk", "Medium"],
-        input="# Audit report\n\nNo fatal findings.\n",
+        input_text="# Audit report\n\nNo fatal findings.\n",
     )
     assert r.exit_code == 0, r.output
     env = _envelope(r.output)
@@ -108,10 +107,9 @@ def test_meta_stamps_hash_from_brief(project):
     """A submit stamps the brief's hash, not a recomputed one."""
     custom = "deadbeef" * 8
     _seed_brief(project, _EID, commit_set_hash=custom)
-    r = CliRunner().invoke(
-        cli,
+    r = run_cli(
         ["audit", "submit", _EID, "--file", "-", "--risk", "Low"],
-        input="report\n",
+        input_text="report\n",
     )
     assert r.exit_code == 0, r.output
     assert _envelope(r.output)["commit_set_hash"] == custom
@@ -119,12 +117,11 @@ def test_meta_stamps_hash_from_brief(project):
 
 def test_last_writer_wins(project):
     _seed_brief(project, _EID)
-    runner = CliRunner()
-    runner.invoke(
-        cli, ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input="v1\n"
+    run_cli(
+        ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input_text="v1\n"
     )
-    r = runner.invoke(
-        cli, ["audit", "submit", _EID, "--file", "-", "--risk", "High"], input="v2\n"
+    r = run_cli(
+        ["audit", "submit", _EID, "--file", "-", "--risk", "High"], input_text="v2\n"
     )
     assert r.exit_code == 0, r.output
     assert Path(_envelope(r.output)["report_ref"]).read_text() == "v2\n"
@@ -142,8 +139,8 @@ def test_no_commit_fires(project):
     head_before = subprocess.run(
         ["git", "rev-parse", "HEAD"], cwd=project, capture_output=True, text=True
     ).stdout.strip()
-    r = CliRunner().invoke(
-        cli, ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input="rep\n"
+    r = run_cli(
+        ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input_text="rep\n"
     )
     assert r.exit_code == 0, r.output
     head_after = subprocess.run(
@@ -160,8 +157,8 @@ def test_no_commit_fires(project):
 
 
 def test_missing_brief_rejects(project):
-    r = CliRunner().invoke(
-        cli, ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input="x\n"
+    r = run_cli(
+        ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input_text="x\n"
     )
     assert r.exit_code == 1
     env = _envelope(r.output)
@@ -176,18 +173,17 @@ def test_missing_brief_rejects(project):
 def test_bad_risk_rejects_before_brief(project):
     # `--risk` is a click.Choice, so an invalid value is rejected by click (exit 2)
     # before run() — assert click's usage error fires.
-    r = CliRunner().invoke(
-        cli, ["audit", "submit", _EID, "--file", "-", "--risk", "Severe"], input="x\n"
+    r = run_cli(
+        ["audit", "submit", _EID, "--file", "-", "--risk", "Severe"], input_text="x\n"
     )
     assert r.exit_code == 2
     assert "Severe" in r.output
 
 
 def test_task_shaped_id_rejects_with_parent(project):
-    r = CliRunner().invoke(
-        cli,
+    r = run_cli(
         ["audit", "submit", "fn-7-demo-epic.2", "--file", "-", "--risk", "Low"],
-        input="x\n",
+        input_text="x\n",
     )
     assert r.exit_code == 1
     env = _envelope(r.output)
@@ -198,8 +194,8 @@ def test_task_shaped_id_rejects_with_parent(project):
 def test_oversize_stdin_rejects(project):
     _seed_brief(project, _EID)
     big = "x" * (1 * 1024 * 1024 + 1)
-    r = CliRunner().invoke(
-        cli, ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input=big
+    r = run_cli(
+        ["audit", "submit", _EID, "--file", "-", "--risk", "Low"], input_text=big
     )
     assert r.exit_code == 1
     assert _envelope(r.output)["error"]["code"] == "PAYLOAD_TOO_LARGE"

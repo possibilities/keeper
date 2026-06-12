@@ -23,14 +23,14 @@ import subprocess
 from pathlib import Path
 
 import pytest
-from click.testing import CliRunner
 from planctl.audit_artifacts import brief_path, compute_commit_set_hash, write_artifact
-from planctl.cli import cli
 from planctl.verdict_schema import (
     VERDICT_SCHEMA,
     cross_field_errors,
     schema_errors,
 )
+
+from .conftest import run_cli
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -78,9 +78,7 @@ def _seed_brief(project: Path, *, commit_set_hash: str | None = None):
 
 def _submit(project, verdict: dict | str):
     payload = verdict if isinstance(verdict, str) else json.dumps(verdict)
-    return CliRunner().invoke(
-        cli, ["verdict", "submit", _EID, "--file", "-"], input=payload
-    )
+    return run_cli(["verdict", "submit", _EID, "--file", "-"], input_text=payload)
 
 
 # ---------------------------------------------------------------------------
