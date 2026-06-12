@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-12T09:04:28.453697Z",
   "created_at": "2026-06-12T08:34:00.618852Z",
   "depends_on_epics": [],
   "id": "fn-804-add-gitpolice-git-usage-sitter",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Add gitpolice git-usage sitter",
   "touched_repos": [
     "/Users/mike/code/sitter"
   ],
-  "updated_at": "2026-06-12T08:34:00.618852Z"
+  "updated_at": "2026-06-12T09:04:28.453697Z"
 }
