@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Hook stops scraping zellij env",
-  "updated_at": "2026-06-12T00:57:44.986897Z"
+  "updated_at": "2026-06-12T02:20:47.402495Z",
+  "worker_done_at": "2026-06-12T02:20:47.402495Z"
 }

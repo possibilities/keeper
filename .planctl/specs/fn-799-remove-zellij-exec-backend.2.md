@@ -36,5 +36,5 @@ In `test/helpers/sandbox-env.ts`, remove the `includeZellij` option and the `KEE
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Removed the includeZellij flag and KEEPER_ZELLIJ_EVENTS_DIR (zero production readers) from sandboxEnv and its events-writer call sites; events-writer.ts source and the ZELLIJ-only/both-set pin tests were already landed, five mandatory sandbox state paths untouched. Full suite green.
 ## Evidence
