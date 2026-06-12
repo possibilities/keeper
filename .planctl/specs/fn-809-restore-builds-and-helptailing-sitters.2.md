@@ -37,5 +37,5 @@ Ported suite green on the schema-v66 fixture; explicit test that an unwhiteliste
 - [ ] plist, agents/helptailing.md, tsconfig/lint/README wiring landed
 
 ## Done summary
-
+Restored the helptailing --agent-help trend sitter into sitters/helptailing/watch.ts, converted to vendored-lib conventions (openDbReadonly, lib/followups, lib/schema-pin gate). Ported the test suite onto the schema-v66 fixture with the five-KEEPER_*-path sandbox plus schema-skew + empty-window coverage; wired build-pin, the watch plist, agents/helptailing.md, and README/CLAUDE roster. bun test green (304), lint clean, fence green.
 ## Evidence
