@@ -30,5 +30,5 @@ bun test green fast and with PLANCTL_RUN_SLOW=1; pytest suite untouched and gree
 - [ ] bun test green (fast + slow); any red translation resolved by fixing src/, recorded in Evidence
 
 ## Done summary
-
+Translated the submits/artifacts/markers/multi-root cluster (124 inventory nodes) to bun: audit-submit (8), verdict-submit (16), followup-submit (14), audit-artifacts (24 cited to src-audit-spine), session-markers (28: 20 translated, 6 cited to lib.test, 4 python_only dropped), cross-project-deps (19: 11 translated, 8 python_only dropped), roots-discovery (15: 6 translated, 9 cited). bun test green fast + PLANCTL_RUN_SLOW=1; lint/typecheck clean; uv run pytest untouched and green. No src/ changes needed.
 ## Evidence
