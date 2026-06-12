@@ -85,6 +85,15 @@ export interface ExecBackend {
    *  `-`). A nonzero "can't find window" is an expected TOCTOU no-op returned as
    *  `{ ok: false }` without noise. NEVER throws. */
   renameWindow(windowId: string, name: string): Promise<LaunchResult>;
+  /** Session-agnostic. Kill the window owning pane `paneId` (`%N`) via
+   *  `kill-window -t <paneId>` — tmux -f /dev/null resolves the pane-id target UPWARD to its
+   *  window and kills every pane in it (the wanted semantics for one-pane
+   *  managed windows; a stable `%N` target cannot be redirected by concurrent
+   *  rename automation). Killing the last window kills the session, which the
+   *  next dispatch re-mints via get-or-create. A nonzero "can't find window" is
+   *  the expected TOCTOU no-op (the window already closed) returned as
+   *  `{ ok: false }` without noise. NEVER throws. */
+  killWindow(paneId: string): Promise<LaunchResult>;
 }
 
 /**
@@ -287,6 +296,19 @@ export function buildTmuxRenameWindowArgs(
   name: string,
 ): string[] {
   return ["tmux", "rename-window", "-t", windowId, "--", name];
+}
+
+/**
+ * Build the tmux `kill-window -t <paneId>` argv. Pure — exported for tests.
+ * Targets by PANE id (server-global `%N`): tmux resolves it upward to the
+ * owning window and removes the whole window (every pane in it) — the wanted
+ * semantics for one-pane managed windows. Pane-id targeting is deliberate over
+ * a window id or name: a stable `%N` handle cannot be redirected by the
+ * concurrent renamer worker, and colons in names break name-based targets. The
+ * window's `remain-on-exit on` does not block the kill.
+ */
+export function buildTmuxKillWindowArgs(paneId: string): string[] {
+  return ["tmux", "kill-window", "-t", paneId];
 }
 
 /** Resolver-filled dep bag for the tmux backend. `session` is the managed
@@ -534,6 +556,33 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
         return {
           ok: false,
           error: `tmux rename-window for ${windowId} exited ${res.exitCode}${detail}`,
+        };
+      }
+      return { ok: true };
+    },
+    async killWindow(paneId: string): Promise<LaunchResult> {
+      // Fire-and-check like renameWindow. The pane-id target resolves upward to
+      // its window; tmux kills every pane in it (one-pane managed windows, so
+      // this removes exactly the worker's window). Killing the last window
+      // kills the managed session — fine, the next dispatch re-mints it via
+      // get-or-create. A nonzero "can't find window" is the expected TOCTOU
+      // no-op (the window already closed between the reaper's snapshot and the
+      // kill) — returned { ok: false } with no noteLine so a self-healing race
+      // never spams the sidecar. The exit-watcher's synthetic Killed mint, not
+      // this op's return, is the only truth of the row's death.
+      const res = await runCapture(buildTmuxKillWindowArgs(paneId));
+      if (res == null) {
+        return {
+          ok: false,
+          error: `tmux kill-window for ${paneId} failed (ENOENT? binary missing)`,
+        };
+      }
+      if (res.exitCode !== 0) {
+        const stderrTrim = res.stderr.trim();
+        const detail = stderrTrim.length > 0 ? `: ${stderrTrim}` : "";
+        return {
+          ok: false,
+          error: `tmux kill-window for ${paneId} exited ${res.exitCode}${detail}`,
         };
       }
       return { ok: true };

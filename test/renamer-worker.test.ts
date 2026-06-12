@@ -111,6 +111,9 @@ function fakeBackend(opts: {
     ensureLaunched: () => {
       throw new Error("renamer must not call ensureLaunched");
     },
+    killWindow: () => {
+      throw new Error("renamer must not call killWindow");
+    },
     listPanes: async (): Promise<PaneInfo[] | null> => {
       tracker.listPanesCalls += 1;
       return opts.panes;

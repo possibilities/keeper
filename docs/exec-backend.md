@@ -53,6 +53,7 @@ factory:
 | `ensureLaunched(session, argv, cwd, name?)` | session-agnostic | `restore-agents.ts` replay | per call |
 | `listPanes()` | session-agnostic | renamer worker | per call (`-a`, whole server) |
 | `renameWindow(windowId, name)` | session-agnostic | renamer worker | per call |
+| `killWindow(paneId)` | session-agnostic | reaper worker | per call (`%N` pane id) |
 
 **Session-bound** ops drive the reconciler against the ONE managed
 session passed at construction. There is no ensure memo — each op runs a
@@ -65,10 +66,18 @@ on (or get-or-create) arbitrary external sessions. `focusPane` runs no
 session-ensure at all, and `ensureLaunched` runs its own per-call
 get-or-create.
 
-**keeper never closes a window.** There is no reap op on the interface;
-every dispatched window stays open until the human closes it. (The fn-724
-pause reap and fn-727 completion reap, and their `reapSurfaces` op, were
-deleted outright in epic fn-789.)
+**`killWindow(paneId)` removes a dispatched window.** Its sole caller is
+the reaper worker, which kills the window of an autopilot-dispatched job
+whose work is verifiably complete (stopped past its grace window with a
+`completed` readiness verdict). The op targets by pane id (`%N`): tmux
+resolves it upward to the owning window and removes every pane in it — the
+wanted semantics for one-pane managed windows, and a stable `%N` handle
+the concurrent renamer worker cannot redirect. Killing the last window
+kills the managed session, which the next dispatch re-mints via
+get-or-create. The op writes nothing to the DB and its return is not the
+truth of the row's death — the exit-watcher's synthetic `Killed` mint is.
+A nonzero "can't find window" is the expected TOCTOU no-op (the window
+already closed) returned as `{ ok: false }` without noise.
 
 ## Public surface
 

@@ -23,6 +23,7 @@
 import { expect, test } from "bun:test";
 import {
   buildTmuxHasSessionArgs,
+  buildTmuxKillWindowArgs,
   buildTmuxListPanesArgs,
   buildTmuxNewSessionArgs,
   buildTmuxNewWindowArgs,
@@ -231,6 +232,22 @@ test("buildTmuxRenameWindowArgs: targets @N window id and carries `--` before th
     "@9",
     "--",
     "-rf weird",
+  ]);
+});
+
+test("buildTmuxKillWindowArgs: targets the %N pane id, exact argv", () => {
+  expect(buildTmuxKillWindowArgs("%7")).toEqual([
+    "tmux",
+    "kill-window",
+    "-t",
+    "%7",
+  ]);
+  // Pane-id targeting is deliberate — tmux resolves it upward to the window.
+  expect(buildTmuxKillWindowArgs("%42")).toEqual([
+    "tmux",
+    "kill-window",
+    "-t",
+    "%42",
   ]);
 });
 
@@ -650,6 +667,54 @@ test("createTmuxBackend.renameWindow: ENOENT (binary missing) → { ok: false },
   };
   const backend = createTmuxBackend({ noteLine: () => {}, spawn });
   const got = await backend.renameWindow("@1", "x");
+  expect(got.ok).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// createTmuxBackend.killWindow — %N target, TOCTOU no-op, ENOENT degrade
+// ---------------------------------------------------------------------------
+
+test("createTmuxBackend.killWindow: exit 0 → { ok: true }, argv targets the %N pane id", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub({ "tmux:kill-window": { exitCode: 0 } }, calls);
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.killWindow("%7");
+  expect(got).toEqual({ ok: true });
+  expect(calls[0]).toEqual(buildTmuxKillWindowArgs("%7"));
+});
+
+test("createTmuxBackend.killWindow: TOCTOU 'can't find window' non-zero → { ok: false }, silent (no noteLine)", async () => {
+  const calls: string[][] = [];
+  const notes: string[] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:kill-window": {
+        stderr: "can't find window %7",
+        exitCode: 1,
+      },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({
+    noteLine: (l) => notes.push(l),
+    spawn,
+  });
+  const got = await backend.killWindow("%7");
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("exited 1");
+    expect(got.error).toContain("can't find window");
+  }
+  // An already-gone window is the expected race — it must not spam the sidecar.
+  expect(notes).toHaveLength(0);
+});
+
+test("createTmuxBackend.killWindow: ENOENT (binary missing) → { ok: false }, never throws", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const got = await backend.killWindow("%1");
   expect(got.ok).toBe(false);
 });
 
