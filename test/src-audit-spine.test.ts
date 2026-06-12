@@ -6,7 +6,7 @@
 //      peer imports the real module and hashes the SAME fixture; the digests
 //      must match (canonical order-independent SHA-256, schema_version folded).
 //   2. validateVerdict reproduces every golden VERDICT_INVALID envelope from
-//      tests/fixtures/golden/verdict/ — the {loc,type,msg} parity table whose
+//      test/fixtures/golden/verdict/ — the {loc,type,msg} parity table whose
 //      message text is the load-bearing surface (python-jsonschema's wording).
 //   3. writeArtifact is COMMIT-FREE and touched-log-free: it lands the file but
 //      records NOTHING under sessions/<sid>/touched (unlike store.atomicWrite),
@@ -46,14 +46,7 @@ import {
 } from "../src/audit_artifacts.ts";
 import { validateVerdict } from "../src/verdict_schema.ts";
 
-const GOLDEN_DIR = join(
-  import.meta.dir,
-  "..",
-  "tests",
-  "fixtures",
-  "golden",
-  "verdict",
-);
+const GOLDEN_DIR = join(import.meta.dir, "fixtures", "golden", "verdict");
 
 /** Hash `commitGroups` through a python3 peer that imports the REAL
  * planctl.audit_artifacts.compute_commit_set_hash — the executable spec the bun
