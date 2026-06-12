@@ -2243,7 +2243,34 @@ load-bearing coupling: the moment the worker writes a new
 `RESTORE_SCHEMA_VERSION`, the OLD reader treats it as "future" and refuses,
 so the bumped writer and reader ship in the same commit.
 
-The ten workers are fully independent; main supervises all ten
+An **eleventh** Worker thread is the tmux window-renamer (epic fn-801): a
+pure EXTERNAL ACTUATOR that opens its own read-only connection, polls
+`PRAGMA data_version` via the shared `watchLoop` primitive, and on every
+change names each tmux WINDOW hosting a live Claude session after that
+session's job title — the latest-appeared Claude in a window wins. It reads
+the `jobs` projection through the same `runQuery` read seam, narrows to live
+(`working` / `stopped`) tmux jobs carrying both a pane id and a non-empty
+title, and gates on an INPUT-side dedup hash of the candidate set so the
+constant data_version churn of active sessions (every hook event bumps it)
+can't spawn tmux dozens of times per second — an unchanged candidate picture
+skips the `list-panes` sweep entirely, and a quiescent board never spawns
+tmux at all. On a changed set it sweeps panes via the exec-backend's
+`listPanes` (a `null`/degraded tmux skips the cycle), joins panes to
+candidates by pane id, groups by window, picks the winner (max `created_at`;
+tie → higher `job_id`, a deterministic tiebreak so equal-aged sessions don't
+flicker the name), and fires `renameWindow` ONLY where the swept window name
+differs from the winning title. Every `rename-window` permanently suppresses
+that window's automatic-rename, so a matching name is never re-issued and the
+suppression is deliberately left in place (tmux fighting back on every
+activity tick is worse than a stale name on a dead window). A TOCTOU rename
+failure (the window closed between sweep and rename) is a logged non-fatal
+skip; the pulse never throws. Like the restore worker it carries no
+`onmessage` handler — it NEVER posts to main and NEVER writes the DB; only an
+unhandled throw out of the watch loop escalates via `onerror`/`close` →
+fatalExit. Human windows get useful tab names for free; autopilot's managed
+windows (deliberately launched unnamed) finally get labels.
+
+The eleven workers are fully independent; main supervises all eleven
 lifecycles but routes none of their traffic, and any worker's `error`
 event escalates the whole process to a clean restart — with that single
 scoped exception, the recoverable drop signal on the transcript, plan,

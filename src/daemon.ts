@@ -84,6 +84,7 @@ import {
   drain,
   serializeBuildSnapshot,
 } from "./reducer";
+import type { RenamerWorkerData } from "./renamer-worker";
 import type {
   RestoreWorkerData,
   TmuxPaneSnapshotMessage,
@@ -1060,7 +1061,8 @@ export type WorkerName =
   | "eventsIngest"
   | "autopilot"
   | "maintenance"
-  | "restore";
+  | "restore"
+  | "renamer";
 
 /**
  * The full worker set, in spawn order — the production boot ({@link runDaemon}
@@ -1081,6 +1083,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "autopilot",
   "maintenance",
   "restore",
+  "renamer",
 ] as const;
 
 /**
@@ -3370,6 +3373,29 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
+  // Gated on the selector — `null` when unselected.
+  const renamerWorker = want("renamer")
+    ? new Worker(new URL("./renamer-worker.ts", import.meta.url).href, {
+        workerData: { dbPath } satisfies RenamerWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (renamerWorker) {
+    const nw = renamerWorker;
+    // NO onmessage handler: the renamer is a pure external actuator (reads the
+    // jobs projection read-only, writes ONLY to tmux via rename-window). It
+    // never posts to main and never writes the DB — only the lifecycle
+    // onerror + close guards escalate to the single recovery path.
+    nw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] renamer worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    nw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -3440,6 +3466,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       autopilotWorkerInstance,
       maintenanceWorker,
       restoreWorker,
+      renamerWorker,
     ].filter((w): w is Worker => w !== null);
 
     // Wrap each shutdown post per-worker: an already-exited worker makes
