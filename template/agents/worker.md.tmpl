@@ -96,7 +96,6 @@ Run project tests before staging anything. If they fail, you do not commit and y
 
 Pick a test command from the project's manifest:
 
-- `pyproject.toml` → `uv run pytest`
 - `package.json` with a `test` script → `pnpm test` / `bun test` / `npm test`
 - `Cargo.toml` → `cargo test`
 - `build.zig` → `zig build test`
@@ -105,7 +104,7 @@ Prefer the epic's `## Quick commands` if present — they may include integratio
 
 **Run the ladder, do not loop the suite.** Your test phase is bounded:
 
-1. **Targeted tests first.** Scope from the task `Files:` list plus the tests you wrote or changed, using the ecosystem's file-arg form (pytest paths, `bun test <file>`, jest/vitest paths, `cargo test <filter>`). When the ecosystem has no per-file selector (e.g. `zig build test`), targeted collapses into the single full pass — that is expected, not a failure of the ladder.
+1. **Targeted tests first.** Scope from the task `Files:` list plus the tests you wrote or changed, using the ecosystem's file-arg form (`bun test <file>`, jest/vitest paths, `cargo test <filter>`). When the ecosystem has no per-file selector (e.g. `zig build test`), targeted collapses into the single full pass — that is expected, not a failure of the ladder.
 2. **Then ONE full-suite pass** to confirm nothing else broke.
 
 **Hard cap: two full-suite runs per worker invocation.** The cap bounds full passes only — fix-then-targeted-rerun iteration on your own failing code is not capped by it.
@@ -124,7 +123,7 @@ If the failure is in tooling itself (broken runner, missing deps, env issue) or 
 
 ## Phase 4 — Commit
 
-Two-commit-per-task contract: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `planctl done` fires at `emit()` (Phase 5). `commit-work` runs the full check matrix internally — ruff check + ruff format --check + ty + cli-boundaries (project-wide when any `.py` is staged) + per-extension shellcheck/zig/lua/hadolint + npm lint per JS/TS package. Never invoke linters separately.
+Two-commit-per-task contract: this commit ships **source** (`feat(scope): ...`) carrying a `Task: $TASK_ID` trailer; the state commit lands automatically when `planctl done` fires at `emit()` (Phase 5). `commit-work` runs the full check matrix internally — per-extension shellcheck/zig/lua/hadolint + npm lint per JS/TS package. Never invoke linters separately.
 
 ```bash
 keeper commit-work "<type>(<scope>): <summary>

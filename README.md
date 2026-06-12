@@ -12,7 +12,6 @@ Data lives in `.planctl/` inside the project directory, under version control.
 ## Requirements
 
 - [Bun](https://bun.sh/) `1.3.14` — builds `planctl-bun`, the compiled production runtime
-- Python `>=3.11,<3.14` and [`uv`](https://docs.astral.sh/uv/) — the dormant reference implementation, kept in-repo as the conformance parity spec and the rollback target
 
 ## Install
 
@@ -27,12 +26,7 @@ planctl --help
 
 `bun run promote` builds as a hard prerequisite, copies into `~/.local/bin` via a same-filesystem temp file, and renames over the `~/.local/bin/planctl` path entry; it logs the promoted `git rev-parse HEAD`. Run `hash -r` (bash) or `rehash` (zsh) afterward so long-lived shells drop their cached path.
 
-The Python package is the dormant reference implementation, kept in-repo as the conformance parity spec and the one-command rollback target (`uv tool install --force .` reinstates the Python shim at `~/.local/bin/planctl`; valid only while the Python package remains in-repo). Run it directly with:
-
-```bash
-uv sync
-uv run planctl --help
-```
+`planctl-bun` is the single implementation. The Python reference implementation lives only in git history behind a single purely-subtractive deletion commit; `git revert <deletion-sha>` restores it as a parity/rollback target.
 
 ## Quick Start
 
@@ -70,7 +64,7 @@ Top-level commands:
 
 `reconcile <task_id>` (fn-6) — read-only post-worker verdict verb, the symmetric bookend to `claim`'s pre-worker brief handoff. Collapses the `/plan:work` orchestrator's post-worker reconciliation into one call returning a typed verdict the orchestrator switches on mechanically: `done | in_progress_committed | in_progress_uncommitted | blocked | state_uncommitted | not_started | tooling_error`. Computed entirely from planctl-native data — merged status, trailer-authentic source commits (against `target_repo` + `epic.touched_repos`), HEAD-visibility of the committed task JSON (against `state_repo`), and an epic-progress tally — with NO keeper dependency. Any git subprocess failure fails closed to `tooling_error`. Cwd-agnostic (scans configured `roots`); supports `--project <path>` to disambiguate. Returns `{verdict, task_id, epic_id, status, source_commits, state_head_visible, epic_progress, assessed_at, blocked_reason}`. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID`.
 
-`find-task-commit <task_id>` — read-only commit lookup for a single task. Wraps the native `Task:`-trailer scan in `planctl/commit_lookup.py` and emits the flat envelope a worker's harness-drop predecessor-detection consumes: `{"success": true, "commits": [{"sha": "<%H>", "repo": "<abs-path>"}, ...]}` (`sha`/`repo` field names, full `%H`; repo-outer first-seen order, per-repo grep order, SHAs deduped per repo). A clean miss is a normal empty success (`commits: []`, exit 0). The verb fails loud (`COMMIT_LOOKUP_FAILED`, exit 1, with `details.broken_repos`) only when every repo in the resolved scan set is missing or not a git repo. Resolution is planctl-native: the owning project is found cwd-agnostically via `find_projects_with_task` (`--project <abs>` to disambiguate), then `primary_repo` / `touched_repos` are read off the epic record to seed the scan set. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID | NOT_A_PROJECT`.
+`find-task-commit <task_id>` — read-only commit lookup for a single task. Wraps the native `Task:`-trailer scan and emits the flat envelope a worker's harness-drop predecessor-detection consumes: `{"success": true, "commits": [{"sha": "<%H>", "repo": "<abs-path>"}, ...]}` (`sha`/`repo` field names, full `%H`; repo-outer first-seen order, per-repo grep order, SHAs deduped per repo). A clean miss is a normal empty success (`commits: []`, exit 0). The verb fails loud (`COMMIT_LOOKUP_FAILED`, exit 1, with `details.broken_repos`) only when every repo in the resolved scan set is missing or not a git repo. Resolution is planctl-native: the owning project is found cwd-agnostically via `find_projects_with_task` (`--project <abs>` to disambiguate), then `primary_repo` / `touched_repos` are read off the epic record to seed the scan set. No `.planctl/` write, no commit. Typed errors: `BAD_TASK_ID | TASK_NOT_FOUND | AMBIGUOUS_TASK_ID | NOT_A_PROJECT`.
 
 The close phase (`/plan:close`) runs as five verbs the content-blind coordinator switches on. `close-preflight <epic_id>` is the pre-audit brief handoff (the bookend to `claim`): it confirms every task is `done`, writes the close-phase brief to `<primary_repo>/.planctl/state/audits/<epic_id>/brief.json` (commit-free, atomic), and returns `{primary_repo, brief_ref, commit_set_hash, tasks, all_done}` — a not-all-done epic is a typed `TASKS_NOT_DONE` error. `audit submit` / `verdict submit` / `followup submit` persist the quality-auditor's report, the close-planner's verdict JSON, and its follow-up plan YAML under `audits/<epic_id>/`, each validating at emission with typed reject envelopes (commit-free, like `claim`). `close-finalize <epic_id>` encodes the saga from observable state — stale-check on `commit_set_hash` (`STALE_ARTIFACTS`), fatal-halt, reversible follow-up scaffold BEFORE the irreversible `epic close` — and returns one of four typed `CloseOutcome` members (`closed_clean | closed_with_followup | fatal_halt | partial_followup`); it is idempotent on re-run.
 

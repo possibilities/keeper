@@ -1,11 +1,3 @@
-# Python
-.venv/
-__pycache__/
-*.egg-info/
-*.pyc
-.pytest_cache/
-.ruff_cache/
-
 # Build artifacts
 dist/
 build/

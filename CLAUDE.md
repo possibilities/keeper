@@ -11,7 +11,7 @@ These diverge from standard arthack conventions:
 - **`planctl cat` is format-free** — always emits raw markdown to stdout regardless of `--format`. FormattedGroup auto-injects `--format` so the flag appears in `cat --help`, but `run_cat.py` ignores it.
 - **`planctl validate` envelope is non-`success`** — emits `{"valid": bool, "errors": [...], "warnings": [...]}` instead of the standard `{"success": bool, ...}`, exiting 1 on `valid: false`. Routes through `format_output` directly (not `emit()`) to preserve the shape.
 - **Bare verb subcommand names** — `init`, `status`, `claim`, etc. instead of arthack's `verb-noun`. Established in the spec and referenced by orchestration scripts; do not rename.
-- **Polyglot, single authority** — `planctl-bun` (compiled TypeScript under `src/`) is the production runtime, installed at `~/.local/bin/planctl`; the Python CLI is the dormant reference implementation, kept in-repo as the conformance parity spec and the rollback target. Both hold full CLI parity, proven against the shared conformance suite. `global_state.py` is api-only with no CLI reach (imported by no `run_*` verb, no conformance surface) and is deliberately unported.
+- **Single implementation** — `planctl-bun` (compiled TypeScript under `src/`) is the sole runtime, installed at `~/.local/bin/planctl`. The bun:test suite under `test/` is the living conformance surface.
 
 ## Commit behavior
 
@@ -42,29 +42,22 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 
 | What | Command |
 |------|---------|
-| Lint | `uv run ruff check .` |
-| Format | `uv run ruff format .` |
-| Type check | `uv run ty check` |
-| Test (fast gate) | `uv run pytest tests/` — default in-process engine, near-subprocess-free; slow-bucket tests (`real_git`/`integration`/`wire`) skip-by-default, visible as skips |
-| Test (full suite) | `uv run pytest tests/ --run-slow` — runs everything incl. the slow bucket (real git/wire machinery) |
-| Conformance (live binary) | `PLANCTL_BIN="$(command -v planctl)" uv run pytest tests/` — exercises the production `planctl-bun` at `~/.local/bin/planctl` as a subprocess with real git; runs every non-`python_only` test, `python_only` tests skip-visible. Parallelise with `-n auto --dist loadscope` (per-worker tmp HOME, no cross-worker flock; `-n auto` capped at 8) |
-| Conformance (Python reference) | `PLANCTL_BIN="$PWD/.venv/bin/planctl" uv run pytest tests/` — points `PLANCTL_BIN` at the in-repo Python executable so the dormant reference keeps a real parity surface |
+| Lint | `bun run lint` — biome check over `src` (and the hook dispatchers) |
+| Typecheck | `bun run typecheck` — `tsc --noEmit` |
+| Test (fast gate) | `bun test` — the living suite; slow-bucket tests (`real_git`/`integration`/`wire`) skip-by-default, visible as skips |
+| Test (full suite) | `PLANCTL_RUN_SLOW=1 bun test` — runs everything incl. the slow bucket (real git/wire machinery) |
+| Build | `bun run build` — compiles `dist/planctl-bun` via `bun build --compile` (Bun pinned at 1.3.14) |
 | Promote | `bun run promote` — builds `dist/planctl-bun` (hard prerequisite), then atomically installs it over the `~/.local/bin/planctl` path entry; logs the promoted `git rev-parse HEAD` |
-| Bun build | `bun run build` — compiles `dist/planctl-bun` via `bun build --compile` (Bun pinned at 1.3.14) |
-| Bun lint | `bun run lint` — biome check over `src` (and the hook dispatchers) |
-| Bun typecheck | `bun run typecheck` — `tsc --noEmit` |
-| Bun test | `bun run test` — `bun test` over the TypeScript suite |
-| Bun conformance | `bun run build && PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/ --run-slow` — the full-suite parity gate against the compiled binary at full CLI parity (serial; add `-n auto --dist loadscope` to parallelise) |
 
 ## Bun cutover runbook
 
 `~/.local/bin/planctl` is the compiled bun binary, promoted by `scripts/promote.sh` (`bun run promote`). The script builds `dist/planctl-bun` as a hard prerequisite in the same invocation, copies it to `~/.local/bin/.planctl.tmp` (temp in the destination dir → same-filesystem atomic rename), `mv -f` over the `~/.local/bin/planctl` path entry (replacing whatever is there — symlink or regular file — without following it), `chmod +x`, and logs the promoted `git rev-parse HEAD`. Any step failing aborts non-zero and leaves the live binary intact.
 
 - **Promote**: `bun run promote`
-- **Rollback (verbatim)**: `uv tool install --force /Users/mike/code/planctl` — reinstates the Python shim as the `~/.local/bin/planctl` symlink into the uv tool dir. Rehearse this BEFORE every promote: run it, confirm the shim answers `planctl --help`, confirm `command -v planctl` still resolves to `~/.local/bin` with no earlier-PATH shadow, then promote. **Rollback-window statement**: this rollback is valid only while the Python package and its `uv tool install` entry exist in-repo; that window closes when the Python package leaves the repo (next epic), after which there is no `uv tool install` rollback target.
+- **Rollback**: the production binary `~/.local/bin/planctl` is replaced atomically by `bun run promote`, so a bad promote is undone by promoting a known-good revision (`git checkout <good-sha> -- . && bun run promote`). The Python reference implementation lives only in git history behind a single purely-subtractive deletion commit; `git revert <deletion-sha>` restores it as a parity/rollback target.
 - **Shell cache**: long-lived shells cache the resolved path. Run `hash -r` (bash) or `rehash` (zsh) after a promote or rollback to drop the cache. Already-exec'd processes hold their inode and are immune.
 
-**Rollback triggers** (any one → run the verbatim rollback immediately, no debate, then surface loudly):
+**Rollback triggers** (any one → roll back to a known-good revision immediately, no debate, then surface loudly):
 
 - any non-zero exit on a known-good verb during the soak or first hour,
 - any `Uncaught` / `error:` / `Traceback` stderr pattern from planctl,
