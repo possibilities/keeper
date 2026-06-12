@@ -85,6 +85,13 @@ async function unlinkQuiet(path: string): Promise<void> {
   }
 }
 
+/** Unlink the marker for `sessionId` — best-effort, never throws. Guards call
+ * this once live state proves the marker stale (task done/blocked/gone). */
+export async function unlinkMarker(sessionId: string): Promise<void> {
+  if (!sessionId) return;
+  await unlinkQuiet(markerPath(sessionId));
+}
+
 /** Run `planctl <args>` read-only and return its last-line JSON envelope, or
  * null on any failure (binary missing, non-zero exit, timeout, malformed JSON).
  * Null is the fail-open signal — callers must allow when they get it. */
