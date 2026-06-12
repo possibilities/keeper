@@ -49,5 +49,5 @@ planctl_op).
 - [ ] one sandboxEnv-isolated integration test per verb (seeded rows, including one compacted-event case for search); fast tier + typecheck green
 
 ## Done summary
-
+Added three read-only history verbs (search-history, find-file-history, show-session-events) to the keeper CLI, registered in SUBCOMMANDS/USAGE/handlers, with COALESCE(events.data, event_blobs.data) for compacted-event coverage and per-verb sandboxEnv integration tests.
 ## Evidence
