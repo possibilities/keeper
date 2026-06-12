@@ -31,5 +31,5 @@ retry tests).
   re-ensure, no second attempt) on a session-gone failure stderr.
 
 ## Done summary
-
+Scoped the exec-backend.md session-gone single-retry paragraph to zellij and documented tmux's per-call has-session probe alternative; added a regression test pinning that tmux launch issues exactly one new-window (no re-ensure/retry) on a session-gone failure.
 ## Evidence

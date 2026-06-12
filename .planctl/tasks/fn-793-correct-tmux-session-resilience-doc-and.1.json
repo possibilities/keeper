@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fix tmux retry doc, pin non-retry",
-  "updated_at": "2026-06-11T23:08:17.586349Z"
+  "updated_at": "2026-06-12T01:04:06.913624Z",
+  "worker_done_at": "2026-06-12T01:04:06.913624Z"
 }
