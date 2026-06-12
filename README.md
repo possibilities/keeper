@@ -11,32 +11,27 @@ Data lives in `.planctl/` inside the project directory, under version control.
 
 ## Requirements
 
-- Python `>=3.11,<3.14` — the authoritative implementation
-- [`uv`](https://docs.astral.sh/uv/) recommended for running/installing
-- [Bun](https://bun.sh/) `1.3.14` — to build `planctl-bun`, a compiled TypeScript binary at full CLI parity with the Python implementation
+- [Bun](https://bun.sh/) `1.3.14` — builds `planctl-bun`, the compiled production runtime
+- Python `>=3.11,<3.14` and [`uv`](https://docs.astral.sh/uv/) — the dormant reference implementation, kept in-repo as the conformance parity spec and the rollback target
 
 ## Install
 
-From this repository:
-
-```bash
-uv sync
-uv run planctl --help
-```
-
-Optional tool install:
-
-```bash
-uv tool install .
-planctl --help
-```
-
-The Python CLI is the authoritative implementation; `planctl-bun` is an additive port at full CLI parity, proven against the same conformance suite (`PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/ --run-slow`). To build it:
+`planctl-bun` is the production binary. Build and promote it:
 
 ```bash
 bun install
 bun run build      # compiles dist/planctl-bun via `bun build --compile`
-./dist/planctl-bun --help
+bun run promote    # builds, then atomically installs dist/planctl-bun at ~/.local/bin/planctl
+planctl --help
+```
+
+`bun run promote` builds as a hard prerequisite, copies into `~/.local/bin` via a same-filesystem temp file, and renames over the `~/.local/bin/planctl` path entry; it logs the promoted `git rev-parse HEAD`. Run `hash -r` (bash) or `rehash` (zsh) afterward so long-lived shells drop their cached path.
+
+The Python package is the dormant reference implementation, kept in-repo as the conformance parity spec and the one-command rollback target (`uv tool install --force .` reinstates the Python shim at `~/.local/bin/planctl`; valid only while the Python package remains in-repo). Run it directly with:
+
+```bash
+uv sync
+uv run planctl --help
 ```
 
 ## Quick Start

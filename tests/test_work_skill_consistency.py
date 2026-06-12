@@ -115,9 +115,8 @@ def test_work_tmpl_planctl_verbs_have_help(verb_parts: tuple[str, ...]):
 # Group B — agentId regex
 # ---------------------------------------------------------------------------
 
-# Frozen contract: this is the regex Phase 3c of work.md.tmpl uses (and
-# `apps/planctl/scripts/classify_worker_dropoffs.py:189` already uses live)
-# to capture the worker's agent_id from the Task tool result string.
+# Frozen contract: this is the regex Phase 3c of work.md.tmpl uses to
+# capture the worker's agent_id from the Task tool result string.
 AGENT_ID_PATTERN: re.Pattern[str] = re.compile(r"agentId:\s*([a-f0-9]{10,})")
 
 # Frozen sample mirroring the actual Task tool result tail.
