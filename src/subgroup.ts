@@ -123,11 +123,31 @@ export function printGroupHelp(group: GroupSpec): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
+/** Render a leaf subcommand's `--help` as click does: a Usage line, the
+ * subcommand's short help paragraph, and the injected Options section. Exits via
+ * the caller after printing (the verb body never runs). No conformance test pins
+ * the exact leaf-help text — only that `--help` exits 0 — so the structural shape
+ * (Usage + short help + Options) is the contract. */
+export function printLeafHelp(group: string, spec: SubcommandSpec): void {
+  const lines: string[] = [];
+  lines.push(`Usage: ${PROG} ${group} ${spec.name} [OPTIONS] [ARGS]...`);
+  lines.push("");
+  for (const wrapped of wrapHelp(spec.shortHelp, 2, HELP_WIDTH)) {
+    lines.push(`  ${wrapped}`);
+  }
+  lines.push("");
+  lines.push("Options:");
+  lines.push("  --format [json|yaml|human]  Output format (default: json)");
+  lines.push("  --help                      Show this message and exit.");
+  process.stdout.write(`${lines.join("\n")}\n`);
+}
+
 /** Dispatch `planctl <group> <sub> [args]`. `groupArgs` is everything after the
  * group name (the global --format is intercepted before this and passed in).
  * `--help` with no subcommand (or as the first token) prints the group help and
- * returns true to signal the caller to stop. An unknown subcommand exits 2; a
- * known one runs its leaf. Returns true when handled. */
+ * returns true to signal the caller to stop. A known subcommand whose args carry
+ * `--help` prints the leaf help (exit 0). An unknown subcommand exits 2; a known
+ * one runs its leaf. Returns true when handled. */
 export function dispatchGroup(
   group: GroupSpec,
   groupArgs: string[],
@@ -143,6 +163,12 @@ export function dispatchGroup(
   const spec = group.commands.find((c) => c.name === first);
   if (spec === undefined) {
     noSuchSubcommand(group.name, first);
+  }
+  // A known leaf with --help in its args renders the leaf help (exit 0) — click
+  // intercepts --help before the verb body runs.
+  if (groupArgs.slice(1).includes("--help")) {
+    printLeafHelp(group.name, spec);
+    return;
   }
   spec.run(groupArgs.slice(1), format);
 }

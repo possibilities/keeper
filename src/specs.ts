@@ -19,6 +19,30 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+/** Extract the body of a `## section` from spec markdown, .strip()'d. Collects
+ * every line after the heading until the next `## ` heading; returns "" when the
+ * section is absent. Mirrors specs.get_task_section. */
+export function getTaskSection(content: string, section: string): string {
+  const lines = content.split("\n");
+  let inTarget = false;
+  const collected: string[] = [];
+  for (const line of lines) {
+    if (line.startsWith("## ")) {
+      if (line.trim() === section) {
+        inTarget = true;
+        continue;
+      }
+      if (inTarget) {
+        break;
+      }
+    }
+    if (inTarget) {
+      collected.push(line);
+    }
+  }
+  return collected.join("\n").trim();
+}
+
 /** Count `^<section>\s*$` matches under MULTILINE — Python
  * len(re.findall(pattern, content, re.MULTILINE)). */
 function countHeadingMatches(content: string, section: string): number {

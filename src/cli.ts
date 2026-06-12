@@ -21,9 +21,12 @@ import { runAuditSubmit } from "./verbs/audit_submit.ts";
 import { runBlock } from "./verbs/block.ts";
 import { runCat } from "./verbs/cat.ts";
 import { runClaim } from "./verbs/claim.ts";
+import { runCloseFinalize } from "./verbs/close_finalize.ts";
+import { runClosePreflight } from "./verbs/close_preflight.ts";
 import { runDetect } from "./verbs/detect.ts";
 import { runDone } from "./verbs/done.ts";
 import { runEpicAddDeps } from "./verbs/epic_add_deps.ts";
+import { runEpicClose } from "./verbs/epic_close.ts";
 import { runEpicCreate } from "./verbs/epic_create.ts";
 import { runEpicAddDep, runEpicRmDep } from "./verbs/epic_dep_edit.ts";
 import { runEpicRm } from "./verbs/epic_rm.ts";
@@ -39,6 +42,7 @@ import {
 import { runEpics } from "./verbs/epics.ts";
 import { runFindTaskCommit } from "./verbs/find_task_commit.ts";
 import { runFollowupSubmit } from "./verbs/followup_submit.ts";
+import { runGist } from "./verbs/gist.ts";
 import { runInit } from "./verbs/init.ts";
 import { runList } from "./verbs/list.ts";
 import { runReady } from "./verbs/ready.ts";
@@ -116,6 +120,16 @@ const COMMANDS: CommandSpec[] = [
     implemented: true,
   },
   {
+    name: "close-finalize",
+    shortHelp: "Run the /plan:close saga to its outcome.",
+    implemented: true,
+  },
+  {
+    name: "close-preflight",
+    shortHelp: "Write the /plan:close brief and emit the handoff.",
+    implemented: true,
+  },
+  {
     name: "detect",
     shortHelp: "Check if cwd belongs to a planctl project.",
     implemented: true,
@@ -131,6 +145,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "followup",
     shortHelp: "Close-phase follow-up-plan submit verb.",
+    implemented: true,
+  },
+  {
+    name: "gist",
+    shortHelp: "Create a multifile gist for an epic.",
     implemented: true,
   },
   {
@@ -236,6 +255,27 @@ function leafFlag(rest: string[], name: string): boolean {
   return rest.includes(name);
 }
 
+/** Reject any `--option` token in `rest` not in `known`, click's parse-time
+ * "No such option" usage error (exit 2). `--name=value` forms are split on `=`
+ * before the membership check. Positional args are ignored. */
+function rejectUnknownLeafOptions(
+  group: string,
+  sub: string,
+  argsHint: string,
+  rest: string[],
+  known: Set<string>,
+): void {
+  for (const arg of rest) {
+    if (!arg.startsWith("--")) {
+      continue;
+    }
+    const name = arg.includes("=") ? arg.slice(0, arg.indexOf("=")) : arg;
+    if (!known.has(name)) {
+      leafUsageError(group, sub, argsHint, `No such option: ${name}`);
+    }
+  }
+}
+
 function leafPositionals(rest: string[], valueTaking: Set<string>): string[] {
   const out: string[] = [];
   for (let i = 0; i < rest.length; i += 1) {
@@ -282,6 +322,29 @@ const EPIC_GROUP: GroupSpec = {
           epicId: epicId ?? "",
           depIds,
           skipInvalid: leafFlag(rest, "--skip-invalid"),
+          format,
+        });
+      },
+    },
+    {
+      name: "close",
+      shortHelp: "Mark an epic as done.",
+      run: (rest, format) => {
+        // click rejects unknown options at parse time (exit 2) — the
+        // removed --audit-required flag must still error. Only --force and
+        // --reason are accepted here.
+        rejectUnknownLeafOptions(
+          "epic",
+          "close",
+          "EPIC_ID",
+          rest,
+          new Set(["--force", "--reason"]),
+        );
+        const [epicId] = leafPositionals(rest, new Set(["--reason"]));
+        runEpicClose({
+          epicId: epicId ?? "",
+          force: leafFlag(rest, "--force"),
+          reason: leafOption(rest, "--reason"),
           format,
         });
       },
@@ -797,6 +860,42 @@ function dispatch(parsed: ParsedArgs): number {
     case "init":
       runInit({ format });
       break;
+    case "close-preflight": {
+      // Read-only brief handoff: emits its payload via formatOutput (no
+      // self-emit), so the dispatcher fires the generic readonly trailer with
+      // target=epicId. The error path exits 1 before the trailer.
+      const id = readPositionalSkipping(rest, new Set(["--project"]));
+      runClosePreflight({
+        epicId: id,
+        project: readOption(rest, "--project"),
+        format,
+      });
+      trailerTarget = id.startsWith("fn-") ? id : null;
+      break;
+    }
+    case "close-finalize":
+      // Self-emits its readonly invocation via emitReadonly — didSelfEmit()
+      // guards the generic trailer below.
+      runCloseFinalize({
+        epicId: readPositionalSkipping(rest, new Set(["--project"])),
+        project: readOption(rest, "--project"),
+        format,
+      });
+      break;
+    case "gist": {
+      // Read-only: emits its payload via formatOutput (no self-emit), so the
+      // dispatcher fires the generic readonly trailer with target=epicId.
+      const id = readPositionalSkipping(rest, new Set(["--desc"]));
+      runGist({
+        epicId: id,
+        public: readFlag(rest, "--public"),
+        noOpen: readFlag(rest, "--no-open"),
+        description: readOption(rest, "--desc"),
+        format,
+      });
+      trailerTarget = id.startsWith("fn-") ? id : null;
+      break;
+    }
     case "epic":
       // Subgroup: dispatch the leaf (or group help). The leaf owns its own
       // invocation tracking, so the parent never fires the generic trailer.

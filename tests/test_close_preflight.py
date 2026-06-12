@@ -302,6 +302,7 @@ class TestCommitGroups:
         assert _load_brief(project, epic_id)["commit_groups"] == []
 
     @pytest.mark.real_git
+    @pytest.mark.python_only
     def test_all_repos_broken_is_fail_loud(
         self, project, monkeypatch, tmp_path_factory
     ):
@@ -312,6 +313,11 @@ class TestCommitGroups:
         scan set is all-broken and the verb fails loud with the
         `details.broken_repos` shape. The broken dir lives OUTSIDE the project's
         git tree so `git rev-parse` cannot resolve a parent `.git`.
+
+        ``python_only``: the ``monkeypatch.setattr(planctl.api, ...)`` injection
+        cannot cross the conformance subprocess boundary. The all-repos-broken
+        COMMIT_LOOKUP_FAILED path itself is engine-shared (the native scan in
+        commit_lookup is byte-identical across engines).
         """
         import planctl.api as _api
 

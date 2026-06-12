@@ -221,6 +221,7 @@ def test_emit_auto_commit_happy_path(tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.python_only
 def test_emit_commit_failure_emits_structured_envelope_and_exits_1(
     tmp_path, monkeypatch
 ):
@@ -335,14 +336,10 @@ def test_validate_emit_bypass_auto_commits(tmp_path, monkeypatch):
 
     pre_count = _git_commit_count(project)
 
-    # First validate — marker is None → stamped → committed inline.
-    result = subprocess.run(
-        ["planctl", "validate", "--epic", epic_id],
-        cwd=project,
-        env=_ENV,
-        capture_output=True,
-        text=True,
-    )
+    # First validate — marker is None → stamped → committed inline. run_cli routes
+    # through both engines and carries PATH (a raw subprocess.run with env=_ENV
+    # strips PATH and cannot find the binary).
+    result = run_cli(["validate", "--epic", epic_id], cwd=project, env=_ENV)
     assert result.returncode == 0, f"validate failed: {result.stdout}\n{result.stderr}"
 
     # HEAD advanced.
@@ -360,17 +357,12 @@ def test_validate_emit_bypass_auto_commits(tmp_path, monkeypatch):
 
     # Re-run validate: marker already stamped → no second commit, no
     # planctl_invocation line in output.
-    result2 = subprocess.run(
-        ["planctl", "validate", "--epic", epic_id],
-        cwd=project,
-        env=_ENV,
-        capture_output=True,
-        text=True,
-    )
+    result2 = run_cli(["validate", "--epic", epic_id], cwd=project, env=_ENV)
     assert result2.returncode == 0
     assert _git_commit_count(project) == pre_count + 1
 
 
+@pytest.mark.python_only
 def test_validate_emit_bypass_commit_failure_aborts_invocation_line(
     tmp_path, monkeypatch
 ):

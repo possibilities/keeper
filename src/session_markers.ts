@@ -101,8 +101,20 @@ export function writeWorkMarker(taskId: string): void {
   writeMarker("work", "task_id", taskId);
 }
 
+/** Mark this session as closing `epicId` (kind="close"). Called on the success
+ * path of close-preflight. Mirrors write_close_marker. */
+export function writeCloseMarker(epicId: string): void {
+  writeMarker("close", "epic_id", epicId);
+}
+
 /** Clear the work marker, but only if it names `taskId`. Called by done/block.
  * Mirrors clear_work_marker. */
 export function clearWorkMarker(taskId: string): void {
   clearIfMatches("task_id", taskId);
+}
+
+/** Clear the close marker, but only if it names `epicId`. Called by
+ * close-finalize on every terminal outcome. Mirrors clear_close_marker. */
+export function clearCloseMarker(epicId: string): void {
+  clearIfMatches("epic_id", epicId);
 }
