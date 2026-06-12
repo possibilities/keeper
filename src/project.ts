@@ -68,21 +68,35 @@ export function resolveProject(format: OutputFormat | null): ProjectContext {
 }
 
 /** Resolve a `--project` override to a validated project root for the read-only
- * trailer, mirroring the per-verb --project branch: an absolute path whose
- * `.planctl/` exists resolves to its realpath; anything else (unset, relative,
- * or not a project) returns null so the caller falls back to cwd resolution.
- * Trailer-only — it never errors, since the verb already validated the flag. */
+ * trailer, mirroring the per-verb --project branch: the flag is expanded with
+ * `expandUser` (tilde form) BEFORE the absolute check, so a `~/proj` form agrees
+ * with the verb. An absolute path whose `.planctl/` exists resolves to its
+ * realpath; anything else (unset, relative, or not a project) returns null so the
+ * caller falls back to cwd resolution. Trailer-only — it never errors, since the
+ * verb already validated the flag. */
 export function trailerProjectRoot(project: string | null): string | null {
-  if (project === null || !isAbsolute(project)) {
+  if (project === null) {
+    return null;
+  }
+  const expanded = expandUser(project);
+  if (!isAbsolute(expanded)) {
     return null;
   }
   let root: string;
   try {
-    root = realpathSync(project);
+    root = realpathSync(expanded);
   } catch {
-    root = project;
+    root = expanded;
   }
   return existsSync(join(root, ".planctl")) ? root : null;
+}
+
+/** Expand a leading `~` / `~/` to $HOME, matching the verb's --project branch. */
+function expandUser(p: string): string {
+  if (p === "~" || p.startsWith("~/")) {
+    return (process.env.HOME ?? "") + p.slice(1);
+  }
+  return p;
 }
 
 function basename(path: string): string {

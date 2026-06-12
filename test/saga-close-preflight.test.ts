@@ -399,6 +399,44 @@ describe("close-preflight --project flag", () => {
     expect(r.code).toBe(0);
     expect(parseCliOutput(r.output).success).toBe(true);
   });
+
+  test("tilde --project from non-project cwd: no spurious missing-project error", () => {
+    // Regression for the trailer/verb tilde disagreement: trailerProjectRoot
+    // must expandUser the flag before its absolute check, matching the verb, so
+    // a `~`-form --project from an outside cwd resolves through the project root
+    // and the read-only trailer never re-resolves from cwd into a missing-project
+    // error envelope.
+    const proj = getProj();
+    // A project under the binary's HOME, so a `~/<name>` --project resolves to it.
+    const projName = "tilde-cpf-proj";
+    const tildeRoot = join(proj.home, projName);
+    mkdirSync(tildeRoot, { recursive: true });
+    git(["init", "-q"], tildeRoot);
+    git(["config", "user.email", "t@p.local"], tildeRoot);
+    git(["config", "user.name", "T"], tildeRoot);
+    git(["config", "commit.gpgsign", "false"], tildeRoot);
+    const initRes = runCli(["init"], { cwd: tildeRoot, home: proj.home });
+    expect(initRes.code).toBe(0);
+    const { epicId } = makeEpic({ root: tildeRoot, home: proj.home }, ["done"]);
+
+    // cwd is an unrelated, non-project dir; only the tilde --project carries it.
+    const elsewhere = mkdtempSync(
+      join(tmpdir(), "planctl-cpf-tilde-elsewhere-"),
+    );
+    try {
+      const r = runCli(
+        ["close-preflight", epicId, "--project", `~/${projName}`],
+        { cwd: elsewhere, home: proj.home },
+      );
+      expect(r.code).toBe(0);
+      expect(r.output.includes("No planctl project found")).toBe(false);
+      const env = parseCliOutput(r.output);
+      expect(env.success).toBe(true);
+      expect("brief_ref" in env).toBe(true);
+    } finally {
+      rmSync(elsewhere, { recursive: true, force: true });
+    }
+  });
 });
 
 // ---------------------------------------------------------------------------
