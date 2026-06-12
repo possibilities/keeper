@@ -34,5 +34,5 @@ Three invocations must be green: `uv run pytest tests/test_readonly_verbs.py` (i
 - [ ] No existing test or conftest behavior modified; full fast gate stays green
 
 ## Done summary
-
+Added tests/test_readonly_verbs.py: engine-agnostic conformance spec pinning state-path/detect/status/epics byte-for-byte (json/yaml/human, trailer, missing-project errors, schema_version asymmetry, non-ASCII title). Green in-process and under PLANCTL_BIN=python planctl.
 ## Evidence
