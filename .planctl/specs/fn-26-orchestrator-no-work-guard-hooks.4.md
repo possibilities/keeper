@@ -35,5 +35,5 @@ bun units: ladder branches, nudge mapping, BLOCKED multiline match, transcript T
 - [ ] bun test + fast/slow pytest green
 
 ## Done summary
-
+Implemented the SubagentStop worker guard (first-chance resume engine) in subagent-stop-guard.ts: bypass/stop_hook_active/BLOCKED ladder, marker-first task-id resolution with bounded transcript TASK_ID fallback, reconcile verdict to Phase 2b nudge mapping, fail-open everywhere. Added bun unit + pytest slow-bucket subprocess tests.
 ## Evidence
