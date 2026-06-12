@@ -41,5 +41,5 @@ bun units: branch selection by marker kind, work checklist wording, each close a
 - [ ] bun test + fast/slow pytest green
 
 ## Done summary
-
+Implemented the Stop checklist guard dispatcher (stop-guard.ts): file-stat-cheap no-marker hot path, work-branch reconcile block-once with the resume checklist (done/blocked allow+clear, tooling/typed errors fail open), and a lenient close branch that allows the close skill's typed-stop surfaces (BLOCKED/QUESTION/typed-error/fatal-halt/partial-followup) and blocks only a bare mid-saga stop. Added bun unit + pytest slow-bucket subprocess tests.
 ## Evidence
