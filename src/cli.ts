@@ -23,7 +23,9 @@ import { runClaim } from "./verbs/claim.ts";
 import { runDetect } from "./verbs/detect.ts";
 import { runDone } from "./verbs/done.ts";
 import { runEpicAddDeps } from "./verbs/epic_add_deps.ts";
+import { runEpicCreate } from "./verbs/epic_create.ts";
 import { runEpicAddDep, runEpicRmDep } from "./verbs/epic_dep_edit.ts";
+import { runEpicRm } from "./verbs/epic_rm.ts";
 import { runEpicSetBranch, runEpicSetTitle } from "./verbs/epic_set_plain.ts";
 import {
   runEpicSetPrimaryRepo,
@@ -242,6 +244,20 @@ const EPIC_GROUP: GroupSpec = {
       },
     },
     {
+      name: "create",
+      shortHelp: "Create a new epic.",
+      run: (rest, format) => {
+        runEpicCreate({
+          title: leafOption(rest, "--title") ?? "",
+          branch: leafOption(rest, "--branch"),
+          specFile: leafOption(rest, "--spec-file"),
+          primaryRepo: leafOption(rest, "--primary-repo"),
+          touchedRepos: leafOption(rest, "--touched-repos"),
+          format,
+        });
+      },
+    },
+    {
       name: "invalidate",
       shortHelp:
         "Clear validation marker (force re-validate on next validate run).",
@@ -257,6 +273,21 @@ const EPIC_GROUP: GroupSpec = {
       run: (rest, format) => {
         const [epicId] = leafPositionals(rest, new Set());
         runEpicQueueJump({ epicId: epicId ?? "", format });
+      },
+    },
+    {
+      name: "rm",
+      shortHelp:
+        "Remove an epic and all its artifacts (sanctioned delete verb).",
+      run: (rest, format) => {
+        const [epicId] = leafPositionals(rest, new Set(["--project"]));
+        runEpicRm({
+          epicId: epicId ?? "",
+          force: leafFlag(rest, "--force"),
+          dryRun: leafFlag(rest, "--dry-run"),
+          project: leafOption(rest, "--project"),
+          format,
+        });
       },
     },
     {

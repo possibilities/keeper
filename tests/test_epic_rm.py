@@ -539,12 +539,17 @@ def test_rm_commit_failure_emits_structured_envelope(planctl_git_repo, monkeypat
     assert obj["details"]["error"] == "git_commit"
 
 
+@pytest.mark.python_only
 @pytest.mark.real_git
 def test_rm_no_lock_nesting(planctl_git_repo, monkeypatch):
     """epic rm doesn't take the ``_epic_id_lock`` at all (it's a delete verb,
     no id allocation). There is no commit flock, so we spy the commit seam
     (``_git_commit``) to prove the auto-commit fires and no spurious id-lock
     acquisition leaks into the rm path.
+
+    python_only: spies in-process internals (``_git_commit`` /
+    ``_epic_id_lock`` monkeypatches) a conformance subprocess can never
+    populate — the no-id-lock guarantee is an in-process structural assertion.
     """
     import planctl.commit as _commit_mod
     import planctl.run_epic_create as _epic_create_mod
