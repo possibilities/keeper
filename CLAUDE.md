@@ -11,7 +11,7 @@ These diverge from standard arthack conventions:
 - **`planctl cat` is format-free** — always emits raw markdown to stdout regardless of `--format`. FormattedGroup auto-injects `--format` so the flag appears in `cat --help`, but `run_cat.py` ignores it.
 - **`planctl validate` envelope is non-`success`** — emits `{"valid": bool, "errors": [...], "warnings": [...]}` instead of the standard `{"success": bool, ...}`, exiting 1 on `valid: false`. Routes through `format_output` directly (not `emit()`) to preserve the shape.
 - **Bare verb subcommand names** — `init`, `status`, `claim`, etc. instead of arthack's `verb-noun`. Established in the spec and referenced by orchestration scripts; do not rename.
-- **Polyglot, single authority** — the Python CLI is the authoritative implementation; `planctl-bun` (compiled TypeScript under `src/`) is an additive port covering a read-only verb subset (`state-path`, `detect`, `status`, `epics`), proven at parity against the shared conformance suite.
+- **Polyglot, single authority** — the Python CLI is the authoritative implementation; `planctl-bun` (compiled TypeScript under `src/`) is an additive port covering the read verbs (`state-path`, `detect`, `status`, `epics`) and the worker-loop writes (`init`, `claim`, `done`, `block`), proven at parity against the shared conformance suite. `claim`/`block` mutate only gitignored `state/` (zero commits); `done` and `init` self-commit byte-identical to Python in subject + trailer shape.
 
 ## Commit behavior
 
@@ -52,4 +52,4 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 | Bun lint | `bun run lint` — biome check over `src` (and the hook dispatchers) |
 | Bun typecheck | `bun run typecheck` — `tsc --noEmit` |
 | Bun test | `bun run test` — `bun test` over the TypeScript suite |
-| Bun conformance | `bun run build && PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/test_cli.py tests/test_readonly_verbs.py` — the scoped read-only gate against the compiled binary (serial; add `-n auto --dist loadscope` to parallelise) |
+| Bun conformance | `bun run build && PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/test_cli.py tests/test_readonly_verbs.py tests/test_init.py tests/test_worker_verbs.py` — the scoped parity gate against the compiled binary (serial; add `-n auto --dist loadscope` to parallelise) |

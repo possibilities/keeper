@@ -12,13 +12,16 @@
 // error envelope + exit 1 inline (the contract for detect's found-false tail).
 // The trailer is suppressed for the cat/validate contract verbs by name.
 
+import { didSelfEmit } from "./emit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
 import { buildPlanctlInvocationReadonly } from "./invocation.ts";
 import { resolveProject } from "./project.ts";
 import { runBlock } from "./verbs/block.ts";
 import { runClaim } from "./verbs/claim.ts";
 import { runDetect } from "./verbs/detect.ts";
+import { runDone } from "./verbs/done.ts";
 import { runEpics } from "./verbs/epics.ts";
+import { runInit } from "./verbs/init.ts";
 import { runStatePath } from "./verbs/state_path.ts";
 import { runStatus } from "./verbs/status.ts";
 
@@ -33,10 +36,11 @@ const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 // / non-standard envelopes). Mirrors cli.py _NO_TRACK_COMMANDS.
 const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
 
-// Verbs that emit their OWN envelope with the planctl_invocation embedded
-// (claim/block via emitReadonly; done/init via emitMutating) — the generic
-// trailer must never fire on top. Mirrors cli.py's INVOCATION_EMITTED_SENTINEL.
-const SELF_EMITTING_COMMANDS = new Set(["claim", "block"]);
+// Whether a verb already printed its own planctl_invocation-bearing envelope is
+// a RUNTIME fact (claim/block via emitReadonly, done via emitMutating always
+// self-emit; init self-emits only on its committing path). The dispatcher reads
+// the didSelfEmit() sentinel after the verb runs — the port of cli.py's
+// INVOCATION_EMITTED_SENTINEL — rather than a static name set.
 
 interface CommandSpec {
   name: string;
@@ -57,7 +61,13 @@ const COMMANDS: CommandSpec[] = [
     shortHelp: "Check if cwd belongs to a planctl project.",
     implemented: true,
   },
+  { name: "done", shortHelp: "Mark a task as complete.", implemented: true },
   { name: "epics", shortHelp: "List all epics.", implemented: true },
+  {
+    name: "init",
+    shortHelp: "Initialize a planctl project for the current directory.",
+    implemented: true,
+  },
   {
     name: "state-path",
     shortHelp: "Print the resolved state directory path.",
@@ -235,13 +245,26 @@ function dispatch(parsed: ParsedArgs): number {
         format,
       });
       break;
+    case "done":
+      runDone({
+        taskId: readPositional(rest),
+        summary: readOption(rest, "--summary"),
+        evidence: readOption(rest, "--evidence"),
+        force: readFlag(rest, "--force"),
+        format,
+      });
+      break;
+    case "init":
+      runInit({ format });
+      break;
     default:
       noSuchCommand(command);
   }
 
-  // claim/block emit their own envelope (with the readonly invocation embedded);
-  // the generic trailer must not fire on top of it.
-  if (!NO_TRACK_COMMANDS.has(command) && !SELF_EMITTING_COMMANDS.has(command)) {
+  // A self-emitting verb (claim/block/done always; init on its committing path)
+  // already printed its invocation-bearing envelope — the generic trailer must
+  // not fire on top. didSelfEmit() is the runtime sentinel.
+  if (!NO_TRACK_COMMANDS.has(command) && !didSelfEmit()) {
     emitTrailer(command, format);
   }
   return 0;
@@ -275,6 +298,8 @@ function readPositional(rest: string[]): string {
     "--project",
     "--reason",
     "--reason-file",
+    "--summary",
+    "--evidence",
   ]);
   for (let i = 0; i < rest.length; i += 1) {
     const arg = rest[i] as string;
