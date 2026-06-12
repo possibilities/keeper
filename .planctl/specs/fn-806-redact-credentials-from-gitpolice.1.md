@@ -23,5 +23,5 @@ the degrade-don't-throw, read-only-observer contract.
 - [ ] A unit test asserts the redacted argv (or its omission) for a bare-token credential.
 
 ## Done summary
-
+Redact URL userinfo from persisted census argv element-wise via redactCommand, closing the at-rest credential leak; reconciled redactCommand doc-comment and added a bare-token argv redaction test.
 ## Evidence
