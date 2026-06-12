@@ -14,9 +14,6 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   HOOK plugin has exactly ONE manifest (`./.claude-plugin/plugin.json`) and ONE
   `./hooks/hooks.json` — never duplicate either, and never add a
   `~/.claude/plugins/keeper` symlink (it double-registers the hook).
-- **Babysitters carve-out:** `babysitters/.claude-plugin/plugin.json` is a SECOND,
-  deliberate plugin manifest — the agents-only `babysitters` plugin (NO `hooks.json`,
-  so it never double-registers the hook), loaded via its own `--plugin-dir`.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `promptctl render code-comment-style`.
@@ -71,9 +68,6 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
 - **Sole-writer rules.** The hook writes ONLY per-pid NDJSON files, never the DB. The
   events-log ingester is the sole writer of hook-sourced `events` rows; main writes
   all synthetic events + `dead_letters` + the replay path; workers feed via main.
-- **Babysitters are pure read-only external scanners** under `babysitters/`: each
-  opens `keeper.db` read-only and only observes (no event-log write, no synthetic
-  events, no RPC), keeping its bookkeeping outside any `KEEPER_*` path.
 
 ## Process & DB-watch invariants
 
