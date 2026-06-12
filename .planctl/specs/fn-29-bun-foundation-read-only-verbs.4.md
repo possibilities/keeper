@@ -31,5 +31,5 @@ The acceptance run is the test: scoped gate green against dist/planctl-bun (seri
 - [ ] Canonical scoped-gate invocation recorded in the Running Things tables
 
 ## Done summary
-
+Capped the epic: full scoped gate green against compiled dist/planctl-bun (serial + -n), tests/test_readonly_verbs.py green against Python, Python fast gate and full conformance green, binary boots under minimal env. Landed docs: README Requirements/Install fold-in, CLAUDE.md (AGENTS.md symlink) bun rows + polyglot authority statement.
 ## Evidence

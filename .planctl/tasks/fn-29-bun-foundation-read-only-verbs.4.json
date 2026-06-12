@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Scoped gate green and docs",
-  "updated_at": "2026-06-12T08:28:15.850721Z"
+  "updated_at": "2026-06-12T08:57:03.939287Z",
+  "worker_done_at": "2026-06-12T08:57:03.939287Z"
 }
