@@ -50,5 +50,5 @@ flow end-to-end for both branches (producer present / absent).
 - [ ] allowed-tools permits the Skill invocation
 
 ## Done summary
-
+Added a producer gate (step 6) to /babysit-init: after scaffolding the home, it checks babysitters/agents/<slug>.md and either keeps the /babysit-triage ending (producer present) or offers a plan:plan handoff with a seeded brief (producer absent), printing the copy-pasteable command on decline.
 ## Evidence
