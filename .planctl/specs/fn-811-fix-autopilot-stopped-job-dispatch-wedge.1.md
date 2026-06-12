@@ -25,5 +25,5 @@ Make occupancy liveness-aware for the `stopped` arm of the dispatch dedupe. `isO
 - [ ] test/autopilot-worker.test.ts updated incl. both new liveness cases; bun test green and bun run test:full green
 
 ## Done summary
-
+Gated the stopped arm of isOccupyingJob on read-time pane liveness (listPanes probe threaded through loadReconcileSnapshot), so a stopped-dead worker no longer wedges its task out of dispatch; working and stopped-with-live-pane rows still occupy, a null probe falls back conservatively, and folds never read liveness.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fix autopilot stopped-job dispatch wedge",
-  "updated_at": "2026-06-12T22:23:57.251000Z"
+  "updated_at": "2026-06-12T22:30:59.174000Z",
+  "worker_done_at": "2026-06-12T22:30:59.174000Z"
 }
