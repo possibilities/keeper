@@ -25,9 +25,16 @@ last_input_request_kind)` (schema v25) marks a stoppage awaiting a human
 answer to a built-in interactive tool that fires no hook of its own
 (currently `ask_user_question`, future-extensible). Both pairs paired-NULL
 together: stamped on the matching reducer fold, cleared on the next
-`UserPromptSubmit` / `SessionStart` revival (with `PreToolUse` /
-`PostToolUse` gated on the column-is-not-NULL hot-path predicate for
-`last_input_request_at`). The `killed` state is the sibling terminal state to
+`UserPromptSubmit` / `SessionStart` revival. They ALSO clear on the next
+`PreToolUse` / `PostToolUse` tool event — a tool after a stop proves the
+session resumed (the CLI internally retried the transient API error, or the
+human answered the in-tool question), so the same fold that NULLs the pair
+also un-stops the row back to `working` (`state` and `active_since` both gated
+on the literal `state = 'stopped'`, so it never resurrects an `ended`/`killed`
+row and never churns `active_since` when the subagent-suppressed api-error case
+left state at `working`). Each clear is gated on its own
+column-is-not-NULL hot-path predicate, keeping the UPDATE cold on the 50+/turn
+tool path. The `killed` state is the sibling terminal state to
 `ended`: reached not from a SessionEnd hook but from synthetic `Killed` events
 emitted by the boot seed sweep and the live exit-watcher worker, which prove a
 session's `(pid, start_time)` is gone from the OUTSIDE (SIGKILL'd,
@@ -2009,12 +2016,11 @@ row changes
 `(title, state, last_api_error_at, last_api_error_kind,
 last_input_request_at, last_input_request_kind)`, keeping the
 projection in lockstep with the session's last-known lifecycle. The
-two pairs are stamped together on `ApiError` / `InputRequest` folds
-and cleared on the next `UserPromptSubmit` / `SessionStart` revival
-(`PreToolUse` / `PostToolUse` also clear `last_input_request_*`,
-gated on the column-is-not-NULL hot-path predicate — these arms fire
-50+ times per turn so the gate keeps the UPDATE cold when nothing is
-awaiting). Each epic also embeds its plan/close-verb (epic-form)
+two stoppage pairs follow the single canonical clearing contract above
+(stamp on `ApiError` / `InputRequest`; clear + un-stop to `working` on
+the next `UserPromptSubmit` / `SessionStart` revival OR `PreToolUse` /
+`PostToolUse` tool event, each gated on its column-is-not-NULL hot-path
+predicate so the 50+/turn tool path stays cold). Each epic also embeds its plan/close-verb (epic-form)
 jobs as a `jobs` JSON array, and each task element embeds its own
 work-verb (task-form) jobs as a nested `jobs` sub-array — fanned in
 from the reducer's jobs-side writes whenever a SessionStart spawn name
@@ -2457,7 +2463,7 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; active_since (v65) is the dash AGENTS recency key, stamped to event.ts on the rising edge into 'working' (NULL on a never-prompted job); last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped together on ApiError / InputRequest folds and cleared on the next UPS/SessionStart revival — last_input_request_* also clear on PreToolUse/PostToolUse, gated):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; active_since (v65) is the dash AGENTS recency key, stamped to event.ts on the rising edge into 'working' (NULL on a never-prompted job); last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped on ApiError / InputRequest folds; both clear on the next UPS/SessionStart revival OR PreToolUse/PostToolUse tool event (gated on column-is-not-NULL), and that tool-event clear also un-stops a stopped row back to working):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, active_since, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 

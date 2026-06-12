@@ -6379,18 +6379,51 @@ function projectJobsRow(db: Database, event: Event): void {
 
     case "PreToolUse":
     case "PostToolUse": {
-      // Hot-path clear: `AskUserQuestion` fires no Pre/PostToolUse hook of its
-      // own, so the next tool the agent uses is the closest "answered" signal —
-      // zero the input-request pair. Gated on `IS NOT NULL` so the common
-      // already-NULL case is a zero-cost no-op (no stamp churn / re-fan).
-      // Paired clear; sync gated on `changes > 0`.
+      // Hot-path clear + un-stop for the api-error pair: a tool event after an
+      // ApiError/RateLimited stamp proves the CLI resumed (it internally retried
+      // the transient failure), so the board must not keep showing `[failed:*]`
+      // / `[::stopped]` on a worker that is actually running. Zero the pair AND
+      // un-stop the row in ONE statement: one write, one `changes > 0`, one
+      // fan-out. Gated on `IS NOT NULL` so the common already-NULL case is a
+      // zero-cost no-op (no stamp churn / re-fan). Both state and active_since
+      // gate on the literal `'stopped'`, NOT the UserPromptSubmit arm's
+      // `!= 'working'` predicate: the narrow gate can never resurrect an
+      // `ended`/`killed` row (a terminal row with a stale pair gets its pair
+      // cleared, state untouched), and in the subagent-suppressed case (pair
+      // stamped while state stayed `working`) it leaves active_since untouched so
+      // the dash timeline sort key does not churn on every tool event. SQLite
+      // evaluates all SET right-hand sides against the pre-UPDATE row, so both
+      // CASEs read the same old state. active_since stamps to `event.ts` only on
+      // the genuine stopped→working rising edge (mirrors the UPS arm's mechanics).
+      const resApi = db.run(
+        `UPDATE jobs SET last_api_error_at = NULL,
+                         last_api_error_kind = NULL,
+                         state = CASE WHEN state = 'stopped' THEN 'working' ELSE state END,
+                         active_since = CASE WHEN state = 'stopped' THEN ? ELSE active_since END,
+                         last_event_id = ?,
+                         updated_at = ?
+           WHERE job_id = ? AND last_api_error_at IS NOT NULL`,
+        [ts, event.id, ts, jobId],
+      );
+      if (resApi.changes > 0) {
+        syncIfPlanRef(db, jobId, event.id, ts);
+      }
+      // Hot-path clear + un-stop for the input-request pair: `AskUserQuestion`
+      // fires no Pre/PostToolUse hook of its own, so the next tool the agent uses
+      // is the closest "answered" signal — zero the pair AND un-stop the row
+      // (the human answered, the session resumed). Same single-statement
+      // clear+un-stop shape as the api-error arm above, same literal-`'stopped'`
+      // gate on both CASEs. Gated on `IS NOT NULL`; paired clear; sync gated on
+      // `changes > 0`.
       const res = db.run(
         `UPDATE jobs SET last_input_request_at = NULL,
                          last_input_request_kind = NULL,
+                         state = CASE WHEN state = 'stopped' THEN 'working' ELSE state END,
+                         active_since = CASE WHEN state = 'stopped' THEN ? ELSE active_since END,
                          last_event_id = ?,
                          updated_at = ?
            WHERE job_id = ? AND last_input_request_at IS NOT NULL`,
-        [event.id, ts, jobId],
+        [ts, event.id, ts, jobId],
       );
       if (res.changes > 0) {
         syncIfPlanRef(db, jobId, event.id, ts);
@@ -6399,7 +6432,11 @@ function projectJobsRow(db: Database, event: Event): void {
       // "permission dialog dismissed" hook exists, so the clear is inferred from
       // the next downstream tool (both Pre and Post, to close the narrow window
       // where the worker fires its next tool before keeper sees a PostToolUse).
-      // Same gate / paired-NULL / `changes > 0` discipline as above.
+      // Same gate / paired-NULL / `changes > 0` discipline as above — but NO
+      // un-stop: the permission-prompt stamp arm (Notification) never flips
+      // `state` (the `[awaiting:…]` pill layers on top of the live state), so
+      // there is no `stopped` to un-stop. Do not "fix" this into a fourth
+      // un-stop.
       const resPP = db.run(
         `UPDATE jobs SET last_permission_prompt_at = NULL,
                          last_permission_prompt_kind = NULL,

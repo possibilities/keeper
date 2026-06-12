@@ -5124,6 +5124,9 @@ test("InputRequest clear arms: PreToolUse + PostToolUse clear the pair (gated on
   expect(
     getInputRequestState("sess-ir-pre")?.last_input_request_kind,
   ).toBeNull();
+  // fn-808: the clear UPDATE also un-stops the row — a tool event proves the
+  // human answered and the session resumed.
+  expect(getInputRequestState("sess-ir-pre")?.state).toBe("working");
 
   // PostToolUse arm: blocked → PostToolUse clears.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-post" });
@@ -5149,6 +5152,8 @@ test("InputRequest clear arms: PreToolUse + PostToolUse clear the pair (gated on
   expect(
     getInputRequestState("sess-ir-post")?.last_input_request_kind,
   ).toBeNull();
+  // fn-808: PostToolUse un-stops the row too.
+  expect(getInputRequestState("sess-ir-post")?.state).toBe("working");
 });
 
 test("InputRequest clear gate: PreToolUse/PostToolUse on a session with last_input_request_at IS NULL does NOT touch jobs (no last_event_id bump)", () => {
@@ -5258,6 +5263,355 @@ test("syncJobLinksOnJobWrite: InputRequest stamp propagates to epics.job_links; 
   expect(revived?.state).toBe("working");
   expect(revived?.last_input_request_at).toBeNull();
   expect(revived?.last_input_request_kind).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// Pre/PostToolUse api-error clear + un-stop family (fn-808 task .1)
+//
+// A tool event after an ApiError/RateLimited or InputRequest stop proves the
+// session resumed (CLI retried the transient error / human answered the
+// question), so the Pre/PostToolUse fold clears the annotation pair AND
+// un-stops the row back to `working` — the board never shows a dead/failed
+// worker that is actually running.
+// ---------------------------------------------------------------------------
+
+/**
+ * Read just `state` + the api-error pair + active_since off a jobs row by id.
+ * Parallel to the v25 `getInputRequestState` helper; none existed for the
+ * api-error pair before fn-808.
+ */
+function getApiErrorState(jobId: string): {
+  state: string;
+  last_api_error_at: number | null;
+  last_api_error_kind: string | null;
+  active_since: number | null;
+} | null {
+  return db
+    .query(
+      "SELECT state, last_api_error_at, last_api_error_kind, active_since FROM jobs WHERE job_id = ?",
+    )
+    .get(jobId) as {
+    state: string;
+    last_api_error_at: number | null;
+    last_api_error_kind: string | null;
+    active_since: number | null;
+  } | null;
+}
+
+test("ApiError stale-stop → tool event un-stops to 'working', clears the pair, stamps active_since", () => {
+  // Matrix item 1: a transient ApiError flips the row to 'stopped' and stamps
+  // the (at, kind) pair; the next tool event proves the CLI resumed, so the
+  // Pre/PostToolUse fold un-stops the row to 'working', NULLs the pair, and
+  // stamps active_since to the tool-event ts (the genuine stopped→working
+  // rising edge).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ae-unstop" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ae-unstop" });
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-ae-unstop",
+    data: JSON.stringify({ kind: "server_error" }),
+  });
+  drainAll();
+  const stopped = getApiErrorState("sess-ae-unstop");
+  expect(stopped?.state).toBe("stopped");
+  expect(stopped?.last_api_error_at).not.toBeNull();
+  expect(stopped?.last_api_error_kind).toBe("server_error");
+
+  const toolId = insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ae-unstop",
+  });
+  drainAll();
+  const resumed = getApiErrorState("sess-ae-unstop");
+  expect(resumed?.state).toBe("working");
+  expect(resumed?.last_api_error_at).toBeNull();
+  expect(resumed?.last_api_error_kind).toBeNull();
+  // active_since stamped to the tool-event ts on the stopped→working edge.
+  const toolTs = (
+    db.query("SELECT ts FROM events WHERE id = ?").get(toolId) as { ts: number }
+  ).ts;
+  expect(resumed?.active_since).toBe(toolTs);
+});
+
+test("RateLimited (legacy alias) stale-stop → tool event un-stops to 'working', clears the pair", () => {
+  // Matrix item 2: the legacy `RateLimited` arm folds kind='rate_limit' onto
+  // the same api-error pair as `ApiError`. A tool event un-stops it identically
+  // — keeping the RateLimited/ApiError fold-equivalence honest across the new
+  // clear arm too. PostToolUse this time (both Pre and Post drive the clear).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-rl-unstop" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-rl-unstop" });
+  insertEvent({ hook_event: "RateLimited", session_id: "sess-rl-unstop" });
+  drainAll();
+  const stopped = getApiErrorState("sess-rl-unstop");
+  expect(stopped?.state).toBe("stopped");
+  expect(stopped?.last_api_error_kind).toBe("rate_limit");
+
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-rl-unstop",
+  });
+  drainAll();
+  const resumed = getApiErrorState("sess-rl-unstop");
+  expect(resumed?.state).toBe("working");
+  expect(resumed?.last_api_error_at).toBeNull();
+  expect(resumed?.last_api_error_kind).toBeNull();
+});
+
+test("Subagent-suppressed api-error: pair stamped while state stayed 'working' → tool event clears pair, leaves state + active_since untouched", () => {
+  // Matrix item 3: the ApiError arm suppresses the state flip while a subagent
+  // is running (parent isn't making API calls while it waits on a sub) but
+  // stamps the pair unconditionally. So the row carries the pair while state
+  // stayed 'working'. The new clear's literal-'stopped' gate is load-bearing:
+  // it NULLs the pair but, because state is NOT 'stopped', leaves both state
+  // AND active_since untouched — the dash timeline sort key must not churn on
+  // every tool event in this case.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ae-sub" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ae-sub" });
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: "sess-ae-sub",
+    agent_id: "sub-ae",
+    agent_type: "Explore",
+  });
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-ae-sub",
+    data: JSON.stringify({ kind: "server_error" }),
+  });
+  drainAll();
+  const stamped = getApiErrorState("sess-ae-sub");
+  // Pair stamped, but state stayed 'working' (sub-agent suppression).
+  expect(stamped?.state).toBe("working");
+  expect(stamped?.last_api_error_at).not.toBeNull();
+  expect(stamped?.last_api_error_kind).toBe("server_error");
+  const activeSinceBefore = stamped?.active_since;
+
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ae-sub",
+  });
+  drainAll();
+  const cleared = getApiErrorState("sess-ae-sub");
+  // Pair cleared, but state stays 'working' and active_since is UNCHANGED —
+  // there was no stopped→working edge to stamp.
+  expect(cleared?.state).toBe("working");
+  expect(cleared?.last_api_error_at).toBeNull();
+  expect(cleared?.last_api_error_kind).toBeNull();
+  expect(cleared?.active_since).toBe(activeSinceBefore ?? null);
+});
+
+test("InputRequest stale-stop → tool event un-stops to 'working' (state now follows the pair clear)", () => {
+  // Matrix item 4: the input-request clear already NULLed the pair on a tool
+  // event (covered above); fn-808 folds the un-stop INTO that same UPDATE so
+  // state follows. A human-answered question resumes the session.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ir-unstop" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ir-unstop" });
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-ir-unstop",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  expect(getInputRequestState("sess-ir-unstop")?.state).toBe("stopped");
+
+  const toolId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ir-unstop",
+  });
+  drainAll();
+  const resumed = getInputRequestState("sess-ir-unstop");
+  expect(resumed?.state).toBe("working");
+  expect(resumed?.last_input_request_at).toBeNull();
+  expect(resumed?.last_input_request_kind).toBeNull();
+  // active_since stamped to the tool-event ts on the stopped→working edge.
+  const toolTs = (
+    db.query("SELECT ts FROM events WHERE id = ?").get(toolId) as { ts: number }
+  ).ts;
+  const activeSince = (
+    db
+      .query("SELECT active_since FROM jobs WHERE job_id = ?")
+      .get("sess-ir-unstop") as { active_since: number | null }
+  ).active_since;
+  expect(activeSince).toBe(toolTs);
+});
+
+test("Terminal guard: killed row with a stale api-error pair → tool event clears the pair, state stays 'killed'", () => {
+  // Matrix item 5: the literal-'stopped' un-stop gate can NEVER resurrect a
+  // terminal row. A killed row carrying a stale api-error pair gets its pair
+  // cleared on the next tool event, but state stays 'killed' (it is not
+  // 'stopped', so the CASE is a no-op). This is the terminal-row guard rail.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ae-killed" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ae-killed" });
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-ae-killed",
+    data: JSON.stringify({ kind: "server_error" }),
+  });
+  // Kill the row while the pair is stamped (Killed forces state='killed';
+  // the api-error pair stays on the row — Killed does not clear it).
+  killedEvent(4242, null, "sess-ae-killed");
+  drainAll();
+  const killed = getApiErrorState("sess-ae-killed");
+  expect(killed?.state).toBe("killed");
+  expect(killed?.last_api_error_at).not.toBeNull();
+  const activeSinceBefore = killed?.active_since;
+
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ae-killed",
+  });
+  drainAll();
+  const cleared = getApiErrorState("sess-ae-killed");
+  // Pair cleared; state stays 'killed'; active_since untouched (no edge).
+  expect(cleared?.state).toBe("killed");
+  expect(cleared?.last_api_error_at).toBeNull();
+  expect(cleared?.last_api_error_kind).toBeNull();
+  expect(cleared?.active_since).toBe(activeSinceBefore ?? null);
+});
+
+test("api-error clear gate: PreToolUse/PostToolUse on a session with last_api_error_at IS NULL does NOT touch jobs (no last_event_id bump)", () => {
+  // Matrix item 6 (mirror of the input-request no-op gate test): with both
+  // pairs NULL, neither clear arm fires, so jobs.last_event_id must NOT advance
+  // past the pre-tool-call snapshot. Pins the `IS NOT NULL` gate that keeps the
+  // UPDATE cold on the 50+/turn tool-event path.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ae-gate" });
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-ae-gate" });
+  drainAll();
+  const before = db
+    .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+    .get("sess-ae-gate") as { last_event_id: number };
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ae-gate",
+  });
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ae-gate",
+  });
+  drainAll();
+  const after = db
+    .query("SELECT last_event_id FROM jobs WHERE job_id = ?")
+    .get("sess-ae-gate") as { last_event_id: number };
+  expect(after.last_event_id).toBe(before.last_event_id);
+});
+
+test("api-error un-stop re-fold determinism: rewind-and-redrain reproduces byte-identical jobs row (stamp→stop→tool→working)", () => {
+  // Matrix item 7 (CLAUDE.md byte-identical re-fold invariant): a from-scratch
+  // re-fold of the stamp→stop→tool→working sequence must reproduce the jobs row
+  // byte-for-byte. Exercises both the ApiError stamp arm and the new
+  // Pre/PostToolUse clear+un-stop arm on re-fold.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-ae-redrain" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-ae-redrain",
+  });
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-ae-redrain",
+    data: JSON.stringify({ kind: "server_error" }),
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-ae-redrain",
+  });
+  drainAll();
+  const before = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-ae-redrain");
+  expect(before).not.toBeNull();
+  // Sanity: the sequence really did un-stop the row.
+  expect((before as { state: string }).state).toBe("working");
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-ae-redrain");
+  expect(after).toEqual(before);
+});
+
+test("both pairs set on one row → one tool event un-stops via the first UPDATE, second UPDATE no-ops (deterministic)", () => {
+  // Risk-note coverage: if both the api-error and input-request pairs are set
+  // on a 'stopped' row, ONE tool event fires both clear UPDATEs in fixed
+  // statement order — the first un-stops + stamps active_since, the second's
+  // CASEs see state already 'working' and no-op on state/active_since. Both
+  // pairs end NULL; re-fold must reproduce it. The api-error arm runs first.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-both-pairs" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-both-pairs",
+  });
+  insertEvent({
+    hook_event: "ApiError",
+    session_id: "sess-both-pairs",
+    data: JSON.stringify({ kind: "server_error" }),
+  });
+  // A second stop event stamps the input-request pair on the same (now
+  // 'stopped') row — the terminal guard lets it through (state is 'stopped',
+  // not ended/killed), so both pairs co-exist.
+  insertEvent({
+    hook_event: "InputRequest",
+    session_id: "sess-both-pairs",
+    data: JSON.stringify({ kind: "ask_user_question" }),
+  });
+  drainAll();
+  const stopped = db
+    .query(
+      "SELECT state, last_api_error_at, last_input_request_at FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-both-pairs") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_input_request_at: number | null;
+  };
+  expect(stopped.state).toBe("stopped");
+  expect(stopped.last_api_error_at).not.toBeNull();
+  expect(stopped.last_input_request_at).not.toBeNull();
+
+  const toolId = insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: "sess-both-pairs",
+  });
+  drainAll();
+  const resumed = db
+    .query(
+      "SELECT state, last_api_error_at, last_input_request_at, active_since FROM jobs WHERE job_id = ?",
+    )
+    .get("sess-both-pairs") as {
+    state: string;
+    last_api_error_at: number | null;
+    last_input_request_at: number | null;
+    active_since: number | null;
+  };
+  expect(resumed.state).toBe("working");
+  expect(resumed.last_api_error_at).toBeNull();
+  expect(resumed.last_input_request_at).toBeNull();
+  const toolTs = (
+    db.query("SELECT ts FROM events WHERE id = ?").get(toolId) as { ts: number }
+  ).ts;
+  expect(resumed.active_since).toBe(toolTs);
+
+  // Re-fold determinism over the both-pairs sequence.
+  const before = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-both-pairs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  drainAll();
+  const refolded = db
+    .query("SELECT * FROM jobs WHERE job_id = ?")
+    .get("sess-both-pairs");
+  expect(refolded).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------
