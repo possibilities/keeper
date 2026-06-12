@@ -1,0 +1,364 @@
+// Unit tests for plugin/hooks/stop-guard.ts.
+//
+// Two layers: (1) the pure classifiers — the close typed-stop allow patterns and
+// the work/close block reason wording — exercised in-process; (2) the decision
+// ladder driven through a real subprocess against a temp HOME and a planctl shim
+// on PATH, so the hot-path short-circuit, the work reconcile block/allow paths,
+// and the lenient close branch are covered with the true stdin/stdout
+// discipline. The shim touches a sentinel on every call, letting us assert "zero
+// planctl subprocesses" for the no-marker hot path and the close branch.
+
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+
+import {
+  closeBlockReason,
+  closeStopAllowed,
+  workBlockReason,
+} from "../plugin/hooks/stop-guard.ts";
+
+describe("closeStopAllowed", () => {
+  const allowed: [string, string][] = [
+    [
+      "BLOCKED: line-start escalation",
+      "BLOCKED: TOOLING_FAILURE — auditor down",
+    ],
+    [
+      "BLOCKED: after a leading newline (multiline)",
+      "Some preamble.\n  BLOCKED: TOOLING_FAILURE",
+    ],
+    ["QUESTION: relay", "QUESTION: should the schema bump major?"],
+    [
+      "surfaced typed-error envelope",
+      'Surfacing verbatim: {"success": false, "error": {"code": "STALE_ARTIFACTS"}}',
+    ],
+    [
+      "fatal-halt report",
+      "Halted `fn-1-x`. fatal finding: data loss. epic NOT closed.",
+    ],
+    [
+      "partial-followup surface",
+      "Partial follow-up for `fn-1-x` (expected 3 tasks, found 1).",
+    ],
+  ];
+  for (const [label, message] of allowed) {
+    test(`allows: ${label}`, () => {
+      expect(closeStopAllowed(message)).toBe(true);
+    });
+  }
+
+  const denied: [string, unknown][] = [
+    ["a bare mid-saga stop", "Closed the audit phase, agents returned."],
+    [
+      "blocked mid-line is not a typed return",
+      "The work is blocked: but this is prose, lowercase too",
+    ],
+    ["empty string", ""],
+    ["non-string content", { foo: "bar" }],
+    ["undefined", undefined],
+  ];
+  for (const [label, message] of denied) {
+    test(`denies: ${label}`, () => {
+      expect(closeStopAllowed(message)).toBe(false);
+    });
+  }
+});
+
+describe("workBlockReason", () => {
+  test("names the task, the verdict, and the resume ladder", () => {
+    const reason = workBlockReason("fn-1-x.2", "in_progress_uncommitted");
+    expect(reason).toContain("fn-1-x.2");
+    expect(reason).toContain("in_progress_uncommitted");
+    expect(reason).toContain("planctl worker resume fn-1-x.2");
+    expect(reason).toContain("never edit or commit");
+  });
+});
+
+describe("closeBlockReason", () => {
+  test("names the epic, the finalize call, and the no-commit rule", () => {
+    const reason = closeBlockReason("fn-1-x");
+    expect(reason).toContain("fn-1-x");
+    expect(reason).toContain("close-finalize fn-1-x --project");
+    expect(reason).toContain("Never write or commit");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// decision ladder — subprocess, temp HOME + planctl shim on PATH
+// ---------------------------------------------------------------------------
+
+const GUARD = join(import.meta.dir, "..", "plugin", "hooks", "stop-guard.ts");
+
+let home: string;
+let sessionsDir: string;
+let binDir: string;
+let sentinel: string;
+
+beforeEach(() => {
+  home = mkdtempSync(join(tmpdir(), "planctl-stop-guard-"));
+  sessionsDir = join(home, ".local", "state", "planctl", "sessions");
+  mkdirSync(sessionsDir, { recursive: true });
+  binDir = join(home, "bin");
+  mkdirSync(binDir, { recursive: true });
+  sentinel = join(home, "planctl-called");
+});
+
+afterEach(() => {
+  rmSync(home, { recursive: true, force: true });
+});
+
+const SESSION = "sess-stop";
+
+function markerPath(): string {
+  return join(sessionsDir, `${SESSION}.json`);
+}
+
+function writeWorkMarker(taskId: string): void {
+  writeFileSync(
+    markerPath(),
+    JSON.stringify({
+      schema_version: 1,
+      session_id: SESSION,
+      kind: "work",
+      task_id: taskId,
+      created_at: "2026-06-11T00:00:00Z",
+    }),
+    "utf-8",
+  );
+}
+
+function writeCloseMarker(epicId: string): void {
+  writeFileSync(
+    markerPath(),
+    JSON.stringify({
+      schema_version: 1,
+      session_id: SESSION,
+      kind: "close",
+      epic_id: epicId,
+      created_at: "2026-06-11T00:00:00Z",
+    }),
+    "utf-8",
+  );
+}
+
+function writePlanctlShim(envelope: unknown, exitCode = 0): void {
+  const shim = join(binDir, "planctl");
+  writeFileSync(
+    shim,
+    `#!/usr/bin/env bun\n` +
+      `import { writeFileSync } from "node:fs";\n` +
+      `writeFileSync(${JSON.stringify(sentinel)}, "1");\n` +
+      `process.stdout.write(${JSON.stringify(`${JSON.stringify(envelope)}\n`)});\n` +
+      `process.exit(${exitCode});\n`,
+    "utf-8",
+  );
+  chmodSync(shim, 0o755);
+}
+
+async function run(
+  payload: unknown,
+  extraEnv: Record<string, string> = {},
+): Promise<{ stdout: string; code: number; planctlCalled: boolean }> {
+  const proc = Bun.spawn(["bun", GUARD], {
+    stdin: "pipe",
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      HOME: home,
+      PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      ...extraEnv,
+    },
+  });
+  proc.stdin.write(JSON.stringify(payload));
+  await proc.stdin.end();
+  const stdout = await new Response(proc.stdout).text();
+  const code = await proc.exited;
+  return { stdout, code, planctlCalled: existsSync(sentinel) };
+}
+
+function stopPayload(extra: Record<string, unknown> = {}): unknown {
+  return {
+    hook_event_name: "Stop",
+    session_id: SESSION,
+    stop_hook_active: false,
+    ...extra,
+  };
+}
+
+describe("stop-guard ladder", () => {
+  test("no marker → allow with zero planctl calls (hot path)", async () => {
+    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+
+    const { stdout, code, planctlCalled } = await run(stopPayload());
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+    expect(planctlCalled).toBe(false);
+  });
+
+  test("bypass allows before any I/O — no planctl call", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+
+    const { stdout, planctlCalled } = await run(stopPayload(), {
+      PLANCTL_GUARD_BYPASS: "1",
+    });
+    expect(stdout).toBe("");
+    expect(planctlCalled).toBe(false);
+  });
+
+  test("stop_hook_active true allows before any I/O (block-once)", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+
+    const { stdout, planctlCalled } = await run(
+      stopPayload({ stop_hook_active: true }),
+    );
+    expect(stdout).toBe("");
+    expect(planctlCalled).toBe(false);
+  });
+
+  // --- work branch ---------------------------------------------------------
+
+  test("work marker + in_progress_uncommitted → block with the checklist", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanctlShim({ verdict: "in_progress_uncommitted" });
+
+    const { stdout, code } = await run(stopPayload());
+    expect(code).toBe(0);
+    const env = JSON.parse(stdout.trim());
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("fn-1-x.2");
+    expect(env.reason).toContain("not finished");
+    expect(env.reason).toContain("planctl worker resume fn-1-x.2");
+  });
+
+  test("work marker + done → allow AND unlink the stale marker", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanctlShim({ verdict: "done" });
+
+    const { stdout } = await run(stopPayload());
+    expect(stdout).toBe("");
+    expect(existsSync(markerPath())).toBe(false);
+  });
+
+  test("work marker + blocked → allow AND unlink the stale marker", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanctlShim({ verdict: "blocked" });
+
+    const { stdout } = await run(stopPayload());
+    expect(stdout).toBe("");
+    expect(existsSync(markerPath())).toBe(false);
+  });
+
+  test("work marker + tooling_error → allow (fail open)", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanctlShim({ verdict: "tooling_error" });
+
+    const { stdout } = await run(stopPayload());
+    expect(stdout).toBe("");
+  });
+
+  test("work marker + typed-error envelope (no verdict key) → allow", async () => {
+    writeWorkMarker("fn-1-x.2");
+    writePlanctlShim({ success: false, error: "task_not_found" }, 1);
+
+    const { stdout } = await run(stopPayload());
+    expect(stdout).toBe("");
+  });
+
+  // --- close branch --------------------------------------------------------
+
+  test("close marker + bare mid-saga stop → block with the mid-saga reason", async () => {
+    writeCloseMarker("fn-1-x");
+    writePlanctlShim({ verdict: "ignored" });
+
+    const { stdout, planctlCalled } = await run(
+      stopPayload({
+        last_assistant_message: "Audit phase done, agents returned.",
+      }),
+    );
+    const env = JSON.parse(stdout.trim());
+    expect(env.decision).toBe("block");
+    expect(env.reason).toContain("fn-1-x");
+    expect(env.reason).toContain("mid-saga");
+    // The close branch never calls reconcile — its decision is message-only.
+    expect(planctlCalled).toBe(false);
+  });
+
+  test("close marker + BLOCKED: last message → allow", async () => {
+    writeCloseMarker("fn-1-x");
+    const { stdout } = await run(
+      stopPayload({
+        last_assistant_message:
+          "BLOCKED: TOOLING_FAILURE — auditor unreachable",
+      }),
+    );
+    expect(stdout).toBe("");
+  });
+
+  test("close marker + QUESTION: last message → allow", async () => {
+    writeCloseMarker("fn-1-x");
+    const { stdout } = await run(
+      stopPayload({ last_assistant_message: "QUESTION: bump major?" }),
+    );
+    expect(stdout).toBe("");
+  });
+
+  test("close marker + typed-error envelope surface → allow", async () => {
+    writeCloseMarker("fn-1-x");
+    const { stdout } = await run(
+      stopPayload({
+        last_assistant_message:
+          'Surfacing: {"success": false, "error": {"code": "STALE_ARTIFACTS"}}',
+      }),
+    );
+    expect(stdout).toBe("");
+  });
+
+  test("close marker + fatal-halt report → allow", async () => {
+    writeCloseMarker("fn-1-x");
+    const { stdout } = await run(
+      stopPayload({
+        last_assistant_message:
+          "Halted `fn-1-x`. fatal finding: x. epic NOT closed.",
+      }),
+    );
+    expect(stdout).toBe("");
+  });
+
+  test("close marker + partial-followup surface → allow", async () => {
+    writeCloseMarker("fn-1-x");
+    const { stdout } = await run(
+      stopPayload({
+        last_assistant_message:
+          "Partial follow-up for `fn-1-x` (expected 3, found 1).",
+      }),
+    );
+    expect(stdout).toBe("");
+  });
+
+  test("unparseable stdin fails open", async () => {
+    const proc = Bun.spawn(["bun", GUARD], {
+      stdin: "pipe",
+      stdout: "pipe",
+      stderr: "pipe",
+      env: { ...process.env, HOME: home },
+    });
+    proc.stdin.write("{not json");
+    await proc.stdin.end();
+    const stdout = await new Response(proc.stdout).text();
+    const code = await proc.exited;
+    expect(code).toBe(0);
+    expect(stdout).toBe("");
+  });
+});
