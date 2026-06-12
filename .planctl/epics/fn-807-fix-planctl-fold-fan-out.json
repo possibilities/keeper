@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-12T14:35:44.039231Z",
+  "depends_on_epics": [],
+  "id": "fn-807-fix-planctl-fold-fan-out",
+  "last_validated_at": "2026-06-12T14:35:44.072510Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Fix planctl fold fan-out",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-12T14:35:44.039231Z"
+}
