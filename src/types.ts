@@ -595,6 +595,34 @@ export interface SubagentInvocation {
 }
 
 /**
+ * One row of the `scheduled_tasks` peer-table projection, folded from the
+ * `CronCreate` / `CronDelete` `PostToolUse` pair a Claude session arms.
+ *
+ * Composite primary key `(job_id, cron_id)`; `job_id` is the arming session id,
+ * `cron_id` the harness-minted cron handle. CronCreate upserts a `'active'` row
+ * (a re-created id resurrects); CronDelete flips the matching row to
+ * `'deleted'`. `recurring` / `durable` are INTEGER 0/1 lifts of the payload's
+ * booleans. `human_schedule` is the payload's pre-rendered display form (no
+ * cron-string parsing); `prompt_summary` is the deterministically truncated
+ * first prompt line. Wall-clock spent/expired marking is renderer-side only —
+ * the fold derives `status` purely from event order. `last_event_id` bumps on
+ * every write to drive the wire diff.
+ */
+export interface ScheduledTask {
+  job_id: string;
+  cron_id: string;
+  cron: string;
+  human_schedule: string;
+  recurring: number;
+  durable: number;
+  prompt_summary: string;
+  status: "active" | "deleted";
+  ts: number;
+  last_event_id: number;
+  updated_at: number;
+}
+
+/**
  * One row of the `epics` projection. `epic_id` is the planctl epic id (pk).
  * The reducer folds synthetic `EpicSnapshot` events into this table via
  * idempotent upsert; columns are nullable matching the zero-event reading.

@@ -261,6 +261,11 @@ from pathlib import Path
 # instead of re-scanning every ``Commit`` blob per swept session. keeper-py reads
 # no ``commit_trailer_facts`` row (the TUI subscribes over the socket), so no
 # reader logic changes — only the version whitelist gains 67.
+#
+# v68 (fn-813 task .1) adds the ``scheduled_tasks`` reducer projection folding
+# the ``CronCreate`` / ``CronDelete`` PostToolUse pair into a per-job cron side
+# table. keeper-py reads no ``scheduled_tasks`` row (the TUI subscribes over the
+# socket), so no reader logic changes — only the version whitelist gains 68.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -300,6 +305,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         65,
         66,
         67,
+        68,
     }
 )
 

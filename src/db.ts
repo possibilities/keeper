@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 67;
+export const SCHEMA_VERSION = 68;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -509,6 +509,34 @@ CREATE TABLE IF NOT EXISTS subagent_invocations (
 
 const CREATE_SUBAGENT_INVOCATIONS_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_subagent_invocations_job ON subagent_invocations(job_id)",
+];
+
+/**
+ * `scheduled_tasks` projection table (schema v68 / fn-813). One row per cron a
+ * Claude session armed via `CronCreate`, keyed `(job_id, cron_id)`. Folded from
+ * the `CronCreate` / `CronDelete` `PostToolUse` pair; `CREATE TABLE IF NOT
+ * EXISTS` is idempotent so no version guard (v57 `event_blobs` precedent).
+ * Defaults match the zero-event projection.
+ */
+const CREATE_SCHEDULED_TASKS = `
+CREATE TABLE IF NOT EXISTS scheduled_tasks (
+    job_id TEXT NOT NULL,
+    cron_id TEXT NOT NULL,
+    cron TEXT NOT NULL DEFAULT '',
+    human_schedule TEXT NOT NULL DEFAULT '',
+    recurring INTEGER NOT NULL DEFAULT 0,
+    durable INTEGER NOT NULL DEFAULT 0,
+    prompt_summary TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    ts REAL NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (job_id, cron_id)
+)
+`;
+
+const CREATE_SCHEDULED_TASKS_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_scheduled_tasks_job ON scheduled_tasks(job_id)",
 ];
 
 /**
@@ -1518,6 +1546,10 @@ function migrate(db: Database): void {
       db.run(CREATE_EPIC_TOMBSTONES);
       db.run(CREATE_EVENT_BLOBS);
       for (const sql of CREATE_EVENT_BLOBS_INDEXES) {
+        db.run(sql);
+      }
+      db.run(CREATE_SCHEDULED_TASKS);
+      for (const sql of CREATE_SCHEDULED_TASKS_INDEXES) {
         db.run(sql);
       }
 

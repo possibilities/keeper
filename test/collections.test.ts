@@ -25,6 +25,7 @@ import {
   JOBS_DESCRIPTOR,
   PENDING_DISPATCHES_DESCRIPTOR,
   PROFILES_DESCRIPTOR,
+  SCHEDULED_TASKS_DESCRIPTOR,
   selectByIdsChunked,
   selectVersionsByIds,
   selectVersionsByIdsChunked,
@@ -1126,5 +1127,106 @@ test("dead_letters defaultFilter: recovered rows excluded from default runQuery 
   );
   expect(res2.total).toBe(1);
   expect(String(res2.rows[0]?.dl_id)).toBe("dl-recv-1");
+  db.close();
+});
+
+test("getCollection resolves the scheduled_tasks collection (schema v68, fn-813)", () => {
+  // Schema v68 (epic fn-813 task .1): the jobs-TUI expanded-row cron detail
+  // surface. One row per cron a session armed via CronCreate, keyed by the
+  // composite SQL key (job_id, cron_id) but wire-identified by job_id.
+  expect(getCollection("scheduled_tasks")).toBe(SCHEDULED_TASKS_DESCRIPTOR);
+  expect(SCHEDULED_TASKS_DESCRIPTOR.table).toBe("scheduled_tasks");
+  // Wire pk is job_id (single column) even though the SQL key is composite —
+  // every subscribe filters by job_id; cron_id rides in columns for display.
+  expect(SCHEDULED_TASKS_DESCRIPTOR.pk).toBe("job_id");
+  expect(SCHEDULED_TASKS_DESCRIPTOR.version).toBe("last_event_id");
+  expect(SCHEDULED_TASKS_DESCRIPTOR.filters.job_id).toBe("job_id");
+  expect(SCHEDULED_TASKS_DESCRIPTOR.defaultSort).toEqual({
+    column: "ts",
+    dir: "asc",
+  });
+  // No JSON-decoded columns — every persisted field is a scalar.
+  expect(SCHEDULED_TASKS_DESCRIPTOR.jsonColumns.size).toBe(0);
+  // cron_id must ride in columns or the client (reading state.rows) collapses
+  // every job's crons to one — the composite-key/single-pk contract.
+  expect(SCHEDULED_TASKS_DESCRIPTOR.columns).toContain("cron_id");
+  for (const col of [
+    "job_id",
+    "cron_id",
+    "cron",
+    "human_schedule",
+    "recurring",
+    "durable",
+    "prompt_summary",
+    "status",
+    "ts",
+    "last_event_id",
+  ]) {
+    expect(SCHEDULED_TASKS_DESCRIPTOR.columns).toContain(col);
+  }
+  expect(SCHEDULED_TASKS_DESCRIPTOR.defaultFilter).toBeUndefined();
+  expect(SCHEDULED_TASKS_DESCRIPTOR.defaultClause).toBeUndefined();
+});
+
+test("runQuery pages a seeded scheduled_tasks row filtered by job_id (schema v68, fn-813)", () => {
+  // Hand-insert rows for two jobs (no reducer needed — the descriptor +
+  // runQuery filter path is the unit under test). The job_id filter must
+  // narrow to the one job's crons, versioned on last_event_id.
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  db.query(
+    `INSERT INTO scheduled_tasks (
+       job_id, cron_id, cron, human_schedule, recurring, durable,
+       prompt_summary, status, ts, last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "sess-x",
+    "cron-1",
+    "0 * * * *",
+    "Every hour",
+    1,
+    0,
+    "do x",
+    "active",
+    100.0,
+    7,
+    100.0,
+  );
+  db.query(
+    `INSERT INTO scheduled_tasks (
+       job_id, cron_id, cron, human_schedule, recurring, durable,
+       prompt_summary, status, ts, last_event_id, updated_at
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(
+    "sess-y",
+    "cron-2",
+    "0 9 * * *",
+    "Daily",
+    1,
+    1,
+    "do y",
+    "active",
+    200.0,
+    9,
+    200.0,
+  );
+  const res = asResult(
+    runQuery(db, 9, {
+      type: "query",
+      collection: "scheduled_tasks",
+      filter: { job_id: "sess-x" },
+    }),
+  );
+  expect(res.total).toBe(1);
+  const row = res.rows[0];
+  if (row == null) throw new Error("expected one scheduled_tasks row");
+  expect(row.job_id).toBe("sess-x");
+  expect(row.cron_id).toBe("cron-1");
+  expect(row.human_schedule).toBe("Every hour");
+  expect(row.recurring).toBe(1);
+  expect(row.last_event_id).toBe(7);
+  // Served columns match the descriptor's column list.
+  expect(Object.keys(row).sort()).toEqual(
+    [...SCHEDULED_TASKS_DESCRIPTOR.columns].sort(),
+  );
   db.close();
 });

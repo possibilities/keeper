@@ -4484,3 +4484,219 @@ test("builds is re-fold deterministic: rewind + DELETE + re-drain reproduces it 
     .all() as unknown[];
   expect(after).toEqual(before);
 });
+
+// ---------------------------------------------------------------------------
+// Schema v68 (fn-813): scheduled_tasks projection from CronCreate/CronDelete
+// ---------------------------------------------------------------------------
+
+interface ScheduledTaskRow {
+  job_id: string;
+  cron_id: string;
+  cron: string;
+  human_schedule: string;
+  recurring: number;
+  durable: number;
+  prompt_summary: string;
+  status: string;
+  ts: number;
+  last_event_id: number;
+  updated_at: number;
+}
+
+/** Insert a CronCreate PostToolUse event with the live payload shape. */
+function cronCreateEvent(
+  cronId: string,
+  opts: {
+    session_id?: string;
+    cron?: string;
+    humanSchedule?: string;
+    recurring?: boolean;
+    durable?: boolean;
+    prompt?: string;
+    hook_event?: string;
+  } = {},
+): number {
+  return insertEvent({
+    hook_event: opts.hook_event ?? "PostToolUse",
+    session_id: opts.session_id ?? "sess-cron",
+    tool_name: "CronCreate",
+    data: JSON.stringify({
+      tool_input: { cron: opts.cron ?? "0 * * * *", prompt: opts.prompt ?? "" },
+      tool_response: {
+        id: cronId,
+        humanSchedule: opts.humanSchedule ?? "Every hour",
+        recurring: opts.recurring ?? true,
+        durable: opts.durable ?? false,
+      },
+    }),
+  });
+}
+
+/** Insert a CronDelete PostToolUse event with the live payload shape. */
+function cronDeleteEvent(
+  cronId: string,
+  opts: { session_id?: string; hook_event?: string } = {},
+): number {
+  return insertEvent({
+    hook_event: opts.hook_event ?? "PostToolUse",
+    session_id: opts.session_id ?? "sess-cron",
+    tool_name: "CronDelete",
+    data: JSON.stringify({
+      tool_input: { id: cronId },
+      tool_response: { id: cronId },
+    }),
+  });
+}
+
+function getScheduledTask(
+  jobId = "sess-cron",
+  cronId = "cron-1",
+): ScheduledTaskRow | null {
+  return db
+    .query("SELECT * FROM scheduled_tasks WHERE job_id = ? AND cron_id = ?")
+    .get(jobId, cronId) as ScheduledTaskRow | null;
+}
+
+test("CronCreate folds to an active scheduled_tasks row with the payload fields", () => {
+  const id = cronCreateEvent("cron-1", {
+    cron: "23 * * * *",
+    humanSchedule: "Every hour at :23",
+    recurring: true,
+    durable: false,
+    prompt: "Watch the deploy\nand report back",
+  });
+  drainAll();
+  const row = getScheduledTask();
+  expect(row).not.toBeNull();
+  expect(row?.status).toBe("active");
+  expect(row?.cron).toBe("23 * * * *");
+  expect(row?.human_schedule).toBe("Every hour at :23");
+  expect(row?.recurring).toBe(1);
+  expect(row?.durable).toBe(0);
+  // prompt_summary is the FIRST line only, not the whole multi-line prompt.
+  expect(row?.prompt_summary).toBe("Watch the deploy");
+  expect(row?.last_event_id).toBe(id);
+  expect(getCursor()).toBe(id);
+});
+
+test("CronCreate prompt_summary truncates the first line deterministically at 200 chars", () => {
+  const longLine = "x".repeat(300);
+  cronCreateEvent("cron-long", { prompt: `${longLine}\nsecond line` });
+  drainAll();
+  const row = getScheduledTask("sess-cron", "cron-long");
+  expect(row?.prompt_summary.length).toBe(200);
+  expect(row?.prompt_summary).toBe("x".repeat(200));
+});
+
+test("recurring/durable JSON booleans lift to INTEGER 0/1", () => {
+  cronCreateEvent("cron-rd", { recurring: false, durable: true });
+  drainAll();
+  const row = getScheduledTask("sess-cron", "cron-rd");
+  expect(row?.recurring).toBe(0);
+  expect(row?.durable).toBe(1);
+});
+
+test("CronDelete flips the matching scheduled_tasks row to deleted", () => {
+  cronCreateEvent("cron-1");
+  const delId = cronDeleteEvent("cron-1");
+  drainAll();
+  const row = getScheduledTask();
+  expect(row?.status).toBe("deleted");
+  expect(row?.last_event_id).toBe(delId);
+});
+
+test("CronDelete without a matching create is a no-op with the cursor advancing", () => {
+  const delId = cronDeleteEvent("ghost-cron");
+  expect(drainAll()).toBe(1);
+  expect(getScheduledTask("sess-cron", "ghost-cron")).toBeNull();
+  expect(getCursor()).toBe(delId);
+});
+
+test("CronCreate after CronDelete resurrects the cron id to active (upsert)", () => {
+  cronCreateEvent("cron-1", { humanSchedule: "Every hour" });
+  cronDeleteEvent("cron-1");
+  const reId = cronCreateEvent("cron-1", { humanSchedule: "Every 2 hours" });
+  drainAll();
+  const row = getScheduledTask();
+  expect(row?.status).toBe("active");
+  // Resurrection upserts the new payload, not the stale create.
+  expect(row?.human_schedule).toBe("Every 2 hours");
+  expect(row?.last_event_id).toBe(reId);
+});
+
+test("CronCreate with a missing tool_response.id folds to a no-op (cursor advances)", () => {
+  const eventId = insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-cron",
+    tool_name: "CronCreate",
+    data: JSON.stringify({
+      tool_input: { cron: "0 * * * *", prompt: "x" },
+      tool_response: { humanSchedule: "Every hour" },
+    }),
+  });
+  expect(drainAll()).toBe(1);
+  const count = db.query("SELECT COUNT(*) AS n FROM scheduled_tasks").get() as {
+    n: number;
+  };
+  expect(count.n).toBe(0);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("CronCreate with malformed JSON data folds to a no-op (no throw, cursor advances)", () => {
+  const eventId = insertEvent({
+    hook_event: "PostToolUse",
+    session_id: "sess-cron",
+    tool_name: "CronCreate",
+    data: "{not valid json",
+  });
+  expect(drainAll()).toBe(1);
+  const count = db.query("SELECT COUNT(*) AS n FROM scheduled_tasks").get() as {
+    n: number;
+  };
+  expect(count.n).toBe(0);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("PostToolUseFailure on CronCreate never mints a scheduled_tasks row", () => {
+  // The failure payload carries no tool_response; even if it did, the
+  // PostToolUse-only gate at the dispatch site keeps it out.
+  const eventId = insertEvent({
+    hook_event: "PostToolUseFailure",
+    session_id: "sess-cron",
+    tool_name: "CronCreate",
+    data: JSON.stringify({ tool_input: { cron: "0 * * * *", prompt: "x" } }),
+  });
+  expect(drainAll()).toBe(1);
+  const count = db.query("SELECT COUNT(*) AS n FROM scheduled_tasks").get() as {
+    n: number;
+  };
+  expect(count.n).toBe(0);
+  expect(getCursor()).toBe(eventId);
+});
+
+test("scheduled_tasks is re-fold deterministic: rewind + DELETE + re-drain reproduces it byte-for-byte", () => {
+  cronCreateEvent("cron-A", { humanSchedule: "Every hour", recurring: true });
+  cronCreateEvent("cron-B", {
+    session_id: "sess-other",
+    humanSchedule: "Daily",
+    recurring: true,
+  });
+  cronDeleteEvent("cron-A");
+  cronCreateEvent("cron-A", { humanSchedule: "Every 30 min" });
+  cronCreateEvent("cron-C", { recurring: false, durable: true });
+  cronDeleteEvent("ghost", { session_id: "sess-cron" });
+  drainAll();
+
+  const before = db
+    .query("SELECT * FROM scheduled_tasks ORDER BY job_id, cron_id")
+    .all() as unknown[];
+  expect(before.length).toBe(3);
+
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM scheduled_tasks");
+  drainAll();
+  const after = db
+    .query("SELECT * FROM scheduled_tasks ORDER BY job_id, cron_id")
+    .all() as unknown[];
+  expect(after).toEqual(before);
+});

@@ -1922,9 +1922,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // Version guard tracks the live SCHEMA_VERSION (v64 adds the `builds` table,
   // fn-781; v65 adds `jobs.active_since`, fn-784; v66 adds the
   // `idx_events_pretooluse_agent_session` partial index, fn-787; v67 adds the
-  // `commit_trailer_facts` projection table, fn-807); the v62→v63 epics-shape
+  // `commit_trailer_facts` projection table, fn-807; v68 adds the
+  // `scheduled_tasks` projection table, fn-813); the v62→v63 epics-shape
   // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(67);
+  expect(SCHEMA_VERSION).toBe(68);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

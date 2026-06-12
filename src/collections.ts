@@ -367,6 +367,39 @@ export const SUBAGENT_INVOCATIONS_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
+ * The `scheduled_tasks` descriptor — one row per cron a Claude session armed
+ * via `CronCreate`, served to the jobs TUI's expanded-row detail section.
+ *
+ * Composite SQL key `(job_id, cron_id)`, but `pk` expects a single column, so
+ * `job_id` carries the wire identity (every subscribe filters by it) and
+ * `cron_id` rides in `columns` for display. The composite-key/single-pk split
+ * means the client MUST read `state.rows` (not `byId`) — `byId` collapses to
+ * one row per `job_id` and crons would silently collapse to one per job.
+ */
+export const SCHEDULED_TASKS_DESCRIPTOR: CollectionDescriptor = {
+  name: "scheduled_tasks",
+  table: "scheduled_tasks",
+  columns: [
+    "job_id",
+    "cron_id",
+    "cron",
+    "human_schedule",
+    "recurring",
+    "durable",
+    "prompt_summary",
+    "status",
+    "ts",
+    "last_event_id",
+  ],
+  pk: "job_id",
+  version: "last_event_id",
+  sortable: new Set(["ts", "cron_id"]),
+  defaultSort: { column: "ts", dir: "asc" },
+  filters: { job_id: "job_id" },
+  jsonColumns: new Set(),
+};
+
+/**
  * The `dead_letters` descriptor — one row per dropped hook-INSERT recovered by
  * the daemon's import path. NOT a reducer projection: rows arrive via the daemon
  * scanning per-pid NDJSON files the hook wrote when its `events` INSERT
@@ -568,6 +601,7 @@ export const REGISTRY: Map<string, CollectionDescriptor> = new Map([
   [EPICS_DESCRIPTOR.name, EPICS_DESCRIPTOR],
   [GIT_DESCRIPTOR.name, GIT_DESCRIPTOR],
   [SUBAGENT_INVOCATIONS_DESCRIPTOR.name, SUBAGENT_INVOCATIONS_DESCRIPTOR],
+  [SCHEDULED_TASKS_DESCRIPTOR.name, SCHEDULED_TASKS_DESCRIPTOR],
   [USAGE_DESCRIPTOR.name, USAGE_DESCRIPTOR],
   [PROFILES_DESCRIPTOR.name, PROFILES_DESCRIPTOR],
   [DEAD_LETTERS_DESCRIPTOR.name, DEAD_LETTERS_DESCRIPTOR],

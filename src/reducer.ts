@@ -4123,6 +4123,133 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
   }
 }
 
+/** First prompt line, deterministically capped — wall-clock-free truncation. */
+const SCHEDULED_TASK_PROMPT_MAX_CHARS = 200;
+
+/**
+ * Project a `CronCreate` / `CronDelete` `PostToolUse` event onto the
+ * `scheduled_tasks` side table. Called as a sibling of
+ * {@link projectSubagentInvocationsRow} at the PostToolUse dispatch site; gated
+ * strictly on `hook_event === 'PostToolUse'` by the caller (a CronCreate
+ * PostToolUseFailure carries no `tool_response` and must NEVER mint a row).
+ *
+ * Create arm: UPSERT on `(job_id, cron_id)` — a re-created cron id resurrects
+ * (`status='active'`). Delete arm: flip the matching row to `'deleted'`; an
+ * unmatched key is a safe no-op. Every field comes from `event.ts` /
+ * `event.id` so a from-scratch re-fold reproduces identical rows. Parses
+ * `event.data` defensively and guard-and-returns on any malformed/missing-id
+ * payload — the cursor still advances upstream. NEVER throws (CLAUDE.md fold
+ * invariant).
+ */
+function projectScheduledTasksRow(db: Database, event: Event): void {
+  // Caller gates hook_event === 'PostToolUse'; filter to the two cron tools
+  // here. Every other PostToolUse is a fast in-fn no-op.
+  if (event.tool_name !== "CronCreate" && event.tool_name !== "CronDelete") {
+    return;
+  }
+
+  let parsed: { tool_input?: unknown; tool_response?: unknown };
+  try {
+    parsed = JSON.parse(event.data ?? "{}") as {
+      tool_input?: unknown;
+      tool_response?: unknown;
+    };
+  } catch {
+    // Malformed payload — safe no-op; the cursor still advances upstream.
+    return;
+  }
+  const toolInput =
+    typeof parsed.tool_input === "object" && parsed.tool_input != null
+      ? (parsed.tool_input as Record<string, unknown>)
+      : {};
+  const toolResponse =
+    typeof parsed.tool_response === "object" && parsed.tool_response != null
+      ? (parsed.tool_response as Record<string, unknown>)
+      : {};
+
+  const ts = event.ts;
+  const jobId = event.session_id;
+
+  if (event.tool_name === "CronCreate") {
+    // Create-side cron id rides `tool_response.id`. A PostToolUseFailure (or
+    // any payload missing it) has no id to key on → guard-and-return no-op.
+    const cronId = toolResponse.id;
+    if (typeof cronId !== "string" || cronId.length === 0) {
+      return;
+    }
+    const cron = typeof toolInput.cron === "string" ? toolInput.cron : "";
+    const humanSchedule =
+      typeof toolResponse.humanSchedule === "string"
+        ? toolResponse.humanSchedule
+        : "";
+    // `recurring` / `durable` arrive as JSON booleans — lift to INTEGER 0/1.
+    const recurring = toolResponse.recurring === true ? 1 : 0;
+    const durable = toolResponse.durable === true ? 1 : 0;
+    // First prompt line, deterministically capped. Untrusted freeform text —
+    // stored opaque, rendered as plain text client-side.
+    const promptRaw =
+      typeof toolInput.prompt === "string" ? toolInput.prompt : "";
+    const promptSummary = promptRaw
+      .split("\n", 1)[0]
+      .slice(0, SCHEDULED_TASK_PROMPT_MAX_CHARS);
+    // UPSERT, never REPLACE/IGNORE: INSERT OR REPLACE is delete+insert and
+    // OR IGNORE silently drops a re-fold update. The ON CONFLICT arm
+    // resurrects a previously-deleted cron id back to 'active'.
+    db.run(
+      `INSERT INTO scheduled_tasks (
+         job_id, cron_id, cron, human_schedule, recurring, durable,
+         prompt_summary, status, ts, last_event_id, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+       ON CONFLICT(job_id, cron_id) DO UPDATE SET
+         cron = excluded.cron,
+         human_schedule = excluded.human_schedule,
+         recurring = excluded.recurring,
+         durable = excluded.durable,
+         prompt_summary = excluded.prompt_summary,
+         status = 'active',
+         ts = excluded.ts,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at`,
+      [
+        jobId,
+        cronId,
+        cron,
+        humanSchedule,
+        recurring,
+        durable,
+        promptSummary,
+        ts,
+        event.id,
+        ts,
+      ],
+    );
+    return;
+  }
+
+  // CronDelete: id rides `tool_input.id` (also echoed at `tool_response.id`).
+  // Prefer tool_input — a PostToolUseFailure carries no tool_response. Missing
+  // → guard-and-return no-op.
+  const inputId = toolInput.id;
+  const cronId =
+    typeof inputId === "string" && inputId.length > 0
+      ? inputId
+      : typeof toolResponse.id === "string" && toolResponse.id.length > 0
+        ? (toolResponse.id as string)
+        : null;
+  if (cronId == null) {
+    return;
+  }
+  // Flip the matching row to 'deleted'. An unmatched key affects zero rows —
+  // safe no-op (crons are session-scoped). `last_event_id` bumps so the wire
+  // diff fires for the surviving row.
+  db.run(
+    `UPDATE scheduled_tasks
+        SET status = 'deleted', last_event_id = ?, updated_at = ?
+      WHERE job_id = ? AND cron_id = ?`,
+    [event.id, ts, jobId, cronId],
+  );
+}
+
 /**
  * The shape of an `EmbeddedJob` element stored inside an `epics.jobs` array
  * (epic-level: verbs `plan` / `close`) or a task element's nested `jobs`
@@ -6870,6 +6997,11 @@ export function applyEvent(
       // The `subagent_invocations` projection rides the same transaction +
       // cursor advance — exactly-once-per-event holds across both projections.
       projectSubagentInvocationsRow(db, event);
+      // The `scheduled_tasks` projection rides this same transaction too. Cron
+      // events are PostToolUse, so this sibling lives in the PostToolUse arm
+      // ONLY (the else arm below never sees CronCreate/CronDelete). The fn
+      // fast-no-ops on every non-cron PostToolUse.
+      projectScheduledTasksRow(db, event);
       const _ptuT2 = performance.now();
       const _ptuSyncMs = _syncIfPlanRefAccumMs;
       _syncIfPlanRefAccumMs = null;
