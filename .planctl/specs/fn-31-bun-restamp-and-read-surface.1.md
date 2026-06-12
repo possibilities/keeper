@@ -33,5 +33,5 @@ Green three ways: default engine, PLANCTL_BIN=python planctl, full fast gate unc
 - [ ] Golden corpus committed with documented regeneration
 
 ## Done summary
-
+Authored tests/test_query_verbs.py: engine-agnostic spec for the read-surface verbs (show/cat/list/ready/tasks/resolve-task/refine-context/validate) with golden-pinned list renderer + integrity errors. Green in both engines; fast gate unchanged.
 ## Evidence
