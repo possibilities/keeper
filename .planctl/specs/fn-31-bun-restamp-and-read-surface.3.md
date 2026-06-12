@@ -35,5 +35,5 @@ bun test green for new units; test_cli.py still green against the compiled binar
 - [ ] All directory listings sorted at the call site
 
 ## Done summary
-
+Landed the read-surface spine: nested epic/task group dispatch with click-matching wrapped help + exit-2 usage errors, cat/validate no-trailer registration, and the helper spine (resolveEpicGlobally/scanEpicIdsGlobal, detectCycles/findDependents, api loaders, isEpicId, loadJson/readFileOrStdin, runtime_status cwd fallbacks). bun:test units green; test_cli.py conformance + Python fast gate untouched.
 ## Evidence
