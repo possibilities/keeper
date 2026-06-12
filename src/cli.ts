@@ -16,16 +16,23 @@ import { didSelfEmit } from "./emit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
 import { buildPlanctlInvocationReadonly } from "./invocation.ts";
 import { resolveProject } from "./project.ts";
-import {
-  dispatchGroup,
-  type GroupSpec,
-  type SubcommandSpec,
-} from "./subgroup.ts";
+import { dispatchGroup, type GroupSpec } from "./subgroup.ts";
 import { runBlock } from "./verbs/block.ts";
 import { runCat } from "./verbs/cat.ts";
 import { runClaim } from "./verbs/claim.ts";
 import { runDetect } from "./verbs/detect.ts";
 import { runDone } from "./verbs/done.ts";
+import { runEpicAddDeps } from "./verbs/epic_add_deps.ts";
+import { runEpicAddDep, runEpicRmDep } from "./verbs/epic_dep_edit.ts";
+import { runEpicSetBranch, runEpicSetTitle } from "./verbs/epic_set_plain.ts";
+import {
+  runEpicSetPrimaryRepo,
+  runEpicSetTouchedRepos,
+} from "./verbs/epic_set_repos.ts";
+import {
+  runEpicInvalidate,
+  runEpicQueueJump,
+} from "./verbs/epic_short_circuit.ts";
 import { runEpics } from "./verbs/epics.ts";
 import { runInit } from "./verbs/init.ts";
 import { runList } from "./verbs/list.ts";
@@ -35,6 +42,13 @@ import { runResolveTask } from "./verbs/resolve_task.ts";
 import { runShow } from "./verbs/show.ts";
 import { runStatePath } from "./verbs/state_path.ts";
 import { runStatus } from "./verbs/status.ts";
+import { runTaskReset } from "./verbs/task_reset.ts";
+import {
+  runTaskSetAcceptance,
+  runTaskSetDescription,
+} from "./verbs/task_set_section.ts";
+import { runTaskSetTargetRepo } from "./verbs/task_set_target_repo.ts";
+import { runTaskSetTier } from "./verbs/task_set_tier.ts";
 import { runTasks } from "./verbs/tasks.ts";
 import { runValidate } from "./verbs/validate.ts";
 
@@ -143,16 +157,41 @@ const COMMANDS: CommandSpec[] = [
 const DESCRIPTION =
   "File-based task tracking for structured development workflows.";
 
-// Leaf runner placeholder for a subcommand whose verb lands in a later wave
-// task. The dispatch table + group help are the spine this task ships; the
-// real runners replace this stub as each verb is ported. Registering the name
-// keeps `<group> --help` listing it (click lists the command regardless of
-// whether its callback is implemented) and routes an unknown sub to exit 2.
-function notImplemented(verb: string): SubcommandSpec["run"] {
-  return () => {
-    process.stderr.write(`Error: ${verb} is not yet implemented.\n`);
-    process.exit(2);
-  };
+// Leaf-arg parsing for subgroup verbs. A leaf receives the post-name argv (its
+// own positionals + options). Options are `--name value` / `--name=value`;
+// `--flag` is a bare boolean. Positionals are everything that is not an option
+// or an option value. `valueTaking` lists the option names that consume the next
+// token so a positional scan skips it.
+function leafOption(rest: string[], name: string): string | null {
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i] as string;
+    if (arg === name) {
+      return rest[i + 1] ?? null;
+    }
+    if (arg.startsWith(`${name}=`)) {
+      return arg.slice(name.length + 1);
+    }
+  }
+  return null;
+}
+
+function leafFlag(rest: string[], name: string): boolean {
+  return rest.includes(name);
+}
+
+function leafPositionals(rest: string[], valueTaking: Set<string>): string[] {
+  const out: string[] = [];
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i] as string;
+    if (arg.startsWith("--")) {
+      if (!arg.includes("=") && valueTaking.has(arg)) {
+        i += 1;
+      }
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
 }
 
 // Subgroups registered in click's alphabetical list_commands order. The in-wave
@@ -166,50 +205,107 @@ const EPIC_GROUP: GroupSpec = {
     {
       name: "add-dep",
       shortHelp: "Add an epic-level dependency.",
-      run: notImplemented("epic add-dep"),
+      run: (rest, format) => {
+        const [epicId, depId] = leafPositionals(rest, new Set());
+        runEpicAddDep({
+          epicId: epicId ?? "",
+          depId: depId ?? "",
+          format,
+        });
+      },
     },
     {
       name: "add-deps",
       shortHelp:
         "Batch-wire N epic-level dependency edges (idempotent per edge).",
-      run: notImplemented("epic add-deps"),
+      run: (rest, format) => {
+        const positionals = leafPositionals(rest, new Set());
+        const [epicId, ...depIds] = positionals;
+        runEpicAddDeps({
+          epicId: epicId ?? "",
+          depIds,
+          skipInvalid: leafFlag(rest, "--skip-invalid"),
+          format,
+        });
+      },
     },
     {
       name: "invalidate",
       shortHelp:
         "Clear validation marker (force re-validate on next validate run).",
-      run: notImplemented("epic invalidate"),
+      run: (rest, format) => {
+        const [epicId] = leafPositionals(rest, new Set());
+        runEpicInvalidate({ epicId: epicId ?? "", format });
+      },
     },
     {
       name: "queue-jump",
       shortHelp:
         "Flip queue_jump=true so the epic sorts to the front of the board (/plan:next).",
-      run: notImplemented("epic queue-jump"),
+      run: (rest, format) => {
+        const [epicId] = leafPositionals(rest, new Set());
+        runEpicQueueJump({ epicId: epicId ?? "", format });
+      },
     },
     {
       name: "rm-dep",
       shortHelp: "Remove an epic-level dependency.",
-      run: notImplemented("epic rm-dep"),
+      run: (rest, format) => {
+        const [epicId, depId] = leafPositionals(rest, new Set());
+        runEpicRmDep({
+          epicId: epicId ?? "",
+          depId: depId ?? "",
+          format,
+        });
+      },
     },
     {
       name: "set-branch",
       shortHelp: "Set the branch name on an epic.",
-      run: notImplemented("epic set-branch"),
+      run: (rest, format) => {
+        const [epicId] = leafPositionals(rest, new Set(["--branch"]));
+        runEpicSetBranch({
+          epicId: epicId ?? "",
+          branch: leafOption(rest, "--branch") ?? "",
+          format,
+        });
+      },
     },
     {
       name: "set-primary-repo",
       shortHelp: "Set the primary_repo path on an epic (metadata only).",
-      run: notImplemented("epic set-primary-repo"),
+      run: (rest, format) => {
+        const [epicId] = leafPositionals(rest, new Set(["--path"]));
+        runEpicSetPrimaryRepo({
+          epicId: epicId ?? "",
+          path: leafOption(rest, "--path") ?? "",
+          format,
+        });
+      },
     },
     {
       name: "set-title",
       shortHelp: "Rename an epic (ID remains unchanged).",
-      run: notImplemented("epic set-title"),
+      run: (rest, format) => {
+        const [epicId] = leafPositionals(rest, new Set(["--title"]));
+        runEpicSetTitle({
+          epicId: epicId ?? "",
+          title: leafOption(rest, "--title") ?? "",
+          format,
+        });
+      },
     },
     {
       name: "set-touched-repos",
       shortHelp: "Replace the touched_repos list on an epic.",
-      run: notImplemented("epic set-touched-repos"),
+      run: (rest, format) => {
+        const [epicId] = leafPositionals(rest, new Set(["--paths"]));
+        runEpicSetTouchedRepos({
+          epicId: epicId ?? "",
+          paths: leafOption(rest, "--paths") ?? "",
+          format,
+        });
+      },
     },
   ],
 };
@@ -221,27 +317,62 @@ const TASK_GROUP: GroupSpec = {
     {
       name: "reset",
       shortHelp: "Reset a task to todo status.",
-      run: notImplemented("task reset"),
+      run: (rest, format) => {
+        const [taskId] = leafPositionals(rest, new Set());
+        runTaskReset({
+          taskId: taskId ?? "",
+          cascade: leafFlag(rest, "--cascade"),
+          format,
+        });
+      },
     },
     {
       name: "set-acceptance",
       shortHelp: "Set or replace the Acceptance section of a task spec.",
-      run: notImplemented("task set-acceptance"),
+      run: (rest, format) => {
+        const [taskId] = leafPositionals(rest, new Set(["--file"]));
+        runTaskSetAcceptance({
+          taskId: taskId ?? "",
+          file: leafOption(rest, "--file"),
+          format,
+        });
+      },
     },
     {
       name: "set-description",
       shortHelp: "Set or replace the Description section of a task spec.",
-      run: notImplemented("task set-description"),
+      run: (rest, format) => {
+        const [taskId] = leafPositionals(rest, new Set(["--file"]));
+        runTaskSetDescription({
+          taskId: taskId ?? "",
+          file: leafOption(rest, "--file"),
+          format,
+        });
+      },
     },
     {
       name: "set-target-repo",
       shortHelp: "Set the target_repo path on a task.",
-      run: notImplemented("task set-target-repo"),
+      run: (rest, format) => {
+        const [taskId] = leafPositionals(rest, new Set(["--path"]));
+        runTaskSetTargetRepo({
+          taskId: taskId ?? "",
+          path: leafOption(rest, "--path") ?? "",
+          format,
+        });
+      },
     },
     {
       name: "set-tier",
       shortHelp: "Persist the worker reasoning tier on a task.",
-      run: notImplemented("task set-tier"),
+      run: (rest, format) => {
+        const [taskId] = leafPositionals(rest, new Set(["--tier"]));
+        runTaskSetTier({
+          taskId: taskId ?? "",
+          tier: leafOption(rest, "--tier") ?? "",
+          format,
+        });
+      },
     },
   ],
 };

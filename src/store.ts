@@ -66,6 +66,23 @@ export function readFileOrStdin(fileArg: string | null): string {
   return readFileSync(fileArg, "utf-8");
 }
 
+/** Resolve a user-supplied path the way the repo setters persist it: expand a
+ * leading `~`, make it absolute against cwd, then resolve symlinks. A path that
+ * does not exist on disk still normalizes to its absolute form (never throws) —
+ * the `str(Path(p).expanduser().resolve())` contract. */
+export function resolveUserPath(pathArg: string): string {
+  let expanded = pathArg;
+  if (pathArg === "~" || pathArg.startsWith("~/")) {
+    expanded = (process.env.HOME ?? "") + pathArg.slice(1);
+  }
+  const abs = resolve(expanded);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
 // JSON value shape we serialize — mirrors what Python's json.dumps accepts for
 // state files (objects, arrays, strings, numbers, bool, null).
 type JsonValue =
