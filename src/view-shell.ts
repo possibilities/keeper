@@ -104,8 +104,8 @@ export const SELECTED_LINE_PREFIX = "\u{E000}";
  *     a paused stdin never emits EOF. Skipped on a non-TTY / piped run
  *     (stdin there is a file/pipe whose natural EOF is NOT a death
  *     signal and would mis-fire an immediate exit).
- *   - a ~2s `process.ppid === 1` poll: the ONLY trigger that catches
- *     zellij's `on_force_close "detach"`, where the pane pty stays OPEN
+ *   - a ~2s `process.ppid === 1` poll: the ONLY trigger that catches a
+ *     detach-on-close multiplexer teardown, where the pane pty stays OPEN
  *     (no SIGHUP, no stdin EOF) but the viewer reparents to init. We
  *     capture the launch-time ppid and only treat `ppid === 1` as death
  *     if it WASN'T 1 at launch — a legitimately detached launch (e.g.

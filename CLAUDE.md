@@ -42,8 +42,8 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   `src/dead-letter.ts` serializers, and the pure `src/derivers.ts`/`exec-backend.ts`
   helpers. It never opens the DB, so it never migrates or probes schema.
 - **Scraping is scoped.** On `SessionStart` only: parent claude `--name`/`-n` +
-  `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event: `ZELLIJ*`
-  plus `TMUX`/`TMUX_PANE`/`KEEPER_TMUX_SESSION` env reads (synchronous, no
+  `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event:
+  `TMUX`/`TMUX_PANE`/`KEEPER_TMUX_SESSION` env reads (synchronous, no
   fork/fs). No other scraping, no env read in a fold.
 
 ## Migrations
@@ -104,8 +104,7 @@ Every test that spawns the real hook MUST sandbox ALL FIVE state paths under the
 per-test tmpdir: `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`,
 `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`. Never `{ ...process.env, KEEPER_DB }`
 — it strands the others at production defaults and pollutes the real feed. Build the
-env via the shared `sandboxEnv(...)` in `test/helpers/sandbox-env.ts`; pass
-`includeZellij: true` for the sixth `KEEPER_ZELLIJ_EVENTS_DIR` on hook-spawn tests.
+env via the shared `sandboxEnv(...)` in `test/helpers/sandbox-env.ts`.
 
 **Two test helpers, two jobs.** `sandboxEnv` is for process-spawn isolation (any
 test launching the real hook/daemon/CLI subprocess). The template-DB helper in

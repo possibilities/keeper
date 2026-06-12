@@ -133,7 +133,7 @@ from pathlib import Path
 #
 # v50 (fn-678 epic, T1) is a whitelist-only bump: adds the new
 # ``pending_dispatches`` reducer projection table (the durable substrate
-# that replaces fn-674's live zellij tab-name probe for launch-window
+# that replaces fn-674's live tab-name probe for launch-window
 # double-dispatch suppression). keeper-py reads neither this table nor
 # the new ``Dispatched`` / ``DispatchExpired`` synthetic events
 # (autopilot surface, not the attribution surface keeper-py serves), so

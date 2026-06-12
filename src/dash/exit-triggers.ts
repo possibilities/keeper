@@ -19,8 +19,8 @@
  *     `resume()` stdin so the `'end'` actually fires on pty teardown — a paused
  *     stdin never emits EOF. Skipped on a non-TTY / piped run (the dash gates on
  *     a TTY stdout before reaching here, but stdin is checked independently).
- *   - a ~2s `process.ppid === 1` poll: the ONLY trigger that catches zellij's
- *     `on_force_close "detach"`, where the pane pty stays OPEN (no SIGHUP, no
+ *   - a ~2s `process.ppid === 1` poll: the ONLY trigger that catches a
+ *     detach-on-close multiplexer teardown, where the pane pty stays OPEN (no SIGHUP, no
  *     stdin EOF) but the viewer reparents to init. We capture the launch-time
  *     ppid and only treat `ppid === 1` as death if it WASN'T 1 at launch — a
  *     legitimately detached launch must not self-exit on the first tick.

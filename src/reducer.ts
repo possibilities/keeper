@@ -2924,7 +2924,7 @@ function extractTmuxPaneSnapshot(event: Event): TmuxPaneSnapshotPair[] {
  * session) for which no launch-time `KEEPER_TMUX_SESSION` env was injected.
  *
  * FILL-ONLY: the `backend_exec_session_id IS NULL` guard means a non-NULL value
- * is NEVER overwritten. This preserves zellij-parity staleness semantics (the
+ * is NEVER overwritten. This preserves the staleness semantics (the
  * hook-fed COALESCE arm already owns live coords) AND makes the fold
  * ORDER-INSENSITIVE: replaying the same event after the COALESCE arm filled the
  * value is a no-op, so re-fold reproduces byte-identical rows regardless of

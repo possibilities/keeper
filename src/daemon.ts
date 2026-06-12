@@ -2764,7 +2764,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: {
           dbPath,
           paused: autopilotPaused,
-          // Selected backend (zellij default; tmux opt-in), read on main and
+          // Selected backend (tmux — the sole backend), read on main and
           // frozen into workerData. Restart-to-apply: a config flip lags until
           // the next restart.
           execBackend: apConfig.execBackend,
