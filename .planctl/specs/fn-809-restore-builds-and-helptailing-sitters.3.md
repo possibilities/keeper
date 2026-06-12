@@ -37,5 +37,5 @@ Buildbot-fixture tests cover: onset detection across ticks, green-clear cursor s
 - [ ] agents/builds.md rewritten for the pull model; plist + tsconfig/lint/README wiring landed
 
 ## Done summary
-
+Restored the builds CI-failure sitter under sitters/builds/ converged onto the pull model: immutable=1 read-only buildbot scan + green-clear onset semantics intact, agent-spawn/ack/watchdog excised, findings written directly via lib/followups.ts. Added buildbot fixture + adapted suite, plist, build-pin, agents/builds.md, README/CLAUDE wiring.
 ## Evidence
