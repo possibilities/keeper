@@ -31,5 +31,5 @@ Full tests/test_generated_guard_hook.py green (default + conformance engines); b
 - [ ] Live-fire post-flip check confirms deny and context paths
 
 ## Done summary
-
+Converted the generated-file guard hooks to bun: pre-hook.ts/post-hook.ts reproduce the promptctl check-generated envelope-for-envelope (deny on write, additionalContext on read, fail-open silent), runPromptctl+emitAdditionalContext added to lib.ts, hooks.json flipped to the bun exec form, Python entry points deleted, tests retargeted to the bun runner. Live-fire confirmed deny/context paths fire and fail-open stays silent.
 ## Evidence

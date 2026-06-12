@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Convert hook entry points to bun",
-  "updated_at": "2026-06-12T17:51:50.671828Z"
+  "updated_at": "2026-06-12T17:56:02.217311Z",
+  "worker_done_at": "2026-06-12T17:56:02.217311Z"
 }
