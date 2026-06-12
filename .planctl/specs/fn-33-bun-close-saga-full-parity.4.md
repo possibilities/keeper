@@ -28,5 +28,5 @@ The four test files green via dist/planctl-bun; zero commits proven.
 - [ ] No commits from any submit verb; artifacts land under state/audits/ untracked
 
 ## Done summary
-
+Ported the verdict/followup/audit submit trio to bun: three runtime-state-only close-phase verbs on the landed spine, with a new shared validateScaffoldYaml dry-run validator reused by followup submit. All four conformance test files green via dist/planctl-bun, zero commits proven.
 ## Evidence
