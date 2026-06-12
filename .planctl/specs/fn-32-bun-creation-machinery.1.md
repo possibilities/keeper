@@ -32,5 +32,5 @@ Green three ways: default engine, PLANCTL_BIN=python planctl, fast gate unchange
 - [ ] Green in default engine and against Python via PLANCTL_BIN; no existing test touched
 
 ## Done summary
-
+Authored tests/test_creation_verbs.py: empirically-pinned YAML 1.1 scalar divergence matrix (norway booleans, octal/underscore dep ordinals, ISO-date scalar, duplicate-key last-wins), the scaffold success-envelope keystone, duplicate_epic + --allow-duplicate, 1 MiB file/stdin cap counts, refine-apply delta/stdin cap, and epic rm --dry-run/--force. Green in default engine and against the Python binary via PLANCTL_BIN under --run-slow; fast gate unchanged.
 ## Evidence
