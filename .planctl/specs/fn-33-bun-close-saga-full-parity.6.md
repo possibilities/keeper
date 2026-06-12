@@ -27,5 +27,5 @@ The acceptance run IS the task: full suite vs bun (serial + -n + --run-slow), fu
 - [ ] Docs collapsed to full-parity statements; gate rows truthful; global_state status recorded
 
 ## Done summary
-
+Drove the bun conformance finish line: full-suite parity green serial + parallel (888 passed, 31 skipped, only python_only) matching the Python reference run byte-for-byte. Collapsed CLAUDE.md/README.md docs to full-parity statements, made the gate row truthful, and recorded global_state.py as api-only/no-CLI-reach for the cutover epic. No src/ fixes or new python_only markers needed.
 ## Evidence
