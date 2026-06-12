@@ -92,6 +92,41 @@ export function mergeTaskState(
   return merged;
 }
 
+/** Merge an epic definition with its runtime sidecar. Epics have no status
+ * overlay, so an absent sidecar makes the merge a pure normalize pass over the
+ * def; the call-shape is kept symmetric with mergeTaskState. Mirrors
+ * merge_epic_state. */
+export function mergeEpicState(
+  definition: Record<string, unknown>,
+  epicRuntime: Record<string, unknown> | null,
+): Record<string, unknown> {
+  const merged = { ...definition, ...(epicRuntime ?? {}) };
+  normalizeEpic(merged);
+  return merged;
+}
+
+/** Sort priority for a task (null / unparseable -> 999). Mirrors task_priority:
+ * a missing/None priority is 999, else `int(value)` with a 999 fallback on the
+ * except branch. Reproduces Python int() faithfully — a finite number truncates
+ * toward zero (int(3.9) == 3); a string must be a base-10 integer literal
+ * (int("3.9") raises, so non-integer strings fall through to 999). */
+export function taskPriority(taskData: Record<string, unknown>): number {
+  const raw = taskData.priority;
+  if (raw === null || raw === undefined) {
+    return 999;
+  }
+  if (typeof raw === "number") {
+    return Number.isFinite(raw) ? Math.trunc(raw) : 999;
+  }
+  if (typeof raw === "boolean") {
+    return raw ? 1 : 0; // Python int(True) == 1, int(False) == 0
+  }
+  if (typeof raw === "string" && /^[+-]?\d+$/.test(raw.trim())) {
+    return Number.parseInt(raw.trim(), 10);
+  }
+  return 999;
+}
+
 /** Worker reasoning tiers — the canonical set workerAgentForTier maps. */
 export const TASK_TIERS = ["medium", "high", "xhigh", "max"] as const;
 

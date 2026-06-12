@@ -16,6 +16,11 @@ import { didSelfEmit } from "./emit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
 import { buildPlanctlInvocationReadonly } from "./invocation.ts";
 import { resolveProject } from "./project.ts";
+import {
+  dispatchGroup,
+  type GroupSpec,
+  type SubcommandSpec,
+} from "./subgroup.ts";
 import { runBlock } from "./verbs/block.ts";
 import { runClaim } from "./verbs/claim.ts";
 import { runDetect } from "./verbs/detect.ts";
@@ -35,6 +40,11 @@ const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
 // Verbs that own their stdout contract and must bypass the trailer (raw markdown
 // / non-standard envelopes). Mirrors cli.py _NO_TRACK_COMMANDS.
 const NO_TRACK_COMMANDS = new Set(["cat", "validate"]);
+
+// Subgroups ("planctl <group> <sub>"). A subgroup owns its own --help and
+// subcommand dispatch, so post-command --help is routed to the group, not the
+// top-level help.
+const SUBGROUP_NAMES = new Set(["epic", "task"]);
 
 // Whether a verb already printed its own planctl_invocation-bearing envelope is
 // a RUNTIME fact (claim/block via emitReadonly, done via emitMutating always
@@ -62,6 +72,7 @@ const COMMANDS: CommandSpec[] = [
     implemented: true,
   },
   { name: "done", shortHelp: "Mark a task as complete.", implemented: true },
+  { name: "epic", shortHelp: "Manage epics.", implemented: true },
   { name: "epics", shortHelp: "List all epics.", implemented: true },
   {
     name: "init",
@@ -78,10 +89,114 @@ const COMMANDS: CommandSpec[] = [
     shortHelp: "Show overall project status.",
     implemented: true,
   },
+  { name: "task", shortHelp: "Manage tasks.", implemented: true },
 ];
 
 const DESCRIPTION =
   "File-based task tracking for structured development workflows.";
+
+// Leaf runner placeholder for a subcommand whose verb lands in a later wave
+// task. The dispatch table + group help are the spine this task ships; the
+// real runners replace this stub as each verb is ported. Registering the name
+// keeps `<group> --help` listing it (click lists the command regardless of
+// whether its callback is implemented) and routes an unknown sub to exit 2.
+function notImplemented(verb: string): SubcommandSpec["run"] {
+  return () => {
+    process.stderr.write(`Error: ${verb} is not yet implemented.\n`);
+    process.exit(2);
+  };
+}
+
+// Subgroups registered in click's alphabetical list_commands order. The in-wave
+// leaves carry a notImplemented stub until their porting task lands a runner;
+// the short helps match the Python binary's collapsed short_help so group help
+// is byte-faithful once the full command set is present.
+const EPIC_GROUP: GroupSpec = {
+  name: "epic",
+  description: "Manage epics.",
+  commands: [
+    {
+      name: "add-dep",
+      shortHelp: "Add an epic-level dependency.",
+      run: notImplemented("epic add-dep"),
+    },
+    {
+      name: "add-deps",
+      shortHelp:
+        "Batch-wire N epic-level dependency edges (idempotent per edge).",
+      run: notImplemented("epic add-deps"),
+    },
+    {
+      name: "invalidate",
+      shortHelp:
+        "Clear validation marker (force re-validate on next validate run).",
+      run: notImplemented("epic invalidate"),
+    },
+    {
+      name: "queue-jump",
+      shortHelp:
+        "Flip queue_jump=true so the epic sorts to the front of the board (/plan:next).",
+      run: notImplemented("epic queue-jump"),
+    },
+    {
+      name: "rm-dep",
+      shortHelp: "Remove an epic-level dependency.",
+      run: notImplemented("epic rm-dep"),
+    },
+    {
+      name: "set-branch",
+      shortHelp: "Set the branch name on an epic.",
+      run: notImplemented("epic set-branch"),
+    },
+    {
+      name: "set-primary-repo",
+      shortHelp: "Set the primary_repo path on an epic (metadata only).",
+      run: notImplemented("epic set-primary-repo"),
+    },
+    {
+      name: "set-title",
+      shortHelp: "Rename an epic (ID remains unchanged).",
+      run: notImplemented("epic set-title"),
+    },
+    {
+      name: "set-touched-repos",
+      shortHelp: "Replace the touched_repos list on an epic.",
+      run: notImplemented("epic set-touched-repos"),
+    },
+  ],
+};
+
+const TASK_GROUP: GroupSpec = {
+  name: "task",
+  description: "Manage tasks.",
+  commands: [
+    {
+      name: "reset",
+      shortHelp: "Reset a task to todo status.",
+      run: notImplemented("task reset"),
+    },
+    {
+      name: "set-acceptance",
+      shortHelp: "Set or replace the Acceptance section of a task spec.",
+      run: notImplemented("task set-acceptance"),
+    },
+    {
+      name: "set-description",
+      shortHelp: "Set or replace the Description section of a task spec.",
+      run: notImplemented("task set-description"),
+    },
+    {
+      name: "set-target-repo",
+      shortHelp: "Set the target_repo path on a task.",
+      run: notImplemented("task set-target-repo"),
+    },
+    {
+      name: "set-tier",
+      shortHelp: "Persist the worker reasoning tier on a task.",
+      run: notImplemented("task set-tier"),
+    },
+  ],
+};
 
 interface ParsedArgs {
   format: OutputFormat | null;
@@ -119,13 +234,15 @@ function parseArgs(argv: string[]): ParsedArgs {
       }
     } else {
       // After the command name, still intercept the global --format/--help.
+      // A subgroup owns its OWN --help (group help), so for epic/task the flag
+      // is left in `rest` for dispatchGroup to render the group help.
       if (arg === "--format") {
         format = readFormat(argv[i + 1]);
         i += 2;
       } else if (arg.startsWith("--format=")) {
         format = readFormat(arg.slice("--format=".length));
         i += 1;
-      } else if (arg === "--help") {
+      } else if (arg === "--help" && !SUBGROUP_NAMES.has(command)) {
         help = true;
         i += 1;
       } else {
@@ -257,6 +374,14 @@ function dispatch(parsed: ParsedArgs): number {
     case "init":
       runInit({ format });
       break;
+    case "epic":
+      // Subgroup: dispatch the leaf (or group help). The leaf owns its own
+      // invocation tracking, so the parent never fires the generic trailer.
+      dispatchGroup(EPIC_GROUP, rest, format);
+      return 0;
+    case "task":
+      dispatchGroup(TASK_GROUP, rest, format);
+      return 0;
     default:
       noSuchCommand(command);
   }

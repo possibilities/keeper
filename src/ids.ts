@@ -26,6 +26,13 @@ export function isTaskId(s: string): boolean {
   return epic !== null && task !== null;
 }
 
+/** True iff `s` is an epic id (epic-num parses, task-num absent). Mirrors
+ * ids.is_epic_id. */
+export function isEpicId(s: string): boolean {
+  const [epic, task] = parseId(s);
+  return epic !== null && task === null;
+}
+
 /** Extract the epic id from a task id by stripping the final `.<task>` segment.
  * Throws on a non-task id. Mirrors ids.epic_id_from_task. */
 export function epicIdFromTask(taskId: string): string {

@@ -48,6 +48,24 @@ export function loadJsonSafe(path: string): Record<string, unknown> | null {
   }
 }
 
+/** Parse JSON at `path`, RAISING on a missing or malformed file (the strict
+ * counterpart of loadJsonSafe). Mirrors load_json — the verb-level error path
+ * surfaces the throw as Python's emit_error envelope, so the caller must catch
+ * it where Python catches FileNotFoundError / JSONDecodeError. */
+export function loadJson(path: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(path, "utf-8")) as Record<string, unknown>;
+}
+
+/** Read a payload from `fileArg` (a path), or from stdin when it is null or
+ * `"-"`. Mirrors read_file_or_stdin: stdin is read via fd 0 so a piped or
+ * heredoc body works the same across engines. */
+export function readFileOrStdin(fileArg: string | null): string {
+  if (fileArg === null || fileArg === "-") {
+    return readFileSync(0, "utf-8");
+  }
+  return readFileSync(fileArg, "utf-8");
+}
+
 // JSON value shape we serialize — mirrors what Python's json.dumps accepts for
 // state files (objects, arrays, strings, numbers, bool, null).
 type JsonValue =
