@@ -24,5 +24,5 @@ seedState byte-fidelity is the keystone — a divergent layout invalidates every
 - [ ] Both suites still green (pytest untouched; existing bun tests pass with the repoint)
 
 ## Done summary
-
+Landed test/harness.ts (byte-faithful port of the conftest fixture spec) with self-tests proving seedState's on-disk bytes match the compiled binary's reads; migrated the verdict golden corpus to test/fixtures/golden with PROVENANCE.md and repointed src-audit-spine; committed the live pytest --collect-only inventory (900 nodes) outside tests/ and set the package.json --timeout floor. Both suites green.
 ## Evidence
