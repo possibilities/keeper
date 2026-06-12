@@ -16,6 +16,9 @@
 // the symbols object, so we dereference the pointer with bun:ffi read.i32.
 
 import { dlopen, FFIType, type Pointer, read, suffix } from "bun:ffi";
+import { closeSync, mkdirSync, openSync } from "node:fs";
+import { homedir } from "node:os";
+import { dirname, join } from "node:path";
 
 // flock(2) operation constants — identical across darwin/linux (these are the
 // BSD flock API values, not platform-specific unlike errno).
@@ -124,4 +127,66 @@ export function flockOrThrow(fd: number, op: number): void {
     throw new FlockWouldBlock();
   }
   throw new Error(`flock(fd=${fd}, op=${op}) failed (errno ${err})`);
+}
+
+// ---------------------------------------------------------------------------
+// Global epic-id lock — the byte-compatible peer of run_epic_create._epic_id_lock.
+// ---------------------------------------------------------------------------
+
+// Same lock PATH Python uses so a bun create and a Python create serialize
+// against each other across process boundaries: `~/.local/state/planctl/...`,
+// honoring $HOME first (matching Python Path.expanduser).
+function epicIdLockPath(): string {
+  const home = process.env.HOME || homedir();
+  return join(home, ".local", "state", "planctl", "epic-id.lock");
+}
+
+/** Run `fn` while holding the global epic-id lock (blocking LOCK_EX) over the
+ * scan -> global-name-check -> write-epic critical section. FAIL-SOFT: if the
+ * lock file cannot be created or locked (unwritable state dir, OSError), `fn`
+ * runs UNLOCKED rather than hard-breaking create — the per-project
+ * epic-path-exists backstop is the degraded guard. The fd is unlocked + closed
+ * in finally. NEVER routes through flockOrThrow: a contended blocking LOCK_EX
+ * parks until granted, and any acquire error degrades to unlocked. Mirrors
+ * run_epic_create._epic_id_lock. */
+export function withEpicIdLock<T>(fn: () => T): T {
+  let fd: number | null = null;
+  try {
+    const path = epicIdLockPath();
+    mkdirSync(dirname(path), { recursive: true });
+    fd = openSync(path, "w");
+    // Blocking LOCK_EX: parks until granted, never throws on contention.
+    if (flock(fd, LOCK_EX) !== 0) {
+      // Acquire failed — degrade to unlocked (fail-soft).
+      closeFdQuiet(fd);
+      fd = null;
+    }
+  } catch {
+    // Could not establish the lock — proceed unlocked (fail-soft).
+    if (fd !== null) {
+      closeFdQuiet(fd);
+      fd = null;
+    }
+  }
+
+  try {
+    return fn();
+  } finally {
+    if (fd !== null) {
+      try {
+        flock(fd, LOCK_UN);
+      } catch {
+        // ignore — closing the fd releases the advisory lock anyway.
+      }
+      closeFdQuiet(fd);
+    }
+  }
+}
+
+function closeFdQuiet(fd: number): void {
+  try {
+    closeSync(fd);
+  } catch {
+    // ignore — best-effort release.
+  }
 }

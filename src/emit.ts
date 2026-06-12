@@ -180,3 +180,24 @@ export function emitReadonlyData(
 ): void {
   formatOutput({ success: true, ...data }, format);
 }
+
+/** The accumulate-all failure emit path — the port of run_scaffold._emit_failure.
+ * Prints ONE compact NDJSON line
+ *   {"success":false,"error":{"code","message","details":[strings]}}
+ * BYPASSING the invocation builder (a pre-commit failure has no invocation to
+ * embed) — a sibling of the landed emit paths, never a modification of them.
+ * Scaffold / refine-apply accumulate every error across buckets and emit one
+ * envelope describing the dominant code with all details; this is that single
+ * write. Does NOT exit on its own — the caller returns the non-zero code so the
+ * dispatcher owns process exit. */
+export function emitFailureEnvelope(
+  code: string,
+  message: string,
+  details: string[],
+): void {
+  const envelope = {
+    success: false,
+    error: { code, message, details },
+  };
+  process.stdout.write(`${compactJson(envelope)}\n`);
+}

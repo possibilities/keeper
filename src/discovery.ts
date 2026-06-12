@@ -308,3 +308,46 @@ export function scanEpicIdsGlobal(
   }
   return owners;
 }
+
+/** The owning project path if ``epicId`` already exists in a DIFFERENT
+ * discovered project, else null — the global-name uniqueness check at epic
+ * allocation time, so two projects can never mint the same full ``fn-N-slug``
+ * even though per-project numbering is independent.
+ *
+ * Excludes ``localProjectPath`` (a same-project collision is the caller's own
+ * epic-path-exists backstop). FAIL-SOFT: if discovery raises or yields no
+ * foreign projects, returns null so a fresh / foreign system never hard-breaks
+ * creation. Mirrors run_epic_create._check_global_name_unique. */
+export function checkGlobalNameUnique(
+  epicId: string,
+  localProjectPath: string,
+): string | null {
+  let projects: string[];
+  try {
+    projects = discoverProjects();
+  } catch {
+    return null;
+  }
+
+  let local: string;
+  try {
+    local = realpathSync(localProjectPath);
+  } catch {
+    local = localProjectPath;
+  }
+  const foreign = projects.filter((p) => {
+    let resolved: string;
+    try {
+      resolved = realpathSync(p);
+    } catch {
+      resolved = p;
+    }
+    return resolved !== local;
+  });
+  if (foreign.length === 0) {
+    return null;
+  }
+
+  const owners = scanEpicIdsGlobal(foreign);
+  return owners[epicId] ?? null;
+}

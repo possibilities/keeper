@@ -10,7 +10,7 @@ import { existsSync, readFileSync, realpathSync } from "node:fs";
 import { homedir } from "node:os";
 import { isAbsolute, resolve } from "node:path";
 
-import yaml from "js-yaml";
+import { parseYamlInput } from "./yaml_input.ts";
 
 // Default roots when the config file is absent or unusable.
 const DEFAULT_ROOTS = ["~/code"];
@@ -77,7 +77,10 @@ export function loadRoots(path?: string): string[] {
   let rawRoots: unknown[] | null = null;
   if (existsSync(p)) {
     try {
-      const data = yaml.load(readFileSync(p, "utf-8"));
+      // PARSER UNITY: config shares the scaffold/refine-apply YAML wrapper
+      // (eemeli 1.1, duplicate-key last-wins) so all bun YAML input parses one
+      // way. Fail-soft is preserved — a parse/UTF-8 throw degrades to default.
+      const data = parseYamlInput(readFileSync(p), p);
       if (data !== null && typeof data === "object" && !Array.isArray(data)) {
         const candidate = (data as Record<string, unknown>).roots;
         if (Array.isArray(candidate)) {
