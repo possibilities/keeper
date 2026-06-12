@@ -285,6 +285,33 @@ export function buildTmuxListPanesArgs(): string[] {
 }
 
 /**
+ * Locale-defaulted env for tmux spawns that must stay byte-faithful. A tmux
+ * CLIENT running under the C locale sanitizes control characters in `-F`
+ * format output — the sweep's TAB delimiters arrive as `_`, every line parses
+ * as malformed, and the sweep reads as an empty (non-degraded) snapshot.
+ * keeperd runs as a LaunchAgent whose env carries no `LANG`/`LC_*` at all, so
+ * without a default every daemon-side tmux client lands in the C locale. The
+ * `LANG` default is applied ONLY when no locale variable is set; an explicitly
+ * configured locale (any of `LC_ALL` / `LC_CTYPE` / `LANG`, per setlocale
+ * precedence) wins. Pure — exported for tests.
+ */
+export function localeDefaultedEnv(
+  base: Record<string, string | undefined>,
+): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(base)) {
+    if (v !== undefined) {
+      out[k] = v;
+    }
+  }
+  // Empty-string locale vars count as unset (setlocale semantics).
+  if (!out.LC_ALL && !out.LC_CTYPE && !out.LANG) {
+    out.LANG = "en_US.UTF-8";
+  }
+  return out;
+}
+
+/**
  * Build the tmux `rename-window -t <windowId> -- <name>` argv. Pure — exported
  * for tests. Targets by WINDOW id (`@N`, server-global durable handle) — never
  * name-based, since colons in names break target parsing. The `--` is
@@ -397,9 +424,10 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
   /**
    * Per-call get-or-create for `targetSession`: a `has-session -t =<session>`
    * probe (exit 0 = live), and `new-session -d` mint when absent. The mint spawn
-   * carries color-capable `TERM`/`COLORTERM` defaults — keeperd runs as a
-   * LaunchAgent with env stripped, so a server minted here would otherwise
-   * render every worker pane colorblind. NEVER throws; a probe `null` (ENOENT)
+   * carries color-capable `TERM`/`COLORTERM` defaults plus a UTF-8 locale
+   * default — keeperd runs as a LaunchAgent with env stripped, so a server
+   * minted here would otherwise render every worker pane colorblind and treat
+   * non-ASCII window names as unprintable. NEVER throws; a probe `null` (ENOENT)
    * skips the mint and the caller's `new-window` then fails loud with
    * `{ ok: false }`.
    */
@@ -415,8 +443,10 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
       );
       return;
     }
+    // Locale-defaulted alongside the color env: a server minted by a C-locale
+    // client treats non-ASCII window names as unprintable server-wide.
     await runCapture(buildTmuxNewSessionArgs(targetSession), {
-      ...(process.env as Record<string, string>),
+      ...localeDefaultedEnv(process.env as Record<string, string | undefined>),
       TERM: process.env.TERM ?? "xterm-256color",
       COLORTERM: process.env.COLORTERM ?? "truecolor",
     });
@@ -510,8 +540,13 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
       // to skip this cycle. Parse is tab-delimited with `window_name` LAST and
       // a 2-split limit so a tab inside an arbitrary window name cannot bleed
       // into the pane/window fields. Malformed lines are dropped silently — a
-      // partial sweep is still a usable snapshot.
-      const res = await runCapture(buildTmuxListPanesArgs());
+      // partial sweep is still a usable snapshot. The locale-defaulted env is
+      // LOAD-BEARING: a C-locale client sanitizes the TAB delimiters to `_`,
+      // which would drop every line and read as an empty sweep.
+      const res = await runCapture(
+        buildTmuxListPanesArgs(),
+        localeDefaultedEnv(process.env as Record<string, string | undefined>),
+      );
       if (res == null || res.exitCode !== 0) {
         return null;
       }

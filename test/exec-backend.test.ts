@@ -33,6 +33,7 @@ import {
   createTmuxBackend,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
+  localeDefaultedEnv,
   MANAGED_EXEC_SESSION,
   resolveExecBackend,
   type SpawnFn,
@@ -612,6 +613,82 @@ test("createTmuxBackend.listPanes: non-zero exit (no server) → null", async ()
   );
   const backend = createTmuxBackend({ noteLine: () => {}, spawn });
   expect(await backend.listPanes()).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// localeDefaultedEnv — UTF-8 locale default for byte-faithful tmux spawns
+// ---------------------------------------------------------------------------
+
+test("localeDefaultedEnv: no locale vars → LANG defaulted to en_US.UTF-8", () => {
+  const got = localeDefaultedEnv({ PATH: "/usr/bin", HOME: "/Users/x" });
+  expect(got).toEqual({
+    PATH: "/usr/bin",
+    HOME: "/Users/x",
+    LANG: "en_US.UTF-8",
+  });
+});
+
+test("localeDefaultedEnv: an explicitly configured locale wins (no override)", () => {
+  expect(localeDefaultedEnv({ LANG: "fr_FR.UTF-8" }).LANG).toBe("fr_FR.UTF-8");
+  const viaCtype = localeDefaultedEnv({ LC_CTYPE: "en_US.UTF-8" });
+  expect(viaCtype.LANG).toBeUndefined();
+  const viaAll = localeDefaultedEnv({ LC_ALL: "C" });
+  expect(viaAll.LANG).toBeUndefined();
+});
+
+test("localeDefaultedEnv: empty-string locale vars count as unset; undefined values are dropped", () => {
+  const got = localeDefaultedEnv({
+    LANG: "",
+    LC_CTYPE: "",
+    TERM: undefined,
+    PATH: "/bin",
+  });
+  expect(got.LANG).toBe("en_US.UTF-8");
+  expect("TERM" in got).toBe(false);
+  expect(got.PATH).toBe("/bin");
+});
+
+test("createTmuxBackend.listPanes: sweep spawn carries a locale-bearing env (C-locale clients sanitize the tab delimiters)", async () => {
+  const envByCall: Array<Record<string, string> | undefined> = [];
+  const spawn: SpawnFn = (_cmd, options) => {
+    envByCall.push(options.env);
+    return {
+      exited: Promise.resolve(0),
+      stdout: new Response("%1\t@1\tname\n").body,
+      stderr: new Response("").body,
+      kill: () => {},
+    };
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  await backend.listPanes();
+  const env = envByCall[0];
+  expect(env).toBeDefined();
+  expect(
+    Boolean(env?.LC_ALL || env?.LC_CTYPE || env?.LANG),
+  ).toBe(true);
+});
+
+test("createTmuxBackend.launch: new-session mint env carries a locale alongside TERM/COLORTERM", async () => {
+  const cmds: string[][] = [];
+  const envByCall: Array<Record<string, string> | undefined> = [];
+  const spawn: SpawnFn = (cmd, options) => {
+    cmds.push([...cmd]);
+    envByCall.push(options.env);
+    return {
+      exited: Promise.resolve(cmd[1] === "has-session" ? 1 : 0),
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+      kill: () => {},
+    };
+  };
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  await backend.launch(["claude"], "label", "/tmp");
+  const mintIdx = cmds.findIndex((c) => c[1] === "new-session");
+  expect(mintIdx).toBeGreaterThanOrEqual(0);
+  const mintEnv = envByCall[mintIdx];
+  expect(
+    Boolean(mintEnv?.LC_ALL || mintEnv?.LC_CTYPE || mintEnv?.LANG),
+  ).toBe(true);
 });
 
 test("createTmuxBackend.listPanes: ENOENT (binary missing) → null, never throws", async () => {
