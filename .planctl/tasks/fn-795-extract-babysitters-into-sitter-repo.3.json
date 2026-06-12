@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/sitter",
   "tier": "xhigh",
   "title": "Add schema-skew whitelist detector",
-  "updated_at": "2026-06-11T23:35:50.346446Z"
+  "updated_at": "2026-06-12T01:32:05.187781Z",
+  "worker_done_at": "2026-06-12T01:32:05.187781Z"
 }

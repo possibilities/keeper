@@ -65,5 +65,5 @@ Covered in Approach; all green under `bun test`.
 - [ ] meta-read failure can never throw out of scan()
 
 ## Done summary
-
+Added a schema-skew guard to the performance sitter: SUPPORTED_SCHEMA_VERSIONS whitelist + degrade-don't-throw readSchemaVersion, detectSchemaSkew pure detector, and a scan() gate that pages once and skips DB detectors on an unknown/unreadable schema_version. Tests cover v66-clean, bump-to-99, deleted-meta, and the whitelist/fixture membership pin.
 ## Evidence
