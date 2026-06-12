@@ -163,6 +163,10 @@ function makeSnapshot(
     gitStatusByProjectDir: new Map(),
     failedKeys: new Set(),
     liveTabKeys: new Set(),
+    // fn-811: read-time backend liveness. Default `null` (probe unavailable) so
+    // every pre-fn-811 test keeps the old stopped-always-occupies behavior; the
+    // liveness-gated tests override it with a live-pane set.
+    livePaneIds: null,
     // fn-721: the launch-window occupancy set feeding the cross-sibling
     // `dispatch-pending` occupant. Default empty; tests that exercise the
     // occupant override it.
@@ -430,7 +434,7 @@ test("fn-721: verbForVerdict(dispatch-pending) → null (launch-window slot stay
 // isOccupyingJob
 // ---------------------------------------------------------------------------
 
-test("isOccupyingJob: working state with matching (verb, id) → true", () => {
+test("isOccupyingJob: working state occupies regardless of pane liveness", () => {
   const jobs = new Map<string, Job>();
   jobs.set(
     "j-1",
@@ -439,12 +443,16 @@ test("isOccupyingJob: working state with matching (verb, id) → true", () => {
       plan_verb: "work",
       plan_ref: "fn-1-foo.1",
       state: "working",
+      backend_exec_pane_id: "%1",
     }),
   );
-  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1")).toBe(true);
+  // A `working` row occupies whether or not its pane shows in the probe — the
+  // liveness gate only narrows the `stopped` arm.
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", new Set())).toBe(true);
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", null)).toBe(true);
 });
 
-test("isOccupyingJob: stopped state still occupies (the schema default)", () => {
+test("fn-811 isOccupyingJob: stopped-with-LIVE-pane still occupies", () => {
   const jobs = new Map<string, Job>();
   jobs.set(
     "j-1",
@@ -453,9 +461,53 @@ test("isOccupyingJob: stopped state still occupies (the schema default)", () => 
       plan_verb: "work",
       plan_ref: "fn-1-foo.1",
       state: "stopped",
+      backend_exec_pane_id: "%7",
     }),
   );
-  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1")).toBe(true);
+  // A parked-but-alive session (its pane is in the live set) keeps occupying —
+  // dispatching here would land a SECOND worker on the same task.
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", new Set(["%7"]))).toBe(
+    true,
+  );
+});
+
+test("fn-811 isOccupyingJob: stopped-with-DEAD-pane no longer occupies (the wedge fix)", () => {
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+      state: "stopped",
+      backend_exec_pane_id: "%7",
+    }),
+  );
+  // The worker ended its turn without completing the task and its pane is gone
+  // (absent from the live set) — the slot must free for re-dispatch instead of
+  // wedging forever.
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", new Set(["%99"]))).toBe(
+    false,
+  );
+  // No pane id at all is likewise not live-provable here.
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", new Set())).toBe(false);
+});
+
+test("fn-811 isOccupyingJob: null livePaneIds (degraded probe) keeps stopped occupying", () => {
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+      state: "stopped",
+      backend_exec_pane_id: "%7",
+    }),
+  );
+  // Probe unavailable — fall back to the conservative pre-liveness behavior so
+  // an un-probeable cycle never double-dispatches.
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", null)).toBe(true);
 });
 
 test("isOccupyingJob: ended / killed terminal rows do not occupy", () => {
@@ -478,7 +530,7 @@ test("isOccupyingJob: ended / killed terminal rows do not occupy", () => {
       state: "killed",
     }),
   );
-  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1")).toBe(false);
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", null)).toBe(false);
 });
 
 test("isOccupyingJob: plan_verb mismatch (stale non-work verb shares plan_ref) → no false match", () => {
@@ -498,7 +550,7 @@ test("isOccupyingJob: plan_verb mismatch (stale non-work verb shares plan_ref) �
       state: "working",
     }),
   );
-  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1")).toBe(false);
+  expect(isOccupyingJob(jobs, "work", "fn-1-foo.1", null)).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
@@ -643,6 +695,61 @@ test("reconcile dedup: occupying job (working) blocks re-dispatch", () => {
     }),
   );
   const snap = makeSnapshot({ epics: [epic], jobs });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches).toEqual([]);
+});
+
+test("fn-811 reconcile dedup: stopped job whose pane is DEAD no longer blocks re-dispatch", () => {
+  // The wedge: a worker ended its turn without completing the task (its jobs
+  // row is `stopped`, the schema default) and its tmux pane is gone. The task
+  // is ready-and-unclaimed, so the dispatch gate must free the slot — with the
+  // live-pane set absent its `%9` pane, `isOccupyingJob` returns false and the
+  // task re-dispatches.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+      state: "stopped",
+      backend_exec_pane_id: "%9",
+    }),
+  );
+  const snap = makeSnapshot({
+    epics: [epic],
+    jobs,
+    livePaneIds: new Set(["%1"]), // %9 absent → dead pane
+  });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches.map((l) => l.key)).toContain("work::fn-1-foo.1");
+});
+
+test("fn-811 reconcile dedup: stopped job whose pane is LIVE still blocks re-dispatch", () => {
+  // A parked-but-alive session (stopped row, pane still present) keeps its slot
+  // — re-dispatching would land a second worker on the same task.
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  const jobs = new Map<string, Job>();
+  jobs.set(
+    "j-1",
+    makeJob({
+      job_id: "j-1",
+      plan_verb: "work",
+      plan_ref: "fn-1-foo.1",
+      state: "stopped",
+      backend_exec_pane_id: "%9",
+    }),
+  );
+  const snap = makeSnapshot({
+    epics: [epic],
+    jobs,
+    livePaneIds: new Set(["%9"]), // %9 present → live pane
+  });
   const decision = reconcile(snap, makeState(), 0);
   expect(decision.launches).toEqual([]);
 });
@@ -2362,6 +2469,36 @@ test("fn-764: a done epic reaches completedRowIds through the REAL loadReconcile
   });
 });
 
+test("fn-811: loadReconcileSnapshot maps a listPanes probe into livePaneIds", async () => {
+  await withSeededDb(async (db) => {
+    const snap = await loadReconcileSnapshot(db, async () => [
+      { paneId: "%1", windowId: "@1", windowName: "w1" },
+      { paneId: "%2", windowId: "@2", windowName: "w2" },
+    ]);
+    expect(snap.livePaneIds).not.toBeNull();
+    expect([...(snap.livePaneIds ?? [])].sort()).toEqual(["%1", "%2"]);
+  });
+});
+
+test("fn-811: loadReconcileSnapshot yields null livePaneIds with no probe, a null probe, or a throwing probe", async () => {
+  await withSeededDb(async (db) => {
+    // No probe injected — the conservative fallback.
+    expect((await loadReconcileSnapshot(db)).livePaneIds).toBeNull();
+    // Probe present but degraded tmux returns null.
+    expect(
+      (await loadReconcileSnapshot(db, async () => null)).livePaneIds,
+    ).toBeNull();
+    // A throwing probe must not crash the cycle — it falls back to null.
+    expect(
+      (
+        await loadReconcileSnapshot(db, async () => {
+          throw new Error("tmux blew up");
+        })
+      ).livePaneIds,
+    ).toBeNull();
+  });
+});
+
 test("fn-779: a done epic with LIVE close-scope work never enters completedRowIds (liveness-gated completion)", async () => {
   await withSeededDb(async (db) => {
     // A done epic whose closer is still winding down — an epic-level (close-verb)
@@ -2814,7 +2951,7 @@ test("fn-773 isEpicInFlight: each in-flight signal flips it true; a cold epic is
   const noTabs = new Set<string>();
 
   // Cold — no signal.
-  expect(isEpicInFlight(epic, noJobs, noTabs)).toBe(false);
+  expect(isEpicInFlight(epic, noJobs, noTabs, null)).toBe(false);
 
   // Occupying close job.
   const closeJob = new Map([
@@ -2823,7 +2960,7 @@ test("fn-773 isEpicInFlight: each in-flight signal flips it true; a cold epic is
       makeJob({ state: "working", plan_verb: "close", plan_ref: "fn-1-foo" }),
     ],
   ]);
-  expect(isEpicInFlight(epic, closeJob, noTabs)).toBe(true);
+  expect(isEpicInFlight(epic, closeJob, noTabs, null)).toBe(true);
 
   // Occupying work job on a task.
   const workJob = new Map([
@@ -2836,20 +2973,23 @@ test("fn-773 isEpicInFlight: each in-flight signal flips it true; a cold epic is
       }),
     ],
   ]);
-  expect(isEpicInFlight(epic, workJob, noTabs)).toBe(true);
+  // `null` liveness (degraded probe) keeps the stopped work job occupying.
+  expect(isEpicInFlight(epic, workJob, noTabs, null)).toBe(true);
 
   // Live close surface.
-  expect(isEpicInFlight(epic, noJobs, new Set(["close::fn-1-foo"]))).toBe(true);
-
-  // Live work surface on a task.
-  expect(isEpicInFlight(epic, noJobs, new Set(["work::fn-1-foo.1"]))).toBe(
+  expect(isEpicInFlight(epic, noJobs, new Set(["close::fn-1-foo"]), null)).toBe(
     true,
   );
 
+  // Live work surface on a task.
+  expect(
+    isEpicInFlight(epic, noJobs, new Set(["work::fn-1-foo.1"]), null),
+  ).toBe(true);
+
   // A job/surface for a DIFFERENT epic's task does not flip it.
-  expect(isEpicInFlight(epic, noJobs, new Set(["work::fn-2-bar.1"]))).toBe(
-    false,
-  );
+  expect(
+    isEpicInFlight(epic, noJobs, new Set(["work::fn-2-bar.1"]), null),
+  ).toBe(false);
 });
 
 test("fn-770: armed epic on a SHARED root beats an earlier-sorted unarmed sibling and dispatches", () => {

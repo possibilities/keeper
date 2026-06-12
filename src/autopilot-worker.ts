@@ -45,7 +45,7 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { openDb } from "./db";
-import { resolveExecBackend } from "./exec-backend";
+import { type PaneInfo, resolveExecBackend } from "./exec-backend";
 import {
   computeReadiness,
   isRootOccupant,
@@ -329,6 +329,17 @@ export interface ReconcileSnapshot {
    * (same-key dedup vs cross-sibling demotion — both needed).
    */
   liveTabKeys: Set<DispatchKey>;
+  /**
+   * The LIVE backend pane ids from the read-time `listPanes()` probe, used to
+   * gate the `stopped` arm of {@link isOccupyingJob}: a stopped job whose
+   * `backend_exec_pane_id` is absent from this set is a dead-session row that
+   * no longer occupies its slot (the wedge fix), while a stopped row WITH a
+   * live pane and every `working` row still occupy. `null` when the probe is
+   * unavailable (degraded / missing tmux) — the conservative pre-liveness
+   * fallback where every stopped row occupies. Assembled in
+   * {@link loadReconcileSnapshot}; NEVER read in a fold.
+   */
+  livePaneIds: ReadonlySet<string> | null;
   /**
    * The open `pending_dispatches` rows projected into the {@link PendingDispatch}[]
    * shape `computeReadiness` consumes for the cross-sibling `dispatch-pending`
@@ -694,29 +705,67 @@ export function verbForVerdict(
 }
 
 /**
- * Inspect a `jobs` map for an OCCUPYING row keyed by `(plan_verb, plan_ref)`
- * whose `state` is in the non-terminal partition `{working, stopped}` (the
- * schema default is `stopped`, so a SessionStart-INSERTed row not yet at
- * `working` already occupies). Reading the projection instead of probing the backend
- * makes the dedup structurally race-free across restart — a non-terminal row for
- * `(verb, id)` means a dispatch would land a SECOND worker on the same task.
- * Pure — returns on first match.
+ * Inspect a `jobs` map for an OCCUPYING row keyed by `(plan_verb, plan_ref)`.
+ * A `working` row ALWAYS occupies. A `stopped` row occupies ONLY while its
+ * backend session is still LIVE — its `backend_exec_pane_id` appears in
+ * `livePaneIds`, the read-time `listPanes()` probe threaded through the
+ * snapshot. `stopped` is the schema default for BOTH a parked-alive session
+ * (still live, still occupies) AND a worker that ended its turn without
+ * completing its task (crashed / blocked-on-deps mid-task) whose pane is now
+ * GONE; gating on liveness lets the latter be re-dispatched instead of wedging
+ * the slot forever, while readiness already classifies it as ready (it reads
+ * `working` for predicate 5, never `stopped`). Aligns with `readiness.ts`
+ * `isLiveWorkOccupant` — a stopped-dead session holds no mutex slot.
+ *
+ * `livePaneIds === null` means the liveness probe was UNAVAILABLE (degraded /
+ * missing tmux) — fall back to the pre-liveness behavior where every stopped
+ * row occupies, never trading a double-dispatch for an un-probeable cycle. A
+ * stopped row with a NULL/empty `backend_exec_pane_id` (the SessionStart-
+ * INSERTed row not yet bound to a pane) is NOT live-provable here and does not
+ * occupy via this gate — the launch → SessionStart window is guarded by the
+ * `liveTabKeys` / cooldown arms instead, which this fix leaves untouched.
+ *
+ * The liveness facts are assembled READ-TIME in `loadReconcileSnapshot`; this
+ * predicate never probes the backend itself (and folds never read liveness —
+ * re-fold determinism is sacrosanct). Returns on first match.
  */
 export function isOccupyingJob(
   jobs: Map<string, Job>,
   verb: Verb,
   id: string,
+  livePaneIds: ReadonlySet<string> | null,
 ): boolean {
   for (const job of jobs.values()) {
-    if (
-      job.plan_verb === verb &&
-      job.plan_ref === id &&
-      (job.state === "working" || job.state === "stopped")
-    ) {
+    if (job.plan_verb !== verb || job.plan_ref !== id) {
+      continue;
+    }
+    if (job.state === "working") {
+      return true;
+    }
+    if (job.state === "stopped" && isStoppedJobLive(job, livePaneIds)) {
       return true;
     }
   }
   return false;
+}
+
+/**
+ * Is a `stopped` job's backend session still LIVE? `null` `livePaneIds` (probe
+ * unavailable) → assume live (the conservative pre-liveness fallback). A row
+ * with no `backend_exec_pane_id` is not live-provable → not live here.
+ */
+function isStoppedJobLive(
+  job: Job,
+  livePaneIds: ReadonlySet<string> | null,
+): boolean {
+  if (livePaneIds === null) {
+    return true;
+  }
+  const paneId = job.backend_exec_pane_id;
+  if (paneId == null || paneId === "") {
+    return false;
+  }
+  return livePaneIds.has(paneId);
 }
 
 /**
@@ -733,16 +782,17 @@ export function isEpicInFlight(
   epic: Epic,
   jobs: Map<string, Job>,
   liveTabKeys: Set<DispatchKey>,
+  livePaneIds: ReadonlySet<string> | null,
 ): boolean {
   if (
-    isOccupyingJob(jobs, "close", epic.epic_id) ||
+    isOccupyingJob(jobs, "close", epic.epic_id, livePaneIds) ||
     liveTabKeys.has(dispatchKey("close", epic.epic_id))
   ) {
     return true;
   }
   for (const task of epic.tasks) {
     if (
-      isOccupyingJob(jobs, "work", task.task_id) ||
+      isOccupyingJob(jobs, "work", task.task_id, livePaneIds) ||
       liveTabKeys.has(dispatchKey("work", task.task_id))
     ) {
       return true;
@@ -870,7 +920,7 @@ export function reconcile(
       if (snapshot.failedKeys.has(key)) {
         continue;
       }
-      if (isOccupyingJob(snapshot.jobs, verb, taskId)) {
+      if (isOccupyingJob(snapshot.jobs, verb, taskId, snapshot.livePaneIds)) {
         continue;
       }
       if (snapshot.liveTabKeys.has(key)) {
@@ -920,7 +970,12 @@ export function reconcile(
         !state.paused &&
         !state.inFlight.has(closeKey) &&
         !snapshot.failedKeys.has(closeKey) &&
-        !isOccupyingJob(snapshot.jobs, closeVerb, epicId) &&
+        !isOccupyingJob(
+          snapshot.jobs,
+          closeVerb,
+          epicId,
+          snapshot.livePaneIds,
+        ) &&
         // Standing dedup arm: a live `close::<epic>` tab proves a launched closer
         // occupies the slot before its SessionStart binds.
         !snapshot.liveTabKeys.has(closeKey) &&
@@ -944,7 +999,12 @@ export function reconcile(
         !(
           armedMode &&
           !eligible?.has(epicId) &&
-          !isEpicInFlight(epic, snapshot.jobs, snapshot.liveTabKeys)
+          !isEpicInFlight(
+            epic,
+            snapshot.jobs,
+            snapshot.liveTabKeys,
+            snapshot.livePaneIds,
+          )
         ) &&
         // Cap — the close-row push shares the SAME decrementing budget as the
         // task push, so a closer can't blow the cap.
@@ -1315,6 +1375,13 @@ type IncomingMessage =
  */
 export async function loadReconcileSnapshot(
   db: Parameters<typeof runQuery>[0],
+  // Read-time backend liveness probe (`ExecBackend.listPanes`) — assembles the
+  // `livePaneIds` set that gates {@link isOccupyingJob}'s stopped arm. Threaded
+  // in (not imported) so this stays a pure read over `db` + the probe and tests
+  // inject a fake. ABSENT or a `null`/throwing probe yields `livePaneIds = null`
+  // (the conservative fallback: every stopped row occupies). NEVER read in a
+  // fold — liveness lives only on this read-time path.
+  listPanes?: () => Promise<PaneInfo[] | null>,
 ): Promise<ReconcileSnapshot> {
   const read = (collection: string): Record<string, unknown>[] => {
     const frame = {
@@ -1415,6 +1482,25 @@ export async function loadReconcileSnapshot(
     }
   }
 
+  // Liveness probe — `null` whenever the probe is absent, returns `null`
+  // (degraded tmux), or throws (NEVER let a probe failure crash the cycle); the
+  // null fallback keeps every stopped row occupying, so an un-probeable cycle
+  // can only over-suppress, never double-dispatch.
+  let livePaneIds: ReadonlySet<string> | null = null;
+  if (listPanes !== undefined) {
+    try {
+      const panes = await listPanes();
+      if (panes !== null) {
+        livePaneIds = new Set(panes.map((pane) => pane.paneId));
+      }
+    } catch (err) {
+      console.error(
+        "[autopilot-worker] listPanes probe threw (non-fatal):",
+        err,
+      );
+    }
+  }
+
   return {
     epics,
     jobs,
@@ -1422,6 +1508,7 @@ export async function loadReconcileSnapshot(
     gitStatusByProjectDir,
     failedKeys,
     liveTabKeys,
+    livePaneIds,
     pendingDispatches,
     mode,
     armedIds,
@@ -1701,7 +1788,12 @@ function main(): void {
         if (shutdown) {
           return;
         }
-        const snapshot = await loadReconcileSnapshot(db);
+        // Pass the backend's `listPanes` as the read-time liveness probe so the
+        // stopped-arm occupancy gate (`isOccupyingJob`) sees which sessions are
+        // actually live — a stopped-dead pane no longer wedges its slot.
+        const snapshot = await loadReconcileSnapshot(db, () =>
+          backend.listPanes(),
+        );
         // Prune expired cooldown entries each cycle, BEFORE `reconcile` reads the
         // Map so a just-expired key is re-dispatchable this cycle. Wrapped
         // (no-self-heal: a sweep throw must not crash the worker).
