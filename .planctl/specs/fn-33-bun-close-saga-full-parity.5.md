@@ -30,5 +30,5 @@ test_close_finalize.py + test_close_preflight.py + test_epic_close coverage gree
 - [ ] epic followup-of remains nonexistent (conformance test green)
 
 ## Done summary
-
+Ported the close saga to full bun CLI parity: epic close / close-preflight / close-finalize + gist verbs, scaffold's created_by_close_of provenance stamp, leaf --help + unknown-option rejection in the subgroup dispatch. Full-suite conformance (PLANCTL_BIN bun, --run-slow) is green: 888 passed, 31 skipped, all skips python_only. Docs collapsed to full-parity statements.
 ## Evidence
