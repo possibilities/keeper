@@ -25,5 +25,5 @@ Symlink and bootstrap the three not-yet-loaded watch jobs (arthack.babysitter.gi
 - [ ] FINDINGS-LEDGER consistent with the shipped followup schemas
 
 ## Done summary
-
+Symlinked + bootstrapped the gitpolice, helptailing, and builds watch jobs; all four sitters now load with last exit 0 and have state dirs + heartbeats after first ticks. Corrected the stale builds (headless-agent) description in FINDINGS-LEDGER to pull-model. README install/uninstall already matched reality.
 ## Evidence

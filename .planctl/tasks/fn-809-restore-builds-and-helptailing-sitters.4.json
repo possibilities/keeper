@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/sitter",
   "tier": "medium",
   "title": "Bootstrap launchd jobs and docs sweep",
-  "updated_at": "2026-06-12T20:28:46.821000Z"
+  "updated_at": "2026-06-12T20:54:23.849000Z",
+  "worker_done_at": "2026-06-12T20:54:23.849000Z"
 }
