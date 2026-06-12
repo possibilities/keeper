@@ -40,5 +40,5 @@ Byte-identity test: seed a mix of scrape-side planctl events, trailer-carrying C
 - [ ] bun run test:full green
 
 ## Done summary
-
+syncPlanctlLinks now performs exactly one commit-trailer load per call via loadAllCommitTrailerFacts (grouped by session, reused for current-session facts + cross-session sweep + per-epic rebuild). The SQL json_extract is gone from the commit-trailer channel — every Commit parses in JS via extractCommit, removing the malformed-JSON throw surface; byte-identity preserved.
 ## Evidence

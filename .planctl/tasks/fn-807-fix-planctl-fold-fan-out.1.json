@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Single-scan commit-trailer hoist",
-  "updated_at": "2026-06-12T14:35:44.039231Z"
+  "updated_at": "2026-06-12T14:49:20.180382Z",
+  "worker_done_at": "2026-06-12T14:49:20.180382Z"
 }
