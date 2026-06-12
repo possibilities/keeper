@@ -62,5 +62,5 @@ review moment.
 - [ ] build-pin asserts the zero-keeper-import fence
 
 ## Done summary
-
+Ported the performance-sitter test suites onto a checked-in schema-v66.sql contract fixture + fixture-db helper (replacing keeper's freshDbFile), repointed all DB opens to the vendored openDbReadonly, and repurposed the build-pin to assert the public surface plus the zero-keeper-import fence. 125 tests green in ~/code/sitter.
 ## Evidence

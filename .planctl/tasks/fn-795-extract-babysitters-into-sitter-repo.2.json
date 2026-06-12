@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/sitter",
   "tier": "high",
   "title": "Port tests onto schema fixture",
-  "updated_at": "2026-06-11T23:35:50.346446Z"
+  "updated_at": "2026-06-12T01:22:28.985784Z",
+  "worker_done_at": "2026-06-12T01:22:28.985784Z"
 }
