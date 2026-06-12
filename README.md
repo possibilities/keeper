@@ -113,8 +113,8 @@ no `-shm` recovery path to walk — closing a boot-race failure surface under lo
 (If an external read-only attachment is present, `wal_checkpoint` returns a busy
 status row rather than throwing, degrading to a `busy_timeout`-bounded PASSIVE
 pause; boot proceeds.) Steady-state checkpoints stay `PASSIVE` (writer-skipping),
-never `TRUNCATE`: live workers and the reaper run concurrently there, and PASSIVE
-skips them without blocking.
+never `TRUNCATE`: live workers and background readers run concurrently there, and
+PASSIVE skips them without blocking.
 
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
@@ -319,8 +319,10 @@ Keeper has no `install` verb. Wire it up manually:
      reconciler dispatches workers into. `tmux` is the sole backend and the
      default; any other value warns and falls back to `tmux`. The managed-session
      name is hardcoded (`autopilot`), NOT configurable; each dispatch opens a new
-     window inside that shared background session. keeper never closes a window
-     — windows stay open for inspection.
+     window inside that shared background session. The window-reaper worker
+     closes a managed window ONLY once its work is verifiably complete (stopped
+     >60s with a completed readiness verdict); every other window stays open for
+     inspection.
    - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
      jobs. A positive integer enforces the cap; omit or set non-positive
      (the default) to leave it unlimited. The cap bounds only `work`/`close`
@@ -1877,8 +1879,9 @@ a test) emits `DispatchExpired` only if the bind truly never lands. On
 `set-paused` (boot-pause included via the same relay), the worker reaped stale
 launch-window surfaces by intersecting `list-panes -a -j` with OPEN
 `pending_dispatches` rows — a discharged row = live worker, never reaped — and
-the reap never threw (no-self-heal). That reap (`ExecBackend.reapSurfaces`) was
-deleted in epic fn-789: keeper never closes a window.
+the reap never threw (no-self-heal). That broad reap (`ExecBackend.reapSurfaces`)
+was deleted in epic fn-789; the fn-802 window-reaper is its narrow,
+completion-gated successor (a single `killWindow`, never a sweep).
 As of schema v42 (fn-661), the new `dispatch_failures` projection table
 (keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
 reconciler uses to dedup against `jobs`) carries the sticky failure record
@@ -2146,8 +2149,9 @@ and flips on the `set_autopilot_paused` RPC, which appends an
 `AutopilotPaused{paused}` event FIRST then flips the worker gate only
 on a successful insert (so the gate and the projection cannot diverge
 on partial failure). The terminal-surface mechanics live behind the
-`ExecBackend` (`src/exec-backend.ts`) — `launch`, `focusPane`, and
-`ensureLaunched`; there is no `reapSurfaces` (keeper never closes a window).
+`ExecBackend` (`src/exec-backend.ts`) — `launch`, `focusPane`,
+`ensureLaunched`, `listPanes`/`renameWindow` (the renamer), and `killWindow`
+(the reaper's only kill op; there is no general `reapSurfaces` close path).
 `ensureLaunched` (session-agnostic) get-or-creates the
 target session with its own per-call mint and launches an
 unnamed window — `restore-agents.ts` is the consumer. tmux is the sole backend,
@@ -2168,13 +2172,17 @@ is KEPT, `inFlight` releases, and the 120s TTL sweep
 (`PENDING_DISPATCH_TTL_MS > ceilingMs (60s)`, an invariant pinned by a test)
 emits `DispatchExpired` only if the bind truly never lands.
 
-keeper NEVER closes a window. There is no launch-window reap and no completion
-reap — every dispatched window (pending, live, completed, or
-worker-ended-incomplete) stays open for inspection until the human closes it.
-The pause-ghost and completion reaps, and the `autoclose_windows` config key,
-were deleted outright in epic fn-789 — `reapSurfaces` no longer exists on
-`ExecBackend`, and the pending-dispatch row discharges on `SessionStart` or the
-120s TTL sweep (above), never via a `list-panes` close path. The close-row
+keeper closes a managed window ONLY through the window-reaper worker (epic
+fn-802), and only when the work is VERIFIABLY complete: an autopilot-dispatched
+`work`/`close` job stopped for over 60s with a `{tag:"completed"}` readiness
+verdict. Every other window — pending, live, working, or worker-ended-incomplete
+— stays open for inspection until the human closes it. The launch-window
+pause-ghost reap and the `autoclose_windows` config key were deleted outright in
+epic fn-789 (the broad `reapSurfaces` close path no longer exists on
+`ExecBackend`); the reaper is its narrow, evidence-gated successor (`killWindow`
+on a single managed pane, never a `list-panes` sweep-and-close). The
+pending-dispatch row still discharges on `SessionStart` or the 120s TTL sweep
+(above), independent of the reaper. The close-row
 readiness verdict still rides the fn-764 wind-down read: the default epics read
 scopes to `status='open'`, so a SECOND bounded read (`filter:{status:"done"}`,
 sorted `updated_at` DESC, limited to a small window — never O(all done history),
@@ -2270,7 +2278,33 @@ unhandled throw out of the watch loop escalates via `onerror`/`close` →
 fatalExit. Human windows get useful tab names for free; autopilot's managed
 windows (deliberately launched unnamed) finally get labels.
 
-The eleven workers are fully independent; main supervises all eleven
+A **twelfth** Worker thread is the tmux window-reaper (epic fn-802): a pure
+EXTERNAL ACTUATOR that opens its own read-only connection and drives a
+single-flight cycle from BOTH `PRAGMA data_version` pulses (via the shared
+`watchLoop`) AND a coarse ~20s periodic tick — the tick is LOAD-BEARING, not
+telemetry, because the 60s completion threshold elapsing writes NOTHING to the
+DB, so no pulse fires on aging alone and time itself must wake the cycle. Each
+cycle loads the SAME `loadReconcileSnapshot` the autopilot reconciler uses
+(including the merged recently-done epics read that makes close-row `completed`
+verdicts observable), runs `computeReadiness` at unix-seconds now, and selects
+the rows passing the FULL predicate: managed session (`autopilot`) AND a
+`work`/`close` verb with a `plan_ref` AND `state='stopped'` for over 60s AND a
+non-null pane id AND a non-null pid AND a `{tag:"completed"}` verdict looked up
+BY VERB (work → `perTask`, close → `perCloseRow` — never both maps, so an
+approve row's `perTask` verdict can't leak through). Immediately before each
+kill it re-runs the full predicate against a FRESH snapshot and requires the
+SAME job to still pass (the CWE-367 TOCTOU mitigation: a resume that flipped the
+verdict aborts the kill), then fires `killWindow` on the stable `%N` pane handle
+(rename-proof against the concurrent renamer) and stamps an in-memory ~10min
+per-job cooldown so a SIGHUP-absorbing process or an already-gone window doesn't
+re-spawn tmux every cycle. It writes NOTHING to the DB and posts NOTHING to main
+— row terminalization flows through the existing exit-watcher → synthetic
+`Killed` mint (pid + start_time match), the SOLE truth of the death; the kill is
+never assumed to have sufficed. The cooldown is in-memory only, so a restart
+re-derives and re-kills once (an idempotent no-op against a closed window). One
+stderr audit line per attempt is the only trace it leaves.
+
+The twelve workers are fully independent; main supervises all twelve
 lifecycles but routes none of their traffic, and any worker's `error`
 event escalates the whole process to a clean restart — with that single
 scoped exception, the recoverable drop signal on the transcript, plan,

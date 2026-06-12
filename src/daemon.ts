@@ -78,6 +78,7 @@ import type {
   PlanWorkerOutbound,
   RecheckPendingMessage,
 } from "./plan-worker";
+import type { ReaperWorkerData } from "./reaper-worker";
 import {
   DEFAULT_BATCH_SIZE,
   type DrainOptions,
@@ -1062,7 +1063,8 @@ export type WorkerName =
   | "autopilot"
   | "maintenance"
   | "restore"
-  | "renamer";
+  | "renamer"
+  | "reaper";
 
 /**
  * The full worker set, in spawn order — the production boot ({@link runDaemon}
@@ -1084,6 +1086,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "maintenance",
   "restore",
   "renamer",
+  "reaper",
 ] as const;
 
 /**
@@ -3396,6 +3399,30 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
+  // Gated on the selector — `null` when unselected.
+  const reaperWorker = want("reaper")
+    ? new Worker(new URL("./reaper-worker.ts", import.meta.url).href, {
+        workerData: { dbPath } satisfies ReaperWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (reaperWorker) {
+    const rpw = reaperWorker;
+    // NO onmessage handler: the reaper is a pure external actuator (reads the
+    // jobs/epics projections read-only, kills via tmux kill-window). It writes
+    // NOTHING to the DB — row terminalization flows through the existing
+    // exit-watcher → synthetic Killed mint, NOT a message from here. Only the
+    // lifecycle onerror + close guards escalate to the single recovery path.
+    rpw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] reaper worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    rpw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -3467,6 +3494,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       maintenanceWorker,
       restoreWorker,
       renamerWorker,
+      reaperWorker,
     ].filter((w): w is Worker => w !== null);
 
     // Wrap each shutdown post per-worker: an already-exited worker makes
