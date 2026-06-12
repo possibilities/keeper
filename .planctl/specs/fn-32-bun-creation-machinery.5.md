@@ -28,5 +28,5 @@ test_epic_rm.py + test_multi_repo_create_validate.py eligible sets green via the
 - [ ] rm --dry-run produces zero commits and intact files; deletions auto-commit correctly
 
 ## Done summary
-
+Ported epic create + epic rm to planctl-bun: single-epic flock mint with hard emit_error failure, and full-artifact deletion with recordTouched-before-unlink commit staging (dry-run readonly, --force live-task guard, cwd-then-global --project resolution). Eligible conformance green vs the compiled binary; docs updated in place.
 ## Evidence
