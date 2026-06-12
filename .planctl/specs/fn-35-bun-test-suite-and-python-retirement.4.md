@@ -23,5 +23,5 @@ Oracle capture must run against the current python NOW — version skew between 
 - [ ] Concurrency coverage preserved bun-vs-bun; both suites green
 
 ## Done summary
-
+Converted the python-oracle bun tests (audit-spine commit-set hashes + integrity catalog/restamp-verb list frozen to literals; store-write flock interop to a second bun peer; creation mint race to N bun workers, mint_worker.py removed) and translated the skill/template/epic-field consistency suites onto the live CLI surface. Zero python3/uv invocations remain anywhere in test/; bun test green fast + PLANCTL_RUN_SLOW=1, lint/typecheck clean.
 ## Evidence
