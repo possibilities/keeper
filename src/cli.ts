@@ -12,8 +12,12 @@
 // error envelope + exit 1 inline (the contract for detect's found-false tail).
 // The trailer is suppressed for the cat/validate contract verbs by name.
 
+import { autoCommitFromInvocation, CommitFailed } from "./commit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
-import { buildPlanctlInvocationReadonly } from "./invocation.ts";
+import {
+  buildPlanctlInvocation,
+  buildPlanctlInvocationReadonly,
+} from "./invocation.ts";
 import { resolveProject } from "./project.ts";
 import { runDetect } from "./verbs/detect.ts";
 import { runEpics } from "./verbs/epics.ts";
@@ -172,6 +176,71 @@ function emitTrailer(verb: string, format: OutputFormat | null): void {
   } catch {
     // Never fail the CLI over a tracing side-effect.
   }
+}
+
+/** The committing-seam emit path for mutating verbs — the port of
+ * output.emit()'s mutating branch and the runner's commit ordering. Build the
+ * planctl_invocation (a fail-closed session id or a bad touched-path throws,
+ * surfacing verbatim), run the auto-commit BEFORE printing, then:
+ *  - on a commit failure, print ONE compact line
+ *    {"success":false,"error":"commit_failed","details":...,"planctl_invocation":...}
+ *    and process.exit(1) — the success envelope is NEVER printed;
+ *  - on success, embed the invocation under planctl_invocation and print ONE
+ *    compact NDJSON line {"success":true, ...data, planctl_invocation}.
+ * Mutating verbs never print the read-only trailer — this path replaces it. */
+export function emitMutating(
+  data: Record<string, unknown>,
+  opts: {
+    verb: string;
+    target: string;
+    detail?: string | null;
+    repoRoot: string;
+    primaryRepo?: string | null;
+    queueJump?: boolean;
+  },
+): void {
+  // Build the invocation FIRST — a fail-closed session id or a path-traversal
+  // touched-path throws here and surfaces verbatim (no commit attempted).
+  const invocation = buildPlanctlInvocation(
+    opts.verb,
+    opts.target,
+    opts.detail,
+    {
+      repoRoot: opts.repoRoot,
+      primaryRepo: opts.primaryRepo,
+      queueJump: opts.queueJump,
+    },
+  );
+
+  // Per-verb auto-commit BEFORE the success envelope prints, so an envelope
+  // success:true on stdout is the authoritative signal that the .planctl/ commit
+  // landed. On a hard failure, emit the compact failure envelope and exit 1.
+  try {
+    autoCommitFromInvocation(invocation);
+  } catch (exc) {
+    if (!(exc instanceof CommitFailed)) {
+      throw exc;
+    }
+    const failure = {
+      success: false,
+      error: "commit_failed",
+      details: {
+        error: exc.error,
+        message: exc.detail,
+        ...exc.extra,
+      },
+      planctl_invocation: invocation,
+    };
+    process.stdout.write(`${compactJson(failure)}\n`);
+    process.exit(1);
+  }
+
+  const envelope = {
+    success: true,
+    ...data,
+    planctl_invocation: invocation,
+  };
+  process.stdout.write(`${compactJson(envelope)}\n`);
 }
 
 function dispatch(parsed: ParsedArgs): number {
