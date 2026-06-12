@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Test kill-sessions busy gate",
-  "updated_at": "2026-06-12T08:39:30.203292Z"
+  "updated_at": "2026-06-12T08:44:24.094079Z",
+  "worker_done_at": "2026-06-12T08:44:24.094079Z"
 }

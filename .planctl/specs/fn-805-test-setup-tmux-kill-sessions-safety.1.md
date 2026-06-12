@@ -20,5 +20,5 @@ both the non-TTY-with-busy branch and the abort-on-N branch.
 - [ ] An empty busy sweep proceeds to setup without prompting.
 
 ## Done summary
-
+Added main() tests pinning the --kill-sessions busy-pane gate: non-TTY-with-busy and aborted-N branches both exit 1 spawning no kill argv, and an empty busy sweep proceeds to setup without prompting. Made main()'s spawn injectable to drive the gate in-process.
 ## Evidence
