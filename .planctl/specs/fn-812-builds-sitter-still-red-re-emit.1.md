@@ -51,5 +51,5 @@ unprocessed occurrence either way.
 - [ ] agents/builds.md documents the re-emit class; bun test passes
 
 ## Done summary
-
+Added a bounded still-red aging re-emit to the builds sitter: STILL_RED_REEMIT_SECS (7d) + an optional last_emitted anchor on SeenEntry (no SEEN_STATE_VERSION bump), an aging clause ORed into selectOnsets, and an anchor re-arm in foldSeenState that advances only on a successful re-emit. Documented the re-emit class in agents/builds.md.
 ## Evidence
