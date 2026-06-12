@@ -7,7 +7,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/pre-hook.py"
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/pre-hook.ts"]
           }
         ]
       },
@@ -28,7 +29,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/post-hook.py"
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/post-hook.ts"]
           }
         ]
       }

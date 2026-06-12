@@ -23,8 +23,8 @@ from pathlib import Path
 import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-PRE_HOOK = REPO_ROOT / "plugin" / "hooks" / "pre-hook.py"
-POST_HOOK = REPO_ROOT / "plugin" / "hooks" / "post-hook.py"
+PRE_HOOK = REPO_ROOT / "plugin" / "hooks" / "pre-hook.ts"
+POST_HOOK = REPO_ROOT / "plugin" / "hooks" / "post-hook.ts"
 COMMIT_GUARD = REPO_ROOT / "plugin" / "hooks" / "commit-guard.ts"
 SUBAGENT_STOP_GUARD = REPO_ROOT / "plugin" / "hooks" / "subagent-stop-guard.ts"
 STOP_GUARD = REPO_ROOT / "plugin" / "hooks" / "stop-guard.ts"
@@ -56,9 +56,12 @@ def _make_stub_promptctl(tmp_path: Path, envelope: dict) -> Path:
 def _run_hook(
     hook: Path, stdin_data: dict, path_prefix: Path
 ) -> subprocess.CompletedProcess:
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("bun not on PATH")
     env = {**os.environ, "PATH": f"{path_prefix}:{os.environ.get('PATH', '')}"}
     return subprocess.run(
-        ["python3", str(hook)],
+        [bun, str(hook)],
         input=json.dumps(stdin_data),
         capture_output=True,
         text=True,
@@ -93,23 +96,22 @@ def test_hooks_json_wires_pre_and_post() -> None:
 
     pre_entry = hooks["PreToolUse"][0]
     assert pre_entry["matcher"] == "Write|Edit"
-    pre_cmd = pre_entry["hooks"][0]["command"]
-    assert "${CLAUDE_PLUGIN_ROOT}" in pre_cmd
-    assert pre_cmd.endswith("plugin/hooks/pre-hook.py")
+    _exec_form_cmd(pre_entry, "pre-hook.ts")
 
     post_entry = hooks["PostToolUse"][0]
     assert post_entry["matcher"] == "Read"
-    post_cmd = post_entry["hooks"][0]["command"]
-    assert "${CLAUDE_PLUGIN_ROOT}" in post_cmd
-    assert post_cmd.endswith("plugin/hooks/post-hook.py")
+    _exec_form_cmd(post_entry, "post-hook.ts")
 
 
-def test_hook_scripts_are_executable() -> None:
-    """Both hook scripts must be marked executable — CC invokes them
-    directly via the command string, not via a python3 prefix.
+def test_hook_scripts_carry_bun_shebang() -> None:
+    """Both hook entry points are bun scripts launched via the exec form
+    (`bun <script>`), so they carry the bun shebang and exist on disk.
     """
-    assert os.access(PRE_HOOK, os.X_OK), f"{PRE_HOOK} not executable"
-    assert os.access(POST_HOOK, os.X_OK), f"{POST_HOOK} not executable"
+    for hook in (PRE_HOOK, POST_HOOK):
+        assert hook.is_file(), f"missing {hook}"
+        assert hook.read_text().startswith("#!/usr/bin/env bun"), (
+            f"{hook} missing bun shebang"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -140,7 +142,7 @@ def test_hooks_json_registers_commit_guard() -> None:
     pre = hooks["PreToolUse"]
 
     write_edit = next(e for e in pre if e.get("matcher") == "Write|Edit")
-    assert write_edit["hooks"][0]["command"].endswith("plugin/hooks/pre-hook.py")
+    _exec_form_cmd(write_edit, "pre-hook.ts")
 
     bash_entry = next(e for e in pre if e.get("matcher") == "Bash")
     _exec_form_cmd(bash_entry, "commit-guard.ts")
@@ -167,11 +169,11 @@ def test_hooks_json_registers_stop_guard() -> None:
 
 
 def test_hooks_json_post_read_entry_intact() -> None:
-    """The PostToolUse(Read) warn entry is untouched by the guard wiring."""
+    """The PostToolUse(Read) warn entry stays a distinct exec-form bun entry."""
     hooks = json.loads((REPO_ROOT / "hooks" / "hooks.json").read_text())["hooks"]
     post = hooks["PostToolUse"][0]
     assert post["matcher"] == "Read"
-    assert post["hooks"][0]["command"].endswith("plugin/hooks/post-hook.py")
+    _exec_form_cmd(post, "post-hook.ts")
 
 
 # ---------------------------------------------------------------------------

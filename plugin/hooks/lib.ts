@@ -128,6 +128,45 @@ export async function runPlanctl(
   }
 }
 
+/** Run `promptctl <args>` and return its last-line JSON envelope, or null on
+ * any failure (binary missing, non-zero exit, timeout, malformed JSON). Mirrors
+ * runPlanctl but targets the generated-file guard's `check-generated` envelope —
+ * callers read `marked` / `message` off the returned object. Null is the
+ * fail-open signal: the generated-file hooks must allow the action whenever a
+ * write/read could not be classified. */
+export async function runPromptctl(
+  args: string[],
+  timeoutMs = 5000,
+): Promise<Record<string, unknown> | null> {
+  try {
+    const proc = Bun.spawn(["promptctl", ...args], {
+      stdout: "pipe",
+      stderr: "ignore",
+      timeout: timeoutMs,
+    });
+    const exitCode = await proc.exited;
+    if (exitCode !== 0) return null;
+    const out = await new Response(proc.stdout).text();
+    const lines = out
+      .trim()
+      .split("\n")
+      .filter((line) => line.trim().length > 0);
+    const lastLine = lines[lines.length - 1];
+    if (!lastLine) return null;
+    const parsed = JSON.parse(lastLine);
+    if (
+      parsed === null ||
+      typeof parsed !== "object" ||
+      Array.isArray(parsed)
+    ) {
+      return null;
+    }
+    return parsed as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
 /** Emit a PreToolUse deny envelope. The top-level `decision` field is
  * deprecated on PreToolUse — the hookSpecificOutput shape is canonical. */
 export function emitDeny(reason: string): void {
@@ -136,6 +175,17 @@ export function emitDeny(reason: string): void {
       hookEventName: "PreToolUse",
       permissionDecision: "deny",
       permissionDecisionReason: reason,
+    },
+  });
+}
+
+/** Emit a PostToolUse additionalContext envelope. Non-blocking: surfaces a
+ * heads-up note to the agent without gating the read. */
+export function emitAdditionalContext(message: string): void {
+  emit({
+    hookSpecificOutput: {
+      hookEventName: "PostToolUse",
+      additionalContext: message,
     },
   });
 }
