@@ -101,11 +101,11 @@ export async function runPlanctl(
     const exitCode = await proc.exited;
     if (exitCode !== 0) return null;
     const out = await new Response(proc.stdout).text();
-    const lastLine = out
+    const lines = out
       .trim()
       .split("\n")
-      .filter((line) => line.trim().length > 0)
-      .at(-1);
+      .filter((line) => line.trim().length > 0);
+    const lastLine = lines[lines.length - 1];
     if (!lastLine) return null;
     const parsed = JSON.parse(lastLine);
     if (
