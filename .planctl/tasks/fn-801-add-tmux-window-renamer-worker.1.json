@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T02:01:27.230326Z",
+  "depends_on": [],
+  "epic": "fn-801-add-tmux-window-renamer-worker",
+  "id": "fn-801-add-tmux-window-renamer-worker.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Add listPanes and renameWindow exec ops",
+  "updated_at": "2026-06-12T02:01:27.230326Z"
+}
