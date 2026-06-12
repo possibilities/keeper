@@ -34,5 +34,5 @@ bun test green; zero-keeper-import fence still empty for source files; `bun run 
 - [ ] tsconfig include, lint glob, README and CLAUDE.md layout all reflect the sitters/ tree
 
 ## Done summary
-
+Relocated performance + gitpolice sitters under a new sitters/<slug>/ tree; rewired lib imports (../../lib), tsconfig include, lint glob, test imports, build-pin SITTER_MODULES, both plist program paths, and README/CLAUDE layout; re-bootstrapped the live performance launchd job from the new path (listed, last exit 0). bun test green (247), both --json scans clean.
 ## Evidence
