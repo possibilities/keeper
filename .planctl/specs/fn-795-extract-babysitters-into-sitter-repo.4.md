@@ -63,5 +63,5 @@ shows the sitter path; heartbeat.json advances within one interval;
 - [ ] README.md + CLAUDE.md exist with install/uninstall, invariants, and the fixture regen command
 
 ## Done summary
-
+Extracted the performance sitter's launchd watch job into sitter/plist/ (sitter paths, ~/.local/bin PATH) and wrote sitter README.md + CLAUDE.md. Cut the watch job over to sitter paths with no monitoring gap (heartbeat advancing), repointed the LaunchAgents symlink, and booted out the dead performance watchdog job (retired in fn-792) + removed its dangling symlink rather than recreating a watchdog plist pointing at a deleted watchdog.ts.
 ## Evidence
