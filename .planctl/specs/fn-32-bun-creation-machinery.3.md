@@ -30,5 +30,5 @@ seed_epic round-trip green via dist/planctl-bun (the keystone); PLANCTL_BIN=dist
 - [ ] Matrix + gap pins green via the compiled binary
 
 ## Done summary
-
+Ported scaffold verb to planctl-bun (src/verbs/scaffold.ts): phase-faithful port of run_scaffold.py with assert-all buckets, type-vs-value forks, duplicate_epic flock guard, in-RAM integrity gate, spec-before-json unwind, three explicit envelope shapes. test_scaffold.py 49 passed / 5 python_only skips under --run-slow conformance; seed_epic envelope byte-compatible.
 ## Evidence
