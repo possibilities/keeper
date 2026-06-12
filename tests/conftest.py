@@ -117,6 +117,13 @@ _SLOW_BUCKET_MARKERS = (
     "wire",
 )
 
+#: Ceiling for ``-n auto`` worker count (see
+#: :func:`pytest_xdist_auto_num_workers`). Under conformance each worker forks
+#: one subprocess + real git per invocation, so an uncapped ``-n auto`` on a
+#: many-core machine can saturate RAM / file descriptors; this bounds the auto
+#: count regardless of core count. An explicit ``-n <N>`` always overrides it.
+_XDIST_AUTO_WORKER_CAP = 8
+
 
 def pytest_addoption(parser):
     """Register ``--run-slow`` — the single gate that re-enables the slow bucket.
@@ -168,6 +175,22 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if item.get_closest_marker("python_only"):
                 item.add_marker(skip_py)
+
+
+def pytest_xdist_auto_num_workers(config):
+    """Cap the ``-n auto`` worker count so a conformance run cannot fork-bomb.
+
+    xdist consults this hook only for ``-n auto`` (an explicit ``-n <N>`` wins
+    outright and never calls it). The default serial fast gate passes no ``-n``,
+    so the hook is inert there. Under conformance ``-n auto`` would otherwise
+    spawn one worker per core, and every worker forks a real planctl subprocess
+    + real git per invocation — on a high-core machine that exhausts RAM and
+    file descriptors. Returning ``min(cpu_count, cap)`` bounds the auto fan-out
+    while still parallelising; ``--dist loadscope`` is the recommended pairing
+    so a module's tests share a worker (and its session-scoped tmp HOME).
+    """
+    cpus = os.cpu_count() or 1
+    return max(1, min(cpus, _XDIST_AUTO_WORKER_CAP))
 
 
 @pytest.fixture(autouse=True)

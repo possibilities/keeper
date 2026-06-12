@@ -44,5 +44,6 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 | Lint | `uv run ruff check .` |
 | Format | `uv run ruff format .` |
 | Type check | `uv run ty check` |
-| Test (fast gate) | `uv run pytest tests/` — near-subprocess-free fast bucket; slow-bucket tests (`real_git`/`integration`/`wire`) skip-by-default, visible as skips |
+| Test (fast gate) | `uv run pytest tests/` — default in-process engine, near-subprocess-free; slow-bucket tests (`real_git`/`integration`/`wire`) skip-by-default, visible as skips |
 | Test (full suite) | `uv run pytest tests/ --run-slow` — runs everything incl. the slow bucket (real git/wire machinery) |
+| Test (conformance) | `PLANCTL_BIN="$(command -v planctl)" uv run pytest tests/` — runs every non-`python_only` test against the real binary as a subprocess with real git; `python_only` tests skip-visible. Parallelise with `-n auto --dist loadscope` (per-worker tmp HOME, no cross-worker flock; `-n auto` capped at 8). Point `PLANCTL_BIN` at any planctl binary to run this suite as its parity spec |
