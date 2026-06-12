@@ -28,6 +28,7 @@ POST_HOOK = REPO_ROOT / "plugin" / "hooks" / "post-hook.py"
 COMMIT_GUARD = REPO_ROOT / "plugin" / "hooks" / "commit-guard.ts"
 SUBAGENT_STOP_GUARD = REPO_ROOT / "plugin" / "hooks" / "subagent-stop-guard.ts"
 STOP_GUARD = REPO_ROOT / "plugin" / "hooks" / "stop-guard.ts"
+LIB_TS = REPO_ROOT / "plugin" / "hooks" / "lib.ts"
 
 
 def _make_stub_promptctl(tmp_path: Path, envelope: dict) -> Path:
@@ -404,3 +405,104 @@ def test_post_hook_unmarked_file_passes_silently(tmp_path: Path) -> None:
     )
     assert result.returncode == 0
     assert result.stdout == ""
+
+# ---------------------------------------------------------------------------
+# cross-language marker round-trip — Python _write_marker → TS readMarker
+# (slow bucket: real bun subprocess + real Python write path)
+# ---------------------------------------------------------------------------
+
+# A bun probe that imports the REAL readMarker from lib.ts, reads the marker for
+# the session id in argv[1], and prints {kind, task_id, epic_id, schema_version}
+# as JSON. Reading through the production reader is the point: a field-name or
+# `kind` rename on either side surfaces as a missing/mismatched field here.
+_TS_READ_PROBE = """\
+import {{ readMarker }} from {lib_import};
+const marker = await readMarker(process.argv[2]);
+if (marker === null) {{
+  process.stdout.write(JSON.stringify({{ ok: false }}) + "\\n");
+}} else {{
+  process.stdout.write(
+    JSON.stringify({{
+      ok: true,
+      kind: marker.kind,
+      task_id: marker.task_id,
+      epic_id: marker.epic_id,
+      schema_version: marker.schema_version,
+    }}) + "\\n",
+  );
+}}
+"""
+
+
+def _write_marker_via_python(home: Path, session_id: str, task_id: str) -> None:
+    """Drive the real Python success-path writer (``write_work_marker``) in a
+    subprocess so the marker dir resolves from ``HOME`` exactly as production
+    does — no monkeypatch, no hand-rolled JSON.
+    """
+    code = (
+        "from planctl.session_markers import write_work_marker; "
+        f"write_work_marker({task_id!r})"
+    )
+    env = {
+        **os.environ,
+        "HOME": str(home),
+        "CLAUDE_CODE_SESSION_ID": session_id,
+    }
+    result = subprocess.run(
+        ["python3", "-c", code],
+        capture_output=True,
+        text=True,
+        cwd=str(REPO_ROOT),
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+
+
+def _read_marker_via_bun(bun: str, home: Path, session_id: str) -> dict:
+    """Read the marker back through the real TS ``readMarker`` via bun."""
+    probe = home / "read_probe.ts"
+    probe.write_text(
+        _TS_READ_PROBE.format(lib_import=json.dumps(str(LIB_TS))),
+        encoding="utf-8",
+    )
+    env = {**os.environ, "HOME": str(home)}
+    result = subprocess.run(
+        [bun, str(probe), session_id],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        env=env,
+    )
+    assert result.returncode == 0, result.stderr
+    return json.loads(result.stdout.strip())
+
+
+@pytest.mark.integration
+def test_marker_round_trips_python_write_to_ts_read(tmp_path: Path) -> None:
+    """A marker written by the Python success path (``write_work_marker``) is
+    read back through the real TS ``readMarker`` (true bun subprocess), and the
+    task identity survives the crossing.
+
+    This pins the cross-language contract: ``_write_marker`` and the TS reader
+    agree on field names and ``kind`` values. Drift on either side fails this
+    test (verify locally by renaming ``task_id`` on one side — the assert below
+    on the round-tripped id breaks).
+    """
+    bun = shutil.which("bun")
+    if bun is None:
+        pytest.skip("bun not on PATH")
+
+    home = tmp_path / "home"
+    home.mkdir()
+    session_id = "round-trip-session"
+    task_id = "fn-99-some-epic.3"
+
+    _write_marker_via_python(home, session_id, task_id)
+    parsed = _read_marker_via_bun(bun, home, session_id)
+
+    assert parsed["ok"] is True, "TS reader returned null for a freshly written marker"
+    assert parsed["kind"] == "work"
+    assert parsed["task_id"] == task_id
+    # A work marker carries no epic_id — JSON.stringify drops the undefined key.
+    assert "epic_id" not in parsed
+    assert parsed["schema_version"] == 1
