@@ -102,7 +102,7 @@ const HELP = `keeper jobs — live jobs list over the keeper subscribe server
 Usage: keeper jobs [--sock <path>] [--snapshot | --watch] [--timeout <s>]
 
 Flags:
-  --sock <path>    Socket path override (\$KEEPER_SOCK / default otherwise)
+  --sock <path>    Socket path override ($KEEPER_SOCK / default otherwise)
   --snapshot       Force one-shot snapshot mode (one frame + keeper-meta: line)
   --watch          Force the live subscribe stream even when piped
   --timeout <s>    Snapshot wait before the timeout escape (default ~2s)

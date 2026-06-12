@@ -321,8 +321,8 @@ Keeper has no `install` verb. Wire it up manually:
      name is hardcoded (`autopilot`), NOT configurable; each dispatch opens a new
      window inside that shared background session. The window-reaper worker
      closes a managed window ONLY once its work is verifiably complete (stopped
-     >60s with a completed readiness verdict); every other window stays open for
-     inspection.
+     past a short debounce with a completed readiness verdict — gone within
+     ~1-2s); every other window stays open for inspection.
    - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
      jobs. A positive integer enforces the cap; omit or set non-positive
      (the default) to leave it unlimited. The cap bounds only `work`/`close`

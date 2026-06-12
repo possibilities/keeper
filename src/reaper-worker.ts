@@ -5,8 +5,8 @@
  * projections (level-triggered on `PRAGMA data_version` via the shared
  * `watchLoop` primitive PLUS a coarse periodic tick), and on every cycle
  * kills the tmux WINDOW of any autopilot-dispatched job whose work is
- * VERIFIABLY complete — stopped for over 60s with a `{tag:"completed"}`
- * readiness verdict.
+ * VERIFIABLY complete — stopped past {@link REAP_STOPPED_AGE_SEC} with a
+ * `{tag:"completed"}` readiness verdict.
  *
  * It reads the projections read-only and writes ONLY to tmux (`kill-window`);
  * it NEVER writes the DB and posts NOTHING to main beyond the lifecycle
@@ -16,7 +16,7 @@
  * (a SIGHUP-absorbing process leaves the row stopped; the cooldown bounds the
  * retry churn and the existing backstops own the residual).
  *
- * The periodic tick is LOAD-BEARING, not telemetry: the 60s threshold
+ * The periodic tick is LOAD-BEARING, not telemetry: the age threshold
  * elapsing writes NOTHING to the DB, so no `data_version` pulse fires when a
  * candidate merely ages past the bar — time itself must wake the cycle. Both
  * feeders call the same single-flight `driveCycle`.
@@ -71,7 +71,7 @@ export interface ReaperWorkerData {
   pollMs?: number;
   /**
    * Coarse periodic-tick cadence in ms. Optional; defaults to
-   * {@link DEFAULT_REAP_TICK_MS}. The tick is LOAD-BEARING (the 60s threshold
+   * {@link DEFAULT_REAP_TICK_MS}. The tick is LOAD-BEARING (the age threshold
    * elapsing writes nothing, so a pulse never fires on aging alone).
    */
   tickMs?: number;
@@ -84,10 +84,12 @@ export interface ShutdownMessage {
 
 /**
  * The completed-and-stopped age threshold (unix SECONDS). A row must have been
- * `stopped` for longer than this before it's reapable, so a session that's
- * merely paused mid-turn is never killed.
+ * `stopped` for longer than this before it's reapable. Deliberately tight —
+ * the done-AND-idle `{tag:"completed"}` verdict and the immediate pre-kill
+ * re-check carry the safety; this bar only debounces the stop-instant
+ * `data_version` pulse so a window never dies the same instant its row lands.
  */
-export const REAP_STOPPED_AGE_SEC = 60;
+export const REAP_STOPPED_AGE_SEC = 1;
 
 /**
  * In-memory kill cooldown (unix SECONDS). After an attempt, the same job is
@@ -97,9 +99,11 @@ export const REAP_STOPPED_AGE_SEC = 60;
  */
 export const REAP_KILL_COOLDOWN_SEC = 10 * 60;
 
-/** Default coarse periodic-tick cadence (ms). ~20s — well under the 60s bar so
- *  an aged candidate is reaped within a tick of crossing it. */
-export const DEFAULT_REAP_TICK_MS = 20_000;
+/** Default periodic-tick cadence (ms). ~1s — matches the tight age bar so an
+ *  aged candidate is reaped within a tick of crossing it (done window dies in
+ *  ~1-2s). The cycle is a few read-only queries over small projections, so the
+ *  1s idle cadence is cheap. */
+export const DEFAULT_REAP_TICK_MS = 1000;
 
 /**
  * One reap the decision emits: the job whose window to kill and the pane id
@@ -364,7 +368,7 @@ function main(): void {
     void driveCycle();
   };
 
-  // The LOAD-BEARING periodic tick: the 60s threshold elapsing writes nothing
+  // The LOAD-BEARING periodic tick: the age threshold elapsing writes nothing
   // to the DB, so no data_version pulse fires on aging alone — time itself must
   // wake the cycle. Cleared on shutdown.
   const tickMs = data.tickMs ?? DEFAULT_REAP_TICK_MS;

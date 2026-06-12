@@ -663,9 +663,7 @@ test("createTmuxBackend.listPanes: sweep spawn carries a locale-bearing env (C-l
   await backend.listPanes();
   const env = envByCall[0];
   expect(env).toBeDefined();
-  expect(
-    Boolean(env?.LC_ALL || env?.LC_CTYPE || env?.LANG),
-  ).toBe(true);
+  expect(Boolean(env?.LC_ALL || env?.LC_CTYPE || env?.LANG)).toBe(true);
 });
 
 test("createTmuxBackend.launch: new-session mint env carries a locale alongside TERM/COLORTERM", async () => {
@@ -686,9 +684,9 @@ test("createTmuxBackend.launch: new-session mint env carries a locale alongside 
   const mintIdx = cmds.findIndex((c) => c[1] === "new-session");
   expect(mintIdx).toBeGreaterThanOrEqual(0);
   const mintEnv = envByCall[mintIdx];
-  expect(
-    Boolean(mintEnv?.LC_ALL || mintEnv?.LC_CTYPE || mintEnv?.LANG),
-  ).toBe(true);
+  expect(Boolean(mintEnv?.LC_ALL || mintEnv?.LC_CTYPE || mintEnv?.LANG)).toBe(
+    true,
+  );
 });
 
 test("createTmuxBackend.listPanes: ENOENT (binary missing) → null, never throws", async () => {
