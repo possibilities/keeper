@@ -27,5 +27,5 @@ doc-accuracy fixes — land them as one commit.
 - [ ] Dated change-history/provenance stamps are pruned from README.md and agents/performance.md to current-contract phrasing.
 
 ## Done summary
-
+Softened agents/performance.md latest.md description to LAST-written (gated order, no severity sort) to match writeFollowup and lines 53/69, and pruned the dated human-decision and false-critical provenance stamps from README.md and agents/performance.md per the forward-facing-advice rule.
 ## Evidence
