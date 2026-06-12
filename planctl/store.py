@@ -261,6 +261,9 @@ def get_actor() -> str:
     return os.environ.get("USER", "unknown")
 
 
+_NOW_ISO_FORMAT = "%Y-%m-%dT%H:%M:%S.%fZ"
+
+
 def now_iso() -> str:
     """Current UTC timestamp in ISO 8601 format with microsecond precision.
 
@@ -271,7 +274,22 @@ def now_iso() -> str:
     Lexicographic sort still works (microseconds widen the time field, they
     don't change ordering); ``datetime.fromisoformat`` parses both the new
     and legacy shapes without changes.
+
+    ``PLANCTL_NOW`` is a pinned cross-implementation contract: when set it
+    overrides the clock source and is returned verbatim, but only after a
+    strict strptime round-trip against ``_NOW_ISO_FORMAT``. A malformed value
+    is a hard error, never a silent wall-clock fallback, so any conforming
+    implementation is held to the identical format.
     """
     from datetime import datetime
 
-    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+    if (override := os.environ.get("PLANCTL_NOW")) is not None:
+        try:
+            datetime.strptime(override, _NOW_ISO_FORMAT)
+        except ValueError as exc:
+            raise ValueError(
+                f"PLANCTL_NOW must match {_NOW_ISO_FORMAT!r} (got {override!r})"
+            ) from exc
+        return override
+
+    return datetime.now(UTC).strftime(_NOW_ISO_FORMAT)

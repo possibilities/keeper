@@ -32,6 +32,11 @@ Every mutating verb auto-commits its own `.planctl/` scope inline at `output.emi
 
 The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epic rm <epic_id>` is the sanctioned — and only — delete verb: it unlinks every artifact an epic owns (epic JSON, every child task JSON, epic + task spec markdowns, runtime state, lock files) and auto-commits the deletions into the owning project's `.planctl/` via the standard envelope path. Resolves cwd-then-global with a `--project` escape, guards `in_progress` / locked tasks behind `--force`, and supports `--dry-run`. Companion guard on the create side: `scaffold` rejects a same-slug sibling epic up front with `duplicate_epic` (naming the existing id + status); `--allow-duplicate` is the explicit escape hatch.
 
+## Environment variables
+
+- `PLANCTL_ACTOR` overrides actor identity.
+- `PLANCTL_NOW` overrides the clock source for all timestamp stamping in `%Y-%m-%dT%H:%M:%S.%fZ` format; any conforming implementation must honor it.
+
 ## Running Things
 
 | What | Command |

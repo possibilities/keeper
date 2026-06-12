@@ -99,6 +99,7 @@ Specs are written in place to `specs/{id}.md` by commands that mutate spec conte
 Environment variables:
 
 - `PLANCTL_ACTOR` (override identity)
+- `PLANCTL_NOW` (overrides the clock source for all timestamp stamping in `%Y-%m-%dT%H:%M:%S.%fZ` format; any conforming implementation must honor it)
 - `CLAUDE_CODE_SESSION_ID` (sole source of the session id used to key the touched-paths log under `.planctl/state/sessions/<session_id>/`; required for every mutating verb except `init`, the session-id-free verb that builds its own commit payload — the claude binary ships it intrinsically on every session including resumed ones, tests and manual invocations set it explicitly)
 
 ## Auto-commit
