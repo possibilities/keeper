@@ -24,5 +24,5 @@ heartbeat-read / last-all-clear-day; no real botctl or clock.
 - [ ] Test runs in the same tier as `test/keeper-watchdog.test.ts` and passes
 
 ## Done summary
-
+Added test/builds-watchdog.test.ts covering the decideWatchdog branch matrix (alarm/first-run/all-clear/ok), readHeartbeatTs degrade, and the day-marker round-trip; slotted into the slow tier (test:full).
 ## Evidence

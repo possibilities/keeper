@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Add builds-watchdog unit test",
-  "updated_at": "2026-06-12T00:03:53.246029Z"
+  "updated_at": "2026-06-12T01:22:34.853597Z",
+  "worker_done_at": "2026-06-12T01:22:34.853597Z"
 }
