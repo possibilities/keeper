@@ -53,3 +53,19 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 | Bun typecheck | `bun run typecheck` — `tsc --noEmit` |
 | Bun test | `bun run test` — `bun test` over the TypeScript suite |
 | Bun conformance | `bun run build && PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/ --run-slow` — the full-suite parity gate against the compiled binary at full CLI parity (serial; add `-n auto --dist loadscope` to parallelise) |
+
+## Bun cutover runbook
+
+`~/.local/bin/planctl` is the compiled bun binary, promoted by `scripts/promote.sh` (`bun run promote`). The script builds `dist/planctl-bun` as a hard prerequisite in the same invocation, copies it to `~/.local/bin/.planctl.tmp` (temp in the destination dir → same-filesystem atomic rename), `mv -f` over the `~/.local/bin/planctl` path entry (replacing whatever is there — symlink or regular file — without following it), `chmod +x`, and logs the promoted `git rev-parse HEAD`. Any step failing aborts non-zero and leaves the live binary intact.
+
+- **Promote**: `bun run promote`
+- **Rollback (verbatim)**: `uv tool install --force /Users/mike/code/planctl` — reinstates the Python shim as the `~/.local/bin/planctl` symlink into the uv tool dir. Rehearse this BEFORE every promote: run it, confirm the shim answers `planctl --help`, confirm `command -v planctl` still resolves to `~/.local/bin` with no earlier-PATH shadow, then promote. **Rollback-window statement**: this rollback is valid only while the Python package and its `uv tool install` entry exist in-repo; that window closes when the Python package leaves the repo (next epic), after which there is no `uv tool install` rollback target.
+- **Shell cache**: long-lived shells cache the resolved path. Run `hash -r` (bash) or `rehash` (zsh) after a promote or rollback to drop the cache. Already-exec'd processes hold their inode and are immune.
+
+**Rollback triggers** (any one → run the verbatim rollback immediately, no debate, then surface loudly):
+
+- any non-zero exit on a known-good verb during the soak or first hour,
+- any `Uncaught` / `error:` / `Traceback` stderr pattern from planctl,
+- p95 invocation time > 2× the rehearsal baseline (measure a 20-invocation `planctl status` baseline against the live shim pre-swap; compare warmed steady-state post-swap, discounting the one-time cold-start of the binary's first exec).
+
+**Soak**: after promote, run the full workflow cycle (init → scaffold → claim → done → close-preflight → audit submit → verdict submit → close-finalize) in a scratch project in its OWN fresh git repo (auto-commits need it; isolation keeps auto-commit failures from confounding the signal). `claim` is cwd-agnostic and resolves through configured roots, so a scratch repo outside the roots needs `claim <task_id> --project <scratch_repo>`. Watch non-zero exit rate by verb, warmed steady-state p95, and the stderr patterns above through the first hour.
