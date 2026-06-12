@@ -28,5 +28,5 @@ PLANCTL_BIN=dist/planctl-bun uv run pytest tests/test_refine_apply.py green (pyt
 - [ ] Restamp membership honored; unwind scope exact
 
 ## Done summary
-
+Ported refine-apply to planctl-bun (src/verbs/refine_apply.ts): narrow task-id flock, restamp OUTSIDE the lock as a VALIDATION_RESTAMP_VERBS member, fresh-mint-only unwind threaded through restampEpicOrFail's onFailure hook. Wired into cli.ts; marked the lock-disjoint test python_only; updated the authority-statement doc mirrors. test_refine_apply.py eligible set green via the compiled binary.
 ## Evidence
