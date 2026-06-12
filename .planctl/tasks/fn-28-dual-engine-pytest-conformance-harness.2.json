@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Unified invoker seam and subprocess engine",
-  "updated_at": "2026-06-12T04:00:56.659159Z"
+  "updated_at": "2026-06-12T04:20:34.337711Z",
+  "worker_done_at": "2026-06-12T04:20:34.337711Z"
 }

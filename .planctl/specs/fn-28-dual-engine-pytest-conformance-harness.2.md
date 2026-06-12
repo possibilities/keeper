@@ -38,5 +38,5 @@ Prove both engines through the seam itself: a handful of representative verbs (i
 - [ ] Default fast gate green and as fast as before; a representative conformance subset green against the installed Python planctl
 
 ## Done summary
-
+Unified run_cli into one invoker with in-process and subprocess engines dispatched on PLANCTL_BIN; _CliResult gains exit_code/output, the four autouse stubs early-return under conformance, fixtures force real git, and the minimal per-worker tmp-HOME env makes the suite xdist-viable. Representative conformance subset (init/scaffold/claim/validate/envelope) green against the installed Python planctl; fast gate unchanged.
 ## Evidence
