@@ -1218,6 +1218,15 @@ export interface AutopilotWorkerData {
    * Threaded in from `resolveConfig()`.
    */
   maxConcurrentJobs?: number | null;
+  /**
+   * Worker-role discriminator. The bottom-of-file entrypoint runs `main()`
+   * ONLY when this is `"autopilot"`. The reaper worker imports this module
+   * for its `loadReconcileSnapshot` export and runs as `!isMainThread`
+   * itself — the gate stops that import from booting a stowaway reconciler
+   * (racing dispatch decisions against the real one) inside the reaper
+   * thread.
+   */
+  role?: "autopilot";
 }
 
 /** Main → worker: paused-flag flip. */
@@ -1800,8 +1809,13 @@ function main(): void {
     });
 }
 
-// Only run inside a real Worker. A plain `import` from a test runs on the main
-// thread, where `main()` must not fire — the pure symbols are driven directly.
-if (!isMainThread) {
+// Only run inside a real Worker spawned AS the autopilot (`role: "autopilot"`).
+// A plain import on the main thread is inert; an import from ANOTHER worker
+// module (the reaper pulls `loadReconcileSnapshot` from here) must NOT boot a
+// stowaway reconciler in that thread — the role gate enforces that.
+if (
+  !isMainThread &&
+  (workerData as AutopilotWorkerData | undefined)?.role === "autopilot"
+) {
   main();
 }

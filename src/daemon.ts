@@ -1472,7 +1472,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   let worker: Worker | null = null;
   if (want("wake")) {
     worker = new Worker(new URL("./wake-worker.ts", import.meta.url).href, {
-      workerData: { dbPath, pollMs: 25 } satisfies WakeWorkerData,
+      workerData: { dbPath, pollMs: 25, role: "wake" } satisfies WakeWorkerData,
     } as WorkerOptions & { workerData: unknown });
 
     // Step 4 — each wake message triggers a (coalescing) drain pass.
@@ -2775,6 +2775,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           // the next restart.
           execBackend: apConfig.execBackend,
           maxConcurrentJobs: apConfig.maxConcurrentJobs,
+          role: "autopilot",
         } satisfies AutopilotWorkerData,
       } as WorkerOptions & { workerData: unknown })
     : null;

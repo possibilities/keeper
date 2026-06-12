@@ -124,7 +124,7 @@ test("spawned Worker shuts down cleanly on shutdown message", async () => {
   // `WorkerOptions` lib type; cast to reach it.
   const worker = new Worker(
     new URL("../src/wake-worker.ts", import.meta.url).href,
-    { workerData: { dbPath, pollMs: 25 } } as WorkerOptions & {
+    { workerData: { dbPath, pollMs: 25, role: "wake" } } as WorkerOptions & {
       workerData: unknown;
     },
   );
