@@ -11,6 +11,7 @@ These diverge from standard arthack conventions:
 - **`planctl cat` is format-free** — always emits raw markdown to stdout regardless of `--format`. FormattedGroup auto-injects `--format` so the flag appears in `cat --help`, but `run_cat.py` ignores it.
 - **`planctl validate` envelope is non-`success`** — emits `{"valid": bool, "errors": [...], "warnings": [...]}` instead of the standard `{"success": bool, ...}`, exiting 1 on `valid: false`. Routes through `format_output` directly (not `emit()`) to preserve the shape.
 - **Bare verb subcommand names** — `init`, `status`, `claim`, etc. instead of arthack's `verb-noun`. Established in the spec and referenced by orchestration scripts; do not rename.
+- **Polyglot, single authority** — the Python CLI is the authoritative implementation; `planctl-bun` (compiled TypeScript under `src/`) is an additive port covering a read-only verb subset (`state-path`, `detect`, `status`, `epics`), proven at parity against the shared conformance suite.
 
 ## Commit behavior
 
@@ -47,3 +48,8 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 | Test (fast gate) | `uv run pytest tests/` — default in-process engine, near-subprocess-free; slow-bucket tests (`real_git`/`integration`/`wire`) skip-by-default, visible as skips |
 | Test (full suite) | `uv run pytest tests/ --run-slow` — runs everything incl. the slow bucket (real git/wire machinery) |
 | Test (conformance) | `PLANCTL_BIN="$(command -v planctl)" uv run pytest tests/` — runs every non-`python_only` test against the real binary as a subprocess with real git; `python_only` tests skip-visible. Parallelise with `-n auto --dist loadscope` (per-worker tmp HOME, no cross-worker flock; `-n auto` capped at 8). Point `PLANCTL_BIN` at any planctl binary to run this suite as its parity spec |
+| Bun build | `bun run build` — compiles `dist/planctl-bun` via `bun build --compile` (Bun pinned at 1.3.14) |
+| Bun lint | `bun run lint` — biome check over `src` (and the hook dispatchers) |
+| Bun typecheck | `bun run typecheck` — `tsc --noEmit` |
+| Bun test | `bun run test` — `bun test` over the TypeScript suite |
+| Bun conformance | `bun run build && PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/test_cli.py tests/test_readonly_verbs.py` — the scoped read-only gate against the compiled binary (serial; add `-n auto --dist loadscope` to parallelise) |
