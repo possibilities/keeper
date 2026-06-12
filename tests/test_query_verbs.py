@@ -785,6 +785,7 @@ def test_validate_epic_stamps_on_none_transition(tmp_path, monkeypatch, fixed_cl
     epic_path = tmp_path / ".planctl" / "epics" / "fn-1-cafe.json"
     assert load_json(epic_path).get("last_validated_at") is None
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
 
     result = run_cli(["validate", "--epic", "fn-1-cafe"], cwd=tmp_path)
     assert result.exit_code == 0, result.output
@@ -808,6 +809,7 @@ def test_validate_epic_already_stamped_is_noop(tmp_path, monkeypatch, fixed_cloc
     seed_state(tmp_path, epic_id="fn-1-cafe", n_tasks=1)
     epic_path = tmp_path / ".planctl" / "epics" / "fn-1-cafe.json"
     monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ID", "test-session-fixture")
 
     first = run_cli(["validate", "--epic", "fn-1-cafe"], cwd=tmp_path)
     assert first.exit_code == 0, first.output
