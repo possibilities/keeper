@@ -55,6 +55,7 @@ function makeHarness(): Harness {
       dash: mkHandler("dash"),
       await: mkHandler("await"),
       "commit-work": mkHandler("commit-work"),
+      "setup-tmux": mkHandler("setup-tmux"),
       "session-state": mkHandler("session-state"),
       "show-session-files": mkHandler("show-session-files"),
       "search-history": mkHandler("search-history"),
@@ -179,6 +180,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("dash")).toBe(true);
     expect(isSubcommand("await")).toBe(true);
     expect(isSubcommand("commit-work")).toBe(true);
+    expect(isSubcommand("setup-tmux")).toBe(true);
     expect(isSubcommand("session-state")).toBe(true);
     expect(isSubcommand("show-session-files")).toBe(true);
     expect(isSubcommand("search-history")).toBe(true);

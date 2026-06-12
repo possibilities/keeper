@@ -10,6 +10,12 @@ This document orients a developer working *on* or *against* the backend.
 The module itself is heavily comment-documented; read it for the
 exact wording of any contract, and read this for the shape of the whole.
 
+> **Outside the seam:** `keeper setup-tmux` (`cli/setup-tmux.ts`) deliberately
+> drives tmux directly via `Bun.spawnSync`, NOT through `ExecBackend`. It is an
+> experimental one-shot provisioner whose lifecycle is unrelated to the managed
+> dispatch ops; it reuses only the pure exports `localeDefaultedEnv` and
+> `MANAGED_EXEC_SESSION` read-only. The `ExecBackend` API stays stable for it.
+
 ## Overview
 
 The backend is a **factory, not a singleton** — `createTmuxBackend(...)`

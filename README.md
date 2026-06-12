@@ -532,6 +532,20 @@ Keeper has no `install` verb. Wire it up manually:
    `src/readiness-client.ts`) — see
    [Example clients](#example-clients).
 
+10. **(Optional) Provision the tmux control plane** — `keeper setup-tmux`
+    stands up the `dash` dashboard session (board + autopilot/jobs/git/builds/
+    usage panes, all in `~/code/keeper`) and ensures the `autopilot`,
+    `background`, and `foreground` work sessions exist (one shell window each,
+    stamped with `KEEPER_TMUX_SESSION`). It rebuilds `dash` on every run, never
+    attaches or `switch-client`s (safe inside or outside tmux), and leaves
+    existing work sessions untouched. `--kill-sessions` tears all four down
+    first, prompting only when the work sessions hold busy panes:
+
+    ```sh
+    keeper setup-tmux                 # rebuild dash, ensure work sessions
+    keeper setup-tmux --kill-sessions # tear down all four first, then rebuild
+    ```
+
 ## Example clients
 
 The unified `keeper` CLI exposes the example subscribe + RPC clients as
@@ -1111,6 +1125,27 @@ commits only that session's attributed files. The other three are read-only.
 
   ```sh
   keeper show-session-files --session-id <id> # {files_by_repo, cwd_repo}
+  ```
+
+`setup-tmux` is a one-shot provisioner (epic fn-803), not a subscribe client.
+It drives tmux directly via `Bun.spawnSync` — deliberately OUTSIDE the
+ExecBackend seam — and writes nothing to git or the event log.
+
+- `setup-tmux.ts` — stand up the human's tmux control plane. Rebuilds the
+  `dash` dashboard session every run (board main pane + autopilot/jobs/git/
+  builds/usage splits, `main-vertical`, each pane a `zsh -ic '…; exec $SHELL'`
+  triple sized to the real client/terminal) and ensures the `autopilot`,
+  `background`, and `foreground` work sessions exist (one shell window each,
+  stamped `KEEPER_TMUX_SESSION=<name>` so hook attribution matches daemon-minted
+  sessions). Existing work sessions are never touched; it NEVER attaches or
+  `switch-client`s, so it is safe inside or outside tmux. `--kill-sessions`
+  tears all four sessions down first, prompting y/N only when the work sessions
+  hold busy (non-shell foreground) panes — non-TTY stdin with busy panes aborts
+  (exit 1) having killed nothing.
+
+  ```sh
+  keeper setup-tmux                 # rebuild dash, ensure work sessions
+  keeper setup-tmux --kill-sessions # tear down all four first (confirm if busy)
   ```
 
 ## Uninstall

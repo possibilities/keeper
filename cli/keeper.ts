@@ -33,6 +33,7 @@ export const SUBCOMMANDS = [
   "dash",
   "await",
   "commit-work",
+  "setup-tmux",
   "session-state",
   "show-session-files",
   "search-history",
@@ -56,6 +57,7 @@ Subcommands:
   dash                Read-only opening screen: header + PLAN + AGENTS (TTY-only)
   await               Block until a planctl/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
+  setup-tmux          Provision the tmux control plane (dash + work sessions)
   session-state       Current session git context + on-hook files (JSON)
   show-session-files  Session's on-hook dirty files grouped by repo (JSON)
   search-history      Search UserPromptSubmit history by LIKE term (JSON)
@@ -152,6 +154,7 @@ export async function main(): Promise<void> {
     dash: async (argv) => (await import("./dash")).main(argv),
     await: async (argv) => (await import("./await")).main(argv),
     "commit-work": async (argv) => (await import("./commit-work")).main(argv),
+    "setup-tmux": async (argv) => (await import("./setup-tmux")).main(argv),
     "session-state": async (argv) =>
       (await import("./session-state")).main(argv),
     "show-session-files": async (argv) =>
