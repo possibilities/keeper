@@ -34,5 +34,5 @@ bun units green incl. a fail-forward case proving the structural write survives 
 - [ ] No fork of the spec-heading check
 
 ## Done summary
-
+Ported the integrity catalog (checkEpicTree, both path-comparison semantics, checkFilesystemRepos toggle) and the restamp pipeline (restampEpicOrFail fail-forward + runSetter with pre-restamp and rollback hooks) to planctl-bun, with bun units catalog-byte-matched against the Python check.
 ## Evidence
