@@ -37,5 +37,5 @@ bun unit tests: regex true/false table (compound commands, env prefixes, quoted 
 - [ ] bun test + fast/slow pytest green
 
 ## Done summary
-
+Implemented the PreToolUse(Bash) commit hard-deny dispatcher: bypass/tool/agent_id/commit-pattern/marker short-circuits then a read-only reconcile that denies only on genuine in-flight verdicts and unlinks stale markers. Added a commit-pattern regex with a bun true/false table plus a slow-bucket pytest covering the full deny/allow ladder.
 ## Evidence

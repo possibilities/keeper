@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Add commit hard-deny guard",
-  "updated_at": "2026-06-11T23:22:24.562941Z"
+  "updated_at": "2026-06-12T00:08:29.243543Z",
+  "worker_done_at": "2026-06-12T00:08:29.243543Z"
 }
