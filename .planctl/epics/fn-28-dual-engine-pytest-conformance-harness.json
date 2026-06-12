@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-12T04:00:56.659159Z",
+  "depends_on_epics": [],
+  "id": "fn-28-dual-engine-pytest-conformance-harness",
+  "last_validated_at": "2026-06-12T04:00:56.877043Z",
+  "primary_repo": "/Users/mike/code/planctl",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Dual-engine pytest conformance harness",
+  "touched_repos": [
+    "/Users/mike/code/planctl"
+  ],
+  "updated_at": "2026-06-12T04:00:56.659159Z"
+}
