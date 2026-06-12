@@ -34,5 +34,5 @@ bun test green incl. interop and golden tests; lint/typecheck green; no Python f
 - [ ] saveRuntime lands; tmp files never survive a failed write
 
 ## Done summary
-
+Landed the bun write-side spine: atomicWrite/atomicWriteJson (same-dir tmp+fsync+rename, tmp unlinked on throw, ensure_ascii recursive-sort serializer byte-identical to Python), the fail-OPEN session touched-log, saveRuntime, and a real bun:ffi flock(2) (src/flock.ts) proven to interop with Python's fcntl both directions and to work inside the compiled binary.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "xhigh",
   "title": "Atomic writer flock store writes",
-  "updated_at": "2026-06-12T09:13:14.626060Z"
+  "updated_at": "2026-06-12T09:25:22.663213Z",
+  "worker_done_at": "2026-06-12T09:25:22.663213Z"
 }
