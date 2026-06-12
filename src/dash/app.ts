@@ -6,11 +6,10 @@
  *   ONCE (root Box column 100%/100%; header Text fixed height over a full-width
  *   rule; body ScrollBox flexGrow:1 + viewportCulling, focused on mount so
  *   j/k/arrows scroll natively), and exposes `render(model)` which diffs the
- *   view-model's keyed body rows into a stable `Map<rowKey, RowHandle>` — four
- *   row kinds (split / section / divider / spacer), content updates in place,
- *   structural add/remove/reorder ONLY when the keyed ORDER changes (Yoga
- *   recalc rides structure, not content). The runtime OpenTUI ctors are
- *   THREADED IN so this
+ *   view-model's keyed body rows into a stable `Map<rowKey, RowHandle>` — two
+ *   row kinds (split / divider), content updates in place, structural
+ *   add/remove/reorder ONLY when the keyed ORDER changes (Yoga recalc rides
+ *   structure, not content). The runtime OpenTUI ctors are THREADED IN so this
  *   module carries a type-only `@opentui/core` import — the same inertness
  *   contract `src/live-shell.ts`'s `attachLiveShellPaint` keeps, so an unrelated
  *   test importing the pure view-model never trips OpenTUI's racy native loader.
@@ -22,7 +21,8 @@
  *   SIGTERM/SIGHUP/SIGQUIT, alternate-screen), attaches the paint layer, wires
  *   the three subscriptions (subscribeReadiness + subscribeCollection
  *   autopilot_state + armed_epics) into one current-inputs struct, the 30s
- *   elapsed interval, the q/Ctrl-C key handler, the forked exit triggers, an
+ *   staleness repaint interval, the q/Ctrl-C key handler, the forked exit
+ *   triggers, an
  *   onFatal override, and uncaughtException/unhandledRejection handlers — every
  *   path routes through ONE idempotent `exitCleanly` so `renderer.destroy()`
  *   ALWAYS precedes `process.exit` (OpenTUI does NOT auto-restore the terminal
@@ -55,8 +55,8 @@ import {
   type Row,
 } from "./view-model";
 
-// One coarse repaint interval for the elapsed cells — 30s (epic-settled).
-const ELAPSED_REFRESH_MS = 30_000;
+// One coarse repaint interval for wall-clock-aged glyphs — 30s (epic-settled).
+const STALE_REFRESH_MS = 30_000;
 
 /**
  * Runtime exports from `@opentui/core` that {@link attachDashApp} needs to
@@ -117,9 +117,9 @@ interface RowHandle {
  * fixed-height header Text pinned at the top, a full-width rule under it, and
  * a flexGrow:1 ScrollBox body filling the rest. The body holds the
  * view-model's keyed rows — split content lines (left text + right-aligned
- * dim metadata), titled section rules, dividers, spacers — each a stable
- * handle in `rowNodes` so a re-render diffs content in place; structural
- * add/remove/reorder fires only when the keyed ORDER changes.
+ * dim metadata) and dividers — each a stable handle in `rowNodes` so a
+ * re-render diffs content in place; structural add/remove/reorder fires only
+ * when the keyed ORDER changes.
  *
  * Production: called from {@link createDashApp}'s async renderer setup.
  * Tests: called against a `createTestRenderer` result.
@@ -168,7 +168,6 @@ export function attachDashApp(
     id: "dash-header",
     width: "100%",
     height: 1,
-    paddingLeft: 1,
     content: "",
   });
   const headerRule = new runtime.BoxRenderable(renderer, {
@@ -232,19 +231,6 @@ export function attachDashApp(
         node.add(right);
         return { kind: "split", node, left, right };
       }
-      case "section":
-        return {
-          kind: "section",
-          node: new runtime.BoxRenderable(renderer, {
-            id: `dash-row-${row.key}`,
-            width: "100%",
-            height: 1,
-            border: ["top"],
-            borderColor: structureColor,
-            title: ` ${row.title} `,
-            titleAlignment: "left",
-          }),
-        };
       case "divider":
         return {
           kind: "divider",
@@ -256,15 +242,6 @@ export function attachDashApp(
             borderColor: structureColor,
           }),
         };
-      case "spacer":
-        return {
-          kind: "spacer",
-          node: new runtime.BoxRenderable(renderer, {
-            id: `dash-row-${row.key}`,
-            width: "100%",
-            height: 1,
-          }),
-        };
     }
   }
 
@@ -272,7 +249,12 @@ export function attachDashApp(
     if (destroyed) {
       return;
     }
-    header.content = styledRow(model.header);
+    // One column of left margin, matching the body rows' Box padding (Text
+    // ignores padding options, so the margin is a literal space chunk).
+    header.content = styledRow([
+      { text: " ", role: "terminal" },
+      ...model.header,
+    ]);
 
     // Ensure every wanted row exists with current content. New nodes mount
     // detached; the order pass below attaches them in position.
@@ -535,11 +517,12 @@ export async function createDashApp(
     onFatal: () => exitCleanly(),
   });
 
-  // One coarse interval refreshes the elapsed cells (no other repaint driver
-  // touches them — they age off wall-clock, not data edges). unref'd so it
-  // never pins the loop alive on its own.
-  const elapsedTimer = setInterval(paint, ELAPSED_REFRESH_MS);
-  (elapsedTimer as { unref?: () => void }).unref?.();
+  // One coarse interval refreshes the wall-clock-aged glyphs — the rolled-up
+  // job verdict's sub-agent/monitor STALE transitions age off `nowSec`, not
+  // data edges, so no subscription repaints them. unref'd so it never pins the
+  // loop alive on its own.
+  const staleTimer = setInterval(paint, STALE_REFRESH_MS);
+  (staleTimer as { unref?: () => void }).unref?.();
 
   // Single idempotent teardown. destroy() ALWAYS precedes exit so the terminal
   // is restored (OpenTUI does not auto-restore on exit/uncaught). Disposes the
@@ -551,7 +534,7 @@ export async function createDashApp(
     }
     exited = true;
     try {
-      clearInterval(elapsedTimer);
+      clearInterval(staleTimer);
     } catch {
       // best-effort
     }
@@ -591,7 +574,7 @@ export async function createDashApp(
     if (!exited) {
       exited = true;
       try {
-        clearInterval(elapsedTimer);
+        clearInterval(staleTimer);
       } catch {
         // best-effort
       }

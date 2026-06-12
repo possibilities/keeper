@@ -3,8 +3,8 @@
  * entry point, {@link buildDashModel}, folds a readiness snapshot plus the two
  * autopilot side-streams into a typed `{ header, body }` model: the header is
  * a single segment row; the body is an ORDERED list of keyed rows — split
- * (left/right content), section rules, dividers, spacers — the materializer
- * renders verbatim. The role vocabulary lives in `./theme.ts` and is semantic
+ * (left/right content) and dividers — the materializer renders verbatim. The
+ * role vocabulary lives in `./theme.ts` and is semantic
  * (motion / ready / attention / failed / terminal / accent / heading / text),
  * never widget-specific — that is the contract the theme fork preserves.
  *
@@ -12,7 +12,7 @@
  * role); titles carry the workability axis — `heading`/`text` (default fg)
  * when workable now, `terminal` (dim) when completed or blocked — so state
  * reads at a glance with no pill words. Metadata (dep refs, project name,
- * elapsed bands) right-aligns on the split rows in the dim tone.
+ * needs-eyes glyphs) right-aligns on the split rows.
  *
  * Forked, not shared: the three tiny autopilot projectors
  * (`projectAutopilotPaused` / `projectAutopilotMode` / `projectArmedEpics`)
@@ -46,8 +46,8 @@ export interface Segment {
 export type Row = readonly Segment[];
 
 /** A content line: `left` hugs the left edge, `right` right-aligns on the
- * same line (dim metadata — dep refs, project, elapsed). `indent` is extra
- * left padding in columns (task rows nest under their epic). */
+ * same line (metadata — dep refs, project, needs-eyes glyphs). `indent` is
+ * extra left padding in columns (task rows nest under their epic). */
 export interface SplitRow {
   readonly kind: "split";
   readonly key: string;
@@ -56,30 +56,17 @@ export interface SplitRow {
   readonly indent?: number;
 }
 
-/** A full-width titled rule — `── TITLE ────…` — opening a section. */
-export interface SectionRow {
-  readonly kind: "section";
-  readonly key: string;
-  readonly title: string;
-}
-
-/** A full-width untitled rule separating epic blocks. */
+/** A full-width rule separating epic blocks and the jobs region. */
 export interface DividerRow {
   readonly kind: "divider";
   readonly key: string;
 }
 
-/** One blank line of breathing room. */
-export interface SpacerRow {
-  readonly kind: "spacer";
-  readonly key: string;
-}
-
 /** One keyed body row. Keys are stable across frames (`epic:<id>`,
- * `epic:<id>:task:<tid>`, `job:<id>`, `sec:*`, `div:*`, `sp:*`, `ph:*`) so
- * the materializer diffs content in place and only restructures when the
- * keyed order changes. A key never changes kind. */
-export type DashBodyRow = SplitRow | SectionRow | DividerRow | SpacerRow;
+ * `epic:<id>:task:<tid>`, `job:<id>`, `div:*`, `ph:*`) so the materializer
+ * diffs content in place and only restructures when the keyed order changes.
+ * A key never changes kind. */
+export type DashBodyRow = SplitRow | DividerRow;
 
 /** The three connection lifecycle states the dash surfaces. */
 export type ConnectionState = "connecting" | "live" | "reconnecting";
@@ -408,10 +395,9 @@ function projectBasename(dir: string | null): string {
 }
 
 /**
- * Build the EPICS rows — one block per epic in SERVER order (`snapshot.epics`
- * is already `sort_path` ASC; NO client re-sort), blocks separated by
- * spacer-divider-spacer runs keyed on the epic ABOVE them (stable as epics
- * append below).
+ * Build the epic rows — one block per epic in SERVER order (`snapshot.epics`
+ * is already `sort_path` ASC; NO client re-sort), blocks separated by a
+ * divider keyed on the epic ABOVE it (stable as epics append below).
  *
  * Epic header row: leading verdict glyph (role-colored); the armed bolt
  * (accent) ONLY in armed mode for an armed epic; the dim epic number; the
@@ -432,9 +418,7 @@ function buildEpicRows(
     const epicId = seg(epic.epic_id);
     if (i > 0) {
       const prev = seg(snapshot.epics[i - 1]?.epic_id);
-      out.push({ kind: "spacer", key: `sp:a:${prev}` });
       out.push({ kind: "divider", key: `div:${prev}` });
-      out.push({ kind: "spacer", key: `sp:b:${prev}` });
     }
 
     const verdict = verdictFromMap(snapshot.readiness.perEpic, epicId);
@@ -514,24 +498,6 @@ function jobLabel(job: Job): string {
   return job.job_id;
 }
 
-/** Compact fixed-width elapsed band, floored to the largest unit, no "ago":
- * `<60s` → `Ns`, `<60m` → `Nm`, `<24h` → `Nh`, else `Nd`. Negative/NaN
- * clamps to `0s`. */
-function elapsedBand(deltaSec: number): string {
-  const d =
-    Number.isFinite(deltaSec) && deltaSec > 0 ? Math.floor(deltaSec) : 0;
-  if (d < 60) {
-    return `${d}s`;
-  }
-  if (d < 3600) {
-    return `${Math.floor(d / 60)}m`;
-  }
-  if (d < 86400) {
-    return `${Math.floor(d / 3600)}h`;
-  }
-  return `${Math.floor(d / 86400)}d`;
-}
-
 /**
  * Build the JOBS rows — EVERY non-terminal job (working AND stopped) on one
  * unified "most-recent-activity-started" timeline. The collections
@@ -547,10 +513,10 @@ function elapsedBand(deltaSec: number): string {
  * Each row's leading glyph is the per-job rolled-up board verdict
  * ({@link rolledUpJobVerdict}: working→sync, sub-agent→cogs/warn,
  * monitor→eye/warn, idle→circleO); the label rides the workability axis (live
- * → `text`, idle → dim). The right side is the dim elapsed band (from
- * `updated_at` vs `nowSec`), LED by a status glyph when the job needs eyes:
- * failed (red ✗) or awaiting-input (attention hand/comment, keyed by which
- * prompt field is set) — glyphs only, no words.
+ * → `text`, idle → dim). The right side is the dim project basename (from the
+ * job's `cwd`), LED by a needs-eyes glyph when one applies: failed (red ✗) or
+ * awaiting-input (attention hand/comment, keyed by which prompt field is set)
+ * — glyphs only, no words.
  */
 function buildJobRows(
   snapshot: ReadinessClientSnapshot,
@@ -603,25 +569,28 @@ function buildJobRows(
       left.push({ text: jobLabel(job), role: "text" });
     }
 
-    // Right side: needs-eyes glyph (failed / awaiting) then the elapsed band.
+    // Right side: needs-eyes glyph (failed / awaiting) then the dim project.
     const right: Segment[] = [];
     if (job.last_api_error_at != null) {
-      right.push({ text: `${glyphOr("failed", "x")} `, role: "failed" });
+      right.push({ text: glyphOr("failed", "x"), role: "failed" });
     } else if (job.last_permission_prompt_at != null) {
       right.push({
-        text: `${glyphOr("awaiting:permission", "?")} `,
+        text: glyphOr("awaiting:permission", "?"),
         role: "attention",
       });
     } else if (job.last_input_request_at != null) {
       right.push({
-        text: `${glyphOr("awaiting:ask_user_question", "?")} `,
+        text: glyphOr("awaiting:ask_user_question", "?"),
         role: "attention",
       });
     }
-    right.push({
-      text: elapsedBand(nowSec - job.updated_at),
-      role: "terminal",
-    });
+    const project = projectBasename(seg(job.cwd) || null);
+    if (project !== "") {
+      if (right.length > 0) {
+        right.push({ text: " · ", role: "terminal" });
+      }
+      right.push({ text: project, role: "terminal" });
+    }
 
     rows.push({ kind: "split", key: `job:${job.job_id}`, left, right });
   }
@@ -636,9 +605,9 @@ function buildJobRows(
  * Build the complete dash view-model for one frame. A `null` snapshot
  * (connecting, no paint yet) yields a body of just the dim `waiting for
  * keeperd…` line; the header still renders off the autopilot seed +
- * side-streams. Once a snapshot lands, loaded-but-empty regions render the
- * dim `no open epics` / `no jobs` placeholders under their section rules
- * (distinguishable from the connecting line).
+ * side-streams. Once a snapshot lands, the body is the epic blocks then the
+ * job rows, divider-separated — no section labels, no empty-state lines: an
+ * empty region simply renders nothing.
  */
 export function buildDashModel(input: DashModelInput): DashModel {
   const { snapshot, autopilotRows, armedRows, connection, nowSec } = input;
@@ -656,7 +625,6 @@ export function buildDashModel(input: DashModelInput): DashModel {
     return {
       header,
       body: [
-        { kind: "spacer", key: "sp:waiting" },
         {
           kind: "split",
           key: "ph:waiting",
@@ -667,36 +635,14 @@ export function buildDashModel(input: DashModelInput): DashModel {
     };
   }
 
-  const body: DashBodyRow[] = [];
-
-  body.push({ kind: "section", key: "sec:epics", title: "EPICS" });
-  body.push({ kind: "spacer", key: "sp:epics" });
-  const epicRows = buildEpicRows(snapshot, armedSet, mode);
-  if (epicRows.length === 0) {
-    body.push({
-      kind: "split",
-      key: "ph:epics",
-      left: [{ text: "no open epics", role: "terminal" }],
-      right: [],
-    });
-  } else {
-    body.push(...epicRows);
-  }
-
-  body.push({ kind: "spacer", key: "sp:jobs:pre" });
-  body.push({ kind: "section", key: "sec:jobs", title: "JOBS" });
-  body.push({ kind: "spacer", key: "sp:jobs" });
+  const body: DashBodyRow[] = [...buildEpicRows(snapshot, armedSet, mode)];
   const jobRows = buildJobRows(snapshot, nowSec);
-  if (jobRows.length === 0) {
-    body.push({
-      kind: "split",
-      key: "ph:jobs",
-      left: [{ text: "no jobs", role: "terminal" }],
-      right: [],
-    });
-  } else {
-    body.push(...jobRows);
+  // One divider fences the jobs region off the last epic block — only when
+  // both regions have rows (a lone region needs no fence).
+  if (body.length > 0 && jobRows.length > 0) {
+    body.push({ kind: "divider", key: "div:jobs" });
   }
+  body.push(...jobRows);
 
   return { header, body };
 }

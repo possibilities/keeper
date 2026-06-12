@@ -331,18 +331,28 @@ test("header: connection marker shows only when not live", () => {
 // Body structure
 // ---------------------------------------------------------------------------
 
-test("body: live frame opens EPICS then JOBS section rules, in that order", () => {
-  const m = build({});
-  const sections = m.body.filter((r) => r.kind === "section");
-  expect(sections.map((r) => (r.kind === "section" ? r.title : ""))).toEqual([
-    "EPICS",
-    "JOBS",
-  ]);
+test("body: epic blocks precede job rows, fenced by one div:jobs divider", () => {
+  const snapshot = makeSnap({
+    epics: [makeEpic({ epic_id: "fn-1-a" })],
+    jobs: new Map([["j", makeJob({ job_id: "j" })]]),
+  });
+  const m = build({ snapshot });
   const keys = m.body.map((r) => r.key);
-  expect(keys.indexOf("sec:epics")).toBeLessThan(keys.indexOf("sec:jobs"));
+  expect(keys.indexOf("epic:fn-1-a")).toBeLessThan(keys.indexOf("div:jobs"));
+  expect(keys.indexOf("div:jobs")).toBeLessThan(keys.indexOf("job:j"));
+
+  // A lone region needs no fence.
+  const epicsOnly = build({
+    snapshot: makeSnap({ epics: [makeEpic({ epic_id: "fn-1-a" })] }),
+  });
+  expect(epicsOnly.body.map((r) => r.key)).not.toContain("div:jobs");
+  const jobsOnly = build({
+    snapshot: makeSnap({ jobs: new Map([["j", makeJob({ job_id: "j" })]]) }),
+  });
+  expect(jobsOnly.body.map((r) => r.key)).not.toContain("div:jobs");
 });
 
-test("body: spacer-divider-spacer runs separate epic blocks, keyed on the epic above", () => {
+test("body: one divider separates epic blocks, keyed on the epic above", () => {
   const snapshot = makeSnap({
     epics: [
       makeEpic({ epic_id: "fn-1-a", epic_number: 1, sort_path: "000001" }),
@@ -351,14 +361,12 @@ test("body: spacer-divider-spacer runs separate epic blocks, keyed on the epic a
   });
   const m = build({ snapshot });
   const keys = m.body.map((r) => r.key);
-  // The run between blocks rides the FIRST epic's id, so appending an epic
-  // below never re-keys an existing divider.
+  // The divider rides the FIRST epic's id, so appending an epic below never
+  // re-keys an existing divider.
   const i = keys.indexOf("epic:fn-1-a");
-  expect(keys.slice(i, i + 5)).toEqual([
+  expect(keys.slice(i, i + 3)).toEqual([
     "epic:fn-1-a",
-    "sp:a:fn-1-a",
     "div:fn-1-a",
-    "sp:b:fn-1-a",
     "epic:fn-2-b",
   ]);
   // No divider trails the last block.
@@ -371,9 +379,9 @@ test("body: spacer-divider-spacer runs separate epic blocks, keyed on the epic a
   expect(one.body.some((r) => r.kind === "divider")).toBe(false);
 });
 
-test("body: null snapshot yields only the waiting line (no sections); header still renders", () => {
+test("body: null snapshot yields only the waiting line; header still renders", () => {
   const m = build({ snapshot: null, connection: "connecting" });
-  expect(m.body.some((r) => r.kind === "section")).toBe(false);
+  expect(m.body.map((r) => r.key)).toEqual(["ph:waiting"]);
   const waiting = splitRow(m, "ph:waiting");
   expect(rowText(waiting.left)).toContain("waiting for keeperd");
   expect(roleOf(waiting.left, "waiting")).toBe("terminal");
@@ -381,15 +389,9 @@ test("body: null snapshot yields only the waiting line (no sections); header sti
   expect(rowText(m.header)).toContain("autopilot");
 });
 
-test("body: loaded-empty regions render dim placeholders under their sections", () => {
+test("body: loaded-but-empty regions render nothing — no placeholder lines", () => {
   const m = build({ snapshot: makeSnap(), connection: "live" });
-  expect(m.body.some((r) => r.key === "ph:waiting")).toBe(false);
-  const epics = splitRow(m, "ph:epics");
-  expect(rowText(epics.left)).toBe("no open epics");
-  expect(roleOf(epics.left, "no open epics")).toBe("terminal");
-  const jobs = splitRow(m, "ph:jobs");
-  expect(rowText(jobs.left)).toBe("no jobs");
-  expect(roleOf(jobs.left, "no jobs")).toBe("terminal");
+  expect(m.body).toHaveLength(0);
 });
 
 // ---------------------------------------------------------------------------
@@ -936,23 +938,35 @@ test("jobs: a wire row delivers active_since as number | null, never undefined",
   expect(keysWithPrefix(m, "job:")).toEqual(["job:a", "job:b"]);
 });
 
-test("jobs: elapsed bands floor to the largest unit, no 'ago', right-aligned", () => {
-  const cases: [number, string][] = [
-    [1000 - 5, "5s"],
-    [1000 - 4 * 60, "4m"],
-    [1000 - 2 * 3600, "2h"],
-    [1000 - 1 * 86400, "1d"],
-  ];
-  for (const [updatedAt, band] of cases) {
-    const jobs = new Map<string, Job>([
-      ["j", makeJob({ job_id: "j", state: "working", updated_at: updatedAt })],
-    ]);
-    const m = build({ snapshot: makeSnap({ jobs }), nowSec: 1000 });
-    expect(rowText(splitRow(m, "job:j").right)).toContain(band);
-  }
+test("jobs: right side is the dim project basename — no elapsed band", () => {
+  const jobs = new Map<string, Job>([
+    [
+      "j",
+      makeJob({
+        job_id: "j",
+        state: "working",
+        updated_at: 940,
+        cwd: "/code/keeper",
+      }),
+    ],
+  ]);
+  const m = build({ snapshot: makeSnap({ jobs }), nowSec: 1000 });
+  const right = splitRow(m, "job:j").right;
+  expect(rowText(right)).toBe("keeper");
+  expect(roleOf(right, "keeper")).toBe("terminal");
+  expect(rowText(right)).not.toMatch(/\d+[smhd]\b/);
+
+  // A cwd-less job renders an empty right side.
+  const bare = build({
+    snapshot: makeSnap({
+      jobs: new Map([["j", makeJob({ job_id: "j", cwd: "" })]]),
+    }),
+    nowSec: 1000,
+  });
+  expect(rowText(splitRow(bare, "job:j").right)).toBe("");
 });
 
-test("jobs: failed/awaiting render as glyphs (no words) beside the elapsed band", () => {
+test("jobs: failed/awaiting render as glyphs only — no words", () => {
   const permission = build({
     snapshot: makeSnap({
       jobs: new Map([
@@ -972,7 +986,6 @@ test("jobs: failed/awaiting render as glyphs (no words) beside the elapsed band"
   const pRow = splitRow(permission, "job:j");
   expect(rowText(pRow.right)).toContain(GLYPH.hand);
   expect(roleOf(pRow.right, GLYPH.hand)).toBe("attention");
-  expect(rowText(pRow.right)).toContain("1m"); // elapsed stays
   expect(rowText(pRow.right)).not.toContain("awaiting");
 
   const input = build({

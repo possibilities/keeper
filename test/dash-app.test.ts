@@ -220,7 +220,7 @@ test("static tree: header fixed at row 0, body is a focused ScrollBox", async ()
   expect((app.body as unknown as { focused: boolean }).focused).toBe(true);
 });
 
-test("connecting: a null snapshot paints the waiting line and no section rules", async () => {
+test("connecting: a null snapshot paints the waiting line; header gets its left margin", async () => {
   const { setup, app } = await bootApp();
   app.render(
     buildDashModel({
@@ -234,13 +234,13 @@ test("connecting: a null snapshot paints the waiting line and no section rules",
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
   expect(frame).toContain("waiting for keeperd…");
-  expect(frame).not.toContain("EPICS");
-  expect(frame).not.toContain("JOBS");
-  // Header surfaces the connection marker pre-paint.
+  // Header surfaces the connection marker pre-paint, behind the one-column
+  // left margin that matches the body rows' padding.
   expect(textContent(app.header)).toContain("connecting…");
+  expect(textContent(app.header).startsWith(" ")).toBe(true);
 });
 
-test("live frame: section rules, epic block with nested task, job row, no pill words", async () => {
+test("live frame: epic block with nested task above the job row, no pill words", async () => {
   const { setup, app } = await bootApp();
   const snap = makeSnap({
     epics: [
@@ -260,39 +260,38 @@ test("live frame: section rules, epic block with nested task, job row, no pill w
   app.render(liveModel(snap));
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // Section rules with inline titles, EPICS above JOBS.
-  expect(frame).toContain("EPICS");
-  expect(frame).toContain("JOBS");
-  expect(frameLineOf(frame, "EPICS")).toBeLessThan(frameLineOf(frame, "JOBS"));
   // The epic line carries number + title with the project basename at right.
   const epicLine = frame.split("\n")[frameLineOf(frame, "add oauth")] ?? "";
   expect(epicLine).toContain("1");
   expect(epicLine).toContain("keeper");
   expect(epicLine).not.toContain("/code");
-  // The task nests on its own line below the epic.
+  // The task nests below the epic; the job region renders below the tasks.
   expect(frameLineOf(frame, "wire the flow")).toBeGreaterThan(
     frameLineOf(frame, "add oauth"),
   );
-  // No pill words, no task-count fraction — glyphs carry the state.
+  expect(frameLineOf(frame, "worker A")).toBeGreaterThan(
+    frameLineOf(frame, "wire the flow"),
+  );
+  // No section labels, no pill words, no task-count fraction.
+  expect(frame).not.toContain("EPICS");
+  expect(frame).not.toContain("JOBS");
   expect(frame).not.toMatch(/\[\w+/);
   expect(frame).not.toMatch(/\d+\/\d+/);
   expect(frame).not.toContain("ready");
-  // The job row carries the coalesced title label.
-  expect(frame).toContain("worker A");
   // Live header carries no connection marker.
   expect(textContent(app.header)).not.toContain("connecting");
   expect(textContent(app.header)).not.toContain("reconnecting");
 });
 
-test("empty-but-live: dim placeholders render under each section rule", async () => {
+test("empty-but-live: the body renders nothing — no placeholder lines", async () => {
   const { setup, app } = await bootApp();
   app.render(liveModel(makeSnap()));
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  expect(frame).toContain("EPICS");
-  expect(frame).toContain("no open epics");
-  expect(frame).toContain("JOBS");
-  expect(frame).toContain("no jobs");
+  expect(frame).not.toContain("no open epics");
+  expect(frame).not.toContain("no jobs");
+  expect(frame).not.toContain("EPICS");
+  expect(frame).not.toContain("JOBS");
 });
 
 test("row-set diff: shrinking the job set structurally prunes its row node", async () => {
