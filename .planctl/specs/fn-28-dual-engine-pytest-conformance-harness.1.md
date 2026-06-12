@@ -32,5 +32,5 @@ Unit-level: set/unset/malformed cases on `now_iso` directly. Boundary-level: dri
 - [ ] README.md and AGENTS.md env-var lists carry a one-line `PLANCTL_NOW` entry, present-tense, no test-harness narration
 
 ## Done summary
-
+now_iso() honors PLANCTL_NOW as a pinned cross-implementation contract: returns the value verbatim after a strict strptime round-trip against %Y-%m-%dT%H:%M:%S.%fZ, hard-errors on malformed input, and preserves the wall-clock default when unset. Documented in the README/AGENTS env-var lists and pinned by a focused contract test.
 ## Evidence
