@@ -24,5 +24,5 @@ covering the same three CLI verbs (one commit).
 - [ ] Tests route through `sandboxEnv` per the test-isolation rule and pass under the slow tier.
 
 ## Done summary
-
+Added test pins for escapeLike literal-match (search-history, find-file-history) and the read-failure error envelope (find-file-history, show-session-events) in test/history-read-verbs.test.ts.
 ## Evidence
