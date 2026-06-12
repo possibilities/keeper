@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-12T08:39:30.316888Z",
   "created_at": "2026-06-12T08:26:38.858965Z",
   "depends_on_epics": [],
   "id": "fn-803-add-setup-tmux-subcommand",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Add setup-tmux subcommand",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-12T08:26:38.858965Z"
+  "updated_at": "2026-06-12T08:39:30.316888Z"
 }
