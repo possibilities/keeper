@@ -116,9 +116,8 @@ afterEach(() => {
  * `KEEPER_DEAD_LETTER_DIR` (per-pid NDJSON recovery files), and
  * `KEEPER_DROP_LOG` (the diagnostic drop-log append). The daemon (not
  * the hook directly, but spawned indirectly) also honors
- * `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684 task .3 — per-session zellij
- * plugin NDJSON files) and `KEEPER_BACKSTOP_LOG` (fn-720 — the
- * backstop-telemetry sidecar main is the sole writer of). If any of these falls through to its
+ * `KEEPER_BACKSTOP_LOG` (fn-720 — the backstop-telemetry sidecar main
+ * is the sole writer of). If any of these falls through to its
  * production default, a test run pollutes the user's real
  * `~/.local/state/keeper/` paths — the drop-log leak that fn-657
  * exists to close. Centralize them here so a new spawn site can't
@@ -131,22 +130,19 @@ function sandboxedBaseEnv(): Record<string, string> & {
   KEEPER_DB: string;
   KEEPER_DEAD_LETTER_DIR: string;
   KEEPER_DROP_LOG: string;
-  KEEPER_ZELLIJ_EVENTS_DIR: string;
   KEEPER_BACKSTOP_LOG: string;
 } {
-  // Family B (hook-spawn): keep ambient ids, include the zellij feed. The
-  // shared core (test/helpers/sandbox-env.ts) guarantees the SIX state paths
-  // are set; the cast pins the keys this file's callers read by name.
+  // Family B (hook-spawn): keep ambient ids. The shared core
+  // (test/helpers/sandbox-env.ts) guarantees the six state paths are set;
+  // the cast pins the keys this file's callers read by name.
   return sandboxEnv({
     tmpDir,
     dbPath,
     clearAmbientIds: false,
-    includeZellij: true,
   }) as Record<string, string> & {
     KEEPER_DB: string;
     KEEPER_DEAD_LETTER_DIR: string;
     KEEPER_DROP_LOG: string;
-    KEEPER_ZELLIJ_EVENTS_DIR: string;
     KEEPER_BACKSTOP_LOG: string;
   };
 }
@@ -1181,7 +1177,6 @@ test("configDirFromEnv normalizes the SessionStart-captured CLAUDE_CONFIG_DIR", 
     tmpDir,
     dbPath,
     clearAmbientIds: false,
-    includeZellij: true,
     extra: { CLAUDE_CONFIG_DIR: "/Users/x/.claude-profiles/profile-b/" },
   });
   expect(configDirFromEnv(trailing)).toBe(
@@ -1192,7 +1187,6 @@ test("configDirFromEnv normalizes the SessionStart-captured CLAUDE_CONFIG_DIR", 
     tmpDir,
     dbPath,
     clearAmbientIds: false,
-    includeZellij: true,
     extra: { CLAUDE_CONFIG_DIR: undefined },
   });
   expect(configDirFromEnv(unset)).toBeNull();
@@ -1201,7 +1195,6 @@ test("configDirFromEnv normalizes the SessionStart-captured CLAUDE_CONFIG_DIR", 
     tmpDir,
     dbPath,
     clearAmbientIds: false,
-    includeZellij: true,
     extra: { CLAUDE_CONFIG_DIR: "" },
   });
   expect(configDirFromEnv(empty)).toBeNull();

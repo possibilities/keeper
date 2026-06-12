@@ -12,12 +12,11 @@
  *  - **Family A** (id-clearing CLI-spawn — commit-work / session-state):
  *    clears the ambient `CLAUDE_CODE_SESSION_ID` /
  *    `JOBCTL_SESSION_ID` / `JOBCTL_JOB_ID` so attribution + the Job-Id trailer
- *    are fully test-controlled, and sets the SIX state paths. No zellij var.
+ *    are fully test-controlled, and sets the six state paths.
  *    Reproduce with `clearAmbientIds: true` (the default).
  *
  *  - **Family B** (hook-spawn — events-writer / integration): does NOT clear
- *    ambient ids and adds a SEVENTH var `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684).
- *    Reproduce with `{ clearAmbientIds: false, includeZellij: true }`.
+ *    the ambient ids. Reproduce with `{ clearAmbientIds: false }`.
  *
  * INVARIANT: the state paths are applied LAST — after the `extra` merge AND the
  * undefined-clear pass — so a caller's `extra` (which may use `undefined` to
@@ -38,12 +37,6 @@ export interface SandboxEnvOptions {
    */
   clearAmbientIds?: boolean;
   /**
-   * Add `KEEPER_ZELLIJ_EVENTS_DIR` (fn-684). Default `false`. Set `true` for
-   * the hook/launcher-spawn tests that exercise the zellij plugin NDJSON feed
-   * (Family B).
-   */
-  includeZellij?: boolean;
-  /**
    * Extra env entries merged BEFORE the state paths are applied. An `undefined`
    * value clears that key. State paths always win over `extra`.
    */
@@ -55,13 +48,7 @@ export interface SandboxEnvOptions {
  * sandboxed under `tmpDir`. See the module doc for the two families.
  */
 export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
-  const {
-    tmpDir,
-    dbPath,
-    clearAmbientIds = true,
-    includeZellij = false,
-    extra = {},
-  } = opts;
+  const { tmpDir, dbPath, clearAmbientIds = true, extra = {} } = opts;
 
   const env: Record<string, string | undefined> = {
     ...(process.env as Record<string, string>),
@@ -86,9 +73,6 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
-  if (includeZellij) {
-    env.KEEPER_ZELLIJ_EVENTS_DIR = join(tmpDir, "zellij-events");
-  }
 
   // Drop any key whose value was cleared to undefined.
   const out: Record<string, string> = {};
