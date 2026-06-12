@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Add listPanes and renameWindow exec ops",
-  "updated_at": "2026-06-12T02:01:27.230326Z"
+  "updated_at": "2026-06-12T02:45:30.299995Z",
+  "worker_done_at": "2026-06-12T02:45:30.299995Z"
 }

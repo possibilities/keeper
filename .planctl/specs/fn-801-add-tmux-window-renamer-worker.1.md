@@ -63,5 +63,5 @@ malformed lines; never-throw on nonzero exit and on null/ENOENT spawn.
 - [ ] `bun test test/exec-backend.test.ts` passes
 
 ## Done summary
-
+Added session-agnostic listPanes / renameWindow ops to ExecBackend (pure builders, injected spawn, never-throw envelopes) with tab-safe parse and -- guard, plus exec-backend.md doc updates.
 ## Evidence
