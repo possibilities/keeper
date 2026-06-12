@@ -95,5 +95,5 @@ produces a findings envelope against the live keeper.db;
 - [ ] keeper tree untouched (copy-only)
 
 ## Done summary
-
+Scaffolded ~/code/sitter as a Bun plugin and extracted the post-fn-792 performance sitter, flattened to the repo root with a vendored lib/keeper-compat.ts (resolvers, atomicWriteFile, parsePlanRef, computeStats, read-only openDbReadonly). Zero keeper-source imports; bun run performance/watch.ts --json runs end-to-end against the live keeper.db, biome is clean, and claude --plugin-dir resolves sitter:performance.
 ## Evidence
