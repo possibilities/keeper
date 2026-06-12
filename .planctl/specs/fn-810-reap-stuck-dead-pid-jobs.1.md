@@ -64,5 +64,5 @@ the row folds to `killed` and a re-sweep is a no-op.
 - [ ] README synthetic-Killed producer enumeration + dead-pid mechanisms prose updated; CLAUDE.md one-line reap-mechanism pointer added
 
 ## Done summary
-
+Added a periodic dead-pid re-probe (reprobeLoop, ~60s) to the exit-watcher: a pure selectDeadReprobeCandidates predicate (age-gated on created_at >= 5 min) mints a synthetic Killed via the existing kernel-arm ExitMessage path for any non-terminal job whose worker pid is verifiably dead or recycled, with main's verifier and the Killed fold unchanged.
 ## Evidence

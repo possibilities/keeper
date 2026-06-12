@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Periodic dead-pid re-probe in exit-watcher",
-  "updated_at": "2026-06-12T21:25:29.115000Z"
+  "updated_at": "2026-06-12T21:35:15.399000Z",
+  "worker_done_at": "2026-06-12T21:35:15.399000Z"
 }
