@@ -87,5 +87,5 @@ test:full tier. retryUntil for any async assertion, never Bun.sleep.
 - [ ] README eleventh-worker paragraph landed; `bun run test:full` passes
 
 ## Done summary
-
+Added the eleventh keeperd worker (renamer-worker): a pure external actuator that names each tmux window after its winning live-job title (latest created_at wins, job_id tiebreak), renames only on mismatch, and gates the tmux sweep behind an input-side candidate hash. Wired at all daemon sites incl. the ALL_WORKERS test pin, absent from WATCHER_WORKERS, with a README eleventh-worker paragraph.
 ## Evidence
