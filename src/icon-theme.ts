@@ -80,6 +80,7 @@ const FA = {
   envelope: "f0e0",
   random: "f074",
   filesO: "f0c5",
+  bolt: "f0e7",
 } as const;
 
 /**
@@ -162,6 +163,7 @@ export const FA_CLASSIC: IconTheme = {
 
     // --- markers ---
     "slotted-after-closer": FA.levelDown,
+    armed: FA.bolt,
   },
   prefix: {
     "blocked:": FA.ban, // ONE glyph for every block reason (reason via text)

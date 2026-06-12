@@ -156,7 +156,7 @@ function liveModel(snapshot: ReadinessClientSnapshot): DashModel {
 }
 
 // ---------------------------------------------------------------------------
-// Harness — read a node's content back as plain text.
+// Harness — read painted text back.
 // ---------------------------------------------------------------------------
 
 function textContent(node: TextRenderable): string {
@@ -165,12 +165,11 @@ function textContent(node: TextRenderable): string {
   return chunks.map((c) => c.text).join("");
 }
 
-/** Pull every row node's plain text out of the ScrollBox body, in order. */
-function bodyTexts(app: DashApp): string[] {
-  const children = (
-    app.body as unknown as { getChildren(): TextRenderable[] }
-  ).getChildren();
-  return children.map((c) => textContent(c));
+/** The 0-based frame line index containing `needle`, or -1. Body rows are
+ * Boxes (split/section/divider/spacer) whose text lives in nested Text
+ * children, so assertions read the painted char frame, not node trees. */
+function frameLineOf(frame: string, needle: string): number {
+  return frame.split("\n").findIndex((line) => line.includes(needle));
 }
 
 beforeAll(() => {
@@ -221,7 +220,7 @@ test("static tree: header fixed at row 0, body is a focused ScrollBox", async ()
   expect((app.body as unknown as { focused: boolean }).focused).toBe(true);
 });
 
-test("connecting: a null snapshot paints the waiting line and no PLAN/AGENTS sections", async () => {
+test("connecting: a null snapshot paints the waiting line and no section rules", async () => {
   const { setup, app } = await bootApp();
   app.render(
     buildDashModel({
@@ -233,16 +232,24 @@ test("connecting: a null snapshot paints the waiting line and no PLAN/AGENTS sec
     }),
   );
   await setup.renderOnce();
-  const texts = bodyTexts(app);
-  expect(texts).toEqual(["waiting for keeperd…"]);
+  const frame = setup.captureCharFrame();
+  expect(frame).toContain("waiting for keeperd…");
+  expect(frame).not.toContain("EPICS");
+  expect(frame).not.toContain("JOBS");
   // Header surfaces the connection marker pre-paint.
   expect(textContent(app.header)).toContain("connecting…");
 });
 
-test("live frame: header + PLAN epic row + AGENTS session row render", async () => {
+test("live frame: section rules, epic block with nested task, job row, no pill words", async () => {
   const { setup, app } = await bootApp();
   const snap = makeSnap({
-    epics: [makeEpic({ title: "add oauth", tasks: [makeTask()] })],
+    epics: [
+      makeEpic({
+        title: "add oauth",
+        project_dir: "/code/keeper",
+        tasks: [makeTask({ title: "wire the flow" })],
+      }),
+    ],
     jobs: new Map([["session-1", makeJob({ title: "worker A" })]]),
     readiness: {
       ...emptyReadiness(),
@@ -252,33 +259,43 @@ test("live frame: header + PLAN epic row + AGENTS session row render", async () 
   });
   app.render(liveModel(snap));
   await setup.renderOnce();
-  const texts = bodyTexts(app);
-  // Section headers present.
-  expect(texts).toContain("PLAN");
-  expect(texts).toContain("AGENTS");
-  // The epic row carries its label + N/M completed count.
-  const planRow = texts.find((t) => t.includes("add oauth"));
-  expect(planRow).toBeDefined();
-  expect(planRow).toContain("1/1");
-  // The agent row carries the coalesced title label.
-  expect(texts.some((t) => t.includes("worker A"))).toBe(true);
+  const frame = setup.captureCharFrame();
+  // Section rules with inline titles, EPICS above JOBS.
+  expect(frame).toContain("EPICS");
+  expect(frame).toContain("JOBS");
+  expect(frameLineOf(frame, "EPICS")).toBeLessThan(frameLineOf(frame, "JOBS"));
+  // The epic line carries number + title with the project basename at right.
+  const epicLine = frame.split("\n")[frameLineOf(frame, "add oauth")] ?? "";
+  expect(epicLine).toContain("1");
+  expect(epicLine).toContain("keeper");
+  expect(epicLine).not.toContain("/code");
+  // The task nests on its own line below the epic.
+  expect(frameLineOf(frame, "wire the flow")).toBeGreaterThan(
+    frameLineOf(frame, "add oauth"),
+  );
+  // No pill words, no task-count fraction — glyphs carry the state.
+  expect(frame).not.toMatch(/\[\w+/);
+  expect(frame).not.toMatch(/\d+\/\d+/);
+  expect(frame).not.toContain("ready");
+  // The job row carries the coalesced title label.
+  expect(frame).toContain("worker A");
   // Live header carries no connection marker.
   expect(textContent(app.header)).not.toContain("connecting");
   expect(textContent(app.header)).not.toContain("reconnecting");
 });
 
-test("empty-but-live: dim placeholders render under each section", async () => {
+test("empty-but-live: dim placeholders render under each section rule", async () => {
   const { setup, app } = await bootApp();
   app.render(liveModel(makeSnap()));
   await setup.renderOnce();
-  const texts = bodyTexts(app);
-  expect(texts).toContain("PLAN");
-  expect(texts).toContain("no open epics");
-  expect(texts).toContain("AGENTS");
-  expect(texts).toContain("no agents");
+  const frame = setup.captureCharFrame();
+  expect(frame).toContain("EPICS");
+  expect(frame).toContain("no open epics");
+  expect(frame).toContain("JOBS");
+  expect(frame).toContain("no jobs");
 });
 
-test("row-set diff: shrinking the agent set structurally prunes its row node", async () => {
+test("row-set diff: shrinking the job set structurally prunes its row node", async () => {
   const { setup, app } = await bootApp();
   const two = makeSnap({
     jobs: new Map([
@@ -291,11 +308,9 @@ test("row-set diff: shrinking the agent set structurally prunes its row node", a
   });
   app.render(liveModel(two));
   await setup.renderOnce();
-  // Agent rows carry a glyph prefix + elapsed suffix around the label, so match
-  // on the label substring, not the whole row.
-  const beforeRows = bodyTexts(app);
-  expect(beforeRows.some((t) => t.includes("alpha-job"))).toBe(true);
-  expect(beforeRows.some((t) => t.includes("beta-job"))).toBe(true);
+  const before = setup.captureCharFrame();
+  expect(before).toContain("alpha-job");
+  expect(before).toContain("beta-job");
 
   // Drop session-2 → its row node must be removed, not stale-retained.
   const one = makeSnap({
@@ -305,9 +320,44 @@ test("row-set diff: shrinking the agent set structurally prunes its row node", a
   });
   app.render(liveModel(one));
   await setup.renderOnce();
-  const after = bodyTexts(app);
-  expect(after.some((t) => t.includes("alpha-job"))).toBe(true);
-  expect(after.some((t) => t.includes("beta-job"))).toBe(false);
+  const after = setup.captureCharFrame();
+  expect(after).toContain("alpha-job");
+  expect(after).not.toContain("beta-job");
+});
+
+test("row order: a job arriving with newer recency paints ABOVE existing rows", async () => {
+  const { setup, app } = await bootApp();
+  const one = makeSnap({
+    jobs: new Map([
+      [
+        "session-1",
+        makeJob({ job_id: "session-1", title: "old-job", active_since: 10 }),
+      ],
+    ]),
+  });
+  app.render(liveModel(one));
+  await setup.renderOnce();
+
+  // A second job lands with newer active_since → the view-model sorts it
+  // first; the materializer must re-attach in model order, not append.
+  const two = makeSnap({
+    jobs: new Map([
+      [
+        "session-1",
+        makeJob({ job_id: "session-1", title: "old-job", active_since: 10 }),
+      ],
+      [
+        "session-2",
+        makeJob({ job_id: "session-2", title: "new-job", active_since: 50 }),
+      ],
+    ]),
+  });
+  app.render(liveModel(two));
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  expect(frameLineOf(frame, "new-job")).toBeLessThan(
+    frameLineOf(frame, "old-job"),
+  );
 });
 
 test("reconnecting: header marker shows while the last-good body stays painted", async () => {
@@ -329,7 +379,7 @@ test("reconnecting: header marker shows while the last-good body stays painted",
   );
   await setup.renderOnce();
   // Body still shows the epic (frozen at last-good), header shows the marker.
-  expect(bodyTexts(app).some((t) => t.includes("add oauth"))).toBe(true);
+  expect(setup.captureCharFrame()).toContain("add oauth");
   expect(textContent(app.header)).toContain("reconnecting…");
 });
 

@@ -3,12 +3,14 @@
  * (`./view-model.ts`). Two surfaces:
  *
  * - {@link attachDashApp} — the PAINT layer. Builds the stable renderable tree
- *   ONCE (root Box column 100%/100%; header Text fixed height; body ScrollBox
- *   flexGrow:1 + viewportCulling, focused on mount so j/k/arrows scroll
- *   natively), and exposes `render(model)` which diffs the view-model's segment
- *   rows into a stable `Map<rowKey, TextRenderable>` — structural add/remove
- *   ONLY when the row set changes, `setContent` otherwise (Yoga recalc rides
- *   structure, not content). The runtime OpenTUI ctors are THREADED IN so this
+ *   ONCE (root Box column 100%/100%; header Text fixed height over a full-width
+ *   rule; body ScrollBox flexGrow:1 + viewportCulling, focused on mount so
+ *   j/k/arrows scroll natively), and exposes `render(model)` which diffs the
+ *   view-model's keyed body rows into a stable `Map<rowKey, RowHandle>` — four
+ *   row kinds (split / section / divider / spacer), content updates in place,
+ *   structural add/remove/reorder ONLY when the keyed ORDER changes (Yoga
+ *   recalc rides structure, not content). The runtime OpenTUI ctors are
+ *   THREADED IN so this
  *   module carries a type-only `@opentui/core` import — the same inertness
  *   contract `src/live-shell.ts`'s `attachLiveShellPaint` keeps, so an unrelated
  *   test importing the pure view-model never trips OpenTUI's racy native loader.
@@ -44,10 +46,11 @@ import {
   subscribeReadiness,
 } from "../readiness-client";
 import { armViewerExitTriggers } from "./exit-triggers";
-import { colorForRole } from "./theme";
+import { colorForRole, STRUCTURE_COLOR_INDEX } from "./theme";
 import {
   buildDashModel,
   type ConnectionState,
+  type DashBodyRow,
   type DashModel,
   type Row,
 } from "./view-model";
@@ -68,7 +71,7 @@ export interface DashAppRuntime {
   readonly BoxRenderable: typeof BoxRenderableType;
   readonly StyledText: typeof StyledTextType;
   readonly RGBA: { fromIndex(index: number): RGBAType };
-  readonly TextAttributes: { readonly DIM: number };
+  readonly TextAttributes: { readonly DIM: number; readonly BOLD: number };
 }
 
 /** Options for {@link attachDashApp}. `onQuit` is the caller's teardown tail,
@@ -89,22 +92,34 @@ export interface DashApp {
 }
 
 /** One TextChunk in the OpenTUI wire shape (`text-buffer.ts` `TextChunk`). The
- * `fg` is resolved from the role's ANSI index; `terminal`'s `dim` descriptor
- * layers the DIM attribute. */
+ * `fg` is resolved from the role's ANSI index — ABSENT when the role carries
+ * no index (default terminal foreground); `dim` / `bold` descriptors layer the
+ * matching text attributes. */
 interface BuiltChunk {
   __isChunk: true;
   text: string;
-  fg: RGBAType;
+  fg?: RGBAType;
   attributes?: number;
+}
+
+/** One mounted body row: the outer node plus, for split rows, the two Text
+ * children whose content updates in place. A key never changes kind, so the
+ * handle's shape is fixed for its lifetime. */
+interface RowHandle {
+  readonly kind: DashBodyRow["kind"];
+  readonly node: BoxRenderableType;
+  readonly left?: TextRenderableType;
+  readonly right?: TextRenderableType;
 }
 
 /**
  * Build the renderable scene + the row-diffing `render`. Column layout: a
- * fixed-height header Text pinned at the top and a flexGrow:1 ScrollBox body
- * filling the rest. The body holds two SECTION header rows (PLAN / AGENTS) plus
- * the per-epic / per-agent rows, each a stable TextRenderable keyed in
- * `rowNodes` so a re-render diffs content in place; structural add/remove fires
- * only when the row KEY SET changes.
+ * fixed-height header Text pinned at the top, a full-width rule under it, and
+ * a flexGrow:1 ScrollBox body filling the rest. The body holds the
+ * view-model's keyed rows — split content lines (left text + right-aligned
+ * dim metadata), titled section rules, dividers, spacers — each a stable
+ * handle in `rowNodes` so a re-render diffs content in place; structural
+ * add/remove/reorder fires only when the keyed ORDER changes.
  *
  * Production: called from {@link createDashApp}'s async renderer setup.
  * Tests: called against a `createTestRenderer` result.
@@ -116,14 +131,23 @@ export function attachDashApp(
 ): DashApp {
   let destroyed = false;
   const { RGBA, TextAttributes } = runtime;
+  const structureColor = RGBA.fromIndex(STRUCTURE_COLOR_INDEX);
 
-  // Resolve a role to its renderable fg + (for `terminal`) the DIM attribute.
+  // Resolve a role to its renderable fg (absent index → default foreground)
+  // plus the descriptor's DIM/BOLD attributes.
   function chunkFor(text: string, role: Row[number]["role"]): BuiltChunk {
     const desc = colorForRole(role);
-    const fg = RGBA.fromIndex(desc.index);
-    return desc.dim === true
-      ? { __isChunk: true, text, fg, attributes: TextAttributes.DIM }
-      : { __isChunk: true, text, fg };
+    const chunk: BuiltChunk = { __isChunk: true, text };
+    if (desc.index !== undefined) {
+      chunk.fg = RGBA.fromIndex(desc.index);
+    }
+    const attributes =
+      (desc.dim === true ? TextAttributes.DIM : 0) |
+      (desc.bold === true ? TextAttributes.BOLD : 0);
+    if (attributes !== 0) {
+      chunk.attributes = attributes;
+    }
+    return chunk;
   }
 
   // A whole row (segment list) → a StyledText of per-segment chunks.
@@ -132,7 +156,8 @@ export function attachDashApp(
     return new runtime.StyledText(chunks);
   }
 
-  // Root: a full-screen column. Header fixed at 1 row; body fills the rest.
+  // Root: a full-screen column. Header fixed at 1 row over a full-width rule;
+  // body fills the rest.
   const root = new runtime.BoxRenderable(renderer, {
     id: "dash-root",
     width: "100%",
@@ -143,7 +168,15 @@ export function attachDashApp(
     id: "dash-header",
     width: "100%",
     height: 1,
+    paddingLeft: 1,
     content: "",
+  });
+  const headerRule = new runtime.BoxRenderable(renderer, {
+    id: "dash-header-rule",
+    width: "100%",
+    height: 1,
+    border: ["top"],
+    borderColor: structureColor,
   });
   const body = new runtime.ScrollBoxRenderable(renderer, {
     id: "dash-body",
@@ -161,30 +194,77 @@ export function attachDashApp(
   body.verticalScrollBar.visible = false;
   body.horizontalScrollBar.visible = false;
   root.add(header);
+  root.add(headerRule);
   root.add(body);
   renderer.root.add(root);
   // Focus the ScrollBox on mount — j/k/arrows are silently dead otherwise.
   body.focus();
 
-  // Stable per-row node map. Key vocabulary: section headers are `sec:plan` /
-  // `sec:agents`; epic rows `plan:<epicId>`; agent rows `agent:<jobId>`;
-  // placeholders `ph:plan` / `ph:agents` / `ph:waiting`. A diff that changes the
-  // KEY SET adds/removes; an unchanged set re-`setContent`s in place.
-  const rowNodes = new Map<string, TextRenderableType>();
+  // Stable per-row handle map, keyed by the view-model's row keys. Content
+  // diffs in place; membership/order changes restructure (see `render`).
+  const rowNodes = new Map<string, RowHandle>();
+  // The previous frame's ordered key list — reorder detection.
+  let lastOrder = "";
 
-  function ensureRow(key: string, content: StyledTextType): void {
-    let node = rowNodes.get(key);
-    if (node === undefined) {
-      node = new runtime.TextRenderable(renderer, {
-        id: `dash-row-${key}`,
-        width: "100%",
-        height: 1,
-        content,
-      });
-      rowNodes.set(key, node);
-      body.add(node);
-    } else {
-      node.content = content;
+  function buildHandle(row: DashBodyRow): RowHandle {
+    switch (row.kind) {
+      case "split": {
+        const node = new runtime.BoxRenderable(renderer, {
+          id: `dash-row-${row.key}`,
+          width: "100%",
+          height: 1,
+          flexDirection: "row",
+          justifyContent: "space-between",
+          paddingLeft: 1 + (row.indent ?? 0),
+          paddingRight: 1,
+        });
+        const left = new runtime.TextRenderable(renderer, {
+          id: `dash-row-${row.key}-l`,
+          height: 1,
+          content: "",
+        });
+        const right = new runtime.TextRenderable(renderer, {
+          id: `dash-row-${row.key}-r`,
+          height: 1,
+          content: "",
+        });
+        node.add(left);
+        node.add(right);
+        return { kind: "split", node, left, right };
+      }
+      case "section":
+        return {
+          kind: "section",
+          node: new runtime.BoxRenderable(renderer, {
+            id: `dash-row-${row.key}`,
+            width: "100%",
+            height: 1,
+            border: ["top"],
+            borderColor: structureColor,
+            title: ` ${row.title} `,
+            titleAlignment: "left",
+          }),
+        };
+      case "divider":
+        return {
+          kind: "divider",
+          node: new runtime.BoxRenderable(renderer, {
+            id: `dash-row-${row.key}`,
+            width: "100%",
+            height: 1,
+            border: ["top"],
+            borderColor: structureColor,
+          }),
+        };
+      case "spacer":
+        return {
+          kind: "spacer",
+          node: new runtime.BoxRenderable(renderer, {
+            id: `dash-row-${row.key}`,
+            width: "100%",
+            height: 1,
+          }),
+        };
     }
   }
 
@@ -194,53 +274,51 @@ export function attachDashApp(
     }
     header.content = styledRow(model.header);
 
-    // Compute the ordered key set for this frame; structural diff against the
-    // live map at the end so Yoga recalc only fires on a real membership change.
+    // Ensure every wanted row exists with current content. New nodes mount
+    // detached; the order pass below attaches them in position.
     const wantKeys: string[] = [];
-
-    // Pre-paint waiting line replaces the whole body when no snapshot has
-    // landed yet (connecting / reconnecting with nothing good to freeze).
-    if (model.placeholders.waiting !== null) {
-      const key = "ph:waiting";
-      wantKeys.push(key);
-      ensureRow(key, styledRow([model.placeholders.waiting]));
-    } else {
-      // PLAN section.
-      wantKeys.push("sec:plan");
-      ensureRow("sec:plan", styledRow([{ text: "PLAN", role: "accent" }]));
-      if (model.plan.length === 0) {
-        wantKeys.push("ph:plan");
-        ensureRow("ph:plan", styledRow([model.placeholders.planEmpty]));
-      } else {
-        for (const epic of model.plan) {
-          const key = `plan:${epic.epicId}`;
-          wantKeys.push(key);
-          ensureRow(key, styledRow(epic.segments));
-        }
+    for (const row of model.body) {
+      wantKeys.push(row.key);
+      let handle = rowNodes.get(row.key);
+      if (handle === undefined) {
+        handle = buildHandle(row);
+        rowNodes.set(row.key, handle);
       }
-      // AGENTS section.
-      wantKeys.push("sec:agents");
-      ensureRow("sec:agents", styledRow([{ text: "AGENTS", role: "accent" }]));
-      if (model.agents.length === 0) {
-        wantKeys.push("ph:agents");
-        ensureRow("ph:agents", styledRow([model.placeholders.agentsEmpty]));
-      } else {
-        for (const agent of model.agents) {
-          const key = `agent:${agent.jobId}`;
-          wantKeys.push(key);
-          ensureRow(key, styledRow(agent.segments));
-        }
+      if (row.kind === "split" && handle.left && handle.right) {
+        handle.left.content = styledRow(row.left);
+        handle.right.content = styledRow(row.right);
       }
     }
 
     // Structural prune: drop any node whose key is no longer wanted.
     const want = new Set(wantKeys);
-    for (const [key, node] of rowNodes) {
+    for (const [key, handle] of rowNodes) {
       if (!want.has(key)) {
-        body.remove(node.id);
-        node.destroy();
+        body.remove(handle.node.id);
+        handle.node.destroy();
         rowNodes.delete(key);
       }
+    }
+
+    // Order sync: when the ordered key list changed (membership OR position),
+    // re-attach every wanted node in model order. Detach-then-append keeps
+    // each node alive (only `destroy` frees it); content-only frames skip
+    // this entirely so Yoga recalc rides structure, not content.
+    const orderSig = wantKeys.join("\n");
+    if (orderSig !== lastOrder) {
+      for (const key of wantKeys) {
+        const handle = rowNodes.get(key);
+        if (handle !== undefined) {
+          body.remove(handle.node.id);
+        }
+      }
+      for (const key of wantKeys) {
+        const handle = rowNodes.get(key);
+        if (handle !== undefined) {
+          body.add(handle.node);
+        }
+      }
+      lastOrder = orderSig;
     }
 
     renderer.requestRender();

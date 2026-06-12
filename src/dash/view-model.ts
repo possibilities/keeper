@@ -1,11 +1,18 @@
 /**
  * `keeper dash` view-model — the pure, OpenTUI-free projection layer. One
  * entry point, {@link buildDashModel}, folds a readiness snapshot plus the two
- * autopilot side-streams into a typed `{ header, plan, agents, placeholders }`
- * model where every row is a list of `{ text, role }` SEGMENTS the materializer
- * (task .2) renders verbatim. The role vocabulary lives in `./theme.ts` and is
- * semantic (motion / ready / attention / failed / terminal / accent), never
- * widget-specific — that is the contract the theme fork preserves.
+ * autopilot side-streams into a typed `{ header, body }` model: the header is
+ * a single segment row; the body is an ORDERED list of keyed rows — split
+ * (left/right content), section rules, dividers, spacers — the materializer
+ * renders verbatim. The role vocabulary lives in `./theme.ts` and is semantic
+ * (motion / ready / attention / failed / terminal / accent / heading / text),
+ * never widget-specific — that is the contract the theme fork preserves.
+ *
+ * Visual language: every line leads with its status GLYPH (color = verdict
+ * role); titles carry the workability axis — `heading`/`text` (default fg)
+ * when workable now, `terminal` (dim) when completed or blocked — so state
+ * reads at a glance with no pill words. Metadata (dep refs, project name,
+ * elapsed bands) right-aligns on the split rows in the dim tone.
  *
  * Forked, not shared: the three tiny autopilot projectors
  * (`projectAutopilotPaused` / `projectAutopilotMode` / `projectArmedEpics`)
@@ -21,7 +28,7 @@
 import { FA_CLASSIC, glyphForToken } from "../icon-theme";
 import { formatPill, rolledUpJobVerdict, type Verdict } from "../readiness";
 import type { ReadinessClientSnapshot } from "../readiness-client";
-import type { Job, SubagentInvocation } from "../types";
+import type { Epic, Job, SubagentInvocation, Task } from "../types";
 import type { Role } from "./theme";
 
 // ---------------------------------------------------------------------------
@@ -29,7 +36,7 @@ import type { Role } from "./theme";
 // ---------------------------------------------------------------------------
 
 /** One rendered run of text in a single role. The materializer renders the
- * `text` verbatim and colors it via `colorForRole(role)`. */
+ * `text` verbatim and styles it via `colorForRole(role)`. */
 export interface Segment {
   readonly text: string;
   readonly role: Role;
@@ -38,37 +45,49 @@ export interface Segment {
 /** A row is an ordered list of role-tagged segments. */
 export type Row = readonly Segment[];
 
-/** One epic row in the PLAN region, in server (`sort_path`) order. */
-export interface PlanRow {
-  readonly epicId: string;
-  readonly segments: Row;
+/** A content line: `left` hugs the left edge, `right` right-aligns on the
+ * same line (dim metadata — dep refs, project, elapsed). `indent` is extra
+ * left padding in columns (task rows nest under their epic). */
+export interface SplitRow {
+  readonly kind: "split";
+  readonly key: string;
+  readonly left: Row;
+  readonly right: Row;
+  readonly indent?: number;
 }
 
-/** One session row in the AGENTS region. */
-export interface AgentRow {
-  readonly jobId: string;
-  readonly segments: Row;
+/** A full-width titled rule — `── TITLE ────…` — opening a section. */
+export interface SectionRow {
+  readonly kind: "section";
+  readonly key: string;
+  readonly title: string;
 }
+
+/** A full-width untitled rule separating epic blocks. */
+export interface DividerRow {
+  readonly kind: "divider";
+  readonly key: string;
+}
+
+/** One blank line of breathing room. */
+export interface SpacerRow {
+  readonly kind: "spacer";
+  readonly key: string;
+}
+
+/** One keyed body row. Keys are stable across frames (`epic:<id>`,
+ * `epic:<id>:task:<tid>`, `job:<id>`, `sec:*`, `div:*`, `sp:*`, `ph:*`) so
+ * the materializer diffs content in place and only restructures when the
+ * keyed order changes. A key never changes kind. */
+export type DashBodyRow = SplitRow | SectionRow | DividerRow | SpacerRow;
 
 /** The three connection lifecycle states the dash surfaces. */
 export type ConnectionState = "connecting" | "live" | "reconnecting";
 
-/** Dim placeholders the materializer paints when a region is empty or the
- * connection has not yet painted. `planEmpty` / `agentsEmpty` are the
- * loaded-but-empty lines; `waiting` is the pre-paint body line shown while
- * connecting / reconnecting (null once live). */
-export interface Placeholders {
-  readonly planEmpty: Segment;
-  readonly agentsEmpty: Segment;
-  readonly waiting: Segment | null;
-}
-
 /** The complete dash view-model for one frame. */
 export interface DashModel {
   readonly header: Row;
-  readonly plan: readonly PlanRow[];
-  readonly agents: readonly AgentRow[];
-  readonly placeholders: Placeholders;
+  readonly body: readonly DashBodyRow[];
 }
 
 /** Inputs to {@link buildDashModel}. `autopilotRows` / `armedRows` are the raw
@@ -136,19 +155,19 @@ export function projectMode(
 }
 
 /**
- * `armed_epics` wire rows → sorted, de-empty'd list of armed epic ids
- * (`epic_id` ASC) for a stable render. Forked from `cli/autopilot.ts`.
+ * `armed_epics` rows → sorted epic-id list (`epic_id` ASC) for a stable
+ * render. Forked from `cli/autopilot.ts`.
  */
 export function projectArmed(rows: Record<string, unknown>[]): string[] {
-  const out: string[] = [];
-  for (const r of rows) {
-    const id = seg(r.epic_id);
+  const ids: string[] = [];
+  for (const row of rows) {
+    const id = seg(row.epic_id);
     if (id !== "") {
-      out.push(id);
+      ids.push(id);
     }
   }
-  out.sort();
-  return out;
+  ids.sort();
+  return ids;
 }
 
 // ---------------------------------------------------------------------------
@@ -217,10 +236,10 @@ function buildHeader(
 }
 
 // ---------------------------------------------------------------------------
-// PLAN
+// Verdict styling
 // ---------------------------------------------------------------------------
 
-/** The verdict a renderer-side map miss resolves to — `[blocked:unknown]`,
+/** The verdict a renderer-side map miss resolves to — blocked/unknown,
  * visible (bug indicator) and inert. Mirrors board's `verdictFromMap`. */
 const UNKNOWN_VERDICT: Verdict = {
   tag: "blocked",
@@ -231,7 +250,7 @@ function verdictFromMap(map: Map<string, Verdict>, id: string): Verdict {
   return map.get(id) ?? UNKNOWN_VERDICT;
 }
 
-/** The role a verdict's pill renders in — forked from board's bucket
+/** The role a verdict's glyph renders in — forked from board's bucket
  * semantics: completed → terminal (inert tail), ready/running → ready/motion,
  * blocked → attention. */
 function roleForVerdict(v: Verdict): Role {
@@ -247,77 +266,236 @@ function roleForVerdict(v: Verdict): Role {
   }
 }
 
-/**
- * The verdict pill's glyph + word. `formatPill` yields `[ready]` /
- * `[completed]` / `[running:<kind>]` / `[blocked:<reason>]`; the inner token
- * (brackets stripped) resolves the glyph via `glyphForToken` (prefix-matched
- * for the `running:` / `blocked:` families), with the token text as fallback.
- */
-function verdictPill(v: Verdict): { glyph: string; word: string } {
+/** The verdict's status glyph. `formatPill` yields `[ready]` / `[completed]`
+ * / `[running:<kind>]` / `[blocked:<reason>]`; the inner token (brackets
+ * stripped) resolves the glyph via `glyphForToken` (prefix-matched for the
+ * `running:` / `blocked:` families). Glyph ONLY — the word never renders; the
+ * glyph + its role color carry the state. */
+function verdictGlyph(v: Verdict): string {
   const token = formatPill(v).slice(1, -1); // strip the [ ]
-  return { glyph: glyphOr(token, "·"), word: token };
+  return glyphOr(token, "·");
 }
 
-/**
- * Build the PLAN region — one row per epic in SERVER order (`snapshot.epics`
- * is already `sort_path` ASC; NO client re-sort). Each row carries: an armed
- * marker (accent) when armed; the `epic_number title` label (epic_id fallback
- * when both null); the per-epic verdict glyph + word (map-miss → the visible
- * blocked/unknown form); a blocked reason inline in the terminal/dim role; and
- * an `N/M` completed-task segment counting ONLY `tag==='completed'` verdicts —
- * hidden entirely when the epic has zero tasks.
- */
-function buildPlan(
-  snapshot: ReadinessClientSnapshot,
-  armed: Set<string>,
-): PlanRow[] {
-  const rows: PlanRow[] = [];
-  for (const epic of snapshot.epics) {
-    const epicId = seg(epic.epic_id);
-    const out: Segment[] = [];
-
-    // Armed marker first (accent) so it reads as a leading structural signal.
-    if (armed.has(epicId)) {
-      out.push({ text: `${glyphOr("armed", "*")} `, role: "accent" });
-    }
-
-    // Label: `epic_number title`, epic_id fallback when both null.
-    const numSeg = epic.epic_number == null ? "" : String(epic.epic_number);
-    const titleSeg = epic.title == null ? "" : epic.title;
-    const label = `${numSeg} ${titleSeg}`.trim();
-    out.push({ text: label === "" ? epicId : label, role: "accent" });
-
-    // Per-epic verdict glyph + word.
-    const verdict = verdictFromMap(snapshot.readiness.perEpic, epicId);
-    const role = roleForVerdict(verdict);
-    const { glyph, word } = verdictPill(verdict);
-    out.push({ text: "  ", role: "terminal" });
-    out.push({ text: `${glyph} ${word}`, role });
-
-    // N/M completed-only — hidden when the epic has zero tasks. M counts ONLY
-    // `tag==='completed'` perTask verdicts (a miss is NOT done).
-    const tasks = epic.tasks;
-    if (tasks.length > 0) {
-      let completed = 0;
-      for (const task of tasks) {
-        const tv = snapshot.readiness.perTask.get(seg(task.task_id));
-        if (tv?.tag === "completed") {
-          completed += 1;
-        }
-      }
-      out.push({
-        text: `  ${completed}/${tasks.length}`,
-        role: completed === tasks.length ? "ready" : "terminal",
-      });
-    }
-
-    rows.push({ epicId, segments: out });
+/** The title role on the workability axis: workable now (ready / running) →
+ * full-intensity `epicTitle` ? `heading` : `text`; inert (completed /
+ * blocked) → the dim `terminal` tone so the whole line recedes. */
+function titleRole(v: Verdict, epicTitle: boolean): Role {
+  if (v.tag === "ready" || v.tag === "running") {
+    return epicTitle ? "heading" : "text";
   }
-  return rows;
+  return "terminal";
 }
 
 // ---------------------------------------------------------------------------
-// AGENTS
+// EPICS
+// ---------------------------------------------------------------------------
+
+/** Trailing `.N` task-number from a planctl task id (`fn-812-slug.3` → `3`),
+ * or `null` when the id has no numeric tail. */
+function taskNumFromDep(id: string): string | null {
+  const m = /\.(\d+)$/.exec(id);
+  return m === null ? null : (m[1] ?? null);
+}
+
+/** Leading epic number from a planctl epic id (`fn-631-slug` or bare
+ * `fn-631`), or `null` when the token doesn't match. */
+function epicNumFromDep(token: string): string | null {
+  const m = /^[a-z][a-z0-9]*-(\d+)(?:-|$)/.exec(token);
+  return m === null ? null : (m[1] ?? null);
+}
+
+/**
+ * The epic's dep-ref segments — a dim `after` lead then one ref per
+ * `depends_on_epics` token. Prefers the reducer's `resolved_epic_deps`
+ * projection (epic numbers + cross-project basenames + per-dep state);
+ * falls back to parsing the raw tokens when the projection is null
+ * (not-yet-computed). Per-ref role carries the dep's weight: satisfied →
+ * dim (history), blocked-incomplete → attention (the live gate), dangling →
+ * failed (a typo to fix). Empty array when the epic has no deps.
+ */
+function epicDepSegments(epic: Epic): Segment[] {
+  const resolved = epic.resolved_epic_deps;
+  const refs: { label: string; role: Role }[] = [];
+  if (resolved !== null) {
+    for (const dep of resolved) {
+      const num = dep.epic_number;
+      if (num === null) {
+        refs.push({ label: `?${dep.dep_token}`, role: "failed" });
+        continue;
+      }
+      const label =
+        dep.cross_project && dep.project_basename !== null
+          ? `${dep.project_basename}#${num}`
+          : `#${num}`;
+      refs.push({
+        label,
+        role: dep.state === "blocked-incomplete" ? "attention" : "terminal",
+      });
+    }
+  } else {
+    for (const token of epic.depends_on_epics) {
+      const num = epicNumFromDep(token);
+      refs.push({
+        label: num === null ? `?${token}` : `#${num}`,
+        role: "terminal",
+      });
+    }
+  }
+  if (refs.length === 0) {
+    return [];
+  }
+  const out: Segment[] = [{ text: "after ", role: "terminal" }];
+  refs.forEach((ref, i) => {
+    if (i > 0) {
+      out.push({ text: " ", role: "terminal" });
+    }
+    out.push({ text: ref.label, role: ref.role });
+  });
+  return out;
+}
+
+/**
+ * The task's dep-ref segments — dim `after` then the dep task NUMBERS, each
+ * colored by the dep's own perTask verdict: completed → dim (satisfied),
+ * anything else → attention (still gating). A dep id with no parseable
+ * number renders its raw tail so the ref never silently disappears.
+ */
+function taskDepSegments(task: Task, perTask: Map<string, Verdict>): Segment[] {
+  if (task.depends_on.length === 0) {
+    return [];
+  }
+  const out: Segment[] = [{ text: "after ", role: "terminal" }];
+  task.depends_on.forEach((depId, i) => {
+    if (i > 0) {
+      out.push({ text: " ", role: "terminal" });
+    }
+    const num = taskNumFromDep(depId);
+    const done = perTask.get(depId)?.tag === "completed";
+    out.push({
+      text: num === null ? depId : num,
+      role: done ? "terminal" : "attention",
+    });
+  });
+  return out;
+}
+
+/** Stable task order: `task_number` ASC nulls-last, `task_id` ASC tiebreak. */
+function sortedTasks(tasks: Task[]): Task[] {
+  return [...tasks].sort((a, b) => {
+    const na = a.task_number;
+    const nb = b.task_number;
+    if (na !== nb) {
+      if (na === null) {
+        return 1;
+      }
+      if (nb === null) {
+        return -1;
+      }
+      return na - nb;
+    }
+    return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0;
+  });
+}
+
+/** Basename of a project dir path, or "" when null/empty. */
+function projectBasename(dir: string | null): string {
+  if (dir === null || dir === "") {
+    return "";
+  }
+  const trimmed = dir.endsWith("/") ? dir.slice(0, -1) : dir;
+  const idx = trimmed.lastIndexOf("/");
+  return idx === -1 ? trimmed : trimmed.slice(idx + 1);
+}
+
+/**
+ * Build the EPICS rows — one block per epic in SERVER order (`snapshot.epics`
+ * is already `sort_path` ASC; NO client re-sort), blocks separated by
+ * spacer-divider-spacer runs keyed on the epic ABOVE them (stable as epics
+ * append below).
+ *
+ * Epic header row: leading verdict glyph (role-colored); the armed bolt
+ * (accent) ONLY in armed mode for an armed epic; the dim epic number; the
+ * title on the workability axis (bold default-fg `heading` when workable,
+ * dim when inert); right side = dep refs then the dim project basename.
+ *
+ * Task rows: indented under the epic, leading perTask verdict glyph (map
+ * miss → the visible blocked/unknown form), dim task number, title on the
+ * same workability axis (`text` tier), right side = task dep refs.
+ */
+function buildEpicRows(
+  snapshot: ReadinessClientSnapshot,
+  armed: Set<string>,
+  mode: "yolo" | "armed",
+): DashBodyRow[] {
+  const out: DashBodyRow[] = [];
+  snapshot.epics.forEach((epic, i) => {
+    const epicId = seg(epic.epic_id);
+    if (i > 0) {
+      const prev = seg(snapshot.epics[i - 1]?.epic_id);
+      out.push({ kind: "spacer", key: `sp:a:${prev}` });
+      out.push({ kind: "divider", key: `div:${prev}` });
+      out.push({ kind: "spacer", key: `sp:b:${prev}` });
+    }
+
+    const verdict = verdictFromMap(snapshot.readiness.perEpic, epicId);
+    const left: Segment[] = [
+      { text: `${verdictGlyph(verdict)}  `, role: roleForVerdict(verdict) },
+    ];
+
+    // Armed bolt — armed mode only; in yolo the armed set is not dispatch
+    // policy, so the marker would lie about behavior.
+    if (mode === "armed" && armed.has(epicId)) {
+      left.push({ text: `${glyphOr("armed", "*")} `, role: "accent" });
+    }
+
+    if (epic.epic_number !== null) {
+      left.push({ text: `${epic.epic_number}  `, role: "terminal" });
+    }
+    const title = epic.title ?? "";
+    left.push({
+      text: title === "" && epic.epic_number === null ? epicId : title,
+      role: titleRole(verdict, true),
+    });
+
+    const right: Segment[] = epicDepSegments(epic);
+    const project = projectBasename(epic.project_dir);
+    if (project !== "") {
+      if (right.length > 0) {
+        right.push({ text: " · ", role: "terminal" });
+      }
+      right.push({ text: project, role: "terminal" });
+    }
+
+    out.push({ kind: "split", key: `epic:${epicId}`, left, right });
+
+    for (const task of sortedTasks(epic.tasks)) {
+      const taskId = seg(task.task_id);
+      const tv = verdictFromMap(snapshot.readiness.perTask, taskId);
+      const tleft: Segment[] = [
+        { text: `${verdictGlyph(tv)}  `, role: roleForVerdict(tv) },
+      ];
+      if (task.task_number !== null) {
+        tleft.push({ text: `${task.task_number}  `, role: "terminal" });
+      }
+      const ttitle = task.title ?? "";
+      tleft.push({
+        text: ttitle === "" ? taskId : ttitle,
+        role: titleRole(tv, false),
+      });
+      out.push({
+        kind: "split",
+        key: `epic:${epicId}:task:${taskId}`,
+        left: tleft,
+        right: taskDepSegments(task, snapshot.readiness.perTask),
+        indent: 4,
+      });
+    }
+  });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// JOBS
 // ---------------------------------------------------------------------------
 
 /**
@@ -355,11 +533,10 @@ function elapsedBand(deltaSec: number): string {
 }
 
 /**
- * Build the AGENTS region — EVERY non-terminal job (working AND stopped) on one
+ * Build the JOBS rows — EVERY non-terminal job (working AND stopped) on one
  * unified "most-recent-activity-started" timeline. The collections
  * `defaultFilter` already excludes `ended`/`killed`, so every job in
- * `snapshot.jobs` is included; needs-you no longer affects ordering (its
- * annotation still renders, only re-positioned).
+ * `snapshot.jobs` is included.
  *
  * Sort: `COALESCE(active_since, created_at)` DESC with a `job_id` ASC tiebreak
  * — a job rises the moment it starts a run and descends as newer runs start
@@ -369,16 +546,16 @@ function elapsedBand(deltaSec: number): string {
  *
  * Each row's leading glyph is the per-job rolled-up board verdict
  * ({@link rolledUpJobVerdict}: working→sync, sub-agent→cogs/warn,
- * monitor→eye/warn, idle→circleO), computed uniformly for plan-linked and
- * ad-hoc jobs and rendered via the same `verdictPill`/`roleForVerdict`
- * machinery as the PLAN region. The trailing annotation — the elapsed band
- * (from `updated_at` vs `nowSec`) REPLACED by an `awaiting` (attention) /
- * `failed` (failed) annotation — is unchanged (annotation only, no sort effect).
+ * monitor→eye/warn, idle→circleO); the label rides the workability axis (live
+ * → `text`, idle → dim). The right side is the dim elapsed band (from
+ * `updated_at` vs `nowSec`), LED by a status glyph when the job needs eyes:
+ * failed (red ✗) or awaiting-input (attention hand/comment, keyed by which
+ * prompt field is set) — glyphs only, no words.
  */
-function buildAgents(
+function buildJobRows(
   snapshot: ReadinessClientSnapshot,
   nowSec: number,
-): AgentRow[] {
+): DashBodyRow[] {
   // Running-subagent index, built the SAME way readiness does: filter to
   // `status === "running"` (the only status that signals live motion).
   const subRunningByJobId = new Map<string, SubagentInvocation[]>();
@@ -408,39 +585,45 @@ function buildAgents(
     return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
   });
 
-  const rows: AgentRow[] = [];
+  const rows: DashBodyRow[] = [];
   for (const job of jobs) {
-    const out: Segment[] = [];
+    const left: Segment[] = [];
 
-    // Leading glyph: the per-job rolled-up verdict → pill glyph, colored by the
-    // verdict's role. An idle job (null verdict) renders the `stopped` glyph in
-    // the terminal/dim role.
+    // Leading glyph: the per-job rolled-up verdict, colored by the verdict's
+    // role. An idle job (null verdict) renders the `stopped` glyph dim.
     const verdict = rolledUpJobVerdict(job, subRunningByJobId, nowSec);
     if (verdict === null) {
-      out.push({ text: `${glyphOr("stopped", "○")} `, role: "terminal" });
+      left.push({ text: `${glyphOr("stopped", "○")}  `, role: "terminal" });
+      left.push({ text: jobLabel(job), role: "terminal" });
     } else {
-      const { glyph } = verdictPill(verdict);
-      out.push({ text: `${glyph} `, role: roleForVerdict(verdict) });
+      left.push({
+        text: `${verdictGlyph(verdict)}  `,
+        role: roleForVerdict(verdict),
+      });
+      left.push({ text: jobLabel(job), role: "text" });
     }
-    out.push({ text: jobLabel(job), role: "accent" });
 
-    // Trailing annotation: awaiting / failed REPLACE the elapsed band.
-    out.push({ text: "  ", role: "terminal" });
+    // Right side: needs-eyes glyph (failed / awaiting) then the elapsed band.
+    const right: Segment[] = [];
     if (job.last_api_error_at != null) {
-      out.push({ text: "failed", role: "failed" });
-    } else if (
-      job.last_input_request_at != null ||
-      job.last_permission_prompt_at != null
-    ) {
-      out.push({ text: "awaiting", role: "attention" });
-    } else {
-      out.push({
-        text: elapsedBand(nowSec - job.updated_at),
-        role: "terminal",
+      right.push({ text: `${glyphOr("failed", "x")} `, role: "failed" });
+    } else if (job.last_permission_prompt_at != null) {
+      right.push({
+        text: `${glyphOr("awaiting:permission", "?")} `,
+        role: "attention",
+      });
+    } else if (job.last_input_request_at != null) {
+      right.push({
+        text: `${glyphOr("awaiting:ask_user_question", "?")} `,
+        role: "attention",
       });
     }
+    right.push({
+      text: elapsedBand(nowSec - job.updated_at),
+      role: "terminal",
+    });
 
-    rows.push({ jobId: job.job_id, segments: out });
+    rows.push({ kind: "split", key: `job:${job.job_id}`, left, right });
   }
   return rows;
 }
@@ -451,11 +634,11 @@ function buildAgents(
 
 /**
  * Build the complete dash view-model for one frame. A `null` snapshot
- * (connecting, no paint yet) yields empty PLAN / AGENTS and the `waiting`
- * placeholder body line; the header still renders off the autopilot seed +
- * side-streams. Once a snapshot lands, loaded-but-empty regions render the dim
- * `no open epics` / `no agents` placeholders (distinguishable from the
- * connecting `waiting` line).
+ * (connecting, no paint yet) yields a body of just the dim `waiting for
+ * keeperd…` line; the header still renders off the autopilot seed +
+ * side-streams. Once a snapshot lands, loaded-but-empty regions render the
+ * dim `no open epics` / `no jobs` placeholders under their section rules
+ * (distinguishable from the connecting line).
  */
 export function buildDashModel(input: DashModelInput): DashModel {
   const { snapshot, autopilotRows, armedRows, connection, nowSec } = input;
@@ -469,17 +652,51 @@ export function buildDashModel(input: DashModelInput): DashModel {
   const deadLetterCount = snapshot?.deadLetters.length ?? 0;
   const header = buildHeader(paused, mode, armed, deadLetterCount, connection);
 
-  const plan = snapshot === null ? [] : buildPlan(snapshot, armedSet);
-  const agents = snapshot === null ? [] : buildAgents(snapshot, nowSec);
+  if (snapshot === null) {
+    return {
+      header,
+      body: [
+        { kind: "spacer", key: "sp:waiting" },
+        {
+          kind: "split",
+          key: "ph:waiting",
+          left: [{ text: "waiting for keeperd…", role: "terminal" }],
+          right: [],
+        },
+      ],
+    };
+  }
 
-  const placeholders: Placeholders = {
-    planEmpty: { text: "no open epics", role: "terminal" },
-    agentsEmpty: { text: "no agents", role: "terminal" },
-    waiting:
-      snapshot === null
-        ? { text: "waiting for keeperd…", role: "terminal" }
-        : null,
-  };
+  const body: DashBodyRow[] = [];
 
-  return { header, plan, agents, placeholders };
+  body.push({ kind: "section", key: "sec:epics", title: "EPICS" });
+  body.push({ kind: "spacer", key: "sp:epics" });
+  const epicRows = buildEpicRows(snapshot, armedSet, mode);
+  if (epicRows.length === 0) {
+    body.push({
+      kind: "split",
+      key: "ph:epics",
+      left: [{ text: "no open epics", role: "terminal" }],
+      right: [],
+    });
+  } else {
+    body.push(...epicRows);
+  }
+
+  body.push({ kind: "spacer", key: "sp:jobs:pre" });
+  body.push({ kind: "section", key: "sec:jobs", title: "JOBS" });
+  body.push({ kind: "spacer", key: "sp:jobs" });
+  const jobRows = buildJobRows(snapshot, nowSec);
+  if (jobRows.length === 0) {
+    body.push({
+      kind: "split",
+      key: "ph:jobs",
+      left: [{ text: "no jobs", role: "terminal" }],
+      right: [],
+    });
+  } else {
+    body.push(...jobRows);
+  }
+
+  return { header, body };
 }
