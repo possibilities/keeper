@@ -34,5 +34,5 @@ test_query_verbs.py green against the compiled binary; bun units for renderers; 
 - [ ] validate --epic state machine exact across all four branches (invalid, valid+unstamped, valid+stamped, commit-failure)
 
 ## Done summary
-
+Ported the eight read-surface verbs (show/cat/list/ready/tasks/resolve-task/refine-context/validate) to planctl-bun at byte parity, all 34 test_query_verbs.py pins green against the compiled binary. Fixed integrity.ts task cycle detection to walk raw insertion order so the golden cycle catalog matches Python's unsorted glob.
 ## Evidence
