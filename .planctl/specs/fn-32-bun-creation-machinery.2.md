@@ -31,5 +31,5 @@ bun test green incl. matrix + race harness; lint/typecheck green; no Python file
 - [ ] scanMaxEpicId honors the orphan-spec invariant; accumulate-all emit path lands
 
 ## Done summary
-
+Added the bun creation-spine machinery: eemeli-1.1 pyyaml-parity YAML input wrapper (matches the full scalar matrix) with config.loadRoots unified onto it, bounded 1 MiB stdin/file reader, slugify/scanMaxEpicId(orphan-spec dual scan)/scanMaxTaskId, throwing expandPath, fail-soft global epic-id lock proven interop-clean against Python in a cross-engine race harness, checkGlobalNameUnique, and the accumulate-all failure emit path.
 ## Evidence
