@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T20:28:46.821000Z",
+  "depends_on": [
+    "fn-809-restore-builds-and-helptailing-sitters.1"
+  ],
+  "epic": "fn-809-restore-builds-and-helptailing-sitters",
+  "id": "fn-809-restore-builds-and-helptailing-sitters.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/sitter",
+  "tier": "xhigh",
+  "title": "Port helptailing sitter from keeper history",
+  "updated_at": "2026-06-12T20:28:46.821000Z"
+}

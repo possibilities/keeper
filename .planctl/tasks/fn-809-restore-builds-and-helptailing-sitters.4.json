@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T20:28:46.821000Z",
+  "depends_on": [
+    "fn-809-restore-builds-and-helptailing-sitters.3"
+  ],
+  "epic": "fn-809-restore-builds-and-helptailing-sitters",
+  "id": "fn-809-restore-builds-and-helptailing-sitters.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/sitter",
+  "tier": "medium",
+  "title": "Bootstrap launchd jobs and docs sweep",
+  "updated_at": "2026-06-12T20:28:46.821000Z"
+}

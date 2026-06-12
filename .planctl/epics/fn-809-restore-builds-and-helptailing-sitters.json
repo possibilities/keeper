@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-12T20:28:46.821000Z",
+  "depends_on_epics": [],
+  "id": "fn-809-restore-builds-and-helptailing-sitters",
+  "last_validated_at": "2026-06-12T20:28:46.837000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Restore builds and helptailing sitters",
+  "touched_repos": [
+    "/Users/mike/code/sitter"
+  ],
+  "updated_at": "2026-06-12T20:28:46.821000Z"
+}
