@@ -23,5 +23,5 @@ This closes the rollback window permanently — the gate task's sign-off is the 
 - [ ] bun test green (fast + slow), lint/typecheck green, binary answers; docs single-implementation present-tense
 
 ## Done summary
-
+Retired the Python reference implementation: purely-subtractive deletion commit (planctl/, tests/, pyproject.toml, uv.lock, pyrightconfig.json; 144 files, zero insertions) then a separate residue commit pruning the .gitignore Python block, worker-template runner/check-matrix Python rows (all rendered agents re-rendered), and CLAUDE.md/README single-implementation present-tense docs with the git-revert rollback fact. bun test green fast (887 pass/73 skip) and slow (960 pass), lint/typecheck exit 0, binary answers.
 ## Evidence
