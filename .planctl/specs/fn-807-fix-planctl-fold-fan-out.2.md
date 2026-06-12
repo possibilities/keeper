@@ -43,5 +43,5 @@ Backfill test seeds inline, relocated, malformed, and non-planctl Commit rows in
 - [ ] README sweep prose + v67 bullet updated in place; bun run test:full green
 
 ## Done summary
-
+Added the v67 commit_trailer_facts projection: foldCommit writes one fact row per trailer-bearing Commit in its transaction, loadAllCommitTrailerFacts reads the indexed table instead of scanning every Commit blob per swept session, and the v66->v67 migration backfills it (no cursor rewind). Bumped SCHEMA_VERSION + api.py whitelist; updated README sweep prose + v67 bullet.
 ## Evidence
