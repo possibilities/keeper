@@ -22,5 +22,5 @@ Assertion weakening is the failure mode — byte pins stay byte pins; when a pyt
 - [ ] All listed modules translated with source-comments; zero unexplained drops; both suites green
 
 ## Done summary
-
+Translated the engine-agnostic verb modules (readonly/worker/query/restamp/creation/cli+init/envelope/gist + decorator/no-track mapping) onto the bun harness: 147 new tests, every pytest node mapped by source-comment (translated | cited | drop-with-reason), zero todos. Added harness helpers (gitBaseline, seedRuntime, pathShim, scaffoldEpic) and migrated the list/integrity goldens with PROVENANCE. Fast + slow bun suites green (547 pass), lint + typecheck green.
 ## Evidence
