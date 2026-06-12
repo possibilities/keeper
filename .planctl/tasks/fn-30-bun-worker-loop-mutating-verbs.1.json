@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "high",
   "title": "Author worker-verb conformance tests",
-  "updated_at": "2026-06-12T09:13:14.626060Z"
+  "updated_at": "2026-06-12T09:17:48.862528Z",
+  "worker_done_at": "2026-06-12T09:17:48.862528Z"
 }

@@ -35,5 +35,5 @@ Green three ways before done: default engine, PLANCTL_BIN=python planctl, and th
 - [ ] No seed_epic/scaffold seeding anywhere in the module
 
 ## Done summary
-
+Added tests/test_worker_verbs.py: engine-agnostic conformance spec for claim/done/block covering the force matrix, fail-open/closed session-id polarity, zero/one-commit splits, and frozen-clock worker_done_at stamp. Green in default engine and Python conformance; fast gate untouched.
 ## Evidence
