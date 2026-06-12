@@ -105,7 +105,7 @@ Flags:
   --no-armed-line        Suppress the initial armed line
   --require-transition   A condition true at arm time waits for a real edge
   --json                 Emit armed/terminal lines as JSON
-  --sock <path>          Socket override (\$KEEPER_SOCK / default)
+  --sock <path>          Socket override ($KEEPER_SOCK / default)
   --help                 Show this help
 
 Exit codes:
