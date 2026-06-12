@@ -13,7 +13,7 @@ Data lives in `.planctl/` inside the project directory, under version control.
 
 - Python `>=3.11,<3.14` — the authoritative implementation
 - [`uv`](https://docs.astral.sh/uv/) recommended for running/installing
-- [Bun](https://bun.sh/) `1.3.14` — to build `planctl-bun`, a compiled TypeScript binary covering the read surface (`state-path`, `detect`, `status`, `epics`, `show`, `cat`, `list`, `ready`, `tasks`, `resolve-task`, `refine-context`, `validate`) the worker-loop writes (`init`, `claim`, `done`, `block`), and the epic/task editing surface (the setter family, the `epic add-dep`/`add-deps`/`rm-dep` dep editors, and the short-circuiting `epic invalidate`/`queue-jump`), and the creation/deletion surface (`scaffold`, `epic create`, `refine-apply`, `epic rm`)
+- [Bun](https://bun.sh/) `1.3.14` — to build `planctl-bun`, a compiled TypeScript binary at full CLI parity with the Python implementation
 
 ## Install
 
