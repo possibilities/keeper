@@ -22,5 +22,5 @@ The full-suite collapse may surface close-saga test files that error (not skip) 
 - [ ] Docs revised in place, mirrors in sync, gate rows truthful
 
 ## Done summary
-
+Drove the broadened bun conformance gate green (serial, -n, --run-slow incl. test_scaffold.py) across the creation/deletion surface plus the unpoisoned fixture-dependent modules. Kept the gate as an explicit file list rather than collapsing to tests/, documenting the unported close-saga + worker-resume residue that errors against the bun binary. Revised CLAUDE.md/AGENTS.md (symlinked mirror) gate row and README bun-coverage lines in place.
 ## Evidence
