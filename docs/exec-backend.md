@@ -175,11 +175,15 @@ inherits the server's — so the mint carries `TERM`/`COLORTERM` defaults
 (preserving any real terminal's values) so the worker `claude` TUI shows
 color. This is the *only* control command that sets a child env.
 
-**Session-gone single-retry.** The memoized session can die out from
-under us. On a `new-tab` / `new-window` failure whose stderr looks like the
-session vanished, `launch` invalidates the memo, re-ensures (re-mints), and
-retries exactly once. The success path leaves the memo untouched.
-`ensureLaunched` mirrors this with per-call state instead of a memo.
+**Session-gone single-retry (zellij only).** Zellij's memoized session can
+die out from under us. On a `new-tab` failure whose stderr looks like the
+session vanished, the zellij `launch` invalidates the memo, re-ensures
+(re-mints), and retries exactly once; the success path leaves the memo
+untouched, and `ensureLaunched` mirrors this with per-call state instead of
+a memo. **Tmux does NOT take this path.** It keeps no ensure memo — every op
+runs a cheap per-call `has-session` probe before `new-window`, so a
+session-gone `new-window` failure surfaces `{ ok: false }` directly with no
+re-ensure and no retry (the probe already absorbs a dead-session race).
 
 ## Pure helpers reference
 

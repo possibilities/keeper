@@ -1459,6 +1459,34 @@ test("createTmuxBackend.launch: non-zero new-window exit → { ok: false, error 
   }
 });
 
+test("createTmuxBackend.launch: session-gone new-window stderr → exactly one new-window, NO re-ensure/retry (inverse of zellij)", async () => {
+  // The tmux backend deliberately omits zellij's session-gone
+  // memo-invalidate-and-retry arm: a per-call `has-session` probe is cheap,
+  // so `launchInto` runs `ensureSessionFor` → `new-window` exactly ONCE and
+  // surfaces `{ ok: false }` on a session-gone failure rather than re-minting
+  // and retrying. This pins that non-retry contract.
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      // Probe says live, so no mint fires; the window then dies session-gone.
+      "tmux:has-session": { exitCode: 0 },
+      "tmux:new-window": { stderr: "can't find session: x", exitCode: 1 },
+    },
+    calls,
+  );
+  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
+  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  expect(res.ok).toBe(false);
+  // Exactly one new-window spawn — no second attempt.
+  const windows = calls.filter((c) => c[1] === "new-window");
+  expect(windows.length).toBe(1);
+  // Exactly one has-session probe — no re-ensure after the failure.
+  const probes = calls.filter((c) => c[1] === "has-session");
+  expect(probes.length).toBe(1);
+  // No mint at all on this path (probe said live), and certainly no second one.
+  expect(calls.some((c) => c[1] === "new-session")).toBe(false);
+});
+
 test("createTmuxBackend.launch: ENOENT (binary missing) → { ok: false, error }, never throws", async () => {
   const spawn: SpawnFn = () => {
     throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
