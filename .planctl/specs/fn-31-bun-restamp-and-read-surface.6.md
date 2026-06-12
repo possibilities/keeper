@@ -34,5 +34,5 @@ test_restamp_verbs.py green against the compiled binary incl. the fail-forward a
 - [ ] add-deps classifier order and result statuses exact; short-circuit branches produce zero commits
 
 ## Done summary
-
+Ported the 14 epic/task editing verbs (setter family, dep editors, short-circuit invalidate/queue-jump) onto the shared restamp pipeline in planctl-bun. All 29 restamp conformance tests green against the compiled binary, serial and parallel; authority statement + gate rows + README scope phrases updated.
 ## Evidence
