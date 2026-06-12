@@ -137,15 +137,81 @@ describe("state-path", () => {
   });
 });
 
-describe("unimplemented read-only verbs", () => {
-  test.each(["detect", "status", "epics"])(
-    "%s exits non-zero with a clear not-available error (never silent success)",
+describe("read-only verbs dispatch through the compiled binary", () => {
+  test("detect found-true reads schema_version (0 default, no meta.json)", () => {
+    const root = seedProject();
+    try {
+      const r = run(["detect"], root);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain('"found": true');
+      expect(r.stdout).toContain('"schema_version": 0');
+      expect(r.stdout).toContain('"planctl_invocation"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("detect found-false: bare {found:false} then resolver error + exit 1", () => {
+    const root = realpathSync(
+      mkdtempSync(join(tmpdir(), "planctl-cli-detect-empty-")),
+    );
+    try {
+      const r = run(["detect"], root);
+      expect(r.code).toBe(1);
+      expect(
+        r.stdout.startsWith('{\n  "success": true,\n  "found": false\n}\n'),
+      ).toBe(true);
+      expect(r.stdout).not.toContain('"planctl_invocation"');
+      expect(r.stdout).toContain(
+        "No planctl project found. Run 'planctl init' first.",
+      );
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("status on an empty project emits zero counts + the trailer", () => {
+    const root = seedProject();
+    try {
+      const r = run(["status"], root);
+      expect(r.code).toBe(0);
+      expect(r.stdout).toContain('"schema_version": 1');
+      expect(r.stdout).toContain('"total": 0');
+      expect(r.stdout).toContain('"planctl_invocation"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("epics on an empty project emits [] + the trailer", () => {
+    const root = seedProject();
+    try {
+      const r = run(["epics"], root);
+      expect(r.code).toBe(0);
+      const lines = r.stdout.trimEnd().split("\n");
+      const trailer = lines[lines.length - 1] as string;
+      const primary = lines.slice(0, -1).join("\n");
+      expect(primary).toBe('{\n  "success": true,\n  "epics": []\n}');
+      expect(trailer).toContain('"op":"epics"');
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test.each(["status", "epics"])(
+    "%s on a missing project errors (exit 1, no trailer)",
     (verb) => {
-      const root = seedProject();
+      const root = realpathSync(
+        mkdtempSync(join(tmpdir(), "planctl-cli-noproj-")),
+      );
       try {
         const r = run([verb], root);
-        expect(r.code).not.toBe(0);
-        expect(r.stderr).toContain("not yet available in planctl-bun");
+        expect(r.code).toBe(1);
+        expect(r.stdout).toBe(
+          '{\n  "success": false,\n' +
+            '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
+        );
+        expect(r.stdout).not.toContain("planctl_invocation");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

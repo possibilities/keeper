@@ -5,17 +5,20 @@
 // positions), `--help` on stdout (exit 0) with a Commands section, and an
 // unknown-command error on stderr (exit 2) shaped like click's "No such command".
 //
-// state-path is implemented end-to-end; the remaining read-only verbs of this
-// epic (detect/status/epics) are registered in help but land in later tasks —
-// invoking one exits non-zero with a clear not-available error (never a silent
-// success). After a read-only verb runs, the trailing planctl_invocation NDJSON
-// line is emitted (soft-fail: dropped when no project resolves), suppressed for
-// the cat/validate contract verbs by name.
+// state-path / detect / status / epics are implemented end-to-end. After a
+// read-only verb runs, the trailing planctl_invocation NDJSON line is emitted by
+// re-resolving the project (mirroring cli.py's _emit_readonly_invocation): a
+// genuine resolve failure is swallowed, but a missing-project resolve raises the
+// error envelope + exit 1 inline (the contract for detect's found-false tail).
+// The trailer is suppressed for the cat/validate contract verbs by name.
 
 import { compactJson, type OutputFormat } from "./format.ts";
 import { buildPlanctlInvocationReadonly } from "./invocation.ts";
-import { findProjectRoot } from "./project.ts";
+import { resolveProject } from "./project.ts";
+import { runDetect } from "./verbs/detect.ts";
+import { runEpics } from "./verbs/epics.ts";
 import { runStatePath } from "./verbs/state_path.ts";
+import { runStatus } from "./verbs/status.ts";
 
 const PROG = "planctl";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
@@ -35,9 +38,9 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "detect",
     shortHelp: "Check if cwd belongs to a planctl project.",
-    implemented: false,
+    implemented: true,
   },
-  { name: "epics", shortHelp: "List all epics.", implemented: false },
+  { name: "epics", shortHelp: "List all epics.", implemented: true },
   {
     name: "state-path",
     shortHelp: "Print the resolved state directory path.",
@@ -46,7 +49,7 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "status",
     shortHelp: "Show overall project status.",
-    implemented: false,
+    implemented: true,
   },
 ];
 
@@ -154,26 +157,21 @@ function printHelp(): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-/** Emit the trailing read-only planctl_invocation NDJSON line. Soft-fail:
- * dropped silently when no project resolves (matches cli.py's try/except). */
-function emitTrailer(verb: string): void {
+/** Emit the trailing read-only planctl_invocation NDJSON line by re-resolving
+ * the project — the port of cli.py:_emit_readonly_invocation. resolveProject
+ * raises the missing-project error envelope + exit 1 when no `.planctl/`
+ * resolves (terminating before any trailer prints); a genuine non-exit failure
+ * is swallowed so a tracing side-effect never breaks the CLI. */
+function emitTrailer(verb: string, format: OutputFormat | null): void {
+  const ctx = resolveProject(format);
   try {
-    const repoRoot = findProjectRoot();
     const envelope = {
-      planctl_invocation: buildPlanctlInvocationReadonly(verb, repoRoot),
+      planctl_invocation: buildPlanctlInvocationReadonly(verb, ctx.projectPath),
     };
     process.stdout.write(`${compactJson(envelope)}\n`);
   } catch {
     // Never fail the CLI over a tracing side-effect.
   }
-}
-
-function notImplemented(name: string): never {
-  process.stderr.write(
-    `Error: '${name}' is not yet available in planctl-bun (read-only subset; ` +
-      "use the Python planctl binary).\n",
-  );
-  process.exit(2);
 }
 
 function dispatch(parsed: ParsedArgs): number {
@@ -187,9 +185,6 @@ function dispatch(parsed: ParsedArgs): number {
   if (spec === undefined) {
     noSuchCommand(command);
   }
-  if (!spec.implemented) {
-    notImplemented(command);
-  }
 
   switch (command) {
     case "state-path": {
@@ -197,12 +192,21 @@ function dispatch(parsed: ParsedArgs): number {
       runStatePath(format, taskId);
       break;
     }
+    case "detect":
+      runDetect(format);
+      break;
+    case "status":
+      runStatus(format);
+      break;
+    case "epics":
+      runEpics(format);
+      break;
     default:
-      notImplemented(command);
+      noSuchCommand(command);
   }
 
   if (!NO_TRACK_COMMANDS.has(command)) {
-    emitTrailer(command);
+    emitTrailer(command, format);
   }
   return 0;
 }
