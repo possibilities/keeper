@@ -47,5 +47,5 @@ Sweep stale zellij comments in every file this task touches (`src/autopilot-work
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Made tmux the sole exec backend: deleted the zellij factory/builders/session-ensure, collapsed resolveExecBackend to always construct tmux (legacy/unknown tags fall through, never throw), flipped DEFAULT_EXEC_BACKEND + db.ts mirror to tmux with VALID_EXEC_BACKENDS={tmux}, dropped restore-agents skipped-backend routing, and reworked unstick-autopilot against tmux has-session. Full suite green.
 ## Evidence
