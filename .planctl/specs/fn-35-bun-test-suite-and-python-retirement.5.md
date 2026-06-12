@@ -21,5 +21,5 @@ The gate exists to catch exactly the silent losses that feel fine — parametriz
 - [ ] Ledger complete and arithmetic exact; zero todos; both suites green; deletion unblocked in writing
 
 ## Done summary
-
+Completeness gate passed: all 900 pytest-inventory nodes mapped (870 translated/cited + 30 enumerated drops: 29 python_only + stub_contracts), zero test.todo, dense-file spot-audit clean, both suites green side by side (bun 960 pass under slow gate, pytest 898+2 full + conformance against the production binary). Committed the ledger and task .4's orphaned generated-guard translation; Python deletion unblocked.
 ## Evidence
