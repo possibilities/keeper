@@ -109,5 +109,5 @@ test/babysitter-build.test.ts. `bun run test:full` before landing
 - [ ] SITTER_ENTRYPOINTS updated; fast tier green; `bun run test:full` green
 
 ## Done summary
-
+Built the helptailing scanner: counts --agent-help Bash PreToolUse invocations via the event_blobs COALESCE join, seeds a frozen pre-2026-06-11 baseline once and recomputes the epoch each tick, and writes trend-digest + rate-spike followups directly (no notification, no watchdog) with Garwood-exact CI gating the spike. Live --tick verified: baseline 93/63, epoch RR ~0.95.
 ## Evidence
