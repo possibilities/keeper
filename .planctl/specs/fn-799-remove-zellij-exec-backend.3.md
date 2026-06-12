@@ -43,5 +43,5 @@ Prose-only change to src files (comments) — `bun test` fast tier plus a `bun r
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Rewrote docs/exec-backend.md against the tmux-only module and swept all zellij prose from README (four clusters), CLAUDE.md, and comment-only mentions in src/types.ts, daemon.ts, view-shell.ts, reducer.ts, exit-triggers.ts, keeper/api.py; deleted the stale autopilot-zellij sketch. Non-test grep gate is zero; surviving zellij literals live only in test/ as load-bearing historical/legacy-fallback fixtures (per the epic Risks note). bun run test:full green.
 ## Evidence
