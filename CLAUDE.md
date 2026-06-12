@@ -52,4 +52,4 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 | Bun lint | `bun run lint` — biome check over `src` (and the hook dispatchers) |
 | Bun typecheck | `bun run typecheck` — `tsc --noEmit` |
 | Bun test | `bun run test` — `bun test` over the TypeScript suite |
-| Bun conformance | `bun run build && PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/test_cli.py tests/test_readonly_verbs.py tests/test_init.py tests/test_worker_verbs.py` — the scoped parity gate against the compiled binary (serial; add `-n auto --dist loadscope` to parallelise) |
+| Bun conformance | `bun run build && PLANCTL_BIN="$PWD/dist/planctl-bun" uv run pytest tests/test_cli.py tests/test_readonly_verbs.py tests/test_init.py tests/test_worker_verbs.py --run-slow` — the scoped parity gate against the compiled binary (`--run-slow` runs `test_init.py`'s `real_git` commit tests; serial, add `-n auto --dist loadscope` to parallelise) |
