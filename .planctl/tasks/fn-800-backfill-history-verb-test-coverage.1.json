@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T01:17:59.045990Z",
+  "depends_on": [],
+  "epic": "fn-800-backfill-history-verb-test-coverage",
+  "id": "fn-800-backfill-history-verb-test-coverage.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "pin escapeLike and error-envelope tests",
+  "updated_at": "2026-06-12T01:17:59.045990Z"
+}
