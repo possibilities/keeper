@@ -1,0 +1,8 @@
+fn-1-cafe  Café résumé ☕  [open]
+  .1  Task 1  [todo]
+  .2  Task 2  [in_progress]  test@example.com
+  .3  Task 3  [done]  test@example.com
+
+fn-2-zeta  Zeta  [open]
+  .1  Task 1  [in_progress]  test@example.com
+  .2  Task 2  [todo]

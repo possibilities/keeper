@@ -85,6 +85,20 @@ describe("LocalFileStateStore.loadRuntime", () => {
   });
 });
 
+// CITED HERE (tests/test_now_iso_contract.py — every node maps to the nowIso
+// units below; the boundary node maps to an end-to-end stamp pin elsewhere):
+//   test_now_iso_contract.py::test_format_string_is_pinned -> the verbatim/6-digit
+//     the accepted %Y-%m-%dT%H:%M:%S.%fZ shape (the format string itself is not
+//     a bun export; its acceptance IS the contract under test).
+//   test_now_iso_contract.py::test_set_and_valid_returns_verbatim -> "...returned verbatim"
+//   test_now_iso_contract.py::test_malformed_is_hard_error -> the malformed / millisecond /
+//     calendar-impossible rejection tests below (the 5 bad inputs collapse onto
+//     these shape-class assertions).
+//   test_now_iso_contract.py::test_unset_returns_wall_clock -> "wall-clock fallback ... 6-digit"
+//   test_now_iso_contract.py::test_boundary_stamped_field_equals_frozen_value -> end-to-end stamp
+//     equality (a verb stamps last_validated_at == frozen PLANCTL_NOW) is pinned
+//     by verbs-query.test.ts "validate --epic stamps on the None transition" and
+//     verbs-restamp.test.ts "add-dep wires + restamps" (both == FROZEN).
 describe("nowIso PLANCTL_NOW contract", () => {
   test("a well-formed override is returned verbatim (no round-trip)", () => {
     process.env.PLANCTL_NOW = "2026-06-12T08:44:14.300970Z";

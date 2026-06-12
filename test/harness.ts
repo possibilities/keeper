@@ -15,6 +15,7 @@
 
 import { afterEach, beforeEach } from "bun:test";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
@@ -23,7 +24,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { delimiter, join } from "node:path";
 
 import { normalizeEpic, normalizeTask, SCHEMA_VERSION } from "../src/models.ts";
 import { serializeStateJson } from "../src/store.ts";
@@ -536,3 +537,171 @@ export const SLOW_ENABLED: boolean = ((): boolean => {
   const v = process.env.PLANCTL_RUN_SLOW;
   return v !== undefined && v !== "" && v !== "0";
 })();
+
+// ---------------------------------------------------------------------------
+// gitBaseline — turn a seedState tree into a clean committed git baseline.
+// Port of the test_worker_verbs / test_restamp_verbs `_git_seed` helper: real
+// `git init` + commit the `.planctl/` tree so any later dirty state is the
+// verb-under-test's. Used by the ZERO-commit / exactly-one-commit assertions.
+// ---------------------------------------------------------------------------
+
+/** `git init` + commit the seeded `.planctl/` tree in *dir*, returning the repo
+ * path. Identity/gpgsign/hooks come from gitInit. The single baseline commit
+ * means a follow-up `git rev-list --count HEAD` delta isolates the verb's
+ * commit. */
+export function gitBaseline(dir: string): string {
+  gitInit(dir);
+  git(["add", ".planctl/"], dir);
+  git(["commit", "-q", "-m", "chore: seed planctl tree"], dir);
+  return dir;
+}
+
+// ---------------------------------------------------------------------------
+// seedRuntime — write a task's runtime-state overlay file directly (no verb, no
+// lock). Port of the `_write_runtime` helper: bytes match save_runtime
+// (json.dumps indent=2 sort_keys + trailing newline == serializeStateJson).
+// ---------------------------------------------------------------------------
+
+/** Write `<root>/.planctl/state/tasks/<taskId>.state.json` from *state*, byte-
+ * faithful to LocalFileStateStore.saveRuntime. Seeds a runtime overlay a read
+ * verb merges over the tracked def. */
+export function seedRuntime(
+  root: string,
+  taskId: string,
+  state: Record<string, unknown>,
+): void {
+  const dir = join(root, ".planctl", "state", "tasks");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(
+    join(dir, `${taskId}.state.json`),
+    serializeStateJson(state),
+    "utf-8",
+  );
+}
+
+// ---------------------------------------------------------------------------
+// pathShim — drop an executable fake binary on PATH. Port of the conftest
+// fake-binary pattern (test_gist's _make_fake_gh, test_generated_guard_hook):
+// an executable temp script that records its argv and emits a controlled
+// stdout/exit. Returns {binDir, env, argvPath} so the caller layers env into
+// runCli and reads the recorded argv back.
+// ---------------------------------------------------------------------------
+
+export interface PathShim {
+  /** Directory holding the shim, prepended to PATH. */
+  binDir: string;
+  /** Env fragment to spread into runCli: PATH with binDir first. */
+  env: Record<string, string>;
+  /** File the shim writes its argv to (one arg per line), or null until run. */
+  argvPath: string;
+}
+
+/** Drop an executable *name* in a fresh dir under *root* that records its argv
+ * to `<binDir>/<name>-argv` (one arg per line) then prints *stdout* and exits
+ * *exitCode* (a non-zero exit also writes a stderr line). Mirrors
+ * _make_fake_gh: a `#!/usr/bin/env bun` script so the shim runs without a
+ * system python. Returns the handle to layer into runCli's env. */
+export function pathShim(
+  root: string,
+  name: string,
+  opts: { stdout?: string; exitCode?: number } = {},
+): PathShim {
+  const { stdout = "", exitCode = 0 } = opts;
+  const binDir = join(root, `shim-${name}`);
+  mkdirSync(binDir, { recursive: true });
+  const argvPath = join(binDir, `${name}-argv`);
+  const script =
+    "#!/usr/bin/env bun\n" +
+    `import { writeFileSync } from "node:fs";\n` +
+    `writeFileSync(${JSON.stringify(argvPath)}, process.argv.slice(2).join("\\n") + "\\n");\n` +
+    `if (${exitCode} !== 0) {\n` +
+    `  process.stderr.write("fake ${name}: simulated failure\\n");\n` +
+    `  process.exit(${exitCode});\n` +
+    `}\n` +
+    `process.stdout.write(${JSON.stringify(stdout)} + "\\n");\n`;
+  writeFileSync(join(binDir, name), script, "utf-8");
+  chmodSync(join(binDir, name), 0o755);
+  return {
+    binDir,
+    env: { PATH: `${binDir}${delimiter}${process.env.PATH ?? ""}` },
+    argvPath,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// scaffoldEpic — mint an epic + N tasks through the COMPILED binary's scaffold
+// verb. Port of conftest.seed_epic / _scaffold_plan_yaml: builds the scaffold
+// `--file` YAML and returns the allocated {epicId, taskIds}. Unlike seedState
+// (CLI-free disk builder) this drives the real mint path, so the caller's dir
+// must be a git repo with `planctl init` applied (use withProject).
+// ---------------------------------------------------------------------------
+
+/** Build the scaffold `--file` YAML for an epic + *nTasks* tasks. Each task
+ * carries a `seed-<i>` Description marker and tier=medium; *taskDeps* maps a
+ * 1-based ordinal to the 1-based ordinals it depends on. Mirrors
+ * _scaffold_plan_yaml. */
+export function scaffoldPlanYaml(opts: {
+  title: string;
+  nTasks: number;
+  branch?: string;
+  taskDeps?: Record<number, number[]>;
+}): string {
+  const { title, nTasks, branch, taskDeps = {} } = opts;
+  const blocks: string[] = [];
+  for (let i = 1; i <= nTasks; i++) {
+    const specLines = taskSpec(`seed-${i}`)
+      .split("\n")
+      .map((ln) => `      ${ln}`)
+      .join("\n");
+    const deps = taskDeps[i];
+    const depLine =
+      deps && deps.length > 0 ? `    deps: [${deps.join(", ")}]\n` : "";
+    blocks.push(
+      `  - title: Task ${i}\n${depLine}    tier: medium\n    spec: |\n${specLines}`,
+    );
+  }
+  const branchLine = branch ? `  branch: ${branch}\n` : "";
+  return (
+    `epic:\n  title: ${title}\n${branchLine}` +
+    "  spec: |\n    ## Overview\n    seed overview\n" +
+    `tasks:\n${blocks.join("\n")}\n`
+  );
+}
+
+export interface ScaffoldResult {
+  epicId: string;
+  taskIds: string[];
+}
+
+/** Scaffold an epic + *nTasks* tasks via the binary in *project* (a withProject
+ * handle: an inited git repo + its dedicated HOME). Returns the allocated
+ * {epicId, taskIds}. Mirrors conftest.seed_epic — a single transactional mint,
+ * no incremental create verbs. Throws on a non-zero scaffold exit. */
+export function scaffoldEpic(
+  project: ProjectHandle,
+  opts: {
+    title?: string;
+    nTasks?: number;
+    branch?: string;
+    taskDeps?: Record<number, number[]>;
+    env?: Record<string, string>;
+  } = {},
+): ScaffoldResult {
+  const { title = "Seed epic", nTasks = 1, branch, taskDeps, env } = opts;
+  const yaml = scaffoldPlanYaml({ title, nTasks, branch, taskDeps });
+  const planPath = join(project.root, "_seed_plan.yaml");
+  writeFileSync(planPath, yaml, "utf-8");
+  const res = runCli(["scaffold", "--file", planPath], {
+    cwd: project.root,
+    home: project.home,
+    env,
+  });
+  if (res.code !== 0) {
+    throw new Error(`scaffold failed in scaffoldEpic:\n${res.output}`);
+  }
+  const payload = firstJsonPayload(res.output);
+  return {
+    epicId: payload.epic_id as string,
+    taskIds: payload.task_ids as string[],
+  };
+}
