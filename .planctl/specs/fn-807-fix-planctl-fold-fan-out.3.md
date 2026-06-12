@@ -35,5 +35,5 @@ Update README's log-line inventory (~519-527) with any net-new line class. Break
 - [ ] README log-line inventory updated
 
 ## Done summary
-
+Split [fold-slow] into lock_wait_ms vs work_ms (t0/t1/t2 around BEGIN IMMEDIATE) and added syncPlanctlLinks fan-out counters (calls/touched epics/swept sessions/trailer-fact rows + load ms) to the commit, PostToolUse, and new [pretufold-breakdown] PreToolUse breakdown lines. README log-line inventory updated.
 ## Evidence

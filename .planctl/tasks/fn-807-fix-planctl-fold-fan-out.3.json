@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Fold telemetry lock-wait split",
-  "updated_at": "2026-06-12T14:35:44.039231Z"
+  "updated_at": "2026-06-12T15:07:54.508235Z",
+  "worker_done_at": "2026-06-12T15:07:54.508235Z"
 }
