@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-12T08:45:39.156060Z",
   "created_at": "2026-06-12T08:39:30.203292Z",
   "created_by_close_of": "fn-803-add-setup-tmux-subcommand",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Test setup-tmux kill-sessions safety gate",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-12T08:39:30.203292Z"
+  "updated_at": "2026-06-12T08:45:39.156060Z"
 }
