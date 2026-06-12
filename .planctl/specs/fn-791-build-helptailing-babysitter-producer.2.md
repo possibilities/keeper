@@ -65,5 +65,5 @@ are human-authored, and the charter is data, not instructions.
 - [ ] Charter `## Sitter facts` refreshed (only that section) and committed in ~/docs
 
 ## Done summary
-
+Documented and scheduled the helptailing trend sitter: producer agent doc (no agent spawn, no paging), hourly plist (no watchdog), README architecture/install(8d)/uninstall, FINDINGS-LEDGER note, and the charter's Sitter facts refreshed + committed in ~/docs.
 ## Evidence
