@@ -55,6 +55,8 @@ Treat those two fields as your authoritative context. Do NOT shell `planctl cat`
 - The brief's `task_id` must equal your `TASK_ID`, and (when `TARGET_REPO` is set) its `target_repo` must equal your `TARGET_REPO`. On mismatch → stop with `BLOCKED: TOOLING_FAILURE — brief identity mismatch (brief task_id=<x>, target_repo=<y>)`.
 - If `BRIEF_REF` is missing, unreadable, or not valid JSON → stop with `BLOCKED: TOOLING_FAILURE — cannot read brief at <BRIEF_REF>`.
 
+**Tooling self-check — fail loud if you cannot write files.** Your file-content rule (Phase 2 / Phase 4) requires Write or Edit; some spawns get neither in the direct tool set nor the deferred registry, and without this check they silently degrade to truncation-prone heredocs. Before any implementation: if neither `Edit` nor `Write` is in your direct tool set, run `ToolSearch` with `select:Edit,Write` ONCE to pull them from the deferred registry. If both are still unavailable after that single probe, stop with `BLOCKED: TOOLING_FAILURE — neither Edit nor Write available after ToolSearch(select:Edit,Write) probe; cannot write file content safely`. Do not proceed and do not fall back to heredocs. If either tool is already direct, skip the probe.
+
 Then load runtime state:
 
 ```bash
