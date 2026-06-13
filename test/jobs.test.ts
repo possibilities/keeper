@@ -27,8 +27,9 @@ import {
   colorizePillsInLine,
   pill,
   renderDeadLetterPill,
+  scheduledTaskLinesFor,
 } from "../src/board-render";
-import type { SubagentInvocation } from "../src/types";
+import type { ScheduledTask, SubagentInvocation } from "../src/types";
 import { SELECTED_LINE_PREFIX } from "../src/view-shell";
 
 // ---------------------------------------------------------------------------
@@ -294,7 +295,11 @@ test("backendCoordsSeg: pill is bracketed so colorizePillsInLine can route it", 
 
 test("renderJobsBody: empty jobs map → empty string", () => {
   expect(
-    renderJobsBody(new Map(), new Map<string, SubagentInvocation[]>()),
+    renderJobsBody(
+      new Map(),
+      new Map<string, SubagentInvocation[]>(),
+      new Map(),
+    ),
   ).toBe("");
 });
 
@@ -312,7 +317,7 @@ test("renderJobsBody: single session with one job → one section, one row", () 
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   expect(body).toBe(
     ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
   );
@@ -332,7 +337,7 @@ test("renderJobsBody: jobs with null session collect under '--- (no session) ---
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   expect(body).toBe(
     ["--- (no session) ---", `(x) ambient ${pill("working")}`].join("\n"),
   );
@@ -366,7 +371,7 @@ test("renderJobsBody: multiple sessions render in first-seen wire order", () => 
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   expect(body).toBe(
     [
       "--- session-b ---",
@@ -403,7 +408,7 @@ test("renderJobsBody: jobs in the same session group together preserving wire or
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   expect(body).toBe(
     [
       "--- ada ---",
@@ -452,7 +457,7 @@ test("renderJobsBody: interleaved sessions split into per-session sections, in f
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   expect(body).toBe(
     [
       "--- session-a ---",
@@ -489,7 +494,7 @@ test("renderJobsBody: backend pill is hidden by default (collapse-controlled)", 
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   // No render opts → nothing in `expanded` → the pill stays hidden.
   expect(body).toBe(["--- ada ---", `(x) live ${pill("working")}`].join("\n"));
   expect(body).not.toContain("[main");
@@ -511,7 +516,7 @@ test("renderJobsBody: expanding a job reveals the backend pill (no sub-agents pr
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map(), {
+  const body = renderJobsBody(jobs, new Map(), new Map(), {
     insertMode: false,
     selectedIndex: 0,
     expanded: new Set(["j1"]),
@@ -557,7 +562,7 @@ const ambWithSub = (): {
 
 test("renderJobsBody: sub-agents are collapse-by-default (hidden with no render opts)", () => {
   const { jobs, subagentIndex } = ambWithSub();
-  const body = renderJobsBody(jobs, subagentIndex);
+  const body = renderJobsBody(jobs, subagentIndex, new Map());
   expect(body).toBe(
     ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
   );
@@ -566,7 +571,7 @@ test("renderJobsBody: sub-agents are collapse-by-default (hidden with no render 
 
 test("renderJobsBody: expanding shows backend pill BEFORE sub-agent lines", () => {
   const { jobs, subagentIndex } = ambWithSub();
-  const body = renderJobsBody(jobs, subagentIndex, {
+  const body = renderJobsBody(jobs, subagentIndex, new Map(), {
     insertMode: false,
     selectedIndex: 0,
     expanded: new Set(["j-amb"]),
@@ -602,7 +607,7 @@ test("renderJobsBody: awaiting line stays always-visible (NOT collapse-controlle
     ],
   ]);
   // No expansion → awaiting line visible, backend pill hidden.
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   expect(body).toBe(
     [
       "--- ada ---",
@@ -688,7 +693,7 @@ test("renderJobsBody insert mode: every job row gets a caret (even with no child
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map(), {
+  const body = renderJobsBody(jobs, new Map(), new Map(), {
     insertMode: true,
     selectedIndex: 0,
     expanded: new Set(),
@@ -733,7 +738,7 @@ test("renderJobsBody insert mode: selected + expanded → down-triangle, backend
       ],
     ],
   ]);
-  const body = renderJobsBody(jobs, subagentIndex, {
+  const body = renderJobsBody(jobs, subagentIndex, new Map(), {
     insertMode: true,
     selectedIndex: 0,
     expanded: new Set(["j1"]),
@@ -764,7 +769,7 @@ test("renderJobsBody insert mode: out-of-range selectedIndex clamps to last row"
     ],
   ]);
   // selectedIndex past the end clamps to the last row, which gets the prefix.
-  const body = renderJobsBody(jobs, new Map(), {
+  const body = renderJobsBody(jobs, new Map(), new Map(), {
     insertMode: true,
     selectedIndex: 99,
     expanded: new Set(),
@@ -797,7 +802,7 @@ test("renderJobsBody insert mode: selectedIndex marks by selectableJobIds order,
     ["a2", mk("a2", "session-a", "a-second")],
     ["b2", mk("b2", "session-b", "b-second")],
   ]);
-  const body = renderJobsBody(jobs, new Map(), {
+  const body = renderJobsBody(jobs, new Map(), new Map(), {
     insertMode: true,
     selectedIndex: 1,
     expanded: new Set(),
@@ -1017,7 +1022,7 @@ test("renderJobsBody: expanded job renders monitors BETWEEN backend pill and sub
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, subagentIndex, {
+  const body = renderJobsBody(jobs, subagentIndex, new Map(), {
     insertMode: false,
     selectedIndex: 0,
     expanded: new Set(["j-amb"]),
@@ -1049,7 +1054,7 @@ test("renderJobsBody: monitors are collapse-by-default (hidden when not expanded
       },
     ],
   ]);
-  const body = renderJobsBody(jobs, new Map());
+  const body = renderJobsBody(jobs, new Map(), new Map());
   expect(body).toBe(
     ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
   );
@@ -1076,7 +1081,7 @@ test("renderJobsBody: empty / missing monitors blob renders no Monitors section"
         },
       ],
     ]);
-    const body = renderJobsBody(jobs, new Map(), {
+    const body = renderJobsBody(jobs, new Map(), new Map(), {
       insertMode: false,
       selectedIndex: 0,
       expanded: new Set(["j1"]),
@@ -1166,4 +1171,235 @@ test("jobs --help: documents --snapshot / --watch / --timeout", async () => {
   expect(res.stdout).toContain("--snapshot");
   expect(res.stdout).toContain("--watch");
   expect(res.stdout).toContain("--timeout");
+});
+
+// ---------------------------------------------------------------------------
+// scheduledTaskLinesFor — schema v68 / fn-813 per-job cron detail section.
+// Filters deleted rows, sorts by `ts` asc (`cron_id` tiebreak), marks
+// one-shot/recurring (upgraded to spent/expired on a terminal job), and
+// renders `human_schedule` (cron fallback) + first prompt line.
+// ---------------------------------------------------------------------------
+
+function makeCron(over: Partial<ScheduledTask> = {}): ScheduledTask {
+  return {
+    job_id: "j1",
+    cron_id: "c1",
+    cron: "0 9 * * *",
+    human_schedule: "every day at 9am",
+    recurring: 1,
+    durable: 0,
+    prompt_summary: "review the inbox",
+    status: "active",
+    ts: 100,
+    last_event_id: 1,
+    updated_at: 100,
+    ...over,
+  };
+}
+
+function cronIndex(rows: ScheduledTask[]): Map<string, ScheduledTask[]> {
+  const idx = new Map<string, ScheduledTask[]>();
+  for (const r of rows) {
+    const arr = idx.get(r.job_id);
+    if (arr === undefined) {
+      idx.set(r.job_id, [r]);
+    } else {
+      arr.push(r);
+    }
+  }
+  return idx;
+}
+
+test("scheduledTaskLinesFor: no crons for the job → [] (spreadable)", () => {
+  expect(scheduledTaskLinesFor(new Map(), "j1", "  ", false)).toEqual([]);
+  expect(
+    scheduledTaskLinesFor(
+      cronIndex([makeCron({ job_id: "other" })]),
+      "j1",
+      "  ",
+      false,
+    ),
+  ).toEqual([]);
+});
+
+test("scheduledTaskLinesFor: recurring active cron → [recurring] <schedule>: <prompt>", () => {
+  const idx = cronIndex([makeCron()]);
+  expect(scheduledTaskLinesFor(idx, "j1", "  ", false)).toEqual([
+    `  ${pill("recurring")} every day at 9am: review the inbox`,
+  ]);
+});
+
+test("scheduledTaskLinesFor: one-shot active cron renders the one-shot marker", () => {
+  const idx = cronIndex([makeCron({ recurring: 0 })]);
+  expect(scheduledTaskLinesFor(idx, "j1", "  ", false)).toEqual([
+    `  ${pill("one-shot")} every day at 9am: review the inbox`,
+  ]);
+});
+
+test("scheduledTaskLinesFor: deleted crons are hidden", () => {
+  const idx = cronIndex([
+    makeCron({ cron_id: "c1", ts: 100 }),
+    makeCron({ cron_id: "c2", ts: 200, status: "deleted" }),
+  ]);
+  expect(scheduledTaskLinesFor(idx, "j1", "  ", false)).toEqual([
+    `  ${pill("recurring")} every day at 9am: review the inbox`,
+  ]);
+});
+
+test("scheduledTaskLinesFor: multiple crons per job all render (read from state.rows, not byId)", () => {
+  const idx = cronIndex([
+    makeCron({ cron_id: "c1", ts: 100, prompt_summary: "first" }),
+    makeCron({ cron_id: "c2", ts: 200, prompt_summary: "second" }),
+    makeCron({ cron_id: "c3", ts: 300, prompt_summary: "third" }),
+  ]);
+  const lines = scheduledTaskLinesFor(idx, "j1", "  ", false);
+  expect(lines).toHaveLength(3);
+  expect(lines).toEqual([
+    `  ${pill("recurring")} every day at 9am: first`,
+    `  ${pill("recurring")} every day at 9am: second`,
+    `  ${pill("recurring")} every day at 9am: third`,
+  ]);
+});
+
+test("scheduledTaskLinesFor: crons sort by ts asc with cron_id tiebreak", () => {
+  // Insert out of order; equal ts pair breaks on cron_id ascending.
+  const idx = cronIndex([
+    makeCron({ cron_id: "cb", ts: 200, prompt_summary: "later" }),
+    makeCron({ cron_id: "cz", ts: 100, prompt_summary: "tie-z" }),
+    makeCron({ cron_id: "ca", ts: 100, prompt_summary: "tie-a" }),
+  ]);
+  const lines = scheduledTaskLinesFor(idx, "j1", "  ", false);
+  expect(lines).toEqual([
+    `  ${pill("recurring")} every day at 9am: tie-a`,
+    `  ${pill("recurring")} every day at 9am: tie-z`,
+    `  ${pill("recurring")} every day at 9am: later`,
+  ]);
+});
+
+test("scheduledTaskLinesFor: empty human_schedule falls back to the raw cron string", () => {
+  const idx = cronIndex([
+    makeCron({ human_schedule: "", cron: "*/5 * * * *" }),
+  ]);
+  expect(scheduledTaskLinesFor(idx, "j1", "  ", false)).toEqual([
+    `  ${pill("recurring")} */5 * * * *: review the inbox`,
+  ]);
+});
+
+test("scheduledTaskLinesFor: empty prompt_summary renders schedule alone (no trailing colon)", () => {
+  const idx = cronIndex([makeCron({ prompt_summary: "" })]);
+  expect(scheduledTaskLinesFor(idx, "j1", "  ", false)).toEqual([
+    `  ${pill("recurring")} every day at 9am`,
+  ]);
+});
+
+test("scheduledTaskLinesFor: terminal job marks recurring as expired, one-shot as spent", () => {
+  const idx = cronIndex([
+    makeCron({ cron_id: "c1", ts: 100, recurring: 1, prompt_summary: "rec" }),
+    makeCron({ cron_id: "c2", ts: 200, recurring: 0, prompt_summary: "once" }),
+  ]);
+  expect(scheduledTaskLinesFor(idx, "j1", "  ", true)).toEqual([
+    `  ${pill("expired")} every day at 9am: rec`,
+    `  ${pill("spent")} every day at 9am: once`,
+  ]);
+});
+
+test("renderJobsBody: expanded job lists crons AFTER the sub-agent section", () => {
+  const { subagentIndex } = ambWithSub();
+  const jobs = new Map<string, unknown>([
+    [
+      "j-amb",
+      {
+        job_id: "j-amb",
+        cwd: "/repo/x",
+        title: "ambient",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "ada",
+        backend_exec_pane_id: "11",
+        monitors: JSON.stringify([{ id: "b1", kind: "ambient" }]),
+      },
+    ],
+  ]);
+  const cronIdx = cronIndex([
+    makeCron({
+      job_id: "j-amb",
+      cron_id: "c1",
+      ts: 100,
+      prompt_summary: "nightly sweep",
+    }),
+    makeCron({
+      job_id: "j-amb",
+      cron_id: "c2",
+      ts: 200,
+      recurring: 0,
+      prompt_summary: "one off",
+    }),
+  ]);
+  const body = renderJobsBody(jobs, subagentIndex, cronIdx, {
+    insertMode: false,
+    selectedIndex: 0,
+    expanded: new Set(["j-amb"]),
+  });
+  expect(body).toBe(
+    [
+      "--- ada ---",
+      `(x) ambient ${pill("working")}`,
+      "  [p11]",
+      `  ${pill("ambient")} b1`,
+      `  general-purpose: investigate ${pill("running")}`,
+      `  ${pill("recurring")} every day at 9am: nightly sweep`,
+      `  ${pill("one-shot")} every day at 9am: one off`,
+    ].join("\n"),
+  );
+});
+
+test("renderJobsBody: crons are collapse-by-default (hidden when not expanded)", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/x",
+        title: "ambient",
+        plan_verb: null,
+        state: "working",
+        backend_exec_session_id: "ada",
+      },
+    ],
+  ]);
+  const cronIdx = cronIndex([makeCron({ job_id: "j1" })]);
+  const body = renderJobsBody(jobs, new Map(), cronIdx);
+  expect(body).toBe(
+    ["--- ada ---", `(x) ambient ${pill("working")}`].join("\n"),
+  );
+});
+
+test("renderJobsBody: crons on a terminal (killed) job render expired/spent", () => {
+  const jobs = new Map<string, unknown>([
+    [
+      "j1",
+      {
+        job_id: "j1",
+        cwd: "/repo/x",
+        title: "ambient",
+        plan_verb: null,
+        state: "killed",
+        backend_exec_session_id: "ada",
+      },
+    ],
+  ]);
+  const cronIdx = cronIndex([
+    makeCron({
+      job_id: "j1",
+      cron_id: "c1",
+      recurring: 1,
+      prompt_summary: "rec",
+    }),
+  ]);
+  const body = renderJobsBody(jobs, new Map(), cronIdx, {
+    insertMode: false,
+    selectedIndex: 0,
+    expanded: new Set(["j1"]),
+  });
+  expect(body).toContain(`  ${pill("expired")} every day at 9am: rec`);
 });

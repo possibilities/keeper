@@ -128,7 +128,7 @@ PASSIVE skips them without blocking.
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names
 a collection in its `query` (sort/limit/offset/filter) and gets back an ordered
-page that doubles as a live subscription. Seven collections register today —
+page that doubles as a live subscription. Eight collections register today —
 `jobs` (the first and default), `epics` (the read-only plans surface — each
 epic embeds its tasks as a JSON array, so there is no separate `tasks`
 collection), `subagent_invocations` (the per-job timeline of Task-tool
@@ -177,7 +177,14 @@ keyed by `dl_id` and idempotent under re-scan; status flips
 `waiting → recovered` only when the human triggers the `replay_dead_letter`
 RPC. It is NOT a reducer projection — re-folding the event log never touches
 it, because dead letters are the audit log of events that NEVER made it into
-the event log to be folded). The
+the event log to be folded), and `scheduled_tasks` (schema v68, fn-813 — one
+row per cron a Claude session armed via the `CronCreate` tool, keyed by the
+composite `(job_id, cron_id)`; folded from the `CronCreate` / `CronDelete`
+`PostToolUse` pair, a CronCreate upserts an `active` row (a re-created id
+resurrects) and a CronDelete flips it to `deleted`; carries the payload's
+pre-rendered `human_schedule`, the `recurring` / `durable` boolean lifts, and a
+deterministically truncated `prompt_summary`; served to the jobs TUI's
+expanded-row cron detail section). The
 surface is built so additional collections register without touching the
 wire protocol or the diff machinery. Page membership is frozen at query time,
 but each row's cells stream `patch` frames as the reducer folds new events.
@@ -815,7 +822,29 @@ event-log/reducer/hook touch. Run any of them with
   (fn-708 J7). The section sits BETWEEN the backend-coords pill and
   the sub-agent lines inside the collapse-controlled region; an empty
   / missing / malformed `monitors` blob produces no Monitors lines
-  and never crashes the render. Same sidecar / TUI / non-TTY snapshot
+  and never crashes the render. After the sub-agent lines a per-job
+  scheduled-tasks (cron) section (schema v68 / fn-813) lists the
+  session's live crons, bucketed per frame from the `scheduled_tasks`
+  collection's `state.rows` (NOT `byId` — the composite
+  `(job_id, cron_id)` identity would otherwise collapse a multi-cron
+  session to one row). Each cron renders on one line:
+
+  ```
+  [<marker>] <human_schedule-or-cron>: <prompt_summary>
+  ```
+
+  where `<marker>` is `recurring` / `one-shot`, upgraded client-side to
+  `spent` (a one-shot on an exited session) or `expired` (a recurring on
+  an exited session) — job state (`ended` / `killed`) is the liveness
+  authority for that marking, since the fold never flips a row's status.
+  `deleted` crons are filtered out; survivors sort by `ts` asc with a
+  `cron_id` tiebreak. The schedule falls back to the raw `cron` string
+  when `human_schedule` is empty, and the trailing `: <prompt>` is
+  omitted when the (untrusted, fold-truncated) `prompt_summary` is empty.
+  `durable` is stored but not rendered. The section sits AFTER the
+  sub-agents (established expanded-row order: backend pill → Monitors →
+  sub-agents → scheduled tasks); a job with no crons emits no lines.
+  Same sidecar / TUI / non-TTY snapshot
   (fn-772) / `--watch` contract as board (jobs is single-stream, so its
   latch is just the first frame) — including the SIGHUP / parent-death /
   TTY-loss self-exit (fn-723), so an orphaned jobs viewer exits within ~2s.
@@ -1840,6 +1869,23 @@ from-scratch re-fold reproduces it byte-identically. keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `67` (whitelist-only; keeper-py
 does not read the projection). Any future rewind-and-redrain that wipes the
 link projections MUST also `DELETE FROM commit_trailer_facts`.
+As of schema v68 (fn-813), the `scheduled_tasks` side table is the read path
+for the crons a Claude session arms via the `CronCreate` tool. It folds from
+the `CronCreate` / `CronDelete` `PostToolUse` pair gated strictly on
+`hook_event='PostToolUse'` (a `PostToolUseFailure` never mints a row): a
+CronCreate UPSERTs an `active` row keyed by the composite `(job_id, cron_id)`
+(`INSERT ... ON CONFLICT DO UPDATE`, never `OR REPLACE`/`OR IGNORE`, so a
+re-created id resurrects and a re-fold update is never silently dropped), and a
+CronDelete flips the matching row to `deleted` (an unmatched id is a no-op). The
+row stores the payload's pre-rendered `human_schedule` (no cron-string parsing),
+the `recurring` / `durable` INTEGER lifts of the payload booleans, and a
+deterministically truncated first-line `prompt_summary` (untrusted freeform
+text, kept opaque). `status` derives PURELY from event order — the fold never
+reads wall-clock — so a from-scratch re-fold reproduces identical rows; the
+spent/expired marking on the jobs-TUI render is the only place `Date.now()` /
+job-liveness drives display. `ScheduleWakeup` events are deliberately NOT folded
+(high-churn, consumed-on-fire). keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
+frozenset gains `68` (whitelist-only; keeper-py does not read the projection).
 As of schema v51 (fn-682), the new `jobs.monitors` JSON-array column is the
 live per-job view of the background shells a session is running — the
 plugin-armed chatctl bus, an agent-armed `keeper await`, a backgrounded

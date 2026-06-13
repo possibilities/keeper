@@ -83,6 +83,7 @@ import {
   pillOrEmpty,
   planVerbLabel,
   renderDeadLetterPill,
+  scheduledTaskLinesFor,
   sendReplayDeadLetterRpc,
   subagentLinesFor,
 } from "../src/board-render";
@@ -94,7 +95,7 @@ import {
 } from "../src/readiness-client";
 import { appendDiagnostic } from "../src/readiness-diagnostics";
 import { resolveSnapshotMode, SnapshotCliMisuseError } from "../src/snapshot";
-import type { SubagentInvocation } from "../src/types";
+import type { ScheduledTask, SubagentInvocation } from "../src/types";
 import { createViewShell, SELECTED_LINE_PREFIX } from "../src/view-shell";
 
 const HELP = `keeper jobs — live jobs list over the keeper subscribe server
@@ -410,6 +411,7 @@ export function selectableJobIds(jobs: Map<string, unknown>): string[] {
 export function renderJobsBody(
   jobs: Map<string, unknown>,
   subagentIndex: Map<string, SubagentInvocation[]>,
+  scheduledTaskIndex: Map<string, ScheduledTask[]>,
   render?: JobsRenderOptions,
 ): string {
   if (jobs.size === 0) {
@@ -503,6 +505,20 @@ export function renderJobsBody(
         }
         for (const sub of subagentLinesFor(subagentIndex, id, "  ")) {
           lines.push(decorateHeadingOrChild(sub));
+        }
+        // Schema v68 (fn-813): the per-job scheduled-tasks (cron) section.
+        // Established expanded-row order is backend pill -> monitors ->
+        // sub-agents -> scheduled tasks, so this sits LAST. `r.state` is the
+        // job-liveness authority for the spent/expired marking — a terminal
+        // (`ended` / `killed`) session can never fire its crons again.
+        const jobTerminal = r.state === "ended" || r.state === "killed";
+        for (const line of scheduledTaskLinesFor(
+          scheduledTaskIndex,
+          id,
+          "  ",
+          jobTerminal,
+        )) {
+          lines.push(decorateHeadingOrChild(line));
         }
       }
       blocks.push(lines.join("\n"));
@@ -856,22 +872,37 @@ export async function main(argv: string[]): Promise<void> {
       for (const arr of subagentIndex.values()) {
         arr.sort((a, b) => a.turn_seq - b.turn_seq);
       }
+      // Per-frame `job_id -> ScheduledTask[]` index from the collection's
+      // flat row stream (composite `(job_id, cron_id)` rows the wire pk would
+      // otherwise collapse). `scheduledTaskLinesFor` does the deleted-filter,
+      // ts/cron_id sort, and spent/expired marking, so this is a plain bucket.
+      const scheduledTaskIndex = new Map<string, ScheduledTask[]>();
+      for (const task of snap.scheduledTasks) {
+        const arr = scheduledTaskIndex.get(task.job_id);
+        if (arr === undefined) {
+          scheduledTaskIndex.set(task.job_id, [task]);
+        } else {
+          arr.push(task);
+        }
+      }
       const body = renderJobsBody(
         snap.jobs as unknown as Map<string, unknown>,
         subagentIndex,
+        scheduledTaskIndex,
         { insertMode, selectedIndex, expanded },
       );
       return {
         bodyLines: body === "" ? ["no jobs"] : body.split("\n"),
         // State JSON carries the inputs this view actually rendered
-        // against — jobs (the row source), subagentInvocations (the
-        // nested-line source), and the dead-letter backlog (the banner
-        // source). Epics + gitStatus are excluded — jobs.ts doesn't
+        // against — jobs (the row source), subagentInvocations + scheduledTasks
+        // (the expanded-row nested-line sources), and the dead-letter backlog
+        // (the banner source). Epics + gitStatus are excluded — jobs.ts doesn't
         // render them, so including them would bloat the sidecar
         // without aiding postmortem.
         stateJson: {
           jobs: Array.from(snap.jobs.values()),
           subagentInvocations: snap.subagentInvocations,
+          scheduledTasks: snap.scheduledTasks,
           deadLetters: snap.deadLetters,
         },
       };

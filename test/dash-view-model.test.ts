@@ -144,6 +144,7 @@ function makeSnap(
     epics: [],
     jobs: new Map(),
     subagentInvocations: [],
+    scheduledTasks: [],
     gitStatus: [],
     deadLetters: [],
     pendingDispatches: [],

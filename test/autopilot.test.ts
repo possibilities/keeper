@@ -153,6 +153,9 @@ function buildSnap(
     // fn-721: the 6th collection on `ReadinessClientSnapshot`. Empty default;
     // this CLI-path fixture doesn't exercise the launch-window occupant.
     pendingDispatches: [],
+    // fn-813: the scheduled-tasks (cron) collection. Empty default; this
+    // CLI-path fixture doesn't exercise the jobs-TUI cron detail section.
+    scheduledTasks: [],
     readiness,
   };
 }

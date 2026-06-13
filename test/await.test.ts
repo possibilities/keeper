@@ -129,11 +129,12 @@ function errorFrame(code: string, message: string, rev = 0): ServerFrame {
 }
 
 /**
- * Deliver a single readiness "all-eight-empty" frame batch under the
+ * Deliver a single readiness "all-nine-empty" frame batch under the
  * given idPrefix so the helper's first-paint gate clears. fn-721 added
  * `pending_dispatches` as the 6th gated collection; fn-770 added
  * `autopilot_state` + `armed_epics` as the 7th + 8th (the armed-mode
- * eligibility feeds the board/CLI readiness pass mirrors).
+ * eligibility feeds the board/CLI readiness pass mirrors); fn-813 added
+ * `scheduled_tasks` as the 9th (the jobs-TUI cron detail feed).
  */
 function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
   sock.deliver([
@@ -145,11 +146,12 @@ function deliverFiveEmpty(sock: MockSocket, idPrefix: string): void {
     resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
     resultFrame("autopilot_state", `${idPrefix}-autopilot-state`, []),
     resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
+    resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
   ]);
 }
 
 /**
- * Deliver an eight-collection frame where `epics` carries one row.
+ * Deliver a nine-collection frame where `epics` carries one row.
  */
 function deliverFiveWithEpic(
   sock: MockSocket,
@@ -165,11 +167,12 @@ function deliverFiveWithEpic(
     resultFrame("pending_dispatches", `${idPrefix}-pending-dispatches`, []),
     resultFrame("autopilot_state", `${idPrefix}-autopilot-state`, []),
     resultFrame("armed_epics", `${idPrefix}-armed-epics`, []),
+    resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, []),
   ]);
 }
 
 /**
- * Deliver an eight-collection readiness frame carrying explicit git + jobs
+ * Deliver a nine-collection readiness frame carrying explicit git + jobs
  * rows (for AND combos that read git/jobs off the readiness snapshot).
  */
 function deliverFiveWith(
@@ -202,6 +205,7 @@ function deliverFiveWith(
     ),
     resultFrame("autopilot_state", `${idPrefix}-autopilot-state`, [], rev),
     resultFrame("armed_epics", `${idPrefix}-armed-epics`, [], rev),
+    resultFrame("scheduled_tasks", `${idPrefix}-scheduled-tasks`, [], rev),
   ]);
 }
 
@@ -1573,11 +1577,11 @@ test("server-up: opens a readiness subscribe and fires met on first snapshot", a
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // server-up rides a full readiness subscribe (eight collections — fn-770
-  // added `autopilot_state` + `armed_epics`), so the initial frame batch is
-  // the eight queries — NOT a bare git/jobs single.
+  // server-up rides a full readiness subscribe (nine collections — fn-770
+  // added `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`),
+  // so the initial frame batch is the nine queries — NOT a bare git/jobs single.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
-  expect(outbound.length).toBe(8);
+  expect(outbound.length).toBe(9);
 
   // No terminal before the first snapshot — it blocks.
   expect(h.exitCode).toBeNull();
@@ -2279,9 +2283,10 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
   if (!sock) {
     throw new Error("mock socket never installed");
   }
-  // A planctl-bearing combo rides subscribeReadiness only — its eight
+  // A planctl-bearing combo rides subscribeReadiness only — its nine
   // collections (fn-721 added `pending_dispatches`; fn-770 added
-  // `autopilot_state` + `armed_epics`), NOT a separate dedicated git sub.
+  // `autopilot_state` + `armed_epics`; fn-813 added `scheduled_tasks`), NOT a
+  // separate dedicated git sub.
   const outbound = sock.takeOutbound() as Array<{ collection?: string }>;
   const cols = outbound.map((o) => o.collection).sort();
   expect(cols).toEqual([
@@ -2292,6 +2297,7 @@ test("AND complete + git-clean: rides readiness snapshot (one connection, no ext
     "git",
     "jobs",
     "pending_dispatches",
+    "scheduled_tasks",
     "subagent_invocations",
   ]);
 

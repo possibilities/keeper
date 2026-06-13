@@ -77,6 +77,7 @@ import type {
   Epic,
   GitStatus,
   Job,
+  ScheduledTask,
   SubagentInvocation,
 } from "./types";
 
@@ -99,6 +100,7 @@ const DEAD_LETTERS_PAGE_LIMIT = 0;
 const PENDING_DISPATCHES_PAGE_LIMIT = 0;
 const AUTOPILOT_STATE_PAGE_LIMIT = 0;
 const ARMED_EPICS_PAGE_LIMIT = 0;
+const SCHEDULED_TASKS_PAGE_LIMIT = 0;
 const POLL_MS = 500;
 const INITIAL_BACKOFF_MS = 250;
 const MAX_BACKOFF_MS = 5000;
@@ -150,6 +152,10 @@ export interface ReadinessClientSnapshot {
   readonly epics: Epic[];
   readonly jobs: Map<string, Job>;
   readonly subagentInvocations: SubagentInvocation[];
+  // The flat `ScheduledTask[]` projected from `state.rows` (the composite
+  // `(job_id, cron_id)` identity collapses under `byId`, so the snapshot
+  // carries every cron). The jobs TUI buckets it by `job_id` per frame.
+  readonly scheduledTasks: ScheduledTask[];
   readonly gitStatus: GitStatus[];
   readonly deadLetters: DeadLetter[];
   // The open `pending_dispatches` rows fed into `computeReadiness` so the
@@ -1329,6 +1335,7 @@ export function subscribeReadiness(
   const pendingDispatchesSubId = `${idPrefix}-pending-dispatches`;
   const autopilotStateSubId = `${idPrefix}-autopilot-state`;
   const armedEpicsSubId = `${idPrefix}-armed-epics`;
+  const scheduledTasksSubId = `${idPrefix}-scheduled-tasks`;
   const epics = makeState("epics", epicsSubId, "epic_id", {
     type: "query",
     collection: "epics",
@@ -1415,6 +1422,24 @@ export function subscribeReadiness(
     id: armedEpicsSubId,
     limit: ARMED_EPICS_PAGE_LIMIT,
   });
+  // `scheduled_tasks` — one row per cron a Claude session armed via
+  // `CronCreate`, served to the jobs TUI's expanded-row detail section. The
+  // wire pk is `job_id` (the descriptor's composite-pk workaround for the SQL
+  // identity `(job_id, cron_id)`), so the snapshot reads from `state.rows` via
+  // `projectRows` — `byId` would collapse every cron in one session to the
+  // last-write-wins row. An empty steady state still produces a `result` with
+  // `rows: []` so the first-paint gate clears.
+  const scheduledTasks = makeState(
+    "scheduled_tasks",
+    scheduledTasksSubId,
+    "job_id",
+    {
+      type: "query",
+      collection: "scheduled_tasks",
+      id: scheduledTasksSubId,
+      limit: SCHEDULED_TASKS_PAGE_LIMIT,
+    },
+  );
   const states: CollectionState[] = [
     epics,
     jobs,
@@ -1424,6 +1449,7 @@ export function subscribeReadiness(
     pendingDispatches,
     autopilotState,
     armedEpics,
+    scheduledTasks,
   ];
 
   function emitSnapshotIfReady(): void {
@@ -1439,7 +1465,10 @@ export function subscribeReadiness(
       // `armed_epics` still produce a `result` with `rows: []`.
       !pendingDispatches.gotResult ||
       !autopilotState.gotResult ||
-      !armedEpics.gotResult
+      !armedEpics.gotResult ||
+      // `scheduled_tasks` (fn-813) — the jobs-TUI cron detail feed. Empty
+      // produces a `result` with `rows: []`, so it still clears the gate.
+      !scheduledTasks.gotResult
     ) {
       return;
     }
@@ -1517,6 +1546,10 @@ export function subscribeReadiness(
       eligibleEpicIds,
     );
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
+    // Read from `state.rows` (not `byId.values()`) — the composite
+    // `(job_id, cron_id)` identity rides a single-column `job_id` wire pk, so
+    // `byId` would collapse a multi-cron session to one row.
+    const scheduledTasksTyped = projectRows<ScheduledTask>(scheduledTasks);
     // Exceptions from `onSnapshot` propagate (the "no in-process self-heal"
     // stance).
     onSnapshot({
@@ -1526,6 +1559,7 @@ export function subscribeReadiness(
       gitStatus: gitTyped,
       deadLetters: deadLettersTyped,
       pendingDispatches: pendingDispatchesTyped,
+      scheduledTasks: scheduledTasksTyped,
       readiness,
     });
   }
