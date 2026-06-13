@@ -60,5 +60,5 @@ scheduledTasks; empty collection still flips ready. `bun run test:full` mandator
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Wired the scheduled_tasks collection through the readiness client and render each job's live crons in the expanded job row after the sub-agent section (schedule, recurring/one-shot marker upgraded to spent/expired on exited sessions, prompt summary), reading state.rows so multi-cron sessions aren't collapsed. Added scheduledTaskLinesFor to board-render, tests in jobs/readiness-client, and README docs for the v68 side table + cron detail section.
 ## Evidence

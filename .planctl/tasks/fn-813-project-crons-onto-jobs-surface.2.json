@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Render crons in jobs TUI",
-  "updated_at": "2026-06-12T23:50:22.545000Z"
+  "updated_at": "2026-06-13T00:12:04.433000Z",
+  "worker_done_at": "2026-06-13T00:12:04.433000Z"
 }
