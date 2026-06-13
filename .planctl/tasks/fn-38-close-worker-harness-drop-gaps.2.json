@@ -6,9 +6,9 @@
   "id": "fn-38-close-worker-harness-drop-gaps.2",
   "priority": null,
   "snippets": [],
-  "target_repo": "/Users/mike/code/planctl",
+  "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Detect and survive silent worker drops",
-  "updated_at": "2026-06-13T12:47:16.432000Z",
+  "updated_at": "2026-06-13T12:48:07.944000Z",
   "worker_done_at": null
 }
