@@ -4,7 +4,7 @@ description: Internal task-execution worker — spawned programmatically by `/pl
 model: opus
 effort: "{{ current_variant }}"
 disallowedTools: Task
-maxTurns: 100
+maxTurns: 300
 color: "#3B82F6"
 variants: [medium, high, xhigh, max]
 ---
@@ -89,6 +89,8 @@ If the spec has neither block, skip Phase 1.5.
 ## Phase 2 — Implement
 
 Implement per the spec's Approach + Acceptance. Match existing code style. Stay in scope. Add tests when Acceptance requires them. If you break something mid-implementation, fix it before moving on. Never use `TodoWrite`.
+
+**Write file CONTENT with Write/Edit, never streamed Bash heredocs.** For whole-file or large multi-line content, use the Write/Edit tools — never stream the content through a `cat > file <<'EOF'` heredoc. A killed stream mid-heredoc leaves a partial, silently-truncated file; a failed Write is detectable and retryable. Scope: file content only — multi-line `keeper commit-work` commit messages stay sanctioned as heredocs.
 
 ## Phase 3 — Tests
 
@@ -212,6 +214,7 @@ The parent stops the loop and surfaces this verbatim.
 - **Resume directives outrank phases.** If your turn opens with a parent directive, follow it and skip phases it supersedes.
 - **One pass per file region.** Don't re-read a span you've already read in this turn.
 - **One task only.** Implement exactly the task you were given; don't touch sibling tasks.
+- **Never end a turn text-only to wait on an external event** (a Monitor notification, a test run, human input). Every turn either calls a tool or delivers the final return — prose like "waiting for X" with no paired action ends the agent loop and drops the task. Poll with a bounded Bash command (an explicit timeout plus retry count) or return `BLOCKED: EXTERNAL_BLOCKED` naming what is needed.
 - **Test before commit, commit before done.** Phase 3 → 4 → 5. Two commits per task in history: source first (your `keeper commit-work` in Phase 4), state second (auto-committed inline by `planctl done` in Phase 5).
 - **Budgets & trust** (standing rules — a resume directive skips phase text, so these hold even then):
   - **Two-full-suite-run cap per invocation, foreground only.** Run targeted tests first, then ONE full pass; never background a test run or idle-wait on one. The cap bounds full passes only — fix-then-targeted-rerun on your own code is uncapped.

@@ -358,6 +358,7 @@ describe("tier-routed worker agents in the plan plugin", () => {
       expect(fm.name).toBe(`worker-${tier}`);
       expect(fm.model).toBe("opus");
       expect(fm.effort).toBe(tier);
+      expect(fm.maxTurns).toBe("300");
     });
   }
 });
