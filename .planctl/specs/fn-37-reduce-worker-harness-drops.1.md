@@ -73,5 +73,5 @@ frontmatter pin — do not hunt for a behavioral test of the cap.
 - [ ] `bun test --timeout 30000` green; work committed via `keeper commit-work`
 
 ## Done summary
-
+Raised worker maxTurns 100->300 and added two drop-hardening rules (poll-don't-yield; Write/Edit over Bash heredocs for file content) to the worker template; pinned maxTurns:300 in the per-tier rendered-frontmatter test. Rendered all four worker agents; full bun test gate green.
 ## Evidence
