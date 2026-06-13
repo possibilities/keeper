@@ -31,7 +31,7 @@ import {
 } from "./protocol";
 import type { Verdict } from "./readiness";
 import { collapseSubagentsByName } from "./readiness-client";
-import type { SubagentInvocation } from "./types";
+import type { ScheduledTask, SubagentInvocation } from "./types";
 
 // ---------------------------------------------------------------------------
 // Iconized pill core (fn-713 follow-on)
@@ -701,6 +701,67 @@ export function subagentLinesFor(
       typeof statusRaw === "string" && statusRaw !== "" ? statusRaw : "ok";
     const statusSeg = ` ${pill(status)}`;
     return `${indent}${label}${statusSeg}`;
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Scheduled-task (cron) line builder
+// ---------------------------------------------------------------------------
+
+/**
+ * Per-job scheduled-task (cron) lines for the expanded job row. Reads from a
+ * per-frame `scheduledTaskIndex` (the `job_id -> ScheduledTask[]` map the
+ * caller builds for each emit, populated from `snapshot.scheduledTasks`, i.e.
+ * the collection's `state.rows` — NOT `byId`, which collapses the composite
+ * `(job_id, cron_id)` identity to one row per job). `deleted` rows are filtered
+ * out (a CronDelete flipped them); the survivors sort by `ts` asc with a
+ * `cron_id` tiebreak so the order is stable across re-paints.
+ *
+ * Each line carries `[<marker>] <schedule>: <prompt>` where:
+ *   - `<marker>` is `recurring` or `one-shot`, upgraded to `spent` (a one-shot
+ *     on a terminal job) or `expired` (a recurring on a terminal job). Job
+ *     state is the authority here — the projection never flips a row's status;
+ *     the renderer marks crons whose arming session has exited
+ *     (`ended` / `killed`). This is the one place wall-clock / job-liveness is
+ *     allowed to drive display, per the fold/render split.
+ *   - `<schedule>` is `human_schedule` (the payload's pre-rendered form),
+ *     falling back to the raw `cron` string when empty.
+ *   - `<prompt>` is `prompt_summary` (already first-line + length capped by the
+ *     fold; untrusted freeform text, rendered as plain text). Omitted when
+ *     empty so a promptless cron stays one clean line.
+ *
+ * `durable` is stored on the row but deliberately not rendered. `indent` is
+ * supplied per caller (matching `subagentLinesFor`). Returns `[]` for jobs with
+ * no crons so callers can spread unconditionally. Exported for the render test.
+ */
+export function scheduledTaskLinesFor(
+  scheduledTaskIndex: Map<string, ScheduledTask[]>,
+  jobId: string,
+  indent: string,
+  jobTerminal: boolean,
+): string[] {
+  const hits = scheduledTaskIndex.get(jobId);
+  if (hits === undefined || hits.length === 0) {
+    return [];
+  }
+  const live = hits
+    .filter((t) => t.status !== "deleted")
+    .sort((a, b) => a.ts - b.ts || a.cron_id.localeCompare(b.cron_id));
+  return live.map((t) => {
+    const recurring = t.recurring === 1;
+    // Job state is the authority: a cron on an exited session can never fire
+    // again, so a one-shot is `spent` and a recurring is `expired`. A live job
+    // keeps the plain `recurring` / `one-shot` marker.
+    const marker = jobTerminal
+      ? recurring
+        ? "expired"
+        : "spent"
+      : recurring
+        ? "recurring"
+        : "one-shot";
+    const schedule = t.human_schedule !== "" ? t.human_schedule : t.cron;
+    const promptSeg = t.prompt_summary !== "" ? `: ${t.prompt_summary}` : "";
+    return `${indent}${pill(marker)} ${schedule}${promptSeg}`;
   });
 }
 
