@@ -7,7 +7,7 @@
     "fn-37-reduce-worker-harness-drops"
   ],
   "id": "fn-38-close-worker-harness-drop-gaps",
-  "last_validated_at": "2026-06-13T13:11:26.907000Z",
+  "last_validated_at": null,
   "primary_repo": "/Users/mike/code/planctl",
   "queue_jump": false,
   "snippets": [],
@@ -17,5 +17,5 @@
     "/Users/mike/code/keeper",
     "/Users/mike/code/planctl"
   ],
-  "updated_at": "2026-06-13T13:11:26.888000Z"
+  "updated_at": "2026-06-14T21:57:21.645000Z"
 }
