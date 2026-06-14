@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Attribute mid-worker window teardowns",
-  "updated_at": "2026-06-13T13:10:51.781000Z"
+  "updated_at": "2026-06-14T22:35:49.366000Z",
+  "worker_done_at": "2026-06-14T22:35:49.366000Z"
 }
