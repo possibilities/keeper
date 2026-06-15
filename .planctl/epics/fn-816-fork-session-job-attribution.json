@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-15T13:51:16.362000Z",
   "created_at": "2026-06-15T13:40:22.112000Z",
   "depends_on_epics": [],
   "id": "fn-816-fork-session-job-attribution",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fork-session job attribution",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-15T13:40:22.112000Z"
+  "updated_at": "2026-06-15T13:51:16.362000Z"
 }
