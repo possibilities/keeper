@@ -67,5 +67,5 @@ Gate: `bun test` (fast) then `bun run test:full` (mandatory — reducer/fold pat
 - [ ] `bun test` green; `bun run test:full` green before landing.
 
 ## Done summary
-
+Mint a standalone jobs row for a forked session on its first pid-bearing UserPromptSubmit (ON CONFLICT DO NOTHING, pid != null guard), so claude --fork-session sessions become normal jobs visible to the board and restore.json; a later real SessionStart hydrates via ON CONFLICT without discharging pending_dispatches. Corrected the stale single-mint invariant prose in reducer + exec-backend docs.
 ## Evidence
