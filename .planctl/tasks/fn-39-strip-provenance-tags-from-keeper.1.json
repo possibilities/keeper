@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/planctl",
   "tier": "medium",
   "title": "Strip provenance comment tombstones",
-  "updated_at": "2026-06-15T07:12:22.273000Z"
+  "updated_at": "2026-06-15T07:14:46.054000Z",
+  "worker_done_at": "2026-06-15T07:14:46.054000Z"
 }

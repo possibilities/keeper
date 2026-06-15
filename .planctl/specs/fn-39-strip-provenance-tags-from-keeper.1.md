@@ -25,5 +25,5 @@ Apply keeper's own WHY-only comment discipline. No code logic changes.
 - [ ] keeper test suite stays green.
 
 ## Done summary
-
+Stripped (fn-38.2) task-id tags and ea343ed2/cfcbc8ec commit-hash tombstones from keeper src/reducer.ts comments and test/silent-stream-cut.test.ts docstrings/test names, preserving WHY-prose and behavioral descriptions. No logic changes; keeper suite green.
 ## Evidence
