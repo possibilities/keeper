@@ -37,5 +37,5 @@ Via `test/_main-harness.ts`: (a) `env` with `TMUX`+`TMUX_PANE` → after `main()
 - [ ] end-to-end after both deploy: a new claudewrap session in tmux renders truecolor (`tmux capture-pane -e` shows `48;2`, not `48;5;37`); `/rename` still renames the tmux window; OSC 52 copy reaches the clipboard
 
 ## Done summary
-
+claudewrap strips TMUX/TMUX_PANE from the Claude child env under $TMUX (after copying the pane id to KEEPER_TMUX_PANE) so the ink2 renderer emits truecolor while keeper's hook keeps the pane id for window renaming. Added harness tests asserting the deps.env mutation, CLAUDE.md env-strip section; bun test/lint/typecheck green.
 ## Evidence
