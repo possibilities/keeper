@@ -161,8 +161,16 @@ claude binary and suppresses its cwd confirmation so dispatch never hangs):
 ```
 launch(argv with --name work::fn-1-x.1)
    → SessionStart hook event
-   → jobs projection edge        ← the only durable spawn signal
+   → jobs projection edge        ← the durable dispatch-correlation signal
 ```
+
+A `jobs` row is minted by ONE of two paths: an autopilot/normal session's
+**SessionStart** (the dispatch-correlation edge above), or — for a
+`claude --fork-session` session, which gets a fresh session id and emits NO
+SessionStart of its own — the **first pid-bearing `UserPromptSubmit`** (the
+fork-attribution seed in `projectJobsRow`). SessionStart remains the only
+signal the reconciler correlates a dispatch against; the fork seed produces a
+standalone job with no dispatch lineage.
 
 The launch → SessionStart blind window (the worker has launched but its
 `SessionStart` has not yet folded, so it owns no `jobs` row) is tracked

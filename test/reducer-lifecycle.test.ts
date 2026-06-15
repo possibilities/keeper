@@ -480,6 +480,205 @@ test("fn-784 re-fold determinism: active_since (stamped + restarted + NULL) re-f
 });
 
 // ---------------------------------------------------------------------------
+// fn-816 — fork-session job attribution. A `claude --fork-session` session
+// gets a fresh session id that NEVER emits a SessionStart, so the first
+// pid-bearing UserPromptSubmit must mint a standalone jobs row (the other
+// fold arms are all UPDATE … WHERE job_id, silent no-ops without it).
+// ---------------------------------------------------------------------------
+
+test("fn-816 fork happy path: first pid-bearing UserPromptSubmit with no SessionStart mints a working job", () => {
+  // Fork-shaped stream: a daemon-synthesized TranscriptTitle (NULL pid) lands
+  // first and mints NOTHING, then the real first prompt (pid + cwd + backend
+  // coords + a payload session_title) seeds the row and flips it to working.
+  insertEvent({
+    hook_event: "TranscriptTitle",
+    session_id: "fork-a",
+    pid: null,
+    data: JSON.stringify({ session_title: "transcript-title" }),
+  });
+  const upsId = insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "fork-a",
+    pid: 9001,
+    cwd: "/tmp/fork",
+    ts: 7000,
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "tsess",
+    backend_exec_pane_id: "%7",
+    data: JSON.stringify({ session_title: "fork-prompt-title" }),
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  const job = getJob("fork-a");
+  expect(job).not.toBeNull();
+  expect(job?.state).toBe("working");
+  // created_at and active_since both stamp the UPS ts — the seed lands
+  // created_at=ts and the immediate UPDATE stamps active_since=ts on the
+  // 'stopped' → 'working' rising edge (identical to a normal first prompt).
+  expect(job?.created_at).toBe(7000);
+  expect(job?.active_since).toBe(7000);
+  expect(job?.pid).toBe(9001);
+  expect(job?.cwd).toBe("/tmp/fork");
+  expect(job?.last_event_id).toBe(upsId);
+  // start_time stays NULL (UPS carries none) — the loose-pid-only match that
+  // keeps a seeded fork row out of the pidless reap.
+  expect(job?.start_time).toBeNull();
+  // The earlier TranscriptTitle title rule was a no-op (no row yet); the
+  // post-switch title rule on the minting UPS lands the payload title.
+  expect(job?.title).toBe("fork-prompt-title");
+
+  // Backend coords landed on the now-present row (REQUIRED for restore
+  // visibility).
+  const coords = db
+    .query(
+      "SELECT backend_exec_type, backend_exec_session_id, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+    )
+    .get("fork-a") as {
+    backend_exec_type: string | null;
+    backend_exec_session_id: string | null;
+    backend_exec_pane_id: string | null;
+  };
+  expect(coords.backend_exec_type).toBe("tmux");
+  expect(coords.backend_exec_session_id).toBe("tsess");
+  expect(coords.backend_exec_pane_id).toBe("%7");
+
+  // Plan-fan-in columns stay NULL — a fork seed is a standalone job with no
+  // dispatch lineage.
+  const plan = db
+    .query("SELECT plan_verb, plan_ref FROM jobs WHERE job_id = ?")
+    .get("fork-a") as { plan_verb: string | null; plan_ref: string | null };
+  expect(plan.plan_verb).toBeNull();
+  expect(plan.plan_ref).toBeNull();
+});
+
+test("fn-816 re-fold determinism: a fork-shaped (UPS-only) stream re-folds byte-identical", () => {
+  // Keystone assertion: the seed reads ONLY event fields, so a from-scratch
+  // re-fold reproduces the minted row byte-for-byte. A leak of wall-clock /
+  // env / fs / liveness into the seed would diverge here.
+  insertEvent({
+    hook_event: "TranscriptTitle",
+    session_id: "fork-rf",
+    pid: null,
+    data: JSON.stringify({ session_title: "tt" }),
+  });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "fork-rf",
+    pid: 9100,
+    cwd: "/tmp/fork-rf",
+    ts: 7100,
+    backend_exec_type: "tmux",
+    backend_exec_session_id: "rfsess",
+    backend_exec_pane_id: "%9",
+    data: JSON.stringify({ session_title: "rf-title" }),
+  });
+  insertEvent({ hook_event: "Stop", session_id: "fork-rf", ts: 7200 });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  const cursor1 = getCursor();
+  const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  expect(drainAll()).toBeGreaterThan(0);
+
+  expect(getCursor()).toBe(cursor1);
+  expect(
+    JSON.stringify(db.query("SELECT * FROM jobs ORDER BY job_id").all()),
+  ).toBe(JSON.stringify(jobs1));
+});
+
+test("fn-816 a NULL-pid UserPromptSubmit mints NO row (guard skip)", () => {
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "fork-nopid",
+    pid: null,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(getJob("fork-nopid")).toBeNull();
+});
+
+test("fn-816 a killed-task-notification UserPromptSubmit mints NO row, and a TranscriptTitle-only stream mints NO row", () => {
+  // The killed-task-notification early-break fires BEFORE the seed, so no row
+  // is minted even with a real pid.
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "fork-killed",
+    pid: 9200,
+    data: JSON.stringify({
+      prompt: "<task-notification><status>killed</status></task-notification>",
+    }),
+  });
+  // A NULL-pid TranscriptTitle on its own never mints (the title rule's SELECT
+  // finds no row).
+  insertEvent({
+    hook_event: "TranscriptTitle",
+    session_id: "fork-tt-only",
+    pid: null,
+    data: JSON.stringify({ session_title: "lonely" }),
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+  expect(getJob("fork-killed")).toBeNull();
+  expect(getJob("fork-tt-only")).toBeNull();
+});
+
+test("fn-816 a later real SessionStart hydrates a UPS-minted fork via ON CONFLICT without discharging pending_dispatches", () => {
+  // Seed a pending dispatch keyed on a plan ref. The fork's first prompt mints
+  // a standalone row; a later real SessionStart for the SAME id (carrying pid /
+  // start_time / config_dir and a work-verb spawn name) hydrates the row via
+  // ON CONFLICT — but because the row already existed, this is NOT a spawn-
+  // INSERT, so the pending dispatch must NOT discharge.
+  db.run(
+    "INSERT INTO pending_dispatches (verb, id, dir, dispatched_at, last_event_id) VALUES (?, ?, ?, ?, ?)",
+    ["work", "fn-99-x.1", "/tmp/fork-hyd", 100, 1],
+  );
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "fork-hyd",
+    pid: 9300,
+    cwd: "/tmp/fork-hyd",
+    ts: 7300,
+  });
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "fork-hyd",
+    pid: 9301,
+    start_time: "111",
+    config_dir: "/Users/x/.claude",
+    spawn_name: "work::fn-99-x.1",
+    ts: 7400,
+  });
+  expect(drainAll()).toBeGreaterThan(0);
+
+  const row = db
+    .query(
+      "SELECT pid, start_time, config_dir, plan_verb, plan_ref FROM jobs WHERE job_id = ?",
+    )
+    .get("fork-hyd") as {
+    pid: number;
+    start_time: string | null;
+    config_dir: string | null;
+    plan_verb: string | null;
+    plan_ref: string | null;
+  };
+  // ON CONFLICT COALESCEd in the SessionStart's pid / start_time / config_dir.
+  expect(row.pid).toBe(9301);
+  expect(row.start_time).toBe("111");
+  expect(row.config_dir).toBe("/Users/x/.claude");
+  // The ON CONFLICT UPDATE branch does NOT touch plan_verb / plan_ref (set-once
+  // on the spawn INSERT only — and this was a fork seed, not a spawn INSERT).
+  expect(row.plan_verb).toBeNull();
+  expect(row.plan_ref).toBeNull();
+
+  // Discharge-on-bind fires ONLY on a spawn INSERT; the row pre-existed (fork
+  // seed), so the pending dispatch survives.
+  const pending = db
+    .query("SELECT 1 AS one FROM pending_dispatches WHERE verb = ? AND id = ?")
+    .get("work", "fn-99-x.1");
+  expect(pending).not.toBeNull();
+});
+
+// ---------------------------------------------------------------------------
 // Schema-v28 GitSnapshot → jobs fan-out — fn-620 mechanical git-cleanliness gate
 // ---------------------------------------------------------------------------
 

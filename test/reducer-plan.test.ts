@@ -877,8 +877,11 @@ test("unchanged title fires no write (last_event_id unchanged by the title rule)
 });
 
 test("title-bearing event for a non-existent job is a no-op", () => {
-  // No SessionStart for "ghost" — the title rule's SELECT finds no row.
-  const id = titleEvent("foo", "ghost");
+  // No SessionStart for "ghost" — the title rule's SELECT finds no row. Use a
+  // TranscriptTitle (NULL pid, daemon-synthesized) rather than a UserPromptSubmit:
+  // fn-816's fork-attribution seed mints a row on a PID-BEARING UPS, so a
+  // pid-bearing title event would no longer exercise the title-rule-no-op path.
+  const id = transcriptTitleEvent("foo", "ghost");
   drainAll();
   expect(getJob("ghost")).toBeNull();
   expect(getCursor()).toBe(id);

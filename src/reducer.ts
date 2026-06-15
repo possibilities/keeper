@@ -6243,6 +6243,36 @@ function projectJobsRow(db: Database, event: Event): void {
       if (isKilledTaskNotification(extractPrompt(event))) {
         break;
       }
+      // Fork attribution: a `claude --fork-session` session gets a NEW session
+      // id that NEVER emits a SessionStart (the SessionStart fired under the
+      // PARENT id; every subsequent event carries the fork's new id). Without a
+      // mint the fold's other arms — all `UPDATE … WHERE job_id = ?` — silently
+      // no-op, so the fork is invisible to the board and `restore.json`. Seed a
+      // minimal STANDALONE row here so the fork becomes a normal job: the
+      // `UPDATE` directly below immediately flips state 'stopped' → 'working'
+      // and stamps `active_since = ts` (the `CASE WHEN state != 'working'` arm),
+      // identical to a normal session's first-prompt transition; the
+      // backend-coords fold and post-switch title rule then enrich the now-
+      // present row.
+      //
+      // `ON CONFLICT(job_id) DO NOTHING` (not `INSERT OR IGNORE`): skips only
+      // the PK conflict — when a real SessionStart later arrives it hydrates
+      // pid/start_time/config_dir — while still surfacing any real NOT NULL /
+      // CHECK violation. Guarded by `event.pid != null`: a NULL-pid event
+      // (notably the daemon-synthesized `TranscriptTitle`) would mint an
+      // unwatchable ghost row the reapers immediately kill; a real-pid +
+      // NULL-start_time row is the existing loose-pid-only match the seed
+      // sweep and exit watcher already leave alone. Self-contained upsert —
+      // no pre-SELECT of projection state — and reads ONLY event fields, so a
+      // from-scratch re-fold reproduces the minted row byte-identically.
+      if (event.pid != null) {
+        db.run(
+          `INSERT INTO jobs (job_id, created_at, cwd, pid, last_event_id, updated_at)
+             VALUES (?, ?, ?, ?, ?, ?)
+           ON CONFLICT(job_id) DO NOTHING`,
+          [jobId, ts, event.cwd, event.pid, event.id, ts],
+        );
+      }
       // A prompt means the session is ALIVE — set 'working' unconditionally (no
       // terminal guard). Also a re-open path: a session can resume straight into
       // a prompt with no SessionStart, and a spurious mid-session SessionEnd is
@@ -6754,8 +6784,10 @@ function projectJobsRow(db: Database, event: Event): void {
   // `backend_exec_type != null` (the all-NULL non-pane case is a fast no-op); a
   // partial capture still COALESCEs so a NULL field preserves the prior value.
   // Reads only `event.backend_exec_*` + the persisted cell — re-fold
-  // deterministic. An UPDATE against a missing jobs row is a no-op (SessionStart,
-  // the only mint, fires first per session).
+  // deterministic. An UPDATE against a missing jobs row is a no-op — a row is
+  // minted first per session by either a SessionStart or the first pid-bearing
+  // UserPromptSubmit (the fork-attribution seed), so a live session always has
+  // one by the time backend coords arrive.
   if (event.backend_exec_type != null) {
     db.run(
       `UPDATE jobs SET
