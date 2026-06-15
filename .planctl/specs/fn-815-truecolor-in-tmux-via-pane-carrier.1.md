@@ -43,5 +43,5 @@ Extend the coord block in test/events-writer.test.ts (runs under `bun run test:f
 - [ ] `bun run test:full` (incl. the new coord cases), `bun lint`, `bun typecheck`, `bun run assert-comment-only` all green
 
 ## Done summary
-
+Added the KEEPER_TMUX_PANE carrier fallback: exec-backend's ExecBackendEnvMeta gains paneIdCarrierEnvVar (defined once with a cross-ref drift-guard comment to claudewrap), and the hook's backendExecCoordsFromEnv stamps coord-identical tmux rows from the carrier when native TMUX is stripped for truecolor, collapsing empty/absent carriers to all-NULL. Docs (CLAUDE.md scraping scope, exec-backend.md, README two-step env-read) updated.
 ## Evidence
