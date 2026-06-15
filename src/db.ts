@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 68;
+export const SCHEMA_VERSION = 69;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -501,6 +501,7 @@ CREATE TABLE IF NOT EXISTS subagent_invocations (
     prompt_chars INTEGER NOT NULL DEFAULT 0,
     status TEXT NOT NULL DEFAULT 'running',
     duration_ms INTEGER,
+    last_disposition TEXT,
     last_event_id INTEGER NOT NULL,
     updated_at REAL NOT NULL,
     PRIMARY KEY (job_id, agent_id, turn_seq)
@@ -3464,6 +3465,21 @@ function migrate(db: Database): void {
           );
         }
       }
+
+      // v68→v69: add `subagent_invocations.last_disposition` — the
+      // transcript-derived terminal disposition of a subagent's most recent
+      // assistant turn ('cut' = stream interrupted mid-turn, stop_reason
+      // tool_use/null with no terminal text; 'clean' = end_turn). Fed by the
+      // synthetic `SubagentTurn` event the transcript worker mints; read by the
+      // SubagentStop fold to recognize SILENT_STREAM_CUT and drive auto-resume.
+      // NO cursor rewind: historical events carry no `SubagentTurn`, so a
+      // from-scratch re-fold reproduces the column's NULL zero-event default.
+      addColumnIfMissing(
+        db,
+        "subagent_invocations",
+        "last_disposition",
+        "TEXT",
+      );
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

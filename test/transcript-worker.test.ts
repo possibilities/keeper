@@ -39,12 +39,17 @@ import {
   decideTranscriptResubscribe,
   matchApiError,
   matchAskUserQuestion,
+  matchSubagentTurn,
   scanJobsForTitles,
   seedFromDb,
   TRANSCRIPT_REARM_FLAP_GUARD_MS,
   TranscriptLineStream,
 } from "../src/transcript-worker";
-import type { ApiErrorKind, InputRequestKind } from "../src/types";
+import type {
+  ApiErrorKind,
+  InputRequestKind,
+  SubagentDisposition,
+} from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -1296,6 +1301,150 @@ test("disjointness corpus: the three pre-filter needles never co-fire on the sam
       hits: c.expect,
     });
   }
+});
+
+// ---------------------------------------------------------------------------
+// fn-38.2 — matchSubagentTurn: the SILENT_STREAM_CUT signature parser. A
+// subagent sidecar assistant turn carries `agentId` + `sessionId` + a
+// `message.stop_reason`; the matcher classifies the cut ('tool_use'/null) vs
+// clean (anything else) disposition.
+// ---------------------------------------------------------------------------
+
+/** Build a subagent assistant-turn JSONL line (the `<sid>/subagents/…` shape). */
+function subagentTurnLine(
+  sessionId: string,
+  agentId: string,
+  stopReason: string | null,
+  // Omit the key entirely to model a non-settled frame.
+  opts: { omitStopReason?: boolean } = {},
+): string {
+  const message: Record<string, unknown> = {
+    role: "assistant",
+    content: [{ type: "text", text: "working" }],
+  };
+  if (!opts.omitStopReason) {
+    message.stop_reason = stopReason;
+  }
+  return JSON.stringify({
+    type: "assistant",
+    isSidechain: true,
+    agentId,
+    sessionId,
+    message,
+  });
+}
+
+test("matchSubagentTurn: stop_reason='tool_use' is a cut (SILENT_STREAM_CUT signature)", () => {
+  const m = matchSubagentTurn(
+    JSON.parse(subagentTurnLine("sess", "agent-abc", "tool_use")),
+  );
+  expect(m).toEqual({
+    sessionId: "sess",
+    agentId: "agent-abc",
+    disposition: "cut",
+  });
+});
+
+test("matchSubagentTurn: stop_reason=null (interrupted stream) is a cut", () => {
+  const m = matchSubagentTurn(
+    JSON.parse(subagentTurnLine("sess", "agent-abc", null)),
+  );
+  expect(m?.disposition).toBe("cut");
+});
+
+test("matchSubagentTurn: stop_reason='end_turn' is clean (negative control)", () => {
+  const m = matchSubagentTurn(
+    JSON.parse(subagentTurnLine("sess", "agent-abc", "end_turn")),
+  );
+  expect(m).toEqual({
+    sessionId: "sess",
+    agentId: "agent-abc",
+    disposition: "clean",
+  });
+});
+
+test("matchSubagentTurn: other terminal stop_reasons fold to clean (never a false cut)", () => {
+  for (const sr of ["max_tokens", "stop_sequence", "pause_turn"]) {
+    const m = matchSubagentTurn(
+      JSON.parse(subagentTurnLine("sess", "agent-abc", sr)),
+    );
+    expect({ sr, disposition: m?.disposition }).toEqual({
+      sr,
+      disposition: "clean" as SubagentDisposition,
+    });
+  }
+});
+
+test("matchSubagentTurn: a parent assistant turn (no agentId) is not a subagent turn", () => {
+  const parentLine = JSON.stringify({
+    type: "assistant",
+    sessionId: "sess",
+    message: { role: "assistant", stop_reason: "tool_use", content: [] },
+  });
+  expect(matchSubagentTurn(JSON.parse(parentLine))).toBeNull();
+});
+
+test("matchSubagentTurn: a frame missing stop_reason entirely is skipped", () => {
+  const m = matchSubagentTurn(
+    JSON.parse(
+      subagentTurnLine("sess", "agent-abc", null, { omitStopReason: true }),
+    ),
+  );
+  expect(m).toBeNull();
+});
+
+test("matchSubagentTurn: a user/tool_result line (not an assistant turn) is skipped", () => {
+  const userLine = JSON.stringify({
+    type: "user",
+    isSidechain: true,
+    agentId: "agent-abc",
+    sessionId: "sess",
+    message: { role: "user", content: [{ type: "tool_result" }] },
+  });
+  expect(matchSubagentTurn(JSON.parse(userLine))).toBeNull();
+});
+
+test('subagent-turn needle: the `"agentId":` pre-filter pins to subagent lines only', () => {
+  // A subagent assistant turn carries `"agentId":`; a parent assistant turn and
+  // a vanilla parent tool_use do not — so the independent 4th needle never
+  // co-fires on parent-transcript lines.
+  const subLine = subagentTurnLine("sess", "agent-abc", "tool_use");
+  const parentTitle = titleLine("sess", "hi");
+  const parentToolUse = JSON.stringify({
+    type: "assistant",
+    sessionId: "sess",
+    message: { content: [{ type: "tool_use", name: "Bash" }] },
+  });
+  expect(subLine.includes('"agentId":')).toBe(true);
+  expect(parentTitle.includes('"agentId":')).toBe(false);
+  expect(parentToolUse.includes('"agentId":')).toBe(false);
+});
+
+test("TranscriptLineStream routes a subagent cut turn to onSubagentTurn", () => {
+  const path = join(tmpDir, "agent-abc.jsonl");
+  writeFileSync(path, "");
+  const seen: Array<{
+    sessionId: string;
+    agentId: string;
+    disposition: SubagentDisposition;
+  }> = [];
+  const stream = new TranscriptLineStream(
+    () => {},
+    () => {},
+    () => {},
+    () => {},
+    (sessionId, agentId, disposition) =>
+      seen.push({ sessionId, agentId, disposition }),
+  );
+  stream.register(path);
+  appendFileSync(
+    path,
+    `${subagentTurnLine("sess", "agent-abc", "tool_use")}\n`,
+  );
+  stream.onChange(path);
+  expect(seen).toEqual([
+    { sessionId: "sess", agentId: "agent-abc", disposition: "cut" },
+  ]);
 });
 
 // ---------------------------------------------------------------------------

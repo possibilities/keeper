@@ -108,6 +108,7 @@ import type {
 import type {
   ApiErrorMessage,
   InputRequestMessage,
+  SubagentTurnMessage,
   TranscriptTitleMessage,
   TranscriptWorkerData,
 } from "./transcript-worker";
@@ -1888,6 +1889,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         | TranscriptTitleMessage
         | ApiErrorMessage
         | InputRequestMessage
+        | SubagentTurnMessage
         | BackstopMessage
         | undefined
       >,
@@ -2006,6 +2008,53 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           $agent_type: null,
           $stop_hook_active: null,
           $data: JSON.stringify({ kind: msg.requestKind }),
+          $subagent_agent_id: null,
+          $spawn_name: null,
+          $start_time: null,
+          $slash_command: null,
+          $skill_name: null,
+          $planctl_op: null,
+          $planctl_target: null,
+          $planctl_epic_id: null,
+          $planctl_task_id: null,
+          $planctl_subject_present: null,
+          $config_dir: null,
+          $planctl_queue_jump: null,
+          $bash_mutation_kind: null,
+          $bash_mutation_targets: null,
+          $planctl_files: null,
+          $backend_exec_type: null,
+          $backend_exec_session_id: null,
+          $backend_exec_pane_id: null,
+        });
+        wakePending = true;
+        pumpWakes();
+        return;
+      }
+      if (msg.kind === "subagent-turn") {
+        // Synthetic `SubagentTurn` event minted from the transcript-worker
+        // signal — the terminal disposition of a subagent's most recent
+        // assistant turn. The reducer's `SubagentTurn` arm stamps it onto the
+        // `subagent_invocations` row's `last_disposition`; the SubagentStop fold
+        // reads it to recognize a SILENT_STREAM_CUT (`disposition='cut'`) and
+        // flip the still-`working` parent job to `stopped`, driving auto-resume
+        // faster than the dead-pid reprobe. The subagent's `agentId` rides in
+        // `agent_id` (the field SubagentStart/Stop fold on); the disposition in
+        // `data.disposition`; everything else is NULL (synthetic).
+        stmts.insertEvent.run({
+          $ts: Date.now() / 1000,
+          $session_id: msg.sessionId,
+          $pid: null,
+          $hook_event: "SubagentTurn",
+          $event_type: "subagent_turn",
+          $tool_name: null,
+          $matcher: null,
+          $cwd: null,
+          $permission_mode: null,
+          $agent_id: msg.agentId,
+          $agent_type: null,
+          $stop_hook_active: null,
+          $data: JSON.stringify({ disposition: msg.disposition }),
           $subagent_agent_id: null,
           $spawn_name: null,
           $start_time: null,

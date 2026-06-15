@@ -590,9 +590,30 @@ export interface SubagentInvocation {
   prompt_chars: number;
   status: "running" | "ok" | "failed" | "unknown" | "superseded";
   duration_ms: number | null;
+  /**
+   * Terminal disposition of the subagent's most recent assistant turn, derived
+   * from the subagent transcript by the transcript worker. `'cut'` = the stream
+   * was interrupted mid-turn (last assistant `stop_reason` was `tool_use` or
+   * `null` with no terminal text — the SILENT_STREAM_CUT signature); `'clean'`
+   * = the turn ended on `end_turn`. NULL until the first `SubagentTurn`
+   * synthetic event folds (the zero-event default). Read by the SubagentStop
+   * fold to recognize a silent stream cut and drive auto-resume. Optional +
+   * absent on the wire (the `subagent_invocations` collection descriptor
+   * narrows the served columns to what consumers read; this is a fold-only
+   * fact), so readers treat absent ≡ NULL.
+   */
+  last_disposition?: SubagentDisposition | null;
   last_event_id: number;
   updated_at: number;
 }
+
+/**
+ * The transcript-derived disposition of a subagent assistant turn. `'cut'` is
+ * the SILENT_STREAM_CUT signature (interrupted stream); `'clean'` is a normal
+ * `end_turn` close. Carried by the synthetic `SubagentTurn` event and stored on
+ * {@link SubagentInvocation.last_disposition}.
+ */
+export type SubagentDisposition = "cut" | "clean";
 
 /**
  * One row of the `scheduled_tasks` peer-table projection, folded from the

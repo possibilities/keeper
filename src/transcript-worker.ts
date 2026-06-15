@@ -33,7 +33,11 @@ import {
 } from "./backstop-telemetry";
 import { openDb } from "./db";
 import { isDropError, RescanScheduler } from "./rescan";
-import type { ApiErrorKind, InputRequestKind } from "./types";
+import type {
+  ApiErrorKind,
+  InputRequestKind,
+  SubagentDisposition,
+} from "./types";
 import { API_ERROR_KINDS } from "./types";
 
 /**
@@ -95,6 +99,25 @@ export interface InputRequestMessage {
   sessionId: string;
   /** Canonical {@link InputRequestKind} value matched by the transcript matcher. */
   requestKind: InputRequestKind;
+}
+
+/**
+ * Message posted to the parent on each subagent assistant turn observed in a
+ * subagent sidecar transcript (`<sid>/subagents/agent-<agentId>.jsonl`). Carries
+ * the turn's terminal {@link SubagentDisposition} — `'cut'` when the stream was
+ * interrupted mid-turn (the SILENT_STREAM_CUT signature), `'clean'` on a normal
+ * `end_turn`. Main mints a synthetic `SubagentTurn` event keyed `(sessionId,
+ * agentId)`; the reducer stamps it onto the subagent row and the SubagentStop
+ * fold reads it to recognize a silent stream cut and drive auto-resume. NOT
+ * change-gated — the reducer fold is idempotent (last-write-wins on the row).
+ */
+export interface SubagentTurnMessage {
+  kind: "subagent-turn";
+  /** Parent session id (the subagent transcript's `sessionId`). */
+  sessionId: string;
+  /** The subagent's `agentId` — matches the SubagentStop event's `agent_id`. */
+  agentId: string;
+  disposition: SubagentDisposition;
 }
 
 /** Message the parent sends to ask the worker to stop. */
@@ -283,6 +306,79 @@ export function matchAskUserQuestion(parsed: unknown): InputRequestLine | null {
 }
 
 /**
+ * A parsed subagent assistant turn line: parent session + subagent agent id +
+ * the turn's terminal {@link SubagentDisposition}.
+ */
+interface SubagentTurnLine {
+  sessionId: string;
+  agentId: string;
+  disposition: SubagentDisposition;
+}
+
+/**
+ * Match a parsed JSONL object against a SUBAGENT assistant turn — a line in a
+ * subagent sidecar transcript (`<sid>/subagents/agent-<agentId>.jsonl`) that
+ * carries the model's `stop_reason`. Strict gates:
+ *
+ *   - `parsed.type === "assistant"`.
+ *   - `parsed.agentId` is a non-empty string (the subagent identity; parent
+ *     transcript assistant lines carry NO `agentId`, so this is the sidechain
+ *     discriminator that keeps the parent's own turns out).
+ *   - `parsed.sessionId` is a non-empty string.
+ *   - `parsed.message.stop_reason` is present (a real model response, not a
+ *     synthetic/streaming-partial frame).
+ *
+ * Disposition: `stop_reason` of `"tool_use"` or `null` is the SILENT_STREAM_CUT
+ * signature — `null` is an interrupted stream (per Anthropic streaming docs,
+ * never a real end), and a `tool_use` turn that becomes the LAST turn means the
+ * stream was cut between the tool_result and the model's next response. Any
+ * other `stop_reason` (`"end_turn"`, `"max_tokens"`, `"stop_sequence"`,
+ * `"pause_turn"`, …) is a legitimate model-side end → `'clean'`. The LAST-turn
+ * determination is the reducer's job (the SubagentStop fold reads the final
+ * stamped disposition); this matcher reports the per-turn disposition and the
+ * reducer's last-write-wins on the row makes the closing turn's value win.
+ *
+ * Returns `null` for any non-subagent / non-assistant / stop_reason-absent line.
+ */
+export function matchSubagentTurn(parsed: unknown): SubagentTurnLine | null {
+  if (!parsed || typeof parsed !== "object") {
+    return null;
+  }
+  const obj = parsed as {
+    type?: unknown;
+    agentId?: unknown;
+    sessionId?: unknown;
+    message?: unknown;
+  };
+  if (obj.type !== "assistant") {
+    return null;
+  }
+  if (typeof obj.agentId !== "string" || obj.agentId.length === 0) {
+    return null;
+  }
+  if (typeof obj.sessionId !== "string" || obj.sessionId.length === 0) {
+    return null;
+  }
+  const msg = obj.message;
+  if (!msg || typeof msg !== "object") {
+    return null;
+  }
+  // `stop_reason` must be PRESENT (the key exists). A real model turn always
+  // carries it (string or explicit `null`); a frame missing the key entirely is
+  // not a settled assistant response and is skipped.
+  if (!("stop_reason" in (msg as object))) {
+    return null;
+  }
+  const stopReason = (msg as { stop_reason?: unknown }).stop_reason;
+  const isCut = stopReason === "tool_use" || stopReason === null;
+  return {
+    sessionId: obj.sessionId,
+    agentId: obj.agentId,
+    disposition: isCut ? "cut" : "clean",
+  };
+}
+
+/**
  * Per-path forward-tail state: the byte offset we've consumed up to, a
  * persistent UTF-8 decoder (so a multi-byte char split across a read-chunk
  * boundary never decodes to U+FFFD), and the unterminated tail of the last read
@@ -355,6 +451,11 @@ export class TranscriptLineStream {
     private readonly onInputRequest: (
       sessionId: string,
       requestKind: InputRequestKind,
+    ) => void = () => {},
+    private readonly onSubagentTurn: (
+      sessionId: string,
+      agentId: string,
+      disposition: SubagentDisposition,
     ) => void = () => {},
   ) {}
 
@@ -677,11 +778,20 @@ export class TranscriptLineStream {
     // rendering the prior tool_use): the `"name":` prefix pins the substring to
     // the `tool_use` schema's `name` field. Relies on the writers emitting no
     // whitespace in JSON; if that changes, widen to `"name"`.
+    //
+    // The subagent-turn needle is `"agentId":` — present ONLY in subagent
+    // sidecar transcript lines (the parent's own turns carry no `agentId`), so
+    // it is the cheap discriminator that pins this branch to subagent
+    // transcripts. It is INDEPENDENT of the three parent-transcript needles
+    // above (a subagent assistant turn lives in a different file and never
+    // carries `custom-title` / `isApiErrorMessage`), so it is checked
+    // separately rather than as part of the mutually-exclusive chain.
     const isTitle = line.includes("custom-title");
     const isApiError = !isTitle && line.includes('"isApiErrorMessage":true');
     const isInputRequest =
       !isTitle && !isApiError && line.includes('"name":"AskUserQuestion"');
-    if (!isTitle && !isApiError && !isInputRequest) {
+    const isSubagentTurn = line.includes('"agentId":');
+    if (!isTitle && !isApiError && !isInputRequest && !isSubagentTurn) {
       return;
     }
     let parsed: unknown;
@@ -716,14 +826,26 @@ export class TranscriptLineStream {
       this.onApiError(match.sessionId, match.text, match.kind);
       return;
     }
-    // No change-gate (idempotent fold). No boot-scan path for this signal: the
-    // `[awaiting:*]` pill marks a LIVE state, so replaying it from a historical
-    // scan would show stale blocks for already-answered sessions.
-    const match = matchAskUserQuestion(parsed);
+    if (isInputRequest) {
+      // No change-gate (idempotent fold). No boot-scan path for this signal: the
+      // `[awaiting:*]` pill marks a LIVE state, so replaying it from a historical
+      // scan would show stale blocks for already-answered sessions.
+      const match = matchAskUserQuestion(parsed);
+      if (!match) {
+        return;
+      }
+      this.onInputRequest(match.sessionId, match.requestKind);
+      return;
+    }
+    // Subagent assistant turn. No change-gate (idempotent fold — last-write-wins
+    // on the row's `last_disposition`). The reducer's SubagentStop fold reads the
+    // final stamped disposition, so streaming every per-turn disposition is
+    // correct: the closing turn's value is whatever folded last.
+    const match = matchSubagentTurn(parsed);
     if (!match) {
       return;
     }
-    this.onInputRequest(match.sessionId, match.requestKind);
+    this.onSubagentTurn(match.sessionId, match.agentId, match.disposition);
   }
 }
 
@@ -909,6 +1031,14 @@ function main(): void {
         sessionId,
         requestKind,
       } satisfies InputRequestMessage);
+    },
+    (sessionId, agentId, disposition) => {
+      port.postMessage({
+        kind: "subagent-turn",
+        sessionId,
+        agentId,
+        disposition,
+      } satisfies SubagentTurnMessage);
     },
   );
 

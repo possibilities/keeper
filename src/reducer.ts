@@ -59,6 +59,7 @@ import type {
   JobLinkEntry,
   PermissionPromptKind,
   ResolvedEpicDep,
+  SubagentDisposition,
 } from "./types";
 import { API_ERROR_KINDS } from "./types";
 
@@ -175,6 +176,24 @@ function extractInputRequestKind(event: Event): InputRequestKind {
     return validateInputRequestKind(parsed?.kind);
   } catch {
     return "ask_user_question";
+  }
+}
+
+/**
+ * Parse the `disposition` out of a `SubagentTurn` event's `data` blob. Returns
+ * `'cut'` | `'clean'` for the two canonical values, `null` for a malformed blob
+ * or any other string (the fold treats `null` as a safe no-op, never throwing
+ * inside the transaction). Only `'cut'` and `'clean'` are recognized — a
+ * forward-compat disposition string folds to `null` rather than a misclassified
+ * cut.
+ */
+function extractSubagentDisposition(event: Event): SubagentDisposition | null {
+  try {
+    const parsed = JSON.parse(event.data) as { disposition?: unknown };
+    const raw = parsed?.disposition;
+    return raw === "cut" || raw === "clean" ? raw : null;
+  } catch {
+    return null;
   }
 }
 
@@ -3779,6 +3798,44 @@ function sweepRunningSubagentsToUnknown(
 }
 
 /**
+ * SILENT_STREAM_CUT recovery (fn-38.2). When a subagent's most recent assistant
+ * turn was a stream cut (`last_disposition='cut'` — `stop_reason` was `tool_use`
+ * or `null`, the harness terminated the turn between a tool_result and the next
+ * API response) and its parent job is STILL `working`, flip the parent job to
+ * `'stopped'` so readiness re-readies the task and autopilot re-dispatches —
+ * faster than the ~60s dead-pid reprobe.
+ *
+ * The `state = 'working'` guard IS the "no terminal error in the correlation
+ * window" guard, by construction: any api_error / SessionEnd / Killed / Stop in
+ * the window would already have moved the row OFF `working` (to `stopped` /
+ * `ended` / `killed`), so a still-`working` row is one that has NO terminal
+ * signal — exactly the SILENT_STREAM_CUT class (the task .3 census found 0/50
+ * api_error correlation). A `clean` (end_turn) turn never reaches here. The
+ * guard also makes the fold idempotent (a re-fire finds the row already
+ * `stopped` → zero changes → no re-fan) and re-fold deterministic (it reads only
+ * folded `jobs.state` + the event log, never wall-clock or liveness).
+ *
+ * Returns true iff it flipped the row (so the caller can decide whether to log).
+ */
+function dropParentJobOnSilentStreamCut(
+  db: Database,
+  jobId: string,
+  eventId: number,
+  ts: number,
+): boolean {
+  const res = db.run(
+    `UPDATE jobs SET state = 'stopped', last_event_id = ?, updated_at = ?
+       WHERE job_id = ? AND state = 'working'`,
+    [eventId, ts, jobId],
+  );
+  if (res.changes > 0) {
+    syncIfPlanRef(db, jobId, eventId, ts);
+    return true;
+  }
+  return false;
+}
+
+/**
  * Apply the `subagent_invocations` projection for one event. Four event shapes
  * feed it:
  *
@@ -3901,12 +3958,13 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
       // 'unknown'); otherwise lands 'ok'.
       const row = db
         .query(
-          `SELECT ts, status FROM subagent_invocations
+          `SELECT ts, status, last_disposition FROM subagent_invocations
             WHERE job_id = ? AND agent_id = ? AND turn_seq = ?`,
         )
         .get(jobId, agentId, openTurnSeq) as {
         ts: number;
         status: string;
+        last_disposition: string | null;
       } | null;
       if (row == null) {
         // Shouldn't happen — findOpenTurnForStop returned a turn_seq it just
@@ -3932,6 +3990,68 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
           WHERE job_id = ? AND agent_id = ? AND turn_seq = ?`,
         [durationMs, nextStatus, event.id, ts, jobId, agentId, openTurnSeq],
       );
+      // SILENT_STREAM_CUT (fn-38.2): the turn that just closed had its last
+      // assistant message folded as a cut (`stop_reason` tool_use/null, no
+      // terminal text) by a prior `SubagentTurn` event, yet a SubagentStop
+      // landed — the harness terminated the worker turn mid-stream. Flip the
+      // still-`working` parent job to `stopped` so the dropped task re-dispatches
+      // without waiting on the ~60s dead-pid reprobe. The negative control is the
+      // disposition itself: a `clean` (end_turn) turn never enters this branch.
+      // Race-tolerant: if the `SubagentTurn(cut)` event instead lands AFTER this
+      // close, its own fold arm performs the identical flip.
+      if (row.last_disposition === "cut") {
+        dropParentJobOnSilentStreamCut(db, jobId, event.id, ts);
+      }
+      return;
+    }
+
+    case "SubagentTurn": {
+      // Synthetic event (transcript worker → main): the terminal disposition of
+      // a subagent's most recent assistant turn. Stamp it onto the row so the
+      // SubagentStop fold can recognize a SILENT_STREAM_CUT. `agent_id` carries
+      // the subagent identity; `data.disposition` is 'cut' | 'clean'.
+      const agentId = event.agent_id;
+      if (agentId == null || agentId.length === 0) {
+        return; // no subagent identity — safe no-op.
+      }
+      const disposition = extractSubagentDisposition(event);
+      if (disposition == null) {
+        return; // malformed/unknown disposition — safe no-op.
+      }
+      // Stamp the LATEST turn for this (job_id, agent_id) — open or just-closed.
+      // Targeting max(turn_seq) (NOT only the open turn) makes the stamp
+      // race-tolerant: a `SubagentTurn` landing AFTER SubagentStop closed the
+      // turn (duration_ms non-null) still records the disposition on the right
+      // row. Matches zero rows when no SubagentStart has folded yet — a safe
+      // no-op (the orphan-turn case).
+      const target = db
+        .query(
+          `SELECT turn_seq, duration_ms FROM subagent_invocations
+            WHERE job_id = ? AND agent_id = ?
+            ORDER BY turn_seq DESC
+            LIMIT 1`,
+        )
+        .get(jobId, agentId) as {
+        turn_seq: number;
+        duration_ms: number | null;
+      } | null;
+      if (target == null) {
+        return; // no row to stamp — safe no-op.
+      }
+      db.run(
+        `UPDATE subagent_invocations
+            SET last_disposition = ?, last_event_id = ?, updated_at = ?
+          WHERE job_id = ? AND agent_id = ? AND turn_seq = ?`,
+        [disposition, event.id, ts, jobId, agentId, target.turn_seq],
+      );
+      // Race tail: when this `cut` disposition lands AFTER the SubagentStop
+      // already closed the turn (`duration_ms` non-null), the SubagentStop arm
+      // could not have seen the cut — so perform the parent-job flip HERE. The
+      // still-`working` guard inside the helper keeps it idempotent if both arms
+      // fire. A `clean` disposition never flips.
+      if (disposition === "cut" && target.duration_ms != null) {
+        dropParentJobOnSilentStreamCut(db, jobId, event.id, ts);
+      }
       return;
     }
 
