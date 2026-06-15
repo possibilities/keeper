@@ -15,5 +15,5 @@ expected here.
 - [ ] None — relocated to fn-814-trace-live-worker-window-teardowns (keeper). This task is intentionally inert.
 
 ## Done summary
-
+Relocated to keeper investigation epic fn-814-trace-live-worker-window-teardowns (F5 = parent-session-teardown recovery). No work performed in this task; marked done administratively — not blocked — so the epic's close-row gate clears and the closer can auto-dispatch once .2 lands.
 ## Evidence
