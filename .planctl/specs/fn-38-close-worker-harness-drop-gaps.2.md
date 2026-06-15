@@ -57,5 +57,5 @@ present) or a legitimately completed turn.
 - [ ] `bun run test:full` green; work committed via `keeper commit-work`.
 
 ## Done summary
-
+Added a keeper-side SILENT_STREAM_CUT detector: the transcript worker mints a synthetic SubagentTurn event (cut vs clean disposition) from subagent sidecar transcripts, and the reducer flips a still-working parent job to stopped on a cut close, driving auto-resume faster than the ~60s dead-pid reprobe. Schema v69 adds subagent_invocations.last_disposition; re-fold deterministic; no false-positive on end_turn.
 ## Evidence
