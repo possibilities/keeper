@@ -32,16 +32,40 @@
  * this util refuse to act rather than guess at garbage; an older / missing
  * version falls back to safe defaults.
  *
+ * The restore SOURCE is resolved by two OPPOSITE precedence orders, and the
+ * mode picks which:
+ *   - Default / `--apply` use the READER precedence — `last_session ‖ current ‖`
+ *     v1-legacy `sessions` (frozen wins) — the post-crash view, since after a
+ *     reboot the worker has already boot-promoted the pre-crash live set into
+ *     `last_session`.
+ *   - `--preview-crash` uses the BOOT-PROMOTE precedence — `current ‖
+ *     last_session ‖ legacy` (live mirror wins) — what a crash RIGHT NOW would
+ *     actually replay, with an empty skip-set (a crash kills every live job).
+ *   - `--snapshot-current` reads the `current` tier alone (the continuous live
+ *     mirror) and emits a runnable restore SCRIPT.
+ * Both `--preview-crash` and `--snapshot-current` are pure local-file reads —
+ * no daemon round-trip, so they work even with `keeperd` down.
+ *
  * Usage:
  *   bun scripts/restore-agents.ts [--session <name>] [--apply] [--sock <path>]
+ *   bun scripts/restore-agents.ts --preview-crash [--session <name>]
+ *   bun scripts/restore-agents.ts --snapshot-current [--session <name>] > restore.sh
  *
- *   --session <name>  Restore only agents from this backend session. Default:
- *                     all sessions in the file.
- *   --apply           Actually relaunch via `ensureLaunched`. Default is
- *                     DRY-RUN — print what would be restored, touch nothing.
- *   --sock <path>     Socket path override (else $KEEPER_SOCK, else the
- *                     ~/.local/state/keeper/keeperd.sock default).
- *   --help            Show this help.
+ *   --session <name>   Restore only agents from this backend session. Default:
+ *                      all sessions in the file.
+ *   --apply            Actually relaunch via `ensureLaunched`. Default is
+ *                      DRY-RUN — print what would be restored, touch nothing.
+ *   --preview-crash    Print what a crash RIGHT NOW would replay (boot-promote
+ *                      precedence, empty skip-set). Read-only, no daemon.
+ *   --snapshot-current Emit a runnable bash script that restores the CURRENT
+ *                      live mirror into tmux windows. Pipe to a file and run
+ *                      later. Read-only, no daemon.
+ *   --sock <path>      Socket path override (else $KEEPER_SOCK, else the
+ *                      ~/.local/state/keeper/keeperd.sock default). Ignored by
+ *                      the two read-only modes above.
+ *   --help             Show this help.
+ *
+ * `--apply`, `--preview-crash`, and `--snapshot-current` are mutually exclusive.
  *
  * Exit codes:
  *   0 — printed the plan (dry-run) or completed the restore (--apply).
@@ -54,6 +78,9 @@
 import { parseArgs } from "node:util";
 import { resolveRestorePath, resolveSockPath } from "../src/db";
 import {
+  buildTmuxHasSessionArgs,
+  buildTmuxNewSessionArgs,
+  buildTmuxNewWindowArgs,
   DEFAULT_EXEC_BACKEND,
   type ExecBackend,
   resolveExecBackend,
@@ -80,12 +107,17 @@ const RESPONSE_TIMEOUT_MS = 5000;
 
 const HELP = `restore-agents — replay surviving Claude Code agents from restore.json
 
-Usage: bun scripts/restore-agents.ts [--session <name>] [--apply] [--sock <path>]
+Usage:
+  bun scripts/restore-agents.ts [--session <name>] [--apply] [--sock <path>]
+  bun scripts/restore-agents.ts --preview-crash [--session <name>]
+  bun scripts/restore-agents.ts --snapshot-current [--session <name>] > restore.sh
 
-  --session <name>  Restore only agents from this backend session (default: all)
-  --apply           Actually relaunch via ensureLaunched (default: DRY-RUN)
-  --sock <path>     Socket path override ($KEEPER_SOCK / default otherwise)
-  --help            Show this help
+  --session <name>    Restore only agents from this backend session (default: all)
+  --apply             Actually relaunch via ensureLaunched (default: DRY-RUN)
+  --preview-crash     Print what a crash RIGHT NOW would replay (read-only)
+  --snapshot-current  Emit a runnable tmux restore script for the live set (read-only)
+  --sock <path>       Socket path override ($KEEPER_SOCK / default otherwise)
+  --help              Show this help
 
 Reads ~/.local/state/keeper/restore.json (override: $KEEPER_RESTORE_FILE) and
 relaunches each agent NOT currently live via 'claude --resume' wrapped in the
@@ -94,6 +126,20 @@ the exec backend its 'backend' tag names; an absent tag coerces to the default
 backend. Always validates
 against live jobs at restore time (working+stopped); a daemon-down probe
 degrades to an empty skip-set so the disaster-recovery path restores everything.
+
+The default / --apply view resolves the restore source as 'last_session ‖
+current ‖ legacy' (the frozen set wins — the post-crash view). Two read-only
+modes pick a different source and skip the daemon entirely:
+
+  --preview-crash     Boot-promote precedence 'current ‖ last_session ‖ legacy'
+                      (live mirror wins) with an EMPTY skip-set — exactly what a
+                      crash right now would promote and replay.
+  --snapshot-current  Reads the 'current' tier alone and emits a runnable bash
+                      script: each agent relaunches into its own tmux window
+                      (get-or-create the session first), byte-aligned with what
+                      --apply spawns. Pipe to a file and run later.
+
+--apply, --preview-crash, and --snapshot-current are mutually exclusive.
 
 A malformed/absent restore.json prints a clear message and exits 0
 (nothing to restore). A future-version schema_version refuses to act and
@@ -113,6 +159,8 @@ const DEFAULT_SHELL = "/bin/zsh" as const;
 interface ParsedArgs {
   session: string | null;
   apply: boolean;
+  previewCrash: boolean;
+  snapshotCurrent: boolean;
   sock: string | null;
   help: boolean;
 }
@@ -436,6 +484,8 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
     options: {
       session: { type: "string" },
       apply: { type: "boolean", default: false },
+      "preview-crash": { type: "boolean", default: false },
+      "snapshot-current": { type: "boolean", default: false },
       sock: { type: "string" },
       help: { type: "boolean", default: false },
     },
@@ -444,6 +494,8 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
   return {
     session: parsed.values.session ?? null,
     apply: parsed.values.apply === true,
+    previewCrash: parsed.values["preview-crash"] === true,
+    snapshotCurrent: parsed.values["snapshot-current"] === true,
     sock: parsed.values.sock ?? null,
     help: parsed.values.help === true,
   };
@@ -590,27 +642,32 @@ function tierSessionsOrNull(
 }
 
 /**
- * Pure: load the side-file off disk and resolve the RESTORE SOURCE to a
- * single `sessions` map. Returns either the resolved map or a typed reason —
- * caller maps `"missing"` / `"parse-error"` to the no-op exit-0 path,
- * `"future"` to die(), and `"ok"` to the action path.
- *
- * **Two-tier resolution (epic fn-702, schema v2).** The restore source is
- * picked by precedence: `last_session ‖ current ‖` (v1) legacy top-level
- * `sessions`. `last_session` is the frozen restore source the worker writes
- * at boot-promote / collapse-freeze; `current` is the live mirror fallback
- * (used when `last_session` is empty/absent — e.g. a freshly-written file
- * that hasn't hit a collapse edge yet); a v1 legacy file's top-level
- * `sessions` (frozen under the fn-689 last-non-empty-wins policy) is read as
- * the `last_session` source, not as `current`. The resolved map MAY be empty
- * ({}) when every tier is empty — "nothing to restore".
- *
- * Exported for tests.
+ * The three restore-source tiers, each coerced to a non-empty `sessions` map
+ * or `null` (an empty/absent tier). Every mode derives its source by picking
+ * a precedence over these:
+ *  - `lastSession` — the FROZEN restore source (boot-promote / collapse-freeze).
+ *  - `current` — the continuous live mirror.
+ *  - `legacy` — a v1 file's top-level `sessions`, lifted into a tier (it was
+ *    frozen under last-non-empty-wins, so it reads as a `last_session` source).
  */
-export async function loadRestoreFile(
+export interface RestoreTiers {
+  lastSession: Record<string, RestoreSession> | null;
+  current: Record<string, RestoreSession> | null;
+  legacy: Record<string, RestoreSession> | null;
+}
+
+/**
+ * Pure: load the side-file off disk and surface the three RAW tiers WITHOUT
+ * collapsing any precedence — each mode picks its own source order. Returns
+ * either the tiers or a typed reason: caller maps `"missing"` / `"parse-error"`
+ * to the no-op exit-0 path, `"future"` to die(), and `"ok"` to an action path.
+ * The schema-version gate (future-refuse / safe-default) lives here so every
+ * mode inherits it. Exported for tests.
+ */
+export async function loadRestoreTiers(
   path: string,
 ): Promise<
-  | { kind: "ok"; sessions: Record<string, RestoreSession> }
+  | ({ kind: "ok" } & RestoreTiers)
   | { kind: "missing" }
   | { kind: "parse-error"; message: string }
   | { kind: "future"; version: number }
@@ -642,17 +699,128 @@ export async function loadRestoreFile(
         typeof rec.schema_version === "number" ? rec.schema_version : NaN,
     };
   }
-  // Resolve the restore source by precedence. `last_session` (frozen) wins,
-  // then `current` (live mirror), then a v1 legacy top-level `sessions` block
-  // — treated as a `last_session` source (it was frozen under
-  // last-non-empty-wins, so a single empty post-upgrade pulse must not be
-  // able to mask it). Each `…OrNull` coerces an empty/absent tier to null so
-  // the chain skips it.
-  const v2Last = tierSessionsOrNull(rec.last_session);
-  const v2Current = tierSessionsOrNull(rec.current);
-  const v1Legacy = tierSessionsOrNull({ sessions: rec.sessions });
-  const sessions = v2Last ?? v2Current ?? v1Legacy ?? {};
+  return {
+    kind: "ok",
+    lastSession: tierSessionsOrNull(rec.last_session),
+    current: tierSessionsOrNull(rec.current),
+    // v1 legacy: a top-level `sessions` block with no tier wrapper.
+    legacy: tierSessionsOrNull({ sessions: rec.sessions }),
+  };
+}
+
+/**
+ * Pure: load the side-file and resolve the RESTORE SOURCE to a single
+ * `sessions` map via the READER precedence — `last_session ‖ current ‖` (v1)
+ * legacy `sessions` (frozen wins). This is the default / `--apply` view: after
+ * a reboot the worker has already boot-promoted the pre-crash live set into
+ * `last_session`, so the frozen tier is the post-crash truth. The resolved map
+ * MAY be empty ({}) when every tier is empty — "nothing to restore". A thin
+ * wrapper over {@link loadRestoreTiers}. Exported for tests.
+ */
+export async function loadRestoreFile(
+  path: string,
+): Promise<
+  | { kind: "ok"; sessions: Record<string, RestoreSession> }
+  | { kind: "missing" }
+  | { kind: "parse-error"; message: string }
+  | { kind: "future"; version: number }
+> {
+  const tiers = await loadRestoreTiers(path);
+  if (tiers.kind !== "ok") {
+    return tiers;
+  }
+  const sessions = tiers.lastSession ?? tiers.current ?? tiers.legacy ?? {};
   return { kind: "ok", sessions };
+}
+
+/**
+ * Pure: the BOOT-PROMOTE restore source — `current ‖ last_session ‖ legacy`
+ * (live mirror wins), the OPPOSITE of {@link loadRestoreFile}'s frozen-wins
+ * reader precedence. This is exactly what `restorePulse`'s boot-promote lifts
+ * into `last_session` on the first post-reboot pulse, so it is what a crash
+ * RIGHT NOW would promote and then replay. Exported for tests.
+ */
+export function resolveCrashSource(
+  tiers: RestoreTiers,
+): Record<string, RestoreSession> {
+  return tiers.current ?? tiers.lastSession ?? tiers.legacy ?? {};
+}
+
+/**
+ * Pure: POSIX single-quote-escape one argv token for safe embedding in the
+ * generated `--snapshot-current` shell script. Wraps in single quotes and
+ * renders any embedded single quote as the `'\''` close-escape-reopen idiom —
+ * the only metacharacter a single-quoted string doesn't already neutralize, so
+ * tmux metachars (`;`, `#{pane_id}`) and the resume body's double quotes reach
+ * tmux literally. An empty string becomes `''`. Exported for tests.
+ */
+export function shellQuote(arg: string): string {
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Pure renderer: turn the `current`-tier session map into a RUNNABLE bash
+ * script that restores each agent into its own tmux window. Byte-aligned with
+ * what `--apply` spawns — the same `buildResumeLaunchArgv` inner argv wrapped
+ * in the same `buildTmuxNewWindowArgs` new-window — but preceded by a per-
+ * session `has-session || new-session` get-or-create guard and emitted as shell
+ * text, so it can be piped to a file and run later (daemon-independent).
+ *
+ * Sessions are emitted in alpha order; agents in their on-disk (job_id-sorted)
+ * order. Every argv token is single-quoted via {@link shellQuote}. The
+ * `--session` filter narrows to one bucket. Exported for tests.
+ */
+export function renderSnapshotScript(
+  sessions: Record<string, RestoreSession>,
+  sessionFilter: string | null,
+  shell: string,
+  sourcePath: string,
+): string {
+  const quoteArgv = (args: string[]): string => args.map(shellQuote).join(" ");
+  const lines: string[] = [
+    "#!/usr/bin/env bash",
+    "# restore-agents --snapshot-current — runnable snapshot of the CURRENT live set.",
+    `# Source: ${sourcePath} (current tier). Pipe to a file and run to restore.`,
+    "# Each agent relaunches into its own tmux window; the session is get-or-created.",
+    "set -euo pipefail",
+  ];
+  let sessionCount = 0;
+  let agentCount = 0;
+  for (const sessionName of Object.keys(sessions).sort()) {
+    if (sessionFilter !== null && sessionName !== sessionFilter) {
+      continue;
+    }
+    const bucket = sessions[sessionName];
+    if (!bucket || bucket.agents.length === 0) {
+      continue;
+    }
+    sessionCount++;
+    const n = bucket.agents.length;
+    lines.push("");
+    lines.push(`# session: ${sessionName} (${n} agent${n === 1 ? "" : "s"})`);
+    // Get-or-create the session so the new-window targets land. `|| ` keeps
+    // `set -e` from tripping when has-session exits non-zero (session absent).
+    lines.push(
+      `${quoteArgv(buildTmuxHasSessionArgs(sessionName))} 2>/dev/null || ` +
+        `${quoteArgv(buildTmuxNewSessionArgs(sessionName))}`,
+    );
+    for (const agent of bucket.agents) {
+      const cwd = agent.cwd == null ? "" : seg(agent.cwd);
+      const innerArgv = buildResumeLaunchArgv(shell, agent);
+      // No window name — mirrors --apply (ensureLaunched passes no name), so the
+      // restored window stays unnamed and the renamer worker labels it later.
+      lines.push(`# ${agent.resume_target}`);
+      lines.push(
+        quoteArgv(buildTmuxNewWindowArgs(sessionName, cwd, innerArgv)),
+      );
+      agentCount++;
+    }
+  }
+  lines.push("");
+  lines.push(
+    `# summary: snapshot-current sessions=${sessionCount} agents=${agentCount}`,
+  );
+  return `${lines.join("\n")}\n`;
 }
 
 async function main(): Promise<void> {
@@ -663,26 +831,76 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  // `--apply`, `--preview-crash`, and `--snapshot-current` each own the run.
+  if (
+    [args.apply, args.previewCrash, args.snapshotCurrent].filter(Boolean)
+      .length > 1
+  ) {
+    die(
+      "--apply, --preview-crash, and --snapshot-current are mutually exclusive",
+    );
+  }
+
   const restorePath = resolveRestorePath();
-  const loaded = await loadRestoreFile(restorePath);
-  if (loaded.kind === "missing") {
+  const tiers = await loadRestoreTiers(restorePath);
+  if (tiers.kind === "missing") {
     process.stdout.write(
       `# restore-agents: no snapshot at ${restorePath} (nothing to restore)\n`,
     );
     process.exit(0);
   }
-  if (loaded.kind === "parse-error") {
+  if (tiers.kind === "parse-error") {
     process.stdout.write(
-      `# restore-agents: ${restorePath} is malformed (${loaded.message}); nothing to restore\n`,
+      `# restore-agents: ${restorePath} is malformed (${tiers.message}); nothing to restore\n`,
     );
     process.exit(0);
   }
-  if (loaded.kind === "future") {
+  if (tiers.kind === "future") {
     die(
-      `restore.json schema_version ${loaded.version} is from the future ` +
+      `restore.json schema_version ${tiers.version} is from the future ` +
         `(this util supports up to ${RESTORE_SCHEMA_VERSION}); refusing to act`,
     );
   }
+
+  const shell = process.env.SHELL ?? DEFAULT_SHELL;
+
+  // --snapshot-current: emit a runnable restore script for the CURRENT live
+  // mirror alone. Pure local-file op — no daemon round-trip, no live-jobs dedup
+  // (every agent in `current` IS live; snapshotting it is the whole point).
+  if (args.snapshotCurrent) {
+    process.stdout.write(
+      renderSnapshotScript(
+        tiers.current ?? {},
+        args.session,
+        shell,
+        restorePath,
+      ),
+    );
+    process.exit(0);
+  }
+
+  // --preview-crash: simulate a crash+reboot. The boot-promote precedence is
+  // `current ‖ last_session ‖ legacy` (live mirror wins) — the OPPOSITE of the
+  // reader's frozen-wins default — so this shows what a crash RIGHT NOW would
+  // actually replay. Empty skip-set: a crash kills every live job, so nothing
+  // is "already live." Pure local-file op — no daemon round-trip.
+  if (args.previewCrash) {
+    const plan = planRestore(
+      resolveCrashSource(tiers),
+      args.session,
+      new Set<string>(),
+    );
+    process.stdout.write(
+      "# restore-agents --preview-crash: what a crash RIGHT NOW would replay\n" +
+        "# (boot-promote precedence current‖last_session‖legacy; assumes every live agent is gone)\n",
+    );
+    process.stdout.write(renderOutcomes(plan, shell, false));
+    process.exit(0);
+  }
+
+  // Default / --apply: resolve the restore source via the reader's frozen-wins
+  // precedence (`last_session ‖ current ‖ legacy`) and dedup against live jobs.
+  const sessions = tiers.lastSession ?? tiers.current ?? tiers.legacy ?? {};
 
   const sockPath = args.sock ?? resolveSockPath();
   const { jobs, reason } = await fetchLiveJobsOrNull(sockPath);
@@ -694,8 +912,7 @@ async function main(): Promise<void> {
     );
   }
 
-  const plan = planRestore(loaded.sessions, args.session, skipSet);
-  const shell = process.env.SHELL ?? DEFAULT_SHELL;
+  const plan = planRestore(sessions, args.session, skipSet);
 
   if (!args.apply) {
     process.stdout.write(renderOutcomes(plan, shell, false));
@@ -736,7 +953,7 @@ async function main(): Promise<void> {
   };
   // Session-name → backend type, lifted off the resolved restore source.
   const backendBySession = new Map<string, string>();
-  for (const [name, bucket] of Object.entries(loaded.sessions)) {
+  for (const [name, bucket] of Object.entries(sessions)) {
     backendBySession.set(name, bucket.backend ?? DEFAULT_EXEC_BACKEND);
   }
   const ensureLaunched: EnsureLaunchedFn = (session, argv, cwd) => {

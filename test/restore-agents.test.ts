@@ -23,8 +23,12 @@ import {
   buildResumeLaunchArgv,
   classifySchemaVersion,
   loadRestoreFile,
+  loadRestoreTiers,
   planRestore,
   renderOutcomes,
+  renderSnapshotScript,
+  resolveCrashSource,
+  shellQuote,
 } from "../scripts/restore-agents";
 import type { RestoreAgent, RestoreSession } from "../src/restore-worker";
 import type { Job } from "../src/types";
@@ -584,4 +588,197 @@ test("loadRestoreFile v2: a legacy bucket carries no backend tag (would-restore 
   expect(planRestore(sessions, null, new Set()).map((p) => p.kind)).toEqual([
     "would-restore",
   ]);
+});
+
+// ---------------------------------------------------------------------------
+// loadRestoreTiers — raw tiers, no precedence collapse
+// ---------------------------------------------------------------------------
+
+function okTiers(res: Awaited<ReturnType<typeof loadRestoreTiers>>) {
+  expect(res.kind).toBe("ok");
+  return res as Extract<typeof res, { kind: "ok" }>;
+}
+
+test("loadRestoreTiers exposes last_session + current as raw, uncollapsed tiers", async () => {
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 3,
+      last_session: {
+        captured_at: 1,
+        sessions: { autopilot: { agents: [fakeAgent({ job_id: "frozen" })] } },
+      },
+      current: {
+        captured_at: 2,
+        sessions: { autopilot: { agents: [fakeAgent({ job_id: "live" })] } },
+      },
+    }),
+    "utf8",
+  );
+  const t = okTiers(await loadRestoreTiers(restorePath));
+  // Both tiers survive independently — no frozen-wins collapse here.
+  expect(t.lastSession?.autopilot.agents[0].job_id).toBe("frozen");
+  expect(t.current?.autopilot.agents[0].job_id).toBe("live");
+  expect(t.legacy).toBeNull();
+});
+
+test("loadRestoreTiers lifts a v1 legacy top-level sessions block into the legacy tier", async () => {
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 1,
+      captured_at: 9,
+      sessions: { autopilot: { agents: [fakeAgent({ job_id: "v1" })] } },
+    }),
+    "utf8",
+  );
+  const t = okTiers(await loadRestoreTiers(restorePath));
+  expect(t.lastSession).toBeNull();
+  expect(t.current).toBeNull();
+  expect(t.legacy?.autopilot.agents[0].job_id).toBe("v1");
+});
+
+test("loadRestoreTiers coerces an empty tier to null", async () => {
+  writeFileSync(
+    restorePath,
+    JSON.stringify({
+      schema_version: 3,
+      last_session: { captured_at: 1, sessions: {} },
+      current: null,
+    }),
+    "utf8",
+  );
+  const t = okTiers(await loadRestoreTiers(restorePath));
+  expect(t.lastSession).toBeNull();
+  expect(t.current).toBeNull();
+});
+
+test("loadRestoreTiers passes missing / parse-error / future through unchanged", async () => {
+  expect((await loadRestoreTiers(join(tmpDir, "nope.json"))).kind).toBe(
+    "missing",
+  );
+  writeFileSync(restorePath, "{not json", "utf8");
+  expect((await loadRestoreTiers(restorePath)).kind).toBe("parse-error");
+  writeFileSync(restorePath, JSON.stringify({ schema_version: 4 }), "utf8");
+  const fut = await loadRestoreTiers(restorePath);
+  expect(fut.kind).toBe("future");
+  expect((fut as { version: number }).version).toBe(4);
+});
+
+// ---------------------------------------------------------------------------
+// resolveCrashSource — boot-promote precedence (current wins), the OPPOSITE of
+// loadRestoreFile's frozen-wins reader precedence
+// ---------------------------------------------------------------------------
+
+test("resolveCrashSource picks current over last_session (boot-promote precedence)", () => {
+  const current = fakeSessions({ autopilot: [fakeAgent({ job_id: "live" })] });
+  const lastSession = fakeSessions({
+    autopilot: [fakeAgent({ job_id: "frozen" })],
+  });
+  // Contrast with loadRestoreFile, which would resolve to "frozen".
+  expect(
+    resolveCrashSource({ current, lastSession, legacy: null }).autopilot
+      .agents[0].job_id,
+  ).toBe("live");
+});
+
+test("resolveCrashSource falls back current → last_session → legacy → {}", () => {
+  const lastSession = fakeSessions({ a: [fakeAgent({ job_id: "x" })] });
+  expect(
+    resolveCrashSource({ current: null, lastSession, legacy: null }).a.agents[0]
+      .job_id,
+  ).toBe("x");
+  const legacy = fakeSessions({ b: [fakeAgent({ job_id: "y" })] });
+  expect(
+    resolveCrashSource({ current: null, lastSession: null, legacy }).b.agents[0]
+      .job_id,
+  ).toBe("y");
+  expect(
+    resolveCrashSource({ current: null, lastSession: null, legacy: null }),
+  ).toEqual({});
+});
+
+// ---------------------------------------------------------------------------
+// shellQuote — POSIX single-quote escaping for the snapshot script
+// ---------------------------------------------------------------------------
+
+test("shellQuote wraps tokens in single quotes", () => {
+  expect(shellQuote("simple")).toBe("'simple'");
+  expect(shellQuote("")).toBe("''");
+  expect(shellQuote("a b c")).toBe("'a b c'");
+});
+
+test("shellQuote neutralizes tmux/shell metacharacters literally", () => {
+  // The bits that make the snapshot script byte-faithful: the tmux command
+  // separator, the pane-id format, and the resume body's double quotes all
+  // survive as literals inside single quotes.
+  expect(shellQuote(";")).toBe("';'");
+  expect(shellQuote("#{pane_id}")).toBe("'#{pane_id}'");
+  expect(shellQuote(`claude --resume "x"`)).toBe(`'claude --resume "x"'`);
+});
+
+test("shellQuote escapes an embedded single quote via the '\\'' idiom", () => {
+  expect(shellQuote("it's")).toBe(`'it'\\''s'`);
+});
+
+// ---------------------------------------------------------------------------
+// renderSnapshotScript — runnable tmux restore script for the current tier
+// ---------------------------------------------------------------------------
+
+test("renderSnapshotScript emits a bash header, get-or-create guard, and one new-window per agent", () => {
+  const current = fakeSessions({
+    autopilot: [
+      fakeAgent({ job_id: "a", cwd: "/repo", resume_target: "epic-foo" }),
+      fakeAgent({ job_id: "b", cwd: "/repo", resume_target: "epic-bar" }),
+    ],
+  });
+  const out = renderSnapshotScript(current, null, "/bin/zsh", "/state/r.json");
+  expect(out.startsWith("#!/usr/bin/env bash\n")).toBe(true);
+  expect(out).toContain("set -euo pipefail");
+  expect(out).toContain("/state/r.json (current tier)");
+  // Get-or-create guard: has-session OR new-session, every token quoted.
+  expect(out).toContain(
+    "'tmux' 'has-session' '-t' '=autopilot' 2>/dev/null || " +
+      "'tmux' 'new-session' '-d' '-s' 'autopilot' '-e' 'KEEPER_TMUX_SESSION=autopilot'",
+  );
+  // One new-window per agent, carrying the resume body + tmux ';' separator.
+  expect(out).toContain("'new-window' '-t' 'autopilot:'");
+  expect(out).toContain(`claude --resume "epic-foo"`);
+  expect(out).toContain(`claude --resume "epic-bar"`);
+  expect(out).toContain("';' 'set-option' '-p' 'remain-on-exit' 'on'");
+  expect(out).toContain("# summary: snapshot-current sessions=1 agents=2");
+});
+
+test("renderSnapshotScript respects the --session filter", () => {
+  const current = fakeSessions({
+    autopilot: [fakeAgent({ job_id: "a", resume_target: "keep" })],
+    side: [fakeAgent({ job_id: "b", resume_target: "drop" })],
+  });
+  const out = renderSnapshotScript(current, "autopilot", "/bin/zsh", "/r.json");
+  expect(out).toContain(`claude --resume "keep"`);
+  expect(out).not.toContain(`claude --resume "drop"`);
+  expect(out).toContain("# summary: snapshot-current sessions=1 agents=1");
+});
+
+test("renderSnapshotScript drops the cd prefix when cwd is null", () => {
+  const current = fakeSessions({
+    autopilot: [fakeAgent({ job_id: "a", cwd: null, resume_target: "x" })],
+  });
+  const out = renderSnapshotScript(current, null, "/bin/zsh", "/r.json");
+  // The inner resume body starts straight at `claude`, no `cd` segment, and the
+  // new-window `-c` carries an empty cwd (quoted as '').
+  expect(out).toContain(
+    `'claude --resume "x" --arthack-no-confirm ; exec /bin/zsh -l -i'`,
+  );
+  expect(out).not.toContain("cd  &&");
+  expect(out).toContain("'-c' ''");
+});
+
+test("renderSnapshotScript on an empty current tier is a valid no-op script", () => {
+  const out = renderSnapshotScript({}, null, "/bin/zsh", "/r.json");
+  expect(out.startsWith("#!/usr/bin/env bash\n")).toBe(true);
+  expect(out).toContain("# summary: snapshot-current sessions=0 agents=0");
+  // No tmux commands at all (the quoted command token never appears — only the
+  // prose "tmux window" in the header does).
+  expect(out).not.toContain("'tmux'");
 });
