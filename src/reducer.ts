@@ -3798,7 +3798,7 @@ function sweepRunningSubagentsToUnknown(
 }
 
 /**
- * SILENT_STREAM_CUT recovery (fn-38.2). When a subagent's most recent assistant
+ * SILENT_STREAM_CUT recovery. When a subagent's most recent assistant
  * turn was a stream cut (`last_disposition='cut'` — `stop_reason` was `tool_use`
  * or `null`, the harness terminated the turn between a tool_result and the next
  * API response) and its parent job is STILL `working`, flip the parent job to
@@ -3990,7 +3990,7 @@ function projectSubagentInvocationsRow(db: Database, event: Event): void {
           WHERE job_id = ? AND agent_id = ? AND turn_seq = ?`,
         [durationMs, nextStatus, event.id, ts, jobId, agentId, openTurnSeq],
       );
-      // SILENT_STREAM_CUT (fn-38.2): the turn that just closed had its last
+      // SILENT_STREAM_CUT: the turn that just closed had its last
       // assistant message folded as a cut (`stop_reason` tool_use/null, no
       // terminal text) by a prior `SubagentTurn` event, yet a SubagentStop
       // landed — the harness terminated the worker turn mid-stream. Flip the

@@ -1,5 +1,5 @@
 /**
- * fn-38.2 — SILENT_STREAM_CUT detector reducer folds.
+ * SILENT_STREAM_CUT detector reducer folds.
  *
  * Covers the keeper-side drop-recovery path: a subagent whose turn the harness
  * terminates mid-stream (between a tool_result and the model's next API
@@ -9,10 +9,10 @@
  * flip the still-`working` parent job to `stopped` so readiness re-dispatches
  * the dropped task faster than the ~60s dead-pid reprobe.
  *
- * Fixtures are shaped after the task .3 evidence signatures: the `cut` case
- * mirrors ea343ed2 (last assistant `stop_reason='tool_use'`, dangling
- * tool_result, no terminal text); the `clean` negative control mirrors cfcbc8ec
- * (`stop_reason='end_turn'`, terminal text).
+ * Fixtures are shaped after the observed evidence signatures: the `cut` case
+ * is a last assistant `stop_reason='tool_use'` with a dangling tool_result and
+ * no terminal text; the `clean` negative control is `stop_reason='end_turn'`
+ * with terminal text.
  *
  * Uses `freshMemDb` (the migrated `:memory:` template clone) so the migration
  * ladder is paid once per process; folds run through the real `applyEvent` /
@@ -131,7 +131,7 @@ function seedWorkingWithSubagent(agentId: string): void {
 
 // ---------------------------------------------------------------------------
 
-test("cut disposition then SubagentStop flips the still-working parent to stopped (ea343ed2 shape)", () => {
+test("cut disposition then SubagentStop flips the still-working parent to stopped", () => {
   seedWorkingWithSubagent("agent-cut");
   // Transcript worker observed the last assistant turn as a stream cut.
   insertEvent({
@@ -156,7 +156,7 @@ test("cut disposition then SubagentStop flips the still-working parent to stoppe
   expect(sub?.duration_ms).not.toBeNull(); // turn closed by SubagentStop
 });
 
-test("clean (end_turn) turn then SubagentStop leaves the parent working (cfcbc8ec negative control)", () => {
+test("clean (end_turn) turn then SubagentStop leaves the parent working (negative control)", () => {
   seedWorkingWithSubagent("agent-clean");
   insertEvent({
     hook_event: "SubagentTurn",
