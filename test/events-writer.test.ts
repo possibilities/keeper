@@ -1096,6 +1096,70 @@ test("backendExecCoordsFromEnv: tmux pane id passes through as raw TEXT", () => 
 });
 
 // ---------------------------------------------------------------------------
+// backendExecCoordsFromEnv carrier fallback (fn-815 — claudewrap strips TMUX
+// to let Claude emit truecolor and copies the pane id into KEEPER_TMUX_PANE; the
+// fallback arm stamps coord-identical tmux rows from the carrier).
+// ---------------------------------------------------------------------------
+
+test("backendExecCoordsFromEnv: carrier present + TMUX absent stamps coord-identical tmux row", () => {
+  // claudewrap deleted TMUX/TMUX_PANE (truecolor) but copied the pane id into
+  // KEEPER_TMUX_PANE first. The fallback arm stamps the same {type, paneId,
+  // sessionId} the native arm would have, so window renaming survives.
+  expect(
+    backendExecCoordsFromEnv({
+      KEEPER_TMUX_PANE: "%7",
+      KEEPER_TMUX_SESSION: "autopilot",
+    }),
+  ).toEqual({ type: "tmux", sessionId: "autopilot", paneId: "%7" });
+});
+
+test("backendExecCoordsFromEnv: carrier present without KEEPER_TMUX_SESSION → type + pane, NULL session", () => {
+  // Human-created tmux session relaunched under claudewrap: no
+  // KEEPER_TMUX_SESSION, so the session stays NULL (poller fills it) while the
+  // carrier still supplies type + pane.
+  expect(backendExecCoordsFromEnv({ KEEPER_TMUX_PANE: "%3" })).toEqual({
+    type: "tmux",
+    sessionId: null,
+    paneId: "%3",
+  });
+});
+
+test("backendExecCoordsFromEnv: empty carrier + TMUX absent → all-NULL, no tmux stamp", () => {
+  // The carrier is a hint, not proof of a live pane: an empty value collapses
+  // to NULL and falls through to all-NULL — never a type=tmux row with a NULL
+  // pane (the renamer filter requires a non-null pane id).
+  expect(
+    backendExecCoordsFromEnv({
+      KEEPER_TMUX_PANE: "",
+      KEEPER_TMUX_SESSION: "autopilot",
+    }),
+  ).toEqual({ type: null, sessionId: null, paneId: null });
+});
+
+test("backendExecCoordsFromEnv: native TMUX wins when both TMUX and carrier present (coord-identical)", () => {
+  // Both present (an existing native tmux pane carrying a stray carrier): the
+  // native arm fires first and is byte-unchanged, and the result is identical
+  // to the carrier-fed fallback for the same coords.
+  const both = backendExecCoordsFromEnv({
+    TMUX: "/tmp/tmux-501/default,12345,0",
+    TMUX_PANE: "%9",
+    KEEPER_TMUX_PANE: "%999",
+    KEEPER_TMUX_SESSION: "autopilot",
+  });
+  expect(both).toEqual({ type: "tmux", sessionId: "autopilot", paneId: "%9" });
+  // The native value, never the carrier, is the one stamped.
+  expect(both.paneId).toBe("%9");
+  // Coord-identical to the carrier fallback when the carrier holds the SAME
+  // pane id the native arm would have read — the renamer-worker equivalence.
+  expect(
+    backendExecCoordsFromEnv({
+      KEEPER_TMUX_PANE: "%9",
+      KEEPER_TMUX_SESSION: "autopilot",
+    }),
+  ).toEqual(both);
+});
+
+// ---------------------------------------------------------------------------
 // CLAUDE_CONFIG_DIR hook-process integration
 // ---------------------------------------------------------------------------
 

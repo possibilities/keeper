@@ -203,6 +203,20 @@ server's — so the mint carries `TERM`/`COLORTERM` defaults (preserving any
 real terminal's values) so the worker `claude` TUI shows color. This is the
 *only* control command that sets a child env.
 
+**Truecolor under tmux + the pane-id carrier.** Claude Code self-caps to
+256 colors whenever `$TMUX` is set (ink2 renderer, since v2.1.77), so the
+interactive launcher claudewrap deletes `TMUX`/`TMUX_PANE` from the Claude
+child env to let it emit 24-bit truecolor. But `$TMUX` is also what the hook
+keys off to stamp the pane id the renamer worker needs. To keep both,
+claudewrap copies the pane id into the keeper-owned carrier `KEEPER_TMUX_PANE`
+*before* deleting the native vars, and `backendExecCoordsFromEnv` grows a
+fallback arm: when native `TMUX` is absent but the carrier is present it stamps
+coord-identical `{type:"tmux", paneId, sessionId}` rows from the carrier (and
+`KEEPER_TMUX_SESSION`). The carrier name is defined once, in
+`execBackendEnvMeta(...).paneIdCarrierEnvVar`; claudewrap holds a matching
+literal guarded by a cross-reference comment (no shared module across repos).
+The fallback is inert until something sets the carrier, so keeper ships first.
+
 **Bounded subprocess await.** Every `runCapture` races `proc.exited`
 against a 5s kill-timeout: a wedged tmux subprocess would otherwise freeze the
 reconciler forever (no fatalExit covers that path), so on expiry the child
@@ -225,7 +239,7 @@ in isolation and the runtime composes them:
 | `buildTmuxSelectPaneArgs(paneId)` | `select-pane` by pane id — focus |
 | `buildTmuxListPanesArgs()` | `list-panes -a -F '#{pane_id}\t#{window_id}\t#{window_name}'` — server-wide pane sweep (tab-delimited, name last) |
 | `buildTmuxRenameWindowArgs(windowId, name)` | `rename-window -t <windowId> -- <name>` — `--`-guarded window rename by `@N` id |
-| `execBackendEnvMeta(backendType?)` | hook env-var names (`KEEPER_TMUX_SESSION` / `TMUX_PANE`) |
+| `execBackendEnvMeta(backendType?)` | hook env-var names (`KEEPER_TMUX_SESSION` / `TMUX_PANE`, plus the `paneIdCarrierEnvVar` carrier `KEEPER_TMUX_PANE`) |
 
 ## Extending to a new backend
 
@@ -236,10 +250,12 @@ single-backend collapse — three steps:
    `ensureLaunched`, `listPanes`, `renameWindow`) over the new mechanism,
    exporting pure argv builders for the tests.
 2. Teach `execBackendEnvMeta(backendType)` the new backend's
-   `backend_exec_type`, session-id, and pane-id env-var names. This is the
-   single source of truth for the env vars the **hook** reads on every event
-   — funnelling the literals through this seam keeps the hook
-   backend-agnostic so it never learns new keys.
+   `backend_exec_type`, session-id, pane-id, and pane-id-carrier env-var
+   names. This is the single source of truth for the env vars the **hook**
+   reads on every event — including the `paneIdCarrierEnvVar` fallback-read
+   key the hook consults when the native pane-id var is stripped. Funnelling
+   the literals through this seam keeps the hook backend-agnostic so it never
+   learns new keys.
 3. Branch `resolveExecBackend(deps)` on backend type to construct the new
    factory, and add the tag to `VALID_EXEC_BACKENDS` in `db.ts` so the
    config parser accepts it. Call sites already go through the resolver, so

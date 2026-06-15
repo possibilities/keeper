@@ -66,9 +66,11 @@ synchronous `process.env` reads (no fork, no fs, no PPID-walk), folded onto
 `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
 `COALESCE`. The backend is tmux, read via `TMUX` (`KEEPER_TMUX_SESSION` for the
 session name, which a keeper-managed launch injects via `-e`, and `TMUX_PANE`
-for the pane). A human-created tmux session carries no `KEEPER_TMUX_SESSION`, so
-its session name lands via the restore-worker's pane-snapshot poller (epic
-fn-789). The generic `backend_exec_*` naming keeps a further backend slotting in
+for the pane). The pane id is a two-step read: native `TMUX_PANE` first, else
+the keeper-owned carrier `KEEPER_TMUX_PANE` (claudewrap strips `TMUX`/`TMUX_PANE`
+so Claude emits truecolor, copying the pane id into the carrier first). A
+human-created tmux session carries no `KEEPER_TMUX_SESSION`, so its session name
+lands via the restore-worker's pane-snapshot poller (epic fn-789). The generic `backend_exec_*` naming keeps a further backend slotting in
 without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
 lifecycle, every session's profile attribution, every planctl-CLI
@@ -1734,7 +1736,12 @@ synchronous `process.env` values on EVERY event for the tmux backend:
 (present only on keeper-managed launches, injected via `-e`; a human-created
 tmux session gets it filled later by the restore-worker pane poller, epic
 fn-789), `TMUX_PANE` → `backend_exec_pane_id` (raw; no fork, no fs, no
-PPID-walk; absent env ⇒ NULL coords, never a bogus `type`) — and the reducer's
+PPID-walk; absent env ⇒ NULL coords, never a bogus `type`). The pane id is a
+two-step read: native `TMUX_PANE` first, else the keeper-owned carrier
+`KEEPER_TMUX_PANE` (claudewrap strips `TMUX`/`TMUX_PANE` to let Claude emit
+truecolor, copying the pane id into the carrier first so window renaming
+survives the strip; the carrier-fed fallback stamps coord-identical tmux rows).
+And the reducer's
 `applyEvent` arm folds the three onto
 `jobs.backend_exec_{type,session_id,pane_id}` latest-non-NULL-wins via
 `COALESCE`, so a re-fold from cursor=0 reproduces byte-identical rows. The

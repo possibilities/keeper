@@ -43,8 +43,8 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   helpers. It never opens the DB, so it never migrates or probes schema.
 - **Scraping is scoped.** On `SessionStart` only: parent claude `--name`/`-n` +
   `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event:
-  `TMUX`/`TMUX_PANE`/`KEEPER_TMUX_SESSION` env reads (synchronous, no
-  fork/fs). No other scraping, no env read in a fold.
+  `TMUX`/`TMUX_PANE`/`KEEPER_TMUX_SESSION`/`KEEPER_TMUX_PANE` env reads
+  (synchronous, no fork/fs). No other scraping, no env read in a fold.
 
 ## Migrations
 

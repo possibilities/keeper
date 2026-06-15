@@ -90,6 +90,7 @@ test("execBackendEnvMeta: defaults to DEFAULT_EXEC_BACKEND, returns KEEPER_TMUX_
   expect(meta.backendType).toBe(DEFAULT_EXEC_BACKEND);
   expect(meta.sessionIdEnvVar).toBe("KEEPER_TMUX_SESSION");
   expect(meta.paneIdEnvVar).toBe("TMUX_PANE");
+  expect(meta.paneIdCarrierEnvVar).toBe("KEEPER_TMUX_PANE");
 });
 
 test("execBackendEnvMeta: 'tmux' returns KEEPER_TMUX_SESSION / TMUX_PANE", () => {
@@ -97,6 +98,7 @@ test("execBackendEnvMeta: 'tmux' returns KEEPER_TMUX_SESSION / TMUX_PANE", () =>
   expect(meta.backendType).toBe("tmux");
   expect(meta.sessionIdEnvVar).toBe("KEEPER_TMUX_SESSION");
   expect(meta.paneIdEnvVar).toBe("TMUX_PANE");
+  expect(meta.paneIdCarrierEnvVar).toBe("KEEPER_TMUX_PANE");
 });
 
 test("execBackendEnvMeta: unknown backend keeps its label but falls back to tmux env vars", () => {
@@ -104,6 +106,7 @@ test("execBackendEnvMeta: unknown backend keeps its label but falls back to tmux
   expect(meta.backendType).toBe("wezterm");
   expect(meta.sessionIdEnvVar).toBe("KEEPER_TMUX_SESSION");
   expect(meta.paneIdEnvVar).toBe("TMUX_PANE");
+  expect(meta.paneIdCarrierEnvVar).toBe("KEEPER_TMUX_PANE");
 });
 
 // ---------------------------------------------------------------------------

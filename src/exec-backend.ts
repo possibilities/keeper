@@ -133,6 +133,13 @@ export interface ExecBackendEnvMeta {
   readonly backendType: string;
   readonly sessionIdEnvVar: string;
   readonly paneIdEnvVar: string;
+  /**
+   * Keeper-owned carrier the hook reads for the pane id when the native
+   * `TMUX`/`TMUX_PANE` env has been stripped (claudewrap deletes them so Claude
+   * emits truecolor, copying the pane id here first). The fallback read in
+   * `backendExecCoordsFromEnv` keys off this name.
+   */
+  readonly paneIdCarrierEnvVar: string;
 }
 
 export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
@@ -148,6 +155,13 @@ export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
     backendType: t,
     sessionIdEnvVar: "KEEPER_TMUX_SESSION",
     paneIdEnvVar: "TMUX_PANE",
+    // Drift guard: this literal MUST stay byte-identical to the carrier string
+    // claudewrap writes in ~/code/claudewrap/src/main.ts. There is no shared
+    // module across the two repos; matching comments on both sides are the
+    // agreed drift guard. claudewrap copies `$TMUX_PANE` here before deleting
+    // `TMUX`/`TMUX_PANE` (so Claude emits truecolor), and the hook's fallback
+    // arm reads it to keep stamping the pane id for window renaming.
+    paneIdCarrierEnvVar: "KEEPER_TMUX_PANE",
   };
 }
 

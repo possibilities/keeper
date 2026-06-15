@@ -239,8 +239,14 @@ export interface BackendExecCoords {
  *    is present (keeper-managed launches inject it via `-e`). A human-created
  *    tmux session carries no `KEEPER_TMUX_SESSION`, so the session stays NULL
  *    and the snapshot poller fills it later.
- *  - no sentinel → all-NULL; never stamp a bogus `type` for a session launched
- *    outside the multiplexer.
+ *  - native `TMUX` absent but the carrier `KEEPER_TMUX_PANE` present → the
+ *    fallback arm stamps coord-identical tmux rows from the carrier. claudewrap
+ *    strips `TMUX`/`TMUX_PANE` (so Claude emits truecolor) after copying the
+ *    pane id into the carrier; this arm keeps window renaming alive across the
+ *    strip. The carrier is a hint, not proof of a live pane: an empty/absent
+ *    carrier collapses to all-NULL (never a `type=tmux` row with a NULL pane).
+ *  - no sentinel and no carrier → all-NULL; never stamp a bogus `type` for a
+ *    session launched outside the multiplexer.
  *
  * Each sub-var collapses absent/empty to NULL independently so the reducer's
  * COALESCE arm cannot be clobbered by a partial capture. The env-var NAMES are
@@ -267,7 +273,28 @@ export function backendExecCoordsFromEnv(
       paneId: rawPane === undefined || rawPane === "" ? null : rawPane,
     };
   }
-  // Not under tmux — `type` would be a lie; every coord stays NULL.
+  // Fallback arm: native `TMUX` is absent (claudewrap strips it so Claude emits
+  // truecolor), but the keeper-owned carrier `KEEPER_TMUX_PANE` rides through
+  // and holds the pane id. Stamp coord-identical tmux rows from it so window
+  // renaming survives the strip. Same empty→NULL collapse the native arm uses,
+  // applied independently per sub-var. The carrier is a hint, not proof of a
+  // live pane: if it collapses to NULL, fall through to all-NULL — never a
+  // `type=tmux` row with a NULL pane (the renamer filter requires a non-null
+  // pane id). Pure synchronous read — no fs/fork (hook cold-start budget).
+  const meta = execBackendEnvMeta("tmux");
+  const rawCarrier = env[meta.paneIdCarrierEnvVar];
+  const carrierPane =
+    rawCarrier === undefined || rawCarrier === "" ? null : rawCarrier;
+  if (carrierPane !== null) {
+    const rawSession = env[meta.sessionIdEnvVar];
+    return {
+      type: meta.backendType,
+      sessionId:
+        rawSession === undefined || rawSession === "" ? null : rawSession,
+      paneId: carrierPane,
+    };
+  }
+  // Not under tmux, no carrier — `type` would be a lie; every coord stays NULL.
   return { type: null, sessionId: null, paneId: null };
 }
 
