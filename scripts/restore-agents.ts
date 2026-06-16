@@ -31,13 +31,16 @@
  * launches (never before the first or after the last).
  *
  * Usage:
- *   bun scripts/restore-agents.ts [--session <name>] [--apply] [--db <path>]
+ *   bun scripts/restore-agents.ts [--session <name>] [--apply] [--last-generation] [--db <path>]
  *   bun scripts/restore-agents.ts --snapshot-current [--session <name>] [--db <path>] > revive.sh
  *
  *   --session <name>   Restore only agents from this backend session. Default:
  *                      all sessions in the candidate set.
  *   --apply            Actually relaunch via `ensureLaunched`. Default is
  *                      DRY-RUN — print what would be restored, touch nothing.
+ *   --last-generation  Bound the crash set to the LAST tmux-server generation
+ *                      window ("the session you just lost") instead of the full
+ *                      7-day pool. Composes with --apply and --session.
  *   --snapshot-current Emit a runnable bash script that revives the CURRENT live
  *                      set (every working/stopped session) into tmux windows — a
  *                      manual safety net independent of the crash-derivation path.
@@ -66,6 +69,7 @@ import {
 } from "../src/exec-backend";
 import {
   deriveCurrentSet,
+  deriveLastGenerationSet,
   deriveRestoreSet,
   type RestoreCandidate,
 } from "../src/restore-set";
@@ -74,11 +78,13 @@ import { buildResumeCommand } from "../src/resume-descriptor";
 const HELP = `restore-agents — replay crash-killed Claude Code agents derived from keeper.db
 
 Usage:
-  bun scripts/restore-agents.ts [--session <name>] [--apply] [--db <path>]
+  bun scripts/restore-agents.ts [--session <name>] [--apply] [--last-generation] [--db <path>]
   bun scripts/restore-agents.ts --snapshot-current [--session <name>] [--db <path>] > revive.sh
 
   --session <name>    Restore only agents from this backend session (default: all)
   --apply             Actually relaunch via ensureLaunched (default: DRY-RUN)
+  --last-generation   Bound the crash set to the LAST tmux-server generation
+                      window ("the session you just lost"); composes with --apply/--session
   --snapshot-current  Emit a runnable revive script for the CURRENT live set (read-only)
   --db <path>         keeper.db path override ($KEEPER_DB / default otherwise)
   --help              Show this help
@@ -90,6 +96,11 @@ name (read live from keeper.db, never a frozen one) wrapped in the same shell
 prologue scripts/resume.ts emits, into the original tmux session. Works with
 keeperd DOWN — the read is a read-only keeper.db connection with no socket
 round-trip.
+
+--last-generation narrows the crash set to the LAST tmux-server generation —
+the agents you just lost when the server died — instead of the full 7-day pool,
+bounding on the kill-anchored BackendExecStart boundary (falls back to the most-
+recent crash burst when no generation boundary is recorded yet).
 
 --snapshot-current is the manual safety net: it reads the CURRENT live set
 (every working/stopped session) and emits a runnable bash script that revives
@@ -120,6 +131,7 @@ interface ParsedArgs {
   session: string | null;
   apply: boolean;
   snapshotCurrent: boolean;
+  lastGeneration: boolean;
   db: string | null;
   help: boolean;
 }
@@ -153,6 +165,7 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
       session: { type: "string" },
       apply: { type: "boolean", default: false },
       "snapshot-current": { type: "boolean", default: false },
+      "last-generation": { type: "boolean", default: false },
       db: { type: "string" },
       help: { type: "boolean", default: false },
     },
@@ -162,6 +175,7 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
     session: parsed.values.session ?? null,
     apply: parsed.values.apply === true,
     snapshotCurrent: parsed.values["snapshot-current"] === true,
+    lastGeneration: parsed.values["last-generation"] === true,
     db: parsed.values.db ?? null,
     help: parsed.values.help === true,
   };
@@ -473,6 +487,34 @@ export function loadRestoreSet(dbPath: string): {
 }
 
 /**
+ * Read the LAST-GENERATION crash-restore set off a read-only `keeper.db` in one
+ * open span — the `--last-generation` source. Same membership/filters as
+ * {@link loadRestoreSet}, bounded to the kill-anchored generation window (see
+ * {@link deriveLastGenerationSet}). Re-throws on open failure (the caller maps
+ * it to `die`). Exported for tests so the read path is assertable against a
+ * seeded DB.
+ */
+export function loadLastGenerationSet(dbPath: string): {
+  candidates: RestoreCandidate[];
+  excludedIdleCount: number;
+} {
+  const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
+  try {
+    const set = deriveLastGenerationSet(db);
+    return {
+      candidates: set.candidates,
+      excludedIdleCount: set.excludedIdleCount,
+    };
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // best-effort; the script is one-shot and exits next.
+    }
+  }
+}
+
+/**
  * Read the CURRENT live set (every `working`/`stopped` session with backend
  * coords) off a read-only `keeper.db` in one open span — the `--snapshot-current`
  * source. Re-throws on open failure (the caller maps it to `die`). Exported for
@@ -523,10 +565,16 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  // --last-generation bounds the crash set to the kill-anchored generation
+  // window ("the session you just lost"); it composes with --apply and --session
+  // by swapping ONLY which load feeds the candidate set — the plan/render/apply
+  // path is identical.
   let candidates: RestoreCandidate[];
   let excludedIdleCount: number;
   try {
-    const set = loadRestoreSet(dbPath);
+    const set = args.lastGeneration
+      ? loadLastGenerationSet(dbPath)
+      : loadRestoreSet(dbPath);
     candidates = set.candidates;
     excludedIdleCount = set.excludedIdleCount;
   } catch (err) {

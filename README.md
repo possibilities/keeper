@@ -2375,11 +2375,20 @@ carries its OWN producer-stamped `close_kind` and membership is a per-row
 predicate over it (no per-row "this is where the crash happened" anchor). Epic
 fn-819 adds a generation BOUNDARY the restore-worker records — a
 `BackendExecStart` synthetic event minted on a tmux-server-pid change (see the
-ninth worker below) — so a forthcoming generation-scoped derivation can bound
-candidates to the PREVIOUS session generation ("the session you just lost")
-rather than the whole crash-like pool; the boundary is cut by `events.id` rowid
-ORDER, never `ts` (boot-sweep `Killed` events all share one `Date.now()`
-instant). A candidate is a `state='killed'` job whose death
+ninth worker below) — and the generation-scoped `deriveLastGenerationSet`
+(`restore-agents --last-generation`) bounds candidates to the PREVIOUS session
+generation ("the session you just lost") rather than the whole crash-like pool.
+It runs the SAME membership/filters, then keeps only candidates whose `Killed`
+event sits at or after the KILL-ANCHORED generation boundary
+(`B_boundary = MAX(events.id) WHERE hook_event='BackendExecStart' AND id <= K_max`,
+where `K_max` is the most-recent candidate `Killed` rowid). Anchoring on the
+settled kills (not "the current generation") is load-bearing: boot ordering mints
+the dead-generation kills BEFORE the restore-worker posts the new boundary, so a
+naive "after the most-recent start" bound would exclude the very agents to
+restore. When no `BackendExecStart` precedes the kills (fresh / pre-feature DB)
+it FALLS BACK to the most-recent `Killed` burst, never the full 7-day pool. The
+boundary is cut by `events.id` rowid ORDER, never `ts` (boot-sweep `Killed`
+events all share one `Date.now()` instant). A candidate is a `state='killed'` job whose death
 was crash-like — `close_kind ∈ {server_gone, pid_died}` (tmux server gone, or the
 pane process died), or `close_kind ∈ {unknown, NULL}` resolved via a BURST
 HEURISTIC (the boot seed-sweep emits its `Killed` events back-to-back, so a
@@ -2403,6 +2412,9 @@ session via `ExecBackend.ensureLaunched` using the shared `buildResumeCommand` /
 `resumeTarget` substrate (`src/resume-descriptor`) that keeps the three
 resume-command producers byte-identical, pacing window creation 0.5s apart. tmux
 is the sole exec backend, so every candidate routes through one resolved instance.
+`--last-generation` swaps the candidate source to `deriveLastGenerationSet`
+(the kill-anchored generation window above) and composes with `--apply` +
+`--session`; the plan/render/apply path is otherwise identical.
 
 A **ninth** Worker thread is the restore-snapshot worker (epic fn-677; freeze
 machinery RETIRED in fn-817): a pure CONSUMER that opens its own read-only

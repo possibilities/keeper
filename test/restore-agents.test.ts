@@ -25,6 +25,7 @@ import {
   type AgentOutcome,
   applyRestore,
   buildResumeLaunchArgv,
+  loadLastGenerationSet,
   loadRestoreSet,
   planRestore,
   renderOutcomes,
@@ -98,6 +99,20 @@ function seedJob(db: Database, j: SeedJob): void {
         : "work",
       j.plan_verb ?? null,
       j.last_event_id ?? null,
+    ],
+  );
+}
+
+/** Insert a synthetic `BackendExecStart` generation-boundary at an explicit
+ *  rowid — pins the generation window relative to the seeded Killed event_ids. */
+function seedBackendExecStart(db: Database, id: number): void {
+  db.run(
+    `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'backend-exec-start', 'BackendExecStart', 'backend_exec_start', ?)`,
+    [
+      id,
+      RECENT,
+      JSON.stringify({ backend_type: "tmux", generation_id: `gen-${id}` }),
     ],
   );
 }
@@ -576,4 +591,77 @@ test("loadRestoreSet end-to-end: the apply path relaunches each derived candidat
   expect(calls[0].cwd).toBe("/repo/a");
   expect(calls[1].argv[4]).toContain(`claude --resume "uuid-b"`);
   expect(calls[1].cwd).toBe("/repo/b");
+});
+
+// ---------------------------------------------------------------------------
+// loadLastGenerationSet — the --last-generation source (epic fn-819 T2)
+// ---------------------------------------------------------------------------
+
+test("loadLastGenerationSet bounds to the last generation; the full set offers more", () => {
+  // gen-A start at id 100, gen-B start at id 200. A prior-gen kill (id 150) and
+  // two last-gen kills (ids 250/251).
+  seedBackendExecStart(kdb.db, 100);
+  seedBackendExecStart(kdb.db, 200);
+  seedJob(kdb.db, {
+    job_id: "prior-gen",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+    backend_exec_session_id: "foreground",
+  });
+  seedJob(kdb.db, {
+    job_id: "last-gen-a",
+    close_kind: "server_gone",
+    window_index: 1,
+    last_event_id: 250,
+    backend_exec_session_id: "foreground",
+  });
+  seedJob(kdb.db, {
+    job_id: "last-gen-b",
+    close_kind: "server_gone",
+    window_index: 2,
+    last_event_id: 251,
+    backend_exec_session_id: "work",
+  });
+  kdb.db.close();
+
+  // The full set offers all three; last-generation bounds to gen-B's two kills.
+  expect(loadRestoreSet(dbPath).candidates.map((c) => c.job_id)).toEqual([
+    "prior-gen",
+    "last-gen-a",
+    "last-gen-b",
+  ]);
+  expect(loadLastGenerationSet(dbPath).candidates.map((c) => c.job_id)).toEqual(
+    ["last-gen-a", "last-gen-b"],
+  );
+});
+
+test("loadLastGenerationSet composes with the --session foreground filter", () => {
+  // Two last-generation kills in different sessions; planRestore narrows to one.
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "fg-agent",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+    backend_exec_session_id: "foreground",
+  });
+  seedJob(kdb.db, {
+    job_id: "work-agent",
+    close_kind: "server_gone",
+    window_index: 1,
+    last_event_id: 151,
+    backend_exec_session_id: "work",
+  });
+  kdb.db.close();
+
+  const { candidates } = loadLastGenerationSet(dbPath);
+  expect(candidates.map((c) => c.job_id).sort()).toEqual([
+    "fg-agent",
+    "work-agent",
+  ]);
+  // --session foreground narrows to the foreground bucket only.
+  const plan = planRestore(candidates, "foreground");
+  expect(plan).toHaveLength(1);
+  expect(plan[0].candidate.job_id).toBe("fg-agent");
 });

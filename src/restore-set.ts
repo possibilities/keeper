@@ -244,6 +244,19 @@ export function isCrashLike(
 }
 
 /**
+ * One crash-restore candidate paired with the `event_id` (rowid) of the Killed
+ * event that produced it — the generation-window sort key
+ * {@link deriveLastGenerationSet} bounds on. The bare {@link RestoreCandidate}
+ * doesn't carry the rowid (the visual-order presenter never needs it), so the
+ * shared membership/filter pass threads it alongside for the as-of-query bound.
+ */
+interface CandidateWithEventId {
+  candidate: RestoreCandidate;
+  /** The Killed event's rowid (`events.id`); NULL on a legacy/partial row. */
+  last_event_id: number | null;
+}
+
+/**
  * Read the killed-job cohort and the live-job id set off a read-only DB
  * connection in ONE pass each. `state='killed'` for the cohort; `state ∈
  * {working, stopped}` for the live dedup set (the same "live" scope the `jobs`
@@ -288,6 +301,25 @@ export function deriveRestoreSet(
   db: Database,
   options: DeriveRestoreSetOptions = {},
 ): RestoreSetResult {
+  const { collected, excludedIdleCount } = collectCrashCandidates(db, options);
+  const candidates = collected.map((c) => c.candidate);
+  candidates.sort(compareCandidates);
+  return { candidates, excludedIdleCount };
+}
+
+/**
+ * The shared membership/filter pass behind both {@link deriveRestoreSet} and
+ * {@link deriveLastGenerationSet}: read the killed cohort, apply crash-like
+ * membership (close_kind + burst backstop) and every filter (backend coords,
+ * autopilot workers, live-UUID dedup, idle cutoff), and return each surviving
+ * candidate PAIRED with its Killed-event rowid (the generation-window sort key).
+ * UNORDERED — the callers sort (`deriveRestoreSet` after dropping the rowid;
+ * `deriveLastGenerationSet` after the window bound). Never throws on data.
+ */
+function collectCrashCandidates(
+  db: Database,
+  options: DeriveRestoreSetOptions,
+): { collected: CandidateWithEventId[]; excludedIdleCount: number } {
   const now = options.now ?? Date.now() / 1000;
   const idleCutoffSecs = options.idleCutoffSecs ?? DEFAULT_IDLE_CUTOFF_SECS;
   const idleBefore = now - idleCutoffSecs;
@@ -299,7 +331,7 @@ export function deriveRestoreSet(
   // — independent of which rows later pass the filters.
   const burst = burstEventIds(killed.map((r) => r.last_event_id));
 
-  const candidates: RestoreCandidate[] = [];
+  const collected: CandidateWithEventId[] = [];
   let excludedIdleCount = 0;
 
   for (const row of killed) {
@@ -334,21 +366,136 @@ export function deriveRestoreSet(
     }
 
     const label = row.title != null && row.title !== "" ? row.title : jobId;
-    candidates.push({
-      job_id: jobId,
-      resume_target: label,
-      label,
-      window_index:
-        typeof row.window_index === "number" &&
-        Number.isFinite(row.window_index)
-          ? row.window_index
+    collected.push({
+      candidate: {
+        job_id: jobId,
+        resume_target: label,
+        label,
+        window_index:
+          typeof row.window_index === "number" &&
+          Number.isFinite(row.window_index)
+            ? row.window_index
+            : null,
+        cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
+        backend_exec_session_id: backendSession,
+        created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+      },
+      last_event_id:
+        typeof row.last_event_id === "number" &&
+        Number.isFinite(row.last_event_id)
+          ? row.last_event_id
           : null,
-      cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
-      backend_exec_session_id: backendSession,
-      created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
     });
   }
 
+  return { collected, excludedIdleCount };
+}
+
+/**
+ * Derive the LAST-GENERATION crash-restore set: the crash candidates bounded to
+ * the kill-anchored tmux-server generation window — "the session you just lost",
+ * not the 7-day pool {@link deriveRestoreSet} returns. (epic fn-819, T2)
+ *
+ * Membership/filters are IDENTICAL to {@link deriveRestoreSet} (shared via
+ * {@link collectCrashCandidates}); the only addition is the generation bound:
+ *
+ *   - `K_max` = the MAX Killed-event rowid over the surviving candidates — the
+ *     most-recent crash kill we're about to offer.
+ *   - `B_boundary` = `MAX(events.id) WHERE hook_event='BackendExecStart' AND
+ *     id <= K_max` — the generation-start boundary the most-recent kills BELONG
+ *     to. Anchoring on the kills (not "the current generation") is the
+ *     load-bearing correctness piece: boot ordering mints the dead-generation
+ *     Killed events BEFORE the restore-worker posts the new BackendExecStart, so
+ *     a naive "after the most-recent start" bound would exclude the very agents
+ *     we want. Anchoring at `<= K_max` puts the boundary at the generation the
+ *     settled kills sit in, so they stay inside the window.
+ *   - keep candidates with `last_event_id >= B_boundary` — this generation only;
+ *     a prior-generation straggler (rowid below the boundary) is excluded.
+ *
+ * FALLBACK. When `B_boundary` is NULL — no `BackendExecStart` recorded before
+ * the kills (a fresh / pre-feature DB) — degrade to the BURST heuristic: keep
+ * only the candidates in the most-recent contiguous Killed cluster
+ * ({@link burstEventIds} over the candidates' rowids, take the cluster with the
+ * largest max rowid). This bounds to the last crash sweep, NOT the full 7-day
+ * pool (which would reintroduce the over-offer this epic fixes). A candidate
+ * with a NULL rowid has no position in either bound and is dropped.
+ *
+ * Empty candidate set ⇒ empty result. Reads only `events` + `jobs` off the
+ * passed read-only connection (daemon-down OK); reuses {@link RestoreCandidate}
+ * and {@link compareCandidates} verbatim (resume_target = latest name).
+ */
+export function deriveLastGenerationSet(
+  db: Database,
+  options: DeriveRestoreSetOptions = {},
+): RestoreSetResult {
+  const { collected, excludedIdleCount } = collectCrashCandidates(db, options);
+  if (collected.length === 0) {
+    return { candidates: [], excludedIdleCount };
+  }
+
+  // K_max: the most-recent Killed-event rowid among the candidates. A candidate
+  // with no rowid contributes nothing to the bound (and can never pass it).
+  const eventIds = collected
+    .map((c) => c.last_event_id)
+    .filter((x): x is number => typeof x === "number" && Number.isFinite(x));
+  if (eventIds.length === 0) {
+    // No positioned candidate at all — no window to bound. Empty, cleanly.
+    return { candidates: [], excludedIdleCount };
+  }
+  const kMax = Math.max(...eventIds);
+
+  // B_boundary: the generation start the most-recent kills belong to. Cut by
+  // `events.id` (rowid) ORDER, NEVER `ts` — boot-sweep Killed events share one
+  // Date.now() instant, so a timestamp cut would smear the whole sweep. (The PK
+  // column is `id`, never `event_id`.)
+  const boundaryRow = db
+    .query(
+      `SELECT MAX(id) AS boundary
+         FROM events
+        WHERE hook_event = 'BackendExecStart'
+          AND id <= ?`,
+    )
+    .get(kMax) as { boundary: number | null } | null;
+  const bBoundary =
+    boundaryRow != null &&
+    typeof boundaryRow.boundary === "number" &&
+    Number.isFinite(boundaryRow.boundary)
+      ? boundaryRow.boundary
+      : null;
+
+  let kept: CandidateWithEventId[];
+  if (bBoundary !== null) {
+    // Generation window: keep this generation's kills only.
+    kept = collected.filter(
+      (c) => c.last_event_id !== null && c.last_event_id >= bBoundary,
+    );
+  } else {
+    // NULL-boundary fallback: no BackendExecStart before the kills. Restrict to
+    // the most-recent contiguous Killed burst, NOT the full pool.
+    const burst = burstEventIds(collected.map((c) => c.last_event_id));
+    if (burst.size > 0) {
+      const burstMax = Math.max(...burst);
+      // The most-recent contiguous run ends at burstMax; walk back over the
+      // gap-free rowids to find that run's floor, then keep candidates inside it.
+      let floor = burstMax;
+      while (burst.has(floor - 1)) {
+        floor--;
+      }
+      kept = collected.filter(
+        (c) =>
+          c.last_event_id !== null &&
+          c.last_event_id >= floor &&
+          c.last_event_id <= burstMax,
+      );
+    } else {
+      // No burst either (every candidate isolated, e.g. a lone server_gone with
+      // no BackendExecStart). The most-recent kill is the only last-generation
+      // signal we have — keep candidates at K_max.
+      kept = collected.filter((c) => c.last_event_id === kMax);
+    }
+  }
+
+  const candidates = kept.map((c) => c.candidate);
   candidates.sort(compareCandidates);
   return { candidates, excludedIdleCount };
 }

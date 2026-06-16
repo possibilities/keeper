@@ -23,6 +23,7 @@ import {
   burstEventIds,
   DEFAULT_IDLE_CUTOFF_SECS,
   deriveCurrentSet,
+  deriveLastGenerationSet,
   deriveRestoreSet,
   isCrashLike,
 } from "../src/restore-set";
@@ -94,6 +95,32 @@ function seedJob(db: Database, j: SeedJob): void {
 
 function derive(opts?: { now?: number; idleCutoffSecs?: number }) {
   return deriveRestoreSet(kdb.db, { now: NOW, ...opts });
+}
+
+function deriveLastGen(opts?: { now?: number; idleCutoffSecs?: number }) {
+  return deriveLastGenerationSet(kdb.db, { now: NOW, ...opts });
+}
+
+/**
+ * Insert a synthetic `BackendExecStart` generation-boundary event at an EXPLICIT
+ * rowid (so a test pins the boundary relative to its seeded Killed `event_id`s).
+ * Mirrors the daemon producer's column mapping (hook_event/event_type/data); the
+ * generation_id rides `data` but the window logic keys only on `events.id` ORDER.
+ */
+function seedBackendExecStart(
+  db: Database,
+  id: number,
+  generationId = `gen-${id}`,
+): void {
+  db.run(
+    `INSERT INTO events (id, ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, 'backend-exec-start', 'BackendExecStart', 'backend_exec_start', ?)`,
+    [
+      id,
+      NOW - 100,
+      JSON.stringify({ backend_type: "tmux", generation_id: generationId }),
+    ],
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -557,4 +584,211 @@ test("deriveRestoreSet: 2026-06-16 incident — 13-wide Killed burst restores in
   const ids = new Set(res.candidates.map((c) => c.job_id));
   expect(ids.has("isolated-before")).toBe(false);
   expect(ids.has("isolated-after")).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// deriveLastGenerationSet — the kill-anchored generation window (epic fn-819 T2)
+// ---------------------------------------------------------------------------
+
+test("deriveLastGenerationSet: empty DB returns cleanly", () => {
+  const res = deriveLastGen();
+  expect(res.candidates).toEqual([]);
+  expect(res.excludedIdleCount).toBe(0);
+});
+
+test("deriveLastGenerationSet: bounds to the last generation, excludes the prior-gen straggler", () => {
+  // Two generation boundaries: gen-A starts at event id 100, gen-B at id 200.
+  seedBackendExecStart(kdb.db, 100);
+  seedBackendExecStart(kdb.db, 200);
+  // A prior-generation kill (id 150, inside gen-A — between the two boundaries).
+  seedJob(kdb.db, {
+    job_id: "prior-gen",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+  });
+  // Two last-generation kills (ids 250/251, after the gen-B boundary).
+  seedJob(kdb.db, {
+    job_id: "last-gen-a",
+    close_kind: "server_gone",
+    window_index: 1,
+    last_event_id: 250,
+  });
+  seedJob(kdb.db, {
+    job_id: "last-gen-b",
+    close_kind: "server_gone",
+    window_index: 2,
+    last_event_id: 251,
+  });
+
+  // The full restore set offers all three (the 7-day pool); last-generation
+  // bounds to gen-B only.
+  expect(derive().candidates.map((c) => c.job_id)).toEqual([
+    "prior-gen",
+    "last-gen-a",
+    "last-gen-b",
+  ]);
+  const res = deriveLastGen();
+  expect(res.candidates.map((c) => c.job_id)).toEqual([
+    "last-gen-a",
+    "last-gen-b",
+  ]);
+});
+
+test("deriveLastGenerationSet: REGRESSION — boot-ordering race (kills BEFORE the new boundary)", () => {
+  // The load-bearing scenario: seedKilledSweep mints the dead-generation Killed
+  // events BEFORE the restore-worker posts the NEW BackendExecStart, so the
+  // dead-gen kills have event_ids < the new boundary. A naive "after the most-
+  // recent BackendExecStart" bound would exclude them (return empty); anchoring
+  // on K_max (the settled kills) keeps them.
+  //
+  // Timeline by events.id:
+  //   100  BackendExecStart (gen-A start — the generation that just died)
+  //   150  Killed dead-gen-1   ┐ the boot sweep's dead-generation kills
+  //   151  Killed dead-gen-2   ┘ (close_kind server_gone)
+  //   200  BackendExecStart (gen-B start — the NEW server, posted AFTER the kills)
+  seedBackendExecStart(kdb.db, 100, "gen-A");
+  seedJob(kdb.db, {
+    job_id: "dead-gen-1",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+  });
+  seedJob(kdb.db, {
+    job_id: "dead-gen-2",
+    close_kind: "server_gone",
+    window_index: 1,
+    last_event_id: 151,
+  });
+  seedBackendExecStart(kdb.db, 200, "gen-B");
+
+  // Naive bound: MAX(BackendExecStart.id) = 200; "kills after 200" = EMPTY.
+  // Prove the trap is real, then prove deriveLastGenerationSet avoids it.
+  const naiveBoundary = (
+    kdb.db
+      .query(
+        "SELECT MAX(id) AS m FROM events WHERE hook_event='BackendExecStart'",
+      )
+      .get() as { m: number }
+  ).m;
+  expect(naiveBoundary).toBe(200);
+  // K_max over the kills = 151; B_boundary = MAX(id <= 151) = 100 (gen-A start).
+  // The dead-gen kills (150, 151 >= 100) stay in the window.
+  const res = deriveLastGen();
+  expect(res.candidates.map((c) => c.job_id)).toEqual([
+    "dead-gen-1",
+    "dead-gen-2",
+  ]);
+});
+
+test("deriveLastGenerationSet: NULL boundary (no BackendExecStart) falls back to the burst, not the full pool", () => {
+  // No BackendExecStart row at all (fresh / pre-feature DB). Fall back to the
+  // most-recent contiguous Killed burst — NOT the 7-day pool.
+  // Most-recent burst: ids 500/501. An older isolated kill at id 100 must be
+  // excluded by the fallback (it would be in the full pool via burst membership
+  // only if contiguous — here it's isolated, but the point is the LAST-gen bound
+  // drops it regardless).
+  seedJob(kdb.db, {
+    job_id: "old-burst-a",
+    close_kind: "unknown",
+    window_index: 0,
+    last_event_id: 100,
+  });
+  seedJob(kdb.db, {
+    job_id: "old-burst-b",
+    close_kind: "unknown",
+    window_index: 1,
+    last_event_id: 101,
+  });
+  seedJob(kdb.db, {
+    job_id: "recent-burst-a",
+    close_kind: "unknown",
+    window_index: 2,
+    last_event_id: 500,
+  });
+  seedJob(kdb.db, {
+    job_id: "recent-burst-b",
+    close_kind: "unknown",
+    window_index: 3,
+    last_event_id: 501,
+  });
+
+  // The full pool (deriveRestoreSet) offers BOTH bursts (4 candidates).
+  expect(derive().candidates.length).toBe(4);
+  // Last-generation, NULL-boundary fallback: only the most-recent burst.
+  const res = deriveLastGen();
+  expect(res.candidates.map((c) => c.job_id)).toEqual([
+    "recent-burst-a",
+    "recent-burst-b",
+  ]);
+});
+
+test("deriveLastGenerationSet: no candidates returns empty cleanly", () => {
+  // A user-closed window is never a candidate — empty set, no throw, even with a
+  // boundary present.
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "user-closed",
+    close_kind: "window_gone_server_alive",
+    last_event_id: 150,
+  });
+  const res = deriveLastGen();
+  expect(res.candidates).toEqual([]);
+});
+
+test("deriveLastGenerationSet: a single server_gone with no boundary keeps the most-recent kill", () => {
+  // Lone crash kill, no BackendExecStart, no burst (isolated). The most-recent
+  // kill is the only last-generation signal — keep it (don't silently drop).
+  seedJob(kdb.db, {
+    job_id: "lone-crash",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 999,
+  });
+  const res = deriveLastGen();
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["lone-crash"]);
+});
+
+test("deriveLastGenerationSet: reuses latest-name resume_target + idle counting", () => {
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "uuid-x",
+    close_kind: "server_gone",
+    window_index: 0,
+    title: "renamed-since-launch",
+    last_event_id: 150,
+    updated_at: NOW - 60,
+  });
+  // An idle-past-cutoff kill in the SAME generation — excluded but counted.
+  seedJob(kdb.db, {
+    job_id: "stale",
+    close_kind: "server_gone",
+    window_index: 1,
+    last_event_id: 151,
+    updated_at: NOW - DEFAULT_IDLE_CUTOFF_SECS - 60,
+  });
+  const res = deriveLastGen();
+  expect(res.candidates.map((c) => c.job_id)).toEqual(["uuid-x"]);
+  expect(res.candidates[0]?.resume_target).toBe("renamed-since-launch");
+  expect(res.candidates[0]?.label).toBe("renamed-since-launch");
+  expect(res.excludedIdleCount).toBe(1);
+});
+
+test("deriveLastGenerationSet: works against a read-only connection (daemon-down path)", () => {
+  seedBackendExecStart(kdb.db, 100);
+  seedJob(kdb.db, {
+    job_id: "ro",
+    close_kind: "server_gone",
+    window_index: 0,
+    last_event_id: 150,
+  });
+  kdb.db.close();
+  const ro = new Database(dbPath, { readonly: true });
+  try {
+    const res = deriveLastGenerationSet(ro, { now: NOW });
+    expect(res.candidates.map((c) => c.job_id)).toEqual(["ro"]);
+  } finally {
+    ro.close();
+  }
+  kdb = { db: ro, stmts: kdb.stmts };
 });
