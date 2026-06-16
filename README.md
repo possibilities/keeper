@@ -519,16 +519,12 @@ Keeper has no `install` verb. Wire it up manually:
    are tiered behind `bun run test:full`; see CLAUDE.md `## Test isolation`). A
    third helper, `retryUntil` (`test/helpers/retry-until.ts`), polls until an
    async worker/daemon condition holds and is the canonical replacement for a
-   fixed `Bun.sleep` deadline race. The restore worker (epic fn-677, two-tier
-   rework fn-702) writes `~/.local/state/keeper/restore.json` (the
-   Chrome-style "restore previous session" snapshot — agents + per-bucket
-   backend metadata for `scripts/restore-agents.ts` to replay against) as a
-   **two-tier descriptor** `{schema_version, last_session, current}`:
-   `current` is the continuous live mirror (may be empty — there is no
-   empty-skip floor), and `last_session` is the FROZEN restore
-   source written only at boot-promote and the `>0→0` collapse edge, so a
-   reboot that reseeds a smaller set still offers the full pre-crash set
-   from `last_session`. Overridable via `KEEPER_RESTORE_FILE` for tests. Set
+   fixed `Bun.sleep` deadline race. The restore worker (epic fn-677) writes
+   `~/.local/state/keeper/restore.json` as a dumb single-tier
+   `{schema_version, current}` live mirror — a DISASTER FALLBACK only, since the
+   live crash-restore set is now derived at read time from `keeper.db`'s
+   producer-stamped `close_kind` / `window_index` columns (fn-817), not from
+   this file. Overridable via `KEEPER_RESTORE_FILE` for tests. Set
    `KEEPER_TRACE_SERVER=1` to enable verbose server-worker diagnostic logging
    — `[srv-ts]` stage timings, frame byte counts, connection lifecycle — on
    `server.stderr`; off by default (the rare `[server-worker]` error class is
@@ -1893,6 +1889,26 @@ spent/expired marking on the jobs-TUI render is the only place `Date.now()` /
 job-liveness drives display. `ScheduleWakeup` events are deliberately NOT folded
 (high-churn, consumed-on-fire). keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
 frozenset gains `68` (whitelist-only; keeper-py does not read the projection).
+As of schema v70 (fn-817), the producer-stamped `jobs.close_kind TEXT` column
+records WHY a session died, classified by a main-side tmux liveness probe at the
+two `Killed` producer sites (boot seed-sweep + main's exit-watcher handler):
+`server_gone` / `pid_died` (crash-killed → restore) vs.
+`window_gone_server_alive` (the human closed the window → don't restore) vs.
+`unknown` (probe failure → still crash-eligible). The reducer's `Killed` fold
+copies it verbatim (an opaque string; no liveness in the fold), and the
+DB-derived crash-restore set reads it per row instead of a frozen `restore.json`
+snapshot. NULL default, no cursor rewind — a historical `Killed` carries no
+`close_kind`, so a from-scratch re-fold reproduces the NULL zero-event default.
+As of schema v71 (fn-817), the nullable `jobs.window_index INTEGER` column
+captures the live tmux `#{window_index}` (a window's left-to-right VISUAL
+position, not its `@N` identity) so the DB-only restore derivation replays
+windows in original visual order. The restore worker probes it per pulse and
+posts a layout-hash-gated `WindowIndexSnapshot` event; the reducer folds it as a
+pure integer copy keyed by `job_id` (no liveness, no probe in the fold), and a
+killed job KEEPS its last-known value so the index survives to restore time when
+the original tmux server is dead. NULL default, no cursor rewind. keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `70` and `71` (whitelist-only;
+keeper-py does not read either column).
 As of schema v51 (fn-682), the new `jobs.monitors` JSON-array column is the
 live per-job view of the background shells a session is running — the
 plugin-armed chatctl bus, an agent-armed `keeper await`, a backgrounded
@@ -2159,9 +2175,14 @@ set in sync with the candidate `jobs` rows (`state IN ('working','stopped')
 AND pid IS NOT NULL`), and posts an `exit` message whenever a tracked pid
 exits or the post-register kill-0 probe finds it already dead. Main — the
 sole writer — verifies the message's `(pid, start_time)` snapshot still
-matches the persisted row, then turns the exit into a synthetic `Killed`
-events row and pumps a wake; the reducer folds it to the `killed` state.
-This is the live-side counterpart to the boot-time seed sweep that runs
+matches the persisted row, runs a main-side tmux liveness probe to classify the
+death into a `close_kind` (`server_gone` / `pid_died` crash-like vs.
+`window_gone_server_alive` user-close vs. `unknown` probe-failure; schema v70,
+fn-817), then turns the exit into a synthetic `Killed` events row carrying that
+`close_kind` and pumps a wake; the reducer folds it to the `killed` state and
+copies `close_kind` verbatim, so the DB-derived crash-restore set can later tell
+a crash from a deliberate close per row. This is the live-side counterpart to
+the boot-time seed sweep that runs
 between `migrate → drainToCompletion` and worker spawn: the sweep covers
 downtime (zombie rows already on disk), the exit-watcher covers steady state
 (processes that die while the daemon is up). It is the third producer-worker
@@ -2345,65 +2366,69 @@ autopilot-owned state is the event-sourced `dispatch_failures` and
 `pending_dispatches` projections; a from-scratch re-fold reproduces both
 byte-identically.
 
-A **ninth** Worker thread is the restore-snapshot worker (epic fn-677,
-two-tier rework fn-702): a pure CONSUMER that opens its own read-only
-connection, polls `PRAGMA data_version` via the shared `watchLoop`
-primitive, and on every change reads the `jobs` + `epics` projections
-through the same `runQuery` read seam the autopilot worker uses. It builds
-a stable `{captured_at, sessions}` TIER of the live (`working` / `stopped`)
-jobs grouped by `backend_exec_session_id` — each bucket tagged with the
-`backend` it ran under (`tmux`, schema v3) and each agent stamped with the live
-tmux `#{window_index}` (left-to-right window POSITION) captured at pulse time
-from a `list-panes` probe correlated by pane id and session-name cross-checked,
-so the restore-agents util replays windows in their original visual order
-(unknown-order agents sink to the tail) — and rewrites
-`~/.local/state/keeper/restore.json` via `atomicWriteFile` as a **two-tier
-descriptor** — `{schema_version, last_session, current}`, the browser
-"restore previous session" model (Chrome "Current Session" / "Last
-Session"):
+The crash-restore set is derived RETROSPECTIVELY from `keeper.db` at READ TIME
+(`src/restore-set.ts`, epic fn-817) — there is no frozen snapshot to read and no
+daemon round-trip, which is exactly the disaster-recovery moment restore exists
+for (a read-only `keeper.db` connection works with keeperd DOWN). The derivation
+is boundary-free: there is no global "this is where the crash happened" marker;
+each `killed` row carries its OWN producer-stamped `close_kind`, and membership
+is a per-row predicate over it. A candidate is a `state='killed'` job whose death
+was crash-like — `close_kind ∈ {server_gone, pid_died}` (tmux server gone, or the
+pane process died), or `close_kind ∈ {unknown, NULL}` resolved via a BURST
+HEURISTIC (the boot seed-sweep emits its `Killed` events back-to-back, so a
+contiguous cluster of `Killed` `event_id`s is a crash signature; an isolated one
+is a routine close — clustered by `event_id` rowid ORDER, never `ts`, since
+boot-sweep `Killed` events are all `Date.now()`-stamped at boot).
+`close_kind = window_gone_server_alive` (the human deliberately closed the
+window) is EXCLUDED always, even inside a burst. After membership, filters drop
+rows with no `backend_exec_session_id`, autopilot workers (`plan_verb='work'`,
+reconciler-managed), `job_id`s already occupying a LIVE backend (the UUID-liveness
+idempotence guard against a double-spawn race, computed from the same DB read),
+and rows idle beyond a cutoff (counted and SURFACED, never silently dropped).
+Candidates sort by captured `window_index` (left-to-right tmux VISUAL position;
+NULL sinks to the tail by `created_at` then `job_id`), so restore replays windows
+in original order. Each candidate's `resume_target` is the `job_id` UUID, never a
+mutable session name — a RENAMED session restores correctly.
 
-- **`current`** — the continuous live mirror. Rewritten on every content
-  change (MAY be empty: the fn-689 last-non-empty empty-skip floor is
-  RETIRED). NOT the restore source.
-- **`last_session`** — the FROZEN restore source, written ONLY at two
-  discrete seams. (1) **Boot-promote:** the first pulse reads the persisted
-  FILE — not the seed-swept `jobs` table, which `seedKilledSweep` has
-  already emptied by the time the worker spawns, so the file is the only
-  pre-crash evidence — and lifts its populated tier forward by precedence
-  `current ‖ last_session ‖` (v1) legacy top-level `sessions`. (2) **The
-  `>0→0` collapse edge:** when the live set drains to empty, the worker
-  freezes the high-water peak (the full pre-collapse count tracked since
-  the set was last empty, NOT the last survivor) into `last_session`; the
-  epoch resets only on a successful write, so a freeze-write failure
-  retries on the next empty pulse. A partial collapse (survivors remain,
-  never reaching 0) freezes nothing by design — it relies on the next
-  boot-promote to capture the survivors.
+`scripts/restore-agents.ts` is a thin presenter over that ordered set: its dry-run
+prints the plan, `--apply` relaunches each survivor into its original backend
+session via `ExecBackend.ensureLaunched` using the shared `buildResumeCommand` /
+`resumeTarget` substrate (`src/resume-descriptor`) that keeps the three
+resume-command producers byte-identical, pacing window creation 0.5s apart. tmux
+is the sole exec backend, so every candidate routes through one resolved instance.
 
-The write gate hashes the WHOLE two-tier file (excluding each tier's
-`captured_at` so an informational timestamp doesn't churn the hash), so a
-`last_session` freeze forces a write even when `current` is byte-stable.
-This fixes the observed 8→2 reboot incident: a reboot that reseeds a
-smaller live set still offers the full pre-crash set from the frozen
-`last_session`. The file is a derived side-file — NOT a projection, NOT in
-the event log — so the worker sidesteps the event-sourcing invariants
-entirely (no DB `SCHEMA_VERSION` bump, no reducer arm, no `keeper/api.py`
-whitelist change; only the side-file's own `RESTORE_SCHEMA_VERSION` bumps
-2→3 for the per-bucket `backend` tag). The worker carries no `onmessage`
-handler — it never posts to main, never writes the DB. Write failures are swallowed to stderr (next pulse
-retries); only an unhandled throw out of the watch loop escalates to
-`onerror`/`close` → fatalExit. The `scripts/restore-agents.ts` util is the
-sole reader; it resolves the restore source `last_session ‖ current ‖`
-(v1) legacy `sessions`, and its `--apply` mode relaunches the surviving
-agents via the exact `claude --resume` shape `scripts/resume.ts` emits,
-deduplicated against jobs still live in the projection. Across every mode it
-sorts each session's agents by the captured `window_index` so restored windows
-come back in their original left-to-right tmux order (unknown order to the
-tail), and paces window creation 0.5s apart between consecutive launches. Each bucket relaunches through the sole tmux backend; any legacy `backend` tag
-(or an absent v2 tag) no longer selects a different multiplexer — every tag
-resolves to tmux. The schema bump is the
-load-bearing coupling: the moment the worker writes a new
-`RESTORE_SCHEMA_VERSION`, the OLD reader treats it as "future" and refuses,
-so the bumped writer and reader ship in the same commit.
+A **ninth** Worker thread is the restore-snapshot worker (epic fn-677; freeze
+machinery RETIRED in fn-817): a pure CONSUMER that opens its own read-only
+connection, polls `PRAGMA data_version` via the shared `watchLoop` primitive, and
+on every change reads the `jobs` + `epics` projections through the same `runQuery`
+read seam the autopilot worker uses. It rewrites
+`~/.local/state/keeper/restore.json` via `atomicWriteFile` as a DUMB single-tier
+`{schema_version, current}` live mirror — `current` is the continuous mirror of
+the live (`working` / `stopped`) jobs grouped by `backend_exec_session_id`, each
+bucket carrying a `backend` tag (`tmux`, v3), rewritten on every content change
+(MAY be empty). This file is the DISASTER FALLBACK only, read by
+`scripts/restore-agents.ts --snapshot-current`; the two-tier `last_session` freeze
+model (boot-promote + the `>0→0` collapse edge + high-water peak) is GONE, since
+per-row `close_kind` membership replaces "which set was live before the crash"
+with nothing to freeze. The write gate is an in-memory `lastHash` over the file
+(sans `current.captured_at`). The file is a derived side-file — NOT a projection,
+NOT in the event log — so the mirror itself needs no `SCHEMA_VERSION` bump, no
+reducer arm, no `keeper/api.py` change (the `close_kind` v70 / `window_index` v71
+column bumps that power the DB-derived set are separate, and carry their
+`SUPPORTED_SCHEMA_VERSIONS` entries; see the Architecture schema history).
+
+Riding the SAME data_version pulse, the worker self-gates on ANY live tmux job
+and spawns ONE `tmux list-panes` probe feeding two consumers: the WINDOW-ORDER
+capture, which posts a layout-hash-gated `WindowIndexSnapshot` event so the
+reducer stamps each job's live `#{window_index}` onto the `jobs.window_index`
+column (a killed job keeps its last value, so visual order survives to restore
+time when the original tmux server is dead); and the PANE-FILL post, which mints
+the sole `TmuxPaneSnapshot` synthetic event (fill-only) when a live tmux job
+carries a NULL `backend_exec_session_id`. Those two posts are the worker's only
+worker→main channel and only event-log contribution — the restore-file write path
+remains a pure consumer side-file. Write failures are swallowed to stderr (next
+pulse retries); only an unhandled throw out of the watch loop escalates to
+`onerror`/`close` → fatalExit.
 
 An **eleventh** Worker thread is the tmux window-renamer (epic fn-801): a
 pure EXTERNAL ACTUATOR that opens its own read-only connection, polls
