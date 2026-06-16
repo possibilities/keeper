@@ -44,16 +44,24 @@
  * `keeper/api.py` whitelist change, no restore-file reducer arm). The
  * `scripts/restore-agents.ts` util (T4) is the sole reader of that file.
  *
- * **Tmux pane-snapshot poll arm (epic fn-789).** Riding the SAME data_version
- * pulse, the worker self-gates on any live tmux job with a NULL
- * `backend_exec_session_id` (a claude started in a human-created tmux session,
- * incl. the first pane). When armed it spawns `tmux list-panes` and posts ONE
- * `{kind:"tmux-pane-snapshot"}` message to main, which mints the sole
- * `TmuxPaneSnapshot` synthetic event the reducer folds (fill-only). This is the
- * worker's ONLY worker→main channel and its ONLY event-log contribution; the
- * restore-file write path remains a pure consumer side-file. The poller is
- * quiescent when no NULL-session tmux job is live; a producer-side dedup hash
- * stops re-posting an unchanged topology.
+ * **Tmux poll arm (epic fn-789; window order epic fn-681).** Riding the SAME
+ * data_version pulse, the worker self-gates on ANY live tmux job (resolved or
+ * not) and spawns ONE `tmux list-panes` probe whose output feeds two
+ * independent consumers:
+ *  - the WINDOW-ORDER cache (`job_id → #{window_index}`), refreshed every pulse
+ *    a live tmux job exists — the original tmux server is dead at restore time,
+ *    so each agent's left-to-right window POSITION must be captured here and
+ *    stamped onto its `RestoreAgent` so the restore-agents util replays windows
+ *    in visual order; and
+ *  - the PANE-FILL post: when a live tmux job carries a NULL
+ *    `backend_exec_session_id`, the worker posts ONE
+ *    `{kind:"tmux-pane-snapshot"}` message to main, which mints the sole
+ *    `TmuxPaneSnapshot` synthetic event the reducer folds (fill-only).
+ * The post is the worker's ONLY worker→main channel and its ONLY event-log
+ * contribution; the restore-file write path remains a pure consumer side-file.
+ * The poller is quiescent when no live tmux job exists; a producer-side dedup
+ * hash (which DELIBERATELY excludes `window_index`) stops re-posting an
+ * unchanged fill topology, so a pure window reorder never re-fires the post.
  *
  * Worker contract (see CLAUDE.md "Worker contract"):
  *  - `isMainThread` guard — a plain import is inert.
@@ -87,7 +95,7 @@ import {
   serializePlanctlJson,
   sortObjectKeys,
 } from "./db";
-import { DEFAULT_EXEC_BACKEND } from "./exec-backend";
+import { DEFAULT_EXEC_BACKEND, localeDefaultedEnv } from "./exec-backend";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import { runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
@@ -114,14 +122,19 @@ export interface ShutdownMessage {
 }
 
 /**
- * One `(pane_id, session_name)` pair the tmux snapshot probe observed. Both are
- * raw tmux strings: `pane_id` is the `%N` id (the durable handle the COALESCE
- * fold stamped `jobs.backend_exec_pane_id` from `TMUX_PANE`), `session_name` the
+ * One `(pane_id, window_index, session_name)` row the tmux snapshot probe
+ * observed. `pane_id` is the `%N` id (the durable handle the COALESCE fold
+ * stamped `jobs.backend_exec_pane_id` from `TMUX_PANE`), `session_name` the
  * `#{session_name}` the reducer fills onto a NULL-session tmux job.
+ * `window_index` is the `#{window_index}` (the window's left-to-right POSITION,
+ * not its `@N` identity) the producer caches per job so the restore-agents util
+ * can replay windows in original visual order; `null` when the field was
+ * absent/non-numeric (degraded probe). NOT part of the pane-fill snapshot hash.
  */
 export interface TmuxPanePair {
   pane_id: string;
   session_name: string;
+  window_index: number | null;
 }
 
 /**
@@ -155,6 +168,11 @@ const defaultSpawnSync: SpawnSyncFn = (cmd) =>
     stdout: "pipe",
     stderr: "ignore",
     timeout: TMUX_PROBE_TIMEOUT_MS,
+    // LOAD-BEARING locale default: the extended `-F` format emits TAB
+    // delimiters, and a daemon-side tmux CLIENT under the C locale (the
+    // LaunchAgent env carries no LANG/LC_*) sanitizes those TABs to `_`,
+    // dropping every line — every window_index would silently read as absent.
+    env: localeDefaultedEnv(process.env as Record<string, string | undefined>),
   });
 
 /** Upper bound on the `tmux list-panes` probe. A wedged tmux server degrades to
@@ -203,6 +221,16 @@ export const RESTORE_SCHEMA_VERSION = 3;
  *    whose epic isn't in the projection.
  *  - `plan_verb` / `plan_ref` — informational (the restore-agents util surfaces
  *    these in the dry-run label); ride straight off the jobs row.
+ *  - `window_index` — the live tmux `#{window_index}` (left-to-right POSITION)
+ *    captured at pulse time from a `list-panes` probe correlated by
+ *    `backend_exec_pane_id` (session-name cross-checked). The restore-agents
+ *    util sorts restored windows by it so they come back in original visual
+ *    order. `null` when the probe couldn't stamp it (no match, recycled pane,
+ *    degraded probe, or a legacy file with no field) — those agents sink to the
+ *    tail by `created_at` then `job_id`.
+ *  - `created_at` — the job's `jobs.created_at` (Claude session birth). The
+ *    restore-agents util uses it as the tail tiebreaker for unknown-order
+ *    agents, before `job_id`.
  */
 export interface RestoreAgent {
   job_id: string;
@@ -211,6 +239,8 @@ export interface RestoreAgent {
   tier: string | null;
   plan_verb: string | null;
   plan_ref: string | null;
+  window_index: number | null;
+  created_at: number;
 }
 
 /**
@@ -287,8 +317,11 @@ export interface RestoreDescriptor {
  *    a safe value per CLAUDE.md's reducer policy — we mirror that here).
  *
  * Grouping: by `backend_exec_session_id`. Each bucket's `agents` array is
- * sorted ASCENDING by `job_id` so the serialized output is byte-stable
- * across SELECTs that may return rows in different order.
+ * sorted ASCENDING by `job_id` purely for byte-stable serialization (so the
+ * hash gate doesn't false-positive on a row-order shuffle from the SELECT) —
+ * this on-disk sort is NOT visual order. Restored windows are reordered by
+ * `window_index` at restore time, a concern entirely for the restore-agents
+ * util; the file stays `job_id`-sorted.
  *
  * Pre-resolution: `tierForJobFromEpics` runs once per agent against the
  * provided `epicsById` map, so the restore-agents util doesn't need to
@@ -302,6 +335,7 @@ export function buildRestoreTier(
   jobs: Job[],
   epicsById: Map<string, Epic>,
   capturedAt: number,
+  windowIndexByJobId: Map<string, number> = new Map(),
 ): RestoreTier {
   const sessions: Record<string, RestoreSession> = {};
   for (const job of jobs) {
@@ -316,6 +350,7 @@ export function buildRestoreTier(
     }
     const sessionId = job.backend_exec_session_id;
     const tier = tierForJobFromEpics(job, epicsById);
+    const windowIndex = windowIndexByJobId.get(job.job_id);
     const agent: RestoreAgent = {
       job_id: job.job_id,
       cwd: job.cwd,
@@ -323,6 +358,8 @@ export function buildRestoreTier(
       tier,
       plan_verb: job.plan_verb,
       plan_ref: job.plan_ref,
+      window_index: windowIndex ?? null,
+      created_at: job.created_at,
     };
     // Backend tag for the bucket (schema v3): the job's `backend_exec_type`,
     // defaulting to `DEFAULT_EXEC_BACKEND` when NULL. A session name
@@ -555,6 +592,16 @@ interface PulseState {
    * it on a post, so a transient "no pairs" pulse leaves it intact.
    */
   lastSnapshotHash: string | null;
+  /**
+   * Live-tmux window POSITION cache: `job_id → #{window_index}`. Populated each
+   * pulse from the single `list-panes` probe (the pane-id match cross-checked
+   * against the job's `backend_exec_session_id`), pruned to the live job ids,
+   * and seeded from the boot-promoted tier's agents. At restore time the
+   * original tmux server is dead, so order MUST be captured here at pulse time;
+   * `buildRestoreTier` stamps each agent's `window_index` from this map. job_ids
+   * are unique Claude session ids, so an entry is never re-keyed.
+   */
+  lastWindowIndexByJobId: Map<string, number>;
 }
 
 /**
@@ -563,15 +610,20 @@ interface PulseState {
  * false the poller is fully quiescent (no spawn, no post). Reads only the
  * projection rows; pure.
  */
-function hasUnresolvedTmuxJob(jobs: Job[]): boolean {
+/**
+ * True when at least one LIVE (`working`/`stopped`) tmux job exists, regardless
+ * of whether its session is resolved. This is the gate that arms the per-pulse
+ * tmux probe: a NULL-session-only gate would go false once every session
+ * resolves, yet visual window order keeps shifting after that, so order capture
+ * (and the one probe both arms share) must keep running. Reads only the
+ * projection rows; pure.
+ */
+function hasLiveTmuxJob(jobs: Job[]): boolean {
   for (const job of jobs) {
     if (job.state !== "working" && job.state !== "stopped") {
       continue;
     }
-    if (
-      job.backend_exec_type === "tmux" &&
-      job.backend_exec_session_id == null
-    ) {
+    if (job.backend_exec_type === "tmux") {
       return true;
     }
   }
@@ -579,12 +631,18 @@ function hasUnresolvedTmuxJob(jobs: Job[]): boolean {
 }
 
 /**
- * Spawn `tmux list-panes -a -F '#{pane_id}\t#{session_name}'` and parse the
- * `(pane_id, session_name)` pairs. NEVER throws: an ENOENT (no tmux binary), a
- * non-zero exit (no server / no panes), or a malformed line degrades to `[]`
- * (skip silently — no server means nothing to resolve). Tab-delimited because a
- * session name may contain spaces; a line missing the tab or either field is
- * dropped. Pure relative to the injected `spawnSync`.
+ * Spawn `tmux list-panes -a -F '#{pane_id}\t#{window_index}\t#{session_name}'`
+ * and parse the `(pane_id, window_index, session_name)` rows. NEVER throws: an
+ * ENOENT (no tmux binary), a non-zero exit (no server / no panes), or a
+ * malformed line degrades to `[]` (skip silently — no server means nothing to
+ * resolve). The numeric `window_index` is the SECOND field (variable-length
+ * `session_name` last) so a session name with spaces/tabs can't bleed into the
+ * numeric field; the parse uses a two-tab slice and reads the name to end. A
+ * line missing either tab, or with an empty `pane_id`/`session_name`, is
+ * dropped; a non-numeric/empty `window_index` coerces to `null` (the pair still
+ * counts — only the index is absent). Default-spawn env is locale-defaulted so
+ * a C-locale TAB mangle can't drop every row. Pure relative to the injected
+ * `spawnSync`.
  */
 export function probeTmuxPanes(spawnSync: SpawnSyncFn): TmuxPanePair[] {
   let res: ReturnType<SpawnSyncFn>;
@@ -594,7 +652,7 @@ export function probeTmuxPanes(spawnSync: SpawnSyncFn): TmuxPanePair[] {
       "list-panes",
       "-a",
       "-F",
-      "#{pane_id}\t#{session_name}",
+      "#{pane_id}\t#{window_index}\t#{session_name}",
     ]);
   } catch {
     return [];
@@ -608,16 +666,30 @@ export function probeTmuxPanes(spawnSync: SpawnSyncFn): TmuxPanePair[] {
     if (line === "") {
       continue;
     }
-    const tab = line.indexOf("\t");
-    if (tab < 0) {
+    const firstTab = line.indexOf("\t");
+    if (firstTab < 0) {
       continue;
     }
-    const paneId = line.slice(0, tab);
-    const sessionName = line.slice(tab + 1);
+    const secondTab = line.indexOf("\t", firstTab + 1);
+    if (secondTab < 0) {
+      continue;
+    }
+    const paneId = line.slice(0, firstTab);
+    const indexRaw = line.slice(firstTab + 1, secondTab);
+    const sessionName = line.slice(secondTab + 1);
     if (paneId === "" || sessionName === "") {
       continue;
     }
-    pairs.push({ pane_id: paneId, session_name: sessionName });
+    // A non-numeric / empty index coerces to absent (not a dropped pair) — the
+    // agent simply sinks to the tail at restore time rather than being lost.
+    const parsed = Number(indexRaw);
+    const windowIndex =
+      indexRaw !== "" && Number.isInteger(parsed) ? parsed : null;
+    pairs.push({
+      pane_id: paneId,
+      session_name: sessionName,
+      window_index: windowIndex,
+    });
   }
   return pairs;
 }
@@ -647,9 +719,88 @@ function fillablePairs(jobs: Job[], pairs: TmuxPanePair[]): TmuxPanePair[] {
 }
 
 /**
+ * Stamp the live-tmux window-index cache IN PLACE from one probe. For each live
+ * tmux job, match `job.backend_exec_pane_id` to a probed pane and store its
+ * `window_index` under `job_id` — but ONLY when the probe's `session_name`
+ * equals the job's `backend_exec_session_id` (the recycled-`%N` guard: a pane id
+ * is reused across kill/create, so a hit whose session differs belongs to a
+ * different agent and must NOT stamp). A pane match with a `null` index, a
+ * recycled hit, or no match leaves the prior entry untouched (a transient
+ * degraded probe shouldn't wipe a good index). job_ids are unique Claude session
+ * ids, so an entry is never silently re-keyed to another agent. Pruning of dead
+ * job ids is a SEPARATE per-pulse step ({@link pruneWindowIndexCache}) so it
+ * runs even when the probe gate is closed (all tmux jobs ended).
+ */
+function stampWindowIndexCache(
+  jobs: Job[],
+  pairs: TmuxPanePair[],
+  cache: Map<string, number>,
+): void {
+  const byPaneId = new Map<string, TmuxPanePair>();
+  for (const p of pairs) {
+    byPaneId.set(p.pane_id, p);
+  }
+  for (const job of jobs) {
+    if (job.state !== "working" && job.state !== "stopped") {
+      continue;
+    }
+    if (job.backend_exec_type !== "tmux") {
+      continue;
+    }
+    if (typeof job.job_id !== "string" || job.job_id === "") {
+      continue;
+    }
+    const paneId = job.backend_exec_pane_id;
+    if (paneId == null) {
+      continue;
+    }
+    const probe = byPaneId.get(paneId);
+    if (probe == null || probe.window_index == null) {
+      continue;
+    }
+    // Recycled-`%N` cross-check: only stamp when the probed session matches the
+    // job's resolved session. A NULL-session job (not yet filled) can't be
+    // cross-checked, so it simply doesn't stamp this pulse.
+    if (probe.session_name !== job.backend_exec_session_id) {
+      continue;
+    }
+    cache.set(job.job_id, probe.window_index);
+  }
+}
+
+/**
+ * Prune window-index cache entries for jobs no longer live, IN PLACE. Runs on
+ * EVERY pulse (not gated on the probe) so a long-lived daemon doesn't accumulate
+ * stale indices once every tmux job ends — the gated stamp arm can't reach this
+ * because its gate closes the moment no live tmux job remains. Reads only the
+ * projection rows; pure relative to the cache mutation.
+ */
+function pruneWindowIndexCache(jobs: Job[], cache: Map<string, number>): void {
+  const liveIds = new Set<string>();
+  for (const job of jobs) {
+    if (job.state !== "working" && job.state !== "stopped") {
+      continue;
+    }
+    if (typeof job.job_id === "string" && job.job_id !== "") {
+      liveIds.add(job.job_id);
+    }
+  }
+  for (const id of cache.keys()) {
+    if (!liveIds.has(id)) {
+      cache.delete(id);
+    }
+  }
+}
+
+/**
  * Stable hash of a pairs set for the producer-side dedup gate. Sorts by
  * `(pane_id, session_name)` so SELECT / probe order doesn't churn the hash, then
  * hashes the joined string. A `null` / empty set is the empty-string hash.
+ *
+ * DELIBERATELY EXCLUDES `window_index`: this hash dedups the pane-fill snapshot
+ * POST (which fills NULL sessions onto live jobs), and a pure window reorder
+ * must NOT re-fire it. The window order lives in the restore FILE hash
+ * (`serializeForHash`) instead, where a reorder rightly forces a rewrite.
  */
 function hashPairs(pairs: TmuxPanePair[]): string {
   const sorted = [...pairs].sort((a, b) =>
@@ -669,14 +820,22 @@ function hashPairs(pairs: TmuxPanePair[]): string {
 }
 
 /**
- * The tmux pane-snapshot poll arm, run at the END of each restore pulse. Gated
- * three ways so the poller is quiescent in the common case:
- *  1. GATE — at least one live tmux job with a NULL session (else return).
- *  2. PROBE — `tmux list-panes`; ENOENT / no server degrades to no pairs.
- *  3. FILL — keep only pairs that would actually fill a NULL-session live job;
- *     if none would fill, mint NOTHING (the gate re-fires next pulse).
- *  4. DEDUP — skip the post when the fillable set is byte-identical to the last
- *     post, so an unresolvable pane doesn't re-post every pulse forever.
+ * The tmux poll arm, run on each restore pulse. ONE `list-panes` probe feeds
+ * TWO independent consumers (never two `list-panes` calls):
+ *
+ *  - the WINDOW-ORDER cache (`state.lastWindowIndexByJobId`) — refreshed
+ *    whenever any live tmux job exists, regardless of session resolution, so
+ *    order capture keeps running after every session resolves; and
+ *  - the PANE-FILL snapshot post — minted only when a fillable NULL-session
+ *    pair exists and the topology changed since the last post.
+ *
+ * Gate: `hasLiveTmuxJob` (the WIDER gate). When no live tmux job exists the
+ * poller is fully quiescent (no spawn, no cache touch, no post). With a live
+ * job, after the single probe:
+ *  - the cache refresh runs unconditionally (correlate + prune);
+ *  - the fill arm narrows to fillable pairs and posts on a topology change,
+ *    deduped via `state.lastSnapshotHash` (which excludes `window_index`, so a
+ *    pure reorder never re-fires the fill post).
  *
  * On a post, advances `state.lastSnapshotHash`. PURE relative to its injected
  * `spawnSync` + `post` — no I/O of its own beyond the probe, no env, no DB.
@@ -687,10 +846,16 @@ function tmuxSnapshotPulse(
   spawnSync: SpawnSyncFn,
   post: (msg: TmuxPaneSnapshotMessage) => void,
 ): void {
-  if (!hasUnresolvedTmuxJob(jobs)) {
+  if (!hasLiveTmuxJob(jobs)) {
     return;
   }
   const probed = probeTmuxPanes(spawnSync);
+  // Always refresh the window-order cache — order keeps shifting after every
+  // session resolves, which the NULL-session-only fill gate below would miss.
+  // (The dead-id prune is a separate per-pulse step in `restorePulse`, so it
+  // still runs once this gate closes on the last tmux job ending.)
+  stampWindowIndexCache(jobs, probed, state.lastWindowIndexByJobId);
+
   const pairs = fillablePairs(jobs, probed);
   if (pairs.length === 0) {
     return;
@@ -771,6 +936,18 @@ export function restorePulse(
       state.lastSession = persisted.legacy;
     }
     // else: leave state.lastSession as-is (null on first-ever boot).
+    // Seed the window-order cache from the promoted tier's agents so a job that
+    // had a captured index pre-restart keeps it until the next live probe
+    // re-stamps it (the per-pulse PRUNE keeps it only while the job stays live).
+    if (state.lastSession != null) {
+      for (const bucket of Object.values(state.lastSession.sessions)) {
+        for (const agent of bucket.agents) {
+          if (agent.window_index != null) {
+            state.lastWindowIndexByJobId.set(agent.job_id, agent.window_index);
+          }
+        }
+      }
+    }
     state.bootPromoted = true;
   }
 
@@ -781,10 +958,12 @@ export function restorePulse(
     epicsById.set(epic.epic_id, epic);
   }
 
-  // Tmux pane-snapshot poll arm — runs on EVERY pulse (before the restore-file
-  // write's own dedup early-return), self-gated so it is quiescent unless a live
-  // tmux job carries a NULL session. Disabled entirely when no `post` is wired
-  // (the pure-pulse test path that never spawns a Worker).
+  // Tmux poll arm — runs on EVERY pulse (before the restore-file write's own
+  // dedup early-return), self-gated so it is quiescent unless a live tmux job
+  // exists. The single probe refreshes the window-order cache AND feeds the
+  // NULL-session pane-fill post. Disabled entirely when no `post` is wired (the
+  // pure-pulse test path that never spawns a Worker) — the cache then stays at
+  // whatever the boot seed left it.
   if (snapshot?.post) {
     tmuxSnapshotPulse(
       jobs,
@@ -794,15 +973,31 @@ export function restorePulse(
     );
   }
 
-  const current = buildRestoreTier(jobs, epicsById, now());
+  // Prune dead job ids from the window-order cache on EVERY pulse, regardless of
+  // the probe gate above — the gate closes when no live tmux job remains, but
+  // the cache must still shed entries for jobs that just ended.
+  pruneWindowIndexCache(jobs, state.lastWindowIndexByJobId);
+
+  const current = buildRestoreTier(
+    jobs,
+    epicsById,
+    now(),
+    state.lastWindowIndexByJobId,
+  );
 
   // Track the high-water peak (by agent count) of the live set since it was
-  // last empty. A populated `current` that exceeds the recorded peak replaces
-  // it — so the collapse-freeze captures the RICHEST snapshot, not the last
-  // survivor before the drain to zero.
+  // last empty. A populated `current` whose count is at least the recorded peak
+  // replaces it — so the collapse-freeze captures the RICHEST snapshot, not the
+  // last survivor before the drain to zero.
+  //
+  // `>=` (not `>`) is LOAD-BEARING ONLY because `window_index` rides in the file
+  // hash (`serializeForHash`): an equal-COUNT reorder — same agents, shuffled
+  // windows — must refresh the peak so the freeze captures the NEW visual order
+  // rather than freezing a stale one into `last_session` (the post-reboot
+  // restore source). With `>` an equal-count reorder would leave a stale peak.
   if (
     tierIsPopulated(current) &&
-    tierAgentCount(current) > tierAgentCount(state.epochHighWater)
+    tierAgentCount(current) >= tierAgentCount(state.epochHighWater)
   ) {
     state.epochHighWater = current;
   }
@@ -913,6 +1108,7 @@ function main(): void {
     lastSession: null,
     bootPromoted: false,
     lastSnapshotHash: null,
+    lastWindowIndexByJobId: new Map(),
   };
   let shutdown = false;
 

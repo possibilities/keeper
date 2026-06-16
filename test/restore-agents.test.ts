@@ -108,6 +108,8 @@ function fakeAgent(opts: {
   cwd?: string | null;
   resume_target?: string;
   tier?: string | null;
+  window_index?: number | null;
+  created_at?: number;
 }): RestoreAgent {
   // Preserve an explicit `null` cwd — tests cover the no-cd branch.
   const cwd = "cwd" in opts ? (opts.cwd ?? null) : "/repo";
@@ -118,6 +120,8 @@ function fakeAgent(opts: {
     tier: opts.tier ?? null,
     plan_verb: null,
     plan_ref: null,
+    window_index: opts.window_index ?? null,
+    created_at: opts.created_at ?? 1000,
   };
 }
 

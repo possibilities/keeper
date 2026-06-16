@@ -56,6 +56,7 @@ import {
   serializeForHash,
   serializeForWrite,
   type TmuxPaneSnapshotMessage,
+  tierAgentCount,
 } from "../src/restore-worker";
 import type { Epic, Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
@@ -68,6 +69,7 @@ function freshState(): {
   lastSession: RestoreTier | null;
   bootPromoted: boolean;
   lastSnapshotHash: string | null;
+  lastWindowIndexByJobId: Map<string, number>;
 } {
   return {
     lastHash: null,
@@ -76,6 +78,7 @@ function freshState(): {
     lastSession: null,
     bootPromoted: false,
     lastSnapshotHash: null,
+    lastWindowIndexByJobId: new Map(),
   };
 }
 
@@ -144,6 +147,7 @@ function insertJob(opts: {
   backend_exec_type?: string | null;
   backend_exec_session_id?: string | null;
   backend_exec_pane_id?: string | null;
+  created_at?: number;
 }): void {
   const state = opts.state ?? "working";
   db.run(
@@ -151,9 +155,10 @@ function insertJob(opts: {
        job_id, created_at, state, last_event_id, updated_at,
        cwd, title, plan_verb, plan_ref,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id
-     ) VALUES (?, 1000, ?, 0, 1000, ?, ?, ?, ?, ?, ?, ?)`,
+     ) VALUES (?, ?, ?, 0, 1000, ?, ?, ?, ?, ?, ?, ?)`,
     [
       opts.job_id,
+      opts.created_at ?? 1000,
       state,
       opts.cwd ?? null,
       opts.title ?? null,
@@ -376,6 +381,55 @@ test("buildRestoreTier sets captured_at on the tier shape (empty live set)", () 
   const out = buildRestoreTier([], new Map(), 1234);
   expect(out.captured_at).toBe(1234);
   expect(out.sessions).toEqual({});
+});
+
+test("buildRestoreTier stamps window_index from the cache and created_at from the job", () => {
+  const jobs: Job[] = [
+    fakeJob({ job_id: "a", backend_exec_session_id: "s1", created_at: 7 }),
+    fakeJob({ job_id: "b", backend_exec_session_id: "s1", created_at: 9 }),
+  ];
+  const cache = new Map<string, number>([
+    ["a", 2],
+    ["b", 0],
+  ]);
+  const out = buildRestoreTier(jobs, new Map(), 1000, cache);
+  const byId = new Map(out.sessions.s1.agents.map((x) => [x.job_id, x]));
+  expect(byId.get("a")?.window_index).toBe(2);
+  expect(byId.get("a")?.created_at).toBe(7);
+  expect(byId.get("b")?.window_index).toBe(0);
+  expect(byId.get("b")?.created_at).toBe(9);
+});
+
+test("buildRestoreTier stamps window_index null on a cache miss (pane gone)", () => {
+  const jobs: Job[] = [fakeJob({ job_id: "a", backend_exec_session_id: "s1" })];
+  // Empty cache → no entry for "a".
+  const out = buildRestoreTier(jobs, new Map(), 1000, new Map());
+  expect(out.sessions.s1.agents[0].window_index).toBeNull();
+});
+
+test("buildRestoreTier defaults to an empty cache (4th param omitted)", () => {
+  const jobs: Job[] = [fakeJob({ job_id: "a", backend_exec_session_id: "s1" })];
+  const out = buildRestoreTier(jobs, new Map(), 1000);
+  expect(out.sessions.s1.agents[0].window_index).toBeNull();
+});
+
+test("buildRestoreTier keeps the on-disk job_id sort regardless of window_index", () => {
+  // Insert in reverse job_id order with window indices that do NOT match the
+  // job_id sort — the on-disk array must still be job_id-sorted (visual order
+  // is a restore-time concern, not the file's).
+  const jobs: Job[] = [
+    fakeJob({ job_id: "zeta", backend_exec_session_id: "s1" }),
+    fakeJob({ job_id: "alpha", backend_exec_session_id: "s1" }),
+  ];
+  const cache = new Map<string, number>([
+    ["zeta", 0],
+    ["alpha", 1],
+  ]);
+  const out = buildRestoreTier(jobs, new Map(), 1000, cache);
+  expect(out.sessions.s1.agents.map((x) => x.job_id)).toEqual([
+    "alpha",
+    "zeta",
+  ]);
 });
 
 /** Wrap a `current` tier into a full two-tier descriptor for serialize tests. */
@@ -758,6 +812,9 @@ test("restorePulse end-to-end pre-resolves tier from the epics projection", () =
       tier: "mint",
       plan_verb: "work",
       plan_ref: "fn-1-foo.2",
+      // No probe wired (pure-pulse path) and no pane id → unknown order.
+      window_index: null,
+      created_at: 1000,
     },
   ]);
 });
@@ -845,9 +902,12 @@ function fakeJob(opts: {
   plan_ref?: string | null;
   backend_exec_type?: string | null;
   backend_exec_session_id?: string | null;
+  backend_exec_pane_id?: string | null;
+  created_at?: number;
 }): Job {
   return {
     job_id: opts.job_id,
+    created_at: opts.created_at ?? 1000,
     state: opts.state ?? "working",
     cwd: opts.cwd ?? null,
     title: opts.title ?? null,
@@ -855,6 +915,7 @@ function fakeJob(opts: {
     plan_ref: opts.plan_ref ?? null,
     backend_exec_type: opts.backend_exec_type ?? null,
     backend_exec_session_id: opts.backend_exec_session_id ?? null,
+    backend_exec_pane_id: opts.backend_exec_pane_id ?? null,
   } as unknown as Job;
 }
 
@@ -885,27 +946,74 @@ function legacyAgent(job_id: string): {
 // probeTmuxPanes — parse + degrade
 // ---------------------------------------------------------------------------
 
-test("probeTmuxPanes parses tab-delimited pane/session pairs", () => {
+test("probeTmuxPanes parses tab-delimited pane/index/session rows", () => {
   const pairs = probeTmuxPanes(
-    stubTmuxPanes(["%1\twork", "%2\tplay", "%3\twork"]),
+    stubTmuxPanes(["%1\t0\twork", "%2\t1\tplay", "%3\t2\twork"]),
   );
   expect(pairs).toEqual([
-    { pane_id: "%1", session_name: "work" },
-    { pane_id: "%2", session_name: "play" },
-    { pane_id: "%3", session_name: "work" },
+    { pane_id: "%1", session_name: "work", window_index: 0 },
+    { pane_id: "%2", session_name: "play", window_index: 1 },
+    { pane_id: "%3", session_name: "work", window_index: 2 },
   ]);
 });
 
-test("probeTmuxPanes keeps session names containing spaces (tab split)", () => {
-  const pairs = probeTmuxPanes(stubTmuxPanes(["%1\tmy session name"]));
-  expect(pairs).toEqual([{ pane_id: "%1", session_name: "my session name" }]);
+test("probeTmuxPanes keeps session names containing spaces and tabs (name last)", () => {
+  // The session name is the variable-length field LAST, so an embedded space
+  // (or tab) cannot bleed into the numeric window_index.
+  const pairs = probeTmuxPanes(stubTmuxPanes(["%1\t3\tmy session name"]));
+  expect(pairs).toEqual([
+    { pane_id: "%1", session_name: "my session name", window_index: 3 },
+  ]);
 });
 
-test("probeTmuxPanes drops malformed lines (no tab / empty field)", () => {
+test("probeTmuxPanes drops malformed lines (missing tab / empty pane / empty session)", () => {
   const pairs = probeTmuxPanes(
-    stubTmuxPanes(["%1\tok", "garbage-no-tab", "\tonlysession", "%4\t", ""]),
+    stubTmuxPanes([
+      "%1\t0\tok",
+      "garbage-no-tab",
+      "%2\tonlyonetab",
+      "\t0\tonlysession",
+      "%4\t0\t",
+      "",
+    ]),
   );
-  expect(pairs).toEqual([{ pane_id: "%1", session_name: "ok" }]);
+  expect(pairs).toEqual([
+    { pane_id: "%1", session_name: "ok", window_index: 0 },
+  ]);
+});
+
+test("probeTmuxPanes coerces a non-numeric / empty window_index to null (pair kept)", () => {
+  const pairs = probeTmuxPanes(
+    stubTmuxPanes(["%1\tNaN\twork", "%2\t\tplay", "%3\t1.5\tmid"]),
+  );
+  // A bad index leaves the pair intact with window_index null (the agent sinks
+  // to the tail at restore time rather than being dropped); a non-integer
+  // (1.5) is also rejected — window indices are integers.
+  expect(pairs).toEqual([
+    { pane_id: "%1", session_name: "work", window_index: null },
+    { pane_id: "%2", session_name: "play", window_index: null },
+    { pane_id: "%3", session_name: "mid", window_index: null },
+  ]);
+});
+
+test("probeTmuxPanes is invoked with a locale-defaulted env (TAB-faithful)", () => {
+  // The default spawn wraps env in localeDefaultedEnv so a C-locale TAB mangle
+  // can't drop every row; the injected spawn here just records that the probe
+  // ran and parsed a 3-field row end to end.
+  let calls = 0;
+  const pairs = probeTmuxPanes((cmd) => {
+    calls += 1;
+    expect(cmd).toContain("#{pane_id}\t#{window_index}\t#{session_name}");
+    return {
+      success: true,
+      exitCode: 0,
+      stdout: Buffer.from("%1\t4\twork"),
+    };
+  });
+  expect(calls).toBe(1);
+  expect(pairs).toEqual([
+    { pane_id: "%1", session_name: "work", window_index: 4 },
+  ]);
 });
 
 test("probeTmuxPanes degrades to [] on a thrown spawn (ENOENT — no tmux binary)", () => {
@@ -937,22 +1045,19 @@ test("restorePulse posts a tmux-pane-snapshot when a live tmux job has a NULL se
   });
   const posts: TmuxPaneSnapshotMessage[] = [];
   restorePulse(db, restorePath, freshState(), () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\twork", "%9\tother"]),
+    spawnSync: stubTmuxPanes(["%1\t0\twork", "%9\t1\tother"]),
     post: (m) => posts.push(m),
   });
   expect(posts).toHaveLength(1);
   // Only the pane matching the NULL-session live job is posted (fillable filter).
-  expect(posts[0].pairs).toEqual([{ pane_id: "%1", session_name: "work" }]);
+  expect(posts[0].pairs).toEqual([
+    { pane_id: "%1", session_name: "work", window_index: 0 },
+  ]);
 });
 
-test("restorePulse poll arm is quiescent when no NULL-session tmux job is live", () => {
-  // A tmux job that already has a session, and a non-tmux NULL-session job.
-  insertJob({
-    job_id: "filled",
-    backend_exec_type: "tmux",
-    backend_exec_pane_id: "%1",
-    backend_exec_session_id: "work",
-  });
+test("restorePulse poll arm is quiescent when NO live tmux job exists", () => {
+  // Only a non-tmux NULL-session job — the wider gate (any live tmux job) is
+  // false, so nothing spawns.
   insertJob({
     job_id: "non-tmux",
     backend_exec_type: "other",
@@ -964,7 +1069,7 @@ test("restorePulse poll arm is quiescent when no NULL-session tmux job is live",
   restorePulse(db, restorePath, freshState(), () => 1000, {
     spawnSync: () => {
       spawned = true;
-      return { success: true, exitCode: 0, stdout: Buffer.from("%1\twork") };
+      return { success: true, exitCode: 0, stdout: Buffer.from("%1\t0\twork") };
     },
     post: (m) => posts.push(m),
   });
@@ -982,7 +1087,7 @@ test("restorePulse mints nothing when no probed pair would fill a NULL-session j
   const posts: TmuxPaneSnapshotMessage[] = [];
   // The server only shows panes keeper never tracked — nothing fills %1.
   restorePulse(db, restorePath, freshState(), () => 1000, {
-    spawnSync: stubTmuxPanes(["%7\tghost", "%8\tphantom"]),
+    spawnSync: stubTmuxPanes(["%7\t0\tghost", "%8\t1\tphantom"]),
     post: (m) => posts.push(m),
   });
   expect(posts).toHaveLength(0);
@@ -998,7 +1103,7 @@ test("restorePulse dedups: an unchanged topology does not re-post across pulses"
   const posts: TmuxPaneSnapshotMessage[] = [];
   const state = freshState();
   const snapshot = {
-    spawnSync: stubTmuxPanes(["%1\twork"]),
+    spawnSync: stubTmuxPanes(["%1\t0\twork"]),
     post: (m: TmuxPaneSnapshotMessage) => posts.push(m),
   };
   restorePulse(db, restorePath, state, () => 1000, snapshot);
@@ -1019,16 +1124,41 @@ test("restorePulse re-posts when the resolvable topology changes", () => {
   const posts: TmuxPaneSnapshotMessage[] = [];
   const state = freshState();
   restorePulse(db, restorePath, state, () => 1000, {
-    spawnSync: stubTmuxPanes(["%1\twork"]),
+    spawnSync: stubTmuxPanes(["%1\t0\twork"]),
     post: (m) => posts.push(m),
   });
   // The pane moved to a different session — a genuine topology change.
   restorePulse(db, restorePath, state, () => 2000, {
-    spawnSync: stubTmuxPanes(["%1\tmoved"]),
+    spawnSync: stubTmuxPanes(["%1\t0\tmoved"]),
     post: (m) => posts.push(m),
   });
   expect(posts).toHaveLength(2);
-  expect(posts[1].pairs).toEqual([{ pane_id: "%1", session_name: "moved" }]);
+  expect(posts[1].pairs).toEqual([
+    { pane_id: "%1", session_name: "moved", window_index: 0 },
+  ]);
+});
+
+test("restorePulse fill post does NOT re-fire on a pure window reorder (hashPairs excludes window_index)", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: null,
+  });
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  const state = freshState();
+  // First pulse posts the fillable pair.
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\t0\twork"]),
+    post: (m) => posts.push(m),
+  });
+  // The window moved (index 0 → 5) but the (pane_id, session_name) pair is
+  // unchanged — the fill-snapshot hash must NOT see the index, so no re-post.
+  restorePulse(db, restorePath, state, () => 2000, {
+    spawnSync: stubTmuxPanes(["%1\t5\twork"]),
+    post: (m) => posts.push(m),
+  });
+  expect(posts).toHaveLength(1);
 });
 
 test("restorePulse poll arm is fully disabled when no post is wired (pure-pulse path)", () => {
@@ -1043,4 +1173,225 @@ test("restorePulse poll arm is fully disabled when no post is wired (pure-pulse 
   // (no spawn, no post) even though the gate would otherwise be armed.
   restorePulse(db, restorePath, freshState(), () => 1000);
   expect(existsSync(restorePath)).toBe(true);
+});
+
+// ---------------------------------------------------------------------------
+// restorePulse — window-index capture (the producer side of visual order)
+// ---------------------------------------------------------------------------
+
+/** Read one session bucket's agents keyed by job_id off disk. */
+function agentsById(
+  tier: RestoreTier | null,
+  session: string,
+): Map<string, { window_index: number | null; created_at: number }> {
+  const out = new Map<
+    string,
+    { window_index: number | null; created_at: number }
+  >();
+  for (const a of tier?.sessions[session]?.agents ?? []) {
+    out.set(a.job_id, {
+      window_index: a.window_index,
+      created_at: a.created_at,
+    });
+  }
+  return out;
+}
+
+test("restorePulse stamps window_index into restore.json from the probe (correlated by pane id)", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+    created_at: 11,
+  });
+  insertJob({
+    job_id: "j2",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%2",
+    backend_exec_session_id: "work",
+    created_at: 22,
+  });
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    // j2's window sits LEFT of j1's (index 0 vs 3) — the visual order the
+    // restore-agents util will replay.
+    spawnSync: stubTmuxPanes(["%1\t3\twork", "%2\t0\twork"]),
+    post: (m) => posts.push(m),
+  });
+  const byId = agentsById(readFile(restorePath).current, "work");
+  expect(byId.get("j1")?.window_index).toBe(3);
+  expect(byId.get("j2")?.window_index).toBe(0);
+  expect(byId.get("j1")?.created_at).toBe(11);
+  expect(byId.get("j2")?.created_at).toBe(22);
+});
+
+test("restorePulse keeps capturing window_index after ALL sessions resolve (wider gate)", () => {
+  // The fill gate (NULL-session) is FALSE here — every job already has a
+  // session. The wider gate (any live tmux job) must still arm the probe so
+  // ongoing reorders are captured.
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  const posts: TmuxPaneSnapshotMessage[] = [];
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\t5\twork"]),
+    post: (m) => posts.push(m),
+  });
+  // No fill post (no NULL-session job) but the index is still captured.
+  expect(posts).toHaveLength(0);
+  expect(
+    agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
+  ).toBe(5);
+});
+
+test("restorePulse does NOT stamp window_index on a recycled pane (session mismatch)", () => {
+  // The pane id %1 hits, but the probe says it lives in session "other" while
+  // the job's resolved session is "work" — a recycled `%N`. Must not stamp.
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  restorePulse(db, restorePath, freshState(), () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\t2\tother"]),
+    post: () => {},
+  });
+  expect(
+    agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
+  ).toBeNull();
+});
+
+test("restorePulse window-index cache prunes entries for jobs no longer live", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\t4\twork"]),
+    post: () => {},
+  });
+  expect(state.lastWindowIndexByJobId.get("j1")).toBe(4);
+  // The job ends → it is no longer live; the next pulse must drop its entry.
+  db.run(`UPDATE jobs SET state = 'ended' WHERE job_id = 'j1'`);
+  restorePulse(db, restorePath, state, () => 2000, {
+    spawnSync: stubTmuxPanes(["%1\t4\twork"]),
+    post: () => {},
+  });
+  expect(state.lastWindowIndexByJobId.has("j1")).toBe(false);
+});
+
+test("restorePulse seeds the window-index cache from the boot-promoted tier", () => {
+  // A persisted file whose `current` carries an agent with window_index 6.
+  // Boot-promote lifts it forward AND seeds the cache, so the first live build
+  // re-stamps it even before a probe runs.
+  const persisted: RestoreDescriptor = {
+    schema_version: RESTORE_SCHEMA_VERSION,
+    last_session: null,
+    current: {
+      captured_at: 500,
+      sessions: {
+        work: {
+          backend: "tmux",
+          agents: [
+            {
+              job_id: "j1",
+              cwd: null,
+              resume_target: "j1",
+              tier: null,
+              plan_verb: null,
+              plan_ref: null,
+              window_index: 6,
+              created_at: 1,
+            },
+          ],
+        },
+      },
+    },
+  };
+  writeFileSync(restorePath, serializeForWrite(persisted));
+  const state = freshState();
+  // First pulse: boot-promote runs, seeding the cache from the persisted tier.
+  // The live job j1 is present (so it survives the prune) but no probe re-stamps
+  // it (no post wired); the seed must carry window_index 6 into the build.
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  restorePulse(db, restorePath, state, () => 2000);
+  expect(state.lastWindowIndexByJobId.get("j1")).toBe(6);
+  expect(
+    agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
+  ).toBe(6);
+});
+
+test("serializeForHash includes window_index (an index change rewrites the file)", () => {
+  const base: RestoreDescriptor = {
+    schema_version: RESTORE_SCHEMA_VERSION,
+    last_session: null,
+    current: buildRestoreTier(
+      [fakeJob({ job_id: "j1", backend_exec_session_id: "work" })],
+      new Map(),
+      1000,
+      new Map([["j1", 0]]),
+    ),
+  };
+  const moved: RestoreDescriptor = {
+    schema_version: RESTORE_SCHEMA_VERSION,
+    last_session: null,
+    current: buildRestoreTier(
+      [fakeJob({ job_id: "j1", backend_exec_session_id: "work" })],
+      new Map(),
+      1000,
+      new Map([["j1", 5]]),
+    ),
+  };
+  // A pure window reorder (0 → 5) must change the file hash so the worker
+  // rewrites restore.json with the new visual order.
+  expect(serializeForHash(base)).not.toBe(serializeForHash(moved));
+});
+
+test("restorePulse high-water uses >= so an equal-count reorder refreshes the peak", () => {
+  // One live tmux job at window 0; a populated current sets the high-water.
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\t0\twork"]),
+    post: () => {},
+  });
+  expect(tierAgentCount(state.epochHighWater)).toBe(1);
+  expect(agentsById(state.epochHighWater, "work").get("j1")?.window_index).toBe(
+    0,
+  );
+
+  // SAME agent count (1), reordered to window 7. With `>` the peak would stay
+  // stale at index 0; `>=` must refresh it to 7 so the collapse-freeze captures
+  // the NEW visual order.
+  restorePulse(db, restorePath, state, () => 2000, {
+    spawnSync: stubTmuxPanes(["%1\t7\twork"]),
+    post: () => {},
+  });
+  expect(tierAgentCount(state.epochHighWater)).toBe(1);
+  expect(agentsById(state.epochHighWater, "work").get("j1")?.window_index).toBe(
+    7,
+  );
+
+  // And the equal-count reorder rewrote the file with the new order.
+  expect(
+    agentsById(readFile(restorePath).current, "work").get("j1")?.window_index,
+  ).toBe(7);
 });

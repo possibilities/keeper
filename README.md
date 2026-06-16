@@ -2352,7 +2352,11 @@ primitive, and on every change reads the `jobs` + `epics` projections
 through the same `runQuery` read seam the autopilot worker uses. It builds
 a stable `{captured_at, sessions}` TIER of the live (`working` / `stopped`)
 jobs grouped by `backend_exec_session_id` — each bucket tagged with the
-`backend` it ran under (`tmux`, schema v3) — and rewrites
+`backend` it ran under (`tmux`, schema v3) and each agent stamped with the live
+tmux `#{window_index}` (left-to-right window POSITION) captured at pulse time
+from a `list-panes` probe correlated by pane id and session-name cross-checked,
+so the restore-agents util replays windows in their original visual order
+(unknown-order agents sink to the tail) — and rewrites
 `~/.local/state/keeper/restore.json` via `atomicWriteFile` as a **two-tier
 descriptor** — `{schema_version, last_session, current}`, the browser
 "restore previous session" model (Chrome "Current Session" / "Last
