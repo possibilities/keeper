@@ -1,3 +1,11 @@
+> **Superseded by fn-817-db-derived-crash-restore.** The two-tier
+> `last_session` freeze model described below (boot-promote + the `>0→0`
+> collapse edge + high-water peak) has been retired. The crash-restore set is
+> now derived RETROSPECTIVELY from `keeper.db` at read time via per-row
+> producer-stamped `close_kind` / `window_index` columns; `restore.json` is
+> demoted to a dumb single-tier `current` mirror kept only as a disaster
+> fallback. This spec is retained as historical record.
+
 ## Overview
 
 keeper's `restore.json` is overwritten with whatever (often smaller) live
