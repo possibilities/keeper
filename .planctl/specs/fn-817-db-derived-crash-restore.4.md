@@ -38,5 +38,5 @@ Assert restore-agents produces UUID-based resume commands for a fixture candidat
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Resume by stable job_id UUID (rename-proof) across all three byte-identical producers; restore-agents rebuilt as a thin presenter deriving candidates from restore-set.ts over its own read-only keeper.db connection (daemon-down first-class), keeping 0.5s pacing and --apply/dry-run; restore-worker freeze machinery (last_session/collapse-freeze/boot-promote) stripped while the dumb current mirror + window_index capture remain. test:full green.
 ## Evidence
