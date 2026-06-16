@@ -28,5 +28,5 @@ Docs-only; no test impact. Verify line ranges against the live files (README has
 - [ ] No stale references to last_session / collapse-freeze / boot-promote / two-tier remain in README or CLAUDE.md.
 
 ## Done summary
-
+Updated the system map to the DB-derived crash-restore model: rewrote the README ninth-worker block (read-time close_kind/window_index derivation, resume-by-UUID, restore.json as disaster fallback), trimmed the env-var summary, added close_kind to the exit-watcher para, added v70/v71 schema-history entries, and marked the fn-702 spec superseded. CLAUDE.md needed no change (no stale restore refs; KEEPER_RESTORE_FILE note already correct).
 ## Evidence
