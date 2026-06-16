@@ -55,6 +55,7 @@ interface SeedJob {
   close_kind?: string | null;
   window_index?: number | null;
   title?: string | null;
+  cwd?: string | null;
   created_at?: number;
   updated_at?: number;
   backend_exec_session_id?: string | null;
@@ -68,8 +69,8 @@ function seedJob(db: Database, j: SeedJob): void {
   db.run(
     `INSERT INTO jobs (
        job_id, created_at, updated_at, state, title, close_kind, window_index,
-       backend_exec_session_id, plan_verb, last_event_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       cwd, backend_exec_session_id, plan_verb, last_event_id
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       j.job_id,
       j.created_at ?? NOW - 100,
@@ -78,6 +79,7 @@ function seedJob(db: Database, j: SeedJob): void {
       j.title ?? null,
       j.close_kind ?? null,
       j.window_index ?? null,
+      j.cwd ?? null,
       // Explicit `null` must survive (the no-backend filter test passes it);
       // only an ABSENT key falls back to the default session.
       "backend_exec_session_id" in j
@@ -395,6 +397,32 @@ test("deriveRestoreSet: resume_target is the job_id UUID (resume by UUID, not na
   const res = derive();
   expect(res.candidates[0]?.resume_target).toBe(uuid);
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
+});
+
+test("deriveRestoreSet: carries cwd (the resume `cd` target); empty/NULL → null", () => {
+  seedJob(kdb.db, {
+    job_id: "with-cwd",
+    close_kind: "server_gone",
+    window_index: 0,
+    cwd: "/Users/mike/code/keeper",
+  });
+  seedJob(kdb.db, {
+    job_id: "empty-cwd",
+    close_kind: "server_gone",
+    window_index: 1,
+    cwd: "",
+  });
+  seedJob(kdb.db, {
+    job_id: "null-cwd",
+    close_kind: "server_gone",
+    window_index: 2,
+    cwd: null,
+  });
+  const byId = new Map(derive().candidates.map((c) => [c.job_id, c]));
+  expect(byId.get("with-cwd")?.cwd).toBe("/Users/mike/code/keeper");
+  // An empty string coerces to null so the restore command drops the `cd` prefix.
+  expect(byId.get("empty-cwd")?.cwd).toBeNull();
+  expect(byId.get("null-cwd")?.cwd).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

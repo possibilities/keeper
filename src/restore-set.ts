@@ -43,9 +43,8 @@
  * ORDER. Candidates sort by captured `window_index` (the live tmux
  * `#{window_index}`, a window's left-to-right VISUAL position) ascending; a
  * NULL/unknown index sinks to the tail, tie-broken by `created_at` then
- * `job_id`. This reuses the total-order shape of
- * `scripts/restore-agents.ts:compareRestoreAgents` so the two restore paths
- * order identically.
+ * `job_id`. The candidate set is returned already ordered, so
+ * `scripts/restore-agents.ts` is a thin presenter that never re-sorts.
  *
  * RESULT. Each candidate's `label` is the latest `title` (what `claude --resume`
  * would target; falls back to the `job_id` for a never-named session), and the
@@ -105,6 +104,7 @@ interface KilledJobRow {
   state: string;
   close_kind: string | null;
   window_index: number | null;
+  cwd: string | null;
   backend_exec_session_id: string | null;
   plan_verb: string | null;
   /** The Killed event's rowid — the burst-cluster sort key. */
@@ -115,12 +115,15 @@ interface KilledJobRow {
  * One crash-restore candidate. `resume_target` is the stable `job_id` UUID (the
  * resume key); `label` is the human-readable display name (latest title).
  * `window_index` rides through for the ordered render's debugging/diagnostics.
+ * `cwd` is the directory the restore command `cd`s into before `claude --resume`
+ * (`null` when the SessionStart event never carried one).
  */
 export interface RestoreCandidate {
   job_id: string;
   resume_target: string;
   label: string;
   window_index: number | null;
+  cwd: string | null;
   backend_exec_session_id: string;
   created_at: number;
 }
@@ -147,8 +150,8 @@ const seg = (v: unknown): string => (v == null ? "" : String(v));
  * Total-order comparator placing candidates in original visual (left-to-right)
  * tmux window order: a known `window_index` sorts ascending and precedes an
  * unknown (`null`) one; equal or both-unknown tiebreak by `created_at` then
- * `job_id`. Mirrors `scripts/restore-agents.ts:compareRestoreAgents` so both
- * restore paths agree. Total + deterministic for legacy/partial rows: a
+ * `job_id`. The candidate set is the SOLE ordering authority — restore-agents
+ * presents the set as-is. Total + deterministic for legacy/partial rows: a
  * non-finite `created_at` coerces to `0` (never NaN, which poisons a sort).
  */
 function compareCandidates(a: RestoreCandidate, b: RestoreCandidate): number {
@@ -250,7 +253,7 @@ function loadRows(db: Database): {
   const killed = db
     .query(
       `SELECT job_id, created_at, updated_at, title, state, close_kind,
-              window_index, backend_exec_session_id, plan_verb, last_event_id
+              window_index, cwd, backend_exec_session_id, plan_verb, last_event_id
          FROM jobs
         WHERE state = 'killed'`,
     )
@@ -337,6 +340,7 @@ export function deriveRestoreSet(
         Number.isFinite(row.window_index)
           ? row.window_index
           : null,
+      cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
       backend_exec_session_id: backendSession,
       created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
     });
