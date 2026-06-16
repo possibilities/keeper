@@ -42,5 +42,5 @@ Reducer test: a layout event folds window_index onto the right jobs rows; a re-f
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Added the folded jobs.window_index column (schema v71) carrying visual tmux window order into the DB so the crash-restore derivation replays original left-to-right order without restore.json. The restore-worker mints a change-gated WindowIndexSnapshot event the reducer folds as a pure integer copy keyed by job_id; killed jobs retain their last-known index.
 ## Evidence

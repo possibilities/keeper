@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "capture window_index into jobs",
-  "updated_at": "2026-06-16T18:59:35.762000Z"
+  "updated_at": "2026-06-16T19:25:20.634000Z",
+  "worker_done_at": "2026-06-16T19:25:20.634000Z"
 }
