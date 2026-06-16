@@ -22,17 +22,18 @@ import type { Epic, Job, Task } from "./types";
 const seg = (v: unknown): string => (v == null ? "" : String(v));
 
 /**
- * The `--resume` target for a job: its latest session NAME when it has one,
- * else the session id as a fallback. keeper's `title` is the current session
- * name — it is seeded from the launch `--name` (`spawn_name`) and kept equal
- * to `name_history`'s newest entry as the name is promoted, so it is exactly
- * the "latest session name" the keeper DB knows. A job that never carried a
- * name (NULL `title`) falls back to `job_id` (= the Claude session id), which
- * `claude --resume` resolves directly. Pure.
+ * The `--resume` target for a job: its `job_id` (the Claude session UUID).
+ * Resuming by the stable UUID — never the mutable session name — is what makes
+ * a RENAMED session restore correctly: `claude --resume <uuid>` re-attaches to
+ * the exact session regardless of how its name has drifted, where passing the
+ * name would only filter the picker by a search term. keeper's `title` is the
+ * latest session name and is carried alongside as a DISPLAY label (see the
+ * restore-set candidate's `label`), but it is never the resume key. A degenerate
+ * NULL/empty `job_id` coerces to the empty string (the producer invariant says
+ * this never happens). Pure.
  */
 export function resumeTarget(job: Job): string {
-  const name = seg(job.title);
-  return name !== "" ? name : seg(job.job_id);
+  return seg(job.job_id);
 }
 
 /**
@@ -50,12 +51,11 @@ export function resumeTarget(job: Job): string {
  * stay intact and the three resume-command producers agree by construction;
  * it just no longer shapes the emitted argv.
  *
- * `target` is the job's latest session NAME when it has one, else its session
- * id (see {@link resumeTarget}). `claude --resume [value]` resolves an exact
- * session id directly, OR opens the /resume picker filtered by `value` as a
- * search term — and `--name` is "shown in the /resume picker" — so passing the
- * display name filters the picker straight to that session. Double-quoted
- * because a promoted (auto-generated) name can contain spaces. Pure.
+ * `target` is the job's `job_id` (the Claude session UUID — see
+ * {@link resumeTarget}). `claude --resume <uuid>` resolves the exact session
+ * directly, rename-proof, never falling into the /resume picker for a session
+ * that still exists. Double-quoted defensively (a UUID needs no quoting, but
+ * the shape stays uniform with the legacy name path). Pure.
  */
 export function buildResumeCommand(
   cwd: string,
