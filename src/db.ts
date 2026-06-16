@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 70;
+export const SCHEMA_VERSION = 71;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -3496,6 +3496,24 @@ function migrate(db: Database): void {
       // commit, or every keeper-py read fails host-wide; test/schema-version.test.ts
       // enforces this).
       addColumnIfMissing(db, "jobs", "close_kind", "TEXT");
+
+      // v70→v71: add the nullable `jobs.window_index` INTEGER column — the live
+      // tmux `#{window_index}` (a window's left-to-right VISUAL position, not its
+      // `@N` identity), so the DB-only crash-restore derivation can replay
+      // windows in original visual order WITHOUT reading restore.json. The
+      // restore-worker probes it per pulse and posts a change-gated
+      // `WindowIndexSnapshot` event (gated on a layout hash so a pure reorder,
+      // not every pulse, re-fires); the reducer folds it as a pure integer copy
+      // keyed by `job_id` — no liveness, no probe in the fold. A killed job
+      // KEEPS its last-known value (the fold never nulls a row), so the index
+      // survives to restore time when the original tmux server is dead. NULL
+      // default, NO cursor rewind: a historical event stream carries no
+      // `WindowIndexSnapshot`, so a from-scratch re-fold reproduces the column's
+      // NULL zero-event default. Whitelist-only Python read (this bump MUST add
+      // 71 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit,
+      // or every keeper-py read fails host-wide; test/schema-version.test.ts
+      // enforces this).
+      addColumnIfMissing(db, "jobs", "window_index", "INTEGER");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

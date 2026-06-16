@@ -3033,6 +3033,97 @@ function foldTmuxPaneSnapshot(db: Database, event: Event): void {
   }
 }
 
+/** One `(job_id, window_index)` entry decoded from a `WindowIndexSnapshot`
+ *  event payload. `job_id` is a validated non-empty string; `window_index` a
+ *  validated finite integer; anything else is dropped. */
+interface WindowIndexEntry {
+  job_id: string;
+  window_index: number;
+}
+
+/**
+ * Null-safe decode of a `WindowIndexSnapshot` event's `data` blob into the
+ * validated `(job_id, window_index)` entries. Returns `[]` on a missing / empty /
+ * malformed blob (the fold folds an empty list to a no-op); NEVER throws. Each
+ * entry is type-narrowed independently so a partial / garbage entry is dropped
+ * rather than poisoning the fold. `window_index` MUST be a finite integer — a
+ * non-integer (float, NaN, string) drops the entry, never coerced. Reads ONLY
+ * `event.data` — no probe, no env — keeping the fold a pure function of the
+ * event payload (re-fold determinism).
+ */
+function extractWindowIndexSnapshot(event: Event): WindowIndexEntry[] {
+  if (event.data == null || event.data.length === 0) {
+    return [];
+  }
+  let parsed: { entries?: unknown };
+  try {
+    parsed = JSON.parse(event.data) as { entries?: unknown };
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(parsed.entries)) {
+    return [];
+  }
+  const out: WindowIndexEntry[] = [];
+  for (const raw of parsed.entries) {
+    if (raw == null || typeof raw !== "object") {
+      continue;
+    }
+    const rec = raw as Record<string, unknown>;
+    const jobId = rec.job_id;
+    const windowIndex = rec.window_index;
+    if (
+      typeof jobId !== "string" ||
+      jobId === "" ||
+      typeof windowIndex !== "number" ||
+      !Number.isInteger(windowIndex)
+    ) {
+      continue;
+    }
+    out.push({ job_id: jobId, window_index: windowIndex });
+  }
+  return out;
+}
+
+/**
+ * Fold one synthetic `WindowIndexSnapshot` event (epic fn-817). The
+ * restore-worker change-gated a `job_id → window_index` layout (the live tmux
+ * `#{window_index}`, a window's left-to-right VISUAL position) and main minted
+ * this event. For each entry, OVERWRITE `jobs.window_index` on the matching
+ * `job_id` — a pure integer copy.
+ *
+ * Unlike {@link foldTmuxPaneSnapshot}, this is NOT fill-only: window order keeps
+ * shifting, so a later snapshot must replace an earlier index. Keying on the
+ * stable `job_id` (not a recyclable pane id) means an entry never re-targets
+ * another agent. The fold NEVER nulls or deletes a row, so a job absent from this
+ * snapshot (already ended / killed) KEEPS its last-folded value — the killed-job
+ * window-order survival the DB-only crash-restore derivation needs at restore
+ * time, when the original tmux server is dead.
+ *
+ * Reads ONLY the event payload + the in-transaction `jobs` rows — no probe, no
+ * env, no wall-clock. An empty / malformed payload folds to a no-op with the
+ * cursor still advancing (never throws). An UPDATE matching zero rows (the
+ * `job_id` isn't a tracked job) is a correct no-op. Replaying the same event
+ * re-writes the same integer (idempotent), so re-fold reproduces byte-identical
+ * rows regardless of event interleaving.
+ */
+function foldWindowIndexSnapshot(db: Database, event: Event): void {
+  const entries = extractWindowIndexSnapshot(event);
+  if (entries.length === 0) {
+    return;
+  }
+  for (const entry of entries) {
+    db.run(
+      `UPDATE jobs SET
+         window_index = ?,
+         last_event_id = ?,
+         updated_at = ?
+       WHERE job_id = ?`,
+      [entry.window_index, event.id, event.ts, entry.job_id],
+    );
+  }
+}
+
 /**
  * Wire payload for a synthetic `BuildSnapshot` event — the projection-meaningful
  * fields of one buildbot builder's latest build. The pk (the builder NAME) does
@@ -7145,6 +7236,13 @@ export function applyEvent(
       // (NOT the retired BackendExecSnapshot above); the fold reads only the
       // payload pairs and never overwrites a non-NULL session.
       foldTmuxPaneSnapshot(db, event);
+    } else if (event.hook_event === "WindowIndexSnapshot") {
+      // epic fn-817 — overwrite `jobs.window_index` from the restore-worker's
+      // change-gated `job_id → window_index` layout so the DB-only crash-restore
+      // derivation replays original visual order. A NEW event name; the fold
+      // reads only the payload entries (pure integer copy keyed by job_id), never
+      // probes, and never nulls a row (killed jobs keep their last index).
+      foldWindowIndexSnapshot(db, event);
     } else if (event.hook_event === "PostToolUse") {
       // PostToolUse fans to BOTH projections plus syncIfPlanRef (inside
       // projectJobsRow); the 781ms avg is otherwise unattributable. Arm the

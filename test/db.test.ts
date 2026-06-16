@@ -1925,9 +1925,9 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `commit_trailer_facts` projection table, fn-807; v68 adds the
   // `scheduled_tasks` projection table, fn-813; v69 adds
   // `subagent_invocations.last_disposition`, fn-38.2; v70 adds
-  // `jobs.close_kind`, fn-817); the v62→v63 epics-shape
-  // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(70);
+  // `jobs.close_kind`, fn-817; v71 adds `jobs.window_index`, fn-817); the
+  // v62→v63 epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(71);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

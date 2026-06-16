@@ -90,6 +90,7 @@ import type { RenamerWorkerData } from "./renamer-worker";
 import type {
   RestoreWorkerData,
   TmuxPaneSnapshotMessage,
+  WindowIndexSnapshotMessage,
 } from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
@@ -3382,23 +3383,50 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
 
   if (restoreWorker) {
     const rw = restoreWorker;
-    // Worker → main: the tmux pane-snapshot post. Main is the SOLE synthetic-
-    // event writer — mint ONE `TmuxPaneSnapshot` row carrying the probed
-    // `(pane_id, session_name)` pairs in `data`; the reducer's fill-only fold
-    // stamps each matching NULL-session tmux job's session name. The restore
-    // file write path stays a pure consumer (no message). The worker self-gates
-    // + dedups, so a post here always carries pairs that would fill something.
+    // Worker → main: two restore-worker posts, both on this one port. Main is the
+    // SOLE synthetic-event writer — mint ONE row carrying the post's payload in
+    // `data`. Discriminate on `msg.kind`:
+    //  - `tmux-pane-snapshot` → `TmuxPaneSnapshot` carrying the probed
+    //    `(pane_id, session_name)` pairs; the reducer's fill-only fold stamps
+    //    each matching NULL-session tmux job's session name.
+    //  - `window-index-snapshot` → `WindowIndexSnapshot` carrying the
+    //    `(job_id, window_index)` layout; the reducer folds each index onto the
+    //    matching `jobs` row (pure integer copy keyed by `job_id`).
+    // The restore file write path stays a pure consumer (no message). The worker
+    // self-gates + dedups, so a post here always carries a changed payload.
     rw.onmessage = (
-      ev: MessageEvent<TmuxPaneSnapshotMessage | undefined>,
+      ev: MessageEvent<
+        TmuxPaneSnapshotMessage | WindowIndexSnapshotMessage | undefined
+      >,
     ): void => {
       const msg = ev.data;
-      if (!msg || msg.kind !== "tmux-pane-snapshot") return;
+      if (!msg) return;
+      let hookEvent: string;
+      let eventType: string;
+      // Stable synthetic `session_id` — `events.session_id` is NOT NULL, and
+      // these folds key on the payload (never `event.session_id`), so a constant
+      // per kind both satisfies the constraint and keeps re-fold deterministic.
+      let sessionId: string;
+      let data: string;
+      if (msg.kind === "tmux-pane-snapshot") {
+        hookEvent = "TmuxPaneSnapshot";
+        eventType = "tmux_pane_snapshot";
+        sessionId = "tmux-pane-snapshot";
+        data = JSON.stringify({ pairs: msg.pairs });
+      } else if (msg.kind === "window-index-snapshot") {
+        hookEvent = "WindowIndexSnapshot";
+        eventType = "window_index_snapshot";
+        sessionId = "window-index-snapshot";
+        data = JSON.stringify({ entries: msg.entries });
+      } else {
+        return;
+      }
       stmts.insertEvent.run({
         $ts: Date.now() / 1000,
-        $session_id: null,
+        $session_id: sessionId,
         $pid: null,
-        $hook_event: "TmuxPaneSnapshot",
-        $event_type: "tmux_pane_snapshot",
+        $hook_event: hookEvent,
+        $event_type: eventType,
         $tool_name: null,
         $matcher: null,
         $cwd: null,
@@ -3406,7 +3434,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $agent_id: null,
         $agent_type: null,
         $stop_hook_active: null,
-        $data: JSON.stringify({ pairs: msg.pairs }),
+        $data: data,
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,

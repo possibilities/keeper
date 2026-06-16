@@ -6228,6 +6228,155 @@ test("Killed fold: a malformed payload folds to a safe no-op and still advances 
   expect(getCursor()).toBeGreaterThanOrEqual(killedId);
 });
 
+// ---------------------------------------------------------------------------
+// Schema-v71 window_index — the visual window-order column the
+// WindowIndexSnapshot fold copies from the restore-worker's change-gated
+// `job_id → window_index` layout (fn-817 task .2).
+// ---------------------------------------------------------------------------
+
+function getWindowIndex(jobId = "sess-a"): number | null {
+  const row = db
+    .query("SELECT window_index FROM jobs WHERE job_id = ?")
+    .get(jobId) as { window_index: number | null } | null;
+  return row?.window_index ?? null;
+}
+
+test("WindowIndexSnapshot fold copies window_index onto the matching jobs rows by job_id", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({
+      entries: [
+        { job_id: "sess-a", window_index: 0 },
+        { job_id: "sess-b", window_index: 2 },
+      ],
+    }),
+  });
+  drainAll();
+  expect(getWindowIndex("sess-a")).toBe(0);
+  expect(getWindowIndex("sess-b")).toBe(2);
+});
+
+test("WindowIndexSnapshot fold OVERWRITES an earlier index (reorder, not fill-only)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({ entries: [{ job_id: "sess-a", window_index: 1 }] }),
+  });
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({ entries: [{ job_id: "sess-a", window_index: 3 }] }),
+  });
+  drainAll();
+  expect(getWindowIndex("sess-a")).toBe(3);
+});
+
+test("WindowIndexSnapshot fold: a killed job retains its last-known window_index", () => {
+  // The fold never nulls a row, so an index folded while a job was live
+  // survives the kill — exactly what the DB-only crash-restore derivation needs
+  // at restore time (the original tmux server is dead).
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-a",
+    ts: 5000,
+  });
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({ entries: [{ job_id: "sess-a", window_index: 4 }] }),
+  });
+  // A later snapshot OMITS the about-to-die job (it left the live cache).
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({ entries: [] }),
+  });
+  insertEvent({
+    hook_event: "Killed",
+    session_id: "sess-a",
+    data: JSON.stringify({
+      pid: 4242,
+      start_time: null,
+      close_kind: "pid_died",
+    }),
+  });
+  drainAll();
+  expect(getJob("sess-a")?.state).toBe("killed");
+  expect(getWindowIndex("sess-a")).toBe(4);
+});
+
+test("WindowIndexSnapshot fold drops a non-integer / garbage entry (never coerced)", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-c" });
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({
+      entries: [
+        { job_id: "sess-a", window_index: 1.5 }, // float → dropped
+        { job_id: "sess-b", window_index: "2" }, // string → dropped
+        { job_id: "sess-c", window_index: 5 }, // valid
+      ],
+    }),
+  });
+  drainAll();
+  expect(getWindowIndex("sess-a")).toBeNull();
+  expect(getWindowIndex("sess-b")).toBeNull();
+  expect(getWindowIndex("sess-c")).toBe(5);
+});
+
+test("WindowIndexSnapshot fold: a malformed payload folds to a safe no-op and still advances the cursor", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  const evId = insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: "not json{",
+  });
+  drainAll();
+  expect(getWindowIndex("sess-a")).toBeNull();
+  expect(getCursor()).toBeGreaterThanOrEqual(evId);
+});
+
+test("WindowIndexSnapshot re-fold determinism: a reorder stream re-folds byte-identical", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-b" });
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({
+      entries: [
+        { job_id: "sess-a", window_index: 0 },
+        { job_id: "sess-b", window_index: 1 },
+      ],
+    }),
+  });
+  insertEvent({
+    hook_event: "WindowIndexSnapshot",
+    data: JSON.stringify({
+      entries: [
+        { job_id: "sess-a", window_index: 1 },
+        { job_id: "sess-b", window_index: 0 },
+      ],
+    }),
+  });
+  drainAll();
+  const live = db
+    .query("SELECT job_id, window_index FROM jobs ORDER BY job_id")
+    .all() as { job_id: string; window_index: number | null }[];
+
+  // Rewind the cursor + wipe the projection, then re-fold from scratch. The fold
+  // reads only the event payload (no probe, no wall-clock), so the rebuilt rows
+  // must be byte-identical.
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  drainAll();
+  const refolded = db
+    .query("SELECT job_id, window_index FROM jobs ORDER BY job_id")
+    .all() as { job_id: string; window_index: number | null }[];
+
+  expect(refolded).toEqual(live);
+  expect(live.find((r) => r.job_id === "sess-a")?.window_index).toBe(1);
+  expect(live.find((r) => r.job_id === "sess-b")?.window_index).toBe(0);
+});
+
 test("active_since: NOT re-stamped by a 2nd UserPromptSubmit while already working", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });

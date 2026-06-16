@@ -273,6 +273,14 @@ from pathlib import Path
 # crash-restore set reads instead of a frozen restore.json snapshot. keeper-py
 # reads no ``close_kind`` column (the TUI subscribes over the socket), so no
 # reader logic changes — only the version whitelist gains 70.
+#
+# v71 (fn-817 task .2) adds the nullable ``jobs.window_index`` INTEGER column —
+# the live tmux ``#{window_index}`` (a window's left-to-right VISUAL position)
+# the restore-worker probes per pulse and folds via a change-gated
+# ``WindowIndexSnapshot`` event, so the DB-only crash-restore derivation replays
+# windows in original visual order without reading restore.json. keeper-py reads
+# no ``window_index`` column (the TUI subscribes over the socket), so no reader
+# logic changes — only the version whitelist gains 71.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -315,6 +323,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         68,
         69,
         70,
+        71,
     }
 )
 

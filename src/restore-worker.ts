@@ -152,6 +152,33 @@ export interface TmuxPaneSnapshotMessage {
 }
 
 /**
+ * One `(job_id, window_index)` entry of a window-layout snapshot — the live
+ * tmux `#{window_index}` (a window's left-to-right VISUAL position) keyed by the
+ * agent's stable Claude session id. `window_index` is always a finite integer
+ * here (a `null` index never enters the cache this is built from).
+ */
+export interface WindowIndexEntry {
+  job_id: string;
+  window_index: number;
+}
+
+/**
+ * Worker→main message: the live `job_id → window_index` map, posted ONLY when it
+ * CHANGES (a layout hash dedups, so a steady topology doesn't re-post every
+ * pulse — and, unlike {@link TmuxPaneSnapshotMessage}, a pure window REORDER DOES
+ * re-fire because window order is exactly what this carries). Main — the sole
+ * synthetic event writer — mints ONE `WindowIndexSnapshot` event carrying
+ * `entries`; the reducer folds each `window_index` onto the matching `jobs` row
+ * keyed by `job_id` (a pure integer copy, no probe in the fold). The DB-only
+ * crash-restore derivation then replays original visual order without reading
+ * restore.json. A NEW event name — never reuses a retired one.
+ */
+export interface WindowIndexSnapshotMessage {
+  kind: "window-index-snapshot";
+  entries: WindowIndexEntry[];
+}
+
+/**
  * `Bun.spawnSync`-shaped subset the tmux pane probe needs; injectable so tests
  * drive the gate / parse / dedup without a real tmux server. Mirrors the
  * git-worker's `gitOutput` spawnSync shape: `success` + `exitCode` + a
@@ -602,6 +629,14 @@ interface PulseState {
    * are unique Claude session ids, so an entry is never re-keyed.
    */
   lastWindowIndexByJobId: Map<string, number>;
+  /**
+   * Producer-side dedup for the `WindowIndexSnapshot` post (mirrors
+   * `lastSnapshotHash`). Hash of the last posted `job_id → window_index` layout
+   * (via {@link hashWindowIndexCache}, which INCLUDES the index), so an unchanged
+   * layout doesn't re-post every pulse but a reorder does. `null` until the first
+   * post; advanced only on a post.
+   */
+  lastWindowIndexHash: string | null;
 }
 
 /**
@@ -820,6 +855,23 @@ function hashPairs(pairs: TmuxPanePair[]): string {
 }
 
 /**
+ * Stable layout hash of a `job_id → window_index` map for the window-index post
+ * dedup gate. Sorts by `job_id` so map iteration order doesn't churn the hash,
+ * then hashes the `job_id\twindow_index` join. INCLUDES `window_index` (the
+ * whole point: a reorder MUST re-fire the post so the DB column tracks visual
+ * order), unlike {@link hashPairs} which deliberately excludes it. An empty map
+ * is the empty-string hash.
+ */
+function hashWindowIndexCache(cache: Map<string, number>): string {
+  const entries = [...cache.entries()].sort((a, b) =>
+    a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0,
+  );
+  return String(
+    Bun.hash(entries.map(([id, idx]) => `${id}\t${idx}`).join("\n")),
+  );
+}
+
+/**
  * The tmux poll arm, run on each restore pulse. ONE `list-panes` probe feeds
  * TWO independent consumers (never two `list-panes` calls):
  *
@@ -869,6 +921,32 @@ function tmuxSnapshotPulse(
 }
 
 /**
+ * Emit a `WindowIndexSnapshot` to main when the settled `job_id → window_index`
+ * layout CHANGED since the last post. Runs AFTER the per-pulse stamp + prune so
+ * the cache it reads is final for the pulse: a reorder, a newly-stamped index, or
+ * a prune-driven removal all shift the layout hash and re-fire. The fold keys on
+ * `job_id` and overwrites only the entries carried, so a job that just left the
+ * cache (ended) keeps its last-folded DB value — the killed-job survival the
+ * crash-restore derivation needs. PURE relative to its injected `post`: reads
+ * only the cache, mutates only `state.lastWindowIndexHash` on a post.
+ */
+function windowIndexSnapshotPulse(
+  state: PulseState,
+  post: (msg: WindowIndexSnapshotMessage) => void,
+): void {
+  const hash = hashWindowIndexCache(state.lastWindowIndexByJobId);
+  if (state.lastWindowIndexHash === hash) {
+    return;
+  }
+  const entries: WindowIndexEntry[] = [];
+  for (const [jobId, windowIndex] of state.lastWindowIndexByJobId) {
+    entries.push({ job_id: jobId, window_index: windowIndex });
+  }
+  post({ kind: "window-index-snapshot", entries });
+  state.lastWindowIndexHash = hash;
+}
+
+/**
  * Drive one restore pulse against the worker's read-only connection. PURE-ish
  * in the same shape as `loadReconcileSnapshot`: reads the projections via the
  * `read(collection)` helper (identical frame shape to the autopilot worker's),
@@ -906,6 +984,11 @@ export function restorePulse(
     /** Post a `TmuxPaneSnapshot` to main; omit to disable the poll arm entirely
      *  (the pure-pulse test path — no parentPort). */
     post?: (msg: TmuxPaneSnapshotMessage) => void;
+    /** Post a `WindowIndexSnapshot` to main (the window-order DB channel). Omit
+     *  to disable the window-index post arm — the cache still refreshes for the
+     *  restore.json mirror, but no DB event is minted (the pure-pulse test
+     *  path, or a path that wants only the fill post). */
+    postWindowIndex?: (msg: WindowIndexSnapshotMessage) => void;
   },
 ): void {
   const read = (collection: string): Record<string, unknown>[] => {
@@ -977,6 +1060,15 @@ export function restorePulse(
   // the probe gate above — the gate closes when no live tmux job remains, but
   // the cache must still shed entries for jobs that just ended.
   pruneWindowIndexCache(jobs, state.lastWindowIndexByJobId);
+
+  // Window-index DB channel — emit AFTER the stamp + prune so the cache is final
+  // for the pulse. Change-gated (layout hash) so a steady topology is silent but
+  // a reorder / new index / prune re-fires. Disabled when no `postWindowIndex`
+  // is wired (the pure-pulse test path) — the restore.json mirror below still
+  // carries window_index from the same cache regardless.
+  if (snapshot?.postWindowIndex) {
+    windowIndexSnapshotPulse(state, snapshot.postWindowIndex);
+  }
 
   const current = buildRestoreTier(
     jobs,
@@ -1109,14 +1201,21 @@ function main(): void {
     bootPromoted: false,
     lastSnapshotHash: null,
     lastWindowIndexByJobId: new Map(),
+    lastWindowIndexHash: null,
   };
   let shutdown = false;
 
-  // The tmux pane-snapshot post → main (the sole synthetic-event writer). The
-  // worker is otherwise a pure consumer; this is its ONLY worker→main channel.
+  // Worker→main posts (main is the sole synthetic-event writer). The worker is
+  // otherwise a pure consumer; these two `postMessage` calls are its ONLY
+  // worker→main channels: the pane-fill `TmuxPaneSnapshot` and the window-order
+  // `WindowIndexSnapshot`. Both ride the same parentPort; main discriminates on
+  // `msg.kind`.
   const port = parentPort;
   const snapshot = {
     post: (msg: TmuxPaneSnapshotMessage): void => {
+      port.postMessage(msg);
+    },
+    postWindowIndex: (msg: WindowIndexSnapshotMessage): void => {
       port.postMessage(msg);
     },
   };

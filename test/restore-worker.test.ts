@@ -57,6 +57,7 @@ import {
   serializeForWrite,
   type TmuxPaneSnapshotMessage,
   tierAgentCount,
+  type WindowIndexSnapshotMessage,
 } from "../src/restore-worker";
 import type { Epic, Job } from "../src/types";
 import { freshMemDb } from "./helpers/template-db";
@@ -70,6 +71,7 @@ function freshState(): {
   bootPromoted: boolean;
   lastSnapshotHash: string | null;
   lastWindowIndexByJobId: Map<string, number>;
+  lastWindowIndexHash: string | null;
 } {
   return {
     lastHash: null,
@@ -79,6 +81,7 @@ function freshState(): {
     bootPromoted: false,
     lastSnapshotHash: null,
     lastWindowIndexByJobId: new Map(),
+    lastWindowIndexHash: null,
   };
 }
 
@@ -1286,6 +1289,82 @@ test("restorePulse window-index cache prunes entries for jobs no longer live", (
     post: () => {},
   });
   expect(state.lastWindowIndexByJobId.has("j1")).toBe(false);
+});
+
+test("restorePulse posts a WindowIndexSnapshot when the layout changes, deduped on no change", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  insertJob({
+    job_id: "j2",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%2",
+    backend_exec_session_id: "work",
+  });
+  const wi: WindowIndexSnapshotMessage[] = [];
+  const state = freshState();
+  const pulse = (panes: string[], now: number): void => {
+    restorePulse(db, restorePath, state, () => now, {
+      spawnSync: stubTmuxPanes(panes),
+      post: () => {},
+      postWindowIndex: (m) => wi.push(m),
+    });
+  };
+  // First pulse: a layout exists → ONE post carrying both entries.
+  pulse(["%1\t0\twork", "%2\t1\twork"], 1000);
+  expect(wi).toHaveLength(1);
+  const entries0 = [...wi[0].entries].sort((a, b) =>
+    a.job_id < b.job_id ? -1 : 1,
+  );
+  expect(entries0).toEqual([
+    { job_id: "j1", window_index: 0 },
+    { job_id: "j2", window_index: 1 },
+  ]);
+  // Identical layout → deduped, no new post.
+  pulse(["%1\t0\twork", "%2\t1\twork"], 1500);
+  expect(wi).toHaveLength(1);
+  // A REORDER (swapped indices) re-fires — the layout hash includes the index.
+  pulse(["%1\t1\twork", "%2\t0\twork"], 2000);
+  expect(wi).toHaveLength(2);
+  const entries1 = [...wi[1].entries].sort((a, b) =>
+    a.job_id < b.job_id ? -1 : 1,
+  );
+  expect(entries1).toEqual([
+    { job_id: "j1", window_index: 1 },
+    { job_id: "j2", window_index: 0 },
+  ]);
+});
+
+test("restorePulse re-posts a WindowIndexSnapshot when a job leaves the live set (prune-driven change)", () => {
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  const wi: WindowIndexSnapshotMessage[] = [];
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmuxPanes(["%1\t2\twork"]),
+    post: () => {},
+    postWindowIndex: (m) => wi.push(m),
+  });
+  expect(wi).toHaveLength(1);
+  expect(wi[0].entries).toEqual([{ job_id: "j1", window_index: 2 }]);
+  // The job ends → pruned from the cache → the layout shrank to empty → re-fire
+  // with an empty entry set. The fold leaves j1's last-folded DB value intact;
+  // the empty post simply records that no live window remains.
+  db.run(`UPDATE jobs SET state = 'ended' WHERE job_id = 'j1'`);
+  restorePulse(db, restorePath, state, () => 2000, {
+    spawnSync: stubTmuxPanes(["%1\t2\twork"]),
+    post: () => {},
+    postWindowIndex: (m) => wi.push(m),
+  });
+  expect(wi).toHaveLength(2);
+  expect(wi[1].entries).toEqual([]);
 });
 
 test("restorePulse seeds the window-index cache from the boot-promoted tier", () => {
