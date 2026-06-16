@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-16T18:59:35.762000Z",
+  "depends_on_epics": [],
+  "id": "fn-817-db-derived-crash-restore",
+  "last_validated_at": "2026-06-16T18:59:35.781000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "db-derived crash restore",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-16T18:59:35.762000Z"
+}
