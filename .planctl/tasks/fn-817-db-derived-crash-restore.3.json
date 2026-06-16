@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "read-time restore-set derivation",
-  "updated_at": "2026-06-16T18:59:35.762000Z"
+  "updated_at": "2026-06-16T19:38:30.586000Z",
+  "worker_done_at": "2026-06-16T19:38:30.586000Z"
 }

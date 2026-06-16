@@ -40,5 +40,5 @@ Build a fixture DB (`freshDbFile()`) seeding killed jobs with each close_kind + 
 - [ ] Unit tests incl. the 2026-06-16 incident cohort as a regression fixture; `bun run test:full` green.
 
 ## Done summary
-
+Added src/restore-set.ts: the DB-derived, read-time crash-restore candidate set (close_kind membership + burst-cluster backstop, backend/autopilot/live-UUID/idle filters, window_index ordering) over a read-only keeper.db connection, with unit tests incl. the 2026-06-16 Killed-burst regression fixture.
 ## Evidence
