@@ -6,6 +6,7 @@ import {
   buildKillSessionArgs,
   buildListPanesArgs,
   buildListSessionsArgs,
+  buildRestoreAgentsArgv,
   buildSelectLayoutArgs,
   buildSelectPaneArgs,
   buildSetMainPaneWidthArgs,
@@ -532,5 +533,166 @@ describe("main() --kill-sessions busy-pane gate", () => {
     expect(spawnedAnyKill(calls)).toBe(true);
     // No busy table was ever rendered to stdout ⇒ no prompt was shown.
     expect(writes.some((w) => w.includes("→"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// buildRestoreAgentsArgv — the subprocess invocation contract. setup-tmux owns
+// no ExecBackend; it spawns this exact argv (the subprocess owns ExecBackend).
+// ---------------------------------------------------------------------------
+
+describe("buildRestoreAgentsArgv", () => {
+  test("spawns restore-agents --apply --session foreground --last-generation", () => {
+    const argv = buildRestoreAgentsArgv();
+    expect(argv[0]).toBe("bun");
+    expect(argv[1]).toBe(`${KEEPER_DIR}/scripts/restore-agents.ts`);
+    expect(argv.slice(2)).toEqual([
+      "--apply",
+      "--session",
+      "foreground",
+      "--last-generation",
+    ]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// main() restore-last-session offer. The offer must be computed BEFORE any
+// session-creating call (rebuildDash/ensureWorkSessions mint a new server =
+// new generation) and fire ONLY when foreground is absent AND count>0 AND TTY.
+// ---------------------------------------------------------------------------
+
+const RESTORE_ARGV = buildRestoreAgentsArgv();
+const spawnedRestore = (calls: string[][]): boolean =>
+  calls.some(
+    (c) =>
+      c.length === RESTORE_ARGV.length &&
+      c.every((tok, i) => tok === RESTORE_ARGV[i]),
+  );
+
+/**
+ * Spawn stub for the offer path: `has-session` for the `=foreground` target
+ * returns `foregroundExit` (so the offer's absence probe is controllable
+ * independently of ensureWorkSessions' other has-session probes); every other
+ * spawn succeeds, with new-session/split-window emitting a pane id so
+ * rebuildDash completes. Records into `calls`.
+ */
+function makeOfferStub(foregroundExit: number, calls: string[][]): SyncSpawnFn {
+  return (cmd): SyncSpawnResult => {
+    calls.push([...cmd]);
+    if (cmd[1] === "has-session" && cmd[3] === "=foreground") {
+      return {
+        exitCode: foregroundExit,
+        stdout: Buffer.from(""),
+        stderr: Buffer.from(""),
+      };
+    }
+    const out =
+      cmd[1] === "new-session" ? "%0" : cmd[1] === "split-window" ? "%1" : "";
+    return {
+      exitCode: 0,
+      stdout: Buffer.from(out),
+      stderr: Buffer.from(""),
+    };
+  };
+}
+
+/** Run main() with stdin/stdout TTY pinned and a fake EOF/typed stdin, then
+ *  restore every patched global. `answer` of "" ⇒ EOF (confirm → false). */
+async function runWithTTY(opts: {
+  spawn: SyncSpawnFn;
+  count: number;
+  tty: boolean;
+  answer: string;
+}): Promise<void> {
+  const savedStdin = process.stdin;
+  const savedStdinTTY = process.stdin.isTTY;
+  const savedStdoutTTY = process.stdout.isTTY;
+  const savedOut = process.stdout.write;
+
+  const { Readable } = await import("node:stream");
+  // A line of input resolves rl.question; [] (EOF) resolves via "close".
+  const fakeStdin = Readable.from(
+    opts.answer === "" ? [] : [`${opts.answer}\n`],
+  ) as unknown as typeof process.stdin;
+  Object.defineProperty(process, "stdin", {
+    value: fakeStdin,
+    configurable: true,
+  });
+  Object.defineProperty(process.stdin, "isTTY", {
+    value: opts.tty,
+    configurable: true,
+  });
+  Object.defineProperty(process.stdout, "isTTY", {
+    value: opts.tty,
+    configurable: true,
+  });
+  process.stdout.write = (() => true) as typeof process.stdout.write;
+
+  try {
+    await main([], opts.spawn, () => opts.count);
+  } finally {
+    Object.defineProperty(process, "stdin", {
+      value: savedStdin,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdin, "isTTY", {
+      value: savedStdinTTY,
+      configurable: true,
+    });
+    Object.defineProperty(process.stdout, "isTTY", {
+      value: savedStdoutTTY,
+      configurable: true,
+    });
+    process.stdout.write = savedOut;
+  }
+}
+
+describe("main() restore-last-session offer", () => {
+  test("foreground absent + count>0 + TTY + y ⇒ spawns restore-agents", async () => {
+    const calls: string[][] = [];
+    // foreground absent (has-session exits 1).
+    const spawn = makeOfferStub(1, calls);
+    await runWithTTY({ spawn, count: 2, tty: true, answer: "y" });
+
+    expect(spawnedRestore(calls)).toBe(true);
+    // Ordering: the foreground has-session probe (the offer's absence check)
+    // precedes the first session-creating call (dash new-session).
+    const probeIdx = calls.findIndex(
+      (c) => c[1] === "has-session" && c[3] === "=foreground",
+    );
+    const newSessionIdx = calls.findIndex((c) => c[1] === "new-session");
+    expect(probeIdx).toBeGreaterThanOrEqual(0);
+    expect(newSessionIdx).toBeGreaterThan(probeIdx);
+  });
+
+  test("foreground absent + count>0 + TTY + N (EOF) ⇒ no spawn", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub(1, calls);
+    await runWithTTY({ spawn, count: 2, tty: true, answer: "" });
+    expect(spawnedRestore(calls)).toBe(false);
+  });
+
+  test("foreground present ⇒ no offer, no spawn", async () => {
+    const calls: string[][] = [];
+    // foreground present (has-session exits 0).
+    const spawn = makeOfferStub(0, calls);
+    // count>0 and TTY would otherwise prompt — presence must short-circuit.
+    await runWithTTY({ spawn, count: 5, tty: true, answer: "y" });
+    expect(spawnedRestore(calls)).toBe(false);
+  });
+
+  test("zero candidates ⇒ no offer, no spawn", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub(1, calls);
+    await runWithTTY({ spawn, count: 0, tty: true, answer: "y" });
+    expect(spawnedRestore(calls)).toBe(false);
+  });
+
+  test("non-TTY ⇒ never auto-restores, no spawn", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub(1, calls);
+    // count>0 but non-TTY must skip silently (never auto-yes).
+    await runWithTTY({ spawn, count: 3, tty: false, answer: "y" });
+    expect(spawnedRestore(calls)).toBe(false);
   });
 });

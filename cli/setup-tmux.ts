@@ -22,7 +22,9 @@
 
 import { createInterface } from "node:readline";
 import { parseArgs } from "node:util";
+import { openDb, resolveDbPath } from "../src/db";
 import { localeDefaultedEnv, MANAGED_EXEC_SESSION } from "../src/exec-backend";
+import { deriveLastGenerationSet } from "../src/restore-set";
 
 export const HELP = `keeper setup-tmux — provision the tmux control plane (dash + work sessions)
 
@@ -35,6 +37,11 @@ builds/usage panes, main-vertical) and ensures the work sessions 'autopilot',
 'background', and 'foreground' exist (one shell window each, stamped with
 KEEPER_TMUX_SESSION). Existing work sessions are left untouched. NEVER attaches
 or switch-clients — safe to run inside or outside tmux.
+
+When the 'foreground' session is ABSENT (the first run after a crash) and the
+last tmux-server generation left crashed 'foreground' agents, it offers — y/N on
+a TTY only, never auto — to relaunch them via 'restore-agents --last-generation'.
+A present 'foreground' session, zero candidates, or a non-TTY skips the offer.
 
 Options:
   --kill-sessions  Kill all four sessions before setup. Prompts y/N only when
@@ -469,11 +476,13 @@ function killAllSessions(spawn: SyncSpawnFn): void {
 
 /** Prompt y/N on a confirmed TTY. EOF/Ctrl-D / anything but y/Y ⇒ false. The
  *  readline interface is created here (after the TTY gate) and always closed. */
-async function confirm(): Promise<boolean> {
+async function confirm(
+  prompt = "Kill these sessions? [y/N] ",
+): Promise<boolean> {
   const rl = createInterface({ input: process.stdin, output: process.stdout });
   try {
     const answer = await new Promise<string>((resolve) => {
-      rl.question("Kill these sessions? [y/N] ", resolve);
+      rl.question(prompt, resolve);
       rl.on("close", () => resolve(""));
     });
     return answer.trim().toLowerCase() === "y";
@@ -482,9 +491,56 @@ async function confirm(): Promise<boolean> {
   }
 }
 
+/**
+ * Injectable provider for the last-generation foreground crash-candidate COUNT.
+ * Default opens `keeper.db` READ-ONLY (NOT the ExecBackend seam — reading the DB
+ * is allowed here; only multiplexer drive stays outside it) and counts
+ * {@link deriveLastGenerationSet} candidates filtered to the `foreground`
+ * backend session. Tests inject a fake so they need no real DB. Daemon-down is
+ * fine (read-only connection); any open/read failure degrades to 0 (skip the
+ * offer rather than crash setup).
+ */
+export type ForegroundCandidateCountFn = () => number;
+
+const FOREGROUND_SESSION = "foreground" as const;
+
+const defaultForegroundCandidateCount: ForegroundCandidateCountFn = () => {
+  try {
+    const { db } = openDb(resolveDbPath(), { readonly: true });
+    try {
+      const { candidates } = deriveLastGenerationSet(db);
+      return candidates.filter(
+        (c) => c.backend_exec_session_id === FOREGROUND_SESSION,
+      ).length;
+    } finally {
+      db.close();
+    }
+  } catch {
+    return 0;
+  }
+};
+
+/**
+ * Build the restore-agents spawn argv for the foreground last-generation set —
+ * the subprocess owns ExecBackend; setup-tmux only spawns it. `--apply` actually
+ * relaunches, `--session foreground` scopes to that session, `--last-generation`
+ * bounds to the kill-anchored generation window.
+ */
+export function buildRestoreAgentsArgv(): string[] {
+  return [
+    "bun",
+    `${KEEPER_DIR}/scripts/restore-agents.ts`,
+    "--apply",
+    "--session",
+    FOREGROUND_SESSION,
+    "--last-generation",
+  ];
+}
+
 export async function main(
   argv: string[],
   spawn: SyncSpawnFn = defaultSpawn,
+  foregroundCandidateCount: ForegroundCandidateCountFn = defaultForegroundCandidateCount,
 ): Promise<void> {
   const parsed = parseArgs({
     args: argv,
@@ -528,11 +584,35 @@ export async function main(
       }
     }
 
+    // Restore-last-session offer — computed BEFORE any session-creating call
+    // (rebuildDash/ensureWorkSessions mint a NEW tmux server = a new generation,
+    // which would shift the kill-anchored window). One-shot: it fires only when
+    // the `foreground` session is ABSENT (the first setup-tmux after a crash);
+    // if it exists, this run isn't a recovery and we skip silently.
+    let restoreForeground = false;
+    const foregroundAbsent =
+      run(spawn, buildHasSessionArgs(FOREGROUND_SESSION)).exitCode !== 0;
+    if (foregroundAbsent) {
+      const count = foregroundCandidateCount();
+      const tty = process.stdout.isTTY === true && process.stdin.isTTY === true;
+      // Non-empty AND TTY ⇒ prompt; non-TTY NEVER auto-restores; zero skips.
+      if (count > 0 && tty) {
+        restoreForeground = await confirm(
+          `Restore ${count} agent(s) from the last 'foreground' session? [y/N] `,
+        );
+      }
+    }
+
     rebuildDash(spawn);
     ensureWorkSessions(spawn);
     process.stdout.write(
       `keeper setup-tmux: '${DASH_SESSION}' rebuilt, work sessions ensured — attach with: tmux attach -t ${DASH_SESSION}\n`,
     );
+
+    if (restoreForeground) {
+      // The subprocess owns ExecBackend; setup-tmux only spawns it.
+      run(spawn, buildRestoreAgentsArgv());
+    }
   } catch (e) {
     if (e instanceof TmuxError) {
       process.stderr.write(`${e.message}\n`);
