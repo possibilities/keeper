@@ -34,5 +34,5 @@ setup-tmux test (mirror :380-488 — isTTY defineProperty save/restore + EOF-con
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+setup-tmux offers a foreground last-generation restore when foreground is absent: TTY-only y/N prompt computed before any session-creating call, spawning restore-agents --apply --session foreground --last-generation via the injectable spawn seam (no ExecBackend import); candidate count reads keeper.db read-only via an injectable provider.
 ## Evidence
