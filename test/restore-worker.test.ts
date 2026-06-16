@@ -39,13 +39,16 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { resolveRestorePath } from "../src/db";
 import {
+  type BackendExecStartMessage,
   buildRestoreTier,
+  probeServerGeneration,
   probeTmuxPanes,
   RESTORE_SCHEMA_VERSION,
   type RestoreDescriptor,
   type RestoreTier,
   restorePulse,
   type SpawnSyncFn,
+  seedLastGenerationHash,
   serializeForHash,
   serializeForWrite,
   type TmuxPaneSnapshotMessage,
@@ -61,6 +64,7 @@ function freshState(): {
   lastSnapshotHash: string | null;
   lastWindowIndexByJobId: Map<string, number>;
   lastWindowIndexHash: string | null;
+  lastGenerationHash: string | null;
 } {
   return {
     lastHash: null,
@@ -68,6 +72,7 @@ function freshState(): {
     lastSnapshotHash: null,
     lastWindowIndexByJobId: new Map(),
     lastWindowIndexHash: null,
+    lastGenerationHash: null,
   };
 }
 
@@ -80,6 +85,45 @@ function stubTmuxPanes(lines: string[]): SpawnSyncFn {
     exitCode: 0,
     stdout: Buffer.from(lines.join("\n")),
   });
+}
+
+/**
+ * A `SpawnSyncFn` that dispatches on the tmux subcommand: a `display-message`
+ * probe (the server-pid generation handle) returns `pid`; a `list-panes` probe
+ * returns the given pane lines. One stub feeds BOTH consumers the pulse drives
+ * off a single injected `spawnSync`. A `null` `pid` makes the display-message
+ * probe a failed (no-server) capture.
+ */
+function stubTmux(opts: { pid: string | null; panes?: string[] }): SpawnSyncFn {
+  return (cmd: string[]) => {
+    if (cmd.includes("display-message")) {
+      if (opts.pid == null) {
+        return { success: false, exitCode: 1, stdout: Buffer.from("") };
+      }
+      return { success: true, exitCode: 0, stdout: Buffer.from(opts.pid) };
+    }
+    return {
+      success: true,
+      exitCode: 0,
+      stdout: Buffer.from((opts.panes ?? []).join("\n")),
+    };
+  };
+}
+
+/** Insert one `BackendExecStart` event carrying `generation_id` so the boot-seed
+ *  reads it as the last logged generation. */
+function insertBackendExecStart(generationId: string): void {
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, ?, ?, ?)`,
+    [
+      1000,
+      "backend-exec-start",
+      "BackendExecStart",
+      "backend_exec_start",
+      JSON.stringify({ backend_type: "tmux", generation_id: generationId }),
+    ],
+  );
 }
 
 /** Read + parse the single-tier file off disk for assertions. */
@@ -1074,4 +1118,187 @@ test("restorePulse re-posts a WindowIndexSnapshot when a job leaves the live set
   });
   expect(wi).toHaveLength(2);
   expect(wi[1].entries).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
+// probeServerGeneration — positive-int validation
+// ---------------------------------------------------------------------------
+
+test("probeServerGeneration returns the pid string for a positive integer", () => {
+  expect(probeServerGeneration(stubTmux({ pid: "4242" }))).toBe("4242");
+});
+
+test("probeServerGeneration returns null on a non-zero exit (no server)", () => {
+  expect(probeServerGeneration(stubTmux({ pid: null }))).toBeNull();
+});
+
+test("probeServerGeneration rejects garbage / non-positive-int output", () => {
+  const cases = ["", "  ", "0", "-1", "12.5", "0x1f", "abc", "12 34", "1e3"];
+  for (const out of cases) {
+    const stub: SpawnSyncFn = () => ({
+      success: true,
+      exitCode: 0,
+      stdout: Buffer.from(out),
+    });
+    expect(probeServerGeneration(stub)).toBeNull();
+  }
+});
+
+test("probeServerGeneration trims surrounding whitespace from a valid pid", () => {
+  const stub: SpawnSyncFn = () => ({
+    success: true,
+    exitCode: 0,
+    stdout: Buffer.from("  777\n"),
+  });
+  expect(probeServerGeneration(stub)).toBe("777");
+});
+
+test("probeServerGeneration returns null when spawnSync throws (no binary)", () => {
+  const stub: SpawnSyncFn = () => {
+    throw new Error("ENOENT");
+  };
+  expect(probeServerGeneration(stub)).toBeNull();
+});
+
+// ---------------------------------------------------------------------------
+// restorePulse — BackendExecStart generation boundary
+// ---------------------------------------------------------------------------
+
+test("restorePulse posts a BackendExecStart on the first observed generation, deduped on no change", () => {
+  // No live tmux job: the generation arm is UNGATED, so it must still fire — the
+  // post-crash state is exactly when no job is live.
+  const bes: BackendExecStartMessage[] = [];
+  const state = freshState();
+  const pulse = (pid: string, now: number): void => {
+    restorePulse(db, restorePath, state, () => now, {
+      spawnSync: stubTmux({ pid }),
+      post: () => {},
+      postBackendExecStart: (m) => bes.push(m),
+    });
+  };
+  // First observation → ONE post carrying backend_type + generation_id.
+  pulse("1000", 1000);
+  expect(bes).toHaveLength(1);
+  expect(bes[0]).toEqual({
+    kind: "backend-exec-start",
+    backend_type: "tmux",
+    generation_id: "1000",
+  });
+  // Unchanged server pid → deduped, no new post.
+  pulse("1000", 1500);
+  expect(bes).toHaveLength(1);
+  // Server respawned (new pid) → a new boundary.
+  pulse("2000", 2000);
+  expect(bes).toHaveLength(2);
+  expect(bes[1].generation_id).toBe("2000");
+});
+
+test("restorePulse emits no BackendExecStart when no tmux server is running", () => {
+  const bes: BackendExecStartMessage[] = [];
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmux({ pid: null }),
+    post: () => {},
+    postBackendExecStart: (m) => bes.push(m),
+  });
+  expect(bes).toHaveLength(0);
+  // A degraded probe must leave the gate untouched, so a later real generation
+  // still posts (it is not silently swallowed as "already seen").
+  expect(state.lastGenerationHash).toBeNull();
+  restorePulse(db, restorePath, state, () => 2000, {
+    spawnSync: stubTmux({ pid: "55" }),
+    post: () => {},
+    postBackendExecStart: (m) => bes.push(m),
+  });
+  expect(bes).toHaveLength(1);
+  expect(bes[0].generation_id).toBe("55");
+});
+
+test("seedLastGenerationHash suppresses a same-pid re-emit across a keeperd restart", () => {
+  // A prior boot logged BackendExecStart{pid:9999}. After a restart against the
+  // SAME server, the boot-seed primes the gate so the first pulse is silent.
+  insertBackendExecStart("9999");
+  const bes: BackendExecStartMessage[] = [];
+  const state = freshState();
+  seedLastGenerationHash(db, state);
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmux({ pid: "9999" }),
+    post: () => {},
+    postBackendExecStart: (m) => bes.push(m),
+  });
+  expect(bes).toHaveLength(0);
+  // A genuine respawn after the restart (different pid) DOES still post.
+  restorePulse(db, restorePath, state, () => 2000, {
+    spawnSync: stubTmux({ pid: "10000" }),
+    post: () => {},
+    postBackendExecStart: (m) => bes.push(m),
+  });
+  expect(bes).toHaveLength(1);
+  expect(bes[0].generation_id).toBe("10000");
+});
+
+test("seedLastGenerationHash reads the LATEST BackendExecStart by id, not ts", () => {
+  // Two generations logged; the latest by rowid is the one that must seed.
+  insertBackendExecStart("100");
+  insertBackendExecStart("200");
+  const bes: BackendExecStartMessage[] = [];
+  const state = freshState();
+  seedLastGenerationHash(db, state);
+  // Server still on the latest generation (200) → silent.
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmux({ pid: "200" }),
+    post: () => {},
+    postBackendExecStart: (m) => bes.push(m),
+  });
+  expect(bes).toHaveLength(0);
+});
+
+test("seedLastGenerationHash leaves the gate null when no BackendExecStart exists", () => {
+  const bes: BackendExecStartMessage[] = [];
+  const state = freshState();
+  seedLastGenerationHash(db, state);
+  expect(state.lastGenerationHash).toBeNull();
+  // With no seed, the first observed generation is treated as a boundary.
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmux({ pid: "42" }),
+    post: () => {},
+    postBackendExecStart: (m) => bes.push(m),
+  });
+  expect(bes).toHaveLength(1);
+  expect(bes[0].generation_id).toBe("42");
+});
+
+test("seedLastGenerationHash tolerates a malformed payload (leaves gate null)", () => {
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, data)
+       VALUES (?, ?, ?, ?, ?)`,
+    [1000, "backend-exec-start", "BackendExecStart", "backend_exec_start", "{"],
+  );
+  const state = freshState();
+  seedLastGenerationHash(db, state);
+  expect(state.lastGenerationHash).toBeNull();
+});
+
+test("restorePulse generation arm is independent of the window-index / pane arms", () => {
+  // One live tmux job drives the pane + window arms; the generation arm fires off
+  // the SAME single injected spawnSync, dispatched by subcommand.
+  insertJob({
+    job_id: "j1",
+    backend_exec_type: "tmux",
+    backend_exec_pane_id: "%1",
+    backend_exec_session_id: "work",
+  });
+  const wi: WindowIndexSnapshotMessage[] = [];
+  const bes: BackendExecStartMessage[] = [];
+  const state = freshState();
+  restorePulse(db, restorePath, state, () => 1000, {
+    spawnSync: stubTmux({ pid: "321", panes: ["%1\t0\twork"] }),
+    post: () => {},
+    postWindowIndex: (m) => wi.push(m),
+    postBackendExecStart: (m) => bes.push(m),
+  });
+  expect(wi).toHaveLength(1);
+  expect(wi[0].entries).toEqual([{ job_id: "j1", window_index: 0 }]);
+  expect(bes).toHaveLength(1);
+  expect(bes[0].generation_id).toBe("321");
 });

@@ -45,18 +45,23 @@
  *    `backend_exec_session_id`, the worker posts ONE
  *    `{kind:"tmux-pane-snapshot"}` message to main, which mints the sole
  *    `TmuxPaneSnapshot` synthetic event the reducer folds (fill-only).
- * The post is the worker's ONLY worker→main channel and its ONLY event-log
- * contribution; the restore-file write path remains a pure consumer side-file.
- * The poller is quiescent when no live tmux job exists; a producer-side dedup
- * hash (which DELIBERATELY excludes `window_index`) stops re-posting an
- * unchanged fill topology, so a pure window reorder never re-fires the post.
+ * Two more posts ride the same pulse (the pulse→event→fold family): the
+ * `{kind:"window-index-snapshot"}` window-order channel (epic fn-817), and the
+ * `{kind:"backend-exec-start"}` generation boundary (epic fn-819) — the latter
+ * UNGATED by a live tmux job, since a post-crash respawn must be recorded when
+ * no job is live. The restore-file write path stays a pure consumer side-file.
+ * The pane/window arms are quiescent when no live tmux job exists; a
+ * producer-side dedup hash per arm (the fill hash DELIBERATELY excludes
+ * `window_index`) stops re-posting an unchanged payload, so a pure window
+ * reorder never re-fires the fill post and an unchanged generation is silent.
  *
  * Worker contract (see CLAUDE.md "Worker contract"):
  *  - `isMainThread` guard — a plain import is inert.
  *  - Own read-only `openDb` connection — `applyPragmas` runs inside `openDb`
  *    so `busy_timeout` is set on this connection too.
- *  - Typed message protocol: `{kind:"tmux-pane-snapshot"}` worker→main (the
- *    only post), `{type:"shutdown"}` main→worker. Exit 0 clean / 1 crash.
+ *  - Typed message protocol: `{kind:"tmux-pane-snapshot"}` /
+ *    `{kind:"window-index-snapshot"}` / `{kind:"backend-exec-start"}`
+ *    worker→main, `{type:"shutdown"}` main→worker. Exit 0 clean / 1 crash.
  *  - Subsystem-style teardown: the read-only DB connection is closed in the
  *    shutdown handler before `process.exit(0)`.
  *
@@ -83,7 +88,11 @@ import {
   serializePlanctlJson,
   sortObjectKeys,
 } from "./db";
-import { DEFAULT_EXEC_BACKEND, localeDefaultedEnv } from "./exec-backend";
+import {
+  buildTmuxServerPidArgs,
+  DEFAULT_EXEC_BACKEND,
+  localeDefaultedEnv,
+} from "./exec-backend";
 import { resumeTarget, tierForJobFromEpics } from "./resume-descriptor";
 import { runQuery } from "./server-worker";
 import type { Epic, Job } from "./types";
@@ -164,6 +173,26 @@ export interface WindowIndexEntry {
 export interface WindowIndexSnapshotMessage {
   kind: "window-index-snapshot";
   entries: WindowIndexEntry[];
+}
+
+/**
+ * Worker→main message: a backend "generation" boundary, posted ONLY when the
+ * probed server generation CHANGES (the dedup hash differs from the last post,
+ * or the first observation after boot once the boot-seed is compared). Unlike
+ * the two snapshot posts above, this is NOT gated on any live tmux job — the
+ * post-crash state has no live job, yet that is exactly when a new generation
+ * (the freshly-respawned server) must be recorded. Main — the sole synthetic
+ * event writer — mints ONE `BackendExecStart` event carrying `backend_type` +
+ * `generation_id`; the reducer folds it via an explicit NO-OP dispatcher arm
+ * (the boundary lives in the event log's `id` order, not a projection column).
+ * `generation_id` is the backend's stable generation handle (the tmux server
+ * pid); `backend_type` is {@link DEFAULT_EXEC_BACKEND} (the seam other backends
+ * extend). A NEW event name — never reuses the retired `BackendExecSnapshot`.
+ */
+export interface BackendExecStartMessage {
+  kind: "backend-exec-start";
+  backend_type: string;
+  generation_id: string;
 }
 
 /**
@@ -482,6 +511,17 @@ interface PulseState {
    * post; advanced only on a post.
    */
   lastWindowIndexHash: string | null;
+  /**
+   * Producer-side dedup for the `BackendExecStart` generation-boundary post. The
+   * hash of the last posted generation id, so an unchanged server generation
+   * does NOT re-post every pulse. Seeded ONCE at the first pulse from the last
+   * logged `BackendExecStart` payload (see {@link seedLastGenerationHash}) so a
+   * keeperd restart against an UNCHANGED server does not mint a spurious
+   * boundary. `null` until seeded/posted; advanced only on a post. A `null` here
+   * after boot-seed means no prior generation was ever recorded — the next
+   * non-empty probe is the first boundary and DOES post.
+   */
+  lastGenerationHash: string | null;
 }
 
 /**
@@ -792,6 +832,128 @@ function windowIndexSnapshotPulse(
 }
 
 /**
+ * Probe the backend's current generation handle (the tmux SERVER pid) via the
+ * injected `spawnSync`. Returns the pid STRING when the probe yields a single
+ * positive integer; `null` for every degraded case — ENOENT (no tmux binary),
+ * a non-zero exit (no running server), or output that does not parse to a
+ * positive integer (garbage / empty). NEVER throws. A `null` means "no
+ * generation observed this pulse" and the caller emits nothing — a degraded
+ * probe must NOT fire a spurious boundary. Pure relative to the injected
+ * `spawnSync`.
+ */
+export function probeServerGeneration(spawnSync: SpawnSyncFn): string | null {
+  let res: ReturnType<SpawnSyncFn>;
+  try {
+    res = spawnSync(buildTmuxServerPidArgs());
+  } catch {
+    return null;
+  }
+  if (!res.success || res.exitCode !== 0) {
+    return null;
+  }
+  const raw = res.stdout.toString().trim();
+  if (raw === "") {
+    return null;
+  }
+  // A positive integer ONLY: a pid is `> 0` and all-digits. `Number` would
+  // accept `"12.5"`, `"0x1f"`, `" 12 "`, or scientific notation, any of which
+  // would hash as a "generation" and fire a bogus boundary, so gate on a strict
+  // digit string then on `> 0`.
+  if (!/^\d+$/.test(raw)) {
+    return null;
+  }
+  const pid = Number(raw);
+  if (!Number.isInteger(pid) || pid <= 0) {
+    return null;
+  }
+  return raw;
+}
+
+/**
+ * Hash a generation id for the `BackendExecStart` post-dedup gate. A thin
+ * wrapper over {@link Bun.hash} so the gate compares by a stable scalar key and
+ * the seed path (which reads the prior `generation_id` off the last logged
+ * event) shares one hashing rule with the live probe. Pure.
+ */
+function hashGenerationId(generationId: string): string {
+  return String(Bun.hash(generationId));
+}
+
+/**
+ * Mint a `BackendExecStart` generation-boundary post when the probed server
+ * generation CHANGED since the last post (or is the first one recorded). Run
+ * UNGATED by {@link hasLiveTmuxJob}: the post-crash state has no live tmux job,
+ * yet the freshly-respawned server is precisely the generation that must be
+ * recorded so crash-restore can scope to "the session you just lost".
+ *
+ * A degraded probe ({@link probeServerGeneration} returning `null` — no binary,
+ * no server, garbage) emits NOTHING and leaves `state.lastGenerationHash`
+ * intact (a transient "no server" pulse must not look like a boundary). On a
+ * real change, posts `{backend_type, generation_id}` and advances the dedup
+ * hash. The boot-seed ({@link seedLastGenerationHash}) primes the hash before
+ * the first pulse so a keeperd restart against an UNCHANGED server is silent.
+ * PURE relative to its injected `spawnSync` + `post`.
+ */
+function backendExecStartPulse(
+  state: PulseState,
+  spawnSync: SpawnSyncFn,
+  post: (msg: BackendExecStartMessage) => void,
+): void {
+  const generationId = probeServerGeneration(spawnSync);
+  if (generationId == null) {
+    return;
+  }
+  const hash = hashGenerationId(generationId);
+  if (state.lastGenerationHash === hash) {
+    return;
+  }
+  post({
+    kind: "backend-exec-start",
+    backend_type: DEFAULT_EXEC_BACKEND,
+    generation_id: generationId,
+  });
+  state.lastGenerationHash = hash;
+}
+
+/**
+ * Seed {@link PulseState.lastGenerationHash} from the last logged
+ * `BackendExecStart` payload so a keeperd restart against an UNCHANGED server
+ * does NOT re-emit a spurious boundary. Reads the single most recent event by
+ * `id` (the rowid total order — never `ts`), parses its `generation_id`, and
+ * hashes it with the SAME rule the live probe uses. NEVER throws: an absent
+ * event, a malformed payload, or any read error leaves the hash `null` (the
+ * next probe is then treated as the first boundary and DOES post). Idempotent —
+ * the caller runs it ONCE, before the first generation pulse. Reads only the
+ * read-only `events` table; no projection, no env, no wall-clock.
+ */
+export function seedLastGenerationHash(
+  db: ReturnType<typeof openDb>["db"],
+  state: PulseState,
+): void {
+  try {
+    const row = db
+      .query(
+        "SELECT data FROM events WHERE hook_event = 'BackendExecStart' ORDER BY id DESC LIMIT 1",
+      )
+      .get() as { data: string | null } | null;
+    if (row == null || row.data == null) {
+      return;
+    }
+    const parsed = JSON.parse(row.data) as { generation_id?: unknown };
+    const generationId = parsed.generation_id;
+    if (typeof generationId !== "string" || generationId === "") {
+      return;
+    }
+    state.lastGenerationHash = hashGenerationId(generationId);
+  } catch {
+    // Malformed payload / read error → leave the hash null. The first live
+    // probe then posts (treated as the first observation), which is benign: at
+    // worst one boundary event is recorded that a perfect seed would have
+    // suppressed. Never wedge the pulse over a seed read.
+  }
+}
+
+/**
  * Drive one restore pulse against the worker's read-only connection. Reads the
  * projections via the `read(collection)` helper (identical frame shape to the
  * autopilot worker's), refreshes the window-order cache from the tmux probe,
@@ -824,6 +986,11 @@ export function restorePulse(
      *  restore.json mirror, but no DB event is minted (the pure-pulse test
      *  path, or a path that wants only the fill post). */
     postWindowIndex?: (msg: WindowIndexSnapshotMessage) => void;
+    /** Post a `BackendExecStart` generation boundary to main. Omit to disable
+     *  the generation pulse arm (the pure-pulse test path). UNGATED by live
+     *  tmux jobs — wired whenever a real worker runs so a post-crash respawn is
+     *  recorded. */
+    postBackendExecStart?: (msg: BackendExecStartMessage) => void;
   },
 ): void {
   const read = (collection: string): Record<string, unknown>[] => {
@@ -871,6 +1038,21 @@ export function restorePulse(
   // carries window_index from the same cache regardless.
   if (snapshot?.postWindowIndex) {
     windowIndexSnapshotPulse(state, snapshot.postWindowIndex);
+  }
+
+  // Generation-boundary arm — runs UNGATED by `hasLiveTmuxJob` (unlike the two
+  // arms above): the post-crash state carries no live tmux job, yet the
+  // freshly-respawned server is exactly the generation crash-restore scopes to.
+  // Change-gated on `state.lastGenerationHash` (boot-seeded so an unchanged
+  // server across a keeperd restart is silent). A degraded probe (no server /
+  // garbage) emits nothing. Disabled when no `postBackendExecStart` is wired
+  // (the pure-pulse test path).
+  if (snapshot?.postBackendExecStart) {
+    backendExecStartPulse(
+      state,
+      snapshot.spawnSync ?? defaultSpawnSync,
+      snapshot.postBackendExecStart,
+    );
   }
 
   const current = buildRestoreTier(
@@ -954,7 +1136,12 @@ function main(): void {
     lastSnapshotHash: null,
     lastWindowIndexByJobId: new Map(),
     lastWindowIndexHash: null,
+    lastGenerationHash: null,
   };
+  // Boot-seed the generation gate from the last logged BackendExecStart BEFORE
+  // the first pulse so a keeperd restart against an UNCHANGED server emits no
+  // spurious boundary. Runs once; never throws.
+  seedLastGenerationHash(db, state);
   let shutdown = false;
 
   // Worker→main posts (main is the sole synthetic-event writer). The worker is
@@ -968,6 +1155,9 @@ function main(): void {
       port.postMessage(msg);
     },
     postWindowIndex: (msg: WindowIndexSnapshotMessage): void => {
+      port.postMessage(msg);
+    },
+    postBackendExecStart: (msg: BackendExecStartMessage): void => {
       port.postMessage(msg);
     },
   };

@@ -6377,6 +6377,90 @@ test("WindowIndexSnapshot re-fold determinism: a reorder stream re-folds byte-id
   expect(live.find((r) => r.job_id === "sess-b")?.window_index).toBe(0);
 });
 
+// ---------------------------------------------------------------------------
+// BackendExecStart — generation-boundary marker (fn-819 task .1). The
+// restore-worker mints one on a tmux-server-pid change; the reducer folds it
+// via an explicit NO-OP dispatcher arm (the boundary lives in the event-log
+// `id` order, NOT a projection column). The arm MUST be explicit: the
+// inner-switch default routes unknown events to `projectJobsRow`, which would
+// mint a bogus jobs row keyed on the synthetic `backend-exec-start` session.
+// ---------------------------------------------------------------------------
+
+test("BackendExecStart folds as a no-op: no jobs row minted, cursor still advances", () => {
+  const evId = insertEvent({
+    hook_event: "BackendExecStart",
+    session_id: "backend-exec-start",
+    data: JSON.stringify({ backend_type: "tmux", generation_id: "4242" }),
+  });
+  drainAll();
+  // The synthetic per-kind session id must NOT mint a jobs row (the inner-switch
+  // default would have created `backend-exec-start`).
+  expect(getJob("backend-exec-start")).toBeNull();
+  expect(
+    (db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n,
+  ).toBe(0);
+  // The event still advanced the cursor (folded, not wedged).
+  expect(getCursor()).toBeGreaterThanOrEqual(evId);
+});
+
+test("BackendExecStart never disturbs an existing jobs projection", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "BackendExecStart",
+    session_id: "backend-exec-start",
+    data: JSON.stringify({ backend_type: "tmux", generation_id: "100" }),
+  });
+  drainAll();
+  // The real session is untouched; no second row appeared.
+  expect(getJob("sess-a")).not.toBeNull();
+  expect(getJob("backend-exec-start")).toBeNull();
+  expect(
+    (db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n,
+  ).toBe(1);
+});
+
+test("BackendExecStart re-fold determinism: an empty jobs projection re-folds byte-identical", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-a" });
+  insertEvent({
+    hook_event: "BackendExecStart",
+    session_id: "backend-exec-start",
+    data: JSON.stringify({ backend_type: "tmux", generation_id: "100" }),
+  });
+  insertEvent({
+    hook_event: "BackendExecStart",
+    session_id: "backend-exec-start",
+    data: JSON.stringify({ backend_type: "tmux", generation_id: "200" }),
+  });
+  drainAll();
+  const live = db
+    .query("SELECT job_id, state FROM jobs ORDER BY job_id")
+    .all() as { job_id: string; state: string }[];
+
+  db.run("DELETE FROM jobs");
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  drainAll();
+  const refolded = db
+    .query("SELECT job_id, state FROM jobs ORDER BY job_id")
+    .all() as { job_id: string; state: string }[];
+
+  expect(refolded).toEqual(live);
+  // Only the real session row — the two BackendExecStart events left no trace.
+  expect(live.map((r) => r.job_id)).toEqual(["sess-a"]);
+});
+
+test("BackendExecStart with a malformed payload folds to a safe no-op and advances the cursor", () => {
+  const evId = insertEvent({
+    hook_event: "BackendExecStart",
+    session_id: "backend-exec-start",
+    data: "not json{",
+  });
+  drainAll();
+  expect(
+    (db.query("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n,
+  ).toBe(0);
+  expect(getCursor()).toBeGreaterThanOrEqual(evId);
+});
+
 test("active_since: NOT re-stamped by a 2nd UserPromptSubmit while already working", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });

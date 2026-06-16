@@ -7243,6 +7243,16 @@ export function applyEvent(
       // reads only the payload entries (pure integer copy keyed by job_id), never
       // probes, and never nulls a row (killed jobs keep their last index).
       foldWindowIndexSnapshot(db, event);
+    } else if (event.hook_event === "BackendExecStart") {
+      // epic fn-819 — a backend generation boundary (restore-worker mints one on
+      // a server-pid change). NO-OP fold: the boundary lives in the event-log
+      // `id` order (read at restore time by `deriveLastGenerationSet`), not a
+      // projection column. MUST stay an explicit empty arm — the final `else`
+      // runs projectJobsRow, so deleting this arm would route BackendExecStart
+      // into the jobs projection and corrupt it. A DISTINCT name from the retired
+      // `BackendExecSnapshot` no-op arm above. The event still advances the
+      // cursor; an empty re-fold reproduces zero rows (the producer probes the
+      // pid, never the fold).
     } else if (event.hook_event === "PostToolUse") {
       // PostToolUse fans to BOTH projections plus syncIfPlanRef (inside
       // projectJobsRow); the 781ms avg is otherwise unattributable. Arm the

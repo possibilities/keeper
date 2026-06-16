@@ -2369,10 +2369,17 @@ byte-identically.
 The crash-restore set is derived RETROSPECTIVELY from `keeper.db` at READ TIME
 (`src/restore-set.ts`, epic fn-817) — there is no frozen snapshot to read and no
 daemon round-trip, which is exactly the disaster-recovery moment restore exists
-for (a read-only `keeper.db` connection works with keeperd DOWN). The derivation
-is boundary-free: there is no global "this is where the crash happened" marker;
-each `killed` row carries its OWN producer-stamped `close_kind`, and membership
-is a per-row predicate over it. A candidate is a `state='killed'` job whose death
+for (a read-only `keeper.db` connection works with keeperd DOWN). The default
+`deriveRestoreSet` derivation is membership-by-`close_kind`: each `killed` row
+carries its OWN producer-stamped `close_kind` and membership is a per-row
+predicate over it (no per-row "this is where the crash happened" anchor). Epic
+fn-819 adds a generation BOUNDARY the restore-worker records — a
+`BackendExecStart` synthetic event minted on a tmux-server-pid change (see the
+ninth worker below) — so a forthcoming generation-scoped derivation can bound
+candidates to the PREVIOUS session generation ("the session you just lost")
+rather than the whole crash-like pool; the boundary is cut by `events.id` rowid
+ORDER, never `ts` (boot-sweep `Killed` events all share one `Date.now()`
+instant). A candidate is a `state='killed'` job whose death
 was crash-like — `close_kind ∈ {server_gone, pid_died}` (tmux server gone, or the
 pane process died), or `close_kind ∈ {unknown, NULL}` resolved via a BURST
 HEURISTIC (the boot seed-sweep emits its `Killed` events back-to-back, so a
@@ -2424,11 +2431,21 @@ reducer stamps each job's live `#{window_index}` onto the `jobs.window_index`
 column (a killed job keeps its last value, so visual order survives to restore
 time when the original tmux server is dead); and the PANE-FILL post, which mints
 the sole `TmuxPaneSnapshot` synthetic event (fill-only) when a live tmux job
-carries a NULL `backend_exec_session_id`. Those two posts are the worker's only
-worker→main channel and only event-log contribution — the restore-file write path
-remains a pure consumer side-file. Write failures are swallowed to stderr (next
-pulse retries); only an unhandled throw out of the watch loop escalates to
-`onerror`/`close` → fatalExit.
+carries a NULL `backend_exec_session_id`. A THIRD post (epic fn-819) rides the
+same pulse but is UNGATED by a live tmux job: a `tmux display-message -p
+'#{pid}'` probe reads the tmux SERVER pid (the backend "generation" handle), and
+on a change — pid-hash-gated, boot-seeded from the last logged event so a
+keeperd restart against an unchanged server is silent — the worker mints a
+`BackendExecStart` event carrying `backend_type` + `generation_id`. It is
+ungated precisely because the post-crash state has no live job, yet the
+freshly-respawned server is the generation crash-restore must scope to. The
+reducer folds `BackendExecStart` via an explicit NO-OP arm (the boundary lives
+in the event-log `id` order, read at restore time, NOT a projection column — no
+schema bump). Those three posts are the worker's only worker→main channel and
+only event-log contribution — the restore-file write path remains a pure
+consumer side-file. Write failures are swallowed to stderr (next pulse retries);
+only an unhandled throw out of the watch loop escalates to `onerror`/`close` →
+fatalExit.
 
 An **eleventh** Worker thread is the tmux window-renamer (epic fn-801): a
 pure EXTERNAL ACTUATOR that opens its own read-only connection, polls

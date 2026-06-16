@@ -88,6 +88,7 @@ import {
 } from "./reducer";
 import type { RenamerWorkerData } from "./renamer-worker";
 import type {
+  BackendExecStartMessage,
   RestoreWorkerData,
   TmuxPaneSnapshotMessage,
   WindowIndexSnapshotMessage,
@@ -3396,7 +3397,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // self-gates + dedups, so a post here always carries a changed payload.
     rw.onmessage = (
       ev: MessageEvent<
-        TmuxPaneSnapshotMessage | WindowIndexSnapshotMessage | undefined
+        | TmuxPaneSnapshotMessage
+        | WindowIndexSnapshotMessage
+        | BackendExecStartMessage
+        | undefined
       >,
     ): void => {
       const msg = ev.data;
@@ -3418,6 +3422,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         eventType = "window_index_snapshot";
         sessionId = "window-index-snapshot";
         data = JSON.stringify({ entries: msg.entries });
+      } else if (msg.kind === "backend-exec-start") {
+        // epic fn-819 — a backend generation boundary. The payload (backend_type
+        // + generation_id) rides `$data`; the reducer folds it via an explicit
+        // NO-OP arm (the boundary lives in the event-log `id` order, not a
+        // projection column). Stable synthetic session_id per kind, as above.
+        hookEvent = "BackendExecStart";
+        eventType = "backend_exec_start";
+        sessionId = "backend-exec-start";
+        data = JSON.stringify({
+          backend_type: msg.backend_type,
+          generation_id: msg.generation_id,
+        });
       } else {
         return;
       }

@@ -30,6 +30,7 @@ import {
   buildTmuxRenameWindowArgs,
   buildTmuxSelectPaneArgs,
   buildTmuxSelectWindowArgs,
+  buildTmuxServerPidArgs,
   classifyCloseKind,
   createTmuxBackend,
   DEFAULT_EXEC_BACKEND,
@@ -217,6 +218,15 @@ test("buildTmuxListPanesArgs: -a sweep, tab-delimited format with window_name la
     "-a",
     "-F",
     "#{pane_id}\t#{window_id}\t#{window_name}",
+  ]);
+});
+
+test("buildTmuxServerPidArgs: display-message -p of the server pid (generation handle)", () => {
+  expect(buildTmuxServerPidArgs()).toEqual([
+    "tmux",
+    "display-message",
+    "-p",
+    "#{pid}",
   ]);
 });
 

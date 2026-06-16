@@ -281,6 +281,21 @@ export function buildTmuxSelectPaneArgs(paneId: string): string[] {
 }
 
 /**
+ * Build the tmux `display-message -p '#{pid}'` server-pid probe argv. Pure —
+ * exported for tests. The tmux SERVER pid is the backend's "generation" handle:
+ * it changes exactly when the server is killed and respawned (the boundary
+ * crash-restore scopes to), and is stable across client attach/detach. `-p`
+ * prints to stdout; no `-t` so it resolves against the default server. The
+ * restore-worker pulse runs this via its injected sync `spawnSync`, parses the
+ * single positive-int line, and hashes it into the `BackendExecStart`
+ * generation id. Backend-agnostic seam: the only tmux-specific piece is this
+ * argv; the pulse pairs the result with `DEFAULT_EXEC_BACKEND`.
+ */
+export function buildTmuxServerPidArgs(): string[] {
+  return ["tmux", "display-message", "-p", "#{pid}"];
+}
+
+/**
  * Build the tmux `list-panes -a -F '#{pane_id}\t#{window_id}\t#{window_name}'`
  * sweep argv. Pure — exported for tests. `-a` spans every session on the
  * server. The format is TAB-delimited with `window_name` LAST so the renamer's
