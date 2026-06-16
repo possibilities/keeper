@@ -46,6 +46,14 @@
  * Both `--preview-crash` and `--snapshot-current` are pure local-file reads —
  * no daemon round-trip, so they work even with `keeperd` down.
  *
+ * Across every mode, restored windows come back in their ORIGINAL visual
+ * (left-to-right) tmux order: each agent's `window_index` was captured at pulse
+ * time (the live tmux server is dead at restore), and the util sorts each
+ * session's agents by it (unknown order sinks to the tail by `created_at` then
+ * `job_id`). The on-disk file stays `job_id`-sorted — visual order is resolved
+ * here. `--apply` and `--snapshot-current` pace window creation by 0.5s between
+ * consecutive launches (never before the first or after the last).
+ *
  * Usage:
  *   bun scripts/restore-agents.ts [--session <name>] [--apply] [--sock <path>]
  *   bun scripts/restore-agents.ts --preview-crash [--session <name>]
@@ -139,6 +147,11 @@ modes pick a different source and skip the daemon entirely:
                       (get-or-create the session first), byte-aligned with what
                       --apply spawns. Pipe to a file and run later.
 
+Every mode restores windows in their original visual (left-to-right) tmux order
+(by the captured window_index; unknown order sinks to the tail). --apply and
+--snapshot-current pace window creation with a 0.5s pause between consecutive
+launches.
+
 --apply, --preview-crash, and --snapshot-current are mutually exclusive.
 
 A malformed/absent restore.json prints a clear message and exits 0
@@ -181,6 +194,42 @@ type AgentOutcome =
     };
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
+
+/**
+ * Total-order comparator for restoring agents into their original visual
+ * (left-to-right) tmux window order. A known `window_index` sorts ASCENDING
+ * and always precedes an unknown (`null`) one; two unknown-order agents — and
+ * agents sharing a `window_index` — tiebreak by `created_at` ascending, then
+ * `job_id`. The order is total and deterministic for legacy/partial records:
+ * a non-finite `created_at` coerces to `0` (never NaN, which would poison the
+ * sort), and a missing `job_id` coerces to "" — so an all-null bucket still
+ * sorts stably.
+ *
+ * `window_index` is a relative SORT KEY only — the consumer never passes it to
+ * `tmux new-window -t <index>` (that would collide with base-index /
+ * renumber-windows); it merely orders the emit/launch loop. Exported for tests.
+ */
+export function compareRestoreAgents(a: RestoreAgent, b: RestoreAgent): number {
+  const ai = a.window_index;
+  const bi = b.window_index;
+  const aKnown = typeof ai === "number" && Number.isFinite(ai);
+  const bKnown = typeof bi === "number" && Number.isFinite(bi);
+  if (aKnown && bKnown) {
+    if (ai !== bi) {
+      return ai - bi;
+    }
+  } else if (aKnown !== bKnown) {
+    // Exactly one side is known: the known index always wins (sinks the null).
+    return aKnown ? -1 : 1;
+  }
+  // Equal index, or both unknown: tiebreak by created_at then job_id.
+  const at = Number.isFinite(a.created_at) ? a.created_at : 0;
+  const bt = Number.isFinite(b.created_at) ? b.created_at : 0;
+  if (at !== bt) {
+    return at - bt;
+  }
+  return seg(a.job_id).localeCompare(seg(b.job_id));
+}
 
 function die(message: string): never {
   process.stderr.write(`restore-agents: ${message}\n`);
@@ -416,8 +465,10 @@ export function buildLiveJobIdSet(jobs: Job[]): Set<string> {
  * RESTORE SOURCE — `last_session ‖ current ‖` v1-legacy `sessions`, picked by
  * {@link loadRestoreFile}), the optional `--session` filter, and the live
  * `job_id` skip-set. Returns the per-agent outcome list in stable order:
- * sessions alpha-sorted, agents in their pre-sorted order (the worker sorts
- * by `job_id` on disk).
+ * sessions alpha-sorted, agents in original VISUAL window order
+ * ({@link compareRestoreAgents} — captured `window_index` ascending, unknown
+ * order to the tail by `created_at` then `job_id`). The on-disk file stays
+ * `job_id`-sorted; visual order is a restore-time concern resolved here.
  *
  * Exported for tests — this is the heart of the util's selection logic.
  *
@@ -443,7 +494,10 @@ export function planRestore(
     if (!bucket) {
       continue;
     }
-    for (const agent of bucket.agents) {
+    // Window order is session-local: sort each bucket's agents by visual order
+    // before emitting. Copy first — never mutate the caller's array.
+    const ordered = [...bucket.agents].sort(compareRestoreAgents);
+    for (const agent of ordered) {
       if (liveSkipSet.has(agent.job_id)) {
         out.push({ kind: "skipped-live", agent, session: sessionName });
         continue;
@@ -514,25 +568,51 @@ type EnsureLaunchedFn = (
 ) => Promise<{ ok: true } | { ok: false; error: string }>;
 
 /**
+ * Sleep injection for {@link applyRestore} — `main()` passes the real
+ * `Bun.sleep`, tests pass a no-op so the apply suite never actually waits. The
+ * pause spaces out window creation so a burst of `new-window` launches don't
+ * race the multiplexer.
+ */
+type SleepFn = (ms: number) => Promise<void>;
+
+/** Inter-window pacing for restore (ms). Held between consecutive real launches
+ * only — never before the first, after the last, or around skipped entries. */
+const INTER_WINDOW_PAUSE_MS = 500;
+
+/** Real sleep binding `main()` injects into {@link applyRestore}. */
+const defaultSleep: SleepFn = (ms) => Bun.sleep(ms);
+
+/**
  * Pure-ish: drive the outcome list through `ensureLaunched`, upgrading each
  * `"would-restore"` to `"restored"` or `"failed"`. Continues past a single
  * agent's launch failure (don't abort the batch — one busted tab shouldn't
- * strand the rest).
+ * strand the rest). Pauses {@link INTER_WINDOW_PAUSE_MS} via the injected
+ * `sleep` BETWEEN consecutive real launches only (never before the first, after
+ * the last, or around `skipped-live` entries) — the pacing sits OUTSIDE the
+ * per-agent try/catch so one launch failure doesn't drop the next agent's
+ * pause.
  *
- * Exported for tests — they pass a capturing fake `ensureLaunched` so
- * `--apply` is asserted without a real multiplexer.
+ * Exported for tests — they pass a capturing fake `ensureLaunched` plus a
+ * no-op `sleep` so `--apply` is asserted without a real multiplexer or a wait.
  */
 export async function applyRestore(
   plan: AgentOutcome[],
   ensureLaunched: EnsureLaunchedFn,
   shell: string,
+  sleep: SleepFn = defaultSleep,
 ): Promise<AgentOutcome[]> {
   const out: AgentOutcome[] = [];
+  let launched = 0;
   for (const entry of plan) {
     if (entry.kind !== "would-restore") {
       out.push(entry);
       continue;
     }
+    // Pace BETWEEN real launches: pause before every launch after the first.
+    if (launched > 0) {
+      await sleep(INTER_WINDOW_PAUSE_MS);
+    }
+    launched++;
     const argv = buildResumeLaunchArgv(shell, entry.agent);
     const cwd = entry.agent.cwd == null ? "" : seg(entry.agent.cwd);
     try {
@@ -766,9 +846,13 @@ export function shellQuote(arg: string): string {
  * session `has-session || new-session` get-or-create guard and emitted as shell
  * text, so it can be piped to a file and run later (daemon-independent).
  *
- * Sessions are emitted in alpha order; agents in their on-disk (job_id-sorted)
- * order. Every argv token is single-quoted via {@link shellQuote}. The
- * `--session` filter narrows to one bucket. Exported for tests.
+ * Sessions are emitted in alpha order; agents within a session in original
+ * VISUAL window order ({@link compareRestoreAgents}). A `sleep 0.5` line
+ * separates consecutive `new-window` emissions (tracked globally across session
+ * boundaries — never before the first window or after the last) so the restored
+ * windows don't race the multiplexer. `sleep 0.5` is portable across BSD/GNU
+ * with a dot decimal. Every argv token is single-quoted via {@link shellQuote}.
+ * The `--session` filter narrows to one bucket. Exported for tests.
  */
 export function renderSnapshotScript(
   sessions: Record<string, RestoreSession>,
@@ -786,6 +870,10 @@ export function renderSnapshotScript(
   ];
   let sessionCount = 0;
   let agentCount = 0;
+  // Tracks whether any new-window has been emitted yet, ACROSS session
+  // boundaries — `sleep 0.5` precedes every new-window after the first, so it
+  // lands strictly between consecutive windows (no leading or trailing sleep).
+  let windowsEmitted = 0;
   for (const sessionName of Object.keys(sessions).sort()) {
     if (sessionFilter !== null && sessionName !== sessionFilter) {
       continue;
@@ -804,15 +892,21 @@ export function renderSnapshotScript(
       `${quoteArgv(buildTmuxHasSessionArgs(sessionName))} 2>/dev/null || ` +
         `${quoteArgv(buildTmuxNewSessionArgs(sessionName))}`,
     );
-    for (const agent of bucket.agents) {
+    // Visual window order is session-local; sort a copy, never the caller's.
+    const ordered = [...bucket.agents].sort(compareRestoreAgents);
+    for (const agent of ordered) {
       const cwd = agent.cwd == null ? "" : seg(agent.cwd);
       const innerArgv = buildResumeLaunchArgv(shell, agent);
       // No window name — mirrors --apply (ensureLaunched passes no name), so the
       // restored window stays unnamed and the renamer worker labels it later.
+      if (windowsEmitted > 0) {
+        lines.push("sleep 0.5");
+      }
       lines.push(`# ${agent.resume_target}`);
       lines.push(
         quoteArgv(buildTmuxNewWindowArgs(sessionName, cwd, innerArgv)),
       );
+      windowsEmitted++;
       agentCount++;
     }
   }
@@ -961,7 +1055,12 @@ async function main(): Promise<void> {
     return backendForType(backendType).ensureLaunched(session, argv, cwd);
   };
 
-  const outcomes = await applyRestore(plan, ensureLaunched, shell);
+  const outcomes = await applyRestore(
+    plan,
+    ensureLaunched,
+    shell,
+    defaultSleep,
+  );
   process.stdout.write(renderOutcomes(outcomes, shell, true));
   process.exit(0);
 }

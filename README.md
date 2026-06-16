@@ -2395,7 +2395,10 @@ retries); only an unhandled throw out of the watch loop escalates to
 sole reader; it resolves the restore source `last_session ‖ current ‖`
 (v1) legacy `sessions`, and its `--apply` mode relaunches the surviving
 agents via the exact `claude --resume` shape `scripts/resume.ts` emits,
-deduplicated against jobs still live in the projection. Each bucket relaunches through the sole tmux backend; any legacy `backend` tag
+deduplicated against jobs still live in the projection. Across every mode it
+sorts each session's agents by the captured `window_index` so restored windows
+come back in their original left-to-right tmux order (unknown order to the
+tail), and paces window creation 0.5s apart between consecutive launches. Each bucket relaunches through the sole tmux backend; any legacy `backend` tag
 (or an absent v2 tag) no longer selects a different multiplexer — every tag
 resolves to tmux. The schema bump is the
 load-bearing coupling: the moment the worker writes a new

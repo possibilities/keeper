@@ -22,6 +22,7 @@ import {
   buildLiveJobIdSet,
   buildResumeLaunchArgv,
   classifySchemaVersion,
+  compareRestoreAgents,
   loadRestoreFile,
   loadRestoreTiers,
   planRestore,
@@ -154,6 +155,77 @@ function fakeSessionsWithBackend(
   return out;
 }
 
+// ---------------------------------------------------------------------------
+// compareRestoreAgents — visual window-order comparator (total order)
+// ---------------------------------------------------------------------------
+
+test("compareRestoreAgents orders known window_index ascending", () => {
+  const agents = [
+    fakeAgent({ job_id: "c", window_index: 2 }),
+    fakeAgent({ job_id: "a", window_index: 0 }),
+    fakeAgent({ job_id: "b", window_index: 1 }),
+  ];
+  agents.sort(compareRestoreAgents);
+  expect(agents.map((a) => a.job_id)).toEqual(["a", "b", "c"]);
+});
+
+test("compareRestoreAgents sinks a null window_index to the tail", () => {
+  const agents = [
+    fakeAgent({ job_id: "null", window_index: null }),
+    fakeAgent({ job_id: "known", window_index: 5 }),
+  ];
+  agents.sort(compareRestoreAgents);
+  expect(agents.map((a) => a.job_id)).toEqual(["known", "null"]);
+});
+
+test("compareRestoreAgents tiebreaks null-vs-null by created_at then job_id", () => {
+  const agents = [
+    fakeAgent({ job_id: "z", window_index: null, created_at: 100 }),
+    fakeAgent({ job_id: "a", window_index: null, created_at: 200 }),
+    fakeAgent({ job_id: "b", window_index: null, created_at: 100 }),
+  ];
+  agents.sort(compareRestoreAgents);
+  // created_at ascending first (b,z share 100 → job_id b<z), then a at 200.
+  expect(agents.map((a) => a.job_id)).toEqual(["b", "z", "a"]);
+});
+
+test("compareRestoreAgents tiebreaks equal window_index by created_at then job_id", () => {
+  const agents = [
+    fakeAgent({ job_id: "z", window_index: 1, created_at: 50 }),
+    fakeAgent({ job_id: "a", window_index: 1, created_at: 50 }),
+    fakeAgent({ job_id: "m", window_index: 1, created_at: 10 }),
+  ];
+  agents.sort(compareRestoreAgents);
+  // created_at 10 wins; then the two at 50 break by job_id a<z.
+  expect(agents.map((a) => a.job_id)).toEqual(["m", "a", "z"]);
+});
+
+test("compareRestoreAgents on an all-null bucket sorts deterministically", () => {
+  const mk = () => [
+    fakeAgent({ job_id: "c", window_index: null, created_at: 3 }),
+    fakeAgent({ job_id: "a", window_index: null, created_at: 1 }),
+    fakeAgent({ job_id: "b", window_index: null, created_at: 2 }),
+  ];
+  const first = mk()
+    .sort(compareRestoreAgents)
+    .map((a) => a.job_id);
+  const second = mk()
+    .sort(compareRestoreAgents)
+    .map((a) => a.job_id);
+  expect(first).toEqual(["a", "b", "c"]);
+  expect(first).toEqual(second);
+});
+
+test("compareRestoreAgents coerces a non-finite created_at to a stable order", () => {
+  const agents = [
+    fakeAgent({ job_id: "nan", window_index: null, created_at: NaN }),
+    fakeAgent({ job_id: "real", window_index: null, created_at: 5 }),
+  ];
+  agents.sort(compareRestoreAgents);
+  // NaN coerces to 0, sorting ahead of created_at=5 — no NaN-poisoned order.
+  expect(agents.map((a) => a.job_id)).toEqual(["nan", "real"]);
+});
+
 test("planRestore marks every agent would-restore when the skip-set is empty", () => {
   const desc = fakeSessions({
     autopilot: [fakeAgent({ job_id: "a" }), fakeAgent({ job_id: "b" })],
@@ -164,7 +236,10 @@ test("planRestore marks every agent would-restore when the skip-set is empty", (
 
 test("planRestore skips agents whose job_id is in the live skip-set", () => {
   const desc = fakeSessions({
-    autopilot: [fakeAgent({ job_id: "live" }), fakeAgent({ job_id: "dead" })],
+    autopilot: [
+      fakeAgent({ job_id: "live", window_index: 0 }),
+      fakeAgent({ job_id: "dead", window_index: 1 }),
+    ],
   });
   const plan = planRestore(desc, null, new Set(["live"]));
   expect(plan).toHaveLength(2);
@@ -203,6 +278,40 @@ test("planRestore visits sessions in alpha-sorted order", () => {
     "alpha",
     "mid",
     "zeta",
+  ]);
+});
+
+test("planRestore emits agents within a session in visual window order", () => {
+  // On-disk order is job_id-sorted (a, b, c) but window_index is 2, 0, 1 —
+  // the plan must come back in window order: b(0), c(1), a(2).
+  const desc = fakeSessions({
+    autopilot: [
+      fakeAgent({ job_id: "a", window_index: 2 }),
+      fakeAgent({ job_id: "b", window_index: 0 }),
+      fakeAgent({ job_id: "c", window_index: 1 }),
+    ],
+  });
+  const plan = planRestore(desc, null, new Set());
+  expect(plan.map((p) => (p as { agent: RestoreAgent }).agent.job_id)).toEqual([
+    "b",
+    "c",
+    "a",
+  ]);
+});
+
+test("planRestore sinks unknown-order agents to the session tail", () => {
+  const desc = fakeSessions({
+    autopilot: [
+      fakeAgent({ job_id: "no-idx", window_index: null, created_at: 1 }),
+      fakeAgent({ job_id: "idx1", window_index: 1 }),
+      fakeAgent({ job_id: "idx0", window_index: 0 }),
+    ],
+  });
+  const plan = planRestore(desc, null, new Set());
+  expect(plan.map((p) => (p as { agent: RestoreAgent }).agent.job_id)).toEqual([
+    "idx0",
+    "idx1",
+    "no-idx",
   ]);
 });
 
@@ -316,6 +425,7 @@ test("applyRestore is a no-op for non-would-restore entries (skipped-live carrie
       return { ok: true };
     },
     "/bin/zsh",
+    async () => {},
   );
   // One skipped-live + one restored.
   expect(out.map((o) => o.kind)).toEqual(["skipped-live", "restored"]);
@@ -341,6 +451,7 @@ test("applyRestore continues past a single agent's launch failure", async () => 
       return { ok: true };
     },
     "/bin/zsh",
+    async () => {},
   );
   expect(out).toHaveLength(2);
   expect(out[0].kind).toBe("failed");
@@ -359,6 +470,7 @@ test("applyRestore traps a thrown ensureLaunched and marks the entry failed", as
       throw new Error("spawn failed");
     },
     "/bin/zsh",
+    async () => {},
   );
   expect(out).toHaveLength(1);
   expect(out[0].kind).toBe("failed");
@@ -378,9 +490,84 @@ test("applyRestore makes ZERO ensureLaunched calls when the plan is all skipped-
       return { ok: true };
     },
     "/bin/zsh",
+    async () => {},
   );
   expect(calls).toBe(0);
   expect(out.map((o) => o.kind)).toEqual(["skipped-live", "skipped-live"]);
+});
+
+test("applyRestore pauses 0.5s between consecutive real launches only", async () => {
+  // a (skipped) , b, c live → two real launches, one pause of 500ms between
+  // them; never before the first or around the skipped entry.
+  const desc = fakeSessions({
+    autopilot: [
+      fakeAgent({ job_id: "a", window_index: 0 }),
+      fakeAgent({ job_id: "b", window_index: 1 }),
+      fakeAgent({ job_id: "c", window_index: 2 }),
+    ],
+  });
+  const plan = planRestore(desc, null, new Set(["a"]));
+  const sleeps: number[] = [];
+  let launches = 0;
+  const out = await applyRestore(
+    plan,
+    async () => {
+      launches++;
+      return { ok: true };
+    },
+    "/bin/zsh",
+    async (ms) => {
+      sleeps.push(ms);
+    },
+  );
+  expect(out.map((o) => o.kind)).toEqual([
+    "skipped-live",
+    "restored",
+    "restored",
+  ]);
+  expect(launches).toBe(2);
+  // Exactly ONE pause (between the two real launches), of 500ms.
+  expect(sleeps).toEqual([500]);
+});
+
+test("applyRestore emits no pause for a single real launch", async () => {
+  const desc = fakeSessions({
+    autopilot: [fakeAgent({ job_id: "solo" })],
+  });
+  const plan = planRestore(desc, null, new Set());
+  const sleeps: number[] = [];
+  await applyRestore(
+    plan,
+    async () => ({ ok: true }),
+    "/bin/zsh",
+    async (ms) => {
+      sleeps.push(ms);
+    },
+  );
+  expect(sleeps).toEqual([]);
+});
+
+test("applyRestore still pauses after a launch FAILURE (pacing outside try/catch)", async () => {
+  const desc = fakeSessions({
+    autopilot: [
+      fakeAgent({ job_id: "fail", window_index: 0 }),
+      fakeAgent({ job_id: "ok", window_index: 1 }),
+    ],
+  });
+  const plan = planRestore(desc, null, new Set());
+  const sleeps: number[] = [];
+  const out = await applyRestore(
+    plan,
+    async (_s, argv) =>
+      argv[4].includes(`"fail"`) ? { ok: false, error: "boom" } : { ok: true },
+    "/bin/zsh",
+    async (ms) => {
+      sleeps.push(ms);
+    },
+  );
+  expect(out.map((o) => o.kind)).toEqual(["failed", "restored"]);
+  // The first launch failing does not drop the second agent's pause.
+  expect(sleeps).toEqual([500]);
 });
 
 // ---------------------------------------------------------------------------
@@ -416,6 +603,7 @@ test("renderOutcomes apply summary names restored / skipped-live / failed", asyn
       return { ok: true };
     },
     "/bin/zsh",
+    async () => {},
   );
   const rendered = renderOutcomes(out, "/bin/zsh", true);
   expect(rendered).toContain("restored=1");
@@ -785,4 +973,65 @@ test("renderSnapshotScript on an empty current tier is a valid no-op script", ()
   // No tmux commands at all (the quoted command token never appears — only the
   // prose "tmux window" in the header does).
   expect(out).not.toContain("'tmux'");
+});
+
+test("renderSnapshotScript emits agents in visual window order", () => {
+  const current = fakeSessions({
+    autopilot: [
+      fakeAgent({ job_id: "a", window_index: 2, resume_target: "third" }),
+      fakeAgent({ job_id: "b", window_index: 0, resume_target: "first" }),
+      fakeAgent({ job_id: "c", window_index: 1, resume_target: "second" }),
+    ],
+  });
+  const out = renderSnapshotScript(current, null, "/bin/zsh", "/r.json");
+  const firstAt = out.indexOf(`claude --resume "first"`);
+  const secondAt = out.indexOf(`claude --resume "second"`);
+  const thirdAt = out.indexOf(`claude --resume "third"`);
+  expect(firstAt).toBeLessThan(secondAt);
+  expect(secondAt).toBeLessThan(thirdAt);
+});
+
+test("renderSnapshotScript puts 'sleep 0.5' BETWEEN new-window lines, not after the last", () => {
+  const current = fakeSessions({
+    autopilot: [
+      fakeAgent({ job_id: "a", window_index: 0, resume_target: "w0" }),
+      fakeAgent({ job_id: "b", window_index: 1, resume_target: "w1" }),
+      fakeAgent({ job_id: "c", window_index: 2, resume_target: "w2" }),
+    ],
+  });
+  const out = renderSnapshotScript(current, null, "/bin/zsh", "/r.json");
+  // Three windows → two interleaving sleeps.
+  const sleepCount = out.split("\n").filter((l) => l === "sleep 0.5").length;
+  expect(sleepCount).toBe(2);
+  // The script never ENDS on a sleep (last non-empty line is the summary).
+  const lines = out.split("\n").filter((l) => l.length > 0);
+  expect(lines[lines.length - 1]).toContain("# summary:");
+  expect(lines[lines.length - 1]).not.toBe("sleep 0.5");
+});
+
+test("renderSnapshotScript tracks the inter-window sleep ACROSS session boundaries", () => {
+  // Two sessions, one agent each → exactly ONE sleep, between the two windows,
+  // even though they live in different session stanzas. No leading sleep in the
+  // second session's stanza.
+  const current = fakeSessions({
+    alpha: [fakeAgent({ job_id: "a", resume_target: "wa" })],
+    beta: [fakeAgent({ job_id: "b", resume_target: "wb" })],
+  });
+  const out = renderSnapshotScript(current, null, "/bin/zsh", "/r.json");
+  const sleepCount = out.split("\n").filter((l) => l === "sleep 0.5").length;
+  expect(sleepCount).toBe(1);
+  // The sleep sits before the second session's new-window, after the first's.
+  const waAt = out.indexOf(`claude --resume "wa"`);
+  const sleepAt = out.indexOf("\nsleep 0.5\n");
+  const wbAt = out.indexOf(`claude --resume "wb"`);
+  expect(waAt).toBeLessThan(sleepAt);
+  expect(sleepAt).toBeLessThan(wbAt);
+});
+
+test("renderSnapshotScript emits NO sleep for a single-agent run", () => {
+  const current = fakeSessions({
+    autopilot: [fakeAgent({ job_id: "solo", resume_target: "only" })],
+  });
+  const out = renderSnapshotScript(current, null, "/bin/zsh", "/r.json");
+  expect(out).not.toContain("sleep 0.5");
 });
