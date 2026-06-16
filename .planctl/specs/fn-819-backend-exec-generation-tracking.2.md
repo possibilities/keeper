@@ -34,5 +34,5 @@ restore-set tests (freshDbFile): seed `BackendExecStart` events + killed crash-l
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Added deriveLastGenerationSet bounding crash candidates to the kill-anchored generation window (B_boundary = MAX(events.id <= K_max) over BackendExecStart, burst fallback when no boundary), exposed via restore-agents --last-generation composing with --apply + --session. Includes the boot-ordering-race regression fixture; README + HELP updated.
 ## Evidence
