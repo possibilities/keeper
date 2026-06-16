@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 69;
+export const SCHEMA_VERSION = 70;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -3480,6 +3480,22 @@ function migrate(db: Database): void {
         "last_disposition",
         "TEXT",
       );
+
+      // v69→v70: add the producer-stamped `jobs.close_kind` TEXT column — WHY a
+      // session died, classified by a main-side tmux liveness probe at the two
+      // Killed producer sites (boot seed-sweep + main's exit-watcher handler):
+      // `server_gone` / `pid_died` (crash-killed → restore) vs.
+      // `window_gone_server_alive` (human closed the window → don't restore) vs.
+      // `unknown` (probe failure → crash-eligible). The DB-derived crash-restore
+      // set reads this per row instead of a frozen restore.json snapshot. The
+      // reducer's Killed fold copies it verbatim (opaque string, no liveness in
+      // the fold). NULL default, NO cursor rewind: a historical Killed carries no
+      // `close_kind` in its payload, so a from-scratch re-fold reproduces the
+      // column's NULL zero-event default. Whitelist-only Python read (this bump
+      // MUST add 70 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME
+      // commit, or every keeper-py read fails host-wide; test/schema-version.test.ts
+      // enforces this).
+      addColumnIfMissing(db, "jobs", "close_kind", "TEXT");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

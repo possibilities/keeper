@@ -6154,6 +6154,80 @@ test("active_since: re-stamped on a killed → UserPromptSubmit re-open", () => 
   expect(job?.active_since).toBe(7000);
 });
 
+// ---------------------------------------------------------------------------
+// Schema-v70 close_kind — the crash-restore discriminator the Killed fold copies
+// verbatim from the producer-stamped payload (fn-817 task .1).
+// ---------------------------------------------------------------------------
+
+function getCloseKind(jobId = "sess-a"): string | null {
+  const row = db
+    .query("SELECT close_kind FROM jobs WHERE job_id = ?")
+    .get(jobId) as { close_kind: string | null } | null;
+  return row?.close_kind ?? null;
+}
+
+for (const kind of [
+  "server_gone",
+  "pid_died",
+  "window_gone_server_alive",
+  "unknown",
+]) {
+  test(`Killed fold copies close_kind="${kind}" onto the jobs row`, () => {
+    insertEvent({ hook_event: "SessionStart" });
+    insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+    insertEvent({
+      hook_event: "Killed",
+      data: JSON.stringify({ pid: 4242, start_time: null, close_kind: kind }),
+    });
+    drainAll();
+    const job = getJob();
+    expect(job?.state).toBe("killed");
+    expect(getCloseKind()).toBe(kind);
+  });
+}
+
+test("Killed fold leaves close_kind NULL when the payload omits it (legacy re-fold)", () => {
+  // A pre-v70 Killed payload carries only (pid, start_time); close_kind folds
+  // to NULL so a from-scratch re-fold reproduces the zero-event default.
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({
+    hook_event: "Killed",
+    data: JSON.stringify({ pid: 4242, start_time: null }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getCloseKind()).toBeNull();
+});
+
+test("Killed fold treats a non-string close_kind as NULL (defensive, never coerced)", () => {
+  // A garbage close_kind value must not masquerade as a real kind — it folds to
+  // NULL, and the row still flips to killed (the kill itself is honored).
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  insertEvent({
+    hook_event: "Killed",
+    data: JSON.stringify({ pid: 4242, start_time: null, close_kind: 42 }),
+  });
+  drainAll();
+  expect(getJob()?.state).toBe("killed");
+  expect(getCloseKind()).toBeNull();
+});
+
+test("Killed fold: a malformed payload folds to a safe no-op and still advances the cursor", () => {
+  insertEvent({ hook_event: "SessionStart" });
+  insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });
+  // Non-JSON data blob → extractKilledPayload returns null → no-op, no throw.
+  const killedId = insertEvent({ hook_event: "Killed", data: "not json{" });
+  drainAll();
+  const job = getJob();
+  // The malformed Killed did not flip the row terminal.
+  expect(job?.state).toBe("working");
+  expect(getCloseKind()).toBeNull();
+  // The cursor advanced past the malformed event (no wedge).
+  expect(getCursor()).toBeGreaterThanOrEqual(killedId);
+});
+
 test("active_since: NOT re-stamped by a 2nd UserPromptSubmit while already working", () => {
   insertEvent({ hook_event: "SessionStart" });
   insertEvent({ hook_event: "UserPromptSubmit", ts: 5000 });

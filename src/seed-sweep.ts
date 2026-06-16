@@ -73,6 +73,7 @@ import {
   parseLinuxStarttime,
   splitArgsLstart,
 } from "../plugin/hooks/events-writer";
+import { classifyCloseKind } from "./exec-backend";
 import { isPidAlive } from "./server-worker";
 
 /**
@@ -132,8 +133,10 @@ export function readOsStartTime(pid: number): string | null {
  * Insert a synthetic `Killed` event for one candidate session, mirroring the
  * shape main uses for `TranscriptTitle` / `EpicSnapshot` (named bindings,
  * everything other than the lifecycle-bearing fields NULL). The payload blob
- * carries the `(pid, start_time)` pair the reducer's Killed fold compares
- * against the persisted row.
+ * carries the `(pid, start_time, close_kind)` triple the reducer's Killed fold
+ * reads — `(pid, start_time)` for the recycle-safe match, `close_kind` for the
+ * crash-restore discriminator (folded as an opaque string copy). `close_kind`
+ * rides the JSON blob, so the `events` column list is unchanged.
  *
  * Why inline SQL here instead of the prepared `stmts.insertEvent`: `db` is the
  * only handle we have at sweep time, and the prepared statement bundle isn't
@@ -146,6 +149,7 @@ function insertKilledEvent(
   sessionId: string,
   pid: number | null,
   startTime: string | null,
+  closeKind: string | null,
 ): void {
   db.run(
     `INSERT INTO events (
@@ -170,7 +174,7 @@ function insertKilledEvent(
       null,
       null,
       null,
-      JSON.stringify({ pid, start_time: startTime }),
+      JSON.stringify({ pid, start_time: startTime, close_kind: closeKind }),
       null,
       null,
       null,
@@ -207,24 +211,31 @@ export function seedKilledSweep(db: Database): void {
   // `row.pid == null` branch below).
   const rows = db
     .query(
-      `SELECT job_id, pid, start_time FROM jobs
+      `SELECT job_id, pid, start_time, backend_exec_pane_id FROM jobs
          WHERE state IN ('working', 'stopped')`,
     )
     .all() as {
     job_id: string;
     pid: number | null;
     start_time: string | null;
+    backend_exec_pane_id: string | null;
   }[];
 
   for (const row of rows) {
     try {
+      // Classify WHY this row is dying via a main-side tmux liveness probe (the
+      // boot half of the two-producer contract; main's exit-watcher handler is
+      // the steady-state half, sharing the SAME `classifyCloseKind` so both
+      // stamp identically). Done once per candidate, BEFORE the Q7 dead/recycle
+      // arms — the kind is orthogonal to which arm emits the Killed.
+      const closeKind = classifyCloseKind(row.backend_exec_pane_id);
       if (row.pid == null) {
         // NULL-pid non-terminal row. Nothing to probe — it can never be
         // watched and we can never prove it alive, so it's terminal by
         // construction. Emit a pidless Killed; the reducer's pidless-reap arm
         // folds it to 'killed' (guarded to NULL-pid rows only, so a watchable
         // row is never touched).
-        insertKilledEvent(db, row.job_id, null, row.start_time);
+        insertKilledEvent(db, row.job_id, null, row.start_time, closeKind);
         continue;
       }
       const alive = isPidAlive(row.pid);
@@ -233,7 +244,7 @@ export function seedKilledSweep(db: Database): void {
         // payload carries the stored start_time so the reducer's match rule
         // (strict when persisted, loose-on-pid when NULL) folds correctly
         // either way.
-        insertKilledEvent(db, row.job_id, row.pid, row.start_time);
+        insertKilledEvent(db, row.job_id, row.pid, row.start_time, closeKind);
         continue;
       }
       if (row.start_time == null) {
@@ -256,7 +267,7 @@ export function seedKilledSweep(db: Database): void {
       // process; the original session is gone. Payload carries the STORED
       // start_time so the reducer matches the persisted row (not the live
       // recycler's start_time).
-      insertKilledEvent(db, row.job_id, row.pid, row.start_time);
+      insertKilledEvent(db, row.job_id, row.pid, row.start_time, closeKind);
     } catch (err) {
       // Per-row isolation: one bad probe never aborts the sweep.
       console.error(

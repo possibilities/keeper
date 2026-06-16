@@ -326,6 +326,108 @@ export function localeDefaultedEnv(
 }
 
 /**
+ * Why a session died, stamped on the synthetic `Killed` event payload by a
+ * main-side tmux liveness probe so the crash-restore derivation can tell a
+ * deliberate window-close from a crash-kill per row, with NO global crash
+ * boundary:
+ *   - `server_gone` — the tmux server is not running (reboot / crash). Restore.
+ *   - `pid_died` — server alive, the job's pane is still listed but its process
+ *     is dead (`remain-on-exit` left a dead pane). Restore.
+ *   - `window_gone_server_alive` — server alive, the job's pane is GONE. The
+ *     human deliberately closed the window. Do NOT restore.
+ *   - `unknown` — probe error/timeout, no tmux binary, or no recorded pane to
+ *     locate. T3's backstop treats `unknown` as crash-like-ELIGIBLE so a probe
+ *     failure never silently strands a crash-kill as a never-restored close.
+ */
+export type CloseKind =
+  | "server_gone"
+  | "pid_died"
+  | "window_gone_server_alive"
+  | "unknown";
+
+/** The slice of a `Bun.spawnSync` result `classifyCloseKind` reads; injectable
+ *  for tests so the classifier exercises canned tmux output with no real fork. */
+export interface SyncProbeResult {
+  readonly success: boolean;
+  readonly exitCode: number;
+  readonly stdout: { toString(): string } | null;
+}
+
+/** `Bun.spawnSync`-shaped probe runner the classifier calls; throwing models an
+ *  unlaunchable tmux (binary missing). Injectable; defaults to `Bun.spawnSync`. */
+export type SyncProbeFn = (args: string[]) => SyncProbeResult;
+
+/**
+ * Synchronous tmux liveness probe → {@link CloseKind}, shared verbatim by both
+ * Killed producer sites (the boot seed-sweep and main's exit-watcher handler)
+ * so they classify identically. ONE `list-panes -a` spawn answers both
+ * questions: a non-zero exit (or unlaunchable / timed-out tmux) means the server
+ * is gone, and a zero exit gives the live pane set to test the job's pane
+ * against.
+ *
+ * Synchronous (`Bun.spawnSync`) on purpose: both call sites run on a sync path
+ * (the seed-sweep loop and the exit-watcher message handler), mirroring
+ * `seed-sweep.ts:readOsStartTime`. The locale-defaulted env is LOAD-BEARING —
+ * a C-locale tmux client sanitizes the TAB delimiters to `_`, dropping every
+ * line so a live pane would read as absent and a `pid_died` would misclassify
+ * as `window_gone_server_alive` (a crash-kill stranded as a user-close).
+ *
+ * `paneId` absent/empty → `unknown`: the row had no recorded tmux pane, so there
+ * is no window-close signal to read; crash-like-eligible, never silently
+ * excluded. NEVER throws — every failure mode degrades to `unknown`.
+ */
+export function classifyCloseKind(
+  paneId: string | null,
+  opts?: { timeoutMs?: number; spawnSync?: SyncProbeFn },
+): CloseKind {
+  const timeout = opts?.timeoutMs ?? 1000;
+  const probe: SyncProbeFn =
+    opts?.spawnSync ??
+    ((args) =>
+      Bun.spawnSync(args, {
+        timeout,
+        env: localeDefaultedEnv(
+          process.env as Record<string, string | undefined>,
+        ),
+      }));
+  let res: SyncProbeResult;
+  try {
+    res = probe(buildTmuxListPanesArgs());
+  } catch {
+    // tmux binary missing / spawn failure — we cannot tell, stay crash-eligible.
+    return "unknown";
+  }
+  // A non-zero exit means the server is not running (reboot/crash) or we could
+  // not connect to it. tmux signals "no server" via a non-zero exit with the
+  // error on stderr; a timed-out spawn also lands here (success=false). Either
+  // way the server is unreachable → server_gone.
+  if (!res.success || res.exitCode !== 0) {
+    return "server_gone";
+  }
+  // Server alive. Without a recorded pane there is no window to locate.
+  if (paneId == null || paneId === "") {
+    return "unknown";
+  }
+  const out = res.stdout?.toString() ?? "";
+  // The pane id is the FIRST tab-delimited field of each `list-panes -a` line.
+  // Match it exactly against the leading field — a substring scan would let a
+  // window name containing the literal pane text spoof presence.
+  for (const line of out.split("\n")) {
+    if (line === "") {
+      continue;
+    }
+    const firstTab = line.indexOf("\t");
+    const candidate = firstTab < 0 ? line : line.slice(0, firstTab);
+    if (candidate === paneId) {
+      // Pane still listed (dead pane held by remain-on-exit) → pid_died.
+      return "pid_died";
+    }
+  }
+  // Server alive but the pane is gone → the human closed the window.
+  return "window_gone_server_alive";
+}
+
+/**
  * Build the tmux `rename-window -t <windowId> -- <name>` argv. Pure — exported
  * for tests. Targets by WINDOW id (`@N`, server-global durable handle) — never
  * name-based, since colons in names break target parsing. The `--` is

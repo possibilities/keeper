@@ -353,19 +353,29 @@ interface KilledPayload {
    */
   pid: number | null;
   start_time: string | null;
+  /**
+   * Why the session died, stamped by the producer's main-side tmux liveness
+   * probe (`server_gone` / `pid_died` / `window_gone_server_alive` / `unknown`).
+   * The reducer folds it as an OPAQUE string copy — no liveness re-probe in the
+   * fold (a re-probe would break re-fold determinism). `null` when the producer
+   * emitted no classification (a pre-schema-v70 Killed re-folding, or a path
+   * that does not probe), folding the column to NULL.
+   */
+  close_kind: string | null;
 }
 
 /**
- * Extract the `(pid, start_time)` payload from a synthetic `Killed` event's
- * `data` blob. Skip-and-log on a malformed blob, never throw — the Killed fold
- * falls through as a safe no-op when this returns null.
+ * Extract the `(pid, start_time, close_kind)` payload from a synthetic `Killed`
+ * event's `data` blob. Skip-and-log on a malformed blob, never throw — the
+ * Killed fold falls through as a safe no-op when this returns null.
  *
  * `pid` is either a finite number (the proven-dead pid) OR explicit `null` for
  * a PIDLESS REAP of a NULL-pid `stopped` row. Any OTHER shape is malformed →
  * null. The pidless arm is opt-in via a literal JSON `null`, so a malformed
  * blob can never accidentally trigger a reap. `start_time` is optional /
  * nullable (the producer may emit a Killed for a row whose stored start_time
- * is NULL).
+ * is NULL). `close_kind` is defensive: any non-string (including absent) folds
+ * to NULL, never coerced — a garbage value must not masquerade as a real kind.
  */
 function extractKilledPayload(event: Event): KilledPayload | null {
   if (event.data == null || event.data.length === 0) {
@@ -375,6 +385,7 @@ function extractKilledPayload(event: Event): KilledPayload | null {
     const parsed = JSON.parse(event.data) as {
       pid?: unknown;
       start_time?: unknown;
+      close_kind?: unknown;
     };
     const pid = parsed.pid;
     // Accept a finite number (proven-dead reap) OR an explicit literal `null`
@@ -384,7 +395,13 @@ function extractKilledPayload(event: Event): KilledPayload | null {
     }
     const startTime =
       typeof parsed.start_time === "string" ? parsed.start_time : null;
-    return { pid: pid as number | null, start_time: startTime };
+    const closeKind =
+      typeof parsed.close_kind === "string" ? parsed.close_kind : null;
+    return {
+      pid: pid as number | null,
+      start_time: startTime,
+      close_kind: closeKind,
+    };
   } catch (err) {
     console.error(
       `keeper reducer: failed to parse Killed payload blob for event id=${event.id} session=${event.session_id}: ${err}`,
@@ -6518,9 +6535,9 @@ function projectJobsRow(db: Database, event: Event): void {
           }
         }
         db.run(
-          `UPDATE jobs SET state = 'killed', monitors = '[]', last_event_id = ?, updated_at = ?
+          `UPDATE jobs SET state = 'killed', monitors = '[]', close_kind = ?, last_event_id = ?, updated_at = ?
              WHERE job_id = ?`,
-          [event.id, ts, jobId],
+          [payload.close_kind, event.id, ts, jobId],
         );
         // Sweep + sync + clear fire ONLY here, on the proven write path. The
         // earlier `break` arms (malformed / missing / stale) MUST NOT — no

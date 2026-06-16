@@ -59,6 +59,7 @@ import type {
   EventsIngestWorkerData,
   EventsLogChangedMessage,
 } from "./events-ingest-worker";
+import { classifyCloseKind } from "./exec-backend";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
 import type {
   AddDiscoveryRootMessage,
@@ -2269,11 +2270,14 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // what's persisted. A non-matching row means the session was re-opened
       // (and the new process is presumably alive) — skip silently.
       const row = db
-        .query("SELECT pid, start_time, state FROM jobs WHERE job_id = ?")
+        .query(
+          "SELECT pid, start_time, state, backend_exec_pane_id FROM jobs WHERE job_id = ?",
+        )
         .get(msg.jobId) as {
         pid: number | null;
         start_time: string | null;
         state: string;
+        backend_exec_pane_id: string | null;
       } | null;
       if (row == null) {
         // Row vanished — nothing to fold against.
@@ -2309,6 +2313,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           return;
         }
       }
+      // Classify WHY this session died via the SAME main-side tmux probe the
+      // boot seed-sweep uses (`classifyCloseKind`), so the steady-state and
+      // boot producers stamp `close_kind` identically. The kind rides the
+      // payload blob (no `events` column changes); the reducer folds it to
+      // `jobs.close_kind` as an opaque string copy for the crash-restore set.
+      const closeKind = classifyCloseKind(row.backend_exec_pane_id);
       stmts.insertEvent.run({
         $ts: Date.now() / 1000, // unix seconds as REAL
         $session_id: msg.jobId, // == job_id
@@ -2322,7 +2332,11 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         $agent_id: null,
         $agent_type: null,
         $stop_hook_active: null,
-        $data: JSON.stringify({ pid: msg.pid, start_time: msg.startTime }),
+        $data: JSON.stringify({
+          pid: msg.pid,
+          start_time: msg.startTime,
+          close_kind: closeKind,
+        }),
         $subagent_agent_id: null,
         $spawn_name: null,
         $start_time: null,

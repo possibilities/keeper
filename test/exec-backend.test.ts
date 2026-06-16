@@ -30,6 +30,7 @@ import {
   buildTmuxRenameWindowArgs,
   buildTmuxSelectPaneArgs,
   buildTmuxSelectWindowArgs,
+  classifyCloseKind,
   createTmuxBackend,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
@@ -37,6 +38,7 @@ import {
   MANAGED_EXEC_SESSION,
   resolveExecBackend,
   type SpawnFn,
+  type SyncProbeFn,
 } from "../src/exec-backend";
 
 /**
@@ -908,4 +910,92 @@ test("resolveExecBackend: threads an explicit session through to the tmux factor
   await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
   // The construction session is on the has-session probe.
   expect(calls[0]).toEqual(buildTmuxHasSessionArgs("custom-session"));
+});
+
+// ---------------------------------------------------------------------------
+// classifyCloseKind — the crash-restore discriminator stamped by both Killed
+// producer sites via a shared main-side tmux liveness probe (fn-817 task .1).
+// Injected canned `list-panes -a` output; no real fork.
+// ---------------------------------------------------------------------------
+
+/** Build a `SyncProbeFn` returning canned `list-panes -a` output, recording the
+ *  argv it was called with so the test can assert the sweep argv + locale env. */
+function makeSyncProbe(canned: {
+  success?: boolean;
+  exitCode?: number;
+  stdout?: string | null;
+}): { probe: SyncProbeFn; calls: string[][] } {
+  const calls: string[][] = [];
+  const probe: SyncProbeFn = (args) => {
+    calls.push([...args]);
+    return {
+      success: canned.success ?? true,
+      exitCode: canned.exitCode ?? 0,
+      stdout:
+        canned.stdout === null ? null : { toString: () => canned.stdout ?? "" },
+    };
+  };
+  return { probe, calls };
+}
+
+test("classifyCloseKind: non-zero exit (no tmux server) → server_gone", () => {
+  const { probe, calls } = makeSyncProbe({ success: false, exitCode: 1 });
+  expect(classifyCloseKind("%5", { spawnSync: probe })).toBe("server_gone");
+  // ONE list-panes -a sweep answers both server-liveness and pane-presence.
+  expect(calls).toHaveLength(1);
+  expect(calls[0]).toEqual(buildTmuxListPanesArgs());
+});
+
+test("classifyCloseKind: success=false (timed-out spawn) → server_gone", () => {
+  const { probe } = makeSyncProbe({ success: false, exitCode: 0 });
+  expect(classifyCloseKind("%5", { spawnSync: probe })).toBe("server_gone");
+});
+
+test("classifyCloseKind: server alive, pane still listed (dead pane) → pid_died", () => {
+  const { probe } = makeSyncProbe({
+    stdout: "%4\t@1\twin-a\n%5\t@2\twin-b\n%6\t@3\twin-c\n",
+  });
+  expect(classifyCloseKind("%5", { spawnSync: probe })).toBe("pid_died");
+});
+
+test("classifyCloseKind: server alive, pane gone → window_gone_server_alive", () => {
+  const { probe } = makeSyncProbe({
+    stdout: "%4\t@1\twin-a\n%6\t@3\twin-c\n",
+  });
+  expect(classifyCloseKind("%5", { spawnSync: probe })).toBe(
+    "window_gone_server_alive",
+  );
+});
+
+test("classifyCloseKind: probe throws (tmux binary missing) → unknown", () => {
+  const probe: SyncProbeFn = () => {
+    throw new Error("ENOENT");
+  };
+  expect(classifyCloseKind("%5", { spawnSync: probe })).toBe("unknown");
+});
+
+test("classifyCloseKind: server alive but no recorded pane (null/empty) → unknown", () => {
+  const { probe } = makeSyncProbe({ stdout: "%4\t@1\twin-a\n" });
+  expect(classifyCloseKind(null, { spawnSync: probe })).toBe("unknown");
+  expect(classifyCloseKind("", { spawnSync: probe })).toBe("unknown");
+});
+
+test("classifyCloseKind: pane match is leading-field exact, not a substring spoof", () => {
+  // A window name containing the literal pane text must NOT read as present —
+  // only the FIRST tab-delimited field counts. Otherwise a crash-kill whose
+  // pane is truly gone would misclassify as pid_died and never be a clean
+  // user-close, or worse a user-close would masquerade as a live pane.
+  const { probe } = makeSyncProbe({
+    stdout: "%4\t@1\tnamed %5 in the title\n",
+  });
+  expect(classifyCloseKind("%5", { spawnSync: probe })).toBe(
+    "window_gone_server_alive",
+  );
+});
+
+test("classifyCloseKind: null stdout on a zero exit → no panes, pane absent → window_gone_server_alive", () => {
+  const { probe } = makeSyncProbe({ stdout: null });
+  expect(classifyCloseKind("%5", { spawnSync: probe })).toBe(
+    "window_gone_server_alive",
+  );
 });

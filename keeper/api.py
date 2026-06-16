@@ -266,6 +266,13 @@ from pathlib import Path
 # the ``CronCreate`` / ``CronDelete`` PostToolUse pair into a per-job cron side
 # table. keeper-py reads no ``scheduled_tasks`` row (the TUI subscribes over the
 # socket), so no reader logic changes — only the version whitelist gains 68.
+#
+# v70 (fn-817 task .1) adds the producer-stamped ``jobs.close_kind`` TEXT column
+# recording WHY a session died (``server_gone`` / ``pid_died`` /
+# ``window_gone_server_alive`` / ``unknown``), the per-row signal the DB-derived
+# crash-restore set reads instead of a frozen restore.json snapshot. keeper-py
+# reads no ``close_kind`` column (the TUI subscribes over the socket), so no
+# reader logic changes — only the version whitelist gains 70.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -307,6 +314,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         67,
         68,
         69,
+        70,
     }
 )
 
