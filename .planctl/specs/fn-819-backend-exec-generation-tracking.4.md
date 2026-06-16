@@ -26,5 +26,5 @@ Docs-only; verify line ranges against the live files (README grows — use as se
 - [ ] No stale "boundary-free / no crash marker" wording remains.
 
 ## Done summary
-
+Docs for the generation-boundary crash-restore model were already shipped in the implementation commits (96e7de44, 5870703c): README crash-restore-set subsection describes the kill-anchored generation window (no stale 'boundary-free' wording), ninth-worker list includes BackendExecStart, and both setup-tmux + restore-agents HELP/README blocks document the restore offer and --last-generation flag. Verified clean; no further changes needed.
 ## Evidence
