@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-16T23:37:31.382000Z",
+  "depends_on": [
+    "fn-819-backend-exec-generation-tracking.2"
+  ],
+  "epic": "fn-819-backend-exec-generation-tracking",
+  "id": "fn-819-backend-exec-generation-tracking.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "setup-tmux restore-last-session offer",
+  "updated_at": "2026-06-16T23:37:31.382000Z"
+}

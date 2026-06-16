@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-16T23:37:31.382000Z",
+  "depends_on": [
+    "fn-819-backend-exec-generation-tracking.1"
+  ],
+  "epic": "fn-819-backend-exec-generation-tracking",
+  "id": "fn-819-backend-exec-generation-tracking.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "deriveLastGenerationSet and --last-generation",
+  "updated_at": "2026-06-16T23:37:31.382000Z"
+}
