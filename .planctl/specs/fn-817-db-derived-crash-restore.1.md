@@ -44,5 +44,5 @@ Unit-test the probe→`close_kind` classifier with injected fake tmux output (se
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Added producer-stamped jobs.close_kind column (schema v70, whitelisted in keeper/api.py same commit): a shared main-side classifyCloseKind tmux probe stamps server_gone/pid_died/window_gone_server_alive/unknown at both Killed producer sites (exit-watcher handler + boot seed-sweep); the reducer folds it as an opaque string copy with safe NULL defaults.
 ## Evidence
