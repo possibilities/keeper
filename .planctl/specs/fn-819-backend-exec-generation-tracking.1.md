@@ -40,5 +40,5 @@ restore-worker test: stub `spawnSync` to return a pid, drive the pulse, assert O
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Mint a backend-agnostic BackendExecStart synthetic event when the tmux server generation (server pid) changes: restore-worker pulse probes the pid ungated by live-tmux-job, change-gated + boot-seeded against the last logged event, posts to main which mints the event; reducer folds it via an explicit no-op dispatcher arm (no schema bump).
 ## Evidence

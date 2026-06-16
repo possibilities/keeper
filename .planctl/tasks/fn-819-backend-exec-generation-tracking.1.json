@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "backend-exec-start generation event",
-  "updated_at": "2026-06-16T23:37:31.382000Z"
+  "updated_at": "2026-06-16T23:45:29.171000Z",
+  "worker_done_at": "2026-06-16T23:45:29.171000Z"
 }
