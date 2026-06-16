@@ -229,9 +229,9 @@ export const RESTORE_SCHEMA_VERSION = 3;
  *    restore time.
  *  - `cwd` — directory to `cd` into before `claude --resume`; `null` when the
  *    SessionStart event never carried one.
- *  - `resume_target` — pre-resolved via {@link resumeTarget} (the `job_id`
- *    UUID — resume by stable id, never a mutable name). Pre-resolved at producer
- *    time so the restore-agents util doesn't have to know the rule.
+ *  - `resume_target` — pre-resolved via {@link resumeTarget} (the latest session
+ *    name, `job_id` fallback — resume by the name keeper currently knows).
+ *    Pre-resolved at producer time so the restore-agents util doesn't re-derive it.
  *  - `tier` — pre-resolved via {@link tierForJobFromEpics} against the
  *    epicsById map built once per pulse. `null` for non-work jobs or jobs
  *    whose epic isn't in the projection.

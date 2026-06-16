@@ -6,8 +6,8 @@
  *    `window_gone_server_alive` excluded.
  *  - filters: backend coords, autopilot workers, already-live UUID dedup, idle
  *    cutoff with a surfaced excluded count.
- *  - order by `window_index` (nulls to tail); resume target = job_id, label =
- *    latest title.
+ *  - order by `window_index` (nulls to tail); resume target = latest title
+ *    (the label carries the same name).
  *  - the recorded 2026-06-16 incident burst cohort as a regression fixture.
  *
  * Pure module — fixture DB via `freshDbFile`, no subprocess, no daemon.
@@ -22,6 +22,7 @@ import {
   BURST_MIN_SIZE,
   burstEventIds,
   DEFAULT_IDLE_CUTOFF_SECS,
+  deriveCurrentSet,
   deriveRestoreSet,
   isCrashLike,
 } from "../src/restore-set";
@@ -387,7 +388,7 @@ test("deriveRestoreSet: label = latest title, falls back to job_id", () => {
   expect(byId.get("untitled-uuid")?.label).toBe("untitled-uuid");
 });
 
-test("deriveRestoreSet: resume_target is the job_id UUID (resume by UUID, not name)", () => {
+test("deriveRestoreSet: resume_target is the latest name (resume by the current title, not the UUID)", () => {
   const uuid = "38c56d06-7378-47e5-a946-0345a26d6201";
   seedJob(kdb.db, {
     job_id: uuid,
@@ -395,8 +396,66 @@ test("deriveRestoreSet: resume_target is the job_id UUID (resume by UUID, not na
     title: "renamed-since-launch",
   });
   const res = derive();
-  expect(res.candidates[0]?.resume_target).toBe(uuid);
+  // Resume by the LATEST name keeper knows (the current title), read live from
+  // the jobs projection — so a session renamed since launch resumes to its
+  // current name. The label carries the same name.
+  expect(res.candidates[0]?.resume_target).toBe("renamed-since-launch");
   expect(res.candidates[0]?.label).toBe("renamed-since-launch");
+});
+
+// ---------------------------------------------------------------------------
+// deriveCurrentSet — the --snapshot-current source (live set, not crash set)
+// ---------------------------------------------------------------------------
+
+test("deriveCurrentSet: returns the live (working+stopped) sessions ordered by window_index", () => {
+  // Two live sessions out of window order — must come back window-ordered.
+  seedJob(kdb.db, {
+    job_id: "w2",
+    state: "stopped",
+    title: "second",
+    window_index: 2,
+    backend_exec_session_id: "foreground",
+  });
+  seedJob(kdb.db, {
+    job_id: "w1",
+    state: "working",
+    title: "first",
+    window_index: 1,
+    backend_exec_session_id: "foreground",
+  });
+  // A killed row is NOT a current-live snapshot member.
+  seedJob(kdb.db, {
+    job_id: "dead",
+    state: "killed",
+    close_kind: "server_gone",
+    title: "gone",
+  });
+  // No backend coords ⇒ nothing to revive ⇒ excluded.
+  seedJob(kdb.db, {
+    job_id: "nobackend",
+    state: "working",
+    title: "x",
+    backend_exec_session_id: null,
+  });
+
+  const cur = deriveCurrentSet(kdb.db);
+  expect(cur.map((c) => c.job_id)).toEqual(["w1", "w2"]);
+  // Resume target is the LATEST name (the title), never the UUID.
+  expect(cur[0].resume_target).toBe("first");
+  expect(cur[1].resume_target).toBe("second");
+});
+
+test("deriveCurrentSet: a never-named live session falls back to its job_id", () => {
+  seedJob(kdb.db, {
+    job_id: "unnamed-uuid",
+    state: "working",
+    title: null,
+    backend_exec_session_id: "foreground",
+  });
+  const cur = deriveCurrentSet(kdb.db);
+  expect(cur).toHaveLength(1);
+  expect(cur[0].resume_target).toBe("unnamed-uuid");
+  expect(cur[0].label).toBe("unnamed-uuid");
 });
 
 test("deriveRestoreSet: carries cwd (the resume `cd` target); empty/NULL → null", () => {

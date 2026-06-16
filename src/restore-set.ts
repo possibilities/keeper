@@ -46,10 +46,12 @@
  * `job_id`. The candidate set is returned already ordered, so
  * `scripts/restore-agents.ts` is a thin presenter that never re-sorts.
  *
- * RESULT. Each candidate's `label` is the latest `title` (what `claude --resume`
- * would target; falls back to the `job_id` for a never-named session), and the
- * `resume_target` is the `job_id` UUID — restore resumes by stable UUID, never
- * by a mutable session name, so a renamed session restores correctly.
+ * RESULT. Each candidate's `resume_target` is the latest `title` — the session
+ * name keeper currently knows, read live from the jobs projection so it is never
+ * a frozen name — falling back to the `job_id` for a never-named session. `label`
+ * carries the same display name. Restore resumes by the LATEST name, which is why
+ * deriving from the live DB (not a snapshot) is what makes a renamed session
+ * restore correctly.
  *
  * PURE-ISH. The derivation reads ONLY the passed read-only `Database` handle and
  * the (injectable) `now` clock for the idle cutoff. No socket, no env, no
@@ -112,8 +114,9 @@ interface KilledJobRow {
 }
 
 /**
- * One crash-restore candidate. `resume_target` is the stable `job_id` UUID (the
- * resume key); `label` is the human-readable display name (latest title).
+ * One crash-restore candidate. `resume_target` is the latest `title` (the resume
+ * key `claude --resume` targets), falling back to the `job_id` for a never-named
+ * session; `label` carries the same human-readable name.
  * `window_index` rides through for the ordered render's debugging/diagnostics.
  * `cwd` is the directory the restore command `cd`s into before `claude --resume`
  * (`null` when the SessionStart event never carried one).
@@ -333,7 +336,7 @@ export function deriveRestoreSet(
     const label = row.title != null && row.title !== "" ? row.title : jobId;
     candidates.push({
       job_id: jobId,
-      resume_target: jobId,
+      resume_target: label,
       label,
       window_index:
         typeof row.window_index === "number" &&
@@ -348,4 +351,65 @@ export function deriveRestoreSet(
 
   candidates.sort(compareCandidates);
   return { candidates, excludedIdleCount };
+}
+
+/**
+ * Derive the CURRENT live set — every `state ∈ {working, stopped}` job that
+ * holds backend coords — as restore candidates, ordered by visual window order.
+ *
+ * This is NOT the crash-restore set: it is a snapshot of what is open RIGHT NOW,
+ * the source for `restore-agents --snapshot-current`'s replayable revive script.
+ * It applies no crash-membership / idle / dedup filtering — the whole point is to
+ * capture the live session verbatim so the human can dump a script and re-run it
+ * after a crash the automatic path can't be trusted to catch. The resume target
+ * is the latest name (`title`, `job_id` fallback), same as a crash candidate, so
+ * the emitted script resumes by the name keeper currently knows. Pure read off
+ * the passed read-only connection; empty input returns `[]`, never throws.
+ */
+export function deriveCurrentSet(db: Database): RestoreCandidate[] {
+  const rows = db
+    .query(
+      `SELECT job_id, created_at, title, window_index, cwd, backend_exec_session_id
+         FROM jobs
+        WHERE state IN ('working', 'stopped')
+          AND backend_exec_session_id IS NOT NULL
+          AND backend_exec_session_id != ''`,
+    )
+    .all() as {
+    job_id: string;
+    created_at: number;
+    title: string | null;
+    window_index: number | null;
+    cwd: string | null;
+    backend_exec_session_id: string;
+  }[];
+
+  const candidates: RestoreCandidate[] = [];
+  for (const row of rows) {
+    const jobId = seg(row.job_id);
+    if (jobId === "") {
+      continue;
+    }
+    const backendSession = seg(row.backend_exec_session_id);
+    if (backendSession === "") {
+      continue;
+    }
+    const label = row.title != null && row.title !== "" ? row.title : jobId;
+    candidates.push({
+      job_id: jobId,
+      resume_target: label,
+      label,
+      window_index:
+        typeof row.window_index === "number" &&
+        Number.isFinite(row.window_index)
+          ? row.window_index
+          : null,
+      cwd: row.cwd != null && row.cwd !== "" ? row.cwd : null,
+      backend_exec_session_id: backendSession,
+      created_at: Number.isFinite(row.created_at) ? row.created_at : 0,
+    });
+  }
+
+  candidates.sort(compareCandidates);
+  return candidates;
 }

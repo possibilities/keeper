@@ -17,7 +17,7 @@
  *  - `buildRestoreTier`: filters to live jobs (`working`/`stopped`), drops
  *    `ended`/`killed`, drops `backend_exec_session_id == null`, drops empty
  *    job_id; groups by session; sorts agents by job_id; stamps `resume_target`
- *    as the job_id UUID; pre-resolves tier via the shared helper.
+ *    as the latest name (job_id fallback); pre-resolves tier via the shared helper.
  *  - `serializeForHash`: strips `current.captured_at`; an index change rewrites.
  *  - `serializeForWrite`: keeps `captured_at`, schema v3, trailing \n, no
  *    `last_session` field.
@@ -343,9 +343,10 @@ test("buildRestoreTier leaves tier null when no epicsById entry matches", () => 
   expect(out.sessions.s1.agents[0].tier).toBeNull();
 });
 
-test("buildRestoreTier stamps resume_target as the job_id UUID, regardless of title", () => {
-  // fn-817: the resume key is the stable job_id UUID, NEVER the mutable title —
-  // that is what makes a renamed session restore correctly.
+test("buildRestoreTier stamps resume_target as the latest name, falling back to job_id", () => {
+  // The resume key is the latest session name (the title) — read live from the
+  // jobs projection, so a renamed session restores to its current name; a
+  // never-named job falls back to its job_id.
   const named: Job[] = [
     fakeJob({
       job_id: "sess-xyz",
@@ -356,7 +357,7 @@ test("buildRestoreTier stamps resume_target as the job_id UUID, regardless of ti
   expect(
     buildRestoreTier(named, new Map(), 1000).sessions.s1.agents[0]
       .resume_target,
-  ).toBe("sess-xyz");
+  ).toBe("work::fn-1-foo.2");
 
   const unnamed: Job[] = [
     fakeJob({ job_id: "sess-abc", backend_exec_session_id: "s1", title: null }),
@@ -575,7 +576,7 @@ test("restorePulse on a first-ever empty boot writes an empty current tier", () 
   expect("last_session" in parsed).toBe(false);
 });
 
-test("restorePulse end-to-end pre-resolves tier and stamps the job_id resume_target", () => {
+test("restorePulse end-to-end pre-resolves tier and stamps the latest-name resume_target", () => {
   insertJob({
     job_id: "sess-xyz",
     backend_exec_session_id: "autopilot",
@@ -596,8 +597,8 @@ test("restorePulse end-to-end pre-resolves tier and stamps the job_id resume_tar
     {
       job_id: "sess-xyz",
       cwd: "/repo",
-      // fn-817: resume_target is the job_id UUID, not the title.
-      resume_target: "sess-xyz",
+      // resume_target is the latest name (the title), read live from the jobs row.
+      resume_target: "work::fn-1-foo.2",
       tier: "mint",
       plan_verb: "work",
       plan_ref: "fn-1-foo.2",

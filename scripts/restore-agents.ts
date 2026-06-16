@@ -14,8 +14,9 @@
  * `scripts/resume.ts` and the restore worker already agree on
  * (`buildResumeCommand` / `resumeTarget` — the shared `src/resume-descriptor`
  * substrate that makes the three resume-command producers byte-identical). The
- * resume key is the job's `job_id` UUID, never its (mutable) session name, so a
- * RENAMED session restores correctly.
+ * resume key is the job's LATEST name (`title`, `job_id` fallback) — read live
+ * from the jobs projection at restore time, never a frozen one — so a renamed
+ * session restores to the name keeper currently knows.
  *
  * The candidate set already excludes any `job_id` still occupying a live
  * backend (`restore-set.ts`'s UUID-liveness dedup, computed from the same DB
@@ -31,50 +32,78 @@
  *
  * Usage:
  *   bun scripts/restore-agents.ts [--session <name>] [--apply] [--db <path>]
+ *   bun scripts/restore-agents.ts --snapshot-current [--session <name>] [--db <path>] > revive.sh
  *
  *   --session <name>   Restore only agents from this backend session. Default:
  *                      all sessions in the candidate set.
  *   --apply            Actually relaunch via `ensureLaunched`. Default is
  *                      DRY-RUN — print what would be restored, touch nothing.
+ *   --snapshot-current Emit a runnable bash script that revives the CURRENT live
+ *                      set (every working/stopped session) into tmux windows — a
+ *                      manual safety net independent of the crash-derivation path.
+ *                      Pipe to a file and run later. Read-only, no daemon.
  *   --db <path>        keeper.db path override (else $KEEPER_DB, else the
  *                      ~/.local/state/keeper/keeper.db default).
  *   --help             Show this help.
  *
+ * `--apply` and `--snapshot-current` are mutually exclusive.
+ *
  * Exit codes:
- *   0 — printed the plan (dry-run) or completed the restore (--apply).
- *       Zero candidates is "nothing to restore" and exits 0.
- *   1 — arguments are malformed, or the keeper.db read failed. The reason goes
- *       to stderr.
+ *   0 — printed the plan (dry-run), completed the restore (--apply), or emitted
+ *       the revive script (--snapshot-current). Zero candidates exits 0.
+ *   1 — arguments are malformed/conflicting, or the keeper.db read failed. The
+ *       reason goes to stderr.
  */
 
 import { parseArgs } from "node:util";
 import { openDb, resolveDbPath } from "../src/db";
-import { type ExecBackend, resolveExecBackend } from "../src/exec-backend";
-import { deriveRestoreSet, type RestoreCandidate } from "../src/restore-set";
+import {
+  buildTmuxHasSessionArgs,
+  buildTmuxNewSessionArgs,
+  buildTmuxNewWindowArgs,
+  type ExecBackend,
+  resolveExecBackend,
+} from "../src/exec-backend";
+import {
+  deriveCurrentSet,
+  deriveRestoreSet,
+  type RestoreCandidate,
+} from "../src/restore-set";
 import { buildResumeCommand } from "../src/resume-descriptor";
 
 const HELP = `restore-agents — replay crash-killed Claude Code agents derived from keeper.db
 
 Usage:
   bun scripts/restore-agents.ts [--session <name>] [--apply] [--db <path>]
+  bun scripts/restore-agents.ts --snapshot-current [--session <name>] [--db <path>] > revive.sh
 
   --session <name>    Restore only agents from this backend session (default: all)
   --apply             Actually relaunch via ensureLaunched (default: DRY-RUN)
+  --snapshot-current  Emit a runnable revive script for the CURRENT live set (read-only)
   --db <path>         keeper.db path override ($KEEPER_DB / default otherwise)
   --help              Show this help
 
 Derives the crash-restore candidate set RETROSPECTIVELY from keeper.db: a
 killed job whose producer-stamped close_kind reads crash-like, that was live
-recently and doesn't already re-occupy a backend. Resumes by the job_id UUID
-(rename-proof) wrapped in the same shell prologue scripts/resume.ts emits, into
-the original tmux session. Works with keeperd DOWN — the read is a read-only
-keeper.db connection with no socket round-trip.
+recently and doesn't already re-occupy a backend. Resumes by the latest session
+name (read live from keeper.db, never a frozen one) wrapped in the same shell
+prologue scripts/resume.ts emits, into the original tmux session. Works with
+keeperd DOWN — the read is a read-only keeper.db connection with no socket
+round-trip.
+
+--snapshot-current is the manual safety net: it reads the CURRENT live set
+(every working/stopped session) and emits a runnable bash script that revives
+each into its own tmux window (get-or-create the session first), byte-aligned
+with what --apply spawns. Pipe it to a file and run it later — a dump you can
+trust independent of the automatic crash path.
 
 Restored windows come back in their original visual (left-to-right) tmux order
-(by the captured window_index; unknown order sinks to the tail). --apply paces
-window creation with a 0.5s pause between consecutive launches.
+(by the captured window_index; unknown order sinks to the tail). --apply and
+--snapshot-current pace window creation with a 0.5s pause between consecutive
+launches.
 
-Zero candidates prints a clear message and exits 0 (nothing to restore).
+--apply and --snapshot-current are mutually exclusive. Zero candidates prints a
+clear message and exits 0 (nothing to restore).
 
 When --apply runs while autopilot is unpaused, restored tabs are not
 'verb::id'-named, so autopilot's fn-674 dedup probe cannot see them and may
@@ -90,6 +119,7 @@ const DEFAULT_SHELL = "/bin/zsh" as const;
 interface ParsedArgs {
   session: string | null;
   apply: boolean;
+  snapshotCurrent: boolean;
   db: string | null;
   help: boolean;
 }
@@ -97,8 +127,8 @@ interface ParsedArgs {
 /**
  * Outcome of one restore attempt — fed into the summary counts and (for the
  * dry-run path) the per-agent label lines. PURE shape — no I/O leaks out. The
- * candidate carries everything the launch needs: `resume_target` (the job_id
- * UUID resume key), `backend_exec_session_id` (the tmux session to relaunch
+ * candidate carries everything the launch needs: `resume_target` (the latest-name
+ * resume key), `backend_exec_session_id` (the tmux session to relaunch
  * into), and `cwd` (to `cd` into before `claude --resume`). `tier` is irrelevant
  * — fn-10 inverted tier routing dropped the `--plugin-dir` flag, so a resume
  * command never carries a tier.
@@ -122,6 +152,7 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
     options: {
       session: { type: "string" },
       apply: { type: "boolean", default: false },
+      "snapshot-current": { type: "boolean", default: false },
       db: { type: "string" },
       help: { type: "boolean", default: false },
     },
@@ -130,6 +161,7 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
   return {
     session: parsed.values.session ?? null,
     apply: parsed.values.apply === true,
+    snapshotCurrent: parsed.values["snapshot-current"] === true,
     db: parsed.values.db ?? null,
     help: parsed.values.help === true,
   };
@@ -140,7 +172,7 @@ function parseArgsTyped(argv: string[]): ParsedArgs {
  * `$SHELL -l -i -c "<cmd> ; exec $SHELL -l -i"` prologue the autopilot
  * worker's `buildLaunchArgv` uses, so a freshly minted tab survives the
  * `claude` process exiting (you keep a login shell). The resume key is the
- * candidate's `resume_target` (the job_id UUID). The shell is injected for
+ * candidate's `resume_target` (the latest name). The shell is injected for
  * testability — the live util passes `process.env.SHELL ?? DEFAULT_SHELL`.
  *
  * Exported for tests.
@@ -313,6 +345,106 @@ export function renderOutcomes(
 }
 
 /**
+ * Pure: POSIX single-quote-escape one argv token for safe embedding in the
+ * generated `--snapshot-current` shell script. Wraps in single quotes and
+ * renders any embedded single quote as the `'\''` close-escape-reopen idiom —
+ * the only metacharacter a single-quoted string doesn't already neutralize, so
+ * tmux metachars (`;`, `#{pane_id}`) and the resume body's double quotes reach
+ * tmux literally. An empty string becomes `''`. Exported for tests.
+ */
+export function shellQuote(arg: string): string {
+  return `'${arg.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Pure renderer: turn the CURRENT live candidate set into a RUNNABLE bash script
+ * that revives each session into its own tmux window. Byte-aligned with what
+ * `--apply` spawns — the same `buildResumeLaunchArgv` inner argv wrapped in the
+ * same `buildTmuxNewWindowArgs` new-window — but preceded by a per-session
+ * `has-session || new-session` get-or-create guard and emitted as shell text, so
+ * it can be piped to a file and run later (daemon-independent).
+ *
+ * Sessions emit in alpha order; candidates within a session in the visual window
+ * order `deriveCurrentSet` already sorted them into. A `sleep 0.5` line separates
+ * consecutive `new-window` emissions (tracked globally across session boundaries
+ * — never before the first window or after the last) so the revived windows don't
+ * race the multiplexer. `sleep 0.5` is portable across BSD/GNU with a dot decimal.
+ * Every argv token is single-quoted via {@link shellQuote}. The `--session` filter
+ * narrows to one bucket. Exported for tests.
+ */
+export function renderSnapshotScript(
+  candidates: RestoreCandidate[],
+  sessionFilter: string | null,
+  shell: string,
+  sourcePath: string,
+): string {
+  const quoteArgv = (args: string[]): string => args.map(shellQuote).join(" ");
+  const lines: string[] = [
+    "#!/usr/bin/env bash",
+    "# restore-agents --snapshot-current — runnable snapshot of the CURRENT live set.",
+    `# Source: ${sourcePath}. Pipe to a file and run to revive these tabs.`,
+    "# Each window relaunches via claude --resume by its LATEST name; the session is get-or-created.",
+    "set -euo pipefail",
+  ];
+  // Group candidates by backend session, preserving the incoming visual order
+  // (deriveCurrentSet already sorted by window_index, so each bucket stays in
+  // left-to-right order).
+  const bySession = new Map<string, RestoreCandidate[]>();
+  for (const c of candidates) {
+    const sess = c.backend_exec_session_id;
+    if (sessionFilter !== null && sess !== sessionFilter) {
+      continue;
+    }
+    const bucket = bySession.get(sess);
+    if (bucket === undefined) {
+      bySession.set(sess, [c]);
+    } else {
+      bucket.push(c);
+    }
+  }
+  let sessionCount = 0;
+  // Tracks whether any new-window has been emitted yet, ACROSS session boundaries
+  // — `sleep 0.5` precedes every new-window after the first, so it lands strictly
+  // between consecutive windows (no leading or trailing sleep).
+  let windowsEmitted = 0;
+  for (const sessionName of [...bySession.keys()].sort()) {
+    const bucket = bySession.get(sessionName);
+    if (bucket === undefined || bucket.length === 0) {
+      continue;
+    }
+    sessionCount++;
+    const n = bucket.length;
+    lines.push("");
+    lines.push(`# session: ${sessionName} (${n} window${n === 1 ? "" : "s"})`);
+    // Get-or-create the session so the new-window targets land. `|| ` keeps
+    // `set -e` from tripping when has-session exits non-zero (session absent).
+    lines.push(
+      `${quoteArgv(buildTmuxHasSessionArgs(sessionName))} 2>/dev/null || ` +
+        `${quoteArgv(buildTmuxNewSessionArgs(sessionName))}`,
+    );
+    for (const candidate of bucket) {
+      const cwd = candidate.cwd == null ? "" : seg(candidate.cwd);
+      const innerArgv = buildResumeLaunchArgv(shell, candidate);
+      // No window name — mirrors --apply (ensureLaunched passes none), so the
+      // revived window stays unnamed and the renamer worker labels it later.
+      if (windowsEmitted > 0) {
+        lines.push("sleep 0.5");
+      }
+      lines.push(`# ${candidate.label}`);
+      lines.push(
+        quoteArgv(buildTmuxNewWindowArgs(sessionName, cwd, innerArgv)),
+      );
+      windowsEmitted++;
+    }
+  }
+  lines.push("");
+  lines.push(
+    `# summary: snapshot-current sessions=${sessionCount} windows=${windowsEmitted}`,
+  );
+  return `${lines.join("\n")}\n`;
+}
+
+/**
  * Derive the crash-restore candidate set from a read-only `keeper.db`
  * connection in ONE open span: open, `deriveRestoreSet`, close. The candidate
  * shape already carries everything the launch needs (`resume_target`, `cwd`,
@@ -340,6 +472,25 @@ export function loadRestoreSet(dbPath: string): {
   }
 }
 
+/**
+ * Read the CURRENT live set (every `working`/`stopped` session with backend
+ * coords) off a read-only `keeper.db` in one open span — the `--snapshot-current`
+ * source. Re-throws on open failure (the caller maps it to `die`). Exported for
+ * tests so the read path is assertable against a seeded DB.
+ */
+export function loadCurrentSet(dbPath: string): RestoreCandidate[] {
+  const { db } = openDb(dbPath, { readonly: true, prepareStmts: false });
+  try {
+    return deriveCurrentSet(db);
+  } finally {
+    try {
+      db.close();
+    } catch {
+      // best-effort; the script is one-shot and exits next.
+    }
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseArgsTyped(Bun.argv.slice(2));
 
@@ -348,7 +499,30 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
+  if (args.apply && args.snapshotCurrent) {
+    die("--apply and --snapshot-current are mutually exclusive");
+  }
+
   const dbPath = args.db ?? resolveDbPath();
+  const shell = process.env.SHELL ?? DEFAULT_SHELL;
+
+  // --snapshot-current: emit a runnable revive script for the CURRENT live set
+  // (every working/stopped session), independent of the crash-derivation path —
+  // the manual safety net. Pure local read: no crash-membership filtering, no
+  // daemon round-trip.
+  if (args.snapshotCurrent) {
+    let current: RestoreCandidate[];
+    try {
+      current = loadCurrentSet(dbPath);
+    } catch (err) {
+      die(`failed to open keeper.db at ${dbPath}: ${(err as Error).message}`);
+    }
+    process.stdout.write(
+      renderSnapshotScript(current, args.session, shell, dbPath),
+    );
+    process.exit(0);
+  }
+
   let candidates: RestoreCandidate[];
   let excludedIdleCount: number;
   try {
@@ -359,7 +533,6 @@ async function main(): Promise<void> {
     die(`failed to open keeper.db at ${dbPath}: ${(err as Error).message}`);
   }
 
-  const shell = process.env.SHELL ?? DEFAULT_SHELL;
   const plan = planRestore(candidates, args.session);
 
   if (!args.apply) {

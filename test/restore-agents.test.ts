@@ -3,13 +3,13 @@
  *
  * Drive the pure pieces of `scripts/restore-agents.ts` against in-memory
  * candidate fixtures and a seeded read-only `keeper.db`:
- *  - `buildResumeLaunchArgv` — UUID resume key, login-shell wrap, no --plugin-dir.
+ *  - `buildResumeLaunchArgv` — latest-name resume key, login-shell wrap, no --plugin-dir.
  *  - `planRestore` — `--session` filter over the candidate's backend session.
  *  - `applyRestore` — apply-vs-dry-run via a capturing fake ensureLaunched, the
  *    0.5s inter-window pacing, continue-past-failure.
- *  - `renderOutcomes` — UUID-targeting commands, label display, idle note.
+ *  - `renderOutcomes` — latest-name resume commands, label display, idle note.
  *  - `loadRestoreSet` — read-only `deriveRestoreSet` over a seeded DB (daemon-down,
- *    no socket); a RENAMED session restores by its stable job_id UUID.
+ *    no socket); a candidate resumes by its latest name, read live from the DB.
  *
  * The util's `main()` exit path (Bun.argv parsing, real openDb, real tmux
  * ensureLaunched) is NOT spawned — the same shape every other one-shot CLI test
@@ -28,6 +28,7 @@ import {
   loadRestoreSet,
   planRestore,
   renderOutcomes,
+  renderSnapshotScript,
 } from "../scripts/restore-agents";
 import type { RestoreCandidate } from "../src/restore-set";
 import { freshDbFile } from "./helpers/template-db";
@@ -123,10 +124,80 @@ function fakeCandidate(opts: {
 }
 
 // ---------------------------------------------------------------------------
-// buildResumeLaunchArgv — UUID resume key, shell wrap, no --plugin-dir
+// renderSnapshotScript — the --snapshot-current revive script
 // ---------------------------------------------------------------------------
 
-test("buildResumeLaunchArgv wraps the UUID resume command in a login shell prologue", () => {
+test("renderSnapshotScript emits a get-or-create guard + paced, latest-name new-windows", () => {
+  const candidates = [
+    fakeCandidate({
+      job_id: "j1",
+      resume_target: "first-name",
+      label: "first-name",
+      cwd: "/repo/a",
+      window_index: 1,
+      backend_exec_session_id: "foreground",
+    }),
+    fakeCandidate({
+      job_id: "j2",
+      resume_target: "second-name",
+      label: "second-name",
+      cwd: "/repo/b",
+      window_index: 2,
+      backend_exec_session_id: "foreground",
+    }),
+  ];
+  const script = renderSnapshotScript(
+    candidates,
+    null,
+    "/bin/zsh",
+    "/tmp/keeper.db",
+  );
+  expect(script.startsWith("#!/usr/bin/env bash\n")).toBe(true);
+  expect(script).toContain("set -euo pipefail");
+  // Get-or-create the session before its windows (every argv token single-quoted).
+  expect(script).toContain("'tmux' 'has-session' '-t' '=foreground'");
+  expect(script).toContain("'tmux' 'new-session' '-d' '-s' 'foreground'");
+  // Resume by the LATEST name, never the job_id UUID.
+  expect(script).toContain('claude --resume "first-name"');
+  expect(script).toContain('claude --resume "second-name"');
+  expect(script).not.toContain("j1");
+  expect(script).not.toContain("j2");
+  // Exactly one inter-window pause (between the two windows; none leading/trailing).
+  expect(script.match(/^sleep 0\.5$/gm) ?? []).toHaveLength(1);
+  expect(script).toContain("# summary: snapshot-current sessions=1 windows=2");
+});
+
+test("renderSnapshotScript --session filter narrows to one bucket", () => {
+  const candidates = [
+    fakeCandidate({
+      job_id: "a",
+      resume_target: "a-name",
+      label: "a-name",
+      backend_exec_session_id: "foreground",
+    }),
+    fakeCandidate({
+      job_id: "b",
+      resume_target: "b-name",
+      label: "b-name",
+      backend_exec_session_id: "other",
+    }),
+  ];
+  const script = renderSnapshotScript(
+    candidates,
+    "other",
+    "/bin/zsh",
+    "/tmp/keeper.db",
+  );
+  expect(script).toContain('claude --resume "b-name"');
+  expect(script).not.toContain('claude --resume "a-name"');
+  expect(script).toContain("# summary: snapshot-current sessions=1 windows=1");
+});
+
+// ---------------------------------------------------------------------------
+// buildResumeLaunchArgv — latest-name resume key, shell wrap, no --plugin-dir
+// ---------------------------------------------------------------------------
+
+test("buildResumeLaunchArgv wraps the resume command in a login shell prologue", () => {
   const argv = buildResumeLaunchArgv(
     "/bin/zsh",
     fakeCandidate({
@@ -401,7 +472,7 @@ test("renderOutcomes omits the idle note when zero excluded", () => {
 // loadRestoreSet — read-only deriveRestoreSet over a seeded DB (daemon-down)
 // ---------------------------------------------------------------------------
 
-test("loadRestoreSet derives a crash-killed session into a UUID-keyed candidate (no socket)", () => {
+test("loadRestoreSet derives a crash-killed session into a latest-name candidate (no socket)", () => {
   // Persist the seeded rows so the fresh read-only open in loadRestoreSet sees
   // them, then close our writer handle.
   seedJob(kdb.db, {
@@ -416,15 +487,16 @@ test("loadRestoreSet derives a crash-killed session into a UUID-keyed candidate 
 
   const { candidates } = loadRestoreSet(dbPath);
   expect(candidates).toHaveLength(1);
-  // The resume target is the stable job_id UUID — a renamed session resumes by
-  // UUID, never by the (renamed) title. The label still shows the latest title.
-  expect(candidates[0].resume_target).toBe("uuid-1111");
+  // The resume target is the LATEST name (the current title) — a renamed session
+  // resumes to the name keeper currently knows, read live from the DB. The label
+  // shows the same name.
+  expect(candidates[0].resume_target).toBe("my-renamed-session");
   expect(candidates[0].label).toBe("my-renamed-session");
   expect(candidates[0].cwd).toBe("/repo");
 
-  // And the rendered command targets the UUID end-to-end.
+  // And the rendered command targets the latest name end-to-end.
   const out = renderOutcomes(planRestore(candidates, null), false, 0);
-  expect(out).toContain(`claude --resume "uuid-1111"`);
+  expect(out).toContain(`claude --resume "my-renamed-session"`);
   expect(out).toContain("would restore my-renamed-session");
 });
 

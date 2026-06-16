@@ -36,23 +36,23 @@ function fixtureTask(overrides: Partial<Task>): Task {
   return overrides as Task;
 }
 
-test("resumeTarget returns the job_id UUID, ignoring a present title (fn-817)", () => {
-  // fn-817: resume by the stable UUID, never the mutable title — that is what
-  // makes a renamed session restore correctly (the title is a display label
-  // only). A job carrying a title still resumes by its job_id.
+test("resumeTarget returns the latest session name, preferring the title over the job_id", () => {
+  // Resume by the latest name keeper knows: `title` tracks name_history's newest
+  // entry, resolved live from the jobs projection at resume time (never a frozen
+  // name), so `claude --resume "<name>"` re-attaches to the right session.
   const job = fixtureJob({ job_id: "sess-123", title: "fn-677.1 worker" });
-  expect(resumeTarget(job)).toBe("sess-123");
+  expect(resumeTarget(job)).toBe("fn-677.1 worker");
 });
 
-test("resumeTarget returns the job_id UUID when title is null", () => {
+test("resumeTarget falls back to the job_id when the job has no name", () => {
   const job = fixtureJob({ job_id: "sess-123", title: null });
   expect(resumeTarget(job)).toBe("sess-123");
 });
 
-test("resumeTarget coerces a null/empty job_id to the empty string", () => {
-  // The producer invariant says job_id is always present; a degenerate
-  // null/empty coerces to "" (never NaN/undefined leaking into the command).
-  expect(resumeTarget(fixtureJob({ job_id: "", title: "x" }))).toBe("");
+test("resumeTarget coerces a fully-degenerate (no name, no id) job to the empty string", () => {
+  // The producer invariant says job_id is always present; a degenerate row with
+  // neither name nor id coerces to "" (never NaN/undefined leaking into argv).
+  expect(resumeTarget(fixtureJob({ job_id: "", title: null }))).toBe("");
 });
 
 test("buildResumeCommand emits cd + claude --resume with a quoted target", () => {
