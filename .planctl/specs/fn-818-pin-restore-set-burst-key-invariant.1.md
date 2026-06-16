@@ -23,5 +23,5 @@ specific gap.
 - [ ] `bun run test:full` is green.
 
 ## Done summary
-
+Added a reducer-level guard test pinning the restore-set burst-key invariant: a killed row's last_event_id (the burst-cluster sort key) is frozen at the Killed event's rowid and an unrelated post-kill Stop does not re-stamp it. The test fails if the Stop arm's terminal guard is dropped.
 ## Evidence
