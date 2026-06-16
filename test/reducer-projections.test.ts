@@ -3923,6 +3923,44 @@ test("v59 monitor fact: Killed (terminal) forces has_live_worker_monitor=false e
   expect(getEmbeddedMonitorFact("fn-1-foo.7", TEST_UUID)).toBe(false);
 });
 
+test("fn-818 restore-set burst key invariant: a killed row's last_event_id (the burst-cluster sort key) is NOT moved by a subsequent unrelated fold targeting that row", () => {
+  // restore-set.ts keys the crash-burst contiguous-cluster signature on
+  // `jobs.last_event_id`, declared as "the Killed event's rowid" — but the
+  // column is the GENERIC "last fold that touched this row" value. The burst
+  // signature stays correct only because the reducer's terminal guard makes any
+  // post-kill fold a no-op (so the column freezes at the Killed event's rowid).
+  // That invariant is load-bearing for unknown/legacy-NULL `close_kind` rows
+  // (whose only restore signal is burst membership) but is asserted nowhere.
+  // This pins it: kill a row, then feed an unrelated Stop (the most common
+  // per-event hook) targeting the same session, and assert `last_event_id` is
+  // unchanged — the burst-cluster position does not move. The test FAILS if a
+  // future late-stamping fold drops the `state NOT IN ('ended','killed')`
+  // terminal guard and re-stamps the column.
+  insertEvent({
+    hook_event: "SessionStart",
+    pid: 7373,
+    start_time: "stamp-burst",
+  });
+  drainAll();
+  const killId = killedEvent(7373, "stamp-burst");
+  drainAll();
+  const killed = getJob();
+  expect(killed?.state).toBe("killed");
+  // The burst key == the Killed event's rowid.
+  expect(killed?.last_event_id).toBe(killId);
+
+  // An unrelated Stop targeting the same session: a real per-event hook that
+  // would re-stamp `last_event_id` on a live row, but must no-op on a killed
+  // one (the terminal guard).
+  const stopId = insertEvent({ hook_event: "Stop" });
+  drainAll();
+  const after = getJob();
+  // Still killed, and the burst key did NOT advance to the Stop's rowid.
+  expect(after?.state).toBe("killed");
+  expect(after?.last_event_id).toBe(killId);
+  expect(after?.last_event_id).not.toBe(stopId);
+});
+
 test("v59 monitor fact: clobber guard — a later syncJobIntoEpic re-sync PRESERVES has_live_worker_monitor", () => {
   // The headline-risk test (mirrors the fn-670 T2 clobber-guard test). Stamp
   // the fact via the Stop fold, then drive a jobs-row re-sync via
