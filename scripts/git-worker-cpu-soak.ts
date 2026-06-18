@@ -343,7 +343,15 @@ interface GitChurn {
 
 // ── faithful hook-feed write storm ────────────────────────────────────────
 
-const HOOK = join(import.meta.dir, "..", "plugin", "hooks", "events-writer.ts");
+const HOOK = join(
+  import.meta.dir,
+  "..",
+  "plugins",
+  "keeper",
+  "plugin",
+  "hooks",
+  "events-writer.ts",
+);
 
 /**
  * Build a faithful PostToolUse payload for `cwd`. PostToolUse is the highest-

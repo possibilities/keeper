@@ -366,14 +366,18 @@ Keeper has no `install` verb. Wire it up manually:
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
    `exec_backend: tmux`). Unknown config keys are silently ignored.
 
-4. **Load the keeper plugin via the arthack launcher** (`--plugin-dir`). The
-   repo root carries `.claude-plugin/plugin.json` (canonical manifest) and
-   `hooks/hooks.json` (events-writer command paths). The arthack launcher
-   appends `--plugin-dir ~/code/keeper` for every profile, so a fresh
-   session auto-loads the hook (and any future `skills/`) from this repo.
-   No symlink step. A `~/.claude/plugins/keeper` symlink double-registers the
-   hook (every invocation writes two `events` rows, with no runtime dedup
-   guard) — there must be none.
+4. **Load the plugins via the arthack launcher's `plugin_scan_dirs`.** Both
+   Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
+   events-writer hook + `keeper:await` skill, manifest at
+   `plugins/keeper/.claude-plugin/plugin.json`, command paths in
+   `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (planctl + the
+   `plan:*` skills, vendored as a `git subtree`). claudewrap's
+   `plugin_scan_dirs` points at `~/code/keeper/plugins`, scans the parent, and
+   appends one `--plugin-dir` per manifest-bearing child — so a fresh session
+   auto-loads BOTH plugins from this repo. No symlink step. A
+   `~/.claude/plugins/keeper` symlink double-registers the hook (every
+   invocation writes two `events` rows, with no runtime dedup guard) — there
+   must be none.
 
 5. **Symlink the LaunchAgent template** into `~/Library/LaunchAgents/`:
 
@@ -1212,8 +1216,9 @@ rm ~/Library/LaunchAgents/arthack.keeperd.plist
 launchctl bootout gui/$(id -u)/arthack.keeperd.logrotate
 rm ~/Library/LaunchAgents/arthack.keeperd.logrotate.plist
 # The sitter scanners now live in ~/code/sitter; uninstall them per that repo's README.
-# Stop loading the plugin: remove `--plugin-dir ~/code/keeper` from
-# whatever entrypoint launches `claude` (e.g. the arthack launcher).
+# Stop loading the plugins: remove the `plugin_scan_dirs` entry pointing at
+# `~/code/keeper/plugins` from whatever entrypoint launches `claude` (e.g. the
+# arthack launcher). This unloads both the keeper and plan plugins.
 # Optional — drops all captured state, including the events log:
 rm -rf ~/.local/state/keeper
 ```

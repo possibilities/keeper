@@ -7441,7 +7441,7 @@ export interface DrainOptions {
   paceEvents?: number;
   /**
    * OS-level sleep primitive. Defaulted to a `SharedArrayBuffer`/`Atomics.wait`
-   * sleep (the same shape `plugin/hooks/events-writer.ts` uses for its bounded
+   * sleep (the same shape `plugins/keeper/plugin/hooks/events-writer.ts` uses for its bounded
    * retry) — a real sleep that releases the SQLite writer lock to a separate
    * process. Test-only injection point: a mock sleep can record call counts
    * and durations without paying the actual wall-clock cost. Production
@@ -7453,7 +7453,7 @@ export interface DrainOptions {
 /**
  * Default OS-level synchronous sleep: blocks the JS thread for up to `ms`
  * milliseconds via `Atomics.wait` on a fresh zero-initialized
- * `SharedArrayBuffer`. Same shape `plugin/hooks/events-writer.ts` uses; the
+ * `SharedArrayBuffer`. Same shape `plugins/keeper/plugin/hooks/events-writer.ts` uses; the
  * wait always returns `"timed-out"` because nothing holds a handle to the
  * buffer to notify. A real OS sleep is the only primitive that releases the
  * SQLite writer lock to a separate process — `setImmediate` does NOT.

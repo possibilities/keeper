@@ -72,7 +72,7 @@ import { readFileSync } from "node:fs";
 import {
   parseLinuxStarttime,
   splitArgsLstart,
-} from "../plugin/hooks/events-writer";
+} from "../plugins/keeper/plugin/hooks/events-writer";
 import { classifyCloseKind } from "./exec-backend";
 import { isPidAlive } from "./server-worker";
 

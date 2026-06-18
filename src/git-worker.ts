@@ -808,10 +808,24 @@ const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
  * - `.planctl/epics/<id>.json` (3-segment)
  * - `.planctl/tasks/<id>.json` (3-segment)
  * - `.planctl/state/tasks/<id>.state.json` (4-segment)
+ *
+ * Rejects the vendored planctl subtree's own dev plan (`plugins/plan/.planctl`)
+ * at the source so a keeper commit touching it (notably the subtree-add commit's
+ * 322 files) is never forwarded to the plan-worker — mirrors that worker's own
+ * `isVendoredPlanctlPath` correctness backstop.
  */
 export function isPlanctlChangedPath(path: string): boolean {
   if (!path.endsWith(".json")) return false;
   const segments = path.split("/");
+  for (let i = 0; i + 2 < segments.length; i++) {
+    if (
+      segments[i] === "plugins" &&
+      segments[i + 1] === "plan" &&
+      segments[i + 2] === ".planctl"
+    ) {
+      return false;
+    }
+  }
   const n = segments.length;
   // 3-segment tail: `.planctl/<epics|tasks>/<file>.json`.
   if (n >= 3 && segments[n - 3] === ".planctl") {

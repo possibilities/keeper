@@ -10,10 +10,22 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
 ## Repo facts
 
 - **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate.
-- **The repo root is the Claude plugin** (`claude --plugin-dir ~/code/keeper`). The
-  HOOK plugin has exactly ONE manifest (`./.claude-plugin/plugin.json`) and ONE
-  `./hooks/hooks.json` — never duplicate either, and never add a
-  `~/.claude/plugins/keeper` symlink (it double-registers the hook).
+- **Two Claude plugins live as peers under `plugins/`** — `plugins/keeper/` (the
+  events-writer HOOK plugin + `keeper:await` skill) and `plugins/plan/` (planctl,
+  vendored via `git subtree --prefix=plugins/plan`, carrying the `plan:*` skills).
+  claudewrap loads both from one `plugin_scan_dirs` entry pointing at `plugins/`.
+  Each plugin has exactly ONE manifest at its own `<plugin>/.claude-plugin/plugin.json`
+  and the keeper plugin exactly ONE `plugins/keeper/hooks/hooks.json` — never
+  duplicate either, never add a `~/.claude/plugins/keeper` symlink (it
+  double-registers the hook). The daemon, `cli/`, `src/`, and the compiled `keeper`
+  binary STAY at the repo root; only the plugin surfaces live under `plugins/`.
+- **`plugins/plan/` is a `git subtree` — never `--squash`, never rebase its merge
+  commit, never GitHub "Squash and merge" a subtree PR.** Any of those breaks the
+  `git-subtree-split:` trailer and kills `git subtree split --prefix=plugins/plan`
+  extractability forever (a one-way door). Its nested `plugins/plan/.planctl/` is
+  planctl's OWN dev plan and is pruned from keeper's plan-worker fold
+  (`isVendoredPlanctlPath` in `src/plan-worker.ts`); keeper folds only the root
+  `.planctl/`.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `promptctl render code-comment-style`.

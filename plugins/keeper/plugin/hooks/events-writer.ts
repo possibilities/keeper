@@ -29,11 +29,11 @@ import type {
   DeadLetterBindings,
   DeadLetterRecord,
   EventLogRecord,
-} from "../../src/dead-letter";
+} from "../../../../src/dead-letter";
 import {
   serializeDeadLetterRecord,
   serializeEventLogRecord,
-} from "../../src/dead-letter";
+} from "../../../../src/dead-letter";
 import {
   extractBackgroundTaskId,
   extractBashMutation,
@@ -41,8 +41,8 @@ import {
   extractSkillName,
   extractToolUseId,
   slashCommandFromPrompt,
-} from "../../src/derivers";
-import { execBackendEnvMeta } from "../../src/exec-backend";
+} from "../../../../src/derivers";
+import { execBackendEnvMeta } from "../../../../src/exec-backend";
 
 /**
  * Hook event names that get renamed when stored as `event_type`. Everything

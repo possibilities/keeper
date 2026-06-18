@@ -5,7 +5,7 @@
  *
  * The hook writes per-pid NDJSON files to `~/.local/state/keeper/dead-letters/`
  * when its `events` INSERT exhausts its retry budget (see fn-643 task .2 in
- * `plugin/hooks/events-writer.ts`). This worker makes those files visible as
+ * `plugins/keeper/plugin/hooks/events-writer.ts`). This worker makes those files visible as
  * `waiting` rows in the schema-v37 `dead_letters` operational table: it watches
  * the dir with `@parcel/watcher` and posts a contentless
  * `{kind: "dead-letter-changed"}` message to main whenever the tree changes.

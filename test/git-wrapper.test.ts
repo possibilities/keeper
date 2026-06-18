@@ -4,7 +4,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { initRepo } from "./helpers/git-repo";
 
-const WRAPPER = join(import.meta.dir, "..", "plugin", "bin", "git");
+const WRAPPER = join(
+  import.meta.dir,
+  "..",
+  "plugins",
+  "keeper",
+  "plugin",
+  "bin",
+  "git",
+);
 const REAL_GIT = "/usr/bin/git";
 const TEST_SESSION_ID = "test-session-uuid-aaaaaaaa-bbbb";
 

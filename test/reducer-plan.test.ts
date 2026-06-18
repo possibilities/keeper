@@ -101,7 +101,7 @@ function insertEvent(
     // event whose envelope carried `queue_jump: true` (stamped 1) or any
     // other planctl event (stamped 0). The test helper defaults to NULL so
     // every non-planctl event lands NULL — matches the live hook's stamping
-    // contract (see `plugin/hooks/events-writer.ts`).
+    // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
     planctl_queue_jump: overrides.planctl_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
     // whose payload didn't match a mutation pattern; defaults to NULL here

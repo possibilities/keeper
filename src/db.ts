@@ -311,9 +311,10 @@ export function resolveUsageRoot(): string {
 
 /**
  * `KEEPER_DEAD_LETTER_DIR` env wins; else `~/.local/state/keeper/dead-letters`.
- * MUST match `resolveDeadLetterDir` in `plugin/hooks/events-writer.ts`
- * byte-for-byte (hook writes the NDJSON, daemon reads it) — the hook keeps its
- * own copy because it cannot import `bun:sqlite`.
+ * MUST match `resolveDeadLetterDir` in
+ * `plugins/keeper/plugin/hooks/events-writer.ts` byte-for-byte (hook writes the
+ * NDJSON, daemon reads it) — the hook keeps its own copy because it cannot
+ * import `bun:sqlite`.
  */
 export function resolveDeadLetterDir(): string {
   const override = process.env.KEEPER_DEAD_LETTER_DIR;
@@ -327,8 +328,8 @@ export function resolveDeadLetterDir(): string {
  * `KEEPER_EVENTS_LOG` env wins; else `~/.local/state/keeper/events-log`. The
  * hook appends a per-pid `<pid>.ndjson` line here; the daemon's ingester tails
  * the files into `events` rows. MUST match `resolveEventsLogDir` in
- * `plugin/hooks/events-writer.ts` byte-for-byte (the hook cannot import
- * `bun:sqlite`).
+ * `plugins/keeper/plugin/hooks/events-writer.ts` byte-for-byte (the hook cannot
+ * import `bun:sqlite`).
  */
 export function resolveEventsLogDir(): string {
   const override = process.env.KEEPER_EVENTS_LOG;

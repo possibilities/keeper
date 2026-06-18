@@ -6,7 +6,7 @@
  * The trick: every `jobs` / `epics` projection row carries `updated_at`, which
  * the reducer sets to `event.ts` (see `src/reducer.ts:671`). For a `jobs` row
  * that `ts` is the hook's own `Date.now()` at invocation
- * (`plugin/hooks/events-writer.ts:590`) — i.e. the wall-clock instant reality
+ * (`plugins/keeper/plugin/hooks/events-writer.ts:590`) — i.e. the wall-clock instant reality
  * changed. We subscribe to a collection exactly the way the TUIs do (via
  * `subscribeCollection`, so we traverse the identical pipeline: wake-worker
  * poll → fold → server-worker poll → patch-nudge → refetch → result), and the

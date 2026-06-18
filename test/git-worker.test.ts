@@ -1813,6 +1813,21 @@ test("isPlanctlChangedPath: epics/tasks json + state-tasks state.json accepted, 
   expect(isPlanctlChangedPath(".planctl/state/tasks/fn-1-x.json")).toBe(false);
   expect(isPlanctlChangedPath(".planctl/epics/sub/fn-1-x.json")).toBe(false);
   expect(isPlanctlChangedPath("src/a.ts")).toBe(false);
+
+  // Reject the vendored planctl subtree's own dev plan (fn-822): keeper
+  // co-hosts planctl under `plugins/plan/`, whose `.planctl` tree is the
+  // dependency's plan, not keeper's. A keeper commit touching it (notably the
+  // subtree-add) must NOT be forwarded to the plan-worker.
+  expect(isPlanctlChangedPath("plugins/plan/.planctl/epics/fn-1-x.json")).toBe(
+    false,
+  );
+  expect(
+    isPlanctlChangedPath(
+      "plugins/plan/.planctl/state/tasks/fn-1-x.2.state.json",
+    ),
+  ).toBe(false);
+  // keeper's OWN root plan is still accepted.
+  expect(isPlanctlChangedPath(".planctl/epics/fn-822.json")).toBe(true);
 });
 
 test("filterPlanctlChanges: tags add/update vs delete by blob_oid null sentinel", () => {

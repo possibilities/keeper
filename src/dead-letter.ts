@@ -7,7 +7,8 @@
  * `CREATE_DEAD_LETTERS` in `src/db.ts`).
  *
  * INVARIANT: this module's import graph is `local-only` — NO third-party
- * deps, NO `bun:sqlite`. The hook (`plugin/hooks/events-writer.ts`) imports
+ * deps, NO `bun:sqlite`. The hook
+ * (`plugins/keeper/plugin/hooks/events-writer.ts`) imports
  * it on a hot path (Bun cold start is ~30ms and the SessionEnd hook has a
  * 1.5s timeout budget; see the "No third-party deps in the hook" rule in
  * CLAUDE.md). The daemon imports it from `src/db.ts` consumers but the

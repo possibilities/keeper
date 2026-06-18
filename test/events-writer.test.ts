@@ -48,7 +48,7 @@ import {
   nameFromArgs,
   parseLinuxStarttime,
   splitArgsLstart,
-} from "../plugin/hooks/events-writer";
+} from "../plugins/keeper/plugin/hooks/events-writer";
 import { openDb } from "../src/db";
 import {
   type DeadLetterBindings,
@@ -65,7 +65,14 @@ import {
 import { sandboxEnv } from "./helpers/sandbox-env";
 
 const ROOT = join(import.meta.dir, "..");
-const HOOK_ENTRY = join(ROOT, "plugin", "hooks", "events-writer.ts");
+const HOOK_ENTRY = join(
+  ROOT,
+  "plugins",
+  "keeper",
+  "plugin",
+  "hooks",
+  "events-writer.ts",
+);
 
 let tmpDir: string;
 let dbPath: string;
@@ -1563,7 +1570,7 @@ test("fn-672 LOCKSTEP: KNOWN_EVENT_COLUMNS == events table columns == insertBind
   // prefix from each key, and compare. A new column added to KNOWN that
   // forgets the bindings entry (or vice-versa) lights up here.
   const writerSrc = readFileSync(
-    join(ROOT, "plugin", "hooks", "events-writer.ts"),
+    join(ROOT, "plugins", "keeper", "plugin", "hooks", "events-writer.ts"),
     "utf8",
   );
   const literalMatch = writerSrc.match(

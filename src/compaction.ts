@@ -16,7 +16,7 @@
  *
  * The hook is the SOLE writer of hook events, opens `{ migrate: false }`,
  * writes each event as a SINGLE `INSERT INTO events`, must always exit 0, and
- * dead-letters on failure (`plugin/hooks/events-writer.ts`). So `data` CANNOT
+ * dead-letters on failure (`plugins/keeper/plugin/hooks/events-writer.ts`). So `data` CANNOT
  * be split off at write time — a second INSERT into the side table would break
  * the single-statement, always-exit-0 contract. New events therefore keep
  * writing `data` inline; this pass relocates cold blobs AFTER the fact.

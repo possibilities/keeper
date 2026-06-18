@@ -374,8 +374,44 @@ const IGNORE_GLOBS = [
   "**/.cache/**",
   "**/target/**",
   "**/.venv/**",
+  // keeper vendors planctl as a `git subtree` under `plugins/plan/`, which
+  // carries planctl's OWN `.planctl/` dev plan. That nested tree is the
+  // vendored dependency's plan, NOT keeper-managed work — fold it and every
+  // planctl-dev epic pollutes keeper's `epics` projection. Excluded here so the
+  // live watcher never delivers it; {@link isVendoredPlanctlDir} is the
+  // boot-scan equivalent.
+  "**/plugins/plan/.planctl/**",
   "**/*.tmp",
 ];
+
+/**
+ * Is this `.planctl` dir the vendored planctl subtree's own dev plan? keeper
+ * co-hosts planctl via `git subtree add --prefix=plugins/plan`, so the subtree
+ * brings planctl's `.planctl/` tree to `<repo>/plugins/plan/.planctl`. That is
+ * the dependency's plan, not keeper's — folding it would inject every
+ * planctl-dev epic into keeper's `epics` projection. Every ingest vector funnels
+ * through here: the recursive boot {@link scanRoot}, the live FSEvents watcher,
+ * and the authoritative `planctl-commit-changed` commit trigger (the subtree-add
+ * commit itself touches 322 such paths). The one-level {@link discoverPlanctlDirs}
+ * heartbeat path never reaches three levels deep, so it needs no guard. The
+ * `**​/plugins/plan/.planctl/**` entry in {@link IGNORE_GLOBS} stops the live
+ * watcher from even delivering these paths; this predicate is the correctness
+ * gate for the other two vectors. Pure path arithmetic — matches any path that
+ * contains a `plugins/plan/.planctl` segment run. Exported for unit reach.
+ */
+export function isVendoredPlanctlPath(path: string): boolean {
+  const segments = path.split(sep);
+  for (let i = 0; i + 2 < segments.length; i++) {
+    if (
+      segments[i] === "plugins" &&
+      segments[i + 1] === "plan" &&
+      segments[i + 2] === ".planctl"
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
 
 /**
  * Directory basenames the boot scan prunes — the recursive-walk equivalent of
@@ -1099,6 +1135,12 @@ export class PlanScanner {
    * does not retract the task.
    */
   onDelete(path: string): void {
+    // The vendored planctl subtree's dev plan is never folded (see onChange),
+    // so a delete under `plugins/plan/.planctl` has no projection row to
+    // tombstone — skip before any cache/re-emit work.
+    if (isVendoredPlanctlPath(path)) {
+      return;
+    }
     const kind = classifyPlanPath(path);
     if (kind === "task-state") {
       // Sidecar delete: drop the runtime-status cache entry (reverts the task
@@ -1274,6 +1316,14 @@ export class PlanScanner {
   onChange(path: string, triggeredByCommit = false): boolean {
     const kind = classifyPlanPath(path);
     if (kind === null) {
+      return false;
+    }
+    // The vendored planctl subtree's own dev plan is out of scope — the
+    // `planctl-commit-changed` trigger (notably the subtree-add commit) and the
+    // boot scan both reach `plugins/plan/.planctl` paths that classify as real
+    // plan files; folding them would inject planctl-dev epics into keeper's
+    // projection.
+    if (isVendoredPlanctlPath(path)) {
       return false;
     }
 
@@ -2116,7 +2166,11 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
       }
       const full = join(dir, entry.name);
       if (entry.name === ".planctl") {
-        scanPlanctlDir(full, scanner);
+        // Skip the vendored planctl subtree's own dev plan
+        // (`plugins/plan/.planctl`) — it is the dependency's plan, not keeper's.
+        if (!isVendoredPlanctlPath(full)) {
+          scanPlanctlDir(full, scanner);
+        }
         continue; // a `.planctl` tree has no nested `.planctl` to find
       }
       stack.push(full);

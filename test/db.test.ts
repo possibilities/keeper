@@ -262,7 +262,7 @@ test("migrate: false skips schema convergence but still applies PRAGMAs + prepar
   // Phase 2 — hook-style reopen against the now-migrated DB with migrate
   // skipped. PRAGMAs are connection-local so they MUST still run; the
   // prepared `insertEvent` statement MUST still build against the live
-  // schema. This is the contract `plugin/hooks/events-writer.ts` relies on.
+  // schema. This is the contract `plugins/keeper/plugin/hooks/events-writer.ts` relies on.
   const hookOpen = openDb(dbPath, { migrate: false });
 
   const busy = hookOpen.db.prepare("PRAGMA busy_timeout").get() as {
