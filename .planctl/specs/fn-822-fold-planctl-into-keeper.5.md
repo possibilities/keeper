@@ -29,5 +29,5 @@ Soak in a scratch repo in its OWN fresh git repo (auto-commits need it). `claim`
 - [ ] go / no-go recorded in the epic Evidence; if go, note the standalone `planctl` remote may now be archived (deferred, optional)
 
 ## Done summary
-
+GO. Sign-off soak passed against the relocated plugins/plan/ build (built+promoted from new location, HEAD ed9c596a). Full cycle init->scaffold->claim->done->close-preflight->audit->verdict->close-finalize all exit 0, outcome=closed_clean; no Uncaught/error:/Traceback in any soak stderr. Warmed p95 122ms vs .1 baseline 152ms (2x trigger=304ms) — no regression, faster. Regression checks PASS: commit-guard fails open for keeper commit-work + git-add-paths escape hatch (no work-marker => allow, status quo); events-writer appends per-pid NDJSON row for same Bash event while commit-guard co-fires, both exit 0, row not suppressed; resolveEventsLogDir byte-synced (src/db.ts:334 == hook:406). Subtree split --prefix=plugins/plan reconstructs 409-commit pushable branch, merge commit e6c8f01e anchors git-subtree-dir trailer (no --squash damage). Standalone planctl remote may now be archived (deferred, optional).
 ## Evidence
