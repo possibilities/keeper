@@ -42,5 +42,5 @@ Drafted rewrites (starting points):
 - [ ] arthack repo committed via `keeper commit-work` (run from /Users/mike/code/arthack).
 
 ## Done summary
-
+Trimmed all 5 arthack skill descriptions to routing keys: panel (1042 to 482 chars, mechanism/model-specifics dropped, non-tiny gate kept), gmail (synonym pile collapsed), design-taste (credential tail dropped). tmux and mrtasty already on-principle, left intact.
 ## Evidence
