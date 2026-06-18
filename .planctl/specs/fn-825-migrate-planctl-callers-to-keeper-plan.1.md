@@ -30,5 +30,5 @@ After render, `rg -n '\bplanctl ' plugins/plan/{skills,agents,template}` returns
 - [ ] a real worker spawn claims+dones a task under the new permissions
 
 ## Done summary
-
+Repointed all planctl command callers to keeper plan across plan-plugin templates + hand-authored skills/agents, flipped allowed-tools to Bash(keeper plan:*), and re-rendered managed outputs. Zero command callers remain; keeper plan claim/done verified routing.
 ## Evidence
