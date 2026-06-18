@@ -47,5 +47,5 @@ Run BOTH suites + the arthack cli-boundary lint to prove no new cross-imports. `
 - [ ] keeper CLAUDE.md / README + planctl CLAUDE.md / README updated forward-facing for the new layout
 
 ## Done summary
-
+Folded planctl into keeper as a peer plugin: git subtree at plugins/plan/ (full 409-commit history, split-extractable) and relocated keeper's own plugin surface to plugins/keeper/ with re-depthed events-writer imports. Pruned the vendored plugins/plan/.planctl subtree from the plan-worker fold so planctl-dev epics never pollute keeper's projection, and scoped keeper's test/lint to exclude the subtree. test:full green, typecheck clean, hook loads+exits 0 from the new path.
 ## Evidence

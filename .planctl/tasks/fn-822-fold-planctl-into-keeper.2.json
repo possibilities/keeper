@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "git-subtree planctl + relocate keeper plugin to plugins/",
-  "updated_at": "2026-06-18T00:26:55.361000Z"
+  "updated_at": "2026-06-18T00:54:03.833000Z",
+  "worker_done_at": "2026-06-18T00:54:03.833000Z"
 }
