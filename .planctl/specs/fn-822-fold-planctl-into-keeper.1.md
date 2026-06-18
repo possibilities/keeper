@@ -42,5 +42,5 @@ Add `"plan"` as a keeper subcommand that execs the compiled `~/.local/bin/planct
 - [ ] fully reversible: no source moved, revert = delete `cli/plan.ts` + the 3 one-line dispatch edits
 
 ## Done summary
-
+Added 'keeper plan <verb>' exec-shim (cli/plan.ts) execing the compiled planctl with full stdin/stdout/stderr passthrough, 128+signal mapping, and exit-127 on missing binary; wired plan into the dispatcher + both keeper-cli test sites; conformance test (test/plan-shim.test.ts) asserts byte-identical output to planctl detect including the planctl_invocation trailer. Fully reversible.
 ## Evidence
