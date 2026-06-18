@@ -1,25 +1,23 @@
 /**
- * Conformance tests for the `keeper plan` exec shim (`cli/plan.ts`). Proves the
- * shim is byte-compatible with a direct `planctl <verb>` invocation: argv
- * forwarded verbatim (the `plan` token already stripped by the dispatcher),
- * stdin piped through, exit code propagated, and the trailing
+ * Conformance tests for the `keeper plan` in-process alias (`cli/plan.ts`).
+ * Proves `keeper plan <verb>` is byte-compatible with a direct `planctl <verb>`
+ * invocation now that the plan verb dispatcher runs IN-PROCESS (no child spawn):
+ * argv forwarded verbatim (the `plan` token already stripped by the dispatcher),
+ * stdin read off the inherited fd 0, exit code propagated, and the trailing
  * `planctl_invocation` NDJSON trailer surviving byte-intact.
  *
- * Two spawn strategies, by design:
- *   - Against the REAL compiled planctl (`detect`, a read-only verb) we assert
- *     byte-identical stdout/stderr/exit between `keeper plan detect` and
- *     `planctl detect` — the end-to-end golden conformance.
- *   - Against a STUB `planctl` placed first on PATH we assert argv + stdin
- *     forwarding deterministically, with no real state touched and full control
- *     over exit codes. The shim resolves the binary via `Bun.which("planctl")`,
- *     which honours the spawn env's PATH, so the stub wins.
+ * The golden conformance drives the REAL compiled `planctl` binary and asserts
+ * byte-identical stdout/stderr/exit between `keeper plan <verb>` and
+ * `planctl <verb>` end to end — covering read-only verbs, the help/usage
+ * surfaces, exit-code propagation, and (in a fresh scratch repo) stdin
+ * forwarding through a stdin-reading verb.
  *
- * This file is fast-tier-ignored (it spawns the keeper CLI); it runs only under
- * `bun run test:full`.
+ * This file is fast-tier-ignored (it spawns the keeper CLI + the planctl
+ * binary); it runs only under `bun run test:full`.
  */
 
 import { afterAll, describe, expect, test } from "bun:test";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -33,7 +31,9 @@ function spawn(
   const r = Bun.spawnSync({
     cmd,
     cwd: opts.cwd ?? process.cwd(),
-    env: { PATH: process.env.PATH ?? "/usr/bin:/bin", ...(opts.env ?? {}) },
+    // Inherit the real env (HOME, PATH, …) so the planctl binary resolves its
+    // config/roots and git finds its identity; per-call overrides win.
+    env: { ...process.env, ...(opts.env ?? {}) },
     stdout: "pipe",
     stderr: "pipe",
     ...(opts.stdin != null ? { stdin: Buffer.from(opts.stdin) } : {}),
@@ -45,7 +45,8 @@ function spawn(
   };
 }
 
-/** Run the keeper CLI under bun, forwarding the given argv. */
+/** Run the keeper CLI under bun, forwarding the given argv (the `plan`
+ * subcommand routes through the in-process dispatcher). */
 function keeper(
   argv: string[],
   opts: { cwd?: string; env?: Record<string, string>; stdin?: string } = {},
@@ -65,19 +66,6 @@ afterAll(() => {
   }
 });
 
-/**
- * Write an executable stub named `planctl` into a fresh tmp dir and return the
- * dir path (to prepend to PATH). The stub body is a bash script.
- */
-function stubBin(body: string): string {
-  const dir = mkdtempSync(join(tmpdir(), "keeper-plan-shim-"));
-  tmps.push(dir);
-  const p = join(dir, "planctl");
-  writeFileSync(p, `#!/bin/bash\n${body}\n`);
-  chmodSync(p, 0o755);
-  return dir;
-}
-
 describe("keeper plan — byte-identical to direct planctl (real binary)", () => {
   test("`keeper plan detect` matches `planctl detect` (stdout/stderr/exit + trailer)", () => {
     const direct = spawn(["planctl", "detect"]);
@@ -86,7 +74,7 @@ describe("keeper plan — byte-identical to direct planctl (real binary)", () =>
     expect(shimmed.stdout).toBe(direct.stdout);
     expect(shimmed.stderr).toBe(direct.stderr);
     // The planctl_invocation NDJSON trailer is the last stdout line — assert it
-    // survived byte-intact through the inherited-stdout shim.
+    // survived byte-intact through the in-process dispatch.
     const lastLine = shimmed.stdout.trimEnd().split("\n").at(-1) ?? "";
     expect(lastLine).toContain('"planctl_invocation"');
     const parsed = JSON.parse(lastLine);
@@ -100,74 +88,152 @@ describe("keeper plan — byte-identical to direct planctl (real binary)", () =>
     expect(shimmed.stdout).toBe(direct.stdout);
     expect(shimmed.stderr).toBe(direct.stderr);
   });
-});
 
-describe("keeper plan — argv forwarding (stub binary)", () => {
-  test("`plan` token is stripped; residual argv forwarded verbatim", () => {
-    // Stub echoes its own argv, one per line, so we can assert exactly what
-    // planctl received.
-    const dir = stubBin('for a in "$@"; do echo "$a"; done');
-    const r = keeper(["plan", "claim", "fn-1-x.2", "--format", "json"], {
-      env: { PATH: `${dir}:${process.env.PATH ?? "/usr/bin:/bin"}` },
-    });
-    expect(r.code).toBe(0);
-    // No leading "plan" token — the dispatcher stripped it before the handler.
-    expect(r.stdout).toBe("claim\nfn-1-x.2\n--format\njson\n");
+  test("`keeper plan --help` matches `planctl --help` byte-for-byte (exit 0)", () => {
+    const direct = spawn(["planctl", "--help"]);
+    const shimmed = keeper(["plan", "--help"]);
+    expect(shimmed.code).toBe(0);
+    expect(direct.code).toBe(0);
+    expect(shimmed.stdout).toBe(direct.stdout);
+    expect(shimmed.stderr).toBe(direct.stderr);
   });
 
-  test("empty residual argv forwards nothing", () => {
-    const dir = stubBin('echo "argc=$#"');
-    const r = keeper(["plan"], {
-      env: { PATH: `${dir}:${process.env.PATH ?? "/usr/bin:/bin"}` },
-    });
-    expect(r.code).toBe(0);
-    expect(r.stdout).toBe("argc=0\n");
+  test("bare `keeper plan` matches bare `planctl` (top-level help)", () => {
+    const direct = spawn(["planctl"]);
+    const shimmed = keeper(["plan"]);
+    expect(shimmed.code).toBe(direct.code);
+    expect(shimmed.stdout).toBe(direct.stdout);
+    expect(shimmed.stderr).toBe(direct.stderr);
   });
 });
 
-describe("keeper plan — stdin forwarding (stub binary)", () => {
-  test("piped stdin is forwarded to the child verbatim", () => {
-    const dir = stubBin("cat");
-    const payload = '{"some":"piped","json":[1,2,3]}\n';
-    const r = keeper(["plan", "ingest"], {
-      env: { PATH: `${dir}:${process.env.PATH ?? "/usr/bin:/bin"}` },
-      stdin: payload,
-    });
-    expect(r.code).toBe(0);
-    expect(r.stdout).toBe(payload);
+describe("keeper plan — exit code propagation (real binary)", () => {
+  test("an unknown verb propagates click's usage error + exit 2", () => {
+    const direct = spawn(["planctl", "no-such-verb-zzz"]);
+    const shimmed = keeper(["plan", "no-such-verb-zzz"]);
+    expect(direct.code).toBe(2);
+    expect(shimmed.code).toBe(2);
+    expect(shimmed.stdout).toBe(direct.stdout);
+    expect(shimmed.stderr).toBe(direct.stderr);
+  });
+
+  test("an invalid --format value propagates the usage error + exit 2", () => {
+    const direct = spawn(["planctl", "--format", "bogus", "status"]);
+    const shimmed = keeper(["plan", "--format", "bogus", "status"]);
+    expect(direct.code).toBe(2);
+    expect(shimmed.code).toBe(2);
+    expect(shimmed.stdout).toBe(direct.stdout);
+    expect(shimmed.stderr).toBe(direct.stderr);
   });
 });
 
-describe("keeper plan — exit code propagation (stub binary)", () => {
-  test("a non-zero child exit propagates unchanged", () => {
-    const dir = stubBin("exit 42");
-    const r = keeper(["plan", "boom"], {
-      env: { PATH: `${dir}:${process.env.PATH ?? "/usr/bin:/bin"}` },
-    });
-    expect(r.code).toBe(42);
-  });
+describe("keeper plan — stdin forwarding (real binary, scratch repo)", () => {
+  /** Stand up a fresh git repo with an initialized planctl project + one
+   * scaffolded epic/task. Returns the realpath'd repo dir. */
+  function scratchRepo(): string {
+    const repo = realpathSync(mkdtempSync(join(tmpdir(), "keeper-plan-shim-")));
+    tmps.push(repo);
+    const git = (...args: string[]) => {
+      const r = Bun.spawnSync(["git", "-C", repo, ...args], {
+        stdout: "ignore",
+        stderr: "pipe",
+      });
+      if (!r.success) {
+        throw new Error(`git ${args.join(" ")} failed: ${r.stderr.toString()}`);
+      }
+    };
+    git("init", "-q", "-b", "main");
+    git("config", "user.email", "test@example.com");
+    git("config", "user.name", "Test");
+    // planctl's auto-commit needs a HEAD to build on.
+    writeFileSync(join(repo, "README.md"), "scratch\n");
+    git("add", "-A");
+    git("commit", "-q", "-m", "init");
 
-  test("a zero child exit propagates as 0", () => {
-    const dir = stubBin("exit 0");
-    const r = keeper(["plan", "ok"], {
-      env: { PATH: `${dir}:${process.env.PATH ?? "/usr/bin:/bin"}` },
+    const init = spawn(["planctl", "init"], { cwd: repo });
+    if (init.code !== 0) {
+      throw new Error(`planctl init failed: ${init.stderr}`);
+    }
+    const yaml = [
+      "epic:",
+      "  title: stdin fixture",
+      "  spec: |",
+      "    ## Overview",
+      "    A stdin-forwarding fixture.",
+      "tasks:",
+      "  - title: First task",
+      "    deps: []",
+      "    tier: medium",
+      "    spec: |",
+      "      ## Description",
+      "      Implement the thing.",
+      "",
+      "      ## Acceptance",
+      "      - [ ] It works.",
+      "",
+      "      ## Done summary",
+      "",
+      "      ## Evidence",
+      "",
+    ].join("\n");
+    const yamlPath = join(repo, "scaffold.yaml");
+    writeFileSync(yamlPath, yaml);
+    const scaf = spawn(["planctl", "scaffold", "--file", yamlPath], {
+      cwd: repo,
     });
-    expect(r.code).toBe(0);
-  });
-});
+    if (scaf.code !== 0) {
+      throw new Error(`planctl scaffold failed: ${scaf.stderr}`);
+    }
+    return repo;
+  }
 
-describe("keeper plan — missing binary", () => {
-  test("no planctl on PATH and no ~/.local/bin/planctl → exit 127", () => {
-    // Empty PATH + a HOME with no .local/bin/planctl forces both resolution
-    // paths to miss. A bare PATH still needs the bash the stub-less shim itself
-    // doesn't invoke — the shim only runs Bun.which + Bun.file, no shell.
-    const emptyHome = mkdtempSync(join(tmpdir(), "keeper-plan-nohome-"));
-    tmps.push(emptyHome);
-    const r = keeper(["plan", "status"], {
-      // PATH points only at a dir with no planctl; HOME has no .local/bin.
-      env: { PATH: emptyHome, HOME: emptyHome },
-    });
-    expect(r.code).toBe(127);
-    expect(r.stderr).toContain("planctl binary not found");
+  test("piped stdin reaches a stdin-reading verb identically in-process", () => {
+    // `task set-acceptance <task> --file -` reads the replacement section off
+    // stdin. Each runtime drives its OWN fresh repo (identical setup), so a
+    // byte-identical stdout/stderr/exit proves the in-process path consumed the
+    // piped stdin exactly as the spawned binary does. The task id is the epic's
+    // single child, `<epic>.1`.
+    const epicId = "fn-1-stdin-fixture";
+    const taskId = `${epicId}.1`;
+    const payload = "- [ ] piped acceptance line\n- [ ] second line\n";
+
+    const directRepo = scratchRepo();
+    const direct = spawn(
+      ["planctl", "task", "set-acceptance", taskId, "--file", "-"],
+      { cwd: directRepo, stdin: payload },
+    );
+
+    const shimRepo = scratchRepo();
+    const shimmed = keeper(
+      ["plan", "task", "set-acceptance", taskId, "--file", "-"],
+      { cwd: shimRepo, stdin: payload },
+    );
+
+    expect(direct.code).toBe(0);
+    expect(shimmed.code).toBe(direct.code);
+    expect(shimmed.stderr).toBe(direct.stderr);
+
+    // The success line carries a per-repo planctl_invocation trailer
+    // (repo_root / state_repo / touched_path_files are absolute tmp paths
+    // unique to each scratch repo), so compare only the repo-invariant fields —
+    // the verb's identity proves it processed the same piped stdin in both
+    // runtimes.
+    const directEnv = JSON.parse(direct.stdout.trim());
+    const shimEnv = JSON.parse(shimmed.stdout.trim());
+    expect(shimEnv.success).toBe(directEnv.success);
+    expect(shimEnv.task_id).toBe(directEnv.task_id);
+    expect(shimEnv.section).toBe(directEnv.section);
+    expect(shimEnv.planctl_invocation.op).toBe(directEnv.planctl_invocation.op);
+    expect(shimEnv.planctl_invocation.target).toBe(
+      directEnv.planctl_invocation.target,
+    );
+
+    // The piped section landed in the spec — `cat` is format-free raw markdown,
+    // repo-path-independent, so it must match byte-for-byte across both repos.
+    const directCat = spawn(["planctl", "cat", taskId], { cwd: directRepo });
+    const shimCat = keeper(["plan", "cat", taskId], { cwd: shimRepo });
+    expect(shimCat.code).toBe(0);
+    expect(shimCat.stdout).toBe(directCat.stdout);
+    expect(shimCat.stdout).toContain("piped acceptance line");
   });
 });
