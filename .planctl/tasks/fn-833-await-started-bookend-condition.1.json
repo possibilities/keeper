@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-18T20:39:08.419000Z",
+  "depends_on": [],
+  "epic": "fn-833-await-started-bookend-condition",
+  "id": "fn-833-await-started-bookend-condition.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "implement started await condition",
+  "updated_at": "2026-06-18T20:39:08.419000Z"
+}
