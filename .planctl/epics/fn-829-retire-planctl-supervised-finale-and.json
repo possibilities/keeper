@@ -2,9 +2,15 @@
   "branch_name": "main",
   "bundles": [],
   "created_at": "2026-06-18T17:57:48.562000Z",
-  "depends_on_epics": [],
+  "depends_on_epics": [
+    "fn-824-native-fold-keeper-plan-in-process",
+    "fn-825-migrate-planctl-callers-to-keeper-plan",
+    "fn-826-erase-planctl-from-keeper-daemon",
+    "fn-827-rename-planctl-dir-to-keeper-in-cli-and",
+    "fn-828-flag-day-rename-planctl-dir-across-repos"
+  ],
   "id": "fn-829-retire-planctl-supervised-finale-and",
-  "last_validated_at": "2026-06-18T17:57:48.577000Z",
+  "last_validated_at": "2026-06-18T17:58:24.368000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -14,5 +20,5 @@
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-18T17:57:48.562000Z"
+  "updated_at": "2026-06-18T17:58:24.351000Z"
 }
