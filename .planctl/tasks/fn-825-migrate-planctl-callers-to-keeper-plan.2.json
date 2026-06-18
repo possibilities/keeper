@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-18T17:55:29.948000Z",
+  "depends_on": [
+    "fn-825-migrate-planctl-callers-to-keeper-plan.1"
+  ],
+  "epic": "fn-825-migrate-planctl-callers-to-keeper-plan",
+  "id": "fn-825-migrate-planctl-callers-to-keeper-plan.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "migrate hand-authored skill/agent callers",
+  "updated_at": "2026-06-18T17:55:29.948000Z"
+}
