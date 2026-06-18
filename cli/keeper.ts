@@ -60,7 +60,7 @@ Subcommands:
   search-history      Search UserPromptSubmit history by LIKE term (JSON)
   find-file-history   List file attributions matching a path fragment (JSON)
   show-session-events Prompt/tool-call spine for one session (JSON)
-  plan                Alias for the planctl CLI: \`keeper plan <verb>\` execs planctl
+  plan                Alias for the planctl CLI: \`keeper plan <verb>\` runs planctl in-process
 
 Flags:
   --help, -h     Show this help
