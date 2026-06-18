@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-18T18:37:02.092000Z",
+  "depends_on": [
+    "fn-831-flip-plan-producers-and-migrate-source.1"
+  ],
+  "epic": "fn-831-flip-plan-producers-and-migrate-source",
+  "id": "fn-831-flip-plan-producers-and-migrate-source.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "emit plan-commit-changed and finish producer flip",
+  "updated_at": "2026-06-18T18:37:02.092000Z"
+}
