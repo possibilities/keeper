@@ -137,7 +137,7 @@ test("buildTmuxNewSessionArgs: detached mint injects KEEPER_TMUX_SESSION via -e"
   ]);
 });
 
-test("buildTmuxNewWindowArgs: trailing-colon session target, -e injection, -P -F pane id, chained `;` set-option, no -n when unnamed", () => {
+test("buildTmuxNewWindowArgs: trailing-colon session target, -e injection, -P -F pane id, argv after --, no -n when unnamed", () => {
   const got = buildTmuxNewWindowArgs("autopilot", "/Users/mike/code/keeper", [
     "/bin/zsh",
     "-l",
@@ -163,15 +163,11 @@ test("buildTmuxNewWindowArgs: trailing-colon session target, -e injection, -P -F
     "-i",
     "-c",
     "echo hi",
-    ";",
-    "set-option",
-    "-p",
-    "remain-on-exit",
-    "on",
   ]);
-  // The `;` is a SEPARATE argv element (tmux command separator), not a
-  // shell-joined string — the chained set-option holds the dead pane.
-  expect(got.filter((a) => a === ";")).toHaveLength(1);
+  // No chained set-option — dispatched windows inherit the global
+  // `remain-on-exit off` and close natively on full-tree exit.
+  expect(got).not.toContain(";");
+  expect(got).not.toContain("remain-on-exit");
   // No window name when unnamed (managed-launch contract).
   expect(got).not.toContain("-n");
 });

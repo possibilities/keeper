@@ -185,10 +185,15 @@ export function execBackendEnvMeta(backendType?: string): ExecBackendEnvMeta {
 // `renameWindow`) labels them after the hosted Claude session's job title — the
 // `name` arg on `launch` stays a log/dedup key, never the `-n` label.
 //
-// Accepted residual race: a worker that exits BEFORE the chained
-// `set-option -p remain-on-exit on` lands loses its dead pane (the window
-// auto-closes). Sub-ms window, no mitigation — the `-P -F '#{pane_id}'` return
-// exists as the fallback hook if the chained form ever misbehaves.
+// Dispatched windows inherit the global `remain-on-exit off` and close natively
+// on full-tree exit; the launch wrapper's trailing `exec $SHELL -l -i` keeps the
+// pane occupied after the hosted `claude` exits, so a window persists for
+// inspection and `classifyCloseKind` still reads `pid_died`. Accepted tradeoff:
+// an isolated whole-process-GROUP death (OOM/`kill -9 -<pgid>` taking claude AND
+// the trailing shell) that spares the tmux server and is missed by the live
+// watcher classifies `window_gone_server_alive`, dropping it from crash-restore's
+// auto-offer (recoverable by hand). Reboots stay `server_gone`; ordinary claude
+// crashes self-heal via the trailing shell → still `pid_died`.
 // ===========================================================================
 
 /** Build the tmux `has-session -t =<session>` probe argv. Pure — exported for
@@ -218,18 +223,21 @@ export function buildTmuxNewSessionArgs(session: string): string[] {
 }
 
 /**
- * Build the tmux `new-window` launch argv, chaining `set-option -p
- * remain-on-exit on` in ONE invocation via the literal `;` command-separator
- * argv element (verified on 3.6b: the dead pane persists with `pane_dead=1` +
- * `pane_dead_status`). Pure — exported for tests.
+ * Build the tmux `new-window` launch argv. Pure — exported for tests. Dispatched
+ * windows inherit the global `remain-on-exit off`, so a window closes natively
+ * once its whole process tree exits — exactly like a hand-created pane. The
+ * hosted `claude` exiting does NOT close the window: the launch wrapper's
+ * trailing `exec $SHELL -l -i` login shell keeps the pane occupied, which both
+ * leaves a usable shell for inspection and keeps the pane LISTED so
+ * `classifyCloseKind`'s `list-panes` probe still reads `pid_died`.
  *
  * Targets `<session>:` (trailing colon = the session's window list) so the new
  * window lands in the managed session. `-c <cwd>` sets the working dir; the
  * `-e KEEPER_TMUX_SESSION=<session>` injection re-stamps the session name on the
  * new window's pane env (a window does NOT inherit the session-mint `-e`).
  * `-P -F '#{pane_id}'` prints the new pane's id to stdout — the durable handle
- * AND the fallback seam if the chained set-option ever needs a targeted retry.
- * `argv` is passed after `--` so tmux execs it directly with no shell layer.
+ * for every later targeted op. `argv` is passed after `--` so tmux execs it
+ * directly with no shell layer.
  *
  * `name`, when non-empty, labels the window via `-n` (the restore caller's seam
  * — managed `launch` always passes empty so windows stay unnamed). Window names
@@ -256,11 +264,6 @@ export function buildTmuxNewWindowArgs(
     "#{pane_id}",
     "--",
     ...argv,
-    ";",
-    "set-option",
-    "-p",
-    "remain-on-exit",
-    "on",
   ];
 }
 
@@ -346,8 +349,10 @@ export function localeDefaultedEnv(
  * deliberate window-close from a crash-kill per row, with NO global crash
  * boundary:
  *   - `server_gone` — the tmux server is not running (reboot / crash). Restore.
- *   - `pid_died` — server alive, the job's pane is still listed but its process
- *     is dead (`remain-on-exit` left a dead pane). Restore.
+ *   - `pid_died` — server alive, the job's pane is still listed but the hosted
+ *     `claude` is dead. The pane stays listed because the launch wrapper's
+ *     trailing `exec $SHELL -l -i` login shell holds it after `claude` exits.
+ *     Restore.
  *   - `window_gone_server_alive` — server alive, the job's pane is GONE. The
  *     human deliberately closed the window. Do NOT restore.
  *   - `unknown` — probe error/timeout, no tmux binary, or no recorded pane to
@@ -434,7 +439,8 @@ export function classifyCloseKind(
     const firstTab = line.indexOf("\t");
     const candidate = firstTab < 0 ? line : line.slice(0, firstTab);
     if (candidate === paneId) {
-      // Pane still listed (dead pane held by remain-on-exit) → pid_died.
+      // Pane still listed (held by the trailing login shell after `claude`
+      // exits) → pid_died.
       return "pid_died";
     }
   }
@@ -462,8 +468,7 @@ export function buildTmuxRenameWindowArgs(
  * owning window and removes the whole window (every pane in it) — the wanted
  * semantics for one-pane managed windows. Pane-id targeting is deliberate over
  * a window id or name: a stable `%N` handle cannot be redirected by the
- * concurrent renamer worker, and colons in names break name-based targets. The
- * window's `remain-on-exit on` does not block the kill.
+ * concurrent renamer worker, and colons in names break name-based targets.
  */
 export function buildTmuxKillWindowArgs(paneId: string): string[] {
   return ["tmux", "kill-window", "-t", paneId];

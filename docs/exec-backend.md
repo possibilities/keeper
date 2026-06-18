@@ -242,7 +242,7 @@ in isolation and the runtime composes them:
 |---|---|
 | `buildTmuxHasSessionArgs(session)` | `has-session -t '=<session>'` exact-match probe |
 | `buildTmuxNewSessionArgs(session)` | `new-session -d -s <session> -e KEEPER_TMUX_SESSION=<session>` — session mint |
-| `buildTmuxNewWindowArgs(session, dir, argv, name?)` | `new-window` argv (chained `set-option -p remain-on-exit on`, `-e KEEPER_TMUX_SESSION` re-injection, optional `-n <name>` label) |
+| `buildTmuxNewWindowArgs(session, dir, argv, name?)` | `new-window` argv (`-e KEEPER_TMUX_SESSION` re-injection, optional `-n <name>` label; inherits the global `remain-on-exit off` so the window closes natively on full-tree exit) |
 | `buildTmuxSelectWindowArgs(paneId)` | `select-window` by pane id — focus |
 | `buildTmuxSelectPaneArgs(paneId)` | `select-pane` by pane id — focus |
 | `buildTmuxListPanesArgs()` | `list-panes -a -F '#{pane_id}\t#{window_id}\t#{window_name}'` — server-wide pane sweep (tab-delimited, name last) |

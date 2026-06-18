@@ -12,7 +12,8 @@
  *
  * MEMBERSHIP. A candidate is a `state='killed'` job whose death was crash-like:
  *   - `close_kind ∈ {server_gone, pid_died}` — tmux server gone (reboot/crash)
- *     or the pane's process died under remain-on-exit. Definitely restore.
+ *     or the hosted `claude` died while its pane stayed listed (held by the
+ *     launch wrapper's trailing login shell). Definitely restore.
  *   - `close_kind ∈ {unknown, NULL}` — the producer's liveness probe failed, or
  *     the row predates the v70 `close_kind` column. Resolved via the BURST
  *     HEURISTIC: the boot seed-sweep emits its Killed events back-to-back, so a
