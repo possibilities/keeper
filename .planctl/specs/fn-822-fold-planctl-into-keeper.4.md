@@ -34,5 +34,5 @@ Use `retryUntil` for the fold assertion (the plan-worker is async). Confirm `bun
 - [ ] the contract test gates under `bun run test:full`
 
 ## Done summary
-
+Added test/plan-contract.test.ts: drives the real planctl producer (init + scaffold) to write a .planctl epic, then asserts keeper's plan-worker folds it into the epics projection — producer and consumer in one repo. Gated under test:full (fast tier path-ignores it); promote runs unchanged from plugins/plan/.
 ## Evidence

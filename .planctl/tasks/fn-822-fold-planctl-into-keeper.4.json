@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "unify CI and add cross-contract fold test",
-  "updated_at": "2026-06-18T00:26:55.361000Z"
+  "updated_at": "2026-06-18T14:09:36.579000Z",
+  "worker_done_at": "2026-06-18T14:09:36.579000Z"
 }
