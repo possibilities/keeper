@@ -1183,15 +1183,18 @@ ExecBackend seam — and writes nothing to git or the event log.
   `switch-client`s, so it is safe inside or outside tmux. `--kill-sessions`
   tears all four sessions down first, prompting y/N only when the work sessions
   hold busy (non-shell foreground) panes — non-TTY stdin with busy panes aborts
-  (exit 1) having killed nothing. When the `foreground` session is ABSENT (the
-  first run after a crash), it offers to relaunch the last tmux-server
-  generation's crashed `foreground` agents — a y/N TTY-only prompt (never
-  auto-restores; computed BEFORE any session-creating call so the fresh server
-  doesn't shift the generation window), spawning
-  `restore-agents --apply --session foreground --last-generation`. A present
-  `foreground` session, zero candidates, or a non-TTY skips the offer. Reading
-  `keeper.db` read-only for the candidate count is the only DB dependency; the
-  relaunch is a spawned subprocess, so `setup-tmux` still imports no ExecBackend.
+  (exit 1) having killed nothing. When a human work session (`foreground` or
+  `background`) is ABSENT (the first run after a crash), it offers to relaunch
+  the last tmux-server generation's crashed agents for it — ONE combined y/N
+  TTY-only prompt naming each absent session and its own candidate count (never
+  auto-restores; counts and absence probes computed BEFORE any session-creating
+  call so the fresh server doesn't shift the generation window), spawning
+  `restore-agents --apply --session <name> --last-generation` per offered
+  session on `y` (continue-on-error — one failure doesn't abort the other). The
+  reconciler-managed `autopilot` session is never offered. A present session,
+  zero candidates, or a non-TTY skips that session's offer. Reading `keeper.db`
+  read-only for the candidate counts is the only DB dependency; the relaunch is
+  a spawned subprocess, so `setup-tmux` still imports no ExecBackend.
 
   ```sh
   keeper setup-tmux                 # rebuild dash, ensure work sessions

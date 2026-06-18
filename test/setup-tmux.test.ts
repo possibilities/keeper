@@ -542,16 +542,18 @@ describe("main() --kill-sessions busy-pane gate", () => {
 // ---------------------------------------------------------------------------
 
 describe("buildRestoreAgentsArgv", () => {
-  test("spawns restore-agents --apply --session foreground --last-generation", () => {
-    const argv = buildRestoreAgentsArgv();
-    expect(argv[0]).toBe("bun");
-    expect(argv[1]).toBe(`${KEEPER_DIR}/scripts/restore-agents.ts`);
-    expect(argv.slice(2)).toEqual([
-      "--apply",
-      "--session",
-      "foreground",
-      "--last-generation",
-    ]);
+  test("spawns restore-agents --apply --session <name> --last-generation per session", () => {
+    for (const session of ["foreground", "background"]) {
+      const argv = buildRestoreAgentsArgv(session);
+      expect(argv[0]).toBe("bun");
+      expect(argv[1]).toBe(`${KEEPER_DIR}/scripts/restore-agents.ts`);
+      expect(argv.slice(2)).toEqual([
+        "--apply",
+        "--session",
+        session,
+        "--last-generation",
+      ]);
+    }
   });
 });
 
@@ -561,27 +563,34 @@ describe("buildRestoreAgentsArgv", () => {
 // new generation) and fire ONLY when foreground is absent AND count>0 AND TTY.
 // ---------------------------------------------------------------------------
 
-const RESTORE_ARGV = buildRestoreAgentsArgv();
-const spawnedRestore = (calls: string[][]): boolean =>
-  calls.some(
-    (c) =>
-      c.length === RESTORE_ARGV.length &&
-      c.every((tok, i) => tok === RESTORE_ARGV[i]),
+/** True iff `calls` contains the exact restore-agents argv for `session`. */
+const spawnedRestoreFor = (calls: string[][], session: string): boolean => {
+  const want = buildRestoreAgentsArgv(session);
+  return calls.some(
+    (c) => c.length === want.length && c.every((tok, i) => tok === want[i]),
   );
+};
+/** True iff ANY restore-agents argv (any session) was spawned. */
+const spawnedAnyRestore = (calls: string[][]): boolean =>
+  ["foreground", "background"].some((s) => spawnedRestoreFor(calls, s));
 
 /**
- * Spawn stub for the offer path: `has-session` for the `=foreground` target
- * returns `foregroundExit` (so the offer's absence probe is controllable
- * independently of ensureWorkSessions' other has-session probes); every other
+ * Spawn stub for the offer path: `has-session` returns the per-session exit from
+ * `presentExits` (key = session name; default ABSENT/exit 1), so each work
+ * session's presence is controllable independently of the others. Every other
  * spawn succeeds, with new-session/split-window emitting a pane id so
  * rebuildDash completes. Records into `calls`.
  */
-function makeOfferStub(foregroundExit: number, calls: string[][]): SyncSpawnFn {
+function makeOfferStub(
+  presentExits: Record<string, number>,
+  calls: string[][],
+): SyncSpawnFn {
   return (cmd): SyncSpawnResult => {
     calls.push([...cmd]);
-    if (cmd[1] === "has-session" && cmd[3] === "=foreground") {
+    if (cmd[1] === "has-session") {
+      const target = (cmd[3] ?? "").replace(/^=/, "");
       return {
-        exitCode: foregroundExit,
+        exitCode: presentExits[target] ?? 1,
         stdout: Buffer.from(""),
         stderr: Buffer.from(""),
       };
@@ -597,10 +606,11 @@ function makeOfferStub(foregroundExit: number, calls: string[][]): SyncSpawnFn {
 }
 
 /** Run main() with stdin/stdout TTY pinned and a fake EOF/typed stdin, then
- *  restore every patched global. `answer` of "" ⇒ EOF (confirm → false). */
+ *  restore every patched global. `answer` of "" ⇒ EOF (confirm → false).
+ *  `counts` is the injected per-session candidate-count map. */
 async function runWithTTY(opts: {
   spawn: SyncSpawnFn;
-  count: number;
+  counts: Record<string, number>;
   tty: boolean;
   answer: string;
 }): Promise<void> {
@@ -629,7 +639,7 @@ async function runWithTTY(opts: {
   process.stdout.write = (() => true) as typeof process.stdout.write;
 
   try {
-    await main([], opts.spawn, () => opts.count);
+    await main([], opts.spawn, () => opts.counts);
   } finally {
     Object.defineProperty(process, "stdin", {
       value: savedStdin,
@@ -648,51 +658,112 @@ async function runWithTTY(opts: {
 }
 
 describe("main() restore-last-session offer", () => {
-  test("foreground absent + count>0 + TTY + y ⇒ spawns restore-agents", async () => {
+  test("both absent + counts>0 + TTY + y ⇒ spawns restore-agents per session", async () => {
     const calls: string[][] = [];
-    // foreground absent (has-session exits 1).
-    const spawn = makeOfferStub(1, calls);
-    await runWithTTY({ spawn, count: 2, tty: true, answer: "y" });
+    // foreground + background both absent (has-session exits 1, the default).
+    const spawn = makeOfferStub({}, calls);
+    await runWithTTY({
+      spawn,
+      counts: { foreground: 2, background: 3 },
+      tty: true,
+      answer: "y",
+    });
 
-    expect(spawnedRestore(calls)).toBe(true);
-    // Ordering: the foreground has-session probe (the offer's absence check)
-    // precedes the first session-creating call (dash new-session).
-    const probeIdx = calls.findIndex(
-      (c) => c[1] === "has-session" && c[3] === "=foreground",
-    );
+    // Both offered sessions spawn their own restore-agents argv.
+    expect(spawnedRestoreFor(calls, "foreground")).toBe(true);
+    expect(spawnedRestoreFor(calls, "background")).toBe(true);
+    // Ordering: BOTH has-session absence probes precede the first
+    // session-creating call (dash new-session), so the kill-anchored generation
+    // window isn't shifted before the counts/probes are read.
     const newSessionIdx = calls.findIndex((c) => c[1] === "new-session");
-    expect(probeIdx).toBeGreaterThanOrEqual(0);
-    expect(newSessionIdx).toBeGreaterThan(probeIdx);
+    expect(newSessionIdx).toBeGreaterThanOrEqual(0);
+    for (const session of ["foreground", "background"]) {
+      const probeIdx = calls.findIndex(
+        (c) => c[1] === "has-session" && c[3] === `=${session}`,
+      );
+      expect(probeIdx).toBeGreaterThanOrEqual(0);
+      expect(newSessionIdx).toBeGreaterThan(probeIdx);
+    }
   });
 
-  test("foreground absent + count>0 + TTY + N (EOF) ⇒ no spawn", async () => {
+  test("foreground present + background absent ⇒ only background offered/spawned", async () => {
     const calls: string[][] = [];
-    const spawn = makeOfferStub(1, calls);
-    await runWithTTY({ spawn, count: 2, tty: true, answer: "" });
-    expect(spawnedRestore(calls)).toBe(false);
+    // foreground present (exit 0), background absent (default exit 1).
+    const spawn = makeOfferStub({ foreground: 0 }, calls);
+    await runWithTTY({
+      spawn,
+      counts: { foreground: 2, background: 3 },
+      tty: true,
+      answer: "y",
+    });
+    expect(spawnedRestoreFor(calls, "foreground")).toBe(false);
+    expect(spawnedRestoreFor(calls, "background")).toBe(true);
   });
 
-  test("foreground present ⇒ no offer, no spawn", async () => {
+  test("both present ⇒ no offer, no spawn", async () => {
     const calls: string[][] = [];
-    // foreground present (has-session exits 0).
-    const spawn = makeOfferStub(0, calls);
-    // count>0 and TTY would otherwise prompt — presence must short-circuit.
-    await runWithTTY({ spawn, count: 5, tty: true, answer: "y" });
-    expect(spawnedRestore(calls)).toBe(false);
+    const spawn = makeOfferStub({ foreground: 0, background: 0 }, calls);
+    // counts>0 and TTY would otherwise prompt — presence must short-circuit.
+    await runWithTTY({
+      spawn,
+      counts: { foreground: 5, background: 5 },
+      tty: true,
+      answer: "y",
+    });
+    expect(spawnedAnyRestore(calls)).toBe(false);
   });
 
-  test("zero candidates ⇒ no offer, no spawn", async () => {
+  test("both absent + counts>0 + TTY + N (EOF) ⇒ no spawn", async () => {
     const calls: string[][] = [];
-    const spawn = makeOfferStub(1, calls);
-    await runWithTTY({ spawn, count: 0, tty: true, answer: "y" });
-    expect(spawnedRestore(calls)).toBe(false);
+    const spawn = makeOfferStub({}, calls);
+    await runWithTTY({
+      spawn,
+      counts: { foreground: 2, background: 3 },
+      tty: true,
+      answer: "",
+    });
+    expect(spawnedAnyRestore(calls)).toBe(false);
+  });
+
+  test("absent but count-0 ⇒ dropped, no offer/spawn", async () => {
+    const calls: string[][] = [];
+    const spawn = makeOfferStub({}, calls);
+    // foreground absent with candidates, background absent but count 0 ⇒ only
+    // foreground is offered; background is dropped.
+    await runWithTTY({
+      spawn,
+      counts: { foreground: 2, background: 0 },
+      tty: true,
+      answer: "y",
+    });
+    expect(spawnedRestoreFor(calls, "foreground")).toBe(true);
+    expect(spawnedRestoreFor(calls, "background")).toBe(false);
   });
 
   test("non-TTY ⇒ never auto-restores, no spawn", async () => {
     const calls: string[][] = [];
-    const spawn = makeOfferStub(1, calls);
-    // count>0 but non-TTY must skip silently (never auto-yes).
-    await runWithTTY({ spawn, count: 3, tty: false, answer: "y" });
-    expect(spawnedRestore(calls)).toBe(false);
+    const spawn = makeOfferStub({}, calls);
+    // counts>0 but non-TTY must skip silently (never auto-yes).
+    await runWithTTY({
+      spawn,
+      counts: { foreground: 3, background: 3 },
+      tty: false,
+      answer: "y",
+    });
+    expect(spawnedAnyRestore(calls)).toBe(false);
+  });
+
+  test("autopilot is never offered even when absent with candidates", async () => {
+    const calls: string[][] = [];
+    // autopilot absent with candidates, but it is excluded from RESTORABLE.
+    const spawn = makeOfferStub({}, calls);
+    await runWithTTY({
+      spawn,
+      counts: { autopilot: 4 },
+      tty: true,
+      answer: "y",
+    });
+    expect(spawnedRestoreFor(calls, "autopilot")).toBe(false);
+    expect(spawnedAnyRestore(calls)).toBe(false);
   });
 });
