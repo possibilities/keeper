@@ -25,5 +25,5 @@ Sweep any `planctl <verb>` command-callers in hand-authored skill/agent files NO
 - [ ] no hand-authored skill/agent invokes `planctl <verb>`; vendored `.planctl/specs` history left untouched
 
 ## Done summary
-
+Swept the one hand-authored planctl command-caller (close-planner.md's 'planctl followup submit' heredoc) to 'keeper plan followup submit'. Remaining 'planctl' tokens in skills/agents are prose noun mentions (internal names), out of scope per epics 3/4.
 ## Evidence

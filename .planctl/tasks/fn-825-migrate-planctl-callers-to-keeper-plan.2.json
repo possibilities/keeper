@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "migrate hand-authored skill/agent callers",
-  "updated_at": "2026-06-18T17:55:29.948000Z"
+  "updated_at": "2026-06-18T20:41:02.235000Z",
+  "worker_done_at": "2026-06-18T20:41:02.235000Z"
 }
