@@ -1324,7 +1324,7 @@ test("discharge-on-bind: SessionStart spawn-INSERT clears the matching pending_d
 
 test("discharge-on-bind: a SessionStart on a spawn name NOT matching the plan-verb whitelist leaves pending_dispatches untouched (fn-678)", () => {
   // `planVerbRefFromSpawnName` returns `{ plan_verb: null, plan_ref: null }`
-  // for any spawn name outside the strict `{plan|work|close|approve}::<ref>`
+  // for any spawn name outside the strict `{plan|work|close}::<ref>`
   // whitelist. The discharge guard requires BOTH non-null, so a non-matching
   // session leaves any pending row alive (it would only ever match a row
   // with verb/id null — which the table forbids).
@@ -1391,6 +1391,69 @@ test("discharge-on-bind FIRES ONLY on the spawn-INSERT branch, NOT on resume (fn
   const row = getPendingDispatch("work", "fn-678-resume.1");
   expect(row).not.toBeNull();
   expect(row?.dispatched_at).toBe(1800);
+});
+
+test("discharge-on-bind HEALS a fold-order race: UserPromptSubmit-before-SessionStart binds the pair AND discharges (fn-832)", () => {
+  // Fold-ordering race that orphaned autopilot workers: the reconciler mints
+  // `Dispatched(work, <ref>)` then launches a worker, but the worker's first
+  // `UserPromptSubmit` (carrying a pid, NO spawn_name) folds BEFORE its
+  // `SessionStart`. The UserPromptSubmit fork-seed mints the jobs row with a
+  // NULL plan correlator, so the later SessionStart takes the ON CONFLICT
+  // (resume) branch — which historically left the pair NULL and never
+  // discharged, stranding the task `[::blocked:dispatch-pending]` forever.
+  // The COALESCE-heal fills the NULL pair AND the widened gate discharges on
+  // that NULL->non-NULL transition.
+  const dispatchId = dispatchedEvent("work", "fn-832-race.1", "/repo", 1700);
+  const promptId = insertEvent({
+    hook_event: "UserPromptSubmit",
+    session_id: "sess-race",
+    pid: 9100,
+  });
+  const sessionId = insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-race",
+    spawn_name: "work::fn-832-race.1",
+    pid: 9100,
+  });
+  drainAll();
+
+  // (a) the pair healed onto the fork-seed row.
+  const job = getJob("sess-race");
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-832-race.1");
+  // (b) the pending dispatch discharged inline.
+  expect(getPendingDispatch("work", "fn-832-race.1")).toBeNull();
+  // (c) board-level outcome: `dispatch-pending` is driven SOLELY by an open
+  // `pending_dispatches` row for `work::<task_id>` (see `taskHasPending` in
+  // src/readiness.ts) — with the row discharged the verdict can no longer fire.
+  expect(
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM pending_dispatches WHERE verb = ? AND id = ?",
+      )
+      .get("work", "fn-832-race.1"),
+  ).toEqual({ n: 0 });
+
+  // (d) re-fold determinism: rewind + DELETE the projections + redrain must
+  // reproduce byte-identical `jobs` + `pending_dispatches` (the mandatory
+  // idiom — these folds are pure over the event log).
+  const jobsBefore = db.query("SELECT * FROM jobs ORDER BY job_id").all();
+  const pendingBefore = db
+    .query("SELECT * FROM pending_dispatches ORDER BY verb, id")
+    .all();
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM pending_dispatches");
+  drainAll();
+  expect(db.query("SELECT * FROM jobs ORDER BY job_id").all()).toEqual(
+    jobsBefore,
+  );
+  expect(
+    db.query("SELECT * FROM pending_dispatches ORDER BY verb, id").all(),
+  ).toEqual(pendingBefore);
+  // Sanity: the event ids fold in the intended order (prompt before session).
+  expect(promptId).toBeGreaterThan(dispatchId);
+  expect(sessionId).toBeGreaterThan(promptId);
 });
 
 test("zero-event projection: a fresh DB has zero pending_dispatches rows (fn-678)", () => {

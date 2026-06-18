@@ -622,12 +622,15 @@ test("fn-816 a killed-task-notification UserPromptSubmit mints NO row, and a Tra
   expect(getJob("fork-tt-only")).toBeNull();
 });
 
-test("fn-816 a later real SessionStart hydrates a UPS-minted fork via ON CONFLICT without discharging pending_dispatches", () => {
+test("fn-816 a later real SessionStart hydrates a UPS-minted fork via ON CONFLICT, healing the plan pair and discharging pending_dispatches", () => {
   // Seed a pending dispatch keyed on a plan ref. The fork's first prompt mints
-  // a standalone row; a later real SessionStart for the SAME id (carrying pid /
-  // start_time / config_dir and a work-verb spawn name) hydrates the row via
-  // ON CONFLICT — but because the row already existed, this is NOT a spawn-
-  // INSERT, so the pending dispatch must NOT discharge.
+  // a standalone row with a NULL plan pair; a later real SessionStart for the
+  // SAME id (carrying pid / start_time / config_dir and a work-verb spawn name)
+  // hydrates the row via ON CONFLICT. The row pre-existed so this is NOT a
+  // spawn-INSERT, but the ON CONFLICT branch COALESCE-heals the NULL pair and
+  // the widened discharge gate fires on that NULL->non-NULL transition — so the
+  // worker binds to its task and the launch-window slot is reaped (fn-832: the
+  // fold-order race that previously orphaned the worker forever).
   db.run(
     "INSERT INTO pending_dispatches (verb, id, dir, dispatched_at, last_event_id) VALUES (?, ?, ?, ?, ?)",
     ["work", "fn-99-x.1", "/tmp/fork-hyd", 100, 1],
@@ -665,17 +668,17 @@ test("fn-816 a later real SessionStart hydrates a UPS-minted fork via ON CONFLIC
   expect(row.pid).toBe(9301);
   expect(row.start_time).toBe("111");
   expect(row.config_dir).toBe("/Users/x/.claude");
-  // The ON CONFLICT UPDATE branch does NOT touch plan_verb / plan_ref (set-once
-  // on the spawn INSERT only — and this was a fork seed, not a spawn INSERT).
-  expect(row.plan_verb).toBeNull();
-  expect(row.plan_ref).toBeNull();
+  // The ON CONFLICT branch COALESCE-fills the NULL pair (fill-only-when-NULL),
+  // so the fork-seed row heals to the spawn name's parsed pair.
+  expect(row.plan_verb).toBe("work");
+  expect(row.plan_ref).toBe("fn-99-x.1");
 
-  // Discharge-on-bind fires ONLY on a spawn INSERT; the row pre-existed (fork
-  // seed), so the pending dispatch survives.
+  // Discharge-on-bind fires on the NULL->non-NULL heal (keyed on the PRE-UPSERT
+  // NULL prior pair), so the pending dispatch is reaped.
   const pending = db
     .query("SELECT 1 AS one FROM pending_dispatches WHERE verb = ? AND id = ?")
     .get("work", "fn-99-x.1");
-  expect(pending).not.toBeNull();
+  expect(pending).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

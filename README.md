@@ -17,7 +17,11 @@ sessions spawned by planctl — a `(plan_verb, plan_ref)` pair derived at
 SessionStart from the spawn name. The verb is the strict whitelist `{plan,
 work, close}` and the ref is the targeted planctl entity (epic id like
 `fn-575-foo`, or task id like `fn-575-foo.3`); both stay NULL for sessions not
-spawned through planctl. Two paired stoppage annotations ride alongside
+spawned through planctl. The pair is fill-once: a resume preserves an
+already-bound pair, but a row that was minted with a NULL pair (an
+out-of-order `UserPromptSubmit` fork-seed landing before the session's
+SessionStart) COALESCE-heals to the spawn name's pair when the SessionStart
+folds, so a worker binds to its task regardless of fold order. Two paired stoppage annotations ride alongside
 the `stopped` state: `(last_api_error_at, last_api_error_kind)` (schema
 v24) marks a stoppage caused by a terminal Claude-API HTTP failure the
 human hasn't picked up since, and `(last_input_request_at,
@@ -2010,7 +2014,10 @@ As of schema v50 (fn-678), the new `pending_dispatches` projection table
 (keyed by `(verb, id)`) is the durable launch-window occupancy signal that
 replaced the fn-674 live tab-name probe. A `Dispatched` synthetic
 event UPSERTs a row (`dir`, `dispatched_at`, `last_event_id`); a
-`SessionStart` fold DELETEs by the same key (discharge-on-bind); a
+`SessionStart` fold DELETEs by the same key (discharge-on-bind) when the
+session binds its `(plan_verb, plan_ref)` pair — on the spawn-INSERT or on a
+NULL->non-NULL heal of a fork-seed row, but never on a genuine resume whose
+pair was already bound (that must not clear a re-pending dispatch); a
 `DispatchExpired` synthetic event DELETEs the key when the TTL sweep fires.
 `DispatchFailed` also DELETEs the pending row so a failed dispatch does not
 block the failure as permanently occupied. A from-scratch re-fold reproduces
@@ -2274,7 +2281,11 @@ NOT a standalone `reconcile()` suppression arm outside the mutex: a launched
 but not-yet-SessionStart-bound worker has no `jobs` row, so readiness reads
 the pending rows (via the shared `projectPendingDispatches` helper, the same
 input the board's `subscribeReadiness` consumes — no board/autopilot
-divergence) and stamps `dispatch-pending` at a late per-row rank that holds
+divergence) and stamps `dispatch-pending` at a late per-row rank. The verdict
+self-clears when the worker's `SessionStart` binds its `(plan_verb, plan_ref)`
+pair and discharges the pending row — including the fold-order case where the
+worker's `UserPromptSubmit` folded first and minted a NULL-pair fork-seed row,
+which COALESCE-heals on the SessionStart (so the slot never strands). It holds
 BOTH the per-epic and per-root mutex (`isLiveWorkOccupant` → auto-covers
 `isRootOccupant`), demoting a same-epic OR same-root ready sibling. A pending
 row matching no snapshot row occupies its root via its own `dir` column

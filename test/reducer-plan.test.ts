@@ -1096,6 +1096,29 @@ test("plan_verb/plan_ref re-fold idempotency on RESUME: rewind reproduces FIRST 
   expect(getJob()?.plan_ref).toBe("fn-1-first");
 });
 
+test("plan_verb/plan_ref HEAL on resume: a NULL-pair fork-seed row fills when the SessionStart folds late", () => {
+  // Fold-ordering race: an out-of-order UserPromptSubmit (carrying a pid, no
+  // spawn_name) mints the jobs row with a NULL plan correlator BEFORE the
+  // session's SessionStart folds. The SessionStart's ON CONFLICT branch
+  // COALESCE-fills the pair (fill-only-when-NULL), so the row heals to the
+  // spawn name's parsed pair instead of staying orphaned.
+  insertEvent({ hook_event: "UserPromptSubmit", pid: 7000 });
+  drainAll();
+  // Fork-seed minted a row with no plan correlator.
+  expect(getJob()?.plan_verb).toBeNull();
+  expect(getJob()?.plan_ref).toBeNull();
+
+  insertEvent({
+    hook_event: "SessionStart",
+    spawn_name: "work::fn-832-foo.1",
+    pid: 7000,
+  });
+  drainAll();
+  const job = getJob();
+  expect(job?.plan_verb).toBe("work");
+  expect(job?.plan_ref).toBe("fn-832-foo.1");
+});
+
 // ---------------------------------------------------------------------------
 // Title provenance / precedence (spawn_name seed + {spawn:1, payload:2})
 // ---------------------------------------------------------------------------

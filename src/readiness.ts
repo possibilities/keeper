@@ -666,9 +666,11 @@ function evaluateTask(
 
   // 10. dep-on-task-synthetic-close — not applicable to a real task.
 
-  // 10.5. dispatch-pending — a worker LAUNCHED against this task (a `work::` /
-  // `approve::` `pending_dispatches` row) but whose SessionStart hasn't folded,
-  // so no `jobs` row makes the slot visible. Set at this LATE rank — after
+  // 10.5. dispatch-pending — a worker LAUNCHED against this task (a `work::`
+  // `pending_dispatches` row, per the `(plan|work|close)` whitelist) but whose
+  // SessionStart hasn't folded, so no `jobs` row makes the slot visible. A
+  // fork-seed row minted by an out-of-order UserPromptSubmit heals + discharges
+  // when the SessionStart folds (see `projectJobsRow`). Set at this LATE rank — after
   // every real `running`, structural, and dep verdict (each still WINS so a
   // truer state isn't masked) but BEFORE the post-pass mutexes, so pass-1 of
   // both mutexes sees it as an occupant via `isLiveWorkOccupant`.

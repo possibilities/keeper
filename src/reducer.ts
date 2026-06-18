@@ -6224,19 +6224,33 @@ function projectJobsRow(db: Database, event: Event): void {
       // touched — precedence-owned / set-once identity.
       {
         // Derive `plan_verb`/`plan_ref` from the spawn name via the shared pure
-        // parser; NULL on any name outside the `{plan|work|close|approve}::<ref>`
-        // whitelist. Set-once on RESUME (ON CONFLICT leaves both untouched).
+        // parser; NULL on any name outside the `{plan|work|close}::<ref>`
+        // whitelist. The pair is COALESCE-filled on the ON CONFLICT branch:
+        // fill-only-when-NULL, so a genuine resume (pair already set) is left
+        // untouched, but a row seeded with a NULL pair — e.g. a fork-seed minted
+        // by an out-of-order UserPromptSubmit before this SessionStart — heals
+        // to the parsed pair. (`planVerbRefFromSpawnName` returns both-or-
+        // neither, so the two columns never desync.)
         const { plan_verb, plan_ref } = planVerbRefFromSpawnName(
           event.spawn_name,
         );
-        // Discharge-on-bind gating: read the jobs row BEFORE the UPSERT to
-        // distinguish spawn-INSERT (no prior row) from resume ON CONFLICT. The
-        // pending-dispatch discharge fires ONLY on spawn-INSERT — a RESUME must
-        // NOT discharge a legitimately re-pending dispatch. The pre-INSERT SELECT
-        // is pure, so re-fold determinism holds.
+        // Discharge-on-bind gating: read the jobs row's PRIOR pair BEFORE the
+        // UPSERT. This distinguishes a spawn-INSERT (no prior row) from a resume
+        // ON CONFLICT, AND captures whether the prior pair was NULL — the heal
+        // transition. The discharge fires on a spawn-INSERT OR a NULL->non-NULL
+        // heal, but NOT on a genuine resume (prior pair already set) which must
+        // NOT clear a legitimately re-pending dispatch. The "was-NULL" half MUST
+        // read the PRE-UPSERT value here — a post-UPSERT read is always non-NULL
+        // after the COALESCE and would wrongly discharge every resume. The
+        // pre-INSERT SELECT is pure, so re-fold determinism holds. A seed row
+        // returns `{ plan_verb: null, plan_ref: null }` (not `null`), so
+        // `isSpawnInsert` stays keyed on row ABSENCE.
         const priorJob = db
-          .query("SELECT 1 AS one FROM jobs WHERE job_id = ?")
-          .get(jobId) as { one: number } | null;
+          .query("SELECT plan_verb, plan_ref FROM jobs WHERE job_id = ?")
+          .get(jobId) as {
+          plan_verb: string | null;
+          plan_ref: string | null;
+        } | null;
         const isSpawnInsert = priorJob == null;
         // Seed `name_history` with `["<spawn_name>"]` on the spawn INSERT (else
         // `'[]'`). RESUME is a no-touch (no `name_history` clause in the UPDATE
@@ -6255,6 +6269,15 @@ function projectJobsRow(db: Database, event: Event): void {
              -- COALESCE preserves the seeded name (mirrors config_dir above).
              profile_name = COALESCE(excluded.profile_name, jobs.profile_name),
              state = CASE WHEN jobs.state IN ('${ENDED}','${KILLED}') THEN 'stopped' ELSE jobs.state END,
+             -- Heal-on-resume: COALESCE-fill the plan correlator. The existing
+             -- jobs column FIRST = fill-only-when-NULL, so a genuine resume's
+             -- already-bound pair is preserved (set-once), but a row seeded with
+             -- a NULL pair (an out-of-order UserPromptSubmit fork-seed that
+             -- minted the row before this SessionStart folded) heals to the
+             -- parsed excluded pair. Both columns fill together — the parser
+             -- returns both-or-neither, honoring the paired-NULL invariant.
+             plan_verb = COALESCE(jobs.plan_verb, excluded.plan_verb),
+             plan_ref = COALESCE(jobs.plan_ref, excluded.plan_ref),
              -- Schema v25: unconditional paired clear on every SessionStart
              -- (including resume). A SessionStart means a live process is
              -- attached, so any pending input-request annotation is stale:
@@ -6315,11 +6338,23 @@ function projectJobsRow(db: Database, event: Event): void {
           `INSERT OR IGNORE INTO profiles (config_dir, profile_name, last_event_id, updated_at) VALUES (COALESCE(?, ''), ?, ?, ?)`,
           [event.config_dir, projectBasename(event.config_dir), event.id, ts],
         );
-        // Discharge-on-bind: fires ONLY on spawn-INSERT, NEVER on resume. A
+        // Discharge-on-bind: fires on a spawn-INSERT OR a NULL->non-NULL heal
+        // (a fork-seed row whose prior pair was NULL, now filled by the
+        // COALESCE above), but NEVER on a genuine resume whose pair was already
+        // bound (that must not clear a legitimately re-pending dispatch). A
         // successful bind means the autopilot's `Dispatched` intent materialized
-        // into a real job, so the launch-window slot is reaped. Idempotent DELETE
-        // (no-op when no pending row). Pure fold.
-        if (isSpawnInsert && plan_verb != null && plan_ref != null) {
+        // into a real job, so the launch-window slot is reaped. The "was-NULL"
+        // half reads the PRE-UPSERT `priorJob.plan_ref` — a post-UPSERT read is
+        // always non-NULL after the COALESCE and would wrongly fire on resume.
+        // The DELETE keys on the just-parsed `(plan_verb, plan_ref)`, which
+        // equals the COALESCEd result because the heal branch fires only when
+        // the prior pair was NULL. Idempotent DELETE (no-op when no pending
+        // row). Pure fold.
+        if (
+          (isSpawnInsert || priorJob.plan_ref == null) &&
+          plan_verb != null &&
+          plan_ref != null
+        ) {
           db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
             plan_verb,
             plan_ref,
