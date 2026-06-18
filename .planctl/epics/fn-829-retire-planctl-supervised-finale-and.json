@@ -7,10 +7,11 @@
     "fn-825-migrate-planctl-callers-to-keeper-plan",
     "fn-826-erase-planctl-from-keeper-daemon",
     "fn-827-rename-planctl-dir-to-keeper-in-cli-and",
-    "fn-828-flag-day-rename-planctl-dir-across-repos"
+    "fn-828-flag-day-rename-planctl-dir-across-repos",
+    "fn-831-flip-plan-producers-and-migrate-source"
   ],
   "id": "fn-829-retire-planctl-supervised-finale-and",
-  "last_validated_at": "2026-06-18T17:58:24.368000Z",
+  "last_validated_at": "2026-06-18T18:38:38.926000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -20,5 +21,5 @@
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-18T17:58:24.351000Z"
+  "updated_at": "2026-06-18T18:38:38.909000Z"
 }
