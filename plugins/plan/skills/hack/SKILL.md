@@ -3,7 +3,7 @@ name: hack
 description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
-allowed-tools: Bash(pairctl:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(planctl list:*), Bash(planctl epics:*), Bash(promptctl:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
+allowed-tools: Bash(pairctl:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(promptctl:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
 ---
 
 # Hack
@@ -43,7 +43,7 @@ Mode-specific moves:
 - **Troubleshoot** — reproduce → narrow surface → quote evidence → hypothesize → test → repeat. `keeper`, `tmuxctl`, recent `git log` and `git blame` are faster than guessing. When the trail is cold, the history recipes below find who touched what, when, and in which session.
 - **Internal report** — codebase, configs, git history, keeper session history, `knowctl`, `claudectl`. Skip `searchctl` and `scrapectl`. Gather enough to be thorough — don't exhaustively research.
 - **External research** — cast a wide net with `searchctl web-search` / `reason-search` / `pro-search`; pull primary sources via `scrapectl fetch-markdown`; use `agent-browser` for pages needing interaction or JS; cross-reference; flag disagreements; cite URLs for key claims.
-- **Work-shaped** — read enough of the surface to understand what would change, what's affected, and what's not yet decided; surface that in chat before any edit. Above inline size, investigate like you'll have to defend the direction: mine prior work (`claudectl list-sessions` / `show-session` for related conversations, `planctl epics` for adjacent epics, `knowctl` for framework docs), read the touched surface until you're confident — no read cap at this tier — and trace the data across every boundary the change crosses. Thin investigation is what makes a sketch thin.
+- **Work-shaped** — read enough of the surface to understand what would change, what's affected, and what's not yet decided; surface that in chat before any edit. Above inline size, investigate like you'll have to defend the direction: mine prior work (`claudectl list-sessions` / `show-session` for related conversations, `keeper plan epics` for adjacent epics, `knowctl` for framework docs), read the touched surface until you're confident — no read cap at this tier — and trace the data across every boundary the change crosses. Thin investigation is what makes a sketch thin.
 
 ### Session history (keeper.db)
 

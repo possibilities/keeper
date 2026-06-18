@@ -5,7 +5,7 @@ description: >-
   finalize the close. Use when the human types `/plan:close <epic_id>` once
   every task in the epic is `done`.
 argument-hint: "<epic_id> [instructions]"
-allowed-tools: Bash(planctl:*), Read, Task, SendMessage
+allowed-tools: Bash(keeper plan:*), Read, Task, SendMessage
 disallowed-tools: Edit, Write, NotebookEdit, TodoWrite
 disable-model-invocation: true
 ---
@@ -16,7 +16,7 @@ Content-blind coordinator for the epic-close phase. The closer drives PROCESS on
 
 The human types `/plan:close <epic_id>` once every task in the epic is `done`. The session is named `close::<epic_id>`.
 
-`planctl close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. After the agents return, the closer's job is one `close-finalize` call and a total switch over its four outcomes.
+`keeper plan close-finalize` encodes the saga from observable state: it stale-checks the source commit set, halts on a `fatal` verdict, and runs the reversible follow-up scaffold BEFORE the irreversible `epic close`. After the agents return, the closer's job is one `close-finalize` call and a total switch over its four outcomes.
 
 ---
 
@@ -25,10 +25,10 @@ The human types `/plan:close <epic_id>` once every task in the epic is `done`. T
 Pass `$ARGUMENTS` as a single quoted token to `close-preflight` — the verb owns id validation, readiness, and the brief handoff. No Phase-1 validation ladder, no `cd`:
 
 ```bash
-planctl close-preflight "$ARGUMENTS"
+keeper plan close-preflight "$ARGUMENTS"
 ```
 
-**Single failure pattern.** On ANY `{"success": false, "error": {"code", "message", "details"}}` envelope, surface `error.message` verbatim and stop. This covers every reject the verb owns — bad/missing/ambiguous id (`BAD_TASK_ID` / `EPIC_NOT_FOUND` / `AMBIGUOUS_EPIC_ID`), a task-id passed where an epic was required, `TASKS_NOT_DONE` (the epic has open tasks), and `SNIPPET_RENDER_FAILED` / `COMMIT_LOOKUP_FAILED`. The human investigates before any agent spawns. For an `AMBIGUOUS_EPIC_ID`, re-run with `planctl close-preflight "$ARGUMENTS" --project <path>`.
+**Single failure pattern.** On ANY `{"success": false, "error": {"code", "message", "details"}}` envelope, surface `error.message` verbatim and stop. This covers every reject the verb owns — bad/missing/ambiguous id (`BAD_TASK_ID` / `EPIC_NOT_FOUND` / `AMBIGUOUS_EPIC_ID`), a task-id passed where an epic was required, `TASKS_NOT_DONE` (the epic has open tasks), and `SNIPPET_RENDER_FAILED` / `COMMIT_LOOKUP_FAILED`. The human investigates before any agent spawns. For an `AMBIGUOUS_EPIC_ID`, re-run with `keeper plan close-preflight "$ARGUMENTS" --project <path>`.
 
 **On success**, pin these envelope fields — process facts only, no prose:
 
@@ -129,7 +129,7 @@ Re-parse the return and continue.
 Run `close-finalize` — one call that encodes the whole saga from observable state. It re-checks the commit-set hash for staleness, halts on a `fatal` verdict, runs the reversible follow-up scaffold (when survivors exist), and only then runs the irreversible `epic close`. Pass `--project` from the preflight `primary_repo` (no `cd`):
 
 ```bash
-planctl close-finalize <epic_id> --project <primary_repo>
+keeper plan close-finalize <epic_id> --project <primary_repo>
 ```
 
 `close-finalize` is idempotent — a re-run after a crash derives its position from observable state (a closed epic, an existing follow-up) and never double-creates. It refuses on a `commit_set_hash` mismatch (a commit landed after the audit) rather than closing against stale artifacts.
@@ -167,7 +167,7 @@ Fatal halt (`fatal_halt` outcome — epic NOT closed):
 Halted `<epic_id>`. fatal finding: <fatal_reason>. epic NOT closed.
 ```
 
-The `## Audit decisions` table on the follow-up epic (visible via `planctl cat <new_epic_id>`) plus its `depends_on_epics: ["<source>"]` are the durable trace of what the audit decided and why — the closer never writes to the source spec.
+The `## Audit decisions` table on the follow-up epic (visible via `keeper plan cat <new_epic_id>`) plus its `depends_on_epics: ["<source>"]` are the durable trace of what the audit decided and why — the closer never writes to the source spec.
 
 ---
 

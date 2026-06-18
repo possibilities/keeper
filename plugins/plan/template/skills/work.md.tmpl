@@ -7,7 +7,7 @@ description: >-
   says "work", "/work", or invokes the planctl work workflow on an existing
   `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
-allowed-tools: Bash(planctl:*), Read, Glob, Task, SendMessage
+allowed-tools: Bash(keeper plan:*), Read, Glob, Task, SendMessage
 disable-model-invocation: true
 ---
 
@@ -32,10 +32,10 @@ The human said "work", "/work", or passed an existing planctl task id to run. Ac
 One call asserts invariants, claims the task (`todo` → `in_progress`), and returns the full worker briefing — no `detect`, no separate `show`/`cat`, no `cd`. `claim` resolves the owning project cwd-agnostically (scans configured `roots`), so this works from any directory:
 
 ```bash
-planctl claim <task_id>
+keeper plan claim <task_id>
 ```
 
-**On a typed error** — envelope `{"success": false, "error": {"code", "message", "details"}}` — surface `error.message` verbatim and stop. The `code` covers every reject (`BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID`, `TASK_DONE`, `TASK_BLOCKED`, claimed-by-another, unmet deps). `claim` fails loud on bad input — automation always supplies a valid id, so there's no empty-args branch to handle. For an `AMBIGUOUS_TASK_ID` (same id in multiple projects), re-run with `planctl claim <task_id> --project <path>`.
+**On a typed error** — envelope `{"success": false, "error": {"code", "message", "details"}}` — surface `error.message` verbatim and stop. The `code` covers every reject (`BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID`, `TASK_DONE`, `TASK_BLOCKED`, claimed-by-another, unmet deps). `claim` fails loud on bad input — automation always supplies a valid id, so there's no empty-args branch to handle. For an `AMBIGUOUS_TASK_ID` (same id in multiple projects), re-run with `keeper plan claim <task_id> --project <path>`.
 
 **On success**, read the briefing envelope and pin these in working memory for the phases below:
 
@@ -72,7 +72,7 @@ Implement a planctl task.
 
 TASK_ID: <fn-N-slug.M>
 EPIC_ID: <fn-N-slug>
-PLANCTL: planctl
+PLANCTL: keeper plan
 TARGET_REPO: <absolute path to target_repo, or same as PRIMARY_REPO if task.target_repo is null>
 PRIMARY_REPO: <absolute path to the primary_repo (planctl state repo)>
 BRIEF_REF: <absolute path from the Phase 1 claim envelope's brief_ref>
@@ -108,21 +108,21 @@ Task(
 After the worker returns, collapse the entire post-worker assessment into ONE read-only call:
 
 ```bash
-planctl reconcile <task_id>
+keeper plan reconcile <task_id>
 ```
 
-`reconcile` computes a typed verdict from planctl-native data alone — merged status, trailer-authentic source commits (against `target_repo` + `epic.touched_repos`), HEAD-visibility of the committed task JSON (against `state_repo`), and an epic tally. NO keeper call, no `planctl show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. Delivery cleanliness is the worker's own job — it runs a mandatory `keeper session-state` self-check on every path and commits its session files before returning, so the orchestrator never reasons over attribution.
+`reconcile` computes a typed verdict from planctl-native data alone — merged status, trailer-authentic source commits (against `target_repo` + `epic.touched_repos`), HEAD-visibility of the committed task JSON (against `state_repo`), and an epic tally. NO keeper call, no `keeper plan show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. Delivery cleanliness is the worker's own job — it runs a mandatory `keeper session-state` self-check on every path and commits its session files before returning, so the orchestrator never reasons over attribution.
 
-**On a typed error** — envelope `{"success": false, "error": {"code", "message", "details"}}` (`BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID`) — surface `error.message` verbatim and stop. For `AMBIGUOUS_TASK_ID`, re-run with `planctl reconcile <task_id> --project <path>`.
+**On a typed error** — envelope `{"success": false, "error": {"code", "message", "details"}}` (`BAD_TASK_ID`, `TASK_NOT_FOUND`, `AMBIGUOUS_TASK_ID`) — surface `error.message` verbatim and stop. For `AMBIGUOUS_TASK_ID`, re-run with `keeper plan reconcile <task_id> --project <path>`.
 
 **On success**, read the envelope `{verdict, task_id, epic_id, status, source_commits, state_head_visible, epic_progress, assessed_at, blocked_reason}` and switch on `verdict`. The switch is total over all seven verdicts.
 
 **Every non-`done` verdict is a resume directive, never a work order.** A dirty tree, failing lint, or a missing commit is the worker's to fix in the worker's context — you route the nudge back into the worker and never touch the tree yourself. The global commit-by-default convention does not apply to this skill: it never edits, so it never commits. The switch arms:
 
 - **`done`** → the source commit and the `.planctl/` state commit both landed. Continue to Phase 3 (report).
-- **`in_progress_committed`** → the worker's source commit landed but `planctl done` never fired. Resume with the nudge *"Source commit `<sha>` landed for `<id>` (sha from `source_commits[0]`) — run `planctl done <task_id> --summary "..."` now."*
-- **`in_progress_uncommitted`** → the worker dropped before committing. Resume with the nudge *"Finish implementation, run tests within your two-full-pass budget, `keeper commit-work`, `planctl done`."*
-- **`state_uncommitted`** → the worker stamped `done` but the `.planctl/` state commit never landed. Resume with the nudge *"Re-run `planctl done <task_id> --summary "..."` to land the state commit."*
+- **`in_progress_committed`** → the worker's source commit landed but `keeper plan done` never fired. Resume with the nudge *"Source commit `<sha>` landed for `<id>` (sha from `source_commits[0]`) — run `keeper plan done <task_id> --summary "..."` now."*
+- **`in_progress_uncommitted`** → the worker dropped before committing. Resume with the nudge *"Finish implementation, run tests within your two-full-pass budget, `keeper commit-work`, `keeper plan done`."*
+- **`state_uncommitted`** → the worker stamped `done` but the `.planctl/` state commit never landed. Resume with the nudge *"Re-run `keeper plan done <task_id> --summary "..."` to land the state commit."*
 - **`blocked`** → the worker escalated; surface the `blocked_reason` (plus any `BLOCKED: <category>` breadcrumb from the worker return) verbatim and stop.
 - **`not_started`** → unexpected post-worker (the task is still `todo`); surface the verdict verbatim and stop.
 - **`tooling_error`** → a git subprocess failed and the verdict is unreliable; surface the envelope verbatim and stop. **Do NOT act on a `tooling_error`** — fail closed, never resume against an unreliable verdict.
@@ -143,11 +143,11 @@ planctl reconcile <task_id>
 
    SendMessage error envelope `{"success": false, "message": "No agent named '<id>' is currently addressable..."}` means the agent_id is dead/invalid — fall through to the cold path.
 
-3. Wait for the worker to finish, then re-run `planctl reconcile <task_id>` and re-switch. On `done` → continue to Phase 3. On `blocked` → BLOCKED short-circuit. If the verdict is still a non-`done` `in_progress_*` / `state_uncommitted` arm, increment the invocation-local attempt counter and loop: re-send a fresh resume directive (warm) as long as `worker_agent_id` is still addressable, falling through to the cold path on a SendMessage error. Only after the **5th** attempt in this invocation drops do you `planctl block <task_id> --reason "RESUME_EXHAUSTED: harness dropped through 5 attempts (1 spawn + 4 retries) on Phase 2b resume"` and stop.
+3. Wait for the worker to finish, then re-run `keeper plan reconcile <task_id>` and re-switch. On `done` → continue to Phase 3. On `blocked` → BLOCKED short-circuit. If the verdict is still a non-`done` `in_progress_*` / `state_uncommitted` arm, increment the invocation-local attempt counter and loop: re-send a fresh resume directive (warm) as long as `worker_agent_id` is still addressable, falling through to the cold path on a SendMessage error. Only after the **5th** attempt in this invocation drops do you `keeper plan block <task_id> --reason "RESUME_EXHAUSTED: harness dropped through 5 attempts (1 spawn + 4 retries) on Phase 2b resume"` and stop.
 
 **Cold path (cross-session, or warm SendMessage error):**
 
-1. Shell `planctl worker resume <task_id>` once. It regenerates the brief fresh and returns a typed envelope — read these fields: `worker_agent` (the `plan:worker-<tier>` subagent name to spawn, or `null` for a legacy null-tier task), `brief_ref` (path to the freshly-baked brief), `nudge` (a one-line process-fact summary), `target_repo`, `primary_repo`, plus process facts `status`, `source_commit_sha`, `dirty_session_file_count`. There is no narrative `prompt` field — assemble the spawn prompt yourself from the config lines below. If `worker_agent` is `null`, surface the typed stop *"tier unset — remediate via /plan:plan <epic_id> refine"* and stop instead of spawning.
+1. Shell `keeper plan worker resume <task_id>` once. It regenerates the brief fresh and returns a typed envelope — read these fields: `worker_agent` (the `plan:worker-<tier>` subagent name to spawn, or `null` for a legacy null-tier task), `brief_ref` (path to the freshly-baked brief), `nudge` (a one-line process-fact summary), `target_repo`, `primary_repo`, plus process facts `status`, `source_commit_sha`, `dirty_session_file_count`. There is no narrative `prompt` field — assemble the spawn prompt yourself from the config lines below. If `worker_agent` is `null`, surface the typed stop *"tier unset — remediate via /plan:plan <epic_id> refine"* and stop instead of spawning.
 
 2. Spawn ONE fresh worker (substitute the envelope's `worker_agent` for `<worker_agent>`) with a config-only prompt carrying `BRIEF_REF` and the resume `nudge`:
 
@@ -155,13 +155,13 @@ planctl reconcile <task_id>
    Task(
        subagent_type="<worker_agent>",
        description="Resume <task_id>",
-       prompt="Resume a planctl task.\n\nTASK_ID: <task_id>\nEPIC_ID: <epic_id>\nPLANCTL: planctl\nTARGET_REPO: <envelope target_repo>\nPRIMARY_REPO: <envelope primary_repo>\nBRIEF_REF: <envelope brief_ref>\n\n## Task\n\n<envelope nudge> Follow your agent spec; read BRIEF_REF in Phase 1.",
+       prompt="Resume a planctl task.\n\nTASK_ID: <task_id>\nEPIC_ID: <epic_id>\nPLANCTL: keeper plan\nTARGET_REPO: <envelope target_repo>\nPRIMARY_REPO: <envelope primary_repo>\nBRIEF_REF: <envelope brief_ref>\n\n## Task\n\n<envelope nudge> Follow your agent spec; read BRIEF_REF in Phase 1.",
    )
    ```
 
-   `subagent_type` is the resume envelope's `worker_agent` string verbatim (`plan:worker-<tier>`) — the always-loaded `plan` plugin owns all four worker agents, so it resolves directly. No `model=` kwarg — the agent file owns the model. The prompt carries process facts only (via the `nudge`) plus `BRIEF_REF` — no spec prose. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (it decides whether to skip ahead to `planctl done` or continue from implementation).
+   `subagent_type` is the resume envelope's `worker_agent` string verbatim (`plan:worker-<tier>`) — the always-loaded `plan` plugin owns all four worker agents, so it resolves directly. No `model=` kwarg — the agent file owns the model. The prompt carries process facts only (via the `nudge`) plus `BRIEF_REF` — no spec prose. The "harness-dropped predecessor" branch inside the worker agent spec's Phase 1 handles detection (it decides whether to skip ahead to `keeper plan done` or continue from implementation).
 
-3. Re-run `planctl reconcile <task_id>` after the spawn returns and re-switch:
+3. Re-run `keeper plan reconcile <task_id>` after the spawn returns and re-switch:
    - `done` → continue to Phase 3.
    - `blocked` → BLOCKED short-circuit.
    - a non-`done` `in_progress_*` / `state_uncommitted` arm (the cold spawn dropped) → this cold-resume invocation has spent its single attempt. The cold path holds no cross-invocation counter, so do NOT block — surface the verdict verbatim and stop. A fresh `/plan:work` re-run takes another attempt under the best-effort budget; a task that genuinely can't progress surfaces repeatedly and the human blocks it by hand.
@@ -172,9 +172,9 @@ planctl reconcile <task_id>
 
 ## Phase 3 — Report
 
-The worker commits source (`keeper commit-work`) before stamping `planctl done`, and self-checks its own delivery cleanliness (its session files committed) before returning — so a `done` verdict in Phase 2b means both commits landed and nothing of the worker's is left dirty. The orchestrator never commits source, never runs `planctl done`, and never inspects git porcelain.
+The worker commits source (`keeper commit-work`) before stamping `keeper plan done`, and self-checks its own delivery cleanliness (its session files committed) before returning — so a `done` verdict in Phase 2b means both commits landed and nothing of the worker's is left dirty. The orchestrator never commits source, never runs `keeper plan done`, and never inspects git porcelain.
 
-**Do NOT close the epic** — `planctl epic close` stays the human's call. **`keeper commit-work` failures surface as BLOCKED** — a lint/commit/push failure makes the worker return `BLOCKED: TOOLING_FAILURE` with the verbatim envelope (Phase 2b's BLOCKED short-circuit catches it); the human resolves and re-runs `/plan:work`, and the resume path picks up via the non-`done` verdict.
+**Do NOT close the epic** — `keeper plan epic close` stays the human's call. **`keeper commit-work` failures surface as BLOCKED** — a lint/commit/push failure makes the worker return `BLOCKED: TOOLING_FAILURE` with the verbatim envelope (Phase 2b's BLOCKED short-circuit catches it); the human resolves and re-runs `/plan:work`, and the resume path picks up via the non-`done` verdict.
 
 One-line summary, using `reconcile`'s `epic_progress` and the worker's returned commit sha:
 
@@ -186,12 +186,12 @@ Include the per-task commit sha from the worker return and `epic_progress.done` 
 
 ## Guardrails
 
-- **Never auto-closes the epic** — `planctl epic close` stays the human's call.
-- **Post-worker assessment is a single `planctl reconcile` call + a total switch on its seven verdicts** (Phase 2b) — no `planctl show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. The orchestrator speaks only in typed verdicts.
-- **Commit-then-done contract:** the worker commits source (`keeper commit-work`) before stamping `planctl done`, and self-checks its own delivery cleanliness before returning. A `done` verdict implies both commits landed and no session file of the worker's is left dirty.
+- **Never auto-closes the epic** — `keeper plan epic close` stays the human's call.
+- **Post-worker assessment is a single `keeper plan reconcile` call + a total switch on its seven verdicts** (Phase 2b) — no `keeper plan show`, no `keeper find-task-commit`, no `keeper session-state`, no `validate --epic`, no git-porcelain reasoning. The orchestrator speaks only in typed verdicts.
+- **Commit-then-done contract:** the worker commits source (`keeper commit-work`) before stamping `keeper plan done`, and self-checks its own delivery cleanliness before returning. A `done` verdict implies both commits landed and no session file of the worker's is left dirty.
 - **`keeper commit-work` failures all surface as `BLOCKED: TOOLING_FAILURE`** with the verbatim envelope. Workers never patch the tool they're calling — the human resolves and re-runs.
 - **Never auto-retries a semantic failure** (`BLOCKED: <CATEGORY>`) — surface and stop. The `in_progress_committed` / `in_progress_uncommitted` / `state_uncommitted` verdicts *do* auto-recover via the shared 5-attempt best-effort budget (Phase 2b resume machinery). A `tooling_error` verdict surfaces-and-stops (fail closed — never resume against an unreliable verdict).
-- **Delivery cleanliness belongs to the worker, not the orchestrator** — the worker commits its own session files before returning; the orchestrator never inspects, classifies, or commits dirty files, never runs `planctl done`, and never commits source on the worker's behalf.
+- **Delivery cleanliness belongs to the worker, not the orchestrator** — the worker commits its own session files before returning; the orchestrator never inspects, classifies, or commits dirty files, never runs `keeper plan done`, and never commits source on the worker's behalf.
 - **Tier routing is owned by the planner + `claim`, not this skill** — spawn the envelope's `worker_agent` (`plan:worker-<tier>`) verbatim, no `model=`, no tier-read. A `null` `worker_agent` is a typed stop, never a spawn.
 - **Never reads or writes** outside planctl state + project code. Never use `TodoWrite` — planctl tracks all tasks.
 

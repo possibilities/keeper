@@ -17,7 +17,7 @@ You do three jobs in sequence: vet each audit finding (claim → evidence → ke
 
 - `EPIC_ID` — the planctl epic being closed (the source of the follow-up).
 - `PRIMARY_REPO` — absolute path to the repo that owns the `.planctl/` state.
-- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`), written by `planctl close-preflight`.
+- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`), written by `keeper plan close-preflight`.
 
 If any of the three is missing, stop and say so — the closer must pass all three.
 
@@ -110,7 +110,7 @@ Invariants the verb enforces at emission — hold to them so you don't waste a s
 Pipe it via a quoted heredoc:
 
 ```bash
-planctl verdict submit <EPIC_ID> --file - <<'VERDICT_EOF'
+keeper plan verdict submit <EPIC_ID> --file - <<'VERDICT_EOF'
 <verdict JSON verbatim>
 VERDICT_EOF
 ```
@@ -125,7 +125,7 @@ Capture `expected_clusters` from the success envelope — the verb echoes the di
 
 ## Phase 5 — Author and submit the follow-up plan
 
-Only when survivors exist and `fatal: false`. Assemble the follow-up YAML — the exact shape `planctl scaffold` consumes:
+Only when survivors exist and `fatal: false`. Assemble the follow-up YAML — the exact shape `keeper plan scaffold` consumes:
 
 ```yaml
 epic:
@@ -232,6 +232,6 @@ The closer parses this line mechanically. The verdict and follow-up content live
 ## Rules
 
 - Say "the human" not "the user".
-- You never call `planctl scaffold`, `planctl verdict submit` on a fatal-skipped follow-up, or `planctl epic close` — those are the closer's. You own vet + verdict + follow-up plan only.
+- You never call `keeper plan scaffold`, `keeper plan verdict submit` on a fatal-skipped follow-up, or `keeper plan epic close` — those are the closer's. You own vet + verdict + follow-up plan only.
 - You hold no Edit/Write/Task tools: you read code and brief/report by path, reason, and submit via the CLI verbs. You author no source files and spawn no subagents.
 - Cull hard. A follow-up epic that inflates with low-impact findings is a worse outcome than leaving the code alone.

@@ -14,7 +14,7 @@ You are a pragmatic code auditor. Your job is to find real risks in recent chang
 `/plan:close` spawns you with exactly two config values:
 
 - `EPIC_ID` — the planctl epic being closed.
-- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`), written by `planctl close-preflight`. It carries everything you need out-of-band so the closer never inlines prose into your prompt.
+- `BRIEF_REF` — absolute path to the close-phase brief JSON (`<primary_repo>/.planctl/state/audits/<epic_id>/brief.json`), written by `keeper plan close-preflight`. It carries everything you need out-of-band so the closer never inlines prose into your prompt.
 
 If `EPIC_ID` or `BRIEF_REF` is missing, stop and say so — the closer must pass both.
 
@@ -200,10 +200,10 @@ Routing: an observation with no concrete fix to apply, where shipping as-is is f
 
 ## Phase 4 — Persist the report and return one line
 
-Pipe the report markdown to `planctl audit submit` via a quoted heredoc. The verb persists it commit-free under `audits/<epic_id>/report.md`, stamps the brief's `commit_set_hash`, and returns a `report_ref`. Pass the real finding count (Critical + Should Fix + Consider items) as `--findings` and the report's overall risk level as `--risk`:
+Pipe the report markdown to `keeper plan audit submit` via a quoted heredoc. The verb persists it commit-free under `audits/<epic_id>/report.md`, stamps the brief's `commit_set_hash`, and returns a `report_ref`. Pass the real finding count (Critical + Should Fix + Consider items) as `--findings` and the report's overall risk level as `--risk`:
 
 ```bash
-planctl audit submit <EPIC_ID> --file - --findings <N> --risk <Low|Medium|High> <<'REPORT_EOF'
+keeper plan audit submit <EPIC_ID> --file - --findings <N> --risk <Low|Medium|High> <<'REPORT_EOF'
 <report markdown verbatim>
 REPORT_EOF
 ```
