@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-18T20:58:17.981000Z",
   "created_at": "2026-06-18T20:39:08.419000Z",
   "depends_on_epics": [],
   "id": "fn-833-await-started-bookend-condition",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "await started bookend condition",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-18T20:39:08.419000Z"
+  "updated_at": "2026-06-18T20:58:17.981000Z"
 }
