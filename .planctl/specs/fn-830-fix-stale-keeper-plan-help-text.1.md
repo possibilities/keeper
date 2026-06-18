@@ -15,5 +15,5 @@ other spawn-implying wording for `keeper plan` remains in the help block.
 - [ ] `keeper --help` output renders the corrected line
 
 ## Done summary
-
+Updated keeper --help plan subcommand line to say it runs planctl in-process instead of execing it, matching the fn-824 in-process dispatch.
 ## Evidence
