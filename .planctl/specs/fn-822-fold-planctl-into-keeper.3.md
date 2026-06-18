@@ -33,5 +33,5 @@ Re-point the claudewrap launcher from two explicit plugin roots to one scan-dir 
 - [ ] adding a hypothetical 3rd plugin dir under `plugins/` would be auto-discovered with zero config change (scan-dir property verified)
 
 ## Done summary
-
+Re-pointed claudewrap launcher from two explicit plugin_dirs entries to one plugin_scan_dirs entry (~/code/keeper/plugins), which auto-discovers both the keeper and plan plugins. Updated install.sh render/bun-cli/preflight paths to ~/code/keeper/plugins/plan and fixed forward-facing path refs in CLAUDE.md and promptctl hook headers.
 ## Evidence
