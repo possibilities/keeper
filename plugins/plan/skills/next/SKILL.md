@@ -1,7 +1,10 @@
 ---
 name: next
 description: >-
-  Flip board priority on an existing epic so it jumps to the front of the queue — calls `planctl epic queue-jump`. Use when the human says "next", "do this next", "/plan:next", "jump the queue", "prioritize", "top of the board", or wants an already-created epic bumped ahead of the normal epic-number order. Operates on an epic that already exists; it does NOT scaffold.
+  Bump an existing planctl epic to the front of the queue. Use when the
+  human says "next", "do this next", "jump the queue", "prioritize", or
+  "top of the board". Operates on an epic that already exists — it does not
+  scaffold one.
 argument-hint: "[epic_id]"
 allowed-tools: Bash(planctl:*), Read
 ---

@@ -1,14 +1,11 @@
 ---
 name: work
 description: >-
-  Run a single planctl task by spawning a tier-matched `plan:worker-<tier>`
-  subagent with fresh context, verifying it reaches `status: done`. The tier
-  (reasoning effort) is picked at decomposition time by `/plan:plan` and
-  persisted in task metadata; `claim` maps it to a `worker_agent` name
-  (`plan:worker-<tier>`) that rides the envelope, and this skill spawns that
-  emitted name directly. Single task, current branch only — no
-  review gates, no worktree. Use when the human says "work", "/work", or
-  invokes the planctl work workflow on an existing `fn-N-slug.M` task.
+  Run a single planctl task by spawning a tier-matched worker subagent with
+  fresh context and verifying it reaches `status: done`. Single task,
+  current branch only — no review gates, no worktree. Use when the human
+  says "work", "/work", or invokes the planctl work workflow on an existing
+  `fn-N-slug.M` task.
 argument-hint: "<fn-N-slug.M> [instructions]"
 allowed-tools: Bash(planctl:*), Read, Glob, Task, SendMessage
 disable-model-invocation: true

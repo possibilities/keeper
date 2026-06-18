@@ -1,31 +1,14 @@
 ---
 name: await
 description: >-
-  Block until a condition holds — a planctl board state (epic/task complete
-  or unblocked), git state ("wait for the project to be clean", "wait until
-  everything's committed", "hold until there are no uncommitted changes"),
-  job state ("wait for the other agents to finish", "wait until everyone
-  else is done working", "block until no one else is editing the repo"),
-  own-session monitor state ("wait until my dev server / script / build
-  watcher finishes", "block until my background task is done"), daemon
-  readiness ("wait until keeper is up", "block until keeperd is back /
-  serving / reachable"), or
-  any AND-combination of these — then run a follow-up action. Use when the
-  user says "wait for", "wait until", "block until", "hold off until", "do
-  X when Y is done", "do X after fn-N finishes", "review when fn-… is
-  complete", "ping me when X completes", "once X is unblocked", "as soon as
-  X is ready", "after the build/epic/task is done", "wait until the repo is
-  clean", "once everything's committed", "when the other agents are done",
-  "after everyone else finishes", "wait until the project is clean and the
-  others are done", or any pushy "do X when Y is in state Z" intent — even
-  when they don't say "keeper", "epic", "task", or "await". The trigger is
-  the wait-then-act shape against a planctl id (`fn-N-slug` for an epic,
-  `fn-N-slug.M` for a task), against git cleanliness of the current repo,
-  against other agents finishing, or any AND-combination. Wires a
-  `Monitor(keeper await …)` invocation, listens for the terminal
-  `[keeper-await] met …` line, then runs the requested follow-up. Refuses
-  upfront if a planctl target is off-board (already completed / popped off)
-  or nonexistent.
+  Block until a condition holds, then run a follow-up action. Conditions: a
+  planctl board state (epic/task complete or unblocked), git cleanliness of
+  the current repo, other agents finishing, an own-session background task
+  (dev server / build / script) completing, daemon readiness, or any
+  AND-combination. Use for any wait-then-act intent — e.g. "review when
+  fn-N is done", "ping me when the repo's clean", "do X after the other
+  agents finish" — even when the user never says "keeper", "await", "epic",
+  or "task".
 allowed-tools: Monitor Bash
 ---
 

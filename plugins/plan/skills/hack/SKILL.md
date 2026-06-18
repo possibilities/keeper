@@ -1,6 +1,6 @@
 ---
 name: hack
-description: Investigate a request and answer in the right shape — read-only by default; with plain-text confirmation, can execute small work inline, sketch a direction in chat, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
+description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
 allowed-tools: Bash(pairctl:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(planctl list:*), Bash(planctl epics:*), Bash(promptctl:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor

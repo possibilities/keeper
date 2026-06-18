@@ -1,6 +1,6 @@
 ---
 name: plan
-description: Plan a feature, bug, or change in planctl — produce an epic + tasks + deps from a free-text request, or refine an existing epic/task. Tiny single-commit work can opt out and skip planctl entirely. Use when human says "plan", "make a plan", "/plan", or invokes the planctl plan workflow.
+description: Plan a feature, bug, or change in planctl — produce an epic + tasks + deps from a free-text request, or refine an existing epic/task. Use when the human says "plan", "make a plan", "/plan", or invokes the planctl plan workflow.
 argument-hint: "[freetext request | fn-N-slug | fn-N-slug.M] [refine note]  (omit to inherit subject from conversation)"
 allowed-tools: Bash(planctl:*), Read, Glob, Write, Task
 ---

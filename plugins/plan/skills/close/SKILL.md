@@ -1,13 +1,9 @@
 ---
 name: close
 description: >-
-  Close a planctl epic — spawn the quality-auditor and (when findings surface)
-  the close-planner, then run `planctl close-finalize` and switch on its typed
-  outcome. Process-only coordinator: every audit/verdict/follow-up artifact
-  lives on disk under `audits/<epic_id>/`; the skill holds envelopes and
-  one-line agent returns, never report prose. Slash-only entry; no auto-invoke
-  from free text. Use when the human types `/plan:close <epic_id>` once every
-  task in the epic is `done`.
+  Close a planctl epic — run the quality audit, address any findings, then
+  finalize the close. Use when the human types `/plan:close <epic_id>` once
+  every task in the epic is `done`.
 argument-hint: "<epic_id> [instructions]"
 allowed-tools: Bash(planctl:*), Read, Task, SendMessage
 disallowed-tools: Edit, Write, NotebookEdit, TodoWrite
