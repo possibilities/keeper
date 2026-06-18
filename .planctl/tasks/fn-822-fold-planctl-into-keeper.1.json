@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-18T00:26:55.361000Z",
+  "depends_on": [],
+  "epic": "fn-822-fold-planctl-into-keeper",
+  "id": "fn-822-fold-planctl-into-keeper.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "keeper plan exec-shim + conformance test",
+  "updated_at": "2026-06-18T00:26:55.361000Z"
+}

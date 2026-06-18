@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-18T00:26:55.361000Z",
+  "depends_on": [
+    "fn-822-fold-planctl-into-keeper.2"
+  ],
+  "epic": "fn-822-fold-planctl-into-keeper",
+  "id": "fn-822-fold-planctl-into-keeper.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "unify CI and add cross-contract fold test",
+  "updated_at": "2026-06-18T00:26:55.361000Z"
+}
