@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-18T17:55:30.086000Z",
+  "depends_on": [
+    "fn-826-erase-planctl-from-keeper-daemon.1"
+  ],
+  "epic": "fn-826-erase-planctl-from-keeper-daemon",
+  "id": "fn-826-erase-planctl-from-keeper-daemon.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "rename plan_invocation envelope + commit event",
+  "updated_at": "2026-06-18T17:55:30.086000Z"
+}
