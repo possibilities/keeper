@@ -192,7 +192,7 @@ tasks:
 Pipe via a quoted heredoc:
 
 ```bash
-planctl followup submit <EPIC_ID> --file - <<'YAML_EOF'
+keeper plan followup submit <EPIC_ID> --file - <<'YAML_EOF'
 <follow-up plan YAML verbatim>
 YAML_EOF
 ```
