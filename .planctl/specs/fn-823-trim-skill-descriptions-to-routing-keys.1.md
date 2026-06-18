@@ -49,5 +49,5 @@ Drafted rewrites (starting points — tune wording but keep the substance):
 - [ ] keeper repo committed via `keeper commit-work`.
 
 ## Done summary
-
+Trimmed all 7 keeper-side skill descriptions to minimal routing keys (what + when), cutting mechanism/caveat/synonym bloat. await 1682->549 chars, every description <=600. plan:work edited via its source template and regenerated; generated work/SKILL.md is gitignored so only the template is committed.
 ## Evidence
