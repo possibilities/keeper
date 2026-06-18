@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Remove remain-on-exit and refresh comments/docs/test",
-  "updated_at": "2026-06-18T00:08:38.720000Z"
+  "updated_at": "2026-06-18T00:10:43.753000Z",
+  "worker_done_at": "2026-06-18T00:10:43.753000Z"
 }

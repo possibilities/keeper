@@ -34,5 +34,5 @@ Accepted tradeoff (mention in passing, do NOT engineer around it): an isolated w
 - [ ] Landed via `keeper commit-work`
 
 ## Done summary
-
+Dropped the chained remain-on-exit on tail from buildTmuxNewWindowArgs so dispatched windows close natively on full-tree exit; the trailing exec $SHELL login shell keeps the pane listed so classifyCloseKind still reads pid_died. Rewrote falsified comments/docs to the trailing-shell mechanism. Full suite green.
 ## Evidence
