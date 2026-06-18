@@ -115,5 +115,5 @@ are slow-tier).
       passes.
 
 ## Done summary
-
+Added monotonic 'started' bookend condition to keeper await — pure taskStarted/epicStarted predicates (job-presence OR runtime_status in {in_progress,done} OR worker_phase=done), wired through both eval arms + absentBranch (popped-off ⇒ met, no re-query), plus the two cli literal-union sites, HELP, SKILL.md, README, and full truth-table + runner tests.
 ## Evidence
