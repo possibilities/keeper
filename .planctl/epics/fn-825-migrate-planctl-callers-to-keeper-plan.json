@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-18T20:44:36.809000Z",
   "created_at": "2026-06-18T17:55:29.948000Z",
   "depends_on_epics": [],
   "id": "fn-825-migrate-planctl-callers-to-keeper-plan",
@@ -8,11 +9,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "migrate planctl callers to keeper plan",
   "touched_repos": [
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-18T17:55:29.948000Z"
+  "updated_at": "2026-06-18T20:44:36.809000Z"
 }
