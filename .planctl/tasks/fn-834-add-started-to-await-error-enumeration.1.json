@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-18T20:58:17.837000Z",
+  "depends_on": [],
+  "epic": "fn-834-add-started-to-await-error-enumeration",
+  "id": "fn-834-add-started-to-await-error-enumeration.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "List started in await error",
+  "updated_at": "2026-06-18T20:58:17.837000Z"
+}

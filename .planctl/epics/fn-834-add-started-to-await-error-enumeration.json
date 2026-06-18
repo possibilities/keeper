@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-18T20:58:17.837000Z",
+  "created_by_close_of": "fn-833-await-started-bookend-condition",
+  "depends_on_epics": [
+    "fn-833-await-started-bookend-condition"
+  ],
+  "id": "fn-834-add-started-to-await-error-enumeration",
+  "last_validated_at": "2026-06-18T20:58:17.860000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Add started to await error enumeration",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-18T20:58:17.837000Z"
+}
