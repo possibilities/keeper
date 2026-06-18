@@ -84,5 +84,5 @@ precedence-owned and out of scope. This task heals only `plan_verb`/`plan_ref` +
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Heal plan_verb/plan_ref via COALESCE on the SessionStart ON CONFLICT branch and discharge the pending dispatch on the NULL->non-NULL heal (keyed on the pre-UPSERT prior pair), so an autopilot worker binds to its task even when its UserPromptSubmit fork-seed folds before SessionStart. Pure fold change: no schema bump, no migration, no re-fold.
 ## Evidence
