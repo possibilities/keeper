@@ -61,6 +61,7 @@ function makeHarness(): Harness {
       "search-history": mkHandler("search-history"),
       "find-file-history": mkHandler("find-file-history"),
       "show-session-events": mkHandler("show-session-events"),
+      plan: mkHandler("plan"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),
@@ -186,6 +187,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("search-history")).toBe(true);
     expect(isSubcommand("find-file-history")).toBe(true);
     expect(isSubcommand("show-session-events")).toBe(true);
+    expect(isSubcommand("plan")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
   });

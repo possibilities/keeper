@@ -1,12 +1,8 @@
 #!/usr/bin/env bun
 /**
- * `keeper` CLI dispatcher. Routes the first positional argv token to one of
- * the four TUI subcommands; surfaces top-level help and version. Landed in
- * task .1 of the OpenTUI port epic with the renderer cutover and the four
- * subcommand mains relocating from `scripts/*.ts` to `cli/*.ts` over
- * `.2`-`.5`. After `.5` (autopilot) every subcommand resolves to a
- * `cli/<sub>.ts` module exporting its own `main(argv)` — no
- * `scripts/*.ts` shim path remains.
+ * `keeper` CLI dispatcher. Routes the first positional argv token to its
+ * subcommand main; surfaces top-level help and version. Every subcommand
+ * resolves to a `cli/<sub>.ts` module exporting its own `main(argv)`.
  *
  * Contract (per the spec's gap analysis):
  *   - Bare `keeper` → usage block on stderr, exit 1.
@@ -39,6 +35,7 @@ export const SUBCOMMANDS = [
   "search-history",
   "find-file-history",
   "show-session-events",
+  "plan",
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -63,6 +60,7 @@ Subcommands:
   search-history      Search UserPromptSubmit history by LIKE term (JSON)
   find-file-history   List file attributions matching a path fragment (JSON)
   show-session-events Prompt/tool-call spine for one session (JSON)
+  plan                Alias for the planctl CLI: \`keeper plan <verb>\` execs planctl
 
 Flags:
   --help, -h     Show this help
@@ -165,6 +163,7 @@ export async function main(): Promise<void> {
       (await import("./find-file-history")).main(argv),
     "show-session-events": async (argv) =>
       (await import("./show-session-events")).main(argv),
+    plan: async (argv) => (await import("./plan")).main(argv),
   };
 
   await dispatch(Bun.argv.slice(2), {
