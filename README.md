@@ -1071,7 +1071,11 @@ event-log/reducer/hook touch. Run any of them with
   stream on stdout — exactly one `[keeper-await] armed …` line after the
   on-board check, then exactly one terminal `[keeper-await] met …` or
   `[keeper-await] failed …` line — and exits when its condition holds.
-  Six conditions: `complete <id>` (epic/task pops off the board) and
+  Seven conditions: `complete <id>` (epic/task pops off the board),
+  `started <id>` (work has begun at least once — a monotonic milestone
+  keyed on job-presence OR `runtime_status` in {in_progress, done} OR
+  `worker_phase=done`, NOT the flapping liveness `running` verdict; a
+  popped-off target reads `met` since it was necessarily started), and
   `unblocked <id>` (workable now) are planctl-id forms auto-detecting
   epic vs task by the `.N` suffix; `git-clean` blocks until the cwd's git
   root has `dirty_count=0 AND orphaned_count=0` (no `git_status` row for
@@ -1114,6 +1118,7 @@ event-log/reducer/hook touch. Run any of them with
 
   ```sh
   keeper await complete fn-646-keeper-cli-opentui-port.1   # task done
+  keeper await started fn-646-keeper-cli-opentui-port.1    # task begun
   keeper await git-clean                                   # repo clean
   keeper await server-up                                   # daemon serving
   keeper await monitor-running cmd:bun run dev             # my dev server done

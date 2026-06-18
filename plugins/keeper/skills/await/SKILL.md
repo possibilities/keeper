@@ -27,7 +27,7 @@ The user's ask has two shapes glued together:
    is done*, *after … finishes*, *once … is ready*, *as soon as …*. The
    condition is one (or more) of:
    - a **planctl id** state — *"once fn-643-…-hook.4 is complete"*,
-     *"as soon as fn-650 is ready"*.
+     *"as soon as fn-650 is ready"*, *"when work starts on fn-650"*.
    - a **git** state — *"when the project is clean"*, *"once everything's
      committed"*, *"after there are no uncommitted changes"*.
    - a **jobs** state — *"when the other agents finish"*, *"once everyone
@@ -54,6 +54,7 @@ the literal `and` token.
 | Condition | How to derive | `keeper await` form |
 |---|---|---|
 | `complete <id>` | Default for a planctl id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). | `complete fn-…` |
+| `started <id>` | A planctl id where the user asks about work BEGINNING ("once it starts", "as soon as someone picks it up", "when work has begun on it"). Monotonic milestone — fires once work has begun at least once and never un-fires. | `started fn-…` |
 | `unblocked <id>` | A planctl id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
@@ -79,7 +80,7 @@ invocation, not an ambiguity.
 
 ## Step 1 — Pre-check planctl targets are on-board (planctl conditions only)
 
-This pre-check applies **only to `complete` / `unblocked`**. The
+This pre-check applies **only to `complete` / `started` / `unblocked`**. The
 `git-clean`, `agents-idle`, `server-up`, and `monitor-running` conditions
 have **no `planctl show` pre-check** — they read live keeper projections (or,
 for `server-up`, just wait for the daemon to serve), so there is nothing to
@@ -123,11 +124,25 @@ Refuse to wire Monitor in any of these cases — the event will never fire:
   - Epic: `epic.status == "done"`.
   Tell the user the target has already popped off the board — there's
   nothing to await — and offer to just run the follow-up now.
+- **Already started** (for `condition=started`): work has already begun if
+  the target carries any job, `task.runtime_status` is `in_progress`/`done`,
+  or `task.worker_phase == "done"` (epic: any task satisfies that). There's
+  nothing to await — tell the user and offer to run the follow-up now.
+  `keeper await started <id>` against an already-started target fires `met`
+  immediately (no refuse-upfront), so wiring it is harmless, but the
+  follow-up runs right away rather than on a real edge.
 
 If the target is on-board and the condition isn't already met, continue
 to step 2. (For `condition=unblocked` you may skip the
 already-unblocked check — `keeper await unblocked` with an already-
 workable target fires `met` immediately, which is the correct behavior.)
+
+> **`started <id> --require-transition` warns.** `started` is a monotonic
+> latch — it fires once and has NO second edge. Pairing it with
+> `--require-transition` against an already-started target makes the wait
+> hang until timeout (it sits waiting for an edge that never comes). Do not
+> add `--require-transition` to a `started` wait unless the target is
+> verifiably not-yet-started at arm time.
 
 ## Step 2 — Wire the Monitor
 

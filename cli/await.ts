@@ -87,6 +87,7 @@ Usage:
 
 Conditions (one per segment; join with the literal 'and' to wait for ALL):
   complete <id>      task done+approved, or epic popped off the board
+  started <id>       work has begun on the task/epic (monotonic milestone)
   unblocked <id>     row is workable now (concurrency mutexes don't block)
   git-clean          cwd's git root has no dirty/orphaned files (no id)
   agents-idle        no OTHER working session inside the git root (no id)
@@ -229,6 +230,7 @@ type ReQueryOutcome = "hit" | "miss" | "indeterminate";
 const PLANCTL_CONDITIONS: ReadonlySet<string> = new Set([
   "complete",
   "unblocked",
+  "started",
 ]);
 /** Conditions that take NO positional arg. */
 const NULLARY_CONDITIONS: ReadonlySet<string> = new Set([
@@ -702,7 +704,10 @@ export async function runAwait(
   // git/jobs off the one snapshot and skips the extra subscribe). git/jobs
   // WITHOUT any planctl segment → dedicated subscribeCollection streams.
   const hasPlanctl = args.segments.some(
-    (s) => s.condition === "complete" || s.condition === "unblocked",
+    (s) =>
+      s.condition === "complete" ||
+      s.condition === "unblocked" ||
+      s.condition === "started",
   );
   const hasGitClean = args.segments.some((s) => s.condition === "git-clean");
   const hasAgentsIdle = args.segments.some(
@@ -738,7 +743,11 @@ export async function runAwait(
 
   // Build the latched slots in segment order (the line render walks them).
   const slots: SlotState[] = args.segments.map((seg): SlotState => {
-    if (seg.condition === "complete" || seg.condition === "unblocked") {
+    if (
+      seg.condition === "complete" ||
+      seg.condition === "unblocked" ||
+      seg.condition === "started"
+    ) {
       return {
         kind: "planctl",
         target: seg.target,

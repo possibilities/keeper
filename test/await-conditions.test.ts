@@ -296,6 +296,121 @@ test("fn-756 task-complete: done + (ignored) rejected → met (approval no longe
 });
 
 // ---------------------------------------------------------------------------
+// Task-started: the monotonic "work has begun at least once" milestone.
+// True via any of {jobs non-empty, runtime_status in {in_progress, done},
+// worker_phase=done}; never `stuck`, even on a blocked-but-ran row.
+// ---------------------------------------------------------------------------
+
+function startedTaskState(task: Task): AwaitState {
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  return evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: task.task_id, kind: "task", condition: "started" },
+  );
+}
+
+test("task-started: embedded job present → met", () => {
+  const task = makeTask({ jobs: [makeEmbeddedJob({})] });
+  expect(startedTaskState(task).kind).toBe("met");
+});
+
+test("task-started: runtime_status=in_progress → met", () => {
+  const task = makeTask({ runtime_status: "in_progress" });
+  expect(startedTaskState(task).kind).toBe("met");
+});
+
+test("task-started: runtime_status=done → met", () => {
+  const task = makeTask({ runtime_status: "done" });
+  expect(startedTaskState(task).kind).toBe("met");
+});
+
+test("task-started: worker_phase=done → met (even with default runtime_status)", () => {
+  const task = makeTask({ worker_phase: "done" });
+  expect(startedTaskState(task).kind).toBe("met");
+});
+
+test("task-started: all defaults (no job, todo, open) → waiting", () => {
+  const task = makeTask({});
+  expect(startedTaskState(task).kind).toBe("waiting");
+});
+
+test("task-started: runtime_status=blocked alone (never ran) → waiting", () => {
+  // An unrecognized/blocked status with no job and no worker-done is NOT
+  // started — set membership, never `!== "todo"`.
+  const task = makeTask({ runtime_status: "blocked" });
+  expect(startedTaskState(task).kind).toBe("waiting");
+});
+
+test("task-started: blocked-but-ran (job present + runtime_status=blocked) → met, never stuck", () => {
+  // A task that already ran a worker and then got blocked reads `met` — the
+  // started predicate is evaluated BEFORE any stuck/blocked branch.
+  const task = makeTask({
+    jobs: [makeEmbeddedJob({})],
+    runtime_status: "blocked",
+  });
+  expect(startedTaskState(task).kind).toBe("met");
+});
+
+test("task-started: absent + priorPresence → met (popped off ⇒ was started)", () => {
+  // Monotonic: a started target that popped off the board fires `met` off
+  // the absentBranch, NOT `deleted` — and needs no re-query.
+  const snap = run([]);
+  const state = evaluateAwaitCondition(
+    { epics: [], snapshot: snap, priorPresence: true },
+    { id: "fn-1-foo.1", kind: "task", condition: "started" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+test("task-started: absent + no priorPresence → not-found", () => {
+  const snap = run([]);
+  const state = evaluateAwaitCondition(
+    { epics: [], snapshot: snap, priorPresence: false },
+    { id: "fn-1-foo.1", kind: "task", condition: "started" },
+  );
+  expect(state.kind).toBe("not-found");
+});
+
+// ---------------------------------------------------------------------------
+// Epic-started: any task started OR an epic-level job present → met.
+// ---------------------------------------------------------------------------
+
+function startedEpicState(epic: Epic): AwaitState {
+  const snap = run([epic]);
+  return evaluateAwaitCondition(
+    { epics: [epic], snapshot: snap, priorPresence: true },
+    { id: epic.epic_id, kind: "epic", condition: "started" },
+  );
+}
+
+test("epic-started: a task is started → met", () => {
+  const task = makeTask({ runtime_status: "in_progress" });
+  const epic = makeEpic({ tasks: [task] });
+  expect(startedEpicState(epic).kind).toBe("met");
+});
+
+test("epic-started: epic-level job present, all tasks todo → met", () => {
+  const task = makeTask({});
+  const epic = makeEpic({ tasks: [task], jobs: [makeEmbeddedJob({})] });
+  expect(startedEpicState(epic).kind).toBe("met");
+});
+
+test("epic-started: all tasks todo + no epic job → waiting", () => {
+  const epic = makeEpic({ tasks: [makeTask({})] });
+  expect(startedEpicState(epic).kind).toBe("waiting");
+});
+
+test("epic-started: absent + priorPresence → met (popped off ⇒ was started)", () => {
+  const snap = run([]);
+  const state = evaluateAwaitCondition(
+    { epics: [], snapshot: snap, priorPresence: true },
+    { id: "fn-1-foo", kind: "epic", condition: "started" },
+  );
+  expect(state.kind).toBe("met");
+});
+
+// ---------------------------------------------------------------------------
 // Epic-complete: present-on-board → waiting; absent + priorPresence +
 // reQueryHit → met; absent + priorPresence + re-query miss → deleted;
 // absent + no priorPresence → not-found.

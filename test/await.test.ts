@@ -404,7 +404,7 @@ function makeHarness(connect: ConnectFactory): AwaitHarness {
 type RunnerArgs = Parameters<typeof runAwait>[0];
 
 function singleArgs(
-  condition: "complete" | "unblocked",
+  condition: "complete" | "unblocked" | "started",
   id: string,
   kind: "task" | "epic",
   overrides: Partial<Omit<RunnerArgs, "segments">> = {},
@@ -441,7 +441,7 @@ function argsFor(
 }
 
 const planctlSeg = (
-  condition: "complete" | "unblocked",
+  condition: "complete" | "unblocked" | "started",
   id: string,
   kind: "task" | "epic",
 ): RunnerArgs["segments"][number] => ({
@@ -517,6 +517,31 @@ test("parseAwaitArgs: unblocked + bare epic id", () => {
   const seg = r.args.segments[0];
   if (seg?.condition !== "unblocked" || !("target" in seg)) {
     throw new Error("expected a planctl unblocked segment");
+  }
+  expect(seg.target.kind).toBe("epic");
+});
+
+test("parseAwaitArgs: started + task id classifies as task", () => {
+  const r = parseAwaitArgs(["started", "fn-1-foo.1"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "started" || !("target" in seg)) {
+    throw new Error("expected a planctl started segment");
+  }
+  expect(seg.target.id).toBe("fn-1-foo.1");
+  expect(seg.target.kind).toBe("task");
+});
+
+test("parseAwaitArgs: started + bare epic id classifies as epic", () => {
+  const r = parseAwaitArgs(["started", "fn-99"]);
+  if (!r.ok) {
+    throw new Error(`expected ok, got ${r.message}`);
+  }
+  const seg = r.args.segments[0];
+  if (seg?.condition !== "started" || !("target" in seg)) {
+    throw new Error("expected a planctl started segment");
   }
   expect(seg.target.kind).toBe("epic");
 });
@@ -991,6 +1016,167 @@ test("epic unblocked: armed + ready task in epic → met (exit 0)", async () => 
   expect(lines).toContain("[keeper-await] armed");
   expect(lines).toContain("[keeper-await] met");
   expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// armed → met: task started (work begins between two polls)
+// ---------------------------------------------------------------------------
+
+test("task started: armed line + met when work begins (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("started", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: task is todo, no jobs → armed + waiting.
+  const taskTodo = makeTaskRow({
+    worker_phase: "open",
+    runtime_status: "todo",
+  });
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ tasks: [taskTodo] }));
+
+  expect(h.stdout).toHaveLength(1);
+  expect(h.stdout[0]).toContain("[keeper-await] armed");
+  expect(h.stdout[0]).toContain("target=fn-1-foo.1");
+  expect(h.stdout[0]).toContain("condition=started");
+  expect(h.exitCode).toBeNull();
+
+  // Second snapshot: work has begun (runtime_status flips) → met.
+  const taskRunning = makeTaskRow({ runtime_status: "in_progress" });
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [makeEpicRow({ tasks: [taskRunning] })],
+      2,
+    ),
+  ]);
+
+  expect(h.stdout).toHaveLength(2);
+  expect(h.stdout[1]).toContain("[keeper-await] met");
+  expect(h.stdout[1]).toContain("target=fn-1-foo.1");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// armed → immediate met: an already-started task fires met on first paint
+// (no refuse-upfront).
+// ---------------------------------------------------------------------------
+
+test("task started: already-started → armed + immediate met (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("started", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: task already has an embedded job → started on first frame.
+  const taskRan = makeTaskRow({
+    runtime_status: "in_progress",
+    jobs: [{ job_id: "s1", plan_verb: "work", state: "working" }],
+  });
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ tasks: [taskRan] }));
+
+  const lines = h.stdout.join("");
+  expect(lines).toContain("[keeper-await] armed");
+  expect(lines).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// start-and-finish-between-polls: a single post-completion frame still
+// fires met (the missed-start edge is a non-issue for the monotonic latch).
+// ---------------------------------------------------------------------------
+
+test("task started: started AND finished between polls → met off post-completion frame", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("started", "fn-1-foo.1", "task"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: task is todo → armed + waiting.
+  const taskTodo = makeTaskRow({
+    worker_phase: "open",
+    runtime_status: "todo",
+  });
+  deliverFiveWithEpic(sock, idPrefix, makeEpicRow({ tasks: [taskTodo] }));
+  expect(h.stdout[0]).toContain("armed");
+  expect(h.exitCode).toBeNull();
+
+  // Next frame: the task BOTH started and finished in the gap — we only see
+  // the post-completion snapshot (worker_phase=done). started still reads met.
+  const taskDone = makeTaskRow({
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  sock.deliver([
+    resultFrame(
+      "epics",
+      `${idPrefix}-epics`,
+      [makeEpicRow({ tasks: [taskDone] })],
+      2,
+    ),
+  ]);
+
+  expect(h.stdout).toHaveLength(2);
+  expect(h.stdout[1]).toContain("[keeper-await] met");
+  expect(h.exitCode).toBe(0);
+});
+
+// ---------------------------------------------------------------------------
+// started epic popped off the board → met via absentBranch (monotonic, no
+// re-query): a started target that vanished was necessarily started.
+// ---------------------------------------------------------------------------
+
+test("epic started: present-then-drop → met, no re-query (exit 0)", async () => {
+  const { factory, socketRef } = makeMockConnect();
+  const h = makeHarness(factory);
+  const idPrefix = `await-${process.pid}`;
+
+  await runAndCatch(singleArgs("started", "fn-1-foo", "epic"), h.deps);
+
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  sock.takeOutbound();
+
+  // First paint: epic present (no started work yet) → armed + waiting.
+  deliverFiveWithEpic(
+    sock,
+    idPrefix,
+    makeEpicRow({ tasks: [makeTaskRow({})] }),
+  );
+  expect(h.stdout[0]).toContain("armed");
+  expect(h.exitCode).toBeNull();
+
+  // Epic pops off the board (empty rows). For `started` this resolves to
+  // `met` SYNCHRONOUSLY off the absentBranch — no scope-exempt re-query.
+  sock.deliver([resultFrame("epics", `${idPrefix}-epics`, [], 2)]);
+
+  expect(h.exitCode).toBe(0);
+  const terminal = h.stdout.find((l) => l.includes("[keeper-await] met"));
+  expect(terminal).toBeDefined();
 });
 
 // ---------------------------------------------------------------------------

@@ -94,12 +94,16 @@ import type { Epic, GitStatus, Job, Task } from "./types";
 export type TargetKind = "epic" | "task";
 
 /**
- * The two planctl-board condition families — each takes exactly one
- * planctl id (`fn-N-slug` epic or `fn-N-slug.M` task). Distinguished from
+ * The planctl-board condition families — each takes exactly one planctl id
+ * (`fn-N-slug` epic or `fn-N-slug.M` task). Distinguished from
  * {@link GitJobCondition} (which take NO id and read git/jobs rows
  * directly) so the grammar's per-condition arity is type-driven.
+ *
+ * `complete` is the end-bookend; `started` is the symmetric start-bookend —
+ * a monotonic "work has begun at least once" milestone, NOT the liveness
+ * `running` verdict (which flaps between turns and is reconnect-sensitive).
  */
-export type PlanctlCondition = "complete" | "unblocked";
+export type PlanctlCondition = "complete" | "unblocked" | "started";
 
 /**
  * The two non-planctl condition families (fn-713). Neither carries a
@@ -358,6 +362,53 @@ function epicAnyStuckRow(
 }
 
 // ---------------------------------------------------------------------------
+// Started: the monotonic "work has begun at least once" milestone
+// ---------------------------------------------------------------------------
+
+/**
+ * Pure "this task has begun being worked at least once" predicate — the
+ * start-bookend keying signal. True once ANY of:
+ *   - an embedded `work`/`approve` job is present (`jobs[]` non-empty),
+ *   - `runtime_status` is in the explicit started set {in_progress, done},
+ *   - `worker_phase === "done"`.
+ *
+ * Set membership on the opaque `runtime_status` string is deliberate — NEVER
+ * `!== "todo"`, which would mint `met` for an unrecognized/blocked-pre-start
+ * value. Deliberately NOT the readiness `running` verdict: that flaps between
+ * turns and is reconnect-sensitive, while this milestone is monotonic (an
+ * embedded job persists `ended`/`killed`; `worker_phase` latches `done`).
+ */
+function taskStarted(task: Task): boolean {
+  if ((task.jobs?.length ?? 0) > 0) {
+    return true;
+  }
+  if (task.runtime_status === "in_progress" || task.runtime_status === "done") {
+    return true;
+  }
+  return task.worker_phase === "done";
+}
+
+/**
+ * Pure "work has begun on this epic at least once" predicate. True if the
+ * epic carries an embedded epic-form job (`plan`/`close`/`approve`) OR any
+ * task satisfies {@link taskStarted}. Mirrors `readiness.ts`'s
+ * `epicWorkStarted` undefined-guard style but composes the FULL task
+ * predicate — `epicWorkStarted` only checks `jobs.length` (it gates the
+ * planner-running discharge, a narrower question), so it is not reused here.
+ */
+function epicStarted(epic: Epic): boolean {
+  if ((epic.jobs?.length ?? 0) > 0) {
+    return true;
+  }
+  for (const task of epic.tasks) {
+    if (taskStarted(task)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// ---------------------------------------------------------------------------
 // Inputs
 // ---------------------------------------------------------------------------
 
@@ -410,8 +461,10 @@ export interface AwaitInputs {
  *
  *   - Target absent from `inputs.epics`:
  *       priorPresence === false → `not-found`
- *       priorPresence === true  → `met` if (condition='complete' AND
- *                                   reQueryHit), else `deleted`
+ *       priorPresence === true  → `met` if condition='started' (monotonic —
+ *                                   a popped-off target was necessarily
+ *                                   started, no re-query) OR (condition=
+ *                                   'complete' AND reQueryHit), else `deleted`
  *       (rationale: an epic "popping off the board" because it transitioned
  *       to `status=='done'` (the terminal planctl status — there is no
  *       `closed`) is the spec's positive completion signal; the command's
@@ -424,6 +477,11 @@ export interface AwaitInputs {
  *                 truly complete has popped off the board scope — see
  *                 absent branch above). If the epic is still on the
  *                 board, it isn't complete yet; return `waiting`.
+ *       condition='started'  → read the raw fields (met / waiting only,
+ *           evaluated BEFORE any stuck branch so a blocked-but-ran row
+ *           reads `met`):
+ *           task: taskStarted(task) → `met`; else `waiting`.
+ *           epic: epicStarted(epic) → `met`; else `waiting`.
  *       condition='unblocked' → read the verdict map:
  *           task: workable(perTask[id]) → `met`; isStuck(perTask[id])
  *                 → `stuck`; else `waiting`.
@@ -464,6 +522,15 @@ function evaluateTaskAwait(
       detail: `task not complete (worker_phase=${task.worker_phase ?? "null"})`,
     };
   }
+  if (target.condition === "started") {
+    // Evaluated off the raw task fields, BEFORE any stuck/blocked read — a
+    // blocked task that already ran reads `met` (monotonic milestone), never
+    // `stuck`. Returns met / waiting only.
+    if (taskStarted(hit.task)) {
+      return { kind: "met", detail: "task started" };
+    }
+    return { kind: "waiting", detail: "task not started yet" };
+  }
   // unblocked
   const v = inputs.snapshot.perTask.get(target.id);
   if (v === undefined) {
@@ -499,6 +566,15 @@ function evaluateEpicAwait(
       detail: `epic still on board (status=${epic.status ?? "null"})`,
     };
   }
+  if (target.condition === "started") {
+    // Evaluated off the raw embedded jobs/tasks, BEFORE the workable/stuck
+    // read — an epic with any started task reads `met` (monotonic), never
+    // `stuck`. Returns met / waiting only.
+    if (epicStarted(epic)) {
+      return { kind: "met", detail: "epic started" };
+    }
+    return { kind: "waiting", detail: "epic not started yet" };
+  }
   // unblocked
   if (epicHasWorkableRow(epic, inputs.snapshot)) {
     return { kind: "met", detail: "epic has at least one workable row" };
@@ -513,6 +589,16 @@ function evaluateEpicAwait(
 function absentBranch(inputs: AwaitInputs, target: AwaitTarget): AwaitState {
   if (!inputs.priorPresence) {
     return { kind: "not-found", detail: "target absent from board scope" };
+  }
+  // `started` is monotonic: a target present in a prior tick that has now
+  // popped off the board was necessarily started, so `met` fires directly —
+  // no `deleted` re-query needed (unlike `complete`, which must disambiguate
+  // a true completion from a deletion).
+  if (target.condition === "started") {
+    return {
+      kind: "met",
+      detail: "target dropped off board (was started)",
+    };
   }
   // Was present in a prior tick, gone now — let the command's
   // scope-exempt re-query disambiguate complete-vs-deleted.
