@@ -39,5 +39,5 @@ Generalize test/setup-tmux.test.ts: `makeOfferStub` (:579-597) currently special
 - [ ] test matrix (both-absent / one-absent / both-present / count-0 / non-TTY / per-session argv) passes; `bun run test:full` green.
 
 ## Done summary
-
+Generalized the setup-tmux restore offer from foreground-only to all human work sessions (foreground+background, excluding managed autopilot): per-session candidate count map, one combined TTY prompt, per-session run() spawn with continue-on-error, parameterized buildRestoreAgentsArgv. HELP/docstring/README revised; test:full green.
 ## Evidence
