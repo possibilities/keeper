@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-13T12:46:41.204000Z",
+  "depends_on": [],
+  "epic": "fn-38-close-worker-harness-drop-gaps",
+  "id": "fn-38-close-worker-harness-drop-gaps.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Recover parent-session-teardown orphans",
+  "updated_at": "2026-06-15T06:57:54.042000Z",
+  "worker_done_at": "2026-06-15T06:57:54.042000Z"
+}

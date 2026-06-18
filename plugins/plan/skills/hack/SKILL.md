@@ -1,0 +1,248 @@
+---
+name: hack
+description: Investigate a request and answer in the right shape — read-only by default; with plain-text confirmation, can execute small work inline, sketch a direction in chat, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
+argument-hint: "<request>"
+disable-model-invocation: true
+allowed-tools: Bash(pairctl:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(planctl list:*), Bash(planctl epics:*), Bash(promptctl:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
+---
+
+# Hack
+
+Investigate a request, answer in the right shape, then either route or execute the next move. One entry point that infers what's needed.
+
+Most invocations are read-only — investigate, answer, stop. When the request reads as work to do — *including when it's phrased as a directive like "edit X to do Y" or "the skill should do Z"* — /hack stops, lays out the concrete change in chat (file, section, the actual new wording or structural edit), and waits for plain-text greenlight before touching anything. A directive in the request sets the topic; it is **not** pre-given approval. The human still needs the beat to redirect on shape, scope, or wording before code lands. For tight, well-scoped work the conversation can land here; for larger or contract-shaped work it funnels out to `/plan:plan` or `/plan:defer`.
+
+## Read the request, infer the mode
+
+Pick a mode from the wording, then operate in that shape. Don't pre-announce the choice — the answer's structure reveals it.
+
+- **Quick-answer** — bounded factoid, yes/no, "how does X work." Terse chat reply, optional brief `## Context` block from local sources only.
+- **Troubleshoot** — "broken," "fails," "why doesn't," "doesn't work." Reproduce, isolate, find root cause, quote evidence. No fix yet.
+- **Internal report** — "summarize," "compare," "give me a writeup." Project-internal sources only — codebase, git history, `knowctl`, `claudectl`. No web search, no scraping.
+- **External research** — "what does the web say," "current state of X," "what are people doing." `searchctl`, `scrapectl`, `agent-browser`, `knowctl`. Primary sources, cited URLs.
+- **Work-shaped** — "add X," "build Y," "implement Z," "fix this." Investigate enough to understand scope, then stop and confirm with the human before touching anything. If they greenlight, execute inline; otherwise route to `/plan:plan` or `/plan:defer`.
+
+If two modes feel equally plausible and the choice would meaningfully change the answer's shape, ask one short plain-text question first. Otherwise pick and proceed.
+
+## How to investigate
+
+Universal moves, in any mode:
+
+- Reproduce or witness the thing literally before theorizing. For a bug, run it; for a system claim, look at the actual code or log.
+- Read evidence literally — quote exact errors, exact log lines, exact code paths, with `path:line` where useful.
+- Form one hypothesis at a time and test it. Don't pile guesses on guesses.
+- Follow data across boundaries (process/file/network/cache). Most surprises live at handoffs.
+- Check recent movement: `git log --oneline -20`, `git log -S <symbol>`, `git blame`, `claudectl list-sessions`.
+- Mine session history when the question is who/when/what-happened: keeper's database holds every prompt, tool call, file mutation, and subagent run across all sessions — recipes below.
+- Delegate when wide: if the investigation spans more than one subsystem or repo, or balloons past ~10 reads, fan out parallel read-only Explore agents (Agent tool, one per surface) and keep this context for synthesis and the conversation. Brief each agent to reproduce before theorizing, quote exact evidence with `path:line`, and return conclusions, not file dumps.
+- Bring in `pairctl send-message` for a quick second opinion when your mental model feels sticky — a single partner, lightweight, narrow. This is **not** the panel: the panel (the routing gate below) is a heavier multi-model fan-out plus a judge, reserved for answering the inquiry itself, not for unsticking a mid-investigation hunch.
+
+Mode-specific moves:
+
+- **Quick-answer** — cap local reads around three; if you need more, you guessed the mode wrong, upgrade to report or troubleshoot.
+- **Troubleshoot** — reproduce → narrow surface → quote evidence → hypothesize → test → repeat. `keeper`, `tmuxctl`, recent `git log` and `git blame` are faster than guessing. When the trail is cold, the history recipes below find who touched what, when, and in which session.
+- **Internal report** — codebase, configs, git history, keeper session history, `knowctl`, `claudectl`. Skip `searchctl` and `scrapectl`. Gather enough to be thorough — don't exhaustively research.
+- **External research** — cast a wide net with `searchctl web-search` / `reason-search` / `pro-search`; pull primary sources via `scrapectl fetch-markdown`; use `agent-browser` for pages needing interaction or JS; cross-reference; flag disagreements; cite URLs for key claims.
+- **Work-shaped** — read enough of the surface to understand what would change, what's affected, and what's not yet decided; surface that in chat before any edit. Above inline size, investigate like you'll have to defend the direction: mine prior work (`claudectl list-sessions` / `show-session` for related conversations, `planctl epics` for adjacent epics, `knowctl` for framework docs), read the touched surface until you're confident — no read cap at this tier — and trace the data across every boundary the change crosses. Thin investigation is what makes a sketch thin.
+
+### Session history (keeper.db)
+
+<!-- Canonical source: promptctl render engineering/keeper-history-forensics -->
+
+Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, planctl op, file mutation, and subagent run. Query it with `sqlite3 -readonly` only — the keeper daemon is the sole writer. Large `data` payloads may live in the `event_blobs` side table, so read payloads as `COALESCE(e.data, b.data)` via `LEFT JOIN event_blobs b ON b.event_id = e.id`.
+
+**Who last touched a file** — then replay that session:
+
+```bash
+sqlite3 -readonly ~/.local/state/keeper/keeper.db \
+  "SELECT session_id, datetime(last_mutation_at,'unixepoch','localtime') AS at, op, source
+   FROM file_attributions WHERE file_path LIKE '%<name>%'
+   ORDER BY last_mutation_at DESC LIMIT 10"
+```
+
+Feed the `session_id` to `claudectl show-session <id>` to see what that session actually did and why.
+
+**Search past prompts** — "when did we discuss X / decide Y" (full scan; takes a few seconds):
+
+```bash
+sqlite3 -readonly ~/.local/state/keeper/keeper.db \
+  "SELECT datetime(e.ts,'unixepoch','localtime') AS at, e.session_id,
+          substr(json_extract(COALESCE(e.data,b.data),'$.prompt'),1,200) AS prompt
+   FROM events e LEFT JOIN event_blobs b ON b.event_id=e.id
+   WHERE e.hook_event='UserPromptSubmit' AND COALESCE(e.data,b.data) LIKE '%<term>%'
+   ORDER BY e.ts DESC LIMIT 20"
+```
+
+**What a session did** — the tool-call spine without transcript bulk:
+
+```bash
+sqlite3 -readonly ~/.local/state/keeper/keeper.db \
+  "SELECT datetime(ts,'unixepoch','localtime') AS at, hook_event, tool_name,
+          COALESCE(slash_command, skill_name, planctl_op, '') AS verb
+   FROM events WHERE session_id='<id>' AND hook_event IN ('UserPromptSubmit','PreToolUse')
+   ORDER BY ts LIMIT 300"
+```
+
+**Failed-worker forensics** — `subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; join `events` on `agent_id` for its tool stream. `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay.
+
+`events` columns worth filtering on: `slash_command`, `skill_name`, `planctl_op` / `planctl_epic_id` / `planctl_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd`. The schema shifts across keeper versions — when a query errors, check `.schema events` rather than guessing.
+
+## Prefer the panel for any non-tiny inquiry
+
+Before answering solo, gate on size: **strongly prefer `/arthack:panel`** for any inquiry that isn't tiny. The panel fans the question out to two models in parallel (Opus 4.8 + GPT-5.5) and fuses their answers with a judge — higher confidence, surfaced blind spots, contradictions caught. The default is to route there; answering solo is the opt-out, earned only by triviality.
+
+- **Solo (no panel)** — the prompt is tiny: a bounded factoid, a yes/no, a one-liner, a trivial lookup you'd answer from one or two local reads. Answer it directly here.
+- **Panel** — everything else: any hard question, multi-step reasoning, a high-stakes research/design/architecture call, troubleshooting where being confidently wrong is expensive, an internal or external report worth cross-checking. Invoke `/arthack:panel` with the **raw question plus any neutral evidence you've already gathered** (`path:line` cites, log lines, reproduction facts). Pass the question verbatim — never pre-digest it into /hack's tentative conclusion, and never seed the panelists with a leading answer. Independence is the point: a conclusion handed to the panel collapses two independent models into one.
+
+This is distinct from the `pairctl` quick second opinion above (one partner, mid-investigation, to unstick a hunch). The panel answers the inquiry; pairctl unsticks the investigation. When in doubt about size, route to the panel — the cost of a redundant fan-out is cheaper than a confidently wrong solo answer.
+
+**Work-shaped requests are not exempt.** "Add X," "build Y," "configure Z like the existing thing" reads like a directive with the direction already given — but above inline size the *approach* is still an open call, so route that design question to `/arthack:panel` before you sketch. The panel answers the *inquiry* shape (what's true, what's the right approach); the sketch/route machinery below still governs how any resulting work lands.
+
+## How to answer
+
+The chat reply's shape follows the mode. Don't say "operating in X mode" — let the structure show it.
+
+- **Quick-answer** — concise paragraph. Optional `## Context` block when ≤3 local reads meaningfully sharpen the answer; skip the section silently otherwise.
+- **Troubleshoot** — `What's happening` (the failure, literally) / `Where it breaks` (file:line, process, command) / `Why` (root cause in 1–2 sentences) / `Evidence` (the specific log, diff, or row) / optional `Suggested direction` (one sentence, no plan).
+- **Internal report** — 2–3-sentence executive summary, then sections with descriptive headings, tables and concrete numbers over prose, recommendations if applicable. Be thorough but scannable.
+- **External research** — start with key takeaways, organize into sections with headings, use concrete facts and quotes, note areas of uncertainty, end with a sources list.
+- **Work-shaped** — two tiers, gated by the same size clauses that decide where the work lands:
+  - **Inline-sized** (fits one or two files, no schema / protocol / UX boundary change) — one short paragraph naming what would change, what's affected, what's not yet decided. Enough for the human to confirm direction so you can execute inline.
+  - **Above inline** — produce a full sketch block (schema below). Investigate first per the work-shaped moves — prior work, full surface, boundaries. Then, before you commit to a direction, **route the design question to `/arthack:panel`** — an above-inline change (new contract, multi-module scope, a partner / worker / migration / screen) is exactly the high-stakes architecture call the panel gate names, and "add X / configure it like the existing thing" framing does **not** exempt it. Feed the panel the raw design question plus neutral evidence, not your tentative direction. Then **commit to one direction: pick the approach you would defend** — informed by the panel. Don't enumerate options as live equals — a single close alternative belongs in Risks & unknowns as one bullet, nowhere else.
+
+A confident "I don't know yet, here's what I've ruled out" is more useful than a confident wrong answer. Say so when the evidence is thin.
+
+### Sketch block (work-shaped, above inline)
+
+When a work-shaped request is above inline size, answer with this block. It is the chosen direction in chat — no code, no edits yet — and it is the one answer shape where depth is the point: the economy that keeps the other modes terse stops at this boundary. A sketch is rich because the investigation behind it was; every section below is grounded in something you actually read, not inferred from the request alone.
+
+Render each section as a `##` heading with substance under it — a sketch is a document the human thinks against, not a compressed schema:
+
+- **`## Goal`** — 1–2 sentences. What this work is for, in plain language.
+- **`## Direction`** — 3–6 bullets. The chosen approach, not code. Each bullet is a step or move, and carries a clause of why when the reasoning isn't obvious — enough rationale that the human can push back on the thinking, not just the sequence.
+- **`## Touchpoints`** — concrete files, modules, and commands with paths, one bullet each, citing `path:line` where useful. Say what changes at each touchpoint, not just that it's involved.
+- **`## Risks & unknowns`** — ≤4 bullets, one per bullet. A near-miss alternative direction, if any, appears here as a single bullet — nowhere else.
+- **`## Open decisions`** — ≤2 bullets, each a single question with a stated default ("A unless you say otherwise"). These give the human cheap handles — a fragment like "A" or "15 is good" answers one. Omit the section when nothing is genuinely open.
+
+For web or mobile work, add **`## Surface`** (1–2 sentences on the artifact, screen, or interface) and **`## Moves`** (≤6 bullets on key user interactions or system responses) before the schema above. Skip both for non-UI work.
+
+## How to route — pick one mid-terminal endpoint
+
+After the answer lands, infer which endpoint fits the work that may follow. Name it as a lead recommendation in one short sentence. List the others as one-line alternatives below. No structured pickers, no `AskUserQuestion`.
+
+The five mid-terminal endpoints:
+
+1. **(no action)** — the inquiry was the whole point; nothing follows.
+2. **→ execute inline** — tight, well-scoped work (one or two files, no new contracts, direction obvious). Before any edit, lay out the concrete change in chat: name the file, name the section, and either quote the proposed new wording verbatim or describe the structural edit in enough detail that the human can redirect on shape. Wait for plain-text greenlight. A directive-shaped request ("edit X", "add Y", "rename Z") scopes the work; the greenlight is a separate beat that authorizes it. Then make the change and commit per the rule below.
+3. **→ produce a sketch in chat** — work is plausibly implied but above inline size, or the human will want to think before changes land. Produce the sketch block from the answer section, then map the human's followup signal: plain-text greenlight → execute inline; "plan it" → `/plan:plan`; "defer it" → `/plan:defer`; "your call" → delegated routing per the rubric below.
+4. **→ `/plan:plan`** — the answer already laid plan-shaped structure (≥3 sequenceable moves, a schema or contract change, multi-module scope). Another sketch round would be ceremony. Route through the warm-handoff beat below — never fire the skill cold.
+5. **→ stay in inquiry** — go deeper (more reads, more boundaries), go wider (add external sources), or shift mode. Name a concrete next read, not a generic "more research?".
+
+Inference rubric:
+
+- Answer stood on its own with nothing actionable → **(no action)** lead.
+- Answer was terse and the human will likely want depth → **→ stay in inquiry** lead, with a specific next action.
+- The answer is work-shaped → size it against the rubric below to pick between inline, sketch-then-route, and `/plan:plan`.
+
+<!-- Canonical source: promptctl render engineering/escalate-inline-or-plan -->
+
+When a request reads as work to do, size it against this rubric before choosing how to act. The same clauses gate both the answer shape and where the work lands.
+
+- **Inline** when the change fits one or two files, introduces no schema / protocol / UX boundary change, the direction reads as a single coherent move, AND the human wants it done now. Answer with the short pre-work paragraph and execute on plain-text greenlight.
+- **`/plan:plan`** when the work spans multiple modules, adds a worker / RPC / migration / screen, introduces a new contract, or reads as ≥3 independently sequenceable moves. Decompose rather than commit.
+- **`/plan:defer`** when the work is inline-shaped (one cohesive task, no new contracts) BUT the human signaled "not now" / "later" / "follow up" / "queue this up" semantics. Capture it as a normal-sorted single-task epic; bump it to the front of the board later with `/plan:next` if the human wants it next.
+
+Tie-breakers:
+
+- Ambiguous between **inline** and **`/plan:plan`** → default to **`/plan:plan`**. Collapsing a plan back into one commit is cheaper than backing out of a premature commit.
+- Ambiguous between **inline** and **`/plan:defer`** → default to **`/plan:defer`**. Capturing it for later is cheaper than an unwanted commit landing now.
+
+When the answer is work-shaped and above inline size, lead with **→ produce a sketch in chat**, then route on the human's followup signal:
+
+- plain-text greenlight → **execute inline**;
+- "plan it" → `/plan:plan`;
+- "defer it" → `/plan:defer`;
+- "your call" (also "you decide" / "you pick" / "auto") → delegate the routing per the rubric above. Announce the chosen path and the deciding clause in one short sentence before executing (e.g. *"Routing to /plan:defer — inline-shaped but you signaled 'follow up later.'"*), giving the human a beat to override before anything lands.
+
+Read follow-ups for decision content, not keywords. A short fragment that answers an open decision ("A", "15 is good", "yup, lowercase") is the greenlight for that piece; an approve-plus-tweak reply ("looks good, but rename the flag") means apply the tweak and proceed — don't spend another round re-confirming.
+
+### Hand off to /plan:plan warm, not cold
+
+When the route is `/plan:plan` — inferred, or because the human said "plan it" — don't fire the skill as the literal next action. The pre-plan beat is what makes the plan session worth running:
+
+1. **Finish the exploration the sketch exposed.** Open the touchpoints you haven't read, run the command you were speculating about, delegate wide sweeps per the investigate rules. Scouts inside `/plan:plan` verify; they shouldn't discover.
+2. **Surface every open question and resolve it with the human** — one at a time, each with a short explainer (the tradeoff, why it matters, what each answer implies). Don't self-answer load-bearing unknowns. Update the sketch as answers land.
+3. **When nothing load-bearing remains open, fire `/plan:plan`**, passing forward what the conversation established as its instructions: the panel's verdict (if it ran), the sketch (goal, direction, touchpoints), the resolved decisions, and key evidence with `path:line` cites — so the plan session starts from this conversation's high-water mark instead of rediscovering it. The panel runs once, here at the inquiry stage; plan inherits its judgment through this handoff rather than re-invoking it.
+
+"Plan it" often arrives with this beat spelled out — "explore, resolve questions, then plan", "ask anything you need first, when ready /plan:plan". That phrasing sets the sequence, not just the destination; honor the sequence even when it's left implicit.
+
+### After an epic lands, arm an await when a follow-up earns it
+
+Scaffolding an epic — via `/plan:plan` or `/plan:defer` — doesn't have to end the session. Keeper's autopilot dispatches workers against ready plan work when armed, and the `keeper:await` skill blocks on board state (epic or task complete, or unblocked) then runs a follow-up action.
+
+- **The human used circle-back phrasing** — "circle back", "wait for followup", "check back after the epic lands", "ping me when it's done", or any wait-then-act wording, anywhere in the conversation → that's the directive: arm `keeper:await` with the condition (`complete fn-N-slug[.M]`) and the follow-up action spelled out. No confirmation beat.
+- **A follow-up was recommended or discussed** — a phase-2 plan gated on this epic's outcome, a verification pass, a follow-up you recommended in the answer → weigh it: if the await is more likely useful than not, arm it without asking. The human can always close it to override.
+- **Neither** → stop silently. No "nothing worth awaiting" narration, no generic "want me to wait?" — an idle await is noise, and so is talking about not arming one. Deferred epics bias hard this way.
+
+When auto-arming, give the human basic context in one or two sentences: what condition the await watches, what fires when it completes, and which part of the conversation made it worth arming.
+
+Daisy-chain: plan the first epic, await its completion while autopilot runs the work, then plan the next phase from what landed — one session driving several plan rounds without the human re-priming context. Each round re-runs the same check before arming the next; when in doubt, stop and hand back.
+
+### Orchestration is yours to shape
+
+You have standing license to conform planctl tooling to the workflow that best delivers, across a closed set: epic right-sizing, multi-repo-root epics (per-task `target_repo`), queue/defer shapes, and awaits and daisy-chains. Confident the shape serves the work → act and inform. Unsure, or the move is off this list → ask first. This discretion never overrides the wait-for-plain-text-greenlight beat before code edits: the greenlight rule elsewhere in this file stays exactly as binding.
+
+If genuinely torn between two endpoints, ask one short plain-text question.
+
+When the chosen endpoint is **execute inline**, the work lands and gets committed here — but only after the human confirms direction in plain text. The commit follows the rule below.
+
+**Forward-facing advice and comments only.** Whatever you write — code comments, docs, skill or command prose, CLI `--help` / `--agent-help` strings, hook messages — states the system as it is *now*. Do not narrate what something replaced, was renamed from, or used to do.
+
+- ❌ "fn-622 retired the dedup mechanism, so renders changed" / "formerly emitted a subset"
+- ✅ "renders always emit the full snippet set"
+
+The one carve-out: commit messages and changelogs are the sanctioned home for history and *should* narrate the change in past tense. Full rule lives in `promptctl render code-comment-style` (comments) and `promptctl render future-facing-docs` (docs and prompts) — cite those, don't restate them.
+
+**Commit by default — don't punt it back to the human.** Once edits land successfully, run `keeper commit-work` yourself in the same turn. Don't stop and ask "want me to commit?", don't suggest the human run `keeper commit-work`, don't leave a dirty working tree as a handoff. The carve-outs at the bottom of the rule below (human-flagged throwaway / debug instrumentation) are the only reasons to skip — and if a change genuinely feels uncommittable (unrelated dirty files in the index, scope ambiguous, mid-investigation), name that specifically instead of using it as a generic excuse to defer.
+
+<!-- Canonical source: promptctl render engineering/commit-via-keeper-default -->
+
+**Commit source changes with `keeper commit-work`, not raw `git commit`.** `commit-work` runs the project's full lint matrix (ruff + ruff format + ty + cli-boundaries when Python is staged; npm lint per JS/TS package; shellcheck / zig / lua / hadolint per relevant staged file) inside a per-host flock, lands the commit, and pushes to origin — all in one call. Don't invoke linters separately; `commit-work` is the single seam.
+
+Preview, then commit:
+
+```bash
+keeper commit-work --preview-files
+keeper commit-work "<type>(<scope>): <summary>
+
+<optional body — 1-3 bullets>"
+```
+
+`<type>` is usually `feat` / `fix` / `refactor` / `test` / `docs`. `<scope>` comes from the file set (CLI name, plugin name, package). Push to origin is automatic after a successful commit.
+
+**On the `lint_failed` envelope** (`{"success": false, "error": "lint_failed", "linter": "<which>", "files": [...], "stderr": "<verbatim>"}`): read the named files, fix per the stderr, re-stage with `git add`, re-invoke `keeper commit-work` with the same message. This is the only `commit-work` failure mode you handle inline.
+
+**Any other non-zero exit** (`commit_failed`, `push_non_fast_forward`, `push_auth`, `push_hook_rejected`, `lock_timeout`, etc.) → stop and surface the verbatim envelope JSON to the human. Don't patch the tool you're calling; don't retry blindly.
+
+**Never** `--no-verify`, `--no-gpg-sign`, `--amend`, `git add -A`, or `git add .` — see `promptctl render engineering/commit-hygiene-flags`.
+
+**Escape hatch — if `commit-work` won't stage the full file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), don't fight it — commit with plain `git` instead. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. This is a temporary escape hatch we'll repair; for now you're empowered to use git directly whenever `commit-work` can't cover what you need.
+
+**The only times to skip `commit-work`:**
+
+- Explicitly experimental or scratch changes the human has flagged as throwaway.
+- Debugging prints or temporary instrumentation you'll discard before continuing.
+
+In those cases, don't commit at all unless asked.
+
+Phrasing pattern (lead + alternatives, ≤5 lines total):
+
+> Above a single-file edit — here's a sketch of the direction. Greenlight to execute, or say "plan it" to decompose first.
+>
+> Other paths: "defer it" to queue without working it now; or ask me to dig into <specific area> before deciding.
+
+If no request appears below, respond only with "Ready."
+
+## Request
+
+$ARGUMENTS

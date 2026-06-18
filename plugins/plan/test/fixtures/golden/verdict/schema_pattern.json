@@ -1,0 +1,37 @@
+{
+  "envelope": {
+    "error": {
+      "code": "VERDICT_INVALID",
+      "details": {
+        "error_count": 1,
+        "errors": [
+          {
+            "loc": "decisions[0].action",
+            "msg": "'bogus-action' does not match '^(kept|culled|merged-into-.+)$'",
+            "type": "pattern"
+          }
+        ],
+        "schema_fragment": {
+          "action": {
+            "pattern": "^(kept|culled|merged-into-.+)$",
+            "type": "string"
+          }
+        }
+      },
+      "message": "verdict failed validation (1 error(s)); fix the listed paths and resubmit"
+    },
+    "success": false
+  },
+  "input": {
+    "decisions": [
+      {
+        "action": "bogus-action",
+        "fid": "f1",
+        "rationale": "r",
+        "task": 1
+      }
+    ],
+    "fatal": false,
+    "fatal_reason": ""
+  }
+}

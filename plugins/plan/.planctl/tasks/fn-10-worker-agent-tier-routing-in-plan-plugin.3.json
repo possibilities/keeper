@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T01:55:21.765131Z",
+  "depends_on": [
+    "fn-10-worker-agent-tier-routing-in-plan-plugin.2"
+  ],
+  "epic": "fn-10-worker-agent-tier-routing-in-plan-plugin",
+  "id": "fn-10-worker-agent-tier-routing-in-plan-plugin.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Drop plugin-dir launch flag from keeper",
+  "updated_at": "2026-06-10T02:29:32.689672Z",
+  "worker_done_at": "2026-06-10T02:29:32.689672Z"
+}

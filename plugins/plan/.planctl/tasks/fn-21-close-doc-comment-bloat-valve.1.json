@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T19:41:15.634407Z",
+  "depends_on": [],
+  "epic": "fn-21-close-doc-comment-bloat-valve",
+  "id": "fn-21-close-doc-comment-bloat-valve.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "Thread discipline into worker template",
+  "updated_at": "2026-06-10T20:13:50.469961Z",
+  "worker_done_at": "2026-06-10T20:13:50.469961Z"
+}

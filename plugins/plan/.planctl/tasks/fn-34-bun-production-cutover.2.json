@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T17:51:50.671828Z",
+  "depends_on": [
+    "fn-34-bun-production-cutover.1"
+  ],
+  "epic": "fn-34-bun-production-cutover",
+  "id": "fn-34-bun-production-cutover.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "Promote script cutover and soak",
+  "updated_at": "2026-06-12T18:03:15.035000Z",
+  "worker_done_at": "2026-06-12T18:03:15.035000Z"
+}

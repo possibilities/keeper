@@ -1,0 +1,19 @@
+{
+  "approval": "approved",
+  "bundles": [],
+  "created_at": "2026-06-04T14:48:06.580804Z",
+  "depends_on": [
+    "fn-1-split-queue-into-defer-and-next.1",
+    "fn-1-split-queue-into-defer-and-next.2",
+    "fn-1-split-queue-into-defer-and-next.3"
+  ],
+  "epic": "fn-1-split-queue-into-defer-and-next",
+  "id": "fn-1-split-queue-into-defer-and-next.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "medium",
+  "title": "Sweep prose to defer-next model",
+  "updated_at": "2026-06-04T15:51:15.287953Z",
+  "worker_done_at": "2026-06-04T15:45:47.290448Z"
+}

@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T00:38:57.139808Z",
+  "depends_on": [],
+  "epic": "fn-27-pin-cross-language-marker-contract-with",
+  "id": "fn-27-pin-cross-language-marker-contract-with.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "medium",
+  "title": "Add marker round-trip test",
+  "updated_at": "2026-06-12T00:47:40.283368Z",
+  "worker_done_at": "2026-06-12T00:47:40.283368Z"
+}

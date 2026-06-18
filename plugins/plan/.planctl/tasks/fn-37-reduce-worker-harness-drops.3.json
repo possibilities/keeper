@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-13T00:44:57.633000Z",
+  "depends_on": [],
+  "epic": "fn-37-reduce-worker-harness-drops",
+  "id": "fn-37-reduce-worker-harness-drops.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "Classify silent worker process deaths",
+  "updated_at": "2026-06-13T01:04:08.477000Z",
+  "worker_done_at": "2026-06-13T01:04:08.477000Z"
+}

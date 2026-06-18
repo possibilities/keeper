@@ -1,0 +1,15 @@
+{
+  "approval": "approved",
+  "bundles": [],
+  "created_at": "2026-06-04T15:56:27.105726Z",
+  "depends_on": [],
+  "epic": "fn-3-update-queue-jump-inline-docs-to",
+  "id": "fn-3-update-queue-jump-inline-docs-to.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "medium",
+  "title": "fix stale queue_jump comment references",
+  "updated_at": "2026-06-04T17:02:16.639221Z",
+  "worker_done_at": "2026-06-04T16:46:39.306377Z"
+}

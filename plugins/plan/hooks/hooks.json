@@ -1,0 +1,62 @@
+{
+  "description": "planctl generated-file guard: PreToolUse(Write|Edit) blocks edits to _promptctl_path-marked files; PostToolUse(Read) warns. Plus the content-blind orchestrator guards: PreToolUse(Bash) commit hard-deny, SubagentStop worker guard, Stop checklist guard (bun dispatchers).",
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/pre-hook.ts"]
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/commit-guard.ts"]
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Read",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/post-hook.ts"]
+          }
+        ]
+      }
+    ],
+    "SubagentStop": [
+      {
+        "matcher": "plan:worker-medium|plan:worker-high|plan:worker-xhigh|plan:worker-max",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/subagent-stop-guard.ts"]
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bun",
+            "args": ["${CLAUDE_PLUGIN_ROOT}/plugin/hooks/stop-guard.ts"]
+          }
+        ]
+      }
+    ]
+  }
+}

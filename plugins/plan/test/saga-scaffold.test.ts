@@ -1,0 +1,976 @@
+// Engine-agnostic conformance spec for `planctl scaffold` — translated from
+// tests/test_scaffold.py, every node mapped by a source-comment. The single
+// transactional mint: one planctl_invocation envelope covering epic JSON + spec +
+// every task JSON + spec; verbatim specs; 1-based ordinal deps + forward-ref two-
+// pass resolution; epic-level depends_on_epics order-preservation + the typed
+// epic_dep_invalid failure family; the bad_yaml / spec_invalid / dep_invalid /
+// dep_cycle failure shapes (each writes nothing); per-task target_repo persistence
+// + sorted-uniq repo_distribution rollup; repo_invalid / bad_yaml target_repo
+// guards; the fresh-epic last_validated_at stamp + one-commit coverage; the
+// missing-session-id fail-closed; stdin (--file -) + the 1 MiB cap; per-task tier
+// persistence + the tier_invalid / bad_yaml tier guards + collect-all-offenders;
+// epic.queue_jump riding the envelope; the dup-slug guard + --allow-duplicate +
+// the suffix false-positive regression + atomicity.
+//
+// Every scaffold node is integration-marked in the Python suite (scaffold's mint-
+// time integrity gate runs check_filesystem_repos=true, needing a real .git/), so
+// every test here is gated behind SLOW_ENABLED (skipped in the fast `bun test`,
+// run under PLANCTL_RUN_SLOW=1) and fixtured on a real-git withProject.
+
+import { beforeEach, describe, expect, test } from "bun:test";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  realpathSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+
+import {
+  firstJsonPayload,
+  gitInit,
+  gitLogCount,
+  type ProjectHandle,
+  runCli,
+  SLOW_ENABLED,
+  withProject,
+} from "./harness.ts";
+
+const slow = test.skipIf(!SLOW_ENABLED);
+
+const VALID_TASK_SPEC = [
+  "## Description",
+  "Implement the thing.",
+  "",
+  "## Acceptance",
+  "- [ ] It works.",
+  "",
+  "## Done summary",
+  "",
+  "## Evidence",
+  "",
+].join("\n");
+
+let project: ProjectHandle;
+const getProject = withProject("planctl-scaffold-");
+beforeEach(() => {
+  project = getProject();
+});
+
+function run(args: string[], opts: { input?: string } = {}) {
+  return runCli(args, {
+    cwd: project.root,
+    home: project.home,
+    input: opts.input,
+  });
+}
+
+// Write a plan.yaml under the project root and return its path. Port of _write_yaml.
+function writeYaml(content: string): string {
+  const path = join(project.root, "plan.yaml");
+  writeFileSync(path, content, "utf-8");
+  return path;
+}
+
+// Indent every line of *text* by *n* spaces (blank lines stay blank). Port of _indent.
+function indent(text: string, n: number): string {
+  const prefix = " ".repeat(n);
+  return text
+    .split("\n")
+    .map((line) => (line ? prefix + line : ""))
+    .join("\n");
+}
+
+// First compact NDJSON line that parses as a JSON object. Port of _parse_envelope.
+function parseEnvelope(output: string): Record<string, unknown> {
+  return firstJsonPayload(output);
+}
+
+function countInvocationLines(output: string): number {
+  return output
+    .trim()
+    .split("\n")
+    .filter(
+      (ln) => ln.trim().startsWith("{") && ln.includes("planctl_invocation"),
+    ).length;
+}
+
+// The two-task plan with task 2 deps on [1]. Port of _two_task_yaml.
+function twoTaskYaml(): string {
+  return (
+    "epic:\n  title: scaffold smoke test\n  spec: |\n    ## Overview\n" +
+    "    A scaffold smoke test.\ntasks:\n  - title: First task\n    deps: []\n" +
+    `    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+    "  - title: Second task\n    deps: [1]\n    tier: medium\n    spec: |\n" +
+    `${indent(VALID_TASK_SPEC, 6)}\n`
+  );
+}
+
+function readJson(rel: string): Record<string, unknown> {
+  return JSON.parse(readFileSync(join(project.root, ".planctl", rel), "utf-8"));
+}
+
+// No fn-* epic/task/spec files landed. Port of _no_epics_or_tasks_landed.
+function noEpicsOrTasksLanded(): boolean {
+  for (const sub of ["epics", "tasks", "specs"]) {
+    const dir = join(project.root, ".planctl", sub);
+    const glob = new Bun.Glob("fn-*.*");
+    for (const _ of glob.scanSync({ cwd: dir, onlyFiles: true })) {
+      return false;
+    }
+  }
+  return true;
+}
+
+// Scaffold a one-task epic with the given title; return the allocated epic id.
+// Port of _seed_epic (the in-file helper, NOT the harness scaffoldEpic).
+function seedEpic(title = "seed epic"): string {
+  const yaml =
+    `epic:\n  title: ${title}\n  spec: |\n    ## Overview\n    seed.\n` +
+    `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+  const r = run(["scaffold", "--file", writeYaml(yaml)]);
+  expect(r.code).toBe(0);
+  return parseEnvelope(r.output).epic_id as string;
+}
+
+// ---------------------------------------------------------------------------
+// Happy path
+// ---------------------------------------------------------------------------
+
+describe("scaffold happy path", () => {
+  slow("emits exactly one invocation covering the full tree", () => {
+    // test_scaffold.py::test_scaffold_happy_path_emits_one_invocation
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    expect(payload.success).toBe(true);
+    const epicId = payload.epic_id as string;
+    expect(epicId.startsWith("fn-")).toBe(true);
+    expect(payload.task_ids).toEqual([`${epicId}.1`, `${epicId}.2`]);
+    expect(countInvocationLines(r.output)).toBe(1);
+
+    const pc = payload.planctl_invocation as Record<string, unknown>;
+    expect(pc.op).toBe("scaffold");
+    expect(pc.target).toBe(epicId);
+    expect(pc.subject).toBe(`chore(planctl): scaffold ${epicId}`);
+    const expected = [
+      `.planctl/epics/${epicId}.json`,
+      `.planctl/specs/${epicId}.md`,
+      `.planctl/tasks/${epicId}.1.json`,
+      `.planctl/specs/${epicId}.1.md`,
+      `.planctl/tasks/${epicId}.2.json`,
+      `.planctl/specs/${epicId}.2.md`,
+    ];
+    const files = new Set(pc.files as string[]);
+    for (const f of expected) {
+      expect(files.has(f)).toBe(true);
+    }
+  });
+
+  slow("writes verbatim specs, not skeletons", () => {
+    // test_scaffold.py::test_scaffold_writes_verbatim_specs_not_skeletons
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    const spec1 = readFileSync(
+      join(project.root, ".planctl", "specs", `${epicId}.1.md`),
+      "utf-8",
+    );
+    expect(spec1).toContain("Implement the thing.");
+    expect(spec1).toContain("- [ ] It works.");
+  });
+
+  slow("1-based ordinal dep resolves to fn-N.M", () => {
+    // test_scaffold.py::test_scaffold_dep_resolves_to_fn_n_m
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`tasks/${epicId}.2.json`).depends_on).toEqual([
+      `${epicId}.1`,
+    ]);
+  });
+
+  slow("forward ref (task1 deps [2]) resolves via two-pass allocation", () => {
+    // test_scaffold.py::test_scaffold_forward_ref_resolves
+    const yaml =
+      "epic:\n  title: forward ref test\n  spec: |\n    ## Overview\n    forward ref.\n" +
+      `tasks:\n  - title: First task\n    deps: [2]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: Second task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`tasks/${epicId}.1.json`).depends_on).toEqual([
+      `${epicId}.2`,
+    ]);
+  });
+
+  slow("epic + task carry snippets/bundles + fresh validated marker", () => {
+    // test_scaffold.py::test_scaffold_epic_carries_snippets_bundles
+    const yaml =
+      "epic:\n  title: snippet metadata\n  snippets: [snip-a, snip-b]\n" +
+      "  bundles: [bundle/dev-env, bundle/snippeting-main]\n  spec: |\n    ## Overview\n    yes.\n" +
+      "tasks:\n  - title: only task\n    deps: []\n    tier: medium\n" +
+      `    snippets: [task-snip]\n    bundles: [bundle/dev-env]\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    const epicDef = readJson(`epics/${epicId}.json`);
+    expect(epicDef.snippets).toEqual(["snip-a", "snip-b"]);
+    expect(epicDef.bundles).toEqual([
+      "bundle/dev-env",
+      "bundle/snippeting-main",
+    ]);
+    const stamped = epicDef.last_validated_at as string;
+    expect(stamped).not.toBeNull();
+    expect(stamped.includes(".") && stamped.endsWith("Z")).toBe(true);
+    const taskDef = readJson(`tasks/${epicId}.1.json`);
+    expect(taskDef.snippets).toEqual(["task-snip"]);
+    expect(taskDef.bundles).toEqual(["bundle/dev-env"]);
+  });
+
+  slow("no epic branch defaults branch_name to main", () => {
+    // test_scaffold.py::test_scaffold_no_branch_defaults_to_main
+    const yaml =
+      "epic:\n  title: no branch given\n  spec: |\n    ## Overview\n    yes.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`epics/${epicId}.json`).branch_name).toBe("main");
+  });
+
+  slow("no substrate emits no advisory + single invocation", () => {
+    // test_scaffold.py::test_scaffold_no_substrate_emits_no_advisory
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    expect(payload.success).toBe(true);
+    expect("warnings" in payload).toBe(false);
+    expect(countInvocationLines(r.output)).toBe(1);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Epic-level depends_on_epics
+// ---------------------------------------------------------------------------
+
+describe("scaffold epic deps", () => {
+  function epicDepYaml(depsLiteral: string, title = "dependent epic"): string {
+    return (
+      `epic:\n  title: ${title}\n  depends_on_epics: ${depsLiteral}\n  spec: |\n    ## Overview\n    x.\n` +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+    );
+  }
+
+  slow("happy path preserves declared order", () => {
+    // test_scaffold.py::test_scaffold_epic_dep_happy_path_preserves_order
+    const first = seedEpic("seed epic first");
+    const second = seedEpic("seed epic second");
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(epicDepYaml(`[${second}, ${first}]`)),
+    ]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`epics/${epicId}.json`).depends_on_epics).toEqual([
+      second,
+      first,
+    ]);
+  });
+
+  slow("absent field coerces to []", () => {
+    // test_scaffold.py::test_scaffold_no_epic_deps_yields_empty_list
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`epics/${epicId}.json`).depends_on_epics).toEqual([]);
+  });
+
+  slow("non-list epic dep is typed epic_dep_invalid", () => {
+    // test_scaffold.py::test_scaffold_epic_dep_non_list_is_typed
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(epicDepYaml('"fn-1-foo"', "bad dep type")),
+    ]);
+    expect(r.code).not.toBe(0);
+    expect(
+      (parseEnvelope(r.output).error as Record<string, unknown>).code,
+    ).toBe("epic_dep_invalid");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("list of non-strings is typed", () => {
+    // test_scaffold.py::test_scaffold_epic_dep_list_of_non_strings_is_typed
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(epicDepYaml("[1, 2]", "bad dep elem type")),
+    ]);
+    expect(r.code).not.toBe(0);
+    expect(
+      (parseEnvelope(r.output).error as Record<string, unknown>).code,
+    ).toBe("epic_dep_invalid");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("malformed id is typed", () => {
+    // test_scaffold.py::test_scaffold_epic_dep_malformed_id_is_typed
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(epicDepYaml("[fn-abc]", "malformed dep id")),
+    ]);
+    expect(r.code).not.toBe(0);
+    expect(
+      (parseEnvelope(r.output).error as Record<string, unknown>).code,
+    ).toBe("epic_dep_invalid");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("nonexistent dep is typed with a does-not-exist detail", () => {
+    // test_scaffold.py::test_scaffold_epic_dep_nonexistent_is_typed
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(epicDepYaml("[fn-9999-nope]", "nonexistent dep")),
+    ]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("epic_dep_invalid");
+    expect(
+      (err.details as string[]).some((d) => d.includes("does not exist")),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("duplicate dep is typed", () => {
+    // test_scaffold.py::test_scaffold_epic_dep_duplicate_is_typed
+    const first = seedEpic();
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(epicDepYaml(`[${first}, ${first}]`, "dup dep")),
+    ]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("epic_dep_invalid");
+    expect(
+      (err.details as string[]).some((d) => d.includes("duplicated")),
+    ).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Failure shapes — typed code, no writes
+// ---------------------------------------------------------------------------
+
+describe("scaffold failure shapes", () => {
+  slow("non-mapping doc is bad_yaml", () => {
+    // test_scaffold.py::test_scaffold_bad_yaml_non_mapping_doc
+    const r = run(["scaffold", "--file", writeYaml("just a string\n")]);
+    expect(r.code).not.toBe(0);
+    const env = parseEnvelope(r.output);
+    expect(env.success).toBe(false);
+    expect((env.error as Record<string, unknown>).code).toBe("bad_yaml");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("empty tasks list is bad_yaml", () => {
+    // test_scaffold.py::test_scaffold_empty_tasks_list_is_bad_yaml
+    const yaml =
+      "epic:\n  title: no tasks\n  spec: |\n    ## Overview\n    x.\ntasks: []\n";
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("bad_yaml");
+    expect(
+      (err.details as string[]).some((d) =>
+        d.includes("tasks: must contain at least one entry"),
+      ),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("spec_invalid lists the offending task #2", () => {
+    // test_scaffold.py::test_scaffold_spec_invalid_lists_offending_task
+    const badSpec = "## Description\n\n## Acceptance\n\n## Done summary\n";
+    const yaml =
+      "epic:\n  title: malformed spec\n  spec: |\n    ## Overview\n    nope.\n" +
+      `tasks:\n  - title: ok\n    deps: []\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: bad\n    deps: []\n    spec: |\n${indent(badSpec, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("spec_invalid");
+    expect((err.details as string[]).some((d) => d.includes("task #2"))).toBe(
+      true,
+    );
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("out-of-range dep ordinal is dep_invalid", () => {
+    // test_scaffold.py::test_scaffold_dep_out_of_range_is_typed
+    const yaml =
+      "epic:\n  title: bad ordinal\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: [5]\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    expect(
+      (parseEnvelope(r.output).error as Record<string, unknown>).code,
+    ).toBe("dep_invalid");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("self-ref dep is dep_invalid", () => {
+    // test_scaffold.py::test_scaffold_dep_self_ref_is_typed
+    const yaml =
+      "epic:\n  title: self ref\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: [1]\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    expect(
+      (parseEnvelope(r.output).error as Record<string, unknown>).code,
+    ).toBe("dep_invalid");
+  });
+
+  slow("dep cycle is dep_cycle", () => {
+    // test_scaffold.py::test_scaffold_dep_cycle_is_typed
+    const yaml =
+      "epic:\n  title: cycle\n  spec: |\n    ## Overview\n    cycle.\n" +
+      `tasks:\n  - title: a\n    deps: [2]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: b\n    deps: [1]\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    expect(
+      (parseEnvelope(r.output).error as Record<string, unknown>).code,
+    ).toBe("dep_cycle");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  // test_scaffold_registered_in_verb_templates — CITED: the bun buildSubject is
+  //   template-free; the happy-path subject assertion pins `chore(planctl):
+  //   scaffold <id>` (python_only VERB_TEMPLATES import).
+  // test_scaffold_not_in_validation_restamp_verbs — CITED: src-integrity.test.ts
+  //   pins the canonical VALIDATION_RESTAMP_VERBS set (scaffold absent;
+  //   python_only import).
+});
+
+// ---------------------------------------------------------------------------
+// Per-task target_repo + repo_distribution rollup
+// ---------------------------------------------------------------------------
+
+describe("scaffold target_repo", () => {
+  // Two real git repos under the project tree (the multi_repo_project port).
+  function twoForeignRepos(): [string, string] {
+    const a = join(project.root, "foreign-a");
+    const b = join(project.root, "foreign-b");
+    for (const d of [a, b]) {
+      mkdirSync(d, { recursive: true });
+      gitInit(d);
+    }
+    return [realpathSync(a), realpathSync(b)];
+  }
+
+  slow(
+    "default-omit: every task targets primary, single-element rollup",
+    () => {
+      // test_scaffold.py::test_scaffold_default_target_repo_unchanged
+      const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+      expect(r.code).toBe(0);
+      const payload = parseEnvelope(r.output);
+      const epicId = payload.epic_id as string;
+      const primary = realpathSync(project.root);
+      expect(payload.repo_distribution).toEqual({ [primary]: 2 });
+      const epicDef = readJson(`epics/${epicId}.json`);
+      expect(epicDef.touched_repos).toEqual([primary]);
+      expect(epicDef.primary_repo).toBe(primary);
+      for (const i of [1, 2]) {
+        expect(readJson(`tasks/${epicId}.${i}.json`).target_repo).toBe(primary);
+      }
+    },
+  );
+
+  slow("two distinct target_repos persist + sorted rollup", () => {
+    // test_scaffold.py::test_scaffold_per_task_target_repo
+    const [a, b] = twoForeignRepos();
+    const yaml =
+      "epic:\n  title: per task target repo\n  spec: |\n    ## Overview\n    fan out across repos.\n" +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    const epicId = payload.epic_id as string;
+    const dist = payload.repo_distribution as Record<string, number>;
+    expect(dist).toEqual({ [a]: 1, [b]: 1 });
+    expect(Object.keys(dist)).toEqual(Object.keys(dist).sort());
+    expect(readJson(`epics/${epicId}.json`).touched_repos).toEqual(
+      [a, b].sort(),
+    );
+    expect(readJson(`tasks/${epicId}.1.json`).target_repo).toBe(a);
+    expect(readJson(`tasks/${epicId}.2.json`).target_repo).toBe(b);
+  });
+
+  slow("mixed target_repo dedups, omitted task falls to primary", () => {
+    // test_scaffold.py::test_scaffold_mixed_target_repo_dedup
+    const [a, b] = twoForeignRepos();
+    const yaml =
+      "epic:\n  title: mixed dedup\n  spec: |\n    ## Overview\n    mixed.\n" +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task C\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    const primary = realpathSync(project.root);
+    const epicDef = readJson(`epics/${epicId}.json`);
+    expect(epicDef.touched_repos).toEqual([a, primary].sort());
+    expect((epicDef.touched_repos as string[]).includes(b)).toBe(false);
+    expect(readJson(`tasks/${epicId}.1.json`).target_repo).toBe(a);
+    expect(readJson(`tasks/${epicId}.2.json`).target_repo).toBe(a);
+    expect(readJson(`tasks/${epicId}.3.json`).target_repo).toBe(primary);
+  });
+
+  slow("relative target_repo is rejected with repo_invalid", () => {
+    // test_scaffold.py::test_scaffold_target_repo_relative_rejected
+    const yaml =
+      "epic:\n  title: relative path\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    target_repo: "apps/foo"\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("repo_invalid");
+    expect(
+      (err.details as string[]).some((d) => d.includes("absolute path")),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("non-string target_repo is bad_yaml", () => {
+    // test_scaffold.py::test_scaffold_target_repo_not_string_rejected
+    const yaml =
+      "epic:\n  title: bad target_repo type\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    target_repo: 42\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("bad_yaml");
+    expect(
+      (err.details as string[]).some((d) =>
+        d.includes("`target_repo` must be a string"),
+      ),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("empty-after-strip target_repo is repo_invalid", () => {
+    // test_scaffold.py::test_scaffold_target_repo_empty_string_rejected
+    const yaml =
+      "epic:\n  title: empty target_repo\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    target_repo: "   "\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("repo_invalid");
+    expect(
+      (err.details as string[]).some((d) =>
+        d.includes("non-empty after strip"),
+      ),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  // test_scaffold_target_repo_tilde_expansion — DROP (python_only): repoints HOME
+  //   to expand `~` to a git root via an in-process monkeypatch the conformance
+  //   subprocess can't model deterministically.
+});
+
+// ---------------------------------------------------------------------------
+// Fresh-epic marker + one-commit coverage + commit-boundary
+// ---------------------------------------------------------------------------
+
+describe("scaffold mint boundary", () => {
+  slow("fresh epic carries a microsecond-precise validated marker", () => {
+    // test_scaffold.py::test_scaffold_fresh_epic_carries_validated_marker
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    const stamped = readJson(`epics/${epicId}.json`)
+      .last_validated_at as string;
+    expect(stamped).not.toBeNull();
+    expect(stamped.includes(".") && stamped.endsWith("Z")).toBe(true);
+  });
+
+  slow("the invocation covers the whole tree (one commit)", () => {
+    // test_scaffold.py::test_scaffold_fresh_epic_emit_covers_one_commit
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    const epicId = payload.epic_id as string;
+    const files = new Set(
+      (payload.planctl_invocation as Record<string, unknown>).files as string[],
+    );
+    for (const f of [
+      `.planctl/epics/${epicId}.json`,
+      `.planctl/specs/${epicId}.md`,
+      `.planctl/tasks/${epicId}.1.json`,
+      `.planctl/specs/${epicId}.1.md`,
+      `.planctl/tasks/${epicId}.2.json`,
+      `.planctl/specs/${epicId}.2.md`,
+    ]) {
+      expect(files.has(f)).toBe(true);
+    }
+  });
+
+  slow("missing session id fails closed before any write or commit", () => {
+    // test_scaffold.py::test_scaffold_missing_session_id_writes_nothing
+    const logBefore = gitLogCount(project.root);
+    const r = runCli(["scaffold", "--file", writeYaml(twoTaskYaml())], {
+      cwd: project.root,
+      home: project.home,
+      env: { CLAUDE_CODE_SESSION_ID: "" },
+    });
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("missing_session_id");
+    expect(noEpicsOrTasksLanded()).toBe(true);
+    expect(gitLogCount(project.root)).toBe(logBefore);
+  });
+
+  // test_scaffold_integrity_failure_aborts_no_writes — DROP (python_only):
+  //   monkeypatches check_epic_tree_in_memory to a synthetic-error spy.
+  // test_scaffold_invocation_raise_persists_written_tree — DROP (python_only):
+  //   monkeypatches build_planctl_invocation to raise post-write.
+  // test_scaffold_integrity_failure_leaves_scan_max_unchanged — DROP (python_only).
+  // test_scaffold_integrity_failure_writes_no_spec_files_at_all — DROP (python_only).
+});
+
+// ---------------------------------------------------------------------------
+// stdin support via `--file -`
+// ---------------------------------------------------------------------------
+
+describe("scaffold stdin", () => {
+  slow("--file - reads YAML from stdin", () => {
+    // test_scaffold.py::test_scaffold_reads_yaml_from_stdin
+    const r = run(["scaffold", "--file", "-"], { input: twoTaskYaml() });
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    expect(payload.success).toBe(true);
+    const epicId = payload.epic_id as string;
+    expect(epicId.startsWith("fn-")).toBe(true);
+    expect(payload.task_ids).toEqual([`${epicId}.1`, `${epicId}.2`]);
+    expect(countInvocationLines(r.output)).toBe(1);
+  });
+
+  slow("the 1 MiB cap fires on stdin pre-decode", () => {
+    // test_scaffold.py::test_scaffold_stdin_byte_cap_enforced
+    const bigComment = `# ${"x".repeat(1024 * 1024 + 100)}\n`;
+    const r = run(["scaffold", "--file", "-"], {
+      input: bigComment + twoTaskYaml(),
+    });
+    expect(r.code).not.toBe(0);
+    const env = parseEnvelope(r.output);
+    expect(env.success).toBe(false);
+    const err = env.error as Record<string, unknown>;
+    expect(err.code).toBe("bad_yaml");
+    expect(err.message as string).toContain("exceeds");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Per-task tier
+// ---------------------------------------------------------------------------
+
+describe("scaffold per-task tier", () => {
+  slow("tier persists per task", () => {
+    // test_scaffold.py::test_scaffold_per_task_tier_persists
+    const yaml =
+      "epic:\n  title: per task tier\n  spec: |\n    ## Overview\n    tier per task.\n" +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: xhigh\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    expect(readJson(`tasks/${epicId}.1.json`).tier).toBe("medium");
+    expect(readJson(`tasks/${epicId}.2.json`).tier).toBe("xhigh");
+  });
+
+  function oneTaskTierYaml(tierLiteral: string, title: string): string {
+    return (
+      `epic:\n  title: ${title}\n  spec: |\n    ## Overview\n    x.\n` +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: ${tierLiteral}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+    );
+  }
+
+  slow("missing tier field is tier_invalid with the allowlist", () => {
+    // test_scaffold.py::test_scaffold_missing_tier_field_rejected
+    const yaml =
+      "epic:\n  title: missing tier\n  spec: |\n    ## Overview\n    no tier.\n" +
+      `tasks:\n  - title: only task\n    deps: []\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("tier_invalid");
+    const blob = (err.details as string[]).join(" ");
+    expect(blob).toContain("missing");
+    for (const valid of ["medium", "high", "xhigh", "max"]) {
+      expect(blob).toContain(valid);
+    }
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("unknown tier value is tier_invalid", () => {
+    // test_scaffold.py::test_scaffold_tier_invalid_value_rejected
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(oneTaskTierYaml("bogus", "bogus tier")),
+    ]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("tier_invalid");
+    expect((err.details as string[]).some((d) => d.includes("'bogus'"))).toBe(
+      true,
+    );
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("'low' is rejected with the allowlist in the message", () => {
+    // test_scaffold.py::test_scaffold_tier_low_rejected_with_allowlist_in_message
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(oneTaskTierYaml("low", "low tier")),
+    ]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("tier_invalid");
+    const blob = (err.details as string[]).join(" ");
+    for (const valid of ["medium", "high", "xhigh", "max"]) {
+      expect(blob).toContain(valid);
+    }
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("non-string tier is bad_yaml", () => {
+    // test_scaffold.py::test_scaffold_tier_non_string_is_bad_yaml
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(oneTaskTierYaml("42", "bad tier type")),
+    ]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("bad_yaml");
+    expect(
+      (err.details as string[]).some((d) =>
+        d.includes("`tier` must be a string"),
+      ),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+
+  slow("every TASK_TIERS member is accepted", () => {
+    // test_scaffold.py::test_scaffold_tier_all_valid_values_accepted
+    const tiers = ["medium", "high", "xhigh", "max"];
+    const tasksBlock = tiers
+      .map(
+        (tier, i) =>
+          `  - title: tier task ${i + 1}\n    deps: []\n    tier: ${tier}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`,
+      )
+      .join("");
+    const yaml =
+      "epic:\n  title: all tiers\n  spec: |\n    ## Overview\n    all tiers.\n" +
+      `tasks:\n${tasksBlock}`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    const epicId = parseEnvelope(r.output).epic_id as string;
+    tiers.forEach((tier, i) => {
+      expect(readJson(`tasks/${epicId}.${i + 1}.json`).tier).toBe(tier);
+    });
+  });
+
+  slow("tier_invalid collects all offenders", () => {
+    // test_scaffold.py::test_scaffold_tier_invalid_collects_all_offenders
+    const yaml =
+      "epic:\n  title: two bad tiers\n  spec: |\n    ## Overview\n    x.\n" +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: low\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: extreme\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("tier_invalid");
+    const details = err.details as string[];
+    expect(
+      details.some((d) => d.includes("task #1") && d.includes("'low'")),
+    ).toBe(true);
+    expect(
+      details.some((d) => d.includes("task #2") && d.includes("'extreme'")),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// epic.queue_jump rides the envelope
+// ---------------------------------------------------------------------------
+
+describe("scaffold queue_jump", () => {
+  function queueJumpYaml(valueLiteral: string | null): string {
+    const line = valueLiteral !== null ? `  queue_jump: ${valueLiteral}\n` : "";
+    return (
+      `epic:\n  title: queue jump test\n${line}  spec: |\n    ## Overview\n    queue jump.\n` +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+    );
+  }
+
+  slow("queue_jump: true rides the envelope + JSON", () => {
+    // test_scaffold.py::test_scaffold_queue_jump_true_rides_envelope
+    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml("true"))]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    expect(payload.success).toBe(true);
+    expect(
+      (payload.planctl_invocation as Record<string, unknown>).queue_jump,
+    ).toBe(true);
+    const epicId = payload.epic_id as string;
+    expect(readJson(`epics/${epicId}.json`).queue_jump).toBe(true);
+  });
+
+  slow("queue_jump: false (explicit) rides the envelope + JSON", () => {
+    // test_scaffold.py::test_scaffold_queue_jump_false_explicit_rides_envelope
+    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml("false"))]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    expect(
+      (payload.planctl_invocation as Record<string, unknown>).queue_jump,
+    ).toBe(false);
+    expect(readJson(`epics/${payload.epic_id}.json`).queue_jump).toBe(false);
+  });
+
+  slow("omitted queue_jump defaults to false on the envelope + JSON", () => {
+    // test_scaffold.py::test_scaffold_queue_jump_omitted_defaults_false
+    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml(null))]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    const pc = payload.planctl_invocation as Record<string, unknown>;
+    expect("queue_jump" in pc).toBe(true);
+    expect(pc.queue_jump).toBe(false);
+    expect(readJson(`epics/${payload.epic_id}.json`).queue_jump).toBe(false);
+    // normalize_epic queue_jump default is pinned by src-models.test.ts (CITED).
+  });
+
+  slow("non-bool queue_jump is bad_yaml", () => {
+    // test_scaffold.py::test_scaffold_queue_jump_non_bool_is_bad_yaml
+    const r = run(["scaffold", "--file", writeYaml(queueJumpYaml('"yes"'))]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("bad_yaml");
+    expect(
+      (err.details as string[]).some((d) => d.includes("queue_jump")),
+    ).toBe(true);
+    expect(noEpicsOrTasksLanded()).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Atomicity + dup guard
+// ---------------------------------------------------------------------------
+
+describe("scaffold dup guard + atomicity", () => {
+  function sameSlugYaml(title: string): string {
+    return (
+      `epic:\n  title: ${title}\n  spec: |\n    ## Overview\n    second attempt.\n` +
+      `tasks:\n  - title: only task\n    deps: []\n    tier: medium\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+    );
+  }
+
+  slow("same-slug scaffold is rejected with duplicate_epic", () => {
+    // test_scaffold.py::test_scaffold_dup_slug_rejected_with_duplicate_epic
+    const firstId = seedEpic("duplicate guard");
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(sameSlugYaml("duplicate guard")),
+    ]);
+    expect(r.code).not.toBe(0);
+    const err = parseEnvelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("duplicate_epic");
+    const blob = (err.details as string[]).join(" ");
+    expect(blob).toContain(firstId);
+    expect(blob).toContain("status:");
+  });
+
+  slow("--allow-duplicate mints a distinct fn-N with the same slug", () => {
+    // test_scaffold.py::test_scaffold_dup_slug_allow_duplicate_mints_distinct_fn_n
+    const firstId = seedEpic("allow duplicate");
+    const r = run([
+      "scaffold",
+      "--file",
+      writeYaml(sameSlugYaml("allow duplicate")),
+      "--allow-duplicate",
+    ]);
+    expect(r.code).toBe(0);
+    const secondId = parseEnvelope(r.output).epic_id as string;
+    expect(secondId).not.toBe(firstId);
+    expect(secondId.endsWith("-allow-duplicate")).toBe(true);
+    expect(firstId.endsWith("-allow-duplicate")).toBe(true);
+  });
+
+  slow("unrelated-slug second scaffold proceeds normally", () => {
+    // test_scaffold.py::test_scaffold_dup_slug_unrelated_slug_unaffected
+    const firstId = seedEpic("first slug");
+    const secondId = seedEpic("second slug different");
+    expect(firstId).not.toBe(secondId);
+    expect(firstId.endsWith("-first-slug")).toBe(true);
+    expect(secondId.endsWith("-second-slug-different")).toBe(true);
+  });
+
+  slow("dup-guard does not false-match a suffix slug", () => {
+    // test_scaffold.py::test_scaffold_dup_slug_suffix_false_positive_regression
+    const fooBarId = seedEpic("foo bar");
+    expect(fooBarId.endsWith("-foo-bar")).toBe(true);
+
+    const barR = run(["scaffold", "--file", writeYaml(sameSlugYaml("bar"))]);
+    expect(barR.code).toBe(0);
+    const barId = parseEnvelope(barR.output).epic_id as string;
+    expect(barId.endsWith("-bar")).toBe(true);
+    expect(barId.endsWith("-foo-bar")).toBe(false);
+    expect(barId).not.toBe(fooBarId);
+
+    const dupR = run([
+      "scaffold",
+      "--file",
+      writeYaml(sameSlugYaml("foo bar")),
+    ]);
+    expect(dupR.code).not.toBe(0);
+    const err = parseEnvelope(dupR.output).error as Record<string, unknown>;
+    expect(err.code).toBe("duplicate_epic");
+    const blob = (err.details as string[]).join(" ");
+    expect(blob).toContain(fooBarId);
+    expect(blob.includes(barId)).toBe(false);
+  });
+
+  slow("the normal path still succeeds + commits the whole tree", () => {
+    // test_scaffold.py::test_scaffold_normal_path_still_succeeds_post_atomicity_fix
+    const r = run(["scaffold", "--file", writeYaml(twoTaskYaml())]);
+    expect(r.code).toBe(0);
+    const payload = parseEnvelope(r.output);
+    expect(payload.success).toBe(true);
+    const epicId = payload.epic_id as string;
+    for (const rel of [
+      `epics/${epicId}.json`,
+      `specs/${epicId}.md`,
+      `tasks/${epicId}.1.json`,
+      `specs/${epicId}.1.md`,
+      `tasks/${epicId}.2.json`,
+      `specs/${epicId}.2.md`,
+    ]) {
+      expect(existsSync(join(project.root, ".planctl", rel))).toBe(true);
+    }
+    expect(countInvocationLines(r.output)).toBe(1);
+  });
+});

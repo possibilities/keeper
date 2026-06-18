@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-12T11:44:05.376010Z",
+  "depends_on": [
+    "fn-32-bun-creation-machinery.1"
+  ],
+  "epic": "fn-32-bun-creation-machinery",
+  "id": "fn-32-bun-creation-machinery.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "YAML wrapper and creation spine",
+  "updated_at": "2026-06-12T11:59:15.955184Z",
+  "worker_done_at": "2026-06-12T11:59:15.955184Z"
+}

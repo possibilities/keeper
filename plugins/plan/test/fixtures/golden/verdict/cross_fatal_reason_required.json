@@ -1,0 +1,29 @@
+{
+  "envelope": {
+    "error": {
+      "code": "VERDICT_INVALID",
+      "details": {
+        "error_count": 1,
+        "errors": [
+          {
+            "loc": "fatal_reason",
+            "msg": "fatal: true requires a non-empty fatal_reason",
+            "type": "fatal_reason_required"
+          }
+        ],
+        "schema_fragment": {
+          "fatal_reason": {
+            "type": "string"
+          }
+        }
+      },
+      "message": "verdict failed validation (1 error(s)); fix the listed paths and resubmit"
+    },
+    "success": false
+  },
+  "input": {
+    "decisions": [],
+    "fatal": true,
+    "fatal_reason": "   "
+  }
+}

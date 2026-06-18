@@ -1,0 +1,21 @@
+{
+  "branch_name": "fn-25-reconcile-scaffold-branch-default-and",
+  "bundles": [],
+  "closer_done_at": "2026-06-11T17:57:58.052009Z",
+  "created_at": "2026-06-11T17:50:44.232482Z",
+  "created_by_close_of": "fn-24-strip-snippet-pipeline",
+  "depends_on_epics": [
+    "fn-24-strip-snippet-pipeline"
+  ],
+  "id": "fn-25-reconcile-scaffold-branch-default-and",
+  "last_validated_at": "2026-06-11T17:50:44.416412Z",
+  "primary_repo": "/Users/mike/code/planctl",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "done",
+  "title": "Reconcile scaffold branch default and trim dead-verb comments",
+  "touched_repos": [
+    "/Users/mike/code/planctl"
+  ],
+  "updated_at": "2026-06-11T17:57:58.052009Z"
+}

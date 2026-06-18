@@ -1,0 +1,14 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-10T18:24:09.631307Z",
+  "depends_on": [],
+  "epic": "fn-18-harden-worker-agent-template",
+  "id": "fn-18-harden-worker-agent-template.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/planctl",
+  "tier": "xhigh",
+  "title": "Bound and harden worker template",
+  "updated_at": "2026-06-10T18:28:45.854040Z",
+  "worker_done_at": "2026-06-10T18:28:45.854040Z"
+}

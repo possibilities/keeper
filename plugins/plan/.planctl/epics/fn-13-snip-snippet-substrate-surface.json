@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "closer_done_at": "2026-06-10T16:32:31.142024Z",
+  "created_at": "2026-06-10T03:48:51.923000Z",
+  "depends_on_epics": [
+    "fn-12-crush-close-skill-into-coordinator"
+  ],
+  "id": "fn-13-snip-snippet-substrate-surface",
+  "last_validated_at": "2026-06-10T03:49:09.783729Z",
+  "primary_repo": "/Users/mike/code/planctl",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "done",
+  "title": "Snip snippet substrate surface",
+  "touched_repos": [
+    "/Users/mike/code/planctl"
+  ],
+  "updated_at": "2026-06-10T16:32:31.142024Z"
+}

@@ -1,0 +1,32 @@
+# Build artifacts
+dist/
+build/
+
+# Bun / TypeScript hook toolchain (bun.lock is committed; node_modules is not)
+node_modules/
+
+# Planctl runtime state (ephemeral; see .planctl/state/ contract)
+.planctl/state/
+
+# Project-scoped promptctl runtime store
+.promptctl/
+
+# Sidecar markers stamped next to every promptctl-rendered output
+# (carry {_warning, source_template, sha256} for the check-generated guard).
+**/*.managed-file-dont-edit
+
+# Generated agents (rendered from template/agents/*.md.tmpl via
+# promptctl render-plugin-templates; carries _promptctl_path marker).
+agents/practice-scout.md
+
+# Generated per-tier worker agents (rendered from template/agents/worker.md.tmpl
+# into agents/worker-<tier>.md, one per `variants:` entry; addressable
+# plan:worker-<tier> by the always-loaded plan plugin).
+agents/worker-*.md
+
+# Generated skills (rendered from template/skills/*.md.tmpl;
+# each SKILL.md carries _promptctl_path marker).
+skills/work/
+
+# macOS
+.DS_Store
