@@ -25,5 +25,5 @@ Scripts run clean; `rg -n '\bplanctl ' ~/code/arthack/scripts` leaves only the b
 - [ ] arthack script command-callers use `keeper plan <verb>`; build/promote/buildbot references untouched (final epic)
 
 ## Done summary
-
+No arthack script command-callers to migrate: all 17 'planctl' references in scripts/ are binary-build (install_bun_cli, section 6d), uv-tool cleanup, echo strings, or comments — reserved for the final-epic cord-cut. No 'planctl <verb>' invocations exist; tree unchanged.
 ## Evidence
