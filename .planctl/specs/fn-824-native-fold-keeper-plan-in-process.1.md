@@ -33,5 +33,5 @@ Replace the exec-shim body of `cli/plan.ts:main(argv)` with an in-process call i
 - [ ] conformance test green in-process under `bun run test:full`; the `planctl` binary build is untouched
 
 ## Done summary
-
+keeper plan now runs the planctl verb dispatcher in-process (cli/plan.ts imports plugins/plan/src/cli.ts main(), no Bun.which/exec); hoisted js-yaml+yaml into keeper's package graph, enabled allowImportingTsExtensions for the subtree imports, and rewrote the plan-shim conformance test to assert in-process byte-parity against the real planctl binary. Full suite green; the standalone planctl binary still builds untouched.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "keeper plan dispatches in-process",
-  "updated_at": "2026-06-18T17:55:29.681000Z"
+  "updated_at": "2026-06-18T18:05:19.978000Z",
+  "worker_done_at": "2026-06-18T18:05:19.978000Z"
 }
