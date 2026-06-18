@@ -1103,13 +1103,13 @@ test("backendExecCoordsFromEnv: tmux pane id passes through as raw TEXT", () => 
 });
 
 // ---------------------------------------------------------------------------
-// backendExecCoordsFromEnv carrier fallback (fn-815 — claudewrap strips TMUX
+// backendExecCoordsFromEnv carrier fallback (fn-815 — agentwrap strips TMUX
 // to let Claude emit truecolor and copies the pane id into KEEPER_TMUX_PANE; the
 // fallback arm stamps coord-identical tmux rows from the carrier).
 // ---------------------------------------------------------------------------
 
 test("backendExecCoordsFromEnv: carrier present + TMUX absent stamps coord-identical tmux row", () => {
-  // claudewrap deleted TMUX/TMUX_PANE (truecolor) but copied the pane id into
+  // agentwrap deleted TMUX/TMUX_PANE (truecolor) but copied the pane id into
   // KEEPER_TMUX_PANE first. The fallback arm stamps the same {type, paneId,
   // sessionId} the native arm would have, so window renaming survives.
   expect(
@@ -1121,7 +1121,7 @@ test("backendExecCoordsFromEnv: carrier present + TMUX absent stamps coord-ident
 });
 
 test("backendExecCoordsFromEnv: carrier present without KEEPER_TMUX_SESSION → type + pane, NULL session", () => {
-  // Human-created tmux session relaunched under claudewrap: no
+  // Human-created tmux session relaunched under agentwrap: no
   // KEEPER_TMUX_SESSION, so the session stays NULL (poller fills it) while the
   // carrier still supplies type + pane.
   expect(backendExecCoordsFromEnv({ KEEPER_TMUX_PANE: "%3" })).toEqual({

@@ -13,7 +13,7 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
 - **Two Claude plugins live as peers under `plugins/`** — `plugins/keeper/` (the
   events-writer HOOK plugin + `keeper:await` skill) and `plugins/plan/` (planctl,
   vendored via `git subtree --prefix=plugins/plan`, carrying the `plan:*` skills).
-  claudewrap loads both from one `plugin_scan_dirs` entry pointing at `plugins/`.
+  agentwrap loads both from one `plugin_scan_dirs` entry pointing at `plugins/`.
   Each plugin has exactly ONE manifest at its own `<plugin>/.claude-plugin/plugin.json`
   and the keeper plugin exactly ONE `plugins/keeper/hooks/hooks.json` — never
   duplicate either, never add a `~/.claude/plugins/keeper` symlink (it

@@ -213,15 +213,15 @@ real terminal's values) so the worker `claude` TUI shows color. This is the
 
 **Truecolor under tmux + the pane-id carrier.** Claude Code self-caps to
 256 colors whenever `$TMUX` is set (ink2 renderer, since v2.1.77), so the
-interactive launcher claudewrap deletes `TMUX`/`TMUX_PANE` from the Claude
+interactive launcher agentwrap deletes `TMUX`/`TMUX_PANE` from the Claude
 child env to let it emit 24-bit truecolor. But `$TMUX` is also what the hook
 keys off to stamp the pane id the renamer worker needs. To keep both,
-claudewrap copies the pane id into the keeper-owned carrier `KEEPER_TMUX_PANE`
+agentwrap copies the pane id into the keeper-owned carrier `KEEPER_TMUX_PANE`
 *before* deleting the native vars, and `backendExecCoordsFromEnv` grows a
 fallback arm: when native `TMUX` is absent but the carrier is present it stamps
 coord-identical `{type:"tmux", paneId, sessionId}` rows from the carrier (and
 `KEEPER_TMUX_SESSION`). The carrier name is defined once, in
-`execBackendEnvMeta(...).paneIdCarrierEnvVar`; claudewrap holds a matching
+`execBackendEnvMeta(...).paneIdCarrierEnvVar`; agentwrap holds a matching
 literal guarded by a cross-reference comment (no shared module across repos).
 The fallback is inert until something sets the carrier, so keeper ships first.
 

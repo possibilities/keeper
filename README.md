@@ -67,7 +67,7 @@ synchronous `process.env` reads (no fork, no fs, no PPID-walk), folded onto
 `COALESCE`. The backend is tmux, read via `TMUX` (`KEEPER_TMUX_SESSION` for the
 session name, which a keeper-managed launch injects via `-e`, and `TMUX_PANE`
 for the pane). The pane id is a two-step read: native `TMUX_PANE` first, else
-the keeper-owned carrier `KEEPER_TMUX_PANE` (claudewrap strips `TMUX`/`TMUX_PANE`
+the keeper-owned carrier `KEEPER_TMUX_PANE` (agentwrap strips `TMUX`/`TMUX_PANE`
 so Claude emits truecolor, copying the pane id into the carrier first). A
 human-created tmux session carries no `KEEPER_TMUX_SESSION`, so its session name
 lands via the restore-worker's pane-snapshot poller (epic fn-789). The generic `backend_exec_*` naming keeps a further backend slotting in
@@ -371,7 +371,7 @@ Keeper has no `install` verb. Wire it up manually:
    events-writer hook + `keeper:await` skill, manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
    `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (planctl + the
-   `plan:*` skills, vendored as a `git subtree`). claudewrap's
+   `plan:*` skills, vendored as a `git subtree`). agentwrap's
    `plugin_scan_dirs` points at `~/code/keeper/plugins`, scans the parent, and
    appends one `--plugin-dir` per manifest-bearing child — so a fresh session
    auto-loads BOTH plugins from this repo. No symlink step. A
@@ -1750,7 +1750,7 @@ tmux session gets it filled later by the restore-worker pane poller, epic
 fn-789), `TMUX_PANE` → `backend_exec_pane_id` (raw; no fork, no fs, no
 PPID-walk; absent env ⇒ NULL coords, never a bogus `type`). The pane id is a
 two-step read: native `TMUX_PANE` first, else the keeper-owned carrier
-`KEEPER_TMUX_PANE` (claudewrap strips `TMUX`/`TMUX_PANE` to let Claude emit
+`KEEPER_TMUX_PANE` (agentwrap strips `TMUX`/`TMUX_PANE` to let Claude emit
 truecolor, copying the pane id into the carrier first so window renaming
 survives the strip; the carrier-fed fallback stamps coord-identical tmux rows).
 And the reducer's
