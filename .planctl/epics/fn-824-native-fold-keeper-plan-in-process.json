@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-18T18:08:20.579000Z",
   "created_at": "2026-06-18T17:55:29.681000Z",
   "depends_on_epics": [],
   "id": "fn-824-native-fold-keeper-plan-in-process",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "native fold keeper plan in-process",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-18T17:55:29.681000Z"
+  "updated_at": "2026-06-18T18:08:20.579000Z"
 }
