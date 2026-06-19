@@ -68,5 +68,5 @@ run the .1 harness.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Added events.mutation_path column (v73, online additive ALTER) promoting the git-attribution fold's lone cross-event field; hook derives it forward and the ingester recomputes for pre-deriver lines. Dual-read on the blob unchanged (no fold/cursor change), re-fold byte-identical. Also skipped the static write-statement bundle on readonly opens so a reader meets a not-yet-migrated live DB without throwing.
 ## Evidence
