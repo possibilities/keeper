@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "emit plan_invocation and mint source plan",
-  "updated_at": "2026-06-18T18:37:02.092000Z"
+  "updated_at": "2026-06-19T13:59:29.536000Z",
+  "worker_done_at": null
 }
