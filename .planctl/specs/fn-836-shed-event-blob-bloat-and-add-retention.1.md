@@ -62,5 +62,5 @@ full-corpus differential variant available for the gate in .3/.4. Poll, don't sl
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Built the re-fold equivalence gate (test/refold-equivalence.test.ts): keep-set ALLOW-list + blob-reader enumeration, per-event extraction audit, legacy-shape charter, full differential re-fold over a live-shaped relocated corpus, and a 0->head migrate check. Proves the mutation_path column carries byte-identically what the git-attribution json_extract scan reads and that shedding a mutation body loses nothing in the broad per-event folds.
 ## Evidence
