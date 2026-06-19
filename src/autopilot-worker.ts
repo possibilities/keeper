@@ -255,7 +255,7 @@ export function buildWorkerCommand(
   const flags: string[] = [];
   // Both verbs launch at max effort.
   flags.push("--model", "sonnet", "--effort", "max");
-  flags.push("--arthack-no-confirm");
+  flags.push("--agentwrap-no-confirm");
   // `--name <key>` adjacency is load-bearing for reap/classify parsing.
   flags.push("--name", `${verb}::${id}`);
   return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;

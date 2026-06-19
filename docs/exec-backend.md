@@ -154,8 +154,8 @@ and rename) returned as `{ ok: false }` with no `noteLine` noise.
 
 `launch` returns no surface ref, no pane id — by design. The reconciler
 correlates a dispatch back to keeperd through the **`--name verb::id`**
-baked into `argv` (`claude … --arthack-no-confirm --name work::fn-1-x.1 …`;
-the `--arthack-no-confirm` arthack-launcher flag is stripped before the real
+baked into `argv` (`claude … --agentwrap-no-confirm --name work::fn-1-x.1 …`;
+the `--agentwrap-no-confirm` arthack-launcher flag is stripped before the real
 claude binary and suppresses its cwd confirmation so dispatch never hangs):
 
 ```
