@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-19T21:31:52.871000Z",
+  "depends_on": [
+    "fn-836-shed-event-blob-bloat-and-add-retention.2"
+  ],
+  "epic": "fn-836-shed-event-blob-bloat-and-add-retention",
+  "id": "fn-836-shed-event-blob-bloat-and-add-retention.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Backfill mutation_path and flip attribution to column",
+  "updated_at": "2026-06-19T21:31:52.871000Z"
+}
