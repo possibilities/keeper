@@ -6,11 +6,10 @@
  * fn-794). Read-only over keeper.db so external consumers stop hand-writing
  * sqlite against a schema keeper owns.
  *
- * The prompt text lives ONLY in the event `data` payload, which the
- * daemon-side compaction relocator can NULL inline after copying the blob to
- * `event_blobs`. So BOTH the LIKE filter and the snippet read resolve through
- * `COALESCE(events.data, event_blobs.data)` with a `LEFT JOIN event_blobs` —
- * a compacted (older) event is otherwise silently missed.
+ * The prompt text lives in the event `data` payload. UserPromptSubmit is
+ * keep-set, so post-shed (fn-836.4 dropped `event_blobs`) its body is ALWAYS
+ * inline in `events.data` — both the LIKE filter and the snippet read resolve
+ * straight from `events.data`.
  *
  * Read-only open via `openDb(path, { readonly: true })`, closed in `finally`.
  * NO schema-version guard (in-binary readers deliberately skip it). A read
@@ -96,10 +95,10 @@ interface HistoryRow {
 }
 
 /**
- * Scan UserPromptSubmit rows whose COALESCEd payload's `$.prompt` LIKE-matches
- * `term`, most-recent-first. The blob VALUE and the LIKE filter both resolve
- * via `COALESCE(events.data, event_blobs.data)` so a relocated payload still
- * matches and re-reads byte-identically.
+ * Scan UserPromptSubmit rows whose payload's `$.prompt` LIKE-matches `term`,
+ * most-recent-first. UserPromptSubmit is keep-set, so its body is always inline
+ * in `events.data` — fn-836.4 dropped the `event_blobs` side table and its
+ * COALESCE dual-read.
  */
 function searchHistory(
   dbPath: string,
@@ -112,11 +111,10 @@ function searchHistory(
       .query(
         `SELECT events.ts AS ts,
                 events.session_id AS session_id,
-                json_extract(COALESCE(events.data, event_blobs.data), '$.prompt') AS prompt
+                json_extract(events.data, '$.prompt') AS prompt
            FROM events
-           LEFT JOIN event_blobs ON event_blobs.event_id = events.id
           WHERE events.hook_event = 'UserPromptSubmit'
-            AND json_extract(COALESCE(events.data, event_blobs.data), '$.prompt') LIKE ? ESCAPE '\\'
+            AND json_extract(events.data, '$.prompt') LIKE ? ESCAPE '\\'
           ORDER BY events.id DESC
           LIMIT ?`,
       )

@@ -245,19 +245,15 @@ export function findBridgePreToolUse(
   sessionId: string,
   toolUseId: string,
 ): BridgePreToolUseRow | null {
-  // fn-717.2 cold-blob relocation: COALESCE the payload column over a LEFT
-  // JOIN so a PreToolUse:Agent blob the compaction relocator MOVEd into
-  // event_blobs (events.data NULLed) still resolves on a from-scratch re-fold.
-  // The COALESCE goes in the SELECT projection ONLY — the WHERE filters indexed
-  // scalar columns (session_id, tool_use_id, hook_event, tool_name) the
-  // relocator NEVER nulls, so the WHERE stays byte-identical and the
-  // idx_events_tool_use_id seek is preserved. The LEFT JOIN is empty pre-
-  // relocation, so this is byte-identical to the prior events-only form.
+  // fn-836.4: read the PreToolUse:Agent body straight from `events.data` — the
+  // `event_blobs` side table + its COALESCE dual-read are gone (the shed kept
+  // every Agent body inline). PreToolUse:Agent is keep-set, so its body was
+  // never shed; the idx_events_tool_use_id seek over the scalar WHERE is
+  // unchanged.
   const row = db
     .prepare(
-      `SELECT COALESCE(e.data, b.data) AS data
+      `SELECT data
          FROM events e
-         LEFT JOIN event_blobs b ON b.event_id = e.id
         WHERE e.session_id = ? AND e.tool_use_id = ?
               AND e.hook_event = 'PreToolUse' AND e.tool_name = 'Agent'
         ORDER BY e.id ASC
@@ -357,17 +353,15 @@ export function findPendingPreToolUseForStart(
   // session's worth of agent-tool calls is tiny). ORDER BY id ASC gives a
   // total order that matches the fold's own event-replay order, so re-fold
   // assignment is deterministic.
-  // fn-717.2 cold-blob relocation: COALESCE(e.data, b.data) over a LEFT JOIN to
-  // event_blobs so a relocated PreToolUse:Agent blob still resolves on a
-  // from-scratch re-fold. The COALESCE is SELECT-projection ONLY — the WHERE
-  // (session_id, hook_event, tool_name, tool_use_id) and the NOT EXISTS
-  // anti-join filter indexed scalar columns the relocator NEVER nulls, so they
-  // stay byte-identical and idx_events_tool_use_id keeps covering the seek.
+  // fn-836.4: read the PreToolUse:Agent body straight from `events.data` — the
+  // `event_blobs` side table + its COALESCE dual-read are gone (Agent is
+  // keep-set, never shed). The WHERE (session_id, hook_event, tool_name,
+  // tool_use_id) + the NOT EXISTS anti-join filter the same indexed scalar
+  // columns, so idx_events_tool_use_id keeps covering the seek.
   const rows = db
     .prepare(
-      `SELECT e.tool_use_id, COALESCE(e.data, b.data) AS data
+      `SELECT e.tool_use_id, e.data AS data
          FROM events e
-         LEFT JOIN event_blobs b ON b.event_id = e.id
         WHERE e.session_id = ?
               AND e.hook_event = 'PreToolUse'
               AND e.tool_name = 'Agent'

@@ -127,13 +127,14 @@ test("idx_events_hook_event serves the Commit trailer scan after the fn-765.3 dr
   // scan back onto the composite + a USE TEMP B-TREE FOR ORDER BY regression,
   // which is why hook_event is kept.) No `json_extract` rides the WHERE anymore
   // — every survivor parses in JS — so the index serves the bare scan directly.
+  // Post-shed (fn-836.4) the scan reads `events.data` inline — no
+  // `COALESCE(events.data, event_blobs.data)` / `LEFT JOIN event_blobs`.
   const { db } = openDb(":memory:");
   const plan = db
     .prepare(
       `EXPLAIN QUERY PLAN
-         SELECT COALESCE(events.data, event_blobs.data) AS data
+         SELECT events.data AS data
            FROM events
-           LEFT JOIN event_blobs ON event_blobs.event_id = events.id
           WHERE hook_event = 'Commit'
           ORDER BY events.id ASC`,
     )
@@ -1030,33 +1031,22 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
     expect(indexNamesAfter.has(name)).toBe(true);
   }
 
-  // REGRESSION GUARD (the FK-rewrite bug): the rebuild must NOT corrupt
-  // `event_blobs`'s FOREIGN KEY. A naive `ALTER TABLE events RENAME TO
-  // events_old` would rewrite it to `REFERENCES "events_old"(id)`, leaving it
-  // dangling after the drop and breaking every later `INSERT INTO event_blobs`
-  // (the compaction relocator). The temp-new-table + FK-off rebuild keeps it
-  // pointing at `events`.
-  const eventBlobsSql = (
-    db
-      .prepare("SELECT sql FROM sqlite_master WHERE name = 'event_blobs'")
-      .get() as { sql: string }
-  ).sql;
-  expect(eventBlobsSql).not.toContain("events_old");
-  expect(eventBlobsSql).not.toContain("events_dn");
-  expect(eventBlobsSql.replace(/\s+/g, " ")).toContain("REFERENCES events");
-  // And the FK actually works: an INSERT INTO event_blobs referencing a real
-  // events row succeeds (a dangling FK would throw on prepare/insert).
-  const someId = (
-    db.prepare("SELECT id FROM events LIMIT 1").get() as { id: number }
-  ).id;
-  expect(() =>
-    db.run("INSERT INTO event_blobs (event_id, data) VALUES (?, ?)", [
-      someId,
-      "relocated",
-    ]),
-  ).not.toThrow();
+  // POST-SHED (fn-836.4): `event_blobs` is DROPPED at the v74 tail, so it is GONE
+  // at head even though the walk recreated it at v57 and the v57→v58 rebuild ran
+  // against it mid-walk. The original FK-rewrite regression guard (the rebuild
+  // must not rewrite event_blobs's FK to a temp name) is now moot at head — the
+  // table no longer exists — but the rebuild-FIDELITY proof above (rows + seq +
+  // indexes + data-nullable preserved) is the live invariant, and a successful
+  // 0→head walk through the rebuild is itself the proof that nothing throws.
+  const hasEventBlobs = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='event_blobs'",
+    )
+    .get();
+  expect(hasEventBlobs ?? null).toBeNull();
 
-  // The relocator's NULL update is now accepted (the whole point of the relax).
+  // events.data NULL update is accepted (the whole point of the v57→v58 relax —
+  // retention NULLs cold non-keep payloads in place post-shed).
   expect(() =>
     db.run("UPDATE events SET data = NULL WHERE hook_event = 'Stop'"),
   ).not.toThrow();
@@ -2004,9 +1994,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `subagent_invocations.last_disposition`, fn-38.2; v70 adds
   // `jobs.close_kind`, fn-817; v71 adds `jobs.window_index`, fn-817; v72 widens
   // the `file_attributions.source` CHECK to accept `'plan'`, fn-826; v73 adds
-  // the `events.mutation_path` column, fn-836.2); the v62→v63 epics-shape
-  // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(73);
+  // the `events.mutation_path` column, fn-836.2; v74 restores keep-set bodies
+  // inline + DROPs `event_blobs`, fn-836.4); the v62→v63 epics-shape migration
+  // this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(74);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

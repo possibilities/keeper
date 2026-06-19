@@ -6,28 +6,27 @@
  * deploy already carries it. This module backfills the column over the
  * HISTORICAL rows the forward path never touched — every
  * `(PostToolUse, Write/Edit/MultiEdit/NotebookEdit)` event that predates the
- * deploy, INCLUDING the cold rows compaction already relocated into
- * `event_blobs` (where `events.data IS NULL`). Once this is provably complete
- * the git-attribution scan flips off the blob onto the column and ARM B (the
- * `event_blobs` rowid-join) is deleted.
+ * deploy. Once this was provably complete (`.3` gate) the git-attribution scan
+ * flipped off the blob onto the column and ARM B (the `event_blobs` rowid-join)
+ * was deleted.
  *
- * ## Why COALESCE both sides
+ * ## Reads `events.data` only (post-shed, fn-836.4)
  *
- * A relocated mutation row has `events.data IS NULL` and its body in
- * `event_blobs.data`. Reading only `events.data` would leave `mutation_path`
- * NULL for every relocated row, and the post-flip discharged-mutation scan
- * (which reaches arbitrarily far back on a from-scratch re-fold) would then
- * silently drop those attributions. So the extract reads
- * `COALESCE(events.data, event_blobs.data)` — the inline body when present, the
- * relocated body otherwise.
+ * `.3` ran this against a corpus where cold mutation bodies were relocated into
+ * `event_blobs` (`events.data IS NULL`), so it COALESCE'd both sides to see the
+ * relocated body. The `.4` shed DROPPED `event_blobs` — every keep-set body was
+ * restored inline and every shed-class mutation body was NULLed (its file_path
+ * already lives in `mutation_path` from this very backfill) — so there is no
+ * side table left to read. The extract now reads `events.data` directly: a row
+ * still owing a backfill must have an INLINE body carrying a file_path, which
+ * (post-shed) means a forward-written row, and the completion gate goes true the
+ * instant no inline mutation body holds an unstamped file_path.
  *
- * ## Byte-identical to ARM B's guard
+ * ## Malformed → NULL (never throws)
  *
- * The extract uses the SAME `CASE WHEN json_valid(...) THEN json_extract(...,
- * '$.tool_input.file_path') END` guard ARM B uses, so a malformed body folds to
- * the SAME NULL the old two-arm scan produced. The column the post-flip scan
- * reads is therefore byte-identical to what the old blob-parse path read — the
- * determinism gate the .1 differential harness proves.
+ * The extract keeps the `CASE WHEN json_valid(e.data) THEN json_extract(e.data,
+ * '$.tool_input.file_path') END` guard, so a malformed body folds to NULL
+ * instead of throwing — byte-identical to the old scan's malformed handling.
  *
  * ## Pacing + crash-safe resume (mirrors `compactColdBlobs`)
  *
@@ -99,14 +98,13 @@ const MUTATION_TOOL_PREDICATE = `hook_event = 'PostToolUse'
    AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')`;
 
 /**
- * The guarded extract, IDENTICAL to ARM B's
- * `CASE WHEN json_valid(b.data) THEN json_extract(b.data, ...) END` but over
- * `COALESCE(events.data, event_blobs.data)` so an already-relocated row's body
- * is read from the side table. Malformed → NULL (never throws), byte-identical
- * to the old scan's malformed handling.
+ * The guarded extract over `events.data` (post-shed there is no side table to
+ * COALESCE). `CASE WHEN json_valid(e.data) THEN json_extract(e.data, ...) END`:
+ * a malformed body folds to NULL instead of throwing, byte-identical to the old
+ * scan's malformed handling.
  */
-const GUARDED_EXTRACT = `CASE WHEN json_valid(COALESCE(e.data, b.data))
-        THEN json_extract(COALESCE(e.data, b.data), '$.tool_input.file_path')
+const GUARDED_EXTRACT = `CASE WHEN json_valid(e.data)
+        THEN json_extract(e.data, '$.tool_input.file_path')
    END`;
 
 /** Read the crash-safe resume watermark; `0` when no pass has run yet. */
@@ -126,12 +124,12 @@ export function readBackfillWatermark(db: Database): number {
  *
  * Each batch: read the next `batchSize` mutation-row ids strictly above the
  * watermark (read-only), then under one `.immediate()` transaction UPDATE their
- * `mutation_path` from the guarded `COALESCE(events.data, event_blobs.data)`
- * extract AND advance the watermark to the batch's max id — both in the SAME
- * transaction so a crash resumes from exactly the last committed batch. Rows
- * whose body yields no valid file_path are STILL processed (their column stays
- * NULL) and the watermark advances past them, so a done-null row is never
- * re-scanned next pass.
+ * `mutation_path` from the guarded extract over the inline `events.data` body
+ * (post-shed: no `event_blobs` side table) AND advance the watermark to the
+ * batch's max id — both in the SAME transaction so a crash resumes from exactly
+ * the last committed batch. Rows whose body yields no valid file_path are STILL
+ * processed (their column stays NULL) and the watermark advances past them, so a
+ * done-null row is never re-scanned next pass.
  *
  * Does NOT checkpoint — the caller reclaims WAL space outside the hot path,
  * exactly as the compaction pass does.
@@ -149,8 +147,8 @@ export function backfillMutationPath(
   // `mutation_path IS NULL` skips the forward-path rows task .2 already filled
   // (so a re-deployed daemon doesn't re-touch them), while the watermark skips
   // the done-null tail (malformed / no-file_path rows whose column legitimately
-  // stays NULL). LEFT JOIN `event_blobs` so a relocated row's body is visible
-  // to the cold-row probe below; the id select itself reads only `events`.
+  // stays NULL). Reads only `events` (the body extract below also reads only the
+  // inline `events.data` — post-shed there is no side table).
   const selectBatch = db.prepare(
     `SELECT id FROM events
       WHERE id > ?
@@ -160,22 +158,15 @@ export function backfillMutationPath(
       LIMIT ?`,
   );
 
-  // UPDATE the batch's `mutation_path` from the guarded extract over the
-  // COALESCE'd body. The correlated `event_blobs` subquery supplies the
-  // relocated body (`b.data`) for a row whose `events.data` is NULL; an inline
-  // row reads `events.data` and the subquery's `b.data` is irrelevant. The
-  // outer `events` reference inside the subquery is the row being updated, so
-  // the join keys on its id.
+  // UPDATE the batch's `mutation_path` from the guarded extract over the inline
+  // `events.data` body (post-shed: no `event_blobs` side table to COALESCE). A
+  // shed-class row whose body was NULLed extracts to NULL and keeps the
+  // `mutation_path` this backfill already stamped before the shed.
   const updateBatch = db.prepare(
     `UPDATE events
-        SET mutation_path = (
-          SELECT CASE WHEN json_valid(COALESCE(events.data, b.data))
-                      THEN json_extract(COALESCE(events.data, b.data),
-                                        '$.tool_input.file_path')
-                 END
-            FROM (SELECT 1) AS _
-            LEFT JOIN event_blobs b ON b.event_id = events.id
-        )
+        SET mutation_path = CASE WHEN json_valid(data)
+                                 THEN json_extract(data, '$.tool_input.file_path')
+                            END
       WHERE id IN (SELECT value FROM json_each(?))`,
   );
 
@@ -219,24 +210,21 @@ export function backfillMutationPath(
 }
 
 /**
- * Completion gate: `true` when NO historical mutation row still owes a
- * backfill. A row owes a backfill iff `mutation_path IS NULL` AND the guarded
- * extract over `COALESCE(events.data, event_blobs.data)` YIELDS A VALUE — i.e.
- * its body carries a real file_path the column doesn't yet hold. This
- * deliberately does NOT count a legitimately-NULL row (malformed body / no
- * `file_path`), so the gate distinguishes "not yet backfilled" from
- * "backfilled to a correct NULL". The git-attribution flip is safe ONLY when
- * this returns `true` (and the .1 differential harness is green).
+ * Completion gate: `true` when NO mutation row still owes a backfill. A row owes
+ * a backfill iff `mutation_path IS NULL` AND the guarded extract over the inline
+ * `events.data` YIELDS A VALUE — i.e. its body carries a real file_path the
+ * column doesn't yet hold. This deliberately does NOT count a legitimately-NULL
+ * row (malformed body / no `file_path` / shed-class body NULLed by the v74 shed),
+ * so the gate distinguishes "not yet backfilled" from "backfilled to a correct
+ * NULL". The git-attribution flip was gated on this returning `true`.
  *
- * Pure read. The LEFT JOIN to `event_blobs` covers relocated rows; `IS NOT
- * NULL` over the guarded extract is the "yields a valid file_path" predicate.
+ * Pure read over `events.data` only (post-shed: no `event_blobs` side table).
  */
 export function isMutationPathBackfillComplete(db: Database): boolean {
   const row = db
     .query(
       `SELECT COUNT(*) AS n
          FROM events e
-         LEFT JOIN event_blobs b ON b.event_id = e.id
         WHERE e.${MUTATION_TOOL_PREDICATE}
           AND e.mutation_path IS NULL
           AND ${GUARDED_EXTRACT} IS NOT NULL`,

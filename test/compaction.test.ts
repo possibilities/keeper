@@ -37,6 +37,14 @@ beforeEach(() => {
   // relocates into this DB's own `event_blobs` table (no external sidecar
   // file), so an in-memory template clone is correct.
   db = freshMemDb().db;
+  // fn-836.4 shed dropped `event_blobs` from the live schema, so the migrated
+  // template no longer carries it. The RELOCATOR (`compactColdBlobs`) still
+  // exists until fn-836.5 repurposes it into the retention pass (which rewrites
+  // this whole file), so until then these unit tests provision the side table
+  // locally to exercise the relocator against the shape it targets.
+  db.run(
+    "CREATE TABLE IF NOT EXISTS event_blobs (event_id INTEGER PRIMARY KEY REFERENCES events(id), data TEXT NOT NULL)",
+  );
 });
 
 afterEach(() => {
@@ -85,20 +93,6 @@ function drainAll(): number {
     total += n;
   } while (n > 0);
   return total;
-}
-
-/** Snapshot the blob-driven projections as plain rows for byte-diff equality. */
-function snapshotProjections() {
-  return {
-    attributions: db
-      .query(
-        "SELECT project_dir, session_id, file_path, last_mutation_at, last_commit_at, op, source, last_event_id, updated_at, worktree_oid, worktree_mode FROM file_attributions ORDER BY project_dir, session_id, file_path",
-      )
-      .all(),
-    gitStatus: db.query("SELECT * FROM git_status ORDER BY project_dir").all(),
-    jobs: db.query("SELECT * FROM jobs ORDER BY job_id").all(),
-    epics: db.query("SELECT * FROM epics ORDER BY epic_id").all(),
-  };
 }
 
 /**
@@ -277,45 +271,13 @@ test("compaction relocates a cold blob atomically; recent blob stays inline; no 
   expect(resolved.data).toBe(coldValue);
 });
 
-test("from-scratch re-fold over a compacted DB = byte-identical projections", () => {
-  seedColdAndLive();
-  drainAll();
-  const live = snapshotProjections();
-
-  // Relocate EVERYTHING (margin 0) — including the DISCHARGED cold.ts mutation
-  // blob whose `tool_input.file_path` the explicit-attribution scan still needs
-  // on re-fold (the Commit that discharged it replays AFTER the GitSnapshot).
-  // This is the case that exercises the two-arm scan's ARM B (relocated
-  // mutation blob served from `event_blobs`); if relocation were lossy here the
-  // re-folded projections would diverge (cold.ts would orphan).
-  const result = compactColdBlobs(db, {
-    recentRetentionMargin: 0,
-    batchSize: 50,
-    maxBatches: 5,
-  });
-  expect(result.relocated).toBeGreaterThan(0);
-  // The discharged cold.ts mutation blob is genuinely relocated (NULL inline,
-  // present in the side table) — so re-fold MUST resolve it via ARM B.
-  const coldMutation = db
-    .query(
-      "SELECT e.data AS inline, b.data AS side FROM events e LEFT JOIN event_blobs b ON b.event_id = e.id WHERE e.tool_name = 'Write' AND json_extract(b.data, '$.tool_input.file_path') = '/repo/cold.ts'",
-    )
-    .get() as { inline: string | null; side: string | null } | null;
-  expect(coldMutation).not.toBeNull();
-  expect(coldMutation?.inline).toBeNull();
-  expect(coldMutation?.side).not.toBeNull();
-
-  // From-scratch re-fold: rewind cursor + DELETE every projection, re-drain.
-  // event_blobs is NOT in the DELETE list — it is a sidecar of the event log.
-  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
-  db.run("DELETE FROM git_status");
-  db.run("DELETE FROM file_attributions");
-  db.run("DELETE FROM jobs");
-  db.run("DELETE FROM epics");
-  drainAll();
-
-  expect(snapshotProjections()).toEqual(live);
-});
+// NOTE (fn-836.4): the former "from-scratch re-fold over a compacted DB =
+// byte-identical projections" test asserted the now-DELETED contract that the
+// drain resolves a relocated body via `COALESCE(events.data, event_blobs.data)`
+// (ARM B). The .4 shed removed that read — the drain reads `events.data` only —
+// so relocating a body the fold still needs is no longer lossless. fn-836.5
+// rewrites this file for the retention pass, which NULLs ONLY non-keep bodies
+// (the allow-list) so retention-then-refold stays byte-identical by construction.
 
 test("absent-in-both-places: folds safe + counted by countAbsentBlobs", () => {
   const { coldId } = seedColdAndLive();

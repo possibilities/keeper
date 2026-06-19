@@ -62,7 +62,7 @@ async function runVerb(verb: string, args: string[]): Promise<RunResult> {
   return { code, stdout, stderr };
 }
 
-/** Insert an event row; `data` NULL relocates the payload to `event_blobs`. */
+/** Insert an event row (post-shed: every keep-set body is inline in events.data). */
 function seedEvent(
   db: Database,
   row: {
@@ -74,7 +74,6 @@ function seedEvent(
     skillName?: string | null;
     planctlOp?: string | null;
     data?: string | null;
-    blob?: string | null;
   },
 ): void {
   db.run(
@@ -94,15 +93,6 @@ function seedEvent(
       row.data ?? null,
     ],
   );
-  if (row.blob != null) {
-    const id = (
-      db.query("SELECT last_insert_rowid() AS id").get() as { id: number }
-    ).id;
-    db.run("INSERT INTO event_blobs (event_id, data) VALUES (?, ?)", [
-      id,
-      row.blob,
-    ]);
-  }
 }
 
 function seedFileAttribution(
@@ -133,22 +123,22 @@ function seedFileAttribution(
 }
 
 describe("search-history", () => {
-  test("matches inline AND compacted (relocated-blob) prompts, JSON on stdout", async () => {
+  test("matches multiple UserPromptSubmit prompts most-recent-first, JSON on stdout", async () => {
+    // Post-shed (fn-836.4): UserPromptSubmit is keep-set, so its body is ALWAYS
+    // inline in events.data — search-history reads events.data directly (the
+    // dropped event_blobs side table + its COALESCE read are gone).
     const { db } = openDb(dbPath);
-    // Inline payload.
     seedEvent(db, {
       ts: 100,
       sessionId: "s1",
       hookEvent: "UserPromptSubmit",
       data: JSON.stringify({ prompt: "please refactor the widget" }),
     });
-    // Compacted: inline data NULL, payload relocated to event_blobs.
     seedEvent(db, {
       ts: 200,
       sessionId: "s2",
       hookEvent: "UserPromptSubmit",
-      data: null,
-      blob: JSON.stringify({ prompt: "refactor the gadget too" }),
+      data: JSON.stringify({ prompt: "refactor the gadget too" }),
     });
     // Non-matching prompt.
     seedEvent(db, {
@@ -163,7 +153,7 @@ describe("search-history", () => {
     expect(res.code).toBe(0);
     const parsed = JSON.parse(res.stdout);
     expect(parsed.success).toBe(true);
-    // Most-recent-first: the compacted row (ts 200) precedes the inline row.
+    // Most-recent-first: ts 200 precedes ts 100.
     expect(
       parsed.matches.map((m: { session_id: string }) => m.session_id),
     ).toEqual(["s2", "s1"]);

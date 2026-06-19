@@ -1,18 +1,17 @@
 /**
- * Historical `events.mutation_path` backfill tests (fn-836.3).
+ * Historical `events.mutation_path` backfill tests (fn-836.3, post-shed .4).
  *
  * Covers the task Acceptance:
- * - every historical mutation row whose body (inline `events.data` OR relocated
- *   `event_blobs.data`) yields a valid file_path gets `mutation_path` set;
+ * - every historical mutation row whose inline `events.data` body yields a valid
+ *   file_path gets `mutation_path` set (the fn-836.4 shed dropped `event_blobs`,
+ *   so the backfill reads `events.data` only — relocated bodies no longer exist);
  * - the backfill is paced (bounded batches) and resumable via a crash-safe
  *   `meta` watermark — a second pass continues where the first stopped without
  *   re-scanning the backfilled prefix;
  * - idempotence: re-running a complete backfill is a no-op;
- * - relocated rows (data IS NULL, body in `event_blobs`) are covered via the
- *   COALESCE'd extract — the risk the spec flags;
  * - the completion gate distinguishes "not yet backfilled" from a legitimate
  *   NULL (malformed / no file_path), and the backfilled column equals the
- *   guarded `json_extract` byte-for-byte.
+ *   guarded `json_extract` over `events.data` byte-for-byte.
  */
 
 import type { Database } from "bun:sqlite";
@@ -26,7 +25,6 @@ import {
   isMutationPathBackfillComplete,
   readBackfillWatermark,
 } from "../src/backfill-mutation-path";
-import { compactColdBlobs } from "../src/compaction";
 import { freshMemDb } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -127,33 +125,6 @@ test("backfill fills mutation_path from inline events.data; non-mutation rows un
   expect(mutationPathOf(pre)).toBeNull();
 });
 
-test("backfill covers RELOCATED rows via COALESCE(events.data, event_blobs.data)", () => {
-  // Seed a mutation, then relocate it into the side table (events.data → NULL,
-  // body in event_blobs) so the ONLY readable body is the relocated one. The
-  // backfill MUST still set mutation_path — reading events.data alone would
-  // leave it NULL and silently drop the post-flip attribution.
-  const id = insertMutation("/repo/relocated.ts");
-  // Filler so the watermark margin can push the mutation below the cold line.
-  for (let i = 0; i < 5; i++) insertEvent({ hook_event: "Stop" });
-  const reloc = compactColdBlobs(db, {
-    recentRetentionMargin: 0,
-    batchSize: 100,
-    maxBatches: 10,
-  });
-  expect(reloc.relocated).toBeGreaterThan(0);
-  // The hot column is genuinely NULL; the body lives in event_blobs.
-  expect(
-    (
-      db.query("SELECT data FROM events WHERE id = ?").get(id) as {
-        data: string | null;
-      }
-    ).data,
-  ).toBeNull();
-
-  backfillMutationPath(db);
-  expect(mutationPathOf(id)).toBe("/repo/relocated.ts");
-});
-
 test("backfill is idempotent — a second complete pass is a no-op", () => {
   const a = insertMutation("/repo/a.ts");
   const b = insertMutation("/repo/b.ts");
@@ -243,37 +214,31 @@ test("completion gate distinguishes legit-NULL (malformed / no file_path) from n
   expect(isMutationPathBackfillComplete(db)).toBe(true);
 });
 
-test("backfilled column equals the guarded json_extract byte-for-byte (inline + relocated)", () => {
-  const inlineId = insertMutation("/repo/inline.ts", "MultiEdit");
-  const relocId = insertMutation("/repo/reloc.ts", "NotebookEdit");
-  for (let i = 0; i < 5; i++) insertEvent({ hook_event: "Stop" });
-  // Relocate only the second mutation (margin chosen so reloc sits cold).
-  compactColdBlobs(db, {
-    recentRetentionMargin: 0,
-    batchSize: 100,
-    maxBatches: 10,
-  });
+test("backfilled column equals the guarded json_extract over events.data byte-for-byte", () => {
+  const id1 = insertMutation("/repo/one.ts", "MultiEdit");
+  const id2 = insertMutation("/repo/two.ts", "NotebookEdit");
 
   backfillMutationPath(db);
 
-  // The column value must equal the guarded extract over the COALESCE'd body —
-  // the exact predicate the old two-arm scan / .1 harness used.
+  // Post-shed (fn-836.4) the column value must equal the guarded extract over the
+  // INLINE `events.data` body — the exact predicate the post-flip scan reads (no
+  // event_blobs side table to COALESCE).
   const rows = db
     .query(
       `SELECT e.id,
               e.mutation_path AS col,
-              CASE WHEN json_valid(COALESCE(e.data, b.data))
-                   THEN json_extract(COALESCE(e.data, b.data), '$.tool_input.file_path')
+              CASE WHEN json_valid(e.data)
+                   THEN json_extract(e.data, '$.tool_input.file_path')
               END AS extracted
          FROM events e
-         LEFT JOIN event_blobs b ON b.event_id = e.id
         WHERE e.id IN (?, ?)`,
     )
-    .all(inlineId, relocId) as Array<{
+    .all(id1, id2) as Array<{
     id: number;
     col: string | null;
     extracted: string | null;
   }>;
+  expect(rows.length).toBe(2);
   for (const r of rows) {
     expect(r.col).toBe(r.extracted);
   }

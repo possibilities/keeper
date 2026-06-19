@@ -1285,12 +1285,12 @@ function buildExplicitAttribHoist(
   // Single-arm tool-mutation scan off the promoted `mutation_path` column
   // (fn-836.3): the file_path the old two-arm scan parsed from the JSON body
   // (inline ARM A + relocated ARM B) is now read directly from the column,
-  // backfilled byte-identically over every historical row (`backfillMutationPath`
-  // — guarded `COALESCE(events.data, event_blobs.data)` extract, malformed→NULL,
-  // matching the old scan exactly). The `WHERE mutation_path IS NOT NULL` partial
-  // index `idx_events_mutation_path` serves this as a sub-ms covering SEEK, so
-  // the fold no longer touches `event_blobs` at all (ARM B's rowid-join gone, no
-  // more multi-second attribution folds under load).
+  // backfilled byte-identically over every historical row (`backfillMutationPath`,
+  // guarded extract, malformed→NULL, matching the old scan exactly). The
+  // `WHERE mutation_path IS NOT NULL` partial index `idx_events_mutation_path`
+  // serves this as a sub-ms covering SEEK. Post-shed (fn-836.4) the `event_blobs`
+  // side table is gone entirely (ARM B's rowid-join was deleted here in .3), so
+  // there are no more multi-second attribution folds under load.
   const toolStmt = db.prepare(
     `SELECT id, ts, session_id, tool_name
          FROM events
@@ -7483,30 +7483,26 @@ export function drain(
     .get() as { last_event_id: number } | null;
   const cursor = cursorRow?.last_event_id ?? 0;
 
-  // fn-717.1: the `data` blob resolves via `COALESCE(events.data,
-  // event_blobs.data)` so a blob the compaction relocator (task .2) has
-  // MOVEd into the `event_blobs` side table folds byte-identically to one
-  // still inline. The LEFT JOIN is empty in .1 (no compaction yet), so
-  // COALESCE returns the inline `events.data` for every row and this drain
-  // is byte-identical to the pre-v57 form. `event_blobs` carries only
-  // `(event_id, data)`, so every other projected column is unambiguous;
-  // `id` is qualified to `events.id` for the join key (the side table has
-  // no `id`).
+  // fn-836.4: the `data` blob reads straight from `events.data` — the
+  // `event_blobs` side table + its `COALESCE(events.data, event_blobs.data)`
+  // dual-read are gone now that the shed restored every keep-set body inline
+  // and dropped the table. Shed-class PostToolUse mutation rows carry NULL
+  // `data` (their `tool_input.file_path` lives in `mutation_path`), and the
+  // shed-class fold arm never reads the body, so a from-scratch re-fold over
+  // the post-shed corpus reproduces byte-identical projection rows.
   const rows = db
     .query(
-      `SELECT events.id AS id, ts, session_id, pid, hook_event, event_type,
+      `SELECT id, ts, session_id, pid, hook_event, event_type,
               tool_name, matcher, cwd, permission_mode, agent_id, agent_type,
-              stop_hook_active,
-              COALESCE(events.data, event_blobs.data) AS data,
+              stop_hook_active, data,
               subagent_agent_id, spawn_name,
               start_time, slash_command, skill_name,
               planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
               planctl_subject_present, tool_use_id, config_dir, planctl_files,
               backend_exec_type, backend_exec_session_id, backend_exec_pane_id
          FROM events
-         LEFT JOIN event_blobs ON event_blobs.event_id = events.id
-        WHERE events.id > ?
-        ORDER BY events.id ASC
+        WHERE id > ?
+        ORDER BY id ASC
         LIMIT ?`,
     )
     .all(cursor, batchSize) as Event[];

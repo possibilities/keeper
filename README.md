@@ -1891,9 +1891,12 @@ commit-trailer channel of `syncPlanctlLinks`: `foldCommit` writes one row per
 trailer-bearing `Commit` in its own transaction, and the loader reads the table
 `ORDER BY event_id ASC` instead of re-scanning every `Commit` blob once per
 swept session. It derives from `Commit` events ALONE, so the v66→v67 migration
-backfills it (through the same `extractCommit` + `parsePlanRef` JS path the
-fold uses, `COALESCE`-ing relocated cold blobs) WITHOUT a cursor rewind, and a
-from-scratch re-fold reproduces it byte-identically. keeper-py's
+backfills it (through the same `extractCommit` + `parsePlanRef` JS path the fold
+uses) WITHOUT a cursor rewind, and a from-scratch re-fold reproduces it
+byte-identically. (Commit is keep-set, so its body is always inline in
+`events.data`; the v67 backfill's historical `COALESCE` over the
+since-shed `event_blobs` table now resolves the inline value during the
+0→latest ladder walk that transiently recreates the table.) keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `67` (whitelist-only; keeper-py
 does not read the projection). Any future rewind-and-redrain that wipes the
 link projections MUST also `DELETE FROM commit_trailer_facts`.
@@ -2598,30 +2601,34 @@ ship as one binary instead of N standalone scripts.
 
 The sitter scanners (performance, builds, helptailing) — read-only out-of-process observers of `keeper.db` and buildbot state — now live in their own repo at `~/code/sitter`. They import nothing from keeper and observe purely through durable contracts (read-only SQLite at a whitelisted schema version, NDJSON telemetry, their own private state tree). See `~/code/sitter` for the daemon set, its launchd jobs, and its architecture.
 
-**event_blobs read-contract.** The cold-blob compaction relocator (fn-717)
-MOVEs an old event's payload out of `events.data` (NULLing the hot column) and
-into the `event_blobs` side table, keyed by `event_id`. Relocation is lossless
-only because every fold-path read of the blob VALUE resolves it back via
-`COALESCE(events.data, event_blobs.data)` over a `LEFT JOIN event_blobs` — so a
-from-scratch re-fold of a compacted DB reproduces byte-identical projections.
-The contract: **every fold-path read of `events.data` either COALESCEs the
-payload column, or documents why it cannot.** The COALESCE wraps the SELECT
-projection ONLY, never a WHERE/filter column — the relocator never touches the
-indexed scalars folds filter on (`tool_use_id`, `session_id`, `tool_name`,
-`hook_event`, generated `bash_mutation_*` columns), and wrapping them would
-defeat their indexes. The tool-mutation attribution scan in `reducer.ts`
-(`findExplicitAttributions`) no longer reads the blob at all (fn-836): its lone
-cross-event fold field, `data.tool_input.file_path`, is promoted to the
-`events.mutation_path` column (hook-derived forward, ingester-recomputed +
-historically backfilled via the guarded `COALESCE(events.data,
-event_blobs.data)` extract), and the scan SEEKs that column through the partial
-index `idx_events_mutation_path WHERE mutation_path IS NOT NULL` — the old
-two-arm form (inline `events.data` SEEK + relocated `event_blobs.data` join) is
-gone, so the git-attribution fold never touches `event_blobs`. Migration-internal
-reads (`migrate()`) and the relocator's own reads (`compaction.ts`) run off the
-fold path and are exempt. The authoritative per-site enumeration of remaining
-`event_blobs` body readers lives in `test/refold-equivalence.test.ts` (the
-keep/shed classification gate).
+**events.data read-contract (post-shed).** As of schema v74 (fn-836) the
+`event_blobs` side table is GONE. The conflated `events.data` blob served two
+roles fused in one column — (1) the typed fold INPUT a fold reads via the
+`extract*()` functions, and (2) a redundant transcript archive — and the shed
+split them. The v74 migration restored every **keep-set** body back inline (the
+explicit ALLOW-list of event types whose body a live fold reads — GitSnapshot,
+Commit, UserPromptSubmit, PreToolUse:Agent, Stop, the Usage/window/build/dispatch
+snapshots, etc.) and dropped the table; the **shed class** — PostToolUse
+`tool_response` bodies for the four mutation tools (Write/Edit/MultiEdit/
+NotebookEdit) — carries NULL `events.data`, its lone fold field
+(`tool_input.file_path`) promoted to the `events.mutation_path` column and
+SEEK'd through the partial index `idx_events_mutation_path WHERE mutation_path IS
+NOT NULL`. So every fold-path read now resolves straight from `events.data` (no
+`COALESCE`, no `LEFT JOIN event_blobs`): the drain SELECT, the subagent
+PreToolUse:Agent bridge, the v67 Commit-trailer backfill (a historical-ladder
+read that still runs against the transiently-recreated table during a 0→latest
+walk), and `search-history`'s UserPromptSubmit `$.prompt`.
+
+Re-fold determinism now scopes to the **projection columns**: a from-scratch
+re-fold reproduces byte-identical projection rows because every keep-set body is
+inline and every shed-class file_path is in `mutation_path`. The shed bodies
+themselves are intentionally **non-reconstructable** — that transcript depth
+defers to Claude Code's own `transcript_path` `.jsonl` (retained per CC's
+`cleanupPeriodDays`). The authoritative per-site keep/shed classification gate
+lives in `test/refold-equivalence.test.ts`. The DROP lands at the migration TAIL
+so the historical v57 create + v67 read still run against a live table on a fresh
+walk; it is UNCONDITIONAL (the `approvals` v12→v13 precedent) so the v57 ladder
+step never resurrects the table on a post-shed restart.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
@@ -2760,8 +2767,9 @@ bun scripts/backup-db.ts   # prints the verified snapshot path + restore steps
 
 The `VACUUM INTO` snapshot is a fully-defragmented copy, so restoring it doubles
 as the offline size reclamation that online `VACUUM` deliberately defers (the
-live file stays large after cold-blob compaction). Steps (DB path shown for the
-default `~/.local/state/keeper/keeper.db`):
+live file stays large after a logical shed of payload bytes until a `VACUUM
+INTO` rebuild reclaims the freelist). Steps (DB path shown for the default
+`~/.local/state/keeper/keeper.db`):
 
 ```sh
 # 1. Stop the daemon so nothing holds the writer lock or a stale WAL.
@@ -2783,3 +2791,18 @@ launchctl start <keeperd label>
 Because the entire system folds deterministically from the immutable `events`
 table, a restored DB re-derives byte-identical projections; no projection state
 is lost that the event log doesn't already carry.
+
+### One-time event_blobs shed reclaim (fn-836.4)
+
+The v74 migration LOGICALLY drops `event_blobs` (restoring keep-set bodies inline
+first), but the freed pages stay on the live file's freelist until a `VACUUM
+INTO` rebuild reclaims them — an in-place online `VACUUM` is deliberately never
+run (it rewrites the whole multi-GB DB under the writer lock). So the physical
+reclaim is a ONE-TIME OFFLINE op, run with the daemon stopped, that also bakes
+`auto_vacuum=INCREMENTAL` into the new file so the steady-state retention pass
+(fn-836.5) can return freed overflow pages to the OS via `PRAGMA
+incremental_vacuum`. `reclaimDb(dbPath, outputPath)` in `src/backup.ts` does the
+`VACUUM INTO` (with the pragma baked) + `quick_check` gate + perms match;
+`reclaimInstructions(...)` prints the full checkpoint → reclaim → atomic `mv` →
+restart → verify procedure. Keep the pre-shed snapshot as the rollback until the
+restarted COALESCE-free binary verifies `event_blobs` is gone.

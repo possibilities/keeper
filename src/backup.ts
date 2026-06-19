@@ -53,7 +53,7 @@
  */
 
 import { Database } from "bun:sqlite";
-import { mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
+import { chmodSync, mkdirSync, readdirSync, rmSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 
 /**
@@ -393,6 +393,215 @@ export function backupDb(
   const pruned = pruneSnapshots(backupDir, retain);
 
   return { snapshotPath, verified: true, bytes, pruned, error: null };
+}
+
+/** Outcome of a single {@link reclaimDb} run — pure data the caller logs. */
+export interface ReclaimResult {
+  /** Absolute path of the reclaimed output file, or `null` on failure. */
+  outputPath: string | null;
+  /** True iff the output was produced AND passed `quick_check`. */
+  ok: boolean;
+  /** Byte size of the source DB (0 if unreadable). */
+  sourceBytes: number;
+  /** Byte size of the reclaimed output (0 on failure). */
+  outputBytes: number;
+  /** Human-readable error when `ok` is false; `null` on success. */
+  error: string | null;
+}
+
+/**
+ * Produce a freelist-compacted, SIZE-RECLAIMED copy of `dbPath` at `outputPath`
+ * with `auto_vacuum=INCREMENTAL` BAKED IN, gated on `PRAGMA quick_check`. The
+ * physical-reclaim half of the fn-836.4 shed: after the migration logically
+ * drops `event_blobs`, the live file still carries the freed pages on the
+ * freelist (an in-place online VACUUM is deliberately never run — it rewrites
+ * the whole multi-GB DB under the writer lock), so the operator runs this
+ * OFFLINE (daemon stopped) and atomically `mv`s the output over the live DB.
+ *
+ * Why `auto_vacuum=INCREMENTAL` baked here: an existing DB's auto_vacuum mode
+ * cannot be changed in place (only at create/VACUUM time), so the steady-state
+ * retention pass (fn-836.5) can only return freed overflow pages to the OS via
+ * `PRAGMA incremental_vacuum` if the file was BORN with INCREMENTAL mode. We set
+ * the pragma on the dedicated VACUUM-INTO source connection BEFORE issuing the
+ * statement; SQLite bakes the connection's auto_vacuum value into the generated
+ * file (verified: the output reads back `auto_vacuum=2`).
+ *
+ * `quick_check` (not the full `integrity_check`) is the go/no-go gate per the
+ * task Approach — a bounded structural sweep on the freshly-defragmented output,
+ * affordable once off the hot path. A failing output is DELETED and `ok:false`
+ * returned: never leave a corrupt reclaim masquerading as good (mv-ing it would
+ * propagate corruption). On success the output is chmod'd to match the source's
+ * mode so the atomic `mv` preserves permissions. Producer-side: reads the source
+ * over a DEDICATED read-only connection (no writer-lock contention), writes only
+ * the output file, never the live DB. The caller does the atomic `mv` + stale
+ * `-wal`/`-shm` cleanup (see {@link reclaimInstructions}); this function only
+ * produces and gates the output.
+ */
+export function reclaimDb(dbPath: string, outputPath: string): ReclaimResult {
+  let sourceBytes = 0;
+  let sourceMode: number | null = null;
+  try {
+    const st = statSync(dbPath);
+    sourceBytes = st.size;
+    sourceMode = st.mode;
+  } catch {
+    return {
+      outputPath: null,
+      ok: false,
+      sourceBytes: 0,
+      outputBytes: 0,
+      error: `source DB not readable: ${dbPath}`,
+    };
+  }
+
+  // Remove any stale output from an interrupted prior attempt so VACUUM INTO
+  // (which refuses to overwrite an existing file) does not error.
+  try {
+    rmSync(outputPath, { force: true });
+  } catch {
+    /* best-effort */
+  }
+
+  // VACUUM INTO on a DEDICATED read-only source connection. Set
+  // auto_vacuum=INCREMENTAL on THIS connection first so it is baked into the
+  // generated output (an existing DB's mode is immutable in place). Read-only on
+  // the source ⇒ no writer-lock contention with a concurrent process.
+  const src = new Database(dbPath, { readonly: true });
+  try {
+    src.run("PRAGMA auto_vacuum=INCREMENTAL");
+    const quoted = outputPath.replace(/'/g, "''");
+    src.run(`VACUUM INTO '${quoted}'`);
+  } catch (err) {
+    try {
+      rmSync(outputPath, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    return {
+      outputPath: null,
+      ok: false,
+      sourceBytes,
+      outputBytes: 0,
+      error: `VACUUM INTO failed: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  } finally {
+    src.close();
+  }
+
+  // GATE on quick_check + assert the auto_vacuum mode actually baked in. A
+  // failing output is deleted (a corrupt reclaim is worse than none).
+  let quickOk = false;
+  let autoVacuum = 0;
+  try {
+    const out = new Database(outputPath, { readonly: true });
+    try {
+      const qc = out.query("PRAGMA quick_check").get() as {
+        quick_check?: unknown;
+      } | null;
+      const v = qc && "quick_check" in qc ? qc.quick_check : null;
+      quickOk = v === INTEGRITY_CHECK_OK;
+      const av = out.query("PRAGMA auto_vacuum").get() as {
+        auto_vacuum?: unknown;
+      } | null;
+      autoVacuum = typeof av?.auto_vacuum === "number" ? av.auto_vacuum : 0;
+    } finally {
+      out.close();
+    }
+  } catch (err) {
+    try {
+      rmSync(outputPath, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    return {
+      outputPath: null,
+      ok: false,
+      sourceBytes,
+      outputBytes: 0,
+      error: `quick_check threw (deleted): ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  }
+
+  if (!quickOk || autoVacuum !== 2) {
+    try {
+      rmSync(outputPath, { force: true });
+    } catch {
+      /* best-effort */
+    }
+    return {
+      outputPath: null,
+      ok: false,
+      sourceBytes,
+      outputBytes: 0,
+      error: !quickOk
+        ? "reclaimed output failed quick_check (deleted)"
+        : `reclaimed output did not bake auto_vacuum=INCREMENTAL (got ${autoVacuum}, deleted)`,
+    };
+  }
+
+  // Match source permissions so the atomic mv preserves them. Best-effort: a
+  // chmod failure does not invalidate the (verified) reclaim.
+  if (sourceMode !== null) {
+    try {
+      chmodSync(outputPath, sourceMode & 0o777);
+    } catch {
+      /* best-effort */
+    }
+  }
+
+  let outputBytes = 0;
+  try {
+    outputBytes = statSync(outputPath).size;
+  } catch {
+    /* size is informational only */
+  }
+
+  return { outputPath, ok: true, sourceBytes, outputBytes, error: null };
+}
+
+/**
+ * The DOCUMENTED offline reclaim procedure for the fn-836.4 shed — checkpoint,
+ * reclaim, gate, atomic mv, clear stale sidecars, restart, verify. Rendered as a
+ * single source of truth here AND in README `## Backup & restore`. Run with the
+ * daemon STOPPED; keep the pre-shed snapshot as the rollback until the restarted
+ * binary verifies.
+ */
+export function reclaimInstructions(
+  outputPath: string,
+  dbPath: string,
+): string {
+  return [
+    "Offline event_blobs shed reclaim (daemon STOPPED):",
+    "",
+    "  1. Stop the daemon so nothing holds the writer lock or a stale WAL:",
+    "       launchctl stop <keeperd label>",
+    "",
+    "  2. Keep a pre-shed snapshot as the rollback (verified VACUUM INTO copy):",
+    "       bun scripts/backup-db.ts   # or the existing daily snapshot",
+    "",
+    "  3. Checkpoint the WAL fully into the main DB, then reclaim into a new",
+    "     file with auto_vacuum=INCREMENTAL baked + quick_check gate:",
+    `       sqlite3 '${dbPath}' 'PRAGMA wal_checkpoint(FULL);'`,
+    "       # reclaimDb(dbPath, outputPath) does the VACUUM INTO + gate",
+    "",
+    "  4. Atomically move the reclaimed file into place (SAME filesystem) and",
+    "     drop the stale WAL/SHM sidecars (they belong to the OLD file):",
+    `       mv '${outputPath}' '${dbPath}'`,
+    `       rm -f '${dbPath}-wal' '${dbPath}-shm'`,
+    "",
+    "  5. Restart the new (COALESCE-free) binary and verify before discarding",
+    "     the pre-shed snapshot:",
+    "       launchctl start <keeperd label> && keeper await server-up",
+    `       sqlite3 -readonly '${dbPath}' "SELECT name FROM sqlite_master WHERE name='event_blobs'"  # empty`,
+    "",
+    "If post-restart verification fails: stop the daemon, mv the pre-shed",
+    "snapshot back, restart the prior binary. Never delete the snapshot until",
+    "verification passes.",
+  ].join("\n");
 }
 
 /**

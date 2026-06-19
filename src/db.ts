@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 73;
+export const SCHEMA_VERSION = 74;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -867,13 +867,15 @@ CREATE TABLE IF NOT EXISTS epic_tombstones (
 `;
 
 /**
- * `event_blobs` cold-blob relocation side table. The compaction pass MOVEs a
- * cold/discharged event's blob here and NULLs `events.data` — the `events` row
- * is never deleted, only the blob's LOCATION moves. Reads resolve via
- * `COALESCE(events.data, event_blobs.data)` so a relocated blob folds
- * byte-identically. `event_id` is a 1:1 FK to `events(id)`. NOT a reducer
- * projection — a content-preserving sidecar of the immutable log, NOT in the
- * rewind-and-redrain DELETE list.
+ * `event_blobs` cold-blob relocation side table — HISTORICAL (fn-836.4 shed it).
+ * Created at v57 and read by the v67 Commit-trailer backfill, so a 0→latest
+ * from-scratch walk still materializes it transiently; the v74 tail then DROPs
+ * it (unconditionally, the `approvals` precedent) after restoring every keep-set
+ * body back inline. No steady-state schema-setup CREATE references it anymore —
+ * it exists ONLY during the historical ladder walk, never at head. Kept here
+ * because the v57 ladder step still runs `db.run(CREATE_EVENT_BLOBS)`; do NOT
+ * resurrect it in the unconditional CREATE block. `event_id` was a 1:1 FK to
+ * `events(id)`.
  */
 const CREATE_EVENT_BLOBS = `
 CREATE TABLE IF NOT EXISTS event_blobs (
@@ -881,19 +883,6 @@ CREATE TABLE IF NOT EXISTS event_blobs (
     data TEXT NOT NULL
 )
 `;
-
-/**
- * Expression index mirroring `idx_events_tool_attr` onto the relocation side
- * table, so `findExplicitAttributions`'s cold-blob arm SEEKs instead of
- * full-scanning the side table per dirty file. Pure perf — no SCHEMA_VERSION
- * bump. The `CASE WHEN json_valid(data)` guard is load-bearing: a bare
- * `json_extract` THROWS on a malformed blob at build/query time, and the reducer
- * tolerates malformed `data`, so the guard yields NULL instead — the consumer
- * query MUST probe with the identical guarded expression to match this index.
- */
-const CREATE_EVENT_BLOBS_INDEXES = [
-  "CREATE INDEX IF NOT EXISTS idx_event_blobs_tool_attr ON event_blobs(CASE WHEN json_valid(data) THEN json_extract(data, '$.tool_input.file_path') END)",
-];
 
 /**
  * `autopilot_state` SINGLETON projection (`CHECK (id = 1)`) carrying the
@@ -1568,10 +1557,10 @@ function migrate(db: Database): void {
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
       db.run(CREATE_EPIC_TOMBSTONES);
-      db.run(CREATE_EVENT_BLOBS);
-      for (const sql of CREATE_EVENT_BLOBS_INDEXES) {
-        db.run(sql);
-      }
+      // `event_blobs` is HISTORICAL (fn-836.4 shed): NOT created in the
+      // steady-state schema-setup block, so a post-shed boot never resurrects
+      // it. A fresh 0→latest walk still materializes it transiently at the v57
+      // ladder step (read by the v67 backfill) and the v74 tail DROPs it.
       db.run(CREATE_SCHEDULED_TASKS);
       for (const sql of CREATE_SCHEDULED_TASKS_INDEXES) {
         db.run(sql);
@@ -3610,6 +3599,56 @@ function migrate(db: Database): void {
       for (const sql of CREATE_V73_INDEXES) {
         db.run(sql);
       }
+
+      // v73→v74 (fn-836.4): the DESTRUCTIVE shed. Restore every keep-set body
+      // back inline, then DROP `event_blobs` at the migration TAIL.
+      //
+      // RESTORE (version-guarded, the one-way data move runs once): copy every
+      // RELOCATED (`events.data IS NULL`) keep-set body back into `events.data`.
+      // The keep-set is the explicit ALLOW-list of event types whose body a live
+      // fold reads (drain → applyEvent, the subagent PreToolUse:Agent bridge,
+      // search-history's UserPromptSubmit `$.prompt`); the SHED CLASS is the four
+      // PostToolUse mutation tools (Write/Edit/MultiEdit/NotebookEdit) whose ONLY
+      // fold consumption is `tool_input.file_path`, already promoted to the
+      // `mutation_path` column (.2/.3). So the restore predicate is "relocated AND
+      // NOT shed-class" — keep-set bodies come back inline, shed-class bodies stay
+      // NULL (their body is the redundant transcript archive being shed). After
+      // this, a from-scratch re-fold reads every keep-set body from `events.data`
+      // and every shed-class file_path from `mutation_path` — byte-identical
+      // projections, with the shed bodies intentionally non-reconstructable.
+      // Idempotent + crash-safe: the `EXISTS` guard + `data IS NULL` predicate
+      // mean a re-run (or a partially-applied prior attempt) finds nothing to
+      // restore; a mid-step crash rolls back the whole migrate transaction to the
+      // known-good pre-shed v73 state (the table is still present until the tail
+      // DROP commits).
+      if (preMigrateStoredVersion < 74) {
+        db.run(
+          `UPDATE events
+              SET data = (
+                  SELECT data FROM event_blobs WHERE event_blobs.event_id = events.id
+              )
+            WHERE events.data IS NULL
+              AND EXISTS (
+                  SELECT 1 FROM event_blobs WHERE event_blobs.event_id = events.id
+              )
+              AND NOT (
+                  hook_event = 'PostToolUse'
+                  AND tool_name IN ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
+              )`,
+        );
+      }
+      // DROP UNCONDITIONALLY at the tail — the `approvals` precedent (v12→v13).
+      // The v57 ladder step (`db.run(CREATE_EVENT_BLOBS)`) recreates the table on
+      // EVERY boot (it must, for a fresh 0→latest walk through v57/v67), so a
+      // version-guarded DROP would let it resurrect empty on a post-shed restart.
+      // An unconditional `DROP TABLE IF EXISTS` here converges cleanly: a fresh
+      // walk drops the freshly-created empty table, a v73→v74 upgrade drops the
+      // restored-and-emptied real table, and a v74 restart drops the empty
+      // resurrected table. This is the LAST event_blobs action of the migration,
+      // AFTER the v67 read, so the historical ladder still runs against a live
+      // table during a from-scratch walk.
+      db.run("DROP TABLE IF EXISTS event_blobs");
+      db.run("DROP INDEX IF EXISTS idx_event_blobs_tool_attr");
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

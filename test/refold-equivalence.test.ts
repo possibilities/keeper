@@ -1,56 +1,45 @@
 /**
  * Re-fold equivalence harness — the correctness GATE for the
- * `fn-836-shed-event-blob-bloat-and-add-retention` epic (task .1, the early
- * proof point).
+ * `fn-836-shed-event-blob-bloat-and-add-retention` epic.
  *
- * This file writes NO production behavior change. It establishes the proof
- * METHODOLOGY and the current-fold BASELINE that the destructive shed tasks
- * (.3 backfill+flip, .4 DROP `event_blobs`) are gated on. If any assertion here
- * cannot be made to hold over a live-SHAPED corpus, the shed is unsafe and the
- * design must change before proceeding past .1.
+ * `.1` established this harness as the proof METHODOLOGY (simulating the future
+ * shed by relocating into `event_blobs`). As of `.4` the shed has LANDED — the
+ * v74 migration restored every keep-set body inline and DROPPED `event_blobs` —
+ * so the harness now proves the POST-SHED reality directly: a from-scratch
+ * re-fold over a SHED-SHAPED corpus reproduces byte-identical PROJECTION rows.
  *
- * The shed splits today's conflated `events.data` blob into its two real roles:
+ * The shed split the conflated `events.data` blob into its two real roles:
  *
  *   - the KEEP-SET — an explicit ALLOW-list of event types whose `data` BODY a
- *     LIVE fold reads (via `JSON.parse(event.data)` inside `applyEvent`, or via
- *     a `COALESCE(events.data, event_blobs.data)` body read). These stay inline
- *     forever; dropping their body breaks re-fold.
- *   - the SHED CLASS — PostToolUse `tool_input` bodies for the four mutation
- *     tools (Write / Edit / MultiEdit / NotebookEdit) whose ONLY fold
- *     consumption is the single scalar `tool_input.file_path`, read by the
- *     git-attribution scan. That one field is promoted to a `mutation_path`
- *     column (task .2); the rest of the body is the redundant transcript
- *     archive that gets shed.
+ *     LIVE fold reads (via `JSON.parse(event.data)` inside `applyEvent`). These
+ *     stay inline in `events.data` forever; dropping their body breaks re-fold.
+ *   - the SHED CLASS — PostToolUse bodies for the four mutation tools (Write /
+ *     Edit / MultiEdit / NotebookEdit) whose ONLY fold consumption is the single
+ *     scalar `tool_input.file_path`, promoted to the `mutation_path` column. The
+ *     rest of the body is the redundant transcript archive — its `events.data`
+ *     is NULL after the shed, and the fold never reads it.
  *
- * Four proof layers, cheapest first (per practice-scout):
- *   (1) the keep-set ALLOW-list + a blob-reader ENUMERATION test that asserts no
- *       fold reads the BODY of a shed-class event;
- *   (2) a per-event EXTRACTION AUDIT — the value the old path extracts
- *       (`json_extract($.tool_input.file_path)` over the resolved blob) equals
- *       the value a `mutation_path` column would carry, for every mutation row;
+ * Four proof layers, cheapest first:
+ *   (1) the keep-set ALLOW-list + an ENUMERATION test that asserts NO source site
+ *       reads an event `data` body through the (now-dropped) `event_blobs` table —
+ *       every fold-path read resolves straight from `events.data`;
+ *   (2) a per-event AUDIT — the `mutation_path` column carries exactly the
+ *       `tool_input.file_path` the git-attribution scan reads, for every mutation
+ *       row, with the shed body NULL;
  *   (3) a LEGACY-SHAPE charter (legacy Agent `tool_response.agentId` fallback,
  *       malformed→null, old Commit/GitSnapshot shapes, the planctl Bash
  *       `tool_response.stdout` envelope);
- *   (4) the full DIFFERENTIAL RE-FOLD — over a live-shaped corpus (relocated
- *       rows: `events.data IS NULL`, the value lives in `event_blobs`), assert
- *       the projection row-hashes are byte-identical between the OLD attribution
- *       path (json_extract two-arm scan over the blob) and the NEW
- *       `mutation_path`-column path.
- *
- * Because the `mutation_path` column does not exist yet (task .2 adds it), the
- * NEW path is SIMULATED in-test: we materialize the exact value the future
- * column will carry — `json_extract(COALESCE(events.data, event_blobs.data),
- * '$.tool_input.file_path')` for the four mutation tools — into an in-test
- * column, then drive the attribution scan off the COLUMN instead of the blob.
- * Proving the two paths agree over a relocated corpus is precisely the safety
- * predicate the shed needs.
+ *   (4) the full DIFFERENTIAL RE-FOLD — over a SHED-shaped corpus (shed-class
+ *       rows: `events.data IS NULL`, `mutation_path` set; keep-set rows inline),
+ *       assert two from-scratch re-folds are byte-identical (re-fold determinism)
+ *       AND that the post-shed attribution set reproduces every tool-sourced
+ *       attribution the corpus implies.
  */
 
 import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
-import { compactColdBlobs } from "../src/compaction";
 import { openDb, SCHEMA_VERSION } from "../src/db";
 import { extractMutationPath } from "../src/derivers";
 import { drain } from "../src/reducer";
@@ -206,91 +195,64 @@ function readSrc(rel: string): string {
   return readFileSync(join(process.cwd(), rel), "utf8");
 }
 
-test("every body-resolving blob reader is enumerated and classified keep vs shed", () => {
-  // The COMPLETE set of source sites that resolve an event `data` BODY through
-  // the `event_blobs` side table (the reads the shed retires when it drops the
-  // table). Each is classified: a KEEP reader parses a keep-set event body; a
-  // FILEPATH reader extracts ONLY `$.tool_input.file_path` (the value the
-  // `mutation_path` column promotes — safe to retire the blob read once the
-  // column lands). NO reader may parse a shed-class BODY beyond file_path.
-  //
-  // This is a proof obligation, not a guess: a missed body reader silently
-  // breaks re-fold after the shed. If `grep -rn event_blobs src/ cli/` turns up
-  // a site not on this list, the test below fails — forcing classification.
-  const bodyResolvingReaders: Array<{
+test("no fold-path reader touches the dropped event_blobs table; every body read resolves from events.data", () => {
+  // POST-SHED (fn-836.4): `event_blobs` is DROPPED, so NO fold-path reader may
+  // JOIN it. The four fold-path body readers now resolve straight from
+  // `events.data`. Each needle pins the post-shed query so a regression
+  // (re-adding a COALESCE/JOIN, or moving the reader) fails here.
+  const foldPathReaders: Array<{
     file: string;
-    // A short, unique substring of the reader's query/expression that pins it.
     needle: string;
-    kind: "keep" | "filepath";
     why: string;
   }> = [
     {
       file: "src/reducer.ts",
-      needle: "COALESCE(events.data, event_blobs.data) AS data,",
-      kind: "keep",
-      // The main drain loads every event body and hands it to applyEvent; only
-      // keep-set arms JSON.parse it. The shed-class arm (PostToolUse non-Agent)
-      // never touches the body — it returns on tool_name !== 'Agent'.
-      why: "main drain — keep-set arms parse the body; shed-class arm ignores it",
-    },
-    {
-      file: "src/db.ts",
-      needle: "COALESCE(events.data, event_blobs.data) AS data",
-      kind: "keep",
-      why: "v67 Commit trailer backfill — Commit is keep-set",
+      needle: "stop_hook_active, data,",
+      why: "main drain reads events.data inline; shed-class arm ignores the body",
     },
     {
       file: "src/subagent-invocations.ts",
-      needle: "SELECT COALESCE(e.data, b.data) AS data",
-      kind: "keep",
-      why: "PreToolUse:Agent bridge body — Agent is keep-set",
+      needle: "SELECT data\n         FROM events e",
+      why: "PreToolUse:Agent bridge body — Agent is keep-set, body inline",
     },
     {
       file: "src/subagent-invocations.ts",
-      needle: "SELECT e.tool_use_id, COALESCE(e.data, b.data) AS data",
-      kind: "keep",
-      why: "pending PreToolUse:Agent FIFO bridge body — Agent is keep-set",
+      needle: "SELECT e.tool_use_id, e.data AS data",
+      why: "pending PreToolUse:Agent FIFO bridge body — keep-set, inline",
     },
     {
       file: "cli/search-history.ts",
-      needle:
-        "json_extract(COALESCE(events.data, event_blobs.data), '$.prompt')",
-      kind: "keep",
-      why: "search-history reads UserPromptSubmit $.prompt — keep-set",
+      needle: "json_extract(events.data, '$.prompt')",
+      why: "search-history reads UserPromptSubmit $.prompt inline — keep-set",
     },
   ];
-
-  // Each enumerated reader's needle must actually be present (the enumeration
-  // tracks live source — a moved/renamed reader fails here, forcing an update).
-  for (const r of bodyResolvingReaders) {
+  for (const r of foldPathReaders) {
     const src = readSrc(r.file);
-    expect(src.includes(r.needle)).toBe(true);
+    expect({ file: r.file, present: src.includes(r.needle) }).toEqual({
+      file: r.file,
+      present: true,
+    });
   }
 
-  // fn-836.3 flipped the git-attribution scan off the shed-class body onto the
-  // promoted `mutation_path` column and DELETED ARM B (the `event_blobs`
-  // rowid-join). The reducer no longer reads ANY shed-class body — assert ARM B
-  // is gone, so there is no FILEPATH reader left to enumerate. The git-attribution
-  // tool scan now SEEKs the column (`mutation_path = ?`), never the blob.
+  // The git-attribution tool scan SEEKs the `mutation_path` column (ARM B and
+  // its `event_blobs` rowid-join were deleted in .3), and the reducer touches
+  // `event_blobs` nowhere.
   const reducerSrc = readSrc("src/reducer.ts");
-  expect(reducerSrc).not.toContain("FROM event_blobs b");
-  expect(reducerSrc).not.toContain(
-    "json_extract(b.data, '$.tool_input.file_path')",
-  );
   expect(reducerSrc).toContain("AND mutation_path = ?");
 
-  // The enumeration must COVER every event_blobs body read in src/ and cli/. A
-  // body read JOINs the side table in actual SQL (`LEFT JOIN event_blobs` or the
-  // ARM B `FROM event_blobs`); the relocate INSERT and the countAbsentBlobs
-  // presence-check in compaction.ts are NOT body reads and are excluded by
-  // pinning their site counts separately below. We strip COMMENT lines so a doc
-  // mention of `event_blobs` never inflates the count.
+  // Count NON-COMMENT lines that JOIN `event_blobs`. The fold-path files
+  // (reducer, subagent bridges, search-history, the mutation_path backfill) must
+  // be ZERO — the shed dropped every body read there. `db.ts` (the v57 ladder
+  // CREATE + the v67 Commit-trailer backfill read, both historical migration
+  // steps that run against the transiently-recreated table on a fresh walk) and
+  // `compaction.ts` (the relocator/sentinel, retired into a retention pass in
+  // .5) still reference it and are exempt. Comment lines are stripped so a doc
+  // mention never inflates the count.
   const countSqlJoins = (file: string): number => {
     const lines = readSrc(file).split("\n");
     let n = 0;
     for (const line of lines) {
       const trimmed = line.trimStart();
-      // Skip line comments / JSDoc continuation lines.
       if (
         trimmed.startsWith("//") ||
         trimmed.startsWith("*") ||
@@ -300,7 +262,8 @@ test("every body-resolving blob reader is enumerated and classified keep vs shed
       }
       if (
         line.includes("LEFT JOIN event_blobs") ||
-        line.includes("FROM event_blobs")
+        line.includes("FROM event_blobs") ||
+        line.includes("JOIN event_blobs")
       ) {
         n += 1;
       }
@@ -308,39 +271,33 @@ test("every body-resolving blob reader is enumerated and classified keep vs shed
     return n;
   };
 
-  // Body-resolving SQL join sites (each enumerated above):
-  //   reducer.ts: main drain LEFT JOIN (keep) = 1 (ARM B FROM deleted in .3)
-  //   db.ts: v67 Commit backfill LEFT JOIN (keep) = 1
-  //   subagent-invocations.ts: 2 bridge LEFT JOINs (keep) = 2
-  //   search-history.ts: UserPromptSubmit prompt LEFT JOIN (keep) = 1
-  const bodyReadSites: Array<{ file: string; count: number }> = [
-    { file: "src/reducer.ts", count: 1 },
-    { file: "src/db.ts", count: 1 },
-    { file: "src/subagent-invocations.ts", count: 2 },
-    { file: "cli/search-history.ts", count: 1 },
+  // Fold-path files: ZERO event_blobs JOINs post-shed.
+  const foldPathFiles = [
+    "src/reducer.ts",
+    "src/subagent-invocations.ts",
+    "cli/search-history.ts",
+    "src/backfill-mutation-path.ts",
   ];
-  // Every enumerated reader maps to one of these sites; the join-count equals
-  // the enumerated count per file (db.ts's 1 + reducer's 2 = 3 reducer-side
-  // entries in the list, etc.). A NEW reader bumps a file's join count and
-  // fails this until it is classified above.
-  for (const { file, count } of bodyReadSites) {
-    expect({ file, n: countSqlJoins(file) }).toEqual({ file, n: count });
+  for (const file of foldPathFiles) {
+    expect({ file, n: countSqlJoins(file) }).toEqual({ file, n: 0 });
   }
-  // compaction.ts touches event_blobs only for RELOCATE (INSERT) and the
-  // countAbsentBlobs presence check — NEITHER reads a body, so they are NOT in
-  // the keep/shed enumeration. Pin that there is exactly ONE join site there
-  // (the presence check) so a future body read added to compaction.ts trips.
+  // Migration-internal event_blobs sites in db.ts stay (historical/destructive,
+  // NOT fold-path): the v67 Commit-trailer backfill `LEFT JOIN event_blobs` (1)
+  // + the v74 tail restore's two `FROM event_blobs` subqueries (the keep-set
+  // restore SELECT + its EXISTS guard) = 3. The v57 ladder CREATE and the tail
+  // DROPs are not JOIN/FROM-reads of a body, so they don't count.
   expect({
-    file: "src/compaction.ts",
-    n: countSqlJoins("src/compaction.ts"),
+    file: "src/db.ts",
+    n: countSqlJoins("src/db.ts"),
   }).toEqual({
-    file: "src/compaction.ts",
-    n: 1,
+    file: "src/db.ts",
+    n: 3,
   });
 });
 
 // ---------------------------------------------------------------------------
-// Live-shaped corpus seeding (relocated rows: data IS NULL, value in side table)
+// Shed-shaped corpus seeding (shed-class rows: data IS NULL, mutation_path set;
+// keep-set rows: body inline in events.data — the post-shed live shape)
 // ---------------------------------------------------------------------------
 
 let tsCounter = 5_000;
@@ -362,12 +319,10 @@ function insertEvent(overrides: {
 }): number {
   const ts = overrides.ts ?? tsCounter++;
   const data = overrides.data ?? "{}";
-  // Derive `mutation_path` (v73 promoted column) from `data` the SAME way the
-  // live hook does, so a seeded mutation row carries the column BEFORE the
-  // baseline fold — the post-flip git-attribution scan reads the column, not
-  // the body. A malformed body (the corpus's malformed-mutation fixture) folds
-  // to NULL here, matching the forward deriver; the relocated-row backfill
-  // (`materializeMutationPathColumn`) is what `event_blobs` rows still need.
+  // Derive `mutation_path` (the v73 promoted column) from `data` the SAME way
+  // the live hook does, so a seeded mutation row carries the column BEFORE the
+  // body is shed — the post-shed git-attribution scan reads the column, not the
+  // body. A no-file_path body folds to NULL here, matching the forward deriver.
   let mutationPath: string | null = null;
   try {
     const parsed = JSON.parse(data) as unknown;
@@ -430,20 +385,18 @@ const OID = "0123456789abcdef0123456789abcdef01234567";
 
 /**
  * Seed a corpus that exercises EVERY path the shed touches:
- *  - a DISCHARGED mutation (cold.ts, committed clean) whose blob is needed on
- *    re-fold (the Commit replays AFTER the GitSnapshot — see the reducer's
- *    "currently-discharged ⇒ safe to drop is FALSE" comment);
+ *  - a DISCHARGED mutation (cold.ts, committed clean) whose file_path is needed
+ *    on re-fold (the Commit replays AFTER the GitSnapshot — see the reducer's
+ *    "currently-discharged ⇒ safe to drop is FALSE" comment), now served by
+ *    `mutation_path` not the shed body;
  *  - an UNDISCHARGED mutation (live.ts, never committed) — stays live;
  *  - an Edit and a NotebookEdit (the other shed tools) so the file_path
  *    promotion covers all four;
- *  - a malformed mutation blob (json_valid=false → file_path null → skipped);
- *  - keep-set bodies that MUST survive: a PreToolUse:Agent bridge, a planctl
- *    Bash stdout envelope, a UserPromptSubmit, a Commit.
+ *  - a no-file_path mutation (mutation_path NULL → skipped);
+ *  - keep-set bodies that MUST survive inline: a PreToolUse:Agent bridge, a
+ *    planctl Bash stdout envelope, a UserPromptSubmit, a Commit.
  */
-let malformedMutationId = 0;
-
 function seedLiveShapedCorpus(): void {
-  malformedMutationId = 0;
   insertEvent({ hook_event: "SessionStart", session_id: SESS_A });
   insertEvent({ hook_event: "SessionStart", session_id: SESS_B });
 
@@ -497,21 +450,16 @@ function seedLiveShapedCorpus(): void {
     }),
   });
 
-  // A MALFORMED mutation blob — json_valid=false → file_path null → skipped by
-  // both the old json_extract path and the new column path (folds the same).
-  // The `idx_events_tool_attr` expression index runs `json_extract` at INSERT
-  // time for the four mutation tools and REJECTS malformed inline JSON, so a
-  // malformed mutation body can only EXIST in the relocated side table (whose
-  // `idx_event_blobs_tool_attr` is `CASE WHEN json_valid(...)`-guarded). We
-  // insert a valid placeholder here and corrupt the side-table bytes AFTER
-  // relocation (see `corruptMalformedMutationBlob`), reproducing the only shape
-  // a malformed mutation body takes in the live corpus.
-  malformedMutationId = insertEvent({
+  // A mutation body with NO file_path (MultiEdit) → mutation_path null → no
+  // attribution, on both the pre- and post-shed paths (folds the same). Its body
+  // is shed (NULLed) like every other shed-class row; with no file_path it never
+  // contributed an attribution, so the shed is lossless for it.
+  insertEvent({
     hook_event: "PostToolUse",
     tool_name: "MultiEdit",
     session_id: SESS_B,
     cwd: REPO,
-    data: JSON.stringify({ tool_input: { will_be: "corrupted" } }),
+    data: JSON.stringify({ tool_input: { no_file: "here" } }),
   });
 
   // A keep-set PreToolUse:Agent body (the subagent bridge reads it).
@@ -619,72 +567,30 @@ function snapshotProjections() {
   };
 }
 
-/** Relocate EVERY blob (margin 0) so the corpus is genuinely live-shaped. */
-function relocateEverything(): void {
-  const result = compactColdBlobs(db, {
-    recentRetentionMargin: 0,
-    batchSize: 100,
-    maxBatches: 50,
-  });
-  expect(result.relocated).toBeGreaterThan(0);
-  // Corrupt the malformed-mutation row's RELOCATED side-table bytes in place.
-  // The side-table index is `json_valid`-guarded so it tolerates malformed JSON
-  // (the inline index would have rejected it at INSERT). This reproduces the
-  // only shape a malformed mutation body can take in the live corpus.
-  if (malformedMutationId > 0) {
-    db.run("UPDATE event_blobs SET data = ? WHERE event_id = ?", [
-      "{ not json at all",
-      malformedMutationId,
-    ]);
-  }
-}
-
 /**
- * Materialize the `mutation_path` column's BACKFILL exactly as task .3 (paced
- * backfill) will: fill it from the inline body where present, then backfill the
- * relocated rows from the side-table body (json_valid-guarded).
- *
- * Task .2 already ships the additive ADD COLUMN at migrate() time, so the column
- * exists on every openDb DB — this helper ADDs it only on the off chance it's
- * absent (column-presence-guarded, so it's a no-op on a current-schema DB and
- * never throws "duplicate column"). What stays the harness's job is the BACKFILL
- * UPDATEs below — the differential predicate (OLD json_extract == column value).
- *
- * The value is `json_extract($.tool_input.file_path)` for the four mutation
- * tools — byte-identical to what the old git-attribution scan reads off the
- * blob. NULL for a malformed body (the guard) and for non-mutation rows.
+ * SHED the corpus into its post-v74 live shape: NULL every shed-class body in
+ * place (the four mutation tools), keeping the keep-set bodies inline. This is
+ * exactly what the v74 migration leaves behind — shed-class `events.data` NULL
+ * (its `tool_input.file_path` already promoted to `mutation_path` at seed time),
+ * keep-set `events.data` inline. There is NO `event_blobs` table post-shed, so
+ * the body simply goes away; the fold reads `mutation_path` for the file_path.
  */
-function materializeMutationPathColumn(): void {
-  const hasColumn = (
-    db.prepare("PRAGMA table_info(events)").all() as { name: string }[]
-  ).some((c) => c.name === "mutation_path");
-  if (!hasColumn) {
-    db.run("ALTER TABLE events ADD COLUMN mutation_path TEXT");
-  }
-  // Inline rows: extract from `events.data` (json_valid-guarded so a future
-  // inline-malformed row never throws the UPDATE).
+function shedCorpus(): void {
+  const before = (
+    db
+      .query(
+        `SELECT COUNT(*) AS n FROM events
+          WHERE hook_event = 'PostToolUse'
+            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+            AND data IS NOT NULL`,
+      )
+      .get() as { n: number }
+  ).n;
+  expect(before).toBeGreaterThan(0);
   db.run(
-    `UPDATE events
-        SET mutation_path = CASE WHEN json_valid(data)
-                                 THEN json_extract(data, '$.tool_input.file_path')
-                            END
+    `UPDATE events SET data = NULL
       WHERE hook_event = 'PostToolUse'
-        AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-        AND data IS NOT NULL`,
-  );
-  // Relocated rows (data IS NULL): backfill ONCE from the side-table body —
-  // the read task .3 does once, then the scan reads only the column forever.
-  db.run(
-    `UPDATE events
-        SET mutation_path = (
-            SELECT CASE WHEN json_valid(b.data)
-                        THEN json_extract(b.data, '$.tool_input.file_path')
-                   END
-              FROM event_blobs b WHERE b.event_id = events.id
-        )
-      WHERE hook_event = 'PostToolUse'
-        AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-        AND data IS NULL`,
+        AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')`,
   );
 }
 
@@ -703,100 +609,97 @@ function rewindAndWipeProjections(): void {
 // Layer 1 — aggregate counts over the live-shaped corpus
 // ---------------------------------------------------------------------------
 
-test("live-shaped corpus: every mutation blob is genuinely relocated (data IS NULL, value in event_blobs)", () => {
+test("shed-shaped corpus: every shed-class body is NULL, every keep-set body stays inline", () => {
   seedLiveShapedCorpus();
   drainAll();
-  relocateEverything();
+  shedCorpus();
 
-  // Every shed-class mutation row has its hot column NULLed and the bytes in
-  // the side table — this is the ARM B / COALESCE shape the shed removes. A
-  // synthetic all-inline fixture would NOT exercise it (the .1 risk note).
-  const relocatedMutations = (
-    db
-      .query(
-        `SELECT COUNT(*) AS n FROM events e
-            JOIN event_blobs b ON b.event_id = e.id
-          WHERE e.hook_event = 'PostToolUse'
-            AND e.tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-            AND e.data IS NULL`,
-      )
-      .get() as { n: number }
-  ).n;
+  // Every shed-class mutation row has its body NULLed — the post-shed shape.
   // cold.ts(Write) + edited.ts(Edit) + nb.ipynb(NotebookEdit) + live.ts(Write)
-  // + the malformed MultiEdit = 5 mutation rows, all relocated.
-  expect(relocatedMutations).toBe(5);
-
-  // The keep-set bodies are ALSO relocated (margin 0) — proving the fold still
-  // resolves them via COALESCE from the side table on re-fold.
-  const relocatedKeepBodies = (
+  // + the no-file_path MultiEdit = 5 mutation rows, all shed.
+  const shedMutations = (
     db
       .query(
-        `SELECT COUNT(*) AS n FROM events e
-            JOIN event_blobs b ON b.event_id = e.id
-          WHERE e.data IS NULL
-            AND e.hook_event IN ('UserPromptSubmit','PreToolUse','GitSnapshot','Commit')`,
+        `SELECT COUNT(*) AS n FROM events
+          WHERE hook_event = 'PostToolUse'
+            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+            AND data IS NULL`,
       )
       .get() as { n: number }
   ).n;
-  expect(relocatedKeepBodies).toBeGreaterThan(0);
+  expect(shedMutations).toBe(5);
+
+  // The keep-set bodies stay INLINE — the fold reads them from events.data on a
+  // from-scratch re-fold (no side table to resolve them from anymore).
+  const inlineKeepBodies = (
+    db
+      .query(
+        `SELECT COUNT(*) AS n FROM events
+          WHERE data IS NOT NULL
+            AND hook_event IN ('UserPromptSubmit','PreToolUse','GitSnapshot','Commit')`,
+      )
+      .get() as { n: number }
+  ).n;
+  expect(inlineKeepBodies).toBeGreaterThan(0);
+
+  // The four well-formed shed-class rows kept their promoted mutation_path even
+  // though the body is gone; the no-file_path MultiEdit has NULL mutation_path.
+  const mp = db
+    .query(
+      `SELECT mutation_path FROM events
+        WHERE hook_event = 'PostToolUse'
+          AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+        ORDER BY id`,
+    )
+    .all() as Array<{ mutation_path: string | null }>;
+  expect(mp.filter((r) => r.mutation_path !== null).length).toBe(4);
 });
 
 // ---------------------------------------------------------------------------
-// Layer 2 — per-event extraction audit (old path == new mutation_path column)
+// Layer 2 — per-event audit (mutation_path == file_path, with the body shed)
 // ---------------------------------------------------------------------------
 
-test("per-event extraction audit: old json_extract path == new mutation_path-column value for every mutation row", () => {
+test("per-event audit: mutation_path carries the file_path the git-attribution scan reads, body shed", () => {
   seedLiveShapedCorpus();
   drainAll();
-  relocateEverything();
+  shedCorpus();
 
-  // NEW PATH: materialize the future `mutation_path` column exactly as task .3
-  // will (backfill from the relocated side-table body, json_valid-guarded).
-  materializeMutationPathColumn();
-
-  // OLD PATH: the value the git-attribution scan extracts today — a
-  // `json_valid`-guarded json_extract over the COALESCEd (relocated) body,
-  // matching the real ARM B `CASE WHEN json_valid(b.data) THEN json_extract(...)`
-  // form (the guard is load-bearing: a bare json_extract THROWS on a malformed
-  // relocated blob). NEW PATH: the value the `mutation_path` column now carries.
-  // The audit asserts they are equal PER ROW — the JSON-path-mismatch guard
-  // that catches a divergence before any full re-fold.
+  // POST-SHED: the body is NULL for every shed-class row; the file_path the
+  // git-attribution scan reads now lives ONLY in `mutation_path`. The audit
+  // proves the column carries exactly what the forward deriver
+  // (`extractMutationPath`) produces from the original body — the value the scan
+  // SEEKs — for every mutation row, with the body genuinely gone.
   const rows = db
     .query(
-      `SELECT e.id AS id, e.tool_name AS tool_name,
-              CASE WHEN json_valid(COALESCE(e.data, b.data))
-                   THEN json_extract(COALESCE(e.data, b.data), '$.tool_input.file_path')
-              END AS old_path,
-              e.mutation_path AS new_column
-         FROM events e
-         LEFT JOIN event_blobs b ON b.event_id = e.id
-        WHERE e.hook_event = 'PostToolUse'
-          AND e.tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-        ORDER BY e.id ASC`,
+      `SELECT id, tool_name, data, mutation_path
+         FROM events
+        WHERE hook_event = 'PostToolUse'
+          AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+        ORDER BY id ASC`,
     )
     .all() as Array<{
     id: number;
     tool_name: string;
-    old_path: string | null;
-    new_column: string | null;
+    data: string | null;
+    mutation_path: string | null;
   }>;
 
   expect(rows.length).toBe(5);
   for (const r of rows) {
-    // The promoted column carries byte-identically what json_extract reads.
-    expect(r.new_column).toBe(r.old_path);
+    // The body is genuinely shed — there is nothing left to read but the column.
+    expect(r.data).toBeNull();
   }
 
-  // The malformed MultiEdit row extracts to null on BOTH paths — folds the
-  // same (no attribution), proving a malformed body is shed-safe.
-  const malformed = rows.find((r) => r.old_path === null);
-  expect(malformed).not.toBeUndefined();
-  expect(malformed?.tool_name).toBe("MultiEdit");
+  // The no-file_path MultiEdit row has a NULL mutation_path — no attribution,
+  // shed-safe (it never contributed one).
+  const noFile = rows.find((r) => r.mutation_path === null);
+  expect(noFile).not.toBeUndefined();
+  expect(noFile?.tool_name).toBe("MultiEdit");
 
-  // The four well-formed mutation rows resolve their absolute file_path.
+  // The four well-formed mutation rows carry their absolute file_path.
   const resolved = rows
-    .filter((r) => r.old_path !== null)
-    .map((r) => r.old_path)
+    .filter((r) => r.mutation_path !== null)
+    .map((r) => r.mutation_path)
     .sort();
   expect(resolved).toEqual([
     `${REPO}/cold.ts`,
@@ -929,24 +832,26 @@ test("legacy charter: a malformed GitSnapshot / Commit body folds safe (cursor a
 // Layer 4 — the full DIFFERENTIAL RE-FOLD (old path vs new mutation_path column)
 // ---------------------------------------------------------------------------
 
-test("differential re-fold: byte-identical projections, OLD json_extract path == NEW mutation_path-column path, over a live-shaped corpus", () => {
+test("differential re-fold: two from-scratch re-folds over a SHED corpus are byte-identical; attributions reproduced from mutation_path", () => {
   seedLiveShapedCorpus();
   drainAll();
-  relocateEverything();
+  shedCorpus();
 
-  // BASELINE = the OLD path: fold via the real two-arm git-attribution scan
-  // (ARM A inline json_extract + ARM B relocated event_blobs json_extract).
-  // This is the production fold today over the relocated corpus.
+  // BASELINE: a from-scratch re-fold over the SHED corpus (shed-class bodies
+  // NULL, mutation_path set; keep-set bodies inline). This is the production
+  // fold post-v74 — the git-attribution scan SEEKs `mutation_path`, the
+  // keep-set arms read inline `events.data`, nothing touches a side table.
   rewindAndWipeProjections();
   drainAll();
-  const oldPath = snapshotProjections();
+  const shed1 = snapshotProjections();
 
-  // Sanity: cold.ts discharged (last_commit_at set), live.ts still live. The
-  // attribution row's `file_path` is the GitSnapshot's REPO-RELATIVE path
-  // (`cold.ts`), not the mutation event's absolute `tool_input.file_path` — the
-  // attribution scan matches on the absolute candidate but keys the row on the
-  // git-relative dirty-file path.
-  const attribs = oldPath.file_attributions as Array<Record<string, unknown>>;
+  // Sanity: cold.ts discharged (last_commit_at set), live.ts still live — the
+  // discharged-mutation case the shed must preserve. On re-fold the Commit
+  // replays AFTER the GitSnapshot and the scan needs cold.ts's file_path; it now
+  // comes from `mutation_path` (the body is shed). The attribution row keys on
+  // the GitSnapshot's REPO-RELATIVE path (`cold.ts`), not the absolute
+  // `tool_input.file_path` the scan matched on.
+  const attribs = shed1.file_attributions as Array<Record<string, unknown>>;
   const cold = attribs.find(
     (a) => a.file_path === "cold.ts" && a.session_id === SESS_A,
   );
@@ -957,58 +862,29 @@ test("differential re-fold: byte-identical projections, OLD json_extract path ==
   expect(live).not.toBeUndefined();
   expect(cold?.last_commit_at).not.toBeNull();
   expect(live?.last_commit_at).toBeNull();
-  // All four dirty files (cold/edited/nb/live) got tool-sourced attributions —
-  // proving ARM B served every relocated mutation blob over the live-shaped
-  // corpus (the malformed MultiEdit row has no file_path → no attribution).
+  // All four dirty files got tool-sourced attributions — proving the
+  // `mutation_path` column served every shed mutation's file_path over the shed
+  // corpus (the no-file_path MultiEdit row has NULL mutation_path → no attribution).
   const toolFiles = attribs
     .filter((a) => a.source === "tool")
     .map((a) => a.file_path)
     .sort();
   expect(toolFiles).toEqual(["cold.ts", "edited.ts", "live.ts", "nb.ipynb"]);
 
-  // NEW path: materialize the future `mutation_path` column and drive the
-  // attribution match off the COLUMN instead of the blob. We simulate the .2/.3
-  // end-state: every mutation row carries `mutation_path`, and a COALESCE-FREE
-  // single-arm scan (no event_blobs touch) reproduces the SAME attributions.
-  // Because re-fold is a pure function of the event log + the values the scan
-  // reads, equal inputs (mutation_path == json_extract(file_path)) MUST yield
-  // byte-identical projections.
-  materializeMutationPathColumn();
-
-  // Assert the column now carries the file_path for the four well-formed rows
-  // and NULL for the malformed one (the new path's input to the scan).
-  const colVals = db
-    .query(
-      `SELECT mutation_path FROM events
-        WHERE hook_event = 'PostToolUse'
-          AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-        ORDER BY id`,
-    )
-    .all() as Array<{ mutation_path: string | null }>;
-  const nonNull = colVals.filter((v) => v.mutation_path !== null).length;
-  expect(nonNull).toBe(4);
-
-  // Re-fold AGAIN, this time deriving the tool-attribution match from the
-  // `mutation_path` column (COALESCE-free, no event_blobs read). We reproduce
-  // the post-shed attribution set by computing it from the column and asserting
-  // it equals the old-path attribution set EXACTLY. (The reducer's own scan is
-  // swapped to the column in task .3; here we prove the column carries enough.)
+  // RE-FOLD DETERMINISM (the sacred invariant): a SECOND from-scratch re-fold
+  // over the identical shed corpus reproduces byte-identical projection rows.
   rewindAndWipeProjections();
   drainAll();
-  const reFoldAgain = snapshotProjections();
+  const shed2 = snapshotProjections();
+  expect(shed2).toEqual(shed1);
 
-  // The fold itself is unchanged in .1, so re-fold-2 must equal re-fold-1 (pure
-  // re-fold determinism — the sacred invariant) regardless of the new column.
-  expect(reFoldAgain).toEqual(oldPath);
-
-  // NEW-PATH ATTRIBUTION EQUIVALENCE: the (session_id, ABSOLUTE-path) pairs the
-  // git-attribution scan would produce reading `mutation_path` must COVER every
-  // tool-sourced attribution the old json_extract path produced. The column
-  // carries the mutation's ABSOLUTE `tool_input.file_path`; the attribution row
-  // keys on the git-RELATIVE path, so we reconstruct the absolute candidate the
-  // scan matched on as `project_dir + '/' + file_path` (the exact lexical join
+  // ATTRIBUTION SOURCE: every tool-sourced attribution is reproducible from the
+  // `mutation_path` column alone (no body read). The column carries the
+  // mutation's ABSOLUTE `tool_input.file_path`; the attribution row keys on the
+  // git-RELATIVE path, so reconstruct the absolute candidate the scan matched on
+  // as `project_dir + '/' + file_path` (the exact lexical join
   // `findExplicitAttributions` does) and compare in the same key space.
-  const newPathToolCandidates = new Set(
+  const columnCandidates = new Set(
     (
       db
         .query(
@@ -1021,30 +897,29 @@ test("differential re-fold: byte-identical projections, OLD json_extract path ==
         .all() as Array<{ session_id: string; abs_path: string }>
     ).map((r) => `${r.session_id}::${r.abs_path}`),
   );
-  const oldPathToolAttributions = new Set(
-    (oldPath.file_attributions as Array<Record<string, unknown>>)
+  const toolAttributions = new Set(
+    (shed1.file_attributions as Array<Record<string, unknown>>)
       .filter((a) => a.source === "tool")
       .map((a) => `${a.session_id}::${a.project_dir}/${a.file_path}`),
   );
-  // Every tool-sourced attribution in the old-path projection is reproducible
-  // from the new mutation_path column — the old-path attributions are a SUBSET
-  // of the new-path candidates (the column reproduces every value the blob scan
-  // read). A non-empty set proves we actually exercised the path.
-  expect(oldPathToolAttributions.size).toBeGreaterThan(0);
-  for (const key of oldPathToolAttributions) {
-    expect(newPathToolCandidates.has(key)).toBe(true);
+  expect(toolAttributions.size).toBeGreaterThan(0);
+  for (const key of toolAttributions) {
+    expect(columnCandidates.has(key)).toBe(true);
   }
 });
 
 // ---------------------------------------------------------------------------
-// 0 → head from-scratch migrate (the event_blobs ladder stays intact)
+// 0 → head from-scratch migrate (event_blobs created at v57, read at v67,
+// DROPPED at the v74 tail — gone at head)
 // ---------------------------------------------------------------------------
 
-test("0 → head from-scratch migrate succeeds and the event_blobs ladder is intact (created v57, read v67, present at head)", () => {
-  // openDb(":memory:") runs the FULL migration ladder from v0. The shed's DROP
-  // lands only at the future destructive task's version tail; until then
-  // event_blobs must be created (v57) and remain present at head, and the v67
-  // Commit-trailer backfill (which reads event_blobs) must run cleanly.
+test("0 → head from-scratch migrate succeeds; event_blobs is gone at head (created v57, read v67, dropped at v74 tail)", () => {
+  // openDb(":memory:") runs the FULL migration ladder from v0. The v57 ladder
+  // step CREATEs event_blobs and the v67 Commit-trailer backfill READs it — both
+  // run against the transiently-present table during the walk — and the v74 tail
+  // DROPs it. So a successful migrate to head with event_blobs ABSENT proves the
+  // whole ladder ran (a missing v57 create or a broken v67 read would throw
+  // before the tail) AND that the shed converged.
   const fresh = openDb(":memory:");
   try {
     const stored = (
@@ -1054,26 +929,25 @@ test("0 → head from-scratch migrate succeeds and the event_blobs ladder is int
     )?.value;
     expect(Number(stored)).toBe(SCHEMA_VERSION);
 
-    // event_blobs exists at head (it is dropped only at the shed's v-tail).
+    // event_blobs is GONE at head — dropped at the v74 tail, never resurrected.
     const hasBlobs = fresh.db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'event_blobs'",
       )
       .get();
-    expect(hasBlobs).not.toBeNull();
-
-    // The v57 CREATE shape: (event_id, data) with the FK to events.
-    const cols = (
-      fresh.db.prepare("PRAGMA table_info('event_blobs')").all() as Array<{
-        name: string;
-      }>
-    ).map((c) => c.name);
-    expect(cols).toContain("event_id");
-    expect(cols).toContain("data");
+    expect(hasBlobs ?? null).toBeNull();
+    // Its expression index is gone too.
+    const hasIdx = fresh.db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type = 'index' AND name = 'idx_event_blobs_tool_attr'",
+      )
+      .get();
+    expect(hasIdx ?? null).toBeNull();
 
     // The fresh ladder ran the v67 backfill path (commit_trailer_facts exists
-    // and is empty on a zero-event DB — proving the backfill SELECT over
-    // COALESCE(events.data, event_blobs.data) executed without error).
+    // and is empty on a zero-event DB — proving the backfill SELECT over the
+    // transiently-present event_blobs executed without error before the tail
+    // DROP).
     const facts = fresh.db
       .prepare("SELECT COUNT(*) AS n FROM commit_trailer_facts")
       .get() as { n: number };

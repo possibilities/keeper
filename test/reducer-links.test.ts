@@ -1634,20 +1634,6 @@ test("fn-695: from-scratch re-fold is byte-identical over a log with commit-trai
 const TEST_UUID_3 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
 const TEST_OID_3 = "abcdef0123456789abcdef0123456789abcdef01";
 
-/**
- * Relocate a `Commit` event's `data` blob into the `event_blobs` side table
- * and NULL the hot column — mirroring the compaction relocator. The
- * loadAllCommitTrailerFacts COALESCE(events.data, event_blobs.data) must
- * resolve the trailer facts from the side table identically.
- */
-function relocateBlob(eventId: number): void {
-  db.run(
-    "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
-    [eventId],
-  );
-  db.run("UPDATE events SET data = NULL WHERE id = ?", [eventId]);
-}
-
 test("fn-807.1: a malformed Commit data blob folds to no trailer facts without throwing", () => {
   // The never-throw-inside-a-fold invariant for the commit-trailer channel.
   // The old json_extract in the WHERE could throw on malformed JSON BEFORE
@@ -1679,12 +1665,12 @@ test("fn-807.1: a malformed Commit data blob folds to no trailer facts without t
   ]);
 });
 
-test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (scrape + inline + relocated blob + commit-only session + malformed)", () => {
+test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (scrape + inline + commit-only session + malformed)", () => {
   // The whole-task equivalence proof. Seed the full mix the single-scan loader
   // must reproduce: a scrape-side planctl creator, a commit dedup of that same
-  // op, a relocated-to-event_blobs trailer Commit, a commit-only session whose
-  // scrape NULLed out, and one malformed Commit blob (a no-fact no-throw). The
-  // re-fold from cursor=0 must reproduce byte-identical jobs / epics.
+  // op, an inline trailer Commit (Commit is keep-set post-shed), a commit-only
+  // session whose scrape NULLed out, and one malformed Commit blob (a no-fact
+  // no-throw). The re-fold from cursor=0 must reproduce byte-identical jobs / epics.
 
   // Session 1: scrape-side creator for fn-1-mix, plus a commit trailer for the
   // SAME op — the channels dedup to one creator edge.
@@ -1707,12 +1693,13 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
     committedAtMs: 5_000_000,
   });
 
-  // Session 2: refines fn-1-mix via a RELOCATED commit-trailer blob ONLY (its
-  // scrape NULLed out). The blob lives in event_blobs; the loader's COALESCE
-  // must still resolve it so the commit-only refiner surfaces.
+  // Session 2: refines fn-1-mix via a commit-trailer blob ONLY (its scrape
+  // NULLed out). Commit is keep-set so its body stays inline post-shed; the
+  // single-scan loader reads commit_trailer_facts (populated at fold time from
+  // events.data) so the commit-only refiner surfaces.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
   planPlanOpener(TEST_UUID_2, 3_000);
-  const relocatedId = commitTrailerEvent({
+  commitTrailerEvent({
     projectDir: "/repo",
     commitOid: TEST_OID_2,
     committerSessionId: TEST_UUID_2,
@@ -1720,7 +1707,6 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
     planctlTarget: "fn-1-mix",
     committedAtMs: 6_000_000,
   });
-  relocateBlob(relocatedId);
 
   // Session 3: a commit-only creator for a DIFFERENT epic (no scrape rows at
   // all) — proves a commit-only session still mints its own creator edge.
@@ -1759,8 +1745,8 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
   const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
   const epics1 = db.query("SELECT * FROM epics ORDER BY epic_id").all();
 
-  // Re-fold from cursor=0 — the COALESCE-resolved relocated blob and the
-  // grouped single-scan facts must reproduce the projections byte-for-byte.
+  // Re-fold from cursor=0 — the grouped single-scan facts must reproduce the
+  // projections byte-for-byte.
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
   db.run("DELETE FROM file_attributions");
@@ -1852,7 +1838,7 @@ test("fn-807.2: a non-planctl / pre-feature Commit writes no fact row", () => {
   expect(getCommitTrailerFacts()).toEqual([]);
 });
 
-test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identically (inline + relocated + malformed + non-planctl in the log)", () => {
+test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identically (inline + malformed + non-planctl in the log)", () => {
   // Session 1: an inline planctl-trailer scaffold → one fact row + creator edge.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
@@ -1864,12 +1850,12 @@ test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identi
     planctlTarget: "fn-1-ctf",
     committedAtMs: 5_000_000,
   });
-  // Session 2: a RELOCATED planctl trailer (data in event_blobs) → fact via
-  // the loader's COALESCE; foldCommit reads the inline data at fold time, the
-  // re-fold reads the relocated blob — both must land the same fact row.
+  // Session 2: a second planctl trailer (Commit is keep-set post-shed, body
+  // inline) → fact row via the loader. foldCommit writes the fact from
+  // events.data at fold time; the re-fold reproduces it from the same inline body.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
   planPlanOpener(TEST_UUID_2, 3_000);
-  const relocId = commitTrailerEvent({
+  commitTrailerEvent({
     projectDir: "/repo",
     commitOid: TEST_OID_2,
     committerSessionId: TEST_UUID_2,
@@ -1877,7 +1863,6 @@ test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identi
     planctlTarget: "fn-1-ctf",
     committedAtMs: 6_000_000,
   });
-  relocateBlob(relocId);
   // A malformed Commit blob → no fact, no throw.
   insertEvent({
     hook_event: "Commit",

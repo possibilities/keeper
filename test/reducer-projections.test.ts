@@ -4220,7 +4220,8 @@ test("v59 monitor fact: refreshes the embedded element EVEN when the sub-agent g
 });
 
 // ---------------------------------------------------------------------------
-// fn-717.1 — cold-blob relocation (event_blobs) read plumbing
+// Blob-driven re-fold determinism (post-shed: every body inline in events.data;
+// fn-836.4 dropped the event_blobs side table + its COALESCE read plumbing)
 // ---------------------------------------------------------------------------
 
 // Snapshot the three projections a `data`-blob read feeds: file_attributions
@@ -4244,12 +4245,12 @@ function snapshotBlobDrivenProjections() {
   };
 }
 
-// Seed one mixed stream exercising EVERY rewritten `data`-blob read site:
-// PostToolUse mutations (drain SELECT + file-attribution scan), a GitSnapshot
-// + Commit pair that discharges the attribution (drain SELECT), and a
-// `chore(planctl)` Commit carrying planctl trailers (loadCommitTrailer{
-// Invocations,SessionsForEpics}). Returns the discharged PostToolUse event id
-// so a test can relocate its now-cold blob.
+// Seed one mixed stream exercising EVERY `data`-driven read site: PostToolUse
+// mutations (drain SELECT + the `mutation_path` file-attribution scan), a
+// GitSnapshot + Commit pair that discharges the attribution (drain SELECT), and
+// a `chore(planctl)` Commit carrying planctl trailers (loadCommitTrailer{
+// Invocations,SessionsForEpics}). Returns the discharged PostToolUse event id so
+// a test can NULL its now-cold body in place (post-shed retention).
 function seedBlobReadStream(): { dischargedPostToolUseId: number } {
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   const dischargedPostToolUseId = insertEvent({
@@ -4321,20 +4322,15 @@ function seedBlobReadStream(): { dischargedPostToolUseId: number } {
   return { dischargedPostToolUseId };
 }
 
-test("fn-717.1 empty event_blobs: cursor=0 re-fold is byte-identical (lossless foundation)", () => {
-  // The provably-lossless foundation: with event_blobs EMPTY, every
-  // COALESCE(events.data, event_blobs.data) returns the inline value
-  // (COALESCE(data, NULL) = data), so a from-scratch re-fold reproduces
-  // byte-identical projections — behavior is unchanged from pre-v57.
+test("blob-driven projections: cursor=0 re-fold is byte-identical (post-shed, bodies inline)", () => {
+  // Post-shed every keep-set body is inline in `events.data` and every
+  // shed-class mutation's file_path is in `mutation_path`, so a from-scratch
+  // re-fold reproduces byte-identical projections (the sacred invariant). The
+  // discharged PostToolUse:Write attribution is driven by the `mutation_path`
+  // column (auto-derived by `insertEvent`), not the JSON body.
   seedBlobReadStream();
   drainAll();
   const live = snapshotBlobDrivenProjections();
-
-  // event_blobs must be empty in task .1 (no compaction yet).
-  const blobCount = db.query("SELECT COUNT(*) AS n FROM event_blobs").get() as {
-    n: number;
-  };
-  expect(blobCount.n).toBe(0);
 
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM git_status");
@@ -4346,78 +4342,28 @@ test("fn-717.1 empty event_blobs: cursor=0 re-fold is byte-identical (lossless f
   expect(snapshotBlobDrivenProjections()).toEqual(live);
 });
 
-test("fn-717.2 events.data is now nullable — the compaction relocator can NULL the hot column", () => {
-  // Task .1 PINNED `events.data NOT NULL`; task .2 RELAXES it (the v57→v58
-  // stop-the-world rebuild in `migrate()`) so the compaction relocator can
-  // `UPDATE events SET data = NULL` after copying the cold blob into
-  // `event_blobs`. This test flips the .1 pin: the relocation's two steps —
-  // copy into the side table, then NULL the hot column — both succeed now.
+test("events.data is nullable — retention can NULL a cold non-keep payload in place", () => {
+  // The v57→v58 rebuild relaxed `events.data` from NOT NULL → nullable; post-shed
+  // (fn-836.4) that relax stands so the steady-state retention pass (fn-836.5)
+  // can `UPDATE events SET data = NULL` on a cold non-keep payload IN PLACE (no
+  // side table). A shed-class mutation row keeps its `mutation_path` after the
+  // body is NULLed — the attribution scan reads the column, not the body.
   const { dischargedPostToolUseId } = seedBlobReadStream();
   drainAll();
-  // Step 1: copy the cold blob into event_blobs (the side-table NOT NULL is
-  // satisfied by the real bytes).
-  db.run(
-    "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
-    [dischargedPostToolUseId],
-  );
-  // Step 2: NULL the hot column — REJECTED in .1, now ACCEPTED under the
-  // relaxed v58 schema.
   expect(() =>
     db.run("UPDATE events SET data = NULL WHERE id = ?", [
       dischargedPostToolUseId,
     ]),
   ).not.toThrow();
   const row = db
-    .query("SELECT data FROM events WHERE id = ?")
-    .get(dischargedPostToolUseId) as { data: string | null };
+    .query("SELECT data, mutation_path FROM events WHERE id = ?")
+    .get(dischargedPostToolUseId) as {
+    data: string | null;
+    mutation_path: string | null;
+  };
   expect(row.data).toBeNull();
-});
-
-test("fn-717.1 relocated blob (event_blobs): COALESCE drain read resolves the side-table value losslessly", () => {
-  // Prove the rewritten read plumbing is lossless ACROSS relocation — the
-  // property task .2's compaction relies on — WITHOUT depending on a NULLable
-  // `events.data` (still NOT NULL in .1). Fold the stream inline, snapshot,
-  // then build the post-relocation read shape on a scratch table whose
-  // `data` IS nullable (the .2 schema shape) and assert the EXACT drain
-  // COALESCE expression resolves the blob from `event_blobs` when the hot
-  // column is NULL, byte-for-byte equal to the inline value.
-  const { dischargedPostToolUseId } = seedBlobReadStream();
-  drainAll();
-  const inlineValue = db
-    .query("SELECT data FROM events WHERE id = ?")
-    .get(dischargedPostToolUseId) as { data: string };
-
-  // Relocate the cold blob into the side table (the .2 INSERT step, which IS
-  // allowed in .1 — only the subsequent hot-column NULL is gated).
-  db.run(
-    "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE id = ?",
-    [dischargedPostToolUseId],
-  );
-
-  // .2 schema preview: a nullable-`data` events shape so we can NULL the hot
-  // column and observe the COALESCE fall through to event_blobs. Mirrors the
-  // exact LEFT JOIN + COALESCE the drain SELECT uses.
-  db.run(
-    "CREATE TABLE events_nullable (id INTEGER PRIMARY KEY, data TEXT, hook_event TEXT)",
-  );
-  db.run(
-    "INSERT INTO events_nullable (id, data, hook_event) SELECT id, NULL, hook_event FROM events WHERE id = ?",
-    [dischargedPostToolUseId],
-  );
-  const resolved = db
-    .query(
-      `SELECT COALESCE(events_nullable.data, event_blobs.data) AS data
-         FROM events_nullable
-         LEFT JOIN event_blobs ON event_blobs.event_id = events_nullable.id
-        WHERE events_nullable.id = ?`,
-    )
-    .get(dischargedPostToolUseId) as { data: string };
-
-  // The relocated value is recovered byte-for-byte from the side table.
-  expect(resolved.data).toBe(inlineValue.data);
-  expect(resolved.data).toBe(
-    JSON.stringify({ tool_input: { file_path: "/repo/cold.ts" } }),
-  );
+  // The promoted column survives the body NULL — the file_path is preserved.
+  expect(row.mutation_path).toBe("/repo/cold.ts");
 });
 
 test("fn-836.3 idx_events_mutation_path serves the flipped file-attribution scan (EXPLAIN-verified)", () => {

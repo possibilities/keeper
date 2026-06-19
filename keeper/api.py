@@ -299,6 +299,12 @@ from pathlib import Path
 # index + COALESCE dual-read stay until the .3 attribution flip). keeper-py reads no
 # ``mutation_path`` column (attribution computes its own dirty set), so no reader
 # logic changes — only the version whitelist gains 73.
+#
+# v74 (fn-836 task .4) is the DESTRUCTIVE shed: the migration restores every
+# keep-set body back inline and DROPs the ``event_blobs`` side table at its tail
+# (shed-class PostToolUse mutation bodies stay NULL — their file_path lives in
+# ``mutation_path`` now). keeper-py never read ``event_blobs`` (it computes its own
+# dirty set), so no reader logic changes — only the version whitelist gains 74.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -344,6 +350,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         71,
         72,
         73,
+        74,
     }
 )
 

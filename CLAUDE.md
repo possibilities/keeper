@@ -36,9 +36,16 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   writes the projection AND bumps `reducer_state.last_event_id` together. Splitting
   them breaks the exactly-once-per-event guarantee.
 - **Re-fold determinism is sacred.** A from-scratch re-fold must reproduce
-  byte-identical rows. Inside a fold: build derived arrays from stable total-order
-  sorts (never append), and NEVER read wall-clock (`Date.now()`), env vars, the
-  filesystem, or process liveness — use the event's `ts`. Only producers probe it.
+  byte-identical PROJECTION rows. Inside a fold: build derived arrays from stable
+  total-order sorts (never append), and NEVER read wall-clock (`Date.now()`), env
+  vars, the filesystem, or process liveness — use the event's `ts`. Only producers
+  probe it. The guarantee scopes to the projection columns: as of v74 (fn-836) the
+  shed NULLs the redundant transcript bodies of PostToolUse mutation events
+  (`tool_input.file_path` is promoted to `events.mutation_path`; the fold reads the
+  column, never the shed body), so those payload bodies are intentionally
+  non-reconstructable — forensic transcript depth defers to Claude Code's own
+  `transcript_path` `.jsonl`. Every KEEP-SET body a fold actually reads stays inline
+  in `events.data` forever, so the projection re-fold stays byte-identical.
 - **Never throw inside a fold.** Malformed `data` folds to a safe value and the
   cursor still advances; a throw rolls back the cursor and wedges the reducer. Schema
   defaults match the zero-event projection, so an empty re-fold reproduces the rows.
