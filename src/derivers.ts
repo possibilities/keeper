@@ -155,6 +155,44 @@ export function extractBackgroundTaskId(
 }
 
 /**
+ * The single cross-event fold field the git-attribution scan reads off a
+ * file-mutating tool event — `data.tool_input.file_path` — promoted to the
+ * `events.mutation_path` column so the fold no longer parses the JSON body.
+ * Gated EXACTLY on `(PostToolUse, toolName in {Write, Edit, MultiEdit,
+ * NotebookEdit})`, mirroring the ARM-B scan's `tool_name IN (...)` predicate.
+ *
+ * Same null-on-malformed contract as ARM B's `CASE WHEN json_valid` guard: a
+ * missing / non-string / empty `file_path`, or a non-object `tool_input`,
+ * returns `null` so the column stays NULL and the partial index stays
+ * selective. NEVER throws — purity is the re-fold-determinism contract (a
+ * future bugfix here needs a schema-bump-with-rewind to re-backfill stored
+ * rows). Hook-safe: pure, no I/O, no `bun:sqlite`/`src/db.ts` import.
+ */
+export function extractMutationPath(
+  hookEvent: string,
+  toolName: string | null,
+  data: Record<string, unknown>,
+): string | null {
+  if (hookEvent !== "PostToolUse") {
+    return null;
+  }
+  if (
+    toolName !== "Write" &&
+    toolName !== "Edit" &&
+    toolName !== "MultiEdit" &&
+    toolName !== "NotebookEdit"
+  ) {
+    return null;
+  }
+  const toolInput = data.tool_input;
+  if (typeof toolInput !== "object" || toolInput === null) {
+    return null;
+  }
+  const filePath = (toolInput as Record<string, unknown>).file_path;
+  return typeof filePath === "string" && filePath.length > 0 ? filePath : null;
+}
+
+/**
  * One entry in the reducer-projected `jobs.monitors` JSON array. Three-way
  * provenance — `monitor` / `bash-bg` / `ambient` (the last is harness-armed,
  * no launch event in this session's stream). Each Stop's `background_tasks`

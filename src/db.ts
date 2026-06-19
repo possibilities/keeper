@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 72;
+export const SCHEMA_VERSION = 73;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -405,7 +405,14 @@ CREATE TABLE IF NOT EXISTS events (
     backend_exec_type TEXT,
     backend_exec_session_id TEXT,
     backend_exec_pane_id TEXT,
-    background_task_id TEXT
+    background_task_id TEXT,
+    -- v72->v73 (fn-836.2): the lone cross-event fold field of the git-attribution
+    -- scan (data.tool_input.file_path) promoted to a column so the fold reads the
+    -- column instead of parsing the JSON body. Hook-derived forward + ingester-
+    -- recomputed for pre-deriver lines; NULL on every non-(PostToolUse, Write/Edit/
+    -- MultiEdit/NotebookEdit) row. The expression index + COALESCE dual-read stay
+    -- until .3 flips attribution onto this column.
+    mutation_path TEXT
 )
 `;
 
@@ -483,6 +490,21 @@ const CREATE_V51_INDEXES = [
  */
 const CREATE_V66_INDEXES = [
   "CREATE INDEX IF NOT EXISTS idx_events_pretooluse_agent_session ON events(session_id, id, tool_use_id) WHERE hook_event = 'PreToolUse' AND tool_name = 'Agent'",
+];
+
+/**
+ * Partial index on the v72→v73 `events.mutation_path` column (KEPT OUT of the
+ * unconditional CREATE block; see {@link CREATE_V10_INDEXES} — the column
+ * doesn't exist yet on a migrating DB until the matching ADD COLUMN runs). The
+ * leading-column layout mirrors `idx_events_tool_attr` (the existing expression
+ * index): `(mutation_path, ts, session_id, tool_name, hook_event)` covers the
+ * git-attribution exact-match SEEK that `.3` will flip onto the column. The
+ * `WHERE mutation_path IS NOT NULL` partial predicate keeps it small (only the
+ * file-mutating tool slice). Built alongside the expression index — both stay
+ * + dual-read until `.3` flips the fold off the blob.
+ */
+const CREATE_V73_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_events_mutation_path ON events(mutation_path, ts, session_id, tool_name, hook_event) WHERE mutation_path IS NOT NULL",
 ];
 
 /**
@@ -3570,6 +3592,25 @@ function migrate(db: Database): void {
         }
       }
 
+      // v72→v73 (fn-836.2): add the `events.mutation_path` TEXT column — the
+      // lone cross-event fold field of the git-attribution scan
+      // (`data.tool_input.file_path`) promoted to a column. The ADD COLUMN is
+      // instant (no rebuild); the partial index is KEPT OUT of the unconditional
+      // CREATE block and run HERE, after the ALTER, so a migrating DB never
+      // references a column that doesn't exist yet. PURELY ADDITIVE + ONLINE: the
+      // hook derives it forward and the ingester recomputes it for pre-deriver
+      // lines, but the fold's COALESCE dual-read on the blob is UNCHANGED this
+      // task (the .3 flip lands later), so there is NO cursor rewind — a
+      // from-scratch re-fold reproduces byte-identical projection rows.
+      // Whitelist-only Python read (this bump MUST add 73 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
+      // every keeper-py read fails host-wide; test/schema-version.test.ts
+      // enforces this).
+      addColumnIfMissing(db, "events", "mutation_path", "TEXT");
+      for (const sql of CREATE_V73_INDEXES) {
+        db.run(sql);
+      }
+
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       ).run(String(SCHEMA_VERSION));
@@ -3610,7 +3651,7 @@ export function prepareStmts(db: Database): Stmts {
         planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
         bash_mutation_kind, bash_mutation_targets, planctl_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-        background_task_id
+        background_task_id, mutation_path
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
@@ -3619,7 +3660,7 @@ export function prepareStmts(db: Database): Stmts {
         $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump,
         $bash_mutation_kind, $bash_mutation_targets, $planctl_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
-        $background_task_id
+        $background_task_id, $mutation_path
       )
     `),
     selectWorldRev: db.prepare(
@@ -3710,10 +3751,17 @@ function openDbSpan(
       migrate(db);
     }
 
-    // Hook carve-out: `prepareStmts: false` returns a throwing stub because the
-    // static `insertEvent` would throw "no such column" on a schema-skewed live
-    // DB before `openDb` returns. The hook builds a column-adaptive INSERT.
-    const stmts = (options.prepareStmts ?? true) ? prepareStmts(db) : noStmts();
+    // A READONLY connection never INSERTs, so it has no business preparing the
+    // static write-statement bundle — and MUST NOT, because the static
+    // `insertEvent` names every events column and would throw "no such column"
+    // when a reader opens a live DB the sole-migrator daemon hasn't yet bumped
+    // (the schema-bump-deploy-skew window: a new `keeper` binary's reader path
+    // runs against the old on-disk schema until keeperd restarts). Readers
+    // destructure `{ db }` only — none touch `stmts` — so the throwing stub is
+    // safe. The hook's explicit `prepareStmts: false` rides the same stub for
+    // the same reason (it builds a column-adaptive INSERT instead).
+    const wantStmts = (options.prepareStmts ?? true) && !readonly;
+    const stmts = wantStmts ? prepareStmts(db) : noStmts();
     return { db, stmts };
   } catch (err) {
     // Close the partially-constructed handle best-effort before re-throwing: a

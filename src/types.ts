@@ -238,6 +238,16 @@ export interface Event {
    * `jobs.backend_exec_pane_id` latest-non-NULL-wins via COALESCE.
    */
   backend_exec_pane_id: string | null;
+  /**
+   * The git-attribution fold's lone cross-event field —
+   * `data.tool_input.file_path` — promoted to a column by
+   * {@link import("./derivers").extractMutationPath}. Gated on
+   * `(PostToolUse, tool_name in Write/Edit/MultiEdit/NotebookEdit)`; NULL on
+   * every other row. Hook-derived forward + ingester-recomputed for pre-deriver
+   * lines. Backed by a partial index `WHERE mutation_path IS NOT NULL`. The
+   * expression index + COALESCE dual-read stay until the `.3` attribution flip.
+   */
+  mutation_path: string | null;
 }
 
 /**

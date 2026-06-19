@@ -37,6 +37,7 @@ import {
 import {
   extractBackgroundTaskId,
   extractBashMutation,
+  extractMutationPath,
   extractPlanctlInvocation,
   extractSkillName,
   extractToolUseId,
@@ -566,6 +567,7 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "backend_exec_session_id",
   "backend_exec_pane_id",
   "background_task_id",
+  "mutation_path",
 ]);
 
 /**
@@ -734,6 +736,14 @@ async function main(): Promise<void> {
   // `background_tasks` snapshot.
   const backgroundTaskId = extractBackgroundTaskId(hookEvent, toolName, data);
 
+  // Promote the git-attribution fold's lone cross-event field
+  // (`tool_input.file_path`) to `events.mutation_path`. Gated on
+  // (PostToolUse, Write/Edit/MultiEdit/NotebookEdit); null on every other row,
+  // so a `WHERE mutation_path IS NOT NULL` partial index stays selective. Pure
+  // + null-on-malformed (same re-fold-determinism contract as the bash mutation
+  // deriver). The ingester recomputes it for any line a pre-deriver hook wrote.
+  const mutationPath = extractMutationPath(hookEvent, toolName, data);
+
   // Resolve the full named-bindings map ONCE up front. It is the canonical
   // source the dead-letter record reads from on failure, so the on-disk record
   // carries every column the hook would have produced — including
@@ -775,6 +785,7 @@ async function main(): Promise<void> {
     $backend_exec_session_id: backendExecCoords.sessionId,
     $backend_exec_pane_id: backendExecCoords.paneId,
     $background_task_id: backgroundTaskId,
+    $mutation_path: mutationPath,
   };
 
   // Dead-letter on events-log APPEND failure. When `writeEventLog` fails hard

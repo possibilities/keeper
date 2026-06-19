@@ -55,6 +55,7 @@ import type {
   DeadLetterChangedMessage,
   DeadLetterWorkerData,
 } from "./dead-letter-worker";
+import { extractMutationPath } from "./derivers";
 import type {
   EventsIngestWorkerData,
   EventsLogChangedMessage,
@@ -552,6 +553,7 @@ export const INGEST_EVENTS_COLUMNS = [
   "backend_exec_session_id",
   "backend_exec_pane_id",
   "background_task_id",
+  "mutation_path",
 ] as const;
 
 /**
@@ -565,6 +567,47 @@ export type EventsIngestContext = {
   counters: BackstopCounters;
   backstopLogPath: string;
 };
+
+/**
+ * Derive `events.mutation_path` for an ingested NDJSON line whose bindings lack
+ * it (a PRE-`mutation_path`-deriver hook wrote the line). The ingester is the
+ * sole writer of hook-sourced rows, so this seam is the only place a pre-deriver
+ * line gets the promoted column — via the SAME pure {@link extractMutationPath}
+ * the forward hook runs, so a recomputed row matches a hook-derived one
+ * byte-for-byte.
+ *
+ * `data` rides the binding as a JSON STRING (the on-disk shape); parse it
+ * defensively. A missing / non-string / unparseable body, or a body that isn't
+ * a plain object, folds to `null` (the deriver's zero-event value) — NEVER a
+ * throw, which would roll back the whole ingest transaction. `hook_event` /
+ * `tool_name` ride as plain string bindings; the deriver gates on them.
+ */
+function recomputeMutationPath(
+  bindings: Record<string, string | number | boolean | null>,
+): string | null {
+  const rawData = bindings.data;
+  if (typeof rawData !== "string" || rawData.length === 0) {
+    return null;
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(rawData);
+  } catch {
+    return null;
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return null;
+  }
+  const hookEvent =
+    typeof bindings.hook_event === "string" ? bindings.hook_event : "";
+  const toolName =
+    typeof bindings.tool_name === "string" ? bindings.tool_name : null;
+  return extractMutationPath(
+    hookEvent,
+    toolName,
+    parsed as Record<string, unknown>,
+  );
+}
 
 /**
  * Ingest the per-pid NDJSON events-log files — the lock-free events path's
@@ -776,8 +819,24 @@ export function scanEventsLogDir(
             );
             if (presentCols.length === 0) {
               // No recognized events column: skip the INSERT but let the offset
-              // advance past it (a no-op line, safe to consume).
+              // advance past it (a no-op line, safe to consume). Recompute is
+              // gated BELOW on a real event line so a degenerate no-column line
+              // is never promoted into a constraint-violating INSERT.
               continue;
+            }
+            // Recompute-for-pre-deriver-lines: the ingester is the SOLE writer
+            // of hook-sourced rows, so a real event line a PRE-`mutation_path`-
+            // deriver hook wrote (no `mutation_path` binding) gets the column
+            // derived HERE from the same pure `extractMutationPath` the forward
+            // hook runs — identical result, so a hook-derived and an ingester-
+            // recomputed row are byte-identical. Only recompute when ABSENT (a
+            // present binding, even NULL, is authoritative — never overwrite the
+            // hook's value). Reads `data` as a JSON string (the on-disk binding
+            // shape); a malformed/non-string body folds to NULL, never a throw
+            // that wedges the ingest transaction.
+            if (!presentCols.includes("mutation_path")) {
+              bindings.mutation_path = recomputeMutationPath(bindings);
+              presentCols.push("mutation_path");
             }
             const placeholders = presentCols.map(() => "?").join(", ");
             const values = presentCols.map((c) => {

@@ -915,3 +915,133 @@ test("fn-742 load: scanEventsLogDir drains many concurrent per-pid files exactly
 
   db.close();
 });
+
+/**
+ * Build a PostToolUse:Write events-log record. `withMutationPath` controls
+ * whether the binding is present (a forward, post-deriver hook line) or absent
+ * (a pre-deriver hook line the ingester must recompute). `filePath` rides
+ * `data.tool_input.file_path`; passing `null` for it omits a valid path so the
+ * recompute folds to NULL.
+ */
+function makeWriteRecord(
+  sessionId: string,
+  opts: {
+    withMutationPath?: boolean;
+    filePath?: string | null;
+  } = {},
+): EventLogRecord {
+  const filePath =
+    opts.filePath === undefined ? "/repo/src/x.ts" : opts.filePath;
+  const toolInput = filePath === null ? {} : { file_path: filePath };
+  const data = JSON.stringify({ tool_input: toolInput });
+  const bindings: EventLogRecord["bindings"] = {
+    ts: 1_700_000_001.5,
+    session_id: sessionId,
+    pid: 4242,
+    hook_event: "PostToolUse",
+    event_type: "tool",
+    tool_name: "Write",
+    matcher: null,
+    cwd: "/repo",
+    permission_mode: "default",
+    agent_id: null,
+    agent_type: null,
+    stop_hook_active: false,
+    data,
+    subagent_agent_id: null,
+    spawn_name: null,
+    start_time: null,
+    slash_command: null,
+    skill_name: null,
+    planctl_op: null,
+    planctl_target: null,
+    planctl_epic_id: null,
+    planctl_task_id: null,
+    planctl_subject_present: null,
+    tool_use_id: null,
+    config_dir: null,
+    planctl_queue_jump: null,
+    bash_mutation_kind: null,
+    bash_mutation_targets: null,
+    planctl_files: null,
+    backend_exec_type: null,
+    backend_exec_session_id: null,
+    backend_exec_pane_id: null,
+    background_task_id: null,
+  };
+  if (opts.withMutationPath) {
+    bindings.mutation_path = filePath;
+  }
+  return { bindings };
+}
+
+function readMutationPath(
+  db: ReturnType<typeof openDb>["db"],
+  sessionId: string,
+): string | null {
+  const row = db
+    .query("SELECT mutation_path FROM events WHERE session_id = ?")
+    .get(sessionId) as { mutation_path: string | null } | null;
+  if (row === null) throw new Error(`no events row for ${sessionId}`);
+  return row.mutation_path;
+}
+
+test("scanEventsLogDir: a forward line's hook-derived mutation_path lands verbatim", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  writeFileSync(
+    file,
+    serializeEventLogRecord(
+      makeWriteRecord("fwd", {
+        withMutationPath: true,
+        filePath: "/repo/src/a.ts",
+      }),
+    ),
+  );
+
+  scanEventsLogDir(db, eventsLogDir);
+
+  expect(readMutationPath(db, "fwd")).toBe("/repo/src/a.ts");
+  db.close();
+});
+
+test("scanEventsLogDir: a pre-deriver line lacking mutation_path is RECOMPUTED at the ingest seam", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  // No `mutation_path` binding — the sole-writer ingester must derive it from
+  // the line's hook_event/tool_name/data via the same pure deriver the hook runs.
+  writeFileSync(
+    file,
+    serializeEventLogRecord(
+      makeWriteRecord("recompute", { filePath: "/repo/src/b.ts" }),
+    ),
+  );
+
+  scanEventsLogDir(db, eventsLogDir);
+
+  expect(readMutationPath(db, "recompute")).toBe("/repo/src/b.ts");
+  db.close();
+});
+
+test("scanEventsLogDir: a pre-deriver line with a path-less payload recomputes to NULL (no throw)", () => {
+  const { db } = openDb(dbPath);
+  mkdirSync(eventsLogDir, { recursive: true });
+  const file = join(eventsLogDir, `${LIVE_PID}.ndjson`);
+  // A pre-deriver PostToolUse:Write line whose tool_input carries no file_path:
+  // the recompute folds to NULL (the deriver's zero-event value) and the row
+  // still lands. (A line with structurally-malformed `data` can never be a
+  // Write/Edit row — the pre-existing idx_events_tool_attr expression index
+  // rejects it at INSERT — so the deriver's never-throw-on-garbage contract is
+  // unit-tested in derivers.test.ts, not exercised through the full INSERT here.)
+  writeFileSync(
+    file,
+    serializeEventLogRecord(makeWriteRecord("nopath", { filePath: null })),
+  );
+
+  expect(() => scanEventsLogDir(db, eventsLogDir)).not.toThrow();
+
+  expect(readMutationPath(db, "nopath")).toBeNull();
+  db.close();
+});

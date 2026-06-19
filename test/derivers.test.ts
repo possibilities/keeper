@@ -10,6 +10,7 @@ import {
   extractBackgroundTaskId,
   extractBackgroundTasks,
   extractBashMutation,
+  extractMutationPath,
   extractPlanctlInvocation,
   extractToolUseId,
   isKilledTaskNotification,
@@ -1618,4 +1619,94 @@ test("extractBackgroundTasks: round-trip determinism — same input → same out
     ],
   };
   expect(extractBackgroundTasks(input)).toEqual(extractBackgroundTasks(input));
+});
+
+// ---------------------------------------------------------------------------
+// extractMutationPath (v73 promoted git-attribution fold column)
+// ---------------------------------------------------------------------------
+
+// Minimal helper to build the deriver call shape for a file-mutating tool.
+function mutationPath(
+  toolName: string | null,
+  data: Record<string, unknown>,
+  hookEvent = "PostToolUse",
+) {
+  return extractMutationPath(hookEvent, toolName, data);
+}
+
+test("extractMutationPath: PostToolUse:Write lifts tool_input.file_path", () => {
+  expect(
+    mutationPath("Write", { tool_input: { file_path: "/repo/src/a.ts" } }),
+  ).toBe("/repo/src/a.ts");
+});
+
+test("extractMutationPath: Edit/MultiEdit/NotebookEdit all lift the path", () => {
+  for (const tool of ["Edit", "MultiEdit", "NotebookEdit"]) {
+    expect(mutationPath(tool, { tool_input: { file_path: "/repo/x" } })).toBe(
+      "/repo/x",
+    );
+  }
+});
+
+test("extractMutationPath: non-PostToolUse event → null", () => {
+  expect(
+    mutationPath(
+      "Write",
+      { tool_input: { file_path: "/repo/a.ts" } },
+      "PreToolUse",
+    ),
+  ).toBeNull();
+  expect(
+    mutationPath(
+      "Write",
+      { tool_input: { file_path: "/repo/a.ts" } },
+      "PostToolUseFailure",
+    ),
+  ).toBeNull();
+});
+
+test("extractMutationPath: non-file-mutating tool → null", () => {
+  expect(
+    mutationPath("Bash", { tool_input: { file_path: "/repo/a.ts" } }),
+  ).toBeNull();
+  expect(
+    mutationPath("Read", { tool_input: { file_path: "/repo/a.ts" } }),
+  ).toBeNull();
+  expect(
+    mutationPath(null, { tool_input: { file_path: "/repo/a.ts" } }),
+  ).toBeNull();
+});
+
+test("extractMutationPath: missing/malformed tool_input → null (never throws)", () => {
+  expect(mutationPath("Write", {})).toBeNull();
+  expect(mutationPath("Write", { tool_input: null })).toBeNull();
+  expect(mutationPath("Write", { tool_input: "nope" })).toBeNull();
+  expect(mutationPath("Write", { tool_input: {} })).toBeNull();
+});
+
+test("extractMutationPath: non-string / empty file_path → null", () => {
+  expect(mutationPath("Write", { tool_input: { file_path: 42 } })).toBeNull();
+  expect(mutationPath("Write", { tool_input: { file_path: "" } })).toBeNull();
+  expect(mutationPath("Write", { tool_input: { file_path: null } })).toBeNull();
+  expect(
+    mutationPath("Write", { tool_input: { file_path: { nested: 1 } } }),
+  ).toBeNull();
+});
+
+test("extractMutationPath: never throws on arbitrary garbage shapes", () => {
+  const garbage: Record<string, unknown>[] = [
+    {},
+    { tool_input: [] },
+    { tool_input: { file_path: [] } },
+    { tool_input: 0 },
+    { tool_input: true },
+  ];
+  for (const g of garbage) {
+    expect(() => mutationPath("Edit", g)).not.toThrow();
+  }
+});
+
+test("extractMutationPath: round-trip determinism — same input → same output", () => {
+  const data = { tool_input: { file_path: "/repo/src/x.ts" } };
+  expect(mutationPath("Write", data)).toBe(mutationPath("Write", data));
 });

@@ -289,6 +289,16 @@ from pathlib import Path
 # flip to ``source='plan'`` can't be rejected once the daemon is bounced. keeper-py
 # reads no ``file_attributions`` rows (the TUI subscribes over the socket), so no
 # reader logic changes — only the version whitelist gains 72.
+#
+# v73 (fn-836 task .2) adds the nullable ``events.mutation_path`` TEXT column —
+# the git-attribution fold's lone cross-event field (``data.tool_input.file_path``)
+# promoted to a column so the fold reads it instead of parsing the JSON body
+# (hook-derived forward + ingester-recomputed for pre-deriver lines; NULL on every
+# non-Write/Edit/MultiEdit/NotebookEdit row). Purely additive + online (instant ADD
+# COLUMN, no rebuild, no cursor rewind, re-fold byte-identical — the expression
+# index + COALESCE dual-read stay until the .3 attribution flip). keeper-py reads no
+# ``mutation_path`` column (attribution computes its own dirty set), so no reader
+# logic changes — only the version whitelist gains 73.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -333,6 +343,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         70,
         71,
         72,
+        73,
     }
 )
 

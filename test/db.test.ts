@@ -390,6 +390,54 @@ test("migrate: false against a stale schema fails on a column-binding error (hoo
   expect(message).toMatch(/no such column|has no column/i);
 });
 
+test("readonly open against a stale schema does NOT prepare the write bundle (schema-bump-deploy-skew window)", () => {
+  // The schema-bump-deploy-skew window: a new `keeper` binary whose static
+  // `insertEvent` names a column the sole-migrator daemon hasn't yet added to
+  // the on-disk DB. A READER (commit-work attribution, the history CLIs, the
+  // workers) must open that live DB cleanly — the static write statement is
+  // never relevant to a readonly connection, so `openDb({ readonly: true })`
+  // must SKIP `prepareStmts` and hand back the throwing stub. Without this a
+  // post-bump `keeper commit-work` throws "no such column" on every host until
+  // keeperd restarts. Companion to the `migrate: false` (hook write-path) test
+  // above, which still throws — only the readonly reader path is exempted.
+  const staleDbPath = join(tmpDir, "stale-readonly.db");
+  const seed = new Database(staleDbPath, { create: true });
+  // WAL mode, matching a real live keeper DB (the daemon sets it) — a readonly
+  // open still runs applyPragmas, and `PRAGMA journal_mode=WAL` is a no-op once
+  // the file is already WAL but errors on a fresh rollback-journal DB opened
+  // readonly. The production reader always meets an already-WAL DB.
+  seed.run("PRAGMA journal_mode = WAL");
+  // Minimal pre-bump events shape (omits mutation_path + many later columns)
+  // plus the reducer_state row a reader actually reads.
+  seed.run(`
+    CREATE TABLE events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      ts INTEGER NOT NULL, session_id TEXT NOT NULL, hook_event TEXT NOT NULL,
+      event_type TEXT NOT NULL, data TEXT
+    )
+  `);
+  seed.run(
+    "CREATE TABLE reducer_state (id INTEGER PRIMARY KEY, last_event_id INTEGER NOT NULL DEFAULT 0)",
+  );
+  seed.run("INSERT INTO reducer_state (id, last_event_id) VALUES (1, 7)");
+  seed.close();
+
+  // The open itself must NOT throw (pre-fix it died in prepareStmts' INSERT).
+  const { db, stmts } = openDb(staleDbPath, { readonly: true });
+  try {
+    // The connection is fully usable for ad-hoc reads against the live shape.
+    const row = db
+      .prepare("SELECT last_event_id FROM reducer_state WHERE id = 1")
+      .get() as { last_event_id: number };
+    expect(row.last_event_id).toBe(7);
+    // The write bundle is the throwing stub — a reader never touches it, and
+    // accessing it is a programming error, not a silent no-op.
+    expect(() => stmts.insertEvent).toThrow(/statement bundle is unavailable/);
+  } finally {
+    db.close();
+  }
+});
+
 // ===========================================================================
 // fn-785 — worker open boot-race hardening: prepareStmts:false + bootRetry.
 // ===========================================================================
@@ -888,12 +936,41 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
         background_task_id TEXT
       )
     `);
-      built.db.run("INSERT INTO events_dn SELECT * FROM events");
+      // Explicit column list (NOT `SELECT *`): the live `events` carries the
+      // v73 `mutation_path` column the faithful v57 fixture must NOT have, so a
+      // `*` copy would mismatch `events_dn`'s arity. The seeded rows leave
+      // `mutation_path` NULL anyway — it's a no-op for the rebuild fidelity proof.
+      built.db.run(`INSERT INTO events_dn (
+        id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+        bash_mutation_kind, bash_mutation_targets, planctl_files,
+        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+        background_task_id
+      ) SELECT
+        id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
+        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
+        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
+        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
+        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
+        bash_mutation_kind, bash_mutation_targets, planctl_files,
+        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
+        background_task_id
+      FROM events`);
       built.db.run("DROP TABLE events");
       built.db.run("ALTER TABLE events_dn RENAME TO events");
       // Recreate every captured index on the downgraded table so the v57 DB is
       // faithfully indexed (the rebuild-under-test must then carry them forward).
+      // SKIP any index referencing a post-v57 column (the v73 `mutation_path`
+      // partial index) — it can't exist on the faithful v57 shape; migrate()
+      // recreates it from CREATE_V73_INDEXES, and the post-migrate index-set
+      // assertion below still sees it (it's in `indexNamesBefore`).
       for (const idx of eventsIndexSqlBefore) {
+        if (idx.sql.includes("mutation_path")) {
+          continue;
+        }
         built.db.run(idx.sql);
       }
       built.db.run(
@@ -1926,9 +2003,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `scheduled_tasks` projection table, fn-813; v69 adds
   // `subagent_invocations.last_disposition`, fn-38.2; v70 adds
   // `jobs.close_kind`, fn-817; v71 adds `jobs.window_index`, fn-817; v72 widens
-  // the `file_attributions.source` CHECK to accept `'plan'`, fn-826); the
-  // v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(72);
+  // the `file_attributions.source` CHECK to accept `'plan'`, fn-826; v73 adds
+  // the `events.mutation_path` column, fn-836.2); the v62→v63 epics-shape
+  // migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(73);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

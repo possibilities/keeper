@@ -2531,16 +2531,19 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // drop detector), to 70 via fn-817 task .1 (the producer-stamped
   // `jobs.close_kind` column the DB-derived crash-restore set reads), to 71
   // via fn-817 task .2 (the folded `jobs.window_index` column carrying visual
-  // window order for the DB-only crash-restore derivation), and to 72 via
+  // window order for the DB-only crash-restore derivation), to 72 via
   // fn-826 task .1 (widening the `file_attributions.source` CHECK to accept the
   // renamed `'plan'` alongside legacy `'planctl'` — a row-preserving table
-  // rebuild, no cursor rewind), each of which bumped SCHEMA_VERSION AND added
-  // its version to `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the
-  // CLAUDE.md same-commit invariant. This pin tracks the LIVE schema version:
-  // the guard it provides is "an accidental reducer/schema change must surface
-  // as a failing whitelist + this pin", which still holds — bump both together
-  // when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(72);
+  // rebuild, no cursor rewind), and to 73 via fn-836 task .2 (the additive
+  // `events.mutation_path` column promoting the git-attribution fold's lone
+  // cross-event field — instant ADD COLUMN, no rebuild, no cursor rewind), each
+  // of which bumped SCHEMA_VERSION AND added its version to
+  // `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the CLAUDE.md same-commit
+  // invariant. This pin tracks the LIVE schema version: the guard it provides is
+  // "an accidental reducer/schema change must surface as a failing whitelist +
+  // this pin", which still holds — bump both together when the schema genuinely
+  // moves.
+  expect(SCHEMA_VERSION).toBe(73);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

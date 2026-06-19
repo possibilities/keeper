@@ -623,18 +623,27 @@ function relocateEverything(): void {
 }
 
 /**
- * Materialize the future `mutation_path` column exactly as task .2 (additive
- * ALTER) + task .3 (paced backfill) will: add the column, fill it from the
- * inline body where present, then backfill the relocated rows from the
- * side-table body (json_valid-guarded). Idempotent ADD-once: a re-add throws,
- * so callers run it at most once per `db`.
+ * Materialize the `mutation_path` column's BACKFILL exactly as task .3 (paced
+ * backfill) will: fill it from the inline body where present, then backfill the
+ * relocated rows from the side-table body (json_valid-guarded).
+ *
+ * Task .2 already ships the additive ADD COLUMN at migrate() time, so the column
+ * exists on every openDb DB — this helper ADDs it only on the off chance it's
+ * absent (column-presence-guarded, so it's a no-op on a current-schema DB and
+ * never throws "duplicate column"). What stays the harness's job is the BACKFILL
+ * UPDATEs below — the differential predicate (OLD json_extract == column value).
  *
  * The value is `json_extract($.tool_input.file_path)` for the four mutation
  * tools — byte-identical to what the old git-attribution scan reads off the
  * blob. NULL for a malformed body (the guard) and for non-mutation rows.
  */
 function materializeMutationPathColumn(): void {
-  db.run("ALTER TABLE events ADD COLUMN mutation_path TEXT");
+  const hasColumn = (
+    db.prepare("PRAGMA table_info(events)").all() as { name: string }[]
+  ).some((c) => c.name === "mutation_path");
+  if (!hasColumn) {
+    db.run("ALTER TABLE events ADD COLUMN mutation_path TEXT");
+  }
   // Inline rows: extract from `events.data` (json_valid-guarded so a future
   // inline-malformed row never throws the UPDATE).
   db.run(
