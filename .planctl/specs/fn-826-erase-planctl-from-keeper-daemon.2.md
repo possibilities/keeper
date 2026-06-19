@@ -26,5 +26,5 @@ Make the daemon-internal consumers tolerant of both commit-event-type names: the
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Daemon-internal consumers now fold both planctl-commit-changed and plan-commit-changed event-type names (plan-worker inbound handler + daemon forward), and isVendoredPlanctlPath prunes plugins/plan/.keeper alongside .planctl so the vendored prune survives the dir rename. Additive only; no producer flips, re-fold unaffected.
 ## Evidence
