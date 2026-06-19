@@ -48,5 +48,5 @@ VERIFY current line numbers before editing (they may have shifted).
 - [ ] No fold touched; no schema bump. `bun run test:full` green.
 
 ## Done summary
-
+Added a last-rank runtime-blocked predicate so a runtime_status=blocked task is never dispatched, and gated the armed-mode pass-2a close-row root-claim on the launcher's eligibility predicate so an ineligible ready close row no longer starves an eligible same-root task (yolo and in-flight closers stay eligibility-blind).
 ## Evidence

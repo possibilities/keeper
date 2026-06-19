@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "gate blocked tasks and fix armed close-row root claim",
-  "updated_at": "2026-06-18T23:50:04.150000Z"
+  "updated_at": "2026-06-19T00:03:36.754000Z",
+  "worker_done_at": "2026-06-19T00:03:36.754000Z"
 }
