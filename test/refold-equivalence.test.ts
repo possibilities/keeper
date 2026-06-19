@@ -52,6 +52,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { compactColdBlobs } from "../src/compaction";
 import { openDb, SCHEMA_VERSION } from "../src/db";
+import { extractMutationPath } from "../src/derivers";
 import { drain } from "../src/reducer";
 import { resolveBridgeAgentId } from "../src/subagent-invocations";
 import { freshMemDb } from "./helpers/template-db";
@@ -233,12 +234,6 @@ test("every body-resolving blob reader is enumerated and classified keep vs shed
       why: "main drain — keep-set arms parse the body; shed-class arm ignores it",
     },
     {
-      file: "src/reducer.ts",
-      needle: "FROM event_blobs b",
-      kind: "filepath",
-      why: "git-attribution ARM B — reads ONLY $.tool_input.file_path (mutation_path)",
-    },
-    {
       file: "src/db.ts",
       needle: "COALESCE(events.data, event_blobs.data) AS data",
       kind: "keep",
@@ -272,20 +267,17 @@ test("every body-resolving blob reader is enumerated and classified keep vs shed
     expect(src.includes(r.needle)).toBe(true);
   }
 
-  // No FILEPATH reader may extract anything but `$.tool_input.file_path` from a
-  // shed-class body. The ARM B query is the only filepath reader; assert it
-  // extracts ONLY file_path (the promoted column) and nothing else from the
-  // shed body.
+  // fn-836.3 flipped the git-attribution scan off the shed-class body onto the
+  // promoted `mutation_path` column and DELETED ARM B (the `event_blobs`
+  // rowid-join). The reducer no longer reads ANY shed-class body — assert ARM B
+  // is gone, so there is no FILEPATH reader left to enumerate. The git-attribution
+  // tool scan now SEEKs the column (`mutation_path = ?`), never the blob.
   const reducerSrc = readSrc("src/reducer.ts");
-  const armB = reducerSrc.slice(
-    reducerSrc.indexOf("FROM event_blobs b"),
-    reducerSrc.indexOf("FROM event_blobs b") + 400,
+  expect(reducerSrc).not.toContain("FROM event_blobs b");
+  expect(reducerSrc).not.toContain(
+    "json_extract(b.data, '$.tool_input.file_path')",
   );
-  expect(armB).toContain("json_extract(b.data, '$.tool_input.file_path')");
-  // It must NOT pull any other JSON path out of the shed body (content,
-  // tool_response, etc.) — that would make the body un-sheddable.
-  expect(armB).not.toContain("$.tool_input.content");
-  expect(armB).not.toContain("$.tool_response");
+  expect(reducerSrc).toContain("AND mutation_path = ?");
 
   // The enumeration must COVER every event_blobs body read in src/ and cli/. A
   // body read JOINs the side table in actual SQL (`LEFT JOIN event_blobs` or the
@@ -317,12 +309,12 @@ test("every body-resolving blob reader is enumerated and classified keep vs shed
   };
 
   // Body-resolving SQL join sites (each enumerated above):
-  //   reducer.ts: main drain LEFT JOIN (keep) + ARM B FROM (filepath) = 2
+  //   reducer.ts: main drain LEFT JOIN (keep) = 1 (ARM B FROM deleted in .3)
   //   db.ts: v67 Commit backfill LEFT JOIN (keep) = 1
   //   subagent-invocations.ts: 2 bridge LEFT JOINs (keep) = 2
   //   search-history.ts: UserPromptSubmit prompt LEFT JOIN (keep) = 1
   const bodyReadSites: Array<{ file: string; count: number }> = [
-    { file: "src/reducer.ts", count: 2 },
+    { file: "src/reducer.ts", count: 1 },
     { file: "src/db.ts", count: 1 },
     { file: "src/subagent-invocations.ts", count: 2 },
     { file: "cli/search-history.ts", count: 1 },
@@ -369,12 +361,36 @@ function insertEvent(overrides: {
   planctl_files?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
+  const data = overrides.data ?? "{}";
+  // Derive `mutation_path` (v73 promoted column) from `data` the SAME way the
+  // live hook does, so a seeded mutation row carries the column BEFORE the
+  // baseline fold — the post-flip git-attribution scan reads the column, not
+  // the body. A malformed body (the corpus's malformed-mutation fixture) folds
+  // to NULL here, matching the forward deriver; the relocated-row backfill
+  // (`materializeMutationPathColumn`) is what `event_blobs` rows still need.
+  let mutationPath: string | null = null;
+  try {
+    const parsed = JSON.parse(data) as unknown;
+    if (
+      parsed !== null &&
+      typeof parsed === "object" &&
+      !Array.isArray(parsed)
+    ) {
+      mutationPath = extractMutationPath(
+        overrides.hook_event,
+        overrides.tool_name ?? null,
+        parsed as Record<string, unknown>,
+      );
+    }
+  } catch {
+    mutationPath = null;
+  }
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
        subagent_agent_id, tool_use_id, agent_type, planctl_op, planctl_target,
-       planctl_files
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       planctl_files, mutation_path
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? "sess-a",
@@ -383,13 +399,14 @@ function insertEvent(overrides: {
       overrides.hook_event,
       overrides.tool_name ?? null,
       overrides.cwd ?? "/tmp/work",
-      overrides.data ?? "{}",
+      data,
       overrides.subagent_agent_id ?? null,
       overrides.tool_use_id ?? null,
       overrides.agent_type ?? null,
       overrides.planctl_op ?? null,
       overrides.planctl_target ?? null,
       overrides.planctl_files ?? null,
+      mutationPath,
     ],
   );
   return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })

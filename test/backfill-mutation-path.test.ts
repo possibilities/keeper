@@ -1,0 +1,280 @@
+/**
+ * Historical `events.mutation_path` backfill tests (fn-836.3).
+ *
+ * Covers the task Acceptance:
+ * - every historical mutation row whose body (inline `events.data` OR relocated
+ *   `event_blobs.data`) yields a valid file_path gets `mutation_path` set;
+ * - the backfill is paced (bounded batches) and resumable via a crash-safe
+ *   `meta` watermark — a second pass continues where the first stopped without
+ *   re-scanning the backfilled prefix;
+ * - idempotence: re-running a complete backfill is a no-op;
+ * - relocated rows (data IS NULL, body in `event_blobs`) are covered via the
+ *   COALESCE'd extract — the risk the spec flags;
+ * - the completion gate distinguishes "not yet backfilled" from a legitimate
+ *   NULL (malformed / no file_path), and the backfilled column equals the
+ *   guarded `json_extract` byte-for-byte.
+ */
+
+import type { Database } from "bun:sqlite";
+import { afterEach, beforeEach, expect, test } from "bun:test";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import {
+  BACKFILL_WATERMARK_KEY,
+  backfillMutationPath,
+  isMutationPathBackfillComplete,
+  readBackfillWatermark,
+} from "../src/backfill-mutation-path";
+import { compactColdBlobs } from "../src/compaction";
+import { freshMemDb } from "./helpers/template-db";
+
+let tmpDir: string;
+let db: Database;
+
+beforeEach(() => {
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-backfill-test-"));
+  db = freshMemDb().db;
+});
+
+afterEach(() => {
+  db.close();
+  rmSync(tmpDir, { recursive: true, force: true });
+});
+
+const SESS = "01234567-89ab-cdef-0123-456789abcdef";
+
+let tsCounter = 1_000;
+
+/**
+ * Insert one raw event row WITHOUT `mutation_path` (column stays NULL) —
+ * simulating a pre-deriver historical row the backfill must fill. Returns the
+ * auto-assigned id.
+ */
+function insertEvent(overrides: {
+  hook_event: string;
+  session_id?: string;
+  tool_name?: string | null;
+  ts?: number;
+  data?: string | null;
+}): number {
+  const ts = overrides.ts ?? tsCounter++;
+  db.run(
+    `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, data)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+    [
+      ts,
+      overrides.session_id ?? SESS,
+      overrides.hook_event,
+      overrides.hook_event,
+      overrides.tool_name ?? null,
+      overrides.data ?? "{}",
+    ],
+  );
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
+    .id;
+}
+
+/** Insert a PostToolUse mutation row carrying `tool_input.file_path`. */
+function insertMutation(filePath: string, tool = "Write"): number {
+  return insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: tool,
+    data: JSON.stringify({ tool_input: { file_path: filePath } }),
+  });
+}
+
+function mutationPathOf(id: number): string | null {
+  return (
+    db.query("SELECT mutation_path FROM events WHERE id = ?").get(id) as {
+      mutation_path: string | null;
+    }
+  ).mutation_path;
+}
+
+test("readBackfillWatermark is 0 before any pass; advances after a pass", () => {
+  insertMutation("/repo/a.ts");
+  expect(readBackfillWatermark(db)).toBe(0);
+
+  backfillMutationPath(db);
+  const maxId = (
+    db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
+  ).m;
+  expect(readBackfillWatermark(db)).toBe(maxId);
+});
+
+test("backfill fills mutation_path from inline events.data; non-mutation rows untouched", () => {
+  const a = insertMutation("/repo/a.ts");
+  const b = insertMutation("/repo/b.ts", "Edit");
+  // A non-mutation row (Bash) and a non-PostToolUse row — both must stay NULL.
+  const bash = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    data: JSON.stringify({ tool_input: { command: "ls" } }),
+  });
+  const pre = insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Write",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/pre.ts" } }),
+  });
+
+  const result = backfillMutationPath(db);
+  expect(result.scanned).toBe(2); // only the two mutation rows are candidates
+
+  expect(mutationPathOf(a)).toBe("/repo/a.ts");
+  expect(mutationPathOf(b)).toBe("/repo/b.ts");
+  expect(mutationPathOf(bash)).toBeNull();
+  expect(mutationPathOf(pre)).toBeNull();
+});
+
+test("backfill covers RELOCATED rows via COALESCE(events.data, event_blobs.data)", () => {
+  // Seed a mutation, then relocate it into the side table (events.data → NULL,
+  // body in event_blobs) so the ONLY readable body is the relocated one. The
+  // backfill MUST still set mutation_path — reading events.data alone would
+  // leave it NULL and silently drop the post-flip attribution.
+  const id = insertMutation("/repo/relocated.ts");
+  // Filler so the watermark margin can push the mutation below the cold line.
+  for (let i = 0; i < 5; i++) insertEvent({ hook_event: "Stop" });
+  const reloc = compactColdBlobs(db, {
+    recentRetentionMargin: 0,
+    batchSize: 100,
+    maxBatches: 10,
+  });
+  expect(reloc.relocated).toBeGreaterThan(0);
+  // The hot column is genuinely NULL; the body lives in event_blobs.
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(id) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+
+  backfillMutationPath(db);
+  expect(mutationPathOf(id)).toBe("/repo/relocated.ts");
+});
+
+test("backfill is idempotent — a second complete pass is a no-op", () => {
+  const a = insertMutation("/repo/a.ts");
+  const b = insertMutation("/repo/b.ts");
+
+  backfillMutationPath(db);
+  expect(isMutationPathBackfillComplete(db)).toBe(true);
+
+  // A second pass scans nothing new (every candidate already has a non-NULL
+  // column AND sits below the watermark) and leaves the values intact.
+  const second = backfillMutationPath(db);
+  expect(second.scanned).toBe(0);
+  expect(second.batches).toBe(0);
+  expect(mutationPathOf(a)).toBe("/repo/a.ts");
+  expect(mutationPathOf(b)).toBe("/repo/b.ts");
+});
+
+test("backfill is paced + resumable: a bounded pass stops, a watermark resumes the rest", () => {
+  // 7 mutation rows; a pass capped at batchSize=2, maxBatches=2 processes 4 and
+  // stops with `moreLikely`. The watermark persists across the (simulated)
+  // restart, and a fresh pass finishes the remaining 3 — never re-touching the
+  // first 4.
+  const ids: number[] = [];
+  for (let i = 0; i < 7; i++) ids.push(insertMutation(`/repo/f${i}.ts`));
+
+  const pass1 = backfillMutationPath(db, { batchSize: 2, maxBatches: 2 });
+  expect(pass1.scanned).toBe(4);
+  expect(pass1.batches).toBe(2);
+  expect(pass1.moreLikely).toBe(true);
+  expect(readBackfillWatermark(db)).toBe(ids[3]);
+  // First 4 filled, last 3 still NULL.
+  for (let i = 0; i < 4; i++)
+    expect(mutationPathOf(ids[i] as number)).toBe(`/repo/f${i}.ts`);
+  for (let i = 4; i < 7; i++)
+    expect(mutationPathOf(ids[i] as number)).toBeNull();
+  expect(isMutationPathBackfillComplete(db)).toBe(false);
+
+  // Resume from the persisted watermark (a fresh module-level call mirrors a
+  // daemon restart — it reads the watermark off `meta`, no in-memory state).
+  const pass2 = backfillMutationPath(db, { batchSize: 2, maxBatches: 2 });
+  expect(pass2.scanned).toBe(3);
+  expect(readBackfillWatermark(db)).toBe(ids[6]);
+  for (let i = 0; i < 7; i++)
+    expect(mutationPathOf(ids[i] as number)).toBe(`/repo/f${i}.ts`);
+  expect(isMutationPathBackfillComplete(db)).toBe(true);
+});
+
+test("crash-safe watermark: a pre-set watermark skips the backfilled prefix", () => {
+  // Simulate a crash that committed batch 1 (rows below the watermark) but lost
+  // the in-memory result: pre-seed the watermark to id of the 2nd row, then run.
+  // The first two rows are NOT re-scanned (their column stays whatever it was);
+  // only rows above the watermark are processed.
+  const ids: number[] = [];
+  for (let i = 0; i < 4; i++) ids.push(insertMutation(`/repo/g${i}.ts`));
+  db.run(
+    "INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+    [BACKFILL_WATERMARK_KEY, String(ids[1])],
+  );
+
+  const result = backfillMutationPath(db);
+  // Only rows g2, g3 (above the watermark) were scanned.
+  expect(result.scanned).toBe(2);
+  expect(mutationPathOf(ids[0] as number)).toBeNull(); // skipped by watermark
+  expect(mutationPathOf(ids[1] as number)).toBeNull(); // skipped by watermark
+  expect(mutationPathOf(ids[2] as number)).toBe("/repo/g2.ts");
+  expect(mutationPathOf(ids[3] as number)).toBe("/repo/g3.ts");
+});
+
+test("completion gate distinguishes legit-NULL (malformed / no file_path) from not-yet-backfilled", () => {
+  // A mutation row whose body carries NO file_path: the column legitimately
+  // stays NULL after backfill, and the gate must NOT count it as outstanding.
+  const noPath = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    data: JSON.stringify({ tool_input: { content: "x" } }),
+  });
+  const withPath = insertMutation("/repo/h.ts");
+
+  // Before any backfill the gate is FALSE — `withPath` owes a backfill (its
+  // body yields a valid file_path the NULL column doesn't hold yet).
+  expect(isMutationPathBackfillComplete(db)).toBe(false);
+
+  backfillMutationPath(db);
+  // After: `withPath` set, `noPath` correctly NULL — and the gate is TRUE
+  // (the legit-NULL row does NOT keep it false).
+  expect(mutationPathOf(withPath)).toBe("/repo/h.ts");
+  expect(mutationPathOf(noPath)).toBeNull();
+  expect(isMutationPathBackfillComplete(db)).toBe(true);
+});
+
+test("backfilled column equals the guarded json_extract byte-for-byte (inline + relocated)", () => {
+  const inlineId = insertMutation("/repo/inline.ts", "MultiEdit");
+  const relocId = insertMutation("/repo/reloc.ts", "NotebookEdit");
+  for (let i = 0; i < 5; i++) insertEvent({ hook_event: "Stop" });
+  // Relocate only the second mutation (margin chosen so reloc sits cold).
+  compactColdBlobs(db, {
+    recentRetentionMargin: 0,
+    batchSize: 100,
+    maxBatches: 10,
+  });
+
+  backfillMutationPath(db);
+
+  // The column value must equal the guarded extract over the COALESCE'd body —
+  // the exact predicate the old two-arm scan / .1 harness used.
+  const rows = db
+    .query(
+      `SELECT e.id,
+              e.mutation_path AS col,
+              CASE WHEN json_valid(COALESCE(e.data, b.data))
+                   THEN json_extract(COALESCE(e.data, b.data), '$.tool_input.file_path')
+              END AS extracted
+         FROM events e
+         LEFT JOIN event_blobs b ON b.event_id = e.id
+        WHERE e.id IN (?, ?)`,
+    )
+    .all(inlineId, relocId) as Array<{
+    id: number;
+    col: string | null;
+    extracted: string | null;
+  }>;
+  for (const r of rows) {
+    expect(r.col).toBe(r.extracted);
+  }
+});

@@ -1042,8 +1042,8 @@ interface RenderedAttribution {
  * modes feed the same `file_attributions` UPSERT in pass 1:
  *
  *   - tool mutations (exact): PostToolUse Write/Edit/MultiEdit/NotebookEdit
- *     whose `tool_input.file_path` matches the dirty file's `path` / `orig_path`
- *     — a SEEK on the once-prepared `toolStmt` / `relocatedStmt`;
+ *     whose promoted `mutation_path` column matches the dirty file's `path` /
+ *     `orig_path` — a SEEK on the once-prepared `toolStmt` (fn-836.3);
  *   - bash mutations (exact): PostToolUse:Bash events whose
  *     `bash_mutation_targets` array contains the path — an O(1) lookup into the
  *     once-built `bashByToken` index (the old SQL-side `json_each` probe,
@@ -1203,12 +1203,12 @@ function bashTargetMatches(token: string, candidatePath: string): boolean {
  * projection write, so re-fold determinism is untouched.
  */
 interface ExplicitAttribAccumulator {
-  // Tool arms A/B are prepared ONCE per snapshot (the hoist) and seek per file,
-  // so only the per-file `.all()` execute time + matched-row count are tracked.
+  // The single tool-mutation scan is prepared ONCE per snapshot (the hoist) and
+  // seeks per file off `mutation_path`, so only its per-file `.all()` execute
+  // time + matched-row count are tracked (fn-836.3 collapsed the old two arms
+  // — inline + relocated `event_blobs` — into one column read).
   toolArmAExecMs: number;
   toolArmARows: number;
-  toolArmBExecMs: number;
-  toolArmBRows: number;
   // Bash + deletion scans run ONCE per snapshot (the hoist); prep=compile,
   // exec=.all+materialize, rows=scanned. A per-file `.get` lookup is O(1) JS.
   bashScanPrepMs: number;
@@ -1223,8 +1223,6 @@ function newExplicitAttribAccumulator(): ExplicitAttribAccumulator {
   return {
     toolArmAExecMs: 0,
     toolArmARows: 0,
-    toolArmBExecMs: 0,
-    toolArmBRows: 0,
     bashScanPrepMs: 0,
     bashScanExecMs: 0,
     bashScanRows: 0,
@@ -1263,8 +1261,8 @@ interface DeletionMutationRow {
 
 interface ExplicitAttribHoist {
   // Prepared once, reused across every dirty file (and both candidate paths).
+  // Single arm off `mutation_path` (fn-836.3) — `event_blobs` no longer read.
   toolStmt: Statement;
-  relocatedStmt: Statement;
   // The bash exact-match scan, materialized once as `target token → rows`. The
   // SQL probe was `json_each(targets) WHERE value = ?` (exact equality), so a
   // per-token bucket reproduces the same matched set via an O(1) JS lookup.
@@ -1284,24 +1282,21 @@ function buildExplicitAttribHoist(
   db: Database,
   acc?: ExplicitAttribAccumulator,
 ): ExplicitAttribHoist {
+  // Single-arm tool-mutation scan off the promoted `mutation_path` column
+  // (fn-836.3): the file_path the old two-arm scan parsed from the JSON body
+  // (inline ARM A + relocated ARM B) is now read directly from the column,
+  // backfilled byte-identically over every historical row (`backfillMutationPath`
+  // — guarded `COALESCE(events.data, event_blobs.data)` extract, malformed→NULL,
+  // matching the old scan exactly). The `WHERE mutation_path IS NOT NULL` partial
+  // index `idx_events_mutation_path` serves this as a sub-ms covering SEEK, so
+  // the fold no longer touches `event_blobs` at all (ARM B's rowid-join gone, no
+  // more multi-second attribution folds under load).
   const toolStmt = db.prepare(
     `SELECT id, ts, session_id, tool_name
          FROM events
         WHERE hook_event = 'PostToolUse'
           AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-          AND json_extract(data, '$.tool_input.file_path') = ?`,
-  );
-  const relocatedStmt = db.prepare(
-    `SELECT e.id AS id, e.ts AS ts, e.session_id AS session_id,
-              e.tool_name AS tool_name
-         FROM event_blobs b
-         JOIN events e ON e.id = b.event_id
-        WHERE e.data IS NULL
-          AND e.hook_event = 'PostToolUse'
-          AND e.tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-          AND CASE WHEN json_valid(b.data)
-                   THEN json_extract(b.data, '$.tool_input.file_path')
-              END = ?`,
+          AND mutation_path = ?`,
   );
 
   // Bash exact-match scan — pull the sparse mutation subset ONCE and bucket each
@@ -1401,7 +1396,7 @@ function buildExplicitAttribHoist(
     acc.deletionScanRows += deletionScanRows.length;
   }
 
-  return { toolStmt, relocatedStmt, bashByToken, deletionRows };
+  return { toolStmt, bashByToken, deletionRows };
 }
 
 function findExplicitAttributions(
@@ -1433,25 +1428,23 @@ function findExplicitAttributions(
   const perSession = new Map<string, SessionMutation>();
 
   // Tool-mutation scan: PostToolUse rows on the four mutation tool names whose
-  // `data.tool_input.file_path` equals a candidate path. Split into two
-  // complementary arms (NOT a plain `COALESCE(events.data, event_blobs.data)`)
-  // so the common inline case keeps its expression index: COALESCE-ing the
-  // `json_extract` predicate would defeat `idx_events_tool_attr` and regress
-  // this to a multi-second full scan of every PostToolUse row.
+  // promoted `mutation_path` column (fn-836.3) equals a candidate path. Single
+  // arm off the column — the old two-arm form (inline `json_extract` ARM A +
+  // relocated `event_blobs` ARM B) is gone now that every historical row's
+  // file_path is backfilled into the column. The partial index
+  // `idx_events_mutation_path WHERE mutation_path IS NOT NULL` makes this a
+  // sub-ms covering SEEK, and the fold no longer touches `event_blobs` at all.
   //
-  // A relocated mutation blob is STILL needed here on a from-scratch re-fold:
-  // the discharging Commit replays AFTER the GitSnapshot, so at GitSnapshot-fold
-  // time a currently-discharged mutation is momentarily live and this scan must
-  // see its file_path. "Currently discharged ⇒ safe to drop" is therefore
-  // FALSE; the two arms partition the rows (ARM B's `e.data IS NULL` guard) and
-  // together equal the COALESCE'd scan, lossless regardless of discharge state.
+  // Discharge-state still doesn't matter: the column holds the file_path
+  // regardless of whether the mutation has since been discharged by a Commit,
+  // so a from-scratch re-fold (where the discharging Commit replays AFTER the
+  // GitSnapshot and a momentarily-live discharged mutation must be seen) reads
+  // the same value the old COALESCE'd two-arm scan read off the body.
   for (const candidatePath of paths) {
-    // ARM A (inline, indexed): filters `events.data` directly so
-    // `idx_events_tool_attr` makes this a sub-ms covering SEEK. Covers every
-    // inline blob; a relocated row has `data IS NULL` so this arm misses it
-    // (handled by ARM B). The statement is prepared ONCE per snapshot (in
-    // `buildExplicitAttribHoist`) and reused — bun:sqlite does not cache
-    // `prepare()`, so per-file recompilation was pure overhead.
+    // Prepared ONCE per snapshot (in `buildExplicitAttribHoist`) and reused —
+    // bun:sqlite does not cache `prepare()`, so per-file recompilation was pure
+    // overhead. The `mutation_path = ?` predicate is a covering SEEK on the
+    // partial index.
     const _armAP0 = acc != null ? performance.now() : 0;
     const toolRows = hoist.toolStmt.all(candidatePath) as Array<{
       id: number;
@@ -1463,28 +1456,7 @@ function findExplicitAttributions(
       acc.toolArmAExecMs += performance.now() - _armAP0;
       acc.toolArmARows += toolRows.length;
     }
-    // ARM B (relocated): reads `event_blobs.data` for rows whose hot column was
-    // NULLed, joining back to `events` for the scalar facts; scans only the
-    // small side table. The `CASE WHEN json_valid(b.data) THEN json_extract(...)
-    // END` form (NOT a bare `json_extract`) does double duty: it MATCHES the
-    // expression index `idx_event_blobs_tool_attr` (so this is a SEEK, not a
-    // full JSON-parse scan of the side table per dirty file per fold), AND it
-    // skips a malformed relocated blob (yields NULL) instead of throwing
-    // "malformed JSON" and crashing the fold. A malformed blob has no parseable
-    // file_path, so skipping is re-fold-deterministic. Prepared once per snapshot
-    // and reused (see ARM A); the per-file SEEK stays on the covering index.
-    const _armBP0 = acc != null ? performance.now() : 0;
-    const relocatedRows = hoist.relocatedStmt.all(candidatePath) as Array<{
-      id: number;
-      ts: number;
-      session_id: string;
-      tool_name: string;
-    }>;
-    if (acc != null) {
-      acc.toolArmBExecMs += performance.now() - _armBP0;
-      acc.toolArmBRows += relocatedRows.length;
-    }
-    for (const row of [...toolRows, ...relocatedRows]) {
+    for (const row of toolRows) {
       if (row.session_id == null || row.session_id.length === 0) continue;
       const existing = perSession.get(row.session_id);
       if (existing == null || row.ts > existing.last_mutation_at) {
@@ -2115,14 +2087,13 @@ function projectGitStatus(db: Database, event: Event): void {
         `pass4_rollup=${(_gfT4 - _gfT3).toFixed(0)}ms ` +
         `fanout=${(_gfT5 - _gfT4).toFixed(0)}ms ` +
         `write=${(performance.now() - _gfT5).toFixed(0)}ms ` +
-        // pass1 per-arm split. Tool arms A/B are prepared once (the hoist) and
-        // SEEK per file, so only their summed `.all()` exec + matched rows show.
+        // pass1 tool scan. The single `mutation_path` SEEK is prepared once (the
+        // hoist) and seeks per file, so only its summed `.all()` exec + matched
+        // rows show (fn-836.3 collapsed the old inline+relocated arms into one).
         // Bash + deletion are once-per-snapshot scans (prep=compile, exec=.all),
         // matched per file via an O(1) lookup that no longer touches SQLite.
-        `p1_toolA_exec=${_pass1Acc.toolArmAExecMs.toFixed(0)}ms ` +
-        `p1_toolA_rows=${_pass1Acc.toolArmARows} ` +
-        `p1_toolB_exec=${_pass1Acc.toolArmBExecMs.toFixed(0)}ms ` +
-        `p1_toolB_rows=${_pass1Acc.toolArmBRows} ` +
+        `p1_tool_exec=${_pass1Acc.toolArmAExecMs.toFixed(0)}ms ` +
+        `p1_tool_rows=${_pass1Acc.toolArmARows} ` +
         `p1_bash_prep=${_pass1Acc.bashScanPrepMs.toFixed(0)}ms ` +
         `p1_bash_exec=${_pass1Acc.bashScanExecMs.toFixed(0)}ms ` +
         `p1_bash_rows=${_pass1Acc.bashScanRows} ` +

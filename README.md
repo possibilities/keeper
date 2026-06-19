@@ -2609,18 +2609,19 @@ payload column, or documents why it cannot.** The COALESCE wraps the SELECT
 projection ONLY, never a WHERE/filter column — the relocator never touches the
 indexed scalars folds filter on (`tool_use_id`, `session_id`, `tool_name`,
 `hook_event`, generated `bash_mutation_*` columns), and wrapping them would
-defeat their indexes. The one documented exception is the tool-mutation
-attribution scan in `reducer.ts` (`findExplicitAttributions`), whose
-`json_extract` predicate is covered by the `idx_events_tool_attr` /
-`idx_event_blobs_tool_attr` expression indexes; it splits into two
-index-preserving arms (inline `events.data` SEEK + relocated `event_blobs.data`
-join, partitioned by `events.data IS NULL`) that together equal the COALESCE'd
-scan without regressing to a full table scan. Both arms are prepared ONCE per
-snapshot (the pass-1 hoist) and SEEK per dirty file — bun:sqlite does not cache
-`prepare()`, so per-file recompilation was pure overhead. Migration-internal reads
-(`migrate()`) and the relocator's own reads (`compaction.ts`) run off the
-fold path and are exempt. The authoritative per-site enumeration lives in the
-comment above that two-arm scan in `src/reducer.ts`.
+defeat their indexes. The tool-mutation attribution scan in `reducer.ts`
+(`findExplicitAttributions`) no longer reads the blob at all (fn-836): its lone
+cross-event fold field, `data.tool_input.file_path`, is promoted to the
+`events.mutation_path` column (hook-derived forward, ingester-recomputed +
+historically backfilled via the guarded `COALESCE(events.data,
+event_blobs.data)` extract), and the scan SEEKs that column through the partial
+index `idx_events_mutation_path WHERE mutation_path IS NOT NULL` — the old
+two-arm form (inline `events.data` SEEK + relocated `event_blobs.data` join) is
+gone, so the git-attribution fold never touches `event_blobs`. Migration-internal
+reads (`migrate()`) and the relocator's own reads (`compaction.ts`) run off the
+fold path and are exempt. The authoritative per-site enumeration of remaining
+`event_blobs` body readers lives in `test/refold-equivalence.test.ts` (the
+keep/shed classification gate).
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

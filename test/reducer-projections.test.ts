@@ -23,6 +23,7 @@ import {
   serializeBuildSnapshot,
 } from "../src/reducer";
 import type { Event } from "../src/types";
+import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -128,6 +129,19 @@ function insertEvent(
     // `tool_response.backgroundTaskId`). NULL on every other event;
     // monitors-projection tests pass this explicitly via overrides.
     background_task_id: overrides.background_task_id ?? null,
+    // Schema v73 / fn-836: promoted git-attribution column. Honor an EXPLICIT
+    // override (a few tests set it directly); otherwise DERIVE it from `data`
+    // via the same pure deriver the live hook + ingester run, so a seeded
+    // mutation row carries `mutation_path` exactly as a production row does —
+    // the post-flip attribution scan reads the COLUMN, not the JSON body.
+    mutation_path:
+      "mutation_path" in overrides
+        ? (overrides.mutation_path ?? null)
+        : deriveSeedMutationPath(
+            overrides.hook_event,
+            overrides.tool_name ?? null,
+            overrides.data ?? "{}",
+          ),
   };
   db.run(
     `INSERT INTO events (
@@ -138,8 +152,8 @@ function insertEvent(
        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
        bash_mutation_kind, bash_mutation_targets, planctl_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       background_task_id, mutation_path
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -174,6 +188,7 @@ function insertEvent(
       row.backend_exec_session_id,
       row.backend_exec_pane_id,
       row.background_task_id,
+      row.mutation_path,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {
@@ -4405,11 +4420,13 @@ test("fn-717.1 relocated blob (event_blobs): COALESCE drain read resolves the si
   );
 });
 
-test("fn-717.1 idx_events_tool_attr still serves the file-attribution scan (EXPLAIN-verified)", () => {
-  // The file-attribution scan's WHERE filter STAYS on events.data (NOT
-  // COALESCE), so the expression index idx_events_tool_attr keeps serving it
-  // as a SEARCH (sub-ms SEEK), never a full table SCAN. EXPLAIN QUERY PLAN
-  // must name the index — proving the .2 seam is documented, not broken.
+test("fn-836.3 idx_events_mutation_path serves the flipped file-attribution scan (EXPLAIN-verified)", () => {
+  // The git-attribution tool scan flipped off the JSON body onto the promoted
+  // `mutation_path` column (ARM B / event_blobs join deleted). The partial
+  // index `idx_events_mutation_path WHERE mutation_path IS NOT NULL` must serve
+  // the new `mutation_path = ?` predicate as a SEARCH (sub-ms covering SEEK),
+  // never a full table SCAN — `= ?` implies NOT NULL so SQLite picks the
+  // partial index. This is the EXACT query `buildExplicitAttribHoist` prepares.
   const plan = db
     .query(
       `EXPLAIN QUERY PLAN
@@ -4417,15 +4434,15 @@ test("fn-717.1 idx_events_tool_attr still serves the file-attribution scan (EXPL
            FROM events
           WHERE hook_event = 'PostToolUse'
             AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-            AND json_extract(data, '$.tool_input.file_path') = ?`,
+            AND mutation_path = ?`,
     )
     .all("/repo/cold.ts") as { detail: string }[];
   const details = plan.map((r) => r.detail);
   const joined = details.join("\n");
-  // The index is named (a SEARCH/SEEK, not a full scan).
-  expect(joined).toContain("idx_events_tool_attr");
+  // The partial index is named (a SEARCH/SEEK, not a full scan).
+  expect(joined).toContain("idx_events_mutation_path");
   // No plan line is a bare full SCAN of the events table (a covered SEARCH
-  // line reads "SEARCH events USING ... idx_events_tool_attr").
+  // line reads "SEARCH events USING ... idx_events_mutation_path").
   expect(details.some((d) => /^SCAN events\b/.test(d.trim()))).toBe(false);
 });
 

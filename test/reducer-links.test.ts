@@ -18,6 +18,7 @@ import type { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { drain } from "../src/reducer";
 import type { Event } from "../src/types";
+import { deriveSeedMutationPath } from "./helpers/seed-mutation-path";
 import { freshMemDb } from "./helpers/template-db";
 
 let db: Database;
@@ -123,6 +124,19 @@ function insertEvent(
     // `tool_response.backgroundTaskId`). NULL on every other event;
     // monitors-projection tests pass this explicitly via overrides.
     background_task_id: overrides.background_task_id ?? null,
+    // Schema v73 / fn-836: promoted git-attribution column. Honor an EXPLICIT
+    // override; otherwise DERIVE it from `data` via the same pure deriver the
+    // live hook + ingester run, so a seeded mutation row carries `mutation_path`
+    // exactly as a production row does — the post-flip attribution scan reads
+    // the COLUMN, not the JSON body.
+    mutation_path:
+      "mutation_path" in overrides
+        ? (overrides.mutation_path ?? null)
+        : deriveSeedMutationPath(
+            overrides.hook_event,
+            overrides.tool_name ?? null,
+            overrides.data ?? "{}",
+          ),
   };
   db.run(
     `INSERT INTO events (
@@ -133,8 +147,8 @@ function insertEvent(
        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
        bash_mutation_kind, bash_mutation_targets, planctl_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
-       background_task_id
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       background_task_id, mutation_path
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
       row.session_id,
@@ -169,6 +183,7 @@ function insertEvent(
       row.backend_exec_session_id,
       row.backend_exec_pane_id,
       row.background_task_id,
+      row.mutation_path,
     ],
   );
   const { id } = db.query("SELECT last_insert_rowid() AS id").get() as {

@@ -28,6 +28,10 @@ import type {
   Verb,
 } from "./autopilot-worker";
 import {
+  backfillMutationPath,
+  isMutationPathBackfillComplete,
+} from "./backfill-mutation-path";
+import {
   appendBackstopRecord,
   BackstopCounters,
   type BackstopMessage,
@@ -231,6 +235,18 @@ export const EVENTS_INGEST_FALLBACK_INTERVAL_MS = 3_000;
  * space reclamation with no latency-sensitive consumer.
  */
 export const COMPACTION_INTERVAL_MS = 300_000;
+
+/**
+ * Cadence (ms) for the producer-side historical `mutation_path` backfill pass
+ * (fn-836.3). Runs on MAIN's writable connection, paced like compaction, so it
+ * fills the promoted git-attribution column over the historical mutation tail
+ * (inline + already-relocated `event_blobs` rows) across many passes without
+ * starving a concurrent hook INSERT. A crash-safe `meta` watermark resumes it,
+ * and once `isMutationPathBackfillComplete` holds the pass self-disables — a
+ * one-shot historical fill, not steady-state work. Same slack cadence as
+ * compaction: pure background catch-up with no latency-sensitive consumer.
+ */
+export const MUTATION_PATH_BACKFILL_INTERVAL_MS = 300_000;
 
 /**
  * Steady-state WAL checkpoint cadence (ms). The writer runs at the default
@@ -3306,6 +3322,80 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     runCompactionPass();
   }, COMPACTION_INTERVAL_MS);
 
+  // Producer-side historical `mutation_path` backfill pass (fn-836.3). Fills the
+  // promoted git-attribution column over the historical mutation tail the
+  // forward write path (hook deriver + ingester recompute) never touched —
+  // including the cold rows compaction already relocated into `event_blobs`
+  // (read via the guarded `COALESCE(events.data, event_blobs.data)` extract).
+  // Paced like compaction (≤500 rows/batch, ≤20 batches/pass, crash-safe `meta`
+  // watermark advanced in the SAME transaction as each batch's UPDATE), so the
+  // writer lock never starves a concurrent hook INSERT and a mid-pass crash
+  // resumes from the last committed batch. Runs ON THE MAIN THREAD against the
+  // writable connection. `events.mutation_path` is a content-preserving promoted
+  // column of the immutable event log, NOT a reducer projection — backfilling it
+  // touches no projection, so a from-scratch re-fold stays byte-identical (the
+  // fold reads the column's value, which equals what the old two-arm scan read
+  // off the body). Once complete the pass self-disables (one-shot historical
+  // fill); steady-state rows arrive already-stamped via the forward path.
+  let backfillDone = false;
+  function runMutationPathBackfillPass(): void {
+    if (shuttingDown || backfillDone) return;
+    let scanned = 0;
+    try {
+      const result = backfillMutationPath(db);
+      scanned = result.scanned;
+      if (scanned > 0) {
+        console.error(
+          `[keeperd] mutation_path backfill: filled ${scanned} row(s) in ${result.batches} batch(es) (watermark id<=${result.watermark}${result.moreLikely ? ", more remain" : ""})`,
+        );
+      }
+      // Self-disable once the historical tail is provably exhausted — the
+      // completion gate counts ONLY rows whose body still yields an unstamped
+      // file_path, so a legitimately-NULL row (malformed / no file_path) never
+      // keeps it running. After this the forward path keeps new rows stamped.
+      if (isMutationPathBackfillComplete(db)) {
+        backfillDone = true;
+        clearInterval(mutationPathBackfillTimer);
+        if (scanned > 0) {
+          console.error(
+            "[keeperd] mutation_path backfill: complete — git-attribution column fully populated, pass disabled",
+          );
+        }
+      }
+    } catch (err) {
+      // A backfill failure is pure catch-up loss, never a correctness issue (the
+      // column stays NULL on a rolled-back batch and the next pass retries; the
+      // git-attribution flip is gated on the completion predicate, not on this
+      // pass succeeding). Log non-fatally.
+      console.error(
+        `[keeperd] mutation_path backfill pass threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+      return;
+    }
+    // Reclaim WAL space OUTSIDE the per-batch transactions, only when a pass
+    // moved bytes — same PASSIVE-never-TRUNCATE rule as compaction.
+    if (scanned > 0) {
+      try {
+        db.run("PRAGMA wal_checkpoint(PASSIVE)");
+      } catch (err) {
+        console.error(
+          `[keeperd] mutation_path backfill PASSIVE checkpoint threw (non-fatal): ${
+            err instanceof Error ? err.message : String(err)
+          }`,
+        );
+      }
+    }
+  }
+
+  // Schedule the backfill on its own slack heartbeat. Stored so shutdown can
+  // `clearInterval` it (and so the self-disable on completion can clear it).
+  // Fires on the MAIN THREAD against the writable connection.
+  const mutationPathBackfillTimer = setInterval(() => {
+    runMutationPathBackfillPass();
+  }, MUTATION_PATH_BACKFILL_INTERVAL_MS);
+
   // Steady-state WAL checkpoint cadence, independent of compaction (whose PASSIVE
   // checkpoint only fires when it relocated bytes). Flushes the WAL back into the
   // main DB on cadence so serve/poll read latency stays bounded under a steady
@@ -3649,6 +3739,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     clearInterval(pendingDispatchSweepTimer);
     clearInterval(eventsIngestFallbackTimer);
     clearInterval(compactionTimer);
+    clearInterval(mutationPathBackfillTimer);
     clearInterval(walCheckpointTimer);
 
     // The workers actually spawned this boot (filter out the `null`s). Teardown
