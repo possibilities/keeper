@@ -219,6 +219,30 @@ test("isVendoredPlanctlPath: matches the plugins/plan/.planctl subtree, rejects 
   );
 });
 
+test("isVendoredPlanctlPath: also prunes the post-rename plugins/plan/.keeper subtree", () => {
+  // The daemon name-erasure renames the plan dir `.planctl` -> `.keeper`; the
+  // vendored subtree's dir moves with it. The prune must recognize BOTH so it
+  // survives the rename (fn-827/fn-828). Additive — the legacy match is intact.
+  expect(
+    isVendoredPlanctlPath(
+      "/home/u/code/keeper/plugins/plan/.keeper/epics/fn-1.json",
+    ),
+  ).toBe(true);
+  expect(
+    isVendoredPlanctlPath(
+      "/home/u/code/keeper/plugins/plan/.keeper/state/tasks/fn-1.2.state.json",
+    ),
+  ).toBe(true);
+  // The subtree's `.keeper` dir itself matches (boot-scan call site).
+  expect(
+    isVendoredPlanctlPath("/home/u/code/keeper/plugins/plan/.keeper"),
+  ).toBe(true);
+  // keeper's OWN root `.keeper` plan is NOT vendored — it must still fold.
+  expect(
+    isVendoredPlanctlPath("/home/u/code/keeper/.keeper/epics/fn-822.json"),
+  ).toBe(false);
+});
+
 test("onChange refuses to fold the vendored plugins/plan/.planctl subtree", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
@@ -2804,6 +2828,32 @@ function applyPlanctlCommitChanges(
   }
 }
 
+/**
+ * Mirror the live worker's inbound-message dispatch INCLUDING the name-tolerant
+ * type guard: a commit-changed message is folded iff its `type` is one of the
+ * accepted event-type names (legacy `planctl-commit-changed` or post-flip
+ * `plan-commit-changed`). Returns whether the message matched — so a test can
+ * assert an unaccepted name is NOT folded and a regression that drops a name
+ * from the handler's set is caught from the consumer side.
+ */
+function dispatchCommitChanged(
+  scanner: PlanScanner,
+  msg: {
+    type: string;
+    repo: string;
+    changes: { path: string; op: "upsert" | "delete" }[];
+  },
+): boolean {
+  if (
+    msg.type !== "planctl-commit-changed" &&
+    msg.type !== "plan-commit-changed"
+  ) {
+    return false;
+  }
+  applyPlanctlCommitChanges(scanner, msg.repo, msg.changes);
+  return true;
+}
+
 test("planctl-commit-changed: upsert batch ingests committed bytes via onChange", () => {
   gitInit(tmpDir);
 
@@ -2858,6 +2908,78 @@ test("planctl-commit-changed: upsert batch ingests committed bytes via onChange"
     { path: ".planctl/tasks/fn-1-demo.2.json", op: "upsert" },
   ]);
   expect(emitted.length).toBe(before);
+});
+
+test("plan-commit-changed: the post-flip event-type name folds identically to planctl-commit-changed", () => {
+  // Cascade-safety keystone: the daemon-internal consumer must fold the
+  // post-flip `plan-commit-changed` name identically to the legacy
+  // `planctl-commit-changed`, so the later producer flip lands with zero
+  // in-flight breakage. Drive the SAME scaffold through both names and assert
+  // identical emissions; assert an unrelated type is NOT folded.
+  gitInit(tmpDir);
+
+  writeEpic("fn-9-flip", { title: "Flip", primary_repo: tmpDir });
+  writeTask("fn-9-flip.1", { epic: "fn-9-flip", title: "t1" });
+  git(tmpDir, "add", "-A");
+  git(tmpDir, "commit", "-q", "-m", "scaffold");
+
+  const changes = [
+    { path: ".planctl/epics/fn-9-flip.json", op: "upsert" as const },
+    { path: ".planctl/tasks/fn-9-flip.1.json", op: "upsert" as const },
+  ];
+
+  // Legacy name.
+  const legacyEmitted: PlanMessage[] = [];
+  const legacyScanner = new PlanScanner(
+    (m) => legacyEmitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+  expect(
+    dispatchCommitChanged(legacyScanner, {
+      type: "planctl-commit-changed",
+      repo: tmpDir,
+      changes,
+    }),
+  ).toBe(true);
+
+  // Post-flip name — same fold.
+  const flipEmitted: PlanMessage[] = [];
+  const flipScanner = new PlanScanner(
+    (m) => flipEmitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+  expect(
+    dispatchCommitChanged(flipScanner, {
+      type: "plan-commit-changed",
+      repo: tmpDir,
+      changes,
+    }),
+  ).toBe(true);
+
+  expect(flipEmitted).toEqual(legacyEmitted);
+  expect(flipEmitted).toHaveLength(2);
+  expect(flipEmitted.map((m) => m.kind).sort()).toEqual([
+    "plan-epic",
+    "plan-task",
+  ]);
+
+  // An unrelated/unaccepted type is NOT folded (the handler's guard rejects it).
+  const strayEmitted: PlanMessage[] = [];
+  const strayScanner = new PlanScanner(
+    (m) => strayEmitted.push(m),
+    () => {},
+    isPathInHead,
+  );
+  expect(
+    dispatchCommitChanged(strayScanner, {
+      type: "something-else",
+      repo: tmpDir,
+      changes,
+    }),
+  ).toBe(false);
+  expect(strayEmitted).toHaveLength(0);
 });
 
 test("planctl-commit-changed: FSEvents-dropped scenario — commit batch alone drives correct ingest", () => {

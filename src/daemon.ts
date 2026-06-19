@@ -2406,15 +2406,22 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         handleBackstopMessage(msg);
         return;
       }
-      if (msg.kind === "planctl-commit-changed") {
-        // Authoritative commit-driven planctl ingest: the git-worker observed a
+      if (
+        msg.kind === "planctl-commit-changed" ||
+        msg.kind === "plan-commit-changed"
+      ) {
+        // Authoritative commit-driven plan ingest: the git-worker observed a
         // commit carrying changed `.planctl/**` paths; forward them to plan-worker
         // so it re-ingests each from the COMMITTED worktree bytes via its
-        // idempotent `onChange`/`onDelete`. NOT written to the event log — this
+        // idempotent `onChange`/`onDelete`. Name-tolerant on the kind (legacy
+        // `planctl-commit-changed` / post-flip `plan-commit-changed` fold
+        // identically; the producer flip is a later epic) and the forwarded
+        // `type` preserves the inbound name so the plan-worker's equally
+        // tolerant handler dispatches it. NOT written to the event log — this
         // channel drives a producer worker, not a projection. The `?.` is
         // null-safe for a git-only boot (no plan worker).
         planWorker?.postMessage({
-          type: "planctl-commit-changed",
+          type: msg.kind,
           repo: msg.project_dir,
           changes: msg.changes,
         } satisfies PlanctlCommitChangedMessage);

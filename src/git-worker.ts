@@ -232,7 +232,15 @@ export interface PlanctlChangedFile {
 }
 
 export interface PlanctlCommitChangedMessage {
-  kind: "planctl-commit-changed";
+  /**
+   * Name-tolerant during the daemon name-erasure: main folds BOTH the legacy
+   * `planctl-commit-changed` and the post-flip `plan-commit-changed` kinds
+   * identically. The git-worker producer still emits the legacy name (the flip
+   * is a later epic); accepting both at the consumer is the cascade-safety
+   * keystone. This is a worker-IPC TRIGGER, not minted projection data, so
+   * re-fold determinism is unaffected.
+   */
+  kind: "planctl-commit-changed" | "plan-commit-changed";
   project_dir: string;
   commit_oid: string;
   changes: PlanctlChangedFile[];

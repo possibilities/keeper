@@ -314,7 +314,15 @@ export interface PlanctlCommitChange {
  * stalling the rest, mirroring the live FSEvents path.
  */
 export interface PlanctlCommitChangedMessage {
-  type: "planctl-commit-changed";
+  /**
+   * Name-tolerant during the daemon name-erasure: the consumer folds BOTH the
+   * legacy `planctl-commit-changed` and the post-flip `plan-commit-changed`
+   * event-type names identically. No producer emits the new name yet (the flip
+   * is a later epic); accepting both here is the cascade-safety keystone so the
+   * producer can flip with zero in-flight breakage. This is a worker-IPC
+   * TRIGGER, not minted projection data, so re-fold determinism is unaffected.
+   */
+  type: "planctl-commit-changed" | "plan-commit-changed";
   repo: string;
   changes: PlanctlCommitChange[];
 }
@@ -375,29 +383,37 @@ const IGNORE_GLOBS = [
   "**/target/**",
   "**/.venv/**",
   // keeper vendors planctl as a `git subtree` under `plugins/plan/`, which
-  // carries planctl's OWN `.planctl/` dev plan. That nested tree is the
-  // vendored dependency's plan, NOT keeper-managed work — fold it and every
-  // planctl-dev epic pollutes keeper's `epics` projection. Excluded here so the
-  // live watcher never delivers it; {@link isVendoredPlanctlDir} is the
-  // boot-scan equivalent.
+  // carries planctl's OWN dev plan. That nested tree is the vendored
+  // dependency's plan, NOT keeper-managed work — fold it and every planctl-dev
+  // epic pollutes keeper's `epics` projection. Excluded here so the live watcher
+  // never delivers it; {@link isVendoredPlanctlPath} is the boot-scan / commit
+  // equivalent. Both the legacy `.planctl` and the post-rename `.keeper` segment
+  // are ignored so the prune survives the daemon name-erasure dir rename.
   "**/plugins/plan/.planctl/**",
+  "**/plugins/plan/.keeper/**",
   "**/*.tmp",
 ];
 
 /**
- * Is this `.planctl` dir the vendored planctl subtree's own dev plan? keeper
+ * Is this dir the vendored planctl subtree's own dev plan? keeper
  * co-hosts planctl via `git subtree add --prefix=plugins/plan`, so the subtree
- * brings planctl's `.planctl/` tree to `<repo>/plugins/plan/.planctl`. That is
+ * brings planctl's plan tree to `<repo>/plugins/plan/.planctl`. That is
  * the dependency's plan, not keeper's — folding it would inject every
  * planctl-dev epic into keeper's `epics` projection. Every ingest vector funnels
  * through here: the recursive boot {@link scanRoot}, the live FSEvents watcher,
- * and the authoritative `planctl-commit-changed` commit trigger (the subtree-add
+ * and the authoritative commit trigger (the subtree-add
  * commit itself touches 322 such paths). The one-level {@link discoverPlanctlDirs}
  * heartbeat path never reaches three levels deep, so it needs no guard. The
- * `**​/plugins/plan/.planctl/**` entry in {@link IGNORE_GLOBS} stops the live
+ * `**​/plugins/plan/.planctl/**` entries in {@link IGNORE_GLOBS} stop the live
  * watcher from even delivering these paths; this predicate is the correctness
  * gate for the other two vectors. Pure path arithmetic — matches any path that
- * contains a `plugins/plan/.planctl` segment run. Exported for unit reach.
+ * contains a `plugins/plan/<vendored-dir>` segment run.
+ *
+ * Name-tolerant on the vendored sub-dir: it matches BOTH the legacy `.planctl`
+ * and the post-rename `.keeper` segment, so the prune holds across the daemon
+ * name-erasure dir rename (fn-827/fn-828) — keeper's OWN plan dir gets renamed
+ * in the same arc, and the vendored subtree's dir moves with it. Additive: the
+ * legacy `.planctl` match is unchanged. Exported for unit reach.
  */
 export function isVendoredPlanctlPath(path: string): boolean {
   const segments = path.split(sep);
@@ -405,7 +421,7 @@ export function isVendoredPlanctlPath(path: string): boolean {
     if (
       segments[i] === "plugins" &&
       segments[i + 1] === "plan" &&
-      segments[i + 2] === ".planctl"
+      (segments[i + 2] === ".planctl" || segments[i + 2] === ".keeper")
     ) {
       return true;
     }
@@ -3152,11 +3168,17 @@ function main(): void {
       }
       return;
     }
-    if (msg.type === "planctl-commit-changed") {
-      // authoritative ingest trigger. The git-worker just observed
-      // a commit landing in `msg.repo` carrying changed `.planctl/**`
-      // paths; re-ingest each from the COMMITTED worktree bytes via the
-      // existing idempotent `onChange` / `onDelete` paths. Drop-proof
+    if (
+      msg.type === "planctl-commit-changed" ||
+      msg.type === "plan-commit-changed"
+    ) {
+      // authoritative ingest trigger. Name-tolerant: the legacy
+      // `planctl-commit-changed` and post-flip `plan-commit-changed` event-type
+      // names fold identically (the producer flip is a later epic). The
+      // git-worker just observed a commit landing in `msg.repo` carrying
+      // changed `.planctl/**` paths; re-ingest each from the COMMITTED worktree
+      // bytes via the existing idempotent `onChange` / `onDelete` paths.
+      // Drop-proof
       // (independent of the broad `~/code` FSEvents subscription) and
       // free of the mid-write partial-read race (planctl commits
       // atomically). Duplicate fires from a live FSEvent are no-ops via
