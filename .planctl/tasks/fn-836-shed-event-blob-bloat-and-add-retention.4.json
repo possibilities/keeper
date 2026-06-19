@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "max",
   "title": "Offline shed event_blobs and reclaim disk",
-  "updated_at": "2026-06-19T21:37:41.114000Z"
+  "updated_at": "2026-06-19T23:51:47.401000Z",
+  "worker_done_at": "2026-06-19T23:51:47.401000Z"
 }

@@ -73,5 +73,5 @@ the table gone. quick_check on a vacuumed fixture.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Shed event_blobs at v74: restore keep-set bodies inline + DROP at the migration tail (unconditional, defeating v57-ladder resurrection); shed-class mutation bodies stay NULL with file_path in mutation_path. Removed all dead COALESCE arms (drain, subagent bridges, search-history, mutation_path backfill) — they read events.data inline now. Added reclaimDb/reclaimInstructions for the offline VACUUM-INTO physical reclaim with auto_vacuum=INCREMENTAL baked. Rewrote the re-fold harness to prove byte-identical projections over a shed corpus; test:full green.
 ## Evidence
