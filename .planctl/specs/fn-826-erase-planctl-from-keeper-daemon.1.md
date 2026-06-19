@@ -30,5 +30,5 @@ Widen the `file_attributions` CHECK to `source IN ('tool','bash','inferred','pla
 - [ ] SCHEMA_VERSION + api.py same commit; `bun run test:full` green
 
 ## Done summary
-
+Widened file_attributions.source CHECK to accept 'plan' alongside 'planctl' (v72 row-preserving table rebuild, no rewind) and taught the reducer's envelope readers (extractPlanctlInvocation + extractPlanctlStateRepo) to prefer plan_invocation, falling back to planctl_invocation. Minting unchanged (source='planctl'), re-fold byte-identical.
 ## Evidence
