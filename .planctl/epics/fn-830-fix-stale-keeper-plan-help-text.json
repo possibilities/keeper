@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-19T00:47:17.218000Z",
   "created_at": "2026-06-18T18:08:20.431000Z",
   "created_by_close_of": "fn-824-native-fold-keeper-plan-in-process",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix stale keeper plan help text",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-18T18:08:20.431000Z"
+  "updated_at": "2026-06-19T00:47:17.218000Z"
 }
