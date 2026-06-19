@@ -221,10 +221,15 @@ export function workable(v: Verdict): boolean {
  * SELF-RESOLVES (the `pending_dispatches` row discharges on the worker's
  * SessionStart bind, or on DispatchFailed / DispatchExpired), so it is
  * plain `waiting`, never `stuck`. No human action is required.
+ *
+ * `runtime-blocked` fires when planctl stamped the task `runtime_status="blocked"`
+ * (e.g. a killed worker). It does NOT self-resolve — the human (or a manual
+ * replay) has to clear the blocked flag — so it is terminal-blocker semantics.
  */
 const STUCK_REASON_KINDS: ReadonlySet<BlockReason["kind"]> = new Set([
   "job-rejected",
   "dep-on-epic-dangling",
+  "runtime-blocked",
 ]);
 
 function isStuck(v: Verdict): boolean {

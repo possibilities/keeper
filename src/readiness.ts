@@ -23,6 +23,9 @@
  *   9.5. epic-no-tasks            — close-row only: the epic has ZERO tasks
  *  10.   dep-on-task-synth-close  — close-row: any non-completed task
  *  10.5. dispatch-pending         — launched-but-unbound worker holds the slot
+ *  10.6. runtime-blocked          — task: planctl `runtime_status==="blocked"`
+ *                                   (last per-row predicate; converts only the
+ *                                   erroneous `ready`, never holds a mutex)
  *  11.   single-task-per-epic     — post-pass: one non-completed slot per epic
  *  12.   single-task-per-root     — post-pass: one non-completed slot per root
  *
@@ -122,6 +125,14 @@ export function resolveEpicDep(
  *                                        it occupies both mutexes via `isLiveWorkOccupant`.
  *                                        Non-dispatchable and self-resolving (discharges on SessionStart
  *                                        bind / DispatchFailed / DispatchExpired). Payload-less.
+ * - `runtime-blocked`                  — planctl stamped the task `runtime_status="blocked"` (e.g. a
+ *                                        killed worker). Without this gate the task still computes `ready`
+ *                                        (its `worker_phase` stays `open`) and the reconciler dispatches a
+ *                                        worker that can't progress. The LAST per-row predicate, after
+ *                                        terminal-completed/running/dispatch-pending, so it converts ONLY
+ *                                        the erroneous `ready` and never masks a truer verdict or releases
+ *                                        a live worker's mutex. NOT a `isLiveWorkOccupant` member — a stuck
+ *                                        task must not hold the per-task/root mutex. Payload-less.
  * - `unknown`                          — defensive default for verdict/renderer mismatch.
  */
 export type BlockReason =
@@ -138,6 +149,7 @@ export type BlockReason =
   | { kind: "single-task-per-root" }
   | { kind: "epic-no-tasks" }
   | { kind: "dispatch-pending" }
+  | { kind: "runtime-blocked" }
   | { kind: "unknown" };
 
 /**
@@ -680,6 +692,20 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "dispatch-pending" } };
   }
 
+  // 10.6. runtime-blocked — planctl stamped `runtime_status="blocked"` (e.g. a
+  // killed worker). Placed LAST, immediately before the `ready` fall-through, is
+  // load-bearing: terminal-completed (1), every running verdict (3/5/6/6.6), and
+  // dispatch-pending (10.5) still WIN above, so a `worker_phase="done"` task
+  // still completes/reaps despite a stale blocked flag, a live worker's mutex is
+  // not released, and a just-launched worker is not raced. This converts ONLY
+  // the erroneous `ready`. `runtime_status` defaults `"todo"` and is never null,
+  // so `=== "blocked"` is total and cannot throw; ONLY literal `"blocked"` is
+  // nondispatchable (`todo`/`in_progress` fall through). `isLiveWorkOccupant`
+  // excludes this kind, so a stuck task does NOT hold the per-task/root mutex.
+  if (task.runtime_status === "blocked") {
+    return { tag: "blocked", reason: { kind: "runtime-blocked" } };
+  }
+
   // 11. single-task-per-epic — deferred to applySingleTaskPerEpicMutex.
   // 12. single-task-per-root — deferred to applySingleTaskPerRootMutex.
 
@@ -1023,8 +1049,11 @@ export function applySingleTaskPerRootMutex(
   // sibling, pass-2b lets ineligible rows take the leftovers. The discriminator
   // is `!== undefined`, NEVER `.size === 0` — an empty set means "armed but
   // nothing armed" and must suppress every TASK row, not fall back to yolo.
-  // Close rows are eligibility-BLIND (mode-exempt) so a finalizer is never
-  // starved; pass-1 physical occupancy is untouched.
+  // In armed mode a `ready` close row's root-claim is gated on eligibility (it
+  // mirrors the launcher's close gate so an ineligible closer can't starve an
+  // eligible same-root task); an in-flight closer is preserved by pass-1's
+  // eligibility-blind occupancy claim. Yolo (`undefined`) keeps close rows
+  // eligibility-blind.
   eligibleEpicIds?: Set<string>,
 ): void {
   // Seed the root-fallback occupants first — a pending dispatch with no
@@ -1098,14 +1127,38 @@ export function applySingleTaskPerRootMutex(
   };
 
   // Settle the synthetic CLOSE row against `occupiedRoots`. Close uses the
-  // epic's project_dir directly (no per-row `target_repo`) and is
-  // eligibility-BLIND — a finalizer is never starved by the mutex layer.
+  // epic's project_dir directly (no per-row `target_repo`).
+  //
+  // Armed-mode eligibility gate (`eligibleEpicIds !== undefined`): a `ready`
+  // close row may CLAIM a free root only if its epic is in the eligible closure.
+  // This mirrors the launcher's close-dispatch gate
+  // (`autopilot-worker.ts:1000-1007`: `armedMode && !eligible.has(epicId) &&
+  // !isEpicInFlight(...)`) so the mutex never reserves a root for a closer the
+  // launcher will REFUSE to launch — the bug being fixed, where an ineligible
+  // unarmed close row claimed a shared root and starved an eligible same-root
+  // armed task to `single-task-per-root`.
+  //
+  // The launcher's "OR in-flight" disjunct needs no mirror HERE: an in-flight
+  // closer (live close job, or launched-but-unbound) renders `running:*` /
+  // `blocked:dispatch-pending`, NOT `ready`, and is claimed by PASS-1's
+  // eligibility-blind `isRootOccupant` path — so the disarmed-mid-flight closer
+  // is preserved. A `ready` close verdict provably means no in-flight closer
+  // (predicates 5/6/6.6/10.5 all fell through), so eligibility alone decides.
+  //
+  // YOLO (`eligibleEpicIds === undefined`) stays mode-EXEMPT — the close row is
+  // eligibility-blind and a finalizer is never starved (yolo launches closers).
   const settleCloseRow = (epic: Epic, projectDir: string | null): void => {
     const closeVerdict = perCloseRow.get(epic.epic_id);
     if (closeVerdict === undefined || closeVerdict.tag !== "ready") {
       return;
     }
     const root = effectiveRoot(null, projectDir);
+    // Armed mode: an ineligible close row neither claims the root nor demotes —
+    // it leaves the root free for an eligible same-root task and is itself left
+    // `ready` (the launcher's close gate suppresses the actual launch).
+    if (eligibleEpicIds !== undefined && !eligibleEpicIds.has(epic.epic_id)) {
+      return;
+    }
     if (!occupiedRoots.has(root)) {
       occupiedRoots.add(root);
     } else {
@@ -1134,9 +1187,12 @@ export function applySingleTaskPerRootMutex(
   // becomes eligibility-aware, so an eligible task never preempts a live worker.
   //
   // Pass-2a (priority): for each ELIGIBLE epic, settle its ready TASK rows so
-  // they claim free roots before any ineligible sibling. ALWAYS settle the
-  // ready CLOSE row (mode-exempt) — a finalizer beats a same-root eligible task
-  // only when it sorts first, never loses to mode.
+  // they claim free roots before any ineligible sibling. Settle every ready
+  // CLOSE row too, but `settleCloseRow` gates the root-claim on eligibility (an
+  // ineligible close row neither claims nor demotes — mirroring the launcher's
+  // close-dispatch gate so it can't starve an eligible same-root task). An
+  // eligible epic's own closer still beats its same-root eligible task when it
+  // sorts first.
   for (const epic of epicsArr) {
     const projectDir = stringOrNull(epic.project_dir);
     if (eligibleEpicIds.has(epic.epic_id)) {
@@ -1735,6 +1791,8 @@ function formatReasonShort(reason: BlockReason): string {
       return "epic-no-tasks";
     case "dispatch-pending":
       return "dispatch-pending";
+    case "runtime-blocked":
+      return "runtime-blocked";
     case "unknown":
       return "unknown";
     default: {

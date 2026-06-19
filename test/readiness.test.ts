@@ -886,6 +886,128 @@ test("fn-779 predicate 9: forward-reference order (consumer BEFORE live upstream
 });
 
 // ---------------------------------------------------------------------------
+// fn-835 (a): runtime_status="blocked" is never dispatched
+// ---------------------------------------------------------------------------
+//
+// `computeReadiness` now consults planctl `runtime_status` as the LAST per-row
+// predicate (rank 10.6): a `runtime_status="blocked"` task converts from the
+// erroneous `ready` to `blocked:runtime-blocked`. Placed last so terminal-
+// completed / running / dispatch-pending still WIN — a done-but-stale-blocked
+// task still completes, a live worker's mutex is not released, a just-launched
+// worker is not raced. Only literal `"blocked"` is nondispatchable.
+
+test("fn-835 (a): runtime_status='blocked' + worker_phase='open' → blocked:runtime-blocked (not dispatched)", () => {
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "open",
+    runtime_status: "blocked",
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "runtime-blocked" }),
+  );
+});
+
+test("fn-835 (a): runtime_status='blocked' does NOT hold the per-root mutex (occupancy unaffected, sibling on same root stays ready)", () => {
+  // A blocked task in fn-1 must not occupy `/repo`; a ready task in fn-2 on the
+  // same root still dispatches. `isLiveWorkOccupant` excludes runtime-blocked.
+  const blockedTask = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    runtime_status: "blocked",
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    tasks: [blockedTask],
+  });
+  const readyTask = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [readyTask],
+  });
+  const snap = run([epic1, epic2]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "runtime-blocked" }),
+  );
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+  expect(isRootOccupant(blocked({ kind: "runtime-blocked" }))).toBe(false);
+});
+
+test("fn-835 (a): worker_phase='done' BEATS a stale runtime_status='blocked' → terminal-completed (gate is last)", () => {
+  // A done task with an idle session terminal-completes (predicate 1) despite a
+  // stale blocked flag — runtime-blocked is ranked AFTER terminal-completed, so
+  // it converts ONLY the erroneous `ready`, never masking the truer verdict.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    runtime_status: "blocked",
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "completed" });
+});
+
+test("fn-835 (a): a live worker (worker_phase='done' + working job) BEATS a stale runtime_status='blocked' → running (mutex not released)", () => {
+  // A still-working embedded job holds the task at running:job-running
+  // (predicate 5) even with a stale blocked flag — the runtime-blocked gate
+  // never releases a live worker's mutex.
+  const task = makeTask({
+    task_id: "fn-1-foo.1",
+    worker_phase: "done",
+    runtime_status: "blocked",
+    jobs: [makeEmbeddedJob({ job_id: "worker-1", state: "working" })],
+  });
+  const epic = makeEpic({ tasks: [task] });
+  const snap = run([epic]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    running({ kind: "job-running" }),
+  );
+});
+
+test("fn-835 (a): runtime_status='in_progress'/'todo' are dispatchable (only literal 'blocked' is gated)", () => {
+  const todoTask = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    runtime_status: "todo",
+  });
+  const inProgressTask = makeTask({
+    task_id: "fn-2-bar.1",
+    epic_id: "fn-2-bar",
+    runtime_status: "in_progress",
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo-a",
+    tasks: [todoTask],
+  });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo-b",
+    tasks: [inProgressTask],
+  });
+  const snap = run([epic1, epic2]);
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+  expect(snap.perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
+});
+
+test("fn-835 (a): formatPill renders [blocked:runtime-blocked]", () => {
+  expect(formatPill(blocked({ kind: "runtime-blocked" }))).toBe(
+    "[blocked:runtime-blocked]",
+  );
+});
+
+// ---------------------------------------------------------------------------
 // fn-770: armed-aware per-root mutex (eligible-priority pass-2)
 // ---------------------------------------------------------------------------
 //
@@ -893,9 +1015,12 @@ test("fn-779 predicate 9: forward-reference order (consumer BEFORE live upstream
 // eligibility-aware: when `computeReadiness` (or `applySingleTaskPerRootMutex`
 // directly) is handed an `eligibleEpicIds` Set, an ELIGIBLE epic's ready task
 // claims a free root BEFORE any earlier-sorted INELIGIBLE sibling can. ABSENT
-// (`undefined`) the legacy single-pass holds (yolo byte-identical). Close rows
-// stay eligibility-blind (always-eligible / mode-exempt). Pass-1 physical
-// occupancy is never eligibility-conditional.
+// (`undefined`) the legacy single-pass holds (yolo byte-identical). In armed
+// mode a ready close row's root-claim is gated on eligibility too (fn-835 (c) —
+// mirroring the launcher's close gate so an ineligible closer can't starve an
+// eligible same-root task); yolo keeps close rows eligibility-blind. Pass-1
+// physical occupancy (an in-flight closer / live worker) is never
+// eligibility-conditional.
 
 // Thread an explicit eligible set through `computeReadiness` (yolo passes
 // `undefined`, armed passes a Set). All the prior `pendingDispatches`-default
@@ -1095,13 +1220,16 @@ test("fn-770 (g): ineligible `fallbackRoots` entry demotes an eligible sibling",
   );
 });
 
-test("fn-770 (h): ready close row on a free root wins via pass-2a even when its epic is unarmed", () => {
-  // The close row is mode-exempt (always-eligible): pass-2a settles it
-  // regardless of `eligibleEpicIds.has(epic_id)`. Here fn-1 is UNARMED and done
-  // with a ready close row on `/repo`; an eligible fn-2 ready TASK shares the
-  // root. Iteration order settles fn-1's close FIRST (pass-2a walks epics in
-  // order, close-row settled per-epic), claiming `/repo`; fn-2's task is then
-  // demoted. The close is never starved by an eligible task.
+test("fn-835 (c): armed mode — an INELIGIBLE ready close row does NOT claim the root, eligible same-root task dispatches", () => {
+  // THE BUG-2 REPRO (fn-830 done-but-open close row + fn-832 armed task, shared
+  // keeper root). fn-1 is UNARMED and done with a ready close row on `/repo`; an
+  // eligible fn-2 ready TASK shares the root. Pre-fix, pass-2a settled fn-1's
+  // close eligibility-BLIND, claiming `/repo` and demoting fn-2 to
+  // `single-task-per-root` — while the launcher SUPPRESSED the unarmed close
+  // launch. Net: armed mode dispatched nothing. Post-fix, `settleCloseRow` gates
+  // the root-claim on eligibility (mirroring the launcher's close gate): the
+  // ineligible close neither claims nor demotes, leaving `/repo` free for the
+  // eligible fn-2 task.
   const closeTask = makeTask({
     task_id: "fn-1-foo.1",
     epic_id: "fn-1-foo",
@@ -1143,8 +1271,99 @@ test("fn-770 (h): ready close row on a free root wins via pass-2a even when its 
     new Set(),
     new Set(["fn-2-bar"]),
   );
-  // fn-1's close row claimed `/repo` in pass-2a (mode-exempt); fn-2's task
-  // demoted in pass-2a (eligible-task walk after the close settle).
+  // The ineligible close left `/repo` free → eligible fn-2 task claims it and
+  // stays ready. The close row neither claimed nor demoted (still ready; the
+  // launcher's own close gate suppresses its launch).
+  expect(perTask.get(t2.task_id)).toEqual({ tag: "ready" });
+  expect(perCloseRow.get("fn-1-foo")).toEqual({ tag: "ready" });
+});
+
+test("fn-835 (c): armed mode — an ELIGIBLE epic's ready close row STILL claims the root (eligible close not starved)", () => {
+  // Eligibility gate is eligible-OR-in-flight; here fn-1 is ELIGIBLE so its
+  // ready close row claims `/repo` in pass-2a, demoting the same-root eligible
+  // fn-2 task — the close finalizer beats the task when it sorts first and the
+  // epic is in the closure.
+  const closeTask = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    status: "open",
+    tasks: [closeTask],
+  });
+  const t2 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  const perTask = new Map<string, Verdict>([
+    [closeTask.task_id, { tag: "completed" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", { tag: "ready" }],
+    ["fn-2-bar", blocked({ kind: "dep-on-task", upstream: "fn-2-bar.1" })],
+  ]);
+  applySingleTaskPerRootMutex(
+    [epic1, epic2],
+    perTask,
+    perCloseRow,
+    new Map(),
+    new Set(),
+    new Set(["fn-1-foo", "fn-2-bar"]),
+  );
+  expect(perCloseRow.get("fn-1-foo")).toEqual({ tag: "ready" });
+  expect(perTask.get(t2.task_id)).toEqual(
+    blocked({ kind: "single-task-per-root" }),
+  );
+});
+
+test("fn-835 (c): YOLO — a ready close row STILL claims the root (mode-exempt, no eligibility gate)", () => {
+  // `eligibleEpicIds === undefined` (yolo) keeps the legacy single-pass: the
+  // close row is eligibility-blind and claims `/repo` regardless, demoting the
+  // same-root task. yolo launches closers, so no starvation. Regression guard
+  // against the eligibility gate leaking into yolo.
+  const closeTask = makeTask({
+    task_id: "fn-1-foo.1",
+    epic_id: "fn-1-foo",
+    worker_phase: "done",
+    runtime_status: "done",
+  });
+  const epic1 = makeEpic({
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    sort_path: "000001",
+    project_dir: "/repo",
+    status: "open",
+    tasks: [closeTask],
+  });
+  const t2 = makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar" });
+  const epic2 = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    sort_path: "000002",
+    project_dir: "/repo",
+    tasks: [t2],
+  });
+  const perTask = new Map<string, Verdict>([
+    [closeTask.task_id, { tag: "completed" }],
+    [t2.task_id, { tag: "ready" }],
+  ]);
+  const perCloseRow = new Map<string, Verdict>([
+    ["fn-1-foo", { tag: "ready" }],
+    ["fn-2-bar", blocked({ kind: "dep-on-task", upstream: "fn-2-bar.1" })],
+  ]);
+  // No trailing eligible arg → yolo single-pass.
+  applySingleTaskPerRootMutex([epic1, epic2], perTask, perCloseRow);
   expect(perCloseRow.get("fn-1-foo")).toEqual({ tag: "ready" });
   expect(perTask.get(t2.task_id)).toEqual(
     blocked({ kind: "single-task-per-root" }),
