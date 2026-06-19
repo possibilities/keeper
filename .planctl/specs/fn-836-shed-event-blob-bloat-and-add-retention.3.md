@@ -58,5 +58,5 @@ harness MUST be byte-identical (this is the determinism gate for the flip). Poll
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Backfilled events.mutation_path over all historical mutation rows (paced, crash-safe-resumable, COALESCE both inline + relocated event_blobs bodies) and flipped the git-attribution scan onto the mutation_path column, deleting ARM B (the event_blobs rowid-join). The .1 differential re-fold harness stays byte-identical; full tier green.
 ## Evidence
