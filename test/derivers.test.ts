@@ -317,6 +317,41 @@ test("extractPlanctlInvocation returns null when stdout exceeds the length cap",
   ).toBeNull();
 });
 
+test("extractPlanctlInvocation reads the renamed plan_invocation key identically to planctl_invocation", () => {
+  // The tolerant fold: a `plan_invocation` envelope (the renamed key) must
+  // extract byte-for-byte the same shape as the legacy `planctl_invocation`.
+  const envelope = { op: "epic-create", target: "fn-1-foo", subject: "x" };
+  const legacy = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    post(envelope),
+  );
+  const renamed = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    postRaw(JSON.stringify({ plan_invocation: envelope })),
+  );
+  expect(legacy).not.toBeNull();
+  expect(renamed).toEqual(legacy);
+});
+
+test("extractPlanctlInvocation prefers plan_invocation when both keys are present (no double-read)", () => {
+  // A single event carrying BOTH keys must resolve to the `plan_invocation`
+  // envelope (never merge / never the legacy one), so it folds exactly once.
+  const got = extractPlanctlInvocation(
+    "PostToolUse",
+    "Bash",
+    postRaw(
+      JSON.stringify({
+        plan_invocation: { op: "wins", target: "fn-1-foo" },
+        planctl_invocation: { op: "loses", target: "fn-2-bar" },
+      }),
+    ),
+  );
+  expect(got?.op).toBe("wins");
+  expect(got?.epic_id).toBe("fn-1-foo");
+});
+
 test("extractPlanctlInvocation parses epic-create envelope with epic ref", () => {
   const got = extractPlanctlInvocation(
     "PostToolUse",

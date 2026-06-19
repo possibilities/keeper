@@ -387,7 +387,8 @@ const PLANCTL_FILES_CAP = 500;
  * Extract a planctl-CLI invocation envelope from a `PostToolUse:Bash`'s
  * `data.tool_response.stdout`. Gated EXACTLY on `(PostToolUse, Bash)`
  * (`PostToolUseFailure` has no `tool_response` and must not match); the buffer
- * must parse as JSON carrying a top-level `planctl_invocation` key.
+ * must parse as JSON carrying a top-level `plan_invocation` (preferred) or
+ * legacy `planctl_invocation` envelope key.
  *
  * The envelope is the AUTHORITATIVE mutation sentinel — planctl writes it on
  * every mutating call and no other, regardless of how it was invoked.
@@ -439,7 +440,11 @@ export function extractPlanctlInvocation(
   if (typeof parsed !== "object" || parsed === null) {
     return null;
   }
-  const envelope = (parsed as Record<string, unknown>).planctl_invocation;
+  // Tolerate BOTH envelope keys: the renamed `plan_invocation` wins when present,
+  // else fall back to the legacy `planctl_invocation`. Preferring one (never
+  // merging) guarantees a single event with both keys folds exactly once.
+  const parsedObj = parsed as Record<string, unknown>;
+  const envelope = parsedObj.plan_invocation ?? parsedObj.planctl_invocation;
   if (typeof envelope !== "object" || envelope === null) {
     return null;
   }

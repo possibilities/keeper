@@ -281,6 +281,14 @@ from pathlib import Path
 # windows in original visual order without reading restore.json. keeper-py reads
 # no ``window_index`` column (the TUI subscribes over the socket), so no reader
 # logic changes — only the version whitelist gains 71.
+#
+# v72 (fn-826 task .1) widens the ``file_attributions.source`` CHECK to accept the
+# renamed ``'plan'`` alongside legacy ``'planctl'`` (a row-preserving TABLE REBUILD;
+# no row's ``source`` changes, no cursor rewind, re-fold byte-identical). The
+# cascade-safety keystone: the fold now tolerates both names so a later producer
+# flip to ``source='plan'`` can't be rejected once the daemon is bounced. keeper-py
+# reads no ``file_attributions`` rows (the TUI subscribes over the socket), so no
+# reader logic changes — only the version whitelist gains 72.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -324,6 +332,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         69,
         70,
         71,
+        72,
     }
 )
 

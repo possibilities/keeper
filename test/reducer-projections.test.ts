@@ -313,19 +313,26 @@ function planctlEvent(args: {
   // shape and the mint becomes a no-op for them.
   files?: string[];
   stateRepo?: string;
+  // fn-826: inline the envelope under the renamed `plan_invocation` key instead
+  // of legacy `planctl_invocation`, to prove the tolerant fold mints identically
+  // off either key. Defaults `false` (legacy key) so existing tests are unchanged.
+  useRenamedKey?: boolean;
   ts?: number;
 }): number {
   // When mint-test args (`files` + `stateRepo`) are passed, also inline the
-  // canonical envelope `{tool_response:{stdout:JSON({planctl_invocation:
-  // {state_repo, files, op, target, ...}})}}` into `data` so the reducer's
-  // `extractPlanctlStateRepo` can lift `state_repo` at fold time. Existing
-  // tests pass neither and get the default empty `data: '{}'` (mint no-ops).
+  // canonical envelope `{tool_response:{stdout:JSON({plan_invocation OR
+  // planctl_invocation: {state_repo, files, op, target, ...}})}}` into `data` so
+  // the reducer's `extractPlanctlStateRepo` can lift `state_repo` at fold time.
+  // Existing tests pass neither and get the default empty `data: '{}'` (mint no-ops).
+  const envelopeKey = args.useRenamedKey
+    ? "plan_invocation"
+    : "planctl_invocation";
   const data =
     args.files != null && args.stateRepo != null
       ? JSON.stringify({
           tool_response: {
             stdout: JSON.stringify({
-              planctl_invocation: {
+              [envelopeKey]: {
                 op: args.op,
                 target: args.target,
                 state_repo: args.stateRepo,
@@ -2257,6 +2264,51 @@ test("planctl mint: scaffold envelope mints source='planctl' file_attributions f
     ".planctl/meta.json",
     ".planctl/specs/fn-1-foo.md",
     ".planctl/tasks/fn-1-foo.1.json",
+  ]);
+});
+
+test("plan mint (fn-826): plan_invocation envelope mints source='planctl' rows identically — minting unchanged", () => {
+  // The tolerant fold's cascade keystone: an envelope inlined under the RENAMED
+  // `plan_invocation` key must mint the SAME `source='planctl'` file_attributions
+  // rows as the legacy `planctl_invocation` key. Minting is deliberately
+  // UNCHANGED (still 'planctl') so a from-scratch re-fold stays byte-identical.
+  insertEvent({ hook_event: "SessionStart", session_id: "sess-mint-renamed" });
+  const eventId = planctlEvent({
+    sessionId: "sess-mint-renamed",
+    op: "scaffold",
+    target: "fn-2-bar",
+    epicId: "fn-2-bar",
+    subjectPresent: true,
+    stateRepo: "/repo-mint-renamed",
+    useRenamedKey: true,
+    files: [".planctl/epics/fn-2-bar.json", ".planctl/meta.json"],
+    ts: 777,
+  });
+  drainAll();
+  const rows = db
+    .query(
+      `SELECT file_path, source, op, last_mutation_at, last_event_id
+         FROM file_attributions
+        WHERE project_dir = ? AND session_id = ?
+        ORDER BY file_path`,
+    )
+    .all("/repo-mint-renamed", "sess-mint-renamed") as Array<{
+    file_path: string;
+    source: string;
+    op: string;
+    last_mutation_at: number;
+    last_event_id: number;
+  }>;
+  expect(rows.length).toBe(2);
+  for (const r of rows) {
+    expect(r.source).toBe("planctl");
+    expect(r.op).toBe("scaffold");
+    expect(r.last_mutation_at).toBe(777);
+    expect(r.last_event_id).toBe(eventId);
+  }
+  expect(rows.map((r) => r.file_path)).toEqual([
+    ".planctl/epics/fn-2-bar.json",
+    ".planctl/meta.json",
   ]);
 });
 

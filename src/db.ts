@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 71;
+export const SCHEMA_VERSION = 72;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1031,7 +1031,7 @@ CREATE TABLE IF NOT EXISTS file_attributions (
     last_mutation_at REAL NOT NULL,
     last_commit_at REAL,
     op TEXT NOT NULL,
-    source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','planctl')),
+    source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','planctl','plan')),
     last_event_id INTEGER,
     updated_at REAL NOT NULL DEFAULT 0,
     worktree_oid TEXT,
@@ -3515,6 +3515,60 @@ function migrate(db: Database): void {
       // or every keeper-py read fails host-wide; test/schema-version.test.ts
       // enforces this).
       addColumnIfMissing(db, "jobs", "window_index", "INTEGER");
+
+      // v71→v72: widen the `file_attributions.source` CHECK to accept the
+      // renamed `'plan'` alongside legacy `'planctl'` — the cascade-safety
+      // keystone so a producer flip to `source='plan'` can't be rejected by an
+      // old CHECK once the daemon is bounced onto this fold. SQLite can't ALTER a
+      // CHECK, so rebuild the table with a byte-faithful row copy (ORDER BY rowid
+      // for stable physical order), drop-old + rename, re-create the indexes.
+      // PURELY ADDITIVE: minting still writes `source='planctl'`, no row's
+      // `source` changes, and there is NO cursor rewind — a from-scratch re-fold
+      // reproduces byte-identical rows. Version-guarded so the rebuild runs once.
+      // Whitelist-only Python read (this bump MUST add 72 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
+      // every keeper-py read fails host-wide; test/schema-version.test.ts
+      // enforces this).
+      if (preMigrateStoredVersion < 72) {
+        // Drop any leftover temp table from an interrupted prior attempt.
+        db.run("DROP TABLE IF EXISTS file_attributions_v72_tmp");
+        db.run(`
+        CREATE TABLE file_attributions_v72_tmp (
+            project_dir TEXT NOT NULL,
+            session_id TEXT NOT NULL,
+            file_path TEXT NOT NULL,
+            last_mutation_at REAL NOT NULL,
+            last_commit_at REAL,
+            op TEXT NOT NULL,
+            source TEXT NOT NULL CHECK(source IN ('tool','bash','inferred','planctl','plan')),
+            last_event_id INTEGER,
+            updated_at REAL NOT NULL DEFAULT 0,
+            worktree_oid TEXT,
+            worktree_mode TEXT,
+            PRIMARY KEY (project_dir, session_id, file_path)
+        )
+      `);
+        // Byte-faithful copy, ORDER BY rowid for stable physical order.
+        db.run(`
+        INSERT INTO file_attributions_v72_tmp
+            (project_dir, session_id, file_path, last_mutation_at,
+             last_commit_at, op, source, last_event_id, updated_at,
+             worktree_oid, worktree_mode)
+          SELECT project_dir, session_id, file_path, last_mutation_at,
+                 last_commit_at, op, source, last_event_id, updated_at,
+                 worktree_oid, worktree_mode
+            FROM file_attributions
+        ORDER BY rowid
+      `);
+        db.run("DROP TABLE file_attributions");
+        db.run(
+          "ALTER TABLE file_attributions_v72_tmp RENAME TO file_attributions",
+        );
+        // Re-create the indexes (SQLite drops them with their base table).
+        for (const sql of CREATE_FILE_ATTRIBUTIONS_INDEXES) {
+          db.run(sql);
+        }
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

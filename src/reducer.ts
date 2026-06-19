@@ -5147,8 +5147,9 @@ function extractPlanctlStateRepo(event: Event): string | null {
     return null;
   }
   // Two equivalent envelope shapes: (1) the canonical PostToolUse:Bash hook
-  // payload `{tool_response:{stdout:"{...planctl_invocation...}"}}`, and (2) a
-  // top-level inlined `planctl_invocation` (synthetic / test events).
+  // payload `{tool_response:{stdout:"{...plan_invocation...}"}}`, and (2) a
+  // top-level inlined envelope (synthetic / test events). BOTH the renamed
+  // `plan_invocation` (preferred) and legacy `planctl_invocation` keys are read.
   const obj = parsed as Record<string, unknown>;
   // Path 1: hook payload — dive through tool_response.stdout.
   const toolResponse = obj.tool_response;
@@ -5166,7 +5167,8 @@ function extractPlanctlStateRepo(event: Event): string | null {
         inner = null;
       }
       if (typeof inner === "object" && inner !== null) {
-        const env = (inner as Record<string, unknown>).planctl_invocation;
+        const innerObj = inner as Record<string, unknown>;
+        const env = innerObj.plan_invocation ?? innerObj.planctl_invocation;
         if (typeof env === "object" && env !== null) {
           const sr = (env as Record<string, unknown>).state_repo;
           if (typeof sr === "string" && sr.length > 0) {
@@ -5177,7 +5179,7 @@ function extractPlanctlStateRepo(event: Event): string | null {
     }
   }
   // Path 2: top-level inlined envelope (synthetic / test shape).
-  const topLevelEnv = obj.planctl_invocation;
+  const topLevelEnv = obj.plan_invocation ?? obj.planctl_invocation;
   if (typeof topLevelEnv === "object" && topLevelEnv !== null) {
     const sr = (topLevelEnv as Record<string, unknown>).state_repo;
     if (typeof sr === "string" && sr.length > 0) {

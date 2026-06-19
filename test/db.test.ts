@@ -1925,9 +1925,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `commit_trailer_facts` projection table, fn-807; v68 adds the
   // `scheduled_tasks` projection table, fn-813; v69 adds
   // `subagent_invocations.last_disposition`, fn-38.2; v70 adds
-  // `jobs.close_kind`, fn-817; v71 adds `jobs.window_index`, fn-817); the
+  // `jobs.close_kind`, fn-817; v71 adds `jobs.window_index`, fn-817; v72 widens
+  // the `file_attributions.source` CHECK to accept `'plan'`, fn-826); the
   // v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(71);
+  expect(SCHEMA_VERSION).toBe(72);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -5959,14 +5960,15 @@ test("fresh v31 DB has file_attributions table with the right PK + indexes", () 
   expect(byName.get("session_id")?.pk).toBe(2);
   expect(byName.get("file_path")?.pk).toBe(3);
 
-  // CHECK constraint on `source` is enforced — verify an invalid value
-  // throws and a valid one (any of tool/bash/inferred) is accepted.
+  // CHECK constraint on `source` is enforced — verify an invalid value throws
+  // and every valid one is accepted. fn-826 widened the CHECK to admit the
+  // renamed `'plan'` alongside legacy `'planctl'` (additive, both allowed).
   expect(() => {
     db.run(
       "INSERT INTO file_attributions (project_dir, session_id, file_path, last_mutation_at, op, source) VALUES ('/r', 's', 'f', 0, 'edit', 'NOT_AN_ENUM')",
     );
   }).toThrow();
-  for (const src of ["tool", "bash", "inferred"]) {
+  for (const src of ["tool", "bash", "inferred", "planctl", "plan"]) {
     db.run(
       "INSERT INTO file_attributions (project_dir, session_id, file_path, last_mutation_at, op, source) VALUES (?, 's', ?, 0, 'edit', ?)",
       ["/r", `f-${src}`, src],
