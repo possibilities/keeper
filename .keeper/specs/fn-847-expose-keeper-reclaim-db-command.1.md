@@ -41,5 +41,5 @@ existing cli verb registration + --agent-help conventions.
 - [ ] `keeper reclaim` runs reclaimDb offline with a daemon-up guard + pre-reclaim snapshot + self-verify (schema/auto_vacuum/row-counts) before success; runbook documented; test:full green
 
 ## Done summary
-
+Added 'keeper reclaim' — a guarded offline DB size-reclaim wrapping reclaimDb with a daemon-up refusal, pre-reclaim snapshot, self-verify (schema_version/auto_vacuum=2/row-counts) before the atomic swap, and the operator runbook in --agent-help + README. backup.test.ts exercises the self-verify + guard; test:full green.
 ## Evidence

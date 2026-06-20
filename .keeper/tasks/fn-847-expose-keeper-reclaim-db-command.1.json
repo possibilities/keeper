@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "add keeper reclaim CLI wrapping reclaimDb",
-  "updated_at": "2026-06-20T14:00:22.829000Z"
+  "updated_at": "2026-06-20T14:28:27.742000Z",
+  "worker_done_at": "2026-06-20T14:28:27.742000Z"
 }
