@@ -69,5 +69,5 @@ flipped classifier. `bun run test:full` is MANDATORY (git-worker process path).
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Flipped git-worker watch + commit-ingest gate from the dead .planctl dir to .keeper (both existsSync sites + isPlanctlChangedPath's 4 shapes incl. state/epics), kept the vendored plugins/plan prune name-tolerant, and updated gate JSDoc. Tests cover .keeper watch + 4-shape ingest + vendored reject + real-git round-trips; bun run test:full green.
 ## Evidence

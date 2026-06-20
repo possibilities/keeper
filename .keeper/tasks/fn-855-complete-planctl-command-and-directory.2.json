@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "git-worker .keeper reconciliation",
-  "updated_at": "2026-06-20T19:01:13.746000Z"
+  "updated_at": "2026-06-20T19:11:45.314000Z",
+  "worker_done_at": "2026-06-20T19:11:45.314000Z"
 }
