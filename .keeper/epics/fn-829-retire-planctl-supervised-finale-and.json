@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T13:07:11.969000Z",
   "created_at": "2026-06-18T17:57:48.562000Z",
   "depends_on_epics": [
     "fn-824-native-fold-keeper-plan-in-process",
@@ -15,11 +16,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "retire planctl supervised finale and archive",
   "touched_repos": [
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T13:00:15.437000Z"
+  "updated_at": "2026-06-20T13:07:11.969000Z"
 }
