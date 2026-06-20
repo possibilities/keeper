@@ -25,5 +25,5 @@ Drop the `planctl` binary build/promote from `install.sh` §6d (native `keeper p
 - [ ] buildbot `planctl` builder removed; checkconfig green; master reloaded
 - [ ] Codex `/hack` symlink → subtree; install.sh §4c source correct
 ## Done summary
-
+Dropped install.sh 6d planctl Bun build/promote and removed ~/.local/bin/planctl (keeper plan is native); deleted dead lib/bun-cli.sh; removed the planctl builder from buildbot master.cfg (checkconfig green, master bounced/reloaded with 6 builders, no planctl); refreshed Codex /hack symlink to the plan-plugin subtree.
 ## Evidence
