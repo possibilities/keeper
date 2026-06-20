@@ -21,4 +21,5 @@ Fresh session smoke; `grep -rn planctl ~/code --glob '!**/.git/**' --glob '!**/a
 - [ ] `~/code/planctl` moved to `~/archive/`; fresh session: board from `.keeper/`, `keeper plan` works, no `planctl` command
 - [ ] `grep -rn planctl` across the live tree returns nothing actionable; the name is gone
 ## Done summary
+
 ## Evidence
