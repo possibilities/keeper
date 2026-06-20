@@ -1,21 +1,21 @@
 /**
- * Cross-contract test for the planctl→keeper fold, exercised in ONE repo.
+ * Cross-contract test for the keeper plan → keeper fold, exercised in ONE repo.
  *
- * This is the payoff the fn-822 fold exists for: the PRODUCER (the compiled
- * `planctl` binary, co-hosted as the `plugins/plan` subtree) and the CONSUMER
- * (keeper's plan-worker → `epics` projection) are now in the same repo, so the
- * shared `.planctl/` data contract is assertable in a single test. Unlike the
- * `integration.test.ts` plan-fold e2e — which hand-writes the `.planctl/*.json`
- * to model what planctl emits — this test drives the REAL planctl producer:
- * `planctl init` + `planctl scaffold --file <yaml>` mint and auto-commit a real
- * epic, and we assert keeper folds that exact on-disk shape.
+ * This is the payoff the fn-822 fold exists for: the PRODUCER (the in-process
+ * `keeper plan` dispatcher, co-hosted as the `plugins/plan` subtree) and the
+ * CONSUMER (keeper's plan-worker → `epics` projection) are now in the same repo,
+ * so the shared `.keeper/` data contract is assertable in a single test. Unlike
+ * the `integration.test.ts` plan-fold e2e — which hand-writes the `.keeper/*.json`
+ * to model what the producer emits — this test drives the REAL producer:
+ * `keeper plan init` + `keeper plan scaffold --file <yaml>` mint and auto-commit
+ * a real epic, and we assert keeper folds that exact on-disk shape.
  *
  * Producer auto-commit is load-bearing for the fn-629 observation gate: every
- * mutating planctl verb commits its `.planctl/` scope inline at `emit()`, so the
+ * mutating plan verb commits its `.keeper/` scope inline at `emit()`, so the
  * scaffolded epic lands in git HEAD with no manual commit — the gate passes it
  * through and the boot scan emits its snapshot.
  *
- * This file spawns a real binary + boots the in-process daemon (the plan-worker
+ * This file spawns the keeper CLI + boots the in-process daemon (the plan-worker
  * fold path), so it is fast-tier-ignored and gates only under `bun run
  * test:full`.
  */
@@ -25,6 +25,10 @@ import { mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { openDb } from "../src/db";
+
+/** The keeper CLI entrypoint — `keeper plan <verb>` runs the plan dispatcher
+ * in-process (no compiled-binary spawn; that binary was retired in fn-829). */
+const KEEPER_CLI = join(import.meta.dir, "..", "cli", "keeper.ts");
 import { withInProcessDaemon } from "./helpers/in-process-daemon";
 import { retryUntil } from "./helpers/retry-until";
 
@@ -62,9 +66,9 @@ function git(...args: string[]): void {
   }
 }
 
-/** Run `planctl <args>` in `repo`; return the parsed JSON envelope. */
-function planctl(...args: string[]): Record<string, unknown> {
-  const r = Bun.spawnSync(["planctl", ...args], {
+/** Run `keeper plan <args>` in `repo`; return the parsed JSON envelope. */
+function plan(...args: string[]): Record<string, unknown> {
+  const r = Bun.spawnSync([process.execPath, KEEPER_CLI, "plan", ...args], {
     cwd: repo,
     stdout: "pipe",
     stderr: "pipe",
@@ -72,19 +76,19 @@ function planctl(...args: string[]): Record<string, unknown> {
   const stdout = r.stdout.toString();
   if (!r.success) {
     throw new Error(
-      `planctl ${args.join(" ")} exited ${r.exitCode}: ${r.stderr.toString()}\n${stdout}`,
+      `keeper plan ${args.join(" ")} exited ${r.exitCode}: ${r.stderr.toString()}\n${stdout}`,
     );
   }
   // The success envelope is the last non-empty stdout line (a trailing
-  // planctl_invocation rides the same object).
+  // plan_invocation rides the same object).
   const lastLine = stdout.trimEnd().split("\n").at(-1) ?? "";
   return JSON.parse(lastLine) as Record<string, unknown>;
 }
 
 /**
  * The minimal valid scaffold YAML: one epic, one task. The task spec block is
- * the planctl-required `## Description` / `## Acceptance` / `## Done summary` /
- * `## Evidence` shape (planctl rejects a malformed spec at scaffold time).
+ * the producer-required `## Description` / `## Acceptance` / `## Done summary` /
+ * `## Evidence` shape (scaffold rejects a malformed spec at mint time).
  */
 function scaffoldYaml(title: string): string {
   return [
@@ -111,26 +115,26 @@ function scaffoldYaml(title: string): string {
   ].join("\n");
 }
 
-test("planctl scaffold writes a .planctl epic → keeper plan-worker folds it into the epics projection", async () => {
-  // --- PRODUCER: drive the real planctl binary. ---
-  // A real git repo with one commit so planctl's auto-commit has a HEAD to build
-  // on (and the keeper fn-629 gate has a HEAD to probe against).
+test("keeper plan scaffold writes a .keeper epic → keeper plan-worker folds it into the epics projection", async () => {
+  // --- PRODUCER: drive the in-process keeper plan dispatcher. ---
+  // A real git repo with one commit so the producer's auto-commit has a HEAD to
+  // build on (and the keeper fn-629 gate has a HEAD to probe against).
   git("init", "-q", "-b", "main");
   git("config", "user.email", "test@example.com");
   git("config", "user.name", "Test");
   git("config", "commit.gpgsign", "false");
   git("commit", "--allow-empty", "-q", "-m", "init");
 
-  const initEnv = planctl("init");
+  const initEnv = plan("init");
   expect(initEnv.success).toBe(true);
 
   writeFileSync(join(repo, "plan.yaml"), scaffoldYaml("cross contract"));
-  const scaffoldEnv = planctl("scaffold", "--file", "plan.yaml");
+  const scaffoldEnv = plan("scaffold", "--file", "plan.yaml");
   expect(scaffoldEnv.success).toBe(true);
   const epicId = scaffoldEnv.epic_id as string;
   expect(epicId.startsWith("fn-")).toBe(true);
 
-  // The producer auto-commits its `.planctl/` scope at emit(), so the scaffolded
+  // The producer auto-commits its `.keeper/` scope at emit(), so the scaffolded
   // epic is already in HEAD — the keeper observation gate passes it through
   // without any manual stage/commit here.
 
@@ -164,7 +168,7 @@ test("planctl scaffold writes a .planctl epic → keeper plan-worker folds it in
           );
         }
         // The folded columns reflect the producer-written epic JSON: number from
-        // the `fn-N-…` id, the scaffold title, and planctl's `open` status.
+        // the `fn-N-…` id, the scaffold title, and the producer's `open` status.
         expect(epic.epic_id).toBe(epicId);
         expect(epic.epic_number).toBe(1);
         expect(epic.title).toBe("cross contract");
