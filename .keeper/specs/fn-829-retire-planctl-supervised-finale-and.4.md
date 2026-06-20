@@ -20,4 +20,5 @@ Forward-facing sweep of every remaining `planctl` mention in docs + comments acr
 ## Acceptance
 - [ ] no live `planctl` mention in keeper/arthack docs or comments; forward-facing only
 ## Done summary
+Forward-facing sweep of stale planctl mentions across keeper docs (CLAUDE.md/README.md + autopilot-worker comment) and arthack docs (CLAUDE.md, claude/scripts/system CLAUDE.md): present-tense keeper plan / .keeper/ framing. Schema column names, the 'planctl' source-badge value, Planctl-Op trailers, and the live ~/.local/bin/planctl binary cord (cut-the-cord task's scope) left unchanged.
 ## Evidence
