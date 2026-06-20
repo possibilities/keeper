@@ -138,7 +138,7 @@ describe("buildPlanctlInvocation state_repo precedence", () => {
   });
 });
 
-describe("buildPlanctlInvocation touched-path validation (throws loud)", () => {
+describe("buildPlanctlInvocation touched-path validation", () => {
   test("path traversal in a touched record throws", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-trav";
     const touchedDir = join(
@@ -156,7 +156,7 @@ describe("buildPlanctlInvocation touched-path validation (throws loud)", () => {
     ).toThrow(/path traversal/);
   });
 
-  test("a non-data-dir prefix in a touched record throws", () => {
+  test("a non-data-dir prefix in a touched record is skipped, not thrown", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-pref";
     const touchedDir = join(
       repo,
@@ -170,6 +170,33 @@ describe("buildPlanctlInvocation touched-path validation (throws loud)", () => {
     writeFileSync(join(touchedDir, "bad.txt"), "src/secret.ts\n");
     expect(() =>
       buildPlanctlInvocation("done", "fn-1-x.1", null, { repoRoot: repo }),
-    ).toThrow(/non-data-dir/);
+    ).not.toThrow();
+  });
+
+  test("a stale legacy .planctl/ record is skipped; valid records still land", () => {
+    process.env.CLAUDE_CODE_SESSION_ID = "sid-stale";
+    // One stale legacy `.planctl/` record (benign migration residue) alongside
+    // two valid+dirty `.keeper/` records: the op succeeds, skipping the stale one.
+    const touchedDir = join(
+      repo,
+      ".keeper",
+      "state",
+      "sessions",
+      "sid-stale",
+      "touched",
+    );
+    mkdirSync(touchedDir, { recursive: true });
+    writeFileSync(
+      join(touchedDir, "stale.txt"),
+      ".planctl/epics/legacy.json\n",
+    );
+    const a = seedTouched("sid-stale", ".keeper/epics/a.json");
+    const b = seedTouched("sid-stale", ".keeper/epics/b.json");
+
+    const inv = buildPlanctlInvocation("done", "fn-1-x.1", null, {
+      repoRoot: repo,
+    });
+    // Only the valid data-dir paths survive; the stale legacy record is dropped.
+    expect(inv.files).toEqual([a, b]);
   });
 });

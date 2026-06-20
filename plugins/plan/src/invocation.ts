@@ -133,8 +133,9 @@ function readTouchedFiles(dataDir: string, sessionId: string): string[] {
 
 /** Paths recorded for `sessionId` in the touched-paths log, each a POSIX string
  * relative to repoRoot starting with the `.keeper/` data-dir prefix. The
- * touched-log lives under the data dir; a path with `..` or a prefix outside the
- * data-dir set is a bug upstream and throws loud, never silently dropped. */
+ * touched-log lives under the data dir; a `..` traversal is a bug upstream and
+ * throws loud, while a prefix outside the data-dir set is benign migration
+ * residue and is logged + skipped so one stale record can't wedge the op. */
 function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
   const dataDir = resolveDataDirOrDefault(repoRoot);
   const touchedDir = join(dataDir, "state", "sessions", sessionId, "touched");
@@ -154,18 +155,22 @@ function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
     if (!raw) {
       continue;
     }
-    // Security: reject traversal and paths outside the data-dir set.
+    // Security: path traversal is a hard reject — that IS a bug signal.
     if (raw.split("/").includes("..")) {
       throw new Error(
         `Touched-paths record contains path traversal: '${raw}' ` +
           `(file: ${file}). This is a bug — report it.`,
       );
     }
+    // A path outside the data-dir set is benign migration residue (e.g. a stale
+    // legacy `.planctl/` record from before the `.keeper/` rename): skip it so
+    // one stale record can't wedge the whole op.
     if (!dataDirPrefixes.some((pfx) => raw.startsWith(pfx))) {
-      throw new Error(
-        `Touched-paths record contains a non-data-dir path: '${raw}' ` +
-          `(file: ${file}). This is a bug — report it.`,
+      process.stderr.write(
+        `Skipping stale touched-paths record (non-data-dir path): ` +
+          `'${raw}' (file: ${file}).\n`,
       );
+      continue;
     }
     paths.push(raw);
   }
