@@ -28,5 +28,5 @@ test to exercise the real read-only-source path so the readonly error is caught.
 - [ ] reclaim completes with no readonly error; output auto_vacuum=2 via inheritance (no read-only-source write); regression test on the real path; test:full green
 
 ## Done summary
-
+reclaimDb no longer bakes auto_vacuum on the read-only source (the cause of 'attempt to write a readonly database' on the live auto_vacuum=2 DB); the VACUUM INTO output inherits INCREMENTAL and the self-verify gate asserts it. Reclaim/backup tests now drive a faithful auto_vacuum=2 read-only source so the regression is pinned. Full suite green.
 ## Evidence
