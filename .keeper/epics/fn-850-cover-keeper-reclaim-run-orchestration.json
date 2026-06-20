@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T14:58:27.389000Z",
   "created_at": "2026-06-20T14:32:20.384000Z",
   "created_by_close_of": "fn-847-expose-keeper-reclaim-db-command",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Cover keeper reclaim run() orchestration",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T14:32:20.384000Z"
+  "updated_at": "2026-06-20T14:58:27.389000Z"
 }
