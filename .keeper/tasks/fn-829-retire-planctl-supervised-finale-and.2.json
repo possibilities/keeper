@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "remove transient planctl fallbacks",
-  "updated_at": "2026-06-18T17:57:48.562000Z"
+  "updated_at": "2026-06-20T11:10:17.417000Z",
+  "worker_done_at": "2026-06-20T11:10:17.417000Z"
 }

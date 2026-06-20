@@ -20,4 +20,5 @@ Now that every repo is on `.keeper/`, delete the transient `.planctl/` read-fall
 ## Acceptance
 - [ ] `.planctl/` fallback removed (CLI + plan-worker); `rg '\.planctl' src plugins/plan/src` → 0; `bun run test:full` green
 ## Done summary
+Removed the transient .planctl read-fallback: collapsed DATA_DIR_NAMES to .keeper in the CLI seam (state_path.ts) and the plan-worker, dropped LEGACY_DATA_DIR. The system reads .keeper only; migrated all test fixtures from .planctl to .keeper. Vendored plugins/plan/.planctl subtree guard unchanged.
 ## Evidence
