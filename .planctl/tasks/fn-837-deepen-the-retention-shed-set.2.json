@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Catch-up drain and offline VACUUM reclaim",
-  "updated_at": "2026-06-20T01:44:57.503000Z"
+  "updated_at": "2026-06-20T02:32:51.386000Z",
+  "worker_done_at": "2026-06-20T02:32:51.386000Z"
 }

@@ -55,5 +55,5 @@ helper code.
 - [ ] `bun run test:full` green (for any helper code)
 
 ## Done summary
-
+Added drainColdPayloads one-shot catch-up drain (loops the paced retention to completion in <=500-row txns, idempotent/resumable, runaway-guarded) plus scripts/reclaim-db.ts and the extended reclaimInstructions runbook (pause autopilot -> drain -> daemon-stopped reclaimDb VACUUM INTO -> swap -> verify). Full suite green.
 ## Evidence
