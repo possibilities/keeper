@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "flip producer envelope and promote planctl",
-  "updated_at": "2026-06-20T03:50:17.729000Z"
+  "updated_at": "2026-06-20T13:40:39.450000Z",
+  "worker_done_at": "2026-06-20T13:40:39.450000Z"
 }

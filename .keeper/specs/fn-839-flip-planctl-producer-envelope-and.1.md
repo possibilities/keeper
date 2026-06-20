@@ -25,5 +25,5 @@ Leave the `planctl_invocation` reader in src/reducer.ts untouched (historical ev
 - [ ] CLI emits `plan_invocation`; 111 refs / 22 files migrated; promote + soak clean; reader retained
 
 ## Done summary
-
+flip producer envelope planctl_invocation->plan_invocation; migrate 100 test refs; remove obsolete plan-shim.test.ts (binary retired)
 ## Evidence
