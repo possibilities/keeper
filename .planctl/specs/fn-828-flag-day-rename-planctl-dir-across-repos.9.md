@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] agentwrap `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+git mv .planctl .keeper in agentwrap; updated the one .planctl path ref in .keeper/CLAUDE.md. keeper board renders agentwrap epics from .keeper/.
 ## Evidence
