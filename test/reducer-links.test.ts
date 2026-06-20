@@ -3125,8 +3125,9 @@ test("syncJobLinksOnJobWrite: state flip on UserPromptSubmit re-stamps embedded 
   // Seed: a planctl creator edge → epic gets a job_links entry whose
   // initial enriched state is "stopped" (the jobs row's default after
   // SessionStart). A subsequent UserPromptSubmit flips state to
-  // "working" and the reverse fan-out must re-stamp the entry so the
-  // board's planner-running predicate fires.
+  // "working" and the reverse fan-out must re-stamp the entry. The fold
+  // keeps `job_links.state` fresh for the board's `[creator]/[refiner]
+  // [working]` job-link line; no readiness predicate consumes it.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-flip" });
   planPlanOpener("sess-flip");
   planctlEvent({

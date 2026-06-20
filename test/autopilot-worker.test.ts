@@ -1621,16 +1621,18 @@ test("fn-725 cap: cap=2 with 1 occupant + 2 ready → exactly 1 launch", () => {
   expect(decision.launches[0]?.key).toBe("work::fn-2-b.1");
 });
 
-test("fn-725 cap: a planner-running occupant does NOT consume budget (planner-exempt)", () => {
-  // The planner epic renders `running:planner-running` — NOT an
-  // `isRootOccupant`, so it must not charge the cap. With cap=1 and one
-  // planner + one ready task in another root, the ready task launches.
+test("fn-867 cap: a validated epic with a working planner link competes for budget like any worker", () => {
+  // The planner-running readiness gate is gone: a validated epic whose
+  // creator/refiner link is still `working` reads its dep-satisfied task as
+  // `ready`, so that task competes for the cap exactly like a worker task in
+  // any other epic. With cap=1 and the planner epic's ready task sorting
+  // FIRST (epic_number 1), it wins the single budget slot.
   const plannerEpic = makeEpic({
     epic_id: "fn-1-plan",
     epic_number: 1,
     project_dir: "/repo-plan",
     sort_path: "fn-1-plan",
-    // A working job_link with no embedded work started → planner-running.
+    // A working job_link no longer holds the epic's tasks off `ready`.
     job_links: [
       {
         kind: "creator",
@@ -1643,10 +1645,9 @@ test("fn-725 cap: a planner-running occupant does NOT consume budget (planner-ex
   const ready = readyEpic("fn-2-go", "/repo-go");
   const snap = makeSnapshot({ epics: [plannerEpic, ready] });
   const decision = reconcile(snap, makeState({ maxConcurrentJobs: 1 }), 0);
-  // The planner's OWN task is held by the per-epic mutex (planner-running),
-  // so only the other root's ready task can launch — and it does, proving
-  // the planner didn't eat the single budget slot.
-  expect(decision.launches.map((l) => l.key)).toEqual(["work::fn-2-go.1"]);
+  // Both tasks are ready; the planner epic's task sorts first and takes the
+  // single slot — it is no longer exempt from the cap.
+  expect(decision.launches.map((l) => l.key)).toEqual(["work::fn-1-plan.1"]);
 });
 
 test("fn-725 cap: cap=null reproduces pre-change dispatch exactly", () => {

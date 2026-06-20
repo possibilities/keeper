@@ -106,12 +106,10 @@ function makeResolvedDep(
   };
 }
 
-// `makeJob` (formerly built `Job` fixture rows for the planner-running
-// predicate's live-jobs Map join) is gone with schema v21 — the
-// `JobLinkEntry.state` field carries the linked session's last-known
-// lifecycle directly off the projection, so the predicate no longer
-// reads from a `jobs` Map. See `makeLink` below for the v21 fixture
-// shape.
+// `makeLink` (below) builds the `JobLinkEntry` projection shape: the
+// `state` field carries the linked session's last-known lifecycle directly
+// off the projection (denormalized at the reducer's write boundary), so no
+// fixture ever threads a separate `jobs` Map.
 
 function makeEmbeddedJob(overrides: Partial<EmbeddedJob>): EmbeddedJob {
   return {
@@ -226,10 +224,6 @@ function runWithNow(
 // mutex integration tests' prose. Now that `isRootOccupant` is exported (so
 // the fn-725 reconcile budget can count root-occupants with the SAME
 // predicate the mutex uses), pin its per-verdict contract directly.
-
-test("isRootOccupant: planner-running is EXEMPT (a planner does not claim the root)", () => {
-  expect(isRootOccupant(running({ kind: "planner-running" }))).toBe(false);
-});
 
 test("isRootOccupant: real running workers occupy the root", () => {
   expect(isRootOccupant(running({ kind: "job-running" }))).toBe(true);
@@ -467,9 +461,8 @@ test("fn-719: ambient-only monitor (has_live_worker_monitor=false) → completed
 test("fn-719: live worker monitor occupies BOTH per-epic and per-root mutex (blocks sibling on same root)", () => {
   // T1 done+approved with a live `bash-bg` monitor holds `monitor-running`,
   // which is a `running` verdict → occupant via `isLiveWorkOccupant`
-  // (per-epic) AND `isRootOccupant` (per-root; no planner exemption — the
-  // worker holds the working tree). A ready sibling T2 on the same root is
-  // demoted, exactly like the fn-671 job-running case.
+  // (per-epic) AND `isRootOccupant` (per-root). A ready sibling T2 on the same
+  // root is demoted, exactly like the fn-671 job-running case.
   const t1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -497,10 +490,10 @@ test("fn-719: live worker monitor occupies BOTH per-epic and per-root mutex (blo
 });
 
 test("fn-719: live worker monitor in epic A occupies the root, demotes a same-root ready task in epic B (per-root mutex)", () => {
-  // Cross-epic same-root collision — the per-root mutex narrows to
-  // `isRootOccupant`. `monitor-running` is a `running` verdict that is NOT
-  // `planner-running`, so it claims the root and a ready task in a different
-  // epic on the same project_dir is demoted to `single-task-per-root`.
+  // Cross-epic same-root collision — the per-root mutex keys on
+  // `isRootOccupant`. `monitor-running` is a `running` verdict, so it claims
+  // the root and a ready task in a different epic on the same project_dir is
+  // demoted to `single-task-per-root`.
   const a1 = makeTask({
     task_id: "fn-1-foo.1",
     worker_phase: "done",
@@ -1473,23 +1466,6 @@ test("predicate 1 wins over 2 (epic-not-validated)", () => {
   expect(snap.perTask.get(task.task_id)).toEqual({ tag: "completed" });
 });
 
-test("predicate 2 (epic-not-validated) wins over 3 (planner-running)", () => {
-  const task = makeTask({});
-  const epic = makeEpic({
-    tasks: [task],
-    last_validated_at: null,
-    // Schema v21: state lives on the embedded JobLinkEntry — no
-    // separate `jobs` Map join. Set state=working to exercise the
-    // planner-running candidate, then assert the higher-priority
-    // epic-not-validated predicate still wins.
-    job_links: [makeLink({ job_id: "planner-job", state: "working" })],
-  });
-  const snap = run([epic]);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    blocked({ kind: "epic-not-validated" }),
-  );
-});
-
 // ---------------------------------------------------------------------------
 // fn-712: epic-not-materialized — the EARLIEST blocked predicate on both
 // the per-task and per-close-row paths. `epic.status === null` ⇔ no
@@ -1552,22 +1528,6 @@ test("fn-712 perCloseRow: epic-not-materialized ranks ABOVE epic-not-validated",
   const snap = run([epic]);
   expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
     blocked({ kind: "epic-not-materialized" }),
-  );
-});
-
-test("predicate 3 (planner-running) wins over 4 (own-approval-rejected)", () => {
-  // A not-yet-done task blocks when a planner is working on the epic.
-  // (Predicate 1 doesn't fire because `worker_phase` is `open`, not `done`.)
-  const task = makeTask({ worker_phase: "open" });
-  const epic = makeEpic({
-    tasks: [task],
-    job_links: [
-      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
-    ],
-  });
-  const snap = run([epic]);
-  expect(snap.perTask.get(task.task_id)).toEqual(
-    running({ kind: "planner-running" }),
   );
 });
 
@@ -2540,81 +2500,14 @@ test("subagent_invocations: running on different job_id → ignored", () => {
 });
 
 // ---------------------------------------------------------------------------
-// planner-running predicate — absent-from-jobs collection is NOT working
+// no planner serialization gate — a working planner/refiner link does NOT
+// hold the epic's tasks or close row off `ready`. The validation gate
+// (predicate 2) is the sole guard; once an epic is validated its rows read
+// through even while the planner session is still `working`.
 // ---------------------------------------------------------------------------
 
-test("planner-running: job_links entry whose embedded state defaults to 'stopped' → not running", () => {
-  // Schema v21: the link carries its own `state` field (denormalized off
-  // the linked jobs row at the reducer's write boundary). For an orphan
-  // entry (job_id with no `jobs` row at enrichment time), `enrichJobLink`
-  // defaults `state` to `"stopped"` — the same zero-event reading that
-  // used to surface as "absent from the jobs map" pre-v21. Either way:
-  // the task is ready because no link is `"working"`.
-  const t = makeTask({ task_id: "fn-1-foo.1" });
-  const linkEntry: JobLinkEntry = makeLink({ job_id: "missing-job" });
-  const epic = makeEpic({ tasks: [t], job_links: [linkEntry] });
-  const snap = run([epic]);
-  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
-});
-
-test("planner-running: job_links entry on a stopped job → not running", () => {
-  // Schema v21 reads state straight off the embedded entry — no live
-  // `jobs` Map join, so this test no longer threads a jobs map at all.
-  const t = makeTask({ task_id: "fn-1-foo.1" });
-  const epic = makeEpic({
-    tasks: [t],
-    job_links: [makeLink({ job_id: "planner-job", state: "stopped" })],
-  });
-  const snap = run([epic]);
-  expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
-});
-
-// ---------------------------------------------------------------------------
-// planner-restart: the planner-running gate discharges once real work has
-// landed on the epic (`epicWorkStarted`). A planner restarted for followup in
-// the same session flips its creator/refiner link back to `working`; without
-// the latch that would re-block an epic the planner already released to a worker.
-// ---------------------------------------------------------------------------
-
-test("planner-restart: a working planner link still gates an epic with NO work yet", () => {
-  // First-time behavior preserved: before any worker lands, a working planner
-  // link blocks the epic's tasks (the wanted "don't pick up a newly minted
-  // epic while the planner is in motion" gate).
-  const t = makeTask({ jobs: [] });
-  const epic = makeEpic({
-    tasks: [t],
-    job_links: [
-      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
-    ],
-  });
-  const snap = run([epic]);
-  expect(snap.perTask.get(t.task_id)).toEqual(
-    running({ kind: "planner-running" }),
-  );
-});
-
-test("planner-restart: a working planner link no longer gates once a worker has landed", () => {
-  // A worker is in flight on the task AND the planner link is working.
-  // Previously predicate 3 would mislabel this `planner-running`; now
-  // `epicWorkStarted` is
-  // true so predicate 3 is skipped and the accurate `job-running` surfaces.
-  const t = makeTask({ jobs: [makeEmbeddedJob({ state: "working" })] });
-  const epic = makeEpic({
-    tasks: [t],
-    job_links: [
-      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
-    ],
-  });
-  const snap = run([epic]);
-  expect(snap.perTask.get(t.task_id)).toEqual(running({ kind: "job-running" }));
-});
-
-test("planner-restart: a restarted planner doesn't re-block an epic whose worker has stopped", () => {
-  // The reported bug. The epic was released to a worker, that worker session
-  // stopped (embedded job `stopped`), then the planner was restarted for
-  // followup → its link flips back to `working`. The latch keeps predicate 3
-  // discharged, so the task reads `ready` instead of `planner-running`.
-  const t = makeTask({ jobs: [makeEmbeddedJob({ state: "stopped" })] });
+test("a working planner/refiner link does NOT block a validated epic's task — it reads ready", () => {
+  const t = makeTask({ task_id: "fn-1-foo.1", jobs: [] });
   const epic = makeEpic({
     tasks: [t],
     job_links: [
@@ -2625,53 +2518,35 @@ test("planner-restart: a restarted planner doesn't re-block an epic whose worker
   expect(snap.perTask.get(t.task_id)).toEqual({ tag: "ready" });
 });
 
-test("planner-restart: work landing on one task discharges the gate for a sibling task", () => {
-  // `epicWorkStarted` is epic-scoped: a worker on task 1 releases the planner
-  // gate across the whole epic, so a fresh sibling (task 2) is no longer
-  // `planner-running`. (Task 1 occupies the per-epic mutex, so the sibling is
-  // demoted to `single-task-per-epic` — NOT planner-running.)
-  const t1 = makeTask({
-    task_id: "fn-1-foo.1",
-    jobs: [makeEmbeddedJob({ state: "working" })],
-  });
-  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2, jobs: [] });
+test("a working planner/refiner link does NOT block a validated epic's close row — it reads ready", () => {
+  // One completed task (so the close row passes the epic-no-tasks /
+  // dep-on-task-synth-close gates) and a still-working planner link. The
+  // close row reads `ready` — the planner no longer holds it at `running`.
+  const t = makeTask({ task_id: "fn-1-foo.1", worker_phase: "done" });
   const epic = makeEpic({
-    tasks: [t1, t2],
-    job_links: [
-      makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
-    ],
-  });
-  const snap = run([epic]);
-  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
-    blocked({ kind: "single-task-per-epic" }),
-  );
-});
-
-test("planner-restart: a working planner link still gates a close row with no work", () => {
-  const epic = makeEpic({
+    tasks: [t],
     jobs: [],
     job_links: [
       makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
     ],
   });
   const snap = run([epic]);
-  expect(snap.perCloseRow.get(epic.epic_id)).toEqual(
-    running({ kind: "planner-running" }),
-  );
+  expect(snap.perCloseRow.get(epic.epic_id)).toEqual({ tag: "ready" });
 });
 
-test("planner-restart: a landed closer discharges the planner-running gate", () => {
-  // A close-verb embedded job at epic level counts as work started, so a
-  // restarted planner no longer re-blocks the close row.
+test("a working planner link on an UNvalidated epic still blocks — via the validation gate, not a planner gate", () => {
+  const t = makeTask({ task_id: "fn-1-foo.1", jobs: [] });
   const epic = makeEpic({
-    jobs: [makeEmbeddedJob({ plan_verb: "close", state: "stopped" })],
+    tasks: [t],
+    last_validated_at: null,
     job_links: [
       makeLink({ kind: "creator", job_id: "planner-job", state: "working" }),
     ],
   });
   const snap = run([epic]);
-  const v = snap.perCloseRow.get(epic.epic_id);
-  expect(v).not.toEqual(running({ kind: "planner-running" }));
+  expect(snap.perTask.get(t.task_id)).toEqual(
+    blocked({ kind: "epic-not-validated" }),
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -2812,10 +2687,9 @@ test("applySingleTaskPerRootMutex: live-work blocked row claims the root", () =>
   // Cross-epic pass-1 semantics: a verdict from the `isRootOccupant`
   // whitelist — one of `job-running`, `sub-agent-running`, `sub-agent-stale`,
   // `job-pending` — in epic A occupies root /r so a later ready row in
-  // epic B gets demoted. Planners are root-exempt (fn-663) — see the
-  // dedicated planner-exemption tests below. Dependency / admin /
-  // repo-state / mutex-synthesized blocks also do NOT claim in pass-1
-  // (see the negative-control test below for `dep-on-task`).
+  // epic B gets demoted. Dependency / admin / repo-state / mutex-synthesized
+  // blocks do NOT claim in pass-1 (see the negative-control test below for
+  // `dep-on-task`).
   const e1t1 = makeTask({ task_id: "fn-1-foo.1", target_repo: "/r" });
   const e1 = makeEpic({
     epic_id: "fn-1-foo",
@@ -3096,82 +2970,6 @@ test("applySingleTaskPerRootMutex (fn-655) negative control: close row running f
   );
 });
 
-test("applySingleTaskPerRootMutex (fn-663): planner-running close row does NOT claim project_dir", () => {
-  // Planner exemption (fn-663). `epic.job_links` carries a working
-  // creator/refiner link — `JobLinkEntry.kind` is `creator | refiner` so
-  // planners are epic-scoped by construction. The close row's verdict is
-  // `running:planner-running`; `isRootOccupant` returns false for that
-  // kind, so the outer pass-1 guard skips the close row entirely. A
-  // sibling epic's ready task on /keeper stays ready and is dispatchable
-  // concurrently with the planner. The planner still blocks its OWN epic
-  // (predicate 3 + per-EPIC mutex remain unchanged).
-  const e1 = makeEpic({
-    epic_id: "fn-1-foo",
-    project_dir: "/keeper",
-    tasks: [],
-    job_links: [
-      makeLink({ kind: "creator", job_id: "planner-A", state: "working" }),
-    ],
-  });
-  const e2t1 = makeTask({
-    task_id: "fn-2-bar.1",
-    epic_id: "fn-2-bar",
-    target_repo: "/keeper",
-  });
-  const e2 = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/keeper",
-    tasks: [e2t1],
-  });
-  const perTask = new Map<string, Verdict>([["fn-2-bar.1", { tag: "ready" }]]);
-  const perCloseRow = new Map<string, Verdict>([
-    ["fn-1-foo", running({ kind: "planner-running" })],
-  ]);
-  applySingleTaskPerRootMutex([e1, e2], perTask, perCloseRow);
-  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
-});
-
-test("applySingleTaskPerRootMutex (fn-663): planner-running task verdict does NOT claim the root", () => {
-  // Per-task analog of the close-row exemption. A `running:planner-running`
-  // verdict on a TASK in epic A does NOT occupy root /keeper, so a ready
-  // sibling task in epic B on the same root stays ready. (In practice
-  // task-level verdicts read `planner-running` via predicate 3 when the
-  // task's parent epic has a working `job_links` planner.) Regression
-  // guard: if a future refactor swaps `isRootOccupant` back to
-  // `isLiveWorkOccupant` at the per-task pass-1 check, this test fires.
-  const e1t1 = makeTask({
-    task_id: "fn-1-foo.1",
-    epic_id: "fn-1-foo",
-    target_repo: "/keeper",
-  });
-  const e1 = makeEpic({
-    epic_id: "fn-1-foo",
-    project_dir: "/keeper",
-    tasks: [e1t1],
-  });
-  const e2t1 = makeTask({
-    task_id: "fn-2-bar.1",
-    epic_id: "fn-2-bar",
-    target_repo: "/keeper",
-  });
-  const e2 = makeEpic({
-    epic_id: "fn-2-bar",
-    epic_number: 2,
-    project_dir: "/keeper",
-    tasks: [e2t1],
-  });
-  const perTask = new Map<string, Verdict>([
-    ["fn-1-foo.1", running({ kind: "planner-running" })],
-    ["fn-2-bar.1", { tag: "ready" }],
-  ]);
-  applySingleTaskPerRootMutex([e1, e2], perTask, new Map());
-  expect(perTask.get("fn-1-foo.1")).toEqual(
-    running({ kind: "planner-running" }),
-  );
-  expect(perTask.get("fn-2-bar.1")).toEqual({ tag: "ready" });
-});
-
 test("applySingleTaskPerRootMutex (fn-655) negative control: same-root task worker keeps root locked via the task's OWN claim", () => {
   // Over-correction guard: when the contributing task IS on the same root
   // (`target_repo === project_dir` or null) the root MUST still be locked
@@ -3279,9 +3077,6 @@ test("formatPill renders the three tags + every reason kind", () => {
   );
   expect(formatPill(blocked({ kind: "epic-not-validated" }))).toBe(
     "[blocked:epic-not-validated]",
-  );
-  expect(formatPill(running({ kind: "planner-running" }))).toBe(
-    "[running:planner-running]",
   );
   expect(formatPill(running({ kind: "job-running" }))).toBe(
     "[running:job-running]",

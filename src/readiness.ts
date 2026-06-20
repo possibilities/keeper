@@ -13,8 +13,9 @@
  *                                   `running:*` until the session is idle, so
  *                                   the mutexes stay held). close: status==="done"
  *   1.5. epic-not-materialized    — epic.status == null (no EpicSnapshot folded)
- *   2.   epic-not-validated       — epic.last_validated_at == null
- *   3.   planner-running          — any job_links entry whose job is `working`
+ *   2.   epic-not-validated       — epic.last_validated_at == null (the sole
+ *                                   guard against dispatching a mid-plan /
+ *                                   mid-refine epic; see the predicate-2 note)
  *   5.   own-progress-main        — embedded jobs[] state==="working"
  *   6.   own-progress-sub         — running sub-agent under this row's worker
  *   6.6. monitor-running/-stale   — live worker-launched monitor occupies the slot
@@ -29,14 +30,12 @@
  *  11.   single-task-per-epic     — post-pass: one non-completed slot per epic
  *  12.   single-task-per-root     — post-pass: one non-completed slot per root
  *
- * Per-epic (11) and per-root (12) diverge on `planner-running`:
- * `isLiveWorkOccupant` INCLUDES it (a planner blocks its OWN epic) while
- * `isRootOccupant` EXCLUDES it (a planner does NOT claim the root, so a sibling
- * epic's ready task may dispatch concurrently). The post-passes run per-epic
- * FIRST (tighter scope wins the reason); each walks board traversal order, the
- * FIRST occupant claims the slot, every LATER `ready` row in that slot is
- * demoted. Only `ready` rows are mutated; iteration order is the determinism
- * gate.
+ * The per-epic (11) and per-root (12) post-passes both key on the same
+ * occupancy predicate (`isRootOccupant` collapses to `isLiveWorkOccupant`).
+ * They run per-epic FIRST (tighter scope wins the reason); each walks board
+ * traversal order, the FIRST occupant claims the slot, every LATER `ready` row
+ * in that slot is demoted. Only `ready` rows are mutated; iteration order is
+ * the determinism gate.
  *
  * Epic header rollup (after per-row + both post-passes):
  *   - `[completed]`      if the close row is `completed`.
@@ -171,8 +170,7 @@ export type RunningReason =
   | { kind: "sub-agent-running" }
   | { kind: "sub-agent-stale" }
   | { kind: "monitor-running" }
-  | { kind: "monitor-stale" }
-  | { kind: "planner-running" };
+  | { kind: "monitor-stale" };
 
 /**
  * Staleness threshold for the `sub-agent-stale` variant. A still-`running`
@@ -536,16 +534,14 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "epic-not-materialized" } };
   }
 
-  // 2. epic-not-validated.
+  // 2. epic-not-validated. The SOLE guard against dispatching into a
+  // mid-plan / mid-refine epic: an epic reads `ready` the moment its plan is
+  // validated (`last_validated_at` stamped), even while its planner/refiner
+  // session is still running — a validated plan is committed-to, so a worker
+  // may pick up a ready, dep-satisfied task concurrently with the planner.
+  // Do NOT re-add a planner-busy serialization gate here.
   if (epic.last_validated_at == null) {
     return { tag: "blocked", reason: { kind: "epic-not-validated" } };
-  }
-
-  // 3. planner-running. Discharges once real work has landed on the epic
-  //    (`epicWorkStarted`), so a planner restarted for followup can't re-block
-  //    an epic it already released to a worker.
-  if (!epicWorkStarted(epic) && anyJobLinkRunning(epic)) {
-    return { tag: "running", reason: { kind: "planner-running" } };
   }
 
   // 5. own-progress-main — embedded jobs[] state (verb implied by location:
@@ -715,8 +711,8 @@ function evaluateTask(
 /**
  * Close-row verdict pipeline. Predicates 5 (own-progress-main) and 6
  * (own-progress-sub) pool TWO scopes:
- *   - EPIC-LEVEL: `epic.jobs` (close-verb embedded jobs) + `epic.job_links`
- *     (planner-running) — the PRIMARY close-row source.
+ *   - EPIC-LEVEL: `epic.jobs` (close-verb embedded jobs) — the PRIMARY
+ *     close-row source.
  *   - TASK-LEVEL: the `task.jobs` of every ALREADY-COMPLETED task — a backstop.
  *     The per-task predicate 1 now also checks worker liveness, so a
  *     `completed` task can no longer have a working job or running sub-agent,
@@ -791,14 +787,12 @@ function evaluateCloseRow(
     return { tag: "blocked", reason: { kind: "epic-not-materialized" } };
   }
 
-  // 2. epic-not-validated.
+  // 2. epic-not-validated. The SOLE guard against dispatching a CLOSER into a
+  // mid-plan / mid-refine epic — see the per-task predicate 2 note. Once the
+  // plan is validated the close row reads through, even while the planner is
+  // still running. Do NOT re-add a planner-busy serialization gate here.
   if (epic.last_validated_at == null) {
     return { tag: "blocked", reason: { kind: "epic-not-validated" } };
-  }
-
-  // 3. planner-running. Discharges once real work has landed (`epicWorkStarted`).
-  if (!epicWorkStarted(epic) && anyJobLinkRunning(epic)) {
-    return { tag: "running", reason: { kind: "planner-running" } };
   }
 
   // 5. own-progress-main — block on a running worker at EITHER scope:
@@ -911,7 +905,7 @@ function evaluateCloseRow(
  *
  * Occupants:
  *   - every `running` verdict (job-running, sub-agent-running,
- *     sub-agent-stale, monitor-running, monitor-stale, planner-running);
+ *     sub-agent-stale, monitor-running, monitor-stale);
  *   - `dispatch-pending` — a worker LAUNCHED but whose SessionStart hasn't
  *     folded (an open `pending_dispatches` row). No `jobs` row exists in the
  *     launch → SessionStart blind window, so this is the ONLY signal the slot
@@ -924,9 +918,8 @@ function evaluateCloseRow(
  * `unknown` — none represent a live worker that would conflict with a
  * freshly-dispatched sibling.
  *
- * The per-EPIC mutex keys on this predicate as-is — a `planner-running`
- * verdict still occupies the epic slot. The per-ROOT mutex narrows it via
- * `isRootOccupant` to exempt planners from claiming the root.
+ * Both the per-EPIC and per-ROOT mutexes key on this predicate (`isRootOccupant`
+ * is a passthrough), so a live worker occupies both scopes identically.
  */
 function isLiveWorkOccupant(verdict: Verdict): boolean {
   return (
@@ -940,21 +933,14 @@ function isLiveWorkOccupant(verdict: Verdict): boolean {
 }
 
 /**
- * Per-root occupancy predicate. Narrower than `isLiveWorkOccupant`: a
- * `planner-running` verdict does NOT occupy the root, because a planner has no
- * dispatched worker holding the working tree — letting a sibling epic's ready
- * task dispatch concurrently in the same root is safe (git `index.lock`
- * contention is absorbed by the git worker's `busy_timeout`; mid-flight
- * multi-attribution is resolved after-the-fact by the mtime pass). Real
- * workers and `dispatch-pending` still occupy via `isLiveWorkOccupant`.
- *
- * The per-EPIC mutex stays on `isLiveWorkOccupant` — a planner still blocks
- * its OWN epic (predicate 3 keeps its tasks off `ready` until it finishes).
+ * Per-root occupancy predicate. A passthrough to `isLiveWorkOccupant` — the
+ * per-root mutex and the autopilot cap (`autopilot-worker.ts` counts occupants
+ * with this predicate) treat any live worker / `dispatch-pending` row as a root
+ * occupant identically to the per-epic mutex. Kept as a distinct exported
+ * symbol so the two call sites read intent-clearly and a future divergence has
+ * a seam.
  */
 export function isRootOccupant(verdict: Verdict): boolean {
-  if (verdict.tag === "running" && verdict.reason.kind === "planner-running") {
-    return false;
-  }
   return isLiveWorkOccupant(verdict);
 }
 
@@ -1311,46 +1297,6 @@ function rollupEpicHeader(
 // ---------------------------------------------------------------------------
 // Predicate helpers
 // ---------------------------------------------------------------------------
-
-/**
- * Predicate 3 (`planner-running`). Reads each link's `state` directly off the
- * embedded `JobLinkEntry` (denormalized off the linked `jobs` row at the
- * reducer's write boundary), so this predicate doesn't join against the live
- * `jobs` page — `"working"` is dispositive.
- */
-function anyJobLinkRunning(epic: Epic): boolean {
-  for (const link of epic.job_links) {
-    if (link.state === "working") {
-      return true;
-    }
-  }
-  return false;
-}
-
-/**
- * Discharge condition for the `planner-running` gate. Returns `true` once real
- * work has landed on the epic — any embedded worker job under a task, or an
- * embedded closer job at epic level.
- *
- * Rationale: `anyJobLinkRunning` reads the LIVE state of the planner's
- * `job_links` entry, so a planner session restarted for followup flips back to
- * `working` and would otherwise re-block an epic it already finished. Once a
- * worker/closer has been dispatched the plan is committed-to; embedded jobs
- * persist (`ended`/`killed`), so this latch is sticky once set. A working
- * planner is a `job_links` edge, never an embedded `jobs[]` element, so it
- * never trips this check.
- */
-function epicWorkStarted(epic: Epic): boolean {
-  if (epic.jobs !== undefined && epic.jobs.length > 0) {
-    return true;
-  }
-  for (const task of epic.tasks) {
-    if (task.jobs !== undefined && task.jobs.length > 0) {
-      return true;
-    }
-  }
-  return false;
-}
 
 function anyEmbeddedJobWorking(
   embedded: { state: string }[] | undefined,

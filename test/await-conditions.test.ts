@@ -226,7 +226,6 @@ test("workable: running verdicts are NOT workable (row already in motion)", () =
     { tag: "running", reason: { kind: "job-running" } },
     { tag: "running", reason: { kind: "sub-agent-running" } },
     { tag: "running", reason: { kind: "sub-agent-stale" } },
-    { tag: "running", reason: { kind: "planner-running" } },
   ];
   for (const v of runningVerdicts) {
     expect(workable(v)).toBe(false);

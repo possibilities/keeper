@@ -472,8 +472,8 @@ const PILL_COLORS: Record<string, PillBucket> = {
  * `[task-repo:<basename>]` divergence pill minted by `taskRepoPillSeg`
  * colors the same as `[blocked]`) AND to the `blue` (bright blue) bucket
  * for any `running:*` payload (so the `[running:<kind>]` motion pills minted
- * by `formatPill` for the four reasons split out of `BlockReason` —
- * `job-running`, `sub-agent-running`, `planner-running`, and (fn-638.4)
+ * by `formatPill` for the reasons split out of `BlockReason` —
+ * `job-running`, `sub-agent-running`, and (fn-638.4)
  * `sub-agent-stale` — color the same as a bare `[running]`, EXCEPT the
  * `running:sub-agent-stale` payload, which is routed to the `warn`
  * (yellow) bucket by a more-specific branch above the generic

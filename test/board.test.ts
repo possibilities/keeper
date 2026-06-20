@@ -1150,11 +1150,10 @@ test("colorizePillsInLine: stopped + failed + awaiting stack colors independentl
   );
 });
 
-// fn-638.4: the `running:*` prefix fallback colors the three "fresh
-// in-flight" RunningReason kinds (`job-running`, `sub-agent-running`,
-// `planner-running`) as `blue` (bright blue) — same bucket as the bare
-// `[running]` exact match — while the more-specific
-// `running:sub-agent-stale` branch above the fallback routes the
+// fn-638.4: the `running:*` prefix fallback colors the "fresh in-flight"
+// RunningReason kinds (`job-running`, `sub-agent-running`) as `blue` (bright
+// blue) — same bucket as the bare `[running]` exact match — while the
+// more-specific `running:sub-agent-stale` branch above the fallback routes the
 // possibly-stuck orphan variant to `warn` (yellow). Asserts the
 // distinct color so a regression that drops the more-specific branch
 // would surface here instead of silently re-collapsing stale into
@@ -1165,9 +1164,6 @@ test("colorizePillsInLine: running:<kind> fresh variants take the blue bucket vi
   );
   expect(colorizePillsInLine("[running:sub-agent-running]")).toBe(
     `[${BLUE}running:sub-agent-running${RESET}]`,
-  );
-  expect(colorizePillsInLine("[running:planner-running]")).toBe(
-    `[${BLUE}running:planner-running${RESET}]`,
   );
 });
 
@@ -1499,10 +1495,6 @@ const JOB_RUNNING: Verdict = {
   tag: "running",
   reason: { kind: "job-running" },
 };
-const PLANNER_RUNNING: Verdict = {
-  tag: "running",
-  reason: { kind: "planner-running" },
-};
 const SUBAGENT_RUNNING: Verdict = {
   tag: "running",
   reason: { kind: "sub-agent-running" },
@@ -1574,7 +1566,6 @@ test("renderTaskPills: worker_phase=done renders [worker-done] in the previously
     JOB_RUNNING,
     SUBAGENT_RUNNING,
     SUBAGENT_STALE,
-    PLANNER_RUNNING,
     EPIC_NOT_VALIDATED,
     READY,
   ]) {

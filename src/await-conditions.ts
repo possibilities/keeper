@@ -427,10 +427,7 @@ function taskStarted(task: Task): boolean {
 /**
  * Pure "work has begun on this epic at least once" predicate. True if the
  * epic carries an embedded epic-form job (`plan`/`close`/`approve`) OR any
- * task satisfies {@link taskStarted}. Mirrors `readiness.ts`'s
- * `epicWorkStarted` undefined-guard style but composes the FULL task
- * predicate — `epicWorkStarted` only checks `jobs.length` (it gates the
- * planner-running discharge, a narrower question), so it is not reused here.
+ * task satisfies {@link taskStarted}.
  */
 function epicStarted(epic: Epic): boolean {
   if ((epic.jobs?.length ?? 0) > 0) {

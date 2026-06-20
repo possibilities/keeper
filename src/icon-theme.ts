@@ -90,11 +90,10 @@ const FA = {
 export const FA_CLASSIC: IconTheme = {
   name: "fa-classic",
   exact: {
-    // --- verdict (Tier 1A): one glyph per tag; the four running kinds ---
+    // --- verdict (Tier 1A): one glyph per tag; the running kinds ---
     ready: FA.play,
     completed: FA.checkCircle,
     "running:job-running": FA.sync,
-    "running:planner-running": FA.pencil,
     "running:sub-agent-running": FA.cogs,
     "running:sub-agent-stale": FA.exclTriangle,
     // fn-719: a live worker-launched monitor (backgrounded suite) occupying
