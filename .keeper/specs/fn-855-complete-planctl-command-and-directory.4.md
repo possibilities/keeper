@@ -45,5 +45,5 @@ reducer-projections/rpc-handlers run on the fast tier. Verify all green.
 - [ ] tests green (test:full for session-state)
 
 ## Done summary
-
+Modernized stale .planctl/ fixture PATH strings to .keeper/ in reducer-projections, rpc-handlers, and session-state tests (convenience values only); planctl_* columns and recognition assertions left untouched. Full suite green.
 ## Evidence

@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Modernize stale .planctl test fixture paths",
-  "updated_at": "2026-06-20T19:01:13.746000Z"
+  "updated_at": "2026-06-20T19:20:47.533000Z",
+  "worker_done_at": "2026-06-20T19:20:47.533000Z"
 }
