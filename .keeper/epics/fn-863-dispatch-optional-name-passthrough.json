@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-20T21:08:48.979000Z",
+  "depends_on_epics": [],
+  "id": "fn-863-dispatch-optional-name-passthrough",
+  "last_validated_at": "2026-06-20T21:08:49.023000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "dispatch optional name passthrough",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-20T21:08:48.979000Z"
+}
