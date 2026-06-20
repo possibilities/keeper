@@ -17,5 +17,5 @@ the why and needs no change.
 - [ ] No body or behavior change; existing dash-view-model tests still pass.
 
 ## Done summary
-
+Rewrote the robotRung doc-comment header to lead with terminal-state resolution (ended/killed -> api-error -> awaiting -> working/stopped), matching the body. Docs-only, no behavior change.
 ## Evidence
