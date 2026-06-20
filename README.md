@@ -2865,6 +2865,47 @@ Because the entire system folds deterministically from the immutable `events`
 table, a restored DB re-derives byte-identical projections; no projection state
 is lost that the event log doesn't already carry.
 
+### `keeper reclaim` — offline size-reclaim (fn-847)
+
+`keeper reclaim` wraps `reclaimDb` (the `VACUUM INTO` rebuild with
+`auto_vacuum=INCREMENTAL` baked + `quick_check` gate) into a single guarded
+operator command. The retention shed (`## Compaction`) frees pages onto the live
+file's freelist, but an in-place online `VACUUM` is deliberately never run (it
+rewrites the whole multi-GB DB under the writer lock), so the physical reclaim is
+this OFFLINE op — run with the daemon STOPPED. The command:
+
+1. **Refuses while the daemon is up.** It reads the keeperd ownership lock
+   (`<sock>.lock`) and, if the recorded pid is alive, exits 1 — a live daemon
+   connection racing the atomic swap corrupts the DB. The guard is load-bearing.
+2. Keeps a **pre-reclaim snapshot** (verified `VACUUM INTO` copy) as the rollback.
+3. Runs `reclaimDb` into `<db>.reclaim`.
+4. **Self-verifies BEFORE the swap** — the reclaimed file opens clean, carries the
+   same `schema_version`, bakes `auto_vacuum=2`, and reproduces IDENTICAL per-table
+   row counts (every `events` row + every projection). On any mismatch the original
+   DB is left untouched and the snapshot kept (a lost/extra row is caught while the
+   original is still recoverable).
+5. Atomically `mv`s the verified output over the live DB and drops the stale
+   `-wal`/`-shm` sidecars.
+
+Operator runbook (default `~/.local/state/keeper` paths; `keeper reclaim
+--agent-help` prints the full step list):
+
+```sh
+keeper autopilot pause                                # level-triggered on data_version
+launchctl bootout gui/$(id -u)/arthack.keeperd        # stop the daemon (releases the DB)
+keeper reclaim                                        # snapshot → reclaim → self-verify → swap
+launchctl bootstrap gui/$(id -u) <keeperd plist>      # restart
+keeper await server-up                                # wait until serving
+sqlite3 -readonly ~/.local/state/keeper/keeper.db 'PRAGMA auto_vacuum;'   # 2
+ls -lh ~/.local/state/keeper/keeper.db                # ~0.6 GB
+keeper search-history <a known term>                  # forensics intact (re-fold byte-identical)
+keeper autopilot play                                 # re-enable
+```
+
+If post-restart verification fails, stop the daemon, `mv` the pre-reclaim snapshot
+back over `keeper.db`, restart, and triage with autopilot left paused. Never delete
+the snapshot until verification passes. `--dry-run` prints the runbook only.
+
 ### One-time event_blobs shed reclaim (fn-836.4)
 
 The v74 migration LOGICALLY drops `event_blobs` (restoring keep-set bodies inline

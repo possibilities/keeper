@@ -31,6 +31,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { daemonUp } from "../cli/reclaim";
 import {
   BACKUP_INTERVAL_MS,
   backupDb,
@@ -39,12 +40,16 @@ import {
   isVerifiedOk,
   newestSnapshotMs,
   pruneSnapshots,
+  readSchemaVersion,
+  readTableRowCounts,
+  reclaimDb,
   resolveBackupDir,
   restoreInstructions,
   snapshotName,
+  verifyReclaim,
   verifySnapshot,
 } from "../src/backup";
-import { openDb } from "../src/db";
+import { openDb, SCHEMA_VERSION } from "../src/db";
 import { freshDbFile } from "./helpers/template-db";
 
 let tmpDir: string;
@@ -335,4 +340,115 @@ test("restoreInstructions: documents the stop → swap → verify → restart st
   expect(text).toContain("-wal");
   expect(text).toContain("integrity_check");
   expect(text).toMatch(/restart/i);
+});
+
+// ---------------------------------------------------------------------------
+// fn-847 — reclaim self-verify + daemon-up guard
+// ---------------------------------------------------------------------------
+
+test("readSchemaVersion / readTableRowCounts: read meta + per-table counts", () => {
+  const { db } = openDb(dbPath, { migrate: false });
+  db.run("INSERT INTO meta (key, value) VALUES ('marker-key', 'marker-val')");
+  db.close();
+
+  const ro = new Database(dbPath, { readonly: true });
+  try {
+    expect(readSchemaVersion(ro)).toBe(SCHEMA_VERSION);
+    const counts = readTableRowCounts(ro);
+    // `events` (the fold source) and `meta` are always present; internal
+    // sqlite_* tables are excluded.
+    expect(counts.events).toBeGreaterThanOrEqual(0);
+    expect(typeof counts.meta).toBe("number");
+    expect(Object.keys(counts).some((n) => n.startsWith("sqlite_"))).toBe(
+      false,
+    );
+  } finally {
+    ro.close();
+  }
+});
+
+test("verifyReclaim: a real reclaim self-verifies OK (schema/auto_vacuum/rows)", () => {
+  // Seed deterministic rows across two tables so the row-count check is real.
+  const { db } = openDb(dbPath, { migrate: false });
+  for (let i = 0; i < 50; i++) {
+    db.run("INSERT INTO meta (key, value) VALUES (?, ?)", [
+      `seed-${i}`,
+      "x".repeat(64),
+    ]);
+  }
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.close();
+
+  const outputPath = `${dbPath}.reclaim`;
+  const result = reclaimDb(dbPath, outputPath);
+  expect(result.ok).toBe(true);
+
+  const verify = verifyReclaim(dbPath, outputPath);
+  expect(verify.ok).toBe(true);
+  expect(verify.error).toBeNull();
+  expect(verify.sourceSchemaVersion).toBe(SCHEMA_VERSION);
+  expect(verify.outputSchemaVersion).toBe(SCHEMA_VERSION);
+  // reclaimDb bakes auto_vacuum=INCREMENTAL (2) into the output.
+  expect(verify.outputAutoVacuum).toBe(2);
+});
+
+test("verifyReclaim: a row-count divergence FAILS the self-verify", () => {
+  const { db } = openDb(dbPath, { migrate: false });
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.close();
+
+  const outputPath = `${dbPath}.reclaim`;
+  expect(reclaimDb(dbPath, outputPath).ok).toBe(true);
+
+  // Mutate the SOURCE after the reclaim so the counts diverge — the verify must
+  // catch it (the Early-proof point: a lost/extra row is caught before swap).
+  const { db: db2 } = openDb(dbPath, { migrate: false });
+  db2.run("INSERT INTO meta (key, value) VALUES ('drift', 'row')");
+  db2.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  db2.close();
+
+  const verify = verifyReclaim(dbPath, outputPath);
+  expect(verify.ok).toBe(false);
+  expect(verify.error).toMatch(/row-count mismatch on 'meta'/);
+});
+
+test("verifyReclaim: a non-INCREMENTAL output FAILS the auto_vacuum check", () => {
+  const { db } = openDb(dbPath, { migrate: false });
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.close();
+
+  // A plain VACUUM INTO (no auto_vacuum pragma) yields auto_vacuum=0 — the swap
+  // must refuse it (the steady-state incremental_vacuum relies on mode 2).
+  const outputPath = `${dbPath}.plain`;
+  const src = new Database(dbPath, { readonly: true });
+  try {
+    src.run(`VACUUM INTO '${outputPath.replace(/'/g, "''")}'`);
+  } finally {
+    src.close();
+  }
+
+  const verify = verifyReclaim(dbPath, outputPath);
+  expect(verify.ok).toBe(false);
+  expect(verify.error).toMatch(/auto_vacuum/);
+});
+
+test("daemonUp: guard reads the keeperd lock pid and probes liveness", () => {
+  const sockPath = join(tmpDir, "keeperd.sock");
+  const lockPath = `${sockPath}.lock`;
+
+  // No lock → daemon down (safe to reclaim).
+  expect(daemonUp(sockPath)).toEqual({ up: false, pid: null });
+
+  // Lock with OUR pid (definitely alive) → guard refuses.
+  writeFileSync(lockPath, `${process.pid}\n`);
+  expect(daemonUp(sockPath)).toEqual({ up: true, pid: process.pid });
+
+  // Lock with a dead pid → stale, reads as down.
+  // PID 2^30 is far above any real pid; process.kill(.,0) → ESRCH.
+  writeFileSync(lockPath, `${1 << 30}\n`);
+  expect(daemonUp(sockPath)).toEqual({ up: false, pid: null });
+
+  // Unparseable lock → conservatively down (matches acquireLock's stale stance).
+  writeFileSync(lockPath, "not-a-pid\n");
+  expect(daemonUp(sockPath)).toEqual({ up: false, pid: null });
 });

@@ -63,6 +63,7 @@ function makeHarness(): Harness {
       "show-session-events": mkHandler("show-session-events"),
       "show-job": mkHandler("show-job"),
       plan: mkHandler("plan"),
+      reclaim: mkHandler("reclaim"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),

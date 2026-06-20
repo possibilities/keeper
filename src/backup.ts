@@ -564,6 +564,174 @@ export function reclaimDb(dbPath: string, outputPath: string): ReclaimResult {
 }
 
 /**
+ * Read the stored `meta.schema_version` from an OPEN read-only DB handle, or
+ * `null` if the row is absent/unparseable. Used by the reclaim self-verify to
+ * assert the migration version round-tripped unchanged through the `VACUUM
+ * INTO` rebuild (a defragmented copy preserves every row, so the version MUST
+ * be identical — a mismatch means the swap targeted the wrong file or the copy
+ * is structurally wrong).
+ */
+export function readSchemaVersion(db: Database): number | null {
+  try {
+    const row = db
+      .query("SELECT value FROM meta WHERE key = 'schema_version'")
+      .get() as { value?: unknown } | null;
+    const raw = row?.value;
+    const n = typeof raw === "string" ? Number.parseInt(raw, 10) : Number(raw);
+    return Number.isInteger(n) ? n : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Per-table row counts for every USER table in an OPEN read-only DB handle,
+ * keyed by table name. Internal `sqlite_*` tables are excluded (their bookkeeping
+ * rows are an implementation detail a `VACUUM INTO` rebuild legitimately
+ * rewrites). Table names come from `sqlite_master`, so the set adapts as the
+ * schema grows — the self-verify covers `events` (the canonical fold source) AND
+ * every projection without a hand-maintained list to drift. Sorted by name for a
+ * stable comparison order.
+ */
+export function readTableRowCounts(db: Database): Record<string, number> {
+  const tables = (
+    db
+      .query(
+        "SELECT name FROM sqlite_master WHERE type = 'table' AND name NOT LIKE 'sqlite_%' ORDER BY name",
+      )
+      .all() as { name: string }[]
+  ).map((r) => r.name);
+  const counts: Record<string, number> = {};
+  for (const t of tables) {
+    // Identifier is a sqlite_master table name (not user input); quote it
+    // defensively all the same.
+    const quoted = t.replace(/"/g, '""');
+    const row = db.query(`SELECT COUNT(*) AS n FROM "${quoted}"`).get() as {
+      n?: unknown;
+    } | null;
+    counts[t] = typeof row?.n === "number" ? row.n : 0;
+  }
+  return counts;
+}
+
+/** Outcome of a {@link verifyReclaim} self-verify — pure data the caller logs. */
+export interface ReclaimVerifyResult {
+  /** True iff EVERY checked invariant holds (the go/no-go for the swap). */
+  ok: boolean;
+  /** Source schema_version (`null` if unreadable). */
+  sourceSchemaVersion: number | null;
+  /** Output schema_version (`null` if unreadable). */
+  outputSchemaVersion: number | null;
+  /** Output `PRAGMA auto_vacuum` mode (2 == INCREMENTAL is required). */
+  outputAutoVacuum: number;
+  /** First mismatch detail (`null` on success); names the failing invariant. */
+  error: string | null;
+}
+
+/**
+ * Self-verify a freshly-{@link reclaimDb}'d OUTPUT against its SOURCE before the
+ * operator swaps it in: the reclaimed copy must open clean, carry the SAME
+ * `schema_version`, bake `auto_vacuum=INCREMENTAL` (=2), and reproduce IDENTICAL
+ * per-table row counts on every user table (so no row — least of all an `events`
+ * row, the fold source — was lost or duplicated by the rebuild). The Early-proof
+ * point: this runs BEFORE the pre-reclaim snapshot is discarded, so a swap that
+ * would corrupt or lose rows is caught while the original is still recoverable.
+ *
+ * Opens BOTH paths read-only on dedicated short-lived connections (no writer
+ * lock); returns the first failing invariant in `error`. Any open/query throw is
+ * itself a verify failure (a reclaimed DB that won't open read-only is not
+ * swap-safe).
+ */
+export function verifyReclaim(
+  sourcePath: string,
+  outputPath: string,
+): ReclaimVerifyResult {
+  let src: Database | null = null;
+  let out: Database | null = null;
+  try {
+    src = new Database(sourcePath, { readonly: true });
+    out = new Database(outputPath, { readonly: true });
+
+    const sourceSchemaVersion = readSchemaVersion(src);
+    const outputSchemaVersion = readSchemaVersion(out);
+    const avRow = out.query("PRAGMA auto_vacuum").get() as {
+      auto_vacuum?: unknown;
+    } | null;
+    const outputAutoVacuum =
+      typeof avRow?.auto_vacuum === "number" ? avRow.auto_vacuum : 0;
+
+    const base: Omit<ReclaimVerifyResult, "ok" | "error"> = {
+      sourceSchemaVersion,
+      outputSchemaVersion,
+      outputAutoVacuum,
+    };
+
+    if (
+      sourceSchemaVersion === null ||
+      outputSchemaVersion === null ||
+      sourceSchemaVersion !== outputSchemaVersion
+    ) {
+      return {
+        ...base,
+        ok: false,
+        error: `schema_version mismatch (source=${sourceSchemaVersion}, output=${outputSchemaVersion})`,
+      };
+    }
+    if (outputAutoVacuum !== 2) {
+      return {
+        ...base,
+        ok: false,
+        error: `output auto_vacuum is ${outputAutoVacuum}, expected 2 (INCREMENTAL)`,
+      };
+    }
+
+    const srcCounts = readTableRowCounts(src);
+    const outCounts = readTableRowCounts(out);
+    const srcTables = Object.keys(srcCounts).sort();
+    const outTables = Object.keys(outCounts).sort();
+    if (srcTables.join(",") !== outTables.join(",")) {
+      return {
+        ...base,
+        ok: false,
+        error: `table set differs (source: ${srcTables.join("|")}; output: ${outTables.join("|")})`,
+      };
+    }
+    for (const t of srcTables) {
+      if (srcCounts[t] !== outCounts[t]) {
+        return {
+          ...base,
+          ok: false,
+          error: `row-count mismatch on '${t}' (source=${srcCounts[t]}, output=${outCounts[t]})`,
+        };
+      }
+    }
+
+    return { ...base, ok: true, error: null };
+  } catch (err) {
+    return {
+      ok: false,
+      sourceSchemaVersion: null,
+      outputSchemaVersion: null,
+      outputAutoVacuum: 0,
+      error: `reclaim self-verify threw: ${
+        err instanceof Error ? err.message : String(err)
+      }`,
+    };
+  } finally {
+    try {
+      src?.close();
+    } catch {
+      /* best-effort */
+    }
+    try {
+      out?.close();
+    } catch {
+      /* best-effort */
+    }
+  }
+}
+
+/**
  * The DOCUMENTED offline reclaim procedure — pause autopilot, catch-up drain,
  * checkpoint, reclaim, gate, atomic mv, clear stale sidecars, restart, verify.
  * Rendered as a single source of truth here AND in README `## Backup & restore`.
