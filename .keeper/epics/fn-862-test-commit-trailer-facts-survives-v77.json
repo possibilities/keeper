@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T21:37:27.094000Z",
   "created_at": "2026-06-20T20:58:21.189000Z",
   "created_by_close_of": "fn-856-ungate-plan-link-classifier-from",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Test commit_trailer_facts survives v77 rewind",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T20:58:21.189000Z"
+  "updated_at": "2026-06-20T21:37:27.094000Z"
 }
