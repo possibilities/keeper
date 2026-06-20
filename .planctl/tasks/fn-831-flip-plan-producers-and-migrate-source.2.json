@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "emit plan-commit-changed and finish producer flip",
-  "updated_at": "2026-06-18T18:37:02.092000Z"
+  "updated_at": "2026-06-20T03:41:54.514000Z",
+  "worker_done_at": "2026-06-20T03:41:54.514000Z"
 }

@@ -26,5 +26,5 @@ Flip the git-worker to emit `plan-commit-changed` (the bounced daemon already fo
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+git-worker now emits plan-commit-changed; producer-side isVendoredPlanctlPath renamed to isVendoredPlanPath; historical planctl_invocation reader retained. Full suite green.
 ## Evidence
