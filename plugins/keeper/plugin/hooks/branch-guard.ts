@@ -55,6 +55,13 @@ function subcommandTokens(afterVerb: string): string[] {
   return cut.trim().length ? cut.trim().split(/[ \t]+/) : [];
 }
 
+/** True for `--orphan` in its `=value` form (`--orphan=gh-pages`). The bare
+ * `--orphan` is matched by exact equality at the call site; this covers the
+ * attached-operand form both `checkout` and `switch` accept. */
+function isOrphanFlag(t: string): boolean {
+  return t.startsWith("--orphan=");
+}
+
 /** True when this `git <subcommand> <args…>` form creates or switches a branch.
  * `args` is everything after `git` for one invocation (global flags included).*/
 function isBranchMutatingInvocation(args: string): boolean {
@@ -65,8 +72,13 @@ function isBranchMutatingInvocation(args: string): boolean {
   const tokens = subcommandTokens(headMatch[2] ?? "");
 
   if (sub === "checkout") {
-    // Create form: any of -b/-B/--orphan.
-    if (tokens.some((t) => t === "-b" || t === "-B" || t === "--orphan"))
+    // Create form: any of -b/-B/--orphan. `--orphan=<x>` (equals form) is the
+    // same create, so match the flag with or without an attached `=value`.
+    if (
+      tokens.some(
+        (t) => t === "-b" || t === "-B" || t === "--orphan" || isOrphanFlag(t),
+      )
+    )
       return true;
     // `git checkout -- <path>` is an explicit file restore — allow.
     if (tokens.includes("--")) return false;
@@ -77,10 +89,17 @@ function isBranchMutatingInvocation(args: string): boolean {
   }
 
   if (sub === "switch") {
-    // Create form: -c/-C/--create/--orphan.
+    // Create form: -c/-C/--create/--orphan. The `--create=<x>` / `--orphan=<x>`
+    // equals forms are the same create, so match those flags prefix-aware too.
     if (
       tokens.some(
-        (t) => t === "-c" || t === "-C" || t === "--create" || t === "--orphan",
+        (t) =>
+          t === "-c" ||
+          t === "-C" ||
+          t === "--create" ||
+          t === "--orphan" ||
+          t.startsWith("--create=") ||
+          isOrphanFlag(t),
       )
     )
       return true;
@@ -93,15 +112,27 @@ function isBranchMutatingInvocation(args: string): boolean {
   }
 
   if (sub === "branch") {
-    // `git branch <newname>` (a bare positional) creates a branch. List/delete/
-    // rename/move and the inspection flags are all allowed. A flag that takes a
-    // value (`-d`/`-D`/`-m`/`-M`/`-u`/`--set-upstream-to`) consumes its operand,
-    // so we only deny when a NON-flag positional appears that is not such an
-    // operand. Simplest robust rule: deny only if the FIRST token is a bare
-    // positional (create form is `git branch <name> [start-point]`).
-    const first = tokens[0];
-    if (first === undefined) return false; // bare `git branch` = list
-    return !first.startsWith("-");
+    // `git branch <newname> [start-point]` (a positional NAME) creates a branch.
+    // A leading flag that consumes no operand (`-f`/`--force`) pushes the
+    // new-branch name to a later token, so we cannot inspect tokens[0] alone.
+    // Mode-selecting flags make the command never a create: delete (`-d`/`-D`),
+    // rename/move (`-m`/`-M`), and copy (`-c`/`-C`) consume their own positionals
+    // — if any is present, allow regardless of how many positionals follow.
+    const modeFlags = new Set(["-d", "-D", "-m", "-M", "-c", "-C"]);
+    if (tokens.some((t) => modeFlags.has(t))) return false;
+    // Otherwise scan for the first positional that is not the single-value
+    // operand of an upstream/track flag (`-u`/`--set-upstream-to`/`-t`/`--track`).
+    // The `=value` forms carry their operand inline and consume no next token.
+    const valueFlags = new Set(["-u", "--set-upstream-to", "-t", "--track"]);
+    for (let i = 0; i < tokens.length; i++) {
+      const t = tokens[i] as string;
+      if (t.startsWith("-")) {
+        if (valueFlags.has(t)) i++; // skip this flag's operand token
+        continue;
+      }
+      return true; // a positional that is not a flag operand = create form
+    }
+    return false; // only flags (or empty) = list/inspect
   }
 
   if (sub === "worktree") {

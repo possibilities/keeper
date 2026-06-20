@@ -22,6 +22,10 @@ describe("isBranchMutatingCommand", () => {
     "git switch -C feature",
     "git switch --create feature",
     "git switch --orphan new",
+    // create-flag equals forms (F1)
+    "git switch --create=zzz",
+    "git checkout --orphan=gh-pages",
+    "git switch --orphan=new",
     // bare switch <ref> (unambiguous switch, no create flag)
     "git switch main",
     "git switch -",
@@ -32,6 +36,10 @@ describe("isBranchMutatingCommand", () => {
     // branch <newname>
     "git branch newfeature",
     "git branch newfeature origin/main",
+    // branch create behind a leading non-operand flag (F2)
+    "git branch --force newbranch",
+    "git branch -f newbranch start-point",
+    "git branch -f newbranch",
     // worktree add
     "git worktree add ../wt feature",
     // compound / subshell / env-prefix / global-flag forms
