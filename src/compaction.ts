@@ -374,6 +374,119 @@ export function retainColdPayloads(
   };
 }
 
+export interface DrainOptions extends RetentionOptions {
+  /**
+   * Hard ceiling on catch-up passes, a runaway guard. Each pass NULLs up to
+   * `maxBatches * batchSize` rows, so `maxPasses` bounds the whole drain at
+   * `maxPasses * maxBatches * batchSize` rows. Defaults
+   * {@link DEFAULT_DRAIN_MAX_PASSES}. The loop normally STOPS earlier — the first
+   * pass that sheds nothing means the cold backlog is drained.
+   */
+  maxPasses?: number;
+  /**
+   * Optional per-pass progress callback, fired AFTER each pass returns with that
+   * pass's {@link RetentionResult} and the 1-based pass number. The operator
+   * script logs from here; tests use it to assert pacing. Never reads wall-clock
+   * or liveness — a pure observer.
+   */
+  onPass?: (result: RetentionResult, pass: number) => void;
+}
+
+export interface DrainResult {
+  /** Total bodies NULLed across every pass (sum of each pass's `shed`). */
+  shed: number;
+  /** Total transactions (batches) executed across every pass. */
+  batches: number;
+  /** Number of catch-up passes run (each a full {@link retainColdPayloads}). */
+  passes: number;
+  /** Total overflow pages returned to the file tail across every pass. */
+  reclaimedPages: number;
+  /**
+   * `true` when the loop stopped on the `maxPasses` runaway guard while the last
+   * pass still shed rows — i.e. the backlog may not be fully drained. `false`
+   * (the steady case) means a pass shed nothing, so the cold tail is fully
+   * drained.
+   */
+  hitPassCap: boolean;
+}
+
+/**
+ * Max catch-up passes a single {@link drainColdPayloads} call runs before
+ * surrendering to the runaway guard. Sized so the default
+ * `maxPasses * maxBatches * batchSize` ceiling (1000 * 200 * 500 = 100M rows)
+ * dwarfs any realistic historical backlog — the loop always stops earlier on a
+ * shed-nothing pass. It exists only so a logic bug (a row that re-selects
+ * forever) cannot spin unbounded.
+ */
+export const DEFAULT_DRAIN_MAX_PASSES = 1_000;
+
+/**
+ * Batch count per catch-up pass — far larger than the steady-state
+ * {@link DEFAULT_RETENTION_MAX_BATCHES} (20) because the one-shot catch-up wants
+ * to clear the historical backlog promptly, not pace across slack ticks. Still
+ * one ≤`batchSize`-row transaction per batch, so the writer lock is released
+ * between batches and a concurrent hook INSERT is never starved — only the
+ * per-PASS cap is elevated, never the per-TX row count.
+ */
+export const DEFAULT_DRAIN_MAX_BATCHES = 200;
+
+/**
+ * One-shot catch-up drain: drive {@link retainColdPayloads} to completion,
+ * NULLing the entire cold shed-class backlog in ≤`batchSize`-row transactions.
+ * For the OPERATOR catch-up after a predicate widening (fn-837) — the
+ * steady-state 300s timer (≤`DEFAULT_RETENTION_MAX_BATCHES` batches/pass) would
+ * take hours to drain a ~600k-row historical backlog. This loops the SAME paced
+ * pass with an elevated per-pass batch cap until a pass sheds nothing.
+ *
+ * Idempotent + resumable BY CONSTRUCTION: each pass re-derives the cold/cursor
+ * window and selects only `data IS NOT NULL` rows, so already-shed rows are
+ * skipped and a re-run (or a resume after an interrupted run) simply continues
+ * from where the freelist stands. NEVER a single giant UPDATE — every tx stays
+ * ≤`batchSize` rows so the writer lock is released between batches.
+ *
+ * Runs on a WRITABLE connection OUTSIDE any fold (same contract as
+ * {@link retainColdPayloads}). Does NOT checkpoint the WAL or run the offline
+ * VACUUM — the operator script handles the PASSIVE checkpoint + the daemon-
+ * stopped `reclaimDb` reclaim around this drain.
+ */
+export function drainColdPayloads(
+  db: Database,
+  options: DrainOptions = {},
+): DrainResult {
+  const maxPasses = options.maxPasses ?? DEFAULT_DRAIN_MAX_PASSES;
+  const passOptions: RetentionOptions = {
+    batchSize: options.batchSize ?? DEFAULT_RETENTION_BATCH_SIZE,
+    maxBatches: options.maxBatches ?? DEFAULT_DRAIN_MAX_BATCHES,
+    recentRetentionMargin:
+      options.recentRetentionMargin ?? RECENT_RETENTION_MARGIN,
+    incrementalVacuumPages:
+      options.incrementalVacuumPages ?? DEFAULT_INCREMENTAL_VACUUM_PAGES,
+  };
+
+  let shed = 0;
+  let batches = 0;
+  let reclaimedPages = 0;
+  let passes = 0;
+  let hitPassCap = false;
+
+  for (let pass = 1; pass <= maxPasses; pass++) {
+    const result = retainColdPayloads(db, passOptions);
+    passes = pass;
+    shed += result.shed;
+    batches += result.batches;
+    reclaimedPages += result.reclaimedPages;
+    options.onPass?.(result, pass);
+
+    // A pass that shed nothing means the cold backlog is fully drained — stop.
+    if (result.shed === 0) break;
+    // Last allowed pass still shed rows: the runaway guard tripped. The caller
+    // re-runs (idempotent) to finish, but flag it so a wrapper can warn.
+    if (pass === maxPasses) hitPassCap = true;
+  }
+
+  return { shed, batches, passes, reclaimedPages, hitPassCap };
+}
+
 /** Current freelist page count — the pool `incremental_vacuum` drains. */
 function freelistPageCount(db: Database): number {
   const row = db.query("PRAGMA freelist_count").get() as {

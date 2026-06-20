@@ -2832,3 +2832,28 @@ incremental_vacuum`. `reclaimDb(dbPath, outputPath)` in `src/backup.ts` does the
 `reclaimInstructions(...)` prints the full checkpoint → reclaim → atomic `mv` →
 restart → verify procedure. Keep the pre-shed snapshot as the rollback until the
 restarted COALESCE-free binary verifies `event_blobs` is gone.
+
+### One-time widened-shed catch-up reclaim (fn-837.2)
+
+fn-837 widened the steady-state retention predicate from the four mutation tools to
+every fold-unread class (see `## Compaction` above). That makes a ~600k-row
+historical backlog newly eligible, but the steady-state 300s timer (≤20 batches ≈
+≤10k rows/pass) would take 5+ hours to drain it, and per-batch `incremental_vacuum`
+lags so the FILE won't shrink without a full `VACUUM INTO`. So the prompt reclaim is
+a TWO-STEP offline op: a catch-up drain (online) then a daemon-stopped VACUUM.
+
+`bun scripts/reclaim-db.ts` runs the catch-up drain — `drainColdPayloads` in
+`src/compaction.ts` loops the SAME paced retention pass (≤500 rows/tx, elevated
+per-pass batch cap, NEVER one giant UPDATE) until a pass sheds nothing; idempotent
+and resumable, safe to run while keeperd is UP (it is the daemon's own paced pass,
+just driven to completion). It then reprints the offline reclaim runbook. Run with
+`--dry-run` to print the runbook only.
+
+The runbook (`reclaimInstructions(...)` in `src/backup.ts`, the single source of
+truth) sequences: pause autopilot FIRST (it is level-triggered on `PRAGMA
+data_version`, which the VACUUM bumps) → catch-up drain → precheck free disk + stop
+the daemon → snapshot → `wal_checkpoint(FULL)` → `reclaimDb` `VACUUM INTO` (bakes
+`auto_vacuum=INCREMENTAL` + `quick_check` gate) → atomic `mv` + clear stale
+`-wal`/`-shm` → restart → `keeper await server-up` → verify DB ~0.6 GB,
+`PRAGMA auto_vacuum=2`, search-history forensics intact → re-enable autopilot. Keep
+the pre-reclaim snapshot as the rollback until verification passes.

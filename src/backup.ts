@@ -564,10 +564,18 @@ export function reclaimDb(dbPath: string, outputPath: string): ReclaimResult {
 }
 
 /**
- * The DOCUMENTED offline reclaim procedure for the fn-836.4 shed — checkpoint,
- * reclaim, gate, atomic mv, clear stale sidecars, restart, verify. Rendered as a
- * single source of truth here AND in README `## Backup & restore`. Run with the
- * daemon STOPPED; keep the pre-shed snapshot as the rollback until the restarted
+ * The DOCUMENTED offline reclaim procedure — pause autopilot, catch-up drain,
+ * checkpoint, reclaim, gate, atomic mv, clear stale sidecars, restart, verify.
+ * Rendered as a single source of truth here AND in README `## Backup & restore`.
+ *
+ * Covers BOTH offline reclaims: the fn-836.4 `event_blobs` shed and the fn-837
+ * retention-predicate widening. The fn-837 version prepends the autopilot-pause
+ * interlock + the one-shot catch-up drain (`bun scripts/reclaim-db.ts`) — the
+ * steady-state 300s timer would take hours to drain the widened historical
+ * backlog and the file won't shrink without the `VACUUM INTO`. Autopilot is
+ * level-triggered on `PRAGMA data_version`, which the VACUUM bumps, so it MUST be
+ * paused BEFORE the daemon is stopped. Run the VACUUM step with the daemon
+ * STOPPED; keep the pre-reclaim snapshot as the rollback until the restarted
  * binary verifies.
  */
 export function reclaimInstructions(
@@ -575,32 +583,47 @@ export function reclaimInstructions(
   dbPath: string,
 ): string {
   return [
-    "Offline event_blobs shed reclaim (daemon STOPPED):",
+    "Offline retention-shed reclaim (daemon STOPPED for the VACUUM):",
     "",
-    "  1. Stop the daemon so nothing holds the writer lock or a stale WAL:",
-    "       launchctl stop <keeperd label>",
+    "  1. Pause autopilot FIRST — it is level-triggered on PRAGMA data_version,",
+    "     which the VACUUM bumps; pausing before the daemon stops avoids a",
+    "     dispatch racing the swapped-in file:",
+    "       keeper autopilot pause",
     "",
-    "  2. Keep a pre-shed snapshot as the rollback (verified VACUUM INTO copy):",
+    "  2. Drain the widened cold shed-class backlog to completion while the",
+    "     daemon is still UP (the SAME paced ≤500-row/tx retention, driven to",
+    "     completion; idempotent — safe to re-run):",
+    "       bun scripts/reclaim-db.ts   # drains, then reprints this runbook",
+    "",
+    "  3. Precheck free disk — VACUUM INTO needs ~1-1.5 GB transient headroom —",
+    "     then stop the daemon so nothing holds the writer lock or a stale WAL:",
+    `       df -h "$(dirname '${dbPath}')"`,
+    "       launchctl bootout <keeperd label>   # or: launchctl stop",
+    "",
+    "  4. Keep a pre-reclaim snapshot as the rollback (verified VACUUM INTO copy):",
     "       bun scripts/backup-db.ts   # or the existing daily snapshot",
     "",
-    "  3. Checkpoint the WAL fully into the main DB, then reclaim into a new",
-    "     file with auto_vacuum=INCREMENTAL baked + quick_check gate:",
+    "  5. Checkpoint the WAL fully into the main DB, then reclaim into a new file",
+    "     with auto_vacuum=INCREMENTAL baked + quick_check gate:",
     `       sqlite3 '${dbPath}' 'PRAGMA wal_checkpoint(FULL);'`,
     "       # reclaimDb(dbPath, outputPath) does the VACUUM INTO + gate",
     "",
-    "  4. Atomically move the reclaimed file into place (SAME filesystem) and",
+    "  6. Atomically move the reclaimed file into place (SAME filesystem) and",
     "     drop the stale WAL/SHM sidecars (they belong to the OLD file):",
     `       mv '${outputPath}' '${dbPath}'`,
     `       rm -f '${dbPath}-wal' '${dbPath}-shm'`,
     "",
-    "  5. Restart the new (COALESCE-free) binary and verify before discarding",
-    "     the pre-shed snapshot:",
-    "       launchctl start <keeperd label> && keeper await server-up",
-    `       sqlite3 -readonly '${dbPath}' "SELECT name FROM sqlite_master WHERE name='event_blobs'"  # empty`,
+    "  7. Restart, wait for server-up, then verify before discarding the snapshot",
+    "     and re-enabling autopilot:",
+    "       launchctl bootstrap <keeperd domain/label> && keeper await server-up",
+    `       sqlite3 -readonly '${dbPath}' 'PRAGMA auto_vacuum;'   # 2 (INCREMENTAL)`,
+    `       ls -lh '${dbPath}'                                    # ~0.6 GB`,
+    "       keeper search-history <a known term>                 # forensics intact",
+    "       keeper autopilot play                                # re-enable",
     "",
-    "If post-restart verification fails: stop the daemon, mv the pre-shed",
-    "snapshot back, restart the prior binary. Never delete the snapshot until",
-    "verification passes.",
+    "If post-restart verification fails: stop the daemon, mv the pre-reclaim",
+    "snapshot back, restart, leave autopilot paused for triage. Never delete the",
+    "snapshot until verification passes.",
   ].join("\n");
 }
 

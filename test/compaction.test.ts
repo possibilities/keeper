@@ -29,6 +29,7 @@ import { join } from "node:path";
 import {
   computeColdWatermark,
   countAbsentBlobs,
+  drainColdPayloads,
   readFoldCursor,
   retainColdPayloads,
 } from "../src/compaction";
@@ -563,4 +564,116 @@ test("no work to do: watermark 0 / empty DB is a clean no-op", () => {
   expect(result.batches).toBe(0);
   expect(result.coldWatermark).toBe(0);
   expect(countAbsentBlobs(db)).toBe(0);
+});
+
+test("drainColdPayloads drives a cold backlog to shed=0 in ≤batchSize-row txns across multiple passes", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  // 120 cold shed-class bodies — more than one pass at (batchSize 5 * maxBatches
+  // 4 = 20 rows/pass), so the drain MUST loop several passes to finish.
+  for (let i = 0; i < 120; i++) {
+    insertMutation(`/repo/f${i}.ts`);
+  }
+  // A trailing keep-set event so every mutation row sits strictly below the
+  // fold cursor (`id < cursor`).
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  const passSheds: number[] = [];
+  const result = drainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 5,
+    maxBatches: 4,
+    incrementalVacuumPages: 0,
+    onPass: (r) => passSheds.push(r.shed),
+  });
+
+  // The whole cold backlog drained.
+  expect(result.shed).toBe(120);
+  expect(result.hitPassCap).toBe(false);
+  // Multiple passes ran (120 / (5*4) = 6 full passes + a final shed-nothing
+  // pass that stops the loop).
+  expect(result.passes).toBeGreaterThan(1);
+  // Each pass shed at most maxBatches*batchSize rows — never one giant UPDATE.
+  for (const s of passSheds) expect(s).toBeLessThanOrEqual(20);
+  // The terminal pass shed nothing (that's what stopped the loop).
+  expect(passSheds[passSheds.length - 1]).toBe(0);
+
+  // Every cold shed-class body is NULL now.
+  const remaining = (
+    db
+      .query(
+        "SELECT COUNT(*) AS n FROM events WHERE hook_event='PostToolUse' AND tool_name='Write' AND data IS NOT NULL",
+      )
+      .get() as { n: number }
+  ).n;
+  expect(remaining).toBe(0);
+  // No keep-set body went missing.
+  expect(countAbsentBlobs(db)).toBe(0);
+});
+
+test("drainColdPayloads is idempotent/resumable — a second run sheds nothing", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 30; i++) {
+    insertMutation(`/repo/f${i}.ts`);
+  }
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  const first = drainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 5,
+    maxBatches: 50,
+    incrementalVacuumPages: 0,
+  });
+  expect(first.shed).toBe(30);
+
+  // Re-running over the already-drained DB sheds nothing (already-NULL bodies
+  // are skipped by `data IS NOT NULL`) and exits after one shed-nothing pass.
+  const second = drainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 5,
+    maxBatches: 50,
+    incrementalVacuumPages: 0,
+  });
+  expect(second.shed).toBe(0);
+  expect(second.passes).toBe(1);
+});
+
+test("drainColdPayloads flags hitPassCap when maxPasses trips before the backlog drains", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 40; i++) {
+    insertMutation(`/repo/f${i}.ts`);
+  }
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  // 40 cold rows but only 2 passes of (1 batch * 5 rows) = 10 rows allowed —
+  // the runaway guard trips with rows still shedding.
+  const result = drainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 5,
+    maxBatches: 1,
+    maxPasses: 2,
+    incrementalVacuumPages: 0,
+  });
+  expect(result.shed).toBe(10);
+  expect(result.passes).toBe(2);
+  expect(result.hitPassCap).toBe(true);
+
+  // A follow-up run (idempotent) finishes the remaining backlog.
+  const finish = drainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 5,
+    maxBatches: 50,
+    incrementalVacuumPages: 0,
+  });
+  expect(finish.shed).toBe(30);
+  expect(finish.hitPassCap).toBe(false);
+});
+
+test("drainColdPayloads over a clean DB is a no-op (no passes shed)", () => {
+  const result = drainColdPayloads(db);
+  expect(result.shed).toBe(0);
+  expect(result.passes).toBe(1);
+  expect(result.hitPassCap).toBe(false);
 });
