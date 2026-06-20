@@ -43,5 +43,5 @@ New `test/dispatch-command.test.ts`: validator (one `::`, verb whitelist, empty/
 - [ ] New unit tests cover the validator, builder (byte-pinned), adversarial prompt, and NUL/oversize rejection.
 
 ## Done summary
-
+Added dep-free src/dispatch-command.ts leaf module holding the discriminated-result verb::id validator, defaultPlanPrompt, the positional $@ buildDispatchLaunchArgv builder, and a prompt-bytes guard; rpc-handlers re-wraps the validator's {ok:false} into BadParamsError keeping the bad_params wire contract byte-identical.
 ## Evidence

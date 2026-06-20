@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "shared dispatch-command module",
-  "updated_at": "2026-06-20T20:16:03.014000Z"
+  "updated_at": "2026-06-20T20:35:30.188000Z",
+  "worker_done_at": "2026-06-20T20:35:30.188000Z"
 }
