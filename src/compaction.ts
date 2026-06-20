@@ -7,42 +7,49 @@
  * `COALESCE(events.data, event_blobs.data)` — lossless but never shrinking the
  * DB (the bytes just moved sideways). The fn-836.4 shed DROPPED `event_blobs`
  * and narrowed the canonical fold input: shed-class bodies are no longer read by
- * any fold (their only fold-consumed field, `tool_input.file_path`, is promoted
- * to the `events.mutation_path` column). So those bodies are now pure redundant
- * transcript archive — safe to NULL IN PLACE, returning their overflow pages to
- * the file via `auto_vacuum=INCREMENTAL` (baked at the .4 reclaim).
+ * any fold. The mutation tools' only fold-consumed field
+ * (`tool_input.file_path`) is promoted to the `events.mutation_path` column; the
+ * other shed classes have no fold-consumed body field at all. So those bodies are
+ * now pure redundant transcript archive — safe to NULL IN PLACE, returning their
+ * overflow pages to the file via `auto_vacuum=INCREMENTAL` (baked at the .4
+ * reclaim).
  *
- * ## What it NULLs — the SHED CLASS, the complement of the keep-set ALLOW-list
+ * ## What it NULLs — the SHED CLASS, a POSITIVE allow-list of fold-unread classes
  *
- * The keep-set is an explicit ALLOW-list of event types whose `data` BODY a live
- * fold parses (snapshot/synthetic folds, session/prompt folds, the subagent
- * PreToolUse:Agent bridge, search-history's UserPromptSubmit `$.prompt`, …). The
- * shed class is its complement: PostToolUse rows for the four mutation tools
- * (`Write`/`Edit`/`MultiEdit`/`NotebookEdit`) whose ONLY fold consumption is
- * `tool_input.file_path` — already promoted to `mutation_path`. This pass NULLs
- * ONLY the complement (never a deny-list): the predicate is the shed-class
- * mutation-tool match, exactly the canonical predicate the v74 shed migration
- * used. Every keep-set body stays inline forever, so a from-scratch re-fold
- * reads it from `events.data` and reproduces byte-identical projection rows.
+ * The shed-set is an explicit POSITIVE allow-list ({@link RETENTION_SHED_CLASS_PREDICATE})
+ * of event classes whose `data` BODY no live fold parses — a new/unlisted type
+ * defaults to KEPT (the fail-safe direction). Its complement IS the keep-set:
+ * every class a live fold reads (snapshot/synthetic folds, session/prompt folds,
+ * the subagent PreToolUse:Agent bridge, search-history's UserPromptSubmit
+ * `$.prompt`, the legacy Agent `tool_response.agentId` fallback, planctl Bash
+ * `tool_response.stdout`, …). The shed-set spans PostToolUse
+ * Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch, non-planctl
+ * PostToolUse:Bash, modern PostToolUse:Agent (`subagent_agent_id IS NOT NULL`),
+ * non-Agent PreToolUse / PostToolUseFailure tool bodies, and
+ * SubagentStart/SubagentStop/BackendExecSnapshot/Notification. Every keep-set
+ * body stays inline forever, so a from-scratch re-fold reads it from
+ * `events.data` and reproduces byte-identical projection rows.
  *
  * ## Why retention-then-refold is byte-identical
  *
- * A shed-class body is dropped ONLY once its `file_path` is captured in
- * `mutation_path` — the {@link RETENTION_SHED_PREDICATE} excludes any row that
- * still owes a backfill (`mutation_path IS NULL` while the body holds a
- * promotable `file_path`). So every file_path a from-scratch re-fold reads off
- * the column was already promoted BEFORE its body was NULLed. The keep-set bodies
- * never move. Therefore retention changes no value any fold reads → projections
- * re-fold byte-identically (the sacred invariant).
+ * No shed-class body is read by any fold, so NULLing it changes no value a fold
+ * sees. The ONE qualifier is mutation-tool-specific: a mutation row's body is
+ * dropped only once its `file_path` is captured in `mutation_path` — the
+ * {@link RETENTION_SHED_PREDICATE} excludes any mutation row that still owes a
+ * backfill (`mutation_path IS NULL` while the body holds a promotable
+ * `file_path`). So every file_path a from-scratch re-fold reads off the column
+ * was already promoted BEFORE its body was NULLed. The keep-set bodies never
+ * move. Therefore retention changes no value any fold reads → projections re-fold
+ * byte-identically (the sacred invariant).
  *
  * ## Past the cursor — never strip a body the fold has not yet consumed
  *
  * Retention additionally gates on `id < reducer_state.last_event_id`: a body is
- * stripped only AFTER the fold has already advanced past it. Even though the fold
- * reads `mutation_path` (not the body) for shed-class rows, the cursor gate is
- * defense-in-depth against any reader that resolves an un-folded body and a hedge
- * against a not-yet-backfilled forward row whose body still carries the only copy
- * of its file_path.
+ * stripped only AFTER the fold has already advanced past it. Even though no fold
+ * reads a shed-class body (the mutation tools read `mutation_path`, the rest read
+ * cheap header columns), the cursor gate is defense-in-depth against any reader
+ * that resolves an un-folded body and a hedge against a not-yet-backfilled
+ * forward mutation row whose body still carries the only copy of its file_path.
  *
  * ## Single-writer + pacing + reclaim
  *
@@ -107,24 +114,79 @@ export const DEFAULT_RETENTION_MAX_BATCHES = 20;
 export const DEFAULT_INCREMENTAL_VACUUM_PAGES = 400;
 
 /**
- * The SHED-CLASS retention predicate — the COMPLEMENT of the keep-set ALLOW-list.
+ * The SHED-CLASS retention predicate — a POSITIVE ALLOW-list of event classes
+ * whose body no live fold reads, expressed over CHEAP HEADER COLUMNS ONLY
+ * (`hook_event` / `tool_name` / `planctl_op` / `subagent_agent_id` — NEVER a
+ * `json_extract`). A new or unlisted event type matches NOTHING here and so
+ * defaults to KEPT — the fail-safe direction (an unclassified body is never
+ * shed). The complement of this set IS the keep-set: every class a live fold
+ * parses (snapshot / synthetic folds, session / prompt folds, the subagent
+ * PreToolUse:Agent bridge, the legacy Agent `tool_response.agentId` fallback,
+ * planctl Bash `tool_response.stdout`, the cron `tool_response.id`, …).
  *
- * A body is eligible to be NULLed iff it is a PostToolUse mutation-tool row (the
- * four shed tools — the only event class whose body no fold reads post-shed) AND
- * it does NOT still owe a `mutation_path` backfill. The second clause is the
- * re-fold safety gate: a row whose body holds a promotable `file_path` the column
- * does not yet carry (`mutation_path IS NULL AND json_extract(...) IS NOT NULL`)
- * is the ONE case where the body is still the sole copy of fold-read data, so it
- * is excluded until the backfill promotes it. A malformed / file_path-less body
- * (extract NULL) is freely sheddable — the fold reads NULL either way.
+ * The shed-set, each clause justified by an exhaustive fold-read audit:
+ *  - PostToolUse Write/Edit/MultiEdit/NotebookEdit — the four mutation tools
+ *    whose only fold consumption (`tool_input.file_path`) is promoted to
+ *    `mutation_path`; the body is pure transcript archive.
+ *  - PostToolUse Read/WebFetch/Skill/ToolSearch — no fold reads their body.
+ *  - PostToolUse Bash WHERE `planctl_op IS NULL` — a planctl Bash row's
+ *    `tool_response.stdout` envelope IS fold-read (`extractPlanctlStateRepo`),
+ *    so the inversion KEEPS `planctl_op IS NOT NULL` and sheds the rest.
+ *  - PostToolUse Agent WHERE `subagent_agent_id IS NOT NULL` — the modern bridge
+ *    resolves the agent id from the indexed column; only a LEGACY row
+ *    (`subagent_agent_id IS NULL`) falls back to the `tool_response.agentId`
+ *    body, so the inversion KEEPS the legacy rows.
+ *  - PreToolUse tool bodies EXCLUDING Agent — the subagent bridge reads the
+ *    PreToolUse:Agent body (`findBridgePreToolUse` / `findPendingPreToolUseForStart`).
+ *  - PostToolUseFailure tool bodies EXCLUDING Agent — a legacy failure:Agent row
+ *    falls back to the `tool_response.agentId` body, so all Agent failures KEEP.
+ *  - SubagentStart / SubagentStop / BackendExecSnapshot / Notification — their
+ *    folds read CHEAP COLUMNS only (`agent_id` / `event_type` / `backend_exec_*`),
+ *    never the body.
  *
- * This is the same `(PostToolUse, Write/Edit/MultiEdit/NotebookEdit)` predicate
- * the v74 shed migration and the `mutation_path` backfill use. Keep-set bodies
- * structurally fail the `hook_event = 'PostToolUse' AND tool_name IN (...)` match
- * and are NEVER touched.
+ * Used as the class gate of {@link RETENTION_SHED_PREDICATE} AND inside
+ * {@link countAbsentBlobs}'s `NOT(...)`. Cheap-cols only is a hard contract: the
+ * sentinel must classify shed-vs-keep on a row whose body is already NULL, so it
+ * can never re-parse the (gone) body.
  */
-export const RETENTION_SHED_PREDICATE = `hook_event = 'PostToolUse'
-   AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
+export const RETENTION_SHED_CLASS_PREDICATE = `(
+        (hook_event = 'PostToolUse' AND tool_name IN (
+           'Write','Edit','MultiEdit','NotebookEdit',
+           'Read','WebFetch','Skill','ToolSearch'
+         ))
+     OR (hook_event = 'PostToolUse' AND tool_name = 'Bash'
+           AND planctl_op IS NULL)
+     OR (hook_event = 'PostToolUse' AND tool_name = 'Agent'
+           AND subagent_agent_id IS NOT NULL)
+     OR (hook_event = 'PreToolUse' AND tool_name IS NOT NULL
+           AND tool_name != 'Agent')
+     OR (hook_event = 'PostToolUseFailure' AND tool_name IS NOT NULL
+           AND tool_name != 'Agent')
+     OR hook_event IN (
+           'SubagentStart','SubagentStop','BackendExecSnapshot','Notification'
+         )
+      )`;
+
+/**
+ * The SHED-CLASS retention predicate — the class allow-list AND the
+ * mutation-tool backfill guard.
+ *
+ * A body is eligible to be NULLed iff it is in {@link RETENTION_SHED_CLASS_PREDICATE}
+ * AND it does NOT still owe a `mutation_path` backfill. The second clause is the
+ * re-fold safety gate: a mutation row whose body holds a promotable `file_path`
+ * the column does not yet carry (`mutation_path IS NULL AND json_extract(...) IS
+ * NOT NULL`) is the ONE case where the body is still the sole copy of fold-read
+ * data, so it is excluded until the backfill promotes it. The `json_extract` is
+ * the LONE json parse in the whole predicate and only ever bites the four
+ * mutation tools — every OTHER shed class has no `mutation_path` to backfill, so
+ * the guard is a no-op for it (extract is NULL on a non-mutation body, the `NOT
+ * (NULL ... AND ...)` short-circuits to "not excluded"). A malformed /
+ * file_path-less mutation body (extract NULL) is freely sheddable — the fold
+ * reads NULL either way.
+ *
+ * Keep-set bodies structurally fail the class match and are NEVER touched.
+ */
+export const RETENTION_SHED_PREDICATE = `${RETENTION_SHED_CLASS_PREDICATE}
    AND NOT (
          mutation_path IS NULL
          AND CASE WHEN json_valid(data)
@@ -329,31 +391,31 @@ function freelistPageCount(db: Database): number {
  *
  * The re-spec'd sentinel flags only a NULL body that is NOT shed-class — i.e. a
  * keep-set event whose body a fold reads but which is missing. Retention can
- * never create that state (its predicate matches ONLY shed-class mutation tools),
+ * never create that state (its predicate matches ONLY the shed-class allow-list),
  * so a positive count always indicates a bug elsewhere (a stray NULLing write, a
  * corrupt restore). The daemon logs it distinctly from the (large, legitimate)
  * shed count.
  *
  * Header-only `IS NULL` probe: tests nullness via the record header's serial
  * type, never materializing the body (no `COALESCE` — the fn-717.2 overflow-
- * materialization peg). The shed predicate's `json_extract`/`json_valid` are not
- * evaluated here (only `hook_event`/`tool_name` distinguish shed-class from
- * keep-set, both cheap header columns), so a NULL-body row is never re-parsed.
+ * materialization peg). It reuses {@link RETENTION_SHED_CLASS_PREDICATE} — the
+ * CHEAP-COLUMNS-ONLY class allow-list, NOT the full {@link RETENTION_SHED_PREDICATE}
+ * (whose `json_extract`/`json_valid` would re-parse a body that is already NULL).
+ * Only the cheap header columns distinguish shed-class from keep-set, so a
+ * NULL-body row is never re-parsed.
  */
 export function countAbsentBlobs(db: Database): number {
   const row = db
     .query(
       // `data IS NULL` reads only the record-header serial type, never any
-      // overflow payload. A shed-class mutation row with a NULL body is the
-      // INTENDED retention outcome and is excluded; every other NULL body is a
-      // keep-set event whose fold-read body has gone missing — data loss.
+      // overflow payload. A shed-class row with a NULL body is the INTENDED
+      // retention outcome and is excluded via the shared cheap-column class
+      // predicate; every other NULL body is a keep-set event whose fold-read
+      // body has gone missing — data loss.
       `SELECT COUNT(*) AS n
          FROM events
         WHERE data IS NULL
-          AND NOT (
-                hook_event = 'PostToolUse'
-                AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-              )`,
+          AND NOT ${RETENTION_SHED_CLASS_PREDICATE}`,
     )
     .get() as { n: number };
   return row.n;

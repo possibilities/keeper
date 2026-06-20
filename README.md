@@ -2632,16 +2632,29 @@ step never resurrects the table on a post-shed restart.
 
 Forward growth is bounded by the steady-state **retention pass** (`src/compaction.ts`,
 `retainColdPayloads`) — keeper's first retention. A slack daemon timer NULLs the
-cold tail of shed-class bodies IN PLACE (the keep-set complement: PostToolUse
-mutation-tool rows past the recent window AND strictly below the fold cursor whose
-`file_path` is already promoted to `mutation_path`), running STRICTLY outside the
-fold on main's writable connection, paced (≤500 rows/batch, ≤20 batches/pass).
-After each batch `PRAGMA incremental_vacuum` returns the freed overflow pages to
-the file tail (a no-op unless the file was born `auto_vacuum=INCREMENTAL`, baked by
-`reclaimDb` above). Because the predicate excludes any row still owing a
-`mutation_path` backfill, retention-then-refold stays byte-identical. The re-spec'd
-data-loss sentinel (`countAbsentBlobs`) flags only a NULL body OUTSIDE the shed
-class — a missing keep-set body — never the intentional shed NULLs.
+cold tail of shed-class bodies IN PLACE, running STRICTLY outside the fold on
+main's writable connection, paced (≤500 rows/batch, ≤20 batches/pass). The
+shed-set is a POSITIVE allow-list over CHEAP HEADER COLUMNS only
+(`RETENTION_SHED_CLASS_PREDICATE`: `hook_event`/`tool_name`/`planctl_op`/
+`subagent_agent_id`, no json parse) — a new/unlisted event type defaults to KEPT
+(fail-safe). fn-837 widened it from the four mutation tools to every class no fold
+reads: PostToolUse Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch,
+non-planctl PostToolUse:Bash (planctl Bash KEEPS — `state_repo` is fold-read),
+modern PostToolUse:Agent (`subagent_agent_id IS NOT NULL`; legacy NULL-id Agent
+KEEPS — its `agentId` is fold-read), non-Agent PreToolUse / PostToolUseFailure tool
+bodies (PreToolUse:Agent is the subagent bridge; failure:Agent has the legacy
+`agentId` fallback), and SubagentStart/SubagentStop/BackendExecSnapshot/Notification
+(cheap-column folds). The full `RETENTION_SHED_PREDICATE` is that class allow-list
+AND a mutation-tool-specific backfill guard (the lone `json_extract`, only ever
+biting the four mutation tools that still owe a `mutation_path` promotion); it also
+gates past the recent window AND strictly below the fold cursor. After each batch
+`PRAGMA incremental_vacuum` returns the freed overflow pages to the file tail (a
+no-op unless the file was born `auto_vacuum=INCREMENTAL`, baked by `reclaimDb`
+above). Because no fold reads a shed-class body (and the mutation tools' file_path
+is already promoted), retention-then-refold stays byte-identical. The data-loss
+sentinel (`countAbsentBlobs`) reuses the SAME cheap-column class predicate inside
+its `NOT()` — flagging only a NULL body OUTSIDE the shed class (a missing keep-set
+body), never the intentional shed NULLs, and never re-parsing an already-NULL body.
 
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).

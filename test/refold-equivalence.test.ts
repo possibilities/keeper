@@ -36,10 +36,16 @@
  *       attribution the corpus implies.
  */
 
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import {
+  countAbsentBlobs,
+  RETENTION_SHED_CLASS_PREDICATE,
+  RETENTION_SHED_PREDICATE,
+  retainColdPayloads,
+} from "../src/compaction";
 import { openDb, SCHEMA_VERSION } from "../src/db";
 import { extractMutationPath } from "../src/derivers";
 import { drain } from "../src/reducer";
@@ -77,18 +83,27 @@ const SHED_MUTATION_TOOLS = new Set([
 
 /**
  * KEEP-SET: the explicit ALLOW-list of `hook_event` values whose `data` BODY a
- * live fold (`applyEvent`) or a body-resolving read (`COALESCE(events.data,
- * event_blobs.data)`) parses. Every entry was verified against a fold read in
- * `src/reducer.ts` / `src/subagent-invocations.ts` (the enumeration test below
- * pins the reader sites). The shed NULLs only bodies OUTSIDE this set AND
- * outside the shed-mutation-tool file_path promotion.
+ * live fold (`applyEvent`) parses. Every entry was verified against a fold read
+ * in `src/reducer.ts` / `src/subagent-invocations.ts` (the enumeration test below
+ * pins the reader sites). The shed NULLs only bodies in the widened shed-set
+ * ({@link RETENTION_SHED_CLASS_PREDICATE}), whose complement is exactly this set.
  *
- * NOTE on PostToolUse: the BODY is keep-set ONLY for `tool_name='Agent'` (the
- * subagent bridge — `resolveBridgeAgentId` legacy `tool_response.agentId`
- * fallback + the PreToolUse:Agent bridge), for the cron tools (CronCreate /
- * CronDelete read `tool_response.id` / `tool_input.id`), and for planctl-op
- * bearing rows (`extractPlanctlStateRepo` reads `tool_response.stdout`). The
- * four SHED_MUTATION_TOOLS are the explicit carve-OUT — their body is shed.
+ * fn-837 widened the shed-set: BackendExecSnapshot / Notification / SubagentStart
+ * / SubagentStop folds read CHEAP COLUMNS only (`backend_exec_*` / `event_type` /
+ * `agent_id`), never the body, so they moved OUT of the keep-set into the shed.
+ *
+ * NOTE on the three PARTIALLY-kept tool hook_events (they stay in this set as a
+ * hook_event because some `tool_name` slice of each is keep):
+ *  - PostToolUse: body is keep-set for `tool_name='Agent'` only on a LEGACY row
+ *    (`subagent_agent_id IS NULL` → `resolveBridgeAgentId` reads
+ *    `tool_response.agentId`); modern Agent rows shed. Also keep for the cron
+ *    tools (`tool_response.id` / `tool_input.id`) and planctl-op Bash rows
+ *    (`extractPlanctlStateRepo` reads `tool_response.stdout`). The eight
+ *    SHED_POSTTOOLUSE tools + non-planctl Bash + modern Agent are the carve-OUT.
+ *  - PreToolUse: body keep-set for `tool_name='Agent'` (the bridge); every other
+ *    PreToolUse tool body sheds.
+ *  - PostToolUseFailure: body keep-set for `tool_name='Agent'` (legacy
+ *    `tool_response.agentId` fallback); every other failure tool body sheds.
  */
 const KEEP_SET_HOOK_EVENTS = new Set([
   // Snapshot / synthetic-event folds that JSON.parse(event.data) directly.
@@ -111,7 +126,6 @@ const KEEP_SET_HOOK_EVENTS = new Set([
   "AutopilotCapSet",
   "AutopilotMode",
   "EpicArmed",
-  "BackendExecSnapshot",
   "TmuxPaneSnapshot",
   "WindowIndexSnapshot",
   "BackendExecStart",
@@ -121,18 +135,15 @@ const KEEP_SET_HOOK_EVENTS = new Set([
   "UserPromptSubmit",
   "TranscriptTitle",
   "Stop",
-  "Notification",
   "InputRequest",
   "RateLimited",
   "ApiError",
   "Killed",
   // Subagent lifecycle (PreToolUse:Agent body is read via the bridge).
-  "SubagentStart",
-  "SubagentStop",
   "SubagentTurn",
   "PreToolUse",
-  // PostToolUse is keep-set for Agent / cron / planctl-op rows; the four
-  // mutation tools are the carve-out (SHED_MUTATION_TOOLS).
+  // PostToolUse is keep-set for legacy Agent / cron / planctl-op Bash rows; the
+  // eight shed tools + non-planctl Bash + modern Agent are the carve-out.
   "PostToolUse",
   "PostToolUseFailure",
 ]);
@@ -153,6 +164,164 @@ test("keep-set and shed-class are disjoint and exhaustively classify the mutatio
     "NotebookEdit",
     "Write",
   ]);
+});
+
+test("the REAL widened shed predicate sheds the fold-unread classes and KEEPS every keep-set hook_event", () => {
+  // Import the PRODUCTION predicate (not a test fiction) and assert its CHEAP-
+  // COLUMN class gate matches exactly what a fold reads. A standalone events
+  // table lets us evaluate the real SQL string against synthetic rows: a row is
+  // "shed" iff the predicate selects it. This is the disjointness gate — the
+  // keep-set complement IS the shed-set.
+  const probe = new Database(":memory:");
+  probe.run(
+    `CREATE TABLE events (
+       id INTEGER PRIMARY KEY AUTOINCREMENT, hook_event TEXT, tool_name TEXT,
+       planctl_op TEXT, subagent_agent_id TEXT, mutation_path TEXT, data TEXT
+     )`,
+  );
+  const shedRow = (row: {
+    hook_event: string;
+    tool_name?: string | null;
+    planctl_op?: string | null;
+    subagent_agent_id?: string | null;
+    mutation_path?: string | null;
+    data?: string | null;
+  }): boolean => {
+    probe.run("DELETE FROM events");
+    probe.run(
+      `INSERT INTO events (hook_event, tool_name, planctl_op, subagent_agent_id, mutation_path, data)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        row.hook_event,
+        row.tool_name ?? null,
+        row.planctl_op ?? null,
+        row.subagent_agent_id ?? null,
+        row.mutation_path ?? null,
+        row.data ?? "{}",
+      ],
+    );
+    return (
+      (
+        probe
+          .query(
+            `SELECT COUNT(*) AS n FROM events WHERE ${RETENTION_SHED_PREDICATE}`,
+          )
+          .get() as { n: number }
+      ).n === 1
+    );
+  };
+
+  // SHED classes (cheap-column allow-list). Every mutation-tool row carries
+  // mutation_path so the backfill guard does not re-keep it.
+  for (const tool of [
+    "Write",
+    "Edit",
+    "MultiEdit",
+    "NotebookEdit",
+    "Read",
+    "WebFetch",
+    "Skill",
+    "ToolSearch",
+  ]) {
+    expect({
+      tool,
+      shed: shedRow({
+        hook_event: "PostToolUse",
+        tool_name: tool,
+        mutation_path: "/repo/x.ts",
+      }),
+    }).toEqual({ tool, shed: true });
+  }
+  expect(
+    shedRow({ hook_event: "PostToolUse", tool_name: "Bash", planctl_op: null }),
+  ).toBe(true); // non-planctl Bash sheds
+  expect(
+    shedRow({
+      hook_event: "PostToolUse",
+      tool_name: "Agent",
+      subagent_agent_id: "agent-modern",
+    }),
+  ).toBe(true); // modern Agent sheds
+  expect(shedRow({ hook_event: "PreToolUse", tool_name: "Bash" })).toBe(true);
+  expect(shedRow({ hook_event: "PostToolUseFailure", tool_name: "Read" })).toBe(
+    true,
+  );
+  for (const he of [
+    "SubagentStart",
+    "SubagentStop",
+    "BackendExecSnapshot",
+    "Notification",
+  ]) {
+    expect({ he, shed: shedRow({ hook_event: he }) }).toEqual({
+      he,
+      shed: true,
+    });
+  }
+
+  // KEEP — the three exact inversions (a flip here is a silent re-fold break).
+  expect(
+    shedRow({
+      hook_event: "PostToolUse",
+      tool_name: "Bash",
+      planctl_op: "done",
+    }),
+  ).toBe(false); // planctl Bash KEPT (state_repo fold-read)
+  expect(
+    shedRow({
+      hook_event: "PostToolUse",
+      tool_name: "Agent",
+      subagent_agent_id: null,
+    }),
+  ).toBe(false); // legacy Agent KEPT (agentId fold-read)
+  expect(shedRow({ hook_event: "PreToolUse", tool_name: "Agent" })).toBe(false); // bridge body
+  expect(
+    shedRow({ hook_event: "PostToolUseFailure", tool_name: "Agent" }),
+  ).toBe(false); // legacy failure agentId
+  // A backfill-owing mutation row (mutation_path NULL, body carries file_path)
+  // is KEPT by the json_extract guard even though its class is shed.
+  expect(
+    shedRow({
+      hook_event: "PostToolUse",
+      tool_name: "Write",
+      mutation_path: null,
+      data: JSON.stringify({ tool_input: { file_path: "/repo/owes.ts" } }),
+    }),
+  ).toBe(false);
+
+  // Every keep-set hook_event with NO tool_name (snapshot/synthetic/session) is
+  // KEPT — the shed-set never lists them.
+  for (const he of KEEP_SET_HOOK_EVENTS) {
+    if (
+      he === "PostToolUse" ||
+      he === "PreToolUse" ||
+      he === "PostToolUseFailure"
+    ) {
+      continue; // partially-kept tool events covered above
+    }
+    expect({ he, shed: shedRow({ hook_event: he }) }).toEqual({
+      he,
+      shed: false,
+    });
+  }
+
+  // A NEW/unlisted event type defaults to KEPT (fail-safe — positive allow-list).
+  expect(shedRow({ hook_event: "SomeFutureEvent", tool_name: "NewTool" })).toBe(
+    false,
+  );
+
+  probe.close();
+});
+
+test("the class predicate (cheap-cols) carries no json parse — countAbsentBlobs never re-parses a NULL body", () => {
+  // The class predicate is the cheap-column allow-list ONLY. It must contain
+  // neither json_extract nor json_valid — those live solely in the full
+  // RETENTION_SHED_PREDICATE's mutation-tool backfill guard. countAbsentBlobs
+  // reuses the CLASS predicate inside its NOT(), so it can classify a row whose
+  // body is already NULL without re-parsing the (gone) body.
+  expect(RETENTION_SHED_CLASS_PREDICATE).not.toContain("json_extract");
+  expect(RETENTION_SHED_CLASS_PREDICATE).not.toContain("json_valid");
+  // The full predicate DOES carry the lone json_extract (the backfill guard).
+  expect(RETENTION_SHED_PREDICATE).toContain("json_extract");
 });
 
 test("broad per-event body folds lose nothing when a shed-class body is NULLed (no session_title / prompt / transcript_path)", () => {
@@ -311,12 +480,14 @@ let tsCounter = 5_000;
 function insertEvent(overrides: {
   hook_event: string;
   session_id?: string;
+  event_type?: string | null;
   tool_name?: string | null;
   cwd?: string | null;
   ts?: number;
   data?: string | null;
   subagent_agent_id?: string | null;
   tool_use_id?: string | null;
+  agent_id?: string | null;
   agent_type?: string | null;
   planctl_op?: string | null;
   planctl_target?: string | null;
@@ -348,20 +519,21 @@ function insertEvent(overrides: {
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
-       subagent_agent_id, tool_use_id, agent_type, planctl_op, planctl_target,
-       planctl_files, mutation_path
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       subagent_agent_id, tool_use_id, agent_id, agent_type, planctl_op,
+       planctl_target, planctl_files, mutation_path
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? "sess-a",
       4242,
       overrides.hook_event,
-      overrides.hook_event,
+      overrides.event_type ?? overrides.hook_event,
       overrides.tool_name ?? null,
       overrides.cwd ?? "/tmp/work",
       data,
       overrides.subagent_agent_id ?? null,
       overrides.tool_use_id ?? null,
+      overrides.agent_id ?? null,
       overrides.agent_type ?? null,
       overrides.planctl_op ?? null,
       overrides.planctl_target ?? null,
@@ -573,30 +745,23 @@ function snapshotProjections() {
 }
 
 /**
- * SHED the corpus into its post-v74 live shape: NULL every shed-class body in
- * place (the four mutation tools), keeping the keep-set bodies inline. This is
- * exactly what the v74 migration leaves behind — shed-class `events.data` NULL
- * (its `tool_input.file_path` already promoted to `mutation_path` at seed time),
- * keep-set `events.data` inline. There is NO `event_blobs` table post-shed, so
- * the body simply goes away; the fold reads `mutation_path` for the file_path.
+ * SHED the corpus into its post-fn-837 live shape by driving the PRODUCTION
+ * retention path — {@link retainColdPayloads} importing the REAL widened
+ * predicate, watermark, cursor gate, and backfill guard. This is NOT a test
+ * fiction: it exercises exactly the SQL the daemon runs. `recentRetentionMargin`
+ * is 0 so the whole cold-and-past-cursor tail is eligible; `incrementalVacuumPages`
+ * is 0 because the mem template DB is not `auto_vacuum=INCREMENTAL`.
+ *
+ * Returns the {@link RetentionResult} so callers can assert the shed actually
+ * fired over the seeded shed-class rows.
  */
-function shedCorpus(): void {
-  const before = (
-    db
-      .query(
-        `SELECT COUNT(*) AS n FROM events
-          WHERE hook_event = 'PostToolUse'
-            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')
-            AND data IS NOT NULL`,
-      )
-      .get() as { n: number }
-  ).n;
-  expect(before).toBeGreaterThan(0);
-  db.run(
-    `UPDATE events SET data = NULL
-      WHERE hook_event = 'PostToolUse'
-        AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')`,
-  );
+function shedCorpus(): ReturnType<typeof retainColdPayloads> {
+  const result = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(result.shed).toBeGreaterThan(0);
+  return result;
 }
 
 function rewindAndWipeProjections(): void {
@@ -912,6 +1077,295 @@ test("differential re-fold: two from-scratch re-folds over a SHED corpus are byt
     expect(columnCandidates.has(key)).toBe(true);
   }
 });
+
+// ---------------------------------------------------------------------------
+// Layer 5 — the WIDENED shed-set (fn-837): one row per newly-shed class + each
+// guarded edge case, proving pre-shed P0 === post-shed re-fold P1 === P2 AND
+// countAbsentBlobs == 0. The shed is driven through the PRODUCTION retention
+// path (retainColdPayloads), so the proof exercises the real predicate/cursor/
+// watermark, not a hardcoded UPDATE.
+// ---------------------------------------------------------------------------
+
+const SESS_C = "11111111-2222-3333-4444-555555555555";
+const SESS_D = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+
+/**
+ * Seed a corpus spanning EVERY newly-shed class beside its KEPT guarded sibling:
+ *  - planctl Bash (KEEP, mints a source='planctl' file_attribution) beside a
+ *    non-planctl Bash (SHED);
+ *  - modern PostToolUse:Agent `subagent_agent_id` (SHED) beside a legacy
+ *    NULL-id Agent (KEEP — the bridge resolves its `tool_response.agentId`);
+ *  - PreToolUse:Agent (KEEP — the bridge body) beside a PreToolUse:Bash (SHED);
+ *  - PostToolUseFailure:Agent (KEEP) beside a PostToolUseFailure:Read (SHED);
+ *  - SubagentStart + SubagentStop (SHED — cheap-column folds) for a full turn;
+ *  - a Notification `event_type='permission_prompt'` (SHED — the fold reads the
+ *    event_type column, stamping jobs.last_permission_prompt_*);
+ *  - PostToolUse Read/WebFetch/Skill/ToolSearch + BackendExecSnapshot (SHED);
+ *  - a Cron CronCreate (KEEP — scheduled_tasks reproduces from the body);
+ *  - a malformed shed-class body (safe default, cursor advances);
+ *  - a shed-class row carrying a top-level session_title/prompt/transcript_path
+ *    a broad fold could read — proving the body is NOT read post-shed.
+ */
+function seedWidenedShedCorpus(): void {
+  insertEvent({ hook_event: "SessionStart", session_id: SESS_C });
+  insertEvent({ hook_event: "SessionStart", session_id: SESS_D });
+
+  // --- planctl Bash (KEEP) beside non-planctl Bash (SHED) ---
+  // planctl Bash: extractPlanctlStateRepo reads tool_response.stdout → KEEP.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: SESS_C,
+    cwd: REPO,
+    planctl_op: "done",
+    planctl_target: "fn-9-z.1",
+    planctl_files: JSON.stringify([".planctl/tasks/fn-9-z.1.md"]),
+    data: JSON.stringify({
+      tool_response: {
+        stdout: JSON.stringify({ plan_invocation: { state_repo: REPO } }),
+      },
+    }),
+  });
+  // non-planctl Bash: no fold reads its body → SHED. Real tool bodies carry only
+  // {tool_input, tool_response} — never a top-level session_title (the lone
+  // EVERY-event broad reader), which is exactly why the shed is lossless. The
+  // structural-keys test ("broad per-event body folds lose nothing…") pins that
+  // invariant; planting a session_title here would be a fiction (a body shape
+  // that never occurs) and would correctly diverge on re-fold.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Bash",
+    session_id: SESS_C,
+    cwd: REPO,
+    data: JSON.stringify({
+      tool_input: { command: "ls" },
+      tool_response: { stdout: "x" },
+    }),
+  });
+
+  // --- modern Agent (SHED) beside legacy NULL-id Agent (KEEP) ---
+  // A SubagentStart so both Agent close-arms have a turn-0 row to resolve.
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: SESS_C,
+    agent_id: "agent-modern",
+    agent_type: "worker",
+  });
+  insertEvent({
+    hook_event: "SubagentStart",
+    session_id: SESS_C,
+    agent_id: "agent-legacy",
+    agent_type: "worker",
+  });
+  // modern PostToolUse:Agent — resolves via the subagent_agent_id column → SHED.
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    session_id: SESS_C,
+    subagent_agent_id: "agent-modern",
+    tool_use_id: "tu-modern",
+    data: JSON.stringify({ tool_response: { ok: true } }),
+  });
+  // legacy PostToolUse:Agent — NULL subagent_agent_id, resolves via the body
+  // `tool_response.agentId` → KEEP (body must survive the shed).
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Agent",
+    session_id: SESS_C,
+    subagent_agent_id: null,
+    tool_use_id: "tu-legacy",
+    data: JSON.stringify({ tool_response: { agentId: "agent-legacy" } }),
+  });
+  // SubagentStop for the modern turn — cheap-column fold (agent_id) → SHED.
+  insertEvent({
+    hook_event: "SubagentStop",
+    session_id: SESS_C,
+    agent_id: "agent-modern",
+  });
+
+  // --- PreToolUse:Agent (KEEP) beside PreToolUse:Bash (SHED) ---
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Agent",
+    session_id: SESS_D,
+    tool_use_id: "tu-pre",
+    agent_type: "scout",
+    data: JSON.stringify({
+      tool_input: { subagent_type: "scout", description: "look", prompt: "go" },
+    }),
+  });
+  insertEvent({
+    hook_event: "PreToolUse",
+    tool_name: "Bash",
+    session_id: SESS_D,
+    data: JSON.stringify({ tool_input: { command: "echo hi" } }),
+  });
+
+  // --- PostToolUseFailure:Agent (KEEP) beside PostToolUseFailure:Read (SHED) ---
+  insertEvent({
+    hook_event: "PostToolUseFailure",
+    tool_name: "Agent",
+    session_id: SESS_D,
+    subagent_agent_id: "agent-fail",
+    data: JSON.stringify({ tool_response: { agentId: "agent-fail" } }),
+  });
+  insertEvent({
+    hook_event: "PostToolUseFailure",
+    tool_name: "Read",
+    session_id: SESS_D,
+    data: JSON.stringify({ tool_input: { file_path: "/repo/r.ts" } }),
+  });
+
+  // --- The pure cheap-column / no-fold-read shed classes ---
+  // Each carries a top-level `prompt` + `transcript_path` to PROVE those folds
+  // don't read a shed-class body: `extractPrompt` runs ONLY inside the
+  // Notification arm and `extractTranscriptPath` ONLY on SessionStart, so a
+  // PostToolUse:Read body's copies are never read — re-fold stays byte-identical.
+  for (const tool of ["Read", "WebFetch", "Skill", "ToolSearch"]) {
+    insertEvent({
+      hook_event: "PostToolUse",
+      tool_name: tool,
+      session_id: SESS_C,
+      data: JSON.stringify({
+        prompt: "SHOULD NEVER BE READ",
+        transcript_path: "/SHOULD/NEVER/READ",
+        tool_input: { q: "x" },
+        tool_response: { ok: true },
+      }),
+    });
+  }
+  insertEvent({
+    hook_event: "BackendExecSnapshot",
+    session_id: SESS_C,
+    data: JSON.stringify({ note: "shed cheap-column fold" }),
+  });
+
+  // --- Cron CronCreate (KEEP — scheduled_tasks reproduces from the body) ---
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "CronCreate",
+    session_id: SESS_C,
+    data: JSON.stringify({
+      tool_input: { cron: "0 9 * * *", prompt: "daily" },
+      tool_response: { id: "cron-1" },
+    }),
+  });
+
+  // --- A malformed shed-class body (safe default; cursor advances) ---
+  insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Read",
+    session_id: SESS_C,
+    data: "{ not json",
+  });
+
+  // --- Notification (SHED) — the fold stamps from the event_type column ---
+  // LAST on SESS_C: a downstream Pre/PostToolUse tool event on the same session
+  // clears the permission-prompt stamp (the "dialog dismissed" inference), so the
+  // stamp survives to the snapshot only when no later SESS_C tool event follows.
+  insertEvent({
+    hook_event: "Notification",
+    event_type: "permission_prompt",
+    session_id: SESS_C,
+    data: JSON.stringify({ message: "SHOULD NEVER BE READ" }),
+  });
+
+  // Filler keep-set events so every seeded shed-class row sits strictly below
+  // the fold cursor AND the recent window after a full drain. Routed to a
+  // DEDICATED filler session so a Stop never clears SESS_C's
+  // last_permission_prompt_* stamp (the Stop arm clears it session-locally).
+  const FILLER = "ffffffff-0000-1111-2222-333333333333";
+  insertEvent({ hook_event: "SessionStart", session_id: FILLER });
+  for (let i = 0; i < 30; i++) {
+    insertEvent({ hook_event: "Stop", session_id: FILLER });
+  }
+}
+
+/** Snapshot every projection the widened shed could touch (adds scheduled_tasks). */
+function snapshotWidenedProjections() {
+  return {
+    ...snapshotProjections(),
+    scheduled_tasks: db
+      .query("SELECT * FROM scheduled_tasks ORDER BY job_id, cron_id")
+      .all(),
+  };
+}
+
+test("widened shed: pre-shed P0 === post-shed re-fold P1 === P2, countAbsentBlobs==0, over every newly-shed class + each guarded edge case", () => {
+  seedWidenedShedCorpus();
+
+  // P0 — the PRE-shed projection (every body inline). This is the ground truth
+  // the post-shed re-folds must reproduce byte-identically.
+  drainAll();
+  const p0 = snapshotWidenedProjections();
+
+  // Guarded-pair sanity on P0 (the inversions resolved the KEPT siblings):
+  // both Agent close-arms resolved their turn-0 row to status terminal/ok.
+  const p0Subs = p0.subagent_invocations as Array<Record<string, unknown>>;
+  const modern = p0Subs.find((r) => r.agent_id === "agent-modern");
+  const legacy = p0Subs.find((r) => r.agent_id === "agent-legacy");
+  expect(modern).not.toBeUndefined();
+  expect(legacy).not.toBeUndefined();
+  // The planctl Bash minted a source='planctl' attribution (state_repo fold-read).
+  const planctlAttribs = (
+    p0.file_attributions as Array<Record<string, unknown>>
+  ).filter((a) => a.source === "planctl");
+  expect(planctlAttribs.length).toBeGreaterThan(0);
+  // The Notification stamped jobs.last_permission_prompt_kind from event_type.
+  const stampedJob = (p0.jobs as Array<Record<string, unknown>>).find(
+    (j) => j.last_permission_prompt_kind === "permission",
+  );
+  expect(stampedJob).not.toBeUndefined();
+  // The Cron minted a scheduled_tasks row from the body.
+  expect(p0.scheduled_tasks.length).toBe(1);
+
+  // SHED via the PRODUCTION retention path (real predicate/cursor/watermark).
+  const result = shedCorpus();
+  expect(result.shed).toBeGreaterThan(0);
+  // The sentinel does NOT false-alarm — every NULLed body is a shed-class row.
+  expect(countAbsentBlobs(db)).toBe(0);
+
+  // The KEPT guarded siblings still carry their bodies inline post-shed.
+  const inlineKept = (rowFilter: string): number =>
+    (
+      db
+        .query(
+          `SELECT COUNT(*) AS n FROM events WHERE data IS NOT NULL AND ${rowFilter}`,
+        )
+        .get() as { n: number }
+    ).n;
+  expect(inlineKept("planctl_op = 'done'")).toBeGreaterThan(0); // planctl Bash
+  expect(
+    inlineKept(
+      "hook_event = 'PostToolUse' AND tool_name = 'Agent' AND subagent_agent_id IS NULL",
+    ),
+  ).toBe(1); // legacy Agent
+  expect(inlineKept("hook_event = 'PreToolUse' AND tool_name = 'Agent'")).toBe(
+    1,
+  ); // bridge
+  expect(
+    inlineKept("hook_event = 'PostToolUseFailure' AND tool_name = 'Agent'"),
+  ).toBe(1); // failure agentId
+  expect(inlineKept("tool_name = 'CronCreate'")).toBe(1); // cron body
+
+  // P1 — a from-scratch re-fold over the SHED corpus.
+  rewindAndWipeWidened();
+  drainAll();
+  const p1 = snapshotWidenedProjections();
+  expect(p1).toEqual(p0);
+  expect(countAbsentBlobs(db)).toBe(0);
+
+  // P2 — a SECOND from-scratch re-fold reproduces byte-identical rows.
+  rewindAndWipeWidened();
+  drainAll();
+  const p2 = snapshotWidenedProjections();
+  expect(p2).toEqual(p1);
+});
+
+function rewindAndWipeWidened(): void {
+  rewindAndWipeProjections();
+  db.run("DELETE FROM scheduled_tasks");
+}
 
 // ---------------------------------------------------------------------------
 // 0 → head from-scratch migrate (event_blobs created at v57, read at v67,

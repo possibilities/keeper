@@ -39,13 +39,19 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   byte-identical PROJECTION rows. Inside a fold: build derived arrays from stable
   total-order sorts (never append), and NEVER read wall-clock (`Date.now()`), env
   vars, the filesystem, or process liveness — use the event's `ts`. Only producers
-  probe it. The guarantee scopes to the projection columns: as of v74 (fn-836) the
-  shed NULLs the redundant transcript bodies of PostToolUse mutation events
-  (`tool_input.file_path` is promoted to `events.mutation_path`; the fold reads the
-  column, never the shed body), so those payload bodies are intentionally
-  non-reconstructable — forensic transcript depth defers to Claude Code's own
-  `transcript_path` `.jsonl`. Every KEEP-SET body a fold actually reads stays inline
-  in `events.data` forever, so the projection re-fold stays byte-identical.
+  probe it. The guarantee scopes to the projection columns: the steady-state
+  retention pass (`src/compaction.ts`) NULLs the redundant transcript bodies of a
+  SHED CLASS no fold reads. fn-836 (v74) seeded it with the four PostToolUse
+  mutation tools (`tool_input.file_path` promoted to `events.mutation_path`; the
+  fold reads the column, never the shed body); fn-837 widened it to a POSITIVE
+  cheap-column allow-list (`RETENTION_SHED_CLASS_PREDICATE`) spanning the
+  fold-unread tool/Bash/Agent/Pre+PostToolUseFailure/Subagent*/BackendExecSnapshot/
+  Notification classes (a new/unlisted type defaults to KEPT). Those payload bodies
+  are intentionally non-reconstructable — forensic transcript depth defers to
+  Claude Code's own `transcript_path` `.jsonl`. Every KEEP-SET body a fold actually
+  reads stays inline in `events.data` forever (the keep-set IS the complement of
+  the shed allow-list — planctl Bash, legacy Agent, PreToolUse:Agent, snapshot /
+  session / prompt folds, …), so the projection re-fold stays byte-identical.
 - **Never throw inside a fold.** Malformed `data` folds to a safe value and the
   cursor still advances; a throw rolls back the cursor and wedges the reducer. Schema
   defaults match the zero-event projection, so an empty re-fold reproduces the rows.
