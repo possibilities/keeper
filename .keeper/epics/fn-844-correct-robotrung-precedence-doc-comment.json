@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T12:39:57.172000Z",
   "created_at": "2026-06-20T12:37:00.708000Z",
   "created_by_close_of": "fn-843-fix-dash-terminal-state-status-rung",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Correct robotRung precedence doc-comment",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T12:37:00.708000Z"
+  "updated_at": "2026-06-20T12:39:57.172000Z"
 }
