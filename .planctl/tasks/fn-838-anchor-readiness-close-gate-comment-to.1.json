@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T02:51:45.930000Z",
+  "depends_on": [],
+  "epic": "fn-838-anchor-readiness-close-gate-comment-to",
+  "id": "fn-838-anchor-readiness-close-gate-comment-to.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Re-anchor close-gate line cite",
+  "updated_at": "2026-06-20T02:51:45.930000Z"
+}
