@@ -213,13 +213,47 @@ test("ladder: robotGlyph resolver matches the materialized codepoints", () => {
   expect(robotGlyph("killed")).toBe(ROBOT.killed);
 });
 
-test("ladder: api-error outranks every base state (priority 1, red rail)", () => {
-  for (const state of ["working", "stopped", "ended", "killed"]) {
+test("ladder: api-error outranks live base states (priority 1, red rail)", () => {
+  // Live (non-terminal) states only — terminal ended/killed now win over a
+  // stale annotation stamp (see the terminal-state-wins ladder below).
+  for (const state of ["working", "stopped"]) {
     const job = makeJob({ job_id: "j", state, last_api_error_at: 5 });
     expect(robotRung(job)).toBe("error");
     const card = onlyCard(build([job], { showTerminal: true }));
     expect(card.robotGlyph).toBe(ROBOT.error);
     expect(card.railRole).toBe("error");
+  }
+});
+
+test("ladder: terminal state wins over a stale annotation stamp", () => {
+  // The reducer's SessionEnd/Killed transitions never clear last_*_at, so a job
+  // that died mid-block keeps its stamp. The dash must still paint it terminal
+  // (idle band, hidden unless showTerminal) rather than pin it in needs-you.
+  const stamps: Partial<Job>[] = [
+    { last_api_error_at: 5 },
+    { last_permission_prompt_at: 5 },
+    { last_input_request_at: 5 },
+  ];
+  for (const [state, rung, role] of [
+    ["ended", "ended", "idle-ended"],
+    ["killed", "killed", "idle-killed"],
+  ] as const) {
+    for (const stamp of stamps) {
+      const job = makeJob({ job_id: "j", state, ...stamp });
+      expect(robotRung(job)).toBe(rung);
+
+      // Lands in idle (terminal), not needs-you, when shown.
+      const shown = build([job], { showTerminal: true });
+      expect(cardKeys(shown, "idle")).toEqual(["job:j"]);
+      const card = onlyCard(shown);
+      expect(card.robotGlyph).toBe(ROBOT[rung]);
+      expect(card.railRole).toBe(role);
+
+      // Hidden entirely when showTerminal is off — a stale stamp no longer
+      // keeps a dead job permanently demanding attention.
+      const hidden = build([job], { showTerminal: false });
+      expect(hidden.bands.flatMap((b) => b.cards)).toHaveLength(0);
+    }
   }
 });
 

@@ -106,6 +106,17 @@ export function robotGlyph(rung: RobotRung): string {
  * running/null and cannot express the six rungs.
  */
 export function robotRung(job: Job): RobotRung {
+  // Terminal state wins over a stale annotation stamp: the reducer's
+  // SessionEnd/Killed transitions never clear last_*_at, so a job that died
+  // mid-block keeps its stamp. Resolve ended/killed first so such a job is
+  // painted terminal (idle band, hidden by showTerminal) rather than pinned
+  // in needs-you forever.
+  if (job.state === "ended") {
+    return "ended";
+  }
+  if (job.state === "killed") {
+    return "killed";
+  }
   if (job.last_api_error_at != null) {
     return "error";
   }
@@ -118,12 +129,8 @@ export function robotRung(job: Job): RobotRung {
   switch (job.state) {
     case "working":
       return "working";
-    case "ended":
-      return "ended";
     case "stopped":
       return "stopped";
-    case "killed":
-      return "killed";
     default:
       return "stopped";
   }
