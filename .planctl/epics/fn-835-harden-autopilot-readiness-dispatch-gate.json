@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T02:51:46.277000Z",
   "created_at": "2026-06-18T23:50:04.150000Z",
   "depends_on_epics": [],
   "id": "fn-835-harden-autopilot-readiness-dispatch-gate",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "harden autopilot readiness dispatch gate",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-18T23:50:04.150000Z"
+  "updated_at": "2026-06-20T02:51:46.277000Z"
 }
