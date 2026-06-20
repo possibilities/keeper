@@ -30,5 +30,5 @@ Introduce a `DATA_DIR = ".keeper"` constant (+ `LEGACY_DATA_DIR = ".planctl"`). 
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Introduced src/state_path.ts (DATA_DIR=.keeper, LEGACY_DATA_DIR=.planctl) and routed every plan-CLI read/write/detect site through a write-back resolver: reads prefer .keeper/ then fall back to .planctl/, writes write back to the resolved dir (legacy boards keep writing .planctl/), only fresh init defaults to .keeper/. Renamed PLANCTL_* env to KEEPER_PLAN_* with legacy fallback and the commit subject to chore(plan):.
 ## Evidence

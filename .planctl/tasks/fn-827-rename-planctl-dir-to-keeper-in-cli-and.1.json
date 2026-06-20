@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "CLI reads keeper dir with planctl fallback",
-  "updated_at": "2026-06-18T17:57:48.257000Z"
+  "updated_at": "2026-06-20T05:08:54.408000Z",
+  "worker_done_at": "2026-06-20T05:08:54.408000Z"
 }
