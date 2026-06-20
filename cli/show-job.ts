@@ -26,6 +26,7 @@ import { openDb, resolveDbPath } from "../src/db";
 import {
   buildTmuxListPanesArgs,
   execBackendEnvMeta,
+  localeDefaultedEnv,
 } from "../src/exec-backend";
 
 const HELP = `keeper show-job [selectors] [options]
@@ -297,6 +298,9 @@ function tmuxWindowPaneIds(
       stdout: "pipe",
       stderr: "ignore",
       timeout: 2000,
+      env: localeDefaultedEnv(
+        process.env as Record<string, string | undefined>,
+      ),
     });
     if (!res.success || res.exitCode !== 0) return null;
     out = res.stdout.toString();
