@@ -21,4 +21,5 @@ Post-`git mv`: `keeper board` + `keeper plan show` resolve from `.keeper/`; auto
 ## Acceptance
 - [ ] keeper `.planctl` → `.keeper` (git mv, committed); active board resolves from `.keeper/`; no dark window
 ## Done summary
+git mv .planctl -> .keeper migrated keeper's active board (1724 files); CLI .keeper/ primary + plan-worker recursive watch resolve it with no dark window. keeper board + plan show verified.
 ## Evidence
