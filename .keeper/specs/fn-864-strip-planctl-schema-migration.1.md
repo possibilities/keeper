@@ -51,5 +51,5 @@ The v77→v78 migration plus the full single-path flip of the schema/fold layer,
 - [ ] re-fold-equivalence proof extended (spelling-equivalence + migrated-vs-refold byte-identity + idempotency + index-predicate); `bun run test:full` green
 
 ## Done summary
-
+v77→v78 migration renames the planctl_* schema surface (7 events + 3 commit_trailer_facts columns, 3 events indexes) to plan_* and rewrites historical planctl_invocation envelopes to plan_invocation in one atomic value-preserving tx (no cursor rewind, COUNT==0 asserted); all readers/writers/types/column-lists + schema-fold symbols flipped single-path, coalesce dropped, frozen ladder version-guarded against zombies, api.py +=78, merge-gate re-fold-equivalence proof added. Full suite green.
 ## Evidence
