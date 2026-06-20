@@ -6,7 +6,7 @@
     "fn-827-rename-planctl-dir-to-keeper-in-cli-and"
   ],
   "id": "fn-828-flag-day-rename-planctl-dir-across-repos",
-  "last_validated_at": "2026-06-18T17:58:24.237000Z",
+  "last_validated_at": "2026-06-20T01:11:01.903000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -15,6 +15,7 @@
   "touched_repos": [
     "/Users/mike/code/agentrender",
     "/Users/mike/code/agentuse",
+    "/Users/mike/code/agentwrap",
     "/Users/mike/code/arthack",
     "/Users/mike/code/dotfiles",
     "/Users/mike/code/prosectl",
@@ -22,5 +23,5 @@
     "/Users/mike/code/vtkeep",
     "/Users/mike/code/zellijsub"
   ],
-  "updated_at": "2026-06-18T17:58:24.220000Z"
+  "updated_at": "2026-06-20T01:11:01.849000Z"
 }
