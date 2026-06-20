@@ -100,8 +100,8 @@ export function robotGlyph(rung: RobotRung): string {
 /**
  * Derive a job's status rung FRESH from `state` + the annotation columns,
  * mirroring the precedence the legacy `buildJobRows` encoded and `keeper jobs`
- * surfaces: api-error → awaiting (permission OR input) → working → ended →
- * stopped → killed. An unknown/malformed `state` folds to `stopped` (calm idle)
+ * surfaces: ended/killed → api-error → awaiting (permission OR input) →
+ * working → stopped. An unknown/malformed `state` folds to `stopped` (calm idle)
  * — never throws. Deliberately NOT `rolledUpJobVerdict`, which only emits
  * running/null and cannot express the six rungs.
  */
