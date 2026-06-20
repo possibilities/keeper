@@ -55,6 +55,23 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
+/**
+ * Rebuild `dbPath` BORN `auto_vacuum=INCREMENTAL` (=2), like the live keeper.db.
+ * The template image ships auto_vacuum=0 (NONE), which does NOT exercise the
+ * production reclaim path: reclaimDb opens its source READ-ONLY and relies on
+ * VACUUM INTO INHERITING the source's mode. A source whose stored mode already
+ * differs from NONE is the precise condition that made the old read-only-source
+ * `PRAGMA auto_vacuum=...` bake throw "attempt to write a readonly database"
+ * (fn-851); a NONE source silently staged the bake and hid the bug.
+ */
+function makeSourceAutoVacuum2(path: string): void {
+  const { db } = openDb(path, { migrate: false });
+  db.run("PRAGMA auto_vacuum=INCREMENTAL");
+  db.run("VACUUM");
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  db.close();
+}
+
 /** A non-dry-run, non-help args object pointing at the temp DB + sock. */
 function args(): ParsedReclaimArgs {
   return {
@@ -113,6 +130,12 @@ function runCatching(
 // ---------------------------------------------------------------------------
 
 test("run(): swaps the reclaimed copy over the live DB and drops stale sidecars", () => {
+  // Make the source faithful to production: born auto_vacuum=2 and read by
+  // reclaimDb over its own read-only connection (no explicit bake — the output
+  // INHERITS the mode). Done BEFORE bloating so the VACUUM here does not consume
+  // the freelist the strictly-smaller-output assertion relies on.
+  makeSourceAutoVacuum2(dbPath);
+
   // Bloat the source: insert+delete a large payload so the freelist grows but
   // the file does not shrink — the reclaim's VACUUM INTO then yields a strictly
   // smaller output, proving the live file was actually swapped.
@@ -157,7 +180,7 @@ test("run(): swaps the reclaimed copy over the live DB and drops stale sidecars"
     const av = ro.db.query("PRAGMA auto_vacuum").get() as {
       auto_vacuum: number;
     };
-    expect(av.auto_vacuum).toBe(2); // INCREMENTAL baked by reclaimDb.
+    expect(av.auto_vacuum).toBe(2); // INCREMENTAL inherited from the source.
   } finally {
     ro.db.close();
     // openDb opens WAL; checkpoint+close so afterEach's rmSync sees no stragglers.
@@ -179,10 +202,9 @@ test("run(): swaps the reclaimed copy over the live DB and drops stale sidecars"
 test("run(): the stale OLD-file sidecars are removed by the swap", () => {
   // Focused assertion on sidecar drop: plant distinctively-sized sidecars, run
   // the swap, and confirm they are gone immediately after run() returns (before
-  // any reopen of the swapped DB can recreate them).
-  const { db } = openDb(dbPath, { migrate: false });
-  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
-  db.close();
+  // any reopen of the swapped DB can recreate them). Source born auto_vacuum=2
+  // so reclaimDb's inheritance gate passes (production-faithful read-only path).
+  makeSourceAutoVacuum2(dbPath);
 
   writeFileSync(`${dbPath}-wal`, Buffer.alloc(128, 0xab));
   writeFileSync(`${dbPath}-shm`, Buffer.alloc(128, 0xcd));

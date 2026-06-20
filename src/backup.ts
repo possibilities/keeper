@@ -418,13 +418,16 @@ export interface ReclaimResult {
  * the whole multi-GB DB under the writer lock), so the operator runs this
  * OFFLINE (daemon stopped) and atomically `mv`s the output over the live DB.
  *
- * Why `auto_vacuum=INCREMENTAL` baked here: an existing DB's auto_vacuum mode
- * cannot be changed in place (only at create/VACUUM time), so the steady-state
- * retention pass (fn-836.5) can only return freed overflow pages to the OS via
- * `PRAGMA incremental_vacuum` if the file was BORN with INCREMENTAL mode. We set
- * the pragma on the dedicated VACUUM-INTO source connection BEFORE issuing the
- * statement; SQLite bakes the connection's auto_vacuum value into the generated
- * file (verified: the output reads back `auto_vacuum=2`).
+ * Why the output carries `auto_vacuum=INCREMENTAL` WITHOUT an explicit bake:
+ * `VACUUM INTO` copies the SOURCE's auto_vacuum mode into the generated file,
+ * and the live DB is already born INCREMENTAL (=2), so the output inherits it.
+ * The steady-state retention pass (fn-836.5) can return freed overflow pages to
+ * the OS via `PRAGMA incremental_vacuum` only if the file was BORN INCREMENTAL,
+ * which inheritance guarantees here. Setting `PRAGMA auto_vacuum=...` on the
+ * read-only source is BOTH redundant and illegal — it writes the header and so
+ * throws "attempt to write a readonly database" once the source already differs
+ * from the requested mode — so it is never issued; the self-verify gate below
+ * asserts the inherited mode is 2 (verified: the output reads back `auto_vacuum=2`).
  *
  * `quick_check` (not the full `integrity_check`) is the go/no-go gate per the
  * task Approach — a bounded structural sweep on the freshly-defragmented output,
@@ -462,13 +465,16 @@ export function reclaimDb(dbPath: string, outputPath: string): ReclaimResult {
     /* best-effort */
   }
 
-  // VACUUM INTO on a DEDICATED read-only source connection. Set
-  // auto_vacuum=INCREMENTAL on THIS connection first so it is baked into the
-  // generated output (an existing DB's mode is immutable in place). Read-only on
-  // the source ⇒ no writer-lock contention with a concurrent process.
+  // VACUUM INTO on a DEDICATED read-only source connection — no writer-lock
+  // contention with a concurrent process. The output INHERITS the source's
+  // auto_vacuum mode (the live DB is born auto_vacuum=INCREMENTAL=2), so the
+  // generated file reads back auto_vacuum=2 with NO explicit bake. A bake here
+  // would be both redundant AND illegal: `PRAGMA auto_vacuum=...` writes the DB
+  // header, which throws "attempt to write a readonly database" on a read-only
+  // handle whose stored mode already differs. The post-VACUUM self-verify gate
+  // asserts the inherited mode is 2, deleting any output that did not inherit.
   const src = new Database(dbPath, { readonly: true });
   try {
-    src.run("PRAGMA auto_vacuum=INCREMENTAL");
     const quoted = outputPath.replace(/'/g, "''");
     src.run(`VACUUM INTO '${quoted}'`);
   } catch (err) {

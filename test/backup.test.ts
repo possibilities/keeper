@@ -74,6 +74,32 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
+/**
+ * Rebuild `dbPath` so it is BORN `auto_vacuum=INCREMENTAL` (=2) like the live
+ * keeper.db — the template image ships auto_vacuum=0 (NONE), which does NOT
+ * exercise the production reclaim path. A source whose stored mode already
+ * differs from the requested one is the precise condition that makes
+ * `PRAGMA auto_vacuum=...` against a READ-ONLY handle throw "attempt to write a
+ * readonly database"; an auto_vacuum=0 source silently stages the change and
+ * masks the bug. reclaimDb opens its source read-only, so this faithful fixture
+ * is what drives the real path.
+ */
+function makeReclaimSourceAutoVacuum2(path: string): void {
+  const { db } = openDb(path, { migrate: false });
+  // auto_vacuum mode is immutable in place; the change takes effect only on the
+  // next VACUUM, which rewrites the file with the new mode baked into the header.
+  db.run("PRAGMA auto_vacuum=INCREMENTAL");
+  db.run("VACUUM");
+  db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  const av = db.query("PRAGMA auto_vacuum").get() as { auto_vacuum: number };
+  db.close();
+  if (av.auto_vacuum !== 2) {
+    throw new Error(
+      `makeReclaimSourceAutoVacuum2: fixture is auto_vacuum=${av.auto_vacuum}, expected 2`,
+    );
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pure helpers
 // ---------------------------------------------------------------------------
@@ -378,6 +404,9 @@ test("verifyReclaim: a real reclaim self-verifies OK (schema/auto_vacuum/rows)",
   }
   db.run("PRAGMA wal_checkpoint(TRUNCATE)");
   db.close();
+  // Production reality: the live DB is born auto_vacuum=2. reclaimDb relies on
+  // VACUUM INTO INHERITING that mode (no read-only-source bake).
+  makeReclaimSourceAutoVacuum2(dbPath);
 
   const outputPath = `${dbPath}.reclaim`;
   const result = reclaimDb(dbPath, outputPath);
@@ -388,14 +417,52 @@ test("verifyReclaim: a real reclaim self-verifies OK (schema/auto_vacuum/rows)",
   expect(verify.error).toBeNull();
   expect(verify.sourceSchemaVersion).toBe(SCHEMA_VERSION);
   expect(verify.outputSchemaVersion).toBe(SCHEMA_VERSION);
-  // reclaimDb bakes auto_vacuum=INCREMENTAL (2) into the output.
+  // The output INHERITS auto_vacuum=INCREMENTAL (2) from the source — no bake.
   expect(verify.outputAutoVacuum).toBe(2);
 });
 
-test("verifyReclaim: a row-count divergence FAILS the self-verify", () => {
+test("reclaimDb: a real read-only auto_vacuum=2 source reclaims with no readonly error (fn-851)", () => {
+  // Regression PIN for fn-851: reclaimDb opens its source READ-ONLY, and the
+  // live DB is born auto_vacuum=2. The old code issued `PRAGMA
+  // auto_vacuum=INCREMENTAL` on that read-only handle, which throws "attempt to
+  // write a readonly database" precisely because the stored mode already
+  // differs from NONE. An auto_vacuum=0 fixture silently staged the bake and
+  // hid the bug; this fixture drives the ACTUAL production path.
   const { db } = openDb(dbPath, { migrate: false });
+  for (let i = 0; i < 25; i++) {
+    db.run("INSERT INTO meta (key, value) VALUES (?, ?)", [
+      `pin-${i}`,
+      "y".repeat(48),
+    ]);
+  }
   db.run("PRAGMA wal_checkpoint(TRUNCATE)");
   db.close();
+  makeReclaimSourceAutoVacuum2(dbPath);
+
+  const outputPath = `${dbPath}.reclaim`;
+  const result = reclaimDb(dbPath, outputPath);
+  // No readonly error; the output is produced and gated clean.
+  expect(result.ok).toBe(true);
+  expect(result.error).toBeNull();
+  expect(result.outputPath).toBe(outputPath);
+
+  // Output inherited auto_vacuum=2 with no bake against the read-only source.
+  const out = new Database(outputPath, { readonly: true });
+  try {
+    const av = out.query("PRAGMA auto_vacuum").get() as { auto_vacuum: number };
+    expect(av.auto_vacuum).toBe(2);
+  } finally {
+    out.close();
+  }
+
+  // Row counts identical across the reclaim (no data lost in the rebuild).
+  const verify = verifyReclaim(dbPath, outputPath);
+  expect(verify.ok).toBe(true);
+  expect(verify.error).toBeNull();
+});
+
+test("verifyReclaim: a row-count divergence FAILS the self-verify", () => {
+  makeReclaimSourceAutoVacuum2(dbPath);
 
   const outputPath = `${dbPath}.reclaim`;
   expect(reclaimDb(dbPath, outputPath).ok).toBe(true);
