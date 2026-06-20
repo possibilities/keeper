@@ -124,5 +124,5 @@ Ordered steps:
 - [ ] `bun run test:full` green; a from-scratch re-fold yields byte-identical projection rows.
 
 ## Done summary
-
+Removed the /plan:plan time-window machinery from the plan-link classifier so every epic-mutating op links as creator/refiner regardless of timing (read-only gate only), with per-session creator-suppression and a (ts, event_id) total-order sort for re-fold determinism. Bumped SCHEMA_VERSION 76->77 with a cursor-rewind + canonical-projection-wipe migration so closers, pre-first-opener scaffolds, and defer/CLI edits repopulate.
 ## Evidence
