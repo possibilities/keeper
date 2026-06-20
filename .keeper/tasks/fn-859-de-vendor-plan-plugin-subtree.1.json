@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T20:51:25.408000Z",
+  "depends_on": [],
+  "epic": "fn-859-de-vendor-plan-plugin-subtree",
+  "id": "fn-859-de-vendor-plan-plugin-subtree.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "De-vendor plugins/plan subtree",
+  "updated_at": "2026-06-20T20:51:25.408000Z"
+}
