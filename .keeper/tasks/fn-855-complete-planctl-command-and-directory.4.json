@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T19:01:13.746000Z",
+  "depends_on": [],
+  "epic": "fn-855-complete-planctl-command-and-directory",
+  "id": "fn-855-complete-planctl-command-and-directory.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Modernize stale .planctl test fixture paths",
+  "updated_at": "2026-06-20T19:01:13.746000Z"
+}
