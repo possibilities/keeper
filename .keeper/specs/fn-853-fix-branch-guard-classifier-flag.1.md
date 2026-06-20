@@ -28,5 +28,5 @@ the same file, the same `isBranchMutatingInvocation` function, and the same
 - [ ] `bun run test:full` passes (hook process path)
 
 ## Done summary
-
+Closed two live-reproduced branch-guard classifier bypasses: switch/checkout now match --create=/--orphan= equals forms, and the branch handler scans for the first non-operand positional past leading -f/--force flags. Added regression cases for all four forms.
 ## Evidence

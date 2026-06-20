@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Close create-flag and positional bypasses",
-  "updated_at": "2026-06-20T18:30:17.340000Z"
+  "updated_at": "2026-06-20T18:32:57.165000Z",
+  "worker_done_at": "2026-06-20T18:32:57.165000Z"
 }
