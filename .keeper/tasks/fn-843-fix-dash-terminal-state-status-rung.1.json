@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T11:55:05.617000Z",
+  "depends_on": [],
+  "epic": "fn-843-fix-dash-terminal-state-status-rung",
+  "id": "fn-843-fix-dash-terminal-state-status-rung.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Terminal state outranks stale annotation",
+  "updated_at": "2026-06-20T11:55:05.617000Z"
+}
