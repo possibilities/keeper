@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T14:44:53.285000Z",
   "created_at": "2026-06-20T14:01:32.724000Z",
   "depends_on_epics": [],
   "id": "fn-848-tooling-cleanup-touched-paths-and-biome",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "tooling cleanup touched-paths and biome debt",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T14:01:32.724000Z"
+  "updated_at": "2026-06-20T14:44:53.285000Z"
 }
