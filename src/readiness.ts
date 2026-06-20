@@ -1131,9 +1131,9 @@ export function applySingleTaskPerRootMutex(
   //
   // Armed-mode eligibility gate (`eligibleEpicIds !== undefined`): a `ready`
   // close row may CLAIM a free root only if its epic is in the eligible closure.
-  // This mirrors the launcher's close-dispatch gate
-  // (`autopilot-worker.ts:1000-1007`: `armedMode && !eligible.has(epicId) &&
-  // !isEpicInFlight(...)`) so the mutex never reserves a root for a closer the
+  // This mirrors the launcher's close-dispatch gate in `autopilot-worker.ts`
+  // (the `armedMode && !eligible?.has(epicId) && !isEpicInFlight(...)` close
+  // suppression) so the mutex never reserves a root for a closer the
   // launcher will REFUSE to launch — the bug being fixed, where an ineligible
   // unarmed close row claimed a shared root and starved an eligible same-root
   // armed task to `single-task-per-root`.
