@@ -12,5 +12,5 @@ to the enumeration string so the error advertises every valid condition.
 - [ ] The listed conditions match the set parsed in `PLANCTL_CONDITIONS`
 
 ## Done summary
-
+Added started to the unknown-condition parse-error enumeration in cli/await.ts so the error advertises every valid PLANCTL_CONDITIONS entry.
 ## Evidence
