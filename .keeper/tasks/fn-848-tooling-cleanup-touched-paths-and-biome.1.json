@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "touched-paths reader skips non-data-dir records",
-  "updated_at": "2026-06-20T14:01:32.724000Z"
+  "updated_at": "2026-06-20T14:42:28.137000Z",
+  "worker_done_at": "2026-06-20T14:42:28.137000Z"
 }

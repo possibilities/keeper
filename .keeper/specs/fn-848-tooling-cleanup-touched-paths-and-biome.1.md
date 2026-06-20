@@ -33,5 +33,5 @@ migration residue, not a fault.
 - [ ] non-data-dir / unreadable touched-paths record is skipped (logged), not thrown; path-traversal still hard-rejects; plugin tests green
 
 ## Done summary
-
+Touched-paths reader now logs+skips a non-data-dir record (e.g. stale legacy .planctl/ residue) instead of throwing, so one stale record can't wedge a planctl op; path-traversal stays a hard reject. Updated the unit test to assert skip + added a mixed stale/valid records case.
 ## Evidence
