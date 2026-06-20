@@ -19,7 +19,7 @@
 // the typed envelope + exit 1 (no invocation line — a failed precondition or
 // all-broken scan mutates nothing).
 
-import { existsSync, realpathSync, statSync } from "node:fs";
+import { existsSync, realpathSync } from "node:fs";
 import { join, resolve as resolveAbs } from "node:path";
 
 import {
@@ -32,7 +32,8 @@ import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanctlInvocationReadonly } from "../invocation.ts";
-import type { ProjectContext } from "../project.ts";
+import { contextForRoot, type ProjectContext } from "../project.ts";
+import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe } from "../store.ts";
 
 /** Emit a typed find-task-commit error envelope and exit 1. Shape
@@ -52,17 +53,6 @@ function emitFindTaskCommitError(
   process.exit(1);
 }
 
-/** Build a ProjectContext from a project root (the .planctl/ parent). */
-function contextForRoot(projectRoot: string): ProjectContext {
-  const planctlDir = join(projectRoot, ".planctl");
-  return {
-    name: basename(projectRoot),
-    dataDir: planctlDir,
-    stateDir: join(planctlDir, "state"),
-    projectPath: projectRoot,
-  };
-}
-
 /** Resolve the owning project for `taskId` cwd-agnostically. --project override
  * resolves directly (NOT_A_PROJECT / TASK_NOT_FOUND); else roots discovery via
  * findProjectsWithTask (TASK_NOT_FOUND on a miss, AMBIGUOUS_TASK_ID on a same-id
@@ -74,7 +64,7 @@ function resolveProjectForTask(
 ): ProjectContext {
   if (project !== null) {
     const projectRoot = realpathOr(resolveAbs(expandUser(project)));
-    if (!isDir(join(projectRoot, ".planctl"))) {
+    if (!hasDataDir(projectRoot)) {
       emitFindTaskCommitError(
         "NOT_A_PROJECT",
         `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
@@ -181,23 +171,10 @@ function realpathOr(p: string): string {
   }
 }
 
-function isDir(p: string): boolean {
-  try {
-    return statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
 function expandUser(p: string): string {
   if (p === "~" || p.startsWith("~/")) {
     const home = process.env.HOME ?? "";
     return home + p.slice(1);
   }
   return p;
-}
-
-function basename(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 0 ? (parts[parts.length - 1] as string) : path;
 }

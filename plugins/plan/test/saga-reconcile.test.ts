@@ -64,14 +64,14 @@ function setRuntime(
   taskId: string,
   state: Record<string, unknown>,
 ): void {
-  const p = join(root, ".planctl", "state", "tasks", `${taskId}.state.json`);
+  const p = join(root, ".keeper", "state", "tasks", `${taskId}.state.json`);
   writeFileSync(p, `${JSON.stringify(state)}\n`, "utf-8");
 }
 
 // Stamp worker_done_at on the tracked task JSON and commit it (reproduces the
 // on-HEAD shape `planctl done` lands). Port of _commit_task_json_with_done_stamp.
 function commitTaskJsonWithDoneStamp(root: string, taskId: string): void {
-  const rel = `.planctl/tasks/${taskId}.json`;
+  const rel = `.keeper/tasks/${taskId}.json`;
   const taskPath = join(root, rel);
   const data = JSON.parse(readFileSync(taskPath, "utf-8")) as Record<
     string,
@@ -80,10 +80,7 @@ function commitTaskJsonWithDoneStamp(root: string, taskId: string): void {
   data.worker_done_at = "2026-06-06T00:00:00.000000Z";
   writeFileSync(taskPath, `${JSON.stringify(data, null, 2)}\n`, "utf-8");
   git(["add", rel], root);
-  git(
-    ["commit", "-m", `chore(planctl): done ${taskId}\n\nTask: ${taskId}`],
-    root,
-  );
+  git(["commit", "-m", `chore(plan): done ${taskId}\n\nTask: ${taskId}`], root);
 }
 
 function envObj(out: string): Record<string, unknown> {
@@ -213,10 +210,10 @@ describe("reconcile verdicts", () => {
       // scaffold's auto-commit already landed the task JSON in HEAD with
       // worker_done_at=null; commit defensively (--allow-empty) so the precondition
       // holds, then flip the sidecar to done WITHOUT stamping HEAD.
-      const rel = `.planctl/tasks/${taskId}.json`;
+      const rel = `.keeper/tasks/${taskId}.json`;
       git(["add", rel], proj.root);
       git(
-        ["commit", "--allow-empty", "-m", "chore(planctl): seed task json"],
+        ["commit", "--allow-empty", "-m", "chore(plan): seed task json"],
         proj.root,
       );
       setRuntime(proj.root, taskId, { status: "done" });
@@ -398,7 +395,7 @@ describe("reconcile cross-repo source scan", () => {
 
   // Repoint the task JSON's target_repo (reconcile re-reads, no mint check).
   function setTargetRepo(root: string, taskId: string, target: string): void {
-    const rel = `.planctl/tasks/${taskId}.json`;
+    const rel = `.keeper/tasks/${taskId}.json`;
     const p = join(root, rel);
     const data = JSON.parse(readFileSync(p, "utf-8")) as Record<
       string,
@@ -412,7 +409,7 @@ describe("reconcile cross-repo source scan", () => {
     epicId: string,
     repos: string[],
   ): void {
-    const rel = `.planctl/epics/${epicId}.json`;
+    const rel = `.keeper/epics/${epicId}.json`;
     const p = join(root, rel);
     const data = JSON.parse(readFileSync(p, "utf-8")) as Record<
       string,
@@ -566,7 +563,7 @@ describe("reconcile errors + contract + meta", () => {
       expect(r.code).toBe(0);
       expect(git(["rev-parse", "HEAD"], proj.root)).toBe(before);
       const log = git(["log", "-5", "--pretty=%s"], proj.root);
-      expect(log.includes("chore(planctl): reconcile")).toBe(false);
+      expect(log.includes("chore(plan): reconcile")).toBe(false);
     },
   );
 

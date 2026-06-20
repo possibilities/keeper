@@ -24,6 +24,7 @@ import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanctlInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, workerAgentForTier } from "../models.ts";
 import { writeWorkMarker } from "../session_markers.ts";
+import { hasDataDir, resolveDataDirOrDefault } from "../state_path.ts";
 import {
   getActor,
   LocalFileStateStore,
@@ -55,12 +56,13 @@ function emitClaimError(
   process.exit(1);
 }
 
-/** Build a ProjectCtx from a project root (the `.planctl/` parent). */
+/** Build a ProjectCtx from a project root, resolving its data dir (`.keeper/`
+ * with the transient `.planctl/` fallback). */
 function contextForRoot(projectRoot: string): ProjectCtx {
-  const planctlDir = join(projectRoot, ".planctl");
+  const dataDir = resolveDataDirOrDefault(projectRoot);
   return {
-    dataDir: planctlDir,
-    stateDir: join(planctlDir, "state"),
+    dataDir,
+    stateDir: join(dataDir, "state"),
     projectPath: projectRoot,
   };
 }
@@ -119,7 +121,7 @@ function resolveProjectForTask(
 ): ProjectCtx {
   if (project !== null) {
     const projectRoot = resolveExpand(project);
-    if (!existsSync(join(projectRoot, ".planctl"))) {
+    if (!hasDataDir(projectRoot)) {
       emitClaimError(
         "NOT_A_PROJECT",
         `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,

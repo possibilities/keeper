@@ -132,7 +132,7 @@ describe("claim happy path + brief schema", () => {
     const { taskIds } = scaffoldEpic(proj, { title: "Claim epic", nTasks: 1 });
     const taskId = taskIds[0] as string;
     // Hand-null to simulate a legacy on-disk record.
-    const taskPath = join(proj.root, ".planctl", "tasks", `${taskId}.json`);
+    const taskPath = join(proj.root, ".keeper", "tasks", `${taskId}.json`);
     const def = JSON.parse(readFileSync(taskPath, "utf-8")) as Record<
       string,
       unknown
@@ -470,9 +470,9 @@ describe("claim roots discovery", () => {
       ["specs", `${epicId}.md`],
       ["specs", `${taskId}.md`],
     ] as const) {
-      const src = join(projA, ".planctl", sub, name);
+      const src = join(projA, ".keeper", sub, name);
       if (existsSync(src)) {
-        const dst = join(projB, ".planctl", sub, name);
+        const dst = join(projB, ".keeper", sub, name);
         mkdirSync(join(dst, ".."), { recursive: true });
         copyFileSync(src, dst);
       }
@@ -520,7 +520,7 @@ describe("claim roots discovery", () => {
     collideInto(projA, projB, taskId);
     // Mark beta's epic closed → not claimable there.
     const epicId = taskId.slice(0, taskId.lastIndexOf("."));
-    const betaEpic = join(projB, ".planctl", "epics", `${epicId}.json`);
+    const betaEpic = join(projB, ".keeper", "epics", `${epicId}.json`);
     const ep = JSON.parse(readFileSync(betaEpic, "utf-8")) as Record<
       string,
       unknown

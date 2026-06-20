@@ -22,8 +22,9 @@ import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
 import { buildPlanctlInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, normalizeTask } from "../models.ts";
-import type { ProjectContext } from "../project.ts";
+import { contextForRoot, type ProjectContext } from "../project.ts";
 import { expectedWorkerCwd } from "../runtime_status.ts";
+import { DATA_DIR_NAMES, hasDataDir } from "../state_path.ts";
 import {
   LocalFileStateStore,
   loadJson,
@@ -77,17 +78,6 @@ function emitReconcileError(
   process.exit(1);
 }
 
-/** Build a ProjectContext from a project root (the .planctl/ parent). */
-function contextForRoot(projectRoot: string): ProjectContext {
-  const planctlDir = join(projectRoot, ".planctl");
-  return {
-    name: basename(projectRoot),
-    dataDir: planctlDir,
-    stateDir: join(planctlDir, "state"),
-    projectPath: projectRoot,
-  };
-}
-
 /** Resolve the owning project for `taskId` cwd-agnostically. Any same-id
  * collision surfaces as AMBIGUOUS_TASK_ID; --project is the escape hatch.
  * Mirrors _resolve_project_for_task. */
@@ -98,7 +88,7 @@ function resolveProjectForTask(
 ): ProjectContext {
   if (project !== null) {
     const projectRoot = realpathOr(resolveAbs(expandUser(project)));
-    if (!isDir(join(projectRoot, ".planctl"))) {
+    if (!hasDataDir(projectRoot)) {
       emitReconcileError(
         "NOT_A_PROJECT",
         `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
@@ -233,9 +223,11 @@ export function findSourceCommits(taskId: string, repo: string): string[] {
 
 /** True when the committed HEAD:<task.json> carries worker_done_at. Runs
  * cat-file against `stateRepo` (NOT target_repo, NOT cwd) at the repo-relative
- * `.planctl/tasks/<id>.json`. Guards the unborn-branch case first. Returns false
- * (not a tooling error) when the repo is unborn or the path isn't in HEAD; throws
- * GitError on any other git failure. Mirrors _state_head_visible. */
+ * `<data-dir>/tasks/<id>.json`, probing `.keeper/` then the transient `.planctl/`
+ * fallback (a mid-migration board commits either). Guards the unborn-branch case
+ * first. Returns false (not a tooling error) when the repo is unborn or the path
+ * isn't in HEAD under any data dir; throws GitError on any other git failure.
+ * Mirrors _state_head_visible. */
 export function stateHeadVisible(stateRepo: string, taskId: string): boolean {
   if (!isDir(stateRepo)) {
     throw new GitError(`state_repo is not a directory: ${stateRepo}`);
@@ -248,21 +240,25 @@ export function stateHeadVisible(stateRepo: string, taskId: string): boolean {
     return false;
   }
 
-  const relpath = `.planctl/tasks/${taskId}.json`;
-  const proc = runGitRaw(["cat-file", "blob", `HEAD:${relpath}`], stateRepo);
-  if (proc.exitCode !== 0) {
-    // Path not present in HEAD — committed JSON not yet visible.
-    return false;
+  for (const dataDirName of DATA_DIR_NAMES) {
+    const relpath = `${dataDirName}/tasks/${taskId}.json`;
+    const proc = runGitRaw(["cat-file", "blob", `HEAD:${relpath}`], stateRepo);
+    if (proc.exitCode !== 0) {
+      // Path not present in HEAD under this data dir — try the next.
+      continue;
+    }
+    let committed: Record<string, unknown>;
+    try {
+      committed = JSON.parse(proc.stdout);
+    } catch (exc) {
+      throw new GitError(
+        `HEAD:${relpath} is not valid JSON: ${(exc as Error).message}`,
+      );
+    }
+    return Boolean(committed.worker_done_at);
   }
-  let committed: Record<string, unknown>;
-  try {
-    committed = JSON.parse(proc.stdout);
-  } catch (exc) {
-    throw new GitError(
-      `HEAD:${relpath} is not valid JSON: ${(exc as Error).message}`,
-    );
-  }
-  return Boolean(committed.worker_done_at);
+  // Committed JSON not yet visible under any data dir.
+  return false;
 }
 
 /** Return {done, total} for `epicId`'s tasks — REPORTING ONLY (not a verdict
@@ -464,9 +460,4 @@ function expandUser(p: string): string {
     return home + p.slice(1);
   }
   return p;
-}
-
-function basename(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 0 ? (parts[parts.length - 1] as string) : path;
 }

@@ -108,13 +108,13 @@ function twoTaskYaml(): string {
 }
 
 function readJson(rel: string): Record<string, unknown> {
-  return JSON.parse(readFileSync(join(project.root, ".planctl", rel), "utf-8"));
+  return JSON.parse(readFileSync(join(project.root, ".keeper", rel), "utf-8"));
 }
 
 // No fn-* epic/task/spec files landed. Port of _no_epics_or_tasks_landed.
 function noEpicsOrTasksLanded(): boolean {
   for (const sub of ["epics", "tasks", "specs"]) {
-    const dir = join(project.root, ".planctl", sub);
+    const dir = join(project.root, ".keeper", sub);
     const glob = new Bun.Glob("fn-*.*");
     for (const _ of glob.scanSync({ cwd: dir, onlyFiles: true })) {
       return false;
@@ -153,14 +153,14 @@ describe("scaffold happy path", () => {
     const pc = payload.planctl_invocation as Record<string, unknown>;
     expect(pc.op).toBe("scaffold");
     expect(pc.target).toBe(epicId);
-    expect(pc.subject).toBe(`chore(planctl): scaffold ${epicId}`);
+    expect(pc.subject).toBe(`chore(plan): scaffold ${epicId}`);
     const expected = [
-      `.planctl/epics/${epicId}.json`,
-      `.planctl/specs/${epicId}.md`,
-      `.planctl/tasks/${epicId}.1.json`,
-      `.planctl/specs/${epicId}.1.md`,
-      `.planctl/tasks/${epicId}.2.json`,
-      `.planctl/specs/${epicId}.2.md`,
+      `.keeper/epics/${epicId}.json`,
+      `.keeper/specs/${epicId}.md`,
+      `.keeper/tasks/${epicId}.1.json`,
+      `.keeper/specs/${epicId}.1.md`,
+      `.keeper/tasks/${epicId}.2.json`,
+      `.keeper/specs/${epicId}.2.md`,
     ];
     const files = new Set(pc.files as string[]);
     for (const f of expected) {
@@ -174,7 +174,7 @@ describe("scaffold happy path", () => {
     expect(r.code).toBe(0);
     const epicId = parseEnvelope(r.output).epic_id as string;
     const spec1 = readFileSync(
-      join(project.root, ".planctl", "specs", `${epicId}.1.md`),
+      join(project.root, ".keeper", "specs", `${epicId}.1.md`),
       "utf-8",
     );
     expect(spec1).toContain("Implement the thing.");
@@ -451,7 +451,7 @@ describe("scaffold failure shapes", () => {
   });
 
   // test_scaffold_registered_in_verb_templates — CITED: the bun buildSubject is
-  //   template-free; the happy-path subject assertion pins `chore(planctl):
+  //   template-free; the happy-path subject assertion pins `chore(plan):
   //   scaffold <id>` (python_only VERB_TEMPLATES import).
   // test_scaffold_not_in_validation_restamp_verbs — CITED: src-integrity.test.ts
   //   pins the canonical VALIDATION_RESTAMP_VERBS set (scaffold absent;
@@ -614,12 +614,12 @@ describe("scaffold mint boundary", () => {
       (payload.planctl_invocation as Record<string, unknown>).files as string[],
     );
     for (const f of [
-      `.planctl/epics/${epicId}.json`,
-      `.planctl/specs/${epicId}.md`,
-      `.planctl/tasks/${epicId}.1.json`,
-      `.planctl/specs/${epicId}.1.md`,
-      `.planctl/tasks/${epicId}.2.json`,
-      `.planctl/specs/${epicId}.2.md`,
+      `.keeper/epics/${epicId}.json`,
+      `.keeper/specs/${epicId}.md`,
+      `.keeper/tasks/${epicId}.1.json`,
+      `.keeper/specs/${epicId}.1.md`,
+      `.keeper/tasks/${epicId}.2.json`,
+      `.keeper/specs/${epicId}.2.md`,
     ]) {
       expect(files.has(f)).toBe(true);
     }
@@ -969,7 +969,7 @@ describe("scaffold dup guard + atomicity", () => {
       `tasks/${epicId}.2.json`,
       `specs/${epicId}.2.md`,
     ]) {
-      expect(existsSync(join(project.root, ".planctl", rel))).toBe(true);
+      expect(existsSync(join(project.root, ".keeper", rel))).toBe(true);
     }
     expect(countInvocationLines(r.output)).toBe(1);
   });

@@ -2,7 +2,7 @@
 // (plus build_subject from planctl/commit_messages.py). Every mutating
 // planctl-bun verb's NDJSON envelope carries a planctl_invocation payload; the
 // emit seam calls autoCommitFromInvocation to land the corresponding
-// `chore(planctl): <op> <target>` commit inline, BEFORE the success envelope
+// `chore(plan): <op> <target>` commit inline, BEFORE the success envelope
 // prints.
 //
 // There is no flock here: each commit is pathspec-scoped to its own exact files
@@ -28,7 +28,7 @@ const RETRY_CAP_SECONDS = 2.0;
 // exact codepoint planctl/commit_messages.py uses.
 const EM_DASH = "—";
 
-/** Build a `chore(planctl): <verb> <id>[ — <detail>]` subject. Mirrors
+/** Build a `chore(plan): <verb> <id>[ — <detail>]` subject. Mirrors
  * commit_messages._subject: when a detail is given, newlines/CRs collapse to
  * spaces and the result is trimmed before the em-dash join. */
 export function buildSubject(
@@ -38,9 +38,9 @@ export function buildSubject(
 ): string {
   if (detail) {
     const safeDetail = detail.replace(/\n/g, " ").replace(/\r/g, " ").trim();
-    return `chore(planctl): ${verb} ${targetId} ${EM_DASH} ${safeDetail}`;
+    return `chore(plan): ${verb} ${targetId} ${EM_DASH} ${safeDetail}`;
   }
-  return `chore(planctl): ${verb} ${targetId}`;
+  return `chore(plan): ${verb} ${targetId}`;
 }
 
 /** Structured commit failure — carries the short error code and verbatim

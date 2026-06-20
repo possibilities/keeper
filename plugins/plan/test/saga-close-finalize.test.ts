@@ -51,7 +51,7 @@ function emptySetHash(): string {
 // _mark_all_done.
 function markAllDone(root: string, taskIds: string[]): void {
   for (const tid of taskIds) {
-    const p = join(root, ".planctl", "state", "tasks", `${tid}.state.json`);
+    const p = join(root, ".keeper", "state", "tasks", `${tid}.state.json`);
     writeFileSync(p, `${JSON.stringify({ status: "done" })}\n`, "utf-8");
   }
 }
@@ -139,7 +139,7 @@ function seedFollowupYaml(
 function epicStatus(root: string, epicId: string): string {
   return (
     JSON.parse(
-      readFileSync(join(root, ".planctl", "epics", `${epicId}.json`), "utf-8"),
+      readFileSync(join(root, ".keeper", "epics", `${epicId}.json`), "utf-8"),
     ) as Record<string, unknown>
   ).status as string;
 }
@@ -280,7 +280,7 @@ describe("close-finalize closed_with_followup", () => {
     expect(epicStatus(proj.root, epicId)).toBe("done");
     const newDef = JSON.parse(
       readFileSync(
-        join(proj.root, ".planctl", "epics", `${newEpicId}.json`),
+        join(proj.root, ".keeper", "epics", `${newEpicId}.json`),
         "utf-8",
       ),
     ) as Record<string, unknown>;
@@ -299,7 +299,7 @@ describe("close-finalize closed_with_followup", () => {
       { root: proj.root, home: proj.home },
       { title: "Innocent dependent", nTasks: 3 },
     );
-    const innPath = join(proj.root, ".planctl", "epics", `${innocentId}.json`);
+    const innPath = join(proj.root, ".keeper", "epics", `${innocentId}.json`);
     const innDef = JSON.parse(readFileSync(innPath, "utf-8")) as Record<
       string,
       unknown
@@ -315,7 +315,7 @@ describe("close-finalize closed_with_followup", () => {
     expect(epicStatus(proj.root, epicId)).toBe("done");
     const newDef = JSON.parse(
       readFileSync(
-        join(proj.root, ".planctl", "epics", `${newEpicId}.json`),
+        join(proj.root, ".keeper", "epics", `${newEpicId}.json`),
         "utf-8",
       ),
     ) as Record<string, unknown>;
@@ -331,7 +331,7 @@ describe("close-finalize closed_with_followup", () => {
     );
     const def = JSON.parse(
       readFileSync(
-        join(proj.root, ".planctl", "epics", `${epicId}.json`),
+        join(proj.root, ".keeper", "epics", `${epicId}.json`),
         "utf-8",
       ),
     ) as Record<string, unknown>;
@@ -363,7 +363,7 @@ describe("close-finalize closed_with_followup", () => {
       { root: proj.root, home: proj.home },
       { title: `Follow-up of ${epicId}`, nTasks: 1 },
     );
-    const fPath = join(proj.root, ".planctl", "epics", `${followId}.json`);
+    const fPath = join(proj.root, ".keeper", "epics", `${followId}.json`);
     const fDef = JSON.parse(readFileSync(fPath, "utf-8")) as Record<
       string,
       unknown
@@ -410,7 +410,7 @@ describe("close-finalize partial_followup", () => {
       { root: proj.root, home: proj.home },
       { title: `Partial follow ${epicId}`, nTasks: 1 },
     );
-    const fp = join(proj.root, ".planctl", "epics", `${followId}.json`);
+    const fp = join(proj.root, ".keeper", "epics", `${followId}.json`);
     const fd = JSON.parse(readFileSync(fp, "utf-8")) as Record<string, unknown>;
     fd.depends_on_epics = [epicId];
     fd.created_by_close_of = epicId;

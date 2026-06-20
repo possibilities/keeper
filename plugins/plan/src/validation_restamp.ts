@@ -15,6 +15,7 @@ import { join } from "node:path";
 import { discoverProjects, scanEpicIdsGlobal } from "./discovery.ts";
 import { compactJson } from "./format.ts";
 import { checkEpicTree } from "./integrity.ts";
+import { resolveDataDir } from "./state_path.ts";
 import {
   atomicWriteJson,
   LocalFileStateStore,
@@ -149,7 +150,11 @@ export function restampEpicOrFail(
     discovered.length > 0 ? scanEpicIdsGlobal(discovered) : {};
   if (discovered.length > 0) {
     for (const project of discovered) {
-      const otherEpics = join(project, ".planctl", "epics");
+      const otherDataDir = resolveDataDir(project);
+      if (otherDataDir === null) {
+        continue;
+      }
+      const otherEpics = join(otherDataDir, "epics");
       if (!existsSync(otherEpics)) {
         continue;
       }

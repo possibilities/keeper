@@ -91,7 +91,7 @@ function writeDelta(content: string, name = "delta.yaml"): string {
 function readEpic(epicId: string): Record<string, unknown> {
   return JSON.parse(
     readFileSync(
-      join(project.root, ".planctl", "epics", `${epicId}.json`),
+      join(project.root, ".keeper", "epics", `${epicId}.json`),
       "utf-8",
     ),
   );
@@ -100,7 +100,7 @@ function readEpic(epicId: string): Record<string, unknown> {
 function readTask(taskId: string): Record<string, unknown> {
   return JSON.parse(
     readFileSync(
-      join(project.root, ".planctl", "tasks", `${taskId}.json`),
+      join(project.root, ".keeper", "tasks", `${taskId}.json`),
       "utf-8",
     ),
   );
@@ -108,20 +108,20 @@ function readTask(taskId: string): Record<string, unknown> {
 
 function readTaskSpec(taskId: string): string {
   return readFileSync(
-    join(project.root, ".planctl", "specs", `${taskId}.md`),
+    join(project.root, ".keeper", "specs", `${taskId}.md`),
     "utf-8",
   );
 }
 
 function readEpicSpec(epicId: string): string {
   return readFileSync(
-    join(project.root, ".planctl", "specs", `${epicId}.md`),
+    join(project.root, ".keeper", "specs", `${epicId}.md`),
     "utf-8",
   );
 }
 
 function taskExists(taskId: string): boolean {
-  return existsSync(join(project.root, ".planctl", "tasks", `${taskId}.json`));
+  return existsSync(join(project.root, ".keeper", "tasks", `${taskId}.json`));
 }
 
 // Scaffold a 2-task epic (task 2 deps on 1) and return its epic id. Port of
@@ -142,7 +142,7 @@ function stampMarker(epicId: string): void {
   const data = readEpic(epicId);
   data.last_validated_at = "2020-01-01T00:00:00Z";
   writeFileSync(
-    join(project.root, ".planctl", "epics", `${epicId}.json`),
+    join(project.root, ".keeper", "epics", `${epicId}.json`),
     JSON.stringify(data),
     "utf-8",
   );
@@ -396,7 +396,7 @@ describe("refine-apply target_repo", () => {
     // test_refine_apply.py::test_refine_apply_recompute_rejects_stale_target_repo
     const epicId = seedTwoTaskEpic();
     const stale = "/definitely/not/a/real/path/on/this/host";
-    const t1Path = join(project.root, ".planctl", "tasks", `${epicId}.1.json`);
+    const t1Path = join(project.root, ".keeper", "tasks", `${epicId}.1.json`);
     const t1 = JSON.parse(readFileSync(t1Path, "utf-8"));
     t1.target_repo = stale;
     writeFileSync(t1Path, JSON.stringify(t1), "utf-8");
@@ -561,7 +561,7 @@ describe("refine-apply commit boundary", () => {
     // persists on disk (§10 no-rollback).
     expect(taskExists(`${epicId}.3`)).toBe(true);
     expect(
-      existsSync(join(project.root, ".planctl", "specs", `${epicId}.3.md`)),
+      existsSync(join(project.root, ".keeper", "specs", `${epicId}.3.md`)),
     ).toBe(true);
   });
 

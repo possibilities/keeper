@@ -27,6 +27,7 @@ import { tmpdir } from "node:os";
 import { delimiter, join } from "node:path";
 
 import { normalizeEpic, normalizeTask, SCHEMA_VERSION } from "../src/models.ts";
+import { resolveDataDirOrDefault } from "../src/state_path.ts";
 import { serializeStateJson } from "../src/store.ts";
 
 // ---------------------------------------------------------------------------
@@ -562,15 +563,17 @@ export function gitBaseline(dir: string): string {
 // (json.dumps indent=2 sort_keys + trailing newline == serializeStateJson).
 // ---------------------------------------------------------------------------
 
-/** Write `<root>/.planctl/state/tasks/<taskId>.state.json` from *state*, byte-
- * faithful to LocalFileStateStore.saveRuntime. Seeds a runtime overlay a read
+/** Write `<root>/<data-dir>/state/tasks/<taskId>.state.json` from *state*, byte-
+ * faithful to LocalFileStateStore.saveRuntime. Resolves the root's existing data
+ * dir (`.keeper/` when present, else legacy `.planctl/`) so the seeded overlay
+ * lands where the board's read path resolves it. Seeds a runtime overlay a read
  * verb merges over the tracked def. */
 export function seedRuntime(
   root: string,
   taskId: string,
   state: Record<string, unknown>,
 ): void {
-  const dir = join(root, ".planctl", "state", "tasks");
+  const dir = join(resolveDataDirOrDefault(root), "state", "tasks");
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, `${taskId}.state.json`),

@@ -56,7 +56,7 @@ describe("validate --epic (CLI end-to-end)", () => {
     // Null the multi-repo fields so the filesystem-repo branch is skipped (the
     // scaffold dir IS a real git repo, but primary_repo points at it; legacy-null
     // mirrors the helper-fixture's minimal tree).
-    const epicPath = join(project.root, ".planctl", "epics", `${epicId}.json`);
+    const epicPath = join(project.root, ".keeper", "epics", `${epicId}.json`);
     const data = JSON.parse(readFileSync(epicPath, "utf-8"));
     data.primary_repo = null;
     data.touched_repos = null;
@@ -120,7 +120,7 @@ describe("multi-repo create → validate gate", () => {
     const epicId = (firstJsonPayload(r.output).epic as Record<string, unknown>)
       .id as string;
     const data = JSON.parse(
-      readFileSync(join(root, ".planctl", "epics", `${epicId}.json`), "utf-8"),
+      readFileSync(join(root, ".keeper", "epics", `${epicId}.json`), "utf-8"),
     );
     expect(data.touched_repos as string[]).toContain(bogus);
   });
@@ -234,7 +234,7 @@ describe("resolve-task routing envelope", () => {
     expect(inv.files ?? null).toBeNull();
   });
 
-  test("read-only: no chore(planctl) resolve-task commit lands", () => {
+  test("read-only: no chore(plan) resolve-task commit lands", () => {
     // test_resolve_task.py::test_resolve_task_lands_no_commit
     const { taskIds } = scaffoldEpic(project, { title: "Resolve epic" });
     const before = runCli(

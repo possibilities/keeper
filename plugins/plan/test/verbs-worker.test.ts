@@ -365,7 +365,7 @@ describe("done", () => {
 
     expect(gitLogCount(root)).toBe(before + 1);
     const msg = gitHeadMessage(root);
-    expect(msg.split("\n")[0]).toBe(`chore(planctl): done ${taskId}`);
+    expect(msg.split("\n")[0]).toBe(`chore(plan): done ${taskId}`);
     expect(msg).toContain("Planctl-Op: done");
     expect(msg).toContain(`Planctl-Target: ${taskId}`);
     expect(msg).toContain("Planctl-Prev-Op:");

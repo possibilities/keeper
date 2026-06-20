@@ -9,13 +9,14 @@
 //
 // buildPlanctlInvocation (mutating): session id fail-CLOSED (throws when
 // CLAUDE_CODE_SESSION_ID is absent); files = the sorted intersection of the
-// session's touched-paths log with git's dirty .planctl/ set; subject from
+// session's touched-paths log with git's dirty data-dir set; subject from
 // buildSubject; queue_jump + session_id ride after state_repo.
 
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { buildSubject } from "./commit.ts";
+import { DATA_DIR_NAMES, resolveDataDirOrDefault } from "./state_path.ts";
 
 export interface ReadonlyInvocation {
   files: null;
@@ -59,7 +60,7 @@ export interface MutatingInvocation {
  * planctl.invocation.build_planctl_invocation:
  *  - session id from CLAUDE_CODE_SESSION_ID, fail-CLOSED (throw when absent),
  *  - touched_path_files = the session's recorded touched-log filenames,
- *  - files = sorted(touched-paths content ∩ dirty .planctl/ set),
+ *  - files = sorted(touched-paths content ∩ dirty data-dir set),
  *  - state_repo = primaryRepo when given, else repoRoot.
  *
  * `target` is the epic/task/project id; `detail` is the optional em-dash
@@ -76,7 +77,7 @@ export function buildPlanctlInvocation(
   },
 ): MutatingInvocation {
   const { repoRoot, primaryRepo = null, queueJump = false } = opts;
-  const planctlDir = join(repoRoot, ".planctl");
+  const dataDir = resolveDataDirOrDefault(repoRoot);
 
   // Session id — CLAUDE_CODE_SESSION_ID is the sole source. Fail-closed on
   // absence: the claude binary ships it intrinsically on every session, so it is
@@ -91,10 +92,10 @@ export function buildPlanctlInvocation(
     );
   }
 
-  const touchedPathFiles = readTouchedFiles(planctlDir, sessionId);
+  const touchedPathFiles = readTouchedFiles(dataDir, sessionId);
 
   const touched = readTouchedPaths(repoRoot, sessionId);
-  const dirty = dirtyPlanctlPaths(repoRoot);
+  const dirty = dirtyDataDirPaths(repoRoot);
   const files = [...touched].filter((p) => dirty.has(p)).sort();
 
   const subject = buildSubject(verb, target, detail);
@@ -119,14 +120,8 @@ export function buildPlanctlInvocation(
 /** The touched-log record filenames for `sessionId` (for hook cleanup, G7) —
  * the basenames of `*.txt` under sessions/<sid>/touched/. Mirrors
  * store._read_touched_files. Empty list when the dir is absent. */
-function readTouchedFiles(planctlDir: string, sessionId: string): string[] {
-  const touchedDir = join(
-    planctlDir,
-    "state",
-    "sessions",
-    sessionId,
-    "touched",
-  );
+function readTouchedFiles(dataDir: string, sessionId: string): string[] {
+  const touchedDir = join(dataDir, "state", "sessions", sessionId, "touched");
   if (!existsSync(touchedDir)) {
     return [];
   }
@@ -137,21 +132,18 @@ function readTouchedFiles(planctlDir: string, sessionId: string): string[] {
 }
 
 /** Paths recorded for `sessionId` in the touched-paths log, each a POSIX string
- * relative to repoRoot starting with `.planctl/`. Mirrors
- * invocation._read_touched_paths: a path with `..` or a non-`.planctl/` prefix
- * is a bug upstream and throws loud, never silently dropped. */
+ * relative to repoRoot starting with a data-dir prefix (`.keeper/`, or the
+ * transient `.planctl/` fallback). The touched-log lives under whichever data
+ * dir resolves; a path with `..` or a prefix outside the data-dir set is a bug
+ * upstream and throws loud, never silently dropped. */
 function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
-  const touchedDir = join(
-    repoRoot,
-    ".planctl",
-    "state",
-    "sessions",
-    sessionId,
-    "touched",
-  );
+  const dataDir = resolveDataDirOrDefault(repoRoot);
+  const touchedDir = join(dataDir, "state", "sessions", sessionId, "touched");
   if (!existsSync(touchedDir)) {
     return [];
   }
+
+  const dataDirPrefixes = DATA_DIR_NAMES.map((name) => `${name}/`);
 
   const paths: string[] = [];
   for (const name of readdirSync(touchedDir)) {
@@ -163,16 +155,16 @@ function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
     if (!raw) {
       continue;
     }
-    // Security: reject traversal and non-.planctl/ paths.
+    // Security: reject traversal and paths outside the data-dir set.
     if (raw.split("/").includes("..")) {
       throw new Error(
         `Touched-paths record contains path traversal: '${raw}' ` +
           `(file: ${file}). This is a bug — report it.`,
       );
     }
-    if (!raw.startsWith(".planctl/")) {
+    if (!dataDirPrefixes.some((pfx) => raw.startsWith(pfx))) {
       throw new Error(
-        `Touched-paths record contains non-.planctl/ path: '${raw}' ` +
+        `Touched-paths record contains a non-data-dir path: '${raw}' ` +
           `(file: ${file}). This is a bug — report it.`,
       );
     }
@@ -181,12 +173,14 @@ function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
   return paths;
 }
 
-/** The set of dirty (modified/untracked) .planctl/ paths from git. Mirrors
- * invocation._dirty_planctl_paths: `git status --porcelain --untracked-files=all
- * -- .planctl/` (the flag is load-bearing — without it new files show as a
- * directory-level `?? .planctl/epics/` and the intersection returns empty). The
- * parse matches Python exactly: line[3:].strip(), rename "a -> b" takes b. */
-function dirtyPlanctlPaths(repoRoot: string): Set<string> {
+/** The set of dirty (modified/untracked) data-dir paths from git, scoped to both
+ * `.keeper/` and the transient `.planctl/` fallback so a mid-migration tree
+ * commits either. Mirrors invocation._dirty_planctl_paths: `git status
+ * --porcelain --untracked-files=all -- <data dirs>` (the flag is load-bearing —
+ * without it new files show as a directory-level `?? .keeper/epics/` and the
+ * intersection returns empty). The parse matches Python exactly: line[3:].strip(),
+ * rename "a -> b" takes b. */
+function dirtyDataDirPaths(repoRoot: string): Set<string> {
   const proc = Bun.spawnSync(
     [
       "git",
@@ -194,7 +188,7 @@ function dirtyPlanctlPaths(repoRoot: string): Set<string> {
       "--porcelain",
       "--untracked-files=all",
       "--",
-      ".planctl/",
+      ...DATA_DIR_NAMES.map((name) => `${name}/`),
     ],
     { cwd: repoRoot },
   );

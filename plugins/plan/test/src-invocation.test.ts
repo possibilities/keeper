@@ -1,7 +1,7 @@
 // Unit tests for src/invocation.ts buildPlanctlInvocation (mutating). Pins the
-// fail-closed session-id contract, the touched-paths ∩ dirty .planctl/
+// fail-closed session-id contract, the touched-paths ∩ dirty data-dir
 // intersection (with --untracked-files=all so new files appear individually),
-// the wire field order, path-traversal/non-.planctl rejection, and the
+// the wire field order, path-traversal/non-data-dir rejection, and the
 // state_repo precedence (primaryRepo over repoRoot).
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
@@ -101,7 +101,7 @@ describe("buildPlanctlInvocation files = touched ∩ dirty", () => {
     const inv = buildPlanctlInvocation("done", "fn-9-x.1", "shipped it", {
       repoRoot: repo,
     });
-    expect(inv.subject).toBe("chore(planctl): done fn-9-x.1 — shipped it");
+    expect(inv.subject).toBe("chore(plan): done fn-9-x.1 — shipped it");
   });
 });
 
@@ -163,7 +163,7 @@ describe("buildPlanctlInvocation touched-path validation (throws loud)", () => {
     ).toThrow(/path traversal/);
   });
 
-  test("non-.planctl/ prefix in a touched record throws", () => {
+  test("a non-data-dir prefix in a touched record throws", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-pref";
     const touchedDir = join(
       repo,
@@ -177,6 +177,6 @@ describe("buildPlanctlInvocation touched-path validation (throws loud)", () => {
     writeFileSync(join(touchedDir, "bad.txt"), "src/secret.ts\n");
     expect(() =>
       buildPlanctlInvocation("done", "fn-1-x.1", null, { repoRoot: repo }),
-    ).toThrow(/non-.planctl/);
+    ).toThrow(/non-data-dir/);
   });
 });

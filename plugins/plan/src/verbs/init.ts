@@ -1,12 +1,14 @@
 // init verb — the port of planctl/run_init.py.
 //
-// Bootstraps a planctl project: the .planctl/{epics,specs,tasks}/ +
-// state/{tasks,locks}/ skeleton, meta.json (atomicWriteJson), a .planctl/.gitignore
+// Bootstraps a planctl project: the <data-dir>/{epics,specs,tasks}/ +
+// state/{tasks,locks}/ skeleton, meta.json (atomicWriteJson), a <data-dir>/.gitignore
 // containing `state/` (raw write), and the advice files — CLAUDE.md written ONLY
 // when absent (preserves human edits) and AGENTS.md as a RELATIVE symlink to it.
 // An already-initialized tree (meta.json present) is backfilled with just the
-// advice files. An idempotent re-run that writes nothing emits read-only with no
-// commit.
+// advice files. The data dir is the write-back target (resolveDataDirOrDefault):
+// a fresh root mints `.keeper/`, but an existing legacy `.planctl/` board is
+// backfilled IN PLACE — init never mints a competing `.keeper/` alongside a live
+// `.planctl/` (that would shadow it).
 //
 // init is the one mutating verb that builds its OWN invocation payload directly:
 // a LITERAL payload (files = sorted written list, no session_id key, no
@@ -28,36 +30,37 @@ import { emitMutatingLiteral, emitReadonlyData } from "../emit.ts";
 import type { OutputFormat } from "../format.ts";
 import { SCHEMA_VERSION } from "../models.ts";
 import { findGitRoot, findProjectRoot } from "../project.ts";
+import { resolveDataDirOrDefault } from "../state_path.ts";
 import { atomicWriteJson } from "../store.ts";
 
-// Byte-identical to planctl/run_init.py CLAUDE_MD_CONTENT (verified by SHA). The
-// advice file dropped into .planctl/ — keep this literal in lock-step with the
-// Python source; test_init.py asserts equality against the Python constant.
+// The advice file dropped into the data dir — the salience-scan exclusion guard
+// every planning skill honors. Exported so verbs-cli-init asserts equality
+// against the live constant.
 export const CLAUDE_MD_CONTENT = `# planctl state directory
 
 Files in this tree (\`epics/\`, \`specs/\`, \`tasks/\`, \`state/\`) are **historical planctl state** — past plans, past task specs, past epic specs, runtime status. None of it describes work the human currently wants to plan.
 
-**Do not treat any content under \`.planctl/\` as a planning subject.** When a skill or agent infers "what does the human want to plan?" from conversation context (notably \`/plan:plan\` with no arguments), file reads and tool outputs sourced from this directory must be excluded from the salience scan. Recent \`chore(planctl): …\` commits in \`git log\` are likewise off-limits as subject material.
+**Do not treat any content under \`.keeper/\` as a planning subject.** When a skill or agent infers "what does the human want to plan?" from conversation context (notably \`/plan:plan\` with no arguments), file reads and tool outputs sourced from this directory must be excluded from the salience scan. Recent \`chore(plan): …\` commits in \`git log\` are likewise off-limits as subject material.
 
 The only legitimate way for an existing plan to drive a planning skill is an explicit \`fn-N-slug\` (epic) or \`fn-N-slug.M\` (task) argument passed by the human. Never via context inference.
 `;
 
-/** Drop CLAUDE.md + AGENTS.md symlink into .planctl/, idempotently. CLAUDE.md is
+/** Drop CLAUDE.md + AGENTS.md symlink into the data dir, idempotently. CLAUDE.md is
  * written ONLY when absent (preserves human edits); the AGENTS.md symlink is
  * created ONLY when absent (relative target so it survives directory moves).
  * Returns the repo-relative POSIX paths this call actually created — folded into
  * the explicit commit file list; an empty list keeps an idempotent re-run from
  * staging anything. Mirrors _ensure_advice_files. */
-function ensureAdviceFiles(planctlDir: string, projectRoot: string): string[] {
+function ensureAdviceFiles(dataDir: string, projectRoot: string): string[] {
   const created: string[] = [];
 
-  const claudeMd = join(planctlDir, "CLAUDE.md");
+  const claudeMd = join(dataDir, "CLAUDE.md");
   if (!existsSync(claudeMd)) {
     writeFileSync(claudeMd, CLAUDE_MD_CONTENT, { encoding: "utf-8" });
     created.push(toPosixRel(projectRoot, claudeMd));
   }
 
-  const agentsMd = join(planctlDir, "AGENTS.md");
+  const agentsMd = join(dataDir, "AGENTS.md");
   // Python: `not exists() and not is_symlink()` — a present symlink (even a
   // broken one) leaves it untouched. existsSync follows symlinks (false for a
   // broken link), so also probe lstat for the symlink case.
@@ -89,14 +92,17 @@ interface InitArgs {
 
 export function runInit(_args: InitArgs): void {
   const projectRoot = findProjectRoot();
-  const planctlDir = join(projectRoot, ".planctl");
+  // Fresh init targets `.keeper/`; an existing data dir (resolved with `.keeper/`
+  // precedence then the `.planctl/` fallback) is backfilled in place, so init on
+  // a legacy-only board never mints a competing empty `.keeper/` alongside it.
+  const dataDir = resolveDataDirOrDefault(projectRoot);
 
   const projectData = {
     project: {
       name: basename(projectRoot),
       path: projectRoot,
-      data_dir: planctlDir,
-      state_dir: join(planctlDir, "state"),
+      data_dir: dataDir,
+      state_dir: join(dataDir, "state"),
     },
   };
 
@@ -105,28 +111,28 @@ export function runInit(_args: InitArgs): void {
   // re-run (which writes nothing) stays a no-op.
   const written: string[] = [];
 
-  if (existsSync(join(planctlDir, "meta.json"))) {
+  if (existsSync(join(dataDir, "meta.json"))) {
     // Backfill advice files into an already-initialized tree on every init call.
-    written.push(...ensureAdviceFiles(planctlDir, projectRoot));
+    written.push(...ensureAdviceFiles(dataDir, projectRoot));
   } else {
     // Fresh init: directory skeleton + meta.json + inner gitignore + advice.
     for (const subdir of ["epics", "specs", "tasks"]) {
-      mkdirSync(join(planctlDir, subdir), { recursive: true });
+      mkdirSync(join(dataDir, subdir), { recursive: true });
     }
     for (const subdir of ["state/tasks", "state/locks"]) {
-      mkdirSync(join(planctlDir, subdir), { recursive: true });
+      mkdirSync(join(dataDir, subdir), { recursive: true });
     }
 
-    atomicWriteJson(join(planctlDir, "meta.json"), {
+    atomicWriteJson(join(dataDir, "meta.json"), {
       schema_version: SCHEMA_VERSION,
     });
 
-    const innerGitignore = join(planctlDir, ".gitignore");
+    const innerGitignore = join(dataDir, ".gitignore");
     writeFileSync(innerGitignore, "state/\n", { encoding: "utf-8" });
 
-    written.push(toPosixRel(projectRoot, join(planctlDir, "meta.json")));
+    written.push(toPosixRel(projectRoot, join(dataDir, "meta.json")));
     written.push(toPosixRel(projectRoot, innerGitignore));
-    written.push(...ensureAdviceFiles(planctlDir, projectRoot));
+    written.push(...ensureAdviceFiles(dataDir, projectRoot));
   }
 
   // Self-commit the bootstrap files when there is something to commit AND we are

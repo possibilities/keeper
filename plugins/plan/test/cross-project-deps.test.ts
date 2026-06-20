@@ -83,14 +83,14 @@ function invoke(mr: MultiRepo, cwd: string, args: string[]): CliResult {
 
 function epicJson(proj: string, epicId: string): Record<string, unknown> {
   return JSON.parse(
-    readFileSync(join(proj, ".planctl", "epics", `${epicId}.json`), "utf-8"),
+    readFileSync(join(proj, ".keeper", "epics", `${epicId}.json`), "utf-8"),
   );
 }
 
 // Copy A's epic JSON into B to simulate legacy dup state (same id in two repos).
 function dupEpicInto(srcProj: string, dstProj: string, epicId: string): void {
-  const src = join(srcProj, ".planctl", "epics", `${epicId}.json`);
-  const dst = join(dstProj, ".planctl", "epics", `${epicId}.json`);
+  const src = join(srcProj, ".keeper", "epics", `${epicId}.json`);
+  const dst = join(dstProj, ".keeper", "epics", `${epicId}.json`);
   writeFileSync(dst, readFileSync(src));
 }
 

@@ -21,6 +21,7 @@ import { epicIdFromTask, isEpicId, isTaskId } from "./ids.ts";
 import { mergeTaskState } from "./models.ts";
 // The spec-heading check is reused verbatim from specs.ts — never forked here.
 import { validateTaskSpecHeadings } from "./specs.ts";
+import { resolveDataDir } from "./state_path.ts";
 import { LocalFileStateStore, loadJsonSafe } from "./store.ts";
 export { validateTaskSpecHeadings };
 
@@ -438,7 +439,11 @@ export function validateEpicIntegrityWithWarnings(
     discovered.length > 0 ? scanEpicIdsGlobal(discovered) : {};
   if (discovered.length > 0) {
     for (const project of discovered) {
-      const otherEpics = join(project, ".planctl", "epics");
+      const otherDataDir = resolveDataDir(project);
+      if (otherDataDir === null) {
+        continue;
+      }
+      const otherEpics = join(otherDataDir, "epics");
       if (!existsSync(otherEpics)) {
         continue;
       }

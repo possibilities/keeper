@@ -4,12 +4,12 @@
 //
 // `/plan:close` is a content-blind coordinator: every pipeline artifact (audit
 // brief, report, verdict, follow-up plan) persists under gitignored
-// `<primary_repo>/.planctl/state/audits/<epic_id>/`, validated at emission by
+// `<primary_repo>/<data-dir>/state/audits/<epic_id>/`, validated at emission by
 // the submit verbs.
 //
 // Why writeArtifact is NOT store.atomicWrite: atomicWrite records the path in
 // the session touched-paths log, which the next mutating verb's auto-commit
-// sweeps into a `chore(planctl): …` commit. Audit artifacts live under
+// sweeps into a `chore(plan): …` commit. Audit artifacts live under
 // gitignored `state/` and must NEVER draw a commit — like claim's worker brief,
 // they are runtime-state-only. So writeArtifact uses atomicWriteRaw (same-dir
 // tmp → fsync → rename → parent-dir fsync) with NO touched-paths bookkeeping,
@@ -25,6 +25,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 
+import { resolveDataDirOrDefault } from "./state_path.ts";
 import { atomicWriteRaw, serializeStateJson } from "./store.ts";
 
 /** Audit-artifact schema version. Integer, starts at 1; additive-only within a
@@ -64,9 +65,15 @@ export class ArtifactSchemaTooNewError extends Error {
   }
 }
 
-/** `<primary_repo>/.planctl/state/audits` (a pure path — not created here). */
+/** `<primary_repo>/<data-dir>/state/audits` (a pure path — not created here).
+ * The data dir resolves `.keeper/` first, then the transient `.planctl/`
+ * fallback. */
 export function auditsRoot(primaryRepo: string): string {
-  return join(resolveResolved(primaryRepo), ".planctl", "state", "audits");
+  return join(
+    resolveDataDirOrDefault(resolveResolved(primaryRepo)),
+    "state",
+    "audits",
+  );
 }
 
 /** Per-epic artifact dir, creating the tree lazily at 0700 on both levels.
@@ -171,7 +178,7 @@ function ensureAscii(serialized: string): string {
  * Uses atomicWriteRaw (same-dir tmp → fsync → rename → parent-dir fsync, tmp
  * unlinked on any throw) which records NOTHING in the session touched-paths log,
  * so the next mutating verb's auto-commit never sweeps the artifact into a
- * `.planctl/` commit — then chmods 0600. Deliberately NOT store.atomicWrite (it
+ * data-dir commit — then chmods 0600. Deliberately NOT store.atomicWrite (it
  * touched-logs) and NOT writeBrief (it omits the mode). Mirrors write_artifact. */
 export function writeArtifact(path: string, content: string): string {
   const dest = resolveResolved(path);

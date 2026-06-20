@@ -268,8 +268,8 @@ describe("find-task-commit --project disambiguation", () => {
       ["epics", `${epicId}.json`],
       ["tasks", `${taskId}.json`],
     ] as const) {
-      const src = join(projA, ".planctl", sub, name);
-      const dst = join(projB, ".planctl", sub, name);
+      const src = join(projA, ".keeper", sub, name);
+      const dst = join(projB, ".keeper", sub, name);
       if (existsSync(src)) {
         mkdirSync(join(dst, ".."), { recursive: true });
         copyFileSync(src, dst);

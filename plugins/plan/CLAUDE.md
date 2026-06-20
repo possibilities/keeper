@@ -15,7 +15,11 @@ These diverge from standard arthack conventions:
 
 ## Commit behavior
 
-Every mutating verb auto-commits its own `.planctl/` scope inline at `output.emit()` (`chore(planctl): <op> <target>`); a success envelope on stdout means the commit landed, and callers never wildcard-commit planctl state.
+Every mutating verb auto-commits its own data-dir scope inline at `output.emit()` (`chore(plan): <op> <target>`); a success envelope on stdout means the commit landed, and callers never wildcard-commit planctl state.
+
+## Data directory
+
+The convention data dir is `.keeper/`; a transient `.planctl/` fallback keeps boards minted before the rename usable during the migration window. **Resolution and write-back live in one seam — `src/state_path.ts`.** Reads/detect resolve `.keeper/` first, then `.planctl/` (deterministic precedence: `.keeper/` wins when both exist at one root). **Writes write BACK to the dir the board already resolves to** — a repo still on `.planctl/` keeps writing to `.planctl/`; only a fresh `init` where neither dir exists defaults to `.keeper/`. Never force `.keeper/` on a legacy board (it spawns a shadow dir that hides the live one); the dir migration happens solely via an explicit `git mv .planctl .keeper`.
 
 ## Validation marker
 
@@ -37,8 +41,8 @@ The no-incremental-mutation stance above is NOT a no-delete stance. `planctl epi
 
 ## Environment variables
 
-- `PLANCTL_ACTOR` overrides actor identity.
-- `PLANCTL_NOW` overrides the clock source for all timestamp stamping in `%Y-%m-%dT%H:%M:%S.%fZ` format; any conforming implementation must honor it.
+- `KEEPER_PLAN_ACTOR` (legacy fallback `PLANCTL_ACTOR`) overrides actor identity.
+- `KEEPER_PLAN_NOW` (legacy fallback `PLANCTL_NOW`) overrides the clock source for all timestamp stamping in `%Y-%m-%dT%H:%M:%S.%fZ` format; any conforming implementation must honor it. The new name takes precedence; the legacy name is read only as a transient migration fallback.
 
 ## Running Things
 

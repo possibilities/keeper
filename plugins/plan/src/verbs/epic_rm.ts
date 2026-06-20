@@ -2,7 +2,7 @@
 //
 // The sanctioned delete verb: physically unlink every artifact an epic owns
 // (epic JSON, epic + task spec markdowns, task JSONs, runtime state, lock
-// files) and auto-commit the deletions into the OWNING repo's .planctl/.
+// files) and auto-commit the deletions into the OWNING repo's data dir.
 //
 // THE LOAD-BEARING ORDERING (the whole deletion-commit mechanism): the commit
 // seam stages touched ∩ dirty, where touched paths come from the session log
@@ -29,11 +29,16 @@ import { emitMutating, emitReadonly } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { buildPlanctlInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState } from "../models.ts";
-import type { ProjectContext } from "../project.ts";
+import { contextForRoot, type ProjectContext } from "../project.ts";
+import {
+  DATA_DIR_NAMES,
+  hasDataDir,
+  resolveDataDirOrDefault,
+} from "../state_path.ts";
 import { LocalFileStateStore, loadJsonSafe, recordTouched } from "../store.ts";
 
 // Traversal guard: only filename-safe characters before we glob/unlink. Any
-// character that could break out of .planctl/specs/ etc. is rejected here.
+// character that could break out of the data dir's specs/ etc. is rejected here.
 const EPIC_ID_PATH_RE = /^[A-Za-z0-9_-]+$/;
 
 interface EpicRmArgs {
@@ -42,17 +47,6 @@ interface EpicRmArgs {
   dryRun: boolean;
   project: string | null;
   format: OutputFormat | null;
-}
-
-/** Build a ProjectContext from a project root dir (the .planctl/ parent). */
-function contextForRoot(projectRoot: string): ProjectContext {
-  const planctlDir = join(projectRoot, ".planctl");
-  return {
-    name: basename(projectRoot),
-    dataDir: planctlDir,
-    stateDir: join(planctlDir, "state"),
-    projectPath: projectRoot,
-  };
 }
 
 function basename(path: string): string {
@@ -90,13 +84,17 @@ function resolveOwningProject(
 ): ProjectContext {
   if (project !== null) {
     const projectRoot = expandResolve(project);
-    if (!isDir(join(projectRoot, ".planctl"))) {
+    if (!hasDataDir(projectRoot)) {
       emitError(
         `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
         format,
       );
     }
-    const epicPath = join(projectRoot, ".planctl", "epics", `${epicId}.json`);
+    const epicPath = join(
+      resolveDataDirOrDefault(projectRoot),
+      "epics",
+      `${epicId}.json`,
+    );
     if (!existsSync(epicPath)) {
       emitError(`Epic not found in ${projectRoot}: ${epicId}`, format);
     }
@@ -368,14 +366,15 @@ export function runEpicRm(args: EpicRmArgs): void {
   );
 }
 
-/** True iff `p` is a tasks/<id>.M.json under a .planctl/. Mirrors the Python
- * p.parent.name == "tasks" and p.parent.parent.name == ".planctl" check. */
+/** True iff `p` is a tasks/<id>.M.json directly under a data dir (`.keeper/`, or
+ * the transient `.planctl/` fallback). Mirrors the Python p.parent.name ==
+ * "tasks" and p.parent.parent.name == data-dir check. */
 function isTaskDefJson(p: string): boolean {
   const parts = resolvePath(p).split("/");
   return (
     parts.length >= 3 &&
     parts[parts.length - 2] === "tasks" &&
-    parts[parts.length - 3] === ".planctl"
+    DATA_DIR_NAMES.includes(parts[parts.length - 3] as string)
   );
 }
 

@@ -92,14 +92,14 @@ describe("init advice-file drop", () => {
 
   test("drops CLAUDE.md byte-equal to the exported content", () => {
     // test_init.py::test_init_drops_claude_md
-    const claudeMd = join(repo, ".planctl", "CLAUDE.md");
+    const claudeMd = join(repo, ".keeper", "CLAUDE.md");
     expect(existsSync(claudeMd)).toBe(true);
     expect(readFileSync(claudeMd, "utf-8")).toBe(CLAUDE_MD_CONTENT);
   });
 
   test("drops AGENTS.md as a relative symlink to CLAUDE.md", () => {
     // test_init.py::test_init_drops_agents_md_as_relative_symlink
-    const agentsMd = join(repo, ".planctl", "AGENTS.md");
+    const agentsMd = join(repo, ".keeper", "AGENTS.md");
     expect(lstatSync(agentsMd).isSymbolicLink()).toBe(true);
     expect(readlinkSync(agentsMd)).toBe("CLAUDE.md");
     expect(readFileSync(agentsMd, "utf-8")).toBe(CLAUDE_MD_CONTENT);
@@ -107,7 +107,7 @@ describe("init advice-file drop", () => {
 
   test("idempotent: a human-edited CLAUDE.md is preserved", () => {
     // test_init.py::test_init_is_idempotent_and_preserves_human_edits
-    const claudeMd = join(repo, ".planctl", "CLAUDE.md");
+    const claudeMd = join(repo, ".keeper", "CLAUDE.md");
     const custom = "# my notes\nthe human modified this file\n";
     writeFileSync(claudeMd, custom, "utf-8");
     const r = runCli(["init"], { cwd: repo, home, env: SID });
@@ -175,15 +175,15 @@ describe("init backfill + commit semantics", () => {
     expect(r.code).toBe(0);
     expect(gitLogCount(dir)).toBe(before + 1);
     const msg = gitHeadMessage(dir);
-    expect(msg.split("\n")[0]).toBe(`chore(planctl): init ${baseName(dir)}`);
+    expect(msg.split("\n")[0]).toBe(`chore(plan): init ${baseName(dir)}`);
     expect(msg).not.toContain("Session-Id:");
 
-    const tracked = git(["ls-files", ".planctl/"], dir);
+    const tracked = git(["ls-files", ".keeper/"], dir);
     for (const f of [
-      ".planctl/meta.json",
-      ".planctl/.gitignore",
-      ".planctl/CLAUDE.md",
-      ".planctl/AGENTS.md",
+      ".keeper/meta.json",
+      ".keeper/.gitignore",
+      ".keeper/CLAUDE.md",
+      ".keeper/AGENTS.md",
     ]) {
       expect(tracked).toContain(f);
     }
@@ -224,14 +224,12 @@ describe("init backfill + commit semantics", () => {
       env: { CLAUDE_CODE_SESSION_ID: "" },
     });
     expect(r.code).toBe(0);
-    const planctlDir = join(dir, ".planctl");
-    expect(existsSync(join(planctlDir, "meta.json"))).toBe(true);
-    expect(readFileSync(join(planctlDir, "CLAUDE.md"), "utf-8")).toBe(
+    const dataDir = join(dir, ".keeper");
+    expect(existsSync(join(dataDir, "meta.json"))).toBe(true);
+    expect(readFileSync(join(dataDir, "CLAUDE.md"), "utf-8")).toBe(
       CLAUDE_MD_CONTENT,
     );
-    expect(lstatSync(join(planctlDir, "AGENTS.md")).isSymbolicLink()).toBe(
-      true,
-    );
+    expect(lstatSync(join(dataDir, "AGENTS.md")).isSymbolicLink()).toBe(true);
     expect(existsSync(join(dir, ".git"))).toBe(false);
   });
 });

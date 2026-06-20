@@ -89,7 +89,7 @@ function makeEpic(nTasks: number): { epicId: string; taskIds: string[] } {
 function readEpic(epicId: string): Record<string, unknown> {
   return JSON.parse(
     readFileSync(
-      join(project.root, ".planctl", "epics", `${epicId}.json`),
+      join(project.root, ".keeper", "epics", `${epicId}.json`),
       "utf-8",
     ),
   );

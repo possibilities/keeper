@@ -156,7 +156,7 @@ describe("set-description / set-acceptance restamp", () => {
     });
     expect(r.code).toBe(0);
     expect(gitLogCount(root)).toBe(before + 1);
-    expect(headSubject(root)).toBe("chore(planctl): set-description fn-2-sd.1");
+    expect(headSubject(root)).toBe("chore(plan): set-description fn-2-sd.1");
   });
 });
 
@@ -254,9 +254,7 @@ describe("set-target-repo", () => {
     );
     expect(r.code).toBe(0);
     expect(gitLogCount(root)).toBe(before + 1);
-    expect(headSubject(root)).toBe(
-      "chore(planctl): set-target-repo fn-2-str.1",
-    );
+    expect(headSubject(root)).toBe("chore(plan): set-target-repo fn-2-str.1");
     const files = new Set(gitFilesInHead(root));
     expect(files.has(".planctl/tasks/fn-2-str.1.json")).toBe(true);
     expect(files.has(".planctl/epics/fn-2-str.json")).toBe(true);
@@ -384,7 +382,7 @@ describe("epic invalidate", () => {
     expect(parseCliOutput(r.output).short_circuited).toBe(false);
     expect(epicDef(root, "fn-2-inv").last_validated_at).toBeNull();
     expect(gitLogCount(root)).toBe(before + 1);
-    expect(headSubject(root)).toBe("chore(planctl): invalidate fn-2-inv");
+    expect(headSubject(root)).toBe("chore(plan): invalidate fn-2-inv");
   });
 });
 
@@ -406,7 +404,7 @@ describe("epic queue-jump", () => {
     expect(parseCliOutput(r.output).short_circuited).toBe(false);
     expect(epicDef(root, "fn-1-qj").queue_jump).toBe(true);
     expect(gitLogCount(root)).toBe(before + 1);
-    expect(headSubject(root)).toBe("chore(planctl): queue-jump fn-1-qj");
+    expect(headSubject(root)).toBe("chore(plan): queue-jump fn-1-qj");
   });
 
   test("short-circuits when already true (ZERO commits)", () => {

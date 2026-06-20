@@ -16,7 +16,6 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
-  readFileSync,
   realpathSync,
   rmSync,
   writeFileSync,
@@ -50,7 +49,7 @@ function run(args: string[], env?: Record<string, string>) {
 }
 
 function artifact(...parts: string[]): string {
-  return join(project.root, ".planctl", ...parts);
+  return join(project.root, ".keeper", ...parts);
 }
 
 // Tolerant payload parser mirroring the Python _invoke: read verbs (dry-run /
@@ -107,14 +106,14 @@ describe("epic rm happy path", () => {
 
     // The auto-commit landed the deletions in HEAD (not an empty commit).
     const headFiles = gitFilesInHead(project.root);
-    expect(headFiles).toContain(`.planctl/epics/${epicId}.json`);
+    expect(headFiles).toContain(`.keeper/epics/${epicId}.json`);
     for (const t of taskIds) {
-      expect(headFiles).toContain(`.planctl/tasks/${t}.json`);
-      expect(headFiles).toContain(`.planctl/specs/${t}.md`);
+      expect(headFiles).toContain(`.keeper/tasks/${t}.json`);
+      expect(headFiles).toContain(`.keeper/specs/${t}.md`);
     }
 
     expect(gitHeadMessage(project.root).split("\n")[0]).toBe(
-      `chore(planctl): rm ${epicId}`,
+      `chore(plan): rm ${epicId}`,
     );
     const inv = (obj.planctl_invocation ?? {}) as Record<string, unknown>;
     expect(inv.op).toBe("rm");
@@ -123,7 +122,7 @@ describe("epic rm happy path", () => {
 
   // test_rm_registered_in_verb_templates — CITED: the bun buildSubject is
   //   template-free (no per-verb whitelist) and the happy-path subject assertion
-  //   above pins `chore(planctl): rm <id>`; the Python node imports VERB_TEMPLATES
+  //   above pins `chore(plan): rm <id>`; the Python node imports VERB_TEMPLATES
   //   (python_only in-process surface).
 });
 
@@ -144,8 +143,8 @@ describe("epic rm --dry-run", () => {
     const obj = payload(r.output);
     expect(obj.dry_run).toBe(true);
     const rels = obj.removed_files as string[];
-    expect(rels).toContain(`.planctl/epics/${epicId}.json`);
-    expect(rels).toContain(`.planctl/tasks/${taskIds[0]}.json`);
+    expect(rels).toContain(`.keeper/epics/${epicId}.json`);
+    expect(rels).toContain(`.keeper/tasks/${taskIds[0]}.json`);
 
     expect(existsSync(epicJson)).toBe(true);
     expect(existsSync(taskJson)).toBe(true);
@@ -241,9 +240,10 @@ describe("epic rm ambiguous resolution", () => {
     for (const p of [projA, projB]) {
       mkdirSync(p, { recursive: true });
       gitInit(p);
-      const init = runCli(["init"], { cwd: p, home: sharedHome });
-      expect(init.code).toBe(0);
     }
+    // proj_a is a convention-dir (`.keeper/`) project via init + scaffold.
+    const initA = runCli(["init"], { cwd: projA, home: sharedHome });
+    expect(initA.code).toBe(0);
 
     // Seed an epic in proj_a via scaffold, then force the SAME id onto proj_b's
     // disk (the legacy-dup scenario the resolver refuses to silently pick).
@@ -255,6 +255,8 @@ describe("epic rm ambiguous resolution", () => {
     );
     dupId = a.epicId;
     // Materialise the dup directly on proj_b's disk (CLI-free), byte-faithful.
+    // seedState builds the legacy `.planctl/` tree, so proj_b resolves via the
+    // transient read fallback — exercising a mixed convention/legacy board pair.
     seedState(projB, { epicId: dupId, title: "Ambiguous epic", nTasks: 1 });
 
     setRoots(sharedHome, [parent]);
@@ -282,7 +284,7 @@ describe("epic rm ambiguous resolution", () => {
         (obj.error as string).includes(projB),
     ).toBe(true);
 
-    expect(existsSync(join(projA, ".planctl", "epics", `${dupId}.json`))).toBe(
+    expect(existsSync(join(projA, ".keeper", "epics", `${dupId}.json`))).toBe(
       true,
     );
     expect(existsSync(join(projB, ".planctl", "epics", `${dupId}.json`))).toBe(
@@ -299,7 +301,7 @@ describe("epic rm ambiguous resolution", () => {
     expect(r.code).toBe(0);
     expect(payload(r.output).success).toBe(true);
 
-    expect(existsSync(join(projA, ".planctl", "epics", `${dupId}.json`))).toBe(
+    expect(existsSync(join(projA, ".keeper", "epics", `${dupId}.json`))).toBe(
       false,
     );
     expect(existsSync(join(projB, ".planctl", "epics", `${dupId}.json`))).toBe(

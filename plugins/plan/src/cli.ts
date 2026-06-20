@@ -777,7 +777,7 @@ function printHelp(): void {
 
 /** Emit the trailing read-only planctl_invocation NDJSON line by re-resolving
  * the project — the port of cli.py:_emit_readonly_invocation. resolveProject
- * raises the missing-project error envelope + exit 1 when no `.planctl/`
+ * raises the missing-project error envelope + exit 1 when no data dir
  * resolves (terminating before any trailer prints); a genuine non-exit failure
  * is swallowed so a tracing side-effect never breaks the CLI. */
 function emitTrailer(

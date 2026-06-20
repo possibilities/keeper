@@ -5,7 +5,7 @@
 // task cat. Conditionally MUTATING under --invalidate: short-circuits to a
 // readonly envelope when last_validated_at is already null, else writes the
 // marker to null + bumps updated_at and rides the mutating emit seam so one
-// chore(planctl): refine-context <epic> commit lands. Typed errors —
+// chore(plan): refine-context <epic> commit lands. Typed errors —
 // BAD_EPIC_ID / EPIC_NOT_FOUND — emit {success:false, error:{code,message}}.
 
 import { existsSync, readFileSync } from "node:fs";

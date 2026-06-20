@@ -316,9 +316,9 @@ describe("git assertion helpers + withProject", () => {
     const { root } = getProject();
     // planctl init self-commits its bootstrap files inline.
     expect(gitLogCount(root)).toBeGreaterThanOrEqual(1);
-    expect(gitHeadMessage(root)).toContain("planctl");
+    expect(gitHeadMessage(root)).toContain("chore(plan): init");
     const files = gitFilesInHead(root);
-    expect(files.some((f) => f.startsWith(".planctl/"))).toBe(true);
+    expect(files.some((f) => f.startsWith(".keeper/"))).toBe(true);
   });
 
   test("withProject HOME is dedicated and a verb runs green against it", () => {

@@ -74,7 +74,7 @@ function scaffold(project: { root: string; home: string }, yaml: string) {
 
 function epicDef(root: string, epicId: string): Record<string, unknown> {
   return JSON.parse(
-    readFileSync(join(root, ".planctl", "epics", `${epicId}.json`), "utf-8"),
+    readFileSync(join(root, ".keeper", "epics", `${epicId}.json`), "utf-8"),
   );
 }
 
@@ -220,7 +220,7 @@ describe("duplicate_epic guard", () => {
     const err = parseCliOutput(second.output).error as Record<string, unknown>;
     expect(err.code).toBe("duplicate_epic");
     expect(err.details).toEqual([`${existingId} (status: open)`]);
-    const epics = readdirSync(join(project.root, ".planctl", "epics")).filter(
+    const epics = readdirSync(join(project.root, ".keeper", "epics")).filter(
       (f) => f.startsWith("fn-") && f.endsWith(".json"),
     );
     expect(epics.length).toBe(1);
@@ -366,13 +366,13 @@ describe("epic rm", () => {
     expect(env.epic_id).toBe(epicId);
     expect(env.task_count).toBe(1);
     const removed = new Set(env.removed_files as string[]);
-    expect(removed.has(`.planctl/epics/${epicId}.json`)).toBe(true);
-    expect(removed.has(`.planctl/specs/${epicId}.md`)).toBe(true);
-    expect(removed.has(`.planctl/specs/${epicId}.1.md`)).toBe(true);
-    expect(removed.has(`.planctl/tasks/${epicId}.1.json`)).toBe(true);
+    expect(removed.has(`.keeper/epics/${epicId}.json`)).toBe(true);
+    expect(removed.has(`.keeper/specs/${epicId}.md`)).toBe(true);
+    expect(removed.has(`.keeper/specs/${epicId}.1.md`)).toBe(true);
+    expect(removed.has(`.keeper/tasks/${epicId}.1.json`)).toBe(true);
 
     expect(
-      existsSync(join(project.root, ".planctl", "epics", `${epicId}.json`)),
+      existsSync(join(project.root, ".keeper", "epics", `${epicId}.json`)),
     ).toBe(true);
     expect(gitHeadSha(project.root)).toBe(headBefore);
   });
@@ -384,7 +384,7 @@ describe("epic rm", () => {
     expect(first.code).toBe(0);
     const epicId = parseCliOutput(first.output).epic_id as string;
 
-    const locks = join(project.root, ".planctl", "state", "locks");
+    const locks = join(project.root, ".keeper", "state", "locks");
     mkdirSync(locks, { recursive: true });
     writeFileSync(join(locks, `${epicId}.1.lock`), "held", "utf-8");
 
@@ -398,7 +398,7 @@ describe("epic rm", () => {
     expect(env.success).toBe(false);
     expect(env.error as string).toContain(`${epicId}.1 (locked)`);
     expect(
-      existsSync(join(project.root, ".planctl", "epics", `${epicId}.json`)),
+      existsSync(join(project.root, ".keeper", "epics", `${epicId}.json`)),
     ).toBe(true);
   });
 
@@ -409,7 +409,7 @@ describe("epic rm", () => {
     expect(first.code).toBe(0);
     const epicId = parseCliOutput(first.output).epic_id as string;
 
-    const locks = join(project.root, ".planctl", "state", "locks");
+    const locks = join(project.root, ".keeper", "state", "locks");
     mkdirSync(locks, { recursive: true });
     writeFileSync(join(locks, `${epicId}.1.lock`), "held", "utf-8");
 
@@ -423,10 +423,10 @@ describe("epic rm", () => {
     expect(env.success).toBe(true);
     expect(env.epic_id).toBe(epicId);
     expect(
-      existsSync(join(project.root, ".planctl", "epics", `${epicId}.json`)),
+      existsSync(join(project.root, ".keeper", "epics", `${epicId}.json`)),
     ).toBe(false);
     expect(
-      existsSync(join(project.root, ".planctl", "tasks", `${epicId}.1.json`)),
+      existsSync(join(project.root, ".keeper", "tasks", `${epicId}.1.json`)),
     ).toBe(false);
   });
 });

@@ -7,14 +7,14 @@
 // error when the brief is missing — close-preflight runs first), then persist
 // commit-free via writeArtifact. They are runtime-state-only verbs (like claim /
 // close-preflight): they mutate only gitignored state/audits/ and draw NO
-// `.planctl/` commit.
+// data-dir commit.
 //
 // This module owns the bits common to all three: the byte-cap payload reader,
 // the brief loader + schema gate, the project resolver, and the typed error
 // emitter. Each verb's own run module owns its payload validation + envelope.
 
 import { existsSync, readFileSync, readSync, realpathSync } from "node:fs";
-import { isAbsolute, join, resolve } from "node:path";
+import { isAbsolute, resolve } from "node:path";
 
 import {
   ArtifactSchemaTooNewError,
@@ -23,7 +23,12 @@ import {
 } from "./audit_artifacts.ts";
 import { formatOutput, type OutputFormat } from "./format.ts";
 import { isEpicId, isTaskId } from "./ids.ts";
-import { type ProjectContext, resolveProject } from "./project.ts";
+import {
+  contextForRoot,
+  type ProjectContext,
+  resolveProject,
+} from "./project.ts";
+import { hasDataDir } from "./state_path.ts";
 
 /** Same 1 MiB stdin cap scaffold uses against a YAML billion-laughs DoS. A real
  * audit report / verdict / follow-up plan is a few KB; 1 MiB is generous.
@@ -131,7 +136,7 @@ export interface AuditContext {
  * the parsed `audits/<epic_id>/brief.json` dict.
  *
  * Typed errors (thrown as SubmitError): BAD_EPIC_ID (garbage / task-shaped id),
- * NOT_A_PROJECT (`--project` path has no .planctl/), BRIEF_MISSING (no brief —
+ * NOT_A_PROJECT (`--project` path has no data dir), BRIEF_MISSING (no brief —
  * run close-preflight first), BRIEF_CORRUPT (unparseable JSON or a too-new
  * schema_version). Mirrors resolve_audit_context. */
 export function resolveAuditContext(
@@ -162,19 +167,13 @@ export function resolveAuditContext(
       );
     }
     const projectRoot = resolveResolved(expandUser(project));
-    if (!existsSync(join(projectRoot, ".planctl"))) {
+    if (!hasDataDir(projectRoot)) {
       throw new SubmitError(
         "NOT_A_PROJECT",
         `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
       );
     }
-    const planctlDir = join(projectRoot, ".planctl");
-    ctx = {
-      name: basename(projectRoot),
-      dataDir: planctlDir,
-      stateDir: join(planctlDir, "state"),
-      projectPath: projectRoot,
-    };
+    ctx = contextForRoot(projectRoot);
   } else {
     ctx = resolveProject(format);
   }
@@ -270,11 +269,6 @@ function resolveResolved(path: string): string {
   } catch {
     return abs;
   }
-}
-
-function basename(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 0 ? (parts[parts.length - 1] as string) : path;
 }
 
 function describeError(exc: unknown): string {

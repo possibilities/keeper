@@ -92,15 +92,13 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("buildSubject", () => {
-  test("no detail: chore(planctl): <verb> <id>", () => {
-    expect(buildSubject("done", "fn-1-x.1")).toBe(
-      "chore(planctl): done fn-1-x.1",
-    );
+  test("no detail: chore(plan): <verb> <id>", () => {
+    expect(buildSubject("done", "fn-1-x.1")).toBe("chore(plan): done fn-1-x.1");
   });
 
   test("with detail: em-dash (U+2014) join, collapsed newlines, trimmed", () => {
     expect(buildSubject("scaffold", "fn-2-y", "  added\nthings  ")).toBe(
-      "chore(planctl): scaffold fn-2-y — added things",
+      "chore(plan): scaffold fn-2-y — added things",
     );
   });
 });
@@ -109,7 +107,7 @@ describe("buildMessageWithTrailers", () => {
   test("stamps the exact uuid; omits Session-Id when falsy", () => {
     const sid = "abcdabcd-1234-4567-89ab-cdefcdefcdef";
     const withSid = buildMessageWithTrailers(
-      "chore(planctl): scaffold fn-1",
+      "chore(plan): scaffold fn-1",
       "scaffold",
       "fn-1",
       "deadbeef",
@@ -118,7 +116,7 @@ describe("buildMessageWithTrailers", () => {
     expect(withSid.trimEnd().endsWith(`Session-Id: ${sid}`)).toBe(true);
 
     const withoutSid = buildMessageWithTrailers(
-      "chore(planctl): scaffold fn-1",
+      "chore(plan): scaffold fn-1",
       "scaffold",
       "fn-1",
       "deadbeef",
@@ -127,7 +125,7 @@ describe("buildMessageWithTrailers", () => {
     expect(withoutSid.includes("Session-Id:")).toBe(false);
 
     const dflt = buildMessageWithTrailers(
-      "chore(planctl): scaffold fn-1",
+      "chore(plan): scaffold fn-1",
       "scaffold",
       "fn-1",
       "deadbeef",
@@ -137,13 +135,13 @@ describe("buildMessageWithTrailers", () => {
 
   test("subject, blank line, then trailers in order", () => {
     const msg = buildMessageWithTrailers(
-      "chore(planctl): done fn-1.1",
+      "chore(plan): done fn-1.1",
       "done",
       "fn-1.1",
       "cafef00d",
     );
     expect(msg).toBe(
-      "chore(planctl): done fn-1.1\n\n" +
+      "chore(plan): done fn-1.1\n\n" +
         "Planctl-Op: done\n" +
         "Planctl-Target: fn-1.1\n" +
         "Planctl-Prev-Op: cafef00d\n",
@@ -176,7 +174,7 @@ describe("autoCommitFromInvocation no-op paths", () => {
       files: [],
       op: "claim",
       target: "fn-1-noop.1",
-      subject: "chore(planctl): claim fn-1-noop.1",
+      subject: "chore(plan): claim fn-1-noop.1",
       state_repo: repo,
       repo_root: repo,
     });
@@ -195,7 +193,7 @@ describe("autoCommitFromInvocation no-op paths", () => {
       files: [tracked],
       op: "noop-clean",
       target: "fn-1-noop",
-      subject: "chore(planctl): noop-clean fn-1-noop",
+      subject: "chore(plan): noop-clean fn-1-noop",
       state_repo: repo,
       repo_root: repo,
     });
@@ -212,7 +210,7 @@ describe("autoCommitFromInvocation happy path", () => {
   test("dirty files → commit lands, returns long sha, payload subject + trailers", () => {
     const rel = makeDirty(".planctl/epics/test_marker.txt");
     const pre = commitCount(repo);
-    const subject = "chore(planctl): approve fn-587-x";
+    const subject = "chore(plan): approve fn-587-x";
 
     const sha = autoCommitFromInvocation({
       files: [rel],
@@ -242,7 +240,7 @@ describe("autoCommitFromInvocation happy path", () => {
       files: [rel],
       op: "scaffold",
       target: "fn-695-x",
-      subject: "chore(planctl): scaffold fn-695-x",
+      subject: "chore(plan): scaffold fn-695-x",
       session_id: sid,
       state_repo: repo,
       repo_root: repo,
@@ -262,7 +260,7 @@ describe("autoCommitFromInvocation happy path", () => {
       files: [rel],
       op: "scaffold",
       target: "fn-695-y",
-      subject: "chore(planctl): scaffold fn-695-y",
+      subject: "chore(plan): scaffold fn-695-y",
       state_repo: repo,
       repo_root: repo,
     });
@@ -280,7 +278,7 @@ describe("autoCommitFromInvocation happy path", () => {
       files: [rel],
       op: "refine-apply",
       target: "fn-695-z",
-      subject: "chore(planctl): refine-apply fn-695-z",
+      subject: "chore(plan): refine-apply fn-695-z",
       session_id: null,
       state_repo: repo,
       repo_root: repo,
@@ -296,7 +294,7 @@ describe("autoCommitFromInvocation happy path", () => {
       files: [inScope],
       op: "approve",
       target: "fn-587-y",
-      subject: "chore(planctl): approve fn-587-y",
+      subject: "chore(plan): approve fn-587-y",
       state_repo: repo,
       repo_root: repo,
     });
@@ -323,7 +321,7 @@ describe("autoCommitFromInvocation happy path", () => {
         files: [".planctl/epics/first.txt"],
         op: "init",
         target: "proj",
-        subject: "chore(planctl): init proj",
+        subject: "chore(plan): init proj",
         state_repo: fresh,
         repo_root: fresh,
       });
@@ -348,7 +346,7 @@ describe("autoCommitFromInvocation failure shapes", () => {
       files: [rel],
       op: "approve",
       target: "fn-587-fb",
-      subject: "chore(planctl): approve fn-587-fb",
+      subject: "chore(plan): approve fn-587-fb",
       repo_root: repo,
     });
     expect(sha).not.toBeNull();
@@ -361,7 +359,7 @@ describe("autoCommitFromInvocation failure shapes", () => {
         files: [".planctl/epics/no_repo.txt"],
         op: "approve",
         target: "fn-587-nr",
-        subject: "chore(planctl): approve fn-587-nr",
+        subject: "chore(plan): approve fn-587-nr",
       });
     } catch (e) {
       caught = e as CommitFailed;
@@ -400,7 +398,7 @@ describe("autoCommitFromInvocation sequential + retry", () => {
       files: [rel],
       op: "approve",
       target: "fn-587-l1",
-      subject: "chore(planctl): approve fn-587-l1",
+      subject: "chore(plan): approve fn-587-l1",
       state_repo: repo,
       repo_root: repo,
     });
@@ -410,7 +408,7 @@ describe("autoCommitFromInvocation sequential + retry", () => {
       files: [rel2],
       op: "approve",
       target: "fn-587-l2",
-      subject: "chore(planctl): approve fn-587-l2",
+      subject: "chore(plan): approve fn-587-l2",
       state_repo: repo,
       repo_root: repo,
     });
@@ -440,7 +438,7 @@ describe("autoCommitFromInvocation sequential + retry", () => {
         files: [rel],
         op: "approve",
         target: "fn-640-retry",
-        subject: "chore(planctl): approve fn-640-retry",
+        subject: "chore(plan): approve fn-640-retry",
         state_repo: repo,
         repo_root: repo,
       },
@@ -468,7 +466,7 @@ describe("autoCommitFromInvocation sequential + retry", () => {
           files: [rel],
           op: "approve",
           target: "fn-640-exhaust",
-          subject: "chore(planctl): approve fn-640-exhaust",
+          subject: "chore(plan): approve fn-640-exhaust",
           state_repo: repo,
           repo_root: repo,
         },

@@ -43,9 +43,13 @@ import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
 import { buildPlanctlInvocationReadonly } from "../invocation.ts";
-import type { ProjectContext } from "../project.ts";
-import { resolveProject } from "../project.ts";
+import {
+  contextForRoot,
+  type ProjectContext,
+  resolveProject,
+} from "../project.ts";
 import { clearCloseMarker } from "../session_markers.ts";
+import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe, nowIso } from "../store.ts";
 import { runEpicClose } from "./epic_close.ts";
 import { runScaffold } from "./scaffold.ts";
@@ -79,17 +83,6 @@ function emitFinalizeError(
   process.exit(1);
 }
 
-/** Build a ProjectContext from a project root (the .planctl/ parent). */
-function contextForRoot(projectRoot: string): ProjectContext {
-  const planctlDir = join(projectRoot, ".planctl");
-  return {
-    name: basename(projectRoot),
-    dataDir: planctlDir,
-    stateDir: join(planctlDir, "state"),
-    projectPath: projectRoot,
-  };
-}
-
 /** Resolve the owning project (--project abs bypass / cwd-walk). Mirrors
  * _resolve_project. */
 function resolveFinalizeProject(
@@ -102,7 +95,7 @@ function resolveFinalizeProject(
       usageError(`--project requires an absolute path, got: ${project}`);
     }
     const projectRoot = realpathOr(resolveAbs(projectPathObj));
-    if (!isDir(join(projectRoot, ".planctl"))) {
+    if (!hasDataDir(projectRoot)) {
       emitFinalizeError(
         "NOT_A_PROJECT",
         `No planctl project found at ${projectRoot}. Run 'planctl init' first.`,
@@ -630,14 +623,6 @@ function realpathOr(p: string): string {
   }
 }
 
-function isDir(p: string): boolean {
-  try {
-    return require("node:fs").statSync(p).isDirectory();
-  } catch {
-    return false;
-  }
-}
-
 function isAbsolute(p: string): boolean {
   return p.startsWith("/");
 }
@@ -648,9 +633,4 @@ function expandUser(p: string): string {
     return home + p.slice(1);
   }
   return p;
-}
-
-function basename(path: string): string {
-  const parts = path.split("/").filter(Boolean);
-  return parts.length > 0 ? (parts[parts.length - 1] as string) : path;
 }

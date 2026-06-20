@@ -22,6 +22,7 @@ import { emitMutating } from "../emit.ts";
 import { compactJson, type OutputFormat } from "../format.ts";
 import { isEpicId } from "../ids.ts";
 import { resolveProject } from "../project.ts";
+import { resolveDataDir } from "../state_path.ts";
 import { atomicWriteJson, loadJson, nowIso } from "../store.ts";
 import { restampEpicOrFail } from "../validation_restamp.ts";
 
@@ -181,7 +182,11 @@ export function runEpicAddDeps(args: AddDepsArgs): void {
       discovered = [];
     }
     for (const project of discovered) {
-      const projectEpics = join(project, ".planctl", "epics");
+      const projectDataDir = resolveDataDir(project);
+      if (projectDataDir === null) {
+        continue;
+      }
+      const projectEpics = join(projectDataDir, "epics");
       if (!existsSync(projectEpics)) {
         continue;
       }

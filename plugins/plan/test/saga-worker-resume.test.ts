@@ -20,12 +20,12 @@ import { join } from "node:path";
 import { runCli, scaffoldEpic, withProject } from "./harness.ts";
 
 function briefPath(root: string, taskId: string): string {
-  return join(root, ".planctl", "state", "briefs", `${taskId}.json`);
+  return join(root, ".keeper", "state", "briefs", `${taskId}.json`);
 }
 
 // Write the runtime sidecar directly, bypassing claim/done. Port of _set_status.
 function setStatus(root: string, taskId: string, status: string): void {
-  const p = join(root, ".planctl", "state", "tasks", `${taskId}.state.json`);
+  const p = join(root, ".keeper", "state", "tasks", `${taskId}.state.json`);
   writeFileSync(
     p,
     `${JSON.stringify({ status, updated_at: "2026-04-18T00:00:00Z" })}\n`,
@@ -174,7 +174,7 @@ describe("worker resume", () => {
 
     const statePath = join(
       proj.root,
-      ".planctl",
+      ".keeper",
       "state",
       "tasks",
       `${taskId}.state.json`,
@@ -194,7 +194,7 @@ describe("worker resume", () => {
     setStatus(proj.root, taskId, "in_progress");
     const statePath = join(
       proj.root,
-      ".planctl",
+      ".keeper",
       "state",
       "tasks",
       `${taskId}.state.json`,
@@ -250,7 +250,7 @@ describe("worker resume", () => {
     const { taskIds } = scaffoldEpic(proj, { title: "Test epic", nTasks: 1 });
     const taskId = taskIds[0] as string;
     // Hand-null the tracked tier to simulate a legacy on-disk record.
-    const taskPath = join(proj.root, ".planctl", "tasks", `${taskId}.json`);
+    const taskPath = join(proj.root, ".keeper", "tasks", `${taskId}.json`);
     const def = JSON.parse(readFileSync(taskPath, "utf-8")) as Record<
       string,
       unknown
@@ -286,7 +286,7 @@ describe("worker resume", () => {
     expect(r.stderr.includes("'blocked'")).toBe(true);
     const statePath = join(
       proj.root,
-      ".planctl",
+      ".keeper",
       "state",
       "tasks",
       `${taskId}.state.json`,

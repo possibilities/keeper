@@ -68,7 +68,7 @@ function create(title: string, extra: string[] = []) {
 // ---------------------------------------------------------------------------
 
 describe("mutating verb planctl_invocation", () => {
-  test("epic create carries op/target/subject + .planctl-only files", () => {
+  test("epic create carries op/target/subject + data-dir-only files", () => {
     // test_envelope.py::test_epic_create_emits_planctl_mutation
     // test_envelope_shape.py::test_epic_create_emits_planctl_mutation (same surface — one bun test)
     const r = create("Test epic");
@@ -79,14 +79,14 @@ describe("mutating verb planctl_invocation", () => {
     expect(pc).not.toBeUndefined();
     expect(pc.op).toBe("create");
     expect((pc.target as string).startsWith("fn-")).toBe(true);
-    expect(
-      (pc.subject as string).startsWith("chore(planctl): create fn-"),
-    ).toBe(true);
+    expect((pc.subject as string).startsWith("chore(plan): create fn-")).toBe(
+      true,
+    );
     expect(Array.isArray(pc.files)).toBe(true);
     expect(Array.isArray(pc.touched_path_files)).toBe(true);
     expect((pc.files as string[]).length).toBeGreaterThanOrEqual(1);
     for (const f of pc.files as string[]) {
-      expect(f.startsWith(".planctl/")).toBe(true);
+      expect(f.startsWith(".keeper/")).toBe(true);
     }
   });
 
@@ -101,7 +101,7 @@ describe("mutating verb planctl_invocation", () => {
     expect(pc.repo_root).toBe(project.root);
   });
 
-  test("files prefix guard: every entry under .planctl/", () => {
+  test("files prefix guard: every entry under .keeper/", () => {
     // test_envelope_shape.py::test_epic_create_files_prefix_guard
     const r = create("Prefix guard");
     expect(r.code).toBe(0);
@@ -110,7 +110,7 @@ describe("mutating verb planctl_invocation", () => {
       unknown
     >;
     for (const f of pc.files as string[]) {
-      expect(f.startsWith(".planctl/")).toBe(true);
+      expect(f.startsWith(".keeper/")).toBe(true);
     }
   });
 
@@ -195,7 +195,7 @@ describe("mutating verb planctl_invocation", () => {
       >;
       expect(Array.isArray(pc.files)).toBe(true);
       expect(typeof pc.subject).toBe("string");
-      expect((pc.subject as string).startsWith("chore(planctl):")).toBe(true);
+      expect((pc.subject as string).startsWith("chore(plan):")).toBe(true);
     }
   });
 });
@@ -234,7 +234,7 @@ describe("claim readonly invocation shape", () => {
 // ---------------------------------------------------------------------------
 
 describe("files set exclusion", () => {
-  test("a dirty non-.planctl tree never leaks into files", () => {
+  test("a dirty non-data-dir tree never leaks into files", () => {
     // test_envelope.py::test_dirty_tree_excluded_from_planctl_mutation_files
     const srcDir = join(project.root, "src");
     mkdirSync(srcDir, { recursive: true });
@@ -246,17 +246,17 @@ describe("files set exclusion", () => {
     const files = (
       parseEnvelope(r.output).planctl_invocation as Record<string, unknown>
     ).files as string[];
-    expect(files.every((f) => f.startsWith(".planctl/"))).toBe(true);
+    expect(files.every((f) => f.startsWith(".keeper/"))).toBe(true);
   });
 
-  test("a peer-session .planctl file never leaks into this session's files", () => {
+  test("a peer-session data-dir file never leaks into this session's files", () => {
     // test_envelope.py::test_peer_session_excluded_from_planctl_mutation_files
     const made = create("Session A epic");
     expect(made.code).toBe(0);
     const epicId = (parseEnvelope(made.output).epic as Record<string, unknown>)
       .id as string;
 
-    const peer = join(project.root, ".planctl", "epics", "fn-peer-inject.json");
+    const peer = join(project.root, ".keeper", "epics", "fn-peer-inject.json");
     writeFileSync(
       peer,
       '{"id": "fn-peer-inject", "status": "open"}\n',
@@ -289,7 +289,7 @@ describe("files set exclusion", () => {
 //   unit (buildPlanctlInvocation) pins the identical contract at the unit layer.
 // CITED: build_subject coverage.
 //   test_envelope_shape.py::test_subject_via_verb_templates    -> the subject
-//     pins above ("chore(planctl): create fn-") + src-commit.test.ts buildSubject.
+//     pins above ("chore(plan): create fn-") + src-commit.test.ts buildSubject.
 //   test_envelope_shape.py::test_subject_with_detail_formatting -> src-commit.test.ts
 //     (buildSubject detail/control-char flattening — a pure-unit string contract).
 
@@ -376,7 +376,7 @@ describe("read-only invocation trailer", () => {
     const beta = (
       parseEnvelope(create("Beta").output).epic as Record<string, unknown>
     ).id as string;
-    const ep = join(project.root, ".planctl", "epics", `${alpha}.json`);
+    const ep = join(project.root, ".keeper", "epics", `${alpha}.json`);
     const data = JSON.parse(readFileSync(ep, "utf-8"));
     data.originating_epic = beta;
     writeFileSync(ep, JSON.stringify(data), "utf-8");
@@ -404,13 +404,13 @@ describe("emit auto-commit boundary", () => {
       title: "emit test epic",
       nTasks: 1,
     });
-    const ep = join(project.root, ".planctl", "epics", `${epicId}.json`);
+    const ep = join(project.root, ".keeper", "epics", `${epicId}.json`);
     const data = JSON.parse(readFileSync(ep, "utf-8"));
     data.primary_repo = null;
     data.touched_repos = null;
     data.last_validated_at = null;
     writeFileSync(ep, JSON.stringify(data), "utf-8");
-    runGit(["add", ".planctl/"], project.root);
+    runGit(["add", ".keeper/"], project.root);
     runGit(["commit", "-q", "-m", "chore: seed planctl tree"], project.root);
     return epicId;
   }
@@ -429,11 +429,9 @@ describe("emit auto-commit boundary", () => {
     expect(env.success).toBe(true);
     expect("planctl_invocation" in env).toBe(true);
     expect(gitLogCount(project.root)).toBe(before + 1);
-    expect(headSubject(project.root)).toBe(
-      `chore(planctl): set-title ${epicId}`,
-    );
+    expect(headSubject(project.root)).toBe(`chore(plan): set-title ${epicId}`);
     expect(
-      runGit(["status", "--porcelain", "--", ".planctl/"], project.root).trim(),
+      runGit(["status", "--porcelain", "--", ".keeper/"], project.root).trim(),
     ).toBe("");
   });
 
@@ -468,12 +466,10 @@ describe("emit auto-commit boundary", () => {
     });
     expect(r.code).toBe(0);
     expect(gitLogCount(project.root)).toBe(before + 1);
-    expect(headSubject(project.root)).toBe(
-      `chore(planctl): validate ${epicId}`,
-    );
+    expect(headSubject(project.root)).toBe(`chore(plan): validate ${epicId}`);
     const data = JSON.parse(
       readFileSync(
-        join(project.root, ".planctl", "epics", `${epicId}.json`),
+        join(project.root, ".keeper", "epics", `${epicId}.json`),
         "utf-8",
       ),
     );

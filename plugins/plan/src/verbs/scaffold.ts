@@ -36,6 +36,7 @@ import { TASK_TIERS } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { expandPath } from "../repo_inference.ts";
 import { ensureValidTaskSpec } from "../specs.ts";
+import { resolveDataDir } from "../state_path.ts";
 import {
   atomicWrite,
   atomicWriteJson,
@@ -949,7 +950,11 @@ export function runScaffold(args: ScaffoldArgs): number {
       discovered.length > 0 ? scanEpicIdsGlobal(discovered) : {};
     if (discovered.length > 0) {
       for (const project of discovered) {
-        const otherEpics = join(project, ".planctl", "epics");
+        const otherDataDir = resolveDataDir(project);
+        if (otherDataDir === null) {
+          continue;
+        }
+        const otherEpics = join(otherDataDir, "epics");
         if (!existsSync(otherEpics)) {
           continue;
         }

@@ -4,12 +4,14 @@
 // linked-worktree `.git` file counts), never honoring GIT_DIR. realpathSync
 // matches Python's Path.resolve() symlink resolution (load-bearing on macOS,
 // where the pytest tmp tree resolves /var -> /private/var). resolveProject
-// hard-errors through emitError when `.planctl/` is absent.
+// hard-errors through emitError when no data dir (`.keeper/`, or the transient
+// `.planctl/` fallback) is present.
 
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
 
 import { emitError, type OutputFormat } from "./format.ts";
+import { hasDataDir, resolveDataDirOrDefault } from "./state_path.ts";
 
 export interface ProjectContext {
   name: string;
@@ -49,28 +51,37 @@ export function findProjectRoot(): string {
   return findGitRoot() ?? resolveStart();
 }
 
-/** Resolve the current directory to a ProjectContext, erroring when `.planctl/`
- * is absent. `format` selects the error envelope's serialization. */
+/** Build a ProjectContext for `projectRoot`, resolving its data dir (`.keeper/`
+ * with the transient `.planctl/` fallback). The shared root→context builder every
+ * verb's local helper routes through, so the data-dir resolution lives in one
+ * place. */
+export function contextForRoot(projectRoot: string): ProjectContext {
+  const dataDir = resolveDataDirOrDefault(projectRoot);
+  return {
+    name: basename(projectRoot),
+    dataDir,
+    stateDir: join(dataDir, "state"),
+    projectPath: projectRoot,
+  };
+}
+
+/** Resolve the current directory to a ProjectContext, erroring when no data dir
+ * (`.keeper/`, or the transient `.planctl/` fallback) is present. `format`
+ * selects the error envelope's serialization. */
 export function resolveProject(format: OutputFormat | null): ProjectContext {
   const projectRoot = findProjectRoot();
-  const planctlDir = join(projectRoot, ".planctl");
 
-  if (!existsSync(planctlDir)) {
+  if (!hasDataDir(projectRoot)) {
     emitError("No planctl project found. Run 'planctl init' first.", format);
   }
 
-  return {
-    name: basename(projectRoot),
-    dataDir: planctlDir,
-    stateDir: join(planctlDir, "state"),
-    projectPath: projectRoot,
-  };
+  return contextForRoot(projectRoot);
 }
 
 /** Resolve a `--project` override to a validated project root for the read-only
  * trailer, mirroring the per-verb --project branch: the flag is expanded with
  * `expandUser` (tilde form) BEFORE the absolute check, so a `~/proj` form agrees
- * with the verb. An absolute path whose `.planctl/` exists resolves to its
+ * with the verb. An absolute path whose data dir exists resolves to its
  * realpath; anything else (unset, relative, or not a project) returns null so the
  * caller falls back to cwd resolution. Trailer-only — it never errors, since the
  * verb already validated the flag. */
@@ -88,7 +99,7 @@ export function trailerProjectRoot(project: string | null): string | null {
   } catch {
     root = expanded;
   }
-  return existsSync(join(root, ".planctl")) ? root : null;
+  return hasDataDir(root) ? root : null;
 }
 
 /** Expand a leading `~` / `~/` to $HOME, matching the verb's --project branch. */

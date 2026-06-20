@@ -45,7 +45,7 @@ function run(args: string[], opts: { input?: string } = {}) {
 }
 
 function epicPath(epicId: string): string {
-  return join(project.root, ".planctl", "epics", `${epicId}.json`);
+  return join(project.root, ".keeper", "epics", `${epicId}.json`);
 }
 
 function readEpic(epicId: string): Record<string, unknown> {
@@ -381,7 +381,7 @@ describe("set-*-repo re-stamps + touched_repos auto-roll", () => {
     data.touched_repos = [...new Set(taskRepos)].sort();
     writeEpic(epicId, data);
     taskRepos.forEach((tr, i) => {
-      const tp = join(project.root, ".planctl", "tasks", `${taskIds[i]}.json`);
+      const tp = join(project.root, ".keeper", "tasks", `${taskIds[i]}.json`);
       const tdata = JSON.parse(readFileSync(tp, "utf-8"));
       tdata.target_repo = tr;
       writeFileSync(tp, JSON.stringify(tdata), "utf-8");

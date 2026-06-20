@@ -3,7 +3,7 @@
 // epic is already in the target state (last_validated_at already null /
 // queue_jump already true), emit a readonly envelope and write NOTHING (zero
 // commits). Otherwise write the field + bump updated_at and route through the
-// mutating seam so one chore(planctl): <verb> <epic> commit lands. queue-jump
+// mutating seam so one chore(plan): <verb> <epic> commit lands. queue-jump
 // rides queue_jump=true on its invocation so keeper folds the priority signal.
 // Neither is a restamp member.
 

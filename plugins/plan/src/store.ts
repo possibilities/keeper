@@ -16,9 +16,10 @@
 // fcntl.flock across engines.
 //
 // nowIso / getActor are spine utilities pinning the cross-implementation
-// contracts: PLANCTL_NOW returned verbatim after a strict shape check, the
-// wall-clock field padded to 6 fractional digits, and the actor-resolution
-// precedence (PLANCTL_ACTOR -> git user.email -> user.name -> USER -> unknown).
+// contracts: KEEPER_PLAN_NOW (legacy fallback PLANCTL_NOW) returned verbatim
+// after a strict shape check, the wall-clock field padded to 6 fractional
+// digits, and the actor-resolution precedence (KEEPER_PLAN_ACTOR, legacy
+// fallback PLANCTL_ACTOR -> git user.email -> user.name -> USER -> unknown).
 
 import { randomBytes } from "node:crypto";
 import {
@@ -37,6 +38,7 @@ import {
 import { dirname, join, relative, resolve, sep } from "node:path";
 
 import { flockOrThrow, LOCK_EX, LOCK_UN } from "./flock.ts";
+import { resolveDataDir } from "./state_path.ts";
 
 /** Parse JSON at `path`; null on missing OR corrupt (never throws). Mirrors
  * load_json_safe — the silent-on-corrupt read every verb relies on. */
@@ -186,10 +188,10 @@ export function atomicWriteRaw(path: string, content: string): void {
 }
 
 /** Append `path` to the current session's touched-paths log, then return.
- * Layout: `.planctl/state/sessions/<sid>/touched/<uuid4hex>.txt`, content =
+ * Layout: `<data-dir>/state/sessions/<sid>/touched/<uuid4hex>.txt`, content =
  * the repo-relative POSIX path + newline. Mirrors planctl/store.py _record_touched:
  * CLAUDE_CODE_SESSION_ID fail-OPEN (no sid -> silent skip), walk up <=20 levels
- * for .planctl/, all exceptions swallowed — a recorder failure never surfaces to
+ * for a data dir, all exceptions swallowed — a recorder failure never surfaces to
  * a caller (it degrades to wildcard staging at commit, which the hook rejects). */
 export function recordTouched(path: string, dataDir?: string): void {
   try {
@@ -198,19 +200,20 @@ export function recordTouched(path: string, dataDir?: string): void {
       return;
     }
 
-    // Resolve dataDir: walk up from path's parent to find a .planctl/ dir.
+    // Resolve dataDir: walk up from path's parent to find a data dir (`.keeper/`,
+    // or the transient `.planctl/` fallback — `.keeper/` wins when both exist).
     let resolvedDataDir = dataDir;
     if (resolvedDataDir === undefined) {
       let check = dirname(resolve(path));
       for (let i = 0; i < 20; i += 1) {
-        const candidate = join(check, ".planctl");
-        if (existsSync(candidate)) {
+        const candidate = resolveDataDir(check);
+        if (candidate !== null) {
           resolvedDataDir = candidate;
           break;
         }
         const parent = dirname(check);
         if (parent === check) {
-          return; // reached fs root, no .planctl/
+          return; // reached fs root, no data dir
         }
         check = parent;
       }
@@ -228,7 +231,7 @@ export function recordTouched(path: string, dataDir?: string): void {
     );
     mkdirSync(touchedDir, { recursive: true });
 
-    // Repo root = the .planctl/ parent; record the path relative to it, POSIX.
+    // Repo root = the data-dir parent; record the path relative to it, POSIX.
     const repoRoot = dirname(resolvedDataDir);
     const relPath = relative(realpathSync(repoRoot), realpathSync(path));
     // A path outside the repo root yields a leading "..": skip silently (Python
@@ -250,7 +253,7 @@ export function recordTouched(path: string, dataDir?: string): void {
 
 /** Atomic write + touched-path record — the drop-in planctl uses everywhere a
  * state file is rewritten (planctl/store.py atomic_write). `dataDir` is the
- * .planctl/ dir; auto-detected from `path` when omitted. */
+ * data dir; auto-detected from `path` when omitted. */
 export function atomicWrite(
   path: string,
   content: string,
@@ -324,7 +327,7 @@ export class LocalFileStateStore {
     atomicWriteJson(this.statePath(taskId), data);
   }
 
-  /** Hold an exclusive flock(2) on `.planctl/state/locks/<task_id>.lock` for
+  /** Hold an exclusive flock(2) on `<data-dir>/state/locks/<task_id>.lock` for
    * the duration of `fn`, then release. Mirrors lock_task: a real advisory
    * whole-file lock (LOCK_EX) that a Python fcntl peer also blocks on; the fd is
    * held for the lock lifetime and released (LOCK_UN) + closed in finally. */
@@ -345,15 +348,21 @@ export class LocalFileStateStore {
   }
 }
 
-// The PLANCTL_NOW / now_iso wire format: %Y-%m-%dT%H:%M:%S.%fZ — a 6-digit
-// fractional-second field. Matched against the override and produced for the
+// The now_iso wire format: %Y-%m-%dT%H:%M:%S.%fZ — a 6-digit fractional-second
+// field. Matched against the KEEPER_PLAN_NOW override and produced for the
 // wall-clock path.
 const NOW_ISO_REGEX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}Z$/;
 
-/** Strict-shape check on a PLANCTL_NOW override: the exact strptime round-trip
- * Python applies (every field two-digit, a literal-Z 6-digit fraction). A
- * value that matches the regex but is calendar-nonsense (month 13) still fails
- * the round-trip in Python; we validate the calendar fields too so a malformed
+/** The clock override: KEEPER_PLAN_NOW, with the transient legacy PLANCTL_NOW as
+ * fallback during the migration window. Undefined when neither is set. */
+function clockOverride(): string | undefined {
+  return process.env.KEEPER_PLAN_NOW ?? process.env.PLANCTL_NOW;
+}
+
+/** Strict-shape check on a clock override: the exact strptime round-trip Python
+ * applies (every field two-digit, a literal-Z 6-digit fraction). A value that
+ * matches the regex but is calendar-nonsense (month 13) still fails the
+ * round-trip in Python; we validate the calendar fields too so a malformed
  * value is a hard error, never a silent wall-clock fallback. */
 function isValidNowIso(value: string): boolean {
   if (!NOW_ISO_REGEX.test(value)) {
@@ -373,18 +382,19 @@ function isValidNowIso(value: string): boolean {
 }
 
 /** Current UTC timestamp in `%Y-%m-%dT%H:%M:%S.%fZ` with microsecond
- * precision. PLANCTL_NOW overrides the clock and is returned VERBATIM after a
- * strict shape check (no Date round-trip) — a malformed value is a hard error,
- * matching the Python contract that holds every implementation to one format.
+ * precision. KEEPER_PLAN_NOW (legacy fallback PLANCTL_NOW) overrides the clock
+ * and is returned VERBATIM after a strict shape check (no Date round-trip) — a
+ * malformed value is a hard error, matching the Python contract that holds every
+ * implementation to one format.
  *
  * JS Date is millisecond-native; the wall-clock path pads the 3-digit
  * millisecond fraction out to the 6-digit field. */
 export function nowIso(): string {
-  const override = process.env.PLANCTL_NOW;
+  const override = clockOverride();
   if (override !== undefined) {
     if (!isValidNowIso(override)) {
       throw new Error(
-        `PLANCTL_NOW must match '%Y-%m-%dT%H:%M:%S.%fZ' (got '${override}')`,
+        `KEEPER_PLAN_NOW must match '%Y-%m-%dT%H:%M:%S.%fZ' (got '${override}')`,
       );
     }
     return override;
@@ -404,10 +414,11 @@ function gitConfig(key: string): string | null {
   return value ? value : null;
 }
 
-/** Current actor identity: PLANCTL_ACTOR -> git user.email -> git user.name ->
- * USER -> "unknown". Mirrors get_actor's precedence exactly. */
+/** Current actor identity: KEEPER_PLAN_ACTOR (legacy fallback PLANCTL_ACTOR) ->
+ * git user.email -> git user.name -> USER -> "unknown". Mirrors get_actor's
+ * precedence exactly. */
 export function getActor(): string {
-  const actor = process.env.PLANCTL_ACTOR;
+  const actor = process.env.KEEPER_PLAN_ACTOR ?? process.env.PLANCTL_ACTOR;
   if (actor) {
     return actor.trim();
   }

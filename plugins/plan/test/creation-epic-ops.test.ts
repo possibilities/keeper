@@ -61,7 +61,7 @@ function createEpic(title: string): string {
 function readEpic(epicId: string): Record<string, unknown> {
   return JSON.parse(
     readFileSync(
-      join(project.root, ".planctl", "epics", `${epicId}.json`),
+      join(project.root, ".keeper", "epics", `${epicId}.json`),
       "utf-8",
     ),
   );
@@ -149,7 +149,7 @@ describe("epic add-deps", () => {
     const pc = payload.planctl_invocation as Record<string, unknown>;
     expect(pc.op).toBe("add-deps");
     expect(pc.target).toBe(epicId);
-    expect(pc.subject).toBe(`chore(planctl): add-deps ${epicId}`);
+    expect(pc.subject).toBe(`chore(plan): add-deps ${epicId}`);
 
     expect(readEpic(epicId).depends_on_epics).toEqual([dep1, dep2]);
   });
@@ -480,7 +480,7 @@ describe("task set-tier (validation + envelope)", () => {
   function readTask(taskId: string): Record<string, unknown> {
     return JSON.parse(
       readFileSync(
-        join(project.root, ".planctl", "tasks", `${taskId}.json`),
+        join(project.root, ".keeper", "tasks", `${taskId}.json`),
         "utf-8",
       ),
     );
@@ -488,7 +488,7 @@ describe("task set-tier (validation + envelope)", () => {
 
   // Hand-null a task's persisted tier to simulate a legacy on-disk record.
   function handNullTier(taskId: string): void {
-    const path = join(project.root, ".planctl", "tasks", `${taskId}.json`);
+    const path = join(project.root, ".keeper", "tasks", `${taskId}.json`);
     const def = readTask(taskId);
     def.tier = null;
     writeFileSync(path, JSON.stringify(def), "utf-8");
@@ -622,7 +622,7 @@ describe("set-primary-repo / set-touched-repos warnings", () => {
 
   function warnReadEpic(epicId: string): Record<string, unknown> {
     return JSON.parse(
-      readFileSync(join(root, ".planctl", "epics", `${epicId}.json`), "utf-8"),
+      readFileSync(join(root, ".keeper", "epics", `${epicId}.json`), "utf-8"),
     );
   }
 

@@ -172,11 +172,11 @@ describe("audit artifact path helpers", () => {
     rmSync(root, { recursive: true, force: true });
   }
 
-  test("auditsRoot is <primary>/.planctl/state/audits (pure path)", () => {
+  test("auditsRoot defaults to <primary>/.keeper/state/audits on a fresh tree (pure path)", () => {
     const primary = setup();
     try {
       expect(auditsRoot(primary)).toBe(
-        join(primary, ".planctl", "state", "audits"),
+        join(primary, ".keeper", "state", "audits"),
       );
       // pure path: not created
       expect(existsSync(auditsRoot(primary))).toBe(false);
