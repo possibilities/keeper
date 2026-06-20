@@ -23,5 +23,5 @@ one test file touching the same orchestration surface and land as one commit.
       `bun run test:full` stays green.
 
 ## Done summary
-
+Added test/reclaim.test.ts driving run() against a real temp DB: happy-path asserts the atomic swap to the reclaimed (smaller) copy with stale -wal/-shm dropped and the sentinel row surviving; daemon-up path asserts exit 1, REFUSING message, and a byte-identical untouched source. Exported ParsedReclaimArgs and registered the file in the fast-tier ignore list.
 ## Evidence

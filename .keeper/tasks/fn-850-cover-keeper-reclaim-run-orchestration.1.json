@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Integration-test reclaim run() path",
-  "updated_at": "2026-06-20T14:32:20.384000Z"
+  "updated_at": "2026-06-20T14:55:42.980000Z",
+  "worker_done_at": "2026-06-20T14:55:42.980000Z"
 }
