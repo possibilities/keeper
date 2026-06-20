@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T20:57:59.803000Z",
+  "depends_on": [],
+  "epic": "fn-861-dispatch-global-prompt-prefix",
+  "id": "fn-861-dispatch-global-prompt-prefix.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "dispatch global prompt prefix",
+  "updated_at": "2026-06-20T20:57:59.803000Z"
+}
