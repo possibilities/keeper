@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Test dispatch main() paths",
-  "updated_at": "2026-06-20T20:54:45.361000Z"
+  "updated_at": "2026-06-20T21:03:27.833000Z",
+  "worker_done_at": "2026-06-20T21:03:27.833000Z"
 }

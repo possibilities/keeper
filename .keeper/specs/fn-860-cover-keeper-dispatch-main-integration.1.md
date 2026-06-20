@@ -31,5 +31,5 @@ keeper-cli test already has an `ExitError`-tagged shim to reuse).
       injected/faked launch backend.
 
 ## Done summary
-
+Added main()-level integration coverage for cli/dispatch.ts: injected a LaunchFn launch seam (and QueryFn) via MainDeps so launch tests run with a fake backend, and covered the arg-fault exit-2 branches, free-form prompt-file/validate paths, and dry-run/launch-result branches.
 ## Evidence
