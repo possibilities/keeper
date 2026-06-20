@@ -2630,6 +2630,19 @@ so the historical v57 create + v67 read still run against a live table on a fres
 walk; it is UNCONDITIONAL (the `approvals` v12→v13 precedent) so the v57 ladder
 step never resurrects the table on a post-shed restart.
 
+Forward growth is bounded by the steady-state **retention pass** (`src/compaction.ts`,
+`retainColdPayloads`) — keeper's first retention. A slack daemon timer NULLs the
+cold tail of shed-class bodies IN PLACE (the keep-set complement: PostToolUse
+mutation-tool rows past the recent window AND strictly below the fold cursor whose
+`file_path` is already promoted to `mutation_path`), running STRICTLY outside the
+fold on main's writable connection, paced (≤500 rows/batch, ≤20 batches/pass).
+After each batch `PRAGMA incremental_vacuum` returns the freed overflow pages to
+the file tail (a no-op unless the file was born `auto_vacuum=INCREMENTAL`, baked by
+`reclaimDb` above). Because the predicate excludes any row still owing a
+`mutation_path` backfill, retention-then-refold stays byte-identical. The re-spec'd
+data-loss sentinel (`countAbsentBlobs`) flags only a NULL body OUTSIDE the shed
+class — a missing keep-set body — never the intentional shed NULLs.
+
 For the in-codebase module map, event-sourcing invariants, and the "DO NOT"
 list, see [CLAUDE.md](./CLAUDE.md).
 

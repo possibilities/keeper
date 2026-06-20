@@ -28,7 +28,7 @@
  * '$.tool_input.file_path') END` guard, so a malformed body folds to NULL
  * instead of throwing — byte-identical to the old scan's malformed handling.
  *
- * ## Pacing + crash-safe resume (mirrors `compactColdBlobs`)
+ * ## Pacing + crash-safe resume (mirrors `retainColdPayloads`)
  *
  * Online, compaction-paced: collect a batch of ids read-only, then UPDATE them
  * under a brief `.immediate()` transaction, never holding a cursor across
@@ -57,7 +57,7 @@ export const BACKFILL_WATERMARK_KEY = "mutation_path_backfill_watermark";
  * Rows backfilled per transaction. Each batch is one `.immediate()` so this
  * bounds how long the writer lock is held per step — kept ≤500 to stay well
  * under a concurrent hook's `busy_timeout`, mirroring
- * {@link import("./compaction").DEFAULT_COMPACTION_BATCH_SIZE}.
+ * {@link import("./compaction").DEFAULT_RETENTION_BATCH_SIZE}.
  */
 export const DEFAULT_BACKFILL_BATCH_SIZE = 500;
 

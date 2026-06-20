@@ -1,29 +1,36 @@
 /**
- * Cold-blob compaction relocator tests (fn-717.2).
+ * Steady-state retention pass tests (fn-836.5).
  *
- * Covers the task .2 Acceptance:
- * - (a) compaction relocates a cold batch atomically: `events.data` goes NULL,
- *   `event_blobs` gains the bytes, and the reducer reads them back identically
- *   via `COALESCE`; no `events` row is ever deleted;
- * - (b) a from-scratch re-fold over the compacted DB reproduces byte-identical
- *   projections vs. pre-compaction;
- * - (c) the cold predicate provably excludes any blob the file-attribution
- *   scan could still need — a LIVE (undischarged) attribution's contributing
- *   blob stays inline, so `idx_events_tool_attr` keeps covering it;
- * - (d) absent-in-both-places folds safe AND is a counted bug (not silent);
- * - the pass runs paced (bounded batches) and the `events` table is measurably
- *   smaller after a run.
+ * The retention pass is the repurposed fn-717.2 relocator: it NULLs the cold
+ * tail of redundant SHED-CLASS `events.data` bodies IN PLACE (PostToolUse
+ * mutation-tool rows whose `tool_input.file_path` is already promoted to
+ * `mutation_path` — the complement of the keep-set ALLOW-list) and returns the
+ * freed overflow pages to the file via per-batch `incremental_vacuum`.
+ *
+ * Covers the task .5 Acceptance:
+ * - retention NULLs only cold shed-class bodies, paced/watermarked, past the
+ *   cursor; keep-set bodies and recent (above-watermark) bodies stay inline;
+ * - a from-scratch re-fold over the RETAINED DB reproduces byte-identical
+ *   projections (the shed predicate excludes any row still owing a backfill, so
+ *   the file_path the fold reads off `mutation_path` was promoted before its body
+ *   was dropped);
+ * - per-batch `incremental_vacuum` reclaims freelist pages on an
+ *   `auto_vacuum=INCREMENTAL` DB (no-op otherwise);
+ * - the re-spec'd data-loss sentinel does NOT false-alarm on intentional shed
+ *   NULLs, but DOES flag a missing keep-set body;
+ * - the pass is idempotent + bounded (never exceeds maxBatches*batchSize).
  */
 
-import type { Database } from "bun:sqlite";
+import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
-  compactColdBlobs,
   computeColdWatermark,
   countAbsentBlobs,
+  readFoldCursor,
+  retainColdPayloads,
 } from "../src/compaction";
 import { drain } from "../src/reducer";
 import { freshMemDb } from "./helpers/template-db";
@@ -32,19 +39,10 @@ let tmpDir: string;
 let db: Database;
 
 beforeEach(() => {
-  tmpDir = mkdtempSync(join(tmpdir(), "keeper-compaction-test-"));
-  // fn-769 mem variant: single in-process connection; `compactColdBlobs`
-  // relocates into this DB's own `event_blobs` table (no external sidecar
-  // file), so an in-memory template clone is correct.
+  tmpDir = mkdtempSync(join(tmpdir(), "keeper-retention-test-"));
+  // In-process clone of the migrated schema — post-shed there is no `event_blobs`
+  // table (fn-836.4 dropped it); retention NULLs `events.data` in place.
   db = freshMemDb().db;
-  // fn-836.4 shed dropped `event_blobs` from the live schema, so the migrated
-  // template no longer carries it. The RELOCATOR (`compactColdBlobs`) still
-  // exists until fn-836.5 repurposes it into the retention pass (which rewrites
-  // this whole file), so until then these unit tests provision the side table
-  // locally to exercise the relocator against the shape it targets.
-  db.run(
-    "CREATE TABLE IF NOT EXISTS event_blobs (event_id INTEGER PRIMARY KEY REFERENCES events(id), data TEXT NOT NULL)",
-  );
 });
 
 afterEach(() => {
@@ -53,12 +51,16 @@ afterEach(() => {
 });
 
 const TEST_UUID = "01234567-89ab-cdef-0123-456789abcdef";
-const TEST_UUID_2 = "fedcba98-7654-3210-fedc-ba9876543210";
 const TEST_OID = "0123456789abcdef0123456789abcdef01234567";
 
 let tsCounter = 1_000;
 
-/** Insert one raw event row; returns its auto-assigned id. */
+/**
+ * Insert one raw event row; returns its auto-assigned id. Mirrors the forward
+ * write path's `mutation_path` stamp for shed-class rows (the hook deriver
+ * promotes `tool_input.file_path` at INSERT), so seeded shed-class rows are
+ * already backfilled unless a test deliberately leaves `mutationPath` undefined.
+ */
 function insertEvent(overrides: {
   hook_event: string;
   session_id?: string;
@@ -66,11 +68,12 @@ function insertEvent(overrides: {
   cwd?: string | null;
   ts?: number;
   data?: string | null;
+  mutation_path?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
   db.run(
-    `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, cwd, data)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? TEST_UUID,
@@ -79,10 +82,30 @@ function insertEvent(overrides: {
       overrides.tool_name ?? null,
       overrides.cwd ?? null,
       overrides.data ?? "{}",
+      overrides.mutation_path ?? null,
     ],
   );
   return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
     .id;
+}
+
+/** Insert a shed-class (PostToolUse mutation) row with file_path already promoted. */
+function insertMutation(
+  filePath: string,
+  opts: { session_id?: string; ts?: number; tool_name?: string } = {},
+): number {
+  return insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: opts.tool_name ?? "Write",
+    session_id: opts.session_id ?? TEST_UUID,
+    cwd: "/repo",
+    ts: opts.ts,
+    data: JSON.stringify({
+      tool_input: { file_path: filePath, content: "x".repeat(200) },
+      tool_response: { ok: true, filePath },
+    }),
+    mutation_path: filePath,
+  });
 }
 
 function drainAll(): number {
@@ -95,41 +118,43 @@ function drainAll(): number {
   return total;
 }
 
-/**
- * Seed a stream with a DISCHARGED PostToolUse mutation (cold — its file
- * attribution committed clean) and an UNDISCHARGED one (live — never
- * committed). Returns both event ids plus a filler count so a test can place
- * the cold/live ids well below the recent-retention window.
- */
-function seedColdAndLive(): {
-  coldId: number;
-  liveId: number;
-  fillerCount: number;
+/** Snapshot the projection tables the seeded stream touches, for refold compare. */
+function projectionSnapshot(): {
+  git_status: unknown[];
+  file_attributions: unknown[];
+  jobs: unknown[];
 } {
+  return {
+    git_status: db.query("SELECT * FROM git_status ORDER BY project_dir").all(),
+    file_attributions: db
+      .query(
+        "SELECT * FROM file_attributions ORDER BY project_dir, file_path, session_id",
+      )
+      .all(),
+    jobs: db.query("SELECT * FROM jobs ORDER BY job_id").all(),
+  };
+}
+
+/**
+ * Seed a stream with a discharged shed-class mutation, a keep-set
+ * UserPromptSubmit, plus filler so the cold ids sit below a tiny recent window.
+ */
+function seedStream(): { coldMutationId: number; promptId: number } {
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
 
-  // COLD: session A writes cold.ts, then commits it clean (discharges).
-  const coldId = insertEvent({
-    hook_event: "PostToolUse",
-    tool_name: "Write",
+  // KEEP-SET: a UserPromptSubmit whose body carries `$.prompt` (search-history
+  // reads it). Must NEVER be NULLed by retention.
+  const promptId = insertEvent({
+    hook_event: "UserPromptSubmit",
     session_id: TEST_UUID,
-    cwd: "/repo",
-    ts: 100,
-    data: JSON.stringify({ tool_input: { file_path: "/repo/cold.ts" } }),
+    ts: 90,
+    data: JSON.stringify({ prompt: "keep me inline forever" }),
   });
 
-  // LIVE: session B writes live.ts and NEVER commits — attribution stays live.
-  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID_2 });
-  const liveId = insertEvent({
-    hook_event: "PostToolUse",
-    tool_name: "Write",
-    session_id: TEST_UUID_2,
-    cwd: "/repo",
-    ts: 110,
-    data: JSON.stringify({ tool_input: { file_path: "/repo/live.ts" } }),
-  });
+  // SHED-CLASS: session A writes cold.ts (file_path already promoted), then
+  // commits it clean (discharges).
+  const coldMutationId = insertMutation("/repo/cold.ts", { ts: 100 });
 
-  // GitSnapshot: both files dirty → both get attribution rows.
   insertEvent({
     hook_event: "GitSnapshot",
     session_id: "/repo",
@@ -150,18 +175,10 @@ function seedColdAndLive(): {
           worktree_oid: null,
           worktree_mode: null,
         },
-        {
-          path: "live.ts",
-          xy: " M",
-          mtime_ms: null,
-          worktree_oid: null,
-          worktree_mode: null,
-        },
       ],
     }),
   });
 
-  // Commit discharges ONLY cold.ts (session A). live.ts stays on the hook.
   insertEvent({
     hook_event: "Commit",
     session_id: "/repo",
@@ -177,226 +194,371 @@ function seedColdAndLive(): {
     }),
   });
 
-  // Filler events so the cold/live ids sit far below the recent-retention
-  // window when tests use a tiny margin.
-  const fillerCount = 30;
-  for (let i = 0; i < fillerCount; i++) {
+  // Filler keep-set events so the cold/prompt ids sit far below a tiny recent
+  // window AND below the fold cursor after a drain.
+  for (let i = 0; i < 30; i++) {
     insertEvent({ hook_event: "Stop", session_id: TEST_UUID, ts: 300 + i });
   }
 
-  return { coldId, liveId, fillerCount };
+  return { coldMutationId, promptId };
 }
 
 test("computeColdWatermark is the recent-retention window (max id - margin)", () => {
-  seedColdAndLive();
+  seedStream();
   drainAll();
   const maxId = (
     db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
   ).m;
 
-  // The watermark is purely the absolute recent window — keep the newest
-  // `margin` events inline, relocate everything older. Not a correctness gate:
-  // relocation is lossless for any blob (the two-arm explicit-attribution scan
-  // + COALESCE reads serve relocated blobs), so the watermark only governs
-  // locality/pacing.
   expect(computeColdWatermark(db, 2)).toBe(maxId - 2);
   expect(computeColdWatermark(db, 0)).toBe(maxId);
-  // A margin larger than the table keeps everything inline (watermark floors
-  // at 0 → relocate nothing).
+  // A margin larger than the table keeps everything inline (floors at 0).
   expect(computeColdWatermark(db, maxId + 100)).toBe(0);
 });
 
-test("compaction relocates a cold blob atomically; recent blob stays inline; no row deleted", () => {
-  const { coldId, liveId } = seedColdAndLive();
+test("readFoldCursor reads reducer_state.last_event_id", () => {
+  seedStream();
+  expect(readFoldCursor(db)).toBe(0); // not yet drained
+  drainAll();
+  const maxId = (
+    db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
+  ).m;
+  expect(readFoldCursor(db)).toBe(maxId);
+});
+
+test("retention NULLs a cold shed-class body; keep-set + recent bodies stay inline; no row deleted", () => {
+  const { coldMutationId, promptId } = seedStream();
   drainAll();
 
   const beforeRowCount = (
     db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
   ).n;
-  const coldValue = (
-    db.query("SELECT data FROM events WHERE id = ?").get(coldId) as {
+  const promptBody = (
+    db.query("SELECT data FROM events WHERE id = ?").get(promptId) as {
       data: string;
     }
   ).data;
 
-  // Pick a margin so the watermark lands strictly between coldId and liveId:
-  // coldId is relocated, liveId stays inside the recent window (inline). This
-  // exercises BOTH the relocated side-table read AND the still-inline read.
-  const maxId = (
-    db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
-  ).m;
-  const margin = maxId - liveId + 1; // watermark = liveId - 1
-  const result = compactColdBlobs(db, {
-    recentRetentionMargin: margin,
+  // Recent window keeps the newest 2 events inline; cold mutation is far below.
+  const result = retainColdPayloads(db, {
+    recentRetentionMargin: 2,
     batchSize: 10,
     maxBatches: 5,
+    incrementalVacuumPages: 0, // mem DB is not auto_vacuum=INCREMENTAL
   });
-  expect(result.relocated).toBeGreaterThan(0);
+  expect(result.shed).toBeGreaterThan(0);
 
-  // Cold blob: hot column NULL, side table has the exact bytes.
+  // Shed-class body: NULL in place. mutation_path retained.
   const coldRow = db
-    .query("SELECT data FROM events WHERE id = ?")
-    .get(coldId) as { data: string | null };
+    .query("SELECT data, mutation_path FROM events WHERE id = ?")
+    .get(coldMutationId) as { data: string | null; mutation_path: string };
   expect(coldRow.data).toBeNull();
-  const sideRow = db
-    .query("SELECT data FROM event_blobs WHERE event_id = ?")
-    .get(coldId) as { data: string } | null;
-  expect(sideRow).not.toBeNull();
-  expect(sideRow?.data).toBe(coldValue);
+  expect(coldRow.mutation_path).toBe("/repo/cold.ts");
 
-  // Recent (live) blob: untouched, still inline (above the recent window).
-  const liveRow = db
+  // Keep-set body (UserPromptSubmit): untouched, still inline.
+  const promptRow = db
     .query("SELECT data FROM events WHERE id = ?")
-    .get(liveId) as { data: string | null };
-  expect(liveRow.data).not.toBeNull();
-  const liveSide = db
-    .query("SELECT data FROM event_blobs WHERE event_id = ?")
-    .get(liveId) as { data: string } | null;
-  expect(liveSide).toBeNull();
+    .get(promptId) as { data: string | null };
+  expect(promptRow.data).toBe(promptBody);
 
-  // No events row ever deleted.
+  // No row deleted.
   const afterRowCount = (
     db.query("SELECT COUNT(*) AS n FROM events").get() as { n: number }
   ).n;
   expect(afterRowCount).toBe(beforeRowCount);
-
-  // COALESCE reads the relocated blob back identically.
-  const resolved = db
-    .query(
-      `SELECT COALESCE(events.data, event_blobs.data) AS data
-         FROM events LEFT JOIN event_blobs ON event_blobs.event_id = events.id
-        WHERE events.id = ?`,
-    )
-    .get(coldId) as { data: string };
-  expect(resolved.data).toBe(coldValue);
 });
 
-// NOTE (fn-836.4): the former "from-scratch re-fold over a compacted DB =
-// byte-identical projections" test asserted the now-DELETED contract that the
-// drain resolves a relocated body via `COALESCE(events.data, event_blobs.data)`
-// (ARM B). The .4 shed removed that read — the drain reads `events.data` only —
-// so relocating a body the fold still needs is no longer lossless. fn-836.5
-// rewrites this file for the retention pass, which NULLs ONLY non-keep bodies
-// (the allow-list) so retention-then-refold stays byte-identical by construction.
+test("retention never strips a body at or above the fold cursor", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  // Many cold shed-class mutations, but DON'T drain — cursor stays 0, so nothing
+  // is past it and retention must shed nothing.
+  for (let i = 0; i < 20; i++) {
+    insertMutation(`/repo/f${i}.ts`);
+  }
+  expect(readFoldCursor(db)).toBe(0);
+  const undrained = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(undrained.shed).toBe(0);
 
-test("absent-in-both-places: folds safe + counted by countAbsentBlobs", () => {
-  const { coldId } = seedColdAndLive();
+  // Drain HALF the stream, then retain: only ids strictly below the cursor are
+  // eligible. Simulate a partial cursor by rewinding it.
+  drainAll();
+  const maxId = (
+    db.query("SELECT MAX(id) AS m FROM events").get() as { m: number }
+  ).m;
+  const partialCursor = maxId - 5;
+  db.run("UPDATE reducer_state SET last_event_id = ? WHERE id = 1", [
+    partialCursor,
+  ]);
+
+  retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+
+  // Every still-inline shed-class body must have id >= cursor.
+  const inlineAboveCursor = (
+    db
+      .query(
+        `SELECT MIN(id) AS m FROM events
+          WHERE data IS NOT NULL
+            AND hook_event = 'PostToolUse'
+            AND tool_name IN ('Write','Edit','MultiEdit','NotebookEdit')`,
+      )
+      .get() as { m: number | null }
+  ).m;
+  if (inlineAboveCursor !== null) {
+    expect(inlineAboveCursor).toBeGreaterThanOrEqual(partialCursor);
+  }
+});
+
+test("retention never strips a shed-class row still owing a mutation_path backfill", () => {
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  // A shed-class row whose body holds a file_path but mutation_path IS NULL — it
+  // still owes a backfill, so its body is the ONLY copy of the file_path. NULLing
+  // it would lose fold-read data, so retention must leave it inline.
+  const unbackfilledId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Write",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: { file_path: "/repo/unfilled.ts" } }),
+    mutation_path: null,
+  });
+  // A backfilled shed-class row (body redundant — file_path in the column).
+  const backfilledId = insertMutation("/repo/filled.ts");
+  // A shed-class row whose body carries NO promotable file_path (valid JSON, no
+  // `$.tool_input.file_path`) — extract is NULL, so it's freely sheddable.
+  const noPathId = insertEvent({
+    hook_event: "PostToolUse",
+    tool_name: "Edit",
+    session_id: TEST_UUID,
+    cwd: "/repo",
+    data: JSON.stringify({ tool_input: {}, tool_response: { ok: true } }),
+    mutation_path: null,
+  });
+  // Trailing keep-set events so every seeded shed-class row sits strictly below
+  // the fold cursor (`id < cursor`).
+  for (let i = 0; i < 3; i++) {
+    insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  }
   drainAll();
 
-  // Healthy state: nothing absent.
+  retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+
+  // Unbackfilled row: body stays inline (still owes a backfill).
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(unbackfilledId) as {
+        data: string | null;
+      }
+    ).data,
+  ).not.toBeNull();
+  // Backfilled row: body NULLed.
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(backfilledId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+  // No-file_path row (nothing to lose): body NULLed.
+  expect(
+    (
+      db.query("SELECT data FROM events WHERE id = ?").get(noPathId) as {
+        data: string | null;
+      }
+    ).data,
+  ).toBeNull();
+});
+
+test("retention-then-from-scratch-refold reproduces byte-identical projections", () => {
+  seedStream();
+  drainAll();
+  const before = projectionSnapshot();
+
+  retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+
+  // From-scratch re-fold over the RETAINED DB: rewind the cursor + wipe the
+  // projections, re-drain. Byte-identical projections prove the shed lost nothing
+  // a fold reads (file_path served from mutation_path, keep-set bodies inline).
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM git_status");
+  db.run("DELETE FROM file_attributions");
+  db.run("DELETE FROM jobs");
+  db.run("DELETE FROM epics");
+  drainAll();
+
+  const after = projectionSnapshot();
+  expect(after.git_status).toEqual(before.git_status);
+  expect(after.file_attributions).toEqual(before.file_attributions);
+  expect(after.jobs).toEqual(before.jobs);
+});
+
+test("data-loss sentinel: no false alarm on intentional shed NULLs; flags a missing keep-set body", () => {
+  const { promptId } = seedStream();
+  drainAll();
+
   expect(countAbsentBlobs(db)).toBe(0);
 
-  // Inject the BUG state directly: NULL the hot column WITHOUT copying to
-  // event_blobs (the impossible-via-relocator data-loss case). This is the
-  // "neither place" condition.
-  db.run("UPDATE events SET data = NULL WHERE id = ?", [coldId]);
+  // Retention NULLs shed-class bodies — INTENTIONAL, must NOT be flagged.
+  retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    incrementalVacuumPages: 0,
+  });
+  expect(countAbsentBlobs(db)).toBe(0);
+
+  // Inject the BUG state: NULL a KEEP-SET body (a UserPromptSubmit). This is real
+  // data loss the retention path can never create (its predicate matches ONLY
+  // shed-class mutation tools).
+  db.run("UPDATE events SET data = NULL WHERE id = ?", [promptId]);
   expect(countAbsentBlobs(db)).toBe(1);
 
-  // The fold must STILL be safe over a now-missing blob — re-fold doesn't
-  // throw and the cursor advances (a missing blob folds to the same safe value
-  // as a malformed one).
+  // The fold must STILL be safe over a missing keep-set body — re-fold doesn't
+  // throw and the cursor advances (a missing body folds to the same safe value as
+  // a malformed one).
   db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
   db.run("DELETE FROM git_status");
   db.run("DELETE FROM file_attributions");
   db.run("DELETE FROM jobs");
   db.run("DELETE FROM epics");
   expect(() => drainAll()).not.toThrow();
-  const cursor = (
-    db.query("SELECT last_event_id FROM reducer_state WHERE id = 1").get() as {
-      last_event_id: number;
-    }
-  ).last_event_id;
-  expect(cursor).toBeGreaterThan(0);
+  expect(readFoldCursor(db)).toBeGreaterThan(0);
 });
 
-test("paced: a pass never exceeds maxBatches*batchSize relocations", () => {
+test("paced: a pass never exceeds maxBatches*batchSize sheds; idempotent across passes", () => {
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
-  // Seed many discharged PostToolUse blobs (no GitSnapshot/attribution → no
-  // live rows, so the watermark is governed purely by the recent window).
   for (let i = 0; i < 50; i++) {
-    insertEvent({
-      hook_event: "PostToolUse",
-      tool_name: "Write",
-      session_id: TEST_UUID,
-      cwd: "/repo",
-      data: JSON.stringify({ tool_input: { file_path: `/repo/f${i}.ts` } }),
-    });
+    insertMutation(`/repo/f${i}.ts`);
   }
   drainAll();
   expect(computeColdWatermark(db, 0)).toBeGreaterThan(0);
 
   // batchSize 5 * maxBatches 3 = 15 max per pass even though >15 are cold.
-  const result = compactColdBlobs(db, {
+  const result = retainColdPayloads(db, {
     recentRetentionMargin: 0,
     batchSize: 5,
     maxBatches: 3,
+    incrementalVacuumPages: 0,
   });
-  expect(result.relocated).toBe(15);
+  expect(result.shed).toBe(15);
   expect(result.batches).toBe(3);
   expect(result.moreLikely).toBe(true);
 
-  // A second pass picks up where the first left off (idempotent — already-
-  // relocated rows have data IS NULL and are skipped).
-  const result2 = compactColdBlobs(db, {
+  // A second pass picks up where the first left off (idempotent — already-shed
+  // rows have data IS NULL and are skipped).
+  const result2 = retainColdPayloads(db, {
     recentRetentionMargin: 0,
     batchSize: 5,
     maxBatches: 3,
+    incrementalVacuumPages: 0,
   });
-  expect(result2.relocated).toBe(15);
+  expect(result2.shed).toBe(15);
 });
 
-test("compaction shrinks the events table footprint (data bytes move out)", () => {
-  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
-  const bigBlob = JSON.stringify({
-    tool_input: { file_path: "/repo/big.ts", content: "x".repeat(4000) },
+test("retention shrinks the inline footprint; per-batch incremental_vacuum reclaims on an INCREMENTAL DB", () => {
+  // A minimal DB born with auto_vacuum=INCREMENTAL so incremental_vacuum actually
+  // returns freed overflow pages (the .4 reclaimDb bakes this into the live file).
+  const path = join(tmpDir, "incr.db");
+  const idb = new Database(path, { create: true });
+  idb.run("PRAGMA auto_vacuum=INCREMENTAL");
+  idb.run("PRAGMA journal_mode=WAL");
+  idb.run(
+    `CREATE TABLE events (
+       id INTEGER PRIMARY KEY AUTOINCREMENT,
+       ts REAL, session_id TEXT, hook_event TEXT, event_type TEXT,
+       tool_name TEXT, cwd TEXT, data TEXT, mutation_path TEXT
+     )`,
+  );
+  idb.run(
+    "CREATE TABLE reducer_state (id INTEGER PRIMARY KEY, last_event_id INTEGER NOT NULL)",
+  );
+  idb.run("INSERT INTO reducer_state (id, last_event_id) VALUES (1, 0)");
+
+  // Seed 40 shed-class mutation rows with bodies large enough to spill onto
+  // overflow pages (default 4096 page → ~4 KB body forces overflow).
+  const bigBody = JSON.stringify({
+    tool_input: { file_path: "/repo/big.ts", content: "x".repeat(8000) },
+    tool_response: { ok: true },
   });
-  const ids: number[] = [];
-  for (let i = 0; i < 20; i++) {
-    ids.push(
-      insertEvent({
-        hook_event: "PostToolUse",
-        tool_name: "Write",
-        session_id: TEST_UUID,
-        cwd: "/repo",
-        data: bigBlob,
-      }),
+  for (let i = 0; i < 40; i++) {
+    idb.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (?, ?, 'PostToolUse', 'PostToolUse', 'Write', '/repo', ?, ?)`,
+      [1000 + i, TEST_UUID, bigBody, `/repo/big${i}.ts`],
     );
   }
-  drainAll();
+  // Advance the cursor past all rows so retention is eligible.
+  idb.run("UPDATE reducer_state SET last_event_id = 9999 WHERE id = 1");
 
-  const eventsDataBytesBefore = (
-    db
+  const inlineBytesBefore = (
+    idb
       .query("SELECT COALESCE(SUM(LENGTH(data)), 0) AS b FROM events")
       .get() as { b: number }
   ).b;
-  expect(eventsDataBytesBefore).toBeGreaterThan(20 * 4000);
+  expect(inlineBytesBefore).toBeGreaterThan(40 * 8000);
 
-  compactColdBlobs(db, {
+  const result = retainColdPayloads(idb, {
     recentRetentionMargin: 0,
     batchSize: 100,
     maxBatches: 10,
+    incrementalVacuumPages: 200,
   });
+  expect(result.shed).toBe(40);
 
-  // The inline data bytes on `events` shrank measurably; the bytes now live in
-  // event_blobs instead (no net loss — relocation, not deletion).
-  const eventsDataBytesAfter = (
-    db
+  // Inline footprint shrank to ~nothing (every shed-class body NULLed).
+  const inlineBytesAfter = (
+    idb
       .query("SELECT COALESCE(SUM(LENGTH(data)), 0) AS b FROM events")
       .get() as { b: number }
   ).b;
-  const blobBytes = (
-    db
-      .query("SELECT COALESCE(SUM(LENGTH(data)), 0) AS b FROM event_blobs")
-      .get() as { b: number }
-  ).b;
-  expect(eventsDataBytesAfter).toBeLessThan(eventsDataBytesBefore);
-  expect(blobBytes).toBeGreaterThanOrEqual(20 * 4000);
+  expect(inlineBytesAfter).toBeLessThan(inlineBytesBefore);
+
+  // incremental_vacuum returned freed overflow pages to the file tail.
+  expect(result.reclaimedPages).toBeGreaterThan(0);
+  // And the freelist is drained (nothing left stranded).
+  const freelist = (
+    idb.query("PRAGMA freelist_count").get() as { freelist_count: number }
+  ).freelist_count;
+  expect(freelist).toBe(0);
+
+  idb.close();
 });
 
-test("no live work to do: watermark 0 / empty DB is a clean no-op", () => {
-  // Fresh DB, zero events.
-  const result = compactColdBlobs(db);
-  expect(result.relocated).toBe(0);
+test("incremental_vacuum is a no-op (0 reclaimed) on a non-INCREMENTAL DB", () => {
+  // The mem template DB is NOT auto_vacuum=INCREMENTAL, so the pragma reclaims
+  // nothing — retention still NULLs bodies (re-fold safety never depends on the
+  // physical reclaim).
+  insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
+  for (let i = 0; i < 10; i++) {
+    insertMutation(`/repo/f${i}.ts`);
+  }
+  // A trailing keep-set event so all 10 mutation rows sit strictly below the
+  // fold cursor (`id < cursor`), making every one eligible.
+  insertEvent({ hook_event: "Stop", session_id: TEST_UUID });
+  drainAll();
+
+  const result = retainColdPayloads(db, {
+    recentRetentionMargin: 0,
+    batchSize: 100,
+    maxBatches: 5,
+    incrementalVacuumPages: 200,
+  });
+  expect(result.shed).toBe(10);
+  expect(result.reclaimedPages).toBe(0);
+});
+
+test("no work to do: watermark 0 / empty DB is a clean no-op", () => {
+  const result = retainColdPayloads(db);
+  expect(result.shed).toBe(0);
   expect(result.batches).toBe(0);
   expect(result.coldWatermark).toBe(0);
   expect(countAbsentBlobs(db)).toBe(0);

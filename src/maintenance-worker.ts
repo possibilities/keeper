@@ -44,9 +44,9 @@
  * mints a synthetic event, or runs inside the reducer's `BEGIN IMMEDIATE` — so
  * re-fold determinism and the sole-writer rules are untouched. The backup writes
  * only a sidecar snapshot file under the state dir; the probe writes nothing.
- * Compaction (a WRITER op — `VACUUM INTO` is read-only, but compaction relocates
- * blobs via the writer connection) deliberately STAYS on main, governed by the
- * sole-writer rule.
+ * Retention (a WRITER op — `VACUUM INTO` is read-only, but retention NULLs cold
+ * shed-class bodies via the writer connection) deliberately STAYS on main,
+ * governed by the sole-writer rule.
  *
  * ## Worker contract (CLAUDE.md "Worker contract")
  *

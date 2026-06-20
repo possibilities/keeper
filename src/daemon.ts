@@ -40,7 +40,7 @@ import {
 } from "./backstop-telemetry";
 import { type BackupResult, liveBackupPage } from "./backup";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
-import { compactColdBlobs, countAbsentBlobs } from "./compaction";
+import { countAbsentBlobs, retainColdPayloads } from "./compaction";
 import {
   openDb,
   resolveBackstopLogPath,
@@ -228,13 +228,13 @@ export const PENDING_DISPATCH_SWEEP_INTERVAL_MS = 60_000;
 export const EVENTS_INGEST_FALLBACK_INTERVAL_MS = 3_000;
 
 /**
- * Heartbeat cadence (ms) for the producer-side cold-blob compaction pass. Runs
- * on MAIN's writable connection, paced, so it relocates the cold tail of inline
- * `data` blobs over many passes without ever holding the writer lock long enough
- * to starve a concurrent hook INSERT. Slacker than the dispatch sweep: pure
- * space reclamation with no latency-sensitive consumer.
+ * Heartbeat cadence (ms) for the producer-side retention pass (fn-836.5). Runs
+ * on MAIN's writable connection, paced, so it NULLs the cold tail of redundant
+ * shed-class `data` bodies over many passes without ever holding the writer lock
+ * long enough to starve a concurrent hook INSERT. Slacker than the dispatch
+ * sweep: pure space reclamation with no latency-sensitive consumer.
  */
-export const COMPACTION_INTERVAL_MS = 300_000;
+export const RETENTION_INTERVAL_MS = 300_000;
 
 /**
  * Cadence (ms) for the producer-side historical `mutation_path` backfill pass
@@ -2932,7 +2932,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // bridge null-guard covers that.)
   autopilotWorker = autopilotWorkerInstance;
 
-  // The `handleDispatch*` mint helpers + the sweep/compaction/checkpoint timers
+  // The `handleDispatch*` mint helpers + the sweep/retention/checkpoint timers
   // below are interleaved with main's steady state, so rather than wrap the
   // region we gate only the three direct worker-binding sites
   // (`onmessage`/`onerror`/`close`) and `?.` the in-helper `postMessage`.
@@ -3257,58 +3257,65 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }, EVENTS_INGEST_FALLBACK_INTERVAL_MS);
 
-  // Producer-side cold-blob compaction pass. Relocates the cold tail of inline
-  // `events.data` blobs into the `event_blobs` side table and NULLs the hot
-  // column, paced so the writer lock never starves a concurrent hook INSERT. Runs
-  // ON THE MAIN THREAD against the writable connection. `event_blobs` is a
-  // content-preserving sidecar, NOT a reducer projection: the relocated value is
-  // read back via `COALESCE(events.data, event_blobs.data)`, so a from-scratch
-  // re-fold stays byte-identical. The cold predicate (`src/compaction.ts`) never
-  // relocates a blob the file-attribution scan could still need.
-  function runCompactionPass(): void {
+  // Producer-side retention pass (fn-836.5). NULLs the cold tail of redundant
+  // shed-class `events.data` bodies in place — PostToolUse mutation-tool rows
+  // whose `tool_input.file_path` is already promoted to `mutation_path`, the
+  // complement of the keep-set ALLOW-list — paced so the writer lock never
+  // starves a concurrent hook INSERT, and returns the freed overflow pages to the
+  // file tail via per-batch `incremental_vacuum`. Runs ON THE MAIN THREAD against
+  // the writable connection, STRICTLY outside the fold. `events.data` is the
+  // canonical event log, NOT a reducer projection: NULLing a redundant shed-class
+  // body (whose file_path the fold reads from the column, never the body) touches
+  // no projection, so a from-scratch re-fold stays byte-identical. The shed
+  // predicate (`src/compaction.ts`) never strips a body the fold still needs (it
+  // excludes any row still owing a `mutation_path` backfill and gates on the
+  // cursor).
+  function runRetentionPass(): void {
     if (shuttingDown) return;
-    let relocated = 0;
+    let shed = 0;
     try {
-      const result = compactColdBlobs(db);
-      relocated = result.relocated;
-      if (relocated > 0) {
+      const result = retainColdPayloads(db);
+      shed = result.shed;
+      if (shed > 0) {
         console.error(
-          `[keeperd] compaction: relocated ${relocated} cold blob(s) in ${result.batches} batch(es) (watermark id<=${result.coldWatermark}${result.moreLikely ? ", more remain" : ""})`,
+          `[keeperd] retention: shed ${shed} cold body/bodies in ${result.batches} batch(es), reclaimed ${result.reclaimedPages} page(s) (watermark id<=${result.coldWatermark}, cursor<${result.cursor}${result.moreLikely ? ", more remain" : ""})`,
         );
       }
-      // Absent-in-both-places is a genuine data-loss BUG — the relocation path
-      // cannot create it, so a positive count means a bug elsewhere. Logged
-      // loudly but NOT fatal. Gate the full-table scan on `relocated > 0`: a pass
-      // that moved zero blobs can't have created an absent-in-both row, so the
-      // scan is wasted work on an idle heartbeat.
-      if (relocated > 0) {
+      // The re-spec'd data-loss sentinel: a NULL body that is NOT shed-class is a
+      // missing keep-set body — genuine data loss the retention path cannot
+      // create (its predicate matches ONLY shed-class mutation tools). Logged
+      // loudly but NOT fatal. Gate on `shed > 0`: a pass that NULLed nothing
+      // cannot have introduced a missing keep-set body, so the scan is wasted
+      // work on an idle slack tick.
+      if (shed > 0) {
         const absent = countAbsentBlobs(db);
         if (absent > 0) {
           console.error(
-            `[keeperd] compaction BUG: ${absent} event(s) have a blob in NEITHER events.data NOR event_blobs — data loss, NOT legitimate compaction`,
+            `[keeperd] retention BUG: ${absent} keep-set event(s) have a NULL body — data loss, NOT legitimate retention`,
           );
         }
       }
     } catch (err) {
-      // A compaction failure is pure space-reclamation loss, never a correctness
-      // issue (the blob stays inline on a rolled-back batch). Log non-fatally.
+      // A retention failure is pure space-reclamation loss, never a correctness
+      // issue (the body stays inline on a rolled-back batch). Log non-fatally; the
+      // next slack tick retries.
       console.error(
-        `[keeperd] compaction pass threw (non-fatal): ${
+        `[keeperd] retention pass threw (non-fatal): ${
           err instanceof Error ? err.message : String(err)
         }`,
       );
       return;
     }
-    // Reclaim WAL space OUTSIDE the per-batch transactions and only when a pass
-    // moved bytes. PASSIVE never waits on writers (TRUNCATE would, starving a
-    // contending hook); it checkpoints what it can without blocking. Main-DB page
-    // reclamation (VACUUM) is left to a separate offline step.
-    if (relocated > 0) {
+    // Checkpoint WAL space OUTSIDE the per-batch transactions and only when a pass
+    // shed bytes. PASSIVE never waits on writers (TRUNCATE would, starving a
+    // contending hook); it checkpoints what it can without blocking. Per-batch
+    // `incremental_vacuum` already returned freed pages to the file tail.
+    if (shed > 0) {
       try {
         db.run("PRAGMA wal_checkpoint(PASSIVE)");
       } catch (err) {
         console.error(
-          `[keeperd] compaction PASSIVE checkpoint threw (non-fatal): ${
+          `[keeperd] retention PASSIVE checkpoint threw (non-fatal): ${
             err instanceof Error ? err.message : String(err)
           }`,
         );
@@ -3316,18 +3323,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     }
   }
 
-  // Schedule the compaction pass on its own slack heartbeat. Stored so shutdown
+  // Schedule the retention pass on its own slack heartbeat. Stored so shutdown
   // can `clearInterval` it. Fires on the MAIN THREAD against the writable conn.
-  const compactionTimer = setInterval(() => {
-    runCompactionPass();
-  }, COMPACTION_INTERVAL_MS);
+  const retentionTimer = setInterval(() => {
+    runRetentionPass();
+  }, RETENTION_INTERVAL_MS);
 
   // Producer-side historical `mutation_path` backfill pass (fn-836.3). Fills the
   // promoted git-attribution column over the historical mutation tail the
-  // forward write path (hook deriver + ingester recompute) never touched —
-  // including the cold rows compaction already relocated into `event_blobs`
-  // (read via the guarded `COALESCE(events.data, event_blobs.data)` extract).
-  // Paced like compaction (≤500 rows/batch, ≤20 batches/pass, crash-safe `meta`
+  // forward write path (hook deriver + ingester recompute) never touched, reading
+  // the inline `events.data` body (post-shed there is no `event_blobs` side
+  // table). Paced like retention (≤500 rows/batch, ≤20 batches/pass, crash-safe `meta`
   // watermark advanced in the SAME transaction as each batch's UPDATE), so the
   // writer lock never starves a concurrent hook INSERT and a mid-pass crash
   // resumes from the last committed batch. Runs ON THE MAIN THREAD against the
@@ -3396,8 +3402,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     runMutationPathBackfillPass();
   }, MUTATION_PATH_BACKFILL_INTERVAL_MS);
 
-  // Steady-state WAL checkpoint cadence, independent of compaction (whose PASSIVE
-  // checkpoint only fires when it relocated bytes). Flushes the WAL back into the
+  // Steady-state WAL checkpoint cadence, independent of retention (whose PASSIVE
+  // checkpoint only fires when it shed bytes). Flushes the WAL back into the
   // main DB on cadence so serve/poll read latency stays bounded under a steady
   // fold stream. PASSIVE never waits on a writer — a no-op if a hook holds the
   // lock. Fires on the MAIN THREAD; stored so shutdown can clear it.
@@ -3738,7 +3744,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     // which clears its own when main posts `{type:"shutdown"}` below.
     clearInterval(pendingDispatchSweepTimer);
     clearInterval(eventsIngestFallbackTimer);
-    clearInterval(compactionTimer);
+    clearInterval(retentionTimer);
     clearInterval(mutationPathBackfillTimer);
     clearInterval(walCheckpointTimer);
 

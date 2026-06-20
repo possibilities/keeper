@@ -244,9 +244,10 @@ test("no fold-path reader touches the dropped event_blobs table; every body read
   // (reducer, subagent bridges, search-history, the mutation_path backfill) must
   // be ZERO — the shed dropped every body read there. `db.ts` (the v57 ladder
   // CREATE + the v67 Commit-trailer backfill read, both historical migration
-  // steps that run against the transiently-recreated table on a fresh walk) and
-  // `compaction.ts` (the relocator/sentinel, retired into a retention pass in
-  // .5) still reference it and are exempt. Comment lines are stripped so a doc
+  // steps that run against the transiently-recreated table on a fresh walk) still
+  // references it and is exempt. (`compaction.ts` was the relocator/sentinel; .5
+  // retired it into the retention pass, which NULLs `events.data` in place and no
+  // longer touches `event_blobs` at all.) Comment lines are stripped so a doc
   // mention never inflates the count.
   const countSqlJoins = (file: string): number => {
     const lines = readSrc(file).split("\n");
