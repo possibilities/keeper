@@ -90,5 +90,5 @@ screenshot a ~25-job field and confirm idle cards recede (calm).
 - [ ] `bun run test:opentui` + `bun run test:full` green; a ~25-job screenshot reads calm
 
 ## Done summary
-
+Rewrote the keeper dash OpenTUI paint layer into a single column of bordered robot job-cards (one BoxRenderable per job, rail-colored six-rung status, heavy-cyan j/k/arrow focus cursor keyed on job_id, t terminal-visibility toggle). Widened the jobs subscription to terminal states via a new subscribeReadiness jobsFilter and dropped the unused autopilot/armed subs; rewrote the frame/shell tests and the dash docs.
 ## Evidence
