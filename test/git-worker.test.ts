@@ -1093,10 +1093,10 @@ test("emitSnapshot delta: a transient enumeration throw re-emits planctl-commit-
   const seed = stepHeadDelta(root, cache, failures, seedOid, false);
   expect(seed.planctlEmits).toEqual([]);
 
-  // A planctl-shaped commit lands.
+  // A plan-shaped commit lands.
   const planctlOid = gitCommit(
     root,
-    ".planctl/epics/fn-999-demo.json",
+    ".keeper/epics/fn-999-demo.json",
     "scaffold\n",
     {},
   );
@@ -1113,7 +1113,7 @@ test("emitSnapshot delta: a transient enumeration throw re-emits planctl-commit-
   // planctl change re-emits — drop-proof.
   const obs2 = stepHeadDelta(root, cache, failures, planctlOid, false);
   expect(obs2.planctlEmits).toHaveLength(1);
-  expect(obs2.planctlEmits[0]).toContain(".planctl/epics/fn-999-demo.json");
+  expect(obs2.planctlEmits[0]).toContain(".keeper/epics/fn-999-demo.json");
   expect(cache.get(root)).toBe(planctlOid); // advanced now that it succeeded
   expect(failures.has(root)).toBe(false); // counter reset on success
 });
@@ -1154,23 +1154,23 @@ test("emitSnapshot delta: divergence-wedge window holds the cache → commits re
   const seedOid = gitCommit(root, "init.ts", "init\n", {});
   stepHeadDelta(root, cache, failures, seedOid, false); // seed
 
-  // Two planctl commits land DURING a divergence-suppression window — emitSnapshot
+  // Two plan commits land DURING a divergence-suppression window — emitSnapshot
   // returns early, so we run NO step for them (the cache stays at seedOid).
-  gitCommit(root, ".planctl/tasks/fn-999-demo.1.json", "task 1\n", {});
+  gitCommit(root, ".keeper/tasks/fn-999-demo.1.json", "task 1\n", {});
   const headDuringWedge = gitCommit(
     root,
-    ".planctl/tasks/fn-999-demo.2.json",
+    ".keeper/tasks/fn-999-demo.2.json",
     "task 2\n",
     {},
   );
   expect(cache.get(root)).toBe(seedOid); // untouched through the wedge
 
   // Wedge clears: the next clean observation re-enumerates the WHOLE window
-  // (seed..headDuringWedge), re-emitting both planctl commits.
+  // (seed..headDuringWedge), re-emitting both plan commits.
   const cleared = stepHeadDelta(root, cache, failures, headDuringWedge, false);
   const flatPaths = cleared.planctlEmits.flat();
-  expect(flatPaths).toContain(".planctl/tasks/fn-999-demo.1.json");
-  expect(flatPaths).toContain(".planctl/tasks/fn-999-demo.2.json");
+  expect(flatPaths).toContain(".keeper/tasks/fn-999-demo.1.json");
+  expect(flatPaths).toContain(".keeper/tasks/fn-999-demo.2.json");
   expect(cache.get(root)).toBe(headDuringWedge);
 });
 
@@ -1242,7 +1242,7 @@ function gitCommit(
   body: string,
   trailers: Record<string, string[]>,
 ): string {
-  // `filename` may be a nested repo-relative path (e.g. `.planctl/epics/x.json`
+  // `filename` may be a nested repo-relative path (e.g. `.keeper/epics/x.json`
   // for the fn-705 re-enumeration tests); ensure its parent dir exists. A flat
   // name leaves `dirname` === `root`, so the recursive mkdir is a no-op there.
   mkdirSync(join(root, filename, ".."), { recursive: true });
@@ -1794,30 +1794,36 @@ test("extractCommit folds non-string / empty planctl_op / planctl_target to null
 // `test/plan-worker.test.ts` against the consumer side.
 // ---------------------------------------------------------------------------
 
-test("isPlanctlChangedPath: epics/tasks json + state-tasks state.json accepted, else rejected", () => {
-  // Accept: the three shapes the plan-worker's classifyPlanPath projects.
-  expect(isPlanctlChangedPath(".planctl/epics/fn-1-x.json")).toBe(true);
-  expect(isPlanctlChangedPath(".planctl/tasks/fn-1-x.2.json")).toBe(true);
-  expect(isPlanctlChangedPath(".planctl/state/tasks/fn-1-x.2.state.json")).toBe(
+test("isPlanctlChangedPath: epics/tasks json + state-tasks/state-epics state.json accepted, else rejected", () => {
+  // Accept: the four shapes the plan-worker's classifyPlanPath projects.
+  expect(isPlanctlChangedPath(".keeper/epics/fn-1-x.json")).toBe(true);
+  expect(isPlanctlChangedPath(".keeper/tasks/fn-1-x.2.json")).toBe(true);
+  expect(isPlanctlChangedPath(".keeper/state/tasks/fn-1-x.2.state.json")).toBe(
+    true,
+  );
+  // The 4th shape — closes the documented lockstep gap with plan-worker.
+  expect(isPlanctlChangedPath(".keeper/state/epics/fn-1-x.state.json")).toBe(
     true,
   );
   // Accept under nested repo paths — git diff-tree emits POSIX separators
   // regardless of platform, so a forward-slash split is sufficient.
-  expect(isPlanctlChangedPath("sub/.planctl/epics/fn-1-x.json")).toBe(true);
+  expect(isPlanctlChangedPath("sub/.keeper/epics/fn-1-x.json")).toBe(true);
 
   // Reject: wrong extension, wrong subdir, missing state.json suffix, non-
-  // planctl paths, deeper nesting under the 3-segment shapes.
-  expect(isPlanctlChangedPath(".planctl/specs/fn-1-x.md")).toBe(false);
-  expect(isPlanctlChangedPath(".planctl/epics/fn-1-x.md")).toBe(false);
+  // plan paths, deeper nesting under the 3-segment shapes.
+  expect(isPlanctlChangedPath(".keeper/specs/fn-1-x.md")).toBe(false);
+  expect(isPlanctlChangedPath(".keeper/epics/fn-1-x.md")).toBe(false);
   expect(isPlanctlChangedPath("epics/fn-1-x.json")).toBe(false);
-  expect(isPlanctlChangedPath(".planctl/state/tasks/fn-1-x.json")).toBe(false);
-  expect(isPlanctlChangedPath(".planctl/epics/sub/fn-1-x.json")).toBe(false);
+  expect(isPlanctlChangedPath(".keeper/state/tasks/fn-1-x.json")).toBe(false);
+  expect(isPlanctlChangedPath(".keeper/state/epics/fn-1-x.json")).toBe(false);
+  expect(isPlanctlChangedPath(".keeper/epics/sub/fn-1-x.json")).toBe(false);
   expect(isPlanctlChangedPath("src/a.ts")).toBe(false);
 
-  // Reject the vendored planctl subtree's own dev plan (fn-822): keeper
-  // co-hosts planctl under `plugins/plan/`, whose `.planctl` tree is the
+  // Reject the vendored plan subtree's own dev plan (fn-822): keeper
+  // co-hosts the plan plugin under `plugins/plan/`, whose data tree is the
   // dependency's plan, not keeper's. A keeper commit touching it (notably the
-  // subtree-add) must NOT be forwarded to the plan-worker.
+  // subtree-add) must NOT be forwarded to the plan-worker. The prune is
+  // NAME-TOLERANT: the subtree is still on `.planctl` while keeper is `.keeper`.
   expect(isPlanctlChangedPath("plugins/plan/.planctl/epics/fn-1-x.json")).toBe(
     false,
   );
@@ -1826,8 +1832,11 @@ test("isPlanctlChangedPath: epics/tasks json + state-tasks state.json accepted, 
       "plugins/plan/.planctl/state/tasks/fn-1-x.2.state.json",
     ),
   ).toBe(false);
+  expect(isPlanctlChangedPath("plugins/plan/.keeper/epics/fn-1-x.json")).toBe(
+    false,
+  );
   // keeper's OWN root plan is still accepted.
-  expect(isPlanctlChangedPath(".planctl/epics/fn-822.json")).toBe(true);
+  expect(isPlanctlChangedPath(".keeper/epics/fn-822.json")).toBe(true);
 });
 
 test("filterPlanctlChanges: tags add/update vs delete by blob_oid null sentinel", () => {
@@ -1837,33 +1846,33 @@ test("filterPlanctlChanges: tags add/update vs delete by blob_oid null sentinel"
   // file in the same commit drops out of the result list entirely.
   const out = filterPlanctlChanges([
     {
-      path: ".planctl/epics/fn-1-x.json",
+      path: ".keeper/epics/fn-1-x.json",
       blob_oid: "0123456789abcdef0123456789abcdef01234567",
       committed_mode: "100644",
     },
     {
-      path: ".planctl/tasks/fn-1-x.2.json",
+      path: ".keeper/tasks/fn-1-x.2.json",
       blob_oid: null,
       committed_mode: null,
     },
     {
       // Sidecar runtime state — also routed to the consumer via
       // onChange's task-state arm.
-      path: ".planctl/state/tasks/fn-1-x.2.state.json",
+      path: ".keeper/state/tasks/fn-1-x.2.state.json",
       blob_oid: "fedcba9876543210fedcba9876543210fedcba98",
       committed_mode: "100644",
     },
     {
-      // Non-planctl file in the same commit — must drop.
+      // Non-plan file in the same commit — must drop.
       path: "src/a.ts",
       blob_oid: "abc1234567890abc1234567890abc1234567890a",
       committed_mode: "100644",
     },
   ]);
   expect(out).toEqual([
-    { path: ".planctl/epics/fn-1-x.json", op: "upsert" },
-    { path: ".planctl/tasks/fn-1-x.2.json", op: "delete" },
-    { path: ".planctl/state/tasks/fn-1-x.2.state.json", op: "upsert" },
+    { path: ".keeper/epics/fn-1-x.json", op: "upsert" },
+    { path: ".keeper/tasks/fn-1-x.2.json", op: "delete" },
+    { path: ".keeper/state/tasks/fn-1-x.2.state.json", op: "upsert" },
   ]);
 });
 
@@ -1887,18 +1896,18 @@ test("filterPlanctlChanges: a commit with no planctl files returns []", () => {
   ).toEqual([]);
 });
 
-test("enumerateCommitsInDelta: a `git rm` of a planctl json → filterPlanctlChanges tags it 'delete'", () => {
-  // End-to-end producer round-trip: scaffold a planctl file under a real
+test("enumerateCommitsInDelta: a `git rm` of a plan json → filterPlanctlChanges tags it 'delete'", () => {
+  // End-to-end producer round-trip: scaffold a plan file under a real
   // tmp repo, commit it (commit 1), then `git rm` it + commit (commit 2),
   // and assert the delta-enumeration → filter chain surfaces the
   // deletion as op='delete'. This is the path that gives commit-driven
   // tombstones without relying on FSEvents.
   const root = mkTmpWorktree();
   gitInit(root);
-  // Commit 1 — add the planctl file.
-  mkdirSync(join(root, ".planctl", "epics"), { recursive: true });
+  // Commit 1 — add the plan file.
+  mkdirSync(join(root, ".keeper", "epics"), { recursive: true });
   writeFileSync(
-    join(root, ".planctl", "epics", "fn-1-x.json"),
+    join(root, ".keeper", "epics", "fn-1-x.json"),
     JSON.stringify({ id: "fn-1-x", title: "demo" }),
   );
   let res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
@@ -1918,9 +1927,9 @@ test("enumerateCommitsInDelta: a `git rm` of a planctl json → filterPlanctlCha
     .stdout.toString()
     .trim();
 
-  // Commit 2 — `git rm` the planctl file.
+  // Commit 2 — `git rm` the plan file.
   res = Bun.spawnSync(
-    ["git", "-C", root, "rm", "-q", ".planctl/epics/fn-1-x.json"],
+    ["git", "-C", root, "rm", "-q", ".keeper/epics/fn-1-x.json"],
     { stdout: "ignore", stderr: "ignore" },
   );
   if (!res.success) throw new Error("git rm failed");
@@ -1943,13 +1952,13 @@ test("enumerateCommitsInDelta: a `git rm` of a planctl json → filterPlanctlCha
   const commits = enumerateCommitsInDelta(root, oid1, oid2);
   expect(commits).toHaveLength(1);
   expect(filterPlanctlChanges(commits[0].files)).toEqual([
-    { path: ".planctl/epics/fn-1-x.json", op: "delete" },
+    { path: ".keeper/epics/fn-1-x.json", op: "delete" },
   ]);
 });
 
-test("enumerateCommitsInDelta: an `add` of planctl files → filterPlanctlChanges tags every entry 'upsert'", () => {
+test("enumerateCommitsInDelta: an `add` of plan files → filterPlanctlChanges tags every entry 'upsert'", () => {
   // The 9-file scaffold-burst shape the epic spec calls out: one commit
-  // touching several planctl paths, every one of them tagged upsert.
+  // touching several plan paths, every one of them tagged upsert.
   // The plan-worker receives the message and re-ingests from the
   // committed worktree — drop-proof for the FSEvents storm scenario.
   //
@@ -1977,18 +1986,18 @@ test("enumerateCommitsInDelta: an `add` of planctl files → filterPlanctlChange
     .stdout.toString()
     .trim();
 
-  mkdirSync(join(root, ".planctl", "epics"), { recursive: true });
-  mkdirSync(join(root, ".planctl", "tasks"), { recursive: true });
+  mkdirSync(join(root, ".keeper", "epics"), { recursive: true });
+  mkdirSync(join(root, ".keeper", "tasks"), { recursive: true });
   writeFileSync(
-    join(root, ".planctl", "epics", "fn-1-x.json"),
+    join(root, ".keeper", "epics", "fn-1-x.json"),
     JSON.stringify({ id: "fn-1-x", title: "epic" }),
   );
   writeFileSync(
-    join(root, ".planctl", "tasks", "fn-1-x.1.json"),
+    join(root, ".keeper", "tasks", "fn-1-x.1.json"),
     JSON.stringify({ id: "fn-1-x.1", epic: "fn-1-x", title: "t1" }),
   );
   writeFileSync(
-    join(root, ".planctl", "tasks", "fn-1-x.2.json"),
+    join(root, ".keeper", "tasks", "fn-1-x.2.json"),
     JSON.stringify({ id: "fn-1-x.2", epic: "fn-1-x", title: "t2" }),
   );
   res = Bun.spawnSync(["git", "-C", root, "add", "-A"], {
@@ -2014,9 +2023,9 @@ test("enumerateCommitsInDelta: an `add` of planctl files → filterPlanctlChange
   // Order is the producer's diff-tree output order; just assert the set.
   expect(new Set(changes.map((c) => c.path))).toEqual(
     new Set([
-      ".planctl/epics/fn-1-x.json",
-      ".planctl/tasks/fn-1-x.1.json",
-      ".planctl/tasks/fn-1-x.2.json",
+      ".keeper/epics/fn-1-x.json",
+      ".keeper/tasks/fn-1-x.1.json",
+      ".keeper/tasks/fn-1-x.2.json",
     ]),
   );
   // Every entry is an upsert.
@@ -2025,7 +2034,7 @@ test("enumerateCommitsInDelta: an `add` of planctl files → filterPlanctlChange
 
 // ---------------------------------------------------------------------------
 // fn-690 — dynamic watch-membership gate. The watch verdict widens from
-// `.planctl`-only to `.planctl || dirty || ahead>0`, recomputed each
+// `.keeper`-only to `.keeper || dirty || ahead>0`, recomputed each
 // reconcile against a bounded + TTL-memoized candidate set with a
 // cooling-hysteresis drop. All the rules below live entirely on the
 // producer side; the reducer is untouched so re-fold determinism holds.
@@ -2083,14 +2092,14 @@ function mkTmpRepoWithUpstream(): string {
 
 // ---------------------------------------------------------------------------
 // shouldWatchRoot — pure verdict helper. Exercised against real-git tmpdir
-// fixtures the same way buildGitSnapshot is, so probe behavior + .planctl
+// fixtures the same way buildGitSnapshot is, so probe behavior + .keeper
 // short-circuit are tested without mocks.
 // ---------------------------------------------------------------------------
 
-test("shouldWatchRoot: .planctl present → watch without probe (short-circuit)", () => {
+test("shouldWatchRoot: .keeper present → watch without probe (short-circuit)", () => {
   const root = mkTmpRepoWithUpstream();
-  mkdirSync(join(root, ".planctl"), { recursive: true });
-  // Pass a probe verdict that would otherwise say "skip" — `.planctl`
+  mkdirSync(join(root, ".keeper"), { recursive: true });
+  // Pass a probe verdict that would otherwise say "skip" — `.keeper`
   // wins anyway. The whole point: a plan-backed clean repo stays watched.
   expect(
     shouldWatchRoot(
@@ -2100,11 +2109,11 @@ test("shouldWatchRoot: .planctl present → watch without probe (short-circuit)"
     ),
   ).toBe(true);
   // And even a null probe (timeout / error) doesn't matter when
-  // `.planctl` is present.
+  // `.keeper` is present.
   expect(shouldWatchRoot(root, null, { currentlyWatched: false })).toBe(true);
 });
 
-test("shouldWatchRoot: clean + pushed (no .planctl) → don't watch", () => {
+test("shouldWatchRoot: clean + pushed (no .keeper) → don't watch", () => {
   const root = mkTmpRepoWithUpstream();
   // Probe verdict from a real git status: clean, ahead 0.
   expect(
@@ -2116,7 +2125,7 @@ test("shouldWatchRoot: clean + pushed (no .planctl) → don't watch", () => {
   ).toBe(false);
 });
 
-test("shouldWatchRoot: dirty worktree (no .planctl) → watch", () => {
+test("shouldWatchRoot: dirty worktree (no .keeper) → watch", () => {
   const root = mkTmpRepoWithUpstream();
   expect(
     shouldWatchRoot(
@@ -2127,7 +2136,7 @@ test("shouldWatchRoot: dirty worktree (no .planctl) → watch", () => {
   ).toBe(true);
 });
 
-test("shouldWatchRoot: ahead > 0 clean (no .planctl) → watch", () => {
+test("shouldWatchRoot: ahead > 0 clean (no .keeper) → watch", () => {
   const root = mkTmpRepoWithUpstream();
   expect(
     shouldWatchRoot(
@@ -2138,7 +2147,7 @@ test("shouldWatchRoot: ahead > 0 clean (no .planctl) → watch", () => {
   ).toBe(true);
 });
 
-test("shouldWatchRoot: no-upstream dirty (no .planctl) → watch", () => {
+test("shouldWatchRoot: no-upstream dirty (no .keeper) → watch", () => {
   // No `# branch.ab` line means ahead=0 by convention; dirty alone is enough.
   const root = mkTmpWorktree();
   gitInit(root);
@@ -2152,7 +2161,7 @@ test("shouldWatchRoot: no-upstream dirty (no .planctl) → watch", () => {
   ).toBe(true);
 });
 
-test("shouldWatchRoot: no-upstream clean-with-commits (no .planctl) → don't watch", () => {
+test("shouldWatchRoot: no-upstream clean-with-commits (no .keeper) → don't watch", () => {
   // No upstream, no dirty: ahead is 0 by convention; verdict is "don't watch".
   // The whole point of the new gate — a quiescent repo with no work in flight
   // isn't keeper's business.
@@ -2511,10 +2520,10 @@ function fakeProbe(
   };
 }
 
-test("discoverProjectRoots: .planctl repo always watched without probe spawn", () => {
+test("discoverProjectRoots: .keeper repo always watched without probe spawn", () => {
   const root = realpathSync(mkTmpWorktree());
   gitInit(root);
-  mkdirSync(join(root, ".planctl"), { recursive: true });
+  mkdirSync(join(root, ".keeper"), { recursive: true });
   const db = makeDiscoveryDb();
   db.run(
     "INSERT INTO jobs (job_id, cwd, state, updated_at) VALUES (?, ?, 'working', 0)",
@@ -2531,12 +2540,12 @@ test("discoverProjectRoots: .planctl repo always watched without probe spawn", (
   };
   const desired = discoverProjectRoots(db, ctx);
   expect(desired).toContain(root);
-  // Crucial: `.planctl` short-circuits — no probe spawn.
+  // Crucial: `.keeper` short-circuits — no probe spawn.
   expect(probeSpawnCount.n).toBe(0);
   db.close();
 });
 
-test("discoverProjectRoots: dirty non-.planctl repo joins desired set", () => {
+test("discoverProjectRoots: dirty non-.keeper repo joins desired set", () => {
   const root = mkTmpRepoWithUpstream();
   // Make the worktree dirty so a real probe would say "watch".
   writeFileSync(join(root, "untracked.ts"), "x\n");
@@ -2558,7 +2567,7 @@ test("discoverProjectRoots: dirty non-.planctl repo joins desired set", () => {
   db.close();
 });
 
-test("discoverProjectRoots: clean+pushed non-.planctl repo drops out of desired set", () => {
+test("discoverProjectRoots: clean+pushed non-.keeper repo drops out of desired set", () => {
   const root = mkTmpRepoWithUpstream();
   const db = makeDiscoveryDb();
   db.run(
@@ -2661,7 +2670,7 @@ test("discoverProjectRoots: clean+pushed watched root drops from desired (caller
     probe: probeWatchMembership,
   };
   const desired = discoverProjectRoots(db, ctx);
-  // Verdict: clean + pushed + no .planctl → not desired.
+  // Verdict: clean + pushed + no .keeper → not desired.
   expect(desired).not.toContain(root);
   db.close();
 });
@@ -2669,10 +2678,10 @@ test("discoverProjectRoots: clean+pushed watched root drops from desired (caller
 test("discoverProjectRoots: epic.project_dir + task.target_repo always candidates (plan-backed)", () => {
   const planRoot = realpathSync(mkTmpWorktree());
   gitInit(planRoot);
-  mkdirSync(join(planRoot, ".planctl"), { recursive: true });
+  mkdirSync(join(planRoot, ".keeper"), { recursive: true });
   const targetRoot = realpathSync(mkTmpWorktree());
   gitInit(targetRoot);
-  mkdirSync(join(targetRoot, ".planctl"), { recursive: true });
+  mkdirSync(join(targetRoot, ".keeper"), { recursive: true });
   const db = makeDiscoveryDb();
   db.run(`INSERT INTO epics (epic_id, project_dir, tasks) VALUES (?, ?, ?)`, [
     "fn-1-foo",
@@ -2767,7 +2776,7 @@ test("buildDiscoveryCandidates: fn-705 extraCandidates folded in unconditionally
   // session in — it has NO `jobs.cwd` row and NO `epics.project_dir` entry, so
   // neither the fast path nor the full sweep would surface it. The plan-worker
   // hands it over via `extraCandidates`; the candidate set must include it
-  // regardless of sweep mode, so the `.planctl` short-circuit in
+  // regardless of sweep mode, so the `.keeper` short-circuit in
   // `shouldWatchRoot` can subscribe it.
   const db = makeDiscoveryDb();
   const nudgeRoot = "/tmp/keeper-fn705-never-seen-repo";

@@ -3,9 +3,9 @@
  * synthetic snapshot message when the rendered git view changes.
  *
  * Watch gate: a worktree is watched iff
- *   `.planctl present || working tree dirty || ahead of upstream > 0`,
- * recomputed each reconcile. Clean-and-pushed non-`.planctl` worktrees drop
- * after a cooling dwell; `.planctl`-backed worktrees stay watched even when
+ *   `.keeper present || working tree dirty || ahead of upstream > 0`,
+ * recomputed each reconcile. Clean-and-pushed non-`.keeper` worktrees drop
+ * after a cooling dwell; `.keeper`-backed worktrees stay watched even when
  * clean and incur no probe spawn (short-circuit).
  *
  * EVENT-DRIVEN, not polled: a snapshot fires only on (1) a worktree FSEvents
@@ -58,10 +58,10 @@ export interface GitWorkerData {
 }
 
 /**
- * Discovery nudge (main → git-worker): the plan-worker observed a `.planctl`
+ * Discovery nudge (main → git-worker): the plan-worker observed a `.keeper`
  * tree in a repo keeper has never seen a session in. Main forwards the repo root
  * so the git-worker adds it to its discovery candidate set IMMEDIATELY (the
- * `.planctl` short-circuit in {@link shouldWatchRoot} subscribes it next
+ * `.keeper` short-circuit in {@link shouldWatchRoot} subscribes it next
  * reconcile) instead of waiting for the next full `SELECT DISTINCT cwd` sweep.
  * Idempotent: a re-nudge of an already-watched root is a no-op.
  */
@@ -147,7 +147,7 @@ export interface GitSnapshotMessage extends GitSnapshotPayload {
 
 /**
  * Tombstone message: a watched root stopped satisfying the watch gate on
- * reconcile (no `.planctl/` AND clean-and-pushed for ≥ {@link
+ * reconcile (no `.keeper/` AND clean-and-pushed for ≥ {@link
  * WATCH_DROP_DWELL_MS}). The worker is unsubscribing; main lifts this into a
  * synthetic `GitRootDropped` event whose reducer fold DELETEs the `git_status`
  * row — without it the UPSERT-only projection would leak the final pre-drop
@@ -214,10 +214,10 @@ export interface CommitMessage {
 }
 
 /**
- * Per-commit message announcing the `.planctl/**` paths that changed in the
+ * Per-commit message announcing the `.keeper/**` paths that changed in the
  * just-observed commit. Drives the plan-worker's commit-triggered ingest channel
  * (not an `events`-row insert). Main forwards it verbatim to plan-worker; the
- * reducer never sees it (re-fold determinism — the planctl files are re-read from
+ * reducer never sees it (re-fold determinism — the plan files are re-read from
  * committed worktree state on every ingest, never from this payload).
  *
  * The producer filters to planctl-shaped paths so the worker needs no
@@ -308,7 +308,7 @@ const FULL_SWEEP_INTERVAL_MS = 5 * 60_000;
  */
 const RECENT_JOB_WINDOW_MS = 2 * 60 * 60 * 1000;
 /**
- * Cooling dwell before a non-`.planctl` clean-and-pushed root is dropped. Must
+ * Cooling dwell before a non-`.keeper` clean-and-pushed root is dropped. Must
  * be ≥ HEARTBEAT_MS + one snapshot/commit-enumeration cycle so a post-commit
  * `emitSnapshot` (HEAD-delta enumeration → `Task:` link + discharge) drains
  * BEFORE the tombstone wipes the file_attributions claim.
@@ -577,8 +577,8 @@ export function probeWatchMembership(
 /**
  * Pure decision: does keeper want to watch this resolved git `root`?
  *
- *   - `.planctl/` present → ALWAYS watch, short-circuit BEFORE the probe (a
- *     `.planctl` repo never incurs a probe spawn).
+ *   - `.keeper/` present → ALWAYS watch, short-circuit BEFORE the probe (a
+ *     `.keeper` repo never incurs a probe spawn).
  *   - probe `null` (timeout/error) → fail-open if `currentlyWatched`, closed
  *     otherwise (don't join on a broken probe; don't drop on a stutter).
  *   - probe non-null → watch iff dirty OR ahead > 0.
@@ -588,7 +588,7 @@ export function shouldWatchRoot(
   probe: { dirty: boolean; ahead: number } | null,
   options: { currentlyWatched: boolean },
 ): boolean {
-  if (existsSync(join(root, ".planctl"))) return true;
+  if (existsSync(join(root, ".keeper"))) return true;
   if (probe === null) return options.currentlyWatched;
   return probe.dirty || probe.ahead > 0;
 }
@@ -813,14 +813,17 @@ const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
  * shapes plan-worker's `classifyPlanPath` recognizes, duplicated so the two
  * workers stay independent — if this set widens, BOTH classifiers must move in
  * lockstep. Recognised shapes (forward-slash split):
- * - `.planctl/epics/<id>.json` (3-segment)
- * - `.planctl/tasks/<id>.json` (3-segment)
- * - `.planctl/state/tasks/<id>.state.json` (4-segment)
+ * - `.keeper/epics/<id>.json` (3-segment)
+ * - `.keeper/tasks/<id>.json` (3-segment)
+ * - `.keeper/state/tasks/<id>.state.json` (4-segment)
+ * - `.keeper/state/epics/<id>.state.json` (4-segment)
  *
- * Rejects the vendored planctl subtree's own dev plan (`plugins/plan/.planctl`)
- * at the source so a keeper commit touching it (notably the subtree-add commit's
- * 322 files) is never forwarded to the plan-worker — mirrors that worker's own
- * `isVendoredPlanPath` correctness backstop.
+ * Rejects the vendored plan subtree's own dev plan (`plugins/plan/{.planctl,
+ * .keeper}`) at the source so a keeper commit touching it (notably the
+ * subtree-add commit's 322 files) is never forwarded to the plan-worker —
+ * mirrors that worker's own `isVendoredPlanPath` correctness backstop. The
+ * prune stays NAME-TOLERANT on both basenames because the vendored subtree is
+ * still on `.planctl` while keeper's own board is `.keeper`.
  */
 export function isPlanctlChangedPath(path: string): boolean {
   if (!path.endsWith(".json")) return false;
@@ -829,23 +832,23 @@ export function isPlanctlChangedPath(path: string): boolean {
     if (
       segments[i] === "plugins" &&
       segments[i + 1] === "plan" &&
-      segments[i + 2] === ".planctl"
+      (segments[i + 2] === ".planctl" || segments[i + 2] === ".keeper")
     ) {
       return false;
     }
   }
   const n = segments.length;
-  // 3-segment tail: `.planctl/<epics|tasks>/<file>.json`.
-  if (n >= 3 && segments[n - 3] === ".planctl") {
+  // 3-segment tail: `.keeper/<epics|tasks>/<file>.json`.
+  if (n >= 3 && segments[n - 3] === ".keeper") {
     const dir = segments[n - 2];
     return dir === "epics" || dir === "tasks";
   }
-  // 4-segment tail: `.planctl/state/tasks/<id>.state.json`.
+  // 4-segment tail: `.keeper/state/<tasks|epics>/<id>.state.json`.
   if (
     n >= 4 &&
-    segments[n - 4] === ".planctl" &&
+    segments[n - 4] === ".keeper" &&
     segments[n - 3] === "state" &&
-    segments[n - 2] === "tasks" &&
+    (segments[n - 2] === "tasks" || segments[n - 2] === "epics") &&
     segments[n - 1].endsWith(".state.json")
   ) {
     return true;
@@ -1164,8 +1167,8 @@ export function buildDiscoveryCandidates(
     runFullSweep: boolean;
     watched: Set<string>;
     /**
-     * Discovery-nudge roots (a `.planctl` tree in a repo with no seen-cwd job
-     * history). Always included so the `.planctl` short-circuit in {@link
+     * Discovery-nudge roots (a `.keeper` tree in a repo with no seen-cwd job
+     * history). Always included so the `.keeper` short-circuit in {@link
      * shouldWatchRoot} subscribes them without waiting for a session to populate
      * `jobs.cwd`. Optional — pure tests omit it.
      */
@@ -1347,7 +1350,7 @@ export function selectVanishedRoots(
  *   1. Build candidate cwds via {@link buildDiscoveryCandidates}.
  *   2. Resolve each cwd → toplevel via the permanent `cwdRootCache`.
  *   3. Per resolved root, consult the TTL memo; on miss/expiry run {@link
- *      probeWatchMembership} ONCE and cache at the right tier. `.planctl`
+ *      probeWatchMembership} ONCE and cache at the right tier. `.keeper`
  *      short-circuits in {@link shouldWatchRoot} BEFORE the probe runs.
  *   4. Compose the verdict via {@link shouldWatchRoot}.
  *
@@ -1366,7 +1369,7 @@ export function discoverProjectRoots(
   });
 
   // Resolve cwd → toplevel via the permanent cache; drop cwds not in a git
-  // worktree. `.planctl` and dirty checks run against the resolved root.
+  // worktree. `.keeper` and dirty checks run against the resolved root.
   const resolvedRoots = new Set<string>();
   for (const candidate of candidates) {
     let root: string | null | undefined = ctx.cwdRootCache.get(candidate);
@@ -1387,10 +1390,10 @@ export function discoverProjectRoots(
     if (cached !== undefined && cached.expiry > ctx.nowMs) {
       probe = cached.verdict;
     } else {
-      // Skip the probe for `.planctl` roots — shouldWatchRoot short-circuits
-      // true on the `.planctl` check; cache a `null` verdict so a future
-      // `.planctl` removal forces a re-probe via expiry.
-      if (existsSync(join(root, ".planctl"))) {
+      // Skip the probe for `.keeper` roots — shouldWatchRoot short-circuits
+      // true on the `.keeper` check; cache a `null` verdict so a future
+      // `.keeper` removal forces a re-probe via expiry.
+      if (existsSync(join(root, ".keeper"))) {
         probe = null;
         ctx.watchProbeCache.set(root, {
           verdict: null,
@@ -1785,12 +1788,12 @@ function startWorker(): void {
   /**
    * fn-705 discovery-nudge roots forwarded by main (an
    * {@link AddDiscoveryRootMessage} per repo the plan-worker first saw a
-   * `.planctl` tree in). Folded into the candidate set on every reconcile via
+   * `.keeper` tree in). Folded into the candidate set on every reconcile via
    * {@link buildDiscoveryCandidates} so a repo with no seen-cwd job history is
    * still discovered. Grows monotonically across the worker's lifetime; bounded
-   * by the number of distinct planctl repos (small, and the membership floor it
-   * provides is harmless — `shouldWatchRoot` still gates on `.planctl` presence
-   * / dirty / ahead, so a nudge for a repo whose `.planctl` later vanishes
+   * by the number of distinct plan repos (small, and the membership floor it
+   * provides is harmless — `shouldWatchRoot` still gates on `.keeper` presence
+   * / dirty / ahead, so a nudge for a repo whose `.keeper` later vanishes
    * simply stops qualifying).
    */
   const extraCandidateRoots = new Set<string>();
@@ -2267,7 +2270,7 @@ function startWorker(): void {
     }
     lastByRoot.delete(root);
     // Clear the HEAD-oid bootstrap cache too so a re-subscribe of the same
-    // root (planctl dir re-created) re-seeds from the current head and
+    // root (`.keeper` dir re-created) re-seeds from the current head and
     // doesn't emit a phantom delta against the pre-drop state. The fn-705
     // enumeration-failure counter is per-root and meaningless across a
     // re-subscribe, so drop it in lockstep.
@@ -2424,7 +2427,7 @@ function startWorker(): void {
     if (msg == null) return;
     if (msg.type === "add-discovery-root") {
       // fn-705 discovery nudge: fold the plan-worker's repo root into the
-      // candidate set and request an immediate reconcile so the `.planctl`
+      // candidate set and request an immediate reconcile so the `.keeper`
       // short-circuit in `shouldWatchRoot` subscribes it now, not on the next
       // full sweep. Idempotent (Set add) + convergent (reconcile is
       // single-flighted). Tolerated no-op during the boot window where
