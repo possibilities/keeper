@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T01:00:32.390000Z",
   "created_at": "2026-06-19T21:31:52.871000Z",
   "depends_on_epics": [],
   "id": "fn-836-shed-event-blob-bloat-and-add-retention",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": true,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Shed event-blob bloat and add retention",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-19T21:37:41.114000Z"
+  "updated_at": "2026-06-20T01:00:32.390000Z"
 }
