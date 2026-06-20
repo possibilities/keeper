@@ -186,16 +186,16 @@ function decode(stream: Uint8Array | Buffer | string | null): string {
 // ---------------------------------------------------------------------------
 // Payload extractors — the port of conftest._first_json_payload (:762) and
 // parse_cli_output (:1047). Mutating verbs emit a compact single NDJSON line;
-// read verbs emit pretty JSON + a trailing {"planctl_invocation": ...} line.
+// read verbs emit pretty JSON + a trailing {"plan_invocation": ...} line.
 // ---------------------------------------------------------------------------
 
 /** First stdout line that parses as a JSON object, skipping the trailing
- * {"planctl_invocation": ...} decorator. Mirrors _first_json_payload — use for
+ * {"plan_invocation": ...} decorator. Mirrors _first_json_payload — use for
  * a compact single-line (mutating-verb) envelope. */
 export function firstJsonPayload(output: string): Record<string, unknown> {
   for (const raw of output.trim().split("\n")) {
     const line = raw.trim();
-    if (!line.startsWith("{") || line.startsWith('{"planctl_invocation"')) {
+    if (!line.startsWith("{") || line.startsWith('{"plan_invocation"')) {
       continue;
     }
     try {
@@ -213,7 +213,7 @@ export function firstJsonPayload(output: string): Record<string, unknown> {
 export function parseCliOutput(output: string): Record<string, unknown> {
   const lines = output.trim().split("\n");
   const primary = lines.filter(
-    (ln) => !ln.trim().startsWith('{"planctl_invocation"'),
+    (ln) => !ln.trim().startsWith('{"plan_invocation"'),
   );
   while (primary.length > 0 && !primary[0]?.trimStart().startsWith("{")) {
     primary.shift();

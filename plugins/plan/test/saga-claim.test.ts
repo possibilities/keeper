@@ -120,7 +120,7 @@ describe("claim happy path + brief schema", () => {
     expect(brief.snippet_context).toBe("");
 
     // claim stays readonly — NULL subject/files.
-    const inv = payload.planctl_invocation as Record<string, unknown>;
+    const inv = payload.plan_invocation as Record<string, unknown>;
     expect(inv.op).toBe("claim");
     expect(inv.subject).toBeNull();
     expect(inv.files).toBeNull();

@@ -84,7 +84,7 @@ function firstObj(output: string): Record<string, unknown> {
         const v = JSON.parse(output.slice(i, end));
         if (v && typeof v === "object" && !Array.isArray(v)) {
           const keys = Object.keys(v);
-          if (!(keys.length === 1 && keys[0] === "planctl_invocation")) {
+          if (!(keys.length === 1 && keys[0] === "plan_invocation")) {
             return v as Record<string, unknown>;
           }
         }

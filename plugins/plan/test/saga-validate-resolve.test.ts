@@ -219,12 +219,11 @@ describe("resolve-task routing envelope", () => {
     expect(r.code).toBe(0);
     expect(r.output).toContain("resolve-task");
     // The merged envelope IS the invocation carrier; pull the trailing line.
-    const inv = (parseCliOutput(r.output).planctl_invocation ??
+    const inv = (parseCliOutput(r.output).plan_invocation ??
       (() => {
         for (const ln of r.output.trim().split("\n")) {
-          if (ln.trim().startsWith('{"planctl_invocation"')) {
-            return (JSON.parse(ln) as Record<string, unknown>)
-              .planctl_invocation;
+          if (ln.trim().startsWith('{"plan_invocation"')) {
+            return (JSON.parse(ln) as Record<string, unknown>).plan_invocation;
           }
         }
         return {};

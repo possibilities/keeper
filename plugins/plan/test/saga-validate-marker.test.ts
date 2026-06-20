@@ -159,7 +159,7 @@ describe("validate --epic marker writes", () => {
     const docs = parseJsonStream(r.stdout);
     expect(docs.length).toBe(2);
     expect(docs[0]?.valid).toBe(true);
-    const inv = docs[1]?.planctl_invocation as Record<string, unknown>;
+    const inv = docs[1]?.plan_invocation as Record<string, unknown>;
     expect(inv).not.toBeUndefined();
     expect(inv.op).toBe("validate");
     expect(inv.target).toBe(epicId);
@@ -196,7 +196,7 @@ describe("validate --epic marker writes", () => {
     expect(docs.length).toBe(1);
     expect(docs[0]?.valid).toBe(false);
     for (const doc of docs) {
-      expect("planctl_invocation" in doc).toBe(false);
+      expect("plan_invocation" in doc).toBe(false);
     }
     expect(readEpic(epicId).last_validated_at ?? null).toBeNull();
   });
@@ -209,7 +209,7 @@ describe("validate --epic marker writes", () => {
     const r = run(["validate"]);
     expect(readEpic(epicId).last_validated_at ?? null).toBeNull();
     for (const doc of parseJsonStream(r.stdout)) {
-      expect("planctl_invocation" in doc).toBe(false);
+      expect("plan_invocation" in doc).toBe(false);
     }
   });
 });
@@ -509,7 +509,7 @@ describe("set-*-repo re-stamps + touched_repos auto-roll", () => {
     const envelope = docs[0] as Record<string, unknown>;
     const business = Object.fromEntries(
       Object.entries(envelope).filter(
-        ([k]) => k !== "success" && k !== "planctl_invocation",
+        ([k]) => k !== "success" && k !== "plan_invocation",
       ),
     );
     expect(new Set(Object.keys(business))).toEqual(
@@ -596,7 +596,7 @@ describe("epic invalidate", () => {
 
     const docs = parseJsonStream(r.stdout);
     expect(docs.length).toBe(1);
-    const inv = (docs[0]?.planctl_invocation ?? {}) as Record<string, unknown>;
+    const inv = (docs[0]?.plan_invocation ?? {}) as Record<string, unknown>;
     expect(inv.op).toBe("invalidate");
     expect(inv.target).toBe(epicId);
   });
@@ -610,7 +610,7 @@ describe("epic invalidate", () => {
     expect(r.code).toBe(0);
     const docs = parseJsonStream(r.stdout);
     expect(docs.length).toBe(1);
-    const inv = (docs[0]?.planctl_invocation ?? {}) as Record<string, unknown>;
+    const inv = (docs[0]?.plan_invocation ?? {}) as Record<string, unknown>;
     expect(inv.op).toBe("invalidate");
     expect(inv.files ?? null).toBeNull();
     expect(readEpic(epicId).last_validated_at ?? null).toBeNull();

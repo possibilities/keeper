@@ -115,7 +115,7 @@ describe("epic rm happy path", () => {
     expect(gitHeadMessage(project.root).split("\n")[0]).toBe(
       `chore(plan): rm ${epicId}`,
     );
-    const inv = (obj.planctl_invocation ?? {}) as Record<string, unknown>;
+    const inv = (obj.plan_invocation ?? {}) as Record<string, unknown>;
     expect(inv.op).toBe("rm");
     expect(inv.target).toBe(epicId);
   });

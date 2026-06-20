@@ -567,7 +567,7 @@ describe("reconcile errors + contract + meta", () => {
     },
   );
 
-  test("envelope carries readonly planctl_invocation footer", () => {
+  test("envelope carries readonly plan_invocation footer", () => {
     // test_reconcile.py::test_reconcile_envelope_carries_readonly_invocation
     const proj = getProj();
     const { taskIds } = scaffoldEpic(proj, {
@@ -581,7 +581,7 @@ describe("reconcile errors + contract + meta", () => {
     });
     expect(r.code).toBe(0);
     // reconcile emits ONE compact line carrying both payload + inline footer.
-    const inv = parseCliOutput(r.output).planctl_invocation as Record<
+    const inv = parseCliOutput(r.output).plan_invocation as Record<
       string,
       unknown
     >;

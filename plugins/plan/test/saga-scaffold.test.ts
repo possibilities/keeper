@@ -1,6 +1,6 @@
 // Engine-agnostic conformance spec for `planctl scaffold` — translated from
 // tests/test_scaffold.py, every node mapped by a source-comment. The single
-// transactional mint: one planctl_invocation envelope covering epic JSON + spec +
+// transactional mint: one plan_invocation envelope covering epic JSON + spec +
 // every task JSON + spec; verbatim specs; 1-based ordinal deps + forward-ref two-
 // pass resolution; epic-level depends_on_epics order-preservation + the typed
 // epic_dep_invalid failure family; the bad_yaml / spec_invalid / dep_invalid /
@@ -91,9 +91,8 @@ function countInvocationLines(output: string): number {
   return output
     .trim()
     .split("\n")
-    .filter(
-      (ln) => ln.trim().startsWith("{") && ln.includes("planctl_invocation"),
-    ).length;
+    .filter((ln) => ln.trim().startsWith("{") && ln.includes("plan_invocation"))
+    .length;
 }
 
 // The two-task plan with task 2 deps on [1]. Port of _two_task_yaml.
@@ -150,7 +149,7 @@ describe("scaffold happy path", () => {
     expect(payload.task_ids).toEqual([`${epicId}.1`, `${epicId}.2`]);
     expect(countInvocationLines(r.output)).toBe(1);
 
-    const pc = payload.planctl_invocation as Record<string, unknown>;
+    const pc = payload.plan_invocation as Record<string, unknown>;
     expect(pc.op).toBe("scaffold");
     expect(pc.target).toBe(epicId);
     expect(pc.subject).toBe(`chore(plan): scaffold ${epicId}`);
@@ -611,7 +610,7 @@ describe("scaffold mint boundary", () => {
     const payload = parseEnvelope(r.output);
     const epicId = payload.epic_id as string;
     const files = new Set(
-      (payload.planctl_invocation as Record<string, unknown>).files as string[],
+      (payload.plan_invocation as Record<string, unknown>).files as string[],
     );
     for (const f of [
       `.keeper/epics/${epicId}.json`,
@@ -834,7 +833,7 @@ describe("scaffold queue_jump", () => {
     const payload = parseEnvelope(r.output);
     expect(payload.success).toBe(true);
     expect(
-      (payload.planctl_invocation as Record<string, unknown>).queue_jump,
+      (payload.plan_invocation as Record<string, unknown>).queue_jump,
     ).toBe(true);
     const epicId = payload.epic_id as string;
     expect(readJson(`epics/${epicId}.json`).queue_jump).toBe(true);
@@ -846,7 +845,7 @@ describe("scaffold queue_jump", () => {
     expect(r.code).toBe(0);
     const payload = parseEnvelope(r.output);
     expect(
-      (payload.planctl_invocation as Record<string, unknown>).queue_jump,
+      (payload.plan_invocation as Record<string, unknown>).queue_jump,
     ).toBe(false);
     expect(readJson(`epics/${payload.epic_id}.json`).queue_jump).toBe(false);
   });
@@ -856,7 +855,7 @@ describe("scaffold queue_jump", () => {
     const r = run(["scaffold", "--file", writeYaml(queueJumpYaml(null))]);
     expect(r.code).toBe(0);
     const payload = parseEnvelope(r.output);
-    const pc = payload.planctl_invocation as Record<string, unknown>;
+    const pc = payload.plan_invocation as Record<string, unknown>;
     expect("queue_jump" in pc).toBe(true);
     expect(pc.queue_jump).toBe(false);
     expect(readJson(`epics/${payload.epic_id}.json`).queue_jump).toBe(false);

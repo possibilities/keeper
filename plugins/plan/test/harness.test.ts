@@ -264,14 +264,14 @@ describe("payload extractors", () => {
   test("firstJsonPayload returns the first JSON object, skips invocation line", () => {
     const out =
       'some stderr noise\n{"success": true, "id": "fn-1-x"}\n' +
-      '{"planctl_invocation": {"op": "done"}}\n';
+      '{"plan_invocation": {"op": "done"}}\n';
     expect(firstJsonPayload(out)).toEqual({ success: true, id: "fn-1-x" });
   });
 
   test("parseCliOutput joins multi-line pretty JSON, drops the trailer", () => {
     const out =
       '{\n  "success": true,\n  "epics": []\n}\n' +
-      '{"planctl_invocation": {"op": "epics"}}\n';
+      '{"plan_invocation": {"op": "epics"}}\n';
     expect(parseCliOutput(out)).toEqual({ success: true, epics: [] });
   });
 

@@ -81,9 +81,8 @@ function countInvocationLines(output: string): number {
   return output
     .trim()
     .split("\n")
-    .filter(
-      (ln) => ln.trim().startsWith("{") && ln.includes("planctl_invocation"),
-    ).length;
+    .filter((ln) => ln.trim().startsWith("{") && ln.includes("plan_invocation"))
+    .length;
 }
 
 // The bare-number form of a full slug (`fn-7-foo` -> `fn-7`). Replaces the
@@ -146,7 +145,7 @@ describe("epic add-deps", () => {
     });
 
     expect(countInvocationLines(r.output)).toBe(1);
-    const pc = payload.planctl_invocation as Record<string, unknown>;
+    const pc = payload.plan_invocation as Record<string, unknown>;
     expect(pc.op).toBe("add-deps");
     expect(pc.target).toBe(epicId);
     expect(pc.subject).toBe(`chore(plan): add-deps ${epicId}`);
@@ -392,7 +391,7 @@ describe("epic close", () => {
     const r = run(["epic", "close", epicId, "--force"]);
     expect(r.code).toBe(0);
     const last = r.output.trim().split("\n").at(-1) as string;
-    const inv = (JSON.parse(last).planctl_invocation ?? {}) as Record<
+    const inv = (JSON.parse(last).plan_invocation ?? {}) as Record<
       string,
       unknown
     >;
@@ -421,7 +420,7 @@ describe("epic queue-jump (errors + envelope)", () => {
     expect(payload.short_circuited).toBe(false);
     expect(readEpic(epicId).queue_jump).toBe(true);
 
-    const inv = (payload.planctl_invocation ?? {}) as Record<string, unknown>;
+    const inv = (payload.plan_invocation ?? {}) as Record<string, unknown>;
     expect(inv.op).toBe("queue-jump");
     expect(inv.target).toBe(epicId);
     expect(inv.queue_jump).toBe(true);
@@ -440,7 +439,7 @@ describe("epic queue-jump (errors + envelope)", () => {
     expect(payload.short_circuited).toBe(true);
     expect(readEpic(epicId)).toStrictEqual(first);
 
-    const inv = (payload.planctl_invocation ?? {}) as Record<string, unknown>;
+    const inv = (payload.plan_invocation ?? {}) as Record<string, unknown>;
     expect(inv.op).toBe("queue-jump");
     expect(inv.subject).toBeNull();
     expect(inv.files).toBeNull();
@@ -577,7 +576,7 @@ describe("task set-tier (validation + envelope)", () => {
     const { taskId } = scaffoldOne();
     const r = run(["task", "set-tier", taskId, "--tier", "medium"]);
     expect(r.code).toBe(0);
-    expect(r.output).toContain('"planctl_invocation"');
+    expect(r.output).toContain('"plan_invocation"');
     expect(r.output).toContain("task-set-tier");
   });
 

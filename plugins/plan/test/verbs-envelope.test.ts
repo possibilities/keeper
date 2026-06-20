@@ -1,4 +1,4 @@
-// Engine-agnostic conformance spec for the planctl_invocation envelope + the
+// Engine-agnostic conformance spec for the plan_invocation envelope + the
 // emit() auto-commit boundary — translated from tests/test_envelope.py,
 // tests/test_envelope_shape.py, and tests/test_emit.py. Every translated node
 // carries its pytest source-comment; the Python-internal nodes (build_subject /
@@ -6,7 +6,7 @@
 // paths) are cited or dropped inline with their reason.
 //
 // The contract: mutating verbs emit a single compact NDJSON envelope carrying
-// planctl_invocation merged in (op / target / subject / .keeper-only files /
+// plan_invocation merged in (op / target / subject / .keeper-only files /
 // touched_path_files / repo_root); read-only verbs emit the invocation as a
 // trailing line with subject=null / files=null and never embed it in the
 // primary payload; the emit()->commit reorder makes a success envelope the
@@ -35,13 +35,13 @@ function parseEnvelope(output: string): Record<string, unknown> {
   return JSON.parse(first);
 }
 
-// Primary payload with the trailing planctl_invocation line stripped. Port of
+// Primary payload with the trailing plan_invocation line stripped. Port of
 // _parse_primary / _split_output.
 function parsePrimary(output: string): Record<string, unknown> {
   const lines = output
     .trim()
     .split("\n")
-    .filter((ln) => !ln.trim().startsWith('{"planctl_invocation"'));
+    .filter((ln) => !ln.trim().startsWith('{"plan_invocation"'));
   return JSON.parse(lines.join("\n"));
 }
 
@@ -64,10 +64,10 @@ function create(title: string, extra: string[] = []) {
 }
 
 // ---------------------------------------------------------------------------
-// Mutating verb emits planctl_invocation (shape + .keeper/ prefix guard)
+// Mutating verb emits plan_invocation (shape + .keeper/ prefix guard)
 // ---------------------------------------------------------------------------
 
-describe("mutating verb planctl_invocation", () => {
+describe("mutating verb plan_invocation", () => {
   test("epic create carries op/target/subject + data-dir-only files", () => {
     // test_envelope.py::test_epic_create_emits_planctl_mutation
     // test_envelope_shape.py::test_epic_create_emits_planctl_mutation (same surface — one bun test)
@@ -75,7 +75,7 @@ describe("mutating verb planctl_invocation", () => {
     expect(r.code).toBe(0);
     const payload = parseEnvelope(r.output);
     expect(payload.success).toBe(true);
-    const pc = payload.planctl_invocation as Record<string, unknown>;
+    const pc = payload.plan_invocation as Record<string, unknown>;
     expect(pc).not.toBeUndefined();
     expect(pc.op).toBe("create");
     expect((pc.target as string).startsWith("fn-")).toBe(true);
@@ -94,7 +94,7 @@ describe("mutating verb planctl_invocation", () => {
     // test_envelope_shape.py::test_epic_create_repo_root
     const r = create("Repo root test");
     expect(r.code).toBe(0);
-    const pc = parseEnvelope(r.output).planctl_invocation as Record<
+    const pc = parseEnvelope(r.output).plan_invocation as Record<
       string,
       unknown
     >;
@@ -105,7 +105,7 @@ describe("mutating verb planctl_invocation", () => {
     // test_envelope_shape.py::test_epic_create_files_prefix_guard
     const r = create("Prefix guard");
     expect(r.code).toBe(0);
-    const pc = parseEnvelope(r.output).planctl_invocation as Record<
+    const pc = parseEnvelope(r.output).plan_invocation as Record<
       string,
       unknown
     >;
@@ -117,7 +117,7 @@ describe("mutating verb planctl_invocation", () => {
   test("no prev_op field", () => {
     // test_envelope_shape.py::test_epic_create_no_prev_op_field
     const r = create("No prev_op");
-    const pc = parseEnvelope(r.output).planctl_invocation as Record<
+    const pc = parseEnvelope(r.output).plan_invocation as Record<
       string,
       unknown
     >;
@@ -135,21 +135,21 @@ describe("mutating verb planctl_invocation", () => {
     const invLines = r.output
       .trim()
       .split("\n")
-      .filter((ln) => ln.includes("planctl_invocation"));
+      .filter((ln) => ln.includes("plan_invocation"));
     expect(invLines.length).toBe(1);
   });
 
   test("touched_path_files is a list", () => {
     // test_envelope_shape.py::test_epic_create_touched_path_files
     const r = create("Touched files check");
-    const pc = parseEnvelope(r.output).planctl_invocation as Record<
+    const pc = parseEnvelope(r.output).plan_invocation as Record<
       string,
       unknown
     >;
     expect(Array.isArray(pc.touched_path_files)).toBe(true);
   });
 
-  test("done always emits planctl_invocation with op/target", () => {
+  test("done always emits plan_invocation with op/target", () => {
     // test_envelope.py::test_done_emits_planctl_mutation
     const { taskIds } = scaffoldEpic(project, { title: "E", nTasks: 1 });
     const taskId = taskIds[0] as string;
@@ -164,7 +164,7 @@ describe("mutating verb planctl_invocation", () => {
       env: SID,
     });
     expect(r.code).toBe(0);
-    const pc = parseEnvelope(r.output).planctl_invocation as Record<
+    const pc = parseEnvelope(r.output).plan_invocation as Record<
       string,
       unknown
     >;
@@ -172,7 +172,7 @@ describe("mutating verb planctl_invocation", () => {
     expect(pc.target).toBe(taskId);
   });
 
-  test("multiple epic verbs each emit planctl_invocation", () => {
+  test("multiple epic verbs each emit plan_invocation", () => {
     // test_envelope.py::test_epic_verbs_emit_planctl_mutation[set-branch|set-title|close]
     for (const verbArgs of [
       ["epic", "set-branch", "{epic_id}", "--branch", "test-branch"],
@@ -189,7 +189,7 @@ describe("mutating verb planctl_invocation", () => {
         env: SID,
       });
       expect(r.code).toBe(0);
-      const pc = parseEnvelope(r.output).planctl_invocation as Record<
+      const pc = parseEnvelope(r.output).plan_invocation as Record<
         string,
         unknown
       >;
@@ -218,7 +218,7 @@ describe("claim readonly invocation shape", () => {
       env: SID,
     });
     expect(r.code).toBe(0);
-    const pc = parseEnvelope(r.output).planctl_invocation as Record<
+    const pc = parseEnvelope(r.output).plan_invocation as Record<
       string,
       unknown
     >;
@@ -244,7 +244,7 @@ describe("files set exclusion", () => {
     const r = create("Dirty tree test");
     expect(r.code).toBe(0);
     const files = (
-      parseEnvelope(r.output).planctl_invocation as Record<string, unknown>
+      parseEnvelope(r.output).plan_invocation as Record<string, unknown>
     ).files as string[];
     expect(files.every((f) => f.startsWith(".keeper/"))).toBe(true);
   });
@@ -274,7 +274,7 @@ describe("files set exclusion", () => {
     );
     expect(r.code).toBe(0);
     const files = (
-      parseEnvelope(r.output).planctl_invocation as Record<string, unknown>
+      parseEnvelope(r.output).plan_invocation as Record<string, unknown>
     ).files as string[];
     expect(files.some((f) => f.includes("fn-peer-inject"))).toBe(false);
   });
@@ -294,7 +294,7 @@ describe("files set exclusion", () => {
 //     (buildSubject detail/control-char flattening — a pure-unit string contract).
 
 // ---------------------------------------------------------------------------
-// no-git: mutation succeeds, planctl_invocation still emitted (files may be empty)
+// no-git: mutation succeeds, plan_invocation still emitted (files may be empty)
 // ---------------------------------------------------------------------------
 
 describe("no-git mutation", () => {
@@ -312,7 +312,7 @@ describe("no-git mutation", () => {
     expect(r.code).toBe(0);
     const payload = parseEnvelope(r.output);
     expect(payload.success).toBe(true);
-    expect("planctl_invocation" in payload).toBe(true);
+    expect("plan_invocation" in payload).toBe(true);
   });
 });
 
@@ -336,17 +336,17 @@ describe("read-only invocation trailer", () => {
       const trailing = r.output
         .trim()
         .split("\n")
-        .find((ln) => ln.trim().startsWith('{"planctl_invocation"'));
+        .find((ln) => ln.trim().startsWith('{"plan_invocation"'));
       expect(trailing).not.toBeUndefined();
       const pc = (JSON.parse(trailing as string) as Record<string, unknown>)
-        .planctl_invocation as Record<string, unknown>;
+        .plan_invocation as Record<string, unknown>;
       expect(pc.subject).toBeNull();
       expect(pc.files).toBeNull();
-      expect("planctl_invocation" in parsePrimary(r.output)).toBe(false);
+      expect("plan_invocation" in parsePrimary(r.output)).toBe(false);
     }
   });
 
-  test("show / epics / tasks primary payload omits planctl_invocation", () => {
+  test("show / epics / tasks primary payload omits plan_invocation", () => {
     // test_envelope_shape.py::test_show_no_planctl_mutation
     // test_envelope_shape.py::test_epics_no_planctl_mutation
     // test_envelope_shape.py::test_tasks_no_planctl_mutation
@@ -364,7 +364,7 @@ describe("read-only invocation trailer", () => {
         env: SID,
       });
       expect(r.code).toBe(0);
-      expect("planctl_invocation" in parsePrimary(r.output)).toBe(false);
+      expect("plan_invocation" in parsePrimary(r.output)).toBe(false);
     }
   });
 
@@ -427,7 +427,7 @@ describe("emit auto-commit boundary", () => {
     expect(r.code).toBe(0);
     const env = parseEnvelope(r.output);
     expect(env.success).toBe(true);
-    expect("planctl_invocation" in env).toBe(true);
+    expect("plan_invocation" in env).toBe(true);
     expect(gitLogCount(project.root)).toBe(before + 1);
     expect(headSubject(project.root)).toBe(`chore(plan): set-title ${epicId}`);
     expect(
@@ -448,7 +448,7 @@ describe("emit auto-commit boundary", () => {
     expect(r.code).toBe(0);
     const env = parseEnvelope(r.output);
     expect(env.success).toBe(true);
-    const inv = env.planctl_invocation as Record<string, unknown>;
+    const inv = env.plan_invocation as Record<string, unknown>;
     expect(inv.files).toBeFalsy();
     expect(gitLogCount(project.root)).toBe(before);
   });

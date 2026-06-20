@@ -77,9 +77,8 @@ function countInvocationLines(output: string): number {
   return output
     .trim()
     .split("\n")
-    .filter(
-      (ln) => ln.trim().startsWith("{") && ln.includes("planctl_invocation"),
-    ).length;
+    .filter((ln) => ln.trim().startsWith("{") && ln.includes("plan_invocation"))
+    .length;
 }
 
 function writeDelta(content: string, name = "delta.yaml"): string {
@@ -167,7 +166,7 @@ describe("refine-apply happy path", () => {
     expect(payload.success).toBe(true);
     expect(payload.added_task_ids).toEqual([`${epicId}.3`]);
     expect(countInvocationLines(r.output)).toBe(1);
-    const pc = payload.planctl_invocation as Record<string, unknown>;
+    const pc = payload.plan_invocation as Record<string, unknown>;
     expect(pc.op).toBe("refine-apply");
     expect(pc.target).toBe(epicId);
     const newTask = readTask(`${epicId}.3`);

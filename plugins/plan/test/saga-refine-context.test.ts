@@ -54,7 +54,7 @@ function envelope(output: string): Record<string, unknown> {
   const lines = output
     .trim()
     .split("\n")
-    .filter((ln) => !ln.trim().startsWith('{"planctl_invocation"'));
+    .filter((ln) => !ln.trim().startsWith('{"plan_invocation"'));
   while (lines.length > 0 && !lines[0]?.trimStart().startsWith("{")) {
     lines.shift();
   }

@@ -33,7 +33,7 @@ function setStatus(root: string, taskId: string, status: string): void {
   );
 }
 
-// The primary envelope is plain JSON on stdout with NO planctl_invocation footer
+// The primary envelope is plain JSON on stdout with NO plan_invocation footer
 // (resume is a plain-group read verb).
 function envelope(out: string): Record<string, unknown> {
   return JSON.parse(out.trim());

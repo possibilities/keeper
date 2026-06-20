@@ -358,7 +358,7 @@ describe("find-task-commit read-only contract", () => {
     },
   );
 
-  test("envelope carries readonly planctl_invocation footer", () => {
+  test("envelope carries readonly plan_invocation footer", () => {
     // test_find_task_commit.py::test_find_task_commit_envelope_carries_readonly_invocation
     const proj = getProj();
     const { taskIds } = scaffoldEpic(proj, { title: "FTC epic", nTasks: 1 });
@@ -369,8 +369,8 @@ describe("find-task-commit read-only contract", () => {
     });
     expect(r.code).toBe(0);
     // find-task-commit emits ONE compact line carrying both the payload and the
-    // inline planctl_invocation footer.
-    const inv = parseCliOutput(r.output).planctl_invocation as Record<
+    // inline plan_invocation footer.
+    const inv = parseCliOutput(r.output).plan_invocation as Record<
       string,
       unknown
     >;
