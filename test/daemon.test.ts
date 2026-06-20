@@ -2544,13 +2544,18 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // producer mint flip — in-transaction with the version stamp, no cursor rewind,
   // re-fold byte-identical), and to 76 via fn-846 task .1 (the never-bound
   // dispatch circuit breaker's additive `dispatch_never_bound` projection table —
-  // CREATE-only, no cursor rewind, re-fold byte-identical), each of which bumped
-  // SCHEMA_VERSION AND added its version to `SUPPORTED_SCHEMA_VERSIONS` in the
-  // same commit per the CLAUDE.md same-commit invariant. This pin tracks the LIVE
-  // schema version: the guard it provides is "an accidental reducer/schema change
-  // must surface as a failing whitelist + this pin", which still holds — bump both
-  // together when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(76);
+  // CREATE-only, no cursor rewind, re-fold byte-identical), and to 77 via fn-856
+  // task .1 (ungating the plan-link classifier from the `/plan:plan` time-window
+  // model — the fold output changed, so the migration REWINDS the cursor and
+  // wipes the canonical projection list to repopulate from the corrected derive,
+  // re-fold byte-identical via the classifier's `(ts, event_id)` total order),
+  // each of which bumped SCHEMA_VERSION AND added its version to
+  // `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the CLAUDE.md same-commit
+  // invariant. This pin tracks the LIVE schema version: the guard it provides is
+  // "an accidental reducer/schema change must surface as a failing whitelist +
+  // this pin", which still holds — bump both together when the schema genuinely
+  // moves.
+  expect(SCHEMA_VERSION).toBe(77);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

@@ -1,18 +1,19 @@
 /**
- * Plan-classifier parity tests. Loads the golden fixture at
- * `test/fixtures/plan_classifier_cases.jsonl` and asserts that the TS port
- * (`src/plan-classifier.ts`) produces byte-identical output per case.
+ * Plan-classifier golden tests. Loads the fixture at
+ * `test/fixtures/plan_classifier_cases.jsonl` and asserts that the windowless
+ * classifier (`src/plan-classifier.ts`) produces byte-identical output per case.
  *
- * The fixture is a FROZEN golden: its Python generator and the upstream
- * `cli_common` classifier derivers it was captured from were both retired, so
- * `src/plan-classifier.ts` is now the sole implementation. The test loads the
- * file and compares the TS port's output to the captured `expected` array;
- * update the JSONL by hand if the TS port's behavior deliberately changes.
+ * The fixture is a HAND-EDITED golden — there is no generator. Each `expected`
+ * array is hand-computed from the case's invocation log under the windowless
+ * rules: every epic-mutating op links (creator = {create, scaffold} with an
+ * epic-shaped target; refiner = any other mutating op naming an epic), gated
+ * only by the read-only `subject_present === false` skip, with per-session
+ * creator-suppression keyed on target/epic. Update the JSONL by hand if the
+ * classifier's behavior deliberately changes.
  *
  * Fixture row shape (mode-tagged):
- * - `mode: "epic_links"` — `{desc, openers, invocations, windows, expected}`.
- *   `windows` is included for cross-check against {@link computePlanWindows}.
- * - `mode: "job_links"` — `{desc, epic_id, sessions, windows_by_session, expected}`.
+ * - `mode: "epic_links"` — `{desc, invocations, expected}`.
+ * - `mode: "job_links"` — `{desc, epic_id, sessions, expected}`.
  *
  * Each `desc` is wired into the test name so a failing case lands an
  * unambiguous Bun-test label.
@@ -23,11 +24,8 @@ import { readFileSync } from "node:fs";
 import path from "node:path";
 import {
   type ClassifierInvocation,
-  computePlanWindows,
   deriveEpicLinks,
   deriveJobLinks,
-  MAX_TS_SENTINEL,
-  type PlanWindow,
 } from "../src/plan-classifier";
 
 // ---------------------------------------------------------------------------
@@ -37,9 +35,7 @@ import {
 interface EpicLinkFixture {
   desc: string;
   mode: "epic_links";
-  openers: number[];
   invocations: ClassifierInvocation[];
-  windows: [number, number][];
   expected: { kind: string; target: string }[];
 }
 
@@ -47,11 +43,7 @@ interface JobLinkFixture {
   desc: string;
   mode: "job_links";
   epic_id: string;
-  sessions: Record<
-    string,
-    { openers: number[]; invocations: ClassifierInvocation[] }
-  >;
-  windows_by_session: Record<string, [number, number][]>;
+  sessions: Record<string, { invocations: ClassifierInvocation[] }>;
   expected: { kind: string; job_id: string }[];
 }
 
@@ -95,39 +87,13 @@ test("fixture file loads with the expected scale", () => {
 });
 
 // ---------------------------------------------------------------------------
-// computePlanWindows — cross-check against the Python's window output.
+// deriveEpicLinks — every epic_links fixture, byte-for-byte.
 // ---------------------------------------------------------------------------
 
-describe("computePlanWindows parity", () => {
+describe("deriveEpicLinks", () => {
   for (const f of EPIC_FIXTURES) {
     test(f.desc, () => {
-      const got = computePlanWindows(f.openers);
-      // PlanWindow is a readonly tuple — translate to plain array pairs for
-      // deep-equality matching against the Python's seconds-shaped output.
-      const gotPlain = got.map(([s, e]) => [s, e]);
-      expect(gotPlain).toEqual(f.windows);
-    });
-  }
-});
-
-test("computePlanWindows MAX_TS_SENTINEL matches Number.MAX_SAFE_INTEGER", () => {
-  // Re-fold determinism + SQLite-no-infinity invariant — guard against any
-  // future refactor pinning MAX_TS_SENTINEL to JS Infinity.
-  expect(MAX_TS_SENTINEL).toBe(Number.MAX_SAFE_INTEGER);
-});
-
-// ---------------------------------------------------------------------------
-// deriveEpicLinks parity — every epic_links fixture, byte-for-byte.
-// ---------------------------------------------------------------------------
-
-describe("deriveEpicLinks parity", () => {
-  for (const f of EPIC_FIXTURES) {
-    test(f.desc, () => {
-      // Build the readonly PlanWindow[] shape the TS API expects.
-      const windows: PlanWindow[] = f.windows.map(
-        ([s, e]) => [s, e] as PlanWindow,
-      );
-      const got = deriveEpicLinks(f.invocations, windows);
+      const got = deriveEpicLinks(f.invocations);
       expect(got).toEqual(
         f.expected as { kind: "creator" | "refiner"; target: string }[],
       );
@@ -136,26 +102,17 @@ describe("deriveEpicLinks parity", () => {
 });
 
 // ---------------------------------------------------------------------------
-// deriveJobLinks parity — every job_links fixture, byte-for-byte.
+// deriveJobLinks — every job_links fixture, byte-for-byte.
 // ---------------------------------------------------------------------------
 
-describe("deriveJobLinks parity", () => {
+describe("deriveJobLinks", () => {
   for (const f of JOB_FIXTURES) {
     test(f.desc, () => {
       const invocationsBySession = new Map<string, ClassifierInvocation[]>();
-      const windowsBySession = new Map<string, PlanWindow[]>();
       for (const [jobId, payload] of Object.entries(f.sessions)) {
         invocationsBySession.set(jobId, payload.invocations);
-        const wins = (f.windows_by_session[jobId] ?? []).map(
-          ([s, e]) => [s, e] as PlanWindow,
-        );
-        windowsBySession.set(jobId, wins);
       }
-      const got = deriveJobLinks(
-        invocationsBySession,
-        windowsBySession,
-        f.epic_id,
-      );
+      const got = deriveJobLinks(invocationsBySession, f.epic_id);
       expect(got).toEqual(
         f.expected as { kind: "creator" | "refiner"; job_id: string }[],
       );
@@ -164,57 +121,56 @@ describe("deriveJobLinks parity", () => {
 });
 
 // ---------------------------------------------------------------------------
-// Targeted unit-tests — defensive behaviour that the Python parity doesn't
-// reach (TS port adds explicit non-finite/NaN guards).
+// Targeted unit-tests — defensive behaviour and the windowless invariants the
+// fixture cases anchor.
 // ---------------------------------------------------------------------------
 
-test("computePlanWindows drops non-finite opener timestamps", () => {
-  expect(
-    computePlanWindows([Number.NaN, Number.POSITIVE_INFINITY, 100]),
-  ).toEqual([[100, MAX_TS_SENTINEL]]);
-});
-
-test("deriveEpicLinks returns empty on zero windows", () => {
-  const got = deriveEpicLinks(
-    [
-      {
-        ts: 100,
-        op: "create",
-        target: "fn-1-foo",
-        epic_id: "fn-1-foo",
-        subject_present: true,
-      },
-    ],
-    [],
-  );
-  expect(got).toEqual([]);
+test("deriveEpicLinks returns empty on no invocations", () => {
+  expect(deriveEpicLinks([])).toEqual([]);
 });
 
 test("deriveJobLinks returns empty on zero-session map", () => {
-  const got = deriveJobLinks(new Map(), new Map(), "fn-1-foo");
-  expect(got).toEqual([]);
+  expect(deriveJobLinks(new Map(), "fn-1-foo")).toEqual([]);
+});
+
+test("deriveEpicLinks drops malformed / non-finite-ts entries without throwing", () => {
+  const got = deriveEpicLinks([
+    // biome-ignore lint/suspicious/noExplicitAny: deliberately malformed input.
+    null as any,
+    {
+      ts: Number.NaN,
+      op: "create",
+      target: "fn-1-foo",
+      epic_id: "fn-1-foo",
+      subject_present: true,
+    },
+    {
+      ts: 100,
+      op: "create",
+      target: "fn-2-bar",
+      epic_id: "fn-2-bar",
+      subject_present: true,
+    },
+  ]);
+  expect(got).toEqual([{ kind: "creator", target: "fn-2-bar" }]);
 });
 
 // ---------------------------------------------------------------------------
-// Keeper-only divergence: scaffold-as-creator. The Python audit layer does
-// NOT recognize scaffold; keeper's classifier is strictly richer because
-// scaffold is the canonical epic-create path on this codebase.
+// Scaffold-as-creator. Scaffold is the canonical epic-create path on this
+// codebase (zero `epic-create` events have ever fired), so it is recognized as
+// a creator alongside `create`.
 // ---------------------------------------------------------------------------
 
 test("deriveEpicLinks accepts op='scaffold' with an epic-shaped target as a creator", () => {
-  const windows: PlanWindow[] = [[100, MAX_TS_SENTINEL]];
-  const got = deriveEpicLinks(
-    [
-      {
-        ts: 150,
-        op: "scaffold",
-        target: "fn-606-envelope-driven-planctl-op-deriver",
-        epic_id: "fn-606-envelope-driven-planctl-op-deriver",
-        subject_present: true,
-      },
-    ],
-    windows,
-  );
+  const got = deriveEpicLinks([
+    {
+      ts: 150,
+      op: "scaffold",
+      target: "fn-606-envelope-driven-planctl-op-deriver",
+      epic_id: "fn-606-envelope-driven-planctl-op-deriver",
+      subject_present: true,
+    },
+  ]);
   expect(got).toEqual([
     {
       kind: "creator",
@@ -223,37 +179,92 @@ test("deriveEpicLinks accepts op='scaffold' with an epic-shaped target as a crea
   ]);
 });
 
-test("deriveEpicLinks: per-window suppression holds when both create and scaffold fire in the same window", () => {
-  // Within one window, a creator-of-X (whether `create` or `scaffold`)
-  // suppresses any same-window refiner-of-X. Both creator entries
-  // dedupe at the (kind, target) seen-set; only one edge survives.
-  const windows: PlanWindow[] = [[100, MAX_TS_SENTINEL]];
-  const got = deriveEpicLinks(
-    [
-      {
-        ts: 110,
-        op: "scaffold",
-        target: "fn-1-foo",
-        epic_id: "fn-1-foo",
-        subject_present: true,
-      },
-      {
-        ts: 120,
-        op: "epic-set-title",
-        target: "fn-1-foo",
-        epic_id: "fn-1-foo",
-        subject_present: true,
-      },
-      {
-        ts: 130,
-        op: "create",
-        target: "fn-1-foo",
-        epic_id: "fn-1-foo",
-        subject_present: true,
-      },
-    ],
-    windows,
-  );
-  // One creator edge — refiner-of-fn-1-foo is suppressed in the same window.
+test("deriveEpicLinks: per-session suppression holds when both create and scaffold fire", () => {
+  // A creator-of-X (whether `create` or `scaffold`) suppresses a later
+  // refiner-of-X in the same session. Both creator entries dedupe at the
+  // (kind, target) seen-set; only one creator edge survives.
+  const got = deriveEpicLinks([
+    {
+      ts: 110,
+      op: "scaffold",
+      target: "fn-1-foo",
+      epic_id: "fn-1-foo",
+      subject_present: true,
+    },
+    {
+      ts: 120,
+      op: "set-title",
+      target: "fn-1-foo",
+      epic_id: "fn-1-foo",
+      subject_present: true,
+    },
+    {
+      ts: 130,
+      op: "create",
+      target: "fn-1-foo",
+      epic_id: "fn-1-foo",
+      subject_present: true,
+    },
+  ]);
   expect(got).toEqual([{ kind: "creator", target: "fn-1-foo" }]);
+});
+
+// ---------------------------------------------------------------------------
+// Total-order sort: a `ts`-tie between a creator and a refiner of the same
+// epic resolves DETERMINISTICALLY via the `event_id` tiebreak, regardless of
+// the input array order. Locks the re-fold-determinism requirement.
+// ---------------------------------------------------------------------------
+
+test("deriveEpicLinks: same-ts create vs set-title resolves deterministically by event_id (both array orders agree)", () => {
+  const create: ClassifierInvocation = {
+    ts: 100,
+    event_id: 1,
+    op: "create",
+    target: "fn-1-foo",
+    epic_id: "fn-1-foo",
+    subject_present: true,
+  };
+  const setTitle: ClassifierInvocation = {
+    ts: 100,
+    event_id: 2,
+    op: "set-title",
+    target: "fn-1-foo",
+    epic_id: "fn-1-foo",
+    subject_present: true,
+  };
+  // event_id=1 (create) sorts before event_id=2 (set-title) on the ts-tie, so
+  // the creator fires first and suppresses the refiner — in BOTH input orders.
+  const forward = deriveEpicLinks([create, setTitle]);
+  const reversed = deriveEpicLinks([setTitle, create]);
+  expect(forward).toEqual([{ kind: "creator", target: "fn-1-foo" }]);
+  expect(reversed).toEqual(forward);
+});
+
+test("deriveJobLinks: same-ts tie resolves deterministically by event_id across array orders", () => {
+  const create: ClassifierInvocation = {
+    ts: 100,
+    event_id: 1,
+    op: "create",
+    target: "fn-1-foo",
+    epic_id: "fn-1-foo",
+    subject_present: true,
+  };
+  const setTitle: ClassifierInvocation = {
+    ts: 100,
+    event_id: 2,
+    op: "set-title",
+    target: "fn-1-foo",
+    epic_id: "fn-1-foo",
+    subject_present: true,
+  };
+  const forward = deriveJobLinks(
+    new Map([["sess-a", [create, setTitle]]]),
+    "fn-1-foo",
+  );
+  const reversed = deriveJobLinks(
+    new Map([["sess-a", [setTitle, create]]]),
+    "fn-1-foo",
+  );
+  expect(forward).toEqual([{ kind: "creator", job_id: "sess-a" }]);
+  expect(reversed).toEqual(forward);
 });

@@ -322,6 +322,18 @@ from pathlib import Path
 # cursor rewind, re-fold byte-identical. keeper-py reads neither the new table nor
 # ``dispatch_failures`` (the TUI subscribes over the socket), so no reader logic
 # changes — only the version whitelist gains 76.
+#
+# v77 (fn-856 task .1) ungates the plan-link classifier from the ``/plan:plan``
+# time-window model: every epic-mutating op now links as ``creator`` / ``refiner``
+# regardless of timing (only the read-only gate survives), repopulating
+# ``epics.job_links`` + ``created_by_closer_of`` for the closers, pre-first-opener
+# scaffolds, and ``/plan:defer`` / direct-CLI edits the window gate silently
+# dropped. Because the fold output changed, the migration REWINDS the cursor and
+# wipes the canonical projection list (same set as v42) so the corrected derive
+# repopulates; the classifier's ``(ts, event_id)`` total-order sort keeps a
+# from-scratch re-fold byte-identical. keeper-py reads ``jobs`` / ``epics`` over
+# the socket, not these projection internals, so no reader logic changes — only
+# the version whitelist gains 77.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -370,6 +382,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         74,
         75,
         76,
+        77,
     }
 )
 

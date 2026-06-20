@@ -861,10 +861,11 @@ test("a job with no plan_ref does not create an epic row (no fan-out)", () => {
 // ---------------------------------------------------------------------------
 
 /**
- * Insert a `PreToolUse:Skill` window-opener event for `/plan:plan`. The
- * classifier's locked gate (`PreToolUse + skill_name='plan:plan'`) is what
- * the reducer's `syncPlanctlLinks` reads to compute window starts; slash-
- * command `UserPromptSubmit` rows are NOT openers (they'd double-fire).
+ * Insert a `PreToolUse:Skill` `/plan:plan` event. Schema v77 ungated the
+ * classifier from the `/plan:plan` time-window model, so this event is now a
+ * HARMLESS no-op for linking — every epic-mutating op links regardless of
+ * `/plan:plan` timing. It is kept in the tests that still call it only to
+ * mirror a realistic event log; new tests need not insert it at all.
  */
 function planPlanOpener(sessionId: string, ts?: number): number {
   return insertEvent({
@@ -1009,9 +1010,13 @@ test("syncPlanctlLinks: single-session single-window one creator emits creator e
   ]);
 });
 
-test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epic emits both edges", () => {
+test("syncPlanctlLinks: single-session create-then-refine same epic emits ONE creator edge (per-session suppression)", () => {
+  // Windowless (schema v77): a session that creates an epic and later refines
+  // the SAME epic emits exactly one `creator` edge — the creator-of-X
+  // suppresses the later refiner-of-X within the session. The `/plan:plan`
+  // openers no longer matter; they are harmless no-ops kept only to mirror a
+  // realistic event log.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-cr" });
-  // Window 1 — creator.
   planPlanOpener("sess-cr");
   planctlEvent({
     sessionId: "sess-cr",
@@ -1020,7 +1025,6 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
     epicId: "fn-2-foo",
     subjectPresent: true,
   });
-  // Window 2 — refiner on the same epic.
   planPlanOpener("sess-cr");
   planctlEvent({
     sessionId: "sess-cr",
@@ -1030,26 +1034,13 @@ test("syncPlanctlLinks: single-session two windows creator-then-refiner-same-epi
     subjectPresent: true,
   });
   drainAll();
-  // Both edges emitted; sort is (kind, target) ASC.
+  // One creator edge; the same-epic refiner is suppressed.
   expect(getEpicLinks("sess-cr")).toEqual([
     { kind: "creator", target: "fn-2-foo" },
-    { kind: "refiner", target: "fn-2-foo" },
   ]);
   expect(getJobLinks("fn-2-foo")).toEqual([
     {
       kind: "creator",
-      job_id: "sess-cr",
-      title: null,
-      state: "stopped",
-      last_api_error_at: null,
-      last_api_error_kind: null,
-      last_input_request_at: null,
-      last_input_request_kind: null,
-      last_permission_prompt_at: null,
-      last_permission_prompt_kind: null,
-    },
-    {
-      kind: "refiner",
       job_id: "sess-cr",
       title: null,
       state: "stopped",
@@ -1150,26 +1141,25 @@ test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_link
   // every other session's edge on that epic. This test fails if the sweep is
   // short-circuited to same-session only.
   //
-  // The drop mechanism here is the classifier's per-window
+  // The drop mechanism here is the classifier's per-session
   // creator-suppression rule (see `deriveEpicLinks`): a creator-of-X
-  // encountered earlier in a window's ts-ASC order suppresses any later
-  // refiner-of-X in the same window. We exercise it by backdating the
+  // encountered earlier in the `(ts, event_id)` order suppresses any later
+  // refiner-of-X in the SAME session. We exercise it by backdating the
   // follow-up `epic-create` (ts 100) so on re-classification it lands BEFORE
-  // the existing `epic-set-title` (ts 110) inside window 1. Synthetic
-  // ordering — what matters here is the cross-session fan-out behaviour, not
-  // the realism of the wall-clock interleave.
+  // the existing `epic-set-title` (ts 110). Synthetic ordering — what matters
+  // here is the cross-session fan-out behaviour, not the realism of the
+  // wall-clock interleave.
   //
-  // Scenario:
-  //   1. Session A opens a /plan:plan window (t=90) and refines epic X via
-  //      `epic-set-title` at t=110. A's epic_links = [refiner:X];
-  //      X's job_links = [refiner:A].
-  //   2. Session B opens a /plan:plan window (t=200) and refines epic X via
-  //      `epic-set-title` at t=210. The cross-session sweep from B's fold
-  //      adds B → X's job_links = [refiner:A, refiner:B].
-  //   3. Session A folds a backdated `epic-create` on X at t=100 — inside
-  //      A's window 1 but BEFORE the refiner. The classifier emits creator-X
-  //      first, which suppresses the now-later refiner-X. A's epic_links
-  //      collapse to [creator:X] — the refiner edge is dropped.
+  // Scenario (windowless — the `/plan:plan` openers are harmless no-ops):
+  //   1. Session A refines epic X via `epic-set-title` at t=110. A's
+  //      epic_links = [refiner:X]; X's job_links = [refiner:A].
+  //   2. Session B refines epic X via `epic-set-title` at t=210. The
+  //      cross-session sweep from B's fold adds B → X's job_links =
+  //      [refiner:A, refiner:B].
+  //   3. Session A folds a backdated `epic-create` on X at t=100 — BEFORE the
+  //      refiner. The classifier emits creator-X first, which suppresses the
+  //      now-later refiner-X. A's epic_links collapse to [creator:X] — the
+  //      refiner edge is dropped.
   //   4. The fan-out's cross-session sweep MUST re-derive X's job_links over
   //      both A and B — yielding [creator:A, refiner:B]. A short-circuited
   //      (same-session-only) sweep would yield [creator:A] only, silently
@@ -1969,6 +1959,84 @@ test("syncPlanctlLinks v29: plain epic with no closer ancestry → created_by_cl
   expect(getEpicSortFields("fn-1-plain")).toEqual({
     created_by_closer_of: null,
     sort_path: "000001",
+  });
+});
+
+test("syncPlanctlLinks v77: closer session with NO /plan:plan opener produces the creator edge AND populates created_by_closer_of", () => {
+  // The headline windowless win (fn-856). A `close::fn-3-parent` closer
+  // session scaffolds its follow-up epic fn-9-followup WITHOUT ever invoking
+  // `/plan:plan` — exactly the population the time-window gate silently
+  // dropped (closers scaffold via close-finalize, never opening a window). With
+  // the gate gone, the scaffold links as a `creator`, and `created_by_closer_of`
+  // resolves to the closer's plan_ref. NOTE: no `planPlanOpener` call — proving
+  // the edge no longer depends on a window.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-closer-noopener",
+    spawn_name: "close::fn-3-parent",
+  });
+  // Seed the parent epic so its sort_path resolves first.
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-3-parent",
+    data: JSON.stringify({
+      epic_number: 3,
+      title: "Parent",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // The closer scaffolds its follow-up — no /plan:plan window in this session.
+  planctlEvent({
+    sessionId: "sess-closer-noopener",
+    op: "epic-scaffold",
+    target: "fn-9-followup",
+    epicId: "fn-9-followup",
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: "fn-9-followup",
+    data: JSON.stringify({
+      epic_number: 9,
+      title: "Follow-up",
+      project_dir: "/repo",
+      status: "open",
+    }),
+  });
+  // One more mutation so syncPlanctlLinks re-runs with epic_number known.
+  planctlEvent({
+    sessionId: "sess-closer-noopener",
+    op: "epic-set-title",
+    target: "fn-9-followup",
+    epicId: "fn-9-followup",
+    subjectPresent: true,
+  });
+  drainAll();
+  // The creator edge exists despite zero `/plan:plan` openers.
+  expect(getEpicLinks("sess-closer-noopener")).toEqual([
+    { kind: "creator", target: "fn-9-followup" },
+  ]);
+  expect(getJobLinks("fn-9-followup")).toEqual([
+    {
+      kind: "creator",
+      job_id: "sess-closer-noopener",
+      // Enriched off the closer's jobs row, whose title is the spawn name.
+      title: "close::fn-3-parent",
+      state: "stopped",
+      last_api_error_at: null,
+      last_api_error_kind: null,
+      last_input_request_at: null,
+      last_input_request_kind: null,
+      last_permission_prompt_at: null,
+      last_permission_prompt_kind: null,
+    },
+  ]);
+  // The `[slotted-after-closer]` pill source — populated because the closer
+  // finally emits a creator edge.
+  expect(getEpicSortFields("fn-9-followup")).toEqual({
+    created_by_closer_of: "fn-3-parent",
+    sort_path: "000003.000009",
   });
 });
 
@@ -2995,8 +3063,10 @@ test("syncPlanctlLinks v30: multiple queue-jumped roots sort FIFO by epic_number
 });
 
 test("syncPlanctlLinks: re-fold determinism (rewind + DELETE + drain reproduces byte-identical projection)", () => {
-  // Drive a full session: two windows, a creator, a refiner, plus a
-  // cross-session refiner so both projections accumulate.
+  // Drive a full session: a creator + a same-session task-create (the refiner
+  // is suppressed by per-session creator-suppression), plus a cross-session
+  // refiner so both projections accumulate. The re-fold must reproduce the same
+  // rows byte-for-byte regardless of the suppression outcome.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-A-det" });
   planPlanOpener("sess-A-det");
   planctlEvent({

@@ -1,108 +1,69 @@
 /**
- * Pure TypeScript port of jobctl's `/plan:plan`-windowed creator/refiner
- * classifier — the load-bearing piece of fn-598. Three exports, all pure
- * (no I/O, no clock, no DB access):
+ * Windowless creator/refiner classifier for keeper's plan-link projection.
+ * Two exports, both pure (no I/O, no clock, no DB access):
  *
- * - {@link computePlanWindows} — derive half-open `[start, next_start)`
- *   windows from a sorted list of `/plan:plan` opener timestamps. The last
- *   window's upper bound is `Number.MAX_SAFE_INTEGER` (NEVER JS `Infinity`
- *   — SQLite has no infinity type and bun:sqlite would coerce to NULL if
- *   ever persisted; see the epic's "Best practices" callout).
- * - {@link deriveEpicLinks} — classify one session's planctl invocations
- *   against its `/plan:plan` windows; return a deduped, sorted list of
- *   `{kind: "creator" | "refiner", target: <epic_id>}` entries.
+ * - {@link deriveEpicLinks} — classify one session's planctl invocations and
+ *   return a deduped, sorted list of `{kind: "creator" | "refiner", target:
+ *   <epic_id>}` entries. Every epic-mutating op links regardless of time; the
+ *   read-only (`subject_present === false`) gate is the only skip.
  * - {@link deriveJobLinks} — symmetric per-epic view: walk every session's
- *   invocations + windows, return a deduped, sorted list of
- *   `{kind, job_id}` entries for the target epic.
+ *   invocations, return a deduped, sorted list of `{kind, job_id}` entries
+ *   for the target epic.
  *
- * The Python source of truth lives at
- * `apps/cli_common/cli_common/planctl_invocations.py:304-756`
- * (`_compute_plan_windows`, `derive_epic_links`, `derive_job_links`).
+ * **Two-kind taxonomy.** `creator` = op in {create, scaffold} with an
+ * epic-shaped `parsePlanRef(target).kind === 'epic'`; otherwise `refiner` if
+ * the op names an epic (`epic_id` resolves). `scaffold` is keeper's canonical
+ * epic-create path (zero `epic-create` events have ever fired on this
+ * codebase); `/plan:defer` rides the scaffold→creator path, and
+ * `/plan:next` / queue-jump / direct-CLI edits land as refiners. No other
+ * kinds.
  *
- * **Unit divergence from the Python.** The Python compares `int ms`
- * throughout (skill invocations are stored as `int(seconds * 1000)`, and
- * planctl invocations are float seconds — converted via `int(raw_ts * 1000)`
- * before window comparison). The TS port compares `seconds` throughout —
- * keeper's `events.ts` is REAL Unix epoch seconds (see
- * `src/types.ts`: "ts is unix-epoch seconds as a REAL"), and we never
- * cross-mix with skill_invocations storage. The golden-fixture generator
- * (`scripts/gen-plan-classifier-fixture.py`) emits Python output as seconds
- * (by passing `ts_ms / 1000` at fixture-emit time) so the byte-identical
- * parity test still holds.
+ * **Per-session creator-suppression.** A session that BOTH scaffolds AND later
+ * refines the same epic emits ONE `creator` edge, not creator+refiner — the
+ * suppression set is keyed on target/epic only (NOT on a time window).
+ * Cross-session edges are NEVER suppressed: two different sessions touching the
+ * same epic keep their distinct `job_id`s.
  *
- * **Window opener input shape.** The locked decision (epic spec, "Approach"):
- * a window opens on `PreToolUse:Skill AND skill_name='plan:plan'` ONLY —
- * `slash_command='/plan:plan'` UserPromptSubmit rows are NOT openers (they'd
- * double-fire on slash-typed invocations). This module accepts a list of
- * opener `ts` values; the upstream reducer fan-out decides which event rows
- * feed in. We do not reach into the event log here.
- *
- * **isEpicId rule.** Mirrors jobctl by reusing {@link parsePlanRef} from
- * `src/derivers.ts` — `parsePlanRef(target)?.kind === 'epic'` is the single
- * source of truth (no second copy of the regex). The spawn-name ref shape
- * (see `SPAWN_VERB_REF_RE` in `src/derivers.ts`) and the planctl-target ref
- * shape MUST agree byte-for-byte so a re-fold from scratch reproduces the
- * same epic links.
+ * **isEpicId rule.** Reuses {@link parsePlanRef} from `src/derivers.ts` —
+ * `parsePlanRef(target)?.kind === 'epic'` is the single source of truth (no
+ * second copy of the regex). The spawn-name ref shape (`SPAWN_VERB_REF_RE` in
+ * `src/derivers.ts`) and the planctl-target ref shape MUST agree byte-for-byte
+ * so a re-fold from scratch reproduces the same epic links.
  *
  * **Re-fold determinism.** Every function here is a pure function of its
- * arguments — no I/O, no mutation of inputs, no time/clock reads. The
- * reducer's `syncPlanctlLinks` fan-out calls these from the deduped UNION of
- * `planctl_op` stdout-scrape events AND durable `Commit`-event trailer facts
+ * arguments — no I/O, no mutation of inputs, no time/clock reads. Input is
+ * sorted by a TOTAL ORDER `(ts ASC, event_id ASC)` before classification, so
+ * the per-session creator-suppression outcome does not depend on the wire order
+ * of `ts`-ties (two same-`ts` ops of one epic resolve identically every fold).
+ * The reducer's `syncPlanctlLinks` fan-out calls these from the deduped UNION
+ * of `planctl_op` stdout-scrape events AND durable `Commit`-event trailer facts
  * (`Planctl-Op` / `Planctl-Target` / `Session-Id`, epic fn-695) — the
- * classifier is agnostic to which channel an invocation came from; it sees
- * the merged invocation list. A from-scratch re-fold must reproduce
- * byte-identical `epic_links` / `job_links` arrays (CLAUDE.md
- * "byte-identical re-fold" invariant); pre-fn-695 `Commit` events lack the
- * trailer fields so the commit channel is a no-op over the historical log.
+ * classifier is agnostic to which channel an invocation came from; it sees the
+ * merged invocation list. A from-scratch re-fold must reproduce byte-identical
+ * `epic_links` / `job_links` arrays (CLAUDE.md "byte-identical re-fold"
+ * invariant); pre-fn-695 `Commit` events lack the trailer fields so the commit
+ * channel is a no-op over the historical log.
  */
 
 import { parsePlanRef } from "./derivers";
 
 /**
- * Half-open window pair `[start, end)` where the upper bound on the last
- * window is {@link MAX_TS_SENTINEL}.
- */
-export type PlanWindow = readonly [start: number, end: number];
-
-/**
- * Sentinel upper bound for the final `/plan:plan` window. Translated from
- * the Python's `math.inf`; we use {@link Number.MAX_SAFE_INTEGER} so any
- * downstream consumer that persists the window into SQLite via bun:sqlite
- * gets a real integer (JS `Infinity` would coerce to NULL — see CLAUDE.md
- * "schema defaults match the zero-event projection" and the epic's Best
- * practices callout on this exact point).
- */
-export const MAX_TS_SENTINEL = Number.MAX_SAFE_INTEGER;
-
-/**
  * Normalize a keeper-side raw planctl CLI verb (`epic-create`, `task-create`,
  * `epic-set-title`, `task-set-description`) into the namespace-stripped form
- * the classifier was ported against (`create`, `set-title`, `set-description`).
+ * the classifier reads (`create`, `set-title`, `set-description`).
  *
  * Keeper's hook stamps the raw CLI verb on the `events.planctl_op` column
- * (see {@link import("./derivers").extractPlanctlInvocation}); jobctl's
- * Python audit layer pre-normalizes by stripping the `epic-` / `task-`
- * prefix before passing rows to `derive_epic_links` / `derive_job_links`.
- * Both fan-out call sites (the live reducer's `syncPlanctlLinks` and the
- * v13→v14 migration backfill in `src/db.ts`) MUST use this same helper so
- * the migration's output is byte-identical to what the live reducer
- * produces — without that, a re-fold from scratch would diverge from a
- * migrated DB and break the "byte-identical re-fold" invariant.
+ * (see {@link import("./derivers").extractPlanctlInvocation}). Both fan-out
+ * call sites (the live reducer's `syncPlanctlLinks` and the frozen migration
+ * backfills in `src/db.ts`) MUST use this same helper so the migration's
+ * output is byte-identical to what the live reducer produces — without that, a
+ * re-fold from scratch would diverge from a migrated DB and break the
+ * "byte-identical re-fold" invariant.
  *
- * Pure function of the input. NEVER throws. Unknown / non-prefixed verbs
- * pass through unchanged — `cat` stays `cat`, `done` stays `done`,
- * `scaffold` stays `scaffold`, `close` stays `close`, etc. — so a future
- * planctl CLI verb that doesn't follow the `<kind>-<op>` shape rides through
- * deterministically.
- *
- * **Deliberate TS-only divergence from the Python reference.** Keeper's
- * classifier ({@link deriveEpicLinks}) recognizes `op === "scaffold"` as a
- * creator alongside `op === "create"`, because scaffold is the canonical
- * epic-creation path on this codebase (zero `epic-create` events have ever
- * fired). The Python `apps/cli_common/cli_common/planctl_invocations.py`
- * does NOT recognize `scaffold` as a creator — its audit layer is unaffected
- * by this change. Keeper's view is strictly richer; the parity-fixture tests
- * remain green because none of the captured cases drive a scaffold edge.
+ * Pure function of the input. NEVER throws. Unknown / non-prefixed verbs pass
+ * through unchanged — `cat` stays `cat`, `done` stays `done`, `scaffold` stays
+ * `scaffold`, `close` stays `close`, etc. — so a future planctl CLI verb that
+ * doesn't follow the `<kind>-<op>` shape rides through deterministically.
  */
 export function normalizePlanctlOp(rawOp: string): string {
   if (rawOp.startsWith("epic-")) {
@@ -115,15 +76,20 @@ export function normalizePlanctlOp(rawOp: string): string {
 }
 
 /**
- * One classifier-input invocation entry. Mirrors the subset of jobctl's
- * row shape that the classifier reads — `ts`, `op`, `target`, `epic_id`,
- * `subject_present`. The hook stamps these onto the `events` row via
+ * One classifier-input invocation entry. The hook stamps `ts`, `op`, `target`,
+ * `epic_id`, `subject_present` onto the `events` row via
  * {@link import("./derivers").extractPlanctlInvocation}; the reducer's
  * per-session re-derive loop loads them into this shape via a partial-index
  * scan.
  *
- * `subject_present === false` mirrors jobctl's `subject is None` readonly
- * gate (see {@link deriveEpicLinks}).
+ * `event_id` is the source-event id (the `events.id` row, or the
+ * `commit_trailer_facts.event_id` for a commit-channel fact). It is the
+ * tiebreaker that makes the classifier's sort a TOTAL ORDER on `ts`-ties —
+ * required for byte-identical re-fold. Absent (`undefined`) inputs sort as 0,
+ * which is harmless for hand-written test cases that never collide on `ts`.
+ *
+ * `subject_present === false` is the read-only gate (mirrors `epics` / `tasks`
+ * / `cat` listing verbs that touch no plan state); such entries are skipped.
  */
 export interface ClassifierInvocation {
   /** Unix epoch seconds (matches `events.ts` REAL). */
@@ -135,6 +101,8 @@ export interface ClassifierInvocation {
   epic_id: string | null;
   /** False for read-only verbs (`epics`, `tasks`, `cat`, etc.); true for mutations. */
   subject_present: boolean;
+  /** Source-event id; the total-order tiebreaker on `ts`-ties. Optional for tests. */
+  event_id?: number;
 }
 
 /**
@@ -162,96 +130,31 @@ export interface JobLink {
 }
 
 /**
- * Derive half-open `[start, next_start)` windows from a list of
- * `/plan:plan` opener timestamps. Mirrors the Python `_compute_plan_windows`
- * at `apps/cli_common/cli_common/planctl_invocations.py:304-363`.
- *
- * - Defensive sort against out-of-order input (Timsort is O(n) on
- *   already-sorted data; cheap on the steady-state path).
- * - Non-finite (`NaN`, `Infinity`, `-Infinity`) timestamps are dropped
- *   defensively; only finite numbers feed in.
- * - Empty input → empty output (no windows, no edges downstream).
- * - The last window's upper bound is {@link MAX_TS_SENTINEL} (NEVER JS
- *   `Infinity` — SQLite has no infinity type).
- *
- * Pure CPU-only. Mutates no inputs.
+ * Total-order comparator on `(ts ASC, event_id ASC)`. The `event_id` tiebreak
+ * makes the order independent of input wire-order on `ts`-ties, so a
+ * from-scratch re-fold over the same deterministic event log reproduces the
+ * same creator-suppression outcome. A missing `event_id` reads as 0.
  */
-export function computePlanWindows(
-  openerTimestamps: readonly number[],
-): PlanWindow[] {
-  const starts: number[] = [];
-  for (const ts of openerTimestamps) {
-    if (typeof ts !== "number") {
-      continue;
-    }
-    if (!Number.isFinite(ts)) {
-      continue;
-    }
-    starts.push(ts);
+function compareInvocations(
+  a: ClassifierInvocation,
+  b: ClassifierInvocation,
+): number {
+  if (a.ts !== b.ts) {
+    return a.ts - b.ts;
   }
-  // Defensive sort — callers should pass ts-ASC but we never trust the wire.
-  starts.sort((a, b) => a - b);
-
-  if (starts.length === 0) {
-    return [];
-  }
-
-  const windows: PlanWindow[] = [];
-  for (let i = 0; i < starts.length; i++) {
-    const start = starts[i] as number;
-    const end =
-      i + 1 < starts.length ? (starts[i + 1] as number) : MAX_TS_SENTINEL;
-    windows.push([start, end]);
-  }
-  return windows;
+  const aid = a.event_id ?? 0;
+  const bid = b.event_id ?? 0;
+  return aid - bid;
 }
 
 /**
- * Classify one session's planctl invocations against its `/plan:plan`
- * windows and return a deduped, sorted list of `{kind, target}` link
- * entries. Mirrors the Python `derive_epic_links` at
- * `apps/cli_common/cli_common/planctl_invocations.py:366-540`.
- *
- * Classification rules (BYTE-FOR-BYTE port of the Python):
- *
- * - `subject_present === false` → ignored (mirrors `subject is None`
- *   readonly gate).
- * - Mutation `ts` strictly before the first window's `start` → ignored.
- * - Mutation `ts` inside a window AND `op === "create"` AND
- *   `isEpicId(target)` → emit `kind: "creator"` for that epic; suppress
- *   any later `refiner` for the same epic in the SAME window
- *   (per-window suppression; cross-window refiner still emits).
- * - Mutation `ts` inside a window AND `epic_id !== null` (and not a
- *   creator edge) → emit `kind: "refiner"` for that epic (subject to
- *   the per-window creator-suppression above).
- * - Mutation with no `epic_id` and no `create`+`isEpicId` match →
- *   ignored.
- *
- * The final list is deduped by `(kind, target)` across all windows, then
- * sorted ASCENDING on the full `(kind, target)` tuple — NEVER on a single
- * field (this matters: `creator` < `refiner` lexicographically, so
- * creators come first, then refiners, each group sorted by target).
- *
- * **Suppression dimensions.** Two structurally-disjoint seen-sets
- * (mirrors Python `seen_links` + `seen_window_creators`):
- * - `seen_links: Set<"kind|target">` — dedup across all windows
- *   (cross-window).
- * - `seen_window_creators: Set<"win_idx|target">` — per-window creator
- *   suppression of refiner. Index-keyed so the same target in two
- *   different windows can still get refiner-then-creator-then-refiner if
- *   the second window opens a fresh creator.
- *
- * Pure CPU-only. Mutates no inputs.
+ * Filter out malformed entries (null/non-object/non-finite `ts`) and sort the
+ * survivors by the total order. NEVER throws — a malformed entry is dropped
+ * defensively so the fold stays safe.
  */
-export function deriveEpicLinks(
+function sortValidInvocations(
   invocations: readonly ClassifierInvocation[],
-  windows: readonly PlanWindow[],
-): EpicLink[] {
-  if (windows.length === 0) {
-    return [];
-  }
-
-  // Defensive sort by ts-ASC — callers should pass sorted, never trust the wire.
+): ClassifierInvocation[] {
   const valid: ClassifierInvocation[] = [];
   for (const e of invocations) {
     if (e == null || typeof e !== "object") {
@@ -262,79 +165,91 @@ export function deriveEpicLinks(
     }
     valid.push(e);
   }
-  valid.sort((a, b) => a.ts - b.ts);
+  valid.sort(compareInvocations);
+  return valid;
+}
+
+/**
+ * Classify one entry into a `(kind, target)` link, or null when it is not an
+ * epic-mutating op. `scaffold` is keeper's canonical epic-create path (the
+ * planctl CLI's `scaffold` verb writes a fresh `.keeper/epics/<id>.json`); it
+ * carries an epic-shaped target and is a creator alongside `create`. A
+ * mutating op that names an epic (via `epic_id`) but is not a create/scaffold
+ * is a refiner. Anything else (read-only, or touching no epic) returns null.
+ */
+function classifyEntry(
+  entry: ClassifierInvocation,
+): { kind: "creator" | "refiner"; target: string } | null {
+  if (typeof entry.op !== "string" || entry.op.length === 0) {
+    return null;
+  }
+  // Read-only / runtime-state-only entries — skip (the only surviving gate).
+  if (entry.subject_present === false) {
+    return null;
+  }
+  if (
+    (entry.op === "create" || entry.op === "scaffold") &&
+    entry.target !== null &&
+    parsePlanRef(entry.target)?.kind === "epic"
+  ) {
+    return { kind: "creator", target: entry.target };
+  }
+  if (entry.epic_id !== null) {
+    return { kind: "refiner", target: entry.epic_id };
+  }
+  return null;
+}
+
+/**
+ * Classify one session's planctl invocations and return a deduped, sorted list
+ * of `{kind, target}` link entries. Every epic-mutating op links regardless of
+ * time — there is no `/plan:plan` window gate.
+ *
+ * Classification rules:
+ *
+ * - `subject_present === false` → ignored (read-only gate).
+ * - `op` in {create, scaffold} with `parsePlanRef(target).kind === 'epic'` →
+ *   `creator` for that epic; suppress any later `refiner` for the SAME epic in
+ *   this session (per-session suppression).
+ * - Any other mutating op naming an epic (`epic_id !== null`) → `refiner` for
+ *   that epic, unless a creator for the same epic already fired this session.
+ * - Mutating op touching no epic → ignored.
+ *
+ * The final list is deduped by `(kind, target)`, then sorted ASCENDING on the
+ * full `(kind, target)` tuple — `creator` < `refiner` lexicographically, so
+ * creators come first, then refiners, each group sorted by target.
+ *
+ * Pure CPU-only. Mutates no inputs.
+ */
+export function deriveEpicLinks(
+  invocations: readonly ClassifierInvocation[],
+): EpicLink[] {
+  const valid = sortValidInvocations(invocations);
 
   const seenLinks = new Set<string>();
-  const seenWindowCreators = new Set<string>();
+  // Per-session creator-of-X suppresses a later refiner-of-X. Keyed on the
+  // target epic only (no time window).
+  const seenCreators = new Set<string>();
   const links: EpicLink[] = [];
 
-  let winIdx = 0;
-  const numWindows = windows.length;
-
   for (const entry of valid) {
-    if (typeof entry.op !== "string" || entry.op.length === 0) {
+    const classified = classifyEntry(entry);
+    if (classified === null) {
       continue;
     }
-    // Readonly / runtime-state-only entries — skip (mirrors Python `subject is None`).
-    if (entry.subject_present === false) {
-      continue;
-    }
+    const { kind, target } = classified;
 
-    const ts = entry.ts;
-
-    // Advance window pointer: mutation belongs to the next window when
-    // ts >= that window's start (half-open [start, next_start)).
-    while (
-      winIdx + 1 < numWindows &&
-      ts >= (windows[winIdx + 1] as PlanWindow)[0]
-    ) {
-      winIdx++;
-    }
-
-    const winStart = (windows[winIdx] as PlanWindow)[0];
-    if (ts < winStart) {
-      // Before the first window — drop.
+    if (kind === "refiner" && seenCreators.has(target)) {
       continue;
     }
 
-    // Classify: creator or refiner?
-    // `scaffold` is keeper's canonical epic-create path (the planctl CLI's
-    // `scaffold` verb writes a fresh `.planctl/epics/<id>.json`); it carries
-    // an epic-shaped target and is treated as a creator alongside `create`.
-    // See {@link normalizePlanctlOp} for the deliberate TS-only divergence
-    // from the Python audit layer.
-    let kind: "creator" | "refiner";
-    let linkTarget: string;
-    if (
-      (entry.op === "create" || entry.op === "scaffold") &&
-      entry.target !== null &&
-      parsePlanRef(entry.target)?.kind === "epic"
-    ) {
-      kind = "creator";
-      linkTarget = entry.target;
-    } else if (entry.epic_id !== null) {
-      kind = "refiner";
-      linkTarget = entry.epic_id;
-    } else {
-      // Mutating op but not touching an epic — skip.
-      continue;
-    }
-
-    // Per-window creator-of-X suppresses refiner-of-X in the same window.
-    // Key is structurally disjoint from seenLinks (window-int prefix vs.
-    // kind-string prefix) so cross-namespace collision is impossible.
-    const windowCreatorKey = `${winIdx} ${linkTarget}`;
-    if (kind === "refiner" && seenWindowCreators.has(windowCreatorKey)) {
-      continue;
-    }
-
-    const linkKey = `${kind} ${linkTarget}`;
+    const linkKey = `${kind} ${target}`;
     if (!seenLinks.has(linkKey)) {
       seenLinks.add(linkKey);
-      links.push({ kind, target: linkTarget });
+      links.push({ kind, target });
     }
     if (kind === "creator") {
-      seenWindowCreators.add(windowCreatorKey);
+      seenCreators.add(target);
     }
   }
 
@@ -350,132 +265,60 @@ export function deriveEpicLinks(
 }
 
 /**
- * Symmetric per-epic view of {@link deriveEpicLinks}: walk every
- * session's invocations + windows and return a deduped, sorted list of
- * `{kind, job_id}` entries that touched the target *epicId*. Mirrors the
- * Python `derive_job_links` at
- * `apps/cli_common/cli_common/planctl_invocations.py:543-746`.
+ * Symmetric per-epic view of {@link deriveEpicLinks}: walk every session's
+ * invocations and return a deduped, sorted list of `{kind, job_id}` entries
+ * that touched the target *epicId*. Every epic-mutating op links regardless of
+ * time — no `/plan:plan` window gate.
  *
- * Classification rules (BYTE-FOR-BYTE port of the Python):
+ * Classification rules (for *epicId* only):
  *
  * - `subject_present === false` → ignored.
- * - Mutation `ts` strictly before the first window's `start` for that
- *   session → ignored.
- * - Mutation `ts` inside a window AND `op === "create"` AND
- *   `isEpicId(target)` AND `target === epicId` → emit `kind: "creator"`
- *   for that session; suppress any later `refiner` for the same epic in
- *   the SAME window.
- * - Mutation `ts` inside a window AND `entry.epic_id === epicId`
- *   (and not a creator) → emit `kind: "refiner"` (subject to suppression).
- * - Mutation that doesn't touch *epicId* at all → ignored.
+ * - `op` in {create, scaffold} with `parsePlanRef(target).kind === 'epic'`
+ *   AND `target === epicId` → emit `creator` for that session; suppress any
+ *   later `refiner` for the same epic in the SAME session.
+ * - `entry.epic_id === epicId` (and not a creator) → emit `refiner` (subject
+ *   to the per-session suppression above).
+ * - Mutation that doesn't touch *epicId* → ignored.
  *
- * Sessions with zero `/plan:plan` invocations (i.e. empty
- * `windowsBySession` entry, or missing entirely) produce no edges.
- *
- * The final list is deduped by `(kind, job_id)` across all sessions,
- * then sorted ASCENDING on the full `(kind, job_id)` tuple.
- *
- * Two structurally-disjoint seen-sets per session (mirrors Python
- * `seen` + `seen_job_creators`):
- * - `seen: Set<"kind|job_id">` — dedup across all sessions (cross-session).
- * - `seenJobCreators: Set<"win_idx|epic_id">` — per-window-per-session
- *   creator suppression of refiner.
- *
- * **Iteration order.** Python 3.7+ dicts preserve insertion order;
- * JavaScript `Map` does too (and `Map.prototype.entries` iterates in
- * insertion order per the ES spec). Sorting on the final
- * `(kind, job_id)` tuple is the only observable ordering, so iteration
- * order of the input map only affects intermediate state (which is
- * collapsed by the dedupe + final sort).
+ * The final list is deduped by `(kind, job_id)` across all sessions, then
+ * sorted ASCENDING on the full `(kind, job_id)` tuple. Cross-session edges are
+ * never suppressed.
  *
  * Pure CPU-only. Mutates no inputs.
  */
 export function deriveJobLinks(
   invocationsBySession: ReadonlyMap<string, readonly ClassifierInvocation[]>,
-  windowsBySession: ReadonlyMap<string, readonly PlanWindow[]>,
   epicId: string,
 ): JobLink[] {
   const seen = new Set<string>();
   const links: JobLink[] = [];
 
   for (const [jobId, invocations] of invocationsBySession) {
-    const windows = windowsBySession.get(jobId);
-    if (windows === undefined || windows.length === 0) {
-      // No /plan:plan windows for this session — no edges.
-      continue;
-    }
-
-    // Defensive sort by ts-ASC.
-    const valid: ClassifierInvocation[] = [];
-    for (const e of invocations) {
-      if (e == null || typeof e !== "object") {
-        continue;
-      }
-      if (typeof e.ts !== "number" || !Number.isFinite(e.ts)) {
-        continue;
-      }
-      valid.push(e);
-    }
-    valid.sort((a, b) => a.ts - b.ts);
-
-    let winIdx = 0;
-    const numWindows = windows.length;
-    const seenJobCreators = new Set<string>();
+    const valid = sortValidInvocations(invocations);
+    // Per-session creator-of-epicId suppresses a later refiner-of-epicId.
+    let seenCreator = false;
 
     for (const entry of valid) {
-      if (typeof entry.op !== "string" || entry.op.length === 0) {
+      const classified = classifyEntry(entry);
+      if (classified === null) {
         continue;
       }
-      if (entry.subject_present === false) {
+      // Only edges for the queried epic count toward this session's links.
+      if (classified.target !== epicId) {
         continue;
       }
-
-      const ts = entry.ts;
-
-      while (
-        winIdx + 1 < numWindows &&
-        ts >= (windows[winIdx + 1] as PlanWindow)[0]
-      ) {
-        winIdx++;
-      }
-
-      const winStart = (windows[winIdx] as PlanWindow)[0];
-      if (ts < winStart) {
+      const kind = classified.kind;
+      if (kind === "refiner" && seenCreator) {
         continue;
       }
 
-      // Classify for this epic only. `scaffold` is keeper's canonical
-      // epic-create path (zero `epic-create` events have ever fired on this
-      // codebase); treated as a creator alongside `create`, symmetric with
-      // the {@link deriveEpicLinks} predicate. Deliberate TS-only
-      // divergence from the Python audit layer.
-      let kind: "creator" | "refiner";
-      if (
-        (entry.op === "create" || entry.op === "scaffold") &&
-        entry.target !== null &&
-        parsePlanRef(entry.target)?.kind === "epic" &&
-        entry.target === epicId
-      ) {
-        kind = "creator";
-      } else if (entry.epic_id === epicId) {
-        // Suppress refiner if creator edge already emitted in this window.
-        const windowCreatorKey = `${winIdx} ${epicId}`;
-        if (seenJobCreators.has(windowCreatorKey)) {
-          continue;
-        }
-        kind = "refiner";
-      } else {
-        // Mutating op but not for this epic — skip.
-        continue;
-      }
-
-      const key = `${kind} ${jobId}`;
+      const key = `${kind} ${jobId}`;
       if (!seen.has(key)) {
         seen.add(key);
         links.push({ kind, job_id: jobId });
       }
       if (kind === "creator") {
-        seenJobCreators.add(`${winIdx} ${epicId}`);
+        seenCreator = true;
       }
     }
   }

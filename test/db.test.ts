@@ -838,13 +838,15 @@ test("v73→v74 shed: relocated shed-class mutation_path captured from event_blo
   expect(blobsGone).toBe(true);
 });
 
-test("v74→v75 source rename: stored file_attributions source='planctl' rows migrate to 'plan', others untouched", () => {
-  // The fn-831 producer-flip companion: minting now yields `source='plan'`, so
-  // the migration rewrites every pre-flip stored `source='planctl'` row to
-  // `'plan'` — without it the projection and a from-scratch re-fold would
-  // disagree. Build a current DB, insert one planctl row + one tool row, rewind
-  // to v74, and re-migrate. The planctl row flips to 'plan'; the tool row and
-  // its other columns are untouched; idempotent (a re-open finds nothing left).
+test("v74→v75 source rename then v77 rewind: file_attributions is wiped (no surviving 'planctl' or 'plan' seed rows)", () => {
+  // The fn-831 producer-flip companion (v74→v75) rewrites stored
+  // `source='planctl'` rows to `'plan'`. As of v77 (fn-856) the migration ALSO
+  // rewinds the cursor and wipes the canonical projection list, which includes
+  // `file_attributions` — so a seeded row (with no backing event to re-fold it)
+  // does not survive to the migrated end state. The v74→v75 rewrite step still
+  // runs in-ladder; its row-level effect is simply overwritten by the later
+  // wipe. Build a current DB, insert one planctl row + one tool row, rewind to
+  // v74, re-migrate, and confirm the table is empty + version stamped current.
   {
     const { db } = openDb(dbPath);
     db.run(
@@ -863,45 +865,24 @@ test("v74→v75 source rename: stored file_attributions source='planctl' rows mi
     db.close();
   }
 
-  // Re-migrate 74→75: rewrites the 'planctl' row's source to 'plan'.
+  // Re-migrate 74→current: the v77 rewind wipes file_attributions.
   const { db } = openDb(dbPath);
   const ver = (
     db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as {
       value: string;
     }
   ).value;
-  const planRow = db
-    .prepare(
-      "SELECT source, op, last_mutation_at, last_event_id FROM file_attributions WHERE file_path = ?",
-    )
-    .get(".planctl/epics/fn-1.json") as {
-    source: string;
-    op: string;
-    last_mutation_at: number;
-    last_event_id: number;
-  };
-  const toolRow = db
-    .prepare("SELECT source FROM file_attributions WHERE file_path = ?")
-    .get("src/x.ts") as { source: string };
-  const planctlLeft = (
-    db
-      .prepare(
-        "SELECT COUNT(*) AS n FROM file_attributions WHERE source = 'planctl'",
-      )
-      .get() as { n: number }
+  const total = (
+    db.prepare("SELECT COUNT(*) AS n FROM file_attributions").get() as {
+      n: number;
+    }
   ).n;
   db.close();
 
   expect(ver).toBe(String(SCHEMA_VERSION));
-  // The planctl row's source flipped to 'plan'; other columns preserved.
-  expect(planRow.source).toBe("plan");
-  expect(planRow.op).toBe("scaffold");
-  expect(planRow.last_mutation_at).toBe(100);
-  expect(planRow.last_event_id).toBe(7);
-  // The tool row is untouched.
-  expect(toolRow.source).toBe("tool");
-  // No 'planctl' rows remain (idempotency invariant).
-  expect(planctlLeft).toBe(0);
+  // The v77 rewind wiped every seeded row (neither 'plan' nor 'planctl' nor the
+  // tool row survives — none had a backing event to re-fold).
+  expect(total).toBe(0);
 });
 
 test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL", () => {
@@ -2081,7 +2062,18 @@ test("fn-712 migration rewrites default_visible to the materialized expression (
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
 
-  // The shell row now computes 0 under the rewritten (materialized) expression.
+  // The v77 rewind (fn-856) wipes the `epics` projection, so the hand-seeded
+  // shell row (no backing event) does not survive. Re-insert it into the
+  // migrated DB to exercise the rewritten generated column directly: a
+  // null-status row computes 0 under the materialized (status-guarded)
+  // expression (it computed 1 under the OLD expression).
+  const wiped = db
+    .prepare("SELECT epic_id FROM epics WHERE epic_id = 'shell'")
+    .get() as { epic_id: string } | null;
+  expect(wiped).toBeNull();
+  db.run(
+    "INSERT INTO epics (epic_id, epic_number, title, status, last_event_id, updated_at) VALUES ('shell', 1, 'shell', NULL, 1, 1)",
+  );
   const after = db
     .prepare("SELECT default_visible AS dv FROM epics WHERE epic_id = 'shell'")
     .get() as { dv: number };
@@ -2137,9 +2129,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // the `events.mutation_path` column, fn-836.2; v74 restores keep-set bodies
   // inline + DROPs `event_blobs`, fn-836.4; v75 rewrites stored
   // `file_attributions.source='planctl'` rows to `'plan'`, fn-831; v76 adds the
-  // `dispatch_never_bound` circuit-breaker projection table, fn-846); the
-  // v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(76);
+  // `dispatch_never_bound` circuit-breaker projection table, fn-846; v77 ungates
+  // the plan-link classifier from `/plan:plan` windows + rewinds the cursor and
+  // wipes the canonical projection list, fn-856); the v62→v63 epics-shape
+  // migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(77);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -8305,24 +8299,16 @@ test("v54 DB migrates to v55: jobs.backend_exec_tab_{id,name} dropped; live coor
   expect(jobColsMig).toContain("backend_exec_session_id");
   expect(jobColsMig).toContain("backend_exec_pane_id");
 
-  // (b) The hand-seeded row survived the DROP COLUMN B-tree rewrite with
-  // its live coords intact (DROP COLUMN preserves the other columns).
+  // (b) The v77 rewind-and-redrain (fn-856) wipes the `jobs` projection: the
+  // hand-seeded `sess-pre` row had no backing event, so the from-scratch
+  // re-fold the daemon runs after `openDb` does not rebuild it. The column DROP
+  // mechanics are proven by the table-shape parity below (c); row preservation
+  // across the v54→v55 DROP COLUMN is no longer observable end-to-end because a
+  // later rewind clears the table. Confirm the row is gone.
   const job = db
-    .prepare(
-      `SELECT title, backend_exec_type, backend_exec_session_id,
-              backend_exec_pane_id
-         FROM jobs WHERE job_id = 'sess-pre'`,
-    )
-    .get() as {
-    title: string | null;
-    backend_exec_type: string | null;
-    backend_exec_session_id: string | null;
-    backend_exec_pane_id: string | null;
-  };
-  expect(job.title).toBe("pre-v55");
-  expect(job.backend_exec_type).toBe("tmux");
-  expect(job.backend_exec_session_id).toBe("ada");
-  expect(job.backend_exec_pane_id).toBe("11");
+    .prepare("SELECT job_id FROM jobs WHERE job_id = 'sess-pre'")
+    .get() as { job_id: string } | null;
+  expect(job).toBeNull();
 
   // (c) Migrated PRAGMA table_info byte-matches a fresh v55 DB — the
   // lockstep CREATE-vs-DROP invariant (CREATE_JOBS omits the tab columns,

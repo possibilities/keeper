@@ -2140,6 +2140,23 @@ never-bound. The bump/reset fold purely from the `DispatchExpired` + bind +
 byte-identical (empty table on a pre-v76 log). keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `76` (whitelist-only; keeper-py
 reads neither `dispatch_never_bound` nor `dispatch_failures`).
+As of schema v77 (fn-856), the plan-link classifier is ungated from the
+`/plan:plan` time-window model: a session that never invokes `/plan:plan` used
+to have zero windows, so every plan op it made was silently dropped — leaking
+three populations (closers that scaffold their follow-up epic via
+`close-finalize`, pre-first-opener scaffolds, and `/plan:defer` / `/plan:next` /
+direct-CLI edits). The measured cost on the live DB: `epics.job_links` empty for
+~1013/1020 epics and `created_by_closer_of` set for 0/1020 (the
+`[slotted-after-closer]` pill had never once fired). The classifier now links
+EVERY epic-mutating op as creator/refiner regardless of timing, keeping only the
+read-only (`subject_present=false`) gate, with per-session (not per-window)
+creator-suppression and a `(ts, event_id)` total-order sort for re-fold
+determinism. Because the fold output changed, the migration REWINDS the cursor
+and wipes the canonical projection list (same set as v42) so the corrected
+derive repopulates every epic; a from-scratch re-fold reproduces byte-identical
+`epics.job_links` / `created_by_closer_of` rows. keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `77` (whitelist-only; keeper-py reads
+`jobs` / `epics` over the socket, not the classifier internals).
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`
@@ -2197,10 +2214,14 @@ schema v54) every `Commit` event carrying the `Planctl-Op` / `Planctl-Target`
 / `Session-Id` trailers triggers the `syncPlanctlLinks` helper, which
 re-derives per-session `jobs.epic_links` and per-epic `epics.job_links` from
 the session's `keeper plan` footprint — the deduped UNION of the legacy
-stdout-scrape rows and the durable commit-trailer facts — classified against
-its `/plan:plan` windows (creator = `epic-create` OR `scaffold` mutation
-inside a window — scaffold is the canonical epic-create path on this
-codebase; refiner = any other epic-touching mutation inside a window). The
+stdout-scrape rows and the durable commit-trailer facts — classified
+unconditionally (no time window): EVERY epic-mutating op links as creator
+(`epic-create` OR `scaffold` with an epic-shaped target — scaffold is the
+canonical epic-create path on this codebase) or refiner (any other
+epic-touching mutation), gated only by the read-only `subject_present` skip.
+The classifier sorts on a `(ts, event_id)` total order so per-session
+creator-suppression (a session that scaffolds AND refines the same epic emits
+ONE creator edge) is deterministic on `ts`-ties. The
 commit-trailer side reads the indexed `commit_trailer_facts` projection
 (schema v67, fn-807) ONCE per call — `foldCommit` writes one fact row per
 trailer-bearing `Commit` in its own transaction — instead of re-scanning every

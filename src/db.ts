@@ -33,11 +33,9 @@ import {
 import { epicIsCompleted, projectBasename, resolveEpicDep } from "./epic-deps";
 import {
   type ClassifierInvocation,
-  computePlanWindows,
   deriveEpicLinks,
   deriveJobLinks,
   normalizePlanctlOp,
-  type PlanWindow,
 } from "./plan-classifier";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import type { Epic, ResolvedEpicDep } from "./types";
@@ -47,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 76;
+export const SCHEMA_VERSION = 77;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1902,7 +1900,6 @@ function migrate(db: Database): void {
           .all() as { session_id: string }[];
 
         const invocationsBySession = new Map<string, ClassifierInvocation[]>();
-        const openerTimestampsBySession = new Map<string, number[]>();
 
         for (const { session_id } of sessionRows) {
           const invRows = db
@@ -1928,36 +1925,15 @@ function migrate(db: Database): void {
             target: r.planctl_target,
             epic_id: r.planctl_epic_id,
             subject_present: r.planctl_subject_present === 1,
+            event_id: r.id,
           }));
           invocationsBySession.set(session_id, invocations);
-
-          // Window-opener gate: PreToolUse:Skill AND skill_name='plan:plan' only
-          // — slash-command UserPromptSubmit rows are NOT openers (they'd
-          // double-fire on slash-typed invocations).
-          const openerRows = db
-            .prepare(
-              `SELECT ts
-               FROM events
-              WHERE session_id = ?
-                AND hook_event = 'PreToolUse'
-                AND skill_name = 'plan:plan'
-              ORDER BY id ASC`,
-            )
-            .all(session_id) as { ts: number }[];
-          openerTimestampsBySession.set(
-            session_id,
-            openerRows.map((r) => r.ts),
-          );
         }
 
-        const windowsBySession = new Map<string, PlanWindow[]>();
         const touchedEpicIds = new Set<string>();
         for (const session_id of invocationsBySession.keys()) {
-          const opens = openerTimestampsBySession.get(session_id) ?? [];
-          const windows = computePlanWindows(opens);
-          windowsBySession.set(session_id, windows);
           const invocations = invocationsBySession.get(session_id) ?? [];
-          const epicLinks = deriveEpicLinks(invocations, windows);
+          const epicLinks = deriveEpicLinks(invocations);
           const epicLinksJson = JSON.stringify(epicLinks);
           const latest = db
             .prepare(
@@ -1986,11 +1962,7 @@ function migrate(db: Database): void {
         // Pass 2b — write `epics.job_links` per touched epic; shell-insert the
         // epic row if missing so a from-scratch re-fold reproduces every row.
         for (const epicId of touchedEpicIds) {
-          const jobLinks = deriveJobLinks(
-            invocationsBySession,
-            windowsBySession,
-            epicId,
-          );
+          const jobLinks = deriveJobLinks(invocationsBySession, epicId);
           const jobLinksJson = JSON.stringify(jobLinks);
           const latest = db
             .prepare(
@@ -2211,7 +2183,6 @@ function migrate(db: Database): void {
           string,
           ClassifierInvocation[]
         >();
-        const openerTimestampsBySessionV20 = new Map<string, number[]>();
 
         for (const { session_id } of sessionRowsV20) {
           const invRows = db
@@ -2237,34 +2208,15 @@ function migrate(db: Database): void {
             target: r.planctl_target,
             epic_id: r.planctl_epic_id,
             subject_present: r.planctl_subject_present === 1,
+            event_id: r.id,
           }));
           invocationsBySessionV20.set(session_id, invocations);
-
-          // Window-opener gate: PreToolUse:Skill AND skill_name='plan:plan' only.
-          const openerRows = db
-            .prepare(
-              `SELECT ts
-               FROM events
-              WHERE session_id = ?
-                AND hook_event = 'PreToolUse'
-                AND skill_name = 'plan:plan'
-              ORDER BY id ASC`,
-            )
-            .all(session_id) as { ts: number }[];
-          openerTimestampsBySessionV20.set(
-            session_id,
-            openerRows.map((r) => r.ts),
-          );
         }
 
-        const windowsBySessionV20 = new Map<string, PlanWindow[]>();
         const touchedEpicIdsV20 = new Set<string>();
         for (const session_id of invocationsBySessionV20.keys()) {
-          const opens = openerTimestampsBySessionV20.get(session_id) ?? [];
-          const windows = computePlanWindows(opens);
-          windowsBySessionV20.set(session_id, windows);
           const invocations = invocationsBySessionV20.get(session_id) ?? [];
-          const epicLinks = deriveEpicLinks(invocations, windows);
+          const epicLinks = deriveEpicLinks(invocations);
           const epicLinksJson = JSON.stringify(epicLinks);
           const latest = db
             .prepare(
@@ -2293,11 +2245,7 @@ function migrate(db: Database): void {
         // missing epic row (its later EpicSnapshot's ON CONFLICT carve-out
         // preserves `job_links`).
         for (const epicId of touchedEpicIdsV20) {
-          const jobLinks = deriveJobLinks(
-            invocationsBySessionV20,
-            windowsBySessionV20,
-            epicId,
-          );
+          const jobLinks = deriveJobLinks(invocationsBySessionV20, epicId);
           const jobLinksJson = JSON.stringify(jobLinks);
           const latest = db
             .prepare(
@@ -3752,6 +3700,48 @@ function migrate(db: Database): void {
       // MUST add 76 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME
       // commit, or every keeper-py read fails host-wide; test/schema-version.test.ts
       // enforces this.
+
+      // v76→v77 (fn-856 task .1): ungate the plan-link classifier from the
+      // `/plan:plan` time-window model. The classifier (`src/plan-classifier.ts`)
+      // dropped the window machinery: every epic-MUTATING op now links as
+      // `creator` ({create, scaffold} with an epic-shaped target) or `refiner`
+      // (any other mutating op naming an epic), regardless of timing — only the
+      // read-only (`subject_present=false`) gate survives. That repairs three
+      // dropped populations (closers, pre-first-opener scaffolds, /plan:defer +
+      // direct-CLI edits): on the live DB `epics.job_links` was empty for ~1013
+      // of 1020 epics and `created_by_closer_of` (the `[slotted-after-closer]`
+      // pill) had never fired once. Because the FOLD OUTPUT changed, this bump
+      // REWINDS the cursor and wipes the canonical projection list so the
+      // corrected derive repopulates everything from the event log. ONE
+      // `BEGIN IMMEDIATE` (the enclosing `.immediate()` tx) carries the wipe +
+      // re-fold trigger + version stamp atomically. The wipe list is the
+      // canonical v41→v42 set (every reducer-owned projection; MUST NOT touch
+      // `dead_letters` — not a reducer projection). Re-fold determinism holds:
+      // the classifier sorts on the `(ts, event_id)` total order, so a migrated
+      // DB and a from-scratch re-fold yield byte-identical rows. The two frozen
+      // historical backfills (v13→v14, v19→v20) were updated to the windowless
+      // signatures in this SAME commit — their recomputed output is overwritten
+      // by this wipe + re-fold, so the migrated-vs-refold end state stays
+      // byte-identical. Whitelist-only Python read (keeper-py reads `jobs` /
+      // `epics` over the socket, not these projection internals) — this bump MUST
+      // add 77 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME
+      // commit; test/schema-version.test.ts enforces this.
+      if (preMigrateStoredVersion < 77) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        db.run("DELETE FROM git_status");
+        db.run("DELETE FROM file_attributions");
+        db.run("DELETE FROM subagent_invocations");
+        db.run("DELETE FROM usage");
+        db.run("DELETE FROM profiles");
+        db.run("DELETE FROM dispatch_failures");
+        db.run("DELETE FROM autopilot_state");
+        db.run("DELETE FROM pending_dispatches");
+        db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM armed_epics");
+        db.run("DELETE FROM builds");
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

@@ -34,13 +34,11 @@ import {
 } from "./epic-deps";
 import {
   type ClassifierInvocation,
-  computePlanWindows,
   deriveEpicLinks,
   deriveJobLinks,
   type EpicLink,
   type JobLink,
   normalizePlanctlOp,
-  type PlanWindow,
 } from "./plan-classifier";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import {
@@ -5322,9 +5320,9 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
 }
 
 /**
- * Fan a planctl-CLI invocation (or a `/plan:plan` window opener) into the
- * `jobs.epic_links` + per-touched-epic `epics.job_links` projections. Parallel
- * to {@link syncJobIntoEpic} but with a disjoint trigger, so the two helpers do
+ * Fan a planctl-CLI invocation into the `jobs.epic_links` +
+ * per-touched-epic `epics.job_links` projections. Parallel to
+ * {@link syncJobIntoEpic} but with a disjoint trigger, so the two helpers do
  * NOT share code. Re-derives from scratch on every triggering event
  * (full-replace, never delta-merge) for byte-identical re-fold:
  *
@@ -5333,11 +5331,11 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
  *      ({@link commitTrailerInvocationsFor}). The classifier dedups, so a
  *      scrape and a commit for the same op collapse to one edge; a scaffold
  *      whose scrape yielded NULL still produces a creator edge via the commit
- *      channel. Also load every `/plan:plan` opener (`PreToolUse +
- *      skill_name='plan:plan'` only — `slash_command` rows would double-fire).
- *   2-6. Compute windows + `epic_links`, read the pre-state, UPDATE the jobs
- *      row.
- *   7. For each epic in the pre+post union, re-derive `job_links` over the FULL
+ *      channel. Each invocation carries its source `event_id` so the
+ *      classifier's `(ts, event_id)` total-order sort is deterministic.
+ *   2. Compute `epic_links` (windowless — every epic-mutating op links), read
+ *      the pre-state, UPDATE the jobs row.
+ *   3. For each epic in the pre+post union, re-derive `job_links` over the FULL
  *      per-epic namespace; shell-insert a missing epic row.
  *
  * No-op when the jobs row for `sessionId` doesn't exist (no SessionStart yet).
@@ -5385,12 +5383,13 @@ interface CommitTrailerFacts {
 function loadAllCommitTrailerFacts(db: Database): CommitTrailerFacts {
   const rows = db
     .query(
-      `SELECT committer_session_id, planctl_op, planctl_target,
+      `SELECT event_id, committer_session_id, planctl_op, planctl_target,
               planctl_epic_id, committed_at_ms
          FROM commit_trailer_facts
         ORDER BY event_id ASC`,
     )
     .all() as {
+    event_id: number;
     committer_session_id: string;
     planctl_op: string;
     planctl_target: string;
@@ -5405,6 +5404,7 @@ function loadAllCommitTrailerFacts(db: Database): CommitTrailerFacts {
       target: r.planctl_target,
       epic_id: r.planctl_epic_id,
       subject_present: true,
+      event_id: r.event_id,
     };
     const existing = factsBySession.get(r.committer_session_id);
     if (existing != null) {
@@ -5491,18 +5491,19 @@ function syncPlanctlLinks(
     _syncPlanctlLinksAccum.factsRows += _factsRows;
   }
 
-  // Load this session's planctl invocations (ASC by event id for stable
-  // window-pointer advance); the partial composite index serves this without a
-  // full-table scan.
+  // Load this session's planctl invocations (ASC by event id — the `id`
+  // doubles as the classifier's total-order tiebreak on `ts`-ties); the
+  // partial composite index serves this without a full-table scan.
   const invRows = db
     .query(
-      `SELECT ts, planctl_op, planctl_target, planctl_epic_id,
+      `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
               planctl_subject_present
          FROM events
         WHERE session_id = ? AND planctl_op IS NOT NULL
         ORDER BY id ASC`,
     )
     .all(sessionId) as {
+    id: number;
     ts: number;
     planctl_op: string;
     planctl_target: string | null;
@@ -5515,30 +5516,17 @@ function syncPlanctlLinks(
     target: r.planctl_target,
     epic_id: r.planctl_epic_id,
     subject_present: r.planctl_subject_present === 1,
+    event_id: r.id,
   }));
   // UNION the durable commit-trailer facts — the classifier dedups, so a scrape
   // and a commit for the same scaffold collapse to one creator edge, and a
   // scrape-NULL scaffold's commit fact alone still mints it.
   invocations.push(...commitTrailerInvocationsFor(commitFacts, sessionId));
 
-  // Load this session's `/plan:plan` openers. Locked gate: `PreToolUse +
-  // skill_name='plan:plan'` only — a slash-command UserPromptSubmit would
-  // double-fire on the same call.
-  const openerRows = db
-    .query(
-      `SELECT ts
-         FROM events
-        WHERE session_id = ?
-          AND hook_event = 'PreToolUse'
-          AND skill_name = 'plan:plan'
-        ORDER BY id ASC`,
-    )
-    .all(sessionId) as { ts: number }[];
-  const windows = computePlanWindows(openerRows.map((r) => r.ts));
-
   // Compute the new epic_links from scratch (full-replace, never delta-merge —
-  // delta-merge would double on re-fold).
-  const newEpicLinks = deriveEpicLinks(invocations, windows);
+  // delta-merge would double on re-fold). Windowless: every epic-mutating op
+  // links regardless of `/plan:plan` timing; the read-only gate is the only skip.
+  const newEpicLinks = deriveEpicLinks(invocations);
   sortEpicLinks(newEpicLinks);
 
   // Read the pre-state epic_links so we know which epics' job_links need a
@@ -5608,17 +5596,17 @@ function syncPlanctlLinks(
   }
 
   const invocationsBySession = new Map<string, ClassifierInvocation[]>();
-  const windowsBySession = new Map<string, PlanWindow[]>();
   for (const sid of sessionIds) {
     const sidInvRows = db
       .query(
-        `SELECT ts, planctl_op, planctl_target, planctl_epic_id,
+        `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
                 planctl_subject_present
            FROM events
           WHERE session_id = ? AND planctl_op IS NOT NULL
           ORDER BY id ASC`,
       )
       .all(sid) as {
+      id: number;
       ts: number;
       planctl_op: string;
       planctl_target: string | null;
@@ -5631,26 +5619,13 @@ function syncPlanctlLinks(
       target: r.planctl_target,
       epic_id: r.planctl_epic_id,
       subject_present: r.planctl_subject_present === 1,
+      event_id: r.id,
     }));
     // UNION this session's commit-trailer facts so the per-epic rebuild
     // classifies BOTH channels symmetrically. Concat is safe — the classifier
-    // dedups + re-sorts by ts.
+    // dedups + re-sorts by the total order (ts, event_id).
     sidInvocations.push(...commitTrailerInvocationsFor(commitFacts, sid));
     invocationsBySession.set(sid, sidInvocations);
-    const sidOpenerRows = db
-      .query(
-        `SELECT ts
-           FROM events
-          WHERE session_id = ?
-            AND hook_event = 'PreToolUse'
-            AND skill_name = 'plan:plan'
-          ORDER BY id ASC`,
-      )
-      .all(sid) as { ts: number }[];
-    windowsBySession.set(
-      sid,
-      computePlanWindows(sidOpenerRows.map((r) => r.ts)),
-    );
   }
 
   // Step 2: re-derive job_links for each touched epic and UPDATE the epic row
@@ -5660,11 +5635,7 @@ function syncPlanctlLinks(
   // closer-chain leads back to this epic — inside the same transaction for
   // byte-identical re-fold.
   for (const epicId of touchedEpics) {
-    const newJobLinks = deriveJobLinks(
-      invocationsBySession,
-      windowsBySession,
-      epicId,
-    );
+    const newJobLinks = deriveJobLinks(invocationsBySession, epicId);
     // Enrich each thin classifier entry into the widened JobLinkEntry shape via
     // the SAME helper the jobs-write fan-out uses — a single source of truth for
     // the on-disk projection shape is required for re-fold determinism.
