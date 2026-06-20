@@ -31,5 +31,5 @@ free-form prompts only. Builds on the shipped fn-858 dispatch command.
 - [ ] README documents the new config key.
 
 ## Done summary
-
+Added config-driven dispatch_prompt_prefix that prepends '<prefix> ' to free-form keeper dispatch prompts (before the NUL/96KB guard, reflected in --dry-run); plan-form and no-prompt paths untouched. Includes a --no-prefix escape hatch, README docs, and config-parser + dispatch-handler tests.
 ## Evidence
