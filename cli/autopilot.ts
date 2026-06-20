@@ -26,12 +26,7 @@
 import { basename } from "node:path";
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
-import {
-  type ClientFrame,
-  encodeFrame,
-  LineBuffer,
-  type ServerFrame,
-} from "../src/protocol";
+import type { ClientFrame } from "../src/protocol";
 import type { Verdict } from "../src/readiness";
 import {
   type ReadinessClientSnapshot,
@@ -45,6 +40,7 @@ import {
 } from "../src/snapshot";
 import type { Task } from "../src/types";
 import { createViewShell } from "../src/view-shell";
+import { sendControlRpc } from "./control-rpc";
 
 const HELP = `keeper autopilot — thin viewer + control surface for the server-side autopilot reconciler
 
@@ -91,13 +87,6 @@ which epics armed mode works, and retry to clear a sticky failure row.
 `;
 
 const seg = (v: unknown): string => (v == null ? "" : String(v));
-
-/**
- * Hard upper bound on how long a control subcommand waits for the
- * `rpc_result` / `error` frame after a successful connect. 5s is generous; a
- * healthy daemon answers in sub-ms on local UDS.
- */
-const RESPONSE_TIMEOUT_MS = 5000;
 
 // ---------------------------------------------------------------------------
 // Dependency graph — ASCII DAG of open tasks (epic + task deps).
@@ -488,141 +477,9 @@ export function buildSetArmedFrame(
   };
 }
 
-/**
- * One round-trip on a fresh UDS connection. Opens, writes the frame, awaits
- * the server frame whose `id === matchId`, closes. Resolves with the matching
- * frame; rejects on connect-fail, transport error, malformed frame, server
- * close before reply, or `RESPONSE_TIMEOUT_MS` elapsing post-connect.
- */
-async function roundTrip(
-  sockPath: string,
-  send: ClientFrame,
-  matchId: string,
-): Promise<ServerFrame> {
-  return new Promise<ServerFrame>((resolve, reject) => {
-    const buffer = new LineBuffer();
-    let settled = false;
-    let sock: Awaited<ReturnType<typeof Bun.connect>> | null = null;
-
-    const settle = (err: Error | null, frame: ServerFrame | null): void => {
-      if (settled) {
-        return;
-      }
-      settled = true;
-      clearTimeout(timeout);
-      try {
-        sock?.end();
-      } catch {
-        // best-effort
-      }
-      if (err) {
-        reject(err);
-      } else if (frame) {
-        resolve(frame);
-      } else {
-        reject(new Error("internal: settle called with neither err nor frame"));
-      }
-    };
-
-    const timeout = setTimeout(() => {
-      settle(
-        new Error(
-          `no response from daemon within ${RESPONSE_TIMEOUT_MS}ms (id ${matchId})`,
-        ),
-        null,
-      );
-    }, RESPONSE_TIMEOUT_MS);
-    timeout.unref?.();
-
-    Bun.connect({
-      unix: sockPath,
-      socket: {
-        open(s) {
-          sock = s;
-          s.write(encodeFrame(send));
-        },
-        data(_s, chunk) {
-          let lines: string[];
-          try {
-            lines = buffer.push(chunk.toString("utf8"));
-          } catch (err) {
-            settle(
-              new Error(`protocol error: ${(err as Error).message}`),
-              null,
-            );
-            return;
-          }
-          for (const line of lines) {
-            if (line.trim().length === 0) {
-              continue;
-            }
-            let frame: ServerFrame;
-            try {
-              frame = JSON.parse(line) as ServerFrame;
-            } catch (err) {
-              settle(
-                new Error(`malformed server frame: ${(err as Error).message}`),
-                null,
-              );
-              return;
-            }
-            if ((frame as { id?: string }).id !== matchId) {
-              continue;
-            }
-            settle(null, frame);
-            return;
-          }
-        },
-        close() {
-          settle(
-            new Error(
-              `daemon closed connection before responding (id ${matchId})`,
-            ),
-            null,
-          );
-        },
-        error(_s, err) {
-          settle(new Error(`socket error: ${err.message}`), null);
-        },
-      },
-    }).catch((err: Error) => {
-      settle(
-        new Error(`failed to connect to ${sockPath}: ${err.message}`),
-        null,
-      );
-    });
-  });
-}
-
 function die(message: string): never {
   process.stderr.write(`autopilot: ${message}\n`);
   process.exit(1);
-}
-
-/**
- * Send one control RPC and exit. On `rpc_result` writes the value as one
- * JSON line to stdout and exits 0; on `error` / connect-fail / timeout
- * surfaces the reason via `die` (exit 1).
- */
-async function sendControlRpc(
-  sockPath: string,
-  frame: ClientFrame,
-  matchId: string,
-): Promise<void> {
-  let response: ServerFrame;
-  try {
-    response = await roundTrip(sockPath, frame, matchId);
-  } catch (err) {
-    die((err as Error).message);
-  }
-  if (response.type === "rpc_result") {
-    process.stdout.write(`${JSON.stringify(response.value)}\n`);
-    process.exit(0);
-  }
-  if (response.type === "error") {
-    die(`server error ${response.code}: ${response.message}`);
-  }
-  die(`unexpected frame type: ${response.type}`);
 }
 
 // ---------------------------------------------------------------------------
@@ -932,6 +789,7 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetPausedFrame(id, subcommand === "pause"),
       id,
+      die,
     );
     return;
   }
@@ -947,7 +805,7 @@ export async function main(argv: string[]): Promise<void> {
       die("'retry' requires a non-empty <verb::id> key");
     }
     const id = crypto.randomUUID();
-    await sendControlRpc(sockPath, buildRetryFrame(id, dispatchKey), id);
+    await sendControlRpc(sockPath, buildRetryFrame(id, dispatchKey), id, die);
     return;
   }
 
@@ -964,7 +822,7 @@ export async function main(argv: string[]): Promise<void> {
       die(`'mode' must be one of yolo | armed (got ${JSON.stringify(mode)})`);
     }
     const id = crypto.randomUUID();
-    await sendControlRpc(sockPath, buildSetModeFrame(id, mode), id);
+    await sendControlRpc(sockPath, buildSetModeFrame(id, mode), id, die);
     return;
   }
 
@@ -983,6 +841,7 @@ export async function main(argv: string[]): Promise<void> {
       sockPath,
       buildSetArmedFrame(id, epicId, subcommand === "arm"),
       id,
+      die,
     );
     return;
   }
