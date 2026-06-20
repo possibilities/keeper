@@ -1,5 +1,5 @@
 {
   "name": "keeper",
-  "description": "Write one row per Claude Code hook invocation into keeper.db for the reducer daemon to fold",
+  "description": "Write one row per Claude Code hook invocation into keeper.db for the reducer daemon to fold, and hard-deny subagents from creating/switching git branches via a PreToolUse(Bash) branch-guard",
   "author": {"name": "arthack"}
 }
