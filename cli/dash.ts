@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 /**
- * `keeper dash` — v1 of the unified keeper TUI: a minimal, read-only opening
- * screen (header strip + PLAN + AGENTS) that answers "what is going on
- * plan/work/agent-wise" in one place, unifying the at-a-glance value of
- * `keeper board` + `keeper jobs` + `keeper autopilot`.
+ * `keeper dash` — the unified keeper TUI: a live, read-only, full-screen single
+ * column of compact robot job-CARDS (one per job: project · title · status),
+ * grouped into needs-you / in-motion / idle urgency bands. Status is
+ * dual-encoded as a Nerd Font md-robot face plus a colored left rail, so the
+ * board is calm when idle and the few jobs that need attention pop.
  *
  * Unlike the five viewer subcommands, dash is TTY-ONLY — there is NO snapshot
  * mode. The TTY gate fires here, BEFORE any `@opentui/core` import, so a piped
@@ -21,7 +22,7 @@
 import { parseArgs } from "node:util";
 import { resolveSockPath } from "../src/db";
 
-const HELP = `keeper dash — read-only opening screen (header + PLAN + AGENTS)
+const HELP = `keeper dash — read-only live robot job-card screen
 
 Usage:
   keeper dash [--sock <path>]

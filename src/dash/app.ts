@@ -3,30 +3,34 @@
  * (`./view-model.ts`). Two surfaces:
  *
  * - {@link attachDashApp} — the PAINT layer. Builds the stable renderable tree
- *   ONCE (root Box column 100%/100%; header Text fixed height over a full-width
- *   rule; body ScrollBox flexGrow:1 + viewportCulling, focused on mount so
- *   j/k/arrows scroll natively), and exposes `render(model)` which diffs the
- *   view-model's keyed body rows into a stable `Map<rowKey, RowHandle>` — two
- *   row kinds (split / divider), content updates in place, structural
+ *   ONCE (root Box column 100%/100%; census header Text fixed height over a
+ *   full-width rule; body ScrollBox flexGrow:1 + viewportCulling, focused on
+ *   mount so j/k/arrows scroll natively), and exposes `render(model)` which
+ *   flattens the card model's bands into keyed rows (a band-title rule per
+ *   non-empty band, then one card line each) and diffs them into a stable
+ *   `Map<rowKey, RowHandle>` — content updates in place, structural
  *   add/remove/reorder ONLY when the keyed ORDER changes (Yoga recalc rides
- *   structure, not content). The runtime OpenTUI ctors are THREADED IN so this
- *   module carries a type-only `@opentui/core` import — the same inertness
- *   contract `src/live-shell.ts`'s `attachLiveShellPaint` keeps, so an unrelated
- *   test importing the pure view-model never trips OpenTUI's racy native loader.
- *   Exported so `test/dash-app.test.ts` mounts the same scene against
- *   `createTestRenderer` without forking the renderer-construction code.
+ *   structure, not content). NOTE: this is the THIN bridge task `.1` ships;
+ *   task `.2` replaces it with real boxed cards (rail-colored left border, robot
+ *   glyph slot, heavy-cyan focus border, the `t`/`j`/`k` keybinds). The runtime
+ *   OpenTUI ctors are THREADED IN so this module carries a type-only
+ *   `@opentui/core` import — the same inertness contract `src/live-shell.ts`'s
+ *   `attachLiveShellPaint` keeps, so an unrelated test importing the pure
+ *   view-model never trips OpenTUI's racy native loader. Exported so
+ *   `test/dash-app.test.ts` mounts the same scene against `createTestRenderer`
+ *   without forking the renderer-construction code.
  *
  * - {@link createDashApp} — the PROCESS shell. Dynamic-imports OpenTUI, builds
  *   the renderer with the proven viewer config (exitOnCtrlC:false, exitSignals
  *   SIGTERM/SIGHUP/SIGQUIT, alternate-screen), attaches the paint layer, wires
- *   the three subscriptions (subscribeReadiness + subscribeCollection
- *   autopilot_state + armed_epics) into one current-inputs struct, the 30s
- *   staleness repaint interval, the q/Ctrl-C key handler, the forked exit
- *   triggers, an
- *   onFatal override, and uncaughtException/unhandledRejection handlers — every
- *   path routes through ONE idempotent `exitCleanly` so `renderer.destroy()`
- *   ALWAYS precedes `process.exit` (OpenTUI does NOT auto-restore the terminal
- *   on exit/uncaught). Reactive mode — never `renderer.start()`.
+ *   the subscriptions (subscribeReadiness for the live jobs projection, plus the
+ *   autopilot_state + armed_epics collection subs whose edges still trigger
+ *   repaints) into one current-inputs struct, the 30s staleness repaint
+ *   interval, the q/Ctrl-C key handler, the forked exit triggers, an onFatal
+ *   override, and uncaughtException/unhandledRejection handlers — every path
+ *   routes through ONE idempotent `exitCleanly` so `renderer.destroy()` ALWAYS
+ *   precedes `process.exit` (OpenTUI does NOT auto-restore the terminal on
+ *   exit/uncaught). Reactive mode — never `renderer.start()`.
  *
  * Read-only end to end: no RPC frame is ever written, no DB is opened.
  */
@@ -46,16 +50,30 @@ import {
   subscribeReadiness,
 } from "../readiness-client";
 import { armViewerExitTriggers } from "./exit-triggers";
-import { colorForRole, STRUCTURE_COLOR_INDEX } from "./theme";
 import {
-  buildDashModel,
-  type ConnectionState,
-  type DashBodyRow,
-  type DashModel,
-  type Row,
-} from "./view-model";
+  type ColorDescriptor,
+  colorForRail,
+  STRUCTURE_COLOR_INDEX,
+} from "./theme";
+import { buildDashModel, type CardVM, type DashModel } from "./view-model";
 
-// One coarse repaint interval for wall-clock-aged glyphs — 30s (epic-settled).
+/**
+ * A thin flattened paint row — task `.1` ships the pure `{ header, bands }` card
+ * MODEL; this is the minimal bridge that paints it through the existing
+ * keyed-row diff. Task `.2` replaces this with real boxed cards (rail color,
+ * robot glyph slot, heavy-cyan focus border, the `t`/`j`/`k` keybinds). A
+ * `band` row is the urgency-band title rule; a `card` row is one job line.
+ */
+type PaintRow =
+  | { readonly kind: "band"; readonly key: string; readonly title: string }
+  | {
+      readonly kind: "card";
+      readonly key: string;
+      readonly card: CardVM;
+    };
+
+// One coarse repaint interval for the wall-clock-aged card fields (age label)
+// — 30s (epic-settled). These age off `nowSec`, not data edges.
 const STALE_REFRESH_MS = 30_000;
 
 /**
@@ -102,11 +120,11 @@ interface BuiltChunk {
   attributes?: number;
 }
 
-/** One mounted body row: the outer node plus, for split rows, the two Text
+/** One mounted body row: the outer node plus, for card rows, the two Text
  * children whose content updates in place. A key never changes kind, so the
  * handle's shape is fixed for its lifetime. */
 interface RowHandle {
-  readonly kind: DashBodyRow["kind"];
+  readonly kind: PaintRow["kind"];
   readonly node: BoxRenderableType;
   readonly left?: TextRenderableType;
   readonly right?: TextRenderableType;
@@ -133,10 +151,9 @@ export function attachDashApp(
   const { RGBA, TextAttributes } = runtime;
   const structureColor = RGBA.fromIndex(STRUCTURE_COLOR_INDEX);
 
-  // Resolve a role to its renderable fg (absent index → default foreground)
-  // plus the descriptor's DIM/BOLD attributes.
-  function chunkFor(text: string, role: Row[number]["role"]): BuiltChunk {
-    const desc = colorForRole(role);
+  // Resolve a color descriptor to its renderable fg (absent index → default
+  // foreground) plus the descriptor's DIM/BOLD attributes.
+  function chunkFor(text: string, desc: ColorDescriptor): BuiltChunk {
     const chunk: BuiltChunk = { __isChunk: true, text };
     if (desc.index !== undefined) {
       chunk.fg = RGBA.fromIndex(desc.index);
@@ -150,10 +167,10 @@ export function attachDashApp(
     return chunk;
   }
 
-  // A whole row (segment list) → a StyledText of per-segment chunks.
-  function styledRow(segments: Row): StyledTextType {
-    const chunks = segments.map((s) => chunkFor(s.text, s.role));
-    return new runtime.StyledText(chunks);
+  // A single default-fg text run → a StyledText (the header census + plain
+  // labels). Task `.2` layers the rail color per card.
+  function plainText(text: string): StyledTextType {
+    return new runtime.StyledText([chunkFor(text, {})]);
   }
 
   // Root: a full-screen column. Header fixed at 1 row over a full-width rule;
@@ -205,16 +222,16 @@ export function attachDashApp(
   // The previous frame's ordered key list — reorder detection.
   let lastOrder = "";
 
-  function buildHandle(row: DashBodyRow): RowHandle {
+  function buildHandle(row: PaintRow): RowHandle {
     switch (row.kind) {
-      case "split": {
+      case "card": {
         const node = new runtime.BoxRenderable(renderer, {
           id: `dash-row-${row.key}`,
           width: "100%",
           height: 1,
           flexDirection: "row",
           justifyContent: "space-between",
-          paddingLeft: 1 + (row.indent ?? 0),
+          paddingLeft: 1,
           paddingRight: 1,
         });
         const left = new runtime.TextRenderable(renderer, {
@@ -229,11 +246,11 @@ export function attachDashApp(
         });
         node.add(left);
         node.add(right);
-        return { kind: "split", node, left, right };
+        return { kind: "card", node, left, right };
       }
-      case "divider":
+      case "band":
         return {
-          kind: "divider",
+          kind: "band",
           node: new runtime.BoxRenderable(renderer, {
             id: `dash-row-${row.key}`,
             width: "100%",
@@ -245,30 +262,57 @@ export function attachDashApp(
     }
   }
 
+  // Flatten the band model into the thin paint-row stream: a band-title rule
+  // per NON-EMPTY band (an empty band collapses), then its cards. Task `.2`
+  // replaces this with per-band sections of real boxed cards.
+  function flatten(model: DashModel): PaintRow[] {
+    const rows: PaintRow[] = [];
+    for (const b of model.bands) {
+      if (b.cards.length === 0) {
+        continue;
+      }
+      rows.push({ kind: "band", key: `band:${b.key}`, title: b.title });
+      for (const card of b.cards) {
+        rows.push({ kind: "card", key: card.key, card });
+      }
+    }
+    return rows;
+  }
+
+  // A card line: the robot glyph (rail-colored) + a space slot, then the title.
+  // The right side carries the dim project basename. Task `.2` moves the rail
+  // color to a left border and adds the focus/heavy-border channel.
+  function cardLeft(card: CardVM): StyledTextType {
+    const rail = colorForRail(card.railRole);
+    return new runtime.StyledText([
+      chunkFor(`${card.robotGlyph} `, rail),
+      chunkFor(card.title, {}),
+    ]);
+  }
+
   function render(model: DashModel): void {
     if (destroyed) {
       return;
     }
     // One column of left margin, matching the body rows' Box padding (Text
     // ignores padding options, so the margin is a literal space chunk).
-    header.content = styledRow([
-      { text: " ", role: "terminal" },
-      ...model.header,
-    ]);
+    header.content = plainText(` ${model.header}`);
+
+    const paintRows = flatten(model);
 
     // Ensure every wanted row exists with current content. New nodes mount
     // detached; the order pass below attaches them in position.
     const wantKeys: string[] = [];
-    for (const row of model.body) {
+    for (const row of paintRows) {
       wantKeys.push(row.key);
       let handle = rowNodes.get(row.key);
       if (handle === undefined) {
         handle = buildHandle(row);
         rowNodes.set(row.key, handle);
       }
-      if (row.kind === "split" && handle.left && handle.right) {
-        handle.left.content = styledRow(row.left);
-        handle.right.content = styledRow(row.right);
+      if (row.kind === "card" && handle.left && handle.right) {
+        handle.left.content = cardLeft(row.card);
+        handle.right.content = plainText(row.card.project);
       }
     }
 
@@ -342,13 +386,12 @@ export function attachDashApp(
 // Process shell
 // ---------------------------------------------------------------------------
 
-/** The mutable current-inputs struct the three subscriptions feed; each edge
- * rebuilds the view-model off the latest of all three. */
+/** The mutable current-inputs struct the subscriptions feed; each edge rebuilds
+ * the card model off the latest snapshot. `showTerminal` rides the ended/killed
+ * visibility toggle (task `.2` wires the keybind that flips it). */
 interface CurrentInputs {
   snapshot: ReadinessClientSnapshot | null;
-  autopilotRows: Record<string, unknown>[];
-  armedRows: Record<string, unknown>[];
-  connection: ConnectionState;
+  showTerminal: boolean;
 }
 
 /** The renderer + runtime ctors {@link createDashApp} threads into
@@ -442,9 +485,7 @@ export async function createDashApp(
 
   const inputs: CurrentInputs = {
     snapshot: null,
-    autopilotRows: [],
-    armedRows: [],
-    connection: "connecting",
+    showTerminal: false,
   };
 
   const app = attachDashApp(renderer, runtime, {
@@ -452,38 +493,35 @@ export async function createDashApp(
   });
 
   function paint(): void {
+    const snap = inputs.snapshot;
     app.render(
-      buildDashModel({
-        snapshot: inputs.snapshot,
-        autopilotRows: inputs.autopilotRows,
-        armedRows: inputs.armedRows,
-        connection: inputs.connection,
-        nowSec: Math.floor(Date.now() / 1000),
-      }),
+      buildDashModel(
+        snap?.jobs ?? new Map(),
+        snap?.subagentInvocations ?? [],
+        inputs.showTerminal,
+        Math.floor(Date.now() / 1000),
+      ),
     );
   }
 
-  // First paint — the connecting/waiting line before any data lands.
+  // First paint — the empty census before any data lands.
   paint();
 
-  // Three subscriptions feeding the one inputs struct. The readiness conn
-  // internally subscribes autopilot_state/armed_epics but does NOT expose them
-  // on the snapshot, so the header needs these two extra subs.
+  // The readiness subscription feeds the card model off the live jobs
+  // projection. The autopilot_state/armed_epics subs below are retained (their
+  // edges trigger repaints) though the robot-card model no longer reads them.
   const readinessHandle = subscribeReadiness({
     sockPath,
     idPrefix: "dash",
     ...connectOpt,
     onSnapshot: (snap) => {
       inputs.snapshot = snap;
-      inputs.connection = "live";
       paint();
     },
     onLifecycle: (event) => {
-      // Pre-paint shows `connecting…`; a post-paint drop shows
-      // `reconnecting…` with the last-good body frozen (snapshot retained).
+      // A snapshot is retained across a drop so the last-good board freezes
+      // until the conn comes back.
       if (event === "disconnected" || event === "connecting") {
-        inputs.connection =
-          inputs.snapshot === null ? "connecting" : "reconnecting";
         paint();
       }
     },
@@ -498,8 +536,7 @@ export async function createDashApp(
     idPrefix: "dash",
     collection: "autopilot_state",
     ...connectOpt,
-    onRows: (rows) => {
-      inputs.autopilotRows = rows;
+    onRows: () => {
       paint();
     },
     onFatal: () => exitCleanly(),
@@ -510,8 +547,7 @@ export async function createDashApp(
     idPrefix: "dash",
     collection: "armed_epics",
     ...connectOpt,
-    onRows: (rows) => {
-      inputs.armedRows = rows;
+    onRows: () => {
       paint();
     },
     onFatal: () => exitCleanly(),

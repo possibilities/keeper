@@ -1,77 +1,41 @@
 /**
  * Pure view-model tests for `src/dash/view-model.ts` and `src/dash/theme.ts`.
- * Table-driven over hand-built snapshots — no subprocess, no `sandboxEnv`, no
+ * Table-driven over hand-built jobs — no subprocess, no `sandboxEnv`, no
  * `@opentui` import anywhere (the property that keeps this file on the fast
- * tier). Asserts the SETTLED dash semantics: header permutations, the keyed
- * body row stream (section rules, spacer/divider runs between epic blocks,
- * placeholders), EPIC rows (server order, fallback label, glyph-only verdicts
- * incl. map-miss, the workability axis on titles, armed bolt gating, dep refs,
- * project basename), TASK rows (nesting, sort, per-task glyphs, dep refs), and
- * JOB rows (all-non-terminal inclusion + never-drop with label coalescing, the
- * unified COALESCE(active_since, created_at) DESC sort with job_id tiebreak +
- * NULL fallback + needs-you-no-reorder, the per-job rollup glyph matrix,
- * elapsed bands, glyph-only awaiting/failed annotations).
+ * tier). Asserts the SETTLED robot-card semantics: the six-rung status ladder
+ * (each rung → its dash-local robot codepoint + rail role; annotations outrank
+ * base state), band assignment (needs-you/in-motion/idle), stable intra-band
+ * `created_at` sort, the `showTerminal` toggle gating, the census header,
+ * per-field projection (project basename, never-blank label, role label,
+ * running-subagent count, age, session coords), ESC sanitization, and the
+ * never-throw fold on a malformed `state`. Also asserts the shared `fa-classic`
+ * board/jobs glyph map is UNCHANGED (the dash robot map is dash-local).
  */
 
 import { expect, test } from "bun:test";
-import { colorForRole, ROLE_COLORS } from "../src/dash/theme";
 import {
+  colorForRail,
+  colorForRole,
+  RAIL_COLORS,
+  type RailRole,
+  ROLE_COLORS,
+} from "../src/dash/theme";
+import {
+  type Band,
+  type BandKey,
   buildDashModel,
-  type ConnectionState,
+  type CardVM,
   type DashModel,
-  type DashModelInput,
-  projectArmed,
-  projectMode,
-  projectPaused,
-  type Row,
-  type SplitRow,
+  type RobotRung,
+  robotGlyph,
+  robotRung,
 } from "../src/dash/view-model";
 import { FA_CLASSIC, glyphForToken } from "../src/icon-theme";
-import type { ReadinessSnapshot } from "../src/readiness";
-import type { ReadinessClientSnapshot } from "../src/readiness-client";
-import type { Epic, Job, SubagentInvocation, Task } from "../src/types";
+import type { Job, SubagentInvocation } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Fixture builders
 // ---------------------------------------------------------------------------
-
-function makeTask(overrides: Partial<Task> = {}): Task {
-  return {
-    task_id: "fn-1-foo.1",
-    epic_id: "fn-1-foo",
-    task_number: 1,
-    title: "task",
-    target_repo: null,
-    tier: null,
-    worker_phase: "open",
-    runtime_status: "todo",
-    depends_on: [],
-    jobs: [],
-    ...overrides,
-  };
-}
-
-function makeEpic(overrides: Partial<Epic> = {}): Epic {
-  return {
-    epic_id: "fn-1-foo",
-    epic_number: 1,
-    title: "epic",
-    project_dir: "/repo",
-    status: "open",
-    last_event_id: 0,
-    updated_at: 0,
-    depends_on_epics: [],
-    tasks: [],
-    jobs: [],
-    job_links: [],
-    created_by_closer_of: null,
-    sort_path: "000001",
-    queue_jump: 0,
-    resolved_epic_deps: null,
-    last_validated_at: null,
-    ...overrides,
-  };
-}
 
 function makeJob(overrides: Partial<Job> = {}): Job {
   return {
@@ -128,903 +92,483 @@ function makeSub(
   };
 }
 
-function emptyReadiness(): ReadinessSnapshot {
-  return {
-    perTask: new Map(),
-    perCloseRow: new Map(),
-    perEpic: new Map(),
-    diagnostics: [],
-  };
-}
-
-function makeSnap(
-  overrides: Partial<ReadinessClientSnapshot> = {},
-): ReadinessClientSnapshot {
-  return {
-    epics: [],
-    jobs: new Map(),
-    subagentInvocations: [],
-    scheduledTasks: [],
-    gitStatus: [],
-    deadLetters: [],
-    pendingDispatches: [],
-    readiness: emptyReadiness(),
-    ...overrides,
-  };
-}
-
-/** A `dead_letters`-length stub — only `.length` is read by the header. */
-function deadLetters(n: number): ReadinessClientSnapshot["deadLetters"] {
-  // The view-model reads only `.length`; an array of `n` placeholder rows
-  // suffices without standing up the full `DeadLetter` shape.
-  return Array.from({ length: n }) as ReadinessClientSnapshot["deadLetters"];
-}
-
 // ---------------------------------------------------------------------------
-// Assertion helpers
+// Helpers
 // ---------------------------------------------------------------------------
 
-/** Concatenated text of every segment in a row. */
-function rowText(row: Row): string {
-  return row.map((s) => s.text).join("");
+const NOW = 1000;
+
+function jobsMap(jobs: Job[]): Map<string, Job> {
+  return new Map(jobs.map((j) => [j.job_id, j]));
 }
 
-/** The role attached to the first segment whose text contains `needle`. */
-function roleOf(row: Row, needle: string): string | undefined {
-  return row.find((s) => s.text.includes(needle))?.role;
+function build(
+  jobs: Job[],
+  opts: {
+    subagents?: SubagentInvocation[];
+    showTerminal?: boolean;
+    nowSec?: number;
+  } = {},
+): DashModel {
+  return buildDashModel(
+    jobsMap(jobs),
+    opts.subagents ?? [],
+    opts.showTerminal ?? false,
+    opts.nowSec ?? NOW,
+  );
 }
 
-/** The body row with this key, asserted to exist and be a split row. */
-function splitRow(model: DashModel, key: string): SplitRow {
-  const row = model.body.find((r) => r.key === key);
-  expect(row).toBeDefined();
-  expect(row?.kind).toBe("split");
-  return row as SplitRow;
+function band(model: DashModel, key: BandKey): Band {
+  const b = model.bands.find((x) => x.key === key);
+  expect(b).toBeDefined();
+  return b as Band;
 }
 
-/** Ordered keys of every body row matching a prefix. */
-function keysWithPrefix(model: DashModel, prefix: string): string[] {
-  return model.body.filter((r) => r.key.startsWith(prefix)).map((r) => r.key);
+function cardKeys(model: DashModel, key: BandKey): string[] {
+  return band(model, key).cards.map((c) => c.key);
 }
 
-const GLYPH = {
-  ready: glyphForToken("ready", FA_CLASSIC) as string,
-  completed: glyphForToken("completed", FA_CLASSIC) as string,
-  ban: glyphForToken("blocked:unknown", FA_CLASSIC) as string,
-  sync: glyphForToken("running:job-running", FA_CLASSIC) as string,
-  bolt: glyphForToken("armed", FA_CLASSIC) as string,
-  times: glyphForToken("failed", FA_CLASSIC) as string,
-  hand: glyphForToken("awaiting:permission", FA_CLASSIC) as string,
-  comment: glyphForToken("awaiting:ask_user_question", FA_CLASSIC) as string,
+/** The single card in a one-job model (asserts exactly one across all bands). */
+function onlyCard(model: DashModel): CardVM {
+  const all = model.bands.flatMap((b) => b.cards);
+  expect(all).toHaveLength(1);
+  return all[0] as CardVM;
+}
+
+// The dash-local robot codepoints, materialized the same way the model does.
+const ROBOT: Record<RobotRung, string> = {
+  error: String.fromCodePoint(0xf169d),
+  awaiting: String.fromCodePoint(0xf169f),
+  working: String.fromCodePoint(0xf06a9),
+  ended: String.fromCodePoint(0xf1719),
+  stopped: String.fromCodePoint(0xf167a),
+  killed: String.fromCodePoint(0xf16a1),
 };
 
-const BASE_INPUT = {
-  snapshot: makeSnap(),
-  autopilotRows: [] as Record<string, unknown>[],
-  armedRows: [] as Record<string, unknown>[],
-  connection: "live" as ConnectionState,
-  nowSec: 1000,
-};
-
-function build(overrides: Partial<DashModelInput>): DashModel {
-  return buildDashModel({ ...BASE_INPUT, ...overrides });
-}
-
 // ---------------------------------------------------------------------------
-// theme.ts
+// theme.ts — rail roles
 // ---------------------------------------------------------------------------
 
-test("theme: roles map to plain descriptors (index/dim/bold only, no RGBA)", () => {
+test("theme: rail roles map to plain descriptors (index/dim only, no RGBA)", () => {
   const roles = [
-    "motion",
-    "ready",
-    "attention",
-    "failed",
-    "terminal",
-    "accent",
-    "heading",
-    "text",
+    "error",
+    "awaiting",
+    "working",
+    "idle-ended",
+    "idle-stopped",
+    "idle-killed",
   ] as const;
   for (const role of roles) {
-    const d = colorForRole(role);
+    const d = colorForRail(role);
     for (const k of Object.keys(d)) {
       expect(["index", "dim", "bold"]).toContain(k);
     }
-    if (d.index !== undefined) {
-      expect(Number.isInteger(d.index)).toBe(true);
-    }
+    expect(Number.isInteger(d.index)).toBe(true);
   }
-  // `terminal` carries the dim flag; `heading` is bold default-fg; `text` is
-  // bare default-fg (no index — the terminal's own foreground).
-  expect(ROLE_COLORS.terminal.dim).toBe(true);
-  expect(ROLE_COLORS.motion.dim).toBeUndefined();
-  expect(ROLE_COLORS.heading.bold).toBe(true);
-  expect(ROLE_COLORS.heading.index).toBeUndefined();
-  expect(ROLE_COLORS.text.index).toBeUndefined();
+  // The three idle/terminal rungs carry dim; the attention rungs do not. The
+  // lightness-distinct attention indices (1/3/12) survive grayscale.
+  expect(RAIL_COLORS.error.index).toBe(1);
+  expect(RAIL_COLORS.awaiting.index).toBe(3);
+  expect(RAIL_COLORS.working.index).toBe(12);
+  expect(RAIL_COLORS["idle-ended"]).toEqual({ index: 2, dim: true });
+  expect(RAIL_COLORS["idle-stopped"]).toEqual({ index: 7, dim: true });
+  expect(RAIL_COLORS["idle-killed"]).toEqual({ index: 1, dim: true });
+  expect(RAIL_COLORS.working.dim).toBeUndefined();
+});
+
+test("theme: the legacy text ROLE_COLORS map is untouched", () => {
+  // The dash card view forks a NEW rail map; the board/jobs text roles stay.
+  expect(colorForRole("motion")).toEqual({ index: 12 });
+  expect(ROLE_COLORS.terminal).toEqual({ index: 7, dim: true });
+  expect(ROLE_COLORS.heading).toEqual({ bold: true });
 });
 
 // ---------------------------------------------------------------------------
-// Forked autopilot projectors
+// Status ladder
 // ---------------------------------------------------------------------------
 
-test("projectors: empty rows return null (keep seed); paused/mode coerce", () => {
-  expect(projectPaused([])).toBeNull();
-  expect(projectPaused([{ paused: 1 }])).toBe(true);
-  expect(projectPaused([{ paused: 0 }])).toBe(false);
-  expect(projectPaused([{ paused: "x" }])).toBe(true); // safer side
+test("ladder: each base state resolves to its robot codepoint + rail role", () => {
+  const cases: [Partial<Job>, RobotRung, RailRole][] = [
+    [{ state: "working" }, "working", "working"],
+    [{ state: "ended" }, "ended", "idle-ended"],
+    [{ state: "stopped" }, "stopped", "idle-stopped"],
+    [{ state: "killed" }, "killed", "idle-killed"],
+  ];
+  for (const [override, rung, rail] of cases) {
+    const job = makeJob({ job_id: "j", ...override });
+    expect(robotRung(job)).toBe(rung);
+    const card = onlyCard(build([job], { showTerminal: true }));
+    expect(card.robotGlyph).toBe(ROBOT[rung]);
+    expect(card.railRole).toBe(rail);
+    expect(card.statusWord).toBe(rung);
+  }
+});
 
-  expect(projectMode([])).toBeNull();
-  expect(projectMode([{ mode: "armed" }])).toBe("armed");
-  expect(projectMode([{ mode: "weird" }])).toBe("yolo");
+test("ladder: robotGlyph resolver matches the materialized codepoints", () => {
+  expect(robotGlyph("error")).toBe(ROBOT.error);
+  expect(robotGlyph("awaiting")).toBe(ROBOT.awaiting);
+  expect(robotGlyph("working")).toBe(ROBOT.working);
+  expect(robotGlyph("ended")).toBe(ROBOT.ended);
+  expect(robotGlyph("stopped")).toBe(ROBOT.stopped);
+  expect(robotGlyph("killed")).toBe(ROBOT.killed);
+});
 
-  expect(projectArmed([{ epic_id: "fn-2" }, { epic_id: "fn-1" }])).toEqual([
-    "fn-1",
-    "fn-2",
+test("ladder: api-error outranks every base state (priority 1, red rail)", () => {
+  for (const state of ["working", "stopped", "ended", "killed"]) {
+    const job = makeJob({ job_id: "j", state, last_api_error_at: 5 });
+    expect(robotRung(job)).toBe("error");
+    const card = onlyCard(build([job], { showTerminal: true }));
+    expect(card.robotGlyph).toBe(ROBOT.error);
+    expect(card.railRole).toBe("error");
+  }
+});
+
+test("ladder: awaiting (permission OR input) outranks working (priority 2)", () => {
+  // working + a permission prompt → confused/yellow, not robot/blue.
+  const perm = makeJob({
+    job_id: "j",
+    state: "working",
+    last_permission_prompt_at: 5,
+  });
+  expect(robotRung(perm)).toBe("awaiting");
+  expect(onlyCard(build([perm])).railRole).toBe("awaiting");
+
+  const input = makeJob({
+    job_id: "j",
+    state: "working",
+    last_input_request_at: 5,
+  });
+  expect(robotRung(input)).toBe("awaiting");
+  expect(onlyCard(build([input])).robotGlyph).toBe(ROBOT.awaiting);
+});
+
+test("ladder: api-error outranks awaiting (priority 1 over 2)", () => {
+  const job = makeJob({
+    job_id: "j",
+    state: "working",
+    last_api_error_at: 9,
+    last_permission_prompt_at: 5,
+    last_input_request_at: 5,
+  });
+  expect(robotRung(job)).toBe("error");
+});
+
+test("ladder: a malformed/unknown state folds to stopped — never throws", () => {
+  for (const state of ["", "garbage", "WORKING", "paused"]) {
+    const job = makeJob({ job_id: "j", state });
+    expect(() => robotRung(job)).not.toThrow();
+    expect(robotRung(job)).toBe("stopped");
+    const card = onlyCard(build([job]));
+    expect(card.robotGlyph).toBe(ROBOT.stopped);
+    expect(card.railRole).toBe("idle-stopped");
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Bands
+// ---------------------------------------------------------------------------
+
+test("bands: model emits the three bands in render order, even when empty", () => {
+  const m = build([]);
+  expect(m.bands.map((b) => b.key)).toEqual(["needs-you", "in-motion", "idle"]);
+  // Every band carries an empty card array — never undefined.
+  for (const b of m.bands) {
+    expect(b.cards).toEqual([]);
+  }
+});
+
+test("bands: each rung sorts into its urgency band", () => {
+  const jobs = [
+    makeJob({ job_id: "err", state: "working", last_api_error_at: 1 }),
+    makeJob({ job_id: "ask", state: "stopped", last_input_request_at: 1 }),
+    makeJob({ job_id: "work", state: "working" }),
+    makeJob({ job_id: "idle", state: "stopped" }),
+  ];
+  const m = build(jobs);
+  expect(cardKeys(m, "needs-you").sort()).toEqual(["job:ask", "job:err"]);
+  expect(cardKeys(m, "in-motion")).toEqual(["job:work"]);
+  expect(cardKeys(m, "idle")).toEqual(["job:idle"]);
+});
+
+test("bands: ended/killed land in the idle band when shown", () => {
+  const jobs = [
+    makeJob({ job_id: "done", state: "ended" }),
+    makeJob({ job_id: "dead", state: "killed" }),
+    makeJob({ job_id: "off", state: "stopped" }),
+  ];
+  const m = build(jobs, { showTerminal: true });
+  expect(cardKeys(m, "idle").sort()).toEqual([
+    "job:dead",
+    "job:done",
+    "job:off",
   ]);
-  expect(projectArmed([{ epic_id: "" }, {}])).toEqual([]);
 });
 
 // ---------------------------------------------------------------------------
-// Header
+// Intra-band sort
 // ---------------------------------------------------------------------------
 
-test("header: seed (no autopilot edge) is paused · yolo, no armed/dl segment", () => {
-  const { header } = build({});
-  const text = rowText(header);
-  expect(text).toContain("autopilot");
-  expect(text).toContain("yolo");
-  expect(text).not.toContain("armed");
-  expect(text).not.toContain("dead-letter");
-});
-
-test("header: playing tags the autopilot segment motion; paused tags terminal", () => {
-  const playing = build({ autopilotRows: [{ paused: 0, mode: "yolo" }] });
-  expect(roleOf(playing.header, "autopilot")).toBe("motion");
-
-  const paused = build({ autopilotRows: [{ paused: 1, mode: "yolo" }] });
-  expect(roleOf(paused.header, "autopilot")).toBe("terminal");
-});
-
-test("header: armed mode with N armed renders the count; empty renders nothing armed", () => {
-  const two = build({
-    autopilotRows: [{ paused: 0, mode: "armed" }],
-    armedRows: [{ epic_id: "fn-1" }, { epic_id: "fn-2" }],
-  });
-  expect(rowText(two.header)).toContain("2 armed");
-  expect(rowText(two.header)).not.toContain("nothing armed");
-
-  const none = build({
-    autopilotRows: [{ paused: 0, mode: "armed" }],
-    armedRows: [],
-  });
-  expect(rowText(none.header)).toContain("nothing armed");
-  expect(roleOf(none.header, "nothing armed")).toBe("attention");
-});
-
-test("header: yolo mode never renders an armed segment", () => {
-  const yolo = build({
-    autopilotRows: [{ paused: 0, mode: "yolo" }],
-    armedRows: [{ epic_id: "fn-1" }],
-  });
-  expect(rowText(yolo.header)).not.toContain("armed");
-});
-
-test("header: dead-letter segment only when count > 0", () => {
-  const none = build({ snapshot: makeSnap({ deadLetters: deadLetters(0) }) });
-  expect(rowText(none.header)).not.toContain("dead-letter");
-
-  const some = build({ snapshot: makeSnap({ deadLetters: deadLetters(3) }) });
-  expect(rowText(some.header)).toContain("3 dead-letter");
-  expect(roleOf(some.header, "dead-letter")).toBe("attention");
-});
-
-test("header: connection marker shows only when not live", () => {
-  expect(rowText(build({ connection: "live" }).header)).not.toMatch(/ing…/);
-  expect(rowText(build({ connection: "connecting" }).header)).toContain(
-    "connecting…",
-  );
-  expect(rowText(build({ connection: "reconnecting" }).header)).toContain(
-    "reconnecting…",
-  );
-});
-
-// ---------------------------------------------------------------------------
-// Body structure
-// ---------------------------------------------------------------------------
-
-test("body: epic blocks precede job rows, fenced by one div:jobs divider", () => {
-  const snapshot = makeSnap({
-    epics: [makeEpic({ epic_id: "fn-1-a" })],
-    jobs: new Map([["j", makeJob({ job_id: "j" })]]),
-  });
-  const m = build({ snapshot });
-  const keys = m.body.map((r) => r.key);
-  expect(keys.indexOf("epic:fn-1-a")).toBeLessThan(keys.indexOf("div:jobs"));
-  expect(keys.indexOf("div:jobs")).toBeLessThan(keys.indexOf("job:j"));
-
-  // A lone region needs no fence.
-  const epicsOnly = build({
-    snapshot: makeSnap({ epics: [makeEpic({ epic_id: "fn-1-a" })] }),
-  });
-  expect(epicsOnly.body.map((r) => r.key)).not.toContain("div:jobs");
-  const jobsOnly = build({
-    snapshot: makeSnap({ jobs: new Map([["j", makeJob({ job_id: "j" })]]) }),
-  });
-  expect(jobsOnly.body.map((r) => r.key)).not.toContain("div:jobs");
-});
-
-test("body: one divider separates epic blocks, keyed on the epic above", () => {
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({ epic_id: "fn-1-a", epic_number: 1, sort_path: "000001" }),
-      makeEpic({ epic_id: "fn-2-b", epic_number: 2, sort_path: "000002" }),
-    ],
-  });
-  const m = build({ snapshot });
-  const keys = m.body.map((r) => r.key);
-  // The divider rides the FIRST epic's id, so appending an epic below never
-  // re-keys an existing divider.
-  const i = keys.indexOf("epic:fn-1-a");
-  expect(keys.slice(i, i + 3)).toEqual([
-    "epic:fn-1-a",
-    "div:fn-1-a",
-    "epic:fn-2-b",
+test("sort: stable created_at ASC within a band, job_id ASC tiebreak", () => {
+  const jobs = [
+    makeJob({ job_id: "c", state: "stopped", created_at: 30 }),
+    makeJob({ job_id: "a", state: "stopped", created_at: 10 }),
+    // Two equal created_at → job_id ASC (eq-a before eq-b).
+    makeJob({ job_id: "eq-b", state: "stopped", created_at: 20 }),
+    makeJob({ job_id: "eq-a", state: "stopped", created_at: 20 }),
+  ];
+  const m = build(jobs);
+  expect(cardKeys(m, "idle")).toEqual([
+    "job:a",
+    "job:eq-a",
+    "job:eq-b",
+    "job:c",
   ]);
-  // No divider trails the last block.
-  expect(keys).not.toContain("div:fn-2-b");
-
-  // A single epic renders no divider at all.
-  const one = build({
-    snapshot: makeSnap({ epics: [makeEpic({ epic_id: "fn-1-a" })] }),
-  });
-  expect(one.body.some((r) => r.kind === "divider")).toBe(false);
 });
 
-test("body: null snapshot yields only the waiting line; header still renders", () => {
-  const m = build({ snapshot: null, connection: "connecting" });
-  expect(m.body.map((r) => r.key)).toEqual(["ph:waiting"]);
-  const waiting = splitRow(m, "ph:waiting");
-  expect(rowText(waiting.left)).toContain("waiting for keeperd");
-  expect(roleOf(waiting.left, "waiting")).toBe("terminal");
-  // The header still renders off the autopilot seed.
-  expect(rowText(m.header)).toContain("autopilot");
-});
-
-test("body: loaded-but-empty regions render nothing — no placeholder lines", () => {
-  const m = build({ snapshot: makeSnap(), connection: "live" });
-  expect(m.body).toHaveLength(0);
+test("sort: order is independent of input map insertion order", () => {
+  const m = build([
+    makeJob({ job_id: "z", state: "working", created_at: 99 }),
+    makeJob({ job_id: "y", state: "working", created_at: 1 }),
+  ]);
+  // created_at ASC → y (1) before z (99) regardless of insertion order.
+  expect(cardKeys(m, "in-motion")).toEqual(["job:y", "job:z"]);
 });
 
 // ---------------------------------------------------------------------------
-// EPICS
+// Toggle gating
 // ---------------------------------------------------------------------------
 
-test("epics: rows keep server order (no client re-sort)", () => {
-  // Epics in a deliberately non-sorted-by-id order; the view-model must keep
-  // the array order it was handed (server `sort_path`).
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({ epic_id: "fn-9-z", epic_number: 9, title: "zeta" }),
-      makeEpic({ epic_id: "fn-2-a", epic_number: 2, title: "alpha" }),
-    ],
-  });
-  const m = build({ snapshot });
-  expect(keysWithPrefix(m, "epic:")).toEqual(["epic:fn-9-z", "epic:fn-2-a"]);
+test("toggle: showTerminal=false hides ended/killed (default)", () => {
+  const jobs = [
+    makeJob({ job_id: "done", state: "ended" }),
+    makeJob({ job_id: "dead", state: "killed" }),
+    makeJob({ job_id: "off", state: "stopped" }),
+  ];
+  const m = build(jobs, { showTerminal: false });
+  // Only the non-terminal stopped card survives.
+  expect(m.bands.flatMap((b) => b.cards).map((c) => c.key)).toEqual([
+    "job:off",
+  ]);
+  expect(cardKeys(m, "idle")).toEqual(["job:off"]);
 });
 
-test("epics: label falls back to epic_id when number and title are null", () => {
-  const snapshot = makeSnap({
-    epics: [makeEpic({ epic_id: "fn-7-x", epic_number: null, title: null })],
-  });
-  const m = build({ snapshot });
-  expect(rowText(splitRow(m, "epic:fn-7-x").left)).toContain("fn-7-x");
+test("toggle: showTerminal=true reveals the happy/dead robots", () => {
+  const jobs = [
+    makeJob({ job_id: "done", state: "ended" }),
+    makeJob({ job_id: "dead", state: "killed" }),
+  ];
+  const m = build(jobs, { showTerminal: true });
+  const cards = band(m, "idle").cards;
+  const done = cards.find((c) => c.key === "job:done");
+  const dead = cards.find((c) => c.key === "job:dead");
+  expect(done?.robotGlyph).toBe(ROBOT.ended);
+  expect(done?.isTerminal).toBe(true);
+  expect(dead?.robotGlyph).toBe(ROBOT.killed);
+  expect(dead?.isTerminal).toBe(true);
 });
 
-test("epics: glyph-only verdicts — no pill words anywhere on the row", () => {
-  const readiness = emptyReadiness();
-  readiness.perEpic.set("fn-1-foo", { tag: "ready" });
-  const snapshot = makeSnap({ epics: [makeEpic({})], readiness });
-  const row = splitRow(build({ snapshot }), "epic:fn-1-foo");
-  expect(row.left[0]?.text).toContain(GLYPH.ready);
-  expect(row.left[0]?.role).toBe("ready");
-  // The verdict WORD never renders — the glyph + color carry the state.
-  expect(rowText(row.left)).not.toContain("ready");
-
-  // No perEpic entry → the visible blocked/unknown glyph in attention.
-  const missRow = splitRow(
-    build({ snapshot: makeSnap({ epics: [makeEpic({})] }) }),
-    "epic:fn-1-foo",
-  );
-  expect(missRow.left[0]?.text).toContain(GLYPH.ban);
-  expect(missRow.left[0]?.role).toBe("attention");
-  expect(rowText(missRow.left)).not.toContain("blocked");
+test("toggle: a non-terminal card is never marked isTerminal", () => {
+  const m = build([makeJob({ job_id: "j", state: "working" })]);
+  expect(onlyCard(m).isTerminal).toBe(false);
 });
 
-test("epics: workability axis — workable title is heading, inert title recedes dim", () => {
-  const readiness = emptyReadiness();
-  readiness.perEpic.set("fn-1-foo", { tag: "ready" });
-  const ready = splitRow(
-    build({ snapshot: makeSnap({ epics: [makeEpic({})], readiness }) }),
-    "epic:fn-1-foo",
-  );
-  expect(roleOf(ready.left, "epic")).toBe("heading");
+// ---------------------------------------------------------------------------
+// Census header
+// ---------------------------------------------------------------------------
 
-  const done = emptyReadiness();
-  done.perEpic.set("fn-1-foo", { tag: "completed" });
-  const completed = splitRow(
-    build({ snapshot: makeSnap({ epics: [makeEpic({})], readiness: done }) }),
-    "epic:fn-1-foo",
-  );
-  expect(completed.left[0]?.role).toBe("terminal"); // glyph
-  expect(roleOf(completed.left, "epic")).toBe("terminal"); // title
-
-  const blocked = splitRow(
-    build({ snapshot: makeSnap({ epics: [makeEpic({})] }) }),
-    "epic:fn-1-foo",
-  );
-  expect(roleOf(blocked.left, "epic")).toBe("terminal");
+test("census: header counts total + per band", () => {
+  const jobs = [
+    makeJob({ job_id: "err", state: "working", last_api_error_at: 1 }),
+    makeJob({ job_id: "work", state: "working" }),
+    makeJob({ job_id: "work2", state: "working" }),
+    makeJob({ job_id: "idle", state: "stopped" }),
+  ];
+  const m = build(jobs);
+  expect(m.header).toBe("4 jobs · 1 need you · 2 in motion · 1 idle");
 });
 
-test("epics: no task-count segment renders", () => {
-  const readiness = emptyReadiness();
-  readiness.perTask.set("fn-1-foo.1", { tag: "completed" });
-  const snapshot = makeSnap({
-    epics: [makeEpic({ tasks: [makeTask({})] })],
-    readiness,
-  });
-  const row = splitRow(build({ snapshot }), "epic:fn-1-foo");
-  expect(rowText(row.left) + rowText(row.right)).not.toMatch(/\d+\/\d+/);
+test("census: empty board reads 0 jobs (header never bare)", () => {
+  expect(build([]).header).toBe("0 jobs · 0 need you · 0 in motion · 0 idle");
 });
 
-test("epics: armed bolt (accent) only in armed mode AND only on armed epics", () => {
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({ epic_id: "fn-1-foo", sort_path: "000001" }),
-      makeEpic({ epic_id: "fn-2-bar", epic_number: 2, sort_path: "000002" }),
-    ],
-  });
-  const armed = build({
-    snapshot,
-    autopilotRows: [{ paused: 0, mode: "armed" }],
-    armedRows: [{ epic_id: "fn-1-foo" }],
-  });
-  expect(rowText(splitRow(armed, "epic:fn-1-foo").left)).toContain(GLYPH.bolt);
-  expect(roleOf(splitRow(armed, "epic:fn-1-foo").left, GLYPH.bolt)).toBe(
-    "accent",
-  );
-  expect(rowText(splitRow(armed, "epic:fn-2-bar").left)).not.toContain(
-    GLYPH.bolt,
-  );
-
-  // Yolo mode: the armed set is not dispatch policy — no bolt even when set.
-  const yolo = build({
-    snapshot,
-    autopilotRows: [{ paused: 0, mode: "yolo" }],
-    armedRows: [{ epic_id: "fn-1-foo" }],
-  });
-  expect(rowText(splitRow(yolo, "epic:fn-1-foo").left)).not.toContain(
-    GLYPH.bolt,
+test("census: a single live job uses the singular noun", () => {
+  expect(build([makeJob({ job_id: "j", state: "working" })]).header).toContain(
+    "1 job ·",
   );
 });
 
-test("epics: project basename right-aligns dim; root-less dir renders as-is", () => {
-  const snapshot = makeSnap({
-    epics: [makeEpic({ project_dir: "/Users/mike/code/keeper" })],
-  });
-  const row = splitRow(build({ snapshot }), "epic:fn-1-foo");
-  expect(rowText(row.right)).toContain("keeper");
-  expect(rowText(row.right)).not.toContain("/Users");
-  expect(roleOf(row.right, "keeper")).toBe("terminal");
+test("census: hidden terminal cards do not inflate the count", () => {
+  const jobs = [
+    makeJob({ job_id: "off", state: "stopped" }),
+    makeJob({ job_id: "done", state: "ended" }),
+  ];
+  // Terminal hidden → only 1 job counted.
+  expect(build(jobs, { showTerminal: false }).header).toContain("1 job ·");
+});
 
-  const noDir = makeSnap({ epics: [makeEpic({ project_dir: null })] });
+// ---------------------------------------------------------------------------
+// Per-field projection
+// ---------------------------------------------------------------------------
+
+test("fields: project is the cwd basename; empty when cwd is blank", () => {
   expect(
-    rowText(splitRow(build({ snapshot: noDir }), "epic:fn-1-foo").right),
+    onlyCard(build([makeJob({ job_id: "j", cwd: "/code/keeper" })])).project,
+  ).toBe("keeper");
+  expect(onlyCard(build([makeJob({ job_id: "j", cwd: "" })])).project).toBe("");
+});
+
+test("fields: title coalesces title→plan_ref→job_id (never blank)", () => {
+  expect(
+    onlyCard(build([makeJob({ job_id: "j", title: "worker A" })])).title,
+  ).toBe("worker A");
+  expect(
+    onlyCard(
+      build([makeJob({ job_id: "j", title: null, plan_ref: "fn-3-baz.2" })]),
+    ).title,
+  ).toBe("fn-3-baz.2");
+  expect(
+    onlyCard(build([makeJob({ job_id: "j", title: null, plan_ref: null })]))
+      .title,
+  ).toBe("j");
+});
+
+test("fields: roleLabel maps the plan verb to its noun (worker)", () => {
+  expect(
+    onlyCard(build([makeJob({ job_id: "j", plan_verb: "work" })])).roleLabel,
+  ).toBe("worker");
+  expect(
+    onlyCard(build([makeJob({ job_id: "j", plan_verb: "plan" })])).roleLabel,
+  ).toBe("planner");
+  // Null plan_verb → empty label, never a crash.
+  expect(
+    onlyCard(build([makeJob({ job_id: "j", plan_verb: null })])).roleLabel,
   ).toBe("");
 });
 
-test("epics: resolved dep refs — state-colored #N / cross-project / dangling forms", () => {
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({
-        depends_on_epics: ["fn-3", "other-5", "fn-9-gone"],
-        resolved_epic_deps: [
-          {
-            dep_token: "fn-3",
-            resolved_epic_id: "fn-3-x",
-            epic_number: 3,
-            project_basename: null,
-            cross_project: false,
-            state: "satisfied",
-          },
-          {
-            dep_token: "other-5",
-            resolved_epic_id: "other-5-y",
-            epic_number: 5,
-            project_basename: "otherproj",
-            cross_project: true,
-            state: "blocked-incomplete",
-          },
-          {
-            dep_token: "fn-9-gone",
-            resolved_epic_id: null,
-            epic_number: null,
-            project_basename: null,
-            cross_project: false,
-            state: "dangling",
-          },
-        ],
-      }),
-    ],
-  });
-  const row = splitRow(build({ snapshot }), "epic:fn-1-foo");
-  const right = rowText(row.right);
-  expect(right).toContain("after ");
-  expect(right).toContain("#3");
-  expect(roleOf(row.right, "#3")).toBe("terminal"); // satisfied → recedes
-  expect(right).toContain("otherproj#5");
-  expect(roleOf(row.right, "otherproj#5")).toBe("attention"); // live gate
-  expect(right).toContain("?fn-9-gone");
-  expect(roleOf(row.right, "?fn-9-gone")).toBe("failed"); // dangling
-});
-
-test("epics: null dep projection falls back to parsing raw tokens dim", () => {
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({
-        depends_on_epics: ["fn-31-slug", "weird token"],
-        resolved_epic_deps: null,
-      }),
-    ],
-  });
-  const row = splitRow(build({ snapshot }), "epic:fn-1-foo");
-  expect(rowText(row.right)).toContain("#31");
-  expect(rowText(row.right)).toContain("?weird token");
-  expect(roleOf(row.right, "#31")).toBe("terminal");
-
-  // No deps at all → no `after` lead.
-  const none = splitRow(
-    build({ snapshot: makeSnap({ epics: [makeEpic({})] }) }),
-    "epic:fn-1-foo",
-  );
-  expect(rowText(none.right)).not.toContain("after");
-});
-
-// ---------------------------------------------------------------------------
-// Tasks
-// ---------------------------------------------------------------------------
-
-test("tasks: nest under their epic in task_number order, indented", () => {
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({
-        tasks: [
-          makeTask({ task_id: "fn-1-foo.3", task_number: 3, title: "three" }),
-          makeTask({ task_id: "fn-1-foo.1", task_number: 1, title: "one" }),
-          makeTask({ task_id: "fn-1-foo.2", task_number: 2, title: "two" }),
-        ],
-      }),
-    ],
-  });
-  const m = build({ snapshot });
-  expect(keysWithPrefix(m, "epic:fn-1-foo:task:")).toEqual([
-    "epic:fn-1-foo:task:fn-1-foo.1",
-    "epic:fn-1-foo:task:fn-1-foo.2",
-    "epic:fn-1-foo:task:fn-1-foo.3",
-  ]);
-  const row = splitRow(m, "epic:fn-1-foo:task:fn-1-foo.1");
-  expect(row.indent).toBeGreaterThan(0);
-  expect(rowText(row.left)).toContain("one");
-});
-
-test("tasks: per-task glyph from perTask verdict; miss renders blocked/unknown", () => {
-  const readiness = emptyReadiness();
-  readiness.perTask.set("fn-1-foo.1", { tag: "completed" });
-  readiness.perTask.set("fn-1-foo.2", { tag: "ready" });
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({
-        tasks: [
-          makeTask({ task_id: "fn-1-foo.1", task_number: 1, title: "done" }),
-          makeTask({ task_id: "fn-1-foo.2", task_number: 2, title: "go" }),
-          makeTask({ task_id: "fn-1-foo.3", task_number: 3, title: "miss" }),
-        ],
-      }),
-    ],
-    readiness,
-  });
-  const m = build({ snapshot });
-
-  const done = splitRow(m, "epic:fn-1-foo:task:fn-1-foo.1");
-  expect(done.left[0]?.text).toContain(GLYPH.completed);
-  expect(done.left[0]?.role).toBe("terminal");
-  expect(roleOf(done.left, "done")).toBe("terminal"); // title recedes
-
-  const go = splitRow(m, "epic:fn-1-foo:task:fn-1-foo.2");
-  expect(go.left[0]?.text).toContain(GLYPH.ready);
-  expect(go.left[0]?.role).toBe("ready");
-  expect(roleOf(go.left, "go")).toBe("text"); // workable, task tier
-
-  const miss = splitRow(m, "epic:fn-1-foo:task:fn-1-foo.3");
-  expect(miss.left[0]?.text).toContain(GLYPH.ban);
-  expect(miss.left[0]?.role).toBe("attention");
-});
-
-test("tasks: dep refs render numbers colored by the dep's own verdict", () => {
-  const readiness = emptyReadiness();
-  readiness.perTask.set("fn-1-foo.1", { tag: "completed" });
-  const snapshot = makeSnap({
-    epics: [
-      makeEpic({
-        tasks: [
-          makeTask({ task_id: "fn-1-foo.1", task_number: 1 }),
-          makeTask({ task_id: "fn-1-foo.2", task_number: 2 }),
-          makeTask({
-            task_id: "fn-1-foo.3",
-            task_number: 3,
-            depends_on: ["fn-1-foo.1", "fn-1-foo.2"],
-          }),
-        ],
-      }),
-    ],
-    readiness,
-  });
-  const row = splitRow(build({ snapshot }), "epic:fn-1-foo:task:fn-1-foo.3");
-  expect(rowText(row.right)).toContain("after ");
-  // Dep .1 completed → dim; dep .2 not completed → attention (still gating).
-  const one = row.right.find((s) => s.text === "1");
-  const two = row.right.find((s) => s.text === "2");
-  expect(one?.role).toBe("terminal");
-  expect(two?.role).toBe("attention");
-
-  // No deps → empty right side.
-  const noDeps = splitRow(build({ snapshot }), "epic:fn-1-foo:task:fn-1-foo.1");
-  expect(rowText(noDeps.right)).toBe("");
-});
-
-// ---------------------------------------------------------------------------
-// JOBS
-// ---------------------------------------------------------------------------
-
-test("jobs: includes EVERY non-terminal job — working AND idle stopped", () => {
-  const jobs = new Map<string, Job>([
-    ["w", makeJob({ job_id: "w", state: "working" })],
-    [
-      "ny",
-      makeJob({
-        job_id: "ny",
-        state: "stopped",
-        last_input_request_at: 5,
-      }),
-    ],
-    // Idle stopped (no needs-you stamp) is INCLUDED on the unified timeline
-    // — the collections defaultFilter already excludes ended/killed.
-    ["idle", makeJob({ job_id: "idle", state: "stopped" })],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }) });
-  expect(keysWithPrefix(m, "job:").sort()).toEqual([
-    "job:idle",
-    "job:ny",
-    "job:w",
-  ]);
-});
-
-test("jobs: never drops a needs-you row; label coalesces title→plan_ref→job_id", () => {
-  const jobs = new Map<string, Job>([
-    [
-      "j1",
-      makeJob({
-        job_id: "j1",
-        state: "stopped",
-        title: null,
-        plan_ref: null,
-        last_permission_prompt_at: 9,
-      }),
-    ],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }) });
-  // No title, no plan_ref → falls back to the job_id label.
-  expect(rowText(splitRow(m, "job:j1").left)).toContain("j1");
-
-  const withRef = build({
-    snapshot: makeSnap({
-      jobs: new Map([
-        [
-          "j2",
-          makeJob({
-            job_id: "j2",
-            state: "stopped",
-            title: null,
-            plan_ref: "fn-3-baz.2",
-            last_api_error_at: 1,
-          }),
-        ],
-      ]),
-    }),
-  });
-  expect(rowText(splitRow(withRef, "job:j2").left)).toContain("fn-3-baz.2");
-});
-
-test("jobs: per-job rollup glyph matrix (sync/cogs/warn/eye/circleO + ambient→idle)", () => {
-  const SYNC = glyphForToken("running:job-running", FA_CLASSIC) as string;
-  const COGS = glyphForToken("running:sub-agent-running", FA_CLASSIC) as string;
-  const WARN = glyphForToken("running:sub-agent-stale", FA_CLASSIC) as string;
-  const EYE = glyphForToken("running:monitor-running", FA_CLASSIC) as string;
-  const CIRCLE_O = glyphForToken("stopped", FA_CLASSIC) as string;
-  // sub-agent-stale and monitor-stale share the warn triangle.
-  expect(glyphForToken("running:monitor-stale", FA_CLASSIC)).toBe(WARN);
-
-  const liveMon = JSON.stringify([{ id: "m1", kind: "monitor" }]);
-  const ambientMon = JSON.stringify([{ id: "a1", kind: "ambient" }]);
-
-  // job_id → [job overrides, running subagents for that job, expected glyph].
-  const cases: [Partial<Job>, SubagentInvocation[], string][] = [
-    // working → sync
-    [{ state: "working" }, [], SYNC],
-    // stopped + fresh subagent → cogs
-    [{ state: "stopped" }, [makeSub({ ts: 990 })], COGS],
-    // stopped + only stale subagents → warn
-    [{ state: "stopped" }, [makeSub({ ts: 0 })], WARN],
-    // stopped + live worker monitor, fresh updated_at → eye
-    [{ state: "stopped", monitors: liveMon, updated_at: 1000 }, [], EYE],
-    // stopped + live worker monitor, stale updated_at → warn
-    [{ state: "stopped", monitors: liveMon, updated_at: 0 }, [], WARN],
-    // stopped, idle → circleO
-    [{ state: "stopped" }, [], CIRCLE_O],
-    // ambient-only monitor → idle (NOT eye): ambient never occupies.
-    [{ state: "stopped", monitors: ambientMon }, [], CIRCLE_O],
+test("fields: subagentCount groups running subagents per job", () => {
+  const jobs = [
+    makeJob({ job_id: "a", state: "working" }),
+    makeJob({ job_id: "b", state: "working" }),
   ];
-
-  for (const [jobOverride, subs, expectedGlyph] of cases) {
-    const job = makeJob({ job_id: "j", ...jobOverride });
-    const subagentInvocations = subs.map((s) => ({ ...s, job_id: "j" }));
-    const m = build({
-      snapshot: makeSnap({
-        jobs: new Map([["j", job]]),
-        subagentInvocations,
-      }),
-      nowSec: 1000,
-    });
-    // The leading glyph is the first left segment's text.
-    expect(splitRow(m, "job:j").left[0]?.text).toContain(expectedGlyph);
-  }
+  const subs = [
+    makeSub({ job_id: "a", agent_id: "a1", status: "running" }),
+    makeSub({ job_id: "a", agent_id: "a2", status: "running" }),
+    // A non-running invocation does not count.
+    makeSub({ job_id: "a", agent_id: "a3", status: "ok" }),
+    makeSub({ job_id: "b", agent_id: "b1", status: "running" }),
+  ];
+  const m = build(jobs, { subagents: subs });
+  const a = band(m, "in-motion").cards.find((c) => c.key === "job:a");
+  const b = band(m, "in-motion").cards.find((c) => c.key === "job:b");
+  expect(a?.subagentCount).toBe(2);
+  expect(b?.subagentCount).toBe(1);
 });
 
-test("jobs: idle label recedes dim; live label rides default fg", () => {
-  const jobs = new Map<string, Job>([
-    ["live", makeJob({ job_id: "live", state: "working", title: "live one" })],
-    ["idle", makeJob({ job_id: "idle", state: "stopped", title: "idle one" })],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }), nowSec: 1000 });
-  expect(roleOf(splitRow(m, "job:live").left, "live one")).toBe("text");
-  expect(roleOf(splitRow(m, "job:idle").left, "idle one")).toBe("terminal");
+test("fields: ageLabel from created_at vs nowSec (injected, no Date.now)", () => {
+  const at = (created: number) =>
+    onlyCard(
+      build([makeJob({ job_id: "j", state: "working", created_at: created })], {
+        nowSec: 1000,
+      }),
+    ).ageLabel;
+  expect(at(1000)).toBe("0s");
+  expect(at(990)).toBe("10s");
+  expect(at(1000 - 120)).toBe("2m");
+  expect(at(1000 - 7200)).toBe("2h");
+  expect(at(1000 - 2 * 86_400)).toBe("2d");
+  // A created_at in the future clamps to 0s (never negative).
+  expect(at(2000)).toBe("0s");
 });
 
-test("jobs: read-side never throws on malformed monitors JSON (folds to idle)", () => {
-  const CIRCLE_O = glyphForToken("stopped", FA_CLASSIC) as string;
-  const jobs = new Map<string, Job>([
-    ["j", makeJob({ job_id: "j", state: "stopped", monitors: "{not json" })],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }), nowSec: 1000 });
-  expect(splitRow(m, "job:j").left[0]?.text).toContain(CIRCLE_O);
+test("fields: sessionLabel from backend coords (session[:pane])", () => {
+  expect(
+    onlyCard(
+      build([
+        makeJob({
+          job_id: "j",
+          backend_exec_session_id: "sess",
+          backend_exec_pane_id: "%3",
+        }),
+      ]),
+    ).sessionLabel,
+  ).toBe("sess:%3");
+  expect(
+    onlyCard(
+      build([
+        makeJob({
+          job_id: "j",
+          backend_exec_session_id: "sess",
+          backend_exec_pane_id: null,
+        }),
+      ]),
+    ).sessionLabel,
+  ).toBe("sess");
+  expect(
+    onlyCard(
+      build([
+        makeJob({
+          job_id: "j",
+          backend_exec_session_id: null,
+          backend_exec_pane_id: null,
+        }),
+      ]),
+    ).sessionLabel,
+  ).toBe("");
 });
 
-test("jobs: unified COALESCE(active_since, created_at) DESC sort, job_id ASC tiebreak", () => {
-  const jobs = new Map<string, Job>([
-    // stopped, recent active_since → outranks the older-active_since working job
-    [
-      "stopped-recent",
-      makeJob({
-        job_id: "stopped-recent",
-        state: "stopped",
-        active_since: 100,
-      }),
-    ],
-    // working, but older active_since
-    [
-      "working-old",
-      makeJob({ job_id: "working-old", state: "working", active_since: 50 }),
-    ],
-    // two equal active_since → job_id ASC tiebreak (eq-a before eq-b)
-    ["eq-b", makeJob({ job_id: "eq-b", state: "stopped", active_since: 75 })],
-    ["eq-a", makeJob({ job_id: "eq-a", state: "stopped", active_since: 75 })],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }) });
-  // 100 > 75 (a before b) > 50 — needs-you / state never affect order.
-  expect(keysWithPrefix(m, "job:")).toEqual([
-    "job:stopped-recent",
-    "job:eq-a",
-    "job:eq-b",
-    "job:working-old",
-  ]);
+test("fields: a fresh card is never focused", () => {
+  expect(onlyCard(build([makeJob({ job_id: "j" })])).isFocused).toBe(false);
 });
 
-test("jobs: NULL active_since falls back to created_at (never-prompted job)", () => {
-  const jobs = new Map<string, Job>([
-    // no active_since (never prompted) but newest created_at
-    [
-      "fresh",
-      makeJob({
-        job_id: "fresh",
-        state: "working",
-        active_since: null,
-        created_at: 90,
-      }),
-    ],
-    // active_since older than fresh's created_at fallback
-    [
-      "ran",
-      makeJob({
-        job_id: "ran",
-        state: "stopped",
-        active_since: 80,
-        created_at: 10,
-      }),
-    ],
-    // no active_since, oldest created_at
-    [
-      "old",
-      makeJob({
-        job_id: "old",
-        state: "stopped",
-        active_since: null,
-        created_at: 5,
-      }),
-    ],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }) });
-  // keys: fresh=90, ran=80, old=5 → DESC.
-  expect(keysWithPrefix(m, "job:")).toEqual([
-    "job:fresh",
-    "job:ran",
-    "job:old",
-  ]);
+// ---------------------------------------------------------------------------
+// Sanitization
+// ---------------------------------------------------------------------------
+
+test("sanitize: ESC stripped from title and project before the model", () => {
+  const job = makeJob({
+    job_id: "j",
+    state: "working",
+    title: "good\x1b[31mEVIL",
+    cwd: "/code/ke\x1beper",
+  });
+  const card = onlyCard(build([job]));
+  expect(card.title).not.toContain("\x1b");
+  expect(card.title).toBe("good[31mEVIL");
+  expect(card.project).not.toContain("\x1b");
+  expect(card.project).toBe("keeper");
 });
 
-test("jobs: needs-you does NOT reorder; the awaiting glyph still renders", () => {
-  const jobs = new Map<string, Job>([
-    // needs-you but OLDER active_since → must NOT float to the top
-    [
-      "ny",
-      makeJob({
-        job_id: "ny",
-        state: "stopped",
-        active_since: 10,
-        last_input_request_at: 5,
-      }),
-    ],
-    // no needs-you, newer active_since → sorts first purely on recency
-    ["fresh", makeJob({ job_id: "fresh", state: "working", active_since: 50 })],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }) });
-  expect(keysWithPrefix(m, "job:")).toEqual(["job:fresh", "job:ny"]);
-  // The needs-you row (sorted on recency, not floated) keeps its awaiting
-  // glyph — the signal is re-positioned, not lost.
-  const nyRow = splitRow(m, "job:ny");
-  expect(rowText(nyRow.right)).toContain(GLYPH.comment);
-  expect(roleOf(nyRow.right, GLYPH.comment)).toBe("attention");
+// ---------------------------------------------------------------------------
+// Never-throw / input shape
+// ---------------------------------------------------------------------------
+
+test("input: accepts either a Map or a plain iterable of jobs", () => {
+  const arr = [makeJob({ job_id: "j", state: "working" })];
+  const fromArray = buildDashModel(arr, [], false, NOW);
+  const fromMap = buildDashModel(jobsMap(arr), [], false, NOW);
+  expect(fromArray).toEqual(fromMap);
 });
 
-test("jobs: a wire row delivers active_since as number | null, never undefined", () => {
-  // Guards against the collections-columns omission from task .1: a job whose
-  // active_since is explicitly null still sorts (by created_at), not via an
-  // undefined-coerced-to-0 key.
-  const jobs = new Map<string, Job>([
-    [
-      "a",
-      makeJob({
-        job_id: "a",
-        state: "stopped",
-        active_since: null,
-        created_at: 30,
-      }),
-    ],
-    [
-      "b",
-      makeJob({
-        job_id: "b",
-        state: "stopped",
-        active_since: 20,
-        created_at: 5,
-      }),
-    ],
-  ]);
-  for (const job of jobs.values()) {
-    // The wire type is number | null — assert the fixture honors it.
+test("input: build never throws on an empty / all-malformed job set", () => {
+  expect(() => buildDashModel(new Map(), [], false, NOW)).not.toThrow();
+  expect(() =>
+    buildDashModel([makeJob({ state: "???" })], [], true, NOW),
+  ).not.toThrow();
+});
+
+// ---------------------------------------------------------------------------
+// The dash robot map is dash-local — fa-classic untouched
+// ---------------------------------------------------------------------------
+
+test("fa-classic: the shared board/jobs glyph map carries no md-robot codepoints", () => {
+  // The dash robots live in a dash-local map; none leaked into FA_CLASSIC.
+  const robotGlyphs = new Set(Object.values(ROBOT));
+  for (const glyph of Object.values(FA_CLASSIC.exact)) {
     expect(
-      job.active_since === null || typeof job.active_since === "number",
-    ).toBe(true);
+      robotGlyphs.has(String.fromCodePoint(Number.parseInt(glyph, 16))),
+    ).toBe(false);
   }
-  const m = build({ snapshot: makeSnap({ jobs }) });
-  // a's created_at fallback (30) > b's active_since (20).
-  expect(keysWithPrefix(m, "job:")).toEqual(["job:a", "job:b"]);
-});
-
-test("jobs: right side is the dim project basename — no elapsed band", () => {
-  const jobs = new Map<string, Job>([
-    [
-      "j",
-      makeJob({
-        job_id: "j",
-        state: "working",
-        updated_at: 940,
-        cwd: "/code/keeper",
-      }),
-    ],
-  ]);
-  const m = build({ snapshot: makeSnap({ jobs }), nowSec: 1000 });
-  const right = splitRow(m, "job:j").right;
-  expect(rowText(right)).toBe("keeper");
-  expect(roleOf(right, "keeper")).toBe("terminal");
-  expect(rowText(right)).not.toMatch(/\d+[smhd]\b/);
-
-  // A cwd-less job renders an empty right side.
-  const bare = build({
-    snapshot: makeSnap({
-      jobs: new Map([["j", makeJob({ job_id: "j", cwd: "" })]]),
-    }),
-    nowSec: 1000,
-  });
-  expect(rowText(splitRow(bare, "job:j").right)).toBe("");
-});
-
-test("jobs: failed/awaiting render as glyphs only — no words", () => {
-  const permission = build({
-    snapshot: makeSnap({
-      jobs: new Map([
-        [
-          "j",
-          makeJob({
-            job_id: "j",
-            state: "working",
-            updated_at: 940,
-            last_permission_prompt_at: 1,
-          }),
-        ],
-      ]),
-    }),
-    nowSec: 1000,
-  });
-  const pRow = splitRow(permission, "job:j");
-  expect(rowText(pRow.right)).toContain(GLYPH.hand);
-  expect(roleOf(pRow.right, GLYPH.hand)).toBe("attention");
-  expect(rowText(pRow.right)).not.toContain("awaiting");
-
-  const input = build({
-    snapshot: makeSnap({
-      jobs: new Map([
-        [
-          "j",
-          makeJob({
-            job_id: "j",
-            state: "stopped",
-            updated_at: 940,
-            last_input_request_at: 1,
-          }),
-        ],
-      ]),
-    }),
-    nowSec: 1000,
-  });
-  expect(rowText(splitRow(input, "job:j").right)).toContain(GLYPH.comment);
-
-  const failed = build({
-    snapshot: makeSnap({
-      jobs: new Map([
-        [
-          "j",
-          makeJob({
-            job_id: "j",
-            state: "stopped",
-            updated_at: 940,
-            last_api_error_at: 1,
-          }),
-        ],
-      ]),
-    }),
-    nowSec: 1000,
-  });
-  const fRow = splitRow(failed, "job:j");
-  expect(rowText(fRow.right)).toContain(GLYPH.times);
-  expect(roleOf(fRow.right, GLYPH.times)).toBe("failed");
-  expect(rowText(fRow.right)).not.toContain("failed");
+  // A couple of fa-classic anchors still resolve as before (map unchanged).
+  expect(glyphForToken("ready", FA_CLASSIC)).toBeTruthy();
+  expect(glyphForToken("running:job-running", FA_CLASSIC)).toBeTruthy();
 });

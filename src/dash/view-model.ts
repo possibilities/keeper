@@ -1,387 +1,229 @@
 /**
- * `keeper dash` view-model — the pure, OpenTUI-free projection layer. One
- * entry point, {@link buildDashModel}, folds a readiness snapshot plus the two
- * autopilot side-streams into a typed `{ header, body }` model: the header is
- * a single segment row; the body is an ORDERED list of keyed rows — split
- * (left/right content) and dividers — the materializer renders verbatim. The
- * role vocabulary lives in `./theme.ts` and is semantic
- * (motion / ready / attention / failed / terminal / accent / heading / text),
- * never widget-specific — that is the contract the theme fork preserves.
+ * `keeper dash` view-model — the pure, OpenTUI-free projection layer for the
+ * robot job-card screen. One entry point, {@link buildDashModel}, folds the
+ * live `jobs` projection plus the flat running-subagent stream into a typed
+ * `{ header, bands }` CARD model the OpenTUI paint layer (`./app.ts`) consumes:
+ * a census `header` string and three urgency BANDS, each an ordered list of
+ * keyed {@link CardVM} cards (one per job).
  *
- * Visual language: every line leads with its status GLYPH (color = verdict
- * role); titles carry the workability axis — `heading`/`text` (default fg)
- * when workable now, `terminal` (dim) when completed or blocked — so state
- * reads at a glance with no pill words. Metadata (dep refs, project name,
- * needs-eyes glyphs) right-aligns on the split rows.
+ * Status is DUAL-ENCODED per card: a Nerd Font md-robot face ({@link robotGlyph})
+ * plus a colored left rail ({@link CardVM.railRole}), both resolved fresh from
+ * the six-rung ladder in {@link robotRung} — annotation columns (api-error,
+ * awaiting permission/input) outrank the base `state`. The robot codepoints live
+ * in a DASH-LOCAL map ({@link ROBOT_CP}); the shared `ACTIVE_THEME` / `FA_CLASSIC`
+ * (the board/jobs `fa-classic` glyphs) are untouched.
  *
- * Forked, not shared: the three tiny autopilot projectors
- * (`projectAutopilotPaused` / `projectAutopilotMode` / `projectArmedEpics`)
- * are re-implemented here because `src/` must never import from `cli/`. Glyphs
- * resolve through `glyphForToken` / `FA_CLASSIC` (imported as-is) with a text
- * fallback when a token has no themed glyph.
+ * Cards group into three bands — needs-you (api-error|awaiting) / in-motion
+ * (working) / idle (stopped|ended|killed) — stable `created_at` ASC within a
+ * band (`job_id` tiebreak) so a live card never teleports on a metadata tick.
+ * Ended/killed cards are terminal and hidden unless `showTerminal` is set.
  *
  * Pure — no I/O, no wall-clock (the caller injects `nowSec`), no `@opentui`
  * import anywhere in this file. That last property is load-bearing: it keeps
  * `test/dash-view-model.test.ts` on the fast tier.
  */
 
-import { FA_CLASSIC, glyphForToken } from "../icon-theme";
-import { formatPill, rolledUpJobVerdict, type Verdict } from "../readiness";
-import type { ReadinessClientSnapshot } from "../readiness-client";
-import type { Epic, Job, SubagentInvocation, Task } from "../types";
-import type { Role } from "./theme";
+import { planVerbLabel } from "../board-render";
+import type { Job, SubagentInvocation } from "../types";
+import type { RailRole } from "./theme";
 
 // ---------------------------------------------------------------------------
-// Output shapes
+// Status ladder — the six robot rungs
 // ---------------------------------------------------------------------------
 
-/** One rendered run of text in a single role. The materializer renders the
- * `text` verbatim and styles it via `colorForRole(role)`. */
-export interface Segment {
-  readonly text: string;
-  readonly role: Role;
+/**
+ * The six rungs of the robot status ladder, in precedence order. Annotation
+ * rungs (`error`, `awaiting`) outrank the base-state rungs (`working`, `ended`,
+ * `stopped`, `killed`) so a working-but-blocked job reads as blocked, never as
+ * quietly running. A malformed/unknown `state` folds to `stopped` (the calm
+ * gray idle default — never thrown).
+ */
+export type RobotRung =
+  | "error"
+  | "awaiting"
+  | "working"
+  | "ended"
+  | "stopped"
+  | "killed";
+
+/**
+ * Dash-LOCAL md-robot codepoints (Nerd Font MDI), one per rung. Verified
+ * present in the user's JetBrainsMono Nerd Font (nerd-fonts `i_md.sh`). Kept
+ * here, NOT in `icon-theme.ts`'s `FA_CLASSIC` / `ACTIVE_THEME`, so the board and
+ * `keeper jobs` views keep their `fa-classic` glyph map untouched.
+ */
+const ROBOT_CP: Record<RobotRung, string> = {
+  error: "f169d", // robot_angry
+  awaiting: "f169f", // robot_confused
+  working: "f06a9", // robot
+  ended: "f1719", // robot_happy
+  stopped: "f167a", // robot_outline
+  killed: "f16a1", // robot_dead
+};
+
+/** The rail role each rung paints. Mirrors the ladder's color column. */
+const RUNG_RAIL: Record<RobotRung, RailRole> = {
+  error: "error",
+  awaiting: "awaiting",
+  working: "working",
+  ended: "idle-ended",
+  stopped: "idle-stopped",
+  killed: "idle-killed",
+};
+
+/** The status WORD each rung surfaces (the screen reads the glyph + rail; the
+ * word is the accessible/label fallback the paint layer may place in a tooltip
+ * or census). */
+const RUNG_WORD: Record<RobotRung, string> = {
+  error: "error",
+  awaiting: "awaiting",
+  working: "working",
+  ended: "ended",
+  stopped: "stopped",
+  killed: "killed",
+};
+
+/**
+ * Materialize a hex codepoint string (e.g. `"f169d"`) to its glyph. Mirrors
+ * `icon-theme.ts`'s `cp` — `String.fromCodePoint(parseInt(hex, 16))` already
+ * handles the 5-digit MDI codepoints.
+ */
+function cp(hex: string): string {
+  return String.fromCodePoint(Number.parseInt(hex, 16));
 }
 
-/** A row is an ordered list of role-tagged segments. */
-export type Row = readonly Segment[];
+/** The robot glyph for a rung (dash-local map). Pure. */
+export function robotGlyph(rung: RobotRung): string {
+  return cp(ROBOT_CP[rung]);
+}
 
-/** A content line: `left` hugs the left edge, `right` right-aligns on the
- * same line (metadata — dep refs, project, needs-eyes glyphs). `indent` is
- * extra left padding in columns (task rows nest under their epic). */
-export interface SplitRow {
-  readonly kind: "split";
+/**
+ * Derive a job's status rung FRESH from `state` + the annotation columns,
+ * mirroring the precedence the legacy `buildJobRows` encoded and `keeper jobs`
+ * surfaces: api-error → awaiting (permission OR input) → working → ended →
+ * stopped → killed. An unknown/malformed `state` folds to `stopped` (calm idle)
+ * — never throws. Deliberately NOT `rolledUpJobVerdict`, which only emits
+ * running/null and cannot express the six rungs.
+ */
+export function robotRung(job: Job): RobotRung {
+  if (job.last_api_error_at != null) {
+    return "error";
+  }
+  if (
+    job.last_permission_prompt_at != null ||
+    job.last_input_request_at != null
+  ) {
+    return "awaiting";
+  }
+  switch (job.state) {
+    case "working":
+      return "working";
+    case "ended":
+      return "ended";
+    case "stopped":
+      return "stopped";
+    case "killed":
+      return "killed";
+    default:
+      return "stopped";
+  }
+}
+
+/** A rung is terminal when it represents a finished session — ended or killed.
+ * Terminal cards are hidden unless `showTerminal` is set. */
+function isTerminalRung(rung: RobotRung): boolean {
+  return rung === "ended" || rung === "killed";
+}
+
+// ---------------------------------------------------------------------------
+// Bands
+// ---------------------------------------------------------------------------
+
+/** The three urgency bands, in render order. */
+export type BandKey = "needs-you" | "in-motion" | "idle";
+
+/** The band a rung sorts into: error/awaiting → needs-you, working → in-motion,
+ * the three idle/terminal rungs → idle. */
+function bandForRung(rung: RobotRung): BandKey {
+  switch (rung) {
+    case "error":
+    case "awaiting":
+      return "needs-you";
+    case "working":
+      return "in-motion";
+    case "ended":
+    case "stopped":
+    case "killed":
+      return "idle";
+  }
+}
+
+/** The human band titles the paint layer rules off. */
+const BAND_TITLES: Record<BandKey, string> = {
+  "needs-you": "needs you",
+  "in-motion": "in motion",
+  idle: "idle",
+};
+
+/** Band render order — needs-you first (the few cards that must pop), idle last
+ * (the calm tail). */
+const BAND_ORDER: readonly BandKey[] = ["needs-you", "in-motion", "idle"];
+
+// ---------------------------------------------------------------------------
+// Output shapes — the contract task `.2` (the OpenTUI paint layer) consumes
+// ---------------------------------------------------------------------------
+
+/**
+ * One job card. `key` (`job:<id>`) is stable across frames so the paint layer
+ * mutates a single BoxRenderable per job in place (never add/remove per frame).
+ * `robotGlyph` + `railRole` dual-encode status; the border is always
+ * structure-gray (the project name in it inherits border color — status lives
+ * only in the rail). `isFocused` rides the `j`/`k` cursor; `isTerminal` flags an
+ * ended/killed card (only present when `showTerminal` reveals them).
+ */
+export interface CardVM {
   readonly key: string;
-  readonly left: Row;
-  readonly right: Row;
-  readonly indent?: number;
+  readonly project: string;
+  readonly title: string;
+  readonly robotGlyph: string;
+  readonly railRole: RailRole;
+  readonly statusWord: string;
+  readonly roleLabel: string;
+  readonly subagentCount: number;
+  readonly ageLabel: string;
+  readonly sessionLabel: string;
+  readonly isFocused: boolean;
+  readonly isTerminal: boolean;
 }
 
-/** A full-width rule separating epic blocks and the jobs region. */
-export interface DividerRow {
-  readonly kind: "divider";
-  readonly key: string;
+/** One urgency band: a keyed, titled, ordered run of cards. An empty band emits
+ * an empty `cards` array (the paint layer collapses it — no rule). */
+export interface Band {
+  readonly key: BandKey;
+  readonly title: string;
+  readonly cards: readonly CardVM[];
 }
 
-/** One keyed body row. Keys are stable across frames (`epic:<id>`,
- * `epic:<id>:task:<tid>`, `job:<id>`, `div:*`, `ph:*`) so the materializer
- * diffs content in place and only restructures when the keyed order changes.
- * A key never changes kind. */
-export type DashBodyRow = SplitRow | DividerRow;
-
-/** The three connection lifecycle states the dash surfaces. */
-export type ConnectionState = "connecting" | "live" | "reconnecting";
-
-/** The complete dash view-model for one frame. */
+/** The complete dash card model for one frame. `header` is the census line. */
 export interface DashModel {
-  readonly header: Row;
-  readonly body: readonly DashBodyRow[];
-}
-
-/** Inputs to {@link buildDashModel}. `autopilotRows` / `armedRows` are the raw
- * `autopilot_state` / `armed_epics` wire rows the readiness conn does NOT
- * expose on its snapshot, so the caller subscribes them separately. */
-export interface DashModelInput {
-  readonly snapshot: ReadinessClientSnapshot | null;
-  readonly autopilotRows: Record<string, unknown>[];
-  readonly armedRows: Record<string, unknown>[];
-  readonly connection: ConnectionState;
-  readonly nowSec: number;
+  readonly header: string;
+  readonly bands: readonly Band[];
 }
 
 // ---------------------------------------------------------------------------
-// Coercion helpers (local — readiness/view layer never throws on a wire field)
+// Field helpers
 // ---------------------------------------------------------------------------
 
-/** Coerce an unknown wire scalar to a trimmed string; non-strings → "". */
-function seg(v: unknown): string {
+/** Coerce an unknown scalar to a string; non-strings → "". */
+function str(v: unknown): string {
   return typeof v === "string" ? v : "";
 }
 
-/**
- * Resolve a themed glyph for a token, or fall back to `fallback` text when the
- * token has no glyph in `FA_CLASSIC`. Mirrors the board renderer's null-guard
- * around `glyphForToken`.
- */
-function glyphOr(token: string, fallback: string): string {
-  return glyphForToken(token, FA_CLASSIC) ?? fallback;
-}
-
-// ---------------------------------------------------------------------------
-// Forked autopilot projectors (src/ must not import from cli/)
-// ---------------------------------------------------------------------------
-
-/**
- * `autopilot_state.paused` (INTEGER 1=paused, 0=playing) → boolean. Empty row
- * set (singleton not yet folded) returns `null` so the caller keeps the seed;
- * a non-0/1 value falls back to `true` (the safer boot-default side). Forked
- * from `cli/autopilot.ts` `projectAutopilotPaused`.
- */
-export function projectPaused(rows: Record<string, unknown>[]): boolean | null {
-  if (rows.length === 0) {
-    return null;
-  }
-  const raw = rows[0]?.paused;
-  if (typeof raw !== "number") {
-    return true;
-  }
-  return raw !== 0;
-}
-
-/**
- * `autopilot_state.mode` (TEXT) → `'yolo' | 'armed'`. Empty row set returns
- * `null` (keep the seed); any non-`'armed'` value falls back to `'yolo'` (the
- * backward-compatible default). Forked from `cli/autopilot.ts`.
- */
-export function projectMode(
-  rows: Record<string, unknown>[],
-): "yolo" | "armed" | null {
-  if (rows.length === 0) {
-    return null;
-  }
-  return rows[0]?.mode === "armed" ? "armed" : "yolo";
-}
-
-/**
- * `armed_epics` rows → sorted epic-id list (`epic_id` ASC) for a stable
- * render. Forked from `cli/autopilot.ts`.
- */
-export function projectArmed(rows: Record<string, unknown>[]): string[] {
-  const ids: string[] = [];
-  for (const row of rows) {
-    const id = seg(row.epic_id);
-    if (id !== "") {
-      ids.push(id);
-    }
-  }
-  ids.sort();
-  return ids;
-}
-
-// ---------------------------------------------------------------------------
-// Header
-// ---------------------------------------------------------------------------
-
-/**
- * Build the header strip: the play/pause + mode + armed-count autopilot
- * banner, the connection marker (only when not live), and the dead-letter
- * segment (only when the backlog is non-empty). Mirrors
- * `autopilotBannerLabel`: seed state before the `autopilot_state` first edge
- * is `paused=true` / `mode='yolo'`; the empty-armed-in-armed-mode case renders
- * the distinct `nothing armed` callout so idle-by-design never reads as a bug.
- */
-function buildHeader(
-  paused: boolean,
-  mode: "yolo" | "armed",
-  armed: string[],
-  deadLetterCount: number,
-  connection: ConnectionState,
-): Row {
-  const out: Segment[] = [];
-
-  // Play/pause pill — motion when playing (live), terminal/dim when paused.
-  const pausedGlyph = glyphOr("rt:blocked", "||");
-  const playingGlyph = glyphOr("ready", ">");
-  out.push(
-    paused
-      ? { text: `${pausedGlyph} autopilot`, role: "terminal" }
-      : { text: `${playingGlyph} autopilot`, role: "motion" },
-  );
-
-  out.push({ text: " · ", role: "terminal" });
-  out.push({ text: mode, role: "accent" });
-
-  // Armed-count suffix — only in armed mode; the empty set renders the
-  // distinct `nothing armed` callout (mirrors the banner).
-  if (mode === "armed") {
-    out.push({ text: " · ", role: "terminal" });
-    out.push(
-      armed.length === 0
-        ? { text: "nothing armed", role: "attention" }
-        : { text: `${armed.length} armed`, role: "accent" },
-    );
-  }
-
-  // Dead-letter segment — only when the backlog is non-empty.
-  if (deadLetterCount > 0) {
-    out.push({ text: " · ", role: "terminal" });
-    out.push({
-      text: `${glyphOr("dead-letter:", "!")} ${deadLetterCount} dead-letter`,
-      role: "attention",
-    });
-  }
-
-  // Connection marker — only when not live (live needs no marker).
-  if (connection !== "live") {
-    out.push({ text: " · ", role: "terminal" });
-    out.push({
-      text: connection === "connecting" ? "connecting…" : "reconnecting…",
-      role: "attention",
-    });
-  }
-
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// Verdict styling
-// ---------------------------------------------------------------------------
-
-/** The verdict a renderer-side map miss resolves to — blocked/unknown,
- * visible (bug indicator) and inert. Mirrors board's `verdictFromMap`. */
-const UNKNOWN_VERDICT: Verdict = {
-  tag: "blocked",
-  reason: { kind: "unknown" },
-};
-
-function verdictFromMap(map: Map<string, Verdict>, id: string): Verdict {
-  return map.get(id) ?? UNKNOWN_VERDICT;
-}
-
-/** The role a verdict's glyph renders in — forked from board's bucket
- * semantics: completed → terminal (inert tail), ready/running → ready/motion,
- * blocked → attention. */
-function roleForVerdict(v: Verdict): Role {
-  switch (v.tag) {
-    case "completed":
-      return "terminal";
-    case "ready":
-      return "ready";
-    case "running":
-      return "motion";
-    case "blocked":
-      return "attention";
-  }
-}
-
-/** The verdict's status glyph. `formatPill` yields `[ready]` / `[completed]`
- * / `[running:<kind>]` / `[blocked:<reason>]`; the inner token (brackets
- * stripped) resolves the glyph via `glyphForToken` (prefix-matched for the
- * `running:` / `blocked:` families). Glyph ONLY — the word never renders; the
- * glyph + its role color carry the state. */
-function verdictGlyph(v: Verdict): string {
-  const token = formatPill(v).slice(1, -1); // strip the [ ]
-  return glyphOr(token, "·");
-}
-
-/** The title role on the workability axis: workable now (ready / running) →
- * full-intensity `epicTitle` ? `heading` : `text`; inert (completed /
- * blocked) → the dim `terminal` tone so the whole line recedes. */
-function titleRole(v: Verdict, epicTitle: boolean): Role {
-  if (v.tag === "ready" || v.tag === "running") {
-    return epicTitle ? "heading" : "text";
-  }
-  return "terminal";
-}
-
-// ---------------------------------------------------------------------------
-// EPICS
-// ---------------------------------------------------------------------------
-
-/** Trailing `.N` task-number from a planctl task id (`fn-812-slug.3` → `3`),
- * or `null` when the id has no numeric tail. */
-function taskNumFromDep(id: string): string | null {
-  const m = /\.(\d+)$/.exec(id);
-  return m === null ? null : (m[1] ?? null);
-}
-
-/** Leading epic number from a planctl epic id (`fn-631-slug` or bare
- * `fn-631`), or `null` when the token doesn't match. */
-function epicNumFromDep(token: string): string | null {
-  const m = /^[a-z][a-z0-9]*-(\d+)(?:-|$)/.exec(token);
-  return m === null ? null : (m[1] ?? null);
-}
-
-/**
- * The epic's dep-ref segments — a dim `after` lead then one ref per
- * `depends_on_epics` token. Prefers the reducer's `resolved_epic_deps`
- * projection (epic numbers + cross-project basenames + per-dep state);
- * falls back to parsing the raw tokens when the projection is null
- * (not-yet-computed). Per-ref role carries the dep's weight: satisfied →
- * dim (history), blocked-incomplete → attention (the live gate), dangling →
- * failed (a typo to fix). Empty array when the epic has no deps.
- */
-function epicDepSegments(epic: Epic): Segment[] {
-  const resolved = epic.resolved_epic_deps;
-  const refs: { label: string; role: Role }[] = [];
-  if (resolved !== null) {
-    for (const dep of resolved) {
-      const num = dep.epic_number;
-      if (num === null) {
-        refs.push({ label: `?${dep.dep_token}`, role: "failed" });
-        continue;
-      }
-      const label =
-        dep.cross_project && dep.project_basename !== null
-          ? `${dep.project_basename}#${num}`
-          : `#${num}`;
-      refs.push({
-        label,
-        role: dep.state === "blocked-incomplete" ? "attention" : "terminal",
-      });
-    }
-  } else {
-    for (const token of epic.depends_on_epics) {
-      const num = epicNumFromDep(token);
-      refs.push({
-        label: num === null ? `?${token}` : `#${num}`,
-        role: "terminal",
-      });
-    }
-  }
-  if (refs.length === 0) {
-    return [];
-  }
-  const out: Segment[] = [{ text: "after ", role: "terminal" }];
-  refs.forEach((ref, i) => {
-    if (i > 0) {
-      out.push({ text: " ", role: "terminal" });
-    }
-    out.push({ text: ref.label, role: ref.role });
-  });
-  return out;
-}
-
-/**
- * The task's dep-ref segments — dim `after` then the dep task NUMBERS, each
- * colored by the dep's own perTask verdict: completed → dim (satisfied),
- * anything else → attention (still gating). A dep id with no parseable
- * number renders its raw tail so the ref never silently disappears.
- */
-function taskDepSegments(task: Task, perTask: Map<string, Verdict>): Segment[] {
-  if (task.depends_on.length === 0) {
-    return [];
-  }
-  const out: Segment[] = [{ text: "after ", role: "terminal" }];
-  task.depends_on.forEach((depId, i) => {
-    if (i > 0) {
-      out.push({ text: " ", role: "terminal" });
-    }
-    const num = taskNumFromDep(depId);
-    const done = perTask.get(depId)?.tag === "completed";
-    out.push({
-      text: num === null ? depId : num,
-      role: done ? "terminal" : "attention",
-    });
-  });
-  return out;
-}
-
-/** Stable task order: `task_number` ASC nulls-last, `task_id` ASC tiebreak. */
-function sortedTasks(tasks: Task[]): Task[] {
-  return [...tasks].sort((a, b) => {
-    const na = a.task_number;
-    const nb = b.task_number;
-    if (na !== nb) {
-      if (na === null) {
-        return 1;
-      }
-      if (nb === null) {
-        return -1;
-      }
-      return na - nb;
-    }
-    return a.task_id < b.task_id ? -1 : a.task_id > b.task_id ? 1 : 0;
-  });
+/** Strip ESC (`\x1b`) from an untrusted socket string before it enters the
+ * model — OSC/DCS injection guard for `title` / `project`. */
+function sanitize(s: string): string {
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ESC is the point.
+  return s.replace(/\x1b/g, "");
 }
 
 /** Basename of a project dir path, or "" when null/empty. */
@@ -395,206 +237,108 @@ function projectBasename(dir: string | null): string {
 }
 
 /**
- * Build the epic rows — one block per epic in SERVER order (`snapshot.epics`
- * is already `sort_path` ASC; NO client re-sort), blocks separated by a
- * divider keyed on the epic ABOVE it (stable as epics append below).
- *
- * Epic header row: leading verdict glyph (role-colored); the armed bolt
- * (accent) ONLY in armed mode for an armed epic; the dim epic number; the
- * title on the workability axis (bold default-fg `heading` when workable,
- * dim when inert); right side = dep refs then the dim project basename.
- *
- * Task rows: indented under the epic, leading perTask verdict glyph (map
- * miss → the visible blocked/unknown form), dim task number, title on the
- * same workability axis (`text` tier), right side = task dep refs.
- */
-function buildEpicRows(
-  snapshot: ReadinessClientSnapshot,
-  armed: Set<string>,
-  mode: "yolo" | "armed",
-): DashBodyRow[] {
-  const out: DashBodyRow[] = [];
-  snapshot.epics.forEach((epic, i) => {
-    const epicId = seg(epic.epic_id);
-    if (i > 0) {
-      const prev = seg(snapshot.epics[i - 1]?.epic_id);
-      out.push({ kind: "divider", key: `div:${prev}` });
-    }
-
-    const verdict = verdictFromMap(snapshot.readiness.perEpic, epicId);
-    const left: Segment[] = [
-      { text: `${verdictGlyph(verdict)}  `, role: roleForVerdict(verdict) },
-    ];
-
-    // Armed bolt — armed mode only; in yolo the armed set is not dispatch
-    // policy, so the marker would lie about behavior.
-    if (mode === "armed" && armed.has(epicId)) {
-      left.push({ text: `${glyphOr("armed", "*")} `, role: "accent" });
-    }
-
-    if (epic.epic_number !== null) {
-      left.push({ text: `${epic.epic_number}  `, role: "terminal" });
-    }
-    const title = epic.title ?? "";
-    left.push({
-      text: title === "" && epic.epic_number === null ? epicId : title,
-      role: titleRole(verdict, true),
-    });
-
-    const right: Segment[] = epicDepSegments(epic);
-    const project = projectBasename(epic.project_dir);
-    if (project !== "") {
-      if (right.length > 0) {
-        right.push({ text: " · ", role: "terminal" });
-      }
-      right.push({ text: project, role: "terminal" });
-    }
-
-    out.push({ kind: "split", key: `epic:${epicId}`, left, right });
-
-    for (const task of sortedTasks(epic.tasks)) {
-      const taskId = seg(task.task_id);
-      const tv = verdictFromMap(snapshot.readiness.perTask, taskId);
-      const tleft: Segment[] = [
-        { text: `${verdictGlyph(tv)}  `, role: roleForVerdict(tv) },
-      ];
-      if (task.task_number !== null) {
-        tleft.push({ text: `${task.task_number}  `, role: "terminal" });
-      }
-      const ttitle = task.title ?? "";
-      tleft.push({
-        text: ttitle === "" ? taskId : ttitle,
-        role: titleRole(tv, false),
-      });
-      out.push({
-        kind: "split",
-        key: `epic:${epicId}:task:${taskId}`,
-        left: tleft,
-        right: taskDepSegments(task, snapshot.readiness.perTask),
-        indent: 4,
-      });
-    }
-  });
-  return out;
-}
-
-// ---------------------------------------------------------------------------
-// JOBS
-// ---------------------------------------------------------------------------
-
-/**
- * The job's label, coalescing `title → plan_ref → job_id` so a needs-you row
- * is NEVER blank (and never dropped for a missing title/plan_ref).
+ * The job's label, coalescing `title → plan_ref → job_id` so a card is NEVER
+ * blank (and never dropped for a missing title/plan_ref).
  */
 function jobLabel(job: Job): string {
-  const title = seg(job.title);
+  const title = str(job.title);
   if (title !== "") {
     return title;
   }
-  const planRef = seg(job.plan_ref);
+  const planRef = str(job.plan_ref);
   if (planRef !== "") {
     return planRef;
   }
   return job.job_id;
 }
 
-/**
- * Build the JOBS rows — EVERY non-terminal job (working AND stopped) on one
- * unified "most-recent-activity-started" timeline. The collections
- * `defaultFilter` already excludes `ended`/`killed`, so every job in
- * `snapshot.jobs` is included.
- *
- * Sort: `COALESCE(active_since, created_at)` DESC with a `job_id` ASC tiebreak
- * — a job rises the moment it starts a run and descends as newer runs start
- * above it, jumping back to the top on a genuine restart. A never-prompted job
- * (`active_since` NULL) sorts by `created_at`. The null guard is explicit so a
- * JS `null` never coerces to `0`.
- *
- * Each row's leading glyph is the per-job rolled-up board verdict
- * ({@link rolledUpJobVerdict}: working→sync, sub-agent→cogs/warn,
- * monitor→eye/warn, idle→circleO); the label rides the workability axis (live
- * → `text`, idle → dim). The right side is the dim project basename (from the
- * job's `cwd`), LED by a needs-eyes glyph when one applies: failed (red ✗) or
- * awaiting-input (attention hand/comment, keyed by which prompt field is set)
- * — glyphs only, no words.
- */
-function buildJobRows(
-  snapshot: ReadinessClientSnapshot,
-  nowSec: number,
-): DashBodyRow[] {
-  // Running-subagent index, built the SAME way readiness does: filter to
-  // `status === "running"` (the only status that signals live motion).
-  const subRunningByJobId = new Map<string, SubagentInvocation[]>();
-  for (const inv of snapshot.subagentInvocations) {
+/** A coarse age label from `created_at` vs the injected `nowSec` — seconds /
+ * minutes / hours / days, clamped at zero. Pure (no `Date.now()`). */
+function ageLabel(createdAt: number, nowSec: number): string {
+  const delta = Math.max(0, Math.floor(nowSec - createdAt));
+  if (delta < 60) {
+    return `${delta}s`;
+  }
+  if (delta < 3600) {
+    return `${Math.floor(delta / 60)}m`;
+  }
+  if (delta < 86_400) {
+    return `${Math.floor(delta / 3600)}h`;
+  }
+  return `${Math.floor(delta / 86_400)}d`;
+}
+
+/** The session label from the backend coords — `<session>` or `<session>:<pane>`
+ * when both are set, "" when neither is. */
+function sessionLabel(job: Job): string {
+  const session = str(job.backend_exec_session_id);
+  const pane = str(job.backend_exec_pane_id);
+  if (session === "") {
+    return pane === "" ? "" : pane;
+  }
+  return pane === "" ? session : `${session}:${pane}`;
+}
+
+/** Running-subagent count per job, grouping the FLAT invocation stream on
+ * `job_id` filtered to `status === "running"` (the only status that signals
+ * live motion — the same filter readiness uses). */
+function runningSubByJob(
+  subagents: readonly SubagentInvocation[],
+): Map<string, number> {
+  const counts = new Map<string, number>();
+  for (const inv of subagents) {
     if (inv.status !== "running") {
       continue;
     }
-    const arr = subRunningByJobId.get(inv.job_id);
-    if (arr === undefined) {
-      subRunningByJobId.set(inv.job_id, [inv]);
-    } else {
-      arr.push(inv);
-    }
+    counts.set(inv.job_id, (counts.get(inv.job_id) ?? 0) + 1);
   }
+  return counts;
+}
 
-  const jobs = Array.from(snapshot.jobs.values());
+// ---------------------------------------------------------------------------
+// Card build
+// ---------------------------------------------------------------------------
 
-  // Unified timeline: COALESCE(active_since, created_at) DESC, job_id ASC
-  // tiebreak. Guard the NULL explicitly so it falls back to created_at rather
-  // than coercing to 0.
-  jobs.sort((a, b) => {
-    const ka = a.active_since ?? a.created_at;
-    const kb = b.active_since ?? b.created_at;
-    if (ka !== kb) {
-      return kb - ka; // DESC
-    }
-    return a.job_id < b.job_id ? -1 : a.job_id > b.job_id ? 1 : 0;
-  });
+/** Build one card from a job. Pure — every wall-clock-derived field rides the
+ * injected `nowSec`. */
+function buildCard(
+  job: Job,
+  rung: RobotRung,
+  subCount: number,
+  nowSec: number,
+): CardVM {
+  return {
+    key: `job:${job.job_id}`,
+    project: sanitize(projectBasename(str(job.cwd) || null)),
+    title: sanitize(jobLabel(job)),
+    robotGlyph: robotGlyph(rung),
+    railRole: RUNG_RAIL[rung],
+    statusWord: RUNG_WORD[rung],
+    roleLabel: planVerbLabel(job.plan_verb) ?? "",
+    subagentCount: subCount,
+    ageLabel: ageLabel(job.created_at, nowSec),
+    sessionLabel: sessionLabel(job),
+    isFocused: false,
+    isTerminal: isTerminalRung(rung),
+  };
+}
 
-  const rows: DashBodyRow[] = [];
-  for (const job of jobs) {
-    const left: Segment[] = [];
+// ---------------------------------------------------------------------------
+// Census header
+// ---------------------------------------------------------------------------
 
-    // Leading glyph: the per-job rolled-up verdict, colored by the verdict's
-    // role. An idle job (null verdict) renders the `stopped` glyph dim.
-    const verdict = rolledUpJobVerdict(job, subRunningByJobId, nowSec);
-    if (verdict === null) {
-      left.push({ text: `${glyphOr("stopped", "○")}  `, role: "terminal" });
-      left.push({ text: jobLabel(job), role: "terminal" });
-    } else {
-      left.push({
-        text: `${verdictGlyph(verdict)}  `,
-        role: roleForVerdict(verdict),
-      });
-      left.push({ text: jobLabel(job), role: "text" });
-    }
-
-    // Right side: needs-eyes glyph (failed / awaiting) then the dim project.
-    const right: Segment[] = [];
-    if (job.last_api_error_at != null) {
-      right.push({ text: glyphOr("failed", "x"), role: "failed" });
-    } else if (job.last_permission_prompt_at != null) {
-      right.push({
-        text: glyphOr("awaiting:permission", "?"),
-        role: "attention",
-      });
-    } else if (job.last_input_request_at != null) {
-      right.push({
-        text: glyphOr("awaiting:ask_user_question", "?"),
-        role: "attention",
-      });
-    }
-    const project = projectBasename(seg(job.cwd) || null);
-    if (project !== "") {
-      if (right.length > 0) {
-        right.push({ text: " · ", role: "terminal" });
-      }
-      right.push({ text: project, role: "terminal" });
-    }
-
-    rows.push({ kind: "split", key: `job:${job.job_id}`, left, right });
-  }
-  return rows;
+/**
+ * The census line: total live cards plus per-band counts. The `needs you`
+ * count leads (it is the actionable number); `0 jobs` renders when the board is
+ * empty so the header is never bare.
+ */
+function buildHeader(counts: Record<BandKey, number>): string {
+  const total = counts["needs-you"] + counts["in-motion"] + counts.idle;
+  const noun = total === 1 ? "job" : "jobs";
+  return (
+    `${total} ${noun} · ${counts["needs-you"]} need you · ` +
+    `${counts["in-motion"]} in motion · ${counts.idle} idle`
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -602,47 +346,77 @@ function buildJobRows(
 // ---------------------------------------------------------------------------
 
 /**
- * Build the complete dash view-model for one frame. A `null` snapshot
- * (connecting, no paint yet) yields a body of just the dim `waiting for
- * keeperd…` line; the header still renders off the autopilot seed +
- * side-streams. Once a snapshot lands, the body is the epic blocks then the
- * job rows, divider-separated — no section labels, no empty-state lines: an
- * empty region simply renders nothing.
+ * Build the complete dash card model for one frame.
+ *
+ * - `jobs` — the live `jobs` projection (a `Map` keyed by `job_id`, or any
+ *   iterable of `Job`). Terminal (ended/killed) cards are dropped unless
+ *   `showTerminal` is set.
+ * - `subagents` — the FLAT running-subagent stream, grouped per job for the
+ *   live-subagent count.
+ * - `showTerminal` — when false (default toggle state) ended/killed cards are
+ *   hidden; when true they join the idle band.
+ * - `nowSec` — the frame's reference seconds (injected; no `Date.now()`).
+ *
+ * Returns `{ header, bands }`: the census header plus the three bands in render
+ * order, each carrying its cards in stable `created_at` ASC (`job_id` tiebreak)
+ * order. Empty bands emit an empty `cards` array. Pure, never throws.
  */
-export function buildDashModel(input: DashModelInput): DashModel {
-  const { snapshot, autopilotRows, armedRows, connection, nowSec } = input;
+export function buildDashModel(
+  jobs: Map<string, Job> | Iterable<Job>,
+  subagents: readonly SubagentInvocation[],
+  showTerminal: boolean,
+  nowSec: number,
+): DashModel {
+  const jobList =
+    jobs instanceof Map ? Array.from(jobs.values()) : Array.from(jobs);
+  const subCounts = runningSubByJob(subagents);
 
-  // Autopilot header state — seed (paused / yolo) until the first edge lands.
-  const paused = projectPaused(autopilotRows) ?? true;
-  const mode = projectMode(autopilotRows) ?? "yolo";
-  const armed = projectArmed(armedRows);
-  const armedSet = new Set(armed);
+  // Bucket cards by band, dropping terminal cards unless revealed.
+  const buckets: Record<BandKey, CardVM[]> = {
+    "needs-you": [],
+    "in-motion": [],
+    idle: [],
+  };
+  // Parallel `Job` lists so the intra-band sort can read created_at / job_id
+  // off the source row without threading them onto the immutable CardVM.
+  const sortKey = new Map<string, { created: number; id: string }>();
 
-  const deadLetterCount = snapshot?.deadLetters.length ?? 0;
-  const header = buildHeader(paused, mode, armed, deadLetterCount, connection);
-
-  if (snapshot === null) {
-    return {
-      header,
-      body: [
-        {
-          kind: "split",
-          key: "ph:waiting",
-          left: [{ text: "waiting for keeperd…", role: "terminal" }],
-          right: [],
-        },
-      ],
-    };
+  for (const job of jobList) {
+    const rung = robotRung(job);
+    if (isTerminalRung(rung) && !showTerminal) {
+      continue;
+    }
+    const card = buildCard(job, rung, subCounts.get(job.job_id) ?? 0, nowSec);
+    buckets[bandForRung(rung)].push(card);
+    sortKey.set(card.key, { created: job.created_at, id: job.job_id });
   }
 
-  const body: DashBodyRow[] = [...buildEpicRows(snapshot, armedSet, mode)];
-  const jobRows = buildJobRows(snapshot, nowSec);
-  // One divider fences the jobs region off the last epic block — only when
-  // both regions have rows (a lone region needs no fence).
-  if (body.length > 0 && jobRows.length > 0) {
-    body.push({ kind: "divider", key: "div:jobs" });
-  }
-  body.push(...jobRows);
+  // Stable intra-band sort: created_at ASC, job_id ASC tiebreak — a live card
+  // never teleports on a metadata tick.
+  const byCreated = (a: CardVM, b: CardVM): number => {
+    const ka = sortKey.get(a.key);
+    const kb = sortKey.get(b.key);
+    const ca = ka?.created ?? 0;
+    const cb = kb?.created ?? 0;
+    if (ca !== cb) {
+      return ca - cb;
+    }
+    const ia = ka?.id ?? "";
+    const ib = kb?.id ?? "";
+    return ia < ib ? -1 : ia > ib ? 1 : 0;
+  };
 
-  return { header, body };
+  const bands: Band[] = BAND_ORDER.map((key) => {
+    const cards = buckets[key];
+    cards.sort(byCreated);
+    return { key, title: BAND_TITLES[key], cards };
+  });
+
+  const counts: Record<BandKey, number> = {
+    "needs-you": buckets["needs-you"].length,
+    "in-motion": buckets["in-motion"].length,
+    idle: buckets.idle.length,
+  };
+
+  return { header: buildHeader(counts), bands };
 }
