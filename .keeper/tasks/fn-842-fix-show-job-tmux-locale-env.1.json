@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T11:25:40.241000Z",
+  "depends_on": [],
+  "epic": "fn-842-fix-show-job-tmux-locale-env",
+  "id": "fn-842-fix-show-job-tmux-locale-env.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Pass localeDefaultedEnv to tmux sweep",
+  "updated_at": "2026-06-20T11:25:40.241000Z"
+}
