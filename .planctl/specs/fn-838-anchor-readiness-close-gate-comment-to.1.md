@@ -16,5 +16,5 @@ launcher" invariant stays verifiable without line-number maintenance.
 - [ ] No behavior change; the comment still documents why the mutex mirrors the launcher gate.
 
 ## Done summary
-
+Re-anchored the settleCloseRow close-gate comment in src/readiness.ts: replaced the rot-prone autopilot-worker.ts:1000-1007 line-span cite with the stable close-dispatch gate condition (armedMode && !eligible?.has(epicId) && !isEpicInFlight(...)). Comment-only, no behavior change.
 ## Evidence
