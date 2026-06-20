@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] zellijsub `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+Renamed zellijsub .planctl/ to .keeper/ via git mv and updated the live CLAUDE.md path ref; keeper board renders the repo's epics from .keeper/.
 ## Evidence
