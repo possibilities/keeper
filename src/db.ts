@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 74;
+export const SCHEMA_VERSION = 75;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -3533,9 +3533,10 @@ function migrate(db: Database): void {
       // old CHECK once the daemon is bounced onto this fold. SQLite can't ALTER a
       // CHECK, so rebuild the table with a byte-faithful row copy (ORDER BY rowid
       // for stable physical order), drop-old + rename, re-create the indexes.
-      // PURELY ADDITIVE: minting still writes `source='planctl'`, no row's
-      // `source` changes, and there is NO cursor rewind — a from-scratch re-fold
-      // reproduces byte-identical rows. Version-guarded so the rebuild runs once.
+      // PURELY ADDITIVE: this step changes no row's `source` and carries NO
+      // cursor rewind — a from-scratch re-fold reproduces byte-identical rows.
+      // (The producer flip to `source='plan'` + the stored-row rewrite land
+      // later at v74→v75.) Version-guarded so the rebuild runs once.
       // Whitelist-only Python read (this bump MUST add 72 to
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
       // every keeper-py read fails host-wide; test/schema-version.test.ts
@@ -3687,6 +3688,26 @@ function migrate(db: Database): void {
       // table during a from-scratch walk.
       db.run("DROP TABLE IF EXISTS event_blobs");
       db.run("DROP INDEX IF EXISTS idx_event_blobs_tool_attr");
+
+      // v74→v75 (fn-831 task .1): rewrite stored `source='planctl'`
+      // `file_attributions` rows to `source='plan'`, matching what the
+      // now-flipped planctl_op mint produces. This is the producer-flip
+      // companion: minting and this row rewrite land in ONE commit so the
+      // projection and a from-scratch re-fold agree — the fold mints `'plan'`
+      // AND every pre-flip stored row is migrated to `'plan'`, so a re-fold is
+      // byte-identical. In-transaction with the schema_version stamp below (the
+      // `.immediate()` tx), so the rewrite + version bump are atomic. No cursor
+      // rewind. Idempotent: a re-run finds no `'planctl'` rows. The CHECK already
+      // permits `'plan'` (v71→v72). Whitelist-only Python read — keeper-py never
+      // reads `file_attributions.source` — so this bump MUST add 75 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit, or
+      // every keeper-py read fails host-wide; test/schema-version.test.ts
+      // enforces this.
+      if (preMigrateStoredVersion < 75) {
+        db.run(
+          "UPDATE file_attributions SET source = 'plan' WHERE source = 'planctl'",
+        );
+      }
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

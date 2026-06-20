@@ -2539,13 +2539,16 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // cross-event field — instant ADD COLUMN, no rebuild, no cursor rewind), and to
   // 74 via fn-836 task .4 (the DESTRUCTIVE shed: restore keep-set bodies inline +
   // DROP `event_blobs` at the migration tail — no cursor rewind, projection
-  // re-fold stays byte-identical), each of which bumped SCHEMA_VERSION AND added
+  // re-fold stays byte-identical), and to 75 via fn-831 task .1 (rewriting stored
+  // `file_attributions.source='planctl'` rows to `'plan'` in lockstep with the
+  // producer mint flip — in-transaction with the version stamp, no cursor rewind,
+  // re-fold byte-identical), each of which bumped SCHEMA_VERSION AND added
   // its version to `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the
   // CLAUDE.md same-commit invariant. This pin tracks the LIVE schema version: the
   // guard it provides is "an accidental reducer/schema change must surface as a
   // failing whitelist + this pin", which still holds — bump both together when
   // the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(74);
+  expect(SCHEMA_VERSION).toBe(75);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

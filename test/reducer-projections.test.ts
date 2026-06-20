@@ -2231,10 +2231,10 @@ test("from-scratch re-fold over [EpicArmed X true, EpicSnapshot X done] leaves z
 // Schema v46 / fn-666 — planctl-file attribution mint
 // ---------------------------------------------------------------------------
 
-test("planctl mint: scaffold envelope mints source='planctl' file_attributions for every named file", () => {
+test("planctl mint: scaffold envelope mints source='plan' file_attributions for every named file", () => {
   // A planctl scaffold envelope carries a `files[]` of the JSON/spec paths
   // planctl wrote. The reducer's mint fold lands one file_attributions row
-  // per path, keyed under (state_repo, session, path), source='planctl',
+  // per path, keyed under (state_repo, session, path), source='plan',
   // last_mutation_at=event.ts.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-mint" });
   const eventId = planctlEvent({
@@ -2269,7 +2269,7 @@ test("planctl mint: scaffold envelope mints source='planctl' file_attributions f
   }>;
   expect(rows.length).toBe(4);
   for (const r of rows) {
-    expect(r.source).toBe("planctl");
+    expect(r.source).toBe("plan");
     expect(r.op).toBe("scaffold");
     expect(r.last_mutation_at).toBe(555);
     expect(r.last_event_id).toBe(eventId);
@@ -2282,11 +2282,11 @@ test("planctl mint: scaffold envelope mints source='planctl' file_attributions f
   ]);
 });
 
-test("plan mint (fn-826): plan_invocation envelope mints source='planctl' rows identically — minting unchanged", () => {
-  // The tolerant fold's cascade keystone: an envelope inlined under the RENAMED
-  // `plan_invocation` key must mint the SAME `source='planctl'` file_attributions
-  // rows as the legacy `planctl_invocation` key. Minting is deliberately
-  // UNCHANGED (still 'planctl') so a from-scratch re-fold stays byte-identical.
+test("plan mint: plan_invocation envelope mints source='plan' file_attributions", () => {
+  // An envelope inlined under the renamed `plan_invocation` key mints
+  // `source='plan'` file_attributions — the post-flip minted value, identical
+  // to what the legacy `planctl_invocation` key folds to (both keys read the
+  // same way; the migration rewrites any pre-flip stored row to match).
   insertEvent({ hook_event: "SessionStart", session_id: "sess-mint-renamed" });
   const eventId = planctlEvent({
     sessionId: "sess-mint-renamed",
@@ -2316,7 +2316,7 @@ test("plan mint (fn-826): plan_invocation envelope mints source='planctl' rows i
   }>;
   expect(rows.length).toBe(2);
   for (const r of rows) {
-    expect(r.source).toBe("planctl");
+    expect(r.source).toBe("plan");
     expect(r.op).toBe("scaffold");
     expect(r.last_mutation_at).toBe(777);
     expect(r.last_event_id).toBe(eventId);
@@ -2523,7 +2523,7 @@ test("planctl mint: path with `..` traversal is filtered out (defensive)", () =>
 test("planctl mint: GitSnapshot following a mint renders the planctl-source attribution (not orphan)", () => {
   // The end-to-end orphan-fix proof. A planctl mint lands the
   // file_attributions row; the next GitSnapshot on a dirty .planctl file
-  // surfaces it through pass-3 render (source='planctl' badge), NOT
+  // surfaces it through pass-3 render (source='plan' badge), NOT
   // through the orphan_count rollup.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-snap" });
   planctlEvent({
@@ -2580,17 +2580,17 @@ test("planctl mint: GitSnapshot following a mint renders the planctl-source attr
   expect(dirty[0].attributions[0]).toEqual(
     expect.objectContaining({
       session_id: "sess-snap",
-      source: "planctl",
+      source: "plan",
       op: "scaffold",
     }),
   );
 });
 
 test("planctl mint: a planctl file does NOT also get an inferred attribution (guard widened)", () => {
-  // The pass-2 inferred-guard widened to `IN ('tool','bash','planctl')`
-  // so a planctl-attributed file is NOT also bracketed against this
-  // session's Bash windows. Without the widening, the file would receive
-  // TWO active attribution rows — `planctl` AND `inferred` — which would
+  // The pass-2 inferred-guard covers `IN ('tool','bash','plan')`
+  // so a plan-attributed file is NOT also bracketed against this
+  // session's Bash windows. Without that, the file would receive
+  // TWO active attribution rows — `plan` AND `inferred` — which would
   // mislabel the file's authorship.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-both", ts: 500 });
   // Pre-bracket Bash window so inference WOULD attribute if the guard
@@ -2644,7 +2644,7 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
     }),
   });
   drainAll();
-  // Only ONE row, source='planctl' — NOT planctl + inferred.
+  // Only ONE row, source='plan' — NOT plan + inferred.
   const rows = db
     .query(
       `SELECT source, op FROM file_attributions
@@ -2656,7 +2656,7 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
     source: string;
     op: string;
   }>;
-  expect(rows).toEqual([{ source: "planctl", op: "scaffold" }]);
+  expect(rows).toEqual([{ source: "plan", op: "scaffold" }]);
 });
 
 test("planctl mint: re-fold determinism — cursor=0 reproduces byte-identical file_attributions", () => {

@@ -1032,7 +1032,7 @@ interface RenderedAttribution {
   state: string;
   last_touch_at: number;
   op: string;
-  source: "tool" | "bash" | "inferred" | "planctl";
+  source: "tool" | "bash" | "inferred" | "plan";
 }
 
 /**
@@ -1066,7 +1066,7 @@ interface SessionMutation {
   last_mutation_at: number;
   last_event_id: number;
   op: string;
-  source: "tool" | "bash" | "planctl";
+  source: "tool" | "bash" | "plan";
 }
 
 /**
@@ -1803,7 +1803,7 @@ function projectGitStatus(db: Database, event: Event): void {
     `SELECT 1 FROM file_attributions
       WHERE project_dir = ?
         AND file_path = ?
-        AND source IN ('tool', 'bash', 'planctl')
+        AND source IN ('tool', 'bash', 'plan')
         AND last_mutation_at > COALESCE(last_commit_at, 0)
       LIMIT 1`,
   );
@@ -1903,7 +1903,7 @@ function projectGitStatus(db: Database, event: Event): void {
         r.source === "tool" ||
         r.source === "bash" ||
         r.source === "inferred" ||
-        r.source === "planctl"
+        r.source === "plan"
           ? r.source
           : "inferred",
     }));
@@ -5161,7 +5161,7 @@ function extractPlanctlStateRepo(event: Event): string | null {
 }
 
 /**
- * Mint one `source='planctl'` `file_attributions` row per path in the event's
+ * Mint one `source='plan'` `file_attributions` row per path in the event's
  * `planctl_files` array, keyed under the envelope's `state_repo` +
  * `event.session_id` + the repo-relative path. Without it, `.planctl/...` files
  * (written by the planctl CLI, not a Claude Write/Edit or recognized bash
@@ -5201,7 +5201,7 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
        (project_dir, session_id, file_path, last_mutation_at,
         last_commit_at, op, source, last_event_id, updated_at,
         worktree_oid, worktree_mode)
-       VALUES (?, ?, ?, ?, NULL, ?, 'planctl', ?, ?, NULL, NULL)
+       VALUES (?, ?, ?, ?, NULL, ?, 'plan', ?, ?, NULL, NULL)
        ON CONFLICT(project_dir, session_id, file_path) DO UPDATE SET
          last_mutation_at = excluded.last_mutation_at,
          op = excluded.op,
@@ -6958,7 +6958,7 @@ function projectJobsRow(db: Database, event: Event): void {
     syncPlanctlLinks(db, jobId, event.id, ts);
   }
 
-  // Planctl-written tracked files get a `source='planctl'` attribution row per
+  // Planctl-written tracked files get a `source='plan'` attribution row per
   // path the envelope's `files` array names — without this mint they appear as
   // strict-mystery orphans the instant they flash dirty.
   if (event.planctl_op != null && event.planctl_files != null) {

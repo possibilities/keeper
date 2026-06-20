@@ -210,7 +210,7 @@ export interface Event {
    * JSON-encoded array of repo-relative paths planctl wrote during this op
    * (the envelope's `files` array). NULL on non-planctl rows and on planctl
    * rows whose envelope omitted/misshaped `files`. The reducer mints
-   * `source='planctl'` `file_attributions` rows under the envelope's
+   * `source='plan'` `file_attributions` rows under the envelope's
    * `state_repo` for every path. NOT a wire-surface column — reducer-only.
    */
   planctl_files: string | null;

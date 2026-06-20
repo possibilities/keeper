@@ -838,6 +838,72 @@ test("v73→v74 shed: relocated shed-class mutation_path captured from event_blo
   expect(blobsGone).toBe(true);
 });
 
+test("v74→v75 source rename: stored file_attributions source='planctl' rows migrate to 'plan', others untouched", () => {
+  // The fn-831 producer-flip companion: minting now yields `source='plan'`, so
+  // the migration rewrites every pre-flip stored `source='planctl'` row to
+  // `'plan'` — without it the projection and a from-scratch re-fold would
+  // disagree. Build a current DB, insert one planctl row + one tool row, rewind
+  // to v74, and re-migrate. The planctl row flips to 'plan'; the tool row and
+  // its other columns are untouched; idempotent (a re-open finds nothing left).
+  {
+    const { db } = openDb(dbPath);
+    db.run(
+      `INSERT INTO file_attributions
+         (project_dir, session_id, file_path, last_mutation_at, op, source,
+          last_event_id, updated_at)
+       VALUES ('/repo', 's1', '.planctl/epics/fn-1.json', 100, 'scaffold',
+               'planctl', 7, 100)`,
+    );
+    db.run(
+      `INSERT INTO file_attributions
+         (project_dir, session_id, file_path, last_mutation_at, op, source)
+       VALUES ('/repo', 's1', 'src/x.ts', 50, 'edit', 'tool')`,
+    );
+    db.run("UPDATE meta SET value = '74' WHERE key = 'schema_version'");
+    db.close();
+  }
+
+  // Re-migrate 74→75: rewrites the 'planctl' row's source to 'plan'.
+  const { db } = openDb(dbPath);
+  const ver = (
+    db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as {
+      value: string;
+    }
+  ).value;
+  const planRow = db
+    .prepare(
+      "SELECT source, op, last_mutation_at, last_event_id FROM file_attributions WHERE file_path = ?",
+    )
+    .get(".planctl/epics/fn-1.json") as {
+    source: string;
+    op: string;
+    last_mutation_at: number;
+    last_event_id: number;
+  };
+  const toolRow = db
+    .prepare("SELECT source FROM file_attributions WHERE file_path = ?")
+    .get("src/x.ts") as { source: string };
+  const planctlLeft = (
+    db
+      .prepare(
+        "SELECT COUNT(*) AS n FROM file_attributions WHERE source = 'planctl'",
+      )
+      .get() as { n: number }
+  ).n;
+  db.close();
+
+  expect(ver).toBe(String(SCHEMA_VERSION));
+  // The planctl row's source flipped to 'plan'; other columns preserved.
+  expect(planRow.source).toBe("plan");
+  expect(planRow.op).toBe("scaffold");
+  expect(planRow.last_mutation_at).toBe(100);
+  expect(planRow.last_event_id).toBe(7);
+  // The tool row is untouched.
+  expect(toolRow.source).toBe("tool");
+  // No 'planctl' rows remain (idempotency invariant).
+  expect(planctlLeft).toBe(0);
+});
+
 test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL", () => {
   // Build a v3-shaped DB by hand: events without spawn_name, jobs without
   // title_source, version '3'.
@@ -2069,9 +2135,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `jobs.close_kind`, fn-817; v71 adds `jobs.window_index`, fn-817; v72 widens
   // the `file_attributions.source` CHECK to accept `'plan'`, fn-826; v73 adds
   // the `events.mutation_path` column, fn-836.2; v74 restores keep-set bodies
-  // inline + DROPs `event_blobs`, fn-836.4); the v62→v63 epics-shape migration
-  // this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(74);
+  // inline + DROPs `event_blobs`, fn-836.4; v75 rewrites stored
+  // `file_attributions.source='planctl'` rows to `'plan'`, fn-831); the v62→v63
+  // epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(75);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

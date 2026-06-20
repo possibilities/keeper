@@ -1091,7 +1091,7 @@ const SESS_D = "66666666-7777-8888-9999-aaaaaaaaaaaa";
 
 /**
  * Seed a corpus spanning EVERY newly-shed class beside its KEPT guarded sibling:
- *  - planctl Bash (KEEP, mints a source='planctl' file_attribution) beside a
+ *  - planctl Bash (KEEP, mints a source='plan' file_attribution) beside a
  *    non-planctl Bash (SHED);
  *  - modern PostToolUse:Agent `subagent_agent_id` (SHED) beside a legacy
  *    NULL-id Agent (KEEP — the bridge resolves its `tool_response.agentId`);
@@ -1306,10 +1306,10 @@ test("widened shed: pre-shed P0 === post-shed re-fold P1 === P2, countAbsentBlob
   const legacy = p0Subs.find((r) => r.agent_id === "agent-legacy");
   expect(modern).not.toBeUndefined();
   expect(legacy).not.toBeUndefined();
-  // The planctl Bash minted a source='planctl' attribution (state_repo fold-read).
+  // The planctl Bash minted a source='plan' attribution (state_repo fold-read).
   const planctlAttribs = (
     p0.file_attributions as Array<Record<string, unknown>>
-  ).filter((a) => a.source === "planctl");
+  ).filter((a) => a.source === "plan");
   expect(planctlAttribs.length).toBeGreaterThan(0);
   // The Notification stamped jobs.last_permission_prompt_kind from event_type.
   const stampedJob = (p0.jobs as Array<Record<string, unknown>>).find(

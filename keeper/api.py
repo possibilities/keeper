@@ -100,8 +100,9 @@ from pathlib import Path
 # enum to include ``'planctl'`` (a row-preserving table rebuild) and
 # adds the additive nullable ``events.planctl_files TEXT`` column lifted
 # from the envelope's ``files`` array by ``extractPlanctlInvocation`` —
-# the reducer's planctl_op fold mints ``source='planctl'`` rows for
-# every named path so ``.planctl`` JSONs + specs no longer orphan.
+# the reducer's planctl_op fold mints a ``file_attributions`` row for
+# every named path so ``.planctl`` JSONs + specs no longer orphan (the
+# minted ``source`` value is ``'plan'`` as of v75; see below).
 # keeper-py reads ``file_attributions`` only for the
 # ``session_id`` / ``file_path`` / ``last_mutation_at`` /
 # ``last_commit_at`` tuple — it never reads ``source`` or
@@ -305,6 +306,13 @@ from pathlib import Path
 # (shed-class PostToolUse mutation bodies stay NULL — their file_path lives in
 # ``mutation_path`` now). keeper-py never read ``event_blobs`` (it computes its own
 # dirty set), so no reader logic changes — only the version whitelist gains 74.
+#
+# v75 (fn-831 task .1) completes the planctl→plan producer flip: the planctl_op
+# fold now mints ``source='plan'`` and the migration rewrites every stored
+# ``source='planctl'`` ``file_attributions`` row to ``'plan'`` (in-transaction with
+# the version stamp, no cursor rewind, re-fold byte-identical). keeper-py reads no
+# ``file_attributions.source`` (the TUI subscribes over the socket), so no reader
+# logic changes — only the version whitelist gains 75.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -351,6 +359,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         72,
         73,
         74,
+        75,
     }
 )
 
