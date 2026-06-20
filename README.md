@@ -377,7 +377,7 @@ Keeper has no `install` verb. Wire it up manually:
    manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
    `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin
-   behind `keeper plan` + the `plan:*` skills, vendored as a `git subtree`). agentwrap's
+   behind `keeper plan` + the `plan:*` skills, a native plugin loaded by agentwrap). agentwrap's
    `plugin_scan_dirs` points at `~/code/keeper/plugins`, scans the parent, and
    appends one `--plugin-dir` per manifest-bearing child — so a fresh session
    auto-loads BOTH plugins from this repo. No symlink step. A

@@ -49,7 +49,6 @@ import {
   epicNumberFromId,
   isPathInHead,
   isPathInHeadBatch,
-  isVendoredPlanPath,
   isWithinRoots,
   MAX_SUBSCRIBES_PER_CYCLE,
   makeSingleFlight,
@@ -204,95 +203,7 @@ test("classifyPlanPath: .keeper/state/epics/*.state.json → epic-state (fn-732)
   ).toBeNull();
 });
 
-// ---------------------------------------------------------------------------
-// Vendored planctl subtree pruning (fn-822). keeper co-hosts planctl via
-// `git subtree add --prefix=plugins/plan`, which brings planctl's OWN
-// `.planctl/` dev plan to `<repo>/plugins/plan/.planctl`. That tree must NEVER
-// fold into keeper's `epics` projection.
-// ---------------------------------------------------------------------------
-
-test("isVendoredPlanPath: matches the plugins/plan/.planctl subtree, rejects the root plan", () => {
-  // The vendored subtree's own plan files match anywhere in the path.
-  expect(
-    isVendoredPlanPath(
-      "/home/u/code/keeper/plugins/plan/.planctl/epics/fn-1.json",
-    ),
-  ).toBe(true);
-  expect(
-    isVendoredPlanPath(
-      "/home/u/code/keeper/plugins/plan/.planctl/state/tasks/fn-1.2.state.json",
-    ),
-  ).toBe(true);
-  // The subtree's `.planctl` dir itself matches (boot-scan call site).
-  expect(isVendoredPlanPath("/home/u/code/keeper/plugins/plan/.planctl")).toBe(
-    true,
-  );
-  // keeper's OWN root plan is NOT vendored — it must still fold.
-  expect(
-    isVendoredPlanPath("/home/u/code/keeper/.planctl/epics/fn-822.json"),
-  ).toBe(false);
-  // A different plugin's `.planctl` (not the `plan` subtree) is not vendored.
-  expect(
-    isVendoredPlanPath(
-      "/home/u/code/keeper/plugins/keeper/.planctl/epics/fn-1.json",
-    ),
-  ).toBe(false);
-  // A `plan/.planctl` that is not under `plugins/` is unrelated.
-  expect(isVendoredPlanPath("/home/u/plan/.planctl/epics/fn-1.json")).toBe(
-    false,
-  );
-});
-
-test("isVendoredPlanPath: also prunes a plugins/plan/.keeper subtree", () => {
-  // The vendored subtree's data dir may carry either name; the prune must
-  // recognize BOTH `.planctl` and `.keeper` so it holds whichever the subtree
-  // is on.
-  expect(
-    isVendoredPlanPath(
-      "/home/u/code/keeper/plugins/plan/.keeper/epics/fn-1.json",
-    ),
-  ).toBe(true);
-  expect(
-    isVendoredPlanPath(
-      "/home/u/code/keeper/plugins/plan/.keeper/state/tasks/fn-1.2.state.json",
-    ),
-  ).toBe(true);
-  // The subtree's `.keeper` dir itself matches (boot-scan call site).
-  expect(isVendoredPlanPath("/home/u/code/keeper/plugins/plan/.keeper")).toBe(
-    true,
-  );
-  // keeper's OWN root `.keeper` plan is NOT vendored — it must still fold.
-  expect(
-    isVendoredPlanPath("/home/u/code/keeper/.keeper/epics/fn-822.json"),
-  ).toBe(false);
-});
-
-test("onChange refuses to fold the vendored plugins/plan/.planctl subtree", () => {
-  const emitted: PlanMessage[] = [];
-  const scanner = new PlanScanner(
-    (m) => emitted.push(m),
-    () => {},
-  );
-  // Write a real, well-formed epic file under the subtree's nested plan tree.
-  const subtreeEpics = join(tmpDir, "plugins", "plan", ".planctl", "epics");
-  mkdirSync(subtreeEpics, { recursive: true });
-  const subtreeEpic = join(subtreeEpics, "fn-1-planctl-dev.json");
-  writeFileSync(
-    subtreeEpic,
-    JSON.stringify({
-      id: "fn-1-planctl-dev",
-      title: "planctl dev epic",
-      status: "open",
-      primary_repo: tmpDir,
-    }),
-  );
-  // The commit-trigger and live-watcher both funnel through onChange.
-  scanner.onChange(subtreeEpic);
-  scanner.onChange(subtreeEpic, true); // commit-triggered variant
-  expect(emitted).toEqual([]);
-});
-
-test("scanRoot folds the root .keeper but skips the vendored plugins/plan/.planctl", () => {
+test("scanRoot folds the root .keeper plan", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
@@ -304,18 +215,6 @@ test("scanRoot folds the root .keeper but skips the vendored plugins/plan/.planc
     status: "open",
     primary_repo: tmpDir,
   });
-  // The vendored subtree's plan — must NOT fold.
-  const subtreeEpics = join(tmpDir, "plugins", "plan", ".planctl", "epics");
-  mkdirSync(subtreeEpics, { recursive: true });
-  writeFileSync(
-    join(subtreeEpics, "fn-1-planctl-dev.json"),
-    JSON.stringify({
-      id: "fn-1-planctl-dev",
-      title: "planctl dev epic",
-      status: "open",
-      primary_repo: tmpDir,
-    }),
-  );
 
   scanRoot(tmpDir, scanner);
 
@@ -323,7 +222,6 @@ test("scanRoot folds the root .keeper but skips the vendored plugins/plan/.planc
     .filter((m) => m.kind === "plan-epic")
     .map((m) => (m as { id: string }).id);
   expect(epicIds).toContain("fn-822-keeper");
-  expect(epicIds).not.toContain("fn-1-planctl-dev");
 });
 
 // ---------------------------------------------------------------------------
@@ -475,35 +373,6 @@ test("scanRepoDataDirs: re-scans whichever data dir(s) a repo holds", () => {
     .filter((m) => m.kind === "plan-epic")
     .map((m) => (m as { id: string }).id);
   expect(epicIds).toEqual(["fn-905-rescan"]);
-});
-
-test("scanRoot still prunes the vendored subtree under .keeper/ too", () => {
-  const emitted: PlanMessage[] = [];
-  const scanner = new PlanScanner(
-    (m) => emitted.push(m),
-    () => {},
-  );
-  // The vendored subtree migrated to `.keeper/` along with keeper's own dir —
-  // it must STILL be pruned (its parent name-tolerant guard covers both).
-  writeEpicIn(join(tmpDir, "plugins", "plan"), ".keeper", "fn-1-planctl-dev", {
-    title: "vendored",
-    status: "open",
-    primary_repo: tmpDir,
-  });
-  // keeper's own `.keeper/` plan at the root must fold.
-  writeEpicIn(tmpDir, ".keeper", "fn-906-keeper", {
-    title: "keeper",
-    status: "open",
-    primary_repo: tmpDir,
-  });
-
-  scanRoot(tmpDir, scanner);
-
-  const epicIds = emitted
-    .filter((m) => m.kind === "plan-epic")
-    .map((m) => (m as { id: string }).id);
-  expect(epicIds).toContain("fn-906-keeper");
-  expect(epicIds).not.toContain("fn-1-planctl-dev");
 });
 
 test("epicIdFromStatePath / epicDefPathFromStatePath: pure path arithmetic (fn-732)", () => {

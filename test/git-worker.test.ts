@@ -1819,23 +1819,7 @@ test("isPlanctlChangedPath: epics/tasks json + state-tasks/state-epics state.jso
   expect(isPlanctlChangedPath(".keeper/epics/sub/fn-1-x.json")).toBe(false);
   expect(isPlanctlChangedPath("src/a.ts")).toBe(false);
 
-  // Reject the vendored plan subtree's own dev plan (fn-822): keeper
-  // co-hosts the plan plugin under `plugins/plan/`, whose data tree is the
-  // dependency's plan, not keeper's. A keeper commit touching it (notably the
-  // subtree-add) must NOT be forwarded to the plan-worker. The prune is
-  // NAME-TOLERANT: the subtree is still on `.planctl` while keeper is `.keeper`.
-  expect(isPlanctlChangedPath("plugins/plan/.planctl/epics/fn-1-x.json")).toBe(
-    false,
-  );
-  expect(
-    isPlanctlChangedPath(
-      "plugins/plan/.planctl/state/tasks/fn-1-x.2.state.json",
-    ),
-  ).toBe(false);
-  expect(isPlanctlChangedPath("plugins/plan/.keeper/epics/fn-1-x.json")).toBe(
-    false,
-  );
-  // keeper's OWN root plan is still accepted.
+  // keeper's OWN root plan is accepted.
   expect(isPlanctlChangedPath(".keeper/epics/fn-822.json")).toBe(true);
 });
 

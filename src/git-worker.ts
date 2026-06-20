@@ -818,25 +818,12 @@ const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
  * - `.keeper/state/tasks/<id>.state.json` (4-segment)
  * - `.keeper/state/epics/<id>.state.json` (4-segment)
  *
- * Rejects the vendored plan subtree's own dev plan (`plugins/plan/{.planctl,
- * .keeper}`) at the source so a keeper commit touching it (notably the
- * subtree-add commit's 322 files) is never forwarded to the plan-worker —
- * mirrors that worker's own `isVendoredPlanPath` correctness backstop. The
- * prune stays NAME-TOLERANT on both basenames because the vendored subtree is
- * still on `.planctl` while keeper's own board is `.keeper`.
+ * The sole gate for {@link filterPlanctlChanges}: only a commit touching one of
+ * these `.keeper/` shapes is forwarded to the plan-worker.
  */
 export function isPlanctlChangedPath(path: string): boolean {
   if (!path.endsWith(".json")) return false;
   const segments = path.split("/");
-  for (let i = 0; i + 2 < segments.length; i++) {
-    if (
-      segments[i] === "plugins" &&
-      segments[i + 1] === "plan" &&
-      (segments[i + 2] === ".planctl" || segments[i + 2] === ".keeper")
-    ) {
-      return false;
-    }
-  }
   const n = segments.length;
   // 3-segment tail: `.keeper/<epics|tasks>/<file>.json`.
   if (n >= 3 && segments[n - 3] === ".keeper") {
