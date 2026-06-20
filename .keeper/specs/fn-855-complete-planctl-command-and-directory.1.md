@@ -40,5 +40,5 @@ No automated test for skill prose. Smoke: `keeper plan show <existing-epic>
 - [ ] command-naming prose reworded to `keeper plan`; condition labels untouched
 
 ## Done summary
-
+Replaced retired `planctl show` command invocations with `keeper plan show` in the await skill's planctl-target pre-check, and reworded tool-naming prose (description, condition table) to keeper plan. Verified --format json parity against show.ts.
 ## Evidence

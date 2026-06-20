@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Fix broken keeper:await planctl show command",
-  "updated_at": "2026-06-20T19:01:13.746000Z"
+  "updated_at": "2026-06-20T19:03:24.668000Z",
+  "worker_done_at": "2026-06-20T19:03:24.668000Z"
 }
