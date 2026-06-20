@@ -32,5 +32,5 @@ pass-through to `claude`. Builds on the shipped fn-858 dispatch command.
 - [ ] README free-form description updated; the hook-scrape scope boundary is noted (not implemented here).
 
 ## Done summary
-
+Free-form keeper dispatch --name is now optional and a pure verbatim pass-through to claude (--name omitted from argv when absent, decoupled from the keeper label); buildDispatchLaunchArgv mirrors the --model/--effort conditional. Updated --help, header, README, and dispatch tests.
 ## Evidence
