@@ -21,5 +21,5 @@ Fresh session smoke; `grep -rn planctl ~/code --glob '!**/.git/**' --glob '!**/a
 - [ ] `~/code/planctl` moved to `~/archive/`; fresh session: board from `.keeper/`, `keeper plan` works, no `planctl` command
 - [ ] `grep -rn planctl` across the live tree returns nothing actionable; the name is gone
 ## Done summary
-
+Archived ~/code/planctl -> ~/archive/planctl after confirming the cord was fully severed (no uv tool/editable install, LaunchAgent, git remote, or live code/planctl path dep). Swept the last two live ~/code/planctl path refs in arthack docs (apps/CLAUDE.md sibling-repo line; codex AGENTS.md dead hack-skill fallback). Smoke: no planctl on PATH, keeper plan verbs work, keeper board renders from .keeper/.
 ## Evidence
