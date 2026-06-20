@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T11:25:40.433000Z",
   "created_at": "2026-06-20T04:00:22.529000Z",
   "depends_on_epics": [],
   "id": "fn-840-add-show-job-cli-verb",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Add show-job CLI verb",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T04:00:22.529000Z"
+  "updated_at": "2026-06-20T11:25:40.433000Z"
 }
