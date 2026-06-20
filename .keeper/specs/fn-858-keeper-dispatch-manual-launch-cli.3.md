@@ -55,5 +55,5 @@ it depends on for safety, plus docs.
 - [ ] `dispatch` registered in `cli/keeper.ts` (3 touches) + `test/keeper-cli.test.ts`; README + docs/exec-backend.md updated.
 
 ## Done summary
-
+Added keeper dispatch: a client-side manual escape hatch (cli/dispatch.ts) firing one claude worker into a tmux window via resolveExecBackend.ensureLaunched, with plan form (work/close::id resolving prompt+cwd from the epics projection, baking --name, best-effort race guard) and free form (--prompt/--prompt-file, --name required). Hardened buildTmuxNewWindowArgs to =-exact-match session targeting, registered the subcommand, and updated README + docs/exec-backend.md.
 ## Evidence
