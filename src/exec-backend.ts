@@ -231,8 +231,10 @@ export function buildTmuxNewSessionArgs(session: string): string[] {
  * leaves a usable shell for inspection and keeps the pane LISTED so
  * `classifyCloseKind`'s `list-panes` probe still reads `pid_died`.
  *
- * Targets `<session>:` (trailing colon = the session's window list) so the new
- * window lands in the managed session. `-c <cwd>` sets the working dir; the
+ * Targets `=<session>:` (the `=` prefix forces an EXACT session match — tmux
+ * otherwise does an fnmatch glob + prefix match, so `back` would land in
+ * `background`; the trailing colon = the session's window list) so the new
+ * window lands in exactly the named session. `-c <cwd>` sets the working dir; the
  * `-e KEEPER_TMUX_SESSION=<session>` injection re-stamps the session name on the
  * new window's pane env (a window does NOT inherit the session-mint `-e`).
  * `-P -F '#{pane_id}'` prints the new pane's id to stdout — the durable handle
@@ -253,7 +255,7 @@ export function buildTmuxNewWindowArgs(
     "tmux",
     "new-window",
     "-t",
-    `${session}:`,
+    `=${session}:`,
     "-c",
     cwd,
     "-e",

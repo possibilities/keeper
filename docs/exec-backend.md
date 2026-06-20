@@ -22,8 +22,9 @@ The backend is a **factory, not a singleton** — `createTmuxBackend(...)`
 returns an `ExecBackend` with no top-level side effects, and
 `resolveExecBackend({ ... })` is the single stable entry point every call
 site goes through. Production constructs one inside the autopilot reconciler
-worker; the `keeper jobs` CLI and the `restore-agents.ts` replay construct
-their own. Tests pass a capturing `spawn` fake.
+worker; the `keeper jobs` CLI, the `restore-agents.ts` replay, and the
+`keeper dispatch` manual escape hatch (`cli/dispatch.ts`) each construct their
+own. Tests pass a capturing `spawn` fake.
 
 ```ts
 const backend = resolveExecBackend({
@@ -56,7 +57,7 @@ factory:
 |---|---|---|---|
 | `launch(argv, name, cwd)` | session-bound lifecycle | autopilot reconciler | baked in at construction |
 | `focusPane(session, paneId)` | session-agnostic | `keeper jobs` `v` key | per call |
-| `ensureLaunched(session, argv, cwd, name?)` | session-agnostic | `restore-agents.ts` replay | per call |
+| `ensureLaunched(session, argv, cwd, name?)` | session-agnostic | `restore-agents.ts` replay, `cli/dispatch.ts` (`keeper dispatch`) | per call |
 | `listPanes()` | session-agnostic | renamer worker | per call (`-a`, whole server) |
 | `renameWindow(windowId, name)` | session-agnostic | renamer worker | per call |
 | `killWindow(paneId)` | session-agnostic | reaper worker | per call (`%N` pane id) |
@@ -125,11 +126,14 @@ target parsing). No session-ensure runs; a missing session/pane degrades to
 
 Session-agnostic get-or-create + launch. Get-or-creates the target
 `session` (mint only when absent) then launches `argv` in a new window at
-`cwd` inside it. `name` is optional and unset on the restore path (no label
-— the Chrome-style restore-previous-session model emits no `verb::id`
-label). Shares NO state with the managed session; the mint is per-call.
-`restore-agents.ts` is the consumer, routing every restore bucket through
-this one backend regardless of the legacy `backend` tag the bucket carries.
+`cwd` inside it. `name` is optional and unset on both consumer paths today (no
+label — the restore path emits no `verb::id` label, and `keeper dispatch`
+leaves plan-form windows for the renamer worker to label from the bound `jobs`
+row). Shares NO state with the managed session; the mint is per-call. Two
+consumers: `restore-agents.ts` (routing every restore bucket through this one
+backend regardless of the legacy `backend` tag the bucket carries) and
+`cli/dispatch.ts` (the manual `keeper dispatch` launch into the resolved
+current/`foreground` session).
 
 ### `listPanes() → PaneInfo[] | null`
 

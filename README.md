@@ -942,6 +942,33 @@ event-log/reducer/hook touch. Run any of them with
   keeper autopilot retry work::fn-1-x.3  # clear a sticky DispatchFailed
   ```
 
+- `dispatch.ts` — a manual escape hatch that fires ONE `claude` worker into a
+  tmux window by hand, the client-side complement to the server-side
+  reconciler above: where `autopilot` is the daemon's level-triggered
+  dispatcher, `keeper dispatch` is a one-shot human-driven launch that goes
+  through `resolveExecBackend(...).ensureLaunched(...)` with NO daemon RPC, NO
+  synthetic event, and NO reducer/migration touch — so re-fold determinism and
+  the five-surface RPC-write invariant hold by construction. Two
+  mutually-exclusive modes: a **plan form** (`work::<id>` / `close::<id>`) that
+  resolves the canonical `/plan:<verb> <id>` prompt + cwd from the daemon's
+  `epics` projection (read-only, via `cli/control-rpc.ts`'s one-shot
+  `queryCollection`) and bakes `--name <verb>::<id>` so the SessionStart hook
+  binds a board-visible `jobs` row, and a **free form** (`--prompt` /
+  `--prompt-file`, `--name` required) for an arbitrary prompt. The target tmux
+  session resolves `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX`-gated current
+  session > the managed `foreground`. The plan form runs a best-effort race
+  guard (a pending dispatch, an unpaused autopilot, or a live job for the key
+  refuses unless `--force`; the read↔launch TOCTOU is inherent and accepted for
+  a manual hatch).
+
+  ```sh
+  keeper dispatch work::fn-1-foo.2                       # plan form → current/foreground session
+  keeper dispatch close::fn-1-foo --session background   # plan form, explicit session
+  keeper dispatch work::fn-1-foo.2 --dry-run             # print the launch plan, launch nothing
+  keeper dispatch --name scratch --prompt 'investigate the flaky X test'
+  keeper dispatch work::fn-1-foo.2 --force               # skip the race guard
+  ```
+
 - `git.ts` — single-collection subscribe client over the `git`
   collection (watched-worktree status — membership gate
   `.keeper present || dirty || ahead of upstream > 0`, recomputed each
@@ -2445,7 +2472,9 @@ on partial failure). The terminal-surface mechanics live behind the
 (the reaper's only kill op; there is no general `reapSurfaces` close path).
 `ensureLaunched` (session-agnostic) get-or-creates the
 target session with its own per-call mint and launches an
-unnamed window — `restore-agents.ts` is the consumer. tmux is the sole backend,
+unnamed window — its consumers are `restore-agents.ts` (session restore) and
+`cli/dispatch.ts` (the manual `keeper dispatch` client-side escape hatch; see
+[Example clients](#example-clients)). tmux is the sole backend,
 resolved via `resolveExecBackend`; each reconciler dispatch opens as a new
 window in the hardcoded managed session (`autopilot`). Each op runs a cheap
 per-call `has-session` probe and mints via `new-session -d` only when the

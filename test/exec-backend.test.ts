@@ -137,7 +137,7 @@ test("buildTmuxNewSessionArgs: detached mint injects KEEPER_TMUX_SESSION via -e"
   ]);
 });
 
-test("buildTmuxNewWindowArgs: trailing-colon session target, -e injection, -P -F pane id, argv after --, no -n when unnamed", () => {
+test("buildTmuxNewWindowArgs: =-exact trailing-colon session target, -e injection, -P -F pane id, argv after --, no -n when unnamed", () => {
   const got = buildTmuxNewWindowArgs("autopilot", "/Users/mike/code/keeper", [
     "/bin/zsh",
     "-l",
@@ -149,7 +149,7 @@ test("buildTmuxNewWindowArgs: trailing-colon session target, -e injection, -P -F
     "tmux",
     "new-window",
     "-t",
-    "autopilot:",
+    "=autopilot:",
     "-c",
     "/Users/mike/code/keeper",
     "-e",
@@ -286,7 +286,7 @@ test("createTmuxBackend.launch: live session (has-session exit 0) → new-window
   // has-session probe fired against the managed session, then new-window.
   expect(calls[0]).toEqual(buildTmuxHasSessionArgs(MANAGED_EXEC_SESSION));
   const win = calls.find((c) => c[1] === "new-window");
-  expect(win?.[3]).toBe(`${MANAGED_EXEC_SESSION}:`);
+  expect(win?.[3]).toBe(`=${MANAGED_EXEC_SESSION}:`);
   // No mint — the live session was respected.
   expect(calls.some((c) => c[1] === "new-session")).toBe(false);
   // Managed window stays UNNAMED — `name` is the dedup key only.
@@ -518,7 +518,7 @@ test("createTmuxBackend.ensureLaunched: live per-call session → new-window wit
   // has-session probed the PER-CALL session, not the construction default.
   expect(calls[0]).toEqual(buildTmuxHasSessionArgs("human-session"));
   const win = calls.find((c) => c[1] === "new-window");
-  expect(win?.[3]).toBe("human-session:");
+  expect(win?.[3]).toBe("=human-session:");
   // -e carries the per-call session name for the hook's session stamp.
   const eIdx = win?.indexOf("-e") ?? -1;
   expect(win?.[eIdx + 1]).toBe("KEEPER_TMUX_SESSION=human-session");
