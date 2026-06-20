@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] agentuse `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+git mv .planctl .keeper in agentuse; updated path refs in .keeper/CLAUDE.md. keeper board renders agentuse plan from .keeper/ (source commit 7f697f8).
 ## Evidence
