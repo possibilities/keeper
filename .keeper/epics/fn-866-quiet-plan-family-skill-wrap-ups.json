@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-20T21:47:53.423000Z",
+  "depends_on_epics": [],
+  "id": "fn-866-quiet-plan-family-skill-wrap-ups",
+  "last_validated_at": "2026-06-20T21:47:53.471000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Quiet plan-family skill wrap-ups",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-20T21:47:53.423000Z"
+}
