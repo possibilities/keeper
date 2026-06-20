@@ -347,7 +347,7 @@ describe("followup submit", () => {
   });
 
   // test_followup_submit.py::test_no_commit_fires — followup mutates only
-  // gitignored state/; no .planctl/ commit payload rides the output.
+  // gitignored state/; no .keeper/ commit payload rides the output.
   test("no commit fires: no files-bearing invocation payload", () => {
     const proj = getProj();
     const src = sourceEpic(proj);

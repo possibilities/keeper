@@ -47,7 +47,7 @@ describe("seedState skeleton + meta.json + inner gitignore", () => {
   test("skeleton dirs + meta.json + inner gitignore match the init contract", () => {
     const root = getTmp();
     seedState(root, { epicId: "fn-1-seed" });
-    const planctlDir = join(root, ".planctl");
+    const planctlDir = join(root, ".keeper");
     for (const subdir of ["epics", "specs", "tasks", "state"]) {
       expect(statSync(join(planctlDir, subdir)).isDirectory()).toBe(true);
     }
@@ -77,7 +77,7 @@ describe("seedState round-trip zero drift", () => {
       taskSnippets: { 1: ["snippet/b"] },
       taskDeps: { 2: [1] },
     });
-    const planctlDir = join(root, ".planctl");
+    const planctlDir = join(root, ".keeper");
 
     // Epic: re-normalizing an already-normalized on-disk record is a no-op, so
     // any field the persisted JSON is missing surfaces as an inequality.
@@ -104,7 +104,7 @@ describe("seedState round-trip zero drift", () => {
       epicId: "fn-3-seed",
       nTasks: 1,
     });
-    const specsDir = join(root, ".planctl", "specs");
+    const specsDir = join(root, ".keeper", "specs");
     expect(readFileSync(join(specsDir, `${epicId}.md`), "utf-8")).toContain(
       "## Overview",
     );
@@ -248,12 +248,10 @@ describe("fixedClock pins seed timestamps", () => {
     expect(frozen).toBe("2026-06-06T00:00:00.000000Z");
     const root = getTmp();
     const [epicId, taskIds] = seedState(root, { epicId: "fn-5-seed" });
-    const epic = loadJson(join(root, ".planctl", "epics", `${epicId}.json`));
+    const epic = loadJson(join(root, ".keeper", "epics", `${epicId}.json`));
     expect(epic.created_at).toBe(frozen);
     expect(epic.updated_at).toBe(frozen);
-    const task = loadJson(
-      join(root, ".planctl", "tasks", `${taskIds[0]}.json`),
-    );
+    const task = loadJson(join(root, ".keeper", "tasks", `${taskIds[0]}.json`));
     expect(task.created_at).toBe(frozen);
   });
 });

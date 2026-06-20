@@ -148,7 +148,7 @@ interface RunResult {
  * tier=medium. Returns the repo root (realpath-resolved). */
 function seedGitProject(epicId: string): string {
   const repo = tmp("planctl-e2e-");
-  const planctl = join(repo, ".planctl");
+  const planctl = join(repo, ".keeper");
   for (const sub of ["epics", "specs", "tasks", "state"]) {
     mkdirSync(join(planctl, sub), { recursive: true });
   }
@@ -199,7 +199,7 @@ function seedGitProject(epicId: string): string {
 
   for (const args of [
     ["init"],
-    ["add", ".planctl/"],
+    ["add", ".keeper/"],
     ["-c", "user.email=t@e.com", "-c", "user.name=T", "commit", "-m", "seed"],
   ]) {
     const g = Bun.spawnSync(["git", ...args], { cwd: repo });
@@ -241,7 +241,7 @@ function runBin(
 
 function runtimeOnDisk(repo: string, taskId: string): string {
   return readFileSync(
-    join(repo, ".planctl", "state", "tasks", `${taskId}.state.json`),
+    join(repo, ".keeper", "state", "tasks", `${taskId}.state.json`),
     "utf-8",
   );
 }
@@ -257,7 +257,7 @@ describe("claim/block end-to-end (compiled binary, real git)", () => {
       expect(payload.success).toBe(true);
       expect(payload.task_state.outcome).toBe("CLAIMED");
       expect(payload.brief_ref).toBe(
-        join(repo, ".planctl", "state", "briefs", "fn-1-claim.1.json"),
+        join(repo, ".keeper", "state", "briefs", "fn-1-claim.1.json"),
       );
       // Zero commits — claim mutates only gitignored state/.
       expect(commitCount(repo)).toBe(before);

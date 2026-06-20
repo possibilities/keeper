@@ -79,9 +79,9 @@ afterEach(() => {
   rmSync(tmpDir, { recursive: true, force: true });
 });
 
-/** Make a `.planctl/<dir>` tree under tmpDir and return the dir path. */
+/** Make a `.keeper/<dir>` tree under tmpDir and return the dir path. */
 function planctlDir(kind: "epics" | "tasks"): string {
-  const dir = join(tmpDir, ".planctl", kind);
+  const dir = join(tmpDir, ".keeper", kind);
   mkdirSync(dir, { recursive: true });
   return dir;
 }
@@ -101,7 +101,8 @@ function writeTask(id: string, body: Record<string, unknown>): string {
 }
 
 /** Make a `<dataDir>/<kind>` tree under a project root and return the dir path.
- * `dataDir` is the data-dir basename (`.keeper` or the legacy `.planctl`). */
+ * `dataDir` is the data-dir basename (`.keeper`; tests also pass `.planctl` to
+ * verify it is ignored). */
 function dataDirOf(
   projectRoot: string,
   dataDir: string,
@@ -128,80 +129,78 @@ function writeEpicIn(
 // (a) Pure-core determinism — path classifier + number parse
 // ---------------------------------------------------------------------------
 
-test("classifyPlanPath: epics/tasks json under .planctl, else null", () => {
-  expect(classifyPlanPath("/a/b/.planctl/epics/fn-1-x.json")).toBe("epic");
-  expect(classifyPlanPath("/a/b/.planctl/tasks/fn-1-x.2.json")).toBe("task");
-  // Wrong subdir, wrong extension, not under .planctl, deeper nesting all reject.
-  expect(classifyPlanPath("/a/.planctl/specs/fn-1-x.md")).toBeNull();
-  expect(classifyPlanPath("/a/.planctl/epics/fn-1-x.md")).toBeNull();
+test("classifyPlanPath: epics/tasks json under .keeper, else null", () => {
+  expect(classifyPlanPath("/a/b/.keeper/epics/fn-1-x.json")).toBe("epic");
+  expect(classifyPlanPath("/a/b/.keeper/tasks/fn-1-x.2.json")).toBe("task");
+  // Wrong subdir, wrong extension, not under .keeper, deeper nesting all reject.
+  expect(classifyPlanPath("/a/.keeper/specs/fn-1-x.md")).toBeNull();
+  expect(classifyPlanPath("/a/.keeper/epics/fn-1-x.md")).toBeNull();
   expect(classifyPlanPath("/a/epics/fn-1-x.json")).toBeNull();
-  expect(classifyPlanPath("/a/.planctl/epics/sub/fn-1-x.json")).toBeNull();
+  expect(classifyPlanPath("/a/.keeper/epics/sub/fn-1-x.json")).toBeNull();
 });
 
-test("classifyPlanPath: .planctl/state/tasks/*.state.json → task-state, else null", () => {
+test("classifyPlanPath: .keeper/state/tasks/*.state.json → task-state, else null", () => {
   // Positive: the planctl LocalFileStateStore shape — 4-segment tail with the
   // `.state.json` suffix on the basename.
-  expect(
-    classifyPlanPath("/a/b/.planctl/state/tasks/fn-1-x.2.state.json"),
-  ).toBe("task-state");
+  expect(classifyPlanPath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json")).toBe(
+    "task-state",
+  );
   // Negative: a stray non-state `.json` under the same dir rejects (the suffix
   // probe excludes it).
-  expect(
-    classifyPlanPath("/a/b/.planctl/state/tasks/fn-1-x.2.json"),
-  ).toBeNull();
-  // Negative: a 3-segment match under `.planctl/state/...` (wrong middle dir
+  expect(classifyPlanPath("/a/b/.keeper/state/tasks/fn-1-x.2.json")).toBeNull();
+  // Negative: a 3-segment match under `.keeper/state/...` (wrong middle dir
   // for the 3-tail probe AND wrong shape for the 4-tail probe) rejects.
-  expect(classifyPlanPath("/a/.planctl/state/fn-1-x.state.json")).toBeNull();
+  expect(classifyPlanPath("/a/.keeper/state/fn-1-x.state.json")).toBeNull();
   // Negative: a non-state file with the same tail depth rejects (wrong dir
   // chain).
   expect(
-    classifyPlanPath("/a/.planctl/snapshots/tasks/fn-1-x.state.json"),
+    classifyPlanPath("/a/.keeper/snapshots/tasks/fn-1-x.state.json"),
   ).toBeNull();
   // Negative: a 5-segment match (deeper nesting) rejects — the probe is exact
   // on the trailing 4 segments.
   expect(
-    classifyPlanPath("/a/.planctl/state/tasks/sub/fn-1-x.state.json"),
+    classifyPlanPath("/a/.keeper/state/tasks/sub/fn-1-x.state.json"),
   ).toBeNull();
 });
 
 test("taskIdFromStatePath / taskDefPathFromStatePath: pure path arithmetic", () => {
   // Strip the `.state.json` suffix from the basename to recover the task id.
   expect(
-    taskIdFromStatePath("/a/.planctl/state/tasks/fn-1-x.2.state.json"),
+    taskIdFromStatePath("/a/.keeper/state/tasks/fn-1-x.2.state.json"),
   ).toBe("fn-1-x.2");
   // A basename without the suffix rejects.
   expect(
-    taskIdFromStatePath("/a/.planctl/state/tasks/fn-1-x.2.json"),
+    taskIdFromStatePath("/a/.keeper/state/tasks/fn-1-x.2.json"),
   ).toBeNull();
   // Map a state-file path to the sibling task-definition path.
   expect(
-    taskDefPathFromStatePath("/a/b/.planctl/state/tasks/fn-1-x.2.state.json"),
-  ).toBe("/a/b/.planctl/tasks/fn-1-x.2.json");
+    taskDefPathFromStatePath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json"),
+  ).toBe("/a/b/.keeper/tasks/fn-1-x.2.json");
   // A path that doesn't match the 4-segment shape rejects.
-  expect(taskDefPathFromStatePath("/a/.planctl/tasks/fn-1-x.json")).toBeNull();
+  expect(taskDefPathFromStatePath("/a/.keeper/tasks/fn-1-x.json")).toBeNull();
 });
 
-test("classifyPlanPath: .planctl/state/epics/*.state.json → epic-state (fn-732)", () => {
+test("classifyPlanPath: .keeper/state/epics/*.state.json → epic-state (fn-732)", () => {
   // Positive: the planctl LocalFileStateStore shape for the epic runtime-state
   // sidecar — 4-segment tail under `state/epics/` with `.state.json` suffix.
   // Keeper ingests no field from this sidecar, but the path classifies so it
   // is recognized, not mis-routed.
-  expect(classifyPlanPath("/a/b/.planctl/state/epics/fn-1-x.state.json")).toBe(
+  expect(classifyPlanPath("/a/b/.keeper/state/epics/fn-1-x.state.json")).toBe(
     "epic-state",
   );
   // Sibling task-state arm still classifies independently.
-  expect(
-    classifyPlanPath("/a/b/.planctl/state/tasks/fn-1-x.2.state.json"),
-  ).toBe("task-state");
+  expect(classifyPlanPath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json")).toBe(
+    "task-state",
+  );
   // Negative: a stray non-state `.json` under state/epics/ rejects.
-  expect(classifyPlanPath("/a/b/.planctl/state/epics/fn-1-x.json")).toBeNull();
+  expect(classifyPlanPath("/a/b/.keeper/state/epics/fn-1-x.json")).toBeNull();
   // Negative: a deeper-nested match rejects (exact trailing-4 probe).
   expect(
-    classifyPlanPath("/a/.planctl/state/epics/sub/fn-1-x.state.json"),
+    classifyPlanPath("/a/.keeper/state/epics/sub/fn-1-x.state.json"),
   ).toBeNull();
   // Negative: an unrelated leaf dir under state/ rejects.
   expect(
-    classifyPlanPath("/a/.planctl/state/sessions/fn-1-x.state.json"),
+    classifyPlanPath("/a/.keeper/state/sessions/fn-1-x.state.json"),
   ).toBeNull();
 });
 
@@ -244,10 +243,10 @@ test("isVendoredPlanPath: matches the plugins/plan/.planctl subtree, rejects the
   );
 });
 
-test("isVendoredPlanPath: also prunes the post-rename plugins/plan/.keeper subtree", () => {
-  // The daemon name-erasure renames the plan dir `.planctl` -> `.keeper`; the
-  // vendored subtree's dir moves with it. The prune must recognize BOTH so it
-  // survives the rename (fn-827/fn-828). Additive — the legacy match is intact.
+test("isVendoredPlanPath: also prunes a plugins/plan/.keeper subtree", () => {
+  // The vendored subtree's data dir may carry either name; the prune must
+  // recognize BOTH `.planctl` and `.keeper` so it holds whichever the subtree
+  // is on.
   expect(
     isVendoredPlanPath(
       "/home/u/code/keeper/plugins/plan/.keeper/epics/fn-1.json",
@@ -293,7 +292,7 @@ test("onChange refuses to fold the vendored plugins/plan/.planctl subtree", () =
   expect(emitted).toEqual([]);
 });
 
-test("scanRoot folds the root .planctl but skips the vendored plugins/plan/.planctl", () => {
+test("scanRoot folds the root .keeper but skips the vendored plugins/plan/.planctl", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
@@ -328,15 +327,12 @@ test("scanRoot folds the root .planctl but skips the vendored plugins/plan/.plan
 });
 
 // ---------------------------------------------------------------------------
-// fn-827: data-dir rename — the worker folds BOTH `.keeper/` (primary) and the
-// legacy `.planctl/` (transient migration fallback) so the `epics` projection,
-// and therefore autopilot's board, covers every repo regardless of which dir
-// name it currently uses. No double-fold when a repo briefly holds both;
-// `.keeper/` wins the deterministic precedence.
+// data dir — the worker folds the `.keeper/` data dir only. A `.planctl/` dir
+// is not a recognized plan data dir: it is ignored entirely (never folded), so
+// the `epics` projection (and autopilot's board) sources from `.keeper/`.
 // ---------------------------------------------------------------------------
 
-test("classifyPlanPath: recognizes both .keeper/ and legacy .planctl/", () => {
-  // `.keeper/` (the convention dir) classifies identically to `.planctl/`.
+test("classifyPlanPath: recognizes .keeper/, ignores .planctl/", () => {
   expect(classifyPlanPath("/a/b/.keeper/epics/fn-1-x.json")).toBe("epic");
   expect(classifyPlanPath("/a/b/.keeper/tasks/fn-1-x.2.json")).toBe("task");
   expect(classifyPlanPath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json")).toBe(
@@ -345,22 +341,20 @@ test("classifyPlanPath: recognizes both .keeper/ and legacy .planctl/", () => {
   expect(classifyPlanPath("/a/b/.keeper/state/epics/fn-1-x.state.json")).toBe(
     "epic-state",
   );
-  // A non-data-dir basename still rejects (the gate is the two known names).
+  // A non-data-dir basename — including the unrecognized `.planctl/` — rejects.
   expect(classifyPlanPath("/a/b/.other/epics/fn-1-x.json")).toBeNull();
+  expect(classifyPlanPath("/a/b/.planctl/epics/fn-1-x.json")).toBeNull();
 });
 
-test("repoRootFromPlanctlPath: resolves the repo root for both dir names", () => {
+test("repoRootFromPlanctlPath: resolves the repo root for the .keeper/ data dir", () => {
   expect(repoRootFromPlanctlPath("/a/b/.keeper/epics/fn-1-x.json")).toBe(
     "/a/b",
   );
-  expect(repoRootFromPlanctlPath("/a/b/.planctl/epics/fn-1-x.json")).toBe(
-    "/a/b",
-  );
+  // A `.planctl/` path is not under a recognized data dir, so no root resolves.
+  expect(repoRootFromPlanctlPath("/a/b/.planctl/epics/fn-1-x.json")).toBeNull();
 });
 
 test("taskDefPathFromStatePath / epicDefPathFromStatePath: preserve the .keeper/ data dir", () => {
-  // The state→def mapper keeps the input's data-dir basename (`.keeper`), not a
-  // hard-coded `.planctl`.
   expect(
     taskDefPathFromStatePath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json"),
   ).toBe("/a/b/.keeper/tasks/fn-1-x.2.json");
@@ -369,25 +363,25 @@ test("taskDefPathFromStatePath / epicDefPathFromStatePath: preserve the .keeper/
   ).toBe("/a/b/.keeper/epics/fn-1-x.json");
 });
 
-test("scanRoot: a .keeper/ epic folds; a legacy .planctl/ epic still folds", () => {
+test("scanRoot: a .keeper/ epic folds; a .planctl/ dir is ignored", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
     () => {},
   );
   // Two sibling projects under the same configured root — one on `.keeper/`,
-  // one still on the legacy `.planctl/`. Both must fold.
+  // one on `.planctl/`. Only the `.keeper/` epic folds.
   const keeperProj = join(tmpDir, "on-keeper");
-  const legacyProj = join(tmpDir, "on-planctl");
+  const planctlProj = join(tmpDir, "on-planctl");
   writeEpicIn(keeperProj, ".keeper", "fn-900-keeper-dir", {
     title: "keeper-dir epic",
     status: "open",
     primary_repo: keeperProj,
   });
-  writeEpicIn(legacyProj, ".planctl", "fn-901-legacy-dir", {
-    title: "legacy-dir epic",
+  writeEpicIn(planctlProj, ".planctl", "fn-901-planctl-dir", {
+    title: "planctl-dir epic",
     status: "open",
-    primary_repo: legacyProj,
+    primary_repo: planctlProj,
   });
 
   scanRoot(tmpDir, scanner);
@@ -396,19 +390,19 @@ test("scanRoot: a .keeper/ epic folds; a legacy .planctl/ epic still folds", () 
     .filter((m) => m.kind === "plan-epic")
     .map((m) => (m as { id: string }).id);
   expect(epicIds).toContain("fn-900-keeper-dir");
-  expect(epicIds).toContain("fn-901-legacy-dir");
+  expect(epicIds).not.toContain("fn-901-planctl-dir");
 });
 
-test("scanRoot: a repo holding BOTH dirs folds each epic once (no double-fold), .keeper/ wins precedence", () => {
+test("scanRoot: a repo holding both dir names folds only the .keeper/ epic", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
     () => {},
   );
   const proj = join(tmpDir, "both-dirs");
-  // Same epic id in BOTH dirs, differing only by a field — `.keeper/` is the
-  // primary and must win the deterministic precedence; the projection + the
-  // change-gate key off the epic id, so the row is folded once.
+  // Same epic id in both dirs, differing only by a field — `.keeper/` is the
+  // only recognized data dir, so only its file folds; the `.planctl/` file is
+  // ignored entirely.
   writeEpicIn(proj, ".keeper", "fn-902-both", {
     title: "from keeper",
     status: "open",
@@ -425,31 +419,28 @@ test("scanRoot: a repo holding BOTH dirs folds each epic once (no double-fold), 
   const epics = emitted.filter(
     (m) => m.kind === "plan-epic" && (m as { id: string }).id === "fn-902-both",
   );
-  // Folded exactly once: dir-level precedence resolves to `.keeper/` and the
-  // legacy `.planctl/` is IGNORED entirely at this root, so the differing-title
-  // `.planctl/` file never emits a second (overriding) snapshot.
+  // Folded exactly once from `.keeper/`; the `.planctl/` file never emits.
   expect(epics.length).toBe(1);
-  // `.keeper/` won — the surviving snapshot carries the `.keeper/` file's title.
   expect((epics[0] as { title: string }).title).toBe("from keeper");
 });
 
-test("discoverPlanctlDirs: surfaces both dir names; reconcilePlanctlDirs folds each", () => {
+test("discoverPlanctlDirs: surfaces .keeper/ dirs only; reconcilePlanctlDirs folds them", () => {
   const keeperProj = join(tmpDir, "k");
-  const legacyProj = join(tmpDir, "p");
+  const planctlProj = join(tmpDir, "p");
   writeEpicIn(keeperProj, ".keeper", "fn-903-k", {
     title: "k",
     status: "open",
     primary_repo: keeperProj,
   });
-  writeEpicIn(legacyProj, ".planctl", "fn-904-p", {
+  writeEpicIn(planctlProj, ".planctl", "fn-904-p", {
     title: "p",
     status: "open",
-    primary_repo: legacyProj,
+    primary_repo: planctlProj,
   });
 
   const dirs = discoverPlanctlDirs([tmpDir]);
   expect(dirs).toContain(join(keeperProj, ".keeper"));
-  expect(dirs).toContain(join(legacyProj, ".planctl"));
+  expect(dirs).not.toContain(join(planctlProj, ".planctl"));
 
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
@@ -461,7 +452,7 @@ test("discoverPlanctlDirs: surfaces both dir names; reconcilePlanctlDirs folds e
     .filter((m) => m.kind === "plan-epic")
     .map((m) => (m as { id: string }).id);
   expect(epicIds).toContain("fn-903-k");
-  expect(epicIds).toContain("fn-904-p");
+  expect(epicIds).not.toContain("fn-904-p");
 });
 
 test("scanRepoDataDirs: re-scans whichever data dir(s) a repo holds", () => {
@@ -517,22 +508,22 @@ test("scanRoot still prunes the vendored subtree under .keeper/ too", () => {
 
 test("epicIdFromStatePath / epicDefPathFromStatePath: pure path arithmetic (fn-732)", () => {
   // Strip the `.state.json` suffix from the basename to recover the epic id.
-  expect(epicIdFromStatePath("/a/.planctl/state/epics/fn-1-x.state.json")).toBe(
+  expect(epicIdFromStatePath("/a/.keeper/state/epics/fn-1-x.state.json")).toBe(
     "fn-1-x",
   );
   // A basename without the suffix rejects.
-  expect(epicIdFromStatePath("/a/.planctl/state/epics/fn-1-x.json")).toBeNull();
+  expect(epicIdFromStatePath("/a/.keeper/state/epics/fn-1-x.json")).toBeNull();
   // Map an epic state-file path to the committed epic-definition path.
   expect(
-    epicDefPathFromStatePath("/a/b/.planctl/state/epics/fn-1-x.state.json"),
-  ).toBe("/a/b/.planctl/epics/fn-1-x.json");
+    epicDefPathFromStatePath("/a/b/.keeper/state/epics/fn-1-x.state.json"),
+  ).toBe("/a/b/.keeper/epics/fn-1-x.json");
   // A path under the WRONG leaf dir (state/tasks/) rejects — the epic mapper is
   // dir-specific even though the id-from-basename transform is shared.
   expect(
-    epicDefPathFromStatePath("/a/b/.planctl/state/tasks/fn-1-x.state.json"),
+    epicDefPathFromStatePath("/a/b/.keeper/state/tasks/fn-1-x.state.json"),
   ).toBeNull();
   // A path that doesn't match the 4-segment shape rejects.
-  expect(epicDefPathFromStatePath("/a/.planctl/epics/fn-1-x.json")).toBeNull();
+  expect(epicDefPathFromStatePath("/a/.keeper/epics/fn-1-x.json")).toBeNull();
 });
 
 test("coerceRuntimeStatus: enum passes through; missing → 'todo' silently; invalid → 'todo' with log", () => {
@@ -733,7 +724,7 @@ test("malformed JSON skips-and-logs without emitting", () => {
   expect(logs.some((l) => l.includes("malformed JSON"))).toBe(true);
 });
 
-test("a non-.planctl path is a no-op (classifier rejects)", () => {
+test("a non-.keeper path is a no-op (classifier rejects)", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
@@ -754,7 +745,7 @@ test("a vanished file (read-vs-delete race) skips-and-logs, no emit", () => {
     (l) => logs.push(l),
   );
 
-  // A path under a real .planctl/epics dir that does not exist on disk → the
+  // A path under a real .keeper/epics dir that does not exist on disk → the
   // stat fails (the race), skip-and-log.
   const path = join(planctlDir("epics"), "fn-7-gone.json");
   scanner.onChange(path);
@@ -1493,30 +1484,30 @@ test("scanRoot: a file changed between boot and recovery emits exactly its delta
 });
 
 // ---------------------------------------------------------------------------
-// (a'') Recursive boot scan — plan files live at <root>/<project>/.planctl/…,
-// not at <root>/.planctl. The boot scan must recurse (the live watcher does) or
+// (a'') Recursive boot scan — plan files live at <root>/<project>/.keeper/…,
+// not at <root>/.keeper. The boot scan must recurse (the live watcher does) or
 // pre-existing files are only ever folded via a live write. Heavy dirs are
 // pruned so a broad root stays cheap.
 // ---------------------------------------------------------------------------
 
-test("scanRoot: discovers .planctl nested under a project subdir", () => {
+test("scanRoot: discovers .keeper nested under a project subdir", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
     () => {},
   );
 
-  // The real layout: <root>/<project>/.planctl/{epics,tasks}/*.json — NOT a
-  // .planctl directly under the watched root.
+  // The real layout: <root>/<project>/.keeper/{epics,tasks}/*.json — NOT a
+  // .keeper directly under the watched root.
   const proj = join(tmpDir, "myproject");
-  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
-  mkdirSync(join(proj, ".planctl", "tasks"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "tasks"), { recursive: true });
   writeFileSync(
-    join(proj, ".planctl", "epics", "fn-9-nested.json"),
+    join(proj, ".keeper", "epics", "fn-9-nested.json"),
     JSON.stringify({ id: "fn-9-nested", title: "Nested", status: "open" }),
   );
   writeFileSync(
-    join(proj, ".planctl", "tasks", "fn-9-nested.1.json"),
+    join(proj, ".keeper", "tasks", "fn-9-nested.1.json"),
     JSON.stringify({ id: "fn-9-nested.1", epic: "fn-9-nested", title: "T" }),
   );
 
@@ -1527,17 +1518,17 @@ test("scanRoot: discovers .planctl nested under a project subdir", () => {
   ]);
 });
 
-test("scanRoot: prunes node_modules/.git so their .planctl trees are skipped", () => {
+test("scanRoot: prunes node_modules/.git so their .keeper trees are skipped", () => {
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
     (m) => emitted.push(m),
     () => {},
   );
 
-  // A stray .planctl buried inside node_modules must NOT be scanned — pruning
+  // A stray .keeper buried inside node_modules must NOT be scanned — pruning
   // is what keeps a broad root (~/code) cheap and avoids vendored noise.
   for (const heavy of ["node_modules", ".git"]) {
-    const dir = join(tmpDir, heavy, "pkg", ".planctl", "epics");
+    const dir = join(tmpDir, heavy, "pkg", ".keeper", "epics");
     mkdirSync(dir, { recursive: true });
     writeFileSync(
       join(dir, "fn-666-vendored.json"),
@@ -1545,7 +1536,7 @@ test("scanRoot: prunes node_modules/.git so their .planctl trees are skipped", (
     );
   }
   // A real project alongside them IS found.
-  const dir = join(tmpDir, "real", ".planctl", "epics");
+  const dir = join(tmpDir, "real", ".keeper", "epics");
   mkdirSync(dir, { recursive: true });
   writeFileSync(
     join(dir, "fn-7-real.json"),
@@ -1557,7 +1548,7 @@ test("scanRoot: prunes node_modules/.git so their .planctl trees are skipped", (
 });
 
 test("scanRoot: primes runtimeStatusCache from state/tasks/ BEFORE the tasks/ loop — first TaskSnapshot carries the on-disk runtime_status (regression: fn-607.F1)", () => {
-  // Boot-path regression: a pre-existing `.planctl/state/tasks/<id>.state.json`
+  // Boot-path regression: a pre-existing `.keeper/state/tasks/<id>.state.json`
   // must seed the runtime-status cache before the task definition file is
   // scanned, so the FIRST emitted TaskSnapshot already carries the correct
   // `runtime_status`. Pre-fix, scanPlanctlDir iterated only ["epics","tasks"]
@@ -1571,7 +1562,7 @@ test("scanRoot: primes runtimeStatusCache from state/tasks/ BEFORE the tasks/ lo
 
   // Set up the state file FIRST (mirrors the boot path: state file already
   // exists on disk when the daemon comes up).
-  const planctl = join(tmpDir, ".planctl");
+  const planctl = join(tmpDir, ".keeper");
   mkdirSync(join(planctl, "state", "tasks"), { recursive: true });
   writeFileSync(
     join(planctl, "state", "tasks", "fn-1-x.1.state.json"),
@@ -1603,7 +1594,7 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
     (msg) => logs.push(msg),
   );
 
-  const planctl = join(tmpDir, ".planctl");
+  const planctl = join(tmpDir, ".keeper");
   mkdirSync(join(planctl, "state", "tasks"), { recursive: true });
   writeFileSync(
     join(planctl, "state", "tasks", "fn-1-x.1.state.json"),
@@ -1621,7 +1612,7 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
 });
 
 // ---------------------------------------------------------------------------
-// (a'''') fn-681 shallow `.planctl` discovery + periodic reconcile backstop
+// (a'''') fn-681 shallow `.keeper` discovery + periodic reconcile backstop
 // — the cheap convergence layer that catches a brand-new repo's first
 // scaffold (git-worker isn't watching the repo's `.git` yet, so the commit
 // path can't fire) and the drop-recovery rescan (now O(#projects), not the
@@ -1629,37 +1620,37 @@ test("scanRoot: invalid runtime_status in a state file skips the cache prime (ta
 // epic, so a transient read failure can't produce a false retraction.
 // ---------------------------------------------------------------------------
 
-test("discoverPlanctlDirs: finds <root>/<project>/.planctl exactly one level deep", () => {
+test("discoverPlanctlDirs: finds <root>/<project>/.keeper exactly one level deep", () => {
   // Real layout the heartbeat needs to cover: each project sits as a top-
-  // level dir under the watched root, with its `.planctl` immediately
+  // level dir under the watched root, with its `.keeper` immediately
   // inside. A bare root with no project dirs returns [].
   const projA = join(tmpDir, "proja");
   const projB = join(tmpDir, "projb");
-  mkdirSync(join(projA, ".planctl", "epics"), { recursive: true });
-  mkdirSync(join(projB, ".planctl", "tasks"), { recursive: true });
-  // A project WITHOUT `.planctl` is silently skipped (the common case for
+  mkdirSync(join(projA, ".keeper", "epics"), { recursive: true });
+  mkdirSync(join(projB, ".keeper", "tasks"), { recursive: true });
+  // A project WITHOUT `.keeper` is silently skipped (the common case for
   // unrelated repos under a broad root like `~/code`).
   mkdirSync(join(tmpDir, "projc"), { recursive: true });
 
   const dirs = discoverPlanctlDirs([tmpDir]);
   expect(dirs.sort()).toEqual(
-    [join(projA, ".planctl"), join(projB, ".planctl")].sort(),
+    [join(projA, ".keeper"), join(projB, ".keeper")].sort(),
   );
 });
 
 test("discoverPlanctlDirs: prunes node_modules/.git (no descent through heavy vendored trees)", () => {
-  // A stray `.planctl` buried inside `node_modules/<pkg>/` MUST NOT be
+  // A stray `.keeper` buried inside `node_modules/<pkg>/` MUST NOT be
   // discovered — the prune set is what keeps the shallow walk cheap. A
   // sibling `.git` dir is excluded for the same reason.
   for (const heavy of ["node_modules", ".git", "dist", "target"]) {
-    const dir = join(tmpDir, heavy, "pkg", ".planctl", "epics");
+    const dir = join(tmpDir, heavy, "pkg", ".keeper", "epics");
     mkdirSync(dir, { recursive: true });
   }
   // A real project alongside them IS found.
-  mkdirSync(join(tmpDir, "real", ".planctl"), { recursive: true });
+  mkdirSync(join(tmpDir, "real", ".keeper"), { recursive: true });
 
   const dirs = discoverPlanctlDirs([tmpDir]);
-  expect(dirs).toEqual([join(tmpDir, "real", ".planctl")]);
+  expect(dirs).toEqual([join(tmpDir, "real", ".keeper")]);
 });
 
 test("discoverPlanctlDirs: a missing root skip-and-logs and yields no entries", () => {
@@ -1667,24 +1658,24 @@ test("discoverPlanctlDirs: a missing root skip-and-logs and yields no entries", 
   // skip-and-log discipline. (Stderr is captured in production via the
   // module log; here we just assert the call doesn't throw and returns
   // entries only for the real root.)
-  mkdirSync(join(tmpDir, "real", ".planctl"), { recursive: true });
+  mkdirSync(join(tmpDir, "real", ".keeper"), { recursive: true });
   const ghost = join(tmpDir, "does-not-exist");
 
   const dirs = discoverPlanctlDirs([ghost, tmpDir]);
-  expect(dirs).toEqual([join(tmpDir, "real", ".planctl")]);
+  expect(dirs).toEqual([join(tmpDir, "real", ".keeper")]);
 });
 
 test("discoverPlanctlDirs: does NOT recurse — a project nested 2 levels deep is out of scope", () => {
-  // The shallow walk is exactly one level. A `.planctl` under
-  // `<root>/group/<project>/.planctl` is intentionally NOT discovered —
+  // The shallow walk is exactly one level. A `.keeper` under
+  // `<root>/group/<project>/.keeper` is intentionally NOT discovered —
   // the recursive boot scan and the live FSEvents watch cover that case;
   // the heartbeat backstop trades coverage of unusual nesting for
   // predictable O(#projects) cost.
-  mkdirSync(join(tmpDir, "group", "nested", ".planctl"), { recursive: true });
-  mkdirSync(join(tmpDir, "flat", ".planctl"), { recursive: true });
+  mkdirSync(join(tmpDir, "group", "nested", ".keeper"), { recursive: true });
+  mkdirSync(join(tmpDir, "flat", ".keeper"), { recursive: true });
 
   const dirs = discoverPlanctlDirs([tmpDir]);
-  expect(dirs).toEqual([join(tmpDir, "flat", ".planctl")]);
+  expect(dirs).toEqual([join(tmpDir, "flat", ".keeper")]);
 });
 
 // fn-737 reflog watch-set wiring, extracted to PURE module-scope helpers
@@ -1719,15 +1710,15 @@ test("resolveReflogTarget: returns null when neither file exists", () => {
   expect(resolveReflogTarget(tmpDir)).toBeNull();
 });
 
-test("discoverPlanctlRepos: returns the repo roots (parents of discovered .planctl dirs)", () => {
-  // Each `<root>/<project>/.planctl` parent IS its repo root. Build a couple of
-  // real `.planctl` trees under a tmp root (no real `~/code` touched) and
-  // confirm the FS wrapper yields the project dirs, not the `.planctl` dirs.
+test("discoverPlanctlRepos: returns the repo roots (parents of discovered .keeper dirs)", () => {
+  // Each `<root>/<project>/.keeper` parent IS its repo root. Build a couple of
+  // real `.keeper` trees under a tmp root (no real `~/code` touched) and
+  // confirm the FS wrapper yields the project dirs, not the `.keeper` dirs.
   const projA = join(tmpDir, "proja");
   const projB = join(tmpDir, "projb");
-  mkdirSync(join(projA, ".planctl", "epics"), { recursive: true });
-  mkdirSync(join(projB, ".planctl", "tasks"), { recursive: true });
-  // A project WITHOUT `.planctl` contributes no repo.
+  mkdirSync(join(projA, ".keeper", "epics"), { recursive: true });
+  mkdirSync(join(projB, ".keeper", "tasks"), { recursive: true });
+  // A project WITHOUT `.keeper` contributes no repo.
   mkdirSync(join(tmpDir, "projc"), { recursive: true });
 
   const repos = discoverPlanctlRepos([tmpDir]);
@@ -1736,7 +1727,7 @@ test("discoverPlanctlRepos: returns the repo roots (parents of discovered .planc
 
 test("desiredReflogRepos: the union of pending repos and discovered planctl repos", () => {
   // The fn-737 widening: watch every pending repo UNION every discovered
-  // `.planctl` repo. A repo present in BOTH inputs appears once (set union).
+  // `.keeper` repo. A repo present in BOTH inputs appears once (set union).
   const pending = new Set(["/r/a", "/r/b"]);
   const discovered = new Set(["/r/b", "/r/c"]);
 
@@ -1749,7 +1740,7 @@ test("desiredReflogRepos: the union of pending repos and discovered planctl repo
 
 test("reflogWatchDiff: toAdd = desired - live, toDrop = live - desired", () => {
   // The watch-set reconcile diff. `/r/new` is desired but not yet live (add);
-  // `/r/gone` is live but no longer desired — e.g. a removed `.planctl` repo —
+  // `/r/gone` is live but no longer desired — e.g. a removed `.keeper` repo —
   // so it lands in toDrop; `/r/keep` is in both (no churn).
   const desired = new Set(["/r/keep", "/r/new"]);
   const live = new Set(["/r/keep", "/r/gone"]);
@@ -1762,11 +1753,11 @@ test("reflogWatchDiff: toAdd = desired - live, toDrop = live - desired", () => {
   expect([...live].sort()).toEqual(["/r/gone", "/r/keep"]);
 });
 
-test("reflogWatchDiff: a removed .planctl repo lands in toDrop (drops its watch)", () => {
-  // The drop-side of the fn-737 lifecycle: a repo that held a `.planctl` tree
+test("reflogWatchDiff: a removed .keeper repo lands in toDrop (drops its watch)", () => {
+  // The drop-side of the fn-737 lifecycle: a repo that held a `.keeper` tree
   // (so it was watched) no longer appears in the desired union, so its live
   // subscription must be reclaimed.
-  const desired = new Set<string>(); // nothing pending, no `.planctl` repos
+  const desired = new Set<string>(); // nothing pending, no `.keeper` repos
   const live = new Set(["/r/removed"]);
 
   const { toAdd, toDrop } = reflogWatchDiff(desired, live);
@@ -1824,15 +1815,15 @@ test("decidePlanResubscribe: a zero/negative cap drains nothing (defensive clamp
   expect(decidePlanResubscribe(flagged, -5)).toEqual([]);
 });
 
-test("attributePlanctlDirToRoot: a discovered .planctl dir maps back to its configured root", () => {
-  // The heartbeat scan surfaces <root>/<project>/.planctl; the re-arm operates
+test("attributePlanctlDirToRoot: a discovered .keeper dir maps back to its configured root", () => {
+  // The heartbeat scan surfaces <root>/<project>/.keeper; the re-arm operates
   // on the broad CONFIGURED root (the subscription key), so the dir must
   // attribute back to it.
   expect(
-    attributePlanctlDirToRoot("/code/keeper/.planctl", ["/code", "/work"]),
+    attributePlanctlDirToRoot("/code/keeper/.keeper", ["/code", "/work"]),
   ).toBe("/code");
   expect(
-    attributePlanctlDirToRoot("/work/proj/.planctl", ["/code", "/work"]),
+    attributePlanctlDirToRoot("/work/proj/.keeper", ["/code", "/work"]),
   ).toBe("/work");
 });
 
@@ -1841,7 +1832,7 @@ test("attributePlanctlDirToRoot: the LONGEST matching configured root wins (nest
   // both contain the dir — the subscription that actually covers it is the
   // nested one, so attribute to the longest prefix.
   expect(
-    attributePlanctlDirToRoot("/code/keeper/sub/.planctl", [
+    attributePlanctlDirToRoot("/code/keeper/sub/.keeper", [
       "/code",
       "/code/keeper",
     ]),
@@ -1850,11 +1841,11 @@ test("attributePlanctlDirToRoot: the LONGEST matching configured root wins (nest
 
 test("attributePlanctlDirToRoot: a dir under no configured root attributes to null (no mis-attribution)", () => {
   expect(
-    attributePlanctlDirToRoot("/elsewhere/proj/.planctl", ["/code", "/work"]),
+    attributePlanctlDirToRoot("/elsewhere/proj/.keeper", ["/code", "/work"]),
   ).toBeNull();
   // A root that is a substring-but-not-path-prefix must NOT match (`/cod` is not
   // a path ancestor of `/code/...`).
-  expect(attributePlanctlDirToRoot("/code/x/.planctl", ["/cod"])).toBeNull();
+  expect(attributePlanctlDirToRoot("/code/x/.keeper", ["/cod"])).toBeNull();
 });
 
 test("reconcilePlanctlDirs(emittedRoots): only the configured root whose scan emitted is reported; a quiescent root is not", () => {
@@ -1864,11 +1855,11 @@ test("reconcilePlanctlDirs(emittedRoots): only the configured root whose scan em
   const rootA = mkdtempSync(join(tmpdir(), "keeper-plan-attrA-"));
   const rootB = mkdtempSync(join(tmpdir(), "keeper-plan-attrB-"));
   try {
-    mkdirSync(join(rootA, "p", ".planctl", "epics"), { recursive: true });
-    // rootB holds a `.planctl` tree too, but it is EMPTY (nothing to emit).
-    mkdirSync(join(rootB, "q", ".planctl", "epics"), { recursive: true });
+    mkdirSync(join(rootA, "p", ".keeper", "epics"), { recursive: true });
+    // rootB holds a `.keeper` tree too, but it is EMPTY (nothing to emit).
+    mkdirSync(join(rootB, "q", ".keeper", "epics"), { recursive: true });
     writeFileSync(
-      join(rootA, "p", ".planctl", "epics", "fn-1-a.json"),
+      join(rootA, "p", ".keeper", "epics", "fn-1-a.json"),
       JSON.stringify({ id: "fn-1-a", title: "A", status: "open" }),
     );
 
@@ -1925,17 +1916,17 @@ test("reconcilePlanctlDirs: a new-repo first scaffold converges on one call (no 
     () => {},
   );
 
-  // Layout: <root>/freshrepo/.planctl/epics/<id>.json — what `planctl
+  // Layout: <root>/freshrepo/.keeper/epics/<id>.json — what `planctl
   // scaffold` writes on first use.
   const proj = join(tmpDir, "freshrepo");
-  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
-  mkdirSync(join(proj, ".planctl", "tasks"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "tasks"), { recursive: true });
   writeFileSync(
-    join(proj, ".planctl", "epics", "fn-99-fresh.json"),
+    join(proj, ".keeper", "epics", "fn-99-fresh.json"),
     JSON.stringify({ id: "fn-99-fresh", title: "Fresh", status: "open" }),
   );
   writeFileSync(
-    join(proj, ".planctl", "tasks", "fn-99-fresh.1.json"),
+    join(proj, ".keeper", "tasks", "fn-99-fresh.1.json"),
     JSON.stringify({ id: "fn-99-fresh.1", epic: "fn-99-fresh", title: "T" }),
   );
 
@@ -1957,9 +1948,9 @@ test("reconcilePlanctlDirs: an in-sync reconcile emits nothing (change-gate)", (
   );
 
   const proj = join(tmpDir, "p");
-  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
   writeFileSync(
-    join(proj, ".planctl", "epics", "fn-1-x.json"),
+    join(proj, ".keeper", "epics", "fn-1-x.json"),
     JSON.stringify({ id: "fn-1-x", title: "X", status: "open" }),
   );
 
@@ -1973,7 +1964,7 @@ test("reconcilePlanctlDirs: an in-sync reconcile emits nothing (change-gate)", (
   // A real change DOES emit on the next reconcile (the change-gate is the
   // gate, not a one-shot mute).
   writeFileSync(
-    join(proj, ".planctl", "epics", "fn-1-x.json"),
+    join(proj, ".keeper", "epics", "fn-1-x.json"),
     JSON.stringify({ id: "fn-1-x", title: "X", status: "done" }),
   );
   reconcilePlanctlDirs([tmpDir], scanner);
@@ -1995,9 +1986,9 @@ test("reconcilePlanctlDirs: ADDITIVE — does NOT retract existing epics (no fal
   );
 
   const proj = join(tmpDir, "p");
-  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
   writeFileSync(
-    join(proj, ".planctl", "epics", "fn-1-x.json"),
+    join(proj, ".keeper", "epics", "fn-1-x.json"),
     JSON.stringify({ id: "fn-1-x", title: "X", status: "open" }),
   );
 
@@ -2008,21 +1999,21 @@ test("reconcilePlanctlDirs: ADDITIVE — does NOT retract existing epics (no fal
   // Delete the file on disk, then reconcile: the periodic path does NOT
   // run a sweep, so no tombstone fires. (A real deletion is caught by
   // the commit channel or live FSEvents.)
-  unlinkSync(join(proj, ".planctl", "epics", "fn-1-x.json"));
+  unlinkSync(join(proj, ".keeper", "epics", "fn-1-x.json"));
   reconcilePlanctlDirs([tmpDir], scanner);
   // Still 1 emit — no `plan-epic-deleted` message added.
   expect(emitted.length).toBe(1);
   expect(emitted.every((m) => m.kind !== "plan-epic-deleted")).toBe(true);
 });
 
-test("reconcilePlanctlDirs: on-drop callback is `.planctl`-scoped (visits only project `.planctl`s, NOT the whole root tree)", () => {
+test("reconcilePlanctlDirs: on-drop callback is `.keeper`-scoped (visits only project `.keeper`s, NOT the whole root tree)", () => {
   // The on-drop {@link RescanScheduler} callback was repointed from
   // `scanRoot(root, scanner)` (whole-tree walk) to
-  // `reconcilePlanctlDirs([root], scanner)` (`.planctl` dirs only).
+  // `reconcilePlanctlDirs([root], scanner)` (`.keeper` dirs only).
   // Confirm the semantic difference: a heavy non-planctl subtree under
   // the root must NOT be visited by the reconcile path. The proof: an
-  // epic NOT under any `.planctl/epics/` is invisible to the reconcile,
-  // while the same epic in a real `.planctl` IS picked up. This is the
+  // epic NOT under any `.keeper/epics/` is invisible to the reconcile,
+  // while the same epic in a real `.keeper` IS picked up. This is the
   // O(#projects) vs O(`~/code` tree) cost difference.
   const emitted: PlanMessage[] = [];
   const scanner = new PlanScanner(
@@ -2032,19 +2023,19 @@ test("reconcilePlanctlDirs: on-drop callback is `.planctl`-scoped (visits only p
 
   // A real planctl-bearing project (the reconcile target).
   const proj = join(tmpDir, "real");
-  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
   writeFileSync(
-    join(proj, ".planctl", "epics", "fn-1-real.json"),
+    join(proj, ".keeper", "epics", "fn-1-real.json"),
     JSON.stringify({ id: "fn-1-real", title: "Real", status: "open" }),
   );
 
-  // A stray `.planctl`-look-alike nested deeper than one level — the
+  // A stray `.keeper`-look-alike nested deeper than one level — the
   // recursive {@link scanRoot} would discover this; the shallow
   // reconcile does NOT.
   const nested = join(tmpDir, "group", "nested-proj");
-  mkdirSync(join(nested, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(nested, ".keeper", "epics"), { recursive: true });
   writeFileSync(
-    join(nested, ".planctl", "epics", "fn-2-nested.json"),
+    join(nested, ".keeper", "epics", "fn-2-nested.json"),
     JSON.stringify({ id: "fn-2-nested", title: "Nested", status: "open" }),
   );
 
@@ -2062,14 +2053,14 @@ test("reconcilePlanctlDirs: covers multiple roots in one call", () => {
   const rootA = mkdtempSync(join(tmpdir(), "keeper-plan-rootA-"));
   const rootB = mkdtempSync(join(tmpdir(), "keeper-plan-rootB-"));
   try {
-    mkdirSync(join(rootA, "p", ".planctl", "epics"), { recursive: true });
-    mkdirSync(join(rootB, "q", ".planctl", "epics"), { recursive: true });
+    mkdirSync(join(rootA, "p", ".keeper", "epics"), { recursive: true });
+    mkdirSync(join(rootB, "q", ".keeper", "epics"), { recursive: true });
     writeFileSync(
-      join(rootA, "p", ".planctl", "epics", "fn-1-a.json"),
+      join(rootA, "p", ".keeper", "epics", "fn-1-a.json"),
       JSON.stringify({ id: "fn-1-a", title: "A", status: "open" }),
     );
     writeFileSync(
-      join(rootB, "q", ".planctl", "epics", "fn-1-b.json"),
+      join(rootB, "q", ".keeper", "epics", "fn-1-b.json"),
       JSON.stringify({ id: "fn-1-b", title: "B", status: "open" }),
     );
 
@@ -2116,15 +2107,15 @@ function gitInit(root: string): void {
   git(root, "commit", "--allow-empty", "-q", "-m", "init");
 }
 
-test("repoRootFromPlanctlPath: walks up to .planctl's parent (the repo root)", () => {
+test("repoRootFromPlanctlPath: walks up to .keeper's parent (the repo root)", () => {
   // Pure path arithmetic — no I/O required.
-  expect(repoRootFromPlanctlPath("/a/b/proj/.planctl/epics/fn-1-x.json")).toBe(
+  expect(repoRootFromPlanctlPath("/a/b/proj/.keeper/epics/fn-1-x.json")).toBe(
     "/a/b/proj",
   );
-  expect(
-    repoRootFromPlanctlPath("/a/b/proj/.planctl/tasks/fn-1-x.2.json"),
-  ).toBe("/a/b/proj");
-  // No .planctl in the ancestry → null.
+  expect(repoRootFromPlanctlPath("/a/b/proj/.keeper/tasks/fn-1-x.2.json")).toBe(
+    "/a/b/proj",
+  );
+  // No .keeper in the ancestry → null.
   expect(repoRootFromPlanctlPath("/a/b/proj/foo/fn-1-x.json")).toBeNull();
 });
 
@@ -2145,7 +2136,7 @@ test("isPathInHead: untracked file → false; committed file → true", () => {
   expect(isPathInHead(path)).toBe(true);
 });
 
-test("isPathInHead: path outside any .planctl tree → false (fail closed)", () => {
+test("isPathInHead: path outside any .keeper tree → false (fail closed)", () => {
   gitInit(tmpDir);
   const path = join(tmpDir, "not-planctl.json");
   writeFileSync(path, "{}");
@@ -2448,16 +2439,16 @@ test("pendingRepos: derives repo roots from pending paths; empties as paths drai
     () => false, // nothing is in HEAD → everything pends
   );
 
-  // Two distinct repos, each with one epic file (paths need a `.planctl`
+  // Two distinct repos, each with one epic file (paths need a `.keeper`
   // ancestor for repoRootFromPlanctlPath to resolve; the files need not exist
   // on disk because the untracked predicate short-circuits before any read…
   // but onChange DOES read the file, so write them under tmpDir).
   const repoA = join(tmpDir, "repoA");
   const repoB = join(tmpDir, "repoB");
-  const epicA = join(repoA, ".planctl", "epics", "fn-1-a.json");
-  const epicB = join(repoB, ".planctl", "epics", "fn-2-b.json");
-  mkdirSync(join(repoA, ".planctl", "epics"), { recursive: true });
-  mkdirSync(join(repoB, ".planctl", "epics"), { recursive: true });
+  const epicA = join(repoA, ".keeper", "epics", "fn-1-a.json");
+  const epicB = join(repoB, ".keeper", "epics", "fn-2-b.json");
+  mkdirSync(join(repoA, ".keeper", "epics"), { recursive: true });
+  mkdirSync(join(repoB, ".keeper", "epics"), { recursive: true });
   writeFileSync(epicA, JSON.stringify({ id: "fn-1-a", title: "A" }));
   writeFileSync(epicB, JSON.stringify({ id: "fn-2-b", title: "B" }));
 
@@ -2494,8 +2485,8 @@ test("onPendingChange observer fires on every pending mutation (fn-705 reflog-wa
   );
 
   const repo = join(tmpDir, "repo");
-  const epicPath = join(repo, ".planctl", "epics", "fn-1-x.json");
-  mkdirSync(join(repo, ".planctl", "epics"), { recursive: true });
+  const epicPath = join(repo, ".keeper", "epics", "fn-1-x.json");
+  mkdirSync(join(repo, ".keeper", "epics"), { recursive: true });
   writeFileSync(epicPath, JSON.stringify({ id: "fn-1-x", title: "X" }));
 
   scanner.onChange(epicPath); // gate-fail add → fires
@@ -2587,10 +2578,10 @@ test("onChange(triggeredByCommit=false): an uncommitted file still bounces to pe
 });
 
 test("reconcilePlanctlDirs(heartbeat): a backstop emit logs a trigger-tagged 'did real work' line (fn-701)", () => {
-  // `reconcilePlanctlDirs` discovers `<root>/<project>/.planctl` one level
+  // `reconcilePlanctlDirs` discovers `<root>/<project>/.keeper` one level
   // deep, so the project must sit under tmpDir as its own git repo.
   const proj = join(tmpDir, "proj");
-  const epicDir = join(proj, ".planctl", "epics");
+  const epicDir = join(proj, ".keeper", "epics");
   mkdirSync(epicDir, { recursive: true });
   gitInit(proj);
 
@@ -2643,7 +2634,7 @@ test("reconcilePlanctlDirs(heartbeat): a backstop emit logs a trigger-tagged 'di
 
 test("reconcilePlanctlDirs(db-poll): a poll-driven emit logs a 'did real work' line WITHOUT the heartbeat alarm wording (fn-705)", () => {
   const proj = join(tmpDir, "proj");
-  const epicDir = join(proj, ".planctl", "epics");
+  const epicDir = join(proj, ".keeper", "epics");
   mkdirSync(epicDir, { recursive: true });
   gitInit(proj);
 
@@ -2683,7 +2674,7 @@ test("reconcilePlanctlDirs(db-poll): a poll-driven emit logs a 'did real work' l
 
 test("reconcilePlanctlDirs(db-poll): a repeated trigger over an unchanged board emits nothing (change-gate idempotency, fn-705)", () => {
   const proj = join(tmpDir, "proj");
-  const epicDir = join(proj, ".planctl", "epics");
+  const epicDir = join(proj, ".keeper", "epics");
   mkdirSync(epicDir, { recursive: true });
   gitInit(proj);
 
@@ -2936,7 +2927,7 @@ test("zero-task epic: a committed epic file with no task files emits without sib
     status: "open",
     primary_repo: tmpDir,
   });
-  // No task files at all under .planctl/tasks.
+  // No task files at all under .keeper/tasks.
 
   git(tmpDir, "add", epicPath);
   git(tmpDir, "commit", "-q", "-m", "add empty epic");
@@ -3093,9 +3084,9 @@ test("planctl-commit-changed: upsert batch ingests committed bytes via onChange"
   // three upsert entries (one per planctl file). The handler joins each
   // path with repo and dispatches to onChange — equivalently:
   applyPlanctlCommitChanges(scanner, tmpDir, [
-    { path: ".planctl/epics/fn-1-demo.json", op: "upsert" },
-    { path: ".planctl/tasks/fn-1-demo.1.json", op: "upsert" },
-    { path: ".planctl/tasks/fn-1-demo.2.json", op: "upsert" },
+    { path: ".keeper/epics/fn-1-demo.json", op: "upsert" },
+    { path: ".keeper/tasks/fn-1-demo.1.json", op: "upsert" },
+    { path: ".keeper/tasks/fn-1-demo.2.json", op: "upsert" },
   ]);
   expect(emitted).toHaveLength(3);
   expect(emitted.map((m) => m.kind).sort()).toEqual([
@@ -3116,9 +3107,9 @@ test("planctl-commit-changed: upsert batch ingests committed bytes via onChange"
   // after a slight delay — either way the gate suppresses.
   const before = emitted.length;
   applyPlanctlCommitChanges(scanner, tmpDir, [
-    { path: ".planctl/epics/fn-1-demo.json", op: "upsert" },
-    { path: ".planctl/tasks/fn-1-demo.1.json", op: "upsert" },
-    { path: ".planctl/tasks/fn-1-demo.2.json", op: "upsert" },
+    { path: ".keeper/epics/fn-1-demo.json", op: "upsert" },
+    { path: ".keeper/tasks/fn-1-demo.1.json", op: "upsert" },
+    { path: ".keeper/tasks/fn-1-demo.2.json", op: "upsert" },
   ]);
   expect(emitted.length).toBe(before);
 });
@@ -3137,8 +3128,8 @@ test("plan-commit-changed: the post-flip event-type name folds identically to pl
   git(tmpDir, "commit", "-q", "-m", "scaffold");
 
   const changes = [
-    { path: ".planctl/epics/fn-9-flip.json", op: "upsert" as const },
-    { path: ".planctl/tasks/fn-9-flip.1.json", op: "upsert" as const },
+    { path: ".keeper/epics/fn-9-flip.json", op: "upsert" as const },
+    { path: ".keeper/tasks/fn-9-flip.1.json", op: "upsert" as const },
   ];
 
   // Legacy name.
@@ -3220,7 +3211,7 @@ test("planctl-commit-changed: FSEvents-dropped scenario — commit batch alone d
   git(tmpDir, "commit", "-q", "-m", "scaffold");
 
   applyPlanctlCommitChanges(scanner, tmpDir, [
-    { path: ".planctl/epics/fn-2-drop.json", op: "upsert" },
+    { path: ".keeper/epics/fn-2-drop.json", op: "upsert" },
   ]);
   expect(emitted).toHaveLength(1);
   expect(emitted[0]).toMatchObject({
@@ -3249,7 +3240,7 @@ test("planctl-commit-changed: delete op emits tombstone via the commit path (no 
   git(tmpDir, "add", "-A");
   git(tmpDir, "commit", "-q", "-m", "add");
   applyPlanctlCommitChanges(scanner, tmpDir, [
-    { path: ".planctl/epics/fn-3-rm.json", op: "upsert" },
+    { path: ".keeper/epics/fn-3-rm.json", op: "upsert" },
   ]);
   expect(emitted).toHaveLength(1);
 
@@ -3260,7 +3251,7 @@ test("planctl-commit-changed: delete op emits tombstone via the commit path (no 
   git(tmpDir, "rm", "-q", epicPath);
   git(tmpDir, "commit", "-q", "-m", "drop");
   applyPlanctlCommitChanges(scanner, tmpDir, [
-    { path: ".planctl/epics/fn-3-rm.json", op: "delete" },
+    { path: ".keeper/epics/fn-3-rm.json", op: "delete" },
   ]);
   expect(emitted).toHaveLength(2);
   expect(emitted[1]).toEqual({ kind: "plan-epic-deleted", id: "fn-3-rm" });
@@ -3289,8 +3280,8 @@ test("planctl-commit-changed: mid-batch ingest failure does NOT stall the rest o
   git(tmpDir, "commit", "-q", "-m", "mixed");
 
   applyPlanctlCommitChanges(scanner, tmpDir, [
-    { path: ".planctl/epics/fn-4-bad.json", op: "upsert" },
-    { path: ".planctl/epics/fn-4-good.json", op: "upsert" },
+    { path: ".keeper/epics/fn-4-bad.json", op: "upsert" },
+    { path: ".keeper/epics/fn-4-good.json", op: "upsert" },
   ]);
   expect(emitted).toHaveLength(1);
   expect(emitted[0]).toMatchObject({ kind: "plan-epic", id: "fn-4-good" });
@@ -3419,9 +3410,9 @@ test("recheckPending(root): batched, ONE git call per repo, not per path (fn-712
     [repoA, 3],
     [repoB, 3],
   ] as const) {
-    mkdirSync(join(repo, ".planctl", "epics"), { recursive: true });
+    mkdirSync(join(repo, ".keeper", "epics"), { recursive: true });
     for (let i = 1; i <= n; i++) {
-      const p = join(repo, ".planctl", "epics", `fn-${i}-x.json`);
+      const p = join(repo, ".keeper", "epics", `fn-${i}-x.json`);
       writeFileSync(p, JSON.stringify({ id: `fn-${i}-x`, title: "X" }));
       scanner.onChange(p); // bounces to pending (batch says false at drain time)
     }
@@ -3469,7 +3460,7 @@ test("recheckPending(root): scopes the drain to the matching repo only (real git
   );
 
   const writeEpicIn = (repo: string, id: string): string => {
-    const dir = join(repo, ".planctl", "epics");
+    const dir = join(repo, ".keeper", "epics");
     mkdirSync(dir, { recursive: true });
     const p = join(dir, `${id}.json`);
     writeFileSync(p, JSON.stringify({ id, title: id, primary_repo: repo }));
@@ -3653,7 +3644,7 @@ test("fn-720 denominator: fires across both backstops snapshot to one rollup per
 
 test("fn-720: reconcilePlanctlDirs returns whether it emitted (the rescued boolean)", () => {
   const proj = join(tmpDir, "proj");
-  const epicDir = join(proj, ".planctl", "epics");
+  const epicDir = join(proj, ".keeper", "epics");
   mkdirSync(epicDir, { recursive: true });
   gitInit(proj);
   const scanner = new PlanScanner(

@@ -2,10 +2,8 @@
  * Plan worker — a Bun Worker thread and event *producer*: it watches each
  * configured project root for `<data-dir>/{epics,tasks}/*.json` files, parses
  * the current file on each change, and posts typed snapshot messages to the
- * parent. The data dir is `.keeper/` (convention) OR the legacy `.planctl/`
- * (transient migration fallback) — see {@link DATA_DIR_NAMES}; both fold into
- * the `epics` projection during the migration window so autopilot's board stays
- * lit regardless of which dir a repo is on. Main (and only main) turns those
+ * parent. The data dir is `.keeper/` — see {@link DATA_DIR_NAMES}; a board folds
+ * into the `epics` projection from there. Main (and only main) turns those
  * snapshots into synthetic `EpicSnapshot` / `TaskSnapshot` events rows. The
  * worker never writes the DB — a READ-ONLY connection (for the restart-seed) and
  * posted messages only, keeping main the sole writer.
@@ -20,26 +18,25 @@
  *   and `unsubscribe()`s in its shutdown handler.
  *
  * The native file watcher is allowed here despite the ban on watching keeper's
- * OWN DB: the `.planctl` trees are EXTERNAL files written by planctl, so the
+ * OWN DB: the `.keeper` trees are EXTERNAL files written by `keeper plan`, so the
  * same-process-write blind spot does not apply. Every watch event is "go look",
  * never the data: each fires an `fstat` + size-bounded re-read + safe-parse,
- * routed on path+existence (planctl writes via atomic `os.replace`, so an update
- * may surface as create/rename). The fast `PRAGMA data_version` poll runs on
- * keeper's OWN read-only connection (the sanctioned DB-change primitive), purely
- * as a TRIGGER — the snapshot data still comes only from a parsed `.planctl` file.
+ * routed on path+existence (`keeper plan` writes via atomic `os.replace`, so an
+ * update may surface as create/rename). The fast `PRAGMA data_version` poll runs
+ * on keeper's OWN read-only connection (the sanctioned DB-change primitive),
+ * purely as a TRIGGER — the snapshot data still comes only from a parsed
+ * `.keeper` file.
  *
  * Watching strategy: ONE recursive `@parcel/watcher` subscribe per root with
  * POSITIVE ignore globs (see {@link IGNORE_GLOBS}) so a git/npm storm doesn't
  * flood the callback. NOT a negation glob — parcel breaks on negated patterns
  * (parcel-bundler/watcher #174). The `<data-dir>/{epics,tasks}/*.json` filter is
- * an in-callback check ({@link classifyPlanPath}), data-dir-name-tolerant across
- * both `.keeper/` and the legacy `.planctl/`.
+ * an in-callback check ({@link classifyPlanPath}), keyed on the `.keeper/`
+ * data-dir name.
  *
  * RESTART REQUIRED to apply this data-dir set: the recursive subscription + the
  * boot scan are wired once at worker spawn. A running daemon keeps folding the
- * dir names it booted with — bounce the daemon so the plan-worker re-watches
- * `.keeper/` BEFORE the flag-day epic's `git mv .planctl .keeper` renames any
- * board's dir.
+ * dir names it booted with — bounce the daemon to re-wire the watch.
  *
  * Internal guards (skip-and-log, never escalate): a missing root, per-file read
  * errors, oversize files, and torn/malformed JSON all log and continue without
@@ -94,7 +91,7 @@ import { isDropError, RescanScheduler } from "./rescan";
 export interface PlanWorkerData {
   dbPath: string;
   /**
-   * The project roots to watch (each scanned recursively for `.planctl` trees).
+   * The project roots to watch (each scanned recursively for `.keeper` trees).
    * The parent resolves these from `resolvePlanRoots()` (config → absolute,
    * existing dirs). Overridable so tests point at hermetic tmp dirs.
    */
@@ -118,7 +115,7 @@ export interface PlanWorkerData {
   disableNativeWatcher?: boolean;
 }
 
-/** Snapshot message for one `.planctl/epics/*.json` file. */
+/** Snapshot message for one `.keeper/epics/*.json` file. */
 export interface PlanEpicMessage {
   kind: "plan-epic";
   /** Planctl epic id (the projection pk; rides in the synthetic event's session_id). */
@@ -133,7 +130,7 @@ export interface PlanEpicMessage {
   dependsOnEpics: string[];
   /**
    * Planctl-native validation timestamp (top-level `last_validated_at` field
-   * on `.planctl/epics/<id>.json`). Plain ISO-8601 string when present; a
+   * on `.keeper/epics/<id>.json`). Plain ISO-8601 string when present; a
    * missing / empty / non-string value collapses to `null` via {@link asString}
    * — the CLAUDE.md "safe value" invariant. Drives the board UI's
    * `[validated]` / `[unvalidated]` pill.
@@ -141,7 +138,7 @@ export interface PlanEpicMessage {
   lastValidatedAt: string | null;
 }
 
-/** Snapshot message for one `.planctl/tasks/*.json` file. */
+/** Snapshot message for one `.keeper/tasks/*.json` file. */
 export interface PlanTaskMessage {
   kind: "plan-task";
   /** Planctl task id (the projection pk; rides in the synthetic event's session_id). */
@@ -167,7 +164,7 @@ export interface PlanTaskMessage {
   workerPhase: string;
   /**
    * Planctl-native runtime status ingested from
-   * `.planctl/state/tasks/<task_id>.state.json` (top-level `status` field):
+   * `.keeper/state/tasks/<task_id>.state.json` (top-level `status` field):
    * `"todo" | "in_progress" | "done" | "blocked"`. Absent / missing file /
    * unrecognized value safe-defaults to `"todo"` per planctl's
    * `merge_task_state` convention (a fresh clone with no `state/` tree reads
@@ -179,7 +176,7 @@ export interface PlanTaskMessage {
 }
 
 /**
- * Tombstone message for a deleted `.planctl/epics/*.json` file. Main turns it
+ * Tombstone message for a deleted `.keeper/epics/*.json` file. Main turns it
  * into a synthetic `EpicDeleted` event; the reducer deletes the `epics` row.
  */
 export interface PlanEpicDeletedMessage {
@@ -189,7 +186,7 @@ export interface PlanEpicDeletedMessage {
 }
 
 /**
- * Tombstone message for a deleted `.planctl/tasks/*.json` file. Main turns it
+ * Tombstone message for a deleted `.keeper/tasks/*.json` file. Main turns it
  * into a synthetic `TaskDeleted` event; the reducer splices the element out of
  * the parent epic's embedded array. `epicId` is recovered from the change-gate's
  * last-emitted snapshot for this task (the only place the parent link survives a
@@ -211,7 +208,7 @@ export type PlanMessage =
   | PlanTaskDeletedMessage;
 
 /**
- * Discovery nudge. Posted by the plan-worker when it first observes a `.planctl`
+ * Discovery nudge. Posted by the plan-worker when it first observes a `.keeper`
  * tree in a repo, so main hands the repo root to the git-worker's discovery
  * candidate set IMMEDIATELY instead of waiting for the next full sweep. Closes
  * the attribution blind spot for a repo keeper has never seen a session in.
@@ -223,7 +220,7 @@ export type PlanMessage =
  */
 export interface PlanDiscoveryNudgeMessage {
   kind: "nudge-discovery";
-  /** Absolute repo root (the `.planctl` parent) the git-worker should watch. */
+  /** Absolute repo root (the `.keeper` parent) the git-worker should watch. */
   root: string;
 }
 
@@ -281,7 +278,7 @@ export interface KickMessage {
 
 /**
  * One entry on a {@link PlanctlCommitChangedMessage} — a single
- * `.planctl/**` path that changed in the committed delta the git-worker
+ * `.keeper/**` path that changed in the committed delta the git-worker
  * just observed. `path` is repo-relative (forward-slash on POSIX), tagged
  * by the git-side `diff-tree` parse with the file's commit-time fate.
  *
@@ -305,12 +302,12 @@ export interface PlanctlCommitChange {
 
 /**
  * Message the parent sends when a commit landed in a keeper-tracked repo
- * carrying changed `.planctl/**` paths. Authoritative ingest
+ * carrying changed `.keeper/**` paths. Authoritative ingest
  * trigger: the COMMITTED bytes are atomically written, so re-ingest from
  * the worktree is drop-proof and free of the mid-write partial-read race
  * the broader `~/code` FSEvents subscription is exposed to. The git-worker
- * filters the per-commit diff to `.planctl/{epics,tasks}/*.json` +
- * `.planctl/state/tasks/*.state.json` producer-side via
+ * filters the per-commit diff to `.keeper/{epics,tasks}/*.json` +
+ * `.keeper/state/tasks/*.state.json` producer-side via
  * {@link classifyPlanPath}, so the worker receives a tight list.
  *
  * One message per commit (even when several arrive in a single push) so
@@ -379,37 +376,25 @@ const BACKSTOP_ALARM_COOLDOWN_MS = 60_000;
 const FAST_PATH_ATTRIBUTION_WINDOW_MS = 60_000;
 
 /**
- * Plan data-dir basenames the worker watches + folds, in PRECEDENCE ORDER
- * (primary first). `.keeper/` is the convention dir; `.planctl/` is the
- * transient migration fallback so a board minted before the flag-day rename
- * (still on `.planctl/`) keeps folding into the `epics` projection — and
- * autopilot's board never goes dark — during the migration window. The fallback
- * leaves once every repo migrates (the flag-day epic).
+ * Plan data-dir basenames the worker watches + folds. `.keeper/` is the data
+ * dir; a board folds into the `epics` projection from there.
  *
  * Mirrors the CLI's `DATA_DIR_NAMES` in `plugins/plan/src/state_path.ts`; the
- * worker can't import the vendored package, so the precedence list is restated
- * here (the two MUST agree). No double-fold when a repo briefly holds BOTH dirs:
- * the projection + change-gate key off the epic/task id (the pk), so two files
- * for one id upsert the same row — and the boot scan / discovery walk this list
- * in order, so `.keeper/` is folded first and wins the deterministic precedence.
+ * worker can't import the vendored package, so the list is restated here (the
+ * two MUST agree).
  */
-const DATA_DIR_NAMES = [".keeper", ".planctl"] as const;
+const DATA_DIR_NAMES = [".keeper"] as const;
 
-/** Is `name` a recognized plan data-dir basename (either `.keeper` or the
- * legacy `.planctl`)? The single membership test every dir-name match routes
- * through. */
+/** Is `name` a recognized plan data-dir basename (`.keeper`)? The single
+ * membership test every dir-name match routes through. */
 function isDataDirName(name: string): boolean {
   return (DATA_DIR_NAMES as readonly string[]).includes(name);
 }
 
 /**
- * Resolve the SINGLE primary data-dir basename to fold for a root, given the set
- * of data-dir names actually present there — the first in {@link DATA_DIR_NAMES}
- * precedence order (`.keeper/` over the legacy `.planctl/`), or null when none
- * is present. The dir-level precedence rule (mirroring the CLI's
- * `resolveDataDir`): when BOTH dirs exist at one root, `.keeper/` wins and
- * `.planctl/` is IGNORED — never merged — so a stale same-id file in the legacy
- * dir can't override the primary through the content-keyed change-gate.
+ * Resolve the SINGLE data-dir basename to fold for a root, given the set of
+ * data-dir names actually present there — the first in {@link DATA_DIR_NAMES},
+ * or null when none is present.
  */
 function resolveDataDirName(present: ReadonlySet<string>): string | null {
   for (const name of DATA_DIR_NAMES) {
@@ -440,8 +425,8 @@ const IGNORE_GLOBS = [
   // dependency's plan, NOT keeper-managed work — fold it and every planctl-dev
   // epic pollutes keeper's `epics` projection. Excluded here so the live watcher
   // never delivers it; {@link isVendoredPlanPath} is the boot-scan / commit
-  // equivalent. Both the legacy `.planctl` and the post-rename `.keeper` segment
-  // are ignored so the prune survives the daemon name-erasure dir rename.
+  // equivalent. Both `.planctl` and `.keeper` segments are ignored so the prune
+  // holds whichever name the vendored subtree's data dir carries.
   "**/plugins/plan/.planctl/**",
   "**/plugins/plan/.keeper/**",
   "**/*.tmp",
@@ -462,11 +447,10 @@ const IGNORE_GLOBS = [
  * gate for the other two vectors. Pure path arithmetic — matches any path that
  * contains a `plugins/plan/<vendored-dir>` segment run.
  *
- * Name-tolerant on the vendored sub-dir: it matches BOTH the legacy `.planctl`
- * and the post-rename `.keeper` segment, so the prune holds across the daemon
- * name-erasure dir rename (fn-827/fn-828) — keeper's OWN plan dir gets renamed
- * in the same arc, and the vendored subtree's dir moves with it. Additive: the
- * legacy `.planctl` match is unchanged. Exported for unit reach.
+ * Name-tolerant on the vendored sub-dir: it matches BOTH a `.keeper` and a
+ * `.keeper` segment, so the prune holds whichever name the vendored subtree's
+ * data dir carries (keeper's OWN board is `.keeper`; the vendored subtree may
+ * still be on `.keeper`). Exported for unit reach.
  */
 export function isVendoredPlanPath(path: string): boolean {
   const segments = path.split(sep);
@@ -486,7 +470,7 @@ export function isVendoredPlanPath(path: string): boolean {
  * Directory basenames the boot scan prunes — the recursive-walk equivalent of
  * {@link IGNORE_GLOBS}. The live `@parcel/watcher` subscribe is recursive, so
  * the boot scan must recurse too (plan files live at
- * `<root>/<project>/.planctl/…`, NOT at `<root>/.planctl/…`); without pruning,
+ * `<root>/<project>/.keeper/…`, NOT at `<root>/.keeper/…`); without pruning,
  * that walk would descend into every `node_modules`/`.git` under a broad root
  * like `~/code` (tens of thousands of dirs). Basename match mirrors the glob
  * set (the `*.tmp` file glob has no directory equivalent).
@@ -502,7 +486,7 @@ const PRUNE_DIRS = new Set([
   ".venv",
 ]);
 
-/** Which `.planctl` collection a path belongs to (or none). */
+/** Which `.keeper` collection a path belongs to (or none). */
 type PlanKind = "epic" | "task" | "task-state" | "epic-state";
 
 /**
@@ -512,8 +496,7 @@ type PlanKind = "epic" | "task" | "task-state" | "epic-state";
  * shapes returns `null` — the callback then skips it (the in-callback filter
  * the ignore globs can't express).
  *
- * Recognised shapes (the data-dir basename is `.keeper` OR the legacy
- * `.planctl` — {@link isDataDirName}):
+ * Recognised shapes (the data-dir basename is `.keeper` — {@link isDataDirName}):
  * - `<data-dir>/epics/<id>.json` (3-segment tail) → `"epic"`
  * - `<data-dir>/tasks/<id>.json` (3-segment tail) → `"task"`
  * - `<data-dir>/state/tasks/<id>.state.json` (4-segment tail) → `"task-state"`
@@ -561,7 +544,7 @@ export function classifyPlanPath(path: string): PlanKind | null {
     if (segments[n - 2] === "tasks") {
       return "task-state";
     }
-    // 4-segment tail: `.planctl/state/epics/<id>.state.json`. Same shape rules
+    // 4-segment tail: `.keeper/state/epics/<id>.state.json`. Same shape rules
     // as task-state, different leaf dir (epic runtime-state sidecar; keeper
     // ingests no field from it).
     if (segments[n - 2] === "epics") {
@@ -632,7 +615,7 @@ interface RawTask {
 
 /**
  * Raw planctl runtime-state JSON shape — only the fields we project. The state
- * file (`.planctl/state/tasks/<task_id>.state.json`) is written by planctl
+ * file (`.keeper/state/tasks/<task_id>.state.json`) is written by planctl
  * `LocalFileStateStore` (`apps/planctl/planctl/store.py:151`) and carries
  * `assignee` / `claim_note` / `claimed_at` / `evidence` / `status` /
  * `updated_at`; keeper ingests only `status`.
@@ -648,7 +631,7 @@ function asString(v: unknown): string | null {
 
 /**
  * Derive the planctl task id from a state-file path:
- * `.../.planctl/state/tasks/<task_id>.state.json` → `<task_id>`. Returns null
+ * `.../.keeper/state/tasks/<task_id>.state.json` → `<task_id>`. Returns null
  * if the basename does not end in `.state.json` (caller has already
  * classified — this stays a pure transform on the matched shape).
  *
@@ -669,7 +652,7 @@ export function taskIdFromStatePath(path: string): string | null {
  * Map a state-file path
  * `.../<data-dir>/state/tasks/<task_id>.state.json` to the sibling task
  * definition file path `.../<data-dir>/tasks/<task_id>.json`, preserving the
- * input's data-dir basename (`.keeper` or the legacy `.planctl`). Pure path
+ * input's `.keeper` data-dir basename. Pure path
  * arithmetic — does no I/O. Returns null on a shape mismatch (caller has
  * already classified, so this is defensive only).
  */
@@ -695,8 +678,8 @@ export function taskDefPathFromStatePath(statePath: string): string | null {
 }
 
 /**
- * Derive the planctl epic id from an epic state-file path:
- * `.../.planctl/state/epics/<epic_id>.state.json` → `<epic_id>`. Returns null
+ * Derive the epic id from an epic state-file path:
+ * `.../.keeper/state/epics/<epic_id>.state.json` → `<epic_id>`. Returns null
  * if the basename does not end in `.state.json` (caller has already
  * classified — this stays a pure transform on the matched shape). Mirrors
  * {@link taskIdFromStatePath}.
@@ -713,7 +696,7 @@ export function epicIdFromStatePath(path: string): string | null {
  * Map an epic state-file path
  * `.../<data-dir>/state/epics/<epic_id>.state.json` to the committed epic
  * definition file path `.../<data-dir>/epics/<epic_id>.json`, preserving the
- * input's data-dir basename (`.keeper` or the legacy `.planctl`). Pure path
+ * input's `.keeper` data-dir basename. Pure path
  * arithmetic — does no I/O. Returns null on a shape mismatch (caller has
  * already classified, so this is defensive only). Mirrors
  * {@link taskDefPathFromStatePath}.
@@ -754,7 +737,7 @@ function asStringArray(v: unknown): string[] {
 
 /**
  * The fixed set of valid planctl runtime-status enum values
- * (`.planctl/state/tasks/<id>.state.json`'s top-level `status` field).
+ * (`.keeper/state/tasks/<id>.state.json`'s top-level `status` field).
  */
 const RUNTIME_STATUS_VALUES: ReadonlySet<string> = new Set([
   "todo",
@@ -863,7 +846,7 @@ export class PlanScanner {
   private readonly pending = new Set<string>();
   /**
    * Per-task cache of the latest runtime-status enum value observed in
-   * `.planctl/state/tasks/<task_id>.state.json` (top-level `status` field).
+   * `.keeper/state/tasks/<task_id>.state.json` (top-level `status` field).
    * Keyed by planctl task id. A task that has never been observed in the
    * cache reads `"todo"` (planctl's `merge_task_state` default — a fresh
    * clone with no `state/` tree shows every task as `todo`); the
@@ -886,9 +869,9 @@ export class PlanScanner {
    * minus `.json`), NOT a parse result: a file mid-rewrite that fails to parse
    * still has its name on disk, so it is "seen" and never spuriously retracted.
    *
-   * State files (`.planctl/state/tasks/<id>.state.json`) are NOT enrolled in
+   * State files (`.keeper/state/tasks/<id>.state.json`) are NOT enrolled in
    * this census — they are a SIDECAR projection layered onto task ids that
-   * already enrol via their definition file under `.planctl/tasks/`. The
+   * already enrol via their definition file under `.keeper/tasks/`. The
    * sweep retracts on missing definition files; a sidecar's absence is the
    * cache's `"todo"` default, not a tombstone.
    */
@@ -1175,7 +1158,7 @@ export class PlanScanner {
 
   /**
    * Prime the per-task runtime-status cache from a boot enumeration of
-   * `.planctl/state/tasks/<task_id>.state.json` (called by `scanPlanctlDir`
+   * `.keeper/state/tasks/<task_id>.state.json` (called by `scanPlanctlDir`
    * BEFORE the `tasks/` loop). Pure cache write — does NOT emit a snapshot,
    * does NOT touch `pathToId`, does NOT touch the on-disk census
    * ({@link markSeen} — state files are sidecar, not enrolled). The
@@ -1589,7 +1572,7 @@ export class PlanScanner {
    * batched + scoped, the ~74s emission-lag fix. The OLD shape
    * `for (path of pending) onChange(path)` spawned one synchronous
    * `git cat-file` PER pending path across ALL repos on EVERY trigger; a
-   * cross-repo pending set of ~1292 abandoned `.planctl` files turned each
+   * cross-repo pending set of ~1292 abandoned `.keeper` files turned each
    * trigger into a synchronous git storm that starved the single-threaded
    * worker so the realtime `planctl-commit-changed` bypass queued behind it
    * for tens of seconds. Two levers collapse it:
@@ -1679,7 +1662,7 @@ export class PlanScanner {
    * - `"heartbeat"` is the SHOULD-NEVER-FIRE paranoia floor. With the
    *   `data_version` poll + reflog watch landed, an emit here means EVERY fast
    *   path missed a change — a genuine ALARM that the realtime architecture is
-   *   broken (or a `.planctl` file is genuinely abandoned-uncommitted), so it
+   *   broken (or a `.keeper` file is genuinely abandoned-uncommitted), so it
    *   logs the loudest wording. It must NEVER fire in normal operation.
    * - `"fswatcher-drop"` is the FSEvents-drop rescan backstop — an
    *   emit means the kernel coalesced/dropped a watcher edge the poll/reflog
@@ -1733,7 +1716,7 @@ export class PlanScanner {
   }
 
   /**
-   * Record that a `.planctl/{epics,tasks}/*.json` file was enumerated on disk
+   * Record that a `.keeper/{epics,tasks}/*.json` file was enumerated on disk
    * during a boot scan — the on-disk census the {@link sweep} diffs against.
    * Called from `scanPlanctlDir` for EVERY file BEFORE `onChange`, so it counts
    * regardless of whether the snapshot parsed or was change-gate-suppressed.
@@ -1888,7 +1871,7 @@ export function buildEpicMessage(
 
 /**
  * Build a `plan-task` message from a parsed task JSON + the task's current
- * runtime status (carried in the sibling `.planctl/state/tasks/<id>.state.json`
+ * runtime status (carried in the sibling `.keeper/state/tasks/<id>.state.json`
  * file). Returns null when the task JSON has no usable id.
  *
  * Field derivation:
@@ -1937,8 +1920,8 @@ function stringifyErr(err: unknown): string {
 /**
  * Find the plan-data-dir ancestor of `path` — the parent of the parent (because
  * `path` is `<data-dir>/{epics,tasks}/<id>.json`). Returns the parent dir of the
- * data dir (the planctl-managed repo root in keeper's layout) or `null` if no
- * data dir (`.keeper` or the legacy `.planctl`) is found in the ancestry. Pure
+ * data dir (the plan-managed repo root in keeper's layout) or `null` if no
+ * `.keeper` data dir is found in the ancestry. Pure
  * path arithmetic.
  *
  * observation gate: the live worker uses this to derive the repo
@@ -1952,7 +1935,7 @@ function stringifyErr(err: unknown): string {
  * `git rev-parse`.
  */
 export function repoRootFromPlanctlPath(path: string): string | null {
-  // Walk up from `path` looking for a plan data dir (`.keeper`/`.planctl`);
+  // Walk up from `path` looking for a `.keeper` plan data dir;
   // return its parent. The shape is always
   // `.../<root>/<data-dir>/{epics,tasks}/<id>.json` so the data-dir element sits
   // at depth `n-3` from the basename. We could index directly, but a walk is
@@ -1985,7 +1968,7 @@ export function repoRootFromPlanctlPath(path: string): string | null {
  *
  * Edge cases handled by returning `false` (fail closed — never wrongly
  * announce a file as committed):
- * - Path is not inside a `.planctl` tree (shouldn't happen, the caller
+ * - Path is not inside a `.keeper` tree (shouldn't happen, the caller
  *   already classified) — no repo root resolvable → `false`.
  * - `git` shell-out fails (not a git repo, no commits yet, timeout) →
  *   `false`. The next git-worker pulse will retry.
@@ -2105,7 +2088,7 @@ const GIT_CHECK_TIMEOUT_MS = 1000;
  * appends there, closing the brand-new/never-seen-repo tail the
  * commit-ingest channel can't cover), and the broad FSEvents
  * subscription. The heartbeat is the FINAL FLOOR for the lone residual
- * case with literally no other signal — a `.planctl` file that flashed
+ * case with literally no other signal — a `.keeper` file that flashed
  * dirty, never committed, and sits in a repo with no DB write and no
  * reflog append. In normal operation it must NEVER deliver a snapshot; a
  * `"heartbeat"`-tagged backstop emit is a loud alarm that a fast path is
@@ -2207,8 +2190,8 @@ export function makeSingleFlight(
 
 /**
  * Boot scan: recursively walk `root` for `<data-dir>/{epics,tasks}/*.json`
- * files (the data dir is `.keeper/` or the legacy `.planctl/` — see
- * {@link DATA_DIR_NAMES}) and run each through the scanner. Called once after
+ * files (the data dir is `.keeper/` — see {@link DATA_DIR_NAMES}) and run each
+ * through the scanner. Called once after
  * each subscribe resolves so files that pre-existed the daemon's boot (or were
  * changed while keeperd was down) are picked up without waiting for a watcher
  * event. The change-gate in PlanScanner suppresses re-emits for files that
@@ -2222,13 +2205,6 @@ export function makeSingleFlight(
  * big root); a data dir is scanned but NOT descended into; symlinked
  * directories are not followed (`Dirent.isDirectory()` is false for a symlink),
  * so a symlink cycle can't trap the walk.
- *
- * Deterministic precedence when ONE project holds BOTH `.keeper/` and
- * `.planctl/`: only the FIRST present dir in {@link DATA_DIR_NAMES} order
- * (`.keeper/` wins) is scanned — the legacy `.planctl/` is ignored entirely when
- * `.keeper/` is present at the same root. That dir-level resolution (mirroring
- * the CLI's `resolveDataDir`) is what prevents a same-id file in the OTHER dir
- * from overriding the primary via the content-keyed change-gate.
  */
 export function scanRoot(root: string, scanner: PlanScanner): void {
   const stack: string[] = [root];
@@ -2259,9 +2235,7 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
       }
       stack.push(join(dir, entry.name));
     }
-    // Resolve to the SINGLE primary dir (`.keeper/` over the legacy
-    // `.planctl/`) and scan only it — ignoring the other dir at the same root,
-    // so a stale same-id file there can't override the primary.
+    // Resolve to the `.keeper/` data dir and scan it.
     const resolved = resolveDataDirName(present);
     if (resolved === null) {
       continue;
@@ -2277,7 +2251,7 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
 }
 
 /**
- * Enumerate one `.planctl` dir's `state/tasks/` + `epics/` + `tasks/` files and
+ * Enumerate one `.keeper` dir's `state/tasks/` + `epics/` + `tasks/` files and
  * run each through the scanner. A missing subdir is fine (skip). The change-gate
  * handles re-emit suppression.
  *
@@ -2409,7 +2383,7 @@ function scanPlanctlDir(
     try {
       names = readdirSync(dir);
     } catch {
-      // No epics/ or tasks/ subdir under this .planctl — nothing to scan.
+      // No epics/ or tasks/ subdir under this .keeper — nothing to scan.
       continue;
     }
     for (const name of names) {
@@ -2441,15 +2415,11 @@ function scanPlanctlDir(
 /**
  * Shallow discovery of `<root>/<project>/<data-dir>` dirs across the configured
  * roots — the cheap convergence backstop the periodic reconcile and on-drop
- * recovery share. A data dir is `.keeper/` or the legacy `.planctl/` (see
- * {@link DATA_DIR_NAMES}).
+ * recovery share. A data dir is `.keeper/` (see {@link DATA_DIR_NAMES}).
  *
  * One level deep ONLY: for each `root`, read its top-level entries and emit
  * `<root>/<entry>/<data-dir>` for every directory entry whose name isn't in
- * {@link PRUNE_DIRS} and that holds a real data dir. A project holding BOTH
- * dirs emits ONLY the resolved primary ({@link resolveDataDirName} — `.keeper/`
- * over the legacy `.planctl/`), matching the dir-level precedence the boot
- * {@link scanRoot} applies, so the legacy dir is never folded over the primary.
+ * {@link PRUNE_DIRS} and that holds a real data dir.
  * Heavy vendored trees (`node_modules`, `.git`, …) are skipped at the
  * project-name step, so a broad root like `~/code` stays O(#projects) instead of
  * O(`~/code` tree). No recursive descent — a project nested deeper than one
@@ -2479,8 +2449,7 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
       if (!entry.isDirectory() || PRUNE_DIRS.has(entry.name)) {
         continue;
       }
-      // Resolve to the single primary data dir present under this project
-      // (`.keeper/` over the legacy `.planctl/`) — emit only it.
+      // Resolve to the `.keeper/` data dir present under this project.
       const present = new Set<string>();
       for (const name of DATA_DIR_NAMES) {
         try {
@@ -2501,11 +2470,11 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
 }
 
 /**
- * Re-scan a single repo root's RESOLVED primary data dir (`.keeper/` over the
- * legacy `.planctl/` — {@link resolveDataDirName}) through the change-gated
+ * Re-scan a single repo root's `.keeper/` data dir
+ * ({@link resolveDataDirName}) through the change-gated
  * {@link scanPlanctlDir} primitive. The repo-scoped re-scan the reflog-watch
  * fire uses (a commit landed in `repoRoot`, possibly already in-HEAD before any
- * FSEvent gated it). A no-op when the repo holds neither dir. `triggerReason`
+ * FSEvent gated it). A no-op when the repo holds no data dir. `triggerReason`
  * tags the calling trigger for the per-emit log line, same as
  * {@link scanPlanctlDir}. Pure I/O dispatch — no DB read, no emission of its
  * own; the change-gate side effect lives in {@link scanPlanctlDir}. Exported
@@ -2547,7 +2516,7 @@ export function scanRepoDataDirs(
  * one-shot boot sweep — none of which run on this code path.
  *
  * Steady-state cost: one shallow `readdirSync` per root + one `statSync`
- * per top-level entry + one shallow `readdirSync` per `.planctl/{epics,tasks,
+ * per top-level entry + one shallow `readdirSync` per `.keeper/{epics,tasks,
  * state/tasks}` + one bounded read + parse per planctl file. The
  * change-gate (`PlanScanner.lastEmitted`) suppresses re-emits for unchanged
  * files, so a quiescent repo emits nothing across heartbeats.
@@ -2563,13 +2532,13 @@ export function scanRepoDataDirs(
  * "a fast path missed it" alarm; `db-poll` does not — it IS a fast path). Pass
  * `undefined` (boot / silent reconcile) to suppress the log.
  *
- * `onPlanctlDir` is invoked once per `.planctl` dir surfaced by this
+ * `onPlanctlDir` is invoked once per `.keeper` dir surfaced by this
  * sweep, BEFORE its scan — the live worker uses it to nudge git-worker
- * discovery for a newly-seen `.planctl` repo (de-duped worker-side). The walk
+ * discovery for a newly-seen `.keeper` repo (de-duped worker-side). The walk
  * already paid for the directory enumeration, so this rides free; pure unit
  * tests omit it.
  *
- * Returns `true` iff at least one `.planctl` dir's scan emitted a snapshot
+ * Returns `true` iff at least one `.keeper` dir's scan emitted a snapshot
  * — the `rescued` boolean the backstop caller (heartbeat / FSEvents-
  * drop) folds into one uniform `missed-wake` record per fire. The `db-poll`
  * (fast-path) and boot callers ignore the return. The boolean's meaning is
@@ -2577,7 +2546,7 @@ export function scanRepoDataDirs(
  * keep their semantics byte-for-byte).
  *
  * `emittedRoots` (optional out-param) — when passed, every CONFIGURED root whose
- * `.planctl` scan emitted is added to it (a discovered `<root>/<project>/.planctl`
+ * `.keeper` scan emitted is added to it (a discovered `<root>/<project>/.keeper`
  * dir is attributed back to its configured root via
  * {@link attributePlanctlDirToRoot}). The mute-watcher re-arm consumes this to
  * flag exactly the implicated roots; all other callers omit it.
@@ -2763,9 +2732,9 @@ export function resolveReflogTarget(repoRoot: string): string | null {
 
 /**
  * the discovered planctl-repo set — every `<root>/<project>` that
- * holds a `.planctl` tree under the configured roots, via the same
+ * holds a `.keeper` tree under the configured roots, via the same
  * {@link discoverPlanctlDirs} walk the heartbeat reconcile uses (a shallow
- * readdir+stat per root, no DB read, no emission). Each `.planctl` dir's
+ * readdir+stat per root, no DB read, no emission). Each `.keeper` dir's
  * parent IS its repo root (`repoRootFromPlanctlPath`-shaped), so a commit in
  * any of these repos can be caught by a reflog watch even when it holds no
  * currently-pending path. Pure I/O; failures inside {@link discoverPlanctlDirs}
@@ -2787,7 +2756,7 @@ export function discoverPlanctlRepos(roots: readonly string[]): Set<string> {
 
 /**
  * The repos that SHOULD hold a `.git/logs/HEAD` reflog watch: every repo that
- * currently owns a pending path UNION every repo that holds a `.planctl` tree
+ * currently owns a pending path UNION every repo that holds a `.keeper` tree
  * under the configured roots (widening — the latter closes the
  * no-pending-repo commit tail).
  *
@@ -2811,7 +2780,7 @@ export function desiredReflogRepos(
  * Diff the desired reflog-watch set against the live (subscribed) set:
  * `toAdd = desired - live` (repos that should be watched but aren't),
  * `toDrop = live - desired` (repos no longer desired — neither pending nor
- * holding a `.planctl` tree any longer, e.g. a removed `.planctl` repo).
+ * holding a `.keeper` tree any longer, e.g. a removed `.keeper` repo).
  *
  * PURE set arithmetic — READ-only (returns fresh sets; never mutates the live
  * `reflogSubs`/`reflogSubscribing` sets the worker owns). Extracted
@@ -2835,10 +2804,10 @@ export function reflogWatchDiff(
 }
 
 /**
- * Attribute a discovered `<root>/<project>/.planctl` dir back to the configured
+ * Attribute a discovered `<root>/<project>/.keeper` dir back to the configured
  * root whose FSEvents subscription covers it — the mute-watcher re-arm operates
  * on the broad CONFIGURED root (`data.roots`, the subscription key), not the
- * nested per-project `.planctl` dir the heartbeat scan walks. Returns the
+ * nested per-project `.keeper` dir the heartbeat scan walks. Returns the
  * LONGEST matching configured-root prefix (a nested configured root wins over a
  * broader ancestor of it), or `null` when no configured root contains the dir
  * (a path the heartbeat scan should never surface, but defended so a stray dir
@@ -2862,7 +2831,7 @@ export function attributePlanctlDirToRoot(
 
 /**
  * Mute-watcher re-arm decision. Given the configured roots a heartbeat rescue
- * implicated (their `.planctl` scan emitted a snapshot the FSEvents fast path
+ * implicated (their `.keeper` scan emitted a snapshot the FSEvents fast path
  * missed) and a per-cycle cap, decide which roots to tear down + re-subscribe
  * THIS drain. Bounded by `cap` (the precedent {@link MAX_SUBSCRIBES_PER_CYCLE});
  * an overflow stays flagged for the next drain. Re-arming the FULL root set on
@@ -2923,19 +2892,19 @@ function main(): void {
   // The in-HEAD transition has no realtime trigger. Fix: watch
   // `.git/logs/HEAD` (a commit ALWAYS appends there) and, on the append, run the
   // GATED `recheckPending()` scoped to that repo (now in HEAD → emit) PLUS a
-  // change-gated `scanPlanctlDir` re-scan (recover a committed `.planctl` change
+  // change-gated `scanPlanctlDir` re-scan (recover a committed `.keeper` change
   // that was never gated into pending).
   //
   // Widening. The pending-only watch set left the epic's confirmed slow
-  // path open: a commit in a repo that holds a `.planctl` tree but NO currently-
+  // path open: a commit in a repo that holds a `.keeper` tree but NO currently-
   // pending path (a steady-state planctl change — e.g. a `done`/`reset` that
-  // edits then commits, or any `.planctl` mutation whose file-write FSEvent the
+  // edits then commits, or any `.keeper` mutation whose file-write FSEvent the
   // kernel coalesced so it never bounced into `pending`). With no pending path
   // no reflog watch was armed, the broad recursive watch IGNORES `.git`
   // (IGNORE_GLOBS), and a foreign commit writes no keeper DB row — so the
   // in-HEAD change was invisible until the git-worker's 60s heartbeat (task .1's
   // measured diagnosis: that is the dominant production fold-latency tail). Fix:
-  // arm a `.git/logs/HEAD` reflog watch for EVERY repo that holds a `.planctl`
+  // arm a `.git/logs/HEAD` reflog watch for EVERY repo that holds a `.keeper`
   // tree under the configured roots — `pendingRepos()` ∪ the discovered planctl-
   // repo set — not just the pending ones. Bounded + safe: the watch count is the
   // number of planctl-tracked repos under the roots (a handful), the broad watch
@@ -2946,8 +2915,8 @@ function main(): void {
   // re-scan is change-gated, re-probes the in-HEAD gate, and writes no DB row.
   //
   // Lifecycle is bounded: a watch is ADDED when a repo gains a pending path OR
-  // is discovered to hold a `.planctl` tree, and DROPPED when it neither holds a
-  // pending path NOR a `.planctl` tree any longer (`reconcileReflogWatches`
+  // is discovered to hold a `.keeper` tree, and DROPPED when it neither holds a
+  // pending path NOR a `.keeper` tree any longer (`reconcileReflogWatches`
   // diffs `pendingRepos()` ∪ `discoverPlanctlRepos()` against
   // `reflogSubs.keys()`). Per FSEvents
   // discipline the append is a HINT, not data — `recheckPending` re-probes
@@ -2968,18 +2937,18 @@ function main(): void {
 
   // Bring the live reflog-watch set into agreement with the repos that should
   // hold a `.git/logs/HEAD` reflog watch: every repo that currently owns a
-  // pending path UNION every repo that holds a `.planctl` tree under the
+  // pending path UNION every repo that holds a `.keeper` tree under the
   // configured roots (widening — the latter closes the no-pending-repo
   // commit tail). Idempotent + cheap (a no-op when the union hasn't changed).
   // Fired by the scanner's `onPendingChange` on every pending mutation, by the
-  // heartbeat (so a brand-new `.planctl` repo arms its watch within one interval
+  // heartbeat (so a brand-new `.keeper` repo arms its watch within one interval
   // even with no pending path), AND once after the watcher module loads (to
   // catch any pending/discovered repos accrued before the module was ready).
   const reconcileReflogWatches = (): void => {
     if (shuttingDown || reflogWatcherModule === null) return;
     const watcher = reflogWatcherModule;
     // PURE desired-set derivation: the union of currently-pending
-    // repos and every discovered `.planctl` repo under the configured roots.
+    // repos and every discovered `.keeper` repo under the configured roots.
     const desired = desiredReflogRepos(
       scanner.pendingRepos(),
       discoverPlanctlRepos(data.roots),
@@ -2990,7 +2959,7 @@ function main(): void {
     // skip below + the in-flight `stillDesired` teardown handle that case).
     const { toDrop } = reflogWatchDiff(desired, new Set(reflogSubs.keys()));
     // Drop watches for repos that are no longer in the desired union (neither
-    // pending nor holding a `.planctl` tree any longer) — the I/O the pure diff
+    // pending nor holding a `.keeper` tree any longer) — the I/O the pure diff
     // can't do: actually `unsubscribe()` and mutate the worker's live set.
     for (const root of toDrop) {
       const sub = reflogSubs.get(root);
@@ -3047,9 +3016,8 @@ function main(): void {
           // it re-reads the now-COMMITTED bytes, re-probes the in-HEAD gate per
           // file, and emits only changed-and-in-HEAD files (the change-gate
           // suppresses unchanged ones, so a spurious fire is an idempotent
-          // no-op). Repo-SCOPED to this `root`'s data dirs only — no global
-          // re-discovery, no per-path git storm. Covers BOTH `.keeper/` and the
-          // legacy `.planctl/` (whichever the repo is on). The re-scan never
+          // no-op). Repo-SCOPED to this `root`'s `.keeper/` data dir only — no
+          // global re-discovery, no per-path git storm. The re-scan never
           // writes the DB (poll-is-trigger-only). Tagged `fswatcher-drop` (this
           // IS a watcher edge a fast path would otherwise need the heartbeat to
           // recover).
@@ -3064,7 +3032,7 @@ function main(): void {
         .then((sub) => {
           reflogSubscribing.delete(root);
           // Lost-the-race teardown: shutdown, or the repo left the desired union
-          // (its pending set drained AND it no longer holds a `.planctl` tree)
+          // (its pending set drained AND it no longer holds a `.keeper` tree)
           // while we were subscribing — release immediately. check the
           // FULL desired union (pending ∪ discovered planctl repos), not just
           // `pendingRepos()`, or a freshly-discovered no-pending repo's watch
@@ -3111,9 +3079,9 @@ function main(): void {
   // ── discovery nudge ─────────────────────────────────────────────────
   // The git-worker discovers repos to watch from `jobs.cwd` seen-cwds, so a
   // repo keeper has never seen a session in is unwatched — no GitSnapshot /
-  // attribution data flows. When the plan-worker first sees a `.planctl` tree
+  // attribution data flows. When the plan-worker first sees a `.keeper` tree
   // in a repo, hand the repo root to git-worker discovery immediately so its
-  // `.planctl` short-circuit in `shouldWatchRoot` subscribes it on the next
+  // `.keeper` short-circuit in `shouldWatchRoot` subscribes it on the next
   // reconcile, rather than waiting for the next full discovery sweep. De-duped
   // per root (one nudge per repo for the worker's lifetime); main null-guards
   // the git-worker forward-ref during the boot window (a dropped nudge is
@@ -3128,10 +3096,10 @@ function main(): void {
     } satisfies PlanDiscoveryNudgeMessage);
   };
   // The planctl-dir callback `reconcilePlanctlDirs` invokes per discovered
-  // `.planctl` dir — derive the repo root and nudge if new.
+  // `.keeper` dir — derive the repo root and nudge if new.
   const nudgeFromPlanctlDir = (planctlDir: string): void => {
-    // `planctlDir` is `<root>/.planctl`; its parent is the repo root. Reuse the
-    // pure ancestor walk by appending a synthetic child so it sees `.planctl`.
+    // `planctlDir` is `<root>/.keeper`; its parent is the repo root. Reuse the
+    // pure ancestor walk by appending a synthetic child so it sees `.keeper`.
     maybeNudgeDiscovery(dirname(planctlDir));
   };
 
@@ -3300,7 +3268,7 @@ function main(): void {
       // `planctl-commit-changed` and post-flip `plan-commit-changed` event-type
       // names fold identically (the producer flip is a later epic). The
       // git-worker just observed a commit landing in `msg.repo` carrying
-      // changed `.planctl/**` paths; re-ingest each from the COMMITTED worktree
+      // changed `.keeper/**` paths; re-ingest each from the COMMITTED worktree
       // bytes via the existing idempotent `onChange` / `onDelete` paths.
       // Drop-proof
       // (independent of the broad `~/code` FSEvents subscription) and
@@ -3468,7 +3436,7 @@ function main(): void {
       if (flaggedAny) onWake();
       // re-reconcile the reflog watches against the live union (pending
       // ∪ discovered planctl repos). `onPendingChange` only fires on a pending
-      // mutation, so a brand-new `.planctl` repo that never accrues a pending
+      // mutation, so a brand-new `.keeper` repo that never accrues a pending
       // path (a foreign commit lands its files already-in-HEAD before any
       // FSEvent gated them) would otherwise never arm its watch. This periodic
       // re-reconcile picks it up within one heartbeat — cheap (a shallow
@@ -3501,7 +3469,7 @@ function main(): void {
   // write, so polling the DB surfaces it without waiting on the 60s heartbeat.
   //
   // The poll is a TRIGGER, not a data source: on a bump it runs a change-gated
-  // `reconcilePlanctlDirs(..., "db-poll")` re-scan (so a `.planctl` change
+  // `reconcilePlanctlDirs(..., "db-poll")` re-scan (so a `.keeper` change
   // whose FSEvent was dropped — and was therefore NEVER gated into pending —
   // is still recovered). The poll NEVER writes the DB.
   //
@@ -3530,7 +3498,7 @@ function main(): void {
       scanner.markFastPath("db-poll");
       reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
       // fn-788: after the scan, drive the mute-watcher re-arm drain. The scan
-      // above only READS the on-disk `.planctl` census — the drain is the sole
+      // above only READS the on-disk `.keeper` census — the drain is the sole
       // mutator of the `subscriptions` map on the wake path, so running it here
       // (inside the single-flight body, after the scan) is what makes a db-poll
       // wake and the re-arm drain never race on that map. The drain is async
@@ -3598,7 +3566,7 @@ function main(): void {
   // watcher seam: skip the native addon dlopen in the in-process tier and
   // run a polling degrade instead. The boot scan per root still seeds the
   // projection and advances the ghost-sweep barrier; the `data_version` poll +
-  // periodic heartbeat (armed above) carry the live `.planctl` fold pipeline at
+  // periodic heartbeat (armed above) carry the live `.keeper` fold pipeline at
   // poll/heartbeat cadence. `reflogWatcherModule` stays null (the reflog fast
   // path is absent, covered by the heartbeat).
   if (data.disableNativeWatcher) {
@@ -3642,7 +3610,7 @@ function main(): void {
     root: string,
   ): Promise<AsyncSubscription | null> => {
     // Per-root drop-recovery scheduler: a recoverable FSEvents drop schedules
-    // a debounced, single-flight re-scan of THIS root's `.planctl` dirs via
+    // a debounced, single-flight re-scan of THIS root's `.keeper` dirs via
     // the change-gated {@link reconcilePlanctlDirs} primitive — never an
     // unsubscribe+re-subscribe (the live subscription stays alive; the
     // drop-rescan recovers a lost batch without opening a no-watch gap — that
@@ -3652,7 +3620,7 @@ function main(): void {
     // files, so recovery is idempotent. The scan re-checks shuttingDown so a
     // queued scan can't touch a closing DB.
     //
-    // scoped to `.planctl` dirs (O(#projects)), NOT the full
+    // scoped to `.keeper` dirs (O(#projects)), NOT the full
     // recursive walk over the whole `~/code` tree the boot scan does.
     // The commit path (`planctl-commit-changed`) + the boot sweep
     // continue to handle deletions, so an additive shallow rescan is
@@ -3725,7 +3693,7 @@ function main(): void {
           // label `fsevents` for per-wake-path attribution.
           scanner.markFastPath("fsevents");
           for (const ev of events) {
-            // The in-callback `.planctl/{epics,tasks}/*.json` filter (via
+            // The in-callback `.keeper/{epics,tasks}/*.json` filter (via
             // classifyPlanPath, applied inside onChange) is what guarantees
             // only real plan files reach the read path — the positive ignore
             // globs are belt-and-suspenders perf, not the correctness gate.

@@ -74,7 +74,7 @@ describe("no-track commands bypass the invocation decorator", () => {
   test("cat stdout is pure markdown — no trailing invocation line", () => {
     // test_no_track_commands.py::test_cat_stdout_is_pure_markdown
     const spec = readFileSync(
-      join(root, ".planctl", "specs", "fn-7-real.md"),
+      join(root, ".keeper", "specs", "fn-7-real.md"),
       "utf-8",
     );
     const r = runCli(["cat", "fn-7-real"], { cwd: root });

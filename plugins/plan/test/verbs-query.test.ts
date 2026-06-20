@@ -125,7 +125,7 @@ function tryDecodePrefix(
 }
 
 function store(root: string): LocalFileStateStore {
-  return new LocalFileStateStore(join(root, ".planctl", "state"));
+  return new LocalFileStateStore(join(root, ".keeper", "state"));
 }
 
 // ---------------------------------------------------------------------------
@@ -168,7 +168,7 @@ function seedInvalidCorpus(root: string): void {
     nTasks: 2,
     taskDeps: { 1: [9, 2], 2: [1] },
   });
-  const ep = join(root, ".planctl", "epics", "fn-1-cafe.json");
+  const ep = join(root, ".keeper", "epics", "fn-1-cafe.json");
   const def = loadJson(ep);
   def.depends_on_epics = ["fn-99-ghost"];
   atomicWriteJson(ep, def);
@@ -330,7 +330,7 @@ describe("cat", () => {
     expect(r.code).toBe(1);
     expect(r.output).toContain("Spec not found");
     expect(r.output).toContain(
-      join(root, ".planctl", "specs", "fn-1-cafe.9.md"),
+      join(root, ".keeper", "specs", "fn-1-cafe.9.md"),
     );
     expect(r.output).not.toContain('"planctl_invocation"');
   });
@@ -504,7 +504,7 @@ describe("resolve-task", () => {
     const proj = realpathSync(mkdirAndReturn(join(rootDir, "proj")));
     seedState(proj, { epicId: "fn-1-cafe", nTasks: 1 });
     // Null the tier on disk to exercise the explicit-null surface.
-    const tp = join(proj, ".planctl", "tasks", "fn-1-cafe.1.json");
+    const tp = join(proj, ".keeper", "tasks", "fn-1-cafe.1.json");
     const td = loadJson(tp);
     td.tier = null;
     atomicWriteJson(tp, td);
@@ -631,7 +631,7 @@ describe("refine-context", () => {
   test("empty spec string when absent", () => {
     // test_query_verbs.py::test_refine_context_empty_spec_string
     seedState(root, { epicId: "fn-1-cafe", nTasks: 0 });
-    unlinkSync(join(root, ".planctl", "specs", "fn-1-cafe.md"));
+    unlinkSync(join(root, ".keeper", "specs", "fn-1-cafe.md"));
     const r = runCli(["refine-context", "fn-1-cafe"], { cwd: root });
     expect(r.code).toBe(0);
     const env = primaryEnvelope(r.output);
@@ -703,11 +703,11 @@ describe("validate", () => {
     mkdirSync(join(other, ".git"), { recursive: true });
     seedState(root, { epicId: "fn-1-cafe", nTasks: 1, primaryRepo: root });
     mkdirSync(join(root, ".git"), { recursive: true });
-    const ep = join(root, ".planctl", "epics", "fn-1-cafe.json");
+    const ep = join(root, ".keeper", "epics", "fn-1-cafe.json");
     const epicDef = loadJson(ep);
     epicDef.touched_repos = [root];
     atomicWriteJson(ep, epicDef);
-    const tp = join(root, ".planctl", "tasks", "fn-1-cafe.1.json");
+    const tp = join(root, ".keeper", "tasks", "fn-1-cafe.1.json");
     const td = loadJson(tp);
     td.target_repo = other;
     atomicWriteJson(tp, td);
@@ -730,7 +730,7 @@ describe("validate --epic", () => {
   test("stamps on the None transition + emits a second compact invocation", () => {
     // test_query_verbs.py::test_validate_epic_stamps_on_none_transition
     seedState(root, { epicId: "fn-1-cafe", nTasks: 1 });
-    const ep = join(root, ".planctl", "epics", "fn-1-cafe.json");
+    const ep = join(root, ".keeper", "epics", "fn-1-cafe.json");
     expect(loadJson(ep).last_validated_at ?? null).toBeNull();
 
     const r = runCli(["validate", "--epic", "fn-1-cafe"], {
@@ -751,7 +751,7 @@ describe("validate --epic", () => {
   test("already-stamped re-run is a pure no-op (no second invocation line)", () => {
     // test_query_verbs.py::test_validate_epic_already_stamped_is_noop
     seedState(root, { epicId: "fn-1-cafe", nTasks: 1 });
-    const ep = join(root, ".planctl", "epics", "fn-1-cafe.json");
+    const ep = join(root, ".keeper", "epics", "fn-1-cafe.json");
     const env = {
       PLANCTL_NOW: FROZEN,
       CLAUDE_CODE_SESSION_ID: "test-query-verbs",

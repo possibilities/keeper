@@ -24,14 +24,7 @@ function git(args: string[], cwd: string): void {
 /** Seed a touched-log record for `sid` naming `relPath`, and write the file so
  * git sees it dirty. Returns relPath. */
 function seedTouched(sid: string, relPath: string, content = "x\n"): string {
-  const touchedDir = join(
-    repo,
-    ".planctl",
-    "state",
-    "sessions",
-    sid,
-    "touched",
-  );
+  const touchedDir = join(repo, ".keeper", "state", "sessions", sid, "touched");
   mkdirSync(touchedDir, { recursive: true });
   writeFileSync(
     join(touchedDir, `${relPath.replace(/\W/g, "_")}.txt`),
@@ -50,7 +43,7 @@ beforeEach(() => {
   git(["init", "-q"], repo);
   git(["config", "user.email", "t@p.local"], repo);
   git(["config", "user.name", "T"], repo);
-  mkdirSync(join(repo, ".planctl"), { recursive: true });
+  mkdirSync(join(repo, ".keeper"), { recursive: true });
 });
 
 afterEach(() => {
@@ -83,9 +76,9 @@ describe("buildPlanctlInvocation files = touched ∩ dirty", () => {
   test("only touched paths that are also dirty appear, sorted", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-int";
     // Two touched+dirty paths (out of order), one touched-but-clean (committed).
-    const b = seedTouched("sid-int", ".planctl/epics/b.json");
-    const a = seedTouched("sid-int", ".planctl/epics/a.json");
-    const clean = seedTouched("sid-int", ".planctl/epics/clean.json");
+    const b = seedTouched("sid-int", ".keeper/epics/b.json");
+    const a = seedTouched("sid-int", ".keeper/epics/a.json");
+    const clean = seedTouched("sid-int", ".keeper/epics/clean.json");
     git(["add", clean], repo);
     git(["commit", "-q", "-m", "commit clean"], repo);
 
@@ -150,14 +143,14 @@ describe("buildPlanctlInvocation touched-path validation (throws loud)", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-trav";
     const touchedDir = join(
       repo,
-      ".planctl",
+      ".keeper",
       "state",
       "sessions",
       "sid-trav",
       "touched",
     );
     mkdirSync(touchedDir, { recursive: true });
-    writeFileSync(join(touchedDir, "bad.txt"), ".planctl/../etc/passwd\n");
+    writeFileSync(join(touchedDir, "bad.txt"), ".keeper/../etc/passwd\n");
     expect(() =>
       buildPlanctlInvocation("done", "fn-1-x.1", null, { repoRoot: repo }),
     ).toThrow(/path traversal/);
@@ -167,7 +160,7 @@ describe("buildPlanctlInvocation touched-path validation (throws loud)", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-pref";
     const touchedDir = join(
       repo,
-      ".planctl",
+      ".keeper",
       "state",
       "sessions",
       "sid-pref",

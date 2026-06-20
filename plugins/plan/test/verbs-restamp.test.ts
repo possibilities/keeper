@@ -10,7 +10,7 @@
 // (skip-invalid statuses, error priority), and the fail-forward restamp-failure.
 //
 // Every fixture is seedState + gitBaseline (the _git_seed port); commit subjects
-// + two-file scope read off git log. Assertions on envelopes, .planctl/ files,
+// + two-file scope read off git log. Assertions on envelopes, .keeper/ files,
 // git — never internals.
 
 import { beforeEach, describe, expect, test } from "bun:test";
@@ -43,16 +43,16 @@ const FROZEN = "2026-06-06T00:00:00.000000Z";
 const STALE = "2026-01-01T00:00:00.000000Z";
 
 function epicDef(root: string, epicId: string): Record<string, unknown> {
-  return loadJson(join(root, ".planctl", "epics", `${epicId}.json`));
+  return loadJson(join(root, ".keeper", "epics", `${epicId}.json`));
 }
 function taskDef(root: string, taskId: string): Record<string, unknown> {
-  return loadJson(join(root, ".planctl", "tasks", `${taskId}.json`));
+  return loadJson(join(root, ".keeper", "tasks", `${taskId}.json`));
 }
 function specText(root: string, specId: string): string {
-  return readFileSync(join(root, ".planctl", "specs", `${specId}.md`), "utf-8");
+  return readFileSync(join(root, ".keeper", "specs", `${specId}.md`), "utf-8");
 }
 function runtime(root: string, taskId: string): Record<string, unknown> | null {
-  const p = join(root, ".planctl", "state", "tasks", `${taskId}.state.json`);
+  const p = join(root, ".keeper", "state", "tasks", `${taskId}.state.json`);
   return existsSync(p) ? JSON.parse(readFileSync(p, "utf-8")) : null;
 }
 // Head commit subject (%s). The harness exposes gitHeadMessage (%B) — take its
@@ -62,7 +62,7 @@ function headSubject(root: string): string {
 }
 // Overwrite last_validated_at directly on the epic JSON (the _stamp_marker seam).
 function stampMarker(root: string, epicId: string, value: unknown): void {
-  const p = join(root, ".planctl", "epics", `${epicId}.json`);
+  const p = join(root, ".keeper", "epics", `${epicId}.json`);
   const ed = loadJson(p);
   ed.last_validated_at = value;
   atomicWriteJson(p, ed);
@@ -172,12 +172,12 @@ describe("reset", () => {
       status: "done",
       assignee: "test@example.com",
     });
-    const tp = join(root, ".planctl", "tasks", "fn-1-rst.1.json");
+    const tp = join(root, ".keeper", "tasks", "fn-1-rst.1.json");
     const td = loadJson(tp);
     td.worker_done_at = STALE;
     atomicWriteJson(tp, td);
     writeFileSync(
-      join(root, ".planctl", "specs", "fn-1-rst.1.md"),
+      join(root, ".keeper", "specs", "fn-1-rst.1.md"),
       "## Description\nx\n\n## Acceptance\n- [ ] x\n\n" +
         "## Done summary\nall shipped\n\n## Evidence\nlots\n",
     );
@@ -256,8 +256,8 @@ describe("set-target-repo", () => {
     expect(gitLogCount(root)).toBe(before + 1);
     expect(headSubject(root)).toBe("chore(plan): set-target-repo fn-2-str.1");
     const files = new Set(gitFilesInHead(root));
-    expect(files.has(".planctl/tasks/fn-2-str.1.json")).toBe(true);
-    expect(files.has(".planctl/epics/fn-2-str.json")).toBe(true);
+    expect(files.has(".keeper/tasks/fn-2-str.1.json")).toBe(true);
+    expect(files.has(".keeper/epics/fn-2-str.json")).toBe(true);
   });
 });
 
@@ -410,7 +410,7 @@ describe("epic queue-jump", () => {
   test("short-circuits when already true (ZERO commits)", () => {
     // test_restamp_verbs.py::test_queue_jump_short_circuit_when_already_true
     seedState(root, { epicId: "fn-2-qj", nTasks: 1 });
-    const p = join(root, ".planctl", "epics", "fn-2-qj.json");
+    const p = join(root, ".keeper", "epics", "fn-2-qj.json");
     const ed = loadJson(p);
     ed.queue_jump = true;
     atomicWriteJson(p, ed);
@@ -683,7 +683,7 @@ describe("restamp-failure fail-forward", () => {
   test("write lands, marker stays stale, exit 1 with integrity_failed", () => {
     // test_restamp_verbs.py::test_restamp_failure_is_fail_forward
     seedState(root, { epicId: "fn-1-ff", nTasks: 2 });
-    unlinkSync(join(root, ".planctl", "specs", "fn-1-ff.2.md"));
+    unlinkSync(join(root, ".keeper", "specs", "fn-1-ff.2.md"));
     expect(epicDef(root, "fn-1-ff").last_validated_at).toBeNull();
 
     const r = runCli(["task", "set-description", "fn-1-ff.1"], {

@@ -6,7 +6,7 @@
 // paths) are cited or dropped inline with their reason.
 //
 // The contract: mutating verbs emit a single compact NDJSON envelope carrying
-// planctl_invocation merged in (op / target / subject / .planctl-only files /
+// planctl_invocation merged in (op / target / subject / .keeper-only files /
 // touched_path_files / repo_root); read-only verbs emit the invocation as a
 // trailing line with subject=null / files=null and never embed it in the
 // primary payload; the emit()->commit reorder makes a success envelope the
@@ -64,7 +64,7 @@ function create(title: string, extra: string[] = []) {
 }
 
 // ---------------------------------------------------------------------------
-// Mutating verb emits planctl_invocation (shape + .planctl/ prefix guard)
+// Mutating verb emits planctl_invocation (shape + .keeper/ prefix guard)
 // ---------------------------------------------------------------------------
 
 describe("mutating verb planctl_invocation", () => {

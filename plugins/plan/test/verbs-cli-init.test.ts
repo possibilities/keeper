@@ -124,7 +124,7 @@ describe("init backfill + commit semantics", () => {
     // test_init.py::test_init_backfills_existing_project
     const dir = getTmp();
     const home = getHome();
-    const planctlDir = join(dir, ".planctl");
+    const planctlDir = join(dir, ".keeper");
     for (const sub of [
       "epics",
       "specs",

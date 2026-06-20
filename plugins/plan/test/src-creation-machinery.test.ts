@@ -344,7 +344,7 @@ describe("checkGlobalNameUnique", () => {
   test("returns null when no foreign project owns the id (fail-soft)", () => {
     const d = tmpDir();
     try {
-      mkdirSync(join(d, ".planctl", "epics"), { recursive: true });
+      mkdirSync(join(d, ".keeper", "epics"), { recursive: true });
       expect(checkGlobalNameUnique("fn-1-nobody", d)).toBeNull();
     } finally {
       rmSync(d, { recursive: true, force: true });
@@ -361,10 +361,10 @@ describe("checkGlobalNameUnique", () => {
       const projectsRoot = join(root, "code");
       const local = join(projectsRoot, "local-proj");
       const foreign = join(projectsRoot, "foreign-proj");
-      mkdirSync(join(local, ".planctl", "epics"), { recursive: true });
-      mkdirSync(join(foreign, ".planctl", "epics"), { recursive: true });
+      mkdirSync(join(local, ".keeper", "epics"), { recursive: true });
+      mkdirSync(join(foreign, ".keeper", "epics"), { recursive: true });
       writeFileSync(
-        join(foreign, ".planctl", "epics", "fn-12-shared.json"),
+        join(foreign, ".keeper", "epics", "fn-12-shared.json"),
         "{}",
       );
       writeFileSync(
@@ -378,7 +378,7 @@ describe("checkGlobalNameUnique", () => {
       expect(realpathSync(owner as string)).toBe(realpathSync(foreign));
       // The id only in the local project is NOT a global collision.
       writeFileSync(
-        join(local, ".planctl", "epics", "fn-3-localonly.json"),
+        join(local, ".keeper", "epics", "fn-3-localonly.json"),
         "{}",
       );
       expect(checkGlobalNameUnique("fn-3-localonly", local)).toBeNull();

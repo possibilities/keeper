@@ -119,7 +119,7 @@ describe("audit submit", () => {
   });
 
   // test_audit_submit.py::test_no_commit_fires — the submit mutates only
-  // gitignored state/; no .planctl/ commit payload rides the output. (withProject
+  // gitignored state/; no .keeper/ commit payload rides the output. (withProject
   // is a real git repo, so this is the real-git assertion the pytest marks.)
   test("no commit fires: no files-bearing invocation payload", () => {
     const proj = getProj();

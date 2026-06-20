@@ -4,8 +4,7 @@
 // linked-worktree `.git` file counts), never honoring GIT_DIR. realpathSync
 // matches Python's Path.resolve() symlink resolution (load-bearing on macOS,
 // where the pytest tmp tree resolves /var -> /private/var). resolveProject
-// hard-errors through emitError when no data dir (`.keeper/`, or the transient
-// `.planctl/` fallback) is present.
+// hard-errors through emitError when no `.keeper/` data dir is present.
 
 import { existsSync, realpathSync } from "node:fs";
 import { dirname, isAbsolute, join } from "node:path";
@@ -51,10 +50,9 @@ export function findProjectRoot(): string {
   return findGitRoot() ?? resolveStart();
 }
 
-/** Build a ProjectContext for `projectRoot`, resolving its data dir (`.keeper/`
- * with the transient `.planctl/` fallback). The shared root→context builder every
- * verb's local helper routes through, so the data-dir resolution lives in one
- * place. */
+/** Build a ProjectContext for `projectRoot`, resolving its `.keeper/` data dir.
+ * The shared root→context builder every verb's local helper routes through, so
+ * the data-dir resolution lives in one place. */
 export function contextForRoot(projectRoot: string): ProjectContext {
   const dataDir = resolveDataDirOrDefault(projectRoot);
   return {
@@ -65,8 +63,8 @@ export function contextForRoot(projectRoot: string): ProjectContext {
   };
 }
 
-/** Resolve the current directory to a ProjectContext, erroring when no data dir
- * (`.keeper/`, or the transient `.planctl/` fallback) is present. `format`
+/** Resolve the current directory to a ProjectContext, erroring when no
+ * `.keeper/` data dir is present. `format`
  * selects the error envelope's serialization. */
 export function resolveProject(format: OutputFormat | null): ProjectContext {
   const projectRoot = findProjectRoot();

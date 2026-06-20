@@ -172,7 +172,7 @@ describe("close-preflight success envelope + brief", () => {
       const porcelain = Bun.spawnSync(["git", "status", "--porcelain"], {
         cwd: proj.root,
       }).stdout.toString();
-      expect(porcelain.includes(".planctl/state/audits")).toBe(false);
+      expect(porcelain.includes(".keeper/state/audits")).toBe(false);
     },
   );
 });

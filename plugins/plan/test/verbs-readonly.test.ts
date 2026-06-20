@@ -53,9 +53,9 @@ function expectedTrailer(op: string, root: string): string {
   });
 }
 
-// Port of _seed_empty_project: a bare .planctl/ skeleton (no epics/tasks).
+// Port of _seed_empty_project: a bare .keeper/ skeleton (no epics/tasks).
 function seedEmptyProject(root: string): void {
-  const planctlDir = join(root, ".planctl");
+  const planctlDir = join(root, ".keeper");
   for (const sub of ["epics", "specs", "tasks", "state"]) {
     mkdirSync(join(planctlDir, sub), { recursive: true });
   }
@@ -70,7 +70,7 @@ function seedEmptyProject(root: string): void {
 // done) + fn-zzz-weird (unparseable id sorts last, 0 tasks).
 function seedMixed(root: string): void {
   seedState(root, { epicId: "fn-1-cafe", title: "Café résumé ☕", nTasks: 3 });
-  const store = new LocalFileStateStore(join(root, ".planctl", "state"));
+  const store = new LocalFileStateStore(join(root, ".keeper", "state"));
   store.saveRuntime("fn-1-cafe.2", {
     status: "in_progress",
     assignee: "test@example.com",
@@ -100,7 +100,7 @@ describe("state-path", () => {
     expect(r.code).toBe(0);
     const [primary, trailer] = split(r.stdout);
     expect(primary).toBe(
-      `{\n  "success": true,\n  "state_dir": "${root}/.planctl/state"\n}\n`,
+      `{\n  "success": true,\n  "state_dir": "${root}/.keeper/state"\n}\n`,
     );
     expect(trailer).toBe(expectedTrailer("state-path", root));
   });
@@ -145,7 +145,7 @@ describe("detect", () => {
 
   test("schema_version default 0 when meta.json absent", () => {
     // test_readonly_verbs.py::test_detect_schema_version_default_zero
-    mkdirSync(join(root, ".planctl"), { recursive: true });
+    mkdirSync(join(root, ".keeper"), { recursive: true });
     const name = basename(root);
     const r = runCli(["detect"], { cwd: root });
     expect(r.code).toBe(0);

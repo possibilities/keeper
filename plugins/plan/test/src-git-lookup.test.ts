@@ -207,8 +207,8 @@ describe("stateHeadVisible", () => {
   });
 
   test("committed task JSON with worker_done_at → true", () => {
-    const rel = ".planctl/tasks/fn-1-x.1.json";
-    mkdirSync(join(repo, ".planctl", "tasks"), { recursive: true });
+    const rel = ".keeper/tasks/fn-1-x.1.json";
+    mkdirSync(join(repo, ".keeper", "tasks"), { recursive: true });
     writeFileSync(
       join(repo, rel),
       `${JSON.stringify({ id: "fn-1-x.1", worker_done_at: "2026-01-01T00:00:00Z" })}\n`,

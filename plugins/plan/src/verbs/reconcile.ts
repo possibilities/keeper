@@ -223,10 +223,10 @@ export function findSourceCommits(taskId: string, repo: string): string[] {
 
 /** True when the committed HEAD:<task.json> carries worker_done_at. Runs
  * cat-file against `stateRepo` (NOT target_repo, NOT cwd) at the repo-relative
- * `<data-dir>/tasks/<id>.json`, probing `.keeper/` then the transient `.planctl/`
- * fallback (a mid-migration board commits either). Guards the unborn-branch case
- * first. Returns false (not a tooling error) when the repo is unborn or the path
- * isn't in HEAD under any data dir; throws GitError on any other git failure.
+ * `<data-dir>/tasks/<id>.json` under the `.keeper/` data dir. Guards the
+ * unborn-branch case first. Returns false (not a tooling error) when the repo is
+ * unborn or the path isn't in HEAD under the data dir; throws GitError on any
+ * other git failure.
  * Mirrors _state_head_visible. */
 export function stateHeadVisible(stateRepo: string, taskId: string): boolean {
   if (!isDir(stateRepo)) {

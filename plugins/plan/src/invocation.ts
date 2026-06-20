@@ -132,10 +132,9 @@ function readTouchedFiles(dataDir: string, sessionId: string): string[] {
 }
 
 /** Paths recorded for `sessionId` in the touched-paths log, each a POSIX string
- * relative to repoRoot starting with a data-dir prefix (`.keeper/`, or the
- * transient `.planctl/` fallback). The touched-log lives under whichever data
- * dir resolves; a path with `..` or a prefix outside the data-dir set is a bug
- * upstream and throws loud, never silently dropped. */
+ * relative to repoRoot starting with the `.keeper/` data-dir prefix. The
+ * touched-log lives under the data dir; a path with `..` or a prefix outside the
+ * data-dir set is a bug upstream and throws loud, never silently dropped. */
 function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
   const dataDir = resolveDataDirOrDefault(repoRoot);
   const touchedDir = join(dataDir, "state", "sessions", sessionId, "touched");
@@ -173,9 +172,8 @@ function readTouchedPaths(repoRoot: string, sessionId: string): string[] {
   return paths;
 }
 
-/** The set of dirty (modified/untracked) data-dir paths from git, scoped to both
- * `.keeper/` and the transient `.planctl/` fallback so a mid-migration tree
- * commits either. Mirrors invocation._dirty_planctl_paths: `git status
+/** The set of dirty (modified/untracked) data-dir paths from git, scoped to the
+ * `.keeper/` data dir. Mirrors invocation._dirty_planctl_paths: `git status
  * --porcelain --untracked-files=all -- <data dirs>` (the flag is load-bearing —
  * without it new files show as a directory-level `?? .keeper/epics/` and the
  * intersection returns empty). The parse matches Python exactly: line[3:].strip(),

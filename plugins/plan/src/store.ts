@@ -200,8 +200,7 @@ export function recordTouched(path: string, dataDir?: string): void {
       return;
     }
 
-    // Resolve dataDir: walk up from path's parent to find a data dir (`.keeper/`,
-    // or the transient `.planctl/` fallback — `.keeper/` wins when both exist).
+    // Resolve dataDir: walk up from path's parent to find a `.keeper/` data dir.
     let resolvedDataDir = dataDir;
     if (resolvedDataDir === undefined) {
       let check = dirname(resolve(path));

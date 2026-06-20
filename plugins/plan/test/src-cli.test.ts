@@ -45,7 +45,7 @@ function run(args: string[], cwd: string): RunResult {
 
 function seedProject(): string {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "planctl-cli-test-")));
-  mkdirSync(join(root, ".planctl", "state"), { recursive: true });
+  mkdirSync(join(root, ".keeper", "state"), { recursive: true });
   return root;
 }
 
@@ -81,7 +81,7 @@ describe("state-path", () => {
       const trailer = lines[lines.length - 1] as string;
       const primary = lines.slice(0, -1).join("\n");
       expect(primary).toBe(
-        `{\n  "success": true,\n  "state_dir": "${root}/.planctl/state"\n}`,
+        `{\n  "success": true,\n  "state_dir": "${root}/.keeper/state"\n}`,
       );
       expect(trailer).toBe(
         '{"planctl_invocation":{"files":null,"op":"state-path","target":null,' +
@@ -99,7 +99,7 @@ describe("state-path", () => {
       const r = run(["state-path", "--task", "fn-1-x.2"], root);
       expect(r.code).toBe(0);
       expect(r.stdout).toContain(
-        `"task_state_path": "${root}/.planctl/state/tasks/fn-1-x.2.state.json"`,
+        `"task_state_path": "${root}/.keeper/state/tasks/fn-1-x.2.state.json"`,
       );
     } finally {
       rmSync(root, { recursive: true, force: true });
@@ -112,7 +112,7 @@ describe("state-path", () => {
       const r = run(["--format", "yaml", "state-path"], root);
       expect(r.code).toBe(0);
       expect(r.stdout).toContain(
-        `success: true\nstate_dir: ${root}/.planctl/state\n`,
+        `success: true\nstate_dir: ${root}/.keeper/state\n`,
       );
     } finally {
       rmSync(root, { recursive: true, force: true });

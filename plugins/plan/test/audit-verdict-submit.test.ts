@@ -266,7 +266,7 @@ describe("verdict submit", () => {
   });
 
   // test_verdict_submit.py::test_no_commit_fires — the verdict mutates only
-  // gitignored state/; no .planctl/ commit payload rides the output.
+  // gitignored state/; no .keeper/ commit payload rides the output.
   test("no commit fires: no files-bearing invocation payload", () => {
     const proj = getProj();
     seedBrief(proj.root);

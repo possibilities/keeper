@@ -56,8 +56,7 @@ function emitClaimError(
   process.exit(1);
 }
 
-/** Build a ProjectCtx from a project root, resolving its data dir (`.keeper/`
- * with the transient `.planctl/` fallback). */
+/** Build a ProjectCtx from a project root, resolving its `.keeper/` data dir. */
 function contextForRoot(projectRoot: string): ProjectCtx {
   const dataDir = resolveDataDirOrDefault(projectRoot);
   return {

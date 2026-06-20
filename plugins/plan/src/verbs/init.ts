@@ -5,10 +5,8 @@
 // containing `state/` (raw write), and the advice files — CLAUDE.md written ONLY
 // when absent (preserves human edits) and AGENTS.md as a RELATIVE symlink to it.
 // An already-initialized tree (meta.json present) is backfilled with just the
-// advice files. The data dir is the write-back target (resolveDataDirOrDefault):
-// a fresh root mints `.keeper/`, but an existing legacy `.planctl/` board is
-// backfilled IN PLACE — init never mints a competing `.keeper/` alongside a live
-// `.planctl/` (that would shadow it).
+// advice files. The data dir is `.keeper/` (resolveDataDirOrDefault): a fresh
+// root mints it; an existing `.keeper/` board is backfilled IN PLACE.
 //
 // init is the one mutating verb that builds its OWN invocation payload directly:
 // a LITERAL payload (files = sorted written list, no session_id key, no
@@ -92,9 +90,8 @@ interface InitArgs {
 
 export function runInit(_args: InitArgs): void {
   const projectRoot = findProjectRoot();
-  // Fresh init targets `.keeper/`; an existing data dir (resolved with `.keeper/`
-  // precedence then the `.planctl/` fallback) is backfilled in place, so init on
-  // a legacy-only board never mints a competing empty `.keeper/` alongside it.
+  // Fresh init targets `.keeper/`; an existing `.keeper/` data dir is backfilled
+  // in place.
   const dataDir = resolveDataDirOrDefault(projectRoot);
 
   const projectData = {

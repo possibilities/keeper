@@ -11,7 +11,7 @@
 // BARE .git/ skeleton and leans on the fast bucket no-op'ing every git verb. The
 // bun binary is the production runtime and ALWAYS runs real-git auto-commit, so
 // every fixture here is a real `git init` (withProject) — the marker write rides a
-// genuine .planctl/ commit. Epics null their multi-repo fields after mint so
+// genuine .keeper/ commit. Epics null their multi-repo fields after mint so
 // validate treats them as legacy (skipping the multi-repo path), exactly as the
 // Python _create_epic does.
 

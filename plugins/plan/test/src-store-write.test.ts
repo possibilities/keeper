@@ -149,7 +149,7 @@ describe("atomicWriteRaw crash path", () => {
 describe("recordTouched (session touched-paths log)", () => {
   function seedPlanctl(): { repoRoot: string; dataDir: string } {
     const repoRoot = realpathSync(mkdtempSync(join(tmpdir(), "planctl-repo-")));
-    const dataDir = join(repoRoot, ".planctl");
+    const dataDir = join(repoRoot, ".keeper");
     mkdirSync(dataDir, { recursive: true });
     return { repoRoot, dataDir };
   }
@@ -173,7 +173,7 @@ describe("recordTouched (session touched-paths log)", () => {
     expect(entries.length).toBe(1);
     expect(entries[0]).toMatch(/^[0-9a-f]{32}\.txt$/);
     expect(readFileSync(join(touchedDir, entries[0] as string), "utf-8")).toBe(
-      ".planctl/tasks/fn-1-x.1.json\n",
+      ".keeper/tasks/fn-1-x.1.json\n",
     );
     rmSync(repoRoot, { recursive: true, force: true });
   });
@@ -189,7 +189,7 @@ describe("recordTouched (session touched-paths log)", () => {
     rmSync(repoRoot, { recursive: true, force: true });
   });
 
-  test("no .planctl/ ancestor => silent skip (fail-open)", () => {
+  test("no .keeper/ ancestor => silent skip (fail-open)", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sess-xyz";
     const target = join(root, "loose.json");
     writeFileSync(target, "{}");

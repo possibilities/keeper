@@ -88,14 +88,14 @@ describe("loadRoots fail-soft", () => {
 });
 
 describe("discoverProjects", () => {
-  /** Make `<parent>/<name>/.planctl/` and return the project dir. */
+  /** Make `<parent>/<name>/.keeper/` and return the project dir. */
   function seedProject(parent: string, name: string): string {
     const proj = join(parent, name);
-    mkdirSync(join(proj, ".planctl"), { recursive: true });
+    mkdirSync(join(proj, ".keeper"), { recursive: true });
     return realpathSync(proj);
   }
 
-  test("returns immediate children holding .planctl/, sorted", () => {
+  test("returns immediate children holding .keeper/, sorted", () => {
     const r = join(root, "roots1");
     mkdirSync(r, { recursive: true });
     const pB = seedProject(r, "bbb");
@@ -105,12 +105,12 @@ describe("discoverProjects", () => {
     expect(discoverProjects([r])).toEqual([pA, pB]);
   });
 
-  test("skips nested .planctl/ (only immediate children)", () => {
+  test("skips nested .keeper/ (only immediate children)", () => {
     const r = join(root, "roots2");
     mkdirSync(r, { recursive: true });
     const proj = seedProject(r, "proj");
-    // A worktree-style nested .planctl two levels down must NOT surface.
-    mkdirSync(join(proj, "deep", "child", ".planctl"), { recursive: true });
+    // A worktree-style nested .keeper two levels down must NOT surface.
+    mkdirSync(join(proj, "deep", "child", ".keeper"), { recursive: true });
     expect(discoverProjects([r])).toEqual([proj]);
   });
 
@@ -124,14 +124,14 @@ describe("discoverProjects", () => {
 });
 
 describe("findProjectsWithTask", () => {
-  test("returns only roots whose .planctl/tasks/<id>.json exists", () => {
+  test("returns only roots whose .keeper/tasks/<id>.json exists", () => {
     const r = join(root, "roots4");
     mkdirSync(r, { recursive: true });
     const withTask = join(r, "has");
-    mkdirSync(join(withTask, ".planctl", "tasks"), { recursive: true });
-    writeFileSync(join(withTask, ".planctl", "tasks", "fn-1-x.1.json"), "{}");
+    mkdirSync(join(withTask, ".keeper", "tasks"), { recursive: true });
+    writeFileSync(join(withTask, ".keeper", "tasks", "fn-1-x.1.json"), "{}");
     const withoutTask = join(r, "without");
-    mkdirSync(join(withoutTask, ".planctl", "tasks"), { recursive: true });
+    mkdirSync(join(withoutTask, ".keeper", "tasks"), { recursive: true });
 
     const matches = findProjectsWithTask("fn-1-x.1", [r]);
     expect(matches).toEqual([realpathSync(withTask)]);
@@ -139,7 +139,7 @@ describe("findProjectsWithTask", () => {
 
   test("no project holds the task => empty list", () => {
     const r = join(root, "roots5");
-    mkdirSync(join(r, "p", ".planctl"), { recursive: true });
+    mkdirSync(join(r, "p", ".keeper"), { recursive: true });
     expect(findProjectsWithTask("fn-9-none.1", [r])).toEqual([]);
   });
 });

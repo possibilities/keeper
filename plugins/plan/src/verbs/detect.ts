@@ -5,7 +5,7 @@
 // a missing data dir), so the read-only trailer is left to dispatch, which
 // resolves independently — on found-false that resolve hits the missing-project
 // guard and tails the error envelope + exit 1, exactly as Python does. The data
-// dir resolves `.keeper/` first, then the transient `.planctl/` fallback.
+// dir is `.keeper/`.
 
 import { basename, join } from "node:path";
 

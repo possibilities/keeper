@@ -40,10 +40,10 @@ interface Fixture {
   dataDir: string;
 }
 
-/** Build a `.planctl/` tree under a fresh tmp dir and return [dir, dataDir]. */
+/** Build a `.keeper/` tree under a fresh tmp dir and return [dir, dataDir]. */
 function makeFixture(): Fixture {
   const dir = realpathSync(mkdtempSync(join(tmpdir(), "planctl-integrity-")));
-  const dataDir = join(dir, ".planctl");
+  const dataDir = join(dir, ".keeper");
   for (const sub of ["epics", "tasks", "specs", "state"]) {
     mkdirSync(join(dataDir, sub), { recursive: true });
   }

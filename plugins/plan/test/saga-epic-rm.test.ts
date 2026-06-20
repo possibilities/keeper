@@ -255,8 +255,8 @@ describe("epic rm ambiguous resolution", () => {
     );
     dupId = a.epicId;
     // Materialise the dup directly on proj_b's disk (CLI-free), byte-faithful.
-    // seedState builds the legacy `.planctl/` tree, so proj_b resolves via the
-    // transient read fallback — exercising a mixed convention/legacy board pair.
+    // seedState builds the `.keeper/` tree, so proj_b resolves the same id —
+    // exercising an ambiguous same-id board pair.
     seedState(projB, { epicId: dupId, title: "Ambiguous epic", nTasks: 1 });
 
     setRoots(sharedHome, [parent]);
@@ -287,7 +287,7 @@ describe("epic rm ambiguous resolution", () => {
     expect(existsSync(join(projA, ".keeper", "epics", `${dupId}.json`))).toBe(
       true,
     );
-    expect(existsSync(join(projB, ".planctl", "epics", `${dupId}.json`))).toBe(
+    expect(existsSync(join(projB, ".keeper", "epics", `${dupId}.json`))).toBe(
       true,
     );
   });
@@ -304,7 +304,7 @@ describe("epic rm ambiguous resolution", () => {
     expect(existsSync(join(projA, ".keeper", "epics", `${dupId}.json`))).toBe(
       false,
     );
-    expect(existsSync(join(projB, ".planctl", "epics", `${dupId}.json`))).toBe(
+    expect(existsSync(join(projB, ".keeper", "epics", `${dupId}.json`))).toBe(
       true,
     );
   });

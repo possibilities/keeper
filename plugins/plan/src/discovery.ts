@@ -1,8 +1,8 @@
 // Multi-project discovery — the subset of planctl/discovery.py that claim needs.
 //
 // Pure filesystem scan: given the configured roots (parent directories), walk
-// each root's IMMEDIATE children and return those holding a data dir (`.keeper/`,
-// or the transient `.planctl/` fallback). Immediate children only — nested data
+// each root's IMMEDIATE children and return those holding a `.keeper/` data dir.
+// Immediate children only — nested data
 // dirs (agent worktrees) must not double-count. Fail-soft: a root that doesn't
 // exist (or can't be listed) is skipped, not an error.
 
@@ -28,8 +28,8 @@ function isDir(p: string): boolean {
 }
 
 /** Planctl project directories under the given (or configured) roots. A project
- * is an IMMEDIATE child of a root containing a data dir (`.keeper/`, or the
- * transient `.planctl/` fallback). Nested data dirs are NOT surfaced — one level
+ * is an IMMEDIATE child of a root containing a `.keeper/` data dir. Nested data
+ * dirs are NOT surfaced — one level
  * of children per root. Roots are deduplicated, missing / unlistable roots
  * skipped silently. Returned paths are absolute, deduplicated, and sorted.
  * Mirrors discover_projects. */

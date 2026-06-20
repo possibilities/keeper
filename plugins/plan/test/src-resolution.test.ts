@@ -34,13 +34,13 @@ afterEach(() => {
   rmSync(root, { recursive: true, force: true });
 });
 
-/** Seed `<parent>/<name>/.planctl/epics/<epicId>.json` and return the project
+/** Seed `<parent>/<name>/.keeper/epics/<epicId>.json` and return the project
  * dir (realpathed). */
 function seedEpic(parent: string, name: string, epicId: string): string {
   const proj = join(parent, name);
-  mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+  mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
   writeFileSync(
-    join(proj, ".planctl", "epics", `${epicId}.json`),
+    join(proj, ".keeper", "epics", `${epicId}.json`),
     JSON.stringify({ id: epicId }),
   );
   return realpathSync(proj);
@@ -56,7 +56,7 @@ describe("resolveEpicGlobally (roots scan, cwd outside any project)", () => {
     expect(res.projectPath).toBe(proj);
     expect(res.resolvedId).toBe("fn-3-add-auth");
     expect(res.epicPath).toBe(
-      join(proj, ".planctl", "epics", "fn-3-add-auth.json"),
+      join(proj, ".keeper", "epics", "fn-3-add-auth.json"),
     );
   });
 
@@ -136,15 +136,15 @@ describe("scanEpicIdsGlobal", () => {
     const a = seedEpic(root, "pA", "fn-1-a");
     const b = seedEpic(root, "pB", "fn-2-b");
     // Also drop a spec-only epic id under pA/specs.
-    mkdirSync(join(a, ".planctl", "specs"), { recursive: true });
-    writeFileSync(join(a, ".planctl", "specs", "fn-9-spec-only.md"), "# x");
+    mkdirSync(join(a, ".keeper", "specs"), { recursive: true });
+    writeFileSync(join(a, ".keeper", "specs", "fn-9-spec-only.md"), "# x");
     const owners = scanEpicIdsGlobal([a, b]);
     expect(owners["fn-1-a"]).toBe(a);
     expect(owners["fn-2-b"]).toBe(b);
     expect(owners["fn-9-spec-only"]).toBe(a);
   });
 
-  test("project without .planctl contributes nothing (fail-soft)", () => {
+  test("project without .keeper contributes nothing (fail-soft)", () => {
     const a = seedEpic(root, "pA", "fn-1-a");
     const missing = join(root, "no-such-project");
     const owners = scanEpicIdsGlobal([missing, a]);

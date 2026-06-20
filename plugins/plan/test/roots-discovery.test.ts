@@ -45,9 +45,9 @@ const SID = { CLAUDE_CODE_SESSION_ID: "test-roots-discovery-fixture" };
 //   -> CITED src-discovery-config.test.ts "roots not a list falls back to the default".
 // test_roots_discovery.py::test_discover_finds_immediate_children
 //   -> CITED src-discovery-config.test.ts "returns immediate children holding
-//      .planctl/, sorted".
+//      .keeper/, sorted".
 // test_roots_discovery.py::test_discover_skips_nested_planctl
-//   -> CITED src-discovery-config.test.ts "skips nested .planctl/ (only immediate
+//   -> CITED src-discovery-config.test.ts "skips nested .keeper/ (only immediate
 //      children)".
 // test_roots_discovery.py::test_discover_missing_root_skipped
 //   -> CITED src-discovery-config.test.ts "missing/unlistable roots are skipped,
@@ -56,7 +56,7 @@ const SID = { CLAUDE_CODE_SESSION_ID: "test-roots-discovery-fixture" };
 //   -> CITED src-resolution.test.ts "maps every bare epic id to its owner;
 //      last-walked wins on dup".
 // test_roots_discovery.py::test_scan_epic_ids_global_empty
-//   -> CITED src-resolution.test.ts "project without .planctl contributes nothing
+//   -> CITED src-resolution.test.ts "project without .keeper contributes nothing
 //      (fail-soft)".
 
 describe("loadRoots gap nodes (config loader under a tmp HOME)", () => {
@@ -130,7 +130,7 @@ describe("discoverProjects gap node", () => {
   test("the same project via duplicate roots appears once", () => {
     const r = join(root, "code");
     const proj = join(r, "alpha");
-    mkdirSync(join(proj, ".planctl", "epics"), { recursive: true });
+    mkdirSync(join(proj, ".keeper", "epics"), { recursive: true });
     const projReal = realpathSync(proj);
     expect(discoverProjects([r, r])).toEqual([projReal]);
   });

@@ -7,7 +7,7 @@
 // session-id polarity (done fail-closed, claim fail-open).
 //
 // Every fixture is the CLI-free seedState builder + gitBaseline (the harness
-// _git_seed port); assertions are on envelopes, .planctl/ files, and git log,
+// _git_seed port); assertions are on envelopes, .keeper/ files, and git log,
 // never internals. The commit-asserting tests run real git via gitBaseline so
 // the auto-commit is exercised honestly.
 
@@ -32,7 +32,7 @@ const FROZEN = "2026-06-06T00:00:00.000000Z";
 // Read a task's runtime overlay off the gitignored state file, or null. Port of
 // _runtime — disk read, no verb.
 function runtime(root: string, taskId: string): Record<string, unknown> | null {
-  const p = join(root, ".planctl", "state", "tasks", `${taskId}.state.json`);
+  const p = join(root, ".keeper", "state", "tasks", `${taskId}.state.json`);
   if (!existsSync(p)) {
     return null;
   }
@@ -42,12 +42,12 @@ function runtime(root: string, taskId: string): Record<string, unknown> | null {
 // Read a task's tracked definition JSON. Port of _task_def.
 function taskDef(root: string, taskId: string): Record<string, unknown> {
   return JSON.parse(
-    readFileSync(join(root, ".planctl", "tasks", `${taskId}.json`), "utf-8"),
+    readFileSync(join(root, ".keeper", "tasks", `${taskId}.json`), "utf-8"),
   );
 }
 
 function specText(root: string, specId: string): string {
-  return readFileSync(join(root, ".planctl", "specs", `${specId}.md`), "utf-8");
+  return readFileSync(join(root, ".keeper", "specs", `${specId}.md`), "utf-8");
 }
 
 let root: string;
@@ -88,7 +88,7 @@ describe("claim success", () => {
     expect(ts.outcome).toBe("CLAIMED");
     expect((payload.epic_state as Record<string, unknown>).status).toBe("open");
     expect(payload.brief_ref).toBe(
-      join(root, ".planctl", "state", "briefs", `${taskId}.json`),
+      join(root, ".keeper", "state", "briefs", `${taskId}.json`),
     );
 
     const rt = runtime(root, taskId);

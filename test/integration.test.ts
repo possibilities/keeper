@@ -44,7 +44,7 @@ beforeEach(() => {
   // survivor's hermetic plan root + config YAML.
   //
   // Hermetic plan root for the plan-worker e2e — a tmp dir the daemon watches
-  // for `.planctl/{epics,tasks}/*.json` instead of the real `~/code`, resolved
+  // for `.keeper/{epics,tasks}/*.json` instead of the real `~/code`, resolved
   // via the `KEEPER_CONFIG` YAML the survivor passes to the harness so the
   // watcher can never touch the real `~/code`/`~/src` trees.
   planRoot = join(tmpDir, "plan-root");
@@ -63,7 +63,7 @@ afterEach(() => {
 /**
  * fn-629 observation-gate helper: initialize a git repo in `dir` (so HEAD
  * resolves) with one empty commit. The plan-worker's fn-629 gate suppresses
- * snapshot emission for any `.planctl/*.json` not in HEAD — every
+ * snapshot emission for any `.keeper/*.json` not in HEAD — every
  * integration test that pre-writes plan files (mimicking what planctl
  * eventually commits at the seam) must init + commit, or the gate
  * (correctly) keeps them out of the projection.
@@ -87,15 +87,15 @@ function gitInitPlanRoot(dir: string): void {
 }
 
 /**
- * fn-629 observation-gate helper: stage + commit every `.planctl/*.json`
+ * fn-629 observation-gate helper: stage + commit every `.keeper/*.json`
  * already present in `dir`, so the plan-worker's `isPathInHead` predicate
- * passes them through the gate. Mirrors what planctl does at the
+ * passes them through the gate. Mirrors what `keeper plan` does at the
  * `output.emit()` seam (commits the tree before the envelope returns) —
  * the keeper-side gate trusts that contract.
  */
 function gitCommitPlanRoot(dir: string, message: string = "plan files"): void {
   for (const args of [
-    ["add", ".planctl"],
+    ["add", ".keeper"],
     ["commit", "-q", "-m", message],
   ] as const) {
     const res = Bun.spawnSync(["git", "-C", dir, ...args], {
@@ -487,15 +487,15 @@ test("end-to-end: replay_dead_letter RPC routes board→worker→main, appends r
   );
 }, 30000);
 
-test("end-to-end: plan worker → .planctl write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
+test("end-to-end: plan worker → .keeper write → synthetic event → fold → epics/tasks projection + UDS subscribe", async () => {
   const epicId = "fn-9-keeper-e2e-plans";
   const taskId = `${epicId}.1`;
 
   // Point the daemon's plan worker at a hermetic tmp root via a tmp config YAML
   // (KEEPER_CONFIG override) so the watcher never touches the real ~/code/~/src.
   writeFileSync(configPath, `roots:\n  - ${JSON.stringify(planRoot)}\n`);
-  const epicsDir = join(planRoot, ".planctl", "epics");
-  const tasksDir = join(planRoot, ".planctl", "tasks");
+  const epicsDir = join(planRoot, ".keeper", "epics");
+  const tasksDir = join(planRoot, ".keeper", "tasks");
   mkdirSync(epicsDir, { recursive: true });
   mkdirSync(tasksDir, { recursive: true });
   const epicFile = join(epicsDir, `${epicId}.json`);
@@ -534,7 +534,7 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
   );
 
   // fn-629 observation gate: plan-worker suppresses snapshot emission for
-  // any .planctl/*.json not yet in git HEAD. Mirror the planctl
+  // any .keeper/*.json not yet in git HEAD. Mirror the planctl
   // `output.emit()` contract by initializing a repo and committing the
   // plan tree before the daemon boots — otherwise the boot scan correctly
   // gates these files into the pending set and no synthetic event lands.
@@ -630,7 +630,7 @@ test("end-to-end: plan worker → .planctl write → synthetic event → fold �
         expect(task.target_repo).toBe("/tmp/keeper-e2e-repo");
         // Schema v19: assert both task-status fields. `worker_phase` is the
         // derived binary (was `status`); `runtime_status` defaults to "todo"
-        // when the task has no `.planctl/state/tasks/<id>.state.json` sidecar.
+        // when the task has no `.keeper/state/tasks/<id>.state.json` sidecar.
         expect(task.worker_phase).toBe("open");
         expect(task.runtime_status).toBe("todo");
 

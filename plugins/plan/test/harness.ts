@@ -223,7 +223,7 @@ export function parseCliOutput(output: string): Record<string, unknown> {
 
 // ---------------------------------------------------------------------------
 // seedState — byte-faithful port of conftest.seed_state (:854-937). Builds a
-// full .planctl/ tree on disk without git, CLI, or flock, routing every record
+// full .keeper/ tree on disk without git, CLI, or flock, routing every record
 // through normalizeEpic/normalizeTask + serializeStateJson (the SAME seams the
 // read path runs). The skeleton + meta.json + inner .gitignore match init.
 // ---------------------------------------------------------------------------
@@ -258,7 +258,7 @@ function writeJson(path: string, data: Record<string, unknown>): void {
   writeFileSync(path, serializeStateJson(data), "utf-8");
 }
 
-/** Build a full .planctl/ tree under *root*, byte-faithful to conftest.seed_state.
+/** Build a full .keeper/ tree under *root*, byte-faithful to conftest.seed_state.
  * Returns [epicId, taskIds]. No git, no CLI, no flock — the caller supplies the
  * fn-N epic id directly. Every record round-trips through normalize* so a seeded
  * tree carries zero schema drift versus the binary's read path. */
@@ -279,12 +279,12 @@ export function seedState(
     primaryRepo = null,
   } = opts;
 
-  const planctlDir = join(root, ".planctl");
+  const dataDir = join(root, ".keeper");
   for (const subdir of ["epics", "specs", "tasks", "state"]) {
-    mkdirSync(join(planctlDir, subdir), { recursive: true });
+    mkdirSync(join(dataDir, subdir), { recursive: true });
   }
-  writeJson(join(planctlDir, "meta.json"), { schema_version: SCHEMA_VERSION });
-  writeFileSync(join(planctlDir, ".gitignore"), "state/\n", "utf-8");
+  writeJson(join(dataDir, "meta.json"), { schema_version: SCHEMA_VERSION });
+  writeFileSync(join(dataDir, ".gitignore"), "state/\n", "utf-8");
 
   const now = nowStamp();
 
@@ -298,8 +298,8 @@ export function seedState(
     created_at: now,
     updated_at: now,
   });
-  writeJson(join(planctlDir, "epics", `${epicId}.json`), epicDef);
-  writeFileSync(join(planctlDir, "specs", `${epicId}.md`), epicSpec, "utf-8");
+  writeJson(join(dataDir, "epics", `${epicId}.json`), epicDef);
+  writeFileSync(join(dataDir, "specs", `${epicId}.md`), epicSpec, "utf-8");
 
   const taskIds: string[] = [];
   for (let i = 1; i <= nTasks; i++) {
@@ -318,9 +318,9 @@ export function seedState(
       created_at: now,
       updated_at: now,
     });
-    writeJson(join(planctlDir, "tasks", `${taskId}.json`), taskDef);
+    writeJson(join(dataDir, "tasks", `${taskId}.json`), taskDef);
     writeFileSync(
-      join(planctlDir, "specs", `${taskId}.md`),
+      join(dataDir, "specs", `${taskId}.md`),
       taskSpec(`seed-${i}`),
       "utf-8",
     );
@@ -542,18 +542,18 @@ export const SLOW_ENABLED: boolean = ((): boolean => {
 // ---------------------------------------------------------------------------
 // gitBaseline — turn a seedState tree into a clean committed git baseline.
 // Port of the test_worker_verbs / test_restamp_verbs `_git_seed` helper: real
-// `git init` + commit the `.planctl/` tree so any later dirty state is the
+// `git init` + commit the `.keeper/` tree so any later dirty state is the
 // verb-under-test's. Used by the ZERO-commit / exactly-one-commit assertions.
 // ---------------------------------------------------------------------------
 
-/** `git init` + commit the seeded `.planctl/` tree in *dir*, returning the repo
+/** `git init` + commit the seeded `.keeper/` tree in *dir*, returning the repo
  * path. Identity/gpgsign/hooks come from gitInit. The single baseline commit
  * means a follow-up `git rev-list --count HEAD` delta isolates the verb's
  * commit. */
 export function gitBaseline(dir: string): string {
   gitInit(dir);
-  git(["add", ".planctl/"], dir);
-  git(["commit", "-q", "-m", "chore: seed planctl tree"], dir);
+  git(["add", ".keeper/"], dir);
+  git(["commit", "-q", "-m", "chore: seed keeper tree"], dir);
   return dir;
 }
 
@@ -564,10 +564,9 @@ export function gitBaseline(dir: string): string {
 // ---------------------------------------------------------------------------
 
 /** Write `<root>/<data-dir>/state/tasks/<taskId>.state.json` from *state*, byte-
- * faithful to LocalFileStateStore.saveRuntime. Resolves the root's existing data
- * dir (`.keeper/` when present, else legacy `.planctl/`) so the seeded overlay
- * lands where the board's read path resolves it. Seeds a runtime overlay a read
- * verb merges over the tracked def. */
+ * faithful to LocalFileStateStore.saveRuntime. Resolves the root's `.keeper/`
+ * data dir so the seeded overlay lands where the board's read path resolves it.
+ * Seeds a runtime overlay a read verb merges over the tracked def. */
 export function seedRuntime(
   root: string,
   taskId: string,

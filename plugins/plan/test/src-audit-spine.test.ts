@@ -223,7 +223,7 @@ describe("writeArtifact is commit-free and touched-log-free", () => {
 
   function setup(): { repoRoot: string; dataDir: string } {
     repoRoot = realpathSync(mkdtempSync(join(tmpdir(), "planctl-art-repo-")));
-    const dataDir = join(repoRoot, ".planctl");
+    const dataDir = join(repoRoot, ".keeper");
     mkdirSync(dataDir, { recursive: true });
     return { repoRoot, dataDir };
   }

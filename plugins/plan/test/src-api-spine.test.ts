@@ -27,8 +27,8 @@ import { loadJson } from "../src/store.ts";
 function projectCtx(root: string): ProjectContext {
   return {
     name: "p",
-    dataDir: join(root, ".planctl"),
-    stateDir: join(root, ".planctl", "state"),
+    dataDir: join(root, ".keeper"),
+    stateDir: join(root, ".keeper", "state"),
     projectPath: root,
   };
 }
@@ -88,7 +88,7 @@ describe("api load helpers", () => {
   test("loadEpic merges def + normalizes; loadTasksForEpic sorts files", () => {
     const root = realpathSync(mkdtempSync(join(tmpdir(), "planctl-api-")));
     try {
-      const dataDir = join(root, ".planctl");
+      const dataDir = join(root, ".keeper");
       mkdirSync(join(dataDir, "epics"), { recursive: true });
       mkdirSync(join(dataDir, "tasks"), { recursive: true });
       writeFileSync(
@@ -129,7 +129,7 @@ describe("api load helpers", () => {
       mkdtempSync(join(tmpdir(), "planctl-api-empty-")),
     );
     try {
-      mkdirSync(join(empty, ".planctl", "epics"), { recursive: true });
+      mkdirSync(join(empty, ".keeper", "epics"), { recursive: true });
       expect(loadTasksForEpic(projectCtx(empty), "fn-1-x")).toEqual([]);
     } finally {
       rmSync(empty, { recursive: true, force: true });

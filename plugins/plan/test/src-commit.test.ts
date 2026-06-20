@@ -208,7 +208,7 @@ describe("autoCommitFromInvocation no-op paths", () => {
 
 describe("autoCommitFromInvocation happy path", () => {
   test("dirty files → commit lands, returns long sha, payload subject + trailers", () => {
-    const rel = makeDirty(".planctl/epics/test_marker.txt");
+    const rel = makeDirty(".keeper/epics/test_marker.txt");
     const pre = commitCount(repo);
     const subject = "chore(plan): approve fn-587-x";
 
@@ -234,7 +234,7 @@ describe("autoCommitFromInvocation happy path", () => {
   });
 
   test("session_id stamps Session-Id trailer verbatim alongside the forensics", () => {
-    const rel = makeDirty(".planctl/epics/session_marker.txt");
+    const rel = makeDirty(".keeper/epics/session_marker.txt");
     const sid = "11111111-2222-4333-8444-555555555555";
     const sha = autoCommitFromInvocation({
       files: [rel],
@@ -254,7 +254,7 @@ describe("autoCommitFromInvocation happy path", () => {
   });
 
   test("missing session_id key → Session-Id omitted, commit still lands", () => {
-    const rel = makeDirty(".planctl/epics/no_session_marker.txt");
+    const rel = makeDirty(".keeper/epics/no_session_marker.txt");
     const pre = commitCount(repo);
     const sha = autoCommitFromInvocation({
       files: [rel],
@@ -273,7 +273,7 @@ describe("autoCommitFromInvocation happy path", () => {
   });
 
   test("explicit session_id=null → Session-Id omitted", () => {
-    const rel = makeDirty(".planctl/epics/none_session_marker.txt");
+    const rel = makeDirty(".keeper/epics/none_session_marker.txt");
     const sha = autoCommitFromInvocation({
       files: [rel],
       op: "refine-apply",
@@ -288,8 +288,8 @@ describe("autoCommitFromInvocation happy path", () => {
   });
 
   test("out-of-scope dirty file is NOT staged and stays dirty", () => {
-    const inScope = makeDirty(".planctl/epics/scope_in.txt");
-    const outScope = makeDirty(".planctl/epics/scope_out.txt");
+    const inScope = makeDirty(".keeper/epics/scope_in.txt");
+    const outScope = makeDirty(".keeper/epics/scope_out.txt");
     const sha = autoCommitFromInvocation({
       files: [inScope],
       op: "approve",
@@ -315,10 +315,10 @@ describe("autoCommitFromInvocation happy path", () => {
     git(["config", "user.name", "T"], fresh);
     git(["config", "commit.gpgsign", "false"], fresh);
     try {
-      mkdirSync(join(fresh, ".planctl", "epics"), { recursive: true });
-      writeFileSync(join(fresh, ".planctl", "epics", "first.txt"), "x\n");
+      mkdirSync(join(fresh, ".keeper", "epics"), { recursive: true });
+      writeFileSync(join(fresh, ".keeper", "epics", "first.txt"), "x\n");
       const sha = autoCommitFromInvocation({
-        files: [".planctl/epics/first.txt"],
+        files: [".keeper/epics/first.txt"],
         op: "init",
         target: "proj",
         subject: "chore(plan): init proj",
@@ -341,7 +341,7 @@ describe("autoCommitFromInvocation happy path", () => {
 
 describe("autoCommitFromInvocation failure shapes", () => {
   test("missing state_repo but repo_root present → works + warns to stderr", () => {
-    const rel = makeDirty(".planctl/epics/fallback.txt");
+    const rel = makeDirty(".keeper/epics/fallback.txt");
     const sha = autoCommitFromInvocation({
       files: [rel],
       op: "approve",
@@ -356,7 +356,7 @@ describe("autoCommitFromInvocation failure shapes", () => {
     let caught: CommitFailed | null = null;
     try {
       autoCommitFromInvocation({
-        files: [".planctl/epics/no_repo.txt"],
+        files: [".keeper/epics/no_repo.txt"],
         op: "approve",
         target: "fn-587-nr",
         subject: "chore(plan): approve fn-587-nr",
@@ -369,7 +369,7 @@ describe("autoCommitFromInvocation failure shapes", () => {
   });
 
   test("missing subject → CommitFailed(missing_subject)", () => {
-    const rel = makeDirty(".planctl/epics/no_subject.txt");
+    const rel = makeDirty(".keeper/epics/no_subject.txt");
     let caught: CommitFailed | null = null;
     try {
       autoCommitFromInvocation({
@@ -393,7 +393,7 @@ describe("autoCommitFromInvocation failure shapes", () => {
 
 describe("autoCommitFromInvocation sequential + retry", () => {
   test("two back-to-back commits both land with distinct shas", () => {
-    const rel = makeDirty(".planctl/epics/seq1.txt");
+    const rel = makeDirty(".keeper/epics/seq1.txt");
     const sha1 = autoCommitFromInvocation({
       files: [rel],
       op: "approve",
@@ -403,7 +403,7 @@ describe("autoCommitFromInvocation sequential + retry", () => {
       repo_root: repo,
     });
     expect(sha1).not.toBeNull();
-    const rel2 = makeDirty(".planctl/epics/seq2.txt");
+    const rel2 = makeDirty(".keeper/epics/seq2.txt");
     const sha2 = autoCommitFromInvocation({
       files: [rel2],
       op: "approve",
@@ -417,7 +417,7 @@ describe("autoCommitFromInvocation sequential + retry", () => {
   });
 
   test("stale index.lock cleared on first backoff → bounded retry commits", () => {
-    const rel = makeDirty(".planctl/epics/contend.txt");
+    const rel = makeDirty(".keeper/epics/contend.txt");
     const pre = commitCount(repo);
     const lockFile = join(repo, ".git", "index.lock");
     writeFileSync(lockFile, ""); // git add will refuse: "File exists"
@@ -452,7 +452,7 @@ describe("autoCommitFromInvocation sequential + retry", () => {
   });
 
   test("persistent index.lock across all attempts → CommitFailed(commit_contended)", () => {
-    const rel = makeDirty(".planctl/epics/exhaust.txt");
+    const rel = makeDirty(".keeper/epics/exhaust.txt");
     const lockFile = join(repo, ".git", "index.lock");
     writeFileSync(lockFile, "");
     const sleep = (_ms: number): void => {

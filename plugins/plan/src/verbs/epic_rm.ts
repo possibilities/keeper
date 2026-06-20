@@ -366,9 +366,9 @@ export function runEpicRm(args: EpicRmArgs): void {
   );
 }
 
-/** True iff `p` is a tasks/<id>.M.json directly under a data dir (`.keeper/`, or
- * the transient `.planctl/` fallback). Mirrors the Python p.parent.name ==
- * "tasks" and p.parent.parent.name == data-dir check. */
+/** True iff `p` is a tasks/<id>.M.json directly under the `.keeper/` data dir.
+ * Mirrors the Python p.parent.name == "tasks" and p.parent.parent.name ==
+ * data-dir check. */
 function isTaskDefJson(p: string): boolean {
   const parts = resolvePath(p).split("/");
   return (

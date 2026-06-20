@@ -66,8 +66,7 @@ export class ArtifactSchemaTooNewError extends Error {
 }
 
 /** `<primary_repo>/<data-dir>/state/audits` (a pure path — not created here).
- * The data dir resolves `.keeper/` first, then the transient `.planctl/`
- * fallback. */
+ * The data dir is `.keeper/`. */
 export function auditsRoot(primaryRepo: string): string {
   return join(
     resolveDataDirOrDefault(resolveResolved(primaryRepo)),
