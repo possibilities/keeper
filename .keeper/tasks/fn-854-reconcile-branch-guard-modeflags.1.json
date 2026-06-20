@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Reconcile modeFlags short/long parity",
-  "updated_at": "2026-06-20T18:35:55.553000Z"
+  "updated_at": "2026-06-20T18:37:53.521000Z",
+  "worker_done_at": "2026-06-20T18:37:53.521000Z"
 }

@@ -24,5 +24,5 @@ stop hitting a false deny. Net: short and long forms classify identically.
 - [ ] Truth-table regression rows added for copy-create deny and long-form mode allow
 
 ## Done summary
-
+Reconciled branch-guard short/long mode-flag parity: dropped -c/-C from modeFlags so copy-create is blocked (creates a ref — a subagent bypass), added --delete/--move long forms so legitimate non-create commands no longer false-deny. Added truth-table regression rows.
 ## Evidence
