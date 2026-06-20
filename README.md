@@ -1042,14 +1042,18 @@ event-log/reducer/hook touch. Run any of them with
   few jobs that need attention pop.
   **Keybinds:** `j`/`k`/`↓`/`↑` drive a focus cursor keyed on `job_id` (survives
   a re-sort) that swaps the focused card to a HEAVY cyan border and
-  `scrollChildIntoView`s it; `t` toggles ended/killed visibility (default OFF —
-  live jobs only); `q`/Ctrl-C quit.
-  **Data sources:** ONE `subscribeReadiness` connection, with the `jobs`
-  subscription WIDENED to terminal states (`jobsFilter: { state: { not_in: [] }
-  }` — overrides the descriptor's live-only default) so the `t` toggle reveals
-  ended/killed client-side; the view-model gates what renders, not the wire. The
-  dash no longer subscribes `autopilot_state` / `armed_epics` (the card screen
-  reads neither).
+  `scrollChildIntoView`s it; `q`/Ctrl-C quit. (`t` is wired but inert against
+  today's live-only feed — see Data sources.)
+  **Data sources:** ONE `subscribeReadiness` connection. The `jobs` subscription
+  uses the descriptor's live-only default scope (`state not_in [ended, killed]`)
+  capped at a bounded first page (`jobsLimit: 50`, `created_at DESC`) so the
+  snapshot stays under the 1 MiB NDJSON line cap regardless of job-history
+  growth — an unbounded fetch over the full history overruns the line and
+  closes the connection before the first snapshot (the `0 jobs` failure). The
+  `t` toggle / `showTerminal` plumbing is retained but inert against this
+  live-only feed; revealing ended/killed awaits a future bounded terminal page.
+  The dash no longer subscribes `autopilot_state` / `armed_epics` (the card
+  screen reads neither).
   **Frame shape:** a fresh `@opentui/core` app under `src/dash/` — a pure
   view-model builder (`src/dash/view-model.ts`, OpenTUI-free, fast-tier tested)
   plus a materializer (`src/dash/app.ts`) that holds one `BoxRenderable` per

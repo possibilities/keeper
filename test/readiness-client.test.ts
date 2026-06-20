@@ -2608,3 +2608,57 @@ test("fn-775: attempt resets on first RESULT (served), not on socket open (accep
     Math.random = realRandom;
   }
 });
+
+// ---------------------------------------------------------------------------
+// jobsLimit — the dash caps the jobs fetch at a bounded first page so the
+// snapshot's single NDJSON line can never exceed `MAX_LINE_LENGTH`. The four
+// readiness CLI callers pass no `jobsLimit` and MUST stay unbounded.
+// ---------------------------------------------------------------------------
+
+function jobsQuery(frames: unknown[]): { limit?: number; filter?: unknown } {
+  const jobs = frames.find(
+    (f) => (f as { collection?: string }).collection === "jobs",
+  );
+  if (!jobs) {
+    throw new Error("no jobs query in outbound frames");
+  }
+  return jobs as { limit?: number; filter?: unknown };
+}
+
+test("jobsLimit threads into the jobs query limit, no filter", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-jobslimit",
+    onSnapshot: () => {},
+    connect: factory,
+    jobsLimit: 50,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  const q = jobsQuery(sock.takeOutbound());
+  expect(q.limit).toBe(50);
+  // No caller filter → the descriptor's live-only default scope applies.
+  expect(q.filter).toBeUndefined();
+  handle.dispose();
+});
+
+test("absent jobsLimit leaves the jobs query unbounded (limit 0)", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-jobslimit-default",
+    onSnapshot: () => {},
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) {
+    throw new Error("mock socket never installed");
+  }
+  // `?? JOBS_PAGE_LIMIT` (0 = unbounded), the contract the four CLI callers
+  // rely on. A `||` would have coerced a future explicit `0` to the fallback.
+  expect(jobsQuery(sock.takeOutbound()).limit).toBe(0);
+  handle.dispose();
+});

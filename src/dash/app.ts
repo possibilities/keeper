@@ -28,9 +28,9 @@
  * - {@link createDashApp} — the PROCESS shell. Dynamic-imports OpenTUI, builds
  *   the renderer with the proven viewer config (exitOnCtrlC:false, exitSignals
  *   SIGTERM/SIGHUP/SIGQUIT, alternate-screen), attaches the paint layer, wires
- *   the live jobs subscription (`subscribeReadiness`, widened to terminal states
- *   so the `t` toggle reveals ended/killed client-side — the view-model gates
- *   what renders, NOT the wire), the 30s staleness repaint interval, the key
+ *   the live jobs subscription (`subscribeReadiness`, live-only default scope
+ *   capped at a bounded first page so the snapshot stays under the NDJSON line
+ *   cap; the `t` toggle is deferred/inert), the 30s staleness repaint interval, the key
  *   handler, the forked exit triggers, an onFatal override, and
  *   uncaughtException/unhandledRejection handlers — every path routes through
  *   ONE idempotent `exitCleanly` so `renderer.destroy()` ALWAYS precedes
@@ -64,6 +64,13 @@ import { buildDashModel, type CardVM, type DashModel } from "./view-model";
 // One coarse repaint interval for the wall-clock-aged card fields (age label)
 // — 30s (epic-settled). These age off `nowSec`, not data edges.
 const STALE_REFRESH_MS = 30_000;
+
+// Bounded first page for the jobs subscription. The feed serializes the
+// snapshot onto one NDJSON line, so an unbounded fetch over a large job history
+// exceeds the 1 MiB `MAX_LINE_LENGTH` and closes the connection before the
+// first snapshot. 50 (`created_at DESC`) keeps the newest live jobs, well under
+// the line cap.
+const DASH_JOBS_PAGE = 50;
 
 // Card chrome: rounded structure-gray border by default; HEAVY cyan when the
 // focus cursor lands on it. The cyan is the dash accent (bright cyan, index 14
@@ -104,8 +111,9 @@ export interface DashAppRuntime {
 
 /** Options for {@link attachDashApp}. `onQuit` is the caller's teardown tail,
  * invoked on a `q` / Ctrl-C keypress (and idempotent); `onToggleTerminal` is
- * invoked on the `t` keypress so the caller flips `showTerminal` and repaints
- * (the ended/killed visibility lives in the data layer, not the paint layer). */
+ * invoked on the `t` keypress so the caller flips `showTerminal` and repaints.
+ * Inert against today's live-only jobs feed (no ended/killed rows to reveal);
+ * retained for a future bounded terminal page. */
 export interface DashAppOptions {
   readonly onQuit?: () => void;
   readonly onToggleTerminal?: () => void;
@@ -618,10 +626,11 @@ async function defaultBuildRenderer(): Promise<DashRendererBundle> {
  * reactive repaint + the subscription until an exit trigger fires). Read-only:
  * no RPC frame is written, no DB opened.
  *
- * The jobs subscription is WIDENED to terminal states (`state not_in []` —
- * matches everything, overriding the descriptor's live-only default) so the `t`
- * toggle can reveal ended/killed cards client-side without re-subscribing; the
- * view-model gates what actually renders (default: live-only).
+ * The jobs subscription uses the descriptor's live-only default scope (`state
+ * not_in [ended, killed]`), capped at a bounded first page (`created_at DESC`)
+ * so the snapshot stays under the 1 MiB NDJSON line cap. The `t` toggle /
+ * `showTerminal` plumbing is retained but inert against this live-only feed;
+ * re-enabling it awaits a future bounded terminal page.
  *
  * Every dep in {@link DashAppDeps} is injectable so a test can drive the whole
  * shell headless (a `createTestRenderer` renderer, a stub trigger set, a fake
@@ -676,13 +685,14 @@ export async function createDashApp(
   paint();
 
   // The readiness subscription feeds the card model off the live jobs
-  // projection, widened to terminal states so the `t` toggle reveals
-  // ended/killed client-side (`not_in: []` matches everything, overriding the
-  // descriptor's live-only default). The view-model gates what renders.
+  // projection, on the descriptor's default live-only scope (`state not_in
+  // [ended, killed]`), capped at a bounded first page so the snapshot stays
+  // under the 1 MiB NDJSON line cap. The `t` toggle / `showTerminal` is inert
+  // against this live-only feed — a future bounded terminal page re-enables it.
   const readinessHandle = subscribeReadiness({
     sockPath,
     idPrefix: "dash",
-    jobsFilter: { state: { not_in: [] } },
+    jobsLimit: DASH_JOBS_PAGE,
     ...connectOpt,
     onSnapshot: (snap) => {
       inputs.snapshot = snap;

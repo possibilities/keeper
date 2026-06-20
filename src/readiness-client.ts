@@ -1315,13 +1315,21 @@ export interface SubscribeOptions {
   readonly now?: () => number;
   /**
    * Explicit filter for the `jobs` subscription, overriding the descriptor's
-   * default live-only scope (`state not_in [ended, killed]`). The dash passes
-   * `{ state: { not_in: [] } }` ({@link FilterValue} — `not_in: []` matches
-   * everything) to widen the stream to terminal states so a client-side toggle
-   * can reveal ended/killed without re-subscribing. Absent → the default
-   * live-only scope. Only the `jobs` collection is affected.
+   * default live-only scope (`state not_in [ended, killed]`). A
+   * `{ state: { not_in: [] } }` value ({@link FilterValue} — `not_in: []`
+   * matches everything) widens the stream to terminal states. Absent → the
+   * default live-only scope. Only the `jobs` collection is affected. (Server
+   * capability; no current caller passes it.)
    */
   readonly jobsFilter?: Record<string, FilterValue>;
+  /**
+   * Bounded first-page limit for the `jobs` subscription, capping the rows on
+   * the snapshot's single NDJSON line so a large job history can never exceed
+   * the 1 MiB `MAX_LINE_LENGTH`. The feed pages `created_at DESC`, so the cap
+   * keeps the newest jobs. Absent → `JOBS_PAGE_LIMIT` (0 = unbounded), which the
+   * readiness CLI callers rely on. Only the `jobs` collection is affected.
+   */
+  readonly jobsLimit?: number;
 }
 
 /**
@@ -1355,9 +1363,12 @@ export function subscribeReadiness(
     type: "query",
     collection: "jobs",
     id: jobsSubId,
-    limit: JOBS_PAGE_LIMIT,
-    // An explicit caller filter (the dash's widen-to-terminal scope) overrides
-    // the descriptor's default live-only `state not_in [ended, killed]`.
+    // `?? JOBS_PAGE_LIMIT` (0 = unbounded), not `||`: a caller's explicit `0`
+    // must mean unbounded, not coerce to the fallback. The dash caps at a
+    // bounded page to stay under `MAX_LINE_LENGTH`.
+    limit: opts.jobsLimit ?? JOBS_PAGE_LIMIT,
+    // An explicit caller filter overrides the descriptor's default live-only
+    // `state not_in [ended, killed]` scope.
     ...(opts.jobsFilter === undefined ? {} : { filter: opts.jobsFilter }),
   });
   // `subagent_invocations` exposes `job_id` as the wire pk though its SQL
