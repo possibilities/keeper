@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Cap dash jobs fetch via pagination",
-  "updated_at": "2026-06-20T14:09:53.437000Z"
+  "updated_at": "2026-06-20T14:48:55.685000Z",
+  "worker_done_at": "2026-06-20T14:48:55.685000Z"
 }

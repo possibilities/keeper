@@ -71,5 +71,5 @@ In `test/readiness-client.test.ts` (FAST tier) via the `makeMockConnect`/`takeOu
 - [ ] `test/readiness-client.test.ts` asserts the dash query (`limit: 50`, no `filter`) AND default-unbounded (`limit: 0`) when `jobsLimit` is absent; `bun run test:full` green
 
 ## Done summary
-
+Added jobsLimit to SubscribeOptions (?? JOBS_PAGE_LIMIT) and pointed the dash at jobsLimit:50 on the live-only default scope, dropping the unbounded widen that overran MAX_LINE_LENGTH and painted 0 jobs.
 ## Evidence
