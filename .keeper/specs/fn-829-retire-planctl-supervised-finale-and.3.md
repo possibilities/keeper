@@ -25,4 +25,5 @@ Drop the `planctl` binary build/promote from `install.sh` §6d (native `keeper p
 - [ ] buildbot `planctl` builder removed; checkconfig green; master reloaded
 - [ ] Codex `/hack` symlink → subtree; install.sh §4c source correct
 ## Done summary
+
 ## Evidence
