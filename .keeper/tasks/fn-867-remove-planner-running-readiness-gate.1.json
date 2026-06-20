@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Remove planner-running gate, helpers, and pills",
-  "updated_at": "2026-06-20T22:10:16.523000Z"
+  "updated_at": "2026-06-20T23:03:56.163000Z",
+  "worker_done_at": "2026-06-20T23:03:56.163000Z"
 }

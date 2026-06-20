@@ -93,5 +93,5 @@ and run the typecheck to catch any fixture still typed against the dropped membe
 - [ ] Forward-facing doc comments + README mutex prose naming planner-running are scrubbed; a comment at predicate 2 documents it as the retained mid-plan guard.
 
 ## Done summary
-
+Removed the planner-running readiness gate end to end so a validated epic reads ready while its planner/refiner is still working; epic-not-validated is now the sole mid-plan guard. Deleted the predicate, its two helpers, the RunningReason member, and the icon-theme entry; collapsed isRootOccupant to a passthrough; reworked the fn-725 cap test and deleted stale planner-running suites.
 ## Evidence
