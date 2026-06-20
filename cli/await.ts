@@ -452,7 +452,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     } else {
       return {
         ok: false,
-        message: `unknown condition '${condRaw}' (expected complete, unblocked, git-clean, agents-idle, server-up, monitor-running)`,
+        message: `unknown condition '${condRaw}' (expected complete, unblocked, started, git-clean, agents-idle, server-up, monitor-running)`,
       };
     }
   }
