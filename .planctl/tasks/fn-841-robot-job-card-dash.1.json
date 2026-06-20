@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T04:04:51.483000Z",
+  "depends_on": [],
+  "epic": "fn-841-robot-job-card-dash",
+  "id": "fn-841-robot-job-card-dash.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Robot status model and view-model",
+  "updated_at": "2026-06-20T04:04:51.483000Z"
+}
