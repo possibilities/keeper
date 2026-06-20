@@ -42,6 +42,7 @@ import {
   type RetryDispatchVerb,
   validatePromptBytes,
 } from "../src/dispatch-command";
+import type { LaunchResult } from "../src/exec-backend";
 import { resolveExecBackend } from "../src/exec-backend";
 import type { QueryFrame, Row } from "../src/protocol";
 import { queryCollection } from "./control-rpc";
@@ -56,6 +57,29 @@ export type QueryFn = (
   collection: string,
   filter?: QueryFrame["filter"],
 ) => Promise<Row[]>;
+
+/**
+ * The launch seam — `ExecBackend.ensureLaunched`'s signature. Injected into
+ * {@link main} so a launch-path test runs against a fake backend (asserting the
+ * success / `result.ok === false` branches) without spawning a real tmux
+ * window. Defaults to the real `resolveExecBackend(...).ensureLaunched`.
+ */
+export type LaunchFn = (
+  session: string,
+  argv: string[],
+  cwd: string,
+  name?: string,
+) => Promise<LaunchResult>;
+
+/** Injectable seams for {@link main} so integration tests drive the orchestration
+ *  without a daemon socket or a real tmux backend. */
+export interface MainDeps {
+  /** The collection-read transport. Defaults to a real `queryCollection`
+   *  against the resolved socket. */
+  readonly query?: QueryFn;
+  /** The launch backend. Defaults to `resolveExecBackend(...).ensureLaunched`. */
+  readonly launch?: LaunchFn;
+}
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
 
@@ -269,7 +293,7 @@ export function resolveSession(deps: ResolveSessionDeps): {
   return { session: FALLBACK_SESSION, attachHint: !inTmux };
 }
 
-export async function main(argv: string[]): Promise<void> {
+export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   const parsed = parseArgs({
     args: argv,
     options: {
@@ -324,9 +348,11 @@ export async function main(argv: string[]): Promise<void> {
     );
   }
 
-  const backend = resolveExecBackend({
-    noteLine: (line: string) => process.stderr.write(`${line}\n`),
-  });
+  const launch: LaunchFn =
+    deps.launch ??
+    resolveExecBackend({
+      noteLine: (line: string) => process.stderr.write(`${line}\n`),
+    }).ensureLaunched;
 
   let cwd: string;
   let prompt: string;
@@ -341,8 +367,9 @@ export async function main(argv: string[]): Promise<void> {
       argFault(keyResult.error);
     }
     const { verb, id } = keyResult;
-    const query: QueryFn = (collection, filter) =>
-      queryCollection(sockPath, collection, filter);
+    const query: QueryFn =
+      deps.query ??
+      ((collection, filter) => queryCollection(sockPath, collection, filter));
     const cwdResult = await resolvePlanCwd(query, verb, id);
     if (!cwdResult.ok) {
       die(cwdResult.error);
@@ -410,7 +437,7 @@ export async function main(argv: string[]): Promise<void> {
 
   // UNNAMED window (empty `name`): the renamer worker labels plan-form windows
   // from the bound jobs row; free-form windows stay unnamed.
-  const result = await backend.ensureLaunched(session, launchArgv, cwd, "");
+  const result = await launch(session, launchArgv, cwd, "");
   if (!result.ok) {
     die(`launch failed: ${result.error}`);
   }

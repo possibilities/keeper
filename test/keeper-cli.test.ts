@@ -13,6 +13,8 @@
 import { describe, expect, test } from "bun:test";
 import {
   checkRaceGuard,
+  main as dispatchMain,
+  type LaunchFn,
   type QueryFn,
   resolvePlanCwd,
   resolveSession,
@@ -25,6 +27,7 @@ import {
   type Subcommand,
   USAGE,
 } from "../cli/keeper";
+import type { LaunchResult } from "../src/exec-backend";
 import type { Row } from "../src/protocol";
 
 class ExitError extends Error {
@@ -397,5 +400,205 @@ describe("cli/dispatch resolveSession", () => {
       probeCurrentSession: () => "current",
     });
     expect(r).toEqual({ session: "current", attachHint: false });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// cli/dispatch main() — end-to-end integration over the orchestration: the
+// arg-fault exit-2 branches, the free-form prompt-file/validate paths, and the
+// dry-run / launch-result branches. `main()` writes to process.{stdout,stderr}
+// and calls process.exit() directly, so `runMain` patches those globals around
+// the call (exit → throws a tagged ExitError so the never-return branches stop
+// the function), captures the streams, and restores in a finally. The launch
+// seam is injected via MainDeps so the launch-path tests run with a fake backend
+// — no real tmux. The query seam is likewise injected for plan-form coverage.
+// ---------------------------------------------------------------------------
+
+interface MainRun {
+  /** Captured exit code (undefined if main returned without exiting). */
+  code: number | undefined;
+  stdout: string;
+  stderr: string;
+}
+
+/** Drive `dispatchMain(argv, deps)` with process.{exit,stdout,stderr} captured. */
+async function runMain(
+  argv: string[],
+  deps?: { query?: QueryFn; launch?: LaunchFn },
+): Promise<MainRun> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const realOut = process.stdout.write.bind(process.stdout);
+  const realErr = process.stderr.write.bind(process.stderr);
+  const realExit = process.exit.bind(process);
+  let code: number | undefined;
+  process.stdout.write = ((s: string | Uint8Array) => {
+    out.push(typeof s === "string" ? s : Buffer.from(s).toString());
+    return true;
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((s: string | Uint8Array) => {
+    err.push(typeof s === "string" ? s : Buffer.from(s).toString());
+    return true;
+  }) as typeof process.stderr.write;
+  process.exit = ((c?: number) => {
+    code = c ?? 0;
+    throw new ExitError(code);
+  }) as typeof process.exit;
+  try {
+    await dispatchMain(argv, deps ?? {});
+  } catch (e) {
+    if (!(e instanceof ExitError)) throw e;
+  } finally {
+    process.stdout.write = realOut;
+    process.stderr.write = realErr;
+    process.exit = realExit;
+  }
+  return { code, stdout: out.join(""), stderr: err.join("") };
+}
+
+/** A LaunchFn recording its call and returning a canned result. */
+function fakeLaunch(result: LaunchResult): {
+  fn: LaunchFn;
+  calls: Array<{ session: string; argv: string[]; cwd: string; name?: string }>;
+} {
+  const calls: Array<{
+    session: string;
+    argv: string[];
+    cwd: string;
+    name?: string;
+  }> = [];
+  const fn: LaunchFn = (session, argv, cwd, name) => {
+    calls.push({ session, argv, cwd, name });
+    return Promise.resolve(result);
+  };
+  return { fn, calls };
+}
+
+describe("cli/dispatch main() arg-fault branches (exit 2)", () => {
+  test("positional + --prompt together → exit 2, modes mutually exclusive", async () => {
+    const r = await runMain(["work::fn-1-x.2", "--prompt", "hi"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("mutually exclusive");
+  });
+
+  test("neither a positional nor a prompt → exit 2, nothing to dispatch", async () => {
+    const r = await runMain([]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("nothing to dispatch");
+  });
+
+  test("--prompt + --prompt-file together → exit 2", async () => {
+    const r = await runMain([
+      "--prompt",
+      "hi",
+      "--prompt-file",
+      "/tmp/x",
+      "--name",
+      "n",
+    ]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain(
+      "--prompt and --prompt-file are mutually exclusive",
+    );
+  });
+
+  test("more than one positional → exit 2", async () => {
+    const r = await runMain(["work::fn-1-x.2", "close::fn-2-y"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("exactly one");
+  });
+});
+
+describe("cli/dispatch main() free-form prompt-file / validate", () => {
+  test("--prompt-file read failure → die (exit 1)", async () => {
+    const r = await runMain([
+      "--prompt-file",
+      "/no/such/dispatch/prompt/file",
+      "--name",
+      "n",
+    ]);
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("cannot read --prompt-file");
+  });
+
+  test("validatePromptBytes rejection through main → exit 2", async () => {
+    // A NUL byte trips validatePromptBytes; it must surface as an arg fault.
+    const r = await runMain(["--prompt", "bad\0prompt", "--name", "n"]);
+    expect(r.code).toBe(2);
+    expect(r.stderr).toContain("NUL byte");
+  });
+});
+
+describe("cli/dispatch main() dry-run / launch-result branches", () => {
+  test("--dry-run prints the resolved plan and exits 0, launching nothing", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const r = await runMain(
+      [
+        "--prompt",
+        "hello",
+        "--name",
+        "manual",
+        "--session",
+        "scratch",
+        "--cwd",
+        "/work/dir",
+        "--dry-run",
+      ],
+      { launch: launch.fn },
+    );
+    expect(r.code).toBe(0);
+    expect(launch.calls).toEqual([]);
+    expect(r.stdout).toContain("session:     scratch");
+    expect(r.stdout).toContain("cwd:         /work/dir");
+    expect(r.stdout).toContain("name:         manual");
+    expect(r.stdout).toContain("prompt-from: --prompt");
+    expect(r.stdout).toContain("argv:");
+  });
+
+  test("successful launch → invokes the backend and reports dispatched", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const r = await runMain(
+      ["--prompt", "go", "--name", "manual", "--session", "scratch"],
+      { launch: launch.fn },
+    );
+    expect(r.code).toBeUndefined();
+    expect(launch.calls).toHaveLength(1);
+    expect(launch.calls[0]?.session).toBe("scratch");
+    expect(r.stdout).toContain("dispatched manual → session scratch");
+  });
+
+  test("failed launch (result.ok === false) → die (exit 1)", async () => {
+    const launch = fakeLaunch({ ok: false, error: "tmux is dead" });
+    const r = await runMain(
+      ["--prompt", "go", "--name", "manual", "--session", "scratch"],
+      { launch: launch.fn },
+    );
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("launch failed: tmux is dead");
+  });
+
+  test("plan-form dry-run resolves cwd via the injected query seam", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const query: QueryFn = (collection) =>
+      Promise.resolve(
+        collection === "epics"
+          ? [
+              {
+                epic_id: "fn-1-foo",
+                project_dir: "/epic/dir",
+                tasks: [{ task_id: "fn-1-foo.2", target_repo: "/task/repo" }],
+              },
+            ]
+          : [],
+      );
+    const r = await runMain(
+      ["work::fn-1-foo.2", "--session", "scratch", "--force", "--dry-run"],
+      { query, launch: launch.fn },
+    );
+    expect(r.code).toBe(0);
+    expect(launch.calls).toEqual([]);
+    expect(r.stdout).toContain("cwd:         /task/repo");
+    expect(r.stdout).toContain("key:         work::fn-1-foo.2");
+    expect(r.stdout).toContain("prompt-from: plan");
   });
 });
