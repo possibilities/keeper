@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] arthack `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+git mv .planctl -> .keeper in arthack; updated path refs in root CLAUDE.md and .keeper/CLAUDE.md. Plan reads from .keeper/ (verified via keeper plan list).
 ## Evidence
