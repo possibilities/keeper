@@ -764,6 +764,80 @@ test("jobs has a nullable title column and no mode/title_history columns", () =>
   db.close();
 });
 
+test("v73→v74 shed: relocated shed-class mutation_path captured from event_blobs before DROP", () => {
+  // Regression for the fn-836.4 hardening: the destructive v74 shed must capture
+  // a RELOCATED shed-class row's `tool_input.file_path` into `mutation_path` from
+  // `event_blobs` BEFORE dropping the table. The runtime backfill pass reads only
+  // inline `events.data` (post-shed there is no side table), so a relocated body
+  // (`data IS NULL`, file_path only in `event_blobs`, `mutation_path` NULL) is
+  // unrecoverable once dropped — the exact shape a from-scratch 0→v74 migrate
+  // hits before that runtime pass has ever run.
+
+  // Build a v74 DB, then rewind it to the v73-with-event_blobs state the shed
+  // migrates FROM.
+  {
+    const { db } = openDb(dbPath);
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, data)
+       VALUES (1, 's1', 'PostToolUse', 'tool_use', 'Edit',
+               '{"tool_input":{"file_path":"/repo/shed.ts"}}')`,
+    );
+    db.run(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, tool_name, data)
+       VALUES (2, 's1', 'PostToolUse', 'tool_use', 'Bash',
+               '{"tool_response":{"stdout":"keep-me"}}')`,
+    );
+    db.close();
+  }
+  {
+    const raw = new Database(dbPath);
+    raw.run(
+      "CREATE TABLE IF NOT EXISTS event_blobs (event_id INTEGER PRIMARY KEY, data TEXT NOT NULL)",
+    );
+    // Relocate every body into event_blobs, NULL the inline data + shed-class
+    // mutation_path, and stamp version 73 — the pre-shed shape.
+    raw.run(
+      "INSERT INTO event_blobs (event_id, data) SELECT id, data FROM events WHERE data IS NOT NULL",
+    );
+    raw.run("UPDATE events SET data = NULL, mutation_path = NULL");
+    raw.run("UPDATE meta SET value = '73' WHERE key = 'schema_version'");
+    raw.close();
+  }
+
+  // Re-migrate 73→74: restore keep-set inline, capture shed-class mutation_path
+  // from event_blobs, then DROP.
+  const { db } = openDb(dbPath);
+  const ver = (
+    db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get() as {
+      value: string;
+    }
+  ).value;
+  const shed = db
+    .prepare("SELECT data, mutation_path FROM events WHERE tool_name = 'Edit'")
+    .get() as { data: string | null; mutation_path: string | null };
+  const keep = db
+    .prepare("SELECT data FROM events WHERE tool_name = 'Bash'")
+    .get() as { data: string | null };
+  const blobsGone =
+    (
+      db
+        .prepare(
+          "SELECT COUNT(*) AS n FROM sqlite_master WHERE type='table' AND name='event_blobs'",
+        )
+        .get() as { n: number }
+    ).n === 0;
+  db.close();
+
+  expect(ver).toBe(String(SCHEMA_VERSION));
+  // shed-class: file_path captured into mutation_path BEFORE the DROP; body shed.
+  expect(shed.mutation_path).toBe("/repo/shed.ts");
+  expect(shed.data).toBeNull();
+  // keep-class: body restored inline.
+  expect(keep.data).toBe('{"tool_response":{"stdout":"keep-me"}}');
+  // side table dropped.
+  expect(blobsGone).toBe(true);
+});
+
 test("v3 DB migrates to v4: spawn_name + title_source added, rows preserved NULL", () => {
   // Build a v3-shaped DB by hand: events without spawn_name, jobs without
   // title_source, version '3'.

@@ -3636,6 +3636,44 @@ function migrate(db: Database): void {
                   AND tool_name IN ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
               )`,
         );
+        // CAPTURE shed-class `mutation_path` from `event_blobs` BEFORE the DROP —
+        // the safety the runtime backfill pass CANNOT provide. That pass extracts
+        // from inline `events.data` only (post-shed there is no side table to
+        // COALESCE), so a RELOCATED shed-class body (`data IS NULL`, file_path only
+        // in `event_blobs`) is unrecoverable once the table is gone. On a
+        // from-scratch 0->v74 migrate the runtime pass has never run, so every
+        // shed-class `mutation_path` is NULL here; dropping `event_blobs` without
+        // this step would permanently lose `tool_input.file_path` and break the
+        // git-attribution re-fold. `COALESCE(events.data, event_blobs.data)` with
+        // the SAME guarded extract the runtime pass + the ARM scan use ⇒ the column
+        // value is byte-identical regardless of which populated it. Idempotent: the
+        // `mutation_path IS NULL` guard no-ops where the runtime pass already
+        // completed before the v74 restart, and a malformed body folds to NULL (the
+        // fold reads NULL either way — re-fold-deterministic).
+        db.run(
+          `UPDATE events
+              SET mutation_path = (
+                  CASE WHEN json_valid(
+                           COALESCE(
+                               events.data,
+                               (SELECT data FROM event_blobs
+                                 WHERE event_blobs.event_id = events.id)
+                           )
+                       )
+                       THEN json_extract(
+                           COALESCE(
+                               events.data,
+                               (SELECT data FROM event_blobs
+                                 WHERE event_blobs.event_id = events.id)
+                           ),
+                           '$.tool_input.file_path'
+                       )
+                  END
+              )
+            WHERE hook_event = 'PostToolUse'
+              AND tool_name IN ('Write', 'Edit', 'MultiEdit', 'NotebookEdit')
+              AND mutation_path IS NULL`,
+        );
       }
       // DROP UNCONDITIONALLY at the tail — the `approvals` precedent (v12→v13).
       // The v57 ladder step (`db.run(CREATE_EVENT_BLOBS)`) recreates the table on

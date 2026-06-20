@@ -285,14 +285,18 @@ test("no fold-path reader touches the dropped event_blobs table; every body read
   // Migration-internal event_blobs sites in db.ts stay (historical/destructive,
   // NOT fold-path): the v67 Commit-trailer backfill `LEFT JOIN event_blobs` (1)
   // + the v74 tail restore's two `FROM event_blobs` subqueries (the keep-set
-  // restore SELECT + its EXISTS guard) = 3. The v57 ladder CREATE and the tail
-  // DROPs are not JOIN/FROM-reads of a body, so they don't count.
+  // restore SELECT + its EXISTS guard) (2) + the v74 tail mutation_path-capture's
+  // two `FROM event_blobs` subqueries (the json_valid + json_extract COALESCE that
+  // rescues a relocated shed-class `tool_input.file_path` into `mutation_path`
+  // BEFORE the DROP — the fn-836 hardening) (2) = 5. All run during migrate(),
+  // before the unconditional tail DROP; none is a fold-path read. The v57 ladder
+  // CREATE and the tail DROPs are not JOIN/FROM body-reads, so they don't count.
   expect({
     file: "src/db.ts",
     n: countSqlJoins("src/db.ts"),
   }).toEqual({
     file: "src/db.ts",
-    n: 3,
+    n: 5,
   });
 });
 
