@@ -23,5 +23,5 @@ clean afterward and the tests still pass.
 - [ ] both test files pass biome format (format-only, tests still green); commit-work no longer trips on them
 
 ## Done summary
-
+Both named test files (resume-descriptor, subagent-invocations) already pass biome check with no fixes needed; format debt was already clean. No-op format task — tree clean, no source commit needed. The lint failure in test/plan-contract.test.ts is out of scope for this task.
 ## Evidence
