@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T03:50:17.729000Z",
+  "depends_on": [],
+  "epic": "fn-839-flip-planctl-producer-envelope-and",
+  "id": "fn-839-flip-planctl-producer-envelope-and.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "flip producer envelope and promote planctl",
+  "updated_at": "2026-06-20T03:50:17.729000Z"
+}
