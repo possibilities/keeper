@@ -162,6 +162,14 @@ autopilot completion-reap closes done plan rows, while the exit-watcher's
 dead-pid re-probe (`reprobeLoop` in `src/exit-watcher.ts`, ~60s, age-gated on
 `created_at >= 5 min`) mints a synthetic `Killed` for a job whose worker pid is
 verifiably gone — the kernel-arm-miss backstop, not a tmux/window reaper.
+The never-bound circuit breaker (`dispatch_never_bound`, v76) folds a per-`(verb,
+id)` consecutive-`DispatchExpired`-without-bind counter in `foldDispatchExpired`;
+at K=3 it mints a sticky `dispatch_failures(reason='never-bound')` the existing
+`failedKeys` arm suppresses. A bind (discharge-on-bind) and a `DispatchCleared`
+(`keeper autopilot retry`) each reset it — bump/reset come PURELY from the event
+stream (never wall-clock), and it joins the re-fold wipe list, so re-fold stays
+byte-identical. Do NOT carry the count on the `pending_dispatches` row: that row
+is DELETEd on expire to release the re-dispatch slot.
 
 ## Out of scope
 

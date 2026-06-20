@@ -313,6 +313,15 @@ from pathlib import Path
 # the version stamp, no cursor rewind, re-fold byte-identical). keeper-py reads no
 # ``file_attributions.source`` (the TUI subscribes over the socket), so no reader
 # logic changes — only the version whitelist gains 75.
+#
+# v76 (fn-846 task .1) adds the never-bound dispatch circuit breaker: a new
+# ``dispatch_never_bound`` reducer projection (per-``(verb, id)`` consecutive-
+# ``DispatchExpired``-without-bind counter) whose fold mints a sticky
+# ``dispatch_failures(reason='never-bound')`` at K=3, suppressed by the existing
+# ``failedKeys`` arm and cleared by ``keeper autopilot retry``. New table only, no
+# cursor rewind, re-fold byte-identical. keeper-py reads neither the new table nor
+# ``dispatch_failures`` (the TUI subscribes over the socket), so no reader logic
+# changes — only the version whitelist gains 76.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -360,6 +369,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         73,
         74,
         75,
+        76,
     }
 )
 

@@ -1565,6 +1565,229 @@ test("from-scratch re-fold reproduces the pending_dispatches projection byte-ide
 });
 
 // ---------------------------------------------------------------------------
+// Schema v76 (fn-846) — `dispatch_never_bound` reducer projection + the
+// never-bound circuit breaker. `foldDispatchExpired` increments a per-`(verb,
+// id)` consecutive-`DispatchExpired`-without-bind counter; at K=3 it mints a
+// sticky `dispatch_failures(reason='never-bound')` the `failedKeys` arm
+// suppresses. A successful bind (discharge-on-bind) and a `DispatchCleared`
+// (`keeper autopilot retry`) each reset the counter. All folds pure (no
+// `Date.now`, no env, no liveness) — a from-scratch re-fold is byte-identical.
+// ---------------------------------------------------------------------------
+
+function getNeverBoundCounter(verb: string, id: string) {
+  return db
+    .query("SELECT * FROM dispatch_never_bound WHERE verb = ? AND id = ?")
+    .get(verb, id) as {
+    verb: string;
+    id: string;
+    consecutive_expired: number;
+    last_event_id: number;
+  } | null;
+}
+
+test("K=3 consecutive DispatchExpired without a bind mints DispatchFailed(never-bound) and clears the counter (fn-846)", () => {
+  // Each expire bumps the counter; the failure does NOT exist until the
+  // K-th expire trips the breaker.
+  dispatchExpiredEvent("work", "fn-846-loop.1");
+  drainAll();
+  expect(
+    getNeverBoundCounter("work", "fn-846-loop.1")?.consecutive_expired,
+  ).toBe(1);
+  expect(getDispatchFailure("work", "fn-846-loop.1")).toBeNull();
+
+  dispatchExpiredEvent("work", "fn-846-loop.1");
+  drainAll();
+  expect(
+    getNeverBoundCounter("work", "fn-846-loop.1")?.consecutive_expired,
+  ).toBe(2);
+  expect(getDispatchFailure("work", "fn-846-loop.1")).toBeNull();
+
+  // The K-th (3rd) expire trips the breaker: a sticky never-bound failure is
+  // minted AND the counter is cleared (so a post-retry re-arm starts at zero).
+  const tripId = dispatchExpiredEvent("work", "fn-846-loop.1");
+  drainAll();
+  const failure = getDispatchFailure("work", "fn-846-loop.1");
+  expect(failure).not.toBeNull();
+  expect(failure?.reason).toBe("never-bound");
+  expect(failure?.dir).toBeNull();
+  expect(failure?.last_event_id).toBe(tripId);
+  expect(getNeverBoundCounter("work", "fn-846-loop.1")).toBeNull();
+});
+
+test("a successful bind between expires resets the counter to 0 — the breaker never trips (fn-846)", () => {
+  // Two expires, then a bind, then two more expires. Without the reset the
+  // 3rd cumulative expire would trip; with it, the bind zeroes the count so
+  // the post-bind run only reaches 2 — no never-bound failure.
+  dispatchExpiredEvent("work", "fn-846-bind.1");
+  dispatchExpiredEvent("work", "fn-846-bind.1");
+  drainAll();
+  expect(
+    getNeverBoundCounter("work", "fn-846-bind.1")?.consecutive_expired,
+  ).toBe(2);
+
+  // Successful bind (discharge-on-bind spawn-INSERT) resets the counter.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-846-bind",
+    spawn_name: "work::fn-846-bind.1",
+  });
+  drainAll();
+  expect(getNeverBoundCounter("work", "fn-846-bind.1")).toBeNull();
+
+  // Two more expires only reach 2 — below K, so no failure.
+  dispatchExpiredEvent("work", "fn-846-bind.1");
+  dispatchExpiredEvent("work", "fn-846-bind.1");
+  drainAll();
+  expect(
+    getNeverBoundCounter("work", "fn-846-bind.1")?.consecutive_expired,
+  ).toBe(2);
+  expect(getDispatchFailure("work", "fn-846-bind.1")).toBeNull();
+});
+
+test("bound-then-died does NOT trip the breaker — a single bind clears any prior count (fn-846)", () => {
+  // A worker that binds once (SessionStart) then dies is the exit-watcher's
+  // path, not never-bound. The bind reset means even a prior near-miss count
+  // is wiped, so a later death never contributes to a never-bound trip.
+  dispatchExpiredEvent("work", "fn-846-died.1");
+  dispatchExpiredEvent("work", "fn-846-died.1");
+  drainAll();
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-846-died",
+    spawn_name: "work::fn-846-died.1",
+  });
+  // The worker dies (synthetic Killed) — irrelevant to the never-bound counter.
+  killedEvent(4242, null, "sess-846-died");
+  drainAll();
+  expect(getNeverBoundCounter("work", "fn-846-died.1")).toBeNull();
+  expect(getDispatchFailure("work", "fn-846-died.1")).toBeNull();
+});
+
+test("DispatchCleared (keeper autopilot retry) clears BOTH the never-bound failure and the counter (fn-846)", () => {
+  // Trip the breaker, then retry. The clear path must DELETE the
+  // dispatch_failures row (so failedKeys stops suppressing) AND zero the
+  // counter (so the next dispatch cycle re-arms from 0, not from K).
+  dispatchExpiredEvent("work", "fn-846-retry.1");
+  dispatchExpiredEvent("work", "fn-846-retry.1");
+  dispatchExpiredEvent("work", "fn-846-retry.1");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-846-retry.1")?.reason).toBe(
+    "never-bound",
+  );
+
+  dispatchClearedEvent("work", "fn-846-retry.1");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-846-retry.1")).toBeNull();
+  expect(getNeverBoundCounter("work", "fn-846-retry.1")).toBeNull();
+
+  // Re-armed from zero: a single post-retry expire is far below K — no
+  // immediate re-trip.
+  dispatchExpiredEvent("work", "fn-846-retry.1");
+  drainAll();
+  expect(
+    getNeverBoundCounter("work", "fn-846-retry.1")?.consecutive_expired,
+  ).toBe(1);
+  expect(getDispatchFailure("work", "fn-846-retry.1")).toBeNull();
+});
+
+test("a Dispatched re-dispatch between expires PRESERVES the counter — the loop still trips at K (fn-846)", () => {
+  // The real never-bound loop: expire → re-dispatch → expire → re-dispatch →
+  // expire. The Dispatched UPSERT only touches pending_dispatches, NOT the
+  // counter, so three consecutive expires (with re-dispatches but NO bind)
+  // still trip the breaker.
+  dispatchedEvent("work", "fn-846-cycle.1", "/r", 1700);
+  dispatchExpiredEvent("work", "fn-846-cycle.1");
+  dispatchedEvent("work", "fn-846-cycle.1", "/r", 1800);
+  dispatchExpiredEvent("work", "fn-846-cycle.1");
+  dispatchedEvent("work", "fn-846-cycle.1", "/r", 1900);
+  dispatchExpiredEvent("work", "fn-846-cycle.1");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-846-cycle.1")?.reason).toBe(
+    "never-bound",
+  );
+});
+
+test("DispatchExpired with a malformed payload does NOT touch dispatch_never_bound (cursor still advances) (fn-846)", () => {
+  const malformed = [
+    { hook_event: "DispatchExpired", data: "{ not json" },
+    { hook_event: "DispatchExpired", data: JSON.stringify({}) },
+    { hook_event: "DispatchExpired", data: JSON.stringify({ verb: "v" }) },
+  ];
+  let lastId = 0;
+  for (const ev of malformed) {
+    lastId = insertEvent({
+      hook_event: ev.hook_event,
+      session_id: "reconciler",
+      data: ev.data,
+    });
+  }
+  expect(drainAll()).toBe(malformed.length);
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM dispatch_never_bound").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+  expect(getCursor()).toBe(lastId);
+});
+
+test("zero-event projection: a fresh DB has zero dispatch_never_bound rows (fn-846)", () => {
+  const count = (
+    db.query("SELECT COUNT(*) AS n FROM dispatch_never_bound").get() as {
+      n: number;
+    }
+  ).n;
+  expect(count).toBe(0);
+});
+
+test("from-scratch re-fold reproduces dispatch_never_bound + the never-bound failure byte-identically (fn-846)", () => {
+  // A representative sequence exercising every counter arm:
+  // - increment below K (a key that never trips)
+  // - bind reset (a key whose count zeroes mid-stream)
+  // - K-th expire mint + counter clear (a key that trips)
+  // - retry clear (a tripped key cleared, then re-armed)
+  dispatchExpiredEvent("work", "fn-846-rf-a.1"); // a: 1
+  dispatchExpiredEvent("work", "fn-846-rf-b.1"); // b: 1
+  dispatchExpiredEvent("work", "fn-846-rf-b.1"); // b: 2
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: "sess-rf-b",
+    spawn_name: "work::fn-846-rf-b.1",
+  }); // b: reset (gone)
+  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: 1
+  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: 2
+  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: 3 → trip + clear counter
+  dispatchClearedEvent("work", "fn-846-rf-c.1"); // c: failure + counter cleared
+  dispatchExpiredEvent("work", "fn-846-rf-c.1"); // c: re-armed → 1
+  dispatchExpiredEvent("work", "fn-846-rf-b.1"); // b (post-reset): 1
+  drainAll();
+
+  const counterBefore = db
+    .query("SELECT * FROM dispatch_never_bound ORDER BY verb ASC, id ASC")
+    .all();
+  const failuresBefore = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+
+  // Rewind cursor + wipe every projection these folds touch + re-drain.
+  db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+  db.run("DELETE FROM dispatch_never_bound");
+  db.run("DELETE FROM dispatch_failures");
+  db.run("DELETE FROM pending_dispatches");
+  db.run("DELETE FROM jobs");
+  drainAll();
+
+  const counterAfter = db
+    .query("SELECT * FROM dispatch_never_bound ORDER BY verb ASC, id ASC")
+    .all();
+  const failuresAfter = db
+    .query("SELECT * FROM dispatch_failures ORDER BY verb ASC, id ASC")
+    .all();
+  expect(counterAfter).toEqual(counterBefore);
+  expect(failuresAfter).toEqual(failuresBefore);
+});
+
+// ---------------------------------------------------------------------------
 // Schema v47 (fn-667) — `autopilot_state` singleton reducer projection. Main
 // mints `AutopilotPaused{paused:boolean}` events (steady-state via the
 // `set_autopilot_paused` RPC bridge, boot via the daemon's boot-append

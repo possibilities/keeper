@@ -3417,7 +3417,10 @@ function foldDispatchFailed(db: Database, event: Event): void {
 /**
  * Fold one synthetic `DispatchCleared` event. Idempotent DELETE on `(verb, id)`
  * — the ONLY legal clear path (a direct DELETE outside the fold arm would break
- * re-fold determinism). Malformed/missing payload → safe no-op.
+ * re-fold determinism). Clears BOTH the sticky `dispatch_failures` row AND the
+ * never-bound `dispatch_never_bound` counter so a `keeper autopilot retry`
+ * re-arms the breaker from zero (a residual count would re-trip after one expire
+ * instead of K). Malformed/missing payload → safe no-op.
  */
 function foldDispatchCleared(db: Database, event: Event): void {
   const payload = extractDispatchClearedPayload(event);
@@ -3425,6 +3428,10 @@ function foldDispatchCleared(db: Database, event: Event): void {
     return;
   }
   db.run("DELETE FROM dispatch_failures WHERE verb = ? AND id = ?", [
+    payload.verb,
+    payload.id,
+  ]);
+  db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
     payload.verb,
     payload.id,
   ]);
@@ -3547,10 +3554,40 @@ function foldDispatched(db: Database, event: Event): void {
 }
 
 /**
- * Fold one synthetic `DispatchExpired` event. Idempotent DELETE on `(verb, id)`
- * — MUST NOT throw on a missing row (a boot-drain race where `SessionStart`
- * already discharged the row before the sweep's `DispatchExpired` lands would
- * otherwise wedge the reducer). Malformed/missing payload → safe no-op.
+ * Never-bound circuit-breaker threshold: after K CONSECUTIVE
+ * `DispatchExpired`-without-bind events for one `(verb, id)`, the fold mints a
+ * sticky `dispatch_failures(reason='never-bound')` the existing `failedKeys` arm
+ * suppresses. A successful bind (or a `retry_dispatch` clear) resets the count,
+ * so a worker that binds even once never trips it ("bound-then-died" is the
+ * exit-watcher's path, not this). Tunable: 2 = more aggressive.
+ */
+const NEVER_BOUND_EXPIRE_THRESHOLD = 3;
+
+/** Stable reason string for the never-bound circuit-breaker failure. */
+const NEVER_BOUND_REASON = "never-bound";
+
+/**
+ * Fold one synthetic `DispatchExpired` event. Two arms, both pure functions of
+ * the event stream (no `Date.now`, no env, no liveness re-probe):
+ *
+ *  1. The idempotent `pending_dispatches` DELETE — UNCHANGED. It releases the
+ *     re-dispatch slot so a normally-slow (in-doubt) launch can re-dispatch.
+ *     MUST NOT throw on a missing row (a boot-drain race where `SessionStart`
+ *     already discharged the row before the sweep's `DispatchExpired` lands would
+ *     otherwise wedge the reducer).
+ *
+ *  2. The never-bound circuit breaker — increment the per-`(verb, id)`
+ *     consecutive-expire counter in `dispatch_never_bound` (the count CANNOT live
+ *     on the just-deleted `pending_dispatches` row, hence its own table). At
+ *     `NEVER_BOUND_EXPIRE_THRESHOLD` mint a sticky
+ *     `dispatch_failures(reason='never-bound')` via the same UPSERT shape as
+ *     {@link foldDispatchFailed}, which the `failedKeys` arm suppresses. The mint
+ *     is keyed-by-pk with `created_at`/`ts` lifted from `event.ts` (re-fold
+ *     deterministic), and ALSO clears the counter so a post-retry re-arm starts
+ *     fresh. The counter resets to zero (DELETE) on a successful bind (the
+ *     SessionStart discharge-on-bind gate) and on `DispatchCleared`.
+ *
+ * Malformed/missing payload → safe no-op.
  */
 function foldDispatchExpired(db: Database, event: Event): void {
   const payload = extractDispatchExpiredPayload(event);
@@ -3561,6 +3598,61 @@ function foldDispatchExpired(db: Database, event: Event): void {
     payload.verb,
     payload.id,
   ]);
+  // Increment the consecutive-no-bind counter. UPSERT keyed on `(verb, id)`:
+  // first expire INSERTs `1`, each subsequent expire (with no intervening bind /
+  // clear, which would have DELETEd the row) bumps it. `last_event_id` tracks the
+  // latest expire for the re-fold cursor view.
+  db.run(
+    `INSERT INTO dispatch_never_bound (verb, id, consecutive_expired, last_event_id)
+       VALUES (?, ?, 1, ?)
+     ON CONFLICT(verb, id) DO UPDATE SET
+       consecutive_expired = dispatch_never_bound.consecutive_expired + 1,
+       last_event_id = excluded.last_event_id`,
+    [payload.verb, payload.id, event.id],
+  );
+  const counter = db
+    .query(
+      "SELECT consecutive_expired FROM dispatch_never_bound WHERE verb = ? AND id = ?",
+    )
+    .get(payload.verb, payload.id) as { consecutive_expired: number } | null;
+  if (
+    counter != null &&
+    counter.consecutive_expired >= NEVER_BOUND_EXPIRE_THRESHOLD
+  ) {
+    // Mint the sticky failure via the SAME UPSERT shape as `foldDispatchFailed`
+    // (reason='never-bound' satisfies the non-empty extractor; dir is unknown at
+    // expire time → NULL). `created_at` preserved on conflict so the "sticky
+    // since" view is the first never-bound mint. Event-payload-free: `ts` /
+    // `created_at` / `updated_at` all come from `event.ts`, keeping the fold
+    // re-fold-deterministic.
+    db.run(
+      `INSERT INTO dispatch_failures (
+         verb, id, reason, dir, ts, last_event_id, created_at, updated_at
+       ) VALUES (?, ?, ?, NULL, ?, ?, ?, ?)
+       ON CONFLICT(verb, id) DO UPDATE SET
+         reason = excluded.reason,
+         dir = excluded.dir,
+         ts = excluded.ts,
+         last_event_id = excluded.last_event_id,
+         updated_at = excluded.updated_at`,
+      [
+        payload.verb,
+        payload.id,
+        NEVER_BOUND_REASON,
+        event.ts,
+        event.id,
+        event.ts,
+        event.ts,
+      ],
+    );
+    // Clear the counter: the breaker has tripped and the sticky failure now owns
+    // suppression. A `retry_dispatch` (`DispatchCleared`) clears the failure; the
+    // counter must start fresh on the next dispatch cycle, not at the threshold.
+    db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
+      payload.verb,
+      payload.id,
+    ]);
+  }
 }
 
 /**
@@ -6329,6 +6421,16 @@ function projectJobsRow(db: Database, event: Event): void {
           plan_ref != null
         ) {
           db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
+            plan_verb,
+            plan_ref,
+          ]);
+          // Never-bound circuit-breaker reset: a successful bind for this pair
+          // zeroes the consecutive-no-bind counter (DELETE), so a bind between
+          // expires never trips the breaker and a "bound-then-died" worker (whose
+          // death is the exit-watcher's path) never counts toward never-bound.
+          // Same discharge gate as the pending DELETE above — fires on spawn-
+          // INSERT or NULL->non-NULL heal, never on a genuine resume. Idempotent.
+          db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
             plan_verb,
             plan_ref,
           ]);

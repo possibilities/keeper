@@ -47,7 +47,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 75;
+export const SCHEMA_VERSION = 76;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -844,6 +844,32 @@ CREATE TABLE IF NOT EXISTS pending_dispatches (
 `;
 
 /**
+ * `dispatch_never_bound` projection table — the never-bound circuit breaker's
+ * per-`(verb, id)` consecutive-`DispatchExpired`-without-bind counter. A worker
+ * the reconciler dispatches that spawns but never binds (no SessionStart for the
+ * pair) TTL-expires, re-dispatches, expires again — forever. This row holds the
+ * consecutive-expire count: `foldDispatchExpired` increments it (the
+ * `pending_dispatches` DELETE that releases the re-dispatch slot is UNCHANGED, so
+ * the count CANNOT live on that deleted row), and at K mints a sticky
+ * `dispatch_failures(reason='never-bound')` the existing `failedKeys` arm
+ * suppresses. RESET to zero (DELETE) on a successful bind (the SessionStart
+ * discharge-on-bind gate) and on `DispatchCleared` (the `keeper autopilot retry`
+ * clear path) — so a bind between expires never trips the breaker, and a retry
+ * clears both the failure and the count. A reducer projection (re-fold reset
+ * DELETE list); `last_event_id` is an event id, never wallclock, so the fold is
+ * re-fold-deterministic. Row PRESENCE is incidental — the count is the signal.
+ */
+const CREATE_DISPATCH_NEVER_BOUND = `
+CREATE TABLE IF NOT EXISTS dispatch_never_bound (
+    verb TEXT NOT NULL,
+    id TEXT NOT NULL,
+    consecutive_expired INTEGER NOT NULL,
+    last_event_id INTEGER NOT NULL,
+    PRIMARY KEY (verb, id)
+)
+`;
+
+/**
  * `epic_tombstones` projection table — a permanent "this epic was deleted"
  * record minted by `EpicDeleted` and cleared by a re-creating `EpicSnapshot`.
  * Every epic-shell-INSERT site consults it and skips the resurrection when a
@@ -1556,6 +1582,7 @@ function migrate(db: Database): void {
       }
       db.run(CREATE_EVENT_INGEST_OFFSETS);
       db.run(CREATE_PENDING_DISPATCHES);
+      db.run(CREATE_DISPATCH_NEVER_BOUND);
       db.run(CREATE_EPIC_TOMBSTONES);
       // `event_blobs` is HISTORICAL (fn-836.4 shed): NOT created in the
       // steady-state schema-setup block, so a post-shed boot never resurrects
@@ -2921,6 +2948,7 @@ function migrate(db: Database): void {
         db.run("DELETE FROM dispatch_failures");
         db.run("DELETE FROM autopilot_state");
         db.run("DELETE FROM pending_dispatches");
+        db.run("DELETE FROM dispatch_never_bound");
         db.run("DELETE FROM armed_epics");
         db.run("DELETE FROM builds");
       }
@@ -3708,6 +3736,22 @@ function migrate(db: Database): void {
           "UPDATE file_attributions SET source = 'plan' WHERE source = 'planctl'",
         );
       }
+
+      // v75→v76 (fn-846 task .1): the never-bound dispatch circuit breaker —
+      // comment-only no-op. The `dispatch_never_bound` reducer projection (a
+      // per-`(verb, id)` consecutive-`DispatchExpired`-without-bind counter the
+      // widened `foldDispatchExpired` increments, minting a sticky
+      // `dispatch_failures(reason='never-bound')` at K so the existing
+      // `failedKeys` arm suppresses the redispatch loop a never-binding worker
+      // would otherwise drive forever) is created above and populates from the
+      // fold arms; the version stamp needs a slot. A reducer projection (in the
+      // rewind-and-redrain DELETE list). NO cursor rewind: a from-scratch re-fold
+      // replays the same `DispatchExpired` / bind / `DispatchCleared` stream and
+      // re-derives byte-identical counter rows (empty on a pre-feature log).
+      // Whitelist-only Python read (keeper-py never reads this table) — this bump
+      // MUST add 76 to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME
+      // commit, or every keeper-py read fails host-wide; test/schema-version.test.ts
+      // enforces this.
 
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",

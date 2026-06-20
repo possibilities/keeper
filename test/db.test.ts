@@ -2136,9 +2136,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // the `file_attributions.source` CHECK to accept `'plan'`, fn-826; v73 adds
   // the `events.mutation_path` column, fn-836.2; v74 restores keep-set bodies
   // inline + DROPs `event_blobs`, fn-836.4; v75 rewrites stored
-  // `file_attributions.source='planctl'` rows to `'plan'`, fn-831); the v62→v63
-  // epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(75);
+  // `file_attributions.source='planctl'` rows to `'plan'`, fn-831; v76 adds the
+  // `dispatch_never_bound` circuit-breaker projection table, fn-846); the
+  // v62→v63 epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(76);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

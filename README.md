@@ -2106,6 +2106,24 @@ server-side in the daemon. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
 gains `42`
 (whitelist-only; keeper-py reads `jobs` / `git_status` / `meta`, not
 `dispatch_failures`).
+As of schema v76 (fn-846), a never-bound circuit breaker closes the original
+pile-up amplifier: a worker the reconciler dispatches that SPAWNS but never
+BINDS (no `SessionStart` for its `(verb, id)` pair) used to TTL-expire,
+re-dispatch, and expire again forever. The new `dispatch_never_bound`
+projection table (keyed `(verb, id)`) folds a per-pair consecutive-
+`DispatchExpired`-without-bind counter: `foldDispatchExpired` increments it (the
+`pending_dispatches` DELETE that releases the re-dispatch slot is UNCHANGED, so
+the count lives on its own row, not the deleted pending row), and at K=3 mints a
+sticky `dispatch_failures(reason='never-bound')` the EXISTING `failedKeys` arm
+suppresses — no readiness or retry-worker change. A successful bind (the
+discharge-on-bind gate) and a `DispatchCleared` (`keeper autopilot retry`) each
+reset the counter to zero, so a bind between expires never trips the breaker and
+a "bound-then-died" worker (the exit-watcher's path) never counts toward
+never-bound. The bump/reset fold purely from the `DispatchExpired` + bind +
+`DispatchCleared` event stream (no wall clock), so a from-scratch re-fold is
+byte-identical (empty table on a pre-v76 log). keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `76` (whitelist-only; keeper-py
+reads neither `dispatch_never_bound` nor `dispatch_failures`).
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`
