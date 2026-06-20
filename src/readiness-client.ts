@@ -1313,6 +1313,15 @@ export interface SubscribeOptions {
   readonly giveUpPolicy?: GiveUpPolicy;
   /** Injectable clock for the give-up deadline (default `Date.now`). */
   readonly now?: () => number;
+  /**
+   * Explicit filter for the `jobs` subscription, overriding the descriptor's
+   * default live-only scope (`state not_in [ended, killed]`). The dash passes
+   * `{ state: { not_in: [] } }` ({@link FilterValue} — `not_in: []` matches
+   * everything) to widen the stream to terminal states so a client-side toggle
+   * can reveal ended/killed without re-subscribing. Absent → the default
+   * live-only scope. Only the `jobs` collection is affected.
+   */
+  readonly jobsFilter?: Record<string, FilterValue>;
 }
 
 /**
@@ -1347,6 +1356,9 @@ export function subscribeReadiness(
     collection: "jobs",
     id: jobsSubId,
     limit: JOBS_PAGE_LIMIT,
+    // An explicit caller filter (the dash's widen-to-terminal scope) overrides
+    // the descriptor's default live-only `state not_in [ended, killed]`.
+    ...(opts.jobsFilter === undefined ? {} : { filter: opts.jobsFilter }),
   });
   // `subagent_invocations` exposes `job_id` as the wire pk though its SQL
   // identity is composite, so `byId` collapses re-entrant sub-agents in one

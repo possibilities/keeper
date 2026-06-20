@@ -10,10 +10,10 @@
  * and `process.exit` / stderr / `process.on` via recorders so nothing escapes
  * into the runner. We then assert: the `exited` idempotency flag (the teardown
  * tail runs ONCE across repeated triggers), `app.destroy()` (renderer.destroy)
- * precedes the `exit` call, the three subscription handles + the elapsed
- * interval + the triggers are all disposed/disarmed on teardown, and that the
- * `onFatalError` net (uncaughtException) routes through the same restore-then-
- * exit tail with exit code 1 and a stderr write.
+ * precedes the `exit` call, the single readiness subscription connection + the
+ * elapsed interval + the triggers are all disposed/disarmed on teardown, and
+ * that the `onFatalError` net (uncaughtException) routes through the same
+ * restore-then-exit tail with exit code 1 and a stderr write.
  *
  * F5 — exit-trigger fork parity. `src/dash/exit-triggers.ts` is a verbatim fork
  * of `src/view-shell.ts`'s `armViewerExitTriggers`. We pin it two ways: dedicated
@@ -81,7 +81,8 @@ interface ShellRig {
   fireUncaught: (err: unknown) => void;
   /** Disarm-call count on the injected trigger set. */
   disarmCount: () => number;
-  /** How many of the three subscription sockets have been torn down. */
+  /** How many subscription sockets have been torn down (one — the single
+   * readiness connection). */
   socketTeardownCount: () => number;
   /** stderr writes captured on the fatal path. */
   stderrWrites: string[];
@@ -127,10 +128,10 @@ async function bootShell(): Promise<ShellRig> {
     };
   };
 
-  // Each of the three subscriptions connects to a controllable fake socket
+  // The single readiness subscription connects to a controllable fake socket
   // that records its own teardown. `dispose()` (run inside the exit tail) writes
   // an unsubscribe frame and hard-destroys the socket via `end()`/`terminate()`,
-  // so counting torn-down sockets proves all three handles were disposed.
+  // so counting torn-down sockets proves the handle was disposed.
   let socketTeardowns = 0;
   const connect: ConnectFactory = async (_path, handlers) => {
     const sock = {
@@ -219,9 +220,9 @@ test("createDashApp: clean exit destroys the renderer before exit(0)", async () 
   expect(destroyIdx).toBeGreaterThanOrEqual(0);
   expect(exitIdx).toBeGreaterThanOrEqual(0);
   expect(destroyIdx).toBeLessThan(exitIdx);
-  // The triggers are disarmed and all three subscription sockets torn down.
+  // The triggers are disarmed and the readiness subscription socket torn down.
   expect(rig.disarmCount()).toBe(1);
-  expect(rig.socketTeardownCount()).toBe(3);
+  expect(rig.socketTeardownCount()).toBe(1);
 });
 
 test("createDashApp: the exit tail is idempotent across repeated triggers", async () => {
@@ -256,9 +257,9 @@ test("createDashApp: onFatalError routes through restore-then-exit with code 1 +
   // The error text surfaces on the now-cooked stderr.
   expect(rig.stderrWrites.join("")).toContain("boom");
   expect(rig.stderrWrites.join("")).toContain("keeper dash: fatal");
-  // Triggers disarmed + all three sockets torn down on the fatal path too.
+  // Triggers disarmed + the readiness socket torn down on the fatal path too.
   expect(rig.disarmCount()).toBe(1);
-  expect(rig.socketTeardownCount()).toBe(3);
+  expect(rig.socketTeardownCount()).toBe(1);
   // No `exit:0` — the clean tail must not have fired.
   expect(rig.events).not.toContain("exit:0");
 });

@@ -34,8 +34,14 @@ Options:
 
 dash is a live, TTY-ONLY screen — there is NO snapshot mode. A non-TTY stdout
 (piped, redirected, CI) exits 1 with 'keeper dash: requires a TTY'. The screen
-reconnects forever, showing connection state in-TUI; q / Ctrl-C quit. It is
-read-only — no dispatch, no control, no DB open.
+reconnects forever, showing connection state in-TUI.
+
+Keys:
+  j / k / ↓ / ↑   move the card focus cursor (heavy cyan border)
+  t               toggle ended/killed cards (default OFF — live jobs only)
+  q / Ctrl-C      quit
+
+It is read-only — no dispatch, no control, no DB open.
 `;
 
 export async function main(argv: string[]): Promise<void> {

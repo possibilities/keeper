@@ -106,8 +106,10 @@ export function colorForRole(role: Role): ColorDescriptor {
  * (which tags the text segments of the legacy board view) because the ladder
  * needs DIM variants of the success/failed/gray hues — `idle-ended` rides green
  * dim, `idle-killed` red dim, `idle-stopped` gray dim — that the text-role map
- * does not carry. The materializer (task `.2`) feeds the index to
- * `RGBA.fromIndex` and layers `dim` as a paint attribute.
+ * does not carry. The dash materializer (`./app.ts`) feeds the index to
+ * `RGBA.fromIndex`, picks the rail glyph weight off `dim` (thin bar for the
+ * receded idle rungs, solid for the attention rungs), and layers `dim` as a
+ * paint attribute.
  */
 export type RailRole =
   | "error"

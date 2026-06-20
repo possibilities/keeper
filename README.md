@@ -1022,47 +1022,56 @@ event-log/reducer/hook touch. Run any of them with
   keeper usage | tail -1      # last line is the parseable keeper-meta JSON record
   ```
 
-- `dash.ts` — v1 of the unified keeper TUI (fn-780): a minimal, read-only
-  OPENING SCREEN unifying the at-a-glance value of `keeper board` + `keeper
-  jobs` + `keeper autopilot` into one frame — a header strip (autopilot
-  play/pause + mode + armed-count, dead-letter count, connection marker), a
-  **PLAN** region (one row per open epic in server `sort_path` order: armed
-  marker, `epic_number title` label, the per-epic readiness verdict, and an
-  `N/M` completed-task count that counts ONLY `completed` perTask verdicts and
-  is hidden at zero tasks), and an **AGENTS** region (EVERY non-terminal session
-  — working AND stopped — on one unified "most-recent-activity-started"
-  timeline; sorted `COALESCE(active_since, created_at)` DESC with a `job_id`
-  tiebreak, so a session rises the moment it starts a run and re-promotes to the
-  top on a genuine restart; needs-you no longer affects ordering. Each row's
-  leading glyph is the per-job rolled-up board icon
-  (working→sync, sub-agent→cogs/warn, monitor→eye/warn, idle→circleO), computed
-  uniformly for plan-linked and ad-hoc jobs via the shared readiness rollup;
-  label `title → plan_ref → job_id`, trailing elapsed band replaced by
-  `awaiting` / `failed` when the session is blocked on a human).
-  **Data sources:** the readiness collections
-  ride one `subscribeReadiness` connection; `autopilot_state` and `armed_epics`
-  ride their own `subscribeCollection` subs (the readiness conn subscribes them
-  internally but does NOT expose them on the snapshot, so the header needs the
-  two extra subs). **Frame shape:** a fresh `@opentui/core` app under `src/dash/`
-  — a pure view-model builder (`src/dash/view-model.ts`, OpenTUI-free, fast-tier
-  tested) plus a thin materializer (`src/dash/app.ts`) that diffs role-tagged
-  segment rows into a stable `Map<rowKey, TextRenderable>` (structural add/remove
-  only on a row-set change; `setContent` otherwise) and colors each segment via
-  `RGBA.fromIndex` so the hue tracks the terminal theme. Reactive render mode (no
-  `renderer.start()`); one coarse 30s interval refreshes the elapsed cells.
+- `dash.ts` — the unified keeper TUI (fn-780; reworked into the robot job-card
+  screen in fn-841): a live, read-only, full-screen SINGLE COLUMN of compact
+  CARDS — one per job (project · title · status) — that replaces the old
+  header+PLAN+AGENTS layout. Each card is a rounded structure-gray bordered box
+  (project name in the border title) with three interior lines: `<rail><robot>
+  <status> · <role> · ◉<subagents>` / `<title>` / `<age> · <session:pane>`.
+  **Status is dual-encoded:** a Nerd Font md-robot face plus a colored left rail,
+  resolved fresh per card from a six-rung ladder where annotations outrank the
+  base state — api-error (robot_angry, red) → awaiting permission/input
+  (robot_confused, yellow) → working (robot, blue) → ended (robot_happy, green
+  dim) → stopped (robot_outline, gray dim) → killed (robot_dead, red dim). The
+  rail is the ONLY color channel; the border is always structure-gray (OpenTUI
+  0.3.0 has no `titleColor`, so the project name in the border inherits border
+  color). Cards group into three urgency BANDS — needs-you / in-motion / idle —
+  each fenced by a dim inline-titled rule (an empty band collapses); within a
+  band, stable `created_at` ASC (`job_id` tiebreak) so a live card never
+  teleports on a metadata tick. The robots make the board calm when idle and the
+  few jobs that need attention pop.
+  **Keybinds:** `j`/`k`/`↓`/`↑` drive a focus cursor keyed on `job_id` (survives
+  a re-sort) that swaps the focused card to a HEAVY cyan border and
+  `scrollChildIntoView`s it; `t` toggles ended/killed visibility (default OFF —
+  live jobs only); `q`/Ctrl-C quit.
+  **Data sources:** ONE `subscribeReadiness` connection, with the `jobs`
+  subscription WIDENED to terminal states (`jobsFilter: { state: { not_in: [] }
+  }` — overrides the descriptor's live-only default) so the `t` toggle reveals
+  ended/killed client-side; the view-model gates what renders, not the wire. The
+  dash no longer subscribes `autopilot_state` / `armed_epics` (the card screen
+  reads neither).
+  **Frame shape:** a fresh `@opentui/core` app under `src/dash/` — a pure
+  view-model builder (`src/dash/view-model.ts`, OpenTUI-free, fast-tier tested)
+  plus a materializer (`src/dash/app.ts`) that holds one `BoxRenderable` per
+  `job:<id>` in a stable `Map<rowKey, RowHandle>` and MUTATES border + child Text
+  content in place every frame (structural detach-then-append only when the keyed
+  band order changes — never add/remove per frame, which would force a full Yoga
+  re-layout). Colors resolve via `RGBA.fromIndex` so the hue tracks the terminal
+  theme. The robot codepoints live in a DASH-LOCAL map; the board/jobs
+  `fa-classic` glyph theme is untouched. Reactive render mode (no
+  `renderer.start()`); one coarse 30s interval refreshes the age cells.
   **TTY-only:** the gate fires in `cli/dash.ts` BEFORE any OpenTUI import — a
   non-TTY stdout exits 1 with `keeper dash: requires a TTY` (no snapshot mode,
   no `keeper-meta:` line). Reconnect-forever with the connection state shown
-  in-TUI (a pre-paint `connecting…` / `reconnecting…` line, then a header marker
-  with the body frozen at last-good once a snapshot has painted). Read-only end
-  to end — no RPC frame is written, no DB opened. q / Ctrl-C quit; j/k/arrows
-  scroll the focused ScrollBox; every exit path (q, Ctrl-C, SIGHUP, stdin-EOF,
+  in-TUI (a pre-paint `connecting…` / `reconnecting…` census line, then the body
+  frozen at last-good once a snapshot has painted). Read-only end to end — no RPC
+  frame is written, no DB opened. Every exit path (q, Ctrl-C, SIGHUP, stdin-EOF,
   the ~2s `ppid === 1` poll, onFatal, uncaughtException/unhandledRejection)
   routes through one idempotent teardown that `renderer.destroy()`s BEFORE
   exiting, so the terminal is never stranded in alt-screen/raw mode.
 
   ```sh
-  keeper dash                 # live screen on a TTY (header + PLAN + AGENTS)
+  keeper dash                 # live robot job-card screen on a TTY
   keeper dash --sock /tmp/x   # socket override
   echo | keeper dash          # non-TTY → 'keeper dash: requires a TTY', exit 1
   ```
@@ -1891,17 +1900,19 @@ board flags armed epics with an `[armed]` pill (both subscribe the new
 `armed_epics` collection over the UDS socket). keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `62` (whitelist-only; keeper-py
 reads neither `autopilot_state` nor `armed_epics`).
-As of schema v65 (fn-784), the nullable `jobs.active_since REAL` column is the
-"most-recent-activity-started" recency key for the `keeper dash` AGENTS unified
-timeline (`COALESCE(active_since, created_at)` DESC). It is stamped to
-`event.ts` ONLY on the rising edge into `working` (the UserPromptSubmit arm's
-`state != 'working'` guard, NOT `active_since IS NULL`), so it re-promotes a
-job on a genuine stopped/terminal→working restart and HOLDS through mid-run
-churn (the explicit `ELSE active_since` branch). The migration adds the column
-NULL with NO backfill — backfilling from `updated_at` ("last touched") would
-conflate it with "run started" and is non-deterministic; a never-prompted job
-stays NULL and sorts by `created_at`. keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
-frozenset gains `65` (whitelist-only; keeper-py does not read `active_since`).
+As of schema v65 (fn-784), the nullable `jobs.active_since REAL` column is a
+"most-recent-activity-started" recency stamp — `event.ts` written ONLY on the
+rising edge into `working` (the UserPromptSubmit arm's `state != 'working'`
+guard, NOT `active_since IS NULL`), so it advances on a genuine
+stopped/terminal→working restart and HOLDS through mid-run churn (the explicit
+`ELSE active_since` branch). The migration adds the column NULL with NO backfill
+— backfilling from `updated_at` ("last touched") would conflate it with "run
+started" and is non-deterministic; a never-prompted job stays NULL. It seeded
+the original `keeper dash` AGENTS timeline ordering; the fn-841 robot job-card
+dash orders cards by `created_at` within urgency bands and no longer reads it, so
+the column is now display/sort metadata only. keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `65` (whitelist-only; keeper-py does
+not read `active_since`).
 As of schema v67 (fn-807), the `commit_trailer_facts` reducer projection
 (`event_id` PK; `committer_session_id` / `planctl_op` / `planctl_target` /
 `planctl_epic_id` / `committed_at_ms`) is the de-blobbed read path for the

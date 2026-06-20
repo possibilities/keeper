@@ -1,36 +1,41 @@
 /**
- * `keeper dash` materializer — the thin OpenTUI layer over the pure view-model
+ * `keeper dash` materializer — the OpenTUI paint layer over the pure view-model
  * (`./view-model.ts`). Two surfaces:
  *
  * - {@link attachDashApp} — the PAINT layer. Builds the stable renderable tree
- *   ONCE (root Box column 100%/100%; census header Text fixed height over a
- *   full-width rule; body ScrollBox flexGrow:1 + viewportCulling, focused on
- *   mount so j/k/arrows scroll natively), and exposes `render(model)` which
- *   flattens the card model's bands into keyed rows (a band-title rule per
- *   non-empty band, then one card line each) and diffs them into a stable
- *   `Map<rowKey, RowHandle>` — content updates in place, structural
- *   add/remove/reorder ONLY when the keyed ORDER changes (Yoga recalc rides
- *   structure, not content). NOTE: this is the THIN bridge task `.1` ships;
- *   task `.2` replaces it with real boxed cards (rail-colored left border, robot
- *   glyph slot, heavy-cyan focus border, the `t`/`j`/`k` keybinds). The runtime
- *   OpenTUI ctors are THREADED IN so this module carries a type-only
- *   `@opentui/core` import — the same inertness contract `src/live-shell.ts`'s
- *   `attachLiveShellPaint` keeps, so an unrelated test importing the pure
- *   view-model never trips OpenTUI's racy native loader. Exported so
- *   `test/dash-app.test.ts` mounts the same scene against `createTestRenderer`
- *   without forking the renderer-construction code.
+ *   ONCE (root column = census header `Text` over a full-width rule + a
+ *   flexGrow:1 `ScrollBox` body) and exposes `render(model)`, which paints the
+ *   card model as a single column of robot-faced CARDS. Each band contributes a
+ *   dim full-width rule (titled inline, structure-gray) followed by its cards;
+ *   an empty band collapses (no rule). Each card is one `BoxRenderable` per
+ *   `job:<id>` — rounded structure-gray border, project name in the border
+ *   title, three interior `Text` lines (`<rail><robot> <status> · <role> ·
+ *   ◉<count>` / `<title>` / `<age> · <session:pane>`). The left RAIL glyph
+ *   carries the status color (the only color channel; the border is always
+ *   structure-gray). A `j`/`k`/arrows focus cursor keyed on `job_id` swaps the
+ *   focused card to a HEAVY cyan border and `scrollChildIntoView`s it; `t`
+ *   toggles ended/killed visibility through the caller. Nodes are MUTATED in
+ *   place across frames (`borderColor`/`borderStyle`/child Text content);
+ *   structural detach-then-append fires ONLY when the keyed band order changes,
+ *   so Yoga recalc rides structure, not content. The runtime OpenTUI ctors are
+ *   THREADED IN so this module carries only a type-only `@opentui/core` import —
+ *   the same inertness contract `src/live-shell.ts`'s `attachLiveShellPaint`
+ *   keeps, so an unrelated test importing the pure view-model never trips
+ *   OpenTUI's racy native loader. Exported so `test/dash-app.test.ts` mounts the
+ *   same scene against `createTestRenderer` without forking the
+ *   renderer-construction code.
  *
  * - {@link createDashApp} — the PROCESS shell. Dynamic-imports OpenTUI, builds
  *   the renderer with the proven viewer config (exitOnCtrlC:false, exitSignals
  *   SIGTERM/SIGHUP/SIGQUIT, alternate-screen), attaches the paint layer, wires
- *   the subscriptions (subscribeReadiness for the live jobs projection, plus the
- *   autopilot_state + armed_epics collection subs whose edges still trigger
- *   repaints) into one current-inputs struct, the 30s staleness repaint
- *   interval, the q/Ctrl-C key handler, the forked exit triggers, an onFatal
- *   override, and uncaughtException/unhandledRejection handlers — every path
- *   routes through ONE idempotent `exitCleanly` so `renderer.destroy()` ALWAYS
- *   precedes `process.exit` (OpenTUI does NOT auto-restore the terminal on
- *   exit/uncaught). Reactive mode — never `renderer.start()`.
+ *   the live jobs subscription (`subscribeReadiness`, widened to terminal states
+ *   so the `t` toggle reveals ended/killed client-side — the view-model gates
+ *   what renders, NOT the wire), the 30s staleness repaint interval, the key
+ *   handler, the forked exit triggers, an onFatal override, and
+ *   uncaughtException/unhandledRejection handlers — every path routes through
+ *   ONE idempotent `exitCleanly` so `renderer.destroy()` ALWAYS precedes
+ *   `process.exit` (OpenTUI does NOT auto-restore the terminal on exit/uncaught).
+ *   Reactive mode — never `renderer.start()`.
  *
  * Read-only end to end: no RPC frame is ever written, no DB is opened.
  */
@@ -46,7 +51,6 @@ import type {
 import {
   type ConnectFactory,
   type ReadinessClientSnapshot,
-  subscribeCollection,
   subscribeReadiness,
 } from "../readiness-client";
 import { armViewerExitTriggers } from "./exit-triggers";
@@ -57,24 +61,30 @@ import {
 } from "./theme";
 import { buildDashModel, type CardVM, type DashModel } from "./view-model";
 
-/**
- * A thin flattened paint row — task `.1` ships the pure `{ header, bands }` card
- * MODEL; this is the minimal bridge that paints it through the existing
- * keyed-row diff. Task `.2` replaces this with real boxed cards (rail color,
- * robot glyph slot, heavy-cyan focus border, the `t`/`j`/`k` keybinds). A
- * `band` row is the urgency-band title rule; a `card` row is one job line.
- */
-type PaintRow =
-  | { readonly kind: "band"; readonly key: string; readonly title: string }
-  | {
-      readonly kind: "card";
-      readonly key: string;
-      readonly card: CardVM;
-    };
-
 // One coarse repaint interval for the wall-clock-aged card fields (age label)
 // — 30s (epic-settled). These age off `nowSec`, not data edges.
 const STALE_REFRESH_MS = 30_000;
+
+// Card chrome: rounded structure-gray border by default; HEAVY cyan when the
+// focus cursor lands on it. The cyan is the dash accent (bright cyan, index 14
+// — mirrors `theme.ts` ROLE_COLORS.accent and board-render's `96` SGR).
+const FOCUS_COLOR_INDEX = 14;
+
+// The left RAIL glyphs — the lone status color channel. Solid bar for the
+// attention rungs (error/awaiting/working), thin bar for the receded idle
+// rungs, so the rail's WEIGHT reinforces the dim/bright lightness split.
+const RAIL_SOLID = "▌";
+const RAIL_THIN = "▏";
+
+// The running-subagent count marker (a small filled lozenge). Dropped when the
+// card has zero running sub-agents.
+const SUBAGENT_MARKER = "◉";
+
+// A card is a bordered box (2 rows of border) over 3 interior content lines.
+const CARD_HEIGHT = 5;
+// Cap the column width so cards stay readable on a wide terminal — full-width
+// up to this, then centered slack.
+const CARD_MAX_WIDTH = 80;
 
 /**
  * Runtime exports from `@opentui/core` that {@link attachDashApp} needs to
@@ -93,9 +103,12 @@ export interface DashAppRuntime {
 }
 
 /** Options for {@link attachDashApp}. `onQuit` is the caller's teardown tail,
- * invoked on a `q` / Ctrl-C keypress (and idempotent). */
+ * invoked on a `q` / Ctrl-C keypress (and idempotent); `onToggleTerminal` is
+ * invoked on the `t` keypress so the caller flips `showTerminal` and repaints
+ * (the ended/killed visibility lives in the data layer, not the paint layer). */
 export interface DashAppOptions {
   readonly onQuit?: () => void;
+  readonly onToggleTerminal?: () => void;
 }
 
 /** The paint handle. `render(model)` diffs a fresh view-model into the stable
@@ -120,24 +133,38 @@ interface BuiltChunk {
   attributes?: number;
 }
 
-/** One mounted body row: the outer node plus, for card rows, the two Text
- * children whose content updates in place. A key never changes kind, so the
- * handle's shape is fixed for its lifetime. */
-interface RowHandle {
-  readonly kind: PaintRow["kind"];
+/** A flattened paint row: a `band` is the dim urgency-band rule (titled inline);
+ * a `card` is one job's bordered card. The view-model's per-frame order drives
+ * the structural diff. */
+type PaintRow =
+  | { readonly kind: "band"; readonly key: string; readonly title: string }
+  | { readonly kind: "card"; readonly key: string; readonly card: CardVM };
+
+/** One mounted card: the bordered box plus its three interior Text lines, all
+ * mutated in place across frames. */
+interface CardHandle {
+  readonly kind: "card";
   readonly node: BoxRenderableType;
-  readonly left?: TextRenderableType;
-  readonly right?: TextRenderableType;
+  readonly line1: TextRenderableType;
+  readonly line2: TextRenderableType;
+  readonly line3: TextRenderableType;
 }
+
+/** One mounted band rule (no interior text — the title rides the box border). */
+interface BandHandle {
+  readonly kind: "band";
+  readonly node: BoxRenderableType;
+}
+
+type RowHandle = CardHandle | BandHandle;
 
 /**
  * Build the renderable scene + the row-diffing `render`. Column layout: a
- * fixed-height header Text pinned at the top, a full-width rule under it, and
- * a flexGrow:1 ScrollBox body filling the rest. The body holds the
- * view-model's keyed rows — split content lines (left text + right-aligned
- * dim metadata) and dividers — each a stable handle in `rowNodes` so a
- * re-render diffs content in place; structural add/remove/reorder fires only
- * when the keyed ORDER changes.
+ * fixed-height census header Text pinned at the top, a full-width rule under it,
+ * and a flexGrow:1 ScrollBox body filling the rest. The body holds the
+ * view-model's bands as dim rule rows + one bordered card per job, each a stable
+ * handle in `rowNodes` so a re-render mutates content/border in place;
+ * structural detach-then-append fires only when the keyed ORDER changes.
  *
  * Production: called from {@link createDashApp}'s async renderer setup.
  * Tests: called against a `createTestRenderer` result.
@@ -150,6 +177,7 @@ export function attachDashApp(
   let destroyed = false;
   const { RGBA, TextAttributes } = runtime;
   const structureColor = RGBA.fromIndex(STRUCTURE_COLOR_INDEX);
+  const focusColor = RGBA.fromIndex(FOCUS_COLOR_INDEX);
 
   // Resolve a color descriptor to its renderable fg (absent index → default
   // foreground) plus the descriptor's DIM/BOLD attributes.
@@ -167,8 +195,7 @@ export function attachDashApp(
     return chunk;
   }
 
-  // A single default-fg text run → a StyledText (the header census + plain
-  // labels). Task `.2` layers the rail color per card.
+  // A single default-fg text run → a StyledText (the header census).
   function plainText(text: string): StyledTextType {
     return new runtime.StyledText([chunkFor(text, {})]);
   }
@@ -213,58 +240,73 @@ export function attachDashApp(
   root.add(headerRule);
   root.add(body);
   renderer.root.add(root);
-  // Focus the ScrollBox on mount — j/k/arrows are silently dead otherwise.
+  // Focus the ScrollBox on mount — j/k/arrows reach the key handler regardless,
+  // but the ScrollBox owns native wheel/page scroll.
   body.focus();
 
-  // Stable per-row handle map, keyed by the view-model's row keys. Content
-  // diffs in place; membership/order changes restructure (see `render`).
+  // Stable per-row handle map, keyed by the view-model's row keys. Content +
+  // border mutate in place; membership/order changes restructure (see `render`).
   const rowNodes = new Map<string, RowHandle>();
   // The previous frame's ordered key list — reorder detection.
   let lastOrder = "";
+  // The ordered list of CARD keys (band rules excluded) in the last paint — the
+  // j/k cursor walks this, so the focus survives a re-sort (it's keyed on the
+  // job_id, not a positional index).
+  let cardOrder: string[] = [];
+  // The focused card key (job:<id>), or null when nothing is focused. Survives
+  // re-sort because it's the key, not an index; cleared only when the card
+  // leaves the rendered set.
+  let focusedKey: string | null = null;
 
-  function buildHandle(row: PaintRow): RowHandle {
-    switch (row.kind) {
-      case "card": {
-        const node = new runtime.BoxRenderable(renderer, {
-          id: `dash-row-${row.key}`,
-          width: "100%",
-          height: 1,
-          flexDirection: "row",
-          justifyContent: "space-between",
-          paddingLeft: 1,
-          paddingRight: 1,
-        });
-        const left = new runtime.TextRenderable(renderer, {
-          id: `dash-row-${row.key}-l`,
-          height: 1,
-          content: "",
-        });
-        const right = new runtime.TextRenderable(renderer, {
-          id: `dash-row-${row.key}-r`,
-          height: 1,
-          content: "",
-        });
-        node.add(left);
-        node.add(right);
-        return { kind: "card", node, left, right };
-      }
-      case "band":
-        return {
-          kind: "band",
-          node: new runtime.BoxRenderable(renderer, {
-            id: `dash-row-${row.key}`,
-            width: "100%",
-            height: 1,
-            border: ["top"],
-            borderColor: structureColor,
-          }),
-        };
-    }
+  function buildCardHandle(key: string): CardHandle {
+    const node = new runtime.BoxRenderable(renderer, {
+      id: `dash-row-${key}`,
+      width: "100%",
+      maxWidth: CARD_MAX_WIDTH,
+      height: CARD_HEIGHT,
+      flexDirection: "column",
+      borderStyle: "rounded",
+      border: true,
+      borderColor: structureColor,
+      paddingLeft: 1,
+      paddingRight: 1,
+    });
+    const line1 = new runtime.TextRenderable(renderer, {
+      id: `dash-row-${key}-1`,
+      height: 1,
+      content: "",
+    });
+    const line2 = new runtime.TextRenderable(renderer, {
+      id: `dash-row-${key}-2`,
+      height: 1,
+      content: "",
+    });
+    const line3 = new runtime.TextRenderable(renderer, {
+      id: `dash-row-${key}-3`,
+      height: 1,
+      content: "",
+    });
+    node.add(line1);
+    node.add(line2);
+    node.add(line3);
+    return { kind: "card", node, line1, line2, line3 };
   }
 
-  // Flatten the band model into the thin paint-row stream: a band-title rule
-  // per NON-EMPTY band (an empty band collapses), then its cards. Task `.2`
-  // replaces this with per-band sections of real boxed cards.
+  function buildBandHandle(key: string): BandHandle {
+    return {
+      kind: "band",
+      node: new runtime.BoxRenderable(renderer, {
+        id: `dash-row-${key}`,
+        width: "100%",
+        height: 1,
+        border: ["top"],
+        borderColor: structureColor,
+      }),
+    };
+  }
+
+  // Flatten the band model into the paint-row stream: a band-title rule per
+  // NON-EMPTY band (an empty band collapses), then its cards.
   function flatten(model: DashModel): PaintRow[] {
     const rows: PaintRow[] = [];
     for (const b of model.bands) {
@@ -279,22 +321,58 @@ export function attachDashApp(
     return rows;
   }
 
-  // A card line: the robot glyph (rail-colored) + a space slot, then the title.
-  // The right side carries the dim project basename. Task `.2` moves the rail
-  // color to a left border and adds the focus/heavy-border channel.
-  function cardLeft(card: CardVM): StyledTextType {
+  // Card line 1: the rail + robot glyph (both status-colored), a space slot,
+  // then the dim status word · role · running-subagent count. The robot glyph
+  // sits in the same status-colored run as the rail; the metadata recedes (dim).
+  function cardLine1(card: CardVM): StyledTextType {
     const rail = colorForRail(card.railRole);
-    return new runtime.StyledText([
-      chunkFor(`${card.robotGlyph} `, rail),
-      chunkFor(card.title, {}),
-    ]);
+    const railGlyph = rail.dim === true ? RAIL_THIN : RAIL_SOLID;
+    const chunks: BuiltChunk[] = [
+      chunkFor(`${railGlyph}${card.robotGlyph} `, rail),
+    ];
+    const meta: string[] = [card.statusWord];
+    if (card.roleLabel !== "") {
+      meta.push(card.roleLabel);
+    }
+    if (card.subagentCount > 0) {
+      meta.push(`${SUBAGENT_MARKER}${card.subagentCount}`);
+    }
+    chunks.push(chunkFor(meta.join(" · "), { dim: true }));
+    return new runtime.StyledText(chunks);
+  }
+
+  // Card line 2: the job title in the terminal default foreground (the one line
+  // that must stay legible at full intensity).
+  function cardLine2(card: CardVM): StyledTextType {
+    return new runtime.StyledText([chunkFor(card.title, {})]);
+  }
+
+  // Card line 3: the dim age · session coordinate footer.
+  function cardLine3(card: CardVM): StyledTextType {
+    const parts = [card.ageLabel];
+    if (card.sessionLabel !== "") {
+      parts.push(card.sessionLabel);
+    }
+    return new runtime.StyledText([chunkFor(parts.join(" · "), { dim: true })]);
+  }
+
+  // Paint a card's focus chrome: HEAVY cyan border when focused, rounded
+  // structure-gray otherwise. Idempotent — safe to call every frame.
+  function applyFocusChrome(handle: CardHandle, focused: boolean): void {
+    if (focused) {
+      handle.node.borderStyle = "heavy";
+      handle.node.borderColor = focusColor;
+    } else {
+      handle.node.borderStyle = "rounded";
+      handle.node.borderColor = structureColor;
+    }
   }
 
   function render(model: DashModel): void {
     if (destroyed) {
       return;
     }
-    // One column of left margin, matching the body rows' Box padding (Text
+    // One column of left margin, matching the body cards' border inset (Text
     // ignores padding options, so the margin is a literal space chunk).
     header.content = plainText(` ${model.header}`);
 
@@ -303,17 +381,41 @@ export function attachDashApp(
     // Ensure every wanted row exists with current content. New nodes mount
     // detached; the order pass below attaches them in position.
     const wantKeys: string[] = [];
+    const nextCardOrder: string[] = [];
     for (const row of paintRows) {
       wantKeys.push(row.key);
       let handle = rowNodes.get(row.key);
       if (handle === undefined) {
-        handle = buildHandle(row);
+        handle =
+          row.kind === "card"
+            ? buildCardHandle(row.key)
+            : buildBandHandle(row.key);
         rowNodes.set(row.key, handle);
       }
-      if (row.kind === "card" && handle.left && handle.right) {
-        handle.left.content = cardLeft(row.card);
-        handle.right.content = plainText(row.card.project);
+      // Update the band title in place (it rides the box border).
+      if (row.kind === "band" && handle.kind === "band") {
+        handle.node.title = row.title;
       }
+      if (row.kind === "card" && handle.kind === "card") {
+        nextCardOrder.push(row.key);
+        // The project name rides the border title (inherits border color —
+        // OpenTUI 0.3.0 has no titleColor, so status color lives only in the
+        // rail, never the border/title).
+        handle.node.title = row.card.project;
+        handle.line1.content = cardLine1(row.card);
+        handle.line2.content = cardLine2(row.card);
+        handle.line3.content = cardLine3(row.card);
+      }
+    }
+    cardOrder = nextCardOrder;
+
+    // The focus cursor: clear it if the focused card left the set; seed it onto
+    // the first card when nothing is focused but cards exist.
+    if (focusedKey !== null && !cardOrder.includes(focusedKey)) {
+      focusedKey = null;
+    }
+    if (focusedKey === null && cardOrder.length > 0) {
+      focusedKey = cardOrder[0] ?? null;
     }
 
     // Structural prune: drop any node whose key is no longer wanted.
@@ -327,9 +429,9 @@ export function attachDashApp(
     }
 
     // Order sync: when the ordered key list changed (membership OR position),
-    // re-attach every wanted node in model order. Detach-then-append keeps
-    // each node alive (only `destroy` frees it); content-only frames skip
-    // this entirely so Yoga recalc rides structure, not content.
+    // re-attach every wanted node in model order. Detach-then-append keeps each
+    // node alive (only `destroy` frees it); content-only frames skip this so
+    // Yoga recalc rides structure, not content.
     const orderSig = wantKeys.join("\n");
     if (orderSig !== lastOrder) {
       for (const key of wantKeys) {
@@ -347,6 +449,51 @@ export function attachDashApp(
       lastOrder = orderSig;
     }
 
+    // Apply focus chrome to every card AFTER the structural pass (a re-attached
+    // node keeps its ctor-default border until repainted).
+    for (const key of cardOrder) {
+      const handle = rowNodes.get(key);
+      if (handle?.kind === "card") {
+        applyFocusChrome(handle, key === focusedKey);
+      }
+    }
+
+    renderer.requestRender();
+  }
+
+  // Move the focus cursor by `delta` steps through the rendered card order
+  // (keyed on job_id, so it survives a re-sort), keep the focused card in view,
+  // and repaint the border swap.
+  function moveFocus(delta: number): void {
+    if (cardOrder.length === 0) {
+      return;
+    }
+    const cur = focusedKey === null ? -1 : cardOrder.indexOf(focusedKey);
+    // From "nothing focused", j lands on the first card, k on the last.
+    let next: number;
+    if (cur === -1) {
+      next = delta > 0 ? 0 : cardOrder.length - 1;
+    } else {
+      next = Math.min(Math.max(cur + delta, 0), cardOrder.length - 1);
+    }
+    const nextKey = cardOrder[next] ?? null;
+    if (nextKey === focusedKey) {
+      return;
+    }
+    focusedKey = nextKey;
+    for (const key of cardOrder) {
+      const handle = rowNodes.get(key);
+      if (handle?.kind === "card") {
+        applyFocusChrome(handle, key === focusedKey);
+      }
+    }
+    if (focusedKey !== null) {
+      const handle = rowNodes.get(focusedKey);
+      if (handle !== undefined) {
+        // Nearest-edge scroll; a no-op if already visible (no key-repeat jitter).
+        body.scrollChildIntoView(handle.node.id);
+      }
+    }
     renderer.requestRender();
   }
 
@@ -362,14 +509,26 @@ export function attachDashApp(
     }
   }
 
-  // q / Ctrl-C → caller teardown. Other keys fall through to the focused
-  // ScrollBox (j/k/arrows scroll natively).
+  // Key handler: q/Ctrl-C → caller teardown; j/down + k/up → move the focus
+  // cursor; t → caller's terminal-visibility toggle.
   renderer.keyInput.on("keypress", (key) => {
     if (destroyed) {
       return;
     }
     if (key.name === "q" || (key.ctrl && key.name === "c")) {
       opts.onQuit?.();
+      return;
+    }
+    if (key.name === "j" || key.name === "down") {
+      moveFocus(1);
+      return;
+    }
+    if (key.name === "k" || key.name === "up") {
+      moveFocus(-1);
+      return;
+    }
+    if (key.name === "t") {
+      opts.onToggleTerminal?.();
     }
   });
 
@@ -386,9 +545,9 @@ export function attachDashApp(
 // Process shell
 // ---------------------------------------------------------------------------
 
-/** The mutable current-inputs struct the subscriptions feed; each edge rebuilds
+/** The mutable current-inputs struct the subscription feeds; each edge rebuilds
  * the card model off the latest snapshot. `showTerminal` rides the ended/killed
- * visibility toggle (task `.2` wires the keybind that flips it). */
+ * visibility toggle the `t` keybind flips. */
 interface CurrentInputs {
   snapshot: ReadinessClientSnapshot | null;
   showTerminal: boolean;
@@ -416,7 +575,7 @@ export interface DashAppDeps {
   readonly armExitTriggers?: (exitCleanly: () => void) => {
     disarm: () => void;
   };
-  /** Socket connect for the three subscriptions. Default: the real UDS connect. */
+  /** Socket connect for the subscription. Default: the real UDS connect. */
   readonly connect?: ConnectFactory;
   /** Process exit. Default: `process.exit`. Tests inject a thrower. */
   readonly exit?: (code: number) => void;
@@ -456,8 +615,13 @@ async function defaultBuildRenderer(): Promise<DashRendererBundle> {
  * The production process shell. Builds the renderer + paint layer, wires the
  * data layer + teardown discipline, and runs reactive mode. Returns a promise
  * that resolves once setup is done (the process then lives on the renderer's
- * reactive repaint + the subscriptions until an exit trigger fires). Read-only:
+ * reactive repaint + the subscription until an exit trigger fires). Read-only:
  * no RPC frame is written, no DB opened.
+ *
+ * The jobs subscription is WIDENED to terminal states (`state not_in []` —
+ * matches everything, overriding the descriptor's live-only default) so the `t`
+ * toggle can reveal ended/killed cards client-side without re-subscribing; the
+ * view-model gates what actually renders (default: live-only).
  *
  * Every dep in {@link DashAppDeps} is injectable so a test can drive the whole
  * shell headless (a `createTestRenderer` renderer, a stub trigger set, a fake
@@ -490,6 +654,10 @@ export async function createDashApp(
 
   const app = attachDashApp(renderer, runtime, {
     onQuit: () => exitCleanly(),
+    onToggleTerminal: () => {
+      inputs.showTerminal = !inputs.showTerminal;
+      paint();
+    },
   });
 
   function paint(): void {
@@ -508,11 +676,13 @@ export async function createDashApp(
   paint();
 
   // The readiness subscription feeds the card model off the live jobs
-  // projection. The autopilot_state/armed_epics subs below are retained (their
-  // edges trigger repaints) though the robot-card model no longer reads them.
+  // projection, widened to terminal states so the `t` toggle reveals
+  // ended/killed client-side (`not_in: []` matches everything, overriding the
+  // descriptor's live-only default). The view-model gates what renders.
   const readinessHandle = subscribeReadiness({
     sockPath,
     idPrefix: "dash",
+    jobsFilter: { state: { not_in: [] } },
     ...connectOpt,
     onSnapshot: (snap) => {
       inputs.snapshot = snap;
@@ -531,38 +701,15 @@ export async function createDashApp(
     onFatal: () => exitCleanly(),
   });
 
-  const autopilotHandle = subscribeCollection({
-    sockPath,
-    idPrefix: "dash",
-    collection: "autopilot_state",
-    ...connectOpt,
-    onRows: () => {
-      paint();
-    },
-    onFatal: () => exitCleanly(),
-  });
-
-  const armedHandle = subscribeCollection({
-    sockPath,
-    idPrefix: "dash",
-    collection: "armed_epics",
-    ...connectOpt,
-    onRows: () => {
-      paint();
-    },
-    onFatal: () => exitCleanly(),
-  });
-
-  // One coarse interval refreshes the wall-clock-aged glyphs — the rolled-up
-  // job verdict's sub-agent/monitor STALE transitions age off `nowSec`, not
-  // data edges, so no subscription repaints them. unref'd so it never pins the
-  // loop alive on its own.
+  // One coarse interval refreshes the wall-clock-aged glyphs — the card age
+  // labels age off `nowSec`, not data edges, so no subscription repaints them.
+  // unref'd so it never pins the loop alive on its own.
   const staleTimer = setInterval(paint, STALE_REFRESH_MS);
   (staleTimer as { unref?: () => void }).unref?.();
 
   // Single idempotent teardown. destroy() ALWAYS precedes exit so the terminal
   // is restored (OpenTUI does not auto-restore on exit/uncaught). Disposes the
-  // subs, clears the interval, disarms the triggers, destroys the renderer.
+  // sub, clears the interval, disarms the triggers, destroys the renderer.
   let exited = false;
   function exitCleanly(): void {
     if (exited) {
@@ -576,8 +723,6 @@ export async function createDashApp(
     }
     try {
       readinessHandle.dispose();
-      autopilotHandle.dispose();
-      armedHandle.dispose();
     } catch {
       // best-effort — a dispose throw must not block terminal restore.
     }
@@ -616,8 +761,6 @@ export async function createDashApp(
       }
       try {
         readinessHandle.dispose();
-        autopilotHandle.dispose();
-        armedHandle.dispose();
       } catch {
         // best-effort
       }

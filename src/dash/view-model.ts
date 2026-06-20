@@ -170,7 +170,7 @@ const BAND_TITLES: Record<BandKey, string> = {
 const BAND_ORDER: readonly BandKey[] = ["needs-you", "in-motion", "idle"];
 
 // ---------------------------------------------------------------------------
-// Output shapes — the contract task `.2` (the OpenTUI paint layer) consumes
+// Output shapes — the contract the OpenTUI paint layer (`./app.ts`) consumes
 // ---------------------------------------------------------------------------
 
 /**
@@ -178,7 +178,9 @@ const BAND_ORDER: readonly BandKey[] = ["needs-you", "in-motion", "idle"];
  * mutates a single BoxRenderable per job in place (never add/remove per frame).
  * `robotGlyph` + `railRole` dual-encode status; the border is always
  * structure-gray (the project name in it inherits border color — status lives
- * only in the rail). `isFocused` rides the `j`/`k` cursor; `isTerminal` flags an
+ * only in the rail). `isFocused` is always false here — the paint layer
+ * (`./app.ts`) owns the live `j`/`k` cursor (keyed on `job_id`), so the model
+ * carries the field for shape stability but never sets it. `isTerminal` flags an
  * ended/killed card (only present when `showTerminal` reveals them).
  */
 export interface CardVM {

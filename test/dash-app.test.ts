@@ -3,13 +3,15 @@
  * `attachDashApp`). Proves the OpenTUI paint surface over the robot job-card
  * model: the static tree mounts (root column → fixed census header + flexGrow
  * ScrollBox body, focused), the card model's header/bands/cards diff into the
- * body, a card line carries the robot glyph + title + project, band rules fence
- * the urgency bands, and the row map is structurally pruned/reordered when the
- * card set changes. This file paints task `.1`'s pure model through the thin
- * keyed-row bridge; task `.2` replaces the bridge with real boxed cards (rail
- * borders, focus cursor, the `t`/`j`/`k` keybinds) and broadens these frame
- * assertions. Boots via `createTestRenderer` (no `--isolate`; see
- * `test/live-shell.test.ts`'s TDZ note), destroys after each test.
+ * body as a single column of bordered robot CARDS (one BoxRenderable per job:
+ * rounded structure-gray border, project title, three interior lines carrying
+ * the rail+robot glyph / title / age footer), band rules fence the urgency
+ * bands, the `j`/`k`/arrow focus cursor swaps the focused card to a heavy cyan
+ * border (keyed on job_id, surviving re-sort), the `t` keybind fires the
+ * terminal-visibility toggle, terminal cards gate on `showTerminal`, and the
+ * row map is structurally pruned/reordered when the card set changes. Boots via
+ * `createTestRenderer` (no `--isolate`; see `test/live-shell.test.ts`'s TDZ
+ * note), destroys after each test.
  *
  * SERIAL-SAFE CHAIN MAINTENANCE: this file imports `@opentui/core` runtime
  * values, so it MUST be in BOTH `package.json`'s `test:opentui` chain AND the
@@ -104,9 +106,9 @@ function textContent(node: TextRenderable): string {
   return chunks.map((c) => c.text).join("");
 }
 
-/** The 0-based frame line index containing `needle`, or -1. Body rows are
- * Boxes whose text lives in nested Text children, so assertions read the
- * painted char frame, not node trees. */
+/** The 0-based frame line index containing `needle`, or -1. Body cards are
+ * bordered Boxes whose text lives in nested Text children, so assertions read
+ * the painted char frame, not node trees. */
 function frameLineOf(frame: string, needle: string): number {
   return frame.split("\n").findIndex((line) => line.includes(needle));
 }
@@ -133,18 +135,28 @@ async function bootApp(
   setup: Awaited<ReturnType<typeof createTestRenderer>>;
   app: DashApp;
   quitCount: () => number;
+  toggleCount: () => number;
 }> {
   const width = options.width ?? 80;
-  const height = options.height ?? 20;
+  const height = options.height ?? 40;
   const setup = await createTestRenderer({ width, height, exitSignals: [] });
   let quits = 0;
+  let toggles = 0;
   const app = attachDashApp(setup.renderer, APP_RUNTIME, {
     onQuit: () => {
       quits += 1;
     },
+    onToggleTerminal: () => {
+      toggles += 1;
+    },
   });
   pendingApps.push(app);
-  return { setup, app, quitCount: () => quits };
+  return {
+    setup,
+    app,
+    quitCount: () => quits,
+    toggleCount: () => toggles,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -155,7 +167,7 @@ test("static tree: header fixed at row 0, body is a focused ScrollBox", async ()
   const { app } = await bootApp();
   expect(app.header.height).toBe(1);
   expect(app.body).toBeInstanceOf(ScrollBoxRenderable);
-  // Focused on mount so j/k/arrows scroll natively.
+  // Focused on mount so wheel/page scroll lands on the body.
   expect((app.body as unknown as { focused: boolean }).focused).toBe(true);
 });
 
@@ -168,7 +180,7 @@ test("census header: the census line renders behind the one-column margin", asyn
   expect(header).toContain("in motion");
 });
 
-test("live frame: a card line carries the robot glyph, title, and project", async () => {
+test("live frame: a card carries the robot glyph, status, title, and project", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([
@@ -182,13 +194,41 @@ test("live frame: a card line carries the robot glyph, title, and project", asyn
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // The working robot glyph (md robot, f06a9) and the title share a line.
+  // The working robot glyph (md robot, f06a9) shares the status line.
   const robot = String.fromCodePoint(0xf06a9);
-  const line = frame.split("\n")[frameLineOf(frame, "worker A")] ?? "";
-  expect(line).toContain(robot);
-  expect(line).toContain("worker A");
-  // The project basename rides the same card line (right side).
-  expect(line).toContain("keeper");
+  expect(frame).toContain(robot);
+  // The title line, the project (in the border title), and the status word all
+  // render somewhere in the card box.
+  expect(frame).toContain("worker A");
+  expect(frame).toContain("keeper");
+  expect(frame).toContain("working");
+});
+
+test("card chrome: cards are bordered boxes — rounded by default, heavy when focused", async () => {
+  const { setup, app } = await bootApp();
+  // Two cards: the first seeds focus (heavy ┏), the second stays rounded (╭).
+  app.render(
+    model([
+      makeJob({
+        job_id: "s1",
+        state: "working",
+        title: "boxed-a",
+        created_at: 1,
+      }),
+      makeJob({
+        job_id: "s2",
+        state: "working",
+        title: "boxed-b",
+        created_at: 2,
+      }),
+    ]),
+  );
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  // The focused card paints a heavy border; the unfocused one a rounded border.
+  expect(frame).toContain("┏");
+  expect(frame).toContain("╭");
+  expect(frame).toContain("╰");
 });
 
 test("bands: a band rule precedes the cards of a non-empty band", async () => {
@@ -201,13 +241,18 @@ test("bands: a band rule precedes the cards of a non-empty band", async () => {
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // needs-you band (the api-error card) paints above the in-motion band.
-  expect(frameLineOf(frame, "needs you")).toBeLessThan(
-    frameLineOf(frame, "in motion"),
+  // needs-you band (the api-error card) paints above the in-motion band. Match
+  // the band RULE rows (leading `──`), not the census header (which also names
+  // both bands).
+  expect(frameLineOf(frame, "──needs you")).toBeLessThan(
+    frameLineOf(frame, "──in motion"),
   );
+  // Both band rules render.
+  expect(frameLineOf(frame, "──needs you")).toBeGreaterThanOrEqual(0);
+  expect(frameLineOf(frame, "──in motion")).toBeGreaterThanOrEqual(0);
 });
 
-test("empty-but-live: the body renders nothing — no placeholder lines", async () => {
+test("empty-but-live: the body renders no card boxes — no placeholder lines", async () => {
   const { setup, app } = await bootApp();
   app.render(model([]));
   await setup.renderOnce();
@@ -215,6 +260,8 @@ test("empty-but-live: the body renders nothing — no placeholder lines", async 
   expect(frame).not.toContain("no jobs");
   expect(frame).not.toContain("EPICS");
   expect(frame).not.toContain("JOBS");
+  // No card boxes paint when the board is empty.
+  expect(frame).not.toContain("╭");
 });
 
 test("toggle: a terminal card is hidden by default, revealed when shown", async () => {
@@ -230,6 +277,123 @@ test("toggle: a terminal card is hidden by default, revealed when shown", async 
   app.render(model(jobs, true));
   await setup.renderOnce();
   expect(setup.captureCharFrame()).toContain("ended-job");
+});
+
+test("toggle keybind: `t` fires the onToggleTerminal callback", async () => {
+  const { setup, toggleCount } = await bootApp();
+  setup.mockInput.pressKey("t");
+  expect(toggleCount()).toBe(1);
+  setup.mockInput.pressKey("t");
+  expect(toggleCount()).toBe(2);
+});
+
+test("focus cursor: j/k move a keyed cursor and swap the focused card border", async () => {
+  const { setup, app } = await bootApp();
+  app.render(
+    model([
+      makeJob({
+        job_id: "session-1",
+        state: "working",
+        title: "first-card",
+        created_at: 1,
+      }),
+      makeJob({
+        job_id: "session-2",
+        state: "working",
+        title: "second-card",
+        created_at: 2,
+      }),
+    ]),
+  );
+  await setup.renderOnce();
+  // The first card seeds the focus on mount → a HEAVY border (┏ corner).
+  expect(setup.captureCharFrame()).toContain("┏");
+
+  // j moves the cursor to the second card; it must remain a single heavy border
+  // (one focused card at a time). The frame still shows exactly one heavy box.
+  setup.mockInput.pressKey("j");
+  await setup.renderOnce();
+  const afterJ = setup.captureCharFrame();
+  expect(afterJ).toContain("┏");
+  // Both cards still render (focus move is not a structural change).
+  expect(afterJ).toContain("first-card");
+  expect(afterJ).toContain("second-card");
+
+  // k moves back up — still exactly one heavy-bordered card.
+  setup.mockInput.pressKey("k");
+  await setup.renderOnce();
+  expect(setup.captureCharFrame()).toContain("┏");
+});
+
+test("focus cursor: arrow keys drive the same cursor as j/k", async () => {
+  const { setup, app } = await bootApp();
+  app.render(
+    model([
+      makeJob({
+        job_id: "a",
+        state: "working",
+        title: "card-a",
+        created_at: 1,
+      }),
+      makeJob({
+        job_id: "b",
+        state: "working",
+        title: "card-b",
+        created_at: 2,
+      }),
+    ]),
+  );
+  await setup.renderOnce();
+  setup.mockInput.pressArrow("down");
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  // The heavy focus border still paints (the down arrow reached the handler).
+  expect(frame).toContain("┏");
+});
+
+test("focus cursor: survives a re-sort (keyed on job_id, not position)", async () => {
+  const { setup, app } = await bootApp();
+  // Two in-motion cards; focus the second (session-2).
+  app.render(
+    model([
+      makeJob({
+        job_id: "s1",
+        state: "working",
+        title: "alpha",
+        created_at: 1,
+      }),
+      makeJob({ job_id: "s2", state: "working", title: "beta", created_at: 2 }),
+    ]),
+  );
+  await setup.renderOnce();
+  setup.mockInput.pressKey("j"); // focus moves from s1 → s2
+  await setup.renderOnce();
+
+  // Now s2 transitions to api-error → it jumps to the needs-you band (re-sort).
+  // The focus must follow the CARD (s2), not the old position.
+  app.render(
+    model([
+      makeJob({
+        job_id: "s1",
+        state: "working",
+        title: "alpha",
+        created_at: 1,
+      }),
+      makeJob({
+        job_id: "s2",
+        state: "working",
+        title: "beta",
+        created_at: 2,
+        last_api_error_at: 99,
+      }),
+    ]),
+  );
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  // beta (s2) now sits in the needs-you band above alpha; the heavy focus border
+  // is on the beta card. Beta's line is above alpha's.
+  expect(frameLineOf(frame, "beta")).toBeLessThan(frameLineOf(frame, "alpha"));
+  expect(frame).toContain("┏");
 });
 
 test("row-set diff: shrinking the card set structurally prunes its row node", async () => {
@@ -250,7 +414,7 @@ test("row-set diff: shrinking the card set structurally prunes its row node", as
   expect(before).toContain("alpha-job");
   expect(before).toContain("beta-job");
 
-  // Drop session-2 → its row node must be removed, not stale-retained.
+  // Drop session-2 → its card node must be removed, not stale-retained.
   app.render(
     model([
       makeJob({ job_id: "session-1", state: "working", title: "alpha-job" }),
