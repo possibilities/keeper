@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T11:55:05.880000Z",
   "created_at": "2026-06-20T04:04:51.483000Z",
   "depends_on_epics": [],
   "id": "fn-841-robot-job-card-dash",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Robot job-card dash",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T04:04:51.483000Z"
+  "updated_at": "2026-06-20T11:55:05.880000Z"
 }
