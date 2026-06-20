@@ -34,5 +34,5 @@ No code tests. Verify AGENTS.md still resolves as a symlink to CLAUDE.md after e
 - [ ] AGENTS.md remains a valid symlink to CLAUDE.md.
 
 ## Done summary
-
+Documented the keeper plugin's two-hook PreToolUse surface (events-writer + branch-guard) across CLAUDE.md, README.md, and plugins/plan/CLAUDE.md, with the load-bearing deny-via-JSON/still-exit-0 contract; AGENTS.md symlink intact.
 ## Evidence
