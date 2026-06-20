@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T12:21:37.928000Z",
   "created_at": "2026-06-20T11:25:40.241000Z",
   "created_by_close_of": "fn-840-add-show-job-cli-verb",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix show-job tmux locale env",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T11:25:40.241000Z"
+  "updated_at": "2026-06-20T12:21:37.928000Z"
 }
