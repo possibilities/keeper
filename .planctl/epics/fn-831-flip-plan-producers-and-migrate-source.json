@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T03:43:37.788000Z",
   "created_at": "2026-06-18T18:37:02.092000Z",
   "depends_on_epics": [
     "fn-826-erase-planctl-from-keeper-daemon"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "flip plan producers and migrate source",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T03:37:01.134000Z"
+  "updated_at": "2026-06-20T03:43:37.788000Z"
 }
