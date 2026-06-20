@@ -37,7 +37,7 @@ import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe } from "../store.ts";
 
 /** Emit a typed find-task-commit error envelope and exit 1. Shape
- * {success:false, error:{code,message,details?}} — no planctl_invocation line.
+ * {success:false, error:{code,message,details?}} — no plan_invocation line.
  * Mirrors _emit_find_task_commit_error. */
 function emitFindTaskCommitError(
   code: string,

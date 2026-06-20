@@ -2,7 +2,7 @@
 // routing lookup: validate the task id, resolve its owning project cwd-
 // agnostically (roots discovery or --project), then return the routing subset
 // (task_id, epic_id, project_path, target_repo, primary_repo, tier, worker_agent,
-// status) with the readonly planctl_invocation MERGED into the same payload line.
+// status) with the readonly plan_invocation MERGED into the same payload line.
 // tier is surfaced as an explicit JSON null when unset. Typed errors —
 // BAD_TASK_ID / NOT_A_PROJECT / TASK_NOT_FOUND / AMBIGUOUS_TASK_ID — emit the
 // {success:false, error:{code,message,details?}} envelope + exit 1, mutating
@@ -26,7 +26,7 @@ import { expectedWorkerCwd } from "../runtime_status.ts";
 import { hasDataDir } from "../state_path.ts";
 import { LocalFileStateStore, loadJson, loadJsonSafe } from "../store.ts";
 
-/** Emit a typed resolve-task error envelope and exit 1. No planctl_invocation —
+/** Emit a typed resolve-task error envelope and exit 1. No plan_invocation —
  * a failed precondition mutates nothing. */
 function emitResolveError(
   code: string,

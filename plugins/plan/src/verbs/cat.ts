@@ -1,6 +1,6 @@
 // cat verb — the port of planctl/run_cat.py. Format-free by contract: emits the
 // raw spec markdown bytes to stdout regardless of --format, with NO trailing
-// planctl_invocation line (the dispatcher lists cat in NO_TRACK_COMMANDS). An
+// plan_invocation line (the dispatcher lists cat in NO_TRACK_COMMANDS). An
 // invalid id or a missing spec writes an `Error: ...` line to stderr and exits
 // 1 — the missing-spec message names the resolved absolute spec path.
 

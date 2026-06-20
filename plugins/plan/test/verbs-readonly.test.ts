@@ -1,7 +1,7 @@
 // Engine-agnostic conformance spec for the four read-only verbs — translated
 // from tests/test_readonly_verbs.py, every node mapped by a source-comment.
 // state-path / detect / status / epics: byte-exact primary envelope + the
-// trailing planctl_invocation NDJSON line, the schema_version asymmetry
+// trailing plan_invocation NDJSON line, the schema_version asymmetry
 // (detect 0, status 1), --format yaml/human surfaces, and the missing-project
 // error. Each test seeds via the CLI-free seedState builder (the harness port)
 // + chdir, so only the verb-under-test crosses the compiled-binary boundary.
@@ -19,7 +19,7 @@ import { LocalFileStateStore, serializeStateJson } from "../src/store.ts";
 import { runCli, seedState, withTmpdir } from "./harness.ts";
 
 // Split CLI stdout into [primary, trailer] — the read-only decorator appends a
-// trailing {"planctl_invocation": ...} compact NDJSON line. Port of the pytest
+// trailing {"plan_invocation": ...} compact NDJSON line. Port of the pytest
 // _split: the trailing newline is preserved on the primary block. (per-file
 // helper — the harness exposes no split; conftest._split is module-local too.)
 function split(output: string): [string, string | null] {
@@ -29,7 +29,7 @@ function split(output: string): [string, string | null] {
     lines.length > 0 &&
     (lines[lines.length - 1] as string)
       .trimStart()
-      .startsWith('{"planctl_invocation"')
+      .startsWith('{"plan_invocation"')
   ) {
     trailer = (lines.pop() as string).replace(/\n$/, "");
   }
@@ -37,11 +37,11 @@ function split(output: string): [string, string | null] {
 }
 
 // Byte-exact compact trailer for a read-only verb. Port of _expected_trailer:
-// the whole {"planctl_invocation": {...}} serialized with compact separators,
+// the whole {"plan_invocation": {...}} serialized with compact separators,
 // target null for verbs with no positional id, repo_root == state_repo == root.
 function expectedTrailer(op: string, root: string): string {
   return JSON.stringify({
-    planctl_invocation: {
+    plan_invocation: {
       files: null,
       op,
       target: null,
@@ -171,7 +171,7 @@ describe("detect", () => {
     expect(
       r.stdout.startsWith('{\n  "success": true,\n  "found": false\n}\n'),
     ).toBe(true);
-    expect(r.stdout).not.toContain('"planctl_invocation"');
+    expect(r.stdout).not.toContain('"plan_invocation"');
     expect(r.stdout).toContain(
       "{\n" +
         '  "success": false,\n' +

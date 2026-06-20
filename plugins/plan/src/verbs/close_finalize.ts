@@ -67,7 +67,7 @@ export const CLOSE_OUTCOMES = {
 export type CloseOutcome = (typeof CLOSE_OUTCOMES)[keyof typeof CLOSE_OUTCOMES];
 
 /** Emit a typed close-finalize error envelope and exit 1. Shape
- * {success:false, error:{code,message,details?}} — no planctl_invocation line.
+ * {success:false, error:{code,message,details?}} — no plan_invocation line.
  * Mirrors _emit_finalize_error. */
 function emitFinalizeError(
   code: string,
@@ -275,7 +275,7 @@ function scaffoldFollowup(
 }
 
 /** Pull epic_id from scaffold's success envelope on stdout, skipping the
- * trailing planctl_invocation line. Scans every JSON object on stdout for the
+ * trailing plan_invocation line. Scans every JSON object on stdout for the
  * first carrying a string epic_id. Mirrors _parse_scaffold_epic_id. */
 function parseScaffoldEpicId(output: string): string | null {
   let idx = 0;
@@ -601,7 +601,7 @@ function emitOutcome(
   );
   // emitReadonly embeds the invocation into the payload line (self-emit), so the
   // dispatcher's generic trailer is suppressed — matching Python's
-  // emit(data, planctl_invocation=pc). format is honored upstream by the caller.
+  // emit(data, plan_invocation=pc). format is honored upstream by the caller.
   void format;
   emitReadonly(data, pc);
 }

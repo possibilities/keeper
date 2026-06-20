@@ -7,7 +7,7 @@
 //
 // Discipline: byte-exact goldens for the human/validate renders; the primary
 // envelope parsed out of the trailer via a raw-decode scan (resolve-task merges
-// the invocation into its payload, so "skip the sole-key planctl_invocation
+// the invocation into its payload, so "skip the sole-key plan_invocation
 // object, return the first object with any other key"). Multi-project roots
 // tests write the roots config under a stable per-test HOME (the setRoots port).
 
@@ -38,7 +38,7 @@ function golden(name: string): string {
 }
 
 // Split into [primary, trailer]. Port of _split: the trailing compact
-// planctl_invocation NDJSON line, primary newline preserved.
+// plan_invocation NDJSON line, primary newline preserved.
 function split(output: string): [string, string | null] {
   const lines = output.split(/(?<=\n)/);
   let trailer: string | null = null;
@@ -46,14 +46,14 @@ function split(output: string): [string, string | null] {
     lines.length > 0 &&
     (lines[lines.length - 1] as string)
       .trimStart()
-      .startsWith('{"planctl_invocation"')
+      .startsWith('{"plan_invocation"')
   ) {
     trailer = (lines.pop() as string).replace(/\n$/, "");
   }
   return [lines.join(""), trailer];
 }
 
-// First JSON object that is NOT the sole-key planctl_invocation trailer. Port of
+// First JSON object that is NOT the sole-key plan_invocation trailer. Port of
 // _primary_envelope: a raw-decode scan tolerating pretty multi-line JSON and
 // resolve-task's merged-invocation shape.
 function primaryEnvelope(output: string): Record<string, unknown> {
@@ -70,7 +70,7 @@ function primaryEnvelope(output: string): Record<string, unknown> {
       continue;
     }
     const keys = Object.keys(obj.value);
-    if (!(keys.length === 1 && keys[0] === "planctl_invocation")) {
+    if (!(keys.length === 1 && keys[0] === "plan_invocation")) {
       return obj.value;
     }
     i += obj.end;
@@ -78,7 +78,7 @@ function primaryEnvelope(output: string): Record<string, unknown> {
   throw new Error(`no primary JSON envelope in output:\n${output}`);
 }
 
-// Trailing planctl_invocation object (parsed) or null. Port of _trailer_obj:
+// Trailing plan_invocation object (parsed) or null. Port of _trailer_obj:
 // scan every JSON object, return the last carrying the key (resolve-task rides
 // the invocation on the same physical line as the envelope).
 function trailerObj(output: string): Record<string, unknown> | null {
@@ -94,8 +94,8 @@ function trailerObj(output: string): Record<string, unknown> | null {
       i += 1;
       continue;
     }
-    if ("planctl_invocation" in obj.value) {
-      found = obj.value.planctl_invocation as Record<string, unknown>;
+    if ("plan_invocation" in obj.value) {
+      found = obj.value.plan_invocation as Record<string, unknown>;
     }
     i += obj.end;
   }
@@ -294,7 +294,7 @@ describe("cat", () => {
     const r = runCli(["cat", "fn-1-cafe"], { cwd: root });
     expect(r.code).toBe(0);
     expect(r.output).toBe("## Overview\nbody\n");
-    expect(r.output).not.toContain('"planctl_invocation"');
+    expect(r.output).not.toContain('"plan_invocation"');
   });
 
   test("--format flag ignored (same raw bytes)", () => {
@@ -332,7 +332,7 @@ describe("cat", () => {
     expect(r.output).toContain(
       join(root, ".keeper", "specs", "fn-1-cafe.9.md"),
     );
-    expect(r.output).not.toContain('"planctl_invocation"');
+    expect(r.output).not.toContain('"plan_invocation"');
   });
 
   test("invalid id errors", () => {
@@ -742,7 +742,7 @@ describe("validate --epic", () => {
     expect((JSON.parse(primary) as Record<string, unknown>).valid).toBe(true);
     expect(trailer).not.toBeNull();
     const inv = (JSON.parse(trailer as string) as Record<string, unknown>)
-      .planctl_invocation as Record<string, unknown>;
+      .plan_invocation as Record<string, unknown>;
     expect(inv.op).toBe("validate");
     expect(inv.target).toBe("fn-1-cafe");
     expect(loadJson(ep).last_validated_at).toBe(FROZEN);

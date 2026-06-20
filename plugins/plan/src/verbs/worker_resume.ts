@@ -9,7 +9,7 @@
 //
 // Runtime-state-only / readonly — regenerating the brief lands it under
 // gitignored state/briefs/; no .planctl/ commit fires. The success envelope
-// renders via format_output WITHOUT a planctl_invocation footer (the `worker`
+// renders via format_output WITHOUT a plan_invocation footer (the `worker`
 // group is a plain group, so the readonly-trailer decorator never fires for
 // `resume`). The typed-error path is the plain {success:false, error:msg}
 // emitError shape (the invalid-id / spec-not-found message text carries the id).
@@ -192,9 +192,9 @@ export function runWorkerResume(opts: {
   // only — typed-error paths above exit before reaching here. Fail-open.
   writeWorkMarker(taskId);
 
-  // Python emit() with neither planctl_invocation nor verb falls to the
+  // Python emit() with neither plan_invocation nor verb falls to the
   // format_output branch: the {success:true, ...} envelope renders in the
-  // ambient --format WITHOUT a planctl_invocation footer (the `worker` group is
+  // ambient --format WITHOUT a plan_invocation footer (the `worker` group is
   // a plain group, so the readonly-trailer decorator never fires for `resume`).
   formatOutput(
     {

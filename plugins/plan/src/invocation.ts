@@ -56,7 +56,7 @@ export interface MutatingInvocation {
   session_id: string;
 }
 
-/** Build the mutating planctl_invocation payload. Mirrors
+/** Build the mutating plan_invocation payload. Mirrors
  * planctl.invocation.build_planctl_invocation:
  *  - session id from CLAUDE_CODE_SESSION_ID, fail-CLOSED (throw when absent),
  *  - touched_path_files = the session's recorded touched-log filenames,

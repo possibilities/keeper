@@ -4,7 +4,7 @@
  * invocation now that the plan verb dispatcher runs IN-PROCESS (no child spawn):
  * argv forwarded verbatim (the `plan` token already stripped by the dispatcher),
  * stdin read off the inherited fd 0, exit code propagated, and the trailing
- * `planctl_invocation` NDJSON trailer surviving byte-intact.
+ * `plan_invocation` NDJSON trailer surviving byte-intact.
  *
  * The golden conformance drives the REAL compiled `planctl` binary and asserts
  * byte-identical stdout/stderr/exit between `keeper plan <verb>` and
@@ -73,12 +73,12 @@ describe("keeper plan — byte-identical to direct planctl (real binary)", () =>
     expect(shimmed.code).toBe(direct.code);
     expect(shimmed.stdout).toBe(direct.stdout);
     expect(shimmed.stderr).toBe(direct.stderr);
-    // The planctl_invocation NDJSON trailer is the last stdout line — assert it
+    // The plan_invocation NDJSON trailer is the last stdout line — assert it
     // survived byte-intact through the in-process dispatch.
     const lastLine = shimmed.stdout.trimEnd().split("\n").at(-1) ?? "";
-    expect(lastLine).toContain('"planctl_invocation"');
+    expect(lastLine).toContain('"plan_invocation"');
     const parsed = JSON.parse(lastLine);
-    expect(parsed.planctl_invocation.op).toBe("detect");
+    expect(parsed.plan_invocation.op).toBe("detect");
   });
 
   test("`keeper plan --format human detect` matches `planctl --format human detect`", () => {
@@ -213,7 +213,7 @@ describe("keeper plan — stdin forwarding (real binary, scratch repo)", () => {
     expect(shimmed.code).toBe(direct.code);
     expect(shimmed.stderr).toBe(direct.stderr);
 
-    // The success line carries a per-repo planctl_invocation trailer
+    // The success line carries a per-repo plan_invocation trailer
     // (repo_root / state_repo / touched_path_files are absolute tmp paths
     // unique to each scratch repo), so compare only the repo-invariant fields —
     // the verb's identity proves it processed the same piped stdin in both
@@ -223,9 +223,9 @@ describe("keeper plan — stdin forwarding (real binary, scratch repo)", () => {
     expect(shimEnv.success).toBe(directEnv.success);
     expect(shimEnv.task_id).toBe(directEnv.task_id);
     expect(shimEnv.section).toBe(directEnv.section);
-    expect(shimEnv.planctl_invocation.op).toBe(directEnv.planctl_invocation.op);
-    expect(shimEnv.planctl_invocation.target).toBe(
-      directEnv.planctl_invocation.target,
+    expect(shimEnv.plan_invocation.op).toBe(directEnv.plan_invocation.op);
+    expect(shimEnv.plan_invocation.target).toBe(
+      directEnv.plan_invocation.target,
     );
 
     // The piped section landed in the spec — `cat` is format-free raw markdown,

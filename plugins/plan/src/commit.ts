@@ -1,6 +1,6 @@
 // Per-verb auto-commit machinery — the byte-parity port of planctl/commit.py
 // (plus build_subject from planctl/commit_messages.py). Every mutating
-// planctl-bun verb's NDJSON envelope carries a planctl_invocation payload; the
+// planctl-bun verb's NDJSON envelope carries a plan_invocation payload; the
 // emit seam calls autoCommitFromInvocation to land the corresponding
 // `chore(plan): <op> <target>` commit inline, BEFORE the success envelope
 // prints.
@@ -211,7 +211,7 @@ export function buildMessageWithTrailers(
 // Public entry point.
 // ---------------------------------------------------------------------------
 
-/** The planctl_invocation payload autoCommitFromInvocation consumes. */
+/** The plan_invocation payload autoCommitFromInvocation consumes. */
 export interface CommitPayload {
   files?: string[] | null;
   subject?: string | null;
@@ -266,7 +266,7 @@ export function autoCommitFromInvocation(
     } else {
       throw new CommitFailed(
         "missing_state_repo",
-        "planctl_invocation payload lacks both state_repo and repo_root",
+        "plan_invocation payload lacks both state_repo and repo_root",
       );
     }
   }
@@ -275,7 +275,7 @@ export function autoCommitFromInvocation(
   if (typeof subject !== "string" || !subject) {
     throw new CommitFailed(
       "missing_subject",
-      "planctl_invocation payload lacks a subject for the commit",
+      "plan_invocation payload lacks a subject for the commit",
     );
   }
 

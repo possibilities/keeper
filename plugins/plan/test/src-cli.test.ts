@@ -84,7 +84,7 @@ describe("state-path", () => {
         `{\n  "success": true,\n  "state_dir": "${root}/.keeper/state"\n}`,
       );
       expect(trailer).toBe(
-        '{"planctl_invocation":{"files":null,"op":"state-path","target":null,' +
+        '{"plan_invocation":{"files":null,"op":"state-path","target":null,' +
           '"subject":null,"touched_path_files":[],' +
           `"repo_root":"${root}","state_repo":"${root}"}}`,
       );
@@ -130,7 +130,7 @@ describe("state-path", () => {
         '{\n  "success": false,\n' +
           '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
       );
-      expect(r.stdout).not.toContain("planctl_invocation");
+      expect(r.stdout).not.toContain("plan_invocation");
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -145,7 +145,7 @@ describe("read-only verbs dispatch through the compiled binary", () => {
       expect(r.code).toBe(0);
       expect(r.stdout).toContain('"found": true');
       expect(r.stdout).toContain('"schema_version": 0');
-      expect(r.stdout).toContain('"planctl_invocation"');
+      expect(r.stdout).toContain('"plan_invocation"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -161,7 +161,7 @@ describe("read-only verbs dispatch through the compiled binary", () => {
       expect(
         r.stdout.startsWith('{\n  "success": true,\n  "found": false\n}\n'),
       ).toBe(true);
-      expect(r.stdout).not.toContain('"planctl_invocation"');
+      expect(r.stdout).not.toContain('"plan_invocation"');
       expect(r.stdout).toContain(
         "No planctl project found. Run 'planctl init' first.",
       );
@@ -177,7 +177,7 @@ describe("read-only verbs dispatch through the compiled binary", () => {
       expect(r.code).toBe(0);
       expect(r.stdout).toContain('"schema_version": 1');
       expect(r.stdout).toContain('"total": 0');
-      expect(r.stdout).toContain('"planctl_invocation"');
+      expect(r.stdout).toContain('"plan_invocation"');
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
@@ -211,7 +211,7 @@ describe("read-only verbs dispatch through the compiled binary", () => {
           '{\n  "success": false,\n' +
             '  "error": "No planctl project found. Run \'planctl init\' first."\n}\n',
         );
-        expect(r.stdout).not.toContain("planctl_invocation");
+        expect(r.stdout).not.toContain("plan_invocation");
       } finally {
         rmSync(root, { recursive: true, force: true });
       }

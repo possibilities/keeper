@@ -11,7 +11,7 @@
  * verbatim (the dispatcher already stripped the `plan` token via `argv.slice(1)`,
  * so we forward exactly what planctl should see), stdin/stdout/stderr are the
  * inherited process streams (streaming + TTY + piped stdin intact, the
- * `planctl_invocation` trailer survives byte-intact), and the verb owns its exit
+ * `plan_invocation` trailer survives byte-intact), and the verb owns its exit
  * code — self-emitting verbs call `process.exit` themselves; the rest return a
  * code the dispatcher's `main` propagates here.
  *

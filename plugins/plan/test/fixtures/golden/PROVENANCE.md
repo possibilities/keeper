@@ -28,7 +28,7 @@ pinned (the renders are path-free, so the captured bytes are stable):
 * `list_human.txt` — `_seedListCorpus`: fn-1-cafe "Café résumé ☕" (3 tasks:
   todo / in_progress / done), fn-2-zeta "Zeta" (2 tasks: in_progress / todo).
   Run `<binary> --format human list` and drop the trailing
-  `planctl_invocation` line.
+  `plan_invocation` line.
 * `integrity_errors.txt` — `_seedInvalidCorpus`: fn-1-cafe with a ghost
   epic-dep (fn-99-ghost), a task dep to a missing .9, and a .1<->.2 cycle. Run
   `<binary> validate` and take the `errors` array, one error per line.

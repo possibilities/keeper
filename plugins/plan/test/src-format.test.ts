@@ -42,7 +42,7 @@ describe("jsonDumps", () => {
 describe("compactJson", () => {
   test("no spaces — the trailer serializer", () => {
     const envelope = {
-      planctl_invocation: {
+      plan_invocation: {
         files: null,
         op: "state-path",
         target: null,
@@ -53,7 +53,7 @@ describe("compactJson", () => {
       },
     };
     expect(compactJson(envelope)).toBe(
-      '{"planctl_invocation":{"files":null,"op":"state-path","target":null,' +
+      '{"plan_invocation":{"files":null,"op":"state-path","target":null,' +
         '"subject":null,"touched_path_files":[],"repo_root":"/r","state_repo":"/r"}}',
     );
   });

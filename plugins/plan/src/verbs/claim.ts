@@ -40,7 +40,7 @@ interface ProjectCtx {
 
 /** Emit a typed claim error envelope {success:false,error:{code,message,
  * details?}} and exit 1. Routes through formatOutput so --format yaml renders
- * YAML. No planctl_invocation — a failed precondition mutates nothing. Mirrors
+ * YAML. No plan_invocation — a failed precondition mutates nothing. Mirrors
  * _emit_claim_error. */
 function emitClaimError(
   code: string,

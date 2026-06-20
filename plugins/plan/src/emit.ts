@@ -32,7 +32,7 @@ import {
 } from "./invocation.ts";
 
 // Runtime self-emit sentinel — set when a verb prints its own NDJSON envelope
-// (with the planctl_invocation embedded), so the dispatcher suppresses the
+// (with the plan_invocation embedded), so the dispatcher suppresses the
 // generic trailer. Reset per process invocation; read once after the verb runs.
 let selfEmitted = false;
 
@@ -49,7 +49,7 @@ function markSelfEmitted(): void {
 /** Emit the success envelope for a runtime-state-only verb with a pre-built
  * readonly invocation. autoCommitFromInvocation is a no-op on files=null (ZERO
  * commits), then the compact NDJSON envelope {success:true, ...data,
- * planctl_invocation} prints. Mirrors emit() with a pre-built readonly
+ * plan_invocation} prints. Mirrors emit() with a pre-built readonly
  * invocation. */
 export function emitReadonly(
   data: Record<string, unknown>,
@@ -61,20 +61,20 @@ export function emitReadonly(
   const envelope = {
     success: true,
     ...data,
-    planctl_invocation: invocation,
+    plan_invocation: invocation,
   };
   markSelfEmitted();
   process.stdout.write(`${compactJson(envelope)}\n`);
 }
 
-/** The committing-seam emit path for mutating verbs. Build the planctl_invocation
+/** The committing-seam emit path for mutating verbs. Build the plan_invocation
  * (a fail-closed session id or a bad touched-path throws, surfacing verbatim),
  * run the auto-commit BEFORE printing, then:
  *  - on a commit failure, print ONE compact line
- *    {"success":false,"error":"commit_failed","details":...,"planctl_invocation":...}
+ *    {"success":false,"error":"commit_failed","details":...,"plan_invocation":...}
  *    and process.exit(1) — the success envelope is NEVER printed;
  *  - on success, embed the invocation and print ONE compact NDJSON line
- *    {"success":true, ...data, planctl_invocation}.
+ *    {"success":true, ...data, plan_invocation}.
  * Mirrors emit()'s mutating branch + the runner's commit ordering. */
 export function emitMutating(
   data: Record<string, unknown>,
@@ -112,7 +112,7 @@ export function emitMutating(
         message: exc.detail,
         ...exc.extra,
       },
-      planctl_invocation: invocation,
+      plan_invocation: invocation,
     };
     process.stdout.write(`${compactJson(failure)}\n`);
     process.exit(1);
@@ -121,7 +121,7 @@ export function emitMutating(
   const envelope = {
     success: true,
     ...data,
-    planctl_invocation: invocation,
+    plan_invocation: invocation,
   };
   markSelfEmitted();
   process.stdout.write(`${compactJson(envelope)}\n`);
@@ -131,7 +131,8 @@ export function emitMutating(
  * list, no session_id key, no touched-log). Runs the auto-commit BEFORE printing
  * — on a commit failure print ONE compact failure line + exit 1 (success NEVER
  * printed); on success embed the literal invocation and print ONE compact NDJSON
- * line. Mirrors run_init.py's emit(planctl_invocation=payload) branch. */
+ * line. Mirrors run_init.py's emit(planctl_invocation=payload) branch (the
+ * Python kwarg name is the upstream symbol; the emitted key is plan_invocation). */
 export function emitMutatingLiteral(
   data: Record<string, unknown>,
   invocation: Record<string, unknown>,
@@ -154,7 +155,7 @@ export function emitMutatingLiteral(
         message: exc.detail,
         ...exc.extra,
       },
-      planctl_invocation: invocation,
+      plan_invocation: invocation,
     };
     markSelfEmitted();
     process.stdout.write(`${compactJson(failure)}\n`);
@@ -164,7 +165,7 @@ export function emitMutatingLiteral(
   const envelope = {
     success: true,
     ...data,
-    planctl_invocation: invocation,
+    plan_invocation: invocation,
   };
   markSelfEmitted();
   process.stdout.write(`${compactJson(envelope)}\n`);
@@ -173,7 +174,7 @@ export function emitMutatingLiteral(
 /** init's read-only path (nothing written / non-git): no invocation, no commit.
  * Prints {success:true, ...data} via formatOutput so --format is honored, and
  * leaves the self-emit sentinel UNSET so the CLI fires the generic readonly
- * trailer afterward. Mirrors emit(data) with no planctl_invocation. */
+ * trailer afterward. Mirrors emit(data) with no plan_invocation. */
 export function emitReadonlyData(
   data: Record<string, unknown>,
   format: OutputFormat | null = null,

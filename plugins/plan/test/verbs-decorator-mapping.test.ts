@@ -15,18 +15,18 @@ import { join } from "node:path";
 
 import { runCli, seedState, withTmpdir } from "./harness.ts";
 
-// Last trailing planctl_invocation object, or null.
+// Last trailing plan_invocation object, or null.
 function trailer(output: string): Record<string, unknown> | null {
   const line = output
     .trim()
     .split("\n")
     .reverse()
-    .find((ln) => ln.trim().startsWith('{"planctl_invocation"'));
+    .find((ln) => ln.trim().startsWith('{"plan_invocation"'));
   if (!line) {
     return null;
   }
   return (JSON.parse(line) as Record<string, unknown>)
-    .planctl_invocation as Record<string, unknown>;
+    .plan_invocation as Record<string, unknown>;
 }
 
 let root: string;
@@ -65,7 +65,7 @@ describe("invocation target extraction (end-to-end equivalent)", () => {
   // engine-agnostic surface; the observable "a raised verb emits no invocation
   // line" is the typed-error path, already asserted across verbs-worker /
   // verbs-restamp where an errored verb's output carries no trailing
-  // planctl_invocation line):
+  // plan_invocation line):
   //   test_decorator_hardening.py::test_raise_path_does_not_emit_invocation
   //   test_decorator_hardening.py::test_raise_path_restores_original_invoke
 });
@@ -80,7 +80,7 @@ describe("no-track commands bypass the invocation decorator", () => {
     const r = runCli(["cat", "fn-7-real"], { cwd: root });
     expect(r.code).toBe(0);
     expect(r.output).toBe(spec);
-    expect(r.output).not.toContain('"planctl_invocation"');
+    expect(r.output).not.toContain('"plan_invocation"');
   });
 
   test("validate --epic: doc1 {valid,...}, doc2 invocation on first stamp; no doc2 on re-run", () => {
@@ -99,7 +99,7 @@ describe("no-track commands bypass the invocation decorator", () => {
     expect("warnings" in doc1).toBe(true);
     if (doc1.valid) {
       expect(docs.length).toBe(2);
-      expect("planctl_invocation" in (docs[1] as Record<string, unknown>)).toBe(
+      expect("plan_invocation" in (docs[1] as Record<string, unknown>)).toBe(
         true,
       );
 

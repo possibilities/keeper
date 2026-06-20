@@ -4,7 +4,7 @@
 // invalid, NO trailer (the dispatcher lists validate in NO_TRACK_COMMANDS). The
 // --epic stamp state machine: when valid AND last_validated_at is null, write
 // the marker + bump updated_at, then auto-commit BEFORE printing a SECOND
-// compact planctl_invocation line — so the printed line is the authoritative
+// compact plan_invocation line — so the printed line is the authoritative
 // signal the .planctl/ commit landed; a commit failure prints a compact
 // commit_failed line + exit 1 (the invocation line is NOT printed); an already-
 // stamped epic is a pure no-op (no write, no commit, no second line).
@@ -154,7 +154,7 @@ export function runValidate(
           success: false,
           error: "commit_failed",
           details: { error: exc.error, message: exc.detail, ...exc.extra },
-          planctl_invocation: pc,
+          plan_invocation: pc,
         };
         process.stdout.write(`${compactJson(failure)}\n`);
         process.exit(1);
@@ -162,7 +162,7 @@ export function runValidate(
 
       // Python prints this line with json.dumps(obj) (default spaced
       // separators) — distinct from the compact commit_failed line above.
-      process.stdout.write(`${pyDefaultJson({ planctl_invocation: pc })}\n`);
+      process.stdout.write(`${pyDefaultJson({ plan_invocation: pc })}\n`);
     }
   }
 

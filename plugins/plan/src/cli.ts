@@ -6,7 +6,7 @@
 // unknown-command error on stderr (exit 2) shaped like click's "No such command".
 //
 // state-path / detect / status / epics are implemented end-to-end. After a
-// read-only verb runs, the trailing planctl_invocation NDJSON line is emitted by
+// read-only verb runs, the trailing plan_invocation NDJSON line is emitted by
 // re-resolving the project (mirroring cli.py's _emit_readonly_invocation): a
 // genuine resolve failure is swallowed, but a missing-project resolve raises the
 // error envelope + exit 1 inline (the contract for detect's found-false tail).
@@ -89,7 +89,7 @@ const SUBGROUP_NAMES = new Set([
   "worker",
 ]);
 
-// Whether a verb already printed its own planctl_invocation-bearing envelope is
+// Whether a verb already printed its own plan_invocation-bearing envelope is
 // a RUNTIME fact (claim/block via emitReadonly, done via emitMutating always
 // self-emit; init self-emits only on its committing path). The dispatcher reads
 // the didSelfEmit() sentinel after the verb runs — the port of cli.py's
@@ -547,7 +547,7 @@ const WORKER_GROUP: GroupSpec = {
 
 // Close-phase submit subgroups (audit/verdict/followup submit). Each uses
 // FormattedGroup semantics: the leaf emits {success:true,...} via formatOutput
-// (or the typed error envelope + exit 1) and NO trailing planctl_invocation line
+// (or the typed error envelope + exit 1) and NO trailing plan_invocation line
 // fires (the group dispatch returns before emitTrailer). All three are
 // runtime-state-only — zero .planctl/ commits.
 const AUDIT_RISK_CHOICES = ["Low", "Medium", "High"];
@@ -775,7 +775,7 @@ function printHelp(): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-/** Emit the trailing read-only planctl_invocation NDJSON line by re-resolving
+/** Emit the trailing read-only plan_invocation NDJSON line by re-resolving
  * the project — the port of cli.py:_emit_readonly_invocation. resolveProject
  * raises the missing-project error envelope + exit 1 when no data dir
  * resolves (terminating before any trailer prints); a genuine non-exit failure
@@ -794,7 +794,7 @@ function emitTrailer(
   const projectPath = projectPathOverride ?? resolveProject(format).projectPath;
   try {
     const envelope = {
-      planctl_invocation: buildPlanctlInvocationReadonly(
+      plan_invocation: buildPlanctlInvocationReadonly(
         verb,
         projectPath,
         target,
@@ -981,7 +981,7 @@ function dispatch(parsed: ParsedArgs): number {
       });
       break;
     case "audit":
-      // Subgroup: `submit` emits via format_output with NO planctl_invocation
+      // Subgroup: `submit` emits via format_output with NO plan_invocation
       // footer (FormattedGroup; the group dispatch returns before the trailer).
       dispatchGroup(AUDIT_GROUP, rest, format);
       return 0;
@@ -993,7 +993,7 @@ function dispatch(parsed: ParsedArgs): number {
       return 0;
     case "worker":
       // Subgroup: dispatch the leaf (or group help). `resume` emits via
-      // format_output with NO planctl_invocation footer (the group dispatch
+      // format_output with NO plan_invocation footer (the group dispatch
       // returns before the generic trailer fires).
       dispatchGroup(WORKER_GROUP, rest, format);
       return 0;

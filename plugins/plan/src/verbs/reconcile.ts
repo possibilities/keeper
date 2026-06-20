@@ -62,7 +62,7 @@ export class GitError extends Error {
 const FIELD_SEP = "\x1f";
 
 /** Emit a typed reconcile error envelope and exit 1. Shape
- * {success:false, error:{code,message,details?}} — no planctl_invocation line.
+ * {success:false, error:{code,message,details?}} — no plan_invocation line.
  * Mirrors _emit_reconcile_error. */
 function emitReconcileError(
   code: string,

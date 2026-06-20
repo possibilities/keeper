@@ -39,7 +39,7 @@ import { getTaskSection } from "../specs.ts";
 import { hasDataDir } from "../state_path.ts";
 
 /** Emit a typed close-preflight error envelope and exit 1. Shape
- * {success:false, error:{code,message,details?}} — no planctl_invocation line
+ * {success:false, error:{code,message,details?}} — no plan_invocation line
  * (a failed read-only fetch mutates nothing). Mirrors _emit_preflight_error. */
 function emitPreflightError(
   code: string,
