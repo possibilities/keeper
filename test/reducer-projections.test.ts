@@ -2468,10 +2468,10 @@ test("planctl mint: scaffold envelope mints source='plan' file_attributions for 
     subjectPresent: true,
     stateRepo: "/repo-mint",
     files: [
-      ".planctl/epics/fn-1-foo.json",
-      ".planctl/meta.json",
-      ".planctl/specs/fn-1-foo.md",
-      ".planctl/tasks/fn-1-foo.1.json",
+      ".keeper/epics/fn-1-foo.json",
+      ".keeper/meta.json",
+      ".keeper/specs/fn-1-foo.md",
+      ".keeper/tasks/fn-1-foo.1.json",
     ],
     ts: 555,
   });
@@ -2498,10 +2498,10 @@ test("planctl mint: scaffold envelope mints source='plan' file_attributions for 
     expect(r.last_event_id).toBe(eventId);
   }
   expect(rows.map((r) => r.file_path)).toEqual([
-    ".planctl/epics/fn-1-foo.json",
-    ".planctl/meta.json",
-    ".planctl/specs/fn-1-foo.md",
-    ".planctl/tasks/fn-1-foo.1.json",
+    ".keeper/epics/fn-1-foo.json",
+    ".keeper/meta.json",
+    ".keeper/specs/fn-1-foo.md",
+    ".keeper/tasks/fn-1-foo.1.json",
   ]);
 });
 
@@ -2519,7 +2519,7 @@ test("plan mint: plan_invocation envelope mints source='plan' file_attributions"
     subjectPresent: true,
     stateRepo: "/repo-mint-renamed",
     useRenamedKey: true,
-    files: [".planctl/epics/fn-2-bar.json", ".planctl/meta.json"],
+    files: [".keeper/epics/fn-2-bar.json", ".keeper/meta.json"],
     ts: 777,
   });
   drainAll();
@@ -2545,8 +2545,8 @@ test("plan mint: plan_invocation envelope mints source='plan' file_attributions"
     expect(r.last_event_id).toBe(eventId);
   }
   expect(rows.map((r) => r.file_path)).toEqual([
-    ".planctl/epics/fn-2-bar.json",
-    ".planctl/meta.json",
+    ".keeper/epics/fn-2-bar.json",
+    ".keeper/meta.json",
   ]);
 });
 
@@ -2621,7 +2621,7 @@ test("planctl mint: missing state_repo (corrupt envelope) mints no rows", () => 
     planctl_epic_id: "fn-1-foo",
     planctl_subject_present: 1,
     planctl_queue_jump: 0,
-    planctl_files: JSON.stringify([".planctl/epics/fn-1-foo.json"]),
+    planctl_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
     // data missing the state_repo field
     data: JSON.stringify({
       tool_response: {
@@ -2657,7 +2657,7 @@ test("planctl mint: malformed event.data folds to no-op (safe value invariant)",
     planctl_epic_id: "fn-1-foo",
     planctl_subject_present: 1,
     planctl_queue_jump: 0,
-    planctl_files: JSON.stringify([".planctl/epics/fn-1-foo.json"]),
+    planctl_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
     data: "{this is not valid json",
   });
   drainAll();
@@ -2713,16 +2713,14 @@ test("planctl mint: absolute path in files[] is filtered out", () => {
     stateRepo: "/repo-abs",
     files: [
       "/abs/path/spec.md", // skipped
-      ".planctl/epics/fn-1-foo.json", // minted
+      ".keeper/epics/fn-1-foo.json", // minted
     ],
   });
   drainAll();
   const rows = db
     .query("SELECT file_path FROM file_attributions ORDER BY file_path")
     .all() as Array<{ file_path: string }>;
-  expect(rows.map((r) => r.file_path)).toEqual([
-    ".planctl/epics/fn-1-foo.json",
-  ]);
+  expect(rows.map((r) => r.file_path)).toEqual([".keeper/epics/fn-1-foo.json"]);
 });
 
 test("planctl mint: path with `..` traversal is filtered out (defensive)", () => {
@@ -2734,13 +2732,13 @@ test("planctl mint: path with `..` traversal is filtered out (defensive)", () =>
     epicId: "fn-1-foo",
     subjectPresent: true,
     stateRepo: "/repo-trav",
-    files: ["../outside.md", ".planctl/specs/fn-1-foo.md"],
+    files: ["../outside.md", ".keeper/specs/fn-1-foo.md"],
   });
   drainAll();
   const rows = db
     .query("SELECT file_path FROM file_attributions ORDER BY file_path")
     .all() as Array<{ file_path: string }>;
-  expect(rows.map((r) => r.file_path)).toEqual([".planctl/specs/fn-1-foo.md"]);
+  expect(rows.map((r) => r.file_path)).toEqual([".keeper/specs/fn-1-foo.md"]);
 });
 
 test("planctl mint: GitSnapshot following a mint renders the planctl-source attribution (not orphan)", () => {
@@ -2756,7 +2754,7 @@ test("planctl mint: GitSnapshot following a mint renders the planctl-source attr
     epicId: "fn-1-foo",
     subjectPresent: true,
     stateRepo: "/repo-snap",
-    files: [".planctl/epics/fn-1-foo.json"],
+    files: [".keeper/epics/fn-1-foo.json"],
     ts: 1000,
   });
   insertEvent({
@@ -2773,7 +2771,7 @@ test("planctl mint: GitSnapshot following a mint renders the planctl-source attr
       behind: null,
       dirty_files: [
         {
-          path: ".planctl/epics/fn-1-foo.json",
+          path: ".keeper/epics/fn-1-foo.json",
           xy: "??",
           mtime_ms: null,
         },
@@ -2840,7 +2838,7 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
     epicId: "fn-1-foo",
     subjectPresent: true,
     stateRepo: "/repo-both",
-    files: [".planctl/epics/fn-1-foo.json"],
+    files: [".keeper/epics/fn-1-foo.json"],
     ts: 1000,
   });
   // GitSnapshot triggers pass-2 inference; the planctl row should suppress
@@ -2859,7 +2857,7 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
       behind: null,
       dirty_files: [
         {
-          path: ".planctl/epics/fn-1-foo.json",
+          path: ".keeper/epics/fn-1-foo.json",
           xy: "??",
           mtime_ms: 1050 * 1000, // inside the bash window
         },
@@ -2875,7 +2873,7 @@ test("planctl mint: a planctl file does NOT also get an inferred attribution (gu
           AND file_path = ?
         ORDER BY source`,
     )
-    .all("/repo-both", "sess-both", ".planctl/epics/fn-1-foo.json") as Array<{
+    .all("/repo-both", "sess-both", ".keeper/epics/fn-1-foo.json") as Array<{
     source: string;
     op: string;
   }>;
@@ -2895,7 +2893,7 @@ test("planctl mint: re-fold determinism — cursor=0 reproduces byte-identical f
     epicId: "fn-1-foo",
     subjectPresent: true,
     stateRepo: "/repo-rd",
-    files: [".planctl/epics/fn-1-foo.json", ".planctl/specs/fn-1-foo.md"],
+    files: [".keeper/epics/fn-1-foo.json", ".keeper/specs/fn-1-foo.md"],
     ts: 200,
   });
   insertEvent({
@@ -2911,8 +2909,8 @@ test("planctl mint: re-fold determinism — cursor=0 reproduces byte-identical f
       ahead: null,
       behind: null,
       dirty_files: [
-        { path: ".planctl/epics/fn-1-foo.json", xy: "??", mtime_ms: null },
-        { path: ".planctl/specs/fn-1-foo.md", xy: "??", mtime_ms: null },
+        { path: ".keeper/epics/fn-1-foo.json", xy: "??", mtime_ms: null },
+        { path: ".keeper/specs/fn-1-foo.md", xy: "??", mtime_ms: null },
       ],
     }),
   });

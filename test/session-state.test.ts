@@ -8,7 +8,7 @@
  *  - empty repo (no commits) → head_sha null, branch is the pre-commit branch
  *    name (symbolic-ref still resolves the unborn branch);
  *  - detached HEAD → branch null, head_sha non-null;
- *  - session_files: the cwd-repo on-hook dirty set (minus .planctl/), and a DB
+ *  - session_files: the cwd-repo on-hook dirty set (minus .keeper/), and a DB
  *    hiccup degrades it to [] rather than throwing the verb;
  *  - the envelope is pretty indent=2 with `success:true`.
  *
@@ -178,17 +178,17 @@ describe("session-state: null parity", () => {
 // ---------------------------------------------------------------------------
 
 describe("session-state: session_files", () => {
-  test("returns the cwd-repo on-hook dirty set (minus .planctl/)", async () => {
+  test("returns the cwd-repo on-hook dirty set (minus .keeper/)", async () => {
     initRepoBare();
     initialCommit();
-    // Two dirty work files + one .planctl file (excluded client-side).
+    // Two dirty work files + one .keeper file (excluded client-side).
     writeFileSync(join(repo, "work.ts"), "w\n");
-    mkdirSync(join(repo, ".planctl", "epics"), { recursive: true });
-    writeFileSync(join(repo, ".planctl", "epics", "fn-1.json"), "{}\n");
+    mkdirSync(join(repo, ".keeper", "epics"), { recursive: true });
+    writeFileSync(join(repo, ".keeper", "epics", "fn-1.json"), "{}\n");
     seedAttribution({ sessionId: "s1", filePath: "work.ts" });
     seedAttribution({
       sessionId: "s1",
-      filePath: ".planctl/epics/fn-1.json",
+      filePath: ".keeper/epics/fn-1.json",
     });
 
     const res = await sessionState(["--session-id", "s1"]);

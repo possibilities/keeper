@@ -1,15 +1,15 @@
 /**
  * Unit tests for `src/rpc-handlers.ts`. Direct-call layer only — no real
  * worker, no real socket, no daemon spawn. Each test sets up a hermetic
- * plan root (a tmp dir with a `.planctl/{epics,tasks}` tree) via
+ * plan root (a tmp dir with a `.keeper/{epics,tasks}` tree) via
  * `KEEPER_CONFIG`, opens a writer DB against a separate tmpdir, calls the
  * handler directly, and asserts on the on-disk file + return value.
  *
  * fn-732: the approval handlers now write the GITIGNORED runtime sidecar
- * (`.planctl/state/{epics,tasks}/<id>.state.json`), create-if-absent + RMW
+ * (`.keeper/state/{epics,tasks}/<id>.state.json`), create-if-absent + RMW
  * preserving the sidecar's existing fields, and LEAVE THE COMMITTED DEF
  * UNTOUCHED. The handler still resolves the committed def first (to prove the
- * entity exists + locate the owning `.planctl`); the sidecar is derived from
+ * entity exists + locate the owning `.keeper`); the sidecar is derived from
  * that resolved path. The keeper read-side folds approval from the sidecar
  * gate-free with a permanent fallback to the def — see `src/plan-worker.ts`.
  *
@@ -44,8 +44,8 @@ let originalKeeperConfig: string | undefined;
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-rpc-handlers-test-"));
   planRoot = join(tmpDir, "plan-root");
-  epicsDir = join(planRoot, ".planctl", "epics");
-  tasksDir = join(planRoot, ".planctl", "tasks");
+  epicsDir = join(planRoot, ".keeper", "epics");
+  tasksDir = join(planRoot, ".keeper", "tasks");
   mkdirSync(epicsDir, { recursive: true });
   mkdirSync(tasksDir, { recursive: true });
   // Hermetic config pointing at our tmp plan root so `resolvePlanRoots()`
