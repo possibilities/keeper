@@ -100,5 +100,5 @@ schema/migration/reducer/daemon change.
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Added optional followup=<id> field to keeper await's complete-epic met line (kv comma-joined + --json array, omitted when no closer child), via a pure closerChildrenOf helper scanning created_by_closer_of with resolvedEpicId capture for bare fn-N targets. Documented in the await skill, --help, and README.
 ## Evidence
