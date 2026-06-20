@@ -60,7 +60,7 @@ function insertEvent(
     hook_event: string;
     bash_mutation_kind?: string | null;
     bash_mutation_targets?: string | null;
-    planctl_files?: string | null;
+    plan_files?: string | null;
     backend_exec_type?: string | null;
     backend_exec_session_id?: string | null;
     backend_exec_pane_id?: string | null;
@@ -95,11 +95,11 @@ function insertEvent(
     start_time: overrides.start_time ?? null,
     slash_command: overrides.slash_command ?? null,
     skill_name: overrides.skill_name ?? null,
-    planctl_op: overrides.planctl_op ?? null,
-    planctl_target: overrides.planctl_target ?? null,
-    planctl_epic_id: overrides.planctl_epic_id ?? null,
-    planctl_task_id: overrides.planctl_task_id ?? null,
-    planctl_subject_present: overrides.planctl_subject_present ?? null,
+    plan_op: overrides.plan_op ?? null,
+    plan_target: overrides.plan_target ?? null,
+    plan_epic_id: overrides.plan_epic_id ?? null,
+    plan_task_id: overrides.plan_task_id ?? null,
+    plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
     // Schema v30: queue-jump sparse column; NULL unless this is a planctl
@@ -107,17 +107,17 @@ function insertEvent(
     // other planctl event (stamped 0). The test helper defaults to NULL so
     // every non-planctl event lands NULL — matches the live hook's stamping
     // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
-    planctl_queue_jump: overrides.planctl_queue_jump ?? null,
+    plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
     // whose payload didn't match a mutation pattern; defaults to NULL here
     // so a non-Bash event lands NULL. Tests covering bash attribution pass
     // these explicitly via the overrides.
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
-    // Schema v46 / fn-666: planctl_files sparse JSON-array column carrying
+    // Schema v46 / fn-666: plan_files sparse JSON-array column carrying
     // the envelope's repo-relative `files` array. NULL on every non-planctl
     // event; planctl-mint tests pass this explicitly via overrides.
-    planctl_files: overrides.planctl_files ?? null,
+    plan_files: overrides.plan_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
     // session/pane the parent Claude ran under). NULL on every event outside a
     // managed multiplexer; backend-exec-mint tests pass these via overrides.
@@ -148,9 +148,9 @@ function insertEvent(
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-       planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-       bash_mutation_kind, bash_mutation_targets, planctl_files,
+       plan_op, plan_target, plan_epic_id, plan_task_id,
+       plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+       bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id, mutation_path
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -173,17 +173,17 @@ function insertEvent(
       row.start_time,
       row.slash_command,
       row.skill_name,
-      row.planctl_op,
-      row.planctl_target,
-      row.planctl_epic_id,
-      row.planctl_task_id,
-      row.planctl_subject_present,
+      row.plan_op,
+      row.plan_target,
+      row.plan_epic_id,
+      row.plan_task_id,
+      row.plan_subject_present,
       row.tool_use_id,
       row.config_dir,
-      row.planctl_queue_jump,
+      row.plan_queue_jump,
       row.bash_mutation_kind,
       row.bash_mutation_targets,
-      row.planctl_files,
+      row.plan_files,
       row.backend_exec_type,
       row.backend_exec_session_id,
       row.backend_exec_pane_id,
@@ -322,32 +322,25 @@ function planctlEvent(args: {
   // passing `queueJump: true` to drive the `/plan:queue` projection path.
   queueJump?: boolean;
   // Schema v46 / fn-666: optional repo-relative `files[]` to lift into
-  // `events.planctl_files` AND inline into the envelope's `state_repo`
+  // `events.plan_files` AND inline into the envelope's `state_repo`
   // payload (so the reducer's mint can read `state_repo` from event.data).
   // Defaults `undefined` — existing tests keep their old null-on-planctl
   // shape and the mint becomes a no-op for them.
   files?: string[];
   stateRepo?: string;
-  // fn-826: inline the envelope under the renamed `plan_invocation` key instead
-  // of legacy `planctl_invocation`, to prove the tolerant fold mints identically
-  // off either key. Defaults `false` (legacy key) so existing tests are unchanged.
-  useRenamedKey?: boolean;
   ts?: number;
 }): number {
   // When mint-test args (`files` + `stateRepo`) are passed, also inline the
-  // canonical envelope `{tool_response:{stdout:JSON({plan_invocation OR
-  // planctl_invocation: {state_repo, files, op, target, ...}})}}` into `data` so
-  // the reducer's `extractPlanctlStateRepo` can lift `state_repo` at fold time.
-  // Existing tests pass neither and get the default empty `data: '{}'` (mint no-ops).
-  const envelopeKey = args.useRenamedKey
-    ? "plan_invocation"
-    : "planctl_invocation";
+  // canonical envelope `{tool_response:{stdout:JSON({plan_invocation:
+  // {state_repo, files, op, target, ...}})}}` into `data` so the reducer's
+  // `extractPlanStateRepo` can lift `state_repo` at fold time. Existing tests
+  // pass neither and get the default empty `data: '{}'` (mint no-ops).
   const data =
     args.files != null && args.stateRepo != null
       ? JSON.stringify({
           tool_response: {
             stdout: JSON.stringify({
-              [envelopeKey]: {
+              plan_invocation: {
                 op: args.op,
                 target: args.target,
                 state_repo: args.stateRepo,
@@ -363,13 +356,13 @@ function planctlEvent(args: {
     session_id: args.sessionId,
     tool_name: "Bash",
     ts: args.ts,
-    planctl_op: args.op,
-    planctl_target: args.target,
-    planctl_epic_id: args.epicId,
-    planctl_task_id: args.taskId ?? null,
-    planctl_subject_present: args.subjectPresent ? 1 : 0,
-    planctl_queue_jump: args.queueJump ? 1 : 0,
-    planctl_files: args.files != null ? JSON.stringify(args.files) : null,
+    plan_op: args.op,
+    plan_target: args.target,
+    plan_epic_id: args.epicId,
+    plan_task_id: args.taskId ?? null,
+    plan_subject_present: args.subjectPresent ? 1 : 0,
+    plan_queue_jump: args.queueJump ? 1 : 0,
+    plan_files: args.files != null ? JSON.stringify(args.files) : null,
     data,
   });
 }
@@ -2506,10 +2499,9 @@ test("planctl mint: scaffold envelope mints source='plan' file_attributions for 
 });
 
 test("plan mint: plan_invocation envelope mints source='plan' file_attributions", () => {
-  // An envelope inlined under the renamed `plan_invocation` key mints
-  // `source='plan'` file_attributions — the post-flip minted value, identical
-  // to what the legacy `planctl_invocation` key folds to (both keys read the
-  // same way; the migration rewrites any pre-flip stored row to match).
+  // An envelope inlined under the `plan_invocation` key mints `source='plan'`
+  // file_attributions. Single-path post-v78: the deriver reads only
+  // `plan_invocation`; the migration rewrote any pre-flip stored row to match.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-mint-renamed" });
   const eventId = planctlEvent({
     sessionId: "sess-mint-renamed",
@@ -2518,7 +2510,6 @@ test("plan mint: plan_invocation envelope mints source='plan' file_attributions"
     epicId: "fn-2-bar",
     subjectPresent: true,
     stateRepo: "/repo-mint-renamed",
-    useRenamedKey: true,
     files: [".keeper/epics/fn-2-bar.json", ".keeper/meta.json"],
     ts: 777,
   });
@@ -2550,7 +2541,7 @@ test("plan mint: plan_invocation envelope mints source='plan' file_attributions"
   ]);
 });
 
-test("planctl mint: null planctl_files (read-only verb) mints no rows", () => {
+test("planctl mint: null plan_files (read-only verb) mints no rows", () => {
   // A read-only verb (`planctl epics`) writes no files — the envelope's
   // `files` field is null, the deriver lifts to null, the mint is a no-op.
   insertEvent({ hook_event: "SessionStart", session_id: "sess-readonly" });
@@ -2560,7 +2551,7 @@ test("planctl mint: null planctl_files (read-only verb) mints no rows", () => {
     target: null,
     epicId: null,
     subjectPresent: false,
-    // No files / stateRepo passed → planctl_files=null, data='{}'.
+    // No files / stateRepo passed → plan_files=null, data='{}'.
   });
   drainAll();
   const count = (
@@ -2571,7 +2562,7 @@ test("planctl mint: null planctl_files (read-only verb) mints no rows", () => {
   expect(count).toBe(0);
 });
 
-test("planctl mint: empty planctl_files array mints no rows (defensive)", () => {
+test("planctl mint: empty plan_files array mints no rows (defensive)", () => {
   // Should never happen at hook write time (the deriver folds empty to
   // null), but a backfill bug could theoretically write `[]` — the
   // reducer's `length > 0` guard catches it.
@@ -2580,12 +2571,12 @@ test("planctl mint: empty planctl_files array mints no rows (defensive)", () => 
     hook_event: "PostToolUse",
     session_id: "sess-empty",
     tool_name: "Bash",
-    planctl_op: "scaffold",
-    planctl_target: "fn-1-foo",
-    planctl_epic_id: "fn-1-foo",
-    planctl_subject_present: 1,
-    planctl_queue_jump: 0,
-    planctl_files: "[]",
+    plan_op: "scaffold",
+    plan_target: "fn-1-foo",
+    plan_epic_id: "fn-1-foo",
+    plan_subject_present: 1,
+    plan_queue_jump: 0,
+    plan_files: "[]",
     data: JSON.stringify({
       tool_response: {
         stdout: JSON.stringify({
@@ -2616,12 +2607,12 @@ test("planctl mint: missing state_repo (corrupt envelope) mints no rows", () => 
     hook_event: "PostToolUse",
     session_id: "sess-norepo",
     tool_name: "Bash",
-    planctl_op: "scaffold",
-    planctl_target: "fn-1-foo",
-    planctl_epic_id: "fn-1-foo",
-    planctl_subject_present: 1,
-    planctl_queue_jump: 0,
-    planctl_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
+    plan_op: "scaffold",
+    plan_target: "fn-1-foo",
+    plan_epic_id: "fn-1-foo",
+    plan_subject_present: 1,
+    plan_queue_jump: 0,
+    plan_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
     // data missing the state_repo field
     data: JSON.stringify({
       tool_response: {
@@ -2652,12 +2643,12 @@ test("planctl mint: malformed event.data folds to no-op (safe value invariant)",
     hook_event: "PostToolUse",
     session_id: "sess-garbage",
     tool_name: "Bash",
-    planctl_op: "scaffold",
-    planctl_target: "fn-1-foo",
-    planctl_epic_id: "fn-1-foo",
-    planctl_subject_present: 1,
-    planctl_queue_jump: 0,
-    planctl_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
+    plan_op: "scaffold",
+    plan_target: "fn-1-foo",
+    plan_epic_id: "fn-1-foo",
+    plan_subject_present: 1,
+    plan_queue_jump: 0,
+    plan_files: JSON.stringify([".keeper/epics/fn-1-foo.json"]),
     data: "{this is not valid json",
   });
   drainAll();
@@ -2669,18 +2660,18 @@ test("planctl mint: malformed event.data folds to no-op (safe value invariant)",
   expect(count).toBe(0);
 });
 
-test("planctl mint: malformed planctl_files JSON folds to no-op", () => {
+test("planctl mint: malformed plan_files JSON folds to no-op", () => {
   insertEvent({ hook_event: "SessionStart", session_id: "sess-badjson" });
   insertEvent({
     hook_event: "PostToolUse",
     session_id: "sess-badjson",
     tool_name: "Bash",
-    planctl_op: "scaffold",
-    planctl_target: "fn-1-foo",
-    planctl_epic_id: "fn-1-foo",
-    planctl_subject_present: 1,
-    planctl_queue_jump: 0,
-    planctl_files: "not valid json",
+    plan_op: "scaffold",
+    plan_target: "fn-1-foo",
+    plan_epic_id: "fn-1-foo",
+    plan_subject_present: 1,
+    plan_queue_jump: 0,
+    plan_files: "not valid json",
     data: JSON.stringify({
       tool_response: {
         stdout: JSON.stringify({
@@ -4535,6 +4526,8 @@ function seedBlobReadStream(): { dischargedPostToolUseId: number } {
       files: [],
       committer_session_id: TEST_UUID,
       committed_at_ms: 210_000,
+      // Commit `data` payload keys (git-worker trailer layer, Decision B) read
+      // by `extractCommit` via `obj.planctl_op` — STAY `planctl_*`.
       planctl_op: "create",
       planctl_target: "fn-1-demo",
       session_id_trailer: TEST_UUID,

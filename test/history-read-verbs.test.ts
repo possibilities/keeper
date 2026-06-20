@@ -72,14 +72,14 @@ function seedEvent(
     toolName?: string | null;
     slashCommand?: string | null;
     skillName?: string | null;
-    planctlOp?: string | null;
+    planOp?: string | null;
     data?: string | null;
   },
 ): void {
   db.run(
     `INSERT INTO events
        (ts, session_id, hook_event, event_type, tool_name,
-        slash_command, skill_name, planctl_op, data)
+        slash_command, skill_name, plan_op, data)
      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       row.ts,
@@ -89,7 +89,7 @@ function seedEvent(
       row.toolName ?? null,
       row.slashCommand ?? null,
       row.skillName ?? null,
-      row.planctlOp ?? null,
+      row.planOp ?? null,
       row.data ?? null,
     ],
   );
@@ -292,7 +292,7 @@ describe("show-session-events", () => {
       sessionId: "s1",
       hookEvent: "PreToolUse",
       toolName: "Bash",
-      planctlOp: "done",
+      planOp: "done",
     });
     seedEvent(db, {
       ts: 250,
@@ -324,7 +324,7 @@ describe("show-session-events", () => {
     expect(parsed.events[1]).toMatchObject({
       hook_event: "PreToolUse",
       tool_name: "Bash",
-      planctl_op: "done",
+      plan_op: "done",
     });
     expect(parsed.events[2]).toMatchObject({
       hook_event: "PreToolUse",

@@ -42,7 +42,7 @@ import {
   parseSessionIdTrailer,
   parseTaskTrailers,
 } from "./derivers";
-import { normalizePlanctlOp } from "./plan-classifier";
+import { normalizePlanOp } from "./plan-classifier";
 import { DEFAULT_DEBOUNCE_MS, isDropError, RescanScheduler } from "./rescan";
 import type { ShutdownMessage } from "./wake-worker";
 
@@ -795,7 +795,7 @@ export interface EnumeratedCommit {
   committer_session_id: string | null;
   task_ids: string[];
   /**
-   * The normalized planctl op (`Planctl-Op:` trailer → {@link normalizePlanctlOp})
+   * The normalized planctl op (`Planctl-Op:` trailer → {@link normalizePlanOp})
    * and validated target ref (`Planctl-Target:` → {@link parsePlanRef}). Both
    * `null` on a non-planctl / malformed commit. Frozen at producer time, read
    * back unchanged by the reducer's edge fold (re-fold determinism).
@@ -1060,8 +1060,8 @@ function coalesceCommitterSessionId(
 
 /**
  * Lift the planctl operation from a commit's `Planctl-Op:` trailer and
- * NORMALIZE it via {@link normalizePlanctlOp} (same vocabulary as the legacy
- * scrape path, so the reducer's `syncPlanctlLinks` union compares both on one
+ * NORMALIZE it via {@link normalizePlanOp} (same vocabulary as the legacy
+ * scrape path, so the reducer's `syncPlanLinks` union compares both on one
  * vocabulary). Take-last on the unfolded block. Returns `null` on empty /
  * non-string input (no such trailer).
  */
@@ -1073,7 +1073,7 @@ function parsePlanctlOpTrailer(raw: string): string | null {
   for (let i = lines.length - 1; i >= 0; i--) {
     const line = (lines[i] ?? "").trim();
     if (line.length === 0) continue;
-    return normalizePlanctlOp(line);
+    return normalizePlanOp(line);
   }
   return null;
 }
@@ -1950,7 +1950,7 @@ function startWorker(): void {
               // commit. The reducer's edge fold reads them (with
               // `committer_session_id`) to mint the commit-derived
               // creator/refiner edge, deduped against the legacy stdout
-              // scrape in `syncPlanctlLinks`.
+              // scrape in `syncPlanLinks`.
               planctl_op: c.planctl_op,
               planctl_target: c.planctl_target,
               committed_at_ms: c.committed_at_ms,

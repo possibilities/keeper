@@ -3,7 +3,7 @@
  * `keeper show-session-events --session-id <id>` — emit the prompt/tool-call
  * spine for one session as a pretty JSON envelope (epic fn-794): the ordered
  * UserPromptSubmit / PreToolUse rows with `ts`, `hook_event`, `tool_name`,
- * `slash_command`, `skill_name`, and `planctl_op`. Read-only over keeper.db so
+ * `slash_command`, `skill_name`, and `plan_op`. Read-only over keeper.db so
  * external consumers stop hand-writing sqlite against a schema keeper owns.
  *
  * The spine fields are all direct `events` columns (derived at ingest), so no
@@ -21,7 +21,7 @@ import { openDb, resolveDbPath } from "../src/db";
 const HELP = `keeper show-session-events --session-id <id> [options]
 
 Emit the prompt/tool-call spine for one session (ts, hook_event, tool_name,
-slash_command, skill_name, planctl_op) as a pretty JSON envelope, ordered
+slash_command, skill_name, plan_op) as a pretty JSON envelope, ordered
 chronologically. Read-only over keeper.db — no commit, no lock.
 
 Options:
@@ -94,7 +94,7 @@ interface SpineRow {
   tool_name: string | null;
   slash_command: string | null;
   skill_name: string | null;
-  planctl_op: string | null;
+  plan_op: string | null;
 }
 
 /**
@@ -110,7 +110,7 @@ function showSessionEvents(
   try {
     return db
       .query(
-        `SELECT ts, hook_event, tool_name, slash_command, skill_name, planctl_op
+        `SELECT ts, hook_event, tool_name, slash_command, skill_name, plan_op
            FROM events
           WHERE session_id = ?
             AND hook_event IN ('UserPromptSubmit', 'PreToolUse')

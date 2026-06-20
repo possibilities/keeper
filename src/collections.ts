@@ -126,7 +126,7 @@ export const JOBS_DESCRIPTOR: CollectionDescriptor = {
   // subscribe is exempt (a detail read of a terminal job still resolves).
   defaultFilter: { state: { not_in: ["ended", "killed"] } },
   // `epic_links`: JSON-TEXT array of the creator/refiner cross-references
-  // `syncPlanctlLinks` maintains, decoded at the read boundary for display.
+  // `syncPlanLinks` maintains, decoded at the read boundary for display.
   jsonColumns: new Set(["epic_links"]),
 };
 
@@ -160,7 +160,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
     // `jsonColumns` (decoding a scalar would corrupt it to `[]`).
     "last_validated_at",
     // `created_by_closer_of` (closer-creator link) + `sort_path`
-    // (materialized-path sort key), both reducer-derived in `syncPlanctlLinks`.
+    // (materialized-path sort key), both reducer-derived in `syncPlanLinks`.
     // `sort_path` lands in `sortable` below; `created_by_closer_of` stays out
     // (downstream branches on its null-ness, not its value).
     "created_by_closer_of",

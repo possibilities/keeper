@@ -11,7 +11,7 @@
  * {@link runQuery} server-worker read seam, builds a pure
  * {@link buildRestoreTier} snapshot of the live jobs grouped by
  * `backend_exec_session_id`, stable-serializes it (sorted keys, ASCII-escaped
- * — same shape `serializePlanctlJson` produces), hashes the serialized bytes,
+ * — same shape `serializePlanJson` produces), hashes the serialized bytes,
  * and rewrites `~/.local/state/keeper/restore.json` via `atomicWriteFile`.
  *
  * **DUMB CURRENT MIRROR (epic fn-817).** The file is a single-tier
@@ -85,7 +85,7 @@ import {
   atomicWriteFile,
   openDb,
   resolveRestorePath,
-  serializePlanctlJson,
+  serializePlanJson,
   sortObjectKeys,
 } from "./db";
 import {
@@ -440,7 +440,7 @@ function tierForHash(
  * Stable-serialize the descriptor for HASHING. Strips the `current` tier's
  * `captured_at` so the informational timestamp doesn't churn the hash on every
  * pulse, then runs the same `sortObjectKeys` → `JSON.stringify(_, null, 2)` →
- * ASCII-escape → trailing-`\n` pipeline `serializePlanctlJson` uses for
+ * ASCII-escape → trailing-`\n` pipeline `serializePlanJson` uses for
  * `.planctl` files. Exported for unit reach (the tests drive the "did content
  * change" gate directly).
  *
@@ -449,7 +449,7 @@ function tierForHash(
  * (with the timestamp intact); only the hash input strips it.
  */
 export function serializeForHash(descriptor: RestoreDescriptor): string {
-  return serializePlanctlJson({
+  return serializePlanJson({
     schema_version: descriptor.schema_version,
     current: tierForHash(descriptor.current),
   });
@@ -459,16 +459,16 @@ export function serializeForHash(descriptor: RestoreDescriptor): string {
  * Stable-serialize the descriptor for DISK. Same pipeline as
  * {@link serializeForHash} but keeps the `current` tier's `captured_at` so a
  * human (or the restore-agents util) can see when the snapshot was last
- * written. The `sortObjectKeys` pass in `serializePlanctlJson` alpha-sorts
+ * written. The `sortObjectKeys` pass in `serializePlanJson` alpha-sorts
  * every nested object's keys, including the `sessions` map's session-name keys,
  * so the output is byte-stable across SELECT order shuffles.
  */
 export function serializeForWrite(descriptor: RestoreDescriptor): string {
   // Run the descriptor through sortObjectKeys explicitly so the test suite
   // can compare against the exact byte sequence the writer emits.
-  // `serializePlanctlJson` does the same sort internally; the redundant call
+  // `serializePlanJson` does the same sort internally; the redundant call
   // is a no-op (sortObjectKeys is idempotent on already-sorted input).
-  return serializePlanctlJson(sortObjectKeys(descriptor));
+  return serializePlanJson(sortObjectKeys(descriptor));
 }
 
 /**

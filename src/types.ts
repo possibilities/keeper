@@ -6,10 +6,10 @@
  * `"creator"` for a `keeper plan epic-create` mutation; `"refiner"` for every
  * other epic-touching mutation inside a window.
  *
- * Footprint source: the deduped union of the `planctl_op` stdout-scrape rows
+ * Footprint source: the deduped union of the `plan_op` stdout-scrape rows
  * AND the durable `Commit`-event trailer facts, so an edge survives a stdout
- * pipe/redirect/truncation that NULLs `events.planctl_op` as long as the
- * planctl commit landed. `syncPlanctlLinks` is the single writer of both
+ * pipe/redirect/truncation that NULLs `events.plan_op` as long as the
+ * plan commit landed. `syncPlanLinks` is the single writer of both
  * `epic_links` and `job_links`; dedup is by `(kind, target)` / `(kind,
  * job_id)`.
  */
@@ -76,7 +76,7 @@ export type PermissionPromptKind = "permission" | "elicitation";
 /**
  * One entry in {@link Epic.job_links} — the symmetric per-epic view of
  * {@link Link}. `job_id` identifies the session whose planctl footprint
- * touched this epic. `syncPlanctlLinks` is the sole writer.
+ * touched this epic. `syncPlanLinks` is the sole writer.
  *
  * Enrichment boundary: the classifier's `JobLink` shape stays thin
  * (`{kind, job_id}`) so it remains a pure function of events; the display
@@ -154,43 +154,43 @@ export interface Event {
    */
   skill_name: string | null;
   /**
-   * Planctl-CLI op parsed from a `PostToolUse:Bash` event's `planctl_invocation`
-   * envelope by {@link import("./derivers").extractPlanctlInvocation}. NULL when
-   * stdout carries no envelope (backed by a partial index `WHERE planctl_op IS
-   * NOT NULL`). ONE of two channels feeding `syncPlanctlLinks` (the `Commit`
+   * Plan-CLI op parsed from a `PostToolUse:Bash` event's `plan_invocation`
+   * envelope by {@link import("./derivers").extractPlanInvocation}. NULL when
+   * stdout carries no envelope (backed by a partial index `WHERE plan_op IS
+   * NOT NULL`). ONE of two channels feeding `syncPlanLinks` (the `Commit`
    * trailer facts are unioned in), but the sole driver of `file_attributions`
-   * planctl rows.
+   * plan rows.
    */
-  planctl_op: string | null;
+  plan_op: string | null;
   /**
-   * Raw planctl target from the envelope — an epic or task id. NULL when the
+   * Raw plan target from the envelope — an epic or task id. NULL when the
    * verb takes no argument or the envelope's `target` is absent/non-string.
    */
-  planctl_target: string | null;
+  plan_target: string | null;
   /**
-   * Parsed planctl epic id — the parent epic of an epic-form or task-form
-   * target. NULL when `planctl_target` is NULL or didn't parse.
+   * Parsed plan epic id — the parent epic of an epic-form or task-form
+   * target. NULL when `plan_target` is NULL or didn't parse.
    */
-  planctl_epic_id: string | null;
+  plan_epic_id: string | null;
   /**
-   * Parsed planctl task id — non-NULL only when the target's parsed shape is
+   * Parsed plan task id — non-NULL only when the target's parsed shape is
    * `task`.
    */
-  planctl_task_id: string | null;
+  plan_task_id: string | null;
   /**
    * Subject-present gate (INTEGER 0/1, lifted to boolean via `=== 1`). `true`
    * when the envelope's `subject` is non-null (a mutation carrying human
-   * content); NULL when `planctl_op` is NULL. Drives creator/refiner
+   * content); NULL when `plan_op` is NULL. Drives creator/refiner
    * classification.
    */
-  planctl_subject_present: number | null;
+  plan_subject_present: number | null;
   /**
    * Queue-jump signal lifted from the envelope's `queue_jump` boolean (INTEGER
    * 0/1). `1` ONLY when the envelope carried literal `true`; NULL when
-   * `planctl_op` is NULL. Projected to `epics.queue_jump` by `syncPlanctlLinks`;
+   * `plan_op` is NULL. Projected to `epics.queue_jump` by `syncPlanLinks`;
    * root epics with `queue_jump = 1` get a `!`-prefix on `sort_path`.
    */
-  planctl_queue_jump: number | null;
+  plan_queue_jump: number | null;
   /**
    * Anthropic tool_use correlator (`toolu_...`) parsed from any event payload
    * by {@link import("./derivers").extractToolUseId}. Backed by a partial
@@ -207,13 +207,13 @@ export interface Event {
    */
   config_dir: string | null;
   /**
-   * JSON-encoded array of repo-relative paths planctl wrote during this op
-   * (the envelope's `files` array). NULL on non-planctl rows and on planctl
+   * JSON-encoded array of repo-relative paths the plan CLI wrote during this op
+   * (the envelope's `files` array). NULL on non-plan rows and on plan
    * rows whose envelope omitted/misshaped `files`. The reducer mints
    * `source='plan'` `file_attributions` rows under the envelope's
    * `state_repo` for every path. NOT a wire-surface column — reducer-only.
    */
-  planctl_files: string | null;
+  plan_files: string | null;
   /**
    * Terminal-multiplexer backend tag the hook captured via pure `process.env`
    * reads. `'tmux'` when the `TMUX` sentinel is set; NULL outside tmux. Paired
@@ -303,7 +303,7 @@ export interface Job {
    *
    * JSON-TEXT, decoded at the read boundary. Sorted ASC on `(kind, target)` —
    * total-order tiebreaker is non-negotiable for byte-identical re-fold.
-   * `syncPlanctlLinks` re-derives this from scratch via `deriveEpicLinks`.
+   * `syncPlanLinks` re-derives this from scratch via `deriveEpicLinks`.
    */
   epic_links: Link[];
   /**
@@ -697,7 +697,7 @@ export interface Epic {
   /**
    * The closer→child link — the closed-epic id of the closer session whose
    * `/plan:plan` window minted THIS epic via `epic-create`. `null` for plain
-   * epics. Reducer-derived in `syncPlanctlLinks` (filtered to
+   * epics. Reducer-derived in `syncPlanLinks` (filtered to
    * `plan_verb='close'`, tie-broken on lowest `job_id`). Immutable once set
    * (one closer-creator per epic), which makes the transitive `sort_path`
    * cascade converge without a cycle. Preserved across an `EpicSnapshot`
@@ -711,7 +711,7 @@ export interface Epic {
    * holds under BINARY collation — a closer-created child slots directly after
    * its parent.
    *
-   * Reducer-derived in `syncPlanctlLinks`:
+   * Reducer-derived in `syncPlanLinks`:
    * - {@link created_by_closer_of} `== null` → `zeroPad6(epic_number)`.
    * - Else → `<parent.sort_path>.<zeroPad6(epic_number)>` (parent-missing
    *   folds to the placeholder `zeroPad6(epic_number)`; a later parent
@@ -725,7 +725,7 @@ export interface Epic {
    */
   sort_path: string;
   /**
-   * Priority-jump flag projected from {@link Event.planctl_queue_jump} (INTEGER
+   * Priority-jump flag projected from {@link Event.plan_queue_jump} (INTEGER
    * 0/1). `1` ONLY when the epic's session emitted a `queue_jump: true`
    * envelope; `0` otherwise. A root epic with `queue_jump = 1` projects
    * `sort_path = "!" + zeroPad6(epic_number)` — the `!` (ASCII 33) sorts below

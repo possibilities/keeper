@@ -11,7 +11,7 @@ import {
   extractBackgroundTasks,
   extractBashMutation,
   extractMutationPath,
-  extractPlanctlInvocation,
+  extractPlanInvocation,
   extractToolUseId,
   isKilledTaskNotification,
   parsePlanRef,
@@ -163,7 +163,7 @@ test("isKilledTaskNotification rejects the empty string", () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractPlanctlInvocation
+// extractPlanInvocation
 // ---------------------------------------------------------------------------
 
 interface Envelope {
@@ -183,14 +183,13 @@ interface Envelope {
 }
 
 /**
- * Wrap a planctl_invocation envelope into the canonical PostToolUse:Bash
- * tool_response.stdout shape — JSON whose top-level `planctl_invocation`
- * key carries the envelope. Mirrors the planctl CLI's stdout-emit shape
- * (`apps/planctl/planctl/cli.py` `emit()`).
+ * Wrap a plan_invocation envelope into the canonical PostToolUse:Bash
+ * tool_response.stdout shape — JSON whose top-level `plan_invocation`
+ * key carries the envelope. Mirrors the plan CLI's stdout-emit shape.
  */
 function post(envelope: Envelope | null): Record<string, unknown> {
   const stdout =
-    envelope === null ? "" : JSON.stringify({ planctl_invocation: envelope });
+    envelope === null ? "" : JSON.stringify({ plan_invocation: envelope });
   return { tool_response: { stdout } };
 }
 
@@ -199,16 +198,16 @@ function postRaw(stdout: unknown): Record<string, unknown> {
   return { tool_response: { stdout } };
 }
 
-test("extractPlanctlInvocation returns null on non-PostToolUse event", () => {
+test("extractPlanInvocation returns null on non-PostToolUse event", () => {
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PreToolUse",
       "Bash",
       post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
     ),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "UserPromptSubmit",
       "Bash",
       post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
@@ -216,11 +215,11 @@ test("extractPlanctlInvocation returns null on non-PostToolUse event", () => {
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation returns null on PostToolUseFailure (prefix-startsWith would false-match)", () => {
+test("extractPlanInvocation returns null on PostToolUseFailure (prefix-startsWith would false-match)", () => {
   // Defense against any future `startsWith('PostToolUse')` shortcut —
   // PostToolUseFailure has no `tool_response` and must not match.
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PostToolUseFailure",
       "Bash",
       post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
@@ -228,16 +227,16 @@ test("extractPlanctlInvocation returns null on PostToolUseFailure (prefix-starts
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation returns null on non-Bash tool", () => {
+test("extractPlanInvocation returns null on non-Bash tool", () => {
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PostToolUse",
       "Skill",
       post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
     ),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PostToolUse",
       null,
       post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
@@ -245,101 +244,101 @@ test("extractPlanctlInvocation returns null on non-Bash tool", () => {
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation returns null on missing tool_response", () => {
-  expect(extractPlanctlInvocation("PostToolUse", "Bash", {})).toBeNull();
+test("extractPlanInvocation returns null on missing tool_response", () => {
+  expect(extractPlanInvocation("PostToolUse", "Bash", {})).toBeNull();
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", { tool_response: null }),
+    extractPlanInvocation("PostToolUse", "Bash", { tool_response: null }),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", {
+    extractPlanInvocation("PostToolUse", "Bash", {
       tool_response: "string",
     }),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation returns null on non-string stdout", () => {
+test("extractPlanInvocation returns null on non-string stdout", () => {
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw(null)),
+    extractPlanInvocation("PostToolUse", "Bash", postRaw(null)),
+  ).toBeNull();
+  expect(extractPlanInvocation("PostToolUse", "Bash", postRaw(42))).toBeNull();
+  expect(
+    extractPlanInvocation("PostToolUse", "Bash", postRaw({ x: 1 })),
+  ).toBeNull();
+  expect(extractPlanInvocation("PostToolUse", "Bash", postRaw(""))).toBeNull();
+});
+
+test("extractPlanInvocation returns null on stdout that isn't JSON", () => {
+  expect(
+    extractPlanInvocation("PostToolUse", "Bash", postRaw("hello world")),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw(42)),
-  ).toBeNull();
-  expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw({ x: 1 })),
-  ).toBeNull();
-  expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("")),
+    extractPlanInvocation("PostToolUse", "Bash", postRaw("ls -la\n")),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation returns null on stdout that isn't JSON", () => {
+test("extractPlanInvocation returns null on malformed JSON", () => {
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("hello world")),
+    extractPlanInvocation("PostToolUse", "Bash", postRaw('{"truncated')),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("ls -la\n")),
-  ).toBeNull();
-});
-
-test("extractPlanctlInvocation returns null on malformed JSON", () => {
-  expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw('{"truncated')),
-  ).toBeNull();
-  expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw("{ not json }")),
+    extractPlanInvocation("PostToolUse", "Bash", postRaw("{ not json }")),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation returns null on JSON without planctl_invocation key", () => {
+test("extractPlanInvocation returns null on JSON without a plan_invocation key", () => {
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw('{"foo":"bar"}')),
+    extractPlanInvocation("PostToolUse", "Bash", postRaw('{"foo":"bar"}')),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PostToolUse",
       "Bash",
-      postRaw('{"planctl_invocation":null}'),
+      postRaw('{"plan_invocation":null}'),
     ),
   ).toBeNull();
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PostToolUse",
       "Bash",
-      postRaw('{"planctl_invocation":"not-an-object"}'),
+      postRaw('{"plan_invocation":"not-an-object"}'),
+    ),
+  ).toBeNull();
+  // A stray LEGACY `planctl_invocation` key is no longer read (single-path
+  // post-v78); without a `plan_invocation` it folds to null.
+  expect(
+    extractPlanInvocation(
+      "PostToolUse",
+      "Bash",
+      postRaw('{"planctl_invocation":{"op":"epic-create"}}'),
     ),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation returns null when stdout exceeds the length cap", () => {
+test("extractPlanInvocation returns null when stdout exceeds the length cap", () => {
   // 64_001 chars of valid JSON-looking text — over the 64_000 cap.
   const oversize = `{${"x".repeat(64_000)}}`;
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", postRaw(oversize)),
+    extractPlanInvocation("PostToolUse", "Bash", postRaw(oversize)),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation reads the renamed plan_invocation key identically to planctl_invocation", () => {
-  // The tolerant fold: a `plan_invocation` envelope (the renamed key) must
-  // extract byte-for-byte the same shape as the legacy `planctl_invocation`.
+test("extractPlanInvocation reads the plan_invocation key (single-path post-v78)", () => {
   const envelope = { op: "epic-create", target: "fn-1-foo", subject: "x" };
-  const legacy = extractPlanctlInvocation(
-    "PostToolUse",
-    "Bash",
-    post(envelope),
-  );
-  const renamed = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     postRaw(JSON.stringify({ plan_invocation: envelope })),
   );
-  expect(legacy).not.toBeNull();
-  expect(renamed).toEqual(legacy);
+  expect(got).not.toBeNull();
+  expect(got?.op).toBe("epic-create");
+  expect(got?.epic_id).toBe("fn-1-foo");
 });
 
-test("extractPlanctlInvocation prefers plan_invocation when both keys are present (no double-read)", () => {
-  // A single event carrying BOTH keys must resolve to the `plan_invocation`
-  // envelope (never merge / never the legacy one), so it folds exactly once.
-  const got = extractPlanctlInvocation(
+test("extractPlanInvocation reads plan_invocation, ignoring a stray legacy planctl_invocation", () => {
+  // Single-path post-v78: the deriver reads ONLY `plan_invocation`. A stray
+  // legacy `planctl_invocation` riding alongside is never read or merged, so
+  // the fold resolves to the `plan_invocation` envelope exactly once.
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     postRaw(
@@ -353,8 +352,8 @@ test("extractPlanctlInvocation prefers plan_invocation when both keys are presen
   expect(got?.epic_id).toBe("fn-1-foo");
 });
 
-test("extractPlanctlInvocation parses epic-create envelope with epic ref", () => {
-  const got = extractPlanctlInvocation(
+test("extractPlanInvocation parses epic-create envelope with epic ref", () => {
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "epic-create", target: "fn-575-foo", subject: "the subject" }),
@@ -370,9 +369,9 @@ test("extractPlanctlInvocation parses epic-create envelope with epic ref", () =>
   });
 });
 
-test("extractPlanctlInvocation parses scaffold envelope with epic ref", () => {
+test("extractPlanInvocation parses scaffold envelope with epic ref", () => {
   // scaffold is the canonical create-an-epic path on this codebase.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -392,10 +391,10 @@ test("extractPlanctlInvocation parses scaffold envelope with epic ref", () => {
   });
 });
 
-test("extractPlanctlInvocation parses epic-close envelope with epic ref", () => {
+test("extractPlanInvocation parses epic-close envelope with epic ref", () => {
   // Two-word verb that the old input-command regex saw as `op=close,
   // target=fn-...` — the envelope carries the real op name.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "epic-close", target: "fn-575-foo", subject: null }),
@@ -411,8 +410,8 @@ test("extractPlanctlInvocation parses epic-close envelope with epic ref", () => 
   });
 });
 
-test("extractPlanctlInvocation parses task-set-tier envelope into epic_id + task_id", () => {
-  const got = extractPlanctlInvocation(
+test("extractPlanInvocation parses task-set-tier envelope into epic_id + task_id", () => {
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "task-set-tier", target: "fn-575-foo.3", subject: "S" }),
@@ -428,8 +427,8 @@ test("extractPlanctlInvocation parses task-set-tier envelope into epic_id + task
   });
 });
 
-test("extractPlanctlInvocation parses envelope with null target (bare-verb mutation)", () => {
-  const got = extractPlanctlInvocation(
+test("extractPlanInvocation parses envelope with null target (bare-verb mutation)", () => {
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "init", target: null, subject: null }),
@@ -445,9 +444,9 @@ test("extractPlanctlInvocation parses envelope with null target (bare-verb mutat
   });
 });
 
-test("extractPlanctlInvocation treats non-ref target as parseable but unresolved", () => {
+test("extractPlanInvocation treats non-ref target as parseable but unresolved", () => {
   // `planctl scaffold spec.json` — target is captured but parsePlanRef yields null.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "scaffold", target: "spec.json", subject: "x" }),
@@ -463,19 +462,19 @@ test("extractPlanctlInvocation treats non-ref target as parseable but unresolved
   });
 });
 
-test("extractPlanctlInvocation marks subject_present:false when subject is missing or null", () => {
+test("extractPlanInvocation marks subject_present:false when subject is missing or null", () => {
   // Envelope where `subject` field is absent or explicitly null → false.
-  const a = extractPlanctlInvocation(
+  const a = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     postRaw(
       JSON.stringify({
-        planctl_invocation: { op: "show", target: "fn-1-foo" },
+        plan_invocation: { op: "show", target: "fn-1-foo" },
       }),
     ),
   );
   expect(a?.subject_present).toBe(false);
-  const b = extractPlanctlInvocation(
+  const b = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "cat", target: "fn-1-foo", subject: null }),
@@ -483,8 +482,8 @@ test("extractPlanctlInvocation marks subject_present:false when subject is missi
   expect(b?.subject_present).toBe(false);
 });
 
-test("extractPlanctlInvocation marks subject_present:true when subject is any non-null value", () => {
-  const got = extractPlanctlInvocation(
+test("extractPlanInvocation marks subject_present:true when subject is any non-null value", () => {
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "epic-set-title", target: "fn-1-foo", subject: "new title" }),
@@ -492,10 +491,10 @@ test("extractPlanctlInvocation marks subject_present:true when subject is any no
   expect(got?.subject_present).toBe(true);
 });
 
-test("extractPlanctlInvocation lifts queue_jump:true from the envelope (schema v30)", () => {
+test("extractPlanInvocation lifts queue_jump:true from the envelope (schema v30)", () => {
   // The canonical `/plan:queue` scaffold path — planctl emits the literal
   // boolean `true` on the envelope, the deriver lifts to `queue_jump: true`.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -516,11 +515,11 @@ test("extractPlanctlInvocation lifts queue_jump:true from the envelope (schema v
   });
 });
 
-test("extractPlanctlInvocation folds queue_jump:false from the envelope (defer / non-queue paths)", () => {
+test("extractPlanInvocation folds queue_jump:false from the envelope (defer / non-queue paths)", () => {
   // `/plan:defer` and every non-queue scaffold path emit the literal
   // boolean `false` (or omit the key entirely). The deriver folds both to
   // `queue_jump: false`.
-  const explicit = extractPlanctlInvocation(
+  const explicit = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -535,7 +534,7 @@ test("extractPlanctlInvocation folds queue_jump:false from the envelope (defer /
   // Absent key (legacy planctl envelope predating v30) — `=== true` is
   // false, so queue_jump folds to `false`. This is the re-fold determinism
   // gate: every historical event lacking the field reproduces `false`.
-  const absent = extractPlanctlInvocation(
+  const absent = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -547,7 +546,7 @@ test("extractPlanctlInvocation folds queue_jump:false from the envelope (defer /
   expect(absent?.queue_jump).toBe(false);
 });
 
-test("extractPlanctlInvocation defensive: non-boolean queue_jump values fold to false", () => {
+test("extractPlanInvocation defensive: non-boolean queue_jump values fold to false", () => {
   // The `=== true` check is intentionally strict — any non-boolean value
   // (string "true", `1`, an object, `null`) folds to `false`. Protects
   // against a buggy planctl emitting the wrong shape.
@@ -558,7 +557,7 @@ test("extractPlanctlInvocation defensive: non-boolean queue_jump values fold to 
     { label: "null", value: null },
   ];
   for (const { value } of cases) {
-    const got = extractPlanctlInvocation(
+    const got = extractPlanInvocation(
       "PostToolUse",
       "Bash",
       post({
@@ -572,11 +571,11 @@ test("extractPlanctlInvocation defensive: non-boolean queue_jump values fold to 
   }
 });
 
-test("extractPlanctlInvocation widens to absolute-path and bash -c invocations (envelope is authoritative)", () => {
+test("extractPlanInvocation widens to absolute-path and bash -c invocations (envelope is authoritative)", () => {
   // The old regex rejected these; the envelope-based deriver accepts them
   // because the envelope rides on stdout regardless of how planctl was
   // invoked. The hook just sees a Bash command whose stdout is JSON.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "epic-create", target: "fn-1-foo", subject: "x" }),
@@ -584,59 +583,59 @@ test("extractPlanctlInvocation widens to absolute-path and bash -c invocations (
   expect(got?.op).toBe("epic-create");
 });
 
-test("extractPlanctlInvocation rejects an envelope missing op", () => {
+test("extractPlanInvocation rejects an envelope missing op", () => {
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PostToolUse",
       "Bash",
       postRaw(
         JSON.stringify({
-          planctl_invocation: { target: "fn-1-foo", subject: "x" },
+          plan_invocation: { target: "fn-1-foo", subject: "x" },
         }),
       ),
     ),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation rejects an envelope with empty-string op", () => {
+test("extractPlanInvocation rejects an envelope with empty-string op", () => {
   expect(
-    extractPlanctlInvocation(
+    extractPlanInvocation(
       "PostToolUse",
       "Bash",
       postRaw(
-        JSON.stringify({ planctl_invocation: { op: "", target: "fn-1-foo" } }),
+        JSON.stringify({ plan_invocation: { op: "", target: "fn-1-foo" } }),
       ),
     ),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation tolerates leading whitespace before the JSON body", () => {
+test("extractPlanInvocation tolerates leading whitespace before the JSON body", () => {
   // planctl envelopes are JSON; tolerate trailing newlines from upstream
   // wrappers and leading whitespace from CLI prefix lines.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     postRaw(
-      `\n  ${JSON.stringify({ planctl_invocation: { op: "init", target: null } })}\n`,
+      `\n  ${JSON.stringify({ plan_invocation: { op: "init", target: null } })}\n`,
     ),
   );
   expect(got?.op).toBe("init");
 });
 
-test("extractPlanctlInvocation never throws on arbitrary garbage", () => {
+test("extractPlanInvocation never throws on arbitrary garbage", () => {
   const garbage: unknown[] = [
     postRaw("\x00\x01\x02"),
     postRaw("not json"),
-    postRaw('{"planctl_invocation":42}'),
-    postRaw('{"planctl_invocation":{"op":null}}'),
-    postRaw('{"planctl_invocation":{"op":"foo","target":42}}'),
+    postRaw('{"plan_invocation":42}'),
+    postRaw('{"plan_invocation":{"op":null}}'),
+    postRaw('{"plan_invocation":{"op":"foo","target":42}}'),
     { tool_response: { stdout: { nested: "object" } } },
     { tool_response: 42 },
     {},
   ];
   for (const data of garbage) {
     expect(() =>
-      extractPlanctlInvocation(
+      extractPlanInvocation(
         "PostToolUse",
         "Bash",
         data as Record<string, unknown>,
@@ -646,13 +645,13 @@ test("extractPlanctlInvocation never throws on arbitrary garbage", () => {
 });
 
 // ---------------------------------------------------------------------------
-// extractPlanctlInvocation — schema v46 / fn-666: `files` lift
+// extractPlanInvocation — schema v46 / fn-666: `files` lift
 // ---------------------------------------------------------------------------
 
-test("extractPlanctlInvocation lifts non-empty files array from the envelope (schema v46)", () => {
+test("extractPlanInvocation lifts non-empty files array from the envelope (schema v46)", () => {
   // Canonical scaffold envelope shape — `files` carries repo-relative
   // paths planctl wrote (every .planctl/{epics,tasks,specs}/...).
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -675,12 +674,12 @@ test("extractPlanctlInvocation lifts non-empty files array from the envelope (sc
   ]);
 });
 
-test("extractPlanctlInvocation folds an absent files key to null", () => {
+test("extractPlanInvocation folds an absent files key to null", () => {
   // Read-only verbs and legacy planctl envelopes omit the field entirely.
   // The deriver folds the absence to `null` so the `events.planctl_files`
   // column's partial-index `WHERE planctl_files IS NOT NULL` stays
   // selective. Re-fold determinism: every legacy event reproduces null.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "epics", target: null, subject: null }),
@@ -688,10 +687,10 @@ test("extractPlanctlInvocation folds an absent files key to null", () => {
   expect(got?.files).toBeNull();
 });
 
-test("extractPlanctlInvocation folds an explicit null files field to null", () => {
+test("extractPlanInvocation folds an explicit null files field to null", () => {
   // The planctl CLI's emit() writes `files: null` on read-only ops
   // (`epics`, `cat`, etc.). Same null-fold path as the absent-key test.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "epics", target: null, subject: null, files: null }),
@@ -699,11 +698,11 @@ test("extractPlanctlInvocation folds an explicit null files field to null", () =
   expect(got?.files).toBeNull();
 });
 
-test("extractPlanctlInvocation folds an empty files array to null", () => {
+test("extractPlanInvocation folds an empty files array to null", () => {
   // An empty `files: []` is functionally equivalent to absent — no mint
   // would land. We collapse it to `null` so the column shape stays
   // sparse + the partial index stays selective.
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({ op: "scaffold", target: "fn-1-foo", subject: "x", files: [] }),
@@ -711,12 +710,12 @@ test("extractPlanctlInvocation folds an empty files array to null", () => {
   expect(got?.files).toBeNull();
 });
 
-test("extractPlanctlInvocation filters non-string elements out of files", () => {
-  // Defensive — `extractPlanctlInvocation` mirrors `bash_mutation_targets`'s
+test("extractPlanInvocation filters non-string elements out of files", () => {
+  // Defensive — `extractPlanInvocation` mirrors `bash_mutation_targets`'s
   // Array.isArray + per-element string filter. Mixed-type entries (a buggy
   // planctl) are dropped; valid strings ride through. If filtering empties
   // the array entirely, the result folds to `null` (no mint).
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -738,8 +737,8 @@ test("extractPlanctlInvocation filters non-string elements out of files", () => 
   ]);
 });
 
-test("extractPlanctlInvocation folds an all-non-string files array to null", () => {
-  const got = extractPlanctlInvocation(
+test("extractPlanInvocation folds an all-non-string files array to null", () => {
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -752,11 +751,11 @@ test("extractPlanctlInvocation folds an all-non-string files array to null", () 
   expect(got?.files).toBeNull();
 });
 
-test("extractPlanctlInvocation folds a non-array files value to null (defensive)", () => {
+test("extractPlanInvocation folds a non-array files value to null (defensive)", () => {
   // A corrupt envelope might carry a string / object / number for `files`.
   // The deriver folds these to `null` (matching every other shape-mismatch
   // path) — never throws, never coerces.
-  const stringFiles = extractPlanctlInvocation(
+  const stringFiles = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -767,7 +766,7 @@ test("extractPlanctlInvocation folds a non-array files value to null (defensive)
     }),
   );
   expect(stringFiles?.files).toBeNull();
-  const objectFiles = extractPlanctlInvocation(
+  const objectFiles = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -780,13 +779,13 @@ test("extractPlanctlInvocation folds a non-array files value to null (defensive)
   expect(objectFiles?.files).toBeNull();
 });
 
-test("extractPlanctlInvocation folds an oversized files array to null (runaway guard)", () => {
+test("extractPlanInvocation folds an oversized files array to null (runaway guard)", () => {
   // Generous cap — a real scaffold writes <20 paths. An array way past the
   // cap is almost certainly a corrupt envelope, and storing it would burn
   // disk space + parse budget downstream. The deriver folds the whole lift
   // to `null` rather than truncating (truncation is silently lossy).
   const oversized = Array.from({ length: 1000 }, (_, i) => `f${i}.txt`);
-  const got = extractPlanctlInvocation(
+  const got = extractPlanInvocation(
     "PostToolUse",
     "Bash",
     post({
@@ -799,7 +798,7 @@ test("extractPlanctlInvocation folds an oversized files array to null (runaway g
   expect(got?.files).toBeNull();
 });
 
-test("extractPlanctlInvocation files lift never throws on arbitrary garbage", () => {
+test("extractPlanInvocation files lift never throws on arbitrary garbage", () => {
   // Mirrors the existing exit-0-contract test — the new files branch must
   // also be unconditionally defensive.
   const garbageFiles: unknown[] = [
@@ -810,7 +809,7 @@ test("extractPlanctlInvocation files lift never throws on arbitrary garbage", ()
   ];
   for (const files of garbageFiles) {
     expect(() =>
-      extractPlanctlInvocation(
+      extractPlanInvocation(
         "PostToolUse",
         "Bash",
         post({ op: "scaffold", target: "fn-1-foo", subject: "x", files }),
@@ -869,7 +868,7 @@ test("extractToolUseId never throws on arbitrary garbage shapes", () => {
 });
 
 test("extractToolUseId fires regardless of hook event / tool name (broad gate)", () => {
-  // Unlike extractSkillName / extractPlanctlInvocation, this deriver has no
+  // Unlike extractSkillName / extractPlanInvocation, this deriver has no
   // event/tool gate — Pre/PostToolUse + PostToolUseFailure on every tool
   // carries the field. The deriver itself only sees `data`, so any payload
   // shape with `data.tool_use_id` populates the column. The hook caller
@@ -1403,7 +1402,7 @@ test("extractBackgroundTaskId: non-PostToolUse hook event returns null", () => {
 });
 
 test("extractBackgroundTaskId: PostToolUseFailure does NOT match (defense vs prefix-startsWith)", () => {
-  // Mirrors the extractPlanctlInvocation hardening for PostToolUseFailure —
+  // Mirrors the extractPlanInvocation hardening for PostToolUseFailure —
   // a strict `===` keeps the gate honest.
   expect(
     extractBackgroundTaskId("PostToolUseFailure", "Monitor", {

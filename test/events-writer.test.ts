@@ -56,7 +56,7 @@ import {
   parseEventLogLine,
 } from "../src/dead-letter";
 import {
-  extractPlanctlInvocation,
+  extractPlanInvocation,
   extractSkillName,
   extractToolUseId,
   planVerbRefFromSpawnName,
@@ -789,13 +789,13 @@ test("skill_name stays NULL on a PreToolUse non-Skill tool", () => {
 // Hook process integration (v14): planctl_* columns end-to-end
 // ---------------------------------------------------------------------------
 
-test("hook writes planctl_* columns on PostToolUse:Bash with a planctl envelope on stdout", async () => {
+test("hook writes plan_* columns on PostToolUse:Bash with a plan envelope on stdout", async () => {
   // Mutation verb on an epic id: subject_present=1, epic_id stamped,
   // task_id NULL (epic-form ref). The envelope (top-level
-  // `planctl_invocation` key in tool_response.stdout) is the authoritative
-  // source — what `planctl epic-create fn-N-foo "subject"` actually emits.
+  // `plan_invocation` key in tool_response.stdout) is the authoritative
+  // source — what `keeper plan epic-create fn-N-foo "subject"` actually emits.
   const stdout = JSON.stringify({
-    planctl_invocation: {
+    plan_invocation: {
       op: "epic-create",
       target: "fn-42-foo",
       subject: "the subject",
@@ -806,31 +806,31 @@ test("hook writes planctl_* columns on PostToolUse:Bash with a planctl envelope 
     session_id: "sess-planctl-create",
     cwd: "/tmp/work",
     tool_name: "Bash",
-    tool_input: { command: 'planctl epic-create fn-42-foo "the subject"' },
+    tool_input: { command: 'keeper plan epic-create fn-42-foo "the subject"' },
     tool_response: { stdout },
   });
   expect(code).toBe(0);
 
   const b = readEventBinding("sess-planctl-create");
-  expect(b?.planctl_op).toBe("epic-create");
-  expect(b?.planctl_target).toBe("fn-42-foo");
-  expect(b?.planctl_epic_id).toBe("fn-42-foo");
-  expect(b?.planctl_task_id).toBeNull();
-  expect(b?.planctl_subject_present).toBe(1);
+  expect(b?.plan_op).toBe("epic-create");
+  expect(b?.plan_target).toBe("fn-42-foo");
+  expect(b?.plan_epic_id).toBe("fn-42-foo");
+  expect(b?.plan_task_id).toBeNull();
+  expect(b?.plan_subject_present).toBe(1);
 });
 
 // The deriver-shape cases below (task-ref split, no-envelope, PreToolUse gate)
-// exercise `extractPlanctlInvocation` directly — the kept epic-create spawn
+// exercise `extractPlanInvocation` directly — the kept epic-create spawn
 // above proves the PostToolUse:Bash → columns wiring end-to-end, so re-spawning
 // per shape only re-runs the deriver inside a subprocess. Convert to in-process
 // calls of the exported deriver over the exact payload shapes the hook lifts
 // (fn-722 task .5 thinning; deriver internals also covered by derivers.test.ts).
-test("extractPlanctlInvocation splits a read-only verb on a task-form ref", () => {
+test("extractPlanInvocation splits a read-only verb on a task-form ref", () => {
   // subject_present=false, epic_id + task_id both stamped via parsePlanRef.
   const stdout = JSON.stringify({
-    planctl_invocation: { op: "cat", target: "fn-42-foo.3", subject: null },
+    plan_invocation: { op: "cat", target: "fn-42-foo.3", subject: null },
   });
-  const got = extractPlanctlInvocation("PostToolUse", "Bash", {
+  const got = extractPlanInvocation("PostToolUse", "Bash", {
     tool_response: { stdout },
   });
   expect(got).not.toBeNull();
@@ -841,20 +841,20 @@ test("extractPlanctlInvocation splits a read-only verb on a task-form ref", () =
   expect(got?.subject_present).toBe(false);
 });
 
-test("extractPlanctlInvocation returns null when stdout carries no envelope", () => {
-  // Plain-text Bash stdout → all planctl_* columns stay NULL (selective index).
+test("extractPlanInvocation returns null when stdout carries no envelope", () => {
+  // Plain-text Bash stdout → all plan_* columns stay NULL (selective index).
   expect(
-    extractPlanctlInvocation("PostToolUse", "Bash", {
+    extractPlanInvocation("PostToolUse", "Bash", {
       tool_response: { stdout: "drwxr-xr-x  ... /tmp\n" },
     }),
   ).toBeNull();
 });
 
-test("extractPlanctlInvocation is gated to PostToolUse (PreToolUse → null)", () => {
+test("extractPlanInvocation is gated to PostToolUse (PreToolUse → null)", () => {
   // PreToolUse:Bash carries no tool_response envelope — the gate keeps the
   // columns NULL even on a planctl command.
   expect(
-    extractPlanctlInvocation("PreToolUse", "Bash", {
+    extractPlanInvocation("PreToolUse", "Bash", {
       tool_input: { command: "planctl epic-create fn-1-bar" },
     }),
   ).toBeNull();
@@ -876,7 +876,7 @@ test("hook exits 0 on PostToolUse:Bash with a malformed tool_response.stdout (de
 
   const b = readEventBinding("sess-planctl-malformed");
   expect(b).not.toBeNull();
-  expect(b?.planctl_op).toBeNull();
+  expect(b?.plan_op).toBeNull();
 });
 
 test("end-to-end: hook append → ingester → events row → fold derives jobs.plan_verb/plan_ref", async () => {

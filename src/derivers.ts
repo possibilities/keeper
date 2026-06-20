@@ -378,7 +378,7 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
 }
 
 /**
- * The shape returned by {@link extractPlanctlInvocation}. A `null` return
+ * The shape returned by {@link extractPlanInvocation}. A `null` return
  * signals "not a planctl invocation we care about". `target` / `epic_id` /
  * `task_id` may individually be `null` when the verb takes no argument or its
  * argument is not a parseable planctl ref.
@@ -391,7 +391,7 @@ export function parsePlanRef(ref: string | null): ParsedPlanRef | null {
  * to `false`. Drives the `!`-prefix `sort_path` so queued work sorts atop the
  * board.
  */
-export interface PlanctlInvocation {
+export interface PlanInvocation {
   op: string;
   target: string | null;
   epic_id: string | null;
@@ -425,8 +425,8 @@ const PLANCTL_FILES_CAP = 500;
  * Extract a planctl-CLI invocation envelope from a `PostToolUse:Bash`'s
  * `data.tool_response.stdout`. Gated EXACTLY on `(PostToolUse, Bash)`
  * (`PostToolUseFailure` has no `tool_response` and must not match); the buffer
- * must parse as JSON carrying a top-level `plan_invocation` (preferred) or
- * legacy `planctl_invocation` envelope key.
+ * must parse as JSON carrying a top-level `plan_invocation` envelope key (the
+ * v78 migration rewrote every legacy `planctl_invocation` envelope forward).
  *
  * The envelope is the AUTHORITATIVE mutation sentinel — planctl writes it on
  * every mutating call and no other, regardless of how it was invoked.
@@ -438,11 +438,11 @@ const PLANCTL_FILES_CAP = 500;
  * so a re-fold reproduces the same epic links. NEVER throws — every
  * shape-mismatch path returns `null`.
  */
-export function extractPlanctlInvocation(
+export function extractPlanInvocation(
   hookEvent: string,
   toolName: string | null,
   data: Record<string, unknown>,
-): PlanctlInvocation | null {
+): PlanInvocation | null {
   if (hookEvent !== "PostToolUse" || toolName !== "Bash") {
     return null;
   }
@@ -478,11 +478,12 @@ export function extractPlanctlInvocation(
   if (typeof parsed !== "object" || parsed === null) {
     return null;
   }
-  // Tolerate BOTH envelope keys: the renamed `plan_invocation` wins when present,
-  // else fall back to the legacy `planctl_invocation`. Preferring one (never
-  // merging) guarantees a single event with both keys folds exactly once.
+  // Single-path read of the `plan_invocation` envelope. The v78 migration
+  // rewrote every historical `planctl_invocation` envelope → `plan_invocation`
+  // and the producer (the plan CLI) emits only `plan_invocation`, so the legacy
+  // fallback coalesce is gone — no canonical event carries the old key.
   const parsedObj = parsed as Record<string, unknown>;
-  const envelope = parsedObj.plan_invocation ?? parsedObj.planctl_invocation;
+  const envelope = parsedObj.plan_invocation;
   if (typeof envelope !== "object" || envelope === null) {
     return null;
   }

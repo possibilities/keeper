@@ -38,7 +38,7 @@ import {
   deriveJobLinks,
   type EpicLink,
   type JobLink,
-  normalizePlanctlOp,
+  normalizePlanOp,
 } from "./plan-classifier";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import {
@@ -2193,7 +2193,7 @@ function retractGitStatus(db: Database, event: Event): void {
 /**
  * Threshold above which a Commit fold emits a `[commitfold-breakdown]` line
  * splitting the per-file discharge loop vs {@link foldCommitTaskLinks} vs the
- * {@link syncPlanctlLinks} fan-out (the commit-trailer edge rebuild — the
+ * {@link syncPlanLinks} fan-out (the commit-trailer edge rebuild — the
  * O(children) JSON RMW). Commit averages 2.5s on the live DB; the split
  * convicts which sub-step holds the write lock. Gated so steady folds stay
  * silent. Pure instrumentation — never read into a projection write.
@@ -2211,7 +2211,7 @@ function foldCommit(db: Database, event: Event): void {
   // happened to carry zero files must still land its fact row for the two views
   // to agree. The condition — committer_session_id + planctl_op + planctl_target
   // all non-null — is exactly the loader/backfill keep condition (DELIBERATELY
-  // wider than the syncPlanctlLinks trigger gate below, which additionally
+  // wider than the syncPlanLinks trigger gate below, which additionally
   // requires `parsePlanRef(target).kind != null`). `INSERT OR IGNORE` keys on the
   // `event_id` PK so a re-fold over the same `Commit` event is idempotent.
   if (
@@ -2221,8 +2221,8 @@ function foldCommit(db: Database, event: Event): void {
   ) {
     db.run(
       `INSERT OR IGNORE INTO commit_trailer_facts (
-         event_id, committer_session_id, planctl_op, planctl_target,
-         planctl_epic_id, committed_at_ms
+         event_id, committer_session_id, plan_op, plan_target,
+         plan_epic_id, committed_at_ms
        ) VALUES (?, ?, ?, ?, ?, ?)`,
       [
         event.id,
@@ -2356,16 +2356,16 @@ function foldCommit(db: Database, event: Event): void {
     }
     // Durable commit-derived creator/refiner edge. When the commit carried a
     // `Planctl-Op` + epic-shaped `Planctl-Target` + `Session-Id`, TRIGGER the
-    // session's edge rebuild — `syncPlanctlLinks` re-derives `jobs.epic_links` +
+    // session's edge rebuild — `syncPlanLinks` re-derives `jobs.epic_links` +
     // the epic's `epics.job_links` from the union of the stdout scrape and this
     // commit-trailer fact. We TRIGGER (never write the edge cells directly) so
-    // `syncPlanctlLinks` stays the sole writer. A non-planctl commit has NULL
+    // `syncPlanLinks` stays the sole writer. A non-planctl commit has NULL
     // `planctl_op` and no-ops, preserving re-fold determinism over the log.
     const _cfT2 = performance.now();
-    // Arm the syncPlanctlLinks fan-out accumulator so the breakdown line can
+    // Arm the syncPlanLinks fan-out accumulator so the breakdown line can
     // carry the planctl cardinality (touched epics / swept sessions / trailer
     // facts). Pure instrumentation; the value is read only by console.error.
-    _syncPlanctlLinksAccum = {
+    _syncPlanLinksAccum = {
       calls: 0,
       touchedEpics: 0,
       sweptSessions: 0,
@@ -2377,10 +2377,10 @@ function foldCommit(db: Database, event: Event): void {
       commit.planctl_target != null &&
       parsePlanRef(commit.planctl_target)?.kind != null
     ) {
-      syncPlanctlLinks(db, commit.committer_session_id, eventId, eventTs);
+      syncPlanLinks(db, commit.committer_session_id, eventId, eventTs);
     }
-    const _cfPlanctlAccum = _syncPlanctlLinksAccum;
-    _syncPlanctlLinksAccum = null;
+    const _cfPlanctlAccum = _syncPlanLinksAccum;
+    _syncPlanLinksAccum = null;
     // Slow-fold breakdown — localizes a [fold-slow] Commit (per-session arm) to
     // a sub-step. nfiles/ntasks give the fan-out cardinality; the planctl_*
     // counters split the trailer-fact load + sweep shape out of planctl_fanout.
@@ -2393,7 +2393,7 @@ function foldCommit(db: Database, event: Event): void {
           `discharge_loop=${(_cfT1 - _cfT0).toFixed(0)}ms ` +
           `task_links=${(_cfT2 - _cfT1).toFixed(0)}ms ` +
           `planctl_fanout=${(performance.now() - _cfT2).toFixed(0)}ms ` +
-          formatSyncPlanctlFanout(_cfPlanctlAccum),
+          formatSyncPlanFanout(_cfPlanctlAccum),
       );
     }
     return;
@@ -4917,34 +4917,34 @@ function syncJobIntoEpic(
 let _syncIfPlanRefAccumMs: number | null = null;
 
 /**
- * When non-null, {@link syncPlanctlLinks} accumulates its fan-out cardinality
+ * When non-null, {@link syncPlanLinks} accumulates its fan-out cardinality
  * (touched epics, swept sessions) and the commit-trailer load cost into this
  * object. Armed ONLY around the dispatch sites in {@link applyEvent} (the
  * commit, PostToolUse, and PreToolUse breakdown arms) so the breakdown lines can
  * carry the planctl fan-out shape without threading a param through the two fixed
- * `syncPlanctlLinks` call sites. `calls` counts invocations so a fold that fires
+ * `syncPlanLinks` call sites. `calls` counts invocations so a fold that fires
  * the fan-out more than once still reports a faithful total. Pure
  * instrumentation: never read into a projection write, never influences a branch
  * — re-fold determinism is untouched. A fold is single-threaded, so the
  * module-scoped accumulator can't interleave.
  */
-interface SyncPlanctlLinksAccum {
+interface SyncPlanLinksAccum {
   calls: number;
   touchedEpics: number;
   sweptSessions: number;
   factsRows: number;
   factsLoadMs: number;
 }
-let _syncPlanctlLinksAccum: SyncPlanctlLinksAccum | null = null;
+let _syncPlanLinksAccum: SyncPlanLinksAccum | null = null;
 
 /**
- * Render the armed {@link SyncPlanctlLinksAccum} as a single breakdown segment
+ * Render the armed {@link SyncPlanLinksAccum} as a single breakdown segment
  * (the `planctl_fanout=` field shared across the commit / PostToolUse /
  * PreToolUse breakdown lines). `calls=0` means the fold never reached
- * `syncPlanctlLinks`, so the cardinality counters are all zero — still emitted
+ * `syncPlanLinks`, so the cardinality counters are all zero — still emitted
  * verbatim so the absence is legible. Pure formatter; reads only the accumulator.
  */
-function formatSyncPlanctlFanout(acc: SyncPlanctlLinksAccum): string {
+function formatSyncPlanFanout(acc: SyncPlanLinksAccum): string {
   return (
     `planctl_calls=${acc.calls} ` +
     `planctl_touched_epics=${acc.touchedEpics} ` +
@@ -5044,7 +5044,7 @@ function sortJobLinks(
  * Enrich a thin classifier-output `JobLink` (`{kind, job_id}`) into the widened
  * `JobLinkEntry` shape carried on `epics.job_links`, adding the display +
  * annotation fields off the post-write `jobs` row. Shared between
- * `syncPlanctlLinks` and `syncJobLinksOnJobWrite` so both produce identical JSON.
+ * `syncPlanLinks` and `syncJobLinksOnJobWrite` so both produce identical JSON.
  *
  * On a missing `jobs` row, returns the zero-event defaults with the api-error
  * columns as explicit JSON nulls (NOT omitted) — omitting keys vs. emitting
@@ -5174,7 +5174,7 @@ function syncJobLinksOnJobWrite(
       // No epic row yet — shell-insert. The EpicSnapshot ON CONFLICT carve-out
       // preserves `job_links` / `created_by_closer_of` / `sort_path` /
       // `queue_jump`, so a later snapshot can't wipe the enriched payload; the
-      // next `syncPlanctlLinks` computes the closer columns. `queue_jump` is
+      // next `syncPlanLinks` computes the closer columns. `queue_jump` is
       // omitted so SQLite fills its `NOT NULL DEFAULT 0`.
       db.run(
         `INSERT INTO epics (
@@ -5194,7 +5194,7 @@ function syncJobLinksOnJobWrite(
  * payload / missing envelope / non-string `state_repo` folds to `null` (the
  * mint is a no-op then), keeping the fold tx sacred.
  */
-function extractPlanctlStateRepo(event: Event): string | null {
+function extractPlanStateRepo(event: Event): string | null {
   if (event.data == null || event.data.length === 0) {
     return null;
   }
@@ -5209,8 +5209,9 @@ function extractPlanctlStateRepo(event: Event): string | null {
   }
   // Two equivalent envelope shapes: (1) the canonical PostToolUse:Bash hook
   // payload `{tool_response:{stdout:"{...plan_invocation...}"}}`, and (2) a
-  // top-level inlined envelope (synthetic / test events). BOTH the renamed
-  // `plan_invocation` (preferred) and legacy `planctl_invocation` keys are read.
+  // top-level inlined envelope (synthetic / test events). Single-path read of
+  // `plan_invocation` — the v78 migration rewrote every legacy
+  // `planctl_invocation` envelope forward, so no canonical event carries it.
   const obj = parsed as Record<string, unknown>;
   // Path 1: hook payload — dive through tool_response.stdout.
   const toolResponse = obj.tool_response;
@@ -5222,14 +5223,14 @@ function extractPlanctlStateRepo(event: Event): string | null {
         inner = JSON.parse(stdout);
       } catch {
         // Fall through to path 2 — the stdout might not be JSON for a
-        // non-planctl event, but the planctl_op gate above already ensured
-        // this IS a planctl envelope, so the stdout should parse. A parse
+        // non-plan event, but the plan_op gate above already ensured
+        // this IS a plan envelope, so the stdout should parse. A parse
         // miss here is a malformed payload — fold to null.
         inner = null;
       }
       if (typeof inner === "object" && inner !== null) {
         const innerObj = inner as Record<string, unknown>;
-        const env = innerObj.plan_invocation ?? innerObj.planctl_invocation;
+        const env = innerObj.plan_invocation;
         if (typeof env === "object" && env !== null) {
           const sr = (env as Record<string, unknown>).state_repo;
           if (typeof sr === "string" && sr.length > 0) {
@@ -5240,7 +5241,7 @@ function extractPlanctlStateRepo(event: Event): string | null {
     }
   }
   // Path 2: top-level inlined envelope (synthetic / test shape).
-  const topLevelEnv = obj.plan_invocation ?? obj.planctl_invocation;
+  const topLevelEnv = obj.plan_invocation;
   if (typeof topLevelEnv === "object" && topLevelEnv !== null) {
     const sr = (topLevelEnv as Record<string, unknown>).state_repo;
     if (typeof sr === "string" && sr.length > 0) {
@@ -5252,7 +5253,7 @@ function extractPlanctlStateRepo(event: Event): string | null {
 
 /**
  * Mint one `source='plan'` `file_attributions` row per path in the event's
- * `planctl_files` array, keyed under the envelope's `state_repo` +
+ * `plan_files` array, keyed under the envelope's `state_repo` +
  * `event.session_id` + the repo-relative path. Without it, `.planctl/...` files
  * (written by the planctl CLI, not a Claude Write/Edit or recognized bash
  * mutation) would appear as strict-mystery orphans on the next `GitSnapshot`.
@@ -5263,23 +5264,23 @@ function extractPlanctlStateRepo(event: Event): string | null {
  * <repo-relative>`. `worktree_oid` / `worktree_mode` ride NULL — the next
  * GitSnapshot's `refreshWorktreeOidStmt` stamps them. All inputs are pure
  * event-derived, so re-fold is byte-identical. No-op (cursor still advances)
- * when `planctl_op` / `planctl_files` are absent or `state_repo` can't be
+ * when `plan_op` / `plan_files` are absent or `state_repo` can't be
  * lifted. NEVER throws.
  */
-function mintPlanctlFileAttributions(db: Database, event: Event): void {
-  if (event.planctl_op == null || event.planctl_files == null) {
+function mintPlanFileAttributions(db: Database, event: Event): void {
+  if (event.plan_op == null || event.plan_files == null) {
     return;
   }
   let files: unknown;
   try {
-    files = JSON.parse(event.planctl_files);
+    files = JSON.parse(event.plan_files);
   } catch {
     return;
   }
   if (!Array.isArray(files) || files.length === 0) {
     return;
   }
-  const stateRepo = extractPlanctlStateRepo(event);
+  const stateRepo = extractPlanStateRepo(event);
   if (stateRepo === null) {
     return;
   }
@@ -5312,7 +5313,7 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
       event.session_id,
       rawPath,
       event.ts,
-      event.planctl_op,
+      event.plan_op,
       event.id,
       event.ts,
     );
@@ -5326,8 +5327,8 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
  * NOT share code. Re-derives from scratch on every triggering event
  * (full-replace, never delta-merge) for byte-identical re-fold:
  *
- *   1. Load every planctl invocation for `sessionId` — the UNION of the legacy
- *      `events.planctl_op` stdout-scrape rows and durable commit-trailer facts
+ *   1. Load every plan invocation for `sessionId` — the UNION of the legacy
+ *      `events.plan_op` stdout-scrape rows and durable commit-trailer facts
  *      ({@link commitTrailerInvocationsFor}). The classifier dedups, so a
  *      scrape and a commit for the same op collapse to one edge; a scaffold
  *      whose scrape yielded NULL still produces a creator edge via the commit
@@ -5347,7 +5348,7 @@ function mintPlanctlFileAttributions(db: Database, event: Event): void {
  * built by a single indexed read of the `commit_trailer_facts` projection (the
  * fn-807 table — zero `Commit`-blob scans, replacing the old per-session +
  * per-epic-sweep scans that re-walked every `Commit` blob once per swept
- * session). {@link syncPlanctlLinks} loads this once per call and reuses it for
+ * session). {@link syncPlanLinks} loads this once per call and reuses it for
  * the current session's facts, the cross-session sweep, and the per-epic
  * rebuild.
  *
@@ -5373,7 +5374,7 @@ interface CommitTrailerFacts {
  *
  * Each row maps to one {@link ClassifierInvocation} with `ts = committed_at_ms /
  * 1000` (so it falls inside the open-ended final `/plan:plan` window),
- * `epic_id` the stored `planctl_epic_id` (frozen at write time via the same
+ * `epic_id` the stored `plan_epic_id` (frozen at write time via the same
  * target→epic split the scrape deriver uses), and `subject_present = true` (a
  * trailer only rides a mutating chore commit). `ORDER BY event_id ASC` is the
  * same total order the old `ORDER BY events.id ASC` produced, so the
@@ -5383,26 +5384,26 @@ interface CommitTrailerFacts {
 function loadAllCommitTrailerFacts(db: Database): CommitTrailerFacts {
   const rows = db
     .query(
-      `SELECT event_id, committer_session_id, planctl_op, planctl_target,
-              planctl_epic_id, committed_at_ms
+      `SELECT event_id, committer_session_id, plan_op, plan_target,
+              plan_epic_id, committed_at_ms
          FROM commit_trailer_facts
         ORDER BY event_id ASC`,
     )
     .all() as {
     event_id: number;
     committer_session_id: string;
-    planctl_op: string;
-    planctl_target: string;
-    planctl_epic_id: string | null;
+    plan_op: string;
+    plan_target: string;
+    plan_epic_id: string | null;
     committed_at_ms: number;
   }[];
   const factsBySession = new Map<string, ClassifierInvocation[]>();
   for (const r of rows) {
     const inv: ClassifierInvocation = {
       ts: r.committed_at_ms / 1000,
-      op: r.planctl_op,
-      target: r.planctl_target,
-      epic_id: r.planctl_epic_id,
+      op: r.plan_op,
+      target: r.plan_target,
+      epic_id: r.plan_epic_id,
       subject_present: true,
       event_id: r.event_id,
     };
@@ -5430,7 +5431,7 @@ function commitTrailerInvocationsFor(
 
 /**
  * Every distinct `committer_session_id` whose commit-trailer facts touch ANY of
- * `epicIds` — the commit-channel counterpart to {@link syncPlanctlLinks}'s
+ * `epicIds` — the commit-channel counterpart to {@link syncPlanLinks}'s
  * scrape-side session sweep. Without it, a session that ONLY ever produced
  * commit-trailer edges would be invisible to the per-epic `deriveJobLinks`
  * rebuild. A commit "touches" an epic when the trailer's target parses to that
@@ -5459,7 +5460,7 @@ function commitTrailerSessionsForEpics(
   return sessions;
 }
 
-function syncPlanctlLinks(
+function syncPlanLinks(
   db: Database,
   sessionId: string,
   eventId: number,
@@ -5475,20 +5476,20 @@ function syncPlanctlLinks(
 
   // Load EVERY commit-trailer fact in ONE pass and group by session. Reused
   // for this session's facts, the cross-session sweep, and the per-epic
-  // rebuild below — so a `syncPlanctlLinks` call performs exactly one
+  // rebuild below — so a `syncPlanLinks` call performs exactly one
   // commit-trailer load instead of the old ~2 + one-per-swept-session scans.
   // Loaded before the `touchedEpics.size === 0` gate because the current
   // session's own facts (unioned just below) are needed before that return.
-  const _splFactsT0 = _syncPlanctlLinksAccum != null ? performance.now() : 0;
+  const _splFactsT0 = _syncPlanLinksAccum != null ? performance.now() : 0;
   const commitFacts = loadAllCommitTrailerFacts(db);
-  if (_syncPlanctlLinksAccum != null) {
-    _syncPlanctlLinksAccum.calls += 1;
-    _syncPlanctlLinksAccum.factsLoadMs += performance.now() - _splFactsT0;
+  if (_syncPlanLinksAccum != null) {
+    _syncPlanLinksAccum.calls += 1;
+    _syncPlanLinksAccum.factsLoadMs += performance.now() - _splFactsT0;
     let _factsRows = 0;
     for (const invs of commitFacts.factsBySession.values()) {
       _factsRows += invs.length;
     }
-    _syncPlanctlLinksAccum.factsRows += _factsRows;
+    _syncPlanLinksAccum.factsRows += _factsRows;
   }
 
   // Load this session's planctl invocations (ASC by event id — the `id`
@@ -5496,26 +5497,26 @@ function syncPlanctlLinks(
   // partial composite index serves this without a full-table scan.
   const invRows = db
     .query(
-      `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
-              planctl_subject_present
+      `SELECT id, ts, plan_op, plan_target, plan_epic_id,
+              plan_subject_present
          FROM events
-        WHERE session_id = ? AND planctl_op IS NOT NULL
+        WHERE session_id = ? AND plan_op IS NOT NULL
         ORDER BY id ASC`,
     )
     .all(sessionId) as {
     id: number;
     ts: number;
-    planctl_op: string;
-    planctl_target: string | null;
-    planctl_epic_id: string | null;
-    planctl_subject_present: number | null;
+    plan_op: string;
+    plan_target: string | null;
+    plan_epic_id: string | null;
+    plan_subject_present: number | null;
   }[];
   const invocations: ClassifierInvocation[] = invRows.map((r) => ({
     ts: r.ts,
-    op: normalizePlanctlOp(r.planctl_op),
-    target: r.planctl_target,
-    epic_id: r.planctl_epic_id,
-    subject_present: r.planctl_subject_present === 1,
+    op: normalizePlanOp(r.plan_op),
+    target: r.plan_target,
+    epic_id: r.plan_epic_id,
+    subject_present: r.plan_subject_present === 1,
     event_id: r.id,
   }));
   // UNION the durable commit-trailer facts — the classifier dedups, so a scrape
@@ -5541,8 +5542,8 @@ function syncPlanctlLinks(
   for (const link of newEpicLinks) {
     touchedEpics.add(link.target);
   }
-  if (_syncPlanctlLinksAccum != null) {
-    _syncPlanctlLinksAccum.touchedEpics += touchedEpics.size;
+  if (_syncPlanLinksAccum != null) {
+    _syncPlanLinksAccum.touchedEpics += touchedEpics.size;
   }
 
   // UPDATE the jobs row's epic_links. Skip when the backing row does not
@@ -5558,9 +5559,9 @@ function syncPlanctlLinks(
     return;
   }
 
-  // Step 1: find every distinct session_id with at least one planctl invocation
-  // touching any of `touchedEpics` (epic id as planctl_epic_id or
-  // planctl_target). UNION (not OR) so the planner uses BOTH partial indexes —
+  // Step 1: find every distinct session_id with at least one plan invocation
+  // touching any of `touchedEpics` (epic id as plan_epic_id or
+  // plan_target). UNION (not OR) so the planner uses BOTH partial indexes —
   // SQLite picks one index per cross-column OR, but a UNION's branches each
   // SEARCH their own index. The session_id set is identical to the OR form, so
   // re-fold determinism holds.
@@ -5570,13 +5571,13 @@ function syncPlanctlLinks(
     .query(
       `SELECT session_id
          FROM events
-        WHERE planctl_op IS NOT NULL
-          AND planctl_epic_id IN (${placeholders})
+        WHERE plan_op IS NOT NULL
+          AND plan_epic_id IN (${placeholders})
         UNION
        SELECT session_id
          FROM events
-        WHERE planctl_op IS NOT NULL
-          AND planctl_target IN (${placeholders})`,
+        WHERE plan_op IS NOT NULL
+          AND plan_target IN (${placeholders})`,
     )
     .all(...targetList, ...targetList) as { session_id: string }[];
   // Add the current session too, in case it touched a pre-state epic that no
@@ -5591,34 +5592,34 @@ function syncPlanctlLinks(
   for (const sid of commitTrailerSessionsForEpics(commitFacts, touchedEpics)) {
     sessionIds.add(sid);
   }
-  if (_syncPlanctlLinksAccum != null) {
-    _syncPlanctlLinksAccum.sweptSessions += sessionIds.size;
+  if (_syncPlanLinksAccum != null) {
+    _syncPlanLinksAccum.sweptSessions += sessionIds.size;
   }
 
   const invocationsBySession = new Map<string, ClassifierInvocation[]>();
   for (const sid of sessionIds) {
     const sidInvRows = db
       .query(
-        `SELECT id, ts, planctl_op, planctl_target, planctl_epic_id,
-                planctl_subject_present
+        `SELECT id, ts, plan_op, plan_target, plan_epic_id,
+                plan_subject_present
            FROM events
-          WHERE session_id = ? AND planctl_op IS NOT NULL
+          WHERE session_id = ? AND plan_op IS NOT NULL
           ORDER BY id ASC`,
       )
       .all(sid) as {
       id: number;
       ts: number;
-      planctl_op: string;
-      planctl_target: string | null;
-      planctl_epic_id: string | null;
-      planctl_subject_present: number | null;
+      plan_op: string;
+      plan_target: string | null;
+      plan_epic_id: string | null;
+      plan_subject_present: number | null;
     }[];
     const sidInvocations: ClassifierInvocation[] = sidInvRows.map((r) => ({
       ts: r.ts,
-      op: normalizePlanctlOp(r.planctl_op),
-      target: r.planctl_target,
-      epic_id: r.planctl_epic_id,
-      subject_present: r.planctl_subject_present === 1,
+      op: normalizePlanOp(r.plan_op),
+      target: r.plan_target,
+      epic_id: r.plan_epic_id,
+      subject_present: r.plan_subject_present === 1,
       event_id: r.id,
     }));
     // UNION this session's commit-trailer facts so the per-epic rebuild
@@ -5684,18 +5685,18 @@ function syncPlanctlLinks(
       .get(epicId) as { epic_number: number | null } | null;
     const ownNumber = ownRow?.epic_number ?? 0;
 
-    // Derive `queue_jump`: scan this epic's events for any planctl envelope that
+    // Derive `queue_jump`: scan this epic's events for any plan envelope that
     // carried `queue_jump: true`. Sticky-true — any single flip locks the epic
     // queued for the projection's lifetime (no `/plan:unqueue`); a re-fold
     // replays the same envelopes, so EXISTS is byte-deterministic. Keyed off
-    // `planctl_epic_id`, served by the dedicated partial composite index.
+    // `plan_epic_id`, served by the dedicated partial composite index.
     const queueJumpRow = db
       .query(
         `SELECT EXISTS(
            SELECT 1 FROM events
-            WHERE planctl_op IS NOT NULL
-              AND planctl_epic_id = ?
-              AND planctl_queue_jump = 1
+            WHERE plan_op IS NOT NULL
+              AND plan_epic_id = ?
+              AND plan_queue_jump = 1
          ) AS hit`,
       )
       .get(epicId) as { hit: number };
@@ -5789,7 +5790,7 @@ function syncPlanctlLinks(
  * defense-in-depth; both bails note and return, never throws. Each descendant's
  * path is `<parent.sort_path>.<zeroPad6(epic_number)>` (or just
  * `zeroPad6(epic_number)` when the parent's path is the `''` placeholder); same
- * `epic_number >= 1_000_000 → ''` overflow guard as {@link syncPlanctlLinks}.
+ * `epic_number >= 1_000_000 → ''` overflow guard as {@link syncPlanLinks}.
  *
  * Schema v30: the `!`-prefix queue-jump signal propagates through the
  * `parentPath` string concat for free. If the root epic carries
@@ -5798,7 +5799,7 @@ function syncPlanctlLinks(
  * separate queue_jump awareness because the prefix is already baked into
  * the parent path string. `queue_jump` itself (the projection column) is
  * NOT re-stamped here: children carry their OWN queue-jump state set by
- * `syncPlanctlLinks` on their own session's events, independent of the
+ * `syncPlanLinks` on their own session's events, independent of the
  * root's state. Cascading only touches `sort_path`, never `queue_jump`.
  */
 function cascadeSortPath(
@@ -7000,42 +7001,42 @@ function projectJobsRow(db: Database, event: Event): void {
   // Planctl-CLI invocation fan-out. Re-derive the session's epic_links +
   // every touched epic's job_links from scratch via the pure classifier in
   // `src/plan-classifier.ts`. Gated on:
-  //   `planctl_op != NULL`     — this event is a planctl-CLI Bash invocation
+  //   `plan_op != NULL`        — this event is a plan-CLI Bash invocation
   //                              (PostToolUse:Bash whose stdout carried the
-  //                              `planctl_invocation` envelope — see
-  //                              {@link extractPlanctlInvocation}), one of
+  //                              `plan_invocation` envelope — see
+  //                              {@link extractPlanInvocation}), one of
   //                              the windowed mutations the classifier folds
   //                              into edges;
   //   OR `PreToolUse + skill_name='plan:plan'`
   //                            — this event is a `/plan:plan` window opener,
   //                              which can change the set of windows (and
-  //                              thus which planctl events fall inside them)
-  //                              even though it carries no `planctl_op` itself.
+  //                              thus which plan events fall inside them)
+  //                              even though it carries no `plan_op` itself.
   //
-  // The trigger gate itself is hook-event-agnostic — `planctl_op != null`
+  // The trigger gate itself is hook-event-agnostic — `plan_op != null`
   // fires correctly regardless of whether the source event is a PreToolUse
   // or PostToolUse row. Only the stamping deriver changed.
   //
   // The two seams are disjoint from `syncJobIntoEpic` (jobs-write trigger):
   // a hook event like a SessionStart with `plan_ref` fires syncIfPlanRef but
-  // not syncPlanctlLinks; a PostToolUse:Bash with a planctl envelope fires
-  // syncPlanctlLinks but no jobs-side write happens (default switch arm).
+  // not syncPlanLinks; a PostToolUse:Bash with a planctl envelope fires
+  // syncPlanLinks but no jobs-side write happens (default switch arm).
   //
   // Post-switch placement matches the title-precedence precedent below: the
   // gate fires regardless of which `hook_event` switch arm did (or did not)
   // do lifecycle work.
   if (
-    event.planctl_op != null ||
+    event.plan_op != null ||
     (event.hook_event === "PreToolUse" && event.skill_name === "plan:plan")
   ) {
-    syncPlanctlLinks(db, jobId, event.id, ts);
+    syncPlanLinks(db, jobId, event.id, ts);
   }
 
   // Planctl-written tracked files get a `source='plan'` attribution row per
   // path the envelope's `files` array names — without this mint they appear as
   // strict-mystery orphans the instant they flash dirty.
-  if (event.planctl_op != null && event.planctl_files != null) {
-    mintPlanctlFileAttributions(db, event);
+  if (event.plan_op != null && event.plan_files != null) {
+    mintPlanFileAttributions(db, event);
   }
 
   // Title precedence rule: a `session_title` folds into `jobs.title`, source
@@ -7338,11 +7339,11 @@ export function applyEvent(
       // PostToolUse fans to BOTH projections plus syncIfPlanRef (inside
       // projectJobsRow); the 781ms avg is otherwise unattributable. Arm the
       // module-scoped syncIfPlanRef accumulator so its fan-out splits out of
-      // the jobs-arm total. The syncPlanctlLinks accumulator (armed alongside)
+      // the jobs-arm total. The syncPlanLinks accumulator (armed alongside)
       // adds the planctl fan-out cardinality. Pure instrumentation — no
       // projection write reads either accumulator.
       _syncIfPlanRefAccumMs = 0;
-      _syncPlanctlLinksAccum = {
+      _syncPlanLinksAccum = {
         calls: 0,
         touchedEpics: 0,
         sweptSessions: 0,
@@ -7363,24 +7364,24 @@ export function applyEvent(
       const _ptuT2 = performance.now();
       const _ptuSyncMs = _syncIfPlanRefAccumMs;
       _syncIfPlanRefAccumMs = null;
-      const _ptuPlanctlAccum = _syncPlanctlLinksAccum;
-      _syncPlanctlLinksAccum = null;
+      const _ptuPlanctlAccum = _syncPlanLinksAccum;
+      _syncPlanLinksAccum = null;
       const _ptuTotal = _ptuT2 - _ptuT0;
       if (_ptuTotal >= PTU_FOLD_BREAKDOWN_MS) {
         // jobs_arm includes its own syncIfPlanRef cost; sync_fanout breaks it
         // out so jobs_arm−sync_fanout is the pure state-machine write. The
-        // planctl_* counters localize the syncPlanctlLinks fan-out shape.
+        // planctl_* counters localize the syncPlanLinks fan-out shape.
         console.error(
           `[ptufold-breakdown] id=${event.id} total=${_ptuTotal.toFixed(0)}ms ` +
             `jobs_arm=${(_ptuT1 - _ptuT0).toFixed(0)}ms ` +
             `subagent_arm=${(_ptuT2 - _ptuT1).toFixed(0)}ms ` +
             `sync_fanout=${_ptuSyncMs.toFixed(0)}ms ` +
-            formatSyncPlanctlFanout(_ptuPlanctlAccum),
+            formatSyncPlanFanout(_ptuPlanctlAccum),
         );
       }
     } else {
       // PreToolUse falls here with NO dedicated arm, yet a `/plan:plan` opener
-      // (PreToolUse + skill_name='plan:plan') fires the syncPlanctlLinks fan-out
+      // (PreToolUse + skill_name='plan:plan') fires the syncPlanLinks fan-out
       // from inside projectJobsRow — the 437s incident fold was a PreToolUse and
       // had zero attribution. Arm the fan-out accumulators on the PreToolUse path
       // so a slow opener gets a breakdown line mirroring [ptufold-breakdown].
@@ -7388,7 +7389,7 @@ export function applyEvent(
       const _ptuePre = event.hook_event === "PreToolUse";
       if (_ptuePre) {
         _syncIfPlanRefAccumMs = 0;
-        _syncPlanctlLinksAccum = {
+        _syncPlanLinksAccum = {
           calls: 0,
           touchedEpics: 0,
           sweptSessions: 0,
@@ -7410,8 +7411,8 @@ export function applyEvent(
         const _ptueT2 = performance.now();
         const _ptueSyncMs = _syncIfPlanRefAccumMs ?? 0;
         _syncIfPlanRefAccumMs = null;
-        const _ptuePlanctlAccum = _syncPlanctlLinksAccum;
-        _syncPlanctlLinksAccum = null;
+        const _ptuePlanctlAccum = _syncPlanLinksAccum;
+        _syncPlanLinksAccum = null;
         const _ptueTotal = _ptueT2 - _ptueT0;
         if (_ptueTotal >= PTU_FOLD_BREAKDOWN_MS && _ptuePlanctlAccum != null) {
           // Same shape as [ptufold-breakdown]; subagent_arm is ~0 on PreToolUse
@@ -7422,7 +7423,7 @@ export function applyEvent(
               `jobs_arm=${(_ptueT1 - _ptueT0).toFixed(0)}ms ` +
               `subagent_arm=${(_ptueT2 - _ptueT1).toFixed(0)}ms ` +
               `sync_fanout=${_ptueSyncMs.toFixed(0)}ms ` +
-              formatSyncPlanctlFanout(_ptuePlanctlAccum),
+              formatSyncPlanFanout(_ptuePlanctlAccum),
           );
         }
       }
@@ -7570,8 +7571,8 @@ export function drain(
               stop_hook_active, data,
               subagent_agent_id, spawn_name,
               start_time, slash_command, skill_name,
-              planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-              planctl_subject_present, tool_use_id, config_dir, planctl_files,
+              plan_op, plan_target, plan_epic_id, plan_task_id,
+              plan_subject_present, tool_use_id, config_dir, plan_files,
               backend_exec_type, backend_exec_session_id, backend_exec_pane_id
          FROM events
         WHERE id > ?

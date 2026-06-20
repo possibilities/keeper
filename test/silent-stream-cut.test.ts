@@ -57,9 +57,9 @@ function insertEvent(overrides: {
        ts, session_id, pid, hook_event, event_type, tool_name, matcher, cwd,
        permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-       planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-       bash_mutation_kind, bash_mutation_targets, planctl_files,
+       plan_op, plan_target, plan_epic_id, plan_task_id,
+       plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+       bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id
      ) VALUES (?, ?, ?, ?, ?, NULL, NULL, '/tmp/work', NULL, ?, ?, NULL, ?,

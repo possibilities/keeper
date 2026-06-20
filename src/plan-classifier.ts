@@ -35,8 +35,8 @@
  * sorted by a TOTAL ORDER `(ts ASC, event_id ASC)` before classification, so
  * the per-session creator-suppression outcome does not depend on the wire order
  * of `ts`-ties (two same-`ts` ops of one epic resolve identically every fold).
- * The reducer's `syncPlanctlLinks` fan-out calls these from the deduped UNION
- * of `planctl_op` stdout-scrape events AND durable `Commit`-event trailer facts
+ * The reducer's `syncPlanLinks` fan-out calls these from the deduped UNION
+ * of `plan_op` stdout-scrape events AND durable `Commit`-event trailer facts
  * (`Planctl-Op` / `Planctl-Target` / `Session-Id`, epic fn-695) — the
  * classifier is agnostic to which channel an invocation came from; it sees the
  * merged invocation list. A from-scratch re-fold must reproduce byte-identical
@@ -52,9 +52,9 @@ import { parsePlanRef } from "./derivers";
  * `epic-set-title`, `task-set-description`) into the namespace-stripped form
  * the classifier reads (`create`, `set-title`, `set-description`).
  *
- * Keeper's hook stamps the raw CLI verb on the `events.planctl_op` column
- * (see {@link import("./derivers").extractPlanctlInvocation}). Both fan-out
- * call sites (the live reducer's `syncPlanctlLinks` and the frozen migration
+ * Keeper's hook stamps the raw CLI verb on the `events.plan_op` column
+ * (see {@link import("./derivers").extractPlanInvocation}). Both fan-out
+ * call sites (the live reducer's `syncPlanLinks` and the frozen migration
  * backfills in `src/db.ts`) MUST use this same helper so the migration's
  * output is byte-identical to what the live reducer produces — without that, a
  * re-fold from scratch would diverge from a migrated DB and break the
@@ -65,7 +65,7 @@ import { parsePlanRef } from "./derivers";
  * `scaffold`, `close` stays `close`, etc. — so a future planctl CLI verb that
  * doesn't follow the `<kind>-<op>` shape rides through deterministically.
  */
-export function normalizePlanctlOp(rawOp: string): string {
+export function normalizePlanOp(rawOp: string): string {
   if (rawOp.startsWith("epic-")) {
     return rawOp.slice("epic-".length);
   }
@@ -78,7 +78,7 @@ export function normalizePlanctlOp(rawOp: string): string {
 /**
  * One classifier-input invocation entry. The hook stamps `ts`, `op`, `target`,
  * `epic_id`, `subject_present` onto the `events` row via
- * {@link import("./derivers").extractPlanctlInvocation}; the reducer's
+ * {@link import("./derivers").extractPlanInvocation}; the reducer's
  * per-session re-derive loop loads them into this shape via a partial-index
  * scan.
  *

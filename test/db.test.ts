@@ -89,8 +89,8 @@ test("all expected indexes are present", () => {
     "idx_events_subagent_agent_id",
     "idx_epics_sort_path",
     "idx_jobs_created_state",
-    "idx_events_planctl_epic",
-    "idx_events_planctl_target",
+    "idx_events_plan_epic",
+    "idx_events_plan_target",
     // fn-649: attribution-fold perf indexes (covering variants — the prior
     // key-only idx_events_tool_file_path / idx_events_bash_mutation_kind are
     // dropped in the migrate tail and replaced by these).
@@ -291,17 +291,17 @@ test("migrate: false skips schema convergence but still applies PRAGMAs + prepar
     $start_time: null,
     $slash_command: null,
     $skill_name: null,
-    $planctl_op: null,
-    $planctl_target: null,
-    $planctl_epic_id: null,
-    $planctl_task_id: null,
-    $planctl_subject_present: null,
+    $plan_op: null,
+    $plan_target: null,
+    $plan_epic_id: null,
+    $plan_task_id: null,
+    $plan_subject_present: null,
     $tool_use_id: null,
     $config_dir: null,
-    $planctl_queue_jump: null,
+    $plan_queue_jump: null,
     $bash_mutation_kind: null,
     $bash_mutation_targets: null,
-    $planctl_files: null,
+    $plan_files: null,
     $backend_exec_type: null,
     $backend_exec_session_id: null,
     $backend_exec_pane_id: null,
@@ -1075,9 +1075,9 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
         id, ts, session_id, pid, hook_event, event_type, tool_name, matcher,
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-        bash_mutation_kind, bash_mutation_targets, planctl_files,
+        plan_op, plan_target, plan_epic_id, plan_task_id,
+        plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+        bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
         background_task_id
       FROM events`);
@@ -1088,9 +1088,16 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
       // SKIP any index referencing a post-v57 column (the v73 `mutation_path`
       // partial index) — it can't exist on the faithful v57 shape; migrate()
       // recreates it from CREATE_V73_INDEXES, and the post-migrate index-set
-      // assertion below still sees it (it's in `indexNamesBefore`).
+      // assertion below still sees it (it's in `indexNamesBefore`). SKIP the v78
+      // `idx_events_plan_*` indexes too: they reference the renamed `plan_*`
+      // columns the v57 fixture (still `planctl_*`) lacks; migrate recreates them
+      // via the frozen v14/v30 steps (`idx_events_planctl_*`) then renames forward
+      // at v78, so the post-migrate assertion still sees `idx_events_plan_*`.
       for (const idx of eventsIndexSqlBefore) {
         if (idx.sql.includes("mutation_path")) {
+          continue;
+        }
+        if (idx.name.startsWith("idx_events_plan_")) {
           continue;
         }
         built.db.run(idx.sql);
@@ -1098,6 +1105,12 @@ test("v57→v58 rebuild relaxes events.data to nullable; rows + seq + indexes pr
       built.db.run(
         "UPDATE sqlite_sequence SET seq = 9999 WHERE name = 'events'",
       );
+      // A faithful v57 DB predates `commit_trailer_facts` (created at v66→v67).
+      // Drop the anachronistic v78-shaped table so the migrate-under-test
+      // recreates it via the frozen v66→v67 CREATE+backfill (which uses the
+      // `planctl_*` literal) and then renames it forward at v78 — mirroring a
+      // real v57→current walk.
+      built.db.run("DROP TABLE IF EXISTS commit_trailer_facts");
       built.db.run("UPDATE meta SET value = '57' WHERE key = 'schema_version'");
     })
     .immediate();
@@ -2131,9 +2144,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `file_attributions.source='planctl'` rows to `'plan'`, fn-831; v76 adds the
   // `dispatch_never_bound` circuit-breaker projection table, fn-846; v77 ungates
   // the plan-link classifier from `/plan:plan` windows + rewinds the cursor and
-  // wipes the canonical projection list, fn-856); the v62→v63 epics-shape
-  // migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(77);
+  // wipes the canonical projection list, fn-856; v78 renames the `planctl_*`
+  // schema surface → `plan_*` + rewrites historical envelopes, fn-864); the
+  // v62→v63 epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(78);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
@@ -2283,7 +2297,7 @@ function seedPlanctlEventMix(db: Database): void {
   const insert = db.prepare(
     `INSERT INTO events (
        ts, session_id, hook_event, event_type, data,
-       planctl_op, planctl_target, planctl_epic_id
+       plan_op, plan_target, plan_epic_id
      ) VALUES (?, ?, ?, ?, '{}', ?, ?, ?)`,
   );
   // Sessions whose footprint matches via planctl_epic_id only — the work-verb
@@ -2359,19 +2373,19 @@ function seedPlanctlEventMix(db: Database): void {
   db.run("ANALYZE");
 }
 
-test("Tier 2 (fn-628.2) idx_events_planctl_epic + idx_events_planctl_target are present on fresh openDb", () => {
+test("Tier 2 (fn-628.2) idx_events_plan_epic + idx_events_plan_target are present on fresh openDb", () => {
   const { db } = openDb(":memory:");
   const indexes = db
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
   const names = new Set(indexes.map((i) => i.name));
-  expect(names.has("idx_events_planctl_epic")).toBe(true);
-  expect(names.has("idx_events_planctl_target")).toBe(true);
+  expect(names.has("idx_events_plan_epic")).toBe(true);
+  expect(names.has("idx_events_plan_target")).toBe(true);
   db.close();
 });
 
-test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH planctl partial indexes (EXPLAIN QUERY PLAN)", () => {
-  // Mirrors the syncPlanctlLinks cross-session sweep at src/reducer.ts:~2371
+test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH plan partial indexes (EXPLAIN QUERY PLAN)", () => {
+  // Mirrors the syncPlanLinks cross-session sweep at src/reducer.ts:~2371
   // after the OR→UNION rewrite. EQP must show a COMPOUND QUERY whose two
   // branches each SEARCH a different new partial index — proving the
   // optimizer can reach both indexes (the prior OR form could only reach one).
@@ -2383,26 +2397,26 @@ test("Tier 2 (fn-628.2) cross-session UNION sweep uses BOTH planctl partial inde
       `EXPLAIN QUERY PLAN
        SELECT session_id
          FROM events
-        WHERE planctl_op IS NOT NULL
-          AND planctl_epic_id IN ('fn-100-foo')
+        WHERE plan_op IS NOT NULL
+          AND plan_epic_id IN ('fn-100-foo')
         UNION
        SELECT session_id
          FROM events
-        WHERE planctl_op IS NOT NULL
-          AND planctl_target IN ('fn-100-foo')`,
+        WHERE plan_op IS NOT NULL
+          AND plan_target IN ('fn-100-foo')`,
     )
     .all() as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
   expect(detail).toMatch(/COMPOUND QUERY/);
-  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_planctl_epic/);
-  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_planctl_target/);
+  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_epic/);
+  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_target/);
   db.close();
 });
 
-test("Tier 2 (fn-628.2) per-epic queue_jump scan uses idx_events_planctl_epic (EXPLAIN QUERY PLAN)", () => {
+test("Tier 2 (fn-628.2) per-epic queue_jump scan uses idx_events_plan_epic (EXPLAIN QUERY PLAN)", () => {
   // The per-epic queue_jump EXISTS scan at src/reducer.ts:~2543 keys off
-  // `planctl_epic_id = ?` — must hit the new index (the schema-v14
-  // session-leading index cannot serve a planctl_epic_id equality).
+  // `plan_epic_id = ?` — must hit the new index (the schema-v14
+  // session-leading index cannot serve a plan_epic_id equality).
   const { db } = openDb(":memory:");
   seedPlanctlEventMix(db);
 
@@ -2411,23 +2425,23 @@ test("Tier 2 (fn-628.2) per-epic queue_jump scan uses idx_events_planctl_epic (E
       `EXPLAIN QUERY PLAN
        SELECT EXISTS(
          SELECT 1 FROM events
-          WHERE planctl_op IS NOT NULL
-            AND planctl_epic_id = ?
-            AND planctl_queue_jump = 1
+          WHERE plan_op IS NOT NULL
+            AND plan_epic_id = ?
+            AND plan_queue_jump = 1
        ) AS hit`,
     )
     .all("fn-100-foo") as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
   expect(detail).toMatch(
-    /SEARCH events USING INDEX idx_events_planctl_epic \(planctl_epic_id=\?\)/,
+    /SEARCH events USING INDEX idx_events_plan_epic \(plan_epic_id=\?\)/,
   );
   db.close();
 });
 
-test("Tier 2 (fn-628.2) per-session ordered planctl load still uses idx_events_planctl_session (regression guard)", () => {
+test("Tier 2 (fn-628.2) per-session ordered plan load still uses idx_events_plan_session (regression guard)", () => {
   // The per-session ordered load at src/reducer.ts:~2389-2395 must NOT be
   // displaced by the new indexes — confirms the v14 session-leading index
-  // remains the planner's pick for `WHERE session_id = ? AND planctl_op IS
+  // remains the planner's pick for `WHERE session_id = ? AND plan_op IS
   // NOT NULL ORDER BY id ASC`.
   const { db } = openDb(":memory:");
   seedPlanctlEventMix(db);
@@ -2435,22 +2449,20 @@ test("Tier 2 (fn-628.2) per-session ordered planctl load still uses idx_events_p
   const plan = db
     .prepare(
       `EXPLAIN QUERY PLAN
-       SELECT ts, planctl_op, planctl_target, planctl_epic_id,
-              planctl_subject_present
+       SELECT ts, plan_op, plan_target, plan_epic_id,
+              plan_subject_present
          FROM events
-        WHERE session_id = ? AND planctl_op IS NOT NULL
+        WHERE session_id = ? AND plan_op IS NOT NULL
         ORDER BY id ASC`,
     )
     .all("sess-both-0") as { detail: string }[];
   const detail = plan.map((r) => r.detail).join(" | ");
-  expect(detail).toMatch(
-    /SEARCH events USING INDEX idx_events_planctl_session/,
-  );
+  expect(detail).toMatch(/SEARCH events USING INDEX idx_events_plan_session/);
   db.close();
 });
 
 test("Tier 2 (fn-628.2) UNION rewrite is semantically equivalent to the prior OR form (re-fold determinism guard)", () => {
-  // The reducer's `syncPlanctlLinks` cross-session sweep must produce
+  // The reducer's `syncPlanLinks` cross-session sweep must produce
   // byte-identical session_id sets after the rewrite. Both forms run against
   // the same fixture; sorted+deduped session_id sets must deep-equal.
   const { db } = openDb(":memory:");
@@ -2460,21 +2472,21 @@ test("Tier 2 (fn-628.2) UNION rewrite is semantically equivalent to the prior OR
     .prepare(
       `SELECT DISTINCT session_id
          FROM events
-        WHERE planctl_op IS NOT NULL
-          AND (planctl_epic_id IN ('fn-100-foo') OR planctl_target IN ('fn-100-foo'))`,
+        WHERE plan_op IS NOT NULL
+          AND (plan_epic_id IN ('fn-100-foo') OR plan_target IN ('fn-100-foo'))`,
     )
     .all() as { session_id: string }[];
   const unionForm = db
     .prepare(
       `SELECT session_id
          FROM events
-        WHERE planctl_op IS NOT NULL
-          AND planctl_epic_id IN ('fn-100-foo')
+        WHERE plan_op IS NOT NULL
+          AND plan_epic_id IN ('fn-100-foo')
         UNION
        SELECT session_id
          FROM events
-        WHERE planctl_op IS NOT NULL
-          AND planctl_target IN ('fn-100-foo')`,
+        WHERE plan_op IS NOT NULL
+          AND plan_target IN ('fn-100-foo')`,
     )
     .all() as { session_id: string }[];
 
@@ -3220,7 +3232,7 @@ test("v12 DB migrates: SQL half replays cleanly — approvals table dropped, epi
   db2.close();
 });
 
-test("fresh openDb at v14 has events.planctl_* + jobs.epic_links + epics.job_links with correct shapes", () => {
+test("fresh openDb at v14 has events.plan_* + jobs.epic_links + epics.job_links with correct shapes", () => {
   const { db } = openDb(":memory:");
   const eventCols = db.prepare("PRAGMA table_info(events)").all() as {
     name: string;
@@ -3230,10 +3242,10 @@ test("fresh openDb at v14 has events.planctl_* + jobs.epic_links + epics.job_lin
   }[];
   const eventByName = new Map(eventCols.map((c) => [c.name, c]));
   for (const col of [
-    "planctl_op",
-    "planctl_target",
-    "planctl_epic_id",
-    "planctl_task_id",
+    "plan_op",
+    "plan_target",
+    "plan_epic_id",
+    "plan_task_id",
   ]) {
     const c = eventByName.get(col);
     expect(c).toBeDefined();
@@ -3241,7 +3253,7 @@ test("fresh openDb at v14 has events.planctl_* + jobs.epic_links + epics.job_lin
     expect(c?.notnull).toBe(0);
     expect(c?.dflt_value).toBeNull();
   }
-  const presentCol = eventByName.get("planctl_subject_present");
+  const presentCol = eventByName.get("plan_subject_present");
   expect(presentCol).toBeDefined();
   expect(presentCol?.type).toBe("INTEGER");
   expect(presentCol?.notnull).toBe(0);
@@ -3275,7 +3287,7 @@ test("fresh openDb at v14 has events.planctl_* + jobs.epic_links + epics.job_lin
     .prepare("SELECT name FROM sqlite_master WHERE type = 'index'")
     .all() as { name: string }[];
   const names = new Set(indexes.map((i) => i.name));
-  expect(names.has("idx_events_planctl_session")).toBe(true);
+  expect(names.has("idx_events_plan_session")).toBe(true);
   db.close();
 });
 
@@ -3875,11 +3887,11 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
     db.prepare("PRAGMA table_info(events)").all() as { name: string }[]
   ).map((c) => c.name);
   for (const col of [
-    "planctl_op",
-    "planctl_target",
-    "planctl_epic_id",
-    "planctl_task_id",
-    "planctl_subject_present",
+    "plan_op",
+    "plan_target",
+    "plan_epic_id",
+    "plan_task_id",
+    "plan_subject_present",
   ]) {
     expect(eventNames).toContain(col);
   }
@@ -3900,11 +3912,11 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
         .all() as { name: string }[]
     ).map((i) => i.name),
   );
-  expect(indexNames.has("idx_events_planctl_session")).toBe(true);
+  expect(indexNames.has("idx_events_plan_session")).toBe(true);
 
-  // Backfill: events.planctl_* on each PreToolUse:Bash row. As of
-  // fn-606.1 the `extractPlanctlInvocation` deriver gates on
-  // PostToolUse:Bash (parsing the authoritative `planctl_invocation`
+  // Backfill: events.plan_* on each PreToolUse:Bash row. As of
+  // fn-606.1 the `extractPlanInvocation` deriver gates on
+  // PostToolUse:Bash (parsing the authoritative `plan_invocation`
   // envelope from `tool_response.stdout`), so the v13→v14 backfill — which
   // scans PreToolUse:Bash rows by hook-event gate — stamps zero columns
   // against the new deriver. The v19→v20 migration (fn-606.2) re-stamps
@@ -3914,8 +3926,8 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
   // are deliberately NULL until the v19→v20 step lands.
   const evRows = db
     .prepare(
-      `SELECT id, ts, session_id, planctl_op, planctl_target,
-              planctl_epic_id, planctl_task_id, planctl_subject_present
+      `SELECT id, ts, session_id, plan_op, plan_target,
+              plan_epic_id, plan_task_id, plan_subject_present
          FROM events
         WHERE hook_event = 'PreToolUse' AND tool_name = 'Bash'
         ORDER BY id ASC`,
@@ -3924,20 +3936,20 @@ test("v13 DB migrates to v14: seven columns + partial index + per-event backfill
     id: number;
     ts: number;
     session_id: string;
-    planctl_op: string | null;
-    planctl_target: string | null;
-    planctl_epic_id: string | null;
-    planctl_task_id: string | null;
-    planctl_subject_present: number | null;
+    plan_op: string | null;
+    plan_target: string | null;
+    plan_epic_id: string | null;
+    plan_task_id: string | null;
+    plan_subject_present: number | null;
   }[];
   // Every PreToolUse:Bash row is left NULL — the deriver no longer
   // recognizes the PreToolUse gate.
   for (const r of evRows) {
-    expect(r.planctl_op).toBeNull();
-    expect(r.planctl_target).toBeNull();
-    expect(r.planctl_epic_id).toBeNull();
-    expect(r.planctl_task_id).toBeNull();
-    expect(r.planctl_subject_present).toBeNull();
+    expect(r.plan_op).toBeNull();
+    expect(r.plan_target).toBeNull();
+    expect(r.plan_epic_id).toBeNull();
+    expect(r.plan_task_id).toBeNull();
+    expect(r.plan_subject_present).toBeNull();
   }
 
   // jobs / epics projection rows do NOT survive the v16→v17
@@ -4286,7 +4298,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
   // two-word `planctl epic close fn-…` invocation, plus a correctly-shaped
   // `epic-create` stamp from a hyphenated one-word verb). Pair each with a
   // PostToolUse:Bash row whose `data.tool_response.stdout` carries a
-  // `planctl_invocation` envelope. After v20, the PreToolUse stamps must
+  // `plan_invocation` envelope. After v20, the PreToolUse stamps must
   // be NULL across the board and the PostToolUse stamps must reflect the
   // envelope's authoritative shape, including a scaffold → creator edge.
   //
@@ -4453,7 +4465,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
       tool_input: { command: "planctl scaffold fn-7-scaff 'Scaffolded title'" },
       tool_response: {
         stdout: JSON.stringify({
-          planctl_invocation: {
+          plan_invocation: {
             op: "scaffold",
             target: "fn-7-scaff",
             subject: "Scaffolded title",
@@ -4527,7 +4539,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
       tool_input: { command: "planctl epic close fn-7-scaff" },
       tool_response: {
         stdout: JSON.stringify({
-          planctl_invocation: {
+          plan_invocation: {
             op: "epic-close",
             target: "fn-7-scaff",
           },
@@ -4573,7 +4585,7 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
       },
       tool_response: {
         stdout: JSON.stringify({
-          planctl_invocation: {
+          plan_invocation: {
             op: "epic-set-title",
             target: "fn-7-scaff",
             subject: "Renamed",
@@ -4610,74 +4622,74 @@ test("v19 DB migrates to v20: PreToolUse:Bash stamps wiped, PostToolUse:Bash re-
     .get() as { value: string };
   expect(ver.value).toBe(String(SCHEMA_VERSION));
 
-  // Pass 0 — every PreToolUse:Bash row's planctl_* columns are now NULL.
+  // Pass 0 — every PreToolUse:Bash row's plan_* columns are now NULL.
   const preRows = db
     .prepare(
-      `SELECT id, planctl_op, planctl_target, planctl_epic_id,
-              planctl_task_id, planctl_subject_present
+      `SELECT id, plan_op, plan_target, plan_epic_id,
+              plan_task_id, plan_subject_present
          FROM events
         WHERE hook_event = 'PreToolUse' AND tool_name = 'Bash'
         ORDER BY id ASC`,
     )
     .all() as {
     id: number;
-    planctl_op: string | null;
-    planctl_target: string | null;
-    planctl_epic_id: string | null;
-    planctl_task_id: string | null;
-    planctl_subject_present: number | null;
+    plan_op: string | null;
+    plan_target: string | null;
+    plan_epic_id: string | null;
+    plan_task_id: string | null;
+    plan_subject_present: number | null;
   }[];
   for (const r of preRows) {
-    expect(r.planctl_op).toBeNull();
-    expect(r.planctl_target).toBeNull();
-    expect(r.planctl_epic_id).toBeNull();
-    expect(r.planctl_task_id).toBeNull();
-    expect(r.planctl_subject_present).toBeNull();
+    expect(r.plan_op).toBeNull();
+    expect(r.plan_target).toBeNull();
+    expect(r.plan_epic_id).toBeNull();
+    expect(r.plan_task_id).toBeNull();
+    expect(r.plan_subject_present).toBeNull();
   }
 
   // Pass 1 — PostToolUse:Bash rows carry the envelope's authoritative shape.
   const postRows = db
     .prepare(
-      `SELECT session_id, planctl_op, planctl_target, planctl_epic_id,
-              planctl_task_id, planctl_subject_present
+      `SELECT session_id, plan_op, plan_target, plan_epic_id,
+              plan_task_id, plan_subject_present
          FROM events
         WHERE hook_event = 'PostToolUse' AND tool_name = 'Bash'
         ORDER BY id ASC`,
     )
     .all() as {
     session_id: string;
-    planctl_op: string | null;
-    planctl_target: string | null;
-    planctl_epic_id: string | null;
-    planctl_task_id: string | null;
-    planctl_subject_present: number | null;
+    plan_op: string | null;
+    plan_target: string | null;
+    plan_epic_id: string | null;
+    plan_task_id: string | null;
+    plan_subject_present: number | null;
   }[];
   expect(postRows).toHaveLength(3);
   // sess-creator-scaffold: op='scaffold', target='fn-7-scaff',
   // epic_id='fn-7-scaff', task_id=null, subject_present=1.
   expect(postRows[0]?.session_id).toBe("sess-creator-scaffold");
-  expect(postRows[0]?.planctl_op).toBe("scaffold");
-  expect(postRows[0]?.planctl_target).toBe("fn-7-scaff");
-  expect(postRows[0]?.planctl_epic_id).toBe("fn-7-scaff");
-  expect(postRows[0]?.planctl_task_id).toBeNull();
-  expect(postRows[0]?.planctl_subject_present).toBe(1);
+  expect(postRows[0]?.plan_op).toBe("scaffold");
+  expect(postRows[0]?.plan_target).toBe("fn-7-scaff");
+  expect(postRows[0]?.plan_epic_id).toBe("fn-7-scaff");
+  expect(postRows[0]?.plan_task_id).toBeNull();
+  expect(postRows[0]?.plan_subject_present).toBe(1);
   // sess-refiner-twoword: op='epic-close', target='fn-7-scaff' — the
   // two-word verb is now correctly stamped via the envelope, not the
   // broken regex (which would have stamped op='epic' target='close').
   expect(postRows[1]?.session_id).toBe("sess-refiner-twoword");
-  expect(postRows[1]?.planctl_op).toBe("epic-close");
-  expect(postRows[1]?.planctl_target).toBe("fn-7-scaff");
-  expect(postRows[1]?.planctl_epic_id).toBe("fn-7-scaff");
-  expect(postRows[1]?.planctl_task_id).toBeNull();
-  expect(postRows[1]?.planctl_subject_present).toBe(0);
+  expect(postRows[1]?.plan_op).toBe("epic-close");
+  expect(postRows[1]?.plan_target).toBe("fn-7-scaff");
+  expect(postRows[1]?.plan_epic_id).toBe("fn-7-scaff");
+  expect(postRows[1]?.plan_task_id).toBeNull();
+  expect(postRows[1]?.plan_subject_present).toBe(0);
   // Second refiner action in the same session, with a subject — drives
   // the actual refiner edge through the classifier.
   expect(postRows[2]?.session_id).toBe("sess-refiner-twoword");
-  expect(postRows[2]?.planctl_op).toBe("epic-set-title");
-  expect(postRows[2]?.planctl_target).toBe("fn-7-scaff");
-  expect(postRows[2]?.planctl_epic_id).toBe("fn-7-scaff");
-  expect(postRows[2]?.planctl_task_id).toBeNull();
-  expect(postRows[2]?.planctl_subject_present).toBe(1);
+  expect(postRows[2]?.plan_op).toBe("epic-set-title");
+  expect(postRows[2]?.plan_target).toBe("fn-7-scaff");
+  expect(postRows[2]?.plan_epic_id).toBe("fn-7-scaff");
+  expect(postRows[2]?.plan_task_id).toBeNull();
+  expect(postRows[2]?.plan_subject_present).toBe(1);
 
   // Pass 2a — jobs.epic_links populated from the new stamps.
   const creatorJob = db
@@ -6043,7 +6055,7 @@ test("v29 DB migrates to v30: events.planctl_queue_jump + epics.queue_jump added
       dflt_value: string | null;
     }[]
   ).map((c) => c.name);
-  expect(evCols).toContain("planctl_queue_jump");
+  expect(evCols).toContain("plan_queue_jump");
 
   reopened.close();
 
@@ -6074,7 +6086,9 @@ test("addColumnIfMissing is idempotent for the v30 columns", () => {
     name: string;
   }[];
   const evNames = evCols.map((c) => c.name);
-  expect(evNames.filter((n) => n === "planctl_queue_jump").length).toBe(1);
+  expect(evNames.filter((n) => n === "plan_queue_jump").length).toBe(1);
+  // Zombie guard: the v78 rename must leave NO stray `planctl_queue_jump`.
+  expect(evNames.filter((n) => n === "planctl_queue_jump").length).toBe(0);
   const ver = db2
     .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
     .get() as { value: string };
@@ -7375,6 +7389,12 @@ test("v38→v39: bash_mutation_* backfilled over historical PostToolUse:Bash row
   v39.run(
     "UPDATE events SET bash_mutation_kind = NULL, bash_mutation_targets = NULL",
   );
+  // A faithful v38 DB predates `commit_trailer_facts` (created at v66→v67). Drop
+  // the anachronistic v78-shaped table so the migrate-under-test recreates it via
+  // the frozen v66→v67 CREATE+backfill (`planctl_*` literal) then renames forward
+  // at v78 — without this, the v66→v67 backfill's `planctl_*` INSERT collides
+  // with the pre-existing `plan_*` table.
+  v39.run("DROP TABLE IF EXISTS commit_trailer_facts");
   v39.run("UPDATE meta SET value = '38' WHERE key = 'schema_version'");
   v39.close();
 
@@ -8524,9 +8544,9 @@ test("v66 DB migrates to v67: commit_trailer_facts table + indexes + backfill (i
   expect(ctfCols).toEqual([
     "event_id",
     "committer_session_id",
-    "planctl_op",
-    "planctl_target",
-    "planctl_epic_id",
+    "plan_op",
+    "plan_target",
+    "plan_epic_id",
     "committed_at_ms",
   ]);
 
@@ -8550,34 +8570,34 @@ test("v66 DB migrates to v67: commit_trailer_facts table + indexes + backfill (i
     .all() as {
     event_id: number;
     committer_session_id: string;
-    planctl_op: string;
-    planctl_target: string;
-    planctl_epic_id: string | null;
+    plan_op: string;
+    plan_target: string;
+    plan_epic_id: string | null;
     committed_at_ms: number;
   }[];
   expect(facts).toEqual([
     {
       event_id: 1,
       committer_session_id: CTF_UUID,
-      planctl_op: "scaffold",
-      planctl_target: "fn-1-inline",
-      planctl_epic_id: "fn-1-inline",
+      plan_op: "scaffold",
+      plan_target: "fn-1-inline",
+      plan_epic_id: "fn-1-inline",
       committed_at_ms: 5_000_000,
     },
     {
       event_id: 2,
       committer_session_id: CTF_UUID_2,
-      planctl_op: "set-title",
-      planctl_target: "fn-2-task.3",
-      planctl_epic_id: "fn-2-task",
+      plan_op: "set-title",
+      plan_target: "fn-2-task.3",
+      plan_epic_id: "fn-2-task",
       committed_at_ms: 5_000_000,
     },
     {
       event_id: 3,
       committer_session_id: CTF_UUID_3,
-      planctl_op: "scaffold",
-      planctl_target: "fn-3-reloc",
-      planctl_epic_id: "fn-3-reloc",
+      plan_op: "scaffold",
+      plan_target: "fn-3-reloc",
+      plan_epic_id: "fn-3-reloc",
       committed_at_ms: 5_000_000,
     },
   ]);
@@ -8720,9 +8740,9 @@ test("v77 rewind preserves commit_trailer_facts (NOT in the wipe list); re-fold 
   type Fact = {
     event_id: number;
     committer_session_id: string;
-    planctl_op: string;
-    planctl_target: string;
-    planctl_epic_id: string | null;
+    plan_op: string;
+    plan_target: string;
+    plan_epic_id: string | null;
     committed_at_ms: number;
   };
   let baselineFacts: Fact[];
@@ -8735,11 +8755,11 @@ test("v77 rewind preserves commit_trailer_facts (NOT in the wipe list); re-fold 
       .prepare("SELECT * FROM commit_trailer_facts ORDER BY event_id ASC")
       .all() as Fact[];
     // Sanity: the seed produced exactly the two trailer facts (epic-folded).
-    expect(baselineFacts.map((f) => f.planctl_target)).toEqual([
+    expect(baselineFacts.map((f) => f.plan_target)).toEqual([
       "fn-1-survives",
       "fn-1-survives",
     ]);
-    expect(baselineFacts.map((f) => f.planctl_op)).toEqual([
+    expect(baselineFacts.map((f) => f.plan_op)).toEqual([
       "scaffold",
       "set-title",
     ]);

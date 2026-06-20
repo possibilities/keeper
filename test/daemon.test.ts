@@ -915,16 +915,16 @@ test("usage-mint crash regression: a real insertEvent.run starved past busy_time
       $start_time: null,
       $slash_command: null,
       $skill_name: null,
-      $planctl_op: null,
-      $planctl_target: null,
-      $planctl_epic_id: null,
-      $planctl_task_id: null,
-      $planctl_subject_present: null,
+      $plan_op: null,
+      $plan_target: null,
+      $plan_epic_id: null,
+      $plan_task_id: null,
+      $plan_subject_present: null,
       $config_dir: null,
-      $planctl_queue_jump: null,
+      $plan_queue_jump: null,
       $bash_mutation_kind: null,
       $bash_mutation_targets: null,
-      $planctl_files: null,
+      $plan_files: null,
       $backend_exec_type: null,
       $backend_exec_session_id: null,
       $backend_exec_pane_id: null,
@@ -2549,13 +2549,16 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // model — the fold output changed, so the migration REWINDS the cursor and
   // wipes the canonical projection list to repopulate from the corrected derive,
   // re-fold byte-identical via the classifier's `(ts, event_id)` total order),
-  // each of which bumped SCHEMA_VERSION AND added its version to
+  // and to 78 via fn-864 task .1 (renaming the `planctl_*` schema surface →
+  // `plan_*` + rewriting historical `planctl_invocation` envelopes → forward —
+  // value-preserving, NO cursor rewind, re-fold byte-identical across the
+  // rename), each of which bumped SCHEMA_VERSION AND added its version to
   // `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the CLAUDE.md same-commit
   // invariant. This pin tracks the LIVE schema version: the guard it provides is
   // "an accidental reducer/schema change must surface as a failing whitelist +
   // this pin", which still holds — bump both together when the schema genuinely
   // moves.
-  expect(SCHEMA_VERSION).toBe(77);
+  expect(SCHEMA_VERSION).toBe(78);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

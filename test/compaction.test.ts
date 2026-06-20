@@ -477,7 +477,7 @@ test("retention shrinks the inline footprint; per-batch incremental_vacuum recla
        id INTEGER PRIMARY KEY AUTOINCREMENT,
        ts REAL, session_id TEXT, hook_event TEXT, event_type TEXT,
        tool_name TEXT, cwd TEXT, data TEXT, mutation_path TEXT,
-       planctl_op TEXT, subagent_agent_id TEXT
+       plan_op TEXT, subagent_agent_id TEXT
      )`,
   );
   idb.run(

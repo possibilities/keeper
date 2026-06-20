@@ -24,7 +24,7 @@ import {
   extractBackgroundTaskId,
   extractBashMutation,
   extractCommit,
-  extractPlanctlInvocation,
+  extractPlanInvocation,
   extractSkillName,
   parsePlanRef,
   planVerbRefFromSpawnName,
@@ -35,7 +35,7 @@ import {
   type ClassifierInvocation,
   deriveEpicLinks,
   deriveJobLinks,
-  normalizePlanctlOp,
+  normalizePlanOp,
 } from "./plan-classifier";
 import type { ResolutionDiagnostic } from "./readiness-diagnostics";
 import type { Epic, ResolvedEpicDep } from "./types";
@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 77;
+export const SCHEMA_VERSION = 78;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -462,7 +462,7 @@ const CREATE_V10_INDEXES = [
 /**
  * Index on the `planctl_op` column added by the v13→v14 ALTER (KEPT OUT of the
  * unconditional CREATE block; see {@link CREATE_V10_INDEXES}). The composite
- * `(session_id, id) WHERE planctl_op IS NOT NULL` serves `syncPlanctlLinks`'s
+ * `(session_id, id) WHERE planctl_op IS NOT NULL` serves `syncPlanLinks`'s
  * per-session ordered scan; the WHERE must match consumer queries syntactically.
  */
 const CREATE_V14_INDEXES = [
@@ -591,7 +591,7 @@ const CREATE_EPICS_INDEXES = [
 ];
 
 /**
- * Partial composite indexes on `events` for `syncPlanctlLinks`'s cross-session
+ * Partial composite indexes on `events` for `syncPlanLinks`'s cross-session
  * sweep. Paired with the UNION query rewrite in `src/reducer.ts`: the planner
  * picks ONE index per cross-column OR, so the UNION form SEARCHes both the
  * `_epic` and `_target` index instead of SCANning. Trailing `(session_id, id)`
@@ -1001,7 +1001,7 @@ CREATE TABLE IF NOT EXISTS builds (
  * `commit_trailer_facts` projection table — one row per `Commit` event whose
  * frozen payload carries a planctl trailer (`committer_session_id` +
  * `planctl_op` + `planctl_target` all non-null). The commit-trailer channel of
- * `syncPlanctlLinks` reads this `ORDER BY event_id ASC` instead of re-scanning
+ * `syncPlanLinks` reads this `ORDER BY event_id ASC` instead of re-scanning
  * every `Commit` blob per swept session (the fn-807 fold fan-out). `event_id` is
  * the PK so the live fold's INSERT is idempotent under a re-fold; the two
  * composite indexes serve the per-session load and the per-epic sweep.
@@ -1819,12 +1819,26 @@ function migrate(db: Database): void {
 
       // v13→v14: planctl_* event columns + `epic_links`/`job_links` projection
       // columns + partial index + a same-transaction backfill via the SAME pure
-      // classifier the live reducer fan-out uses.
-      addColumnIfMissing(db, "events", "planctl_op", "TEXT");
-      addColumnIfMissing(db, "events", "planctl_target", "TEXT");
-      addColumnIfMissing(db, "events", "planctl_epic_id", "TEXT");
-      addColumnIfMissing(db, "events", "planctl_task_id", "TEXT");
-      addColumnIfMissing(db, "events", "planctl_subject_present", "INTEGER");
+      // classifier the live reducer fan-out uses. The `planctl_*` adds + their
+      // index are spelled as schema history (Decision A) but VERSION-GUARDED: v78
+      // renames `planctl_*` → `plan_*`, so an unconditional presence-idempotent
+      // re-add would resurrect a zombie `planctl_*` column on every post-v78 boot.
+      // The `< 14` guard fires them only while walking up to v14 (fresh DB or a
+      // pre-v14 upgrade); the `epic_links`/`job_links` adds are NOT renamed and
+      // stay unconditional.
+      if (preMigrateStoredVersion < 14) {
+        addColumnIfMissing(db, "events", "planctl_op", "TEXT");
+        addColumnIfMissing(db, "events", "planctl_target", "TEXT");
+        addColumnIfMissing(db, "events", "planctl_epic_id", "TEXT");
+        addColumnIfMissing(db, "events", "planctl_task_id", "TEXT");
+        addColumnIfMissing(db, "events", "planctl_subject_present", "INTEGER");
+        // Index AFTER the ADD COLUMNs it depends on. Guarded with the adds so a
+        // post-v78 boot never re-CREATEs the dropped `idx_events_planctl_session`
+        // against a renamed-away `planctl_op`.
+        for (const sql of CREATE_V14_INDEXES) {
+          db.run(sql);
+        }
+      }
       addColumnIfMissing(
         db,
         "jobs",
@@ -1837,11 +1851,6 @@ function migrate(db: Database): void {
         "job_links",
         "TEXT NOT NULL DEFAULT '[]'",
       );
-
-      // Index AFTER the ADD COLUMNs it depends on.
-      for (const sql of CREATE_V14_INDEXES) {
-        db.run(sql);
-      }
 
       // JS-driven backfill (uncached `db.run`; a throw rolls back). Version-
       // guarded non-idempotent — the projection re-derive must run at most once.
@@ -1880,7 +1889,7 @@ function migrate(db: Database): void {
           if (parsed == null) {
             continue;
           }
-          const inv = extractPlanctlInvocation(
+          const inv = extractPlanInvocation(
             row.hook_event,
             row.tool_name,
             parsed,
@@ -1908,7 +1917,7 @@ function migrate(db: Database): void {
         }
 
         // Pass 2 — per-session projection re-derive, byte-identical to the live
-        // `syncPlanctlLinks` fan-out (both feed the same pure classifier).
+        // `syncPlanLinks` fan-out (both feed the same pure classifier).
         const sessionRows = db
           .prepare(
             `SELECT DISTINCT session_id
@@ -1939,7 +1948,7 @@ function migrate(db: Database): void {
           }[];
           const invocations: ClassifierInvocation[] = invRows.map((r) => ({
             ts: r.ts,
-            op: normalizePlanctlOp(r.planctl_op),
+            op: normalizePlanOp(r.planctl_op),
             target: r.planctl_target,
             epic_id: r.planctl_epic_id,
             subject_present: r.planctl_subject_present === 1,
@@ -2160,7 +2169,7 @@ function migrate(db: Database): void {
           if (parsed == null) {
             continue;
           }
-          const inv = extractPlanctlInvocation(
+          const inv = extractPlanInvocation(
             row.hook_event,
             row.tool_name,
             parsed,
@@ -2188,7 +2197,7 @@ function migrate(db: Database): void {
         }
 
         // Pass 2 — per-session projection re-derive, byte-identical to the live
-        // `syncPlanctlLinks` fan-out (same pure classifier).
+        // `syncPlanLinks` fan-out (same pure classifier).
         const sessionRowsV20 = db
           .prepare(
             `SELECT DISTINCT session_id
@@ -2222,7 +2231,7 @@ function migrate(db: Database): void {
           }[];
           const invocations: ClassifierInvocation[] = invRows.map((r) => ({
             ts: r.ts,
-            op: normalizePlanctlOp(r.planctl_op),
+            op: normalizePlanOp(r.planctl_op),
             target: r.planctl_target,
             epic_id: r.planctl_epic_id,
             subject_present: r.planctl_subject_present === 1,
@@ -2495,7 +2504,7 @@ function migrate(db: Database): void {
       addColumnIfMissing(db, "epics", "sort_path", "TEXT NOT NULL DEFAULT ''");
 
       // Version-guarded rewind-and-redrain (both columns derive from the log via
-      // `syncPlanctlLinks`).
+      // `syncPlanLinks`).
       const storedVersionV29 = Number(
         (
           db
@@ -2513,8 +2522,13 @@ function migrate(db: Database): void {
       // v29→v30: add `events.planctl_queue_jump` (the `/plan:queue` signal) +
       // `epics.queue_jump`. `queue_jump` drives the `!`-prefix `sort_path` branch
       // for root epics — `"!"` (ASCII 33) sorts strictly below the digits (48-57)
-      // under BINARY collation, lifting queued roots above non-queued ones.
-      addColumnIfMissing(db, "events", "planctl_queue_jump", "INTEGER");
+      // under BINARY collation, lifting queued roots above non-queued ones. The
+      // `planctl_queue_jump` add is VERSION-GUARDED (v78 renames it → `plan_queue_jump`,
+      // so an unconditional re-add would resurrect a zombie post-v78); the
+      // non-renamed `epics.queue_jump` add stays unconditional.
+      if (preMigrateStoredVersion < 30) {
+        addColumnIfMissing(db, "events", "planctl_queue_jump", "INTEGER");
+      }
       addColumnIfMissing(
         db,
         "epics",
@@ -2688,8 +2702,15 @@ function migrate(db: Database): void {
       for (const sql of CREATE_JOBS_INDEXES) {
         db.run(sql);
       }
-      for (const sql of CREATE_EVENTS_PLANCTL_INDEXES) {
-        db.run(sql);
+      // VERSION-GUARDED (not always-run like the two above): v78 DROP/CREATE-
+      // renames `idx_events_planctl_epic`/`_target` → `idx_events_plan_*`. An
+      // unconditional re-CREATE on a post-v78 boot would resurrect the dropped old
+      // index name against the renamed-away `planctl_*` columns and throw. The
+      // `< 32` guard (their v31→v32 intro version) fires them only on the walk up.
+      if (preMigrateStoredVersion < 32) {
+        for (const sql of CREATE_EVENTS_PLANCTL_INDEXES) {
+          db.run(sql);
+        }
       }
       db.run("ANALYZE epics");
       db.run("ANALYZE jobs");
@@ -2940,8 +2961,12 @@ function migrate(db: Database): void {
       // row-preserving TABLE REBUILD since SQLite can't ALTER a CHECK), backfills,
       // and rewinds. The CHECK rebuild MUST run BEFORE the rewind (DELETE
       // preserves the new CHECK) and before the boot drain writes
-      // `source='planctl'` rows the old CHECK would reject. Version-guarded.
-      addColumnIfMissing(db, "events", "planctl_files", "TEXT");
+      // `source='planctl'` rows the old CHECK would reject. Version-guarded. The
+      // `planctl_files` add is itself VERSION-GUARDED (v78 renames it →
+      // `plan_files`, so an unconditional re-add resurrects a zombie post-v78).
+      if (preMigrateStoredVersion < 46) {
+        addColumnIfMissing(db, "events", "planctl_files", "TEXT");
+      }
 
       const storedVersionV46 = Number(
         (
@@ -2995,7 +3020,7 @@ function migrate(db: Database): void {
         }
       }
 
-      // Backfill `events.planctl_files` via the shared `extractPlanctlInvocation`
+      // Backfill `events.planctl_files` via the shared `extractPlanInvocation`
       // deriver (defensive parse; non-planctl rows stay NULL).
       if (storedVersionV46 < 46) {
         const rows = db
@@ -3022,7 +3047,7 @@ function migrate(db: Database): void {
           } catch {
             continue;
           }
-          const inv = extractPlanctlInvocation(
+          const inv = extractPlanInvocation(
             row.hook_event,
             row.tool_name,
             parsed,
@@ -3414,7 +3439,7 @@ function migrate(db: Database): void {
       }
 
       // v66→v67: add the `commit_trailer_facts` projection table so the
-      // commit-trailer channel of `syncPlanctlLinks` reads an indexed projection
+      // commit-trailer channel of `syncPlanLinks` reads an indexed projection
       // instead of re-scanning every `Commit` blob per swept session (the fn-807
       // fold fan-out). CREATE + indexes run UNCONDITIONALLY (idempotent IF NOT
       // EXISTS) so fresh and migrated DBs are schema-identical; the BACKFILL is
@@ -3761,6 +3786,148 @@ function migrate(db: Database): void {
         db.run("DELETE FROM builds");
       }
 
+      // v77→v78 (fn-864 task .1): rename every `planctl_*` schema surface →
+      // `plan_*` and rewrite the historical `events.data` `planctl_invocation`
+      // envelopes → `plan_invocation`, in ONE atomic `.immediate()` tx. This is a
+      // VALUE-PRESERVING rename (the fn-831 pattern) — NO cursor rewind: the
+      // column rename keeps every row, `ALTER RENAME COLUMN` is metadata-only and
+      // auto-rewrites the partial-index predicates, and the envelope rewrite swaps
+      // ONE JSON key while preserving surrounding bytes, so a from-scratch re-fold
+      // over the rewritten corpus reproduces byte-identical projection rows. The
+      // CREATE-TABLE literals + the frozen `addColumnIfMissing("planctl_*")` ladder
+      // steps stay spelled `planctl_*` (schema history, Decision A) but are now
+      // version-guarded so a post-v78 reboot never resurrects a zombie `planctl_*`
+      // column; this v78 step is the sole forward rename. Whitelist-only Python
+      // read (keeper-py reads `jobs`/`epics` over the socket, not these projection
+      // internals) — this bump MUST add 78 to `SUPPORTED_SCHEMA_VERSIONS` in
+      // `keeper/api.py` in the SAME commit; test/schema-version.test.ts enforces.
+      if (preMigrateStoredVersion < 78) {
+        // 1. Column renames. `renameColumnIfPresent` is quad-state idempotent: it
+        // runs the ALTER on old-present/new-absent (fresh-DB-walk + v77-upgrade)
+        // and no-ops every other combination. The rename auto-rewrites each
+        // partial index's stored WHERE predicate to the new column name.
+        for (const [oldName, newName] of [
+          ["planctl_op", "plan_op"],
+          ["planctl_target", "plan_target"],
+          ["planctl_epic_id", "plan_epic_id"],
+          ["planctl_task_id", "plan_task_id"],
+          ["planctl_subject_present", "plan_subject_present"],
+          ["planctl_queue_jump", "plan_queue_jump"],
+          ["planctl_files", "plan_files"],
+        ] as const) {
+          renameColumnIfPresent(db, "events", oldName, newName);
+        }
+        for (const [oldName, newName] of [
+          ["planctl_op", "plan_op"],
+          ["planctl_target", "plan_target"],
+          ["planctl_epic_id", "plan_epic_id"],
+        ] as const) {
+          renameColumnIfPresent(db, "commit_trailer_facts", oldName, newName);
+        }
+
+        // 2. Index-identifier renames for the THREE `events` partial indexes. The
+        // column rename above already rewrote their predicates; this DROP/CREATE
+        // only renames the index IDENTIFIER. Safe because their frozen creates are
+        // now version-guarded (never re-run on a post-v78 reboot with the dropped
+        // old name + a stale `planctl_*` column ref). The `idx_commit_trailer_facts_epic`
+        // identifier is DELIBERATELY left unrenamed — its create is unconditional
+        // (in two always-run blocks), so a DROP/rename would make the next boot's
+        // `CREATE IF NOT EXISTS idx_commit_trailer_facts_epic` re-evaluate a stale
+        // `planctl_epic_id` ref and throw. The column rename auto-rewrites its
+        // predicate to `plan_epic_id`, which is the schema surface that matters.
+        db.run("DROP INDEX IF EXISTS idx_events_planctl_session");
+        db.run(
+          "CREATE INDEX IF NOT EXISTS idx_events_plan_session ON events (session_id, id) WHERE plan_op IS NOT NULL",
+        );
+        db.run("DROP INDEX IF EXISTS idx_events_planctl_epic");
+        db.run(
+          "CREATE INDEX IF NOT EXISTS idx_events_plan_epic ON events(plan_epic_id, session_id, id) WHERE plan_op IS NOT NULL",
+        );
+        db.run("DROP INDEX IF EXISTS idx_events_planctl_target");
+        db.run(
+          "CREATE INDEX IF NOT EXISTS idx_events_plan_target ON events(plan_target, session_id, id) WHERE plan_op IS NOT NULL",
+        );
+
+        // 3. Rewrite the historical `events.data` `planctl_invocation` envelopes →
+        // `plan_invocation`. The envelope sits inside `tool_response.stdout` (itself
+        // a JSON *string*), so this is an app-level parse / swap-key / re-embed —
+        // NOT `json_set` (which can't reach into a JSON string) and NOT
+        // `serializePlanJson` (which re-sorts keys and would break stdout byte
+        // fidelity + the re-fold byte-identity gate). Per-row try/catch: a
+        // malformed / oversized body is skipped, never thrown (a throw rolls back
+        // the whole v78 tx). Idempotent — a re-run finds no `planctl_invocation`.
+        const legacyRows = db
+          .prepare(
+            `SELECT id, data FROM events
+              WHERE data LIKE '%planctl_invocation%'`,
+          )
+          .all() as { id: number; data: string | null }[];
+        const rewriteStmt = db.prepare(
+          "UPDATE events SET data = ? WHERE id = ?",
+        );
+        for (const row of legacyRows) {
+          if (row.data == null) continue;
+          try {
+            const outer = JSON.parse(row.data) as Record<string, unknown>;
+            if (typeof outer !== "object" || outer === null) continue;
+            const toolResponse = outer.tool_response;
+            // Two shapes carry the envelope: the canonical
+            // `tool_response.stdout` JSON string (the hook's PostToolUse:Bash
+            // shape), and a top-level inlined `planctl_invocation` (synthetic /
+            // test rows). Touch ONLY the envelope key — never `tool_input.command`.
+            let mutated = false;
+            if (typeof toolResponse === "object" && toolResponse !== null) {
+              const tr = toolResponse as Record<string, unknown>;
+              const stdout = tr.stdout;
+              if (typeof stdout === "string" && stdout.length > 0) {
+                const inner = JSON.parse(stdout) as Record<string, unknown>;
+                if (
+                  typeof inner === "object" &&
+                  inner !== null &&
+                  Object.hasOwn(inner, "planctl_invocation")
+                ) {
+                  inner.plan_invocation = inner.planctl_invocation;
+                  delete inner.planctl_invocation;
+                  tr.stdout = JSON.stringify(inner);
+                  mutated = true;
+                }
+              }
+            }
+            if (Object.hasOwn(outer, "planctl_invocation")) {
+              outer.plan_invocation = outer.planctl_invocation;
+              delete outer.planctl_invocation;
+              mutated = true;
+            }
+            if (mutated) {
+              rewriteStmt.run(JSON.stringify(outer), row.id);
+            }
+          } catch {
+            // Malformed body — leave it; the deriver folds it to NULL anyway.
+          }
+        }
+
+        // 4. Hard assertion: no canonical event may still carry the legacy key
+        // after the rewrite, or the dropped `?? planctl_invocation` coalesce would
+        // silently NULL that event's plan link. A residual count > 0 is a missed
+        // row shape — throw loud and roll the whole v78 tx back to v77 (boot
+        // retries). Skip-on-malformed is fine here: a body that failed JSON.parse
+        // is one the deriver also can't read, so it carries no live plan link.
+        const residual = (
+          db
+            .prepare(
+              `SELECT COUNT(*) AS n FROM events
+                WHERE data LIKE '%planctl_invocation%'
+                  AND json_valid(data)`,
+            )
+            .get() as { n: number }
+        ).n;
+        if (residual > 0) {
+          throw new Error(
+            `v78 envelope rewrite incomplete: ${residual} events still carry planctl_invocation`,
+          );
+        }
+      }
+
       db.prepare(
         "INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
       ).run(String(SCHEMA_VERSION));
@@ -3797,18 +3964,18 @@ export function prepareStmts(db: Database): Stmts {
         ts, session_id, pid, hook_event, event_type, tool_name, matcher,
         cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
         subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-        planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-        planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-        bash_mutation_kind, bash_mutation_targets, planctl_files,
+        plan_op, plan_target, plan_epic_id, plan_task_id,
+        plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+        bash_mutation_kind, bash_mutation_targets, plan_files,
         backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
         background_task_id, mutation_path
       ) VALUES (
         $ts, $session_id, $pid, $hook_event, $event_type, $tool_name, $matcher,
         $cwd, $permission_mode, $agent_id, $agent_type, $stop_hook_active, $data,
         $subagent_agent_id, $spawn_name, $start_time, $slash_command, $skill_name,
-        $planctl_op, $planctl_target, $planctl_epic_id, $planctl_task_id,
-        $planctl_subject_present, $tool_use_id, $config_dir, $planctl_queue_jump,
-        $bash_mutation_kind, $bash_mutation_targets, $planctl_files,
+        $plan_op, $plan_target, $plan_epic_id, $plan_task_id,
+        $plan_subject_present, $tool_use_id, $config_dir, $plan_queue_jump,
+        $bash_mutation_kind, $bash_mutation_targets, $plan_files,
         $backend_exec_type, $backend_exec_session_id, $backend_exec_pane_id,
         $background_task_id, $mutation_path
       )
@@ -3996,7 +4163,7 @@ function noStmts(): Stmts {
  * ping-pong. Sorts object keys, ASCII-escapes non-ASCII (`ensure_ascii=True`),
  * appends one trailing `\n`.
  */
-export function serializePlanctlJson(data: unknown): string {
+export function serializePlanJson(data: unknown): string {
   const sorted = sortObjectKeys(data);
   const body = JSON.stringify(sorted, null, 2);
   return `${escapeNonAscii(body)}\n`;

@@ -38,7 +38,7 @@ import {
   extractBackgroundTaskId,
   extractBashMutation,
   extractMutationPath,
-  extractPlanctlInvocation,
+  extractPlanInvocation,
   extractSkillName,
   extractToolUseId,
   slashCommandFromPrompt,
@@ -552,17 +552,17 @@ export const KNOWN_EVENT_COLUMNS: ReadonlySet<string> = new Set([
   "start_time",
   "slash_command",
   "skill_name",
-  "planctl_op",
-  "planctl_target",
-  "planctl_epic_id",
-  "planctl_task_id",
-  "planctl_subject_present",
+  "plan_op",
+  "plan_target",
+  "plan_epic_id",
+  "plan_task_id",
+  "plan_subject_present",
   "tool_use_id",
   "config_dir",
-  "planctl_queue_jump",
+  "plan_queue_jump",
   "bash_mutation_kind",
   "bash_mutation_targets",
-  "planctl_files",
+  "plan_files",
   "backend_exec_type",
   "backend_exec_session_id",
   "backend_exec_pane_id",
@@ -649,36 +649,36 @@ async function main(): Promise<void> {
   const skillName = extractSkillName(hookEvent, toolName, data);
 
   // Index the planctl-CLI invocation footprint on PostToolUse:Bash by parsing
-  // the `planctl_invocation` envelope planctl writes on every mutating call's
+  // the `plan_invocation` envelope the plan CLI writes on every mutating call's
   // stdout. The deriver is pure, gated on hook event + tool name, and
   // defensive against any malformed `data.tool_response` shape — a null return
   // collapses to all the params bound NULL.
-  const planctlInvocation = extractPlanctlInvocation(hookEvent, toolName, data);
-  const planctlOp = planctlInvocation?.op ?? null;
-  const planctlTarget = planctlInvocation?.target ?? null;
-  const planctlEpicId = planctlInvocation?.epic_id ?? null;
-  const planctlTaskId = planctlInvocation?.task_id ?? null;
+  const planInvocation = extractPlanInvocation(hookEvent, toolName, data);
+  const planOp = planInvocation?.op ?? null;
+  const planTarget = planInvocation?.target ?? null;
+  const planEpicId = planInvocation?.epic_id ?? null;
+  const planTaskId = planInvocation?.task_id ?? null;
   // `subject_present` is 0/1 on disk to match the INTEGER column; NULL when
   // the event is not a planctl invocation at all.
-  const planctlSubjectPresent =
-    planctlInvocation === null
+  const planSubjectPresent =
+    planInvocation === null
       ? null
-      : planctlInvocation.subject_present
+      : planInvocation.subject_present
         ? 1
         : 0;
   // `queue_jump` mirrors the `subject_present` 0/1/null convention — INTEGER
   // on disk, NULL when the event isn't a planctl invocation at all.
-  const planctlQueueJump =
-    planctlInvocation === null ? null : planctlInvocation.queue_jump ? 1 : 0;
+  const planQueueJump =
+    planInvocation === null ? null : planInvocation.queue_jump ? 1 : 0;
   // The envelope's repo-relative `files[]` array, JSON-encoded for the SQLite
   // TEXT column. NULL when the deriver couldn't lift a non-empty string array
   // (non-planctl events, read-only ops, or runaway-size payloads). Sparse
-  // JSON-or-NULL so a `WHERE planctl_files IS NOT NULL` partial index stays
+  // JSON-or-NULL so a `WHERE plan_files IS NOT NULL` partial index stays
   // selective.
-  const planctlFiles =
-    planctlInvocation?.files == null
+  const planFiles =
+    planInvocation?.files == null
       ? null
-      : JSON.stringify(planctlInvocation.files);
+      : JSON.stringify(planInvocation.files);
 
   // Index the Anthropic tool_use_id correlator on every event payload carrying
   // it. NOT gated on hook event or tool name — Pre/PostToolUse +
@@ -770,17 +770,17 @@ async function main(): Promise<void> {
     $start_time: spawnInfo.startTime,
     $slash_command: slashCommand,
     $skill_name: skillName,
-    $planctl_op: planctlOp,
-    $planctl_target: planctlTarget,
-    $planctl_epic_id: planctlEpicId,
-    $planctl_task_id: planctlTaskId,
-    $planctl_subject_present: planctlSubjectPresent,
+    $plan_op: planOp,
+    $plan_target: planTarget,
+    $plan_epic_id: planEpicId,
+    $plan_task_id: planTaskId,
+    $plan_subject_present: planSubjectPresent,
     $tool_use_id: toolUseId,
     $config_dir: configDir,
-    $planctl_queue_jump: planctlQueueJump,
+    $plan_queue_jump: planQueueJump,
     $bash_mutation_kind: bashMutationKind,
     $bash_mutation_targets: bashMutationTargets,
-    $planctl_files: planctlFiles,
+    $plan_files: planFiles,
     $backend_exec_type: backendExecCoords.type,
     $backend_exec_session_id: backendExecCoords.sessionId,
     $backend_exec_pane_id: backendExecCoords.paneId,

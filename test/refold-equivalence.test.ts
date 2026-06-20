@@ -38,7 +38,8 @@
 
 import { Database } from "bun:sqlite";
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import {
   countAbsentBlobs,
@@ -176,25 +177,25 @@ test("the REAL widened shed predicate sheds the fold-unread classes and KEEPS ev
   probe.run(
     `CREATE TABLE events (
        id INTEGER PRIMARY KEY AUTOINCREMENT, hook_event TEXT, tool_name TEXT,
-       planctl_op TEXT, subagent_agent_id TEXT, mutation_path TEXT, data TEXT
+       plan_op TEXT, subagent_agent_id TEXT, mutation_path TEXT, data TEXT
      )`,
   );
   const shedRow = (row: {
     hook_event: string;
     tool_name?: string | null;
-    planctl_op?: string | null;
+    plan_op?: string | null;
     subagent_agent_id?: string | null;
     mutation_path?: string | null;
     data?: string | null;
   }): boolean => {
     probe.run("DELETE FROM events");
     probe.run(
-      `INSERT INTO events (hook_event, tool_name, planctl_op, subagent_agent_id, mutation_path, data)
+      `INSERT INTO events (hook_event, tool_name, plan_op, subagent_agent_id, mutation_path, data)
        VALUES (?, ?, ?, ?, ?, ?)`,
       [
         row.hook_event,
         row.tool_name ?? null,
-        row.planctl_op ?? null,
+        row.plan_op ?? null,
         row.subagent_agent_id ?? null,
         row.mutation_path ?? null,
         row.data ?? "{}",
@@ -233,7 +234,7 @@ test("the REAL widened shed predicate sheds the fold-unread classes and KEEPS ev
     }).toEqual({ tool, shed: true });
   }
   expect(
-    shedRow({ hook_event: "PostToolUse", tool_name: "Bash", planctl_op: null }),
+    shedRow({ hook_event: "PostToolUse", tool_name: "Bash", plan_op: null }),
   ).toBe(true); // non-planctl Bash sheds
   expect(
     shedRow({
@@ -263,7 +264,7 @@ test("the REAL widened shed predicate sheds the fold-unread classes and KEEPS ev
     shedRow({
       hook_event: "PostToolUse",
       tool_name: "Bash",
-      planctl_op: "done",
+      plan_op: "done",
     }),
   ).toBe(false); // planctl Bash KEPT (state_repo fold-read)
   expect(
@@ -489,9 +490,9 @@ function insertEvent(overrides: {
   tool_use_id?: string | null;
   agent_id?: string | null;
   agent_type?: string | null;
-  planctl_op?: string | null;
-  planctl_target?: string | null;
-  planctl_files?: string | null;
+  plan_op?: string | null;
+  plan_target?: string | null;
+  plan_files?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
   const data = overrides.data ?? "{}";
@@ -519,8 +520,8 @@ function insertEvent(overrides: {
   db.run(
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
-       subagent_agent_id, tool_use_id, agent_id, agent_type, planctl_op,
-       planctl_target, planctl_files, mutation_path
+       subagent_agent_id, tool_use_id, agent_id, agent_type, plan_op,
+       plan_target, plan_files, mutation_path
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
@@ -535,9 +536,9 @@ function insertEvent(overrides: {
       overrides.tool_use_id ?? null,
       overrides.agent_id ?? null,
       overrides.agent_type ?? null,
-      overrides.planctl_op ?? null,
-      overrides.planctl_target ?? null,
-      overrides.planctl_files ?? null,
+      overrides.plan_op ?? null,
+      overrides.plan_target ?? null,
+      overrides.plan_files ?? null,
       mutationPath,
     ],
   );
@@ -925,7 +926,7 @@ test("legacy charter: malformed / missing agentId folds to null (never throws)",
 
 test("legacy charter: planctl Bash tool_response.stdout envelope folds; malformed body does not throw", () => {
   // The planctl plan-invocation fold reads `tool_response.stdout` from a
-  // PostToolUse:Bash body — a keep-set read (gated on planctl_op + planctl_files
+  // PostToolUse:Bash body — a keep-set read (gated on plan_op + plan_files
   // sparse columns, so it never touches a shed-class body). A well-shaped
   // envelope mints; a malformed body folds safe with the cursor advancing.
   insertEvent({ hook_event: "SessionStart", session_id: SESS_A });
@@ -934,9 +935,9 @@ test("legacy charter: planctl Bash tool_response.stdout envelope folds; malforme
     tool_name: "Bash",
     session_id: SESS_A,
     cwd: REPO,
-    planctl_op: "done",
-    planctl_target: "fn-1-x.1",
-    planctl_files: JSON.stringify([".planctl/tasks/fn-1-x.1.md"]),
+    plan_op: "done",
+    plan_target: "fn-1-x.1",
+    plan_files: JSON.stringify([".planctl/tasks/fn-1-x.1.md"]),
     data: JSON.stringify({
       tool_response: {
         stdout: JSON.stringify({
@@ -951,9 +952,9 @@ test("legacy charter: planctl Bash tool_response.stdout envelope folds; malforme
     tool_name: "Bash",
     session_id: SESS_A,
     cwd: REPO,
-    planctl_op: "done",
-    planctl_target: "fn-1-x.2",
-    planctl_files: JSON.stringify([".planctl/tasks/fn-1-x.2.md"]),
+    plan_op: "done",
+    plan_target: "fn-1-x.2",
+    plan_files: JSON.stringify([".planctl/tasks/fn-1-x.2.md"]),
     data: "{ not json",
   });
   expect(() => drainAll()).not.toThrow();
@@ -1117,9 +1118,9 @@ function seedWidenedShedCorpus(): void {
     tool_name: "Bash",
     session_id: SESS_C,
     cwd: REPO,
-    planctl_op: "done",
-    planctl_target: "fn-9-z.1",
-    planctl_files: JSON.stringify([".planctl/tasks/fn-9-z.1.md"]),
+    plan_op: "done",
+    plan_target: "fn-9-z.1",
+    plan_files: JSON.stringify([".planctl/tasks/fn-9-z.1.md"]),
     data: JSON.stringify({
       tool_response: {
         stdout: JSON.stringify({ plan_invocation: { state_repo: REPO } }),
@@ -1334,7 +1335,7 @@ test("widened shed: pre-shed P0 === post-shed re-fold P1 === P2, countAbsentBlob
         )
         .get() as { n: number }
     ).n;
-  expect(inlineKept("planctl_op = 'done'")).toBeGreaterThan(0); // planctl Bash
+  expect(inlineKept("plan_op = 'done'")).toBeGreaterThan(0); // planctl Bash
   expect(
     inlineKept(
       "hook_event = 'PostToolUse' AND tool_name = 'Agent' AND subagent_agent_id IS NULL",
@@ -1427,5 +1428,334 @@ test("0 → head from-scratch migrate succeeds; event_blobs is gone at head (cre
     ).toBe(0);
   } finally {
     fresh.db.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v77→v78 (fn-864) — the planctl_*→plan_* rename + envelope-rewrite MERGE GATE
+//
+// Proves the riskiest migration of the strip is value-preserving and
+// re-fold-equivalent: a v77-shaped DB carrying a `planctl_invocation`-only
+// legacy event AND a `plan_invocation`-only new event migrates to v78 such that
+// (a) no canonical event still carries the legacy envelope key, (b) the legacy
+// envelope's `data` is rewritten in place preserving surrounding bytes, (c) the
+// columns/indexes rename, and (d) the migrated projection is byte-identical to a
+// from-scratch re-fold of the rewritten corpus — the same plan link mints off
+// either spelling. NO cursor rewind (value-preserving). Idempotent (re-migrate
+// finds nothing). Built by reverse-engineering a v77 fixture from a fresh v78
+// `openDb` (rename the columns back, restore the old index identifiers, stamp
+// 77), then reopening to drive the v78 step forward.
+// ---------------------------------------------------------------------------
+
+const V78_EVENT_COLS = [
+  ["plan_op", "planctl_op"],
+  ["plan_target", "planctl_target"],
+  ["plan_epic_id", "planctl_epic_id"],
+  ["plan_task_id", "planctl_task_id"],
+  ["plan_subject_present", "planctl_subject_present"],
+  ["plan_queue_jump", "planctl_queue_jump"],
+  ["plan_files", "planctl_files"],
+] as const;
+
+/** Reverse-rename a fresh v78 DB to the v77 shape (columns + the 3 event index
+ * identifiers), then stamp version 77 so the next open drives v77→v78. */
+function downgradeToV77Shape(d: Database): void {
+  for (const [newName, oldName] of V78_EVENT_COLS) {
+    d.run(`ALTER TABLE events RENAME COLUMN ${newName} TO ${oldName}`);
+  }
+  for (const [newName, oldName] of [
+    ["plan_op", "planctl_op"],
+    ["plan_target", "planctl_target"],
+    ["plan_epic_id", "planctl_epic_id"],
+  ] as const) {
+    d.run(
+      `ALTER TABLE commit_trailer_facts RENAME COLUMN ${newName} TO ${oldName}`,
+    );
+  }
+  // Restore the v77 index identifiers (the column rename above already rewrote
+  // their predicates back to `planctl_op`).
+  d.run("DROP INDEX IF EXISTS idx_events_plan_session");
+  d.run(
+    "CREATE INDEX IF NOT EXISTS idx_events_planctl_session ON events (session_id, id) WHERE planctl_op IS NOT NULL",
+  );
+  d.run("DROP INDEX IF EXISTS idx_events_plan_epic");
+  d.run(
+    "CREATE INDEX IF NOT EXISTS idx_events_planctl_epic ON events(planctl_epic_id, session_id, id) WHERE planctl_op IS NOT NULL",
+  );
+  d.run("DROP INDEX IF EXISTS idx_events_plan_target");
+  d.run(
+    "CREATE INDEX IF NOT EXISTS idx_events_planctl_target ON events(planctl_target, session_id, id) WHERE planctl_op IS NOT NULL",
+  );
+  d.run("UPDATE meta SET value = '77' WHERE key = 'schema_version'");
+}
+
+/** Snapshot the fold-output projection rows that a plan-link fold produces, for
+ * byte-identity comparison across the migration / a re-fold. */
+function planProjectionSnapshot(d: Database): {
+  fileAttributions: unknown[];
+  jobs: unknown[];
+  epics: unknown[];
+} {
+  return {
+    fileAttributions: d
+      .query(
+        `SELECT project_dir, session_id, file_path, op, source
+           FROM file_attributions ORDER BY project_dir, session_id, file_path`,
+      )
+      .all(),
+    jobs: d.query("SELECT job_id, epic_links FROM jobs ORDER BY job_id").all(),
+    epics: d
+      .query("SELECT epic_id, job_links FROM epics ORDER BY epic_id")
+      .all(),
+  };
+}
+
+test("v77→v78 MERGE GATE: legacy `planctl_invocation`-only + `plan_invocation`-only fold byte-identically across the rename + rewrite", () => {
+  const dir = mkdtempSync(join(tmpdir(), "keeper-v78-proof-"));
+  const dbPath = join(dir, "keeper.db");
+  const SESS_LEGACY = "11111111-1111-1111-1111-111111111111";
+  const SESS_NEW = "22222222-2222-2222-2222-222222222222";
+  try {
+    // 1. Build a fresh v78 DB, downgrade it to the v77 shape, and seed a mixed
+    // corpus: a SessionStart per session, ONE legacy `planctl_invocation`-only
+    // scaffold (envelope inside tool_response.stdout) and ONE new
+    // `plan_invocation`-only scaffold — identical op/target/files modulo the
+    // envelope key spelling. The two events differ ONLY in that one key.
+    {
+      const { db: seed } = openDb(dbPath);
+      downgradeToV77Shape(seed);
+      const insert = seed.prepare(
+        `INSERT INTO events (
+           ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
+           planctl_op, planctl_target, planctl_epic_id, planctl_subject_present,
+           planctl_files
+         ) VALUES (?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      );
+      // SessionStart rows (no plan columns).
+      insert.run(
+        1000,
+        SESS_LEGACY,
+        "SessionStart",
+        "session_start",
+        null,
+        REPO,
+        "{}",
+        null,
+        null,
+        null,
+        null,
+        null,
+      );
+      insert.run(
+        1001,
+        SESS_NEW,
+        "SessionStart",
+        "session_start",
+        null,
+        REPO,
+        "{}",
+        null,
+        null,
+        null,
+        null,
+        null,
+      );
+      const envBody = (key: "planctl_invocation" | "plan_invocation") =>
+        JSON.stringify({
+          tool_response: {
+            stdout: JSON.stringify({
+              [key]: {
+                op: "scaffold",
+                target: "fn-1-x",
+                state_repo: REPO,
+                files: [".planctl/epics/fn-1-x.json"],
+                subject: "x",
+              },
+            }),
+          },
+        });
+      // Legacy `planctl_invocation`-only PostToolUse:Bash scaffold.
+      insert.run(
+        1002,
+        SESS_LEGACY,
+        "PostToolUse",
+        "post_tool_use",
+        "Bash",
+        REPO,
+        envBody("planctl_invocation"),
+        "scaffold",
+        "fn-1-x",
+        "fn-1-x",
+        1,
+        JSON.stringify([".planctl/epics/fn-1-x.json"]),
+      );
+      // New `plan_invocation`-only PostToolUse:Bash scaffold (same shape).
+      insert.run(
+        1003,
+        SESS_NEW,
+        "PostToolUse",
+        "post_tool_use",
+        "Bash",
+        REPO,
+        envBody("plan_invocation"),
+        "scaffold",
+        "fn-1-x",
+        "fn-1-x",
+        1,
+        JSON.stringify([".planctl/epics/fn-1-x.json"]),
+      );
+      // Sanity: the v77 fixture genuinely carries the legacy key.
+      expect(
+        (
+          seed
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE data LIKE '%planctl_invocation%'",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(1);
+      seed.close();
+    }
+
+    // 2. Reopen — migrate() drives v77→v78 (rename + envelope rewrite + COUNT==0
+    // assert), then the boot drain folds the rewritten corpus.
+    const { db } = openDb(dbPath);
+    try {
+      expect(
+        (
+          db
+            .query("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as {
+            value: string;
+          }
+        ).value,
+      ).toBe(String(SCHEMA_VERSION));
+
+      // (a) No canonical event carries the legacy envelope key post-migrate.
+      expect(
+        (
+          db
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE data LIKE '%planctl_invocation%'",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(0);
+      // Both events now carry the renamed key.
+      expect(
+        (
+          db
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE data LIKE '%plan_invocation%'",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(2);
+
+      // (b) The columns renamed (a `plan_op` read succeeds; `planctl_op` is gone).
+      const evCols = (
+        db.query("PRAGMA table_info(events)").all() as { name: string }[]
+      ).map((c) => c.name);
+      expect(evCols).toContain("plan_op");
+      expect(evCols).not.toContain("planctl_op");
+
+      // (c) The 3 event indexes renamed AND their predicates rewrote to plan_op.
+      const idxSql = new Map(
+        (
+          db
+            .query(
+              "SELECT name, sql FROM sqlite_master WHERE type='index' AND tbl_name='events'",
+            )
+            .all() as { name: string; sql: string | null }[]
+        ).map((r) => [r.name, r.sql ?? ""]),
+      );
+      for (const name of [
+        "idx_events_plan_session",
+        "idx_events_plan_epic",
+        "idx_events_plan_target",
+      ]) {
+        expect(idxSql.has(name)).toBe(true);
+        expect(idxSql.get(name)).toContain("plan_op IS NOT NULL");
+        expect(idxSql.get(name)).not.toContain("planctl_op");
+      }
+
+      // Fold the rewritten corpus.
+      let n: number;
+      do {
+        n = drain(db);
+      } while (n > 0);
+
+      // (d) BOTH the legacy-spelled and new-spelled scaffold minted an
+      // identical `source='plan'` file_attribution — the rewrite made the two
+      // spellings fold the same. One row per session, same path/op/source.
+      const attrs = db
+        .query(
+          `SELECT session_id, file_path, op, source
+             FROM file_attributions ORDER BY session_id`,
+        )
+        .all() as {
+        session_id: string;
+        file_path: string;
+        op: string;
+        source: string;
+      }[];
+      expect(attrs).toEqual([
+        {
+          session_id: SESS_LEGACY,
+          file_path: ".planctl/epics/fn-1-x.json",
+          op: "scaffold",
+          source: "plan",
+        },
+        {
+          session_id: SESS_NEW,
+          file_path: ".planctl/epics/fn-1-x.json",
+          op: "scaffold",
+          source: "plan",
+        },
+      ]);
+
+      // Capture the migrated projection, then run a from-scratch re-fold and
+      // assert byte-identity (value-equal across the column rename + rewrite).
+      const migrated = planProjectionSnapshot(db);
+      db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+      db.run("DELETE FROM file_attributions");
+      db.run("DELETE FROM jobs");
+      db.run("DELETE FROM epics");
+      db.run("DELETE FROM git_status");
+      db.run("DELETE FROM subagent_invocations");
+      do {
+        n = drain(db);
+      } while (n > 0);
+      const refolded = planProjectionSnapshot(db);
+      expect(JSON.stringify(refolded)).toBe(JSON.stringify(migrated));
+    } finally {
+      db.close();
+    }
+
+    // 3. Idempotency: a second open re-runs migrate() with no `planctl_*` left —
+    // the rename no-ops, the rewrite finds zero rows, the version holds at v78.
+    const { db: again } = openDb(dbPath);
+    try {
+      expect(
+        (
+          again
+            .query("SELECT value FROM meta WHERE key = 'schema_version'")
+            .get() as { value: string }
+        ).value,
+      ).toBe(String(SCHEMA_VERSION));
+      expect(
+        (
+          again
+            .query(
+              "SELECT COUNT(*) AS n FROM events WHERE data LIKE '%planctl_invocation%'",
+            )
+            .get() as { n: number }
+        ).n,
+      ).toBe(0);
+    } finally {
+      again.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
   }
 });

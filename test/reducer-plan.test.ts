@@ -55,7 +55,7 @@ function insertEvent(
     hook_event: string;
     bash_mutation_kind?: string | null;
     bash_mutation_targets?: string | null;
-    planctl_files?: string | null;
+    plan_files?: string | null;
     backend_exec_type?: string | null;
     backend_exec_session_id?: string | null;
     backend_exec_pane_id?: string | null;
@@ -90,11 +90,11 @@ function insertEvent(
     start_time: overrides.start_time ?? null,
     slash_command: overrides.slash_command ?? null,
     skill_name: overrides.skill_name ?? null,
-    planctl_op: overrides.planctl_op ?? null,
-    planctl_target: overrides.planctl_target ?? null,
-    planctl_epic_id: overrides.planctl_epic_id ?? null,
-    planctl_task_id: overrides.planctl_task_id ?? null,
-    planctl_subject_present: overrides.planctl_subject_present ?? null,
+    plan_op: overrides.plan_op ?? null,
+    plan_target: overrides.plan_target ?? null,
+    plan_epic_id: overrides.plan_epic_id ?? null,
+    plan_task_id: overrides.plan_task_id ?? null,
+    plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
     // Schema v30: queue-jump sparse column; NULL unless this is a planctl
@@ -102,17 +102,17 @@ function insertEvent(
     // other planctl event (stamped 0). The test helper defaults to NULL so
     // every non-planctl event lands NULL — matches the live hook's stamping
     // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
-    planctl_queue_jump: overrides.planctl_queue_jump ?? null,
+    plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
     // whose payload didn't match a mutation pattern; defaults to NULL here
     // so a non-Bash event lands NULL. Tests covering bash attribution pass
     // these explicitly via the overrides.
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
-    // Schema v46 / fn-666: planctl_files sparse JSON-array column carrying
+    // Schema v46 / fn-666: plan_files sparse JSON-array column carrying
     // the envelope's repo-relative `files` array. NULL on every non-planctl
     // event; planctl-mint tests pass this explicitly via overrides.
-    planctl_files: overrides.planctl_files ?? null,
+    plan_files: overrides.plan_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
     // session/pane the parent Claude ran under). NULL on every non-zellij
     // event; backend-exec-mint tests pass these explicitly via overrides.
@@ -130,9 +130,9 @@ function insertEvent(
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-       planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-       bash_mutation_kind, bash_mutation_targets, planctl_files,
+       plan_op, plan_target, plan_epic_id, plan_task_id,
+       plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+       bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -155,17 +155,17 @@ function insertEvent(
       row.start_time,
       row.slash_command,
       row.skill_name,
-      row.planctl_op,
-      row.planctl_target,
-      row.planctl_epic_id,
-      row.planctl_task_id,
-      row.planctl_subject_present,
+      row.plan_op,
+      row.plan_target,
+      row.plan_epic_id,
+      row.plan_task_id,
+      row.plan_subject_present,
       row.tool_use_id,
       row.config_dir,
-      row.planctl_queue_jump,
+      row.plan_queue_jump,
       row.bash_mutation_kind,
       row.bash_mutation_targets,
-      row.planctl_files,
+      row.plan_files,
       row.backend_exec_type,
       row.backend_exec_session_id,
       row.backend_exec_pane_id,

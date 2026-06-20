@@ -116,7 +116,7 @@ export const DEFAULT_INCREMENTAL_VACUUM_PAGES = 400;
 /**
  * The SHED-CLASS retention predicate — a POSITIVE ALLOW-list of event classes
  * whose body no live fold reads, expressed over CHEAP HEADER COLUMNS ONLY
- * (`hook_event` / `tool_name` / `planctl_op` / `subagent_agent_id` — NEVER a
+ * (`hook_event` / `tool_name` / `plan_op` / `subagent_agent_id` — NEVER a
  * `json_extract`). A new or unlisted event type matches NOTHING here and so
  * defaults to KEPT — the fail-safe direction (an unclassified body is never
  * shed). The complement of this set IS the keep-set: every class a live fold
@@ -129,9 +129,9 @@ export const DEFAULT_INCREMENTAL_VACUUM_PAGES = 400;
  *    whose only fold consumption (`tool_input.file_path`) is promoted to
  *    `mutation_path`; the body is pure transcript archive.
  *  - PostToolUse Read/WebFetch/Skill/ToolSearch — no fold reads their body.
- *  - PostToolUse Bash WHERE `planctl_op IS NULL` — a planctl Bash row's
- *    `tool_response.stdout` envelope IS fold-read (`extractPlanctlStateRepo`),
- *    so the inversion KEEPS `planctl_op IS NOT NULL` and sheds the rest.
+ *  - PostToolUse Bash WHERE `plan_op IS NULL` — a plan Bash row's
+ *    `tool_response.stdout` envelope IS fold-read (`extractPlanStateRepo`),
+ *    so the inversion KEEPS `plan_op IS NOT NULL` and sheds the rest.
  *  - PostToolUse Agent WHERE `subagent_agent_id IS NOT NULL` — the modern bridge
  *    resolves the agent id from the indexed column; only a LEGACY row
  *    (`subagent_agent_id IS NULL`) falls back to the `tool_response.agentId`
@@ -155,7 +155,7 @@ export const RETENTION_SHED_CLASS_PREDICATE = `(
            'Read','WebFetch','Skill','ToolSearch'
          ))
      OR (hook_event = 'PostToolUse' AND tool_name = 'Bash'
-           AND planctl_op IS NULL)
+           AND plan_op IS NULL)
      OR (hook_event = 'PostToolUse' AND tool_name = 'Agent'
            AND subagent_agent_id IS NOT NULL)
      OR (hook_event = 'PreToolUse' AND tool_name IS NOT NULL

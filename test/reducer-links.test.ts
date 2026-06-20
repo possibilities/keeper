@@ -55,7 +55,7 @@ function insertEvent(
     hook_event: string;
     bash_mutation_kind?: string | null;
     bash_mutation_targets?: string | null;
-    planctl_files?: string | null;
+    plan_files?: string | null;
     backend_exec_type?: string | null;
     backend_exec_session_id?: string | null;
     backend_exec_pane_id?: string | null;
@@ -90,11 +90,11 @@ function insertEvent(
     start_time: overrides.start_time ?? null,
     slash_command: overrides.slash_command ?? null,
     skill_name: overrides.skill_name ?? null,
-    planctl_op: overrides.planctl_op ?? null,
-    planctl_target: overrides.planctl_target ?? null,
-    planctl_epic_id: overrides.planctl_epic_id ?? null,
-    planctl_task_id: overrides.planctl_task_id ?? null,
-    planctl_subject_present: overrides.planctl_subject_present ?? null,
+    plan_op: overrides.plan_op ?? null,
+    plan_target: overrides.plan_target ?? null,
+    plan_epic_id: overrides.plan_epic_id ?? null,
+    plan_task_id: overrides.plan_task_id ?? null,
+    plan_subject_present: overrides.plan_subject_present ?? null,
     tool_use_id: overrides.tool_use_id ?? null,
     config_dir: overrides.config_dir ?? null,
     // Schema v30: queue-jump sparse column; NULL unless this is a planctl
@@ -102,17 +102,17 @@ function insertEvent(
     // other planctl event (stamped 0). The test helper defaults to NULL so
     // every non-planctl event lands NULL — matches the live hook's stamping
     // contract (see `plugins/keeper/plugin/hooks/events-writer.ts`).
-    planctl_queue_jump: overrides.planctl_queue_jump ?? null,
+    plan_queue_jump: overrides.plan_queue_jump ?? null,
     // Schema v31: bash-mutation deriver sparse columns. NULL on every row
     // whose payload didn't match a mutation pattern; defaults to NULL here
     // so a non-Bash event lands NULL. Tests covering bash attribution pass
     // these explicitly via the overrides.
     bash_mutation_kind: overrides.bash_mutation_kind ?? null,
     bash_mutation_targets: overrides.bash_mutation_targets ?? null,
-    // Schema v46 / fn-666: planctl_files sparse JSON-array column carrying
+    // Schema v46 / fn-666: plan_files sparse JSON-array column carrying
     // the envelope's repo-relative `files` array. NULL on every non-planctl
     // event; planctl-mint tests pass this explicitly via overrides.
-    planctl_files: overrides.planctl_files ?? null,
+    plan_files: overrides.plan_files ?? null,
     // Schema v48 / fn-668: backend-exec coordinates (terminal-multiplexer
     // session/pane the parent Claude ran under). NULL on every non-zellij
     // event; backend-exec-mint tests pass these explicitly via overrides.
@@ -143,9 +143,9 @@ function insertEvent(
        ts, session_id, pid, hook_event, event_type, tool_name, matcher,
        cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
        subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
-       planctl_op, planctl_target, planctl_epic_id, planctl_task_id,
-       planctl_subject_present, tool_use_id, config_dir, planctl_queue_jump,
-       bash_mutation_kind, bash_mutation_targets, planctl_files,
+       plan_op, plan_target, plan_epic_id, plan_task_id,
+       plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
+       bash_mutation_kind, bash_mutation_targets, plan_files,
        backend_exec_type, backend_exec_session_id, backend_exec_pane_id,
        background_task_id, mutation_path
      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -168,17 +168,17 @@ function insertEvent(
       row.start_time,
       row.slash_command,
       row.skill_name,
-      row.planctl_op,
-      row.planctl_target,
-      row.planctl_epic_id,
-      row.planctl_task_id,
-      row.planctl_subject_present,
+      row.plan_op,
+      row.plan_target,
+      row.plan_epic_id,
+      row.plan_task_id,
+      row.plan_subject_present,
       row.tool_use_id,
       row.config_dir,
-      row.planctl_queue_jump,
+      row.plan_queue_jump,
       row.bash_mutation_kind,
       row.bash_mutation_targets,
-      row.planctl_files,
+      row.plan_files,
       row.backend_exec_type,
       row.backend_exec_session_id,
       row.backend_exec_pane_id,
@@ -895,7 +895,7 @@ function planctlEvent(args: {
   // passing `queueJump: true` to drive the `/plan:queue` projection path.
   queueJump?: boolean;
   // Schema v46 / fn-666: optional repo-relative `files[]` to lift into
-  // `events.planctl_files` AND inline into the envelope's `state_repo`
+  // `events.plan_files` AND inline into the envelope's `state_repo`
   // payload (so the reducer's mint can read `state_repo` from event.data).
   // Defaults `undefined` — existing tests keep their old null-on-planctl
   // shape and the mint becomes a no-op for them.
@@ -929,13 +929,13 @@ function planctlEvent(args: {
     session_id: args.sessionId,
     tool_name: "Bash",
     ts: args.ts,
-    planctl_op: args.op,
-    planctl_target: args.target,
-    planctl_epic_id: args.epicId,
-    planctl_task_id: args.taskId ?? null,
-    planctl_subject_present: args.subjectPresent ? 1 : 0,
-    planctl_queue_jump: args.queueJump ? 1 : 0,
-    planctl_files: args.files != null ? JSON.stringify(args.files) : null,
+    plan_op: args.op,
+    plan_target: args.target,
+    plan_epic_id: args.epicId,
+    plan_task_id: args.taskId ?? null,
+    plan_subject_present: args.subjectPresent ? 1 : 0,
+    plan_queue_jump: args.queueJump ? 1 : 0,
+    plan_files: args.files != null ? JSON.stringify(args.files) : null,
     data,
   });
 }
@@ -1134,8 +1134,8 @@ test("syncPlanctlLinks: two sessions touching the same epic both appear in job_l
 
 test("syncPlanctlLinks: cross-session sweep re-derives a touched epic's job_links across every session that ever touched it", () => {
   // Coverage for the cross-session expansion at `src/reducer.ts:1192` (the
-  // `SELECT DISTINCT session_id ... WHERE planctl_op IS NOT NULL AND
-  // (planctl_epic_id IN (...) OR planctl_target IN (...))` sweep). Without it
+  // `SELECT DISTINCT session_id ... WHERE plan_op IS NOT NULL AND
+  // (plan_epic_id IN (...) OR plan_target IN (...))` sweep). Without it
   // a re-classification in session A would re-derive the touched epic's
   // `job_links` against session A's invocations only — silently dropping
   // every other session's edge on that epic. This test fails if the sweep is
@@ -1385,6 +1385,11 @@ function commitTrailerEvent(args: {
       ],
       committer_session_id: args.committerSessionId,
       task_ids: [],
+      // Commit-event `data` payload keys — written by the git-worker trailer
+      // layer (Decision B, out of scope for the v78 rename) and read back by
+      // `extractCommit` via `obj.planctl_op` / `obj.planctl_target`. STAY
+      // `planctl_*` even though the `commit_trailer_facts` columns they feed are
+      // now `plan_*`.
       planctl_op: args.planctlOp,
       planctl_target: args.planctlTarget,
       committed_at_ms: args.committedAtMs,
@@ -1395,7 +1400,7 @@ function commitTrailerEvent(args: {
 test("fn-695: commit-only scaffold (scrape NULL) still mints a creator edge via the commit trailer", () => {
   // The fn-635-class fix-forward proof. The session opened /plan:plan and
   // ran `planctl scaffold` BUT its stdout was piped through grep, so the
-  // envelope scrape never landed (`events.planctl_op` is NULL — we insert
+  // envelope scrape never landed (`events.plan_op` is NULL — we insert
   // NO planctlEvent at all). The durable commit trailer carries the op.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
@@ -1536,10 +1541,10 @@ test("fn-695: commit-channel refiner edge surfaces for a non-create op (set-titl
   ]);
 });
 
-test("fn-695: pre-feature Commit event (NULL planctl_op/target) mints no edge", () => {
+test("fn-695: pre-feature Commit event (NULL plan_op/target) mints no edge", () => {
   // A historical / non-planctl Commit (a source commit, or a pre-fn-695
   // chore commit whose payload predates the trailer fields). extractCommit
-  // defaults planctl_op/target to null → the foldCommit trigger gate is
+  // defaults plan_op/target to null → the foldCommit trigger gate is
   // closed → no edge. Re-fold no-op over the historical log.
   insertEvent({ hook_event: "SessionStart", session_id: TEST_UUID });
   planPlanOpener(TEST_UUID, 1_000);
@@ -1764,9 +1769,9 @@ test("fn-807.1: from-scratch re-fold is byte-identical over a trailer-rich log (
 function getCommitTrailerFacts(): {
   event_id: number;
   committer_session_id: string;
-  planctl_op: string;
-  planctl_target: string;
-  planctl_epic_id: string | null;
+  plan_op: string;
+  plan_target: string;
+  plan_epic_id: string | null;
   committed_at_ms: number;
 }[] {
   return db
@@ -1774,9 +1779,9 @@ function getCommitTrailerFacts(): {
     .all() as {
     event_id: number;
     committer_session_id: string;
-    planctl_op: string;
-    planctl_target: string;
-    planctl_epic_id: string | null;
+    plan_op: string;
+    plan_target: string;
+    plan_epic_id: string | null;
     committed_at_ms: number;
   }[];
 }
@@ -1799,9 +1804,9 @@ test("fn-807.2: foldCommit writes a commit_trailer_facts row in the same transac
     {
       event_id: evId,
       committer_session_id: TEST_UUID,
-      planctl_op: "set-title",
-      planctl_target: "fn-5-fact.2",
-      planctl_epic_id: "fn-5-fact",
+      plan_op: "set-title",
+      plan_target: "fn-5-fact.2",
+      plan_epic_id: "fn-5-fact",
       committed_at_ms: 5_000_000,
     },
   ]);
@@ -1873,7 +1878,7 @@ test("fn-807.2: from-scratch re-fold reproduces commit_trailer_facts byte-identi
   const facts1 = getCommitTrailerFacts();
   // Sanity: exactly the two valid trailers landed (the relocated row's blob
   // was read inline at first fold).
-  expect(facts1.map((r) => r.planctl_target)).toEqual(["fn-1-ctf", "fn-1-ctf"]);
+  expect(facts1.map((r) => r.plan_target)).toEqual(["fn-1-ctf", "fn-1-ctf"]);
   const cursor1 = getCursor();
   const jobs1 = db.query("SELECT * FROM jobs ORDER BY job_id").all();
   const epics1 = db.query("SELECT * FROM epics ORDER BY epic_id").all();
@@ -2599,7 +2604,7 @@ function getEpicQueueState(
 
 test("syncPlanctlLinks v30: root epic with queue_jump=true → epics.queue_jump=1, sort_path='!<padded>'", () => {
   // The canonical `/plan:queue` flow: scaffold envelope carries
-  // `queue_jump: true`; hook stamps `planctl_queue_jump = 1` on the event;
+  // `queue_jump: true`; hook stamps `plan_queue_jump = 1` on the event;
   // reducer projects `epics.queue_jump = 1` AND prepends `!` to the
   // sort_path (root → `created_by_closer_of IS NULL`).
   insertEvent({ hook_event: "SessionStart", session_id: "sess-queued-root" });
@@ -4794,10 +4799,10 @@ test("subagent_invocations coexists with planctl_links fan-out — both projecti
   insertEvent({
     hook_event: "PreToolUse",
     tool_name: "Bash",
-    planctl_op: "epic-create",
-    planctl_target: "fn-1-foo",
-    planctl_epic_id: "fn-1-foo",
-    planctl_subject_present: 1,
+    plan_op: "epic-create",
+    plan_target: "fn-1-foo",
+    plan_epic_id: "fn-1-foo",
+    plan_subject_present: 1,
   });
   // /plan:plan opener (PreToolUse:Skill) — opens the window for the planctl
   // event above to be classified as a creator edge.
@@ -5254,7 +5259,7 @@ test("InputRequest clear gate: PreToolUse/PostToolUse on a session with last_inp
     .get("sess-ir-gate") as { last_event_id: number };
   // No clear-arm UPDATE fired, so jobs.last_event_id stayed at the
   // UserPromptSubmit event id. (PreToolUse / PostToolUse have no other
-  // jobs-write path on this session — no plan_ref, no planctl_op.)
+  // jobs-write path on this session — no plan_ref, no plan_op.)
   expect(after.last_event_id).toBe(before.last_event_id);
 });
 
