@@ -72,5 +72,5 @@ break loudly if a future fold reads a shed-class body). `bun run test:full` MAND
 - [ ] NO SCHEMA_VERSION bump; `bun run test:full` green
 
 ## Done summary
-
+Widened the retention shed-set from the 4 mutation tools to a positive cheap-column allow-list (RETENTION_SHED_CLASS_PREDICATE) covering every fold-unread class; coupled countAbsentBlobs to the same class predicate and extended the refold harness to prove P0===P1===P2 + countAbsentBlobs==0 over each newly-shed class and guarded keep/shed edge case. No SCHEMA_VERSION bump; test:full green.
 ## Evidence
