@@ -12,11 +12,15 @@
  *     best-effort race guard) when a live/pending slot exists or autopilot is
  *     unpaused — unless `--force`.
  *   - **free form** (`--prompt "<text>"` / `--prompt-file <path>`): launches an
- *     arbitrary prompt. `--name` is REQUIRED (the claude session name +
- *     correlation key). A `verb::id`-shaped `--name` WILL bind to that plan row
- *     (feature + hazard — document it). When `dispatch_prompt_prefix` is
- *     configured, the free-form prompt launches as `<prefix> <prompt>` (unless
- *     `--no-prefix`); plan form is never prefixed.
+ *     arbitrary prompt. `--name` is OPTIONAL and a pure pass-through — when
+ *     supplied it is forwarded verbatim as `claude --name <value>` and is NOT a
+ *     keeper labeling/correlation concept; when omitted no `--name` is passed at
+ *     all. (CAVEAT: keeper's SessionStart hook still scrapes any `claude --name`
+ *     keeper-wide, so a `verb::id`-shaped `--name` can still bind to that plan
+ *     row — excluding dispatch names from that is a deeper hook change, out of
+ *     scope here.) When `dispatch_prompt_prefix` is configured, the free-form
+ *     prompt launches as `<prefix> <prompt>` (unless `--no-prefix`); plan form
+ *     is never prefixed.
  *
  * Launch is purely CLIENT-SIDE via `resolveExecBackend(...).ensureLaunched(...)`
  * — no daemon RPC, no synthetic event, no reducer/migration touch — so re-fold
@@ -91,19 +95,19 @@ const HELP = `keeper dispatch — manually fire one claude worker into a tmux wi
 
 Usage:
   keeper dispatch <work|close>::<id> [options]      # plan form
-  keeper dispatch --prompt "<text>"  --name <n> [options]   # free form
-  keeper dispatch --prompt-file <path> --name <n> [options] # free form
+  keeper dispatch --prompt "<text>" [options]       # free form
+  keeper dispatch --prompt-file <path> [options]    # free form
   keeper dispatch --help
 
 Plan form resolves the /plan:<verb> <id> prompt + cwd from the daemon and bakes
 --name <verb>::<id> so the hook binds a board-visible jobs row. Free form
-launches an arbitrary prompt; --name is REQUIRED (the claude session name +
-correlation key — a verb::id-shaped --name binds to that plan row).
+launches an arbitrary prompt; --name is OPTIONAL and forwarded verbatim to
+claude (no keeper labeling). When omitted, no --name is passed at all.
 
 Options:
   --prompt <text>      Free-form prompt (mutually exclusive with the positional)
   --prompt-file <path> Read the free-form prompt from a file
-  --name <n>           claude --name (REQUIRED in free form)
+  --name <n>           claude --name (OPTIONAL pass-through in free form)
   --session <s>        Target tmux session (overrides every fallback)
   --cwd <dir>          Working dir (free form; defaults to process.cwd())
   --model <m>          Pass --model to claude
@@ -364,7 +368,13 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
 
   let cwd: string;
   let prompt: string;
-  let claudeName: string;
+  // claude `--name` value. Plan form bakes `verb::id` (board-binding); free form
+  // forwards `--name` verbatim ONLY when supplied (undefined = no `--name`).
+  let claudeName: string | undefined;
+  // Neutral status label for the dry-run line + post-launch message. In plan
+  // form it is the `verb::id` key; in free form it is the prompt source — never
+  // the free-form `--name` (which is a pure claude pass-through, not a keeper
+  // labeling/correlation concept).
   let label: string;
 
   if (hasPlanKey) {
@@ -397,10 +407,6 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     }
   } else {
     // ---- free form ----
-    const name = v.name;
-    if (name === undefined || name === "") {
-      argFault("free form requires --name <n> (the claude session name)");
-    }
     if (hasPromptFile) {
       const path = v["prompt-file"] as string;
       try {
@@ -431,8 +437,11 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       argFault(promptCheck.error);
     }
     cwd = v.cwd ?? process.cwd();
-    claudeName = name;
-    label = name;
+    // `--name` (when supplied) is forwarded verbatim to `claude` and nothing
+    // else — an empty `--name ""` is treated as absent. It is NOT reused for the
+    // keeper-side label.
+    claudeName = v.name !== undefined && v.name !== "" ? v.name : undefined;
+    label = hasPromptFile ? `file ${v["prompt-file"]}` : "--prompt";
   }
 
   const { session, attachHint } = resolveSession({ sessionFlag: v.session });
@@ -449,7 +458,9 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
   if (dryRun) {
     process.stdout.write(`session:     ${session}\n`);
     process.stdout.write(`cwd:         ${cwd}\n`);
-    process.stdout.write(`${hasPlanKey ? "key" : "name"}:         ${label}\n`);
+    // Plan form keys off the board `verb::id`; free form has no keeper label, so
+    // the resolved `--name` (if any) is already visible in the argv below.
+    if (hasPlanKey) process.stdout.write(`key:         ${label}\n`);
     process.stdout.write(
       `prompt-from: ${hasPromptFile ? `file ${v["prompt-file"]}` : hasPlanKey ? "plan" : "--prompt"}\n`,
     );

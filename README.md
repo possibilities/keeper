@@ -961,7 +961,13 @@ event-log/reducer/hook touch. Run any of them with
   `epics` projection (read-only, via `cli/control-rpc.ts`'s one-shot
   `queryCollection`) and bakes `--name <verb>::<id>` so the SessionStart hook
   binds a board-visible `jobs` row, and a **free form** (`--prompt` /
-  `--prompt-file`, `--name` required) for an arbitrary prompt. The target tmux
+  `--prompt-file`) for an arbitrary prompt. In free form `--name` is OPTIONAL and
+  a pure pass-through — when supplied it is forwarded verbatim as `claude --name
+  <value>` (no keeper-side labeling/correlation/tab-renaming); when omitted no
+  `--name` is passed at all. (Note: keeper's SessionStart hook still scrapes any
+  `claude --name` keeper-wide, so a `verb::id`-shaped free-form `--name` can
+  still bind to that plan row; excluding dispatch names from keeper's
+  correlation/renaming is a deeper hook change, not done here.) The target tmux
   session resolves `--session` > `$KEEPER_TMUX_SESSION` > `$TMUX`-gated current
   session > the managed `foreground`. The plan form runs a best-effort race
   guard (a pending dispatch, an unpaused autopilot, or a live job for the key
@@ -972,7 +978,8 @@ event-log/reducer/hook touch. Run any of them with
   keeper dispatch work::fn-1-foo.2                       # plan form → current/foreground session
   keeper dispatch close::fn-1-foo --session background   # plan form, explicit session
   keeper dispatch work::fn-1-foo.2 --dry-run             # print the launch plan, launch nothing
-  keeper dispatch --name scratch --prompt 'investigate the flaky X test'
+  keeper dispatch --prompt 'investigate the flaky X test'         # free form, no --name
+  keeper dispatch --prompt 'investigate X' --name scratch         # --name forwarded to claude verbatim
   keeper dispatch work::fn-1-foo.2 --force               # skip the race guard
   keeper dispatch --name scratch --prompt 'look at X' --no-prefix  # bypass dispatch_prompt_prefix
   ```

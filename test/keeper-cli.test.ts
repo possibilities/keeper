@@ -11,6 +11,8 @@
  */
 
 import { describe, expect, test } from "bun:test";
+import { rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import {
   checkRaceGuard,
   main as dispatchMain,
@@ -550,8 +552,12 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
     expect(launch.calls).toEqual([]);
     expect(r.stdout).toContain("session:     scratch");
     expect(r.stdout).toContain("cwd:         /work/dir");
-    expect(r.stdout).toContain("name:         manual");
+    // Free form has no keeper label — no `name:`/`key:` line; the forwarded
+    // `--name` is visible in the argv instead.
+    expect(r.stdout).not.toContain("name:");
+    expect(r.stdout).not.toContain("key:");
     expect(r.stdout).toContain("prompt-from: --prompt");
+    expect(r.stdout).toContain('"--name","manual"');
     expect(r.stdout).toContain("argv:");
   });
 
@@ -564,7 +570,45 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
     expect(r.code).toBeUndefined();
     expect(launch.calls).toHaveLength(1);
     expect(launch.calls[0]?.session).toBe("scratch");
-    expect(r.stdout).toContain("dispatched manual → session scratch");
+    // `--name` is forwarded verbatim to claude…
+    expect(launch.calls[0]?.argv).toContain("--name");
+    const ni = launch.calls[0]?.argv.indexOf("--name") ?? -1;
+    expect(launch.calls[0]?.argv[ni + 1]).toBe("manual");
+    // …but it is NOT reused as the keeper label or the tmux window name.
+    expect(launch.calls[0]?.name).toBe("");
+    expect(r.stdout).toContain("dispatched --prompt → session scratch");
+    expect(r.stdout).not.toContain("dispatched manual");
+  });
+
+  test("free form with NO --name: launches with no claude --name in the argv", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const r = await runMain(["--prompt", "go", "--session", "scratch"], {
+      launch: launch.fn,
+    });
+    // No arg fault — free form no longer requires --name.
+    expect(r.code).toBeUndefined();
+    expect(launch.calls).toHaveLength(1);
+    expect(launch.calls[0]?.argv).not.toContain("--name");
+    expect(launch.calls[0]?.name).toBe("");
+    expect(r.stdout).toContain("dispatched --prompt → session scratch");
+  });
+
+  test("free form --prompt-file: label/status keys off the file, not --name", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const tmp = `${tmpdir()}/dispatch-pf-${Date.now()}.txt`;
+    writeFileSync(tmp, "from a file");
+    try {
+      const r = await runMain(
+        ["--prompt-file", tmp, "--name", "manual", "--session", "scratch"],
+        { launch: launch.fn },
+      );
+      expect(r.code).toBeUndefined();
+      const ni = launch.calls[0]?.argv.indexOf("--name") ?? -1;
+      expect(launch.calls[0]?.argv[ni + 1]).toBe("manual");
+      expect(r.stdout).toContain(`dispatched file ${tmp} → session scratch`);
+    } finally {
+      rmSync(tmp, { force: true });
+    }
   });
 
   test("failed launch (result.ok === false) → die (exit 1)", async () => {

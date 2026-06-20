@@ -125,6 +125,38 @@ test("buildDispatchLaunchArgv: includes --model / --effort ONLY when supplied", 
   ]);
 });
 
+test("buildDispatchLaunchArgv: omits --name entirely when claudeName is absent", () => {
+  const argv = buildDispatchLaunchArgv("/bin/zsh", {
+    cwd: "/repo",
+    prompt: "investigate X",
+    noConfirm: true,
+  });
+  expect(argv).not.toContain("--name");
+  expect(argv).toEqual([
+    "/bin/zsh",
+    "-l",
+    "-i",
+    "-c",
+    'exec claude "$@" ; exec "$0" -l -i',
+    "/bin/zsh",
+    "--agentwrap-no-confirm",
+    // no --name pair — prompt is the FINAL positional
+    "investigate X",
+  ]);
+});
+
+test("buildDispatchLaunchArgv: emits --name verbatim when claudeName is supplied", () => {
+  const argv = buildDispatchLaunchArgv("/bin/zsh", {
+    cwd: "/repo",
+    claudeName: "scratch",
+    prompt: "investigate X",
+    noConfirm: true,
+  });
+  const i = argv.indexOf("--name");
+  expect(i).toBeGreaterThanOrEqual(0);
+  expect(argv[i + 1]).toBe("scratch");
+});
+
 test("buildDispatchLaunchArgv: omits --agentwrap-no-confirm when noConfirm is false", () => {
   const argv = buildDispatchLaunchArgv("/bin/bash", {
     cwd: "/repo",

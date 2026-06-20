@@ -158,8 +158,10 @@ export function validatePromptBytes(prompt: string): ValidatePromptResult {
 export interface DispatchLaunchOpts {
   /** Working directory — applied by `ensureLaunched`'s tmux `-c`, not by the builder. */
   cwd: string;
-  /** `--name <claudeName>` value (load-bearing for reap/classify parsing). */
-  claudeName: string;
+  /** `--name <claudeName>` value — emitted only when supplied. In plan form it
+   *  is load-bearing for reap/classify parsing; in free form it is an OPTIONAL
+   *  verbatim pass-through to `claude`. */
+  claudeName?: string;
   /** The initial interactive prompt — rides as the FINAL positional argv element. */
   prompt: string;
   /** `--model <m>` — emitted only when supplied. */
@@ -184,7 +186,7 @@ export interface DispatchLaunchOpts {
  * login+interactive shell if `claude` exits.
  *
  * `flags` carries `--agentwrap-no-confirm` (the LIVE cwd-confirm suppressor —
- * `src/autopilot-worker.ts:258`), `--name <claudeName>`, and `--model` /
+ * `src/autopilot-worker.ts:258`) always, and `--name <claudeName>` / `--model` /
  * `--effort` ONLY when supplied. cwd is NOT a flag — `ensureLaunched` applies
  * it via tmux `-c`, mirroring autopilot.
  *
@@ -202,8 +204,9 @@ export function buildDispatchLaunchArgv(
   if (opts.model !== undefined) flags.push("--model", opts.model);
   if (opts.effort !== undefined) flags.push("--effort", opts.effort);
   if (opts.noConfirm) flags.push("--agentwrap-no-confirm");
-  // `--name <key>` adjacency is load-bearing for reap/classify parsing.
-  flags.push("--name", opts.claudeName);
+  // `--name <key>` is emitted only when supplied (mirrors `--model`/`--effort`).
+  // When present its adjacency is load-bearing for reap/classify parsing.
+  if (opts.claudeName !== undefined) flags.push("--name", opts.claudeName);
   const body = `exec claude "$@" ; exec "$0" -l -i`;
   // `shell` fills the explicit `$0` slot so the first flag is NOT eaten as $0.
   return [shell, "-l", "-i", "-c", body, shell, ...flags, opts.prompt];
