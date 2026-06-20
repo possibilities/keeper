@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T18:35:55.553000Z",
+  "depends_on": [],
+  "epic": "fn-854-reconcile-branch-guard-modeflags",
+  "id": "fn-854-reconcile-branch-guard-modeflags.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Reconcile modeFlags short/long parity",
+  "updated_at": "2026-06-20T18:35:55.553000Z"
+}
