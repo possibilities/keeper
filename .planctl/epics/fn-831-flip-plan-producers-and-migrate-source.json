@@ -6,7 +6,7 @@
     "fn-826-erase-planctl-from-keeper-daemon"
   ],
   "id": "fn-831-flip-plan-producers-and-migrate-source",
-  "last_validated_at": "2026-06-20T03:05:45.765000Z",
+  "last_validated_at": "2026-06-20T03:37:01.134000Z",
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
@@ -15,5 +15,5 @@
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T03:05:45.765000Z"
+  "updated_at": "2026-06-20T03:37:01.134000Z"
 }
