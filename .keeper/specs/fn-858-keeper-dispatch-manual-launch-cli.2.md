@@ -39,5 +39,5 @@ Cover `queryCollection` against a fake/echo socket (one-shot read returns decode
 - [ ] A one-shot read returns decoded rows and closes the connection (no lingering subscription).
 
 ## Done summary
-
+Lifted the one-shot UDS roundTrip/sendControlRpc out of cli/autopilot.ts into a shared cli/control-rpc.ts and added a queryCollection read-then-exit helper. autopilot consumes the shared module with no behavior change; new tests cover queryCollection over a real UDS echo server.
 ## Evidence
