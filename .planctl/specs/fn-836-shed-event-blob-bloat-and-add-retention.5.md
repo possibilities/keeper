@@ -51,5 +51,5 @@ false-alarms on shed rows. Poll, don't sleep.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Shipped keeper's first steady-state retention pass (ENABLED): retainColdPayloads NULLs cold shed-class bodies in place (keep-set complement, past watermark + cursor, file_path already promoted to mutation_path), per-batch incremental_vacuum reclaims freelist; re-spec'd countAbsentBlobs sentinel flags only missing keep-set bodies, never intentional shed NULLs. Retention-then-refold byte-identical; runs strictly outside the fold.
 ## Evidence
