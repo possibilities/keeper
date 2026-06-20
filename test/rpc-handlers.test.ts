@@ -364,6 +364,10 @@ test("set_epic_armed throws rpc_failed when the bridge reports ok:false", async 
 // fn-661 task .4 — `retry_dispatch`
 // ---------------------------------------------------------------------------
 
+// The exhaustive validator-rule coverage lives in `test/dispatch-command.test.ts`
+// (the dep-free leaf module). These two tests prove the rpc-handlers wrapper's
+// CONTRACT: success returns the parsed pair, and a `{ ok: false }` from the
+// leaf re-wraps into `BadParamsError` so the `bad_params` wire code is unchanged.
 test("parseDispatchKey: splits the composite key into a typed {verb, id} pair", () => {
   expect(parseDispatchKey("work::fn-1-foo.3")).toEqual({
     verb: "work",
@@ -375,31 +379,14 @@ test("parseDispatchKey: splits the composite key into a typed {verb, id} pair", 
   });
 });
 
-test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", () => {
-  for (const bad of ["", undefined, null, 42, true, "no-sep", "work::"]) {
-    expect(() => parseDispatchKey(bad)).toThrow(BadParamsError);
-  }
-});
-
-test("parseDispatchKey: rejects unknown verbs", () => {
-  expect(() => parseDispatchKey("rm::fn-1-foo")).toThrow(BadParamsError);
-  expect(() => parseDispatchKey("plan::fn-1-foo")).toThrow(BadParamsError);
-  // `approve` is not a dispatch verb (the dispatch verb set excludes it).
-  expect(() => parseDispatchKey("approve::fn-1-foo")).toThrow(BadParamsError);
-});
-
-test("parseDispatchKey: rejects nested `::` separators (no command injection)", () => {
-  expect(() => parseDispatchKey("work::fn-1::pwned")).toThrow(BadParamsError);
-});
-
-test("parseDispatchKey: rejects path-traversal tokens in the id half", () => {
+test("parseDispatchKey: re-wraps a leaf `{ok:false}` into BadParamsError", () => {
   for (const bad of [
+    "",
+    undefined,
+    "no-sep",
+    "rm::fn-1-foo",
+    "work::fn-1::pwned",
     "work::../etc/passwd",
-    "work::/abs/path",
-    "work::a/b",
-    "work::a\\b",
-    "work::.hidden",
-    "work::a\0b",
   ]) {
     expect(() => parseDispatchKey(bad)).toThrow(BadParamsError);
   }

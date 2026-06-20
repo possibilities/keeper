@@ -43,10 +43,19 @@
  */
 
 import {
+  parseDispatchKey as parseDispatchKeyResult,
+  type RetryDispatchVerb,
+} from "./dispatch-command";
+import {
   BadParamsError,
   type ReplayBridge,
   registerAsyncRpc,
 } from "./server-worker";
+
+// Re-export the verb type for downstream importers that read it off this
+// module (the validator itself now lives in the dep-free `./dispatch-command`
+// leaf; this module re-wraps its discriminated result into `BadParamsError`).
+export type { RetryDispatchVerb };
 
 // ---------------------------------------------------------------------------
 // `replay_dead_letter` (async — routes through the worker→main bridge)
@@ -321,16 +330,6 @@ export async function setEpicArmedHandler(
 // synthetic event; fn-661 task .4)
 // ---------------------------------------------------------------------------
 
-/**
- * The keeper plan verbs the reconciler dispatches. Mirrors the `Verb` union
- * in `src/autopilot-worker.ts` (kept local rather than re-imported to
- * keep the rpc-handlers module's import graph narrow — no `bun:sqlite` /
- * `Database` types cross from the worker file).
- */
-export type RetryDispatchVerb = "work" | "close";
-
-const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>(["work", "close"]);
-
 /** `retry_dispatch` wire params. */
 export interface RetryDispatchParams {
   /** Composite dispatch key — exactly `${verb}::${id}`. */
@@ -345,74 +344,22 @@ export interface RetryDispatchResult {
 }
 
 /**
- * Split + validate a `${verb}::${id}` composite key. Returns the parsed
- * pair; throws `BadParamsError` on any miss. Pure — exported for unit
- * reach.
- *
- * Validation rules (id shape ONLY — launch params come from the
- * projection read at the next reconcile, never the RPC payload):
- *
- * - Non-empty string with exactly one `::` separator.
- * - `verb` is one of `work` / `close`.
- * - `id` is a non-empty token AND passes the {@link rejectPathTraversal}
- *   filename-safety predicate (no path separators, no embedded null, no
- *   leading dot). The `dispatch_id` never feeds a filesystem path, but
- *   the predicate is a cheap belt-and-suspenders against a wire token
- *   that looks like a path-traversal probe.
+ * Split + validate a `${verb}::${id}` composite key, throwing `BadParamsError`
+ * on any miss. A thin re-wrap of the dep-free validator in
+ * `./dispatch-command` — the pure logic and validation rules live there; this
+ * wrapper maps its `{ ok: false }` discriminated result onto the
+ * `BadParamsError` the RPC dispatcher frames as `bad_params`, keeping the wire
+ * contract byte-identical. Pure — exported for unit reach.
  */
 export function parseDispatchKey(value: unknown): {
   verb: RetryDispatchVerb;
   id: string;
 } {
-  if (typeof value !== "string" || value.length === 0) {
-    throw new BadParamsError(
-      "retry_dispatch: `id` must be a non-empty string of the form `verb::id` (e.g. `work::fn-1-foo.3`)",
-    );
+  const result = parseDispatchKeyResult(value);
+  if (!result.ok) {
+    throw new BadParamsError(result.error);
   }
-  const sep = value.indexOf("::");
-  if (sep <= 0 || sep === value.length - 2) {
-    throw new BadParamsError(
-      "retry_dispatch: `id` must contain exactly one `::` separator with non-empty halves",
-    );
-  }
-  // A second `::` is also a malformed key — the verb half MUST be a
-  // simple token, and the id half MUST NOT contain `::` either (the
-  // composite key is `verb::id`, not nested).
-  if (value.indexOf("::", sep + 2) !== -1) {
-    throw new BadParamsError(
-      "retry_dispatch: `id` must contain exactly ONE `::` separator",
-    );
-  }
-  const verbRaw = value.slice(0, sep);
-  const idRaw = value.slice(sep + 2);
-  if (!RETRY_DISPATCH_VERBS.has(verbRaw as RetryDispatchVerb)) {
-    throw new BadParamsError(
-      `retry_dispatch: \`verb\` must be one of work|close (got ${JSON.stringify(verbRaw)})`,
-    );
-  }
-  rejectDispatchIdToken(idRaw);
-  return { verb: verbRaw as RetryDispatchVerb, id: idRaw };
-}
-
-/**
- * Reject any `id` half that looks like a path-traversal probe or an
- * empty token. The id never feeds a filesystem path inside the
- * reconciler, but rejecting weaponizable shapes at the wire boundary is
- * cheap defense against future code paths that might (e.g. a viewer
- * that ever serialized an id into a path).
- */
-function rejectDispatchIdToken(value: string): void {
-  if (
-    value.length === 0 ||
-    value.includes("/") ||
-    value.includes("\\") ||
-    value.includes("\0") ||
-    value.startsWith(".")
-  ) {
-    throw new BadParamsError(
-      "retry_dispatch: `id` half is empty or weaponizable (path-traversal token rejected)",
-    );
-  }
+  return { verb: result.verb, id: result.id };
 }
 
 function validateRetryDispatchParams(params: unknown): RetryDispatchParams {
