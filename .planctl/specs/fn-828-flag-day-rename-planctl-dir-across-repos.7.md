@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] vtkeep `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+git mv .planctl .keeper in vtkeep; updated .keeper/CLAUDE.md path ref to .keeper/. Board renders vtkeep plan from .keeper/.
 ## Evidence
