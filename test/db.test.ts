@@ -8597,3 +8597,246 @@ test("v66 DB migrates to v67: commit_trailer_facts table + indexes + backfill (i
   expect(factsAfter.map((r) => r.event_id)).toEqual([1, 2, 3]);
   db2.close();
 });
+
+// fn-862.1 (F2): the v77 (fn-856) cursor-rewind migration wipes the canonical
+// projection list but DELIBERATELY omits `commit_trailer_facts`. Re-fold
+// idempotency rests on the table's append-only `INSERT OR IGNORE` keyed on
+// `event_id`: the rewind replays the same Commit events as no-ops and the rows
+// stay consistent. The comment at CREATE_COMMIT_TRAILER_FACTS calls this the
+// "MUST NOT touch" invariant. db.test.ts had no `commit_trailer_facts` survival
+// case across the rewind, and refold-equivalence.test.ts's
+// `rewindAndWipeProjections` DELETEs the table before re-folding (the
+// wipe-and-rebuild scenario, NOT this rewind-WITHOUT-wipe-preserves-rows one).
+const CTF_V77_UUID_CREATOR = "11111111-2222-3333-4444-555555555555";
+const CTF_V77_UUID_REFINER = "66666666-7777-8888-9999-aaaaaaaaaaaa";
+const CTF_V77_OID_CREATOR = "1111111111111111111111111111111111111111";
+const CTF_V77_OID_REFINER = "2222222222222222222222222222222222222222";
+
+test("v77 rewind preserves commit_trailer_facts (NOT in the wipe list); re-fold reproduces identical creator/refiner edges (fn-862.1)", () => {
+  // Build a current-schema DB, seed two committer sessions + two planctl-trailer
+  // Commit events (a `scaffold` creator and a `set-title` refiner, both naming
+  // the SAME epic so its job_links carries both edges), and drain to populate
+  // `commit_trailer_facts` + the link projections. Then rewind `schema_version`
+  // to 76 and re-open: the v76→v77 migration runs the cursor-rewind + projection
+  // wipe. The seeded facts MUST survive that wipe intact (a regression that
+  // added the table to the wipe list would empty it here), and the post-wipe
+  // re-fold MUST reproduce byte-identical edges (a regression that double-counted
+  // the facts would drift the link arrays).
+  const insertEvent = (
+    db: Database,
+    cols: {
+      ts: number;
+      session_id: string;
+      hook_event: string;
+      event_type: string;
+      cwd?: string | null;
+      data: string;
+    },
+  ): void => {
+    db.prepare(
+      `INSERT INTO events (ts, session_id, hook_event, event_type, cwd, data)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    ).run(
+      cols.ts,
+      cols.session_id,
+      cols.hook_event,
+      cols.event_type,
+      cols.cwd ?? null,
+      cols.data,
+    );
+  };
+
+  const commitData = (
+    oid: string,
+    committerSessionId: string,
+    planctlOp: string,
+    planctlTarget: string,
+  ): string =>
+    JSON.stringify({
+      project_dir: "/repo",
+      commit_oid: oid,
+      parent_oid: null,
+      files: [
+        { path: ".planctl/epics/x.json", blob_oid: null, committed_mode: null },
+      ],
+      committer_session_id: committerSessionId,
+      task_ids: [],
+      planctl_op: planctlOp,
+      planctl_target: planctlTarget,
+      committed_at_ms: 5_000_000,
+    });
+
+  // (1) Build + populate at the current schema.
+  {
+    const { db } = openDb(dbPath);
+    // SessionStart events mint the jobs rows the link enrichment reads.
+    insertEvent(db, {
+      ts: 1,
+      session_id: CTF_V77_UUID_CREATOR,
+      hook_event: "SessionStart",
+      event_type: "session_start",
+      data: "{}",
+    });
+    insertEvent(db, {
+      ts: 2,
+      session_id: CTF_V77_UUID_REFINER,
+      hook_event: "SessionStart",
+      event_type: "session_start",
+      data: "{}",
+    });
+    // Creator: scaffold of an epic-form target → `creator` edge.
+    insertEvent(db, {
+      ts: 5_000,
+      session_id: "/repo",
+      hook_event: "Commit",
+      event_type: "commit",
+      cwd: "/repo",
+      data: commitData(
+        CTF_V77_OID_CREATOR,
+        CTF_V77_UUID_CREATOR,
+        "scaffold",
+        "fn-1-survives",
+      ),
+    });
+    // Refiner: a non-create mutating op naming the SAME epic → `refiner` edge.
+    insertEvent(db, {
+      ts: 6_000,
+      session_id: "/repo",
+      hook_event: "Commit",
+      event_type: "commit",
+      cwd: "/repo",
+      data: commitData(
+        CTF_V77_OID_REFINER,
+        CTF_V77_UUID_REFINER,
+        "set-title",
+        "fn-1-survives",
+      ),
+    });
+    drainAll(db);
+    db.close();
+  }
+
+  // Baseline: the facts the fold derived, plus the two link projection arrays.
+  type Fact = {
+    event_id: number;
+    committer_session_id: string;
+    planctl_op: string;
+    planctl_target: string;
+    planctl_epic_id: string | null;
+    committed_at_ms: number;
+  };
+  let baselineFacts: Fact[];
+  let baselineEpicLinksCreator: string;
+  let baselineEpicLinksRefiner: string;
+  let baselineJobLinks: string;
+  {
+    const { db } = openDb(dbPath);
+    baselineFacts = db
+      .prepare("SELECT * FROM commit_trailer_facts ORDER BY event_id ASC")
+      .all() as Fact[];
+    // Sanity: the seed produced exactly the two trailer facts (epic-folded).
+    expect(baselineFacts.map((f) => f.planctl_target)).toEqual([
+      "fn-1-survives",
+      "fn-1-survives",
+    ]);
+    expect(baselineFacts.map((f) => f.planctl_op)).toEqual([
+      "scaffold",
+      "set-title",
+    ]);
+    baselineEpicLinksCreator = (
+      db
+        .prepare("SELECT epic_links FROM jobs WHERE job_id = ?")
+        .get(CTF_V77_UUID_CREATOR) as { epic_links: string }
+    ).epic_links;
+    baselineEpicLinksRefiner = (
+      db
+        .prepare("SELECT epic_links FROM jobs WHERE job_id = ?")
+        .get(CTF_V77_UUID_REFINER) as { epic_links: string }
+    ).epic_links;
+    baselineJobLinks = (
+      db
+        .prepare("SELECT job_links FROM epics WHERE epic_id = ?")
+        .get("fn-1-survives") as { job_links: string }
+    ).job_links;
+    // The baseline edges actually exist (otherwise the survival assertion is
+    // vacuous): one creator edge, one refiner edge, both kinds on the epic.
+    expect(baselineEpicLinksCreator).toContain('"creator"');
+    expect(baselineEpicLinksRefiner).toContain('"refiner"');
+    expect(baselineJobLinks).toContain('"creator"');
+    expect(baselineJobLinks).toContain('"refiner"');
+
+    // Rewind the version stamp to 76 so the next open runs the v76→v77 block.
+    // Leave events + facts + projections in place — this is a pre-v77 DB whose
+    // facts table is already populated, exactly the state the migration spares.
+    db.run("UPDATE meta SET value = '76' WHERE key = 'schema_version'");
+    db.close();
+  }
+
+  // (2) Re-open → the v76→v77 migration rewinds the cursor and wipes the
+  // canonical projection list. Assert (a) facts survived intact BEFORE any
+  // re-fold (proving the wipe spared the table, not that a re-fold rebuilt it),
+  // and that the wipe did fire (the link projections are empty pre-drain).
+  const { db } = openDb(dbPath);
+  expect(
+    (
+      db
+        .prepare("SELECT value FROM meta WHERE key = 'schema_version'")
+        .get() as { value: string }
+    ).value,
+  ).toBe(String(SCHEMA_VERSION));
+
+  const survivedFacts = db
+    .prepare("SELECT * FROM commit_trailer_facts ORDER BY event_id ASC")
+    .all() as Fact[];
+  expect(survivedFacts).toEqual(baselineFacts);
+
+  // The wipe ran: the jobs/epics projections were emptied by the rewind, so the
+  // edges are gone until the re-fold rebuilds them.
+  expect(
+    (db.prepare("SELECT COUNT(*) AS n FROM jobs").get() as { n: number }).n,
+  ).toBe(0);
+  expect(
+    (db.prepare("SELECT COUNT(*) AS n FROM epics").get() as { n: number }).n,
+  ).toBe(0);
+  // The cursor was rewound to 0 so the re-fold replays the full log.
+  expect(
+    (
+      db
+        .prepare("SELECT last_event_id AS n FROM reducer_state WHERE id = 1")
+        .get() as { n: number }
+    ).n,
+  ).toBe(0);
+
+  // (3) Re-fold over the preserved facts. The Commit events re-INSERT OR IGNORE
+  // the same fact rows as no-ops, and the classifier reproduces identical edges.
+  drainAll(db);
+
+  // (b) Facts unchanged after the re-fold (idempotent re-insert, no double-count).
+  const refoldedFacts = db
+    .prepare("SELECT * FROM commit_trailer_facts ORDER BY event_id ASC")
+    .all() as Fact[];
+  expect(refoldedFacts).toEqual(baselineFacts);
+
+  // (b) The creator/refiner edges are byte-identical to the baseline — a wipe of
+  // the facts (no backing rows for the commit-channel sweep) or a double-count
+  // (duplicate edges) would diverge here.
+  const refoldEpicLinksCreator = (
+    db
+      .prepare("SELECT epic_links FROM jobs WHERE job_id = ?")
+      .get(CTF_V77_UUID_CREATOR) as { epic_links: string }
+  ).epic_links;
+  const refoldEpicLinksRefiner = (
+    db
+      .prepare("SELECT epic_links FROM jobs WHERE job_id = ?")
+      .get(CTF_V77_UUID_REFINER) as { epic_links: string }
+  ).epic_links;
+  const refoldJobLinks = (
+    db
+      .prepare("SELECT job_links FROM epics WHERE epic_id = ?")
+      .get("fn-1-survives") as { job_links: string }
+  ).job_links;
+  expect(refoldEpicLinksCreator).toBe(baselineEpicLinksCreator);
+  expect(refoldEpicLinksRefiner).toBe(baselineEpicLinksRefiner);
+  expect(refoldJobLinks).toBe(baselineJobLinks);
+  db.close();
+});
