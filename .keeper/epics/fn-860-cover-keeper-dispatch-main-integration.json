@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-20T21:24:58.164000Z",
   "created_at": "2026-06-20T20:54:45.361000Z",
   "created_by_close_of": "fn-858-keeper-dispatch-manual-launch-cli",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Cover keeper dispatch main() integration paths",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T20:54:45.361000Z"
+  "updated_at": "2026-06-20T21:24:58.164000Z"
 }
