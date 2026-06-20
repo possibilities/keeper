@@ -35,6 +35,7 @@ export const SUBCOMMANDS = [
   "search-history",
   "find-file-history",
   "show-session-events",
+  "show-job",
   "plan",
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
@@ -60,6 +61,7 @@ Subcommands:
   search-history      Search UserPromptSubmit history by LIKE term (JSON)
   find-file-history   List file attributions matching a path fragment (JSON)
   show-session-events Prompt/tool-call spine for one session (JSON)
+  show-job            One job's full metadata by session-id/title/cwd/pane or auto-detect (JSON)
   plan                Alias for the planctl CLI: \`keeper plan <verb>\` runs planctl in-process
 
 Flags:
@@ -163,6 +165,7 @@ export async function main(): Promise<void> {
       (await import("./find-file-history")).main(argv),
     "show-session-events": async (argv) =>
       (await import("./show-session-events")).main(argv),
+    "show-job": async (argv) => (await import("./show-job")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),
   };
 

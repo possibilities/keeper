@@ -1182,6 +1182,24 @@ commits only that session's attributed files. The other three are read-only.
   keeper show-session-files --session-id <id> # {files_by_repo, cwd_repo}
   ```
 
+- `show-job.ts` — emit ONE job's full `jobs` metadata row as a pretty JSON
+  envelope (`{success, job, resolution}`), read-only. Resolve it by the cheapest
+  signal: `--session-id <id>`, `--session <title>` (the Claude session title —
+  current title or any `name_history` entry, case-insensitive), `--cwd <dir>`
+  (git-toplevel containment; `--cwd-exact` for strict equality), or `--pane %N`.
+  With no flag it auto-detects: your own job inside a Claude session (via
+  `$CLAUDE_CODE_SESSION_ID`), else the single live agent in your current tmux
+  WINDOW (split a shell pane beside it), else the job whose cwd contains yours.
+  Ambiguity is explicit — one-live-wins, else a candidate list + exit 1, with
+  `--latest` to collapse to the most-recent. A read failure (`{success:false,
+  error}`) is distinct from `not_found`; `--raw` leaves JSON-TEXT columns as TEXT.
+
+  ```sh
+  keeper show-job --session-id <id> | jq .job.title  # explicit id lookup
+  keeper show-job --session "<claude --name title>"  # by session title
+  keeper show-job                                     # auto-detect (session/tmux/cwd)
+  ```
+
 `setup-tmux` is a one-shot provisioner (epic fn-803), not a subscribe client.
 It drives tmux directly via `Bun.spawnSync` — deliberately OUTSIDE the
 ExecBackend seam — and writes nothing to git or the event log.

@@ -74,14 +74,18 @@ test("buildResumeCommand never inserts --plugin-dir, even for a non-null tier (f
   // threaded through the signature (board/projection read) but never shapes
   // the argv.
   const cmd = buildResumeCommand("/repo", "fn-1.1", "mint");
-  expect(cmd).toBe('cd /repo && claude --resume "fn-1.1" --agentwrap-no-confirm');
+  expect(cmd).toBe(
+    'cd /repo && claude --resume "fn-1.1" --agentwrap-no-confirm',
+  );
   expect(cmd).not.toContain("--plugin-dir");
   expect(cmd).not.toContain("work-plugins");
 });
 
 test("buildResumeCommand omits --plugin-dir on an empty tier string", () => {
   const cmd = buildResumeCommand("/repo", "fn-1.1", "");
-  expect(cmd).toBe('cd /repo && claude --resume "fn-1.1" --agentwrap-no-confirm');
+  expect(cmd).toBe(
+    'cd /repo && claude --resume "fn-1.1" --agentwrap-no-confirm',
+  );
 });
 
 test("tierForJobFromEpics resolves the tier for a work job whose epic is in the map", () => {
