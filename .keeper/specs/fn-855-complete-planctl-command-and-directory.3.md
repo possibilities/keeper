@@ -56,5 +56,5 @@ command-naming `planctl` prose remains in swept files.
 - [ ] tests green
 
 ## Done summary
-
+Swept command-naming planctl prose to keeper plan across cli/plan.ts docstring, gate-descriptor comments (collections/types/await-conditions: .planctl present -> .keeper present), and src/scripts comments. Left all intentional residue (columns, trailers, source badge, planctl_invocation reader, symbols, dual-path transition comments, data descriptors, subtree prune, git-worker.ts) untouched. Full suite green.
 ## Evidence
