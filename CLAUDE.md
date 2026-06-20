@@ -1,9 +1,11 @@
 keeper — event-sourced Claude Code control-data daemon (Bun + bun:sqlite).
 
-The hook plugin appends one per-pid NDJSON line per Claude Code hook invocation
-(lock-free, no SQLite open); the `keeperd` daemon's events-log ingester lands each
-line as one `events` row, folds those events into the `jobs`/`epics` projections,
-and serves them read-only over a UDS subscribe socket. The `events` table is the
+The keeper plugin ships two `PreToolUse(Bash)` hooks: the events-writer appends one
+per-pid NDJSON line per Claude Code hook invocation (lock-free, no SQLite open), and
+the branch-guard hard-denies subagent git branch create/switch. The `keeperd`
+daemon's events-log ingester lands each events-writer line as one `events` row, folds
+those events into the `jobs`/`epics` projections, and serves them read-only over a
+UDS subscribe socket. The `events` table is the
 canonical fold source, so re-fold determinism holds by construction. System map,
 rationale, and incident history: `README.md` `## Architecture` and `.keeper/` specs.
 
@@ -59,9 +61,20 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 
 ## Hook rules
 
+- **Two hooks, two contracts.** The keeper plugin ships TWO `PreToolUse(Bash)` hooks:
+  the events-writer (logs every invocation, NEVER blocks) and the branch-guard
+  (`plugins/keeper/plugin/hooks/branch-guard.ts` — hard-blocks a subagent, detected by
+  `agent_id`/`agent_type` presence, from git branch create/switch/worktree-add so
+  workers stay on the current branch; ordinary git, file-restore, and non-subagent
+  sessions pass).
 - **Always exit 0.** A non-zero exit can fail-closed the human's session. On a HARD
-  append failure the hook writes a per-pid dead-letter and still exits 0 (losing one
-  row is acceptable; wedging the agent is not).
+  append failure the events-writer writes a per-pid dead-letter and still exits 0
+  (losing one row is acceptable; wedging the agent is not). The branch-guard ALSO
+  exits 0 — it denies via the `PreToolUse` JSON envelope
+  (`hookSpecificOutput.permissionDecision:"deny"`), NOT a non-zero exit, so the
+  exit-0 rule holds for both. Never "fix" the branch-guard to drop the deny or to
+  exit non-zero: exit 0 is REQUIRED for the deny JSON to be honored, and a non-zero
+  exit would fail-close the session.
 - **No third-party deps, and NO `bun:sqlite`/`src/db.ts`.** The hook never opens
   SQLite — a stray `db.ts` symbol re-drags the 6.5k-line module and erases the
   cold-start win. Keep imports to `node:fs`/`node:os`/`node:path`, the dep-free

@@ -372,7 +372,9 @@ Keeper has no `install` verb. Wire it up manually:
 
 4. **Load the plugins via the arthack launcher's `plugin_scan_dirs`.** Both
    Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
-   events-writer hook + `keeper:await` skill, manifest at
+   events-writer hook + the branch-guard hook that hard-denies subagent git
+   branch create/switch via the `PreToolUse` deny JSON, + `keeper:await` skill,
+   manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
    `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin
    behind `keeper plan` + the `plan:*` skills, vendored as a `git subtree`). agentwrap's
@@ -1296,6 +1298,16 @@ table stays the canonical fold source, so re-fold determinism is preserved by
 construction. Skew is lag-not-loss: a new-hook/old-daemon window backs up NDJSON
 (drained at the next daemon boot ingest); an old-hook/new-daemon window INSERTs
 directly while the ingester finds an empty dir.
+
+The keeper plugin also ships a second, daemon-independent `PreToolUse(Bash)` hook,
+the **branch-guard** (`plugins/keeper/plugin/hooks/branch-guard.ts`): a pure-payload
+hard-deny that blocks a SUBAGENT (a `/plan:work` worker, detected by `agent_id` /
+`agent_type` presence) from git branch create/switch/worktree-add so workers stay on
+the current branch. It denies via the `PreToolUse` JSON envelope
+(`hookSpecificOutput.permissionDecision:"deny"`) and STILL exits 0 — exit 0 is
+required for the deny to be honored. It makes no subprocess/fs/git/DB calls, fails
+open, and never touches non-subagent sessions (the human's interactive claude and the
+`/plan:work` orchestrator both run with no `agent_id`).
 
 A **second** Worker thread runs the read-only UDS subscribe server. It mirrors
 the wake worker's archetype — its own read-only connection, its own
