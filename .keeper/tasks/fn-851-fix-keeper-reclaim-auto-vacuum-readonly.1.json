@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T15:10:12.723000Z",
+  "depends_on": [],
+  "epic": "fn-851-fix-keeper-reclaim-auto-vacuum-readonly",
+  "id": "fn-851-fix-keeper-reclaim-auto-vacuum-readonly.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "bake auto_vacuum on output not the readonly source",
+  "updated_at": "2026-06-20T15:10:12.723000Z"
+}
