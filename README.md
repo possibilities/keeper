@@ -349,6 +349,13 @@ Keeper has no `install` verb. Wire it up manually:
      jobs. A positive integer enforces the cap; omit or set non-positive
      (the default) to leave it unlimited. The cap bounds only `work`/`close`
      launches.
+   - `dispatch_prompt_prefix` — a global prompt prefix for `keeper dispatch`
+     FREE-FORM dispatches (`--prompt`/`--prompt-file`). When set (e.g. `/hack`),
+     a free-form prompt launches as `<prefix> <prompt>` (single space) — handy
+     for wrapping every ad-hoc dispatch in a skill. A non-empty string only;
+     absent/empty leaves it unset (no prefix). Plan-form (`<verb>::<id>`)
+     dispatches are never prefixed, and `keeper dispatch --no-prefix` bypasses
+     it for one invocation.
 
    ```sh
    mkdir -p ~/.config/keeper
@@ -967,7 +974,14 @@ event-log/reducer/hook touch. Run any of them with
   keeper dispatch work::fn-1-foo.2 --dry-run             # print the launch plan, launch nothing
   keeper dispatch --name scratch --prompt 'investigate the flaky X test'
   keeper dispatch work::fn-1-foo.2 --force               # skip the race guard
+  keeper dispatch --name scratch --prompt 'look at X' --no-prefix  # bypass dispatch_prompt_prefix
   ```
+
+  When `dispatch_prompt_prefix` is configured (e.g. `/hack`), a FREE-FORM prompt
+  launches as `<prefix> <prompt>` (single space) so every ad-hoc dispatch wraps
+  in that skill; the NUL/96 KB prompt guard runs on the final prefixed prompt,
+  `--dry-run` reflects it, and `--no-prefix` bypasses it for one invocation.
+  Plan-form dispatches are never prefixed.
 
 - `git.ts` — single-collection subscribe client over the `git`
   collection (watched-worktree status — membership gate

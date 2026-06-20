@@ -14,7 +14,9 @@
  *   - **free form** (`--prompt "<text>"` / `--prompt-file <path>`): launches an
  *     arbitrary prompt. `--name` is REQUIRED (the claude session name +
  *     correlation key). A `verb::id`-shaped `--name` WILL bind to that plan row
- *     (feature + hazard — document it).
+ *     (feature + hazard — document it). When `dispatch_prompt_prefix` is
+ *     configured, the free-form prompt launches as `<prefix> <prompt>` (unless
+ *     `--no-prefix`); plan form is never prefixed.
  *
  * Launch is purely CLIENT-SIDE via `resolveExecBackend(...).ensureLaunched(...)`
  * — no daemon RPC, no synthetic event, no reducer/migration touch — so re-fold
@@ -34,7 +36,7 @@
 
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { resolveSockPath } from "../src/db";
+import { resolveConfig, resolveSockPath } from "../src/db";
 import {
   buildDispatchLaunchArgv,
   defaultPlanPrompt,
@@ -79,6 +81,10 @@ export interface MainDeps {
   readonly query?: QueryFn;
   /** The launch backend. Defaults to `resolveExecBackend(...).ensureLaunched`. */
   readonly launch?: LaunchFn;
+  /** The configured global prompt prefix for FREE-FORM dispatches. Defaults to
+   *  `resolveConfig().dispatchPromptPrefix`. Injected so tests drive the
+   *  prefixing without writing a config.yaml; `undefined` = no prefix. */
+  readonly promptPrefix?: string;
 }
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
@@ -103,6 +109,7 @@ Options:
   --model <m>          Pass --model to claude
   --effort <e>         Pass --effort to claude
   --force              Plan form: skip the race guard
+  --no-prefix          Free form: bypass the configured dispatch_prompt_prefix
   --dry-run            Print the resolved launch plan; launch nothing
   --sock <path>        Daemon socket path override
   --help, -h           Show this help
@@ -305,6 +312,7 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       model: { type: "string" },
       effort: { type: "string" },
       force: { type: "boolean", default: false },
+      "no-prefix": { type: "boolean", default: false },
       "dry-run": { type: "boolean", default: false },
       sock: { type: "string" },
       help: { type: "boolean", default: false },
@@ -402,6 +410,20 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
       }
     } else {
       prompt = v.prompt as string;
+    }
+    // Global prompt prefix (config `dispatch_prompt_prefix`) — FREE FORM ONLY.
+    // When set, prepend `<prefix> ` so the worker launches with
+    // `<prefix> <prompt>`. The NUL/96 KB guard below runs on the FINAL prefixed
+    // prompt, and `--dry-run` reflects it. The plan-form branch is untouched.
+    // `--no-prefix` bypasses the configured prefix for a single invocation.
+    const promptPrefix =
+      deps.promptPrefix ?? resolveConfig().dispatchPromptPrefix;
+    if (
+      !(v["no-prefix"] ?? false) &&
+      promptPrefix !== undefined &&
+      promptPrefix !== ""
+    ) {
+      prompt = `${promptPrefix} ${prompt}`;
     }
     const promptCheck = validatePromptBytes(prompt);
     if (!promptCheck.ok) {

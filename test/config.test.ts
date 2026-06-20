@@ -190,3 +190,40 @@ test("account_aliases resolves independently of a malformed sibling key", () => 
   expect(cfg.accountAliases).toEqual({ default: "claude-0" });
   expect(cfg.roots.length).toBeGreaterThan(0);
 });
+
+// ---------------------------------------------------------------------------
+// dispatch_prompt_prefix (fn-861) — non-empty-string only, else undefined
+// (mirrors buildbot_url's independent best-effort string-key pattern)
+// ---------------------------------------------------------------------------
+
+test("dispatchPromptPrefix defaults to undefined when the file is absent", () => {
+  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
+  expect(resolveConfig().dispatchPromptPrefix).toBeUndefined();
+});
+
+test("dispatchPromptPrefix defaults to undefined when the key is absent", () => {
+  writeConfig("roots:\n  - ~/code\n");
+  expect(resolveConfig().dispatchPromptPrefix).toBeUndefined();
+});
+
+test("dispatch_prompt_prefix: /hack → /hack (a non-empty string overrides)", () => {
+  writeConfig("dispatch_prompt_prefix: /hack\n");
+  expect(resolveConfig().dispatchPromptPrefix).toBe("/hack");
+});
+
+test('dispatch_prompt_prefix: "" → undefined (empty is rejected)', () => {
+  writeConfig('dispatch_prompt_prefix: ""\n');
+  expect(resolveConfig().dispatchPromptPrefix).toBeUndefined();
+});
+
+test("a non-string dispatch_prompt_prefix falls back to undefined", () => {
+  writeConfig("dispatch_prompt_prefix: 42\n");
+  expect(resolveConfig().dispatchPromptPrefix).toBeUndefined();
+});
+
+test("dispatch_prompt_prefix resolves independently of a malformed sibling key", () => {
+  writeConfig("roots: not-a-list\ndispatch_prompt_prefix: /hack\n");
+  const cfg = resolveConfig();
+  expect(cfg.dispatchPromptPrefix).toBe("/hack");
+  expect(cfg.roots.length).toBeGreaterThan(0);
+});

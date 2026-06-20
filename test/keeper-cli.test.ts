@@ -424,7 +424,7 @@ interface MainRun {
 /** Drive `dispatchMain(argv, deps)` with process.{exit,stdout,stderr} captured. */
 async function runMain(
   argv: string[],
-  deps?: { query?: QueryFn; launch?: LaunchFn },
+  deps?: { query?: QueryFn; launch?: LaunchFn; promptPrefix?: string },
 ): Promise<MainRun> {
   const out: string[] = [];
   const err: string[] = [];
@@ -575,6 +575,81 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
     );
     expect(r.code).toBe(1);
     expect(r.stderr).toContain("launch failed: tmux is dead");
+  });
+
+  test("free-form prompt is prefixed with the configured dispatch_prompt_prefix", async () => {
+    // With a prefix configured, a free-form prompt launches as `<prefix> <prompt>`.
+    const launch = fakeLaunch({ ok: true });
+    const r = await runMain(
+      ["--prompt", "hello", "--name", "manual", "--session", "scratch"],
+      { launch: launch.fn, promptPrefix: "/hack" },
+    );
+    expect(r.code).toBeUndefined();
+    expect(launch.calls).toHaveLength(1);
+    // The prefixed prompt rides in the launch argv.
+    expect(launch.calls[0]?.argv.join(" ")).toContain("/hack hello");
+  });
+
+  test("free-form dry-run reflects the prefixed prompt in argv", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const r = await runMain(
+      [
+        "--prompt",
+        "hello",
+        "--name",
+        "manual",
+        "--session",
+        "scratch",
+        "--dry-run",
+      ],
+      { launch: launch.fn, promptPrefix: "/hack" },
+    );
+    expect(r.code).toBe(0);
+    expect(launch.calls).toEqual([]);
+    expect(r.stdout).toContain("/hack hello");
+  });
+
+  test("--no-prefix bypasses the configured prefix for a single invocation", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const r = await runMain(
+      [
+        "--prompt",
+        "hello",
+        "--name",
+        "manual",
+        "--session",
+        "scratch",
+        "--no-prefix",
+      ],
+      { launch: launch.fn, promptPrefix: "/hack" },
+    );
+    expect(r.code).toBeUndefined();
+    expect(launch.calls).toHaveLength(1);
+    expect(launch.calls[0]?.argv.join(" ")).not.toContain("/hack");
+    expect(launch.calls[0]?.argv.join(" ")).toContain("hello");
+  });
+
+  test("plan-form prompt is NEVER prefixed even when a prefix is configured", async () => {
+    // The plan-form prompt comes from defaultPlanPrompt and must be untouched.
+    const launch = fakeLaunch({ ok: true });
+    const query: QueryFn = (collection) =>
+      Promise.resolve(
+        collection === "epics"
+          ? [
+              {
+                epic_id: "fn-1-foo",
+                project_dir: "/epic/dir",
+                tasks: [{ task_id: "fn-1-foo.2", target_repo: "/task/repo" }],
+              },
+            ]
+          : [],
+      );
+    const r = await runMain(
+      ["work::fn-1-foo.2", "--session", "scratch", "--force", "--dry-run"],
+      { query, launch: launch.fn, promptPrefix: "/hack" },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).not.toContain("/hack");
   });
 
   test("plan-form dry-run resolves cwd via the injected query seam", async () => {

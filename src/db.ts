@@ -99,6 +99,12 @@ export interface KeeperConfig {
   // builds` dashboard's poller. Independent best-effort key with NO default:
   // absent/empty/garbage → undefined → the builds worker is not spawned.
   buildbotUrl?: string;
+  // Global prompt prefix for `keeper dispatch` FREE-FORM dispatches: when set
+  // (e.g. `/hack`), it is prepended with a single space to a free-form prompt
+  // so the worker launches with `<prefix> <prompt>`. Independent best-effort key
+  // with NO default: absent/empty/garbage → undefined → no prefix applied.
+  // Plan-form dispatches are never prefixed.
+  dispatchPromptPrefix?: string;
   // Autopilot exec backend — `tmux` (the sole backend). The managed-session
   // name is hardcoded (`MANAGED_EXEC_SESSION`), not configurable.
   execBackend?: string;
@@ -138,6 +144,9 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `buildbotUrl` undefined so the builds worker
   // never spawns.
   let buildbotUrl: string | undefined;
+  // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
+  // applied to free-form `keeper dispatch` prompts.
+  let dispatchPromptPrefix: string | undefined;
   let execBackend: string = DEFAULT_EXEC_BACKEND;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   let accountAliases: Record<string, string> = {};
@@ -176,6 +185,14 @@ export function resolveConfig(): KeeperConfig {
       const bbu = (raw as { buildbot_url?: unknown }).buildbot_url;
       if (typeof bbu === "string" && bbu.length > 0) {
         buildbotUrl = bbu;
+      }
+      // Independent best-effort key — non-empty string only; garbage/absent
+      // leaves `dispatchPromptPrefix` undefined and no free-form prompt prefix
+      // is applied.
+      const dpp = (raw as { dispatch_prompt_prefix?: unknown })
+        .dispatch_prompt_prefix;
+      if (typeof dpp === "string" && dpp.length > 0) {
+        dispatchPromptPrefix = dpp;
       }
       // Independent best-effort key: a recognized value wins; an unknown
       // non-empty value warns and falls back to the default (every key
@@ -227,6 +244,7 @@ export function resolveConfig(): KeeperConfig {
     claudeProjectsRoot,
     agentuseRoot,
     buildbotUrl,
+    dispatchPromptPrefix,
     execBackend,
     maxConcurrentJobs,
     accountAliases,
