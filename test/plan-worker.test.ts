@@ -60,6 +60,7 @@ import {
   reflogWatchDiff,
   repoRootFromPlanctlPath,
   resolveReflogTarget,
+  scanRepoDataDirs,
   scanRoot,
   seedFromDb,
   taskDefPathFromStatePath,
@@ -95,6 +96,30 @@ function writeEpic(id: string, body: Record<string, unknown>): string {
 /** Write a task JSON file and return its path. */
 function writeTask(id: string, body: Record<string, unknown>): string {
   const path = join(planctlDir("tasks"), `${id}.json`);
+  writeFileSync(path, JSON.stringify({ id, ...body }));
+  return path;
+}
+
+/** Make a `<dataDir>/<kind>` tree under a project root and return the dir path.
+ * `dataDir` is the data-dir basename (`.keeper` or the legacy `.planctl`). */
+function dataDirOf(
+  projectRoot: string,
+  dataDir: string,
+  kind: "epics" | "tasks",
+): string {
+  const dir = join(projectRoot, dataDir, kind);
+  mkdirSync(dir, { recursive: true });
+  return dir;
+}
+
+/** Write an epic JSON under `<projectRoot>/<dataDir>/epics/` and return its path. */
+function writeEpicIn(
+  projectRoot: string,
+  dataDir: string,
+  id: string,
+  body: Record<string, unknown>,
+): string {
+  const path = join(dataDirOf(projectRoot, dataDir, "epics"), `${id}.json`);
   writeFileSync(path, JSON.stringify({ id, ...body }));
   return path;
 }
@@ -299,6 +324,194 @@ test("scanRoot folds the root .planctl but skips the vendored plugins/plan/.plan
     .filter((m) => m.kind === "plan-epic")
     .map((m) => (m as { id: string }).id);
   expect(epicIds).toContain("fn-822-keeper");
+  expect(epicIds).not.toContain("fn-1-planctl-dev");
+});
+
+// ---------------------------------------------------------------------------
+// fn-827: data-dir rename — the worker folds BOTH `.keeper/` (primary) and the
+// legacy `.planctl/` (transient migration fallback) so the `epics` projection,
+// and therefore autopilot's board, covers every repo regardless of which dir
+// name it currently uses. No double-fold when a repo briefly holds both;
+// `.keeper/` wins the deterministic precedence.
+// ---------------------------------------------------------------------------
+
+test("classifyPlanPath: recognizes both .keeper/ and legacy .planctl/", () => {
+  // `.keeper/` (the convention dir) classifies identically to `.planctl/`.
+  expect(classifyPlanPath("/a/b/.keeper/epics/fn-1-x.json")).toBe("epic");
+  expect(classifyPlanPath("/a/b/.keeper/tasks/fn-1-x.2.json")).toBe("task");
+  expect(classifyPlanPath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json")).toBe(
+    "task-state",
+  );
+  expect(classifyPlanPath("/a/b/.keeper/state/epics/fn-1-x.state.json")).toBe(
+    "epic-state",
+  );
+  // A non-data-dir basename still rejects (the gate is the two known names).
+  expect(classifyPlanPath("/a/b/.other/epics/fn-1-x.json")).toBeNull();
+});
+
+test("repoRootFromPlanctlPath: resolves the repo root for both dir names", () => {
+  expect(repoRootFromPlanctlPath("/a/b/.keeper/epics/fn-1-x.json")).toBe(
+    "/a/b",
+  );
+  expect(repoRootFromPlanctlPath("/a/b/.planctl/epics/fn-1-x.json")).toBe(
+    "/a/b",
+  );
+});
+
+test("taskDefPathFromStatePath / epicDefPathFromStatePath: preserve the .keeper/ data dir", () => {
+  // The state→def mapper keeps the input's data-dir basename (`.keeper`), not a
+  // hard-coded `.planctl`.
+  expect(
+    taskDefPathFromStatePath("/a/b/.keeper/state/tasks/fn-1-x.2.state.json"),
+  ).toBe("/a/b/.keeper/tasks/fn-1-x.2.json");
+  expect(
+    epicDefPathFromStatePath("/a/b/.keeper/state/epics/fn-1-x.state.json"),
+  ).toBe("/a/b/.keeper/epics/fn-1-x.json");
+});
+
+test("scanRoot: a .keeper/ epic folds; a legacy .planctl/ epic still folds", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  // Two sibling projects under the same configured root — one on `.keeper/`,
+  // one still on the legacy `.planctl/`. Both must fold.
+  const keeperProj = join(tmpDir, "on-keeper");
+  const legacyProj = join(tmpDir, "on-planctl");
+  writeEpicIn(keeperProj, ".keeper", "fn-900-keeper-dir", {
+    title: "keeper-dir epic",
+    status: "open",
+    primary_repo: keeperProj,
+  });
+  writeEpicIn(legacyProj, ".planctl", "fn-901-legacy-dir", {
+    title: "legacy-dir epic",
+    status: "open",
+    primary_repo: legacyProj,
+  });
+
+  scanRoot(tmpDir, scanner);
+
+  const epicIds = emitted
+    .filter((m) => m.kind === "plan-epic")
+    .map((m) => (m as { id: string }).id);
+  expect(epicIds).toContain("fn-900-keeper-dir");
+  expect(epicIds).toContain("fn-901-legacy-dir");
+});
+
+test("scanRoot: a repo holding BOTH dirs folds each epic once (no double-fold), .keeper/ wins precedence", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  const proj = join(tmpDir, "both-dirs");
+  // Same epic id in BOTH dirs, differing only by a field — `.keeper/` is the
+  // primary and must win the deterministic precedence; the projection + the
+  // change-gate key off the epic id, so the row is folded once.
+  writeEpicIn(proj, ".keeper", "fn-902-both", {
+    title: "from keeper",
+    status: "open",
+    primary_repo: proj,
+  });
+  writeEpicIn(proj, ".planctl", "fn-902-both", {
+    title: "from planctl",
+    status: "open",
+    primary_repo: proj,
+  });
+
+  scanRoot(proj, scanner);
+
+  const epics = emitted.filter(
+    (m) => m.kind === "plan-epic" && (m as { id: string }).id === "fn-902-both",
+  );
+  // Folded exactly once: dir-level precedence resolves to `.keeper/` and the
+  // legacy `.planctl/` is IGNORED entirely at this root, so the differing-title
+  // `.planctl/` file never emits a second (overriding) snapshot.
+  expect(epics.length).toBe(1);
+  // `.keeper/` won — the surviving snapshot carries the `.keeper/` file's title.
+  expect((epics[0] as { title: string }).title).toBe("from keeper");
+});
+
+test("discoverPlanctlDirs: surfaces both dir names; reconcilePlanctlDirs folds each", () => {
+  const keeperProj = join(tmpDir, "k");
+  const legacyProj = join(tmpDir, "p");
+  writeEpicIn(keeperProj, ".keeper", "fn-903-k", {
+    title: "k",
+    status: "open",
+    primary_repo: keeperProj,
+  });
+  writeEpicIn(legacyProj, ".planctl", "fn-904-p", {
+    title: "p",
+    status: "open",
+    primary_repo: legacyProj,
+  });
+
+  const dirs = discoverPlanctlDirs([tmpDir]);
+  expect(dirs).toContain(join(keeperProj, ".keeper"));
+  expect(dirs).toContain(join(legacyProj, ".planctl"));
+
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  reconcilePlanctlDirs([tmpDir], scanner);
+  const epicIds = emitted
+    .filter((m) => m.kind === "plan-epic")
+    .map((m) => (m as { id: string }).id);
+  expect(epicIds).toContain("fn-903-k");
+  expect(epicIds).toContain("fn-904-p");
+});
+
+test("scanRepoDataDirs: re-scans whichever data dir(s) a repo holds", () => {
+  // The reflog-watch re-scan path: given a repo root, fold its present data
+  // dirs. A repo on `.keeper/` only folds via `.keeper/`; the absent
+  // `.planctl/` is silently skipped.
+  const proj = join(tmpDir, "repo");
+  writeEpicIn(proj, ".keeper", "fn-905-rescan", {
+    title: "rescan",
+    status: "open",
+    primary_repo: proj,
+  });
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  scanRepoDataDirs(proj, scanner);
+  const epicIds = emitted
+    .filter((m) => m.kind === "plan-epic")
+    .map((m) => (m as { id: string }).id);
+  expect(epicIds).toEqual(["fn-905-rescan"]);
+});
+
+test("scanRoot still prunes the vendored subtree under .keeper/ too", () => {
+  const emitted: PlanMessage[] = [];
+  const scanner = new PlanScanner(
+    (m) => emitted.push(m),
+    () => {},
+  );
+  // The vendored subtree migrated to `.keeper/` along with keeper's own dir —
+  // it must STILL be pruned (its parent name-tolerant guard covers both).
+  writeEpicIn(join(tmpDir, "plugins", "plan"), ".keeper", "fn-1-planctl-dev", {
+    title: "vendored",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+  // keeper's own `.keeper/` plan at the root must fold.
+  writeEpicIn(tmpDir, ".keeper", "fn-906-keeper", {
+    title: "keeper",
+    status: "open",
+    primary_repo: tmpDir,
+  });
+
+  scanRoot(tmpDir, scanner);
+
+  const epicIds = emitted
+    .filter((m) => m.kind === "plan-epic")
+    .map((m) => (m as { id: string }).id);
+  expect(epicIds).toContain("fn-906-keeper");
   expect(epicIds).not.toContain("fn-1-planctl-dev");
 });
 

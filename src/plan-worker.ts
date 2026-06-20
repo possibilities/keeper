@@ -1,10 +1,14 @@
 /**
  * Plan worker — a Bun Worker thread and event *producer*: it watches each
- * configured project root for `.planctl/{epics,tasks}/*.json` files, parses the
- * current file on each change, and posts typed snapshot messages to the parent.
- * Main (and only main) turns those into synthetic `EpicSnapshot` / `TaskSnapshot`
- * events rows. The worker never writes the DB — a READ-ONLY connection (for the
- * restart-seed) and posted messages only, keeping main the sole writer.
+ * configured project root for `<data-dir>/{epics,tasks}/*.json` files, parses
+ * the current file on each change, and posts typed snapshot messages to the
+ * parent. The data dir is `.keeper/` (convention) OR the legacy `.planctl/`
+ * (transient migration fallback) — see {@link DATA_DIR_NAMES}; both fold into
+ * the `epics` projection during the migration window so autopilot's board stays
+ * lit regardless of which dir a repo is on. Main (and only main) turns those
+ * snapshots into synthetic `EpicSnapshot` / `TaskSnapshot` events rows. The
+ * worker never writes the DB — a READ-ONLY connection (for the restart-seed) and
+ * posted messages only, keeping main the sole writer.
  *
  * Producer-worker archetype (cloned from `transcript-worker.ts`):
  * - `isMainThread`-guarded body — a plain `import` is inert; the pure
@@ -27,8 +31,15 @@
  * Watching strategy: ONE recursive `@parcel/watcher` subscribe per root with
  * POSITIVE ignore globs (see {@link IGNORE_GLOBS}) so a git/npm storm doesn't
  * flood the callback. NOT a negation glob — parcel breaks on negated patterns
- * (parcel-bundler/watcher #174). The `.planctl/{epics,tasks}/*.json` filter is
- * an in-callback check.
+ * (parcel-bundler/watcher #174). The `<data-dir>/{epics,tasks}/*.json` filter is
+ * an in-callback check ({@link classifyPlanPath}), data-dir-name-tolerant across
+ * both `.keeper/` and the legacy `.planctl/`.
+ *
+ * RESTART REQUIRED to apply this data-dir set: the recursive subscription + the
+ * boot scan are wired once at worker spawn. A running daemon keeps folding the
+ * dir names it booted with — bounce the daemon so the plan-worker re-watches
+ * `.keeper/` BEFORE the flag-day epic's `git mv .planctl .keeper` renames any
+ * board's dir.
  *
  * Internal guards (skip-and-log, never escalate): a missing root, per-file read
  * errors, oversize files, and torn/malformed JSON all log and continue without
@@ -368,6 +379,48 @@ const BACKSTOP_ALARM_COOLDOWN_MS = 60_000;
 const FAST_PATH_ATTRIBUTION_WINDOW_MS = 60_000;
 
 /**
+ * Plan data-dir basenames the worker watches + folds, in PRECEDENCE ORDER
+ * (primary first). `.keeper/` is the convention dir; `.planctl/` is the
+ * transient migration fallback so a board minted before the flag-day rename
+ * (still on `.planctl/`) keeps folding into the `epics` projection — and
+ * autopilot's board never goes dark — during the migration window. The fallback
+ * leaves once every repo migrates (the flag-day epic).
+ *
+ * Mirrors the CLI's `DATA_DIR_NAMES` in `plugins/plan/src/state_path.ts`; the
+ * worker can't import the vendored package, so the precedence list is restated
+ * here (the two MUST agree). No double-fold when a repo briefly holds BOTH dirs:
+ * the projection + change-gate key off the epic/task id (the pk), so two files
+ * for one id upsert the same row — and the boot scan / discovery walk this list
+ * in order, so `.keeper/` is folded first and wins the deterministic precedence.
+ */
+const DATA_DIR_NAMES = [".keeper", ".planctl"] as const;
+
+/** Is `name` a recognized plan data-dir basename (either `.keeper` or the
+ * legacy `.planctl`)? The single membership test every dir-name match routes
+ * through. */
+function isDataDirName(name: string): boolean {
+  return (DATA_DIR_NAMES as readonly string[]).includes(name);
+}
+
+/**
+ * Resolve the SINGLE primary data-dir basename to fold for a root, given the set
+ * of data-dir names actually present there — the first in {@link DATA_DIR_NAMES}
+ * precedence order (`.keeper/` over the legacy `.planctl/`), or null when none
+ * is present. The dir-level precedence rule (mirroring the CLI's
+ * `resolveDataDir`): when BOTH dirs exist at one root, `.keeper/` wins and
+ * `.planctl/` is IGNORED — never merged — so a stale same-id file in the legacy
+ * dir can't override the primary through the content-keyed change-gate.
+ */
+function resolveDataDirName(present: ReadonlySet<string>): string | null {
+  for (const name of DATA_DIR_NAMES) {
+    if (present.has(name)) {
+      return name;
+    }
+  }
+  return null;
+}
+
+/**
  * Aggressive POSITIVE ignore globs — the #1 perf lever for broad roots like
  * `~/code` / `~/src`. Without these, every git/npm/build churn under the root
  * floods the FSEvents callback. These are passed to `@parcel/watcher`'s
@@ -459,17 +512,18 @@ type PlanKind = "epic" | "task" | "task-state" | "epic-state";
  * shapes returns `null` — the callback then skips it (the in-callback filter
  * the ignore globs can't express).
  *
- * Recognised shapes:
- * - `.planctl/epics/<id>.json` (3-segment tail) → `"epic"`
- * - `.planctl/tasks/<id>.json` (3-segment tail) → `"task"`
- * - `.planctl/state/tasks/<id>.state.json` (4-segment tail) → `"task-state"`
- * - `.planctl/state/epics/<id>.state.json` (4-segment tail) → `"epic-state"`
+ * Recognised shapes (the data-dir basename is `.keeper` OR the legacy
+ * `.planctl` — {@link isDataDirName}):
+ * - `<data-dir>/epics/<id>.json` (3-segment tail) → `"epic"`
+ * - `<data-dir>/tasks/<id>.json` (3-segment tail) → `"task"`
+ * - `<data-dir>/state/tasks/<id>.state.json` (4-segment tail) → `"task-state"`
+ * - `<data-dir>/state/epics/<id>.state.json` (4-segment tail) → `"epic-state"`
  *
  * The 3-segment check is tried first so an `.json`-suffixed file under a
  * 3-tail layout never falls through to the 4-tail probe. The 4-tail probes
  * match the planctl `LocalFileStateStore` shape (see
  * `apps/planctl/planctl/store.py:151`); files there end in `.state.json` so a
- * stray `*.json` (non-state) under `.planctl/state/{tasks,epics}/` rejects.
+ * stray `*.json` (non-state) under `<data-dir>/state/{tasks,epics}/` rejects.
  * The epic-state sidecar classifies as `"epic-state"` so its path is
  * recognized, but keeper ingests no field from it — no change/delete arm acts
  * on an epic-state path.
@@ -482,8 +536,8 @@ export function classifyPlanPath(path: string): PlanKind | null {
   }
   const segments = path.split(sep);
   const n = segments.length;
-  // 3-segment tail: `.planctl/<epics|tasks>/<file>.json`.
-  if (n >= 3 && segments[n - 3] === ".planctl") {
+  // 3-segment tail: `<data-dir>/<epics|tasks>/<file>.json`.
+  if (n >= 3 && isDataDirName(segments[n - 3])) {
     const dir = segments[n - 2];
     if (dir === "epics") {
       return "epic";
@@ -491,16 +545,16 @@ export function classifyPlanPath(path: string): PlanKind | null {
     if (dir === "tasks") {
       return "task";
     }
-    // Other `.planctl/<dir>/*.json` shapes (e.g. `specs/`) fall through and
+    // Other `<data-dir>/<dir>/*.json` shapes (e.g. `specs/`) fall through and
     // reject below — they are not our concern.
     return null;
   }
-  // 4-segment tail: `.planctl/state/tasks/<id>.state.json`. The filename MUST
+  // 4-segment tail: `<data-dir>/state/tasks/<id>.state.json`. The filename MUST
   // end in `.state.json` (the planctl LocalFileStateStore convention); a
   // stray `*.json` (non-state) under this subtree rejects.
   if (
     n >= 4 &&
-    segments[n - 4] === ".planctl" &&
+    isDataDirName(segments[n - 4]) &&
     segments[n - 3] === "state" &&
     segments[n - 1].endsWith(".state.json")
   ) {
@@ -613,8 +667,9 @@ export function taskIdFromStatePath(path: string): string | null {
 
 /**
  * Map a state-file path
- * `.../.planctl/state/tasks/<task_id>.state.json` to the sibling task
- * definition file path `.../.planctl/tasks/<task_id>.json`. Pure path
+ * `.../<data-dir>/state/tasks/<task_id>.state.json` to the sibling task
+ * definition file path `.../<data-dir>/tasks/<task_id>.json`, preserving the
+ * input's data-dir basename (`.keeper` or the legacy `.planctl`). Pure path
  * arithmetic — does no I/O. Returns null on a shape mismatch (caller has
  * already classified, so this is defensive only).
  */
@@ -623,7 +678,7 @@ export function taskDefPathFromStatePath(statePath: string): string | null {
   const n = segments.length;
   if (
     n < 4 ||
-    segments[n - 4] !== ".planctl" ||
+    !isDataDirName(segments[n - 4]) ||
     segments[n - 3] !== "state" ||
     segments[n - 2] !== "tasks"
   ) {
@@ -633,9 +688,10 @@ export function taskDefPathFromStatePath(statePath: string): string | null {
   if (taskId === null) {
     return null;
   }
-  // Replace the trailing `state/tasks/<id>.state.json` with `tasks/<id>.json`.
-  const planctlPrefix = segments.slice(0, n - 3);
-  return [...planctlPrefix, "tasks", `${taskId}.json`].join(sep);
+  // Replace the trailing `state/tasks/<id>.state.json` with `tasks/<id>.json`,
+  // keeping the data-dir prefix (and its basename) intact.
+  const dataDirPrefix = segments.slice(0, n - 3);
+  return [...dataDirPrefix, "tasks", `${taskId}.json`].join(sep);
 }
 
 /**
@@ -655,8 +711,9 @@ export function epicIdFromStatePath(path: string): string | null {
 
 /**
  * Map an epic state-file path
- * `.../.planctl/state/epics/<epic_id>.state.json` to the committed epic
- * definition file path `.../.planctl/epics/<epic_id>.json`. Pure path
+ * `.../<data-dir>/state/epics/<epic_id>.state.json` to the committed epic
+ * definition file path `.../<data-dir>/epics/<epic_id>.json`, preserving the
+ * input's data-dir basename (`.keeper` or the legacy `.planctl`). Pure path
  * arithmetic — does no I/O. Returns null on a shape mismatch (caller has
  * already classified, so this is defensive only). Mirrors
  * {@link taskDefPathFromStatePath}.
@@ -666,7 +723,7 @@ export function epicDefPathFromStatePath(statePath: string): string | null {
   const n = segments.length;
   if (
     n < 4 ||
-    segments[n - 4] !== ".planctl" ||
+    !isDataDirName(segments[n - 4]) ||
     segments[n - 3] !== "state" ||
     segments[n - 2] !== "epics"
   ) {
@@ -676,9 +733,10 @@ export function epicDefPathFromStatePath(statePath: string): string | null {
   if (epicId === null) {
     return null;
   }
-  // Replace the trailing `state/epics/<id>.state.json` with `epics/<id>.json`.
-  const planctlPrefix = segments.slice(0, n - 3);
-  return [...planctlPrefix, "epics", `${epicId}.json`].join(sep);
+  // Replace the trailing `state/epics/<id>.state.json` with `epics/<id>.json`,
+  // keeping the data-dir prefix (and its basename) intact.
+  const dataDirPrefix = segments.slice(0, n - 3);
+  return [...dataDirPrefix, "epics", `${epicId}.json`].join(sep);
 }
 
 /**
@@ -1877,34 +1935,36 @@ function stringifyErr(err: unknown): string {
 }
 
 /**
- * Find the `.planctl` ancestor of `path` — the parent of the parent (because
- * `path` is `.planctl/{epics,tasks}/<id>.json`). Returns the parent dir of
- * `.planctl` (the planctl-managed repo root in keeper's layout) or `null` if
- * `.planctl` isn't found in the ancestry. Pure path arithmetic.
+ * Find the plan-data-dir ancestor of `path` — the parent of the parent (because
+ * `path` is `<data-dir>/{epics,tasks}/<id>.json`). Returns the parent dir of the
+ * data dir (the planctl-managed repo root in keeper's layout) or `null` if no
+ * data dir (`.keeper` or the legacy `.planctl`) is found in the ancestry. Pure
+ * path arithmetic.
  *
  * observation gate: the live worker uses this to derive the repo
  * root to run `git cat-file -e HEAD:<relpath>` against without a per-path
  * shell-out (`git rev-parse --show-toplevel` per call would be a
- * 100ms-class per-file cost on a `~/code` storm). The planctl tree IS
+ * 100ms-class per-file cost on a `~/code` storm). The data dir IS
  * always at the repo root — planctl writes via `_resolve_repo_root` which
  * calls `git rev-parse --show-toplevel` and refuses to operate on a
- * non-git tree — so the `.planctl` parent equals the repo root by
+ * non-git tree — so the data-dir parent equals the repo root by
  * construction. A future subtree-planctl layout would need to switch to
  * `git rev-parse`.
  */
 export function repoRootFromPlanctlPath(path: string): string | null {
-  // Walk up from `path` looking for a `.planctl` directory; return its parent.
-  // The shape is always `.../<root>/.planctl/{epics,tasks}/<id>.json` so the
-  // `.planctl` element sits at depth `n-3` from the basename. We could index
-  // directly, but a walk is more robust against any future shape drift.
+  // Walk up from `path` looking for a plan data dir (`.keeper`/`.planctl`);
+  // return its parent. The shape is always
+  // `.../<root>/<data-dir>/{epics,tasks}/<id>.json` so the data-dir element sits
+  // at depth `n-3` from the basename. We could index directly, but a walk is
+  // more robust against any future shape drift.
   let cur = dirname(path);
   while (cur !== "" && cur !== "/" && cur !== ".") {
     const parent = dirname(cur);
     if (parent === cur) {
-      return null; // hit filesystem root without finding .planctl
+      return null; // hit filesystem root without finding a data dir
     }
     const segments = cur.split(sep);
-    if (segments[segments.length - 1] === ".planctl") {
+    if (isDataDirName(segments[segments.length - 1])) {
       return parent;
     }
     cur = parent;
@@ -2146,21 +2206,29 @@ export function makeSingleFlight(
 }
 
 /**
- * Boot scan: recursively walk `root` for `.planctl/{epics,tasks}/*.json` files
- * and run each through the scanner. Called once after each subscribe resolves so
- * files that pre-existed the daemon's boot (or were changed while keeperd was
- * down) are picked up without waiting for a watcher event. The change-gate in
- * PlanScanner suppresses re-emits for files that already match the seeded
- * projection row. Exported for unit reach.
+ * Boot scan: recursively walk `root` for `<data-dir>/{epics,tasks}/*.json`
+ * files (the data dir is `.keeper/` or the legacy `.planctl/` — see
+ * {@link DATA_DIR_NAMES}) and run each through the scanner. Called once after
+ * each subscribe resolves so files that pre-existed the daemon's boot (or were
+ * changed while keeperd was down) are picked up without waiting for a watcher
+ * event. The change-gate in PlanScanner suppresses re-emits for files that
+ * already match the seeded projection row. Exported for unit reach.
  *
  * The walk MUST recurse: the live `@parcel/watcher` subscribe is recursive, and
- * plan files live at `<root>/<project>/.planctl/…` — there is no `.planctl` at
+ * plan files live at `<root>/<project>/<data-dir>/…` — there is no data dir at
  * the root itself. A non-recursive scan finds nothing under a broad root, so
  * only files touched while keeperd is live would ever enter the projection.
  * {@link PRUNE_DIRS} keeps the walk cheap (skips `node_modules`/`.git`/… under a
- * big root); a `.planctl` dir is scanned but NOT descended into; symlinked
+ * big root); a data dir is scanned but NOT descended into; symlinked
  * directories are not followed (`Dirent.isDirectory()` is false for a symlink),
  * so a symlink cycle can't trap the walk.
+ *
+ * Deterministic precedence when ONE project holds BOTH `.keeper/` and
+ * `.planctl/`: only the FIRST present dir in {@link DATA_DIR_NAMES} order
+ * (`.keeper/` wins) is scanned — the legacy `.planctl/` is ignored entirely when
+ * `.keeper/` is present at the same root. That dir-level resolution (mirroring
+ * the CLI's `resolveDataDir`) is what prevents a same-id file in the OTHER dir
+ * from overriding the primary via the content-keyed change-gate.
  */
 export function scanRoot(root: string, scanner: PlanScanner): void {
   const stack: string[] = [root];
@@ -2176,20 +2244,34 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
       );
       continue;
     }
+    // Names present in this dir, so the precedence resolution below is an O(1)
+    // Set hit and doesn't re-stat.
+    const present = new Set<string>();
     for (const entry of entries) {
       if (!entry.isDirectory() || PRUNE_DIRS.has(entry.name)) {
         continue;
       }
-      const full = join(dir, entry.name);
-      if (entry.name === ".planctl") {
-        // Skip the vendored planctl subtree's own dev plan
-        // (`plugins/plan/.planctl`) — it is the dependency's plan, not keeper's.
-        if (!isVendoredPlanPath(full)) {
-          scanPlanctlDir(full, scanner);
-        }
-        continue; // a `.planctl` tree has no nested `.planctl` to find
+      // A data dir is NOT pushed onto the walk stack — it has no nested data
+      // dir to find, and scanning it is handled in the resolution pass below.
+      if (isDataDirName(entry.name)) {
+        present.add(entry.name);
+        continue;
       }
-      stack.push(full);
+      stack.push(join(dir, entry.name));
+    }
+    // Resolve to the SINGLE primary dir (`.keeper/` over the legacy
+    // `.planctl/`) and scan only it — ignoring the other dir at the same root,
+    // so a stale same-id file there can't override the primary.
+    const resolved = resolveDataDirName(present);
+    if (resolved === null) {
+      continue;
+    }
+    const full = join(dir, resolved);
+    // Skip the vendored planctl subtree's own dev plan
+    // (`plugins/plan/{.planctl,.keeper}`) — it is the dependency's plan, not
+    // keeper's.
+    if (!isVendoredPlanPath(full)) {
+      scanPlanctlDir(full, scanner);
     }
   }
 }
@@ -2357,15 +2439,19 @@ function scanPlanctlDir(
 }
 
 /**
- * Shallow discovery of `<root>/<project>/.planctl` dirs across the configured
+ * Shallow discovery of `<root>/<project>/<data-dir>` dirs across the configured
  * roots — the cheap convergence backstop the periodic reconcile and on-drop
- * recovery share.
+ * recovery share. A data dir is `.keeper/` or the legacy `.planctl/` (see
+ * {@link DATA_DIR_NAMES}).
  *
  * One level deep ONLY: for each `root`, read its top-level entries and emit
- * `<root>/<entry>/.planctl` for every directory entry whose name isn't in
- * {@link PRUNE_DIRS} and whose `.planctl` child is a real directory. Heavy
- * vendored trees (`node_modules`, `.git`, …) are skipped at the project-name
- * step, so a broad root like `~/code` stays O(#projects) instead of
+ * `<root>/<entry>/<data-dir>` for every directory entry whose name isn't in
+ * {@link PRUNE_DIRS} and that holds a real data dir. A project holding BOTH
+ * dirs emits ONLY the resolved primary ({@link resolveDataDirName} — `.keeper/`
+ * over the legacy `.planctl/`), matching the dir-level precedence the boot
+ * {@link scanRoot} applies, so the legacy dir is never folded over the primary.
+ * Heavy vendored trees (`node_modules`, `.git`, …) are skipped at the
+ * project-name step, so a broad root like `~/code` stays O(#projects) instead of
  * O(`~/code` tree). No recursive descent — a project nested deeper than one
  * level under a configured root is intentionally out of scope (the live
  * recursive FSEvents watch + boot {@link scanRoot} cover those cases; this
@@ -2393,16 +2479,21 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
       if (!entry.isDirectory() || PRUNE_DIRS.has(entry.name)) {
         continue;
       }
-      const planctl = join(root, entry.name, ".planctl");
-      let st: ReturnType<typeof statSync>;
-      try {
-        st = statSync(planctl);
-      } catch {
-        // No `.planctl` under this project — common case.
-        continue;
+      // Resolve to the single primary data dir present under this project
+      // (`.keeper/` over the legacy `.planctl/`) — emit only it.
+      const present = new Set<string>();
+      for (const name of DATA_DIR_NAMES) {
+        try {
+          if (statSync(join(root, entry.name, name)).isDirectory()) {
+            present.add(name);
+          }
+        } catch {
+          // No data dir of this name under this project — common case.
+        }
       }
-      if (st.isDirectory()) {
-        dirs.push(planctl);
+      const resolved = resolveDataDirName(present);
+      if (resolved !== null) {
+        dirs.push(join(root, entry.name, resolved));
       }
     }
   }
@@ -2410,7 +2501,39 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
 }
 
 /**
- * ADDITIVE re-ingest of every `<root>/<project>/.planctl` dir discovered by
+ * Re-scan a single repo root's RESOLVED primary data dir (`.keeper/` over the
+ * legacy `.planctl/` — {@link resolveDataDirName}) through the change-gated
+ * {@link scanPlanctlDir} primitive. The repo-scoped re-scan the reflog-watch
+ * fire uses (a commit landed in `repoRoot`, possibly already in-HEAD before any
+ * FSEvent gated it). A no-op when the repo holds neither dir. `triggerReason`
+ * tags the calling trigger for the per-emit log line, same as
+ * {@link scanPlanctlDir}. Pure I/O dispatch — no DB read, no emission of its
+ * own; the change-gate side effect lives in {@link scanPlanctlDir}. Exported
+ * for unit reach.
+ */
+export function scanRepoDataDirs(
+  repoRoot: string,
+  scanner: PlanScanner,
+  triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
+): void {
+  const present = new Set<string>();
+  for (const name of DATA_DIR_NAMES) {
+    try {
+      if (statSync(join(repoRoot, name)).isDirectory()) {
+        present.add(name);
+      }
+    } catch {
+      // no data dir of this name under this repo — skip.
+    }
+  }
+  const resolved = resolveDataDirName(present);
+  if (resolved !== null) {
+    scanPlanctlDir(join(repoRoot, resolved), scanner, triggerReason);
+  }
+}
+
+/**
+ * ADDITIVE re-ingest of every `<root>/<project>/<data-dir>` dir discovered by
  * {@link discoverPlanctlDirs} via the change-gated {@link scanPlanctlDir}
  * primitive — the heartbeat backstop and on-drop recovery path (epic
  *).
@@ -2917,20 +3040,21 @@ function main(): void {
           }
           // `recheckPending(root)` only drains paths ALREADY in the
           // pending gate. The widened-watch slow path is a commit in a repo with
-          // NO pending path — the `.planctl` change was never gated in (its
+          // NO pending path — the data-dir change was never gated in (its
           // file-write FSEvent was a no-op or coalesced), so a pending drain is
-          // a no-op. Re-scan this repo's `.planctl` dir directly via the same
+          // a no-op. Re-scan this repo's present data dirs directly via the same
           // change-gated `scanPlanctlDir` the heartbeat/db-poll reconcile uses:
           // it re-reads the now-COMMITTED bytes, re-probes the in-HEAD gate per
           // file, and emits only changed-and-in-HEAD files (the change-gate
           // suppresses unchanged ones, so a spurious fire is an idempotent
-          // no-op). Repo-SCOPED to this `root`'s `.planctl` only — no global
-          // re-discovery, no per-path git storm. The
-          // re-scan never writes the DB (poll-is-trigger-only). Tagged
-          // `fswatcher-drop` (this IS a watcher edge a fast path would otherwise
-          // need the heartbeat to recover).
+          // no-op). Repo-SCOPED to this `root`'s data dirs only — no global
+          // re-discovery, no per-path git storm. Covers BOTH `.keeper/` and the
+          // legacy `.planctl/` (whichever the repo is on). The re-scan never
+          // writes the DB (poll-is-trigger-only). Tagged `fswatcher-drop` (this
+          // IS a watcher edge a fast path would otherwise need the heartbeat to
+          // recover).
           try {
-            scanPlanctlDir(join(root, ".planctl"), scanner, "fswatcher-drop");
+            scanRepoDataDirs(root, scanner, "fswatcher-drop");
           } catch (e) {
             console.error(
               `[plan-worker] reflog scanPlanctlDir failed for ${root}: ${stringifyErr(e)}`,
