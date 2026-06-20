@@ -52,5 +52,5 @@ De-vendor `plugins/plan/` in one cohesive change. **ORDER IS LOAD-BEARING:** del
 - [ ] `bun run test:full` passes; plan plugin `bun test` passes
 
 ## Done summary
-
+De-vendored plugins/plan/: removed the git-subtree linkage, deleted the plan plugin's 322-file dev board, dropped isVendoredPlanPath + the plugins/plan reject branch in isPlanctlChangedPath (keeping .keeper commit-forwarding), and rewrote subtree-discipline docs forward-facing.
 ## Evidence
