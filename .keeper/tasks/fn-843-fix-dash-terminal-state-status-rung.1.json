@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Terminal state outranks stale annotation",
-  "updated_at": "2026-06-20T11:55:05.617000Z"
+  "updated_at": "2026-06-20T12:34:54.594000Z",
+  "worker_done_at": "2026-06-20T12:34:54.594000Z"
 }

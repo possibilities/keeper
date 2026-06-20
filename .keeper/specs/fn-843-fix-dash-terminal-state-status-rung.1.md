@@ -29,5 +29,5 @@ error/awaiting. Keep the function pure and never-throwing.
       and killed, against both api-error and permission/input stamps.
 
 ## Done summary
-
+robotRung now resolves terminal state (ended/killed) before annotation stamps, so a job that died mid-block paints terminal and lands in the idle band hidden by showTerminal; live blocked jobs still resolve error/awaiting. Fast-tier test covers ended+killed against api-error/permission/input stamps.
 ## Evidence
