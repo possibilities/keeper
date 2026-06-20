@@ -36,5 +36,5 @@ Update plugins/plan/test/verbs-gist.test.ts to expect no Branch line. Run the pl
 - [ ] plugins/plan/test/verbs-gist.test.ts updated and green; plan slow-tier tests pass.
 
 ## Done summary
-
+Added a 'never create or switch branches; work in place' guardrail to worker.md.tmpl (regenerated all four worker-*.md), removed the misleading Branch line from gist buildToc, and added a TOC test asserting its absence.
 ## Evidence
