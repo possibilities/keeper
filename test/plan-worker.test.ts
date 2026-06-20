@@ -49,7 +49,7 @@ import {
   epicNumberFromId,
   isPathInHead,
   isPathInHeadBatch,
-  isVendoredPlanctlPath,
+  isVendoredPlanPath,
   isWithinRoots,
   MAX_SUBSCRIBES_PER_CYCLE,
   makeSingleFlight,
@@ -187,59 +187,59 @@ test("classifyPlanPath: .planctl/state/epics/*.state.json → epic-state (fn-732
 // fold into keeper's `epics` projection.
 // ---------------------------------------------------------------------------
 
-test("isVendoredPlanctlPath: matches the plugins/plan/.planctl subtree, rejects the root plan", () => {
+test("isVendoredPlanPath: matches the plugins/plan/.planctl subtree, rejects the root plan", () => {
   // The vendored subtree's own plan files match anywhere in the path.
   expect(
-    isVendoredPlanctlPath(
+    isVendoredPlanPath(
       "/home/u/code/keeper/plugins/plan/.planctl/epics/fn-1.json",
     ),
   ).toBe(true);
   expect(
-    isVendoredPlanctlPath(
+    isVendoredPlanPath(
       "/home/u/code/keeper/plugins/plan/.planctl/state/tasks/fn-1.2.state.json",
     ),
   ).toBe(true);
   // The subtree's `.planctl` dir itself matches (boot-scan call site).
-  expect(
-    isVendoredPlanctlPath("/home/u/code/keeper/plugins/plan/.planctl"),
-  ).toBe(true);
+  expect(isVendoredPlanPath("/home/u/code/keeper/plugins/plan/.planctl")).toBe(
+    true,
+  );
   // keeper's OWN root plan is NOT vendored — it must still fold.
   expect(
-    isVendoredPlanctlPath("/home/u/code/keeper/.planctl/epics/fn-822.json"),
+    isVendoredPlanPath("/home/u/code/keeper/.planctl/epics/fn-822.json"),
   ).toBe(false);
   // A different plugin's `.planctl` (not the `plan` subtree) is not vendored.
   expect(
-    isVendoredPlanctlPath(
+    isVendoredPlanPath(
       "/home/u/code/keeper/plugins/keeper/.planctl/epics/fn-1.json",
     ),
   ).toBe(false);
   // A `plan/.planctl` that is not under `plugins/` is unrelated.
-  expect(isVendoredPlanctlPath("/home/u/plan/.planctl/epics/fn-1.json")).toBe(
+  expect(isVendoredPlanPath("/home/u/plan/.planctl/epics/fn-1.json")).toBe(
     false,
   );
 });
 
-test("isVendoredPlanctlPath: also prunes the post-rename plugins/plan/.keeper subtree", () => {
+test("isVendoredPlanPath: also prunes the post-rename plugins/plan/.keeper subtree", () => {
   // The daemon name-erasure renames the plan dir `.planctl` -> `.keeper`; the
   // vendored subtree's dir moves with it. The prune must recognize BOTH so it
   // survives the rename (fn-827/fn-828). Additive — the legacy match is intact.
   expect(
-    isVendoredPlanctlPath(
+    isVendoredPlanPath(
       "/home/u/code/keeper/plugins/plan/.keeper/epics/fn-1.json",
     ),
   ).toBe(true);
   expect(
-    isVendoredPlanctlPath(
+    isVendoredPlanPath(
       "/home/u/code/keeper/plugins/plan/.keeper/state/tasks/fn-1.2.state.json",
     ),
   ).toBe(true);
   // The subtree's `.keeper` dir itself matches (boot-scan call site).
-  expect(
-    isVendoredPlanctlPath("/home/u/code/keeper/plugins/plan/.keeper"),
-  ).toBe(true);
+  expect(isVendoredPlanPath("/home/u/code/keeper/plugins/plan/.keeper")).toBe(
+    true,
+  );
   // keeper's OWN root `.keeper` plan is NOT vendored — it must still fold.
   expect(
-    isVendoredPlanctlPath("/home/u/code/keeper/.keeper/epics/fn-822.json"),
+    isVendoredPlanPath("/home/u/code/keeper/.keeper/epics/fn-822.json"),
   ).toBe(false);
 });
 

@@ -820,7 +820,7 @@ const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
  * Rejects the vendored planctl subtree's own dev plan (`plugins/plan/.planctl`)
  * at the source so a keeper commit touching it (notably the subtree-add commit's
  * 322 files) is never forwarded to the plan-worker — mirrors that worker's own
- * `isVendoredPlanctlPath` correctness backstop.
+ * `isVendoredPlanPath` correctness backstop.
  */
 export function isPlanctlChangedPath(path: string): boolean {
   if (!path.endsWith(".json")) return false;
@@ -1987,7 +1987,7 @@ function startWorker(): void {
             const planctlChanges = filterPlanctlChanges(c.files);
             if (planctlChanges.length > 0) {
               port.postMessage({
-                kind: "planctl-commit-changed",
+                kind: "plan-commit-changed",
                 project_dir: root,
                 commit_oid: c.commit_oid,
                 changes: planctlChanges,

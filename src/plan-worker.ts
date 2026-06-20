@@ -386,7 +386,7 @@ const IGNORE_GLOBS = [
   // carries planctl's OWN dev plan. That nested tree is the vendored
   // dependency's plan, NOT keeper-managed work — fold it and every planctl-dev
   // epic pollutes keeper's `epics` projection. Excluded here so the live watcher
-  // never delivers it; {@link isVendoredPlanctlPath} is the boot-scan / commit
+  // never delivers it; {@link isVendoredPlanPath} is the boot-scan / commit
   // equivalent. Both the legacy `.planctl` and the post-rename `.keeper` segment
   // are ignored so the prune survives the daemon name-erasure dir rename.
   "**/plugins/plan/.planctl/**",
@@ -415,7 +415,7 @@ const IGNORE_GLOBS = [
  * in the same arc, and the vendored subtree's dir moves with it. Additive: the
  * legacy `.planctl` match is unchanged. Exported for unit reach.
  */
-export function isVendoredPlanctlPath(path: string): boolean {
+export function isVendoredPlanPath(path: string): boolean {
   const segments = path.split(sep);
   for (let i = 0; i + 2 < segments.length; i++) {
     if (
@@ -1154,7 +1154,7 @@ export class PlanScanner {
     // The vendored planctl subtree's dev plan is never folded (see onChange),
     // so a delete under `plugins/plan/.planctl` has no projection row to
     // tombstone — skip before any cache/re-emit work.
-    if (isVendoredPlanctlPath(path)) {
+    if (isVendoredPlanPath(path)) {
       return;
     }
     const kind = classifyPlanPath(path);
@@ -1339,7 +1339,7 @@ export class PlanScanner {
     // boot scan both reach `plugins/plan/.planctl` paths that classify as real
     // plan files; folding them would inject planctl-dev epics into keeper's
     // projection.
-    if (isVendoredPlanctlPath(path)) {
+    if (isVendoredPlanPath(path)) {
       return false;
     }
 
@@ -2184,7 +2184,7 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
       if (entry.name === ".planctl") {
         // Skip the vendored planctl subtree's own dev plan
         // (`plugins/plan/.planctl`) — it is the dependency's plan, not keeper's.
-        if (!isVendoredPlanctlPath(full)) {
+        if (!isVendoredPlanPath(full)) {
           scanPlanctlDir(full, scanner);
         }
         continue; // a `.planctl` tree has no nested `.planctl` to find

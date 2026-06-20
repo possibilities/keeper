@@ -24,7 +24,7 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   `git-subtree-split:` trailer and kills `git subtree split --prefix=plugins/plan`
   extractability forever (a one-way door). Its nested `plugins/plan/.planctl/` is
   planctl's OWN dev plan and is pruned from keeper's plan-worker fold
-  (`isVendoredPlanctlPath` in `src/plan-worker.ts`); keeper folds only the root
+  (`isVendoredPlanPath` in `src/plan-worker.ts`); keeper folds only the root
   `.planctl/`.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
