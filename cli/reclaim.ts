@@ -76,7 +76,7 @@ Exit codes:
   1  daemon up (refused), reclaim failed, or self-verify failed (DB untouched)
 `;
 
-interface ParsedReclaimArgs {
+export interface ParsedReclaimArgs {
   dbPath: string;
   sockPath: string;
   dryRun: boolean;
