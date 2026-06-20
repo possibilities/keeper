@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] tmux0r `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+Renamed tmux0r .planctl -> .keeper via git mv and updated in-repo path refs in .keeper/CLAUDE.md. keeper board still renders tmux0r's plan from .keeper/.
 ## Evidence
