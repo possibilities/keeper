@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T17:32:47.148000Z",
+  "depends_on": [],
+  "epic": "fn-852-block-subagent-branch-changes",
+  "id": "fn-852-block-subagent-branch-changes.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Branch-guard PreToolUse hook",
+  "updated_at": "2026-06-20T17:32:47.148000Z"
+}
