@@ -29,5 +29,5 @@ Flip the CLI emit to `plan_invocation` (`plugins/plan/src/emit.ts`/`invocation.t
 - [ ] SCHEMA_VERSION + api.py same commit; re-fold byte-identical; `bun run test:full` green
 
 ## Done summary
-
+Keystone-only deliverable (re-split): reducer mint flipped planctl->plan, version-guarded v75 file_attributions row migration (UPDATE source='plan' WHERE source='planctl') atomic with the version stamp, SCHEMA_VERSION 74->75, api.py SUPPORTED_SCHEMA_VERSIONS gains 75; all keeper-side tests green (re-fold byte-identical). CLI-emit flip (emit.ts) deferred to a separate task bundled with the planctl binary promote + plugin conformance-suite migration.
 ## Evidence
