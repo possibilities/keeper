@@ -24,7 +24,7 @@ const HELP = `keeper show-session-files --session-id <id> [options]
 
 Emit the session's Claude-mutated files still dirty in git, grouped by repo, as
 a pretty JSON envelope \`{files_by_repo, cwd_repo}\`. Thin pass-through over the
-attribution reader — .planctl/ is NOT excluded here (exclusion-agnostic shape).
+attribution reader — the .keeper/ board is NOT excluded here (exclusion-agnostic shape).
 
 Options:
   --session-id <id>    Claude Code session id (REQUIRED)

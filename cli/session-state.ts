@@ -11,7 +11,7 @@
  *   - `head_sha`         — full HEAD SHA, or `null` in an empty repo.
  *   - `branch`           — current branch, or `null` on detached HEAD.
  *   - `session_files`    — repo-relative on-hook dirty paths (cwd repo, minus
- *     `.planctl/`) via task 1's attribution reader. A DB hiccup degrades this to
+ *     the `.keeper/` board) via task 1's attribution reader. A DB hiccup degrades this to
  *     `[]` (the Python's bare-except swallow) — NEVER throws the verb.
  *
  * Null parity is load-bearing: an empty repo's `head_sha` and a detached HEAD's

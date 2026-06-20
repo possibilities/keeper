@@ -17,11 +17,11 @@
  *    keeper-py reader. keeper owns the schema in this same binary, so there is
  *    NO `SUPPORTED_SCHEMA_VERSIONS` re-assertion — a hardcoded TS whitelist
  *    would self-reject the instant `SCHEMA_VERSION` bumps.
- *  - `.planctl/` exclusion is NOT done in {@link getSessionDirtyFiles} (it
+ *  - Board-dir exclusion is NOT done in {@link getSessionDirtyFiles} (it
  *    matches the Python's exclusion-agnostic shape exactly, for parity tests);
  *    the client-side partition lives in {@link discoverSessionFiles}, which
- *    selects the cwd's repo and drops `.planctl/` paths (they commit via the
- *    planctl-commit hook, not commit-work).
+ *    selects the cwd's repo and drops `.keeper/` board paths (they commit via
+ *    the plan-commit hook, not commit-work).
  */
 
 import { openDb, resolveDbPath } from "../db";
@@ -34,10 +34,14 @@ export interface SessionDirtyFiles {
 
 /**
  * Repo-relative path prefixes excluded CLIENT-side from commit-work's view —
- * they route through the planctl-commit hook, not commit-work. keeper's
+ * they route through the plan-commit hook, not commit-work. keeper's
  * attribution surface is exclusion-agnostic, so the partition lives here.
+ *
+ * `.keeper/` is the live keeper board dir (the board moved there in fn-829.1);
+ * `.planctl/` is retained for the vendored plugin board and any historical
+ * attribution rows still keyed under the old path.
  */
-const PLANCTL_EXCLUDE_PREFIXES = [".planctl/"];
+const PLANCTL_EXCLUDE_PREFIXES = [".keeper/", ".planctl/"];
 
 /** Inject a custom git runner / DB path / db-path resolver (tests). */
 export interface AttributionDeps {
@@ -182,7 +186,7 @@ function pathAfterPrefixTokens(rec: string, kind: string): string | null {
 /**
  * Faithful port of `get_session_dirty_files(session_id, cwd)` — the
  * exclusion-AGNOSTIC shape, byte-identical output to the Python (sorted paths
- * per repo, repos with no surviving file omitted). `.planctl/` filtering is the
+ * per repo, repos with no surviving file omitted). Board-dir filtering is the
  * caller's job — see {@link discoverSessionFiles}.
  */
 export function getSessionDirtyFiles(
@@ -246,7 +250,7 @@ function defaultGitRootOrInjected(
 
 /**
  * The commit-work consumer view: the cwd repo's on-hook dirty files with
- * `.planctl/` paths removed (order-preserving over the sorted parity output).
+ * board-dir paths removed (order-preserving over the sorted parity output).
  * Mirrors jobctl's `discover_files` — only the cwd's own repo is returned;
  * cross-repo files stay in their own repos.
  */

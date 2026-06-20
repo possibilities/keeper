@@ -53,7 +53,7 @@ Subcommands:
   autopilot           Dispatch log viewer (TTY: live TUI; non-TTY: one snapshot + exit)
   builds              Buildbot status dashboard (TTY: live TUI; non-TTY: one snapshot + exit)
   dash                Read-only opening screen: header + PLAN + AGENTS (TTY-only)
-  await               Block until a planctl/git/job condition holds
+  await               Block until a plan/git/job condition holds
   commit-work         Stage session-attributed files, lint, commit, push
   setup-tmux          Provision the tmux control plane (dash + work sessions)
   session-state       Current session git context + on-hook files (JSON)

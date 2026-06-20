@@ -47,7 +47,7 @@
  *     across its subscribe stream and, on a present-then-absent
  *     transition, runs a scope-exempt re-query against the daemon to
  *     disambiguate: re-query hit AND the target dropped off the
- *     default-visible board (a planctl epic terminalizes as
+ *     default-visible board (a keeper plan epic terminalizes as
  *     `status=='done'` — there is no `closed` status) → completed; miss
  *     → `deleted`. This module exposes a `priorPresence` input so the
  *     command can express that decision through the pure surface
@@ -222,7 +222,7 @@ export function workable(v: Verdict): boolean {
  * SessionStart bind, or on DispatchFailed / DispatchExpired), so it is
  * plain `waiting`, never `stuck`. No human action is required.
  *
- * `runtime-blocked` fires when planctl stamped the task `runtime_status="blocked"`
+ * `runtime-blocked` fires when keeper plan stamped the task `runtime_status="blocked"`
  * (e.g. a killed worker). It does NOT self-resolve — the human (or a manual
  * replay) has to clear the blocked flag — so it is terminal-blocker semantics.
  */
@@ -441,7 +441,7 @@ function epicStarted(epic: Epic): boolean {
  *                        sets `true` if the daemon still has the row,
  *                        `false` if it's truly gone. For tasks: a
  *                        re-query hit means the parent epic's
- *                        `.planctl/epics/<id>.json` is still present and
+ *                        `.keeper/epics/<id>.json` is still present and
  *                        the task is in its `tasks[]` array (the
  *                        scope-exempt read of the parent epic). For
  *                        epics: a re-query hit means the epic id is
@@ -471,7 +471,7 @@ export interface AwaitInputs {
  *                                   started, no re-query) OR (condition=
  *                                   'complete' AND reQueryHit), else `deleted`
  *       (rationale: an epic "popping off the board" because it transitioned
- *       to `status=='done'` (the terminal planctl status — there is no
+ *       to `status=='done'` (the terminal keeper plan status — there is no
  *       `closed`) is the spec's positive completion signal; the command's
  *       scope-exempt re-query disambiguates that from a real deletion.)
  *

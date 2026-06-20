@@ -80,7 +80,7 @@ import type { Epic, GitStatus, Job } from "../src/types";
 // Help text
 // ---------------------------------------------------------------------------
 
-export const HELP = `keeper await — block until a planctl/git/job condition holds
+export const HELP = `keeper await — block until a plan/git/job condition holds
 
 Usage:
   keeper await <condition> [<id>] [and <condition> [<id>]]... [flags]

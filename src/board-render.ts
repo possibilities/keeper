@@ -298,7 +298,7 @@ export function armedPill(isArmed: boolean): string {
  * Part 4:
  *   - **runtime_status (B10, T1 + de-ambiguate)** — omit `todo` (default);
  *     render `in_progress` / `done` verbatim; relabel `blocked` →
- *     `[rt:blocked]` so the manual planctl block flag never collides with
+ *     `[rt:blocked]` so the manual keeper plan block flag never collides with
  *     the verdict `[blocked:*]` family.
  *   - **worker_phase (B11, T1 + de-ambiguate)** — never render `[open]`;
  *     render the survivor as the LABELED `[worker-done]` (never bare

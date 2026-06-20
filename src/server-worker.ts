@@ -180,7 +180,7 @@ export interface RetryDispatchRequestMessage {
   id: string;
   /** The dispatch verb half of the failed `${verb}::${id}` key. */
   verb: "work" | "close";
-  /** The planctl id (epic id for `close`; task id for `work`). Handler-validated
+  /** The keeper plan id (epic id for `close`; task id for `work`). Handler-validated
    *  non-empty; main treats it as an opaque token. */
   dispatch_id: string;
 }

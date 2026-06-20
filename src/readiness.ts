@@ -23,7 +23,7 @@
  *   9.5. epic-no-tasks            — close-row only: the epic has ZERO tasks
  *  10.   dep-on-task-synth-close  — close-row: any non-completed task
  *  10.5. dispatch-pending         — launched-but-unbound worker holds the slot
- *  10.6. runtime-blocked          — task: planctl `runtime_status==="blocked"`
+ *  10.6. runtime-blocked          — task: keeper plan `runtime_status==="blocked"`
  *                                   (last per-row predicate; converts only the
  *                                   erroneous `ready`, never holds a mutex)
  *  11.   single-task-per-epic     — post-pass: one non-completed slot per epic
@@ -125,7 +125,7 @@ export function resolveEpicDep(
  *                                        it occupies both mutexes via `isLiveWorkOccupant`.
  *                                        Non-dispatchable and self-resolving (discharges on SessionStart
  *                                        bind / DispatchFailed / DispatchExpired). Payload-less.
- * - `runtime-blocked`                  — planctl stamped the task `runtime_status="blocked"` (e.g. a
+ * - `runtime-blocked`                  — keeper plan stamped the task `runtime_status="blocked"` (e.g. a
  *                                        killed worker). Without this gate the task still computes `ready`
  *                                        (its `worker_phase` stays `open`) and the reconciler dispatches a
  *                                        worker that can't progress. The LAST per-row predicate, after
@@ -507,7 +507,7 @@ function evaluateTask(
   }
 
   // 1. terminal-completed. `worker_phase === "done"` is the administrative
-  // signal (planctl stamped `worker_done_at`), which can race ahead of the
+  // signal (keeper plan stamped `worker_done_at`), which can race ahead of the
   // Claude session's Stop/SessionEnd. The three liveness clauses below hold
   // the verdict at `running:*` (predicate 5/6/6.6) until the session is
   // genuinely idle, so `isLiveWorkOccupant` / `isRootOccupant` don't release
@@ -692,7 +692,7 @@ function evaluateTask(
     return { tag: "blocked", reason: { kind: "dispatch-pending" } };
   }
 
-  // 10.6. runtime-blocked — planctl stamped `runtime_status="blocked"` (e.g. a
+  // 10.6. runtime-blocked — keeper plan stamped `runtime_status="blocked"` (e.g. a
   // killed worker). Placed LAST, immediately before the `ready` fall-through, is
   // load-bearing: terminal-completed (1), every running verdict (3/5/6/6.6), and
   // dispatch-pending (10.5) still WIN above, so a `worker_phase="done"` task
@@ -758,7 +758,7 @@ function evaluateCloseRow(
   }
 
   // 1. terminal-completed (close-row variant). `epic.status==="done"` is the
-  // administrative signal (planctl stamped the epic done), which can race ahead
+  // administrative signal (keeper plan stamped the epic done), which can race ahead
   // of the closer agent and its sub-agents winding down. The three close-scope
   // liveness clauses hold the verdict off `completed` until the closer is
   // genuinely idle — a done-but-live close row falls through to predicate

@@ -117,7 +117,7 @@ export const FA_CLASSIC: IconTheme = {
     creator: FA.plusCircle,
     refiner: FA.magic,
 
-    // --- RuntimeStatus (planctl manual) ---
+    // --- RuntimeStatus (keeper plan manual) ---
     todo: FA.circleO,
     in_progress: FA.dotCircleO,
     done: FA.checkCircle,

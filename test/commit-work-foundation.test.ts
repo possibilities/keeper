@@ -7,7 +7,7 @@
  *     CLAUDE_CODE_SESSION_ID → null);
  *   - the `get_session_dirty_files` attribution reader against a temp git repo
  *     + sandboxed KEEPER_DB (parity output, per-repo fail-open, cwd_repo
- *     resolution, `.planctl/` client-side exclusion);
+ *     resolution, `.keeper/` board-dir client-side exclusion);
  *   - the `flock(2)` FFI primitive (acquire/release; a second concurrent
  *     non-blocking acquire blocks; constants are the on-the-wire values);
  *   - the write-capable git-exec helper draining both streams concurrently.
@@ -228,12 +228,13 @@ describe("getSessionDirtyFiles", () => {
 });
 
 describe("discoverSessionFiles", () => {
-  test("selects the cwd repo and drops .planctl/ paths client-side", () => {
+  test("selects the cwd repo and drops board-dir paths client-side", () => {
     const repo = "/repo/d";
     for (const f of [
       "src/a.ts",
+      ".keeper/epics/fn-1.json",
+      ".keeper/specs/fn-1.md",
       ".planctl/epics/fn-1.json",
-      ".planctl/specs/fn-1.md",
       "src/b.ts",
     ]) {
       seedAttribution({ projectDir: repo, sessionId: "s1", filePath: f });
@@ -244,14 +245,16 @@ describe("discoverSessionFiles", () => {
       liveDirtyPaths: () =>
         new Set([
           "src/a.ts",
+          ".keeper/epics/fn-1.json",
+          ".keeper/specs/fn-1.md",
           ".planctl/epics/fn-1.json",
-          ".planctl/specs/fn-1.md",
           "src/b.ts",
         ]),
       gitRoot: () => repo,
     });
 
-    // .planctl/ paths excluded; remaining sorted (parity output order).
+    // .keeper/ (live board) and .planctl/ (vendored/legacy) paths excluded;
+    // remaining sorted (parity output order).
     expect(files).toEqual(["src/a.ts", "src/b.ts"]);
   });
 

@@ -28,7 +28,7 @@
  *   - `format_output(...)` → `json_dumps` — pretty `indent=2`,
  *     `ensure_ascii=False`, trailing `\n`. Used for `--preview-files` and the
  *     no-files `committed:false` envelope. {@link printPretty}.
- * Line-oriented consumers (planctl, the worker dispatch) depend on the compact
+ * Line-oriented consumers (keeper plan, the worker dispatch) depend on the compact
  * two-line form — these serializers reproduce Python's exact bytes.
  */
 
@@ -43,8 +43,8 @@ import { resolveSessionId } from "../src/commit-work/session-id";
 const HELP = `keeper commit-work [MSG] [options]
 
 Stage session-touched work files, run the lint matrix, commit, and push.
-Always run \`--preview-files\` first to inspect the file list. .planctl/**
-files are excluded (they commit via the planctl-commit hook). Untracked
+Always run \`--preview-files\` first to inspect the file list. .keeper/**
+board files are excluded (they commit via the plan-commit hook). Untracked
 gitignored files are filtered before staging; a runaway file list
 (> --max-files, default 500) aborts with a file_list_too_large envelope.
 
