@@ -199,13 +199,9 @@ function buildToc(
 ): string {
   const epicId = (epicDef.id as string | undefined) ?? "";
   const title = (epicDef.title as string | undefined) ?? "";
-  const branch = epicDef.branch_name as string | undefined;
   const epicDeps = (epicDef.depends_on_epics as string[] | undefined) ?? [];
 
   const lines: string[] = [`# ${title} — \`${epicId}\``, ""];
-  if (branch) {
-    lines.push(`- **Branch:** \`${branch}\``);
-  }
   if (epicDeps.length > 0) {
     lines.push(
       `- **Epic deps:** ${epicDeps.map((d) => `\`${d}\``).join(", ")}`,

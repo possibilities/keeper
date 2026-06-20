@@ -11,6 +11,7 @@
 
 import { beforeEach, describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
+import { join } from "node:path";
 
 import { pathShim, runCli, seedState, withTmpdir } from "./harness.ts";
 
@@ -112,6 +113,22 @@ describe("gist", () => {
     expect(readFileSync(shim.argvPath, "utf-8").split("\n")).toContain(
       "--public",
     );
+  });
+
+  test("the rendered TOC carries no Branch line", () => {
+    const captureDir = join(root, "captured");
+    const shim = pathShim(root, "gh", {
+      stdout: "https://gist.github.com/abc123",
+      captureDir,
+    });
+    const epicId = seed(1);
+    const r = runCli(["gist", epicId, "--no-open"], {
+      cwd: root,
+      env: shim.env,
+    });
+    expect(r.code).toBe(0);
+    const toc = readFileSync(join(captureDir, "00-TOC.md"), "utf-8");
+    expect(toc).not.toContain("**Branch:**");
   });
 
   test("a non-zero gh exit surfaces an error envelope, not a URL", () => {

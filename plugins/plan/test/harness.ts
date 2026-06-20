@@ -606,15 +606,28 @@ export interface PathShim {
 export function pathShim(
   root: string,
   name: string,
-  opts: { stdout?: string; exitCode?: number } = {},
+  opts: { stdout?: string; exitCode?: number; captureDir?: string } = {},
 ): PathShim {
-  const { stdout = "", exitCode = 0 } = opts;
+  const { stdout = "", exitCode = 0, captureDir } = opts;
   const binDir = join(root, `shim-${name}`);
   mkdirSync(binDir, { recursive: true });
+  if (captureDir) {
+    mkdirSync(captureDir, { recursive: true });
+  }
   const argvPath = join(binDir, `${name}-argv`);
+  const capture = captureDir
+    ? `import { copyFileSync } from "node:fs";\n` +
+      `import { basename } from "node:path";\n` +
+      `for (const a of process.argv.slice(2)) {\n` +
+      `  if (a.endsWith(".md")) {\n` +
+      `    try { copyFileSync(a, ${JSON.stringify(captureDir)} + "/" + basename(a)); } catch {}\n` +
+      `  }\n` +
+      `}\n`
+    : "";
   const script =
     "#!/usr/bin/env bun\n" +
     `import { writeFileSync } from "node:fs";\n` +
+    capture +
     `writeFileSync(${JSON.stringify(argvPath)}, process.argv.slice(2).join("\\n") + "\\n");\n` +
     `if (${exitCode} !== 0) {\n` +
     `  process.stderr.write("fake ${name}: simulated failure\\n");\n` +
