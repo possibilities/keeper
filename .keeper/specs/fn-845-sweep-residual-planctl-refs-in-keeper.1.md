@@ -23,5 +23,5 @@ reader, vendored .planctl prune globs, and historical chore(planctl): attributio
 - [ ] commit-work excludes `.keeper/`; stale comments swept; intentional residue intact; test:full green
 
 ## Done summary
-
+Fixed PLANCTL_EXCLUDE_PREFIXES to exclude the live .keeper/ board dir; swept stale planctl/.planctl doc-comments + CLI help to keeper plan / .keeper across attribution, readiness, await-conditions, and CLI surfaces. Intentional residue (planctl_invocation reader, schema/trailer/envelope identifiers, vendored .planctl prune, .planctl-keyed git-worker watch code) left intact. test:full green.
 ## Evidence

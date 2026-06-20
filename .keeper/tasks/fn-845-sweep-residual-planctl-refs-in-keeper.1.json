@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "fix commit-work keeper exclude and sweep stale planctl comments",
-  "updated_at": "2026-06-20T13:13:57.029000Z"
+  "updated_at": "2026-06-20T13:49:35.935000Z",
+  "worker_done_at": "2026-06-20T13:49:35.935000Z"
 }
