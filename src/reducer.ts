@@ -4900,7 +4900,7 @@ function syncJobIntoEpic(
  *   (2) every linked epic's `epics.job_links` entries via
  *       {@link syncJobLinksOnJobWrite} — gated on `epic_links != '[]'`,
  *       INDEPENDENT of `plan_ref` (a manual session can still carry a
- *       creator/refiner edge from `planctl epic-create`).
+ *       creator/refiner edge from `keeper plan epic-create`).
  *
  * The SELECT lives here (not at each call site) so both fan-outs read the
  * LATEST state-machine state in lockstep. The caller MUST gate on "an
@@ -4979,7 +4979,7 @@ function syncIfPlanRef(
   }
   // Always call: `syncJobLinksOnJobWrite` short-circuits on `'[]'` itself, and
   // gating on `plan_ref != null` would miss creator/refiner sessions whose
-  // spawn name didn't parse as a planctl verb (e.g. a manual `planctl
+  // spawn name didn't parse as a plan verb (e.g. a manual `keeper plan
   // epic-create`).
   syncJobLinksOnJobWrite(db, jobId, eventId, ts);
   if (_syncIfPlanRefAccumMs != null) {

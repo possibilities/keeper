@@ -665,7 +665,7 @@ function cwdInsideRoot(cwd: string, root: string): boolean {
  * No row for the root → MET (clean): a repo absent from the
  * membership-gated `git_status` projection has no dirty/orphan facts, which
  * is exactly the "nothing to commit" steady state — keeper only mints a
- * `git_status` row for a worktree that is `.planctl`-backed, dirty, or
+ * `git_status` row for a worktree that is `.keeper`-backed, dirty, or
  * ahead of upstream, so an absent row means none of those held at snapshot
  * time.
  *

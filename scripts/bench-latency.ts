@@ -32,7 +32,7 @@
  * Caveat on epics: an `epics` row's `updated_at` is the SYNTHETIC event's mint
  * time on main, AFTER the plan-worker's `@parcel/watcher` + `git cat-file`
  * observation gate. So an epics Δ measures mint → surface and EXCLUDES the
- * `.planctl` → mint producer latency. A jobs Δ is the full reality → surface
+ * `.keeper` → mint producer latency. A jobs Δ is the full reality → surface
  * chain. The summary labels this.
  *
  * Usage:
@@ -68,7 +68,7 @@ Options:
 
 Measures Δ = now − updated_at the instant each freshly-changed row surfaces.
 jobs Δ is the full hook→surface chain; epics Δ is mint→surface (excludes the
-.planctl→mint producer latency). Needs the keeperd daemon running.
+.keeper→mint producer latency). Needs the keeperd daemon running.
 `;
 
 const KNOWN_COLLECTIONS = new Set(["jobs", "epics"]);

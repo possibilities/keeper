@@ -1,15 +1,15 @@
 #!/usr/bin/env bun
 /**
- * `keeper plan <verb>` — in-process alias for the planctl CLI. The human-facing
- * alias for `planctl <verb>`; the hot path (autopilot, skills, the ~132 caller
- * files) keeps calling `planctl` directly. This alias exists so `keeper plan
- * status` reads identically to `planctl status` now that the two plugins are
+ * `keeper plan <verb>` — in-process entry point for the plan verb dispatcher.
+ * `keeper plan` is the canonical command (the retired standalone `planctl` CLI is
+ * gone); this entry exists so callers — autopilot, skills, scripts — invoke the
+ * plan tooling through the single `keeper` binary now that the two plugins are
  * co-hosted in one repo.
  *
- * Contract — byte-identical to a direct `planctl <verb>` invocation: the plan
- * verb dispatcher runs IN-PROCESS (no child spawn), so argv flows through
- * verbatim (the dispatcher already stripped the `plan` token via `argv.slice(1)`,
- * so we forward exactly what planctl should see), stdin/stdout/stderr are the
+ * Contract — the plan verb dispatcher runs IN-PROCESS (no child spawn), so argv
+ * flows through verbatim (the dispatcher already stripped the `plan` token via
+ * `argv.slice(1)`, so we forward exactly what the dispatcher should see),
+ * stdin/stdout/stderr are the
  * inherited process streams (streaming + TTY + piped stdin intact, the
  * `plan_invocation` trailer survives byte-intact), and the verb owns its exit
  * code — self-emitting verbs call `process.exit` themselves; the rest return a

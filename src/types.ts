@@ -3,7 +3,7 @@
 /**
  * One entry in {@link Job.epic_links} — a per-job cross-reference to an epic
  * the job's planctl footprint touched inside a `/plan:plan` window. `kind`:
- * `"creator"` for a `planctl epic-create` mutation; `"refiner"` for every
+ * `"creator"` for a `keeper plan epic-create` mutation; `"refiner"` for every
  * other epic-touching mutation inside a window.
  *
  * Footprint source: the deduped union of the `planctl_op` stdout-scrape rows
@@ -788,7 +788,7 @@ export interface ResolvedEpicDep {
  * One row of the volatile git read projection. Rows are produced by synthetic
  * `GitSnapshot` events the git worker emits after polling a worktree with
  * porcelain-v2 status, and retracted by `GitRootDropped` tombstone events when
- * a worktree stops satisfying the watch gate (no `.planctl/` AND clean-and-
+ * a worktree stops satisfying the watch gate (no `.keeper/` AND clean-and-
  * pushed past the cooling dwell). The reducer folds only the persisted payload
  * and never re-reads filesystem state, so a from-scratch re-fold reproduces
  * the same frames — including the retraction.

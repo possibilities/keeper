@@ -222,7 +222,7 @@ export const EPICS_DESCRIPTOR: CollectionDescriptor = {
 
 /**
  * The `git` descriptor — one row per watched git worktree (membership gate:
- * `.planctl present || dirty || ahead of upstream > 0`, recomputed each
+ * `.keeper present || dirty || ahead of upstream > 0`, recomputed each
  * reconcile). A current-status snapshot plus derived per-live-job dirty/orphan
  * buckets, produced by synthetic `GitSnapshot` events.
  */
