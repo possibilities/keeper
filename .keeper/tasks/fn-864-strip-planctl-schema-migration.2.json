@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T21:31:38.397000Z",
+  "depends_on": [
+    "fn-864-strip-planctl-schema-migration.1"
+  ],
+  "epic": "fn-864-strip-planctl-schema-migration",
+  "id": "fn-864-strip-planctl-schema-migration.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "Sweep planctl from forensics docs",
+  "updated_at": "2026-06-20T21:31:38.397000Z"
+}
