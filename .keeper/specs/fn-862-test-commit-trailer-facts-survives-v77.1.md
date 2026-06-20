@@ -26,5 +26,5 @@ re-fold over the preserved facts reproduces the same creator/refiner edges.
 - [ ] `bun run test:full` passes (touches db/migration path).
 
 ## Done summary
-
+Added a migration-level test in db.test.ts: seeds commit_trailer_facts rows + backing Commit events in a pre-v77 DB, migrates 76->head, and asserts the facts survive the v77 projection wipe intact and the re-fold reproduces byte-identical creator/refiner edges. Verified it fails when the table is added to the wipe list.
 ## Evidence
