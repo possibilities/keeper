@@ -290,7 +290,10 @@ function findTaskById(
  * match by iteration order; the command's scope-exempt re-query path is
  * what disambiguates a truly absent epic from a renamed one.
  */
-function findEpicByIdOrBare(epics: readonly Epic[], id: string): Epic | null {
+export function findEpicByIdOrBare(
+  epics: readonly Epic[],
+  id: string,
+): Epic | null {
   const bareMatch = /^fn-(\d+)$/.exec(id);
   if (bareMatch !== null) {
     const num = Number.parseInt(bareMatch[1] ?? "", 10);
@@ -309,6 +312,34 @@ function findEpicByIdOrBare(epics: readonly Epic[], id: string): Epic | null {
     }
   }
   return null;
+}
+
+/**
+ * Follow-up epics a closer minted for `closedEpicId` — the epics whose
+ * `created_by_closer_of` exactly equals the closed epic's full id. Returns
+ * their `epic_id`s sorted by `sort_path` asc (zero-padded → numerically
+ * correct), tie-broken on `epic_id`. The caller passes the RESOLVED full id
+ * (a bare `fn-N` await target never matches the full-id link).
+ *
+ * Pure: no I/O, no clock, never throws. Empty/absent input → `[]`. Used on
+ * the terminal `complete` met emit, where a throw would fail-close the
+ * listener — so it stays total over malformed-but-typed input.
+ */
+export function closerChildrenOf(
+  epics: readonly Epic[],
+  closedEpicId: string,
+): string[] {
+  const children = epics.filter((e) => e.created_by_closer_of === closedEpicId);
+  return children
+    .slice()
+    .sort((a, b) => {
+      if (a.sort_path < b.sort_path) return -1;
+      if (a.sort_path > b.sort_path) return 1;
+      if (a.epic_id < b.epic_id) return -1;
+      if (a.epic_id > b.epic_id) return 1;
+      return 0;
+    })
+    .map((e) => e.epic_id);
 }
 
 // ---------------------------------------------------------------------------

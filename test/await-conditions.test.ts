@@ -30,6 +30,7 @@ import {
   type AwaitState,
   agentsIdleState,
   classifyTargetId,
+  closerChildrenOf,
   evaluateAwaitCondition,
   gitCleanState,
   monitorRunningState,
@@ -1250,4 +1251,81 @@ test("monitor-running: ownSessionId null → met (no own row, vacuously done)", 
   expect(monitorRunningState(null, { command: "watch.sh" }, jobs).kind).toBe(
     "met",
   );
+});
+
+// ---------------------------------------------------------------------------
+// closerChildrenOf — closer-minted follow-up epics for a closed epic
+// ---------------------------------------------------------------------------
+
+test("closerChildrenOf: returns matching children sorted by sort_path", () => {
+  const epics = [
+    makeEpic({
+      epic_id: "fn-9-child-b",
+      epic_number: 9,
+      created_by_closer_of: "fn-1-parent",
+      sort_path: "000001.000009",
+    }),
+    makeEpic({
+      epic_id: "fn-7-child-a",
+      epic_number: 7,
+      created_by_closer_of: "fn-1-parent",
+      sort_path: "000001.000007",
+    }),
+  ];
+  // sort_path order (000001.000007 < 000001.000009), not iteration order.
+  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual([
+    "fn-7-child-a",
+    "fn-9-child-b",
+  ]);
+});
+
+test("closerChildrenOf: ignores non-matching and null created_by_closer_of", () => {
+  const epics = [
+    makeEpic({ epic_id: "fn-1-plain", created_by_closer_of: null }),
+    makeEpic({
+      epic_id: "fn-2-other-parent",
+      epic_number: 2,
+      created_by_closer_of: "fn-99-someone-else",
+      sort_path: "000099.000002",
+    }),
+    makeEpic({
+      epic_id: "fn-3-match",
+      epic_number: 3,
+      created_by_closer_of: "fn-1-parent",
+      sort_path: "000001.000003",
+    }),
+  ];
+  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual(["fn-3-match"]);
+});
+
+test("closerChildrenOf: empty input → []", () => {
+  expect(closerChildrenOf([], "fn-1-parent")).toEqual([]);
+});
+
+test("closerChildrenOf: no match → []", () => {
+  const epics = [makeEpic({ epic_id: "fn-1-plain" })];
+  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual([]);
+});
+
+test("closerChildrenOf: sort_path-placeholder children sort stably on epic_id", () => {
+  // Two children whose parent hasn't re-stamped the cascade yet both carry
+  // the empty-string placeholder sort_path — the epic_id tie-break orders them.
+  const epics = [
+    makeEpic({
+      epic_id: "fn-12-late",
+      epic_number: 12,
+      created_by_closer_of: "fn-1-parent",
+      sort_path: "",
+    }),
+    makeEpic({
+      epic_id: "fn-11-early",
+      epic_number: 11,
+      created_by_closer_of: "fn-1-parent",
+      sort_path: "",
+    }),
+  ];
+  expect(closerChildrenOf(epics, "fn-1-parent")).toEqual([
+    "fn-11-early",
+    "fn-12-late",
+  ]);
 });

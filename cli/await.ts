@@ -57,7 +57,9 @@ import {
   type AwaitTarget,
   agentsIdleState,
   classifyTargetId,
+  closerChildrenOf,
   evaluateAwaitCondition,
+  findEpicByIdOrBare,
   gitCleanState,
   type MonitorSelector,
   monitorRunningState,
@@ -109,6 +111,9 @@ Flags:
   --sock <path>          Socket override ($KEEPER_SOCK / default)
   --help                 Show this help
 
+A 'complete <epic>' met may carry followup=<id> (comma-joined; --json array)
+naming any follow-up epic the closer minted; omitted when there is none.
+
 Exit codes:
   0 met
   1 not-found / no-match / no-git-root / usage / connect / unreachable
@@ -153,18 +158,21 @@ export interface EmitDeps {
 function eventLine(
   json: boolean,
   event: string,
-  fields: Record<string, string>,
+  fields: Record<string, string | string[]>,
 ): string {
   if (json) {
-    const sanitized: Record<string, string> = { event };
+    const sanitized: Record<string, string | string[]> = { event };
     for (const [k, v] of Object.entries(fields)) {
-      sanitized[k] = sanitizeValue(v);
+      sanitized[k] = Array.isArray(v) ? v.map(sanitizeValue) : sanitizeValue(v);
     }
     return `${JSON.stringify(sanitized)}\n`;
   }
   const parts: string[] = [`[keeper-await] ${event}`];
   for (const [k, v] of Object.entries(fields)) {
-    parts.push(`${k}=${sanitizeValue(v)}`);
+    const rendered = Array.isArray(v)
+      ? v.map(sanitizeValue).join(",")
+      : sanitizeValue(v);
+    parts.push(`${k}=${rendered}`);
   }
   return `${parts.join(" ")}\n`;
 }
@@ -623,6 +631,14 @@ interface PlanctlSlotState {
   presentThisConnection: boolean;
   /** Seen present at least once across the run (drives priorPresence). */
   everSeen: boolean;
+  /**
+   * The epic's RESOLVED full id, stamped while it is on-board (a bare `fn-N`
+   * target resolves to its `fn-N-slug`). Used at the `complete` met emit to
+   * scan for closer-minted follow-up children, since `created_by_closer_of`
+   * stores the full `plan_ref` but the awaited epic has dropped off the
+   * board by the met tick. `null` until first seen.
+   */
+  resolvedEpicId: string | null;
   /** Verdict-change throttle for stderr progress. */
   lastVerdictPhrase: string | null;
 }
@@ -755,6 +771,7 @@ export async function runAwait(
         lastEval: null,
         presentThisConnection: false,
         everSeen: false,
+        resolvedEpicId: null,
         lastVerdictPhrase: null,
       };
     }
@@ -862,7 +879,7 @@ export async function runAwait(
   const emitTerminal = (
     event: "met" | "failed",
     code: number,
-    fields: Record<string, string>,
+    fields: Record<string, string | string[]>,
   ): void => {
     if (state.terminating) {
       return;
@@ -937,13 +954,28 @@ export async function runAwait(
   // slot the field shape is byte-identical to pre-fn-713).
   const emitAggregateMet = (): void => {
     if (single && slots[0]?.kind === "planctl") {
-      const t = slots[0].target;
-      emitTerminal("met", 0, {
+      const slot = slots[0];
+      const t = slot.target;
+      const fields: Record<string, string | string[]> = {
         target: t.id,
         kind: t.kind,
         condition: t.condition,
-        detail: slots[0].lastEval?.detail ?? "",
-      });
+        detail: slot.lastEval?.detail ?? "",
+      };
+      // Only the single `complete <epic>` met surfaces closer-minted follow-up
+      // children (this branch also serves `unblocked`/`started`). Omit the
+      // field entirely when none, keeping the no-child line byte-identical.
+      if (t.condition === "complete") {
+        const scanKey = slot.resolvedEpicId ?? t.id;
+        const children = closerChildrenOf(
+          latestReadiness?.epics ?? [],
+          scanKey,
+        );
+        if (children.length > 0) {
+          fields.followup = children;
+        }
+      }
+      emitTerminal("met", 0, fields);
       return;
     }
     if (single && slots[0]?.kind === "monitor-running") {
@@ -1184,6 +1216,15 @@ export async function runAwait(
     if (presentNow) {
       slot.presentThisConnection = true;
       slot.everSeen = true;
+      // Capture the resolved full epic_id while the epic is still on-board:
+      // the `complete` met scans `created_by_closer_of` (a full `plan_ref`)
+      // after the awaited epic has dropped, and the target may be bare `fn-N`.
+      if (slot.target.kind === "epic") {
+        const resolved = findEpicByIdOrBare(inputs.epics, slot.target.id);
+        if (resolved !== null) {
+          slot.resolvedEpicId = resolved.epic_id;
+        }
+      }
     }
 
     // Reconnect-blip gate: a post-reconnect baseline absence that would

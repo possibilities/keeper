@@ -1089,7 +1089,11 @@ event-log/reducer/hook touch. Run any of them with
   Monitor-shaped event
   stream on stdout — exactly one `[keeper-await] armed …` line after the
   on-board check, then exactly one terminal `[keeper-await] met …` or
-  `[keeper-await] failed …` line — and exits when its condition holds.
+  `[keeper-await] failed …` line — and exits when its condition holds. A
+  single `complete <epic>` met additionally carries `followup=<id>`
+  (comma-joined; a `--json` array) when the closer that finished the epic
+  minted follow-up epic(s) for it (read off the `created_by_closer_of`
+  projection), omitted entirely when there is none.
   Seven conditions: `complete <id>` (epic/task pops off the board),
   `started <id>` (work has begun at least once — a monotonic milestone
   keyed on job-presence OR `runtime_status` in {in_progress, done} OR
