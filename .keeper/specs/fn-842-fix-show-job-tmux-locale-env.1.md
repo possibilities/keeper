@@ -21,5 +21,5 @@ string | undefined>)` to the spawnSync options to match.
 - [ ] No behavior change in an interactive shell with an inherited locale.
 
 ## Done summary
-
+Wrapped the tmuxWindowPaneIds list-panes spawn in cli/show-job.ts with localeDefaultedEnv so the window-scope auto-detect rung survives a locale-stripped (C locale) environment, matching the other buildTmuxListPanesArgs() call sites.
 ## Evidence

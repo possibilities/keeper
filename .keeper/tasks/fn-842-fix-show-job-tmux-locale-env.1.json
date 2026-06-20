@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Pass localeDefaultedEnv to tmux sweep",
-  "updated_at": "2026-06-20T11:25:40.241000Z"
+  "updated_at": "2026-06-20T12:19:13.848000Z",
+  "worker_done_at": "2026-06-20T12:19:13.848000Z"
 }
