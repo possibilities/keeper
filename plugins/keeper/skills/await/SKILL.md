@@ -2,7 +2,7 @@
 name: await
 description: >-
   Block until a condition holds, then run a follow-up action. Conditions: a
-  planctl board state (epic/task complete or unblocked), git cleanliness of
+  keeper plan board state (epic/task complete or unblocked), git cleanliness of
   the current repo, other agents finishing, an own-session background task
   (dev server / build / script) completing, daemon readiness, or any
   AND-combination. Use for any wait-then-act intent — e.g. "review when
@@ -16,7 +16,7 @@ allowed-tools: Monitor Bash
 
 Turn a "wait until <thing> happens, then do <follow-up>" request into a
 `Monitor(keeper await …)` invocation plus the follow-up action. The
-condition can be a planctl board state, the cleanliness of the current
+condition can be a keeper plan board state, the cleanliness of the current
 git repo, other agents going idle, or an AND-combination of these.
 
 ## When this fires
@@ -26,7 +26,7 @@ The user's ask has two shapes glued together:
 1. **A wait condition** — words like *wait*, *block*, *hold off*, *when …
    is done*, *after … finishes*, *once … is ready*, *as soon as …*. The
    condition is one (or more) of:
-   - a **planctl id** state — *"once fn-643-…-hook.4 is complete"*,
+   - a **keeper plan id** state — *"once fn-643-…-hook.4 is complete"*,
      *"as soon as fn-650 is ready"*, *"when work starts on fn-650"*.
    - a **git** state — *"when the project is clean"*, *"once everything's
      committed"*, *"after there are no uncommitted changes"*.
@@ -53,9 +53,9 @@ the literal `and` token.
 
 | Condition | How to derive | `keeper await` form |
 |---|---|---|
-| `complete <id>` | Default for a planctl id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). | `complete fn-…` |
-| `started <id>` | A planctl id where the user asks about work BEGINNING ("once it starts", "as soon as someone picks it up", "when work has begun on it"). Monotonic milestone — fires once work has begun at least once and never un-fires. | `started fn-…` |
-| `unblocked <id>` | A planctl id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
+| `complete <id>` | Default for a keeper plan id. "done" / "finished" / "complete" all map here. `<id>` is `fn-N-slug` (epic) or `fn-N-slug.M` (task). | `complete fn-…` |
+| `started <id>` | A keeper plan id where the user asks about work BEGINNING ("once it starts", "as soon as someone picks it up", "when work has begun on it"). Monotonic milestone — fires once work has begun at least once and never un-fires. | `started fn-…` |
+| `unblocked <id>` | A keeper plan id where the user explicitly asks about readiness ("once it's unblocked", "as soon as it's ready to be worked on", "when the deps clear"). | `unblocked fn-…` |
 | `git-clean` | Any "wait for the repo / project to be clean / committed / have no uncommitted changes" phrasing. **No id.** Project-scoped to the cwd's git root. | `git-clean` |
 | `agents-idle` | Any "wait for the other agents / everyone else to finish / be done / stop editing" phrasing. **No id.** Project-scoped to the cwd's git root; excludes THIS session. | `agents-idle` |
 | `server-up` | Any "wait until keeper / keeperd / the daemon is up / back / serving / reachable" phrasing. **No id.** Fires `met` on the first snapshot. Reconnects FOREVER (permanently give-up-exempt), so it blocks through a daemon bounce — the escape hatch for a slow cold boot. **CANNOT be ANDed** with another condition, and **CANNOT be combined with `--connect-timeout`** (both parse-time usage errors). | `server-up` |
@@ -73,16 +73,16 @@ opens only the subscriptions its conditions need and emits the terminal
 `met` only when ALL conditions hold simultaneously (level-triggered,
 glitch-free).
 
-If the user gives multiple PLANCTL ids and it's ambiguous which to wait
+If the user gives multiple keeper plan ids and it's ambiguous which to wait
 on (e.g. "wait for one of these"), ask. An explicit AND of distinct
 conditions ("wait for fn-X and the repo to be clean") is a single
 invocation, not an ambiguity.
 
-## Step 1 — Pre-check planctl targets are on-board (planctl conditions only)
+## Step 1 — Pre-check plan targets are on-board (planctl conditions only)
 
 This pre-check applies **only to `complete` / `started` / `unblocked`**. The
 `git-clean`, `agents-idle`, `server-up`, and `monitor-running` conditions
-have **no `planctl show` pre-check** — they read live keeper projections (or,
+have **no `keeper plan show` pre-check** — they read live keeper projections (or,
 for `server-up`, just wait for the daemon to serve), so there is nothing to
 refuse upfront here; skip straight to step 2 for them. `server-up` in
 particular deliberately blocks while keeperd is down, so a "is it on board?"
@@ -108,15 +108,15 @@ appear in a `keeper jobs` snapshot first, then wire the await.
 > mode, but the bare command is the right way to observe it.)
 
 For each planctl segment, verify the id exists and is awaitable before
-wiring Monitor. `planctl show` is read-only and fast.
+wiring Monitor. `keeper plan show` is read-only and fast.
 
 ```bash
-planctl show <target> --format json
+keeper plan show <target> --format json
 ```
 
 Refuse to wire Monitor in any of these cases — the event will never fire:
 
-- **Nonexistent** — `planctl show` exits non-zero or returns `success:
+- **Nonexistent** — `keeper plan show` exits non-zero or returns `success:
   false`. Tell the user the id doesn't exist; ask them to double-check.
 - **Already complete** (for `condition=complete`):
   - Task: `task.runtime_status == "done"` (fn-756 — completion is the
@@ -255,7 +255,7 @@ how they want to proceed — do NOT silently run the follow-up.
 > User: "Do a full review when fn-643-keeper-hook-dead-letters.4 is
 > complete."
 
-1. `planctl show fn-643-keeper-hook-dead-letters.4 --format json` →
+1. `keeper plan show fn-643-keeper-hook-dead-letters.4 --format json` →
    task exists, `runtime_status != "done"`. Proceed.
 2. `Monitor({ command: "keeper await complete
    fn-643-keeper-hook-dead-letters.4", description: "wait for fn-643.4
@@ -303,7 +303,7 @@ it WITHOUT `--connect-timeout` so it waits forever.
 
 > User: "Ping me when my dev server stops."
 
-1. No `planctl show` pre-check — `monitor-running` has no off-board state.
+1. No `keeper plan show` pre-check — `monitor-running` has no off-board state.
    Confirm the monitor already shows in a `keeper jobs` snapshot (it must
    have been captured by a prior Stop); if you just launched it THIS turn,
    wait for the next snapshot before arming.
@@ -329,10 +329,10 @@ it WITHOUT `--connect-timeout` so it waits forever.
 
 - Do not pass `keeper await --timeout`. Monitor's `timeout_ms` owns the
   deadline.
-- Do not run the `planctl show` pre-check for `git-clean` / `agents-idle`
+- Do not run the `keeper plan show` pre-check for `git-clean` / `agents-idle`
   — they have no off-board state. The pre-check is for `complete` /
   `unblocked` only.
-- Do not wire a planctl Monitor without the `planctl show` pre-check — a
+- Do not wire a planctl Monitor without the `keeper plan show` pre-check — a
   doomed Monitor that immediately exits `failed reason=not-found` is bad
   UX.
 - Do not pass an id to `git-clean` / `agents-idle` / `server-up` — they're
