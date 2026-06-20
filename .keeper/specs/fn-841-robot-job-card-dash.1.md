@@ -83,5 +83,5 @@ census counts; ESC sanitization; never-throw on a malformed `state`. Assert the
 - [ ] Pure tests cover ladder/bands/sort/toggle/sanitize/never-throw; fast `bun test` green
 
 ## Done summary
-
+Rewrote the dash view-model into a { header, bands } robot job-card model: six-rung status ladder (annotations outrank base state), dash-local md-robot codepoints + rail roles in theme.ts, urgency bands with stable created_at sort, and a showTerminal toggle. Pure/fast-tier; app.ts + dash-app test bridged to the new shape (rich card paint is task .2).
 ## Evidence
