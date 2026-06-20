@@ -13,11 +13,11 @@ events into a minimal `jobs` projection: one row per session, carrying the live
 (seeded from the session's spawn name at SessionStart, refined by the prompt
 payload and the live transcript `custom-title`, with a `title_source` recording
 its provenance and precedence: `spawn` < `payload` < `transcript`), and — for
-sessions spawned by planctl — a `(plan_verb, plan_ref)` pair derived at
+sessions spawned by `keeper plan` — a `(plan_verb, plan_ref)` pair derived at
 SessionStart from the spawn name. The verb is the strict whitelist `{plan,
-work, close}` and the ref is the targeted planctl entity (epic id like
+work, close}` and the ref is the targeted plan entity (epic id like
 `fn-575-foo`, or task id like `fn-575-foo.3`); both stay NULL for sessions not
-spawned through planctl. The pair is fill-once: a resume preserves an
+spawned through `keeper plan`. The pair is fill-once: a resume preserves an
 already-bound pair, but a row that was minted with a NULL pair (an
 out-of-order `UserPromptSubmit` fork-seed landing before the session's
 SessionStart) COALESCE-heals to the spawn name's pair when the SessionStart
@@ -62,7 +62,7 @@ planctl-invocation envelope (`planctl_op`, `planctl_target`,
 `planctl_epic_id`, `planctl_task_id`, `planctl_subject_present`) stamped
 on every `PostToolUse:Bash` row whose `data.tool_response.stdout` parses
 as JSON carrying a top-level `planctl_invocation` key — the authoritative
-envelope planctl writes on every mutating call — and (schema v48 / fn-668)
+envelope `keeper plan` writes on every mutating call — and (schema v48 / fn-668)
 three terminal-multiplexer backend-exec coordinates
 (`events.backend_exec_type`, `events.backend_exec_session_id`,
 `events.backend_exec_pane_id`) captured by the hook on EVERY event as pure
@@ -77,7 +77,7 @@ human-created tmux session carries no `KEEPER_TMUX_SESSION`, so its session name
 lands via the restore-worker's pane-snapshot poller (epic fn-789). The generic `backend_exec_*` naming keeps a further backend slotting in
 without a schema change. Consumers can find
 `/plan:work` calls, `Skill` invocations, every Task-tool subagent
-lifecycle, every session's profile attribution, every planctl-CLI
+lifecycle, every session's profile attribution, every `keeper plan`
 mutation, AND the terminal location each live session lives in cheaply
 without JSON-scanning the event `data` blob. The
 `planctl_*` columns feed the creator/refiner classifier (see
@@ -86,7 +86,7 @@ both classify as creators (scaffold is the canonical epic-create path on
 this codebase). As of epic fn-695 the classifier reads the deduped UNION of
 these stdout-scrape rows AND the durable `Commit`-event trailer facts
 (`Planctl-Op` / `Planctl-Target` / `Session-Id`), so an edge still forms when
-this column lands NULL because the planctl stdout was piped / `grep`'d /
+this column lands NULL because the `keeper plan` stdout was piped / `grep`'d /
 truncated (the fn-635 failure). The `planctl_*` columns remain the SOLE
 driver of the `file_attributions` planctl-source rows (schema v46 / fn-666) —
 the commit channel feeds ONLY the creator/refiner edge. The non-`config_dir` signals are partial-indexed
@@ -106,7 +106,7 @@ with a single third-party runtime dependency: `@parcel/watcher` (a native
 FSEvents-backed file watcher), used by the transcript-title worker and the plan
 worker. It is the one place keeper watches files instead of polling
 `data_version` — because those files (transcript JSONL written by Claude Code,
-`.planctl` JSON written by planctl) are written by *another* process, so there is
+`.keeper` JSON written by `keeper plan`) are written by *another* process, so there is
 no keeper `data_version` to poll for them and the same-process-write blind spot
 that rules watchers out for keeper's own DB does not apply. The daemon detects new
 events in its own DB by polling SQLite's `PRAGMA data_version` on a read-only
@@ -143,7 +143,7 @@ subagent calls — one row per `PreToolUse:Agent` paired with its later
 `running | ok | failed | unknown | superseded` and a populated `duration_ms`
 on close (NULL on rows that never observed a SubagentStop — `superseded`
 peers + lifecycle-swept `unknown` orphans)), `git` (per-watched-worktree
-git status — watch gate is `.planctl present || dirty || ahead of upstream > 0`,
+git status — watch gate is `.keeper present || dirty || ahead of upstream > 0`,
 recomputed each reconcile (epic fn-690); branch, ahead/behind, and a file-centric `dirty_files` list where
 each entry carries a per-file `attributions[]` array with `source` badges
 (`tool` / `bash` / `inferred` / `planctl`) naming every session that mutated the file
@@ -271,15 +271,15 @@ Keeper's read surface is intentionally narrow. Explicit non-goals:
   permitted in the *daemon* (keeperd's transcript worker tails the external
   transcript tree on a watch to supply the priority-3 `transcript` title) but
   stays forbidden in the hook.
-- **No general plan write path through the socket** — keeper *reads* planctl
+- **No general plan write path through the socket** — keeper *reads* plan
   state into the single `epics` projection, each epic embedding its tasks as a
   JSON array, each epic also embedding its plan/close-verb jobs as a JSON
   array, and each task element embedding its own work-verb jobs as a nested
   JSON array (a fourth, read-only producer worker watches the configured
-  roots' `.planctl/{epics,tasks}` trees; jobs fan in from the reducer's own
+  roots' `.keeper/{epics,tasks}` trees; jobs fan in from the reducer's own
   jobs-side writes whenever a SessionStart spawn name parses as
   `{plan|work|close}::<ref>`). The socket carries no plan mutations: every field
-  of every `.planctl` file is read-only end to end, the same fence as `jobs`.
+  of every `.keeper` file is read-only end to end, the same fence as `jobs`.
 - **No multi-session-per-job lineage** — v1 holds `job_id === session_id` (one
   session per job).
 - **No kernel watchers on keeper's own DB** (`fs.watch` / FSEvents / kqueue) —
@@ -332,7 +332,7 @@ Keeper has no `install` verb. Wire it up manually:
    INDEPENDENT keys:
 
    - `roots` — the project roots the plan worker watches for
-     `.planctl/{epics,tasks}` trees, folding them into the single `epics`
+     `.keeper/{epics,tasks}` trees, folding them into the single `epics`
      collection (tasks embedded per epic). Default (no config): the single root `~/code`.
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
@@ -374,8 +374,8 @@ Keeper has no `install` verb. Wire it up manually:
    Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
    events-writer hook + `keeper:await` skill, manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
-   `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (planctl + the
-   `plan:*` skills, vendored as a `git subtree`). agentwrap's
+   `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin
+   behind `keeper plan` + the `plan:*` skills, vendored as a `git subtree`). agentwrap's
    `plugin_scan_dirs` points at `~/code/keeper/plugins`, scans the parent, and
    appends one `--plugin-dir` per manifest-bearing child — so a fresh session
    auto-loads BOTH plugins from this repo. No symlink step. A
@@ -588,7 +588,7 @@ command list plus a `===`-delimited "ready" block); `keeper git`
 watches the `git` worktree collection; `keeper usage` watches the
 `usage` collection; `keeper await` is the blocking
 wait-for-condition client (emits a Monitor-shaped `armed`/`met`/`failed`
-event stream on stdout and exits when its condition holds — a planctl
+event stream on stdout and exits when its condition holds — a plan
 epic/task going `complete` or `unblocked`, the cwd's repo going
 `git-clean`, other agents going `agents-idle`, keeperd coming back up via
 `server-up` (reconnect-forever; the escape hatch for a slow cold boot),
@@ -669,7 +669,7 @@ event-log/reducer/hook touch. Run any of them with
   the default `sort_path ASC` ordering)
   (with omit-default `[<runtime>]? [worker-done]?
   [ready|completed|blocked:<reason>]` pills — the two native fields
-  consolidated per fn-708: the planctl runtime enum elides its `todo`
+  consolidated per fn-708: the plan runtime enum elides its `todo`
   default, renders `in_progress` / `done` verbatim, and relabels
   `blocked` → `[rt:blocked]` so it never collides with the verdict
   `[blocked:*]` family; the derived worker-phase binary never renders
@@ -686,8 +686,8 @@ event-log/reducer/hook touch. Run any of them with
   non-resting `running|failed|unknown|superseded` states render (no
   hiding — `superseded` is promoted natively by the projection so the
   full audit trail of re-entrant attempts is visible). The `[validated]`
-  pill reflects planctl's `last_validated_at` timestamp on the epic file
-  (flipped by `planctl validate --epic <id>`); its absence encodes
+  pill reflects the plan's `last_validated_at` timestamp on the epic file
+  (flipped by `keeper plan validate --epic <id>`); its absence encodes
   `unvalidated`. The `[ready] / [completed] /
   [blocked:<reason>]` pill is a pure-function readiness verdict computed
   from the three-collection snapshot (see `src/readiness.ts`); a
@@ -700,7 +700,7 @@ event-log/reducer/hook touch. Run any of them with
   <id>` (red / error — the upstream id failed to resolve at all,
   meaning either a full-id miss, a bare `fn-N` miss, or an ambiguous
   bare-id with no same-project disambiguator). The dangling case
-  surfaces planctl's fn-600 cross-project bare-id dep contract: a
+  surfaces the plan's fn-600 cross-project bare-id dep contract: a
   stored `fn-100` on `epic.depends_on_epics` resolves cwd-then-global
   against the in-snapshot epics index built inside `computeReadiness`,
   and an unresolvable id is a structural problem (typo, deleted
@@ -942,16 +942,16 @@ event-log/reducer/hook touch. Run any of them with
 
 - `git.ts` — single-collection subscribe client over the `git`
   collection (watched-worktree status — membership gate
-  `.planctl present || dirty || ahead of upstream > 0`, recomputed each
+  `.keeper present || dirty || ahead of upstream > 0`, recomputed each
   reconcile (epic fn-690): branch, ahead/behind,
   and a file-centric layout — one line per dirty file followed by its
   per-session `attributions[]`, each rendered with a colored source
   badge (`tool` = direct Edit/Write/MultiEdit, `bash` = derived from a
   Bash mutation event, `inferred` = time-bracketed against the
-  session's Bash intervals, `planctl` = lifted from a planctl-CLI
-  invocation envelope's `files[]` — so `.planctl/{epics,tasks}/*.json`
-  and `.planctl/specs/*.md` attribute to the session that ran
-  `planctl scaffold/done/...`); a single file can carry multiple
+  session's Bash intervals, `planctl` = lifted from a `keeper plan`
+  invocation envelope's `files[]` — so `.keeper/{epics,tasks}/*.json`
+  and `.keeper/specs/*.md` attribute to the session that ran
+  `keeper plan scaffold/done/...`); a single file can carry multiple
   attribution rows when several live sessions edited it without an
   intervening commit, and the strict `orphan_files` bucket is rendered
   as a separate trailing block for dirty files with zero attribution). Uses `subscribeCollection` from `src/readiness-client.ts`
@@ -1080,7 +1080,7 @@ event-log/reducer/hook touch. Run any of them with
   keyed on job-presence OR `runtime_status` in {in_progress, done} OR
   `worker_phase=done`, NOT the flapping liveness `running` verdict; a
   popped-off target reads `met` since it was necessarily started), and
-  `unblocked <id>` (workable now) are planctl-id forms auto-detecting
+  `unblocked <id>` (workable now) are plan-id forms auto-detecting
   epic vs task by the `.N` suffix; `git-clean` blocks until the cwd's git
   root has `dirty_count=0 AND orphaned_count=0` (no `git_status` row for
   the root counts as clean); `agents-idle` blocks until no OTHER session
@@ -1088,7 +1088,7 @@ event-log/reducer/hook touch. Run any of them with
   inside the cwd's git root; `server-up` blocks until keeperd is reachable
   and serving, firing `met` on the first snapshot — it reconnects FOREVER
   (permanently give-up-exempt) so it survives a daemon bounce, takes
-  no id, has no planctl pre-check, CANNOT be ANDed with another
+  no id, has no plan pre-check, CANNOT be ANDed with another
   condition (rejected at parse time), and CANNOT be combined with
   `--connect-timeout`; `monitor-running <selector>` blocks
   until the matching background monitor in the CALLER'S OWN session
@@ -1354,7 +1354,7 @@ transcripts, while the fn-720 rescued accounting is byte-identical.
 
 A **fourth** Worker thread is the plan producer: it watches each configured
 project root (from `~/.config/keeper/config.yaml`, default `~/code`) for
-`.planctl/{epics,tasks}/*.json` files with `@parcel/watcher`, safe-parses each
+`.keeper/{epics,tasks}/*.json` files with `@parcel/watcher`, safe-parses each
 changed file, and posts a `plan-epic`/`plan-task` snapshot message to main (and a
 `plan-epic-deleted`/`plan-task-deleted` tombstone when a file vanishes). Main
 — again the sole writer — turns each into a synthetic
@@ -1368,7 +1368,7 @@ the autopilot-dispatch-against-uncommitted-epic window (the fn-627
 duplicate-incident shape). `PlanScanner` takes an `isTracked(path) =>
 boolean` predicate fed by the live worker as `isPathInHead` — a
 `git cat-file -e HEAD:<relpath>` shell-out scoped to the resolved
-planctl repo root, bounded by a 1s timeout and fail-closed (any git
+plan repo root, bounded by a 1s timeout and fail-closed (any git
 failure reads as not-in-HEAD). When the predicate returns false, the
 path lands in a per-scanner `pending` set and NO `EpicSnapshot` /
 `TaskSnapshot` is emitted — so the reducer never folds an uncommitted
@@ -1398,26 +1398,26 @@ the plan producer is realtime end to end, mirroring the eighth-worker
 connection (`PLAN_DB_POLL_MS`, 100ms — the cadence the sibling producers
 share) so every keeper DB write, the close fold included, drives a
 single-flight gated rescan that drains `pending` + re-ingests changed
-`.planctl` files in ~50ms — the realtime complement to the best-effort
+`.keeper` files in ~50ms — the realtime complement to the best-effort
 FSEvents subscription, closing the up-to-60s fold lag the heartbeat used to
-impose. It ALSO watches each planctl repo's `.git/logs/HEAD` reflog with
+impose. It ALSO watches each plan repo's `.git/logs/HEAD` reflog with
 `@parcel/watcher` (a commit always appends there) to close the
 no-DB-write commit tail, where the in-HEAD transition fires no DB
 write and no `recheck-pending` post — the broad recursive watch IGNORES
 `.git` (`IGNORE_GLOBS`), so the per-repo reflog watch is the only FSEvents
 commit signal. As of fn-737 the worker reconciles those external reflog
 watches against the UNION of its live `pending` repo set AND every repo that
-holds a `.planctl` tree under the configured roots (`discoverPlanctlDirs`),
+holds a `.keeper` tree under the configured roots (`discoverPlanctlDirs`),
 not just the pending ones — fn-705 armed a watch only while a repo held a
-pending path, so a commit in a planctl repo with NO pending path (a
-steady-state `.planctl` change whose file-write FSEvent was a no-op or
+pending path, so a commit in a plan repo with NO pending path (a
+steady-state `.keeper` change whose file-write FSEvent was a no-op or
 coalesced) had no realtime signal and fell to the git-worker's 60s heartbeat
 (task fn-737 measured that as the dominant fold-latency tail). The widening is
-bounded — the watch count is the number of planctl-tracked repos under the
+bounded — the watch count is the number of plan-tracked repos under the
 roots, and since the broad watch ignores `.git` these per-repo `.git/logs`
 watches don't overlap it (no fseventsd bad-state). On the reflog append the
 worker runs the repo-SCOPED gated `recheckPending(root)` PLUS a change-gated
-`scanPlanctlDir` re-scan of that repo's `.planctl` dir (the latter recovers a
+`scanPlanctlDir` re-scan of that repo's `.keeper` dir (the latter recovers a
 committed change that was never gated into `pending`); neither writes the DB.
 The two remaining drain
 triggers are main's `recheck-pending` post on every `GitSnapshot` / `Commit`
@@ -1439,16 +1439,16 @@ per-key so `server.stderr` can't flood — the NDJSON record + counters are
 NEVER rate-limited, so the metric stays complete. It is observability-only:
 zero behavior change, no synthetic events, no schema/keeper-py bump, no
 reducer change. The poll is a TRIGGER only — it never writes the DB
-nor drives a synthetic event from anything but a parsed `.planctl` file, so
+nor drives a synthetic event from anything but a parsed `.keeper` file, so
 re-fold determinism is intact. Every drain trigger re-runs the in-HEAD probe
 and a still-uncommitted path stays in `pending` (no fn-627 regression — the
 fn-629 gate is preserved exactly, only the realtime drain triggers are new).
 A freshly-committed path emits its snapshot and leaves the set, with no
-permanent strand. The gate trusts planctl's commit-at-the-seam contract: every
+permanent strand. The gate trusts the plan's commit-at-the-seam contract: every
 mutating verb's `output.emit()` owns the write→commit transaction inline, so
 the file is in HEAD by the time the envelope `success: true` lands on stdout. As of schema v14, the `epics` projection adds
-`last_validated_at` (TEXT, nullable) — the validation timestamp planctl writes
-via `planctl validate --epic <id>` and the board client renders as a
+`last_validated_at` (TEXT, nullable) — the validation timestamp `keeper plan` writes
+via `keeper plan validate --epic <id>` and the board client renders as a
 `[validated]` pill at the non-null (validated) value, omitting it otherwise
 per fn-708's omit-default rule (absence ≡ `unvalidated`). As of schema v22, `jobs.config_dir` captures `CLAUDE_CONFIG_DIR` from the
 SessionStart environment, projecting the arthack-claude profile a session
@@ -1537,9 +1537,9 @@ attribution claim. Symmetric across per-session and global discharge
 equal blob but differing mode is also caught — oid-equality alone would
 have wrongly discharged it. The four discharge READ predicates
 (passes 2 / 3 / 4) are byte-identical to pre-v45 — only the WRITE
-site changed. As of schema v46 / fn-666, the planctl-CLI invocation
-envelope's `files[]` array (every `.planctl/{epics,tasks}/*.json` and
-`.planctl/specs/*.md` planctl wrote during the op) is lifted into a
+site changed. As of schema v46 / fn-666, the `keeper plan` invocation
+envelope's `files[]` array (every `.keeper/{epics,tasks}/*.json` and
+`.keeper/specs/*.md` `keeper plan` wrote during the op) is lifted into a
 new sparse `events.planctl_files TEXT` column by `extractPlanctlInvocation`
 (Array.isArray + per-element string filter + runaway-size guard; NULL
 on miss / non-array / empty / oversized), and the reducer's
@@ -1550,16 +1550,16 @@ absolute repo path, extracted in-fold from the stored envelope) +
 (`scaffold` / `done` / …) as `op`. The
 `file_attributions.source` CHECK widens to include `'planctl'` via a
 row-preserving table rebuild; pass-2's inferred-guard widens to
-`source IN ('tool','bash','planctl')` so a planctl file does NOT also
+`source IN ('tool','bash','planctl')` so a `'planctl'`-source file does NOT also
 get a spurious inferred attribution; pass-3 renders `'planctl'` as a
 honest badge. Discharge flows through the SAME `foldCommit` path as
-`'tool'`/`'bash'`/`'inferred'` — a `chore(planctl)` commit clears
+`'tool'`/`'bash'`/`'inferred'` — a `chore(plan)` commit clears
 the row via the same `last_commit_at` UPDATE; no per-source branch.
-Fixes the 559-orphan spike (`.planctl/{epics,tasks}/*.json` and
-`.planctl/specs/*.md` were strict-mystery orphans the instant they
-flashed dirty, since planctl writes them outside any Claude
+Fixes the 559-orphan spike (`.keeper/{epics,tasks}/*.json` and
+`.keeper/specs/*.md` were strict-mystery orphans the instant they
+flashed dirty, since `keeper plan` writes them outside any Claude
 Write/Edit / bash mutation deriver match). This envelope `files[]` scrape
-remains the SOLE driver of the planctl `file_attributions` rows — epic
+remains the SOLE driver of the `'planctl'`-source `file_attributions` rows — epic
 fn-695 added a SECOND, independent use of the commit channel (the
 creator/refiner edge below) but did NOT touch the attribution mint; the
 two are orthogonal. As of schema v49 / fn-670
@@ -1574,7 +1574,7 @@ cell on `epics` (no new real column — the v48→v49 bump is whitelist-
 only on `keeper/api.py`'s `SUPPORTED_SCHEMA_VERSIONS`). `buildEmbeddedJob`
 preserves the field across every `syncJobIntoEpic` re-sync via the
 OLD-element carve-out — without that guard, a later jobs-row write
-would clobber the link the consumer (`planctl pick_target_job`) relies
+would clobber the link the consumer (`keeper plan pick_target_job`) relies
 on to prefer the committing session over a stale empty re-claim.
 Commit-before-claim (no embedded job element yet under the named task)
 drops the link rather than shelling a job element foldCommit doesn't
@@ -1585,7 +1585,7 @@ order so the ordering inverts anyway. Pre-fn-670 Commit events lack
 no-op over the historical log, and a re-fold reproduces byte-identical
 `epics` rows. As of schema v54 / fn-695, the git-worker ALSO freezes the
 `Planctl-Op` / `Planctl-Target` / `Session-Id` trailers (stamped by
-planctl on every `chore(planctl)` commit) onto the `Commit` payload, and
+`keeper plan` on every `chore(plan)` commit) onto the `Commit` payload, and
 `foldCommit` — when all three axes are non-null and the target parses —
 TRIGGERS the per-session creator/refiner edge rebuild by calling
 `syncPlanctlLinks(committer_session_id, …)`. As of schema v67 (fn-807)
@@ -1597,7 +1597,7 @@ re-scanning every `Commit` blob per swept session. `foldCommit` never writes
 the `epic_links` / `job_links` cells itself: `syncPlanctlLinks` stays the
 SINGLE writer and re-derives the edge from the deduped UNION of the
 legacy stdout scrape AND this durable commit-trailer fact. The motivating
-failure (fn-635) piped planctl stdout through `grep`, NULLing
+failure (fn-635) piped `keeper plan` stdout through `grep`, NULLing
 `events.planctl_op` so the scrape-only edge never formed; the commit
 channel reconstructs it from the `Session-Id`-stamped commit, surviving
 client + server reboots and any stdout mangling. Whitelist-only schema
@@ -1617,7 +1617,7 @@ from the persisted JSON. The push guard collapses the persisted set
 from a monotonically ratcheting one to the currently-dirty set, and
 the fn-679 bound collapses the ITERATED pass-4 set from the entire
 undischarged set under `project_dir` (dominated by non-discharging
-planctl attributions, 288 in production) to the same event-relevant
+`'planctl'`-source attributions, 288 in production) to the same event-relevant
 union. The dominant GitSnapshot cost is pass 1 (explicit attribution),
 not pass 4: its tool-mutation arms, bash exact-match scan, and
 git-rm/git-mv deletion scan run inside a per-dirty-file loop, so fn-787
@@ -2133,7 +2133,7 @@ fan-out rides alongside: every `planctl_op != NULL` event AND (epic fn-695,
 schema v54) every `Commit` event carrying the `Planctl-Op` / `Planctl-Target`
 / `Session-Id` trailers triggers the `syncPlanctlLinks` helper, which
 re-derives per-session `jobs.epic_links` and per-epic `epics.job_links` from
-the session's planctl-CLI footprint — the deduped UNION of the legacy
+the session's `keeper plan` footprint — the deduped UNION of the legacy
 stdout-scrape rows and the durable commit-trailer facts — classified against
 its `/plan:plan` windows (creator = `epic-create` OR `scaffold` mutation
 inside a window — scaffold is the canonical epic-create path on this
@@ -2639,7 +2639,7 @@ shed-set is a POSITIVE allow-list over CHEAP HEADER COLUMNS only
 `subagent_agent_id`, no json parse) — a new/unlisted event type defaults to KEPT
 (fail-safe). fn-837 widened it from the four mutation tools to every class no fold
 reads: PostToolUse Write/Edit/MultiEdit/NotebookEdit/Read/WebFetch/Skill/ToolSearch,
-non-planctl PostToolUse:Bash (planctl Bash KEEPS — `state_repo` is fold-read),
+non-`keeper-plan` PostToolUse:Bash (`keeper plan` Bash KEEPS — `state_repo` is fold-read),
 modern PostToolUse:Agent (`subagent_agent_id IS NOT NULL`; legacy NULL-id Agent
 KEEPS — its `agentId` is fold-read), non-Agent PreToolUse / PostToolUseFailure tool
 bodies (PreToolUse:Agent is the subagent bridge; failure:Agent has the legacy
@@ -2662,11 +2662,11 @@ list, see [CLAUDE.md](./CLAUDE.md).
 ## Inspect
 
 ```sh
-# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a planctl-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; active_since (v65) is the dash AGENTS recency key, stamped to event.ts on the rising edge into 'working' (NULL on a never-prompted job); last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped on ApiError / InputRequest folds; both clear on the next UPS/SessionStart revival OR PreToolUse/PostToolUse tool event (gated on column-is-not-NULL), and that tool-event clear also un-stops a stopped row back to working):
+# Recent jobs (state: working|stopped|ended|killed; title_source: NULL=unset, 'spawn'=from --name, 'payload'=from prompt, 'transcript'=from live custom-title; plan_verb / plan_ref derived from a plan-shaped spawn name at SessionStart, NULL otherwise; config_dir captures CLAUDE_CONFIG_DIR at SessionStart with latest-non-NULL-wins via COALESCE on resume; active_since (v65) is the dash AGENTS recency key, stamped to event.ts on the rising edge into 'working' (NULL on a never-prompted job); last_api_error_(at,kind) and last_input_request_(at,kind) are paired stoppage annotations stamped on ApiError / InputRequest folds; both clear on the next UPS/SessionStart revival OR PreToolUse/PostToolUse tool event (gated on column-is-not-NULL), and that tool-event clear also un-stops a stopped row back to working):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, title, title_source, plan_verb, plan_ref, config_dir, active_since, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind, last_event_id FROM jobs ORDER BY updated_at DESC LIMIT 10'
 
-# Planctl-spawned jobs only — indexed via the partial `idx_jobs_plan_ref WHERE plan_ref IS NOT NULL` so this lands the index, not a scan:
+# Plan-spawned jobs only — indexed via the partial `idx_jobs_plan_ref WHERE plan_ref IS NOT NULL` so this lands the index, not a scan:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT job_id, plan_verb, plan_ref, state, title FROM jobs WHERE plan_verb = 'close' ORDER BY updated_at DESC LIMIT 10"
 
@@ -2674,7 +2674,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT session_id, datetime(ts,'unixepoch','localtime'), skill_name FROM events WHERE skill_name LIKE 'plan:%' ORDER BY id DESC LIMIT 20"
 
-# All planctl-CLI invocations across sessions — uses the composite partial idx_events_planctl_session index; the WHERE predicate must match the index predicate syntactically for SQLite to land the index:
+# All `keeper plan` invocations across sessions — uses the composite partial idx_events_planctl_session index; the WHERE predicate must match the index predicate syntactically for SQLite to land the index:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT session_id, datetime(ts,'unixepoch','localtime'), planctl_op, planctl_target FROM events WHERE planctl_op IS NOT NULL ORDER BY id DESC LIMIT 20"
 
@@ -2694,7 +2694,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT job_id, plan_verb, plan_ref, epic_links FROM jobs WHERE json_array_length(epic_links) > 0 ORDER BY updated_at DESC LIMIT 10"
 
-# Epics by inbound-link density — every job whose planctl-CLI footprint (stdout scrape ∪ durable commit-trailer facts, epic fn-695) created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v25 each entry embeds the linked job's title/state/last_api_error_(at,kind)/last_input_request_(at,kind) denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
+# Epics by inbound-link density — every job whose `keeper plan` footprint (stdout scrape ∪ durable commit-trailer facts, epic fn-695) created or refined the epic during a /plan:plan window (epics.job_links is the symmetric per-epic fan-out; as of schema v25 each entry embeds the linked job's title/state/last_api_error_(at,kind)/last_input_request_(at,kind) denormalized off the jobs row at the reducer's write boundary, so renderers + predicates no longer need a live-jobs join):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT epic_id, epic_number, title, json_array_length(job_links) AS n FROM epics WHERE json_array_length(job_links) > 0 ORDER BY n DESC, sort_path ASC LIMIT 10"
 # Unnest job_links to see each link's embedded display payload (schema v25: kind, job_id, title, state, last_api_error_at, last_api_error_kind, last_input_request_at, last_input_request_kind):
@@ -2705,20 +2705,20 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT job_id, state, pid, start_time FROM jobs WHERE state = "killed" ORDER BY updated_at DESC LIMIT 10'
 
-# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.planctl` roots. As of schema v29 the natural sort is `sort_path ASC` (matches the `EPICS_DESCRIPTOR` default), which slots closer-created children directly below their parent — an unfiltered query uses idx_epics_sort_path; the default-scope query (`WHERE default_visible = 1`, schema v32) uses the partial composite idx_epics_default_visible:
+# Plans projection — epics (each embedding its tasks AND its plan/close-verb jobs as JSON arrays) folded from the configured `.keeper` roots. As of schema v29 the natural sort is `sort_path ASC` (matches the `EPICS_DESCRIPTOR` default), which slots closer-created children directly below their parent — an unfiltered query uses idx_epics_sort_path; the default-scope query (`WHERE default_visible = 1`, schema v32) uses the partial composite idx_epics_default_visible:
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT epic_id, epic_number, sort_path, created_by_closer_of, title, status, last_validated_at, json_array_length(jobs) AS epic_jobs_n FROM epics ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
 # Default-scope epics — what the board sees by default: every open epic. Schema v32 (fn-634, narrowed at v63/fn-756) materializes the predicate `status='open'` as the VIRTUAL generated column `default_visible` and a partial composite index `idx_epics_default_visible ON epics(default_visible, sort_path, epic_id) WHERE default_visible = 1` serves it as a covering SEARCH (no SCAN, no temp B-tree). The literal `= 1` is load-bearing for the partial-index match:
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT epic_id, epic_number, sort_path, title, status FROM epics WHERE default_visible = 1 ORDER BY sort_path ASC, epic_id ASC LIMIT 10'
-# Tasks live inside epics.tasks now — unnest with json_each to list them per epic. Schema v19 surfaces BOTH the planctl-native runtime status (`runtime_status`: todo|in_progress|done|blocked, ingested from `.planctl/state/tasks/<task_id>.state.json`) AND the derived worker-phase binary (`worker_phase`: open|done, derived from `worker_done_at`) — outer ORDER BY uses the idx_epics_sort_path index:
+# Tasks live inside epics.tasks now — unnest with json_each to list them per epic. Schema v19 surfaces BOTH the plan-native runtime status (`runtime_status`: todo|in_progress|done|blocked, ingested from `.keeper/state/tasks/<task_id>.state.json`) AND the derived worker-phase binary (`worker_phase`: open|done, derived from `worker_done_at`) — outer ORDER BY uses the idx_epics_sort_path index:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(t.value, '\$.task_number') AS task_number, json_extract(t.value, '\$.title') AS title, json_extract(t.value, '\$.runtime_status') AS runtime_status, json_extract(t.value, '\$.worker_phase') AS worker_phase FROM epics e, json_each(e.tasks) t ORDER BY e.sort_path ASC, task_number ASC LIMIT 10"
 # Work-verb jobs per task — double-unnest epics.tasks then each task's embedded jobs sub-array:
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT e.epic_id, json_extract(t.value, '\$.task_id') AS task_id, json_extract(j.value, '\$.job_id') AS job_id, json_extract(j.value, '\$.state') AS state FROM epics e, json_each(e.tasks) t, json_each(json_extract(t.value, '\$.jobs')) j ORDER BY e.sort_path ASC, task_id ASC LIMIT 10"
 
-# Git projection — one row per watched worktree (membership gate `.planctl present || dirty || ahead of upstream > 0`, recomputed each reconcile, epic fn-690). dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|planctl (planctl added in schema v46 / fn-666 — minted by the reducer's planctl_op fold from the envelope's files[] array so .planctl/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
+# Git projection — one row per watched worktree (membership gate `.keeper present || dirty || ahead of upstream > 0`, recomputed each reconcile, epic fn-690). dirty_files is a JSON array; each entry carries {path, xy, mtime_ms, worktree_oid, worktree_mode, attributions:[{session_id, source, last_mutation_at, last_commit_at}, ...]} (schema v31 file-centric shape — per-(session, file) attribution with source badges tool|bash|inferred|planctl (planctl added in schema v46 / fn-666 — minted by the reducer's planctl_op fold from the envelope's files[] array so .keeper/ JSONs+specs no longer orphan) and commit-discharge timestamps; schema v44/v45 — fn-664 — adds the producer-frozen worktree_oid + worktree_mode so foldCommit can gate discharge on content equality):
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT project_dir, branch, ahead, behind, json_extract(dirty_files, '\$[0]') AS first_dirty FROM git_status LIMIT 5"
 

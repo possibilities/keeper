@@ -62,7 +62,7 @@ import type { Epic, GitStatus, Job, SubagentInvocation } from "./types";
 import { watchLoop } from "./wake-worker";
 
 /**
- * The two planctl verbs the reconciler dispatches: `work` for a `ready` task
+ * The two `keeper plan` verbs the reconciler dispatches: `work` for a `ready` task
  * row, `close` for a `ready` close row. The argv shape's single source of truth
  * is `cli/autopilot.ts`.
  */

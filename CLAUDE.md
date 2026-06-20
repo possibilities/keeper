@@ -5,14 +5,15 @@ The hook plugin appends one per-pid NDJSON line per Claude Code hook invocation
 line as one `events` row, folds those events into the `jobs`/`epics` projections,
 and serves them read-only over a UDS subscribe socket. The `events` table is the
 canonical fold source, so re-fold determinism holds by construction. System map,
-rationale, and incident history: `README.md` `## Architecture` and `.planctl/` specs.
+rationale, and incident history: `README.md` `## Architecture` and `.keeper/` specs.
 
 ## Repo facts
 
 - **`AGENTS.md` is a symlink to this file.** Edit in place; never `rm`+recreate.
 - **Two Claude plugins live as peers under `plugins/`** — `plugins/keeper/` (the
-  events-writer HOOK plugin + `keeper:await` skill) and `plugins/plan/` (planctl,
-  vendored via `git subtree --prefix=plugins/plan`, carrying the `plan:*` skills).
+  events-writer HOOK plugin + `keeper:await` skill) and `plugins/plan/` (the
+  plan plugin behind `keeper plan`, vendored via `git subtree --prefix=plugins/plan`,
+  carrying the `plan:*` skills).
   agentwrap loads both from one `plugin_scan_dirs` entry pointing at `plugins/`.
   Each plugin has exactly ONE manifest at its own `<plugin>/.claude-plugin/plugin.json`
   and the keeper plugin exactly ONE `plugins/keeper/hooks/hooks.json` — never
@@ -23,9 +24,9 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   commit, never GitHub "Squash and merge" a subtree PR.** Any of those breaks the
   `git-subtree-split:` trailer and kills `git subtree split --prefix=plugins/plan`
   extractability forever (a one-way door). Its nested `plugins/plan/.planctl/` is
-  planctl's OWN dev plan and is pruned from keeper's plan-worker fold
+  the plan plugin's OWN dev plan and is pruned from keeper's plan-worker fold
   (`isVendoredPlanPath` in `src/plan-worker.ts`); keeper folds only the root
-  `.planctl/`.
+  `.keeper/`.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `promptctl render code-comment-style`.
@@ -50,7 +51,7 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   are intentionally non-reconstructable — forensic transcript depth defers to
   Claude Code's own `transcript_path` `.jsonl`. Every KEEP-SET body a fold actually
   reads stays inline in `events.data` forever (the keep-set IS the complement of
-  the shed allow-list — planctl Bash, legacy Agent, PreToolUse:Agent, snapshot /
+  the shed allow-list — `keeper plan` Bash, legacy Agent, PreToolUse:Agent, snapshot /
   session / prompt folds, …), so the projection re-fold stays byte-identical.
 - **Never throw inside a fold.** Malformed `data` folds to a safe value and the
   cursor still advances; a throw rolls back the cursor and wedges the reducer. Schema
@@ -88,7 +89,7 @@ rationale, and incident history: `README.md` `## Architecture` and `.planctl/` s
   synthetic event so a re-fold sees it: `replay_dead_letter`, `retry_dispatch`,
   `set_autopilot_paused`, `set_autopilot_mode`, `set_epic_armed`. RPC handlers MUST
   NOT write `jobs`/`epics`/etc directly (folds still mutate their own projections).
-- **Plans are READ-ONLY.** The plan worker folds `.planctl/{epics,tasks}` snapshots
+- **Plans are READ-ONLY.** The plan worker folds `.keeper/{epics,tasks}` snapshots
   into `epics`; every field is read-only end to end. No RPC writes a plan field.
 - **Sole-writer rules.** The hook writes ONLY per-pid NDJSON files, never the DB. The
   events-log ingester is the sole writer of hook-sourced `events` rows; main writes
