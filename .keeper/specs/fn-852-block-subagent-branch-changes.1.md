@@ -46,5 +46,5 @@ Mirror commit-guard.test.ts: (1) in-process truth table over the exported predic
 - [ ] In-process classifier truth table + subprocess decision-ladder tests pass; `bun run test:full` green.
 
 ## Done summary
-
+Added plugins/keeper/plugin/hooks/branch-guard.ts: a pure-payload PreToolUse(Bash) hard-deny that blocks subagents (agent_id/agent_type present) from git branch create/switch/worktree-add forms while allowing file-restore and ordinary git, registered as a second PreToolUse(Bash) hook alongside events-writer with a 70-test classifier + decision-ladder suite.
 ## Evidence
