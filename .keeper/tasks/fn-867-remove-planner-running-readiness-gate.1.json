@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-20T22:10:16.523000Z",
+  "depends_on": [],
+  "epic": "fn-867-remove-planner-running-readiness-gate",
+  "id": "fn-867-remove-planner-running-readiness-gate.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Remove planner-running gate, helpers, and pills",
+  "updated_at": "2026-06-20T22:10:16.523000Z"
+}
