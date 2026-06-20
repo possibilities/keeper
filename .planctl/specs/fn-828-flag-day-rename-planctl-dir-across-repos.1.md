@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] agentrender `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+Renamed agentrender .planctl state dir to .keeper via git mv and updated .keeper/CLAUDE.md path refs. keeper board renders agentrender's plan from .keeper/.
 ## Evidence
