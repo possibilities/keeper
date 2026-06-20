@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] dotfiles `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+Renamed dotfiles .planctl/ to .keeper/ via git mv (20 files, pure rename) and updated the .keeper/CLAUDE.md directory path ref. keeper board renders dotfiles epics from .keeper/. Source commit 488b264 in dotfiles.
 ## Evidence
