@@ -13,4 +13,5 @@
 ## Acceptance
 - [ ] prosectl `.planctl` → `.keeper` (git mv, committed); refs updated; board visible
 ## Done summary
+Renamed prosectl .planctl -> .keeper via git mv (22 files); updated .keeper/CLAUDE.md heading and path refs from .planctl to .keeper. No other in-repo refs.
 ## Evidence
