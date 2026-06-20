@@ -46,5 +46,5 @@ Schema: v75->v76 via addColumnIfMissing (db.ts:1184) + the fresh-DB CREATE + SUP
 - [ ] per-(verb,id) consecutive-no-bind counter folded deterministically; mints sticky DispatchFailed("never-bound") at K=3; bind resets to 0; failedKeys suppression + retry clear unchanged and verified (incl. clearing the counter); SCHEMA_VERSION 75->76 + api.py 76 same commit; re-fold byte-identical; test:full green
 
 ## Done summary
-
+Added the never-bound dispatch circuit breaker: a per-(verb,id) consecutive-DispatchExpired-without-bind counter (dispatch_never_bound, schema v76) that mints a sticky DispatchFailed("never-bound") at K=3, reset on a successful bind or DispatchCleared, reusing the existing failedKeys suppression and retry-clear paths.
 ## Evidence
