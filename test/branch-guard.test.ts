@@ -36,6 +36,12 @@ describe("isBranchMutatingCommand", () => {
     // branch <newname>
     "git branch newfeature",
     "git branch newfeature origin/main",
+    // branch copy-create — copy creates a new ref, so it BLOCKS (F1); short and
+    // long forms classify identically
+    "git branch -c newcopy",
+    "git branch -C base newcopy",
+    "git branch --copy newcopy",
+    "git branch --copy base newcopy",
     // branch create behind a leading non-operand flag (F2)
     "git branch --force newbranch",
     "git branch -f newbranch start-point",
@@ -76,6 +82,10 @@ describe("isBranchMutatingCommand", () => {
     "git branch -d old",
     "git branch -D old",
     "git branch -m old new",
+    // long-form delete/move operate on an existing branch — no false-deny (F3);
+    // short and long forms classify identically
+    "git branch --delete old",
+    "git branch --move old new",
     "git branch --list",
     "git branch -a",
     "git branch -v",

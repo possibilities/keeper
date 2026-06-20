@@ -115,10 +115,15 @@ function isBranchMutatingInvocation(args: string): boolean {
     // `git branch <newname> [start-point]` (a positional NAME) creates a branch.
     // A leading flag that consumes no operand (`-f`/`--force`) pushes the
     // new-branch name to a later token, so we cannot inspect tokens[0] alone.
-    // Mode-selecting flags make the command never a create: delete (`-d`/`-D`),
-    // rename/move (`-m`/`-M`), and copy (`-c`/`-C`) consume their own positionals
-    // — if any is present, allow regardless of how many positionals follow.
-    const modeFlags = new Set(["-d", "-D", "-m", "-M", "-c", "-C"]);
+    // Mode-selecting flags make the command never a create: delete
+    // (`-d`/`-D`/`--delete`) and rename/move (`-m`/`-M`/`--move`) operate on an
+    // existing branch — if any is present, allow regardless of how many
+    // positionals follow. Short and long forms classify identically.
+    //
+    // Copy (`-c`/`-C`/`--copy`) is deliberately ABSENT: copy creates a new
+    // branch ref, which is exactly the subagent bypass this guard exists to
+    // block, so it falls through to the positional create check and DENIES.
+    const modeFlags = new Set(["-d", "-D", "--delete", "-m", "-M", "--move"]);
     if (tokens.some((t) => modeFlags.has(t))) return false;
     // Otherwise scan for the first positional that is not the single-value
     // operand of an upstream/track flag (`-u`/`--set-upstream-to`/`-t`/`--track`).
