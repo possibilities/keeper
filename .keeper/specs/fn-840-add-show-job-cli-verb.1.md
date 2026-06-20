@@ -167,5 +167,5 @@ are fast-tier-excluded; this touches CLI/db paths).
 - [ ] `resolveJob` is pure (db + resolved selectors only); all resolution paths unit-tested via `freshMemDb()`; `test/keeper-cli.test.ts` extended; `bun run test:full` green.
 
 ## Done summary
-
+Added keeper show-job read-only verb: fetches one jobs row as a pretty JSON envelope, resolved by session-id/title/cwd/pane or zero-flag auto-detection (ambient session, tmux current-window single-live-agent, cwd). Pure resolveJob + impure main, registered in dispatcher with scripts/ shim and README bullet.
 ## Evidence
