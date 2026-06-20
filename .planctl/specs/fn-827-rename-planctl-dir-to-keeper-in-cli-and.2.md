@@ -28,5 +28,5 @@ Update keeper's plan-worker to watch + fold BOTH `.keeper/{epics,tasks,state}` (
 - [ ] note recorded: a daemon restart is required to apply this watch before the flag-day epic
 
 ## Done summary
-
+plan-worker now folds both .keeper/ (primary) and legacy .planctl/ (transient fallback): classify/scan/discover route through DATA_DIR_NAMES, dir-level precedence resolves to .keeper/ when both exist (legacy ignored, no double-fold), vendored prune intact. Daemon restart required to apply the new watch before the flag-day rename.
 ## Evidence
