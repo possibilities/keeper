@@ -41,5 +41,5 @@ Layer A — give the close-planner the repo map and teach it to emit an explicit
 - [ ] A brief test asserts `target_repo` + `touched_repos` presence.
 
 ## Done summary
-
+Close brief now carries per-task target_repo (both projection + brief map) and epic touched_repos on the root; close-planner reads target_repo in Phase 1 and emits an explicit per-task target_repo in Phase 5 with the repo-resolution rule, sentinel ban, and repo_required reject code. README brief-shape sentence updated.
 ## Evidence
