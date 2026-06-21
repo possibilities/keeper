@@ -27,7 +27,7 @@ import {
   resolveAuditContext,
   SubmitError,
 } from "../submit_common.ts";
-import { validateScaffoldYaml } from "./scaffold.ts";
+import { buildSourceRepoGuard, validateScaffoldYaml } from "./scaffold.ts";
 
 export interface FollowupSubmitArgs {
   epicId: string;
@@ -86,11 +86,22 @@ export function runFollowupSubmit(args: FollowupSubmitArgs): void {
 
     const followupYaml = readPayloadCapped(file, "follow-up YAML");
 
+    // The cross-repo follow-up guard's source-of-truth: the source epic's
+    // touched_repos, carried on the brief root (close-preflight stamped it). The
+    // mint seam reads the same fields off the on-disk source epic — one shape,
+    // one normalizer — so the dry-run reject is exactly reproducible at scaffold.
+    const sourceRepoGuard = buildSourceRepoGuard(
+      brief.touched_repos as string[] | null | undefined,
+      primaryRepo,
+    );
+
     // Scaffold dry-run: the assert-all half, no mint. Reuses scaffold's leaf
     // checkers + exact failure-code priority. Surfaces scaffold's codes verbatim.
     const result = validateScaffoldYaml(
       Buffer.from(followupYaml, "utf-8"),
       "followup",
+      true,
+      sourceRepoGuard,
     );
     if (!result.ok) {
       throw new SubmitError(result.code, result.message, result.details);

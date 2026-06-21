@@ -27,6 +27,7 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
+import { runScaffold } from "../src/verbs/scaffold.ts";
 import {
   firstJsonPayload,
   gitInit,
@@ -972,4 +973,170 @@ describe("scaffold dup guard + atomicity", () => {
     }
     expect(countInvocationLines(r.output)).toBe(1);
   });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-repo follow-up guard at the MINT seam (createdByCloseOf path).
+//
+// The createdByCloseOf flag is internal-only (the CLI always passes null), so
+// the mint-seam guard is driven by calling runScaffold in-process with cwd set
+// to the project root and stdout captured — exactly how close-finalize's
+// scaffoldFollowup delegate invokes it. A multi-repo SOURCE epic forces every
+// follow-up task to carry an explicit, in-set target_repo or the mint rejects
+// repo_required, leaving the disk untouched.
+// ---------------------------------------------------------------------------
+
+describe("scaffold cross-repo follow-up guard (mint seam)", () => {
+  // Two real git repos under the project tree (the multi_repo_project port).
+  function twoForeignRepos(): [string, string] {
+    const a = join(project.root, "foreign-a");
+    const b = join(project.root, "foreign-b");
+    for (const d of [a, b]) {
+      mkdirSync(d, { recursive: true });
+      gitInit(d);
+    }
+    return [realpathSync(a), realpathSync(b)];
+  }
+
+  // Mint a SOURCE epic whose touched_repos span the two foreign repos. Returns
+  // the source epic id; afterward its touched_repos == sorted([a, b]).
+  function seedMultiRepoSource(a: string, b: string): string {
+    const yaml =
+      "epic:\n  title: multi repo source\n  spec: |\n    ## Overview\n    span repos.\n" +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const r = run(["scaffold", "--file", writeYaml(yaml)]);
+    expect(r.code).toBe(0);
+    return parseEnvelope(r.output).epic_id as string;
+  }
+
+  // Build a one-task follow-up YAML, optionally with an explicit target_repo.
+  function followupYaml(targetRepo: string | null): string {
+    const repoLine =
+      targetRepo !== null ? `    target_repo: ${targetRepo}\n` : "";
+    return (
+      "epic:\n  title: follow up of source\n  spec: |\n    ## Overview\n    fu.\n" +
+      `tasks:\n  - title: follow task\n    deps: []\n    tier: medium\n${repoLine}    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`
+    );
+  }
+
+  // Run runScaffold in-process with cwd pinned to the project + stdout captured.
+  // Mirrors close_finalize.runCaptured's chdir + redirect dance.
+  function mintFollowup(
+    yaml: string,
+    sourceId: string,
+  ): { code: number; output: string } {
+    const planPath = join(project.root, "followup.yaml");
+    writeFileSync(planPath, yaml, "utf-8");
+
+    const prevCwd = process.cwd();
+    const prevSession = process.env.CLAUDE_CODE_SESSION_ID;
+    const chunks: string[] = [];
+    const origWrite = process.stdout.write.bind(process.stdout);
+    (process.stdout as unknown as { write: (s: unknown) => boolean }).write = (
+      chunk: unknown,
+    ): boolean => {
+      chunks.push(typeof chunk === "string" ? chunk : String(chunk));
+      return true;
+    };
+    try {
+      process.chdir(project.root);
+      process.env.CLAUDE_CODE_SESSION_ID = "test-session-fixture";
+      const code = runScaffold({
+        file: planPath,
+        allowDuplicate: false,
+        createdByCloseOf: sourceId,
+      });
+      return { code, output: chunks.join("") };
+    } finally {
+      process.chdir(prevCwd);
+      if (prevSession === undefined) {
+        delete process.env.CLAUDE_CODE_SESSION_ID;
+      } else {
+        process.env.CLAUDE_CODE_SESSION_ID = prevSession;
+      }
+      (process.stdout as unknown as { write: typeof origWrite }).write =
+        origWrite;
+    }
+  }
+
+  function noFollowupLanded(sourceId: string): boolean {
+    const epicsDir = join(project.root, ".keeper", "epics");
+    const glob = new Bun.Glob("fn-*.json");
+    for (const f of glob.scanSync({ cwd: epicsDir, onlyFiles: true })) {
+      const stem = f.slice(0, -".json".length);
+      if (stem === sourceId) {
+        continue;
+      }
+      return false;
+    }
+    return true;
+  }
+
+  slow(
+    "multi-repo source + omitted target_repo -> repo_required, no write",
+    () => {
+      const [a, b] = twoForeignRepos();
+      const sourceId = seedMultiRepoSource(a, b);
+      const { code, output } = mintFollowup(followupYaml(null), sourceId);
+      expect(code).toBe(1);
+      const err = parseEnvelope(output).error as Record<string, unknown>;
+      expect(err.code).toBe("repo_required");
+      expect((err.details as string[]).some((d) => d.includes("task #1"))).toBe(
+        true,
+      );
+      expect(noFollowupLanded(sourceId)).toBe(true);
+    },
+  );
+
+  slow(
+    "multi-repo source + explicit in-set target_repo -> mints cleanly",
+    () => {
+      const [a, b] = twoForeignRepos();
+      const sourceId = seedMultiRepoSource(a, b);
+      const { code, output } = mintFollowup(followupYaml(a), sourceId);
+      expect(code).toBe(0);
+      const payload = parseEnvelope(output);
+      const newEpicId = payload.epic_id as string;
+      expect(newEpicId).not.toBe(sourceId);
+      expect(readJson(`tasks/${newEpicId}.1.json`).target_repo).toBe(a);
+      void b;
+    },
+  );
+
+  slow(
+    "multi-repo source + out-of-set target_repo -> repo_required, no write",
+    () => {
+      const [a, b] = twoForeignRepos();
+      void b;
+      const sourceId = seedMultiRepoSource(a, b);
+      // A third foreign repo, not in the source's touched_repos.
+      const c = join(project.root, "foreign-c");
+      mkdirSync(c, { recursive: true });
+      gitInit(c);
+      const cReal = realpathSync(c);
+      const { code, output } = mintFollowup(followupYaml(cReal), sourceId);
+      expect(code).toBe(1);
+      const err = parseEnvelope(output).error as Record<string, unknown>;
+      expect(err.code).toBe("repo_required");
+      expect(
+        (err.details as string[]).some((d) => d.includes("not in the source")),
+      ).toBe(true);
+      expect(noFollowupLanded(sourceId)).toBe(true);
+    },
+  );
+
+  slow(
+    "single-repo source + omitted target_repo -> mints, defaults to primary",
+    () => {
+      // The source epic touches only primary_repo (no foreign target_repo), so the
+      // guard does NOT fire — the existing default-to-primary behavior stands.
+      const sourceId = seedEpic("single repo source");
+      const { code, output } = mintFollowup(followupYaml(null), sourceId);
+      expect(code).toBe(0);
+      const newEpicId = parseEnvelope(output).epic_id as string;
+      const primary = realpathSync(project.root);
+      expect(readJson(`tasks/${newEpicId}.1.json`).target_repo).toBe(primary);
+    },
+  );
 });

@@ -50,6 +50,49 @@ function seedBrief(root: string, epicId: string): string {
   return h;
 }
 
+// A brief whose source epic is MULTI-repo: touched_repos spans the primary
+// (root) plus a second repo, the source-of-truth the cross-repo guard reads.
+function seedMultiRepoBrief(
+  root: string,
+  epicId: string,
+  otherRepo: string,
+): string {
+  const h = computeCommitSetHash([{ repo: root, shas: ["abc123"] }]);
+  const brief = {
+    schema_version: 1,
+    epic_id: epicId,
+    primary_repo: root,
+    touched_repos: [root, otherRepo],
+    commit_set_hash: h,
+    commit_groups: [],
+    snippet_context: "",
+    tasks: [],
+  };
+  writeArtifact(briefPath(root, epicId), `${JSON.stringify(brief)}\n`);
+  return h;
+}
+
+// A one-task follow-up YAML carrying an explicit per-task target_repo.
+function followupYamlWithRepo(source: string, targetRepo: string): string {
+  const lines = [
+    "epic:",
+    "  title: Follow up",
+    `  depends_on_epics: [${source}]`,
+    "  spec: |",
+    "    ## Overview",
+    "    fu",
+    "tasks:",
+    "  - title: task 1",
+    "    tier: medium",
+    `    target_repo: ${targetRepo}`,
+    "    spec: |",
+  ];
+  for (const ln of TASK_SPEC_LINES) {
+    lines.push(`      ${ln}`);
+  }
+  return `${lines.join("\n")}\n`;
+}
+
 // Persist a verdict whose kept decisions occupy *ordinals* (distinct count = the
 // expected follow-up cluster count). Port of _seed_verdict.
 function seedVerdict(root: string, epicId: string, ordinals: number[]): void {
@@ -360,5 +403,63 @@ describe("followup submit", () => {
     );
     expect(code).toBe(0);
     expect(output.includes('"files":[')).toBe(false);
+  });
+
+  // Cross-repo guard at the dry-run seam: a multi-repo source brief makes an
+  // omitted per-task target_repo a typed repo_required reject (re-runnably — the
+  // verb persists nothing), while an explicit in-set target_repo passes.
+  test("multi-repo source + omitted target_repo -> repo_required", () => {
+    const proj = getProj();
+    const src = sourceEpic(proj);
+    const other = `${proj.root}-other`;
+    seedMultiRepoBrief(proj.root, src, other);
+    seedVerdict(proj.root, src, [1]);
+    const { code, output } = submit(
+      proj,
+      src,
+      followupYaml(1, { source: src }),
+    );
+    expect(code).toBe(1);
+    expect(errCode(output)).toBe("repo_required");
+  });
+
+  test("multi-repo source + in-set target_repo passes the dry-run", () => {
+    const proj = getProj();
+    const src = sourceEpic(proj);
+    const other = `${proj.root}-other`;
+    seedMultiRepoBrief(proj.root, src, other);
+    seedVerdict(proj.root, src, [1]);
+    const { code, output } = submit(
+      proj,
+      src,
+      followupYamlWithRepo(src, other),
+    );
+    expect(code).toBe(0);
+    expect(parseCliOutput(output).task_count).toBe(1);
+  });
+
+  test("multi-repo source + out-of-set target_repo -> repo_required", () => {
+    const proj = getProj();
+    const src = sourceEpic(proj);
+    const other = `${proj.root}-other`;
+    seedMultiRepoBrief(proj.root, src, other);
+    seedVerdict(proj.root, src, [1]);
+    const { code, output } = submit(
+      proj,
+      src,
+      followupYamlWithRepo(src, `${proj.root}-elsewhere`),
+    );
+    expect(code).toBe(1);
+    expect(errCode(output)).toBe("repo_required");
+  });
+
+  test("single-repo source brief never rejects on an omitted target_repo", () => {
+    const proj = getProj();
+    const src = sourceEpic(proj);
+    // seedBrief carries no touched_repos -> single-repo -> guard off.
+    seedBrief(proj.root, src);
+    seedVerdict(proj.root, src, [1]);
+    const { code } = submit(proj, src, followupYaml(1, { source: src }));
+    expect(code).toBe(0);
   });
 });

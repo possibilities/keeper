@@ -13,7 +13,7 @@
 // the retired `epic followup-of` node asserts the unknown-subcommand error.
 
 import { describe, expect, test } from "bun:test";
-import { readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, realpathSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 import {
@@ -27,6 +27,8 @@ import {
 } from "../src/audit_artifacts.ts";
 import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
 import {
+  firstJsonPayload,
+  gitInit,
   parseCliOutput,
   runCli,
   scaffoldEpic,
@@ -379,6 +381,135 @@ describe("close-finalize closed_with_followup", () => {
     expect(env.outcome).toBe("closed_with_followup");
     expect(env.new_epic_id).toBe(followId);
     expect(epicStatus(proj.root, epicId)).toBe("done");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Cross-repo follow-up guard at the close-finalize -> scaffold mint seam.
+//
+// A MULTI-repo source epic forces the scaffolded follow-up to carry an explicit,
+// in-set per-task target_repo. A followup.yaml that omits it makes the mint
+// reject repo_required, which close-finalize surfaces as SCAFFOLD_FAILED — a
+// re-runnable refusal that leaves the source epic OPEN.
+// ---------------------------------------------------------------------------
+
+describe("close-finalize cross-repo follow-up guard", () => {
+  const getProj = withProject("planctl-cf-xrepo-");
+
+  const VALID_TASK_SPEC = [
+    "## Description",
+    "Implement the thing.",
+    "",
+    "## Acceptance",
+    "- [ ] It works.",
+    "",
+    "## Done summary",
+    "",
+    "## Evidence",
+    "",
+  ].join("\n");
+
+  function indent(text: string, n: number): string {
+    const prefix = " ".repeat(n);
+    return text
+      .split("\n")
+      .map((line) => (line ? prefix + line : ""))
+      .join("\n");
+  }
+
+  // Two real git repos under the project root; the source epic spans both, so
+  // its touched_repos == sorted([a, b]) (a strict superset of {primary}).
+  function twoForeignRepos(root: string): [string, string] {
+    const a = join(root, "foreign-a");
+    const b = join(root, "foreign-b");
+    for (const d of [a, b]) {
+      mkdirSync(d, { recursive: true });
+      gitInit(d);
+    }
+    return [realpathSync(a), realpathSync(b)];
+  }
+
+  // Mint a done MULTI-repo source epic spanning the two foreign repos; seed its
+  // brief + a one-kept-finding verdict at the empty-set hash. Returns the id.
+  function doneMultiRepoSource(
+    proj: { root: string; home: string },
+    a: string,
+    b: string,
+  ): string {
+    const yaml =
+      "epic:\n  title: multi repo source\n  spec: |\n    ## Overview\n    span repos.\n" +
+      `tasks:\n  - title: task A\n    deps: []\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n` +
+      `  - title: task B\n    deps: []\n    tier: medium\n    target_repo: ${b}\n    spec: |\n${indent(VALID_TASK_SPEC, 6)}\n`;
+    const planPath = join(proj.root, "_xrepo_source.yaml");
+    writeFileSync(planPath, yaml, "utf-8");
+    const res = runCli(["scaffold", "--file", planPath], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(res.code).toBe(0);
+    const epicId = firstJsonPayload(res.output).epic_id as string;
+    markAllDone(proj.root, [`${epicId}.1`, `${epicId}.2`]);
+    const hash = emptySetHash();
+    seedBrief(proj.root, epicId, hash);
+    seedVerdict(proj.root, epicId, {
+      commitSetHash: hash,
+      decisions: [{ fid: "f1", action: "kept", task: 1, rationale: "real" }],
+    });
+    return epicId;
+  }
+
+  test("multi-repo source + followup.yaml omitting target_repo -> SCAFFOLD_FAILED, source open", () => {
+    const proj = getProj();
+    const [a, b] = twoForeignRepos(proj.root);
+    void a;
+    void b;
+    const epicId = doneMultiRepoSource(proj, a, b);
+    // A followup.yaml whose single task carries NO target_repo (seedFollowupYaml
+    // emits none) — the mint must refuse rather than default to primary.
+    seedFollowupYaml(proj.root, epicId, epicId, 1);
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(1);
+    const error = env.error as Record<string, unknown>;
+    expect(error.code).toBe("SCAFFOLD_FAILED");
+    // The mint reject (repo_required) rides the captured scaffold_output.
+    expect(JSON.stringify(error.details ?? {}).includes("repo_required")).toBe(
+      true,
+    );
+    // Re-runnable: the source epic stays OPEN.
+    expect(epicStatus(proj.root, epicId)).toBe("open");
+  });
+
+  test("multi-repo source + in-set per-task target_repo -> closed_with_followup", () => {
+    const proj = getProj();
+    const [a, b] = twoForeignRepos(proj.root);
+    void b;
+    const epicId = doneMultiRepoSource(proj, a, b);
+    // A followup.yaml whose task carries an explicit in-set target_repo.
+    const spec =
+      "      ## Description\n      follow-up\n\n" +
+      "      ## Acceptance\n      - [ ] x\n\n" +
+      "      ## Done summary\n\n      ## Evidence\n";
+    const yaml =
+      `epic:\n  title: Follow-up of ${epicId}\n` +
+      `  depends_on_epics: [${epicId}]\n` +
+      "  spec: |\n    ## Overview\n    follow overview\n" +
+      `tasks:\n  - title: Follow task\n    tier: medium\n    target_repo: ${a}\n    spec: |\n${spec}`;
+    writeArtifact(followupPath(proj.root, epicId), yaml);
+
+    const { code, env } = finalize(proj, epicId);
+    expect(code).toBe(0);
+    expect(env.outcome).toBe("closed_with_followup");
+    const newEpicId = env.new_epic_id as string;
+    expect(newEpicId).not.toBe(epicId);
+    expect(epicStatus(proj.root, epicId)).toBe("done");
+    const newTask = JSON.parse(
+      readFileSync(
+        join(proj.root, ".keeper", "tasks", `${newEpicId}.1.json`),
+        "utf-8",
+      ),
+    ) as Record<string, unknown>;
+    expect(newTask.target_repo).toBe(a);
   });
 });
 

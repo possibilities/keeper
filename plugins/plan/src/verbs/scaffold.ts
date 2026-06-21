@@ -18,8 +18,8 @@
 // SPECS BEFORE JSONs (the orphan-spec invariant — scanMaxEpicId scans specs/ too,
 // so a JSON-before-spec unwind would leave a spec that poisons the id counter).
 
-import { existsSync, readdirSync, unlinkSync } from "node:fs";
-import { join } from "node:path";
+import { existsSync, readdirSync, realpathSync, unlinkSync } from "node:fs";
+import { join, resolve as resolveAbs } from "node:path";
 
 import { detectCycles } from "../deps.ts";
 import {
@@ -85,17 +85,138 @@ function pyReprStr(v: string): string {
   return `'${v}'`;
 }
 
+/** The fail-loud cross-repo follow-up guard for a `created_by_close_of` mint:
+ * when the SOURCE epic touches more than one repo, every follow-up task MUST
+ * carry an explicit, in-set `target_repo` — silently defaulting to primary_repo
+ * would dispatch a worker into the wrong tree. `multiRepo` is true iff the
+ * source's `touched_repos` is a strict superset of `{primary_repo}` (a
+ * single-repo source has a deterministic answer and never gates). `allowed` is
+ * the realpath-normalized member set the per-task `target_repo` must belong to.
+ * Both seams (the dry-run + the mint) compute the check from this one shape so
+ * the planner can reproduce any reject. */
+export interface SourceRepoGuard {
+  multiRepo: boolean;
+  allowed: Set<string>;
+}
+
+/** Normalize a repo path the one way the guard compares both sides: absolute +
+ * realpath, falling back to the absolute form when the path can't be resolved.
+ * Equivalent to expandPath's resolution for an already-absolute input, so a
+ * `target_repo` (expandPath-normalized) and a source `touched_repos` member
+ * compare equal when they name the same tree. */
+function normalizeRepo(p: string): string {
+  const abs = resolveAbs(p);
+  try {
+    return realpathSync(abs);
+  } catch {
+    return abs;
+  }
+}
+
+/** Build the cross-repo guard from a source epic's `touched_repos` +
+ * `primary_repo`. Pure: the caller supplies the source-of-truth (the brief on
+ * the dry-run seam, the on-disk source epic on the mint seam). multiRepo fires
+ * only when at least one normalized touched repo is NOT the primary — a strict
+ * superset of `{primary}`. */
+export function buildSourceRepoGuard(
+  touchedRepos: string[] | null | undefined,
+  primaryRepo: string,
+): SourceRepoGuard {
+  const allowed = new Set<string>();
+  const normalizedPrimary = normalizeRepo(primaryRepo);
+  if (Array.isArray(touchedRepos)) {
+    for (const tr of touchedRepos) {
+      if (typeof tr === "string" && tr) {
+        allowed.add(normalizeRepo(tr));
+      }
+    }
+  }
+  // Strict superset of {primary}: a member outside the primary exists.
+  let multiRepo = false;
+  for (const member of allowed) {
+    if (member !== normalizedPrimary) {
+      multiRepo = true;
+      break;
+    }
+  }
+  return { multiRepo, allowed };
+}
+
+/** Load the cross-repo guard for the mint seam: resolve the source epic named
+ * by `createdByCloseOf` and build the guard from its on-disk `touched_repos` +
+ * `primary_repo` — the SAME source-of-truth the dry-run reads off the brief.
+ * Returns null for a non-close mint (createdByCloseOf null) or an
+ * unresolvable/unreadable source epic (fail-open: a source that can't be read
+ * cannot prove multi-repo, so the existing default-to-primary path stands). */
+function loadSourceRepoGuard(
+  createdByCloseOf: string | null,
+): SourceRepoGuard | null {
+  if (createdByCloseOf === null) {
+    return null;
+  }
+  const resolution = resolveEpicGlobally(createdByCloseOf);
+  if (!resolution.resolved || resolution.epicPath === null) {
+    return null;
+  }
+  const sourceEpic = loadJsonSafe(resolution.epicPath);
+  if (sourceEpic === null) {
+    return null;
+  }
+  const touchedRepos = sourceEpic.touched_repos as string[] | null | undefined;
+  const primaryRepo =
+    (sourceEpic.primary_repo as string | null | undefined) ?? "";
+  return buildSourceRepoGuard(touchedRepos, primaryRepo);
+}
+
+/** Per-task `repo_required` offenders for a multi-repo source follow-up. Each
+ * task's `target_repo` (the raw entry value, null when omitted) must be present
+ * AND a member of the source's `touched_repos`. A single-repo source (or no
+ * guard) yields no offenders — the existing default-to-primary path is
+ * untouched. Pure + deterministic: reads only the guard's member set, never
+ * findings/clock/fs inference. */
+function repoRequiredErrors(
+  taskTargetRepos: (string | null)[],
+  guard: SourceRepoGuard | null,
+): string[] {
+  if (guard === null || !guard.multiRepo) {
+    return [];
+  }
+  const offenders: string[] = [];
+  for (let idx = 0; idx < taskTargetRepos.length; idx += 1) {
+    const prefix = `task #${idx + 1}`;
+    const tr = taskTargetRepos[idx];
+    if (tr === null || tr === undefined) {
+      offenders.push(
+        `${prefix}: \`target_repo\` is required — the source epic is ` +
+          "multi-repo, so a follow-up task cannot default to primary_repo",
+      );
+      continue;
+    }
+    if (!guard.allowed.has(normalizeRepo(tr))) {
+      offenders.push(
+        `${prefix}: \`target_repo\` ${pyReprStr(tr)} is not in the source ` +
+          "epic's touched_repos",
+      );
+    }
+  }
+  return offenders;
+}
+
 /** The dry-run validation verdict from validateScaffoldYaml — scaffold's
  * structural verdict WITHOUT minting. On success `ok` is true and `nTasks`
  * carries the task count; on failure `ok` is false and the
  * code/message/details triplet describes the dominant error class in
- * scaffold's exact priority order. Mirrors ScaffoldValidation. */
+ * scaffold's exact priority order. `taskTargetRepos` carries the per-task
+ * collected target_repo (null when omitted, validated-but-unexpanded string
+ * otherwise) so the dry-run seam can apply the cross-repo guard against the
+ * source's touched_repos. Mirrors ScaffoldValidation. */
 export interface ScaffoldValidation {
   ok: boolean;
   nTasks: number;
   code: string;
   message: string;
   details: string[];
+  taskTargetRepos: (string | null)[];
 }
 
 function validationFailure(
@@ -103,7 +224,7 @@ function validationFailure(
   message: string,
   details: string[],
 ): ScaffoldValidation {
-  return { ok: false, nTasks: 0, code, message, details };
+  return { ok: false, nTasks: 0, code, message, details, taskTargetRepos: [] };
 }
 
 /** Run scaffold's read-cap + parse + Phase-2 validation, NO mutation — the
@@ -123,6 +244,7 @@ export function validateScaffoldYaml(
   rawBytes: Buffer,
   fileLabel: string,
   checkEpicDeps = true,
+  sourceRepoGuard: SourceRepoGuard | null = null,
 ): ScaffoldValidation {
   if (rawBytes.length > MAX_YAML_BYTES) {
     return validationFailure(
@@ -223,6 +345,7 @@ export function validateScaffoldYaml(
   }
 
   const taskDepsList: number[][] = [];
+  const taskTargetRepos: (string | null)[] = [];
   const specErrors: string[] = [];
   const depErrors: string[] = [];
   const repoErrors: string[] = [];
@@ -235,6 +358,7 @@ export function validateScaffoldYaml(
     if (!isPlainObject(entry)) {
       errors.push(`${prefix}: must be a mapping`);
       taskDepsList.push([]);
+      taskTargetRepos.push(null);
       continue;
     }
 
@@ -276,21 +400,26 @@ export function validateScaffoldYaml(
     taskDepsList.push(isListOfInt(deps) ? [...deps] : []);
 
     const targetRepoRaw = "target_repo" in entry ? entry.target_repo : null;
-    if (targetRepoRaw !== null && targetRepoRaw !== undefined) {
-      if (!isStr(targetRepoRaw)) {
-        errors.push(`${prefix}: \`target_repo\` must be a string when present`);
+    if (targetRepoRaw === null || targetRepoRaw === undefined) {
+      taskTargetRepos.push(null);
+    } else if (!isStr(targetRepoRaw)) {
+      errors.push(`${prefix}: \`target_repo\` must be a string when present`);
+      taskTargetRepos.push(null);
+    } else {
+      const stripped = targetRepoRaw.trim();
+      if (stripped === "") {
+        repoErrors.push(
+          `${prefix}: \`target_repo\` must be non-empty after strip`,
+        );
+        taskTargetRepos.push(null);
+      } else if (!(stripped.startsWith("/") || stripped.startsWith("~"))) {
+        repoErrors.push(
+          `${prefix}: \`target_repo\` ${pyReprStr(targetRepoRaw)} must be an ` +
+            "absolute path (starts with / or ~)",
+        );
+        taskTargetRepos.push(null);
       } else {
-        const stripped = targetRepoRaw.trim();
-        if (stripped === "") {
-          repoErrors.push(
-            `${prefix}: \`target_repo\` must be non-empty after strip`,
-          );
-        } else if (!(stripped.startsWith("/") || stripped.startsWith("~"))) {
-          repoErrors.push(
-            `${prefix}: \`target_repo\` ${pyReprStr(targetRepoRaw)} must be an ` +
-              "absolute path (starts with / or ~)",
-          );
-        }
+        taskTargetRepos.push(stripped);
       }
     }
 
@@ -308,6 +437,10 @@ export function validateScaffoldYaml(
       );
     }
   }
+
+  // The cross-repo follow-up guard: a multi-repo source REQUIRES an explicit,
+  // in-set target_repo per task. Single-repo source / non-close mint → no-op.
+  const repoRequired = repoRequiredErrors(taskTargetRepos, sourceRepoGuard);
 
   // Failure-code priority order — identical to scaffold's run().
   if (errors.length > 0) {
@@ -383,6 +516,14 @@ export function validateScaffoldYaml(
       tierErrors,
     );
   }
+  if (repoRequired.length > 0) {
+    return validationFailure(
+      "repo_required",
+      "One or more follow-up tasks need an explicit in-set `target_repo` " +
+        "because the source epic is multi-repo",
+      repoRequired,
+    );
+  }
 
   // --- Cycle detection on the in-memory ordinal graph ---------------------
   const graph: Record<string, { depends_on: string[] }> = {};
@@ -400,7 +541,14 @@ export function validateScaffoldYaml(
     );
   }
 
-  return { ok: true, nTasks, code: "", message: "", details: [] };
+  return {
+    ok: true,
+    nTasks,
+    code: "",
+    message: "",
+    details: [],
+    taskTargetRepos,
+  };
 }
 
 export function runScaffold(args: ScaffoldArgs): number {
@@ -736,6 +884,24 @@ export function runScaffold(args: ScaffoldArgs): number {
       "tier_invalid",
       "One or more task `tier` values are invalid",
       tierErrors,
+    );
+    return 1;
+  }
+
+  // The cross-repo follow-up guard: a multi-repo source REQUIRES an explicit,
+  // in-set target_repo per task. Reads the SOURCE epic's touched_repos off disk
+  // — the same source-of-truth the dry-run reads off the brief. Single-repo
+  // source / non-close mint → no-op (the default-to-primary path below stands).
+  const repoRequired = repoRequiredErrors(
+    taskTargetRepos,
+    loadSourceRepoGuard(createdByCloseOf),
+  );
+  if (repoRequired.length > 0) {
+    emitFailureEnvelope(
+      "repo_required",
+      "One or more follow-up tasks need an explicit in-set `target_repo` " +
+        "because the source epic is multi-repo",
+      repoRequired,
     );
     return 1;
   }
