@@ -75,5 +75,5 @@ in the full tier; test:full is mandatory.
 - [ ] Full-tier integration test passes; `bun run test:full` green
 
 ## Done summary
-
+Built the keystone Agent Bus worker: keeperd's 16th Worker running a UDS pub/sub relay over T1 storage+resolution, with lock-before-bind, 0600 socket, NDJSON max-frame guard, peer-pid anti-spoof from-overwrite, bounded-queue eviction, monotonic two-threshold reap, and (pid,start_time) takeover. Proven end-to-end (directed send, broadcast, dead-name resolution, anti-spoof, shutdown release) by a full-tier integration test; test:full green.
 ## Evidence
