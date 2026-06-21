@@ -713,7 +713,6 @@ export async function main(argv: string[]): Promise<void> {
       }
       process.stdout.write(`${JSON.stringify(channels)}\n`);
       process.exit(0);
-      break;
     }
     case "resolve": {
       let res: unknown;
@@ -724,7 +723,6 @@ export async function main(argv: string[]): Promise<void> {
       }
       process.stdout.write(`${JSON.stringify(res)}\n`);
       process.exit(0);
-      break;
     }
     case "send": {
       const text = await resolveMessage(cmd.message);
@@ -734,7 +732,6 @@ export async function main(argv: string[]): Promise<void> {
         die((err as Error).message);
       }
       process.exit(0);
-      break;
     }
     case "broadcast": {
       const text = await resolveMessage(cmd.message);
@@ -744,7 +741,6 @@ export async function main(argv: string[]): Promise<void> {
         die((err as Error).message);
       }
       process.exit(0);
-      break;
     }
     case "watch": {
       await runWatch(sockPath);
