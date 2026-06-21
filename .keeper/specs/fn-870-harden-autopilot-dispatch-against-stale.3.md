@@ -39,5 +39,5 @@ five surfaces — this widens an existing one, does not add a sixth).
 - [ ] CLI help + README/CLAUDE CLI+RPC docs updated (forward-facing); `bun run test:full` green
 
 ## Done summary
-
+Widened the retry_dispatch validator (RETRY_DISPATCH_VERBS + RetryDispatchVerb) and the server-worker bridge/message types to accept the approve verb, so an operator can clear a resurrected/phantom approve pending via keeper autopilot retry. No new RPC (existing surface widened), no schema bump; CLI help + README updated.
 ## Evidence
