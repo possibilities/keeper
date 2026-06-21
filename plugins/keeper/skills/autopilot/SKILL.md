@@ -5,14 +5,14 @@ description: >-
   mode (yolo vs armed), arm / disarm an epic, retry a stuck dispatch, or read
   what it is doing. Also the temporary take-over window: capture the current
   {paused, mode, armed} state, change it for a bit, then restore it when the
-  human says done. Use when the human EXPLICITLY asks to control or inspect
-  the autopilot — "pause it", "let it rip", "only work fn-X", "approve fn-Y",
-  "what's autopilot doing". NOT for launching one worker by hand (that is
-  `keeper:dispatch`), NOT for "prioritize this" / "do this next" (that is
-  `plan:next`), NOT for planning (`/plan:plan`).
+  human says done. Use when the user asks to pause or steer the autopilot —
+  pause/play, mode, arm, retry, or inspect it ("pause it", "let it rip",
+  "only work fn-X", "approve fn-Y", "what's autopilot doing") — even when they
+  never say "keeper" or "autopilot". NOT for launching one worker by hand
+  (that is `keeper:dispatch`), NOT for "prioritize this" / "do this next"
+  (that is `plan:next`), NOT for planning (`/plan:plan`).
 allowed-tools: Bash Monitor
 argument-hint: pause | play | mode <yolo|armed> | arm <id> | disarm <id> | retry <verb::id> | show
-disable-model-invocation: true
 ---
 
 # autopilot
@@ -20,10 +20,11 @@ disable-model-invocation: true
 Turn a "control or inspect the autopilot" request into a `keeper autopilot`
 Bash call. The autopilot reconciler lives server-side in keeperd; it dispatches
 ready plan work on its own and **boots PAUSED for safety**. This skill is the
-human-gated operator surface over it — pausing, playing, mode-switching,
-arming, retrying a stuck dispatch, and reading its live state. This is an
-OPERATOR ESCAPE HATCH: exceptional and human-gated, not a philosophy shift. The
-normal path is the autopilot quietly working ready epics on its own.
+operator surface over it — pausing, playing, mode-switching, arming, retrying a
+stuck dispatch, and reading its live state. It is a precisely-triggered
+operator surface, conservative by default: it mutates global autopilot state
+only on a clear request to steer it. The autopilot quietly working ready epics
+on its own remains the everyday path.
 
 **Name-vs-subcommand collision.** This skill is named `autopilot` and the CLI
 it wraps is `keeper autopilot`. Running the viewer is a **Bash call**
@@ -31,7 +32,7 @@ it wraps is `keeper autopilot`. Running the viewer is a **Bash call**
 
 ## When this fires
 
-The human explicitly asks to control or inspect the autopilot. Two layers:
+The user asks to control or inspect the autopilot. Two layers:
 
 1. **Single control ops + reads** — pause / play, mode yolo|armed, arm /
    disarm an epic, retry a stuck dispatch, or "what's it doing." A bare control
@@ -255,9 +256,10 @@ allowed here ONLY for that cross-ref — a bare control op never needs it.
 
 ## Guardrails
 
-- **Exceptional, human-gated.** This is the operator surface over the autopilot
-  — the normal path is the reconciler working ready epics on its own. Only reach
-  for it when the human explicitly asks to control or inspect it.
+- **Precisely-triggered, conservative by default.** This is the operator surface
+  over the autopilot — the everyday path is the reconciler working ready epics on
+  its own. Reach for it on a clear request to control or inspect it, and never
+  mutate global state on ambiguous intent.
 - **Bare ops just run; take-over captures and restores.** A single control op is
   one Bash call with no capture. Capture → drive → restore is reserved for an
   explicit "take over for a bit, then put it back," and the window always closes

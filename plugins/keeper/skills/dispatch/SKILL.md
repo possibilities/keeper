@@ -1,29 +1,29 @@
 ---
 name: dispatch
 description: >-
-  Fire ONE claude worker into a tmux window by hand — the manual escape hatch
+  Fire ONE claude worker into a tmux window by hand — the manual surface
   parallel to the server-side autopilot reconciler. Two forms: plan form
   ("fire a worker on fn-N.M", "spawn a closer for fn-N") → `keeper dispatch
   work::fn-N.M` / `close::fn-N`; free form ("run this one-off prompt in a
-  worker") → `--prompt` / `--prompt-file`. Use when the human EXPLICITLY asks
-  to launch a single worker out of band. NOT for routine plan execution
-  (that is `/plan:work`, which runs in THIS session), NOT for resuming a
-  stuck autopilot retry or "approve fn-X" (that is `keeper:autopilot`), and
-  NOT for planning work (`/plan:plan`).
+  worker") → `--prompt` / `--prompt-file`. Use when the user asks to launch a
+  single worker by hand / spawn a closer — even when they never say "keeper"
+  or "dispatch". NOT for routine plan execution (that is `/plan:work`, which
+  runs in THIS session), NOT for resuming a stuck autopilot retry or
+  "approve fn-X" (that is `keeper:autopilot`), and NOT for planning work
+  (`/plan:plan`).
 allowed-tools: Bash
 argument-hint: <verb>::<id> | --prompt "<text>"
-disable-model-invocation: true
 ---
 
 # dispatch
 
 Turn a "launch ONE worker by hand" request into a single `keeper dispatch`
-Bash call. `keeper dispatch` is the manual escape hatch that fires one
-`claude` worker into a tmux window, parallel to — and independent of — the
-server-side autopilot reconciler. This is an OPERATOR ESCAPE HATCH:
-exceptional and human-gated, not the normal way work gets done. The normal
-path is the autopilot dispatching ready plan work on its own, or `/plan:work`
-running a task in THIS session.
+Bash call. `keeper dispatch` fires one `claude` worker into a tmux window,
+parallel to — and independent of — the server-side autopilot reconciler. This
+is a precisely-triggered operator surface, conservative by default: it fires a
+worker only on a clear request to launch one by hand. The autopilot dispatching
+ready plan work on its own, or `/plan:work` running a task in THIS session,
+remain the everyday paths.
 
 `keeper dispatch` is a ONE-SHOT Bash call (optionally `--dry-run` first). It
 is NOT a Monitor — dispatch has no snapshot / keeper-meta streaming mode. Run
@@ -31,7 +31,7 @@ it once and read the exit code.
 
 ## When this fires
 
-The user explicitly asks to launch a single worker out of band. Two shapes:
+The user asks to launch a single worker by hand. Two shapes:
 
 1. **Plan form** — fire a worker against an on-board plan id:
    - *"fire a worker on fn-871-…-skills.2"*, *"manually dispatch the next
@@ -227,9 +227,9 @@ on your own.** Offer the two options:
 
 ## Guardrails
 
-- **Exceptional, human-gated.** This is the operator escape hatch — the
-  normal path is the autopilot or `/plan:work`. Only reach for it when the
-  human explicitly asks to launch a worker by hand.
+- **Precisely-triggered, conservative by default.** This is a manual operator
+  surface — the everyday paths are the autopilot or `/plan:work`. Reach for it
+  on a clear request to launch a worker by hand, not for routine execution.
 - **Surface-and-ask on the race guard.** The skill never auto-pauses and
   never self-arms `--force`. It surfaces the refusal verbatim and asks.
 - **One worker per call.** `keeper dispatch` fires exactly one window. To
