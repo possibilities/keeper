@@ -64,5 +64,5 @@ KEEPER_BUS_SOCK/KEEPER_BUS_DB.
 - [ ] CLI unit tests pass; the full-tier round-trip is green under test:full
 
 ## Done summary
-
+Added the keeper bus CLI surface: cli/bus.ts (one-shot UDS client for list/resolve/chat send|broadcast with '-' stdin; long-lived watch subscriber rendering authoritative-directive lines, spilling over-budget bodies to bus/inbox/ with a compact pointer + startup prune) wired into cli/keeper.ts. Fast-tier unit tests + full-tier CLI round-trip against the .2 bus socket.
 ## Evidence

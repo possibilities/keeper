@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "keeper bus CLI",
-  "updated_at": "2026-06-21T22:35:27.203000Z"
+  "updated_at": "2026-06-21T22:45:04.168000Z",
+  "worker_done_at": "2026-06-21T22:45:04.168000Z"
 }
