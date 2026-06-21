@@ -30,5 +30,5 @@ Forward-facing docs for the new projection-class model, after `.1` lands. **CLAU
 - [ ] `cli/find-file-history.ts` reworded/repointed (live-only loses ancient attributions)
 
 ## Done summary
-
+Documented the live-only git projection class: CLAUDE.md taxonomy + skip-floor + boot-producer contract + time-bomb rule + no-wipe-live-projections migration discipline; README/charter-doc/planctl-strip scope re-fold determinism to deterministic-replayed projections and document the git surface as live-only; find-file-history repoints deep history at the event log.
 ## Evidence
