@@ -57,5 +57,5 @@ Confirm frontmatter still parses and no `disable-model-invocation` remains.
 - [ ] over-trigger stress-test passes on the four anchor phrasings above
 
 ## Done summary
-
+Made keeper:dispatch and keeper:autopilot model-invocable: removed disable-model-invocation, re-tuned descriptions to precise intent triggers with near-miss exclusions intact, reframed the slash-only/escape-hatch stance to precisely-triggered/conservative-by-default. All behavioral guardrails retained.
 ## Evidence
