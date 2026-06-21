@@ -317,8 +317,13 @@ export interface RegistryEntry {
   namespaces: string[];
   /** The subscribed socket; null until a `subscribe` op binds it. */
   sock: Writable | null;
-  /** Bounded outbound queue of pre-serialized NDJSON lines. */
-  queue: string[];
+  /**
+   * Bounded outbound queue of pre-serialized, UTF-8-encoded NDJSON frames. Held
+   * as bytes (never decoded strings) so a partial-write tail re-flushes
+   * byte-identical — a short write splitting a multi-byte sequence must not be
+   * round-tripped through a TextDecoder (it would mint U+FFFD).
+   */
+  queue: Uint8Array[];
   /** `performance.now()` of the last heartbeat (monotonic). */
   lastBeatMono: number;
   /** Whether a warn was already logged this miss-window (de-dupes warn spam). */
@@ -489,7 +494,7 @@ export function startBusServer(
         evict(entry, "queue-overflow");
         return;
       }
-      entry.queue.push(line);
+      entry.queue.push(encoder.encode(line));
       flushQueue(entry);
       return;
     }
@@ -502,8 +507,9 @@ export function startBusServer(
     }
     const decision = backpressureDecision(accepted, bytes.length, 0);
     if (decision === "ok") return;
-    // Short write — stash the unaccepted tail as a queued frame.
-    entry.queue.push(decodeTail(bytes, accepted));
+    // Short write — stash the unaccepted byte tail (never decoded; see queue
+    // doc) so it re-flushes byte-identical even when split mid-UTF-8-sequence.
+    entry.queue.push(requeueTail(bytes, accepted));
   };
 
   /** Flush queued frames until the socket backpressures or the queue empties. */
@@ -511,8 +517,7 @@ export function startBusServer(
     const sock = entry.sock;
     if (sock === null) return;
     while (entry.queue.length > 0) {
-      const frame = entry.queue[0];
-      const bytes = encoder.encode(frame);
+      const bytes = entry.queue[0];
       const accepted = safeWrite(sock, bytes);
       if (accepted < 0) {
         evict(entry, "write-closed");
@@ -522,8 +527,9 @@ export function startBusServer(
         entry.queue.shift();
         continue;
       }
-      // Partial — replace the head with its tail and stop (drain resumes us).
-      entry.queue[0] = decodeTail(bytes, accepted);
+      // Partial — replace the head with its byte tail and stop (drain resumes
+      // us). Sliced, not decoded, so a mid-UTF-8-sequence split stays intact.
+      entry.queue[0] = requeueTail(bytes, accepted);
       return;
     }
   };
@@ -1022,9 +1028,14 @@ function safeWrite(sock: Writable, bytes: Uint8Array): number {
   }
 }
 
-/** Decode the unaccepted tail of a buffer back to a string for re-queueing. */
-function decodeTail(bytes: Uint8Array, accepted: number): string {
-  return new TextDecoder().decode(bytes.subarray(Math.max(0, accepted)));
+/**
+ * Slice the unaccepted byte tail of a frame after a short write, for
+ * re-queueing. Returns a byte view (never a decoded string) so a write that
+ * lands mid multi-byte UTF-8 sequence re-flushes byte-identical instead of
+ * collapsing the split bytes to a U+FFFD replacement char.
+ */
+export function requeueTail(bytes: Uint8Array, accepted: number): Uint8Array {
+  return bytes.subarray(Math.max(0, accepted));
 }
 
 /** Send an `ack` frame (server → client). Never throws. */

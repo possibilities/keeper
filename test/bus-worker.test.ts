@@ -28,6 +28,7 @@ import {
   MAX_CLIENT_QUEUE,
   type RegistryEntry,
   reapDecision,
+  requeueTail,
   selectFanoutTargets,
   takeoverVictim,
 } from "../src/bus-worker";
@@ -262,4 +263,47 @@ test("enrichPeerFromJobs returns null on a keeper miss (resume-gap fallback path
   const { db } = freshMemDb();
   expect(enrichPeerFromJobs(db, 9999)).toBeNull();
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// requeueTail — byte-tail re-flush across a multi-byte-UTF-8-splitting short
+// write (regression: decoding the tail to a string minted U+FFFD, fn-876 F1)
+// ---------------------------------------------------------------------------
+
+test("requeueTail re-flushes a multi-byte UTF-8 body byte-identically across a write that splits a sequence", () => {
+  // A body whose bytes include markdown, emoji, and non-Latin script — routine
+  // bus traffic that a fixed-byte short write will split mid-sequence.
+  const source = "héllo **wörld** 🚀 日本語 — café\n";
+  const encoder = new TextEncoder();
+  const bytes = encoder.encode(source);
+
+  // Drive the relay's partial-write loop against a fake socket that accepts a
+  // fixed, sequence-splitting chunk per write. Each short write stashes a byte
+  // tail via requeueTail (mirrors deliver/flushQueue); the wire is the
+  // concatenation of every accepted chunk.
+  const CHUNK = 7; // small + prime → lands mid multi-byte sequence repeatedly
+  let frame: Uint8Array = bytes;
+  const wire: number[] = [];
+  // Bound the loop defensively; one byte minimum drains per iteration.
+  for (let guard = 0; guard < bytes.length + 1 && frame.length > 0; guard++) {
+    const accepted = Math.min(CHUNK, frame.length);
+    for (let i = 0; i < accepted; i++) wire.push(frame[i]);
+    frame = requeueTail(frame, accepted);
+  }
+
+  expect(frame.length).toBe(0);
+  const delivered = new Uint8Array(wire);
+  // Byte-identical on the wire …
+  expect(Array.from(delivered)).toEqual(Array.from(bytes));
+  // … and therefore decodes back to the exact source — no U+FFFD corruption.
+  expect(new TextDecoder("utf-8", { fatal: true }).decode(delivered)).toBe(
+    source,
+  );
+});
+
+test("requeueTail returns an empty tail when the whole frame was accepted", () => {
+  const bytes = new TextEncoder().encode("done\n");
+  expect(requeueTail(bytes, bytes.length).length).toBe(0);
+  // A spurious over-accept clamps to empty, never a negative-offset view.
+  expect(requeueTail(bytes, bytes.length + 5).length).toBe(0);
 });
