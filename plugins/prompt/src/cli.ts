@@ -207,7 +207,13 @@ function dispatch(parsed: ParsedArgs): number {
       return runBuildSnippets({ check, projectRoot });
     }
     case "find-snippets": {
-      const query = positional(parsed.rest);
+      const query = positional(parsed.rest, [
+        "--domain",
+        "--scope",
+        "--phase",
+        "--bundle",
+        "--limit",
+      ]);
       const projectRoot = resolveProjectRoot(null);
       const limitStr = readOption(parsed.rest, "--limit");
       return runFindSnippets(
@@ -246,7 +252,11 @@ function dispatch(parsed: ParsedArgs): number {
       );
     }
     case "save-bundle": {
-      const ref = positional(parsed.rest);
+      const ref = positional(parsed.rest, [
+        "--snippets",
+        "--summary",
+        "--tags",
+      ]);
       const projectRoot = resolveProjectRoot(null);
       return runSaveBundle(
         ref,
@@ -285,10 +295,27 @@ function dispatch(parsed: ParsedArgs): number {
   }
 }
 
-/** First non-flag positional in a verb's rest (skips `--flag value` pairs is the
- * caller's job — here we just take the first arg not starting with `-`). */
-function positional(rest: string[]): string | undefined {
-  return rest.find((a) => !a.startsWith("-"));
+/** First bare positional in a verb's rest, walking past value-bearing options and
+ * their values so `--opt val <positional>` resolves `<positional>` rather than
+ * the option's value. `valueOpts` names the `--name value` options the verb
+ * accepts; boolean flags (e.g. `--force`) start with `-` and are skipped as
+ * non-positionals. `--name=value` forms are self-contained and never consume the
+ * following token. */
+export function positional(
+  rest: string[],
+  valueOpts: readonly string[] = [],
+): string | undefined {
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i] as string;
+    if (!arg.startsWith("-")) {
+      return arg;
+    }
+    if (valueOpts.includes(arg)) {
+      // Skip the option's value so it can't be mistaken for the positional.
+      i += 1;
+    }
+  }
+  return undefined;
 }
 
 /** Read the value of a `--name value` or `--name=value` option from a verb's
