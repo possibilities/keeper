@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-21T04:26:44.773000Z",
   "created_at": "2026-06-20T21:35:18.910000Z",
   "depends_on_epics": [
     "fn-868-live-only-git-projection"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Sweep residual planctl symbols",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-21T01:14:29.168000Z"
+  "updated_at": "2026-06-21T04:26:44.773000Z"
 }
