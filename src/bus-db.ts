@@ -1,0 +1,360 @@
+/**
+ * Agent Bus storage layer (epic fn-875). The bus's OWN SQLite store, PHYSICALLY
+ * separate from keeper.db — its own file (`bus.db`), its own forward-only
+ * `PRAGMA user_version` ladder, decoupled from keeper's `SCHEMA_VERSION`. This
+ * keeps the bus OUT of keeper.db's blast radius: it adds NO keeper event type,
+ * projection, RPC surface, or schema-version bump, so keeper's re-fold
+ * determinism and tightly-scoped-write invariants hold by construction.
+ *
+ * NEVER call keeper's `openDb`/`migrate` on bus.db. We REUSE only the
+ * connection-local `applyPragmas` (schema-free WAL/foreign-keys setup) and run
+ * the bus's own migrate ladder below.
+ *
+ * Two tables (epic Architecture):
+ *  - `channels`  — one row per live registration, keyed on `(pid, start_time)`
+ *    to defeat OS pid reuse. Best-effort persistence cache: the in-memory
+ *    registry in the worker is the runtime source of truth; this table is
+ *    rehydrated at boot with dead pids dropped.
+ *  - `messages`  — append-only durable forensic log; `id` autoincrement is the
+ *    monotonic cursor a reconnecting subscriber replays from.
+ *
+ * Sole-writer: the bus worker owns the single writable connection. These helpers
+ * are pure over a passed `Database` handle so they unit-test in-process.
+ */
+
+import { Database } from "bun:sqlite";
+import { mkdirSync } from "node:fs";
+import { dirname } from "node:path";
+import { applyPragmas } from "./db";
+
+/**
+ * Current bus.db schema version — INDEPENDENT of keeper's `SCHEMA_VERSION`.
+ * Forward-only: bump only when adding a step to {@link migrateBusDb}.
+ */
+export const BUS_SCHEMA_VERSION = 1;
+
+const CREATE_CHANNELS = `
+CREATE TABLE IF NOT EXISTS channels (
+    channel_id     TEXT PRIMARY KEY,
+    pid            INTEGER NOT NULL,
+    start_time     TEXT NOT NULL,
+    session_id     TEXT,
+    current_name   TEXT,
+    name_history   TEXT NOT NULL DEFAULT '[]',
+    namespaces     TEXT NOT NULL DEFAULT '[]',
+    registered_at  REAL NOT NULL,
+    last_heartbeat REAL NOT NULL
+)
+`;
+
+/**
+ * `(pid, start_time)` is the stable identity key that defeats OS pid reuse — a
+ * recycled pid with a different process start time is a DIFFERENT agent. UNIQUE
+ * so an upsert keyed on it collapses re-registrations of the same process.
+ */
+const CREATE_CHANNELS_INDEXES = [
+  "CREATE UNIQUE INDEX IF NOT EXISTS idx_channels_pid_start ON channels(pid, start_time)",
+];
+
+const CREATE_MESSAGES = `
+CREATE TABLE IF NOT EXISTS messages (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts                  REAL NOT NULL,
+    namespace           TEXT NOT NULL,
+    event               TEXT NOT NULL,
+    from_channel_id     TEXT,
+    from_pid            INTEGER,
+    from_name           TEXT,
+    to_target           TEXT,
+    resolved_channel_id TEXT,
+    resolved_session_id TEXT,
+    body                TEXT,
+    body_size           INTEGER NOT NULL DEFAULT 0,
+    status              TEXT,
+    reply_to            INTEGER
+)
+`;
+
+const CREATE_MESSAGES_INDEXES = [
+  "CREATE INDEX IF NOT EXISTS idx_messages_ns_id ON messages(namespace, id)",
+];
+
+/**
+ * Run the bus's forward-only migrate ladder against an OPEN connection. Idempotent:
+ * `CREATE TABLE IF NOT EXISTS` + a `PRAGMA user_version` gate make a re-open a
+ * no-op. Wrapped in a transaction so a half-applied schema can never persist.
+ *
+ * `user_version` is the bus's own counter (NOT keeper's `meta(schema_version)`).
+ * A bus.db whose stored version EXCEEDS this binary's {@link BUS_SCHEMA_VERSION}
+ * throws — an old binary must not silently downgrade a newer bus.db. The throw
+ * is the loud, ISOLATED failure the epic risk note calls for: it surfaces in the
+ * bus worker only and must never wedge keeperd boot.
+ */
+export function migrateBusDb(db: Database): void {
+  const stored = Number(
+    (db.prepare("PRAGMA user_version").get() as { user_version: number } | null)
+      ?.user_version ?? 0,
+  );
+  if (stored > BUS_SCHEMA_VERSION) {
+    throw new Error(
+      `bus.db schema v${stored} is newer than this binary's v${BUS_SCHEMA_VERSION} — ` +
+        "deploy the newer keeper (or remove bus.db); refusing to downgrade",
+    );
+  }
+  db.transaction(() => {
+    db.run(CREATE_CHANNELS);
+    for (const ddl of CREATE_CHANNELS_INDEXES) db.run(ddl);
+    db.run(CREATE_MESSAGES);
+    for (const ddl of CREATE_MESSAGES_INDEXES) db.run(ddl);
+    // Stamp unconditionally — forward-only, never regresses (the > guard above
+    // already refused a newer DB).
+    db.run(`PRAGMA user_version = ${BUS_SCHEMA_VERSION}`);
+  })();
+}
+
+/**
+ * Open (creating if absent) the bus's writable SQLite store, apply the REUSED
+ * connection-local pragmas, and run the bus's own migrate ladder. NEVER routes
+ * through keeper's `openDb`/`migrate`.
+ *
+ * @param path  bus.db path (usually {@link resolveBusDbPath}).
+ */
+export function openBusDb(path: string): Database {
+  if (path !== ":memory:") {
+    mkdirSync(dirname(path), { recursive: true });
+  }
+  const db = new Database(path, { create: true });
+  applyPragmas(db);
+  migrateBusDb(db);
+  return db;
+}
+
+// ---------------------------------------------------------------------------
+// Channels — best-effort persistence cache of the live registry
+// ---------------------------------------------------------------------------
+
+/** A persisted channel row (the registry's durable cache shape). */
+export interface ChannelRow {
+  channel_id: string;
+  pid: number;
+  start_time: string;
+  session_id: string | null;
+  current_name: string | null;
+  /** Oldest→newest session names; an old name maps to the same agent forever. */
+  name_history: string[];
+  /** Tenant namespaces this channel is subscribed to (e.g. `["chat"]`). */
+  namespaces: string[];
+  registered_at: number;
+  last_heartbeat: number;
+}
+
+/** Decode a JSON-TEXT array cell to `string[]`, fail-soft to `[]`. */
+function decodeStringArray(cell: unknown): string[] {
+  if (typeof cell !== "string" || cell.length === 0) return [];
+  try {
+    const parsed = JSON.parse(cell);
+    return Array.isArray(parsed) ? parsed.map((v) => String(v)) : [];
+  } catch {
+    return [];
+  }
+}
+
+/** Decode a raw DB row to a {@link ChannelRow} (JSON-TEXT columns decoded). */
+function rowToChannel(row: Record<string, unknown>): ChannelRow {
+  return {
+    channel_id: String(row.channel_id),
+    pid: Number(row.pid),
+    start_time: String(row.start_time),
+    session_id: row.session_id == null ? null : String(row.session_id),
+    current_name: row.current_name == null ? null : String(row.current_name),
+    name_history: decodeStringArray(row.name_history),
+    namespaces: decodeStringArray(row.namespaces),
+    registered_at: Number(row.registered_at),
+    last_heartbeat: Number(row.last_heartbeat),
+  };
+}
+
+/**
+ * Upsert a channel keyed on its stable `(pid, start_time)` identity. A
+ * re-registration of the same process (same pid AND start_time) updates the row
+ * in place; a recycled pid with a different start_time is a distinct row.
+ *
+ * `channel_id` is the row's own primary key; we conflict-resolve on the UNIQUE
+ * `(pid, start_time)` index so the identity — not the synthetic id — drives the
+ * collapse.
+ */
+export function upsertChannel(db: Database, ch: ChannelRow): void {
+  db.prepare(
+    `INSERT INTO channels
+       (channel_id, pid, start_time, session_id, current_name, name_history,
+        namespaces, registered_at, last_heartbeat)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+     ON CONFLICT(pid, start_time) DO UPDATE SET
+        channel_id     = excluded.channel_id,
+        session_id     = excluded.session_id,
+        current_name   = excluded.current_name,
+        name_history   = excluded.name_history,
+        namespaces     = excluded.namespaces,
+        registered_at  = excluded.registered_at,
+        last_heartbeat = excluded.last_heartbeat`,
+  ).run(
+    ch.channel_id,
+    ch.pid,
+    ch.start_time,
+    ch.session_id,
+    ch.current_name,
+    JSON.stringify(ch.name_history),
+    JSON.stringify(ch.namespaces),
+    ch.registered_at,
+    ch.last_heartbeat,
+  );
+}
+
+/** Load all persisted channels (registry-cache rehydration source). */
+export function loadChannels(db: Database): ChannelRow[] {
+  const rows = db
+    .prepare(
+      "SELECT * FROM channels ORDER BY registered_at ASC, channel_id ASC",
+    )
+    .all() as Record<string, unknown>[];
+  return rows.map(rowToChannel);
+}
+
+/** Delete a channel by its stable `(pid, start_time)` identity (deregister/reap). */
+export function deleteChannel(
+  db: Database,
+  pid: number,
+  startTime: string,
+): void {
+  db.prepare("DELETE FROM channels WHERE pid = ? AND start_time = ?").run(
+    pid,
+    startTime,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Messages — append-only forensic log + replay cursor
+// ---------------------------------------------------------------------------
+
+/** A message to append. `id`/`ts` are assigned by {@link appendMessage}. */
+export interface MessageInput {
+  ts?: number;
+  namespace: string;
+  event: string;
+  from_channel_id?: string | null;
+  from_pid?: number | null;
+  from_name?: string | null;
+  to_target?: string | null;
+  resolved_channel_id?: string | null;
+  resolved_session_id?: string | null;
+  body?: string | null;
+  status?: string | null;
+  reply_to?: number | null;
+}
+
+/** A persisted message row (the full forensic shape). */
+export interface MessageRow {
+  id: number;
+  ts: number;
+  namespace: string;
+  event: string;
+  from_channel_id: string | null;
+  from_pid: number | null;
+  from_name: string | null;
+  to_target: string | null;
+  resolved_channel_id: string | null;
+  resolved_session_id: string | null;
+  body: string | null;
+  body_size: number;
+  status: string | null;
+  reply_to: number | null;
+}
+
+function rowToMessage(row: Record<string, unknown>): MessageRow {
+  return {
+    id: Number(row.id),
+    ts: Number(row.ts),
+    namespace: String(row.namespace),
+    event: String(row.event),
+    from_channel_id:
+      row.from_channel_id == null ? null : String(row.from_channel_id),
+    from_pid: row.from_pid == null ? null : Number(row.from_pid),
+    from_name: row.from_name == null ? null : String(row.from_name),
+    to_target: row.to_target == null ? null : String(row.to_target),
+    resolved_channel_id:
+      row.resolved_channel_id == null ? null : String(row.resolved_channel_id),
+    resolved_session_id:
+      row.resolved_session_id == null ? null : String(row.resolved_session_id),
+    body: row.body == null ? null : String(row.body),
+    body_size: Number(row.body_size),
+    status: row.status == null ? null : String(row.status),
+    reply_to: row.reply_to == null ? null : Number(row.reply_to),
+  };
+}
+
+/**
+ * Append one message; returns its assigned monotonic `id` (the replay cursor).
+ * `body_size` is derived from the byte length of `body` (forensic sizing of the
+ * spill threshold). `ts` defaults to wall-clock at append — this is a PRODUCER,
+ * not a fold, so reading the clock here is correct.
+ */
+export function appendMessage(db: Database, msg: MessageInput): number {
+  const body = msg.body ?? null;
+  const bodySize = body == null ? 0 : Buffer.byteLength(body, "utf8");
+  const ts = msg.ts ?? Date.now();
+  const info = db
+    .prepare(
+      `INSERT INTO messages
+         (ts, namespace, event, from_channel_id, from_pid, from_name,
+          to_target, resolved_channel_id, resolved_session_id, body, body_size,
+          status, reply_to)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    )
+    .run(
+      ts,
+      msg.namespace,
+      msg.event,
+      msg.from_channel_id ?? null,
+      msg.from_pid ?? null,
+      msg.from_name ?? null,
+      msg.to_target ?? null,
+      msg.resolved_channel_id ?? null,
+      msg.resolved_session_id ?? null,
+      body,
+      bodySize,
+      msg.status ?? null,
+      msg.reply_to ?? null,
+    );
+  return Number(info.lastInsertRowid);
+}
+
+/** The current max message id (the live replay cursor), or 0 when empty. */
+export function maxMessageId(db: Database): number {
+  const row = db.prepare("SELECT MAX(id) AS m FROM messages").get() as {
+    m: number | null;
+  } | null;
+  return Number(row?.m ?? 0);
+}
+
+/**
+ * Replay messages strictly AFTER `afterId`, oldest-first — the reconnect-recovery
+ * path. A subscriber that drops at cursor C calls this with `afterId = C` to
+ * recover everything it missed, optionally narrowed to one tenant `namespace`.
+ */
+export function replayFromCursor(
+  db: Database,
+  afterId: number,
+  namespace?: string,
+): MessageRow[] {
+  const rows =
+    namespace === undefined
+      ? db
+          .prepare("SELECT * FROM messages WHERE id > ? ORDER BY id ASC")
+          .all(afterId)
+      : db
+          .prepare(
+            "SELECT * FROM messages WHERE id > ? AND namespace = ? ORDER BY id ASC",
+          )
+          .all(afterId, namespace);
+  return (rows as Record<string, unknown>[]).map(rowToMessage);
+}

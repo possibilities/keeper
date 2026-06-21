@@ -65,6 +65,31 @@ export function resolveSockPath(): string {
   return join(homedir(), ".local", "state", "keeper", "keeperd.sock");
 }
 
+/**
+ * `KEEPER_BUS_DB` env wins; else `~/.local/state/keeper/bus.db`. Pure.
+ *
+ * The Agent Bus's OWN SQLite store, PHYSICALLY separate from keeper.db so the
+ * bus adds no keeper event/projection/RPC/schema-version. Mirrors
+ * {@link resolveDbPath}; never passed to `openDb`/`migrate` (bus.db runs its own
+ * `PRAGMA user_version` ladder in `src/bus-db.ts`).
+ */
+export function resolveBusDbPath(): string {
+  const override = process.env.KEEPER_BUS_DB;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "bus.db");
+}
+
+/** `KEEPER_BUS_SOCK` env wins; else `~/.local/state/keeper/bus.sock`. Pure. */
+export function resolveBusSockPath(): string {
+  const override = process.env.KEEPER_BUS_SOCK;
+  if (override && override.length > 0) {
+    return override;
+  }
+  return join(homedir(), ".local", "state", "keeper", "bus.sock");
+}
+
 /** `KEEPER_RESTORE_FILE` env wins; else `~/.local/state/keeper/restore.json`. Pure. */
 export function resolveRestorePath(): string {
   const override = process.env.KEEPER_RESTORE_FILE;

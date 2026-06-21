@@ -1,0 +1,267 @@
+/**
+ * Pure in-process tests for `src/bus-db.ts` — the Agent Bus's OWN SQLite store
+ * (epic fn-875). Covers the bus's independent `user_version` migrate ladder
+ * (idempotent re-open, downgrade refusal), the `channels` registry-cache upsert
+ * keyed on `(pid, start_time)` (pid-reuse safety), and the append-only `messages`
+ * log's monotonic-cursor + replay-from-cursor contract.
+ *
+ * `openBusDb(":memory:")` runs the bus ladder against a private memory DB — no
+ * sandbox env needed (the store never touches keeper.db or any prod path).
+ */
+
+import { Database } from "bun:sqlite";
+import { expect, test } from "bun:test";
+import {
+  appendMessage,
+  BUS_SCHEMA_VERSION,
+  type ChannelRow,
+  deleteChannel,
+  loadChannels,
+  maxMessageId,
+  migrateBusDb,
+  openBusDb,
+  replayFromCursor,
+  upsertChannel,
+} from "../src/bus-db";
+
+function makeChannel(overrides: Partial<ChannelRow> = {}): ChannelRow {
+  return {
+    channel_id: "ch-1",
+    pid: 1000,
+    start_time: "2026-06-21T00:00:00Z",
+    session_id: "sess-1",
+    current_name: "alpha",
+    name_history: ["alpha"],
+    namespaces: ["chat"],
+    registered_at: 1,
+    last_heartbeat: 1,
+    ...overrides,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Migrate ladder
+// ---------------------------------------------------------------------------
+
+test("openBusDb stamps the bus user_version and creates both tables", () => {
+  const db = openBusDb(":memory:");
+  const ver = (
+    db.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    }
+  ).user_version;
+  expect(ver).toBe(BUS_SCHEMA_VERSION);
+  const tables = (
+    db.prepare("SELECT name FROM sqlite_master WHERE type = 'table'").all() as {
+      name: string;
+    }[]
+  ).map((r) => r.name);
+  expect(tables).toContain("channels");
+  expect(tables).toContain("messages");
+  db.close();
+});
+
+test("migrateBusDb is idempotent across re-runs (no duplicate-column / table throw)", () => {
+  const db = openBusDb(":memory:");
+  expect(() => migrateBusDb(db)).not.toThrow();
+  expect(() => migrateBusDb(db)).not.toThrow();
+  const ver = (
+    db.prepare("PRAGMA user_version").get() as {
+      user_version: number;
+    }
+  ).user_version;
+  expect(ver).toBe(BUS_SCHEMA_VERSION);
+  db.close();
+});
+
+test("migrateBusDb refuses to downgrade a newer bus.db", () => {
+  const db = new Database(":memory:");
+  db.run(`PRAGMA user_version = ${BUS_SCHEMA_VERSION + 5}`);
+  expect(() => migrateBusDb(db)).toThrow(/newer than this binary/);
+  db.close();
+});
+
+test("bus.db migrate never calls keeper's openDb — keeper.db is untouched", () => {
+  // A bus DB carries the bus user_version, NOT keeper's meta(schema_version).
+  const db = openBusDb(":memory:");
+  const metaExists = db
+    .prepare(
+      "SELECT name FROM sqlite_master WHERE type='table' AND name='meta'",
+    )
+    .get();
+  expect(metaExists).toBeNull();
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// channels — registry cache keyed on (pid, start_time)
+// ---------------------------------------------------------------------------
+
+test("upsertChannel inserts then updates in place on the same (pid, start_time)", () => {
+  const db = openBusDb(":memory:");
+  upsertChannel(db, makeChannel({ current_name: "alpha" }));
+  upsertChannel(
+    db,
+    makeChannel({
+      current_name: "alpha-renamed",
+      name_history: ["alpha", "alpha-renamed"],
+    }),
+  );
+  const all = loadChannels(db);
+  expect(all).toHaveLength(1);
+  expect(all[0].current_name).toBe("alpha-renamed");
+  expect(all[0].name_history).toEqual(["alpha", "alpha-renamed"]);
+  db.close();
+});
+
+test("pid reuse with a different start_time is a DISTINCT channel row", () => {
+  const db = openBusDb(":memory:");
+  upsertChannel(
+    db,
+    makeChannel({ channel_id: "ch-1", pid: 1000, start_time: "t1" }),
+  );
+  upsertChannel(
+    db,
+    makeChannel({ channel_id: "ch-2", pid: 1000, start_time: "t2" }),
+  );
+  const all = loadChannels(db);
+  expect(all).toHaveLength(2);
+  expect(new Set(all.map((c) => c.start_time))).toEqual(new Set(["t1", "t2"]));
+  db.close();
+});
+
+test("loadChannels round-trips JSON-TEXT arrays and deleteChannel reaps by identity", () => {
+  const db = openBusDb(":memory:");
+  upsertChannel(
+    db,
+    makeChannel({
+      name_history: ["a", "b", "c"],
+      namespaces: ["chat", "pair"],
+    }),
+  );
+  const [loaded] = loadChannels(db);
+  expect(loaded.name_history).toEqual(["a", "b", "c"]);
+  expect(loaded.namespaces).toEqual(["chat", "pair"]);
+  deleteChannel(db, loaded.pid, loaded.start_time);
+  expect(loadChannels(db)).toHaveLength(0);
+  db.close();
+});
+
+// ---------------------------------------------------------------------------
+// messages — append-only monotonic cursor + replay
+// ---------------------------------------------------------------------------
+
+test("appendMessage assigns a strictly increasing monotonic id cursor", () => {
+  const db = openBusDb(":memory:");
+  const id1 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "one",
+  });
+  const id2 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "two",
+  });
+  const id3 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "three",
+  });
+  expect(id2).toBeGreaterThan(id1);
+  expect(id3).toBeGreaterThan(id2);
+  expect(maxMessageId(db)).toBe(id3);
+  db.close();
+});
+
+test("maxMessageId is 0 on an empty log", () => {
+  const db = openBusDb(":memory:");
+  expect(maxMessageId(db)).toBe(0);
+  db.close();
+});
+
+test("appendMessage derives body_size from the UTF-8 byte length", () => {
+  const db = openBusDb(":memory:");
+  const id = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "héllo",
+  });
+  const row = db
+    .prepare("SELECT body_size FROM messages WHERE id = ?")
+    .get(id) as {
+    body_size: number;
+  };
+  expect(row.body_size).toBe(Buffer.byteLength("héllo", "utf8"));
+  db.close();
+});
+
+test("replayFromCursor returns only messages strictly after the cursor, oldest-first", () => {
+  const db = openBusDb(":memory:");
+  const id1 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "a",
+  });
+  const id2 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "b",
+  });
+  const id3 = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "c",
+  });
+  const recovered = replayFromCursor(db, id1);
+  expect(recovered.map((m) => m.id)).toEqual([id2, id3]);
+  expect(recovered.map((m) => m.body)).toEqual(["b", "c"]);
+  // Cursor at the head recovers nothing.
+  expect(replayFromCursor(db, id3)).toHaveLength(0);
+  db.close();
+});
+
+test("replayFromCursor narrows to one tenant namespace when given", () => {
+  const db = openBusDb(":memory:");
+  appendMessage(db, { namespace: "chat", event: "message", body: "chat-1" });
+  appendMessage(db, { namespace: "pair", event: "message", body: "pair-1" });
+  appendMessage(db, { namespace: "chat", event: "message", body: "chat-2" });
+  const chatOnly = replayFromCursor(db, 0, "chat");
+  expect(chatOnly.map((m) => m.body)).toEqual(["chat-1", "chat-2"]);
+  const pairOnly = replayFromCursor(db, 0, "pair");
+  expect(pairOnly.map((m) => m.body)).toEqual(["pair-1"]);
+  db.close();
+});
+
+test("appendMessage persists the full forensic envelope including reply_to + namespace", () => {
+  const db = openBusDb(":memory:");
+  const root = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    from_channel_id: "ch-a",
+    from_pid: 42,
+    from_name: "alpha",
+    to_target: "beta",
+    resolved_channel_id: "ch-b",
+    resolved_session_id: "sess-b",
+    body: "hi",
+    status: "delivered",
+  });
+  const reply = appendMessage(db, {
+    namespace: "chat",
+    event: "message",
+    body: "re: hi",
+    reply_to: root,
+  });
+  const [m] = replayFromCursor(db, root);
+  expect(m.id).toBe(reply);
+  expect(m.reply_to).toBe(root);
+  expect(m.namespace).toBe("chat");
+  const rootRow = db
+    .prepare("SELECT * FROM messages WHERE id = ?")
+    .get(root) as Record<string, unknown>;
+  expect(rootRow.from_name).toBe("alpha");
+  expect(rootRow.resolved_session_id).toBe("sess-b");
+  expect(rootRow.status).toBe("delivered");
+  db.close();
+});

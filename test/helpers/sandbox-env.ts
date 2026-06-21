@@ -73,6 +73,10 @@ export function sandboxEnv(opts: SandboxEnvOptions): Record<string, string> {
   env.KEEPER_DROP_LOG = join(tmpDir, "hook-drops.ndjson");
   env.KEEPER_RESTORE_FILE = join(tmpDir, "restore.json");
   env.KEEPER_BACKSTOP_LOG = join(tmpDir, "backstop.ndjson");
+  // Agent Bus state (fn-875): its own DB + UDS socket, sandboxed alongside the
+  // keeper paths so a bus-spawn test never strands them at production defaults.
+  env.KEEPER_BUS_DB = join(tmpDir, "bus.db");
+  env.KEEPER_BUS_SOCK = join(tmpDir, "bus.sock");
 
   // Drop any key whose value was cleared to undefined.
   const out: Record<string, string> = {};
