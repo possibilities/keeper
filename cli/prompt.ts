@@ -1,10 +1,9 @@
 #!/usr/bin/env bun
 /**
  * `keeper prompt <verb>` — in-process entry point for the prompt-substrate verb
- * dispatcher. `keeper prompt` is the canonical command (the retired standalone
- * `promptctl` CLI is gone); this entry exists so callers — install.sh, the plan
- * generated-guard hooks, skills, scripts — invoke the prompt engine through the
- * single `keeper` binary now that the plugins are co-hosted in one repo.
+ * dispatcher. `keeper prompt` is the canonical command; this entry lets callers —
+ * install.sh, the plan generated-guard hooks, skills, scripts — invoke the prompt
+ * engine through the single `keeper` binary, the plugins being co-hosted in one repo.
  *
  * Contract — the dispatcher runs IN-PROCESS (no child spawn), so argv flows
  * through verbatim (the keeper dispatcher already stripped the `prompt` token via

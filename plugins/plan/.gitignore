@@ -8,15 +8,15 @@ node_modules/
 # Planctl runtime state (ephemeral; see .planctl/state/ contract)
 .planctl/state/
 
-# Project-scoped promptctl runtime store
+# Project-scoped keeper-prompt runtime store
 .promptctl/
 
-# Sidecar markers stamped next to every promptctl-rendered output
+# Sidecar markers stamped next to every keeper-prompt-rendered output
 # (carry {_warning, source_template, sha256} for the check-generated guard).
 **/*.managed-file-dont-edit
 
 # Generated agents (rendered from template/agents/*.md.tmpl via
-# promptctl render-plugin-templates; carries _promptctl_path marker).
+# keeper prompt render-plugin-templates; carries _promptctl_path marker).
 agents/practice-scout.md
 
 # Generated per-tier worker agents (rendered from template/agents/worker.md.tmpl
