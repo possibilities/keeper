@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-21T04:36:03.411000Z",
   "created_at": "2026-06-21T02:00:58.642000Z",
   "created_by_close_of": "fn-868-live-only-git-projection",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Test seed-then-live git re-emit idempotency",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-21T02:00:58.642000Z"
+  "updated_at": "2026-06-21T04:36:03.411000Z"
 }
