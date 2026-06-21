@@ -224,14 +224,14 @@ export interface CommitMessage {
  * re-classification. One message per commit; {@link changes} is non-empty by
  * construction (emission is suppressed when no planctl path moved).
  */
-export interface PlanctlChangedFile {
+export interface PlanChangedFile {
   /** Repo-relative path (forward-slash on POSIX). */
   path: string;
   /** `"upsert"` (present in HEAD) or `"delete"` (`git rm`'d in this commit). */
   op: "upsert" | "delete";
 }
 
-export interface PlanctlCommitChangedMessage {
+export interface PlanCommitChangedMessage {
   /**
    * Name-tolerant during the daemon name-erasure: main folds BOTH the legacy
    * `planctl-commit-changed` and the post-flip `plan-commit-changed` kinds
@@ -243,14 +243,14 @@ export interface PlanctlCommitChangedMessage {
   kind: "planctl-commit-changed" | "plan-commit-changed";
   project_dir: string;
   commit_oid: string;
-  changes: PlanctlChangedFile[];
+  changes: PlanChangedFile[];
 }
 
 export type GitWorkerMessage =
   | GitSnapshotMessage
   | GitRootDroppedMessage
   | CommitMessage
-  | PlanctlCommitChangedMessage
+  | PlanCommitChangedMessage
   // A backstop rescue/rollup record posted up to main (the sole sidecar writer).
   // NOT folded into the event log — routed straight to `handleBackstopMessage`.
   | BackstopMessage;
@@ -828,7 +828,7 @@ const PRODUCER_OID_RE = /^[0-9a-f]{40}(?:[0-9a-f]{24})?$/;
  * The sole gate for {@link filterPlanctlChanges}: only a commit touching one of
  * these `.keeper/` shapes is forwarded to the plan-worker.
  */
-export function isPlanctlChangedPath(path: string): boolean {
+export function isPlanChangedPath(path: string): boolean {
   if (!path.endsWith(".json")) return false;
   const segments = path.split("/");
   const n = segments.length;
@@ -857,10 +857,10 @@ export function isPlanctlChangedPath(path: string): boolean {
  */
 export function filterPlanctlChanges(
   files: EnumeratedCommitFile[],
-): PlanctlChangedFile[] {
-  const out: PlanctlChangedFile[] = [];
+): PlanChangedFile[] {
+  const out: PlanChangedFile[] = [];
   for (const f of files) {
-    if (!isPlanctlChangedPath(f.path)) continue;
+    if (!isPlanChangedPath(f.path)) continue;
     out.push({ path: f.path, op: f.blob_oid === null ? "delete" : "upsert" });
   }
   return out;
@@ -1973,7 +1973,7 @@ function startWorker(): void {
             // Epic fn-681: authoritative commit-driven planctl ingest.
             // Filter the commit's enumerated file list to planctl-shaped
             // paths (epics / tasks / state-tasks) and post one
-            // {@link PlanctlCommitChangedMessage} per commit carrying any
+            // {@link PlanCommitChangedMessage} per commit carrying any
             // such paths. Suppressed when the commit touched no planctl
             // files — the common case for source commits. Main forwards
             // the message verbatim to plan-worker, which re-ingests each
@@ -1988,7 +1988,7 @@ function startWorker(): void {
                 project_dir: root,
                 commit_oid: c.commit_oid,
                 changes: planctlChanges,
-              } satisfies PlanctlCommitChangedMessage);
+              } satisfies PlanCommitChangedMessage);
             }
           }
         } catch (err) {

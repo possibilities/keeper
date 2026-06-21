@@ -54,7 +54,7 @@
  * (`planctl-commit-changed` → re-ingest the committed bytes, drop-proof and free
  * of the mid-write partial-read race); the fast `data_version` poll drives a
  * gated {@link PlanScanner.recheckPending} drain plus a change-gated
- * {@link reconcilePlanctlDirs} re-scan, collapsing close→emit for any repo
+ * {@link reconcilePlanDirs} re-scan, collapsing close→emit for any repo
  * keeper already watches; the periodic reconcile heartbeat is the paranoia
  * backstop for the brand-new-repo case no DB write accompanies; and the broad
  * `@parcel/watcher` subscription is the best-effort live path, the only one for
@@ -107,7 +107,7 @@ export interface PlanWorkerData {
    * When `true`, the worker NEVER `import()`s `@parcel/watcher` — it skips the
    * live FSEvents subscribe + the reflog watches and runs a POLLING degrade: the
    * boot scan per root plus the fast `data_version` poll and the periodic
-   * `reconcilePlanctlDirs` heartbeat carry the live fold pipeline at poll/
+   * `reconcilePlanDirs` heartbeat carry the live fold pipeline at poll/
    * heartbeat cadence. The in-process daemon harness sets this so the slow-test
    * tier never dlopens the NAPI addon. A real resilience path — the degrade
    * keeper would take if the addon ever failed to load.
@@ -277,7 +277,7 @@ export interface KickMessage {
 }
 
 /**
- * One entry on a {@link PlanctlCommitChangedMessage} — a single
+ * One entry on a {@link PlanCommitChangedMessage} — a single
  * `.keeper/**` path that changed in the committed delta the git-worker
  * just observed. `path` is repo-relative (forward-slash on POSIX), tagged
  * by the git-side `diff-tree` parse with the file's commit-time fate.
@@ -295,7 +295,7 @@ export interface KickMessage {
  *   the change-gate's recovered epicId. This gives commit-path deletion
  *   without relying on FSEvents delete events.
  */
-export interface PlanctlCommitChange {
+export interface PlanCommitChange {
   path: string;
   op: "upsert" | "delete";
 }
@@ -321,7 +321,7 @@ export interface PlanctlCommitChange {
  * any per-path failure (stat race, malformed JSON) skip-and-logs without
  * stalling the rest, mirroring the live FSEvents path.
  */
-export interface PlanctlCommitChangedMessage {
+export interface PlanCommitChangedMessage {
   /**
    * Name-tolerant during the daemon name-erasure: the consumer folds BOTH the
    * legacy `planctl-commit-changed` and the post-flip `plan-commit-changed`
@@ -332,7 +332,7 @@ export interface PlanctlCommitChangedMessage {
    */
   type: "planctl-commit-changed" | "plan-commit-changed";
   repo: string;
-  changes: PlanctlCommitChange[];
+  changes: PlanCommitChange[];
 }
 
 /** Inbound message protocol — every shape main sends to the worker. */
@@ -340,7 +340,7 @@ export type InboundMessage =
   | ShutdownMessage
   | RecheckPendingMessage
   | KickMessage
-  | PlanctlCommitChangedMessage;
+  | PlanCommitChangedMessage;
 
 /**
  * Cap a plan file's size before `JSON.parse`. Plan JSONs live under a
@@ -818,7 +818,7 @@ export class PlanScanner {
   private readonly runtimeStatusCache = new Map<string, string>();
   /**
    * The set of planctl ids whose backing `.json` file was actually enumerated
-   * on disk by a boot scan ({@link markSeen}, called from `scanPlanctlDir` for
+   * on disk by a boot scan ({@link markSeen}, called from `scanPlanDir` for
    * EVERY file regardless of parse outcome). The boot-reconciliation
    * {@link sweep} diffs the projection against this census to retract ghosts —
    * projection ids whose file was deleted while the daemon was down (no live
@@ -1062,7 +1062,7 @@ export class PlanScanner {
   /**
    * The set of repo roots that currently own at least one path in the
    * observation gate's {@link pending} set, derived via
-   * {@link repoRootFromPlanctlPath} (pure path arithmetic). The live worker
+   * {@link repoRootFromPlanPath} (pure path arithmetic). The live worker
    * reconciles its `.git/logs/HEAD` reflog watches against this set:
    * a repo enters when it gains a first pending path and leaves when its last
    * pending path drains, keeping the watch lifecycle bounded. A path whose
@@ -1072,7 +1072,7 @@ export class PlanScanner {
   pendingRepos(): Set<string> {
     const repos = new Set<string>();
     for (const path of this.pending) {
-      const root = repoRootFromPlanctlPath(path);
+      const root = repoRootFromPlanPath(path);
       if (root !== null) {
         repos.add(root);
       }
@@ -1115,7 +1115,7 @@ export class PlanScanner {
 
   /**
    * Prime the per-task runtime-status cache from a boot enumeration of
-   * `.keeper/state/tasks/<task_id>.state.json` (called by `scanPlanctlDir`
+   * `.keeper/state/tasks/<task_id>.state.json` (called by `scanPlanDir`
    * BEFORE the `tasks/` loop). Pure cache write — does NOT emit a snapshot,
    * does NOT touch `pathToId`, does NOT touch the on-disk census
    * ({@link markSeen} — state files are sidecar, not enrolled). The
@@ -1307,7 +1307,7 @@ export class PlanScanner {
    * (a fresh entity or a changed one that cleared the change-gate); `false` for
    * every no-op outcome (non-plan path, gated-to-pending, unchanged snapshot,
    * parse skip, task-state cache poke). The boolean lets a backstop caller
-   * ({@link reconcilePlanctlDirs} via heartbeat / FSEvents-drop rescan) detect
+   * ({@link reconcilePlanDirs} via heartbeat / FSEvents-drop rescan) detect
    * that it delivered work a fast path missed and log a trigger-tagged line.
    *
    * `triggeredByCommit` (default `false`): when `true`, the `isTracked`
@@ -1558,7 +1558,7 @@ export class PlanScanner {
     // repo to batch-probe and would have failed `isPathInHead` anyway.
     const byRepo = new Map<string, string[]>();
     for (const path of this.pending) {
-      const repo = repoRootFromPlanctlPath(path);
+      const repo = repoRootFromPlanPath(path);
       if (repo === null) continue;
       if (root !== undefined && repo !== root) continue;
       const group = byRepo.get(repo);
@@ -1661,7 +1661,7 @@ export class PlanScanner {
   /**
    * Record that a `.keeper/{epics,tasks}/*.json` file was enumerated on disk
    * during a boot scan — the on-disk census the {@link sweep} diffs against.
-   * Called from `scanPlanctlDir` for EVERY file BEFORE `onChange`, so it counts
+   * Called from `scanPlanDir` for EVERY file BEFORE `onChange`, so it counts
    * regardless of whether the snapshot parsed or was change-gate-suppressed.
    *
    * The id is derived from the filename (basename minus `.json`), which equals
@@ -1877,7 +1877,7 @@ function stringifyErr(err: unknown): string {
  * construction. A future subtree-planctl layout would need to switch to
  * `git rev-parse`.
  */
-export function repoRootFromPlanctlPath(path: string): string | null {
+export function repoRootFromPlanPath(path: string): string | null {
   // Walk up from `path` looking for a `.keeper` plan data dir;
   // return its parent. The shape is always
   // `.../<root>/<data-dir>/{epics,tasks}/<id>.json` so the data-dir element sits
@@ -1920,7 +1920,7 @@ export function repoRootFromPlanctlPath(path: string): string | null {
  * Exported for unit reach.
  */
 export function isPathInHead(path: string): boolean {
-  const root = repoRootFromPlanctlPath(path);
+  const root = repoRootFromPlanPath(path);
   if (root === null) {
     return false;
   }
@@ -2184,7 +2184,7 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
       continue;
     }
     const full = join(dir, resolved);
-    scanPlanctlDir(full, scanner);
+    scanPlanDir(full, scanner);
   }
 }
 
@@ -2228,8 +2228,8 @@ export function scanRoot(root: string, scanner: PlanScanner): void {
  * the return (boot isn't a backstop; `db-poll` IS a fast path, stamped
  * separately via {@link PlanScanner.markFastPath}).
  */
-function scanPlanctlDir(
-  planctlDir: string,
+function scanPlanDir(
+  planDir: string,
   scanner: PlanScanner,
   triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
 ): boolean {
@@ -2243,7 +2243,7 @@ function scanPlanctlDir(
   // vocabulary; malformed JSON / bad-status / oversized files skip-and-log
   // without poisoning the cache. The cache write is the only side effect:
   // no snapshot emits here.
-  const stateDir = join(planctlDir, "state", "tasks");
+  const stateDir = join(planDir, "state", "tasks");
   let stateNames: string[];
   try {
     stateNames = readdirSync(stateDir);
@@ -2316,7 +2316,7 @@ function scanPlanctlDir(
   // primed cache so their first emitted snapshot carries the correct
   // runtime_status.
   for (const collection of ["epics", "tasks"]) {
-    const dir = join(planctlDir, collection);
+    const dir = join(planDir, collection);
     let names: string[];
     try {
       names = readdirSync(dir);
@@ -2369,9 +2369,9 @@ function scanPlanctlDir(
  * for a symlink), so a symlink cycle can't trap the walk. A missing root
  * skip-and-logs (same discipline as {@link scanRoot}). Pure I/O — no DB
  * read, no event emission; the change-gate side effect lives downstream in
- * {@link scanPlanctlDir}. Exported for unit reach.
+ * {@link scanPlanDir}. Exported for unit reach.
  */
-export function discoverPlanctlDirs(roots: readonly string[]): string[] {
+export function discoverPlanDirs(roots: readonly string[]): string[] {
   const dirs: string[] = [];
   for (const root of roots) {
     let entries: Dirent[];
@@ -2379,7 +2379,7 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
       entries = readdirSync(root, { withFileTypes: true });
     } catch (err) {
       console.error(
-        `[plan-worker] discoverPlanctlDirs failed to read ${root}: ${stringifyErr(err)}`,
+        `[plan-worker] discoverPlanDirs failed to read ${root}: ${stringifyErr(err)}`,
       );
       continue;
     }
@@ -2410,12 +2410,12 @@ export function discoverPlanctlDirs(roots: readonly string[]): string[] {
 /**
  * Re-scan a single repo root's `.keeper/` data dir
  * ({@link resolveDataDirName}) through the change-gated
- * {@link scanPlanctlDir} primitive. The repo-scoped re-scan the reflog-watch
+ * {@link scanPlanDir} primitive. The repo-scoped re-scan the reflog-watch
  * fire uses (a commit landed in `repoRoot`, possibly already in-HEAD before any
  * FSEvent gated it). A no-op when the repo holds no data dir. `triggerReason`
  * tags the calling trigger for the per-emit log line, same as
- * {@link scanPlanctlDir}. Pure I/O dispatch — no DB read, no emission of its
- * own; the change-gate side effect lives in {@link scanPlanctlDir}. Exported
+ * {@link scanPlanDir}. Pure I/O dispatch — no DB read, no emission of its
+ * own; the change-gate side effect lives in {@link scanPlanDir}. Exported
  * for unit reach.
  */
 export function scanRepoDataDirs(
@@ -2435,13 +2435,13 @@ export function scanRepoDataDirs(
   }
   const resolved = resolveDataDirName(present);
   if (resolved !== null) {
-    scanPlanctlDir(join(repoRoot, resolved), scanner, triggerReason);
+    scanPlanDir(join(repoRoot, resolved), scanner, triggerReason);
   }
 }
 
 /**
  * ADDITIVE re-ingest of every `<root>/<project>/<data-dir>` dir discovered by
- * {@link discoverPlanctlDirs} via the change-gated {@link scanPlanctlDir}
+ * {@link discoverPlanDirs} via the change-gated {@link scanPlanDir}
  * primitive — the heartbeat backstop and on-drop recovery path (epic
  *).
  *
@@ -2459,7 +2459,7 @@ export function scanRepoDataDirs(
  * change-gate (`PlanScanner.lastEmitted`) suppresses re-emits for unchanged
  * files, so a quiescent repo emits nothing across heartbeats.
  *
- * Per-dir failures inside {@link scanPlanctlDir} skip-and-log (the same
+ * Per-dir failures inside {@link scanPlanDir} skip-and-log (the same
  * discipline as the boot scan); the loop never throws. Exported for unit
  * reach.
  *
@@ -2470,7 +2470,7 @@ export function scanRepoDataDirs(
  * "a fast path missed it" alarm; `db-poll` does not — it IS a fast path). Pass
  * `undefined` (boot / silent reconcile) to suppress the log.
  *
- * `onPlanctlDir` is invoked once per `.keeper` dir surfaced by this
+ * `onPlanDir` is invoked once per `.keeper` dir surfaced by this
  * sweep, BEFORE its scan — the live worker uses it to nudge git-worker
  * discovery for a newly-seen `.keeper` repo (de-duped worker-side). The walk
  * already paid for the directory enumeration, so this rides free; pure unit
@@ -2486,26 +2486,26 @@ export function scanRepoDataDirs(
  * `emittedRoots` (optional out-param) — when passed, every CONFIGURED root whose
  * `.keeper` scan emitted is added to it (a discovered `<root>/<project>/.keeper`
  * dir is attributed back to its configured root via
- * {@link attributePlanctlDirToRoot}). The mute-watcher re-arm consumes this to
+ * {@link attributePlanDirToRoot}). The mute-watcher re-arm consumes this to
  * flag exactly the implicated roots; all other callers omit it.
  */
-export function reconcilePlanctlDirs(
+export function reconcilePlanDirs(
   roots: readonly string[],
   scanner: PlanScanner,
   triggerReason?: "heartbeat" | "fswatcher-drop" | "db-poll",
-  onPlanctlDir?: (planctlDir: string) => void,
+  onPlanDir?: (planDir: string) => void,
   emittedRoots?: Set<string>,
 ): boolean {
-  const dirs = discoverPlanctlDirs(roots);
+  const dirs = discoverPlanDirs(roots);
   let emittedAny = false;
   for (const dir of dirs) {
-    if (onPlanctlDir !== undefined) {
-      onPlanctlDir(dir);
+    if (onPlanDir !== undefined) {
+      onPlanDir(dir);
     }
-    if (scanPlanctlDir(dir, scanner, triggerReason)) {
+    if (scanPlanDir(dir, scanner, triggerReason)) {
       emittedAny = true;
       if (emittedRoots !== undefined) {
-        const root = attributePlanctlDirToRoot(dir, roots);
+        const root = attributePlanDirToRoot(dir, roots);
         if (root !== null) emittedRoots.add(root);
       }
     }
@@ -2671,23 +2671,23 @@ export function resolveReflogTarget(repoRoot: string): string | null {
 /**
  * the discovered planctl-repo set — every `<root>/<project>` that
  * holds a `.keeper` tree under the configured roots, via the same
- * {@link discoverPlanctlDirs} walk the heartbeat reconcile uses (a shallow
+ * {@link discoverPlanDirs} walk the heartbeat reconcile uses (a shallow
  * readdir+stat per root, no DB read, no emission). Each `.keeper` dir's
- * parent IS its repo root (`repoRootFromPlanctlPath`-shaped), so a commit in
+ * parent IS its repo root (`repoRootFromPlanPath`-shaped), so a commit in
  * any of these repos can be caught by a reflog watch even when it holds no
- * currently-pending path. Pure I/O; failures inside {@link discoverPlanctlDirs}
+ * currently-pending path. Pure I/O; failures inside {@link discoverPlanDirs}
  * skip-and-log (so a transient read miss just yields a smaller set this cycle,
  * re-derived on the next reconcile).
  *
  * hoisted out of the worker `main()` closure, parameterized on `roots`
  * (was a closure over `data.roots`) + exported. Thin FS wrapper over the
- * already-exported {@link discoverPlanctlDirs} + `dirname` — no readdir/dirname
+ * already-exported {@link discoverPlanDirs} + `dirname` — no readdir/dirname
  * logic duplicated here.
  */
-export function discoverPlanctlRepos(roots: readonly string[]): Set<string> {
+export function discoverPlanRepos(roots: readonly string[]): Set<string> {
   const repos = new Set<string>();
-  for (const planctlDir of discoverPlanctlDirs(roots)) {
-    repos.add(dirname(planctlDir));
+  for (const planDir of discoverPlanDirs(roots)) {
+    repos.add(dirname(planDir));
   }
   return repos;
 }
@@ -2753,14 +2753,14 @@ export function reflogWatchDiff(
  *
  * PURE — string-prefix arithmetic over the path, no I/O. Exported for unit reach.
  */
-export function attributePlanctlDirToRoot(
-  planctlDir: string,
+export function attributePlanDirToRoot(
+  planDir: string,
   roots: readonly string[],
 ): string | null {
   let best: string | null = null;
   for (const root of roots) {
     const prefix = root.endsWith(sep) ? root : root + sep;
-    if (planctlDir === root || planctlDir.startsWith(prefix)) {
+    if (planDir === root || planDir.startsWith(prefix)) {
       if (best === null || root.length > best.length) best = root;
     }
   }
@@ -2830,7 +2830,7 @@ function main(): void {
   // The in-HEAD transition has no realtime trigger. Fix: watch
   // `.git/logs/HEAD` (a commit ALWAYS appends there) and, on the append, run the
   // GATED `recheckPending()` scoped to that repo (now in HEAD → emit) PLUS a
-  // change-gated `scanPlanctlDir` re-scan (recover a committed `.keeper` change
+  // change-gated `scanPlanDir` re-scan (recover a committed `.keeper` change
   // that was never gated into pending).
   //
   // Widening. The pending-only watch set left the epic's confirmed slow
@@ -2848,14 +2848,14 @@ function main(): void {
   // number of planctl-tracked repos under the roots (a handful), the broad watch
   // already ignores `.git` so these per-repo `.git/logs` watches do NOT overlap
   // it (no fseventsd bad-state from overlapping subtree watches), and the
-  // callback stays repo-SCOPED (`recheckPending(root)` + one `scanPlanctlDir` —
+  // callback stays repo-SCOPED (`recheckPending(root)` + one `scanPlanDir` —
   // no global-recheck storm). The poll stays trigger-only: the
   // re-scan is change-gated, re-probes the in-HEAD gate, and writes no DB row.
   //
   // Lifecycle is bounded: a watch is ADDED when a repo gains a pending path OR
   // is discovered to hold a `.keeper` tree, and DROPPED when it neither holds a
   // pending path NOR a `.keeper` tree any longer (`reconcileReflogWatches`
-  // diffs `pendingRepos()` ∪ `discoverPlanctlRepos()` against
+  // diffs `pendingRepos()` ∪ `discoverPlanRepos()` against
   // `reflogSubs.keys()`). Per FSEvents
   // discipline the append is a HINT, not data — `recheckPending` re-probes
   // `isPathInHead`, so a spurious fire is an idempotent no-op and a missed fire
@@ -2869,8 +2869,8 @@ function main(): void {
   const reflogSubscribing = new Set<string>();
 
   // The module-scope `resolveReflogTarget` (the `.git/logs/HEAD` -> `.git/HEAD`
-  // -> null `existsSync` ladder) and `discoverPlanctlRepos(roots)` (the
-  // `discoverPlanctlDirs` + `dirname` FS wrapper) are pure helpers this closure
+  // -> null `existsSync` ladder) and `discoverPlanRepos(roots)` (the
+  // `discoverPlanDirs` + `dirname` FS wrapper) are pure helpers this closure
   // composes.
 
   // Bring the live reflog-watch set into agreement with the repos that should
@@ -2889,7 +2889,7 @@ function main(): void {
     // repos and every discovered `.keeper` repo under the configured roots.
     const desired = desiredReflogRepos(
       scanner.pendingRepos(),
-      discoverPlanctlRepos(data.roots),
+      discoverPlanRepos(data.roots),
     );
     // PURE add/drop diff against the live subscription set. The live set is the
     // KEYS of `reflogSubs` only — a mid-subscribe root (`reflogSubscribing`)
@@ -2950,7 +2950,7 @@ function main(): void {
           // NO pending path — the data-dir change was never gated in (its
           // file-write FSEvent was a no-op or coalesced), so a pending drain is
           // a no-op. Re-scan this repo's present data dirs directly via the same
-          // change-gated `scanPlanctlDir` the heartbeat/db-poll reconcile uses:
+          // change-gated `scanPlanDir` the heartbeat/db-poll reconcile uses:
           // it re-reads the now-COMMITTED bytes, re-probes the in-HEAD gate per
           // file, and emits only changed-and-in-HEAD files (the change-gate
           // suppresses unchanged ones, so a spurious fire is an idempotent
@@ -2963,7 +2963,7 @@ function main(): void {
             scanRepoDataDirs(root, scanner, "fswatcher-drop");
           } catch (e) {
             console.error(
-              `[plan-worker] reflog scanPlanctlDir failed for ${root}: ${stringifyErr(e)}`,
+              `[plan-worker] reflog scanPlanDir failed for ${root}: ${stringifyErr(e)}`,
             );
           }
         })
@@ -2977,7 +2977,7 @@ function main(): void {
           // would be torn down the instant it resolved.
           const stillDesired =
             scanner.pendingRepos().has(root) ||
-            discoverPlanctlRepos(data.roots).has(root);
+            discoverPlanRepos(data.roots).has(root);
           if (shuttingDown || !stillDesired) {
             void sub.unsubscribe().catch(() => {});
             return;
@@ -3033,12 +3033,12 @@ function main(): void {
       root: repoRoot,
     } satisfies PlanDiscoveryNudgeMessage);
   };
-  // The planctl-dir callback `reconcilePlanctlDirs` invokes per discovered
+  // The planctl-dir callback `reconcilePlanDirs` invokes per discovered
   // `.keeper` dir — derive the repo root and nudge if new.
-  const nudgeFromPlanctlDir = (planctlDir: string): void => {
-    // `planctlDir` is `<root>/.keeper`; its parent is the repo root. Reuse the
+  const nudgeFromPlanDir = (planDir: string): void => {
+    // `planDir` is `<root>/.keeper`; its parent is the repo root. Reuse the
     // pure ancestor walk by appending a synthetic child so it sees `.keeper`.
-    maybeNudgeDiscovery(dirname(planctlDir));
+    maybeNudgeDiscovery(dirname(planDir));
   };
 
   // Observation gate: the live worker passes `isPathInHead` so an
@@ -3127,7 +3127,7 @@ function main(): void {
   // until the addon loads — the heartbeat re-arm null-guards on it.
   let mainTreeWatcherModule: typeof import("@parcel/watcher") | null = null;
   // periodic reconcile backstop: a low-frequency heartbeat re-runs
-  // `reconcilePlanctlDirs` across every configured root, so a brand-new
+  // `reconcilePlanDirs` across every configured root, so a brand-new
   // repo's first scaffold converges within one interval even if FSEvents
   // dropped its burst AND git-worker isn't yet watching it (it only
   // starts watching a repo's `.git` once an epic row for it exists).
@@ -3304,7 +3304,7 @@ function main(): void {
   // git-worker's commit signal (so it covers the brand-new-repo case where
   // no `.git` is yet watched). The scan re-checks `shuttingDown` belt-and-
   // suspenders; the timer itself is cleared in the shutdown handler above.
-  // Reuses the change-gated {@link reconcilePlanctlDirs} primitive — a
+  // Reuses the change-gated {@link reconcilePlanDirs} primitive — a
   // quiescent repo emits nothing across heartbeats.
   heartbeatTimer = setInterval(() => {
     if (shuttingDown) return;
@@ -3322,11 +3322,11 @@ function main(): void {
       // rescue is the stream-flap vector — rejected). The aggregate `rescued`
       // boolean keeps its semantics for `fireBackstop` (byte-compatible).
       const emittedRoots = new Set<string>();
-      const rescued = reconcilePlanctlDirs(
+      const rescued = reconcilePlanDirs(
         data.roots,
         scanner,
         "heartbeat",
-        nudgeFromPlanctlDir,
+        nudgeFromPlanDir,
         emittedRoots,
       );
       // per-wake-path attribution: classify whether the rescued repos
@@ -3407,7 +3407,7 @@ function main(): void {
   // write, so polling the DB surfaces it without waiting on the 60s heartbeat.
   //
   // The poll is a TRIGGER, not a data source: on a bump it runs a change-gated
-  // `reconcilePlanctlDirs(..., "db-poll")` re-scan (so a `.keeper` change
+  // `reconcilePlanDirs(..., "db-poll")` re-scan (so a `.keeper` change
   // whose FSEvent was dropped — and was therefore NEVER gated into pending —
   // is still recovered). The poll NEVER writes the DB.
   //
@@ -3417,7 +3417,7 @@ function main(): void {
   // realtime bypass for tens of seconds. The pending drain is instead covered
   // by the repo-SCOPED triggers (the `recheck-pending` post on every
   // `GitSnapshot`/`Commit`, the per-repo reflog watch) plus the 5s heartbeat
-  // floor, all batched-per-repo. The `reconcilePlanctlDirs` re-scan STAYS — it
+  // floor, all batched-per-repo. The `reconcilePlanDirs` re-scan STAYS — it
   // is the FSEvents-drop recovery a recheck-only path cannot replace (a dropped
   // FSEvent never gated the path into pending in the first place).
   //
@@ -3434,7 +3434,7 @@ function main(): void {
       // record (a db-poll emit is a normal fast-path success, never a rescue).
       // label `db-poll` for per-wake-path attribution.
       scanner.markFastPath("db-poll");
-      reconcilePlanctlDirs(data.roots, scanner, "db-poll", nudgeFromPlanctlDir);
+      reconcilePlanDirs(data.roots, scanner, "db-poll", nudgeFromPlanDir);
       // fn-788: after the scan, drive the mute-watcher re-arm drain. The scan
       // above only READS the on-disk `.keeper` census — the drain is the sole
       // mutator of the `subscriptions` map on the wake path, so running it here
@@ -3549,7 +3549,7 @@ function main(): void {
   ): Promise<AsyncSubscription | null> => {
     // Per-root drop-recovery scheduler: a recoverable FSEvents drop schedules
     // a debounced, single-flight re-scan of THIS root's `.keeper` dirs via
-    // the change-gated {@link reconcilePlanctlDirs} primitive — never an
+    // the change-gated {@link reconcilePlanDirs} primitive — never an
     // unsubscribe+re-subscribe (the live subscription stays alive; the
     // drop-rescan recovers a lost batch without opening a no-watch gap — that
     // is DISTINCT from the mute-watcher re-arm below, which replaces a
@@ -3576,11 +3576,11 @@ function main(): void {
         // this is the FSEvents-drop backstop — fold the emitted-
         // boolean into one `rescan-drop` missed-wake record. The shutdown
         // guard above gates both the scan and the telemetry emit.
-        const rescued = reconcilePlanctlDirs(
+        const rescued = reconcilePlanDirs(
           [root],
           scanner,
           "fswatcher-drop",
-          nudgeFromPlanctlDir,
+          nudgeFromPlanDir,
         );
         // this drop-rescan is scoped to ONE `root`, so attribute the
         // reflog watch for that root specifically — `present`/`absent` only
@@ -3674,7 +3674,7 @@ function main(): void {
   //
   // Producer state survives: only the watcher subscription is replaced — the
   // PlanScanner change-gate / lastEmitted is untouched, so the post-re-arm scan
-  // (the existing `reconcilePlanctlDirs`) re-emits nothing that didn't actually
+  // (the existing `reconcilePlanDirs`) re-emits nothing that didn't actually
   // change (no phantom re-folds). The one-shot flag is cleared as it drains; a
   // re-mute re-flags it on a later heartbeat.
   const drainResubscribe = async (
@@ -3725,7 +3725,7 @@ function main(): void {
       // path. The change-gate suppresses unchanged files, so this re-emits only
       // what actually changed.
       try {
-        reconcilePlanctlDirs([root], scanner, "fswatcher-drop", undefined);
+        reconcilePlanDirs([root], scanner, "fswatcher-drop", undefined);
       } catch (err) {
         console.error(
           `[plan-worker] re-arm rescan failed for ${root}: ${stringifyErr(err)}`,

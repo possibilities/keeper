@@ -103,7 +103,7 @@ export type TargetKind = "epic" | "task";
  * a monotonic "work has begun at least once" milestone, NOT the liveness
  * `running` verdict (which flaps between turns and is reconnect-sensitive).
  */
-export type PlanctlCondition = "complete" | "unblocked" | "started";
+export type PlanCondition = "complete" | "unblocked" | "started";
 
 /**
  * The two non-planctl condition families (fn-713). Neither carries a
@@ -114,7 +114,7 @@ export type PlanctlCondition = "complete" | "unblocked" | "started";
 export type GitJobCondition = "git-clean" | "agents-idle";
 
 /** Every awaitable condition family. */
-export type AwaitCondition = PlanctlCondition | GitJobCondition;
+export type AwaitCondition = PlanCondition | GitJobCondition;
 
 /**
  * Discriminator the command hands to {@link evaluateAwaitCondition}. The
@@ -127,7 +127,7 @@ export type AwaitCondition = PlanctlCondition | GitJobCondition;
 export interface AwaitTarget {
   id: string;
   kind: TargetKind;
-  condition: PlanctlCondition;
+  condition: PlanCondition;
 }
 
 /**

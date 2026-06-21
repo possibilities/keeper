@@ -63,7 +63,7 @@ import {
   gitCleanState,
   type MonitorSelector,
   monitorRunningState,
-  type PlanctlCondition,
+  type PlanCondition,
 } from "../src/await-conditions";
 import { resolveSockPath } from "../src/db";
 import type { MonitorEntry } from "../src/derivers";
@@ -187,7 +187,7 @@ function eventLine(
  * carry only the condition tag.
  */
 export type ConditionSegment =
-  | { condition: PlanctlCondition; target: AwaitTarget }
+  | { condition: PlanCondition; target: AwaitTarget }
   | { condition: "git-clean" }
   | { condition: "agents-idle" }
   | { condition: "server-up" }
@@ -408,7 +408,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
       if (kind === null) {
         return { ok: false, message: "target id is empty" };
       }
-      const condition = condRaw as PlanctlCondition;
+      const condition = condRaw as PlanCondition;
       const dupKey = `${condition}:${id}`;
       if (seen.has(dupKey)) {
         return { ok: false, message: `duplicate condition '${dupKey}'` };

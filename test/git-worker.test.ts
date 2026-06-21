@@ -39,7 +39,7 @@ import {
   filterPlanctlChanges,
   type GitDirtyFile,
   type GitSnapshotPayload,
-  isPlanctlChangedPath,
+  isPlanChangedPath,
   parsePorcelainV2,
   probeWatchMembership,
   resolveHeadOidViaFs,
@@ -1794,33 +1794,31 @@ test("extractCommit folds non-string / empty planctl_op / planctl_target to null
 // `test/plan-worker.test.ts` against the consumer side.
 // ---------------------------------------------------------------------------
 
-test("isPlanctlChangedPath: epics/tasks json + state-tasks/state-epics state.json accepted, else rejected", () => {
+test("isPlanChangedPath: epics/tasks json + state-tasks/state-epics state.json accepted, else rejected", () => {
   // Accept: the four shapes the plan-worker's classifyPlanPath projects.
-  expect(isPlanctlChangedPath(".keeper/epics/fn-1-x.json")).toBe(true);
-  expect(isPlanctlChangedPath(".keeper/tasks/fn-1-x.2.json")).toBe(true);
-  expect(isPlanctlChangedPath(".keeper/state/tasks/fn-1-x.2.state.json")).toBe(
+  expect(isPlanChangedPath(".keeper/epics/fn-1-x.json")).toBe(true);
+  expect(isPlanChangedPath(".keeper/tasks/fn-1-x.2.json")).toBe(true);
+  expect(isPlanChangedPath(".keeper/state/tasks/fn-1-x.2.state.json")).toBe(
     true,
   );
   // The 4th shape — closes the documented lockstep gap with plan-worker.
-  expect(isPlanctlChangedPath(".keeper/state/epics/fn-1-x.state.json")).toBe(
-    true,
-  );
+  expect(isPlanChangedPath(".keeper/state/epics/fn-1-x.state.json")).toBe(true);
   // Accept under nested repo paths — git diff-tree emits POSIX separators
   // regardless of platform, so a forward-slash split is sufficient.
-  expect(isPlanctlChangedPath("sub/.keeper/epics/fn-1-x.json")).toBe(true);
+  expect(isPlanChangedPath("sub/.keeper/epics/fn-1-x.json")).toBe(true);
 
   // Reject: wrong extension, wrong subdir, missing state.json suffix, non-
   // plan paths, deeper nesting under the 3-segment shapes.
-  expect(isPlanctlChangedPath(".keeper/specs/fn-1-x.md")).toBe(false);
-  expect(isPlanctlChangedPath(".keeper/epics/fn-1-x.md")).toBe(false);
-  expect(isPlanctlChangedPath("epics/fn-1-x.json")).toBe(false);
-  expect(isPlanctlChangedPath(".keeper/state/tasks/fn-1-x.json")).toBe(false);
-  expect(isPlanctlChangedPath(".keeper/state/epics/fn-1-x.json")).toBe(false);
-  expect(isPlanctlChangedPath(".keeper/epics/sub/fn-1-x.json")).toBe(false);
-  expect(isPlanctlChangedPath("src/a.ts")).toBe(false);
+  expect(isPlanChangedPath(".keeper/specs/fn-1-x.md")).toBe(false);
+  expect(isPlanChangedPath(".keeper/epics/fn-1-x.md")).toBe(false);
+  expect(isPlanChangedPath("epics/fn-1-x.json")).toBe(false);
+  expect(isPlanChangedPath(".keeper/state/tasks/fn-1-x.json")).toBe(false);
+  expect(isPlanChangedPath(".keeper/state/epics/fn-1-x.json")).toBe(false);
+  expect(isPlanChangedPath(".keeper/epics/sub/fn-1-x.json")).toBe(false);
+  expect(isPlanChangedPath("src/a.ts")).toBe(false);
 
   // keeper's OWN root plan is accepted.
-  expect(isPlanctlChangedPath(".keeper/epics/fn-822.json")).toBe(true);
+  expect(isPlanChangedPath(".keeper/epics/fn-822.json")).toBe(true);
 });
 
 test("filterPlanctlChanges: tags add/update vs delete by blob_oid null sentinel", () => {

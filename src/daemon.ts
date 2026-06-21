@@ -80,7 +80,7 @@ import type {
   MaintenanceWorkerData,
 } from "./maintenance-worker";
 import type {
-  PlanctlCommitChangedMessage,
+  PlanCommitChangedMessage,
   PlanWorkerData,
   PlanWorkerOutbound,
   RecheckPendingMessage,
@@ -2519,7 +2519,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
           type: msg.kind,
           repo: msg.project_dir,
           changes: msg.changes,
-        } satisfies PlanctlCommitChangedMessage);
+        } satisfies PlanCommitChangedMessage);
         return;
       }
       let hookEvent: string;
