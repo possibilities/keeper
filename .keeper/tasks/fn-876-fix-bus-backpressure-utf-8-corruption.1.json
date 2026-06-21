@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T23:03:38.361000Z",
+  "depends_on": [],
+  "epic": "fn-876-fix-bus-backpressure-utf-8-corruption",
+  "id": "fn-876-fix-bus-backpressure-utf-8-corruption.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Stash bus tail as bytes",
+  "updated_at": "2026-06-21T23:03:38.361000Z"
+}
