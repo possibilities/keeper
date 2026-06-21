@@ -1,8 +1,8 @@
 #!/usr/bin/env bun
 // PostToolUse(Read) generated-file heads-up.
 //
-// Injects a non-blocking note when reading a file that carries the
-// `_promptctl_path` frontmatter marker: shells `keeper prompt check-generated
+// Injects a non-blocking note when reading a file that carries a
+// `<file>.managed-file-dont-edit` sidecar: shells `keeper prompt check-generated
 // <file> --on read` and, when the envelope reports `marked: true`, emits the
 // softer warn-variant message via `additionalContext` so the agent knows the
 // file is generated before trying to edit it. Fail open on every path (exit 0,

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 // PreToolUse(Write|Edit) generated-file guard.
 //
-// Blocks an edit to a file carrying the `_promptctl_path` frontmatter marker:
+// Blocks an edit to a file carrying a `<file>.managed-file-dont-edit` sidecar:
 // shells `keeper prompt check-generated <file> --on write` and, when the
 // envelope reports `marked: true`, emits a `permissionDecision: deny` naming the
 // source template + regenerate command. Fail open on every path (exit 0, no
