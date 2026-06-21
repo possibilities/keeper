@@ -102,5 +102,5 @@ H) README.md await section (~:1138-1197): verify only — trim a sentence ONLY i
 - [ ] `cd plugins/plan && bun test` is green.
 
 ## Done summary
-
+Made plan-family skill wrap-ups silent by default: no /plan:work offers, hack silence-by-default awaits + always-on close-signal, defer-scoped /plan:next, plan Phase 8 menu dropped, work template human-call framing reworded (never-close invariant preserved, re-rendered). plan-plugin CLAUDE.md synced; README await section verified CLI-only.
 ## Evidence
