@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T14:51:37.522000Z",
+  "depends_on": [],
+  "epic": "fn-872-panel-as-silent-cognition",
+  "id": "fn-872-panel-as-silent-cognition.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "carve silent panel into hack",
+  "updated_at": "2026-06-21T14:51:37.522000Z"
+}
