@@ -260,12 +260,45 @@ export interface ReadinessSnapshot {
  * - `dir` — the launch directory. Used ONLY for the root-fallback: a pending
  *   row matching no snapshot row occupies this `dir` as a per-root slot. A null
  *   `dir` contributes no root occupant (degrades safely).
+ * - `dispatched_at` — unix-epoch SECONDS the row was minted (the same clock as
+ *   the injected `now`). Drives the {@link PENDING_DISPATCH_STALE_CEILING_SEC}
+ *   backstop: a pending older than the hard ceiling is EXCLUDED from occupancy
+ *   (verdict + per-root mutex + budget) so a stale launch window can't starve
+ *   real dispatch in the window before the TTL sweep clears it. A missing value
+ *   normalises to `Infinity` (treated as fresh — never excluded).
  *
  * `projectPendingDispatches` in `src/readiness-client.ts` is the SOLE builder,
  * imported by BOTH consumers (the reconciler and `subscribeReadiness`) so they
  * never diverge.
  */
-export type PendingDispatch = { verb: string; id: string; dir: string | null };
+export type PendingDispatch = {
+  verb: string;
+  id: string;
+  dir: string | null;
+  dispatched_at: number;
+};
+
+/**
+ * Hard staleness ceiling (unix SECONDS) for the `pending_dispatches` occupancy
+ * backstop. A pending whose `dispatched_at` is older than the injected `now` by
+ * strictly more than this is excluded from the `dispatch-pending` verdict, the
+ * per-root mutex, and the autopilot budget — a pure LAST-RESORT defense so a
+ * stale launch window can't starve real dispatch before the TTL sweep releases
+ * it.
+ *
+ * Set to 2× `PENDING_DISPATCH_TTL_MS` (= 240s, vs the 120s TTL + ~60s sweep
+ * cadence) so the exclusion NEVER opens a double-dispatch window: the 60s sweep
+ * always expires + DELETEs the row well before this ceiling, so by the time a
+ * row would be excluded here it is already gone. Held as a local constant (not
+ * imported from `daemon.ts`) to keep readiness an import LEAF, mirroring
+ * {@link SUBAGENT_STALENESS_SEC}; the relationship is asserted in tests.
+ *
+ * Determinism: `now - dispatched_at > ceiling` reads the INJECTED `now`, never
+ * `Date.now()`. The simulator/tests pass the default `Number.NEGATIVE_INFINITY`
+ * so the branch is inert (`-Infinity - dispatched_at` is always `-Infinity`),
+ * keeping readiness/simulator byte-identity — exactly like the staleness gates.
+ */
+export const PENDING_DISPATCH_STALE_CEILING_SEC = 240;
 
 // ---------------------------------------------------------------------------
 // Inputs
@@ -306,7 +339,9 @@ export function computeReadiness(
   // `dispatch-pending` occupant verdict at a LATE per-row rank, so the launch
   // → SessionStart blind window holds BOTH mutexes via `isLiveWorkOccupant`. A
   // row matching NO snapshot row falls back to occupying its own `dir` root,
-  // seeded into `applySingleTaskPerRootMutex` outside the per-row walk. Default
+  // seeded into `applySingleTaskPerRootMutex` outside the per-row walk. A row
+  // past {@link PENDING_DISPATCH_STALE_CEILING_SEC} (relative to `now`) is
+  // EXCLUDED from BOTH the verdict and the root-fallback (the backstop). Default
   // `[]` for callers that don't subscribe to `pending_dispatches`.
   pendingDispatches: PendingDispatch[] = [],
   // Autopilot `armed`-mode eligibility, threaded into the per-root mutex's
@@ -319,12 +354,24 @@ export function computeReadiness(
   // valid.
   eligibleEpicIds?: Set<string>,
 ): ReadinessSnapshot {
-  // Index the pending dispatches by their canonical `verb::id` key
-  // (constructed locally — readiness is the import LEAF). The per-row
+  // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
+  // launch window must not count toward the `dispatch-pending` verdict, the
+  // per-root mutex, or the autopilot budget, so a phantom can't starve real
+  // dispatch in the window before the TTL sweep clears it. `now`-gated EXACTLY
+  // like the staleness variants — the default `-Infinity` makes
+  // `-Infinity - dispatched_at > ceiling` always false, so every pending stays
+  // an occupant and re-fold/simulator byte-identity holds. See
+  // {@link PENDING_DISPATCH_STALE_CEILING_SEC}.
+  const livePendingDispatches = pendingDispatches.filter(
+    (pd) => !(now - pd.dispatched_at > PENDING_DISPATCH_STALE_CEILING_SEC),
+  );
+
+  // Index the LIVE (non-stale) pending dispatches by their canonical `verb::id`
+  // key (constructed locally — readiness is the import LEAF). The per-row
   // evaluators record every key they MATCH into `matchedPendingKeys`, so the
   // unmatched remainder drives the root-fallback after the per-row walk.
   const pendingKeys = new Set<string>();
-  for (const pd of pendingDispatches) {
+  for (const pd of livePendingDispatches) {
     pendingKeys.add(`${pd.verb}::${pd.id}`);
   }
   const matchedPendingKeys = new Set<string>();
@@ -417,7 +464,7 @@ export function computeReadiness(
   // into the per-root mutex's occupied set. A null `dir` contributes nothing
   // (degrades safely — the row's own TTL/discharge still clears it).
   const fallbackRoots = new Set<string>();
-  for (const pd of pendingDispatches) {
+  for (const pd of livePendingDispatches) {
     const key = `${pd.verb}::${pd.id}`;
     if (matchedPendingKeys.has(key)) {
       continue;

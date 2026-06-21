@@ -455,7 +455,10 @@ export function projectGitStatusByProjectDir(
  *
  * Defensive parsing: `verb` / `id` are required strings (a row missing either
  * can't form a `verb::id` key, so it's dropped); a non-string `dir` normalises
- * to `null` (the root-fallback degrades safely).
+ * to `null` (the root-fallback degrades safely); a non-finite-number
+ * `dispatched_at` (unix SECONDS) normalises to `Infinity` so the row is treated
+ * as FRESH (never excluded by the staleness backstop — degrades safely toward
+ * holding the slot, exactly as before this field existed).
  */
 export function projectPendingDispatches(
   rows: Record<string, unknown>[],
@@ -468,7 +471,12 @@ export function projectPendingDispatches(
       continue;
     }
     const dir = typeof row.dir === "string" ? row.dir : null;
-    out.push({ verb, id, dir });
+    const rawDispatchedAt = row.dispatched_at;
+    const dispatched_at =
+      typeof rawDispatchedAt === "number" && Number.isFinite(rawDispatchedAt)
+        ? rawDispatchedAt
+        : Number.POSITIVE_INFINITY;
+    out.push({ verb, id, dir, dispatched_at });
   }
   return out;
 }

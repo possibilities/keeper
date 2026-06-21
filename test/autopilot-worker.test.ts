@@ -1515,7 +1515,7 @@ test("fn-721 reconcile: a pending dispatch demotes a same-epic ready sibling (no
     ],
   });
   const pending: PendingDispatch[] = [
-    { verb: "work", id: "fn-1-foo.1", dir: "/repo" },
+    { verb: "work", id: "fn-1-foo.1", dir: "/repo", dispatched_at: 0 },
   ];
   const snap = makeSnapshot({
     epics: [epic],
@@ -1816,6 +1816,57 @@ test("fn-721 parity: autopilot reconcile path and the board/CLI computeReadiness
     tag: "blocked",
     reason: { kind: "single-task-per-epic" },
   });
+});
+
+test("projectPendingDispatches: parses dispatched_at; non-finite normalises to Infinity (fresh)", () => {
+  const projected = projectPendingDispatches([
+    {
+      verb: "work",
+      id: "a.1",
+      dir: "/r",
+      dispatched_at: 1700,
+      last_event_id: 1,
+    },
+    // missing dispatched_at → Infinity (treated as fresh, never excluded)
+    { verb: "work", id: "b.1", dir: "/r", last_event_id: 2 },
+    // non-number dispatched_at → Infinity
+    {
+      verb: "work",
+      id: "c.1",
+      dir: "/r",
+      dispatched_at: "soon",
+      last_event_id: 3,
+    },
+    // NaN dispatched_at → Infinity (Number.isFinite guard)
+    {
+      verb: "work",
+      id: "d.1",
+      dir: "/r",
+      dispatched_at: NaN,
+      last_event_id: 4,
+    },
+  ]);
+  expect(projected).toEqual([
+    { verb: "work", id: "a.1", dir: "/r", dispatched_at: 1700 },
+    {
+      verb: "work",
+      id: "b.1",
+      dir: "/r",
+      dispatched_at: Number.POSITIVE_INFINITY,
+    },
+    {
+      verb: "work",
+      id: "c.1",
+      dir: "/r",
+      dispatched_at: Number.POSITIVE_INFINITY,
+    },
+    {
+      verb: "work",
+      id: "d.1",
+      dir: "/r",
+      dispatched_at: Number.POSITIVE_INFINITY,
+    },
+  ]);
 });
 
 // ---------------------------------------------------------------------------

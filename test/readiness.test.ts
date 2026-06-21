@@ -25,6 +25,7 @@ import {
   computeReadiness,
   formatPill,
   isRootOccupant,
+  PENDING_DISPATCH_STALE_CEILING_SEC,
   type PendingDispatch,
   type RunningReason,
   type Verdict,
@@ -3386,15 +3387,24 @@ test("fn-671: completed-racing worker holds per-task running, close row blocks o
 // ---------------------------------------------------------------------------
 
 // Variant that threads the new `pendingDispatches` param into
-// `computeReadiness` (appended after `now`). The other inputs default.
-function runWithPending(epics: Epic[], pendingDispatches: PendingDispatch[]) {
+// `computeReadiness` (appended after `now`). The other inputs default. Each
+// literal may omit `dispatched_at`; it defaults to `0` here, which under the
+// `-Infinity` `now` below is never stale, so the staleness backstop stays inert
+// and these occupancy proofs are unaffected by it.
+function runWithPending(
+  epics: Epic[],
+  pendingDispatches: Array<
+    Omit<PendingDispatch, "dispatched_at"> &
+      Partial<Pick<PendingDispatch, "dispatched_at">>
+  >,
+) {
   return computeReadiness(
     epics,
     new Map(),
     [],
     new Map(),
     Number.NEGATIVE_INFINITY,
-    pendingDispatches,
+    pendingDispatches.map((pd) => ({ dispatched_at: 0, ...pd })),
   );
 }
 
@@ -3640,4 +3650,100 @@ test("dispatch-pending: formatPill renders the bracket pill", () => {
   expect(formatPill(blocked({ kind: "dispatch-pending" }))).toBe(
     "[blocked:dispatch-pending]",
   );
+});
+
+// Variant of `runWithPending` that injects an explicit `now` (unix seconds) so
+// the stale-pending backstop (`PENDING_DISPATCH_STALE_CEILING_SEC`) can fire.
+function runWithPendingAt(
+  epics: Epic[],
+  pendingDispatches: PendingDispatch[],
+  now: number,
+) {
+  return computeReadiness(
+    epics,
+    new Map(),
+    [],
+    new Map(),
+    now,
+    pendingDispatches,
+  );
+}
+
+test("dispatch-pending: a FRESH pending (within the hard ceiling) still occupies", () => {
+  // now - dispatched_at = 100 < ceiling(240): the pending counts toward the
+  // per-epic mutex, so the same-epic ready sibling is demoted — identical to
+  // the default `-Infinity` behavior.
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const snap = runWithPendingAt(
+    [epic],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo", dispatched_at: 1000 }],
+    1100,
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual(
+    blocked({ kind: "dispatch-pending" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.2")).toEqual(
+    blocked({ kind: "single-task-per-epic" }),
+  );
+});
+
+test("dispatch-pending: a STALE pending (past the hard ceiling) does NOT occupy", () => {
+  // now - dispatched_at = ceiling+1 > ceiling: the stale pending is excluded
+  // from the verdict AND the mutex, so the task is NOT dispatch-pending and the
+  // same-epic sibling is free to be picked by the base mutex (first ready wins).
+  const t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", task_number: 2 });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  const dispatchedAt = 1000;
+  const snap = runWithPendingAt(
+    [epic],
+    [
+      {
+        verb: "work",
+        id: "fn-1-foo.1",
+        dir: "/repo",
+        dispatched_at: dispatchedAt,
+      },
+    ],
+    dispatchedAt + PENDING_DISPATCH_STALE_CEILING_SEC + 1,
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).not.toEqual(
+    blocked({ kind: "dispatch-pending" }),
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("dispatch-pending: a STALE unmatched pending does NOT seed the per-root mutex", () => {
+  // The root-fallback backstop: an unmatched pending past the ceiling must not
+  // hold its `dir` root, so a sibling epic on that same root stays ready.
+  const e1t1 = makeTask({ task_id: "fn-1-foo.1" });
+  const e1 = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: "/repo",
+    tasks: [e1t1],
+  });
+  const dispatchedAt = 1000;
+  const snap = runWithPendingAt(
+    [e1],
+    // Matches no snapshot row (a ghost id), so it would normally seed /repo as
+    // a fallback root — but it's past the ceiling, so it's dropped entirely.
+    [
+      {
+        verb: "work",
+        id: "fn-9-ghost.1",
+        dir: "/repo",
+        dispatched_at: dispatchedAt,
+      },
+    ],
+    dispatchedAt + PENDING_DISPATCH_STALE_CEILING_SEC + 1,
+  );
+  expect(snap.perTask.get("fn-1-foo.1")).toEqual({ tag: "ready" });
+});
+
+test("PENDING_DISPATCH_STALE_CEILING_SEC is 2× the TTL (240s) — pure backstop, never a double-dispatch window", () => {
+  // The ceiling must be distinctly longer than the 120s TTL + ~60s sweep
+  // cadence so the 60s sweep always DELETEs the row before this exclusion fires.
+  expect(PENDING_DISPATCH_STALE_CEILING_SEC).toBe(240);
 });

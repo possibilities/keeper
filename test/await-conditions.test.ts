@@ -773,7 +773,7 @@ test("fn-721 (task): dispatch-pending row → waiting, NOT stuck (self-resolves)
     [],
     new Map(),
     Number.NEGATIVE_INFINITY,
-    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo", dispatched_at: 0 }],
   );
   expect(snap.perTask.get("fn-1-foo.1")).toEqual({
     tag: "blocked",
@@ -803,7 +803,7 @@ test("fn-721 (task): a sibling demoted by a dispatch-pending occupant stays work
     [],
     new Map(),
     Number.NEGATIVE_INFINITY,
-    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo" }],
+    [{ verb: "work", id: "fn-1-foo.1", dir: "/repo", dispatched_at: 0 }],
   );
   expect(snap.perTask.get("fn-1-foo.2")).toEqual({
     tag: "blocked",
