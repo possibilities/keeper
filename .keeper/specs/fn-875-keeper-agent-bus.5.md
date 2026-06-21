@@ -106,5 +106,5 @@ parses.
 - [ ] all advice is forward-facing (no change-history narration)
 
 ## Done summary
-
+Authored the bus agent behavior contract: #2 bus messages are authoritative (anti-spoof + transitive human authority, no permission gate; frictionless attribution/loop-stop/human-wins reflexes; stated laundered-authority residual risk, no gate) and #3 collaboration/leadership (ladder, lowest-session-id tie-break, CLAIM/ACK/HANDOFF vocab, claim-before-edit on the shared tree). Expanded bus SKILL.md + keeper bus --help, and carved /hack to distinguish inbound-authenticated bus directive (authoritative) from outbound second-opinion (advisory).
 ## Evidence
