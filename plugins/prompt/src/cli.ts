@@ -12,6 +12,8 @@
 // dispatch table, arg parsing, help text, and exit-code contract land once.
 
 import type { OutputFormat } from "../../plan/src/format.ts";
+import { run as runCheckGenerated } from "./check_generated.ts";
+import { run as runRender } from "./render.ts";
 
 const PROG = "keeper prompt";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
@@ -190,8 +192,14 @@ function dispatch(parsed: ParsedArgs): number {
   // Every keep-verb is pre-wired to a stub. Verb-port tasks (3/4/5) replace the
   // matching case body with a call into its `src/<verb>.ts` runner.
   switch (command) {
-    case "render":
-    case "check-generated":
+    case "render": {
+      const ref = parsed.rest.find((a) => !a.startsWith("-"));
+      return runRender(ref, format);
+    }
+    case "check-generated": {
+      const file = parsed.rest.find((a) => !a.startsWith("-"));
+      return runCheckGenerated(file, readOption(parsed.rest, "--on"));
+    }
     case "render-plugin-templates":
     case "find-snippets":
     case "build-snippets":
@@ -204,6 +212,21 @@ function dispatch(parsed: ParsedArgs): number {
     default:
       noSuchCommand(command);
   }
+}
+
+/** Read the value of a `--name value` or `--name=value` option from a verb's
+ * positional rest. Returns undefined when absent. */
+function readOption(rest: string[], name: string): string | undefined {
+  for (let i = 0; i < rest.length; i += 1) {
+    const arg = rest[i] as string;
+    if (arg === name) {
+      return rest[i + 1];
+    }
+    if (arg.startsWith(`${name}=`)) {
+      return arg.slice(name.length + 1);
+    }
+  }
+  return undefined;
 }
 
 export function main(argv: string[]): number {

@@ -75,6 +75,12 @@ const KEEP_VERBS = [
   "show-bundle",
 ];
 
+// Verbs whose runner has landed (no longer the not-implemented stub). Their
+// registration proof is that the dispatcher routes them to their runner instead
+// of the no-such-command (exit 2) path.
+const PORTED_VERBS = new Set(["render", "check-generated"]);
+const STUB_VERBS = KEEP_VERBS.filter((v) => !PORTED_VERBS.has(v));
+
 describe("keeper prompt dispatcher contract", () => {
   test("--help prints the Commands section to stdout and returns 0", () => {
     const r = run(["--help"]);
@@ -113,7 +119,7 @@ describe("keeper prompt dispatcher contract", () => {
     expect(r.stderr).toContain("Invalid value for '--format'");
   });
 
-  for (const verb of KEEP_VERBS) {
+  for (const verb of STUB_VERBS) {
     test(`'${verb}' is registered (reachable stub returns the not-implemented envelope)`, () => {
       const r = run([verb]);
       // The stub returns exit 1 with a not-implemented envelope — wiring proof
@@ -121,6 +127,16 @@ describe("keeper prompt dispatcher contract", () => {
       expect(r.ret).toBe(1);
       expect(r.code).toBeUndefined();
       expect(r.stdout).toContain(`not implemented: ${verb}`);
+    });
+  }
+
+  for (const verb of PORTED_VERBS) {
+    test(`'${verb}' is registered (dispatches to its runner, not no-such-command)`, () => {
+      const r = run([verb]);
+      // A ported verb owns its exit code via its runner. The registration proof
+      // is the negative: it never falls through to the no-such-command path
+      // (exit 2 with "No such command"), so the dispatcher routes it.
+      expect(r.stderr).not.toContain("No such command");
     });
   }
 });
