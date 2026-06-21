@@ -1,0 +1,19 @@
+{
+  "name": "keeper-prompt",
+  "version": "0.0.0",
+  "description": "Bun TypeScript prompt-substrate engine behind keeper prompt, ported from promptctl",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "lint": "biome check --no-errors-on-unmatched src test",
+    "test": "bun test --timeout 30000",
+    "capture-oracle": "bun test/oracle/capture.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.2.0",
+    "@types/bun": "^1"
+  },
+  "engines": {
+    "bun": "1.3.14"
+  }
+}

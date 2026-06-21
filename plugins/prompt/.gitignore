@@ -1,0 +1,9 @@
+# Build artifacts
+dist/
+build/
+
+# Bun / TypeScript toolchain (node_modules is not committed)
+node_modules/
+
+# macOS
+.DS_Store

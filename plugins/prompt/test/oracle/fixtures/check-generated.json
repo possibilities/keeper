@@ -1,0 +1,338 @@
+[
+  {
+    "target_relative": "plugins/plan/agents/practice-scout.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/practice-scout.md.tmpl",
+      "source_template_relative": "template/agents/practice-scout.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/practice-scout.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/practice-scout.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/practice-scout.md.tmpl",
+      "source_template_relative": "template/agents/practice-scout.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. promptctl overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/practice-scout.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/practice-scout.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/practice-scout.md.tmpl",
+      "source_template_relative": "template/agents/practice-scout.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/practice-scout.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/practice-scout.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/practice-scout.md.tmpl",
+      "source_template_relative": "template/agents/practice-scout.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. promptctl regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/practice-scout.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-high.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-high.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. promptctl overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-high.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-high.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. promptctl regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-max.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-max.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. promptctl overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-max.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-max.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. promptctl regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-medium.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-medium.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. promptctl overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-medium.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-medium.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. promptctl regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-xhigh.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-xhigh.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. promptctl overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-xhigh.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/agents/worker-xhigh.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/agents/worker.md.tmpl",
+      "source_template_relative": "template/agents/worker.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. promptctl regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/agents/worker.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/skills/work/SKILL.md",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/skills/work.md.tmpl",
+      "source_template_relative": "template/skills/work.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/skills/work.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/skills/work/SKILL.md",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/skills/work.md.tmpl",
+      "source_template_relative": "template/skills/work.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a generated file. promptctl overwrites it on every render, so any edit here is silently lost.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/skills/work.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/skills/work/SKILL.md.managed-file-dont-edit",
+    "on": "read",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "warn",
+      "source_template": "<KEEPER_ROOT>/template/skills/work.md.tmpl",
+      "source_template_relative": "template/skills/work.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "Heads-up: this is a sidecar marker for a generated file. Edits here are silently lost on the next render.\n\nSource template: <KEEPER_ROOT>/template/skills/work.md.tmpl\nRegenerate with: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  },
+  {
+    "target_relative": "plugins/plan/skills/work/SKILL.md.managed-file-dont-edit",
+    "on": "write",
+    "envelope_raw": {
+      "marked": true,
+      "mode": "block",
+      "source_template": "<KEEPER_ROOT>/template/skills/work.md.tmpl",
+      "source_template_relative": "template/skills/work.md.tmpl",
+      "regenerate_cmd": "promptctl render-plugin-templates --project-root <KEEPER_ROOT>",
+      "drift": false,
+      "message": "BLOCKED: this is a sidecar for a generated file. promptctl regenerates it on every render, so editing it directly is silently lost. Edit the source template instead.\n\nFix it at the source:\n  1. Edit the template: <KEEPER_ROOT>/template/skills/work.md.tmpl\n  2. Regenerate: promptctl render-plugin-templates --project-root <KEEPER_ROOT>\n\n(Source identified from this file's `.managed-file-dont-edit` sidecar.)"
+    },
+    "exit_code": 0
+  }
+]
