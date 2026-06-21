@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T23:30:21.438000Z",
+  "depends_on": [],
+  "epic": "fn-878-fix-bus-harness-identity-and-heartbeat",
+  "id": "fn-878-fix-bus-harness-identity-and-heartbeat.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "resolve channel identity to the Claude harness",
+  "updated_at": "2026-06-21T23:30:21.438000Z"
+}
