@@ -49,5 +49,5 @@ Forward-facing only: state the present rule positively; no tombstones ("no longe
 - [ ] All edits are forward-facing (no change-narration tombstones).
 
 ## Done summary
-
+rewrote panel skill so judged answer is absorbed as the agent's own conclusion
 ## Evidence
