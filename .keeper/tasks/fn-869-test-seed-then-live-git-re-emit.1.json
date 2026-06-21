@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T02:00:58.642000Z",
+  "depends_on": [],
+  "epic": "fn-869-test-seed-then-live-git-re-emit",
+  "id": "fn-869-test-seed-then-live-git-re-emit.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "Pin seed-then-live re-emit idempotency",
+  "updated_at": "2026-06-21T02:00:58.642000Z"
+}
