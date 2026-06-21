@@ -40,6 +40,7 @@ import {
 } from "./backstop-telemetry";
 import { type BackupResult, liveBackupPage } from "./backup";
 import type { BuildsMessage, BuildsWorkerData } from "./builds-worker";
+import type { BusWorkerData } from "./bus-worker";
 import { countAbsentBlobs, retainColdPayloads } from "./compaction";
 import {
   openDb,
@@ -1145,7 +1146,8 @@ export type WorkerName =
   | "maintenance"
   | "restore"
   | "renamer"
-  | "reaper";
+  | "reaper"
+  | "bus";
 
 /**
  * The full worker set, in spawn order — the production boot ({@link runDaemon}
@@ -1168,6 +1170,7 @@ export const ALL_WORKERS: readonly WorkerName[] = [
   "restore",
   "renamer",
   "reaper",
+  "bus",
 ] as const;
 
 /**
@@ -3732,6 +3735,35 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
+  // Gated on the selector — `null` when unselected. The Agent Bus relay
+  // (epic fn-875): opens keeper.db READ-ONLY for jobs identity reads and owns
+  // its OWN writable bus.db + dedicated bus.sock (paths default to
+  // `resolveBusDbPath()`/`resolveBusSockPath()` worker-side, honoring
+  // KEEPER_BUS_DB / KEEPER_BUS_SOCK). NOT a WATCHER_WORKER — socket-driven, no
+  // parcel watcher.
+  const busWorker = want("bus")
+    ? new Worker(new URL("./bus-worker.ts", import.meta.url).href, {
+        workerData: { dbPath } satisfies BusWorkerData,
+      } as WorkerOptions & { workerData: unknown })
+    : null;
+
+  if (busWorker) {
+    const bw = busWorker;
+    // NO onmessage handler: the bus is a pure relay actuator — it reads keeper's
+    // jobs projection READ-ONLY and writes ONLY its own bus.db, never keeper.db,
+    // and posts NOTHING to main. Only the lifecycle onerror + close guards
+    // escalate to the single recovery path (a bus boot failure bounces the
+    // daemon; the documented fallback is the sibling --bus-only LaunchAgent).
+    bw.onerror = (err: ErrorEvent): void => {
+      console.error("[keeperd] bus worker error:", err.message ?? err);
+      if (!shuttingDown) fatalExit();
+    };
+
+    bw.addEventListener("close", () => {
+      if (!shuttingDown) fatalExit();
+    });
+  }
+
   /** Crash exit. Reserved for unrecoverable errors so launchd restarts us. */
   function fatalExit(): void {
     try {
@@ -3805,6 +3837,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       restoreWorker,
       renamerWorker,
       reaperWorker,
+      busWorker,
     ].filter((w): w is Worker => w !== null);
 
     // Wrap each shutdown post per-worker: an already-exited worker makes

@@ -3156,6 +3156,7 @@ const WORKER_MODULE_TO_NAME: Record<string, WorkerName> = {
   "restore-worker.ts": "restore",
   "renamer-worker.ts": "renamer",
   "reaper-worker.ts": "reaper",
+  "bus-worker.ts": "bus",
 };
 
 /**
@@ -3236,17 +3237,19 @@ function spawnedWorkerNames(opts?: {
   return captured;
 }
 
-test("fn-749: the production boot (no selector) spawns the IDENTICAL fifteen workers", () => {
+test("fn-749: the production boot (no selector) spawns the IDENTICAL sixteen workers", () => {
   // The headline regression guard: a wrong default would silently drop a worker
   // in prod (no autopilot, no exit-watcher, …). `startDaemon()` with NO selector
   // must spawn exactly ALL_WORKERS, in order. fn-765 added `maintenance`; fn-781
   // added `builds` (the first outbound-HTTP worker, gated on a configured
   // `buildbot_url` — `spawnedWorkerNames` pins one so the boot is deterministic);
   // fn-801 added `renamer` (the tmux window-namer; no watcher, no message minter);
-  // fn-802 added `reaper` (the autopilot window-reaper; no watcher, no message minter).
+  // fn-802 added `reaper` (the autopilot window-reaper; no watcher, no message minter);
+  // fn-875 added `bus` (the Agent Bus UDS relay; no watcher, no message minter —
+  // owns its own bus.db + bus.sock, reads keeper.db read-only).
   const spawned = spawnedWorkerNames();
   expect(spawned).toEqual([...ALL_WORKERS]);
-  expect(spawned).toHaveLength(15);
+  expect(spawned).toHaveLength(16);
   // And ALL_WORKERS itself is the exact set, pinned so a future worker add/rename
   // must consciously update this contract.
   expect([...ALL_WORKERS]).toEqual([
@@ -3265,6 +3268,7 @@ test("fn-749: the production boot (no selector) spawns the IDENTICAL fifteen wor
     "restore",
     "renamer",
     "reaper",
+    "bus",
   ]);
 });
 
