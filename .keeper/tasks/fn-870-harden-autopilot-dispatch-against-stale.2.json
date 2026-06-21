@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "exclude stale pendings from dispatch budget",
-  "updated_at": "2026-06-21T04:43:58.918000Z"
+  "updated_at": "2026-06-21T05:07:30.036000Z",
+  "worker_done_at": "2026-06-21T05:07:30.036000Z"
 }

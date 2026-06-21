@@ -43,5 +43,5 @@ so re-fold/simulator byte-identity holds (a phantom is never "expired" under
 - [ ] reconciler + `subscribeReadiness` share one cutoff; `bun run test:full` green
 
 ## Done summary
-
+Thread dispatched_at into the readiness PendingDispatch occupant and exclude any pending past a 2x-TTL hard ceiling (240s) from the dispatch-pending verdict, per-root mutex, and autopilot budget. now-gated (default -Infinity = no-op) so re-fold/simulator byte-identity holds; reconciler + subscribeReadiness share the one cutoff via the shared computeReadiness + projectPendingDispatches.
 ## Evidence
