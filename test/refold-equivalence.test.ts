@@ -58,7 +58,7 @@ import {
   RETENTION_SHED_PREDICATE,
   retainColdPayloads,
 } from "../src/compaction";
-import { openDb, SCHEMA_VERSION } from "../src/db";
+import { EPHEMERAL_PROJECTIONS, openDb, SCHEMA_VERSION } from "../src/db";
 import { extractMutationPath } from "../src/derivers";
 import { drain } from "../src/reducer";
 import { resolveBridgeAgentId } from "../src/subagent-invocations";
@@ -733,7 +733,15 @@ function seedLiveShapedCorpus(): void {
   }
 }
 
-/** Snapshot the projections the shed could affect, ordered for byte-diff. */
+/**
+ * Snapshot the projections the shed could affect, ordered for byte-diff. The
+ * compared set is the DETERMINISTIC-REPLAYED class only — the LIVE-ONLY git
+ * surface and the EPHEMERAL projections (`EPHEMERAL_PROJECTIONS`, e.g.
+ * `pending_dispatches`) are DELIBERATELY excluded from the byte-identical charter
+ * (the ephemeral set is boot-truncated, so a re-fold legitimately diverges). The
+ * `charter excludes the EPHEMERAL projections` test below enforces that none of
+ * the ephemeral tables leaks into this snapshot.
+ */
 function snapshotProjections() {
   return {
     file_attributions: db
@@ -796,6 +804,117 @@ function rewindAndWipeProjections(): void {
   // (`charter excludes the live-only surface`) covers the production carve-out.
   db.run("UPDATE git_projection_state SET floor = 0 WHERE id = 1");
 }
+
+// ---------------------------------------------------------------------------
+// EPHEMERAL projection carve-out (fn-870) — `pending_dispatches` is boot-truncated,
+// NOT replayed; it must be excluded from the byte-identical charter, and a full
+// re-fold over historical `Dispatched` events must NOT resurrect it at serve.
+// ---------------------------------------------------------------------------
+
+test("charter excludes the EPHEMERAL projections — no ephemeral table leaks into the byte-diff snapshot", () => {
+  // The byte-identical charter compares only the DETERMINISTIC-REPLAYED class.
+  // Every `EPHEMERAL_PROJECTIONS` table (boot-truncated, deliberately divergent
+  // on re-fold) MUST be absent from `snapshotProjections`'s compared key set.
+  const snapshotKeys = new Set(Object.keys(snapshotProjections()));
+  for (const table of EPHEMERAL_PROJECTIONS) {
+    expect(snapshotKeys.has(table)).toBe(false);
+  }
+});
+
+test("resurrection regression: a full re-fold over historical Dispatched events leaves pending_dispatches empty at serve; dispatch_failures + dispatch_never_bound survive", () => {
+  // Seed the EXACT shape that jammed dispatch in v76→v79: historical `Dispatched`
+  // events that fold into open `pending_dispatches` rows (no discharge), plus a
+  // sticky `dispatch_failures` row + a never-bound counter for OTHER keys (the
+  // deterministic-replayed siblings that MUST survive the boot-truncate).
+  insertEvent({
+    hook_event: "Dispatched",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "work",
+      id: "fn-870-phantom.1",
+      dir: "/r",
+      ts: 1700,
+    }),
+  });
+  insertEvent({
+    hook_event: "Dispatched",
+    session_id: "reconciler",
+    data: JSON.stringify({
+      verb: "plan-plan",
+      id: "fn-870-phantom.2",
+      dir: "/r2",
+      ts: 1710,
+    }),
+  });
+  // A never-bound loop for a third key: K=3 consecutive expires trips a sticky
+  // `dispatch_failures(reason='never-bound')` (a deterministic-replayed row).
+  for (let i = 0; i < 3; i++) {
+    insertEvent({
+      hook_event: "DispatchExpired",
+      session_id: "reconciler",
+      data: JSON.stringify({ verb: "work", id: "fn-870-loop.3" }),
+    });
+  }
+  drainAll();
+
+  // After the live drain: 2 open pendings, 1 sticky never-bound failure.
+  expect(
+    (
+      db.query("SELECT COUNT(*) AS n FROM pending_dispatches").get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(2);
+  expect(
+    (
+      db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(1);
+
+  // Full re-fold: rewind the cursor to 0 and wipe the DETERMINISTIC projections
+  // (the production rewinding-migration shape). The ephemeral `pending_dispatches`
+  // is NOT wiped here — it is replayed back by the re-fold (the resurrection), and
+  // the boot-truncate is what clears it before serving.
+  rewindAndWipeProjections();
+  db.run("DELETE FROM dispatch_failures");
+  db.run("DELETE FROM dispatch_never_bound");
+  drainAll();
+
+  // The re-fold RESURRECTED the phantoms (this is the bug the boot-truncate fixes).
+  expect(
+    (
+      db.query("SELECT COUNT(*) AS n FROM pending_dispatches").get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(2);
+
+  // Boot-truncate (the daemon's after-drain / before-serve slot) clears them.
+  for (const table of EPHEMERAL_PROJECTIONS) db.run(`DELETE FROM ${table}`);
+
+  // At serve: pending_dispatches is EMPTY (no resurrection), while the
+  // deterministic-replayed siblings re-folded back byte-identically.
+  expect(
+    (
+      db.query("SELECT COUNT(*) AS n FROM pending_dispatches").get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(0);
+  expect(
+    (
+      db.query("SELECT COUNT(*) AS n FROM dispatch_failures").get() as {
+        n: number;
+      }
+    ).n,
+  ).toBe(1);
+  const loopFailure = db
+    .query("SELECT reason FROM dispatch_failures WHERE verb = ? AND id = ?")
+    .get("work", "fn-870-loop.3") as { reason: string } | null;
+  expect(loopFailure?.reason).toBe("never-bound");
+});
 
 // ---------------------------------------------------------------------------
 // Layer 1 — aggregate counts over the live-shaped corpus

@@ -843,10 +843,23 @@ CREATE TABLE IF NOT EXISTS dispatch_failures (
  * `ExecBackend.launch()` (a crash between mint and launch leaves a phantom row
  * that TTL'd-clears, preferable to double-dispatch); the reducer UPSERTs keyed
  * on `(verb, id)`. Discharged by SessionStart bind, `DispatchFailed`, or
- * `DispatchExpired`. Row PRESENCE is the signal — no status column. A reducer
- * projection (re-fold reset DELETE list). `dispatched_at` is lifted from the
- * event PAYLOAD (not `event.ts`/`Date.now()`); the TTL sweep compares it against
- * `Date.now()` IN MAIN, never in the fold.
+ * `DispatchExpired`. Row PRESENCE is the signal — no status column. `dispatched_at`
+ * is lifted from the event PAYLOAD (not `event.ts`/`Date.now()`); the TTL sweep
+ * compares it against `Date.now()` IN MAIN, never in the fold.
+ *
+ * EPHEMERAL projection (`EPHEMERAL_PROJECTIONS`, fn-870) — in-flight launch-window
+ * state, NOT replayed from history. The boot drain still folds historical
+ * `Dispatched`/`DispatchExpired` events (the global cursor must advance for the
+ * deterministic projections), but a `DELETE FROM pending_dispatches` runs AFTER
+ * the drain and BEFORE serving, so the in-flight set starts empty every boot. This
+ * is correct: the autopilot re-derives genuine in-flight launches from live
+ * `jobs`/tmux panes, and empty-at-boot subsumes clearing any phantom row a
+ * rewinding migration's full re-fold would otherwise resurrect (the v76→v79 jam:
+ * weeks-old phantoms consumed the dispatch budget + per-root mutex). Because the
+ * boot-truncate discards the folded set, this table is DELIBERATELY excluded from
+ * the byte-identical re-fold charter. The sibling `dispatch_failures` /
+ * `dispatch_never_bound` tables stay DETERMINISTIC-REPLAYED (genuinely re-fold-
+ * deterministic + sticky-failure durability is intentional).
  */
 const CREATE_PENDING_DISPATCHES = `
 CREATE TABLE IF NOT EXISTS pending_dispatches (
@@ -1182,6 +1195,37 @@ export const LIVE_ONLY_PROJECTIONS = [
   "git_status",
   "file_attributions",
 ] as const;
+
+/**
+ * EPHEMERAL projection tables (fn-870) — in-flight RUNTIME state rebuilt from
+ * current reality at boot, NEVER replayed from history. Distinct from the
+ * LIVE-ONLY git surface above: an ephemeral table is folded by the boot drain
+ * like any reducer projection (the global cursor must advance for the
+ * deterministic projections), but a `DELETE FROM <table>` runs AFTER the drain
+ * and BEFORE serving, so the runtime set starts empty every boot.
+ *
+ * `pending_dispatches` is the launch-window double-dispatch suppression set: the
+ * autopilot re-derives genuine in-flight launches from live `jobs`/tmux panes, so
+ * empty-at-boot is correct and subsumes clearing any phantom row a rewinding
+ * migration's full re-fold would otherwise resurrect (the v76→v79 dispatch jam).
+ *
+ * Single source of truth shared by the daemon boot-truncate slot and the re-fold
+ * charter exclusion (`test/refold-equivalence.test.ts`): every table here is
+ * DELIBERATELY excluded from the byte-identical re-fold comparison because the
+ * boot-truncate discards the folded set.
+ */
+export const EPHEMERAL_PROJECTIONS = ["pending_dispatches"] as const;
+
+/**
+ * Truncate every {@link EPHEMERAL_PROJECTIONS} table. Call this in the daemon boot
+ * AFTER the boot drain (so live folds have applied) and BEFORE serving (so no
+ * consumer ever observes a resurrected phantom). Idempotent.
+ */
+export function truncateEphemeralProjections(db: Database): void {
+  for (const table of EPHEMERAL_PROJECTIONS) {
+    db.run(`DELETE FROM ${table}`);
+  }
+}
 
 /**
  * The git-derived counter columns embedded in the otherwise-deterministic `jobs`

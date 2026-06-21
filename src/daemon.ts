@@ -53,6 +53,7 @@ import {
   resolvePlanRoots,
   resolveSockPath,
   resolveUsageRoot,
+  truncateEphemeralProjections,
 } from "./db";
 import { parseDeadLetterLine, parseEventLogLine } from "./dead-letter";
 import type {
@@ -263,25 +264,25 @@ export const MUTATION_PATH_BACKFILL_INTERVAL_MS = 300_000;
 export const WAL_CHECKPOINT_INTERVAL_MS = 30_000;
 
 /**
- * Select every `pending_dispatches` row aged past the TTL that does NOT already
- * have an open `dispatch_failures` row for the same `(verb, id)`. The LEFT JOIN
- * guard suppresses an expire-mint for a `(verb, id)` whose `DispatchFailed`
- * already discharged the pending row, protecting the race where the
- * `DispatchFailed` event is written but not yet folded. Reads the projection on
- * the passed connection — production passes main's writable connection.
+ * Select every `pending_dispatches` row aged past the TTL — UNCONDITIONALLY on
+ * `dispatch_failures` membership (fn-870 BUG2). A TTL/lease sweep MUST expire an
+ * aged lease regardless of lessee/breaker state: the prior `WHERE df.verb IS NULL`
+ * guard was a "suppressed sweep" deadlock — a pending that tripped the never-bound
+ * breaker (which mints a sticky `dispatch_failures` row) could NEVER be expired,
+ * so it held its launch-window slot + per-root mutex forever (the v76→v79 jam:
+ * all 5 phantoms were BLOCKED-by-`dispatch_failures`, so the sweep never freed
+ * them). The expiry DELETE is idempotent with a concurrent `DispatchFailed` fold
+ * (both DELETE the same `(verb, id)` row), so dropping the guard cannot corrupt
+ * the projection — it only re-includes the rows the breaker would otherwise strand.
+ * Reads the projection on the passed connection — production passes main's
+ * writable connection.
  */
 export function selectExpiredPendingDispatches(
   db: Database,
   nowMs: number,
 ): { verb: string; id: string; dispatched_at: number }[] {
   const rows = db
-    .query(
-      `SELECT pd.verb AS verb, pd.id AS id, pd.dispatched_at AS dispatched_at
-         FROM pending_dispatches pd
-         LEFT JOIN dispatch_failures df
-           ON df.verb = pd.verb AND df.id = pd.id
-         WHERE df.verb IS NULL`,
-    )
+    .query(`SELECT verb, id, dispatched_at FROM pending_dispatches`)
     .all() as { verb: string; id: string; dispatched_at: number }[];
   const cutoffMs = nowMs - PENDING_DISPATCH_TTL_MS;
   // `dispatched_at` is unix-epoch SECONDS; compare in ms.
@@ -1436,6 +1437,19 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         drainToCompletion(handle, DEFAULT_BATCH_SIZE, bootPace),
     });
   }
+
+  // Step 2a.6 — EPHEMERAL projection boot-truncate (fn-870). `pending_dispatches`
+  // is in-flight launch-window state, NOT replayed from history: the boot drain
+  // above folds historical `Dispatched`/`DispatchExpired` events (the cursor must
+  // advance for the deterministic projections), but the in-flight set must start
+  // empty so a rewinding migration's full re-fold can't resurrect weeks-old
+  // phantoms that consume the dispatch budget + per-root mutex (the v76→v79 jam).
+  // Empty-at-boot is CORRECT — the autopilot re-derives genuine in-flight launches
+  // from live `jobs`/tmux panes. MUST run AFTER the drain (live folds applied) and
+  // BEFORE serving / the autopilot worker spawn (no consumer ever observes a
+  // phantom). NOT worker-gated: the truncate is unconditional regardless of the
+  // selected worker set. See `truncateEphemeralProjections` / `EPHEMERAL_PROJECTIONS`.
+  truncateEphemeralProjections(db);
 
   // Step 2b — dead-letter boot import. Read every NDJSON file the hook wrote
   // during downtime and INSERT OR IGNORE each parsed record into `dead_letters`
@@ -3199,8 +3213,13 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   }
 
   // Producer-side TTL sweep for `pending_dispatches`. Mints a `DispatchExpired`
-  // for every row aged past `PENDING_DISPATCH_TTL_MS` without an open
-  // `dispatch_failures` row for the same `(verb, id)` (the LEFT JOIN guard).
+  // for every row aged past `PENDING_DISPATCH_TTL_MS`, UNCONDITIONALLY on
+  // `dispatch_failures` membership (fn-870 BUG2 self-heal — a lease sweep must
+  // expire an aged row even when the never-bound breaker has minted a sticky
+  // failure for the key, else the slot is held forever; see
+  // `selectExpiredPendingDispatches`). The expiry DELETE is idempotent with a
+  // concurrent `DispatchFailed` fold, so re-including those rows can't corrupt
+  // the projection.
   // MUST ride the heartbeat timer, not the level-triggered `data_version` wake: a
   // crashed dispatch can be the only pending row on a quiescent board, where a
   // write-triggered wake never fires. All wallclock lives HERE in the producer,

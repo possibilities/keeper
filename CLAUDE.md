@@ -52,13 +52,21 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   cursor still advances; a throw rolls back the cursor and wedges the reducer. Schema
   defaults match the zero-event projection, so an empty re-fold reproduces the rows.
 - **Projection-class taxonomy + skip-floor** (Marten's "Live projection lifecycle";
-  central registry `LIVE_ONLY_PROJECTIONS` / `LIVE_ONLY_JOBS_COLUMNS` in `src/db.ts`).
-  Three classes: **deterministic-replayed** (the sacred default above — byte-identical
+  central registries `LIVE_ONLY_PROJECTIONS` / `LIVE_ONLY_JOBS_COLUMNS` /
+  `EPHEMERAL_PROJECTIONS` in `src/db.ts`).
+  Four classes: **deterministic-replayed** (the sacred default above — byte-identical
   re-fold), **live-producer-fed** (the git surface: `git_status`, `file_attributions`,
   and the three `jobs` git-counters — NOT replayed from history; boot-seeded then kept
   current by incremental folds ABOVE a skip-floor; DELIBERATELY excluded from the
-  byte-identical charter), and **control** (`reducer_state`, plus
-  `git_projection_state`'s `floor` + `seed_required`). The skip-floor
+  byte-identical charter), **ephemeral** (`EPHEMERAL_PROJECTIONS` — currently just
+  `pending_dispatches`, the in-flight launch-window set; folded by the boot drain like
+  any projection so the global cursor advances, but `truncateEphemeralProjections`
+  runs AFTER the drain and BEFORE serving so the runtime set starts empty every boot;
+  the autopilot re-derives genuine in-flight launches from live `jobs`/tmux panes, so
+  empty-at-boot is correct and subsumes clearing any phantom a rewinding migration's
+  full re-fold would resurrect — the v76→v79 dispatch jam; DELIBERATELY excluded from
+  the byte-identical charter, NOT in the re-fold wipe list), and **control**
+  (`reducer_state`, plus `git_projection_state`'s `floor` + `seed_required`). The skip-floor
   (`git_projection_state.floor`, a monotonic `events.id`) makes every git fold no-op
   for `id <= floor` — the gate lives INSIDE `applyEvent` by event type, never in the
   drain SQL (the global cursor must still advance for the deterministic projections).
@@ -202,9 +210,19 @@ id)` consecutive-`DispatchExpired`-without-bind counter in `foldDispatchExpired`
 at K=3 it mints a sticky `dispatch_failures(reason='never-bound')` the existing
 `failedKeys` arm suppresses. A bind (discharge-on-bind) and a `DispatchCleared`
 (`keeper autopilot retry`) each reset it — bump/reset come PURELY from the event
-stream (never wall-clock), and it joins the re-fold wipe list, so re-fold stays
-byte-identical. Do NOT carry the count on the `pending_dispatches` row: that row
-is DELETEd on expire to release the re-dispatch slot.
+stream (never wall-clock), and `dispatch_never_bound` joins the re-fold wipe list,
+so re-fold stays byte-identical. Do NOT carry the count on the `pending_dispatches`
+row: that row is DELETEd on expire to release the re-dispatch slot, AND
+`pending_dispatches` is EPHEMERAL (boot-truncated, never replayed — see the
+projection-class taxonomy), so a counter on it would not survive boot. The TTL
+sweep (`selectExpiredPendingDispatches`) expires an aged pending UNCONDITIONALLY on
+`dispatch_failures` membership (fn-870 — a lease sweep gated on breaker state is a
+"suppressed sweep" deadlock that held the slot + per-root mutex forever); to keep
+the unconditional sweep from re-tripping the breaker, `foldDispatchExpired` SKIPS
+the counter arm when the key already has a `dispatch_failures` row (an expiry of an
+already-failed key is a slot release, not a target failure). `DispatchCleared` also
+DELETEs the `pending_dispatches` row so an operator clear immediately frees the
+slot.
 
 ## Out of scope
 

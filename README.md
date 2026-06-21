@@ -1748,7 +1748,12 @@ git surface is DELIBERATELY excluded from that charter via the central
 `LIVE_ONLY_PROJECTIONS` / `LIVE_ONLY_JOBS_COLUMNS` registry (`src/db.ts`), and a
 rewinding migration RESETS its floor + sets `seed_required` (via
 `rewindLiveProjection`) rather than replaying it — the live surface is never
-wiped-and-replayed alongside the deterministic ones. As of
+wiped-and-replayed alongside the deterministic ones. The **ephemeral** class
+(fn-870, `EPHEMERAL_PROJECTIONS` — currently just `pending_dispatches`) is a third
+charter exclusion: in-flight runtime state that IS folded by the boot drain but
+`truncateEphemeralProjections` empties AFTER the drain and BEFORE serving, so the
+runtime set is rebuilt from current reality at boot rather than replayed (NOT in
+the re-fold wipe list, NOT byte-identical). As of
 schema v32 (fn-634, narrowed at v63/fn-756), `epics` adds
 `default_visible` as a VIRTUAL generated column SQLite computes from
 `CASE WHEN status='open' THEN 1 ELSE 0 END`,
@@ -2141,11 +2146,18 @@ NULL->non-NULL heal of a fork-seed row, but never on a genuine resume whose
 pair was already bound (that must not clear a re-pending dispatch); a
 `DispatchExpired` synthetic event DELETEs the key when the TTL sweep fires.
 `DispatchFailed` also DELETEs the pending row so a failed dispatch does not
-block the failure as permanently occupied. A from-scratch re-fold reproduces
-the table byte-identically (no fold-time wall clock; `dispatched_at` derives
-from the event's own `ts`; no `Dispatched` events in the pre-v50 log →
-empty table on historical replay). keeper-py's `SUPPORTED_SCHEMA_VERSIONS`
-frozenset gains `50` (whitelist-only).
+block the failure as permanently occupied. As of fn-870, `pending_dispatches`
+is an EPHEMERAL projection (`EPHEMERAL_PROJECTIONS`): it is folded by the boot
+drain like any projection (the global cursor must advance for the deterministic
+ones), but `truncateEphemeralProjections` runs AFTER the drain and BEFORE serving
+so the in-flight set starts EMPTY every boot — the autopilot re-derives genuine
+in-flight launches from live `jobs`/tmux panes. It is therefore NOT replayed from
+history and is DELIBERATELY EXCLUDED from the byte-identical re-fold charter (the
+prior "re-fold reproduces the table byte-identically" claim no longer holds, and
+must not: a rewinding migration's full re-fold would otherwise RESURRECT weeks-old
+phantoms that consume the dispatch budget + per-root mutex — the v76→v79 jam where
+5 phantoms BLOCKED-by-`dispatch_failures` starved all dispatch). keeper-py's
+`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `50` (whitelist-only).
 
 The producer side of this lifecycle is hardened independently of the reducer,
 schema, and `keeper/api.py` (`SCHEMA_VERSION` stays 59). The mint is
@@ -2209,10 +2221,24 @@ discharge-on-bind gate) and a `DispatchCleared` (`keeper autopilot retry`) each
 reset the counter to zero, so a bind between expires never trips the breaker and
 a "bound-then-died" worker (the exit-watcher's path) never counts toward
 never-bound. The bump/reset fold purely from the `DispatchExpired` + bind +
-`DispatchCleared` event stream (no wall clock), so a from-scratch re-fold is
-byte-identical (empty table on a pre-v76 log). keeper-py's
-`SUPPORTED_SCHEMA_VERSIONS` frozenset gains `76` (whitelist-only; keeper-py
-reads neither `dispatch_never_bound` nor `dispatch_failures`).
+`DispatchCleared` event stream (no wall clock), so a from-scratch re-fold of
+`dispatch_never_bound` is byte-identical (empty table on a pre-v76 log).
+fn-870 hardened two failure modes in this lifecycle. (1) The TTL sweep
+(`selectExpiredPendingDispatches`) now expires an aged `pending_dispatches` row
+UNCONDITIONALLY on `dispatch_failures` membership — the prior `WHERE df.verb IS
+NULL` guard was a "suppressed sweep" deadlock: a pending that tripped the
+never-bound breaker (which mints a sticky `dispatch_failures` row) could NEVER be
+expired, so it held its launch-window slot + per-root mutex forever (the root
+cause of the v76→v79 jam). The expiry DELETE is idempotent with a concurrent
+`DispatchFailed` fold, so re-including those rows cannot corrupt the projection.
+(2) To keep the now-unconditional sweep from re-tripping the breaker,
+`foldDispatchExpired` SKIPS the counter arm when the key already has a
+`dispatch_failures` row — an expiry of an already-failed key is a slot release,
+not a target failure. fn-870 also widens `foldDispatchCleared` to DELETE the
+`pending_dispatches` row alongside the failure + counter, so an operator clear
+immediately frees the slot. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
+gains `76` (whitelist-only; keeper-py reads neither `dispatch_never_bound` nor
+`dispatch_failures`).
 As of schema v77 (fn-856), the plan-link classifier is ungated from the
 `/plan:plan` time-window model: a session that never invokes `/plan:plan` used
 to have zero windows, so every plan op it made was silently dropped — leaking

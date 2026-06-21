@@ -3471,10 +3471,14 @@ function foldDispatchFailed(db: Database, event: Event): void {
 /**
  * Fold one synthetic `DispatchCleared` event. Idempotent DELETE on `(verb, id)`
  * — the ONLY legal clear path (a direct DELETE outside the fold arm would break
- * re-fold determinism). Clears BOTH the sticky `dispatch_failures` row AND the
- * never-bound `dispatch_never_bound` counter so a `keeper autopilot retry`
- * re-arms the breaker from zero (a residual count would re-trip after one expire
- * instead of K). Malformed/missing payload → safe no-op.
+ * re-fold determinism). Clears the sticky `dispatch_failures` row, the never-bound
+ * `dispatch_never_bound` counter (so a `keeper autopilot retry` re-arms the breaker
+ * from zero — a residual count would re-trip after one expire instead of K), AND
+ * the in-flight `pending_dispatches` row (fn-870 BUG fix: an operator clear must
+ * immediately free the launch-window slot + per-root mutex; clearing only the
+ * failure + counter left a stale pending stranding the slot until the TTL sweep).
+ * All three DELETEs are idempotent no-ops on a missing row. Malformed/missing
+ * payload → safe no-op.
  */
 function foldDispatchCleared(db: Database, event: Event): void {
   const payload = extractDispatchClearedPayload(event);
@@ -3486,6 +3490,10 @@ function foldDispatchCleared(db: Database, event: Event): void {
     payload.id,
   ]);
   db.run("DELETE FROM dispatch_never_bound WHERE verb = ? AND id = ?", [
+    payload.verb,
+    payload.id,
+  ]);
+  db.run("DELETE FROM pending_dispatches WHERE verb = ? AND id = ?", [
     payload.verb,
     payload.id,
   ]);
@@ -3641,6 +3649,15 @@ const NEVER_BOUND_REASON = "never-bound";
  *     fresh. The counter resets to zero (DELETE) on a successful bind (the
  *     SessionStart discharge-on-bind gate) and on `DispatchCleared`.
  *
+ *     Breaker-loop safety (fn-870): the counter arm is SKIPPED when the key
+ *     ALREADY has a `dispatch_failures` row. The TTL sweep now expires aged
+ *     pendings UNCONDITIONALLY (BUG2) — including a key already holding a sticky
+ *     failure — so an expiry of an already-failed row is just a slot release, not
+ *     a fresh target failure: it must NOT bump the counter (which would re-trip
+ *     the breaker on an already-failed key and churn `last_event_id`). Arm 1's
+ *     DELETE still frees the slot. The probe reads only the persisted row, so the
+ *     fold stays pure + re-fold-deterministic.
+ *
  * Malformed/missing payload → safe no-op.
  */
 function foldDispatchExpired(db: Database, event: Event): void {
@@ -3652,6 +3669,17 @@ function foldDispatchExpired(db: Database, event: Event): void {
     payload.verb,
     payload.id,
   ]);
+  // Breaker-loop safety: an expiry of a key that ALREADY has a sticky
+  // `dispatch_failures` row is a slot release, not a target failure — skip the
+  // counter arm entirely (no bump, no re-trip, no `last_event_id` churn). With the
+  // sweep's df-guard dropped (BUG2), this is the arm that keeps an already-failed
+  // pending's repeated expiries from re-tripping the never-bound breaker.
+  const alreadyFailed = db
+    .query("SELECT verb FROM dispatch_failures WHERE verb = ? AND id = ?")
+    .get(payload.verb, payload.id) as { verb: string } | null;
+  if (alreadyFailed != null) {
+    return;
+  }
   // Increment the consecutive-no-bind counter. UPSERT keyed on `(verb, id)`:
   // first expire INSERTs `1`, each subsequent expire (with no intervening bind /
   // clear, which would have DELETEd the row) bumps it. `last_event_id` tracks the

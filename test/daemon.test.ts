@@ -2591,22 +2591,23 @@ test("selectExpiredPendingDispatches returns aged rows past the TTL", () => {
   db.close();
 });
 
-test("selectExpiredPendingDispatches skips rows with an open dispatch_failures row (LEFT JOIN guard)", () => {
+test("selectExpiredPendingDispatches expires an aged row EVEN with an open dispatch_failures row (fn-870 BUG2 self-heal)", () => {
   const { db } = openDb(dbPath);
   const now = 1_700_000_000_000;
   const nowSec = now / 1000;
-  // Aged row that should expire …
+  // Aged row WITH a sticky dispatch_failures row for the same (verb, id). The
+  // prior `WHERE df.verb IS NULL` guard shielded this row from the sweep forever
+  // — the "suppressed sweep" deadlock (the v76→v79 jam: every phantom was
+  // BLOCKED-by-dispatch_failures, so the sweep never freed the slot). The TTL
+  // sweep is now UNCONDITIONAL on dispatch_failures membership, so this aged row
+  // expires.
   seedPendingDispatch(db, "work", "fn-1-foo.1", nowSec - 200);
-  // … but an open dispatch_failures row for the same (verb, id) shields it.
-  // The reducer's foldDispatchFailed already discharges the pending row
-  // through the same DELETE path; the sweep's LEFT JOIN guard is
-  // belt-and-braces against a transient ordering race.
   seedDispatchFailure(db, "work", "fn-1-foo.1", nowSec - 200);
-  // Another aged row WITHOUT a matching failure — should expire.
+  // Another aged row WITHOUT a matching failure — also expires.
   seedPendingDispatch(db, "work", "fn-1-foo.2", nowSec - 200);
 
   const expired = selectExpiredPendingDispatches(db, now);
-  expect(expired.map((r) => r.id).sort()).toEqual(["fn-1-foo.2"]);
+  expect(expired.map((r) => r.id).sort()).toEqual(["fn-1-foo.1", "fn-1-foo.2"]);
   db.close();
 });
 

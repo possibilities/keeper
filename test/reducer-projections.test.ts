@@ -1297,6 +1297,48 @@ test("DispatchFailed deletes the matching pending_dispatches row in the same fol
   expect(getPendingDispatch("plan-plan", "fn-fail.1")).toBeNull();
 });
 
+test("DispatchCleared also deletes the pending_dispatches row so an operator clear immediately frees the slot (fn-870)", () => {
+  // An operator clear (`keeper autopilot retry`) must free the launch-window slot
+  // + per-root mutex immediately, not leave a stale pending until the TTL sweep.
+  // Seed a sticky failure + an open pending for the same (verb, id).
+  dispatchedEvent("approve", "fn-870-clear.1", "/repo", 1700);
+  dispatchFailedEvent(
+    "approve",
+    "fn-870-clear.1",
+    "ceiling-elapsed",
+    "/repo",
+    1750,
+  );
+  drainAll();
+  // foldDispatchFailed already discharges the pending, so re-arm a fresh pending
+  // AFTER the failure to model an operator clearing a key that still has a live
+  // pending row alongside the sticky failure (e.g. a re-dispatch after the
+  // failure landed). The clear must remove BOTH.
+  dispatchedEvent("approve", "fn-870-clear.1", "/repo", 1800);
+  drainAll();
+  expect(getPendingDispatch("approve", "fn-870-clear.1")).not.toBeNull();
+  expect(getDispatchFailure("approve", "fn-870-clear.1")).not.toBeNull();
+
+  dispatchClearedEvent("approve", "fn-870-clear.1");
+  drainAll();
+  expect(getDispatchFailure("approve", "fn-870-clear.1")).toBeNull();
+  expect(getPendingDispatch("approve", "fn-870-clear.1")).toBeNull();
+});
+
+test("DispatchCleared on a key with only a pending row (no failure) still deletes the pending — idempotent (fn-870)", () => {
+  dispatchedEvent("work", "fn-870-clear-pending-only.1", "/r", 1700);
+  drainAll();
+  expect(
+    getPendingDispatch("work", "fn-870-clear-pending-only.1"),
+  ).not.toBeNull();
+
+  // Two clears: the first deletes, the second is a safe no-op (idempotent).
+  dispatchClearedEvent("work", "fn-870-clear-pending-only.1");
+  dispatchClearedEvent("work", "fn-870-clear-pending-only.1");
+  drainAll();
+  expect(getPendingDispatch("work", "fn-870-clear-pending-only.1")).toBeNull();
+});
+
 test("DispatchFailed without a prior Dispatched is still a safe no-op on pending_dispatches (fn-678)", () => {
   // Idempotent: the widened DELETE matches zero rows — no error, the
   // dispatch_failures arm still UPSERTs normally.
@@ -1696,6 +1738,40 @@ test("a Dispatched re-dispatch between expires PRESERVES the counter — the loo
   dispatchExpiredEvent("work", "fn-846-cycle.1");
   drainAll();
   expect(getDispatchFailure("work", "fn-846-cycle.1")?.reason).toBe(
+    "never-bound",
+  );
+});
+
+test("an expiry of an already-failed key does NOT re-trip the breaker — no counter bump (fn-870)", () => {
+  // BUG2 widened the TTL sweep to expire aged pendings UNCONDITIONALLY, so an
+  // expiry can now land on a key that ALREADY holds a sticky dispatch_failures
+  // row (e.g. a never-bound trip, then a re-dispatch, then another TTL expiry).
+  // foldDispatchExpired must treat that as a pure slot release: delete the pending
+  // but NOT bump the never-bound counter (which would re-trip the breaker and
+  // churn last_event_id on an already-failed key).
+  //
+  // Trip the breaker (K=3 expires → sticky never-bound failure, counter cleared).
+  dispatchExpiredEvent("work", "fn-870-already-failed.1");
+  dispatchExpiredEvent("work", "fn-870-already-failed.1");
+  dispatchExpiredEvent("work", "fn-870-already-failed.1");
+  drainAll();
+  expect(getDispatchFailure("work", "fn-870-already-failed.1")?.reason).toBe(
+    "never-bound",
+  );
+  expect(getNeverBoundCounter("work", "fn-870-already-failed.1")).toBeNull();
+
+  // Re-dispatch (the slow re-arm), then the widened sweep expires it again while
+  // the sticky failure still stands. The expiry must NOT create a new counter row.
+  dispatchedEvent("work", "fn-870-already-failed.1", "/r", 2000);
+  drainAll();
+  expect(getPendingDispatch("work", "fn-870-already-failed.1")).not.toBeNull();
+
+  dispatchExpiredEvent("work", "fn-870-already-failed.1");
+  drainAll();
+  // Slot released, breaker NOT re-armed: pending gone, no counter, failure intact.
+  expect(getPendingDispatch("work", "fn-870-already-failed.1")).toBeNull();
+  expect(getNeverBoundCounter("work", "fn-870-already-failed.1")).toBeNull();
+  expect(getDispatchFailure("work", "fn-870-already-failed.1")?.reason).toBe(
     "never-bound",
   );
 });
