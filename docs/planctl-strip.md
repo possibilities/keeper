@@ -244,7 +244,7 @@ commit-trailer reader dual-parse — that one is permanent.
 
 ## 7. Suggested phasing & how to collaborate
 
-**Run `/arthack:panel` on the migration strategy before scaffolding Problem A.** An
+**Run `/plan:panel` on the migration strategy before scaffolding Problem A.** An
 event-log-rewriting migration with re-fold-determinism stakes is exactly the
 high-stakes design call the panel is for: feed it the raw question (rewrite-vs-dual-read,
 trailer reader-compat, cursor-rewind sequencing) plus §3/§4 as neutral evidence —
