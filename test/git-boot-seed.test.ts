@@ -25,6 +25,7 @@ import {
   DEFAULT_GIT_SEED_BUDGET_MS,
   seedGitProjection,
 } from "../src/git-boot-seed";
+import { buildGitSnapshot, readStatus } from "../src/git-worker";
 import { drain } from "../src/reducer";
 import { initRepo } from "./helpers/git-repo";
 import { freshMemDb } from "./helpers/template-db";
@@ -123,6 +124,95 @@ test("tail-equivalence: a clean repo seeds an empty/clean git_status (dirty_coun
   const row = gitStatusRow(dir);
   // A clean repo still emits a snapshot (head_oid present) with dirty_count 0.
   expect(row?.dirty_count ?? 0).toBe(0);
+});
+
+test("seed-then-live re-emit on the SAME dirty set is idempotent (git_status + file_attributions + 3 jobs git-counters unchanged)", () => {
+  // The production path on every git-enabled boot: the boot-seed populates the
+  // live-only git surface, then the live git-worker's first scan re-emits a
+  // GitSnapshot for the SAME dirty set. That re-emit must fold idempotently —
+  // no double-counted attributions, no drifted git_status, no bumped jobs
+  // git-counters. It is the invariant the whole live-only design rests on (see
+  // the git-boot-seed.ts header). Bookkeeping columns (last_event_id /
+  // updated_at) DO advance on the re-fold and are excluded; the OBSERVABLE git
+  // surface must not move.
+  const repo = dirtyRepo();
+  const sess = "11111111-1111-1111-1111-111111111111";
+
+  // A live job that edited the now-dirty file, so the seed attributes dirty.ts
+  // to a live toucher — populating file_attributions AND the job's git-counters
+  // so the check is meaningful (not a 0 == 0 tautology).
+  kdb.db.run(
+    "INSERT INTO jobs (job_id, created_at, updated_at, state) VALUES (?, 1000, 1000, 'working')",
+    [sess],
+  );
+  const dirtyPath = join(repo, "dirty.ts");
+  kdb.db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, tool_name, cwd, data, mutation_path)
+       VALUES (1001, ?, NULL, 'PostToolUse', 'post_tool_use', 'Write', ?, ?, ?)`,
+    [sess, repo, JSON.stringify({ file_path: dirtyPath }), dirtyPath],
+  );
+
+  const stripVolatile = (
+    row: Record<string, unknown> | null,
+  ): Record<string, unknown> | null => {
+    if (row !== null) {
+      delete row.last_event_id;
+      delete row.updated_at;
+    }
+    return row;
+  };
+  const capture = () => ({
+    gitStatus: stripVolatile(
+      kdb.db
+        .query("SELECT * FROM git_status WHERE project_dir = ?")
+        .get(repo) as Record<string, unknown> | null,
+    ),
+    attributions: (
+      kdb.db
+        .query(
+          "SELECT * FROM file_attributions WHERE project_dir = ? ORDER BY file_path, session_id",
+        )
+        .all(repo) as Record<string, unknown>[]
+    ).map((r) => stripVolatile(r)),
+    jobCounters: kdb.db
+      .query(
+        "SELECT git_dirty_count, git_unattributed_to_live_count, git_orphan_count FROM jobs WHERE job_id = ?",
+      )
+      .get(sess),
+  });
+
+  // 1. Boot-seed (the boot half of the live surface).
+  const seed = seedGitProjection(kdb.db, kdb.stmts, {
+    drainToCompletion: drainAll,
+    roots: [repo],
+  });
+  expect(seed.complete).toBe(true);
+
+  const before = capture();
+  // Fixture sanity: all three surfaces are actually populated.
+  expect((before.gitStatus as { dirty_count: number }).dirty_count).toBe(1);
+  expect(before.attributions.length).toBeGreaterThanOrEqual(1);
+  expect(
+    (before.jobCounters as { git_dirty_count: number }).git_dirty_count,
+  ).toBeGreaterThanOrEqual(1);
+
+  // 2. Live re-emit: the git-worker's first scan emits a GitSnapshot for the
+  //    SAME dirty set, folded ABOVE the floor with NO reset (its id is the
+  //    highest in the log — appended after the boot-seed's synthetic snapshot).
+  const status = readStatus(repo);
+  if (status === null) {
+    throw new Error("readStatus returned null for a known-dirty repo");
+  }
+  const snapshot = buildGitSnapshot(repo, status);
+  kdb.db.run(
+    `INSERT INTO events (ts, session_id, pid, hook_event, event_type, cwd, data)
+       VALUES (2000, ?, NULL, 'GitSnapshot', 'git_snapshot', ?, ?)`,
+    [repo, repo, JSON.stringify(snapshot)],
+  );
+  drainAll();
+
+  // 3. The re-emit folded idempotently — the observable surface is unchanged.
+  expect(capture()).toEqual(before);
 });
 
 // ---------------------------------------------------------------------------
