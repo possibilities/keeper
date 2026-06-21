@@ -66,5 +66,5 @@ likely no change.
 - [ ] forward-facing prose only; subagent-reach checked (workers don't carry these skills) and noted
 
 ## Done summary
-
+Relaxed the carve-out at hack:183/defer:14,186/plan-CLAUDE.md:34 to PARTIAL (planning flow never surprise-launches; model-invocable operator skills reachable on clear user intent), kept the /plan:hack slash-only clause and hack's closed list intact, and added a concise cross-skill orchestration section to /hack and /plan consolidating the daisy-chain fragment.
 ## Evidence
