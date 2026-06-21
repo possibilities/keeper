@@ -563,6 +563,17 @@ An id in both sections produces one `wired:` line (Dependencies pass) and one `o
 
 **Refine path (R5b):** run the same batch wire after rewriting the epic spec, additive-only — `add-deps` is idempotent per edge, and never call `epic rm-dep`. The log noise on already-present edges is the audit signal, not a regression.
 
+### Cross-skill orchestration awareness (multi-epic)
+
+When the plan spans more than one epic, how those epics EXECUTE is a cross-skill concern the operator skills own — not this planning flow. Wire the topology into the plan itself; never proactively launch execution mid-plan. Reach for the operator skills only on clear user intent (they are model-invocable), referencing them for mechanics:
+
+- **Parallel** (dep-free epics) → scaffold both; `keeper:autopilot mode yolo` dispatches them concurrently.
+- **Sequential** (B after A) → the `epic.depends_on_epics` edge wired above sequences execution under autopilot; a stricter human-gated cadence is `keeper:autopilot mode armed` plus a `keeper:await complete <epic>` phase gate.
+- **Planning-dependent daisy-chain** (B genuinely unplannable until A lands) → arm `keeper:await complete fn-A`, then re-enter planning for B on `met`.
+- **Take-over window** → `keeper:autopilot` captures `{paused, mode, armed}`, drives by hand, restores; `keeper:dispatch` fires one worker.
+
+The planning flow's default wrap-up stays quiet (Phase 8) — these shapes engage only on the human's request.
+
 ---
 
 ## Phase 7 — Validate (refine path only)

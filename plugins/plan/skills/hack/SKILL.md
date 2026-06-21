@@ -180,7 +180,7 @@ When the route is `/plan:plan` — inferred, or because the human said "plan it"
 
 ### After an epic lands, the session goes quiet by default
 
-Scaffolding an epic — via `/plan:plan` or `/plan:defer` — normally ends the visible session. Keeper's autopilot dispatches and completes all plan work on its own; **the agent is left in the dark about execution by design.** Once the epic lands, the wrap-up is the plan skill's own one-line report and nothing more — no description of how the work runs, and **never an unsolicited offer to drive execution** (no "run it when ready" prompt, no surfacing the `keeper:dispatch` / `keeper:autopilot` operator hatch). The agent plans; it does not start, drive, or close the work. The operator hatch is human-gated: it exists, but the planning skills never advertise it — a human reaches it only by invoking those skills explicitly.
+Scaffolding an epic — via `/plan:plan` or `/plan:defer` — normally ends the visible session. Keeper's autopilot dispatches and completes all plan work on its own. Once the epic lands, the wrap-up is the plan skill's own one-line report and nothing more — **no proactive, unsolicited offer to drive execution** (no "run it when ready" prompt, no surprise-launching workers). The planning beat plans; it does not surprise-launch, drive, or close the work mid-plan. The operator skills (`keeper:dispatch` / `keeper:autopilot`) are model-invocable, so you MAY reach for them on a clear user request to drive execution — but the planning flow never reaches for them on its own: a quiet wrap-up by default, execution driven only on explicit intent.
 
 The one optional move is arming an await — and it stays silent unless the conversation earns it. `keeper:await` blocks on board state (epic or task complete, or unblocked) then runs a follow-up action.
 
@@ -188,14 +188,18 @@ The one optional move is arming an await — and it stays silent unless the conv
 - **Ambiguous** — a follow-up was genuinely discussed (a phase-2 plan gated on this epic, a verification pass you raised) but the human never asked to wait → collaborate: ask one short plain-text question whether to arm it. Don't self-arm a follow-up the human didn't request.
 - **Neither** → silent. No "nothing worth awaiting" narration, no generic "want me to wait?", no raising the await topic at all — an idle await is noise, and so is talking about not arming one. This is the common case; deferred epics bias hard this way.
 
-**Multiple epics are yours to sequence.** When the conversation calls for more than one epic — the human asks for two plans, or a piece of work splits across epics — you decide the topology; one-at-a-time is not the default:
+**Multiple epics are yours to sequence.** When the conversation calls for more than one epic — the human asks for two plans, or a piece of work splits across epics — you decide the topology; one-at-a-time is not the default. The cross-skill orchestration section below carries the topologies and how the operator skills combine.
 
-- **Independent** → scaffold both now; autopilot runs them in parallel.
-- **Execution-ordered, plannable now** (B must run after A, but you can author B well today) → scaffold both now and wire the cross-epic dep (`epic add-dep`); autopilot sequences execution while you stay out of it — no await.
-- **Planning-dependent** (you genuinely can't author B until A's landed reality exists — new APIs, file shapes, schema) → daisy-chain: plan A, arm `keeper:await complete fn-A`, and on `met` plan B against what landed. One session drives several plan rounds without the human re-priming context.
-- **Any combination** of the above across three-plus epics.
+### Cross-skill orchestration
 
-Pick the shape confidently and inform; only ask the human when genuinely torn between two topologies and the choice changes the outcome. Each daisy-chain round re-runs the close/await check before arming the next; when nothing's left to arm, stay silent and hand back.
+No single skill owns how the operator skills (`keeper:dispatch`, `keeper:autopilot`, `keeper:await`) COMBINE across epics — this section does. Reach for these shapes on clear user intent to drive multi-epic work; never proactively, mid-plan, unsolicited. Each skill's own body carries its mechanics — reference them, don't re-teach them here.
+
+- **Parallel** (epics are independent / dep-free) → scaffold both, then `keeper:autopilot mode yolo` lets the reconciler dispatch them concurrently.
+- **Sequential** (B must run after A) → wire the cross-epic dep on the epic (`epic add-dep` / `depends_on_epics`) so autopilot sequences execution on its own; for a stricter human-gated cadence, `keeper:autopilot mode armed` plus a `keeper:await complete <epic>` phase gate holds B until A lands.
+- **Planning-dependent daisy-chain** (you genuinely can't author B until A's landed reality exists — new APIs, file shapes, schema) → plan A, arm `keeper:await complete fn-A`, and on `met` plan B against what landed. One session drives several plan rounds without the human re-priming context. Each round re-runs the close/await check before arming the next; when nothing's left to arm, stay silent and hand back.
+- **Take-over window** (drive execution by hand for a stretch) → `keeper:autopilot` captures the current `{paused, mode, armed}` state, changes it for the window, and restores it when the human says done; `keeper:dispatch` fires one worker by hand inside that window.
+
+Pick the shape confidently and inform; only ask when genuinely torn between two topologies and the choice changes the outcome.
 
 ### Always check the session is done — speak only to close it
 

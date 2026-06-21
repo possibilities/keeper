@@ -11,7 +11,7 @@ allowed-tools: Bash(keeper plan:*), Bash(keeper:*), Read, Glob, Task
 
 # Defer
 
-Capture a tiny, actionable change as a single-task epic and stop. No priority jump — the epic sorts in normal `epic_number` order on the board. This skill sits in the `/plan:*` family, not `/plan:work` — it scaffolds an epic and exits. It does NOT spawn a worker, does NOT run an audit, and does NOT close the epic. Running the work is autopilot's job, not this skill's — and this skill never advertises the human-gated operator hatch (`keeper:dispatch` / `keeper:autopilot`) that drives execution by hand.
+Capture a tiny, actionable change as a single-task epic and stop. No priority jump — the epic sorts in normal `epic_number` order on the board. This skill sits in the `/plan:*` family, not `/plan:work` — it scaffolds an epic and exits. It does NOT spawn a worker, does NOT run an audit, and does NOT close the epic. Running the work is autopilot's job, not this skill's — defer itself never proactively surprise-launches execution. The operator skills (`keeper:dispatch` / `keeper:autopilot`) are model-invocable and may be reached on a clear user request, but never from this defer flow on its own.
 
 ## When to invoke
 
@@ -175,7 +175,7 @@ One-line summary citing the new epic id and the defer status:
 
 > *deferred `<epic_id>` (queue_jump=false): <epic title> — sorts in normal epic_number order; autopilot runs it when it reaches the front of the board.*
 
-No menu, no follow-up prompts, no epic close. Autopilot runs the task — never offer to drive execution (no `/plan:work`, no surfacing the `keeper:dispatch` / `keeper:autopilot` hatch).
+No menu, no follow-up prompts, no epic close. Autopilot runs the task — defer never proactively offers to drive execution (no `/plan:work`, no surprise-launch). The operator skills stay reachable on explicit user intent, never from this flow on its own.
 
 ---
 
@@ -183,7 +183,7 @@ No menu, no follow-up prompts, no epic close. Autopilot runs the task — never 
 
 - **Never scales up silently.** Phase 3's one-task fit check is the load-bearing gate. If the work won't fit, stop with a concrete alternative — never scaffold a partial epic.
 - **No mutating verbs before Phase 4.** Phase 1 + Phase 2 + Phase 3 emit zero envelopes, zero commits. The only mutating verb in this skill is `keeper plan scaffold` in Phase 4.
-- **Not a job-launcher.** This skill does not spawn a worker, run an audit, or close the epic — autopilot runs the task. Never offer to drive execution: no `/plan:work`, and never surface the human-gated `keeper:dispatch` / `keeper:autopilot` operator hatch.
+- **Not a job-launcher.** This skill does not spawn a worker, run an audit, or close the epic — autopilot runs the task. Never proactively drive execution from this flow: no `/plan:work`, no surprise-launch. The model-invocable `keeper:dispatch` / `keeper:autopilot` operator skills are reached only on explicit user intent, never from defer on its own.
 - **Subject inference excludes `.planctl/`.** Same prompt-injection guard as `/plan:plan` Phase 1b — historical planctl state never seeds a new subject.
 - **One scout cap.** Phase 2 spawns at most one `repo-scout`. No fan-out, no gap-analyst, no Priority Questions loop — this is the fast lane.
 - **No `TodoWrite`.** planctl tracks all tasks.
