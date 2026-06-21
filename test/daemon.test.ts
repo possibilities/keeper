@@ -2554,11 +2554,15 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // value-preserving, NO cursor rewind, re-fold byte-identical across the
   // rename), each of which bumped SCHEMA_VERSION AND added its version to
   // `SUPPORTED_SCHEMA_VERSIONS` in the same commit per the CLAUDE.md same-commit
-  // invariant. This pin tracks the LIVE schema version: the guard it provides is
-  // "an accidental reducer/schema change must surface as a failing whitelist +
-  // this pin", which still holds — bump both together when the schema genuinely
-  // moves.
-  expect(SCHEMA_VERSION).toBe(78);
+  // invariant. And to 79 via fn-868 task .1 (the LIVE-ONLY git projection: a new
+  // `git_projection_state` control singleton + skip-floor, additive table +
+  // floor-raise, NO cursor rewind of the deterministic projections — the git
+  // surface is carved out of the re-fold charter, the other ~16 stay
+  // byte-identical). This pin tracks the LIVE schema version: the guard it
+  // provides is "an accidental reducer/schema change must surface as a failing
+  // whitelist + this pin", which still holds — bump both together when the schema
+  // genuinely moves.
+  expect(SCHEMA_VERSION).toBe(79);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

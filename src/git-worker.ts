@@ -532,7 +532,7 @@ function gitOutput(args: string[]): string | null {
  * a session's lifetime, so its cache is permanent; the separate membership
  * verdict ({@link shouldWatchRoot}) re-runs per reconcile against a fresh probe.
  */
-function resolveGitToplevel(path: string): string | null {
+export function resolveGitToplevel(path: string): string | null {
   const out = gitOutput(["-C", path, "rev-parse", "--show-toplevel"]);
   const root = out?.trim();
   if (!root) return null;
@@ -754,7 +754,14 @@ export function decideHeadCacheAdvance(
   return { advance: true, nextFailures: 0, loudBackstop: true };
 }
 
-function readStatus(root: string): ParsedGitStatus | null {
+/**
+ * Full porcelain-v2 status read for one root — the producer-side input to {@link
+ * buildGitSnapshot}. Time-bound + fail-safe via {@link gitOutput} (returns `null`
+ * on timeout/error). Exported so the boot-seed producer (`git-boot-seed.ts`)
+ * re-derives the live git surface through the SAME read the live worker uses,
+ * rather than reimplementing the porcelain parse.
+ */
+export function readStatus(root: string): ParsedGitStatus | null {
   const out = gitOutput([
     "-C",
     root,

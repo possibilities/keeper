@@ -334,6 +334,12 @@ from pathlib import Path
 # from-scratch re-fold byte-identical. keeper-py reads ``jobs`` / ``epics`` over
 # the socket, not these projection internals, so no reader logic changes — only
 # the version whitelist gains 77.
+#
+# v79 (fn-868 task .1) makes the git surface a LIVE-ONLY projection: a new
+# ``git_projection_state`` control singleton holds a skip-floor + ``seed_required``
+# flag, the migration raises the floor to ``max(events.id)`` so historical git
+# folds no-op, and a boot-seed producer re-derives the git surface. keeper-py
+# stopped reading the git tables, so again only the version whitelist gains 79.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -384,6 +390,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         76,
         77,
         78,
+        79,
     }
 )
 

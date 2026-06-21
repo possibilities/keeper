@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 78;
+export const SCHEMA_VERSION = 79;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -1121,6 +1121,176 @@ CREATE TABLE IF NOT EXISTS reducer_state (
 )
 `;
 
+/**
+ * Control row for the LIVE-ONLY git projection surface (`git_status` +
+ * `file_attributions` + the 3 `jobs` git-counter columns). Singleton
+ * (`CHECK id = 1`), mirroring {@link CREATE_REDUCER_STATE}.
+ *
+ * - `floor` — a monotonic `events.id` SKIP-FLOOR. Every git fold
+ *   (`projectGitStatus` / `retractGitStatus` / `mintPlanFileAttributions` / the
+ *   `foldCommit` discharge sub-blocks) NO-OPS for `event.id <= floor`. The global
+ *   cursor still advances past those events (the other ~16 projections fold
+ *   normally), so this is NOT a drain-SQL gate — it lives INSIDE `applyEvent` by
+ *   event type. The boot-seed producer re-derives the whole surface ABOVE the
+ *   floor, so replaying the 4.3M historical `GitSnapshot`/`Commit` events (the
+ *   ~6-day `computeRepoBashWindows` self-join time-bomb) is skipped entirely.
+ * - `seed_required` — 1 while the boot-seed is mid-flight (set before the
+ *   per-root delete+reseed, cleared after the synthetic snapshot folds). On boot
+ *   a stuck `seed_required = 1` (crash mid-seed, or a degraded git scan) forces a
+ *   re-seed before serving so the surface is never left permanently empty.
+ *
+ * Both columns are PRODUCER/live-owned — they are DELIBERATELY excluded from the
+ * re-fold byte-identical charter (see `LIVE_ONLY_PROJECTIONS`). A class-aware
+ * rewind that wipes a live projection MUST reset `floor` to 0 and set
+ * `seed_required = 1` (enforced by {@link rewindLiveProjection}), or the
+ * historical GitSnapshots self-gate below the stale floor and the surface stays
+ * empty forever.
+ */
+const CREATE_GIT_PROJECTION_STATE = `
+CREATE TABLE IF NOT EXISTS git_projection_state (
+    id INTEGER PRIMARY KEY CHECK (id = 1),
+    floor INTEGER NOT NULL DEFAULT 0,
+    seed_required INTEGER NOT NULL DEFAULT 0,
+    updated_at REAL NOT NULL
+)
+`;
+
+/**
+ * Projection-class taxonomy (Marten's "Live projection lifecycle"). The central
+ * source of truth for which projection tables are LIVE-PRODUCER-FED — re-derived
+ * by a boot-seed producer + kept current by incremental folds ABOVE a skip-floor,
+ * NOT replayed from history, and DELIBERATELY excluded from the re-fold
+ * byte-identical charter.
+ *
+ * Everything NOT listed here is **deterministic-replayed** (the sacred default —
+ * `jobs`/`epics`/`commit_trailer_facts`/… reproduce byte-identical projection
+ * rows on a from-scratch re-fold). The two `git_projection_state` control columns
+ * (`floor`, `seed_required`) are **control** state, also charter-excluded.
+ *
+ * The carve-out exists because `projectGitStatus`'s `computeRepoBashWindows`
+ * self-joins the WHOLE event log per `GitSnapshot` — an O(history)-per-event fold
+ * whose replay cost grows without bound (the fn-856 incident: ~6 days over 4.3M
+ * events). The general rule this codifies: any projection whose per-event fold
+ * cost grows with history length is a replay time-bomb — model it live-only or
+ * constant-bounded, never O(history)-per-event.
+ *
+ * Charter tests (`test/refold-equivalence.test.ts`) MUST exclude every table here
+ * AND the 3 `jobs` git-counter columns enumerated in `LIVE_ONLY_JOBS_COLUMNS`
+ * (the columns live INSIDE the otherwise-deterministic `jobs` table).
+ */
+export const LIVE_ONLY_PROJECTIONS = [
+  "git_status",
+  "file_attributions",
+] as const;
+
+/**
+ * The git-derived counter columns embedded in the otherwise-deterministic `jobs`
+ * projection. Live-producer-fed (re-seeded by the boot-seed's per-root reset),
+ * so the charter byte-identical comparison of `jobs` MUST blank these columns
+ * before comparing. fn-867 deleted the readiness predicate that read them, so
+ * they are now display-only.
+ */
+export const LIVE_ONLY_JOBS_COLUMNS = [
+  "git_dirty_count",
+  "git_unattributed_to_live_count",
+  "git_orphan_count",
+] as const;
+
+/**
+ * Class-aware rewind of the LIVE-ONLY git surface. ENFORCES the coupling that a
+ * raw `DELETE FROM git_status` cannot: wiping the live tables WITHOUT resetting
+ * the skip-floor would leave the surface permanently empty — every historical
+ * `GitSnapshot` self-gates below the stale floor, so nothing repopulates it.
+ *
+ * This helper:
+ *   1. wipes every `LIVE_ONLY_PROJECTIONS` table + zeroes the 3 jobs git-counters,
+ *   2. resets `floor = 0` so a subsequent re-fold's git folds run again, AND
+ *   3. sets `seed_required = 1` so the boot-seed re-derives the surface even if
+ *      the re-fold path doesn't cover every currently-dirty root.
+ *
+ * Call this anywhere a migration rewinds-and-redrains a step that wipes the git
+ * surface (in place of the bare `DELETE FROM git_status; DELETE FROM
+ * file_attributions` pair). Idempotent. The caller still owns the cursor rewind
+ * (`reducer_state.last_event_id = 0`) for the DETERMINISTIC projections — that is
+ * a separate concern from the live surface and stays explicit at the call site.
+ */
+function rewindLiveProjection(db: Database): void {
+  for (const table of LIVE_ONLY_PROJECTIONS) {
+    db.run(`DELETE FROM ${table}`);
+  }
+  // Zero the embedded jobs git-counters (the boot-seed/live folds re-derive
+  // them). A `jobs` rewind that DELETEs the whole table covers this too, but the
+  // counters are live-owned so we reset them explicitly here for the case where
+  // `jobs` is NOT being wiped alongside.
+  db.run(
+    `UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0`,
+  );
+  db.run(
+    `UPDATE git_projection_state
+        SET floor = 0, seed_required = 1, updated_at = unixepoch('now', 'subsec')
+      WHERE id = 1`,
+  );
+}
+
+/**
+ * Read the LIVE-ONLY git-projection skip-floor. Every git fold no-ops for
+ * `event.id <= floor`. Returns 0 when the control row is missing (a pre-v79 /
+ * mid-migrate read) so folds run unconditionally rather than silently gating —
+ * fail-open on the floor, never fail-empty.
+ */
+export function readGitProjectionFloor(db: Database): number {
+  const row = db
+    .query("SELECT floor FROM git_projection_state WHERE id = 1")
+    .get() as { floor: number } | null;
+  return row?.floor ?? 0;
+}
+
+/**
+ * Read whether the boot-seed must (re-)derive the git surface before serving.
+ * `true` when the control row says so OR when the row is absent (treat a missing
+ * control row as "needs seeding" — fail-safe toward re-deriving). The daemon
+ * boot-seed checks this and the migration sets it on every v→v79 upgrade.
+ */
+export function readGitProjectionSeedRequired(db: Database): boolean {
+  const row = db
+    .query("SELECT seed_required FROM git_projection_state WHERE id = 1")
+    .get() as { seed_required: number } | null;
+  return row == null ? true : row.seed_required !== 0;
+}
+
+/**
+ * Set `seed_required`. The boot-seed producer sets it `true` before its per-root
+ * delete+reseed and clears it `false` after the synthetic snapshot folds, so a
+ * crash mid-seed leaves it set and the next boot re-seeds.
+ */
+export function setGitProjectionSeedRequired(
+  db: Database,
+  required: boolean,
+): void {
+  db.run(
+    `UPDATE git_projection_state
+        SET seed_required = ?, updated_at = unixepoch('now', 'subsec')
+      WHERE id = 1`,
+    [required ? 1 : 0],
+  );
+}
+
+/**
+ * Raise the skip-floor to `max(floor, newFloor)`. Monotonic — never lowers the
+ * floor (a stale producer can't reopen the historical replay). The boot-seed
+ * reads `max(events.id)` BEFORE its git scan and persists THAT as the floor in
+ * the same step it clears `seed_required`, so events that arrived DURING the scan
+ * (id > the captured floor) re-apply idempotently via the live fold.
+ */
+export function raiseGitProjectionFloor(db: Database, newFloor: number): void {
+  db.run(
+    `UPDATE git_projection_state
+        SET floor = max(floor, ?), updated_at = unixepoch('now', 'subsec')
+      WHERE id = 1`,
+    [newFloor],
+  );
+}
+
 const CREATE_META = `
 CREATE TABLE IF NOT EXISTS meta (
     key TEXT PRIMARY KEY,
@@ -1570,6 +1740,7 @@ function migrate(db: Database): void {
       db.run(CREATE_GIT_STATUS);
       db.run(CREATE_USAGE);
       db.run(CREATE_REDUCER_STATE);
+      db.run(CREATE_GIT_PROJECTION_STATE);
       db.run(CREATE_META);
       db.run(CREATE_SUBAGENT_INVOCATIONS);
       for (const sql of CREATE_SUBAGENT_INVOCATIONS_INDEXES) {
@@ -1612,6 +1783,14 @@ function migrate(db: Database): void {
       // Seed singleton cursor on first boot.
       db.run(
         "INSERT OR IGNORE INTO reducer_state (id, last_event_id, updated_at) VALUES (1, 0, unixepoch('now', 'subsec'))",
+      );
+      // Seed the live-only git-projection control singleton. `floor = 0` +
+      // `seed_required = 1` on a cold first boot so the boot-seed producer
+      // re-derives the git surface before serving (a fresh DB has no prior floor;
+      // a 0 floor means every git fold runs, but the boot-seed runs anyway and
+      // the floor moves up to current `max(events.id)` once it does).
+      db.run(
+        "INSERT OR IGNORE INTO git_projection_state (id, floor, seed_required, updated_at) VALUES (1, 0, 1, unixepoch('now', 'subsec'))",
       );
 
       // Forward-only schema changes run on EVERY boot, NOT gated on the stored
@@ -2671,8 +2850,10 @@ function migrate(db: Database): void {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
         db.run("DELETE FROM epics");
-        db.run("DELETE FROM git_status");
-        db.run("DELETE FROM file_attributions");
+        // Class-aware wipe of the LIVE-ONLY git surface: resets the skip-floor +
+        // sets seed_required so the surface repopulates (a bare DELETE would
+        // strand it empty below the floor). See `rewindLiveProjection`.
+        rewindLiveProjection(db);
         db.run("DELETE FROM subagent_invocations");
       }
 
@@ -2854,8 +3035,10 @@ function migrate(db: Database): void {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
         db.run("DELETE FROM epics");
-        db.run("DELETE FROM git_status");
-        db.run("DELETE FROM file_attributions");
+        // Class-aware wipe of the LIVE-ONLY git surface: resets the skip-floor +
+        // sets seed_required so the surface repopulates (a bare DELETE would
+        // strand it empty below the floor). See `rewindLiveProjection`.
+        rewindLiveProjection(db);
         db.run("DELETE FROM subagent_invocations");
       }
 
@@ -2924,8 +3107,10 @@ function migrate(db: Database): void {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
         db.run("DELETE FROM epics");
-        db.run("DELETE FROM git_status");
-        db.run("DELETE FROM file_attributions");
+        // Class-aware wipe of the LIVE-ONLY git surface: resets the skip-floor +
+        // sets seed_required so the surface repopulates (a bare DELETE would
+        // strand it empty below the floor). See `rewindLiveProjection`.
+        rewindLiveProjection(db);
         db.run("DELETE FROM subagent_invocations");
         db.run("DELETE FROM usage");
         db.run("DELETE FROM profiles");
@@ -3064,8 +3249,10 @@ function migrate(db: Database): void {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
         db.run("DELETE FROM epics");
-        db.run("DELETE FROM git_status");
-        db.run("DELETE FROM file_attributions");
+        // Class-aware wipe of the LIVE-ONLY git surface: resets the skip-floor +
+        // sets seed_required so the surface repopulates (a bare DELETE would
+        // strand it empty below the floor). See `rewindLiveProjection`.
+        rewindLiveProjection(db);
         db.run("DELETE FROM subagent_invocations");
       }
 
@@ -3773,8 +3960,10 @@ function migrate(db: Database): void {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
         db.run("DELETE FROM epics");
-        db.run("DELETE FROM git_status");
-        db.run("DELETE FROM file_attributions");
+        // Class-aware wipe of the LIVE-ONLY git surface: resets the skip-floor +
+        // sets seed_required so the surface repopulates (a bare DELETE would
+        // strand it empty below the floor). See `rewindLiveProjection`.
+        rewindLiveProjection(db);
         db.run("DELETE FROM subagent_invocations");
         db.run("DELETE FROM usage");
         db.run("DELETE FROM profiles");
@@ -3906,26 +4095,68 @@ function migrate(db: Database): void {
           }
         }
 
-        // 4. Hard assertion: no canonical event may still carry the legacy key
-        // after the rewrite, or the dropped `?? planctl_invocation` coalesce would
-        // silently NULL that event's plan link. A residual count > 0 is a missed
-        // row shape — throw loud and roll the whole v78 tx back to v77 (boot
-        // retries). Skip-on-malformed is fine here: a body that failed JSON.parse
-        // is one the deriver also can't read, so it carries no live plan link.
+        // 4. Hard assertion: no event the DERIVER reads as an envelope may still
+        // carry the legacy `planctl_invocation` key after the rewrite, or the
+        // dropped `?? planctl_invocation` coalesce would silently NULL that event's
+        // plan link. The check is SCOPED to the deriver's two envelope read
+        // locations — the top-level inlined envelope and the `tool_response.stdout`
+        // JSON-string envelope — NOT a raw `data` substring: `planctl_invocation`
+        // legitimately survives as incidental TEXT in Bash command lines, file-read
+        // bodies, git snapshots, and prompts, none of which the deriver reads as an
+        // envelope. A residual > 0 is a real missed envelope shape — throw loud and
+        // roll the whole v78 tx back to v77 (boot retries). Malformed/oversized
+        // stdout is excluded by the json_valid guard: the deriver can't read it
+        // either, so it carries no live plan link.
         const residual = (
           db
             .prepare(
               `SELECT COUNT(*) AS n FROM events
-                WHERE data LIKE '%planctl_invocation%'
-                  AND json_valid(data)`,
+                WHERE json_valid(data)
+                  AND (
+                    json_type(data, '$.planctl_invocation') IS NOT NULL
+                    OR (
+                      json_valid(json_extract(data, '$.tool_response.stdout'))
+                      AND json_type(
+                            json_extract(data, '$.tool_response.stdout'),
+                            '$.planctl_invocation'
+                          ) IS NOT NULL
+                    )
+                  )`,
             )
             .get() as { n: number }
         ).n;
         if (residual > 0) {
           throw new Error(
-            `v78 envelope rewrite incomplete: ${residual} events still carry planctl_invocation`,
+            `v78 envelope rewrite incomplete: ${residual} events still carry a planctl_invocation envelope`,
           );
         }
+      }
+
+      // v78→v79 (fn-868 task .1): make the git surface a LIVE-ONLY projection.
+      // The `git_projection_state` control singleton is created+seeded
+      // unconditionally above; this version-guarded step RAISES the skip-floor to
+      // the current `max(events.id)` so the very next boot drain NO-OPS every
+      // historical `GitSnapshot`/`Commit` git fold (`id <= floor`) instead of
+      // replaying 4.3M events through `computeRepoBashWindows`'s ~6-day self-join.
+      // The boot-seed producer then re-derives `git_status` + `file_attributions`
+      // + the 3 jobs git-counters at full fidelity ABOVE the floor before serving.
+      // `seed_required = 1` so the boot-seed fires even on a clean restart.
+      //
+      // Idempotent + fresh-walk-safe: `max(floor, coalesce(max(events.id), 0))`
+      // never lowers the floor (re-run is a no-op) and a fresh 0→79 DB has no
+      // events so `max(events.id)` is NULL → floor stays 0 (every git fold runs,
+      // and the boot-seed runs anyway). NOT a cursor rewind: the global
+      // `reducer_state.last_event_id` is untouched, so the other ~16
+      // deterministic projections keep folding the full log byte-identically.
+      // This is a PRODUCER/live-owned write — excluded from the re-fold charter.
+      if (preMigrateStoredVersion < 79) {
+        db.run(
+          `UPDATE git_projection_state
+              SET floor = max(floor, (SELECT COALESCE(MAX(id), 0) FROM events)),
+                  seed_required = 1,
+                  updated_at = unixepoch('now', 'subsec')
+            WHERE id = 1`,
+        );
       }
 
       db.prepare(

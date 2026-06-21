@@ -774,6 +774,16 @@ function rewindAndWipeProjections(): void {
   db.run("DELETE FROM subagent_invocations");
   db.run("DELETE FROM usage");
   db.run("DELETE FROM commit_trailer_facts");
+  // Reset the LIVE-ONLY git skip-floor to 0 alongside the cursor rewind. In
+  // PRODUCTION the git surface (`git_status`/`file_attributions`/the 3 jobs
+  // git-counters) is live-only and a rewind leaves it to the boot-seed — but
+  // these charter tests deliberately REPLAY the historical git folds to assert
+  // the SHED preserves what the git-attribution scan reads (the fn-836/837
+  // `mutation_path` mechanism). Resetting the floor reopens that replay, so the
+  // two from-scratch re-folds stay byte-identical across the FULL projection set
+  // (including the live surface). The separate enumeration test
+  // (`charter excludes the live-only surface`) covers the production carve-out.
+  db.run("UPDATE git_projection_state SET floor = 0 WHERE id = 1");
 }
 
 // ---------------------------------------------------------------------------
@@ -1678,6 +1688,15 @@ test("v77→v78 MERGE GATE: legacy `planctl_invocation`-only + `plan_invocation`
         expect(idxSql.get(name)).toContain("plan_op IS NOT NULL");
         expect(idxSql.get(name)).not.toContain("planctl_op");
       }
+
+      // Lower the LIVE-ONLY git skip-floor to 0 before the re-fold. The v79
+      // migration raised `floor = max(events.id)` so production never replays
+      // historical `file_attributions` mints — but THIS test exercises the v78
+      // envelope-rewrite fold-equivalence precisely BY replaying the two seeded
+      // scaffold events, so it deliberately reopens the historical fold. (The
+      // surface is live-only in production; here we want the deterministic fold
+      // to run so the legacy-vs-new equivalence is observable.)
+      db.run("UPDATE git_projection_state SET floor = 0 WHERE id = 1");
 
       // Fold the rewritten corpus.
       let n: number;

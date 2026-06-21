@@ -2145,9 +2145,10 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // `dispatch_never_bound` circuit-breaker projection table, fn-846; v77 ungates
   // the plan-link classifier from `/plan:plan` windows + rewinds the cursor and
   // wipes the canonical projection list, fn-856; v78 renames the `planctl_*`
-  // schema surface → `plan_*` + rewrites historical envelopes, fn-864); the
-  // v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(78);
+  // schema surface → `plan_*` + rewrites historical envelopes, fn-864; v79 adds
+  // the `git_projection_state` live-only control singleton + skip-floor, fn-868);
+  // the v62→v63 epics-shape migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(79);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

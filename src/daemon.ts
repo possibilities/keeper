@@ -66,6 +66,7 @@ import type {
 } from "./events-ingest-worker";
 import { classifyCloseKind } from "./exec-backend";
 import type { ExitMessage, ExitWatcherWorkerData } from "./exit-watcher";
+import { seedGitProjection } from "./git-boot-seed";
 import type {
   AddDiscoveryRootMessage,
   GitWorkerData,
@@ -1416,6 +1417,25 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     );
     drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
   });
+
+  // Step 2a.5 — LIVE-ONLY git boot-seed. The v79 skip-floor makes every
+  // historical `GitSnapshot`/`Commit` git fold no-op, so the git surface
+  // (`git_status` + `file_attributions` + the 3 jobs git-counters) is EMPTY after
+  // the boot drain. Re-derive it for currently-dirty files here — BEFORE serving,
+  // so `await git-clean` / `commit-work` / readiness consumers see a populated
+  // surface from the first board read. Runs AFTER `seedKilledSweep` (job rows
+  // must exist so attribution rendering resolves session state) and BEFORE the
+  // git-worker spawn (whose first emit is suppressed). DEGRADE-NOT-FATAL: the
+  // seed is time-bound and never throws; a git hang/failure serves the rest of
+  // the control plane and leaves `seed_required` set to retry. Reachable from the
+  // `startDaemon` test path (this is the same `runDaemon` body). Skipped only on
+  // a git-unselected boot (`want("git")` false) — no git surface to seed.
+  if (want("git")) {
+    seedGitProjection(db, stmts, {
+      drainToCompletion: (handle) =>
+        drainToCompletion(handle, DEFAULT_BATCH_SIZE, bootPace),
+    });
+  }
 
   // Step 2b — dead-letter boot import. Read every NDJSON file the hook wrote
   // during downtime and INSERT OR IGNORE each parsed record into `dead_letters`

@@ -1693,6 +1693,28 @@ function inferFromWindows(
  * zero rows; the next snapshot lands the counts).
  */
 /**
+ * Read the LIVE-ONLY git-projection skip-floor (`git_projection_state.floor`).
+ * The git surface (`git_status` + `file_attributions` + the 3 `jobs` git-counter
+ * columns) is a LIVE-PRODUCER-FED projection, NOT replayed from history: a
+ * boot-seed re-derives it on boot and live folds keep it current. Every git fold
+ * NO-OPS for `event.id <= floor`, so re-folding the 4.3M historical
+ * `GitSnapshot`/`Commit` events skips the ~6-day `computeRepoBashWindows`
+ * self-join entirely.
+ *
+ * Inline SQL (matching the reducer's no-prepared-stmts convention). Returns 0
+ * when the control row is missing (pre-v79 / mid-migrate) so folds run rather
+ * than silently gate — fail-open. PURE event-derived: this reads a control row,
+ * never wall-clock / env / FS, so it does NOT break re-fold determinism for the
+ * deterministic projections (and the git surface it gates is charter-excluded).
+ */
+function readGitFloor(db: Database): number {
+  const row = db
+    .query("SELECT floor FROM git_projection_state WHERE id = 1")
+    .get() as { floor: number } | null;
+  return row?.floor ?? 0;
+}
+
+/**
  * Threshold above which a GitSnapshot fold emits a per-pass `[gitfold-breakdown]`
  * line — high enough that normal folds stay silent; only the multi-second
  * outliers that hold the write lock and starve hook INSERTs matter.
@@ -1700,6 +1722,15 @@ function inferFromWindows(
 const GIT_FOLD_BREAKDOWN_MS = 1000;
 
 function projectGitStatus(db: Database, event: Event): void {
+  // LIVE-ONLY skip-floor: `git_status` + `file_attributions` are producer-fed,
+  // not replayed. A historical GitSnapshot (`id <= floor`) no-ops — the boot-seed
+  // re-derives the surface above the floor. The cursor still advances at the
+  // dispatch site, so the other ~16 deterministic projections fold normally.
+  // This is the fold whose `computeRepoBashWindows` self-join is the replay
+  // time-bomb, so gating it is the whole point of the live-only design.
+  if (event.id <= readGitFloor(db)) {
+    return;
+  }
   const snapshot = extractGitSnapshot(event);
   if (snapshot == null) {
     return;
@@ -2122,6 +2153,12 @@ function projectGitStatus(db: Database, event: Event): void {
  * the snapshot + retract pair, preserving byte-identical re-fold.
  */
 function retractGitStatus(db: Database, event: Event): void {
+  // LIVE-ONLY skip-floor: a historical GitRootDropped (`id <= floor`) no-ops —
+  // the boot-seed re-derives the current surface, and replaying old tombstones
+  // against a freshly-seeded surface would wrongly DELETE a still-dirty root.
+  if (event.id <= readGitFloor(db)) {
+    return;
+  }
   const projectDir = event.session_id;
   if (projectDir == null || projectDir.length === 0) {
     return;
@@ -2240,6 +2277,14 @@ function foldCommit(db: Database, event: Event): void {
     // discharge. Safe no-op.
     return;
   }
+  // LIVE-ONLY skip-floor — SCOPED to the `file_attributions` discharge ONLY.
+  // A historical Commit (`id <= floor`) must NOT touch the producer-fed
+  // `file_attributions` surface (the boot-seed re-derives it). But the
+  // `commit_trailer_facts` INSERT above, plus `foldCommitTaskLinks` +
+  // `syncPlanLinks` below, stay UNCONDITIONAL — those are DETERMINISTIC
+  // projections that must replay byte-identically over the full log. So the gate
+  // is a per-block boolean, not an early-return out of `foldCommit`.
+  const skipDischarge = event.id <= readGitFloor(db);
   // Convert producer-side milliseconds to projection-table seconds. The
   // file_attributions schema (see `src/db.ts:631`) stores REAL unix-
   // seconds for `last_mutation_at` / `last_commit_at`, mirroring every
@@ -2313,28 +2358,32 @@ function foldCommit(db: Database, event: Event): void {
     );
     // Content-aware gate. When it suppresses, skip the UPDATE entirely —
     // `last_mutation_at` is unchanged, so the row stays attributed via the
-    // (mutation > commit) discharge inequality.
-    for (const entry of commit.files) {
-      const filePath = entry.path;
-      if (typeof filePath !== "string" || filePath.length === 0) continue;
-      if (
-        shouldSkipDischarge(
+    // (mutation > commit) discharge inequality. The whole discharge loop is also
+    // skipped below the live-only floor (`skipDischarge`) — `file_attributions`
+    // is producer-fed, so a historical Commit must not discharge against it.
+    if (!skipDischarge) {
+      for (const entry of commit.files) {
+        const filePath = entry.path;
+        if (typeof filePath !== "string" || filePath.length === 0) continue;
+        if (
+          shouldSkipDischarge(
+            commit.project_dir,
+            filePath,
+            entry.blob_oid,
+            entry.committed_mode,
+          )
+        ) {
+          continue;
+        }
+        stmt.run(
+          lastCommitAtSeconds,
+          eventId,
+          eventTs,
           commit.project_dir,
+          commit.committer_session_id,
           filePath,
-          entry.blob_oid,
-          entry.committed_mode,
-        )
-      ) {
-        continue;
+        );
       }
-      stmt.run(
-        lastCommitAtSeconds,
-        eventId,
-        eventTs,
-        commit.project_dir,
-        commit.committer_session_id,
-        filePath,
-      );
     }
     const _cfT1 = performance.now();
     // Task→committing-session link write, gated on `task_ids.length > 0` (the
@@ -2400,7 +2449,14 @@ function foldCommit(db: Database, event: Event): void {
   }
   // Global discharge: no trailer (or malformed) → no honest way to pin the
   // discharge to a session, so clear EVERY session's attribution row for the
-  // named files.
+  // named files. This arm is ENTIRELY a `file_attributions` discharge (the
+  // unconditional `commit_trailer_facts` INSERT + task-links + syncPlanLinks all
+  // live in the per-session arm, which already returned), so the live-only floor
+  // skips the whole arm — a historical Commit (`id <= floor`) leaves the
+  // producer-fed surface to the boot-seed.
+  if (skipDischarge) {
+    return;
+  }
   const _cfgT0 = performance.now();
   const globalStmt = db.prepare(
     `UPDATE file_attributions
@@ -5268,6 +5324,13 @@ function extractPlanStateRepo(event: Event): string | null {
  * lifted. NEVER throws.
  */
 function mintPlanFileAttributions(db: Database, event: Event): void {
+  // LIVE-ONLY skip-floor: `file_attributions` is producer-fed. A historical
+  // plan-file mint (`id <= floor`) no-ops — the boot-seed re-derives current
+  // attributions, and the next live GitSnapshot re-mints any still-dirty
+  // `.keeper/**` path. Gating here keeps the surface live-only end to end.
+  if (event.id <= readGitFloor(db)) {
+    return;
+  }
   if (event.plan_op == null || event.plan_files == null) {
     return;
   }
