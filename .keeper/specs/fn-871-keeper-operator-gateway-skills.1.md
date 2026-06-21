@@ -61,5 +61,5 @@ mirroring await's exactly.
 - [ ] no Monitor wrapping (one-shot Bash); no plugin manifest or hooks.json edits
 
 ## Done summary
-
+Added plugins/keeper/skills/dispatch/SKILL.md — a slash-only one-shot Bash gateway mirroring keeper:await section-for-section (intent->command table for plan/free forms, pre-check, --dry-run, exit taxonomy, surface-and-ask race-guard). Validated frontmatter parse and dry-run output shape against a real board id.
 ## Evidence

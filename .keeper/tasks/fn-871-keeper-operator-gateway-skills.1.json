@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "keeper:dispatch gateway skill",
-  "updated_at": "2026-06-21T14:47:52.559000Z"
+  "updated_at": "2026-06-21T14:50:10.899000Z",
+  "worker_done_at": "2026-06-21T14:50:10.899000Z"
 }
