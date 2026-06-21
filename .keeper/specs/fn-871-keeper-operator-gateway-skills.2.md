@@ -81,5 +81,5 @@ subcommands. Frontmatter mirrors await.
 - [ ] `## Guardrails` restates exceptional + human-gated; no plugin manifest or hooks.json edits
 
 ## Done summary
-
+Added keeper:autopilot gateway skill mirroring await/dispatch structure: intent->command table for pause/play/mode/arm/disarm/retry/snapshot-read, the capture->drive->restore take-over lifecycle (re-read before restore, restore-failure surfaced distinctly, partial-mutation named), risk gradient, plan:next anti-trigger, and the --watch What-NOT-to-do. SKILL.md only; no manifest/hooks edits.
 ## Evidence
