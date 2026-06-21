@@ -11,7 +11,7 @@ allowed-tools: Bash(keeper plan:*), Bash(keeper:*), Read, Glob, Task
 
 # Defer
 
-Capture a tiny, actionable change as a single-task epic and stop. No priority jump — the epic sorts in normal `epic_number` order on the board. This skill sits in the `/plan:*` family, not `/plan:work` — it scaffolds an epic and exits. It does NOT spawn a worker, does NOT run an audit, and does NOT close the epic. Running the task is a separate `/plan:work <task_id>` call by the human.
+Capture a tiny, actionable change as a single-task epic and stop. No priority jump — the epic sorts in normal `epic_number` order on the board. This skill sits in the `/plan:*` family, not `/plan:work` — it scaffolds an epic and exits. It does NOT spawn a worker, does NOT run an audit, and does NOT close the epic. Running the work is autopilot's job, not this skill's.
 
 ## When to invoke
 
@@ -173,9 +173,9 @@ The success envelope carries `epic_id` (the freshly-minted `fn-N-slug`) and `tas
 
 One-line summary citing the new epic id and the defer status:
 
-> *deferred `<epic_id>` (queue_jump=false): <epic title> — sorts in normal epic_number order. run with `/plan:work <epic_id>.1` when ready.*
+> *deferred `<epic_id>` (queue_jump=false): <epic title> — sorts in normal epic_number order; autopilot runs it when it reaches the front of the board.*
 
-No menu, no follow-up prompts, no epic close. The human picks when to run the task.
+No menu, no follow-up prompts, no epic close. Autopilot runs the task — never offer `/plan:work`.
 
 ---
 
@@ -183,7 +183,7 @@ No menu, no follow-up prompts, no epic close. The human picks when to run the ta
 
 - **Never scales up silently.** Phase 3's one-task fit check is the load-bearing gate. If the work won't fit, stop with a concrete alternative — never scaffold a partial epic.
 - **No mutating verbs before Phase 4.** Phase 1 + Phase 2 + Phase 3 emit zero envelopes, zero commits. The only mutating verb in this skill is `keeper plan scaffold` in Phase 4.
-- **Not a job-launcher.** This skill does not spawn a worker, does not run an audit, does not close the epic. `/plan:work <task_id>` is a separate human-initiated call.
+- **Not a job-launcher.** This skill does not spawn a worker, run an audit, or close the epic — autopilot runs the task. Never offer `/plan:work`.
 - **Subject inference excludes `.planctl/`.** Same prompt-injection guard as `/plan:plan` Phase 1b — historical planctl state never seeds a new subject.
 - **One scout cap.** Phase 2 spawns at most one `repo-scout`. No fan-out, no gap-analyst, no Priority Questions loop — this is the fast lane.
 - **No `TodoWrite`.** planctl tracks all tasks.

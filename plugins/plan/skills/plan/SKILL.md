@@ -324,7 +324,7 @@ Emit a sketch-shaped artifact (mirrors `/arthack:sketch`). Pull Touchpoints from
 
 Follow it with one explainer paragraph and one question (plain text, no `AskUserQuestion`):
 
-> *This looks like a single-commit job — SHORT depth, one task, no seams worth splitting on. I can skip the epic entirely and just commit, defer it as a single-task epic at normal sort order for later (then `/plan:next <epic_id>` if you want to jump it to the front), or write the full epic + task now if you'd rather have the planctl trail.*
+> *This looks like a single-commit job — SHORT depth, one task, no seams worth splitting on. I can skip the epic entirely and just commit, defer it as a single-task epic at normal sort order for later, or write the full epic + task now if you'd rather have the planctl trail.*
 >
 > *Commit directly, defer for later, or continue planning?*
 
@@ -597,7 +597,7 @@ On the refine path, append:
 Scouts: ran {<name>, …}; skipped {<name>: <reason>, …}
 ```
 
-Omit the `ran {}` side if zero ran; omit `skipped {}` if none were skipped. No menu, no follow-up prompts — the human can run `keeper plan list` / `ready` / `show <id>`.
+Omit the `ran {}` side if zero ran; omit `skipped {}` if none were skipped. No menu, no follow-up prompts.
 
 ---
 

@@ -176,17 +176,26 @@ When the route is `/plan:plan` — inferred, or because the human said "plan it"
 
 "Plan it" often arrives with this beat spelled out — "explore, resolve questions, then plan", "ask anything you need first, when ready /plan:plan". That phrasing sets the sequence, not just the destination; honor the sequence even when it's left implicit.
 
-### After an epic lands, arm an await when a follow-up earns it
+### After an epic lands, the session goes quiet by default
 
-Scaffolding an epic — via `/plan:plan` or `/plan:defer` — doesn't have to end the session. Keeper's autopilot dispatches workers against ready plan work when armed, and the `keeper:await` skill blocks on board state (epic or task complete, or unblocked) then runs a follow-up action.
+Scaffolding an epic — via `/plan:plan` or `/plan:defer` — normally ends the visible session. Keeper's autopilot dispatches and completes all plan work on its own; **the agent is left in the dark about execution by design.** Once the epic lands, the wrap-up is the plan skill's own one-line report and nothing more — no description of how the work runs, and **never an offer to run `/plan:work`** (or any "run it when ready" prompt). The agent plans; it does not start, drive, or close the work.
 
-- **The human used circle-back phrasing** — "circle back", "wait for followup", "check back after the epic lands", "ping me when it's done", or any wait-then-act wording, anywhere in the conversation → that's the directive: arm `keeper:await` with the condition (`complete fn-N-slug[.M]`) and the follow-up action spelled out. No confirmation beat.
-- **A follow-up was recommended or discussed** — a phase-2 plan gated on this epic's outcome, a verification pass, a follow-up you recommended in the answer → weigh it: if the await is more likely useful than not, arm it without asking. The human can always close it to override.
-- **Neither** → stop silently. No "nothing worth awaiting" narration, no generic "want me to wait?" — an idle await is noise, and so is talking about not arming one. Deferred epics bias hard this way.
+The one optional move is arming an await — and it stays silent unless the conversation earns it. `keeper:await` blocks on board state (epic or task complete, or unblocked) then runs a follow-up action.
 
-When auto-arming, give the human basic context in one or two sentences: what condition the await watches, what fires when it completes, and which part of the conversation made it worth arming.
+- **Positive call** — the human used wait-then-act phrasing anywhere in the conversation ("circle back", "wait for followup", "check back after the epic lands", "ping me when it's done") → that's the directive: arm `keeper:await` with the condition (`complete fn-N-slug[.M]`) and the follow-up action spelled out. No confirmation beat — just a one-or-two-sentence note on what it watches and what fires.
+- **Ambiguous** — a follow-up was genuinely discussed (a phase-2 plan gated on this epic, a verification pass you raised) but the human never asked to wait → collaborate: ask one short plain-text question whether to arm it. Don't self-arm a follow-up the human didn't request.
+- **Neither** → silent. No "nothing worth awaiting" narration, no generic "want me to wait?", no raising the await topic at all — an idle await is noise, and so is talking about not arming one. This is the common case; deferred epics bias hard this way.
 
-Daisy-chain: plan the first epic, await its completion while autopilot runs the work, then plan the next phase from what landed — one session driving several plan rounds without the human re-priming context. Each round re-runs the same check before arming the next; when in doubt, stop and hand back.
+Daisy-chain: plan the first epic, await its completion while autopilot runs the work, then plan the next phase from what landed — one session driving several plan rounds without the human re-priming context. Each round re-runs the same check before arming the next; when in doubt, stay silent and hand back.
+
+### Always check the session is done — speak only to close it
+
+At the end of any flow that did real work or landed an epic — and any other point where the human might reasonably wonder whether you're finished — silently answer one question: *is there anything left in this conversation to accomplish or revisit, now or when the epic completes?* This runs every time; it is an internal check, not a prompt. (After a self-evidently-complete trivial answer, the answer is its own close-signal — stay silent.)
+
+- **Something is left** — an armed await, an unanswered sub-thread, a side-ask the human raised and you haven't closed, a follow-up the conversation implies → stay quiet about closing. The await note above, or the work itself, already carries the "more is coming" signal; don't pile "still some things to do" narration on top.
+- **Nothing is left** — the inquiry is fully answered, any epic is scaffolded, no await is armed or pending, nothing the human raised is dangling → say so in one short sentence so the human never has to ask: *"That's everything from this thread — clear to close the session whenever you like."* Nothing more.
+
+Never ask "anything else?" or "should I close?" — answering that for the human is the whole point. An armed await means something IS pending, so it and the close-signal never fire together.
 
 ### Orchestration is yours to shape
 
