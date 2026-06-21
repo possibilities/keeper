@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T04:43:58.918000Z",
+  "depends_on": [
+    "fn-870-harden-autopilot-dispatch-against-stale.1"
+  ],
+  "epic": "fn-870-harden-autopilot-dispatch-against-stale",
+  "id": "fn-870-harden-autopilot-dispatch-against-stale.3",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "operator clear for stuck approve dispatches",
+  "updated_at": "2026-06-21T04:43:58.918000Z"
+}

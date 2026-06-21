@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T04:43:58.918000Z",
+  "depends_on": [],
+  "epic": "fn-870-harden-autopilot-dispatch-against-stale",
+  "id": "fn-870-harden-autopilot-dispatch-against-stale.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "pending-dispatches ephemeral + self-heal core",
+  "updated_at": "2026-06-21T04:43:58.918000Z"
+}
