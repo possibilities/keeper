@@ -48,5 +48,5 @@ Layer B — fail-loud backstop. When scaffold mints a `created_by_close_of` foll
 - [ ] Tests added/updated: saga-scaffold, src-scaffold-dryrun, audit-followup-submit, saga-close-finalize (slow-gated where they touch real git).
 
 ## Done summary
-
+Added the fail-loud cross-repo follow-up guard: a created_by_close_of mint over a multi-repo source rejects repo_required when a per-task target_repo is missing or out-of-set, at both the followup-submit dry-run and the scaffold mint seam, via one shared predicate and normalizer. Single-repo sources keep the silent default-to-primary behavior; SCAFFOLD_FAILED stays re-runnable.
 ## Evidence
