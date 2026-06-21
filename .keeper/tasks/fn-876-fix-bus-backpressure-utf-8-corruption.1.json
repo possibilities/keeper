@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "medium",
   "title": "Stash bus tail as bytes",
-  "updated_at": "2026-06-21T23:03:38.361000Z"
+  "updated_at": "2026-06-21T23:07:11.593000Z",
+  "worker_done_at": "2026-06-21T23:07:11.593000Z"
 }

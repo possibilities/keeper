@@ -20,5 +20,5 @@ decoded string.
 - [ ] Existing bus integration tests (directed/broadcast/anti-spoof/0600/shutdown) stay green; test:full passes.
 
 ## Done summary
-
+Carry the bus relay's partial-write tail as bytes (requeueTail) and re-flush from a byte offset instead of decoding/re-encoding via TextDecoder, so a short write splitting a multi-byte UTF-8 sequence delivers byte-identical. Added a unit regression test proving byte-identical reassembly across a sequence-splitting short write.
 ## Evidence
