@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-21T23:08:35.108000Z",
   "created_at": "2026-06-21T23:03:38.361000Z",
   "created_by_close_of": "fn-875-keeper-agent-bus",
   "depends_on_epics": [
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix bus backpressure UTF-8 corruption",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-21T23:03:38.361000Z"
+  "updated_at": "2026-06-21T23:08:35.108000Z"
 }
