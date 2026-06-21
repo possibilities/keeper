@@ -88,6 +88,17 @@ After the rewrite, re-fold (from the rewritten events) stays byte-identical. Thi
 is the "heavy lifting" the human anticipated. Precedent exists and is proven —
 see §4.
 
+This byte-identical determinism is scoped to the **deterministic-replayed**
+projection class. The git surface (`git_status`/`file_attributions`/the three
+`jobs` git-counters) is now a **live-only** projection (fn-868, v79): it is
+boot-seeded + kept current above a skip-floor, never replayed from history, and
+DELIBERATELY excluded from the byte-identical charter via the central
+`LIVE_ONLY_PROJECTIONS` registry. So the cursor-rewind-and-redrain this rewrite
+demands (§3c) no longer drags the catastrophic O(history)-per-event git replay
+(the ~6-day fn-856 incident) — a rewind RESETS the git floor + re-seeds rather
+than replaying the surface. The rewind cost is now bounded by the deterministic
+projections alone.
+
 ### 3b. Commit trailers live in immutable git history — the reader can't fully drop them
 
 The git-worker scrapes `Planctl-Op:` / `Planctl-Target:` from **live `git log`**

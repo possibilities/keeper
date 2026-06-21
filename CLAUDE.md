@@ -30,8 +30,9 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **Cursor + projection advance in ONE `BEGIN IMMEDIATE` transaction** — the fold
   writes the projection AND bumps `reducer_state.last_event_id` together. Splitting
   them breaks the exactly-once-per-event guarantee.
-- **Re-fold determinism is sacred.** A from-scratch re-fold must reproduce
-  byte-identical PROJECTION rows. Inside a fold: build derived arrays from stable
+- **Re-fold determinism is sacred** — for the **deterministic-replayed** projection
+  class (the sacred default: `jobs`/`epics`/`commit_trailer_facts`/…). A from-scratch
+  re-fold must reproduce byte-identical PROJECTION rows. Inside a fold: build derived arrays from stable
   total-order sorts (never append), and NEVER read wall-clock (`Date.now()`), env
   vars, the filesystem, or process liveness — use the event's `ts`. Only producers
   probe it. The guarantee scopes to the projection columns: the steady-state
@@ -50,6 +51,27 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **Never throw inside a fold.** Malformed `data` folds to a safe value and the
   cursor still advances; a throw rolls back the cursor and wedges the reducer. Schema
   defaults match the zero-event projection, so an empty re-fold reproduces the rows.
+- **Projection-class taxonomy + skip-floor** (Marten's "Live projection lifecycle";
+  central registry `LIVE_ONLY_PROJECTIONS` / `LIVE_ONLY_JOBS_COLUMNS` in `src/db.ts`).
+  Three classes: **deterministic-replayed** (the sacred default above — byte-identical
+  re-fold), **live-producer-fed** (the git surface: `git_status`, `file_attributions`,
+  and the three `jobs` git-counters — NOT replayed from history; boot-seeded then kept
+  current by incremental folds ABOVE a skip-floor; DELIBERATELY excluded from the
+  byte-identical charter), and **control** (`reducer_state`, plus
+  `git_projection_state`'s `floor` + `seed_required`). The skip-floor
+  (`git_projection_state.floor`, a monotonic `events.id`) makes every git fold no-op
+  for `id <= floor` — the gate lives INSIDE `applyEvent` by event type, never in the
+  drain SQL (the global cursor must still advance for the deterministic projections).
+  Above the floor a live fold stays pure (no git/clock/fs reads — those belong to the
+  producer only). **Boot-producer contract:** capture `floor = max(events.id)` BEFORE
+  the git scan, set `seed_required`, scan + populate the surface, then persist the
+  floor + clear `seed_required` atomically; a crash mid-seed leaves `seed_required` set
+  so the next boot re-seeds. The boot-seed runs AFTER drain, BEFORE serving.
+- **A fold whose per-event cost grows with history is a re-fold time-bomb.** Any
+  projection whose per-event fold cost scales with history length (the git fold's
+  `computeRepoBashWindows` self-joins the whole log per `GitSnapshot` — the ~6-day
+  fn-856 replay over 4.3M events) is a replay time-bomb: model it **live-only or
+  constant-bounded**, never O(history)-per-event.
 
 ## Hook rules
 
@@ -86,6 +108,14 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **When you bump `SCHEMA_VERSION`, add the version to `SUPPORTED_SCHEMA_VERSIONS`
   in `keeper/api.py` in the SAME commit** — a hard whitelist; an unlisted version
   fails every keeper-py read. `test/schema-version.test.ts` enforces this.
+- **Never wipe-and-replay the LIVE-ONLY projections.** A rewinding migration's
+  wipe list enumerates ONLY the deterministic-replayed projections (they re-fold
+  byte-identically from the rewound cursor). The live-only git surface is NOT in
+  that list: rewinding it RESETS its skip-floor to 0 + sets `seed_required`
+  (via `rewindLiveProjection` in `src/db.ts`, not a bare
+  `DELETE FROM git_status`) so the boot-seed producer re-derives it. Wiping the live
+  tables WITHOUT resetting the floor leaves the surface permanently empty (every
+  historical `GitSnapshot` self-gates below the stale floor).
 
 ## Writes are tightly scoped — DO NOT widen them
 

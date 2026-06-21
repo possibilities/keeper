@@ -10,6 +10,13 @@
  * blob), so no `events`/`event_blobs` COALESCE is needed here — the read is a
  * plain LIKE scan over the table.
  *
+ * SCOPE — `file_attributions` is a LIVE-ONLY projection (fn-868): boot-seeded +
+ * kept current ABOVE a skip-floor, NOT replayed from history. So this surface is
+ * the current attribution state (currently-dirty + recently-discharged paths),
+ * NOT a deep historical ledger — ancient attributions a full replay would have
+ * carried are not re-derived. For exhaustive per-file mutation history, query the
+ * event log (`events` mutation rows) rather than this projection.
+ *
  * Read-only open via `openDb(path, { readonly: true })`, closed in `finally`.
  * NO schema-version guard (in-binary readers deliberately skip it). A read
  * failure surfaces as an error envelope (`{ success: false, error }`), NOT an

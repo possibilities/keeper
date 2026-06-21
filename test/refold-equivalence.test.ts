@@ -34,6 +34,17 @@
  *       assert two from-scratch re-folds are byte-identical (re-fold determinism)
  *       AND that the post-shed attribution set reproduces every tool-sourced
  *       attribution the corpus implies.
+ *
+ * Scope of the byte-identical charter: the **deterministic-replayed** projection
+ * class only. `git_status` + `file_attributions` (and the three `jobs` git-counter
+ * columns) are the canonical **live-only** counter-example (fn-868, v79) — a
+ * live-producer-fed surface that is boot-seeded + kept current above a skip-floor,
+ * NOT replayed from history, and DELIBERATELY excluded from this charter via the
+ * central `LIVE_ONLY_PROJECTIONS` / `LIVE_ONLY_JOBS_COLUMNS` registry (`src/db.ts`).
+ * These differential tests deliberately LOWER the skip-floor to 0 before re-folding
+ * (`UPDATE git_projection_state SET floor = 0`) so the historical git folds replay
+ * and the shed's `mutation_path` preservation stays observable — the production
+ * carve-out (the surface is never replayed) is asserted separately, not here.
  */
 
 import { Database } from "bun:sqlite";

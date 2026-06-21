@@ -1727,7 +1727,28 @@ prior `git_status.jobs` blob). Per-job project-wide counters
 the bounded set only — informational-only columns (readiness reads
 `git_status` scalars + per-file `dirty_files[].attributions[]`, not
 the per-job columns), so the narrowed broadcast is a cosmetic shrink.
-`GitRootDropped` retracts symmetrically. As of
+`GitRootDropped` retracts symmetrically. As of schema v79 (fn-868) the entire
+git surface — `git_status`, `file_attributions`, and the three git-derived `jobs`
+counters (`git_dirty_count` / `git_unattributed_to_live_count` /
+`git_orphan_count`) — is a **LIVE-ONLY (live-producer-fed) projection**, NOT
+replayed from history. A monotonic `events.id` SKIP-FLOOR
+(`git_projection_state.floor`) no-ops every `GitSnapshot` / `Commit` / discharge
+git fold for `id <= floor`, and a **boot-seed producer** (`src/git-boot-seed.ts`)
+re-derives the surface for currently-dirty roots before the daemon serves; live
+events above the floor keep it current. The carve-out exists because the
+`projectGitStatus` / `computeRepoBashWindows` git fold self-joins the WHOLE event
+log per `GitSnapshot` — an O(history)-per-event fold whose replay cost grows
+without bound (the fn-856 incident: a 4.3M-event re-fold projected to ~6 days).
+The general rule it codifies: any projection whose per-event fold cost grows with
+history length is a replay time-bomb — model it live-only or constant-bounded,
+never O(history)-per-event. The re-fold byte-identical determinism described
+throughout this section is therefore scoped to the **deterministic-replayed**
+projections (the sacred default — `jobs`/`epics`/`commit_trailer_facts`/…); the
+git surface is DELIBERATELY excluded from that charter via the central
+`LIVE_ONLY_PROJECTIONS` / `LIVE_ONLY_JOBS_COLUMNS` registry (`src/db.ts`), and a
+rewinding migration RESETS its floor + sets `seed_required` (via
+`rewindLiveProjection`) rather than replaying it — the live surface is never
+wiped-and-replayed alongside the deterministic ones. As of
 schema v32 (fn-634, narrowed at v63/fn-756), `epics` adds
 `default_visible` as a VIRTUAL generated column SQLite computes from
 `CASE WHEN status='open' THEN 1 ELSE 0 END`,
