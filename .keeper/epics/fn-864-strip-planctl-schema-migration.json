@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-21T02:12:22.071000Z",
   "created_at": "2026-06-20T21:31:38.397000Z",
   "depends_on_epics": [
     "fn-862-test-commit-trailer-facts-survives-v77",
@@ -11,10 +12,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Strip planctl schema migration",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-21T01:14:28.835000Z"
+  "updated_at": "2026-06-21T02:12:22.071000Z"
 }
