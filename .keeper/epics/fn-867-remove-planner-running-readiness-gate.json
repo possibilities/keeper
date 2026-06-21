@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-21T04:24:51.070000Z",
   "created_at": "2026-06-20T22:10:16.523000Z",
   "depends_on_epics": [],
   "id": "fn-867-remove-planner-running-readiness-gate",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Remove planner-running readiness gate",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-20T22:10:16.523000Z"
+  "updated_at": "2026-06-21T04:24:51.070000Z"
 }
