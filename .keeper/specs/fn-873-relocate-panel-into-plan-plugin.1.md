@@ -62,5 +62,5 @@ Forward-facing prose only — NO "moved from arthack"/"formerly arthack:panel" b
 - [ ] Forward-facing prose only; committed via keeper commit-work (branch-guard.ts excluded).
 
 ## Done summary
-
+Relocated the panel skill + panel-judge agent into plugins/plan/, flipped every arthack:panel literal to plan:panel / plan:panel-judge across the moved files, the plan:hack callsite, and docs/planctl-strip.md, and refreshed the plan-plugin README/CLAUDE enumerations. arthack originals untouched (removed in .2).
 ## Evidence
