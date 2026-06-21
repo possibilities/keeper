@@ -1,6 +1,7 @@
 {
   "branch_name": "fn-relocate-panel-into-plan-plugin",
   "bundles": [],
+  "closer_done_at": "2026-06-21T15:33:15.580000Z",
   "created_at": "2026-06-21T15:26:59.050000Z",
   "depends_on_epics": [],
   "id": "fn-873-relocate-panel-into-plan-plugin",
@@ -8,11 +9,11 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "relocate panel into plan plugin",
   "touched_repos": [
     "/Users/mike/code/arthack",
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-21T15:26:59.050000Z"
+  "updated_at": "2026-06-21T15:33:15.580000Z"
 }
