@@ -41,5 +41,5 @@ Forward-facing only; no tombstones (`promptctl render future-facing-docs`).
 - [ ] Forward-facing wording only; no change-narration.
 
 ## Done summary
-
+Reframed the /hack panel callsite so routing is silent internal cognition: the judged answer is absorbed into /hack's answer-shape taxonomy with reveal-on-demand, the above-inline sketch presents the panel-informed direction as the agent's own, and the plan handoff forwards the conclusion downstream without a relayed-verdict framing.
 ## Evidence
