@@ -78,6 +78,7 @@ function makeHarness(): Harness {
       prompt: mkHandler("prompt"),
       dispatch: mkHandler("dispatch"),
       reclaim: mkHandler("reclaim"),
+      bus: mkHandler("bus"),
     },
     stdout: (s) => stdout.push(s),
     stderr: (s) => stderr.push(s),
@@ -206,6 +207,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("show-job")).toBe(true);
     expect(isSubcommand("plan")).toBe(true);
     expect(isSubcommand("prompt")).toBe(true);
+    expect(isSubcommand("bus")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
   });

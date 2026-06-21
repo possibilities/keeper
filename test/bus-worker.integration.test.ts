@@ -24,6 +24,7 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { main as busMain } from "../cli/bus";
 import type { BusWorkerData } from "../src/bus-worker";
 import { retryUntil } from "./helpers/retry-until";
 import { freshDbFile } from "./helpers/template-db";
@@ -334,6 +335,117 @@ test("anti-spoof: the server overwrites the sender-claimed `from`; socket is 060
   expect(from.channel_id).not.toBe("ch-FORGED");
 
   alice.socket.end();
+  bob.socket.end();
+});
+
+/**
+ * Drive `cli/bus.ts main(argv)` against the sandboxed bus socket with
+ * process.{exit,stdout,stderr} captured. `main()` calls `process.exit`, so the
+ * exit shim throws to unwind the never-return branches; KEEPER_BUS_SOCK points the
+ * CLI's client at this test's socket.
+ */
+class CliExit extends Error {
+  readonly code: number;
+  constructor(code: number) {
+    super(`exit ${code}`);
+    this.code = code;
+  }
+}
+async function runBusCli(
+  argv: string[],
+): Promise<{ code: number | undefined; stdout: string; stderr: string }> {
+  const out: string[] = [];
+  const err: string[] = [];
+  const realOut = process.stdout.write.bind(process.stdout);
+  const realErr = process.stderr.write.bind(process.stderr);
+  const realExit = process.exit.bind(process);
+  const realSock = process.env.KEEPER_BUS_SOCK;
+  process.env.KEEPER_BUS_SOCK = sockPath;
+  let code: number | undefined;
+  process.stdout.write = ((s: string | Uint8Array) => {
+    out.push(typeof s === "string" ? s : Buffer.from(s).toString());
+    return true;
+  }) as typeof process.stdout.write;
+  process.stderr.write = ((s: string | Uint8Array) => {
+    err.push(typeof s === "string" ? s : Buffer.from(s).toString());
+    return true;
+  }) as typeof process.stderr.write;
+  process.exit = ((c?: number) => {
+    code = c ?? 0;
+    throw new CliExit(code);
+  }) as typeof process.exit;
+  try {
+    await busMain(argv);
+  } catch (e) {
+    if (!(e instanceof CliExit)) throw e;
+  } finally {
+    process.stdout.write = realOut;
+    process.stderr.write = realErr;
+    process.exit = realExit;
+    if (realSock === undefined) delete process.env.KEEPER_BUS_SOCK;
+    else process.env.KEEPER_BUS_SOCK = realSock;
+  }
+  return { code, stdout: out.join(""), stderr: err.join("") };
+}
+
+test("CLI round-trip: `keeper bus chat send` reaches a live subscriber; `list` shows the bus", async () => {
+  await bootBus();
+  // A raw subscriber (bob) the CLI sender will reach by name.
+  const bob = await connectClient();
+  bob.send({
+    op: "register",
+    namespace: "chat",
+    name: "bob",
+    session_id: "sess-bob",
+    start_time: "t-bob",
+  });
+  await waitFrame(bob.frames, (f) => f.type === "ack" && f.op === "register");
+  bob.send({ op: "subscribe", namespaces: ["chat"] });
+  await waitFrame(bob.frames, (f) => f.type === "ack" && f.op === "subscribe");
+
+  // The CLI one-shot send: register → publish → exit 0.
+  const sent = await runBusCli(["chat", "send", "bob", "hello from the CLI"]);
+  expect(sent.code).toBe(0);
+
+  const delivered = await waitFrame(bob.frames, (f) => f.event === "message");
+  expect(delivered).not.toBeNull();
+  expect((delivered?.payload as { text?: string })?.text).toBe(
+    "hello from the CLI",
+  );
+
+  // `keeper bus list` round-trips and emits a JSON array including bob.
+  const listed = await runBusCli(["list"]);
+  expect(listed.code).toBe(0);
+  const channels = JSON.parse(listed.stdout) as Array<{ name?: string }>;
+  expect(channels.some((c) => c.name === "bob")).toBe(true);
+
+  bob.socket.end();
+});
+
+test("CLI `keeper bus resolve` resolves a FORMER name to the live identity", async () => {
+  await bootBus();
+  const bob = await connectClient();
+  // bob registers as sess-bob — the seeded keeper job carries former name "bob-old".
+  bob.send({
+    op: "register",
+    namespace: "chat",
+    name: "bob",
+    session_id: "sess-bob",
+    start_time: "t-bob",
+  });
+  await waitFrame(bob.frames, (f) => f.type === "ack" && f.op === "register");
+  bob.send({ op: "subscribe", namespaces: ["chat"] });
+  await waitFrame(bob.frames, (f) => f.type === "ack" && f.op === "subscribe");
+
+  const resolved = await runBusCli(["resolve", "bob-old"]);
+  expect(resolved.code).toBe(0);
+  const body = JSON.parse(resolved.stdout) as {
+    kind?: string;
+    channel_id?: string | null;
+  };
+  expect(body.kind).toBe("ok");
+  expect(body.channel_id).toBeTruthy();
+
   bob.socket.end();
 });
 

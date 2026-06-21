@@ -40,6 +40,7 @@ export const SUBCOMMANDS = [
   "prompt",
   "dispatch",
   "reclaim",
+  "bus",
 ] as const;
 export type Subcommand = (typeof SUBCOMMANDS)[number];
 
@@ -69,6 +70,7 @@ Subcommands:
   prompt              Snippet/bundle substrate engine: \`keeper prompt <verb>\` runs the prompt CLI in-process
   dispatch            Manually fire one claude worker into a tmux window (client-side escape hatch)
   reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
+  bus                 Agent Bus: \`keeper bus <list|resolve|chat send|chat broadcast|watch>\`
 
 Flags:
   --help, -h     Show this help
@@ -176,6 +178,7 @@ export async function main(): Promise<void> {
     prompt: async (argv) => (await import("./prompt")).main(argv),
     dispatch: async (argv) => (await import("./dispatch")).main(argv),
     reclaim: async (argv) => (await import("./reclaim")).main(argv),
+    bus: async (argv) => (await import("./bus")).main(argv),
   };
 
   await dispatch(Bun.argv.slice(2), {
