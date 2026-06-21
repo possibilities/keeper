@@ -178,7 +178,7 @@ When the route is `/plan:plan` — inferred, or because the human said "plan it"
 
 ### After an epic lands, the session goes quiet by default
 
-Scaffolding an epic — via `/plan:plan` or `/plan:defer` — normally ends the visible session. Keeper's autopilot dispatches and completes all plan work on its own; **the agent is left in the dark about execution by design.** Once the epic lands, the wrap-up is the plan skill's own one-line report and nothing more — no description of how the work runs, and **never an offer to run `/plan:work`** (or any "run it when ready" prompt). The agent plans; it does not start, drive, or close the work.
+Scaffolding an epic — via `/plan:plan` or `/plan:defer` — normally ends the visible session. Keeper's autopilot dispatches and completes all plan work on its own; **the agent is left in the dark about execution by design.** Once the epic lands, the wrap-up is the plan skill's own one-line report and nothing more — no description of how the work runs, and **never an unsolicited offer to drive execution** (no "run it when ready" prompt, no surfacing the `keeper:dispatch` / `keeper:autopilot` operator hatch). The agent plans; it does not start, drive, or close the work. The operator hatch is human-gated: it exists, but the planning skills never advertise it — a human reaches it only by invoking those skills explicitly.
 
 The one optional move is arming an await — and it stays silent unless the conversation earns it. `keeper:await` blocks on board state (epic or task complete, or unblocked) then runs a follow-up action.
 

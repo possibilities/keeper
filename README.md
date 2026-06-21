@@ -380,7 +380,8 @@ Keeper has no `install` verb. Wire it up manually:
 4. **Load the plugins via the arthack launcher's `plugin_scan_dirs`.** Both
    Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
    events-writer hook + the branch-guard hook that hard-denies subagent git
-   branch create/switch via the `PreToolUse` deny JSON, + `keeper:await` skill,
+   branch create/switch via the `PreToolUse` deny JSON, + the `keeper:await` /
+   `keeper:dispatch` / `keeper:autopilot` gateway skills,
    manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
    `plugins/keeper/hooks/hooks.json`) and `plugins/plan/` (the plan plugin
@@ -953,6 +954,10 @@ event-log/reducer/hook touch. Run any of them with
   keeper autopilot retry approve::fn-1-x # clear a resurrected/phantom approve pending (fn-870)
   ```
 
+  The `keeper:autopilot` gateway skill maps natural-language operator intent
+  onto these RPCs (including the capture→drive→restore take-over window) for
+  the human-invoked control path.
+
 - `dispatch.ts` — a manual escape hatch that fires ONE `claude` worker into a
   tmux window by hand, the client-side complement to the server-side
   reconciler above: where `autopilot` is the daemon's level-triggered
@@ -993,6 +998,10 @@ event-log/reducer/hook touch. Run any of them with
   in that skill; the NUL/96 KB prompt guard runs on the final prefixed prompt,
   `--dry-run` reflects it, and `--no-prefix` bypasses it for one invocation.
   Plan-form dispatches are never prefixed.
+
+  The `keeper:dispatch` gateway skill maps natural-language operator intent
+  onto this command (surfacing the plan-form race-guard refusal and asking
+  rather than auto-pausing) for the human-invoked launch path.
 
 - `git.ts` — single-collection subscribe client over the `git`
   collection (watched-worktree status — membership gate
