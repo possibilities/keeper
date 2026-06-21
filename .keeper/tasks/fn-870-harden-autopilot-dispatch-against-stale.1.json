@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "pending-dispatches ephemeral + self-heal core",
-  "updated_at": "2026-06-21T04:43:58.918000Z"
+  "updated_at": "2026-06-21T05:00:45.399000Z",
+  "worker_done_at": "2026-06-21T05:00:45.399000Z"
 }

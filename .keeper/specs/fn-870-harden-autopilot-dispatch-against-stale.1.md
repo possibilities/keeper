@@ -57,5 +57,5 @@ for an already-failed key.
 - [ ] CLAUDE.md + README taxonomy/architecture prose updated (forward-facing); `bun run test:full` green
 
 ## Done summary
-
+Reclassified pending_dispatches as an EPHEMERAL projection (boot-truncated after drain, before serving) so a rewinding migration's re-fold can't resurrect phantom dispatch rows. Made the TTL sweep expire aged pendings unconditionally on dispatch_failures membership, skipped the never-bound counter for already-failed keys, and widened DispatchCleared to delete the pending row. No SCHEMA_VERSION bump; test:full green.
 ## Evidence
