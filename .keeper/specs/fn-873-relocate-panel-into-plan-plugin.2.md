@@ -36,5 +36,5 @@ This task DEPENDS ON `.1` — remove from arthack only after the keeper copy has
 - [ ] The removal landed after `.1` (the keeper copy) — verified the panel exists under plugins/plan/ before removing the arthack originals.
 
 ## Done summary
-
+Removed the panel skill dir and panel-judge agent from arthack now that they live in keeper's plan plugin; committed and pushed to arthack origin/main. Sibling skills design-taste and mrtasty untouched.
 ## Evidence
