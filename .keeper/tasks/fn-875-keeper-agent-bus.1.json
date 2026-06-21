@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T21:51:20.711000Z",
+  "depends_on": [],
+  "epic": "fn-875-keeper-agent-bus",
+  "id": "fn-875-keeper-agent-bus.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "bus storage and identity resolution",
+  "updated_at": "2026-06-21T21:51:20.711000Z"
+}
