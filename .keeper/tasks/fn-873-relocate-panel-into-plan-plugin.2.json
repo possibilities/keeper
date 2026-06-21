@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T15:26:59.050000Z",
+  "depends_on": [
+    "fn-873-relocate-panel-into-plan-plugin.1"
+  ],
+  "epic": "fn-873-relocate-panel-into-plan-plugin",
+  "id": "fn-873-relocate-panel-into-plan-plugin.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "medium",
+  "title": "remove panel from arthack",
+  "updated_at": "2026-06-21T15:26:59.050000Z"
+}
