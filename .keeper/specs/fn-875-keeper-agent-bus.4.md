@@ -80,5 +80,5 @@ sanity check.
 - [ ] no out-of-band / "not the human's instructions" guard is shipped (the authority contract lives in fn-875-keeper-agent-bus.5)
 
 ## Done summary
-
+Auto-armed the Agent Bus inbox watcher (keeper bus watch) as an always-on session Monitor via the keeper plugin's experimental.monitors manifest, shipped the blind already-listening advice in a new bus SKILL.md + keeper bus --help, and documented the new worker/bus.db/bus.sock/KEEPER_BUS_* env vars across README, CLAUDE.md (ALL SIX isolation + worker contract + Repo facts), and the plist.
 ## Evidence
