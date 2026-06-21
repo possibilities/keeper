@@ -78,7 +78,12 @@ const KEEP_VERBS = [
 // Verbs whose runner has landed (no longer the not-implemented stub). Their
 // registration proof is that the dispatcher routes them to their runner instead
 // of the no-such-command (exit 2) path.
-const PORTED_VERBS = new Set(["render", "check-generated"]);
+const PORTED_VERBS = new Set([
+  "render",
+  "check-generated",
+  "render-plugin-templates",
+  "build-snippets",
+]);
 const STUB_VERBS = KEEP_VERBS.filter((v) => !PORTED_VERBS.has(v));
 
 describe("keeper prompt dispatcher contract", () => {

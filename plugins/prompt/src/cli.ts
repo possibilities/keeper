@@ -12,8 +12,11 @@
 // dispatch table, arg parsing, help text, and exit-code contract land once.
 
 import type { OutputFormat } from "../../plan/src/format.ts";
+import { runBuildSnippets } from "./build_snippets.ts";
 import { run as runCheckGenerated } from "./check_generated.ts";
+import { resolveProjectRoot } from "./project_root.ts";
 import { run as runRender } from "./render.ts";
+import { runRenderPluginTemplates } from "./render_plugin_templates.ts";
 
 const PROG = "keeper prompt";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
@@ -200,9 +203,17 @@ function dispatch(parsed: ParsedArgs): number {
       const file = parsed.rest.find((a) => !a.startsWith("-"));
       return runCheckGenerated(file, readOption(parsed.rest, "--on"));
     }
-    case "render-plugin-templates":
+    case "render-plugin-templates": {
+      const explicit = readOption(parsed.rest, "--project-root") ?? null;
+      const projectRoot = resolveProjectRoot(explicit);
+      return runRenderPluginTemplates({ projectRoot });
+    }
+    case "build-snippets": {
+      const check = parsed.rest.includes("--check");
+      const projectRoot = resolveProjectRoot(null);
+      return runBuildSnippets({ check, projectRoot });
+    }
     case "find-snippets":
-    case "build-snippets":
     case "save-snippet":
     case "save-bundle":
     case "validate-bundles":
