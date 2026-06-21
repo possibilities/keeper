@@ -128,18 +128,18 @@ export async function runPlanctl(
   }
 }
 
-/** Run `promptctl <args>` and return its last-line JSON envelope, or null on
- * any failure (binary missing, non-zero exit, timeout, malformed JSON). Mirrors
- * runPlanctl but targets the generated-file guard's `check-generated` envelope —
- * callers read `marked` / `message` off the returned object. Null is the
- * fail-open signal: the generated-file hooks must allow the action whenever a
- * write/read could not be classified. */
-export async function runPromptctl(
+/** Run `keeper prompt <args>` and return its last-line JSON envelope, or null
+ * on any failure (binary missing, non-zero exit, timeout, malformed JSON).
+ * Mirrors runPlanctl but targets the generated-file guard's `check-generated`
+ * envelope — callers read `marked` / `message` off the returned object. Null is
+ * the fail-open signal: the generated-file hooks must allow the action whenever
+ * a write/read could not be classified. */
+export async function runKeeperPrompt(
   args: string[],
   timeoutMs = 5000,
 ): Promise<Record<string, unknown> | null> {
   try {
-    const proc = Bun.spawn(["promptctl", ...args], {
+    const proc = Bun.spawn(["keeper", "prompt", ...args], {
       stdout: "pipe",
       stderr: "ignore",
       timeout: timeoutMs,

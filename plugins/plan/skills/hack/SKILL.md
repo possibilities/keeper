@@ -3,7 +3,7 @@ name: hack
 description: Investigate a request, answer in the right shape, then route or execute the next move — answer inline, do small work, or funnel larger work to /plan:plan or /plan:defer. Use when the human says "hack", "/hack", "/plan:hack", or wants something investigated, answered, and routed.
 argument-hint: "<request>"
 disable-model-invocation: true
-allowed-tools: Bash(pairctl:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(promptctl:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
+allowed-tools: Bash(pairctl:*), Bash(knowctl:*), Bash(scrapectl:*), Bash(searchctl:*), Bash(summaryctl:*), Bash(claudectl:*), Bash(agent-browser:*), Bash(keeper:*), Bash(tmuxctl:*), Bash(sqlite3:*), Bash(keeper plan list:*), Bash(keeper plan epics:*), Bash(keeper prompt:*), Bash(git log:*), Bash(git show:*), Bash(git diff:*), Bash(git status:*), Agent, Skill, Monitor
 ---
 
 # Hack
@@ -47,7 +47,7 @@ Mode-specific moves:
 
 ### Session history (keeper.db)
 
-<!-- Canonical source: promptctl render engineering/keeper-history-forensics -->
+<!-- Canonical source: keeper prompt render engineering/keeper-history-forensics -->
 
 Keeper's event log (`~/.local/state/keeper/keeper.db`) records every Claude Code session: each prompt, tool call, slash/skill invocation, planctl op, file mutation, and subagent run. Query it with `sqlite3 -readonly` only — the keeper daemon is the sole writer. Large `data` payloads may live in the `event_blobs` side table, so read payloads as `COALESCE(e.data, b.data)` via `LEFT JOIN event_blobs b ON b.event_id = e.id`.
 
@@ -146,7 +146,7 @@ Inference rubric:
 - Answer was terse and the human will likely want depth → **→ stay in inquiry** lead, with a specific next action.
 - The answer is work-shaped → size it against the rubric below to pick between inline, sketch-then-route, and `/plan:plan`.
 
-<!-- Canonical source: promptctl render engineering/escalate-inline-or-plan -->
+<!-- Canonical source: keeper prompt render engineering/escalate-inline-or-plan -->
 
 When a request reads as work to do, size it against this rubric before choosing how to act. The same clauses gate both the answer shape and where the work lands.
 
@@ -223,11 +223,11 @@ When the chosen endpoint is **execute inline**, the work lands and gets committe
 - ❌ "fn-622 retired the dedup mechanism, so renders changed" / "formerly emitted a subset"
 - ✅ "renders always emit the full snippet set"
 
-The one carve-out: commit messages and changelogs are the sanctioned home for history and *should* narrate the change in past tense. Full rule lives in `promptctl render code-comment-style` (comments) and `promptctl render future-facing-docs` (docs and prompts) — cite those, don't restate them.
+The one carve-out: commit messages and changelogs are the sanctioned home for history and *should* narrate the change in past tense. Full rule lives in `keeper prompt render code-comment-style` (comments) and `keeper prompt render future-facing-docs` (docs and prompts) — cite those, don't restate them.
 
 **Commit by default — don't punt it back to the human.** Once edits land successfully, run `keeper commit-work` yourself in the same turn. Don't stop and ask "want me to commit?", don't suggest the human run `keeper commit-work`, don't leave a dirty working tree as a handoff. The carve-outs at the bottom of the rule below (human-flagged throwaway / debug instrumentation) are the only reasons to skip — and if a change genuinely feels uncommittable (unrelated dirty files in the index, scope ambiguous, mid-investigation), name that specifically instead of using it as a generic excuse to defer.
 
-<!-- Canonical source: promptctl render engineering/commit-via-keeper-default -->
+<!-- Canonical source: keeper prompt render engineering/commit-via-keeper-default -->
 
 **Commit source changes with `keeper commit-work`, not raw `git commit`.** `commit-work` runs the project's full lint matrix (ruff + ruff format + ty + cli-boundaries when Python is staged; npm lint per JS/TS package; shellcheck / zig / lua / hadolint per relevant staged file) inside a per-host flock, lands the commit, and pushes to origin — all in one call. Don't invoke linters separately; `commit-work` is the single seam.
 
@@ -246,7 +246,7 @@ keeper commit-work "<type>(<scope>): <summary>
 
 **Any other non-zero exit** (`commit_failed`, `push_non_fast_forward`, `push_auth`, `push_hook_rejected`, `lock_timeout`, etc.) → stop and surface the verbatim envelope JSON to the human. Don't patch the tool you're calling; don't retry blindly.
 
-**Never** `--no-verify`, `--no-gpg-sign`, `--amend`, `git add -A`, or `git add .` — see `promptctl render engineering/commit-hygiene-flags`.
+**Never** `--no-verify`, `--no-gpg-sign`, `--amend`, `git add -A`, or `git add .` — see `keeper prompt render engineering/commit-hygiene-flags`.
 
 **Escape hatch — if `commit-work` won't stage the full file set, drop to git directly.** `commit-work` scopes to session-touched files; if it leaves out a file you need in the commit (or stages the wrong set), don't fight it — commit with plain `git` instead. Stage only the files you're committing, by explicit path (`git add <path> …` — never `git add -A` / `git add .`), then `git commit` and `git push`. This is a temporary escape hatch we'll repair; for now you're empowered to use git directly whenever `commit-work` can't cover what you need.
 

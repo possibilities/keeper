@@ -2,14 +2,14 @@
 // PostToolUse(Read) generated-file heads-up.
 //
 // Injects a non-blocking note when reading a file that carries the
-// `_promptctl_path` frontmatter marker: shells `promptctl check-generated
+// `_promptctl_path` frontmatter marker: shells `keeper prompt check-generated
 // <file> --on read` and, when the envelope reports `marked: true`, emits the
 // softer warn-variant message via `additionalContext` so the agent knows the
 // file is generated before trying to edit it. Fail open on every path (exit 0,
-// silent) — surfacing tool noise just because promptctl was off PATH is wrong
-// for the read path.
+// silent) — surfacing tool noise just because keeper prompt was off PATH is
+// wrong for the read path.
 
-import { emitAdditionalContext, readStdin, runPromptctl } from "./lib.ts";
+import { emitAdditionalContext, readStdin, runKeeperPrompt } from "./lib.ts";
 
 async function main(): Promise<void> {
   const raw = await readStdin();
@@ -23,7 +23,7 @@ async function main(): Promise<void> {
   const filePath = payload.tool_input?.file_path ?? "";
   if (!filePath) return;
 
-  const envelope = await runPromptctl([
+  const envelope = await runKeeperPrompt([
     "check-generated",
     filePath,
     "--on",

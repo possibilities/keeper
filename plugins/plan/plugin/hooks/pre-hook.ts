@@ -2,13 +2,14 @@
 // PreToolUse(Write|Edit) generated-file guard.
 //
 // Blocks an edit to a file carrying the `_promptctl_path` frontmatter marker:
-// shells `promptctl check-generated <file> --on write` and, when the envelope
-// reports `marked: true`, emits a `permissionDecision: deny` naming the source
-// template + regenerate command. Fail open on every path (exit 0, no deny) — a
-// hot-path hook that blocked every Write because promptctl is broken would
-// brick the agent surface; only a definitive `marked` verdict denies.
+// shells `keeper prompt check-generated <file> --on write` and, when the
+// envelope reports `marked: true`, emits a `permissionDecision: deny` naming the
+// source template + regenerate command. Fail open on every path (exit 0, no
+// deny) — a hot-path hook that blocked every Write because keeper prompt is
+// broken would brick the agent surface; only a definitive `marked` verdict
+// denies.
 
-import { emitDeny, readStdin, runPromptctl } from "./lib.ts";
+import { emitDeny, readStdin, runKeeperPrompt } from "./lib.ts";
 
 async function main(): Promise<void> {
   const raw = await readStdin();
@@ -19,7 +20,7 @@ async function main(): Promise<void> {
   const filePath = payload.tool_input?.file_path ?? "";
   if (!filePath) return;
 
-  const envelope = await runPromptctl([
+  const envelope = await runKeeperPrompt([
     "check-generated",
     filePath,
     "--on",

@@ -4,8 +4,8 @@
 // baseline is already covered by commit-guard / stop-guard / subagent-stop-guard
 // bun tests, so this file pins (1) the hooks.json co-location + matcher/exec-form
 // wiring, (2) the pre-hook deny / pass-through plumbing against a stubbed
-// promptctl, (3) the post-hook additionalContext plumbing, and (4) the work
-// marker write→read round-trip through the production writer + reader.
+// `keeper prompt`, (3) the post-hook additionalContext plumbing, and (4) the
+// work marker write→read round-trip through the production writer + reader.
 
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import {
@@ -113,7 +113,7 @@ describe("hooks.json wiring", () => {
 });
 
 // ---------------------------------------------------------------------------
-// pre-hook / post-hook behavior against a stubbed promptctl
+// pre-hook / post-hook behavior against a stubbed `keeper prompt`
 // ---------------------------------------------------------------------------
 
 let root: string;
@@ -128,11 +128,12 @@ afterEach(() => {
   process.env.PATH = savedPath;
 });
 
-/** Drop a bun-script `promptctl` on a fresh bin dir that echoes `envelope`. */
-function stubPromptctl(envelope: Record<string, unknown>): string {
+/** Drop a bun-script `keeper` on a fresh bin dir that echoes `envelope`. The
+ * hook shells `keeper prompt check-generated …`; the shim ignores its args. */
+function stubKeeper(envelope: Record<string, unknown>): string {
   const binDir = join(root, "stub-bin");
   mkdirSync(binDir, { recursive: true });
-  const shim = join(binDir, "promptctl");
+  const shim = join(binDir, "keeper");
   writeFileSync(
     shim,
     "#!/usr/bin/env bun\n" +
@@ -142,11 +143,11 @@ function stubPromptctl(envelope: Record<string, unknown>): string {
   return binDir;
 }
 
-/** Drop a bun-script `promptctl` that exits non-zero (broken-tool path). */
-function stubBrokenPromptctl(): string {
+/** Drop a bun-script `keeper` that exits non-zero (broken-tool path). */
+function stubBrokenKeeper(): string {
   const binDir = join(root, "stub-bin");
   mkdirSync(binDir, { recursive: true });
-  const shim = join(binDir, "promptctl");
+  const shim = join(binDir, "keeper");
   writeFileSync(shim, "#!/usr/bin/env bun\nprocess.exit(99);\n");
   chmodSync(shim, 0o755);
   return binDir;
@@ -177,7 +178,7 @@ describe("pre-hook (PreToolUse Write/Edit → deny)", () => {
       message:
         "BLOCKED: this is a generated file. Edit /path/to/template/agents/worker.md.tmpl instead.",
     };
-    const binDir = stubPromptctl(envelope);
+    const binDir = stubKeeper(envelope);
     const target = join(root, "agents", "worker-high.md");
     mkdirSync(join(root, "agents"), { recursive: true });
     writeFileSync(target, "stub doesn't read it\n");
@@ -200,7 +201,7 @@ describe("pre-hook (PreToolUse Write/Edit → deny)", () => {
   });
 
   test("a marked: false envelope passes silently", () => {
-    const binDir = stubPromptctl({ marked: false });
+    const binDir = stubKeeper({ marked: false });
     const target = join(root, "plain.md");
     writeFileSync(target, "plain body\n");
     const r = runHook(
@@ -212,15 +213,15 @@ describe("pre-hook (PreToolUse Write/Edit → deny)", () => {
     expect(r.stdout).toBe("");
   });
 
-  test("a missing file_path passes silently (no promptctl call)", () => {
-    const binDir = stubPromptctl({ marked: true, message: "irrelevant" });
+  test("a missing file_path passes silently (no keeper prompt call)", () => {
+    const binDir = stubKeeper({ marked: true, message: "irrelevant" });
     const r = runHook(PRE_HOOK, { tool_name: "Write", tool_input: {} }, binDir);
     expect(r.code).toBe(0);
     expect(r.stdout).toBe("");
   });
 
-  test("a broken promptctl (non-zero exit) fails open — passes silently", () => {
-    const binDir = stubBrokenPromptctl();
+  test("a broken keeper prompt (non-zero exit) fails open — passes silently", () => {
+    const binDir = stubBrokenKeeper();
     const target = join(root, "marked.md");
     writeFileSync(target, "---\n_promptctl_path: foo.tmpl\n---\nbody\n");
     const r = runHook(
@@ -242,7 +243,7 @@ describe("post-hook (PostToolUse Read → additionalContext)", () => {
       message:
         "Heads-up: this is a generated file. Source: /repo/template/agents/worker.md.tmpl.",
     };
-    const binDir = stubPromptctl(envelope);
+    const binDir = stubKeeper(envelope);
     const target = join(root, "agents", "worker.md");
     mkdirSync(join(root, "agents"), { recursive: true });
     writeFileSync(target, "body\n");
@@ -263,7 +264,7 @@ describe("post-hook (PostToolUse Read → additionalContext)", () => {
   });
 
   test("a non-Read tool is a no-op", () => {
-    const binDir = stubPromptctl({ marked: true, message: "x" });
+    const binDir = stubKeeper({ marked: true, message: "x" });
     const r = runHook(
       POST_HOOK,
       { tool_name: "Bash", tool_input: { command: "ls" } },
@@ -274,7 +275,7 @@ describe("post-hook (PostToolUse Read → additionalContext)", () => {
   });
 
   test("a marked: false envelope injects nothing", () => {
-    const binDir = stubPromptctl({ marked: false });
+    const binDir = stubKeeper({ marked: false });
     const target = join(root, "plain.md");
     writeFileSync(target, "plain\n");
     const r = runHook(

@@ -24,7 +24,7 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   binary STAY at the repo root; only the plugin surfaces live under `plugins/`.
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
-  `promptctl render code-comment-style`.
+  `keeper prompt render code-comment-style`.
 
 ## Event-sourcing invariants
 
