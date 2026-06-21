@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-21T19:34:06.799000Z",
+  "depends_on": [
+    "fn-874-keeper-operator-skills-model-invocable.1"
+  ],
+  "epic": "fn-874-keeper-operator-skills-model-invocable",
+  "id": "fn-874-keeper-operator-skills-model-invocable.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "relax carve-out + orchestration section",
+  "updated_at": "2026-06-21T19:34:06.799000Z"
+}
