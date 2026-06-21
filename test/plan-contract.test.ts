@@ -29,6 +29,7 @@ import { openDb } from "../src/db";
 /** The keeper CLI entrypoint — `keeper plan <verb>` runs the plan dispatcher
  * in-process (no compiled-binary spawn; that binary was retired in fn-829). */
 const KEEPER_CLI = join(import.meta.dir, "..", "cli", "keeper.ts");
+
 import { withInProcessDaemon } from "./helpers/in-process-daemon";
 import { retryUntil } from "./helpers/retry-until";
 
