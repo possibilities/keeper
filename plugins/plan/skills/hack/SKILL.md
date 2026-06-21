@@ -78,14 +78,14 @@ sqlite3 -readonly ~/.local/state/keeper/keeper.db \
 ```bash
 sqlite3 -readonly ~/.local/state/keeper/keeper.db \
   "SELECT datetime(ts,'unixepoch','localtime') AS at, hook_event, tool_name,
-          COALESCE(slash_command, skill_name, planctl_op, '') AS verb
+          COALESCE(slash_command, skill_name, plan_op, '') AS verb
    FROM events WHERE session_id='<id>' AND hook_event IN ('UserPromptSubmit','PreToolUse')
    ORDER BY ts LIMIT 300"
 ```
 
 **Failed-worker forensics** — `subagent_invocations` (keyed by `job_id`) gives each spawned agent's type, status, and duration; join `events` on `agent_id` for its tool stream. `jobs` carries session titles and `transcript_path` for `claudectl show-session` replay.
 
-`events` columns worth filtering on: `slash_command`, `skill_name`, `planctl_op` / `planctl_epic_id` / `planctl_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd`. The schema shifts across keeper versions — when a query errors, check `.schema events` rather than guessing.
+`events` columns worth filtering on: `slash_command`, `skill_name`, `plan_op` / `plan_epic_id` / `plan_task_id`, `tool_name`, `agent_id`, `session_id`, `cwd`. The schema shifts across keeper versions — when a query errors, check `.schema events` rather than guessing.
 
 ## Prefer the panel for any non-tiny inquiry
 
