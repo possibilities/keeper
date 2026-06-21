@@ -59,5 +59,5 @@ enumeration lists all three skills and the symlink is intact (`ls -l AGENTS.md`)
 - [ ] no plugin manifest or hooks.json edits
 
 ## Done summary
-
+Carve-out + enumeration doc edits: tightened planning-skill 'never offer /plan:work' lines to prohibit unsolicited drive offers without advertising the human-gated operator hatch; enumerated all three keeper skills (await/dispatch/autopilot) in README + CLAUDE.md; cross-referenced the gateway skills from the dispatch/autopilot CLI subsections. Hack's closed list left untouched; AGENTS.md symlink intact.
 ## Evidence
