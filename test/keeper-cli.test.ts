@@ -75,6 +75,7 @@ function makeHarness(): Harness {
       "show-session-events": mkHandler("show-session-events"),
       "show-job": mkHandler("show-job"),
       plan: mkHandler("plan"),
+      prompt: mkHandler("prompt"),
       dispatch: mkHandler("dispatch"),
       reclaim: mkHandler("reclaim"),
     },
@@ -204,6 +205,7 @@ describe("cli/keeper dispatch", () => {
     expect(isSubcommand("show-session-events")).toBe(true);
     expect(isSubcommand("show-job")).toBe(true);
     expect(isSubcommand("plan")).toBe(true);
+    expect(isSubcommand("prompt")).toBe(true);
     expect(isSubcommand("bogus")).toBe(false);
     expect(isSubcommand("")).toBe(false);
   });

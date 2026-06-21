@@ -15,5 +15,9 @@
   },
   "engines": {
     "bun": "1.3.14"
+  },
+  "dependencies": {
+    "liquidjs": "^10.27.0",
+    "zod": "^4.4.3"
   }
 }

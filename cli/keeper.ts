@@ -37,6 +37,7 @@ export const SUBCOMMANDS = [
   "show-session-events",
   "show-job",
   "plan",
+  "prompt",
   "dispatch",
   "reclaim",
 ] as const;
@@ -65,6 +66,7 @@ Subcommands:
   show-session-events Prompt/tool-call spine for one session (JSON)
   show-job            One job's full metadata by session-id/title/cwd/pane or auto-detect (JSON)
   plan                Alias for the planctl CLI: \`keeper plan <verb>\` runs planctl in-process
+  prompt              Snippet/bundle substrate engine: \`keeper prompt <verb>\` runs the prompt CLI in-process
   dispatch            Manually fire one claude worker into a tmux window (client-side escape hatch)
   reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
 
@@ -171,6 +173,7 @@ export async function main(): Promise<void> {
       (await import("./show-session-events")).main(argv),
     "show-job": async (argv) => (await import("./show-job")).main(argv),
     plan: async (argv) => (await import("./plan")).main(argv),
+    prompt: async (argv) => (await import("./prompt")).main(argv),
     dispatch: async (argv) => (await import("./dispatch")).main(argv),
     reclaim: async (argv) => (await import("./reclaim")).main(argv),
   };
