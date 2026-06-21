@@ -30,5 +30,5 @@ Forward-facing docs sweep after `.1`'s rename lands. The live sqlite forensics r
 - [ ] `keeper-history-forensics` promptctl snippet drift flagged (snippet updated or recorded as a follow-up)
 
 ## Done summary
-
+Renamed planctl_* schema surface to plan_* across forensics docs (README architecture prose + sqlite recipes + RETENTION/commit_trailer_facts/git-projection prose + syncPlanLinks/extractPlanInvocation symbols; SKILL.md session-history recipes). All renamed recipes verified runnable against a migrated plan_* DB. Decision-B runtime values (file_attributions 'planctl' source badge, Planctl-Op/Target trailer keys, .planctl/ dir) left intact. FOLLOW-UP/RISK: the keeper-history-forensics promptctl snippet is the canonical source baking SKILL.md (and likely plugins/plan/CLAUDE.md) recipes and may live outside this repo — it must be updated to plan_* or a re-bake reverts SKILL.md. plugins/plan/CLAUDE.md had no planctl_* schema-column refs (only CLI/.planctl-dir mentions, out of scope); root CLAUDE.md had no planctl refs at all.
 ## Evidence
