@@ -186,7 +186,14 @@ The one optional move is arming an await — and it stays silent unless the conv
 - **Ambiguous** — a follow-up was genuinely discussed (a phase-2 plan gated on this epic, a verification pass you raised) but the human never asked to wait → collaborate: ask one short plain-text question whether to arm it. Don't self-arm a follow-up the human didn't request.
 - **Neither** → silent. No "nothing worth awaiting" narration, no generic "want me to wait?", no raising the await topic at all — an idle await is noise, and so is talking about not arming one. This is the common case; deferred epics bias hard this way.
 
-Daisy-chain: plan the first epic, await its completion while autopilot runs the work, then plan the next phase from what landed — one session driving several plan rounds without the human re-priming context. Each round re-runs the same check before arming the next; when in doubt, stay silent and hand back.
+**Multiple epics are yours to sequence.** When the conversation calls for more than one epic — the human asks for two plans, or a piece of work splits across epics — you decide the topology; one-at-a-time is not the default:
+
+- **Independent** → scaffold both now; autopilot runs them in parallel.
+- **Execution-ordered, plannable now** (B must run after A, but you can author B well today) → scaffold both now and wire the cross-epic dep (`epic add-dep`); autopilot sequences execution while you stay out of it — no await.
+- **Planning-dependent** (you genuinely can't author B until A's landed reality exists — new APIs, file shapes, schema) → daisy-chain: plan A, arm `keeper:await complete fn-A`, and on `met` plan B against what landed. One session drives several plan rounds without the human re-priming context.
+- **Any combination** of the above across three-plus epics.
+
+Pick the shape confidently and inform; only ask the human when genuinely torn between two topologies and the choice changes the outcome. Each daisy-chain round re-runs the close/await check before arming the next; when nothing's left to arm, stay silent and hand back.
 
 ### Always check the session is done — speak only to close it
 
