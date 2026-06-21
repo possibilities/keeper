@@ -1,0 +1,8 @@
+[
+  {
+    "name": "keeper-bus",
+    "command": "keeper bus watch",
+    "description": "keeper agent bus",
+    "when": "always"
+  }
+]

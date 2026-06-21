@@ -49,6 +49,16 @@
 		  <key>KEEPER_SOCK</key>
 		  <string>/Users/mike/.local/state/keeper/keeperd.sock</string>
 		-->
+		<!--
+		  The Agent Bus relay worker (epic fn-875) owns its OWN writable bus.db
+		  and a DEDICATED relay socket bus.sock, both defaulting to the state dir
+		  below (siblings of keeper.db / keeperd.sock, but a separate file +
+		  protocol). Uncomment to override either:
+		  <key>KEEPER_BUS_DB</key>
+		  <string>/Users/mike/.local/state/keeper/bus.db</string>
+		  <key>KEEPER_BUS_SOCK</key>
+		  <string>/Users/mike/.local/state/keeper/bus.sock</string>
+		-->
 	</dict>
 	<key>RunAtLoad</key>
 	<true/>

@@ -22,6 +22,12 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   duplicate either, never add a `~/.claude/plugins/keeper` symlink (it
   double-registers the hook). The daemon, `cli/`, `src/`, and the compiled `keeper`
   binary STAY at the repo root; only the plugin surfaces live under `plugins/`.
+- **The keeper plugin auto-arms the Agent Bus inbox watcher** via
+  `experimental.monitors` in its manifest → `plugins/keeper/monitors.json`
+  (`keeper bus watch`, `when:"always"`). It is a session Monitor, STRICTLY
+  separate from `hooks.json` — never fold it into the hooks file. That Monitor is
+  invisible to the hook stream, so it does NOT populate `jobs.monitors` (correct —
+  bus presence is the `bus.db` registry, not the hook-fed projection).
 - **Forward-facing advice only** in comments and docs: state current behavior and
   invariants, not change history (which lives in the diff). Full rule:
   `keeper prompt render code-comment-style`.
@@ -167,14 +173,24 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **Supervisor-owned lifecycle** — main spawns after migrate+boot-drain and is the
   only one that terminates (`shutdown` → await close → terminate). A worker owning an
   external resource MUST release it in its own shutdown handler.
+- **A worker may own resources beyond a read-only keeper.db connection** — the
+  Agent Bus relay (`src/bus-worker.ts`) holds two new classes: a SECOND owned
+  SQLite file (`bus.db`, writable, its OWN `PRAGMA user_version` ladder — NEVER
+  keeper's `openDb`/`migrate`) and an OUTWARD-facing UDS socket (`bus.sock`, mode
+  0600, lock-before-bind). Both are external resources under the rule above: the
+  worker's own shutdown handler releases them (close the bus.db connection, close
+  the listener, drop the lock). The keeper.db connection it ALSO opens stays
+  read-only — a worker writing keeper.db is still forbidden.
 
 ## Test isolation
 
-Every test that spawns the real hook MUST sandbox ALL FIVE state paths under the
-per-test tmpdir: `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`, `KEEPER_DROP_LOG`,
-`KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`. Never `{ ...process.env, KEEPER_DB }`
-— it strands the others at production defaults and pollutes the real feed. Build the
-env via the shared `sandboxEnv(...)` in `test/helpers/sandbox-env.ts`.
+Every test that spawns the real hook (or daemon/CLI) MUST sandbox ALL SIX state
+classes under the per-test tmpdir: `KEEPER_DB`, `KEEPER_DEAD_LETTER_DIR`,
+`KEEPER_DROP_LOG`, `KEEPER_RESTORE_FILE`, `KEEPER_BACKSTOP_LOG`, and the Agent Bus
+pair `KEEPER_BUS_DB` / `KEEPER_BUS_SOCK` (its own DB + relay socket). Never
+`{ ...process.env, KEEPER_DB }` — it strands the others at production defaults and
+pollutes the real feed. Build the env via the shared `sandboxEnv(...)` in
+`test/helpers/sandbox-env.ts`.
 
 **Two test helpers, two jobs.** `sandboxEnv` is for process-spawn isolation (any
 test launching the real hook/daemon/CLI subprocess). The template-DB helper in

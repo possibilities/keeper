@@ -542,7 +542,15 @@ Keeper has no `install` verb. Wire it up manually:
    `{schema_version, current}` live mirror — a DISASTER FALLBACK only, since the
    live crash-restore set is now derived at read time from `keeper.db`'s
    producer-stamped `close_kind` / `window_index` columns (fn-817), not from
-   this file. Overridable via `KEEPER_RESTORE_FILE` for tests. Set
+   this file. Overridable via `KEEPER_RESTORE_FILE` for tests. The Agent Bus
+   relay worker (epic fn-875) owns two more state paths, both under the same
+   state dir and both override-able: `KEEPER_BUS_DB` (its own writable SQLite
+   file, default `~/.local/state/keeper/bus.db` — separate from `keeper.db`,
+   running its own `PRAGMA user_version` ladder) and `KEEPER_BUS_SOCK` (its
+   dedicated relay UDS socket, default `~/.local/state/keeper/bus.sock` — a
+   different path and protocol from the subscribe server's `keeperd.sock`). It
+   also spills long inbound message bodies under `~/.local/state/keeper/bus/`;
+   the state dir created in step 2 covers all of them (no extra `mkdir`). Set
    `KEEPER_TRACE_SERVER=1` to enable verbose server-worker diagnostic logging
    — `[srv-ts]` stage timings, frame byte counts, connection lifecycle — on
    `server.stderr`; off by default (the rare `[server-worker]` error class is
@@ -2745,7 +2753,37 @@ never assumed to have sufficed. The cooldown is in-memory only, so a restart
 re-derives and re-kills once (an idempotent no-op against a closed window). One
 stderr audit line per attempt is the only trace it leaves.
 
-The twelve workers are fully independent; main supervises all twelve
+A **thirteenth** Worker thread is the Agent Bus relay (epic fn-875): a local
+inter-agent message bus that is PHYSICALLY OUT of keeper.db's blast radius. It
+opens keeper.db READ-ONLY (for `jobs` identity reads — session_id, title,
+`name_history`, start_time — never a write) and owns its OWN writable `bus.db`
+plus a DEDICATED Unix-domain socket at `~/.local/state/keeper/bus.sock`
+(`KEEPER_BUS_SOCK`). That bus socket is SEPARATE from the subscribe server's
+`keeperd.sock` above — a different path, a different wire protocol
+(op-discriminated NDJSON pub/sub, not the collection query/subscribe surface),
+and a different purpose (agent-to-agent relay, not projection streaming). Agents
+register by pid, then send/broadcast to each other by current name, session id,
+or ANY former name — append-only `name_history` makes a since-dead name resolve
+deterministically to the same agent, symmetric for reach and reply. The server
+resolves the connecting peer's pid via `LOCAL_PEERPID` and OVERWRITES any
+client-claimed `from` with that peer-resolved identity (anti-spoof); the socket
+is mode 0600. The wire envelope carries a `namespace` axis (`chat` is the first
+tenant; the core routes tenant-agnostically). Per-client send queues are bounded
+so a slow/dead subscriber is evicted rather than blocking the relay, and a
+malformed/oversized frame is dropped without affecting other subscribers. It
+adds NO keeper event type, projection, RPC surface, or schema-version bump — so
+keeper's re-fold determinism and tightly-scoped-write invariants hold by
+construction; `bus.db` runs its OWN `PRAGMA user_version` ladder (NEVER keeper's
+`migrate()`). Like the restore/renamer/reaper workers it carries no `onmessage`
+handler — it posts NOTHING to main and writes ONLY its own `bus.db`; only an
+unhandled throw escalates via `onerror`/`close` → fatalExit (the documented
+fallback is a sibling `--bus-only` LaunchAgent). The bus inbox watcher is armed
+per interactive session as a Claude Code Monitor (`keeper bus watch`, via the
+keeper plugin's `experimental.monitors` manifest); that Monitor is INVISIBLE to
+the hook stream, so it does NOT populate `jobs.monitors` — which is correct, bus
+presence is the `bus.db` registry, not the hook-fed projection.
+
+The thirteen workers are fully independent; main supervises all thirteen
 lifecycles but routes none of their traffic, and any worker's `error`
 event escalates the whole process to a clean restart — with that single
 scoped exception, the recoverable drop signal on the transcript, plan,

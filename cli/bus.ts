@@ -68,6 +68,14 @@ Usage:
   keeper bus chat broadcast <msg|->       Message everyone on the chat namespace
   keeper bus watch                        Long-lived inbox subscriber (Monitor command)
 
+Your inbox is already open:
+  The keeper plugin arms 'keeper bus watch' as a session Monitor before your
+  first prompt. NEVER start a watcher/listener, NEVER run 'keeper bus watch'
+  yourself, NEVER check whether you're connected — just WAIT for events.
+  'Wait' means yield, not spin: keep doing other work or hand back, don't poll.
+  When a human says you'll get a message from someone, you are already
+  listening — just watch for the notification line.
+
 Notes:
   - <target> resolves a CURRENT name, session id, channel id, or ANY former name.
   - <msg> of '-' reads the message body from stdin.
