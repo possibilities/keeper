@@ -156,6 +156,29 @@ describe("close-preflight success envelope + brief", () => {
     expect(tasks[1]?.done_summary).toBe(`summary for ${taskIds[1]}`);
   });
 
+  test("brief carries per-task target_repo + epic touched_repos (the close-planner repo map)", () => {
+    // The close-planner routes each follow-up task by these fields. Scaffold
+    // resolves an omitted per-task target_repo to the epic primary, so a
+    // single-repo source carries the realpath-normalized primary on every task
+    // and touched_repos = [primary].
+    const proj = getProj();
+    const { epicId, taskIds } = makeEpic(proj, ["done", "done"]);
+    const r = runCli(["close-preflight", epicId, "--project", proj.root], {
+      cwd: proj.root,
+      home: proj.home,
+    });
+    expect(r.code).toBe(0);
+    const brief = loadBrief(proj.root, epicId);
+    const primary = realpathSync(proj.root);
+    expect(brief.touched_repos).toEqual([primary]);
+    const tasks = brief.tasks as Array<Record<string, unknown>>;
+    expect(tasks.map((t) => t.id)).toEqual(taskIds);
+    for (const t of tasks) {
+      expect("target_repo" in t).toBe(true);
+      expect(t.target_repo).toBe(primary);
+    }
+  });
+
   test.skipIf(!SLOW_ENABLED)(
     "brief write is commit-free: HEAD unmoved, nothing tracked",
     () => {

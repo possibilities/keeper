@@ -27,7 +27,8 @@ The auditor's report is NOT in your prompt. You read it by path (the brief and t
 
 Read `BRIEF_REF` with the Read tool, parse the JSON, and read these fields:
 
-- `tasks` — `[{id, title, status, done_summary}, ...]`, ordinal-ordered. The done summaries are your first evidence rung: what each task claims it shipped.
+- `tasks` — `[{id, title, status, target_repo, done_summary}, ...]`, ordinal-ordered. The done summaries are your first evidence rung: what each task claims it shipped. Each task's `target_repo` is the git tree its code lives in (`null` when the task inherits the epic default).
+- `touched_repos` — on the brief root: the repos this epic's code spans (`null`/absent for a single-repo source). When this lists more than one repo, the source is MULTI-repo and each follow-up task MUST carry an explicit, in-set `target_repo` (Phase 5).
 - `commit_set_hash` — provenance pin; you don't act on it.
 
 **Brief self-check:** `schema_version` must be `1` and `epic_id` must equal your `EPIC_ID`. On mismatch, stop and say so verbatim.
@@ -162,6 +163,7 @@ epic:
 tasks:
   - title: <3–6 word task title>
     tier: <medium|high|xhigh|max>   # REQUIRED — scaffold errors tier_invalid if absent
+    target_repo: <absolute path — REQUIRED over a multi-repo source; see resolution rule below>
     # deps: [1]   # optional, 1-based ordinals into this task list
     spec: |
       ## Description
@@ -189,6 +191,8 @@ tasks:
 
 **Task-spec rules:** each task `spec` is the full four-section block (`## Description` / `## Acceptance` / `## Done summary` / `## Evidence`) — all four headings present exactly once. `tier` is required per task. Merged findings fold into the task of their merge target — do NOT create a separate task for a `merged-into-*` row. Intra-task deps are 1-based ordinals via the optional `deps:` list (omit for the flat case). The task count MUST equal `expected_clusters` from Phase 4.
 
+**`target_repo` resolution rule:** set each follow-up task's `target_repo` to the repo where its surviving finding's code lives — resolve the cited `file:line` against the brief's `touched_repos`; default to the `target_repo` of the source task the finding traces back to. Emit a concrete absolute path — sentinel values (`auto` / `inherit`) are forbidden. Keep ONE follow-up epic and annotate per-task so clusters stay repo-coherent (a single epic spanning repos is fine when each task pins its own repo); fall back to the one-shot `QUESTION:` protocol (Phase 6) ONLY when a finding genuinely cannot be pinned to one repo. Over a single-repo source (`touched_repos` absent or one entry) `target_repo` may be omitted — the engine defaults it to the epic's primary repo. Over a MULTI-repo source a missing OR out-of-set per-task `target_repo` is hard-rejected by the engine (`repo_required`); the fix is to add an explicit, in-set per-task `target_repo`.
+
 Pipe via a quoted heredoc:
 
 ```bash
@@ -197,7 +201,7 @@ keeper plan followup submit <EPIC_ID> --file - <<'YAML_EOF'
 YAML_EOF
 ```
 
-On a `{success: false, ...}` reject — the scaffold dry-run codes (`bad_yaml` / `spec_invalid` / `ref_invalid` / `dep_invalid` / `epic_dep_invalid` / `repo_invalid` / `tier_invalid` / `dep_cycle`) or `TASK_COUNT_MISMATCH` (plan task count != verdict's expected cluster count) — fix the named defect and resubmit. **Self-correction budget: 3 resubmits, shared with Phase 4's budget** (3 total typed-reject retries across both submits). On exhaustion, surface the last reject verbatim and stop. A `TASK_COUNT_MISMATCH` means your clustering and your verdict ordinals disagree — reconcile them, do not pad the plan with filler tasks.
+On a `{success: false, ...}` reject — the scaffold dry-run codes (`bad_yaml` / `spec_invalid` / `ref_invalid` / `dep_invalid` / `epic_dep_invalid` / `repo_invalid` / `repo_required` (a multi-repo source needs an explicit, in-set per-task `target_repo` — add one) / `tier_invalid` / `dep_cycle`) or `TASK_COUNT_MISMATCH` (plan task count != verdict's expected cluster count) — fix the named defect and resubmit. **Self-correction budget: 3 resubmits, shared with Phase 4's budget** (3 total typed-reject retries across both submits). On exhaustion, surface the last reject verbatim and stop. A `TASK_COUNT_MISMATCH` means your clustering and your verdict ordinals disagree — reconcile them, do not pad the plan with filler tasks.
 
 Capture `followup_ref` from the success envelope.
 

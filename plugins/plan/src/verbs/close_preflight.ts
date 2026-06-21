@@ -135,6 +135,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
     id: t.id as string | undefined,
     title: t.title as string | undefined,
     status: (t.status as string | undefined) ?? "todo",
+    target_repo: (t.target_repo as string | null) ?? null,
   }));
   const allDone = tasks.length > 0 && tasks.every((t) => t.status === "done");
 
@@ -179,6 +180,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
     schema_version: AUDIT_SCHEMA_VERSION,
     epic_id: epicId,
     primary_repo: primaryRepo,
+    touched_repos: touchedRepos ?? null,
     commit_set_hash: commitSetHash,
     commit_groups: commitGroups,
     snippet_context: "",
@@ -186,6 +188,7 @@ export function runClosePreflight(args: ClosePreflightArgs): void {
       id: t.id,
       title: t.title,
       status: t.status,
+      target_repo: t.target_repo,
       done_summary: t.id ? doneSummary(ctx.dataDir, t.id) : "",
     })),
   };
