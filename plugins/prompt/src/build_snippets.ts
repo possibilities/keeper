@@ -102,7 +102,7 @@ function relPosix(from: string, to: string): string {
 /** Cheap, dependency-free token estimate. Replaces the dropped tiktoken
  * cl100k_base count with a ~4-chars-per-token heuristic; the value is
  * informational and intentionally diverges from the oracle (accepted churn). */
-function estimateTokens(text: string): number {
+export function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
@@ -114,7 +114,7 @@ function escapeRegExp(s: string): string {
 /** Return repo-relative paths referencing a snippet by name. A reference is
  * either an explicit `snippet('...name')` / `snippets(...)` call or a literal
  * `{% include '...name.md.tmpl' %}`. Mirrors _find_usages (claude/ tree only). */
-function findUsages(projectRoot: string, snippetName: string): string[] {
+export function findUsages(projectRoot: string, snippetName: string): string[] {
   const escaped = escapeRegExp(snippetName);
   const pattern = new RegExp(
     `(?:snippet\\(\\s*['"][^'"]*${escaped}['"]` +

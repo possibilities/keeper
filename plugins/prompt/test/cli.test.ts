@@ -83,6 +83,12 @@ const PORTED_VERBS = new Set([
   "check-generated",
   "render-plugin-templates",
   "build-snippets",
+  "find-snippets",
+  "save-snippet",
+  "save-bundle",
+  "validate-bundles",
+  "list-bundles",
+  "show-bundle",
 ]);
 const STUB_VERBS = KEEP_VERBS.filter((v) => !PORTED_VERBS.has(v));
 

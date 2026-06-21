@@ -11,12 +11,18 @@
 // tasks fill in each `src/<verb>.ts` runner WITHOUT editing this dispatcher — the
 // dispatch table, arg parsing, help text, and exit-code contract land once.
 
-import type { OutputFormat } from "../../plan/src/format.ts";
+import { formatOutput, type OutputFormat } from "../../plan/src/format.ts";
 import { runBuildSnippets } from "./build_snippets.ts";
 import { run as runCheckGenerated } from "./check_generated.ts";
+import { runFindSnippets } from "./find_snippets.ts";
+import { runListBundles } from "./list_bundles.ts";
 import { resolveProjectRoot } from "./project_root.ts";
 import { run as runRender } from "./render.ts";
 import { runRenderPluginTemplates } from "./render_plugin_templates.ts";
+import { runSaveBundle } from "./save_bundle.ts";
+import { runSaveSnippet } from "./save_snippet.ts";
+import { runShowBundle } from "./show_bundle.ts";
+import { runValidateBundles } from "./validate_bundles.ts";
 
 const PROG = "keeper prompt";
 const USAGE = `Usage: ${PROG} [OPTIONS] COMMAND [ARGS]...`;
@@ -167,19 +173,6 @@ function printHelp(): void {
   process.stdout.write(`${lines.join("\n")}\n`);
 }
 
-/** Stub for a keep-verb whose runner lands in a later verb-port task. Emits a
- * not-yet-ported error envelope + exit 1 so a premature call fails loud instead
- * of silently succeeding. The verb-port task replaces the dispatch case body. */
-function notImplemented(verb: string, format: OutputFormat | null): number {
-  const payload = { success: false, error: `not implemented: ${verb}` };
-  if (format === "yaml") {
-    process.stdout.write(`success: false\nerror: 'not implemented: ${verb}'\n`);
-  } else {
-    process.stdout.write(`${JSON.stringify(payload, null, 2)}\n`);
-  }
-  return 1;
-}
-
 function dispatch(parsed: ParsedArgs): number {
   const { command, format } = parsed;
   if (command === null) {
@@ -213,16 +206,89 @@ function dispatch(parsed: ParsedArgs): number {
       const projectRoot = resolveProjectRoot(null);
       return runBuildSnippets({ check, projectRoot });
     }
-    case "find-snippets":
-    case "save-snippet":
-    case "save-bundle":
-    case "validate-bundles":
-    case "list-bundles":
-    case "show-bundle":
-      return notImplemented(command, format);
+    case "find-snippets": {
+      const query = positional(parsed.rest);
+      const projectRoot = resolveProjectRoot(null);
+      const limitStr = readOption(parsed.rest, "--limit");
+      return runFindSnippets(
+        query,
+        projectRoot,
+        {
+          domain: readOption(parsed.rest, "--domain") ?? null,
+          scope: readOption(parsed.rest, "--scope") ?? null,
+          phase: readOption(parsed.rest, "--phase") ?? null,
+          bundle: readOption(parsed.rest, "--bundle") ?? null,
+          limit: limitStr !== undefined ? Number(limitStr) : undefined,
+        },
+        format,
+        (rows, fmt) => formatOutput(rows, fmt),
+      );
+    }
+    case "save-snippet": {
+      const projectRoot = resolveProjectRoot(null);
+      return runSaveSnippet(
+        projectRoot,
+        {
+          name: readOption(parsed.rest, "--name") ?? "",
+          domain: readOption(parsed.rest, "--domain") ?? "",
+          summary: readOption(parsed.rest, "--summary") ?? "",
+          body: readOption(parsed.rest, "--body") ?? null,
+          tags: readOption(parsed.rest, "--tags") ?? null,
+          scope: readOption(parsed.rest, "--scope") ?? null,
+          phase: readOption(parsed.rest, "--phase") ?? null,
+          related: readOption(parsed.rest, "--related") ?? null,
+          audience: readOption(parsed.rest, "--audience") ?? null,
+          severity: readOption(parsed.rest, "--severity") ?? null,
+          force: parsed.rest.includes("--force"),
+        },
+        format,
+        (row, fmt) => formatOutput(row, fmt),
+      );
+    }
+    case "save-bundle": {
+      const ref = positional(parsed.rest);
+      const projectRoot = resolveProjectRoot(null);
+      return runSaveBundle(
+        ref,
+        projectRoot,
+        {
+          snippets: readOption(parsed.rest, "--snippets") ?? null,
+          summary: readOption(parsed.rest, "--summary") ?? null,
+          tags: readOption(parsed.rest, "--tags") ?? null,
+          append: parsed.rest.includes("--append"),
+          force: parsed.rest.includes("--force"),
+        },
+        format,
+        (row, fmt) => formatOutput(row, fmt),
+      );
+    }
+    case "validate-bundles": {
+      const projectRoot = resolveProjectRoot(null);
+      return runValidateBundles(projectRoot);
+    }
+    case "list-bundles": {
+      const projectRoot = resolveProjectRoot(null);
+      const namespace = readOption(parsed.rest, "--namespace") ?? null;
+      return runListBundles(projectRoot, namespace, format, (rows, fmt) =>
+        formatOutput(rows, fmt),
+      );
+    }
+    case "show-bundle": {
+      const ref = positional(parsed.rest);
+      const projectRoot = resolveProjectRoot(null);
+      return runShowBundle(ref, projectRoot, format, (row, fmt) =>
+        formatOutput(row, fmt),
+      );
+    }
     default:
       noSuchCommand(command);
   }
+}
+
+/** First non-flag positional in a verb's rest (skips `--flag value` pairs is the
+ * caller's job — here we just take the first arg not starting with `-`). */
+function positional(rest: string[]): string | undefined {
+  return rest.find((a) => !a.startsWith("-"));
 }
 
 /** Read the value of a `--name value` or `--name=value` option from a verb's
