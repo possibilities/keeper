@@ -67,5 +67,5 @@ Add the new test files to the fast tier.
 - [ ] New unit tests pass in the fast tier
 
 ## Done summary
-
+Bus storage layer (src/bus-db.ts: own user_version ladder, channels keyed on (pid,start_time), append-only messages with monotonic cursor + replay) and pure two-layer name resolver (src/bus-identity.ts: jobs exact/prefix/substring tiers, dead-name via name_history, fail-soft to live registry); path resolvers + sandboxEnv extended. 25 unit tests in the fast tier.
 ## Evidence
