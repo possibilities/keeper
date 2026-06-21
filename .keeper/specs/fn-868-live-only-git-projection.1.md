@@ -49,5 +49,5 @@ Build the panel-verified live-only machinery as ONE cohesive change (interdepend
 - [ ] Copy-proof passes: v76→78 migrate+boot-seed fast + correct for currently-dirty files
 
 ## Done summary
-
+Live-only git projection: v79 skip-floor no-ops historical GitSnapshot/Commit git folds, a degrade-not-fatal boot-seed producer re-derives git_status/file_attributions/3 jobs-counters for currently-dirty files before serving, and a central LIVE_ONLY registry + class-aware rewind helpers exclude the surface from the re-fold charter. Synthetic copy-proof + full suite green.
 ## Evidence
