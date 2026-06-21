@@ -897,10 +897,13 @@ event-log/reducer/hook touch. Run any of them with
     viewer can subscribe).
   - `keeper autopilot retry <verb::id>` — clear a sticky `dispatch_failures`
     row via `retry_dispatch`. The RPC bridges through main, which appends a
-    `DispatchCleared` synthetic event; the reducer DELETEs the row on the
-    next drain and the reconciler is free to re-attempt. There is no
-    auto-retry — a failed dispatch is sticky and visible in the `--- failed
-    ---` section until a human runs `retry`.
+    `DispatchCleared` synthetic event; the reducer DELETEs the failure +
+    never-bound counter + `pending_dispatches` row on the next drain and the
+    reconciler is free to re-attempt. There is no auto-retry — a failed
+    dispatch is sticky and visible in the `--- failed ---` section until a
+    human runs `retry`. `verb` is one of `work|close|approve`: `approve` is
+    accepted SOLELY to clear a resurrected/phantom `approve` pending (the
+    reconciler never dispatches `approve` itself — fn-870).
   - `keeper autopilot mode <yolo|armed>` — set the autopilot mode via
     `set_autopilot_mode` (fn-751, schema v62). **yolo** (the default) works
     every ready epic; **armed** works ONLY explicitly-armed epics plus their
@@ -947,6 +950,7 @@ event-log/reducer/hook touch. Run any of them with
   keeper autopilot arm fn-1-foo          # add fn-1-foo to the armed set
   keeper autopilot disarm fn-1-foo       # remove fn-1-foo from the armed set
   keeper autopilot retry work::fn-1-x.3  # clear a sticky DispatchFailed
+  keeper autopilot retry approve::fn-1-x # clear a resurrected/phantom approve pending (fn-870)
   ```
 
 - `dispatch.ts` — a manual escape hatch that fires ONE `claude` worker into a

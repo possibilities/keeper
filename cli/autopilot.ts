@@ -66,7 +66,9 @@ Subcommands:
   arm      Send set_epic_armed {epic_id:<id>, armed:true} and exit.
   disarm   Send set_epic_armed {epic_id:<id>, armed:false} and exit.
   retry    Send retry_dispatch {id:<verb::id>} and exit. <verb::id> is
-           the canonical composite key (e.g. work::fn-619-foo.3).
+           the canonical composite key (e.g. work::fn-619-foo.3). verb is
+           one of work|close|approve; approve clears a resurrected/phantom
+           approve pending (the reconciler never dispatches approve itself).
 
 Options:
   --sock <path>  Socket path override ($KEEPER_SOCK / default otherwise)

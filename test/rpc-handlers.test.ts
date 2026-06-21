@@ -399,6 +399,19 @@ test("retry_dispatch forwards the split (verb, id) to the bridge and returns ok+
   expect(state.retryCalls).toEqual([{ verb: "work", id: "fn-1-foo.3" }]);
 });
 
+test("retry_dispatch accepts an `approve::id` clear and forwards it to the bridge (fn-870)", async () => {
+  // The operator-clear path for a resurrected/phantom `approve` pending —
+  // `bridge.retryDispatch` mints the `DispatchCleared` event the reducer folds
+  // to DELETE the failure + counter + pending row.
+  const { bridge, state } = autopilotStubBridge({});
+  const result = await retryDispatchHandler(
+    { id: "approve::fn-870-clear.1" },
+    bridge,
+  );
+  expect(result).toEqual({ ok: true, verb: "approve", id: "fn-870-clear.1" });
+  expect(state.retryCalls).toEqual([{ verb: "approve", id: "fn-870-clear.1" }]);
+});
+
 test("retry_dispatch rejects params with extra keys (no command/param injection)", async () => {
   const { bridge } = autopilotStubBridge({});
   for (const bad of [

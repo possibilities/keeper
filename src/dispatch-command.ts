@@ -22,9 +22,13 @@
  * `Verb` union in `src/autopilot-worker.ts` (kept local rather than
  * re-imported to keep this leaf module's import graph empty).
  */
-export type RetryDispatchVerb = "work" | "close";
+export type RetryDispatchVerb = "work" | "close" | "approve";
 
-const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>(["work", "close"]);
+const RETRY_DISPATCH_VERBS = new Set<RetryDispatchVerb>([
+  "work",
+  "close",
+  "approve",
+]);
 
 /** Discriminated result of {@link parseDispatchKey}. */
 export type ParseDispatchKeyResult =
@@ -42,7 +46,10 @@ export type ParseDispatchKeyResult =
  * read at the next reconcile, never the RPC payload):
  *
  * - Non-empty string with exactly one `::` separator.
- * - `verb` is one of `work` / `close`.
+ * - `verb` is one of `work` / `close` / `approve`. The reconciler only ever
+ *   dispatches `work` / `close`; `approve` is accepted SOLELY so an operator can
+ *   clear a resurrected/phantom `approve` pending via `retry_dispatch` (the
+ *   actual fn-870 incident shape) — there is no live `approve` dispatch path.
  * - `id` is a non-empty token AND passes the {@link rejectDispatchIdToken}
  *   filename-safety predicate (no path separators, no embedded null, no
  *   leading dot). The `dispatch_id` never feeds a filesystem path, but the
@@ -79,7 +86,7 @@ export function parseDispatchKey(value: unknown): ParseDispatchKeyResult {
   if (!RETRY_DISPATCH_VERBS.has(verbRaw as RetryDispatchVerb)) {
     return {
       ok: false,
-      error: `retry_dispatch: \`verb\` must be one of work|close (got ${JSON.stringify(verbRaw)})`,
+      error: `retry_dispatch: \`verb\` must be one of work|close|approve (got ${JSON.stringify(verbRaw)})`,
     };
   }
   if (!isSafeDispatchIdToken(idRaw)) {

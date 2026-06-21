@@ -29,6 +29,14 @@ test("parseDispatchKey: splits the composite key into {ok, verb, id}", () => {
     verb: "close",
     id: "fn-1-foo",
   });
+  // `approve` is accepted SOLELY for the operator-clear path (fn-870) —
+  // `retry_dispatch` on a resurrected/phantom `approve` pending. The
+  // reconciler never dispatches `approve` itself.
+  expect(parseDispatchKey("approve::fn-1-foo")).toEqual({
+    ok: true,
+    verb: "approve",
+    id: "fn-1-foo",
+  });
 });
 
 test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", () => {
@@ -40,7 +48,7 @@ test("parseDispatchKey: rejects empty / non-string / missing-separator inputs", 
 });
 
 test("parseDispatchKey: rejects unknown verbs", () => {
-  for (const bad of ["rm::fn-1-foo", "plan::fn-1-foo", "approve::fn-1-foo"]) {
+  for (const bad of ["rm::fn-1-foo", "plan::fn-1-foo", "exec::fn-1-foo"]) {
     expect(parseDispatchKey(bad).ok).toBe(false);
   }
 });

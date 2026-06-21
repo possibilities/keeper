@@ -54,6 +54,7 @@ import {
   selectVersionsByIdsChunked,
 } from "./collections";
 import { openDb, resolveSockPath } from "./db";
+import type { RetryDispatchVerb } from "./dispatch-command";
 import {
   type ClientFrame,
   type ErrorFrame,
@@ -178,8 +179,9 @@ export interface SetAutopilotPausedResultMessage {
 export interface RetryDispatchRequestMessage {
   kind: "retry-dispatch-request";
   id: string;
-  /** The dispatch verb half of the failed `${verb}::${id}` key. */
-  verb: "work" | "close";
+  /** The dispatch verb half of the failed `${verb}::${id}` key. `approve` is
+   *  accepted ONLY for the operator-clear path (fn-870). */
+  verb: RetryDispatchVerb;
   /** The keeper plan id (epic id for `close`; task id for `work`). Handler-validated
    *  non-empty; main treats it as an opaque token. */
   dispatch_id: string;
@@ -1282,7 +1284,7 @@ export interface ReplayBridge {
    * the parts as opaque tokens.
    */
   retryDispatch(
-    verb: "work" | "close",
+    verb: RetryDispatchVerb,
     dispatch_id: string,
   ): Promise<{
     ok: boolean;
@@ -2853,7 +2855,7 @@ function main(): void {
       });
     },
     retryDispatch(
-      verb: "work" | "close",
+      verb: RetryDispatchVerb,
       dispatch_id: string,
     ): Promise<SimpleResolution> {
       return new Promise<SimpleResolution>((resolve, reject) => {
