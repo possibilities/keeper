@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "max",
   "title": "Scheduled arthack install/doctor with self-bounce safety",
-  "updated_at": "2026-06-22T17:44:14.768000Z"
+  "updated_at": "2026-06-22T18:34:22.002000Z",
+  "worker_done_at": "2026-06-22T18:34:22.002000Z"
 }

@@ -56,5 +56,5 @@ Run install.sh with the buildbot env flag set and confirm it does NOT reload `ar
 - [ ] `buildbot checkconfig` passes
 
 ## Done summary
-
+Added arthack-install (preinstall+install) and arthack-doctor builders on a 4x/day Nightly (hour=[0,6,12,18]), both auto-joining ForceScheduler via STANDALONE_JOBS. install steps set KEEPER_BUILDBOT_INSTALL=1, which processctl start-processes honors to skip linking/loading buildbot's own launchagent so the scheduled install never self-kills the master; doctor is a separate red row. checkconfig passes.
 ## Evidence
