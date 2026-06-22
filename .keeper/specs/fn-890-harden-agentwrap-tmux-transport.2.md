@@ -43,5 +43,5 @@ Via `makeHarness` + injected `runTmuxCommandFn`: assert non-`--wait-for-stop` pr
 - [ ] `bun lint && bun typecheck && bun test` green; CLAUDE.md tmux-transport JSON/exit-code description updated to match.
 
 ## Done summary
-
+tmux mode now prints one schema_version'd JSON line immediately for non-wait launches (decoupled from the transcript poll) and a distinct exit-code taxonomy (3 prereq, 4 transient, 1 internal, 2 bad-args) with a structured JSON error on every non-zero exit.
 ## Evidence
