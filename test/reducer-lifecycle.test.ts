@@ -4347,7 +4347,7 @@ test("Commit fold runs in the SAME transaction as cursor advance (atomicity)", (
 });
 
 // ---------------------------------------------------------------------------
-// UsageSnapshot / UsageDeleted reducer arms — fn-615-add-agentuse-usage-collection
+// UsageSnapshot / UsageDeleted reducer arms — fn-615-add-agentusage-usage-collection
 // ---------------------------------------------------------------------------
 
 test("UsageSnapshot folds into the usage projection and advances the cursor", () => {
@@ -4694,8 +4694,8 @@ test("from-scratch re-fold reproduces jobs.profile_name byte-identically (v36)",
 });
 
 test("forward fan-out: a rate_limit on an untracked profile is a no-op — no phantom usage row minted (fn-642)", () => {
-  // SessionStart on profile-A but agentuse never observed profile-A in
-  // ~/.local/state/agentuse — there's no `usage` row to fan into. The
+  // SessionStart on profile-A but agentusage never observed profile-A in
+  // ~/.local/state/agentusage — there's no `usage` row to fan into. The
   // forward UPDATE must match zero rows and we must NOT mint a phantom.
   insertEvent({
     hook_event: "SessionStart",
@@ -4868,7 +4868,7 @@ test("literal usage.id='' stays non-joinable — directional mapping is one-way 
   });
   insertEvent({ hook_event: "UserPromptSubmit", session_id: "sess-default" });
   insertEvent({ hook_event: "RateLimited", session_id: "sess-default" });
-  // A pathological UsageSnapshot with session_id='' — agentuse cannot mint
+  // A pathological UsageSnapshot with session_id='' — agentusage cannot mint
   // this in practice (`<id>.json` with empty basename is impossible on
   // disk), but the early guard must reject it regardless.
   insertEvent({
@@ -5143,7 +5143,7 @@ test("from-scratch re-fold reproduces usage + profiles projections byte-identica
       week_resets_at: "T2",
     }),
   });
-  // (c) untracked: rate-limit on a profile agentuse doesn't track.
+  // (c) untracked: rate-limit on a profile agentusage doesn't track.
   insertEvent({
     hook_event: "SessionStart",
     session_id: "sess-untracked",
@@ -5198,7 +5198,7 @@ test("UsageSnapshot ingests top-level lift_at into usage.rate_limit_lifts_at (fn
       week_percent: 50.0,
       week_resets_at: "2026-06-01T20:00:00-04:00",
       status: "active",
-      // agentuse's derived unblock instant — soonest resets_at among >=100%
+      // agentusage's derived unblock instant — soonest resets_at among >=100%
       // windows. Folds into usage.rate_limit_lifts_at on the percentage path.
       lift_at: "2026-05-30T20:30:00-04:00",
     }),
@@ -5299,7 +5299,7 @@ test("UsageSnapshot does NOT bump last_usage_fold_at on an idle/stale fold (fn-6
 test("UsageSnapshot stamps last_usage_fold_at when any per-window percent is non-null (fn-651)", () => {
   // The "successful fold" gate is `status === "active" OR any percent
   // non-null`. A row with only `session_percent` (no status field at all)
-  // still qualifies — agentuse's `active` status is a sufficient signal but
+  // still qualifies — agentusage's `active` status is a sufficient signal but
   // not a necessary one.
   insertEvent({
     hook_event: "UsageSnapshot",

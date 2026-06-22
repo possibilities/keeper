@@ -2,7 +2,7 @@
  * Pure-function tests for `cli/usage.ts`'s `renderRowLines` helper.
  *
  * `renderRowLines` consumes the daemon-side `usage` collection rows and
- * renders a stacked block per agentuse profile: a header line carrying
+ * renders a stacked block per agentusage profile: a header line carrying
  * the id chip + target/multiplier chip, then one indented body line per
  * quota window (session / week / sonnet-where-present). Each body line
  * is `label [bar] pct rel` — a 30-wide ASCII bar (`█`/`░`) followed by
@@ -97,7 +97,7 @@ test("renders the round boundary as 'now'", () => {
 });
 
 test("collapses an elapsed-but-fresh reset to 'now', never '—' or '<rel> ago'", () => {
-  // A reset cell is a strictly-forward countdown — agentuse always resolves
+  // A reset cell is a strictly-forward countdown — agentusage always resolves
   // `*_resets_at` into the future at scrape time. On a FRESH row (no keeper
   // staleness) a PAST timestamp means "the reset is due; a fresh scrape just
   // hasn't landed yet" → `now`. It is neither an age (`<rel> ago` would
@@ -640,7 +640,7 @@ test("label padding ignores 'limited' when no row renders one", () => {
 test("limited line renders when last_rate_limit_at is NULL but a future lift is set (fn-754)", () => {
   // fn-754 dropped the fired-time gate: the presence test is now the FUTURE
   // lift itself. A depleted-but-quiet row (`last_rate_limit_at` NULL because
-  // agentuse paused polling) with a known future `rate_limit_lifts_at` now
+  // agentusage paused polling) with a known future `rate_limit_lifts_at` now
   // renders a `limited lifts in <rel>` line — the inverse of the old v41
   // behavior.
   const lines = renderRowLines(
@@ -669,7 +669,7 @@ test("limited line renders when last_rate_limit_at is NULL but a future lift is 
 // is older than the renderer's `STALENESS_THRESHOLD_MS` cutoff (~15m)
 // picks up an indented `stale Nm` body line — driven exclusively off
 // that stamp, never `updated_at` (a rate-limit fold bumps it) and never
-// agentuse's own `status`. NULL stamp leaves the warning off; codex
+// agentusage's own `status`. NULL stamp leaves the warning off; codex
 // gets the same contract.
 // ---------------------------------------------------------------------------
 
@@ -742,7 +742,7 @@ test("no 'stale' line when last_usage_fold_at is NULL (no successful fold to age
 // ---------------------------------------------------------------------------
 // Lift-aware staleness anchor (fn-754). The stale clock anchors to
 // `max(last_usage_fold_at, rate_limit_lifts_at)` so a depleted-but-quiet row
-// (agentuse paused polling until its known lift, freezing the fold stamp)
+// (agentusage paused polling until its known lift, freezing the fold stamp)
 // stays FRESH while the lift is future — surfacing the week countdown + a
 // `limited` line instead of `—` + `stale`. After the lift passes, the normal
 // 15m grace is measured FROM the lift.
@@ -955,7 +955,7 @@ test("a stale row dashes its reset countdowns instead of showing a value", () =>
 
 test("omits the session line when the weekly window is depleted (>=100%)", () => {
   // A maxed weekly window collapses the session window to a reset-less 0% on
-  // the /usage panel (agentuse emits session with a null reset). The renderer
+  // the /usage panel (agentusage emits session with a null reset). The renderer
   // suppresses the now-noise `session` line entirely — only `week` renders.
   const lines = renderRowLines(
     [

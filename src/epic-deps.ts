@@ -57,11 +57,11 @@ export function projectBasename(dir: string | null): string {
 
 /**
  * Schema v42 (fn-662): the shared, pure, directional mapping between
- * keeper's `''` default-profile sentinel and agentuse's `"default"` usage id.
+ * keeper's `''` default-profile sentinel and agentusage's `"default"` usage id.
  * Both name the SAME entity — a user running Claude Code with no
  * `CLAUDE_CONFIG_DIR` set (the default `~/.claude` profile). keeper writes
  * the SessionStart-seeded profile row under `profile_name=''` (basename of
- * `null`/`''`); agentuse writes the matching usage record under
+ * `null`/`''`); agentusage writes the matching usage record under
  * `usage.id='default'` (it has no notion of `CLAUDE_CONFIG_DIR` to project
  * a basename from). The v35/fn-642 bidirectional rate-limit fan-out joined
  * `usage.id = profiles.profile_name` with both arms guarding
@@ -93,7 +93,7 @@ export function projectBasename(dir: string | null): string {
  * values only.
  *
  * Accepted edge: a profile literally basenamed `default` (i.e.
- * `CLAUDE_CONFIG_DIR=/some/where/default`) collides with the agentuse
+ * `CLAUDE_CONFIG_DIR=/some/where/default`) collides with the agentusage
  * default account on `usage.id='default'` and last-write-wins with the
  * `''` sentinel. Documented, not handled — vanishingly unlikely in practice.
  */

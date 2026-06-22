@@ -42,7 +42,7 @@ let stateDir: string;
 
 beforeEach(() => {
   tmpDir = mkdtempSync(join(tmpdir(), "keeper-usage-test-"));
-  stateDir = join(tmpDir, "agentuse");
+  stateDir = join(tmpDir, "agentusage");
   mkdirSync(stateDir, { recursive: true });
 });
 
@@ -58,7 +58,7 @@ function writeEnvelope(id: string, body: Record<string, unknown>): string {
 }
 
 /**
- * A realistic agentuse envelope with the four freshness fields populated.
+ * A realistic agentusage envelope with the four freshness fields populated.
  * Tests that flip ONLY the freshness fields verify the change-gate
  * suppression.
  */
@@ -90,9 +90,9 @@ test("isUsageFilename accepts <id>.json (lowercase, digit, hyphen); rejects ever
   expect(isUsageFilename("claude-multi-1.json")).toBe(true);
   expect(isUsageFilename("codex.json")).toBe(true);
   expect(isUsageFilename("a.json")).toBe(true);
-  // Reject extra dot segment (future agentuse error envelope).
+  // Reject extra dot segment (future agentusage error envelope).
   expect(isUsageFilename("claude-default.error.json")).toBe(false);
-  // Reject non-.json files (agentuse log surfaces).
+  // Reject non-.json files (agentusage log surfaces).
   expect(isUsageFilename("server.stdout")).toBe(false);
   expect(isUsageFilename("server.stderr")).toBe(false);
   expect(isUsageFilename("events.jsonl")).toBe(false);
@@ -229,7 +229,7 @@ test("buildUsageMessage drops every freshness field — they NEVER enter the mes
 test("FRESHNESS EXCLUSION: two envelopes differing ONLY in fetch timestamps produce ZERO emits past the first", () => {
   // The point of this test: a future contributor adding `fetched_at` (or any
   // of the four freshness fields) to the change-gate hash would force a
-  // synthetic event on every ~90s agentuse fetch cycle, churning the
+  // synthetic event on every ~90s agentusage fetch cycle, churning the
   // projection. The change-gate compares JSON.stringify byte-for-byte, so
   // omitting the field from `buildUsageMessage`'s output is the discipline
   // — and this test asserts that discipline holds.
@@ -329,7 +329,7 @@ test("fn-651: buildUsageMessage projects top-level lift_at; absent/non-string �
   const absent = buildUsageMessage({ id: "x" });
   expect(absent?.lift_at).toBeNull();
 
-  // Non-string (e.g. agentuse fault, or a typo'd envelope) → null per the
+  // Non-string (e.g. agentusage fault, or a typo'd envelope) → null per the
   // safe-value invariant. The reducer's `parseUsageSnapshot` enforces the
   // same string-guard on the wire side.
   const bogus = buildUsageMessage({ id: "x", lift_at: 42 });

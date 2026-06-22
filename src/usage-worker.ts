@@ -1,7 +1,7 @@
 /**
  * Usage producer worker. keeperd's FIFTH file-watcher producer (after
- * transcript, plan, git) — watches the agentuse daemon's flat leaf state dir
- * `~/.local/state/agentuse/` for one `<id>.json` per profile, reads + parses
+ * transcript, plan, git) — watches the agentusage daemon's flat leaf state dir
+ * `~/.local/state/agentusage/` for one `<id>.json` per profile, reads + parses
  * each on change, and posts typed snapshot/tombstone messages
  * (`{kind:"usage-snapshot"|"usage-deleted", ...}`) to the parent. The parent
  * (and only the parent) turns those messages into synthetic `UsageSnapshot` /
@@ -24,17 +24,17 @@
  *   external resource the worker owns and `unsubscribe()`s in its shutdown
  *   handler. Terminate alone would leak the FSEvents/inotify fd.
  *
- * Watching strategy: ONE recursive `@parcel/watcher` subscribe on the agentuse
+ * Watching strategy: ONE recursive `@parcel/watcher` subscribe on the agentusage
  * state dir, with EMPTY `ignore` (flat leaf dir, no `**` globs to worry about)
  * and an in-callback filename predicate `/^[a-z0-9-]+\.json$/` that rejects
  * `<id>.error.json` (extra dot segment), `server.stdout` / `server.stderr` (no
  * `.json` suffix), and any `<id>.json.tmp.*` temp artifacts the producer
  * leaves mid-rename. The classify-then-read-current-file pattern handles
- * agentuse's atomic `os.replace` writes — parcel surfaces them as `create`,
+ * agentusage's atomic `os.replace` writes — parcel surfaces them as `create`,
  * not `update`, so we route on filename + existence, never on `event.type`.
  *
  * Internal guards (skip-and-log, never escalate): a missing root is tolerated
- * (subscribe + scan both no-op until the dir appears — agentuse may never
+ * (subscribe + scan both no-op until the dir appears — agentusage may never
  * have run yet), per-file read errors, oversize files, and torn/malformed
  * JSON all log to stderr and continue without emitting. Only an unrecoverable
  * failure (the addon failing to load) exits non-zero → daemon `fatalExit` →
@@ -48,7 +48,7 @@
  * delete — no new event types.
  *
  * **Freshness-exclusion discipline (load-bearing).** The source envelope
- * agentuse writes carries four freshness fields — `fetched_at`,
+ * agentusage writes carries four freshness fields — `fetched_at`,
  * `next_fetch_at`, `last_successful_fetch_at`, `last_skipped_fetch_at` — that
  * refresh on every ~90s fetch cycle even when no real content has moved.
  * Including ANY of them in the change-gate hash (or in the projection schema)
@@ -79,10 +79,10 @@ import type { ShutdownMessage } from "./wake-worker";
 export interface UsageWorkerData {
   dbPath: string;
   /**
-   * The agentuse state directory to watch (flat leaf — one `<id>.json` per
+   * The agentusage state directory to watch (flat leaf — one `<id>.json` per
    * profile). The parent resolves this from {@link resolveUsageRoot}. A
    * missing directory is tolerated (subscribe + scan both no-op until the
-   * dir appears — agentuse may not have run yet).
+   * dir appears — agentusage may not have run yet).
    */
   root: string;
   /**
@@ -96,10 +96,10 @@ export interface UsageWorkerData {
   disableNativeWatcher?: boolean;
 }
 
-/** Snapshot message for one `~/.local/state/agentuse/<id>.json` file. */
+/** Snapshot message for one `~/.local/state/agentusage/<id>.json` file. */
 export interface UsageSnapshotMessage {
   kind: "usage-snapshot";
-  /** Agentuse profile id (the projection pk; rides in the synthetic event's session_id). */
+  /** Agentusage profile id (the projection pk; rides in the synthetic event's session_id). */
   id: string;
   /**
    * Agent vendor target (`"claude"` / `"codex"` / ...). Stored opaque, never
@@ -130,7 +130,7 @@ export interface UsageSnapshotMessage {
   sonnet_week_resets_at: string | null;
   /**
    * Envelope freshness/liveness axis (fn-645): `"active" | "idle" | "stale"`.
-   * Stamped at write time by agentuse, never derived. Null when the envelope
+   * Stamped at write time by agentusage, never derived. Null when the envelope
    * omits the field (forward-compat / pre-fn-3 envelopes).
    */
   status: string | null;
@@ -141,7 +141,7 @@ export interface UsageSnapshotMessage {
    */
   subscription_active: boolean | null;
   /**
-   * Stale-only error type (fn-645) — the agentuse-side exception class name,
+   * Stale-only error type (fn-645) — the agentusage-side exception class name,
    * e.g. `"ClaudeUsageParseError"`. Present only when `status == "stale"`;
    * null otherwise.
    */
@@ -176,9 +176,9 @@ export interface UsageSnapshotMessage {
    * the percentage path; CARVED OUT of the rate-limit fan-out's UPDATE so
    * a RateLimited event can never clobber it.
    *
-   * Emitted by agentuse's envelope (top-level `lift_at`); the wire shape
+   * Emitted by agentusage's envelope (top-level `lift_at`); the wire shape
    * here mirrors `session_resets_at` (string | null). Preserved through
-   * idle/stale envelope writes on the agentuse side so a paused profile
+   * idle/stale envelope writes on the agentusage side so a paused profile
    * does not lose its lift mid-cooldown.
    */
   lift_at: string | null;
@@ -190,7 +190,7 @@ export interface UsageSnapshotMessage {
  */
 export interface UsageDeletedMessage {
   kind: "usage-deleted";
-  /** Agentuse profile id (the projection pk; rides in the synthetic event's session_id). */
+  /** Agentusage profile id (the projection pk; rides in the synthetic event's session_id). */
   id: string;
 }
 
@@ -201,7 +201,7 @@ export type UsageMessage = UsageSnapshotMessage | UsageDeletedMessage;
  * Cap a usage file's size before `JSON.parse`. Usage JSONs live under the
  * user's `~/.local/state/` and are very small (a few hundred bytes); a
  * pathological/oversize file is skip-and-logged so a bad file never balloons
- * memory or stalls the callback. 1 MiB is far above any real agentuse
+ * memory or stalls the callback. 1 MiB is far above any real agentusage
  * envelope.
  */
 const MAX_USAGE_FILE_BYTES = 1024 * 1024;
@@ -215,13 +215,13 @@ const MAX_USAGE_FILE_BYTES = 1024 * 1024;
  * `claude-default.json`, `claude-multi-1.json`, `codex.json`.
  *
  * Rejects:
- *   - `<id>.error.json`         — extra `.error.` dot segment (agentuse
+ *   - `<id>.error.json`         — extra `.error.` dot segment (agentusage
  *                                 future surface for per-account scrape
  *                                 errors); explicitly not in our envelope.
- *   - `server.stdout` / `server.stderr` — no `.json` suffix; agentuse's
+ *   - `server.stdout` / `server.stderr` — no `.json` suffix; agentusage's
  *                                          daemon-side log files.
  *   - `events.jsonl`            — no `.json` suffix (the trailing `l` blocks);
- *                                 the agentuse-side audit log.
+ *                                 the agentusage-side audit log.
  *   - `<id>.json.tmp.*`         — temp artifacts the producer leaves
  *                                 mid-atomic-rename; the `^[a-z0-9-]+\.json$`
  *                                 anchor on the FULL basename rejects.
@@ -233,7 +233,7 @@ export function isUsageFilename(name: string): boolean {
 }
 
 /**
- * Derive the agentuse profile id from a `<id>.json` filename. Returns the
+ * Derive the agentusage profile id from a `<id>.json` filename. Returns the
  * basename minus `.json` when the filename passes {@link isUsageFilename},
  * else null. Pure.
  */
@@ -246,7 +246,7 @@ export function idFromUsagePath(path: string): string | null {
   return base.slice(0, -".json".length);
 }
 
-/** Raw agentuse envelope shape — only the fields we project. */
+/** Raw agentusage envelope shape — only the fields we project. */
 interface RawUsage {
   id?: unknown;
   target?: unknown;
@@ -260,7 +260,7 @@ interface RawUsage {
   // onto `usage.rate_limit_lifts_at`. ISO-8601 string when present, null when
   // no window is at >=100%.
   lift_at?: unknown;
-  // Freshness fields — present in real agentuse envelopes, read and discarded.
+  // Freshness fields — present in real agentusage envelopes, read and discarded.
   // `last_failed_fetch_at` joined this set under fn-645 (the stale `error`
   // sub-object carries the same info as `error.at`, projected instead).
   fetched_at?: unknown;
@@ -275,7 +275,7 @@ interface RawUsageWindow {
   resets_at?: unknown;
 }
 
-/** Raw shape of the agentuse envelope's stale `error` sub-object. */
+/** Raw shape of the agentusage envelope's stale `error` sub-object. */
 interface RawUsageError {
   type?: unknown;
   message?: unknown;
@@ -389,7 +389,7 @@ export function buildUsageMessage(raw: RawUsage): UsageSnapshotMessage | null {
     error_message: errorMessage,
     error_at: errorAt,
     // fn-651: rate-limit lift instant (the soonest `resets_at` among >=100%
-    // windows on the agentuse side; null when not over any limit). Top-level
+    // windows on the agentusage side; null when not over any limit). Top-level
     // envelope field — mirrors `session_resets_at` shape.
     lift_at: asString(raw.lift_at),
   };
@@ -438,7 +438,7 @@ export function usageGateKey(msg: UsageSnapshotMessage): string {
  * - `markSeen(path)` records the path's id in the on-disk census the boot
  *   {@link sweep} diffs against.
  *
- * The change-gate is keyed by the agentuse id (the projection pk) and holds
+ * The change-gate is keyed by the agentusage id (the projection pk) and holds
  * the last-emitted serialized snapshot. {@link seedFromDb} primes it from the
  * `usage` projection so a daemon restart full-scan does not re-emit a
  * synthetic event per profile every boot.
@@ -472,7 +472,7 @@ export class UsageScanner {
   }
 
   /**
-   * Record that an agentuse `<id>.json` file was enumerated on disk during a
+   * Record that an agentusage `<id>.json` file was enumerated on disk during a
    * boot scan — the on-disk census {@link sweep} diffs against. Called from
    * the boot-scan loop for EVERY file BEFORE `onChange`, so it counts
    * regardless of whether the snapshot parsed or was change-gate-suppressed.
@@ -610,7 +610,7 @@ export class UsageScanner {
  * resolves so files that pre-existed the daemon's boot are picked up without
  * waiting for a watcher event. The change-gate in {@link UsageScanner}
  * suppresses re-emits for files that already match the seeded projection
- * row. A missing root is treated as empty (no files, no work) — agentuse may
+ * row. A missing root is treated as empty (no files, no work) — agentusage may
  * never have run yet. Exported for unit reach.
  */
 export function scanRoot(root: string, scanner: UsageScanner): void {
@@ -709,7 +709,7 @@ export function seedFromDb(db: Database, scanner: UsageScanner): void {
 
 /**
  * Worker entrypoint. Opens its own read-only connection, seeds the
- * change-gate, subscribes ONE recursive watch on the agentuse state dir
+ * change-gate, subscribes ONE recursive watch on the agentusage state dir
  * (tolerates absence), routes each change event into the scanner, and posts
  * a snapshot/tombstone message per changed file. The subscription is an
  * owned external resource — `unsubscribe()`d in the shutdown handler.
@@ -797,13 +797,13 @@ function main(): void {
 
   void import("@parcel/watcher")
     .then((watcher) => {
-      // Tolerate a missing root: agentuse may never have run, in which case
-      // `~/.local/state/agentuse/` doesn't exist yet. Skip subscribe + scan;
+      // Tolerate a missing root: agentusage may never have run, in which case
+      // `~/.local/state/agentusage/` doesn't exist yet. Skip subscribe + scan;
       // when (if) the dir appears, the next daemon restart picks it up. A
       // live-mount feature would need a parent-dir watch — out of scope here.
       if (!existsSync(data.root)) {
         console.error(
-          `[usage-worker] root ${data.root} does not exist; not watching (agentuse may not have run yet)`,
+          `[usage-worker] root ${data.root} does not exist; not watching (agentusage may not have run yet)`,
         );
         return;
       }
@@ -846,7 +846,7 @@ function main(): void {
               // In-callback filename filter is the correctness gate — empty
               // `ignore` glob list (flat leaf dir, nothing to prune at the
               // watcher layer; no negated patterns per parcel #174). Route
-              // on filename + existence, NOT event.type (agentuse writes via
+              // on filename + existence, NOT event.type (agentusage writes via
               // atomic os.replace, so an update may surface as create).
               if (ev.type === "delete") {
                 scanner.onDelete(ev.path);

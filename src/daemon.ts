@@ -1522,7 +1522,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
    * starvation instead of crashing the daemon.
    *
    * The usage producer churns `<id>.json` create/delete events whenever the
-   * agentuse daemon rotates a profile, so its mint is the one most likely to
+   * agentusage daemon rotates a profile, so its mint is the one most likely to
    * land mid-checkpoint while a multi-GB WAL writer holds the lock past the
    * connection `busy_timeout`. `insertEvent.run` is synchronous, so on that
    * miss it throws `SQLITE_BUSY` straight up through `uw.onmessage` (no awaits,
@@ -2625,12 +2625,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   } // end `if (gitWorker)`
 
   // Spawn the usage worker in the SAME post-migration window. It watches the
-  // agentuse daemon's flat leaf state dir (`~/.local/state/agentuse/`) and
+  // agentusage daemon's flat leaf state dir (`~/.local/state/agentusage/`) and
   // posts `{kind: "usage-snapshot" | "usage-deleted", ...}` messages — the
   // fifth file-watcher producer-worker instance. Main turns each into a
   // synthetic `UsageSnapshot`/`UsageDeleted` events row on its writable
   // connection. The watch root is resolved on main via `resolveUsageRoot()`
-  // and tolerates absence (agentuse may not have run yet).
+  // and tolerates absence (agentusage may not have run yet).
   // Gated on the selector — `null` when unselected.
   const usageWorker = want("usage")
     ? new Worker(new URL("./usage-worker.ts", import.meta.url).href, {
@@ -2646,7 +2646,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     const uw = usageWorker;
     // Main stays the SOLE writer: a `usage-snapshot`/`usage-deleted` message
     // becomes a synthetic events row on the WRITABLE connection, then a wake pump
-    // folds it. The agentuse profile id rides in `session_id`; the flattened
+    // folds it. The agentusage profile id rides in `session_id`; the flattened
     // snapshot in `data` (empty for tombstones). Everything else is NULL.
     uw.onmessage = (ev: MessageEvent<UsageMessage | undefined>): void => {
       const msg = ev.data;
@@ -2674,7 +2674,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       // throws on through to `fatalExit`. See {@link mintUsageEventTolerant}.
       const minted = mintUsageEventTolerant({
         $ts: Date.now() / 1000,
-        $session_id: msg.id, // the entity pk: agentuse profile id
+        $session_id: msg.id, // the entity pk: agentusage profile id
         $pid: null,
         $hook_event: hookEvent,
         $event_type: "usage_snapshot",

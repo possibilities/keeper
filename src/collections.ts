@@ -260,8 +260,8 @@ export const GIT_DESCRIPTOR: CollectionDescriptor = {
 };
 
 /**
- * The `usage` descriptor — one row per agentuse profile, a current-state
- * snapshot of one `~/.local/state/agentuse/<id>.json` envelope, produced by
+ * The `usage` descriptor — one row per agentusage profile, a current-state
+ * snapshot of one `~/.local/state/agentusage/<id>.json` envelope, produced by
  * synthetic `UsageSnapshot` / `UsageDeleted` events.
  *
  * The source envelope's freshness fields (`fetched_at`, `next_fetch_at`, …) are

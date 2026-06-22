@@ -2722,7 +2722,7 @@ function clearEmbeddedMonitorFactOnTerminal(
 }
 
 /**
- * Pre-flattened agentuse usage snapshot. The usage-worker carries every
+ * Pre-flattened agentusage usage snapshot. The usage-worker carries every
  * projection-meaningful field in the synthetic `UsageSnapshot` event's `data`
  * blob; the reducer never re-reads the on-disk file. Freshness fields
  * (`fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
@@ -2926,7 +2926,7 @@ function projectUsageRow(db: Database, event: Event): void {
   );
   // Reverse fan-out: pull the current rate-limit annotation from the matching
   // `profiles` row and stamp it onto the just-UPSERTed usage row. The join key
-  // `profileNameForUsageId(usage.id)` translates agentuse's `"default"` id to
+  // `profileNameForUsageId(usage.id)` translates agentusage's `"default"` id to
   // keeper's `''` default-profile sentinel. NULL-safe: a missing profile row
   // leaves the columns NULL (the zero-event shape); a later `RateLimited`
   // populates them via the forward fan-out. Pure function of the fold inputs +
@@ -6879,10 +6879,10 @@ function projectJobsRow(db: Database, event: Event): void {
           // Forward fan-out: colocate the rate-limit annotation on the matching
           // `usage` row (join key `usage.id = profiles.profile_name`). Pure
           // UPDATE, never UPSERT — a rate_limit must not mint a phantom `usage`
-          // row for a profile agentuse isn't tracking; a missing row matches
+          // row for a profile agentusage isn't tracking; a missing row matches
           // zero, and a later `UsageSnapshot` pulls the annotation back via the
           // reverse fan-out. `usageIdForProfileName` maps the `''` sentinel to
-          // agentuse's `"default"` id so a default-account rate limit colocates
+          // agentusage's `"default"` id so a default-account rate limit colocates
           // on `usage.default`. The `last_event_id` bump is load-bearing (it
           // drives the wire diff). Pure function of the fold inputs.
           //

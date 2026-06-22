@@ -89,10 +89,10 @@ the lift is past/unknown, when the row is stale, and for codex stacks.
 A \`stale Nm\` line appears under any row whose stale anchor —
 \`max(last_usage_fold_at, rate_limit_lifts_at)\` (fn-754) — is older than
 the staleness threshold; anchoring to the lift keeps a depleted-but-quiet
-row (agentuse paused polling until its lift) FRESH while the lift is
+row (agentusage paused polling until its lift) FRESH while the lift is
 future. Driven only off that anchor, never \`updated_at\` and never
-agentuse's own \`status\` — surfacing a wedged ingestion path instead of
-silently frozen gauges, and labelling the \`—\` cells above it. Untracked profiles (a rate-limit with no agentuse usage
+agentusage's own \`status\` — surfacing a wedged ingestion path instead of
+silently frozen gauges, and labelling the \`—\` cells above it. Untracked profiles (a rate-limit with no agentusage usage
 row) do not render. Below the profile stacks, a \`recent sessions\` block logs the
 last 20 jobs (any state) newest-first, each labeled with the profile
 it ran under (\`profile_name\`, schema v36) plus a short id, title,
@@ -107,7 +107,7 @@ function seg(v: unknown): string {
 }
 
 /**
- * Resolve an agentuse account id to its configured display alias (purely
+ * Resolve an agentusage account id to its configured display alias (purely
  * cosmetic). An unmapped id passes through verbatim. The alias never touches
  * row identity; it is applied only at the render edge.
  */
@@ -196,7 +196,7 @@ function relTimeFromMs(
 /**
  * Render a quota-reset countdown cell (`session` / `week` / `sonnet`).
  *
- * A reset is a strictly-FORWARD value — agentuse resolves `*_resets_at` into
+ * A reset is a strictly-FORWARD value — agentusage resolves `*_resets_at` into
  * the future at every scrape, so a target slipped into the PAST on a fresh row
  * is "the reset is due, a fresh scrape just hasn't landed," not an age:
  *
@@ -228,7 +228,7 @@ const BAR_WIDTH = 30;
  * unix-seconds event ts of the last successful usage fold) — is older than this
  * against the renderer's `nowMs` picks up an indented `stale Nm` line.
  * Anchoring to the lift keeps a depleted-but-quiet row FRESH while the lift is
- * future. Tuned to ~3x agentuse's ~5m envelope-write cadence, so a brief lull
+ * future. Tuned to ~3x agentusage's ~5m envelope-write cadence, so a brief lull
  * doesn't flap the warning while a wedged ingestion path surfaces within
  * ~15-20m.
  */
@@ -286,7 +286,7 @@ function bar(v: unknown): string {
  * The `stale` line renders only when the stale anchor (`max(last_usage_fold_at,
  * rate_limit_lifts_at)`) is older than `STALENESS_THRESHOLD_MS`, driven off
  * that stamp + lift — never `updated_at` (a rate-limit fold bumps it) or
- * agentuse's `status` (which tracks scrape failures, not ingestion health).
+ * agentusage's `status` (which tracks scrape failures, not ingestion health).
  *
  * All cells render against the supplied `nowMs` (the data-change emit, the 30s
  * tick, or a fixed test clock) so the renderer does no wall-clock IO.
@@ -319,7 +319,7 @@ export function renderRowLines(
     wPct: string;
     wReset: string;
     // True when the weekly window is depleted (>=100%); the session body line
-    // is then suppressed (agentuse emits a bar-less 0% with no reset, which is
+    // is then suppressed (agentusage emits a bar-less 0% with no reset, which is
     // noise under a maxed week). Only `week` (+ `sonnet`) render.
     weekDepleted: boolean;
     // null when this row's envelope carried no sonnet_week sub-object.
@@ -335,7 +335,7 @@ export function renderRowLines(
     rlRel: string;
     // Empty when this row is fresh (or `last_usage_fold_at` is NULL). Otherwise
     // the `stale` line's age tail. Driven off `last_usage_fold_at`, never
-    // `updated_at` (a rate-limit fold bumps it) or agentuse's `status`.
+    // `updated_at` (a rate-limit fold bumps it) or agentusage's `status`.
     staleRel: string;
     // Stale-error line body — empty when `error_type` is NULL, else the
     // `<type>: <message>` content (the matching `errRel` is the rel-time cell).
@@ -357,7 +357,7 @@ export function renderRowLines(
     const foldAtRaw = row.last_usage_fold_at;
     const foldAtMs =
       typeof foldAtRaw === "number" ? foldAtRaw * 1000 : Number.NaN;
-    // Lift-aware staleness anchor. agentuse STOPS polling a maxed account until
+    // Lift-aware staleness anchor. agentusage STOPS polling a maxed account until
     // its lift, freezing `last_usage_fold_at`, so anchoring the stale clock to
     // `max(foldAt, lift)` keeps a depleted-but-quiet row with a future lift
     // fresh. After the lift passes (no fresh fold) the 15m grace is measured

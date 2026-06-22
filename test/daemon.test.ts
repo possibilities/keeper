@@ -898,7 +898,7 @@ test("usage-mint crash regression: a real insertEvent.run starved past busy_time
   try {
     stmts.insertEvent.run({
       $ts: Date.now() / 1000,
-      $session_id: "agentuse-profile-pk", // the UsageDeleted pk shape
+      $session_id: "agentusage-profile-pk", // the UsageDeleted pk shape
       $pid: null,
       $hook_event: "UsageDeleted",
       $event_type: "usage_snapshot",

@@ -701,7 +701,7 @@ test("the callback's .jsonl filter ignores non-jsonl + directory paths (no read,
  * Build a canonical `isApiErrorMessage:true` synthetic-assistant envelope,
  * matching the wire shape of real captured transcript lines (the bare-string
  * `error` form — confirmed against
- * `~/.claude/projects/-Users-mike-code-agentuse/2164484b-*.jsonl` for
+ * `~/.claude/projects/-Users-mike-code-agentusage/2164484b-*.jsonl` for
  * `authentication_failed` and the 2026-05 `rate_limit` corpus). The matcher
  * accepts both bare-string and structured `error.type` shapes; the bare
  * form is the one Claude Code actually writes in 2026-05.
@@ -828,10 +828,10 @@ test("matchApiError: a missing/non-string error field also folds to 'unknown'", 
 test("matchApiError: real captured 401 envelope (bare-string 'authentication_failed') matches", () => {
   // Wire-shape regression gate: a verbatim line from a real captured
   // transcript at
-  // ~/.claude/projects/-Users-mike-code-agentuse/2164484b-*.jsonl
+  // ~/.claude/projects/-Users-mike-code-agentusage/2164484b-*.jsonl
   // (the practice-scout's authentication_failed fixture). If Claude Code's
   // writer ever changes shape, this is the canary.
-  const line = `{"parentUuid":"dcc9930c-8714-4b3b-98e6-420ce59697bd","isSidechain":false,"type":"assistant","uuid":"d5367c20-bdc1-4bee-b4d9-90a404208ab5","timestamp":"2026-05-26T18:45:22.855Z","message":{"id":"f87b7fc5-d392-4db8-a7eb-c55cb0adccbb","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","content":[{"type":"text","text":"Please run /login · API Error: 401 Invalid authentication credentials"}],"context_management":null},"requestId":"req_011CbRgADwFUygFMyevtB7zP","error":"authentication_failed","isApiErrorMessage":true,"apiErrorStatus":401,"userType":"external","entrypoint":"cli","cwd":"/Users/mike/code/agentuse","sessionId":"2164484b-e74a-4f26-b716-b80b44c4de61","version":"2.1.150","gitBranch":"main"}`;
+  const line = `{"parentUuid":"dcc9930c-8714-4b3b-98e6-420ce59697bd","isSidechain":false,"type":"assistant","uuid":"d5367c20-bdc1-4bee-b4d9-90a404208ab5","timestamp":"2026-05-26T18:45:22.855Z","message":{"id":"f87b7fc5-d392-4db8-a7eb-c55cb0adccbb","container":null,"model":"<synthetic>","role":"assistant","stop_details":null,"stop_reason":"stop_sequence","stop_sequence":"","type":"message","content":[{"type":"text","text":"Please run /login · API Error: 401 Invalid authentication credentials"}],"context_management":null},"requestId":"req_011CbRgADwFUygFMyevtB7zP","error":"authentication_failed","isApiErrorMessage":true,"apiErrorStatus":401,"userType":"external","entrypoint":"cli","cwd":"/Users/mike/code/agentusage","sessionId":"2164484b-e74a-4f26-b716-b80b44c4de61","version":"2.1.150","gitBranch":"main"}`;
   const match = matchApiError(JSON.parse(line));
   expect(match).not.toBeNull();
   expect(match?.kind).toBe("authentication_failed");

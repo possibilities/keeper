@@ -3312,7 +3312,7 @@ test("fresh openDb has git_status table for the git read surface", () => {
   db.close();
 });
 
-test("fresh openDb has the schema-v23 usage table for the agentuse read surface (fn-615)", () => {
+test("fresh openDb has the schema-v23 usage table for the agentusage read surface (fn-615)", () => {
   const { db } = openDb(":memory:");
   // Table exists, table_info shape matches the CREATE_USAGE literal.
   const cols = db.prepare("PRAGMA table_info(usage)").all() as {

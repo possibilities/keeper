@@ -155,15 +155,15 @@ session's claim when its captured `(blob_oid, committed_mode)` matches
 the file's current `(worktree_oid, worktree_mode)`, so a
 stage→re-edit→commit file (committed bytes != worktree bytes) STAYS
 attributed; the strict `orphan_files` bucket holds dirty files with
-zero attribution after the inference pass), `usage` (one row per agentuse profile observed
-at `~/.local/state/agentuse/<id>.json` — target, multiplier, session+week
+zero attribution after the inference pass), `usage` (one row per agentusage profile observed
+at `~/.local/state/agentusage/<id>.json` — target, multiplier, session+week
 percent and reset timestamps; schema v35 (fn-642) adds the colocated
 `last_rate_limit_at` + `last_rate_limit_session_id` columns, populated
 server-side by a bidirectional fan-out against the matching `profiles`
 row so a single-collection client sees both quota and rate-limit state
 together; schema v41 (fn-651) adds `rate_limit_lifts_at` — the soonest
 `resets_at` among windows at >=100% used (when a rate-limited profile
-actually unblocks, folded from agentuse's top-level `lift_at`) — and
+actually unblocks, folded from agentusage's top-level `lift_at`) — and
 `last_usage_fold_at`, a freshness stamp equal to the event `ts` of the
 last *successful* usage fold and never bumped by an idle/stale snapshot
 or the rate-limit fan-out; both ride the percentage path and are carved
@@ -1052,7 +1052,7 @@ event-log/reducer/hook touch. Run any of them with
   colocated the rate-limit annotation onto the `usage` row, dropping the
   prior dual-collection `usage` + `profiles` split). One
   `subscribeCollection` call over the `usage` collection (one row per
-  agentuse profile observed at `~/.local/state/agentuse/<id>.json`:
+  agentusage profile observed at `~/.local/state/agentusage/<id>.json`:
   target, multiplier, session+week percent + reset timestamps, plus the
   schema-v35 colocated `last_rate_limit_at` +
   `last_rate_limit_session_id` and the schema-v41 `rate_limit_lifts_at` +
@@ -1062,17 +1062,17 @@ event-log/reducer/hook touch. Run any of them with
   within the ±30s rounding gap; a past/NULL lift omits the line. As of
   fn-754 the gate is the future lift itself, NOT the fired-time
   `last_rate_limit_at`, so a depleted-but-quiet row (weekly 100%,
-  agentuse paused polling until its lift) still surfaces its countdown
+  agentusage paused polling until its lift) still surfaces its countdown
   instead of going blank. A v41 `stale Nm` line surfaces under any row
   whose stale anchor — `max(last_usage_fold_at, rate_limit_lifts_at)`
   (fn-754) — is older than the renderer's `STALENESS_THRESHOLD_MS`
   cutoff (currently ~15m); anchoring to the lift keeps a deliberately-
   idle producer (paused with a known resume time) from being misread as
   dead. Driven only off that anchor, never `updated_at` (a rate-limit
-  fold bumps that) and never agentuse's own `status` (which tracks its
+  fold bumps that) and never agentusage's own `status` (which tracks its
   scrape failures rather than keeper's ingestion health) — so a wedged
   usage worker becomes visible instead of silently frozen. Untracked
-  profiles (rate-limited but with no agentuse usage row) do not render.
+  profiles (rate-limited but with no agentusage usage row) do not render.
   Per-frame sidecars
   (`/tmp/keeper-usage.<pid>.{state,frame,diff}.<n>.*`, indexed via a meta
   sidecar) carry the row set so the JSON sidecar captures the full input
@@ -1841,7 +1841,7 @@ row, joined on the derived `profile_name = projectBasename(config_dir)`
 column (`profiles.profile_name = usage.id`). The forward direction
 lives in the `RateLimited` / `ApiError(kind='rate_limit')` arm — a
 pure UPDATE against `usage WHERE id = <profile_name>` (never UPSERT, so
-a rate-limit on a profile agentuse isn't tracking does NOT mint a
+a rate-limit on a profile agentusage isn't tracking does NOT mint a
 phantom usage row). The reverse direction lives in `projectUsageRow`:
 the existing UPSERT carves the two rate-limit columns OUT of the
 `ON CONFLICT(id) DO UPDATE SET` clause (so a re-snapshot can't clobber
@@ -1850,7 +1850,7 @@ the current state forward. The shared directional mapping helper pair
 (`usageIdForProfileName` / `profileNameForUsageId` in
 `src/epic-deps.ts`, schema v42/fn-662) translates keeper's `''`
 default-profile sentinel (default `~/.claude`, basename `""`) to
-agentuse's `"default"` usage id at the join boundary in both directions:
+agentusage's `"default"` usage id at the join boundary in both directions:
 forward `''` → `'default'` colocates a default-account rate limit onto
 `usage.default`; reverse `'default'` → `''` pulls the `''` profile
 row's annotation onto `usage.default` on a re-snapshot. The mapping
@@ -2294,8 +2294,8 @@ keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `80` (whitelist-only).
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`
-percentage path. `rate_limit_lifts_at TEXT` is folded from the agentuse
-envelope's new top-level `lift_at` field — agentuse computes it as the
+percentage path. `rate_limit_lifts_at TEXT` is folded from the agentusage
+envelope's new top-level `lift_at` field — agentusage computes it as the
 soonest `resets_at` among windows at >=100% used, the effective unblock
 instant; null when not over any limit. `last_usage_fold_at REAL` is the
 unix-seconds freshness stamp equal to the event `ts` of the last
@@ -2313,7 +2313,7 @@ percentage path owns them outright. The renderer compares the stale
 anchor — `max(last_usage_fold_at, rate_limit_lifts_at)` (fn-754) —
 against the wall clock to surface a staleness warning when ingestion
 has wedged, anchoring to the lift so a deliberately-idle producer
-(agentuse paused polling a maxed account until its lift, freezing the
+(agentusage paused polling a maxed account until its lift, freezing the
 fold stamp) is not misread as dead, and renders a `limited lifts in
 `<rel>`` countdown off `rate_limit_lifts_at` (`limited lifts now`
 within the ±30s gap; omitted when the lift is absent or already past —
@@ -2400,8 +2400,8 @@ The replace swaps only the `subscription` variable; the line stream's byte
 offsets are untouched, so the post-re-arm rescan re-anchors nothing and emits
 no phantom titles.
 
-A **fifth** Worker thread is the usage producer: it watches the agentuse
-daemon's flat leaf state directory (`~/.local/state/agentuse/`, one
+A **fifth** Worker thread is the usage producer: it watches the agentusage
+daemon's flat leaf state directory (`~/.local/state/agentusage/`, one
 `<id>.json` per profile) with `@parcel/watcher`, safe-parses each changed
 file, and posts a `usage-snapshot` message to main (and a `usage-deleted`
 tombstone when a file vanishes). Main — again the sole writer — turns each
@@ -2413,7 +2413,7 @@ the same descriptor + REGISTRY entry pattern as `git`. Freshness fields
 (`fetched_at` / `next_fetch_at` / `last_successful_fetch_at` /
 `last_skipped_fetch_at`) are read-and-discarded at the worker boundary and
 excluded from both the change-gate and the projection schema, so the ~90s
-agentuse fetch loop produces zero events when no content moved. Like the
+agentusage fetch loop produces zero events when no content moved. Like the
 transcript + plan producers, this is read-only / write-free, feeding the
 log only via main, and the watcher subscription is released in the
 worker's own shutdown handler. The producer also self-recovers from a
@@ -2978,7 +2978,7 @@ sqlite3 ~/.local/state/keeper/keeper.db \
 sqlite3 ~/.local/state/keeper/keeper.db \
   "SELECT project_dir, file_path, session_id, last_mutation_at, last_commit_at, worktree_oid, worktree_mode FROM file_attributions ORDER BY last_mutation_at DESC LIMIT 20"
 
-# Usage projection — one row per agentuse profile observed at ~/.local/state/agentuse/<id>.json (freshness fields are excluded by design — keeper has no freshness signal yet):
+# Usage projection — one row per agentusage profile observed at ~/.local/state/agentusage/<id>.json (freshness fields are excluded by design — keeper has no freshness signal yet):
 sqlite3 ~/.local/state/keeper/keeper.db \
   'SELECT * FROM usage ORDER BY target, id'
 

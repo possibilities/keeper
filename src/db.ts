@@ -103,7 +103,7 @@ const DEFAULT_PLAN_ROOTS = ["~/code"];
 
 const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 
-const DEFAULT_AGENTUSE_ROOT = "~/.local/state/agentuse";
+const DEFAULT_AGENTUSAGE_ROOT = "~/.local/state/agentusage";
 
 /** Mirrors `DEFAULT_EXEC_BACKEND` in `src/exec-backend.ts`. */
 const DEFAULT_EXEC_BACKEND = "tmux";
@@ -119,7 +119,7 @@ const VALID_EXEC_BACKENDS = new Set(["tmux"]);
 export interface KeeperConfig {
   roots: string[];
   claudeProjectsRoot?: string;
-  agentuseRoot?: string;
+  agentusageRoot?: string;
   // Buildbot master base URL (e.g. `http://localhost:8010`) for the `keeper
   // builds` dashboard's poller. Independent best-effort key with NO default:
   // absent/empty/garbage → undefined → the builds worker is not spawned.
@@ -165,7 +165,7 @@ export function resolveConfig(): KeeperConfig {
   const path = resolveConfigPath();
   let roots: string[] = [...DEFAULT_PLAN_ROOTS];
   let claudeProjectsRoot: string = DEFAULT_CLAUDE_PROJECTS_ROOT;
-  let agentuseRoot: string = DEFAULT_AGENTUSE_ROOT;
+  let agentusageRoot: string = DEFAULT_AGENTUSAGE_ROOT;
   // No default — absent leaves `buildbotUrl` undefined so the builds worker
   // never spawns.
   let buildbotUrl: string | undefined;
@@ -180,7 +180,7 @@ export function resolveConfig(): KeeperConfig {
       return {
         roots,
         claudeProjectsRoot,
-        agentuseRoot,
+        agentusageRoot,
         execBackend,
         maxConcurrentJobs,
         accountAliases,
@@ -201,9 +201,9 @@ export function resolveConfig(): KeeperConfig {
       if (typeof cpr === "string" && cpr.length > 0) {
         claudeProjectsRoot = cpr;
       }
-      const aur = (raw as { agentuse_root?: unknown }).agentuse_root;
+      const aur = (raw as { agentusage_root?: unknown }).agentusage_root;
       if (typeof aur === "string" && aur.length > 0) {
-        agentuseRoot = aur;
+        agentusageRoot = aur;
       }
       // Independent best-effort key — non-empty string only; garbage/absent
       // leaves `buildbotUrl` undefined and the builds worker un-spawned.
@@ -258,7 +258,7 @@ export function resolveConfig(): KeeperConfig {
     return {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
-      agentuseRoot: DEFAULT_AGENTUSE_ROOT,
+      agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
       execBackend: DEFAULT_EXEC_BACKEND,
       maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
       accountAliases: {},
@@ -267,7 +267,7 @@ export function resolveConfig(): KeeperConfig {
   return {
     roots,
     claudeProjectsRoot,
-    agentuseRoot,
+    agentusageRoot,
     buildbotUrl,
     dispatchPromptPrefix,
     execBackend,
@@ -335,12 +335,12 @@ export function resolveClaudeProjectsRoot(): string {
 }
 
 /**
- * Resolve the agentuse watch root to an absolute path. Tilde-expand only, NO
+ * Resolve the agentusage watch root to an absolute path. Tilde-expand only, NO
  * existence-filter (the usage-worker tolerates absence).
  */
 export function resolveUsageRoot(): string {
   const home = homedir();
-  const entry = resolveConfig().agentuseRoot ?? DEFAULT_AGENTUSE_ROOT;
+  const entry = resolveConfig().agentusageRoot ?? DEFAULT_AGENTUSAGE_ROOT;
   if (entry === "~") {
     return home;
   }
@@ -716,7 +716,7 @@ CREATE TABLE IF NOT EXISTS git_status (
 `;
 
 /**
- * `usage` projection table — one row per agentuse profile, folded from
+ * `usage` projection table — one row per agentusage profile, folded from
  * `UsageSnapshot` / `UsageDeleted` events via a single-row UPSERT.
  *
  * Freshness fields (`fetched_at` etc.) are intentionally absent: both this
@@ -3023,7 +3023,7 @@ function migrate(db: Database): void {
       // slot. NOT a reducer projection: the re-fold reset path MUST NOT touch it
       // (it records events that never made it into the log).
 
-      // v37→v38: project the agentuse envelope's status/subscription/error axes
+      // v37→v38: project the agentusage envelope's status/subscription/error axes
       // onto `usage`. `error_at` is projected but EXCLUDED from the worker
       // change-gate (it advances on every failed scrape, ~90s).
       addColumnIfMissing(db, "usage", "status", "TEXT");
@@ -3166,7 +3166,7 @@ function migrate(db: Database): void {
       db.run("DROP INDEX IF EXISTS idx_events_tool_name");
       db.run("DROP INDEX IF EXISTS idx_events_hook_tool");
 
-      // v41→v42: translate keeper's `''` default-profile sentinel ↔ agentuse's
+      // v41→v42: translate keeper's `''` default-profile sentinel ↔ agentusage's
       // `"default"` usage id at the join boundary so a default-account rate limit
       // colocates onto `usage.default`. No schema-shape change — the bump gates
       // the rewind that heals the stranded annotations (the fold output changed).
