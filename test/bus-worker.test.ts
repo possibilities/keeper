@@ -22,13 +22,16 @@ import {
   authoritativeFrom,
   backpressureDecision,
   enrichPeerFromJobs,
+  HARNESS_WALK_MAX_DEPTH,
   HEARTBEAT_EVICT_MS,
   HEARTBEAT_WARN_MS,
+  type JobIdentity,
   liveChannelsAtBoot,
   MAX_CLIENT_QUEUE,
   type RegistryEntry,
   reapDecision,
   requeueTail,
+  resolveHarnessIdentity,
   selectFanoutTargets,
   takeoverVictim,
 } from "../src/bus-worker";
@@ -263,6 +266,106 @@ test("enrichPeerFromJobs returns null on a keeper miss (resume-gap fallback path
   const { db } = freshMemDb();
   expect(enrichPeerFromJobs(db, 9999)).toBeNull();
   db.close();
+});
+
+// ---------------------------------------------------------------------------
+// resolveHarnessIdentity — server-side ancestry walk to the nearest pid keeper
+// tracks (the harness), rooted at the anti-spoof peer pid
+// ---------------------------------------------------------------------------
+
+function jobIdentity(over: Partial<JobIdentity> = {}): JobIdentity {
+  return {
+    job_id: "sess-1",
+    pid: 5000,
+    start_time: "t1",
+    title: "alice",
+    name_history: ["alice"],
+    ...over,
+  };
+}
+
+test("resolveHarnessIdentity climbs from the watcher peer pid to the nearest ancestor with a jobs row", () => {
+  // peer (watch subprocess) → zsh → claude harness. Only the harness has a job.
+  const parents: Record<number, number> = { 300: 200, 200: 100, 100: 1 };
+  const jobs: Record<number, JobIdentity> = {
+    100: jobIdentity({ pid: 100, title: "harness" }),
+  };
+  const res = resolveHarnessIdentity(
+    300,
+    (p) => parents[p] ?? null,
+    (p) => jobs[p] ?? null,
+  );
+  expect(res).not.toBeNull();
+  expect(res?.pid).toBe(100);
+  expect(res?.identity.title).toBe("harness");
+});
+
+test("resolveHarnessIdentity prefers the NEAREST ancestor when multiple have jobs rows", () => {
+  // Both the peer and a grandparent have rows; the nearest (the peer itself) wins.
+  const parents: Record<number, number> = { 300: 200, 200: 100 };
+  const jobs: Record<number, JobIdentity> = {
+    300: jobIdentity({ pid: 300, title: "near" }),
+    100: jobIdentity({ pid: 100, title: "far" }),
+  };
+  const res = resolveHarnessIdentity(
+    300,
+    (p) => parents[p] ?? null,
+    (p) => jobs[p] ?? null,
+  );
+  expect(res?.pid).toBe(300);
+  expect(res?.identity.title).toBe("near");
+});
+
+test("resolveHarnessIdentity returns null when no ancestor has a jobs row (resume gap)", () => {
+  const parents: Record<number, number> = { 300: 200, 200: 100, 100: 1 };
+  const res = resolveHarnessIdentity(
+    300,
+    (p) => parents[p] ?? null,
+    () => null,
+  );
+  expect(res).toBeNull();
+});
+
+test("resolveHarnessIdentity terminates at pid 1 / a missing parent without looping", () => {
+  // getPpid returns null after the first hop — the walk must stop, not spin.
+  let calls = 0;
+  const res = resolveHarnessIdentity(
+    300,
+    () => {
+      calls++;
+      return null;
+    },
+    () => null,
+  );
+  expect(res).toBeNull();
+  expect(calls).toBe(1);
+});
+
+test("resolveHarnessIdentity stops at the depth bound on a pathological chain", () => {
+  // A chain longer than the bound with no jobs row: the walk caps at maxDepth
+  // lookups and returns null rather than walking forever.
+  let lookups = 0;
+  const res = resolveHarnessIdentity(
+    1_000_000,
+    (p) => p - 1, // strictly-decreasing parent, never null, all > 1
+    () => {
+      lookups++;
+      return null;
+    },
+    HARNESS_WALK_MAX_DEPTH,
+  );
+  expect(res).toBeNull();
+  expect(lookups).toBe(HARNESS_WALK_MAX_DEPTH);
+});
+
+test("resolveHarnessIdentity treats a self-parent as a terminal (no infinite loop)", () => {
+  // ps occasionally reports ppid == pid for an orphaned/init-adopted process.
+  const res = resolveHarnessIdentity(
+    300,
+    () => 300, // parent == pid
+    () => null,
+  );
+  expect(res).toBeNull();
 });
 
 // ---------------------------------------------------------------------------

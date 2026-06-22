@@ -25,7 +25,9 @@ import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { main as busMain } from "../cli/bus";
+import { openBusDb } from "../src/bus-db";
 import type { BusWorkerData } from "../src/bus-worker";
+import { openDb } from "../src/db";
 import { retryUntil } from "./helpers/retry-until";
 import { freshDbFile } from "./helpers/template-db";
 
@@ -68,6 +70,38 @@ beforeEach(() => {
     );
   seeded.close();
 });
+
+/**
+ * Seed a keeper job keyed on THIS TEST PROCESS pid — the live-registration
+ * proof. Used ONLY by the harness-resolution tests (the distinct-agents tests
+ * deliberately MISS peer-pid enrichment so two same-process clients stay
+ * distinct, so this row must NOT live in the shared seed). A client connecting
+ * from this process resolves its peer pid to process.pid, and
+ * resolveHarnessIdentity finds this row at the walk root (depth 0), so the
+ * channel adopts "harness-live" + sess-harness — the harness-resolution +
+ * enrichment path the pure unit tests can't exercise over a real socket.
+ */
+function seedHarnessJob(): void {
+  // Reopen the on-disk db (migrate:false — already migrated by the beforeEach
+  // template write) and add the row alongside the shared seed.
+  const kdb = openDb(dbPath, { migrate: false });
+  kdb.db
+    .query(
+      `INSERT INTO jobs (job_id, created_at, updated_at, state, pid, start_time, title, name_history)
+       VALUES (?, ?, ?, 'running', ?, ?, ?, ?)`,
+    )
+    .run(
+      "sess-harness",
+      1,
+      20,
+      process.pid,
+      "t-harness-job",
+      "harness-live",
+      JSON.stringify(["harness-old", "harness-live"]),
+    );
+  kdb.db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  kdb.db.close();
+}
 
 afterEach(async () => {
   if (worker) {
@@ -447,6 +481,102 @@ test("CLI `keeper bus resolve` resolves a FORMER name to the live identity", asy
   expect(body.channel_id).toBeTruthy();
 
   bob.socket.end();
+});
+
+test("live registration resolves the channel identity to the keeper HARNESS title, not the bare connecting pid", async () => {
+  seedHarnessJob();
+  await bootBus();
+  // The watch client sends NO name/session_id — identity is server-resolved from
+  // the peer pid's ancestry. The peer pid here is this test process, which has a
+  // seeded jobs row (sess-harness / "harness-live"), so the channel must adopt it.
+  const watcher = await connectClient();
+  watcher.send({ op: "register", namespace: "chat" });
+  const reg = await waitFrame(
+    watcher.frames,
+    (f) => f.type === "ack" && f.op === "register",
+  );
+  expect(reg).not.toBeNull();
+  // The register ack already carries the harness-resolved identity.
+  expect(reg?.name).toBe("harness-live");
+  expect(reg?.session_id).toBe("sess-harness");
+  watcher.send({ op: "subscribe", namespaces: ["chat"] });
+  await waitFrame(
+    watcher.frames,
+    (f) => f.type === "ack" && f.op === "subscribe",
+  );
+
+  // `keeper bus list` shows the channel with its HARNESS title (not null).
+  const listed = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+    name?: string;
+    session_id?: string;
+    pid?: number;
+  }>;
+  const ch = listed.find((c) => c.name === "harness-live");
+  expect(ch).toBeDefined();
+  expect(ch?.session_id).toBe("sess-harness");
+  expect(ch?.pid).toBe(process.pid);
+
+  // Reachable by a FORMER name (jobs.name_history) — resolves to the same channel.
+  const byFormer = JSON.parse(
+    (await runBusCli(["resolve", "harness-old"])).stdout,
+  ) as { kind?: string; channel_id?: string | null };
+  expect(byFormer.kind).toBe("ok");
+  expect(byFormer.channel_id).toBeTruthy();
+
+  watcher.socket.end();
+});
+
+test("live registration: a harness-resolved channel's published `from` carries the harness identity", async () => {
+  seedHarnessJob();
+  await bootBus();
+  // ONE client; it resolves to the harness, subscribes to a namespace it does
+  // NOT publish into, then broadcasts on `chat`. We can't add a SECOND distinct
+  // same-process receiver (every in-process peer resolves to the SAME harness
+  // identity → takeover), so we read the harness `from` off the message the
+  // server persists for the broadcast (which is fanned to no one but recorded).
+  const sender = await connectClient();
+  sender.send({ op: "register", namespace: "chat" });
+  const reg = await waitFrame(
+    sender.frames,
+    (f) => f.type === "ack" && f.op === "register",
+  );
+  expect(reg?.name).toBe("harness-live");
+  sender.send({ op: "subscribe", namespaces: ["chat"] });
+  await waitFrame(
+    sender.frames,
+    (f) => f.type === "ack" && f.op === "subscribe",
+  );
+
+  // A directed send to the channel's OWN former name routes back to itself, but
+  // the sender is never echoed — so assert the persisted `from` via the message
+  // log instead: a send to a CURRENT-name target the resolver finds (its own
+  // current name) records a delivered row with the harness from-identity.
+  sender.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "harness-live",
+    payload: { media_type: "text/plain", text: "self" },
+  });
+  // The persisted message carries the harness from_* fields. Read them from the
+  // sandboxed bus.db (the durable message log).
+  const busDb = openBusDb(busDbPath);
+  const row = await retryUntil(
+    () =>
+      (busDb
+        .query(
+          "SELECT from_pid, from_name FROM messages WHERE body = 'self' ORDER BY id DESC LIMIT 1",
+        )
+        .get() as { from_pid?: number; from_name?: string } | null) ?? null,
+    3000,
+    25,
+  );
+  expect(row).not.toBeNull();
+  expect(row?.from_name).toBe("harness-live");
+  expect(row?.from_pid).toBe(process.pid);
+  busDb.close();
+
+  sender.socket.end();
 });
 
 test("shutdown releases the socket + lock", async () => {

@@ -28,9 +28,12 @@
  * the `last_message_id` replay cursor.
  *
  * Anti-spoof: the server resolves the connecting peer's pid via `peerPidForFd`
- * (authoritative LOCAL_PEERPID), enriches it from keeper.db `jobs`, and
- * OVERWRITES the sender-claimed `from` with the peer-resolved identity. A client
- * cannot forge another agent's `from`.
+ * (authoritative LOCAL_PEERPID), walks its ancestry to the nearest pid keeper
+ * tracks (the Claude harness — the peer is the `keeper bus watch` subprocess two
+ * hops below it), enriches THAT pid from keeper.db `jobs`, and OVERWRITES the
+ * sender-claimed `from` with the harness-resolved identity. Because the walk
+ * roots at the server-resolved peer pid, a client cannot forge an identity it is
+ * not descended from.
  */
 
 import type { Database } from "bun:sqlite";
@@ -395,6 +398,80 @@ export function enrichPeerFromJobs(
 }
 
 // ---------------------------------------------------------------------------
+// Harness identity resolution (server-side ancestry walk, anti-spoof-preserving)
+// ---------------------------------------------------------------------------
+
+/** Ancestry-walk depth bound (matches chatctl's `identity.py` walk). */
+export const HARNESS_WALK_MAX_DEPTH = 40;
+
+/** Resolved harness identity: the ancestor pid keeper tracks + its job row. */
+export interface HarnessIdentity {
+  /** The ancestor pid that has a keeper `jobs` row — the Claude harness. */
+  pid: number;
+  /** That ancestor's keeper-resolved identity. */
+  identity: JobIdentity;
+}
+
+/**
+ * Walk a connecting peer's pid up its ancestry and return the NEAREST ancestor
+ * (the peer pid itself counts) that has a keeper.db `jobs` row — keeper only
+ * tracks Claude HARNESS pids, so the nearest ancestor keeper knows IS the
+ * harness. The `keeper bus watch` client is two hops below its harness (harness
+ * → zsh → watch), so enriching the bare peer pid always missed; this lifts the
+ * identity to the real session.
+ *
+ * ANTI-SPOOF: the walk roots at the SERVER-resolved peer pid (never a
+ * client-supplied pid), so a client can only resolve to an ancestor it is
+ * actually descended from — it cannot claim a harness pid it does not belong to.
+ *
+ * Pure relative to the injected `getPpid` (parent-pid probe) and `lookupJobs`
+ * (keeper.db enrichment) so it unit-tests deterministically. Returns null on the
+ * resume-gap case (no ancestor within the depth bound has a jobs row) — the
+ * caller falls back to the client-provided floor identity exactly as before.
+ */
+export function resolveHarnessIdentity(
+  peerPid: number,
+  getPpid: (pid: number) => number | null,
+  lookupJobs: (pid: number) => JobIdentity | null,
+  maxDepth = HARNESS_WALK_MAX_DEPTH,
+): HarnessIdentity | null {
+  let pid = peerPid;
+  for (let depth = 0; depth < maxDepth; depth++) {
+    if (pid <= 1) break; // pid 0 (kernel) / 1 (init) are never a harness
+    const identity = lookupJobs(pid);
+    if (identity !== null) return { pid, identity };
+    const parent = getPpid(pid);
+    if (parent === null || parent === pid) break;
+    pid = parent;
+  }
+  return null;
+}
+
+/**
+ * Parent pid of `pid` via `ps -o ppid=` (macOS has no /proc). Synchronous and
+ * bounded — registrations are infrequent, so a per-register `ps` per ancestry
+ * hop is fine. Returns null on any failure (unknown pid, ps unavailable, parse
+ * miss) so the ancestry walk terminates gracefully. A process-state read in the
+ * worker, like `isPidAlive` — the producer-side process-state precedent.
+ */
+export function ppidViaPs(pid: number): number | null {
+  if (pid <= 0) return null;
+  try {
+    const res = Bun.spawnSync(["ps", "-o", "ppid=", "-p", String(pid)], {
+      stdout: "pipe",
+      stderr: "ignore",
+    });
+    if (!res.success) return null;
+    const raw = res.stdout.toString().trim();
+    if (raw.length === 0) return null;
+    const parsed = Number.parseInt(raw, 10);
+    return Number.isFinite(parsed) && parsed >= 0 ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+
+// ---------------------------------------------------------------------------
 // Worker runtime (lifecycle) — only inside a real Worker
 // ---------------------------------------------------------------------------
 
@@ -602,14 +679,30 @@ export function startBusServer(
     conn: BusConnState,
     op: Extract<ClientOp, { op: "register" }>,
   ): void => {
-    // Anti-spoof: the pid is the PEER pid, never the client-claimed one.
+    // Anti-spoof: the pid is the PEER pid, never the client-claimed one. The
+    // peer is the `keeper bus watch` subprocess (harness → zsh → watch), so we
+    // resolve the channel's IDENTITY from the nearest ancestor keeper tracks —
+    // the Claude harness — rooting the walk at the server-resolved peer pid so a
+    // client cannot forge an identity it is not descended from.
     const peerPid = conn.peerPid ?? op.pid ?? 0;
-    const enriched = peerPid > 0 ? enrichPeerFromJobs(keeperDb, peerPid) : null;
+    const harness =
+      peerPid > 0
+        ? resolveHarnessIdentity(peerPid, ppidViaPs, (p) =>
+            enrichPeerFromJobs(keeperDb, p),
+          )
+        : null;
+    const enriched = harness?.identity ?? null;
+    // The channel's identity pid is the resolved HARNESS pid (stable across a
+    // `/clear`, and what keeper's liveness/takeover keys must track); on a keeper
+    // miss (resume gap) it falls back to the bare peer pid.
+    const identityPid = harness?.pid ?? peerPid;
     // keeper miss → fall back to the client-provided floor name/session (resume
     // gap before keeper folds the new session).
     const sessionId = enriched?.job_id ?? op.session_id ?? null;
+    // Pair the resolved pid with its keeper start_time (pid-reuse defense); the
+    // jobs-row start_time on a hit, else the client floor / a synthetic stamp.
     const startTime =
-      enriched?.start_time ?? op.start_time ?? `${peerPid}-${Date.now()}`;
+      enriched?.start_time ?? op.start_time ?? `${identityPid}-${Date.now()}`;
     const name = enriched?.title ?? op.name ?? null;
     const history =
       enriched && enriched.name_history.length > 0
@@ -623,7 +716,7 @@ export function startBusServer(
     // Takeover: a prior live channel for the SAME (pid, start_time) is superseded.
     const victim = takeoverVictim(
       registryList(),
-      peerPid,
+      identityPid,
       startTime,
       channelId,
     );
@@ -642,7 +735,7 @@ export function startBusServer(
 
     const channel: ChannelRow = {
       channel_id: channelId,
-      pid: peerPid,
+      pid: identityPid,
       start_time: startTime,
       session_id: sessionId,
       current_name: name,
