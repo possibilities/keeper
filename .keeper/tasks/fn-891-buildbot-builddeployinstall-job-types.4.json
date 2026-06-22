@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "max",
   "title": "Gate mermaidctl-deploy on green build + mermaidctl changes",
-  "updated_at": "2026-06-22T17:44:14.768000Z"
+  "updated_at": "2026-06-22T18:44:25.406000Z",
+  "worker_done_at": "2026-06-22T18:44:25.406000Z"
 }

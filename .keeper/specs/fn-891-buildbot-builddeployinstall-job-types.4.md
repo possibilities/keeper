@@ -51,5 +51,5 @@ checkconfig. Reason through all three cases against the gate: green+mermaidctlâ†
 - [ ] `buildbot checkconfig` passes
 
 ## Done summary
-
+Green-gated mermaidctl deploy on arthack's CI build: converted the deploy to a Triggerable fired by a trailing gated Trigger step at the end of arthack's build factory, whose doStepIf deploys only when the build is GREEN and changes touched apps/mermaidctl/**. ForceScheduler manual-deploy path preserved; checkconfig green.
 ## Evidence
