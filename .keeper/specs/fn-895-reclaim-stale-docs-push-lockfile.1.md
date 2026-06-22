@@ -32,5 +32,5 @@ reclaim failure must skip, not throw.
 - [ ] The hook still always exits 0 and never rebases / force-pushes.
 
 ## Done summary
-
+Made the ~/docs push lock self-reclaiming: pid-stamp on acquire, reclaim when the holder pid is gone or the lock is older than 60s (>GIT_TIMEOUT_MS), log a locked skip, and fix the misleading self-heal comment. Added reclaim-path tests against a real initRepo fixture.
 ## Evidence
