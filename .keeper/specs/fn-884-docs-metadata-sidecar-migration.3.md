@@ -28,5 +28,5 @@ Update the canonical snippet body: the open command becomes `gh gist create <doc
 - [ ] `keeper prompt render source-dirs/docs-dir-and-gist-open` reflects the change
 
 ## Done summary
-
+Updated docs-dir-and-gist-open snippet: open command is now gh gist create <doc>.md <doc>.yaml --web with metadata living only in the .yaml sidecar; regenerated _index.yaml summary to match.
 ## Evidence
