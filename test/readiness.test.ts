@@ -3747,3 +3747,55 @@ test("PENDING_DISPATCH_STALE_CEILING_SEC is 2× the TTL (240s) — pure backstop
   // cadence so the 60s sweep always DELETEs the row before this exclusion fires.
   expect(PENDING_DISPATCH_STALE_CEILING_SEC).toBe(240);
 });
+
+// ---------------------------------------------------------------------------
+// fn-897 B1: unseeded git surface → every row UNKNOWN (never dispatch)
+// ---------------------------------------------------------------------------
+
+test("fn-897 B1: gitSeedRequired=true forces every task + close row to blocked:unknown", () => {
+  const t1 = makeTask({ task_id: "fn-1-foo.1", worker_phase: "open" });
+  const t2 = makeTask({ task_id: "fn-1-foo.2", worker_phase: "open" });
+  const epic = makeEpic({ tasks: [t1, t2] });
+  // Seeded (default): the tasks compute their normal verdicts (at least one ready).
+  const seeded = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    undefined,
+    false,
+  );
+  expect(seeded.perTask.get("fn-1-foo.1")).not.toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+
+  // Unseeded: EVERY row is forced to blocked:unknown so the autopilot dispatches
+  // nothing against a not-yet-seeded git surface.
+  const unseeded = computeReadiness(
+    [epic],
+    new Map(),
+    [],
+    new Map(),
+    Number.NEGATIVE_INFINITY,
+    [],
+    undefined,
+    true,
+  );
+  expect(unseeded.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+  expect(unseeded.perTask.get("fn-1-foo.2")).toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+  expect(unseeded.perCloseRow.get("fn-1-foo")).toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+  // The epic header rolls up to blocked too (no ready/running row left).
+  expect(unseeded.perEpic.get("fn-1-foo")?.tag).toBe("blocked");
+});
