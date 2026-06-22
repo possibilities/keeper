@@ -39,5 +39,5 @@ Widen the hooks.json PostToolUse matcher to include Edit/MultiEdit (it is Write+
 - [ ] tests pass; `bun run test:full` green
 
 ## Done summary
-
+Ported the plan committer dep-free into src/doc-commit.ts (timeout-bounded git, ~4-attempt retry, gpgsign off, mid-operation + detached-HEAD guards) and wired it fail-open into the sidecar-writer hook: Write commits doc+sidecar, Edit/MultiEdit commit the .md, rm/mv/git-rm commit deletes. Widened the PostToolUse matcher to Edit/MultiEdit.
 ## Evidence
