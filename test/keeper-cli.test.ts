@@ -251,7 +251,7 @@ describe("cli/dispatch resolvePlanCwd", () => {
         },
       ],
     });
-    const res = await resolvePlanCwd(q, "work", "fn-1-foo.2");
+    const res = await resolvePlanCwd(q, "work", "fn-1-foo.2", () => true);
     expect(res).toEqual({ ok: true, cwd: "/task/repo" });
   });
 
@@ -265,7 +265,7 @@ describe("cli/dispatch resolvePlanCwd", () => {
         },
       ],
     });
-    const res = await resolvePlanCwd(q, "work", "fn-1-foo.2");
+    const res = await resolvePlanCwd(q, "work", "fn-1-foo.2", () => true);
     expect(res).toEqual({ ok: true, cwd: "/epic/dir" });
   });
 
@@ -273,8 +273,32 @@ describe("cli/dispatch resolvePlanCwd", () => {
     const q = stubQuery({
       epics: [{ epic_id: "fn-1-foo", project_dir: "/epic/dir", tasks: [] }],
     });
-    const res = await resolvePlanCwd(q, "close", "fn-1-foo");
+    const res = await resolvePlanCwd(q, "close", "fn-1-foo", () => true);
     expect(res).toEqual({ ok: true, cwd: "/epic/dir" });
+  });
+
+  test("work: resolved cwd missing on disk → cwd-missing miss (not a silent launch)", async () => {
+    const q = stubQuery({
+      epics: [
+        {
+          epic_id: "fn-1-foo",
+          project_dir: "/epic/dir",
+          tasks: [{ task_id: "fn-1-foo.2", target_repo: "/renamed-away" }],
+        },
+      ],
+    });
+    const res = await resolvePlanCwd(q, "work", "fn-1-foo.2", () => false);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe("cwd-missing: /renamed-away");
+  });
+
+  test("close: resolved cwd missing on disk → cwd-missing miss", async () => {
+    const q = stubQuery({
+      epics: [{ epic_id: "fn-1-foo", project_dir: "/renamed-away", tasks: [] }],
+    });
+    const res = await resolvePlanCwd(q, "close", "fn-1-foo", () => false);
+    expect(res.ok).toBe(false);
+    if (!res.ok) expect(res.error).toBe("cwd-missing: /renamed-away");
   });
 
   test("unknown epic id → not-found miss (distinct from unreachable)", async () => {
@@ -438,7 +462,12 @@ interface MainRun {
 /** Drive `dispatchMain(argv, deps)` with process.{exit,stdout,stderr} captured. */
 async function runMain(
   argv: string[],
-  deps?: { query?: QueryFn; launch?: LaunchFn; promptPrefix?: string },
+  deps?: {
+    query?: QueryFn;
+    launch?: LaunchFn;
+    promptPrefix?: string;
+    dirExists?: (dir: string) => boolean;
+  },
 ): Promise<MainRun> {
   const out: string[] = [];
   const err: string[] = [];
@@ -710,7 +739,12 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
       );
     const r = await runMain(
       ["work::fn-1-foo.2", "--session", "scratch", "--force", "--dry-run"],
-      { query, launch: launch.fn, promptPrefix: "/hack" },
+      {
+        query,
+        launch: launch.fn,
+        promptPrefix: "/hack",
+        dirExists: () => true,
+      },
     );
     expect(r.code).toBe(0);
     expect(r.stdout).not.toContain("/hack");
@@ -732,7 +766,7 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
       );
     const r = await runMain(
       ["work::fn-1-foo.2", "--session", "scratch", "--force", "--dry-run"],
-      { query, launch: launch.fn },
+      { query, launch: launch.fn, dirExists: () => true },
     );
     expect(r.code).toBe(0);
     expect(launch.calls).toEqual([]);
@@ -786,10 +820,35 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
       );
     const r = await runMain(
       ["work::fn-1-foo.2", "--session", "scratch", "--force"],
-      { query, launch: launch.fn },
+      { query, launch: launch.fn, dirExists: () => true },
     );
     expect(r.code).toBeUndefined();
     expect(launch.calls[0]?.spec?.claudeName).toBe("work::fn-1-foo.2");
+  });
+
+  test("plan-form dispatch into a renamed-away cwd exits non-zero with cwd-missing", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const query: QueryFn = (collection) =>
+      Promise.resolve(
+        collection === "epics"
+          ? [
+              {
+                epic_id: "fn-1-foo",
+                project_dir: "/epic/dir",
+                tasks: [
+                  { task_id: "fn-1-foo.2", target_repo: "/renamed-away" },
+                ],
+              },
+            ]
+          : [],
+      );
+    const r = await runMain(
+      ["work::fn-1-foo.2", "--session", "scratch", "--force"],
+      { query, launch: launch.fn, dirExists: () => false },
+    );
+    expect(r.code).toBe(1);
+    expect(r.stderr).toContain("cwd-missing: /renamed-away");
+    expect(launch.calls).toEqual([]);
   });
 });
 

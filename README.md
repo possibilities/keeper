@@ -1011,7 +1011,17 @@ event-log/reducer/hook touch. Run any of them with
   `epics` projection (read-only, via `cli/control-rpc.ts`'s one-shot
   `queryCollection`) and bakes `--name <verb>::<id>` so the SessionStart hook
   binds a board-visible `jobs` row, and a **free form** (`--prompt` /
-  `--prompt-file`) for an arbitrary prompt. In free form `--name` is OPTIONAL and
+  `--prompt-file`) for an arbitrary prompt. The plan-form resolver FAILS LOUD on
+  a resolved cwd that no longer exists on disk (typically a renamed-away repo
+  dir): it exits 1 with `cwd-missing: <path>` instead of launching a worker into
+  a stale path that silently never runs — the server-side reconciler mirrors
+  this, marking the task blocked-with-reason via a sticky `cwd-missing`
+  `dispatch_failures` row (no new projection column; unrelated epics keep
+  dispatching). The on-disk stat lives in the PRODUCER paths only (the CLI
+  resolver + the autopilot launch arm), never in a fold, so re-fold determinism
+  holds. Remediation for both: `keeper plan mv-repo <old> <new>` rewrites the
+  board's `primary_repo` / `target_repo` / `touched_repos`, then re-dispatch (or
+  `keeper autopilot retry`). In free form `--name` is OPTIONAL and
   a pure pass-through — when supplied it is forwarded verbatim as `claude --name
   <value>` (no keeper-side labeling/correlation/tab-renaming); when omitted no
   `--name` is passed at all. (Note: keeper's SessionStart hook still scrapes any

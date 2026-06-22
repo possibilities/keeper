@@ -165,7 +165,7 @@ on your own.** Offer the two options:
 | Exit | Meaning | Your action |
 |---|---|---|
 | 0 | Dispatched (or `--dry-run` previewed). | Surface the `dispatched …` line. |
-| 1 | Resolution / launch failure (`die`). | Read the `dispatch: …` message. **Distinguish:** an unknown-id / not-on-board failure (`no epic '…' in the board`, `no task '…' under epic '…'`, empty-cwd) means the target is wrong — re-check the id. A daemon-unreachable failure (`cannot reach daemon to resolve cwd (…)`) means keeperd is down — surface that. The race-guard refusal is also exit 1 — handle it via Step 3's surface-and-ask. |
+| 1 | Resolution / launch failure (`die`). | Read the `dispatch: …` message. **Distinguish:** an unknown-id / not-on-board failure (`no epic '…' in the board`, `no task '…' under epic '…'`, empty-cwd) means the target is wrong — re-check the id. A `cwd-missing: <path>` failure means the resolved repo dir no longer exists on disk (typically a renamed-away repo) — fix with `keeper plan mv-repo <old> <new>` (rewrites the board's `primary_repo` / `target_repo` / `touched_repos`), then re-dispatch. A daemon-unreachable failure (`cannot reach daemon to resolve cwd (…)`) means keeperd is down — surface that. The race-guard refusal is also exit 1 — handle it via Step 3's surface-and-ask. |
 | 2 | Arg fault. | Mode misuse (both forms, or neither), a malformed `<verb>::<id>` key, or the prompt cap (NUL byte / over 96 KB) — for a large prompt, route it to `--prompt-file`. |
 
 ## Examples

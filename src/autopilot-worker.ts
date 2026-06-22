@@ -35,6 +35,7 @@
  * persisting it would survive a restart in a way that contradicts the invariant.
  */
 
+import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
@@ -560,6 +561,16 @@ export interface ConfirmRunningDeps {
   ): FoundJob | null;
   /** Producer-side wall-clock for the reconcile-time `ts` stamp. */
   now(): number;
+  /**
+   * Producer-side on-disk existence probe for a launch cwd (defaults to
+   * `existsSync` in `runReconcileCycle` when absent). A resolved cwd that no
+   * longer exists — typically a renamed-away repo dir — mints a sticky
+   * `cwd-missing: <path>` `DispatchFailed` instead of launching into a stale
+   * path that silently never runs (remediation: `keeper plan mv-repo`). This is
+   * a PRODUCER read by contract — it lives in `runReconcileCycle`, never in a
+   * `reconcile`/fold arm, so re-fold determinism holds.
+   */
+  dirExists?(dir: string): boolean;
   /**
    * Sleep `ms`, abortable via the worker's shutdown signal. Resolves
    * early when `signal.aborted` flips; the caller checks the flag and
@@ -1260,6 +1271,25 @@ export async function runReconcileCycle(
       // double-queue. Skip to keep one-at-a-time honest.
       continue;
     }
+    // Fail-loud on a stale (renamed-away) launch cwd. The resolved cwd is
+    // stamped into `plan.cwd` by the pure `reconcile`; the on-disk stat lives
+    // HERE in the producer (never in a fold) so re-fold determinism holds. A
+    // missing dir mints a sticky `cwd-missing: <path>` `DispatchFailed` via the
+    // EXISTING dispatch-failure surface (no new projection column) — the key is
+    // suppressed until a `retry_dispatch` clears it, and unrelated launches in
+    // this same loop keep dispatching (per-key block, not a queue stall).
+    // Remediation: `keeper plan mv-repo <old> <new>`.
+    const dirExists = deps.dirExists ?? existsSync;
+    if (!dirExists(plan.cwd)) {
+      deps.emitDispatchFailed({
+        verb: plan.verb,
+        id: plan.id,
+        reason: `cwd-missing: ${plan.cwd}`,
+        dir: plan.cwd,
+        ts: deps.now(),
+      });
+      continue;
+    }
     state.inFlight.add(plan.key);
     // STAMP the cooldown at the SAME point as `inFlight.add`, BEFORE the confirm
     // await, so it covers BOTH the `ok` AND the `indoubt` outcomes — gating on
@@ -1866,6 +1896,10 @@ function main(): void {
       return row ?? null;
     },
     now: () => Math.floor(Date.now() / 1000),
+    // Producer-side cwd existence probe — fail-loud on a renamed-away launch
+    // dir (`cwd-missing` DispatchFailed) instead of a silent skip. Runs on the
+    // worker but only on the reconcile/confirm path, never in a fold.
+    dirExists: (dir) => existsSync(dir),
     sleep: (ms, signal) => abortableSleep(ms, signal),
     recordTimeoutBackstop,
   };

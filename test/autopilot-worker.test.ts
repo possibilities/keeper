@@ -247,6 +247,13 @@ interface FakeDepsOptions {
    *   never-resolving ack (the ack-timeout abort) or a deferred resolve.
    */
   dispatchedAck?: DispatchedAck | (() => Promise<DispatchedAck>);
+  /**
+   * Producer-side cwd existence probe. Tests use fixture paths like `/epic/dir`
+   * that never exist on disk, so the default is `() => true` (every cwd present)
+   * — pass `() => false` (or a per-path predicate) to drive the `cwd-missing`
+   * block-with-reason branch in `runReconcileCycle`.
+   */
+  dirExists?: (dir: string) => boolean;
 }
 
 function makeFakeDeps(opts: FakeDepsOptions = {}): {
@@ -307,6 +314,7 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
       return null;
     },
     now: nowFn,
+    dirExists: opts.dirExists ?? (() => true),
     async sleep(ms, signal) {
       // Synchronous-ish microtask sleep so tests don't spin real time.
       // Honor abort: a pre-aborted signal resolves immediately.
@@ -2419,6 +2427,65 @@ test("runReconcileCycle: two launches serialize one-at-a-time (fn-644 stagger)",
   ]);
   // Both promoted to live.
   expect(liveDispatches.size).toBe(2);
+});
+
+test("fn-887 runReconcileCycle: a missing launch cwd is blocked-with-reason (cwd-missing) and NOT launched, while a sibling epic with a valid cwd still dispatches", async () => {
+  // A renamed-away repo dir must fail LOUD via the existing dispatch-failure
+  // surface (sticky `cwd-missing: <path>` DispatchFailed) instead of silently
+  // never running — and the block is per-task, so an unrelated sibling epic in
+  // a present dir keeps dispatching.
+  const present = "/repo-present";
+  const missing = "/repo-renamed-away";
+  const { deps, log, setJobByKey } = makeFakeDeps({
+    dirExists: (dir) => dir === present,
+  });
+  setJobByKey("work", "fn-2-bar.1", { job_id: "j-2", last_event_id: 201 });
+
+  const epicMissing = makeEpic({
+    epic_id: "fn-1-foo",
+    project_dir: missing,
+    tasks: [makeTask({ task_id: "fn-1-foo.1", epic_id: "fn-1-foo" })],
+    sort_path: "000001",
+  });
+  const epicPresent = makeEpic({
+    epic_id: "fn-2-bar",
+    epic_number: 2,
+    project_dir: present,
+    tasks: [
+      makeTask({ task_id: "fn-2-bar.1", epic_id: "fn-2-bar", task_number: 1 }),
+    ],
+    sort_path: "000002",
+  });
+  const snap = makeSnapshot({ epics: [epicMissing, epicPresent] });
+  const state = makeState();
+  const liveDispatches = new Map<string, LiveDispatch>();
+  const decision = reconcile(snap, state, 0);
+  expect(decision.launches.length).toBe(2);
+
+  const ctrl = new AbortController();
+  await runReconcileCycle(
+    decision,
+    state,
+    liveDispatches,
+    "/bin/zsh",
+    ctrl.signal,
+    deps,
+  );
+
+  // The missing-cwd task minted a sticky cwd-missing DispatchFailed and never
+  // launched; the present sibling dispatched and promoted to live.
+  expect(log.emissions).toHaveLength(1);
+  expect(log.emissions[0]).toMatchObject({
+    verb: "work",
+    id: "fn-1-foo.1",
+    reason: `cwd-missing: ${missing}`,
+    dir: missing,
+  });
+  expect(log.launches.map((l) => l.name)).toEqual(["work::fn-2-bar.1"]);
+  expect(liveDispatches.has("work::fn-1-foo.1")).toBe(false);
+  expect(liveDispatches.has("work::fn-2-bar.1")).toBe(true);
+  // The blocked key never entered the in-flight set (no slot held).
+  expect(state.inFlight.has("work::fn-1-foo.1")).toBe(false);
 });
 
 test("runReconcileCycle: a tiered `work` task launches directly — no work-plugin manifest gate (fn-10)", async () => {

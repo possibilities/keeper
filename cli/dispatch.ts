@@ -39,7 +39,7 @@
  * lock; `--force` skips it entirely.
  */
 
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
 import {
   resolveAgentwrapPath,
@@ -100,6 +100,10 @@ export interface MainDeps {
    *  `resolveConfig().dispatchPromptPrefix`. Injected so tests drive the
    *  prefixing without writing a config.yaml; `undefined` = no prefix. */
   readonly promptPrefix?: string;
+  /** On-disk cwd existence probe for plan-form resolution. Defaults to
+   *  `existsSync`; injected so a test drives the `cwd-missing` branch (or
+   *  asserts a resolved-but-nonexistent fixture path) without a real dir. */
+  readonly dirExists?: (dir: string) => boolean;
 }
 
 const HELP = `keeper dispatch — manually fire one claude worker into a tmux window
@@ -157,13 +161,20 @@ interface EpicRow extends Row {
  *   - work: the parent epic's `tasks[]` entry → `target_repo ?? project_dir`.
  *   - close: the epic's `project_dir`.
  * Returns a discriminated result so the caller distinguishes daemon-unreachable
- * (transport throw) from not-found / empty-cwd (resolution miss) for distinct
- * error text + a clean exit 1 that launches nothing.
+ * (transport throw) from not-found / empty-cwd / cwd-missing (resolution miss)
+ * for distinct error text + a clean exit 1 that launches nothing.
+ *
+ * `dirExists` is the on-disk existence probe (defaults to `existsSync`),
+ * injected for tests. A resolved cwd that does not exist on disk — typically a
+ * renamed-away repo dir — fails LOUD with `cwd-missing: <path>` instead of
+ * launching a worker into a stale path that silently never runs. Remediation:
+ * `keeper plan mv-repo <old> <new>`.
  */
 export async function resolvePlanCwd(
   query: QueryFn,
   verb: RetryDispatchVerb,
   id: string,
+  dirExists: (dir: string) => boolean = existsSync,
 ): Promise<{ ok: true; cwd: string } | { ok: false; error: string }> {
   // work: id is a task id `fn-N-slug.M` whose parent epic is the `fn-N-slug`
   // prefix. close: id IS the epic id. The epic filter resolves both.
@@ -190,6 +201,9 @@ export async function resolvePlanCwd(
     if (projectDir === "") {
       return { ok: false, error: `epic '${epicId}' has no project_dir` };
     }
+    if (!dirExists(projectDir)) {
+      return { ok: false, error: `cwd-missing: ${projectDir}` };
+    }
     return { ok: true, cwd: projectDir };
   }
   // work: walk the parent epic's tasks for the matching task id.
@@ -209,6 +223,9 @@ export async function resolvePlanCwd(
       ok: false,
       error: `task '${id}' resolves to an empty cwd (no target_repo and no epic project_dir)`,
     };
+  }
+  if (!dirExists(cwd)) {
+    return { ok: false, error: `cwd-missing: ${cwd}` };
   }
   return { ok: true, cwd };
 }
@@ -409,7 +426,12 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     const query: QueryFn =
       deps.query ??
       ((collection, filter) => queryCollection(sockPath, collection, filter));
-    const cwdResult = await resolvePlanCwd(query, verb, id);
+    const cwdResult = await resolvePlanCwd(
+      query,
+      verb,
+      id,
+      deps.dirExists ?? existsSync,
+    );
     if (!cwdResult.ok) {
       die(cwdResult.error);
     }
