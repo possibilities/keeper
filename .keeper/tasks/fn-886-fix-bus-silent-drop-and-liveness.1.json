@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T16:06:04.609000Z",
+  "depends_on": [],
+  "epic": "fn-886-fix-bus-silent-drop-and-liveness",
+  "id": "fn-886-fix-bus-silent-drop-and-liveness.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Server tri-state presence and honest send result",
+  "updated_at": "2026-06-22T16:06:04.609000Z"
+}
