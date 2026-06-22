@@ -9,6 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "AST codemod + frozen allowlist + lint guard",
-  "updated_at": "2026-06-22T22:43:22.816000Z",
-  "worker_done_at": null
+  "updated_at": "2026-06-22T22:51:14.324000Z",
+  "worker_done_at": "2026-06-22T22:51:14.324000Z"
 }

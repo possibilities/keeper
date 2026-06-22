@@ -51,5 +51,5 @@ planted retired-name edit to a frozen-literal file.
 - [ ] NO code symbols renamed in this task (harness only)
 
 ## Done summary
-
+Built the fn-889 safety harness: scripts/frozen-allowlist.txt enumerates the permanently-frozen planctl literals (trailer keys, src/db.ts schema-history, .3-owned Commit-event/wire-kind keys) and scripts/lint-retired-name.sh guards them — hard-failing on a frozen-literal clobber or a planted retired-name edit while staying green on the current un-renamed tree. No code symbols renamed.
 ## Evidence
