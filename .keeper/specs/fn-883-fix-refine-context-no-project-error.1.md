@@ -25,5 +25,5 @@ fix (F1) and its regression test (TG1) land as one commit.
 - [ ] Existing refine-context not-found / ambiguous behavior is unchanged.
 
 ## Done summary
-
+refine-context now renders the resolver's typed no_project reason as a NO_PROJECT project-missing message matching done/show/cat, instead of a misleading 'Epic not found'. Added a regression test exercising the no_project path through refine-context.
 ## Evidence
