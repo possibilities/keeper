@@ -105,15 +105,6 @@ const DEFAULT_CLAUDE_PROJECTS_ROOT = "~/.claude/projects";
 
 const DEFAULT_AGENTUSAGE_ROOT = "~/.local/state/agentusage";
 
-/** Mirrors `DEFAULT_EXEC_BACKEND` in `src/exec-backend.ts`. */
-const DEFAULT_EXEC_BACKEND = "tmux";
-
-/** Recognized `exec_backend` values; an unknown value warns and falls back to
- *  `DEFAULT_EXEC_BACKEND`. `agentwrap` launches workers via the patched
- *  agentwrap CLI (which owns the tmux window); `tmux` stays the default + the
- *  warn-and-fall-back target. */
-const VALID_EXEC_BACKENDS = new Set(["tmux", "agentwrap"]);
-
 /** Default absolute agentwrap binary used when `agentwrap_path` /
  *  `KEEPER_AGENTWRAP_PATH` are unset. Tilde-expanded at resolve time. */
 const DEFAULT_AGENTWRAP_PATH = "~/.bun/bin/agentwrap";
@@ -136,10 +127,7 @@ export interface KeeperConfig {
   // with NO default: absent/empty/garbage → undefined → no prefix applied.
   // Plan-form dispatches are never prefixed.
   dispatchPromptPrefix?: string;
-  // Autopilot exec backend — `tmux` (default + fallback) or `agentwrap`. The
-  // managed-session name is hardcoded (`MANAGED_EXEC_SESSION`), not configurable.
-  execBackend?: string;
-  // Absolute path to the agentwrap binary the `agentwrap` exec backend invokes.
+  // Absolute path to the agentwrap binary keeper launches workers through.
   // Independent best-effort key with NO default at the parse layer (absent →
   // undefined here); `resolveAgentwrapPath()` supplies the `~/.bun/bin/agentwrap`
   // default + the `KEEPER_AGENTWRAP_PATH` env override + tilde-expansion.
@@ -186,7 +174,6 @@ export function resolveConfig(): KeeperConfig {
   // No default at the parse layer — absent leaves `agentwrapPath` undefined so
   // `resolveAgentwrapPath()` applies the `~/.bun/bin/agentwrap` default.
   let agentwrapPath: string | undefined;
-  let execBackend: string = DEFAULT_EXEC_BACKEND;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   let accountAliases: Record<string, string> = {};
   try {
@@ -195,7 +182,6 @@ export function resolveConfig(): KeeperConfig {
         roots,
         claudeProjectsRoot,
         agentusageRoot,
-        execBackend,
         maxConcurrentJobs,
         accountAliases,
       };
@@ -241,19 +227,6 @@ export function resolveConfig(): KeeperConfig {
       if (typeof awp === "string" && awp.length > 0) {
         agentwrapPath = awp;
       }
-      // Independent best-effort key: a recognized value wins; an unknown
-      // non-empty value warns and falls back to the default (every key
-      // resolves independently). Absent / non-string → default silently.
-      const eb = (raw as { exec_backend?: unknown }).exec_backend;
-      if (typeof eb === "string" && eb.length > 0) {
-        if (VALID_EXEC_BACKENDS.has(eb)) {
-          execBackend = eb;
-        } else {
-          console.error(
-            `[keeper] config: unknown exec_backend "${eb}"; falling back to "${DEFAULT_EXEC_BACKEND}"`,
-          );
-        }
-      }
       // Only a POSITIVE INTEGER overrides the unlimited (`null`) default.
       const mcj = (raw as { max_concurrent_jobs?: unknown })
         .max_concurrent_jobs;
@@ -281,7 +254,6 @@ export function resolveConfig(): KeeperConfig {
       roots: [...DEFAULT_PLAN_ROOTS],
       claudeProjectsRoot: DEFAULT_CLAUDE_PROJECTS_ROOT,
       agentusageRoot: DEFAULT_AGENTUSAGE_ROOT,
-      execBackend: DEFAULT_EXEC_BACKEND,
       maxConcurrentJobs: DEFAULT_MAX_CONCURRENT_JOBS,
       accountAliases: {},
     };
@@ -293,7 +265,6 @@ export function resolveConfig(): KeeperConfig {
     buildbotUrl,
     dispatchPromptPrefix,
     agentwrapPath,
-    execBackend,
     maxConcurrentJobs,
     accountAliases,
   };

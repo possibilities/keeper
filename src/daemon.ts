@@ -1222,6 +1222,71 @@ export interface DaemonHandle {
   sockPath: string;
 }
 
+/** Minimal `Bun.spawnSync`-shaped result the agentwrap boot probe reads. */
+export interface AgentwrapProbeResult {
+  readonly success: boolean;
+  readonly exitCode: number;
+}
+
+/** Injectable `Bun.spawnSync`-shaped probe for {@link checkAgentwrapPresence};
+ *  a throw models an unlaunchable binary (ENOENT / non-executable). */
+export type AgentwrapProbeFn = (path: string) => AgentwrapProbeResult;
+
+/**
+ * Fail-fast agentwrap presence check, run at boot ONLY where launch is reachable
+ * (the `want("autopilot")` gate). agentwrap is keeper's sole, direct launch
+ * transport — no tmux-launch fallback — so a missing/non-executable binary would
+ * otherwise surface only as a per-launch ENOENT, spiralling into the never-bound
+ * breaker. This pre-empts that with one loud boot warning naming the resolved
+ * ABSOLUTE path + an install hint.
+ *
+ * Never throws and never exits: the daemon still serves reads + pane-ops without
+ * agentwrap, so a miss is a WARNING, not a hard exit. Returns `true` when present
+ * (probe succeeded with exit 0), `false` when missing/unlaunchable.
+ *
+ * The probe runs `agentwrap --version`. `PATH` MUST ride in the env — a bare
+ * custom env drops it and a binary that re-execs a PATH lookup would false-ENOENT.
+ * Injectable `spawn`/`log` for unit tests so the present/missing branches exercise
+ * with no real fork.
+ */
+export function checkAgentwrapPresence(
+  agentwrapPath: string,
+  deps: {
+    spawn?: AgentwrapProbeFn;
+    log?: (msg: string) => void;
+  } = {},
+): boolean {
+  const log = deps.log ?? ((msg: string) => console.error(msg));
+  const probe: AgentwrapProbeFn =
+    deps.spawn ??
+    ((path: string) => {
+      const res = Bun.spawnSync([path, "--version"], {
+        timeout: 5_000,
+        // PATH is load-bearing — a bare custom env drops it and a binary that
+        // re-execs a PATH lookup false-ENOENTs.
+        env: process.env as Record<string, string | undefined>,
+      });
+      return { success: res.success, exitCode: res.exitCode };
+    });
+  let ok = false;
+  try {
+    const res = probe(agentwrapPath);
+    ok = res.success && res.exitCode === 0;
+  } catch {
+    ok = false;
+  }
+  if (ok) {
+    log(`[keeper] agentwrap launch transport: ${agentwrapPath}`);
+  } else {
+    log(
+      `[keeper] WARNING: agentwrap not found or not executable at ${agentwrapPath} — ` +
+        `worker launch (autopilot + manual dispatch) will FAIL until installed ` +
+        `(install agentwrap or set KEEPER_AGENTWRAP_PATH / config agentwrap_path).`,
+    );
+  }
+  return ok;
+}
+
 /**
  * Boot the daemon programmatically and return a {@link DaemonHandle}. Runs the
  * same migrate → boot-drain → seed-sweep → worker-spawn sequence as production,
@@ -2947,6 +3012,17 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // relay. Config is read here on main and threaded into workerData so the worker
   // never opens config itself.
   const apConfig = resolveConfig();
+  // Absolute agentwrap binary — keeper's sole launch transport. Resolved once on
+  // main (env override + config + `~`-expansion), boot-checked for presence, then
+  // frozen into workerData; restart-to-apply (a config flip lags until restart).
+  const agentwrapPath = resolveAgentwrapPath();
+  // Fail-fast presence check ONLY where launch is reachable (the autopilot gate):
+  // a loud boot warning naming the resolved path pre-empts the per-launch
+  // ENOENT → never-bound-breaker spiral. Never hard-exits — reads + pane-ops still
+  // serve without agentwrap.
+  if (want("autopilot")) {
+    checkAgentwrapPresence(agentwrapPath);
+  }
   // Gated on the selector — `null` when unselected. The server-worker bridge's
   // `set_autopilot_paused` relay null-guards via `autopilotWorker === null`, so a
   // server-only boot's pause RPC degrades gracefully.
@@ -2955,10 +3031,7 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: {
           dbPath,
           paused: autopilotPaused,
-          // Absolute agentwrap binary — keeper's sole launch transport. Resolved
-          // on main (env override + config + `~`-expansion) and frozen in here;
-          // restart-to-apply (a config flip lags until the next restart).
-          agentwrapPath: resolveAgentwrapPath(),
+          agentwrapPath,
           maxConcurrentJobs: apConfig.maxConcurrentJobs,
           role: "autopilot",
         } satisfies AutopilotWorkerData,

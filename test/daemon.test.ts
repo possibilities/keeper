@@ -26,6 +26,7 @@ import {
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   buildPendingDispatchSweepRecords,
+  checkAgentwrapPresence,
   type DaemonHandle,
   drainToCompletion,
   isTransientBusyError,
@@ -3309,4 +3310,48 @@ test("fn-749: a minimal selector spawns ONLY the named workers (no watcher worke
   // among the watchers.
   const planSet = spawnedWorkerNames({ workers: ["wake", "server", "plan"] });
   expect(planSet).toEqual(["wake", "server", "plan"]);
+});
+
+// ---------------------------------------------------------------------------
+// fn-896: agentwrap is keeper's sole launch transport (no tmux-launch fallback),
+// so boot fail-fasts with a loud warning when the resolved binary is absent
+// rather than spiralling into the per-launch ENOENT → never-bound breaker.
+// ---------------------------------------------------------------------------
+
+test("checkAgentwrapPresence: present (exit 0) returns true and logs the resolved path", () => {
+  const logs: string[] = [];
+  const ok = checkAgentwrapPresence("/opt/bin/agentwrap", {
+    spawn: () => ({ success: true, exitCode: 0 }),
+    log: (m) => logs.push(m),
+  });
+  expect(ok).toBe(true);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain("/opt/bin/agentwrap");
+});
+
+test("checkAgentwrapPresence: non-zero exit returns false and warns with the path + install hint", () => {
+  const logs: string[] = [];
+  const ok = checkAgentwrapPresence("/opt/bin/agentwrap", {
+    spawn: () => ({ success: false, exitCode: 127 }),
+    log: (m) => logs.push(m),
+  });
+  expect(ok).toBe(false);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain("WARNING");
+  expect(logs[0]).toContain("/opt/bin/agentwrap");
+  expect(logs[0]).toContain("KEEPER_AGENTWRAP_PATH");
+});
+
+test("checkAgentwrapPresence: a throwing spawn (unlaunchable binary) returns false and warns", () => {
+  const logs: string[] = [];
+  const ok = checkAgentwrapPresence("/no/such/agentwrap", {
+    spawn: () => {
+      throw new Error("ENOENT");
+    },
+    log: (m) => logs.push(m),
+  });
+  expect(ok).toBe(false);
+  expect(logs).toHaveLength(1);
+  expect(logs[0]).toContain("WARNING");
+  expect(logs[0]).toContain("/no/such/agentwrap");
 });

@@ -5331,64 +5331,36 @@ test("resolveConfig: malformed YAML and missing roots key fall back to default",
 });
 
 // ---------------------------------------------------------------------------
-// fn-789: autopilot exec backend selector (`exec_backend`)
+// fn-896: the `exec_backend` toggle is retired — agentwrap is keeper's sole,
+// direct launch transport. A stale key falls into the silent-ignore path.
 // ---------------------------------------------------------------------------
 
-test("resolveConfig: exec_backend defaults to tmux, accepts tmux, warns+falls-back on unknown", () => {
+test("resolveConfig: a stale exec_backend key is silently ignored (no field, siblings intact)", () => {
   const original = process.env.KEEPER_CONFIG;
   try {
     const cfg = join(tmpDir, "config.yaml");
-    // Absent → tmux default.
-    writeFileSync(cfg, "roots:\n  - /tmp/x\n");
-    process.env.KEEPER_CONFIG = cfg;
-    expect(resolveConfig().execBackend).toBe("tmux");
-    // tmux → kept verbatim.
-    writeFileSync(cfg, "exec_backend: tmux\n");
-    expect(resolveConfig().execBackend).toBe("tmux");
-    // agentwrap → recognized, selects verbatim.
-    writeFileSync(cfg, "exec_backend: agentwrap\n");
-    expect(resolveConfig().execBackend).toBe("agentwrap");
-    // Legacy zellij value → warn + fall back to tmux (no longer recognized).
-    writeFileSync(cfg, "exec_backend: zellij\n");
-    expect(resolveConfig().execBackend).toBe("tmux");
-    // Unknown value → warn + fall back to tmux.
-    writeFileSync(cfg, "exec_backend: ghostty\n");
-    expect(resolveConfig().execBackend).toBe("tmux");
-    // Non-string → default.
-    writeFileSync(cfg, "exec_backend: 42\n");
-    expect(resolveConfig().execBackend).toBe("tmux");
-  } finally {
-    if (original === undefined) delete process.env.KEEPER_CONFIG;
-    else process.env.KEEPER_CONFIG = original;
-  }
-});
-
-test("resolveConfig: exec_backend / roots resolve independently", () => {
-  const original = process.env.KEEPER_CONFIG;
-  try {
-    const cfg = join(tmpDir, "config.yaml");
-    writeFileSync(cfg, "roots:\n  - /tmp/projects\nexec_backend: tmux\n");
+    writeFileSync(cfg, "roots:\n  - /tmp/projects\nexec_backend: agentwrap\n");
     process.env.KEEPER_CONFIG = cfg;
     const got = resolveConfig();
+    expect(got).not.toHaveProperty("execBackend");
     expect(got.roots).toEqual(["/tmp/projects"]);
-    expect(got.execBackend).toBe("tmux");
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;
   }
 });
 
-test("resolveConfig: catch-block defaults include exec_backend", () => {
+test("resolveConfig: catch-block defaults carry no exec_backend field", () => {
   const original = process.env.KEEPER_CONFIG;
   try {
     const cfg = join(tmpDir, "config.yaml");
-    // Malformed YAML → catch block fires; the returned record must
-    // carry the autopilot defaults so downstream callers never read
-    // `undefined` from the parse-failure path.
+    // Malformed YAML → catch block fires; the returned record carries the kept
+    // defaults and no retired `execBackend` field.
     writeFileSync(cfg, "roots:\n  - [unbalanced\n: : :\n");
     process.env.KEEPER_CONFIG = cfg;
     const got = resolveConfig();
-    expect(got.execBackend).toBe("tmux");
+    expect(got).not.toHaveProperty("execBackend");
+    expect(got.roots).toEqual(["~/code"]);
   } finally {
     if (original === undefined) delete process.env.KEEPER_CONFIG;
     else process.env.KEEPER_CONFIG = original;

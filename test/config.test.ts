@@ -49,54 +49,15 @@ function writeConfig(yaml: string): void {
   process.env.KEEPER_CONFIG = path;
 }
 
-test("execBackend defaults to tmux when the config file is absent", () => {
-  process.env.KEEPER_CONFIG = join(dir, "does-not-exist.yaml");
-  expect(resolveConfig().execBackend).toBe("tmux");
-});
-
-test("execBackend defaults to tmux when the key is absent", () => {
-  writeConfig("roots:\n  - ~/code\n");
-  expect(resolveConfig().execBackend).toBe("tmux");
-});
-
-test("exec_backend: tmux selects the tmux backend", () => {
-  writeConfig("exec_backend: tmux\n");
-  expect(resolveConfig().execBackend).toBe("tmux");
-});
-
-test("exec_backend: agentwrap selects the agentwrap backend", () => {
-  // `agentwrap` is now a recognized backend — it SELECTS rather than taking the
-  // unknown-value warn-and-fall-back path.
-  writeConfig("exec_backend: agentwrap\n");
-  expect(resolveConfig().execBackend).toBe("agentwrap");
-});
-
-test("exec_backend: an explicit zellij value warns and falls back to tmux", () => {
-  // `zellij` is no longer a recognized backend — it takes the unknown-value
-  // warn-and-fall-back path, now landing on tmux.
-  writeConfig("exec_backend: zellij\n");
-  expect(resolveConfig().execBackend).toBe("tmux");
-});
-
-test("an unknown exec_backend value warns and falls back to tmux", () => {
-  // `ghostty` is not a recognized backend — fall back to the default
-  // rather than threading an unhandled value into the worker.
-  writeConfig("exec_backend: ghostty\n");
-  expect(resolveConfig().execBackend).toBe("tmux");
-});
-
-test("a non-string exec_backend falls back to the tmux default", () => {
-  writeConfig("exec_backend: 42\n");
-  expect(resolveConfig().execBackend).toBe("tmux");
-});
-
-test("exec_backend resolves independently of a malformed sibling key", () => {
-  // A junk `roots` (non-array) must not disturb the exec_backend resolution.
-  writeConfig("roots: not-a-list\nexec_backend: tmux\n");
+test("a stale exec_backend: key boots clean (silently ignored, no field)", () => {
+  // The `exec_backend` toggle is retired — agentwrap is keeper's sole, direct
+  // launch transport. A stale key in a live config must parse cleanly into the
+  // existing silent-ignore path: every kept key still resolves, and there is no
+  // `execBackend` field on the result.
+  writeConfig("exec_backend: agentwrap\nroots:\n  - ~/code\n");
   const cfg = resolveConfig();
-  expect(cfg.execBackend).toBe("tmux");
-  // roots fell back to its default (non-empty) — independence holds.
-  expect(cfg.roots.length).toBeGreaterThan(0);
+  expect(cfg).not.toHaveProperty("execBackend");
+  expect(cfg.roots).toEqual(["~/code"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -196,12 +157,14 @@ test("max_concurrent_jobs: null → null (explicit null stays unlimited)", () =>
 });
 
 test("a malformed max_concurrent_jobs leaves a sibling key intact (independence)", () => {
-  // A junk cap value must not strand `exec_backend` at its default —
-  // the keys resolve independently from the same parsed document.
-  writeConfig('max_concurrent_jobs: "nope"\nexec_backend: tmux\n');
+  // A junk cap value must not strand `agentwrap_path` — the keys resolve
+  // independently from the same parsed document.
+  writeConfig(
+    'max_concurrent_jobs: "nope"\nagentwrap_path: /opt/bin/agentwrap\n',
+  );
   const cfg = resolveConfig();
   expect(cfg.maxConcurrentJobs).toBe(null);
-  expect(cfg.execBackend).toBe("tmux");
+  expect(cfg.agentwrapPath).toBe("/opt/bin/agentwrap");
 });
 
 // ---------------------------------------------------------------------------
