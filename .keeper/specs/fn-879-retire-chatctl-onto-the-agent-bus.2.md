@@ -40,5 +40,5 @@ resolves (`uv sync` / `uv lock --check`) with chatctl gone.
 - [ ] no chatctl reference remains in the workspace manifest or lockfiles
 
 ## Done summary
-
+Removed all 5 chatctl references from pyproject.toml and regenerated uv.lock + pnpm-lock.yaml via the toolchain; workspace resolves clean (uv lock --check passes), no chatctl reference remains in manifest or lockfiles.
 ## Evidence

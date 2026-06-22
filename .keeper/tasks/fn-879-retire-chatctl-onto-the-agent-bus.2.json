@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "excise chatctl from the workspace and lockfiles",
-  "updated_at": "2026-06-22T00:54:50.513000Z"
+  "updated_at": "2026-06-22T01:54:43.701000Z",
+  "worker_done_at": "2026-06-22T01:54:43.701000Z"
 }
