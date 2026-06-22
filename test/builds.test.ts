@@ -20,6 +20,7 @@ import {
   formatAge,
   renderRow,
   renderRowLines,
+  resolveJobType,
   resolveStatus,
 } from "../cli/builds";
 
@@ -73,6 +74,32 @@ test("resolveStatus: results NULL + complete falsy is RUNNING, not an error", ()
 test("resolveStatus: an out-of-range / non-numeric code degrades to UNKNOWN", () => {
   expect(resolveStatus({ results: 99, complete: 1 }).label).toBe("UNKNOWN");
   expect(resolveStatus({ results: "2", complete: 1 }).label).toBe("UNKNOWN");
+});
+
+// ---------------------------------------------------------------------------
+// resolveJobType: builder-name suffix → deploy / install / build (epic fn-891).
+// ---------------------------------------------------------------------------
+
+test("resolveJobType: suffix derives deploy/install/build (doctor → install)", () => {
+  expect(resolveJobType("foo")).toBe("build");
+  expect(resolveJobType("foo-deploy")).toBe("deploy");
+  expect(resolveJobType("foo-install")).toBe("install");
+  expect(resolveJobType("foo-doctor")).toBe("install");
+  // Unsuffixed / empty falls through to build.
+  expect(resolveJobType("")).toBe("build");
+});
+
+test("renderRow: each job type renders a distinct ASCII-safe tag", () => {
+  const lines = ["foo", "foo-deploy", "foo-install", "foo-doctor"].map(
+    (project) => renderRow(freshRow({ project }), NOW_MS),
+  );
+  expect(lines[0]).toContain("[build]");
+  expect(lines[1]).toContain("[deploy]");
+  expect(lines[2]).toContain("[install]");
+  // doctor folds into the install family.
+  expect(lines[3]).toContain("[install]");
+  // build / deploy / install render as three distinct tags.
+  expect(new Set(lines.map((l) => /\[(\w+)\]/.exec(l)?.[1])).size).toBe(3);
 });
 
 // ---------------------------------------------------------------------------

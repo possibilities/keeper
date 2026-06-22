@@ -651,8 +651,8 @@ subscribe clients share helpers in `src/readiness-client.ts` —
 autopilot) and `subscribeCollection` owns the single-collection
 lifecycle (git, usage); both feed `computeReadiness` / row-list
 callbacks (the pure verdict pipeline lives in `src/readiness.ts` as
-library code, not a runnable script). All five snapshot-capable viewers (`board`, `jobs`,
-`git`, `autopilot`, `usage`) resolve their output mode through a
+library code, not a runnable script). All six snapshot-capable viewers (`board`, `jobs`,
+`git`, `autopilot`, `usage`, `builds`) resolve their output mode through a
 three-way TTY gate (fn-772, shared `src/snapshot.ts` / `src/view-shell.ts`
 seam); `keeper dash` is a TTY-ONLY exception outside this gate (no snapshot
 mode — a non-TTY stdout exits 1, see the `dash.ts` bullet below): (1) **TTY
@@ -3015,7 +3015,7 @@ without paying its cost today.
 
 The unified `keeper` CLI is a single dispatcher entrypoint (`cli/keeper.ts`,
 the package.json `bin`) that fans into every subcommand — `board`,
-`autopilot`, `git`, `usage`, `await` — so all example clients
+`autopilot`, `git`, `usage`, `builds`, `await` — so all example clients
 ship as one binary instead of N standalone scripts.
 
 The sitter scanners (performance, builds, helptailing) — read-only out-of-process observers of `keeper.db` and buildbot state — now live in their own repo at `~/code/sitter`. They import nothing from keeper and observe purely through durable contracts (read-only SQLite at a whitelisted schema version, NDJSON telemetry, their own private state tree). See `~/code/sitter` for the daemon set, its launchd jobs, and its architecture.

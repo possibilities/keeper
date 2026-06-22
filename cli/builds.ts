@@ -21,6 +21,12 @@
  * an error. Age is derived client-side from `updated_at` (cosmetic render
  * concern, never folded).
  *
+ * Each row also carries a `[build]`/`[deploy]`/`[install]` job-type tag
+ * (epic fn-891). The tag is derived purely at render time from the builder
+ * NAME suffix (`-deploy` → deploy, `-install`/`-doctor` → install, else
+ * build) — the arthack-side builder-name convention is the only contract;
+ * the `builds` projection has no `tags` field and is never touched here.
+ *
  * Connection lifecycle is owned by `subscribeCollection` in
  * `src/readiness-client.ts` (same reconnect / coalesce / dispose contract
  * as the sibling views). This module's job is rendering rows; the helper
@@ -50,11 +56,13 @@ Usage: keeper builds [--sock <path>] [--snapshot | --watch] [--timeout <s>]
 By default, stdout that is NOT a TTY (piped into an agent) auto-detects
 snapshot mode; a TTY gets the live TUI. \`CI\` / \`TERM=dumb\` force snapshot.
 
-Rows show one registered buildbot builder: project name, a status glyph +
-label (SUCCESS / WARNINGS / FAILURE / SKIPPED / EXCEPTION / RETRY /
-CANCELLED / RUNNING), the latest build number, the build state string, and
-an age. RUNNING (\`results\` NULL, build in flight) is a normal state, not an
-error. An empty table means no builds yet — is \`buildbot_url\` configured?
+Rows show one registered buildbot builder: project name, a job-type tag
+(\`[build]\` / \`[deploy]\` / \`[install]\`, derived from the builder-name
+suffix), a status glyph + label (SUCCESS / WARNINGS / FAILURE / SKIPPED /
+EXCEPTION / RETRY / CANCELLED / RUNNING), the latest build number, the build
+state string, and an age. RUNNING (\`results\` NULL, build in flight) is a
+normal state, not an error. An empty table means no builds yet — is
+\`buildbot_url\` configured?
 `;
 
 /**
@@ -97,6 +105,31 @@ export function resolveStatus(row: Record<string, unknown>): Status {
 }
 
 /**
+ * One builder-name suffix → job-type tag mapping (epic fn-891). The builder
+ * NAME (the `project` PK string) is the sole contract with the arthack-side
+ * buildbot config: a `-deploy` suffix is a deploy job, `-install`/`-doctor`
+ * is an install-family job (doctor folds into install), everything else is a
+ * plain build. ASCII-safe, render-time only — the `builds` projection has no
+ * `tags` field and stays a deterministic-replayed, never-touched-here surface.
+ */
+const JOB_TYPE_SUFFIXES: ReadonlyArray<readonly [string, string]> = [
+  ["-deploy", "deploy"],
+  ["-install", "install"],
+  ["-doctor", "install"],
+];
+
+/**
+ * Resolve the job-type tag from a builder name. Pure, suffix-driven (see
+ * `JOB_TYPE_SUFFIXES`); an unsuffixed or empty name is a plain `build`.
+ */
+export function resolveJobType(project: string): string {
+  for (const [suffix, type] of JOB_TYPE_SUFFIXES) {
+    if (project.endsWith(suffix)) return type;
+  }
+  return "build";
+}
+
+/**
  * Humanize an age in milliseconds into a compact `Nm`/`Nh`/`Nd` token. A
  * negative or non-finite age (clock skew, missing `updated_at`) renders as
  * `?`. Whole-unit only — this is a glanceable affordance, not a precise
@@ -130,6 +163,7 @@ function seg(v: unknown): string {
 export function renderRow(row: Record<string, unknown>, now: number): string {
   const status = resolveStatus(row);
   const project = seg(row.project) || "(unnamed)";
+  const jobType = `[${resolveJobType(seg(row.project))}]`;
   const buildNumber =
     typeof row.build_number === "number" ? `#${row.build_number}` : "#?";
   const stateString = seg(row.state_string);
@@ -143,6 +177,7 @@ export function renderRow(row: Record<string, unknown>, now: number): string {
   const parts = [
     status.glyph,
     project,
+    jobType,
     buildNumber,
     status.label,
     stateString,
