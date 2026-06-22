@@ -10,7 +10,7 @@
  * survive the move so `test/git.test.ts` continues to assert against
  * the same pure-function row layout.
  *
- * The daemon-side git worker polls planctl-backed git worktrees and
+ * The daemon-side git worker polls plan-backed git worktrees and
  * folds synthetic `GitSnapshot` events into the `git` collection. This
  * is the primitive frame UI for that surface, mirroring the sibling
  * scripts' sidecars.
@@ -56,7 +56,7 @@ Real TUI mode (alt-screen + keyboard nav) when stdout is a TTY. Keys:
   appended to /tmp/keeper-git.<pid>.lifecycle.txt. Session paths print
   on exit.
 
-Rows show one planctl-backed git worktree, its dirty / orphan /
+Rows show one plan-backed git worktree, its dirty / orphan /
 unattributed counts, and per-file source-badged attribution
 (\`tool@<session>, bash@<session>, inferred@<session>\`). Files with
 no attribution at all render as \`<orphan>\` in the attribution slot.

@@ -1,7 +1,7 @@
 #!/usr/bin/env bun
 /**
  * `keeper plan <verb>` — in-process entry point for the plan verb dispatcher.
- * `keeper plan` is the canonical command (the retired standalone `planctl` CLI is
+ * `keeper plan` is the canonical command (the former standalone plan CLI is
  * gone); this entry exists so callers — autopilot, skills, scripts — invoke the
  * plan tooling through the single `keeper` binary now that the two plugins are
  * co-hosted in one repo.
@@ -19,10 +19,10 @@
  * with code N" banner (Bun #5455).
  */
 
-import { main as planctlMain } from "../plugins/plan/src/cli.ts";
+import { main as planMain } from "../plugins/plan/src/cli.ts";
 
 export function main(argv: string[]): never {
-  process.exit(planctlMain(argv));
+  process.exit(planMain(argv));
 }
 
 if (import.meta.main) {

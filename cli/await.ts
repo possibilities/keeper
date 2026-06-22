@@ -182,7 +182,7 @@ function eventLine(
 // ---------------------------------------------------------------------------
 
 /**
- * One parsed condition segment. The two planctl families carry an
+ * One parsed condition segment. The two plan families carry an
  * {@link AwaitTarget} (id + kind + condition); `git-clean` / `agents-idle`
  * carry only the condition tag.
  */
@@ -234,8 +234,8 @@ const REQUERY_GIVE_UP_MS = 6000;
  */
 type ReQueryOutcome = "hit" | "miss" | "indeterminate";
 
-/** Conditions that take exactly one planctl id positional. */
-const PLANCTL_CONDITIONS: ReadonlySet<string> = new Set([
+/** Conditions that take exactly one plan id positional. */
+const PLAN_CONDITIONS: ReadonlySet<string> = new Set([
   "complete",
   "unblocked",
   "started",
@@ -396,7 +396,7 @@ export function parseAwaitArgs(argv: string[]): ParseFailure | ParseSuccess {
     }
     const condRaw = seg[0] ?? "";
     const rest = seg.slice(1);
-    if (PLANCTL_CONDITIONS.has(condRaw)) {
+    if (PLAN_CONDITIONS.has(condRaw)) {
       if (rest.length !== 1) {
         return {
           ok: false,
@@ -579,7 +579,7 @@ export interface RunDeps {
    * cwd isn't inside a git worktree (the runner emits
    * `failed reason=no-git-root` exit 1 at arm time when any condition needs
    * a root). Only consulted by `git-clean` / `agents-idle` segments — a
-   * pure planctl invocation tolerates `null`.
+   * pure plan invocation tolerates `null`.
    */
   gitRoot: string | null;
   /**
@@ -615,13 +615,13 @@ export interface RunResult {
 }
 
 /**
- * Per-planctl-slot mutable state. Each `complete`/`unblocked` segment
+ * Per-plan-slot mutable state. Each `complete`/`unblocked` segment
  * keeps its own presence / re-query / reconnect machinery so the
  * single-segment path stays byte-identical and a multi-segment AND
- * tracks each planctl target independently.
+ * tracks each plan target independently.
  */
-interface PlanctlSlotState {
-  readonly kind: "planctl";
+interface PlanSlotState {
+  readonly kind: "plan";
   readonly target: AwaitTarget;
   /** Latched: has this slot's condition been met? Booted to false. */
   met: boolean;
@@ -644,7 +644,7 @@ interface PlanctlSlotState {
 }
 
 /**
- * Per-git/jobs-slot mutable state. Simpler than the planctl slot — these
+ * Per-git/jobs-slot mutable state. Simpler than the plan slot — these
  * families have no `deleted`/`stuck` semantic; an absent row is MET, so
  * the slot only latches `met` plus a per-slot verdict-change throttle.
  */
@@ -686,7 +686,7 @@ interface ServerUpSlotState {
 }
 
 type SlotState =
-  | PlanctlSlotState
+  | PlanSlotState
   | GitJobSlotState
   | MonitorSlotState
   | ServerUpSlotState;
@@ -704,9 +704,9 @@ interface RunnerState {
  *
  * Generalized to N latched condition slots (fn-713): one slot per
  * `args.segments` entry. The aggregate emits a single terminal `met` only
- * when EVERY slot is simultaneously met; any planctl sub-condition going
+ * when EVERY slot is simultaneously met; any plan sub-condition going
  * `not-found`/`deleted`/`stuck`(under `--fail-on-stuck`) short-circuits the
- * whole process. A single planctl segment reproduces the pre-fn-713 line
+ * whole process. A single plan segment reproduces the pre-fn-713 line
  * shape + exit codes byte-for-byte.
  */
 export async function runAwait(
@@ -715,11 +715,11 @@ export async function runAwait(
 ): Promise<RunResult> {
   const single = args.segments.length === 1;
 
-  // Which subscription streams do we need? planctl → subscribeReadiness
-  // (it also exposes raw git/jobs rows, so a planctl-bearing combo reads
+  // Which subscription streams do we need? plan → subscribeReadiness
+  // (it also exposes raw git/jobs rows, so a plan-bearing combo reads
   // git/jobs off the one snapshot and skips the extra subscribe). git/jobs
-  // WITHOUT any planctl segment → dedicated subscribeCollection streams.
-  const hasPlanctl = args.segments.some(
+  // WITHOUT any plan segment → dedicated subscribeCollection streams.
+  const hasPlan = args.segments.some(
     (s) =>
       s.condition === "complete" ||
       s.condition === "unblocked" ||
@@ -733,7 +733,7 @@ export async function runAwait(
     (s) => s.condition === "monitor-running",
   );
   // `server-up` (fn-750.2) is a dedicated minimal subscribe: it needs a
-  // CONNECTION but NO git root / planctl / jobs rows, and it fires `met` on
+  // CONNECTION but NO git root / plan / jobs rows, and it fires `met` on
   // first paint. It's always the SOLE segment (parse rejects ANDing it), so
   // it doesn't combine with any other stream. It is PERMANENTLY give-up-exempt
   // — reconnect-forever — so it survives a daemon bounce. (fn-757: every
@@ -746,15 +746,15 @@ export async function runAwait(
   const needsRoot = hasGitClean || hasAgentsIdle;
   // Both `agents-idle` and `monitor-running` read the jobs collection.
   const needsJobs = hasAgentsIdle || hasMonitorRunning;
-  // Open the readiness stream when any planctl segment is present; it
+  // Open the readiness stream when any plan segment is present; it
   // already folds git + jobs so those families ride it. Otherwise open a
   // dedicated git / jobs collection stream per family used.
-  const openReadiness = hasPlanctl;
-  const openGitCollection = hasGitClean && !hasPlanctl;
-  const openJobsCollection = needsJobs && !hasPlanctl;
+  const openReadiness = hasPlan;
+  const openGitCollection = hasGitClean && !hasPlan;
+  const openJobsCollection = needsJobs && !hasPlan;
   // `server-up` gets its OWN minimal readiness subscribe (always
   // give-up-exempt) — NOT bolted onto `openReadiness`, which would drag in
-  // the planctl re-query machinery.
+  // the plan re-query machinery.
   const openServerUp = hasServerUp;
 
   // Build the latched slots in segment order (the line render walks them).
@@ -765,7 +765,7 @@ export async function runAwait(
       seg.condition === "started"
     ) {
       return {
-        kind: "planctl",
+        kind: "plan",
         target: seg.target,
         met: false,
         lastEval: null,
@@ -803,7 +803,7 @@ export async function runAwait(
   // until it seeds. Defaults `false` (steady state / a server that stamps no
   // header → treat as seeded).
   let latestGitSeedRequired = false;
-  // Latest readiness snapshot (null until first paint); planctl + (when
+  // Latest readiness snapshot (null until first paint); plan + (when
   // riding readiness) git/jobs read off it.
   let latestReadiness: ReadinessClientSnapshot | null = null;
 
@@ -899,10 +899,10 @@ export async function runAwait(
   };
 
   // Best-effort prose of a slot's condition for the line render. For a
-  // planctl slot it's `<condition> <id>`; for git/jobs it's the bare
+  // plan slot it's `<condition> <id>`; for git/jobs it's the bare
   // condition tag.
   const slotLabel = (slot: SlotState): string => {
-    if (slot.kind === "planctl") {
+    if (slot.kind === "plan") {
       return `${slot.target.condition} ${slot.target.id}`;
     }
     if (slot.kind === "monitor-running") {
@@ -918,8 +918,8 @@ export async function runAwait(
     state.armed = true;
     state.result.armed = true;
     let fields: Record<string, string>;
-    if (single && slots[0]?.kind === "planctl") {
-      // Byte-identical single-planctl line shape (external contract).
+    if (single && slots[0]?.kind === "plan") {
+      // Byte-identical single-plan line shape (external contract).
       const t = slots[0].target;
       const initial = initials[0] ?? { kind: "waiting" as const };
       fields = {
@@ -956,10 +956,10 @@ export async function runAwait(
     });
   };
 
-  // Emit the aggregate terminal `met` (single line; for a single planctl
+  // Emit the aggregate terminal `met` (single line; for a single plan
   // slot the field shape is byte-identical to pre-fn-713).
   const emitAggregateMet = (): void => {
-    if (single && slots[0]?.kind === "planctl") {
+    if (single && slots[0]?.kind === "plan") {
       const slot = slots[0];
       const t = slot.target;
       const fields: Record<string, string | string[]> = {
@@ -1005,11 +1005,11 @@ export async function runAwait(
     });
   };
 
-  // A planctl slot reached a short-circuit terminal failure (not-found /
+  // A plan slot reached a short-circuit terminal failure (not-found /
   // deleted / stuck). For a single segment the line is byte-identical;
   // for an aggregate it names which condition failed.
-  const emitPlanctlFailure = (
-    slot: PlanctlSlotState,
+  const emitPlanFailure = (
+    slot: PlanSlotState,
     reason: "not-found" | "deleted" | "stuck",
     code: number,
     detail: string | undefined,
@@ -1034,7 +1034,7 @@ export async function runAwait(
   // selector matches NO running monitor in the caller's own session, the
   // predicate would already read `met` — but firing `met` immediately on a
   // never-started selector is premature-unblock. We instead refuse loudly
-  // (`reason=no-match` exit 1) — mirrors the planctl `not-found` refusal
+  // (`reason=no-match` exit 1) — mirrors the plan `not-found` refusal
   // and the skill's off-board pre-check. Caveat: arm this in a turn AFTER a
   // Stop has snapshotted the monitor; arming in the SAME turn you launch it
   // races the snapshot and trips this refusal.
@@ -1191,7 +1191,7 @@ export async function runAwait(
   // ---- per-slot evaluation -------------------------------------------
 
   /**
-   * SYNCHRONOUS first pass over one planctl slot off the latest readiness
+   * SYNCHRONOUS first pass over one plan slot off the latest readiness
    * snapshot. Computes the `AwaitState` WITHOUT the `deleted` re-query —
    * critically synchronous so `armed` can fire on the same turn as the
    * frame delivery (the pre-fn-713 contract; an `await` here would defer
@@ -1205,8 +1205,8 @@ export async function runAwait(
    *                     `deleted`-vs-`met` before commit; the async wrapper
    *                     runs that and re-evaluates.
    */
-  const evalPlanctlSlotSync = (
-    slot: PlanctlSlotState,
+  const evalPlanSlotSync = (
+    slot: PlanSlotState,
     snap: ReadinessClientSnapshot,
     isReconnectBaseline: boolean,
   ): { result: AwaitState; blip: boolean; needsReQuery: boolean } => {
@@ -1256,7 +1256,7 @@ export async function runAwait(
    * delivering the re-query result and asserting). Returns the raw hit
    * promise; the caller folds it into `evaluateAwaitCondition`.
    */
-  const reQueryForSlot = (slot: PlanctlSlotState): Promise<ReQueryOutcome> =>
+  const reQueryForSlot = (slot: PlanSlotState): Promise<ReQueryOutcome> =>
     slot.target.kind === "task"
       ? reQueryHitTask(slot.target.id)
       : reQueryHit(slot.target.id);
@@ -1274,7 +1274,7 @@ export async function runAwait(
     const phrase = evalState.detail ?? evalState.kind;
     if (phrase !== slot.lastVerdictPhrase) {
       const label =
-        slot.kind === "planctl"
+        slot.kind === "plan"
           ? slot.target.id
           : slot.kind === "monitor-running"
             ? `monitor-running ${slot.raw}`
@@ -1289,7 +1289,7 @@ export async function runAwait(
   /**
    * Shared re-evaluation pass — the ONE place the AND gate is computed.
    * Walks every slot, evaluates each off the latest rows it cares about,
-   * latches `met`, short-circuits on any planctl terminal failure, and
+   * latches `met`, short-circuits on any plan terminal failure, and
    * emits the aggregate `met` only when EVERY slot is simultaneously met.
    *
    * Held behind the aggregate first-paint gate (`allPainted()`): until
@@ -1323,12 +1323,12 @@ export async function runAwait(
       if (slot === undefined) {
         continue;
       }
-      if (slot.kind === "planctl") {
+      if (slot.kind === "plan") {
         if (latestReadiness === null) {
           evals[i] = { kind: "waiting" };
           continue;
         }
-        const { result, blip, needsReQuery } = evalPlanctlSlotSync(
+        const { result, blip, needsReQuery } = evalPlanSlotSync(
           slot,
           latestReadiness,
           readinessBaseline,
@@ -1409,7 +1409,7 @@ export async function runAwait(
       }
     }
 
-    // First-paint baseline: arm OR emit a planctl `not-found` terminal.
+    // First-paint baseline: arm OR emit a plan `not-found` terminal.
     // A `not-found` only arises on the synchronous (non-deferred) path —
     // the deferred path is a present-then-absent drop, which is
     // `deleted`/`met`, never `not-found`.
@@ -1418,8 +1418,8 @@ export async function runAwait(
       for (let i = 0; i < slots.length; i++) {
         const slot = slots[i];
         const ev = evals[i];
-        if (slot?.kind === "planctl" && ev?.kind === "not-found") {
-          emitPlanctlFailure(slot, "not-found", 1, undefined);
+        if (slot?.kind === "plan" && ev?.kind === "not-found") {
+          emitPlanFailure(slot, "not-found", 1, undefined);
           return;
         }
         // Refuse-upfront: a `monitor-running` slot that's already `met` at
@@ -1448,7 +1448,7 @@ export async function runAwait(
       const snap = latestReadiness;
       for (const i of deferred) {
         const slot = slots[i];
-        if (slot === undefined || slot.kind !== "planctl") {
+        if (slot === undefined || slot.kind !== "plan") {
           continue;
         }
         let outcome: ReQueryOutcome = "miss";
@@ -1495,19 +1495,19 @@ export async function runAwait(
       }
     }
 
-    // Short-circuit on any planctl terminal failure (deleted / stuck).
+    // Short-circuit on any plan terminal failure (deleted / stuck).
     for (let i = 0; i < slots.length; i++) {
       const slot = slots[i];
       const ev = evals[i];
-      if (slot?.kind !== "planctl" || ev === undefined || ev === null) {
+      if (slot?.kind !== "plan" || ev === undefined || ev === null) {
         continue;
       }
       if (ev.kind === "deleted") {
-        emitPlanctlFailure(slot, "deleted", 4, undefined);
+        emitPlanFailure(slot, "deleted", 4, undefined);
         return;
       }
       if (ev.kind === "stuck" && args.failOnStuck) {
-        emitPlanctlFailure(slot, "stuck", 5, ev.detail);
+        emitPlanFailure(slot, "stuck", 5, ev.detail);
         return;
       }
     }
@@ -1523,7 +1523,7 @@ export async function runAwait(
   const onReadinessSnapshot = (snap: ReadinessClientSnapshot): void => {
     latestReadiness = snap;
     paintGate.readiness = true;
-    // When riding readiness for git/jobs (a planctl-bearing combo), pull
+    // When riding readiness for git/jobs (a plan-bearing combo), pull
     // the raw rows off the snapshot rather than a separate subscribe.
     if (hasGitClean) {
       latestGitRows = snap.gitStatus;
@@ -1576,7 +1576,7 @@ export async function runAwait(
         }
         if (stream === "readiness") {
           for (const slot of slots) {
-            if (slot.kind === "planctl") {
+            if (slot.kind === "plan") {
               slot.presentThisConnection = false;
             }
           }
@@ -1609,10 +1609,10 @@ export async function runAwait(
     });
   };
 
-  // Aggregate timeout fields. Single-planctl is byte-identical; otherwise
+  // Aggregate timeout fields. Single-plan is byte-identical; otherwise
   // a generalized shape.
   const timeoutFields = (): Record<string, string> => {
-    if (single && slots[0]?.kind === "planctl") {
+    if (single && slots[0]?.kind === "plan") {
       const t = slots[0].target;
       return {
         reason: "timeout",
@@ -1720,7 +1720,7 @@ export async function runAwait(
   // read any rows off the snapshot; the first `onSnapshot` IS the signal
   // ("the daemon is serving"), so `onServerUpSnapshot` flips the paint flag
   // and `evaluate()` latches `met` on first paint. NEVER any give-up extras
-  // and NO planctl re-query machinery. (fn-757: the give-up-eligible streams
+  // and NO plan re-query machinery. (fn-757: the give-up-eligible streams
   // above are ALSO exempt unless `--connect-timeout` arms `giveUpExtras`.)
   if (openServerUp) {
     readinessHandle = subscribeReadiness({

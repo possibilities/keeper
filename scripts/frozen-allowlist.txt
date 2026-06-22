@@ -87,4 +87,3 @@ exempt|src/git-worker.ts
 exempt|src/derivers.ts
 exempt|src/reducer.ts
 exempt|src/daemon.ts
-exempt|cli/commit-work.ts
