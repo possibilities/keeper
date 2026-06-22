@@ -10,7 +10,8 @@
 // readonly envelope when last_validated_at is already null, else writes the
 // marker to null + bumps updated_at and rides the mutating emit seam so one
 // chore(plan): refine-context <epic> commit lands. Typed errors —
-// BAD_EPIC_ID / EPIC_NOT_FOUND — emit {success:false, error:{code,message}}.
+// BAD_EPIC_ID / NO_PROJECT / EPIC_NOT_FOUND — emit
+// {success:false, error:{code,message}}.
 
 import { existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
@@ -68,6 +69,14 @@ export function runRefineContext(opts: {
   // contract). The resolved owning project is where any --invalidate write lands.
   const resolution = tryResolveOwningProjectForId(epicId, project);
   if (!resolution.ok) {
+    if (resolution.reason === "no_project") {
+      emitRefineError(
+        "NO_PROJECT",
+        `No planctl project found at ${resolution.projectRoot}. ` +
+          `Run 'planctl init' first.`,
+        format,
+      );
+    }
     if (resolution.reason === "ambiguous") {
       emitRefineError(
         "EPIC_NOT_FOUND",

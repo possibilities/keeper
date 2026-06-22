@@ -197,6 +197,20 @@ describe("empty epic + gates", () => {
     );
   });
 
+  test("--project at a path without a board -> NO_PROJECT, exit 1", () => {
+    // Regression for F1/TG1: refine-context's bespoke not-found branch dropped
+    // the resolver's typed no_project reason and rendered "Epic not found",
+    // sending an operator who fat-fingered --project hunting a missing epic.
+    const { epicId } = makeEpic(1);
+    const r = run(["refine-context", epicId, "--project", project.home]);
+    expect(r.code).toBe(1);
+    const err = envelope(r.output).error as Record<string, unknown>;
+    expect(err.code).toBe("NO_PROJECT");
+    expect(err.message as string).toContain("No planctl project found at");
+    expect(err.message as string).toContain(project.home);
+    expect(err.message as string).not.toContain("Epic not found");
+  });
+
   // test_run_directly_no_click_context — DROP (python_only): calls
   //   run_refine_context.run(SimpleNamespace(...)) in-process to exercise the
   //   no-click-context sentinel; not a CLI-observable surface.
