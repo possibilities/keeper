@@ -5125,6 +5125,35 @@ function sortJobLinks(
 }
 
 /**
+ * Replace-by-key merge of one session's slice into an epic's `job_links` array.
+ * MERGE ONLY — the shared core both `syncPlanLinks` and `syncJobLinksOnJobWrite`
+ * splice through: drop EVERY entry whose `job_id === dropJobId`, append the
+ * caller's freshly-built `replacements`, re-sort by the locked `(kind, job_id)`
+ * total order. Returns a NEW array; mutates no input.
+ *
+ * The merge is idempotent and non-additive: dropping the old slice before
+ * splicing means a re-fold reproduces the same bytes (additive append would
+ * double). Every OTHER session's entry is preserved verbatim — the
+ * enrichment-freshness invariant (every enriched-column jobs-write fans out via
+ * `syncJobLinksOnJobWrite`) makes that byte-identical to a full re-derive.
+ *
+ * What stays per-caller (NOT merged here): the classifier `kind` ownership
+ * (`syncPlanLinks` derives a fresh `kind`; the sibling re-stamps the OLD entry's
+ * `kind`), the closer/`sort_path`/`queue_jump`/cascade derivation, and the
+ * shell-insert shape. Those differ per caller and live at the call sites.
+ */
+function mergeJobLinkSlice(
+  existing: readonly JobLinkEntry[],
+  dropJobId: string,
+  replacements: readonly JobLinkEntry[],
+): JobLinkEntry[] {
+  const merged = existing.filter((e) => e.job_id !== dropJobId);
+  merged.push(...replacements);
+  sortJobLinks(merged);
+  return merged;
+}
+
+/**
  * Enrich a thin classifier-output `JobLink` (`{kind, job_id}`) into the widened
  * `JobLinkEntry` shape carried on `epics.job_links`, adding the display +
  * annotation fields off the post-write `jobs` row. Shared between
@@ -5242,12 +5271,13 @@ function syncJobLinksOnJobWrite(
       // corrupt blob can't wedge the fan-out.
       continue;
     }
-    const next = existing.filter((e) => e.job_id !== jobId);
-    next.push({
-      ...enriched,
-      kind: oldEntry.kind,
-    });
-    sortJobLinks(next);
+    // Replace-by-key via the shared MERGE helper: drop this job_id's entry,
+    // splice ONE re-stamped entry carrying the OLD `kind` (the classifier, not
+    // the jobs-write, owns creator vs. refiner; this helper only refreshes
+    // display fields). Closer/sort/cascade/shell-insert stay per-caller below.
+    const next = mergeJobLinkSlice(existing, jobId, [
+      { ...enriched, kind: oldEntry.kind },
+    ]);
     const jobLinksJson = JSON.stringify(next);
     if (epicRow != null) {
       db.run(
@@ -5521,6 +5551,43 @@ function commitTrailerInvocationsFor(
 }
 
 /**
+ * One session's commit-trailer invocations read DIRECTLY via the
+ * `idx_commit_trailer_facts_session` index — the normal-path counterpart to
+ * {@link loadAllCommitTrailerFacts}, which loads EVERY session's facts. The
+ * per-session merge needs only the triggering session's slice, so this avoids
+ * the whole-table load (constant per-event cost independent of board size).
+ * `ORDER BY event_id ASC` preserves the historical total order the classifier's
+ * ts-tie dedup depends on. Pure indexed read; never throws.
+ */
+function commitTrailerInvocationsForSession(
+  db: Database,
+  sessionId: string,
+): ClassifierInvocation[] {
+  const rows = db
+    .query(
+      `SELECT event_id, plan_op, plan_target, plan_epic_id, committed_at_ms
+         FROM commit_trailer_facts
+        WHERE committer_session_id = ?
+        ORDER BY event_id ASC`,
+    )
+    .all(sessionId) as {
+    event_id: number;
+    plan_op: string;
+    plan_target: string;
+    plan_epic_id: string | null;
+    committed_at_ms: number;
+  }[];
+  return rows.map((r) => ({
+    ts: r.committed_at_ms / 1000,
+    op: r.plan_op,
+    target: r.plan_target,
+    epic_id: r.plan_epic_id,
+    subject_present: true,
+    event_id: r.event_id,
+  }));
+}
+
+/**
  * Every distinct `committer_session_id` whose commit-trailer facts touch ANY of
  * `epicIds` — the commit-channel counterpart to {@link syncPlanLinks}'s
  * scrape-side session sweep. Without it, a session that ONLY ever produced
@@ -5560,25 +5627,38 @@ function syncPlanLinks(
   // The backing jobs row must exist for an epic_links UPDATE to land. A planctl
   // invocation in a session with no SessionStart is an orphan; skip the
   // jobs-side write but still re-derive every touched epic's job_links so
-  // symmetry holds.
+  // symmetry holds. This row's presence ALSO selects the per-epic strategy: the
+  // normal path (row present) runs an idempotent per-SESSION replace-by-key
+  // merge using this session's pre-state diff; the orphan path (row absent) has
+  // no pre-state to diff and retains the full cross-session sweep. The choice is
+  // a pure function of the event id (the jobs row exists deterministically at
+  // this cursor position), so re-fold stays byte-identical.
   const jobsRow = db
     .query("SELECT epic_links FROM jobs WHERE job_id = ?")
     .get(sessionId) as { epic_links: string | null } | null;
+  const isOrphan = jobsRow == null;
 
-  // Load EVERY commit-trailer fact in ONE pass and group by session. Reused
-  // for this session's facts, the cross-session sweep, and the per-epic
-  // rebuild below — so a `syncPlanLinks` call performs exactly one
-  // commit-trailer load instead of the old ~2 + one-per-swept-session scans.
-  // Loaded before the `touchedEpics.size === 0` gate because the current
-  // session's own facts (unioned just below) are needed before that return.
+  // Commit-trailer facts. The orphan path needs the WHOLE pre-grouped log (its
+  // cross-session sweep rebuilds every touched epic over every session); the
+  // normal path needs only THIS session's slice for the merge, read via the
+  // per-session index — constant per-event cost regardless of board size.
   const _splFactsT0 = _syncPlanLinksAccum != null ? performance.now() : 0;
-  const commitFacts = loadAllCommitTrailerFacts(db);
+  const orphanCommitFacts: CommitTrailerFacts | null = isOrphan
+    ? loadAllCommitTrailerFacts(db)
+    : null;
+  const thisSessionCommitFacts =
+    orphanCommitFacts != null
+      ? commitTrailerInvocationsFor(orphanCommitFacts, sessionId)
+      : commitTrailerInvocationsForSession(db, sessionId);
   if (_syncPlanLinksAccum != null) {
     _syncPlanLinksAccum.calls += 1;
     _syncPlanLinksAccum.factsLoadMs += performance.now() - _splFactsT0;
-    let _factsRows = 0;
-    for (const invs of commitFacts.factsBySession.values()) {
-      _factsRows += invs.length;
+    let _factsRows = thisSessionCommitFacts.length;
+    if (orphanCommitFacts != null) {
+      _factsRows = 0;
+      for (const invs of orphanCommitFacts.factsBySession.values()) {
+        _factsRows += invs.length;
+      }
     }
     _syncPlanLinksAccum.factsRows += _factsRows;
   }
@@ -5613,7 +5693,7 @@ function syncPlanLinks(
   // UNION the durable commit-trailer facts — the classifier dedups, so a scrape
   // and a commit for the same scaffold collapse to one creator edge, and a
   // scrape-NULL scaffold's commit fact alone still mints it.
-  invocations.push(...commitTrailerInvocationsFor(commitFacts, sessionId));
+  invocations.push(...thisSessionCommitFacts);
 
   // Compute the new epic_links from scratch (full-replace, never delta-merge —
   // delta-merge would double on re-fold). Windowless: every epic-mutating op
@@ -5650,75 +5730,102 @@ function syncPlanLinks(
     return;
   }
 
-  // Step 1: find every distinct session_id with at least one plan invocation
-  // touching any of `touchedEpics` (epic id as plan_epic_id or
-  // plan_target). UNION (not OR) so the planner uses BOTH partial indexes —
-  // SQLite picks one index per cross-column OR, but a UNION's branches each
-  // SEARCH their own index. The session_id set is identical to the OR form, so
-  // re-fold determinism holds.
-  const targetList = [...touchedEpics];
-  const placeholders = targetList.map(() => "?").join(",");
-  const sessionRows = db
-    .query(
-      `SELECT session_id
-         FROM events
-        WHERE plan_op IS NOT NULL
-          AND plan_epic_id IN (${placeholders})
-        UNION
-       SELECT session_id
-         FROM events
-        WHERE plan_op IS NOT NULL
-          AND plan_target IN (${placeholders})`,
-    )
-    .all(...targetList, ...targetList) as { session_id: string }[];
-  // Add the current session too, in case it touched a pre-state epic that no
-  // invocation now references (a dropped refiner edge) so its now-stale
-  // job_links entry gets pulled.
-  const sessionIds = new Set<string>(sessionRows.map((r) => r.session_id));
-  sessionIds.add(sessionId);
-  // The scrape-side sweep only sees sessions with populated sparse columns; add
-  // every commit-channel session (whose `Commit` events carry NULL sparse
-  // columns) touching a touched epic so the per-epic rebuild sees its
-  // commit-only creator/refiner.
-  for (const sid of commitTrailerSessionsForEpics(commitFacts, touchedEpics)) {
-    sessionIds.add(sid);
-  }
-  if (_syncPlanLinksAccum != null) {
-    _syncPlanLinksAccum.sweptSessions += sessionIds.size;
+  // ORPHAN-PATH cross-session sweep (full rebuild). Only the orphan path builds
+  // this — it has no per-session pre-state to diff, so it re-derives every
+  // touched epic over EVERY session that ever touched it (the wide commit-facts
+  // load above). The normal path skips all of this and merges this session's
+  // slice into the existing array instead.
+  let invocationsBySession: Map<string, ClassifierInvocation[]> | null = null;
+  if (isOrphan) {
+    // Step 1: find every distinct session_id with at least one plan invocation
+    // touching any of `touchedEpics` (epic id as plan_epic_id or
+    // plan_target). UNION (not OR) so the planner uses BOTH partial indexes —
+    // SQLite picks one index per cross-column OR, but a UNION's branches each
+    // SEARCH their own index. The session_id set is identical to the OR form, so
+    // re-fold determinism holds.
+    const targetList = [...touchedEpics];
+    const placeholders = targetList.map(() => "?").join(",");
+    const sessionRows = db
+      .query(
+        `SELECT session_id
+           FROM events
+          WHERE plan_op IS NOT NULL
+            AND plan_epic_id IN (${placeholders})
+          UNION
+         SELECT session_id
+           FROM events
+          WHERE plan_op IS NOT NULL
+            AND plan_target IN (${placeholders})`,
+      )
+      .all(...targetList, ...targetList) as { session_id: string }[];
+    // Add the current session too, in case it touched a pre-state epic that no
+    // invocation now references (a dropped refiner edge) so its now-stale
+    // job_links entry gets pulled.
+    const sessionIds = new Set<string>(sessionRows.map((r) => r.session_id));
+    sessionIds.add(sessionId);
+    // The scrape-side sweep only sees sessions with populated sparse columns; add
+    // every commit-channel session (whose `Commit` events carry NULL sparse
+    // columns) touching a touched epic so the per-epic rebuild sees its
+    // commit-only creator/refiner.
+    for (const sid of commitTrailerSessionsForEpics(
+      // biome-ignore lint/style/noNonNullAssertion: orphanCommitFacts is set iff isOrphan.
+      orphanCommitFacts!,
+      touchedEpics,
+    )) {
+      sessionIds.add(sid);
+    }
+    if (_syncPlanLinksAccum != null) {
+      _syncPlanLinksAccum.sweptSessions += sessionIds.size;
+    }
+
+    invocationsBySession = new Map<string, ClassifierInvocation[]>();
+    for (const sid of sessionIds) {
+      const sidInvRows = db
+        .query(
+          `SELECT id, ts, plan_op, plan_target, plan_epic_id,
+                  plan_subject_present
+             FROM events
+            WHERE session_id = ? AND plan_op IS NOT NULL
+            ORDER BY id ASC`,
+        )
+        .all(sid) as {
+        id: number;
+        ts: number;
+        plan_op: string;
+        plan_target: string | null;
+        plan_epic_id: string | null;
+        plan_subject_present: number | null;
+      }[];
+      const sidInvocations: ClassifierInvocation[] = sidInvRows.map((r) => ({
+        ts: r.ts,
+        op: normalizePlanOp(r.plan_op),
+        target: r.plan_target,
+        epic_id: r.plan_epic_id,
+        subject_present: r.plan_subject_present === 1,
+        event_id: r.id,
+      }));
+      // UNION this session's commit-trailer facts so the per-epic rebuild
+      // classifies BOTH channels symmetrically. Concat is safe — the classifier
+      // dedups + re-sorts by the total order (ts, event_id).
+      sidInvocations.push(
+        // biome-ignore lint/style/noNonNullAssertion: orphanCommitFacts is set iff isOrphan.
+        ...commitTrailerInvocationsFor(orphanCommitFacts!, sid),
+      );
+      invocationsBySession.set(sid, sidInvocations);
+    }
+  } else if (_syncPlanLinksAccum != null) {
+    // Normal path sweeps exactly one session (the triggering session merges its
+    // own slice). Record it so the breakdown counter stays honest.
+    _syncPlanLinksAccum.sweptSessions += 1;
   }
 
-  const invocationsBySession = new Map<string, ClassifierInvocation[]>();
-  for (const sid of sessionIds) {
-    const sidInvRows = db
-      .query(
-        `SELECT id, ts, plan_op, plan_target, plan_epic_id,
-                plan_subject_present
-           FROM events
-          WHERE session_id = ? AND plan_op IS NOT NULL
-          ORDER BY id ASC`,
-      )
-      .all(sid) as {
-      id: number;
-      ts: number;
-      plan_op: string;
-      plan_target: string | null;
-      plan_epic_id: string | null;
-      plan_subject_present: number | null;
-    }[];
-    const sidInvocations: ClassifierInvocation[] = sidInvRows.map((r) => ({
-      ts: r.ts,
-      op: normalizePlanOp(r.plan_op),
-      target: r.plan_target,
-      epic_id: r.plan_epic_id,
-      subject_present: r.plan_subject_present === 1,
-      event_id: r.id,
-    }));
-    // UNION this session's commit-trailer facts so the per-epic rebuild
-    // classifies BOTH channels symmetrically. Concat is safe — the classifier
-    // dedups + re-sorts by the total order (ts, event_id).
-    sidInvocations.push(...commitTrailerInvocationsFor(commitFacts, sid));
-    invocationsBySession.set(sid, sidInvocations);
-  }
+  // The normal path's single-session slice input: this session's scrape
+  // invocations UNIONed with its commit-trailer facts (the two-channel union),
+  // keyed under the triggering session id. Fed to `deriveJobLinks` per touched
+  // epic so the classifier emits exactly this session's creator/refiner edge.
+  const thisSessionSlice: Map<string, ClassifierInvocation[]> | null = isOrphan
+    ? null
+    : new Map([[sessionId, invocations]]);
 
   // Step 2: re-derive job_links for each touched epic and UPDATE the epic row
   // (shell-insert a missing one). Per-epic, also derive `created_by_closer_of`
@@ -5727,14 +5834,44 @@ function syncPlanLinks(
   // closer-chain leads back to this epic — inside the same transaction for
   // byte-identical re-fold.
   for (const epicId of touchedEpics) {
-    const newJobLinks = deriveJobLinks(invocationsBySession, epicId);
-    // Enrich each thin classifier entry into the widened JobLinkEntry shape via
-    // the SAME helper the jobs-write fan-out uses — a single source of truth for
-    // the on-disk projection shape is required for re-fold determinism.
-    const enriched: JobLinkEntry[] = newJobLinks.map((e) =>
-      enrichJobLink(db, e),
-    );
-    sortJobLinks(enriched);
+    // Pre-filter tombstoned epics before the derive loop: a deleted epic gets no
+    // job_links UPDATE / shell-insert (it would resurrect a ghost row), but its
+    // sort_path cascade STILL runs so a live descendant re-stamps off the
+    // (already-deleted) parent's path. Matches the old code's net effect: the
+    // shell-insert was tombstone-suppressed and an UPDATE on a missing/deleted
+    // row was a no-op, while the cascade always fired.
+    if (isEpicTombstoned(db, epicId)) {
+      cascadeSortPath(db, epicId, eventId, ts);
+      continue;
+    }
+
+    let enriched: JobLinkEntry[];
+    if (isOrphan) {
+      // ORPHAN: full re-derive over every swept session, then enrich every
+      // entry — there is no pre-state to preserve.
+      // biome-ignore lint/style/noNonNullAssertion: invocationsBySession is set iff isOrphan.
+      const newJobLinks = deriveJobLinks(invocationsBySession!, epicId);
+      enriched = newJobLinks.map((e) => enrichJobLink(db, e));
+      sortJobLinks(enriched);
+    } else {
+      // NORMAL: replace-by-key merge. Drop THIS session's entries from the
+      // existing array, splice its freshly-derived+enriched slice, preserve
+      // every other session's entry VERBATIM (the enrichment-freshness
+      // invariant — every enriched-column jobs-write already fans out via
+      // `syncJobLinksOnJobWrite` — makes that byte-identical to a full
+      // re-derive). Enrichment is limited to THIS session's spliced entries.
+      const epicRow = db
+        .query("SELECT job_links FROM epics WHERE epic_id = ?")
+        .get(epicId) as { job_links: string | null } | null;
+      const existing =
+        epicRow != null
+          ? parseEmbeddedLinks<JobLinkEntry>(epicRow.job_links)
+          : [];
+      // biome-ignore lint/style/noNonNullAssertion: thisSessionSlice is set iff !isOrphan.
+      const sliceLinks = deriveJobLinks(thisSessionSlice!, epicId);
+      const sliceEnriched = sliceLinks.map((e) => enrichJobLink(db, e));
+      enriched = mergeJobLinkSlice(existing, sessionId, sliceEnriched);
+    }
     const jobLinksJson = JSON.stringify(enriched);
 
     // Derive `created_by_closer_of` from the creator entries whose backing

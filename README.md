@@ -95,9 +95,12 @@ sharing the `WHERE plan_op IS NOT NULL` predicate: `idx_events_plan_session`
 on `(session_id, id)` for the per-session ordered scan, plus the Tier 2
 `idx_events_plan_epic` on `(plan_epic_id, session_id, id)` and
 `idx_events_plan_target` on `(plan_target, session_id, id)` for the
-reducer's `syncPlanLinks` cross-session sweep — the sweep is a UNION
+reducer's `syncPlanLinks` ORPHAN-path cross-session sweep — the sweep is a UNION
 of `plan_epic_id IN (...)` and `plan_target IN (...)` so the planner
-SEARCHes both indexes (a cross-column `OR` would have to scan one).
+SEARCHes both indexes (a cross-column `OR` would have to scan one). The normal
+per-session-merge path no longer runs this sweep; it re-derives only the
+triggering session via `idx_events_plan_session`, so per-event cost is
+independent of board size.
 `events.config_dir` rides without its own index — it is read off
 `jobs.config_dir` (a steady-state attribution column), not the event log.
 
@@ -570,7 +573,10 @@ Keeper has no `install` verb. Wire it up manually:
    `[ptufold-breakdown]` (PostToolUse), and `[pretufold-breakdown]` (PreToolUse
    — covers the `/plan:plan` opener fold). The commit / PostToolUse / PreToolUse
    breakdowns carry `plan_*` counters (calls, touched epics, swept sessions,
-   trailer-fact rows + load ms) that attribute the `syncPlanLinks` fan-out.
+   trailer-fact rows + load ms) that attribute the `syncPlanLinks` fan-out. On
+   the normal per-session-merge path `swept_sessions` is 1 (only the triggering
+   session is re-derived); a count growing with board size means the orphan
+   full-sweep path fired.
    Steady folds stay silent, so a quiet `server.stderr` is the fold-latency
    all-clear.
 
@@ -2366,22 +2372,38 @@ parses as `{plan|work|close}::<ref>`
 fan-out rides alongside: every `plan_op != NULL` event AND (epic fn-695,
 schema v54) every `Commit` event carrying the `Planctl-Op` / `Planctl-Target`
 / `Session-Id` trailers triggers the `syncPlanLinks` helper, which
-re-derives per-session `jobs.epic_links` and per-epic `epics.job_links` from
-the session's `keeper plan` footprint — the deduped UNION of the legacy
-stdout-scrape rows and the durable commit-trailer facts — classified
-unconditionally (no time window): every epic-mutating op links as creator
-(`epic-create` OR `scaffold` with an epic-shaped target — scaffold is the
-canonical epic-create path on this codebase) or refiner (any other
-epic-touching mutation), gated by the read-only `subject_present` skip AND the
-v80 (fn-881) autopilot-op exclusion that drops the worker's `done` and the
-closer's `close` op so `refiner` means only genuine plan-shaping edits.
-The classifier sorts on a `(ts, event_id)` total order so per-session
-creator-suppression (a session that scaffolds AND refines the same epic emits
-ONE creator edge) is deterministic on `ts`-ties. The
-commit-trailer side reads the indexed `commit_trailer_facts` projection
-(schema v67, fn-807) ONCE per call — `foldCommit` writes one fact row per
-trailer-bearing `Commit` in its own transaction — instead of re-scanning every
-`Commit` blob once per swept session (the fold fan-out the projection retired).
+re-derives the triggering session's `jobs.epic_links` from its `keeper plan`
+footprint — the deduped UNION of the legacy stdout-scrape rows and the durable
+commit-trailer facts — and merges that session's slice into each touched epic's
+`epics.job_links`. Ops are classified unconditionally (no time window): every
+epic-mutating op links as creator (`epic-create` OR `scaffold` with an
+epic-shaped target — scaffold is the canonical epic-create path on this
+codebase) or refiner (any other epic-touching mutation), gated by the read-only
+`subject_present` skip AND the v80 (fn-881) autopilot-op exclusion that drops
+the worker's `done` and the closer's `close` op so `refiner` means only genuine
+plan-shaping edits. The classifier sorts on a `(ts, event_id)` total order so
+per-session creator-suppression (a session that scaffolds AND refines the same
+epic emits ONE creator edge) is deterministic on `ts`-ties. The per-epic
+`epics.job_links` update is an idempotent per-SESSION replace-by-key merge
+(the shared `mergeJobLinkSlice` helper, also used by the `syncJobLinksOnJobWrite`
+reverse fan-out): drop every entry whose `job_id` is the triggering session,
+splice that session's freshly-derived + enriched slice, preserve every OTHER
+session's entry verbatim, re-sort on the locked `(kind, job_id)` total order.
+Preserving other sessions' entries verbatim is byte-identical to the old full
+re-derive because the enrichment-freshness invariant holds — every jobs-write
+that changes an enriched display column (`title` / `state` / `last_*`) already
+fans out via `syncJobLinksOnJobWrite` to re-stamp the matching entry — so the
+merge's per-event cost is independent of how many sessions ever touched the epic
+AND of board size (a static source-text guard in `test/refold-equivalence.test.ts`
+pins the invariant). An ORPHAN invocation (no backing `jobs` row — a session
+with no SessionStart yet) has no per-session pre-state to diff, so it retains the
+full cross-session sweep (the path choice is deterministic per event id).
+The commit-trailer side reads the indexed `commit_trailer_facts` projection
+(schema v67, fn-807) — `foldCommit` writes one fact row per trailer-bearing
+`Commit` in its own transaction — the normal path reading only the triggering
+session's slice via `idx_commit_trailer_facts_session`, the orphan path loading
+the whole projection ONCE (instead of re-scanning every `Commit` blob per swept
+session, the fold fan-out the projection retired).
 `syncPlanLinks` stays the SINGLE writer of both cells; `foldCommit` only
 triggers the rebuild, never writes the edge directly. The commit channel
 makes the edge survive any stdout pipe / `grep` / truncation that NULLs

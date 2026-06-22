@@ -85,11 +85,17 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   the git scan, set `seed_required`, scan + populate the surface, then persist the
   floor + clear `seed_required` atomically; a crash mid-seed leaves `seed_required` set
   so the next boot re-seeds. The boot-seed runs AFTER drain, BEFORE serving.
-- **A fold whose per-event cost grows with history is a re-fold time-bomb.** Any
-  projection whose per-event fold cost scales with history length (the git fold's
-  `computeRepoBashWindows` self-joins the whole log per `GitSnapshot` — the ~6-day
-  fn-856 replay over 4.3M events) is a replay time-bomb: model it **live-only or
-  constant-bounded**, never O(history)-per-event.
+- **A fold whose per-event cost grows with history — OR with board / projection
+  size — is a re-fold time-bomb.** Any projection whose per-event fold cost scales
+  with history length (the git fold's `computeRepoBashWindows` self-joins the whole
+  log per `GitSnapshot` — the ~6-day fn-856 replay over 4.3M events) OR with the
+  board / projection size (the old `syncPlanLinks` re-derived a touched epic over
+  EVERY session that ever touched it — O(touched_epics × swept_sessions) per plan
+  event, the fn-888 ~15-min socket-down catch-up) is a replay time-bomb: model it
+  **live-only, constant-bounded, or an idempotent per-key replace-merge** (fn-888
+  swapped the full session-sweep for a per-session `mergeJobLinkSlice` whose cost is
+  independent of how many sessions touched the epic), never
+  O(history)/O(board)-per-event.
 
 ## Hook rules
 

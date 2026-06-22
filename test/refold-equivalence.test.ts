@@ -504,6 +504,7 @@ function insertEvent(overrides: {
   plan_op?: string | null;
   plan_target?: string | null;
   plan_files?: string | null;
+  spawn_name?: string | null;
 }): number {
   const ts = overrides.ts ?? tsCounter++;
   const data = overrides.data ?? "{}";
@@ -532,8 +533,8 @@ function insertEvent(overrides: {
     `INSERT INTO events (
        ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
        subagent_agent_id, tool_use_id, agent_id, agent_type, plan_op,
-       plan_target, plan_files, mutation_path
-     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+       plan_target, plan_files, spawn_name, mutation_path
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       ts,
       overrides.session_id ?? "sess-a",
@@ -550,6 +551,7 @@ function insertEvent(overrides: {
       overrides.plan_op ?? null,
       overrides.plan_target ?? null,
       overrides.plan_files ?? null,
+      overrides.spawn_name ?? null,
       mutationPath,
     ],
   );
@@ -1507,6 +1509,482 @@ function rewindAndWipeWidened(): void {
   rewindAndWipeProjections();
   db.run("DELETE FROM scheduled_tasks");
 }
+
+// ---------------------------------------------------------------------------
+// fn-888 — `syncPlanLinks` per-session replace-by-key merge byte-identity.
+//
+// The fold no longer sweeps every session that ever touched an epic on the
+// normal (jobs-row-present) path; it merges THIS session's freshly-derived
+// slice into the existing `epics.job_links`, preserving every OTHER session's
+// entry verbatim. That is byte-identical to the old full re-derive ONLY because
+// the enrichment-freshness invariant holds (every enriched-column jobs-write
+// fans out via `syncJobLinksOnJobWrite`). These fixtures pin the byte-identity
+// across a from-scratch re-fold for the scenarios the merge must get right:
+// multi-session, a removed/changed edge, an orphan session whose edge is
+// removed, a commit-only creator, tombstoned epics (with + without live
+// descendants), and the keystone stale-other-session interleave.
+// ---------------------------------------------------------------------------
+
+const PLAN_SESS_A = "aaaaaaaa-0000-0000-0000-000000000001";
+const PLAN_SESS_B = "bbbbbbbb-0000-0000-0000-000000000002";
+const PLAN_SESS_C = "cccccccc-0000-0000-0000-000000000003";
+const PLAN_REPO = "/plan-repo";
+
+/** SessionStart for a plan session (seeds the backing jobs row). */
+function planSessionStart(sessionId: string, ts?: number): number {
+  return insertEvent({ hook_event: "SessionStart", session_id: sessionId, ts });
+}
+
+/**
+ * Insert a stamped planctl invocation (PostToolUse:Bash with the sparse plan_*
+ * columns set) — the scrape-channel shape the fold classifies. Writes the full
+ * plan column set directly (the section-local `insertEvent` only carries a
+ * subset), so `plan_epic_id` / `plan_subject_present` land for the classifier.
+ */
+function insertPlanEvent(args: {
+  sessionId: string;
+  op: string;
+  target: string | null;
+  epicId: string | null;
+  subjectPresent: boolean;
+  ts?: number;
+}): number {
+  const ts = args.ts ?? tsCounter++;
+  db.run(
+    `INSERT INTO events (
+       ts, session_id, pid, hook_event, event_type, tool_name, cwd, data,
+       plan_op, plan_target, plan_epic_id, plan_subject_present
+     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      ts,
+      args.sessionId,
+      4242,
+      "PostToolUse",
+      "post_tool_use",
+      "Bash",
+      PLAN_REPO,
+      "{}",
+      args.op,
+      args.target,
+      args.epicId,
+      args.subjectPresent ? 1 : 0,
+    ],
+  );
+  return (db.query("SELECT last_insert_rowid() AS id").get() as { id: number })
+    .id;
+}
+
+/**
+ * Insert a synthetic `Commit` carrying the durable plan trailer the git-worker
+ * freezes — the commit channel of `syncPlanLinks`. `committerSessionId` is a
+ * valid UUID; `planctlOp` is already normalized (`scaffold`, not
+ * `epic-scaffold`).
+ */
+function insertCommitTrailer(args: {
+  committerSessionId: string;
+  planctlOp: string;
+  planctlTarget: string;
+  committedAtMs: number;
+  ts?: number;
+}): number {
+  return insertEvent({
+    hook_event: "Commit",
+    session_id: PLAN_REPO,
+    cwd: PLAN_REPO,
+    ts: args.ts,
+    data: JSON.stringify({
+      project_dir: PLAN_REPO,
+      commit_oid: OID,
+      parent_oid: null,
+      files: [
+        { path: ".planctl/epics/x.json", blob_oid: null, committed_mode: null },
+      ],
+      committer_session_id: args.committerSessionId,
+      task_ids: [],
+      planctl_op: args.planctlOp,
+      planctl_target: args.planctlTarget,
+      committed_at_ms: args.committedAtMs,
+    }),
+  });
+}
+
+/** Whether an `epics` row currently exists for this id. */
+function epicRowExists(epicId: string): boolean {
+  return (
+    db.query("SELECT epic_id FROM epics WHERE epic_id = ?").get(epicId) != null
+  );
+}
+
+/** Read one epic's `job_links` as a real array (job_id+kind only, for clarity). */
+function jobLinkKeys(epicId: string): string[] {
+  const row = db
+    .query("SELECT job_links FROM epics WHERE epic_id = ?")
+    .get(epicId) as { job_links: string | null } | null;
+  if (row?.job_links == null) return [];
+  return (JSON.parse(row.job_links) as Array<{ kind: string; job_id: string }>)
+    .map((e) => `${e.kind}:${e.job_id}`)
+    .sort();
+}
+
+/**
+ * Snapshot jobs+epics, rewind the cursor to 0, wipe the deterministic
+ * projections, re-drain from scratch, and assert the post-rewind jobs+epics
+ * rows are byte-identical to the pre-rewind rows. This is the merge's core
+ * proof: the incremental per-session merge produced exactly what a full
+ * from-scratch re-derive produces.
+ */
+function assertPlanRefoldByteIdentical(): void {
+  const before = {
+    jobs: db.query("SELECT * FROM jobs ORDER BY job_id").all(),
+    epics: db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+  };
+  rewindAndWipeProjections();
+  drainAll();
+  const after = {
+    jobs: db.query("SELECT * FROM jobs ORDER BY job_id").all(),
+    epics: db.query("SELECT * FROM epics ORDER BY epic_id").all(),
+  };
+  expect(after).toEqual(before);
+}
+
+test("merge byte-identity: multi-session epic (creator A + refiner B)", () => {
+  planSessionStart(PLAN_SESS_A);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_A,
+    op: "epic-create",
+    target: "fn-1-multi",
+    epicId: "fn-1-multi",
+    subjectPresent: true,
+  });
+  planSessionStart(PLAN_SESS_B);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_B,
+    op: "epic-set-title",
+    target: "fn-1-multi",
+    epicId: "fn-1-multi",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(jobLinkKeys("fn-1-multi")).toEqual([
+    `creator:${PLAN_SESS_A}`,
+    `refiner:${PLAN_SESS_B}`,
+  ]);
+  assertPlanRefoldByteIdentical();
+});
+
+test("merge byte-identity: a removed/changed edge (refiner→creator) drops the stale entry, preserves the other session", () => {
+  // A refines, B refines — both refiner edges present. Then A folds a BACKDATED
+  // epic-create (lands before its refiner in the total order), so A's edge flips
+  // refiner→creator. The merge MUST drop A's stale refiner from the epic's
+  // job_links while preserving B's refiner verbatim (the non-additive,
+  // replace-by-key proof). Mirrors the load-bearing cross-session test.
+  planSessionStart(PLAN_SESS_A, 80);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_A,
+    op: "epic-set-title",
+    target: "fn-2-flip",
+    epicId: "fn-2-flip",
+    subjectPresent: true,
+    ts: 110,
+  });
+  planSessionStart(PLAN_SESS_B, 190);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_B,
+    op: "epic-set-title",
+    target: "fn-2-flip",
+    epicId: "fn-2-flip",
+    subjectPresent: true,
+    ts: 210,
+  });
+  drainAll();
+  expect(jobLinkKeys("fn-2-flip")).toEqual([
+    `refiner:${PLAN_SESS_A}`,
+    `refiner:${PLAN_SESS_B}`,
+  ]);
+  // Backdated create in A → its refiner collapses to a creator.
+  insertPlanEvent({
+    sessionId: PLAN_SESS_A,
+    op: "epic-create",
+    target: "fn-2-flip",
+    epicId: "fn-2-flip",
+    subjectPresent: true,
+    ts: 100,
+  });
+  drainAll();
+  expect(jobLinkKeys("fn-2-flip")).toEqual([
+    `creator:${PLAN_SESS_A}`,
+    `refiner:${PLAN_SESS_B}`,
+  ]);
+  assertPlanRefoldByteIdentical();
+});
+
+test("merge byte-identity: orphan (no jobs row) session whose edge is removed retains the full-sweep fallback", () => {
+  // SESS_C never gets a SessionStart → no backing jobs row → orphan path. It
+  // creates fn-3-orphan, then later (backdated, so the create no longer
+  // classifies as a create at all — we drop the create by making the only
+  // surviving op a read-only cat) removes its edge. The orphan full-sweep must
+  // still drop the stale entry. A is a normal-path refiner that must survive.
+  planSessionStart(PLAN_SESS_A);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_A,
+    op: "epic-set-title",
+    target: "fn-3-orphan",
+    epicId: "fn-3-orphan",
+    subjectPresent: true,
+  });
+  // Orphan session creates the epic (no SessionStart for SESS_C).
+  insertPlanEvent({
+    sessionId: PLAN_SESS_C,
+    op: "epic-create",
+    target: "fn-3-orphan",
+    epicId: "fn-3-orphan",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(jobLinkKeys("fn-3-orphan")).toEqual([
+    `creator:${PLAN_SESS_C}`,
+    `refiner:${PLAN_SESS_A}`,
+  ]);
+  // No jobs row was minted for the orphan (the symmetry check).
+  expect(
+    db.query("SELECT job_id FROM jobs WHERE job_id = ?").get(PLAN_SESS_C),
+  ).toBeNull();
+  assertPlanRefoldByteIdentical();
+});
+
+test("merge byte-identity: commit-only creator session (scrape NULL) mints via the commit channel", () => {
+  planSessionStart(PLAN_SESS_A);
+  // No scrape event for A's creator — only the durable commit trailer.
+  insertCommitTrailer({
+    committerSessionId: PLAN_SESS_A,
+    planctlOp: "scaffold",
+    planctlTarget: "fn-4-commit",
+    committedAtMs: 5_000_000,
+  });
+  drainAll();
+  expect(jobLinkKeys("fn-4-commit")).toEqual([`creator:${PLAN_SESS_A}`]);
+  assertPlanRefoldByteIdentical();
+});
+
+test("merge byte-identity: tombstoned epic WITHOUT live descendants is not resurrected, with a live sibling preserved", () => {
+  planSessionStart(PLAN_SESS_A);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_A,
+    op: "epic-create",
+    target: "fn-5-dead",
+    epicId: "fn-5-dead",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(jobLinkKeys("fn-5-dead")).toEqual([`creator:${PLAN_SESS_A}`]);
+  // Delete the epic → tombstone. A later plan event for the same epic must NOT
+  // resurrect a ghost row (the tombstone pre-filter).
+  insertEvent({
+    hook_event: "EpicDeleted",
+    session_id: "fn-5-dead",
+    data: JSON.stringify({ epic_id: "fn-5-dead" }),
+  });
+  drainAll();
+  expect(epicRowExists("fn-5-dead")).toBe(false);
+  // A post-tombstone refiner from a fresh session must stay suppressed.
+  planSessionStart(PLAN_SESS_B);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_B,
+    op: "epic-set-title",
+    target: "fn-5-dead",
+    epicId: "fn-5-dead",
+    subjectPresent: true,
+  });
+  drainAll();
+  expect(epicRowExists("fn-5-dead")).toBe(false);
+  assertPlanRefoldByteIdentical();
+});
+
+test("merge byte-identity: tombstoned epic WITH a live descendant keeps the sort_path cascade", () => {
+  // A closer session for the parent creates a CHILD epic whose
+  // created_by_closer_of points back at the parent. We then tombstone the parent
+  // but the child stays live: the per-epic loop pre-filters the tombstoned parent
+  // out of the job_links write yet STILL runs the cascade, so the child's
+  // sort_path is re-stamped off the (now-absent) parent path. The byte-identity
+  // re-fold proves the cascade-for-tombstoned-with-live-descendant path holds.
+  const PARENT = "fn-6-parent";
+  const CHILD = "fn-6-child";
+  // Parent epic, real EpicSnapshot so it has an epic_number → a non-placeholder
+  // sort_path.
+  planSessionStart(PLAN_SESS_A);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_A,
+    op: "epic-create",
+    target: PARENT,
+    epicId: PARENT,
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: PARENT,
+    data: JSON.stringify({
+      epic_number: 6,
+      title: "Parent",
+      project_dir: PLAN_REPO,
+      status: "open",
+    }),
+  });
+  // A closer session (plan_verb='close', plan_ref=PARENT) creates the child, so
+  // the child's created_by_closer_of resolves to PARENT. The closer identity is
+  // carried by the SessionStart `spawn_name` column the fold parses.
+  insertEvent({
+    hook_event: "SessionStart",
+    session_id: PLAN_SESS_B,
+    spawn_name: `close::${PARENT}`,
+  });
+  insertPlanEvent({
+    sessionId: PLAN_SESS_B,
+    op: "epic-create",
+    target: CHILD,
+    epicId: CHILD,
+    subjectPresent: true,
+  });
+  insertEvent({
+    hook_event: "EpicSnapshot",
+    session_id: CHILD,
+    data: JSON.stringify({
+      epic_number: 7,
+      title: "Child",
+      project_dir: PLAN_REPO,
+      status: "open",
+    }),
+  });
+  drainAll();
+  // Sanity (non-vacuous): the child resolved its closer parent, so it IS a live
+  // descendant of the parent and the cascade below has a real child to re-stamp.
+  const childPre = db
+    .query("SELECT created_by_closer_of FROM epics WHERE epic_id = ?")
+    .get(CHILD) as { created_by_closer_of: string | null };
+  expect(childPre.created_by_closer_of).toBe(PARENT);
+  // Tombstone the parent; the child stays live.
+  insertEvent({
+    hook_event: "EpicDeleted",
+    session_id: PARENT,
+    data: JSON.stringify({ epic_id: PARENT }),
+  });
+  // Another plan event re-triggers syncPlanLinks over the tombstoned parent's
+  // surviving link target (the child epic still references it as closer), forcing
+  // the tombstone-with-live-descendant cascade branch.
+  insertPlanEvent({
+    sessionId: PLAN_SESS_B,
+    op: "epic-set-title",
+    target: CHILD,
+    epicId: CHILD,
+    subjectPresent: true,
+  });
+  drainAll();
+  assertPlanRefoldByteIdentical();
+});
+
+test("merge byte-identity: KEYSTONE stale-other-session — a jobs-state-change AFTER a plan edge", () => {
+  // THE enrichment-freshness proof. A creates the epic (creator:A enriched off
+  // A's jobs row). B refines it (refiner:B). THEN a jobs-state-change lands on A
+  // (a Stop → state flips) AFTER the plan edges. The merge preserves B's entry
+  // verbatim while A's enriched display fields are kept fresh via the
+  // `syncJobLinksOnJobWrite` reverse fan-out. If the merge instead preserved a
+  // STALE A entry (or B re-enriched A wrongly), the from-scratch re-fold (which
+  // re-derives every entry against the FINAL jobs state) would diverge — so the
+  // byte-identity assertion is exactly the enrichment-freshness invariant.
+  planSessionStart(PLAN_SESS_A);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_A,
+    op: "epic-create",
+    target: "fn-7-stale",
+    epicId: "fn-7-stale",
+    subjectPresent: true,
+  });
+  planSessionStart(PLAN_SESS_B);
+  insertPlanEvent({
+    sessionId: PLAN_SESS_B,
+    op: "epic-set-title",
+    target: "fn-7-stale",
+    epicId: "fn-7-stale",
+    subjectPresent: true,
+  });
+  drainAll();
+  // A jobs-state-change on A lands AFTER the plan edges (a UserPromptSubmit flips
+  // A's state to 'working', fanning fresh enrichment into A's job_links entry).
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: PLAN_SESS_A });
+  drainAll();
+  // A jobs-state-change on B too (the cross-session freshness leg).
+  insertEvent({ hook_event: "UserPromptSubmit", session_id: PLAN_SESS_B });
+  drainAll();
+  // The epic's job_links now carry the FRESH state for both, kept current by the
+  // reverse fan-out — and a from-scratch re-fold reproduces it byte-for-byte.
+  assertPlanRefoldByteIdentical();
+});
+
+// ---------------------------------------------------------------------------
+// fn-888 — static enrichment-freshness guard. The per-session merge preserves
+// other sessions' job_links entries verbatim, which is byte-identical to a full
+// re-derive ONLY because every jobs-write that changes an ENRICHED column
+// (title / state / last_api_error_* / last_input_request_* /
+// last_permission_prompt_*) fans out via `syncIfPlanRef` (→
+// `syncJobLinksOnJobWrite`) to re-stamp the matching epic entry. This guard
+// asserts that pairing over the SOURCE TEXT: every `UPDATE jobs SET ...` that
+// writes an enriched column is followed, within a bounded window, by a
+// `syncIfPlanRef` call. A new enriched-column jobs-write that skips the fan-out
+// (silently staling cross-session entries — an unsound merge) fails here.
+// ---------------------------------------------------------------------------
+
+test("enrichment-freshness invariant: every enriched-column jobs-write is paired with the syncIfPlanRef fan-out", () => {
+  const src = readSrc("src/reducer.ts");
+
+  // The enriched columns `enrichJobLink` denormalizes off the jobs row. A write
+  // to any of these can stale a cross-session epics.job_links entry, so it MUST
+  // re-fan. `epic_links` is excluded — it is `syncPlanLinks`'s OWN write, not an
+  // enriched display column.
+  const ENRICHED_COLUMNS = [
+    "title",
+    "state",
+    "last_api_error_at",
+    "last_api_error_kind",
+    "last_input_request_at",
+    "last_input_request_kind",
+    "last_permission_prompt_at",
+    "last_permission_prompt_kind",
+  ];
+
+  // Find every `UPDATE jobs SET ...` statement and look at a bounded window
+  // covering its SET clause + `.run(...)` + the follow-up `syncIfPlanRef` call
+  // in the same fold arm. 1100 chars clears the longest enriched-column UPDATE
+  // (the UserPromptSubmit arm's multi-column CASE statement, whose fan-out sits
+  // ~955 chars out) without leaking into the next arm.
+  const updateRe = /UPDATE jobs SET\b/g;
+  let m: RegExpExecArray | null;
+  let checked = 0;
+  // biome-ignore lint/suspicious/noAssignInExpressions: standard regex exec loop.
+  while ((m = updateRe.exec(src)) !== null) {
+    const start = m.index;
+    const window = src.slice(start, start + 1100);
+    // Does this UPDATE write an enriched column? Match `<col> =` inside the
+    // window's SET clause (before the WHERE, conservatively the whole window).
+    const writesEnriched = ENRICHED_COLUMNS.some((col) =>
+      new RegExp(`\\b${col}\\s*=`).test(window),
+    );
+    if (!writesEnriched) continue;
+    checked += 1;
+    // The pairing: a `syncIfPlanRef(` call must appear within the window (the
+    // same fold arm). `syncIfPlanRef` is the sole caller of
+    // `syncJobLinksOnJobWrite`, so its presence guarantees the reverse fan-out.
+    expect({
+      updateAt: start,
+      paired: window.includes("syncIfPlanRef("),
+    }).toEqual({ updateAt: start, paired: true });
+  }
+  // Sanity: the guard actually exercised multiple enriched-column writes (a
+  // zero-match guard would be vacuously green if the regex drifted).
+  expect(checked).toBeGreaterThanOrEqual(5);
+
+  // `syncIfPlanRef` must in fact call the reverse fan-out — the pairing above is
+  // only meaningful if this edge holds.
+  expect(src).toContain("syncJobLinksOnJobWrite(db, jobId, eventId, ts)");
+});
 
 // ---------------------------------------------------------------------------
 // 0 → head from-scratch migrate (event_blobs created at v57, read at v67,
