@@ -26,7 +26,7 @@
 import { autoCommitFromInvocation, CommitFailed } from "./commit.ts";
 import { compactJson, formatOutput, type OutputFormat } from "./format.ts";
 import {
-  buildPlanctlInvocation,
+  buildPlanInvocation,
   type MutatingInvocation,
   type ReadonlyInvocation,
 } from "./invocation.ts";
@@ -87,16 +87,11 @@ export function emitMutating(
     queueJump?: boolean;
   },
 ): void {
-  const invocation = buildPlanctlInvocation(
-    opts.verb,
-    opts.target,
-    opts.detail,
-    {
-      repoRoot: opts.repoRoot,
-      primaryRepo: opts.primaryRepo,
-      queueJump: opts.queueJump,
-    },
-  );
+  const invocation = buildPlanInvocation(opts.verb, opts.target, opts.detail, {
+    repoRoot: opts.repoRoot,
+    primaryRepo: opts.primaryRepo,
+    queueJump: opts.queueJump,
+  });
 
   try {
     autoCommitFromInvocation(invocation);

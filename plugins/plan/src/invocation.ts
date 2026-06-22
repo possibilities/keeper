@@ -4,10 +4,10 @@
 //   files, op, target, subject, touched_path_files, repo_root, state_repo
 //   (mutating adds queue_jump, session_id after state_repo).
 //
-// buildPlanctlInvocationReadonly: read-only verbs touch nothing, so files/subject
+// buildPlanInvocationReadonly: read-only verbs touch nothing, so files/subject
 // are null and touched_path_files is empty; repo_root === state_repo.
 //
-// buildPlanctlInvocation (mutating): session id fail-CLOSED (throws when
+// buildPlanInvocation (mutating): session id fail-CLOSED (throws when
 // CLAUDE_CODE_SESSION_ID is absent); files = the sorted intersection of the
 // session's touched-paths log with git's dirty data-dir set; subject from
 // buildSubject; queue_jump + session_id ride after state_repo.
@@ -28,7 +28,7 @@ export interface ReadonlyInvocation {
   state_repo: string;
 }
 
-export function buildPlanctlInvocationReadonly(
+export function buildPlanInvocationReadonly(
   verb: string,
   repoRoot: string,
   target: string | null = null,
@@ -66,7 +66,7 @@ export interface MutatingInvocation {
  * `target` is the epic/task/project id; `detail` is the optional em-dash
  * subject suffix. Throws RuntimeError-equivalent when the session id is absent
  * (Python raises RuntimeError; here a plain Error with the same message). */
-export function buildPlanctlInvocation(
+export function buildPlanInvocation(
   verb: string,
   target: string,
   detail: string | null | undefined,

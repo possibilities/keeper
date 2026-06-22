@@ -21,7 +21,7 @@ import { findProjectsWithTask } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState, workerAgentForTier } from "../models.ts";
 import { writeWorkMarker } from "../session_markers.ts";
 import { hasDataDir, resolveDataDirOrDefault } from "../state_path.ts";
@@ -362,7 +362,7 @@ export function runClaim(args: ClaimArgs): void {
   // Mark this session as actively working the task (success path only, fail-open).
   writeWorkMarker(taskId);
 
-  const pc = buildPlanctlInvocationReadonly("claim", ctx.projectPath, taskId);
+  const pc = buildPlanInvocationReadonly("claim", ctx.projectPath, taskId);
   emitReadonly(
     {
       task_id: taskId,

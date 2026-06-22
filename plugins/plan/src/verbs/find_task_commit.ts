@@ -31,7 +31,7 @@ import { findProjectsWithTask } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { contextForRoot, type ProjectContext } from "../project.ts";
 import { hasDataDir } from "../state_path.ts";
 import { loadJsonSafe } from "../store.ts";
@@ -153,7 +153,7 @@ export function runFindTaskCommit(opts: {
     group.shas.map((sha) => ({ sha, repo: group.repo })),
   );
 
-  const pc = buildPlanctlInvocationReadonly(
+  const pc = buildPlanInvocationReadonly(
     "find-task-commit",
     ctx.projectPath,
     taskId,

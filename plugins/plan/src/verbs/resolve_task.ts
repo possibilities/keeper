@@ -15,7 +15,7 @@ import { findProjectsWithTask } from "../discovery.ts";
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { epicIdFromTask, isTaskId } from "../ids.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import {
   mergeTaskState,
   normalizeTask,
@@ -118,7 +118,7 @@ export function runResolveTask(opts: {
 
   const tier = (taskDef.tier as string | null) ?? null;
 
-  const pc = buildPlanctlInvocationReadonly("resolve-task", projPath, taskId);
+  const pc = buildPlanInvocationReadonly("resolve-task", projPath, taskId);
   emitReadonly(
     {
       task_id: taskId,

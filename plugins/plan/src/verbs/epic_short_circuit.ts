@@ -12,7 +12,7 @@ import { join } from "node:path";
 
 import { emitMutating, emitReadonly } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { resolveProject } from "../project.ts";
 import { atomicWriteJson, loadJson, nowIso } from "../store.ts";
 
@@ -39,7 +39,7 @@ export function runEpicInvalidate(args: ShortCircuitArgs): void {
     epicDef.last_validated_at === null ||
     epicDef.last_validated_at === undefined
   ) {
-    const pc = buildPlanctlInvocationReadonly(
+    const pc = buildPlanInvocationReadonly(
       "invalidate",
       ctx.projectPath,
       epicId,
@@ -78,7 +78,7 @@ export function runEpicQueueJump(args: ShortCircuitArgs): void {
 
   // Short-circuit: priority already set -> readonly envelope only, no write.
   if (epicDef.queue_jump === true) {
-    const pc = buildPlanctlInvocationReadonly(
+    const pc = buildPlanInvocationReadonly(
       "queue-jump",
       ctx.projectPath,
       epicId,

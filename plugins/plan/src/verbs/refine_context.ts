@@ -20,7 +20,7 @@ import { loadEpic, loadTasksForEpic, taskSortKey } from "../api.ts";
 import { emitMutating, emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId } from "../ids.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { tryResolveOwningProjectForId } from "../project.ts";
 import { atomicWriteJson, loadJson, nowIso } from "../store.ts";
 
@@ -123,7 +123,7 @@ export function runRefineContext(opts: {
       epicDef.last_validated_at === undefined
     ) {
       // Short-circuit: marker already null -> readonly envelope, no write.
-      const pc = buildPlanctlInvocationReadonly(
+      const pc = buildPlanInvocationReadonly(
         "refine-context",
         ctx.projectPath,
         epicId,

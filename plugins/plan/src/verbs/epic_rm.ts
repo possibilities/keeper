@@ -27,7 +27,7 @@ import { join, relative, resolve as resolvePath } from "node:path";
 import { resolveEpicGlobally } from "../discovery.ts";
 import { emitMutating, emitReadonly } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState } from "../models.ts";
 import { contextForRoot, type ProjectContext } from "../project.ts";
 import {
@@ -318,7 +318,7 @@ export function runEpicRm(args: EpicRmArgs): void {
   if (dryRun) {
     // No writes, no commit. Routes through a readonly invocation (mirrors
     // Python's emit({...}) whose click decorator emits its own read-only line).
-    const pc = buildPlanctlInvocationReadonly("rm", ctx.projectPath, epicId);
+    const pc = buildPlanInvocationReadonly("rm", ctx.projectPath, epicId);
     emitReadonly(
       {
         epic_id: epicId,

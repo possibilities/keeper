@@ -14,7 +14,7 @@
 
 import { didSelfEmit } from "./emit.ts";
 import { compactJson, type OutputFormat } from "./format.ts";
-import { buildPlanctlInvocationReadonly } from "./invocation.ts";
+import { buildPlanInvocationReadonly } from "./invocation.ts";
 import { resolveProject, trailerProjectRoot } from "./project.ts";
 import { dispatchGroup, type GroupSpec, leafUsageError } from "./subgroup.ts";
 import { runAuditSubmit } from "./verbs/audit_submit.ts";
@@ -800,11 +800,7 @@ function emitTrailer(
   const projectPath = projectPathOverride ?? resolveProject(format).projectPath;
   try {
     const envelope = {
-      plan_invocation: buildPlanctlInvocationReadonly(
-        verb,
-        projectPath,
-        target,
-      ),
+      plan_invocation: buildPlanInvocationReadonly(verb, projectPath, target),
     };
     process.stdout.write(`${compactJson(envelope)}\n`);
   } catch {

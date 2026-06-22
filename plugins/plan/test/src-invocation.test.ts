@@ -9,7 +9,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { buildPlanctlInvocation } from "../src/invocation.ts";
+import { buildPlanInvocation } from "../src/invocation.ts";
 
 let repo: string;
 const savedSid = process.env.CLAUDE_CODE_SESSION_ID;
@@ -59,13 +59,13 @@ describe("buildPlanctlInvocation session-id (fail-closed)", () => {
   test("throws when CLAUDE_CODE_SESSION_ID is absent", () => {
     delete process.env.CLAUDE_CODE_SESSION_ID;
     expect(() =>
-      buildPlanctlInvocation("claim", "fn-1-x.1", null, { repoRoot: repo }),
+      buildPlanInvocation("claim", "fn-1-x.1", null, { repoRoot: repo }),
     ).toThrow(/resolvable session_id/);
   });
 
   test("session_id rides on the payload verbatim", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-123";
-    const inv = buildPlanctlInvocation("claim", "fn-1-x.1", null, {
+    const inv = buildPlanInvocation("claim", "fn-1-x.1", null, {
       repoRoot: repo,
     });
     expect(inv.session_id).toBe("sid-123");
@@ -82,7 +82,7 @@ describe("buildPlanctlInvocation files = touched ∩ dirty", () => {
     git(["add", clean], repo);
     git(["commit", "-q", "-m", "commit clean"], repo);
 
-    const inv = buildPlanctlInvocation("done", "fn-9-x.1", null, {
+    const inv = buildPlanInvocation("done", "fn-9-x.1", null, {
       repoRoot: repo,
     });
     // a, b are dirty (sorted); clean.json is committed so excluded.
@@ -91,7 +91,7 @@ describe("buildPlanctlInvocation files = touched ∩ dirty", () => {
 
   test("subject uses buildSubject with the em-dash detail", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-subj";
-    const inv = buildPlanctlInvocation("done", "fn-9-x.1", "shipped it", {
+    const inv = buildPlanInvocation("done", "fn-9-x.1", "shipped it", {
       repoRoot: repo,
     });
     expect(inv.subject).toBe("chore(plan): done fn-9-x.1 — shipped it");
@@ -101,7 +101,7 @@ describe("buildPlanctlInvocation files = touched ∩ dirty", () => {
 describe("buildPlanctlInvocation wire field order", () => {
   test("keys appear in the contract order", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-order";
-    const inv = buildPlanctlInvocation("block", "fn-1-x.1", null, {
+    const inv = buildPlanInvocation("block", "fn-1-x.1", null, {
       repoRoot: repo,
     });
     expect(Object.keys(inv)).toEqual([
@@ -121,7 +121,7 @@ describe("buildPlanctlInvocation wire field order", () => {
 describe("buildPlanctlInvocation state_repo precedence", () => {
   test("primaryRepo wins over repoRoot when given", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-sr";
-    const inv = buildPlanctlInvocation("done", "fn-1-x.1", null, {
+    const inv = buildPlanInvocation("done", "fn-1-x.1", null, {
       repoRoot: repo,
       primaryRepo: "/some/primary",
     });
@@ -131,7 +131,7 @@ describe("buildPlanctlInvocation state_repo precedence", () => {
 
   test("falls back to repoRoot when primaryRepo absent", () => {
     process.env.CLAUDE_CODE_SESSION_ID = "sid-sr2";
-    const inv = buildPlanctlInvocation("done", "fn-1-x.1", null, {
+    const inv = buildPlanInvocation("done", "fn-1-x.1", null, {
       repoRoot: repo,
     });
     expect(inv.state_repo).toBe(repo);
@@ -152,7 +152,7 @@ describe("buildPlanctlInvocation touched-path validation", () => {
     mkdirSync(touchedDir, { recursive: true });
     writeFileSync(join(touchedDir, "bad.txt"), ".keeper/../etc/passwd\n");
     expect(() =>
-      buildPlanctlInvocation("done", "fn-1-x.1", null, { repoRoot: repo }),
+      buildPlanInvocation("done", "fn-1-x.1", null, { repoRoot: repo }),
     ).toThrow(/path traversal/);
   });
 
@@ -169,7 +169,7 @@ describe("buildPlanctlInvocation touched-path validation", () => {
     mkdirSync(touchedDir, { recursive: true });
     writeFileSync(join(touchedDir, "bad.txt"), "src/secret.ts\n");
     expect(() =>
-      buildPlanctlInvocation("done", "fn-1-x.1", null, { repoRoot: repo }),
+      buildPlanInvocation("done", "fn-1-x.1", null, { repoRoot: repo }),
     ).not.toThrow();
   });
 
@@ -193,7 +193,7 @@ describe("buildPlanctlInvocation touched-path validation", () => {
     const a = seedTouched("sid-stale", ".keeper/epics/a.json");
     const b = seedTouched("sid-stale", ".keeper/epics/b.json");
 
-    const inv = buildPlanctlInvocation("done", "fn-1-x.1", null, {
+    const inv = buildPlanInvocation("done", "fn-1-x.1", null, {
       repoRoot: repo,
     });
     // Only the valid data-dir paths survive; the stale legacy record is dropped.

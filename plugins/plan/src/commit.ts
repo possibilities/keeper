@@ -282,7 +282,7 @@ export function autoCommitFromInvocation(
   const op = payload.op ?? "";
   const target = payload.target || "";
   // The committing session id (CLAUDE_CODE_SESSION_ID), carried on the envelope
-  // by buildPlanctlInvocation. Fail-open — absent -> Session-Id trailer omitted,
+  // by buildPlanInvocation. Fail-open — absent -> Session-Id trailer omitted,
   // commit still lands.
   const sessionId = payload.session_id || null;
 

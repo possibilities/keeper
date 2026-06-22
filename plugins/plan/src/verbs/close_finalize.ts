@@ -42,7 +42,7 @@ import {
 import { emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import {
   contextForRoot,
   type ProjectContext,
@@ -594,7 +594,7 @@ function emitOutcome(
     data.actual_tasks = extra.actualTasks;
   }
 
-  const pc = buildPlanctlInvocationReadonly(
+  const pc = buildPlanInvocationReadonly(
     "close-finalize",
     ctx.projectPath,
     epicId,

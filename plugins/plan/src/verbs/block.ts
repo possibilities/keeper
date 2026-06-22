@@ -13,7 +13,7 @@ import { join } from "node:path";
 import { emitReadonly } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
-import { buildPlanctlInvocationReadonly } from "../invocation.ts";
+import { buildPlanInvocationReadonly } from "../invocation.ts";
 import { mergeTaskState } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { clearWorkMarker } from "../session_markers.ts";
@@ -80,7 +80,7 @@ export function runBlock(args: BlockArgs): void {
   // only, fail-open.
   clearWorkMarker(taskId);
 
-  const pc = buildPlanctlInvocationReadonly("block", ctx.projectPath, taskId);
+  const pc = buildPlanInvocationReadonly("block", ctx.projectPath, taskId);
   emitReadonly(
     { task_id: taskId, status: "blocked", blocked_reason: reasonText },
     pc,

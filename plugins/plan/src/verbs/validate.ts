@@ -20,7 +20,7 @@ import {
   pyDefaultJson,
 } from "../format.ts";
 import { validateEpicIntegrityWithWarnings } from "../integrity.ts";
-import { buildPlanctlInvocation } from "../invocation.ts";
+import { buildPlanInvocation } from "../invocation.ts";
 import { SCHEMA_VERSION } from "../models.ts";
 import { resolveProject } from "../project.ts";
 import { atomicWriteJson, loadJson, loadJsonSafe, nowIso } from "../store.ts";
@@ -137,7 +137,7 @@ export function runValidate(
 
       const primaryRepo =
         (epicDef.primary_repo as string | null | undefined) ?? null;
-      const pc = buildPlanctlInvocation("validate", epicId, null, {
+      const pc = buildPlanInvocation("validate", epicId, null, {
         repoRoot: ctx.projectPath,
         primaryRepo,
       });
