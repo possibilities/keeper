@@ -39,6 +39,7 @@ export const SUBCOMMANDS = [
   "plan",
   "prompt",
   "dispatch",
+  "pair",
   "reclaim",
   "bus",
 ] as const;
@@ -69,6 +70,7 @@ Subcommands:
   plan                Alias for the planctl CLI: \`keeper plan <verb>\` runs planctl in-process
   prompt              Snippet/bundle substrate engine: \`keeper prompt <verb>\` runs the prompt CLI in-process
   dispatch            Manually fire one claude worker into a tmux window (client-side escape hatch)
+  pair                Fan a task to another model CLI (claude/codex) via agentwrap (\`keeper pair send\`)
   reclaim             OFFLINE size-reclaim of the live keeper.db (daemon must be stopped)
   bus                 Agent Bus: \`keeper bus <list|resolve|chat send|chat broadcast|watch>\`
 
@@ -177,6 +179,7 @@ export async function main(): Promise<void> {
     plan: async (argv) => (await import("./plan")).main(argv),
     prompt: async (argv) => (await import("./prompt")).main(argv),
     dispatch: async (argv) => (await import("./dispatch")).main(argv),
+    pair: async (argv) => (await import("./pair")).main(argv),
     reclaim: async (argv) => (await import("./reclaim")).main(argv),
     bus: async (argv) => (await import("./bus")).main(argv),
   };
