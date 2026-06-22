@@ -36,5 +36,5 @@ byte-fixture, then run the full test gate.
 - [ ] `bun run test:full` is green.
 
 ## Done summary
-
+Pinned the cross-repo agentwrap JSON/exit-code contract with a byte-captured stdout fixture + drift-guard tests, and revised README, docs/exec-backend.md, and the dispatch SKILL.md to document the two-backend (tmux + agentwrap) reality. Full gate green.
 ## Evidence
