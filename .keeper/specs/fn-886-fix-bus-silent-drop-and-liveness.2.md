@@ -51,5 +51,5 @@ Rewrite the bus-cli.test.ts heartbeat/resolve tests. Full-tier: a directed send 
 - [ ] `bun run test:full` passes
 
 ## Done summary
-
+CLI bus send now awaits the synchronous publish result: delivered exits 0, every other result (not_connected/unknown_target/ambiguous_target/delivery_failed) is a loud exit-1 on stderr. Removed the resolve subcommand and the client heartbeat; rewrote SKILL.md + README to send-blindly + tri-state presence + socket-close liveness.
 ## Evidence

@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Blind-send CLI, fail-loud, remove resolve",
-  "updated_at": "2026-06-22T16:06:04.609000Z"
+  "updated_at": "2026-06-22T18:27:15.491000Z",
+  "worker_done_at": "2026-06-22T18:27:15.491000Z"
 }
