@@ -22,9 +22,10 @@
  *     prompt launches as `<prefix> <prompt>` (unless `--no-prefix`); plan form
  *     is never prefixed.
  *
- * Launch is purely CLIENT-SIDE via `resolveExecBackend(...).ensureLaunched(...)`
- * — no daemon RPC, no synthetic event, no reducer/migration touch — so re-fold
- * determinism and the five-surface RPC-write invariant hold by construction.
+ * Launch is purely CLIENT-SIDE via a direct `agentwrapLaunch(...)` (keeper's
+ * sole launch transport) — no daemon RPC, no synthetic event, no
+ * reducer/migration touch — so re-fold determinism and the five-surface
+ * RPC-write invariant hold by construction.
  *
  * Exit taxonomy (mirrors `cli/autopilot.ts`): `die` → 1 (resolution / launch
  * failure), arg fault → 2 (mode misuse, bad prompt), `--help` → 0.
@@ -53,7 +54,7 @@ import {
   validatePromptBytes,
 } from "../src/dispatch-command";
 import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
-import { resolveExecBackend } from "../src/exec-backend";
+import { agentwrapLaunch } from "../src/exec-backend";
 import type { QueryFrame, Row } from "../src/protocol";
 import { queryCollection } from "./control-rpc";
 
@@ -69,23 +70,22 @@ export type QueryFn = (
 ) => Promise<Row[]>;
 
 /**
- * The launch seam — `ExecBackend.ensureLaunched`'s signature. Injected into
- * {@link main} so a launch-path test runs against a fake backend (asserting the
- * success / `result.ok === false` branches) without spawning a real tmux
- * window. Defaults to the real `resolveExecBackend(...).ensureLaunched`.
+ * The launch seam. Injected into {@link main} so a launch-path test runs against
+ * a fake launch (asserting the success / `result.ok === false` branches) without
+ * spawning a real tmux window. Defaults to a direct {@link agentwrapLaunch} into
+ * the resolved session.
  *
- * `spec` carries the structured launch (prompt + claude flags). The tmux backend
- * ignores it and execs the pre-wrapped `argv`; the agentwrap backend IGNORES
- * `argv` and builds its own invocation FROM `spec` — so manual dispatch under
- * `exec_backend: agentwrap` MUST pass it (without a spec the agentwrap backend
- * falls back to tmux). Optional so the default/tmux path stays unchanged.
+ * agentwrap is the sole launch transport: it builds its invocation from `spec`
+ * (the structured prompt + claude flags) and owns the tmux window, IGNORING the
+ * pre-wrapped `argv`. `argv`/`name` are retained at the seam so the dry-run line
+ * keeps printing the shell-wrapped argv shape; the launch impl reads `spec`.
  */
 export type LaunchFn = (
   session: string,
   argv: string[],
   cwd: string,
-  name?: string,
-  spec?: LaunchSpec,
+  name: string,
+  spec: LaunchSpec,
 ) => Promise<LaunchResult>;
 
 /** Injectable seams for {@link main} so integration tests drive the orchestration
@@ -94,7 +94,7 @@ export interface MainDeps {
   /** The collection-read transport. Defaults to a real `queryCollection`
    *  against the resolved socket. */
   readonly query?: QueryFn;
-  /** The launch backend. Defaults to `resolveExecBackend(...).ensureLaunched`. */
+  /** The launch transport. Defaults to a direct `agentwrapLaunch(...)`. */
   readonly launch?: LaunchFn;
   /** The configured global prompt prefix for FREE-FORM dispatches. Defaults to
    *  `resolveConfig().dispatchPromptPrefix`. Injected so tests drive the
@@ -371,17 +371,21 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     );
   }
 
-  // Honor the configured exec backend so a hand-launched worker goes through
-  // agentwrap when `exec_backend: agentwrap` — same resolution as the autopilot
-  // path. `backendType`/`agentwrapPath` are ignored when the config selects tmux
-  // (the default + fallback), so the default path stays byte-identical.
+  // Launch directly through agentwrap (keeper's sole launch transport) into the
+  // resolved session — the same transport as the autopilot path. The pre-wrapped
+  // `argv` is ignored; agentwrap builds its invocation from `spec`.
+  const agentwrapPath = resolveAgentwrapPath();
   const launch: LaunchFn =
     deps.launch ??
-    resolveExecBackend({
-      noteLine: (line: string) => process.stderr.write(`${line}\n`),
-      backendType: resolveConfig().execBackend,
-      agentwrapPath: resolveAgentwrapPath(),
-    }).ensureLaunched;
+    ((session, _argv, cwd, name, spec) =>
+      agentwrapLaunch({
+        noteLine: (line: string) => process.stderr.write(`${line}\n`),
+        agentwrapPath,
+        session,
+        cwd,
+        label: name !== "" ? name : `session=${session}`,
+        spec,
+      }));
 
   let cwd: string;
   let prompt: string;
@@ -485,10 +489,9 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     process.exit(0);
   }
 
-  // Structured spec for the agentwrap backend (it ignores the pre-wrapped
-  // `launchArgv` and builds its own unwrapped invocation from this). The tmux
-  // backend ignores `spec` and execs `launchArgv` verbatim, so the default path
-  // is unchanged. Mirrors the flags already baked into `launchArgv`.
+  // Structured spec agentwrap builds its unwrapped invocation from (it ignores
+  // the pre-wrapped `launchArgv`). Mirrors the flags already baked into
+  // `launchArgv` — that parity keeps the dry-run argv line honest.
   const spec: LaunchSpec = {
     prompt,
     ...(claudeName !== undefined ? { claudeName } : {}),

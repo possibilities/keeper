@@ -6,20 +6,18 @@
  *    `buildTmuxNewSessionArgs`, `buildTmuxNewWindowArgs`,
  *    `buildTmuxSelectWindowArgs`, `buildTmuxSelectPaneArgs`) produce the tmux
  *    CLI shape the live spec calls for.
- *  - `createTmuxBackend` — `launch` get-or-create + chained `new-window`,
- *    `focusPane` id-based select-window+select-pane, `ensureLaunched` per-call
- *    session + restore `-n` seam, the timeout-kill degrade, and ENOENT/non-zero
- *    failure envelopes.
- *  - The agentwrap backend — `buildAgentwrapLaunchArgv` (byte-pinned contract
- *    invocation), `parseAgentwrapStdout` (line-scan, schema_version check,
+ *  - `restoreReplayLaunch` — the surviving direct tmux launch (crash-restore
+ *    replay): get-or-create + chained `new-window`, per-call session + the `-n`
+ *    label seam, the timeout-kill degrade, and ENOENT/non-zero failure envelopes.
+ *  - `createTmuxPaneOps` — the direct session-agnostic pane ops: `focusPane`
+ *    id-based select-window+select-pane, `listPanes` tab-safe sweep + null
+ *    degrade, `renameWindow`/`killWindow` `@N`/`%N` targets + TOCTOU no-op.
+ *  - The agentwrap launch (keeper's sole launch transport) —
+ *    `buildAgentwrapLaunchArgv` (byte-pinned contract invocation),
+ *    `parseAgentwrapStdout` (line-scan, schema_version check,
  *    empty/non-JSON/missing-field), `mapAgentwrapExit` (the central
- *    0/1/2/3/4 + timeout exit-map), `createAgentwrapBackend.launch`
- *    (launch→parse→exit-map→outcome, worker-cwd-on-spawn, missing-spec guard),
- *    the spec-gated `ensureLaunched`, and the shared (tmux-delegated) pane ops.
- *  - `resolveExecBackend` returns the agentwrap backend for `agentwrap`+path,
- *    falls back to tmux (loudly) without a path, and returns the tmux backend for
- *    EVERY other tag (tmux, unknown, legacy `zellij`, absent), tolerating an
- *    undefined session via `MANAGED_EXEC_SESSION`.
+ *    0/1/2/3/4 + timeout exit-map), and `agentwrapLaunch`
+ *    (launch→parse→exit-map→outcome, worker-cwd-on-spawn, per-call session).
  *  - `execBackendEnvMeta` returns the tmux env-var names, including the
  *    fall-through for unknown backends.
  *
@@ -31,6 +29,7 @@ import { expect, test } from "bun:test";
 import {
   AGENTWRAP_SCHEMA_VERSION,
   AGENTWRAP_TMUX_EXIT,
+  agentwrapLaunch,
   buildAgentwrapLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxKillWindowArgs,
@@ -42,8 +41,7 @@ import {
   buildTmuxSelectWindowArgs,
   buildTmuxServerPidArgs,
   classifyCloseKind,
-  createAgentwrapBackend,
-  createTmuxBackend,
+  createTmuxPaneOps,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
   type LaunchResult,
@@ -51,7 +49,7 @@ import {
   MANAGED_EXEC_SESSION,
   mapAgentwrapExit,
   parseAgentwrapStdout,
-  resolveExecBackend,
+  restoreReplayLaunch,
   type SpawnFn,
   type SyncProbeFn,
 } from "../src/exec-backend";
@@ -278,10 +276,11 @@ test("buildTmuxKillWindowArgs: targets the %N pane id, exact argv", () => {
 });
 
 // ---------------------------------------------------------------------------
-// createTmuxBackend.launch — get-or-create + chained new-window
+// restoreReplayLaunch — the surviving direct tmux launch (crash-restore replay):
+// get-or-create + chained new-window
 // ---------------------------------------------------------------------------
 
-test("createTmuxBackend.launch: live session (has-session exit 0) → new-window only, no mint, unnamed window", async () => {
+test("restoreReplayLaunch: live session (has-session exit 0) → new-window only, no mint, unnamed when name absent", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -290,24 +289,24 @@ test("createTmuxBackend.launch: live session (has-session exit 0) → new-window
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const res = await backend.launch(
+  const res = await restoreReplayLaunch(
+    MANAGED_EXEC_SESSION,
     ["/bin/zsh", "-l", "-i", "-c", "echo hi"],
-    "work::fn-1-x.1",
     "/abs/dir",
+    { noteLine: () => {}, spawn },
   );
   expect(res).toEqual({ ok: true });
-  // has-session probe fired against the managed session, then new-window.
+  // has-session probe fired against the session, then new-window.
   expect(calls[0]).toEqual(buildTmuxHasSessionArgs(MANAGED_EXEC_SESSION));
   const win = calls.find((c) => c[1] === "new-window");
   expect(win?.[3]).toBe(`=${MANAGED_EXEC_SESSION}:`);
   // No mint — the live session was respected.
   expect(calls.some((c) => c[1] === "new-session")).toBe(false);
-  // Managed window stays UNNAMED — `name` is the dedup key only.
+  // No name passed → window stays UNNAMED.
   expect(win).not.toContain("-n");
 });
 
-test("createTmuxBackend.launch: absent session (has-session non-zero) → new-session mint then new-window", async () => {
+test("restoreReplayLaunch: absent session (has-session non-zero) → new-session mint then new-window", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -317,8 +316,10 @@ test("createTmuxBackend.launch: absent session (has-session non-zero) → new-se
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
+    noteLine: () => {},
+    spawn,
+  });
   expect(res).toEqual({ ok: true });
   // Order: has-session (absent) → new-session mint → new-window.
   expect(calls[0]?.[1]).toBe("has-session");
@@ -326,7 +327,7 @@ test("createTmuxBackend.launch: absent session (has-session non-zero) → new-se
   expect(calls[2]?.[1]).toBe("new-window");
 });
 
-test("createTmuxBackend.launch: new-session mint carries color env (TERM/COLORTERM); has-session/new-window do not", async () => {
+test("restoreReplayLaunch: new-session mint carries color env (TERM/COLORTERM); has-session/new-window do not", async () => {
   const calls: string[][] = [];
   const envByCall: Array<Record<string, string> | undefined> = [];
   const spawn: SpawnFn = (cmd, options) => {
@@ -340,8 +341,10 @@ test("createTmuxBackend.launch: new-session mint carries color env (TERM/COLORTE
       kill: () => {},
     };
   };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
+    noteLine: () => {},
+    spawn,
+  });
   const mintIdx = calls.findIndex((c) => c[1] === "new-session");
   expect(mintIdx).toBeGreaterThan(-1);
   const mintEnv = envByCall[mintIdx];
@@ -354,12 +357,11 @@ test("createTmuxBackend.launch: new-session mint carries color env (TERM/COLORTE
   expect(envByCall[winIdx]).toBeUndefined();
 });
 
-test("createTmuxBackend.launch: a never-resolving new-window is killed at the timeout and degrades to { ok: false }", async () => {
-  // A wedged `tmux` subprocess (server hang) would freeze proc.exited forever —
-  // and the reconciler with it, no fatalExit. runCapture must race a
-  // kill-timeout: on expiry it kills the child and returns null, which launch
-  // folds into the sticky { ok: false } envelope. We shrink the timeout via
-  // captureTimeoutMs so the test doesn't wait the real 5s.
+test("restoreReplayLaunch: a never-resolving new-window is killed at the timeout and degrades to { ok: false }", async () => {
+  // A wedged `tmux` subprocess (server hang) would freeze proc.exited forever.
+  // runCapture must race a kill-timeout: on expiry it kills the child and
+  // returns null, which the launch folds into the { ok: false } envelope. We
+  // shrink the timeout via captureTimeoutMs so the test doesn't wait the real 5s.
   const calls: string[][] = [];
   const notes: string[] = [];
   let windowKilled = false;
@@ -385,15 +387,11 @@ test("createTmuxBackend.launch: a never-resolving new-window is killed at the ti
       },
     };
   };
-  const backend = createTmuxBackend({
-    noteLine: (s) => notes.push(s),
-    spawn,
-    captureTimeoutMs: 20,
-  });
-  const res = await backend.launch(
+  const res = await restoreReplayLaunch(
+    MANAGED_EXEC_SESSION,
     ["/bin/zsh", "-c", "echo hi"],
-    "work::fn-1-x.1",
     "/tmp/proj",
+    { noteLine: (s) => notes.push(s), spawn, captureTimeoutMs: 20 },
   );
   // runCapture timed out → null → the ENOENT-shaped { ok: false } envelope.
   expect(res.ok).toBe(false);
@@ -403,7 +401,7 @@ test("createTmuxBackend.launch: a never-resolving new-window is killed at the ti
   expect(notes.some((n) => n.includes("exceeded 20ms"))).toBe(true);
 });
 
-test("createTmuxBackend.launch: non-zero new-window exit → { ok: false, error }", async () => {
+test("restoreReplayLaunch: non-zero new-window exit → { ok: false, error }", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -412,19 +410,20 @@ test("createTmuxBackend.launch: non-zero new-window exit → { ok: false, error 
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
+    noteLine: () => {},
+    spawn,
+  });
   expect(res.ok).toBe(false);
   if (res.ok === false) {
     expect(res.error).toContain("exited non-zero");
   }
 });
 
-test("createTmuxBackend.launch: session-gone new-window stderr → exactly one new-window, NO re-ensure/retry", async () => {
-  // The tmux backend runs `ensureSessionFor` → `new-window` exactly ONCE per
-  // op: a per-call `has-session` probe is cheap, so a session-gone failure
-  // surfaces `{ ok: false }` rather than re-minting and retrying. This pins
-  // that non-retry contract.
+test("restoreReplayLaunch: session-gone new-window stderr → exactly one new-window, NO re-ensure/retry", async () => {
+  // The launch runs get-or-create → `new-window` exactly ONCE per op: a per-call
+  // `has-session` probe is cheap, so a session-gone failure surfaces
+  // `{ ok: false }` rather than re-minting and retrying. This pins that contract.
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -434,86 +433,34 @@ test("createTmuxBackend.launch: session-gone new-window stderr → exactly one n
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
+    noteLine: () => {},
+    spawn,
+  });
   expect(res.ok).toBe(false);
   // Exactly one new-window spawn — no second attempt.
-  const windows = calls.filter((c) => c[1] === "new-window");
-  expect(windows.length).toBe(1);
+  expect(calls.filter((c) => c[1] === "new-window").length).toBe(1);
   // Exactly one has-session probe — no re-ensure after the failure.
-  const probes = calls.filter((c) => c[1] === "has-session");
-  expect(probes.length).toBe(1);
+  expect(calls.filter((c) => c[1] === "has-session").length).toBe(1);
   // No mint at all on this path (probe said live), and certainly no second one.
   expect(calls.some((c) => c[1] === "new-session")).toBe(false);
 });
 
-test("createTmuxBackend.launch: ENOENT (binary missing) → { ok: false, error }, never throws", async () => {
+test("restoreReplayLaunch: ENOENT (binary missing) → { ok: false, error }, never throws", async () => {
   const spawn: SpawnFn = () => {
     throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const res = await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  const res = await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["sh"], "/abs", {
+    noteLine: () => {},
+    spawn,
+  });
   expect(res.ok).toBe(false);
   if (res.ok === false) {
     expect(res.error).toContain("failed");
   }
 });
 
-// ---------------------------------------------------------------------------
-// createTmuxBackend.focusPane — id-based select-window then select-pane
-// ---------------------------------------------------------------------------
-
-test("createTmuxBackend.focusPane: exit 0 → select-window then select-pane against the pane id, { ok: true }", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:select-window": { exitCode: 0 },
-      "tmux:select-pane": { exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.focusPane("any-session", "%7");
-  expect(got).toEqual({ ok: true });
-  // Both ops target the server-global pane id, never the session name.
-  expect(calls[0]).toEqual(buildTmuxSelectWindowArgs("%7"));
-  expect(calls[1]).toEqual(buildTmuxSelectPaneArgs("%7"));
-});
-
-test("createTmuxBackend.focusPane: select-window non-zero → { ok: false }, select-pane never runs", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:select-window": { stderr: "can't find pane", exitCode: 1 },
-      "tmux:select-pane": { exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.focusPane("s", "%99");
-  expect(got.ok).toBe(false);
-  if (got.ok === false) {
-    expect(got.error).toContain("exited 1");
-    expect(got.error).toContain("can't find pane");
-  }
-  // select-pane is gated on a successful select-window.
-  expect(calls.some((c) => c[1] === "select-pane")).toBe(false);
-});
-
-test("createTmuxBackend.focusPane: ENOENT throw → { ok: false }, never throws back", async () => {
-  const spawn: SpawnFn = () => {
-    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
-  };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.focusPane("s", "%1");
-  expect(got.ok).toBe(false);
-});
-
-// ---------------------------------------------------------------------------
-// createTmuxBackend.ensureLaunched — per-call session, restore -n seam
-// ---------------------------------------------------------------------------
-
-test("createTmuxBackend.ensureLaunched: live per-call session → new-window with -e KEEPER_TMUX_SESSION=<target>, omits -n when absent", async () => {
+test("restoreReplayLaunch: live per-call session → new-window with -e KEEPER_TMUX_SESSION=<target>, omits -n when absent", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -522,14 +469,12 @@ test("createTmuxBackend.ensureLaunched: live per-call session → new-window wit
     },
     calls,
   );
-  const backend = createTmuxBackend({
+  const res = await restoreReplayLaunch("human-session", ["sh"], "/proj", {
     noteLine: () => {},
-    session: "autopilot",
     spawn,
   });
-  const res = await backend.ensureLaunched("human-session", ["sh"], "/proj");
   expect(res).toEqual({ ok: true });
-  // has-session probed the PER-CALL session, not the construction default.
+  // has-session probed the per-call session.
   expect(calls[0]).toEqual(buildTmuxHasSessionArgs("human-session"));
   const win = calls.find((c) => c[1] === "new-window");
   expect(win?.[3]).toBe("=human-session:");
@@ -541,7 +486,7 @@ test("createTmuxBackend.ensureLaunched: live per-call session → new-window wit
   expect(win).not.toContain("-n");
 });
 
-test("createTmuxBackend.ensureLaunched: absent per-call session mints then new-window with -n <name>", async () => {
+test("restoreReplayLaunch: absent per-call session mints then new-window with -n <name>", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -551,11 +496,11 @@ test("createTmuxBackend.ensureLaunched: absent per-call session mints then new-w
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const res = await backend.ensureLaunched(
+  const res = await restoreReplayLaunch(
     "restored",
     ["sh"],
     "/abs",
+    { noteLine: () => {}, spawn },
     "work::fn-9-y.2",
   );
   expect(res).toEqual({ ok: true });
@@ -569,11 +514,86 @@ test("createTmuxBackend.ensureLaunched: absent per-call session mints then new-w
   expect(win?.[nameIdx + 1]).toBe("work::fn-9-y.2");
 });
 
+test("restoreReplayLaunch: new-session mint env carries a locale alongside TERM/COLORTERM", async () => {
+  const cmds: string[][] = [];
+  const envByCall: Array<Record<string, string> | undefined> = [];
+  const spawn: SpawnFn = (cmd, options) => {
+    cmds.push([...cmd]);
+    envByCall.push(options.env);
+    return {
+      exited: Promise.resolve(cmd[1] === "has-session" ? 1 : 0),
+      stdout: new Response("").body,
+      stderr: new Response("").body,
+      kill: () => {},
+    };
+  };
+  await restoreReplayLaunch(MANAGED_EXEC_SESSION, ["claude"], "/tmp", {
+    noteLine: () => {},
+    spawn,
+  });
+  const mintIdx = cmds.findIndex((c) => c[1] === "new-session");
+  expect(mintIdx).toBeGreaterThanOrEqual(0);
+  const mintEnv = envByCall[mintIdx];
+  expect(Boolean(mintEnv?.LC_ALL || mintEnv?.LC_CTYPE || mintEnv?.LANG)).toBe(
+    true,
+  );
+});
+
 // ---------------------------------------------------------------------------
-// createTmuxBackend.listPanes — server-wide sweep, tab-safe parse, null degrade
+// createTmuxPaneOps.focusPane — id-based select-window then select-pane
 // ---------------------------------------------------------------------------
 
-test("createTmuxBackend.listPanes: parses (paneId, windowId, windowName) from one -a sweep", async () => {
+test("createTmuxPaneOps.focusPane: exit 0 → select-window then select-pane against the pane id, { ok: true }", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:select-window": { exitCode: 0 },
+      "tmux:select-pane": { exitCode: 0 },
+    },
+    calls,
+  );
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.focusPane("any-session", "%7");
+  expect(got).toEqual({ ok: true });
+  // Both ops target the server-global pane id, never the session name.
+  expect(calls[0]).toEqual(buildTmuxSelectWindowArgs("%7"));
+  expect(calls[1]).toEqual(buildTmuxSelectPaneArgs("%7"));
+});
+
+test("createTmuxPaneOps.focusPane: select-window non-zero → { ok: false }, select-pane never runs", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:select-window": { stderr: "can't find pane", exitCode: 1 },
+      "tmux:select-pane": { exitCode: 0 },
+    },
+    calls,
+  );
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.focusPane("s", "%99");
+  expect(got.ok).toBe(false);
+  if (got.ok === false) {
+    expect(got.error).toContain("exited 1");
+    expect(got.error).toContain("can't find pane");
+  }
+  // select-pane is gated on a successful select-window.
+  expect(calls.some((c) => c[1] === "select-pane")).toBe(false);
+});
+
+test("createTmuxPaneOps.focusPane: ENOENT throw → { ok: false }, never throws back", async () => {
+  const spawn: SpawnFn = () => {
+    throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
+  };
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.focusPane("s", "%1");
+  expect(got.ok).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// createTmuxPaneOps.listPanes — server-wide sweep, tab-safe parse, null degrade
+// ---------------------------------------------------------------------------
+
+test("createTmuxPaneOps.listPanes: parses (paneId, windowId, windowName) from one -a sweep", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -584,8 +604,8 @@ test("createTmuxBackend.listPanes: parses (paneId, windowId, windowName) from on
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.listPanes();
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.listPanes();
   expect(calls[0]).toEqual(buildTmuxListPanesArgs());
   expect(got).toEqual([
     { paneId: "%1", windowId: "@1", windowName: "work::fn-1-x.2" },
@@ -593,26 +613,26 @@ test("createTmuxBackend.listPanes: parses (paneId, windowId, windowName) from on
   ]);
 });
 
-test("createTmuxBackend.listPanes: a tab inside a window name stays in windowName (2-split limit)", async () => {
+test("createTmuxPaneOps.listPanes: a tab inside a window name stays in windowName (2-split limit)", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
       "tmux:list-panes": {
         // window name itself contains a tab, a colon, and unicode.
-        stdout: "%7\t@7\tweird:\tname \u00e9\n",
+        stdout: "%7\t@7\tweird:\tname é\n",
         exitCode: 0,
       },
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.listPanes();
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.listPanes();
   expect(got).toEqual([
-    { paneId: "%7", windowId: "@7", windowName: "weird:\tname \u00e9" },
+    { paneId: "%7", windowId: "@7", windowName: "weird:\tname é" },
   ]);
 });
 
-test("createTmuxBackend.listPanes: drops malformed lines (missing tabs / empty ids), keeps the rest", async () => {
+test("createTmuxPaneOps.listPanes: drops malformed lines (missing tabs / empty ids), keeps the rest", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     {
@@ -625,19 +645,19 @@ test("createTmuxBackend.listPanes: drops malformed lines (missing tabs / empty i
     },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.listPanes();
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.listPanes();
   expect(got).toEqual([{ paneId: "%4", windowId: "@4", windowName: "" }]);
 });
 
-test("createTmuxBackend.listPanes: non-zero exit (no server) → null", async () => {
+test("createTmuxPaneOps.listPanes: non-zero exit (no server) → null", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub(
     { "tmux:list-panes": { stderr: "no server running", exitCode: 1 } },
     calls,
   );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  expect(await backend.listPanes()).toBeNull();
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  expect(await ops.listPanes()).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
@@ -673,7 +693,7 @@ test("localeDefaultedEnv: empty-string locale vars count as unset; undefined val
   expect(got.PATH).toBe("/bin");
 });
 
-test("createTmuxBackend.listPanes: sweep spawn carries a locale-bearing env (C-locale clients sanitize the tab delimiters)", async () => {
+test("createTmuxPaneOps.listPanes: sweep spawn carries a locale-bearing env (C-locale clients sanitize the tab delimiters)", async () => {
   const envByCall: Array<Record<string, string> | undefined> = [];
   const spawn: SpawnFn = (_cmd, options) => {
     envByCall.push(options.env);
@@ -684,58 +704,35 @@ test("createTmuxBackend.listPanes: sweep spawn carries a locale-bearing env (C-l
       kill: () => {},
     };
   };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  await backend.listPanes();
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  await ops.listPanes();
   const env = envByCall[0];
   expect(env).toBeDefined();
   expect(Boolean(env?.LC_ALL || env?.LC_CTYPE || env?.LANG)).toBe(true);
 });
 
-test("createTmuxBackend.launch: new-session mint env carries a locale alongside TERM/COLORTERM", async () => {
-  const cmds: string[][] = [];
-  const envByCall: Array<Record<string, string> | undefined> = [];
-  const spawn: SpawnFn = (cmd, options) => {
-    cmds.push([...cmd]);
-    envByCall.push(options.env);
-    return {
-      exited: Promise.resolve(cmd[1] === "has-session" ? 1 : 0),
-      stdout: new Response("").body,
-      stderr: new Response("").body,
-      kill: () => {},
-    };
-  };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  await backend.launch(["claude"], "label", "/tmp");
-  const mintIdx = cmds.findIndex((c) => c[1] === "new-session");
-  expect(mintIdx).toBeGreaterThanOrEqual(0);
-  const mintEnv = envByCall[mintIdx];
-  expect(Boolean(mintEnv?.LC_ALL || mintEnv?.LC_CTYPE || mintEnv?.LANG)).toBe(
-    true,
-  );
-});
-
-test("createTmuxBackend.listPanes: ENOENT (binary missing) → null, never throws", async () => {
+test("createTmuxPaneOps.listPanes: ENOENT (binary missing) → null, never throws", async () => {
   const spawn: SpawnFn = () => {
     throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  expect(await backend.listPanes()).toBeNull();
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  expect(await ops.listPanes()).toBeNull();
 });
 
 // ---------------------------------------------------------------------------
-// createTmuxBackend.renameWindow — @N target, `--` guard, TOCTOU no-op, ENOENT
+// createTmuxPaneOps.renameWindow — @N target, `--` guard, TOCTOU no-op, ENOENT
 // ---------------------------------------------------------------------------
 
-test("createTmuxBackend.renameWindow: exit 0 → { ok: true }, argv targets @N and carries `--`", async () => {
+test("createTmuxPaneOps.renameWindow: exit 0 → { ok: true }, argv targets @N and carries `--`", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub({ "tmux:rename-window": { exitCode: 0 } }, calls);
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.renameWindow("@5", "fn-2-y.1");
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.renameWindow("@5", "fn-2-y.1");
   expect(got).toEqual({ ok: true });
   expect(calls[0]).toEqual(buildTmuxRenameWindowArgs("@5", "fn-2-y.1"));
 });
 
-test("createTmuxBackend.renameWindow: TOCTOU 'can't find window' non-zero → { ok: false }, silent (no noteLine)", async () => {
+test("createTmuxPaneOps.renameWindow: TOCTOU 'can't find window' non-zero → { ok: false }, silent (no noteLine)", async () => {
   const calls: string[][] = [];
   const notes: string[] = [];
   const spawn = makeSpawnStub(
@@ -747,11 +744,8 @@ test("createTmuxBackend.renameWindow: TOCTOU 'can't find window' non-zero → { 
     },
     calls,
   );
-  const backend = createTmuxBackend({
-    noteLine: (l) => notes.push(l),
-    spawn,
-  });
-  const got = await backend.renameWindow("@5", "gone");
+  const ops = createTmuxPaneOps({ noteLine: (l) => notes.push(l), spawn });
+  const got = await ops.renameWindow("@5", "gone");
   expect(got.ok).toBe(false);
   if (got.ok === false) {
     expect(got.error).toContain("exited 1");
@@ -761,29 +755,29 @@ test("createTmuxBackend.renameWindow: TOCTOU 'can't find window' non-zero → { 
   expect(notes).toHaveLength(0);
 });
 
-test("createTmuxBackend.renameWindow: ENOENT (binary missing) → { ok: false }, never throws", async () => {
+test("createTmuxPaneOps.renameWindow: ENOENT (binary missing) → { ok: false }, never throws", async () => {
   const spawn: SpawnFn = () => {
     throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.renameWindow("@1", "x");
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.renameWindow("@1", "x");
   expect(got.ok).toBe(false);
 });
 
 // ---------------------------------------------------------------------------
-// createTmuxBackend.killWindow — %N target, TOCTOU no-op, ENOENT degrade
+// createTmuxPaneOps.killWindow — %N target, TOCTOU no-op, ENOENT degrade
 // ---------------------------------------------------------------------------
 
-test("createTmuxBackend.killWindow: exit 0 → { ok: true }, argv targets the %N pane id", async () => {
+test("createTmuxPaneOps.killWindow: exit 0 → { ok: true }, argv targets the %N pane id", async () => {
   const calls: string[][] = [];
   const spawn = makeSpawnStub({ "tmux:kill-window": { exitCode: 0 } }, calls);
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.killWindow("%7");
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.killWindow("%7");
   expect(got).toEqual({ ok: true });
   expect(calls[0]).toEqual(buildTmuxKillWindowArgs("%7"));
 });
 
-test("createTmuxBackend.killWindow: TOCTOU 'can't find window' non-zero → { ok: false }, silent (no noteLine)", async () => {
+test("createTmuxPaneOps.killWindow: TOCTOU 'can't find window' non-zero → { ok: false }, silent (no noteLine)", async () => {
   const calls: string[][] = [];
   const notes: string[] = [];
   const spawn = makeSpawnStub(
@@ -795,11 +789,8 @@ test("createTmuxBackend.killWindow: TOCTOU 'can't find window' non-zero → { ok
     },
     calls,
   );
-  const backend = createTmuxBackend({
-    noteLine: (l) => notes.push(l),
-    spawn,
-  });
-  const got = await backend.killWindow("%7");
+  const ops = createTmuxPaneOps({ noteLine: (l) => notes.push(l), spawn });
+  const got = await ops.killWindow("%7");
   expect(got.ok).toBe(false);
   if (got.ok === false) {
     expect(got.error).toContain("exited 1");
@@ -809,133 +800,19 @@ test("createTmuxBackend.killWindow: TOCTOU 'can't find window' non-zero → { ok
   expect(notes).toHaveLength(0);
 });
 
-test("createTmuxBackend.killWindow: ENOENT (binary missing) → { ok: false }, never throws", async () => {
+test("createTmuxPaneOps.killWindow: ENOENT (binary missing) → { ok: false }, never throws", async () => {
   const spawn: SpawnFn = () => {
     throw Object.assign(new Error("ENOENT"), { code: "ENOENT" });
   };
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.killWindow("%1");
+  const ops = createTmuxPaneOps({ noteLine: () => {}, spawn });
+  const got = await ops.killWindow("%1");
   expect(got.ok).toBe(false);
 });
 
-test("createTmuxBackend: omitting session is allowed (session-agnostic-only consumer)", async () => {
-  // Construct with just { noteLine } so a session-agnostic-only consumer (e.g.
-  // cli/jobs.ts' `v` focus key) skips the construction-session entirely; the
-  // focus call uses the per-call pane id, so the absent default is never read.
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:select-window": { exitCode: 0 },
-      "tmux:select-pane": { exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = createTmuxBackend({ noteLine: () => {}, spawn });
-  const got = await backend.focusPane("any", "%1");
-  expect(got).toEqual({ ok: true });
-});
-
 // ---------------------------------------------------------------------------
-// resolveExecBackend — tmux is the sole backend, so EVERY tag resolves to it
-// and an unrecognized/legacy tag NEVER throws.
-// ---------------------------------------------------------------------------
-
-test("resolveExecBackend: backendType 'tmux' routes through the tmux factory", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend({
-    noteLine: () => {},
-    backendType: "tmux",
-    spawn,
-  });
-  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
-  // A tmux backend issues `tmux has-session`, never a zellij command.
-  expect(calls[0]?.[0]).toBe("tmux");
-});
-
-test("resolveExecBackend: absent backendType resolves to tmux", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend({ noteLine: () => {}, spawn });
-  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
-  expect(calls[0]?.[0]).toBe("tmux");
-});
-
-test("resolveExecBackend: legacy 'zellij' tag falls through to tmux (never throws)", async () => {
-  // Historical job rows carry `backend_exec_type='zellij'`. The collapsed
-  // resolver MUST fall through to the tmux backend rather than throw — a throw
-  // here would crash focus routing for every legacy-tagged row.
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend({
-    noteLine: () => {},
-    backendType: "zellij",
-    spawn,
-  });
-  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
-  expect(calls[0]?.[0]).toBe("tmux");
-});
-
-test("resolveExecBackend: unknown/garbage backendType falls through to tmux", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend({
-    noteLine: () => {},
-    backendType: "wezterm",
-    spawn,
-  });
-  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
-  expect(calls[0]?.[0]).toBe("tmux");
-});
-
-test("resolveExecBackend: threads an explicit session through to the tmux factory", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend({
-    noteLine: () => {},
-    backendType: "tmux",
-    session: "custom-session",
-    spawn,
-  });
-  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
-  // The construction session is on the has-session probe.
-  expect(calls[0]).toEqual(buildTmuxHasSessionArgs("custom-session"));
-});
-
-// ---------------------------------------------------------------------------
-// agentwrap backend — buildAgentwrapLaunchArgv (byte-pinned), parse, exit-map,
-// the backend factory's launch→parse→exit-map→outcome path, shared pane ops,
-// and the resolveExecBackend agentwrap branch.
+// agentwrap launch (keeper's sole launch transport) — buildAgentwrapLaunchArgv
+// (byte-pinned), parse, exit-map, and the agentwrapLaunch
+// launch→parse→exit-map→outcome path.
 // ---------------------------------------------------------------------------
 
 /**
@@ -1130,21 +1007,21 @@ test("fixture: the real line carries schema_version === AGENTWRAP_SCHEMA_VERSION
   expect(typeof obj.paneId).toBe("string");
 });
 
-test("fixture-fed createAgentwrapBackend.launch: exit 0 + real stdout → ok (full launch→parse→map path)", async () => {
+test("fixture-fed agentwrapLaunch: exit 0 + real stdout → ok (full launch→parse→map path)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
     AWP,
     { stdout: AGENTWRAP_FIXTURE_STDOUT, exitCode: 0 },
     records,
   );
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "/plan:work fn-1-x.1", claudeName: "work::fn-1-x.1" },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "/plan:work fn-1-x.1",
-    claudeName: "work::fn-1-x.1",
   });
   expect(res).toEqual({ ok: true });
 });
@@ -1205,25 +1082,28 @@ test("mapAgentwrapExit: exit-code → outcome class table (1/2/3 permanent, 4 tr
   }
 });
 
-// --- createAgentwrapBackend.launch ---
+// --- agentwrapLaunch (launch→parse→exit-map→outcome) ---
 
-test("createAgentwrapBackend.launch: exit 0 + valid JSON → ok; spawns the agentwrap argv with worker cwd on the spawn", async () => {
+test("agentwrapLaunch: exit 0 + valid JSON → ok; spawns the agentwrap argv with worker cwd on the spawn", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
     AWP,
     { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
     records,
   );
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: {
+      prompt: "/plan:work fn-1-x.1",
+      claudeName: "work::fn-1-x.1",
+      model: "sonnet",
+      effort: "max",
+    },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "/plan:work fn-1-x.1",
-    claudeName: "work::fn-1-x.1",
-    model: "sonnet",
-    effort: "max",
   });
   expect(res).toEqual({ ok: true });
   // The launch spawned the agentwrap binary by absolute path, into the managed
@@ -1234,30 +1114,32 @@ test("createAgentwrapBackend.launch: exit 0 + valid JSON → ok; spawns the agen
   expect(records[0]?.cwd).toBe("/repo");
 });
 
-test("createAgentwrapBackend.launch: exit 4 RETRYABLE → transient ({ ok:false, retryable:true })", async () => {
+test("agentwrapLaunch: exit 4 RETRYABLE → transient ({ ok:false, retryable:true })", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 4 }, records);
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "p" },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "p",
   });
   expect(res).toMatchObject({ ok: false, retryable: true });
 });
 
-test("createAgentwrapBackend.launch: exit 3 NOOP → permanent (no retryable)", async () => {
+test("agentwrapLaunch: exit 3 NOOP → permanent (no retryable)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 3 }, records);
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "p" },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "p",
   });
   expect(res.ok).toBe(false);
   if (res.ok === false) {
@@ -1265,16 +1147,17 @@ test("createAgentwrapBackend.launch: exit 3 NOOP → permanent (no retryable)", 
   }
 });
 
-test("createAgentwrapBackend.launch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)", async () => {
+test("agentwrapLaunch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 2 }, records);
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "p" },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "p",
   });
   expect(res.ok).toBe(false);
   if (res.ok === false) {
@@ -1282,20 +1165,21 @@ test("createAgentwrapBackend.launch: exit 2 BAD_ARGS → permanent (keeper built
   }
 });
 
-test("createAgentwrapBackend.launch: exit 0 but schema_version:2 stdout → permanent (unconfirmed)", async () => {
+test("agentwrapLaunch: exit 0 but schema_version:2 stdout → permanent (unconfirmed)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
     AWP,
     { stdout: `${JSON.stringify({ schema_version: 2 })}\n`, exitCode: 0 },
     records,
   );
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "p" },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "p",
   });
   expect(res.ok).toBe(false);
   if (res.ok === false) {
@@ -1303,20 +1187,21 @@ test("createAgentwrapBackend.launch: exit 0 but schema_version:2 stdout → perm
   }
 });
 
-test("createAgentwrapBackend.launch: exit 0 but empty stdout → permanent (INTERNAL, unconfirmed)", async () => {
+test("agentwrapLaunch: exit 0 but empty stdout → permanent (INTERNAL, unconfirmed)", async () => {
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
     AWP,
     { stdout: "", exitCode: 0 },
     records,
   );
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "p" },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "p",
   });
   expect(res.ok).toBe(false);
   if (res.ok === false) {
@@ -1324,7 +1209,7 @@ test("createAgentwrapBackend.launch: exit 0 but empty stdout → permanent (INTE
   }
 });
 
-test("createAgentwrapBackend.launch: timeout-kill (runCapture null) → transient", async () => {
+test("agentwrapLaunch: timeout-kill (runCapture null) → transient", async () => {
   // A spawn whose `exited` never resolves forces the kill-timeout path; a tiny
   // captureTimeoutMs pins it without a real wait.
   const spawn: SpawnFn = (_cmd, _options) => ({
@@ -1333,179 +1218,62 @@ test("createAgentwrapBackend.launch: timeout-kill (runCapture null) → transien
     stderr: new Response("").body,
     kill: () => {},
   });
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "p" },
     spawn,
     captureTimeoutMs: 5,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "p",
   });
   expect(res).toMatchObject({ ok: false, retryable: true });
 });
 
-test("createAgentwrapBackend.launch: ENOENT (bad path) → transient, loud (noteLine warned)", async () => {
+test("agentwrapLaunch: ENOENT (bad path) → transient, loud (noteLine warned)", async () => {
   const warnings: string[] = [];
   // A spawn that throws models ENOENT (missing binary).
   const spawn: SpawnFn = () => {
     throw new Error("ENOENT");
   };
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: (l) => warnings.push(l),
     agentwrapPath: "/nope/agentwrap",
+    session: MANAGED_EXEC_SESSION,
+    cwd: "/repo",
+    label: "work::fn-1-x.1",
+    spec: { prompt: "p" },
     spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
-    prompt: "p",
   });
   expect(res).toMatchObject({ ok: false, retryable: true });
   // Loud, not silent — the bad path is named in a warn line.
   expect(warnings.some((w) => w.includes("/nope/agentwrap"))).toBe(true);
 });
 
-test("createAgentwrapBackend.launch: missing spec → permanent fail (wiring bug, never silent)", async () => {
-  const warnings: string[] = [];
+test("agentwrapLaunch: a per-call session targets that session, not the managed default", async () => {
+  // Manual `keeper dispatch` passes a per-call session (the resolved foreground /
+  // current session) rather than the hardcoded managed one.
   const records: Array<{ cmd: string[]; cwd?: string }> = [];
   const spawn = makeAgentwrapSpawnStub(
     AWP,
     { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
     records,
   );
-  const backend = createAgentwrapBackend({
-    noteLine: (l) => warnings.push(l),
-    agentwrapPath: AWP,
-    spawn,
-  });
-  const res = await backend.launch([], "work::fn-1-x.1", "/repo");
-  expect(res.ok).toBe(false);
-  if (res.ok === false) {
-    expect(res.retryable).toBeUndefined();
-  }
-  // No spawn happened (no argv to build) and the wiring bug was warned.
-  expect(records.length).toBe(0);
-  expect(warnings.some((w) => w.includes("missing structured spec"))).toBe(
-    true,
-  );
-});
-
-// --- shared pane ops delegate to the tmux backend verbatim ---
-
-test("createAgentwrapBackend: listPanes/killWindow/renameWindow/focusPane issue tmux commands (shared, not reimplemented)", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:list-panes": { stdout: "%1\t@1\twin\n", exitCode: 0 },
-      "tmux:kill-window": { exitCode: 0 },
-      "tmux:rename-window": { exitCode: 0 },
-      "tmux:select-window": { exitCode: 0 },
-      "tmux:select-pane": { exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = createAgentwrapBackend({
+  const res = await agentwrapLaunch({
     noteLine: () => {},
     agentwrapPath: AWP,
+    session: "foreground",
+    cwd: "/proj",
+    label: "session=foreground",
+    spec: { prompt: "/plan:work fn-1-x.1", claudeName: "work::fn-1-x.1" },
     spawn,
-  });
-  await backend.listPanes();
-  await backend.killWindow("%1");
-  await backend.renameWindow("@1", "name");
-  await backend.focusPane("autopilot", "%1");
-  // Every pane op went through tmux, never the agentwrap binary.
-  expect(calls.every((c) => c[0] === "tmux")).toBe(true);
-});
-
-test("createAgentwrapBackend.ensureLaunched WITHOUT a spec falls back to the tmux launch (restore replay)", async () => {
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = createAgentwrapBackend({
-    noteLine: () => {},
-    agentwrapPath: AWP,
-    spawn,
-  });
-  const res = await backend.ensureLaunched(
-    "human-session",
-    ["sh", "-l"],
-    "/proj",
-    "restored",
-  );
-  expect(res).toEqual({ ok: true });
-  // The restore replay execs the recorded argv via tmux, NOT agentwrap.
-  expect(calls.every((c) => c[0] === "tmux")).toBe(true);
-});
-
-test("createAgentwrapBackend.ensureLaunched WITH a spec routes through agentwrap into the per-call session", async () => {
-  const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(
-    AWP,
-    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
-    records,
-  );
-  const backend = createAgentwrapBackend({
-    noteLine: () => {},
-    agentwrapPath: AWP,
-    spawn,
-  });
-  const res = await backend.ensureLaunched("foreground", [], "/proj", "", {
-    prompt: "/plan:work fn-1-x.1",
-    claudeName: "work::fn-1-x.1",
   });
   expect(res).toEqual({ ok: true });
   expect(records[0]?.cmd[0]).toBe(AWP);
   // Per-call session targeted, not the managed default.
   expect(records[0]?.cmd).toContain("foreground");
   expect(records[0]?.cmd).toContain("KEEPER_TMUX_SESSION=foreground");
-});
-
-// --- resolveExecBackend: the agentwrap branch ---
-
-test("resolveExecBackend: backendType 'agentwrap' + a path routes through the agentwrap factory", async () => {
-  const records: Array<{ cmd: string[]; cwd?: string }> = [];
-  const spawn = makeAgentwrapSpawnStub(
-    AWP,
-    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
-    records,
-  );
-  const backend = resolveExecBackend({
-    noteLine: () => {},
-    backendType: "agentwrap",
-    agentwrapPath: AWP,
-    spawn,
-  });
-  await backend.launch([], "work::fn-1-x.1", "/abs", {
-    prompt: "/plan:work fn-1-x.1",
-    claudeName: "work::fn-1-x.1",
-  });
-  // The agentwrap binary was spawned, not tmux.
-  expect(records[0]?.cmd[0]).toBe(AWP);
-});
-
-test("resolveExecBackend: backendType 'agentwrap' WITHOUT a path falls back to tmux (loud)", async () => {
-  const warnings: string[] = [];
-  const calls: string[][] = [];
-  const spawn = makeSpawnStub(
-    {
-      "tmux:has-session": { exitCode: 0 },
-      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
-    },
-    calls,
-  );
-  const backend = resolveExecBackend({
-    noteLine: (l) => warnings.push(l),
-    backendType: "agentwrap",
-    spawn,
-  });
-  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
-  // Fell back to tmux, and warned loudly about the missing path.
-  expect(calls[0]?.[0]).toBe("tmux");
-  expect(warnings.some((w) => w.includes("no agentwrap_path"))).toBe(true);
 });
 
 // ---------------------------------------------------------------------------

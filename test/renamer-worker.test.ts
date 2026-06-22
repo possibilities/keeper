@@ -3,8 +3,8 @@
  *
  * Exercise the pure decision symbols — `renameCandidates`, `hashCandidates`,
  * `computeRenames` — and the `renamerPulse` orchestration against a fresh
- * in-memory writer DB seeded by direct `INSERT INTO jobs`, with an INJECTED
- * fake `ExecBackend` (no real tmux, no Worker spawn). The worker's lifecycle
+ * in-memory writer DB seeded by direct `INSERT INTO jobs`, with INJECTED fake
+ * pane ops (`listPanes`/`renameWindow`; no real tmux, no Worker spawn). The worker's lifecycle
  * (Worker thread, watchLoop, parentPort) is NOT spawned — the `isMainThread`
  * guard keeps the plain `import` inert, the same shape every other worker test
  * uses. Worker lifecycle is covered by the daemon ALL_WORKERS pin + test:full.
@@ -21,7 +21,7 @@
 
 import type { Database } from "bun:sqlite";
 import { beforeEach, expect, test } from "bun:test";
-import type { ExecBackend, LaunchResult, PaneInfo } from "../src/exec-backend";
+import type { LaunchResult, PaneInfo, TmuxPaneOps } from "../src/exec-backend";
 import {
   computeRenames,
   hashCandidates,
@@ -85,15 +85,15 @@ function candidate(
 }
 
 /**
- * Fake `ExecBackend` recording `renameWindow` calls. Only `listPanes` /
- * `renameWindow` carry behavior — the session-bound ops throw if a test path
- * ever reaches them (the renamer must never call them).
+ * Fake pane ops recording `renameWindow` calls. Shrunk to the kept subset
+ * `renamerPulse` consumes — `Pick<TmuxPaneOps, "listPanes" | "renameWindow">`;
+ * a broad ExecBackend-shaped fake would structurally mask a real gap.
  */
 function fakeBackend(opts: {
   panes: PaneInfo[] | null;
   renameResult?: (windowId: string, name: string) => LaunchResult;
 }): {
-  backend: ExecBackend;
+  backend: Pick<TmuxPaneOps, "listPanes" | "renameWindow">;
   listPanesCalls: number;
   renameCalls: { windowId: string; name: string }[];
 } {
@@ -101,19 +101,7 @@ function fakeBackend(opts: {
     listPanesCalls: 0,
     renameCalls: [] as { windowId: string; name: string }[],
   };
-  const backend: ExecBackend = {
-    launch: () => {
-      throw new Error("renamer must not call launch");
-    },
-    focusPane: () => {
-      throw new Error("renamer must not call focusPane");
-    },
-    ensureLaunched: () => {
-      throw new Error("renamer must not call ensureLaunched");
-    },
-    killWindow: () => {
-      throw new Error("renamer must not call killWindow");
-    },
+  const backend: Pick<TmuxPaneOps, "listPanes" | "renameWindow"> = {
     listPanes: async (): Promise<PaneInfo[] | null> => {
       tracker.listPanesCalls += 1;
       return opts.panes;

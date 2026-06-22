@@ -2939,8 +2939,8 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   } // end `if (eventsIngestWorker)`
 
   // The autopilot reconciler worker runs the level-triggered dispatch loop
-  // server-side: data_version wake → desired-vs-observed verdict → launch via the
-  // ExecBackend → confirm → mint on ceiling (bridged through main). The pure
+  // server-side: data_version wake → desired-vs-observed verdict → launch via
+  // agentwrap → confirm → mint on ceiling (bridged through main). The pure
   // decision logic lives in `src/autopilot-worker.ts`; this spawn is the glue.
   // Boots PAUSED (safety default) from the `paused: true` workerData; the flag
   // flips ONLY via the `set_autopilot_paused` RPC → bridge → `{type:"set-paused"}`
@@ -2955,14 +2955,9 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: {
           dbPath,
           paused: autopilotPaused,
-          // Selected backend (tmux default + fallback, or agentwrap), read on
-          // main and frozen into workerData. Restart-to-apply: a config flip
-          // lags until the next restart.
-          execBackend: apConfig.execBackend,
-          // Absolute agentwrap binary for the agentwrap backend — resolved on
-          // main (env override + config + `~`-expansion) and frozen in
-          // alongside `execBackend`, same restart-to-apply lifecycle. Ignored
-          // by the tmux backend.
+          // Absolute agentwrap binary — keeper's sole launch transport. Resolved
+          // on main (env override + config + `~`-expansion) and frozen in here;
+          // restart-to-apply (a config flip lags until the next restart).
           agentwrapPath: resolveAgentwrapPath(),
           maxConcurrentJobs: apConfig.maxConcurrentJobs,
           role: "autopilot",

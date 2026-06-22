@@ -2,8 +2,8 @@
  * tmux window-reaper worker tests (epic fn-802 task .2).
  *
  * Exercise the pure decision symbol `selectReapCandidates` clause-by-clause and
- * the `reaperCycle` orchestration with an INJECTED selector + fake `ExecBackend`
- * (no real tmux, no Worker spawn, no DB). The worker's lifecycle (Worker thread,
+ * the `reaperCycle` orchestration with an INJECTED selector + a fake pane-ops
+ * `killWindow` (no real tmux, no Worker spawn, no DB). The worker's lifecycle (Worker thread,
  * watchLoop, parentPort, periodic tick) is NOT spawned — the `isMainThread`
  * guard keeps the plain `import` inert, the same shape every other worker test
  * uses. Worker lifecycle + registration is covered by the daemon ALL_WORKERS
@@ -21,7 +21,7 @@
  */
 
 import { expect, test } from "bun:test";
-import type { ExecBackend, LaunchResult } from "../src/exec-backend";
+import type { LaunchResult, TmuxPaneOps } from "../src/exec-backend";
 import { MANAGED_EXEC_SESSION } from "../src/exec-backend";
 import type { ReadinessSnapshot, Verdict } from "../src/readiness";
 import {
@@ -249,26 +249,21 @@ test("a job inside its cooldown window is suppressed; past it, re-admitted", () 
 // reaperCycle — orchestration with an injected selector + fake backend
 // ---------------------------------------------------------------------------
 
-interface FakeBackend extends ExecBackend {
+// Shrunk to the kept pane-op subset `reaperCycle` consumes — `Pick<TmuxPaneOps,
+// "killWindow">`. A broad ExecBackend-shaped fake would structurally mask a real
+// gap, so only the op under test carries behavior.
+interface FakeBackend extends Pick<TmuxPaneOps, "killWindow"> {
   kills: string[];
 }
 
 function fakeBackend(result: LaunchResult = { ok: true }): FakeBackend {
   const kills: string[] = [];
-  const notImpl = (): never => {
-    throw new Error("not implemented in fake");
-  };
   return {
     kills,
     killWindow: async (paneId: string): Promise<LaunchResult> => {
       kills.push(paneId);
       return result;
     },
-    launch: notImpl,
-    focusPane: notImpl,
-    ensureLaunched: notImpl,
-    listPanes: notImpl,
-    renameWindow: notImpl,
   };
 }
 

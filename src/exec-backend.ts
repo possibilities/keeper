@@ -1,21 +1,20 @@
 /**
- * `ExecBackend` — terminal-surface spawn port for the autopilot reconciler,
- * plus session-agnostic pane ops for the `keeper jobs` CLI and restore-agents
- * replay. A factory with no top-level side effects; tests inject a fake `spawn`
- * to assert argv without launching real processes.
+ * The terminal-surface launch + pane seams keeper dispatches workers through.
+ * agentwrap is the sole launch transport: {@link agentwrapLaunch} invokes the
+ * patched agentwrap CLI (which OWNS the tmux window — session-create + handoff)
+ * for both autopilot dispatch and manual `keeper dispatch`. tmux is used DIRECTLY
+ * for the surviving direct seams — the session-agnostic pane ops
+ * ({@link createTmuxPaneOps}: focus / list / rename / kill, consumed by the
+ * reaper / renamer / jobs CLI / autopilot liveness probe) and the crash-recovery
+ * restore replay ({@link restoreReplayLaunch}). No `ExecBackend` interface, no
+ * backend toggle: the launch transport is agentwrap, the pane ops are tmux.
  *
- * Two op categories share one factory + one set of tmux -f /dev/null subprocess plumbing:
- *   - Session-bound lifecycle (`launch`) drives ONE managed session baked in at
- *     construction; each op runs a cheap per-call `has-session` get-or-create.
- *     Launch-window dedup is served by the durable `pending_dispatches`
- *     projection.
- *   - Session-agnostic (`focusPane`, `ensureLaunched`) take the target session
- *     per call. `focusPane` runs NO session-ensure; `ensureLaunched` runs its
- *     OWN per-call get-or-create.
+ * Every function is pure / side-effect-free at module scope; tests inject a fake
+ * `spawn` to assert argv without launching real processes.
  *
  * The reconciler correlates a launch back to keeperd via the `--name verb::id`
- * baked into `argv` → SessionStart hook event → `jobs` projection, never via a
- * surface ref; tmux is stateless from autopilot's side.
+ * baked into the agentwrap invocation → SessionStart hook event → `jobs`
+ * projection, never via a surface ref; tmux is stateless from autopilot's side.
  */
 
 /** Bun.spawn-shaped subset the backend needs; injectable for tests. */
@@ -69,14 +68,11 @@ export type LaunchResult =
   | { ok: false; error: string; retryable?: boolean };
 
 /**
- * Structured launch inputs an `ExecBackend.launch` may consume to build its own
- * invocation argv, instead of the pre-wrapped `argv` positional. The tmux
- * backend IGNORES this and execs the shell-wrapped `argv` verbatim; the
- * agentwrap backend IGNORES the pre-wrapped `argv` and builds the unwrapped
- * agentwrap invocation FROM this spec (it owns its own tmux window, so the
- * keeper shell-wrap shape does not apply). Both call sites already hold these
- * pieces — the autopilot reconciler from `(verb, id)`, the CLI from its parsed
- * flags — so threading the spec costs nothing at the seam.
+ * Structured launch inputs {@link agentwrapLaunch} builds its unwrapped
+ * agentwrap invocation from (agentwrap owns its own tmux window, so the keeper
+ * shell-wrap shape does not apply). Both call sites already hold these pieces —
+ * the autopilot reconciler from `(verb, id)`, the CLI from its parsed flags — so
+ * threading the spec costs nothing at the seam.
  */
 export interface LaunchSpec {
   /** The initial interactive prompt — the FINAL positional of the worker argv. */
@@ -98,59 +94,6 @@ export interface PaneInfo {
   readonly windowName: string;
 }
 
-export interface ExecBackend {
-  /** Session-bound. Spawn the worker at `cwd` in a new window in the managed
-   *  session. The `name` arg is NOT forwarded to the window label — it feeds the
-   *  warn/log lines and is the autopilot dedup key only. The tmux backend execs
-   *  the pre-wrapped `argv` verbatim; the agentwrap backend IGNORES `argv` and
-   *  builds its own unwrapped invocation from `spec` (when supplied), delegating
-   *  the tmux window to agentwrap. `spec` is optional so the tmux-only call sites
-   *  (restore replay) and tests keep the legacy 3-arg shape. */
-  launch(
-    argv: string[],
-    name: string,
-    cwd: string,
-    spec?: LaunchSpec,
-  ): Promise<LaunchResult>;
-  /** Session-agnostic. Focus `paneId` in an already-live external `session`
-   *  (brings its window forward, then focuses the pane). No session-ensure runs;
-   *  a missing session/pane → `{ ok: false }`. NEVER throws. */
-  focusPane(session: string, paneId: string): Promise<LaunchResult>;
-  /** Session-agnostic. Launch into the per-call `session`. The tmux backend
-   *  get-or-creates the session and execs the pre-wrapped `argv` in a new
-   *  window (unnamed when `name` is empty/absent — the restore path); the
-   *  agentwrap backend ignores `argv` and builds its own invocation from `spec`
-   *  (delegating session-create to agentwrap). `spec` is optional so the restore
-   *  replay (which has only a recorded shell-wrapped `argv`, no structured spec)
-   *  stays on the tmux-style path even under the agentwrap backend. NEVER
-   *  throws. */
-  ensureLaunched(
-    session: string,
-    argv: string[],
-    cwd: string,
-    name?: string,
-    spec?: LaunchSpec,
-  ): Promise<LaunchResult>;
-  /** Session-agnostic. Sweep every pane on the server (`list-panes -a`) into
-   *  `(paneId, windowId, windowName)` rows. `null` on a degraded/missing tmux —
-   *  callers skip the cycle. NEVER throws. */
-  listPanes(): Promise<PaneInfo[] | null>;
-  /** Session-agnostic. Rename window `windowId` (`@N`) to `name` via
-   *  `rename-window -t <id> -- <name>` (the `--` guards names starting with
-   *  `-`). A nonzero "can't find window" is an expected TOCTOU no-op returned as
-   *  `{ ok: false }` without noise. NEVER throws. */
-  renameWindow(windowId: string, name: string): Promise<LaunchResult>;
-  /** Session-agnostic. Kill the window owning pane `paneId` (`%N`) via
-   *  `kill-window -t <paneId>` — tmux -f /dev/null resolves the pane-id target UPWARD to its
-   *  window and kills every pane in it (the wanted semantics for one-pane
-   *  managed windows; a stable `%N` target cannot be redirected by concurrent
-   *  rename automation). Killing the last window kills the session, which the
-   *  next dispatch re-mints via get-or-create. A nonzero "can't find window" is
-   *  the expected TOCTOU no-op (the window already closed) returned as
-   *  `{ ok: false }` without noise. NEVER throws. */
-  killWindow(paneId: string): Promise<LaunchResult>;
-}
-
 /**
  * Upper bound on a single `runCapture` tmux-subprocess await. On expiry the
  * child is force-killed and the op degrades to `null`, keeping a wedged tmux
@@ -160,8 +103,11 @@ export interface ExecBackend {
  */
 const RUN_CAPTURE_TIMEOUT_MS = 5000;
 
-/** Backend selected when `exec_backend` is absent; the one source of truth for
- *  the lockstep `db.ts` site and tests. */
+/** The persisted `backend_exec_type` schema tag (restore-worker.ts stamps it;
+ *  the hook's {@link execBackendEnvMeta} returns it). NOT a launch toggle —
+ *  agentwrap is the sole launch transport; this is the historical tag the env
+ *  metadata + the persisted snapshot carry. The one source of truth for the
+ *  lockstep `db.ts` site and tests. */
 export const DEFAULT_EXEC_BACKEND = "tmux" as const;
 
 /** The single managed-session name keeper dispatches autopilot workers into.
@@ -605,38 +551,9 @@ export function buildTmuxKillWindowArgs(paneId: string): string[] {
   return ["tmux", "kill-window", "-t", paneId];
 }
 
-/** Resolver-filled dep bag for the tmux backend. `session` is the managed
- *  session for `launch`; it defaults to `MANAGED_EXEC_SESSION` so a consumer
- *  touching only the session-agnostic ops can construct with just `{ noteLine }`.
- *  `spawn` is injectable for tests. */
-export interface TmuxBackendDeps {
-  readonly noteLine: (line: string) => void;
-  readonly session?: string;
-  readonly spawn?: SpawnFn;
-  /** Override the `runCapture` kill-timeout; tests shrink it to pin the
-   *  timeout-kill-degrade path without a real 5s wait. */
-  readonly captureTimeoutMs?: number;
-}
-
-/** Resolver dep bag: `backendType` is the per-row/config backend tag, and the
- *  resolver fills `MANAGED_EXEC_SESSION` for an absent `session`. Every tag
- *  resolves to the tmux backend — `tmux` is the sole backend. */
-export interface ResolveExecBackendDeps {
-  readonly noteLine: (line: string) => void;
-  readonly session?: string;
-  readonly spawn?: SpawnFn;
-  /** Backend tag (typically a config value or a per-row `backend_exec_type`).
-   *  Any value — including unknown, NULL, or legacy tags — resolves to tmux. */
-  readonly backendType?: string;
-  /** Absolute agentwrap binary path for the `agentwrap` backend (resolved by
-   *  `resolveAgentwrapPath()`). Plumbed in by the wiring layer; consumed by the
-   *  agentwrap backend factory. Ignored when `backendType` resolves to tmux. */
-  readonly agentwrapPath?: string;
-}
-
-/** Dep bag for {@link createTmuxPaneOps} — the kept session-agnostic pane
- *  operations as a direct seam (no `ExecBackend` interface). `spawn` is
- *  injectable for tests; `captureTimeoutMs` tunes the per-call kill-timeout. */
+/** Dep bag for {@link createTmuxPaneOps} — the direct session-agnostic pane
+ *  operations seam. `spawn` is injectable for tests; `captureTimeoutMs` tunes
+ *  the per-call kill-timeout. */
 export interface TmuxPaneOpsDeps {
   readonly noteLine: (line: string) => void;
   readonly spawn?: SpawnFn;
@@ -654,14 +571,13 @@ export interface TmuxPaneOps {
 }
 
 /**
- * Direct factory for the session-agnostic tmux pane ops kept after the
- * exec-backend collapse — focus / sweep / rename / kill. These survive as their
- * own seam (NOT routed through the `ExecBackend` interface or
- * `resolveExecBackend`): every op targets a server-global tmux id the hook
- * stamps, so they apply identically regardless of who minted the window.
- * Reuses the same pure argv builders + bounded `makeRunCapture` + locale default
- * the launch path uses. NEVER throws — every failure degrades to a `noteLine`
- * warn / a best-effort no-op `{ ok: false }`.
+ * Direct factory for the session-agnostic tmux pane ops — focus / sweep /
+ * rename / kill. These are the surviving tmux seam alongside the restore replay:
+ * every op targets a server-global tmux id the hook stamps, so they apply
+ * identically regardless of who minted the window (agentwrap-launched or
+ * hand-created). Reuses the same pure argv builders + bounded `makeRunCapture` +
+ * locale default the restore-replay path uses. NEVER throws — every failure
+ * degrades to a `noteLine` warn / a best-effort no-op `{ ok: false }`.
  */
 export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
   const spawn = deps.spawn ?? defaultSpawn;
@@ -813,10 +729,10 @@ export interface RestoreReplayDeps {
  * then execs the recorded shell-wrapped `argv` verbatim in a new window via
  * `new-window` (named `name` when supplied). This is a spec-less replay: the
  * restore caller holds only a recorded `argv`, never a structured `LaunchSpec`,
- * so it stays on the direct tmux path (NOT routed through `ExecBackend` /
- * `resolveExecBackend`). Behavior is verbatim the old tmux-backend
- * `ensureLaunched` (a regression here is invisible until the next crash, so the
- * launch shape is preserved exactly). NEVER throws.
+ * so it stays on the direct tmux launch (this epic does not migrate restore to
+ * agentwrap — a deferred follow-up). Behavior is verbatim the prior launch shape
+ * (a regression here is invisible until the next crash, so it is preserved
+ * exactly). NEVER throws.
  */
 export async function restoreReplayLaunch(
   session: string,
@@ -845,12 +761,11 @@ export async function restoreReplayLaunch(
 }
 
 /**
- * Shared tmux get-or-create + `new-window` launch, factored to module scope so
- * both {@link createTmuxBackend} and the standalone {@link restoreReplayLaunch}
- * seam exec the same verbatim launch shape. Runs a per-call `has-session` probe
- * → `new-session` mint when absent (the mint carries color + locale env so a
- * keeperd-minted server is not colorblind / non-ASCII-blind), then a chained
- * `new-window`. NEVER throws.
+ * Shared tmux get-or-create + `new-window` launch, factored to module scope as
+ * the implementation behind the {@link restoreReplayLaunch} seam. Runs a
+ * per-call `has-session` probe → `new-session` mint when absent (the mint
+ * carries color + locale env so a keeperd-minted server is not colorblind /
+ * non-ASCII-blind), then a chained `new-window`. NEVER throws.
  */
 async function launchIntoTmux(
   runCapture: ReturnType<typeof makeRunCapture>,
@@ -904,97 +819,16 @@ async function launchIntoTmux(
   return { ok: true };
 }
 
-/**
- * tmux backend factory. Each op runs a per-call get-or-create (`has-session`
- * probe → `new-session` mint when absent) then a chained `new-window`; there is
- * NO session-ensure memo — `has-session` is cheap and avoids a stale-memo wedge
- * after a session dies. NEVER throws — every failure mode degrades to a
- * `noteLine` warn + an `{ ok: false }` (or a best-effort focus no-op).
- *
- * Delegates the session-agnostic pane ops to {@link createTmuxPaneOps} and the
- * get-or-create launch to {@link launchIntoTmux} — the kept direct seams — so
- * the surviving surface has a single implementation while the `ExecBackend`
- * interface (removed in a follow-up) still composes over it.
- */
-export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
-  const spawn = deps.spawn ?? defaultSpawn;
-  const session = deps.session ?? MANAGED_EXEC_SESSION;
-  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
-
-  const runCapture = makeRunCapture({
-    spawn,
-    captureTimeoutMs,
-    noteLine: deps.noteLine,
-    kind: "tmux",
-  });
-
-  const paneOps = createTmuxPaneOps({
-    noteLine: deps.noteLine,
-    spawn,
-    captureTimeoutMs,
-  });
-
-  return {
-    launch(
-      argv: string[],
-      name: string,
-      cwd: string,
-      _spec?: LaunchSpec,
-    ): Promise<LaunchResult> {
-      // Managed window stays UNNAMED — `name` feeds the log label + autopilot
-      // dedup key only, never the `-n` window label (the future naming system's
-      // seam). Dispatches into the construction-baked managed session. `_spec`
-      // is the agentwrap backend's structured-input seam — the tmux backend
-      // ignores it and execs the pre-wrapped `argv` verbatim.
-      return launchIntoTmux(
-        runCapture,
-        deps.noteLine,
-        session,
-        argv,
-        "",
-        cwd,
-        name,
-      );
-    },
-    focusPane: paneOps.focusPane,
-    ensureLaunched(
-      targetSession: string,
-      argv: string[],
-      cwd: string,
-      name?: string,
-      _spec?: LaunchSpec,
-    ): Promise<LaunchResult> {
-      // Session-agnostic get-or-create + launch into the per-call session. The
-      // restore caller passes `name` to label the window; managed dispatch never
-      // reaches here. Empty/absent name leaves the window unnamed. `_spec` is
-      // the agentwrap backend's structured-input seam — the tmux backend ignores
-      // it and execs the pre-wrapped `argv`.
-      return launchIntoTmux(
-        runCapture,
-        deps.noteLine,
-        targetSession,
-        argv,
-        name ?? "",
-        cwd,
-        `session=${targetSession}`,
-      );
-    },
-    listPanes: paneOps.listPanes,
-    renameWindow: paneOps.renameWindow,
-    killWindow: paneOps.killWindow,
-  };
-}
-
 // ===========================================================================
-// agentwrap backend
+// agentwrap launch — keeper's sole launch transport
 //
-// Opt-in via `exec_backend: agentwrap`. keeper invokes the patched agentwrap
-// CLI — which OWNS the tmux window (session-create + handoff) — instead of
-// hand-rolling `tmux new-window`. Only the LAUNCH transport changes: the
-// binding/lease/kill/list/rename/focus machinery is shared verbatim with the
-// tmux backend (every later op targets the server-global tmux pane id the hook
-// stamps, not anything agentwrap returns). agentwrap's one-line JSON + exit
-// code are consumed ONLY to confirm the launch and classify retry.
+// keeper invokes the patched agentwrap CLI — which OWNS the tmux window
+// (session-create + handoff) — for both autopilot dispatch and manual
+// `keeper dispatch`. The binding/lease/kill/list/rename/focus machinery is the
+// DIRECT tmux pane-ops seam ({@link createTmuxPaneOps}): every later op targets
+// the server-global tmux pane id the hook stamps, not anything agentwrap
+// returns. agentwrap's one-line JSON + exit code are consumed ONLY to confirm
+// the launch and classify retry.
 //
 // Cross-repo contract (NO shared module — matching comments are the drift
 // guard, byte-pinned by a fixture in test/exec-backend.test.ts):
@@ -1210,49 +1044,51 @@ export function mapAgentwrapExit(
   return { ok: false, error: `agentwrap launch failed (exit ${exitCode})` };
 }
 
-/** Resolver-filled dep bag for the agentwrap backend. Mirrors
- *  {@link TmuxBackendDeps} plus the absolute `agentwrapPath`. The
- *  `captureTimeoutMs` default is GENEROUS relative to tmux's: agentwrap does a
- *  session-create + claude handoff, so a 5s cap would spuriously timeout-kill a
- *  legitimately-slow launch. Tests shrink it to pin the timeout-kill path. */
-export interface AgentwrapBackendDeps {
+/**
+ * Upper bound on a single agentwrap-launch `runCapture` await. Larger than the
+ * pane-ops 5s default because agentwrap mints the session AND hands off to
+ * claude in the same invocation, so a 5s cap would spuriously timeout-kill a
+ * legitimately-slow launch. On expiry the child is force-killed and the launch
+ * degrades to a TRANSIENT fail (the normal expire path re-dispatches), never a
+ * sticky one. Unit: MILLISECONDS.
+ */
+export const AGENTWRAP_CAPTURE_TIMEOUT_MS = 30_000;
+
+/** Inputs to {@link agentwrapLaunch}. `session` is the tmux session agentwrap
+ *  mints/targets (the hardcoded {@link MANAGED_EXEC_SESSION} for autopilot
+ *  dispatch, a per-call session for manual `keeper dispatch`); `cwd` is the
+ *  worker's target repo, set on the spawn (agentwrap has no cwd flag). `label`
+ *  feeds the warn/log lines only. `spec` is the structured launch agentwrap
+ *  builds its invocation from. `spawn`/`captureTimeoutMs` are injectable for
+ *  tests. */
+export interface AgentwrapLaunchDeps {
   readonly noteLine: (line: string) => void;
   readonly agentwrapPath: string;
-  readonly session?: string;
+  readonly session: string;
+  readonly cwd: string;
+  readonly label: string;
+  readonly spec: LaunchSpec;
   readonly spawn?: SpawnFn;
   readonly captureTimeoutMs?: number;
 }
 
 /**
- * Upper bound on a single agentwrap-launch `runCapture` await. Larger than the
- * tmux 5s default because agentwrap mints the session AND hands off to claude in
- * the same invocation. On expiry the child is force-killed and the launch
- * degrades to a TRANSIENT fail (the normal expire path re-dispatches), never a
- * sticky one. Unit: MILLISECONDS.
+ * keeper's sole launch transport. Builds the unwrapped agentwrap invocation from
+ * the structured {@link LaunchSpec} (agentwrap owns its own tmux window, so the
+ * keeper shell-wrap shape does not apply), runs it via the shared bounded
+ * `runCapture` with the worker `cwd` on the spawn (agentwrap has no cwd flag and
+ * reads its own `process.cwd()` for the launch-script `cd`; keeperd's cwd is NOT
+ * the worker's target repo), parses the one-line JSON defensively, and maps the
+ * exit code through the central {@link mapAgentwrapExit}. Session-create is
+ * DELEGATED to agentwrap (`--agentwrap-tmux-session`, minting with
+ * C.UTF-8 + TERM/COLORTERM) — keeper runs no tmux session-ensure on this path.
+ * Drives BOTH autopilot dispatch (the managed session) and manual `keeper
+ * dispatch` (a per-call session). NEVER throws.
  */
-const AGENTWRAP_CAPTURE_TIMEOUT_MS = 30_000;
-
-/**
- * agentwrap backend factory. `launch` builds the unwrapped agentwrap invocation
- * from the structured {@link LaunchSpec} (NOT the pre-wrapped `argv`), runs it
- * via the shared bounded `runCapture`, parses the one-line JSON defensively, and
- * maps the exit code through the central {@link mapAgentwrapExit}. Session-create
- * is DELEGATED to agentwrap (`--agentwrap-tmux-session`) — keeper runs NO
- * `ensureSessionFor` here (agentwrap mints with C.UTF-8 + TERM/COLORTERM,
- * landed in round 1).
- *
- * The dispatch transport (`launch`) AND the session-agnostic `ensureLaunched`
- * (with a spec) both route through agentwrap. Only the pure pane ops
- * (`focusPane`/`listPanes`/`renameWindow`/`killWindow`) are shared verbatim with
- * an internal tmux backend — they operate on server-global tmux pane ids that
- * agentwrap's window carries just like a keeper-minted one, so reimplementing
- * them would be pointless drift. NEVER throws.
- */
-export function createAgentwrapBackend(
-  deps: AgentwrapBackendDeps,
-): ExecBackend {
+export async function agentwrapLaunch(
+  deps: AgentwrapLaunchDeps,
+): Promise<LaunchResult> {
   const spawn = deps.spawn ?? defaultSpawn;
-  const session = deps.session ?? MANAGED_EXEC_SESSION;
   const captureTimeoutMs =
     deps.captureTimeoutMs ?? AGENTWRAP_CAPTURE_TIMEOUT_MS;
   const runCapture = makeRunCapture({
@@ -1261,145 +1097,42 @@ export function createAgentwrapBackend(
     noteLine: deps.noteLine,
     kind: "agentwrap",
   });
-  // The pure pane ops run on tmux pane ids regardless of who minted the window —
-  // delegate them verbatim to a tmux backend constructed with the SAME spawn +
-  // session so `listPanes`/`killWindow`/`renameWindow`/`focusPane` behave
-  // identically. `ensureLaunched` WITHOUT a spec (the restore replay of a
-  // recorded shell-wrapped argv) also falls back to this tmux backend.
-  const tmux = createTmuxBackend({
-    noteLine: deps.noteLine,
-    session,
-    spawn,
+  const launchArgv = buildAgentwrapLaunchArgv({
+    agentwrapPath: deps.agentwrapPath,
+    session: deps.session,
+    prompt: deps.spec.prompt,
+    ...(deps.spec.claudeName !== undefined
+      ? { claudeName: deps.spec.claudeName }
+      : {}),
+    ...(deps.spec.model !== undefined ? { model: deps.spec.model } : {}),
+    ...(deps.spec.effort !== undefined ? { effort: deps.spec.effort } : {}),
+    noConfirm: true,
   });
-
-  /**
-   * Shared agentwrap launch: build the unwrapped invocation from `spec`, run it
-   * via the bounded `runCapture` (worker cwd on the spawn — agentwrap has no cwd
-   * flag), parse the one-line JSON defensively, and map the exit code through
-   * the central {@link mapAgentwrapExit}. Session-create is DELEGATED to
-   * agentwrap. Drives BOTH `launch` (managed session) and `ensureLaunched`
-   * (per-call session).
-   */
-  async function agentwrapLaunchInto(
-    targetSession: string,
-    cwd: string,
-    label: string,
-    spec: LaunchSpec,
-  ): Promise<LaunchResult> {
-    const launchArgv = buildAgentwrapLaunchArgv({
-      agentwrapPath: deps.agentwrapPath,
-      session: targetSession,
-      prompt: spec.prompt,
-      ...(spec.claudeName !== undefined ? { claudeName: spec.claudeName } : {}),
-      ...(spec.model !== undefined ? { model: spec.model } : {}),
-      ...(spec.effort !== undefined ? { effort: spec.effort } : {}),
-      noConfirm: true,
-    });
-    // agentwrap has no cwd flag — it reads its own `process.cwd()` for the
-    // launch-script `cd`. keeperd's cwd is NOT the worker's target repo, so set
-    // the worker cwd on the spawn (the agentwrap analogue of the tmux backend's
-    // `new-window -c <cwd>`).
-    const res = await runCapture(launchArgv, cwd !== "" ? { cwd } : undefined);
-    if (res == null) {
-      // ENOENT (bad/missing agentwrap path) OR a timeout-kill. A missing path
-      // must fail LOUDLY (not silently): note it. Classify as TRANSIENT so a
-      // wedged-but-recoverable launch (the timeout-kill case) re-dispatches; a
-      // genuinely-missing binary keeps failing each cycle and surfaces in the
-      // warn log, tripping the K=3 never-bound breaker after bounded retries.
-      const error = `agentwrap launch for ${label} produced no result (bad path '${deps.agentwrapPath}'? or timeout-kill)`;
-      deps.noteLine(`# warn: ${error}`);
-      return { ok: false, error, retryable: true };
-    }
-    if (res.stderr.trim().length > 0) {
-      deps.noteLine(`# launch stderr (${label}): ${res.stderr.trim()}`);
-    }
-    const parse = parseAgentwrapStdout(res.stdout);
-    const outcome = mapAgentwrapExit(res.exitCode, parse);
-    if (outcome.ok === false) {
-      deps.noteLine(
-        `# warn: ${outcome.error}${outcome.retryable === true ? " (transient)" : ""}; raw stdout: ${JSON.stringify(res.stdout)}`,
-      );
-    }
-    return outcome;
+  // agentwrap has no cwd flag — it reads its own `process.cwd()` for the
+  // launch-script `cd`, so set the worker cwd on the spawn.
+  const res = await runCapture(
+    launchArgv,
+    deps.cwd !== "" ? { cwd: deps.cwd } : undefined,
+  );
+  if (res == null) {
+    // ENOENT (bad/missing agentwrap path) OR a timeout-kill. A missing path
+    // must fail LOUDLY (not silently): note it. Classify as TRANSIENT so a
+    // wedged-but-recoverable launch (the timeout-kill case) re-dispatches; a
+    // genuinely-missing binary keeps failing each cycle and surfaces in the
+    // warn log, tripping the K=3 never-bound breaker after bounded retries.
+    const error = `agentwrap launch for ${deps.label} produced no result (bad path '${deps.agentwrapPath}'? or timeout-kill)`;
+    deps.noteLine(`# warn: ${error}`);
+    return { ok: false, error, retryable: true };
   }
-
-  return {
-    launch(
-      argv: string[],
-      name: string,
-      cwd: string,
-      spec?: LaunchSpec,
-    ): Promise<LaunchResult> {
-      // The agentwrap path needs the UNWRAPPED structured inputs — the
-      // pre-wrapped `[shell,-l,-i,-c,…]` `argv` is the tmux backend's shape and
-      // is ignored here. A missing `spec` is a wiring bug (the call site must
-      // thread it for this backend); fail loud rather than launch a malformed
-      // invocation. Dispatches into the construction-baked managed session.
-      void argv;
-      if (spec === undefined) {
-        const error = `agentwrap launch for ${name} missing structured spec (wiring bug)`;
-        deps.noteLine(`# warn: ${error}`);
-        return Promise.resolve({ ok: false, error });
-      }
-      return agentwrapLaunchInto(session, cwd, name, spec);
-    },
-    ensureLaunched(
-      targetSession: string,
-      argv: string[],
-      cwd: string,
-      name?: string,
-      spec?: LaunchSpec,
-    ): Promise<LaunchResult> {
-      // WITH a spec (manual `keeper dispatch` under the agentwrap backend):
-      // route through agentwrap into the per-call session. WITHOUT a spec (the
-      // restore replay of a recorded shell-wrapped argv): fall back to the tmux
-      // backend's `ensureLaunched`, which execs the recorded argv verbatim.
-      if (spec === undefined) {
-        return tmux.ensureLaunched(targetSession, argv, cwd, name);
-      }
-      void argv;
-      return agentwrapLaunchInto(
-        targetSession,
-        cwd,
-        `session=${targetSession}`,
-        spec,
-      );
-    },
-    focusPane: tmux.focusPane,
-    listPanes: tmux.listPanes,
-    renameWindow: tmux.renameWindow,
-    killWindow: tmux.killWindow,
-  };
-}
-
-/**
- * Resolve the exec backend from `backendType`. `agentwrap` selects the real
- * agentwrap backend (when an `agentwrapPath` is supplied); EVERY other tag —
- * `tmux`, unknown names, NULL, and legacy tags from historical job rows —
- * resolves to the tmux factory (the default + fallback) and NEVER throws on an
- * unrecognized tag. A thin seam so the reconciler call site and the jobs-board
- * focus path keep one stable entry point.
- */
-export function resolveExecBackend(deps: ResolveExecBackendDeps): ExecBackend {
-  const session = deps.session ?? MANAGED_EXEC_SESSION;
-  if (deps.backendType === "agentwrap") {
-    if (deps.agentwrapPath !== undefined && deps.agentwrapPath !== "") {
-      return createAgentwrapBackend({
-        noteLine: deps.noteLine,
-        agentwrapPath: deps.agentwrapPath,
-        session,
-        spawn: deps.spawn,
-      });
-    }
-    // `agentwrap` selected but no path resolved — fall back to tmux loudly
-    // rather than construct an unlaunchable backend.
+  if (res.stderr.trim().length > 0) {
+    deps.noteLine(`# launch stderr (${deps.label}): ${res.stderr.trim()}`);
+  }
+  const parse = parseAgentwrapStdout(res.stdout);
+  const outcome = mapAgentwrapExit(res.exitCode, parse);
+  if (outcome.ok === false) {
     deps.noteLine(
-      "# warn: exec_backend=agentwrap but no agentwrap_path resolved; falling back to tmux",
+      `# warn: ${outcome.error}${outcome.retryable === true ? " (transient)" : ""}; raw stdout: ${JSON.stringify(res.stdout)}`,
     );
   }
-  return createTmuxBackend({
-    noteLine: deps.noteLine,
-    session,
-    spawn: deps.spawn,
-  });
+  return outcome;
 }

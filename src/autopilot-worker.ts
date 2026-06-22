@@ -47,10 +47,11 @@ import {
 import { openDb } from "./db";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
+  agentwrapLaunch,
   createTmuxPaneOps,
   type LaunchSpec,
+  MANAGED_EXEC_SESSION,
   type PaneInfo,
-  resolveExecBackend,
 } from "./exec-backend";
 import {
   computeReadiness,
@@ -268,18 +269,18 @@ export function buildWorkerCommand(
 }
 
 /** Worker `--model` / `--effort` — the single source of truth shared by the
- *  shell-wrapped `buildWorkerCommand` (tmux backend) and the structured
- *  {@link buildPlannedLaunchSpec} (agentwrap backend) so both backends launch
- *  workers identically. */
+ *  shell-wrapped {@link buildWorkerCommand} and the structured
+ *  {@link buildPlannedLaunchSpec} so the worker flags stay identical across both
+ *  shapes. */
 export const WORKER_MODEL = "sonnet" as const;
 export const WORKER_EFFORT = "max" as const;
 
 /**
  * Build the structured {@link LaunchSpec} for a planned launch — the unwrapped
- * inputs the agentwrap backend builds its invocation from (the tmux backend
- * ignores it and execs the shell-wrapped `workerCommand`). Mirrors
+ * inputs {@link agentwrapLaunch} builds its invocation from. Mirrors
  * {@link buildWorkerCommand}'s flag choices EXACTLY (same model/effort/name/
- * prompt) so a worker launches identically under either backend. Pure —
+ * prompt) — that parity is a drift guard kept alongside the shell-wrapped
+ * `buildLaunchArgv` shape even though agentwrap reads only this spec. Pure —
  * exported for tests.
  */
 export function buildPlannedLaunchSpec(verb: Verb, id: string): LaunchSpec {
@@ -492,15 +493,18 @@ export interface ReconcileDecision {
  * — no real worker spawn).
  */
 export interface ConfirmRunningDeps {
-  /** Spawn the worker in a managed window keyed by `name`. The tmux backend
-   *  execs the pre-wrapped `argv`; the agentwrap backend ignores `argv` and
-   *  builds its own invocation from `spec`. `spec` is threaded for every launch
-   *  so the configured backend (tmux or agentwrap) gets what it needs. */
+  /** Spawn the worker in a managed window keyed by `name`. agentwrap is the sole
+   *  launch transport: it builds its invocation from `spec` (the unwrapped
+   *  structured launch) and owns the tmux window, IGNORING the pre-wrapped
+   *  `argv`. `name` feeds the warn/log lines and is the autopilot dedup key only.
+   *  `argv` is retained at the seam so the shell-wrapped `buildLaunchArgv` shape
+   *  (whose flag choices {@link buildPlannedLaunchSpec} mirrors as a drift guard)
+   *  stays computed at the call site; the launch impl reads `spec`, not `argv`. */
   launch(
     argv: string[],
     name: string,
     cwd: string,
-    spec?: LaunchSpec,
+    spec: LaunchSpec,
   ): Promise<LaunchResult>;
   /**
    * Emit a synthetic `DispatchFailed` event onto the writable connection
@@ -1129,8 +1133,8 @@ export async function confirmRunning(
     return "aborted-prelaunch";
   }
   // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`. `spec` is the
-  // structured-input the agentwrap backend builds its invocation from; the tmux
-  // backend ignores it and execs the pre-wrapped `argv`.
+  // structured input agentwrap (keeper's sole launch transport) builds its
+  // invocation from; the pre-wrapped `argv` is ignored by the launch impl.
   const launchResult: LaunchResult = await deps
     .launch(argv, key, cwd, spec)
     .catch((err) => ({
@@ -1331,18 +1335,11 @@ export interface AutopilotWorkerData {
   /** Poll cadence for the data_version wake loop (ms). */
   pollMs?: number;
   /**
-   * Exec backend the in-worker reconciler dispatches into — `tmux` (default +
-   * fallback) or `agentwrap`. Threaded in from `resolveConfig()` so config I/O
-   * happens once on main and every worker receives the resolved value. The
-   * managed session name is the hardcoded `MANAGED_EXEC_SESSION`, not
-   * configurable.
-   */
-  execBackend?: string;
-  /**
-   * Absolute agentwrap binary path for the `agentwrap` backend. Resolved once
-   * on main (`resolveAgentwrapPath()`: env override + config + `~`-expansion)
-   * and frozen in alongside `execBackend` — restart-to-apply, same as
-   * `execBackend`. Unused by the tmux backend.
+   * Absolute agentwrap binary path — keeper's sole launch transport. Resolved
+   * once on main (`resolveAgentwrapPath()`: env override + config +
+   * `~`-expansion) and frozen in here (restart-to-apply: a config flip lags
+   * until the next restart). The in-worker reconciler dispatches DIRECTLY through
+   * agentwrap into the hardcoded `MANAGED_EXEC_SESSION` (not configurable).
    */
   agentwrapPath?: string;
   /**
@@ -1447,8 +1444,8 @@ type IncomingMessage =
  */
 export async function loadReconcileSnapshot(
   db: Parameters<typeof runQuery>[0],
-  // Read-time backend liveness probe (`ExecBackend.listPanes`) — assembles the
-  // `livePaneIds` set that gates {@link isOccupyingJob}'s stopped arm. Threaded
+  // Read-time tmux liveness probe (the pane-ops `listPanes` seam) — assembles
+  // the `livePaneIds` set that gates {@link isOccupyingJob}'s stopped arm. Threaded
   // in (not imported) so this stays a pure read over `db` + the probe and tests
   // inject a fake. ABSENT or a `null`/throwing probe yields `livePaneIds = null`
   // (the conservative fallback: every stopped row occupies). NEVER read in a
@@ -1719,28 +1716,20 @@ function main(): void {
     }
   };
 
-  // The terminal-surface backend — `data.execBackend` (resolved from config on
-  // main) selects the tmux (default + fallback) or agentwrap factory.
-  // Dispatches into the hardcoded `MANAGED_EXEC_SESSION` — `resolveExecBackend`
-  // fills that default, so no session is threaded here. `data.agentwrapPath`
-  // (resolved on main) is the absolute agentwrap binary for the agentwrap
-  // backend; ignored by tmux. `noteLine` funnels its warnings to stderr — the
-  // worker has no lifecycle sidecar.
-  const backend = resolveExecBackend({
-    noteLine: (line: string) => {
-      console.error(line);
-    },
-    backendType: data.execBackend,
-    agentwrapPath: data.agentwrapPath,
-  });
+  // The worker has no lifecycle sidecar, so launch/probe warnings funnel to
+  // stderr.
+  const noteLine = (line: string): void => {
+    console.error(line);
+  };
+  // Launch is DIRECT via agentwrap (keeper's sole launch transport) into the
+  // hardcoded `MANAGED_EXEC_SESSION`. `data.agentwrapPath` (resolved on main) is
+  // the absolute agentwrap binary; `data.agentwrapPath` absent → an empty path
+  // that fails LOUDLY per launch (the daemon boot check is the primary guard).
+  const agentwrapPath = data.agentwrapPath ?? "";
   // The read-time liveness probe (`listPanes`) is a direct tmux pane-ops seam —
   // it targets server-global tmux ids the hook stamps, independent of the launch
-  // transport, so it does NOT go through the launch backend.
-  const paneOps = createTmuxPaneOps({
-    noteLine: (line: string) => {
-      console.error(line);
-    },
-  });
+  // transport.
+  const paneOps = createTmuxPaneOps({ noteLine });
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
 
@@ -1784,7 +1773,18 @@ function main(): void {
   // a DispatchFailed is described to main via `postMessage` (main is the
   // sole writer of the synthetic event, mirroring the git-worker mint).
   const deps: ConfirmRunningDeps = {
-    launch: (argv, name, cwd, spec) => backend.launch(argv, name, cwd, spec),
+    // Direct agentwrap launch into the managed session. The pre-wrapped `argv`
+    // is ignored — agentwrap builds its invocation from the structured `spec`
+    // and owns the tmux window; `name` is the warn/log label + dedup key.
+    launch: (_argv, name, cwd, spec) =>
+      agentwrapLaunch({
+        noteLine,
+        agentwrapPath,
+        session: MANAGED_EXEC_SESSION,
+        cwd,
+        label: name,
+        spec,
+      }),
     emitDispatchFailed: (payload) => {
       parentPort?.postMessage({
         kind: "dispatch-failed",

@@ -793,18 +793,20 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
   });
 });
 
-// cli/dispatch backend resolution — the manual CLI honors the configured
-// `exec_backend`. With NO injected launch seam, `main()` resolves the real
-// backend from `resolveConfig().execBackend` + `resolveAgentwrapPath()`. A stub
-// agentwrap binary (a recording shell script) proves the agentwrap launch
-// transport fires for `exec_backend: agentwrap`, and stays UNTOUCHED on the
-// default/tmux path. KEEPER_CONFIG + KEEPER_AGENTWRAP_PATH sandbox the resolve.
+// cli/dispatch launch transport — the manual CLI launches DIRECTLY through
+// agentwrap (keeper's sole launch transport). With NO injected launch seam,
+// `main()` resolves the real path from `resolveAgentwrapPath()` and invokes it.
+// A stub agentwrap binary (a recording shell script) proves the agentwrap launch
+// fires and carries the round-1 contract flags. A stale `exec_backend:` key in
+// config is silently ignored (the toggle is gone — agentwrap launches either
+// way). KEEPER_CONFIG + KEEPER_AGENTWRAP_PATH sandbox the resolve.
 // ---------------------------------------------------------------------------
-describe("cli/dispatch backend resolution honors exec_backend config", () => {
-  /** Build a tmp dir holding a config.yaml + a recording agentwrap stub that
-   *  appends its argv to `argv.log` and emits the schema_version:1 launch JSON.
+describe("cli/dispatch launches via the agentwrap transport", () => {
+  /** Build a tmp dir holding a recording agentwrap stub that appends its argv to
+   *  `argv.log` and emits the schema_version:1 launch JSON, plus a config.yaml
+   *  (optionally carrying a stale `exec_backend:` to prove it is ignored).
    *  Returns the paths plus a reader for the recorded argv lines. */
-  function setupBackendSandbox(execBackend: string): {
+  function setupBackendSandbox(staleExecBackend?: string): {
     configPath: string;
     stubPath: string;
     readArgvLog: () => string;
@@ -822,7 +824,12 @@ describe("cli/dispatch backend resolution honors exec_backend config", () => {
     );
     chmodSync(stubPath, 0o755);
     const configPath = join(dir, "config.yaml");
-    writeFileSync(configPath, `exec_backend: ${execBackend}\n`);
+    writeFileSync(
+      configPath,
+      staleExecBackend !== undefined
+        ? `exec_backend: ${staleExecBackend}\n`
+        : "",
+    );
     return {
       configPath,
       stubPath,
@@ -842,7 +849,7 @@ describe("cli/dispatch backend resolution honors exec_backend config", () => {
     process.env.KEEPER_CONFIG = s.configPath;
     process.env.KEEPER_AGENTWRAP_PATH = s.stubPath;
     try {
-      // No `launch` dep → main resolves the real backend from config.
+      // No `launch` dep → main resolves the real agentwrap path + launches.
       return await runMain(argv, {});
     } finally {
       if (prevConfig === undefined) delete process.env.KEEPER_CONFIG;
@@ -852,8 +859,8 @@ describe("cli/dispatch backend resolution honors exec_backend config", () => {
     }
   }
 
-  test("exec_backend: agentwrap → manual dispatch launches via the agentwrap binary", async () => {
-    const s = setupBackendSandbox("agentwrap");
+  test("manual dispatch launches via the agentwrap binary with the contract flags", async () => {
+    const s = setupBackendSandbox();
     try {
       const r = await runWithBackendEnv(
         ["--prompt", "hello agentwrap", "--session", "scratch"],
@@ -875,17 +882,17 @@ describe("cli/dispatch backend resolution honors exec_backend config", () => {
     }
   });
 
-  test("default/tmux exec_backend → the agentwrap binary is NEVER invoked", async () => {
+  test("a stale exec_backend: key in config is ignored — agentwrap still launches", async () => {
+    // The exec_backend toggle is gone; a leftover key must not change behavior.
     const s = setupBackendSandbox("tmux");
     try {
-      // tmux backend execs a shell-wrapped argv via a real `tmux` — which may be
-      // absent in CI; we only assert the agentwrap stub stayed untouched, the
-      // load-bearing "default path does NOT route through agentwrap" guarantee.
-      await runWithBackendEnv(
-        ["--prompt", "hello tmux", "--session", "scratch"],
+      const r = await runWithBackendEnv(
+        ["--prompt", "hello agentwrap", "--session", "scratch"],
         s,
       );
-      expect(s.readArgvLog()).toBe("");
+      expect(r.code).toBeUndefined();
+      // agentwrap still fired despite `exec_backend: tmux` in config.
+      expect(s.readArgvLog()).toContain("claude --agentwrap-tmux");
     } finally {
       s.cleanup();
     }
