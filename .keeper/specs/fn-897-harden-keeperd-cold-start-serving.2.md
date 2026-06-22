@@ -70,5 +70,5 @@ The only failure mode is a consumer acting on partial state, which the gate in (
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+B1 keystone: read-only control socket spawns right after migrate() (before the boot drain) so it serves reads during catch-up; mutating RPCs return server_booting and the autopilot actuator stay gated until drain-reaches-head + git-seed + ephemeral-truncate. Every reply carries a boot-status header (rev/head_event_id/catching_up/git_seed_required); unseeded git reads as unknown (never clean) in readiness and keeper await git-clean. TRUNCATE degrade documented.
 ## Evidence

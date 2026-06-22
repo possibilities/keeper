@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Serve reads while still draining",
-  "updated_at": "2026-06-22T20:02:32.773000Z"
+  "updated_at": "2026-06-22T21:27:43.823000Z",
+  "worker_done_at": "2026-06-22T21:27:43.823000Z"
 }
