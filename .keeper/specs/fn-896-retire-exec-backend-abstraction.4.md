@@ -35,5 +35,5 @@ Bring docs to the direct-binding reality and run the mandatory full gate.
 - [ ] `bun run test:full` green.
 
 ## Done summary
-
+Retired docs/exec-backend.md and rewrote README Config + Architecture and dispatch SKILL.md to the direct-binding reality: keeper launches via agentwrap (sole boot-validated transport); tmux -f /dev/null is used directly for pane ops + restore replay. Byte-pinned cross-repo fixture intact; bun run test:full green.
 ## Evidence
