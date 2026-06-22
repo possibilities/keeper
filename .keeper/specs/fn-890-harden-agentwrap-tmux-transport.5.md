@@ -41,5 +41,5 @@ This task IS the test. Run it locally with tmux present and confirm it passes an
 - [ ] `bun lint && bun typecheck && bun test` green.
 
 ## Done summary
-
+Added the real-tmux stripped-env verification harness (test/tmux-launch-stripped-env.test.ts) that spawns agentwrap under env -i on a per-pid scratch socket, proving the immediate launch JSON parses under C-locale and returns <~1s without --wait-for-stop. Docs (CLAUDE.md tmux section, AGENTWRAP_HELP) already reflected the final flags/codes/schema from predecessor commits; no revision needed.
 ## Evidence
