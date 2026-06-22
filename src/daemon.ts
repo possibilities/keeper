@@ -44,6 +44,7 @@ import type { BusWorkerData } from "./bus-worker";
 import { countAbsentBlobs, retainColdPayloads } from "./compaction";
 import {
   openDb,
+  resolveAgentwrapPath,
   resolveBackstopLogPath,
   resolveBuildbotUrl,
   resolveClaudeProjectsRoot,
@@ -2954,10 +2955,15 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
         workerData: {
           dbPath,
           paused: autopilotPaused,
-          // Selected backend (tmux — the sole backend), read on main and
-          // frozen into workerData. Restart-to-apply: a config flip lags until
-          // the next restart.
+          // Selected backend (tmux default + fallback, or agentwrap), read on
+          // main and frozen into workerData. Restart-to-apply: a config flip
+          // lags until the next restart.
           execBackend: apConfig.execBackend,
+          // Absolute agentwrap binary for the agentwrap backend — resolved on
+          // main (env override + config + `~`-expansion) and frozen in
+          // alongside `execBackend`, same restart-to-apply lifecycle. Ignored
+          // by the tmux backend.
+          agentwrapPath: resolveAgentwrapPath(),
           maxConcurrentJobs: apConfig.maxConcurrentJobs,
           role: "autopilot",
         } satisfies AutopilotWorkerData,

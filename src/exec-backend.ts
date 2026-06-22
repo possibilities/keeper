@@ -499,6 +499,10 @@ export interface ResolveExecBackendDeps {
   /** Backend tag (typically a config value or a per-row `backend_exec_type`).
    *  Any value — including unknown, NULL, or legacy tags — resolves to tmux. */
   readonly backendType?: string;
+  /** Absolute agentwrap binary path for the `agentwrap` backend (resolved by
+   *  `resolveAgentwrapPath()`). Plumbed in by the wiring layer; consumed by the
+   *  agentwrap backend factory. Ignored when `backendType` resolves to tmux. */
+  readonly agentwrapPath?: string;
 }
 
 /**

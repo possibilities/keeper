@@ -10,16 +10,23 @@
 
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_MAX_CONCURRENT_JOBS, resolveConfig } from "../src/db";
+import {
+  DEFAULT_MAX_CONCURRENT_JOBS,
+  resolveAgentwrapPath,
+  resolveConfig,
+} from "../src/db";
 
 let dir: string;
 let prevEnv: string | undefined;
+let prevAgentwrapEnv: string | undefined;
 
 beforeEach(() => {
   dir = mkdtempSync(join(tmpdir(), "keeper-config-"));
   prevEnv = process.env.KEEPER_CONFIG;
+  prevAgentwrapEnv = process.env.KEEPER_AGENTWRAP_PATH;
+  delete process.env.KEEPER_AGENTWRAP_PATH;
 });
 
 afterEach(() => {
@@ -27,6 +34,11 @@ afterEach(() => {
     delete process.env.KEEPER_CONFIG;
   } else {
     process.env.KEEPER_CONFIG = prevEnv;
+  }
+  if (prevAgentwrapEnv === undefined) {
+    delete process.env.KEEPER_AGENTWRAP_PATH;
+  } else {
+    process.env.KEEPER_AGENTWRAP_PATH = prevAgentwrapEnv;
   }
   rmSync(dir, { recursive: true, force: true });
 });
@@ -50,6 +62,13 @@ test("execBackend defaults to tmux when the key is absent", () => {
 test("exec_backend: tmux selects the tmux backend", () => {
   writeConfig("exec_backend: tmux\n");
   expect(resolveConfig().execBackend).toBe("tmux");
+});
+
+test("exec_backend: agentwrap selects the agentwrap backend", () => {
+  // `agentwrap` is now a recognized backend — it SELECTS rather than taking the
+  // unknown-value warn-and-fall-back path.
+  writeConfig("exec_backend: agentwrap\n");
+  expect(resolveConfig().execBackend).toBe("agentwrap");
 });
 
 test("exec_backend: an explicit zellij value warns and falls back to tmux", () => {
@@ -78,6 +97,57 @@ test("exec_backend resolves independently of a malformed sibling key", () => {
   expect(cfg.execBackend).toBe("tmux");
   // roots fell back to its default (non-empty) — independence holds.
   expect(cfg.roots.length).toBeGreaterThan(0);
+});
+
+// ---------------------------------------------------------------------------
+// agentwrap_path / resolveAgentwrapPath — env override > config > default,
+// tilde-expanded at resolve time.
+// ---------------------------------------------------------------------------
+
+test("agentwrap_path parses onto agentwrapPath (non-empty string only)", () => {
+  writeConfig("agentwrap_path: /opt/bin/agentwrap\n");
+  expect(resolveConfig().agentwrapPath).toBe("/opt/bin/agentwrap");
+});
+
+test("agentwrapPath is undefined when the key is absent", () => {
+  writeConfig("roots:\n  - ~/code\n");
+  expect(resolveConfig().agentwrapPath).toBeUndefined();
+});
+
+test("resolveAgentwrapPath defaults to ~/.bun/bin/agentwrap (tilde-expanded)", () => {
+  writeConfig("roots:\n  - ~/code\n");
+  expect(resolveAgentwrapPath()).toBe(
+    join(homedir(), ".bun", "bin", "agentwrap"),
+  );
+});
+
+test("resolveAgentwrapPath uses the config value over the default", () => {
+  writeConfig("agentwrap_path: /opt/bin/agentwrap\n");
+  expect(resolveAgentwrapPath()).toBe("/opt/bin/agentwrap");
+});
+
+test("resolveAgentwrapPath expands a leading ~/ in the config value", () => {
+  writeConfig("agentwrap_path: ~/tools/agentwrap\n");
+  expect(resolveAgentwrapPath()).toBe(join(homedir(), "tools", "agentwrap"));
+});
+
+test("KEEPER_AGENTWRAP_PATH env override wins over the config value", () => {
+  writeConfig("agentwrap_path: /opt/bin/agentwrap\n");
+  process.env.KEEPER_AGENTWRAP_PATH = "/usr/local/bin/agentwrap";
+  expect(resolveAgentwrapPath()).toBe("/usr/local/bin/agentwrap");
+});
+
+test("KEEPER_AGENTWRAP_PATH env override expands a leading ~/", () => {
+  process.env.KEEPER_AGENTWRAP_PATH = "~/env/agentwrap";
+  expect(resolveAgentwrapPath()).toBe(join(homedir(), "env", "agentwrap"));
+});
+
+test("a non-string agentwrap_path leaves agentwrapPath undefined → default", () => {
+  writeConfig("agentwrap_path: 42\n");
+  expect(resolveConfig().agentwrapPath).toBeUndefined();
+  expect(resolveAgentwrapPath()).toBe(
+    join(homedir(), ".bun", "bin", "agentwrap"),
+  );
 });
 
 // ---------------------------------------------------------------------------

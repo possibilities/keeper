@@ -5345,6 +5345,9 @@ test("resolveConfig: exec_backend defaults to tmux, accepts tmux, warns+falls-ba
     // tmux → kept verbatim.
     writeFileSync(cfg, "exec_backend: tmux\n");
     expect(resolveConfig().execBackend).toBe("tmux");
+    // agentwrap → recognized, selects verbatim.
+    writeFileSync(cfg, "exec_backend: agentwrap\n");
+    expect(resolveConfig().execBackend).toBe("agentwrap");
     // Legacy zellij value → warn + fall back to tmux (no longer recognized).
     writeFileSync(cfg, "exec_backend: zellij\n");
     expect(resolveConfig().execBackend).toBe("tmux");

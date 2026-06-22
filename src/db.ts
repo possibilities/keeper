@@ -109,8 +109,14 @@ const DEFAULT_AGENTUSAGE_ROOT = "~/.local/state/agentusage";
 const DEFAULT_EXEC_BACKEND = "tmux";
 
 /** Recognized `exec_backend` values; an unknown value warns and falls back to
- *  `DEFAULT_EXEC_BACKEND`. */
-const VALID_EXEC_BACKENDS = new Set(["tmux"]);
+ *  `DEFAULT_EXEC_BACKEND`. `agentwrap` launches workers via the patched
+ *  agentwrap CLI (which owns the tmux window); `tmux` stays the default + the
+ *  warn-and-fall-back target. */
+const VALID_EXEC_BACKENDS = new Set(["tmux", "agentwrap"]);
+
+/** Default absolute agentwrap binary used when `agentwrap_path` /
+ *  `KEEPER_AGENTWRAP_PATH` are unset. Tilde-expanded at resolve time. */
+const DEFAULT_AGENTWRAP_PATH = "~/.bun/bin/agentwrap";
 
 /**
  * Parsed keeper daemon config. Keys are INDEPENDENT — a malformed/missing one
@@ -130,9 +136,14 @@ export interface KeeperConfig {
   // with NO default: absent/empty/garbage → undefined → no prefix applied.
   // Plan-form dispatches are never prefixed.
   dispatchPromptPrefix?: string;
-  // Autopilot exec backend — `tmux` (the sole backend). The managed-session
-  // name is hardcoded (`MANAGED_EXEC_SESSION`), not configurable.
+  // Autopilot exec backend — `tmux` (default + fallback) or `agentwrap`. The
+  // managed-session name is hardcoded (`MANAGED_EXEC_SESSION`), not configurable.
   execBackend?: string;
+  // Absolute path to the agentwrap binary the `agentwrap` exec backend invokes.
+  // Independent best-effort key with NO default at the parse layer (absent →
+  // undefined here); `resolveAgentwrapPath()` supplies the `~/.bun/bin/agentwrap`
+  // default + the `KEEPER_AGENTWRAP_PATH` env override + tilde-expansion.
+  agentwrapPath?: string;
   // `null` (default) is unlimited; only a POSITIVE INTEGER overrides.
   // Enforced as a reconcile-level budget, not a readiness verdict.
   maxConcurrentJobs?: number | null;
@@ -172,6 +183,9 @@ export function resolveConfig(): KeeperConfig {
   // No default — absent leaves `dispatchPromptPrefix` undefined so no prefix is
   // applied to free-form `keeper dispatch` prompts.
   let dispatchPromptPrefix: string | undefined;
+  // No default at the parse layer — absent leaves `agentwrapPath` undefined so
+  // `resolveAgentwrapPath()` applies the `~/.bun/bin/agentwrap` default.
+  let agentwrapPath: string | undefined;
   let execBackend: string = DEFAULT_EXEC_BACKEND;
   let maxConcurrentJobs: number | null = DEFAULT_MAX_CONCURRENT_JOBS;
   let accountAliases: Record<string, string> = {};
@@ -218,6 +232,14 @@ export function resolveConfig(): KeeperConfig {
         .dispatch_prompt_prefix;
       if (typeof dpp === "string" && dpp.length > 0) {
         dispatchPromptPrefix = dpp;
+      }
+      // Independent best-effort key — non-empty string only; garbage/absent
+      // leaves `agentwrapPath` undefined and `resolveAgentwrapPath()` falls
+      // back to the default. NOT tilde-expanded here — resolution happens in
+      // `resolveAgentwrapPath()`.
+      const awp = (raw as { agentwrap_path?: unknown }).agentwrap_path;
+      if (typeof awp === "string" && awp.length > 0) {
+        agentwrapPath = awp;
       }
       // Independent best-effort key: a recognized value wins; an unknown
       // non-empty value warns and falls back to the default (every key
@@ -270,10 +292,36 @@ export function resolveConfig(): KeeperConfig {
     agentusageRoot,
     buildbotUrl,
     dispatchPromptPrefix,
+    agentwrapPath,
     execBackend,
     maxConcurrentJobs,
     accountAliases,
   };
+}
+
+/**
+ * Resolve the absolute agentwrap binary path for the `agentwrap` exec backend.
+ * `KEEPER_AGENTWRAP_PATH` env wins; else the `agentwrap_path` config key; else
+ * `~/.bun/bin/agentwrap`. A leading `~` is expanded via `homedir()` AT RESOLVE
+ * TIME — `execvp` does not expand `~`, so a tilde must be gone before spawn.
+ * Mirrors {@link resolveDbPath}'s env-override + {@link resolvePlanRoots}'s
+ * tilde-expansion precedents. No existence check here — a missing/bad path
+ * fails the launch loudly at spawn time, not silently at resolve time.
+ */
+export function resolveAgentwrapPath(): string {
+  const override = process.env.KEEPER_AGENTWRAP_PATH;
+  const entry =
+    override && override.length > 0
+      ? override
+      : (resolveConfig().agentwrapPath ?? DEFAULT_AGENTWRAP_PATH);
+  const home = homedir();
+  if (entry === "~") {
+    return home;
+  }
+  if (entry.startsWith("~/")) {
+    return join(home, entry.slice(2));
+  }
+  return entry;
 }
 
 /**

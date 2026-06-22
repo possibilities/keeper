@@ -1267,12 +1267,20 @@ export interface AutopilotWorkerData {
   /** Poll cadence for the data_version wake loop (ms). */
   pollMs?: number;
   /**
-   * Exec backend the in-worker reconciler dispatches into — `tmux` (the sole
-   * backend). Threaded in from `resolveConfig()` so config I/O happens once on
-   * main and every worker receives the resolved value. The managed session name
-   * is the hardcoded `MANAGED_EXEC_SESSION`, not configurable.
+   * Exec backend the in-worker reconciler dispatches into — `tmux` (default +
+   * fallback) or `agentwrap`. Threaded in from `resolveConfig()` so config I/O
+   * happens once on main and every worker receives the resolved value. The
+   * managed session name is the hardcoded `MANAGED_EXEC_SESSION`, not
+   * configurable.
    */
   execBackend?: string;
+  /**
+   * Absolute agentwrap binary path for the `agentwrap` backend. Resolved once
+   * on main (`resolveAgentwrapPath()`: env override + config + `~`-expansion)
+   * and frozen in alongside `execBackend` — restart-to-apply, same as
+   * `execBackend`. Unused by the tmux backend.
+   */
+  agentwrapPath?: string;
   /**
    * Global root-occupant cap across ALL epics/roots. `null`/absent = unlimited.
    * Threaded in from `resolveConfig()`.
@@ -1648,15 +1656,18 @@ function main(): void {
   };
 
   // The terminal-surface backend — `data.execBackend` (resolved from config on
-  // main) resolves to the tmux factory for every tag — tmux is the sole
-  // backend. Dispatches into the hardcoded `MANAGED_EXEC_SESSION` — `resolveExecBackend`
-  // fills that default, so no session is threaded here. `noteLine` funnels its
-  // warnings to stderr — the worker has no lifecycle sidecar.
+  // main) selects the tmux (default + fallback) or agentwrap factory.
+  // Dispatches into the hardcoded `MANAGED_EXEC_SESSION` — `resolveExecBackend`
+  // fills that default, so no session is threaded here. `data.agentwrapPath`
+  // (resolved on main) is the absolute agentwrap binary for the agentwrap
+  // backend; ignored by tmux. `noteLine` funnels its warnings to stderr — the
+  // worker has no lifecycle sidecar.
   const backend = resolveExecBackend({
     noteLine: (line: string) => {
       console.error(line);
     },
     backendType: data.execBackend,
+    agentwrapPath: data.agentwrapPath,
   });
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
