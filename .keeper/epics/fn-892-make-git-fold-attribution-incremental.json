@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-22T17:49:26.748000Z",
+  "depends_on_epics": [],
+  "id": "fn-892-make-git-fold-attribution-incremental",
+  "last_validated_at": "2026-06-22T17:49:26.828000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Make git-fold attribution incremental",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-22T17:49:26.748000Z"
+}

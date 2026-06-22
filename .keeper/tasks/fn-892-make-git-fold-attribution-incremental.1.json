@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T17:49:26.748000Z",
+  "depends_on": [],
+  "epic": "fn-892-make-git-fold-attribution-incremental",
+  "id": "fn-892-make-git-fold-attribution-incremental.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Memoize git-fold explicit-attribution scans",
+  "updated_at": "2026-06-22T17:49:26.748000Z"
+}
