@@ -3,9 +3,9 @@
  * (`./view-model.ts`). Two surfaces:
  *
  * - {@link attachDashApp} — the PAINT layer. Builds the stable renderable tree
- *   ONCE (root column = census header `Text` over a full-width rule + a
- *   flexGrow:1 `ScrollBox` body) and exposes `render(model)`, which paints the
- *   card model as a single column of robot-faced CARDS. Each band contributes a
+ *   ONCE (root column = a single flexGrow:1 `ScrollBox` body) and exposes
+ *   `render(model)`, which paints the card model as a single column of
+ *   robot-faced CARDS. Each band contributes a
  *   dim full-width rule (titled inline, structure-gray) followed by its cards;
  *   an empty band collapses (no rule). Each card is one `BoxRenderable` per
  *   `job:<id>` — rounded structure-gray border, project name in the border
@@ -124,7 +124,6 @@ export interface DashAppOptions {
  * read content without re-deriving the tree. */
 export interface DashApp {
   readonly renderer: CliRenderer;
-  readonly header: TextRenderableType;
   readonly body: ScrollBoxRenderableType;
   render(model: DashModel): void;
   destroy(): void;
@@ -167,9 +166,8 @@ interface BandHandle {
 type RowHandle = CardHandle | BandHandle;
 
 /**
- * Build the renderable scene + the row-diffing `render`. Column layout: a
- * fixed-height census header Text pinned at the top, a full-width rule under it,
- * and a flexGrow:1 ScrollBox body filling the rest. The body holds the
+ * Build the renderable scene + the row-diffing `render`. Column layout: a single
+ * flexGrow:1 ScrollBox body filling the screen. The body holds the
  * view-model's bands as dim rule rows + one bordered card per job, each a stable
  * handle in `rowNodes` so a re-render mutates content/border in place;
  * structural detach-then-append fires only when the keyed ORDER changes.
@@ -203,31 +201,12 @@ export function attachDashApp(
     return chunk;
   }
 
-  // A single default-fg text run → a StyledText (the header census).
-  function plainText(text: string): StyledTextType {
-    return new runtime.StyledText([chunkFor(text, {})]);
-  }
-
-  // Root: a full-screen column. Header fixed at 1 row over a full-width rule;
-  // body fills the rest.
+  // Root: a full-screen column holding just the scrolling card body.
   const root = new runtime.BoxRenderable(renderer, {
     id: "dash-root",
     width: "100%",
     height: "100%",
     flexDirection: "column",
-  });
-  const header = new runtime.TextRenderable(renderer, {
-    id: "dash-header",
-    width: "100%",
-    height: 1,
-    content: "",
-  });
-  const headerRule = new runtime.BoxRenderable(renderer, {
-    id: "dash-header-rule",
-    width: "100%",
-    height: 1,
-    border: ["top"],
-    borderColor: structureColor,
   });
   const body = new runtime.ScrollBoxRenderable(renderer, {
     id: "dash-body",
@@ -244,8 +223,6 @@ export function attachDashApp(
   // `scrollbarOptions` setter has the same bypass.
   body.verticalScrollBar.visible = false;
   body.horizontalScrollBar.visible = false;
-  root.add(header);
-  root.add(headerRule);
   root.add(body);
   renderer.root.add(root);
   // Focus the ScrollBox on mount — j/k/arrows reach the key handler regardless,
@@ -380,10 +357,6 @@ export function attachDashApp(
     if (destroyed) {
       return;
     }
-    // One column of left margin, matching the body cards' border inset (Text
-    // ignores padding options, so the margin is a literal space chunk).
-    header.content = plainText(` ${model.header}`);
-
     const paintRows = flatten(model);
 
     // Ensure every wanted row exists with current content. New nodes mount
@@ -542,7 +515,6 @@ export function attachDashApp(
 
   return {
     renderer,
-    header,
     body,
     render,
     destroy,

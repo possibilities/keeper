@@ -2,9 +2,9 @@
  * `keeper dash` view-model — the pure, OpenTUI-free projection layer for the
  * robot job-card screen. One entry point, {@link buildDashModel}, folds the
  * live `jobs` projection plus the flat running-subagent stream into a typed
- * `{ header, bands }` CARD model the OpenTUI paint layer (`./app.ts`) consumes:
- * a census `header` string and three urgency BANDS, each an ordered list of
- * keyed {@link CardVM} cards (one per job).
+ * `{ bands }` CARD model the OpenTUI paint layer (`./app.ts`) consumes: three
+ * urgency BANDS, each an ordered list of keyed {@link CardVM} cards (one per
+ * job).
  *
  * Status is DUAL-ENCODED per card: a Nerd Font md-robot face ({@link robotGlyph})
  * plus a colored left rail ({@link CardVM.railRole}), both resolved fresh from
@@ -213,9 +213,8 @@ export interface Band {
   readonly cards: readonly CardVM[];
 }
 
-/** The complete dash card model for one frame. `header` is the census line. */
+/** The complete dash card model for one frame. */
 export interface DashModel {
-  readonly header: string;
   readonly bands: readonly Band[];
 }
 
@@ -333,24 +332,6 @@ function buildCard(
 }
 
 // ---------------------------------------------------------------------------
-// Census header
-// ---------------------------------------------------------------------------
-
-/**
- * The census line: total live cards plus per-band counts. The `needs you`
- * count leads (it is the actionable number); `0 jobs` renders when the board is
- * empty so the header is never bare.
- */
-function buildHeader(counts: Record<BandKey, number>): string {
-  const total = counts["needs-you"] + counts["in-motion"] + counts.idle;
-  const noun = total === 1 ? "job" : "jobs";
-  return (
-    `${total} ${noun} · ${counts["needs-you"]} need you · ` +
-    `${counts["in-motion"]} in motion · ${counts.idle} idle`
-  );
-}
-
-// ---------------------------------------------------------------------------
 // Entry point
 // ---------------------------------------------------------------------------
 
@@ -366,9 +347,9 @@ function buildHeader(counts: Record<BandKey, number>): string {
  *   hidden; when true they join the idle band.
  * - `nowSec` — the frame's reference seconds (injected; no `Date.now()`).
  *
- * Returns `{ header, bands }`: the census header plus the three bands in render
- * order, each carrying its cards in stable `created_at` ASC (`job_id` tiebreak)
- * order. Empty bands emit an empty `cards` array. Pure, never throws.
+ * Returns `{ bands }`: the three bands in render order, each carrying its cards
+ * in stable `created_at` ASC (`job_id` tiebreak) order. Empty bands emit an
+ * empty `cards` array. Pure, never throws.
  */
 export function buildDashModel(
   jobs: Map<string, Job> | Iterable<Job>,
@@ -421,11 +402,5 @@ export function buildDashModel(
     return { key, title: BAND_TITLES[key], cards };
   });
 
-  const counts: Record<BandKey, number> = {
-    "needs-you": buckets["needs-you"].length,
-    "in-motion": buckets["in-motion"].length,
-    idle: buckets.idle.length,
-  };
-
-  return { header: buildHeader(counts), bands };
+  return { bands };
 }

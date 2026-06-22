@@ -5,7 +5,7 @@
  * tier). Asserts the SETTLED robot-card semantics: the six-rung status ladder
  * (each rung → its dash-local robot codepoint + rail role; annotations outrank
  * base state), band assignment (needs-you/in-motion/idle), stable intra-band
- * `created_at` sort, the `showTerminal` toggle gating, the census header,
+ * `created_at` sort, the `showTerminal` toggle gating,
  * per-field projection (project basename, never-blank label, role label,
  * running-subagent count, age, session coords), ESC sanitization, and the
  * never-throw fold on a malformed `state`. Also asserts the shared `fa-classic`
@@ -404,40 +404,6 @@ test("toggle: showTerminal=true reveals the happy/dead robots", () => {
 test("toggle: a non-terminal card is never marked isTerminal", () => {
   const m = build([makeJob({ job_id: "j", state: "working" })]);
   expect(onlyCard(m).isTerminal).toBe(false);
-});
-
-// ---------------------------------------------------------------------------
-// Census header
-// ---------------------------------------------------------------------------
-
-test("census: header counts total + per band", () => {
-  const jobs = [
-    makeJob({ job_id: "err", state: "working", last_api_error_at: 1 }),
-    makeJob({ job_id: "work", state: "working" }),
-    makeJob({ job_id: "work2", state: "working" }),
-    makeJob({ job_id: "idle", state: "stopped" }),
-  ];
-  const m = build(jobs);
-  expect(m.header).toBe("4 jobs · 1 need you · 2 in motion · 1 idle");
-});
-
-test("census: empty board reads 0 jobs (header never bare)", () => {
-  expect(build([]).header).toBe("0 jobs · 0 need you · 0 in motion · 0 idle");
-});
-
-test("census: a single live job uses the singular noun", () => {
-  expect(build([makeJob({ job_id: "j", state: "working" })]).header).toContain(
-    "1 job ·",
-  );
-});
-
-test("census: hidden terminal cards do not inflate the count", () => {
-  const jobs = [
-    makeJob({ job_id: "off", state: "stopped" }),
-    makeJob({ job_id: "done", state: "ended" }),
-  ];
-  // Terminal hidden → only 1 job counted.
-  expect(build(jobs, { showTerminal: false }).header).toContain("1 job ·");
 });
 
 // ---------------------------------------------------------------------------

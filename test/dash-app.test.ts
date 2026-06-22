@@ -1,8 +1,8 @@
 /**
  * Frame test for the `keeper dash` materializer (`src/dash/app.ts`
  * `attachDashApp`). Proves the OpenTUI paint surface over the robot job-card
- * model: the static tree mounts (root column → fixed census header + flexGrow
- * ScrollBox body, focused), the card model's header/bands/cards diff into the
+ * model: the static tree mounts (root column → a focused flexGrow ScrollBox
+ * body), the card model's bands/cards diff into the
  * body as a single column of bordered robot CARDS (one BoxRenderable per job:
  * rounded structure-gray border, project title, three interior lines carrying
  * the rail+robot glyph / title / age footer), band rules fence the urgency
@@ -100,12 +100,6 @@ function model(jobs: Job[], showTerminal = false): DashModel {
 // Harness — read painted text back.
 // ---------------------------------------------------------------------------
 
-function textContent(node: TextRenderable): string {
-  const styled = node.content;
-  const chunks = styled?.chunks ?? [];
-  return chunks.map((c) => c.text).join("");
-}
-
 /** The 0-based frame line index containing `needle`, or -1. Body cards are
  * bordered Boxes whose text lives in nested Text children, so assertions read
  * the painted char frame, not node trees. */
@@ -163,21 +157,11 @@ async function bootApp(
 // Tests
 // ---------------------------------------------------------------------------
 
-test("static tree: header fixed at row 0, body is a focused ScrollBox", async () => {
+test("static tree: body is a focused ScrollBox", async () => {
   const { app } = await bootApp();
-  expect(app.header.height).toBe(1);
   expect(app.body).toBeInstanceOf(ScrollBoxRenderable);
   // Focused on mount so wheel/page scroll lands on the body.
   expect((app.body as unknown as { focused: boolean }).focused).toBe(true);
-});
-
-test("census header: the census line renders behind the one-column margin", async () => {
-  const { app } = await bootApp();
-  app.render(model([makeJob({ job_id: "j", state: "working" })]));
-  const header = textContent(app.header);
-  expect(header.startsWith(" ")).toBe(true);
-  expect(header).toContain("1 job");
-  expect(header).toContain("in motion");
 });
 
 test("live frame: a card carries the robot glyph, status, title, and project", async () => {
@@ -242,8 +226,7 @@ test("bands: a band rule precedes the cards of a non-empty band", async () => {
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
   // needs-you band (the api-error card) paints above the in-motion band. Match
-  // the band RULE rows (leading `──`), not the census header (which also names
-  // both bands).
+  // the band RULE rows by their leading `──`.
   expect(frameLineOf(frame, "──needs you")).toBeLessThan(
     frameLineOf(frame, "──in motion"),
   );
