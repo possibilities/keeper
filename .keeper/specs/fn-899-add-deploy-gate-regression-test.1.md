@@ -24,5 +24,5 @@ under the same pytest tier.
 - [ ] Test runs in the existing system/tests pytest suite (no new harness).
 
 ## Done summary
-
+Added system/tests/test_buildbot_deploygate.py: a direct regression test for _arthack_deploy_gate that execs the real gate source from master.cfg and asserts a FAILURE-step build does not deploy while an all-green mermaidctl build does.
 ## Evidence
