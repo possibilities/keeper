@@ -32,5 +32,5 @@ Retire planctl in arthack. CORRECTNESS FIX: `keeper-history-forensics.md.tmpl` d
 - [ ] trailer-literal read-spots preserved; arthack tests + lint green
 
 ## Done summary
-
+Retired the planctl name across arthack: fixed the broken keeper-history-forensics snippet query (planctl_* event columns renamed to plan_* at keeper v78), renamed the buildbot notify test builder fixture to keeper-plan, swept incidental commit_attribution symbols to plan_* (preserving the frozen Planctl-Op trailer literal), emptied the dead planctl->keeper SUBPROCESS_EXEMPTIONS entry, and cleaned residual prose. Repo-wide grep now returns only the frozen Planctl-Op trailer literals plus the sanctioned ln-template ban/cleanup scripts.
 ## Evidence
