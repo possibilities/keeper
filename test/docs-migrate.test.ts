@@ -128,6 +128,27 @@ describe("bare-fence (headingless) EOF stamp", () => {
     expect(bareFenceStampIndex(plain)).toBe(-1);
   });
 
+  test("trims an empty numbered `## N. Metadata` husk above the fence", () => {
+    // The author parked the stamp under a numbered section heading; its only
+    // content was the machine fences, so the husk heading goes too.
+    const husked =
+      "# Doc\n\n## 1. Intro\n\ntext\n\n---\n\n## 11. Metadata\n\n```yaml\n" +
+      "session-id: abc\npath: /Users/mike/docs/x.md\n```\n\n```sh\n" +
+      "claude --resume abc\n```\n";
+    const out = stripBareFenceStamp(husked);
+    expect(out).not.toContain("## 11. Metadata");
+    expect(out).toContain("## 1. Intro");
+    expect(out.trimEnd().endsWith("text")).toBe(true);
+  });
+
+  test("a real content heading ending elsewhere is NOT a Metadata husk", () => {
+    // `## Tool Metadata` is content, not the stamp husk — only `## [N.] Metadata`
+    // exactly is trimmed; here there is no bare-fence stamp at all anyway.
+    const doc = "# Doc\n\n## Tool Metadata\n\nreal content.\n";
+    expect(bareFenceStampIndex(doc)).toBe(-1);
+    expect(stripBareFenceStamp(doc)).toBe(doc);
+  });
+
   test("migrateDoc strips a bare-fence doc + writes the sidecar", () => {
     const dir = mkdtempSync(join(tmpdir(), "docs-migrate-bare-"));
     try {

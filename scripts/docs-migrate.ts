@@ -235,16 +235,31 @@ export function bareFenceStampIndex(body: string): number {
   }
   // Everything after the yaml fence must be only the optional ```sh resume
   // fence + whitespace — i.e. this fence really is the EOF stamp, not a fence
-  // embedded mid-body. A `## Metadata` heading variant is handled elsewhere;
-  // if one precedes this fence the heading stripper already removed it.
+  // embedded mid-body. The un-numbered `## Metadata` heading variant is handled
+  // by the heading stripper; if one precedes this fence it already ran.
   const after = trailer.slice(yamlEnd + "```".length);
   if (!/^\s*(?:```sh\b[\s\S]*?```\s*)?$/.test(after)) {
     return -1;
   }
   // Trim back over a preceding `---` thematic break + blank lines.
-  const head = body.slice(0, lastIdx);
+  let head = body.slice(0, lastIdx);
   const sepMatch = head.match(/\n+(?:---\s*\n)?\s*$/);
-  return sepMatch ? (sepMatch.index ?? lastIdx) : lastIdx;
+  let cut = sepMatch ? (sepMatch.index ?? lastIdx) : lastIdx;
+
+  // A few docs parked the stamp under a NUMBERED `## N. Metadata` heading (the
+  // author's section sequence). Its only content was the machine fences, so the
+  // heading is now an empty husk — trim it (and its own preceding `---`) too.
+  // Gated on a `Metadata`-suffixed heading so a real content heading survives.
+  head = body.slice(0, cut);
+  const husk = head.match(
+    /\n+(?:---\s*\n\s*)?#{2,3} (?:\d+\.\s+)?Metadata\s*$/,
+  );
+  if (husk) {
+    const beforeHusk = body.slice(0, husk.index ?? cut);
+    const sep2 = beforeHusk.match(/\n+(?:---\s*\n)?\s*$/);
+    cut = sep2 ? (sep2.index ?? husk.index ?? cut) : (husk.index ?? cut);
+  }
+  return cut;
 }
 
 /** Field map for a headingless bare-fence EOF stamp, or empty when absent. */
