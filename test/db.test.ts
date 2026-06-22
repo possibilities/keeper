@@ -2148,9 +2148,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // schema surface → `plan_*` + rewrites historical envelopes, fn-864; v79 adds
   // the `git_projection_state` live-only control singleton + skip-floor, fn-868;
   // v80 excludes the worker's `done` + closer's `close` op from the plan-link
-  // classifier + rewinds the cursor with a git-floor-raise (not reset), fn-881);
-  // the v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(80);
+  // classifier + rewinds the cursor with a git-floor-raise (not reset), fn-881;
+  // v81 converges `epics.job_links` under the cheap per-session `mergeJobLinkSlice`
+  // merge via a v80-shaped rewind-and-redrain, fn-888); the v62→v63 epics-shape
+  // migration this test exercises is unchanged.
+  expect(SCHEMA_VERSION).toBe(81);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).

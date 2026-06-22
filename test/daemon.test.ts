@@ -2563,11 +2563,16 @@ test("fn-724: SCHEMA_VERSION tracks the live schema (durable ack itself added no
   // changed, so the migration REWINDS the cursor and wipes the canonical
   // projection list to repopulate from the corrected derive, but RAISES the git
   // skip-floor instead of resetting it to 0 to keep the v79 git carve-out, so the
-  // deterministic link projections re-fold byte-identically). This pin tracks the
-  // LIVE schema version: the guard it provides is "an accidental reducer/schema
+  // deterministic link projections re-fold byte-identically). And to 81 via fn-888
+  // task .2 (converging `epics.job_links` under task .1's cheap per-session
+  // `mergeJobLinkSlice` merge — the fold is byte-identical to the old per event, so
+  // this rewind-and-redrain is a convergence + self-validation pass, mirroring v80's
+  // rewind/wipe block exactly: cursor→0, deterministic projections wiped,
+  // `commit_trailer_facts` preserved, git skip-floor RAISED not reset). This pin tracks
+  // the LIVE schema version: the guard it provides is "an accidental reducer/schema
   // change must surface as a failing whitelist + this pin", which still holds —
   // bump both together when the schema genuinely moves.
-  expect(SCHEMA_VERSION).toBe(80);
+  expect(SCHEMA_VERSION).toBe(81);
 });
 
 test("PENDING_DISPATCH_SWEEP_INTERVAL_MS is 60s (matches the documented heartbeat cadence)", () => {

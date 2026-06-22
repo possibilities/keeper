@@ -2317,6 +2317,27 @@ the git skip-floor instead of resetting it to 0 (preserving the v79 git carve-ou
 the cursor-0 re-fold drain no-ops historical git folds), so the deterministic link
 projections re-fold byte-identically and `created_by_closer_of` lineage stays intact.
 keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `80` (whitelist-only).
+As of schema v81 (fn-888), `syncPlanLinks` re-derives `epics.job_links` with an
+idempotent per-SESSION replace-by-key merge (the shared `mergeJobLinkSlice` helper)
+instead of the old per-epic full cross-session sweep, so the fold's per-event cost is
+independent of sessions-per-epic AND board size — disarming the O(board)-per-event
+replay time-bomb (the old sweep re-derived a touched epic over EVERY session that had
+ever touched it, an O(touched_epics × swept_sessions) fan-out that turned a
+cursor-rewinding migration into a ~15-min socket-down catch-up with a 3–4 GB WAL). The
+new logic is byte-identical to the old PER EVENT, so the fold change (task .1) lands
+WITHOUT a rewind or storm. This bump's rewind-and-redrain (task .2) is justified by
+convergence + self-validation, NOT defensiveness: it CONVERGES every historical
+`epics.job_links` cell under the new code path, and it is SELF-VALIDATING — the
+cursor-0 re-fold that previously took ~15 min now completes in ~1–2 min under the
+constant-bounded fold, proving the time-bomb is disarmed. The migration MIRRORS the v80
+rewind/wipe block exactly: cursor→0, the deterministic projection list wiped (`jobs` /
+`epics` / …), `commit_trailer_facts` DELIBERATELY preserved (a derive INPUT rebuilt
+byte-identically from id 0 by the `INSERT OR IGNORE` `foldCommit`), the git skip-floor
+RAISED to `max(events.id)` (not reset to 0 — that re-arms the v79 git time-bomb), and
+the ephemeral / autopilot tables replicated so the re-fold cannot resurrect a phantom
+`pending_dispatches` dispatch jam. keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset
+gains `81` (whitelist-only; keeper-py reads `jobs` / `epics` over the socket, not the
+fold internals).
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`

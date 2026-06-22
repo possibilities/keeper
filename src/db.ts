@@ -45,7 +45,7 @@ import type { Epic, ResolvedEpicDep } from "./types";
  * Forward-only — never reduce, never branch. A SCHEMA_VERSION bump MUST add the
  * version to `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the same commit.
  */
-export const SCHEMA_VERSION = 80;
+export const SCHEMA_VERSION = 81;
 
 /** `KEEPER_DB` env wins; else `~/.local/state/keeper/keeper.db`. */
 export function resolveDbPath(): string {
@@ -4262,6 +4262,71 @@ function migrate(db: Database): void {
       // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
       // test/schema-version.test.ts enforces this.
       if (preMigrateStoredVersion < 80) {
+        db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
+        db.run("DELETE FROM jobs");
+        db.run("DELETE FROM epics");
+        // LIVE-ONLY git surface: wipe the tables + zero the embedded jobs
+        // git-counters, then RAISE the floor to `max(events.id)` (NOT the
+        // floor-0 reset `rewindLiveProjection` does) so the cursor-0 re-fold
+        // drain skips the historical git folds. `seed_required = 1` → the
+        // boot-seed re-derives the surface above the floor before serving.
+        for (const table of LIVE_ONLY_PROJECTIONS) {
+          db.run(`DELETE FROM ${table}`);
+        }
+        db.run(
+          `UPDATE jobs SET git_dirty_count = 0, git_unattributed_to_live_count = 0, git_orphan_count = 0`,
+        );
+        db.run(
+          `UPDATE git_projection_state
+              SET floor = max(floor, (SELECT COALESCE(MAX(id), 0) FROM events)),
+                  seed_required = 1,
+                  updated_at = unixepoch('now', 'subsec')
+            WHERE id = 1`,
+        );
+        db.run("DELETE FROM subagent_invocations");
+        db.run("DELETE FROM usage");
+        db.run("DELETE FROM profiles");
+        db.run("DELETE FROM dispatch_failures");
+        db.run("DELETE FROM autopilot_state");
+        db.run("DELETE FROM pending_dispatches");
+        db.run("DELETE FROM dispatch_never_bound");
+        db.run("DELETE FROM armed_epics");
+        db.run("DELETE FROM builds");
+      }
+
+      // v80→v81 (fn-888 task .2): converge `epics.job_links` under the new
+      // CHEAP `syncPlanLinks` fold (task .1). The fold changed from an O(touched_epics
+      // × swept_sessions) per-epic full session-sweep into an idempotent per-SESSION
+      // replace-by-key merge (`mergeJobLinkSlice`) whose per-event cost is independent
+      // of sessions-per-epic AND board size. The new logic is byte-identical to the old
+      // PER EVENT, so no live storm — but a rewind-and-redrain is still warranted, for
+      // two reasons named in the README prose (NOT "just in case"): it CONVERGES every
+      // historical `epics.job_links` cell under the new code path, and it is
+      // SELF-VALIDATING — the cursor-0 re-fold that previously took ~15 min (3–4 GB WAL,
+      // socket down) now completes in ~1–2 min under the constant-bounded fold, proving
+      // the O(board)-per-event time-bomb is disarmed.
+      //
+      // Modeled EXACTLY on the v80 step above (the v77 rewind/wipe shape with the v79
+      // git-floor RAISE, not a floor-0 reset). The full re-fold runs via the normal
+      // post-migrate boot drain — NOT inline here (avoids holding the writer lock
+      // across a full-log replay).
+      //
+      // `commit_trailer_facts` is DELIBERATELY NOT wiped — it is a DERIVE INPUT (the
+      // fn-695 commit channel), keyed by the `event_id` PK with an `INSERT OR IGNORE`
+      // fold (`foldCommit`), so the cursor-0 re-fold rebuilds it byte-identically from
+      // id 0 without a wipe. Wiping it would drop the commit-channel edges the new
+      // merge reads. The LIVE-ONLY git surface is wiped + its floor RAISED to
+      // `max(events.id)` (NOT reset to 0 — that re-arms the O(history)
+      // `computeRepoBashWindows` time-bomb v79 fixed), `seed_required = 1` so the
+      // boot-seed re-derives it above the floor. The ephemeral / autopilot tables are
+      // replicated from v80's list so the cursor-0 re-fold cannot resurrect a phantom
+      // `pending_dispatches` dispatch jam (test/refold-equivalence.test.ts guards it).
+      //
+      // Whitelist-only Python read (keeper-py reads `jobs` / `epics` over the socket,
+      // not these projection internals) — this bump MUST add 81 to
+      // `SUPPORTED_SCHEMA_VERSIONS` in `keeper/api.py` in the SAME commit;
+      // test/schema-version.test.ts enforces this.
+      if (preMigrateStoredVersion < 81) {
         db.run("UPDATE reducer_state SET last_event_id = 0 WHERE id = 1");
         db.run("DELETE FROM jobs");
         db.run("DELETE FROM epics");

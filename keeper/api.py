@@ -348,6 +348,16 @@ from pathlib import Path
 # the git skip-floor instead of resetting it to 0 (the v79 shape, avoiding a
 # historical git-fold replay). keeper-py reads ``jobs`` / ``epics`` over the
 # socket, not these projection internals, so only the version whitelist gains 80.
+#
+# v81 (fn-888 task .2) converges ``epics.job_links`` under the new cheap
+# ``syncPlanLinks`` fold: task .1 swapped the O(touched_epics x swept_sessions)
+# per-epic session-sweep for an idempotent per-session replace-by-key merge whose
+# per-event cost is independent of board size. The migration mirrors the v80
+# rewind/wipe block (cursor-0 rewind + canonical projection wipe, ``commit_trailer_facts``
+# preserved, git skip-floor RAISED not reset) so the re-fold converges every epic under
+# the fast logic and self-validates (the ~15-min replay now runs in ~1-2 min).
+# keeper-py reads ``jobs`` / ``epics`` over the socket, not these internals, so only the
+# version whitelist gains 81.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -400,6 +410,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         78,
         79,
         80,
+        81,
     }
 )
 
