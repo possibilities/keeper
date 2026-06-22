@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T15:32:02.477000Z",
+  "depends_on": [
+    "fn-884-docs-metadata-sidecar-migration.4"
+  ],
+  "epic": "fn-884-docs-metadata-sidecar-migration",
+  "id": "fn-884-docs-metadata-sidecar-migration.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/docs",
+  "tier": "xhigh",
+  "title": "reconcile remote gists to new shape",
+  "updated_at": "2026-06-22T15:32:02.477000Z"
+}
