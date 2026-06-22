@@ -50,5 +50,5 @@ Extend `test/tmux-launch.test.ts` via the injected `runTmuxCommandFn` seam (no r
 - [ ] `bun lint && bun typecheck && bun test` green; existing behavior unchanged when env already has a UTF-8 locale.
 
 ## Done summary
-
+Hardened the tmux spawn core: locale/TERM defaulting and an ASCII \x01 capture delimiter on every tmux spawn, =-exact has-session/new-window targets (create name untouched), a bounded spawn timeout mapped to a classifiable non-zero result, and absolute tmux/agentwrap binary resolution under a stripped PATH. New flags would have changed nothing; existing behavior is byte-identical when a UTF-8 locale is already set.
 ## Evidence
