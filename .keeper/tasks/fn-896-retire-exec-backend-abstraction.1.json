@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T19:42:30.791000Z",
+  "depends_on": [],
+  "epic": "fn-896-retire-exec-backend-abstraction",
+  "id": "fn-896-retire-exec-backend-abstraction.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "extract kept tmux surface",
+  "updated_at": "2026-06-22T19:42:30.791000Z"
+}

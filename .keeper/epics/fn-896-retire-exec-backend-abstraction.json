@@ -1,0 +1,17 @@
+{
+  "branch_name": "fn-collapse-exec-backend",
+  "bundles": [],
+  "created_at": "2026-06-22T19:42:30.791000Z",
+  "depends_on_epics": [],
+  "id": "fn-896-retire-exec-backend-abstraction",
+  "last_validated_at": "2026-06-22T19:42:30.891000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "retire exec-backend abstraction",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-22T19:42:30.791000Z"
+}
