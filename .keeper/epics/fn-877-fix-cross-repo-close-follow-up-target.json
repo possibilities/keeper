@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-22T00:00:35.299000Z",
   "created_at": "2026-06-21T23:23:13.581000Z",
   "depends_on_epics": [],
   "id": "fn-877-fix-cross-repo-close-follow-up-target",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Fix cross-repo close follow-up target_repo routing",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-21T23:23:13.581000Z"
+  "updated_at": "2026-06-22T00:00:35.299000Z"
 }
