@@ -2,9 +2,9 @@
  * `keeper dash` view-model — the pure, OpenTUI-free projection layer for the
  * robot job-card screen. One entry point, {@link buildDashModel}, folds the
  * live `jobs` projection plus the flat running-subagent stream into a typed
- * `{ bands }` CARD model the OpenTUI paint layer (`./app.ts`) consumes: three
- * urgency BANDS, each an ordered list of keyed {@link CardVM} cards (one per
- * job).
+ * `{ bands }` CARD model the OpenTUI paint layer (`./app.ts`) consumes: one BAND
+ * per active tmux session, each an ordered list of keyed {@link CardVM} cards
+ * (one per job).
  *
  * Status is DUAL-ENCODED per card: a Nerd Font md-robot face ({@link robotGlyph})
  * plus a colored left rail ({@link CardVM.railRole}), both resolved fresh from
@@ -13,10 +13,13 @@
  * in a DASH-LOCAL map ({@link ROBOT_CP}); the shared `ACTIVE_THEME` / `FA_CLASSIC`
  * (the board/jobs `fa-classic` glyphs) are untouched.
  *
- * Cards group into three bands — needs-you (api-error|awaiting) / in-motion
- * (working) / idle (stopped|ended|killed) — stable `created_at` ASC within a
- * band (`job_id` tiebreak) so a live card never teleports on a metadata tick.
- * Ended/killed cards are terminal and hidden unless `showTerminal` is set.
+ * Cards group by tmux session (`backend_exec_session_id`) — the priority
+ * sessions `foreground` / `background` / `autopilot` first, then any other named
+ * session alphabetically, then the `detached` band (no recorded session) last —
+ * stable `created_at` ASC within a band (`job_id` tiebreak) so a live card never
+ * teleports on a metadata tick. Status stays dual-encoded per card (robot face +
+ * rail), independent of which band the card sits in. Ended/killed cards are
+ * terminal and hidden unless `showTerminal` is set.
  *
  * Pure — no I/O, no wall-clock (the caller injects `nowSec`), no `@opentui`
  * import anywhere in this file. That last property is load-bearing: it keeps
@@ -146,35 +149,60 @@ function isTerminalRung(rung: RobotRung): boolean {
 // Bands
 // ---------------------------------------------------------------------------
 
-/** The three urgency bands, in render order. */
-export type BandKey = "needs-you" | "in-motion" | "idle";
+/** A band key — a tmux session name, or {@link DETACHED_KEY} for jobs with no
+ * recorded session. */
+export type BandKey = string;
 
-/** The band a rung sorts into: error/awaiting → needs-you, working → in-motion,
- * the three idle/terminal rungs → idle. */
-function bandForRung(rung: RobotRung): BandKey {
-  switch (rung) {
-    case "error":
-    case "awaiting":
-      return "needs-you";
-    case "working":
-      return "in-motion";
-    case "ended":
-    case "stopped":
-    case "killed":
-      return "idle";
-  }
+/** The session bands ranked first, in this render order, whenever present. Any
+ * other named session follows them alphabetically; {@link DETACHED_KEY} is
+ * always last. */
+const SESSION_PRIORITY: readonly string[] = [
+  "foreground",
+  "background",
+  "autopilot",
+];
+
+/** The band key for a job with no recorded tmux session (NULL/blank
+ * `backend_exec_session_id`). Empty so an all-ESC/blank session name folds here
+ * too; titled by {@link DETACHED_TITLE} and ordered last. */
+const DETACHED_KEY = "";
+
+/** The human title of the {@link DETACHED_KEY} band. */
+const DETACHED_TITLE = "detached";
+
+/** The tmux session band a job sorts into: its sanitized
+ * `backend_exec_session_id`, or {@link DETACHED_KEY} when NULL/blank. Pure. */
+function sessionBand(job: Job): BandKey {
+  return sanitize(str(job.backend_exec_session_id)).trim();
 }
 
-/** The human band titles the paint layer rules off. */
-const BAND_TITLES: Record<BandKey, string> = {
-  "needs-you": "needs you",
-  "in-motion": "in motion",
-  idle: "idle",
-};
+/** The display title for a band key — the session name itself, or
+ * {@link DETACHED_TITLE} for the detached band. */
+function bandTitle(key: BandKey): string {
+  return key === DETACHED_KEY ? DETACHED_TITLE : key;
+}
 
-/** Band render order — needs-you first (the few cards that must pop), idle last
- * (the calm tail). */
-const BAND_ORDER: readonly BandKey[] = ["needs-you", "in-motion", "idle"];
+/** Render rank for a band key: a priority session by its listed index, any
+ * other named session after them, the detached band last. {@link byBand} breaks
+ * rank ties alphabetically. */
+function bandRank(key: BandKey): number {
+  if (key === DETACHED_KEY) {
+    return Number.MAX_SAFE_INTEGER;
+  }
+  const pri = SESSION_PRIORITY.indexOf(key);
+  return pri === -1 ? SESSION_PRIORITY.length : pri;
+}
+
+/** Total order over band keys: rank ASC, then alphabetical within a rank (so
+ * the "other named sessions" tier sorts alphabetically). */
+function byBand(a: BandKey, b: BandKey): number {
+  const ra = bandRank(a);
+  const rb = bandRank(b);
+  if (ra !== rb) {
+    return ra - rb;
+  }
+  return a < b ? -1 : a > b ? 1 : 0;
+}
 
 // ---------------------------------------------------------------------------
 // Output shapes — the contract the OpenTUI paint layer (`./app.ts`) consumes
@@ -205,8 +233,9 @@ export interface CardVM {
   readonly isTerminal: boolean;
 }
 
-/** One urgency band: a keyed, titled, ordered run of cards. An empty band emits
- * an empty `cards` array (the paint layer collapses it — no rule). */
+/** One session band: a keyed (tmux session name, or {@link DETACHED_KEY}),
+ * titled, ordered run of cards. Only sessions with at least one visible card get
+ * a band — there are no empty bands. */
 export interface Band {
   readonly key: BandKey;
   readonly title: string;
@@ -344,12 +373,12 @@ function buildCard(
  * - `subagents` — the FLAT running-subagent stream, grouped per job for the
  *   live-subagent count.
  * - `showTerminal` — when false (default toggle state) ended/killed cards are
- *   hidden; when true they join the idle band.
+ *   hidden; when true they join their session band.
  * - `nowSec` — the frame's reference seconds (injected; no `Date.now()`).
  *
- * Returns `{ bands }`: the three bands in render order, each carrying its cards
- * in stable `created_at` ASC (`job_id` tiebreak) order. Empty bands emit an
- * empty `cards` array. Pure, never throws.
+ * Returns `{ bands }`: one band per active tmux session in render order (priority
+ * sessions first, the rest alphabetical, `detached` last), each carrying its
+ * cards in stable `created_at` ASC (`job_id` tiebreak) order. Pure, never throws.
  */
 export function buildDashModel(
   jobs: Map<string, Job> | Iterable<Job>,
@@ -361,14 +390,12 @@ export function buildDashModel(
     jobs instanceof Map ? Array.from(jobs.values()) : Array.from(jobs);
   const subCounts = runningSubByJob(subagents);
 
-  // Bucket cards by band, dropping terminal cards unless revealed.
-  const buckets: Record<BandKey, CardVM[]> = {
-    "needs-you": [],
-    "in-motion": [],
-    idle: [],
-  };
-  // Parallel `Job` lists so the intra-band sort can read created_at / job_id
-  // off the source row without threading them onto the immutable CardVM.
+  // Bucket cards by tmux-session band, dropping terminal cards unless revealed.
+  // Only sessions that contribute a card get a bucket, so there are no empty
+  // bands.
+  const buckets = new Map<BandKey, CardVM[]>();
+  // Parallel sort keys so the intra-band sort can read created_at / job_id off
+  // the source row without threading them onto the immutable CardVM.
   const sortKey = new Map<string, { created: number; id: string }>();
 
   for (const job of jobList) {
@@ -377,7 +404,13 @@ export function buildDashModel(
       continue;
     }
     const card = buildCard(job, rung, subCounts.get(job.job_id) ?? 0, nowSec);
-    buckets[bandForRung(rung)].push(card);
+    const key = sessionBand(job);
+    const bucket = buckets.get(key);
+    if (bucket === undefined) {
+      buckets.set(key, [card]);
+    } else {
+      bucket.push(card);
+    }
     sortKey.set(card.key, { created: job.created_at, id: job.job_id });
   }
 
@@ -396,11 +429,15 @@ export function buildDashModel(
     return ia < ib ? -1 : ia > ib ? 1 : 0;
   };
 
-  const bands: Band[] = BAND_ORDER.map((key) => {
-    const cards = buckets[key];
-    cards.sort(byCreated);
-    return { key, title: BAND_TITLES[key], cards };
-  });
+  // One band per active session, ordered by `byBand` (priority sessions first,
+  // the rest alphabetical, detached last), cards stable-sorted within.
+  const bands: Band[] = Array.from(buckets.keys())
+    .sort(byBand)
+    .map((key) => {
+      const cards = buckets.get(key) ?? [];
+      cards.sort(byCreated);
+      return { key, title: bandTitle(key), cards };
+    });
 
   return { bands };
 }

@@ -4,7 +4,8 @@
  * `@opentui` import anywhere (the property that keeps this file on the fast
  * tier). Asserts the SETTLED robot-card semantics: the six-rung status ladder
  * (each rung → its dash-local robot codepoint + rail role; annotations outrank
- * base state), band assignment (needs-you/in-motion/idle), stable intra-band
+ * base state), band assignment by tmux session (priority order + detached
+ * fallback), stable intra-band
  * `created_at` sort, the `showTerminal` toggle gating,
  * per-field projection (project basename, never-blank label, role label,
  * running-subagent count, age, session coords), ESC sanitization, and the
@@ -242,9 +243,10 @@ test("ladder: terminal state wins over a stale annotation stamp", () => {
       const job = makeJob({ job_id: "j", state, ...stamp });
       expect(robotRung(job)).toBe(rung);
 
-      // Lands in idle (terminal), not needs-you, when shown.
+      // Resolves to the terminal rung (a stale annotation stamp does not pin it
+      // as error/awaiting); when shown it lands in its session band (detached).
       const shown = build([job], { showTerminal: true });
-      expect(cardKeys(shown, "idle")).toEqual(["job:j"]);
+      expect(cardKeys(shown, "")).toEqual(["job:j"]);
       const card = onlyCard(shown);
       expect(card.robotGlyph).toBe(ROBOT[rung]);
       expect(card.railRole).toBe(role);
@@ -302,36 +304,80 @@ test("ladder: a malformed/unknown state folds to stopped — never throws", () =
 // Bands
 // ---------------------------------------------------------------------------
 
-test("bands: model emits the three bands in render order, even when empty", () => {
-  const m = build([]);
-  expect(m.bands.map((b) => b.key)).toEqual(["needs-you", "in-motion", "idle"]);
-  // Every band carries an empty card array — never undefined.
-  for (const b of m.bands) {
-    expect(b.cards).toEqual([]);
-  }
+test("bands: empty board emits no bands (no empty bands)", () => {
+  expect(build([]).bands).toEqual([]);
 });
 
-test("bands: each rung sorts into its urgency band", () => {
+test("bands: jobs group by tmux session (backend_exec_session_id)", () => {
   const jobs = [
-    makeJob({ job_id: "err", state: "working", last_api_error_at: 1 }),
-    makeJob({ job_id: "ask", state: "stopped", last_input_request_at: 1 }),
-    makeJob({ job_id: "work", state: "working" }),
-    makeJob({ job_id: "idle", state: "stopped" }),
+    makeJob({ job_id: "fg1", backend_exec_session_id: "foreground" }),
+    makeJob({ job_id: "ap1", backend_exec_session_id: "autopilot" }),
+    makeJob({ job_id: "fg2", backend_exec_session_id: "foreground" }),
   ];
   const m = build(jobs);
-  expect(cardKeys(m, "needs-you").sort()).toEqual(["job:ask", "job:err"]);
-  expect(cardKeys(m, "in-motion")).toEqual(["job:work"]);
-  expect(cardKeys(m, "idle")).toEqual(["job:idle"]);
+  expect(cardKeys(m, "foreground").sort()).toEqual(["job:fg1", "job:fg2"]);
+  expect(cardKeys(m, "autopilot")).toEqual(["job:ap1"]);
 });
 
-test("bands: ended/killed land in the idle band when shown", () => {
+test("bands: render order — priority sessions first, others alpha, detached last", () => {
   const jobs = [
-    makeJob({ job_id: "done", state: "ended" }),
-    makeJob({ job_id: "dead", state: "killed" }),
-    makeJob({ job_id: "off", state: "stopped" }),
+    makeJob({ job_id: "z", backend_exec_session_id: "zeta" }),
+    makeJob({ job_id: "ap", backend_exec_session_id: "autopilot" }),
+    makeJob({ job_id: "det", backend_exec_session_id: null }),
+    makeJob({ job_id: "fg", backend_exec_session_id: "foreground" }),
+    makeJob({ job_id: "ctl", backend_exec_session_id: "control" }),
+    makeJob({ job_id: "bg", backend_exec_session_id: "background" }),
+  ];
+  const m = build(jobs);
+  // foreground/background/autopilot (priority order) → other named sessions
+  // alphabetically (control, zeta) → detached last.
+  expect(m.bands.map((b) => b.key)).toEqual([
+    "foreground",
+    "background",
+    "autopilot",
+    "control",
+    "zeta",
+    "",
+  ]);
+});
+
+test("bands: title is the session name; the no-session band is titled 'detached'", () => {
+  const jobs = [
+    makeJob({ job_id: "fg", backend_exec_session_id: "foreground" }),
+    makeJob({ job_id: "det", backend_exec_session_id: null }),
+  ];
+  const m = build(jobs);
+  expect(band(m, "foreground").title).toBe("foreground");
+  expect(band(m, "").title).toBe("detached");
+});
+
+test("bands: a blank/whitespace session folds into detached", () => {
+  const jobs = [makeJob({ job_id: "blank", backend_exec_session_id: "   " })];
+  const m = build(jobs);
+  expect(m.bands.map((b) => b.key)).toEqual([""]);
+  expect(cardKeys(m, "")).toEqual(["job:blank"]);
+});
+
+test("bands: ended/killed land in their session band when shown", () => {
+  const jobs = [
+    makeJob({
+      job_id: "done",
+      state: "ended",
+      backend_exec_session_id: "autopilot",
+    }),
+    makeJob({
+      job_id: "dead",
+      state: "killed",
+      backend_exec_session_id: "autopilot",
+    }),
+    makeJob({
+      job_id: "off",
+      state: "stopped",
+      backend_exec_session_id: "autopilot",
+    }),
   ];
   const m = build(jobs, { showTerminal: true });
-  expect(cardKeys(m, "idle").sort()).toEqual([
+  expect(cardKeys(m, "autopilot").sort()).toEqual([
     "job:dead",
     "job:done",
     "job:off",
@@ -343,29 +389,26 @@ test("bands: ended/killed land in the idle band when shown", () => {
 // ---------------------------------------------------------------------------
 
 test("sort: stable created_at ASC within a band, job_id ASC tiebreak", () => {
+  const s = "foreground";
   const jobs = [
-    makeJob({ job_id: "c", state: "stopped", created_at: 30 }),
-    makeJob({ job_id: "a", state: "stopped", created_at: 10 }),
+    makeJob({ job_id: "c", created_at: 30, backend_exec_session_id: s }),
+    makeJob({ job_id: "a", created_at: 10, backend_exec_session_id: s }),
     // Two equal created_at → job_id ASC (eq-a before eq-b).
-    makeJob({ job_id: "eq-b", state: "stopped", created_at: 20 }),
-    makeJob({ job_id: "eq-a", state: "stopped", created_at: 20 }),
+    makeJob({ job_id: "eq-b", created_at: 20, backend_exec_session_id: s }),
+    makeJob({ job_id: "eq-a", created_at: 20, backend_exec_session_id: s }),
   ];
   const m = build(jobs);
-  expect(cardKeys(m, "idle")).toEqual([
-    "job:a",
-    "job:eq-a",
-    "job:eq-b",
-    "job:c",
-  ]);
+  expect(cardKeys(m, s)).toEqual(["job:a", "job:eq-a", "job:eq-b", "job:c"]);
 });
 
 test("sort: order is independent of input map insertion order", () => {
+  const s = "foreground";
   const m = build([
-    makeJob({ job_id: "z", state: "working", created_at: 99 }),
-    makeJob({ job_id: "y", state: "working", created_at: 1 }),
+    makeJob({ job_id: "z", created_at: 99, backend_exec_session_id: s }),
+    makeJob({ job_id: "y", created_at: 1, backend_exec_session_id: s }),
   ]);
   // created_at ASC → y (1) before z (99) regardless of insertion order.
-  expect(cardKeys(m, "in-motion")).toEqual(["job:y", "job:z"]);
+  expect(cardKeys(m, s)).toEqual(["job:y", "job:z"]);
 });
 
 // ---------------------------------------------------------------------------
@@ -383,7 +426,6 @@ test("toggle: showTerminal=false hides ended/killed (default)", () => {
   expect(m.bands.flatMap((b) => b.cards).map((c) => c.key)).toEqual([
     "job:off",
   ]);
-  expect(cardKeys(m, "idle")).toEqual(["job:off"]);
 });
 
 test("toggle: showTerminal=true reveals the happy/dead robots", () => {
@@ -392,7 +434,7 @@ test("toggle: showTerminal=true reveals the happy/dead robots", () => {
     makeJob({ job_id: "dead", state: "killed" }),
   ];
   const m = build(jobs, { showTerminal: true });
-  const cards = band(m, "idle").cards;
+  const cards = band(m, "").cards;
   const done = cards.find((c) => c.key === "job:done");
   const dead = cards.find((c) => c.key === "job:dead");
   expect(done?.robotGlyph).toBe(ROBOT.ended);
@@ -458,8 +500,8 @@ test("fields: subagentCount groups running subagents per job", () => {
     makeSub({ job_id: "b", agent_id: "b1", status: "running" }),
   ];
   const m = build(jobs, { subagents: subs });
-  const a = band(m, "in-motion").cards.find((c) => c.key === "job:a");
-  const b = band(m, "in-motion").cards.find((c) => c.key === "job:b");
+  const a = band(m, "").cards.find((c) => c.key === "job:a");
+  const b = band(m, "").cards.find((c) => c.key === "job:b");
   expect(a?.subagentCount).toBe(2);
   expect(b?.subagentCount).toBe(1);
 });

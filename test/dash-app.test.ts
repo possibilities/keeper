@@ -5,7 +5,7 @@
  * body), the card model's bands/cards diff into the
  * body as a single column of bordered robot CARDS (one BoxRenderable per job:
  * rounded structure-gray border, project title, three interior lines carrying
- * the rail+robot glyph / title / age footer), band rules fence the urgency
+ * the rail+robot glyph / title / age footer), band rules fence the tmux-session
  * bands, the `j`/`k`/arrow focus cursor swaps the focused card to a heavy cyan
  * border (keyed on job_id, surviving re-sort), the `t` keybind fires the
  * terminal-visibility toggle, terminal cards gate on `showTerminal`, and the
@@ -215,24 +215,32 @@ test("card chrome: cards are bordered boxes — rounded by default, heavy when f
   expect(frame).toContain("╰");
 });
 
-test("bands: a band rule precedes the cards of a non-empty band", async () => {
+test("bands: a session-band rule precedes its cards, in priority order", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([
-      makeJob({ job_id: "needy", state: "working", last_api_error_at: 1 }),
-      makeJob({ job_id: "busy", state: "working" }),
+      makeJob({
+        job_id: "ap",
+        state: "working",
+        backend_exec_session_id: "autopilot",
+      }),
+      makeJob({
+        job_id: "fg",
+        state: "working",
+        backend_exec_session_id: "foreground",
+      }),
     ]),
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // needs-you band (the api-error card) paints above the in-motion band. Match
-  // the band RULE rows by their leading `──`.
-  expect(frameLineOf(frame, "──needs you")).toBeLessThan(
-    frameLineOf(frame, "──in motion"),
+  // foreground outranks autopilot. Match the band RULE rows by their leading
+  // `──`.
+  expect(frameLineOf(frame, "──foreground")).toBeLessThan(
+    frameLineOf(frame, "──autopilot"),
   );
   // Both band rules render.
-  expect(frameLineOf(frame, "──needs you")).toBeGreaterThanOrEqual(0);
-  expect(frameLineOf(frame, "──in motion")).toBeGreaterThanOrEqual(0);
+  expect(frameLineOf(frame, "──foreground")).toBeGreaterThanOrEqual(0);
+  expect(frameLineOf(frame, "──autopilot")).toBeGreaterThanOrEqual(0);
 });
 
 test("empty-but-live: the body renders no card boxes — no placeholder lines", async () => {
@@ -336,7 +344,7 @@ test("focus cursor: arrow keys drive the same cursor as j/k", async () => {
 
 test("focus cursor: survives a re-sort (keyed on job_id, not position)", async () => {
   const { setup, app } = await bootApp();
-  // Two in-motion cards; focus the second (session-2).
+  // Two cards in the autopilot band; alpha (created 1) above beta (created 2).
   app.render(
     model([
       makeJob({
@@ -344,37 +352,46 @@ test("focus cursor: survives a re-sort (keyed on job_id, not position)", async (
         state: "working",
         title: "alpha",
         created_at: 1,
-      }),
-      makeJob({ job_id: "s2", state: "working", title: "beta", created_at: 2 }),
-    ]),
-  );
-  await setup.renderOnce();
-  setup.mockInput.pressKey("j"); // focus moves from s1 → s2
-  await setup.renderOnce();
-
-  // Now s2 transitions to api-error → it jumps to the needs-you band (re-sort).
-  // The focus must follow the CARD (s2), not the old position.
-  app.render(
-    model([
-      makeJob({
-        job_id: "s1",
-        state: "working",
-        title: "alpha",
-        created_at: 1,
+        backend_exec_session_id: "autopilot",
       }),
       makeJob({
         job_id: "s2",
         state: "working",
         title: "beta",
         created_at: 2,
-        last_api_error_at: 99,
+        backend_exec_session_id: "autopilot",
+      }),
+    ]),
+  );
+  await setup.renderOnce();
+  setup.mockInput.pressKey("j"); // focus moves from s1 → s2
+  await setup.renderOnce();
+
+  // Now s2 moves to the foreground session → its band outranks autopilot, so it
+  // jumps above alpha (re-sort). The focus must follow the CARD (s2), not the
+  // old position.
+  app.render(
+    model([
+      makeJob({
+        job_id: "s1",
+        state: "working",
+        title: "alpha",
+        created_at: 1,
+        backend_exec_session_id: "autopilot",
+      }),
+      makeJob({
+        job_id: "s2",
+        state: "working",
+        title: "beta",
+        created_at: 2,
+        backend_exec_session_id: "foreground",
       }),
     ]),
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // beta (s2) now sits in the needs-you band above alpha; the heavy focus border
-  // is on the beta card. Beta's line is above alpha's.
+  // beta (s2) now sits in the foreground band above alpha; the heavy focus
+  // border is on the beta card. Beta's line is above alpha's.
   expect(frameLineOf(frame, "beta")).toBeLessThan(frameLineOf(frame, "alpha"));
   expect(frame).toContain("┏");
 });

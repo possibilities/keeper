@@ -140,7 +140,7 @@ interface BuiltChunk {
   attributes?: number;
 }
 
-/** A flattened paint row: a `band` is the dim urgency-band rule (titled inline);
+/** A flattened paint row: a `band` is the dim session-band rule (titled inline);
  * a `card` is one job's bordered card. The view-model's per-frame order drives
  * the structural diff. */
 type PaintRow =

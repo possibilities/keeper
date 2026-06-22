@@ -2,9 +2,9 @@
 /**
  * `keeper dash` — the unified keeper TUI: a live, read-only, full-screen single
  * column of compact robot job-CARDS (one per job: project · title · status),
- * grouped into needs-you / in-motion / idle urgency bands. Status is
- * dual-encoded as a Nerd Font md-robot face plus a colored left rail, so the
- * board is calm when idle and the few jobs that need attention pop.
+ * grouped by tmux session (foreground / background / autopilot / … / detached).
+ * Status is dual-encoded as a Nerd Font md-robot face plus a colored left rail,
+ * so the board is calm when idle and the few jobs that need attention pop.
  *
  * Unlike the five viewer subcommands, dash is TTY-ONLY — there is NO snapshot
  * mode. The TTY gate fires here, BEFORE any `@opentui/core` import, so a piped
