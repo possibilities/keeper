@@ -40,5 +40,5 @@ Forward-facing only — no "formerly/moved to keeper" narration in the prose (co
 - [ ] `bun test --cwd claude/arthack/hooks` green
 
 ## Done summary
-
+Removed docs-metadata + gist-url machinery from arthack post_tool_use.ts (functions, consts, call sites, exports, tests) now that the keeper plugin owns it; kept stylua/zig-fmt formatters and commandAdvice. Updated hooks.json and both CLAUDE.md descriptions forward-facing. bun test --cwd claude/arthack/hooks green (64 pass).
 ## Evidence
