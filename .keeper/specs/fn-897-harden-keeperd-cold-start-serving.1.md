@@ -52,5 +52,5 @@ harness at :147-236. `bun run test:full`.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Added a size/count-gated wal_checkpoint(PASSIVE) inside drainToCompletion's batch loop (between per-event transactions, ~10k events or ~200MB -wal gate, never per-event), bounding peak WAL during the boot drain while preserving wal_autocheckpoint=0 and the final TRUNCATE. New daemon test proves the peak stays bounded across a 3x-interval backlog and the TRUNCATE collapses the WAL.
 ## Evidence

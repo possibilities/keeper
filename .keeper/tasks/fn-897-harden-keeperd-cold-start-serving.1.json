@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Periodic PASSIVE checkpoint during boot drain",
-  "updated_at": "2026-06-22T20:02:32.773000Z"
+  "updated_at": "2026-06-22T20:47:39.797000Z",
+  "worker_done_at": "2026-06-22T20:47:39.797000Z"
 }
