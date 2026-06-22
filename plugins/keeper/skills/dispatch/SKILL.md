@@ -19,8 +19,8 @@ argument-hint: <verb>::<id> | --prompt "<text>"
 
 Turn a "launch ONE worker by hand" request into a single `keeper dispatch`
 Bash call. `keeper dispatch` fires one `claude` worker into a managed window
-(via whatever `exec_backend` is configured — tmux or agentwrap), parallel to —
-and independent of — the server-side autopilot reconciler. This
+(via agentwrap), parallel to — and independent of — the server-side autopilot
+reconciler. This
 is a precisely-triggered operator surface, conservative by default: it fires a
 worker only on a clear request to launch one by hand. The autopilot dispatching
 ready plan work on its own, or `/plan:work` running a task in THIS session,

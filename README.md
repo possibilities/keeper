@@ -340,23 +340,19 @@ Keeper has no `install` verb. Wire it up manually:
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
-   - `exec_backend` — how keeperd's server-side autopilot reconciler launches
-     workers into a managed window. Two backends: `tmux` (the default + fallback)
-     hand-rolls `tmux new-window` itself; `agentwrap` instead invokes the patched
-     agentwrap CLI (which owns the tmux window) by absolute path. Any other value
-     warns and falls back to `tmux`. Only the LAUNCH transport differs — both
-     backends share the identical hook-based binding/lease/kill/focus machinery,
-     so a worker binds the same way under either. The managed-session name is
+   - `agentwrap_path` — absolute path to the agentwrap binary, keeper's sole
+     launch transport: keeperd's server-side autopilot reconciler and the manual
+     `keeper dispatch` both invoke agentwrap (which owns the tmux window) to spawn
+     a worker into a managed window. The `KEEPER_AGENTWRAP_PATH` env var wins, else
+     this config key, else `~/.bun/bin/agentwrap`. A leading `~` is expanded at
+     resolve time (`execvp` does not expand `~`). agentwrap is a HARD runtime
+     dependency: keeperd validates its presence at boot (logging the resolved
+     absolute path; a prominent warning if missing). The managed-session name is
      hardcoded (`autopilot`), NOT configurable; each dispatch opens a new window
      inside that shared background session. The window-reaper worker closes a
      managed window ONLY once its work is verifiably complete (stopped past a
      short debounce with a completed readiness verdict — gone within ~1-2s);
      every other window stays open for inspection.
-   - `agentwrap_path` — absolute path to the agentwrap binary, used ONLY when
-     `exec_backend: agentwrap`. The `KEEPER_AGENTWRAP_PATH` env var wins, else
-     this config key, else `~/.bun/bin/agentwrap`. A leading `~` is expanded at
-     resolve time (`execvp` does not expand `~`); a missing/bad path fails the
-     launch loudly at spawn, not silently.
    - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
      jobs. A positive integer enforces the cap; omit or set non-positive
      (the default) to leave it unlimited. The cap bounds only `work`/`close`
@@ -376,8 +372,7 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/code
      - ~/src
    claude_projects_root: ~/.claude/projects
-   exec_backend: tmux              # or: agentwrap
-   # agentwrap_path: ~/.bun/bin/agentwrap   # only used when exec_backend: agentwrap
+   # agentwrap_path: ~/.bun/bin/agentwrap   # keeper's launch transport
    max_concurrent_jobs: 3
    YAML
    ```
@@ -388,7 +383,8 @@ Keeper has no `install` verb. Wire it up manually:
    All keys fall back independently — a missing/malformed one never disturbs
    the others; a missing or malformed config falls back to every default
    (`roots: [~/code]`, `claude_projects_root: ~/.claude/projects`,
-   `exec_backend: tmux`). Unknown config keys are silently ignored.
+   `agentwrap_path: ~/.bun/bin/agentwrap`). Unknown config keys are silently
+   ignored.
 
 4. **Load the plugins via the arthack launcher's `plugin_scan_dirs`.** Both
    Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
@@ -991,7 +987,7 @@ event-log/reducer/hook touch. Run any of them with
   tmux window by hand, the client-side complement to the server-side
   reconciler above: where `autopilot` is the daemon's level-triggered
   dispatcher, `keeper dispatch` is a one-shot human-driven launch that goes
-  through `resolveExecBackend(...).ensureLaunched(...)` with NO daemon RPC, NO
+  through a direct `agentwrapLaunch(...)` with NO daemon RPC, NO
   synthetic event, and NO reducer/migration touch — so re-fold determinism and
   the five-surface RPC-write invariant hold by construction. Two
   mutually-exclusive modes: a **plan form** (`work::<id>` / `close::<id>`) that
@@ -1310,8 +1306,9 @@ commits only that session's attributed files. The other three are read-only.
   ```
 
 `setup-tmux` is a one-shot provisioner (epic fn-803), not a subscribe client.
-It drives tmux directly via `Bun.spawnSync` — deliberately OUTSIDE the
-ExecBackend seam — and writes nothing to git or the event log.
+It drives tmux directly via `Bun.spawnSync` — its own provisioning lifecycle,
+unrelated to the managed dispatch path — and writes nothing to git or the event
+log.
 
 - `setup-tmux.ts` — stand up the human's tmux control plane. Rebuilds the
   `dash` dashboard session every run (board main pane + autopilot/jobs/git/
@@ -1334,7 +1331,7 @@ ExecBackend seam — and writes nothing to git or the event log.
   reconciler-managed `autopilot` session is never offered. A present session,
   zero candidates, or a non-TTY skips that session's offer. Reading `keeper.db`
   read-only for the candidate counts is the only DB dependency; the relaunch is
-  a spawned subprocess, so `setup-tmux` still imports no ExecBackend.
+  a spawned subprocess (`restore-agents`), so `setup-tmux` owns no launch transport.
 
   ```sh
   keeper setup-tmux                 # rebuild dash, ensure work sessions
@@ -2293,9 +2290,9 @@ a test) emits `DispatchExpired` only if the bind truly never lands. On
 `set-paused` (boot-pause included via the same relay), the worker reaped stale
 launch-window surfaces by intersecting `list-panes -a -j` with OPEN
 `pending_dispatches` rows — a discharged row = live worker, never reaped — and
-the reap never threw (no-self-heal). That broad reap (`ExecBackend.reapSurfaces`)
-was deleted in epic fn-789; the fn-802 window-reaper is its narrow,
-completion-gated successor (a single `killWindow`, never a sweep).
+the reap never threw (no-self-heal). That broad pause/boot reap is gone; the
+window-reaper is its narrow, completion-gated successor (a single `killWindow`,
+never a sweep).
 As of schema v42 (fn-661), the new `dispatch_failures` projection table
 (keyed by `(verb, ref)` — the same `verb::id` correlation key the autopilot
 reconciler uses to dedup against `jobs`) carries the sticky failure record
@@ -2697,22 +2694,19 @@ is maintained by the boot-append re-arm event, not by flag volatility)
 and flips on the `set_autopilot_paused` RPC, which appends an
 `AutopilotPaused{paused}` event FIRST then flips the worker gate only
 on a successful insert (so the gate and the projection cannot diverge
-on partial failure). The terminal-surface mechanics live behind the
-`ExecBackend` (`src/exec-backend.ts`) — `launch`, `focusPane`,
-`ensureLaunched`, `listPanes`/`renameWindow` (the renamer), and `killWindow`
-(the reaper's only kill op; there is no general `reapSurfaces` close path).
-`ensureLaunched` (session-agnostic) get-or-creates the
-target session with its own per-call mint and launches an
-unnamed window — its consumers are `restore-agents.ts` (session restore) and
-`cli/dispatch.ts` (the manual `keeper dispatch` client-side escape hatch; see
-[Example clients](#example-clients)). `resolveExecBackend` picks the backend
-from `exec_backend`: `tmux` (default + fallback, hand-rolls `tmux new-window`)
-or `agentwrap` (invokes the agentwrap CLI, which owns the window). Only the
-launch transport differs — the pane ops above are SHARED (the agentwrap backend
-delegates `focusPane`/`listPanes`/`renameWindow`/`killWindow` to the tmux
-backend verbatim). Each reconciler dispatch opens as a new window in the
-hardcoded managed session (`autopilot`). Each op runs a cheap
-per-call `has-session` probe and mints via `new-session -d` only when the
+on partial failure). The terminal-surface mechanics live in
+`src/exec-backend.ts`. keeper launches via agentwrap directly: both the
+autopilot reconciler dispatch and the manual `keeper dispatch` call
+`agentwrapLaunch(...)`, which invokes the agentwrap CLI (which owns the tmux
+window) — agentwrap is the sole, hard-required launch transport (validated at
+boot). tmux is used DIRECTLY for everything else: the pane ops
+(`createTmuxPaneOps` — `focusPane`, `listPanes`/`renameWindow` for the renamer,
+and `killWindow`, the reaper's only kill op; there is no general sweep-close
+path) and the crash-recovery restore replay (`restore-agents.ts`, which spawns a
+spec-less `claude --resume` argv into a get-or-created session via its own
+per-call mint). Each reconciler dispatch opens as a new window in the
+hardcoded managed session (`autopilot`); the launch and pane ops each run a cheap
+per-call `has-session` probe and mint via `new-session -d` only when the
 session is absent, so a stale/EXITED corpse is rebuilt rather than resurrected;
 a probe short-circuits before any mint when the target is already LIVE. The confirm step
 is now three-way (`ConfirmOutcome`, fn-724): a hard launch failure
@@ -2731,10 +2725,9 @@ keeper closes a managed window ONLY through the window-reaper worker (epic
 fn-802), and only when the work is VERIFIABLY complete: an autopilot-dispatched
 `work`/`close` job stopped for over 60s with a `{tag:"completed"}` readiness
 verdict. Every other window — pending, live, working, or worker-ended-incomplete
-— stays open for inspection until the human closes it. The launch-window
-pause-ghost reap and the `autoclose_windows` config key were deleted outright in
-epic fn-789 (the broad `reapSurfaces` close path no longer exists on
-`ExecBackend`); the reaper is its narrow, evidence-gated successor (`killWindow`
+— stays open for inspection until the human closes it. There is no broad
+launch-window pause-ghost reap and no `autoclose_windows` config key; the
+window-reaper is the only close path — narrow and evidence-gated (`killWindow`
 on a single managed pane, never a `list-panes` sweep-and-close). The
 pending-dispatch row still discharges on `SessionStart` or the 120s TTL sweep
 (above), independent of the reaper. The close-row
@@ -2794,14 +2787,14 @@ in original order. Each candidate's `resume_target` is the `job_id` UUID, never 
 mutable session name — a RENAMED session restores correctly.
 
 `scripts/restore-agents.ts` is a thin presenter over that ordered set: its dry-run
-prints the plan, `--apply` relaunches each survivor into its original backend
-session via `ExecBackend.ensureLaunched` using the shared `buildResumeCommand` /
-`resumeTarget` substrate (`src/resume-descriptor`) that keeps the three
-resume-command producers byte-identical, pacing window creation 0.5s apart.
-A spec-less `ensureLaunched` (the restore replay) execs the recorded argv via
-the tmux launch path under EITHER backend (the agentwrap backend falls back to
-the tmux launch when handed no structured spec), so every candidate routes
-through one resolved instance.
+prints the plan, `--apply` relaunches each survivor into its original session via
+`restoreReplayLaunch` (`src/exec-backend.ts`) using the shared
+`buildResumeCommand` / `resumeTarget` substrate (`src/resume-descriptor`) that
+keeps the three resume-command producers byte-identical, pacing window creation
+0.5s apart. The restore replay is a direct tmux launch: it execs the recorded
+spec-less `claude --resume` argv into a get-or-created session via its own
+per-call mint (the crash-recovery path stays on tmux directly, distinct from the
+agentwrap dispatch launch).
 `--last-generation` swaps the candidate source to `deriveLastGenerationSet`
 (the kill-anchored generation window above) and composes with `--apply` +
 `--session`; the plan/render/apply path is otherwise identical.
