@@ -38,6 +38,13 @@ export interface LiveChannel {
   current_name: string | null;
   /** Oldest→newest session names. */
   name_history: string[];
+  /**
+   * Presence axis: whether the channel has an OPEN socket right now. Identity
+   * resolution treats a known-disconnected channel as resolvable (so a send to
+   * it reports `not_connected` rather than `unknown`), but delivery and the
+   * ambiguity-collapse "preferred" pick gate on this being `true`.
+   */
+  connected: boolean;
 }
 
 /** A stable keeper identity resolved from `jobs` (Layer 2 output). */
@@ -187,11 +194,13 @@ function escapeLike(term: string): string {
 }
 
 /**
- * Collapse a >1 identity set deterministically: prefer the one with a LIVE
- * channel; if exactly one is live, that wins. Else the set stays ambiguous (the
- * caller's `jobs` query already ordered newest-by-updated_at first, so a `latest`
- * collapse picks index 0 — but the bus surfaces ambiguity rather than guessing
- * across distinct agents). Returns `{ picked }` for a clean pick, else `{ all }`.
+ * Collapse a >1 identity set deterministically: prefer the one with a CONNECTED
+ * channel; if exactly one is connected, that wins. A disconnected-but-resolvable
+ * channel does NOT break a tie (it would deliver to no one), so the connected
+ * pick is what disambiguates. Else the set stays ambiguous (the caller's `jobs`
+ * query already ordered newest-by-updated_at first, but the bus surfaces
+ * ambiguity rather than guessing across distinct agents). Returns `{ picked }`
+ * for a clean pick, else `{ all }`.
  */
 function collapseByLive(
   identities: ResolvedIdentity[],
@@ -199,14 +208,14 @@ function collapseByLive(
 ):
   | { picked: ResolvedIdentity; channel: LiveChannel }
   | { all: ResolvedIdentity[] } {
-  const withLive = identities
+  const withConnected = identities
     .map((id) => ({ id, channel: liveChannelForIdentity(channels, id) }))
-    .filter((x) => x.channel != null) as {
+    .filter((x) => x.channel?.connected) as {
     id: ResolvedIdentity;
     channel: LiveChannel;
   }[];
-  if (withLive.length === 1) {
-    return { picked: withLive[0].id, channel: withLive[0].channel };
+  if (withConnected.length === 1) {
+    return { picked: withConnected[0].id, channel: withConnected[0].channel };
   }
   return { all: identities };
 }
@@ -272,6 +281,17 @@ export function resolveTarget(
     };
   }
   if (live.length > 1) {
+    // >1 live match — a single CONNECTED channel disambiguates (the others can't
+    // receive anyway); only when 0 or >1 are connected is it genuinely ambiguous.
+    const connected = live.filter((c) => c.connected);
+    if (connected.length === 1) {
+      return {
+        kind: "ok",
+        method: "live-fallback",
+        identity: null,
+        channel: connected[0],
+      };
+    }
     // Ambiguity in the live set alone — surface it (no keeper identity to rank by).
     return {
       kind: "ambiguous",

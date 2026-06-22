@@ -1,11 +1,13 @@
 /**
- * Fast-tier pure-decision tests for `src/bus-worker.ts` (epic fn-875 task .2).
+ * Fast-tier pure-decision tests for `src/bus-worker.ts` (epic fn-886 task .1).
  *
  * Exercises the worker's PURE decision symbols — `authoritativeFrom` (anti-spoof
- * from-overwrite), `selectFanoutTargets` (namespace ∩ resolved-target routing),
- * `backpressureDecision` (bounded-queue eviction), `reapDecision` (monotonic
- * two-threshold liveness), `takeoverVictim` (duplicate-watcher/takeover on the
- * stable `(pid, start_time)` key), `liveChannelsAtBoot` (dead-pid drop), and
+ * from-overwrite), `selectFanoutTargets` (namespace ∩ resolved-target routing,
+ * connected-only), `backpressureDecision` (bounded-queue eviction),
+ * `publishOutcome` (the honest directed-send result vocabulary),
+ * `closeOwnsBinding` (the takeover generation token), `toLiveChannel` (the
+ * presence axis), `takeoverVictim` (duplicate-watcher/takeover on the stable
+ * `(pid, start_time)` key), `liveChannelsAtBoot` (dead-pid drop), and
  * `enrichPeerFromJobs` (read-only keeper.db identity enrichment).
  *
  * NO Worker spawn — the `isMainThread` guard keeps the plain import inert (the
@@ -21,21 +23,28 @@ import type { ChannelRow } from "../src/bus-db";
 import {
   authoritativeFrom,
   backpressureDecision,
+  closeOwnsBinding,
   enrichPeerFromJobs,
   HARNESS_WALK_MAX_DEPTH,
-  HEARTBEAT_EVICT_MS,
-  HEARTBEAT_WARN_MS,
   type JobIdentity,
   liveChannelsAtBoot,
   MAX_CLIENT_QUEUE,
+  publishOutcome,
   type RegistryEntry,
-  reapDecision,
   requeueTail,
   resolveHarnessIdentity,
   selectFanoutTargets,
   takeoverVictim,
+  toLiveChannel,
 } from "../src/bus-worker";
 import { freshMemDb } from "./helpers/template-db";
+
+/** A no-op writable stand-in: a non-null `sock` so an entry counts as CONNECTED
+ *  in the connected-only fan-out selection (the bytes are never inspected). */
+const FAKE_SOCK = {
+  write: () => 0,
+  data: {},
+} as unknown as RegistryEntry["sock"];
 
 function makeChannel(overrides: Partial<ChannelRow> = {}): ChannelRow {
   return {
@@ -60,10 +69,11 @@ function makeEntry(
   return {
     channel,
     namespaces: channel.namespaces,
-    sock: null,
+    // Default to CONNECTED (a bound socket) so fan-out selection includes the
+    // entry; a disconnected case overrides `sock: null`.
+    sock: FAKE_SOCK,
     queue: [],
-    lastBeatMono: 0,
-    warned: false,
+    generation: 1,
     ...entryOverrides,
   };
 }
@@ -147,15 +157,69 @@ test("a short write at/over the bounded queue cap evicts (never blocks the relay
 });
 
 // ---------------------------------------------------------------------------
-// reapDecision — monotonic two-threshold liveness
+// selectFanoutTargets — connected-only: a disconnected entry is never a target
 // ---------------------------------------------------------------------------
 
-test("reapDecision: a fresh heartbeat is live; the two thresholds fire in order", () => {
-  expect(reapDecision(1000, 1000)).toBe("live");
-  expect(reapDecision(1000 + HEARTBEAT_WARN_MS - 1, 1000)).toBe("live");
-  expect(reapDecision(1000 + HEARTBEAT_WARN_MS, 1000)).toBe("warn");
-  expect(reapDecision(1000 + HEARTBEAT_EVICT_MS - 1, 1000)).toBe("warn");
-  expect(reapDecision(1000 + HEARTBEAT_EVICT_MS, 1000)).toBe("evict");
+test("fan-out excludes a known-but-disconnected channel (sock === null)", () => {
+  const connected = makeEntry({ channel_id: "ch-on", namespaces: ["chat"] });
+  const disconnected = makeEntry(
+    { channel_id: "ch-off", namespaces: ["chat"] },
+    { sock: null },
+  );
+  // A directed send to the disconnected channel resolves to no delivery target.
+  expect(
+    selectFanoutTargets([connected, disconnected], "chat", "ch-off", "ch-on"),
+  ).toEqual([]);
+  // A broadcast skips it too — only the connected peer receives.
+  const bcast = selectFanoutTargets(
+    [connected, disconnected],
+    "chat",
+    null,
+    null,
+  );
+  expect(bcast.map((t) => t.channel.channel_id)).toEqual(["ch-on"]);
+});
+
+// ---------------------------------------------------------------------------
+// publishOutcome — the honest directed-send result vocabulary
+// ---------------------------------------------------------------------------
+
+test("publishOutcome maps resolution + delivered-count to the true result", () => {
+  // Unknown / ambiguous resolution ignore the connected/count axes.
+  expect(publishOutcome("unknown", false, 0)).toBe("unknown_target");
+  expect(publishOutcome("ambiguous", false, 0)).toBe("ambiguous_target");
+  // Resolved but no open socket → not_connected (identity resolved, no delivery).
+  expect(publishOutcome("ok", false, 0)).toBe("not_connected");
+  // Resolved + connected + at least one full-frame delivery → delivered.
+  expect(publishOutcome("ok", true, 1)).toBe("delivered");
+  // Resolved + connected but nothing got fully written (partial/evicted) →
+  // delivery_failed (the false-negative the epic accepts without L2 receipts).
+  expect(publishOutcome("ok", true, 0)).toBe("delivery_failed");
+});
+
+// ---------------------------------------------------------------------------
+// closeOwnsBinding — the takeover late-close generation token
+// ---------------------------------------------------------------------------
+
+test("closeOwnsBinding: a connection only nulls the socket when it still owns the binding", () => {
+  // The connection bound at the entry's current generation → its close owns it.
+  expect(closeOwnsBinding(3, 3)).toBe(true);
+  // A takeover re-subscribed and bumped the entry's generation; the victim's
+  // late close carries the OLDER generation → it must NOT clobber the rebinding.
+  expect(closeOwnsBinding(2, 3)).toBe(false);
+});
+
+// ---------------------------------------------------------------------------
+// toLiveChannel — the presence axis (connected === has an open socket)
+// ---------------------------------------------------------------------------
+
+test("toLiveChannel surfaces connected presence from the bound socket", () => {
+  const live = toLiveChannel(makeEntry({ channel_id: "ch-on" }));
+  expect(live.connected).toBe(true);
+  const dead = toLiveChannel(
+    makeEntry({ channel_id: "ch-off" }, { sock: null }),
+  );
+  expect(dead.connected).toBe(false);
 });
 
 // ---------------------------------------------------------------------------

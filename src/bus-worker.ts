@@ -23,9 +23,11 @@
  * Wire (2-axis NDJSON, epic Architecture). The core routes ONLY on
  * `(namespace, resolved-target)`; the payload is opaque, so a future `pair`
  * tenant needs no core change. Op-discriminated socket frames: client →
- * register / heartbeat / subscribe / publish(send|broadcast) / list / resolve /
- * deregister; server → ack / event / presence / error. A `subscribe` ack carries
- * the `last_message_id` replay cursor.
+ * register / subscribe / publish(send|broadcast) / list / deregister; server →
+ * ack / event / presence / error. A `subscribe` ack carries the
+ * `last_message_id` replay cursor. A `publish` ack carries the synchronous
+ * delivery result. Peer liveness is socket-close (a kill/crash FINs the fd);
+ * there is NO heartbeat op and NO periodic liveness timer.
  *
  * Anti-spoof: the server resolves the connecting peer's pid via `peerPidForFd`
  * (authoritative LOCAL_PEERPID), walks its ancestry to the nearest pid keeper
@@ -76,13 +78,6 @@ export const MAX_CLIENT_QUEUE = 256;
 /** Max inbound frame length (chars) — a longer line is a protocol error; the
  *  connection is destroyed. Mirrors the server worker's `MAX_LINE_LENGTH` order. */
 export const MAX_FRAME_LENGTH = 1024 * 1024;
-
-/** Heartbeat liveness thresholds on the MONOTONIC clock (ms since last beat). */
-export const HEARTBEAT_WARN_MS = 60_000;
-export const HEARTBEAT_EVICT_MS = 90_000;
-
-/** Reap loop cadence (ms). */
-export const REAP_INTERVAL_MS = 30_000;
 
 /** Worker-shutdown grace (ms) before the worker force-exits. */
 const SHUTDOWN_DEADLINE_MS = 2_000;
@@ -161,7 +156,6 @@ export type ClientOp =
       pid?: number;
       start_time?: string;
     }
-  | { op: "heartbeat" }
   | { op: "subscribe"; namespaces?: string[]; after_id?: number }
   | {
       op: "publish";
@@ -172,7 +166,6 @@ export type ClientOp =
       reply_to?: number | null;
     }
   | { op: "list" }
-  | { op: "resolve"; target: string }
   | { op: "deregister" };
 
 // ---------------------------------------------------------------------------
@@ -200,13 +193,16 @@ export function authoritativeFrom(
 }
 
 /**
- * Fan-out target selection: the live channels that should receive a message in
- * `namespace` addressed to `resolvedChannelId`. A `broadcast` (null target) goes
- * to every channel SUBSCRIBED to the namespace except the sender; a directed
- * send goes to the single resolved channel (when it is subscribed). The sender
- * is never echoed its own message. Pure over the registry snapshot.
+ * Fan-out target selection: the CONNECTED channels that should receive a message
+ * in `namespace` addressed to `resolvedChannelId`. A `broadcast` (null target)
+ * goes to every CONNECTED channel SUBSCRIBED to the namespace except the sender;
+ * a directed send goes to the single resolved channel (when it is connected +
+ * subscribed). A channel with no open socket (`sock === null` — a rehydrated
+ * cache row or a closed-but-kept identity) is NEVER a delivery target, so the
+ * fanned-out count matches what actually got written. The sender is never echoed
+ * its own message. Pure over the registry snapshot.
  *
- * @param registry          all live channels (the routing universe).
+ * @param registry          all registry entries (the routing universe).
  * @param namespace         the tenant axis.
  * @param resolvedChannelId the directed target's channel id, or `null` for broadcast.
  * @param senderChannelId   the publisher's channel id (excluded from delivery).
@@ -219,6 +215,7 @@ export function selectFanoutTargets(
 ): RegistryEntry[] {
   const out: RegistryEntry[] = [];
   for (const e of registry) {
+    if (e.sock === null) continue;
     if (e.channel.channel_id === senderChannelId) continue;
     if (!e.namespaces.includes(namespace)) continue;
     if (
@@ -251,20 +248,49 @@ export function backpressureDecision(
 }
 
 /**
- * Reap predicate on the MONOTONIC clock (never `Date.now()` — a wall-clock jump
- * must not spuriously reap a live agent). Two thresholds: `warn` past
- * {@link HEARTBEAT_WARN_MS}, `evict` past {@link HEARTBEAT_EVICT_MS}, measured
- * from the channel's last heartbeat. `nowMono`/`lastBeatMono` are both
- * `performance.now()`-domain values. Pure.
+ * The synchronous result vocabulary a publish replies with (and persists to
+ * `messages.status`). A directed send resolves to exactly one of these; a
+ * broadcast only ever yields `delivered` (with a recipient count).
+ *
+ *  - `delivered`       — the resolved target had an OPEN socket and the full
+ *                        frame was accepted (a directed send: 1 recipient).
+ *  - `not_connected`   — the target resolved to a known identity, but no open
+ *                        socket (delivered to no one). The seam for a future
+ *                        wake-on-send.
+ *  - `unknown_target`  — the name resolved to nothing.
+ *  - `ambiguous_target`— the name resolved to >1 distinct identity.
+ *  - `delivery_failed` — resolved + connected, but the write was partial/failed
+ *                        (or the peer was evicted mid-fanout).
  */
-export function reapDecision(
-  nowMono: number,
-  lastBeatMono: number,
-): "live" | "warn" | "evict" {
-  const age = nowMono - lastBeatMono;
-  if (age >= HEARTBEAT_EVICT_MS) return "evict";
-  if (age >= HEARTBEAT_WARN_MS) return "warn";
-  return "live";
+export type PublishOutcome =
+  | "delivered"
+  | "not_connected"
+  | "unknown_target"
+  | "ambiguous_target"
+  | "delivery_failed";
+
+/**
+ * Compute the TRUE directed-send outcome from the resolution kind and the count
+ * of targets whose full frame was actually accepted into an open socket. Pure —
+ * the impure fanout runs first and hands its delivered-count in.
+ *
+ *  - resolution `unknown`   → `unknown_target`
+ *  - resolution `ambiguous` → `ambiguous_target`
+ *  - resolution `ok` but the resolved channel has no open socket
+ *    (`resolvedConnected === false`) → `not_connected`
+ *  - resolution `ok` + connected, `delivered >= 1` → `delivered`
+ *  - resolution `ok` + connected, but `delivered === 0` (partial write / the
+ *    peer was evicted during fanout) → `delivery_failed`
+ */
+export function publishOutcome(
+  resolveKind: "ok" | "ambiguous" | "unknown",
+  resolvedConnected: boolean,
+  deliveredCount: number,
+): PublishOutcome {
+  if (resolveKind === "unknown") return "unknown_target";
+  if (resolveKind === "ambiguous") return "ambiguous_target";
+  if (!resolvedConnected) return "not_connected";
+  return deliveredCount >= 1 ? "delivered" : "delivery_failed";
 }
 
 /**
@@ -312,13 +338,16 @@ export function liveChannelsAtBoot(
 
 /**
  * One live registry entry: the channel identity, the namespaces it subscribes
- * to, the bound socket (null until `subscribe`), the bounded outbound queue, and
- * the MONOTONIC last-heartbeat stamp the reaper reads.
+ * to, the bound socket (null until `subscribe`, null again on close), the
+ * bounded outbound queue, and the binding generation token.
+ *
+ * Peer death is socket-close: there is NO heartbeat stamp and no reaper. A live
+ * entry's presence is exactly `sock !== null`.
  */
 export interface RegistryEntry {
   channel: ChannelRow;
   namespaces: string[];
-  /** The subscribed socket; null until a `subscribe` op binds it. */
+  /** The subscribed socket; null until a `subscribe` op binds it, null on close. */
   sock: Writable | null;
   /**
    * Bounded outbound queue of pre-serialized, UTF-8-encoded NDJSON frames. Held
@@ -327,13 +356,33 @@ export interface RegistryEntry {
    * round-tripped through a TextDecoder (it would mint U+FFFD).
    */
   queue: Uint8Array[];
-  /** `performance.now()` of the last heartbeat (monotonic). */
-  lastBeatMono: number;
-  /** Whether a warn was already logged this miss-window (de-dupes warn spam). */
-  warned: boolean;
+  /**
+   * Monotonic binding generation, bumped on every `subscribe` that binds a
+   * socket. A connection captures the generation it bound at; a late `close()`
+   * from a superseded connection only nulls `sock` when its captured generation
+   * still matches — so a takeover that rebinds the entry to a fresh connection
+   * is not clobbered by the victim socket's straggling close. See
+   * {@link closeOwnsBinding}.
+   */
+  generation: number;
 }
 
-/** Map a {@link RegistryEntry}'s channel to the resolver's {@link LiveChannel}. */
+/**
+ * Generation-token guard for the close handler: a closing connection may null
+ * the entry's socket ONLY when the generation it bound at still matches the
+ * entry's current generation. A takeover/re-subscribe bumps the generation, so a
+ * superseded victim's late close (`connGeneration < entry.generation`) no-ops
+ * and the reconnected channel keeps its fresh socket. Pure.
+ */
+export function closeOwnsBinding(
+  connGeneration: number,
+  entryGeneration: number,
+): boolean {
+  return connGeneration === entryGeneration;
+}
+
+/** Map a {@link RegistryEntry}'s channel to the resolver's {@link LiveChannel}.
+ *  `connected` surfaces the presence axis — an open socket means deliverable. */
 export function toLiveChannel(e: RegistryEntry): LiveChannel {
   return {
     channel_id: e.channel.channel_id,
@@ -342,6 +391,7 @@ export function toLiveChannel(e: RegistryEntry): LiveChannel {
     session_id: e.channel.session_id,
     current_name: e.channel.current_name,
     name_history: e.channel.name_history,
+    connected: e.sock !== null,
   };
 }
 
@@ -485,6 +535,12 @@ const encoder = new TextEncoder();
 interface BusConnState {
   buffer: LineBuffer;
   entry: RegistryEntry | null;
+  /**
+   * The entry generation this connection bound at its last `subscribe`. The
+   * close handler compares it against the entry's CURRENT generation so a
+   * superseded victim's late close cannot clobber a reconnected channel.
+   */
+  boundGeneration: number;
   peerPid: number | null;
   id: number;
 }
@@ -523,8 +579,7 @@ export function startBusServer(
       namespaces: row.namespaces,
       sock: null,
       queue: [],
-      lastBeatMono: performance.now(),
-      warned: false,
+      generation: 0,
     });
   }
 
@@ -534,13 +589,18 @@ export function startBusServer(
   const resolve = (target: string): BusResolveResult =>
     resolveTarget(registryList().map(toLiveChannel), keeperDb, target);
 
-  /** Pre-serialize one event line ONCE, then fan out to each target. */
+  /**
+   * Pre-serialize one event line ONCE, then fan out to each CONNECTED target.
+   * Returns the count of targets whose FULL frame was accepted into an open
+   * socket with no eviction — the honest delivered count the publish result is
+   * computed from. A queued (short-write) or evicted target does NOT count.
+   */
   const fanout = (
     namespace: string,
     resolvedChannelId: string | null,
     senderChannelId: string | null,
     envelope: EventEnvelope,
-  ): void => {
+  ): number => {
     const line = `${JSON.stringify(envelope)}\n`;
     const targets = selectFanoutTargets(
       registryList(),
@@ -548,45 +608,52 @@ export function startBusServer(
       resolvedChannelId,
       senderChannelId,
     );
-    for (const t of targets) deliver(t, line);
+    let delivered = 0;
+    for (const t of targets) if (deliver(t, line)) delivered++;
+    return delivered;
   };
 
   /**
    * Deliver one pre-serialized line to a subscriber with bounded-queue
    * backpressure. NEVER awaits — a short write queues the tail; an overflow
    * EVICTS via destroy() (not end(), which would flush the dead queue). The
-   * relay moves to the next subscriber regardless.
+   * relay moves to the next subscriber regardless. Returns true ONLY when the
+   * full frame was accepted into the open socket with no eviction — a queued
+   * tail or an evict returns false (so the publish result counts only L1-accepted
+   * recipients, never a partially-buffered one).
    */
-  const deliver = (entry: RegistryEntry, line: string): void => {
+  const deliver = (entry: RegistryEntry, line: string): boolean => {
     const sock = entry.sock;
     if (sock === null) {
       // Not subscribed (a registry-cache rehydrate, or a register without a
       // subscribe). Nothing to deliver to.
-      return;
+      return false;
     }
     // Already-queued frames: append behind them (preserve order), then try to
     // flush. The queue is the bounded resource.
     if (entry.queue.length > 0) {
       if (entry.queue.length >= MAX_CLIENT_QUEUE) {
         evict(entry, "queue-overflow");
-        return;
+        return false;
       }
       entry.queue.push(encoder.encode(line));
       flushQueue(entry);
-      return;
+      // The frame is buffered behind a backlog, not yet fully on the wire.
+      return false;
     }
     const bytes = encoder.encode(line);
     const accepted = safeWrite(sock, bytes);
     if (accepted < 0) {
       // Socket closing/closed — evict.
       evict(entry, "write-closed");
-      return;
+      return false;
     }
     const decision = backpressureDecision(accepted, bytes.length, 0);
-    if (decision === "ok") return;
+    if (decision === "ok") return true;
     // Short write — stash the unaccepted byte tail (never decoded; see queue
     // doc) so it re-flushes byte-identical even when split mid-UTF-8-sequence.
     entry.queue.push(requeueTail(bytes, accepted));
+    return false;
   };
 
   /** Flush queued frames until the socket backpressures or the queue empties. */
@@ -647,20 +714,14 @@ export function startBusServer(
       case "register":
         opRegister(sock, conn, op);
         return;
-      case "heartbeat":
-        opHeartbeat(conn);
-        return;
       case "subscribe":
         opSubscribe(sock, conn, op);
         return;
       case "publish":
-        opPublish(conn, op);
+        opPublish(sock, conn, op);
         return;
       case "list":
         opList(sock);
-        return;
-      case "resolve":
-        opResolve(sock, op);
         return;
       case "deregister":
         opDeregister(conn);
@@ -749,8 +810,7 @@ export function startBusServer(
       namespaces,
       sock: null,
       queue: [],
-      lastBeatMono: performance.now(),
-      warned: false,
+      generation: 0,
     };
     registry.set(channelId, entry);
     conn.entry = entry;
@@ -768,13 +828,6 @@ export function startBusServer(
     });
   };
 
-  const opHeartbeat = (conn: BusConnState): void => {
-    if (conn.entry === null) return;
-    conn.entry.lastBeatMono = performance.now();
-    conn.entry.warned = false;
-    conn.entry.channel.last_heartbeat = Date.now();
-  };
-
   const opSubscribe = (
     sock: Writable,
     conn: BusConnState,
@@ -790,7 +843,11 @@ export function startBusServer(
       entry.channel.namespaces = entry.namespaces;
     }
     entry.sock = sock;
-    entry.lastBeatMono = performance.now();
+    // Bump the binding generation and record it on THIS connection: a later
+    // takeover/re-subscribe bumps it again, so a superseded conn's late close
+    // (carrying the older generation) no-ops instead of nulling the fresh socket.
+    entry.generation += 1;
+    conn.boundGeneration = entry.generation;
     try {
       upsertChannel(busDb, entry.channel);
     } catch {
@@ -807,6 +864,7 @@ export function startBusServer(
   };
 
   const opPublish = (
+    sock: Writable,
     conn: BusConnState,
     op: Extract<ClientOp, { op: "publish" }>,
   ): void => {
@@ -830,18 +888,23 @@ export function startBusServer(
       },
     );
 
-    let resolvedChannelId: string | null = null;
-    let resolvedSessionId: string | null = null;
-    let toTarget: string | null = null;
+    // -- directed send: resolve, then gate DELIVERY on a connected socket -----
     if (event === "send") {
-      toTarget = op.to ?? "";
+      const toTarget = op.to ?? "";
       const res = resolve(toTarget);
-      if (res.kind === "ok" && res.channel) {
-        resolvedChannelId = res.channel.channel_id;
-        resolvedSessionId = res.channel.session_id;
-      } else {
-        // Unknown / not-on-the-bus / ambiguous: persist the attempt for forensics
-        // but deliver to no one. The sender's own CLI surfaces the miss.
+      // The resolved live channel (present only on an `ok` resolution) carries
+      // the presence axis: a delivery needs `connected === true`.
+      const channel = res.kind === "ok" ? res.channel : null;
+      // Resolution that yields no DELIVERY (unknown / ambiguous / known-but-
+      // disconnected) persists the true outcome and replies; it fans out to no
+      // one. A resolved-but-disconnected identity is `not_connected`, NOT
+      // `unknown` — the seam for a future wake-on-send.
+      if (channel === null || !channel.connected) {
+        const outcome = publishOutcome(
+          res.kind,
+          channel?.connected ?? false,
+          0,
+        );
         appendMessage(busDb, {
           namespace,
           event,
@@ -849,47 +912,112 @@ export function startBusServer(
           from_pid: from.pid,
           from_name: from.name,
           to_target: toTarget,
-          resolved_channel_id: null,
-          resolved_session_id: null,
+          resolved_channel_id: channel?.channel_id ?? null,
+          resolved_session_id: channel?.session_id ?? null,
           body: payload.text,
-          status: res.kind,
+          status: outcome,
           reply_to: op.reply_to ?? null,
         });
+        sendAck(sock, "publish", { result: outcome, recipients: 0 });
         return;
       }
+
+      const resolvedChannelId = channel.channel_id;
+      const resolvedSessionId = channel.session_id;
+      // Persist provisionally so the envelope id (the replay cursor) is minted
+      // BEFORE fanout, then compute the TRUE outcome from what fanout actually
+      // wrote and reconcile the status. No unconditional pre-fanout `delivered`.
+      const id = appendMessage(busDb, {
+        namespace,
+        event,
+        from_channel_id: from.channel_id,
+        from_pid: from.pid,
+        from_name: from.name,
+        to_target: toTarget,
+        resolved_channel_id: resolvedChannelId,
+        resolved_session_id: resolvedSessionId,
+        body: payload.text,
+        status: "pending",
+        reply_to: op.reply_to ?? null,
+      });
+      const envelope = buildEnvelope(
+        namespace,
+        id,
+        from,
+        toTarget,
+        resolvedChannelId,
+        resolvedSessionId,
+        payload,
+        op.reply_to ?? null,
+      );
+      const delivered = fanout(
+        namespace,
+        resolvedChannelId,
+        from.channel_id,
+        envelope,
+      );
+      const outcome = publishOutcome("ok", true, delivered);
+      setMessageStatus(busDb, id, outcome);
+      sendAck(sock, "publish", { result: outcome, recipients: delivered });
+      return;
     }
 
+    // -- broadcast: fan out to every connected namespace subscriber -----------
     const id = appendMessage(busDb, {
       namespace,
       event,
       from_channel_id: from.channel_id,
       from_pid: from.pid,
       from_name: from.name,
-      to_target: toTarget,
-      resolved_channel_id: resolvedChannelId,
-      resolved_session_id: resolvedSessionId,
+      to_target: null,
+      resolved_channel_id: null,
+      resolved_session_id: null,
       body: payload.text,
-      status: "delivered",
+      status: "pending",
       reply_to: op.reply_to ?? null,
     });
-
-    const envelope: EventEnvelope = {
-      v: 1,
+    const envelope = buildEnvelope(
       namespace,
-      event: "message",
       id,
-      ts: Date.now(),
       from,
-      to: {
-        target: toTarget ?? "",
-        channel_id: resolvedChannelId,
-        session_id: resolvedSessionId,
-      },
+      null,
+      null,
+      null,
       payload,
-      reply_to: op.reply_to ?? null,
-    };
-    fanout(namespace, resolvedChannelId, from.channel_id, envelope);
+      op.reply_to ?? null,
+    );
+    const delivered = fanout(namespace, null, from.channel_id, envelope);
+    // A broadcast is always `delivered` (with a recipient count); it never
+    // yields unknown/ambiguous (there is no single target to resolve).
+    setMessageStatus(busDb, id, "delivered");
+    sendAck(sock, "publish", { result: "delivered", recipients: delivered });
   };
+
+  /** Build one delivered-message event envelope (the 2-axis wire shape). */
+  const buildEnvelope = (
+    namespace: string,
+    id: number,
+    from: FromIdentity,
+    toTarget: string | null,
+    resolvedChannelId: string | null,
+    resolvedSessionId: string | null,
+    payload: Payload,
+    replyTo: number | null,
+  ): EventEnvelope => ({
+    v: 1,
+    namespace,
+    event: "message",
+    id,
+    ts: Date.now(),
+    from,
+    to: {
+      target: toTarget ?? "",
+      channel_id: resolvedChannelId,
+      session_id: resolvedSessionId,
+    },
+    payload,
+    reply_to: replyTo,
+  });
 
   const opList = (sock: Writable): void => {
     const channels = registryList().map((e) => ({
@@ -901,23 +1029,6 @@ export function startBusServer(
       subscribed: e.sock !== null,
     }));
     sendAck(sock, "list", { channels });
-  };
-
-  const opResolve = (
-    sock: Writable,
-    op: Extract<ClientOp, { op: "resolve" }>,
-  ): void => {
-    const res = resolve(op.target);
-    sendAck(sock, "resolve", {
-      target: op.target,
-      kind: res.kind,
-      method: res.kind === "unknown" ? "unknown" : res.method,
-      channel_id: res.kind === "ok" ? (res.channel?.channel_id ?? null) : null,
-      session_id:
-        res.kind === "ok"
-          ? (res.channel?.session_id ?? res.identity?.job_id ?? null)
-          : null,
-    });
   };
 
   const opDeregister = (conn: BusConnState): void => {
@@ -949,6 +1060,7 @@ export function startBusServer(
           socket.data = {
             buffer: new LineBuffer(),
             entry: null,
+            boundGeneration: 0,
             peerPid: peerPidForFd(
               (socket as unknown as { fd?: number }).fd ?? -1,
             ),
@@ -1008,10 +1120,15 @@ export function startBusServer(
         if (entry?.sock) flushQueue(entry);
       },
       close(socket) {
-        // The peer went away. Unbind its socket but KEEP the registry entry as a
-        // cache row (the agent may reconnect + replay) UNLESS it never registered.
-        const entry = socket.data?.entry;
-        if (entry) {
+        // The peer went away — socket-close is the death signal (no heartbeat).
+        // Unbind its socket but KEEP the registry entry as a cache row (the agent
+        // may reconnect + replay). Generation guard: only null `sock` when THIS
+        // connection still owns the current binding. A takeover/re-subscribe
+        // rebound the entry to a fresh socket with a higher generation, so a
+        // superseded victim's late close must NOT clobber the reconnected channel.
+        const conn = socket.data;
+        const entry = conn?.entry;
+        if (entry && closeOwnsBinding(conn.boundGeneration, entry.generation)) {
           entry.sock = null;
           entry.queue = [];
         }
@@ -1032,41 +1149,12 @@ export function startBusServer(
     // best-effort; the dir mode is the real gate
   }
 
-  // Reap loop on the MONOTONIC clock — a silent channel past the evict threshold
-  // is dropped; a warn threshold logs once. Unref'd so it never holds the loop.
-  const reapTimer = setInterval(() => {
-    try {
-      reapOnce();
-    } catch (err) {
-      console.error("[bus-worker] reap threw (non-fatal):", err);
-    }
-  }, REAP_INTERVAL_MS);
-  reapTimer.unref?.();
-
-  const reapOnce = (): void => {
-    const now = performance.now();
-    for (const entry of registryList()) {
-      const verdict = reapDecision(now, entry.lastBeatMono);
-      if (verdict === "evict") {
-        publishControl(
-          busDb,
-          "reap",
-          entry.channel,
-          entry.namespaces[0] ?? DEFAULT_NAMESPACE,
-        );
-        evict(entry, "heartbeat-timeout");
-      } else if (verdict === "warn" && !entry.warned) {
-        entry.warned = true;
-        console.error(
-          `[bus-worker] channel ${entry.channel.channel_id} missed heartbeat (warn)`,
-        );
-      }
-    }
-  };
+  // No periodic liveness timer: peer death is socket-close (a kill/crash FINs
+  // the peer fd → the `close` handler nulls the entry's socket). Boot rehydration
+  // (`liveChannelsAtBoot`) drops dead pids once; steady state needs no sweep.
 
   return {
     stop() {
-      clearInterval(reapTimer);
       try {
         listener.stop(true);
       } catch {
@@ -1097,6 +1185,24 @@ function publishControl(
     });
   } catch (err) {
     console.error("[bus-worker] publishControl failed (non-fatal):", err);
+  }
+}
+
+/**
+ * Reconcile a persisted message's `status` to the TRUE post-fanout outcome — the
+ * provisional `pending` row is rewritten to `delivered`/`delivery_failed` once
+ * fanout reports what actually got written. `messages.status` is free-text TEXT,
+ * so no schema bump. Direct UPDATE on the worker's own writable bus.db handle
+ * (the bus worker is the sole bus.db writer). Best-effort — a forensic-log write
+ * failure must never bounce the daemon.
+ */
+function setMessageStatus(busDb: Database, id: number, status: string): void {
+  try {
+    busDb
+      .prepare("UPDATE messages SET status = ? WHERE id = ?")
+      .run(status, id);
+  } catch (err) {
+    console.error("[bus-worker] setMessageStatus failed (non-fatal):", err);
   }
 }
 

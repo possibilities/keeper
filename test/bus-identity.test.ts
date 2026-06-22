@@ -49,6 +49,9 @@ function makeChannel(overrides: Partial<LiveChannel> = {}): LiveChannel {
     session_id: "sess-1",
     current_name: "alpha",
     name_history: ["alpha"],
+    // Default to CONNECTED: most resolution tests assert delivery to a live
+    // channel, which now requires an open socket. A disconnected case sets it.
+    connected: true,
     ...overrides,
   };
 }

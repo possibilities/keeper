@@ -226,6 +226,13 @@ test("two live agents exchange a directed message end-to-end; the subscribe ack 
   );
   expect(delivered).not.toBeNull();
   expect((delivered?.payload as { text?: string })?.text).toBe("hello bob");
+  // The sender gets a synchronous `delivered` result with a recipient count.
+  const result = await waitFrame(
+    alice.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(result?.result).toBe("delivered");
+  expect(result?.recipients).toBe(1);
 
   alice.socket.end();
   bob.socket.end();
@@ -372,6 +379,221 @@ test("anti-spoof: the server overwrites the sender-claimed `from`; socket is 060
   bob.socket.end();
 });
 
+/** Register + subscribe a raw client and wait for both acks. */
+async function registerAndSubscribe(
+  client: Awaited<ReturnType<typeof connectClient>>,
+  name: string,
+  sessionId: string,
+  startTime: string,
+): Promise<void> {
+  client.send({
+    op: "register",
+    namespace: "chat",
+    name,
+    session_id: sessionId,
+    start_time: startTime,
+  });
+  await waitFrame(
+    client.frames,
+    (f) => f.type === "ack" && f.op === "register",
+  );
+  client.send({ op: "subscribe", namespaces: ["chat"] });
+  await waitFrame(
+    client.frames,
+    (f) => f.type === "ack" && f.op === "subscribe",
+  );
+}
+
+/** Read the latest persisted `messages.status` for a given body from bus.db. */
+async function statusForBody(body: string): Promise<string | null> {
+  const busDb = openBusDb(busDbPath);
+  try {
+    const row = await retryUntil(
+      () =>
+        (busDb
+          .query(
+            "SELECT status FROM messages WHERE body = ? ORDER BY id DESC LIMIT 1",
+          )
+          .get(body) as { status?: string } | null) ?? null,
+      3000,
+      25,
+    );
+    return (row?.status as string | undefined) ?? null;
+  } finally {
+    busDb.close();
+  }
+}
+
+test("a directed send to a CONNECTED agent returns `delivered` and persists `delivered`", async () => {
+  await bootBus();
+  const alice = await connectClient();
+  const bob = await connectClient();
+  await registerAndSubscribe(alice, "alice", "sess-alice", "t-alice");
+  await registerAndSubscribe(bob, "bob", "sess-bob", "t-bob");
+
+  alice.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "bob",
+    payload: { media_type: "text/plain", text: "connected-send" },
+  });
+  const ack = await waitFrame(
+    alice.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(ack?.result).toBe("delivered");
+  expect(ack?.recipients).toBe(1);
+  const arrived = await waitFrame(bob.frames, (f) => f.event === "message");
+  expect((arrived?.payload as { text?: string })?.text).toBe("connected-send");
+  expect(await statusForBody("connected-send")).toBe("delivered");
+
+  alice.socket.end();
+  bob.socket.end();
+});
+
+test("a send to a KNOWN-but-DISCONNECTED agent returns `not_connected` and delivers to no one", async () => {
+  await bootBus();
+  const alice = await connectClient();
+  const bob = await connectClient();
+  await registerAndSubscribe(alice, "alice", "sess-alice", "t-alice");
+  await registerAndSubscribe(bob, "bob", "sess-bob", "t-bob");
+
+  // Close bob's socket but the server KEEPS his registry entry (a cache row): the
+  // identity still resolves, but there is no open socket to deliver to.
+  bob.socket.end();
+  // Wait until the server has observed the close (the channel is no longer
+  // `subscribed` in `list`).
+  const disconnected = await retryUntil(
+    async () => {
+      const channels = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+        name?: string;
+        subscribed?: boolean;
+      }>;
+      const ch = channels.find((c) => c.name === "bob");
+      return ch && ch.subscribed === false ? true : null;
+    },
+    3000,
+    25,
+  );
+  expect(disconnected).toBe(true);
+
+  alice.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "bob",
+    payload: { media_type: "text/plain", text: "to-the-void" },
+  });
+  const ack = await waitFrame(
+    alice.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(ack?.result).toBe("not_connected");
+  expect(ack?.recipients).toBe(0);
+  // The persisted status is the TRUE outcome, NOT an unconditional `delivered`.
+  expect(await statusForBody("to-the-void")).toBe("not_connected");
+
+  alice.socket.end();
+});
+
+test("a send to an UNKNOWN name returns `unknown_target`", async () => {
+  await bootBus();
+  const alice = await connectClient();
+  await registerAndSubscribe(alice, "alice", "sess-alice", "t-alice");
+
+  alice.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "nobody-here",
+    payload: { media_type: "text/plain", text: "into-the-unknown" },
+  });
+  const ack = await waitFrame(
+    alice.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(ack?.result).toBe("unknown_target");
+  expect(await statusForBody("into-the-unknown")).toBe("unknown_target");
+
+  alice.socket.end();
+});
+
+test("takeover late-close: a victim socket's straggling close does not null the reconnected channel", async () => {
+  await bootBus();
+  // Two clients for the SAME (pid, start_time) identity: the second register is a
+  // takeover. Bob1 is the victim; bob2 is the reconnection. Both share start_time
+  // so the server keys them as one agent and supersedes bob1.
+  const sender = await connectClient();
+  await registerAndSubscribe(sender, "alice", "sess-alice", "t-alice");
+
+  const bob1 = await connectClient();
+  await registerAndSubscribe(bob1, "bob", "sess-bob", "t-bob-shared");
+  const bob2 = await connectClient();
+  await registerAndSubscribe(bob2, "bob", "sess-bob", "t-bob-shared");
+
+  // bob2's register took over bob1 (same pid+start_time → eviction of bob1's
+  // channel). NOW close bob1's socket: its late `close` must not clobber bob2's
+  // fresh binding. (bob1 was already evicted, so this proves the close path is
+  // robust to a superseded victim — the generation token / evicted-entry guard.)
+  bob1.socket.end();
+  await retryUntil(() => true, 150, 50);
+
+  // bob2 is still connected and reachable: a directed send to "bob" delivers.
+  sender.send({
+    op: "publish",
+    event: "send",
+    namespace: "chat",
+    to: "bob",
+    payload: { media_type: "text/plain", text: "after-takeover" },
+  });
+  const ack = await waitFrame(
+    sender.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(ack?.result).toBe("delivered");
+  const arrived = await waitFrame(bob2.frames, (f) => f.event === "message");
+  expect((arrived?.payload as { text?: string })?.text).toBe("after-takeover");
+
+  sender.socket.end();
+  bob2.socket.end();
+});
+
+test("a send racing a peer disconnect cannot crash the worker (no SIGPIPE)", async () => {
+  await bootBus();
+  const alice = await connectClient();
+  const bob = await connectClient();
+  await registerAndSubscribe(alice, "alice", "sess-alice", "t-alice");
+  await registerAndSubscribe(bob, "bob", "sess-bob", "t-bob");
+
+  // Hard-kill bob's socket and IMMEDIATELY fire a send before the server's close
+  // handler may have run — the write can race a closing/closed peer fd. The
+  // worker must survive (best-effort write, no signal reaching the thread).
+  bob.socket.terminate?.();
+  bob.socket.end();
+  for (let i = 0; i < 5; i++) {
+    alice.send({
+      op: "publish",
+      event: "send",
+      namespace: "chat",
+      to: "bob",
+      payload: { media_type: "text/plain", text: `race-${i}` },
+    });
+  }
+  // The worker is still alive and serving: a subsequent `list` round-trips.
+  const listed = await runBusCli(["list"]);
+  expect(listed.code).toBe(0);
+  // And alice still gets a publish result for her sends (proves the op loop
+  // never threw to the top).
+  const ack = await waitFrame(
+    alice.frames,
+    (f) => f.type === "ack" && f.op === "publish",
+  );
+  expect(ack).not.toBeNull();
+
+  alice.socket.end();
+});
+
 /**
  * Drive `cli/bus.ts main(argv)` against the sandboxed bus socket with
  * process.{exit,stdout,stderr} captured. `main()` calls `process.exit`, so the
@@ -456,33 +678,6 @@ test("CLI round-trip: `keeper bus chat send` reaches a live subscriber; `list` s
   bob.socket.end();
 });
 
-test("CLI `keeper bus resolve` resolves a FORMER name to the live identity", async () => {
-  await bootBus();
-  const bob = await connectClient();
-  // bob registers as sess-bob — the seeded keeper job carries former name "bob-old".
-  bob.send({
-    op: "register",
-    namespace: "chat",
-    name: "bob",
-    session_id: "sess-bob",
-    start_time: "t-bob",
-  });
-  await waitFrame(bob.frames, (f) => f.type === "ack" && f.op === "register");
-  bob.send({ op: "subscribe", namespaces: ["chat"] });
-  await waitFrame(bob.frames, (f) => f.type === "ack" && f.op === "subscribe");
-
-  const resolved = await runBusCli(["resolve", "bob-old"]);
-  expect(resolved.code).toBe(0);
-  const body = JSON.parse(resolved.stdout) as {
-    kind?: string;
-    channel_id?: string | null;
-  };
-  expect(body.kind).toBe("ok");
-  expect(body.channel_id).toBeTruthy();
-
-  bob.socket.end();
-});
-
 test("live registration resolves the channel identity to the keeper HARNESS title, not the bare connecting pid", async () => {
   seedHarnessJob();
   await bootBus();
@@ -515,13 +710,6 @@ test("live registration resolves the channel identity to the keeper HARNESS titl
   expect(ch).toBeDefined();
   expect(ch?.session_id).toBe("sess-harness");
   expect(ch?.pid).toBe(process.pid);
-
-  // Reachable by a FORMER name (jobs.name_history) — resolves to the same channel.
-  const byFormer = JSON.parse(
-    (await runBusCli(["resolve", "harness-old"])).stdout,
-  ) as { kind?: string; channel_id?: string | null };
-  expect(byFormer.kind).toBe("ok");
-  expect(byFormer.channel_id).toBeTruthy();
 
   watcher.socket.end();
 });
@@ -577,53 +765,6 @@ test("live registration: a harness-resolved channel's published `from` carries t
   busDb.close();
 
   sender.socket.end();
-});
-
-test("heartbeat persistence: a registered watcher's {op:heartbeat} is accepted over the live wire and the channel survives", async () => {
-  await bootBus();
-  // A watcher registers, then beats on the SAME long-lived connection — the
-  // exact wire path `watchOnce` now drives (register → subscribe → heartbeat
-  // interval). The server's opHeartbeat refreshes the channel's monotonic
-  // last-beat stamp the reaper reads, so the channel is NOT a silent eviction
-  // candidate.
-  const watcher = await connectClient();
-  watcher.send({
-    op: "register",
-    namespace: "chat",
-    name: "watcher",
-    session_id: "sess-watcher",
-    start_time: "t-watcher",
-  });
-  await waitFrame(
-    watcher.frames,
-    (f) => f.type === "ack" && f.op === "register",
-  );
-  watcher.send({ op: "subscribe", namespaces: ["chat"] });
-  await waitFrame(
-    watcher.frames,
-    (f) => f.type === "ack" && f.op === "subscribe",
-  );
-
-  // The channel is on the bus.
-  const before = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
-    name?: string;
-  }>;
-  expect(before.some((c) => c.name === "watcher")).toBe(true);
-
-  // Beat several times on the open connection (no ack frame by contract — the
-  // server silently refreshes). A malformed/unhandled op would surface an error
-  // frame; assert none arrives and the connection stays open.
-  for (let i = 0; i < 3; i++) watcher.send({ op: "heartbeat" });
-  // Give the worker a beat to process the frames, then confirm no error frame
-  // and the channel is still listed (heartbeat refreshed, not evicted).
-  await retryUntil(() => true, 150, 50);
-  expect(watcher.frames.find((f) => f.type === "error")).toBeUndefined();
-  const after = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
-    name?: string;
-  }>;
-  expect(after.some((c) => c.name === "watcher")).toBe(true);
-
-  watcher.socket.end();
 });
 
 test("shutdown releases the socket + lock", async () => {
