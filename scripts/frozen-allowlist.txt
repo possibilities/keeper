@@ -1,0 +1,90 @@
+# Frozen-string allowlist for the retired "planctl" name.
+#
+# The fn-889 epic retires "planctl" → "keeper plan" / ".keeper" / "plan" across
+# the repo. Two classes of literal are PERMANENTLY FROZEN and must survive every
+# code sweep verbatim. This file is the single source of truth the guard
+# (scripts/lint-retired-name.sh) reads to tell a frozen literal from a renamable
+# symbol. Every code-sweep task (.6/.7/.8) and the migration/docs tasks
+# (.2/.3/.4/.5) lean on it.
+#
+# Format: pipe-delimited records, one per line. Blank lines and `#` comments are
+# ignored. Three record kinds:
+#
+#   anchor|<relpath>|<exact-substring>
+#       A frozen literal that must appear verbatim in <relpath>. The guard
+#       fails if the substring is missing (a sweep clobbered a frozen literal).
+#       The substring is matched as a fixed string (grep -F), so regex/quoting
+#       metacharacters are literal.
+#
+#   count|<relpath>|<n>
+#       A PURE-frozen file: every case-insensitive "planctl" token in it is a
+#       frozen literal (schema-history or trailer). The guard fails if the live
+#       count != <n> — catching both an accidental clobber (count drops) and a
+#       planted retired-name edit (count rises).
+#
+#   exempt|<relpath>
+#       A file that legitimately still carries un-renamed "planctl" references
+#       the guard must NOT flag, but whose tokens are NOT all frozen (mixed
+#       frozen + renamable). Listed for documentation; the guard does not pin a
+#       count on these. As .6/.7/.8 land, each sweep removes its file from here.
+#
+# =========================================================================
+# CLASS 1 — Trailer literals (frozen FOREVER: immutable git history reads them)
+# =========================================================================
+# The `Planctl-Op` / `Planctl-Target` / `Planctl-Prev-Op` commit-trailer key
+# strings. They are written into commits that already live in git history; the
+# emit, the git-log scrape, and the passthrough-regex readers can never rename
+# them without orphaning every historical commit's plan attribution.
+
+# Trailer EMIT — plugins/plan/src/commit.ts (buildMessageWithTrailers).
+anchor|plugins/plan/src/commit.ts|`Planctl-Op: ${op}\n` +
+anchor|plugins/plan/src/commit.ts|`Planctl-Target: ${target}\n` +
+anchor|plugins/plan/src/commit.ts|`Planctl-Prev-Op: ${prevOpSha}\n`;
+
+# git-log SCRAPE format — src/git-worker.ts (enumerateCommitsInDelta).
+anchor|src/git-worker.ts|%(trailers:key=Planctl-Op,valueonly,only,unfold)
+anchor|src/git-worker.ts|%(trailers:key=Planctl-Target,valueonly,only,unfold)
+
+# Passthrough/forbidden-trailer REGEX — cli/commit-work.ts (FORBIDDEN_TRAILER_RE).
+anchor|cli/commit-work.ts|Planctl-Op:|Planctl-Target:|Planctl-Prev-Op:|Planctl-[A-Za-z]+:
+
+# =========================================================================
+# CLASS 2 — Schema-history literals in src/db.ts (frozen FOREVER)
+# =========================================================================
+# A fresh-DB migration walk replays the `CREATE TABLE` / `addColumnIfMissing` /
+# backfill / idx-drop steps in order; renaming a `planctl_*` literal breaks the
+# v66→v78 sequence (the v78 rename block depends on the older `planctl_*` names
+# existing exactly as written, version-guarded so a post-v78 boot never
+# resurrects a zombie column). Every `planctl` token in src/db.ts is one of
+# these schema-history literals — so the whole file is count-pinned.
+count|src/db.ts|163
+
+# =========================================================================
+# CLASS 3 — Commit-event data keys + wire kind (frozen FOR NOW; .3 migrates)
+# =========================================================================
+# The synthetic Commit-event `events.data` keys `planctl_op` / `planctl_target`
+# (4,409 live events) and the `planctl-commit-changed` wire kind. Task .3's v81
+# migration rewrites the historical events and flips producer + reader to the
+# new keys; until then these stay verbatim. .3 owns removing these anchors.
+anchor|src/git-worker.ts|planctl_op: c.planctl_op,
+anchor|src/git-worker.ts|planctl_target: c.planctl_target,
+anchor|src/git-worker.ts|"planctl-commit-changed" | "plan-commit-changed"
+anchor|src/derivers.ts|const rawOp = obj.planctl_op;
+anchor|src/derivers.ts|const rawTarget = obj.planctl_target;
+anchor|src/daemon.ts|msg.kind === "planctl-commit-changed" ||
+anchor|src/reducer.ts|commit.planctl_op != null &&
+anchor|src/reducer.ts|commit.planctl_target != null
+
+# =========================================================================
+# Renamable residue (mixed files; NOT count-pinned) — .6/.7/.8/.5 own these
+# =========================================================================
+# These files carry both frozen literals (anchored above) and incidental
+# symbols / comments / `PLANCTL_*` env fallbacks a later sweep renames. Listed
+# so a sweep knows the guard already accounts for them; each sweep removes its
+# file from this block as it lands.
+exempt|plugins/plan/src/commit.ts
+exempt|src/git-worker.ts
+exempt|src/derivers.ts
+exempt|src/reducer.ts
+exempt|src/daemon.ts
+exempt|cli/commit-work.ts
