@@ -40,5 +40,5 @@ Repoint the pane-op/restore worker tests (reaper/renamer/jobs/restore-agents) to
 - [ ] `DEFAULT_EXEC_BACKEND`/`execBackendEnvMeta`/drift-guard comments unmoved + dep-free.
 
 ## Done summary
-
+Extracted the kept tmux pane-ops (createTmuxPaneOps) + restore-replay launch (restoreReplayLaunch) as direct seams; repointed reaper/renamer/jobs/autopilot-probe/restore to them. Interface + resolver kept for .2; tree compiles, full suite green.
 ## Evidence
