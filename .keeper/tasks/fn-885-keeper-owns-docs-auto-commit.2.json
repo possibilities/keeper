@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "debounced docs pusher on Stop",
-  "updated_at": "2026-06-22T16:04:03.923000Z"
+  "updated_at": "2026-06-22T19:28:44.928000Z",
+  "worker_done_at": "2026-06-22T19:28:44.928000Z"
 }

@@ -38,5 +38,5 @@ Update docs forward-facing, starting from fn-884's revised baseline: keeper CLAU
 - [ ] tests pass; `bun run test:full` green
 
 ## Done summary
-
+Added a fail-open Stop hook (docs-pusher) that pushes ~/docs to its remote once per turn when local is ahead of @{u} — local ahead-count (no fetch), .git/ O_EXCL lockfile for concurrent sessions, non-ff/auth/network logged + skipped (never rebase/--force), always exits 0. Docs updated (CLAUDE.md hook rules + invariants, README architecture + install, hooks.json description).
 ## Evidence
