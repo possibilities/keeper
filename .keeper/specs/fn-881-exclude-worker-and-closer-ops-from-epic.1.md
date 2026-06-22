@@ -70,5 +70,5 @@ epic's Docs gaps).
 - [ ] Docstrings + README + CLAUDE.md updated; `.keeper/specs/*` untouched.
 
 ## Done summary
-
+Excluded the worker's done op and closer's close op from the plan-link classifier (classifyEntry returns null before the refiner branch); v79->v80 migration rewinds the cursor + wipes link projections while raising the git skip-floor to preserve the v79 carve-out. Added done/close fixtures + unit tests, bumped api.py + version pins to 80, updated docs.
 ## Evidence

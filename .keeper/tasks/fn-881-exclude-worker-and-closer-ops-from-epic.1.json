@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
   "title": "Exclude done and close ops in classifyEntry",
-  "updated_at": "2026-06-22T02:09:16.856000Z"
+  "updated_at": "2026-06-22T02:53:16.830000Z",
+  "worker_done_at": "2026-06-22T02:53:16.830000Z"
 }
