@@ -54,5 +54,5 @@ keeper-root `test/pair-command.test.ts`: argv-builder shape (flags per `--cli`/`
 - [ ] `bun run test:full` passes.
 
 ## Done summary
-
+Built keeper pair send: a thin CLI + dep-free src/pair-command.ts leaf that fans a task to claude/codex via agentwrap (launch -> wait-for-stop -> show-last-message), ports pairctl's role prompts/read-only directive/git-snapshot backstop/two-line Monitor contract, and writes the partner's final answer to --output as YAML with transcript drill-down.
 ## Evidence
