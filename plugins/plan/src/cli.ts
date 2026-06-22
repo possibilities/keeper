@@ -856,11 +856,13 @@ function dispatch(parsed: ParsedArgs): number {
       });
       break;
     case "done":
+      // readPositional already skips --project / --summary / --evidence values.
       runDone({
         taskId: readPositional(rest),
         summary: readOption(rest, "--summary"),
         evidence: readOption(rest, "--evidence"),
         force: readFlag(rest, "--force"),
+        project: readOption(rest, "--project"),
         format,
       });
       break;
@@ -932,13 +934,18 @@ function dispatch(parsed: ParsedArgs): number {
       });
     case "show": {
       const id = readPositional(rest);
-      runShow(id, format);
+      const showProject = readOption(rest, "--project");
+      const showResult = runShow(id, showProject, format);
       trailerTarget = id.startsWith("fn-") ? id : null;
+      // The verb resolved the OWNING project (cwd-then-global); the trailer must
+      // resolve through that root, not the (possibly non-owning) cwd — a
+      // cross-repo read from a bare cwd must not fail the trailer.
+      trailerProjectPath = showResult.projectPath;
       break;
     }
     case "cat":
       // Format-free, no trailer: cat owns its stdout + exit code.
-      return runCat(readPositional(rest));
+      return runCat(readPositional(rest), readOption(rest, "--project"));
     case "list":
       runList(format);
       break;
@@ -999,12 +1006,17 @@ function dispatch(parsed: ParsedArgs): number {
       return 0;
     case "refine-context": {
       const id = readPositional(rest);
-      runRefineContext({
+      const rcResult = runRefineContext({
         epicId: id,
         invalidate: readFlag(rest, "--invalidate"),
+        project: readOption(rest, "--project"),
         format,
       });
       trailerTarget = id.startsWith("fn-") ? id : null;
+      // Read-only path fires the generic trailer; resolve it through the OWNING
+      // project the verb resolved (cwd-then-global), not the cwd. The --invalidate
+      // path self-emits, so didSelfEmit() guards the trailer there.
+      trailerProjectPath = rcResult.projectPath;
       break;
     }
     case "validate":

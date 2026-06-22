@@ -4,6 +4,11 @@
 // and missing entities surface the {success:false, error} envelope + exit 1.
 // Returns the resolved project root + the positional id for the read-only
 // trailer (whose target is the id, unlike the no-positional list/tasks verbs).
+//
+// Resolution is cwd-then-global (resolveOwningProjectForId): a globally-unique
+// id reads the board that owns it regardless of cwd, so a cross-repo worker can
+// read a task/epic owned by another repo's plan board. --project bypasses
+// discovery for a legacy ambiguous id.
 
 import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
@@ -11,7 +16,7 @@ import { join } from "node:path";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId, isTaskId } from "../ids.ts";
 import { mergeTaskState } from "../models.ts";
-import { resolveProject } from "../project.ts";
+import { resolveOwningProjectForId } from "../project.ts";
 import { LocalFileStateStore, loadJson, loadJsonSafe } from "../store.ts";
 
 interface ShowResult {
@@ -92,10 +97,11 @@ function str(v: unknown): string {
 
 export function runShow(
   idStr: string,
+  project: string | null,
   format: OutputFormat | null,
 ): ShowResult {
   if (isTaskId(idStr)) {
-    const ctx = resolveProject(format);
+    const ctx = resolveOwningProjectForId(idStr, project, format);
     const store = new LocalFileStateStore(ctx.stateDir);
 
     const taskPath = join(ctx.dataDir, "tasks", `${idStr}.json`);
@@ -143,7 +149,7 @@ export function runShow(
   }
 
   if (isEpicId(idStr)) {
-    const ctx = resolveProject(format);
+    const ctx = resolveOwningProjectForId(idStr, project, format);
     const store = new LocalFileStateStore(ctx.stateDir);
 
     const epicPath = join(ctx.dataDir, "epics", `${idStr}.json`);

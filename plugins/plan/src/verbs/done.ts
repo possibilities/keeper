@@ -1,7 +1,10 @@
 // done verb — the port of planctl/run_done.py.
 //
-// The wave's committing verb. Resolves the project cwd-based (resolveProject),
-// then under lockTask: re-read runtime, gate (already-done error; non-force
+// The wave's committing verb. Resolves the OWNING project cwd-then-global
+// (resolveOwningProjectForId), so a cross-repo worker whose cwd is the task's
+// target repo still stamps the task on the board that owns it (the stamp lands
+// in the owning project's store + commits there). --project bypasses discovery.
+// Then under lockTask: re-read runtime, gate (already-done error; non-force
 // requires in_progress + assignee match), patch the spec's `## Done summary` and
 // `## Evidence` sections byte-stably, atomicWrite the spec, saveRuntime(done).
 // AFTER the lock: stamp updated_at + worker_done_at on the TRACKED task JSON
@@ -16,7 +19,7 @@ import { emitMutating } from "../emit.ts";
 import { emitError, type OutputFormat } from "../format.ts";
 import { isTaskId } from "../ids.ts";
 import { mergeTaskState } from "../models.ts";
-import { resolveProject } from "../project.ts";
+import { resolveOwningProjectForId } from "../project.ts";
 import { clearWorkMarker } from "../session_markers.ts";
 import { ensureValidTaskSpec, patchTaskSection } from "../specs.ts";
 import {
@@ -33,6 +36,7 @@ interface DoneArgs {
   summary: string | null;
   evidence: string | null;
   force: boolean;
+  project: string | null;
   format: OutputFormat | null;
 }
 
@@ -43,13 +47,22 @@ interface Evidence {
 }
 
 export function runDone(args: DoneArgs): void {
-  const { taskId, summary, evidence: evidenceInline, force, format } = args;
+  const {
+    taskId,
+    summary,
+    evidence: evidenceInline,
+    force,
+    project,
+    format,
+  } = args;
 
   if (!isTaskId(taskId)) {
     emitError(`Invalid task ID: ${taskId}`, format);
   }
 
-  const ctx = resolveProject(format);
+  // Cwd-then-global owning-project resolution: the stamp lands in the board that
+  // owns the task, not the cwd project (the cross-repo self-complete fix).
+  const ctx = resolveOwningProjectForId(taskId, project, format);
   const dataDir = ctx.dataDir;
   const stateStore = new LocalFileStateStore(ctx.stateDir);
 

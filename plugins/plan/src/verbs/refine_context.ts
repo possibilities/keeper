@@ -2,7 +2,11 @@
 // default: returns one envelope carrying the epic metadata, raw epic spec
 // markdown ("" when absent), and the child task list (each with its own spec_md)
 // so /plan:plan's Phase R2 fires one verb instead of show + cat + tasks + per-
-// task cat. Conditionally MUTATING under --invalidate: short-circuits to a
+// task cat. Resolution is cwd-then-global (resolveOwningProjectForId), so a
+// globally-unique epic id resolves to its owning board regardless of cwd;
+// --project bypasses discovery for a legacy ambiguous id. Conditionally MUTATING
+// under --invalidate: the null-marker write lands in that owning project's store.
+// Short-circuits to a
 // readonly envelope when last_validated_at is already null, else writes the
 // marker to null + bumps updated_at and rides the mutating emit seam so one
 // chore(plan): refine-context <epic> commit lands. Typed errors —
@@ -16,7 +20,7 @@ import { emitMutating, emitReadonly } from "../emit.ts";
 import { formatOutput, type OutputFormat } from "../format.ts";
 import { isEpicId } from "../ids.ts";
 import { buildPlanctlInvocationReadonly } from "../invocation.ts";
-import { resolveProject } from "../project.ts";
+import { tryResolveOwningProjectForId } from "../project.ts";
 import { atomicWriteJson, loadJson, nowIso } from "../store.ts";
 
 /** Emit a typed refine-context error envelope and exit 1. No invocation. */
@@ -38,18 +42,43 @@ function readSpecMd(dataDir: string, specId: string): string {
   return readFileSync(specPath, "utf-8");
 }
 
+export interface RefineContextResult {
+  /** The OWNING project the epic resolved to (cwd-then-global). The read-only
+   * path returns it so the dispatcher's generic trailer resolves through this
+   * root, not the (possibly non-owning) cwd. The --invalidate path self-emits, so
+   * the returned value is unused there. */
+  projectPath: string;
+}
+
 export function runRefineContext(opts: {
   epicId: string;
   invalidate: boolean;
+  project: string | null;
   format: OutputFormat | null;
-}): void {
-  const { epicId, invalidate, format } = opts;
+}): RefineContextResult {
+  const { epicId, invalidate, project, format } = opts;
 
   if (!isEpicId(epicId)) {
     emitRefineError("BAD_EPIC_ID", `Invalid epic ID: ${epicId}`, format);
   }
 
-  const ctx = resolveProject(format);
+  // Cwd-then-global owning-project resolution via the non-emitting resolver, so
+  // not-found / ambiguous map to refine-context's OWN typed EPIC_NOT_FOUND
+  // envelope (the resolver's plain string error would drop the {code,message}
+  // contract). The resolved owning project is where any --invalidate write lands.
+  const resolution = tryResolveOwningProjectForId(epicId, project);
+  if (!resolution.ok) {
+    if (resolution.reason === "ambiguous") {
+      emitRefineError(
+        "EPIC_NOT_FOUND",
+        `Epic ${epicId} exists in multiple projects; pass --project <path>. ` +
+          `Candidates: ${resolution.owners.join(", ")}`,
+        format,
+      );
+    }
+    emitRefineError("EPIC_NOT_FOUND", `Epic not found: ${epicId}`, format);
+  }
+  const ctx = resolution.ctx;
   const dataDir = ctx.dataDir;
 
   const epicPath = join(dataDir, "epics", `${epicId}.json`);
@@ -102,7 +131,7 @@ export function runRefineContext(opts: {
         },
         pc,
       );
-      return;
+      return { projectPath: ctx.projectPath };
     }
 
     // Stamped -> None transition. Load raw epic JSON so the write round-trips
@@ -130,11 +159,12 @@ export function runRefineContext(opts: {
           (rawEpic.primary_repo as string | null | undefined) ?? null,
       },
     );
-    return;
+    return { projectPath: ctx.projectPath };
   }
 
   // Read-only path: no invocation embedded — the dispatcher fires the generic
-  // readonly trailer afterward (sentinel left unset).
+  // readonly trailer afterward (sentinel left unset), resolving through the
+  // returned owning project root.
   formatOutput(
     {
       success: true,
@@ -147,4 +177,5 @@ export function runRefineContext(opts: {
     },
     format,
   );
+  return { projectPath: ctx.projectPath };
 }
