@@ -1,6 +1,7 @@
 {
   "branch_name": "harden-plan-against-repo-renames",
   "bundles": [],
+  "closer_done_at": "2026-06-22T22:13:33.513000Z",
   "created_at": "2026-06-22T16:21:25.267000Z",
   "depends_on_epics": [],
   "id": "fn-887-harden-plan-against-repo-renames",
@@ -8,10 +9,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "harden plan against repo renames",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-22T16:21:25.267000Z"
+  "updated_at": "2026-06-22T22:13:33.513000Z"
 }
