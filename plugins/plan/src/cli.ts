@@ -45,6 +45,7 @@ import { runFollowupSubmit } from "./verbs/followup_submit.ts";
 import { runGist } from "./verbs/gist.ts";
 import { runInit } from "./verbs/init.ts";
 import { runList } from "./verbs/list.ts";
+import { runMvRepo } from "./verbs/mv_repo.ts";
 import { runReady } from "./verbs/ready.ts";
 import { runReconcile } from "./verbs/reconcile.ts";
 import { runRefineApply } from "./verbs/refine_apply.ts";
@@ -160,6 +161,11 @@ const COMMANDS: CommandSpec[] = [
   {
     name: "list",
     shortHelp: "List all epics and their tasks in a tree view.",
+    implemented: true,
+  },
+  {
+    name: "mv-repo",
+    shortHelp: "Rewrite stored board paths for a renamed repo (metadata only).",
     implemented: true,
   },
   {
@@ -949,6 +955,17 @@ function dispatch(parsed: ParsedArgs): number {
     case "list":
       runList(format);
       break;
+    case "mv-repo": {
+      // Self-emits (emitMutating on success / emitError on a bad <new>) and owns
+      // its exit code — return it directly, no generic trailer. Two positionals:
+      // <oldPath> <newPath>.
+      const [oldPath, newPath] = leafPositionals(rest, new Set());
+      return runMvRepo({
+        oldPath: oldPath ?? "",
+        newPath: newPath ?? "",
+        format,
+      });
+    }
     case "ready":
       // --epic is an OPTION, not a positional, so the trailer target stays null.
       runReady(readOption(rest, "--epic") ?? "", format);

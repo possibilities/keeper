@@ -35,6 +35,7 @@ export const VALIDATION_RESTAMP_VERBS: readonly string[] = [
   "set-primary-repo",
   "set-touched-repos",
   "set-target-repo",
+  "mv-repo",
   "refine-apply",
 ];
 

@@ -19,6 +19,7 @@ import {
   mkdirSync,
   readFileSync,
   realpathSync,
+  rmSync,
   unlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -302,6 +303,110 @@ describe("set-primary-repo / set-touched-repos", () => {
     expect(payload.touched_repos).toEqual([missing]);
     expect((payload.warnings as unknown[]).length).toBe(1);
     expect(epicDef(root, "fn-1-stp").touched_repos).toEqual([missing]);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// mv-repo — board-wide path rewrite for a renamed repo (one commit)
+// ---------------------------------------------------------------------------
+
+describe("mv-repo", () => {
+  test("rewrites primary_repo + target_repo + touched_repos in one commit", () => {
+    // Seed with the OLD repo path on disk so the seeded canonical strings match
+    // what mv-repo canonicalizes; rename old -> new on disk, then rewrite.
+    const oldRepo = realpathSync(mkdirRepo(join(root, "r_old")));
+    seedState(root, { epicId: "fn-1-mv", nTasks: 2, primaryRepo: oldRepo });
+    // touched_repos defaults to null; set it explicitly to exercise the rewrite.
+    const ep = join(root, ".keeper", "epics", "fn-1-mv.json");
+    const ed = loadJson(ep);
+    ed.touched_repos = [oldRepo];
+    atomicWriteJson(ep, ed);
+    mkdirSync(join(root, ".git"), { recursive: true });
+    gitBaseline(root);
+
+    // The rename: old dir gone, new dir is a real git repo.
+    const newRepo = realpathSync(mkdirRepo(join(root, "r_new")));
+    rmSync(join(root, "r_old"), { recursive: true, force: true });
+
+    const before = gitLogCount(root);
+    const r = runCli(["mv-repo", oldRepo, newRepo], {
+      cwd: root,
+      env: { ...SID, PLANCTL_NOW: FROZEN },
+    });
+    expect(r.code).toBe(0);
+
+    expect(epicDef(root, "fn-1-mv").primary_repo).toBe(newRepo);
+    expect(epicDef(root, "fn-1-mv").touched_repos).toEqual([newRepo]);
+    expect(taskDef(root, "fn-1-mv.1").target_repo).toBe(newRepo);
+    expect(taskDef(root, "fn-1-mv.2").target_repo).toBe(newRepo);
+    expect(epicDef(root, "fn-1-mv").last_validated_at).toBe(FROZEN);
+
+    // Exactly one commit, scoping every rewritten file.
+    expect(gitLogCount(root)).toBe(before + 1);
+    expect(headSubject(root)).toBe(`chore(plan): mv-repo ${newRepo}`);
+    const files = new Set(gitFilesInHead(root));
+    expect(files.has(".keeper/epics/fn-1-mv.json")).toBe(true);
+    expect(files.has(".keeper/tasks/fn-1-mv.1.json")).toBe(true);
+    expect(files.has(".keeper/tasks/fn-1-mv.2.json")).toBe(true);
+  });
+
+  test("idempotent re-run is a no-op (zero commits)", () => {
+    const oldRepo = realpathSync(mkdirRepo(join(root, "r_old2")));
+    seedState(root, { epicId: "fn-2-mv", nTasks: 1, primaryRepo: oldRepo });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    gitBaseline(root);
+    const newRepo = realpathSync(mkdirRepo(join(root, "r_new2")));
+    rmSync(join(root, "r_old2"), { recursive: true, force: true });
+
+    const first = runCli(["mv-repo", oldRepo, newRepo], {
+      cwd: root,
+      env: SID,
+    });
+    expect(first.code).toBe(0);
+    expect(epicDef(root, "fn-2-mv").primary_repo).toBe(newRepo);
+    const afterFirst = gitLogCount(root);
+
+    // Nothing matches <old> anymore — a re-run rewrites nothing.
+    const second = runCli(["mv-repo", oldRepo, newRepo], {
+      cwd: root,
+      env: SID,
+    });
+    expect(second.code).toBe(0);
+    expect(firstObj(second.output).rewritten_epics).toEqual([]);
+    expect(firstObj(second.output).rewritten_tasks).toEqual([]);
+    expect(gitLogCount(root)).toBe(afterFirst);
+    expect(epicDef(root, "fn-2-mv").primary_repo).toBe(newRepo);
+  });
+
+  test("old == new after canonicalize is a no-op (zero commits)", () => {
+    const repo = realpathSync(mkdirRepo(join(root, "r_same")));
+    seedState(root, { epicId: "fn-3-mv", nTasks: 1, primaryRepo: repo });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    gitBaseline(root);
+    const before = gitLogCount(root);
+
+    const r = runCli(["mv-repo", repo, repo], { cwd: root, env: SID });
+    expect(r.code).toBe(0);
+    expect(firstObj(r.output).rewritten_epics).toEqual([]);
+    expect(gitLogCount(root)).toBe(before);
+    expect(epicDef(root, "fn-3-mv").primary_repo).toBe(repo);
+  });
+
+  test("refuses loudly when <new> is not a git repo", () => {
+    const oldRepo = realpathSync(mkdirRepo(join(root, "r_old3")));
+    seedState(root, { epicId: "fn-4-mv", nTasks: 1, primaryRepo: oldRepo });
+    mkdirSync(join(root, ".git"), { recursive: true });
+    // <new> exists but has no .git/.
+    const notRepo = realpathSync(mkdirRepo(join(root, "r_new3"), false));
+
+    const r = runCli(["mv-repo", oldRepo, notRepo], { cwd: root, env: SID });
+    expect(r.code).toBe(1);
+    expect(parseCliOutput(r.output).success).toBe(false);
+    expect(parseCliOutput(r.output).error as string).toContain(
+      "contains no .git/",
+    );
+    // Refused before any write — primary_repo unchanged.
+    expect(epicDef(root, "fn-4-mv").primary_repo).toBe(oldRepo);
   });
 });
 

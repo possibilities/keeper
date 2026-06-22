@@ -425,7 +425,7 @@ SHORT: only `### Approach` and `### Investigation targets`. DEEP: also `### Deta
 
 **Tier** — write the band from 5d as `tier:`. **Required on every task** — scaffold errors `tier_invalid` if missing or unknown. Say the choice in one line per task (*"task 3 is contract-touching — xhigh"*) so the human can redirect.
 
-**Target repo (cross-repo epics only)** — when a task lands outside `primary_repo`, set `target_repo:` to the absolute path (`~` expands); omit otherwise (defaults to `primary_repo`). `primary_repo` is where scaffold runs, so run `/plan:plan` from it. Do **not** hand-set `epic.touched_repos` — the engine auto-derives it from the resolved per-task `target_repo` set. Canonical wording: `keeper plan scaffold --agent-help`.
+**Target repo (cross-repo epics only)** — when a task lands outside `primary_repo`, set `target_repo:` to the absolute path (`~` expands); omit otherwise (defaults to `primary_repo`). `primary_repo` is where scaffold runs, so run `/plan:plan` from it. Do **not** hand-set `epic.touched_repos` — the engine auto-derives it from the resolved per-task `target_repo` set. Canonical wording: `keeper plan scaffold --agent-help`. After a post-scaffold repo directory rename, fix the stored paths in one shot with `keeper plan mv-repo <old> <new>` — not per-task `task set-target-repo`; `mv-repo` rewrites every `primary_repo` / `target_repo` / `touched_repos` match across the board in one commit.
 
 ### 5f. Declare cross-task dependencies (cognitive)
 
