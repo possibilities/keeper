@@ -40,6 +40,7 @@ import {
   serializeSidecar,
   stripDocSignature,
 } from "../src/sidecar.ts";
+import { initRepo } from "./helpers/git-repo.ts";
 import { sandboxEnv } from "./helpers/sandbox-env.ts";
 
 // ---------------------------------------------------------------------------
@@ -429,5 +430,125 @@ describe("sidecar-writer hook (subprocess)", () => {
     const { code } = await run(writePayload(md));
     expect(code).toBe(0);
     expect(existsSync(join(docsDir, "ghost.yaml"))).toBe(false);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Layer 2b — the fn-885 docs auto-committer, exercised through the real hook
+// against a `KEEPER_DOCS_DIR` that IS a git repo. (Real git; the hook commits
+// the doc + sidecar / edit / delete fail-open, always exiting 0.)
+// ---------------------------------------------------------------------------
+
+/** Run a git command in `docsDir` synchronously; throw on a non-zero exit. */
+function gitDocs(...args: string[]): string {
+  const res = Bun.spawnSync(["git", "-C", docsDir, ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+  });
+  if (res.exitCode !== 0) {
+    throw new Error(
+      `git ${args.join(" ")} failed: ${res.stderr.toString().trim()}`,
+    );
+  }
+  return res.stdout.toString();
+}
+
+function headSubject(): string {
+  return gitDocs("log", "-1", "--format=%s").trim();
+}
+
+function commitCount(): number {
+  return Number(gitDocs("rev-list", "--count", "HEAD").trim());
+}
+
+describe("sidecar-writer hook — docs auto-commit (subprocess, real git)", () => {
+  beforeEach(() => {
+    // Re-make docsDir as a real git repo with an initial commit so HEAD
+    // resolves. (The outer beforeEach already created docsDir.)
+    initRepo(docsDir);
+    writeFileSync(join(docsDir, "seed.md"), "# seed\n");
+    gitDocs("add", "--", "seed.md");
+    gitDocs("commit", "-q", "-m", "init");
+  });
+
+  test("a Write under the docs repo commits the doc + sidecar with a write subject", async () => {
+    const md = join(docsDir, "w.md");
+    writeFileSync(md, "# W\n\nBody.\n");
+    const pre = commitCount();
+
+    const { code } = await run(writePayload(md));
+    expect(code).toBe(0);
+
+    // sidecar was written AND both files were committed
+    expect(existsSync(join(docsDir, "w.yaml"))).toBe(true);
+    expect(commitCount()).toBe(pre + 1);
+    expect(headSubject()).toBe("docs: write w.md");
+    // tree is clean — both the .md and .yaml landed
+    expect(gitDocs("status", "--porcelain").trim()).toBe("");
+  });
+
+  test("an Edit under the docs repo commits just the .md with an update subject", async () => {
+    const md = join(docsDir, "e.md");
+    writeFileSync(md, "# E\n");
+    gitDocs("add", "--", "e.md");
+    gitDocs("commit", "-q", "-m", "seed e");
+    writeFileSync(md, "# E edited\n");
+    const pre = commitCount();
+
+    const { code } = await run({
+      hook_event_name: "PostToolUse",
+      tool_name: "Edit",
+      session_id: "s",
+      cwd: "/repo",
+      tool_input: { file_path: md },
+    });
+    expect(code).toBe(0);
+    expect(commitCount()).toBe(pre + 1);
+    expect(headSubject()).toBe("docs: update e.md");
+  });
+
+  test("a `rm` of a tracked doc commits the deletion", async () => {
+    const md = join(docsDir, "d.md");
+    writeFileSync(md, "# D\n");
+    gitDocs("add", "--", "d.md");
+    gitDocs("commit", "-q", "-m", "seed d");
+    rmSync(md);
+    const pre = commitCount();
+
+    const { code } = await run({
+      hook_event_name: "PostToolUse",
+      tool_name: "Bash",
+      session_id: "s",
+      cwd: docsDir,
+      tool_input: { command: `rm ${md}` },
+      tool_response: { stdout: "", stderr: "" },
+    });
+    expect(code).toBe(0);
+    expect(commitCount()).toBe(pre + 1);
+    expect(headSubject()).toBe("docs: delete d.md");
+    expect(gitDocs("ls-files", "d.md").trim()).toBe("");
+  });
+
+  test("a Write OUTSIDE the docs repo does not commit", async () => {
+    const outside = join(tmpDir, "outside.md");
+    writeFileSync(outside, "# X\n");
+    const pre = commitCount();
+
+    const { code } = await run(writePayload(outside));
+    expect(code).toBe(0);
+    expect(commitCount()).toBe(pre);
+    expect(existsSync(join(tmpDir, "outside.yaml"))).toBe(false);
+  });
+
+  test("exit 0 (no throw) when the docs dir is not a git repo", async () => {
+    const nonRepo = join(tmpDir, "plain-docs");
+    mkdirSync(nonRepo, { recursive: true });
+    const md = join(nonRepo, "p.md");
+    writeFileSync(md, "# P\n");
+
+    const { code } = await run(writePayload(md), nonRepo);
+    expect(code).toBe(0);
+    // sidecar still written (the commit no-ops on the non-repo, fail-open)
+    expect(existsSync(join(nonRepo, "p.yaml"))).toBe(true);
   });
 });

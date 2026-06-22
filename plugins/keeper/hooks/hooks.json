@@ -1,5 +1,5 @@
 {
-  "description": "Keeper hooks: (1) events-writer appends one per-pid NDJSON line per hook invocation (lock-free, no SQLite) for the keeperd ingester to fold into the jobs projection; (2) branch-guard is a PreToolUse(Bash) hard-deny that blocks subagents (agent_id present) from creating/switching git branches via the deny JSON envelope (still exits 0), keeping worker subagents on the current branch; (3) sidecar-writer is a fail-open PostToolUse(Write|Bash) hook that owns the ~/docs metadata sidecar — create-or-merge a doc's .yaml on Write and upsert the gist-url on `gh gist create`, NEVER touching the .md (still exits 0)",
+  "description": "Keeper hooks: (1) events-writer appends one per-pid NDJSON line per hook invocation (lock-free, no SQLite) for the keeperd ingester to fold into the jobs projection; (2) branch-guard is a PreToolUse(Bash) hard-deny that blocks subagents (agent_id present) from creating/switching git branches via the deny JSON envelope (still exits 0), keeping worker subagents on the current branch; (3) sidecar-writer is a fail-open PostToolUse(Write|Edit|MultiEdit|Bash) hook that owns the ~/docs metadata sidecar AND git state — create-or-merge a doc's .yaml on Write, upsert the gist-url on `gh gist create` (NEVER touching the .md), and commit every doc write/edit/delete to the ~/docs repo (pathspec-scoped, mechanical message, fail-open so a commit failure never blocks; still exits 0)",
   "hooks": {
     "SessionStart": [
       {
@@ -52,7 +52,7 @@
         ]
       },
       {
-        "matcher": "Write",
+        "matcher": "Write|Edit|MultiEdit",
         "hooks": [
           {
             "type": "command",
