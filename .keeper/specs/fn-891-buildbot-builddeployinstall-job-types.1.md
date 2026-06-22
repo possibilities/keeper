@@ -56,5 +56,5 @@ Run `~/.local/share/uv/tools/buildbot/bin/buildbot checkconfig ~/.local/state/bu
 - [ ] `buildbot checkconfig` passes
 
 ## Done summary
-
+Extracted _make_step helper preserving the dep-vs-check envelope (with halt override), normalized PROJECTS to typed JobSpecs constructed via JOB_FACTORIES dispatch with job:<kind> tags and the -install/-deploy suffix convention, and folded mermaidctl-deploy through the helper. Behavior-preserving: 5 build builders + mermaidctl-deploy construct byte-identically; checkconfig green.
 ## Evidence
