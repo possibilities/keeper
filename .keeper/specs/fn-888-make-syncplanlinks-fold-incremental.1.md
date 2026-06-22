@@ -76,5 +76,5 @@ tense, no change-history.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Replaced syncPlanLinks's normal-path full session-sweep with an idempotent per-session replace-by-key merge (shared mergeJobLinkSlice helper) so per-event cost is independent of sessions-per-epic and board size; orphan invocations retain the full-sweep fallback. Added seven refold byte-identity fixtures incl. the keystone stale-other-session case plus a static enrichment-freshness source guard.
 ## Evidence
