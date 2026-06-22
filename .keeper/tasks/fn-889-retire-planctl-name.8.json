@@ -1,13 +1,15 @@
 {
   "bundles": [],
-  "created_at": "2026-06-22T16:33:42.038000Z",
-  "depends_on": [],
+  "created_at": "2026-06-22T22:42:19.071000Z",
+  "depends_on": [
+    "fn-889-retire-planctl-name.1"
+  ],
   "epic": "fn-889-retire-planctl-name",
-  "id": "fn-889-retire-planctl-name.1",
+  "id": "fn-889-retire-planctl-name.8",
   "priority": null,
   "snippets": [],
   "target_repo": "/Users/mike/code/keeper",
   "tier": "xhigh",
-  "title": "AST codemod + frozen allowlist + lint guard",
+  "title": "keeper-core TS surgical sweep (planctl rename)",
   "updated_at": "2026-06-22T22:42:19.071000Z"
 }
