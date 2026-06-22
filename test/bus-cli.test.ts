@@ -26,7 +26,6 @@ import {
   CHAT_NAMESPACE,
   directiveHead,
   emitMessage,
-  HEARTBEAT_INTERVAL_MS,
   handleWatchFrame,
   hms,
   type InboundMessage,
@@ -39,7 +38,6 @@ import {
   senderLabel,
   spillFileName,
   spillPointerLine,
-  startHeartbeat,
 } from "../cli/bus";
 
 describe("parseBusArgv routing", () => {
@@ -51,17 +49,10 @@ describe("parseBusArgv routing", () => {
     expect(parseBusArgv(["watch"])).toEqual({ kind: "watch" });
   });
 
-  test("resolve <target>", () => {
-    expect(parseBusArgv(["resolve", "bob"])).toEqual({
-      kind: "resolve",
-      target: "bob",
-    });
-  });
-
-  test("resolve without a target → usage", () => {
-    const r = parseBusArgv(["resolve"]);
+  test("resolve is gone → unknown verb usage", () => {
+    const r = parseBusArgv(["resolve", "bob"]);
     expect(r.kind).toBe("usage");
-    if (r.kind === "usage") expect(r.error).toContain("target");
+    if (r.kind === "usage") expect(r.error).toContain("unknown bus verb");
   });
 
   test("chat send <target> <msg>", () => {
@@ -365,7 +356,7 @@ describe("emitMessage (filesystem, sandboxed)", () => {
   });
 });
 
-describe("watch heartbeat", () => {
+describe("watch frame handling (no heartbeat)", () => {
   /** A fake socket capturing every frame the client writes. */
   function fakeWriter(): { writes: string[]; write: (d: string) => number } {
     const writes: string[] = [];
@@ -378,46 +369,15 @@ describe("watch heartbeat", () => {
     };
   }
 
-  test("schedules a heartbeat frame at HEARTBEAT_INTERVAL_MS, well under 90s", () => {
-    expect(HEARTBEAT_INTERVAL_MS).toBeLessThan(90_000);
+  test("register-ack subscribes and sends NO heartbeat traffic", () => {
     const w = fakeWriter();
-    const captured: { fn: () => void; ms: number }[] = [];
-    const cancel = startHeartbeat(w, (fn, ms) => {
-      captured.push({ fn, ms });
-      return 0 as unknown as ReturnType<typeof setInterval>;
-    });
-
-    expect(captured).toHaveLength(1);
-    const sched = captured[0];
-    expect(sched.ms).toBe(HEARTBEAT_INTERVAL_MS);
-    // No frame until the timer fires.
-    expect(w.writes).toEqual([]);
-
-    // Fire the scheduled callback twice (fake timer) — each beat is one frame.
-    sched.fn();
-    sched.fn();
-    expect(w.writes).toEqual([
-      `${JSON.stringify({ op: "heartbeat" })}\n`,
-      `${JSON.stringify({ op: "heartbeat" })}\n`,
-    ]);
-
-    // Canceller is wired to the timer id (no throw, idempotent to call).
-    cancel();
+    handleWatchFrame(w, { type: "ack", op: "register" }, "/tmp/ignored");
+    // Only a subscribe — the connection stays open with no periodic heartbeat.
+    expect(w.writes).toEqual([`${JSON.stringify({ op: "subscribe" })}\n`]);
   });
 
-  test("register-ack starts the heartbeat and subscribes; non-register frames do not", () => {
+  test("a bus-namespace lifecycle frame is skipped (no subscribe, no emit)", () => {
     const w = fakeWriter();
-    let beats = 0;
-    const begin = (): void => {
-      beats += 1;
-    };
-
-    handleWatchFrame(w, { type: "ack", op: "register" }, "/tmp/ignored", begin);
-    expect(beats).toBe(1);
-    expect(w.writes).toEqual([`${JSON.stringify({ op: "subscribe" })}\n`]);
-
-    // A non-register control frame must NOT (re)start the heartbeat (bus-namespace
-    // lifecycle events are skipped before any emit/spill).
     handleWatchFrame(
       w,
       {
@@ -428,8 +388,7 @@ describe("watch heartbeat", () => {
         ts: 0,
       },
       "/tmp/ignored",
-      begin,
     );
-    expect(beats).toBe(1);
+    expect(w.writes).toEqual([]);
   });
 });

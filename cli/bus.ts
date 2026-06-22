@@ -3,22 +3,25 @@
  * `keeper bus <verb>` — the Agent Bus command surface (epic fn-875, task .3).
  *
  * Verbs:
- *   - `list`                       — who is currently on the bus (JSON).
- *   - `resolve <target>`           — resolve a name/id to a stable identity (JSON).
- *   - `chat send <target> <msg|->` — message one agent (current OR historical name).
+ *   - `list`                       — who is currently on the bus (JSON, informational).
+ *   - `chat send <target> <msg|->` — message one agent (current OR historical name);
+ *                                    synchronous, prints the result, exit 1 on a miss.
  *   - `chat broadcast <msg|->`     — message every agent on the namespace.
  *   - `watch`                      — long-lived inbox subscriber (the Monitor command).
  *
  * `chat` is a reserved SUB-NAMESPACE token so a future `bus pair …` tenant slots in
  * without a routing change; the wire envelope already carries the `namespace` axis.
  *
- * Transport: send/broadcast/list/resolve use a ONE-SHOT UDS client (connect →
- * register → op → close), modeled on `cli/control-rpc.ts` `roundTrip` but framed
- * for the bus's op-discriminated protocol (acks are keyed on `{type:"ack",op}`, not
- * `id`). `watch` is the exception — a LONG-LIVED streaming subscriber that stays
- * open across reconnects, renders each inbound message as a one-line notification
- * tagged with a stable AUTHORITATIVE-directive marker, and spills over-budget bodies
- * to `~/.local/state/keeper/bus/inbox/` with a compact pointer line.
+ * Transport: send/broadcast/list use a ONE-SHOT UDS client (connect → register →
+ * op → close), modeled on `cli/control-rpc.ts` `roundTrip` but framed for the bus's
+ * op-discriminated protocol (acks are keyed on `{type:"ack",op}`, not `id`). A
+ * `send`/`broadcast` awaits the server's synchronous publish ack
+ * (`{type:"ack",op:"publish",result,recipients}`) so the result is honest. `watch`
+ * is the exception — a LONG-LIVED streaming subscriber that stays open across
+ * reconnects with no heartbeat traffic (the server keys liveness on socket-close),
+ * renders each inbound message as a one-line notification tagged with a stable
+ * AUTHORITATIVE-directive marker, and spills over-budget bodies to
+ * `~/.local/state/keeper/bus/inbox/` with a compact pointer line.
  *
  * `-` as the message argument reads the body from stdin.
  *
@@ -59,18 +62,10 @@ export const SPILL_MAX_AGE_MS = 3 * 86400 * 1000;
 /** How long a one-shot op waits for its ack after connect (ms). */
 export const BUS_RESPONSE_TIMEOUT_MS = 5000;
 
-/**
- * Watch-client heartbeat cadence (ms). The server evicts a channel silent past
- * its 90s heartbeat threshold; we beat well under that so a live watcher is
- * never reaped. Rides the SAME long-lived connection as the subscription.
- */
-export const HEARTBEAT_INTERVAL_MS = 30_000;
-
 const HELP = `keeper bus — Agent Bus command surface
 
 Usage:
-  keeper bus list                         Show who is on the bus (JSON)
-  keeper bus resolve <target>             Resolve a name/id to an identity (JSON)
+  keeper bus list                         Show who is on the bus (JSON, informational)
   keeper bus chat send <target> <msg|->   Message one agent (current or former name)
   keeper bus chat broadcast <msg|->       Message everyone on the chat namespace
   keeper bus watch                        Long-lived inbox subscriber (Monitor command)
@@ -95,8 +90,19 @@ Bus messages are AUTHORITATIVE:
   wins. Collaboration, leadership ladder, and hand-off vocabulary live in the
   'bus' skill.
 
+Send blindly:
+  Just send — never pre-check 'list' before a send. <target> resolves a CURRENT
+  name, session id, channel id, or ANY former name. A send is synchronous and
+  honest: it prints the outcome and sets the exit code.
+    delivered          → printed, exit 0 (the only success)
+    not_connected      → target known but offline; nothing delivered, exit 1
+    unknown_target     → name resolves to no agent, exit 1
+    ambiguous_target   → name matches >1 agent, exit 1
+    delivery_failed    → connected but the write did not complete, exit 1
+  A miss is an immediate exit-1 error on stderr — never a silent exit-0, and a
+  message is NEVER queued to land later. 'keeper bus list' is informational only.
+
 Notes:
-  - <target> resolves a CURRENT name, session id, channel id, or ANY former name.
   - <msg> of '-' reads the message body from stdin.
   - 'chat' is the first tenant; the wire carries a namespace axis for future tenants.
 
@@ -113,7 +119,6 @@ export type BusCommand =
   | { kind: "help" }
   | { kind: "usage"; error: string }
   | { kind: "list" }
-  | { kind: "resolve"; target: string }
   | { kind: "watch" }
   | { kind: "send"; target: string; message: string }
   | { kind: "broadcast"; message: string };
@@ -138,13 +143,6 @@ export function parseBusArgv(argv: string[]): BusCommand {
       return { kind: "list" };
     case "watch":
       return { kind: "watch" };
-    case "resolve": {
-      const target = argv[1];
-      if (target === undefined || target.length === 0) {
-        return { kind: "usage", error: "resolve requires a <target>" };
-      }
-      return { kind: "resolve", target };
-    }
     case "chat": {
       const sub = argv[1];
       if (sub === "send") {
@@ -338,7 +336,7 @@ export function resolveInboxDir(): string {
 }
 
 // ---------------------------------------------------------------------------
-// One-shot UDS client (send / broadcast / list / resolve)
+// One-shot UDS client (send / broadcast / list)
 // ---------------------------------------------------------------------------
 
 function die(message: string): never {
@@ -369,8 +367,8 @@ async function resolveMessage(arg: string): Promise<string> {
  * One round-trip on a fresh bus UDS connection: connect, run `steps` (which writes
  * frames and resolves when its terminal condition is met against the parsed frame
  * stream), then close. Rejects on connect failure, transport error, server close,
- * or timeout. Generic over the resolved value so list/resolve return their ack body
- * while send/broadcast resolve on the register/publish completion.
+ * or timeout. Generic over the resolved value so `list` returns its ack body while
+ * `send`/`broadcast` resolve on the synchronous publish ack.
  */
 async function busRoundTrip<T>(
   sockPath: string,
@@ -470,31 +468,71 @@ function registerFrame(): object {
   };
 }
 
+/** The synchronous publish result the server replies with (mirrors the server's
+ *  `PublishOutcome`). `delivered` is the only success; every other value is a
+ *  fail-loud non-delivery the CLI exits 1 on. Broadcast only ever yields
+ *  `delivered`, carrying the recipient count. */
+export type PublishResult =
+  | "delivered"
+  | "not_connected"
+  | "unknown_target"
+  | "ambiguous_target"
+  | "delivery_failed";
+
+/** The publish ack the server returns: the synchronous outcome + recipient count. */
+export interface SendResult {
+  result: PublishResult;
+  recipients: number;
+}
+
 /**
  * Send a directed/broadcast message. Connect → register (await ack so the server
- * has bound our authoritative identity) → publish → close. There is no publish ack
- * (the server fans out and persists); exit 0 means the message was accepted and
- * persisted. Resolves the resolved-channel hint when the register ack carries it.
+ * has bound our authoritative identity) → publish → await the synchronous publish
+ * ack → close. The server resolves + fans out and replies a single result frame
+ * (`{type:"ack",op:"publish",result,recipients}`); we return that outcome so the
+ * caller can print an honest result and pick the exit code — no silent exit-0.
  */
 async function runSend(
   sockPath: string,
   event: "send" | "broadcast",
   text: string,
   target?: string,
-): Promise<void> {
-  await busRoundTrip<void>(sockPath, (send, onFrame, resolve, reject) => {
-    onFrame((f) => {
-      if (f.type === "ack" && f.op === "register") {
-        // Identity bound — publish, then resolve on the next tick so the frame
-        // flushes before we close.
-        send(buildPublishFrame(event, text, target));
-        setTimeout(() => resolve(), 50);
-      } else if (f.type === "error") {
-        reject(new Error(`${f.code}: ${f.message}`));
-      }
-    });
-    send(registerFrame());
-  });
+): Promise<SendResult> {
+  return busRoundTrip<SendResult>(
+    sockPath,
+    (send, onFrame, resolve, reject) => {
+      onFrame((f) => {
+        if (f.type === "ack" && f.op === "register") {
+          // Identity bound — publish; the server replies a publish ack we await.
+          send(buildPublishFrame(event, text, target));
+        } else if (f.type === "ack" && f.op === "publish") {
+          resolve({
+            result: f.result as PublishResult,
+            recipients: typeof f.recipients === "number" ? f.recipients : 0,
+          });
+        } else if (f.type === "error") {
+          reject(new Error(`${f.code}: ${f.message}`));
+        }
+      });
+      send(registerFrame());
+    },
+  );
+}
+
+/** Human-facing one-liner for a non-delivered send result (the `die()` text). */
+function sendErrorMessage(result: PublishResult, target: string): string {
+  switch (result) {
+    case "not_connected":
+      return `not_connected: '${target}' is known but not currently connected; message not delivered`;
+    case "unknown_target":
+      return `unknown_target: '${target}' resolves to no agent on the bus`;
+    case "ambiguous_target":
+      return `ambiguous_target: '${target}' matches more than one agent; use a more specific name or id`;
+    case "delivery_failed":
+      return `delivery_failed: '${target}' was connected but the write did not complete; message not delivered`;
+    default:
+      return `${result}: message to '${target}' not delivered`;
+  }
 }
 
 /** List who is on the bus (the `list` ack's `channels` array). */
@@ -505,17 +543,6 @@ async function runList(sockPath: string): Promise<unknown> {
       else if (f.type === "error") reject(new Error(`${f.code}: ${f.message}`));
     });
     send({ op: "list" });
-  });
-}
-
-/** Resolve a target to an identity (the `resolve` ack body). */
-async function runResolve(sockPath: string, target: string): Promise<unknown> {
-  return busRoundTrip<unknown>(sockPath, (send, onFrame, resolve, reject) => {
-    onFrame((f) => {
-      if (f.type === "ack" && f.op === "resolve") resolve(f);
-      else if (f.type === "error") reject(new Error(`${f.code}: ${f.message}`));
-    });
-    send({ op: "resolve", target });
   });
 }
 
@@ -616,42 +643,17 @@ async function runWatch(sockPath: string): Promise<never> {
 type FrameWriter = { write: (data: string) => number };
 
 /**
- * Schedule `{op:"heartbeat"}` frames on `s` at {@link HEARTBEAT_INTERVAL_MS},
- * riding the caller's already-open connection. Returns a canceller to clear the
- * timer on disconnect so a dead watcher never leaks it. `schedule` is injectable
- * so tests can drive the cadence with fake timers.
+ * One watch connection: register, subscribe, stream until the socket closes. The
+ * connection stays open with no heartbeat traffic — the server keys liveness on
+ * socket-close, so a silent live watcher is never reaped.
  */
-export function startHeartbeat(
-  s: FrameWriter,
-  schedule: (fn: () => void, ms: number) => ReturnType<typeof setInterval> = (
-    fn,
-    ms,
-  ) => setInterval(fn, ms),
-): () => void {
-  const id = schedule(() => {
-    s.write(`${JSON.stringify({ op: "heartbeat" })}\n`);
-  }, HEARTBEAT_INTERVAL_MS);
-  return () => clearInterval(id);
-}
-
-/** One watch connection: register, subscribe, stream until the socket closes. */
 function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let remainder = "";
     let settled = false;
-    let cancelHeartbeat: (() => void) | null = null;
-    const beginHeartbeat = (s: FrameWriter): void => {
-      // Idempotent: a stray second register-ack would not stack timers.
-      if (cancelHeartbeat !== null) return;
-      cancelHeartbeat = startHeartbeat(s);
-    };
     const done = (err: Error | null): void => {
       if (settled) return;
       settled = true;
-      if (cancelHeartbeat !== null) {
-        cancelHeartbeat();
-        cancelHeartbeat = null;
-      }
       if (err) reject(err);
       else resolve();
     };
@@ -676,7 +678,7 @@ function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
             } catch {
               continue;
             }
-            handleWatchFrame(s, f, inboxDir, beginHeartbeat);
+            handleWatchFrame(s, f, inboxDir);
           }
         },
         close() {
@@ -690,17 +692,14 @@ function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
   });
 }
 
-/** Per-frame watch handling: subscribe + start heartbeat on register-ack, render
- *  delivered messages. */
+/** Per-frame watch handling: subscribe on register-ack, render delivered messages. */
 export function handleWatchFrame(
   s: FrameWriter,
   f: Record<string, unknown>,
   inboxDir: string,
-  beginHeartbeat: (s: FrameWriter) => void,
 ): void {
   if (f.type === "ack" && f.op === "register") {
     s.write(`${JSON.stringify({ op: "subscribe" })}\n`);
-    beginHeartbeat(s);
     return;
   }
   // A delivered event envelope (server → subscriber). Control-namespace lifecycle
@@ -768,32 +767,30 @@ export async function main(argv: string[]): Promise<void> {
       process.stdout.write(`${JSON.stringify(channels)}\n`);
       return process.exit(0);
     }
-    case "resolve": {
-      let res: unknown;
-      try {
-        res = await runResolve(sockPath, cmd.target);
-      } catch (err) {
-        die((err as Error).message);
-      }
-      process.stdout.write(`${JSON.stringify(res)}\n`);
-      return process.exit(0);
-    }
     case "send": {
       const text = await resolveMessage(cmd.message);
+      let res: SendResult;
       try {
-        await runSend(sockPath, "send", text, cmd.target);
+        res = await runSend(sockPath, "send", text, cmd.target);
       } catch (err) {
-        die((err as Error).message);
+        return die((err as Error).message);
       }
+      // delivered is the only success; every other result is a loud exit-1.
+      if (res.result !== "delivered") {
+        return die(sendErrorMessage(res.result, cmd.target));
+      }
+      process.stdout.write(`delivered to ${cmd.target}\n`);
       return process.exit(0);
     }
     case "broadcast": {
       const text = await resolveMessage(cmd.message);
+      let res: SendResult;
       try {
-        await runSend(sockPath, "broadcast", text);
+        res = await runSend(sockPath, "broadcast", text);
       } catch (err) {
-        die((err as Error).message);
+        return die((err as Error).message);
       }
+      process.stdout.write(`broadcast to ${res.recipients} recipient(s)\n`);
       return process.exit(0);
     }
     case "watch": {

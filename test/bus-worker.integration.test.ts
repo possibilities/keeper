@@ -659,9 +659,10 @@ test("CLI round-trip: `keeper bus chat send` reaches a live subscriber; `list` s
   bob.send({ op: "subscribe", namespaces: ["chat"] });
   await waitFrame(bob.frames, (f) => f.type === "ack" && f.op === "subscribe");
 
-  // The CLI one-shot send: register → publish → exit 0.
+  // The CLI one-shot send: register → publish → await the `delivered` result → exit 0.
   const sent = await runBusCli(["chat", "send", "bob", "hello from the CLI"]);
   expect(sent.code).toBe(0);
+  expect(sent.stdout).toContain("delivered to bob");
 
   const delivered = await waitFrame(bob.frames, (f) => f.event === "message");
   expect(delivered).not.toBeNull();
@@ -676,6 +677,61 @@ test("CLI round-trip: `keeper bus chat send` reaches a live subscriber; `list` s
   expect(channels.some((c) => c.name === "bob")).toBe(true);
 
   bob.socket.end();
+});
+
+test("CLI send to a KNOWN-but-DISCONNECTED agent fails loud: exit 1 + `not_connected` on stderr", async () => {
+  await bootBus();
+  const bob = await connectClient();
+  await registerAndSubscribe(bob, "bob", "sess-bob", "t-bob");
+
+  // Close bob's socket; the server keeps his registry row, so the name still
+  // resolves but there is no open socket to deliver to.
+  bob.socket.end();
+  const disconnected = await retryUntil(
+    async () => {
+      const channels = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+        name?: string;
+        subscribed?: boolean;
+      }>;
+      const ch = channels.find((c) => c.name === "bob");
+      return ch && ch.subscribed === false ? true : null;
+    },
+    3000,
+    25,
+  );
+  expect(disconnected).toBe(true);
+
+  const sent = await runBusCli(["chat", "send", "bob", "to the void"]);
+  expect(sent.code).toBe(1);
+  expect(sent.stderr).toContain("not_connected");
+  expect(sent.stdout).toBe("");
+});
+
+test("CLI send to an UNKNOWN name fails loud: exit 1 + `unknown_target` on stderr", async () => {
+  await bootBus();
+  const sent = await runBusCli(["chat", "send", "nobody-here", "hi"]);
+  expect(sent.code).toBe(1);
+  expect(sent.stderr).toContain("unknown_target");
+  expect(sent.stdout).toBe("");
+});
+
+test("CLI broadcast prints a recipient count and exits 0", async () => {
+  await bootBus();
+  const bob = await connectClient();
+  await registerAndSubscribe(bob, "bob", "sess-bob", "t-bob");
+
+  const sent = await runBusCli(["chat", "broadcast", "all hands"]);
+  expect(sent.code).toBe(0);
+  expect(sent.stdout).toMatch(/broadcast to \d+ recipient/);
+
+  bob.socket.end();
+});
+
+test("`keeper bus resolve` is gone — the CLI rejects it as an unknown verb (exit 1)", async () => {
+  await bootBus();
+  const r = await runBusCli(["resolve", "bob"]);
+  expect(r.code).toBe(1);
+  expect(r.stderr).toContain("unknown bus verb");
 });
 
 test("live registration resolves the channel identity to the keeper HARNESS title, not the bare connecting pid", async () => {

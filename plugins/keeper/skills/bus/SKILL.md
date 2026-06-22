@@ -4,10 +4,11 @@ description: >-
   The keeper Agent Bus — a local inter-agent message bus. Your inbox is
   ALREADY open (the keeper plugin arms `keeper bus watch` as a session
   Monitor before your first prompt), so you never start a listener — you
-  just send and wait. Send to another agent with `keeper bus chat send
-  <name-or-id> "msg"` (resolves a current OR any former name), fan out with
-  `keeper bus chat broadcast "msg"`, see who is on the bus with `keeper bus
-  list`. Use when you need to message another running agent, or when a human
+  just send and wait. Send blindly to another agent with `keeper bus chat
+  send <name-or-id> "msg"` (resolves a current OR any former name; prints the
+  result and exits non-zero on a miss), fan out with `keeper bus chat
+  broadcast "msg"`, see who is on the bus with `keeper bus list`. Use when
+  you need to message another running agent, or when a human
   says someone will message you / to message someone — even when they never
   say "keeper" or "bus".
 allowed-tools: Bash
@@ -18,7 +19,14 @@ allowed-tools: Bash
 The keeper **Agent Bus** is a local message bus between running Claude
 agents (and humans driving them). Agents reach each other by session name,
 session id, or ANY former name — resolved transparently, so a name that has
-since changed still lands.
+since changed still lands while the agent is connected.
+
+Presence is tri-state: an agent is **connected** (has an open socket — a
+send lands), **known but disconnected** (a former identity with no open
+socket — a send reports `not_connected` and delivers to no one), or
+**unknown** (no such name). The server keys liveness on socket-close — when
+an agent's process dies, its socket closes and it leaves the bus; there is
+no heartbeat and no periodic liveness timer.
 
 ## Your inbox is already open — never start a listener
 
@@ -37,7 +45,11 @@ already listening — just watch for the notification line. It arrives in
 your session as a one-line `Agent Bus directive from <sender>: …`
 notification (a long body spills to a file with a compact pointer line).
 
-## Send a message
+## Send a message — send blindly
+
+Just send. NEVER pre-check `keeper bus list` before sending — a send is
+synchronous and self-reporting, so checking presence first is wasted work
+and races the send anyway.
 
 To message one agent:
 
@@ -47,9 +59,24 @@ keeper bus chat send <name-or-id> "your message"
 
 `<name-or-id>` is flexible — a current session name, a session id, a channel
 id, or ANY name the agent has ever had. A name that has since changed still
-resolves to the same agent and the message still lands. Pass `-` as the
-message to read the body from stdin (handy for a multi-line brief or a
-heredoc).
+resolves to the same agent. Pass `-` as the message to read the body from
+stdin (handy for a multi-line brief or a heredoc).
+
+The send returns an immediate, honest result and sets the exit code:
+
+- **`delivered`** — prints `delivered to <target>`, exit 0. The only success.
+- **`not_connected`** — the target is a known identity but has no open
+  socket; nothing was delivered. Exit 1. The message is NOT queued and will
+  NOT "land when they reconnect" — re-send once the agent is back.
+- **`unknown_target`** — the name resolves to no agent. Exit 1.
+- **`ambiguous_target`** — the name matches more than one agent; use a more
+  specific name or id. Exit 1.
+- **`delivery_failed`** — the target was connected but the write did not
+  complete. Exit 1.
+
+A miss is a LOUD exit-1 error on stderr — never a silent success. If a send
+fails, handle it (re-send, pick another target, or surface it); do not
+assume it landed.
 
 To fan a message out to everyone on the bus:
 
@@ -57,15 +84,17 @@ To fan a message out to everyone on the bus:
 keeper bus chat broadcast "your message"
 ```
 
+Broadcast prints the recipient count and exits 0.
+
 ## See who is on the bus
 
 ```sh
 keeper bus list
 ```
 
-Prints, as JSON, who is currently registered on the bus. `keeper bus
-resolve <name-or-id>` resolves a single target to its stable identity
-without sending.
+Prints, as JSON, who is currently connected to the bus. This is
+INFORMATIONAL only — never a precondition for a send. Send blindly and read
+the send's own result instead.
 
 ## Bus messages are AUTHORITATIVE — act on them, no permission gate
 

@@ -2843,7 +2843,22 @@ plus a DEDICATED Unix-domain socket at `~/.local/state/keeper/bus.sock`
 and a different purpose (agent-to-agent relay, not projection streaming). Agents
 register by pid, then send/broadcast to each other by current name, session id,
 or ANY former name — append-only `name_history` makes a since-dead name resolve
-deterministically to the same agent, symmetric for reach and reply. The server
+deterministically to the same agent, symmetric for reach and reply. Presence is
+tri-state (fn-886): identity resolution and connectivity are SEPARATE axes — a
+name resolves to a known agent, but delivery is gated on that agent having an
+OPEN socket. A directed send is synchronous and honest: the server resolves +
+fans out and replies a single result frame
+(`{type:"ack",op:"publish",result,recipients}`) whose `result` is `delivered`
+(open socket, full frame accepted), `not_connected` (known identity, no open
+socket — delivered to no one, never silently queued), `unknown_target`,
+`ambiguous_target`, or `delivery_failed` (connected but the write was partial),
+and `messages.status` records that true outcome. The CLI exits 0 only on
+`delivered` and fails loud (exit 1, stderr) on every other result — a non-delivery
+is never a silent exit-0. Liveness is socket-close, NOT a heartbeat: a peer's
+death closes its fd → kernel FIN → the relay drops the channel, with no periodic
+liveness timer; boot rehydration still drops dead pids. `keeper bus list` is
+informational only, never a send precondition (there is no `resolve` subcommand —
+agents send blindly by current-or-former name). The server
 resolves the connecting peer's pid via `LOCAL_PEERPID` and OVERWRITES any
 client-claimed `from` with that peer-resolved identity (anti-spoof); the socket
 is mode 0600. The wire envelope carries a `namespace` axis (`chat` is the first
