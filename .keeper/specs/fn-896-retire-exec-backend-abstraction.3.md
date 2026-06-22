@@ -36,5 +36,5 @@ config tests: drop the `execBackend`/`exec_backend` tests (config.test.ts:52-105
 - [ ] config + boot-check tests green.
 
 ## Done summary
-
+Removed the exec_backend config toggle (VALID_EXEC_BACKENDS + execBackend field/parse/warn); a stale exec_backend: key now silently ignored. Added a fail-fast checkAgentwrapPresence boot check (gated on want(autopilot)) that logs the resolved agentwrap path and warns prominently if missing without hard-exiting.
 ## Evidence

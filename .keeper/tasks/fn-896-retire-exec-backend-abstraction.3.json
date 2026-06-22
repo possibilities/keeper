@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "remove config toggle and add boot check",
-  "updated_at": "2026-06-22T19:42:30.791000Z"
+  "updated_at": "2026-06-22T20:27:43.518000Z",
+  "worker_done_at": "2026-06-22T20:27:43.518000Z"
 }
