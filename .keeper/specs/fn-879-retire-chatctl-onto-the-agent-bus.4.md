@@ -41,5 +41,5 @@ The Quick commands in the epic spec are the verification checklist; all must pas
 - [ ] a fresh session arms only the keeper-bus monitor (no chatctl monitor)
 
 ## Done summary
-
+Rewrote CLAUDE.md + claude/CLAUDE.md inter-agent guidance to point at the keeper Agent Bus (keeper bus chat send/broadcast/list, already-armed inbox monitor) and ran the final teardown sweep: grep chatctl clean, no chatctl daemon, workspace resolves, bus bundle renders.
 ## Evidence
