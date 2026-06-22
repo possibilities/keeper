@@ -44,5 +44,5 @@ Autopilot: a task whose resolved cwd is missing-on-disk is marked blocked-with-r
 - [ ] keeper lint (bun) + `bun test` green
 
 ## Done summary
-
+Both dispatch producers (CLI resolvePlanCwd + autopilot reconcile launch arm) now stat the resolved cwd and fail loud on a renamed-away dir: the CLI exits 1 with 'cwd-missing: <path>' and the reconciler mints a sticky cwd-missing DispatchFailed via the existing dispatch_failures surface (no new src/db.ts column), so unrelated epics keep dispatching. The stat lives in producer paths only, never a fold.
 ## Evidence
