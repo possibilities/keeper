@@ -47,5 +47,5 @@ Add bun:test coverage: `wait-for-stop` blocks until a stop event appears in a fi
 - [ ] bun:test covers both subcommands per backend.
 
 ## Done summary
-
+Added agentwrap wait-for-stop + show-last-message subcommands (per-backend final-message extraction for claude/codex/pi) and removed the --wait-for-stop launch flag; detached launch returns the handle JSON consumed by the verbs.
 ## Evidence
