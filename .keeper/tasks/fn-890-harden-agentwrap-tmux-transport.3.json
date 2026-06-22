@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/agentwrap",
   "tier": "high",
   "title": "caller env injection flag",
-  "updated_at": "2026-06-22T17:35:20.322000Z"
+  "updated_at": "2026-06-22T18:02:15.201000Z",
+  "worker_done_at": "2026-06-22T18:02:15.201000Z"
 }

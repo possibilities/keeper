@@ -43,5 +43,5 @@ Direct-call tests on `parseAgentwrapTmuxArgs` (new describe block — none exist
 - [ ] `bun lint && bun typecheck && bun test` green; `AGENTWRAP_HELP` lists the new flag at the existing column alignment.
 
 ## Done summary
-
+Added repeatable --agentwrap-tmux-env KEY=VALUE flag injecting validated caller env into the pane via tmux -e on both new-session and new-window; LD_*/DYLD_* and malformed keys rejected as bad-args, control chars stripped, consumed in the tmux pre-pass so it never leaks into the inner agent argv.
 ## Evidence
