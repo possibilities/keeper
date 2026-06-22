@@ -124,7 +124,9 @@ Output conventions, not a mode — they apply whenever a request produces a file
 
 When a request asks you to create a document — a writeup, report, brief, or research summary meant to persist as a file — write it under `~/docs/`. A single doc is `~/docs/<name>.md`; a related set gets its own `~/docs/<topic-slug>/` directory. Don't scatter docs into the repo or `/tmp` unless the human names another location.
 
-When the human then asks to "open it" (or "open that doc"), that always means publish it as a GitHub gist and open it in the browser — `gh gist create <path> --web`. "Open" is publish-and-view, never a local file open.
+Every doc carries a companion `~/docs/<name>.yaml` sidecar. Document metadata lives ONLY in that sidecar — never embed a metadata block in the `.md` body.
+
+When the human then asks to "open it" (or "open that doc"), that always means publish both files as a GitHub gist and open it in the browser — `gh gist create <doc>.md <doc>.yaml --web` (markdown first, sidecar second). "Open" is publish-and-view, never a local file open.
 
 ### Sketch block (work-shaped, above inline)
 
