@@ -159,6 +159,58 @@ export function drainToCompletion(
   let remainingPaceEvents = options.paceEvents ?? 0;
   const paceMs = options.paceMs ?? 0;
   const sleep = options.sleep;
+  // In-drain WAL checkpoint accounting (boot only — at steady state the drain is
+  // a few events and the gates never trip). The boot drain runs with
+  // `wal_autocheckpoint=0`, so without this the WAL grows for the whole re-fold.
+  // The PASSIVE rides BETWEEN batches, i.e. between per-event `BEGIN IMMEDIATE`
+  // transactions — never inside a fold — so it cannot contend its own write lock
+  // and the drain's cursor+projection co-advance is untouched. `walPath` is
+  // null-safe for `:memory:` / unnamed DBs (the size gate then degrades to the
+  // event-count gate alone).
+  const walPath =
+    db.filename && db.filename !== ":memory:" ? `${db.filename}-wal` : null;
+  let eventsSinceCheckpoint = 0;
+  const maybeCheckpoint = (): void => {
+    const sizeTripped =
+      walPath !== null &&
+      (() => {
+        try {
+          return statSync(walPath).size >= BOOT_DRAIN_CHECKPOINT_WAL_BYTES;
+        } catch {
+          // `-wal` absent (nothing written yet) or unreadable: no size pressure.
+          return false;
+        }
+      })();
+    if (
+      eventsSinceCheckpoint < BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL &&
+      !sizeTripped
+    ) {
+      return;
+    }
+    eventsSinceCheckpoint = 0;
+    try {
+      // PASSIVE returns immediately if a writer holds the lock and only flushes
+      // already-committed frames; it never blocks the drain. Mirror the
+      // steady-state heartbeat call-site: read the result, log it, swallow errors
+      // (a checkpoint miss is pure space reclamation loss, never correctness).
+      const result = db.query("PRAGMA wal_checkpoint(PASSIVE)").get() as {
+        busy: number;
+        log: number;
+        checkpointed: number;
+      } | null;
+      if (result) {
+        console.error(
+          `[keeperd] boot-drain PASSIVE checkpoint: busy=${result.busy} log=${result.log} checkpointed=${result.checkpointed}`,
+        );
+      }
+    } catch (err) {
+      console.error(
+        `[keeperd] boot-drain PASSIVE checkpoint threw (non-fatal): ${
+          err instanceof Error ? err.message : String(err)
+        }`,
+      );
+    }
+  };
   for (;;) {
     const batchOptions: DrainOptions =
       paceMs > 0 && (remainingPaceEvents > 0 || (options.paceEvents ?? 0) === 0)
@@ -176,6 +228,8 @@ export function drainToCompletion(
     if (remainingPaceEvents > 0) {
       remainingPaceEvents -= Math.min(remainingPaceEvents, folded);
     }
+    eventsSinceCheckpoint += folded;
+    maybeCheckpoint();
   }
 }
 
@@ -203,6 +257,30 @@ export const BOOT_DRAIN_PACE_MS = 5;
  * re-fold pays before catching up to head.
  */
 export const BOOT_DRAIN_PACE_EVENTS = 500;
+
+/**
+ * In-drain WAL-checkpoint cadence (folded-event count). The boot drain runs with
+ * `wal_autocheckpoint=0` (see {@link withBootDrainCheckpointTuning}), so without a
+ * periodic flush the WAL grows for the WHOLE drain — a from-scratch re-fold of
+ * ~150k one-event transactions ballooned the WAL to multiple GB before the single
+ * final TRUNCATE. {@link drainToCompletion} issues a `wal_checkpoint(PASSIVE)`
+ * once this many events have folded since the last in-drain checkpoint, bounding
+ * peak WAL to roughly one interval's worth of frames. Gated on COUNT (not
+ * per-event) so the millions of near-no-op checkpoints a per-event cadence would
+ * cost never dominate drain time. The PASSIVE runs BETWEEN per-event
+ * transactions on the writer connection, never inside a fold's `BEGIN IMMEDIATE`.
+ */
+export const BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL = 10_000;
+
+/**
+ * In-drain WAL-checkpoint size gate (`-wal` file bytes ≈ 50k pages × 4 KiB). The
+ * secondary trigger to {@link BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL}: a burst of
+ * large event bodies can grow the WAL past this before the event counter trips,
+ * so {@link drainToCompletion} also checkpoints once the `-wal` file crosses this
+ * size — whichever fires first. The stat runs at batch boundaries only (~once per
+ * `DEFAULT_BATCH_SIZE` folds), never per-event.
+ */
+export const BOOT_DRAIN_CHECKPOINT_WAL_BYTES = 50_000 * 4096;
 
 /**
  * TTL (ms) for an open `pending_dispatches` row before the producer-side sweep

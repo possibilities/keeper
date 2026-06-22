@@ -13,6 +13,7 @@ import {
   mkdtempSync,
   readFileSync,
   rmSync,
+  statSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -23,6 +24,8 @@ import {
 } from "../src/backstop-telemetry";
 import {
   ALL_WORKERS,
+  BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL,
+  BOOT_DRAIN_CHECKPOINT_WAL_BYTES,
   BOOT_DRAIN_PACE_EVENTS,
   BOOT_DRAIN_PACE_MS,
   buildPendingDispatchSweepRecords,
@@ -235,6 +238,81 @@ test("withBootDrainCheckpointTuning still folds the boot backlog to completion",
 
   db.close();
 });
+
+test("boot drain checkpoints the WAL periodically so peak stays bounded, and the final TRUNCATE collapses it", () => {
+  // The in-drain PASSIVE is gated on a folded-event count (or `-wal` size),
+  // so the backlog must cross the real interval several times. With
+  // `wal_autocheckpoint=0` and NO in-drain checkpoint, the `-wal` file
+  // high-water would grow with the total drain length; the periodic PASSIVE
+  // caps it near the size-gate ceiling regardless of how long the drain runs.
+  // The `-wal` file never shrinks mid-drain, so its final size IS the peak
+  // high-water the drain reached.
+  const interval = BOOT_DRAIN_CHECKPOINT_EVENT_INTERVAL;
+
+  const walHigh = (path: string): number =>
+    existsSync(`${path}-wal`) ? statSync(`${path}-wal`).size : 0;
+
+  // Drive a synthetic backlog through `drainToCompletion`, returning the
+  // peak `-wal` file size reached during the drain (captured at the end of the
+  // wrapper body, BEFORE its final TRUNCATE) and the post-TRUNCATE size.
+  const driveDrain = (
+    path: string,
+    total: number,
+  ): { folded: number; peakWalBytes: number; postTruncateWalBytes: number } => {
+    const { db } = openDb(path);
+    db.run("BEGIN");
+    for (let i = 1; i <= total; i += 1) {
+      db.run(
+        `INSERT INTO events (ts, session_id, pid, hook_event, event_type, permission_mode, data)
+           VALUES (?, ?, 4242, 'SessionStart', 'lifecycle', NULL, '{}')`,
+        [i, `sess-${i}`],
+      );
+    }
+    db.run("COMMIT");
+
+    let peakWalBytes = 0;
+    withBootDrainCheckpointTuning(db, () => {
+      drainToCompletion(db);
+      peakWalBytes = walHigh(path);
+    });
+    const folded = (
+      db
+        .query("SELECT last_event_id FROM reducer_state WHERE id = 1")
+        .get() as {
+        last_event_id: number;
+      }
+    ).last_event_id;
+    const postTruncateWalBytes = walHigh(path);
+    db.close();
+    return { folded, peakWalBytes, postTruncateWalBytes };
+  };
+
+  // A control backlog JUST UNDER the interval never trips the in-drain gate.
+  const controlDir = mkdtempSync(join(tmpdir(), "keeper-wal-control-"));
+  const control = driveDrain(
+    join(controlDir, "keeper.db"),
+    Math.floor(interval * 0.9),
+  );
+  rmSync(controlDir, { recursive: true, force: true });
+  expect(control.peakWalBytes).toBeGreaterThan(0);
+
+  // The large backlog spans several intervals — the in-drain PASSIVE fires
+  // repeatedly, so its peak WAL must NOT scale up with the extra length.
+  const total = interval * 3;
+  const large = driveDrain(dbPath, total);
+
+  // Every event folded — the periodic checkpoint never disturbed the cursor.
+  expect(large.folded).toBe(total);
+
+  // Peak stays bounded near the size-gate ceiling even though the backlog is
+  // ~5.5× the control's. A linear, un-checkpointed WAL would balloon past the
+  // ceiling; the periodic PASSIVE caps the high-water within the size gate plus
+  // a single between-checkpoint interval of growth.
+  expect(large.peakWalBytes).toBeLessThan(BOOT_DRAIN_CHECKPOINT_WAL_BYTES * 2);
+
+  // The final TRUNCATE in the wrapper collapsed the WAL file to empty.
+  expect(large.postTruncateWalBytes).toBe(0);
+}, 30_000);
 
 test("boot drain spanning multiple batches catches up every event", () => {
   const { db } = openDb(dbPath);
