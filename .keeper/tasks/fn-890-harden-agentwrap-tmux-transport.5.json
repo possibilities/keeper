@@ -1,0 +1,16 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T17:35:20.322000Z",
+  "depends_on": [
+    "fn-890-harden-agentwrap-tmux-transport.2",
+    "fn-890-harden-agentwrap-tmux-transport.4"
+  ],
+  "epic": "fn-890-harden-agentwrap-tmux-transport",
+  "id": "fn-890-harden-agentwrap-tmux-transport.5",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/agentwrap",
+  "tier": "high",
+  "title": "stripped-env verification harness",
+  "updated_at": "2026-06-22T17:35:20.322000Z"
+}

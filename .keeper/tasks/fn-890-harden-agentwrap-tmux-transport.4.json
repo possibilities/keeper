@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T17:35:20.322000Z",
+  "depends_on": [
+    "fn-890-harden-agentwrap-tmux-transport.3"
+  ],
+  "epic": "fn-890-harden-agentwrap-tmux-transport",
+  "id": "fn-890-harden-agentwrap-tmux-transport.4",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/agentwrap",
+  "tier": "high",
+  "title": "run artifact GC and no-artifacts",
+  "updated_at": "2026-06-22T17:35:20.322000Z"
+}
