@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T03:49:04.662000Z",
+  "depends_on": [],
+  "epic": "fn-882-fix-cross-repo-plan-id-resolution",
+  "id": "fn-882-fix-cross-repo-plan-id-resolution.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "resolve plan ids cwd-then-global in id-addressed verbs",
+  "updated_at": "2026-06-22T03:49:04.662000Z"
+}
