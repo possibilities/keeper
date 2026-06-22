@@ -13,5 +13,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "re-bake /hack, run install, verify end-to-end",
-  "updated_at": "2026-06-22T15:32:02.477000Z"
+  "updated_at": "2026-06-22T18:31:10.477000Z",
+  "worker_done_at": "2026-06-22T18:31:10.477000Z"
 }

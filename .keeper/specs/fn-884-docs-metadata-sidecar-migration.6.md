@@ -29,5 +29,5 @@ End-to-end smoke after install: (a) the harness `/hack` copies show the new gist
 - [ ] working trees committed per-repo
 
 ## Done summary
-
+Re-baked the docs-dir-and-gist-open snippet into /hack SKILL.md byte-for-byte, ran install.sh to deploy final state (codex/pi /hack reflect new gist command), and verified end-to-end: keeper hook writes the .yaml sidecar (not an md block) and arthack post_tool_use no longer stamps docs.
 ## Evidence
