@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "plan-plugin TS codemod (planctl rename)",
-  "updated_at": "2026-06-22T22:42:19.071000Z"
+  "updated_at": "2026-06-22T23:25:20.394000Z",
+  "worker_done_at": "2026-06-22T23:25:20.394000Z"
 }

@@ -34,5 +34,5 @@ The plan slow suite (`PLANCTL_RUN_SLOW=1 bun test` in plugins/plan) + the .1 lin
 - [ ] plan slow suite green
 
 ## Done summary
-
+AST-renamed plan-plugin invocation-builder symbols buildPlanctlInvocation/buildPlanctlInvocationReadonly to buildPlanInvocation/buildPlanInvocationReadonly across all call sites and imports; frozen Planctl-* trailer literals and user-facing CLI strings left untouched. One atomic mechanical commit; plan slow suite green except 7 pre-existing consistency-skills failures outside scope.
 ## Evidence
