@@ -45,7 +45,12 @@ import {
   buildTimeoutRecord,
 } from "./backstop-telemetry";
 import { openDb } from "./db";
-import { type PaneInfo, resolveExecBackend } from "./exec-backend";
+import { defaultPlanPrompt } from "./dispatch-command";
+import {
+  type LaunchSpec,
+  type PaneInfo,
+  resolveExecBackend,
+} from "./exec-backend";
 import {
   computeReadiness,
   isRootOccupant,
@@ -254,11 +259,35 @@ export function buildWorkerCommand(
   const cdPrefix = projectDir === "" ? "" : `cd ${projectDir} && `;
   const flags: string[] = [];
   // Both verbs launch at max effort.
-  flags.push("--model", "sonnet", "--effort", "max");
+  flags.push("--model", WORKER_MODEL, "--effort", WORKER_EFFORT);
   flags.push("--agentwrap-no-confirm");
   // `--name <key>` adjacency is load-bearing for reap/classify parsing.
   flags.push("--name", `${verb}::${id}`);
   return `${cdPrefix}claude ${flags.join(" ")} '/plan:${verb} ${id}'`;
+}
+
+/** Worker `--model` / `--effort` — the single source of truth shared by the
+ *  shell-wrapped `buildWorkerCommand` (tmux backend) and the structured
+ *  {@link buildPlannedLaunchSpec} (agentwrap backend) so both backends launch
+ *  workers identically. */
+export const WORKER_MODEL = "sonnet" as const;
+export const WORKER_EFFORT = "max" as const;
+
+/**
+ * Build the structured {@link LaunchSpec} for a planned launch — the unwrapped
+ * inputs the agentwrap backend builds its invocation from (the tmux backend
+ * ignores it and execs the shell-wrapped `workerCommand`). Mirrors
+ * {@link buildWorkerCommand}'s flag choices EXACTLY (same model/effort/name/
+ * prompt) so a worker launches identically under either backend. Pure —
+ * exported for tests.
+ */
+export function buildPlannedLaunchSpec(verb: Verb, id: string): LaunchSpec {
+  return {
+    prompt: defaultPlanPrompt(verb, id),
+    claudeName: dispatchKey(verb, id),
+    model: WORKER_MODEL,
+    effort: WORKER_EFFORT,
+  };
 }
 
 /** Compose the canonical `${verb}::${id}` key. */
@@ -462,8 +491,16 @@ export interface ReconcileDecision {
  * — no real worker spawn).
  */
 export interface ConfirmRunningDeps {
-  /** Spawn the worker argv in a tmux window keyed by `name`. */
-  launch(argv: string[], name: string, cwd: string): Promise<LaunchResult>;
+  /** Spawn the worker in a managed window keyed by `name`. The tmux backend
+   *  execs the pre-wrapped `argv`; the agentwrap backend ignores `argv` and
+   *  builds its own invocation from `spec`. `spec` is threaded for every launch
+   *  so the configured backend (tmux or agentwrap) gets what it needs. */
+  launch(
+    argv: string[],
+    name: string,
+    cwd: string,
+    spec?: LaunchSpec,
+  ): Promise<LaunchResult>;
   /**
    * Emit a synthetic `DispatchFailed` event onto the writable connection
    * (via the parent thread — workers never write the DB). Carries the
@@ -535,8 +572,14 @@ export interface ConfirmRunningDeps {
   ceilingMs?: number;
 }
 
-/** Reuse the backend's launch envelope shape. */
-export type LaunchResult = { ok: true } | { ok: false; error: string };
+/** Reuse the backend's launch envelope shape. The `retryable` discriminant on a
+ *  failure routes a TRANSIENT launch fail (agentwrap exit 4 / timeout-kill /
+ *  bad-path) to `"indoubt"` (keep the pending row → TTL→`DispatchExpired`
+ *  re-dispatch) instead of a sticky `"failed"` — kept byte-identical to
+ *  `exec-backend.ts`'s `LaunchResult`. */
+export type LaunchResult =
+  | { ok: true }
+  | { ok: false; error: string; retryable?: boolean };
 
 /** Found-job payload from `findJob`. */
 export interface FoundJob {
@@ -1047,6 +1090,7 @@ export async function confirmRunning(
   id: string,
   cwd: string,
   argv: string[],
+  spec: LaunchSpec,
   signal: AbortSignal,
   deps: ConfirmRunningDeps,
 ): Promise<ConfirmOutcome> {
@@ -1083,14 +1127,31 @@ export async function confirmRunning(
     // Shutdown raced the ack. Abort before the side-effect.
     return "aborted-prelaunch";
   }
-  // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`.
-  const launchResult: LaunchResult | { ok: false; error: string } = await deps
-    .launch(argv, key, cwd)
+  // 3. Launch — ONLY after the durable `dispatched-ack{ok:true}`. `spec` is the
+  // structured-input the agentwrap backend builds its invocation from; the tmux
+  // backend ignores it and execs the pre-wrapped `argv`.
+  const launchResult: LaunchResult = await deps
+    .launch(argv, key, cwd, spec)
     .catch((err) => ({
       ok: false as const,
+      // A thrown launch is a PERMANENT (sticky) fail — `retryable` absent.
       error: `launch threw: ${err instanceof Error ? err.message : String(err)}`,
     }));
   if (launchResult.ok === false) {
+    if (launchResult.retryable === true) {
+      // TRANSIENT launch fail (agentwrap exit 4 / timeout-kill / bad-path). Do
+      // NOT mint a sticky `DispatchFailed` — KEEP the `pending_dispatches` row
+      // so the TTL sweep mints `DispatchExpired` and the normal expire path
+      // re-dispatches. This routes EXACTLY like the ceiling `"indoubt"` outcome:
+      // a transient that never binds feeds the K=3 never-bound breaker (bounded
+      // retry → sticky), while a PERMANENT fail below skips the counter entirely.
+      deps.recordTimeoutBackstop?.({ rescued: true, stalenessMs: 0 });
+      return "indoubt";
+    }
+    // PERMANENT launch fail (agentwrap exit 3/1/2, a tmux backend failure, or a
+    // thrown launch): a sticky `DispatchFailed`, cleared only by a human
+    // `retry_dispatch`. Must NOT feed the never-bound counter as a transient
+    // would.
     deps.emitDispatchFailed({
       verb,
       id,
@@ -1195,12 +1256,14 @@ export async function runReconcileCycle(
       state.finalizerGuard.set(plan.id, deps.now());
     }
     const argv = buildLaunchArgv(shell, plan.workerCommand);
+    const spec = buildPlannedLaunchSpec(plan.verb, plan.id);
     try {
       const outcome = await confirmRunning(
         plan.verb,
         plan.id,
         plan.cwd,
         argv,
+        spec,
         signal,
         deps,
       );
@@ -1712,7 +1775,7 @@ function main(): void {
   // a DispatchFailed is described to main via `postMessage` (main is the
   // sole writer of the synthetic event, mirroring the git-worker mint).
   const deps: ConfirmRunningDeps = {
-    launch: (argv, name, cwd) => backend.launch(argv, name, cwd),
+    launch: (argv, name, cwd, spec) => backend.launch(argv, name, cwd, spec),
     emitDispatchFailed: (payload) => {
       parentPort?.postMessage({
         kind: "dispatch-failed",

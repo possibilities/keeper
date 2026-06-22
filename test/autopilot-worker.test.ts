@@ -35,6 +35,7 @@ import { join } from "node:path";
 import { computeEligibleEpics } from "../src/armed-closure";
 import {
   buildLaunchArgv,
+  buildPlannedLaunchSpec,
   buildWorkerCommand,
   type ConfirmRunningDeps,
   confirmRunning,
@@ -63,12 +64,15 @@ import {
   sweepFinalizerGuard,
   sweepRedispatchCooldown,
   verbForVerdict,
+  WORKER_EFFORT,
+  WORKER_MODEL,
 } from "../src/autopilot-worker";
 import {
   PENDING_DISPATCH_SWEEP_INTERVAL_MS,
   PENDING_DISPATCH_TTL_MS,
 } from "../src/daemon";
 import { openDb } from "../src/db";
+import type { LaunchSpec } from "../src/exec-backend";
 import {
   computeReadiness,
   type PendingDispatch,
@@ -197,7 +201,12 @@ function makeState(overrides: Partial<ReconcileState> = {}): ReconcileState {
 
 // A simple deps factory that records all interactions.
 interface FakeDepsLog {
-  launches: Array<{ argv: string[]; name: string; cwd: string }>;
+  launches: Array<{
+    argv: string[];
+    name: string;
+    cwd: string;
+    spec?: LaunchSpec;
+  }>;
   emissions: DispatchFailedPayload[];
   dispatchedEmissions: DispatchedPayload[];
   findJobCalls: Array<{ verb: string; id: string; watermark: number }>;
@@ -209,7 +218,12 @@ interface FakeDepsLog {
 }
 
 interface FakeDepsOptions {
-  launch?: (argv: string[], name: string, cwd: string) => Promise<LaunchResult>;
+  launch?: (
+    argv: string[],
+    name: string,
+    cwd: string,
+    spec?: LaunchSpec,
+  ) => Promise<LaunchResult>;
   /**
    * Map of `${verb}::${id}` → FoundJob | null. Returned only when the
    * call's `last_event_id_gt < hit.last_event_id` (so the watermark
@@ -256,10 +270,10 @@ function makeFakeDeps(opts: FakeDepsOptions = {}): {
         })();
 
   const deps: ConfirmRunningDeps = {
-    async launch(argv, name, cwd) {
-      log.launches.push({ argv: [...argv], name, cwd });
+    async launch(argv, name, cwd, spec) {
+      log.launches.push({ argv: [...argv], name, cwd, spec });
       if (opts.launch) {
-        return opts.launch(argv, name, cwd);
+        return opts.launch(argv, name, cwd, spec);
       }
       return { ok: true };
     },
@@ -1920,6 +1934,7 @@ test("confirmRunning GOOD: job appears before ceiling → ok, no emission", asyn
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -1949,6 +1964,7 @@ test("confirmRunning IN-DOUBT (fn-724): launch.ok + ceiling elapses, NO jobs row
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -1984,6 +2000,7 @@ test("confirmRunning ceiling-hit: posts a timeout rescue with elapsedMs stalenes
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2018,6 +2035,7 @@ test("confirmRunning pre-ceiling confirm: bumps the rescued:false denominator (n
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2045,6 +2063,7 @@ test("confirmRunning aborted: no timeout-backstop record (shutdown is not a resc
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2066,6 +2085,7 @@ test("confirmRunning BAD: launch returns {ok:false} → failed immediately with 
     "fn-1-foo.1",
     "/repo",
     ["sh"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2074,6 +2094,54 @@ test("confirmRunning BAD: launch returns {ok:false} → failed immediately with 
   expect(log.emissions[0]?.reason).toBe("tmux ENOENT");
   // No poll loop touched.
   expect(log.findJobCalls.length).toBe(0);
+});
+
+test("confirmRunning TRANSIENT (agentwrap): launch {ok:false, retryable:true} → indoubt, NO DispatchFailed, pending row kept", async () => {
+  // The agentwrap exit-4 / timeout-kill / bad-path class. A transient launch
+  // fail must NOT mint a sticky DispatchFailed (that writes off a recoverable
+  // launch) and must NOT route as "failed" (which would clear the cooldown +
+  // never feed the TTL→DispatchExpired→never-bound machinery). It routes EXACTLY
+  // like the ceiling "indoubt": keep the pending_dispatches row, emit nothing.
+  const { deps, log } = makeFakeDeps({
+    launch: async () => ({
+      ok: false,
+      error: "agentwrap launch transient (exit 4 RETRYABLE)",
+      retryable: true,
+    }),
+  });
+  const ctrl = new AbortController();
+  const outcome = await confirmRunning(
+    "work",
+    "fn-1-foo.1",
+    "/repo",
+    ["sh"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
+    ctrl.signal,
+    deps,
+  );
+  expect(outcome).toBe("indoubt");
+  // NO sticky DispatchFailed — the pending row survives to the TTL sweep.
+  expect(log.emissions).toEqual([]);
+  // The dispatched mint still happened exactly once (intent before launch).
+  expect(log.dispatchedEmissions.length).toBe(1);
+  // No poll loop — the transient short-circuits before the ceiling poll.
+  expect(log.findJobCalls.length).toBe(0);
+});
+
+test("buildPlannedLaunchSpec: mirrors buildWorkerCommand's model/effort/name/prompt", () => {
+  const spec = buildPlannedLaunchSpec("work", "fn-1-foo.1");
+  expect(spec).toEqual({
+    prompt: "/plan:work fn-1-foo.1",
+    claudeName: "work::fn-1-foo.1",
+    model: WORKER_MODEL,
+    effort: WORKER_EFFORT,
+  });
+  // The shell-wrapped worker command carries the SAME pieces (lockstep guard).
+  const cmd = buildWorkerCommand("work", "fn-1-foo.1", "/repo");
+  expect(cmd).toContain(`--model ${WORKER_MODEL}`);
+  expect(cmd).toContain(`--effort ${WORKER_EFFORT}`);
+  expect(cmd).toContain("--name work::fn-1-foo.1");
+  expect(cmd).toContain("/plan:work fn-1-foo.1");
 });
 
 test("confirmRunning: watermark captured BEFORE launch (excludes stale terminal rows)", async () => {
@@ -2097,6 +2165,7 @@ test("confirmRunning: watermark captured BEFORE launch (excludes stale terminal 
     "fn-1-foo.1",
     "/repo",
     ["sh"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2118,6 +2187,7 @@ test("confirmRunning ABORTED: shutdown signal during poll → aborted-postlaunch
     "fn-1-foo.1",
     "/repo",
     ["sh"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2158,6 +2228,7 @@ test("confirmRunning (fn-724): launch() is NOT called until the dispatched-ack r
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2189,6 +2260,7 @@ test("confirmRunning (fn-724): ack {ok:false} → no launch, aborted-prelaunch, 
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );
@@ -2218,6 +2290,7 @@ test("confirmRunning (fn-724): ack-wait that never resolves → aborted on signa
     "fn-1-foo.1",
     "/repo",
     ["sh", "-c", "true"],
+    { prompt: "/plan:work fn-1-foo.1", claudeName: "work::fn-1-foo.1" },
     ctrl.signal,
     deps,
   );

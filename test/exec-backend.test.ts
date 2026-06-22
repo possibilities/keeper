@@ -10,9 +10,16 @@
  *    `focusPane` id-based select-window+select-pane, `ensureLaunched` per-call
  *    session + restore `-n` seam, the timeout-kill degrade, and ENOENT/non-zero
  *    failure envelopes.
- *  - `resolveExecBackend` returns the tmux backend for EVERY tag (tmux, unknown,
- *    legacy `zellij`, absent) and tolerates an undefined session via
- *    `MANAGED_EXEC_SESSION`.
+ *  - The agentwrap backend — `buildAgentwrapLaunchArgv` (byte-pinned contract
+ *    invocation), `parseAgentwrapStdout` (line-scan, schema_version check,
+ *    empty/non-JSON/missing-field), `mapAgentwrapExit` (the central
+ *    0/1/2/3/4 + timeout exit-map), `createAgentwrapBackend.launch`
+ *    (launch→parse→exit-map→outcome, worker-cwd-on-spawn, missing-spec guard),
+ *    the spec-gated `ensureLaunched`, and the shared (tmux-delegated) pane ops.
+ *  - `resolveExecBackend` returns the agentwrap backend for `agentwrap`+path,
+ *    falls back to tmux (loudly) without a path, and returns the tmux backend for
+ *    EVERY other tag (tmux, unknown, legacy `zellij`, absent), tolerating an
+ *    undefined session via `MANAGED_EXEC_SESSION`.
  *  - `execBackendEnvMeta` returns the tmux env-var names, including the
  *    fall-through for unknown backends.
  *
@@ -22,6 +29,8 @@
 
 import { expect, test } from "bun:test";
 import {
+  AGENTWRAP_SCHEMA_VERSION,
+  buildAgentwrapLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxKillWindowArgs,
   buildTmuxListPanesArgs,
@@ -32,11 +41,15 @@ import {
   buildTmuxSelectWindowArgs,
   buildTmuxServerPidArgs,
   classifyCloseKind,
+  createAgentwrapBackend,
   createTmuxBackend,
   DEFAULT_EXEC_BACKEND,
   execBackendEnvMeta,
+  type LaunchResult,
   localeDefaultedEnv,
   MANAGED_EXEC_SESSION,
+  mapAgentwrapExit,
+  parseAgentwrapStdout,
   resolveExecBackend,
   type SpawnFn,
   type SyncProbeFn,
@@ -916,6 +929,502 @@ test("resolveExecBackend: threads an explicit session through to the tmux factor
   await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
   // The construction session is on the has-session probe.
   expect(calls[0]).toEqual(buildTmuxHasSessionArgs("custom-session"));
+});
+
+// ---------------------------------------------------------------------------
+// agentwrap backend — buildAgentwrapLaunchArgv (byte-pinned), parse, exit-map,
+// the backend factory's launch→parse→exit-map→outcome path, shared pane ops,
+// and the resolveExecBackend agentwrap branch.
+// ---------------------------------------------------------------------------
+
+/**
+ * A canned `schema_version:1` agentwrap success line — the cross-repo contract
+ * keeper parses. Byte-pinned (with `\n`) so the JSON-parse path is exercised on
+ * the real one-line shape agentwrap emits, not a hand-trimmed approximation.
+ * Task .4 adds the cross-repo fixture pin; this is the in-test canned form.
+ */
+const AGENTWRAP_OK_LINE = `${JSON.stringify({
+  schema_version: 1,
+  id: "fn-1-x.1",
+  agent: "claude",
+  cwd: "/abs",
+  session: "autopilot",
+  windowId: "@7",
+  paneId: "%9",
+  runDir: null,
+  launchScript: null,
+  transcriptPath: null,
+  waitedForStop: false,
+  stop: null,
+  tmux: {
+    session: "autopilot",
+    windowId: "@7",
+    paneId: "%9",
+    attachCommand: null,
+  },
+})}\n`;
+
+/**
+ * agentwrap-launch spawn stub: keys the launch result off the agentwrap binary
+ * path (cmd[0]) and captures every spawn's argv + options (cwd) so the test can
+ * assert the invocation shape and the worker-cwd-on-spawn behavior. tmux ops
+ * fall through to a zero-exit default.
+ */
+function makeAgentwrapSpawnStub(
+  agentwrapPath: string,
+  launch: { stdout?: string; stderr?: string; exitCode?: number },
+  records: Array<{ cmd: string[]; cwd?: string }>,
+): SpawnFn {
+  return (cmd, options) => {
+    records.push({
+      cmd: [...cmd],
+      ...((options as { cwd?: string }).cwd !== undefined
+        ? { cwd: (options as { cwd?: string }).cwd }
+        : {}),
+    });
+    const isAgentwrap = cmd[0] === agentwrapPath;
+    const canned = isAgentwrap
+      ? launch
+      : { stdout: "", stderr: "", exitCode: 0 };
+    return {
+      exited: Promise.resolve(canned.exitCode ?? 0),
+      stdout: new Response(canned.stdout ?? "").body,
+      stderr: new Response(canned.stderr ?? "").body,
+      kill: () => {},
+    };
+  };
+}
+
+const AWP = "/abs/bin/agentwrap";
+
+test("buildAgentwrapLaunchArgv: exact landed-contract invocation (byte-pinned)", () => {
+  expect(
+    buildAgentwrapLaunchArgv({
+      agentwrapPath: AWP,
+      session: "autopilot",
+      prompt: "/plan:work fn-1-x.1",
+      claudeName: "work::fn-1-x.1",
+      model: "sonnet",
+      effort: "max",
+      noConfirm: true,
+    }),
+  ).toEqual([
+    AWP,
+    "claude",
+    "--agentwrap-tmux",
+    "--agentwrap-tmux-detached",
+    "--agentwrap-tmux-session",
+    "autopilot",
+    "--agentwrap-tmux-env",
+    "KEEPER_TMUX_SESSION=autopilot",
+    "--model",
+    "sonnet",
+    "--effort",
+    "max",
+    "--agentwrap-no-confirm",
+    "--name",
+    "work::fn-1-x.1",
+    "/plan:work fn-1-x.1",
+  ]);
+});
+
+test("buildAgentwrapLaunchArgv: omits absent model/effort/name and the no-confirm flag", () => {
+  expect(
+    buildAgentwrapLaunchArgv({
+      agentwrapPath: AWP,
+      session: "autopilot",
+      prompt: "do a thing",
+      noConfirm: false,
+    }),
+  ).toEqual([
+    AWP,
+    "claude",
+    "--agentwrap-tmux",
+    "--agentwrap-tmux-detached",
+    "--agentwrap-tmux-session",
+    "autopilot",
+    "--agentwrap-tmux-env",
+    "KEEPER_TMUX_SESSION=autopilot",
+    "do a thing",
+  ]);
+});
+
+// --- parseAgentwrapStdout ---
+
+test("parseAgentwrapStdout: a schema_version:1 line → ok", () => {
+  expect(parseAgentwrapStdout(AGENTWRAP_OK_LINE)).toEqual({ ok: true });
+});
+
+test("parseAgentwrapStdout: tolerates a banner line before the JSON line", () => {
+  expect(
+    parseAgentwrapStdout(`some startup banner\n${AGENTWRAP_OK_LINE}`),
+  ).toEqual({ ok: true });
+});
+
+test("parseAgentwrapStdout: schema_version:2 → permanent fail (contract drift)", () => {
+  const line = `${JSON.stringify({ schema_version: 2, session: "autopilot" })}\n`;
+  const res = parseAgentwrapStdout(line);
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.error).toContain("schema_version");
+  }
+});
+
+test("parseAgentwrapStdout: empty stdout → INTERNAL fail", () => {
+  const res = parseAgentwrapStdout("");
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.error).toContain("no parseable schema_version");
+  }
+});
+
+test("parseAgentwrapStdout: non-JSON noise only → INTERNAL fail", () => {
+  const res = parseAgentwrapStdout("not json\nstill not json\n");
+  expect(res.ok).toBe(false);
+});
+
+test("parseAgentwrapStdout: a JSON object without schema_version → INTERNAL fail naming the missing field", () => {
+  const res = parseAgentwrapStdout(`${JSON.stringify({ session: "x" })}\n`);
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.error).toContain("no schema_version");
+  }
+});
+
+test("AGENTWRAP_SCHEMA_VERSION is pinned at 1 (cross-repo contract)", () => {
+  expect(AGENTWRAP_SCHEMA_VERSION).toBe(1);
+});
+
+// --- mapAgentwrapExit (the ONE central exit map, table-driven) ---
+
+test("mapAgentwrapExit: 0 + valid parse → ok", () => {
+  expect(mapAgentwrapExit(0, { ok: true })).toEqual({ ok: true });
+});
+
+test("mapAgentwrapExit: 0 + bad parse → PERMANENT (unconfirmed launch, never retry)", () => {
+  const res = mapAgentwrapExit(0, { ok: false, error: "no json" });
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.retryable).toBeUndefined();
+  }
+});
+
+test("mapAgentwrapExit: exit-code → outcome class table (1/2/3 permanent, 4 transient, unknown permanent)", () => {
+  const ok: LaunchResult = { ok: true };
+  // 4 RETRYABLE → transient.
+  const four = mapAgentwrapExit(4, ok);
+  expect(four).toMatchObject({ ok: false, retryable: true });
+  // 3 NOOP, 1 INTERNAL, 2 BAD_ARGS, and an unknown code → permanent (no retryable).
+  for (const code of [1, 2, 3, 99]) {
+    const res = mapAgentwrapExit(code, ok);
+    expect(res.ok).toBe(false);
+    if (res.ok === false) {
+      expect(res.retryable).toBeUndefined();
+    }
+  }
+});
+
+// --- createAgentwrapBackend.launch ---
+
+test("createAgentwrapBackend.launch: exit 0 + valid JSON → ok; spawns the agentwrap argv with worker cwd on the spawn", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(
+    AWP,
+    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
+    records,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+    model: "sonnet",
+    effort: "max",
+  });
+  expect(res).toEqual({ ok: true });
+  // The launch spawned the agentwrap binary by absolute path, into the managed
+  // session, with the worker cwd set on the spawn (agentwrap has no cwd flag).
+  expect(records[0]?.cmd[0]).toBe(AWP);
+  expect(records[0]?.cmd).toContain("--agentwrap-tmux");
+  expect(records[0]?.cmd).toContain("autopilot"); // the managed session
+  expect(records[0]?.cwd).toBe("/repo");
+});
+
+test("createAgentwrapBackend.launch: exit 4 RETRYABLE → transient ({ ok:false, retryable:true })", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 4 }, records);
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "p",
+  });
+  expect(res).toMatchObject({ ok: false, retryable: true });
+});
+
+test("createAgentwrapBackend.launch: exit 3 NOOP → permanent (no retryable)", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 3 }, records);
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "p",
+  });
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.retryable).toBeUndefined();
+  }
+});
+
+test("createAgentwrapBackend.launch: exit 2 BAD_ARGS → permanent (keeper built a bad argv)", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(AWP, { exitCode: 2 }, records);
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "p",
+  });
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.retryable).toBeUndefined();
+  }
+});
+
+test("createAgentwrapBackend.launch: exit 0 but schema_version:2 stdout → permanent (unconfirmed)", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(
+    AWP,
+    { stdout: `${JSON.stringify({ schema_version: 2 })}\n`, exitCode: 0 },
+    records,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "p",
+  });
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.retryable).toBeUndefined();
+  }
+});
+
+test("createAgentwrapBackend.launch: exit 0 but empty stdout → permanent (INTERNAL, unconfirmed)", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(
+    AWP,
+    { stdout: "", exitCode: 0 },
+    records,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "p",
+  });
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.retryable).toBeUndefined();
+  }
+});
+
+test("createAgentwrapBackend.launch: timeout-kill (runCapture null) → transient", async () => {
+  // A spawn whose `exited` never resolves forces the kill-timeout path; a tiny
+  // captureTimeoutMs pins it without a real wait.
+  const spawn: SpawnFn = (_cmd, _options) => ({
+    exited: new Promise<number>(() => {}), // never resolves
+    stdout: new Response("").body,
+    stderr: new Response("").body,
+    kill: () => {},
+  });
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+    captureTimeoutMs: 5,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "p",
+  });
+  expect(res).toMatchObject({ ok: false, retryable: true });
+});
+
+test("createAgentwrapBackend.launch: ENOENT (bad path) → transient, loud (noteLine warned)", async () => {
+  const warnings: string[] = [];
+  // A spawn that throws models ENOENT (missing binary).
+  const spawn: SpawnFn = () => {
+    throw new Error("ENOENT");
+  };
+  const backend = createAgentwrapBackend({
+    noteLine: (l) => warnings.push(l),
+    agentwrapPath: "/nope/agentwrap",
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "p",
+  });
+  expect(res).toMatchObject({ ok: false, retryable: true });
+  // Loud, not silent — the bad path is named in a warn line.
+  expect(warnings.some((w) => w.includes("/nope/agentwrap"))).toBe(true);
+});
+
+test("createAgentwrapBackend.launch: missing spec → permanent fail (wiring bug, never silent)", async () => {
+  const warnings: string[] = [];
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(
+    AWP,
+    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
+    records,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: (l) => warnings.push(l),
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo");
+  expect(res.ok).toBe(false);
+  if (res.ok === false) {
+    expect(res.retryable).toBeUndefined();
+  }
+  // No spawn happened (no argv to build) and the wiring bug was warned.
+  expect(records.length).toBe(0);
+  expect(warnings.some((w) => w.includes("missing structured spec"))).toBe(
+    true,
+  );
+});
+
+// --- shared pane ops delegate to the tmux backend verbatim ---
+
+test("createAgentwrapBackend: listPanes/killWindow/renameWindow/focusPane issue tmux commands (shared, not reimplemented)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:list-panes": { stdout: "%1\t@1\twin\n", exitCode: 0 },
+      "tmux:kill-window": { exitCode: 0 },
+      "tmux:rename-window": { exitCode: 0 },
+      "tmux:select-window": { exitCode: 0 },
+      "tmux:select-pane": { exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  await backend.listPanes();
+  await backend.killWindow("%1");
+  await backend.renameWindow("@1", "name");
+  await backend.focusPane("autopilot", "%1");
+  // Every pane op went through tmux, never the agentwrap binary.
+  expect(calls.every((c) => c[0] === "tmux")).toBe(true);
+});
+
+test("createAgentwrapBackend.ensureLaunched WITHOUT a spec falls back to the tmux launch (restore replay)", async () => {
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 0 },
+      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.ensureLaunched(
+    "human-session",
+    ["sh", "-l"],
+    "/proj",
+    "restored",
+  );
+  expect(res).toEqual({ ok: true });
+  // The restore replay execs the recorded argv via tmux, NOT agentwrap.
+  expect(calls.every((c) => c[0] === "tmux")).toBe(true);
+});
+
+test("createAgentwrapBackend.ensureLaunched WITH a spec routes through agentwrap into the per-call session", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(
+    AWP,
+    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
+    records,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.ensureLaunched("foreground", [], "/proj", "", {
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+  });
+  expect(res).toEqual({ ok: true });
+  expect(records[0]?.cmd[0]).toBe(AWP);
+  // Per-call session targeted, not the managed default.
+  expect(records[0]?.cmd).toContain("foreground");
+  expect(records[0]?.cmd).toContain("KEEPER_TMUX_SESSION=foreground");
+});
+
+// --- resolveExecBackend: the agentwrap branch ---
+
+test("resolveExecBackend: backendType 'agentwrap' + a path routes through the agentwrap factory", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(
+    AWP,
+    { stdout: AGENTWRAP_OK_LINE, exitCode: 0 },
+    records,
+  );
+  const backend = resolveExecBackend({
+    noteLine: () => {},
+    backendType: "agentwrap",
+    agentwrapPath: AWP,
+    spawn,
+  });
+  await backend.launch([], "work::fn-1-x.1", "/abs", {
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+  });
+  // The agentwrap binary was spawned, not tmux.
+  expect(records[0]?.cmd[0]).toBe(AWP);
+});
+
+test("resolveExecBackend: backendType 'agentwrap' WITHOUT a path falls back to tmux (loud)", async () => {
+  const warnings: string[] = [];
+  const calls: string[][] = [];
+  const spawn = makeSpawnStub(
+    {
+      "tmux:has-session": { exitCode: 0 },
+      "tmux:new-window": { stdout: "%1\n", exitCode: 0 },
+    },
+    calls,
+  );
+  const backend = resolveExecBackend({
+    noteLine: (l) => warnings.push(l),
+    backendType: "agentwrap",
+    spawn,
+  });
+  await backend.launch(["sh"], "work::fn-1-x.1", "/abs");
+  // Fell back to tmux, and warned loudly about the missing path.
+  expect(calls[0]?.[0]).toBe("tmux");
+  expect(warnings.some((w) => w.includes("no agentwrap_path"))).toBe(true);
 });
 
 // ---------------------------------------------------------------------------
