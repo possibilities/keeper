@@ -55,5 +55,5 @@ Pure-fn fast-tier tests for the presence/outcome decision functions in test/bus-
 - [ ] `bun run test:full` passes
 
 ## Done summary
-
+Bus server now distinguishes connected from known-disconnected channels (presence axis on the resolver), gates delivery on an open socket, and replies a synchronous publish result (delivered/not_connected/unknown_target/ambiguous_target/delivery_failed) persisted as the true messages.status. Heartbeat fully retired (no reaper/timer/op) in favor of socket-close liveness; server resolve op removed (internal closure kept); takeover late-close guarded by a generation token. Full suite green.
 ## Evidence
