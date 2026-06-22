@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/agentwrap",
   "tier": "high",
   "title": "run artifact GC and no-artifacts",
-  "updated_at": "2026-06-22T17:35:20.322000Z"
+  "updated_at": "2026-06-22T18:07:39.691000Z",
+  "worker_done_at": "2026-06-22T18:07:39.691000Z"
 }

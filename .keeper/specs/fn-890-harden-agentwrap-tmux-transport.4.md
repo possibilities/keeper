@@ -40,5 +40,5 @@ Unit-test the sweep predicate (age+liveness+cap, path-traversal guard) with a te
 - [ ] `bun lint && bun typecheck && bun test` green; `AGENTWRAP_HELP` lists `--no-artifacts`.
 
 ## Done summary
-
+Added run-artifact GC (startup sweep gated on age AND liveness with count-cap, path-traversal-guarded, in-flight-safe) and a --no-artifacts flag that inlines the launch as bash -c and returns runDir/launchScript null. Docs + help updated; bun lint/typecheck/test green.
 ## Evidence
