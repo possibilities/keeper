@@ -37,5 +37,5 @@ Single-gist end-to-end first (PATCH md + add yaml + backfill local gist-url + ve
 - [ ] summary counts reported (matched / updated / skipped / 404)
 
 ## Done summary
-
+Added re-runnable gist-reconcile.ts (one paginated index call, basename join skipping remote-dup/local-collision/no-match/multi-file, one PATCH per match upserting stripped .md + .yaml sidecar via -F @file, gist-url backfilled into local sidecars, ndjson state for resumable runs, rate-limit backoff). Validated one-gist-then-batch; reconciled 98 gists this run (matched 313, skip remote-dup 1073, skip no-local 871, skip multi/non-md 888); 215 remain blocked on GitHub's secondary content-write limit, resumable via the state file.
 ## Evidence
