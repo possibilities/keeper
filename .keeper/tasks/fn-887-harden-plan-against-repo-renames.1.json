@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T16:21:25.267000Z",
+  "depends_on": [],
+  "epic": "fn-887-harden-plan-against-repo-renames",
+  "id": "fn-887-harden-plan-against-repo-renames.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "add keeper plan mv-repo verb",
+  "updated_at": "2026-06-22T16:21:25.267000Z"
+}

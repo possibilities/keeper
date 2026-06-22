@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T16:21:25.267000Z",
+  "depends_on": [],
+  "epic": "fn-887-harden-plan-against-repo-renames",
+  "id": "fn-887-harden-plan-against-repo-renames.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "fail loud on missing dispatch cwd",
+  "updated_at": "2026-06-22T16:21:25.267000Z"
+}
