@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T17:44:14.768000Z",
+  "depends_on": [],
+  "epic": "fn-891-buildbot-builddeployinstall-job-types",
+  "id": "fn-891-buildbot-builddeployinstall-job-types.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/arthack",
+  "tier": "xhigh",
+  "title": "Typed job-factory foundation in master.cfg",
+  "updated_at": "2026-06-22T17:44:14.768000Z"
+}
