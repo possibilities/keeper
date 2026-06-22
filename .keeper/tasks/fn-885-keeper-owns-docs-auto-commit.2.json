@@ -1,0 +1,15 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T16:04:03.923000Z",
+  "depends_on": [
+    "fn-885-keeper-owns-docs-auto-commit.1"
+  ],
+  "epic": "fn-885-keeper-owns-docs-auto-commit",
+  "id": "fn-885-keeper-owns-docs-auto-commit.2",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "debounced docs pusher on Stop",
+  "updated_at": "2026-06-22T16:04:03.923000Z"
+}
