@@ -54,5 +54,5 @@ Add cases to test/builds.test.ts with `project` overrides `"foo"`, `"foo-install
 - [ ] `bun run lint` + `bun run typecheck` + `bun test test/builds.test.ts` pass
 
 ## Done summary
-
+keeper builds renders a render-time job-type tag ([build]/[deploy]/[install]) per row, derived from the builder-name suffix via a new pure resolveJobType. No schema/worker/fold change.
 ## Evidence

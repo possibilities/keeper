@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "Display build/deploy/install types in keeper builds",
-  "updated_at": "2026-06-22T17:44:14.768000Z"
+  "updated_at": "2026-06-22T22:54:05.014000Z",
+  "worker_done_at": "2026-06-22T22:54:05.014000Z"
 }
