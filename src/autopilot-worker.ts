@@ -47,6 +47,7 @@ import {
 import { openDb } from "./db";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
+  createTmuxPaneOps,
   type LaunchSpec,
   type PaneInfo,
   resolveExecBackend,
@@ -1732,6 +1733,14 @@ function main(): void {
     backendType: data.execBackend,
     agentwrapPath: data.agentwrapPath,
   });
+  // The read-time liveness probe (`listPanes`) is a direct tmux pane-ops seam —
+  // it targets server-global tmux ids the hook stamps, independent of the launch
+  // transport, so it does NOT go through the launch backend.
+  const paneOps = createTmuxPaneOps({
+    noteLine: (line: string) => {
+      console.error(line);
+    },
+  });
   // `$SHELL` for the launch argv (`buildLaunchArgv`). Resolved once.
   const shell = process.env.SHELL ?? "/bin/sh";
 
@@ -1866,7 +1875,7 @@ function main(): void {
         // stopped-arm occupancy gate (`isOccupyingJob`) sees which sessions are
         // actually live — a stopped-dead pane no longer wedges its slot.
         const snapshot = await loadReconcileSnapshot(db, () =>
-          backend.listPanes(),
+          paneOps.listPanes(),
         );
         // Prune expired cooldown entries each cycle, BEFORE `reconcile` reads the
         // Map so a just-expired key is re-dispatchable this cycle. Wrapped

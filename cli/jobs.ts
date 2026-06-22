@@ -88,7 +88,7 @@ import {
   subagentLinesFor,
 } from "../src/board-render";
 import { resolveSockPath } from "../src/db";
-import { resolveExecBackend } from "../src/exec-backend";
+import { createTmuxPaneOps } from "../src/exec-backend";
 import {
   type ReadinessClientSnapshot,
   subscribeReadiness,
@@ -708,17 +708,13 @@ export async function main(argv: string[]): Promise<void> {
       view.flashStatus("[no backend pane]");
       return;
     }
-    // Resolve per-row: every `backend_exec_type` (NULL/unknown/legacy included)
-    // resolves to the tmux factory inside `resolveExecBackend`.
-    const backendType =
-      typeof row.backend_exec_type === "string"
-        ? row.backend_exec_type
-        : undefined;
-    const backend = resolveExecBackend({
+    // Direct tmux pane-ops seam: focusPane targets server-global tmux ids the
+    // hook stamps, so it is backend-agnostic (no per-row `backend_exec_type`
+    // resolution needed).
+    const backend = createTmuxPaneOps({
       noteLine: (line: string) => {
         view.noteLine(line);
       },
-      backendType,
     });
     focusInFlight = true;
     view.liveShell.setStatus("[focusing…]");

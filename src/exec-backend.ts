@@ -634,18 +634,38 @@ export interface ResolveExecBackendDeps {
   readonly agentwrapPath?: string;
 }
 
-/**
- * tmux backend factory. Each op runs a per-call get-or-create (`has-session`
- * probe → `new-session` mint when absent) then a chained `new-window`; there is
- * NO session-ensure memo — `has-session` is cheap and avoids a stale-memo wedge
- * after a session dies. NEVER throws — every failure mode degrades to a
- * `noteLine` warn + an `{ ok: false }` (or a best-effort focus no-op).
- */
-export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
-  const spawn = deps.spawn ?? defaultSpawn;
-  const session = deps.session ?? MANAGED_EXEC_SESSION;
-  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
+/** Dep bag for {@link createTmuxPaneOps} — the kept session-agnostic pane
+ *  operations as a direct seam (no `ExecBackend` interface). `spawn` is
+ *  injectable for tests; `captureTimeoutMs` tunes the per-call kill-timeout. */
+export interface TmuxPaneOpsDeps {
+  readonly noteLine: (line: string) => void;
+  readonly spawn?: SpawnFn;
+  readonly captureTimeoutMs?: number;
+}
 
+/** The kept tmux pane operations, surviving the exec-backend collapse as a
+ *  direct seam. Session-agnostic: `focusPane` takes the target session; the
+ *  sweep/rename/kill ops target server-global tmux ids. All NEVER throw. */
+export interface TmuxPaneOps {
+  focusPane(session: string, paneId: string): Promise<LaunchResult>;
+  listPanes(): Promise<PaneInfo[] | null>;
+  renameWindow(windowId: string, name: string): Promise<LaunchResult>;
+  killWindow(paneId: string): Promise<LaunchResult>;
+}
+
+/**
+ * Direct factory for the session-agnostic tmux pane ops kept after the
+ * exec-backend collapse — focus / sweep / rename / kill. These survive as their
+ * own seam (NOT routed through the `ExecBackend` interface or
+ * `resolveExecBackend`): every op targets a server-global tmux id the hook
+ * stamps, so they apply identically regardless of who minted the window.
+ * Reuses the same pure argv builders + bounded `makeRunCapture` + locale default
+ * the launch path uses. NEVER throws — every failure degrades to a `noteLine`
+ * warn / a best-effort no-op `{ ok: false }`.
+ */
+export function createTmuxPaneOps(deps: TmuxPaneOpsDeps): TmuxPaneOps {
+  const spawn = deps.spawn ?? defaultSpawn;
+  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
   const runCapture = makeRunCapture({
     spawn,
     captureTimeoutMs,
@@ -653,81 +673,7 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
     kind: "tmux",
   });
 
-  /**
-   * Per-call get-or-create for `targetSession`: a `has-session -t =<session>`
-   * probe (exit 0 = live), and `new-session -d` mint when absent. The mint spawn
-   * carries color-capable `TERM`/`COLORTERM` defaults plus a UTF-8 locale
-   * default — keeperd runs as a LaunchAgent with env stripped, so a server
-   * minted here would otherwise render every worker pane colorblind and treat
-   * non-ASCII window names as unprintable. NEVER throws; a probe `null` (ENOENT)
-   * skips the mint and the caller's `new-window` then fails loud with
-   * `{ ok: false }`.
-   */
-  async function ensureSessionFor(targetSession: string): Promise<void> {
-    const has = await runCapture(buildTmuxHasSessionArgs(targetSession));
-    if (has != null && has.exitCode === 0) {
-      // Already live — never re-mint.
-      return;
-    }
-    if (has == null) {
-      deps.noteLine(
-        `# warn: tmux has-session failed (binary missing?); subsequent launches will no-op`,
-      );
-      return;
-    }
-    // Locale-defaulted alongside the color env: a server minted by a C-locale
-    // client treats non-ASCII window names as unprintable server-wide.
-    await runCapture(buildTmuxNewSessionArgs(targetSession), {
-      env: {
-        ...localeDefaultedEnv(
-          process.env as Record<string, string | undefined>,
-        ),
-        TERM: process.env.TERM ?? "xterm-256color",
-        COLORTERM: process.env.COLORTERM ?? "truecolor",
-      },
-    });
-  }
-
-  async function launchInto(
-    targetSession: string,
-    argv: string[],
-    name: string,
-    cwd: string,
-    label: string,
-  ): Promise<LaunchResult> {
-    await ensureSessionFor(targetSession);
-    const args = buildTmuxNewWindowArgs(targetSession, cwd, argv, name);
-    const res = await runCapture(args);
-    if (res == null) {
-      const error = `tmux new-window for ${label} failed (ENOENT? binary missing)`;
-      deps.noteLine(`# warn: ${error}`);
-      return { ok: false, error };
-    }
-    if (res.stderr.length > 0) {
-      deps.noteLine(`# launch stderr (${label}): ${res.stderr.trim()}`);
-    }
-    if (res.exitCode !== 0) {
-      const error = `tmux new-window for ${label} exited non-zero (${res.exitCode})`;
-      deps.noteLine(`# warn: ${error}`);
-      return { ok: false, error };
-    }
-    return { ok: true };
-  }
-
   return {
-    launch(
-      argv: string[],
-      name: string,
-      cwd: string,
-      _spec?: LaunchSpec,
-    ): Promise<LaunchResult> {
-      // Managed window stays UNNAMED — `name` feeds the log label + autopilot
-      // dedup key only, never the `-n` window label (the future naming system's
-      // seam). Dispatches into the construction-baked managed session. `_spec`
-      // is the agentwrap backend's structured-input seam — the tmux backend
-      // ignores it and execs the pre-wrapped `argv` verbatim.
-      return launchInto(session, argv, "", cwd, name);
-    },
     async focusPane(
       targetSession: string,
       paneId: string,
@@ -760,26 +706,6 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
         return { ok: false, error };
       }
       return { ok: true };
-    },
-    ensureLaunched(
-      targetSession: string,
-      argv: string[],
-      cwd: string,
-      name?: string,
-      _spec?: LaunchSpec,
-    ): Promise<LaunchResult> {
-      // Session-agnostic get-or-create + launch into the per-call session. The
-      // restore caller passes `name` to label the window; managed dispatch never
-      // reaches here. Empty/absent name leaves the window unnamed. `_spec` is
-      // the agentwrap backend's structured-input seam — the tmux backend ignores
-      // it and execs the pre-wrapped `argv`.
-      return launchInto(
-        targetSession,
-        argv,
-        name ?? "",
-        cwd,
-        `session=${targetSession}`,
-      );
     },
     async listPanes(): Promise<PaneInfo[] | null> {
       // One server-wide sweep; `null` (degraded/missing tmux) tells the caller
@@ -869,6 +795,193 @@ export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
       }
       return { ok: true };
     },
+  };
+}
+
+/** Dep bag for {@link restoreReplayLaunch} — the kept spec-less tmux replay
+ *  launch as a direct seam. `spawn` injectable for tests; `captureTimeoutMs`
+ *  tunes the per-call kill-timeout. */
+export interface RestoreReplayDeps {
+  readonly noteLine: (line: string) => void;
+  readonly spawn?: SpawnFn;
+  readonly captureTimeoutMs?: number;
+}
+
+/**
+ * Direct seam for the ONE surviving tmux launch — the crash-recovery restore
+ * replay (scripts/restore-agents.ts). Get-or-creates the per-call `session`
+ * then execs the recorded shell-wrapped `argv` verbatim in a new window via
+ * `new-window` (named `name` when supplied). This is a spec-less replay: the
+ * restore caller holds only a recorded `argv`, never a structured `LaunchSpec`,
+ * so it stays on the direct tmux path (NOT routed through `ExecBackend` /
+ * `resolveExecBackend`). Behavior is verbatim the old tmux-backend
+ * `ensureLaunched` (a regression here is invisible until the next crash, so the
+ * launch shape is preserved exactly). NEVER throws.
+ */
+export async function restoreReplayLaunch(
+  session: string,
+  argv: string[],
+  cwd: string,
+  deps: RestoreReplayDeps,
+  name?: string,
+): Promise<LaunchResult> {
+  const spawn = deps.spawn ?? defaultSpawn;
+  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
+  const runCapture = makeRunCapture({
+    spawn,
+    captureTimeoutMs,
+    noteLine: deps.noteLine,
+    kind: "tmux",
+  });
+  return launchIntoTmux(
+    runCapture,
+    deps.noteLine,
+    session,
+    argv,
+    name ?? "",
+    cwd,
+    `session=${session}`,
+  );
+}
+
+/**
+ * Shared tmux get-or-create + `new-window` launch, factored to module scope so
+ * both {@link createTmuxBackend} and the standalone {@link restoreReplayLaunch}
+ * seam exec the same verbatim launch shape. Runs a per-call `has-session` probe
+ * → `new-session` mint when absent (the mint carries color + locale env so a
+ * keeperd-minted server is not colorblind / non-ASCII-blind), then a chained
+ * `new-window`. NEVER throws.
+ */
+async function launchIntoTmux(
+  runCapture: ReturnType<typeof makeRunCapture>,
+  noteLine: (line: string) => void,
+  targetSession: string,
+  argv: string[],
+  name: string,
+  cwd: string,
+  label: string,
+): Promise<LaunchResult> {
+  // Per-call get-or-create: a `has-session -t =<session>` probe (exit 0 = live)
+  // and a `new-session -d` mint when absent. The mint spawn carries
+  // color-capable TERM/COLORTERM + a UTF-8 locale default — keeperd runs as a
+  // LaunchAgent with env stripped, so a server minted here would otherwise
+  // render every worker pane colorblind and treat non-ASCII window names as
+  // unprintable. A probe `null` (ENOENT) skips the mint and the `new-window`
+  // then fails loud with `{ ok: false }`.
+  const has = await runCapture(buildTmuxHasSessionArgs(targetSession));
+  if (has == null) {
+    noteLine(
+      `# warn: tmux has-session failed (binary missing?); subsequent launches will no-op`,
+    );
+  } else if (has.exitCode !== 0) {
+    // Locale-defaulted alongside the color env: a server minted by a C-locale
+    // client treats non-ASCII window names as unprintable server-wide.
+    await runCapture(buildTmuxNewSessionArgs(targetSession), {
+      env: {
+        ...localeDefaultedEnv(
+          process.env as Record<string, string | undefined>,
+        ),
+        TERM: process.env.TERM ?? "xterm-256color",
+        COLORTERM: process.env.COLORTERM ?? "truecolor",
+      },
+    });
+  }
+  const args = buildTmuxNewWindowArgs(targetSession, cwd, argv, name);
+  const res = await runCapture(args);
+  if (res == null) {
+    const error = `tmux new-window for ${label} failed (ENOENT? binary missing)`;
+    noteLine(`# warn: ${error}`);
+    return { ok: false, error };
+  }
+  if (res.stderr.length > 0) {
+    noteLine(`# launch stderr (${label}): ${res.stderr.trim()}`);
+  }
+  if (res.exitCode !== 0) {
+    const error = `tmux new-window for ${label} exited non-zero (${res.exitCode})`;
+    noteLine(`# warn: ${error}`);
+    return { ok: false, error };
+  }
+  return { ok: true };
+}
+
+/**
+ * tmux backend factory. Each op runs a per-call get-or-create (`has-session`
+ * probe → `new-session` mint when absent) then a chained `new-window`; there is
+ * NO session-ensure memo — `has-session` is cheap and avoids a stale-memo wedge
+ * after a session dies. NEVER throws — every failure mode degrades to a
+ * `noteLine` warn + an `{ ok: false }` (or a best-effort focus no-op).
+ *
+ * Delegates the session-agnostic pane ops to {@link createTmuxPaneOps} and the
+ * get-or-create launch to {@link launchIntoTmux} — the kept direct seams — so
+ * the surviving surface has a single implementation while the `ExecBackend`
+ * interface (removed in a follow-up) still composes over it.
+ */
+export function createTmuxBackend(deps: TmuxBackendDeps): ExecBackend {
+  const spawn = deps.spawn ?? defaultSpawn;
+  const session = deps.session ?? MANAGED_EXEC_SESSION;
+  const captureTimeoutMs = deps.captureTimeoutMs ?? RUN_CAPTURE_TIMEOUT_MS;
+
+  const runCapture = makeRunCapture({
+    spawn,
+    captureTimeoutMs,
+    noteLine: deps.noteLine,
+    kind: "tmux",
+  });
+
+  const paneOps = createTmuxPaneOps({
+    noteLine: deps.noteLine,
+    spawn,
+    captureTimeoutMs,
+  });
+
+  return {
+    launch(
+      argv: string[],
+      name: string,
+      cwd: string,
+      _spec?: LaunchSpec,
+    ): Promise<LaunchResult> {
+      // Managed window stays UNNAMED — `name` feeds the log label + autopilot
+      // dedup key only, never the `-n` window label (the future naming system's
+      // seam). Dispatches into the construction-baked managed session. `_spec`
+      // is the agentwrap backend's structured-input seam — the tmux backend
+      // ignores it and execs the pre-wrapped `argv` verbatim.
+      return launchIntoTmux(
+        runCapture,
+        deps.noteLine,
+        session,
+        argv,
+        "",
+        cwd,
+        name,
+      );
+    },
+    focusPane: paneOps.focusPane,
+    ensureLaunched(
+      targetSession: string,
+      argv: string[],
+      cwd: string,
+      name?: string,
+      _spec?: LaunchSpec,
+    ): Promise<LaunchResult> {
+      // Session-agnostic get-or-create + launch into the per-call session. The
+      // restore caller passes `name` to label the window; managed dispatch never
+      // reaches here. Empty/absent name leaves the window unnamed. `_spec` is
+      // the agentwrap backend's structured-input seam — the tmux backend ignores
+      // it and execs the pre-wrapped `argv`.
+      return launchIntoTmux(
+        runCapture,
+        deps.noteLine,
+        targetSession,
+        argv,
+        name ?? "",
+        cwd,
+        `session=${targetSession}`,
+      );
+    },
+    listPanes: paneOps.listPanes,
+    renameWindow: paneOps.renameWindow,
+    killWindow: paneOps.killWindow,
   };
 }
 

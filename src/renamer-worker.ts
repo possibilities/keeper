@@ -48,9 +48,9 @@
 import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { openDb } from "./db";
 import {
-  type ExecBackend,
+  createTmuxPaneOps,
   type PaneInfo,
-  resolveExecBackend,
+  type TmuxPaneOps,
 } from "./exec-backend";
 import { runQuery } from "./server-worker";
 import type { Job } from "./types";
@@ -234,7 +234,7 @@ export function computeRenames(
  */
 export async function renamerPulse(
   db: Parameters<typeof runQuery>[0],
-  backend: ExecBackend,
+  backend: Pick<TmuxPaneOps, "listPanes" | "renameWindow">,
   state: PulseState,
 ): Promise<void> {
   const read = (collection: string): Record<string, unknown>[] => {
@@ -314,9 +314,10 @@ function main(): void {
     prepareStmts: false,
     bootRetry: true,
   });
-  // Session-agnostic backend: only listPanes / renameWindow are used, so the
-  // managed-session default is irrelevant. Warnings route to stderr.
-  const backend = resolveExecBackend({
+  // Session-agnostic pane-ops seam: only listPanes / renameWindow are used.
+  // Direct tmux seam (NOT routed through the removed exec-backend abstraction).
+  // Warnings route to stderr.
+  const backend = createTmuxPaneOps({
     noteLine: (line: string): void => {
       console.error(`[renamer-worker] ${line}`);
     },

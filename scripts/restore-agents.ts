@@ -64,8 +64,7 @@ import {
   buildTmuxHasSessionArgs,
   buildTmuxNewSessionArgs,
   buildTmuxNewWindowArgs,
-  type ExecBackend,
-  resolveExecBackend,
+  restoreReplayLaunch,
 } from "../src/exec-backend";
 import {
   deriveCurrentSet,
@@ -593,14 +592,14 @@ async function main(): Promise<void> {
     process.exit(0);
   }
 
-  // --apply path. Resolve ONE tmux backend instance (tmux is the sole backend);
-  // route every candidate through it.
+  // --apply path. The restore replay is the ONE surviving direct tmux launch —
+  // route every candidate through the `restoreReplayLaunch` seam (a spec-less
+  // get-or-create + new-window of the recorded shell-wrapped argv).
   const noteLine = (line: string): void => {
     process.stderr.write(`${line}\n`);
   };
-  const backend: ExecBackend = resolveExecBackend({ noteLine });
   const ensureLaunched: EnsureLaunchedFn = (session, argv, cwd) =>
-    backend.ensureLaunched(session, argv, cwd);
+    restoreReplayLaunch(session, argv, cwd, { noteLine });
 
   const outcomes = await applyRestore(
     plan,

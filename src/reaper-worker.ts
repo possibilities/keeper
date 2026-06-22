@@ -47,9 +47,9 @@ import { isMainThread, parentPort, workerData } from "node:worker_threads";
 import { loadReconcileSnapshot } from "./autopilot-worker";
 import { openDb } from "./db";
 import {
-  type ExecBackend,
+  createTmuxPaneOps,
   MANAGED_EXEC_SESSION,
-  resolveExecBackend,
+  type TmuxPaneOps,
 } from "./exec-backend";
 import { computeReadiness, type ReadinessSnapshot } from "./readiness";
 import type { runQuery } from "./server-worker";
@@ -246,7 +246,7 @@ export type ReapSelector = (
  */
 export async function reaperCycle(
   select: ReapSelector,
-  backend: ExecBackend,
+  backend: Pick<TmuxPaneOps, "killWindow">,
   cooldown: Map<string, number>,
   now: () => number,
 ): Promise<void> {
@@ -301,13 +301,13 @@ function main(): void {
     prepareStmts: false,
     bootRetry: true,
   });
-  // Session-agnostic backend: only killWindow is used, so the managed-session
-  // default is irrelevant. Warnings route to stderr.
-  const backend = resolveExecBackend({
+  // Session-agnostic pane-ops seam: only killWindow is used. Direct tmux seam
+  // (NOT routed through the removed exec-backend abstraction). Warnings route to
+  // stderr.
+  const backend = createTmuxPaneOps({
     noteLine: (line: string): void => {
       console.error(`[reaper-worker] ${line}`);
     },
-    backendType: undefined,
   });
   // job_id → last kill-attempt unix-seconds. In-memory only.
   const cooldown = new Map<string, number>();
