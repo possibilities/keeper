@@ -1,0 +1,20 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-22T04:12:25.168000Z",
+  "created_by_close_of": "fn-882-fix-cross-repo-plan-id-resolution",
+  "depends_on_epics": [
+    "fn-882-fix-cross-repo-plan-id-resolution"
+  ],
+  "id": "fn-883-fix-refine-context-no-project-error",
+  "last_validated_at": "2026-06-22T04:12:25.195000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "Fix refine-context no_project error rendering",
+  "touched_repos": [
+    "/Users/mike/code/keeper"
+  ],
+  "updated_at": "2026-06-22T04:12:25.168000Z"
+}
