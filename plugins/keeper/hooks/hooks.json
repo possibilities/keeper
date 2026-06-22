@@ -1,5 +1,5 @@
 {
-  "description": "Keeper hooks: (1) events-writer appends one per-pid NDJSON line per hook invocation (lock-free, no SQLite) for the keeperd ingester to fold into the jobs projection; (2) branch-guard is a PreToolUse(Bash) hard-deny that blocks subagents (agent_id present) from creating/switching git branches via the deny JSON envelope (still exits 0), keeping worker subagents on the current branch",
+  "description": "Keeper hooks: (1) events-writer appends one per-pid NDJSON line per hook invocation (lock-free, no SQLite) for the keeperd ingester to fold into the jobs projection; (2) branch-guard is a PreToolUse(Bash) hard-deny that blocks subagents (agent_id present) from creating/switching git branches via the deny JSON envelope (still exits 0), keeping worker subagents on the current branch; (3) sidecar-writer is a fail-open PostToolUse(Write|Bash) hook that owns the ~/docs metadata sidecar — create-or-merge a doc's .yaml on Write and upsert the gist-url on `gh gist create`, NEVER touching the .md (still exits 0)",
   "hooks": {
     "SessionStart": [
       {
@@ -48,6 +48,24 @@
           {
             "type": "command",
             "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/events-writer.ts"
+          }
+        ]
+      },
+      {
+        "matcher": "Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/sidecar-writer.ts"
+          }
+        ]
+      },
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "${CLAUDE_PLUGIN_ROOT}/plugin/hooks/sidecar-writer.ts"
           }
         ]
       }

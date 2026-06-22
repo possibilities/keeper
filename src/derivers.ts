@@ -684,8 +684,11 @@ export interface BashMutation {
  *
  * Compound-command separators (`;`, `&`, `|`) terminate the token list — we
  * only tokenize the FIRST simple command. Subshells pass through opaque.
+ *
+ * Exported so the sidecar-writer hook reuses the SAME tokenizer for parsing a
+ * `gh gist create <doc>.md <doc>.yaml` argv (no second hand-rolled splitter).
  */
-function tokenizeShell(command: string): string[] {
+export function tokenizeShell(command: string): string[] {
   const tokens: string[] = [];
   let current = "";
   let inSingle = false;

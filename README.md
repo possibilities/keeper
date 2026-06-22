@@ -380,7 +380,9 @@ Keeper has no `install` verb. Wire it up manually:
 4. **Load the plugins via the arthack launcher's `plugin_scan_dirs`.** Both
    Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
    events-writer hook + the branch-guard hook that hard-denies subagent git
-   branch create/switch via the `PreToolUse` deny JSON, + the `keeper:await` /
+   branch create/switch via the `PreToolUse` deny JSON + the sidecar-writer hook
+   that owns the `~/docs` metadata sidecar on `PostToolUse(Write|Bash)`, + the
+   `keeper:await` /
    `keeper:dispatch` / `keeper:autopilot` gateway skills,
    manifest at
    `plugins/keeper/.claude-plugin/plugin.json`, command paths in
@@ -1381,6 +1383,24 @@ the current branch. It denies via the `PreToolUse` JSON envelope
 required for the deny to be honored. It makes no subprocess/fs/git/DB calls, fails
 open, and never touches non-subagent sessions (the human's interactive claude and the
 `/plan:work` orchestrator both run with no `agent_id`).
+
+A **third**, daemon-independent `PostToolUse(Write|Bash)` hook, the
+**sidecar-writer** (`plugins/keeper/plugin/hooks/sidecar-writer.ts`), owns the
+`~/docs` metadata sidecar (relocated out of arthack's `post_tool_use.ts` so the
+keeper plugin is the single owner of `~/docs` control-data). On a Write to a
+`~/docs/*.md` (the dir is overridable via `KEEPER_DOCS_DIR` for tests) it
+create-or-merges the doc's `.yaml` sidecar — stamping `path`/`type`/`created`/
+`session-id`/`cwd`/`resume` and best-effort `git-branch`/`git-commit` — preserving
+an existing `created`. On a `gh gist create <doc>.md …` it parses the gist URL out
+of the tool-response (bounded `https?://gist.github.com/[^\s"'<>]+`, never the old
+greedy `\S+` that swallowed the JSON tail) and upserts `gist-url:` into the matching
+sidecar. It **NEVER touches the `.md` body** — machine metadata lives only in the
+sidecar now — writes the sidecar atomically (tempfile + rename), fails open (exit 0
+on any error, including `uncaughtException`/`unhandledRejection`), and is dep-free
+(`node:fs`/`node:os`/`node:path` + the pure `src/derivers.ts` tokenizer +
+`src/sidecar.ts`, never `bun:sqlite`/`src/db.ts`). Its strip-signature detector +
+sidecar parse/merge logic live in `src/sidecar.ts`, shared with the one-shot
+`~/docs` migration so the strip regex never drifts.
 
 A **second** Worker thread runs the read-only UDS subscribe server. It mirrors
 the wake worker's archetype — its own read-only connection, its own

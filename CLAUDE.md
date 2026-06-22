@@ -1,8 +1,9 @@
 keeper — event-sourced Claude Code control-data daemon (Bun + bun:sqlite).
 
-The keeper plugin ships two `PreToolUse(Bash)` hooks: the events-writer appends one
-per-pid NDJSON line per Claude Code hook invocation (lock-free, no SQLite open), and
-the branch-guard hard-denies subagent git branch create/switch. The `keeperd`
+The keeper plugin ships three hooks: the events-writer appends one per-pid NDJSON
+line per Claude Code hook invocation (lock-free, no SQLite open), the branch-guard
+hard-denies subagent git branch create/switch, and the sidecar-writer owns the
+`~/docs` metadata sidecar (PostToolUse, never touches the `.md` body). The `keeperd`
 daemon's events-log ingester lands each events-writer line as one `events` row, folds
 those events into the `jobs`/`epics` projections, and serves them read-only over a
 UDS subscribe socket. The `events` table is the
@@ -92,12 +93,19 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 
 ## Hook rules
 
-- **Two hooks, two contracts.** The keeper plugin ships TWO `PreToolUse(Bash)` hooks:
-  the events-writer (logs every invocation, NEVER blocks) and the branch-guard
+- **Three hooks, three contracts.** The keeper plugin ships TWO `PreToolUse(Bash)`
+  hooks — the events-writer (logs every invocation, NEVER blocks) and the branch-guard
   (`plugins/keeper/plugin/hooks/branch-guard.ts` — hard-blocks a subagent, detected by
   `agent_id`/`agent_type` presence, from git branch create/switch/worktree-add so
   workers stay on the current branch; ordinary git, file-restore, and non-subagent
-  sessions pass).
+  sessions pass) — plus the `PostToolUse(Write|Bash)` sidecar-writer
+  (`plugins/keeper/plugin/hooks/sidecar-writer.ts` — owns the `~/docs` metadata
+  sidecar: on Write to a `~/docs/*.md` it create-or-merges the doc's `.yaml` sidecar,
+  on `gh gist create` it upserts `gist-url:` into the matching sidecar. It NEVER
+  touches the `.md` body — machine metadata lives only in the sidecar — and is
+  fail-open like the others. `KEEPER_DOCS_DIR` overrides `~/docs` for tests. Its
+  strip-signature + sidecar parse/merge logic is the dep-free `src/sidecar.ts`,
+  shared with the one-shot migration so the strip regex never drifts).
 - **Always exit 0.** A non-zero exit can fail-closed the human's session. On a HARD
   append failure the events-writer writes a per-pid dead-letter and still exits 0
   (losing one row is acceptable; wedging the agent is not). The branch-guard ALSO
@@ -109,8 +117,9 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 - **No third-party deps, and NO `bun:sqlite`/`src/db.ts`.** The hook never opens
   SQLite — a stray `db.ts` symbol re-drags the 6.5k-line module and erases the
   cold-start win. Keep imports to `node:fs`/`node:os`/`node:path`, the dep-free
-  `src/dead-letter.ts` serializers, and the pure `src/derivers.ts`/`exec-backend.ts`
-  helpers. It never opens the DB, so it never migrates or probes schema.
+  `src/dead-letter.ts` serializers, and the pure `src/derivers.ts`/`exec-backend.ts`/
+  `src/sidecar.ts` helpers. It never opens the DB, so it never migrates or probes
+  schema.
 - **Scraping is scoped.** On `SessionStart` only: parent claude `--name`/`-n` +
   `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event:
   `TMUX`/`TMUX_PANE`/`KEEPER_TMUX_SESSION`/`KEEPER_TMUX_PANE` env reads
