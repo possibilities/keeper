@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T01:28:07.852000Z",
+  "depends_on": [],
+  "epic": "fn-880-commit-work-no-session-id-git-hint",
+  "id": "fn-880-commit-work-no-session-id-git-hint.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "reshape no-session-id envelope and test",
+  "updated_at": "2026-06-22T01:28:07.852000Z"
+}
