@@ -51,5 +51,5 @@ not-found and ambiguous cases too. Add to the appropriate tier (process-level
 - [ ] regression test covers the cross-repo stamp + not-found + ambiguous cases; tests green
 
 ## Done summary
-
+Made done/show/cat/refine-context resolve a globally-unique fn-N[.M] id cwd-then-global via the reused resolveEpicGlobally helper, so a cross-repo worker self-completes a task owned by another repo's board; the stamp lands in the owning store. Added a process-level regression test covering cross-repo done/show/cat/refine-context, not-found, ambiguous, --project bypass, and unchanged single-repo/list semantics.
 ## Evidence
