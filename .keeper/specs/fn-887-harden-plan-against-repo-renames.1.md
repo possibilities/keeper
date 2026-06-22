@@ -47,5 +47,5 @@ Model `plugins/plan/test/verbs-restamp.test.ts` with `runCli` + two git repos (o
 - [ ] plan-plugin lint (biome + tsc) + `bun test` green
 
 ## Done summary
-
+Added the mv-repo verb: a metadata-only board rewrite that rewrites every primary_repo/target_repo/touched_repos match old->new across the project in one commit, restamping touched epics. Realpath-canonicalized matching (never lowercased), validates <new> is a git repo, idempotent re-run + old==new no-ops. Registered in cli.ts and VALIDATION_RESTAMP_VERBS; README + plan SKILL note added.
 ## Evidence
