@@ -697,6 +697,14 @@ function cwdInsideRoot(cwd: string, root: string): boolean {
  * ahead of upstream, so an absent row means none of those held at snapshot
  * time.
  *
+ * fn-897 B1: `seedRequired` (the boot-status header's `git_seed_required`)
+ * OVERRIDES the absent-row inference. While the live-only git surface is
+ * unseeded (the daemon restarted and the boot-seed hasn't run yet), EVERY repo
+ * reads as a missing row — which would otherwise falsely report "clean". An
+ * unseeded surface is UNKNOWN, not clean, so this returns `waiting` regardless
+ * of the rows. Defaults `false` so steady-state callers (and the legacy
+ * two-arg form) behave exactly as before.
+ *
  * Orphan-metric choice is load-bearing: this uses the STRICT
  * `orphaned_count` column (zero attribution from any session). If a future
  * caller wants this to mirror autopilot's dispatch gate it would instead
@@ -712,7 +720,13 @@ function cwdInsideRoot(cwd: string, root: string): boolean {
 export function gitCleanState(
   gitRoot: string,
   gitStatusRows: readonly GitStatus[],
+  seedRequired = false,
 ): AwaitState {
+  // fn-897 B1: an unseeded git surface is UNKNOWN — never report "clean" off the
+  // empty rows it produces. Hold `waiting` until the boot-seed populates it.
+  if (seedRequired) {
+    return { kind: "waiting", detail: "git surface unseeded (booting)" };
+  }
   const normRoot = gitRoot.endsWith("/")
     ? gitRoot.replace(/\/+$/, "")
     : gitRoot;

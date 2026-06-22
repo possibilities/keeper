@@ -72,7 +72,9 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   byte-identical charter), **ephemeral** (`EPHEMERAL_PROJECTIONS` — currently just
   `pending_dispatches`, the in-flight launch-window set; folded by the boot drain like
   any projection so the global cursor advances, but `truncateEphemeralProjections`
-  runs AFTER the drain and BEFORE serving so the runtime set starts empty every boot;
+  runs AFTER the drain and BEFORE the actuator + mutating-RPC gate opens (fn-897 — the
+  read socket is already serving by then, but no consumer ACTS on the phantom because
+  the actuator stays gated) so the runtime set starts empty every boot;
   the autopilot re-derives genuine in-flight launches from live `jobs`/tmux panes, so
   empty-at-boot is correct and subsumes clearing any phantom a rewinding migration's
   full re-fold would resurrect — the v76→v79 dispatch jam, and the same hazard any later
@@ -87,7 +89,14 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   producer only). **Boot-producer contract:** capture `floor = max(events.id)` BEFORE
   the git scan, set `seed_required`, scan + populate the surface, then persist the
   floor + clear `seed_required` atomically; a crash mid-seed leaves `seed_required` set
-  so the next boot re-seeds. The boot-seed runs AFTER drain, BEFORE serving.
+  so the next boot re-seeds. The boot-seed runs AFTER drain, BEFORE the autopilot
+  actuator + mutating-RPC gate opens (fn-897 split serving into TWO gates: the
+  READ socket opens right after migrate during the drain; the boot-seed + drain
+  reaching head + ephemeral-truncate gate the actuator + mutating RPCs). **Unseeded
+  git reads as UNKNOWN, never CLEAN** (`seed_required=1` forces every readiness row
+  to `{kind:"unknown"}` and holds `keeper await git-clean` at `waiting`) — a
+  consumer must never treat the empty surface a not-yet-seeded boot produces as a
+  clean repo.
 - **A fold whose per-event cost grows with history — OR with board / projection
   size — is a re-fold time-bomb.** Any projection whose per-event fold cost scales
   with history length (the git fold's pass-1 explicit-attribution `buildExplicitAttribHoist`

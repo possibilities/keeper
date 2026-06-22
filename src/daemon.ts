@@ -104,6 +104,7 @@ import type {
 } from "./restore-worker";
 import { seedKilledSweep } from "./seed-sweep";
 import type {
+  BootCompleteMessage,
   KickMessage,
   ReplayRequestMessage,
   ReplayResultMessage,
@@ -406,18 +407,21 @@ export function buildPendingDispatchSweepRecords(
  * guarantees we never leave the long-running writer with checkpointing disabled
  * even if a drain throws.
  *
- * TRUNCATE here, PASSIVE in steady state: this call site runs at boot BEFORE any
- * worker thread spawns (the `new Worker(...)` sites are all later in `start`), so
- * the only connection attached to the DB is main's own writer — TRUNCATE has no
- * concurrent writer or reader to wait on. Emptying the WAL means every worker's
- * first `openDb` reads the main file with no WAL frames to scan and no `-shm`
- * recovery path to walk, removing a raciest-moment failure surface at boot. If an
- * external read-only attachment is present (keeper-py, the performance sitter,
- * dashctl), `PRAGMA wal_checkpoint` returns a busy-status ROW rather than throwing,
- * so the worst case degrades to a `busy_timeout`-bounded pause with PASSIVE
- * semantics and boot still proceeds. Steady-state checkpoints stay PASSIVE — the
- * hook no longer writes the DB (since fn-736) but live workers and the reaper run
- * concurrently there, and PASSIVE skips them without blocking.
+ * TRUNCATE here, PASSIVE in steady state. fn-897 B1 weakened the old "sole
+ * connection" precondition: the READ-ONLY server worker now spawns BEFORE this
+ * drain (so the control socket is reachable during catch-up), so its reader
+ * connection is attached when the final TRUNCATE runs — main's writer is no longer
+ * the only attachment. The reader is autocommit and idle between queries, so
+ * TRUNCATE usually still collapses the WAL; if a poll-tick read happens to pin a
+ * frame (or an external read-only attachment — keeper-py, the performance sitter,
+ * dashctl — is present), `PRAGMA wal_checkpoint` returns a busy-status ROW rather
+ * than throwing, so the worst case DEGRADES to busy/PASSIVE semantics and the
+ * steady-state PASSIVE heartbeat reclaims the space on its next cadence. Emptying
+ * the WAL (when it succeeds) still means a worker's first `openDb` reads the main
+ * file with no WAL frames to scan and no `-shm` recovery path to walk. Steady-state
+ * checkpoints stay PASSIVE — the hook no longer writes the DB (since fn-736) but
+ * live workers and the reaper run concurrently there, and PASSIVE skips them
+ * without blocking.
  */
 export function withBootDrainCheckpointTuning(
   db: Database,
@@ -1399,17 +1403,24 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // (potentially from-scratch) re-fold doesn't starve concurrent hook INSERTs
   // on synchronous WAL checkpoints. See `withBootDrainCheckpointTuning`.
   //
-  // The drain MUST finish before the worker spawns: otherwise the worker would
-  // fire wakes against a writer connection still iterating boot drain
-  // (harmless, drain is idempotent, but wasteful). The pre-sweep drain also
-  // brings the `jobs` projection up to the latest persisted lifecycle BEFORE
-  // `seedKilledSweep` reads it — without this, a SessionEnd that landed
-  // mid-boot would still look like a live row to the sweep.
+  // fn-897 B1: the READ-ONLY server worker now spawns BEFORE this drain (right
+  // after `migrate()`), so the control socket is reachable while the reducer is
+  // still catching up — `serveBootDrain()` below is DEFINED here but INVOKED only
+  // after the server-worker spawn. The drain still runs synchronously on main, and
+  // its order is unchanged (drain → seedKilledSweep → autopilot re-arm → trailing
+  // drain → git boot-seed → ephemeral-truncate). The wake worker (which fires
+  // wakes against the writer) and the STATE-CHANGING surfaces (autopilot actuator
+  // + mutating RPCs) stay gated AFTER the drain — only the read socket comes up
+  // early. The pre-sweep drain brings the `jobs` projection up to the latest
+  // persisted lifecycle BEFORE `seedKilledSweep` reads it — without this, a
+  // SessionEnd that landed mid-boot would still look like a live row to the sweep.
   //
-  // Step 2a — seed sweep. Fold dead/recycled jobs to `killed` BEFORE the
-  // workers spawn, so the projection is consistent the moment the UDS server
-  // starts serving. See `seedKilledSweep` for the Q7 match rules; the trailing
-  // drain folds the synthetic Killed events the sweep just emitted.
+  // Step 2a — seed sweep. Fold dead/recycled jobs to `killed` so the projection
+  // converges to the persisted lifecycle. The early read socket may serve a
+  // pre-sweep snapshot during the drain (the boot-status header's `catching_up`
+  // flag tells the client it's provisional); the actuator stays gated until the
+  // sweep + drain complete. See `seedKilledSweep` for the Q7 match rules; the
+  // trailing drain folds the synthetic Killed events the sweep just emitted.
   //
   // Boot-pacing: a stateless boot-phase parameter that gates a short OS-level
   // sleep AFTER each fold's COMMIT in the SAME `drain()` function steady
@@ -1426,6 +1437,10 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     paceMs: BOOT_DRAIN_PACE_MS,
     paceEvents: BOOT_DRAIN_PACE_EVENTS,
   };
+
+  // Dead-letter dir resolved up here so both the boot import (inside
+  // `serveBootDrain`) and the dead-letter worker (spawned later) share it.
+  const deadLetterDir = resolveDeadLetterDir();
 
   // Step 1b — events-log boot ingest. Land every per-pid NDJSON line the hook
   // wrote during downtime as an `events` row BEFORE the boot drain, so the drain
@@ -1461,17 +1476,21 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   mkdirSync(eventsLogDir, { recursive: true });
   scanEventsLogDir(db, eventsLogDir, eventsIngestCtx);
 
-  withBootDrainCheckpointTuning(db, () => {
-    drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
-    seedKilledSweep(db);
-    // Unconditional boot-append of an `AutopilotPaused{paused:true}` re-arm. The
-    // worker boots PAUSED in memory (safety default); this synthetic event
-    // preserves that in the durable `autopilot_state` projection so the viewer's
-    // banner reads `[paused]` honestly from boot. The trailing `drainToCompletion`
-    // folds it BEFORE `serverWorker` spawns. Raw `db.run` INSERT — the column list
-    // MUST stay in sync with the prepared form in `prepareStmts`.
-    db.run(
-      `INSERT INTO events (
+  // fn-897 B1: the boot drain + seed + ephemeral-truncate runs in `serveBootDrain`
+  // below, INVOKED after the server-worker spawn so the read socket is up during
+  // this synchronous catch-up. The sequence is byte-for-byte the pre-fn-897 order.
+  function serveBootDrain(): void {
+    withBootDrainCheckpointTuning(db, () => {
+      drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
+      seedKilledSweep(db);
+      // Unconditional boot-append of an `AutopilotPaused{paused:true}` re-arm. The
+      // worker boots PAUSED in memory (safety default); this synthetic event
+      // preserves that in the durable `autopilot_state` projection so the viewer's
+      // banner reads `[paused]` honestly from boot. The trailing `drainToCompletion`
+      // folds it BEFORE `serverWorker` spawns. Raw `db.run` INSERT — the column list
+      // MUST stay in sync with the prepared form in `prepareStmts`.
+      db.run(
+        `INSERT INTO events (
          ts, session_id, pid, hook_event, event_type, tool_name, matcher,
          cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
          subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
@@ -1479,48 +1498,48 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
          plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
          bash_mutation_kind, bash_mutation_targets, plan_files
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        Date.now() / 1000, // unix seconds as REAL
-        "autopilot", // stable synthetic session_id
-        null, // pid
-        "AutopilotPaused",
-        "autopilot_state", // synthetic event_type tag
-        null, // tool_name
-        null, // matcher
-        null, // cwd
-        null, // permission_mode
-        null, // agent_id
-        null, // agent_type
-        null, // stop_hook_active
-        JSON.stringify({ paused: true }), // boot re-arm
-        null, // subagent_agent_id
-        null, // spawn_name
-        null, // start_time
-        null, // slash_command
-        null, // skill_name
-        null, // plan_op
-        null, // plan_target
-        null, // plan_epic_id
-        null, // plan_task_id
-        null, // plan_subject_present
-        null, // tool_use_id
-        null, // config_dir
-        null, // plan_queue_jump
-        null, // bash_mutation_kind
-        null, // bash_mutation_targets
-        null, // plan_files
-      ],
-    );
-    // Unconditional boot-append of an `AutopilotCapSet` re-arm carrying the
-    // global concurrency cap, minted AFTER the `AutopilotPaused` re-arm (so the
-    // cap fold hits the shared-singleton CONFLICT branch and preserves the
-    // just-folded `paused` flag) and BEFORE the trailing `drainToCompletion`. The
-    // cap value is read from config HERE, on main, and FROZEN into the payload —
-    // `resolveConfig()` is NEVER called inside the fold (re-fold determinism). The
-    // column LAGS config until the next restart re-mints. Raw `db.run` INSERT —
-    // column list MUST stay in sync with `prepareStmts`.
-    db.run(
-      `INSERT INTO events (
+        [
+          Date.now() / 1000, // unix seconds as REAL
+          "autopilot", // stable synthetic session_id
+          null, // pid
+          "AutopilotPaused",
+          "autopilot_state", // synthetic event_type tag
+          null, // tool_name
+          null, // matcher
+          null, // cwd
+          null, // permission_mode
+          null, // agent_id
+          null, // agent_type
+          null, // stop_hook_active
+          JSON.stringify({ paused: true }), // boot re-arm
+          null, // subagent_agent_id
+          null, // spawn_name
+          null, // start_time
+          null, // slash_command
+          null, // skill_name
+          null, // plan_op
+          null, // plan_target
+          null, // plan_epic_id
+          null, // plan_task_id
+          null, // plan_subject_present
+          null, // tool_use_id
+          null, // config_dir
+          null, // plan_queue_jump
+          null, // bash_mutation_kind
+          null, // bash_mutation_targets
+          null, // plan_files
+        ],
+      );
+      // Unconditional boot-append of an `AutopilotCapSet` re-arm carrying the
+      // global concurrency cap, minted AFTER the `AutopilotPaused` re-arm (so the
+      // cap fold hits the shared-singleton CONFLICT branch and preserves the
+      // just-folded `paused` flag) and BEFORE the trailing `drainToCompletion`. The
+      // cap value is read from config HERE, on main, and FROZEN into the payload —
+      // `resolveConfig()` is NEVER called inside the fold (re-fold determinism). The
+      // column LAGS config until the next restart re-mints. Raw `db.run` INSERT —
+      // column list MUST stay in sync with `prepareStmts`.
+      db.run(
+        `INSERT INTO events (
          ts, session_id, pid, hook_event, event_type, tool_name, matcher,
          cwd, permission_mode, agent_id, agent_type, stop_hook_active, data,
          subagent_agent_id, spawn_name, start_time, slash_command, skill_name,
@@ -1528,83 +1547,84 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
          plan_subject_present, tool_use_id, config_dir, plan_queue_jump,
          bash_mutation_kind, bash_mutation_targets, plan_files
        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-      [
-        Date.now() / 1000, // unix seconds as REAL
-        "autopilot", // stable synthetic session_id
-        null, // pid
-        "AutopilotCapSet",
-        "autopilot_state", // synthetic event_type tag
-        null, // tool_name
-        null, // matcher
-        null, // cwd
-        null, // permission_mode
-        null, // agent_id
-        null, // agent_type
-        null, // stop_hook_active
-        // Config read on MAIN, frozen into the payload. `?? null` = unlimited.
-        JSON.stringify({
-          max_concurrent_jobs: resolveConfig().maxConcurrentJobs ?? null,
-        }),
-        null, // subagent_agent_id
-        null, // spawn_name
-        null, // start_time
-        null, // slash_command
-        null, // skill_name
-        null, // plan_op
-        null, // plan_target
-        null, // plan_epic_id
-        null, // plan_task_id
-        null, // plan_subject_present
-        null, // tool_use_id
-        null, // config_dir
-        null, // plan_queue_jump
-        null, // bash_mutation_kind
-        null, // bash_mutation_targets
-        null, // plan_files
-      ],
-    );
-    drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
-  });
-
-  // Step 2a.5 — LIVE-ONLY git boot-seed. The v79 skip-floor makes every
-  // historical `GitSnapshot`/`Commit` git fold no-op, so the git surface
-  // (`git_status` + `file_attributions` + the 3 jobs git-counters) is EMPTY after
-  // the boot drain. Re-derive it for currently-dirty files here — BEFORE serving,
-  // so `await git-clean` / `commit-work` / readiness consumers see a populated
-  // surface from the first board read. Runs AFTER `seedKilledSweep` (job rows
-  // must exist so attribution rendering resolves session state) and BEFORE the
-  // git-worker spawn (whose first emit is suppressed). DEGRADE-NOT-FATAL: the
-  // seed is time-bound and never throws; a git hang/failure serves the rest of
-  // the control plane and leaves `seed_required` set to retry. Reachable from the
-  // `startDaemon` test path (this is the same `runDaemon` body). Skipped only on
-  // a git-unselected boot (`want("git")` false) — no git surface to seed.
-  if (want("git")) {
-    seedGitProjection(db, stmts, {
-      drainToCompletion: (handle) =>
-        drainToCompletion(handle, DEFAULT_BATCH_SIZE, bootPace),
+        [
+          Date.now() / 1000, // unix seconds as REAL
+          "autopilot", // stable synthetic session_id
+          null, // pid
+          "AutopilotCapSet",
+          "autopilot_state", // synthetic event_type tag
+          null, // tool_name
+          null, // matcher
+          null, // cwd
+          null, // permission_mode
+          null, // agent_id
+          null, // agent_type
+          null, // stop_hook_active
+          // Config read on MAIN, frozen into the payload. `?? null` = unlimited.
+          JSON.stringify({
+            max_concurrent_jobs: resolveConfig().maxConcurrentJobs ?? null,
+          }),
+          null, // subagent_agent_id
+          null, // spawn_name
+          null, // start_time
+          null, // slash_command
+          null, // skill_name
+          null, // plan_op
+          null, // plan_target
+          null, // plan_epic_id
+          null, // plan_task_id
+          null, // plan_subject_present
+          null, // tool_use_id
+          null, // config_dir
+          null, // plan_queue_jump
+          null, // bash_mutation_kind
+          null, // bash_mutation_targets
+          null, // plan_files
+        ],
+      );
+      drainToCompletion(db, DEFAULT_BATCH_SIZE, bootPace);
     });
-  }
 
-  // Step 2a.6 — EPHEMERAL projection boot-truncate (fn-870). `pending_dispatches`
-  // is in-flight launch-window state, NOT replayed from history: the boot drain
-  // above folds historical `Dispatched`/`DispatchExpired` events (the cursor must
-  // advance for the deterministic projections), but the in-flight set must start
-  // empty so a rewinding migration's full re-fold can't resurrect weeks-old
-  // phantoms that consume the dispatch budget + per-root mutex (the v76→v79 jam).
-  // Empty-at-boot is CORRECT — the autopilot re-derives genuine in-flight launches
-  // from live `jobs`/tmux panes. MUST run AFTER the drain (live folds applied) and
-  // BEFORE serving / the autopilot worker spawn (no consumer ever observes a
-  // phantom). NOT worker-gated: the truncate is unconditional regardless of the
-  // selected worker set. See `truncateEphemeralProjections` / `EPHEMERAL_PROJECTIONS`.
-  truncateEphemeralProjections(db);
+    // Step 2a.5 — LIVE-ONLY git boot-seed. The v79 skip-floor makes every
+    // historical `GitSnapshot`/`Commit` git fold no-op, so the git surface
+    // (`git_status` + `file_attributions` + the 3 jobs git-counters) is EMPTY after
+    // the boot drain. Re-derive it for currently-dirty files here — BEFORE serving,
+    // so `await git-clean` / `commit-work` / readiness consumers see a populated
+    // surface from the first board read. Runs AFTER `seedKilledSweep` (job rows
+    // must exist so attribution rendering resolves session state) and BEFORE the
+    // git-worker spawn (whose first emit is suppressed). DEGRADE-NOT-FATAL: the
+    // seed is time-bound and never throws; a git hang/failure serves the rest of
+    // the control plane and leaves `seed_required` set to retry. Reachable from the
+    // `startDaemon` test path (this is the same `runDaemon` body). Skipped only on
+    // a git-unselected boot (`want("git")` false) — no git surface to seed.
+    if (want("git")) {
+      seedGitProjection(db, stmts, {
+        drainToCompletion: (handle) =>
+          drainToCompletion(handle, DEFAULT_BATCH_SIZE, bootPace),
+      });
+    }
 
-  // Step 2b — dead-letter boot import. Read every NDJSON file the hook wrote
-  // during downtime and INSERT OR IGNORE each parsed record into `dead_letters`
-  // as `waiting`. MUST run before the dead-letter worker AND the server worker
-  // start serving so a board client sees the full backlog. Idempotent
-  // (`INSERT OR IGNORE` on `dl_id`); a DIRECT operational-table write, NOT a fold.
-  const deadLetterDir = resolveDeadLetterDir();
-  scanDeadLetterDir(db, deadLetterDir);
+    // Step 2a.6 — EPHEMERAL projection boot-truncate (fn-870). `pending_dispatches`
+    // is in-flight launch-window state, NOT replayed from history: the boot drain
+    // above folds historical `Dispatched`/`DispatchExpired` events (the cursor must
+    // advance for the deterministic projections), but the in-flight set must start
+    // empty so a rewinding migration's full re-fold can't resurrect weeks-old
+    // phantoms that consume the dispatch budget + per-root mutex (the v76→v79 jam).
+    // Empty-at-boot is CORRECT — the autopilot re-derives genuine in-flight launches
+    // from live `jobs`/tmux panes. MUST run AFTER the drain (live folds applied) and
+    // BEFORE serving / the autopilot worker spawn (no consumer ever observes a
+    // phantom). NOT worker-gated: the truncate is unconditional regardless of the
+    // selected worker set. See `truncateEphemeralProjections` / `EPHEMERAL_PROJECTIONS`.
+    truncateEphemeralProjections(db);
+
+    // Step 2b — dead-letter boot import. Read every NDJSON file the hook wrote
+    // during downtime and INSERT OR IGNORE each parsed record into `dead_letters`
+    // as `waiting`. Runs during the early-served drain: a board client connecting
+    // mid-boot may briefly see a not-yet-imported backlog, with the boot-status
+    // header's `catching_up` flag signalling the snapshot is provisional. Idempotent
+    // (`INSERT OR IGNORE` on `dl_id`); a DIRECT operational-table write, NOT a fold.
+    scanDeadLetterDir(db, deadLetterDir);
+  } // end serveBootDrain
 
   // Coalescing flag: every wake sets it; the run loop resets it before each
   // drain pass. A wake arriving mid-drain leaves the flag set, so the loop runs
@@ -1729,6 +1749,12 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
   // a worker_threads option not in the DOM lib type, hence the cast. A daemon
   // without the wake worker never pumps main's reducer drain, so a fold-driven
   // test MUST include `wake`.
+  //
+  // fn-897 B1: this now spawns BEFORE `serveBootDrain()` (so the server worker can
+  // also come up early). A wake landing during the synchronous boot drain can't
+  // interleave — main's event loop is blocked in the drain — so the queued
+  // `pumpWakes()` fires only after the drain returns, where it's a no-op (already
+  // at head). Harmless: drain is idempotent and re-reads from the cursor.
   let worker: Worker | null = null;
   if (want("wake")) {
     worker = new Worker(new URL("./wake-worker.ts", import.meta.url).href, {
@@ -1761,13 +1787,18 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
     });
   }
 
-  // Spawn the server worker in the SAME post-migration window: its read-only
-  // `openDb` would fail loud against a missing/un-migrated DB. It binds the UDS,
-  // acquires the ownership lock, and runs its own `data_version` poll — fully
-  // decoupled from the reducer. `dbPath` is the only required field; sock/lock
-  // paths default to `resolveSockPath()` worker-side (KEEPER_SOCK honored there).
-  // `serverWorker` was forward-declared above (for `pumpWakes`'s kick); assign
-  // it here when selected. A boot without the server worker binds no UDS — a
+  // fn-897 B1: spawn the read-only server worker BEFORE the boot drain
+  // (`serveBootDrain()` is invoked just after this block). It needs only a
+  // migrated schema — its read-only `openDb` would fail loud against a
+  // missing/un-migrated DB, but `migrate()` ran inside `openDb` above — and is
+  // fully decoupled from the reducer (its own connection + `data_version` poll),
+  // so it can bind the UDS and serve reads while the reducer catches up. It boots
+  // with its gate un-`ready`: mutating RPCs are rejected `server_booting` and
+  // every frame carries `catching_up: true` until main posts `boot-complete`
+  // (after the drain). `dbPath` is the only required field; sock/lock paths
+  // default to `resolveSockPath()` worker-side (KEEPER_SOCK honored there).
+  // `serverWorker` was forward-declared above (for `pumpWakes`'s kick); assign it
+  // here when selected. A boot without the server worker binds no UDS — a
   // query/RPC test MUST include `server`.
   if (want("server")) {
     serverWorker = new Worker(
@@ -2116,6 +2147,28 @@ export function startDaemon(opts: DaemonOptions = {}): DaemonHandle {
       if (!shuttingDown) fatalExit();
     });
   } // end `if (want("server"))`
+
+  // fn-897 B1: NOW run the synchronous boot drain + seed sweep + git boot-seed +
+  // ephemeral-truncate. The read-only server worker is already bound (above), so
+  // the control socket is reachable while this catch-up runs; every served frame
+  // carries `catching_up: true` until we signal boot-complete just below. This is
+  // also where the early server's reader connection becomes a concurrent
+  // attachment during the final `wal_checkpoint(TRUNCATE)` (see
+  // `withBootDrainCheckpointTuning`): the reader is autocommit/idle between
+  // queries, so TRUNCATE usually still collapses the WAL; if a poll-tick read
+  // happens to pin a frame, TRUNCATE degrades to busy/PASSIVE semantics (returns a
+  // busy ROW, never throws) and the steady-state PASSIVE heartbeat reclaims the
+  // space on the next cadence — an accepted, documented degrade.
+  serveBootDrain();
+
+  // fn-897 B1: drain reached head + git-seed + ephemeral-truncate are done.
+  // Flip the server worker's boot gate so mutating RPCs are accepted and the
+  // `catching_up` header settles. One-way, idempotent; `?.` tolerates a
+  // server-less boot. The autopilot actuator (spawned below) is the OTHER gated
+  // surface — it arms only after this point because it spawns AFTER this line.
+  serverWorker?.postMessage({
+    type: "boot-complete",
+  } satisfies BootCompleteMessage);
 
   // Spawn the transcript worker in the SAME post-migration window. It watches
   // the external transcript tree and posts a `transcript-title` message whenever

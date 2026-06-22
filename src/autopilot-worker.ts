@@ -44,7 +44,7 @@ import {
   type BackstopMessage,
   buildTimeoutRecord,
 } from "./backstop-telemetry";
-import { openDb } from "./db";
+import { openDb, readGitProjectionSeedRequired } from "./db";
 import { defaultPlanPrompt } from "./dispatch-command";
 import {
   agentwrapLaunch,
@@ -392,6 +392,15 @@ export interface ReconcileSnapshot {
    * upstreams) via {@link computeEligibleEpics} and suppresses `work` outside it.
    */
   armedIds: Set<string>;
+  /**
+   * fn-897 B1: `git_projection_state.seed_required`. While the live-only git
+   * surface is unseeded (post-restart, before the boot-seed), it reads EMPTY —
+   * so `reconcile` forces every row UNKNOWN via `computeReadiness` and dispatches
+   * NOTHING until it seeds. On a normal boot the autopilot worker spawns AFTER the
+   * boot-seed, so this is `false`; it guards the re-fold-migration / restart-race
+   * window where the reconciler could otherwise read an unseeded surface.
+   */
+  gitSeedRequired: boolean;
 }
 
 /**
@@ -900,6 +909,9 @@ export function reconcile(
     // mutex's pass-2 tiebreak so an armed epic claims a free root over an
     // earlier-sorted unarmed sibling.
     eligible,
+    // fn-897 B1: unseeded git surface → force every row UNKNOWN (dispatch nothing
+    // until the boot-seed populates the surface).
+    snapshot.gitSeedRequired,
   );
 
   // Harvest the completion set from the ONE readiness pass above (never a second
@@ -1570,6 +1582,11 @@ export async function loadReconcileSnapshot(
     }
   }
 
+  // fn-897 B1: read the git boot-seed flag so `reconcile` dispatches nothing while
+  // the surface is unseeded. The read connection is the autopilot's own; the
+  // helper degrades a missing row to `true` (treat unknown as unseeded).
+  const gitSeedRequired = readGitProjectionSeedRequired(db);
+
   return {
     epics,
     jobs,
@@ -1581,6 +1598,7 @@ export async function loadReconcileSnapshot(
     pendingDispatches,
     mode,
     armedIds,
+    gitSeedRequired,
   };
 }
 

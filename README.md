@@ -123,16 +123,32 @@ absorb a synchronous checkpoint that would hold the writer lock for seconds)
 and inserts a short OS-level yield AFTER each fold's COMMIT — a bounded
 event-count budget (~500 events × 5 ms ≈ 2.5 s) so the bounce window stays
 small under a normal backlog, and a from-scratch re-fold catches up to head
-without paying the per-event sleep for minutes. The end-of-boot WAL checkpoint
-is `TRUNCATE`: it runs before any worker thread spawns, so main's writer is the
-only connection attached and there is nothing to block on. Emptying the WAL means
-every worker's first `openDb` reads the main file with no WAL frames to scan and
-no `-shm` recovery path to walk — closing a boot-race failure surface under load.
-(If an external read-only attachment is present, `wal_checkpoint` returns a busy
-status row rather than throwing, degrading to a `busy_timeout`-bounded PASSIVE
-pause; boot proceeds.) Steady-state checkpoints stay `PASSIVE` (writer-skipping),
-never `TRUNCATE`: live workers and background readers run concurrently there, and
-PASSIVE skips them without blocking.
+without paying the per-event sleep for minutes. To bound peak WAL during a large
+drain it also issues a `wal_checkpoint(PASSIVE)` between batches whenever the WAL
+crosses a size/event threshold (PASSIVE never blocks the per-event transaction).
+
+**Two boot gates, not one (fn-897).** The READ-ONLY subscribe socket comes up
+right after `migrate()` — BEFORE the boot drain — so the control plane is
+reachable while the reducer is still catching up. STATE-CHANGING surfaces stay
+gated behind drain-reaches-head + git-seed + ephemeral-truncate: the autopilot
+actuator arms only after that point, and a mutating RPC issued during the drain
+is rejected with a `server_booting` error. Reads are served throughout, and every
+reply carries a **boot-status header** (`rev` / `head_event_id` / `catching_up` /
+`git_seed_required`) so a client can tell it is seeing provisional catch-up state
+and never caches an empty mid-drain projection as ground truth. The unseeded git
+surface reads as "unknown", never "clean" (readiness forces every row unknown and
+`keeper await git-clean` holds `waiting` until the boot-seed runs).
+
+The end-of-boot WAL checkpoint is `TRUNCATE`. With the early read socket now
+attached during the drain, main's writer is no longer the SOLE connection — but
+the server's reader is autocommit and idle between queries, so TRUNCATE usually
+still collapses the WAL; if a poll-tick read happens to pin a frame, TRUNCATE
+degrades to busy/PASSIVE semantics (it returns a busy status row, never throws)
+and the steady-state PASSIVE heartbeat reclaims the space on its next cadence — an
+accepted, documented degrade. (An external read-only attachment degrades the same
+way.) Steady-state checkpoints stay `PASSIVE` (writer-skipping), never `TRUNCATE`:
+live workers and background readers run concurrently there, and PASSIVE skips them
+without blocking.
 
 Keeper also exposes an **NDJSON-over-UDS subscribe + RPC server** as a second
 Worker thread. The read surface is **namespaced by collection**: a client names

@@ -180,6 +180,10 @@ function makeSnapshot(
     // armed-mode tests override these.
     mode: "yolo",
     armedIds: new Set(),
+    // fn-897 B1: git boot-seed flag. Default `false` (seeded) so every
+    // pre-fn-897 test sees the normal dispatch behavior; the unseeded-gate test
+    // overrides it to `true`.
+    gitSeedRequired: false,
     ...overrides,
   };
 }
@@ -627,6 +631,17 @@ test("reconcile: ready task → planned `work` launch with correct argv shape", 
   expect(plan?.workerCommand).toBe(
     "cd /repo && claude --model sonnet --effort max --agentwrap-no-confirm --name work::fn-1-foo.1 '/plan:work fn-1-foo.1'",
   );
+});
+
+test("fn-897 B1: reconcile dispatches NOTHING while the git surface is unseeded", () => {
+  const epic = makeEpic({
+    tasks: [makeTask({ task_id: "fn-1-foo.1" })],
+  });
+  // Same ready epic, but the git surface is unseeded (post-restart, pre-seed):
+  // every readiness row is forced UNKNOWN, so no `work` is dispatched.
+  const snap = makeSnapshot({ epics: [epic], gitSeedRequired: true });
+  const decision = reconcile(snap, makeState(), 0);
+  expect(decision.launches).toEqual([]);
 });
 
 test("reconcile: ready close row → planned `close` launch", () => {
@@ -2571,6 +2586,13 @@ async function withSeededDb(
   // Migrate the schema, then reopen writable for the test body.
   openDb(dbPath).db.close();
   const { db } = openDb(dbPath, { readonly: false });
+  // fn-897 B1: these tests model the RUNNING daemon — by the time the autopilot
+  // calls `loadReconcileSnapshot`, the boot-seed has already cleared
+  // `seed_required`. A freshly-migrated DB defaults `seed_required = 1`, which
+  // would (correctly, by the new gate) force every readiness verdict to UNKNOWN
+  // and suppress the completed-epic verdicts these tests assert. Clear it to
+  // reflect the seeded runtime state.
+  db.run("UPDATE git_projection_state SET seed_required = 0 WHERE id = 1");
   try {
     await body(db);
   } finally {

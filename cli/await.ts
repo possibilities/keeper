@@ -797,6 +797,12 @@ export async function runAwait(
   // the dedicated collection streams. Null until first-painted.
   let latestGitRows: readonly GitStatus[] | null = null;
   let latestJobRows: readonly Job[] | null = null;
+  // fn-897 B1: latest `git_seed_required` off the boot-status header. While the
+  // daemon is booting, the git surface reads EMPTY only because the boot-seed
+  // hasn't run — so `git-clean` must hold `waiting` (UNKNOWN, never "clean")
+  // until it seeds. Defaults `false` (steady state / a server that stamps no
+  // header → treat as seeded).
+  let latestGitSeedRequired = false;
   // Latest readiness snapshot (null until first paint); planctl + (when
   // riding readiness) git/jobs read off it.
   let latestReadiness: ReadinessClientSnapshot | null = null;
@@ -1348,7 +1354,14 @@ export async function runAwait(
           evals[i] = { kind: "waiting" };
           continue;
         }
-        const result = gitCleanState(deps.gitRoot, latestGitRows);
+        // fn-897 B1: pass the boot-status `git_seed_required` so an unseeded
+        // surface holds `waiting` (UNKNOWN), never falsely reports "clean" off
+        // the empty rows it produces during catch-up.
+        const result = gitCleanState(
+          deps.gitRoot,
+          latestGitRows,
+          latestGitSeedRequired,
+        );
         slot.lastEval = result;
         logProgress(slot, result);
         slot.met = result.kind === "met";
@@ -1527,6 +1540,14 @@ export async function runAwait(
     void evaluate();
   };
 
+  // fn-897 B1: latch `git_seed_required` off the boot-status header (carried on
+  // every served frame during catch-up). Threaded into BOTH the readiness and
+  // dedicated-git subscribes so `git-clean` never reports "clean" off an unseeded
+  // surface, regardless of which stream feeds the git rows.
+  const onBootStatus = (boot: { git_seed_required: boolean }): void => {
+    latestGitSeedRequired = boot.git_seed_required;
+  };
+
   const onJobRows = (rows: Record<string, unknown>[]): void => {
     latestJobRows = rows as unknown as Job[];
     paintGate.jobs = true;
@@ -1661,6 +1682,8 @@ export async function runAwait(
       onSnapshot: onReadinessSnapshot,
       onLifecycle: onLifecycle("readiness"),
       onFatal,
+      // fn-897 B1: capture the git-seed state when this stream feeds git rows.
+      ...(hasGitClean ? { onBootStatus } : {}),
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });
@@ -1673,6 +1696,8 @@ export async function runAwait(
       onRows: onGitRows,
       onLifecycle: onLifecycle("git"),
       onFatal,
+      // fn-897 B1: capture the git-seed state from the dedicated git stream.
+      onBootStatus,
       ...(giveUpExtras ?? {}),
       ...(deps.connect === undefined ? {} : { connect: deps.connect }),
     });

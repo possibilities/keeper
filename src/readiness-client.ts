@@ -60,6 +60,7 @@
 import { computeEligibleEpics } from "./armed-closure";
 import { getCollection } from "./collections";
 import {
+  type BootStatus,
   encodeFrame,
   type FilterValue,
   LineBuffer,
@@ -561,6 +562,13 @@ interface MultiOptions {
   readonly onLifecycle?: LifecycleCallback;
   readonly onFatal: (err: FatalError) => void;
   readonly connect: ConnectFactory;
+  /**
+   * fn-897 B1: invoked with the boot-status header carried on every `result`
+   * frame (when the server stamps one — present only during catch-up). Lets a
+   * consumer (e.g. `keeper await git-clean`) know the git surface is unseeded so
+   * it never treats an empty projection as "clean". Optional — most callers omit.
+   */
+  readonly onBootStatus?: (boot: BootStatus) => void;
   /** Opt-in bounded give-up. Absent → reconnect-forever. */
   readonly giveUpPolicy?: GiveUpPolicy;
   /**
@@ -586,6 +594,7 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
     onFatal,
     connect,
     giveUpPolicy,
+    onBootStatus,
   } = opts;
   const now = opts.now ?? Date.now;
   const byCollection = new Map(states.map((s) => [s.collection, s]));
@@ -845,6 +854,12 @@ function subscribeMulti(opts: MultiOptions): ReadinessClientHandle {
 
   function handleFrame(frame: ServerFrame): void {
     if (frame.type === "result") {
+      // fn-897 B1: surface the boot-status header (present during catch-up) so a
+      // consumer can detect an unseeded git surface / still-draining reducer. Fired
+      // before the per-state handling so a slot evaluating on this same frame sees it.
+      if (onBootStatus !== undefined && frame.boot !== undefined) {
+        onBootStatus(frame.boot);
+      }
       // Id-first routing: prefer the echoed sub `id`, fall back to `collection`
       // (a legacy server that doesn't echo `id`). Doing this uniformly here
       // keeps result/patch/meta consistent for a future consumer that registers
@@ -1246,6 +1261,8 @@ export interface SubscribeCollectionOptions {
   readonly giveUpPolicy?: GiveUpPolicy;
   /** Injectable clock for the give-up deadline (default `Date.now`). */
   readonly now?: () => number;
+  /** fn-897 B1: boot-status header callback (see {@link MultiOptions}). */
+  readonly onBootStatus?: (boot: BootStatus) => void;
 }
 
 /**
@@ -1297,6 +1314,9 @@ export function subscribeCollection(
       ? {}
       : { giveUpPolicy: opts.giveUpPolicy }),
     ...(opts.now === undefined ? {} : { now: opts.now }),
+    ...(opts.onBootStatus === undefined
+      ? {}
+      : { onBootStatus: opts.onBootStatus }),
   });
 }
 
@@ -1338,6 +1358,9 @@ export interface SubscribeOptions {
    * readiness CLI callers rely on. Only the `jobs` collection is affected.
    */
   readonly jobsLimit?: number;
+  /** fn-897 B1: boot-status header callback (see {@link MultiOptions}). Fires
+   *  independently of `onSnapshot` whenever a `result` frame carries a header. */
+  readonly onBootStatus?: (boot: BootStatus) => void;
 }
 
 /**
@@ -1349,6 +1372,11 @@ export function subscribeReadiness(
   opts: SubscribeOptions,
 ): ReadinessClientHandle {
   const { sockPath, idPrefix, onSnapshot, onLifecycle } = opts;
+  // fn-897 B1: latch the latest git-seed state off the boot-status header so the
+  // readiness pass forces UNKNOWN while the surface is unseeded (the autopilot
+  // never dispatches against a not-yet-seeded git surface). Defaults `false`
+  // (steady state / a server that stamps no header → assume seeded).
+  let gitSeedRequired = false;
   const onFatal = opts.onFatal ?? defaultOnFatal;
   const connect = opts.connect ?? defaultConnect;
 
@@ -1575,6 +1603,9 @@ export function subscribeReadiness(
       // Armed-mode eligibility in `armed` mode, `undefined` in `yolo`. Makes
       // the board's per-root tiebreak agree with the reconciler's dispatch.
       eligibleEpicIds,
+      // fn-897 B1: unseeded git surface → every row forced UNKNOWN (no dispatch
+      // against a not-yet-seeded surface).
+      gitSeedRequired,
     );
     const deadLettersTyped = projectRows<DeadLetter>(deadLetters);
     // Read from `state.rows` (not `byId.values()`) — the composite
@@ -1607,5 +1638,12 @@ export function subscribeReadiness(
       ? {}
       : { giveUpPolicy: opts.giveUpPolicy }),
     ...(opts.now === undefined ? {} : { now: opts.now }),
+    // fn-897 B1: latch the git-seed state for the readiness pass AND forward to a
+    // caller-supplied `onBootStatus` (the readiness pass reads the latch on its
+    // NEXT emit, which fires on the same frame).
+    onBootStatus: (boot: BootStatus): void => {
+      gitSeedRequired = boot.git_seed_required;
+      opts.onBootStatus?.(boot);
+    },
   });
 }

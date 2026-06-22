@@ -353,6 +353,14 @@ export function computeReadiness(
   // LEAF and never derives it. Appended LAST so default-reliant call sites stay
   // valid.
   eligibleEpicIds?: Set<string>,
+  // fn-897 B1: `git_projection_state.seed_required`. While the live-only git
+  // surface is UNSEEDED (the daemon restarted and the boot-seed hasn't run yet),
+  // it reads EMPTY — so a dispatch decision would race against a surface that
+  // can't yet report dirtiness/orphans. When `true`, EVERY row is forced to
+  // `{tag:"blocked", reason:{kind:"unknown"}}` so the autopilot never dispatches
+  // against an unknown surface. Default `false` so steady-state / test / simulator
+  // callers (and the byte-identical re-fold simulator) behave exactly as before.
+  gitSeedRequired = false,
 ): ReadinessSnapshot {
   // Drop pendings past the hard ceiling BEFORE deriving occupancy: a stale
   // launch window must not count toward the `dispatch-pending` verdict, the
@@ -487,6 +495,16 @@ export function computeReadiness(
     fallbackRoots,
     eligibleEpicIds,
   );
+
+  // fn-897 B1: unseeded git surface → force every row UNKNOWN so the autopilot
+  // can't dispatch against a surface that reads empty only because the boot-seed
+  // hasn't run. Applied AFTER the normal pass (cheaper to overwrite than to gate
+  // every predicate) and BEFORE the header rollup so epics roll up to blocked too.
+  if (gitSeedRequired) {
+    const unknown: Verdict = { tag: "blocked", reason: { kind: "unknown" } };
+    for (const key of perTask.keys()) perTask.set(key, unknown);
+    for (const key of perCloseRow.keys()) perCloseRow.set(key, unknown);
+  }
 
   // Epic header rollup.
   for (const epic of epicsArr) {

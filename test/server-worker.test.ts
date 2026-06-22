@@ -45,6 +45,7 @@ import {
   ASYNC_RPC_REGISTRY,
   acquireLock,
   BadParamsError,
+  type BootGate,
   type ConnState,
   type DispatchAsyncCtx,
   diffTick,
@@ -1085,6 +1086,96 @@ test("dispatchLine async rpc → handler throw flows to rpc_failed via onAsyncRe
   }
 });
 
+// ---------------------------------------------------------------------------
+// fn-897 B1: boot gate — mutating RPCs rejected `server_booting` until ready
+// ---------------------------------------------------------------------------
+
+test("fn-897 B1: mutating rpc returns server_booting while the gate is un-ready", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  try {
+    const conn = newConn();
+    const gate: BootGate = { ready: false };
+    // `set_autopilot_mode` is a MUTATING method — gated BEFORE the registry
+    // lookup, so an un-ready gate rejects it even though the handler isn't
+    // registered in this unit test.
+    const frames = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "set_autopilot_mode" }),
+      db,
+      undefined,
+      newResultMemo(),
+      gate,
+    );
+    expect(frames).toHaveLength(1);
+    const frame = frames[0] as ErrorFrame;
+    expect(frame.type).toBe("error");
+    expect(frame.code).toBe("server_booting");
+    expect(frame.id).toBe("r1");
+  } finally {
+    db.close();
+  }
+});
+
+test("fn-897 B1: a READ rpc is NOT gated by the boot gate (only mutating methods)", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  const teardown = withRpc("read_noop", () => ({ ok: true }));
+  try {
+    const conn = newConn();
+    const gate: BootGate = { ready: false };
+    const frames = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "read_noop" }),
+      db,
+      undefined,
+      newResultMemo(),
+      gate,
+    );
+    expect(frames).toHaveLength(1);
+    // Served normally (NOT server_booting) — the gate only fences mutating methods.
+    expect((frames[0] as ServerFrame).type).toBe("rpc_result");
+  } finally {
+    teardown();
+    db.close();
+  }
+});
+
+test("fn-897 B1: once the gate flips ready, a mutating rpc is no longer rejected", () => {
+  const { db } = openDb(dbPath, { readonly: false, migrate: false });
+  // Register `set_autopilot_mode` as a local no-op so the ready path resolves to
+  // a real handler instead of unknown_method.
+  registerRpc("set_autopilot_mode", () => ({ ok: true }));
+  try {
+    const conn = newConn();
+    const gate: BootGate = { ready: false };
+    const blocked = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r1", method: "set_autopilot_mode" }),
+      db,
+      undefined,
+      newResultMemo(),
+      gate,
+    );
+    expect((blocked[0] as ErrorFrame).code).toBe("server_booting");
+    gate.ready = true;
+    const allowed = dispatchLine(
+      db,
+      conn,
+      JSON.stringify({ type: "rpc", id: "r2", method: "set_autopilot_mode" }),
+      db,
+      undefined,
+      newResultMemo(),
+      gate,
+    );
+    expect((allowed[0] as ServerFrame).type).toBe("rpc_result");
+  } finally {
+    unregisterRpc("set_autopilot_mode");
+    db.close();
+  }
+});
+
 test("dispatchLine async rpc → BadParamsError throw flows to bad_params via onAsyncResult", async () => {
   const { db } = openDb(dbPath, { readonly: false, migrate: false });
   const teardown = withAsyncRpc("async_strict", async () => {
@@ -1337,6 +1428,147 @@ test("startServer binds the socket and stop() releases socket + lock", () => {
   server.stop();
   expect(existsSync(sockPath)).toBe(false);
   expect(existsSync(lockPath)).toBe(false);
+  db.close();
+});
+
+test("fn-897 B1: a real query during catch-up carries the boot-status header (rev<head, catching_up, seed flags)", async () => {
+  // Arrange a catch-up state on disk: rev=5, head=10, git unseeded. The reader
+  // connection serves these via the boot-status header on the result frame.
+  {
+    const { db: w } = openDb(dbPath, { readonly: false, migrate: false });
+    setWorldRev(w, 5);
+    for (let i = 1; i <= 10; i++) {
+      w.run(
+        "INSERT INTO events (id, ts, session_id, hook_event, event_type) VALUES (?, ?, 's', 'X', 'x')",
+        [i, i],
+      );
+    }
+    w.run("UPDATE git_projection_state SET seed_required = 1 WHERE id = 1");
+    w.close();
+  }
+  const { db } = openDb(dbPath, { readonly: true });
+  // Un-ready gate → frames stamped `catching_up`, mutating RPCs rejected.
+  const gate: BootGate = { ready: false };
+  const server = startServer(
+    db,
+    sockPath,
+    lockPath,
+    undefined,
+    undefined,
+    gate,
+  );
+
+  const frames: ServerFrame[] = [];
+  let buf = "";
+  const client = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      data(_s, chunk) {
+        buf += chunk.toString("utf8");
+        let nl = buf.indexOf("\n");
+        while (nl !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim().length > 0) frames.push(JSON.parse(line));
+          nl = buf.indexOf("\n");
+        }
+      },
+      error() {},
+    },
+  });
+  client.write(
+    `${JSON.stringify({ type: "query", id: "q1", collection: "jobs" })}\n`,
+  );
+  client.write(
+    `${JSON.stringify({ type: "rpc", id: "m1", method: "set_autopilot_mode" })}\n`,
+  );
+
+  const got = await retryUntil(
+    () => (frames.length >= 2 ? frames : null),
+    5000,
+  );
+  expect(got).not.toBeNull();
+  const result = frames.find((f) => f.type === "result") as ResultFrame;
+  expect(result).toBeDefined();
+  expect(result.boot).toBeDefined();
+  expect(result.boot?.rev).toBe(5);
+  expect(result.boot?.head_event_id).toBe(10);
+  expect(result.boot?.catching_up).toBe(true);
+  expect(result.boot?.git_seed_required).toBe(true);
+  // The mutating rpc is rejected `server_booting` with the boot header too.
+  const err = frames.find((f) => f.type === "error") as ErrorFrame;
+  expect(err).toBeDefined();
+  expect(err.code).toBe("server_booting");
+  expect(err.boot?.catching_up).toBe(true);
+
+  client.end();
+  server.stop();
+  db.close();
+});
+
+test("fn-897 B1: once the gate is ready and rev==head, catching_up settles and mutating RPCs pass the gate", async () => {
+  {
+    const { db: w } = openDb(dbPath, { readonly: false, migrate: false });
+    setWorldRev(w, 4);
+    for (let i = 1; i <= 4; i++) {
+      w.run(
+        "INSERT INTO events (id, ts, session_id, hook_event, event_type) VALUES (?, ?, 's', 'X', 'x')",
+        [i, i],
+      );
+    }
+    // Seeded surface.
+    w.run("UPDATE git_projection_state SET seed_required = 0 WHERE id = 1");
+    w.close();
+  }
+  const { db } = openDb(dbPath, { readonly: true });
+  const gate: BootGate = { ready: true };
+  const server = startServer(
+    db,
+    sockPath,
+    lockPath,
+    undefined,
+    undefined,
+    gate,
+  );
+
+  const frames: ServerFrame[] = [];
+  let buf = "";
+  const client = await Bun.connect({
+    unix: sockPath,
+    socket: {
+      data(_s, chunk) {
+        buf += chunk.toString("utf8");
+        let nl = buf.indexOf("\n");
+        while (nl !== -1) {
+          const line = buf.slice(0, nl);
+          buf = buf.slice(nl + 1);
+          if (line.trim().length > 0) frames.push(JSON.parse(line));
+          nl = buf.indexOf("\n");
+        }
+      },
+      error() {},
+    },
+  });
+  client.write(
+    `${JSON.stringify({ type: "query", id: "q1", collection: "jobs" })}\n`,
+  );
+
+  const result = await retryUntil(
+    () =>
+      (frames.find((f) => f.type === "result") as ResultFrame | undefined) ??
+      null,
+    5000,
+  );
+  expect(result).not.toBeNull();
+  // Memo path is used at steady state — it may serve a PreSerialized line WITHOUT
+  // the boot header. When a header IS present, `catching_up` must be false.
+  if (result?.boot !== undefined) {
+    expect(result.boot.catching_up).toBe(false);
+    expect(result.boot.git_seed_required).toBe(false);
+  }
+
+  client.end();
+  server.stop();
   db.close();
 });
 

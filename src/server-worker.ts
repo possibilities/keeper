@@ -56,6 +56,7 @@ import {
 import { openDb, resolveSockPath } from "./db";
 import type { RetryDispatchVerb } from "./dispatch-command";
 import {
+  type BootStatus,
   type ClientFrame,
   type ErrorFrame,
   encodeFrame,
@@ -112,6 +113,19 @@ export interface ShutdownMessage {
  */
 export interface KickMessage {
   type: "kick";
+}
+
+/**
+ * Main→worker boot-complete signal (fn-897 B1). The server worker now spawns
+ * right after `migrate()` — BEFORE the boot drain — so it serves reads while the
+ * reducer is still catching up. Main posts this ONCE the boot drain has reached
+ * head AND the git boot-seed + ephemeral-truncate have run (today's post-drain
+ * spawn point). Until it arrives, the worker rejects every MUTATING rpc with a
+ * `server_booting` error so no consumer can act on partial state. One-way and
+ * idempotent (a duplicate just re-sets the latch true).
+ */
+export interface BootCompleteMessage {
+  type: "boot-complete";
 }
 
 /**
@@ -1456,6 +1470,7 @@ export function dispatchLine(
   writerDb: Database | undefined,
   asyncCtx: DispatchAsyncCtx | undefined,
   memo: ResultMemo,
+  bootGate?: BootGate,
 ): (ServerFrame | PreSerialized)[];
 export function dispatchLine(
   db: Database,
@@ -1464,6 +1479,7 @@ export function dispatchLine(
   writerDb?: Database,
   asyncCtx?: DispatchAsyncCtx,
   memo?: ResultMemo,
+  bootGate?: BootGate,
 ): (ServerFrame | PreSerialized)[] {
   if (line.trim().length === 0) {
     return []; // blank keep-alive line — ignore
@@ -1508,7 +1524,15 @@ export function dispatchLine(
       // (`dispatchLine` is no-self-heal — it must never throw). Only attempted
       // when a memo was threaded in (the worker passes it; direct-dispatch
       // tests omit it).
-      if (memo) {
+      //
+      // fn-897 B1: SKIP the memo while booting (gate un-`ready`). The memo emits
+      // a PreSerialized line built WITHOUT the boot-status header, but the header
+      // must ride EVERY reply during catch-up — so during boot we fall through to
+      // the un-memoized object-frame path that `handleData` stamps. The memo's win
+      // is a steady-state optimization; the brief boot window can afford the
+      // un-memoized SELECT, and this keeps the steady-state memo line
+      // byte-identical (no boot field once `ready`).
+      if (memo && (bootGate === undefined || bootGate.ready)) {
         try {
           const memoResult = serveFromMemo(db, conn, frame, worldRev, memo);
           if (memoResult) return memoResult;
@@ -1570,7 +1594,7 @@ export function dispatchLine(
       return [];
     }
     case "rpc": {
-      return dispatchRpc(db, frame as RpcFrame, writerDb, asyncCtx);
+      return dispatchRpc(db, frame as RpcFrame, writerDb, asyncCtx, bootGate);
     }
     default: {
       const t = (frame as { type?: unknown }).type;
@@ -1605,6 +1629,7 @@ function dispatchRpc(
   frame: RpcFrame,
   writerDb: Database | undefined,
   asyncCtx: DispatchAsyncCtx | undefined,
+  bootGate?: BootGate,
 ): ServerFrame[] {
   // `id` must be a non-empty string — without it the client can't correlate
   // the response, and we won't echo `undefined` to paper over the omission.
@@ -1623,6 +1648,27 @@ function dispatchRpc(
         db,
         "bad_frame",
         "rpc frame missing non-empty string `method`",
+        id,
+      ),
+    ];
+  }
+
+  // fn-897 B1: gate MUTATING RPCs until boot-complete. The read socket comes up
+  // during the boot drain, but a state-changing RPC against partially-folded
+  // projections (e.g. `set_epic_armed` against unfolded job-link state →
+  // phantom-ready dispatch) is the core hazard, so it's enforced HERE at dispatch
+  // (not by convention). Reads are served throughout. A `bootGate` of `undefined`
+  // (direct-dispatch unit tests) leaves the pre-fn-897 behavior verbatim.
+  if (
+    bootGate !== undefined &&
+    !bootGate.ready &&
+    MUTATING_RPC_METHODS.has(frame.method)
+  ) {
+    return [
+      errorFrame(
+        db,
+        "server_booting",
+        `daemon is still booting (catching up); rpc \`${frame.method}\` rejected until the reducer reaches head and the git surface is seeded`,
         id,
       ),
     ];
@@ -1750,6 +1796,112 @@ function readWorldRev(db: Database): number {
     .prepare("SELECT last_event_id FROM reducer_state WHERE id = 1")
     .get() as { last_event_id: number } | null;
   return row ? row.last_event_id : 0;
+}
+
+/**
+ * Per-worker-instance boot gate (fn-897 B1). `ready` flips `true` when main posts
+ * `{type:"boot-complete"}` after drain-reaches-head + git-seed + ephemeral-truncate.
+ * Until then mutating RPCs are rejected `server_booting` and every served frame
+ * carries `catching_up: true`. An object (not a bare boolean) so the dispatch and
+ * framing closures share one mutable latch by reference.
+ */
+export interface BootGate {
+  ready: boolean;
+}
+
+/**
+ * Read the {@link BootStatus} header for the current frame (fn-897 B1).
+ * Three cheap singleton reads on the reader connection:
+ *   - `rev` = `reducer_state.last_event_id` (the global fold cursor).
+ *   - `head_event_id` = `max(events.id)` (the newest ingested event; 0 on empty).
+ *   - `git_seed_required` = `git_projection_state.seed_required != 0` (the live-only
+ *     git surface has not been boot-seeded, so it reads EMPTY).
+ * `catching_up` is true while the gate is un-`ready` (the durable signal main owns):
+ * reads are served throughout the drain, and the header tells the client the data
+ * may still be partial. Pure read; never throws into the dispatch path (the caller
+ * is no-self-heal), so each read defends against a missing row.
+ */
+function readBootStatus(db: Database, gate: BootGate): BootStatus {
+  let rev = 0;
+  let head = 0;
+  let seedRequired = false;
+  try {
+    const r = db
+      .prepare("SELECT last_event_id FROM reducer_state WHERE id = 1")
+      .get() as { last_event_id: number } | null;
+    rev = r ? r.last_event_id : 0;
+  } catch {
+    rev = 0;
+  }
+  try {
+    const h = db.prepare("SELECT MAX(id) AS head FROM events").get() as {
+      head: number | null;
+    } | null;
+    head = h && h.head !== null ? h.head : 0;
+  } catch {
+    head = 0;
+  }
+  try {
+    const g = db
+      .prepare("SELECT seed_required FROM git_projection_state WHERE id = 1")
+      .get() as { seed_required: number } | null;
+    // Absent row → treat as unseeded (the conservative default — never report
+    // "clean" for a surface we can't confirm is seeded).
+    seedRequired = g == null ? true : g.seed_required !== 0;
+  } catch {
+    seedRequired = true;
+  }
+  return {
+    rev,
+    head_event_id: head,
+    // Catch-up persists while EITHER the fold is behind head OR the git surface
+    // is unseeded — both are "the board may still be partial" conditions. The
+    // gate (`!ready`) is the authoritative main-owned signal; the rev<head and
+    // seed checks are belt-and-suspenders for the window before boot-complete.
+    catching_up: !gate.ready || rev < head || seedRequired,
+    git_seed_required: seedRequired,
+  };
+}
+
+/** Mutating RPC methods (fn-897 B1) — the five state-changing async handlers,
+ *  gated behind boot-complete so a consumer never acts on partial state. A read
+ *  RPC (none today) would NOT appear here. Kept in sync with
+ *  `installRpcHandlers()` in `src/rpc-handlers.ts`. */
+const MUTATING_RPC_METHODS: ReadonlySet<string> = new Set([
+  "replay_dead_letter",
+  "set_autopilot_paused",
+  "set_autopilot_mode",
+  "set_epic_armed",
+  "retry_dispatch",
+]);
+
+/**
+ * Stamp the boot-status header (fn-897 B1) onto every object-form served frame
+ * (`result` / `rpc_result` / `error`) in place — the single chokepoint is the
+ * write path (`handleData` + async-RPC `onAsyncResult`). A {@link PreSerialized}
+ * memo line is left untouched: the memo is bypassed during catch-up (see
+ * `dispatchLine`), so a memo line only ever rides at steady state where
+ * `catching_up` is false and the header is optional. Mutates and returns the same
+ * array so callers can inline it. Computes the status ONCE per call.
+ */
+function stampBootStatus(
+  db: Database,
+  gate: BootGate,
+  frames: (ServerFrame | PreSerialized)[],
+): (ServerFrame | PreSerialized)[] {
+  if (frames.length === 0) {
+    return frames;
+  }
+  const boot = readBootStatus(db, gate);
+  for (const f of frames) {
+    if (isPreSerialized(f)) {
+      continue;
+    }
+    if (f.type === "result" || f.type === "rpc_result" || f.type === "error") {
+      f.boot = boot;
+    }
+  }
+  return frames;
 }
 
 // ---------------------------------------------------------------------------
@@ -2465,6 +2617,11 @@ export interface RunningServer {
  * `bridge` is the worker→main round-trip surface; when absent, async-RPC methods
  * surface as `unknown_method`. Throws `LockHeldError` if a live instance owns
  * the lock.
+ *
+ * `bootGate` is the fn-897 B1 latch: while un-`ready` (boot drain still running)
+ * every served frame carries `catching_up: true` and mutating RPCs are rejected
+ * `server_booting`. Defaults to a permanently-ready gate so direct unit callers
+ * (and tests) behave as steady-state.
  */
 export function startServer(
   db: Database,
@@ -2472,6 +2629,7 @@ export function startServer(
   lockPath: string,
   writerDb?: Database,
   bridge?: ReplayBridge,
+  bootGate: BootGate = { ready: true },
 ): RunningServer {
   acquireLock(lockPath, sockPath);
 
@@ -2551,7 +2709,7 @@ export function startServer(
         // querying conn is never idle-reaped; a silently-dead probe stops
         // bumping this and ages out.
         socket.data.lastActivityAt = t0;
-        handleData(db, socket, chunk, writerDb, bridge, memo);
+        handleData(db, socket, chunk, writerDb, bridge, memo, bootGate);
         const dur = Date.now() - t0;
         if (dur >= 5) {
           if (TRACE) srvTs(`conn ${id} handleData duration=${dur}ms`);
@@ -2620,6 +2778,7 @@ function handleData(
   writerDb: Database | undefined,
   bridge: ReplayBridge | undefined,
   memo: ResultMemo,
+  bootGate: BootGate = { ready: true },
 ): void {
   const w = socket as unknown as Writable;
   let lines: string[];
@@ -2627,14 +2786,17 @@ function handleData(
     lines = socket.data.buffer.push(chunk.toString("utf8"));
   } catch (err) {
     if (err instanceof OversizedLineError) {
-      writeFrames(w, [
-        {
-          type: "error",
-          rev: readWorldRev(db),
-          code: "oversized_line",
-          message: err.message,
-        },
-      ]);
+      writeFrames(
+        w,
+        stampBootStatus(db, bootGate, [
+          {
+            type: "error",
+            rev: readWorldRev(db),
+            code: "oversized_line",
+            message: err.message,
+          },
+        ]),
+      );
       socket.end();
       return;
     }
@@ -2650,7 +2812,10 @@ function handleData(
     ? {
         bridge,
         onAsyncResult: (frames: ServerFrame[]): void => {
-          if (frames.length > 0) writeFrames(w, frames);
+          // fn-897 B1: stamp the boot-status header on the deferred async-RPC
+          // result too (read at result-construction time, like `rev`).
+          if (frames.length > 0)
+            writeFrames(w, stampBootStatus(db, bootGate, frames));
         },
       }
     : undefined;
@@ -2673,7 +2838,15 @@ function handleData(
       // dispatchLine itself will surface the bad_frame; just log unknown.
     }
     try {
-      frames = dispatchLine(db, socket.data, line, writerDb, asyncCtx, memo);
+      frames = dispatchLine(
+        db,
+        socket.data,
+        line,
+        writerDb,
+        asyncCtx,
+        memo,
+        bootGate,
+      );
     } catch (err) {
       // Defensive: dispatchLine is contracted not to throw, but a DB hiccup
       // mid-query shouldn't kill the connection.
@@ -2686,6 +2859,10 @@ function handleData(
         },
       ];
     }
+    // fn-897 B1: stamp the boot-status header on the synchronous reply set (the
+    // memo path is bypassed during catch-up, so any PreSerialized line here only
+    // rides at steady state and stamps nothing).
+    stampBootStatus(db, bootGate, frames);
     const _dispatchDur = Date.now() - _dispatchStart;
     const _id = socket.data.id ?? -1;
     const _collTag = _collection ? ` coll=${_collection}` : "";
@@ -2924,9 +3101,16 @@ function main(): void {
     },
   };
 
+  // fn-897 B1 boot gate. The server worker now spawns right after `migrate()`,
+  // BEFORE the boot drain, so it serves reads during catch-up. The gate boots
+  // un-`ready` (mutating RPCs rejected `server_booting`, every frame stamped
+  // `catching_up`) and flips on main's `{type:"boot-complete"}` message, posted
+  // after drain-reaches-head + git-seed + ephemeral-truncate.
+  const bootGate: BootGate = { ready: false };
+
   let server: RunningServer;
   try {
-    server = startServer(db, sockPath, lockPath, writerDb, bridge);
+    server = startServer(db, sockPath, lockPath, writerDb, bridge, bootGate);
   } catch (err) {
     // Lock held by a live instance, or bind failed. No self-heal — exit
     // non-zero; launchd backs off and the live owner keeps serving.
@@ -2983,6 +3167,7 @@ function main(): void {
       msg:
         | ShutdownMessage
         | KickMessage
+        | BootCompleteMessage
         | ReplayResultMessage
         | SetAutopilotPausedResultMessage
         | RetryDispatchResultMessage
@@ -3002,6 +3187,12 @@ function main(): void {
         // Fast path: main folded + kicked so we diffTick now. The try/catch is in
         // `handleKick` — this handler must never throw (no-self-heal path).
         handleKick(db, server.conns);
+        return;
+      }
+      if ((msg as BootCompleteMessage).type === "boot-complete") {
+        // fn-897 B1: drain reached head + git-seed + ephemeral-truncate are done.
+        // Flip the gate so mutating RPCs are accepted and `catching_up` settles.
+        bootGate.ready = true;
         return;
       }
       if ((msg as ReplayResultMessage).type === "replay-result") {

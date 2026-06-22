@@ -993,6 +993,23 @@ test("git-clean: empty rows → met (clean)", () => {
   expect(gitCleanState("/repo", []).kind).toBe("met");
 });
 
+test("fn-897 B1: git-clean with seedRequired=true → waiting (unseeded, never clean)", () => {
+  // Empty rows would normally read MET (clean); an unseeded surface (the boot
+  // window) reads UNKNOWN instead, so it must hold `waiting`.
+  expect(gitCleanState("/repo", [], true).kind).toBe("waiting");
+  // Even a row that LOOKS clean is held while the surface is unseeded — the
+  // seed flag overrides the row inspection entirely.
+  const cleanRows = [makeGitStatus({ project_dir: "/repo" })];
+  expect(gitCleanState("/repo", cleanRows, true).kind).toBe("waiting");
+});
+
+test("fn-897 B1: git-clean with seedRequired=false → unchanged (seeded clean is met)", () => {
+  // The seeded path (explicit false) is byte-identical to the legacy two-arg form.
+  const cleanRows = [makeGitStatus({ project_dir: "/repo" })];
+  expect(gitCleanState("/repo", cleanRows, false).kind).toBe("met");
+  expect(gitCleanState("/repo", [], false).kind).toBe("met");
+});
+
 test("git-clean: dirty>0 → waiting", () => {
   const rows = [makeGitStatus({ project_dir: "/repo", dirty_count: 3 })];
   expect(gitCleanState("/repo", rows).kind).toBe("waiting");

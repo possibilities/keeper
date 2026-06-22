@@ -321,6 +321,104 @@ test("subscribeReadiness: first-paint gate withholds onSnapshot until all nine c
 });
 
 // ---------------------------------------------------------------------------
+// (a.1b) fn-897 B1 — the boot-status header on a `result` frame fires
+//        `onBootStatus` AND, when `git_seed_required`, forces the next snapshot's
+//        readiness to UNKNOWN (the autopilot must not dispatch against an
+//        unseeded git surface).
+// ---------------------------------------------------------------------------
+
+test("subscribeReadiness: boot-status header fires onBootStatus and forces readiness UNKNOWN when git unseeded", () => {
+  const { factory, socketRef } = makeMockConnect();
+  const snapshots: ReadinessClientSnapshot[] = [];
+  const boots: { git_seed_required: boolean }[] = [];
+  const handle = subscribeReadiness({
+    sockPath: "/tmp/keeper-mock.sock",
+    idPrefix: "test-boot",
+    onSnapshot: (snap) => snapshots.push(snap),
+    onBootStatus: (b) => boots.push(b),
+    connect: factory,
+  });
+  const sock = socketRef.current;
+  if (!sock) throw new Error("mock socket never installed");
+  sock.takeOutbound();
+
+  // An epic with one open task so the readiness pass has a row to force UNKNOWN.
+  const epicRow = {
+    epic_id: "fn-1-foo",
+    epic_number: 1,
+    title: "epic",
+    project_dir: "/repo",
+    status: "open",
+    last_event_id: 1,
+    updated_at: 0,
+    depends_on_epics: [],
+    tasks: [
+      {
+        task_id: "fn-1-foo.1",
+        epic_id: "fn-1-foo",
+        task_number: 1,
+        title: "t",
+        target_repo: null,
+        tier: null,
+        worker_phase: "open",
+        runtime_status: "todo",
+        depends_on: [],
+        jobs: [],
+      },
+    ],
+    jobs: [],
+    job_links: [],
+    created_by_closer_of: null,
+    sort_path: "000001",
+    queue_jump: 0,
+    resolved_epic_deps: null,
+    last_validated_at: "2026-05-24T00:00:00Z",
+  };
+  // Stamp the boot-status header (git unseeded) on the epics result.
+  const epicsFrame: ServerFrame = {
+    type: "result",
+    id: "test-boot-epics",
+    collection: "epics",
+    rev: 1,
+    total: 1,
+    rows: [epicRow],
+    boot: {
+      rev: 1,
+      head_event_id: 9,
+      catching_up: true,
+      git_seed_required: true,
+    },
+  };
+  sock.deliver([epicsFrame]);
+  // onBootStatus fired with the unseeded flag, even before the gate clears.
+  expect(boots.length).toBeGreaterThanOrEqual(1);
+  expect(boots.at(-1)?.git_seed_required).toBe(true);
+
+  // Deliver the rest so the first-paint gate clears.
+  for (const c of [
+    "jobs",
+    "subagent_invocations",
+    "git",
+    "dead_letters",
+    "pending_dispatches",
+    "autopilot_state",
+    "armed_epics",
+    "scheduled_tasks",
+  ]) {
+    sock.deliver([emptyResult(c, `test-boot-${c.replace(/_/g, "-")}`)]);
+  }
+  expect(snapshots).toHaveLength(1);
+  // The unseeded git surface forces the task + close-row to blocked:unknown.
+  const r = snapshots[0]?.readiness;
+  expect(r?.perTask.get("fn-1-foo.1")).toEqual({
+    tag: "blocked",
+    reason: { kind: "unknown" },
+  });
+
+  handle.dispose();
+});
+
+// ---------------------------------------------------------------------------
 // (a.2) fn-813 — the `scheduled_tasks` collection rides the snapshot, and a
 //       multi-cron session is NOT collapsed (the composite `(job_id, cron_id)`
 //       identity reads off `state.rows`, not the `job_id` wire pk's `byId`).

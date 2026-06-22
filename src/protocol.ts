@@ -73,6 +73,37 @@
 /** The generic served-row shape; a collection's columns determine the keys. */
 export type Row = Record<string, unknown>;
 
+/**
+ * Boot-status header (fn-897 B1) the server stamps on EVERY served frame
+ * (`result` / `rpc_result` / `error`) so a client can tell whether it is
+ * reading catch-up state. The read socket comes up right after `migrate()` —
+ * BEFORE the boot drain finishes — so an early client can page a partially-folded
+ * projection; this header is how it knows.
+ *
+ * - `rev` — `reducer_state.last_event_id`, the global fold cursor (mirrors the
+ *   frame's own `rev`). Carried here too so a single field carries the whole
+ *   staleness verdict.
+ * - `head_event_id` — `max(events.id)`, the newest INGESTED event. While the
+ *   drain runs `rev < head_event_id`; at head they coincide.
+ * - `catching_up` — `true` while the reducer is still draining toward head OR
+ *   the git surface is unseeded. The client treats a snapshot read while
+ *   `catching_up` is true as provisional (it MUST NOT cache an empty projection
+ *   as ground truth — the header rides EVERY reply, not just the first).
+ * - `git_seed_required` — `git_projection_state.seed_required !== 0`: the
+ *   live-only git surface (`git_status` + attributions) has not been boot-seeded
+ *   yet, so it reads EMPTY. A consumer of git cleanliness must treat unseeded as
+ *   "unknown", never "clean".
+ *
+ * Forward-compat: an older client ignores the unknown `boot` field (the
+ * "unknown frame fields ignored" rule), so adding it is wire-safe.
+ */
+export interface BootStatus {
+  rev: number;
+  head_event_id: number;
+  catching_up: boolean;
+  git_seed_required: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Frame types
 // ---------------------------------------------------------------------------
@@ -166,6 +197,13 @@ export interface ResultFrame<R extends Row = Row> {
   rev: number;
   total: number;
   rows: R[];
+  /**
+   * Boot-status header (fn-897 B1). Present on every reply during catch-up
+   * (and harmlessly at steady state, where `catching_up` is false). Optional
+   * for forward/backward compat and so direct-dispatch unit paths that don't
+   * thread a status reader omit it.
+   */
+  boot?: BootStatus;
 }
 
 /**
@@ -247,6 +285,8 @@ export interface RpcResultFrame {
   id: string;
   rev: number;
   value: unknown;
+  /** Boot-status header (fn-897 B1); see {@link BootStatus} / {@link ResultFrame}. */
+  boot?: BootStatus;
 }
 
 /**
@@ -268,6 +308,11 @@ export interface RpcResultFrame {
  *   (e.g. the recovery transaction itself crashed). The thrown / posted-back
  *   message is carried in `message`; the connection stays open. Carries the
  *   request `id`.
+ * - `"server_booting"` — a MUTATING rpc was rejected because the daemon has not
+ *   yet reached the post-drain spawn point (drain-reaches-head + git-seed +
+ *   ephemeral-truncate). Reads are served throughout the boot; only state-changing
+ *   RPCs are gated, so a consumer never acts on partial state. Carries the
+ *   request `id`; the connection stays open (retry once `catching_up` clears).
  *
  * `id` is set when the error is attributable to a specific client frame;
  * `collection` is set when attributable to a named collection.
@@ -279,6 +324,8 @@ export interface ErrorFrame {
   rev: number;
   code: string;
   message: string;
+  /** Boot-status header (fn-897 B1); see {@link BootStatus} / {@link ResultFrame}. */
+  boot?: BootStatus;
 }
 
 /** Discriminated union of frames a client may send. */
