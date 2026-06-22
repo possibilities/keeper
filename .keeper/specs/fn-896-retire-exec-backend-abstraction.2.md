@@ -41,5 +41,5 @@ Remove the createTmuxBackend.launch tests (exec-backend.test.ts:281-461) + the r
 - [ ] exec-backend + autopilot launch tests green.
 
 ## Done summary
-
+Collapsed the pluggable exec-backend abstraction: deleted ExecBackend/resolveExecBackend/createTmuxBackend, promoted the agentwrap launch to a standalone agentwrapLaunch (keeper's sole transport) that autopilot + cli/dispatch call directly. Kept the direct tmux pane-ops + restore-replay seams, the retryable routing, the 30s timeout, and the byte-pinned drift guards; shrank the worker-test fakes.
 ## Evidence
