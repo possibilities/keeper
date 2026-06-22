@@ -163,7 +163,8 @@ describe("commit-work: session id", () => {
     expect(res.code).toBe(1);
     const parsed = JSON.parse(res.stdout);
     expect(parsed.success).toBe(false);
-    expect(parsed.error).toContain("no session id available");
+    expect(parsed.error).toBe("no_session_id");
+    expect(parsed.hint).toContain("git");
     // Compact single line (no pretty indentation).
     expect(res.stdout).not.toContain("\n  ");
   });

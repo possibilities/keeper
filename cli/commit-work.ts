@@ -349,9 +349,12 @@ async function run(args: ParsedArgs): Promise<number> {
   if (sessionId === null) {
     fail({
       success: false,
-      error:
-        "no session id available — pass --session-id or run inside a Claude " +
-        "Code session (or set JOBCTL_SESSION_ID)",
+      error: "no_session_id",
+      hint:
+        "commit-work attributes files by Claude Code session id, which isn't " +
+        "set here. Commit with git directly instead: stage ONLY the files you " +
+        "changed, by explicit path (git add <path> … — never -A or .), then " +
+        "git commit and git push.",
     });
   }
 
