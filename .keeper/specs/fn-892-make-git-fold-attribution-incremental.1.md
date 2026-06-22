@@ -81,5 +81,5 @@ future follow-up.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Made the git fold's pass-1 explicit-attribution scans incremental via a per-Database WeakMap id-watermark memo (scan only id > maxId, append to cached structures), collapsing steady-state cost from O(history) to O(rows since last fold) with byte-identical file_attributions. Added warm-vs-cold + malformed-row equivalence tests and corrected the CLAUDE.md/README time-bomb framing.
 ## Evidence
