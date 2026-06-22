@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T23:22:22.548000Z",
+  "depends_on": [],
+  "epic": "fn-900-never-built-builds-row-activate",
+  "id": "fn-900-never-built-builds-row-activate.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "xhigh",
+  "title": "Never-built placeholder row in keeper builds",
+  "updated_at": "2026-06-22T23:22:22.548000Z"
+}
