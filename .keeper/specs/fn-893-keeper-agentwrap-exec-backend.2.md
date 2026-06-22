@@ -44,5 +44,5 @@ exec-backend unit tests via `makeSpawnStub` (test/exec-backend.test.ts:51-76): a
 - [ ] `focusPane`/`listPanes`/`renameWindow`/`killWindow` shared with the tmux backend; exec-backend unit tests (argv, JSON, exit-map, timeout) green.
 
 ## Done summary
-
+Added the agentwrap exec backend (createAgentwrapBackend) selectable via exec_backend=agentwrap: buildAgentwrapLaunchArgv emits the landed-contract invocation, parseAgentwrapStdout reads the one-line schema_version:1 JSON, and a single mapAgentwrapExit routes 0/1/2/3/4+timeout through a widened LaunchResult so confirmRunning sends transient(4/timeout) to indoubt and permanent(3/1/2) to a sticky DispatchFailed without mis-feeding the never-bound breaker. tmux stays default+fallback; pane ops are shared.
 ## Evidence
