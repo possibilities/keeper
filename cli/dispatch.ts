@@ -40,7 +40,11 @@
 
 import { readFileSync } from "node:fs";
 import { parseArgs } from "node:util";
-import { resolveConfig, resolveSockPath } from "../src/db";
+import {
+  resolveAgentwrapPath,
+  resolveConfig,
+  resolveSockPath,
+} from "../src/db";
 import {
   buildDispatchLaunchArgv,
   defaultPlanPrompt,
@@ -48,7 +52,7 @@ import {
   type RetryDispatchVerb,
   validatePromptBytes,
 } from "../src/dispatch-command";
-import type { LaunchResult } from "../src/exec-backend";
+import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import { resolveExecBackend } from "../src/exec-backend";
 import type { QueryFrame, Row } from "../src/protocol";
 import { queryCollection } from "./control-rpc";
@@ -69,12 +73,19 @@ export type QueryFn = (
  * {@link main} so a launch-path test runs against a fake backend (asserting the
  * success / `result.ok === false` branches) without spawning a real tmux
  * window. Defaults to the real `resolveExecBackend(...).ensureLaunched`.
+ *
+ * `spec` carries the structured launch (prompt + claude flags). The tmux backend
+ * ignores it and execs the pre-wrapped `argv`; the agentwrap backend IGNORES
+ * `argv` and builds its own invocation FROM `spec` — so manual dispatch under
+ * `exec_backend: agentwrap` MUST pass it (without a spec the agentwrap backend
+ * falls back to tmux). Optional so the default/tmux path stays unchanged.
  */
 export type LaunchFn = (
   session: string,
   argv: string[],
   cwd: string,
   name?: string,
+  spec?: LaunchSpec,
 ) => Promise<LaunchResult>;
 
 /** Injectable seams for {@link main} so integration tests drive the orchestration
@@ -360,10 +371,16 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     );
   }
 
+  // Honor the configured exec backend so a hand-launched worker goes through
+  // agentwrap when `exec_backend: agentwrap` — same resolution as the autopilot
+  // path. `backendType`/`agentwrapPath` are ignored when the config selects tmux
+  // (the default + fallback), so the default path stays byte-identical.
   const launch: LaunchFn =
     deps.launch ??
     resolveExecBackend({
       noteLine: (line: string) => process.stderr.write(`${line}\n`),
+      backendType: resolveConfig().execBackend,
+      agentwrapPath: resolveAgentwrapPath(),
     }).ensureLaunched;
 
   let cwd: string;
@@ -468,9 +485,20 @@ export async function main(argv: string[], deps: MainDeps = {}): Promise<void> {
     process.exit(0);
   }
 
+  // Structured spec for the agentwrap backend (it ignores the pre-wrapped
+  // `launchArgv` and builds its own unwrapped invocation from this). The tmux
+  // backend ignores `spec` and execs `launchArgv` verbatim, so the default path
+  // is unchanged. Mirrors the flags already baked into `launchArgv`.
+  const spec: LaunchSpec = {
+    prompt,
+    ...(claudeName !== undefined ? { claudeName } : {}),
+    ...(v.model !== undefined ? { model: v.model } : {}),
+    ...(v.effort !== undefined ? { effort: v.effort } : {}),
+  };
+
   // UNNAMED window (empty `name`): the renamer worker labels plan-form windows
   // from the bound jobs row; free-form windows stay unnamed.
-  const result = await launch(session, launchArgv, cwd, "");
+  const result = await launch(session, launchArgv, cwd, "", spec);
   if (!result.ok) {
     die(`launch failed: ${result.error}`);
   }

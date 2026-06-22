@@ -11,8 +11,16 @@
  */
 
 import { describe, expect, test } from "bun:test";
-import { rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
+import { join } from "node:path";
 import {
   checkRaceGuard,
   main as dispatchMain,
@@ -29,7 +37,7 @@ import {
   type Subcommand,
   USAGE,
 } from "../cli/keeper";
-import type { LaunchResult } from "../src/exec-backend";
+import type { LaunchResult, LaunchSpec } from "../src/exec-backend";
 import type { Row } from "../src/protocol";
 
 class ExitError extends Error {
@@ -462,19 +470,27 @@ async function runMain(
   return { code, stdout: out.join(""), stderr: err.join("") };
 }
 
-/** A LaunchFn recording its call and returning a canned result. */
+/** A LaunchFn recording its call (including the structured `spec` the agentwrap
+ *  backend consumes) and returning a canned result. */
 function fakeLaunch(result: LaunchResult): {
   fn: LaunchFn;
-  calls: Array<{ session: string; argv: string[]; cwd: string; name?: string }>;
+  calls: Array<{
+    session: string;
+    argv: string[];
+    cwd: string;
+    name?: string;
+    spec?: LaunchSpec;
+  }>;
 } {
   const calls: Array<{
     session: string;
     argv: string[];
     cwd: string;
     name?: string;
+    spec?: LaunchSpec;
   }> = [];
-  const fn: LaunchFn = (session, argv, cwd, name) => {
-    calls.push({ session, argv, cwd, name });
+  const fn: LaunchFn = (session, argv, cwd, name, spec) => {
+    calls.push({ session, argv, cwd, name, spec });
     return Promise.resolve(result);
   };
   return { fn, calls };
@@ -723,5 +739,155 @@ describe("cli/dispatch main() dry-run / launch-result branches", () => {
     expect(r.stdout).toContain("cwd:         /task/repo");
     expect(r.stdout).toContain("key:         work::fn-1-foo.2");
     expect(r.stdout).toContain("prompt-from: plan");
+  });
+
+  test("threads a structured spec to the launch seam (agentwrap backend consumes it)", async () => {
+    // The agentwrap backend ignores the pre-wrapped argv and builds its own
+    // invocation from `spec`; manual dispatch MUST pass it. Free form: prompt +
+    // the forwarded model/effort, no claudeName.
+    const launch = fakeLaunch({ ok: true });
+    const r = await runMain(
+      [
+        "--prompt",
+        "go",
+        "--session",
+        "scratch",
+        "--model",
+        "opus",
+        "--effort",
+        "high",
+      ],
+      // promptPrefix:"" neutralizes any machine-local dispatch_prompt_prefix so
+      // the spec.prompt assertion is deterministic.
+      { launch: launch.fn, promptPrefix: "" },
+    );
+    expect(r.code).toBeUndefined();
+    expect(launch.calls).toHaveLength(1);
+    expect(launch.calls[0]?.spec).toEqual({
+      prompt: "go",
+      model: "opus",
+      effort: "high",
+    });
+  });
+
+  test("plan-form threads the verb::id claudeName into the launch spec", async () => {
+    const launch = fakeLaunch({ ok: true });
+    const query: QueryFn = (collection) =>
+      Promise.resolve(
+        collection === "epics"
+          ? [
+              {
+                epic_id: "fn-1-foo",
+                project_dir: "/epic/dir",
+                tasks: [{ task_id: "fn-1-foo.2", target_repo: "/task/repo" }],
+              },
+            ]
+          : [],
+      );
+    const r = await runMain(
+      ["work::fn-1-foo.2", "--session", "scratch", "--force"],
+      { query, launch: launch.fn },
+    );
+    expect(r.code).toBeUndefined();
+    expect(launch.calls[0]?.spec?.claudeName).toBe("work::fn-1-foo.2");
+  });
+});
+
+// cli/dispatch backend resolution — the manual CLI honors the configured
+// `exec_backend`. With NO injected launch seam, `main()` resolves the real
+// backend from `resolveConfig().execBackend` + `resolveAgentwrapPath()`. A stub
+// agentwrap binary (a recording shell script) proves the agentwrap launch
+// transport fires for `exec_backend: agentwrap`, and stays UNTOUCHED on the
+// default/tmux path. KEEPER_CONFIG + KEEPER_AGENTWRAP_PATH sandbox the resolve.
+// ---------------------------------------------------------------------------
+describe("cli/dispatch backend resolution honors exec_backend config", () => {
+  /** Build a tmp dir holding a config.yaml + a recording agentwrap stub that
+   *  appends its argv to `argv.log` and emits the schema_version:1 launch JSON.
+   *  Returns the paths plus a reader for the recorded argv lines. */
+  function setupBackendSandbox(execBackend: string): {
+    configPath: string;
+    stubPath: string;
+    readArgvLog: () => string;
+    cleanup: () => void;
+  } {
+    const dir = mkdtempSync(join(tmpdir(), "dispatch-backend-"));
+    const argvLog = join(dir, "argv.log");
+    const stubPath = join(dir, "agentwrap-stub.sh");
+    // Record argv, emit one line of schema_version:1 JSON, exit 0 (launched).
+    writeFileSync(
+      stubPath,
+      `#!/bin/sh\nprintf '%s\\n' "$*" >> '${argvLog}'\n` +
+        `echo '{"schema_version":1,"session":"scratch","windowId":"@9","paneId":"%9"}'\n` +
+        `exit 0\n`,
+    );
+    chmodSync(stubPath, 0o755);
+    const configPath = join(dir, "config.yaml");
+    writeFileSync(configPath, `exec_backend: ${execBackend}\n`);
+    return {
+      configPath,
+      stubPath,
+      readArgvLog: () =>
+        existsSync(argvLog) ? readFileSync(argvLog, "utf8") : "",
+      cleanup: () => rmSync(dir, { recursive: true, force: true }),
+    };
+  }
+
+  /** Run `dispatchMain` with the env pointed at the sandbox, env restored after. */
+  async function runWithBackendEnv(
+    argv: string[],
+    s: { configPath: string; stubPath: string },
+  ): Promise<MainRun> {
+    const prevConfig = process.env.KEEPER_CONFIG;
+    const prevPath = process.env.KEEPER_AGENTWRAP_PATH;
+    process.env.KEEPER_CONFIG = s.configPath;
+    process.env.KEEPER_AGENTWRAP_PATH = s.stubPath;
+    try {
+      // No `launch` dep → main resolves the real backend from config.
+      return await runMain(argv, {});
+    } finally {
+      if (prevConfig === undefined) delete process.env.KEEPER_CONFIG;
+      else process.env.KEEPER_CONFIG = prevConfig;
+      if (prevPath === undefined) delete process.env.KEEPER_AGENTWRAP_PATH;
+      else process.env.KEEPER_AGENTWRAP_PATH = prevPath;
+    }
+  }
+
+  test("exec_backend: agentwrap → manual dispatch launches via the agentwrap binary", async () => {
+    const s = setupBackendSandbox("agentwrap");
+    try {
+      const r = await runWithBackendEnv(
+        ["--prompt", "hello agentwrap", "--session", "scratch"],
+        s,
+      );
+      // The stub exited 0 → launched; dispatch reports success.
+      expect(r.code).toBeUndefined();
+      const recorded = s.readArgvLog();
+      // The agentwrap launch argv reached the binary (round-1 contract flags).
+      expect(recorded).toContain("claude --agentwrap-tmux");
+      expect(recorded).toContain("--agentwrap-tmux-session scratch");
+      expect(recorded).toContain(
+        "--agentwrap-tmux-env KEEPER_TMUX_SESSION=scratch",
+      );
+      // The structured prompt rides as the final positional.
+      expect(recorded).toContain("hello agentwrap");
+    } finally {
+      s.cleanup();
+    }
+  });
+
+  test("default/tmux exec_backend → the agentwrap binary is NEVER invoked", async () => {
+    const s = setupBackendSandbox("tmux");
+    try {
+      // tmux backend execs a shell-wrapped argv via a real `tmux` — which may be
+      // absent in CI; we only assert the agentwrap stub stayed untouched, the
+      // load-bearing "default path does NOT route through agentwrap" guarantee.
+      await runWithBackendEnv(
+        ["--prompt", "hello tmux", "--session", "scratch"],
+        s,
+      );
+      expect(s.readArgvLog()).toBe("");
+    } finally {
+      s.cleanup();
+    }
   });
 });
