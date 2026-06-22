@@ -57,5 +57,5 @@ the new fold logic must exist before the redrain replays under it.
 - [ ] `bun run test:full` green
 
 ## Done summary
-
+Added the v81 version-guarded rewind-and-redrain migration (modeled on v80) that converges epics.job_links under task .1's cheap per-session merge and self-validates the fast re-fold. Bumped SCHEMA_VERSION to 81 with the paired keeper/api.py whitelist + README schema-history block.
 ## Evidence
