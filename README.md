@@ -394,7 +394,10 @@ Keeper has no `install` verb. Wire it up manually:
    Claude plugins live as peers under `plugins/`: `plugins/keeper/` (the
    events-writer hook + the branch-guard hook that hard-denies subagent git
    branch create/switch via the `PreToolUse` deny JSON + the sidecar-writer hook
-   that owns the `~/docs` metadata sidecar on `PostToolUse(Write|Bash)`, + the
+   that owns the `~/docs` metadata sidecar AND its git state on
+   `PostToolUse(Write|Edit|MultiEdit|Bash)` (commits every doc write/edit/delete) +
+   the docs-pusher hook that pushes `~/docs` to its remote once per turn on `Stop`,
+   + the
    `keeper:await` /
    `keeper:dispatch` / `keeper:autopilot` gateway skills,
    manifest at
@@ -1400,23 +1403,52 @@ required for the deny to be honored. It makes no subprocess/fs/git/DB calls, fai
 open, and never touches non-subagent sessions (the human's interactive claude and the
 `/plan:work` orchestrator both run with no `agent_id`).
 
-A **third**, daemon-independent `PostToolUse(Write|Bash)` hook, the
+A **third**, daemon-independent `PostToolUse(Write|Edit|MultiEdit|Bash)` hook, the
 **sidecar-writer** (`plugins/keeper/plugin/hooks/sidecar-writer.ts`), owns the
-`~/docs` metadata sidecar (relocated out of arthack's `post_tool_use.ts` so the
-keeper plugin is the single owner of `~/docs` control-data). On a Write to a
+`~/docs` metadata sidecar AND its git state (relocated out of arthack's
+`post_tool_use.ts` so the keeper plugin is the single owner of `~/docs`
+control-data). On a Write to a
 `~/docs/*.md` (the dir is overridable via `KEEPER_DOCS_DIR` for tests) it
 create-or-merges the doc's `.yaml` sidecar — stamping `path`/`type`/`created`/
 `session-id`/`cwd`/`resume` and best-effort `git-branch`/`git-commit` — preserving
 an existing `created`. On a `gh gist create <doc>.md …` it parses the gist URL out
 of the tool-response (bounded `https?://gist.github.com/[^\s"'<>]+`, never the old
 greedy `\S+` that swallowed the JSON tail) and upserts `gist-url:` into the matching
-sidecar. It **NEVER touches the `.md` body** — machine metadata lives only in the
+sidecar. After the sidecar write — and on an Edit/MultiEdit to a doc, and on a
+`rm`/`mv`/`git rm` delete of one — it **commits** the dirty `~/docs` paths inline:
+pathspec-scoped, a mechanical `docs: write|update|delete <relpath>` subject, via the
+dep-free committer `src/doc-commit.ts` (`commitDocsPaths` — a hook-context port of
+`plugins/plan/src/commit.ts` with a tightened retry cap, a per-call git subprocess
+timeout, `-c commit.gpgsign=false`, and mid-operation/detached-HEAD skip guards; a
+hook MUST NOT import the plan plugin). The commit is fail-open — a `CommitFailed`
+logs to stderr and the hook still exits 0 (the sidecar write already succeeded). It
+**NEVER touches the `.md` body** — machine metadata lives only in the
 sidecar now — writes the sidecar atomically (tempfile + rename), fails open (exit 0
 on any error, including `uncaughtException`/`unhandledRejection`), and is dep-free
 (`node:fs`/`node:os`/`node:path` + the pure `src/derivers.ts` tokenizer +
-`src/sidecar.ts`, never `bun:sqlite`/`src/db.ts`). Its strip-signature detector +
+`src/sidecar.ts` + `src/doc-commit.ts`, never `bun:sqlite`/`src/db.ts`). Its
+strip-signature detector +
 sidecar parse/merge logic live in `src/sidecar.ts`, shared with the one-shot
 `~/docs` migration so the strip regex never drifts.
+
+A **fourth**, daemon-independent `Stop` hook, the **docs-pusher**
+(`plugins/keeper/plugin/hooks/docs-pusher.ts`), pushes `~/docs` to its remote on a
+debounced cadence — Stop fires once per turn, which IS the debounce (no persistent
+timer state). It guards a mid-operation repo and a detached/unborn HEAD, then checks
+ahead-of-upstream with the purely LOCAL `git rev-list --count @{u}..HEAD` (using
+`@{u}`, not a hardcoded `origin/main`, so it survives a non-main branch; NO
+`git fetch` per turn). Nothing-ahead and no-upstream are clean no-ops. It serializes
+concurrent sessions with a `.git/keeper-push.lock` `wx`/O_EXCL lockfile (skip if
+held) and pushes with `--no-progress`, `GIT_TERMINAL_PROMPT=0`, and a subprocess
+timeout. On a non-fast-forward / auth / network failure it LOGs the classified error
+(`classifyPushError` substrings re-derived inline from `src/commit-work/push.ts`,
+which is async/dep-heavy and NOT hook-portable) to `.git/keeper-push.log` and
+SKIPs — **never auto-rebase, never `--force`**. It **ALWAYS exits 0**: a `Stop` hook
+that exits 2 would BLOCK Claude from stopping, so every path swallows + logs. Fully
+self-contained dep-free (`node:fs`/`node:os`/`node:path` + `Bun.spawnSync`, no `src/`
+import; `KEEPER_DOCS_PUSH_LOG` overrides the skip-log for tests). It only PUSHES —
+the sidecar-writer owns the commits — so the two hooks together make keeper the sole
+reliable owner of `~/docs` git state.
 
 A **second** Worker thread runs the read-only UDS subscribe server. It mirrors
 the wake worker's archetype — its own read-only connection, its own

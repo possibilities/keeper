@@ -1,9 +1,12 @@
 keeper — event-sourced Claude Code control-data daemon (Bun + bun:sqlite).
 
-The keeper plugin ships three hooks: the events-writer appends one per-pid NDJSON
+The keeper plugin ships four hooks: the events-writer appends one per-pid NDJSON
 line per Claude Code hook invocation (lock-free, no SQLite open), the branch-guard
-hard-denies subagent git branch create/switch, and the sidecar-writer owns the
-`~/docs` metadata sidecar (PostToolUse, never touches the `.md` body). The `keeperd`
+hard-denies subagent git branch create/switch, the sidecar-writer owns the
+`~/docs` metadata sidecar AND its git state (PostToolUse, never touches the `.md`
+body — create-or-merges the `.yaml` then commits the doc write/edit/delete), and
+the docs-pusher pushes `~/docs` to its remote once per turn (Stop, when local is
+ahead of `@{u}`, fail-open). The `keeperd`
 daemon's events-log ingester lands each events-writer line as one `events` row, folds
 those events into the `jobs`/`epics` projections, and serves them read-only over a
 UDS subscribe socket. The `events` table is the
@@ -99,19 +102,30 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
 
 ## Hook rules
 
-- **Three hooks, three contracts.** The keeper plugin ships TWO `PreToolUse(Bash)`
+- **Four hooks, four contracts.** The keeper plugin ships TWO `PreToolUse(Bash)`
   hooks — the events-writer (logs every invocation, NEVER blocks) and the branch-guard
   (`plugins/keeper/plugin/hooks/branch-guard.ts` — hard-blocks a subagent, detected by
   `agent_id`/`agent_type` presence, from git branch create/switch/worktree-add so
   workers stay on the current branch; ordinary git, file-restore, and non-subagent
-  sessions pass) — plus the `PostToolUse(Write|Bash)` sidecar-writer
+  sessions pass) — plus the `PostToolUse(Write|Edit|MultiEdit|Bash)` sidecar-writer
   (`plugins/keeper/plugin/hooks/sidecar-writer.ts` — owns the `~/docs` metadata
-  sidecar: on Write to a `~/docs/*.md` it create-or-merges the doc's `.yaml` sidecar,
-  on `gh gist create` it upserts `gist-url:` into the matching sidecar. It NEVER
-  touches the `.md` body — machine metadata lives only in the sidecar — and is
-  fail-open like the others. `KEEPER_DOCS_DIR` overrides `~/docs` for tests. Its
-  strip-signature + sidecar parse/merge logic is the dep-free `src/sidecar.ts`,
-  shared with the one-shot migration so the strip regex never drifts).
+  sidecar AND its git state: on Write to a `~/docs/*.md` it create-or-merges the doc's
+  `.yaml` sidecar, on `gh gist create` it upserts `gist-url:` into the matching
+  sidecar, and on every doc write/edit/delete it commits the dirty `~/docs` paths
+  inline — pathspec-scoped, mechanical `docs: write|update|delete <relpath>` subject,
+  fail-open so a commit failure never blocks. It NEVER touches the `.md` body — machine
+  metadata lives only in the sidecar. The dep-free committer is `src/doc-commit.ts`
+  (`commitDocsPaths`, a hook-context port of `plugins/plan/src/commit.ts` — a hook MUST
+  NOT import the plan plugin). The strip-signature + sidecar parse/merge logic is the
+  dep-free `src/sidecar.ts`, shared with the one-shot migration so the strip regex
+  never drifts) — plus the `Stop` docs-pusher
+  (`plugins/keeper/plugin/hooks/docs-pusher.ts` — pushes `~/docs` once per turn when
+  local is ahead of `@{u}`, fully self-contained dep-free: a LOCAL ahead-count
+  `git rev-list --count @{u}..HEAD` — NEVER `git fetch` per turn — a `.git/`
+  `wx`/O_EXCL lockfile to serialize concurrent sessions, and on non-fast-forward / auth
+  / network a LOG to `.git/keeper-push.log` + SKIP — never rebase, never `--force`).
+  `KEEPER_DOCS_DIR` overrides `~/docs` for tests (both hooks honor it);
+  `KEEPER_DOCS_PUSH_LOG` overrides the pusher's skip-log.
 - **Always exit 0.** A non-zero exit can fail-closed the human's session. On a HARD
   append failure the events-writer writes a per-pid dead-letter and still exits 0
   (losing one row is acceptable; wedging the agent is not). The branch-guard ALSO
@@ -119,13 +133,20 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   (`hookSpecificOutput.permissionDecision:"deny"`), NOT a non-zero exit, so the
   exit-0 rule holds for both. Never "fix" the branch-guard to drop the deny or to
   exit non-zero: exit 0 is REQUIRED for the deny JSON to be honored, and a non-zero
-  exit would fail-close the session.
+  exit would fail-close the session. The `Stop` docs-pusher's exit-0 is EXTRA
+  load-bearing: a Stop hook that exits 2 BLOCKS Claude from stopping, so every push
+  path (failure, mid-op, detached HEAD, hung git via subprocess timeout, non-repo
+  docs dir) swallows + logs and exits 0 — never escalate a push error to a non-zero
+  exit.
 - **No third-party deps, and NO `bun:sqlite`/`src/db.ts`.** The hook never opens
   SQLite — a stray `db.ts` symbol re-drags the 6.5k-line module and erases the
   cold-start win. Keep imports to `node:fs`/`node:os`/`node:path`, the dep-free
   `src/dead-letter.ts` serializers, and the pure `src/derivers.ts`/`exec-backend.ts`/
-  `src/sidecar.ts` helpers. It never opens the DB, so it never migrates or probes
-  schema.
+  `src/sidecar.ts`/`src/doc-commit.ts` helpers (`src/doc-commit.ts` is itself dep-free
+  — `node:path` + `Bun.spawnSync` only). The docs-pusher is fully self-contained (no
+  `src/` import — it does NOT import the async/dep-heavy `src/commit-work/push.ts`;
+  only its `classifyPushError` substrings are re-derived inline). It never opens the
+  DB, so it never migrates or probes schema.
 - **Scraping is scoped.** On `SessionStart` only: parent claude `--name`/`-n` +
   `CLAUDE_CONFIG_DIR` (single-level ppid, no walking). On every event:
   `TMUX`/`TMUX_PANE`/`KEEPER_TMUX_SESSION`/`KEEPER_TMUX_PANE` env reads
@@ -158,7 +179,9 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   NOT write `jobs`/`epics`/etc directly (folds still mutate their own projections).
 - **Plans are READ-ONLY.** The plan worker folds `.keeper/{epics,tasks}` snapshots
   into `epics`; every field is read-only end to end. No RPC writes a plan field.
-- **Sole-writer rules.** The hook writes ONLY per-pid NDJSON files, never the DB. The
+- **Sole-writer rules.** The events-writer hook writes ONLY per-pid NDJSON files,
+  never keeper's DB; the sidecar-writer + docs-pusher write ONLY the `~/docs` repo
+  (its sidecars + commits/pushes), never keeper's DB. The
   events-log ingester is the sole writer of hook-sourced `events` rows; main writes
   all synthetic events + `dead_letters` + the replay path; workers feed via main.
 
@@ -172,6 +195,15 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   `process.exit(1)`; the LaunchAgent restarts the single recovery path. Never respawn
   a worker in-process. Carve-out: closing a stale/EPIPE UDS client connection is
   connection hygiene, not self-heal.
+- **A `~/docs` hook may spawn a bounded git subprocess.** The sidecar-writer's inline
+  committer and the Stop docs-pusher each shell out to `git` (timeout-bounded
+  `Bun.spawnSync`) against the `~/docs` repo only — these are external-tree git calls,
+  NOT a keeper-DB write, so the no-DB-write hook rule and the kernel-watcher carve-out
+  both still hold. The push flush is debounced by the `Stop` cadence itself (once per
+  turn — no persistent timer state) and serialized across concurrent sessions by a
+  `.git/keeper-push.lock` `wx`/O_EXCL lockfile; a hung git is killed by the per-call
+  subprocess timeout. NO `git fetch` per turn — the ahead-check is the local
+  `@{u}..HEAD` count.
 
 ## Worker contract
 
