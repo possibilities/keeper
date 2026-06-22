@@ -13,13 +13,14 @@
  * any worker-thread addon dlopen, the SIGTRAP source.
  *
  * This harness wires that up:
- *  1. Sandbox ALL SIX `KEEPER_*` state paths under a per-test tmpdir (the
+ *  1. Sandbox every keeper-owned state path under a per-test tmpdir (the
  *     CLAUDE.md "Test isolation" invariant — never strand one at its production
- *     `~/.local/state/keeper/` default) PLUS `KEEPER_SOCK` (a unique UDS per
- *     test so parallel daemons don't collide on the default socket inode). The
- *     in-process daemon's path resolvers read `process.env` directly, so we MUST
- *     set these on the live `process.env`, not just build an object the way
- *     `sandboxEnv` does for a subprocess spawn.
+ *     `~/.local/state/keeper/` default), including the Agent Bus DB/socket pair,
+ *     PLUS `KEEPER_SOCK` (a unique UDS per test so parallel daemons don't
+ *     collide on the default socket inode). The in-process daemon's path
+ *     resolvers read `process.env` directly, so we MUST set these on the live
+ *     `process.env`, not just build an object the way `sandboxEnv` does for a
+ *     subprocess spawn.
  *  2. `startDaemon({ disableNativeWatcher: true })`. The boot body is fully
  *     SYNCHRONOUS up to returning the handle: every path resolver runs and every
  *     worker spawns (capturing the env snapshot the worker thread inherits)
@@ -81,7 +82,7 @@ export interface WithInProcessDaemonOptions {
   workers?: readonly WorkerName[];
 }
 
-/** The six sandboxed `KEEPER_*` state-path keys, plus the per-test socket. */
+/** Sandboxed keeper state-path keys, plus the per-test daemon socket. */
 const STATE_KEYS = [
   "KEEPER_DB",
   "KEEPER_DEAD_LETTER_DIR",
@@ -89,6 +90,8 @@ const STATE_KEYS = [
   "KEEPER_DROP_LOG",
   "KEEPER_RESTORE_FILE",
   "KEEPER_BACKSTOP_LOG",
+  "KEEPER_BUS_DB",
+  "KEEPER_BUS_SOCK",
   "KEEPER_SOCK",
 ] as const;
 
@@ -125,13 +128,16 @@ export async function withInProcessDaemon(
     KEEPER_DROP_LOG: join(tmpDir, "hook-drops.ndjson"),
     KEEPER_RESTORE_FILE: join(tmpDir, "restore.json"),
     KEEPER_BACKSTOP_LOG: join(tmpDir, "backstop.ndjson"),
+    KEEPER_BUS_DB: join(tmpDir, "bus.db"),
+    KEEPER_BUS_SOCK: join(tmpDir, "bus.sock"),
     KEEPER_SOCK: sockPath,
     // Caller-supplied boot env (e.g. KEEPER_CONFIG for a hermetic plan root) —
     // applied/snapshotted/restored in the same window as the sandbox keys.
     ...opts.env,
   };
-  // Snapshot every key we touch (the fixed six + sock + any caller-supplied
-  // env) so the restore is EXACT — an absent key goes back to absent.
+  // Snapshot every key we touch (the fixed state paths + sock + any
+  // caller-supplied env) so the restore is EXACT — an absent key goes back to
+  // absent.
   const touchedKeys = [...STATE_KEYS, ...Object.keys(opts.env ?? {})];
   const prior: Record<string, string | undefined> = {};
   for (const k of touchedKeys) prior[k] = process.env[k];

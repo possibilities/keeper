@@ -39,6 +39,8 @@ let repo: string;
 let cfgDir: string;
 let configPath: string;
 
+const PLAN_CONTRACT_SESSION_ID = "test-plan-contract-session";
+
 beforeEach(() => {
   repo = realpathSync(mkdtempSync(join(tmpdir(), "keeper-plan-contract-")));
   cfgDir = realpathSync(
@@ -71,6 +73,10 @@ function git(...args: string[]): void {
 function plan(...args: string[]): Record<string, unknown> {
   const r = Bun.spawnSync([process.execPath, KEEPER_CLI, "plan", ...args], {
     cwd: repo,
+    env: {
+      ...process.env,
+      CLAUDE_CODE_SESSION_ID: PLAN_CONTRACT_SESSION_ID,
+    },
     stdout: "pipe",
     stderr: "pipe",
   });
