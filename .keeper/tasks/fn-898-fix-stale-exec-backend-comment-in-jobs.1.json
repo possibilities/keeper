@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T20:34:56.152000Z",
+  "depends_on": [],
+  "epic": "fn-898-fix-stale-exec-backend-comment-in-jobs",
+  "id": "fn-898-fix-stale-exec-backend-comment-in-jobs.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "medium",
+  "title": "trim stale focus-key comment",
+  "updated_at": "2026-06-22T20:34:56.152000Z"
+}
