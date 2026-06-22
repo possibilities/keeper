@@ -33,5 +33,5 @@ regex (`:72`).
 - [ ] one atomic mechanical commit; lint guard green over the cli scope
 
 ## Done summary
-
+Renamed incidental planctl symbols/comments to plan across cli/** (await.ts slot discriminant verified non-serialized, plus PlanSlotState/PLAN_CONDITIONS/planMain/git+keeper prose); frozen Planctl-* trailer regex left verbatim and commit-work.ts dropped from the now-swept exempt allowlist. Lint guard green; cli-scope tests pass.
 ## Evidence
