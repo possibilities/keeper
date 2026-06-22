@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T18:51:38.460000Z",
+  "depends_on": [],
+  "epic": "fn-894-keeper-pair-via-agentwrap",
+  "id": "fn-894-keeper-pair-via-agentwrap.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/agentwrap",
+  "tier": "xhigh",
+  "title": "agentwrap wait/read subcommands",
+  "updated_at": "2026-06-22T18:51:38.460000Z"
+}
