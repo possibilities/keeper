@@ -41,5 +41,5 @@ After: `launchctl list | grep chatctl` is empty; `ls apps/chatctl` is gone; port
 - [ ] no LIVE chatctl import was found outside apps/chatctl (verified before delete)
 
 ## Done summary
-
+Removed the chatctl runtime: unloaded + deleted the arthack.chatctl.run-server LaunchAgent (repo plist + home symlink), deleted apps/chatctl entirely, and dropped the chatctl entry from portalctl apps.yaml. No live chatctl import existed outside apps/chatctl (verified pre-delete).
 ## Evidence

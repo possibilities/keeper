@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "stop the chatctl daemon and delete the app",
-  "updated_at": "2026-06-22T00:54:50.513000Z"
+  "updated_at": "2026-06-22T01:04:37.278000Z",
+  "worker_done_at": "2026-06-22T01:04:37.278000Z"
 }
