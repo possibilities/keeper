@@ -60,5 +60,5 @@ row and asserts the channel carries the title (the gap unit tests missed).
 - [ ] Unit + full-tier live-registration tests pass
 
 ## Done summary
-
+Resolved bus channel identity from the Claude harness via a bounded server-side ancestry walk rooted at the anti-spoof peer pid (the nearest ancestor with a keeper jobs row IS the harness), so name/session_id/name_history and the published from now resolve to the real session instead of the keeper-bus-watch subprocess. Added unit tests for the walk + a full-tier live-registration integration test.
 ## Evidence
