@@ -40,5 +40,5 @@ Config tests (test/config.test.ts / the db.test.ts config block): `exec_backend:
 - [ ] Config tests green; `tmux` default behavior unchanged.
 
 ## Done summary
-
+Wired agentwrap as a selectable exec backend: exec_backend: agentwrap is now accepted (VALID_EXEC_BACKENDS) with tmux still default+fallback; added agentwrap_path config + KEEPER_AGENTWRAP_PATH env override resolving to an absolute, ~-expanded path (default ~/.bun/bin/agentwrap); both execBackend and agentwrapPath travel the restart-to-apply AutopilotWorkerData freeze into resolveExecBackend (factory lands in .2).
 ## Evidence

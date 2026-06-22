@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "exec backend config and selection plumbing",
-  "updated_at": "2026-06-22T18:31:41.889000Z"
+  "updated_at": "2026-06-22T18:39:23.800000Z",
+  "worker_done_at": "2026-06-22T18:39:23.800000Z"
 }
