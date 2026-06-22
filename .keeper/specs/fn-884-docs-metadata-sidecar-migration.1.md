@@ -42,5 +42,5 @@ Add a fail-open `PostToolUse` hook to the keeper plugin. On `Write` to a `.md` u
 - [ ] keeper CLAUDE.md ("Two hooks, two contracts"→three) + README (Install + Architecture hook count/paragraph) updated forward-facing
 
 ## Done summary
-
+Added the fail-open keeper PostToolUse(Write|Bash) sidecar-writer hook + dep-free src/sidecar.ts (strip-signature + sidecar parse/merge/serialize, shared with the .4 migration). On Write to ~/docs/*.md it create-or-merges the .yaml sidecar (never the .md); on gh gist create it upserts a bounded gist-url. Exported tokenizeShell, wired hooks.json, updated CLAUDE.md/README; 30 unit+subprocess tests green and test:full passes.
 ## Evidence
