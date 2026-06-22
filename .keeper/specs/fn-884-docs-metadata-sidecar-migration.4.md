@@ -37,5 +37,5 @@ Dry-run output (counts) is the first evidence. Spot-check 3-5 stripped docs + th
 - [ ] second run is a no-op; changes committed to ~/docs in tranches
 
 ## Done summary
-
+Built scripts/docs-migrate.ts (idempotent, dry-run-first) reusing src/sidecar.ts: stripped machine stamps from 335 docs (heading + bare-fence variants, incl. empty numbered-Metadata husks), backfilled/merged 823 .yaml sidecars, fixed corrupted gist-urls. Committed to ~/docs in 24 tranches after a pre-migration tag; second run is a clean no-op.
 ## Evidence

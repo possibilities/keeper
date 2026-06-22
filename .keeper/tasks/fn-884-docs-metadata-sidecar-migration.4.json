@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/docs",
   "tier": "xhigh",
   "title": "migrate ~/docs to sidecar-only metadata",
-  "updated_at": "2026-06-22T15:32:02.477000Z"
+  "updated_at": "2026-06-22T16:47:10.323000Z",
+  "worker_done_at": "2026-06-22T16:47:10.323000Z"
 }
