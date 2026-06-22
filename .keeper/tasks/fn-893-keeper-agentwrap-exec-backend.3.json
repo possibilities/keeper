@@ -12,5 +12,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "manual dispatch honors backend config",
-  "updated_at": "2026-06-22T18:31:41.889000Z"
+  "updated_at": "2026-06-22T19:03:33.377000Z",
+  "worker_done_at": "2026-06-22T19:03:33.377000Z"
 }

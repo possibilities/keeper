@@ -35,5 +35,5 @@ A cli/dispatch test (fake backend via `MainDeps`): with `exec_backend: agentwrap
 - [ ] Dispatch test green.
 
 ## Done summary
-
+Manual keeper dispatch now resolves the exec backend from config (backendType + agentwrapPath threaded into resolveExecBackend) and passes a structured LaunchSpec so it launches via agentwrap when exec_backend: agentwrap; default/tmux -f /dev/null path unchanged.
 ## Evidence
