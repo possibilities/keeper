@@ -1,7 +1,7 @@
 ---
 name: dispatch
 description: >-
-  Fire ONE claude worker into a tmux window by hand — the manual surface
+  Fire ONE claude worker into a managed window by hand — the manual surface
   parallel to the server-side autopilot reconciler. Two forms: plan form
   ("fire a worker on fn-N.M", "spawn a closer for fn-N") → `keeper dispatch
   work::fn-N.M` / `close::fn-N`; free form ("run this one-off prompt in a
@@ -18,8 +18,9 @@ argument-hint: <verb>::<id> | --prompt "<text>"
 # dispatch
 
 Turn a "launch ONE worker by hand" request into a single `keeper dispatch`
-Bash call. `keeper dispatch` fires one `claude` worker into a tmux window,
-parallel to — and independent of — the server-side autopilot reconciler. This
+Bash call. `keeper dispatch` fires one `claude` worker into a managed window
+(via whatever `exec_backend` is configured — tmux or agentwrap), parallel to —
+and independent of — the server-side autopilot reconciler. This
 is a precisely-triggered operator surface, conservative by default: it fires a
 worker only on a clear request to launch one by hand. The autopilot dispatching
 ready plan work on its own, or `/plan:work` running a task in THIS session,

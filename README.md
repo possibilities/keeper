@@ -340,14 +340,23 @@ Keeper has no `install` verb. Wire it up manually:
    - `claude_projects_root` — the single tree the transcript worker watches for
      session JSONL (to fold `custom-title` renames). Default: `~/.claude/projects`.
      Override only if your Claude Code transcripts live elsewhere.
-   - `exec_backend` — the terminal multiplexer keeperd's server-side autopilot
-     reconciler dispatches workers into. `tmux` is the sole backend and the
-     default; any other value warns and falls back to `tmux`. The managed-session
-     name is hardcoded (`autopilot`), NOT configurable; each dispatch opens a new
-     window inside that shared background session. The window-reaper worker
-     closes a managed window ONLY once its work is verifiably complete (stopped
-     past a short debounce with a completed readiness verdict — gone within
-     ~1-2s); every other window stays open for inspection.
+   - `exec_backend` — how keeperd's server-side autopilot reconciler launches
+     workers into a managed window. Two backends: `tmux` (the default + fallback)
+     hand-rolls `tmux new-window` itself; `agentwrap` instead invokes the patched
+     agentwrap CLI (which owns the tmux window) by absolute path. Any other value
+     warns and falls back to `tmux`. Only the LAUNCH transport differs — both
+     backends share the identical hook-based binding/lease/kill/focus machinery,
+     so a worker binds the same way under either. The managed-session name is
+     hardcoded (`autopilot`), NOT configurable; each dispatch opens a new window
+     inside that shared background session. The window-reaper worker closes a
+     managed window ONLY once its work is verifiably complete (stopped past a
+     short debounce with a completed readiness verdict — gone within ~1-2s);
+     every other window stays open for inspection.
+   - `agentwrap_path` — absolute path to the agentwrap binary, used ONLY when
+     `exec_backend: agentwrap`. The `KEEPER_AGENTWRAP_PATH` env var wins, else
+     this config key, else `~/.bun/bin/agentwrap`. A leading `~` is expanded at
+     resolve time (`execvp` does not expand `~`); a missing/bad path fails the
+     launch loudly at spawn, not silently.
    - `max_concurrent_jobs` — the global cap on concurrent autopilot worker
      jobs. A positive integer enforces the cap; omit or set non-positive
      (the default) to leave it unlimited. The cap bounds only `work`/`close`
@@ -367,7 +376,8 @@ Keeper has no `install` verb. Wire it up manually:
      - ~/code
      - ~/src
    claude_projects_root: ~/.claude/projects
-   exec_backend: tmux
+   exec_backend: tmux              # or: agentwrap
+   # agentwrap_path: ~/.bun/bin/agentwrap   # only used when exec_backend: agentwrap
    max_concurrent_jobs: 3
    YAML
    ```
@@ -2642,9 +2652,13 @@ on partial failure). The terminal-surface mechanics live behind the
 target session with its own per-call mint and launches an
 unnamed window — its consumers are `restore-agents.ts` (session restore) and
 `cli/dispatch.ts` (the manual `keeper dispatch` client-side escape hatch; see
-[Example clients](#example-clients)). tmux is the sole backend,
-resolved via `resolveExecBackend`; each reconciler dispatch opens as a new
-window in the hardcoded managed session (`autopilot`). Each op runs a cheap
+[Example clients](#example-clients)). `resolveExecBackend` picks the backend
+from `exec_backend`: `tmux` (default + fallback, hand-rolls `tmux new-window`)
+or `agentwrap` (invokes the agentwrap CLI, which owns the window). Only the
+launch transport differs — the pane ops above are SHARED (the agentwrap backend
+delegates `focusPane`/`listPanes`/`renameWindow`/`killWindow` to the tmux
+backend verbatim). Each reconciler dispatch opens as a new window in the
+hardcoded managed session (`autopilot`). Each op runs a cheap
 per-call `has-session` probe and mints via `new-session -d` only when the
 session is absent, so a stale/EXITED corpse is rebuilt rather than resurrected;
 a probe short-circuits before any mint when the target is already LIVE. The confirm step
@@ -2730,8 +2744,11 @@ mutable session name — a RENAMED session restores correctly.
 prints the plan, `--apply` relaunches each survivor into its original backend
 session via `ExecBackend.ensureLaunched` using the shared `buildResumeCommand` /
 `resumeTarget` substrate (`src/resume-descriptor`) that keeps the three
-resume-command producers byte-identical, pacing window creation 0.5s apart. tmux
-is the sole exec backend, so every candidate routes through one resolved instance.
+resume-command producers byte-identical, pacing window creation 0.5s apart.
+A spec-less `ensureLaunched` (the restore replay) execs the recorded argv via
+the tmux launch path under EITHER backend (the agentwrap backend falls back to
+the tmux launch when handed no structured spec), so every candidate routes
+through one resolved instance.
 `--last-generation` swaps the candidate source to `deriveLastGenerationSet`
 (the kill-anchored generation window above) and composes with `--apply` +
 `--session`; the plan/render/apply path is otherwise identical.

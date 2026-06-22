@@ -30,6 +30,7 @@
 import { expect, test } from "bun:test";
 import {
   AGENTWRAP_SCHEMA_VERSION,
+  AGENTWRAP_TMUX_EXIT,
   buildAgentwrapLaunchArgv,
   buildTmuxHasSessionArgs,
   buildTmuxKillWindowArgs,
@@ -1093,6 +1094,86 @@ test("parseAgentwrapStdout: a JSON object without schema_version → INTERNAL fa
 
 test("AGENTWRAP_SCHEMA_VERSION is pinned at 1 (cross-repo contract)", () => {
   expect(AGENTWRAP_SCHEMA_VERSION).toBe(1);
+});
+
+// --- cross-repo drift guard: byte-pinned agentwrap stdout fixture ---
+
+/**
+ * The JSON shape + exit-code taxonomy is a cross-repo contract with NO shared
+ * module (agentwrap `src/main.ts` `tmuxMetadata` / `tmux-launch.ts` `TMUX_EXIT`
+ * on one side, keeper `parseAgentwrapStdout` / `AGENTWRAP_TMUX_EXIT` on the
+ * other). `test/fixtures/agentwrap-launch-stdout.json` is ONE line of real
+ * `agentwrap claude --agentwrap-tmux --agentwrap-tmux-detached …` stdout
+ * (captured from the binary, not hand-authored), so these tests fail loudly the
+ * moment agentwrap's emitted shape or keeper's parser drifts apart. Recapture
+ * the fixture from real output when the contract is intentionally bumped.
+ */
+const AGENTWRAP_FIXTURE_STDOUT = await Bun.file(
+  new URL("./fixtures/agentwrap-launch-stdout.jsonl", import.meta.url),
+).text();
+
+test("fixture: keeper's parser consumes agentwrap's real launch stdout → ok", () => {
+  expect(parseAgentwrapStdout(AGENTWRAP_FIXTURE_STDOUT)).toEqual({ ok: true });
+});
+
+test("fixture: the real line carries schema_version === AGENTWRAP_SCHEMA_VERSION and the top-level bind points", () => {
+  const obj = JSON.parse(AGENTWRAP_FIXTURE_STDOUT.trim()) as Record<
+    string,
+    unknown
+  >;
+  // The version keeper validates against.
+  expect(obj.schema_version).toBe(AGENTWRAP_SCHEMA_VERSION);
+  // The stable top-level bind points keeper documents (discarded at runtime —
+  // binding is hook-based — but their PRESENCE is the contract).
+  expect(typeof obj.session).toBe("string");
+  expect(typeof obj.windowId).toBe("string");
+  expect(typeof obj.paneId).toBe("string");
+});
+
+test("fixture-fed createAgentwrapBackend.launch: exit 0 + real stdout → ok (full launch→parse→map path)", async () => {
+  const records: Array<{ cmd: string[]; cwd?: string }> = [];
+  const spawn = makeAgentwrapSpawnStub(
+    AWP,
+    { stdout: AGENTWRAP_FIXTURE_STDOUT, exitCode: 0 },
+    records,
+  );
+  const backend = createAgentwrapBackend({
+    noteLine: () => {},
+    agentwrapPath: AWP,
+    spawn,
+  });
+  const res = await backend.launch([], "work::fn-1-x.1", "/repo", {
+    prompt: "/plan:work fn-1-x.1",
+    claudeName: "work::fn-1-x.1",
+  });
+  expect(res).toEqual({ ok: true });
+});
+
+test("AGENTWRAP_TMUX_EXIT mirrors agentwrap's landed TMUX_EXIT taxonomy (1/2/3/4) and maps to the right outcome class", () => {
+  // The exit-code numbers MUST match agentwrap's `TMUX_EXIT`
+  // (src/tmux-launch.ts): INTERNAL=1, BAD_ARGS=2, NOOP=3, RETRYABLE=4.
+  expect(AGENTWRAP_TMUX_EXIT.INTERNAL).toBe(1);
+  expect(AGENTWRAP_TMUX_EXIT.BAD_ARGS).toBe(2);
+  expect(AGENTWRAP_TMUX_EXIT.NOOP).toBe(3);
+  expect(AGENTWRAP_TMUX_EXIT.RETRYABLE).toBe(4);
+  // …and the central map routes each to its outcome class: only RETRYABLE(4)
+  // is transient; INTERNAL/BAD_ARGS/NOOP are permanent (no retryable).
+  const ok: LaunchResult = { ok: true };
+  expect(mapAgentwrapExit(AGENTWRAP_TMUX_EXIT.RETRYABLE, ok)).toMatchObject({
+    ok: false,
+    retryable: true,
+  });
+  for (const code of [
+    AGENTWRAP_TMUX_EXIT.INTERNAL,
+    AGENTWRAP_TMUX_EXIT.BAD_ARGS,
+    AGENTWRAP_TMUX_EXIT.NOOP,
+  ]) {
+    const res = mapAgentwrapExit(code, ok);
+    expect(res.ok).toBe(false);
+    if (res.ok === false) {
+      expect(res.retryable).toBeUndefined();
+    }
+  }
 });
 
 // --- mapAgentwrapExit (the ONE central exit map, table-driven) ---

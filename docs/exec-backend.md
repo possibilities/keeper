@@ -1,10 +1,15 @@
 # The backend exec API
 
 `ExecBackend` (`src/exec-backend.ts`) is keeper's single seam over
-terminal-surface spawn mechanics. One implementation exists — **tmux** —
-and every consumer goes through the narrow `ExecBackend` interface so the
-multiplexer's subprocess plumbing lives in one place and tests can inject a
-fake `spawn` to assert argv construction without launching real processes.
+terminal-surface spawn mechanics. Two implementations exist — **tmux** (the
+default, which hand-rolls `tmux new-window`) and **agentwrap** (which invokes
+the patched agentwrap CLI to own the window) — and every consumer goes through
+the narrow `ExecBackend` interface so the multiplexer's subprocess plumbing
+lives in one place and tests can inject a fake `spawn` to assert argv
+construction without launching real processes. Only the LAUNCH transport
+differs between the two; the pane ops are shared (the agentwrap backend
+delegates `focusPane`/`listPanes`/`renameWindow`/`killWindow` to the tmux
+backend verbatim).
 
 This document orients a developer working *on* or *against* the backend.
 The module itself is heavily comment-documented; read it for the
@@ -18,10 +23,10 @@ exact wording of any contract, and read this for the shape of the whole.
 
 ## Overview
 
-The backend is a **factory, not a singleton** — `createTmuxBackend(...)`
-returns an `ExecBackend` with no top-level side effects, and
-`resolveExecBackend({ ... })` is the single stable entry point every call
-site goes through. Production constructs one inside the autopilot reconciler
+The backend is a **factory, not a singleton** — `createTmuxBackend(...)` and
+`createAgentwrapBackend(...)` each return an `ExecBackend` with no top-level
+side effects, and `resolveExecBackend({ ... })` is the single stable entry
+point every call site goes through (it picks the factory from `backendType`). Production constructs one inside the autopilot reconciler
 worker; the `keeper jobs` CLI, the `restore-agents.ts` replay, and the
 `keeper dispatch` manual escape hatch (`cli/dispatch.ts`) each construct their
 own. Tests pass a capturing `spawn` fake.
@@ -40,9 +45,14 @@ const backend = resolveExecBackend({
   so a consumer touching only the session-agnostic ops can construct with
   just `{ noteLine }`.
 - `spawn` defaults to `Bun.spawn`; inject a fake in tests.
-- `backendType` is accepted on `resolveExecBackend` but advisory: every tag
-  — including unknown, NULL, and legacy tags carried by historical job rows —
-  resolves to the tmux backend, which never throws on an unrecognized tag.
+- `backendType` selects the implementation: `agentwrap` (with an
+  `agentwrapPath`) routes through the agentwrap factory; `tmux` and EVERY other
+  tag — unknown, NULL, and legacy tags carried by historical job rows, and
+  `agentwrap` WITHOUT a resolved path — fall through to the tmux backend (loud
+  on the missing-path case), which never throws on an unrecognized tag.
+- `agentwrapPath` is the absolute agentwrap binary, consumed only by the
+  agentwrap backend (resolved by `resolveAgentwrapPath()`: `KEEPER_AGENTWRAP_PATH`
+  env → `agentwrap_path` config → `~/.bun/bin/agentwrap`, `~`-expanded).
 
 `resolveExecBackend(deps)` is the single stable entry point — call sites
 (the reconciler dispatch, the jobs-board focus path, the restore replay)
@@ -253,25 +263,44 @@ in isolation and the runtime composes them:
 | `buildTmuxRenameWindowArgs(windowId, name)` | `rename-window -t <windowId> -- <name>` — `--`-guarded window rename by `@N` id |
 | `execBackendEnvMeta(backendType?)` | hook env-var names (`KEEPER_TMUX_SESSION` / `TMUX_PANE`, plus the `paneIdCarrierEnvVar` carrier `KEEPER_TMUX_PANE`) |
 
-## Extending to a new backend
+## How a backend is wired (and how to add a third)
 
-The seam for a second backend (wezterm, kitty, …) survives the
-single-backend collapse — three steps:
+The `agentwrap` backend was added through exactly this seam, alongside `tmux`;
+the same four touch-points wire any further backend (wezterm, kitty, …):
 
 1. Implement the `ExecBackend` interface (`launch`, `focusPane`,
-   `ensureLaunched`, `listPanes`, `renameWindow`) over the new mechanism,
-   exporting pure argv builders for the tests.
+   `ensureLaunched`, `listPanes`, `renameWindow`, `killWindow`) over the new
+   mechanism, exporting pure argv builders for the tests. The agentwrap backend
+   re-implements ONLY `launch` (its own `buildAgentwrapLaunchArgv` +
+   `parseAgentwrapStdout` + the central `mapAgentwrapExit` exit-code map) and
+   delegates every pane op to a tmux backend it holds internally — a new
+   backend reuses as much of the tmux factory as its mechanism allows.
 2. Teach `execBackendEnvMeta(backendType)` the new backend's
    `backend_exec_type`, session-id, pane-id, and pane-id-carrier env-var
    names. This is the single source of truth for the env vars the **hook**
    reads on every event — including the `paneIdCarrierEnvVar` fallback-read
-   key the hook consults when the native pane-id var is stripped. Funnelling
-   the literals through this seam keeps the hook backend-agnostic so it never
+   key the hook consults when the native pane-id var is stripped. (agentwrap
+   binds through the SAME `KEEPER_TMUX_*` carriers as tmux — it injects them
+   into the pane via `--agentwrap-tmux-env` — so it shares the tmux meta;
+   a backend with its own pane-id var adds an entry here.) Funnelling the
+   literals through this seam keeps the hook backend-agnostic so it never
    learns new keys.
-3. Branch `resolveExecBackend(deps)` on backend type to construct the new
-   factory, and add the tag to `VALID_EXEC_BACKENDS` in `db.ts` so the
-   config parser accepts it. Call sites already go through the resolver, so
-   they need no structural change.
+3. Branch `resolveExecBackend(deps)` on `backendType` to construct the new
+   factory, and add the tag to `VALID_EXEC_BACKENDS` in `db.ts` so the config
+   parser accepts it. Call sites already go through the resolver, so they need
+   no structural change. A tag the parser rejects, or a backend missing a
+   required input (e.g. `agentwrap` without an `agentwrapPath`), falls through
+   to the tmux backend loudly.
+4. If the backend launches via an external binary, resolve its path with an
+   env-override → config-key → default ladder, `~`-expanded at resolve time
+   (`resolveAgentwrapPath()` is the model: `KEEPER_AGENTWRAP_PATH` →
+   `agentwrap_path` → `~/.bun/bin/agentwrap`).
+
+When the launch shape is a CROSS-REPO contract with no shared module (as
+agentwrap's one-line JSON + exit-code taxonomy is), pin it with a byte-captured
+fixture from the real binary so drift fails a test — see
+`test/fixtures/agentwrap-launch-stdout.jsonl` and its drift-guard tests in
+`test/exec-backend.test.ts`.
 
 The `DEFAULT_EXEC_BACKEND` (`"tmux"`) and `MANAGED_EXEC_SESSION`
 (`"autopilot"`) consts are exported so the lockstep `db.ts` site and tests
