@@ -50,5 +50,5 @@ checkconfig; force-build a `-install` builder and confirm it runs the right comm
 - [ ] `buildbot checkconfig` passes
 
 ## Done summary
-
+Added keeper/agentrender/agentusage install builders (each Dependent on its repo's green build; agentusage is a dep-refresh with no bun link) plus a standalone dotfiles-install on a daily 3am Nightly. Scheduler construction now dispatches on sched kind (singlebranch/dependent/nightly); all new builders are in the ForceScheduler. checkconfig passes.
 ## Evidence

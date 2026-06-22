@@ -11,5 +11,6 @@
   "target_repo": "/Users/mike/code/arthack",
   "tier": "high",
   "title": "Install builders and build-triggered chaining",
-  "updated_at": "2026-06-22T17:44:14.768000Z"
+  "updated_at": "2026-06-22T18:26:37.408000Z",
+  "worker_done_at": "2026-06-22T18:26:37.408000Z"
 }
