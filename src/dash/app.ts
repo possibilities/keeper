@@ -7,15 +7,20 @@
  *   `render(model)`, which paints the model as a flat list of one-line jobs
  *   grouped under session rules. Each band contributes a dim full-width rule
  *   (titled inline with the tmux session name, structure-gray) followed by its
- *   job lines; an empty band collapses (no rule). Each job is ONE `Text` line per
- *   `job:<id>` — `<caret><icon> <title> · <project>` — where the leading robot
- *   icon carries the status color (face + hue dual-encode status). The `j`/`k`/
- *   arrow SELECTION cursor (keyed on `job_id`, surviving a re-sort) marks the
- *   current line with a cyan caret + bold text + a subtle background wash and
- *   `scrollChildIntoView`s it; there is no border and no card. Nodes are MUTATED
- *   in place across frames (Text content); structural detach-then-append fires
- *   ONLY when the keyed line order changes, so Yoga recalc rides structure, not
- *   content. The runtime OpenTUI ctors are THREADED IN so this module carries
+ *   job lines; an empty band collapses (no rule). Each job is a flex-ROW per
+ *   `job:<id>` — a growing `<caret><icon>  <job name>` Text on the left and a
+ *   right-justified, dimmer `<project>` Text on the right. The leading robot icon
+ *   carries the status color (face + hue dual-encode status); when the row is
+ *   narrow the job name TRUNCATES (char-level ellipsis) before the project does.
+ *   The SELECTION cursor (keyed on `job_id`, surviving a re-sort) marks the
+ *   current line with a full-bleed background bar + a cyan caret + bold, and
+ *   `scrollChildIntoView`s it; `j`/`k`/arrows move it (and a click on a line
+ *   selects it directly), selection starts EMPTY on load (j/↓ seeds the first
+ *   line, k/↑ the last) and ESC clears it. There is no border and no card.
+ *   Nodes are MUTATED in place
+ *   across frames (Text content); structural detach-then-append fires ONLY when
+ *   the keyed line order changes, so Yoga recalc rides structure, not content.
+ *   The runtime OpenTUI ctors are THREADED IN so this module carries
  *   only a type-only `@opentui/core` import — the same inertness contract
  *   `src/live-shell.ts`'s `attachLiveShellPaint` keeps, so an unrelated test
  *   importing the pure view-model never trips OpenTUI's racy native loader.
@@ -116,27 +121,31 @@ export interface DashApp {
 /** One TextChunk in the OpenTUI wire shape (`text-buffer.ts` `TextChunk`). The
  * `fg` is resolved from the role's ANSI index — ABSENT when the role carries
  * no index (default terminal foreground); `dim` / `bold` descriptors layer the
- * matching text attributes; `bg` is the selection wash (absent off-selection). */
+ * matching text attributes. (The selection highlight is a full-bleed row
+ * background, not a per-chunk bg.) */
 interface BuiltChunk {
   __isChunk: true;
   text: string;
   fg?: RGBAType;
-  bg?: RGBAType;
   attributes?: number;
 }
 
 /** A flattened paint row: a `band` is the dim session-band rule (titled inline);
- * a `line` is one job's single text line. The view-model's per-frame order
- * drives the structural diff. */
+ * a `line` is one job's row. The view-model's per-frame order drives the
+ * structural diff. */
 type PaintRow =
   | { readonly kind: "band"; readonly key: string; readonly title: string }
   | { readonly kind: "line"; readonly key: string; readonly card: CardVM };
 
-/** One mounted job line: the Text node plus the card it last painted (so a
- * selection move can repaint the line without a full model re-render). */
+/** One mounted job line: a flex-row `node` holding a `left` Text (caret + icon +
+ * job name — grows to fill and TRUNCATES first when the screen is narrow) and a
+ * right-justified, dimmer `right` Text (project — never shrinks). `card` is the
+ * last-painted model so a selection move repaints without a full re-render. */
 interface LineHandle {
   kind: "line";
-  readonly node: TextRenderableType;
+  readonly node: BoxRenderableType;
+  readonly left: TextRenderableType;
+  readonly right: TextRenderableType;
   card: CardVM;
 }
 
@@ -169,13 +178,8 @@ export function attachDashApp(
   const selectBg = RGBA.fromIndex(SELECT_BG_INDEX);
 
   // Resolve a color descriptor to its renderable fg (absent index → default
-  // foreground) plus the descriptor's DIM/BOLD attributes; `bg` (when given)
-  // is the selection wash applied uniformly across the line.
-  function chunkFor(
-    text: string,
-    desc: ColorDescriptor,
-    bg?: RGBAType,
-  ): BuiltChunk {
+  // foreground) plus the descriptor's DIM/BOLD attributes.
+  function chunkFor(text: string, desc: ColorDescriptor): BuiltChunk {
     const chunk: BuiltChunk = { __isChunk: true, text };
     if (desc.index !== undefined) {
       chunk.fg = RGBA.fromIndex(desc.index);
@@ -185,9 +189,6 @@ export function attachDashApp(
       (desc.bold === true ? TextAttributes.BOLD : 0);
     if (attributes !== 0) {
       chunk.attributes = attributes;
-    }
-    if (bg !== undefined) {
-      chunk.bg = bg;
     }
     return chunk;
   }
@@ -235,16 +236,44 @@ export function attachDashApp(
   let selectedKey: string | null = null;
 
   function buildLineHandle(key: string, card: CardVM): LineHandle {
-    return {
-      kind: "line",
-      node: new runtime.TextRenderable(renderer, {
-        id: `dash-row-${key}`,
-        width: "100%",
-        height: 1,
-        content: "",
-      }),
-      card,
-    };
+    const node = new runtime.BoxRenderable(renderer, {
+      id: `dash-row-${key}`,
+      width: "100%",
+      height: 1,
+      flexDirection: "row",
+    });
+    // The job-name side grows into the slack. `wrapMode:"none"` + `truncate`
+    // clip with a char-level ellipsis (OpenTUI's built-in middle-ellipsis); a
+    // far higher flexShrink than the project means the job name gives way FIRST
+    // when the row is narrow.
+    const left = new runtime.TextRenderable(renderer, {
+      id: `dash-row-${key}-l`,
+      flexGrow: 1,
+      flexShrink: 100,
+      minWidth: 0,
+      overflow: "hidden",
+      wrapMode: "none",
+      truncate: true,
+      height: 1,
+      content: "",
+    });
+    // The right-justified project truncates the SAME way (char-level ellipsis),
+    // but only once the job name has fully given way (tiny flexShrink weight).
+    const right = new runtime.TextRenderable(renderer, {
+      id: `dash-row-${key}-r`,
+      flexShrink: 1,
+      minWidth: 0,
+      overflow: "hidden",
+      wrapMode: "none",
+      truncate: true,
+      height: 1,
+      content: "",
+    });
+    node.add(left);
+    node.add(right);
+    // A click anywhere on the row selects that job line.
+    node.onMouseDown = () => selectByKey(key);
+    return { kind: "line", node, left, right, card };
   }
 
   function buildBandHandle(key: string): BandHandle {
@@ -276,33 +305,62 @@ export function attachDashApp(
     return rows;
   }
 
-  // The job line: `<caret><icon> <title> · <project>`. The robot icon carries
-  // the status color; the selected line gets the cyan caret, bold title/project,
-  // and a uniform background wash. An unselected line pads the caret gutter so
-  // columns never shift.
-  function buildLineStyled(card: CardVM, selected: boolean): StyledTextType {
-    const bg = selected ? selectBg : undefined;
+  // The job-name side: `<caret><icon>  <title>`. The robot icon carries the
+  // status color; the selected line gets the cyan caret and bold title. An
+  // unselected line pads the caret gutter so columns never shift.
+  function buildLeftStyled(card: CardVM, selected: boolean): StyledTextType {
     const icon = colorForIcon(card.iconRole);
     const emphasis: ColorDescriptor = selected ? { bold: true } : {};
-    const chunks: BuiltChunk[] = [
+    return new runtime.StyledText([
       selected
-        ? chunkFor(SELECT_CARET, { index: ACCENT_COLOR_INDEX, bold: true }, bg)
-        : chunkFor(NO_CARET, {}, bg),
-      chunkFor(`${card.robotGlyph}  `, icon, bg),
-      chunkFor(card.title, emphasis, bg),
-      chunkFor(" · ", { dim: true }, bg),
-      chunkFor(card.project, emphasis, bg),
-    ];
-    return new runtime.StyledText(chunks);
+        ? chunkFor(SELECT_CARET, { index: ACCENT_COLOR_INDEX, bold: true })
+        : chunkFor(NO_CARET, {}),
+      chunkFor(`${card.robotGlyph}  `, icon),
+      chunkFor(card.title, emphasis),
+    ]);
   }
 
-  // Repaint one job line's content from its last card + the current selection.
-  // Idempotent — safe to call every frame and on every selection move.
+  // The right-justified project — always dim (a receded secondary label). The
+  // leading gap keeps it off a truncated job name; the trailing gap insets it
+  // from the right edge to match the left gutter.
+  function buildRightStyled(card: CardVM): StyledTextType {
+    return new runtime.StyledText([
+      chunkFor(`  ${card.project}  `, { dim: true }),
+    ]);
+  }
+
+  // Repaint one job line from its last card + the current selection. The
+  // selection highlight is a FULL-BLEED row background (covers the whole width,
+  // including the truncation ellipsis); the caret + bold ride on top. Idempotent
+  // — safe to call every frame and on every selection move.
   function paintLine(key: string): void {
     const handle = rowNodes.get(key);
     if (handle?.kind === "line") {
-      handle.node.content = buildLineStyled(handle.card, key === selectedKey);
+      const selected = key === selectedKey;
+      handle.node.backgroundColor = selected ? selectBg : undefined;
+      handle.left.content = buildLeftStyled(handle.card, selected);
+      handle.right.content = buildRightStyled(handle.card);
     }
+  }
+
+  // Select a job line by key (the shared path for keyboard moves and clicks):
+  // repaint the old + new lines and scroll the new one into view.
+  function selectByKey(key: string): void {
+    if (key === selectedKey) {
+      return;
+    }
+    const prevKey = selectedKey;
+    selectedKey = key;
+    if (prevKey !== null) {
+      paintLine(prevKey);
+    }
+    paintLine(key);
+    const handle = rowNodes.get(key);
+    if (handle !== undefined) {
+      // Nearest-edge scroll; a no-op if already visible.
+      body.scrollChildIntoView(handle.node.id);
+    }
+    renderer.requestRender();
   }
 
   function render(model: DashModel): void {
@@ -338,13 +396,11 @@ export function attachDashApp(
     }
     lineOrder = nextLineOrder;
 
-    // The selection cursor: clear it if the selected line left the set; seed it
-    // onto the first line when nothing is selected but lines exist.
+    // The selection cursor starts EMPTY (nothing selected on load) and clears
+    // again if the selected line leaves the set or on ESC. It is never
+    // auto-seeded — the first j/↓ lands on the first line, k/↑ on the last.
     if (selectedKey !== null && !lineOrder.includes(selectedKey)) {
       selectedKey = null;
-    }
-    if (selectedKey === null && lineOrder.length > 0) {
-      selectedKey = lineOrder[0] ?? null;
     }
 
     // Structural prune: drop any node whose key is no longer wanted.
@@ -388,37 +444,34 @@ export function attachDashApp(
   }
 
   // Move the selection cursor by `delta` steps through the rendered line order
-  // (keyed on job_id, so it survives a re-sort), keep the selected line in view,
-  // and repaint the marker swap.
+  // (keyed on job_id, so it survives a re-sort). From "nothing selected", j/↓
+  // lands on the first line, k/↑ on the last.
   function moveSelection(delta: number): void {
     if (lineOrder.length === 0) {
       return;
     }
     const cur = selectedKey === null ? -1 : lineOrder.indexOf(selectedKey);
-    // From "nothing selected", j lands on the first line, k on the last.
-    let next: number;
-    if (cur === -1) {
-      next = delta > 0 ? 0 : lineOrder.length - 1;
-    } else {
-      next = Math.min(Math.max(cur + delta, 0), lineOrder.length - 1);
+    const next =
+      cur === -1
+        ? delta > 0
+          ? 0
+          : lineOrder.length - 1
+        : Math.min(Math.max(cur + delta, 0), lineOrder.length - 1);
+    const nextKey = lineOrder[next];
+    if (nextKey !== undefined) {
+      selectByKey(nextKey);
     }
-    const nextKey = lineOrder[next] ?? null;
-    if (nextKey === selectedKey) {
+  }
+
+  // ESC drops back to "nothing selected" — the load state. The next j/↓ re-seeds
+  // the first line, k/↑ the last.
+  function clearSelection(): void {
+    if (selectedKey === null) {
       return;
     }
     const prevKey = selectedKey;
-    selectedKey = nextKey;
-    if (prevKey !== null) {
-      paintLine(prevKey);
-    }
-    if (selectedKey !== null) {
-      paintLine(selectedKey);
-      const handle = rowNodes.get(selectedKey);
-      if (handle !== undefined) {
-        // Nearest-edge scroll; a no-op if already visible (no key-repeat jitter).
-        body.scrollChildIntoView(handle.node.id);
-      }
-    }
+    selectedKey = null;
+    paintLine(prevKey);
     renderer.requestRender();
   }
 
@@ -435,7 +488,7 @@ export function attachDashApp(
   }
 
   // Key handler: q/Ctrl-C → caller teardown; j/down + k/up → move the selection
-  // cursor; t → caller's terminal-visibility toggle.
+  // cursor; ESC → clear the selection; t → caller's terminal-visibility toggle.
   renderer.keyInput.on("keypress", (key) => {
     if (destroyed) {
       return;
@@ -450,6 +503,10 @@ export function attachDashApp(
     }
     if (key.name === "k" || key.name === "up") {
       moveSelection(-1);
+      return;
+    }
+    if (key.name === "escape") {
+      clearSelection();
       return;
     }
     if (key.name === "t") {

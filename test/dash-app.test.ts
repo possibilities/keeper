@@ -2,14 +2,16 @@
  * Frame test for the `keeper dash` materializer (`src/dash/app.ts`
  * `attachDashApp`). Proves the OpenTUI paint surface over the robot job model:
  * the static tree mounts (root column → a focused flexGrow ScrollBox body), the
- * model's bands/lines diff into the body as a flat list of one-line jobs
- * (`<caret><icon> <title> · <project>`, no box, no border), band rules fence the
- * tmux-session bands, the `j`/`k`/arrow SELECTION cursor marks the current line
- * with a cyan caret (keyed on job_id, surviving re-sort), the `t` keybind fires
- * the terminal-visibility toggle, terminal lines gate on `showTerminal`, and the
- * row map is structurally pruned/reordered when the line set changes. Boots via
- * `createTestRenderer` (no `--isolate`; see `test/live-shell.test.ts`'s TDZ
- * note), destroys after each test.
+ * model's bands/lines diff into the body as a flat list of one-line jobs (a
+ * growing `<caret><icon>  <job name>` left side + a right-justified dim project,
+ * no box, no border), band rules fence the tmux-session bands, the SELECTION
+ * cursor (keyed on job_id, surviving re-sort) marks the current line with a
+ * caret — moved by `j`/`k`/arrows, seeded first/last from nothing, cleared by
+ * ESC, and settable by a click — a narrow row truncates the job name first, the
+ * `t` keybind fires the terminal-visibility toggle, terminal lines gate on
+ * `showTerminal`, and the row map is structurally pruned/reordered when the line
+ * set changes. Boots via `createTestRenderer` (no `--isolate`; see
+ * `test/live-shell.test.ts`'s TDZ note), destroys after each test.
  *
  * SERIAL-SAFE CHAIN MAINTENANCE: this file imports `@opentui/core` runtime
  * values, so it MUST be in BOTH `package.json`'s `test:opentui` chain AND the
@@ -105,6 +107,24 @@ function frameLineOf(frame: string, needle: string): number {
 const SELECT_CARET = "❯";
 function selectedLine(frame: string): string {
   return frame.split("\n").find((line) => line.includes(SELECT_CARET)) ?? "";
+}
+
+// A lone ESC byte is held by the renderer's key parser until a short idle flush
+// fires, so the `escape` keypress arrives asynchronously. Poll render frames
+// until `want` holds (or give up) instead of a fixed sleep.
+async function frameWhen(
+  setup: Awaited<ReturnType<typeof createTestRenderer>>,
+  want: (frame: string) => boolean,
+): Promise<string> {
+  for (let i = 0; i < 40; i++) {
+    await Bun.sleep(10);
+    await setup.renderOnce();
+    const frame = setup.captureCharFrame();
+    if (want(frame)) {
+      return frame;
+    }
+  }
+  return setup.captureCharFrame();
 }
 
 beforeAll(() => {
@@ -209,8 +229,8 @@ test("line chrome: jobs are plain lines — no box borders", async () => {
   // No rounded or heavy box borders anywhere — jobs are bare lines.
   expect(frame).not.toContain("╭");
   expect(frame).not.toContain("┏");
-  // The first line seeds the selection caret; exactly one line carries it.
-  expect(selectedLine(frame)).toContain("plain-a");
+  // Nothing is selected on load — no caret paints until a directional key.
+  expect(frame).not.toContain(SELECT_CARET);
 });
 
 test("bands: a session-band rule precedes its job lines, in priority order", async () => {
@@ -296,10 +316,13 @@ test("selection cursor: j/k move a keyed caret across job lines", async () => {
     ]),
   );
   await setup.renderOnce();
-  // The first line seeds the selection on mount → the caret sits on it.
-  expect(selectedLine(setup.captureCharFrame())).toContain("first-line");
+  // Nothing selected on load.
+  expect(setup.captureCharFrame()).not.toContain(SELECT_CARET);
 
-  // j moves the caret to the second line (one selected line at a time).
+  // j seeds the first line, a second j moves the caret to the second line.
+  setup.mockInput.pressKey("j");
+  await setup.renderOnce();
+  expect(selectedLine(setup.captureCharFrame())).toContain("first-line");
   setup.mockInput.pressKey("j");
   await setup.renderOnce();
   const afterJ = setup.captureCharFrame();
@@ -335,8 +358,9 @@ test("selection cursor: arrow keys drive the same caret as j/k", async () => {
   await setup.renderOnce();
   setup.mockInput.pressArrow("down");
   await setup.renderOnce();
-  // The down arrow reached the handler → caret moved to the second line.
-  expect(selectedLine(setup.captureCharFrame())).toContain("line-b");
+  // The down arrow reached the handler → from nothing selected it seeds the
+  // first line (same path as `j`).
+  expect(selectedLine(setup.captureCharFrame())).toContain("line-a");
 });
 
 test("selection cursor: survives a re-sort (keyed on job_id, not position)", async () => {
@@ -361,7 +385,8 @@ test("selection cursor: survives a re-sort (keyed on job_id, not position)", asy
     ]),
   );
   await setup.renderOnce();
-  setup.mockInput.pressKey("j"); // focus moves from s1 → s2
+  setup.mockInput.pressKey("j"); // nothing → first line (alpha)
+  setup.mockInput.pressKey("j"); // alpha → beta
   await setup.renderOnce();
 
   // Now s2 moves to the foreground session → its band outranks autopilot, so it
@@ -391,6 +416,93 @@ test("selection cursor: survives a re-sort (keyed on job_id, not position)", asy
   // the line (keyed on job_id), and beta's line is above alpha's.
   expect(frameLineOf(frame, "beta")).toBeLessThan(frameLineOf(frame, "alpha"));
   expect(selectedLine(frame)).toContain("beta");
+});
+
+test("selection cursor: ↓ from nothing seeds the first line, ↑ the last", async () => {
+  const { setup, app } = await bootApp();
+  app.render(
+    model([
+      makeJob({ job_id: "a", state: "working", title: "top", created_at: 1 }),
+      makeJob({ job_id: "b", state: "working", title: "mid", created_at: 2 }),
+      makeJob({ job_id: "c", state: "working", title: "bot", created_at: 3 }),
+    ]),
+  );
+  await setup.renderOnce();
+  // ↓ from nothing → the FIRST line.
+  setup.mockInput.pressArrow("down");
+  await setup.renderOnce();
+  expect(selectedLine(setup.captureCharFrame())).toContain("top");
+
+  // ESC, then ↑ from nothing → the LAST line.
+  setup.mockInput.pressEscape();
+  await frameWhen(setup, (f) => !f.includes(SELECT_CARET));
+  setup.mockInput.pressArrow("up");
+  await setup.renderOnce();
+  expect(selectedLine(setup.captureCharFrame())).toContain("bot");
+});
+
+test("selection cursor: ESC clears the selection back to nothing", async () => {
+  const { setup, app } = await bootApp();
+  app.render(
+    model([makeJob({ job_id: "a", state: "working", title: "only" })]),
+  );
+  await setup.renderOnce();
+  setup.mockInput.pressKey("j"); // select the line
+  await setup.renderOnce();
+  expect(setup.captureCharFrame()).toContain(SELECT_CARET);
+
+  setup.mockInput.pressEscape();
+  // Wait for the lone-ESC flush; the caret clears and the line still renders.
+  const frame = await frameWhen(setup, (f) => !f.includes(SELECT_CARET));
+  expect(frame).not.toContain(SELECT_CARET);
+  expect(frame).toContain("only");
+});
+
+test("click: clicking a job line selects it", async () => {
+  const { setup, app } = await bootApp();
+  app.render(
+    model([
+      makeJob({
+        job_id: "a",
+        state: "working",
+        title: "click-top",
+        created_at: 1,
+      }),
+      makeJob({
+        job_id: "b",
+        state: "working",
+        title: "click-bot",
+        created_at: 2,
+      }),
+    ]),
+  );
+  await setup.renderOnce();
+  expect(setup.captureCharFrame()).not.toContain(SELECT_CARET);
+
+  // Band rule paints at y=0; the two job lines at y=1 and y=2. Click the second.
+  await setup.mockMouse.click(3, 2);
+  await setup.renderOnce();
+  expect(selectedLine(setup.captureCharFrame())).toContain("click-bot");
+});
+
+test("narrow screen: the job name truncates while the project survives", async () => {
+  const { setup, app } = await bootApp({ width: 28 });
+  app.render(
+    model([
+      makeJob({
+        job_id: "j",
+        state: "working",
+        title: "an-extremely-long-job-name-that-cannot-fit",
+        cwd: "/work/Zproj",
+      }),
+    ]),
+  );
+  await setup.renderOnce();
+  const frame = setup.captureCharFrame();
+  // The right-justified project is never sacrificed.
+  expect(frame).toContain("Zproj");
+  // The job name is clipped — its full text does not survive the narrow row.
+  expect(frame).not.toContain("an-extremely-long-job-name-that-cannot-fit");
 });
 
 test("row-set diff: shrinking the line set structurally prunes its row node", async () => {

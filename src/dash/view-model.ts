@@ -5,9 +5,9 @@
  * (`./app.ts`) consumes: one BAND per active tmux session, each an ordered list
  * of keyed {@link CardVM} job lines (one per job).
  *
- * Each job paints as a single minimal line — a status ICON, the job name, a
- * dot, and the project name. Status is DUAL-ENCODED on that one glyph: a Nerd Font
- * md-robot FACE ({@link robotGlyph}) plus the icon's COLOR ({@link CardVM.iconRole}),
+ * Each job paints as a single minimal line — a status ICON, the job name, and a
+ * right-justified project name. Status is DUAL-ENCODED on that one glyph: a Nerd
+ * Font md-robot FACE ({@link robotGlyph}) plus the icon's COLOR ({@link CardVM.iconRole}),
  * both resolved fresh from the six-rung ladder in {@link robotRung} — annotation
  * columns (api-error, awaiting permission/input) outrank the base `state`. The
  * robot codepoints live in a DASH-LOCAL map ({@link ROBOT_CP}); the shared
@@ -196,8 +196,8 @@ function byBand(a: BandKey, b: BandKey): number {
 /**
  * One job line. `key` (`job:<id>`) is stable across frames so the paint layer
  * mutates a single line in place (never add/remove per frame). `robotGlyph` +
- * `iconRole` dual-encode status on the leading icon. `title` (job name) and
- * `project` (cwd basename) fill out the `<icon> <title> · <project>` line.
+ * `iconRole` dual-encode status on the leading icon. `title` (job name) leads
+ * the line after the icon; `project` (cwd basename) is right-justified.
  * `isTerminal` flags an ended/killed job (only present when `showTerminal`
  * reveals them).
  */
