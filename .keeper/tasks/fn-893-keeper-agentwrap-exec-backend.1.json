@@ -1,0 +1,13 @@
+{
+  "bundles": [],
+  "created_at": "2026-06-22T18:31:41.889000Z",
+  "depends_on": [],
+  "epic": "fn-893-keeper-agentwrap-exec-backend",
+  "id": "fn-893-keeper-agentwrap-exec-backend.1",
+  "priority": null,
+  "snippets": [],
+  "target_repo": "/Users/mike/code/keeper",
+  "tier": "high",
+  "title": "exec backend config and selection plumbing",
+  "updated_at": "2026-06-22T18:31:41.889000Z"
+}
