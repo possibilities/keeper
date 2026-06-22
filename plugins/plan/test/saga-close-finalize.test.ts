@@ -25,7 +25,7 @@ import {
   writeArtifact,
   writeBriefArtifact,
 } from "../src/audit_artifacts.ts";
-import { CLOSE_OUTCOMES } from "../src/verbs/close_finalize.ts";
+import { CLOSE_OUTCOMES, type CloseOutcome } from "../src/verbs/close_finalize.ts";
 import {
   firstJsonPayload,
   gitInit,
@@ -678,7 +678,7 @@ describe("close-finalize gates + exhaustiveness + retired verb", () => {
 
   test("every CloseOutcome member has a /plan:close handler and vice versa", () => {
     // test_close_finalize.py::test_close_outcome_exhaustiveness
-    const members = new Set(Object.values(CLOSE_OUTCOMES));
+    const members = new Set(Object.values(CLOSE_OUTCOMES) as CloseOutcome[]);
     expect(members).toEqual(CLOSE_SKILL_HANDLERS);
   });
 
