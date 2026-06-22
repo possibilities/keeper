@@ -1,0 +1,17 @@
+{
+  "branch_name": "main",
+  "bundles": [],
+  "created_at": "2026-06-22T00:54:50.513000Z",
+  "depends_on_epics": [],
+  "id": "fn-879-retire-chatctl-onto-the-agent-bus",
+  "last_validated_at": "2026-06-22T00:54:50.545000Z",
+  "primary_repo": "/Users/mike/code/keeper",
+  "queue_jump": false,
+  "snippets": [],
+  "status": "open",
+  "title": "retire chatctl onto the agent bus",
+  "touched_repos": [
+    "/Users/mike/code/arthack"
+  ],
+  "updated_at": "2026-06-22T00:54:50.513000Z"
+}
