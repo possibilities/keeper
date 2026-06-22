@@ -210,6 +210,74 @@ test("deriveEpicLinks: per-session suppression holds when both create and scaffo
 });
 
 // ---------------------------------------------------------------------------
+// Autopilot-op exclusion: the worker's `done` and the closer's `close` are
+// epic-mutating ops that would otherwise fall through to the refiner branch,
+// but they emit NO edge — they are redundant with the task rows and the
+// `work::` / `close::` spawn-name prefix (fn-881). A genuine refiner in the
+// same session survives, proving the exclusion is op-scoped, not session-scoped.
+// ---------------------------------------------------------------------------
+
+test("deriveEpicLinks: worker `done` and closer `close` emit no edge", () => {
+  expect(
+    deriveEpicLinks([
+      {
+        ts: 100,
+        op: "done",
+        target: "fn-1-foo.3",
+        epic_id: "fn-1-foo",
+        subject_present: true,
+      },
+      {
+        ts: 110,
+        op: "close",
+        target: "fn-1-foo",
+        epic_id: "fn-1-foo",
+        subject_present: true,
+      },
+    ]),
+  ).toEqual([]);
+});
+
+test("deriveEpicLinks: a genuine refiner survives alongside an excluded `done`", () => {
+  expect(
+    deriveEpicLinks([
+      {
+        ts: 100,
+        op: "done",
+        target: "fn-1-foo.3",
+        epic_id: "fn-1-foo",
+        subject_present: true,
+      },
+      {
+        ts: 150,
+        op: "set-title",
+        target: "fn-1-foo",
+        epic_id: "fn-1-foo",
+        subject_present: true,
+      },
+    ]),
+  ).toEqual([{ kind: "refiner", target: "fn-1-foo" }]);
+});
+
+test("deriveJobLinks: a worker `done` session contributes no edge", () => {
+  const bySession = new Map<string, ClassifierInvocation[]>([
+    [
+      "sess-worker",
+      [
+        {
+          ts: 100,
+          op: "done",
+          target: "fn-1-foo.3",
+          epic_id: "fn-1-foo",
+          subject_present: true,
+        },
+      ],
+    ],
+  ]);
+  expect(deriveJobLinks(bySession, "fn-1-foo")).toEqual([]);
+});
+
+// ---------------------------------------------------------------------------
 // Total-order sort: a `ts`-tie between a creator and a refiner of the same
 // epic resolves DETERMINISTICALLY via the `event_id` tiebreak, regardless of
 // the input array order. Locks the re-fold-determinism requirement.

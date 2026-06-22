@@ -340,6 +340,14 @@ from pathlib import Path
 # flag, the migration raises the floor to ``max(events.id)`` so historical git
 # folds no-op, and a boot-seed producer re-derives the git surface. keeper-py
 # stopped reading the git tables, so again only the version whitelist gains 79.
+#
+# v80 (fn-881 task .1) excludes the worker's ``done`` op and the closer's
+# ``close`` op from the plan-link classifier so ``refiner`` means only genuine
+# plan-shaping edits. Because the fold output changed, the migration mirrors the
+# v77 rewind/wipe block (cursor-0 rewind + canonical projection wipe) but raises
+# the git skip-floor instead of resetting it to 0 (the v79 shape, avoiding a
+# historical git-fold replay). keeper-py reads ``jobs`` / ``epics`` over the
+# socket, not these projection internals, so only the version whitelist gains 80.
 SUPPORTED_SCHEMA_VERSIONS = frozenset(
     {
         31,
@@ -391,6 +399,7 @@ SUPPORTED_SCHEMA_VERSIONS = frozenset(
         77,
         78,
         79,
+        80,
     }
 )
 

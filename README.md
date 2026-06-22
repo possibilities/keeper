@@ -2277,6 +2277,20 @@ derive repopulates every epic; a from-scratch re-fold reproduces byte-identical
 `epics.job_links` / `created_by_closer_of` rows. keeper-py's
 `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `77` (whitelist-only; keeper-py reads
 `jobs` / `epics` over the socket, not the classifier internals).
+As of schema v80 (fn-881), the plan-link classifier EXCLUDES the worker's `done`
+op and the closer's `close` op: since v77 every epic-mutating op grafts, so each
+epic carried one `creator` plus a pile of `refiner` edges that were actually every
+autopiloted `/plan:work` worker (`keeper plan done`) and the `/plan:close` closer
+(`keeper plan epic close`) — redundant with the task rows and self-evident from the
+job title's `work::` / `close::` spawn-name prefix. `classifyEntry` now returns
+null for `op === "done"` / `op === "close"` (after the read-only gate, before the
+creator/refiner branches), so `refiner` means only genuine plan-shaping edits
+(`refine-apply`, `/plan:next` queue jumps, `epic set-*`, deps, direct CLI). Because
+the fold output changed, the migration MIRRORS the v77 rewind/wipe block but RAISES
+the git skip-floor instead of resetting it to 0 (preserving the v79 git carve-out so
+the cursor-0 re-fold drain no-ops historical git folds), so the deterministic link
+projections re-fold byte-identically and `created_by_closer_of` lineage stays intact.
+keeper-py's `SUPPORTED_SCHEMA_VERSIONS` frozenset gains `80` (whitelist-only).
 As of schema v41 (fn-651), the `usage` projection tells the truth about
 WHEN a rate-limited profile unblocks AND whether its numbers are fresh.
 Two additive nullable columns ride the existing `UsageSnapshot`
@@ -2335,10 +2349,12 @@ schema v54) every `Commit` event carrying the `Planctl-Op` / `Planctl-Target`
 re-derives per-session `jobs.epic_links` and per-epic `epics.job_links` from
 the session's `keeper plan` footprint — the deduped UNION of the legacy
 stdout-scrape rows and the durable commit-trailer facts — classified
-unconditionally (no time window): EVERY epic-mutating op links as creator
+unconditionally (no time window): every epic-mutating op links as creator
 (`epic-create` OR `scaffold` with an epic-shaped target — scaffold is the
 canonical epic-create path on this codebase) or refiner (any other
-epic-touching mutation), gated only by the read-only `subject_present` skip.
+epic-touching mutation), gated by the read-only `subject_present` skip AND the
+v80 (fn-881) autopilot-op exclusion that drops the worker's `done` and the
+closer's `close` op so `refiner` means only genuine plan-shaping edits.
 The classifier sorts on a `(ts, event_id)` total order so per-session
 creator-suppression (a session that scaffolds AND refines the same epic emits
 ONE creator edge) is deterministic on `ts`-ties. The

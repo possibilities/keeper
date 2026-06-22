@@ -4,8 +4,9 @@
  *
  * - {@link deriveEpicLinks} — classify one session's planctl invocations and
  *   return a deduped, sorted list of `{kind: "creator" | "refiner", target:
- *   <epic_id>}` entries. Every epic-mutating op links regardless of time; the
- *   read-only (`subject_present === false`) gate is the only skip.
+ *   <epic_id>}` entries. Every epic-mutating op links regardless of time, EXCEPT
+ *   the two autopilot-op exclusions below; the read-only
+ *   (`subject_present === false`) gate skips read-only verbs.
  * - {@link deriveJobLinks} — symmetric per-epic view: walk every session's
  *   invocations, return a deduped, sorted list of `{kind, job_id}` entries
  *   for the target epic.
@@ -17,6 +18,17 @@
  * codebase); `/plan:defer` rides the scaffold→creator path, and
  * `/plan:next` / queue-jump / direct-CLI edits land as refiners. No other
  * kinds.
+ *
+ * **Autopilot-op exclusions.** Two epic-mutating ops are EXCLUDED — they emit
+ * no edge of either kind: the worker's `done` (`keeper plan done`, every
+ * autopiloted `/plan:work`) and the closer's `close` (`keeper plan epic
+ * close`, `/plan:close`). They are redundant with the task rows and
+ * self-evident from the job title's `work::` / `close::` spawn-name prefix, so
+ * `refiner` means only genuine plan-shaping edits (`refine-apply`,
+ * `/plan:next` queue jumps, `epic set-*`, deps, direct CLI). No other op
+ * normalizes to `done`/`close`, so the exclusion is collateral-free. The skips
+ * are pure constant-time branches, so re-fold determinism holds by
+ * construction (fn-881; the v79→v80 rewind purges the stale persisted edges).
  *
  * **Per-session creator-suppression.** A session that BOTH scaffolds AND later
  * refines the same epic emits ONE `creator` edge, not creator+refiner — the
@@ -175,7 +187,11 @@ function sortValidInvocations(
  * planctl CLI's `scaffold` verb writes a fresh `.keeper/epics/<id>.json`); it
  * carries an epic-shaped target and is a creator alongside `create`. A
  * mutating op that names an epic (via `epic_id`) but is not a create/scaffold
- * is a refiner. Anything else (read-only, or touching no epic) returns null.
+ * is a refiner — EXCEPT the autopilot-op exclusions (`op === "done"` /
+ * `op === "close"`), which return null before the refiner branch (the worker /
+ * closer edges are redundant with the task rows and the spawn-name prefix).
+ * Anything else (read-only, the two excluded ops, or touching no epic) returns
+ * null.
  */
 function classifyEntry(
   entry: ClassifierInvocation,
@@ -183,8 +199,20 @@ function classifyEntry(
   if (typeof entry.op !== "string" || entry.op.length === 0) {
     return null;
   }
-  // Read-only / runtime-state-only entries — skip (the only surviving gate).
+  // Read-only / runtime-state-only entries — skip.
   if (entry.subject_present === false) {
+    return null;
+  }
+  // Autopilot-op exclusions — skip the worker's `done` and the closer's
+  // `close`. Both are autopiloted, epic-mutating ops that would otherwise fall
+  // through to the refiner branch, but they are redundant with the task rows
+  // and self-evident from the job title's `work::` / `close::` spawn-name
+  // prefix, so they emit NO link edge. Placed AFTER the read-only gate and
+  // BEFORE the create/scaffold→creator and epic_id→refiner branches. No other
+  // op normalizes to `done`/`close` (raw verbs are already these — see
+  // {@link normalizePlanOp}), so there is no collateral exclusion. Pure
+  // constant-time branches — re-fold determinism holds by construction.
+  if (entry.op === "done" || entry.op === "close") {
     return null;
   }
   if (
@@ -208,6 +236,8 @@ function classifyEntry(
  * Classification rules:
  *
  * - `subject_present === false` → ignored (read-only gate).
+ * - `op` in {done, close} → ignored (autopilot-op exclusion: the worker's
+ *   `done` and the closer's `close` emit no edge).
  * - `op` in {create, scaffold} with `parsePlanRef(target).kind === 'epic'` →
  *   `creator` for that epic; suppress any later `refiner` for the SAME epic in
  *   this session (per-session suppression).
@@ -273,6 +303,7 @@ export function deriveEpicLinks(
  * Classification rules (for *epicId* only):
  *
  * - `subject_present === false` → ignored.
+ * - `op` in {done, close} → ignored (autopilot-op exclusion).
  * - `op` in {create, scaffold} with `parsePlanRef(target).kind === 'epic'`
  *   AND `target === epicId` → emit `creator` for that session; suppress any
  *   later `refiner` for the same epic in the SAME session.

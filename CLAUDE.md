@@ -71,8 +71,10 @@ rationale, and incident history: `README.md` `## Architecture` and `.keeper/` sp
   runs AFTER the drain and BEFORE serving so the runtime set starts empty every boot;
   the autopilot re-derives genuine in-flight launches from live `jobs`/tmux panes, so
   empty-at-boot is correct and subsumes clearing any phantom a rewinding migration's
-  full re-fold would resurrect — the v76→v79 dispatch jam; DELIBERATELY excluded from
-  the byte-identical charter, NOT in the re-fold wipe list), and **control**
+  full re-fold would resurrect — the v76→v79 dispatch jam, and the same hazard any later
+  cursor-rewind migration carries (e.g. the v80/fn-881 classifier-exclusion rewind);
+  DELIBERATELY excluded from the byte-identical charter, NOT in the re-fold wipe list),
+  and **control**
   (`reducer_state`, plus `git_projection_state`'s `floor` + `seed_required`). The skip-floor
   (`git_projection_state.floor`, a monotonic `events.id`) makes every git fold no-op
   for `id <= floor` — the gate lives INSIDE `applyEvent` by event type, never in the

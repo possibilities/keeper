@@ -20,6 +20,7 @@ import {
   openDb,
   readGitProjectionFloor,
   readGitProjectionSeedRequired,
+  SCHEMA_VERSION,
 } from "../src/db";
 import {
   DEFAULT_GIT_SEED_BUDGET_MS,
@@ -424,7 +425,7 @@ test("copy-proof (synthetic): v78→v79 migrate + boot-seed is FAST (historical 
     // (c) The runtime-downgrade guard still refuses an older binary: stamp the DB
     //     one ahead and assert openDb throws BEFORE migrating.
     db.prepare("UPDATE meta SET value = ? WHERE key = 'schema_version'").run(
-      String(80),
+      String(SCHEMA_VERSION + 1),
     );
     db.close();
     let guardErr: unknown = null;

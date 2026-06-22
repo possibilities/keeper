@@ -2146,9 +2146,11 @@ test("fn-756 (v63): epics has NO `approval` column; default_visible rewritten to
   // the plan-link classifier from `/plan:plan` windows + rewinds the cursor and
   // wipes the canonical projection list, fn-856; v78 renames the `planctl_*`
   // schema surface → `plan_*` + rewrites historical envelopes, fn-864; v79 adds
-  // the `git_projection_state` live-only control singleton + skip-floor, fn-868);
+  // the `git_projection_state` live-only control singleton + skip-floor, fn-868;
+  // v80 excludes the worker's `done` + closer's `close` op from the plan-link
+  // classifier + rewinds the cursor with a git-floor-raise (not reset), fn-881);
   // the v62→v63 epics-shape migration this test exercises is unchanged.
-  expect(SCHEMA_VERSION).toBe(79);
+  expect(SCHEMA_VERSION).toBe(80);
 
   // (a) Fresh DB: no `approval` column (table_info excludes generated cols, so
   // a real stored column shows up here if present).
