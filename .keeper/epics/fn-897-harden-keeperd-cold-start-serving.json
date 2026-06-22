@@ -1,6 +1,7 @@
 {
   "branch_name": "main",
   "bundles": [],
+  "closer_done_at": "2026-06-22T21:30:57.155000Z",
   "created_at": "2026-06-22T20:02:32.773000Z",
   "depends_on_epics": [
     "fn-896-retire-exec-backend-abstraction"
@@ -10,10 +11,10 @@
   "primary_repo": "/Users/mike/code/keeper",
   "queue_jump": false,
   "snippets": [],
-  "status": "open",
+  "status": "done",
   "title": "Harden keeperd cold-start serving",
   "touched_repos": [
     "/Users/mike/code/keeper"
   ],
-  "updated_at": "2026-06-22T20:02:40.924000Z"
+  "updated_at": "2026-06-22T21:30:57.155000Z"
 }
