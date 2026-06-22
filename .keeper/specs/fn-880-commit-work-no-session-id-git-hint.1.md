@@ -57,5 +57,5 @@ Then update the test block `describe("commit-work: session id", ...)` at
 - [ ] `bun run test:full` passes (slow-tier file; fast `bun test` skips it)
 
 ## Done summary
-
+Reshaped commit-work null-session guard into a structured error: no_session_id envelope with a git-direct hint; updated test to assert the new error/hint shape.
 ## Evidence
