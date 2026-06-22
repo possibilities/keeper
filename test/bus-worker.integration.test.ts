@@ -579,6 +579,53 @@ test("live registration: a harness-resolved channel's published `from` carries t
   sender.socket.end();
 });
 
+test("heartbeat persistence: a registered watcher's {op:heartbeat} is accepted over the live wire and the channel survives", async () => {
+  await bootBus();
+  // A watcher registers, then beats on the SAME long-lived connection — the
+  // exact wire path `watchOnce` now drives (register → subscribe → heartbeat
+  // interval). The server's opHeartbeat refreshes the channel's monotonic
+  // last-beat stamp the reaper reads, so the channel is NOT a silent eviction
+  // candidate.
+  const watcher = await connectClient();
+  watcher.send({
+    op: "register",
+    namespace: "chat",
+    name: "watcher",
+    session_id: "sess-watcher",
+    start_time: "t-watcher",
+  });
+  await waitFrame(
+    watcher.frames,
+    (f) => f.type === "ack" && f.op === "register",
+  );
+  watcher.send({ op: "subscribe", namespaces: ["chat"] });
+  await waitFrame(
+    watcher.frames,
+    (f) => f.type === "ack" && f.op === "subscribe",
+  );
+
+  // The channel is on the bus.
+  const before = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+    name?: string;
+  }>;
+  expect(before.some((c) => c.name === "watcher")).toBe(true);
+
+  // Beat several times on the open connection (no ack frame by contract — the
+  // server silently refreshes). A malformed/unhandled op would surface an error
+  // frame; assert none arrives and the connection stays open.
+  for (let i = 0; i < 3; i++) watcher.send({ op: "heartbeat" });
+  // Give the worker a beat to process the frames, then confirm no error frame
+  // and the channel is still listed (heartbeat refreshed, not evicted).
+  await retryUntil(() => true, 150, 50);
+  expect(watcher.frames.find((f) => f.type === "error")).toBeUndefined();
+  const after = JSON.parse((await runBusCli(["list"])).stdout) as Array<{
+    name?: string;
+  }>;
+  expect(after.some((c) => c.name === "watcher")).toBe(true);
+
+  watcher.socket.end();
+});
+
 test("shutdown releases the socket + lock", async () => {
   await bootBus();
   expect(existsSync(sockPath)).toBe(true);

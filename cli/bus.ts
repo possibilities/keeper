@@ -59,6 +59,13 @@ export const SPILL_MAX_AGE_MS = 3 * 86400 * 1000;
 /** How long a one-shot op waits for its ack after connect (ms). */
 export const BUS_RESPONSE_TIMEOUT_MS = 5000;
 
+/**
+ * Watch-client heartbeat cadence (ms). The server evicts a channel silent past
+ * its 90s heartbeat threshold; we beat well under that so a live watcher is
+ * never reaped. Rides the SAME long-lived connection as the subscription.
+ */
+export const HEARTBEAT_INTERVAL_MS = 30_000;
+
 const HELP = `keeper bus — Agent Bus command surface
 
 Usage:
@@ -605,14 +612,46 @@ async function runWatch(sockPath: string): Promise<never> {
   }
 }
 
+/** A minimal writable for the watch frame handlers (the Bun socket / a test fake). */
+type FrameWriter = { write: (data: string) => number };
+
+/**
+ * Schedule `{op:"heartbeat"}` frames on `s` at {@link HEARTBEAT_INTERVAL_MS},
+ * riding the caller's already-open connection. Returns a canceller to clear the
+ * timer on disconnect so a dead watcher never leaks it. `schedule` is injectable
+ * so tests can drive the cadence with fake timers.
+ */
+export function startHeartbeat(
+  s: FrameWriter,
+  schedule: (fn: () => void, ms: number) => ReturnType<typeof setInterval> = (
+    fn,
+    ms,
+  ) => setInterval(fn, ms),
+): () => void {
+  const id = schedule(() => {
+    s.write(`${JSON.stringify({ op: "heartbeat" })}\n`);
+  }, HEARTBEAT_INTERVAL_MS);
+  return () => clearInterval(id);
+}
+
 /** One watch connection: register, subscribe, stream until the socket closes. */
 function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
   return new Promise<void>((resolve, reject) => {
     let remainder = "";
     let settled = false;
+    let cancelHeartbeat: (() => void) | null = null;
+    const beginHeartbeat = (s: FrameWriter): void => {
+      // Idempotent: a stray second register-ack would not stack timers.
+      if (cancelHeartbeat !== null) return;
+      cancelHeartbeat = startHeartbeat(s);
+    };
     const done = (err: Error | null): void => {
       if (settled) return;
       settled = true;
+      if (cancelHeartbeat !== null) {
+        cancelHeartbeat();
+        cancelHeartbeat = null;
+      }
       if (err) reject(err);
       else resolve();
     };
@@ -637,7 +676,7 @@ function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
             } catch {
               continue;
             }
-            handleWatchFrame(s, f, inboxDir);
+            handleWatchFrame(s, f, inboxDir, beginHeartbeat);
           }
         },
         close() {
@@ -651,14 +690,17 @@ function watchOnce(sockPath: string, inboxDir: string): Promise<void> {
   });
 }
 
-/** Per-frame watch handling: subscribe on register-ack, render delivered messages. */
-function handleWatchFrame(
-  s: { write: (data: string) => number },
+/** Per-frame watch handling: subscribe + start heartbeat on register-ack, render
+ *  delivered messages. */
+export function handleWatchFrame(
+  s: FrameWriter,
   f: Record<string, unknown>,
   inboxDir: string,
+  beginHeartbeat: (s: FrameWriter) => void,
 ): void {
   if (f.type === "ack" && f.op === "register") {
     s.write(`${JSON.stringify({ op: "subscribe" })}\n`);
+    beginHeartbeat(s);
     return;
   }
   // A delivered event envelope (server → subscriber). Control-namespace lifecycle
