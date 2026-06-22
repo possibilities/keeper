@@ -43,5 +43,5 @@ cadence (fake timers). A full-tier test: register a watcher, advance past
 - [ ] Unit + full-tier persistence tests pass
 
 ## Done summary
-
+The watch client now heartbeats every 30s on its long-lived connection after register-ack (cleared on disconnect), so the relay no longer evicts a live channel at the 90s threshold. Added a fast-tier cadence/dispatch unit test and a full-tier wire test that the registered watcher's heartbeat is accepted and the channel survives.
 ## Evidence

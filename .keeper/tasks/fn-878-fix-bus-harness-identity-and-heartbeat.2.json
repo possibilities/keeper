@@ -9,5 +9,6 @@
   "target_repo": "/Users/mike/code/keeper",
   "tier": "high",
   "title": "watch client sends heartbeats",
-  "updated_at": "2026-06-21T23:30:21.438000Z"
+  "updated_at": "2026-06-22T00:18:09.476000Z",
+  "worker_done_at": "2026-06-22T00:18:09.476000Z"
 }
