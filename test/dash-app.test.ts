@@ -1,15 +1,13 @@
 /**
  * Frame test for the `keeper dash` materializer (`src/dash/app.ts`
- * `attachDashApp`). Proves the OpenTUI paint surface over the robot job-card
- * model: the static tree mounts (root column → a focused flexGrow ScrollBox
- * body), the card model's bands/cards diff into the
- * body as a single column of bordered robot CARDS (one BoxRenderable per job:
- * rounded structure-gray border, project title, three interior lines carrying
- * the rail+robot glyph / title / age footer), band rules fence the tmux-session
- * bands, the `j`/`k`/arrow focus cursor swaps the focused card to a heavy cyan
- * border (keyed on job_id, surviving re-sort), the `t` keybind fires the
- * terminal-visibility toggle, terminal cards gate on `showTerminal`, and the
- * row map is structurally pruned/reordered when the card set changes. Boots via
+ * `attachDashApp`). Proves the OpenTUI paint surface over the robot job model:
+ * the static tree mounts (root column → a focused flexGrow ScrollBox body), the
+ * model's bands/lines diff into the body as a flat list of one-line jobs
+ * (`<caret><icon> <title> · <project>`, no box, no border), band rules fence the
+ * tmux-session bands, the `j`/`k`/arrow SELECTION cursor marks the current line
+ * with a cyan caret (keyed on job_id, surviving re-sort), the `t` keybind fires
+ * the terminal-visibility toggle, terminal lines gate on `showTerminal`, and the
+ * row map is structurally pruned/reordered when the line set changes. Boots via
  * `createTestRenderer` (no `--isolate`; see `test/live-shell.test.ts`'s TDZ
  * note), destroys after each test.
  *
@@ -86,14 +84,9 @@ function makeJob(overrides: Partial<Job> = {}): Job {
   };
 }
 
-/** The card model for a set of jobs, terminal hidden (the default toggle). */
+/** The dash model for a set of jobs, terminal hidden (the default toggle). */
 function model(jobs: Job[], showTerminal = false): DashModel {
-  return buildDashModel(
-    new Map(jobs.map((j) => [j.job_id, j])),
-    [],
-    showTerminal,
-    1000,
-  );
+  return buildDashModel(new Map(jobs.map((j) => [j.job_id, j])), showTerminal);
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +98,13 @@ function model(jobs: Job[], showTerminal = false): DashModel {
  * the painted char frame, not node trees. */
 function frameLineOf(frame: string, needle: string): number {
   return frame.split("\n").findIndex((line) => line.includes(needle));
+}
+
+// The selection caret marks exactly one line. Return that line's text (or "")
+// so a test can assert WHICH job is selected by its title.
+const SELECT_CARET = "❯";
+function selectedLine(frame: string): string {
+  return frame.split("\n").find((line) => line.includes(SELECT_CARET)) ?? "";
 }
 
 beforeAll(() => {
@@ -164,7 +164,7 @@ test("static tree: body is a focused ScrollBox", async () => {
   expect((app.body as unknown as { focused: boolean }).focused).toBe(true);
 });
 
-test("live frame: a card carries the robot glyph, status, title, and project", async () => {
+test("live frame: a job line carries the robot icon, job name, and project", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([
@@ -178,44 +178,42 @@ test("live frame: a card carries the robot glyph, status, title, and project", a
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // The working robot glyph (md robot, f06a9) shares the status line.
+  // The working robot glyph (md robot, f06a9) leads the line.
   const robot = String.fromCodePoint(0xf06a9);
   expect(frame).toContain(robot);
-  // The title line, the project (in the border title), and the status word all
-  // render somewhere in the card box.
+  // The job name and the project both render on the one line.
   expect(frame).toContain("worker A");
   expect(frame).toContain("keeper");
-  expect(frame).toContain("working");
 });
 
-test("card chrome: cards are bordered boxes — rounded by default, heavy when focused", async () => {
+test("line chrome: jobs are plain lines — no box borders", async () => {
   const { setup, app } = await bootApp();
-  // Two cards: the first seeds focus (heavy ┏), the second stays rounded (╭).
   app.render(
     model([
       makeJob({
         job_id: "s1",
         state: "working",
-        title: "boxed-a",
+        title: "plain-a",
         created_at: 1,
       }),
       makeJob({
         job_id: "s2",
         state: "working",
-        title: "boxed-b",
+        title: "plain-b",
         created_at: 2,
       }),
     ]),
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // The focused card paints a heavy border; the unfocused one a rounded border.
-  expect(frame).toContain("┏");
-  expect(frame).toContain("╭");
-  expect(frame).toContain("╰");
+  // No rounded or heavy box borders anywhere — jobs are bare lines.
+  expect(frame).not.toContain("╭");
+  expect(frame).not.toContain("┏");
+  // The first line seeds the selection caret; exactly one line carries it.
+  expect(selectedLine(frame)).toContain("plain-a");
 });
 
-test("bands: a session-band rule precedes its cards, in priority order", async () => {
+test("bands: a session-band rule precedes its job lines, in priority order", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([
@@ -243,7 +241,7 @@ test("bands: a session-band rule precedes its cards, in priority order", async (
   expect(frameLineOf(frame, "──autopilot")).toBeGreaterThanOrEqual(0);
 });
 
-test("empty-but-live: the body renders no card boxes — no placeholder lines", async () => {
+test("empty-but-live: the body renders nothing — no placeholder lines", async () => {
   const { setup, app } = await bootApp();
   app.render(model([]));
   await setup.renderOnce();
@@ -251,8 +249,9 @@ test("empty-but-live: the body renders no card boxes — no placeholder lines", 
   expect(frame).not.toContain("no jobs");
   expect(frame).not.toContain("EPICS");
   expect(frame).not.toContain("JOBS");
-  // No card boxes paint when the board is empty.
-  expect(frame).not.toContain("╭");
+  // Nothing paints when the board is empty — no band rules, no caret.
+  expect(frame).not.toContain("──");
+  expect(frame).not.toContain(SELECT_CARET);
 });
 
 test("toggle: a terminal card is hidden by default, revealed when shown", async () => {
@@ -278,58 +277,57 @@ test("toggle keybind: `t` fires the onToggleTerminal callback", async () => {
   expect(toggleCount()).toBe(2);
 });
 
-test("focus cursor: j/k move a keyed cursor and swap the focused card border", async () => {
+test("selection cursor: j/k move a keyed caret across job lines", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([
       makeJob({
         job_id: "session-1",
         state: "working",
-        title: "first-card",
+        title: "first-line",
         created_at: 1,
       }),
       makeJob({
         job_id: "session-2",
         state: "working",
-        title: "second-card",
+        title: "second-line",
         created_at: 2,
       }),
     ]),
   );
   await setup.renderOnce();
-  // The first card seeds the focus on mount → a HEAVY border (┏ corner).
-  expect(setup.captureCharFrame()).toContain("┏");
+  // The first line seeds the selection on mount → the caret sits on it.
+  expect(selectedLine(setup.captureCharFrame())).toContain("first-line");
 
-  // j moves the cursor to the second card; it must remain a single heavy border
-  // (one focused card at a time). The frame still shows exactly one heavy box.
+  // j moves the caret to the second line (one selected line at a time).
   setup.mockInput.pressKey("j");
   await setup.renderOnce();
   const afterJ = setup.captureCharFrame();
-  expect(afterJ).toContain("┏");
-  // Both cards still render (focus move is not a structural change).
-  expect(afterJ).toContain("first-card");
-  expect(afterJ).toContain("second-card");
+  expect(selectedLine(afterJ)).toContain("second-line");
+  // Both lines still render (a selection move is not a structural change).
+  expect(afterJ).toContain("first-line");
+  expect(afterJ).toContain("second-line");
 
-  // k moves back up — still exactly one heavy-bordered card.
+  // k moves the caret back up to the first line.
   setup.mockInput.pressKey("k");
   await setup.renderOnce();
-  expect(setup.captureCharFrame()).toContain("┏");
+  expect(selectedLine(setup.captureCharFrame())).toContain("first-line");
 });
 
-test("focus cursor: arrow keys drive the same cursor as j/k", async () => {
+test("selection cursor: arrow keys drive the same caret as j/k", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([
       makeJob({
         job_id: "a",
         state: "working",
-        title: "card-a",
+        title: "line-a",
         created_at: 1,
       }),
       makeJob({
         job_id: "b",
         state: "working",
-        title: "card-b",
+        title: "line-b",
         created_at: 2,
       }),
     ]),
@@ -337,14 +335,13 @@ test("focus cursor: arrow keys drive the same cursor as j/k", async () => {
   await setup.renderOnce();
   setup.mockInput.pressArrow("down");
   await setup.renderOnce();
-  const frame = setup.captureCharFrame();
-  // The heavy focus border still paints (the down arrow reached the handler).
-  expect(frame).toContain("┏");
+  // The down arrow reached the handler → caret moved to the second line.
+  expect(selectedLine(setup.captureCharFrame())).toContain("line-b");
 });
 
-test("focus cursor: survives a re-sort (keyed on job_id, not position)", async () => {
+test("selection cursor: survives a re-sort (keyed on job_id, not position)", async () => {
   const { setup, app } = await bootApp();
-  // Two cards in the autopilot band; alpha (created 1) above beta (created 2).
+  // Two lines in the autopilot band; alpha (created 1) above beta (created 2).
   app.render(
     model([
       makeJob({
@@ -390,13 +387,13 @@ test("focus cursor: survives a re-sort (keyed on job_id, not position)", async (
   );
   await setup.renderOnce();
   const frame = setup.captureCharFrame();
-  // beta (s2) now sits in the foreground band above alpha; the heavy focus
-  // border is on the beta card. Beta's line is above alpha's.
+  // beta (s2) now sits in the foreground band above alpha; the caret followed
+  // the line (keyed on job_id), and beta's line is above alpha's.
   expect(frameLineOf(frame, "beta")).toBeLessThan(frameLineOf(frame, "alpha"));
-  expect(frame).toContain("┏");
+  expect(selectedLine(frame)).toContain("beta");
 });
 
-test("row-set diff: shrinking the card set structurally prunes its row node", async () => {
+test("row-set diff: shrinking the line set structurally prunes its row node", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([
@@ -414,7 +411,7 @@ test("row-set diff: shrinking the card set structurally prunes its row node", as
   expect(before).toContain("alpha-job");
   expect(before).toContain("beta-job");
 
-  // Drop session-2 → its card node must be removed, not stale-retained.
+  // Drop session-2 → its line node must be removed, not stale-retained.
   app.render(
     model([
       makeJob({ job_id: "session-1", state: "working", title: "alpha-job" }),
@@ -426,7 +423,7 @@ test("row-set diff: shrinking the card set structurally prunes its row node", as
   expect(after).not.toContain("beta-job");
 });
 
-test("row order: cards paint in stable created_at order within a band", async () => {
+test("row order: lines paint in stable created_at order within a band", async () => {
   const { setup, app } = await bootApp();
   app.render(
     model([

@@ -4,38 +4,35 @@
  *
  * - {@link attachDashApp} — the PAINT layer. Builds the stable renderable tree
  *   ONCE (root column = a single flexGrow:1 `ScrollBox` body) and exposes
- *   `render(model)`, which paints the card model as a single column of
- *   robot-faced CARDS. Each band contributes a
- *   dim full-width rule (titled inline, structure-gray) followed by its cards;
- *   an empty band collapses (no rule). Each card is one `BoxRenderable` per
- *   `job:<id>` — rounded structure-gray border, project name in the border
- *   title, three interior `Text` lines (`<rail><robot> <status> · <role> ·
- *   ◉<count>` / `<title>` / `<age> · <session:pane>`). The left RAIL glyph
- *   carries the status color (the only color channel; the border is always
- *   structure-gray). A `j`/`k`/arrows focus cursor keyed on `job_id` swaps the
- *   focused card to a HEAVY cyan border and `scrollChildIntoView`s it; `t`
- *   toggles ended/killed visibility through the caller. Nodes are MUTATED in
- *   place across frames (`borderColor`/`borderStyle`/child Text content);
- *   structural detach-then-append fires ONLY when the keyed band order changes,
- *   so Yoga recalc rides structure, not content. The runtime OpenTUI ctors are
- *   THREADED IN so this module carries only a type-only `@opentui/core` import —
- *   the same inertness contract `src/live-shell.ts`'s `attachLiveShellPaint`
- *   keeps, so an unrelated test importing the pure view-model never trips
- *   OpenTUI's racy native loader. Exported so `test/dash-app.test.ts` mounts the
- *   same scene against `createTestRenderer` without forking the
- *   renderer-construction code.
+ *   `render(model)`, which paints the model as a flat list of one-line jobs
+ *   grouped under session rules. Each band contributes a dim full-width rule
+ *   (titled inline with the tmux session name, structure-gray) followed by its
+ *   job lines; an empty band collapses (no rule). Each job is ONE `Text` line per
+ *   `job:<id>` — `<caret><icon> <title> · <project>` — where the leading robot
+ *   icon carries the status color (face + hue dual-encode status). The `j`/`k`/
+ *   arrow SELECTION cursor (keyed on `job_id`, surviving a re-sort) marks the
+ *   current line with a cyan caret + bold text + a subtle background wash and
+ *   `scrollChildIntoView`s it; there is no border and no card. Nodes are MUTATED
+ *   in place across frames (Text content); structural detach-then-append fires
+ *   ONLY when the keyed line order changes, so Yoga recalc rides structure, not
+ *   content. The runtime OpenTUI ctors are THREADED IN so this module carries
+ *   only a type-only `@opentui/core` import — the same inertness contract
+ *   `src/live-shell.ts`'s `attachLiveShellPaint` keeps, so an unrelated test
+ *   importing the pure view-model never trips OpenTUI's racy native loader.
+ *   Exported so `test/dash-app.test.ts` mounts the same scene against
+ *   `createTestRenderer` without forking the renderer-construction code.
  *
  * - {@link createDashApp} — the PROCESS shell. Dynamic-imports OpenTUI, builds
  *   the renderer with the proven viewer config (exitOnCtrlC:false, exitSignals
  *   SIGTERM/SIGHUP/SIGQUIT, alternate-screen), attaches the paint layer, wires
  *   the live jobs subscription (`subscribeReadiness`, live-only default scope
  *   capped at a bounded first page so the snapshot stays under the NDJSON line
- *   cap; the `t` toggle is deferred/inert), the 30s staleness repaint interval, the key
- *   handler, the forked exit triggers, an onFatal override, and
- *   uncaughtException/unhandledRejection handlers — every path routes through
- *   ONE idempotent `exitCleanly` so `renderer.destroy()` ALWAYS precedes
- *   `process.exit` (OpenTUI does NOT auto-restore the terminal on exit/uncaught).
- *   Reactive mode — never `renderer.start()`.
+ *   cap; the `t` toggle is deferred/inert), the key handler, the forked exit
+ *   triggers, an onFatal override, and uncaughtException/unhandledRejection
+ *   handlers — every path routes through ONE idempotent `exitCleanly` so
+ *   `renderer.destroy()` ALWAYS precedes `process.exit` (OpenTUI does NOT
+ *   auto-restore the terminal on exit/uncaught). Reactive mode — never
+ *   `renderer.start()`.
  *
  * Read-only end to end: no RPC frame is ever written, no DB is opened.
  */
@@ -56,14 +53,10 @@ import {
 import { armViewerExitTriggers } from "./exit-triggers";
 import {
   type ColorDescriptor,
-  colorForRail,
+  colorForIcon,
   STRUCTURE_COLOR_INDEX,
 } from "./theme";
 import { buildDashModel, type CardVM, type DashModel } from "./view-model";
-
-// One coarse repaint interval for the wall-clock-aged card fields (age label)
-// — 30s (epic-settled). These age off `nowSec`, not data edges.
-const STALE_REFRESH_MS = 30_000;
 
 // Bounded first page for the jobs subscription. The feed serializes the
 // snapshot onto one NDJSON line, so an unbounded fetch over a large job history
@@ -72,26 +65,17 @@ const STALE_REFRESH_MS = 30_000;
 // the line cap.
 const DASH_JOBS_PAGE = 50;
 
-// Card chrome: rounded structure-gray border by default; HEAVY cyan when the
-// focus cursor lands on it. The cyan is the dash accent (bright cyan, index 14
-// — mirrors `theme.ts` ROLE_COLORS.accent and board-render's `96` SGR).
-const FOCUS_COLOR_INDEX = 14;
-
-// The left RAIL glyphs — the lone status color channel. Solid bar for the
-// attention rungs (error/awaiting/working), thin bar for the receded idle
-// rungs, so the rail's WEIGHT reinforces the dim/bright lightness split.
-const RAIL_SOLID = "▌";
-const RAIL_THIN = "▏";
-
-// The running-subagent count marker (a small filled lozenge). Dropped when the
-// card has zero running sub-agents.
-const SUBAGENT_MARKER = "◉";
-
-// A card is a bordered box (2 rows of border) over 3 interior content lines.
-const CARD_HEIGHT = 5;
-// Cap the column width so cards stay readable on a wide terminal — full-width
-// up to this, then centered slack.
-const CARD_MAX_WIDTH = 80;
+// Selection chrome — no border, no outline. The selected line gets a cyan caret
+// (bright cyan, index 14 — the dash accent, mirroring `theme.ts` ROLE_COLORS
+// .accent and board-render's `96` SGR), bold text, and a subtle gray background
+// wash (index 8, the structure gray) so it reads as the current line without
+// any box.
+const ACCENT_COLOR_INDEX = 14;
+const SELECT_BG_INDEX = 8;
+// The selection caret occupies the leading gutter on the current line; an
+// unselected line pads the same two columns with spaces so nothing shifts.
+const SELECT_CARET = "❯ ";
+const NO_CARET = "  ";
 
 /**
  * Runtime exports from `@opentui/core` that {@link attachDashApp} needs to
@@ -120,8 +104,8 @@ export interface DashAppOptions {
 }
 
 /** The paint handle. `render(model)` diffs a fresh view-model into the stable
- * tree; `destroy()` tears the renderer down. Exposed pieces let the frame test
- * read content without re-deriving the tree. */
+ * tree; `destroy()` tears the renderer down. The `body` ScrollBox is exposed so
+ * the frame test can assert mount/focus state. */
 export interface DashApp {
   readonly renderer: CliRenderer;
   readonly body: ScrollBoxRenderableType;
@@ -132,29 +116,28 @@ export interface DashApp {
 /** One TextChunk in the OpenTUI wire shape (`text-buffer.ts` `TextChunk`). The
  * `fg` is resolved from the role's ANSI index — ABSENT when the role carries
  * no index (default terminal foreground); `dim` / `bold` descriptors layer the
- * matching text attributes. */
+ * matching text attributes; `bg` is the selection wash (absent off-selection). */
 interface BuiltChunk {
   __isChunk: true;
   text: string;
   fg?: RGBAType;
+  bg?: RGBAType;
   attributes?: number;
 }
 
 /** A flattened paint row: a `band` is the dim session-band rule (titled inline);
- * a `card` is one job's bordered card. The view-model's per-frame order drives
- * the structural diff. */
+ * a `line` is one job's single text line. The view-model's per-frame order
+ * drives the structural diff. */
 type PaintRow =
   | { readonly kind: "band"; readonly key: string; readonly title: string }
-  | { readonly kind: "card"; readonly key: string; readonly card: CardVM };
+  | { readonly kind: "line"; readonly key: string; readonly card: CardVM };
 
-/** One mounted card: the bordered box plus its three interior Text lines, all
- * mutated in place across frames. */
-interface CardHandle {
-  readonly kind: "card";
-  readonly node: BoxRenderableType;
-  readonly line1: TextRenderableType;
-  readonly line2: TextRenderableType;
-  readonly line3: TextRenderableType;
+/** One mounted job line: the Text node plus the card it last painted (so a
+ * selection move can repaint the line without a full model re-render). */
+interface LineHandle {
+  kind: "line";
+  readonly node: TextRenderableType;
+  card: CardVM;
 }
 
 /** One mounted band rule (no interior text — the title rides the box border). */
@@ -163,14 +146,14 @@ interface BandHandle {
   readonly node: BoxRenderableType;
 }
 
-type RowHandle = CardHandle | BandHandle;
+type RowHandle = LineHandle | BandHandle;
 
 /**
  * Build the renderable scene + the row-diffing `render`. Column layout: a single
- * flexGrow:1 ScrollBox body filling the screen. The body holds the
- * view-model's bands as dim rule rows + one bordered card per job, each a stable
- * handle in `rowNodes` so a re-render mutates content/border in place;
- * structural detach-then-append fires only when the keyed ORDER changes.
+ * flexGrow:1 ScrollBox body filling the screen. The body holds the view-model's
+ * bands as dim rule rows + one Text line per job, each a stable handle in
+ * `rowNodes` so a re-render mutates content in place; structural
+ * detach-then-append fires only when the keyed ORDER changes.
  *
  * Production: called from {@link createDashApp}'s async renderer setup.
  * Tests: called against a `createTestRenderer` result.
@@ -183,11 +166,16 @@ export function attachDashApp(
   let destroyed = false;
   const { RGBA, TextAttributes } = runtime;
   const structureColor = RGBA.fromIndex(STRUCTURE_COLOR_INDEX);
-  const focusColor = RGBA.fromIndex(FOCUS_COLOR_INDEX);
+  const selectBg = RGBA.fromIndex(SELECT_BG_INDEX);
 
   // Resolve a color descriptor to its renderable fg (absent index → default
-  // foreground) plus the descriptor's DIM/BOLD attributes.
-  function chunkFor(text: string, desc: ColorDescriptor): BuiltChunk {
+  // foreground) plus the descriptor's DIM/BOLD attributes; `bg` (when given)
+  // is the selection wash applied uniformly across the line.
+  function chunkFor(
+    text: string,
+    desc: ColorDescriptor,
+    bg?: RGBAType,
+  ): BuiltChunk {
     const chunk: BuiltChunk = { __isChunk: true, text };
     if (desc.index !== undefined) {
       chunk.fg = RGBA.fromIndex(desc.index);
@@ -198,10 +186,13 @@ export function attachDashApp(
     if (attributes !== 0) {
       chunk.attributes = attributes;
     }
+    if (bg !== undefined) {
+      chunk.bg = bg;
+    }
     return chunk;
   }
 
-  // Root: a full-screen column holding just the scrolling card body.
+  // Root: a full-screen column holding just the scrolling list body.
   const root = new runtime.BoxRenderable(renderer, {
     id: "dash-root",
     width: "100%",
@@ -229,52 +220,31 @@ export function attachDashApp(
   // but the ScrollBox owns native wheel/page scroll.
   body.focus();
 
-  // Stable per-row handle map, keyed by the view-model's row keys. Content +
-  // border mutate in place; membership/order changes restructure (see `render`).
+  // Stable per-row handle map, keyed by the view-model's row keys. Content
+  // mutates in place; membership/order changes restructure (see `render`).
   const rowNodes = new Map<string, RowHandle>();
   // The previous frame's ordered key list — reorder detection.
   let lastOrder = "";
-  // The ordered list of CARD keys (band rules excluded) in the last paint — the
-  // j/k cursor walks this, so the focus survives a re-sort (it's keyed on the
-  // job_id, not a positional index).
-  let cardOrder: string[] = [];
-  // The focused card key (job:<id>), or null when nothing is focused. Survives
-  // re-sort because it's the key, not an index; cleared only when the card
+  // The ordered list of LINE keys (band rules excluded) in the last paint — the
+  // j/k cursor walks this, so the selection survives a re-sort (it's keyed on
+  // the job_id, not a positional index).
+  let lineOrder: string[] = [];
+  // The selected line key (job:<id>), or null when nothing is selected. Survives
+  // re-sort because it's the key, not an index; cleared only when the line
   // leaves the rendered set.
-  let focusedKey: string | null = null;
+  let selectedKey: string | null = null;
 
-  function buildCardHandle(key: string): CardHandle {
-    const node = new runtime.BoxRenderable(renderer, {
-      id: `dash-row-${key}`,
-      width: "100%",
-      maxWidth: CARD_MAX_WIDTH,
-      height: CARD_HEIGHT,
-      flexDirection: "column",
-      borderStyle: "rounded",
-      border: true,
-      borderColor: structureColor,
-      paddingLeft: 1,
-      paddingRight: 1,
-    });
-    const line1 = new runtime.TextRenderable(renderer, {
-      id: `dash-row-${key}-1`,
-      height: 1,
-      content: "",
-    });
-    const line2 = new runtime.TextRenderable(renderer, {
-      id: `dash-row-${key}-2`,
-      height: 1,
-      content: "",
-    });
-    const line3 = new runtime.TextRenderable(renderer, {
-      id: `dash-row-${key}-3`,
-      height: 1,
-      content: "",
-    });
-    node.add(line1);
-    node.add(line2);
-    node.add(line3);
-    return { kind: "card", node, line1, line2, line3 };
+  function buildLineHandle(key: string, card: CardVM): LineHandle {
+    return {
+      kind: "line",
+      node: new runtime.TextRenderable(renderer, {
+        id: `dash-row-${key}`,
+        width: "100%",
+        height: 1,
+        content: "",
+      }),
+      card,
+    };
   }
 
   function buildBandHandle(key: string): BandHandle {
@@ -291,7 +261,7 @@ export function attachDashApp(
   }
 
   // Flatten the band model into the paint-row stream: a band-title rule per
-  // NON-EMPTY band (an empty band collapses), then its cards.
+  // NON-EMPTY band (an empty band collapses), then its job lines.
   function flatten(model: DashModel): PaintRow[] {
     const rows: PaintRow[] = [];
     for (const b of model.bands) {
@@ -300,56 +270,38 @@ export function attachDashApp(
       }
       rows.push({ kind: "band", key: `band:${b.key}`, title: b.title });
       for (const card of b.cards) {
-        rows.push({ kind: "card", key: card.key, card });
+        rows.push({ kind: "line", key: card.key, card });
       }
     }
     return rows;
   }
 
-  // Card line 1: the rail + robot glyph (both status-colored), a space slot,
-  // then the dim status word · role · running-subagent count. The robot glyph
-  // sits in the same status-colored run as the rail; the metadata recedes (dim).
-  function cardLine1(card: CardVM): StyledTextType {
-    const rail = colorForRail(card.railRole);
-    const railGlyph = rail.dim === true ? RAIL_THIN : RAIL_SOLID;
+  // The job line: `<caret><icon> <title> · <project>`. The robot icon carries
+  // the status color; the selected line gets the cyan caret, bold title/project,
+  // and a uniform background wash. An unselected line pads the caret gutter so
+  // columns never shift.
+  function buildLineStyled(card: CardVM, selected: boolean): StyledTextType {
+    const bg = selected ? selectBg : undefined;
+    const icon = colorForIcon(card.iconRole);
+    const emphasis: ColorDescriptor = selected ? { bold: true } : {};
     const chunks: BuiltChunk[] = [
-      chunkFor(`${railGlyph}${card.robotGlyph} `, rail),
+      selected
+        ? chunkFor(SELECT_CARET, { index: ACCENT_COLOR_INDEX, bold: true }, bg)
+        : chunkFor(NO_CARET, {}, bg),
+      chunkFor(`${card.robotGlyph}  `, icon, bg),
+      chunkFor(card.title, emphasis, bg),
+      chunkFor(" · ", { dim: true }, bg),
+      chunkFor(card.project, emphasis, bg),
     ];
-    const meta: string[] = [card.statusWord];
-    if (card.roleLabel !== "") {
-      meta.push(card.roleLabel);
-    }
-    if (card.subagentCount > 0) {
-      meta.push(`${SUBAGENT_MARKER}${card.subagentCount}`);
-    }
-    chunks.push(chunkFor(meta.join(" · "), { dim: true }));
     return new runtime.StyledText(chunks);
   }
 
-  // Card line 2: the job title in the terminal default foreground (the one line
-  // that must stay legible at full intensity).
-  function cardLine2(card: CardVM): StyledTextType {
-    return new runtime.StyledText([chunkFor(card.title, {})]);
-  }
-
-  // Card line 3: the dim age · session coordinate footer.
-  function cardLine3(card: CardVM): StyledTextType {
-    const parts = [card.ageLabel];
-    if (card.sessionLabel !== "") {
-      parts.push(card.sessionLabel);
-    }
-    return new runtime.StyledText([chunkFor(parts.join(" · "), { dim: true })]);
-  }
-
-  // Paint a card's focus chrome: HEAVY cyan border when focused, rounded
-  // structure-gray otherwise. Idempotent — safe to call every frame.
-  function applyFocusChrome(handle: CardHandle, focused: boolean): void {
-    if (focused) {
-      handle.node.borderStyle = "heavy";
-      handle.node.borderColor = focusColor;
-    } else {
-      handle.node.borderStyle = "rounded";
-      handle.node.borderColor = structureColor;
+  // Repaint one job line's content from its last card + the current selection.
+  // Idempotent — safe to call every frame and on every selection move.
+  function paintLine(key: string): void {
+    const handle = rowNodes.get(key);
+    if (handle?.kind === "line") {
+      handle.node.content = buildLineStyled(handle.card, key === selectedKey);
     }
   }
 
@@ -359,17 +311,17 @@ export function attachDashApp(
     }
     const paintRows = flatten(model);
 
-    // Ensure every wanted row exists with current content. New nodes mount
-    // detached; the order pass below attaches them in position.
+    // Ensure every wanted row exists and carries current content. New nodes
+    // mount detached; the order pass below attaches them in position.
     const wantKeys: string[] = [];
-    const nextCardOrder: string[] = [];
+    const nextLineOrder: string[] = [];
     for (const row of paintRows) {
       wantKeys.push(row.key);
       let handle = rowNodes.get(row.key);
       if (handle === undefined) {
         handle =
-          row.kind === "card"
-            ? buildCardHandle(row.key)
+          row.kind === "line"
+            ? buildLineHandle(row.key, row.card)
             : buildBandHandle(row.key);
         rowNodes.set(row.key, handle);
       }
@@ -377,26 +329,22 @@ export function attachDashApp(
       if (row.kind === "band" && handle.kind === "band") {
         handle.node.title = row.title;
       }
-      if (row.kind === "card" && handle.kind === "card") {
-        nextCardOrder.push(row.key);
-        // The project name rides the border title (inherits border color —
-        // OpenTUI 0.3.0 has no titleColor, so status color lives only in the
-        // rail, never the border/title).
-        handle.node.title = row.card.project;
-        handle.line1.content = cardLine1(row.card);
-        handle.line2.content = cardLine2(row.card);
-        handle.line3.content = cardLine3(row.card);
+      // Stash the latest card; the selection-aware content paint happens after
+      // the structural pass, once selectedKey is settled.
+      if (row.kind === "line" && handle.kind === "line") {
+        nextLineOrder.push(row.key);
+        handle.card = row.card;
       }
     }
-    cardOrder = nextCardOrder;
+    lineOrder = nextLineOrder;
 
-    // The focus cursor: clear it if the focused card left the set; seed it onto
-    // the first card when nothing is focused but cards exist.
-    if (focusedKey !== null && !cardOrder.includes(focusedKey)) {
-      focusedKey = null;
+    // The selection cursor: clear it if the selected line left the set; seed it
+    // onto the first line when nothing is selected but lines exist.
+    if (selectedKey !== null && !lineOrder.includes(selectedKey)) {
+      selectedKey = null;
     }
-    if (focusedKey === null && cardOrder.length > 0) {
-      focusedKey = cardOrder[0] ?? null;
+    if (selectedKey === null && lineOrder.length > 0) {
+      selectedKey = lineOrder[0] ?? null;
     }
 
     // Structural prune: drop any node whose key is no longer wanted.
@@ -430,46 +378,42 @@ export function attachDashApp(
       lastOrder = orderSig;
     }
 
-    // Apply focus chrome to every card AFTER the structural pass (a re-attached
-    // node keeps its ctor-default border until repainted).
-    for (const key of cardOrder) {
-      const handle = rowNodes.get(key);
-      if (handle?.kind === "card") {
-        applyFocusChrome(handle, key === focusedKey);
-      }
+    // Paint every line's content AFTER the structural pass, so the selection
+    // marker lands on the settled selectedKey.
+    for (const key of lineOrder) {
+      paintLine(key);
     }
 
     renderer.requestRender();
   }
 
-  // Move the focus cursor by `delta` steps through the rendered card order
-  // (keyed on job_id, so it survives a re-sort), keep the focused card in view,
-  // and repaint the border swap.
-  function moveFocus(delta: number): void {
-    if (cardOrder.length === 0) {
+  // Move the selection cursor by `delta` steps through the rendered line order
+  // (keyed on job_id, so it survives a re-sort), keep the selected line in view,
+  // and repaint the marker swap.
+  function moveSelection(delta: number): void {
+    if (lineOrder.length === 0) {
       return;
     }
-    const cur = focusedKey === null ? -1 : cardOrder.indexOf(focusedKey);
-    // From "nothing focused", j lands on the first card, k on the last.
+    const cur = selectedKey === null ? -1 : lineOrder.indexOf(selectedKey);
+    // From "nothing selected", j lands on the first line, k on the last.
     let next: number;
     if (cur === -1) {
-      next = delta > 0 ? 0 : cardOrder.length - 1;
+      next = delta > 0 ? 0 : lineOrder.length - 1;
     } else {
-      next = Math.min(Math.max(cur + delta, 0), cardOrder.length - 1);
+      next = Math.min(Math.max(cur + delta, 0), lineOrder.length - 1);
     }
-    const nextKey = cardOrder[next] ?? null;
-    if (nextKey === focusedKey) {
+    const nextKey = lineOrder[next] ?? null;
+    if (nextKey === selectedKey) {
       return;
     }
-    focusedKey = nextKey;
-    for (const key of cardOrder) {
-      const handle = rowNodes.get(key);
-      if (handle?.kind === "card") {
-        applyFocusChrome(handle, key === focusedKey);
-      }
+    const prevKey = selectedKey;
+    selectedKey = nextKey;
+    if (prevKey !== null) {
+      paintLine(prevKey);
     }
-    if (focusedKey !== null) {
-      const handle = rowNodes.get(focusedKey);
+    if (selectedKey !== null) {
+      paintLine(selectedKey);
+      const handle = rowNodes.get(selectedKey);
       if (handle !== undefined) {
         // Nearest-edge scroll; a no-op if already visible (no key-repeat jitter).
         body.scrollChildIntoView(handle.node.id);
@@ -490,7 +434,7 @@ export function attachDashApp(
     }
   }
 
-  // Key handler: q/Ctrl-C → caller teardown; j/down + k/up → move the focus
+  // Key handler: q/Ctrl-C → caller teardown; j/down + k/up → move the selection
   // cursor; t → caller's terminal-visibility toggle.
   renderer.keyInput.on("keypress", (key) => {
     if (destroyed) {
@@ -501,11 +445,11 @@ export function attachDashApp(
       return;
     }
     if (key.name === "j" || key.name === "down") {
-      moveFocus(1);
+      moveSelection(1);
       return;
     }
     if (key.name === "k" || key.name === "up") {
-      moveFocus(-1);
+      moveSelection(-1);
       return;
     }
     if (key.name === "t") {
@@ -526,7 +470,7 @@ export function attachDashApp(
 // ---------------------------------------------------------------------------
 
 /** The mutable current-inputs struct the subscription feeds; each edge rebuilds
- * the card model off the latest snapshot. `showTerminal` rides the ended/killed
+ * the model off the latest snapshot. `showTerminal` rides the ended/killed
  * visibility toggle the `t` keybind flips. */
 interface CurrentInputs {
   snapshot: ReadinessClientSnapshot | null;
@@ -643,24 +587,17 @@ export async function createDashApp(
 
   function paint(): void {
     const snap = inputs.snapshot;
-    app.render(
-      buildDashModel(
-        snap?.jobs ?? new Map(),
-        snap?.subagentInvocations ?? [],
-        inputs.showTerminal,
-        Math.floor(Date.now() / 1000),
-      ),
-    );
+    app.render(buildDashModel(snap?.jobs ?? new Map(), inputs.showTerminal));
   }
 
-  // First paint — the empty census before any data lands.
+  // First paint — the empty list before any data lands.
   paint();
 
-  // The readiness subscription feeds the card model off the live jobs
-  // projection, on the descriptor's default live-only scope (`state not_in
-  // [ended, killed]`), capped at a bounded first page so the snapshot stays
-  // under the 1 MiB NDJSON line cap. The `t` toggle / `showTerminal` is inert
-  // against this live-only feed — a future bounded terminal page re-enables it.
+  // The readiness subscription feeds the model off the live jobs projection, on
+  // the descriptor's default live-only scope (`state not_in [ended, killed]`),
+  // capped at a bounded first page so the snapshot stays under the 1 MiB NDJSON
+  // line cap. The `t` toggle / `showTerminal` is inert against this live-only
+  // feed — a future bounded terminal page re-enables it.
   const readinessHandle = subscribeReadiness({
     sockPath,
     idPrefix: "dash",
@@ -671,7 +608,7 @@ export async function createDashApp(
       paint();
     },
     onLifecycle: (event) => {
-      // A snapshot is retained across a drop so the last-good board freezes
+      // A snapshot is retained across a drop so the last-good list freezes
       // until the conn comes back.
       if (event === "disconnected" || event === "connecting") {
         paint();
@@ -683,26 +620,15 @@ export async function createDashApp(
     onFatal: () => exitCleanly(),
   });
 
-  // One coarse interval refreshes the wall-clock-aged glyphs — the card age
-  // labels age off `nowSec`, not data edges, so no subscription repaints them.
-  // unref'd so it never pins the loop alive on its own.
-  const staleTimer = setInterval(paint, STALE_REFRESH_MS);
-  (staleTimer as { unref?: () => void }).unref?.();
-
   // Single idempotent teardown. destroy() ALWAYS precedes exit so the terminal
   // is restored (OpenTUI does not auto-restore on exit/uncaught). Disposes the
-  // sub, clears the interval, disarms the triggers, destroys the renderer.
+  // sub, disarms the triggers, destroys the renderer.
   let exited = false;
   function exitCleanly(): void {
     if (exited) {
       return;
     }
     exited = true;
-    try {
-      clearInterval(staleTimer);
-    } catch {
-      // best-effort
-    }
     try {
       readinessHandle.dispose();
     } catch {
@@ -736,11 +662,6 @@ export async function createDashApp(
     // restore-then-exit here with the failure code.
     if (!exited) {
       exited = true;
-      try {
-        clearInterval(staleTimer);
-      } catch {
-        // best-effort
-      }
       try {
         readinessHandle.dispose();
       } catch {

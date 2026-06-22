@@ -96,22 +96,21 @@ export function colorForRole(role: Role): ColorDescriptor {
 }
 
 // ---------------------------------------------------------------------------
-// Rail roles — the robot-card status channel
+// Icon roles — the robot-line status channel
 // ---------------------------------------------------------------------------
 
 /**
- * The six rail roles of the robot job-card status ladder (`view-model.ts`
- * `robotRung`). One per rung; each names the colored LEFT RAIL the card paints
- * to dual-encode status alongside the robot face. Distinct from {@link Role}
- * (which tags the text segments of the legacy board view) because the ladder
- * needs DIM variants of the success/failed/gray hues — `idle-ended` rides green
- * dim, `idle-killed` red dim, `idle-stopped` gray dim — that the text-role map
- * does not carry. The dash materializer (`./app.ts`) feeds the index to
- * `RGBA.fromIndex`, picks the rail glyph weight off `dim` (thin bar for the
- * receded idle rungs, solid for the attention rungs), and layers `dim` as a
- * paint attribute.
+ * The six icon roles of the robot job-line status ladder (`view-model.ts`
+ * `robotRung`). One per rung; each names the COLOR the leading status icon
+ * paints to dual-encode status alongside the robot face. Distinct from
+ * {@link Role} (which tags the text segments of the board view) because the
+ * ladder needs DIM variants of the success/failed/gray hues — `idle-ended`
+ * rides green dim, `idle-killed` red dim, `idle-stopped` gray dim — that the
+ * text-role map does not carry. The dash materializer (`./app.ts`) feeds the
+ * index to `RGBA.fromIndex` and layers `dim` as a paint attribute, so the
+ * receded idle rungs recede while the attention rungs stay full-intensity.
  */
-export type RailRole =
+export type IconRole =
   | "error"
   | "awaiting"
   | "working"
@@ -120,14 +119,14 @@ export type RailRole =
   | "idle-killed";
 
 /**
- * The rail-role → descriptor map. Indices stay on the standard-16 ANSI palette
+ * The icon-role → descriptor map. Indices stay on the standard-16 ANSI palette
  * (so the hue tracks the terminal theme) and the three idle/terminal rungs
- * carry `dim` so completed/stopped/killed cards recede while the attention
+ * carry `dim` so completed/stopped/killed lines recede while the attention
  * rungs (error red, awaiting yellow, working blue) stay full-intensity. The
  * indices 1 / 3 / 12 differ in lightness so status survives grayscale and
  * color-deficiency (WCAG SC 1.4.1).
  */
-export const RAIL_COLORS: Record<RailRole, ColorDescriptor> = {
+export const ICON_COLORS: Record<IconRole, ColorDescriptor> = {
   error: { index: 1 },
   awaiting: { index: 3 },
   working: { index: 12 },
@@ -136,7 +135,7 @@ export const RAIL_COLORS: Record<RailRole, ColorDescriptor> = {
   "idle-killed": { index: 1, dim: true },
 };
 
-/** Resolve a rail role to its ANSI-indexed descriptor. Pure. */
-export function colorForRail(role: RailRole): ColorDescriptor {
-  return RAIL_COLORS[role];
+/** Resolve an icon role to its ANSI-indexed descriptor. Pure. */
+export function colorForIcon(role: IconRole): ColorDescriptor {
+  return ICON_COLORS[role];
 }

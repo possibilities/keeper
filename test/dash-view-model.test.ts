@@ -2,23 +2,22 @@
  * Pure view-model tests for `src/dash/view-model.ts` and `src/dash/theme.ts`.
  * Table-driven over hand-built jobs — no subprocess, no `sandboxEnv`, no
  * `@opentui` import anywhere (the property that keeps this file on the fast
- * tier). Asserts the SETTLED robot-card semantics: the six-rung status ladder
- * (each rung → its dash-local robot codepoint + rail role; annotations outrank
+ * tier). Asserts the SETTLED robot-line semantics: the six-rung status ladder
+ * (each rung → its dash-local robot codepoint + icon role; annotations outrank
  * base state), band assignment by tmux session (priority order + detached
- * fallback), stable intra-band
- * `created_at` sort, the `showTerminal` toggle gating,
- * per-field projection (project basename, never-blank label, role label,
- * running-subagent count, age, session coords), ESC sanitization, and the
- * never-throw fold on a malformed `state`. Also asserts the shared `fa-classic`
- * board/jobs glyph map is UNCHANGED (the dash robot map is dash-local).
+ * fallback), stable intra-band `created_at` sort, the `showTerminal` toggle
+ * gating, per-field projection (project basename, never-blank label), ESC
+ * sanitization, and the never-throw fold on a malformed `state`. Also asserts
+ * the shared `fa-classic` board/jobs glyph map is UNCHANGED (the dash robot map
+ * is dash-local).
  */
 
 import { expect, test } from "bun:test";
 import {
-  colorForRail,
+  colorForIcon,
   colorForRole,
-  RAIL_COLORS,
-  type RailRole,
+  ICON_COLORS,
+  type IconRole,
   ROLE_COLORS,
 } from "../src/dash/theme";
 import {
@@ -32,7 +31,7 @@ import {
   robotRung,
 } from "../src/dash/view-model";
 import { FA_CLASSIC, glyphForToken } from "../src/icon-theme";
-import type { Job, SubagentInvocation } from "../src/types";
+import type { Job } from "../src/types";
 
 // ---------------------------------------------------------------------------
 // Fixture builders
@@ -73,50 +72,16 @@ function makeJob(overrides: Partial<Job> = {}): Job {
   };
 }
 
-function makeSub(
-  overrides: Partial<SubagentInvocation> = {},
-): SubagentInvocation {
-  return {
-    job_id: "session-1",
-    agent_id: "a1",
-    turn_seq: 0,
-    ts: 0,
-    tool_use_id: null,
-    subagent_type: null,
-    description: null,
-    prompt_chars: 0,
-    status: "running",
-    duration_ms: null,
-    last_event_id: 0,
-    updated_at: 0,
-    ...overrides,
-  };
-}
-
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-const NOW = 1000;
 
 function jobsMap(jobs: Job[]): Map<string, Job> {
   return new Map(jobs.map((j) => [j.job_id, j]));
 }
 
-function build(
-  jobs: Job[],
-  opts: {
-    subagents?: SubagentInvocation[];
-    showTerminal?: boolean;
-    nowSec?: number;
-  } = {},
-): DashModel {
-  return buildDashModel(
-    jobsMap(jobs),
-    opts.subagents ?? [],
-    opts.showTerminal ?? false,
-    opts.nowSec ?? NOW,
-  );
+function build(jobs: Job[], opts: { showTerminal?: boolean } = {}): DashModel {
+  return buildDashModel(jobsMap(jobs), opts.showTerminal ?? false);
 }
 
 function band(model: DashModel, key: BandKey): Band {
@@ -147,10 +112,10 @@ const ROBOT: Record<RobotRung, string> = {
 };
 
 // ---------------------------------------------------------------------------
-// theme.ts — rail roles
+// theme.ts — icon roles
 // ---------------------------------------------------------------------------
 
-test("theme: rail roles map to plain descriptors (index/dim only, no RGBA)", () => {
+test("theme: icon roles map to plain descriptors (index/dim only, no RGBA)", () => {
   const roles = [
     "error",
     "awaiting",
@@ -160,7 +125,7 @@ test("theme: rail roles map to plain descriptors (index/dim only, no RGBA)", () 
     "idle-killed",
   ] as const;
   for (const role of roles) {
-    const d = colorForRail(role);
+    const d = colorForIcon(role);
     for (const k of Object.keys(d)) {
       expect(["index", "dim", "bold"]).toContain(k);
     }
@@ -168,17 +133,17 @@ test("theme: rail roles map to plain descriptors (index/dim only, no RGBA)", () 
   }
   // The three idle/terminal rungs carry dim; the attention rungs do not. The
   // lightness-distinct attention indices (1/3/12) survive grayscale.
-  expect(RAIL_COLORS.error.index).toBe(1);
-  expect(RAIL_COLORS.awaiting.index).toBe(3);
-  expect(RAIL_COLORS.working.index).toBe(12);
-  expect(RAIL_COLORS["idle-ended"]).toEqual({ index: 2, dim: true });
-  expect(RAIL_COLORS["idle-stopped"]).toEqual({ index: 7, dim: true });
-  expect(RAIL_COLORS["idle-killed"]).toEqual({ index: 1, dim: true });
-  expect(RAIL_COLORS.working.dim).toBeUndefined();
+  expect(ICON_COLORS.error.index).toBe(1);
+  expect(ICON_COLORS.awaiting.index).toBe(3);
+  expect(ICON_COLORS.working.index).toBe(12);
+  expect(ICON_COLORS["idle-ended"]).toEqual({ index: 2, dim: true });
+  expect(ICON_COLORS["idle-stopped"]).toEqual({ index: 7, dim: true });
+  expect(ICON_COLORS["idle-killed"]).toEqual({ index: 1, dim: true });
+  expect(ICON_COLORS.working.dim).toBeUndefined();
 });
 
 test("theme: the legacy text ROLE_COLORS map is untouched", () => {
-  // The dash card view forks a NEW rail map; the board/jobs text roles stay.
+  // The dash view forks a NEW icon map; the board/jobs text roles stay.
   expect(colorForRole("motion")).toEqual({ index: 12 });
   expect(ROLE_COLORS.terminal).toEqual({ index: 7, dim: true });
   expect(ROLE_COLORS.heading).toEqual({ bold: true });
@@ -188,20 +153,19 @@ test("theme: the legacy text ROLE_COLORS map is untouched", () => {
 // Status ladder
 // ---------------------------------------------------------------------------
 
-test("ladder: each base state resolves to its robot codepoint + rail role", () => {
-  const cases: [Partial<Job>, RobotRung, RailRole][] = [
+test("ladder: each base state resolves to its robot codepoint + icon role", () => {
+  const cases: [Partial<Job>, RobotRung, IconRole][] = [
     [{ state: "working" }, "working", "working"],
     [{ state: "ended" }, "ended", "idle-ended"],
     [{ state: "stopped" }, "stopped", "idle-stopped"],
     [{ state: "killed" }, "killed", "idle-killed"],
   ];
-  for (const [override, rung, rail] of cases) {
+  for (const [override, rung, icon] of cases) {
     const job = makeJob({ job_id: "j", ...override });
     expect(robotRung(job)).toBe(rung);
     const card = onlyCard(build([job], { showTerminal: true }));
     expect(card.robotGlyph).toBe(ROBOT[rung]);
-    expect(card.railRole).toBe(rail);
-    expect(card.statusWord).toBe(rung);
+    expect(card.iconRole).toBe(icon);
   }
 });
 
@@ -222,7 +186,7 @@ test("ladder: api-error outranks live base states (priority 1, red rail)", () =>
     expect(robotRung(job)).toBe("error");
     const card = onlyCard(build([job], { showTerminal: true }));
     expect(card.robotGlyph).toBe(ROBOT.error);
-    expect(card.railRole).toBe("error");
+    expect(card.iconRole).toBe("error");
   }
 });
 
@@ -249,7 +213,7 @@ test("ladder: terminal state wins over a stale annotation stamp", () => {
       expect(cardKeys(shown, "")).toEqual(["job:j"]);
       const card = onlyCard(shown);
       expect(card.robotGlyph).toBe(ROBOT[rung]);
-      expect(card.railRole).toBe(role);
+      expect(card.iconRole).toBe(role);
 
       // Hidden entirely when showTerminal is off — a stale stamp no longer
       // keeps a dead job permanently demanding attention.
@@ -267,7 +231,7 @@ test("ladder: awaiting (permission OR input) outranks working (priority 2)", () 
     last_permission_prompt_at: 5,
   });
   expect(robotRung(perm)).toBe("awaiting");
-  expect(onlyCard(build([perm])).railRole).toBe("awaiting");
+  expect(onlyCard(build([perm])).iconRole).toBe("awaiting");
 
   const input = makeJob({
     job_id: "j",
@@ -296,7 +260,7 @@ test("ladder: a malformed/unknown state folds to stopped — never throws", () =
     expect(robotRung(job)).toBe("stopped");
     const card = onlyCard(build([job]));
     expect(card.robotGlyph).toBe(ROBOT.stopped);
-    expect(card.railRole).toBe("idle-stopped");
+    expect(card.iconRole).toBe("idle-stopped");
   }
 });
 
@@ -474,94 +438,6 @@ test("fields: title coalesces title→plan_ref→job_id (never blank)", () => {
   ).toBe("j");
 });
 
-test("fields: roleLabel maps the plan verb to its noun (worker)", () => {
-  expect(
-    onlyCard(build([makeJob({ job_id: "j", plan_verb: "work" })])).roleLabel,
-  ).toBe("worker");
-  expect(
-    onlyCard(build([makeJob({ job_id: "j", plan_verb: "plan" })])).roleLabel,
-  ).toBe("planner");
-  // Null plan_verb → empty label, never a crash.
-  expect(
-    onlyCard(build([makeJob({ job_id: "j", plan_verb: null })])).roleLabel,
-  ).toBe("");
-});
-
-test("fields: subagentCount groups running subagents per job", () => {
-  const jobs = [
-    makeJob({ job_id: "a", state: "working" }),
-    makeJob({ job_id: "b", state: "working" }),
-  ];
-  const subs = [
-    makeSub({ job_id: "a", agent_id: "a1", status: "running" }),
-    makeSub({ job_id: "a", agent_id: "a2", status: "running" }),
-    // A non-running invocation does not count.
-    makeSub({ job_id: "a", agent_id: "a3", status: "ok" }),
-    makeSub({ job_id: "b", agent_id: "b1", status: "running" }),
-  ];
-  const m = build(jobs, { subagents: subs });
-  const a = band(m, "").cards.find((c) => c.key === "job:a");
-  const b = band(m, "").cards.find((c) => c.key === "job:b");
-  expect(a?.subagentCount).toBe(2);
-  expect(b?.subagentCount).toBe(1);
-});
-
-test("fields: ageLabel from created_at vs nowSec (injected, no Date.now)", () => {
-  const at = (created: number) =>
-    onlyCard(
-      build([makeJob({ job_id: "j", state: "working", created_at: created })], {
-        nowSec: 1000,
-      }),
-    ).ageLabel;
-  expect(at(1000)).toBe("0s");
-  expect(at(990)).toBe("10s");
-  expect(at(1000 - 120)).toBe("2m");
-  expect(at(1000 - 7200)).toBe("2h");
-  expect(at(1000 - 2 * 86_400)).toBe("2d");
-  // A created_at in the future clamps to 0s (never negative).
-  expect(at(2000)).toBe("0s");
-});
-
-test("fields: sessionLabel from backend coords (session[:pane])", () => {
-  expect(
-    onlyCard(
-      build([
-        makeJob({
-          job_id: "j",
-          backend_exec_session_id: "sess",
-          backend_exec_pane_id: "%3",
-        }),
-      ]),
-    ).sessionLabel,
-  ).toBe("sess:%3");
-  expect(
-    onlyCard(
-      build([
-        makeJob({
-          job_id: "j",
-          backend_exec_session_id: "sess",
-          backend_exec_pane_id: null,
-        }),
-      ]),
-    ).sessionLabel,
-  ).toBe("sess");
-  expect(
-    onlyCard(
-      build([
-        makeJob({
-          job_id: "j",
-          backend_exec_session_id: null,
-          backend_exec_pane_id: null,
-        }),
-      ]),
-    ).sessionLabel,
-  ).toBe("");
-});
-
-test("fields: a fresh card is never focused", () => {
-  expect(onlyCard(build([makeJob({ job_id: "j" })])).isFocused).toBe(false);
-});
-
 // ---------------------------------------------------------------------------
 // Sanitization
 // ---------------------------------------------------------------------------
@@ -586,16 +462,14 @@ test("sanitize: ESC stripped from title and project before the model", () => {
 
 test("input: accepts either a Map or a plain iterable of jobs", () => {
   const arr = [makeJob({ job_id: "j", state: "working" })];
-  const fromArray = buildDashModel(arr, [], false, NOW);
-  const fromMap = buildDashModel(jobsMap(arr), [], false, NOW);
+  const fromArray = buildDashModel(arr, false);
+  const fromMap = buildDashModel(jobsMap(arr), false);
   expect(fromArray).toEqual(fromMap);
 });
 
 test("input: build never throws on an empty / all-malformed job set", () => {
-  expect(() => buildDashModel(new Map(), [], false, NOW)).not.toThrow();
-  expect(() =>
-    buildDashModel([makeJob({ state: "???" })], [], true, NOW),
-  ).not.toThrow();
+  expect(() => buildDashModel(new Map(), false)).not.toThrow();
+  expect(() => buildDashModel([makeJob({ state: "???" })], true)).not.toThrow();
 });
 
 // ---------------------------------------------------------------------------

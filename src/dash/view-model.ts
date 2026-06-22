@@ -1,34 +1,32 @@
 /**
  * `keeper dash` view-model — the pure, OpenTUI-free projection layer for the
- * robot job-card screen. One entry point, {@link buildDashModel}, folds the
- * live `jobs` projection plus the flat running-subagent stream into a typed
- * `{ bands }` CARD model the OpenTUI paint layer (`./app.ts`) consumes: one BAND
- * per active tmux session, each an ordered list of keyed {@link CardVM} cards
- * (one per job).
+ * robot job screen. One entry point, {@link buildDashModel}, folds the live
+ * `jobs` projection into a typed `{ bands }` model the OpenTUI paint layer
+ * (`./app.ts`) consumes: one BAND per active tmux session, each an ordered list
+ * of keyed {@link CardVM} job lines (one per job).
  *
- * Status is DUAL-ENCODED per card: a Nerd Font md-robot face ({@link robotGlyph})
- * plus a colored left rail ({@link CardVM.railRole}), both resolved fresh from
- * the six-rung ladder in {@link robotRung} — annotation columns (api-error,
- * awaiting permission/input) outrank the base `state`. The robot codepoints live
- * in a DASH-LOCAL map ({@link ROBOT_CP}); the shared `ACTIVE_THEME` / `FA_CLASSIC`
- * (the board/jobs `fa-classic` glyphs) are untouched.
+ * Each job paints as a single minimal line — a status ICON, the job name, a
+ * dot, and the project name. Status is DUAL-ENCODED on that one glyph: a Nerd Font
+ * md-robot FACE ({@link robotGlyph}) plus the icon's COLOR ({@link CardVM.iconRole}),
+ * both resolved fresh from the six-rung ladder in {@link robotRung} — annotation
+ * columns (api-error, awaiting permission/input) outrank the base `state`. The
+ * robot codepoints live in a DASH-LOCAL map ({@link ROBOT_CP}); the shared
+ * `ACTIVE_THEME` / `FA_CLASSIC` (the board/jobs `fa-classic` glyphs) are untouched.
  *
- * Cards group by tmux session (`backend_exec_session_id`) — the priority
+ * Lines group by tmux session (`backend_exec_session_id`) — the priority
  * sessions `foreground` / `background` / `autopilot` first, then any other named
  * session alphabetically, then the `detached` band (no recorded session) last —
- * stable `created_at` ASC within a band (`job_id` tiebreak) so a live card never
- * teleports on a metadata tick. Status stays dual-encoded per card (robot face +
- * rail), independent of which band the card sits in. Ended/killed cards are
- * terminal and hidden unless `showTerminal` is set.
+ * stable `created_at` ASC within a band (`job_id` tiebreak) so a live line never
+ * teleports on a metadata tick. Ended/killed jobs are terminal and hidden unless
+ * `showTerminal` is set.
  *
- * Pure — no I/O, no wall-clock (the caller injects `nowSec`), no `@opentui`
- * import anywhere in this file. That last property is load-bearing: it keeps
- * `test/dash-view-model.test.ts` on the fast tier.
+ * Pure — no I/O, no wall-clock, no `@opentui` import anywhere in this file. That
+ * last property is load-bearing: it keeps `test/dash-view-model.test.ts` on the
+ * fast tier.
  */
 
-import { planVerbLabel } from "../board-render";
-import type { Job, SubagentInvocation } from "../types";
-import type { RailRole } from "./theme";
+import type { Job } from "../types";
+import type { IconRole } from "./theme";
 
 // ---------------------------------------------------------------------------
 // Status ladder — the six robot rungs
@@ -64,26 +62,14 @@ const ROBOT_CP: Record<RobotRung, string> = {
   killed: "f16a1", // robot_dead
 };
 
-/** The rail role each rung paints. Mirrors the ladder's color column. */
-const RUNG_RAIL: Record<RobotRung, RailRole> = {
+/** The icon color role each rung paints. Mirrors the ladder's color column. */
+const RUNG_ICON: Record<RobotRung, IconRole> = {
   error: "error",
   awaiting: "awaiting",
   working: "working",
   ended: "idle-ended",
   stopped: "idle-stopped",
   killed: "idle-killed",
-};
-
-/** The status WORD each rung surfaces (the screen reads the glyph + rail; the
- * word is the accessible/label fallback the paint layer may place in a tooltip
- * or census). */
-const RUNG_WORD: Record<RobotRung, string> = {
-  error: "error",
-  awaiting: "awaiting",
-  working: "working",
-  ended: "ended",
-  stopped: "stopped",
-  killed: "killed",
 };
 
 /**
@@ -112,8 +98,7 @@ export function robotRung(job: Job): RobotRung {
   // Terminal state wins over a stale annotation stamp: the reducer's
   // SessionEnd/Killed transitions never clear last_*_at, so a job that died
   // mid-block keeps its stamp. Resolve ended/killed first so such a job is
-  // painted terminal (idle band, hidden by showTerminal) rather than pinned
-  // in needs-you forever.
+  // painted terminal (hidden by showTerminal) rather than pinned as blocked.
   if (job.state === "ended") {
     return "ended";
   }
@@ -140,7 +125,7 @@ export function robotRung(job: Job): RobotRung {
 }
 
 /** A rung is terminal when it represents a finished session — ended or killed.
- * Terminal cards are hidden unless `showTerminal` is set. */
+ * Terminal lines are hidden unless `showTerminal` is set. */
 function isTerminalRung(rung: RobotRung): boolean {
   return rung === "ended" || rung === "killed";
 }
@@ -209,40 +194,32 @@ function byBand(a: BandKey, b: BandKey): number {
 // ---------------------------------------------------------------------------
 
 /**
- * One job card. `key` (`job:<id>`) is stable across frames so the paint layer
- * mutates a single BoxRenderable per job in place (never add/remove per frame).
- * `robotGlyph` + `railRole` dual-encode status; the border is always
- * structure-gray (the project name in it inherits border color — status lives
- * only in the rail). `isFocused` is always false here — the paint layer
- * (`./app.ts`) owns the live `j`/`k` cursor (keyed on `job_id`), so the model
- * carries the field for shape stability but never sets it. `isTerminal` flags an
- * ended/killed card (only present when `showTerminal` reveals them).
+ * One job line. `key` (`job:<id>`) is stable across frames so the paint layer
+ * mutates a single line in place (never add/remove per frame). `robotGlyph` +
+ * `iconRole` dual-encode status on the leading icon. `title` (job name) and
+ * `project` (cwd basename) fill out the `<icon> <title> · <project>` line.
+ * `isTerminal` flags an ended/killed job (only present when `showTerminal`
+ * reveals them).
  */
 export interface CardVM {
   readonly key: string;
   readonly project: string;
   readonly title: string;
   readonly robotGlyph: string;
-  readonly railRole: RailRole;
-  readonly statusWord: string;
-  readonly roleLabel: string;
-  readonly subagentCount: number;
-  readonly ageLabel: string;
-  readonly sessionLabel: string;
-  readonly isFocused: boolean;
+  readonly iconRole: IconRole;
   readonly isTerminal: boolean;
 }
 
 /** One session band: a keyed (tmux session name, or {@link DETACHED_KEY}),
- * titled, ordered run of cards. Only sessions with at least one visible card get
- * a band — there are no empty bands. */
+ * titled, ordered run of job lines. Only sessions with at least one visible line
+ * get a band — there are no empty bands. */
 export interface Band {
   readonly key: BandKey;
   readonly title: string;
   readonly cards: readonly CardVM[];
 }
 
-/** The complete dash card model for one frame. */
+/** The complete dash model for one frame. */
 export interface DashModel {
   readonly bands: readonly Band[];
 }
@@ -274,7 +251,7 @@ function projectBasename(dir: string | null): string {
 }
 
 /**
- * The job's label, coalescing `title → plan_ref → job_id` so a card is NEVER
+ * The job's label, coalescing `title → plan_ref → job_id` so a line is NEVER
  * blank (and never dropped for a missing title/plan_ref).
  */
 function jobLabel(job: Job): string {
@@ -289,73 +266,18 @@ function jobLabel(job: Job): string {
   return job.job_id;
 }
 
-/** A coarse age label from `created_at` vs the injected `nowSec` — seconds /
- * minutes / hours / days, clamped at zero. Pure (no `Date.now()`). */
-function ageLabel(createdAt: number, nowSec: number): string {
-  const delta = Math.max(0, Math.floor(nowSec - createdAt));
-  if (delta < 60) {
-    return `${delta}s`;
-  }
-  if (delta < 3600) {
-    return `${Math.floor(delta / 60)}m`;
-  }
-  if (delta < 86_400) {
-    return `${Math.floor(delta / 3600)}h`;
-  }
-  return `${Math.floor(delta / 86_400)}d`;
-}
-
-/** The session label from the backend coords — `<session>` or `<session>:<pane>`
- * when both are set, "" when neither is. */
-function sessionLabel(job: Job): string {
-  const session = str(job.backend_exec_session_id);
-  const pane = str(job.backend_exec_pane_id);
-  if (session === "") {
-    return pane === "" ? "" : pane;
-  }
-  return pane === "" ? session : `${session}:${pane}`;
-}
-
-/** Running-subagent count per job, grouping the FLAT invocation stream on
- * `job_id` filtered to `status === "running"` (the only status that signals
- * live motion — the same filter readiness uses). */
-function runningSubByJob(
-  subagents: readonly SubagentInvocation[],
-): Map<string, number> {
-  const counts = new Map<string, number>();
-  for (const inv of subagents) {
-    if (inv.status !== "running") {
-      continue;
-    }
-    counts.set(inv.job_id, (counts.get(inv.job_id) ?? 0) + 1);
-  }
-  return counts;
-}
-
 // ---------------------------------------------------------------------------
-// Card build
+// Line build
 // ---------------------------------------------------------------------------
 
-/** Build one card from a job. Pure — every wall-clock-derived field rides the
- * injected `nowSec`. */
-function buildCard(
-  job: Job,
-  rung: RobotRung,
-  subCount: number,
-  nowSec: number,
-): CardVM {
+/** Build one job line from a job. Pure. */
+function buildCard(job: Job, rung: RobotRung): CardVM {
   return {
     key: `job:${job.job_id}`,
     project: sanitize(projectBasename(str(job.cwd) || null)),
     title: sanitize(jobLabel(job)),
     robotGlyph: robotGlyph(rung),
-    railRole: RUNG_RAIL[rung],
-    statusWord: RUNG_WORD[rung],
-    roleLabel: planVerbLabel(job.plan_verb) ?? "",
-    subagentCount: subCount,
-    ageLabel: ageLabel(job.created_at, nowSec),
-    sessionLabel: sessionLabel(job),
-    isFocused: false,
+    iconRole: RUNG_ICON[rung],
     isTerminal: isTerminalRung(rung),
   };
 }
@@ -365,33 +287,27 @@ function buildCard(
 // ---------------------------------------------------------------------------
 
 /**
- * Build the complete dash card model for one frame.
+ * Build the complete dash model for one frame.
  *
  * - `jobs` — the live `jobs` projection (a `Map` keyed by `job_id`, or any
- *   iterable of `Job`). Terminal (ended/killed) cards are dropped unless
+ *   iterable of `Job`). Terminal (ended/killed) lines are dropped unless
  *   `showTerminal` is set.
- * - `subagents` — the FLAT running-subagent stream, grouped per job for the
- *   live-subagent count.
- * - `showTerminal` — when false (default toggle state) ended/killed cards are
+ * - `showTerminal` — when false (default toggle state) ended/killed lines are
  *   hidden; when true they join their session band.
- * - `nowSec` — the frame's reference seconds (injected; no `Date.now()`).
  *
  * Returns `{ bands }`: one band per active tmux session in render order (priority
- * sessions first, the rest alphabetical, `detached` last), each carrying its
- * cards in stable `created_at` ASC (`job_id` tiebreak) order. Pure, never throws.
+ * sessions first, the rest alphabetical, `detached` last), each carrying its job
+ * lines in stable `created_at` ASC (`job_id` tiebreak) order. Pure, never throws.
  */
 export function buildDashModel(
   jobs: Map<string, Job> | Iterable<Job>,
-  subagents: readonly SubagentInvocation[],
   showTerminal: boolean,
-  nowSec: number,
 ): DashModel {
   const jobList =
     jobs instanceof Map ? Array.from(jobs.values()) : Array.from(jobs);
-  const subCounts = runningSubByJob(subagents);
 
-  // Bucket cards by tmux-session band, dropping terminal cards unless revealed.
-  // Only sessions that contribute a card get a bucket, so there are no empty
+  // Bucket lines by tmux-session band, dropping terminal lines unless revealed.
+  // Only sessions that contribute a line get a bucket, so there are no empty
   // bands.
   const buckets = new Map<BandKey, CardVM[]>();
   // Parallel sort keys so the intra-band sort can read created_at / job_id off
@@ -403,7 +319,7 @@ export function buildDashModel(
     if (isTerminalRung(rung) && !showTerminal) {
       continue;
     }
-    const card = buildCard(job, rung, subCounts.get(job.job_id) ?? 0, nowSec);
+    const card = buildCard(job, rung);
     const key = sessionBand(job);
     const bucket = buckets.get(key);
     if (bucket === undefined) {
@@ -414,7 +330,7 @@ export function buildDashModel(
     sortKey.set(card.key, { created: job.created_at, id: job.job_id });
   }
 
-  // Stable intra-band sort: created_at ASC, job_id ASC tiebreak — a live card
+  // Stable intra-band sort: created_at ASC, job_id ASC tiebreak — a live line
   // never teleports on a metadata tick.
   const byCreated = (a: CardVM, b: CardVM): number => {
     const ka = sortKey.get(a.key);
@@ -430,7 +346,7 @@ export function buildDashModel(
   };
 
   // One band per active session, ordered by `byBand` (priority sessions first,
-  // the rest alphabetical, detached last), cards stable-sorted within.
+  // the rest alphabetical, detached last), lines stable-sorted within.
   const bands: Band[] = Array.from(buckets.keys())
     .sort(byBand)
     .map((key) => {
